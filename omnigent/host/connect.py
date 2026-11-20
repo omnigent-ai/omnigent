@@ -74,7 +74,9 @@ from omnigent.host.frames import (
     HOST_CAPABILITIES,
     LAUNCH_HANDLER_FAILED_ERROR_CODE,
     RUNNER_LOG_TAIL_HEADING,
+    SERVER_CAPABILITIES_HEADER,
     WORKSPACE_MISSING_ERROR_CODE,
+    HostCloneRepositoryFrame,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
@@ -120,6 +122,7 @@ from omnigent.host.frames import (
     HostPluginsResultFrame,
     HostProbeAccountsFrame,
     HostProbeAccountsResultFrame,
+    HostRecoverSessionsFrame,
     HostRefreshHarnessesFrame,
     HostRefreshHarnessesResultFrame,
     HostRemoveWorktreeFrame,
@@ -127,6 +130,8 @@ from omnigent.host.frames import (
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
+    HostSetMcpServerEnabledFrame,
+    HostSetMcpServerEnabledResultFrame,
     HostSkillContentFrame,
     HostSkillContentResultFrame,
     HostSkillsFrame,
@@ -137,12 +142,16 @@ from omnigent.host.frames import (
     HostStopRunnerResultFrame,
     HostStoreSecretFrame,
     HostStoreSecretResultFrame,
+    HostWorkspaceCallFrame,
     ImportSessionChunkingUnsupportedError,
     decode_host_frame,
     encode_host_frame,
     encode_import_local_session_frames,
+    frame_for_server,
+    parse_server_capabilities,
     workspace_missing_message,
 )
+from omnigent.host.git_clone import clone_repository
 from omnigent.host.git_worktree import (
     WorktreeError,
     create_worktree,
@@ -152,6 +161,7 @@ from omnigent.host.git_worktree import (
 from omnigent.host.identity import HostIdentity, load_or_create_host_identity
 from omnigent.host.maintenance import HostMaintenanceJanitor
 from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
+from omnigent.host.session_env import consume_session_env_handoff
 from omnigent.inner import _proc
 from omnigent.onboarding.harness_accounts import (
     HARNESS_ACCOUNT_KEYS,
@@ -198,12 +208,15 @@ from omnigent.runner.identity import (
     RUNNER_AUTH_REJECTED_EXIT_CODE,
     RUNNER_CONNECT_MARKER_ENV_VAR,
     RUNNER_DELEGATED_AUTH_ENV_VAR,
+    RUNNER_FINISH_WORK_SIGNAL,
     RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR,
     RUNNER_ID_ENV_VAR,
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
     RUNNER_INTERACTIVE_SHELLS_ENV_VAR,
     RUNNER_LAUNCH_HARNESS_ENV_VAR,
+    RUNNER_MCP_DISABLED_SERVERS_ACTIVE_HARNESSES_ENV_VAR,
     RUNNER_PARENT_PID_ENV_VAR,
+    RUNNER_SESSION_ENV_NAMES_ENV_VAR,
     RUNNER_SLICE_KEY_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
     RUNNER_WORKSPACE_ENV_VAR,
@@ -240,10 +253,12 @@ from omnigent.util.tunnel_limits import (
 from omnigent.version import VERSION
 
 if TYPE_CHECKING:
+    from omnigent.host.workspace_service import WorkspaceSocket
     from omnigent.workspace_fs import WorkspaceReader
 
 # Workspaces whose fs reader (and change registry) stay warm between requests.
 _FS_READER_CACHE_SIZE = 8
+
 
 # Older servers omit a create's timeout_s and wait 150 s for its reply; finish inside that.
 _LEGACY_SERVER_CREATE_BUDGET_S = 140.0
@@ -337,7 +352,7 @@ def _harness_now_configured(harness: str) -> bool:
 def _unavailable_harness_became_ready(
     previous: Mapping[str, HarnessAvailability],
 ) -> bool:
-    """Detect newly available binaries; auth changes wait for the full refresh."""
+    """Detect newly available binaries; auth and tmux changes wait for the full refresh."""
     return any(
         (availability is False or availability == HARNESS_BINARY_MISSING)
         and _harness_now_configured(harness)
@@ -377,6 +392,15 @@ _RUNNER_WATCH_INTERVAL_S = 0.5
 # The server's 30s send wait handles user feedback; this host check also covers
 # create-time launches and outlasts the runner's 150s pending-sign-in wait.
 _RUNNER_CONNECT_DEADLINE_S = 180.0
+
+# After the server rejects this host's credentials, the tunnel stays up until no
+# launch has been starting for the settle window, so a waiting send gets the cause.
+_REJECTED_TUNNEL_SETTLE_S = 2.0
+_REJECTED_TUNNEL_DRAIN_CAP_S = 30.0
+# A connected host re-checks its credentials on this cadence, so one that stops
+# working while no runner is starting still takes the host offline.
+_CREDENTIAL_PROBE_INTERVAL_S = 300.0
+_CREDENTIAL_PROBE_RECHECK_S = 10.0
 
 
 def _connect_marker_path(log_path: Path) -> Path:
@@ -539,6 +563,9 @@ except ValueError:
 # full default timeout on each reconnect after an established tunnel drops.
 _INITIAL_CONNECT_OPEN_TIMEOUT_S = 10.0
 _RECONNECT_OPEN_TIMEOUT_S = 3.0
+# Each consecutive reconnect handshake timeout doubles the next one up to this
+# cap, so a replica that is slow to accept during a handoff is still reached.
+_RECONNECT_OPEN_TIMEOUT_CAP_S = 30.0
 # Consecutive handshake recycle failures before the prompt cadence gives way
 # to normal backoff. An ingress cycle is brief; sustained 502 responses are an
 # outage and shouldn't hammer the endpoint twice a second.
@@ -599,6 +626,10 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "REQUESTS_CA_BUNDLE",
         "CURL_CA_BUNDLE",
         "NODE_EXTRA_CA_CERTS",
+        # git's own CA paths: git built on libcurl-gnutls ignores SSL_CERT_FILE,
+        # so sandboxes that terminate TLS (e.g. OpenShell) inject these instead.
+        "GIT_SSL_CAINFO",
+        "GIT_SSL_CAPATH",
         # Force UTF-8 I/O on Windows. Without this, Python on Windows defaults
         # to the system ANSI code page (e.g. cp1252), causing UnicodeEncodeError
         # when the host daemon / runner prints Unicode characters such as "✓" or
@@ -623,8 +654,10 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "CLAUDE_CONFIG_DIR",
         "CODEX_HOME",
         # Forge CLI config selectors must agree across CLI, daemon, and runner.
-        # Forward paths only; bearer-token environment variables remain excluded.
+        # Forward paths and hosts; bearer-token environment variables remain excluded.
         "GLAB_CONFIG_DIR",
+        "GITLAB_HOST",
+        "GLAB_HOST",
         "GH_CONFIG_DIR",
         "XDG_CONFIG_HOME",
         "XDG_CONFIG_DIRS",
@@ -651,6 +684,9 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # cli._ensure_host_daemon), never to a (possibly hosted) runner.
         "OMNIGENT_CONFIG_HOME",
         "OMNIGENT_DATA_DIR",
+        # Path to the MCP sign-in status file; the executor must read the
+        # same file the host lists in /mcp to reconnect after sign-in.
+        "OMNIGENT_MCP_AUTH_STATUS_FILE",
         # The workspace this host is bound to (cli_auth.load_databricks_org_id),
         # so runners keep routing to it when the stored record changes.
         "OMNIGENT_DATABRICKS_ORG_PIN",
@@ -707,7 +743,7 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # launcher registered in the ``omnigent.claude_launcher`` group (e.g.
         # ``isaac``). Read by omnigent.claude_launcher.resolve_claude_launch in
         # the managed-host runner (``_auto_create_claude_terminal``) to wrap the
-        # Claude launch through a downstream binary (e.g. Databricks' isaac).
+        # Claude launch through a downstream binary.
         # The daemon→runner env strip would otherwise drop it, leaving the
         # runner on the default launch. Safe to propagate: not a secret, just a
         # plugin name.
@@ -793,10 +829,11 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "OMNIGENT_HARNESS_STDERR_ENABLED",
         # Runner release flags must survive CLI -> daemon -> runner.
         "OMNIGENT_FEATURES",
-        # Idle-reap windows the runner reads at boot (``0`` disables reaping).
-        # Numeric tuning knobs, not secrets.
+        # Idle-reap windows and the human-wait hold the runner reads at boot
+        # (``0`` disables each). Numeric tuning knobs, not secrets.
         "OMNIGENT_HARNESS_IDLE_TIMEOUT_S",
         "OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S",
+        "OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S",
         # Opaque request-routing headers (dev/test): a JSON header map folded by
         # cli_auth.databricks_request_headers into every client→server connection
         # so a request pins to a specific server instance/replica. Must reach the
@@ -833,6 +870,9 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # Keep host and spawned-runner routing decisions aligned when the
         # host-slice-key kill switch is explicitly disabled.
         "OMNIGENT_HOST_SLICE_KEY_ENABLED",
+        # Keep the native-terminal idle-poll backoff kill switch (a non-secret
+        # boolean) readable by spawned runners, where the watcher reads it.
+        "OMNIGENT_TERMINAL_IDLE_POLL_BACKOFF",
     }
     # Windows system / profile constants (SYSTEMROOT is mandatory for Winsock,
     # USERPROFILE for Path.home(), etc.); a no-op on POSIX. See _platform.
@@ -950,10 +990,12 @@ def _build_runner_env(
     initial_auth_token: str | None = None,
     host_id: str | None = None,
     harness: str | None = None,
+    mcp_disabled_servers_active_harnesses: list[str] | None = None,
     interactive_shells: list[str] | None = None,
     host_owns_global_cleanup: bool = False,
     harness_tmp_parent: Path | None = None,
     inference_config: dict[str, object] | None = None,
+    session_env: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """
     Build the environment for a spawned runner subprocess.
@@ -987,6 +1029,8 @@ def _build_runner_env(
         machine-global cleanup that standalone runners perform synchronously.
     :param harness_tmp_parent: Absolute harness socket root shared with the
         host janitor. ``None`` preserves the standalone runner default.
+    :param session_env: Variables the launching CLI forwarded for this
+        session only. They bypass the allowlist but not the runner wiring.
     :returns: The runner subprocess environment.
     """
     extra_names = {
@@ -1022,6 +1066,12 @@ def _build_runner_env(
         or key.startswith(_RUNNER_ENV_ALLOWLIST_PREFIXES)
         or key in forwarded
     }
+    # Runners start in the session workspace, so resolve a relative override here.
+    if auth_status_file := env.get("OMNIGENT_MCP_AUTH_STATUS_FILE"):
+        env["OMNIGENT_MCP_AUTH_STATUS_FILE"] = str(Path(auth_status_file).expanduser().absolute())
+    if session_env:
+        env.update(session_env)
+        env[RUNNER_SESSION_ENV_NAMES_ENV_VAR] = ",".join(sorted(session_env))
     env["RUNNER_SERVER_URL"] = server_url
     env[RUNNER_ID_ENV_VAR] = runner_id
     env[RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR] = binding_token
@@ -1047,6 +1097,10 @@ def _build_runner_env(
         env[RUNNER_SLICE_KEY_ENV_VAR] = host_id
     if harness:
         env[RUNNER_LAUNCH_HARNESS_ENV_VAR] = harness
+    if mcp_disabled_servers_active_harnesses is not None:
+        env[RUNNER_MCP_DISABLED_SERVERS_ACTIVE_HARNESSES_ENV_VAR] = json.dumps(
+            mcp_disabled_servers_active_harnesses
+        )
     if interactive_shells is not None:
         env[RUNNER_INTERACTIVE_SHELLS_ENV_VAR] = json.dumps(interactive_shells)
     return env
@@ -1074,15 +1128,6 @@ def _write_runner_inference_config(session_id: str, inference_config: dict[str, 
         with contextlib.suppress(FileNotFoundError):
             os.unlink(temp_name)
     return path
-
-
-def _is_utf8_encodable(text: str) -> bool:
-    """Return whether ``text`` has no surrogate-escaped bytes, so it encodes as UTF-8."""
-    try:
-        text.encode("utf-8")
-    except UnicodeEncodeError:
-        return False
-    return True
 
 
 def _paginate_list_dir(
@@ -1197,6 +1242,8 @@ class _RunnerHandle:
         ``None`` disables the watchdog.
     :param stop_requested: Suppress diagnostics for intentional stops
         or superseded launches, even after the exit watcher pops them.
+    :param create_time: Process start time recorded while the runner was
+        alive, used to reject a reused PID before signalling a forked runner.
     """
 
     proc: subprocess.Popen[bytes] | ZygoteRunnerProc
@@ -1204,6 +1251,7 @@ class _RunnerHandle:
     session_id: str | None = None
     connect_marker: Path | None = None
     stop_requested: bool = False
+    create_time: float | None = None
 
 
 @dataclass(frozen=True)
@@ -1276,6 +1324,7 @@ class HostProcess:
         server_url: str,
         lifecycle_lock: DaemonLifecycleLock | None = None,
         interactive_shells: list[str] | None = None,
+        server_still_ours: Callable[[], bool] | None = None,
     ) -> None:
         """Initialize the host process.
 
@@ -1286,9 +1335,13 @@ class HostProcess:
             and self-terminates once the record is deleted or reassigned.
         :param interactive_shells: Optional shell inventory override for tests.
             By default the host discovers its installed shells once at startup.
+        :param server_still_ours: For a local-mode host, reports whether the
+            local server it started is still the one on ``server_url``; while
+            it is ``False`` each attempt is treated as refused instead of dialing.
         """
         self._identity = identity
         self._server_url = server_url.rstrip("/")
+        self._server_still_ours = server_still_ours
         # One reader per workspace, so its registry keeps state between
         # requests (the changed-files snapshot search reuses for untracked
         # files). Each entry remembers the repository root it was built for.
@@ -1303,6 +1356,13 @@ class HostProcess:
             self._interactive_shells = ["bash"]
         self._harness_tmp_parent = resolve_harness_tmp_parent()
         self._runners: dict[str, _RunnerHandle] = {}
+        from omnigent.onboarding.provider_config import load_config
+
+        host_config = load_config().get("host", {})
+        self._recover_interrupted_sessions = (
+            isinstance(host_config, dict)
+            and host_config.get("recover_interrupted_sessions") is True
+        )
         from omnigent.host.skills import HostSkillDiscovery
 
         self._skill_discovery = HostSkillDiscovery(self._fetch_skill_bundle)
@@ -1318,6 +1378,9 @@ class HostProcess:
         # to retry credential discovery.
         self._auth_token_factory: Callable[[], str | None] | None = None
         self._auth_token_factory_resolved = False
+        self._credential_check_running = False
+        # A tunnel the server no longer authenticates; launches on it are refused.
+        self._credentials_rejected_ws: websockets.asyncio.client.ClientConnection | None = None
         # This host's owning user, resolved once after the first accepted tunnel
         # upgrade (GET /v1/me). Injected into every runner it spawns and published
         # to OMNIGENT_USER_ID so host/runner debug-log rows carry it. None until
@@ -1339,6 +1402,8 @@ class HostProcess:
         # connection handshake. Reconnects reuse this snapshot while the live
         # refresh task keeps it current.
         self._configured_harnesses: dict[str, HarnessAvailability] | None = None
+        # Capabilities the connected server advertised on its upgrade response.
+        self._server_capabilities: frozenset[str] = frozenset()
         self._harness_accounts: HarnessAccounts | None = None
         self._gateway_inference: dict[str, bool] | None = None
         self._capabilities_initialized = False
@@ -1367,6 +1432,8 @@ class HostProcess:
         # Past a bound the reconnect loop escalates instead of fast-recycling.
         self._recycle_streak = 0
         self._silent_connect_streak = 0
+        # Reset to the short default by an accepted upgrade.
+        self._reconnect_open_timeout_s = _RECONNECT_OPEN_TIMEOUT_S
         # Per-connection markers feeding the silent-connect streak.
         self._conn_upgrade_accepted = False
         self._conn_frame_received = False
@@ -1448,6 +1515,8 @@ class HostProcess:
         # instead of waiting out the ~90s keepalive timeout. See run() /
         # _on_resume_from_suspend.
         self._suspend_task: asyncio.Task[None] | None = None
+        # The owner-only workspace API socket, when workspace_direct_access is on.
+        self._workspace_socket: WorkspaceSocket | None = None
         # Set by _on_resume_from_suspend when it aborts a live tunnel after a
         # detected resume; read+cleared in run()'s reconnect handler to force a
         # prompt reconnect (skip the backoff).
@@ -1484,6 +1553,34 @@ class HostProcess:
             if (pid := active.session.pid) is not None
         )
         return pids
+
+    def signal_runners_finish_work(self, kill: Callable[[int, int], None] = os.kill) -> None:
+        """Tell live runners to finish in-flight work once this host exits.
+
+        Runs on the hangup signal-exit thread, so it only reads process state
+        and sends signals; the zygote is not a runner and is never signalled.
+        A direct child is filtered by a non-blocking poll(), which keeps its
+        PID reserved while the host remains its parent. A zygote-forked runner,
+        which the host does not reap, is validated against the start identity
+        recorded at launch so a reused PID is never signalled.
+
+        :param kill: Signal sender, defaults to :func:`os.kill`; injectable for tests.
+        """
+        if RUNNER_FINISH_WORK_SIGNAL is None:
+            return
+        zygote_pid = self._zygote.unreaped_pid if self._zygote is not None else None
+        for handle in list(self._runners.values()):
+            proc = handle.proc
+            pid = proc.pid
+            code = proc.returncode if isinstance(proc, ZygoteRunnerProc) else proc.poll()
+            if code is not None or pid == zygote_pid:
+                continue
+            if isinstance(proc, ZygoteRunnerProc) and (
+                handle.create_time is None or _proc.process_create_time(pid) != handle.create_time
+            ):
+                continue
+            with contextlib.suppress(OSError):
+                kill(pid, RUNNER_FINISH_WORK_SIGNAL)
 
     @staticmethod
     def _orphan_child_pids() -> list[int]:
@@ -1578,18 +1675,19 @@ class HostProcess:
         return await asyncio.shield(task)
 
     def _alive_runner_ids(self) -> list[str]:
-        """Return IDs of runners that are still alive.
+        """Return runner IDs without waiting for forkserver control replies.
 
-        Cleans up dead entries as a side effect.
-
-        :returns: List of alive runner ID strings.
+        :returns: IDs whose exit has not yet been observed.
         """
-        dead = [rid for rid, handle in self._runners.items() if handle.proc.poll() is not None]
-        for rid in dead:
-            self._runners.pop(rid)
-        if dead:
-            self._trigger_maintenance("runner_exited_during_reconnect")
-        return list(self._runners.keys())
+        alive = []
+        for runner_id, handle in self._runners.items():
+            proc = handle.proc
+            # Hello cannot wait for forkserver IPC. The watcher owns polling,
+            # removal and exit reporting, including exits observed during hello.
+            code = proc.returncode if isinstance(proc, ZygoteRunnerProc) else proc.poll()
+            if code is None:
+                alive.append(runner_id)
+        return alive
 
     def _tunnel_url(self) -> str:
         """Build the WebSocket tunnel URL.
@@ -2001,6 +2099,10 @@ class HostProcess:
             ``"failed"`` result. Deterministic preflight refusals
             include a machine-readable ``error_code``.
         """
+        if self._ws is not None and self._ws is self._credentials_rejected_ws:
+            return self._launch_failed(
+                frame, self._credentials_rejected_error(), error_category=ErrorCategory.CONFIG
+            )
         # Refuse to spawn for a harness this machine can't actually run —
         # otherwise the runner starts, the session looks alive, and the
         # first turn dies confusingly inside the executor. ``None`` (an
@@ -2017,10 +2119,16 @@ class HostProcess:
             and (binding_for_harness(frame.inference_config, frame.harness) is not None)
         )
         if has_binding:
-            from omnigent.onboarding.harness_install import missing_harness_cli
+            from omnigent.onboarding.harness_install import (
+                READINESS_CLI_PROBE_TIMEOUT_S,
+                missing_harness_cli,
+            )
 
             assert frame.harness is not None
-            harness_ready = (await asyncio.to_thread(missing_harness_cli, frame.harness)) is None
+            missing = await asyncio.to_thread(
+                missing_harness_cli, frame.harness, READINESS_CLI_PROBE_TIMEOUT_S
+            )
+            harness_ready = missing is None
         else:
             harness_ready = frame.harness is None or await asyncio.to_thread(
                 harness_is_configured, frame.harness
@@ -2059,6 +2167,12 @@ class HostProcess:
 
         workspace = Path(frame.workspace).expanduser()
         workspace_recreated = False
+        if frame.recovery and not workspace.is_dir():
+            return self._launch_failed(
+                frame,
+                workspace_missing_message(workspace),
+                error_code=WORKSPACE_MISSING_ERROR_CODE,
+            )
         if not workspace.is_dir():
             # Recreate a vanished leaf (pruned worktree, an agent's rm -rf) so the
             # session keeps working; a missing *parent* signals a stale path or an
@@ -2101,6 +2215,13 @@ class HostProcess:
             self._current_auth_token,
             initialize=False,
         )
+        session_env = (
+            await asyncio.to_thread(
+                consume_session_env_handoff, frame.session_id, frame.session_env_handoff_id
+            )
+            if frame.session_id
+            else {}
+        )
         env = _build_runner_env(
             os.environ,
             server_url=self._server_url,
@@ -2111,10 +2232,12 @@ class HostProcess:
             initial_auth_token=initial_auth_token,
             host_id=self._identity.host_id,
             harness=frame.harness,
+            mcp_disabled_servers_active_harnesses=frame.mcp_disabled_servers_active_harnesses,
             interactive_shells=self._interactive_shells,
             host_owns_global_cleanup=self._maintenance_janitor is not None,
             harness_tmp_parent=self._harness_tmp_parent,
             inference_config=frame.inference_config,
+            session_env=session_env,
         )
         if frame.inference_config is not None:
             try:
@@ -2165,6 +2288,10 @@ class HostProcess:
             )
             try:
                 proc, log_path = await asyncio.shield(spawn)
+                # A runner now exists and may connect on its own.
+                self._spawned_launch_requests.add(frame.request_id)
+                # Forkserver polls block on control IPC, just like spawning.
+                returncode = await asyncio.to_thread(proc.poll)
             except asyncio.CancelledError:
                 task = asyncio.create_task(
                     self._stop_abandoned_spawn(spawn),
@@ -2174,15 +2301,14 @@ class HostProcess:
                 task.add_done_callback(self._runner_stop_tasks.discard)
                 raise
             except OSError as exc:
+                if frame.request_id in self._spawned_launch_requests:
+                    raise
                 return self._launch_failed(
                     frame,
                     f"failed to spawn runner: {exc}",
                 )
-        # A runner now exists and may connect on its own.
-        self._spawned_launch_requests.add(frame.request_id)
-
-        if proc.poll() is not None:
-            # The runner died before Popen returned — its actual error
+        if returncode is not None:
+            # The runner exited before launch acknowledgement — its actual error
             # is in the captured log, so ship the tail with the result
             # instead of making the user go find the file on the host.
             error = _runner_exit_error(proc.returncode, log_path)
@@ -2224,6 +2350,7 @@ class HostProcess:
             log_path=log_path,
             session_id=frame.session_id or None,
             connect_marker=_connect_marker_path(log_path),
+            create_time=_proc.process_create_time(proc.pid),
         )
         launch_context = current_scheduled_run()
         with scheduled_run_scope(None, session_id=frame.session_id):
@@ -2391,6 +2518,9 @@ class HostProcess:
                     stdin=subprocess.DEVNULL,
                     stdout=log_fh,
                     stderr=log_fh,
+                    # Own session: a hangup of the daemon's terminal reaches only
+                    # the daemon, which asks its runners to finish in-flight work.
+                    **_proc.spawn_kwargs(),
                     **logging_kwargs,
                 )
             return proc, log_path
@@ -2423,6 +2553,9 @@ class HostProcess:
         )
         try:
             await self._stop_runner_and_trigger(proc, "runner_spawn_abandoned")
+            if isinstance(proc, ZygoteRunnerProc):
+                # No watcher owns an abandoned spawn's retained exit status.
+                await asyncio.to_thread(proc.wait, timeout=5.0)
         except Exception:  # detached cleanup must be observed
             _logger.warning(
                 "Failed to stop abandoned runner pid=%s",
@@ -2441,14 +2574,43 @@ class HostProcess:
         :param frame: The stop request frame.
         :returns: Result frame with status.
         """
+        return await self._finish_stop(frame, self._claim_runner_for_stop(frame))
+
+    def _claim_runner_for_stop(self, frame: HostStopRunnerFrame) -> _RunnerHandle | None:
+        """Untrack the runner a stop names, marking its exit as intentional.
+
+        This is the only part of a stop that must keep arrival order with
+        launches, so the frame dispatcher runs it under the lifecycle lock.
+
+        :param frame: The stop request frame.
+        :returns: The claimed handle, or ``None`` for an unknown runner.
+        """
         handle = self._runners.pop(frame.runner_id, None)
+        if handle is not None:
+            handle.stop_requested = True
+        return handle
+
+    async def _finish_stop(
+        self,
+        frame: HostStopRunnerFrame,
+        handle: _RunnerHandle | None,
+    ) -> HostStopRunnerResultFrame:
+        """Terminate a claimed runner and build the stop result.
+
+        Runs outside the lifecycle lock: termination can wait out the
+        runner's exit grace, and launches queued behind a burst of stops
+        would otherwise exceed the server's launch timeout.
+
+        :param frame: The stop request frame.
+        :param handle: The handle from :meth:`_claim_runner_for_stop`.
+        :returns: Result frame with status.
+        """
         if handle is None:
             return HostStopRunnerResultFrame(
                 request_id=frame.request_id,
                 status="failed",
                 error=f"unknown runner: {frame.runner_id}",
             )
-        handle.stop_requested = True
         # The poll/terminate/wait round-trips are lock-free waitpid calls for a
         # direct-Popen runner, but blocking control-socket exchanges for a
         # zygote-forked one — run them off the loop so a wedged zygote can't
@@ -2525,12 +2687,14 @@ class HostProcess:
     def _stop_runner_proc(proc: subprocess.Popen[bytes] | ZygoteRunnerProc) -> None:
         """Terminate a runner: SIGTERM, brief wait, then SIGKILL. Blocking.
 
-        Runs on a worker thread (see :meth:`_handle_stop`) because for a
-        zygote-forked runner these are blocking control-socket round-trips, not
-        lock-free waitpid calls.
+        Runs on a worker thread (see :meth:`_handle_stop`). Forked runners
+        use OS liveness so a stalled control exchange cannot postpone a stop.
 
         :param proc: The runner process handle (Popen or zygote shim).
         """
+        if isinstance(proc, ZygoteRunnerProc):
+            proc.stop()
+            return
         if proc.poll() is not None:
             return
         proc.terminate()
@@ -2674,12 +2838,7 @@ class HostProcess:
                 and had_connected is not True
             )
             if auth_rejected:
-                error = (
-                    "The server rejected this host's credentials, so the runner could not "
-                    f"connect. Sign in again with `{cli_invocation()} login "
-                    f"{self._login_hint_url()}` "
-                    f"on this host, then retry. Details: {error}"
-                )
+                error = f"{self._credentials_rejected_error()} Details: {error}"
             _logger.warning(
                 "Runner %s died unexpectedly: %s",
                 runner_id,
@@ -2699,6 +2858,120 @@ class HostProcess:
                 ),
             )
             await self._report_runner_exit(runner_id, error, had_connected=had_connected)
+        if auth_rejected:
+            await self._drop_tunnel_if_credentials_rejected()
+
+    async def _drop_tunnel_if_credentials_rejected(self) -> None:
+        """Reconnect when the server now refuses the credentials this host connects with.
+
+        The tunnel authenticates only at upgrade, so it can outlive a rejected credential.
+        Dropping it marks the host offline until a reconnect presents one that works.
+        Managed hosts are skipped because ``/v1/me`` does not accept their launch token.
+        """
+        from omnigent.host.identity import HOST_TOKEN_ENV_VAR
+
+        ws = self._ws
+        if (
+            ws is None
+            or ws is self._credentials_rejected_ws
+            or self._credential_check_running
+            or os.environ.get(HOST_TOKEN_ENV_VAR)
+        ):
+            return
+        self._credential_check_running = True
+        try:
+            rejected = await self._run_host_subprocess_in_thread(self._server_rejects_credentials)
+        except Exception:
+            _logger.debug("Could not check this host's credentials", exc_info=True)
+            return
+        finally:
+            self._credential_check_running = False
+        if not rejected or self._ws is not ws:
+            return
+        message = (
+            "The server now rejects this host's credentials, so its runners cannot "
+            f"connect. Reconnecting; if this persists, run `{cli_invocation()} login "
+            f"{self._login_hint_url()}` on this host."
+        )
+        _logger.warning("%s", message)
+        _print_host_status(f"⚠ {message}", stderr=True)
+        self._credentials_rejected_ws = ws
+        self._auth_token_factory = None
+        self._auth_token_factory_resolved = False
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _REJECTED_TUNNEL_DRAIN_CAP_S
+        quiet_since = loop.time()
+        try:
+            while self._ws is ws and (now := loop.time()) < deadline:
+                if await self._has_starting_runners():
+                    quiet_since = now
+                elif now - quiet_since >= _REJECTED_TUNNEL_SETTLE_S:
+                    break
+                await asyncio.sleep(_RUNNER_WATCH_INTERVAL_S)
+        finally:
+            # A tunnel left marked rejected would refuse every launch while staying online.
+            if self._ws is ws:
+                self._abort_live_tunnel()
+
+    async def _has_starting_runners(self) -> bool:
+        """Return whether a launch is in progress or a live runner has not connected yet."""
+        if self._pending_runner_launches:
+            return True
+        markers = [
+            handle.connect_marker
+            for handle in self._runners.values()
+            if handle.connect_marker is not None and not handle.stop_requested
+        ]
+
+        def any_unconnected() -> bool:
+            for marker in markers:
+                try:
+                    if not marker.exists():
+                        return True
+                except OSError:
+                    _logger.debug("Could not read connect marker %s", marker, exc_info=True)
+            return False
+
+        return await asyncio.to_thread(any_unconnected)
+
+    def _credentials_rejected_error(self) -> str:
+        """Return the sign-in instruction for a runner the server refused on credentials."""
+        return (
+            "The server rejected this host's credentials, so the runner could not "
+            f"connect. Sign in again with `{cli_invocation()} login {self._login_hint_url()}` "
+            "on this host, then retry."
+        )
+
+    async def _credential_probe_loop(self) -> None:
+        """Periodically drop the tunnel if the server refuses this host's credentials.
+
+        A refusal is checked again after a short pause, so one failed token refresh
+        does not take the host offline.
+        """
+        while True:
+            await asyncio.sleep(_CREDENTIAL_PROBE_INTERVAL_S)
+            try:
+                rejected = await self._run_host_subprocess_in_thread(
+                    self._server_rejects_credentials
+                )
+            except Exception:
+                _logger.debug("Could not probe this host's credentials", exc_info=True)
+                continue
+            if rejected:
+                await asyncio.sleep(_CREDENTIAL_PROBE_RECHECK_S)
+                await self._drop_tunnel_if_credentials_rejected()
+
+    def _server_rejects_credentials(self) -> bool:
+        """Return whether ``GET /v1/me`` refuses the tunnel's own headers as unauthenticated."""
+        from omnigent.runner._entry import _is_login_redirect_or_unauthorized
+
+        response = httpx.get(
+            f"{self._server_url}/v1/me",
+            headers=self._build_connect_headers(),
+            timeout=10.0,
+            verify=client_ssl_context(),
+        )
+        return _is_login_redirect_or_unauthorized(response)
 
     async def _watch_runner_connect(
         self, runner_id: str, *, exit_watcher: asyncio.Task[None]
@@ -2763,7 +3036,7 @@ class HostProcess:
         ws = self._ws
         if ws is not None:
             try:
-                await self._send_text(ws, encode_host_frame(report))
+                await self._send_text(ws, self._encode_frame(report))
                 return
             except Exception:  # any send failure parks the report
                 _logger.debug(
@@ -2923,7 +3196,7 @@ class HostProcess:
             if enum_error is not None:
                 await self._send_text(
                     ws,
-                    encode_host_frame(
+                    self._encode_frame(
                         HostImportLocalDoneFrame(
                             request_id=frame.request_id, status="failed", error=enum_error
                         )
@@ -2993,7 +3266,7 @@ class HostProcess:
                     continue
             await self._send_text(
                 ws,
-                encode_host_frame(
+                self._encode_frame(
                     HostImportLocalDoneFrame(
                         request_id=frame.request_id,
                         status="ok",
@@ -3011,7 +3284,7 @@ class HostProcess:
             with contextlib.suppress(Exception):
                 await self._send_text(
                     ws,
-                    encode_host_frame(
+                    self._encode_frame(
                         HostImportLocalDoneFrame(
                             request_id=frame.request_id, status="failed", error=str(exc)
                         )
@@ -3076,9 +3349,11 @@ class HostProcess:
         # Walk every entry, classifying by target type. Per-entry
         # OSError → skip (e.g. dangling symlink) so the listing
         # surfaces real entries instead of failing wholesale.
+        from omnigent.workspace_fs import is_utf8_encodable
+
         entries: list[HostListDirEntry] = []
         for de in scanned:
-            if not _is_utf8_encodable(de.path):
+            if not is_utf8_encodable(de.path):
                 # A name that isn't valid UTF-8 comes back surrogate-escaped; it
                 # can't be sent as JSON or reopened by path, so skip it too.
                 continue
@@ -3432,7 +3707,7 @@ class HostProcess:
             self._replace_capabilities(configured, self._gateway_inference, accounts)
             await self._send_text(
                 ws,
-                encode_host_frame(
+                self._encode_frame(
                     HostHarnessLoginCompletedFrame(
                         login_id=login_id,
                         success=success,
@@ -3450,7 +3725,7 @@ class HostProcess:
             with contextlib.suppress(Exception):
                 await self._send_text(
                     ws,
-                    encode_host_frame(
+                    self._encode_frame(
                         HostHarnessLoginCompletedFrame(
                             login_id=login_id,
                             success=False,
@@ -3696,6 +3971,44 @@ class HostProcess:
             ],
         )
 
+    async def _start_workspace_socket(self) -> WorkspaceSocket | None:
+        """Open the direct workspace socket when its extra is installed, else ``None``.
+
+        The server's ``workspace_direct_access`` decides whether anyone gets a
+        token for it; without one, every call is refused.
+        """
+        try:
+            from omnigent.host.workspace_service import start_workspace_socket
+        except ImportError:
+            _logger.debug("No `omnigent[workspace-api]`; the workspace socket is off")
+            return None
+        return await start_workspace_socket(self._workspace_reader, host_id=self._identity.host_id)
+
+    def _workspace_reader(self, workspace: str) -> WorkspaceReader:
+        """Return the cached reader for an existing workspace directory.
+
+        Shared by tunnel fs requests and the direct workspace socket, so both
+        reuse one reader (and its change registry) per workspace. Blocking:
+        call it from a worker thread.
+
+        :param workspace: Expanded workspace path, e.g. ``"/home/me/project"``.
+        :returns: The workspace's reader.
+        """
+        from omnigent.runtime.filesystem_registry import detect_git_root
+        from omnigent.workspace_fs import WorkspaceReader
+
+        # A workspace can gain or lose its .git while the host is running.
+        repo_root = detect_git_root(Path(workspace))
+        with self._fs_readers_lock:
+            cached = self._fs_readers.get(workspace)
+            if cached is None or cached[0] != repo_root:
+                cached = (repo_root, WorkspaceReader(Path(workspace)))
+                self._fs_readers[workspace] = cached
+                while len(self._fs_readers) > _FS_READER_CACHE_SIZE:
+                    self._fs_readers.popitem(last=False)
+            self._fs_readers.move_to_end(workspace)
+            return cached[1]
+
     def _handle_fs_request(self, frame: HostFsRequestFrame) -> HostFsResultFrame:
         """Serve a read-only workspace filesystem request from the host.
 
@@ -3713,12 +4026,7 @@ class HostProcess:
         """
         from pathlib import Path
 
-        from omnigent.runtime.filesystem_registry import detect_git_root
-        from omnigent.workspace_fs import (
-            WorkspaceReader,
-            WorkspaceReaderError,
-            read_repository_branches,
-        )
+        from omnigent.workspace_fs import WorkspaceReaderError, read_repository_branches
 
         try:
             expanded = os.path.expanduser(frame.workspace)
@@ -3752,17 +4060,7 @@ class HostProcess:
                     Path(expanded), cast("list[dict[str, str]]", params["repositories"])
                 )
             else:
-                # A workspace can gain or lose its .git while the host is running.
-                repo_root = detect_git_root(Path(expanded))
-                with self._fs_readers_lock:
-                    cached = self._fs_readers.get(expanded)
-                    if cached is None or cached[0] != repo_root:
-                        cached = (repo_root, WorkspaceReader(Path(expanded)))
-                        self._fs_readers[expanded] = cached
-                        while len(self._fs_readers) > _FS_READER_CACHE_SIZE:
-                            self._fs_readers.popitem(last=False)
-                    self._fs_readers.move_to_end(expanded)
-                    reader = cached[1]
+                reader = self._workspace_reader(expanded)
                 with pr_resource.server_tracking(
                     params.get("server_tracked"), params.get("default_pr_url")
                 ):
@@ -3922,6 +4220,50 @@ class HostProcess:
                 error="skill content lookup failed",
             )
         return HostSkillContentResultFrame(request_id=frame.request_id, status="ok", skill=skill)
+
+    def _handle_set_mcp_server_enabled(
+        self, frame: HostSetMcpServerEnabledFrame
+    ) -> HostSetMcpServerEnabledResultFrame:
+        from omnigent.host.mcp_inventory import configured_mcp_servers, find_configured_server
+        from omnigent.mcp_disabled_servers import (
+            HARNESS_EXECUTORS,
+            DisabledServerWriteError,
+            ServerKey,
+            set_disabled,
+        )
+
+        def rejected(message: str) -> HostSetMcpServerEnabledResultFrame:
+            return HostSetMcpServerEnabledResultFrame(
+                frame.request_id, "failed", error=message, error_code="invalid_server"
+            )
+
+        if frame.harness not in HARNESS_EXECUTORS or frame.server == "omnigent":
+            return rejected("This MCP server cannot be toggled")
+        servers = configured_mcp_servers()
+        if any(
+            server.summary["harness"] == frame.harness
+            and server.summary["name"] == frame.server
+            and server.summary.get("managed") == "true"
+            for server in servers
+        ):
+            return rejected("Managed MCP servers cannot be toggled")
+        try:
+            server = find_configured_server(
+                frame.harness, frame.server, frame.plugin, frame.source_id, servers=servers
+            )
+        except LookupError:
+            return rejected("MCP server no longer exists or its source changed; refresh inventory")
+        try:
+            set_disabled(ServerKey(frame.harness, frame.server, frame.plugin), not frame.enabled)
+        except DisabledServerWriteError as exc:
+            return HostSetMcpServerEnabledResultFrame(
+                frame.request_id,
+                "failed",
+                error=str(exc),
+                error_code="io" if exc.code == "io" else "invalid_server",
+            )
+        summary = {**server.summary, "enabled": str(frame.enabled).lower(), "locked": "false"}
+        return HostSetMcpServerEnabledResultFrame(frame.request_id, "ok", server=summary)
 
     async def _handle_mcp_tools(self, frame: HostMcpToolsFrame) -> HostMcpToolsResultFrame:
         try:
@@ -4252,7 +4594,12 @@ class HostProcess:
                 str(params.get("after", "")),
             )
         if op == "github_changes":
-            return r.github_changes(session_id, cast("str | None", params.get("pr_url")))
+            return r.github_changes(
+                session_id,
+                cast("str | None", params.get("pr_url")),
+                head_sha=cast("str | None", params.get("head_sha")),
+                base_sha=cast("str | None", params.get("base_sha")),
+            )
         if op == "github_diff":
             return r.github_file_diff(
                 cast("str | None", params.get("base")),
@@ -4269,6 +4616,25 @@ class HostProcess:
                 cast("str | None", params.get("pr_url")),
                 head_sha=cast("str | None", params.get("head_sha")),
                 base_sha=cast("str | None", params.get("base_sha")),
+            )
+        if op == "github_commits":
+            return r.github_commits(
+                session_id,
+                cast("str | None", params.get("pr_url")),
+                head_sha=cast("str | None", params.get("head_sha")),
+            )
+        if op == "github_commit_diff":
+            return r.github_commit_diff(
+                session_id,
+                cast("str | None", params.get("pr_url")),
+                commit_sha=cast("str | None", params.get("commit_sha")),
+            )
+        if op == "github_compare_diff":
+            return r.github_compare_diff(
+                session_id,
+                cast("str | None", params.get("pr_url")),
+                head_sha=cast("str | None", params.get("head_sha")),
+                from_sha=cast("str | None", params.get("from_sha")),
             )
         if op == "github_labels":
             return r.github_labels(session_id, cast("str | None", params.get("pr_url")))
@@ -4381,6 +4747,15 @@ class HostProcess:
                 pr_url=cast("str | None", params.get("pr_url")),
                 merge_method=params.get("merge_method"),
                 expected_head=params.get("expected_head"),
+            )
+        if op == "github_merge_as":
+            return pr_resource.merge_pr_as(
+                workspace,
+                session_id=cast("str | None", params.get("session_id")),
+                pr_url=cast("str | None", params.get("pr_url")),
+                merge_method=params.get("merge_method"),
+                expected_head=params.get("expected_head"),
+                account=params.get("account"),
             )
         if op == "github_disable_auto_merge":
             return pr_resource.disable_pr_auto_merge(
@@ -4862,6 +5237,7 @@ class HostProcess:
         self._suspend_task = asyncio.create_task(
             watch_for_resume(self._on_resume_from_suspend), name="host-suspend-watch"
         )
+        self._workspace_socket = await self._start_workspace_socket()
         # Warm the runner zygote now: start() blocks on its one-time import
         # of the runner graph (~1-2s), which otherwise lands inside the first
         # session launch of the daemon's life. Best-effort — a failure
@@ -5074,6 +5450,9 @@ class HostProcess:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await self._suspend_task
                 self._suspend_task = None
+            if self._workspace_socket is not None:
+                await self._workspace_socket.stop()
+                self._workspace_socket = None
             if self._lifecycle_task is not None:
                 self._lifecycle_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -5173,6 +5552,12 @@ class HostProcess:
         # Fresh per-connection markers for the silent-connect streak.
         self._conn_upgrade_accepted = False
         self._conn_frame_received = False
+        if self._server_still_ours is not None and not self._server_still_ours():
+            # Our local server exited; another data dir's server may now own the
+            # port, and registering there steals that host's same-name row.
+            raise ConnectionRefusedError(
+                errno.ECONNREFUSED, f"the local server at {self._server_url} is no longer running"
+            )
         url = self._tunnel_url()
         # Credential discovery may invoke the Databricks CLI. Keep it off the
         # event loop so startup capability discovery can make progress at the
@@ -5185,17 +5570,24 @@ class HostProcess:
         # (no OpenSSL default cert path), which fails handshake verification.
         # ``ssl=None`` for ws:// is the library default (no TLS).
         ssl_ctx = client_ssl_context() if url.startswith("wss://") else None
+        # websockets adds its own User-Agent on top of additional_headers; send only ours.
+        ws_headers = dict(headers)
+        from omnigent.telemetry.request_headers import pop_client_user_agent
+
+        user_agent = pop_client_user_agent(ws_headers)
+        open_timeout = (
+            self._reconnect_open_timeout_s
+            if self._ever_connected
+            else _INITIAL_CONNECT_OPEN_TIMEOUT_S
+        )
         try:
             ws_cm = websockets.asyncio.client.connect(
                 url,
-                additional_headers=headers,
+                additional_headers=ws_headers,
+                user_agent_header=user_agent,
                 max_size=100 * 1024 * 1024,
                 ssl=ssl_ctx,
-                open_timeout=(
-                    _RECONNECT_OPEN_TIMEOUT_S
-                    if self._ever_connected
-                    else _INITIAL_CONNECT_OPEN_TIMEOUT_S
-                ),
+                open_timeout=open_timeout,
                 # Align the host->server tunnel's protocol keepalive to the same
                 # 90 s app-level budget as the runner tunnel (not the 20 s library
                 # default that drops a busy-but-healthy tunnel with 1011 — #1116).
@@ -5204,6 +5596,12 @@ class HostProcess:
                 ping_timeout=TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
             )
             ws = await ws_cm.__aenter__()
+        except TimeoutError:
+            if self._ever_connected:
+                self._reconnect_open_timeout_s = min(
+                    open_timeout * 2, _RECONNECT_OPEN_TIMEOUT_CAP_S
+                )
+            raise
         except (InvalidURI, InvalidStatus) as exc:
             if isinstance(exc, InvalidURI) or exc.response.status_code in (401, 403):
                 # Rediscover repaired credentials instead of reusing a rejected SDK cache.
@@ -5216,6 +5614,12 @@ class HostProcess:
             if fatal is not None:
                 raise fatal from exc
             raise
+        upgrade_response = getattr(ws, "response", None)
+        self._server_capabilities = parse_server_capabilities(
+            upgrade_response.headers.get(SERVER_CAPABILITIES_HEADER)
+            if upgrade_response is not None
+            else None
+        )
         # An accepted upgrade proves the credentials work: login redirects
         # from here on are server restarts, not an unauthenticated host.
         reconnect = self._ever_connected
@@ -5228,6 +5632,7 @@ class HostProcess:
         # A completed upgrade proves the endpoint healthy — the next drop's
         # prompt reconnect is wanted again.
         self._recycle_streak = 0
+        self._reconnect_open_timeout_s = _RECONNECT_OPEN_TIMEOUT_S
         record_websocket_connected("host", reconnect=reconnect)
         connection_id = uuid.uuid4().hex
         connected_at = time.monotonic()
@@ -5463,6 +5868,10 @@ class HostProcess:
             return self._tunnel_diagnostics[1]
         return None
 
+    def _encode_frame(self, frame: HostFrame) -> str:
+        """Encode *frame* in the readiness vocabulary the connected server accepts."""
+        return encode_host_frame(frame_for_server(frame, self._server_capabilities))
+
     async def _send_text(self, ws: websockets.asyncio.client.ClientConnection, data: str) -> None:
         diagnostics = self._diagnostics_for(ws)
         if diagnostics is None:
@@ -5505,9 +5914,12 @@ class HostProcess:
             installation_id=_tel_install_id,
             capabilities=list(HOST_CAPABILITIES),
             connection_id=connection_id,
+            workspace_socket=str(listener.path) if (listener := self._workspace_socket) else None,
+            workspace_token_key=listener.token_key if listener else None,
+            recover_interrupted_sessions=self._recover_interrupted_sessions,
         )
         try:
-            encoded_hello = encode_host_frame(hello)
+            encoded_hello = self._encode_frame(hello)
         except Exception as exc:
             raise HostConnectError(f"Could not encode host.hello: {exc}") from exc
         await self._send_text(ws, encoded_hello)
@@ -5518,6 +5930,8 @@ class HostProcess:
         self._ensure_model_options_prewarm()
         self._ws = ws
         readiness_task = asyncio.create_task(self._harness_readiness_loop(ws))
+        recovery_task = asyncio.create_task(self._session_recovery_loop(ws))
+        credential_probe_task = asyncio.create_task(self._credential_probe_loop())
         try:
             # Reports raised while disconnected must wait until registration;
             # the server cannot route them before this connection owns the host.
@@ -5560,10 +5974,33 @@ class HostProcess:
         finally:
             if (diagnostics := self._diagnostics_for(ws)) is not None:
                 diagnostics.freeze()
+            recovery_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await recovery_task
             readiness_task.cancel()
+            credential_probe_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await readiness_task
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await credential_probe_task
             await self._cancel_all_harness_logins()
+
+    async def _session_recovery_loop(self, ws: websockets.asyncio.client.ClientConnection) -> None:
+        """Only opted-in hosts request recovery after their local state is ready."""
+        from omnigent.session_recovery import RECOVERY_RETRY_S
+
+        if not self._recover_interrupted_sessions:
+            return
+        while True:
+            await self._send_text(
+                ws,
+                encode_host_frame(
+                    HostRecoverSessionsFrame(
+                        runners=self._alive_runner_ids(),
+                    )
+                ),
+            )
+            await asyncio.sleep(RECOVERY_RETRY_S)
 
     async def _harness_readiness_loop(
         self,
@@ -5608,7 +6045,7 @@ class HostProcess:
             ):
                 await self._send_text(
                     ws,
-                    encode_host_frame(
+                    self._encode_frame(
                         HostHarnessReadinessFrame(
                             configured_harnesses=configured,
                             harness_accounts=self._harness_accounts,
@@ -5800,7 +6237,7 @@ class HostProcess:
                 completion.set_result(None)
             if launch_result is not None:
                 try:
-                    await self._send_text(ws, encode_host_frame(launch_result))
+                    await self._send_text(ws, self._encode_frame(launch_result))
                 except ConnectionClosed:
                     if launch_fault is None:
                         raise
@@ -5813,19 +6250,30 @@ class HostProcess:
                 raise launch_fault
         elif isinstance(frame, HostStopRunnerFrame):
             async with self._runner_lifecycle_lock:
-                stop_result = await self._handle_stop(frame)
-            await self._send_text(ws, encode_host_frame(stop_result))
+                stopping_handle = self._claim_runner_for_stop(frame)
+            stop_result = await self._finish_stop(frame, stopping_handle)
+            await self._send_text(ws, self._encode_frame(stop_result))
         elif isinstance(frame, HostRunnerStatusFrame):
-            await self._send_text(ws, encode_host_frame(await self._handle_runner_status(frame)))
+            await self._send_text(ws, self._encode_frame(await self._handle_runner_status(frame)))
         elif isinstance(frame, HostStatFrame):
-            await self._send_text(ws, encode_host_frame(self._handle_stat(frame)))
+            # Even a single metadata lookup can block on a mounted filesystem.
+            stat_result = await asyncio.to_thread(self._handle_stat, frame)
+            await self._send_text(ws, self._encode_frame(stat_result))
         elif isinstance(frame, HostListDirFrame):
             # Stat-ing every entry can be slow on large or network-backed
             # directories; keep the tunnel's event loop free meanwhile.
             list_result = await asyncio.to_thread(self._handle_list_dir, frame)
-            await self._send_text(ws, encode_host_frame(list_result))
+            await self._send_text(ws, self._encode_frame(list_result))
         elif isinstance(frame, HostCreateDirFrame):
-            await self._send_text(ws, encode_host_frame(self._handle_create_dir(frame)))
+            create_dir_result = await asyncio.to_thread(self._handle_create_dir, frame)
+            await self._send_text(ws, self._encode_frame(create_dir_result))
+        elif isinstance(frame, HostCloneRepositoryFrame):
+            # git runs for minutes; the owned-subprocess guard keeps the orphan
+            # reaper from collecting its exit status.
+            clone_result = await self._run_host_subprocess_in_thread(
+                lambda: clone_repository(frame)
+            )
+            await self._send_text(ws, self._encode_frame(clone_result))
         elif isinstance(frame, HostInstallHarnessFrame):
             # The installer shells out (npm) and can run for minutes, so run
             # it off the event loop and reply when it completes.
@@ -5837,11 +6285,11 @@ class HostProcess:
                     install_result.configured_harnesses,
                     install_result.gateway_inference,
                 )
-            await self._send_text(ws, encode_host_frame(install_result))
+            await self._send_text(ws, self._encode_frame(install_result))
         elif isinstance(frame, HostProbeAccountsFrame):
             await self._send_text(
                 ws,
-                encode_host_frame(await self._handle_probe_harness_accounts(frame)),
+                self._encode_frame(await self._handle_probe_harness_accounts(frame)),
             )
         elif isinstance(frame, HostRefreshHarnessesFrame):
             refresh_result = await self._handle_refresh_harnesses(frame)
@@ -5850,21 +6298,21 @@ class HostProcess:
                     refresh_result.configured_harnesses,
                     refresh_result.gateway_inference,
                 )
-            await self._send_text(ws, encode_host_frame(refresh_result))
+            await self._send_text(ws, self._encode_frame(refresh_result))
         elif isinstance(frame, HostHarnessLoginFrame):
             await self._send_text(
                 ws,
-                encode_host_frame(await self._handle_harness_login(ws, frame)),
+                self._encode_frame(await self._handle_harness_login(ws, frame)),
             )
         elif isinstance(frame, HostHarnessLoginCancelFrame):
             await self._send_text(
                 ws,
-                encode_host_frame(await self._handle_harness_login_cancel(frame)),
+                self._encode_frame(await self._handle_harness_login_cancel(frame)),
             )
         elif isinstance(frame, HostHarnessLogoutFrame):
             await self._send_text(
                 ws,
-                encode_host_frame(await self._handle_harness_logout(frame)),
+                self._encode_frame(await self._handle_harness_logout(frame)),
             )
         elif isinstance(frame, HostStoreSecretFrame):
             # The credential write touches the OS keychain / config file, so run
@@ -5877,45 +6325,58 @@ class HostProcess:
                     secret_result.configured_harnesses,
                     secret_result.gateway_inference,
                 )
-            await self._send_text(ws, encode_host_frame(secret_result))
+            await self._send_text(ws, self._encode_frame(secret_result))
         elif isinstance(frame, HostDetectCredentialsFrame):
             # Ambient detection may probe files / a localhost socket, so run it
             # off the event loop.
             credentials_result = await asyncio.to_thread(self._handle_detect_credentials, frame)
-            await self._send_text(ws, encode_host_frame(credentials_result))
+            await self._send_text(ws, self._encode_frame(credentials_result))
         elif isinstance(frame, HostCreateWorktreeFrame):
-            await self._send_text(ws, encode_host_frame(await self._handle_create_worktree(frame)))
+            await self._send_text(
+                ws, self._encode_frame(await self._handle_create_worktree(frame))
+            )
         elif isinstance(frame, HostRemoveWorktreeFrame):
-            await self._send_text(ws, encode_host_frame(await self._handle_remove_worktree(frame)))
+            await self._send_text(
+                ws, self._encode_frame(await self._handle_remove_worktree(frame))
+            )
         elif isinstance(frame, HostListWorktreesFrame):
-            await self._send_text(ws, encode_host_frame(await self._handle_list_worktrees(frame)))
+            await self._send_text(ws, self._encode_frame(await self._handle_list_worktrees(frame)))
+        elif isinstance(frame, HostWorkspaceCallFrame):
+            from omnigent.host.workspace_service import serve_tunnel_call
+
+            # Reply per message so a long ReadFile stays within the server's per-reply timeout.
+            async for reply in serve_tunnel_call(self._workspace_reader, frame):
+                await self._send_text(ws, self._encode_frame(reply))
         elif isinstance(frame, HostFsRequestFrame):
             # Git status and directory walks can block, so run the read
             # off the event loop and reply when it completes.
             fs_result = await asyncio.to_thread(self._handle_fs_request, frame)
-            await self._send_text(ws, encode_host_frame(fs_result))
+            await self._send_text(ws, self._encode_frame(fs_result))
         elif isinstance(frame, HostFsWriteFrame):
             # gh/git writes can block; run off the event loop and reply back.
             fs_write_result = await asyncio.to_thread(self._handle_fs_write, frame)
-            await self._send_text(ws, encode_host_frame(fs_write_result))
+            await self._send_text(ws, self._encode_frame(fs_write_result))
         elif isinstance(frame, HostSkillsFrame):
             skills_result = await asyncio.to_thread(self._handle_skills, frame)
-            await self._send_text(ws, encode_host_frame(skills_result))
+            await self._send_text(ws, self._encode_frame(skills_result))
         elif isinstance(frame, HostPluginsFrame):
             plugins_result = await asyncio.to_thread(self._handle_plugins, frame)
-            await self._send_text(ws, encode_host_frame(plugins_result))
+            await self._send_text(ws, self._encode_frame(plugins_result))
         elif isinstance(frame, HostSkillContentFrame):
             content_result = await asyncio.to_thread(self._handle_skill_content, frame)
-            await self._send_text(ws, encode_host_frame(content_result))
+            await self._send_text(ws, self._encode_frame(content_result))
+        elif isinstance(frame, HostSetMcpServerEnabledFrame):
+            enabled_result = await asyncio.to_thread(self._handle_set_mcp_server_enabled, frame)
+            await self._send_text(ws, self._encode_frame(enabled_result))
         elif isinstance(frame, HostMcpToolsFrame):
             tools_result = await self._handle_mcp_tools(frame)
-            await self._send_text(ws, encode_host_frame(tools_result))
+            await self._send_text(ws, self._encode_frame(tools_result))
         elif isinstance(frame, HostHarnessStartupFrame):
             startup_result = await asyncio.to_thread(self._handle_harness_startup, frame)
-            await self._send_text(ws, encode_host_frame(startup_result))
+            await self._send_text(ws, self._encode_frame(startup_result))
         elif isinstance(frame, HostMcpServersFrame):
             mcp_result = await asyncio.to_thread(self._handle_mcp_servers, frame)
-            await self._send_text(ws, encode_host_frame(mcp_result))
+            await self._send_text(ws, self._encode_frame(mcp_result))
         elif isinstance(frame, HostModelOptionsFrame):
             # Every dispatched frame already runs on its own task (see
             # _start_frame_task), so a cold harness probe here cannot stall
@@ -5930,7 +6391,7 @@ class HostProcess:
                     status="failed",
                     error=f"model options resolution crashed for {frame.harness!r}",
                 )
-            await self._send_text(ws, encode_host_frame(options_result))
+            await self._send_text(ws, self._encode_frame(options_result))
         elif isinstance(frame, (HostImportLocalFrame, HostImportLocalByIdFrame)):
             # Streams one host.import_local_session per session (reads run off the
             # event loop inside), then a terminal host.import_local_done.
@@ -6022,6 +6483,7 @@ def run_host_process(
     daemon_target: str | None = None,
     lifecycle_lock: DaemonLifecycleLock | None = None,
     interactive_shells: list[str] | None = None,
+    server_still_ours: Callable[[], bool] | None = None,
 ) -> None:
     """Entry point for ``omnigent host``.
 
@@ -6041,11 +6503,22 @@ def run_host_process(
         for the host process lifetime instead of acquiring another handle.
     :param interactive_shells: Optional shell inventory override for tests.
         By default the host discovers its installed shells once at startup.
+    :param server_still_ours: Local-mode ownership check; see :class:`HostProcess`.
     :raises SystemExit: With :data:`HOST_FATAL_EXIT_CODE` when the tunnel
         fails permanently (auth / authorization / outdated server, or a
         loopback server that is gone). The actionable cause is printed
         to stderr first.
     """
+    from omnigent.cli_auth import pin_databricks_org_id
+    from omnigent.telemetry.request_headers import set_client_component
+    from omnigent.util.server_url import ServerUrl, is_workspace_hosted_url
+
+    # Foreground (`omnigent host`) and daemon hosts both identify as the host.
+    set_client_component("host")
+    if is_workspace_hosted_url(server_url):
+        # Foreground hosts need the same snapshot as auto-launched daemons.
+        # Pinning absence prevents later login metadata retargeting runners.
+        pin_databricks_org_id(server_url, ServerUrl.from_api_base(server_url).org_id)
     # Before any startup work logs, so its earliest debug-log rows are attributed.
     publish_origin_identity(server_url)
     # The loop prints and logs to the terminal; one that stops reading must not stall it.
@@ -6075,6 +6548,7 @@ def run_host_process(
             daemon_target=daemon_target,
             lifecycle_lock=lifecycle_lock,
             interactive_shells=interactive_shells,
+            server_still_ours=server_still_ours,
         )
     except BaseException as exc:
         # A stop signal already being handled owns the exit: never returns then.
@@ -6124,6 +6598,7 @@ def _serve_host_until_exit(
     daemon_target: str | None,
     lifecycle_lock: DaemonLifecycleLock | None,
     interactive_shells: list[str] | None,
+    server_still_ours: Callable[[], bool] | None = None,
 ) -> bool:
     """Run the host until it exits; see :func:`run_host_process`.
 
@@ -6215,7 +6690,9 @@ def _serve_host_until_exit(
         server_url,
         lifecycle_lock=lifecycle_lock,
         interactive_shells=interactive_shells,
+        server_still_ours=server_still_ours,
     )
+    crash_reporting.set_hangup_callback(host.signal_runners_finish_work)
     try:
         asyncio.run(host.run())
     except HostConnectError as exc:
@@ -6232,4 +6709,8 @@ def _serve_host_until_exit(
             stderr=True,
         )
         raise SystemExit(HOST_FATAL_EXIT_CODE) from exc
+    finally:
+        # Serving is over: drop the callback so a hangup during the exit-drain
+        # window cannot signal runners through a torn-down host.
+        crash_reporting.set_hangup_callback(None)
     return host.lifecycle_lost

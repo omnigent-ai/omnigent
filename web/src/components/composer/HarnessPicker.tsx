@@ -41,6 +41,7 @@ const PickerInteractionContext = createContext<{
   onPointerInteraction: () => void;
   onKeyboardInteraction: () => void;
   closeMenu: () => void;
+  flyoutBoundary: HTMLElement | undefined;
 } | null>(null);
 
 function usePickerInteraction() {
@@ -56,8 +57,12 @@ function useMenuInteractionProps(configOpen = false) {
     "data-initial-selection": interaction.showInitialSelection || undefined,
     onPointerEnter: interaction.onPointerInteraction,
     onPointerLeave: interaction.onPointerInteraction,
+    onPointerOutCapture: (event: SyntheticEvent<HTMLElement>) => {
+      if (event.currentTarget.dataset.state === "closed") event.preventDefault();
+    },
     onPointerDownCapture: interaction.onPointerInteraction,
     onPointerMoveCapture: (event: SyntheticEvent<HTMLElement>) => {
+      if (event.currentTarget.dataset.state === "closed") return event.preventDefault();
       interaction.onPointerInteraction();
       if (configOpen && event.currentTarget.contains(event.target as Node)) event.preventDefault();
     },
@@ -136,11 +141,13 @@ function focusSelectedMenuItem(content: HTMLElement): void {
 export function HarnessPickerSubContent({
   focusSelected = false,
   onSelectedFocus,
+  className,
   ...props
 }: ComponentProps<typeof DropdownMenuSubContent> & {
   focusSelected?: boolean;
   onSelectedFocus?: () => void;
 }) {
+  const { flyoutBoundary } = usePickerInteraction();
   const interactionProps = useMenuInteractionProps();
   const [content, setContent] = useState<HTMLDivElement | null>(null);
   useLayoutEffect(() => {
@@ -148,7 +155,19 @@ export function HarnessPickerSubContent({
     focusSelectedMenuItem(content);
     if (content.contains(content.ownerDocument.activeElement)) onSelectedFocus?.();
   }, [content, focusSelected, onSelectedFocus]);
-  return <DropdownMenuSubContent {...props} {...interactionProps} ref={setContent} />;
+  return (
+    <DropdownMenuSubContent
+      collisionBoundary={flyoutBoundary}
+      // When neither side has room, slide back over the parent menu to stay inside the boundary.
+      className={cn(
+        "data-[side=left]:translate-x-[max(0px,calc(100%-var(--radix-dropdown-menu-content-available-width)))] data-[side=right]:translate-x-[min(0px,calc(var(--radix-dropdown-menu-content-available-width)-100%))]",
+        className,
+      )}
+      {...props}
+      {...interactionProps}
+      ref={setContent}
+    />
+  );
 }
 
 function CyclePreview({ section, hint }: { section: ComposerConfigSection; hint?: string }) {
@@ -214,6 +233,10 @@ export function HarnessPicker({
   const previewFocus = useRef<HTMLElement | null>(null);
   const previewActive = useRef(previewOnly);
   previewActive.current = previewOnly;
+  // The Workspace rail can show the embedded browser, a native view drawn over all HTML,
+  // so flyouts flip within the trigger's pane instead of opening over the rail.
+  const [triggerNode, setTriggerNode] = useState<HTMLElement | null>(null);
+  const flyoutBoundary = triggerNode?.closest<HTMLElement>("[data-flyout-boundary]") ?? undefined;
   // Programmatic focus can retain :focus-visible during pointer-only interaction.
   const [pointerInteraction, setPointerInteraction] = useState(false);
   const [hasMenuInteraction, setHasMenuInteraction] = useState(false);
@@ -243,13 +266,22 @@ export function HarnessPicker({
         onDismissCyclePreview?.();
         onOpenChange(false);
       },
+      flyoutBoundary,
     }),
-    [open, pointerInteraction, hasMenuInteraction, onOpenChange, onDismissCyclePreview],
+    [
+      open,
+      pointerInteraction,
+      hasMenuInteraction,
+      onOpenChange,
+      onDismissCyclePreview,
+      flyoutBoundary,
+    ],
   );
   const menuTrigger = (
     <DropdownMenuTrigger asChild>
       <ComposerHarnessTrigger
         {...trigger}
+        ref={setTriggerNode}
         data-pointer-interaction={pointerInteraction || undefined}
         className={cn("data-[pointer-interaction=true]:focus-visible:ring-0", trigger.className)}
         onPointerDownCapture={(event) => {

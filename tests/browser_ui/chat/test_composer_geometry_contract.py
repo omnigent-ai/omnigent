@@ -162,6 +162,8 @@ def test_landing_and_live_cards_share_the_geometry_contract(
     for surface in ("landing", "live"):
         _surface(page, chat, surface, viewport)
         card_locator = page.locator("[data-composer-card]")
+        if viewport["width"] < 1181:
+            expect(card_locator).to_have_attribute("data-mobile-composer", "collapsed")
         card = box(card_locator)
         container = box(card_locator.locator(".."))
         assert_symmetric_insets(card, container)
@@ -170,7 +172,8 @@ def test_landing_and_live_cards_share_the_geometry_contract(
         assert_within_viewport(box(_submit(page, surface)), viewport["width"])
         assert document_width(page) <= viewport["width"]
         submit = box(_submit(page, surface))
-        if touch:
+        mobile_layout = viewport["width"] < 1181
+        if mobile_layout:
             assert submit["width"] >= 44 and submit["height"] >= 44
         else:
             assert submit["height"] < 44
@@ -183,7 +186,7 @@ def test_landing_and_live_cards_share_the_geometry_contract(
         expect(menu).to_be_visible()
         _settle_menu(menu)
         assert_within_viewport(box(menu), viewport["width"])
-        if touch:
+        if mobile_layout:
             for row in menu.get_by_role("menuitem").all():
                 bounds = box(row)
                 assert bounds["width"] >= 44 and bounds["height"] >= 44
@@ -242,6 +245,22 @@ def test_content_and_action_controls_follow_shared_inset_lines(
 
 
 @pytest.mark.parametrize("surface", ["landing", "live"])
+def test_long_draft_keeps_submit_visible_above_phone_keyboard(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    surface: str,
+) -> None:
+    """A capped draft scrolls inside the input while Send stays on screen."""
+    # The iOS shell sizes the app to the area above the docked keyboard.
+    viewport = {"width": 390, "height": 420}
+    _surface(page, chat_session_contract, surface, viewport)
+    _input(page, surface).fill("Lorem ipsum dolor sit amet " * 60)
+    submit = box(_submit(page, surface))
+    assert submit["y"] >= -TOLERANCE
+    assert submit["y"] + submit["height"] <= viewport["height"] + TOLERANCE
+
+
+@pytest.mark.parametrize("surface", ["landing", "live"])
 def test_label_collapse_preserves_submit_geometry(
     page: Page,
     chat_session_contract: ChatSessionContract,
@@ -264,12 +283,12 @@ def test_label_collapse_preserves_submit_geometry(
     _surface(page, chat, surface, DESKTOP)
     card_locator = page.locator("[data-composer-card]")
     expanded_inset = right_inset(box(card_locator), box(_submit(page, surface)))
-    # Exercise the narrowest common phone width after the mobile composer
-    # adopted 24px outer gutters.
+    assert expanded_inset == pytest.approx(13, abs=TOLERANCE)
+    # Mobile keeps an 8px action inset inside its 16px screen gutters.
     page.set_viewport_size({"width": 320, "height": PHONE["height"]})
     expect(_action_row(page, surface)).to_have_attribute("data-labels", "collapsed")
     collapsed_inset = right_inset(box(card_locator), box(_submit(page, surface)))
-    assert collapsed_inset == pytest.approx(expanded_inset, abs=TOLERANCE)
+    assert collapsed_inset == pytest.approx(8, abs=TOLERANCE)
     leading = (
         page.get_by_test_id("new-chat-landing-attach")
         if surface == "landing"
@@ -408,7 +427,7 @@ def test_slash_rows_follow_the_row_grid(
     assert left == pytest.approx(right, abs=TOLERANCE)
 
 
-def test_mention_chips_follow_the_row_grid(
+def test_mention_tokens_overlay_the_textarea_text(
     page: Page,
     chat_session_contract: ChatSessionContract,
 ) -> None:
@@ -441,15 +460,22 @@ def test_mention_chips_follow_the_row_grid(
         option = page.get_by_role("option", name=re.compile(name))
         expect(option).to_be_visible()
         option.get_by_role("button", name=name).click()
-    chips = [box(page.locator(f"span[title='{name}']").locator("..")) for name in names]
-    for chip in chips[1:]:
-        assert chip["height"] == pytest.approx(chips[0]["height"], abs=TOLERANCE)
-        assert_same_vertical_center(chips[0], chip)
-    gaps = [
-        chips[index + 1]["x"] - chips[index]["x"] - chips[index]["width"] for index in range(2)
-    ]
-    assert gaps[0] == pytest.approx(gaps[1], abs=TOLERANCE)
-    assert chips[0]["x"] == pytest.approx(box(composer)["x"], abs=TOLERANCE)
+    # Picked files are inline tokens; the mirror that paints them as pills must
+    # sit exactly over the textarea so each pill covers its own glyphs.
+    expect(composer).to_have_value("@alpha.md @beta.md @gamma.md ")
+    tokens = page.get_by_test_id("composer-mention-token")
+    expect(tokens).to_have_count(len(names))
+    pills = [box(tokens.nth(index)) for index in range(len(names))]
+    for pill in pills[1:]:
+        assert pill["height"] == pytest.approx(pills[0]["height"], abs=TOLERANCE)
+        assert_same_vertical_center(pills[0], pill)
+    # The first token starts the text, so its pill starts where the textarea's
+    # text does; the mirror is pinned to the textarea's top and height.
+    field = box(composer)
+    assert pills[0]["x"] == pytest.approx(field["x"], abs=TOLERANCE)
+    mirror = box(page.get_by_test_id("composer-highlight-overlay"))
+    for edge in ("y", "height"):
+        assert mirror[edge] == pytest.approx(field[edge], abs=TOLERANCE)
 
 
 @pytest.mark.parametrize("surface", ["landing", "live"])
@@ -598,6 +624,41 @@ def test_picker_rows_follow_the_row_grid(
         choice_xs = [box(choice_labels.nth(index))["x"] for index in range(choice_labels.count())]
         assert max(choice_xs) - min(choice_xs) <= TOLERANCE
         assert choice_xs[0] - box(navigation_labels[0])["x"] > TOLERANCE
+
+
+def test_model_flyout_stays_inside_the_chat_beside_the_workspace(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    chat = chat_session_contract
+    chat.set_catalog(
+        harness="claude-native",
+        models=[model_option("sonnet", display_name="Sonnet 5", is_default=True)],
+        selected_model="sonnet",
+    )
+    chat.update_session(labels={"omnigent.wrapper": "claude-code-native-ui"})
+    open_live(page, chat, DESKTOP)
+    page.get_by_role("button", name="Expand right panel").click()
+    workspace = page.get_by_role("complementary", name="Workspace")
+    expect(workspace).to_be_visible()
+    workspace.evaluate(
+        "el => Promise.all(el.getAnimations().map(animation => animation.finished))"
+    )
+    page.get_by_test_id("composer-config-gear").click()
+    page.get_by_test_id("composer-agent-edit").click()
+    flyout_menu = page.get_by_test_id("composer-agent-config-menu")
+    expect(flyout_menu).to_be_visible()
+    _settle_menu(flyout_menu)
+    chat_pane = box(page.get_by_role("main"))
+    picker = box(page.locator(".composer-agent-menu:not(.composer-agent-config-menu)"))
+    flyout = box(flyout_menu)
+    rail_left = box(workspace)["x"]
+    # The flyout fits on neither side of the picker inside this pane.
+    assert picker["x"] + picker["width"] + flyout["width"] > rail_left
+    assert picker["x"] - flyout["width"] < chat_pane["x"]
+    assert flyout["x"] >= chat_pane["x"] - TOLERANCE
+    pane_right = min(rail_left, chat_pane["x"] + chat_pane["width"])
+    assert flyout["x"] + flyout["width"] <= pane_right + TOLERANCE
 
 
 @pytest.mark.parametrize("surface", ["landing", "live"])
@@ -1092,7 +1153,8 @@ def test_composer_growth_reflows_without_covering_output(
     baseline = settled_geometry(page)
 
     def assert_clearance(state: dict, label: str) -> None:
-        assert abs(state["overlap"]) <= TOLERANCE, (label, state)
+        expected_overlap = state["overlayHeight"] if state["mobileOverlay"] else 0
+        assert state["overlap"] == pytest.approx(expected_overlap, abs=TOLERANCE), (label, state)
         assert state["lastMessageBottom"] <= state["composerTop"] + TOLERANCE, (label, state)
         assert state["formMarginTop"] == 0, (label, state)
         assert state["distanceFromBottom"] <= TOLERANCE, (label, state)
@@ -1172,13 +1234,13 @@ def test_composer_growth_reflows_without_covering_output(
     composer.click()
     touch_baseline = settled_geometry(page)
     assert_clearance(touch_baseline, "native touch baseline")
-    # Keep touch input emulated while measuring: ending it resizes touch-sized targets.
     with native_touch_emulation(page) as touch_session:
         touch = scroll_with_native_touch(page, touch_session)
         assert touch["settledDistance"] > 100, touch
         assert touch["settledScrollTop"] < touch["initialScrollTop"], touch
         assert "pointercancel" in touch["events"] and "scroll" in touch["events"], touch
         assert touch["events"].index("pointercancel") < touch["events"].index("scroll"), touch
+        assert touch["events"][-1] == "scrollend", touch
         touch_settled = settled_geometry(page)
         assert touch_settled["distanceFromBottom"] == pytest.approx(
             touch["settledDistance"], abs=8
@@ -1186,9 +1248,15 @@ def test_composer_growth_reflows_without_covering_output(
         composer.press("Shift+Enter")
         touch_grown = settled_geometry(page)
         assert_reader_anchor(touch_settled, touch_grown, "native touch composer growth")
-        assert abs(touch_grown["overlap"]) <= TOLERANCE
+        assert touch_grown["overlap"] == pytest.approx(touch_grown["overlayHeight"], abs=TOLERANCE)
 
     page.set_viewport_size({"width": 1280, "height": 720})
+    # Rows measured under touch keep their larger message-font heights after
+    # unmounting; reload so the desktop checks start from desktop measurements.
+    page.reload()
+    expect(page.get_by_text("Turn 20 response", exact=False).first).to_be_visible()
+    composer = page.get_by_label("Message the agent")
+    composer.click()
     composer.fill("")
     settled_geometry(page)
     scroll_to_distance_from_bottom(page, 180)
@@ -1313,6 +1381,48 @@ def test_composer_growth_stays_bottom_pinned_every_frame(
     assert grown["distanceFromBottom"] <= TOLERANCE
 
 
+def test_phone_composer_growth_keeps_the_bottom_through_a_scroll_before_remeasure(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    chat = chat_session_contract
+    seed_long_transcript(chat, 20)
+    open_live(page, chat, PHONE)
+    # After a reload, rows measuring shorter than their estimates can clamp the
+    # scroll position, which releases StickToBottom's lock at the bottom; then
+    # only the composer growth pin holds it.
+    page.reload()
+    expect(page.get_by_text("Turn 20 response", exact=False).first).to_be_visible()
+    start = settled_geometry(page)
+    assert start["mobileOverlay"], start
+    assert start["distanceFromBottom"] <= TOLERANCE, start
+    # Until the overlay re-measures, a grown composer shortens the transcript's
+    # viewport. A scroll event read in that window (in practice the growth pin's
+    # own, a frame late) is not the reader leaving the bottom.
+    stale = page.evaluate(
+        """() => {
+          const ta = document.querySelector('textarea[aria-label="Message the agent"]');
+          const form = ta.closest('form');
+          const scroller = form.parentElement.querySelector('[role="log"] > div');
+          const surface = form.closest('[data-chat-surface]');
+          form.style.minHeight = `${form.getBoundingClientRect().height + 40}px`;
+          const stale = {
+            overlayHeight: Math.round(parseFloat(
+              getComputedStyle(surface).getPropertyValue('--session-composer-height')) || 0),
+            distanceFromBottom: Math.round(
+              scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop),
+          };
+          scroller.dispatchEvent(new Event('scroll'));
+          return stale;
+        }"""
+    )
+    assert stale["overlayHeight"] == pytest.approx(start["overlayHeight"], abs=TOLERANCE), stale
+    assert stale["distanceFromBottom"] > TOLERANCE, (start, stale)
+    grown = settled_geometry(page)
+    assert grown["overlayHeight"] == pytest.approx(start["overlayHeight"] + 40, abs=TOLERANCE)
+    assert grown["distanceFromBottom"] <= TOLERANCE, (start, grown)
+
+
 def _single_reply(chat: ChatSessionContract, words: int) -> None:
     seed_items(
         chat,
@@ -1354,13 +1464,14 @@ def test_fully_visible_transcript_paints_no_scrollbar(
 ) -> None:
     chat = chat_session_contract
     _single_reply(chat, 140)
-    open_live(page, chat, {"width": 1400, "height": 800})
+    open_live(page, chat, {"width": 1400, "height": 900})
     page.get_by_role("button", name="Expand right panel").click()
     expect(page.get_by_role("complementary", name="Workspace")).to_be_visible()
     expect(page.get_by_text("word0000", exact=False)).to_be_visible()
     page.wait_for_timeout(1200)
     state = _fully_visible_state(page)
     assert state["first"] >= state["top"] and state["last"] <= state["bottom"] - 32
+    assert state["max"] <= TOLERANCE, state
     assert not state["thumb"], state
 
 
@@ -1416,7 +1527,8 @@ def test_scrollbar_thumb_drags_by_touch(
 ) -> None:
     chat = chat_session_contract
     seed_long_transcript(chat, 30, paragraphs=6)
-    open_live(page, chat, {"width": 800, "height": 1280})
+    # Desktop layout: the mobile composer overlays the thumb parked at the bottom.
+    open_live(page, chat, {"width": 1200, "height": 1280})
     tag_scroller(page)
     expect(page.get_by_test_id("transcript-scrollbar-thumb")).to_be_visible()
     bottom = park_at_bottom(page)

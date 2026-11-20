@@ -1016,13 +1016,45 @@ def test_invalid_new_thread_coordinates_never_reach_github(
     assert calls == []
 
 
+_PINNED_READS = {
+    "patch": (
+        github._pr_patch_at_revision,
+        "patch",
+        {"object": "session.github.pr_diff", "patch": "patch"},
+    ),
+    "changed_files": (
+        github._pr_changed_files_at_revision,
+        json.dumps([[{"filename": "a.py", "status": "modified"}]]),
+        {
+            "object": "list",
+            "data": [
+                {
+                    "object": "session.github.changed_file",
+                    "path": "a.py",
+                    "name": "a.py",
+                    "status": "modified",
+                    "lines_added": None,
+                    "lines_removed": None,
+                    "previous_path": None,
+                }
+            ],
+            "has_more": False,
+            "total_count": 1,
+        },
+    ),
+}
+
+
+@pytest.mark.parametrize("read", sorted(_PINNED_READS))
 @pytest.mark.parametrize("move_during_fetch", [False, True])
-def test_review_patch_checks_revision_before_and_after_fetch(
+def test_pinned_read_checks_revision_before_and_after_fetch(
     monkeypatch: pytest.MonkeyPatch,
     reference: PullRequestRef,
     move_during_fetch: bool,
+    read: str,
 ) -> None:
-    original = {"head": {"sha": "a" * 40}, "base": {"sha": "b" * 40}}
+    function, fetched, expected = _PINNED_READS[read]
+    original = {"head": {"sha": "a" * 40}, "base": {"sha": "b" * 40}, "changed_files": 1}
     final = {**original, "head": {"sha": "c" * 40}} if move_during_fetch else original
     calls: list[GhCall] = []
     monkeypatch.setattr(
@@ -1032,22 +1064,17 @@ def test_review_patch_checks_revision_before_and_after_fetch(
             calls,
             [
                 (0, json.dumps(original), ""),
-                (0, "patch", ""),
+                (0, fetched, ""),
                 (0, json.dumps(final), ""),
             ],
         ),
     )
     if move_during_fetch:
         with pytest.raises(ValueError, match="pull request changed"):
-            github._pr_patch_at_revision(
-                "/workspace", reference, head_sha="a" * 40, base_sha="b" * 40
-            )
+            function("/workspace", reference, head_sha="a" * 40, base_sha="b" * 40)
     else:
-        assert github._pr_patch_at_revision(
-            "/workspace", reference, head_sha="a" * 40, base_sha="b" * 40
-        ) == {
-            "object": "session.github.pr_diff",
-            "patch": "patch",
+        assert function("/workspace", reference, head_sha="a" * 40, base_sha="b" * 40) == {
+            **expected,
             "head_sha": "a" * 40,
             "base_sha": "b" * 40,
         }

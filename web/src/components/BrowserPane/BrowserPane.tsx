@@ -25,6 +25,12 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
+import {
+  ADDRESS_BAR_KEYS,
+  MOD_KEY,
+  RELOAD_KEYS,
+  shortcutText,
+} from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -42,10 +48,12 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 
+import { useDesktopCommand } from "@/lib/desktopCommands";
 import {
   getDesktopFeatures,
   navigationHostOptions,
   supportsBrowser,
+  supportsDesktopCommands,
   type BrowserHostOptions,
   type ChromeCookieImportResult,
   type ChromeCookiePreviewResult,
@@ -54,6 +62,12 @@ import { browserViewOwnerId } from "@/lib/browserTabs";
 import { fetchSessionHostId } from "@/lib/fetchSessionHostId";
 import { normalizeTypedUrl } from "@/lib/normalizeTypedUrl";
 import { cn } from "@/lib/utils";
+// Say when the tab's page is open in another desktop window.
+import { OpenElsewhereHint } from "@/components/BrowserPane/agentTools/OpenElsewhereHint";
+import {
+  DesktopDesignTools,
+  useHasDesktopDesignTools,
+} from "@/components/BrowserPane/designTools/LazyDesktopDesignTools";
 
 /** Renderer CSS-pixel bounds pushed to the main process (converted to window
  *  DIPs there via the host zoom factor). */
@@ -77,7 +91,10 @@ interface NavResult {
  *  component doesn't depend on the full nativeBridge type; every method is
  *  optional (an older shell may predate the browser feature). */
 interface BrowserPaneBridge {
-  browserSetActive?: (conversationId: string | null) => Promise<{ ok: boolean; error?: string }>;
+  browserSetActive?: (
+    conversationId: string | null,
+    options?: { focus?: boolean },
+  ) => Promise<{ ok: boolean; error?: string }>;
   browserResize?: (
     conversationId: string,
     bounds: Bounds,
@@ -155,6 +172,9 @@ export interface BrowserPaneProps {
   active?: boolean;
   /** Extra classes for the measuring placeholder wrapper. */
   className?: string;
+  /** Take keyboard focus once, in the address bar or the page, then call `onFocused`. */
+  focus?: "address" | "page" | null;
+  onFocused?: () => void;
 }
 
 /**
@@ -166,8 +186,12 @@ export function BrowserPane({
   className,
   agentBrowser = true,
   active = true,
+  focus = null,
+  onFocused,
 }: BrowserPaneProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const toolbarRef = useRef<HTMLDivElement | null>(null);
+  const addressBarRef = useRef<HTMLInputElement | null>(null);
   const lastBoundsRef = useRef<Bounds | null>(null);
   const browserSupported = supportsBrowser();
   // A detached view still exists; only `active` controls its attachment.
@@ -178,9 +202,14 @@ export function BrowserPane({
   // the arrow buttons.
   const [currentUrl, setCurrentUrl] = useState("");
   const [navigationError, setNavigationError] = useState<string | null>(null);
+  // The page the view has loaded, not what's typed in the address bar: the design tools'
+  // requests name it.
+  const [pageUrl, setPageUrl] = useState("");
   // Ref (not state): read synchronously in the url-changed listener; a
   // stale-closure state read would race.
   const urlEditingRef = useRef(false);
+  // Counts url-changed events, so an older view probe can't overwrite a newer URL.
+  const urlEventsRef = useRef(0);
   const submitSequenceRef = useRef(0);
   useEffect(
     () => () => {
@@ -194,6 +223,8 @@ export function BrowserPane({
   // routing lives in AppShell. This flag only drives the button + enable/disable IPC.
   const [designMode, setDesignMode] = useState(false);
   const designModeRef = useRef(false);
+  // The design tools replace design mode, unless the shell predates them or they can't load.
+  const hasDesignTools = useHasDesktopDesignTools();
   // "Import cookies from Chrome" needs BOTH an optional bridge method (older
   // shells predate it) and the shell's desktop feature flag (macOS only).
   const [cookieImportSupported, setCookieImportSupported] = useState(false);
@@ -218,14 +249,21 @@ export function BrowserPane({
     if (!bridge) return;
     let cancelled = false;
     let viewChanged = false;
+    const urlEvents = urlEventsRef.current;
 
     // A newer lifecycle event takes precedence over this asynchronous snapshot.
     void bridge.browserHasView?.(conversationId).then((r) => {
       if (!cancelled && !viewChanged && r?.exists) {
         setHasView(true);
-        if (!urlEditingRef.current && r.url) setCurrentUrl(r.url);
-        setCanGoBack(!!r.canGoBack);
-        setCanGoForward(!!r.canGoForward);
+        // A navigation since it asked brought its own URL and back/forward state.
+        const fresh = urlEventsRef.current === urlEvents;
+        const url = fresh ? r.url : undefined;
+        if (url) setPageUrl(url);
+        if (!urlEditingRef.current && url) setCurrentUrl(url);
+        if (fresh) {
+          setCanGoBack(!!r.canGoBack);
+          setCanGoForward(!!r.canGoForward);
+        }
       }
     });
 
@@ -238,6 +276,7 @@ export function BrowserPane({
       if (payload.conversationId !== conversationId) return;
       viewChanged = true;
       setHasView(false);
+      setPageUrl("");
       setCanGoBack(false);
       setCanGoForward(false);
     });
@@ -257,6 +296,8 @@ export function BrowserPane({
     if (!bridge) return;
     const unsubUrl = bridge.onBrowserUrlChanged?.((payload) => {
       if (payload.conversationId !== conversationId) return;
+      urlEventsRef.current += 1;
+      setPageUrl(payload.url);
       if (urlEditingRef.current) return;
       setCurrentUrl(payload.url);
     });
@@ -326,6 +367,32 @@ export function BrowserPane({
     const bridge = getBridge();
     void bridge?.browserReload?.(conversationId);
   }, [conversationId]);
+
+  // Desktop Reload (⌘R) from this toolbar reloads the page rather than the app;
+  // Focus Address Bar (⌘L) selects the address. (A focused page reloads itself in the shell.)
+  useDesktopCommand(
+    "reload",
+    active
+      ? () => {
+          if (!toolbarRef.current?.contains(document.activeElement)) return false;
+          handleReload();
+          return true;
+        }
+      : null,
+    { priority: 10 },
+  );
+  useDesktopCommand(
+    "focus-address-bar",
+    active
+      ? () => {
+          addressBarRef.current?.focus();
+          addressBarRef.current?.select();
+        }
+      : null,
+  );
+  // Chords in the toolbar's native titles; DOM tooltips here could sit under the page.
+  const chord = (label: string, keys: readonly string[]) =>
+    supportsDesktopCommands() ? `${label} (${shortcutText(keys)})` : label;
 
   const handleDevTools = useCallback(() => {
     const bridge = getBridge();
@@ -445,6 +512,14 @@ export function BrowserPane({
     }
   }, [hasView, active, designMode]);
 
+  // The tools loading late (their chunk retried) replace design mode: turn its picker off.
+  useEffect(() => {
+    if (!hasDesignTools || !designMode) return;
+    designModeRef.current = false;
+    void getBridge()?.browserDisableDesignMode?.(conversationId);
+    setDesignMode(false);
+  }, [hasDesignTools, designMode, conversationId]);
+
   // Measure the placeholder and push bounds to the main process. These are
   // renderer CSS pixels; the main process converts to WebContentsView DIPs
   // using the host zoom factor (they diverge after Cmd+/Cmd- zoom).
@@ -513,6 +588,19 @@ export function BrowserPane({
       }
     };
   }, [conversationId, browserSupported, hasView, active, syncBounds]);
+
+  // A tab just opened takes focus in its address bar, as in a browser; one the
+  // user returns to gets it back where it was. The page needs its view attached.
+  useEffect(() => {
+    if (focus === "address") {
+      addressBarRef.current?.focus();
+    } else if (focus === "page" && hasView && active) {
+      void getBridge()?.browserSetActive?.(conversationId, { focus: true });
+    } else {
+      return;
+    }
+    onFocused?.();
+  }, [focus, hasView, active, conversationId, onFocused]);
 
   // Reconcile bounds every frame while shown (cheap: same-rect setBounds is a
   // no-op + we dedupe via lastBoundsRef). Catches position-only shifts that
@@ -593,13 +681,16 @@ export function BrowserPane({
       className={cn("flex min-h-0 min-w-0 flex-col", className)}
       data-browser-pane-conversation={conversationId}
     >
-      <div className="flex shrink-0 items-center gap-1 border-border border-b bg-card px-2 py-1.5">
+      <div
+        ref={toolbarRef}
+        className="flex shrink-0 items-center gap-1 border-border border-b bg-card px-2 py-1.5"
+      >
         <button
           type="button"
           onClick={handleBack}
           disabled={!canGoBack}
           aria-label="Go back"
-          title="Back"
+          title={chord("Back", [MOD_KEY, "["])}
           className="flex size-6 items-center justify-center rounded text-foreground hover:bg-muted disabled:pointer-events-none disabled:opacity-40"
         >
           <ChevronLeftIcon className="size-4" />
@@ -609,7 +700,7 @@ export function BrowserPane({
           onClick={handleForward}
           disabled={!canGoForward}
           aria-label="Go forward"
-          title="Forward"
+          title={chord("Forward", [MOD_KEY, "]"])}
           className="flex size-6 items-center justify-center rounded text-foreground hover:bg-muted disabled:pointer-events-none disabled:opacity-40"
         >
           <ChevronRightIcon className="size-4" />
@@ -619,7 +710,7 @@ export function BrowserPane({
           onClick={handleReload}
           disabled={!hasView}
           aria-label="Reload"
-          title="Reload"
+          title={chord("Reload", RELOAD_KEYS)}
           className="flex size-6 items-center justify-center rounded text-foreground hover:bg-muted disabled:pointer-events-none disabled:opacity-40"
         >
           <RotateCwIcon className="size-4" />
@@ -630,8 +721,10 @@ export function BrowserPane({
           spellCheck={false}
           autoCorrect="off"
           autoCapitalize="off"
+          ref={addressBarRef}
           placeholder="Enter a URL"
           aria-label="Address bar"
+          title={chord("Address bar", ADDRESS_BAR_KEYS)}
           onChange={(e) => setCurrentUrl(e.target.value)}
           onFocus={() => {
             urlEditingRef.current = true;
@@ -670,9 +763,17 @@ export function BrowserPane({
             <CookieIcon className="size-4" />
           </button>
         )}
+        <DesktopDesignTools
+          viewId={conversationId}
+          hasView={hasView}
+          active={active}
+          url={pageUrl}
+          container={containerRef}
+        />
         <button
           type="button"
           onClick={handleToggleDesignMode}
+          hidden={hasDesignTools}
           disabled={!hasView}
           aria-pressed={designMode}
           aria-label={designMode ? "Exit design mode" : "Enter design mode"}
@@ -708,8 +809,10 @@ export function BrowserPane({
         <div ref={containerRef} className="ml-1 min-h-0 min-w-0 flex-1" />
       ) : (
         <div className="flex min-h-0 flex-1 items-center justify-center bg-card px-6 py-8 text-center text-muted-foreground text-ui">
-          Enter a URL above to get started
-          {agentBrowser ? " — the agent will open pages here too." : "."}
+          <OpenElsewhereHint viewId={conversationId}>
+            Enter a URL above to get started
+            {agentBrowser ? " — the agent will open pages here too." : "."}
+          </OpenElsewhereHint>
         </div>
       )}
       {/* DialogContent mounts SuppressBrowserView, hiding the native view. */}

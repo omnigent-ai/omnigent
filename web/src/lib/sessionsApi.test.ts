@@ -8,13 +8,16 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  ApiError,
   apiErrorFromResponse,
+  parseRetryAfterMs,
   approve,
   bindOnlyOnlineRunner,
   createBundledSession,
   createSession,
   createSideChat,
   exportSessionTranscript,
+  fetchRewindPrompts,
   fetchSessionItemsPage,
   fetchSessionRepositoryBranches,
   forkSession,
@@ -23,6 +26,7 @@ import {
   getSessionUsage,
   importLocalSessions,
   interrupt,
+  launchManagedHost,
   listRunners,
   openSessionStream,
   postEvent,
@@ -97,7 +101,43 @@ describe("fetchSessionRepositoryBranches", () => {
   });
 });
 
+describe("parseRetryAfterMs", () => {
+  it("reads delta-seconds and HTTP dates, and rejects anything else", () => {
+    const now = Date.parse("2026-11-04T00:00:00Z");
+    expect(parseRetryAfterMs("30", now)).toBe(30_000);
+    expect(parseRetryAfterMs(" 0 ", now)).toBe(0);
+    expect(parseRetryAfterMs("Wed, 04 Nov 2026 00:00:05 GMT", now)).toBe(5_000);
+    // A date already past means "now", not a negative wait.
+    expect(parseRetryAfterMs("Wed, 04 Nov 2026 00:00:00 GMT", now + 1_000)).toBe(0);
+    expect(parseRetryAfterMs(null, now)).toBeNull();
+    expect(parseRetryAfterMs("soon", now)).toBeNull();
+    // Malformed numbers aren't dates, so they mustn't read as "retry now".
+    expect(parseRetryAfterMs("-1", now)).toBeNull();
+    expect(parseRetryAfterMs("1.5", now)).toBeNull();
+    expect(parseRetryAfterMs("2026-11-04", now)).toBeNull();
+    // Looser date forms Date.parse would accept, read as "now" or a far-off wait.
+    expect(parseRetryAfterMs("Mon 1", now)).toBeNull();
+    expect(parseRetryAfterMs("January 1, 2027", now)).toBeNull();
+    expect(parseRetryAfterMs("Wednesday, 04-Nov-26 00:00:05 GMT", now)).toBeNull();
+  });
+});
+
 describe("apiErrorFromResponse", () => {
+  it("records the response's Retry-After for the retry policy", async () => {
+    const throttled = new Response(JSON.stringify({ error: { code: "rate_limited" } }), {
+      status: 429,
+      headers: { "Retry-After": "7" },
+    });
+    expect((await apiErrorFromResponse(throttled)).retryAfterMs).toBe(7_000);
+
+    const plain = new Response("{}", { status: 503 });
+    expect((await apiErrorFromResponse(plain)).retryAfterMs).toBeNull();
+    // Hand-built stand-ins have no headers at all.
+    expect(
+      (await apiErrorFromResponse(mockJsonResponse({}, { ok: false, status: 503 }))).retryAfterMs,
+    ).toBeNull();
+  });
+
   it("reads the AP `error` envelope (message + code)", async () => {
     const err = await apiErrorFromResponse(
       mockJsonResponse(
@@ -167,16 +207,20 @@ describe("createSession", () => {
       archived: false,
       status: "idle",
       createdAt: 1704067200,
+      updatedAt: null,
       title: null,
       items: [],
       queuedItems: undefined,
       contextWindow: undefined,
       labels: undefined,
       projectId: null,
+      sideChatParentId: null,
+      sideChatAllowed: null,
       lastTaskError: undefined,
       lastTotalTokens: undefined,
       usageIncluded: true,
       totalCostUsd: undefined,
+      costHidden: false,
       usageByModel: null,
       llmModel: undefined,
       harness: null,
@@ -186,6 +230,7 @@ describe("createSession", () => {
       reasoningEffort: undefined,
       pendingElicitations: [],
       pendingInputs: [],
+      failedInputs: [],
       permissionLevel: null,
       parentSessionId: null,
       subAgentName: null,
@@ -292,6 +337,98 @@ describe("createSession", () => {
     });
   });
 
+  it("files a host start in its project with the chosen directory and launch settings", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_run",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 1704067200,
+      }),
+    );
+
+    await createSession("agent_xyz", [], {
+      projectId: "proj_tests",
+      hostId: "host_1",
+      workflowId: "0123456789abcdef0123456789abcdef",
+      workspace: "/home/you/project",
+      labels: { "omnigent.ui": "terminal" },
+      terminalLaunchArgs: ["--permission-mode", "plan"],
+      modelOverride: "claude-opus-4-7",
+      reasoningEffort: "high",
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({
+      agent_id: "agent_xyz",
+      initial_items: [],
+      project_id: "proj_tests",
+      git: null,
+      host_id: "host_1",
+      workflow_id: "0123456789abcdef0123456789abcdef",
+      workspace: "/home/you/project",
+      labels: { "omnigent.ui": "terminal" },
+      terminal_launch_args: ["--permission-mode", "plan"],
+      model_override: "claude-opus-4-7",
+      reasoning_effort: "high",
+    });
+  });
+
+  it("asks for a managed sandbox, with its first message, for a sandbox start", async () => {
+    const created = () =>
+      mockJsonResponse({
+        id: "conv_run",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 1704067200,
+      });
+    fetchMock.mockResolvedValueOnce(created()).mockResolvedValueOnce(created());
+    const firstMessage = {
+      type: "message",
+      data: { role: "user", content: [{ type: "input_text", text: "Run it" }] },
+    };
+
+    await createSession("agent_xyz", [], {
+      projectId: "proj_tests",
+      sandbox: {
+        provider: "modal",
+        profileId: "profile_1",
+        profileRevision: "rev_1",
+        workspaces: ["https://github.com/example/app#main"],
+        hostId: "0123456789abcdef0123456789abcdef",
+      },
+      initialInput: firstMessage,
+      workflowId: "0123456789abcdef0123456789abcdef",
+    });
+    await createSession("agent_xyz", [], { sandbox: { provider: null, workspaces: [] } });
+
+    const bodies = fetchMock.mock.calls.map(([, init]) =>
+      JSON.parse((init as RequestInit).body as string),
+    );
+    expect(bodies[0]).toEqual({
+      agent_id: "agent_xyz",
+      initial_items: [],
+      project_id: "proj_tests",
+      workspace: null,
+      git: null,
+      host_type: "managed",
+      sandbox_provider: "modal",
+      sandbox_profile_id: "profile_1",
+      sandbox_profile_revision: "rev_1",
+      workspaces: ["https://github.com/example/app#main"],
+      host_id: "0123456789abcdef0123456789abcdef",
+      initial_input: firstMessage,
+      workflow_id: "0123456789abcdef0123456789abcdef",
+    });
+    // No provider leaves the choice to the server; no repositories is an empty workspace.
+    expect(bodies[1]).toEqual({
+      agent_id: "agent_xyz",
+      initial_items: [],
+      host_type: "managed",
+      workspaces: [],
+    });
+  });
+
   it("omits the optional fields entirely when no options are passed", async () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({
@@ -335,11 +472,12 @@ describe("createSession", () => {
     expect(session.queuedItems).toEqual(queued);
   });
 
-  it("maps pending_inputs (snake) to pendingInputs (camel) with content", async () => {
+  it("maps pending_inputs and failed_inputs (snake) to camel with content", async () => {
     // The snapshot replays un-consumed native web messages here so the
     // store re-hydrates the optimistic bubble on rebind. Each entry's
     // pending_id becomes the bubble's stable key and the content is
-    // carried through verbatim for rendering.
+    // carried through verbatim for rendering. Undelivered startup
+    // messages share the shape.
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({
         id: "conv_abc",
@@ -350,12 +488,26 @@ describe("createSession", () => {
         pending_inputs: [
           { pending_id: "pending_1", content: [{ type: "input_text", text: "queued" }] },
         ],
+        failed_inputs: [
+          {
+            pending_id: "pending_2",
+            content: [{ type: "input_text", text: "lost" }],
+            created_by: "alice@example.com",
+          },
+        ],
       }),
     );
 
     const session = await createSession("agent_xyz");
     expect(session.pendingInputs).toEqual([
       { pendingId: "pending_1", content: [{ type: "input_text", text: "queued" }] },
+    ]);
+    expect(session.failedInputs).toEqual([
+      {
+        pendingId: "pending_2",
+        content: [{ type: "input_text", text: "lost" }],
+        createdBy: "alice@example.com",
+      },
     ]);
   });
 
@@ -394,6 +546,23 @@ describe("createSession", () => {
 });
 
 describe("createBundledSession", () => {
+  it("uploads durable first input and its files with the agent bundle", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ session_id: "conv_bundle" }));
+    const task = {
+      type: "message",
+      data: { role: "user", content: [{ type: "input_text", text: "Review this file" }] },
+    };
+    const attachment = new File(["hello"], "task.txt");
+    await createBundledSession(
+      new File([], "agent.tar.gz"),
+      { host_type: "managed", initial_input: task },
+      [attachment],
+    );
+    const form = (fetchMock.mock.calls[0][1] as RequestInit).body as FormData;
+    expect(JSON.parse(form.get("metadata") as string).initial_input).toEqual(task);
+    expect(form.getAll("initial_files")).toEqual([attachment]);
+  });
+
   it("sends the local opt-out header when background titles are disabled", async () => {
     localStorage.setItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY, "off");
     fetchMock.mockResolvedValueOnce(
@@ -422,6 +591,8 @@ describe("forkSession", () => {
         agent_id: "agent_clone",
         status: "idle",
         created_at: 1704067200,
+        updated_at: 1704067260,
+        project_id: "proj_1",
         title: "Fork of My session",
         items: [],
       }),
@@ -439,6 +610,9 @@ describe("forkSession", () => {
     expect(session.id).toBe("conv_fork");
     expect(session.title).toBe("Fork of My session");
     expect(session.status).toBe("idle");
+    // The sidebar row built from this snapshot sorts and files by these.
+    expect(session.updatedAt).toBe(1704067260);
+    expect(session.projectId).toBe("proj_1");
   });
 
   it("forwards the title when provided", async () => {
@@ -648,6 +822,57 @@ describe("forkSession", () => {
   it("surfaces a non-ok response as a thrown error (e.g. 403 no access)", async () => {
     fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status: 403 }));
     await expect(forkSession("conv_src")).rejects.toThrow(/403/);
+  });
+});
+
+describe("launchManagedHost", () => {
+  const moved = { id: "conv_1", agent_id: "agent_1", status: "idle", created_at: 1, items: [] };
+
+  it("omits the provider and repository a move leaves to the server", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse(moved));
+
+    const session = await launchManagedHost("conv 1", { provider: null, workspace: null });
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/sessions/conv%201/managed-host");
+    expect(init.method).toBe("POST");
+    expect(new Headers(init.headers).get("Content-Type")).toBe("application/json");
+    expect(JSON.parse(init.body as string)).toEqual({});
+    expect(session.id).toBe("conv_1");
+  });
+
+  it("sends the provider, repository and new host id", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse(moved));
+
+    await launchManagedHost("conv_1", {
+      provider: "modal",
+      workspace: "https://github.com/org/repo#main",
+      hostId: "0123456789abcdef0123456789abcdef",
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({
+      sandbox_provider: "modal",
+      workspace: "https://github.com/org/repo#main",
+      host_id: "0123456789abcdef0123456789abcdef",
+    });
+  });
+
+  it("rejects with the server's reason", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse(
+        { error: { code: "conflict", message: "This session has no host to move from" } },
+        { ok: false, status: 409, statusText: "Conflict" },
+      ),
+    );
+
+    await expect(
+      launchManagedHost("conv_1", { provider: null, workspace: null }),
+    ).rejects.toMatchObject({
+      status: 409,
+      code: "conflict",
+      message: "This session has no host to move from",
+    });
   });
 });
 
@@ -1122,6 +1347,8 @@ describe("getSession", () => {
         status: "running",
         created_at: 1704067200,
         items: [],
+        side_chat_parent_id: "conv_parent",
+        side_chat_allowed: false,
       }),
     );
 
@@ -1131,7 +1358,39 @@ describe("getSession", () => {
     expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/conv_abc");
     expect(session.agentId).toBe("agent_xyz");
     expect(session.createdAt).toBe(1704067200);
+    expect(session.sideChatParentId).toBe("conv_parent");
+    expect(session.sideChatAllowed).toBe(false);
   });
+
+  // The server keeps a background-agent wait at "running" for released headless
+  // clients and names the agents beside it; the web reads that pair as waiting.
+  it.each([
+    ["running", [{ id: "a1", type: "subagent", description: "Audit" }], "waiting"],
+    ["running", [], "running"],
+    ["running", undefined, "running"],
+    ["idle", [{ id: "a1" }], "idle"],
+    ["waiting", undefined, "waiting"],
+  ] as const)(
+    "reads status %s with background agents %j as %s",
+    async (status, backgroundAgents, expected) => {
+      fetchMock.mockResolvedValueOnce(
+        mockJsonResponse({
+          id: "conv_abc",
+          agent_id: "agent_xyz",
+          status,
+          created_at: 0,
+          background_agents: backgroundAgents,
+        }),
+      );
+      const session = await getSession("conv_abc");
+      expect(session.status).toBe(expected);
+      expect(session.backgroundAgents).toEqual(
+        backgroundAgents !== undefined && backgroundAgents.length > 0
+          ? backgroundAgents
+          : undefined,
+      );
+    },
+  );
 
   it("url-encodes the session id", async () => {
     fetchMock.mockResolvedValueOnce(
@@ -1410,6 +1669,7 @@ describe("getSessionUsage", () => {
     expect(usage).toEqual({
       id: "conv with space",
       totalCostUsd: 3.5,
+      costHidden: false,
       usageByModel: {
         "model-a": {
           inputTokens: 10,
@@ -1450,6 +1710,7 @@ describe("getSessionUsage", () => {
       expect(await getSessionUsage("conv_usage_projection")).toEqual({
         id: "conv_usage_projection",
         totalCostUsd: 3.5,
+        costHidden: false,
         usageByModel: null,
       });
       expect(getSessionHost("conv_usage_projection")).toBe("host_current");
@@ -1466,6 +1727,7 @@ describe("getSessionUsage", () => {
     expect(await getSessionUsage("conv_abc")).toEqual({
       id: "conv_abc",
       totalCostUsd: cost,
+      costHidden: false,
       usageByModel: null,
     });
   });
@@ -1474,6 +1736,97 @@ describe("getSessionUsage", () => {
     fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status: 503 }));
 
     await expect(getSessionUsage("conv_abc")).rejects.toMatchObject({ status: 503 });
+  });
+});
+
+describe("fetchRewindPrompts", () => {
+  it("lists user prompts newest first across message pages, skipping hidden context", async () => {
+    const message = (id: string, role: string, text: string, extra = {}) => ({
+      id,
+      type: "message",
+      role,
+      content: [{ type: role === "user" ? "input_text" : "output_text", text }],
+      ...extra,
+    });
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        object: "list",
+        data: [
+          message("msg_a2", "assistant", "Done"),
+          message("msg_q2", "user", "Add parser tests"),
+          message("msg_skill", "user", "skill body", { is_meta: true }),
+        ],
+        last_id: "msg_skill",
+        has_more: true,
+      }),
+    );
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        object: "list",
+        data: [
+          message("msg_q1", "user", "Write the parser"),
+          // Attachment-only: still a prompt to rewind to, with no text.
+          {
+            id: "msg_file",
+            type: "message",
+            role: "user",
+            content: [{ type: "input_file", file_id: "file_notes", filename: "notes.txt" }],
+          },
+        ],
+        last_id: "msg_file",
+        has_more: false,
+      }),
+    );
+
+    const { prompts, olderCursor } = await fetchRewindPrompts("sess_1");
+
+    expect(prompts.map((prompt) => [prompt.itemId, prompt.text])).toEqual([
+      ["msg_q2", "Add parser tests"],
+      ["msg_q1", "Write the parser"],
+      ["msg_file", ""],
+    ]);
+    expect(olderCursor).toBeNull();
+    expect(fetchMock.mock.calls[0]![0]).toBe(
+      "/v1/sessions/sess_1/items?limit=200&order=desc&type=message",
+    );
+    expect(fetchMock.mock.calls[1]![0]).toBe(
+      "/v1/sessions/sess_1/items?limit=200&order=desc&type=message&after=msg_skill",
+    );
+  });
+
+  it("stops after five pages and continues from the cursor it returns", async () => {
+    const page = (id: string, hasMore: boolean) =>
+      mockJsonResponse({
+        object: "list",
+        data: [{ id, type: "message", role: "user", content: [{ type: "input_text", text: id }] }],
+        last_id: id,
+        has_more: hasMore,
+      });
+    for (const id of ["msg_p1", "msg_p2", "msg_p3", "msg_p4", "msg_p5"])
+      fetchMock.mockResolvedValueOnce(page(id, true));
+    fetchMock.mockResolvedValueOnce(page("msg_oldest", false));
+
+    const newest = await fetchRewindPrompts("sess_1");
+
+    expect(newest.prompts.map((prompt) => prompt.itemId)).toEqual([
+      "msg_p1",
+      "msg_p2",
+      "msg_p3",
+      "msg_p4",
+      "msg_p5",
+    ]);
+    expect(newest.olderCursor).toBe("msg_p5");
+    expect(fetchMock).toHaveBeenCalledTimes(5);
+
+    const older = await fetchRewindPrompts("sess_1", undefined, newest.olderCursor);
+
+    expect(older).toEqual({
+      prompts: [{ itemId: "msg_oldest", text: "msg_oldest", createdAt: undefined }],
+      olderCursor: null,
+    });
+    expect(fetchMock.mock.calls[5]![0]).toBe(
+      "/v1/sessions/sess_1/items?limit=200&order=desc&type=message&after=msg_p5",
+    );
   });
 });
 
@@ -1631,6 +1984,32 @@ describe("postEvent", () => {
     expect(init.method).toBe("POST");
     expect(JSON.parse(init.body as string)).toEqual(event);
     expect(out).toEqual({ queued: true, itemId: "ci_123" });
+  });
+
+  it("reports an expired sign-in when the POST is answered with a login page", async () => {
+    // The auth edge's 200 login page: a body that is not JSON, served as text/html.
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      headers: new Headers({ "content-type": "text/html; charset=utf-8" }),
+      json: async () => {
+        throw new SyntaxError("Unexpected token '<'");
+      },
+    });
+
+    const error = await postEvent("conv_abc", { type: "clear", data: {} }).catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error).toMatchObject({ status: 401, code: "sign_in_expired" });
+  });
+
+  it("reads the session a claude-sdk clear continued in", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: false, session_id: "conv_new" }));
+
+    const out = await postEvent("conv_abc", { type: "clear", data: {} });
+
+    expect(out.sessionId).toBe("conv_new");
   });
 
   it("surfaces 4xx as a thrown error (does not silently swallow)", async () => {
@@ -1875,6 +2254,25 @@ describe("approve", () => {
 });
 
 describe("importLocalSessions", () => {
+  it("sends the browser tools mode header on the import request", async () => {
+    const win = window as unknown as { omnigentDesktop?: unknown };
+    const before = win.omnigentDesktop;
+    win.omnigentDesktop = { browserTabs: () => undefined };
+    try {
+      fetchMock.mockResolvedValueOnce(
+        mockNdjsonResponse([
+          JSON.stringify({ event: "done", imported: 0, already_imported: 0, failed: 0 }),
+        ]),
+      );
+      await importLocalSessions("host_1", "all", 25);
+      const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+      expect(url).toBe("/v1/imports/local/stream");
+      expect(new Headers(init.headers).get("X-Omnigent-Browser-Agent-Tools")).toBe("on");
+    } finally {
+      win.omnigentDesktop = before;
+    }
+  });
+
   it("streams each session through onSession and returns the final tally", async () => {
     fetchMock.mockResolvedValueOnce(
       mockNdjsonResponse([
@@ -1954,6 +2352,57 @@ describe("importLocalSessions", () => {
     );
     // The session that streamed before the error was still handed to the caller.
     expect(seen).toEqual(["c1"]);
+  });
+
+  it("throws with the delivered count when the stream closes before done", async () => {
+    // A proxy ending the body early drops the terminal tally. Resolving would
+    // report "Imported 0" beside sessions that did import.
+    fetchMock.mockResolvedValueOnce(
+      mockNdjsonResponse([
+        JSON.stringify({ event: "session", session_id: "c1", title: "First" }),
+        JSON.stringify({ event: "session", session_id: "c2", title: "Second" }),
+      ]),
+    );
+
+    const seen: string[] = [];
+    await expect(importLocalSessions("h", "all", 25, (s) => seen.push(s.id))).rejects.toThrow(
+      "The import stopped before it could finish. 2 sessions were imported. " +
+        "Import again to pick up the rest.",
+    );
+    expect(seen).toEqual(["c1", "c2"]);
+  });
+
+  it("throws when the stream closes before done with nothing delivered", async () => {
+    fetchMock.mockResolvedValueOnce(mockNdjsonResponse([]));
+
+    await expect(importLocalSessions("h", "claude", 10)).rejects.toThrow(
+      "The import stopped before it could finish. 0 sessions were imported.",
+    );
+  });
+
+  it("resolves a by-ID import whose session arrived even without done", async () => {
+    // The one requested session was saved before it streamed, so nothing is left to do.
+    fetchMock.mockResolvedValueOnce(
+      mockNdjsonResponse([JSON.stringify({ event: "session", session_id: "c1", title: "Exact" })]),
+    );
+
+    const result = await importLocalSessions("h", "codex", 25, undefined, "session-exact");
+
+    expect(result).toEqual({
+      imported: 1,
+      alreadyImported: 0,
+      failed: 0,
+      sessions: [{ id: "c1", title: "Exact" }],
+      failures: [],
+    });
+  });
+
+  it("throws a retry message when a by-ID import ends before done with nothing delivered", async () => {
+    fetchMock.mockResolvedValueOnce(mockNdjsonResponse([]));
+
+    await expect(importLocalSessions("h", "codex", 25, undefined, "session-exact")).rejects.toThrow(
+      "The import stopped before it could finish. Try importing it again.",
+    );
   });
 
   it("sends an exact session ID with its harness", async () => {

@@ -102,10 +102,19 @@ def test_coding_supervisor_with_forks_one_shot(
         ],
         key=mock_model,
     )
+    env = dict(mock_credentials_env)
+    if harness == "claude-sdk":
+        # claude-sdk speaks the Anthropic Messages API, so route it to the mock the way
+        # test_yaml_hello_world does. Without this the CLI is "Not logged in" and the
+        # run fails instead of reaching the mock.
+        env["ANTHROPIC_BASE_URL"] = mock_llm_server_url
+        env["HARNESS_CLAUDE_SDK_API_KEY_HELPER"] = "printf %s mock-key"
+        env.pop("OPENAI_BASE_URL", None)
+        env.pop("OPENAI_API_KEY", None)
     result = run_one_shot(
         omnigent_python=omnigent_python,
         omnigent_repo_root=omnigent_repo_root,
-        omnigent_credentials_env=mock_credentials_env,
+        omnigent_credentials_env=env,
         example_name="coding_supervisor_with_forks",
         harness=harness,
         model=mock_model,

@@ -89,6 +89,9 @@ describe("macOS Electron embed", () => {
     const scope = container.querySelector(".omnigent-app")!;
     expect(scope.getAttribute("data-electron-mac")).toBe(expected ? "true" : null);
     expect(document.documentElement).not.toHaveAttribute("data-electron-mac");
+    // Every desktop app keeps the desktop layout, so the marker isn't macOS-only.
+    expect(scope.getAttribute("data-desktop-app")).toBe(electron ? "true" : null);
+    expect(document.documentElement).not.toHaveAttribute("data-desktop-app");
 
     const keyboardScope = getEmbedRoot()!;
     expect(keyboardScope.getAttribute("tabindex")).toBe(electron ? null : "-1");
@@ -108,6 +111,13 @@ describe("macOS Electron embed", () => {
       expect(selector).not.toContain(":has(");
       expect(scope.querySelector(`.${className}`)!.matches(selector), className).toBe(expected);
     }
+
+    let smoothingSelector = "";
+    css.walkDecls("-webkit-font-smoothing", (declaration) => {
+      smoothingSelector = (declaration.parent as Rule).selector;
+    });
+    expect(smoothingSelector).not.toBe("");
+    expect(scope.matches(smoothingSelector)).toBe(true);
 
     const controlsSelector = selectorFor(":is(");
     expect(controlsSelector).not.toContain(":has(");

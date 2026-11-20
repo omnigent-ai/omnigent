@@ -154,6 +154,10 @@ GEOMETRY_PROBE = """() => {
         lastMessageBottom: Math.round(sections.at(-1).getBoundingClientRect().bottom),
         composerHeight: Math.round(ta.getBoundingClientRect().height),
         composerTop,
+        mobileOverlay: card.hasAttribute('data-mobile-composer'),
+        overlayHeight: Math.round(parseFloat(getComputedStyle(
+            form.closest('[data-chat-surface]')
+        ).getPropertyValue('--session-composer-height')) || 0),
         transcriptBottom,
         overlap: transcriptBottom - composerTop,
         formMarginTop: Math.round(parseFloat(getComputedStyle(form).marginTop) || 0),
@@ -199,11 +203,7 @@ def scroll_to_distance_from_bottom(page: Page, distance: int) -> dict:
 
 @contextmanager
 def native_touch_emulation(page: Page) -> Iterator[CDPSession]:
-    """Emulate touch input until the block exits.
-
-    Ending emulation re-evaluates pointer/hover media, which resizes touch-sized
-    targets; measurements that must share one layout belong inside the block.
-    """
+    """Emulate touch input until the block exits."""
     session = page.context.new_cdp_session(page)
     try:
         session.send("Emulation.setTouchEmulationEnabled", {"enabled": True, "maxTouchPoints": 1})
@@ -253,7 +253,13 @@ def scroll_with_native_touch(page: Page, session: CDPSession | None = None) -> d
         )
         page.wait_for_timeout(16)
     session.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
-    page.wait_for_timeout(600)
+    # Native momentum can outlast a fixed delay; measure after the gesture and
+    # any virtual-row remeasurement have both finished.
+    page.wait_for_function(
+        "() => window.__nativeTouchProbe.events.at(-1) === 'scrollend'",
+        timeout=15_000,
+    )
+    settled_geometry(page)
     return page.evaluate(
         """initial => { const {events, scroller} = window.__nativeTouchProbe; return {
           events, initialScrollTop: initial, settledScrollTop: Math.round(scroller.scrollTop),

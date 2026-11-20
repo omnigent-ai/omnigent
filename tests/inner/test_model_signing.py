@@ -69,13 +69,13 @@ def test_reconstructs_authority_and_bearer_from_frozen_inputs() -> None:
             "databricks-ucode-v1",
             "workspace.cloud.databricks.com",
             "/ai-gateway/codex/v1/responses",
-            "omnigent, omnigent-desktop, ug",
+            "omnigent-desktop, ug",
         ),
         (
             "databricks-ucode-v1",
             "workspace.ai-gateway.cloud.databricks.com",
             "/v1/responses",
-            "omnigent, omnigent-desktop, ug",
+            "omnigent-desktop, ug",
         ),
         ("databricks-ucode-v1", _HOST, _PATH, None),
         (
@@ -194,14 +194,15 @@ def test_ambiguous_routing_and_framing_headers_are_rejected(
 
 
 def test_placeholder_literal_in_other_header_or_target_is_rejected() -> None:
-    with pytest.raises(SigningRejected):
-        _reconstruct(
-            headers=[
-                ("Authorization", f"Bearer {_PLACEHOLDER}"),
-                ("Content-Type", "application/json"),
-                ("User-Agent", _PLACEHOLDER),
-            ]
-        )
+    for header_name in ("User-Agent", "x-api-key"):
+        with pytest.raises(SigningRejected, match="placeholder"):
+            _reconstruct(
+                headers=[
+                    ("Authorization", f"Bearer {_PLACEHOLDER}"),
+                    ("Content-Type", "application/json"),
+                    (header_name, _PLACEHOLDER),
+                ]
+            )
     with pytest.raises(SigningRejected):
         _reconstruct(target=f"{_PATH}/{_PLACEHOLDER}")
 

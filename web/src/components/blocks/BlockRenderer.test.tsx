@@ -11,10 +11,12 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RenderItem } from "@/lib/renderItems";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import { ConversationScrollLockContext } from "@/components/ai-elements/conversation";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
-import { BlockRenderer, rendersOnlyWorkedFold } from "./BlockRenderer";
+import { BlockRenderer, mayDefineReferenceLink, rendersOnlyWorkedFold } from "./BlockRenderer";
 import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 
 afterEach(cleanup);
@@ -358,7 +360,7 @@ describe("BlockRenderer dispatch", () => {
 
   it("hides a live turn's reasoning duration after assistant text arrives", () => {
     const items: RenderItem[] = [
-      { kind: "reasoning", itemId: "live-reasoning", text: "still working", duration: 5 },
+      { kind: "reasoning", itemId: "live-reasoning", text: "", duration: 5 },
       { kind: "text", itemId: "live-text", text: "Partial answer", final: false },
     ];
 
@@ -383,7 +385,7 @@ describe("BlockRenderer dispatch", () => {
       </>,
     );
 
-    expect(screen.getByText("Thought for a few seconds")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Thinking: finished" })).toBeInTheDocument();
     expect(screen.getAllByText("Thinking...")).toHaveLength(1);
   });
 
@@ -392,6 +394,120 @@ describe("BlockRenderer dispatch", () => {
 
     expect(screen.getByText("*settled")).toBeInTheDocument();
     expect(container.querySelector("em")).toBeNull();
+  });
+
+  it("keeps a settled streamed reply's markdown as it rendered while streaming", () => {
+    // Streaming mode closes unclosed syntax; a streamed reply keeps that once it settles.
+    const { container } = render(
+      <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+        <BlockRenderer
+          items={[
+            { kind: "text", itemId: "t1", text: "*settled", final: true, streamKey: "text#0" },
+          ]}
+          sessionStatus="idle"
+        />
+      </FileViewerContext.Provider>,
+    );
+
+    expect(container.querySelector("em")).toHaveTextContent("settled");
+  });
+
+  it.each([
+    ["at the top level", "See [the docs][docs].\n\n[docs]: https://example.com/docs"],
+    ["in a blockquote", "See [the docs][docs].\n\n> [docs]: https://example.com/docs"],
+    [
+      "in a blockquote inside a list item",
+      "See [the docs][docs].\n\n10. q\n\n    > [docs]: https://example.com/docs",
+    ],
+    [
+      "after CR line endings",
+      "See [the docs][docs].\n\nNotes.\r\r[docs]: https://example.com/docs",
+    ],
+    ["with a caret-only label", "See [the docs][^].\n\n[^]: https://example.com/docs"],
+  ])("resolves a settled streamed reply's reference link defined %s", (_where, text) => {
+    // Streamed text stays in streaming mode, which renders each block alone, so a
+    // reply with a link definition in another block settles into static mode.
+    render(
+      <TestProviders queryClient={new QueryClient()} fileViewerContext={FILE_VIEWER_NOOP}>
+        <BlockRenderer
+          items={[
+            {
+              kind: "text",
+              itemId: "t1",
+              text,
+              final: true,
+              streamKey: "text#0",
+            },
+          ]}
+          sessionStatus="idle"
+        />
+      </TestProviders>,
+    );
+
+    expect(screen.getByRole("link", { name: "the docs" })).toHaveAttribute(
+      "href",
+      "https://example.com/docs",
+    );
+  });
+
+  it("keeps a streamed reply's footnotes mounted as it settles", () => {
+    // Streamdown keeps a message with footnotes in one block, so they need no static switch.
+    const queryClient = new QueryClient();
+    const view = (sessionStatus: "running" | "idle") => (
+      <TestProviders queryClient={queryClient} fileViewerContext={FILE_VIEWER_NOOP}>
+        <BlockRenderer
+          items={[
+            {
+              kind: "text",
+              itemId: "t1",
+              text: "Claim.[^1]\n\n[^1]: A note.",
+              final: sessionStatus === "idle",
+              streamKey: "text#0",
+            },
+          ]}
+          sessionStatus={sessionStatus}
+        />
+      </TestProviders>
+    );
+    const { container, rerender } = render(view("running"));
+    const footnotes = container.querySelector("[data-footnotes]");
+    expect(footnotes).toHaveTextContent("A note.");
+
+    rerender(view("idle"));
+    expect(container.querySelector("[data-footnotes]")).toBe(footnotes);
+    expect(container.querySelector("[data-footnote-ref]")).toHaveTextContent("1");
+  });
+
+  it.each([
+    ["a definition", "See [a][docs].\n\n[docs]: https://example.com", true],
+    ["no space after the colon", "[docs]:/docs", true],
+    ["an escaped bracket in the label", String.raw`[foo\]]: /url`, true],
+    ["a definition in a list item", "- [docs]: https://example.com", true],
+    ["a definition on a list item's continuation", "10. See [docs][].\n\n    [docs]: /url", true],
+    ["a blockquote in a list item's continuation", "See [x][a].\n\n10. q\n\n    > [a]: /url", true],
+    ["a label split across lines", "See [foo bar][].\n\n[foo\nbar]: /url", true],
+    ["a label split across blockquote lines", "> [foo\n> bar]: /url", true],
+    ["a split label whose first line ends in a backslash", "[foo\\\nbar]: /url", true],
+    ["CR line endings", "See [docs][].\r\r[docs]: /docs", true],
+    // Code isn't parsed: matching there only keeps the static rendering.
+    ["a definition-like line in code", "```ini\n[docs]: x\n```", true],
+    ["an unescaped bracket in the label", "[foo[bar]: text", false],
+    ["a split label broken by a blank line", "[foo\n\nbar]: /url", false],
+    ["a footnote definition", "[^1]: A note.", false],
+    ["a caret-only label", "See [docs][^].\n\n[^]: https://example.com/docs", true],
+    ["plain prose", "Done. There are two names in the file.", false],
+  ])("mayDefineReferenceLink: %s", (_case, text, expected) => {
+    expect(mayDefineReferenceLink(text)).toBe(expected);
+  });
+
+  it("scans long pathological text in linear time", () => {
+    const started = performance.now();
+    expect(mayDefineReferenceLink("`".repeat(64_000))).toBe(false);
+    expect(mayDefineReferenceLink("[" + "a".repeat(64_000))).toBe(false);
+    expect(mayDefineReferenceLink("[a\n".repeat(20_000))).toBe(false);
+    expect(mayDefineReferenceLink(" ".repeat(64_000) + "x")).toBe(false);
+    expect(mayDefineReferenceLink("[" + "\\".repeat(64_000) + "]")).toBe(false);
+    expect(performance.now() - started).toBeLessThan(250);
   });
 
   it("uses streaming markdown mode only for the live trailing text item", () => {
@@ -613,7 +729,12 @@ describe("BlockRenderer dispatch", () => {
 
     it("keeps the answer and follow-up in order around separate work runs", () => {
       const items: RenderItem[] = [
-        { kind: "reasoning", itemId: "r0", text: "Considering the request.", duration: 4 },
+        {
+          kind: "reasoning",
+          itemId: "r0",
+          text: "Considering the request.\n\nChecking the inputs.",
+          duration: 4,
+        },
         tool(1, "Bash"),
         { kind: "text", itemId: "m0", text: "Here is the substantive answer.", final: true },
         tool(2, "Agent"),
@@ -636,13 +757,13 @@ describe("BlockRenderer dispatch", () => {
       expect(
         folds[1]!.compareDocumentPosition(followUp) & Node.DOCUMENT_POSITION_FOLLOWING,
       ).toBeTruthy();
-      expect(screen.queryByText("Considering the request.")).toBeNull();
+      expect(screen.queryByText("Checking the inputs.")).toBeNull();
       fireEvent.click(folds[0]!);
       expect(folds[0]).toHaveAttribute("aria-expanded", "true");
       expect(folds[1]).toHaveAttribute("aria-expanded", "false");
       expect(screen.getByText("Ran 1 shell command")).toBeDefined();
-      fireEvent.click(screen.getByText(/Thought for/));
-      expect(screen.getByText("Considering the request.")).toBeDefined();
+      fireEvent.click(screen.getByRole("button", { name: "Thinking: Considering the request." }));
+      expect(screen.getByText("Checking the inputs.")).toBeDefined();
       fireEvent.click(folds[1]!);
       expect(folds[0]).toHaveAttribute("aria-expanded", "true");
       expect(folds[1]).toHaveAttribute("aria-expanded", "true");
@@ -1440,6 +1561,50 @@ describe("BlockRenderer dispatch", () => {
       expect(screen.getByText("Called 2 tools")).toBeDefined();
     });
 
+    describe("task markers", () => {
+      const marker = (entryId: string, status: string, name: string): RenderItem => ({
+        kind: "subagent_activity",
+        itemId: `item_${entryId}`,
+        data: {
+          type: "resource_event",
+          event_type: "session.journal.task",
+          resource_type: "journal",
+          resource_id: "hello",
+          resource: { name, status, text: null, entry_id: entryId, native: false },
+        },
+      });
+
+      it("keeps a settled turn's task markers in view instead of folding its work", () => {
+        render(
+          <MemoryRouter>
+            <CapabilitiesProvider
+              info={{ ...SERVER_INFO_OFFLINE_FALLBACK, features: { workflows: true } }}
+            >
+              <BlockRenderer
+                items={[
+                  tool(1, "Agent"),
+                  marker("e1", "started", "Say hello"),
+                  tool(2, "Agent"),
+                  marker("e2", "done", "Say hello"),
+                  { kind: "text", itemId: "m1", text: "Said hello.", final: true },
+                ]}
+                sessionStatus="idle"
+                workedForS={9}
+              />
+            </CapabilitiesProvider>
+          </MemoryRouter>,
+        );
+        expect(screen.queryByRole("button", { name: "Worked for 9s" })).toBeNull();
+        expect(screen.getAllByTestId("task-activity").map((node) => node.textContent)).toEqual([
+          "Started Say hello",
+          "Completed Say hello",
+        ]);
+        // The tool calls on either side of a marker stay in their own group.
+        expect(screen.getAllByText("Called 1 tool")).toHaveLength(2);
+        expect(screen.getByText("Said hello.")).toBeDefined();
+      });
+    });
+
     describe("sub-agent notices", () => {
       const notice = (itemId: string, phase: "delegated" | "returned"): RenderItem => ({
         kind: "subagent_activity",
@@ -1875,7 +2040,12 @@ describe("BlockRenderer dispatch", () => {
         { kind: "text", itemId: "m0", text: "Checking the CLI.", final: true },
         tool(1, "Bash"),
         { kind: "text", itemId: "m1", text: "Server started on 8838.", final: true },
-        { kind: "reasoning", itemId: null, text: "Finishing checks.", duration: undefined },
+        {
+          kind: "reasoning",
+          itemId: null,
+          text: "Finishing checks.\n\nAll green.",
+          duration: undefined,
+        },
       ];
       render(
         <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
@@ -1886,10 +2056,10 @@ describe("BlockRenderer dispatch", () => {
       // Both messages stay visible while the tool and trailing reasoning fold.
       expect(screen.getByText("Server started on 8838.")).toBeDefined();
       expect(screen.getByText("Checking the CLI.")).toBeDefined();
-      expect(screen.queryByText("Finishing checks.")).toBeNull();
+      expect(screen.queryByText("All green.")).toBeNull();
       fireEvent.click(screen.getByRole("button", { name: "Worked" }));
-      fireEvent.click(screen.getByText(/Thought/));
-      expect(screen.getByText("Finishing checks.")).toBeDefined();
+      fireEvent.click(screen.getByRole("button", { name: "Thinking: Finishing checks." }));
+      expect(screen.getByText("All green.")).toBeDefined();
     });
 
     it("never folds a bubble made only of streaming artifacts", () => {
@@ -2282,6 +2452,30 @@ describe("BlockRenderer dispatch", () => {
         vi.advanceTimersByTime(100);
       });
       expect(container.textContent).toContain("CHARLIE");
+    });
+
+    it("keeps a Mermaid fence's source while the shown text trails the turn's end", () => {
+      const open = "Flow:\n\n```mermaid\nflowchart LR\n  Alpha --> Beta\n";
+      const view = (text: string, sessionStatus: "running" | "idle") => (
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer
+            items={[{ kind: "text", itemId: null, text, final: false, streamKey: "text#0" }]}
+            sessionStatus={sessionStatus}
+          />
+        </FileViewerContext.Provider>
+      );
+      const { rerender, container } = render(view("Flow:", "running"));
+      act(() => rerender(view(open, "running")));
+      // The turn ends within the throttle window, before the fence's close is shown.
+      act(() => rerender(view(`${open}\`\`\`\n\nDone.`, "idle")));
+      expect(container.querySelector('[data-streamdown="code-block"]')).toHaveTextContent(
+        "Alpha --> Beta",
+      );
+      expect(container.querySelector(".chat-mermaid")).toBeNull();
+
+      act(() => vi.advanceTimersByTime(100));
+      expect(container).toHaveTextContent("Done.");
+      expect(container.querySelector(".chat-mermaid")).not.toBeNull();
     });
   });
 

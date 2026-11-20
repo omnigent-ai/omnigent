@@ -2,7 +2,18 @@
 
 from typing import Any
 
+from omnigent.server.feature_flags import Feature, resolve_feature_flags
 from omnigent.tools.base import Tool
+
+# Sized so an automation's worker can receive long owner instructions plus the matched item.
+SESSION_MESSAGE_MAX_CHARS = 32_000
+# Servers that don't advertise session_message_max_chars deliver at most this.
+LEGACY_SESSION_MESSAGE_MAX_CHARS = 8_000
+
+
+def peer_session_messaging_enabled() -> bool:
+    """Whether this process's ``OMNIGENT_FEATURES`` leaves peer messaging enabled."""
+    return resolve_feature_flags().enabled(Feature.PEER_SESSION_MESSAGING)
 
 
 class SysSessionMessageTool(Tool):
@@ -13,15 +24,12 @@ class SysSessionMessageTool(Tool):
     @classmethod
     def description(cls) -> str:
         return (
-            "Send work to another session owned by the same user. Requires session "
-            "orchestration enabled and a sending session that is private or shared "
-            "read-only, including its side-chat source chain. The receiver "
-            "may be shared: its readers will see your message. It uses normal queue/steering "
-            "behavior without changing parentage or forwarding replies. A queued result "
-            "means accepted, not executed; destination policy may still deny it during "
-            "startup replay. Check results with "
-            "sys_session_get_info/sys_session_get_history. Do not automatically retry an "
-            "uncertain delivery."
+            "Send a message to another session the user owns. Use it only when the user "
+            "explicitly asks, directly or in their instructions. For your own subagents, "
+            "use sys_session_send. The receiver sees it as a user message from your "
+            "session ID, so make it self-contained. Replies are not forwarded; read them "
+            "with sys_session_get_history. `queued` means accepted, not run. Never resend "
+            "an uncertain delivery automatically."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -34,7 +42,11 @@ class SysSessionMessageTool(Tool):
                     "type": "object",
                     "properties": {
                         "session_id": {"type": "string", "description": "Destination session ID."},
-                        "message": {"type": "string", "minLength": 1, "maxLength": 8000},
+                        "message": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": SESSION_MESSAGE_MAX_CHARS,
+                        },
                     },
                     "required": ["session_id", "message"],
                     "additionalProperties": False,

@@ -424,5 +424,12 @@ describe("computePullRequestPollInterval", () => {
     expect(computePullRequestPollInterval(ready({ pr: { ...ready().pr!, state: "CLOSED" } }))).toBe(
       false,
     );
+    for (const state of ["OPEN", "MERGED", "CLOSED"]) {
+      expect(
+        computePullRequestPollInterval(
+          ready({ pr: { ...ready().pr!, state, timeline_partial: true } }),
+        ),
+      ).toBe(false);
+    }
   });
 });

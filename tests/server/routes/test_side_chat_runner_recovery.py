@@ -8,10 +8,12 @@ from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
+from fastapi import FastAPI
 
 from omnigent.db.utils import generate_agent_id
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.host.frames import CAP_CODEX_SIDE_CHAT_RESUME
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, LEVEL_READ
 from omnigent.server.routes import sessions
 from omnigent.server.routes._sessions import orchestration
@@ -129,6 +131,157 @@ async def test_side_chat_binding_unchanged_when_source_runner_unavailable(
     assert saved is not None and saved.runner_id == "runner-exited"
 
 
+@pytest.mark.parametrize(
+    ("state", "status", "payload", "succeeds"),
+    [
+        ("replaced", 200, {"resumed": True}, True),
+        ("unavailable", 200, {"resumed": True}, False),
+        ("live", 422, {"detail": [{"type": "union_tag_invalid"}]}, True),
+        ("closed", 200, {"queued": False}, False),
+        ("closed", 409, {"error": "no_live_harness"}, False),
+        ("closed", 422, {"detail": [{"type": "union_tag_invalid"}]}, False),
+        ("unbound", 503, {"error": "no_harness"}, False),
+        ("mismatched", 200, {"queued": False}, False),
+        ("reappeared", 200, {"queued": False}, False),
+        ("advanced", 409, {"error": "no_live_harness"}, False),
+        ("offline", 503, {"error": "no_harness"}, False),
+        ("closed", 503, {"error": "codex_side_chat_unavailable"}, False),
+        ("closed", 200, {"resumed": False}, False),
+        ("legacy-reappeared", 422, {"detail": [{"type": "union_tag_invalid"}]}, True),
+        ("legacy-closed", 422, {"detail": [{"type": "union_tag_invalid"}]}, False),
+        ("legacy-mismatched", 422, {"detail": [{"type": "union_tag_invalid"}]}, False),
+    ],
+)
+async def test_native_side_chat_resume_revalidates_runner_after_parent_initialization(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+    status: int,
+    payload: dict[str, Any],
+    succeeds: bool,
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    source = store.create_conversation(runner_id="runner-first")
+    side = store.create_conversation(
+        kind="sub_agent",
+        parent_conversation_id=source.id,
+        runner_id=None if state == "unbound" else "runner-first",
+    )
+    if state in ("mismatched", "legacy-mismatched"):
+        store.replace_runner_id(side.id, "runner-stale")
+    closed = state in ("replaced", "unavailable", "closed", "advanced", "legacy-closed")
+    store.set_labels(
+        side.id,
+        {
+            "omnigent.wrapper": "codex-native-ui-subagent",
+            "omnigent.codex_native.agent_nickname": "Side chat",
+            "omnigent.codex_native.subagent_thread_id": "thread-side",
+            **({"omnigent.closed": "true"} if closed else {}),
+        },
+    )
+    side = store.get_conversation(side.id)
+    assert side is not None
+    first_runner = AsyncMock()
+    next_runner = AsyncMock()
+    first_runner.post.return_value = next_runner.post.return_value = httpx.Response(
+        status, json=payload
+    )
+    runners = {"runner-first": first_runner, "runner-next": next_runner}
+
+    async def ensure(*, conv: Conversation, **_kwargs: object):
+        current = store.get_conversation(conv.id)
+        assert current is not None
+        if current.runner_id == "runner-next" and state == "unavailable":
+            return None, current
+        return runners[current.runner_id], current
+
+    parent_probes = 0
+
+    async def client_for(session_id: str, *_args: object, **_kwargs: object):
+        nonlocal parent_probes
+        if session_id == source.id:
+            parent_probes += 1
+            if state == "offline" or (
+                state in ("reappeared", "legacy-reappeared") and parent_probes == 1
+            ):
+                return None
+        current = store.get_conversation(session_id)
+        assert current is not None
+        return runners[current.runner_id]
+
+    async def initialize_parent(**kwargs: object) -> None:
+        assert kwargs["session_id"] == source.id
+        if state in ("replaced", "unavailable", "advanced"):
+            store.replace_runner_id(source.id, "runner-next")
+
+    ensure_connected = AsyncMock(side_effect=ensure)
+    initialize = AsyncMock(side_effect=initialize_parent)
+    monkeypatch.setattr(orchestration, "ensure_runner_connected", ensure_connected)
+    monkeypatch.setattr(sessions, "_get_runner_client", client_for)
+    monkeypatch.setattr(routes_events, "_recover_retry_session", initialize)
+    kwargs = {
+        "request": SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace())),
+        "conv": side,
+        "conversation_store": store,
+        "runner_router": SimpleNamespace(
+            runner_is_online=lambda _runner_id: True,
+            runner_has_capability=lambda _runner_id, capability: (
+                capability == CAP_CODEX_SIDE_CHAT_RESUME and not state.startswith("legacy-")
+            ),
+            runner_owner=lambda _runner_id: None,
+        ),
+        "user_id": None,
+        "permission_store": None,
+    }
+    expected_runner_id = (
+        "runner-next" if state in ("replaced", "unavailable", "advanced") else "runner-first"
+    )
+    expected_runner = runners[expected_runner_id]
+    if succeeds:
+        recovered = await routes_events._resume_codex_side_chat(**kwargs)
+        assert recovered.runner_id == expected_runner_id
+        assert "omnigent.closed" not in recovered.labels
+    else:
+        with pytest.raises(OmnigentError) as raised:
+            await routes_events._resume_codex_side_chat(**kwargs)
+        assert raised.value.code == (
+            ErrorCode.CONFLICT
+            if status == 409 and state != "unavailable"
+            else ErrorCode.RUNNER_UNAVAILABLE
+        )
+        saved = store.get_conversation(side.id)
+        assert (saved.labels.get("omnigent.closed") == "true") == (state != "legacy-mismatched")
+        if state == "legacy-mismatched":
+            assert saved.runner_id == "runner-stale"
+    if state in ("live", "legacy-reappeared", "legacy-closed", "legacy-mismatched"):
+        if state == "legacy-mismatched":
+            ensure_connected.assert_awaited_once()
+        else:
+            ensure_connected.assert_not_awaited()
+        initialize.assert_not_awaited()
+        first_runner.post.assert_not_awaited()
+    elif state == "unavailable":
+        next_runner.post.assert_not_awaited()
+    else:
+        expected_runner.post.assert_awaited_once_with(
+            f"/v1/sessions/{source.id}/events",
+            json={"type": "codex_side_chat_resume", "codex_side_session_id": side.id},
+        )
+    other_runner = next_runner if expected_runner is first_runner else first_runner
+    other_runner.post.assert_not_awaited()
+    if state == "mismatched":
+        first_runner.post.return_value = httpx.Response(200, json={"resumed": True})
+        kwargs["conv"] = store.get_conversation(side.id)
+        assert kwargs["conv"].runner_id == "runner-first"
+
+        recovered = await routes_events._resume_codex_side_chat(**kwargs)
+
+        assert recovered.runner_id == "runner-first"
+        assert "omnigent.closed" not in recovered.labels
+        assert first_runner.post.await_count == 2
+        assert first_runner.post.await_args == first_runner.post.await_args_list[0]
+
+
 class _AdvancingSource:
     """Stage ``ensure_runner_connected`` with a stale snapshot, then the advanced row.
 
@@ -243,28 +396,45 @@ async def test_side_chat_recovery_follows_source_only_advancement(
     assert saved is not None and saved.runner_id == advanced
 
 
+@pytest.mark.parametrize("native", [False, True], ids=["generic", "codex-native"])
 async def test_side_chat_recovery_gates_on_source_edit_access_at_the_routes(
+    auth_app: FastAPI,
     auth_client: httpx.AsyncClient,
     client: httpx.AsyncClient,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    native: bool,
 ) -> None:
     """Route-level recovery requires edit access to the source, not just the side chat.
 
     Protects ``user_id``/``permission_store`` propagation through the message
     and Resume entry points: a caller who can edit the side chat but not its
     source gets the plain unavailable error with no recovery attempt, while
-    the source's owner reaches recovery through the same routes.
+    the source's owner reaches recovery. An editor may use an existing live
+    native binding without owning its runner.
     """
     store = SqlAlchemyConversationStore(db_uri)
     permissions = SqlAlchemyPermissionStore(db_uri)
     agent = await create_test_agent(client, name="side-chat-source-edit-gate")
     source = store.create_conversation(agent_id=agent["id"])
     store.set_runner_id(source.id, "runner-shared")
-    side = store.fork_conversation(
-        source.id,
-        extra_labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: source.id},
-    )
+    if native:
+        side = store.create_conversation(
+            kind="sub_agent", agent_id=agent["id"], parent_conversation_id=source.id
+        )
+        store.set_labels(
+            side.id,
+            {
+                "omnigent.wrapper": "codex-native-ui-subagent",
+                "omnigent.codex_native.agent_nickname": "Side chat",
+                "omnigent.codex_native.subagent_thread_id": "thread-side",
+            },
+        )
+    else:
+        side = store.fork_conversation(
+            source.id,
+            extra_labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: source.id},
+        )
     store.set_runner_id(side.id, "runner-shared")
     for user in (_OWNER, _OTHER):
         permissions.ensure_user(user)
@@ -292,7 +462,7 @@ async def test_side_chat_recovery_gates_on_source_edit_access_at_the_routes(
         json=message,
         headers={"X-Forwarded-Email": _OTHER},
     )
-    assert denied.status_code == 503, denied.text
+    assert denied.status_code == (404 if native else 503), denied.text
     ensure.assert_not_awaited()
 
     denied_resume = await auth_client.post(
@@ -300,10 +470,12 @@ async def test_side_chat_recovery_gates_on_source_edit_access_at_the_routes(
         json={"type": "retry_session", "data": {}},
         headers={"X-Forwarded-Email": _OTHER},
     )
-    assert denied_resume.status_code == 503, denied_resume.text
+    assert denied_resume.status_code == (404 if native else 503), denied_resume.text
     # Resume resolves the side chat's own binding first; the source is never
     # touched when access is denied.
-    assert [c.kwargs["session_id"] for c in ensure.await_args_list] == [side.id]
+    assert [c.kwargs["session_id"] for c in ensure.await_args_list] == (
+        [] if native else [side.id]
+    )
 
     allowed = await auth_client.post(
         f"/v1/sessions/{side.id}/events",
@@ -311,7 +483,87 @@ async def test_side_chat_recovery_gates_on_source_edit_access_at_the_routes(
         headers={"X-Forwarded-Email": _OWNER},
     )
     assert allowed.status_code == 503, allowed.text
-    assert [c.kwargs["session_id"] for c in ensure.await_args_list] == [side.id, source.id]
+    assert [c.kwargs["session_id"] for c in ensure.await_args_list] == (
+        [source.id] if native else [side.id, source.id]
+    )
+    if native:
+        permissions.grant(_OTHER, source.id, LEVEL_READ)
+        store.set_host_id(source.id, _HOST_ID, workspace="/workspace")
+        runner = AsyncMock()
+        runner.post.return_value = httpx.Response(202)
+        ensure.reset_mock()
+        ensure.side_effect = None
+        ensure.return_value = (runner, store.get_conversation(source.id))
+        monkeypatch.setattr(
+            auth_app.state.runner_router, "runner_owner", Mock(return_value=_OWNER)
+        )
+        monkeypatch.setattr(
+            auth_app.state.runner_router, "host_is_on_another_replica", Mock(return_value=False)
+        )
+        monkeypatch.setattr(
+            auth_app.state.runner_router, "runner_is_online", Mock(return_value=True)
+        )
+        monkeypatch.setattr(
+            auth_app.state.runner_router,
+            "runner_has_capability",
+            Mock(
+                side_effect=lambda _runner_id, capability: capability == CAP_CODEX_SIDE_CHAT_RESUME
+            ),
+        )
+        monkeypatch.setattr(sessions, "_get_runner_client", AsyncMock(return_value=runner))
+        monkeypatch.setattr(routes_events, "_ensure_runner_relay_ready", AsyncMock())
+
+        read_only = await auth_client.post(
+            f"/v1/sessions/{side.id}/events",
+            json=message,
+            headers={"X-Forwarded-Email": _OTHER},
+        )
+        assert read_only.status_code == 403, read_only.text
+        ensure.assert_not_awaited()
+        runner.post.assert_not_awaited()
+
+        permissions.grant(_OTHER, source.id, LEVEL_EDIT)
+        edited = await auth_client.post(
+            f"/v1/sessions/{side.id}/events",
+            json=message,
+            headers={"X-Forwarded-Email": _OTHER},
+        )
+
+        assert edited.status_code == 202, edited.text
+        ensure.assert_not_awaited()
+        runner.post.assert_awaited_once_with(
+            f"/v1/sessions/{source.id}/events",
+            json={
+                "type": "message",
+                "content": message["data"]["content"],
+                "codex_side_thread_id": "thread-side",
+            },
+        )
+        monkeypatch.setattr(routes_events, "_recover_retry_session", AsyncMock())
+        runner.post.return_value = httpx.Response(200, json={"resumed": True})
+        for event in (message, {"type": "retry_session", "data": {}}):
+            store.set_labels(side.id, {"omnigent.closed": "true"})
+            runner.post.reset_mock()
+
+            reopened = await auth_client.post(
+                f"/v1/sessions/{side.id}/events",
+                json=event,
+                headers={"X-Forwarded-Email": _OTHER},
+            )
+
+            assert reopened.status_code == 202, reopened.text
+            ensure.assert_not_awaited()
+            saved = store.get_conversation(side.id)
+            assert saved.runner_id == "runner-shared"
+            assert "omnigent.closed" not in saved.labels
+            forwarded = [call.kwargs["json"] for call in runner.post.await_args_list]
+            assert forwarded[0] == {
+                "type": "codex_side_chat_resume",
+                "codex_side_session_id": side.id,
+            }
+            assert len(forwarded) == (2 if event["type"] == "message" else 1)
+            if event["type"] == "message":
+                assert forwarded[1]["codex_side_thread_id"] == "thread-side"
 
 
 @pytest.mark.parametrize(

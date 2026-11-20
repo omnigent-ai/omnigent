@@ -1,20 +1,54 @@
 import type * as TerminalsModule from "@/hooks/useTerminals";
 import type * as SessionsApi from "@/lib/sessionsApi";
+import type { Session } from "@/lib/types";
+import type * as ConversationEntryStateModule from "@/hooks/useConversationEntryState";
 import type * as FilesPanelModule from "@/shell/FilesPanel";
-import { type ComponentProps, useContext, useState } from "react";
-import { act, cleanup, fireEvent, render, screen, within, waitFor } from "@testing-library/react";
+import type * as GridSessionsModule from "./GridSessionsContext";
+import {
+  type ComponentProps,
+  type ReactElement,
+  type ReactNode,
+  useContext,
+  useState,
+} from "react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render as renderComponent,
+  screen,
+  within,
+  waitFor,
+} from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { emitUiOpenFile } from "@/lib/uiFileRequests";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, expect, it, onTestFinished, vi } from "vitest";
-import { FileViewerContext } from "@/shell/FileViewerContext";
+import { type FileNavigationGuard, FileViewerContext } from "@/shell/FileViewerContext";
 import type { WorkspacePanel } from "@/shell/WorkspacePanel";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { RearrangeableGrid } from "./GridWorkspace";
 import { splitGrid } from "./gridLayout";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
-import { retrySession } from "@/lib/sessionsApi";
+import { retrySession, updateSession } from "@/lib/sessionsApi";
+import { toast } from "sonner";
 import { revealFolderInFilesPanel } from "@/shell/FilesPanel";
+import { selectPullRequestInPanel } from "@/shell/PullRequestPanel";
+import { conversationRegistry } from "@/store/conversationRegistry";
+import { gridCellComposerKey, useChatStore } from "@/store/chatStore";
+import { clearSessionDrafts, setSessionDraft } from "@/lib/sessionDrafts";
+
+const queryClient = new QueryClient();
+const LINKED_PR = "https://github.com/example/app/pull/42";
+
+function render(ui: ReactElement) {
+  return renderComponent(ui, {
+    wrapper: ({ children }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    ),
+  });
+}
 
 const fixture = vi.hoisted(() => ({
   labels: {} as Record<string, string>,
@@ -22,14 +56,41 @@ const fixture = vi.hoisted(() => ({
   terminals: [] as TerminalsModule.TerminalInfo[],
   terminalPending: false,
   composerDisabled: false,
+  transcriptField: false,
   hostOnline: undefined as boolean | undefined,
+  livenessKind: "online",
   failedChat: "",
   failedTerminal: "",
   renderError: new Error("Grid surface render failed"),
+  // Set while a cell's viewer holds unsaved edits and is asking to discard them.
+  discardEdits: null as (() => void) | null,
+  // Sessions the viewer can't edit, and each session's sandbox launch.
+  readOnlySessions: [] as string[],
+  launches: {} as Record<string, { stage: string; error: null }>,
+  inferenceConfigured: undefined as boolean | undefined,
 }));
 vi.mock("@/lib/sessionsApi", async (original) => ({
   ...(await original<typeof SessionsApi>()),
   retrySession: vi.fn(async () => ({ recovered: true })),
+  updateSession: vi.fn(async () => ({ labels: {} })),
+}));
+vi.mock("@/components/HostBadge", () => ({
+  HostBadge: ({
+    sessionId,
+    readOnly,
+    launch,
+  }: {
+    sessionId: string;
+    readOnly?: boolean;
+    launch?: { stage: string } | null;
+  }) => (
+    <span>
+      Host for {sessionId}
+      {readOnly && " (status only)"}
+      {launch && ` (launch ${launch.stage})`}
+      {launch === undefined && " (launch omitted)"}
+    </span>
+  ),
 }));
 vi.mock("@/components/blocks/TerminalView", () => ({
   TerminalView: ({
@@ -47,26 +108,45 @@ vi.mock("@/components/blocks/TerminalView", () => ({
 }));
 
 vi.mock("@/canvas/CanvasWorkspace", () => ({ CanvasWorkspace: () => null }));
+vi.mock("@/shell/PullRequestPanel", () => ({ selectPullRequestInPanel: vi.fn() }));
 vi.mock("@/shell/FilesPanel", async (original) => ({
   ...(await original<typeof FilesPanelModule>()),
   revealFolderInFilesPanel: vi.fn(),
 }));
-vi.mock("@/hooks/useSidebarData", () => ({ useLoadedConversations: () => ({}) }));
+vi.mock("@/hooks/useSidebarData", () => ({
+  useLoadedConversations: () => ({}),
+  useOptionalLoadedConversations: () => undefined,
+}));
 
 vi.mock("@/hooks/useSession", () => ({
   useSession: (id: string) => ({
     session: {
+      id,
       title: id,
+      harness: "claude-native",
       agentId: `agent-${id}`,
       labels: fixture.labels,
       permissionLevel: fixture.permissionLevel,
+      inferenceConfigured: fixture.inferenceConfigured,
     },
   }),
   useRootSessionId: (id: string) => id,
+  sessionQueryOptions: (id: string) => ({
+    queryKey: ["session", id],
+    queryFn: async () => ({ id, title: id }),
+  }),
 }));
-vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: () => true }));
-vi.mock("@/hooks/useConversationEntryState", () => ({
-  useConversationEntryState: () => ({ terminalPending: fixture.terminalPending }),
+vi.mock("@/hooks/usePermissions", () => ({
+  useCanEdit: (id: string) => !fixture.readOnlySessions.includes(id),
+}));
+vi.mock("@/hooks/useConversationEntryState", async (importOriginal) => ({
+  // The real value hook: the cell's picker reads each session's registry entry.
+  ...(await importOriginal<typeof ConversationEntryStateModule>()),
+  useConversationEntryState: (id: string) => ({
+    terminalPending: fixture.terminalPending,
+    claudePermissionMode: "default",
+    sandboxStatus: fixture.launches[id] ?? null,
+  }),
 }));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useRunnerHealthRegistration: () => {},
@@ -76,7 +156,7 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
 vi.mock("@/hooks/useBrowserAgentRelay", () => ({ useBrowserAgentRelay: () => {} }));
 vi.mock("@/hooks/useSessionLiveness", () => ({
   livenessRowFromSession: () => null,
-  useSessionLiveness: () => ({ kind: "online" }),
+  useSessionLiveness: () => ({ kind: fixture.livenessKind }),
 }));
 vi.mock("@/hooks/useChildSessions", () => ({ useChildSessions: () => ({ children: [] }) }));
 vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
@@ -88,21 +168,40 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   useTerminals: () => ({ terminals: fixture.terminals }),
   useDeleteTerminal: () => ({}),
 }));
-vi.mock("./GridSessionsContext", () => ({
+vi.mock("./GridSessionsContext", async (original) => ({
+  ...(await original<typeof GridSessionsModule>()),
   useGridSessions: () => {
     const [selectedSessionId, selectSession] = useState("first");
     return { closePane: vi.fn(), selectedSessionId, selectSession };
   },
-  gridTitle: () => "Test grid",
 }));
 vi.mock("@/components/chat/SideChatPane", () => ({
-  SideChatPane: ({ childId }: { childId: string }) => {
+  SideChatPane: ({
+    childId,
+    gridComposer,
+  }: {
+    childId: string;
+    gridComposer?: {
+      leading?: ReactNode;
+      trailing?: ReactNode;
+      cyclePermissionMode?: () => boolean;
+    };
+  }) => {
     const context = useContext(FileViewerContext)!;
     const terminal = useTerminalFirst();
     if (childId === fixture.failedChat) throw fixture.renderError;
     return (
       <>
-        <textarea aria-label="Message" disabled={fixture.composerDisabled} />
+        <textarea
+          aria-label="Message"
+          data-composer-input=""
+          disabled={fixture.composerDisabled}
+          onKeyDown={(event) => {
+            if (event.key === "Tab" && event.shiftKey && gridComposer?.cyclePermissionMode?.())
+              event.preventDefault();
+          }}
+        />
+        {fixture.transcriptField && <textarea aria-label="Transcript field" />}
         <button type="button" onClick={() => terminal?.setView("terminal")}>
           Open terminal dialog
         </button>
@@ -112,9 +211,24 @@ vi.mock("@/components/chat/SideChatPane", () => ({
         <button type="button" onClick={() => context.registerNavigationGuard?.(() => {})}>
           Block navigation
         </button>
+        <button
+          type="button"
+          onClick={() =>
+            context.registerNavigationGuard?.((_path, _options, navigate) => {
+              fixture.discardEdits = navigate;
+            })
+          }
+        >
+          Edit file
+        </button>
         <button type="button" onClick={() => context.openFolder?.("/workspace/experimental")}>
           Open folder
         </button>
+        <button type="button" onClick={() => context.openGithubTab(LINKED_PR)}>
+          Open PR
+        </button>
+        {gridComposer?.leading}
+        {gridComposer?.trailing}
       </>
     );
   },
@@ -158,6 +272,7 @@ vi.mock("@/shell/WorkspacePanel", () => ({
 
 afterEach(() => {
   cleanup();
+  queryClient.clear();
   localStorage.clear();
   sessionStorage.clear();
   fixture.labels = {};
@@ -165,10 +280,85 @@ afterEach(() => {
   fixture.terminals = [];
   fixture.terminalPending = false;
   fixture.composerDisabled = false;
+  fixture.transcriptField = false;
   fixture.hostOnline = undefined;
+  fixture.livenessKind = "online";
   fixture.failedChat = "";
   fixture.failedTerminal = "";
+  fixture.discardEdits = null;
+  fixture.readOnlySessions = [];
+  fixture.launches = {};
+  fixture.inferenceConfigured = undefined;
   vi.restoreAllMocks();
+});
+
+/** A two-cell grid of "first" and "second". */
+const twoCellGrid = () => (
+  <MemoryRouter>
+    <TooltipProvider>
+      <RearrangeableGrid
+        grid={{ id: "two-cells", layout: splitGrid("first", "first", "second", "right")! }}
+      />
+    </TooltipProvider>
+  </MemoryRouter>
+);
+
+it("shows each cell's session controls and targets that session's permission mode", async () => {
+  fixture.labels = { "omnigent.wrapper": "claude-code-native-ui" };
+  document.title = "Single session";
+  const view = render(twoCellGrid());
+  // Named from the cells' snapshots; neither session is on a loaded sidebar page.
+  await waitFor(() => expect(document.title).toBe("first + second"));
+  const second = within(screen.getByRole("region", { name: "second" }));
+  expect(second.getByText("Host for second")).toBeInTheDocument();
+  expect(second.getByRole("button", { name: "Configure session" })).toBeEnabled();
+  fireEvent.pointerDown(second.getByRole("button", { name: "Permission mode: Manual" }), {
+    button: 0,
+  });
+  fireEvent.click(screen.getByTestId("composer-permission-option-auto"));
+  await waitFor(() =>
+    expect(updateSession).toHaveBeenCalledWith("second", { claudePermissionMode: "auto" }),
+  );
+  // A rejected switch reports why and frees the chip for another try.
+  const toastError = vi.spyOn(toast, "error").mockReturnValue("error");
+  vi.mocked(updateSession).mockRejectedValueOnce(new Error("Runner unavailable"));
+  const chip = () => second.getByRole("button", { name: "Permission mode: Manual" });
+  fireEvent.pointerDown(chip(), { button: 0 });
+  fireEvent.click(screen.getByTestId("composer-permission-option-plan"));
+  await waitFor(() => expect(toastError).toHaveBeenCalledWith("Runner unavailable"));
+  await waitFor(() => expect(chip()).toBeEnabled());
+  // Only the owner can switch modes.
+  fixture.permissionLevel = 2;
+  view.rerender(twoCellGrid());
+  expect(chip()).toBeDisabled();
+  fixture.permissionLevel = null;
+  // Like the main composer, an unreachable session's chip can't switch modes.
+  fixture.livenessKind = "host_offline";
+  view.rerender(twoCellGrid());
+  expect(second.getByRole("button", { name: "Permission mode: Manual" })).toBeDisabled();
+  view.unmount();
+  expect(document.title).toBe("Single session");
+});
+
+it("gives each cell its own host-switch access and launch progress", () => {
+  fixture.readOnlySessions = ["first"];
+  fixture.launches = { second: { stage: "provisioning", error: null } };
+  render(twoCellGrid());
+  // The active cell's name gains an " (active)" suffix, hence the prefix match.
+  const first = within(screen.getByRole("region", { name: /^first/ }));
+  const second = within(screen.getByRole("region", { name: "second" }));
+  // A cell with no launch passes null, so its badge never shows the open session's.
+  expect(first.getByText("Host for first (status only)")).toBeInTheDocument();
+  expect(second.getByText("Host for second (launch provisioning)")).toBeInTheDocument();
+});
+
+it("opens each cell with its session's saved draft", () => {
+  onTestFinished(clearSessionDrafts);
+  setSessionDraft("second", { text: "half-typed", files: [] });
+  render(twoCellGrid());
+  const composers = useChatStore.getState().sideChatComposers;
+  expect(composers[gridCellComposerKey("second")]?.text).toBe("half-typed");
+  expect(composers[gridCellComposerKey("first")]).toBeUndefined();
 });
 
 it("opens agent-requested files only in the active workspace and respects navigation guards", () => {
@@ -193,7 +383,61 @@ it("opens agent-requested files only in the active workspace and respects naviga
   expect(screen.getByTestId("workspace-first")).not.toHaveTextContent("blocked.md");
 });
 
-it("browses a chat-linked folder in the Files tab of that pane's workspace", () => {
+/** The shell's file-viewer context, collecting the guards registered with it. */
+function shellFileViewerContext(guards: Set<FileNavigationGuard>) {
+  return {
+    openFile: vi.fn(),
+    registerNavigationGuard: (guard: FileNavigationGuard) => {
+      guards.add(guard);
+      return () => void guards.delete(guard);
+    },
+    openGithubTab: vi.fn(),
+    isChangedPath: () => false,
+    conversationId: undefined,
+    workspaceRoot: null,
+    workspaceHome: null,
+  };
+}
+
+it("asks each cell's viewer before the shell's Close leaves the grid", () => {
+  // Stands in for AppShell: its Close runs every registered guard, then leaves.
+  const shellGuards = new Set<FileNavigationGuard>();
+  const shellContext = shellFileViewerContext(shellGuards);
+  const leave = vi.fn();
+  const closeFromShell = () => {
+    const guards = [...shellGuards];
+    const next = (index: number): void => {
+      const guard = guards[index];
+      if (guard) guard(null, undefined, () => next(index + 1));
+      else leave();
+    };
+    next(0);
+  };
+  render(
+    <MemoryRouter>
+      <TooltipProvider>
+        <FileViewerContext.Provider value={shellContext}>
+          <RearrangeableGrid
+            grid={{ id: "dirty-close", layout: splitGrid("first", "first", "second", "right")! }}
+          />
+        </FileViewerContext.Provider>
+      </TooltipProvider>
+    </MemoryRouter>,
+  );
+  const second = screen.getByRole("region", { name: "second" });
+  fireEvent.click(within(second).getByText("Edit file"));
+
+  // Keep editing: the viewer never calls back, so the grid stays.
+  act(() => closeFromShell());
+  expect(fixture.discardEdits).not.toBeNull();
+  expect(leave).not.toHaveBeenCalled();
+
+  // Discard changes: leaving goes ahead.
+  act(() => fixture.discardEdits?.());
+  expect(leave).toHaveBeenCalledOnce();
+});
+
+it("opens chat-linked folders and PRs in that pane's workspace", () => {
   writeSessionWorkspaceState("first", { rightRailTab: "subagents" });
   render(
     <MemoryRouter>
@@ -208,7 +452,9 @@ it("browses a chat-linked folder in the Files tab of that pane's workspace", () 
   const first = within(screen.getByRole("region", { name: "first (active)" }));
   fireEvent.click(first.getByText("Block navigation"));
   fireEvent.click(first.getByText("Open folder"));
+  fireEvent.click(first.getByText("Open PR"));
   expect(revealFolderInFilesPanel).not.toHaveBeenCalledWith("first", expect.anything());
+  expect(selectPullRequestInPanel).not.toHaveBeenCalled();
   expect(screen.getByTestId("workspace-first")).toHaveAttribute("data-tab", "subagents");
   expect(screen.getByTestId("workspace-first")).toHaveAttribute("aria-hidden", "true");
 
@@ -219,6 +465,125 @@ it("browses a chat-linked folder in the Files tab of that pane's workspace", () 
   expect(workspace).toHaveAttribute("data-testid", "workspace-second");
   expect(workspace).toHaveAttribute("data-tab", "files");
   expect(workspace).toHaveTextContent("No file");
+
+  fireEvent.click(
+    within(screen.getByRole("region", { name: "second (active)" })).getByText("Open PR"),
+  );
+  expect(selectPullRequestInPanel).toHaveBeenCalledWith(queryClient, "second", LINKED_PR);
+  expect(workspace).toHaveAttribute("data-tab", "github");
+});
+
+/** Renders the two-cell grid with both cells on claude-native sessions in "Manual" mode. */
+function renderClaudeCells() {
+  fixture.labels = { "omnigent.wrapper": "claude-code-native-ui" };
+  for (const id of ["first", "second"]) {
+    conversationRegistry.acquire(id).setState({ claudePermissionMode: "default" });
+  }
+  onTestFinished(() => conversationRegistry.clear());
+  vi.mocked(updateSession).mockClear();
+  return render(twoCellGrid());
+}
+
+/** Shift+Tab in the named cell's composer; false when the cell took the key. */
+function pressShiftTab(cellName: string) {
+  return fireEvent.keyDown(
+    within(screen.getByRole("region", { name: cellName })).getByLabelText("Message"),
+    { key: "Tab", shiftKey: true },
+  );
+}
+
+/** Waits until the named cell's chip is enabled, so its switch has settled. */
+async function settled(cellName: string) {
+  await waitFor(() =>
+    expect(
+      within(screen.getByRole("region", { name: cellName })).getByRole("button", {
+        name: "Permission mode: Manual",
+      }),
+    ).toBeEnabled(),
+  );
+}
+
+/** A PATCH response in which the server confirms *mode* for a claude-native session. */
+const claudeSessionConfirming = (mode: string) =>
+  ({ labels: { "omnigent.claude_native.permission_mode": mode } }) as unknown as Session;
+
+it("steps only the Shift+Tab cell's session to its next mode, for its owner and while reachable", async () => {
+  const view = renderClaudeCells();
+  expect(pressShiftTab("second")).toBe(false);
+  await waitFor(() =>
+    expect(updateSession).toHaveBeenCalledWith("second", { claudePermissionMode: "auto" }),
+  );
+  expect(updateSession).toHaveBeenCalledTimes(1);
+  await settled("second");
+
+  // The mocked PATCH cleared this cell's mode; restore it so only the gate can stop a press.
+  // Only the owner can switch modes.
+  conversationRegistry.acquire("second").setState({ claudePermissionMode: "default" });
+  fixture.permissionLevel = 2;
+  view.rerender(twoCellGrid());
+  expect(pressShiftTab("second")).toBe(true);
+  // Like the main composer, an unreachable session doesn't cycle.
+  conversationRegistry.acquire("second").setState({ claudePermissionMode: "default" });
+  fixture.permissionLevel = null;
+  fixture.livenessKind = "host_offline";
+  view.rerender(twoCellGrid());
+  expect(pressShiftTab("second")).toBe(true);
+  expect(updateSession).toHaveBeenCalledTimes(1);
+  view.unmount();
+});
+
+it("holds a cell's Shift+Tab while its switch is in flight", () => {
+  const view = renderClaudeCells();
+  vi.mocked(updateSession).mockReturnValueOnce(new Promise<never>(() => {}));
+  expect(pressShiftTab("second")).toBe(false);
+  expect(pressShiftTab("second")).toBe(false);
+  expect(updateSession).toHaveBeenCalledTimes(1);
+  view.unmount();
+});
+
+it("moves a cell past the mode its session refused on the next Shift+Tab", async () => {
+  const toastError = vi.spyOn(toast, "error").mockReturnValue("error");
+  const view = renderClaudeCells();
+  vi.mocked(updateSession).mockRejectedValueOnce(new Error("Runner unavailable"));
+  pressShiftTab("second");
+  await waitFor(() => expect(toastError).toHaveBeenCalledWith("Runner unavailable"));
+  await settled("second");
+  pressShiftTab("second");
+  await waitFor(() =>
+    expect(updateSession).toHaveBeenLastCalledWith("second", {
+      claudePermissionMode: "acceptEdits",
+    }),
+  );
+  view.unmount();
+});
+
+it("steps a cell on from the mode its session confirmed", async () => {
+  const view = renderClaudeCells();
+  vi.mocked(updateSession).mockResolvedValueOnce(claudeSessionConfirming("auto"));
+  pressShiftTab("second");
+  await settled("second");
+  pressShiftTab("second");
+  await waitFor(() =>
+    expect(updateSession).toHaveBeenLastCalledWith("second", {
+      claudePermissionMode: "acceptEdits",
+    }),
+  );
+  view.unmount();
+});
+
+it("moves a cell past the mode its session confirmed as a different one", async () => {
+  const view = renderClaudeCells();
+  // The server kept the session in Manual rather than the requested Auto.
+  vi.mocked(updateSession).mockResolvedValueOnce(claudeSessionConfirming("default"));
+  pressShiftTab("second");
+  await settled("second");
+  pressShiftTab("second");
+  await waitFor(() =>
+    expect(updateSession).toHaveBeenLastCalledWith("second", {
+      claudePermissionMode: "acceptEdits",
+    }),
+  );
+  view.unmount();
 });
 
 it("keeps cell views, input, permissions and shortcut targets independent", async () => {
@@ -346,6 +711,7 @@ it.each(["chat", "terminal"])(
 );
 
 it("cycles keyboard focus through cells and toggles the grid workspace from the keyboard", () => {
+  fixture.transcriptField = true;
   fixture.labels = { "omnigent.ui": "terminal" };
   fixture.terminals = [{ id: "terminal_tui_main", name: "tui", session: "main", running: true }];
   const layout = splitGrid(
@@ -404,6 +770,7 @@ it("cycles keyboard focus through cells and toggles the grid workspace from the 
 
 it("focuses the cell itself when its composer is not ready", () => {
   fixture.composerDisabled = true;
+  fixture.transcriptField = true;
   render(
     <MemoryRouter>
       <RearrangeableGrid
@@ -481,6 +848,9 @@ it("shares one workspace, preserves per-session files and drafts, and persists g
   fireEvent.click(within(first).getByText("Open citation"));
   let workspace = screen.getByRole("complementary", { name: "Workspace" });
   expect(workspace).toHaveAttribute("data-width", "480");
+  const flyoutBoundary = first.closest<HTMLElement>("[data-flyout-boundary]");
+  expect(flyoutBoundary).toBe(screen.getByTestId("session-grid"));
+  expect(flyoutBoundary).not.toContainElement(workspace);
   expect(workspace).toHaveTextContent("notes.md7agent-first");
   expect(workspace).toHaveAttribute("data-end-line", "9");
   fireEvent.change(within(workspace).getByRole("textbox", { name: "File draft" }), {
@@ -529,4 +899,99 @@ it("shares one workspace, preserves per-session files and drafts, and persists g
     "data-width",
     "504",
   );
+});
+
+const CELL_MODELS = [
+  { id: "opus", displayName: "Opus" },
+  { id: "sonnet", displayName: "Sonnet" },
+];
+
+/** The named cell's model picker trigger. */
+function cellModelTrigger(cellName: string) {
+  return within(screen.getByRole("region", { name: new RegExp(`^${cellName}`) })).getByRole(
+    "button",
+    { name: "Configure session" },
+  );
+}
+
+/** Opens the named cell's model list with the keyboard, as in the composer. */
+function openCellModelList(cellName: string) {
+  fireEvent.keyDown(cellModelTrigger(cellName), { key: "ArrowDown" });
+  fireEvent.click(screen.getByTestId("composer-agent-edit"));
+}
+
+it("shows each cell's own model, not the active conversation's", () => {
+  const initialChatState = useChatStore.getState();
+  onTestFinished(() => useChatStore.setState(initialChatState, true));
+  useChatStore.setState({ conversationId: "active", llmModel: "opus" });
+  const view = renderClaudeCells();
+  act(() => {
+    conversationRegistry.acquire("first").setState({ codexModelOptions: CELL_MODELS });
+    conversationRegistry
+      .acquire("second")
+      .setState({ llmModel: "sonnet", codexModelOptions: CELL_MODELS });
+  });
+  expect(
+    within(screen.getByRole("region", { name: "second" })).getByTestId("composer-config-gear"),
+  ).toHaveTextContent("Sonnet");
+  expect(
+    within(screen.getByRole("region", { name: /^first/ })).getByTestId("composer-config-gear"),
+  ).not.toHaveTextContent(/opus/i);
+  view.unmount();
+});
+
+it("writes a cell's model pick to its own session, and leaves the other cell's picker free", async () => {
+  const view = renderClaudeCells();
+  act(() => {
+    for (const id of ["first", "second"])
+      conversationRegistry.acquire(id).setState({ codexModelOptions: CELL_MODELS });
+  });
+  // The first cell's switch stays in flight; the second cell's picker must still work.
+  vi.mocked(updateSession).mockReturnValueOnce(new Promise<never>(() => {}));
+  openCellModelList("first");
+  fireEvent.click(screen.getByTestId("composer-agent-model-opus"));
+  await waitFor(() =>
+    expect(updateSession).toHaveBeenCalledWith("first", { modelOverride: "opus" }),
+  );
+  expect(cellModelTrigger("first")).toBeDisabled();
+  openCellModelList("second");
+  fireEvent.click(screen.getByTestId("composer-agent-model-sonnet"));
+  await waitFor(() =>
+    expect(updateSession).toHaveBeenCalledWith("second", { modelOverride: "sonnet" }),
+  );
+  expect(updateSession).toHaveBeenCalledTimes(2);
+  view.unmount();
+});
+
+it("keeps each cell's picker inert for a read-only viewer and while its session is unreachable", () => {
+  // The composer is hidden from a viewer who can't edit in production; this checks the picker's own gate.
+  fixture.readOnlySessions = ["first"];
+  const view = renderClaudeCells();
+  expect(cellModelTrigger("first")).toHaveAttribute("aria-disabled", "true");
+  expect(cellModelTrigger("second")).toHaveAttribute("aria-disabled", "false");
+  fireEvent.keyDown(cellModelTrigger("first"), { key: "ArrowDown" });
+  expect(screen.queryByTestId("composer-agent-edit")).not.toBeInTheDocument();
+  fixture.livenessKind = "host_offline";
+  view.rerender(twoCellGrid());
+  expect(cellModelTrigger("second")).toHaveAttribute("aria-disabled", "true");
+  fireEvent.keyDown(cellModelTrigger("second"), { key: "ArrowDown" });
+  expect(screen.queryByTestId("composer-agent-edit")).not.toBeInTheDocument();
+  expect(updateSession).not.toHaveBeenCalled();
+  view.unmount();
+});
+
+it("keeps a Claude Code sub-agent child's picker disabled, with no PATCH, even with configured inference", () => {
+  fixture.labels = { "omnigent.wrapper": "claude-code-native-ui-subagent" };
+  fixture.inferenceConfigured = true;
+  for (const id of ["first", "second"])
+    conversationRegistry.acquire(id).setState({ codexModelOptions: CELL_MODELS });
+  onTestFinished(() => conversationRegistry.clear());
+  vi.mocked(updateSession).mockClear();
+  const view = render(twoCellGrid());
+  // Editable and reachable, with models offered: only the read-only sub-agent gate disables it.
+  expect(cellModelTrigger("second")).toHaveAttribute("aria-disabled", "true");
+  fireEvent.keyDown(cellModelTrigger("second"), { key: "ArrowDown" });
+  expect(screen.queryByTestId("composer-agent-edit")).not.toBeInTheDocument();
+  expect(updateSession).not.toHaveBeenCalled();
+  view.unmount();
 });

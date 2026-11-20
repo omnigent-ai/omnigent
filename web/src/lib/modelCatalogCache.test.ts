@@ -4,6 +4,8 @@ import { getCurrentUserId } from "./identity";
 import {
   modelCatalogCacheKey,
   readModelCatalogCache,
+  SANDBOX_SESSION_CATALOG_MAX_AGE_MS,
+  sandboxSessionCatalogKey,
   writeModelCatalogCache,
 } from "./modelCatalogCache";
 
@@ -25,6 +27,7 @@ beforeEach(() => {
   vi.mocked(getCurrentUserId).mockReturnValue("alice");
 });
 afterEach(() => {
+  document.cookie = "omnigent_admin_view=; Max-Age=0; Path=/";
   vi.restoreAllMocks();
   vi.useRealTimers();
 });
@@ -45,12 +48,13 @@ it("does not restore Fusion configurations as selectable model IDs", () => {
   expect(readModelCatalogCache(key())?.models).toEqual(models);
 });
 
-it.each(["server", "user", "target", "kind", "harness", "agent"])(
+it.each(["server", "user", "target", "kind", "harness", "agent", "view"])(
   "isolates catalogs by %s",
   (dimension) => {
     writeModelCatalogCache(key(), models, true);
     if (dimension === "server") vi.mocked(getOmnigentServerIdentity).mockReturnValue("server-b");
     if (dimension === "user") vi.mocked(getCurrentUserId).mockReturnValue("bob");
+    if (dimension === "view") document.cookie = "omnigent_admin_view=off; Path=/";
     const other = modelCatalogCacheKey(
       dimension === "kind" ? "host" : "sandbox",
       dimension === "target" ? "other-provider" : "company",
@@ -109,4 +113,76 @@ it("tolerates unavailable browser storage", () => {
   });
   expect(() => writeModelCatalogCache(key(), models, true)).not.toThrow();
   expect(readModelCatalogCache(key())).toBeNull();
+});
+
+it("reads a runner-reported catalog that sends null for unset fields", () => {
+  const sessionKey = sandboxSessionCatalogKey("company", "claude-native", "ag_1");
+  window.localStorage.setItem(
+    sessionKey!,
+    JSON.stringify({
+      models: [
+        {
+          id: "system.ai.claude-sonnet-5-5",
+          model: "system.ai.claude-sonnet-5-5",
+          displayName: "Claude Sonnet 5.5",
+          defaultReasoningEffort: null,
+          supportedReasoningEfforts: [],
+          isDefault: null,
+          source: { kind: "databricks", label: "Workspace", name: "DEFAULT" },
+        },
+      ],
+      configured: false,
+      savedAt: Date.now(),
+    }),
+  );
+  const saved = readModelCatalogCache(sessionKey, SANDBOX_SESSION_CATALOG_MAX_AGE_MS);
+  expect(saved?.models).toEqual([
+    {
+      id: "system.ai.claude-sonnet-5-5",
+      model: "system.ai.claude-sonnet-5-5",
+      displayName: "Claude Sonnet 5.5",
+      supportedReasoningEfforts: [],
+      source: { kind: "databricks", label: "Workspace", name: "DEFAULT" },
+    },
+  ]);
+});
+
+it("keeps session catalogs apart from previews and other agents, for a week", () => {
+  vi.useFakeTimers();
+  const now = Date.now();
+  const sessionKey = sandboxSessionCatalogKey("company", "codex-native", "ag_1");
+  writeModelCatalogCache(sessionKey, models, false);
+  document.cookie = "omnigent_admin_view=off; Path=/";
+  expect(
+    readModelCatalogCache(sandboxSessionCatalogKey("company", "codex-native", "ag_1")),
+  ).toBeNull();
+  document.cookie = "omnigent_admin_view=; Max-Age=0; Path=/";
+  expect(readModelCatalogCache(key())).toBeNull();
+  expect(
+    readModelCatalogCache(sandboxSessionCatalogKey("company", "claude-native", "ag_1")),
+  ).toBeNull();
+  expect(
+    readModelCatalogCache(sandboxSessionCatalogKey("other", "codex-native", "ag_1")),
+  ).toBeNull();
+  expect(
+    readModelCatalogCache(sandboxSessionCatalogKey("company", "codex-native", "ag_2")),
+  ).toBeNull();
+  vi.setSystemTime(now + 2 * 24 * 60 * 60 * 1000);
+  expect(readModelCatalogCache(sessionKey, SANDBOX_SESSION_CATALOG_MAX_AGE_MS)?.models).toEqual(
+    models,
+  );
+  vi.setSystemTime(now + SANDBOX_SESSION_CATALOG_MAX_AGE_MS + 1);
+  expect(readModelCatalogCache(sessionKey, SANDBOX_SESSION_CATALOG_MAX_AGE_MS)).toBeNull();
+  expect(sandboxSessionCatalogKey(null, "codex-native", "ag_1")).toBeNull();
+  expect(sandboxSessionCatalogKey("company", "codex-native", null)).toBeNull();
+  vi.mocked(getCurrentUserId).mockReturnValue("bob");
+  expect(sandboxSessionCatalogKey("company", "codex-native", "ag_1")).not.toBe(sessionKey);
+  vi.mocked(getCurrentUserId).mockReturnValue("alice");
+  vi.mocked(getOmnigentServerIdentity).mockReturnValue("server-b");
+  expect(sandboxSessionCatalogKey("company", "codex-native", "ag_1")).not.toBe(sessionKey);
+  vi.mocked(getOmnigentServerIdentity).mockReturnValue(null);
+  expect(sandboxSessionCatalogKey("company", "codex-native", "ag_1")).toBeNull();
+  vi.mocked(getOmnigentServerIdentity).mockReturnValue("server-a");
+  vi.mocked(getCurrentUserId).mockReturnValue(null);
+  expect(sandboxSessionCatalogKey("company", "codex-native", "ag_1")).toBeNull();
 });

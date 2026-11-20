@@ -50,6 +50,8 @@ export interface ZoomableImageProps extends React.ComponentProps<"img"> {
   /** Display source. May be undefined while the image is still resolving. */
   src?: string;
   alt: string;
+  /** Optional sizing for the button around the image. */
+  buttonClassName?: string;
 }
 
 /**
@@ -57,16 +59,25 @@ export interface ZoomableImageProps extends React.ComponentProps<"img"> {
  * button carries the interaction (click + Enter/Space + focus ring, all native
  * to a button); the inner `<img>` keeps its `role="img"` and alt-derived name,
  * so screen readers and tests still see a real image. Activation is a no-op
- * until `src` resolves. `className` styles the inner `<img>` (sizing,
- * `object-contain`, etc.) — the button is a layout-transparent wrapper.
+ * until `src` resolves. `className` styles the image; `buttonClassName` can
+ * reserve a stable hit target around a smaller image.
  */
-export function ZoomableImage({ src, alt, className, ...imgProps }: ZoomableImageProps) {
+export function ZoomableImage({
+  src,
+  alt,
+  className,
+  buttonClassName,
+  ...imgProps
+}: ZoomableImageProps) {
   const { open } = useLightbox();
   return (
     <button
       type="button"
       aria-label={alt ? `Zoom image: ${alt}` : "Zoom image"}
-      className="m-0 inline-flex max-w-full cursor-zoom-in appearance-none border-0 bg-transparent p-0 leading-none"
+      className={cn(
+        "m-0 inline-flex max-w-full cursor-zoom-in appearance-none border-0 bg-transparent p-0 leading-none",
+        buttonClassName,
+      )}
       onClick={() => {
         if (src) open({ src, alt });
       }}

@@ -64,7 +64,7 @@ def is_databricks_ai_gateway_url(base_url: str) -> bool:
 
     1. **Dedicated Unity Gateway subdomain** — ``ai-gateway`` is a full DNS label
        in the hostname (e.g. ``<id>.ai-gateway.cloud.databricks.com``). Used by
-       the standard ``isaac configure codex`` setup.
+       the standard Codex gateway setup.
     2. **Workspace-hosted gateway** — the hostname is a plain Databricks
        workspace (under a trusted parent domain) and the path starts with
        ``/ai-gateway/`` (e.g. ``<workspace>.cloud.databricks.com/ai-gateway/...``).
@@ -259,13 +259,12 @@ def gateway_attribution_headers(
     :param client_surface: The session's creating interface, e.g. ``"desktop"``;
         ``None`` or an unknown value sends only ``omnigent``.
     :returns: e.g. ``{"Databricks-Custom-Coding-Agent": "codex",
-        "Databricks-Custom-Client-Surfaces": "omnigent, omnigent-desktop, ug"}``.
+        "Databricks-Custom-Client-Surfaces": "omnigent-desktop, ug"}``.
     """
     qualified = _OMNIGENT_CLIENT_SURFACES.get(client_surface or "")
-    stale = set(_OMNIGENT_CLIENT_SURFACES.values())
+    stale = {"omnigent", *_OMNIGENT_CLIENT_SURFACES.values()}
     candidates = (
-        "omnigent",
-        *((qualified,) if qualified else ()),
+        qualified or "omnigent",
         *(surface for surface in client_surfaces if surface.strip().lower() not in stale),
         *(("ug",) if via_ug else ()),
     )
