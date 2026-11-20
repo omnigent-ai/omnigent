@@ -194,12 +194,9 @@ export function QuickPickCommandPalette({
       : [];
 
   const { visibleSessions, contentSessions, searching } = search;
-  const pageItems =
-    childPage?.kind === "setting-choices"
-      ? settingPage.items
-      : childPage?.kind === "command-options"
-        ? optionsPage.items
-        : null;
+  const activePage =
+    childPage?.kind === "setting-choices" ? settingPage : childPage ? optionsPage : null;
+  const pageItems = activePage?.items ?? null;
   const rootSegments: QuickPickSegment<PaletteRow>[] = [
     {
       sourceId: "sessions",
@@ -237,7 +234,7 @@ export function QuickPickCommandPalette({
               shortcut: action.shortcut,
               value: { kind: "action", action },
             })),
-            // The app's registry commands join its other actions.
+            // Registry commands without a feature are the app's own, so they list as Actions.
             ...commandItems
               .filter((item) => item.group === undefined)
               .map((item): QuickPickItem<PaletteRow> => ({
@@ -289,7 +286,6 @@ export function QuickPickCommandPalette({
         setParkedId(activeChoice);
         return "keepOpen";
       }
-      // A command that asks which first opens its options.
       if (command.options) {
         optionsPage.openOptions(command, item.id, row.targetKey, { query, activeId: item.id });
         setPageQuery("");
@@ -338,6 +334,11 @@ export function QuickPickCommandPalette({
         )}
       </p>
     ) : null;
+  // As in today's palette, a load error or loading message stands in for the empty one.
+  const rootEmptyMessage = (): string | null => {
+    if (loadStatus) return null;
+    return search.searchFetching ? "Searching…" : "No results found";
+  };
   // The cap stays visible with a load message, so hidden matches are never a surprise.
   const capStatus = sessionsOnly && search.sessions.length > search.visibleSessions.length && (
     <p role="status" className="px-3 py-2 text-xs text-muted-foreground">
@@ -410,16 +411,7 @@ export function QuickPickCommandPalette({
       activeId={parkedId}
       onActiveIdChange={() => setParkedId(null)}
       inputTestId="command-palette-input"
-      // As in today's palette, a load error or loading message stands in for the empty one.
-      emptyMessage={
-        childPage
-          ? (optionsPage.empty ?? pageCopy?.empty)
-          : loadStatus
-            ? null
-            : search.searchFetching
-              ? "Searching…"
-              : "No results found"
-      }
+      emptyMessage={childPage ? (optionsPage.empty ?? pageCopy?.empty) : rootEmptyMessage()}
       status={childPage ? undefined : status}
       listEnd={childPage ? undefined : olderSessions}
       inputEnd={

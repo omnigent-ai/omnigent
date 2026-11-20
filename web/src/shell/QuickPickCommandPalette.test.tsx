@@ -5,7 +5,11 @@ import { FlagIcon } from "lucide-react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { readQuickPickHistory } from "@/components/ui/quick-pick";
-import { type PaletteCommand, usePaletteCommandsStore } from "@/store/paletteCommands";
+import {
+  type PaletteCommand,
+  unavailableBecause,
+  usePaletteCommandsStore,
+} from "@/store/paletteCommands";
 
 import { QuickPickCommandPalette } from "./QuickPickCommandPalette";
 
@@ -256,15 +260,28 @@ describe("QuickPickCommandPalette feature commands", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
-  it("keeps the palette open when the accepted row's command was withdrawn or greyed out since", () => {
-    const later = command("Later");
-    offer([later]);
-    const { input, onOpenChange } = renderPalette();
-    fireEvent.change(input, { target: { value: "later" } });
-    // Withdrawn between the render and the accept, as a feature unmounting would.
-    usePaletteCommandsStore.setState({ groups: {} });
-    fireEvent.keyDown(input, { key: "Enter" });
-    expect(later.run).not.toHaveBeenCalled();
-    expect(onOpenChange).not.toHaveBeenCalled();
-  });
+  it.each(["withdrawn", "greyed out"] as const)(
+    "keeps the palette open when the accepted row's command was %s since",
+    (change) => {
+      const later = command("Later");
+      offer([later]);
+      const { input, onOpenChange } = renderPalette();
+      fireEvent.change(input, { target: { value: "later" } });
+      // Changed between the render and the accept, as a feature unmounting or updating would.
+      usePaletteCommandsStore.setState({
+        groups:
+          change === "withdrawn"
+            ? {}
+            : {
+                tabs: {
+                  heading: "Workspace",
+                  commands: [{ ...later, availability: unavailableBecause("Not now.") }],
+                },
+              },
+      });
+      fireEvent.keyDown(input, { key: "Enter" });
+      expect(later.run).not.toHaveBeenCalled();
+      expect(onOpenChange).not.toHaveBeenCalled();
+    },
+  );
 });

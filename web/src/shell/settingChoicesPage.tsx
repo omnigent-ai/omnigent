@@ -1,8 +1,6 @@
-// A setting's page in ⌘K: every value, the current one marked, opened from the
-// setting's row. It stays bound to that row's setting, owner and command target:
-// if any of them changes it goes back instead of choosing for whatever offers the
-// setting now. Choosing applies the value and returns to the row, which then shows
-// the value the owner reports, never the one picked.
+// A setting's ⌘K page: its values, the current one marked. It goes back without choosing if
+// the setting, its owner or the command target changes; after a choice, the row shows the
+// value the owner reports.
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useStore } from "zustand";
