@@ -76,6 +76,7 @@ export function QuickPickCommandPalette({
   onToggleLeftSidebar,
   onToggleRightSidebar,
   rightSidebarShortcutEnabled = true,
+  onGoToSession,
 }: CommandPaletteProps) {
   const navigate = useNavigate();
   const isMobile = useIsMobileViewport();
@@ -93,7 +94,7 @@ export function QuickPickCommandPalette({
   const region = useCommandRegion(open);
   const readRegion = useCommandRegionReader();
   const targetKey = commandTargetKey(context, region);
-  const appCommands = useQuickPickAppCommands();
+  const appCommands = useQuickPickAppCommands({ onGoToSession });
   // Every registry row: the app's own, ungrouped, then each feature's under its heading.
   const commandItems = useMemo(
     () => paletteCommandItems(appCommands, featureGroups, targetKey),

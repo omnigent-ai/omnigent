@@ -33,6 +33,7 @@ function renderOverlays(features: Record<string, boolean> | "loading", sessionSe
     setCommandPaletteOpen: vi.fn(),
     toggleLeftSidebar: vi.fn(),
     toggleRightPanel: vi.fn(),
+    goToSession: vi.fn(),
     gridRoute: false,
     allConversations: undefined,
     serverConversationId: undefined,

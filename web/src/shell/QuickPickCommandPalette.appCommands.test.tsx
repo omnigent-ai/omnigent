@@ -54,6 +54,67 @@ const actionNames = () =>
     .getAllByRole("option")
     .map((option) => option.textContent ?? "");
 
+describe("QuickPick ⌘K Go to Session…", () => {
+  // As the shell does: the palette continues in its sessions-only mode, as a fresh palette.
+  function Shell() {
+    const [open, setOpen] = useState(false);
+    const [sessionsOnly, setSessionsOnly] = useState(false);
+    return (
+      <>
+        <button
+          type="button"
+          onClick={() => {
+            setSessionsOnly(false);
+            setOpen(true);
+          }}
+        >
+          Search
+        </button>
+        <QuickPickCommandPalette
+          key={sessionsOnly ? "sessions" : "commands"}
+          sessionsOnly={sessionsOnly}
+          open={open}
+          onOpenChange={setOpen}
+          onToggleLeftSidebar={vi.fn()}
+          onToggleRightSidebar={vi.fn()}
+          onGoToSession={() => setSessionsOnly(true)}
+        />
+      </>
+    );
+  }
+
+  it("switches the open palette to sessions, focused, and Escape returns where ⌘K opened", async () => {
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Shell />
+      </QueryClientProvider>,
+    );
+    const opener = screen.getByRole("button", { name: "Search" });
+    opener.focus();
+    fireEvent.click(opener);
+    const input = await screen.findByTestId("command-palette-input");
+    fireEvent.change(input, { target: { value: "go to session" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    const sessions = await screen.findByRole("combobox", { name: "Switch session" });
+    await waitFor(() => expect(sessions).toHaveFocus());
+    // The palette it replaced finishes closing without taking focus back.
+    await act(async () => {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 20);
+      });
+    });
+    expect(sessions).toHaveFocus();
+    fireEvent.keyDown(sessions, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(opener).toHaveFocus());
+  });
+
+  it("isn't offered where the palette can't switch", () => {
+    renderPalette();
+    expect(actionNames().some((name) => name.includes("Go to Session"))).toBe(false);
+  });
+});
+
 describe("QuickPick ⌘K app commands", () => {
   it("opens the keyboard shortcuts once the palette has closed", async () => {
     const opened = vi.fn(() => expect(screen.queryByRole("dialog")).toBeNull());

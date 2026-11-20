@@ -23,6 +23,8 @@ export interface AppShellOverlaysProps {
   setCommandPaletteOpen: (open: boolean) => void;
   toggleLeftSidebar: () => void;
   toggleRightPanel: () => void;
+  /** Switches the open palette to searching sessions only. */
+  goToSession: () => void;
   gridRoute: boolean;
   allConversations: Conversation[] | undefined;
   serverConversationId: string | undefined;
@@ -42,6 +44,7 @@ export function AppShellOverlays({
   setCommandPaletteOpen,
   toggleLeftSidebar,
   toggleRightPanel,
+  goToSession,
   gridRoute,
   allConversations,
   serverConversationId,
@@ -76,6 +79,7 @@ export function AppShellOverlays({
         onToggleLeftSidebar={toggleLeftSidebar}
         onToggleRightSidebar={toggleRightPanel}
         rightSidebarShortcutEnabled={!gridRoute}
+        onGoToSession={goToSession}
       />
       <RecentSessionsSwitcher
         conversations={allConversations}

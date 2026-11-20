@@ -2208,6 +2208,8 @@ function AppShellImpl() {
     setSessionSearch(false);
     setCommandPaletteOpen(true);
   }, []);
+  // ⌘K's Go to Session…: the open palette continues as the session switcher.
+  const handleGoToSession = useCallback(() => setSessionSearch(true), []);
   const isEmbedded = useIsEmbedded();
   useCommandPaletteHotkey(
     () => {
@@ -3776,6 +3778,7 @@ function AppShellImpl() {
             setCommandPaletteOpen={setCommandPaletteOpen}
             toggleLeftSidebar={toggleLeftSidebar}
             toggleRightPanel={toggleRightPanel}
+            goToSession={handleGoToSession}
             gridRoute={gridRoute}
             allConversations={allConversations}
             serverConversationId={serverConversationId}

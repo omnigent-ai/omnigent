@@ -3,16 +3,37 @@
 // palettes list stay in `useAppCommands`.
 
 import { useMemo } from "react";
-import { KeyboardIcon, SearchIcon } from "lucide-react";
+import { KeyboardIcon, MessagesSquareIcon, SearchIcon } from "lucide-react";
 
 import { openKeyboardShortcuts } from "@/components/KeyboardShortcutsDialog";
 import { openFindFromCommand, useCanOpenFindFromCommand } from "@/lib/findRouting";
 import { AVAILABLE, HIDDEN, type PaletteCommand } from "@/store/paletteCommands";
 
-export function useQuickPickAppCommands(): PaletteCommand[] {
+export interface QuickPickAppCommandOptions {
+  /** Switches the palette to searching sessions only; absent where it can't. */
+  onGoToSession?: () => void;
+}
+
+export function useQuickPickAppCommands({
+  onGoToSession,
+}: QuickPickAppCommandOptions = {}): PaletteCommand[] {
   const canOpenFind = useCanOpenFindFromCommand();
   return useMemo<PaletteCommand[]>(
     () => [
+      ...(onGoToSession
+        ? [
+            {
+              id: "go-to-session",
+              label: "Go to Session…",
+              icon: MessagesSquareIcon,
+              keywords: ["open", "find", "switch", "session", "conversation", "chat"],
+              shortcut: "palette.sessions" as const,
+              // The palette stays open, now searching sessions.
+              keepsPaletteOpen: true,
+              run: onGoToSession,
+            },
+          ]
+        : []),
       {
         id: "find",
         label: "Find…",
@@ -35,6 +56,6 @@ export function useQuickPickAppCommands(): PaletteCommand[] {
         run: openKeyboardShortcuts,
       },
     ],
-    [canOpenFind],
+    [canOpenFind, onGoToSession],
   );
 }
