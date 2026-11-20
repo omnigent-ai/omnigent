@@ -11490,8 +11490,10 @@ def _session_live_permission_mode(conv: Conversation) -> tuple[str, str] | None:
     """
     The harness and permission mode a native session is running in now.
 
-    The mode labels track switches made after launch, so they win over the
-    launch flags they may have replaced.
+    Claude's mode label tracks switches made after launch, so it wins over the
+    launch flags it may have replaced. Codex rewrites the flags on every settings
+    change but keeps its label when no preset matches, so the flags decide and a
+    label that disagrees with them means the mode is unknown.
 
     :param conv: The session row, e.g. a sub-agent's parent.
     :returns: ``(harness, mode)``, e.g. ``("claude-native", "auto")``, or ``None``
@@ -11514,8 +11516,10 @@ def _session_live_permission_mode(conv: Conversation) -> tuple[str, str] | None:
             or "--dangerously-bypass-approvals-and-sandbox" in launch_args
         ):
             return harness, "bypass"
-        mode = conv.labels.get(_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY)
-        mode = mode or codex_launch_permission_preset(launch_args)
+        mode = codex_launch_permission_preset(launch_args)
+        label = conv.labels.get(_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY)
+        if label and label != mode:
+            return None
     else:
         return None
     return (harness, mode) if mode else None

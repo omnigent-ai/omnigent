@@ -748,6 +748,9 @@ def test_routed_spawn_launch_args_gate_is_off_without_auto_harness() -> None:
         (["--permission-mode", "auto", "--permission-mode=plan"], "plan"),
         # ...but the bypass flag wins over any mode.
         (["--permission-mode", "auto", "--dangerously-skip-permissions"], "bypassPermissions"),
+        # Text after the ``--`` terminator is the prompt, not options.
+        (["--permission-mode", "plan", "--", "--permission-mode=auto"], "plan"),
+        (["--permission-mode", "plan", "--", "--dangerously-skip-permissions"], "plan"),
     ],
 )
 def test_claude_launch_permission_mode_logs_only_known_values(

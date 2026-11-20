@@ -128,6 +128,42 @@ def test_remote_resume_option_spellings(args: tuple[str, ...], expected: dict) -
             None,
         ),
         (("-c", 'default_permissions=":workspace"', "--approve-for-me"), "approve-for-me"),
+        # ``untrusted`` gates commands differently, and an omitted policy is config's.
+        (
+            (
+                "--sandbox",
+                "workspace-write",
+                "--ask-for-approval",
+                "untrusted",
+                "-c",
+                'approvals_reviewer="auto_review"',
+            ),
+            None,
+        ),
+        (("--sandbox", "workspace-write", "-c", 'approvals_reviewer="auto_review"'), None),
+        # A config profile's permissions can replace --sandbox...
+        (
+            (
+                "--profile",
+                "strict",
+                *PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
+            ),
+            None,
+        ),
+        # ...but not an explicit permission profile, which Codex records after a switch.
+        (
+            (
+                "--profile",
+                "strict",
+                "-c",
+                'default_permissions=":workspace"',
+                "-c",
+                'approval_policy="on-request"',
+                "-c",
+                'approvals_reviewer="auto_review"',
+            ),
+            "approve-for-me",
+        ),
         ((), None),
     ],
 )

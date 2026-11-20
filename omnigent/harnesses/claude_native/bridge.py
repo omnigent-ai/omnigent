@@ -3309,11 +3309,14 @@ def claude_launch_permission_mode(args: Sequence[str] | None) -> str | None:
     """Return the known permission mode Claude Code launches in with ``args``.
 
     The bypass flag wins over any ``--permission-mode``; otherwise the last one does.
+    Everything from an ``--`` option terminator on is positional text.
 
     :param args: Claude CLI args, e.g. ``["--permission-mode=plan"]``.
     :returns: The mode, e.g. ``"plan"``, or ``None`` when absent or unknown.
     """
     launch_args = tuple(args or ())
+    if "--" in launch_args:
+        launch_args = launch_args[: launch_args.index("--")]
     if _args_request_bypass_permissions(launch_args):
         return "bypassPermissions"
     candidate = _arg_value(launch_args, "--permission-mode")

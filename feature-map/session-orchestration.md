@@ -80,7 +80,11 @@ MCP independent creation.
   mapped to its own harness (Claude Code Auto ↔ Codex Approve for me), unless its
   agent spec or an automation sets a mode. Approval-skipping, plan/read-only and
   default parent modes aren't passed on, and neither is a Codex custom permission
-  profile. Codex's Ask for approval is a preset, so a Codex child gets it too.
+  profile. Codex's Ask for approval is a preset, so a Codex child gets it too. A
+  Codex parent's mode comes from its current permission flags, which Codex rewrites
+  on every switch; a mode label that disagrees with them, or an approval policy
+  other than on-request, passes nothing on. Claude Code flags after `--` are prompt
+  text, not options.
   A `config_path` child gets the same, except an undeclared Codex or Cursor child
   keeps its headless full-bypass default. A named sub-agent (`sub_agent_name`) keeps
   the launch settings its sub-spec declares.
