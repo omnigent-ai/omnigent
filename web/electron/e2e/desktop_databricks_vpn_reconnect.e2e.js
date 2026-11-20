@@ -48,14 +48,15 @@ async function waitFor(check, timeoutMs, intervalMs = 500) {
 
 /** What the desktop window shows: the page URL, the overlay, and setup-page text. */
 async function screenState(app) {
-  const shell = await app.electronApp.evaluate(({ BrowserWindow }) => {
-    const win = BrowserWindow.getAllWindows().find((w) => !w.isDestroyed() && w.isVisible());
+  const window = await app.electronApp.browserWindow(app.window);
+  const shell = await window.evaluate((win) => {
     if (!win) return null;
     const overlay = win.contentView.children
       .map((view) => view.webContents?.getURL?.() ?? "")
       .find((url) => url.includes("reconnect-overlay/index.html"));
     return { url: win.webContents.getURL(), overlayUrl: overlay ?? null };
   });
+  await window.dispose();
   const state = {
     at: new Date().toISOString(),
     url: shell?.url ?? null,
@@ -141,7 +142,12 @@ async function signInAndOpenConversation(app, workspace, log, sessionId) {
 
 async function onConversation(app, conversationUrl) {
   const state = await screenState(app);
-  return state.url === conversationUrl && !state.overlay ? state : null;
+  const replyVisible = await app.window
+    .getByText(REPLY)
+    .first()
+    .isVisible()
+    .catch(() => false);
+  return state.url === conversationUrl && !state.overlay && replyVisible ? state : null;
 }
 
 const SCENARIO_CONFIG = {
@@ -180,6 +186,7 @@ async function runScenario(scenario, server) {
       preload: PRELOADS,
       env: {
         HOME: home,
+        OMNIGENT_DESKTOP_VERSION_OVERRIDE: "999.0.0",
         OMNIGENT_E2E_DATABRICKS_HOST: HOST,
         OMNIGENT_E2E_DATABRICKS_PLAIN_URL: workspace.plainUrl,
       },
@@ -256,7 +263,18 @@ const SCENARIO_STEPS = {
   async "refresh-blocked"(app, workspace, log, conversationUrl) {
     workspace.setVpn(false);
     log.note("left VPN");
-    await waitFor(() => workspace.counts.tokenRefresh >= 1, 90_000);
+    const refused = await waitFor(
+      () =>
+        workspace.requests.some(
+          (request) =>
+            !request.vpn &&
+            request.path === "/oidc/v1/token" &&
+            request.detail === "refresh_token" &&
+            request.status === 403,
+        ),
+      90_000,
+    );
+    assert.ok(refused, "the stand-in never refused a token refresh off the network");
     const offVpn = await watch(app, log, 20_000);
     const connect = app.window.locator("#connect");
     let clickedOffVpn = false;
@@ -295,19 +313,17 @@ const SCENARIO_STEPS = {
     workspace.setVpn(false);
     log.note("left VPN");
     await watch(app, log, 5000);
-    // Playwright key events skip Electron menu accelerators, so run View > Reload's menu item.
-    const reloaded = await app.electronApp.evaluate(({ BrowserWindow, Menu }) => {
-      const item = Menu.getApplicationMenu()
-        .items.flatMap((menu) => menu.submenu?.items ?? [])
-        .find((entry) => entry.role === "reload");
-      const win = BrowserWindow.getAllWindows().find((candidate) => candidate.isVisible());
-      if (!item || !win) return false;
-      item.click(undefined, win, win.webContents);
-      return true;
-    });
-    assert.ok(reloaded, "View > Reload menu item not found");
-    log.note("chose View > Reload");
+    const window = await app.electronApp.browserWindow(app.window);
+    await window.evaluate((win) => win.webContents.reload());
+    await window.dispose();
+    log.note("reloaded the conversation window");
     const offVpn = await watch(app, log, 20_000);
+    assert.ok(
+      workspace.requests.some(
+        (request) => !request.vpn && request.path.startsWith("/omnigent") && request.status === 403,
+      ),
+      "the stand-in never refused the conversation reload",
+    );
     workspace.setVpn(true);
     log.note("rejoined VPN");
     const back = await waitFor(

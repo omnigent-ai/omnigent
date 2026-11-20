@@ -280,13 +280,15 @@ jobs:
       - name: Checkout demonstration support
         if: >-
           github.event.inputs.test_target == 'web/electron/e2e/desktop_databricks_vpn_reconnect.e2e.js' ||
-          github.event.inputs.test_target == 'tests/e2e/test_claude_native_gateway_advisor_rejection_e2e.py'
+          github.event.inputs.test_target == 'tests/e2e/test_claude_native_gateway_advisor_rejection_e2e.py' ||
+          github.event.inputs.test_target == 'tests/e2e/test_codex_native_terminal_recovery_e2e.py'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.workflow_sha }}
           path: .demo-driver
           sparse-checkout: |
             .github/scripts/capture-sdk-advisor-demo.py
+            .github/scripts/capture-codex-resume-demo.py
             web/electron/e2e/desktop_databricks_vpn_reconnect.e2e.js
             web/electron/e2e/desktopDesignPromptHarness.js
             web/electron/e2e/fixtures/databricksStandInNetwork.cjs
@@ -318,6 +320,7 @@ jobs:
         uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@75d817057138bd2cf5cd5af1cd954fdaca12e03d
         with:
           harness: codex
+          version: "0.154.0"
 
       - name: Install Antigravity CLI
         uses: ./.github/actions/setup-agy
@@ -342,6 +345,12 @@ jobs:
           mkdir -p artifacts "artifacts/basetemp-${{ matrix.attempt }}"
           git rev-parse HEAD > artifacts/demo-source.txt
           export OMNIGENT_E2E_RECORD_DIR="$PWD/artifacts/demo-videos"
+          if [[ "$TEST_TARGET" == "tests/e2e/test_codex_native_terminal_recovery_e2e.py" ]]; then
+            export OMNIGENT_CONFIG_HOME="$PWD/artifacts/codex-demo-config"
+            export CODEX_HOME="$PWD/artifacts/codex-demo-home"
+            uv run python .demo-driver/.github/scripts/capture-codex-resume-demo.py
+            exit $?
+          fi
           if [[ "$TEST_TARGET" == "tests/e2e/test_claude_native_gateway_advisor_rejection_e2e.py" ]]; then
             uv run python .demo-driver/.github/scripts/capture-sdk-advisor-demo.py
             exit $?
