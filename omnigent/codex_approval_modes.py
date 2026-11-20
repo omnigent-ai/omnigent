@@ -130,8 +130,8 @@ def codex_permission_preset_from_thread_settings(settings: object) -> str | None
     full-access sandbox/profile/``never`` policy → ``full-access``; a read-only
     sandbox/profile → ``read-only``; an ``auto_review`` reviewer under on-request
     → ``approve-for-me``; a plain on-request policy → ``ask-for-approval``.
-    Returns ``None`` when the payload doesn't resolve to a preset, including a
-    custom profile that isn't full-access or read-only, or another approval policy.
+    Returns ``None`` when the payload doesn't resolve to a preset (e.g. a custom
+    profile).
 
     :param settings: The ``threadSettings`` mapping (or anything, defensively).
     :returns: A value from :data:`CODEX_NATIVE_PERMISSION_VALUES`, or ``None``.
@@ -154,11 +154,8 @@ def codex_permission_preset_from_thread_settings(settings: object) -> str | None
         return "full-access"
     if sandbox_type in _READ_ONLY_SANDBOX_TYPES or profile_id == ":read-only":
         return "read-only"
-    # A custom profile (built-in ids start with ":") has its own rules, and other
-    # policies such as ``untrusted`` gate commands differently, so neither matches
-    # an on-request preset.
-    if isinstance(profile_id, str) and not profile_id.startswith(":"):
-        return None
-    if approval_policy != "on-request":
-        return None
-    return "approve-for-me" if reviewer == "auto_review" else "ask-for-approval"
+    if reviewer == "auto_review":
+        return "approve-for-me"
+    if approval_policy == "on-request":
+        return "ask-for-approval"
+    return None

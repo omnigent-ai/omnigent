@@ -45,7 +45,6 @@ if TYPE_CHECKING:
     from omnigent.spec.types import AgentSpec, RetryPolicy
 
 from omnigent.cli_invocation import cli_invocation
-from omnigent.codex_approval_modes import codex_permission_preset_from_thread_settings
 from omnigent.debug_logging import debug_event
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harnesses.codex_egress import CertificateFailure, detect_certificate_failure
@@ -5335,41 +5334,6 @@ def _codex_resume_permission_params(terminal_launch_args: Sequence[str] | None) 
     if "permissions" in params:
         params.pop("sandbox", None)
     return params
-
-
-def codex_launch_permission_preset(terminal_launch_args: Sequence[str] | None) -> str | None:
-    """
-    The ``/permissions`` preset Codex starts in with these launch args.
-
-    :param terminal_launch_args: Persisted Codex launch arguments.
-    :returns: A preset, e.g. ``"approve-for-me"``, or ``None`` for Codex's default,
-        a custom profile, conflicting flags, or a sandbox or approval policy left
-        to the user's config.
-    """
-    try:
-        # The prompt and anything after ``--`` are text, not permission options.
-        options = without_codex_positional_prompt(terminal_launch_args or ())
-        params = _codex_resume_permission_params(options)
-        selects_profile = codex_config_profile(options) is not None
-    except ValueError:
-        return None
-    # Config decides any field the flags leave out, so a preset needs an explicit
-    # sandbox (the classifier also needs an explicit policy). A config profile's own
-    # permissions can replace --sandbox, so after one only a permission profile
-    # counts, which is what Codex records after a switch.
-    permissions = params.get("permissions")
-    explicit_permissions = permissions if selects_profile else params.get("sandbox") or permissions
-    if not isinstance(explicit_permissions, str):
-        return None
-    settings: dict[str, object] = {
-        "approvalPolicy": params.get("approvalPolicy"),
-        "approvalsReviewer": params.get("approvalsReviewer"),
-    }
-    if isinstance(params.get("sandbox"), str):
-        settings["sandboxPolicy"] = {"type": params["sandbox"]}
-    if isinstance(params.get("permissions"), str):
-        settings["activePermissionProfile"] = {"id": params["permissions"]}
-    return codex_permission_preset_from_thread_settings(settings)
 
 
 _CODEX_RESUME_PERMISSION_CONFIG_FIELDS = {

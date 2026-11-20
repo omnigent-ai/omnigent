@@ -335,7 +335,6 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     ARCHIVED_AT_LABEL_KEY,
-    CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     FORK_SOURCE_LABEL_KEY,
     MUTED_LABEL_KEY,
     PINNED_LABEL_KEY,
@@ -11488,41 +11487,24 @@ _SPEC_PERMISSION_KEYS = ("permission_mode", "exec_mode", "yolo")
 
 def _session_live_permission_mode(conv: Conversation) -> tuple[str, str] | None:
     """
-    The harness and permission mode a native session is running in now.
+    The harness and permission mode a Claude Code session is running in now.
 
-    Claude's mode label tracks switches made after launch, so it wins over the
-    launch flags it may have replaced. Codex rewrites the flags on every settings
-    change but keeps its label when no preset matches, so the flags decide and a
-    label that disagrees with them means the mode is unknown.
+    The mode label tracks switches made after launch, so it wins over the launch
+    flags it may have replaced. Other harnesses, Codex included, report nothing:
+    their recorded mode can go stale or be left to config, so it isn't passed on.
 
     :param conv: The session row, e.g. a sub-agent's parent.
     :returns: ``(harness, mode)``, e.g. ``("claude-native", "auto")``, or ``None``
-        when the session isn't a Claude Code or Codex session with a known mode.
+        when the session isn't a Claude Code session with a known mode.
     """
     from omnigent.harnesses.claude_native.bridge import claude_launch_permission_mode
-    from omnigent.harnesses.codex_native.app_server import codex_launch_permission_preset
 
     native_agent = _native_coding_agent_for_session(conv)
-    if native_agent is None:
+    if native_agent is None or native_agent.harness != _CLAUDE_NATIVE_HARNESS:
         return None
-    harness = native_agent.harness
-    launch_args = list(conv.terminal_launch_args or [])
-    if harness == _CLAUDE_NATIVE_HARNESS:
-        mode = conv.labels.get(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY)
-        mode = mode or claude_launch_permission_mode(launch_args)
-    elif harness == _CODEX_NATIVE_HARNESS:
-        if (
-            conv.labels.get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == "1"
-            or "--dangerously-bypass-approvals-and-sandbox" in launch_args
-        ):
-            return harness, "bypass"
-        mode = codex_launch_permission_preset(launch_args)
-        label = conv.labels.get(_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY)
-        if label and label != mode:
-            return None
-    else:
-        return None
-    return (harness, mode) if mode else None
+    mode = conv.labels.get(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY)
+    mode = mode or claude_launch_permission_mode(list(conv.terminal_launch_args or []))
+    return (_CLAUDE_NATIVE_HARNESS, mode) if mode else None
 
 
 def _inherited_parent_permission_launch_args(
