@@ -4928,6 +4928,7 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
   for (const [trigger, drop] of [
     ["the session cookie is removed", (_h, network) => network.removeCookie()],
     ["the workspace redirects to login", loginRedirect],
+    ["a reload is refused", (h) => h.emit("did-navigate", `${workspace}/c/456`, 403, "Forbidden")],
   ]) {
     it(`reconnects by itself when the VPN returns after ${trigger} off the VPN`, async (t) => {
       const { h, network } = await connected(t, Array(6).fill(40));
@@ -4963,24 +4964,6 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
     });
   }
 
-  it("reconnects by itself when the VPN returns after a reload is refused off the VPN", async (t) => {
-    const { h, network } = await connected(t, Array(6).fill(40));
-    h.emit("did-navigate", `${workspace}/c/456`, 200, "OK");
-    network.verdict = "blocked";
-    h.emit("did-navigate", `${workspace}/c/456`, 403, "Forbidden");
-    await until(
-      () => h.overlay.hint !== null || h.calls.loadFile.length > 0,
-      "the reconnecting overlay or the setup page",
-    );
-    assert.deepEqual(h.calls.loadFile, []);
-    network.verdict = "allow";
-    await until(() => h.calls.loadURL.length === 2, "the reconnect");
-    assert.deepEqual(h.calls.loadURL.at(-1), [`${workspace}/c/456`]);
-    assert.equal(h.overlay.hint, null);
-    assert.deepEqual(h.calls.loadFile, []);
-    assert.equal(network.browserSignIns, 0);
-  });
-
   it("shows a reload's 403 on the setup page when the session still renews", async (t) => {
     const { h, network } = await connected(t, [20]);
     const sessionCreates = network.sessionCreates;
@@ -5002,11 +4985,16 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
       const checksBefore = network.sessionChecks.length;
       network.verdict = verdict;
       h.emit("did-navigate", `${workspace}/c/456`, 403, "Forbidden");
-      h.emit("did-navigate", `${workspace}/c/456`, 200, "OK");
+      const newerPage = `${workspace}/c/789`;
+      h.setUrl(newerPage);
+      h.emit("did-navigate", newerPage, 200, "OK");
+      const loadsBefore = structuredClone(h.calls.loadURL);
       await until(() => network.sessionCreates === sessionCreates + 1, "the session check");
       assert.equal(network.sessionChecks.length, checksBefore + 1);
       await network.sessionChecks.at(-1);
       assert.deepEqual(h.calls.loadFile, []);
+      assert.deepEqual(h.calls.loadURL, loadsBefore);
+      assert.equal(h.webContents.getURL(), newerPage);
       assert.deepEqual(h.overlay.shows, []);
       assert.equal(h.api.windows.get(h.win).origin, origin);
     });
