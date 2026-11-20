@@ -21,6 +21,7 @@ import { ExtensionProvider } from "./extensions/ExtensionProvider";
 import { createBootServerInfo, withBootTimeout } from "./lib/bootCapabilities";
 import { isLoginRedirectPending, resolveIdentity, setSessionHostResolver } from "./lib/identity";
 import { hideNativeChatTerminalBar } from "./lib/nativeChatTerminalBar";
+import { applyDesktopAppAttribute } from "./lib/desktopAppLayout";
 import { applyMacElectronShellAttribute } from "./lib/nativeBridge";
 import { applyMobileAppTargetAttribute } from "./lib/mobileAppTargets";
 import { initNativeInsets } from "./lib/nativeInsets";
@@ -87,6 +88,8 @@ initNativeInsets();
 
 // Scope the macOS frameless-window CSS from <html> before first paint.
 applyMacElectronShellAttribute();
+// Keep the desktop layout in the desktop app, whatever its window width.
+applyDesktopAppAttribute();
 applyMobileAppTargetAttribute();
 
 // The Chat/Terminal switcher lives in the header (ViewModeToggle) on every
