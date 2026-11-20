@@ -341,21 +341,99 @@ export async function createHostDirectory(hostId: string, path: string): Promise
     body: JSON.stringify({ path }),
   });
   if (!res.ok) {
-    // Surface the server's detail (e.g. "directory already exists") so
-    // the user sees why creation failed rather than a bare status code.
-    let detail: string | null;
-    try {
-      const body = (await res.json()) as { detail?: string };
-      detail = typeof body.detail === "string" ? body.detail : null;
-    } catch {
-      detail = null;
-    }
-    const err: FetchError = new Error(detail ?? `create directory failed: HTTP ${res.status}`);
-    err.status = res.status;
-    throw err;
+    throw await hostRequestError(res, "create directory failed");
   }
   const body = (await res.json()) as CreateHostDirectoryResponse;
   return body.path;
+}
+
+/**
+ * Build the error for a failed host request, keeping the server's ``detail``
+ * (e.g. "directory already exists") so the user sees why it failed.
+ *
+ * @param res Non-OK response.
+ * @param fallback Message to use when the response carries no ``detail``.
+ * @returns An error carrying the HTTP status.
+ */
+async function hostRequestError(res: Response, fallback: string): Promise<FetchError> {
+  let detail: string | null;
+  try {
+    const body = (await res.json()) as { detail?: string };
+    detail = typeof body.detail === "string" && body.detail !== "" ? body.detail : null;
+  } catch {
+    detail = null;
+  }
+  const err: FetchError = new Error(detail ?? `${fallback}: HTTP ${res.status}`);
+  err.status = res.status;
+  return err;
+}
+
+/** Shape returned by ``POST /v1/hosts/{id}/repositories/clone``. */
+interface CloneHostRepositoryResponse {
+  object: string;
+  /** Absolute path of the new checkout, e.g. ``"/Users/me/code/app"``. */
+  path: string;
+}
+
+/**
+ * Clone a git repository into a new directory on a host via
+ * ``POST /v1/hosts/{id}/repositories/clone``.
+ *
+ * The host refuses an existing destination, so a successful call always
+ * means a fresh checkout. The server's ``detail`` is kept on failure.
+ *
+ * @param hostId Host identifier, e.g. ``"host_a1b2..."``.
+ * @param request The clone URL, optional branch, and destination path, e.g.
+ *   ``{ url: "https://git.example.com/team/app.git", branch: "main", path: "~/code/app" }``.
+ * @returns The checkout's absolute path.
+ * @throws FetchError carrying the HTTP status and the server's detail on failure.
+ */
+export async function cloneHostRepository(
+  hostId: string,
+  request: { url: string; branch?: string; path: string },
+): Promise<string> {
+  const res = await authenticatedFetch(
+    `/v1/hosts/${encodeURIComponent(hostId)}/repositories/clone`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        url: request.url,
+        branch: request.branch ?? null,
+        path: request.path,
+      }),
+    },
+  );
+  if (!res.ok) {
+    throw await hostRequestError(res, "clone repository failed");
+  }
+  const body = (await res.json()) as CloneHostRepositoryResponse;
+  return body.path;
+}
+
+/**
+ * React Query mutation: clone a repository onto a host. Never retried, since a
+ * retry after a lost response would find the destination already taken.
+ *
+ * @returns A mutation; call ``mutateAsync({ hostId, url, branch, path })``.
+ */
+export function useCloneHostRepository() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    retry: false,
+    mutationFn: ({
+      hostId,
+      ...request
+    }: {
+      hostId: string;
+      url: string;
+      branch?: string;
+      path: string;
+    }) => cloneHostRepository(hostId, request),
+    onSuccess: (_clonedPath, { hostId }) => {
+      void queryClient.invalidateQueries({ queryKey: ["host-filesystem", hostId] });
+    },
+  });
 }
 
 /**

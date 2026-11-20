@@ -48,7 +48,7 @@ it.each([
     "arclet_omnigent-arclet-session.ssh",
   ],
   [{ name: "x".repeat(64), sandbox_provider: "arclet" }, `arclet_${"x".repeat(64)}.ssh`],
-] as const)("infers the standard Databricks SSH target from %j", (host, expected) => {
+] as const)("infers the standard SSH target from %j", (host, expected) => {
   expect(inferHostSshTarget(host)).toBe(expected);
 });
 

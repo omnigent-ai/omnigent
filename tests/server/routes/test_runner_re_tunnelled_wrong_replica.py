@@ -24,14 +24,14 @@ class _Store:
         return self._conv if self._conv is not None and session_id == self._conv.id else None
 
 
-def _conv(runner_id, runner_last_seen):
+def _conv(runner_id, runner_last_seen, host_id="host_1"):
     return Conversation(
         id="conv_1",
         created_at=1,
         updated_at=1,
         root_conversation_id="conv_1",
         runner_id=runner_id,
-        host_id="host_1",
+        host_id=host_id,
         runner_last_seen=runner_last_seen,
     )
 
@@ -44,12 +44,15 @@ async def _run(fresh_conv, monkeypatch, *, classified_runner_id, own_stamp):
 
 
 @pytest.mark.asyncio
-async def test_fresh_sibling_stamp_raises_wrong_replica(monkeypatch):
-    """A fresh stamp this process never wrote is a live sibling → WRONG_REPLICA."""
-    conv = _conv("runner_abc", int(time.time()))
+@pytest.mark.parametrize("host_id", ["host_1", None])
+async def test_fresh_sibling_stamp_raises_wrong_replica(monkeypatch, host_id):
+    """A fresh stamp this process never wrote is a live sibling → WRONG_REPLICA,
+    naming the routing host whose key reaches the sibling when there is one."""
+    conv = _conv("runner_abc", int(time.time()), host_id=host_id)
     with pytest.raises(OmnigentError) as exc:
         await _run(conv, monkeypatch, classified_runner_id="runner_abc", own_stamp=None)
     assert exc.value.code == ErrorCode.WRONG_REPLICA
+    assert getattr(exc.value, "host_id", None) == host_id
 
 
 @pytest.mark.asyncio

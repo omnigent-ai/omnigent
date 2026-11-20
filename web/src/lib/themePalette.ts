@@ -248,7 +248,7 @@ export const PALETTES: readonly PaletteMeta[] = [
         buttonBorder: "#d6d6d6",
         ring: "#11171c",
         brandAccent: "#df3c85",
-        sidebar: "#fafafa",
+        sidebar: "#f9f9f9",
         sidebarPrimary: "var(--link)",
         sidebarRing: "var(--ring)",
         shellBackground: "var(--background)",

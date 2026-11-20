@@ -18,14 +18,35 @@ const { contextBridge, ipcRenderer, webFrame, webUtils } = require("electron");
 
 // Native window controls stay in window pixels while the page zooms.
 if (process.platform === "darwin") {
+  const setFullScreenAttribute = (fullScreen) => {
+    document.documentElement.toggleAttribute("data-electron-full-screen", fullScreen === true);
+  };
   const syncTitlebarZoom = () => {
     document.documentElement.style.setProperty(
       "--omnigent-electron-zoom",
       String(webFrame.getZoomFactor()),
     );
   };
-  window.addEventListener("DOMContentLoaded", syncTitlebarZoom, { once: true });
+  window.addEventListener(
+    "DOMContentLoaded",
+    () => {
+      syncTitlebarZoom();
+      void ipcRenderer
+        .invoke("omnigent:is-full-screen")
+        .then(setFullScreenAttribute)
+        .catch(() => {});
+    },
+    { once: true },
+  );
   window.addEventListener("resize", syncTitlebarZoom);
+  ipcRenderer.on("omnigent:full-screen-changed", (_event, fullScreen) => {
+    setFullScreenAttribute(fullScreen);
+  });
+}
+
+/** A shortcut id for the shell to check; anything else names the default "show". */
+function shortcutId(id) {
+  return typeof id === "string" ? id : undefined;
 }
 
 // Collapse the update states the in-page UpdateBanner renders on
@@ -49,6 +70,21 @@ function bannerSafe(status) {
 // Native integrations for the SPA: a dock/taskbar badge and OS notifications.
 // Numbers/strings only so the values survive contextBridge's structured-clone
 // boundary.
+// Annotate and Draw (designTools.js): open and stop a tool's overlay on a view, and its page
+// operations and captures. A test run can leave them out, to stand in for an older shell.
+const designTools =
+  process.env?.OMNIGENT_DESKTOP_LEGACY_DESIGN_MODE === "1"
+    ? {}
+    : {
+        browserDesignTools: (args) => ipcRenderer.invoke("omnigent:browser-design-tools", args),
+        /** Main ended a view's opening (its page went): `{ viewId, type: "ended", session, reason }`. */
+        onBrowserDesignToolsEvent: (callback) => {
+          const listener = (_event, payload) => callback(payload);
+          ipcRenderer.on("browser-design-tools-event", listener);
+          return () => ipcRenderer.removeListener("browser-design-tools-event", listener);
+        },
+      };
+
 contextBridge.exposeInMainWorld("omnigentDesktop", {
   kind: "electron",
   /** Paint the dock/taskbar badge; 0 clears it. Fire-and-forget. */
@@ -150,25 +186,37 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   /** Quit once the page's prompt has confirmed; `dontAskAgain` turns that prompt off. */
   confirmQuit: (options) =>
     ipcRenderer.invoke("omnigent:confirm-quit", { dontAskAgain: options?.dontAskAgain === true }),
-  /** The "Show Omnigent from anywhere" shortcut (off by default). */
-  getGlobalShortcut: () => ipcRenderer.invoke("omnigent:get-global-shortcut"),
+  // macOS ships system Dictation; elsewhere the composer mic needs server dictation.
+  ...(process.platform === "darwin"
+    ? {
+        /** Start macOS Dictation in the focused field. Resolves whether it started. */
+        startSystemDictation: () => ipcRenderer.invoke("omnigent:start-system-dictation"),
+      }
+    : {}),
+  /**
+   * A system-wide shortcut by id: "show" (Show Omnigent from anywhere, off by default, and
+   * the default id) or "floatingComposer" (the New Agent panel, macOS).
+   */
+  getGlobalShortcut: (id) => ipcRenderer.invoke("omnigent:get-global-shortcut", shortcutId(id)),
   /**
    * Saves `{ enabled, accelerator }`, or turns the shortcut off for `{ enabled: false }`,
    * keeping the saved chord. Resolves `{ ok, setting?, error? }`; `ok: false` means the
    * saved setting is unchanged.
    */
-  setGlobalShortcut: ({ enabled, accelerator } = {}) =>
+  setGlobalShortcut: ({ enabled, accelerator } = {}, id) =>
     ipcRenderer.invoke(
       "omnigent:set-global-shortcut",
       enabled !== true && accelerator === undefined
         ? { enabled: false }
         : { enabled: enabled === true, accelerator: String(accelerator ?? "") },
+      shortcutId(id),
     ),
   /**
    * Takes the next chord in the shell, before the page's shortcuts and the menu see it.
    * Resolves its accelerator, or null when Escape or the cancel call ends recording.
    */
-  recordGlobalShortcut: () => ipcRenderer.invoke("omnigent:record-global-shortcut"),
+  recordGlobalShortcut: (id) =>
+    ipcRenderer.invoke("omnigent:record-global-shortcut", shortcutId(id)),
   cancelGlobalShortcutRecording: () =>
     ipcRenderer.invoke("omnigent:cancel-global-shortcut-recording"),
   /** The runner picked during onboarding for this server ("local" |
@@ -213,14 +261,38 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    */
   controlHost: (action) => ipcRenderer.invoke("omnigent:host-control", action),
   /**
-   * Desktop feature gates the server can't know about — currently
+   * Desktop feature gates the server can't know about: currently
    * `{ databricksInternalFeatures }` from macOS Managed Preferences, scoped
-   * to the window's server (true only on Databricks-managed servers).
+   * to the window's server (true only on managed servers).
    * Resolves null off a connected server.
    */
   getDesktopFeatures: () => ipcRenderer.invoke("omnigent:get-desktop-features"),
   /**
-   * Connect the user's Arca instance (Databricks-internal) to the window's
+   * The floating New Agent panel, usable when getDesktopFeatures() reports
+   * `floatingComposer` (macOS). A main window's page announces it can render the panel;
+   * the panel's own page dismisses itself and opens what it launched in a main window.
+   */
+  floatingComposer: {
+    /** From a main window: this document can render the panel (version 1) for its server. */
+    announceSupport: (version) => ipcRenderer.send("omnigent:floating-composer:announce", version),
+    /** From the panel: hide it, keeping its draft. */
+    dismiss: () => ipcRenderer.send("omnigent:floating-composer:dismiss"),
+    /**
+     * From the panel: open `/c/<id>` or a page it links to in a main window of its server,
+     * then hide. Resolves `{ ok: true }` or
+     * `{ ok: false, error: "not-composer" | "bad-path" | "window-loading" }`.
+     */
+    openInMainWindow: (path) =>
+      ipcRenderer.invoke("omnigent:floating-composer:open-in-main-window", path),
+    /** From the panel: its native file picker opened or closed. */
+    filePicker: (state) =>
+      ipcRenderer.send(
+        "omnigent:floating-composer:file-picker",
+        state === "open" ? "open" : "closed",
+      ),
+  },
+  /**
+   * Connect the user's Arca instance to the window's
    * server as a host, via `arca ssh`. Native consent is asked in the main
    * process. Resolves a `{ ok, error?, authError? }` result.
    */
@@ -236,14 +308,28 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
          */
         connectSshHost: (destination) => ipcRenderer.invoke("omnigent:ssh-connect", destination),
       }),
+  // Main checks a socket's owner before using it, which Windows can't report.
+  ...(process.platform === "win32"
+    ? {}
+    : {
+        /**
+         * Send one workspace API call to a session host's socket, named by the
+         * server with a token: on this machine, or over SSH. `sshTarget` is an
+         * alias main may ask the user to allow, then try and record, if the
+         * host has none yet.
+         * Resolves `{ status, headers, body }`.
+         * @param {{hostId: string, sshTarget?: string, socketPath: string, path: string, headers: Record<string, string>, body: Uint8Array}} request
+         */
+        workspaceSocketRequest: (request) =>
+          ipcRenderer.invoke("omnigent:workspace-socket-request", request),
+      }),
   /** Extend the local Arca instance with one of the main process's approved modes. */
   extendArca: (mode) => ipcRenderer.invoke("omnigent:arca-extend", mode),
   /**
-   * Renew this machine's dbcert (Databricks-internal); Arca Companion copies
-   * it to the user's Arcas and Arclets. Resolves a `{ ok, error? }` result.
+   * Renew this machine's dbcert. Resolves a `{ ok, error? }` result.
    */
   refreshDbcert: (options) => ipcRenderer.invoke("omnigent:dbcert-refresh", options),
-  /** Check the laptop's dbcert without starting sign-in. */
+  /** Check this machine's dbcert without starting sign-in. */
   checkDbcert: () => ipcRenderer.invoke("omnigent:dbcert-check"),
 
   /**
@@ -363,10 +449,21 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * @returns {Promise<{ ok: boolean, dataUrl?: string, error?: string }>}
    */
   browserScreenshot: (conversationId, opts) =>
-    ipcRenderer.invoke("omnigent:browser-screenshot", { conversationId, opts }),
+    ipcRenderer.invoke("omnigent:browser-screenshot", {
+      deadlineAt: opts?.deadlineAt,
+      conversationId,
+      opts,
+    }),
   /** Perform a fixed snapshot, click or type action in the conversation's view. */
   browserPerformAction: (conversationId, action, params, opts) =>
     ipcRenderer.invoke("omnigent:browser-perform-action", { conversationId, action, params, opts }),
+  // The agent browser tools' per-session tab records, kept in main (browserTabs.js).
+  browserTabs: (args) => ipcRenderer.invoke("omnigent:browser-tabs", args),
+  onBrowserTabsChanged: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on("omnigent:browser-tabs-changed", listener);
+    return () => ipcRenderer.removeListener("omnigent:browser-tabs-changed", listener);
+  },
   /** @deprecated Until v0.21: main translates only recognized v0.18 action templates. */
   browserExecute: (conversationId, js, opts) =>
     ipcRenderer.invoke("omnigent:browser-execute", { conversationId, js, opts }),
@@ -375,8 +472,13 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * @param {string} conversationId
    * @param {string} [reason]
    */
-  browserClose: (conversationId, reason) =>
-    ipcRenderer.invoke("omnigent:browser-close", { conversationId, reason }),
+  browserClose: (conversationId, reason, opts) =>
+    ipcRenderer.invoke("omnigent:browser-close", {
+      conversationId,
+      reason,
+      deadlineAt: opts?.deadlineAt,
+      expectedNavs: opts?.expectedNavs,
+    }), // deadlineAt, expectedNavs
   /**
    * Subscribe to which conversation's browser view is currently attached to the
    * host window (`{conversationId}` or `{conversationId: null}` when detached).
@@ -403,6 +505,20 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   /** Enable native Ctrl+Tab forwarding only while this renderer supports it. */
   browserSetRecentSessionSwitchSupported: (supported) =>
     ipcRenderer.invoke("omnigent:browser-set-recent-session-switch-supported", { supported }),
+  /**
+   * Subscribe to page links Cmd/Ctrl- or middle-clicked in an embedded browser
+   * view (`{conversationId, url}`, where conversationId is the clicked view's id).
+   * @param {(payload: { conversationId: string, url: string }) => void} callback
+   * @returns {() => void}
+   */
+  onBrowserOpenTab: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on("browser-open-tab", listener);
+    return () => ipcRenderer.removeListener("browser-open-tab", listener);
+  },
+  /** Route modifier-clicked page links to `onBrowserOpenTab` while supported. */
+  browserSetOpenTabSupported: (supported) =>
+    ipcRenderer.invoke("omnigent:browser-set-open-tab-supported", { supported }),
   /** Clear the native Ctrl+Tab latch when the renderer has no sessions to show. */
   browserCancelRecentSessionSwitch: () =>
     ipcRenderer.invoke("omnigent:browser-cancel-recent-session-switch"),
@@ -521,6 +637,8 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     return () => ipcRenderer.removeListener("browser-nav-state", listener);
   },
 
+  ...designTools,
+
   // ── Design mode (point-and-prompt) ─────────────────────────────────────
   // Toggle the in-page picker + popup. On Send, the SPA gets the submit via
   // onBrowserElementPromptSubmit, routes it as a normal chat message (no backend
@@ -625,6 +743,8 @@ contextBridge.exposeInMainWorld("omnigentSetup", {
    *  `{ok, error?}`; output streams via onRunnerConnectLog.
    *  @param {string} url @param {"local"|"remote"} runner */
   connectRunner: (url, runner) => ipcRenderer.invoke("omnigent:connect-runner", url, runner),
+  /** Stop the in-flight connectRunner sign-in. Resolves whether one was running. */
+  cancelRunnerConnect: () => ipcRenderer.invoke("omnigent:cancel-runner-connect"),
   /** Subscribe to connectRunner output. Returns an unsubscribe function.
    *  @param {(line: string) => void} callback */
   onRunnerConnectLog: (callback) => {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Conversation } from "@/hooks/useConversations";
-import { isIndentedSibling, orderSessionFamilies } from "./sessionFamilies";
+import { isIndentedSibling, isSessionPinned, orderSessionFamilies } from "./sessionFamilies";
 
 const member = (id: string, created_at: number, representative_id = "a") =>
   ({ id, created_at, family: { id: "family", representative_id, pinned: false } }) as Conversation;
@@ -12,8 +12,8 @@ describe("session families", () => {
     expect(orderSessionFamilies([standalone, c, a, b]).map((row) => row.id)).toEqual([
       "x",
       "a",
-      "b",
       "c",
+      "b",
     ]);
     expect([a, b, c].map(isIndentedSibling)).toEqual([false, true, true]);
     const promoted = [member("c", 3, "b"), member("b", 2, "b")];
@@ -33,9 +33,10 @@ describe("session families", () => {
       "x",
     ]);
     const pinned = { ...c, labels: { "omnigent.pinned": "1" } };
-    expect(orderSessionFamilies([b, pinned, a], collapsed).map((row) => row.id)).toEqual([
-      "a",
-      "c",
-    ]);
+    expect(orderSessionFamilies([b, pinned, a], collapsed).map((row) => row.id)).toEqual(["a"]);
+    expect(isSessionPinned(pinned, new Set(["c"]))).toBe(false);
+    expect(isSessionPinned({ ...pinned, family: { ...pinned.family!, pinned: true } })).toBe(true);
+    expect(isSessionPinned({ ...a, labels: { "omnigent.pinned": "50" } })).toBe(true);
+    expect(isSessionPinned(b, new Set(["a"]))).toBe(true);
   });
 });

@@ -11,6 +11,7 @@ import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as FileViewerContextModule from "@/shell/FileViewerContext";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as UseHarnessInventoryModule from "@/hooks/useHarnessInventory";
+import type * as UseSessionLiveMcpServersModule from "@/hooks/useSessionLiveMcpServers";
 import type * as UseAgentsModule from "@/hooks/useAgents";
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
@@ -31,12 +32,23 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
     ...actual,
     useWorkspaceAllFiles: () => ({ data: undefined }),
     useWorkspaceDirectory: () => ({ data: undefined }),
+    useWorkspaceFileSearch: () => ({ data: undefined }),
   };
 });
+// The "@" menu's session rows read the sidebar cache and a search query; these
+// tests don't open it, so stub the source like the workspace hooks above.
+vi.mock("@/hooks/useSessionMentionEntries", () => ({
+  MENTION_SEARCH_DEBOUNCE_MS: 300,
+  useSessionMentionEntries: () => [],
+}));
 
 // ComposerStatusLine's PR link reads GitHub info via a TanStack query; stub it
 // (default: no PR) so these tests don't need a QueryClientProvider, matching
 // the workspace-files stub above.
+// Run a workflow lists saved workflows from a TanStack query; none here.
+vi.mock("@/hooks/useSavedWorkflows", () => ({
+  useSavedWorkflows: () => ({ workflows: [], refresh: () => {} }),
+}));
 vi.mock("@/hooks/usePullRequests", () => ({
   usePullRequestInfo: () => usePullRequestInfoMock(),
 }));
@@ -77,6 +89,16 @@ vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
 vi.mock("@/hooks/useHarnessInventory", async (importOriginal) => ({
   ...(await importOriginal<typeof UseHarnessInventoryModule>()),
   useHostMcpServers: () => ({ data: [], isLoading: false, isError: false }),
+}));
+vi.mock("@/hooks/useSessionLiveMcpServers", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseSessionLiveMcpServersModule>()),
+  useSessionLiveMcpServers: () => ({ data: undefined, isError: false }),
+  useReconnectLiveMcpServer: () => ({
+    reconnect: () => {},
+    reconnectingName: null,
+    error: null,
+    clearError: () => {},
+  }),
 }));
 // /mcp reads the session's agent via a TanStack query; stub it (no agent loaded)
 // so these renders don't need a QueryClientProvider either.
@@ -125,6 +147,7 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
     antigravity: "Antigravity",
     copilot: "Copilot",
   }),
+  useFileMentionHarnesses: () => new Set<string>(),
 }));
 
 import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
@@ -396,11 +419,11 @@ describe("Composer status line (branch + context ring)", () => {
   it.each([true, false])(
     "places host and model controls beside overflow only on mobile (%s)",
     (mobile) => {
-      const mediaQuery = window.matchMedia("(max-width: 767.98px)");
+      const mediaQuery = window.matchMedia("(max-width: 1180.98px)");
       vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
         ...mediaQuery,
         media: query,
-        matches: mobile && query === "(max-width: 767.98px)",
+        matches: mobile && query === "(max-width: 1180.98px)",
       }));
       bindHost("mac-laptop");
       useSessionHostOnlineMock.mockReturnValue(false);

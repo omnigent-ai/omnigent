@@ -161,7 +161,7 @@ print(f'input={r.usage.prompt_tokens} output={r.usage.completion_tokens}')
 omni server
 ```
 
-Verified output (run against e2-dogfood workspace):
+Verified output (run against a test workspace):
 
 ```
 HELLO
@@ -269,7 +269,7 @@ print(f'Model:    {r.model}')
 "
 ```
 
-Output (verified against e2-dogfood):
+Output (verified against a test workspace):
 
 ```
 Response: 'GATEWAY OK'
@@ -393,7 +393,7 @@ restart.
 
 ### Verified end-to-end
 
-Created a real External Model endpoint on e2-dogfood that proxies
+Created a real External Model endpoint on a test workspace that proxies
 through `databricks-model-serving` to `databricks-claude-sonnet-4`,
 then called it via the same OpenAI SDK pattern omnigent uses. The
 Gateway config included `usage_tracking_config.enabled=true` and a
@@ -547,8 +547,8 @@ for a specific request in MLflow by stripping the `resp_` prefix.
 ### Verified end-to-end
 
 Emitted a synthetic trace from a local Python script (using the same
-`mlflow.start_span` API omnigent's `TracingContext` wraps) against the
-e2-dogfood Databricks workspace's MLflow OTLP receiver. Verified the
+`mlflow.start_span` API omnigent's `TracingContext` wraps) against a
+test Databricks workspace's MLflow OTLP receiver. Verified the
 trace landed in UC and the spans carry the expected attributes:
 
 ```
@@ -569,7 +569,7 @@ The trace is queryable via `mlflow.search_traces()` and shows up in
 the workspace MLflow Traces UI at
 `/ml/experiments/<experiment_id>/traces/<trace_id>` per UC RBAC.
 
-Workspace MLflow Traces UI (e2-dogfood) showing the verification trace
+Workspace MLflow Traces UI (test workspace) showing the verification trace
 in the experiment table:
 
 ![MLflow Traces list](images/databricks/mlflow-trace-list.png)
@@ -692,7 +692,7 @@ observability series shipped in PRs [#1050](https://github.com/omnigent-ai/omnig
 [#1072](https://github.com/omnigent-ai/omnigent/pull/1072), and
 [#1083](https://github.com/omnigent-ai/omnigent/pull/1083).
 
-Verified end-to-end against the e2-dogfood Databricks workspace
+Verified end-to-end against a test Databricks workspace
 (2026-06-24):
 
 - Foundation Model call output (`databricks-claude-sonnet-4`,
