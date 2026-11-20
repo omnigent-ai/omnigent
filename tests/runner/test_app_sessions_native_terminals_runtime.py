@@ -888,12 +888,13 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     )
     import omnigent.inner.codex_executor as codex_executor_mod
 
-    probe_codex_version = codex_executor_mod._codex_cli_version
+    monkeypatch.setattr(codex_executor_mod, "_find_codex_cli", lambda: app_server.codex_path)
     wrapper_probes: list[tuple[str, ...]] = []
 
     async def _fake_codex_cli_version(*argv: str) -> tuple[int, int, int] | None:
-        if argv[0] != "codex-wrapper":
-            return await probe_codex_version(*argv)
+        if argv == (app_server.codex_path,):
+            return app_server.codex_cli_version
+        assert argv == ("codex-wrapper", "codex", "--"), f"unexpected version probe: {argv!r}"
         wrapper_probes.append(argv)
         return version
 

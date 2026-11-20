@@ -156,6 +156,10 @@ version cannot be identified, the runner retains the previous app-server-based
 decision. An unprobeable wrapper can still differ from that binary; this legacy
 ambiguity remains unresolved.
 
+A configured command keeps its arguments opaque. An alternate executable combined
+with permission arguments retains prior behavior and can still be rejected on a
+modern remote resume; only argument-only configuration is filtered automatically.
+
 The TUI's private tmux server keeps its pane after the process exits
 (`keep_alive_after_exit`), so once the terminal has started, its exit is
 captured by the watcher's pane-dead path instead of collapsing into a bare "no
