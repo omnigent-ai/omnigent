@@ -63,7 +63,7 @@ const liveCode = mainSource.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/
 
 /** A fake workspace behind the real databricks-session module: `verdict` answers session-create. */
 function createWorkspaceNetwork(origin, { oauth: oauthOverrides, account = {} } = {}) {
-  const network = { verdict: "allow", sessionCreates: 0, browserSignIns: 0 };
+  const network = { verdict: "allow", sessionCreates: 0, browserSignIns: 0, sessionChecks: [] };
   let jar = [];
   const cookies = Object.assign(new EventEmitter(), { get: async () => jar });
   // Chromium removes the old cookie before inserting its replacement.
@@ -630,6 +630,17 @@ function loadNavigationHarness({
     },
     "./databricks-auth": {
       ...require("../src/databricks-auth"),
+      createDatabricksAuth(options) {
+        const auth = require("../src/databricks-auth").createDatabricksAuth(options);
+        return {
+          ...auth,
+          checkSession(...args) {
+            const pending = auth.checkSession(...args);
+            network?.sessionChecks?.push(pending);
+            return pending;
+          },
+        };
+      },
       readDatabricksAuthMode: () => databricksMode,
     },
     // The bounce's behavior is unit-tested in workspace-root-bounce.test.js;
@@ -4988,11 +4999,13 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
     it(`leaves a newer page load alone when a reload's session check ends in ${verdict}`, async (t) => {
       const { h, network } = await connected(t, [20]);
       const sessionCreates = network.sessionCreates;
+      const checksBefore = network.sessionChecks.length;
       network.verdict = verdict;
       h.emit("did-navigate", `${workspace}/c/456`, 403, "Forbidden");
       h.emit("did-navigate", `${workspace}/c/456`, 200, "OK");
       await until(() => network.sessionCreates === sessionCreates + 1, "the session check");
-      await wait(60);
+      assert.equal(network.sessionChecks.length, checksBefore + 1);
+      await network.sessionChecks.at(-1);
       assert.deepEqual(h.calls.loadFile, []);
       assert.deepEqual(h.overlay.shows, []);
       assert.equal(h.api.windows.get(h.win).origin, origin);
