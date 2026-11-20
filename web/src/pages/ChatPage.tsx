@@ -3221,7 +3221,7 @@ function ComposerImpl(
   const highlight = useComposerHighlight({
     value,
     commandNames: slashCommandNames,
-    // Context makes the send an ordinary message, so no built-in runs from it.
+    // With context the text goes out as typed, so only exact-case commands run.
     anyCaseCommandNames: carriesMessageContext(draft, files, sendContext)
       ? []
       : anyCaseBuiltinNames,
