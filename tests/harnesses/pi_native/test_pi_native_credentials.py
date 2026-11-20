@@ -1149,6 +1149,12 @@ def test_generated_token_command_reports_only_safe_results(
     assert payload["kind"] == kind
     if attempts > 1:
         assert payload["elapsedMs"] >= sum(auth_command.AUTH_RETRY_DELAYS_MS[: attempts - 1]) - 5
+    if kind == "timeout":
+        # Retries share the deadline; restarting it would add at least the first delay.
+        assert (
+            payload["elapsedMs"]
+            < auth_command.AUTH_TIMEOUT_MS + auth_command.AUTH_RETRY_DELAYS_MS[0]
+        )
     assert payload["piPid"] == 123
     assert "private-" not in status.read_text()
     for file in auth_dir.iterdir():

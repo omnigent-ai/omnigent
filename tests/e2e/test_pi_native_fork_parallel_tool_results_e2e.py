@@ -872,6 +872,7 @@ def test_pi_native_token_failure_recovers_without_replaying_tools(
             assert native_pids() == pids
         for kind in ("failed_exit", "empty"):
             (workspace / "auth-mode").write_text(f"{kind}_once")
+            helper_runs = (workspace / "auth-pids.jsonl").read_text().count("\n")
             before = len(requests)
             old_errors = {item["id"] for item in items() if item["type"] == "error"}
             send(f"Continue through a one-off {kind} token result.")
@@ -887,6 +888,8 @@ def test_pi_native_token_failure_recovers_without_replaying_tools(
                 )
             )
             assert outcome["type"] != "error", outcome
+            assert (workspace / "auth-mode").read_text() == "ok"
+            assert (workspace / "auth-pids.jsonl").read_text().count("\n") >= helper_runs + 2
             assert len(requests) == before + 1
             assert native_pids() == pids
         history = json.dumps(requests[-1]["messages"])
