@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import hashlib
 import json
 import math
@@ -2944,6 +2945,7 @@ class _StoppedSessionAnswer:
     One question's recovery on this replica: a running delivery, then its acknowledgement.
 
     ``runner_id``: the session's runner at the first answer; a retry waits only for that runner.
+    ``replaced``: a different question under this id was answered during the running delivery.
     """
 
     started_at: float
@@ -2951,6 +2953,7 @@ class _StoppedSessionAnswer:
     runner_id: str | None
     delivery: asyncio.Future[Any] | None = None
     acknowledgement: dict[str, Any] | None = None
+    replaced: bool = False
 
 
 # Questions answered on a stopped session, by (session id, elicitation id), per replica.
@@ -2986,6 +2989,24 @@ def _stopped_session_answer_text(
     return "\n\n".join(lines)
 
 
+def _report_conflict_as_unavailable(
+    deliver: Callable[..., Awaitable[dict[str, Any] | None]],
+) -> Callable[..., Awaitable[dict[str, Any] | None]]:
+    """Raise a recovery 409 as 503: clients read a 409 as an already answered question."""
+
+    @functools.wraps(deliver)
+    async def _wrapped(*args: Any, **kwargs: Any) -> dict[str, Any] | None:
+        try:
+            return await deliver(*args, **kwargs)
+        except OmnigentError as exc:
+            if exc.http_status != 409:
+                raise
+            raise OmnigentError(exc.message, code=ErrorCode.RUNNER_UNAVAILABLE) from exc
+
+    return _wrapped
+
+
+@_report_conflict_as_unavailable
 async def _deliver_answer_to_stopped_session(
     request: Any,
     session_id: str,
@@ -3001,8 +3022,9 @@ async def _deliver_answer_to_stopped_session(
     Send an AskUserQuestion answer as a user message when the session's runner stays gone.
 
     The message path relaunches the runner; the card closes only after it accepts the message.
+    A session with no host in its chain is left to its hook: nothing can relaunch its runner.
     :returns: The acknowledgement (also for a later answer), or ``None``: the caller resolves it.
-    :raises OmnigentError: 403 on a policy denial, or the message path's error; waiters get it too.
+    :raises OmnigentError: 403 on a policy denial, or the message path's error (a 409 as 503).
     """
     elicitation_id = data.get("elicitation_id")
     if post_event is None or not isinstance(request, Request):
@@ -3020,6 +3042,11 @@ async def _deliver_answer_to_stopped_session(
             # A new question under a reused id: the earlier recovery does not apply.
             _stopped_session_answers.pop(key, None)
             record = None
+    if record is not None and record.delivery is not None and isinstance(params, dict):
+        if _harness_elicitation_fingerprint_or_none(params) != record.fingerprint:
+            # A new question under a reused id during a delivery: its own hook takes the answer.
+            record.replaced = True
+            return None
     if record is not None and record.delivery is None and record.acknowledgement is not None:
         if isinstance(params, dict):
             _close_answered_card(session_id, elicitation_id, params)
@@ -3044,6 +3071,12 @@ async def _deliver_answer_to_stopped_session(
         or conv.kind == "sub_agent"
         or not _is_native_terminal_session(conv)
     ):
+        return None
+    if conv.host_id is None and (
+        conversation_store is None
+        or await asyncio.to_thread(routing_host_id, conv, conversation_store) is None
+    ):
+        # No host in the chain can relaunch the runner, so the hook keeps the answer.
         return None
     # Check the runner on a first answer or under the same runner id; a new runner never asked.
     if record is None or record.runner_id == conv.runner_id:
@@ -3097,6 +3130,7 @@ async def _run_stopped_session_delivery(
     delivery: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
     delivery.add_done_callback(lambda done: done.cancelled() or done.exception())
     record.delivery = delivery
+    record.replaced = False
     _logger.info(
         "Delivering an answer to %s as a message: the session's runner is gone",
         elicitation_id,
@@ -3128,7 +3162,15 @@ async def _run_stopped_session_delivery(
             raise OmnigentError(f"A policy denied this answer: {reason}", code=ErrorCode.FORBIDDEN)
         delivery.set_result(acknowledgement)
         record.acknowledgement = acknowledgement
-        _close_answered_card(session_id, elicitation_id, params)
+        current = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
+        current_params = current[1].get("params") if current is not None else None
+        # A different question under this id has its own card and hook: leave them.
+        replaced = record.replaced or (
+            isinstance(current_params, dict)
+            and _harness_elicitation_fingerprint_or_none(current_params) != record.fingerprint
+        )
+        if not replaced:
+            _close_answered_card(session_id, elicitation_id, params)
         return acknowledgement
     except Exception as exc:
         if not delivery.done():

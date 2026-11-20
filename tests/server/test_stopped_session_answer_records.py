@@ -28,7 +28,8 @@ def _record(started_at: float, *, delivering: bool) -> orchestration._StoppedSes
     return record
 
 
-async def test_the_prune_keeps_running_and_recent_records() -> None:
+async def test_an_answer_prunes_only_old_idle_records() -> None:
+    """Any answer prunes expired idle records; running and recent ones survive."""
     old = time.time() - orchestration._CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S - 1
     records = {
         ("session", "old_done"): _record(old, delivering=False),
@@ -37,22 +38,6 @@ async def test_the_prune_keeps_running_and_recent_records() -> None:
     }
     for key, record in records.items():
         orchestration._stopped_session_answers[key] = record
-    try:
-        orchestration._prune_stopped_session_answers()
-
-        kept = {
-            key for key in records if orchestration._stopped_session_answers.get(key) is not None
-        }
-        assert kept == {("session", "old_running"), ("session", "recent")}
-    finally:
-        for key in records:
-            orchestration._stopped_session_answers.pop(key, None)
-
-
-async def test_an_answer_prunes_old_records() -> None:
-    old = time.time() - orchestration._CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S - 1
-    key = ("session", "old_done")
-    orchestration._stopped_session_answers[key] = _record(old, delivering=False)
     request = Request({"type": "http", "method": "POST", "path": "/", "headers": []})
     conv = Conversation(id="other", created_at=0, updated_at=0, root_conversation_id="other")
 
@@ -72,50 +57,13 @@ async def test_an_answer_prunes_old_records() -> None:
         )
 
         assert delivered is None
-        assert orchestration._stopped_session_answers.get(key) is None
+        kept = {
+            key for key in records if orchestration._stopped_session_answers.get(key) is not None
+        }
+        assert kept == {("session", "old_running"), ("session", "recent")}
     finally:
-        orchestration._stopped_session_answers.pop(key, None)
-
-
-async def test_a_reused_id_does_not_drop_a_running_delivery() -> None:
-    session_id, elicitation_id = "conv_reused", "elicit_claude_" + "d" * 32
-    pending_elicitations.record_publish(
-        session_id,
-        {
-            "type": "response.elicitation_request",
-            "elicitation_id": elicitation_id,
-            "params": {"mode": "form", "message": "a different question"},
-        },
-    )
-    record = _record(time.time(), delivering=True)
-    key = (session_id, elicitation_id)
-    orchestration._stopped_session_answers[key] = record
-    request = Request({"type": "http", "method": "POST", "path": "/", "headers": []})
-    conv = Conversation(id=session_id, created_at=0, updated_at=0, root_conversation_id=session_id)
-
-    async def _post_event(*args: object, **kwargs: object) -> dict[str, bool]:
-        raise AssertionError("a request that waits must not start its own delivery")
-
-    try:
-        answer = asyncio.create_task(
-            orchestration._deliver_answer_to_stopped_session(
-                request,
-                session_id,
-                conv,
-                {"elicitation_id": elicitation_id, "action": "accept", "content": {}},
-                None,
-                _post_event,
-                conversation_store=None,
-                runner_exit_reports=None,
-            )
-        )
-        await asyncio.sleep(0)
-        assert orchestration._stopped_session_answers.get(key) is record
-        record.delivery.set_result({"queued": True})
-        assert await asyncio.wait_for(answer, 5.0) == {"queued": True}
-    finally:
-        orchestration._stopped_session_answers.pop(key, None)
-        pending_elicitations.resolve(session_id, elicitation_id)
+        for key in records:
+            orchestration._stopped_session_answers.pop(key, None)
 
 
 _QUESTION = "Which database?"
@@ -133,13 +81,17 @@ def _question_params() -> dict[str, object]:
 
 
 class _Question:
-    """One parked Claude question on a hostless native session, answered at unit level."""
+    """One parked Claude question on a host-bound native session, answered at unit level."""
 
     def __init__(self, monkeypatch: pytest.MonkeyPatch, session_id: str) -> None:
         self.session_id = session_id
         self.elicitation_id = "elicit_claude_" + session_id[-8:].rjust(32, "0")
         self.conv = Conversation(
-            id=session_id, created_at=0, updated_at=0, root_conversation_id=session_id
+            id=session_id,
+            created_at=0,
+            updated_at=0,
+            root_conversation_id=session_id,
+            host_id="host_bound",
         )
         self.request = Request({"type": "http", "method": "POST", "path": "/", "headers": []})
         self.posts: list[object] = []
@@ -156,14 +108,7 @@ class _Question:
         monkeypatch.setattr(orchestration, "_is_native_terminal_session", lambda conv: True)
         monkeypatch.setattr(orchestration, "_get_runner_client", _no_runner)
         monkeypatch.setattr(orchestration, "_publish_elicitation_resolved", _record_resolved)
-        pending_elicitations.record_publish(
-            session_id,
-            {
-                "type": "response.elicitation_request",
-                "elicitation_id": self.elicitation_id,
-                "params": _question_params(),
-            },
-        )
+        self.publish(_question_params())
 
     @property
     def key(self) -> tuple[str, str]:
@@ -175,7 +120,24 @@ class _Question:
             is not None
         )
 
-    def answer(self, post_event: Callable[..., Awaitable[Any]]) -> asyncio.Task[Any]:
+    def publish(self, params: dict[str, object]) -> None:
+        """Park *params* under this question's id, replacing what is parked there."""
+        pending_elicitations.record_publish(
+            self.session_id,
+            {
+                "type": "response.elicitation_request",
+                "elicitation_id": self.elicitation_id,
+                "params": params,
+            },
+        )
+
+    def answer(
+        self,
+        post_event: Callable[..., Awaitable[Any]],
+        *,
+        action: str = "accept",
+        conversation_store: Any = None,
+    ) -> asyncio.Task[Any]:
         return asyncio.create_task(
             orchestration._deliver_answer_to_stopped_session(
                 self.request,
@@ -183,12 +145,12 @@ class _Question:
                 self.conv,
                 {
                     "elicitation_id": self.elicitation_id,
-                    "action": "accept",
+                    "action": action,
                     "content": {_QUESTION: "sqlite"},
                 },
                 None,
                 post_event,
-                conversation_store=None,
+                conversation_store=conversation_store,
                 runner_exit_reports=None,
             )
         )
@@ -226,6 +188,160 @@ def _gated_post_event(
         return result
 
     return _post_event, reached, release
+
+
+_OTHER_QUESTION = {**_question_params(), "message": "a different question"}
+_CURSOR_QUESTION = {
+    "mode": "form",
+    "message": "Cursor wants to call **AskQuestion**",
+    "phase": "pre_tool_use",
+    "policy_name": "cursor_native_permission",
+    "ask_user_question": {"questions": [{"question": _QUESTION, "options": []}]},
+}
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["decline", "cancel", "tool_permission", "not_native", "sub_agent", "cursor_question"],
+)
+async def test_an_answer_outside_the_question_scope_is_not_sent(
+    question: _Question, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    """Only an accepted AskUserQuestion on a top-level native session can become a message."""
+
+    async def _post_event(*args: object, **kwargs: object) -> dict[str, bool]:
+        raise AssertionError("an out-of-scope answer must not be delivered")
+
+    if case == "tool_permission":
+        question.publish({**_question_params(), "ask_user_question": None})
+    elif case == "cursor_question":
+        question.publish(_CURSOR_QUESTION)
+    elif case == "not_native":
+        monkeypatch.setattr(orchestration, "_is_native_terminal_session", lambda conv: False)
+    elif case == "sub_agent":
+        question.conv.kind = "sub_agent"
+    action = case if case in ("decline", "cancel") else "accept"
+
+    assert await asyncio.wait_for(question.answer(_post_event, action=action), 5.0) is None
+    assert question.pending()
+
+
+@pytest.mark.parametrize("routing_host", ["host_parent", None])
+async def test_a_session_with_no_host_in_its_chain_leaves_the_answer_to_its_hook(
+    question: _Question, monkeypatch: pytest.MonkeyPatch, routing_host: str | None
+) -> None:
+    """With no host in the chain the hook keeps the answer; an inherited host still relaunches."""
+    question.conv.host_id = None
+    monkeypatch.setattr(orchestration, "routing_host_id", lambda conv, store: routing_host)
+    post_event, _reached, release = _gated_post_event(question, [{"queued": True}])
+    release.set()
+
+    delivered = await asyncio.wait_for(
+        question.answer(post_event, conversation_store=_Rows(question.conv)), 5.0
+    )
+
+    if routing_host is None:
+        assert delivered is None
+        assert question.posts == []
+        return
+    assert delivered == {"queued": True}
+    assert len(question.posts) == 1
+
+
+@pytest.mark.parametrize(
+    "case", ["moving", "admission", "denied"], ids=["409_moving", "409_admission", "403"]
+)
+async def test_a_recovery_409_is_reported_as_unavailable(
+    question: _Question, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    """A recovery 409 reaches every waiting answer as 503; other errors keep their code."""
+    from omnigent.server.runtime_compatibility import RuntimeSupportError
+
+    if case == "admission":
+        error: OmnigentError = RuntimeSupportError(
+            "Cannot load /example/agent.yaml", code=ErrorCode.CONFLICT
+        )
+
+        async def _fails_admission(*args: object, **kwargs: object) -> bool:
+            raise error
+
+        monkeypatch.setattr(orchestration, "_session_runner_reachable", _fails_admission)
+        post_event, _reached, release = _gated_post_event(question, [])
+        release.set()
+        answers = [question.answer(post_event)]
+    else:
+        error = OmnigentError(
+            "This chat is moving to a new session; send the message there.",
+            code=ErrorCode.CONFLICT if case == "moving" else ErrorCode.FORBIDDEN,
+        )
+        post_event, reached, release = _gated_post_event(question, [error])
+        answers = [question.answer(post_event)]
+        await asyncio.wait_for(reached.wait(), 5.0)
+        answers.append(question.answer(post_event))
+        await asyncio.sleep(0)
+        release.set()
+    outcomes = await asyncio.wait_for(asyncio.gather(*answers, return_exceptions=True), 5.0)
+
+    expected = ErrorCode.FORBIDDEN if case == "denied" else ErrorCode.RUNNER_UNAVAILABLE
+    for outcome in outcomes:
+        assert isinstance(outcome, OmnigentError), outcome
+        assert outcome.code == expected
+        assert outcome.message == error.message
+    assert question.pending()
+
+
+@pytest.mark.parametrize(
+    ("replacement", "action"),
+    [("pending", "accept"), ("answered", "accept"), ("answered", "decline"), ("unanswered", None)],
+)
+async def test_a_new_question_under_a_reused_id_keeps_its_own_hook(
+    question: _Question, replacement: str, action: str | None
+) -> None:
+    """A different question under the id during a delivery is not acknowledged or cancelled."""
+    post_event, reached, release = _gated_post_event(question, [{"queued": True}])
+    first = question.answer(post_event)
+    hook = asyncio.get_running_loop().create_future()
+    eid = question.elicitation_id
+    try:
+        await asyncio.wait_for(reached.wait(), 5.0)
+        question.publish(_OTHER_QUESTION)
+        orchestration._harness_elicitation_registry[eid] = hook
+        orchestration._harness_elicitation_owners[eid] = question.session_id
+        if action is not None:
+            assert await asyncio.wait_for(question.answer(post_event, action=action), 5.0) is None
+        if replacement == "answered":
+            pending_elicitations.resolve(question.session_id, eid)
+        release.set()
+        assert await asyncio.wait_for(first, 5.0) == {"queued": True}
+    finally:
+        release.set()
+        await asyncio.gather(first, return_exceptions=True)
+        orchestration._harness_elicitation_registry.pop(eid, None)
+        orchestration._harness_elicitation_owners.pop(eid, None)
+
+    assert len(question.posts) == 1
+    assert eid not in question.resolved
+    assert not hook.done()
+    assert question.pending() is (replacement != "answered")
+
+
+async def test_a_retry_after_a_failed_delivery_closes_its_card(question: _Question) -> None:
+    """A replacement seen by a failed delivery does not stop the next delivery's card close."""
+    error = OmnigentError("host offline", code=ErrorCode.RUNNER_UNAVAILABLE)
+    post_event, reached, release = _gated_post_event(question, [error, {"queued": True}])
+    first = question.answer(post_event)
+    await asyncio.wait_for(reached.wait(), 5.0)
+    question.publish(_OTHER_QUESTION)
+    assert await asyncio.wait_for(question.answer(post_event), 5.0) is None
+    pending_elicitations.resolve(question.session_id, question.elicitation_id)
+    release.set()
+    with pytest.raises(OmnigentError):
+        await asyncio.wait_for(first, 5.0)
+
+    question.publish(_question_params())
+    assert await asyncio.wait_for(question.answer(post_event), 5.0) == {"queued": True}
+    assert question.resolved == [question.elicitation_id]
+    assert not question.pending()
 
 
 async def test_a_denied_answer_keeps_the_question_open(question: _Question) -> None:

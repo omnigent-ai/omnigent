@@ -132,7 +132,7 @@ def register_elicitations_routes(
             conversation item, except an answer sent as a message on a stopped session,
             which returns that send's acknowledgement.
         :raises OmnigentError: 404 if no session exists; for an answer sent as a message, the
-            message path's error, or 403 when a policy denies it.
+            message path's error (a 409 as 503), or 403 when a policy denies it.
         """
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(

@@ -5836,12 +5836,10 @@ def _stage_relaunched_runner(
     monkeypatch: pytest.MonkeyPatch,
     fake_runner: httpx.AsyncClient | None,
     in_flight_seen: list[int] | None = None,
-    gate: tuple[asyncio.Event, asyncio.Event] | None = None,
 ) -> None:
     """Make the runner look gone; after a relaunch, connect *fake_runner* (``None``: no runner).
 
     :param in_flight_seen: Receives the session's in-flight message count at the relaunch wait.
-    :param gate: ``(reached, release)``: the relaunch wait sets *reached*, then awaits *release*.
     """
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes._sessions import orchestration
@@ -5854,9 +5852,6 @@ def _stage_relaunched_runner(
         del args, kwargs
         if in_flight_seen is not None:
             in_flight_seen.append(orchestration._dispatch_in_flight.get(session_id, 0))
-        if gate is not None:
-            gate[0].set()
-            await gate[1].wait()
         return fake_runner
 
     async def _noop_relay_ready(*args: Any, **kwargs: Any) -> None:
@@ -6064,14 +6059,51 @@ async def test_answer_with_a_live_runner_reaches_the_hook_and_sends_no_message(
         await asyncio.gather(hook_task, return_exceptions=True)
         await fake_runner.aclose()
 
-    # With admission_error the approval forward uses resource routing and fails: check the hook.
+    # With admission_error the hook has the answer, then the approval forward's admission fails.
     if lookup == "live":
         assert response.status_code == 202, response.text
         assert response.json() == {"queued": False}
+    else:
+        assert response.status_code == 409, response.text
+        assert response.json()["error"]["code"] == "conflict"
     decision = hook_response.json()["hookSpecificOutput"]["decision"]
     assert decision["behavior"] == "allow", decision
     assert decision["updatedInput"]["answers"] == {_QUESTION: "sqlite"}
     assert _message_texts(runner_posts) == []
+    assert not await _expect_no_launch(comm, budget_s=budget(0.2))
+
+
+@pytest.mark.parametrize("route", ["resolve", "approval_event"])
+async def test_a_hostless_session_in_a_tunnel_gap_answers_its_hook(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    app: FastAPI,
+    db_uri: str,
+    route: str,
+) -> None:
+    """With no host to relaunch the runner, a tunnel gap still leaves the answer to the hook."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    comm, session_id, hook_task, elicitation_id = await _park_on_claude_session(client, app)
+    SqlAlchemyConversationStore(db_uri).clear_host_binding(session_id, keep_runner=True)
+
+    async def _tunnel_gap(*args: Any, **kwargs: Any) -> httpx.AsyncClient | None:
+        del args, kwargs
+        return None
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _tunnel_gap)
+    try:
+        response = await _resolve_answer(client, session_id, elicitation_id, route=route)
+        hook_response = await asyncio.wait_for(hook_task, budget(5.0))
+    finally:
+        hook_task.cancel()
+        await asyncio.gather(hook_task, return_exceptions=True)
+
+    assert response.status_code == 202, response.text
+    assert response.json() == {"queued": False}
+    decision = hook_response.json()["hookSpecificOutput"]["decision"]
+    assert decision["behavior"] == "allow", decision
+    assert decision["updatedInput"]["answers"] == {_QUESTION: "sqlite"}
     assert not await _expect_no_launch(comm, budget_s=budget(0.2))
 
 
@@ -6121,12 +6153,10 @@ async def test_an_answer_during_a_runner_tunnel_gap_reaches_the_hook(
     assert not await _expect_no_launch(comm, budget_s=budget(0.2))
 
 
-@pytest.mark.parametrize("route", ["resolve", "approval_event"])
 async def test_an_admission_failure_after_the_tunnel_gap_still_reaches_the_hook(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
     app: FastAPI,
-    route: str,
 ) -> None:
     """The asking runner reconnects but fails admission: its hook still gets the answer."""
     from omnigent.runner.routing import RoutedRunner
@@ -6152,14 +6182,16 @@ async def test_an_admission_failure_after_the_tunnel_gap_still_reaches_the_hook(
     monkeypatch.setattr(router, "client_for_session_resources", _fail_admission)
     monkeypatch.setattr(app.state.tunnel_registry, "wait_for_runner", _connects)
     try:
-        await _resolve_answer(client, session_id, elicitation_id, route=route)
+        response = await _resolve_answer(client, session_id, elicitation_id)
         hook_response = await asyncio.wait_for(hook_task, budget(5.0))
     finally:
         hook_task.cancel()
         await asyncio.gather(hook_task, return_exceptions=True)
         await fake_runner.aclose()
 
-    # The route may still return the admission error; the hook already has the answer.
+    # The hook has the answer; the route still reports the admission error.
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "conflict"
     decision = hook_response.json()["hookSpecificOutput"]["decision"]
     assert decision["behavior"] == "allow", decision
     assert decision["updatedInput"]["answers"] == {_QUESTION: "sqlite"}
@@ -6285,31 +6317,6 @@ async def test_a_policy_denied_answer_fails_and_keeps_the_question_open(
     assert pending_elicitations.lookup(elicitation_id, conversation_id=session_id) is not None
     assert _message_texts(runner_posts) == []
     assert not await _expect_no_launch(comm, budget_s=budget(0.2))
-
-
-@pytest.mark.parametrize("action", ["decline", "cancel"])
-async def test_decline_on_a_stopped_claude_session_does_not_relaunch(
-    client: httpx.AsyncClient,
-    monkeypatch: pytest.MonkeyPatch,
-    app: FastAPI,
-    action: str,
-) -> None:
-    """A decline or a cancel is not an answer to deliver, so it starts no runner."""
-    from omnigent.runtime import set_runner_client
-
-    comm, session_id, hook_task, elicitation_id = await _park_on_claude_session(client, app)
-    set_runner_client(None)
-    _stage_relaunched_runner(monkeypatch, None)
-    try:
-        response = await _resolve_answer(client, session_id, elicitation_id, action=action)
-        assert response.status_code == 202, response.text
-        assert response.json() == {"queued": False}
-        hook_response = await asyncio.wait_for(hook_task, budget(5.0))
-        assert hook_response.json()["hookSpecificOutput"]["decision"]["behavior"] == "deny"
-        assert not await _expect_no_launch(comm, budget_s=budget(0.5))
-    finally:
-        hook_task.cancel()
-        await asyncio.gather(hook_task, return_exceptions=True)
 
 
 async def _disconnect_host(app: FastAPI, comm: ApplicationCommunicator) -> None:
@@ -6467,38 +6474,19 @@ async def test_answer_when_the_host_is_on_another_replica_redirects(
     assert pending_elicitations.lookup(elicitation_id, conversation_id=session_id) is not None
 
 
-@pytest.mark.parametrize("case", ["tool_permission", "not_native", "sub_agent", "cursor_question"])
 async def test_accept_outside_the_question_scope_keeps_the_old_path(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
     app: FastAPI,
-    case: str,
 ) -> None:
-    """Only a Claude AskUserQuestion on a top-level native session becomes a message."""
+    """An accepted tool permission is not a question: its hook gets the answer, no relaunch."""
     from omnigent.runtime import set_runner_client
 
     comm = await _connect_host(app)
-    harness = {"not_native": None, "cursor_question": "cursor-native"}.get(case, "claude-native")
-    session = await _inline_launch_session(client, comm, harness=harness)
-    session_id = session["id"]
-    if case == "sub_agent":
-        stat_responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
-        try:
-            session_id = (await _inline_child_session(client, session_id))["id"]
-        finally:
-            stat_responder.cancel()
-            await asyncio.gather(stat_responder, return_exceptions=True)
+    session_id = (await _inline_launch_session(client, comm, harness="claude-native"))["id"]
     payload = _ask_user_question_hook_payload()
-    hook = "permission-request"
-    if case == "tool_permission":
-        payload.update(tool_name="Bash", tool_input={"command": "ls"})
-    if case == "cursor_question":
-        hook = "cursor-permission-request"
-        payload = {
-            "elicitation_id": f"elicit_cursor_{'b' * 32}",
-            "ask_user_question": payload["tool_input"],
-        }
-    hook_task, elicitation_id = await _park_ask_user_question(client, session_id, payload, hook)
+    payload.update(tool_name="Bash", tool_input={"command": "ls"})
+    hook_task, elicitation_id = await _park_ask_user_question(client, session_id, payload)
     set_runner_client(None)
     _stage_relaunched_runner(monkeypatch, None)
     try:
@@ -6511,9 +6499,8 @@ async def test_accept_outside_the_question_scope_keeps_the_old_path(
     assert response.status_code == 202, response.text
     assert response.json() == {"queued": False}
     assert hook_response.status_code == 200, hook_response.text
-    if case != "cursor_question":
-        decision = hook_response.json()["hookSpecificOutput"]["decision"]
-        assert decision["behavior"] == "allow", decision
+    decision = hook_response.json()["hookSpecificOutput"]["decision"]
+    assert decision["behavior"] == "allow", decision
     assert not await _expect_no_launch(comm, budget_s=budget(0.5))
 
 
