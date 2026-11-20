@@ -349,7 +349,7 @@ describe("Databricks browser session lifecycle", () => {
       const checked = h.auth.checkSession(win, "test", () => true);
       await drain();
       h.request(win, `${ORIGIN}/login`);
-      if (!cookiePresent) h.setCookie(null);
+      if (!cookiePresent) h.removeCookie();
       releaseCookies();
       assert.equal(await checked, false);
       assert.equal(h.calls.renew.length, 1);
