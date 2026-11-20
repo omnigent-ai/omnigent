@@ -21,6 +21,9 @@ sys.path.insert(0, str(Path.cwd()))
 assert os.environ.get("GITHUB_ACTIONS") == "true", "This capture only runs in hosted CI"
 output = Path(os.environ["OMNIGENT_E2E_RECORD_DIR"])
 output.mkdir(parents=True, exist_ok=True)
+control_home = Path(os.environ["CODEX_HOME"]).resolve()
+assert control_home.is_relative_to(Path.cwd().resolve() / "artifacts")
+control_home.mkdir(parents=True, exist_ok=True)
 permission_args = ["--sandbox", "danger-full-access", "--ask-for-approval", "never"]
 binary = shutil.which("codex")
 assert binary is not None
@@ -128,8 +131,16 @@ def frame(name: str) -> None:
 def capture_state(*args: Any, **kwargs: Any) -> Any:
     state = read_state(*args, **kwargs)
     if state is not None and state.thread_id and "control" not in observation:
+        control_argv = [
+            binary,
+            *permission_args,
+            "resume",
+            "--remote",
+            state.socket_path,
+            state.thread_id,
+        ]
         control = subprocess.run(
-            [binary, *permission_args, "resume", "--remote", state.socket_path, state.thread_id],
+            control_argv,
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
@@ -137,6 +148,7 @@ def capture_state(*args: Any, **kwargs: Any) -> Any:
             check=False,
         )
         observation["control"] = {
+            "argv": control_argv,
             "exit_code": control.returncode,
             "stdout": control.stdout,
             "stderr": control.stderr,
@@ -188,6 +200,11 @@ control_rejected = (
     and any(word in control_text for word in ("permission", "sandbox", "approval", "override"))
 )
 qualified = code == 0 and passed and len(observation["frames"]) == 5 and control_rejected
-observation.update(pytest_exit_code=int(code), actual_test_pass=qualified)
+observation.update(
+    pytest_exit_code=int(code),
+    app_test_pass=code == 0 and passed,
+    control_rejected=control_rejected,
+    actual_test_pass=qualified,
+)
 (output / "codex-resume-results.json").write_text(json.dumps(observation, indent=2) + "\n")
 raise SystemExit(0 if qualified else 1)
