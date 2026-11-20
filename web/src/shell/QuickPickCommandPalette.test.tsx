@@ -4,6 +4,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { FlagIcon } from "lucide-react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { readQuickPickHistory } from "@/components/ui/quick-pick";
 import { type PaletteCommand, usePaletteCommandsStore } from "@/store/paletteCommands";
 
 import { QuickPickCommandPalette } from "./QuickPickCommandPalette";
@@ -20,9 +21,10 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({ session_search_scope: true }),
 }));
 const useConversations = vi.fn();
+const useSessionSearch = vi.fn((..._args: unknown[]): unknown => ({ isFetching: false }));
 vi.mock("@/hooks/useConversations", () => ({
   useConversations: (...args: unknown[]) => useConversations(...args),
-  useSessionSearch: () => ({ isFetching: false }),
+  useSessionSearch: (...args: unknown[]) => useSessionSearch(...args),
   useProjects: () => ({ data: [] }),
 }));
 
@@ -38,6 +40,8 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   usePaletteCommandsStore.setState({ groups: {} });
+  localStorage.clear();
+  useSessionSearch.mockImplementation(() => ({ isFetching: false }));
 });
 
 function renderPalette() {
@@ -89,6 +93,76 @@ describe("QuickPickCommandPalette", () => {
     fireEvent.keyDown(input, { key: "Enter" });
     expect(onOpenChange).toHaveBeenCalledWith(false);
     expect(navigate).toHaveBeenCalledWith("/");
+  });
+});
+
+describe("QuickPickCommandPalette ordering", () => {
+  const groupNames = () =>
+    screen
+      .getAllByRole("group")
+      .map(
+        (group) =>
+          document.getElementById(group.getAttribute("aria-labelledby") ?? "")?.textContent,
+      );
+
+  it("lists a command picked before under Recent, below the sessions", () => {
+    const first = renderPalette();
+    fireEvent.change(first.input, { target: { value: "go to settings" } });
+    fireEvent.keyDown(first.input, { key: "Enter" });
+    expect(navigate).toHaveBeenCalledWith("/settings");
+    cleanup();
+
+    renderPalette();
+    expect(groupNames().slice(0, 2)).toEqual(["Sessions", "Recent"]);
+    const recent = screen.getByRole("group", { name: "Recent" });
+    expect(
+      within(recent)
+        .getAllByRole("option")
+        .map((option) => option.textContent),
+    ).toEqual([expect.stringContaining("Go to Settings")]);
+  });
+
+  it("keeps session and Show more picks out of the commands' history", async () => {
+    const commandHistory = () => readQuickPickHistory("command-palette:commands");
+    const first = renderPalette();
+    fireEvent.keyDown(first.input, { key: "Enter" });
+    expect(navigate).toHaveBeenCalledWith("/c/c1");
+    expect(commandHistory()).toEqual([]);
+    cleanup();
+
+    useSessionSearch.mockImplementation((_query: unknown, scope: unknown) =>
+      scope === "content"
+        ? { isFetching: false }
+        : {
+            isFetching: false,
+            data: {
+              pages: [{ data: [{ id: "k1", title: "Kestrel plan", agent_name: null }] }],
+            },
+            hasNextPage: true,
+            fetchNextPage: vi.fn(),
+          },
+    );
+    const { input } = renderPalette();
+    fireEvent.change(input, { target: { value: "kestrel" } });
+    const showMore = await screen.findByRole("option", { name: /Show more/ });
+    fireEvent.click(showMore);
+    expect(commandHistory()).toEqual([]);
+  });
+
+  it("puts a command the query names ahead of the sessions that match it", () => {
+    useConversations.mockReturnValue({
+      data: {
+        pages: [
+          { data: [{ id: "c2", title: "Settings sync", agent_name: null, archived: false }] },
+        ],
+      },
+      isFetching: false,
+    });
+    const { input } = renderPalette();
+    fireEvent.change(input, { target: { value: "settings" } });
+    const options = screen.getAllByRole("option").map((option) => option.textContent ?? "");
+    expect(options[0]).toContain("Go to Settings");
+    expect(options.some((option) => option.includes("Settings sync"))).toBe(true);
   });
 });
 

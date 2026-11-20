@@ -39,6 +39,8 @@ type PaletteRow =
   | PaletteCommandRow
   | { kind: "more"; load: () => void; lastRowId: string | undefined };
 
+const COMMAND_HISTORY_KEY = "command-palette:commands";
+
 /** A blank icon slot, so session labels line up with the icon-prefixed actions. */
 const SESSION_ICON = <span aria-hidden className="size-4" />;
 
@@ -110,6 +112,8 @@ export function QuickPickCommandPalette({
         <span className="text-sm text-muted-foreground">{session.agent}</span>
       </>
     ),
+    // Sessions list by their own activity; the history holds commands only.
+    rememberInHistory: false,
     value: { kind: "session", id: session.id },
   });
   const showMoreItem = (
@@ -123,6 +127,7 @@ export function QuickPickCommandPalette({
       ? [
           {
             id: `more:${scope}`,
+            rememberInHistory: false,
             label: group.isFetchingNextPage ? "Loading…" : "Show more",
             group: groupLabel,
             icon: SESSION_ICON,
@@ -141,6 +146,7 @@ export function QuickPickCommandPalette({
     {
       sourceId: "sessions",
       ranking: "provider",
+      origin: "source",
       items: [
         ...visibleSessions.map((session) => sessionItem(session, "Sessions")),
         ...(searching ? showMoreItem("title", titleSearch, visibleSessions, "Sessions") : []),
@@ -149,6 +155,7 @@ export function QuickPickCommandPalette({
     {
       sourceId: "messages",
       ranking: "provider",
+      origin: "source",
       items: [
         ...contentSessions.map((session) => sessionItem(session, "In messages")),
         ...showMoreItem("content", contentSearch, contentSessions, "In messages"),
@@ -278,6 +285,10 @@ export function QuickPickCommandPalette({
           : "top-1/4 sm:max-w-2xl"
       }
       label={label}
+      // Commands picked lately lead the commands, under Recent; sessions keep their own order.
+      historyKey={sessionsOnly ? undefined : COMMAND_HISTORY_KEY}
+      // Sessions lead, unless the query names a command from a word's start, such as "settings".
+      sourcesFirst
       placeholder={sessionsOnly ? "Search sessions by name…" : "Search sessions or run a command"}
       segments={segments}
       query={query}
