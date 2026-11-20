@@ -90,7 +90,7 @@ function normalizeSearchQuery(query: string): string {
   return query.trim().toLowerCase();
 }
 
-// Matches the former `gap-0.5` between rows, so windowed rows keep their spacing.
+// Space between rows, in px (Tailwind `gap-0.5`).
 const ROW_GAP_PX = 2;
 
 function FileListItem({

@@ -11,6 +11,7 @@ vi.unmock("@tanstack/react-virtual");
 const VIEWPORT_HEIGHT = 300;
 const ROW_HEIGHT = 24;
 const ROW_GAP = 2;
+const HEADER_HEIGHT = 28;
 // The rows filling the viewport plus overscan on each side, with some slack.
 const MAX_MOUNTED_ROWS = 60;
 
@@ -24,8 +25,27 @@ function stub<Key extends keyof HTMLElement>(key: Key, descriptor: PropertyDescr
   });
 }
 const isScroller = (element: HTMLElement) => element.dataset.testid === "scroller";
-const heightOf = (element: HTMLElement) =>
-  isScroller(element) ? VIEWPORT_HEIGHT : element.tagName === "LI" ? ROW_HEIGHT : 0;
+const isRow = (element: HTMLElement) => element.tagName === "LI" && "index" in element.dataset;
+const isWindowedList = (element: HTMLElement) =>
+  element.tagName === "UL" && element.style.height !== "";
+const heightOf = (element: HTMLElement) => {
+  if (isScroller(element)) return VIEWPORT_HEIGHT;
+  if (isRow(element)) return ROW_HEIGHT;
+  return isWindowedList(element) ? Number.parseFloat(element.style.height) : 0;
+};
+
+// Where a windowed list starts in the scroll content: below its repository
+// header, if any, and every list before it.
+function contentTopOf(list: HTMLElement, scroller: HTMLElement): number {
+  let top = 0;
+  for (const other of scroller.querySelectorAll<HTMLElement>("ul")) {
+    if (!isWindowedList(other)) continue;
+    if (other.closest("[role=group]")) top += HEADER_HEIGHT;
+    if (other === list) return top;
+    top += heightOf(other);
+  }
+  return top;
+}
 
 beforeAll(() => {
   // jsdom does no layout: give the scroller a viewport and every row a height.
@@ -43,7 +63,10 @@ beforeAll(() => {
     value(this: HTMLElement) {
       // Content moves up as the scroller scrolls.
       const scroller = this.closest<HTMLElement>("[data-testid=scroller]");
-      const top = isScroller(this) ? 0 : -(scroller?.scrollTop ?? 0);
+      const list = isRow(this) ? this.parentElement : this;
+      const listTop = scroller && list && isWindowedList(list) ? contentTopOf(list, scroller) : 0;
+      const rowTop = isRow(this) ? Number.parseFloat(this.style.top) || 0 : 0;
+      const top = isScroller(this) ? 0 : listTop + rowTop - (scroller?.scrollTop ?? 0);
       const height = heightOf(this);
       return { top, left: 0, right: 300, bottom: top + height, width: 300, height, x: 0, y: top };
     },
@@ -96,7 +119,8 @@ function Harness({ files }: { files: WorkspaceChangedFile[] }) {
   );
 }
 
-const mountedRows = () => screen.queryAllByRole("button", { name: /src\/file-\d+\.ts$/ });
+const mountedRows = (root = "") =>
+  screen.queryAllByRole("button", { name: new RegExp(`^${root}src/file-\\d+\\.ts$`) });
 
 describe("FlatFileList windowing", () => {
   it("mounts only the rows near the viewport of a large change set", () => {
@@ -121,12 +145,30 @@ describe("FlatFileList windowing", () => {
     expect(screen.queryByRole("button", { name: "src/file-0000.ts" })).toBeNull();
   });
 
-  it("windows the rows of each repository group", () => {
-    render(<Harness files={[...manyFiles(1_000, "api"), ...manyFiles(1_000, "web")]} />);
+  it("windows each repository group at its own offset in the panel", () => {
+    const perGroup = 1_000;
+    render(<Harness files={[...manyFiles(perGroup, "api"), ...manyFiles(perGroup, "web")]} />);
 
     expect(screen.getByRole("button", { name: "api, 1000 changed files" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "web, 1000 changed files" })).toBeInTheDocument();
-    expect(mountedRows().length).toBeLessThan(2 * MAX_MOUNTED_ROWS);
+    expect(screen.getByRole("button", { name: "api/src/file-0000.ts" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "api/src/file-0999.ts" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "web/src/file-0999.ts" })).toBeNull();
+    expect(mountedRows("api/").length + mountedRows("web/").length).toBeLessThan(MAX_MOUNTED_ROWS);
+
+    // Center the viewport on the boundary between the two groups.
+    const apiListHeight = perGroup * ROW_HEIGHT + (perGroup - 1) * ROW_GAP;
+    const webListTop = 2 * HEADER_HEIGHT + apiListHeight;
+    const scroller = screen.getByTestId("scroller");
+    act(() => {
+      scroller.scrollTop = webListTop - VIEWPORT_HEIGHT / 2;
+      fireEvent.scroll(scroller);
+    });
+
+    expect(screen.getByRole("button", { name: "api/src/file-0999.ts" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "web/src/file-0000.ts" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "api/src/file-0000.ts" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "web/src/file-0999.ts" })).toBeNull();
+    expect(mountedRows("api/").length + mountedRows("web/").length).toBeLessThan(MAX_MOUNTED_ROWS);
   });
 });
