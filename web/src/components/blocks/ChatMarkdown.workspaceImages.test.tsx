@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { ImageLightboxProvider } from "@/components/ImageLightbox";
@@ -59,10 +59,22 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  vi.restoreAllMocks();
   URL.createObjectURL = ORIGINAL_CREATE;
   URL.revokeObjectURL = ORIGINAL_REVOKE;
   vi.unstubAllGlobals();
 });
+
+/** Record each synthetic download link's `[href, download]` instead of navigating. */
+function captureDownloads(): [string, string][] {
+  const clicked: [string, string][] = [];
+  vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
+    this: HTMLAnchorElement,
+  ) {
+    clicked.push([this.getAttribute("href") ?? "", this.download]);
+  });
+  return clicked;
+}
 
 function renderMarkdown(
   markdown: string,
@@ -131,12 +143,7 @@ describe("assistant workspace markdown images", () => {
           respond = resolve;
         }),
     );
-    const clicked: [string, string][] = [];
-    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
-      this: HTMLAnchorElement,
-    ) {
-      clicked.push([this.getAttribute("href") ?? "", this.download]);
-    });
+    const clicked = captureDownloads();
     renderMarkdown("![Screenshot](/workspace/project/shots/shot.png)");
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
@@ -144,10 +151,26 @@ describe("assistant workspace markdown images", () => {
     respond(imageResponse());
     fireEvent.click(await screen.findByRole("button", { name: "Download image: shot.png" }));
 
-    expect(clicked).toEqual([["blob:workspace-image-1", "shot.png"]]);
+    expect(createObjectURL.mock.calls[1][0]).toBe(createObjectURL.mock.calls[0][0]);
+    expect(clicked).toEqual([["blob:workspace-image-2", "shot.png"]]);
     expect(fetchMock).toHaveBeenCalledOnce();
     expect(screen.queryByRole("dialog")).toBeNull();
-    vi.restoreAllMocks();
+  });
+
+  it("still saves the image from an open preview after its message scrolls away", async () => {
+    const clicked = captureDownloads();
+    const result = renderMarkdown("![Screenshot](/workspace/project/shot.png)");
+    fireEvent.click(await screen.findByRole("button", { name: "Zoom image: Screenshot" }));
+
+    // A virtualized transcript unmounts the row, which revokes its object URL.
+    result.update("No image here");
+    expect(revokeObjectURL).toHaveBeenCalledWith("blob:workspace-image-1");
+    fireEvent.click(
+      within(screen.getByRole("dialog")).getByRole("button", { name: "Download image: shot.png" }),
+    );
+
+    expect(createObjectURL.mock.calls[1][0]).toMatchObject({ size: 8, type: "image/png" });
+    expect(clicked).toEqual([["blob:workspace-image-2", "shot.png"]]);
   });
 
   it("loads a typed WebP blob when MIME metadata is absent", async () => {

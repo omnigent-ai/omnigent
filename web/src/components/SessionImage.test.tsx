@@ -14,6 +14,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const getOmnigentHostConfig = vi.fn();
 const authenticatedFetch = vi.fn();
+const isAndroidShell = vi.fn(() => false);
+const toastError = vi.fn();
+
+vi.mock("@/lib/nativeBridge", () => ({
+  isIOSShell: () => false,
+  isAndroidShell: () => isAndroidShell(),
+}));
+
+vi.mock("sonner", () => ({ toast: { error: (message: string) => toastError(message) } }));
 
 vi.mock("@/lib/host", () => ({
   getOmnigentHostConfig: () => getOmnigentHostConfig(),
@@ -60,6 +69,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
   vi.clearAllMocks();
   vi.restoreAllMocks();
+  isAndroidShell.mockReturnValue(false);
 });
 
 /** Record each synthetic download link's `[href, download]` instead of navigating. */
@@ -124,6 +134,31 @@ describe("SessionImage (standalone, no host fetcher)", () => {
 
     expect(clicked).toEqual([["/v1/sessions/a/resources/files/x/content", "shot.png"]]);
     expect(authenticatedFetch).not.toHaveBeenCalled();
+  });
+
+  it("reports a failed download once the slow response arrives", async () => {
+    // The Android shell saves through the app's transport, which can fail.
+    isAndroidShell.mockReturnValue(true);
+    let respond: (response: { ok: boolean; status: number; statusText: string }) => void = () => {};
+    authenticatedFetch.mockReturnValue(
+      new Promise((resolve) => {
+        respond = resolve;
+      }),
+    );
+    render(
+      <SessionImage
+        path="/v1/sessions/a/resources/files/x/content"
+        alt="shot.png"
+        variant="userAttachment"
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Download image: shot.png" }));
+    expect(authenticatedFetch).toHaveBeenCalledWith("/v1/sessions/a/resources/files/x/content");
+    expect(toastError).not.toHaveBeenCalled();
+
+    respond({ ok: false, status: 503, statusText: "Service Unavailable" });
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith("Download failed"));
   });
 
   it("reserves a square for a user attachment before its session path resolves", () => {
@@ -193,9 +228,13 @@ describe("SessionImage (embedded, host fetcher present)", () => {
     render(<SessionImage path="/thumbnail" alt="shot.png" variant="userAttachment" />);
     expect(screen.queryByRole("button", { name: "Download image: shot.png" })).toBeNull();
 
-    resolveFetch({ ok: true, blob: () => Promise.resolve(new Blob(["x"])) });
+    const bytes = new Blob(["x"], { type: "image/png" });
+    resolveFetch({ ok: true, blob: () => Promise.resolve(bytes) });
     fireEvent.click(await screen.findByRole("button", { name: "Download image: shot.png" }));
 
+    // Saved from the held bytes, so evicting the cached URL can't break it.
+    expect(createObjectURL).toHaveBeenCalledTimes(2);
+    expect(createObjectURL).toHaveBeenLastCalledWith(bytes);
     expect(clicked).toEqual([["blob:fake-url", "shot.png"]]);
     expect(authenticatedFetch).toHaveBeenCalledOnce();
   });

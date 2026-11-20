@@ -214,38 +214,81 @@ async function downloadApiFile(url: string, filename: string): Promise<void> {
 // The page already holds these bytes, so saving them sends no request.
 const IN_MEMORY_IMAGE_SOURCE = /^(?:blob|data):/i;
 
+const IMAGE_EXTENSIONS_BY_TYPE: Record<string, string> = {
+  "image/png": "png",
+  "image/jpeg": "jpg",
+  "image/gif": "gif",
+  "image/webp": "webp",
+  "image/avif": "avif",
+  "image/bmp": "bmp",
+  "image/svg+xml": "svg",
+};
+
+/** Fallback names (an alt text, a file id) carry no extension for the OS to open them by. */
+function withImageExtension(name: string, type: string): string {
+  if (/\.[^./\s]+$/.test(name)) return name;
+  const extension = IMAGE_EXTENSIONS_BY_TYPE[type.split(";")[0].trim().toLowerCase()];
+  return extension ? `${name}.${extension}` : name;
+}
+
+/** Only the app's own API is re-read; anything else would be a new request elsewhere. */
+function isAppApiPath(path: string | undefined): path is string {
+  return path !== undefined && path.startsWith("/v1/");
+}
+
+/** Where to read an on-screen image's bytes from, besides the source it displays. */
+export interface ImageDownloadSource {
+  /** The app API path the image was read from. */
+  apiPath?: string;
+  /** The image's bytes, which stay valid after the page revokes its object URL. */
+  blob?: Blob;
+}
+
 /**
  * Whether {@link downloadImage} can save an on-screen image.
  *
  * :param src: The source the `<img>` displays.
- * :param apiPath: The app API path the image was read from, if any.
+ * :param source: Other places its bytes can be read from.
  */
-export function canDownloadImage(src: string | undefined, apiPath?: string): boolean {
-  return src !== undefined && (IN_MEMORY_IMAGE_SOURCE.test(src) || apiPath !== undefined);
+export function canDownloadImage(
+  src: string | undefined,
+  { apiPath, blob }: ImageDownloadSource = {},
+): boolean {
+  return (
+    src !== undefined &&
+    (blob !== undefined || IN_MEMORY_IMAGE_SOURCE.test(src) || isAppApiPath(apiPath))
+  );
 }
 
 /**
  * Save an image the page is showing.
  *
- * `blob:` and `data:` sources are saved from the bytes already loaded. Any
- * other source is re-read from `apiPath` the way {@link downloadWorkspaceFile}
- * reads a file; a remote URL without one is never fetched.
+ * A held `blob`, or a `blob:`/`data:` source, is saved from the bytes already
+ * loaded. Any other source is re-read from `apiPath` the way
+ * {@link downloadWorkspaceFile} reads a file; a remote URL without one is
+ * never fetched. A name without an extension gets one from the image type.
+ * Callers offer the action only when {@link canDownloadImage} holds, so the
+ * rejection for an unsavable image is a programming error, not a user state.
  *
  * :param src: The source the `<img>` displays.
  * :param filename: The suggested filename for the save dialog.
- * :param apiPath: The app API path the image was read from, e.g.
- *     ``"/v1/sessions/s/resources/files/f/content"``.
+ * :param source: Other places its bytes can be read from, e.g. an `apiPath`
+ *     of ``"/v1/sessions/s/resources/files/f/content"``.
  */
 export async function downloadImage(
   src: string,
   filename: string,
-  apiPath?: string,
+  { apiPath, blob }: ImageDownloadSource = {},
 ): Promise<void> {
-  if (IN_MEMORY_IMAGE_SOURCE.test(src)) {
-    clickDownloadLink(src, filename);
+  if (blob) {
+    triggerBrowserDownload(blob, withImageExtension(filename, blob.type));
     return;
   }
-  if (apiPath === undefined) throw new Error("This image can't be downloaded");
+  if (IN_MEMORY_IMAGE_SOURCE.test(src)) {
+    clickDownloadLink(src, withImageExtension(filename, src.match(/^data:([^;,]+)/i)?.[1] ?? ""));
+    return;
+  }
+  if (!isAppApiPath(apiPath)) throw new Error("This image can't be downloaded");
   await downloadApiFile(apiPath, filename);
 }
 

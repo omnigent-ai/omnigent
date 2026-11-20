@@ -37,18 +37,25 @@ interface LightboxImage {
   downloadName?: string;
   /** App API path the image was read from, for sources the page can't save itself. */
   downloadPath?: string;
-}
-
-function saveImage({ src, alt, downloadName, downloadPath }: LightboxImage) {
-  downloadImage(src, downloadName || alt || "image", downloadPath).catch(() =>
-    toast.error("Download failed"),
-  );
+  /** The image's bytes; outlives an object URL its owner revokes while the preview is open. */
+  downloadBlob?: Blob;
 }
 
 function ImageDownloadButton({ image, className }: { image: LightboxImage; className?: string }) {
+  const [saving, setSaving] = useState(false);
   const name = image.downloadName || image.alt;
+  const save = () => {
+    if (saving) return;
+    setSaving(true);
+    downloadImage(image.src, name || "image", {
+      apiPath: image.downloadPath,
+      blob: image.downloadBlob,
+    })
+      .catch(() => toast.error("Download failed"))
+      .finally(() => setSaving(false));
+  };
   return (
-    // Local provider: images also render where no app-level provider exists.
+    // Tests and stories render images without the app root's provider.
     <TooltipProvider>
       <Tooltip>
         <TooltipTrigger asChild>
@@ -57,9 +64,10 @@ function ImageDownloadButton({ image, className }: { image: LightboxImage; class
             size="icon-sm"
             aria-label={name ? `Download image: ${name}` : "Download image"}
             className={className}
+            disabled={saving}
             onClick={(e) => {
               e.stopPropagation();
-              saveImage(image);
+              save();
             }}
           >
             <DownloadIcon />
@@ -95,6 +103,8 @@ export interface ZoomableImageProps extends React.ComponentProps<"img"> {
   downloadName?: string;
   /** App API path the image was read from, for sources the page can't save itself. */
   downloadPath?: string;
+  /** The image's bytes, so a save survives its owner revoking `src`. */
+  downloadBlob?: Blob;
 }
 
 /**
@@ -112,6 +122,7 @@ export function ZoomableImage({
   buttonClassName,
   downloadName,
   downloadPath,
+  downloadBlob,
   ...imgProps
 }: ZoomableImageProps) {
   const { open } = useLightbox();
@@ -124,21 +135,23 @@ export function ZoomableImage({
         buttonClassName,
       )}
       onClick={() => {
-        if (src) open({ src, alt, downloadName, downloadPath });
+        if (src) open({ src, alt, downloadName, downloadPath, downloadBlob });
       }}
     >
       <img {...imgProps} src={src} alt={alt} className={className} />
     </button>
   );
-  if (!downloadName || !src || !canDownloadImage(src, downloadPath)) return zoom;
+  const source = { apiPath: downloadPath, blob: downloadBlob };
+  if (!downloadName || !src || !canDownloadImage(src, source)) return zoom;
   return (
     <span className="group/image relative inline-flex max-w-full">
       {zoom}
       <ImageDownloadButton
-        image={{ src, alt, downloadName, downloadPath }}
+        image={{ src, alt, downloadName, downloadPath, downloadBlob }}
         className={cn(
           "absolute top-1 right-1 bg-background/80 shadow-sm ring-1 ring-foreground/10 backdrop-blur-xs hover:bg-background/90",
-          "opacity-0 group-hover/image:opacity-100 focus-visible:opacity-100",
+          // Touch screens never hover, so the hidden button must not take the zoom tap.
+          "pointer-events-none opacity-0 group-hover/image:pointer-events-auto group-hover/image:opacity-100 focus-visible:pointer-events-auto focus-visible:opacity-100",
         )}
       />
     </span>
@@ -285,7 +298,9 @@ function ZoomViewer({ image, onClose }: { image: LightboxImage; onClose: () => v
         >
           <ZoomInIcon />
         </Button>
-        {canDownloadImage(image.src, image.downloadPath) && <ImageDownloadButton image={image} />}
+        {canDownloadImage(image.src, { apiPath: image.downloadPath, blob: image.downloadBlob }) && (
+          <ImageDownloadButton image={image} />
+        )}
       </div>
     </>
   );

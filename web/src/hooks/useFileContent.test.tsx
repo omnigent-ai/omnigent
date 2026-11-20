@@ -27,6 +27,8 @@ import { isDatabricksWorkspace } from "@/lib/host";
 import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
 import { useChatStore } from "@/store/chatStore";
 import {
+  canDownloadImage,
+  downloadImage,
   downloadWorkspaceFile,
   FILE_CONTENT_FAILING_POLL_MS,
   FILE_CONTENT_POLL_MAX_BYTES,
@@ -340,6 +342,34 @@ describe("downloadWorkspaceFile", () => {
     } as Response);
 
     await expect(downloadWorkspaceFile("sess_x", "missing.txt")).rejects.toThrow("404");
+  });
+});
+
+describe("canDownloadImage", () => {
+  it.each([
+    ["an in-memory blob source in any case", "BLOB:http://app/1", {}, true],
+    ["a data source", "data:image/png;base64,AA==", {}, true],
+    ["held bytes for any source", "https://example.com/a.png", { blob: new Blob(["x"]) }, true],
+    [
+      "an app API path",
+      "/base/v1/x",
+      { apiPath: "/v1/sessions/s/resources/files/f/content" },
+      true,
+    ],
+    ["an empty API path", "/v1/x", { apiPath: "" }, false],
+    ["a remote URL as the API path", "/v1/x", { apiPath: "https://example.com/a.png" }, false],
+    ["a remote source with nothing else", "https://example.com/a.png", {}, false],
+  ])("decides %s (%s)", (_label, src, source, expected) => {
+    expect(canDownloadImage(src, source)).toBe(expected);
+  });
+
+  it("accepts nothing before the source resolves", () => {
+    expect(canDownloadImage(undefined, { blob: new Blob(["x"]) })).toBe(false);
+  });
+
+  it("refuses to fetch a source it can't save, without a request", async () => {
+    await expect(downloadImage("https://example.com/a.png", "a.png")).rejects.toThrow();
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
 

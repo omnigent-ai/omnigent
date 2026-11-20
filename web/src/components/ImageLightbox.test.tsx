@@ -198,13 +198,19 @@ describe("downloading from the lightbox", () => {
     return clicked;
   }
 
-  function openImage(props: { src: string; downloadName?: string; downloadPath?: string }) {
+  function openImage(props: {
+    src: string;
+    alt?: string;
+    downloadName?: string;
+    downloadPath?: string;
+    downloadBlob?: Blob;
+  }) {
     render(
       <ImageLightboxProvider>
         <ZoomableImage alt="diagram" {...props} />
       </ImageLightboxProvider>,
     );
-    fireEvent.click(screen.getByRole("button", { name: "Zoom image: diagram" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Zoom image/ }));
     return within(screen.getByRole("dialog"));
   }
 
@@ -225,13 +231,70 @@ describe("downloading from the lightbox", () => {
     expect(authenticatedFetch).not.toHaveBeenCalled();
   });
 
-  it("names an inline data image after its alt text", () => {
+  it("names an inline data image after its alt text, typed by its MIME type", () => {
     const clicked = captureDownloads();
     const dialog = openImage({ src: "data:image/png;base64,iVBORw0KGgo=" });
 
     fireEvent.click(dialog.getByRole("button", { name: "Download image: diagram" }));
 
-    expect(clicked).toEqual([["data:image/png;base64,iVBORw0KGgo=", "diagram"]]);
+    expect(clicked).toEqual([["data:image/png;base64,iVBORw0KGgo=", "diagram.png"]]);
+  });
+
+  it("falls back to a typed generic name for an image with no alt text", () => {
+    const clicked = captureDownloads();
+    const dialog = openImage({ src: "data:image/jpeg;base64,/9j/4AAQ", alt: "" });
+
+    fireEvent.click(dialog.getByRole("button", { name: "Download image" }));
+
+    expect(clicked).toEqual([["data:image/jpeg;base64,/9j/4AAQ", "image.jpg"]]);
+  });
+
+  it("saves held bytes even after the source's object URL is gone", () => {
+    const clicked = captureDownloads();
+    const blob = new Blob(["png"], { type: "image/png" });
+    const createObjectURL = vi.fn(() => "blob:lightbox-copy");
+    vi.stubGlobal("URL", { createObjectURL, revokeObjectURL: vi.fn() });
+    const dialog = openImage({ src: "blob:revoked", downloadName: "1f3a", downloadBlob: blob });
+
+    fireEvent.click(dialog.getByRole("button", { name: "Download image: 1f3a" }));
+
+    expect(createObjectURL).toHaveBeenCalledWith(blob);
+    expect(clicked).toEqual([["blob:lightbox-copy", "1f3a.png"]]);
+    vi.unstubAllGlobals();
+  });
+
+  it("sends one request when Download is clicked again while saving", async () => {
+    isAndroidShell.mockReturnValue(true);
+    let respond: (response: Response) => void = () => {};
+    authenticatedFetch.mockReturnValue(
+      new Promise<Response>((resolve) => {
+        respond = resolve;
+      }),
+    );
+    const dialog = openImage({
+      src: "/v1/sessions/s/resources/files/f/content",
+      downloadName: "shot.png",
+      downloadPath: "/v1/sessions/s/resources/files/f/content",
+    });
+    const download = dialog.getByRole("button", { name: "Download image: shot.png" });
+
+    fireEvent.click(download);
+    fireEvent.click(download);
+    expect(authenticatedFetch).toHaveBeenCalledOnce();
+
+    respond(new Response(null, { status: 503 }));
+    await waitFor(() => expect(download).toBeEnabled());
+  });
+
+  it("keeps the hidden inline button from taking taps until it shows", () => {
+    render(<ZoomableImage src="blob:shown" alt="diagram" downloadName="shot.png" />);
+
+    // Touch screens never match hover, so the zoom button gets the tap.
+    expect(screen.getByRole("button", { name: "Download image: shot.png" })).toHaveClass(
+      "pointer-events-none",
+      "group-hover/image:pointer-events-auto",
+      "focus-visible:pointer-events-auto",
+    );
   });
 
   it("saves a same-origin image from the API path it was read from", () => {
