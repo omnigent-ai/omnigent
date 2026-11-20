@@ -558,7 +558,7 @@ const PULL_REQUEST_READ_CONCURRENCY = 2;
 
 interface QueuedPullRequestRead {
   key: string;
-  start: (counted: boolean) => void;
+  start: () => void;
 }
 
 /**
@@ -568,8 +568,12 @@ interface QueuedPullRequestRead {
  * asks the host's git provider. Unqueued, a session that links dozens of PRs
  * keeps enough requests open to use up the browser's concurrent requests to
  * the server, so sends and streams in every session wait behind them. Queued,
- * those statuses fill in gradually. A prioritized PR, the one open in the
- * panel, is read at once.
+ * those statuses fill in gradually.
+ *
+ * A prioritized PR, the one open in a details view, goes first and may use one
+ * more slot, so it doesn't wait behind background reads. That slot is shared:
+ * a read the user has moved away from keeps it until it settles, so moving
+ * between PRs faster than they load can't add more requests.
  */
 class PullRequestReadQueue {
   private running = 0;
@@ -578,24 +582,21 @@ class PullRequestReadQueue {
 
   async run<T>(key: string, signal: AbortSignal, read: () => Promise<T>): Promise<T> {
     signal.throwIfAborted();
-    const release = this.prioritized.has(key) ? undefined : await this.waitForTurn(key, signal);
+    const release = await this.waitForTurn(key, signal);
     try {
       // Closing a session frees its running reads' slots before it cancels the waiting ones,
       // so a read can be handed a slot just as it's cancelled; it must not start then.
       signal.throwIfAborted();
       return await read();
     } finally {
-      release?.();
+      release();
     }
   }
 
   /** Reads `key` ahead of the queue until the returned function is called. */
   prioritize(key: string): () => void {
     this.prioritized.set(key, (this.prioritized.get(key) ?? 0) + 1);
-    for (const entry of this.waiting.filter((queued) => queued.key === key)) {
-      this.waiting.splice(this.waiting.indexOf(entry), 1);
-      entry.start(false);
-    }
+    this.drain();
     return () => {
       const remaining = (this.prioritized.get(key) ?? 1) - 1;
       if (remaining > 0) this.prioritized.set(key, remaining);
@@ -603,17 +604,13 @@ class PullRequestReadQueue {
     };
   }
 
-  /** Resolves when `key` may start: with a function that frees its slot, or none if prioritized. */
-  private waitForTurn(key: string, signal: AbortSignal): Promise<(() => void) | undefined> {
+  /** Resolves, once `key` may start, with a function that frees its slot. */
+  private waitForTurn(key: string, signal: AbortSignal): Promise<() => void> {
     return new Promise((resolve, reject) => {
       const entry: QueuedPullRequestRead = {
         key,
-        start: (counted) => {
+        start: () => {
           signal.removeEventListener("abort", abandon);
-          if (!counted) {
-            resolve(undefined);
-            return;
-          }
           this.running += 1;
           let holding = true;
           const release = () => {
@@ -640,8 +637,15 @@ class PullRequestReadQueue {
   }
 
   private drain() {
-    while (this.running < PULL_REQUEST_READ_CONCURRENCY && this.waiting.length > 0) {
-      this.waiting.shift()!.start(true);
+    for (;;) {
+      const viewed = this.waiting.findIndex((entry) => this.prioritized.has(entry.key));
+      if (viewed >= 0 && this.running < PULL_REQUEST_READ_CONCURRENCY + 1) {
+        this.waiting.splice(viewed, 1)[0]!.start();
+      } else if (this.waiting.length > 0 && this.running < PULL_REQUEST_READ_CONCURRENCY) {
+        this.waiting.shift()!.start();
+      } else {
+        return;
+      }
     }
   }
 }

@@ -73,17 +73,45 @@ it("reads a session's linked pull requests two at a time, in order", async () =>
 
 it("reads the pull request being viewed ahead of the queue", async () => {
   const held = holdReads();
-  const urls = pullRequestUrls(5);
-  const { unmount } = renderHook(
-    () => {
+  const urls = pullRequestUrls(6);
+  const initialProps: { viewed: string | undefined } = { viewed: urls[4] };
+  const { rerender, unmount } = renderHook(
+    ({ viewed }) => {
       usePullRequestInfos("conv-1", urls);
-      usePullRequestReadPriority("conv-1", urls[4]);
+      usePullRequestReadPriority("conv-1", viewed);
     },
-    { wrapper: withQueryClient() },
+    { wrapper: withQueryClient(), initialProps },
   );
   await waitFor(() =>
     expect(held.map((read) => read.prUrl).sort()).toEqual([urls[0], urls[1], urls[4]].sort()),
   );
+  // Leaving while the viewed read is still open (and still polled) keeps it on the extra
+  // slot, so viewing another pull request waits for a free slot instead of adding a read.
+  rerender({ viewed: undefined });
+  rerender({ viewed: urls[5] });
+  await act(async () => {});
+  expect(held).toHaveLength(3);
+  act(() => held[0]!.answer());
+  await waitFor(() =>
+    expect(held.map((read) => read.prUrl)).toEqual([urls[0], urls[1], urls[4], urls[5]]),
+  );
+  unmount();
+});
+
+it("shares the limit across sessions", async () => {
+  const held = holdReads();
+  const first = pullRequestUrls(2);
+  const [other] = pullRequestUrls(1, 9);
+  const { unmount } = renderHook(
+    () => {
+      usePullRequestInfos("conv-1", first);
+      usePullRequestInfos("conv-2", [other!]);
+    },
+    { wrapper: withQueryClient() },
+  );
+  await waitFor(() => expect(held.map((read) => read.prUrl)).toEqual(first));
+  act(() => held[0]!.answer());
+  await waitFor(() => expect(held.map((read) => read.prUrl)).toEqual([...first, other]));
   unmount();
 });
 
