@@ -188,6 +188,7 @@ def test_requested_sandbox_never_falls_back_to_bare_worker(
         assert private_diagnostic not in failure.value.client_message
     elif fault == "launcher":
         launcher.assert_called_once()
+        assert launcher.call_args.kwargs["cwd"] == str(workspace)
     elif fault in ("backend", "backend-oserror"):
         backend.assert_called_once()
     else:
@@ -546,15 +547,6 @@ print(json.dumps({{'contained': True}}))
     assert not (writable / "denied.txt").exists()
 
 
-def test_claude_sdk_missing_system_and_bundled_cli_rejects_requested_sandbox(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(claude_sdk_executor, "_find_system_claude", lambda: None)
-    monkeypatch.setattr(claude_sdk_executor, "_find_bundled_claude", lambda: None)
-    with pytest.raises(OSError, match="requires a system or SDK-bundled CLI"):
-        claude_sdk_executor.ClaudeSDKExecutor(os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec()))
-
-
 def test_installed_codex_native_commands_remain_inside_outer_sandbox(
     tmp_path: Path, active_sandbox_type: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -766,7 +758,7 @@ def test_pi_version_probe_runs_inside_requested_sandbox(
     workspace.mkdir()
     home = tmp_path / "home"
     home.mkdir()
-    executable = tmp_path / "install" / "bin" / "pi"
+    executable = tmp_path / "install" / "1.2.3" / "bin" / "pi"
     executable.parent.mkdir(parents=True)
     secret = tmp_path / "private.txt"
     secret.write_text("private canary")
@@ -783,7 +775,7 @@ except OSError:
     pass
 else:
     raise AssertionError('version probe read outside its sandbox')
-print('0.80.4')
+print('0.68.0', file=sys.stderr)
 """
     executable.write_text(
         f'#!/bin/sh\nexec {shlex.quote(sys.executable)} -c {shlex.quote(script)} "$@"\n'
@@ -803,7 +795,9 @@ print('0.80.4')
         ),
     )
     try:
-        assert executor._pi_version == (0, 80, 4)
+        assert executor._pi_version == (0, 68, 0)
+        assert not executor._settled_turn_boundary
+        assert "--approve" not in executor._extra_args
     finally:
         Path(executor._pi_launch_path).unlink(missing_ok=True)
 

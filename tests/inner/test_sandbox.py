@@ -18,6 +18,7 @@ from unittest import mock
 
 import pytest
 
+from omnigent.inner.model_auth import ProviderAuthRequired
 from omnigent.inner.sandbox import (
     HOST_SANDBOX_BACKEND_ENV,
     HarnessSandboxPreparationError,
@@ -884,6 +885,7 @@ def test_harness_policy_validation_rejects_unenforceable_network_or_backend(feat
         (RuntimeError("launcher unavailable"), False),
         (HarnessSandboxValidationError("unsupported policy", reason="fork"), True),
         (HarnessSandboxPreparationError("already classified"), True),
+        (ProviderAuthRequired("sign in again"), True),
         (asyncio.CancelledError(), True),
     ],
 )

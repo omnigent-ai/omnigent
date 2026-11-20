@@ -262,8 +262,12 @@ def use_error_with_usage(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
-def use_provider_auth_failure(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("MOCK_EXECUTOR_SCRIPT", "provider_auth_failure")
+def use_provider_auth_failure(
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> str:
+    script = request.param
+    monkeypatch.setenv("MOCK_EXECUTOR_SCRIPT", script)
+    return script
 
 
 @pytest.fixture
@@ -775,8 +779,13 @@ async def test_executor_error_usage_reaches_response_failed(
     assert events[-1].data["response"]["error"] is not None
 
 
+@pytest.mark.parametrize(
+    "use_provider_auth_failure",
+    ["provider_auth_failure", "claude_preparation_auth_failure"],
+    indirect=True,
+)
 async def test_provider_auth_required_survives_adapter_and_sse_envelope(
-    use_provider_auth_failure: None,
+    use_provider_auth_failure: str,
     manager: HarnessProcessManager,
 ) -> None:
     conv_id = "conv_provider_auth"
@@ -790,7 +799,7 @@ async def test_provider_auth_required_survives_adapter_and_sse_envelope(
 
     assert events[-1].event == "response.failed"
     error = events[-1].data["response"]["error"]
-    assert error == {
+    expected = {
         "code": "PROVIDER_AUTH_REQUIRED",
         "message": (
             "Provider authentication required for host "
@@ -804,6 +813,14 @@ async def test_provider_auth_required_survives_adapter_and_sse_envelope(
         ),
         "remediation": "ucode configure",
     }
+    if use_provider_auth_failure == "claude_preparation_auth_failure":
+        expected.update(
+            message="Claude model authentication is unavailable; sign in again and retry.",
+            title="Claude authentication required",
+            cause="The selected Claude credential is missing or expired.",
+        )
+        expected.pop("remediation")
+    assert error == expected
     assert "stderr" not in str(error).lower()
     assert "token" not in str(error).lower()
 

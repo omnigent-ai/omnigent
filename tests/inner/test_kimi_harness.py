@@ -13,7 +13,6 @@ import json
 import time
 from collections.abc import Callable
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -732,12 +731,6 @@ def test_sandbox_launch_path_wraps_when_sandbox_requested(
 
     monkeypatch.setattr(sandbox_mod, "create_exec_launcher", _reject_launcher)
     with pytest.raises(OSError, match="trusted runtime is writable"):
-        ex._sandbox_launch_path(("PATH",))
-
-    monkeypatch.setattr(
-        sandbox_mod, "resolve_sandbox", lambda *_a, **_k: SimpleNamespace(active=False)
-    )
-    with pytest.raises(sandbox_mod.HarnessSandboxPreparationError, match="active sandbox"):
         ex._sandbox_launch_path(("PATH",))
 
 

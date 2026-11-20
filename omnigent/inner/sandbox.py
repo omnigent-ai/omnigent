@@ -898,10 +898,12 @@ class HarnessSandboxPreparationError(OSError):
 
 @contextlib.contextmanager
 def harness_sandbox_preparation() -> Iterator[None]:
-    """Keep sandbox setup diagnostics in logs without reclassifying policy or cancellation."""
+    """Classify setup diagnostics while preserving policy, authentication, and cancellation."""
+    from .model_auth import ProviderAuthRequired
+
     try:
         yield
-    except (HarnessSandboxValidationError, HarnessSandboxPreparationError):
+    except (HarnessSandboxValidationError, HarnessSandboxPreparationError, ProviderAuthRequired):
         raise
     except Exception as exc:
         raise HarnessSandboxPreparationError(str(exc)) from exc

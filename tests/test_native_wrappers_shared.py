@@ -980,6 +980,12 @@ class _Completed:
     [
         ("pi 0.79.10\n", "", (0, 79, 10)),
         ("", "@earendil-works/pi-coding-agent v1.2.3", (1, 2, 3)),
+        (
+            "",
+            "[omnigent-sandbox] activated; spawning target=/opt/pi/1.2.3/bin/pi\n0.68.0\n",
+            (0, 68, 0),
+        ),
+        ("", "[omnigent-sandbox] target=/opt/pi/1.2.3/bin/pi\n", None),
         ("no version here", "", None),
         ("", "", None),
     ],

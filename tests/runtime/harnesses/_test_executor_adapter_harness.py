@@ -48,7 +48,7 @@ from omnigent.inner.executor import (
 )
 from omnigent.inner.model_auth import ProviderAuthRequired
 from omnigent.inner.os_env_serialization import resolve_harness_os_env
-from omnigent.inner.sandbox import validate_harness_sandbox
+from omnigent.inner.sandbox import harness_sandbox_preparation, validate_harness_sandbox
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 
 _SCRIPT_ENV_VAR = "MOCK_EXECUTOR_SCRIPT"
@@ -276,6 +276,13 @@ def _build_provider_auth_failure() -> Executor:
     return _ProviderAuthFailureExecutor()
 
 
+def _build_claude_preparation_auth_failure() -> Executor:
+    from omnigent.inner.claude_model_access import ClaudeAuthRequired
+
+    with harness_sandbox_preparation():
+        raise ClaudeAuthRequired()
+
+
 def _build_sandbox_policy() -> Executor:
     """Validate the transported worker policy before allocating a mock executor."""
     validate_harness_sandbox(resolve_harness_os_env("HARNESS_CLAUDE_SDK_OS_ENV"), "Test")
@@ -296,6 +303,7 @@ _SCRIPTS: dict[str, Callable[[], Executor]] = {
     "cancelled": _build_cancelled,
     "capture_messages": _build_capture_messages,
     "provider_auth_failure": _build_provider_auth_failure,
+    "claude_preparation_auth_failure": _build_claude_preparation_auth_failure,
 }
 
 

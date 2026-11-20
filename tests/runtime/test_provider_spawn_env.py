@@ -399,8 +399,10 @@ def _brokered_codex_spec(
     return spec, sandbox, binding
 
 
+@pytest.mark.parametrize("broker_gateway", [None, False], ids=["absent", "disabled"])
 def test_codex_nonbrokered_credentials_rejected_before_provider_resolution(
     monkeypatch: pytest.MonkeyPatch,
+    broker_gateway: bool | None,
 ) -> None:
     from unittest.mock import Mock
 
@@ -411,7 +413,10 @@ def test_codex_nonbrokered_credentials_rejected_before_provider_resolution(
         host="openai.example.com",
         response_path="/v1/responses",
     )
-    spec.executor.config["broker_gateway"] = False
+    if broker_gateway is None:
+        spec.executor.config.pop("broker_gateway")
+    else:
+        spec.executor.config["broker_gateway"] = broker_gateway
     binding.inject_env = ["UNRELATED_TOKEN"]
     resolve_provider = Mock()
     monkeypatch.setattr(workflow, "_resolve_provider_for_build", resolve_provider)
@@ -437,12 +442,6 @@ def test_codex_gateway_binding_uses_only_placeholder_auth(config_home: Path) -> 
     assert env["HARNESS_CODEX_DISABLE_NATIVE_TOOLS"] == "true"
     assert "/private/model-token.sock" not in env["HARNESS_CODEX_GATEWAY_AUTH_COMMAND"]
 
-    spec.executor.config.pop("broker_gateway")
-    with pytest.raises(OmnigentError, match="credential_proxy"):
-        _build_codex_spawn_env(spec)
-    spec.executor.config["broker_gateway"] = False
-    with pytest.raises(OmnigentError, match="credential_proxy"):
-        _build_codex_spawn_env(spec)
     for value in (None, 0, 1, "true", "false"):
         spec.executor.config["broker_gateway"] = value
         with pytest.raises(OmnigentError, match="broker_gateway must be a boolean"):

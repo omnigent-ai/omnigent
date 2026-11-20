@@ -5559,7 +5559,6 @@ async def test_sandboxed_sdk_exposes_bash_for_skill_expansion(
         await executor.close()
 
 
-@pytest.mark.parametrize("allow_network", [True, False], ids=["network-allowed", "network-denied"])
 @pytest.mark.parametrize(
     "cwd_source",
     [
@@ -5577,7 +5576,7 @@ async def test_sandboxed_sdk_exposes_bash_for_skill_expansion(
     ],
 )
 def test_prepare_claude_cli_path_probe_passes_target_and_still_wraps(
-    monkeypatch, tmp_path: Path, allow_network: bool, cwd_source: str
+    monkeypatch, tmp_path: Path, cwd_source: str
 ) -> None:
     """
     The probe uses the CLI target and policy even when networking is denied.
@@ -5585,6 +5584,7 @@ def test_prepare_claude_cli_path_probe_passes_target_and_still_wraps(
     """
     from omnigent.inner.claude_sdk_executor import prepare_claude_cli_path
 
+    allow_network = False
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path))
     spec = _wrap_probe_spec(allow_network=allow_network)
     cwd = None

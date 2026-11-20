@@ -218,8 +218,14 @@ def pi_version(
     # Older Pi (mariozechner package) prints the version to stderr via
     # console.error; newer Pi (earendil-works) prints to stdout via
     # console.log. Check both so the probe works across all versions.
-    combined = result.stdout + result.stderr
-    match = re.search(r"(\d+)\.(\d+)\.(\d+)", combined)
+    # Only accept version lines; launcher diagnostics can contain versioned paths.
+    combined = result.stdout + "\n" + result.stderr
+    match = re.search(
+        r"^\s*(?:(?:pi|@[\w.-]+/pi-coding-agent)\s+(?:version\s+)?)?"
+        r"v?(\d+)\.(\d+)\.(\d+)(?:[-+]\S+)?\s*$",
+        combined,
+        re.MULTILINE | re.IGNORECASE,
+    )
     if match is None:
         return None
     return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
