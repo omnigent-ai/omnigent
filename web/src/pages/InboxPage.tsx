@@ -444,22 +444,26 @@ export function InboxPage() {
   const emptyState = EMPTY_STATES[filter];
 
   // "Mark all as read" covers what the current tab lists as unread; approvals
-  // stay, since only an answer clears them.
+  // stay, since only an answer clears them. A session whose reply is still
+  // sending stays too: its pending POST may hand the draft back.
   const unreadSuggestions = visibleSuggestions.filter((item) => item.status === "unread");
+  const unreadSessionsToClear = visibleUnread.filter(
+    ({ row }) => replyStatuses[row.id]?.state !== "sending",
+  );
   const markAllReadCount =
     visibleComments.length +
-    visibleUnread.length +
+    unreadSessionsToClear.length +
     visibleAutomations.length +
     unreadSuggestions.length;
   const markAllRead = () => {
-    const clearedKeys = new Set(visibleUnread.map(({ row }) => `unread:${row.id}`));
-    const clearedSessions = new Set(visibleUnread.map(({ row }) => row.id));
+    const clearedKeys = new Set(unreadSessionsToClear.map(({ row }) => `unread:${row.id}`));
+    const clearedSessions = new Set(unreadSessionsToClear.map(({ row }) => row.id));
     const keep = <T,>(state: Record<string, T>, cleared: Set<string>) =>
       Object.fromEntries(Object.entries(state).filter(([key]) => !cleared.has(key)));
     setExpandedOverrides((prev) => keep(prev, clearedKeys));
     setReplyDrafts((prev) => keep(prev, clearedSessions));
     setReplyStatuses((prev) => keep(prev, clearedSessions));
-    for (const { row } of visibleUnread) markConversationRead(row.id, row.updated_at);
+    for (const { row } of unreadSessionsToClear) markConversationRead(row.id, row.updated_at);
     markCommentsSeen(visibleComments.map(({ comment }) => comment.id));
     for (const item of visibleAutomations) automationInbox.markRead(item.runId);
     for (const item of unreadSuggestions) void proactiveInbox.update(item.id, { status: "read" });
