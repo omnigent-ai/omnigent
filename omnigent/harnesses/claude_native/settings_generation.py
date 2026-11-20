@@ -10,8 +10,9 @@ import re
 import secrets
 import shutil
 import stat
+import threading
 from collections.abc import Iterator
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -29,8 +30,10 @@ _logger = logging.getLogger(__name__)
 _GENERATION = re.compile(r"[0-9a-f]{32}")
 _REQUEST_FILE = re.compile(r"claude-settings-([0-9a-f]{32})\.request\.lock")
 _OWNERSHIP_LOCK = re.compile(r"claude-settings-[0-9a-f]{32}\.(?:request|lease)\.lock")
+_TERMINAL_CLAIM = re.compile(r"claude-settings-[0-9a-f]{32}\.terminal-[0-9a-f]{32}\.owner")
 _LIFECYCLE_FILE = ".claude-settings-lifecycle.json"
 CLAUDE_SETTINGS_REQUEST_PROTOCOL = 1
+CLAUDE_SETTINGS_FENCED_REQUEST_PROTOCOL = 2
 
 
 class ClaudeSettingsRequestExpired(ValueError):
@@ -329,6 +332,108 @@ def _dispatch_binding(
     ).encode("ascii")
 
 
+@dataclass(frozen=True)
+class _FencedSettingsBinding:
+    incarnation: str
+    epoch: str
+    session_id: str | None
+    identities: dict[str, tuple[int, int]]
+
+    def encode(self, **claims: tuple[int, int]) -> bytes:
+        return json.dumps(
+            {
+                "schema": 2,
+                "incarnation": self.incarnation,
+                "admission_epoch": self.epoch,
+                "session_id": self.session_id,
+                "owner_identities": {
+                    name: list(identity) for name, identity in (self.identities | claims).items()
+                },
+            },
+            sort_keys=True,
+            ensure_ascii=True,
+        ).encode("ascii")
+
+
+def _read_fenced_binding(bridge_dir: Path, generation: str) -> _FencedSettingsBinding | None:
+    """Recognize only exact new-protocol ownership; older or damaged records stay protected."""
+    baseline = settings_generation_path(bridge_dir, generation)
+    descriptors: dict[str, int] = {}
+    try:
+        descriptors["bridge"] = _open_bridge(bridge_dir)
+        for name in ("request", "lease"):
+            descriptors[name] = _open_lock(baseline.with_suffix(f".{name}.lock"))
+        raw = os.pread(descriptors["request"], 4097, 0)
+        payload = json.loads(raw)
+        if (
+            not isinstance(payload, dict)
+            or set(payload)
+            != {"schema", "incarnation", "admission_epoch", "session_id", "owner_identities"}
+            or type(payload["schema"]) is not int
+            or payload["schema"] != 2
+            or any(
+                not isinstance(payload[key], str) or not _GENERATION.fullmatch(payload[key])
+                for key in ("incarnation", "admission_epoch")
+            )
+            or (
+                payload["session_id"] is not None
+                and (not isinstance(payload["session_id"], str) or not payload["session_id"])
+            )
+        ):
+            return None
+        identities = {name: _fd_identity(fd) for name, fd in descriptors.items()}
+        binding = _FencedSettingsBinding(
+            payload["incarnation"], payload["admission_epoch"], payload["session_id"], identities
+        )
+        if raw != binding.encode() or any(
+            not _file_matches_fd(baseline.with_suffix(f".{name}.lock"), descriptors[name])
+            for name in ("request", "lease")
+        ):
+            return None
+        return binding
+    except (OSError, ValueError, RecursionError):
+        return None
+    finally:
+        for fd in descriptors.values():
+            _release(fd)
+
+
+def _remove_fenced_claim(path: Path, binding: _FencedSettingsBinding, kind: str) -> bool:
+    fd: int | None = None
+    try:
+        fd = _open_lock(path)
+        if os.pread(fd, 4097, 0) != binding.encode(**{kind: _fd_identity(fd)}):
+            return False
+        if not _file_matches_fd(path, fd):
+            return False
+        path.unlink()
+        return True
+    except (OSError, ValueError):
+        return False
+    finally:
+        _release(fd)
+
+
+def _prune_fenced_claims(bridge_dir: Path, generation: str) -> None:
+    try:
+        if _read_lifecycle(bridge_dir) is None:
+            return
+    except (OSError, ValueError):
+        return
+    binding = _read_fenced_binding(bridge_dir, generation)
+    if binding is None:
+        return
+    baseline = settings_generation_path(bridge_dir, generation)
+    with _unused(baseline.with_suffix(".request.lock")) as unused:
+        if unused:
+            _remove_fenced_claim(baseline.with_suffix(".dispatch.owner"), binding, "dispatch")
+    for path in bridge_dir.glob(f"claude-settings-{generation}.terminal-*.owner"):
+        if _TERMINAL_CLAIM.fullmatch(path.name):
+            with contextlib.suppress(OSError, ValueError), _unused(path) as unused:
+                if unused:
+                    _remove_fenced_claim(path, binding, "terminal")
+
+
 def _release(fd: int | None) -> None:
     if fd is not None:
         with contextlib.suppress(OSError):
@@ -380,12 +485,31 @@ def _unused(path: Path) -> Iterator[bool]:
         _release(fd)
 
 
+def _recognized_request(bridge_dir: Path, generation: str) -> bool:
+    fd: int | None = None
+    try:
+        fd = _open_lock(
+            settings_generation_path(bridge_dir, generation).with_suffix(".request.lock")
+        )
+        raw = os.pread(fd, 33, 0)
+        if len(raw) == 32 and _GENERATION.fullmatch(raw.decode("ascii", errors="replace")):
+            return True
+        return _read_fenced_binding(bridge_dir, generation) is not None
+    except (OSError, ValueError):
+        return False
+    finally:
+        _release(fd)
+
+
 def _retire_unused(bridge_dir: Path, generation: str) -> bool:
     """The stable bridge lock excludes new owners while lock inodes are removed."""
     baseline = settings_generation_path(bridge_dir, generation)
     request_lock = baseline.with_suffix(".request.lock")
     if not request_lock.exists():
         return False
+    if not _recognized_request(bridge_dir, generation):
+        return False
+    _prune_fenced_claims(bridge_dir, generation)
     with _unused(request_lock) as request_unused:
         if not request_unused:
             return False
@@ -426,11 +550,24 @@ def prune_unused_claude_settings(bridge_dir: Path) -> int:
     if not bridge_dir.exists():
         return 0
     with bridge_dir_preparation_lock(bridge_dir):
-        return _prune_unused(bridge_dir)
+        retired = _prune_unused(bridge_dir)
+        with contextlib.suppress(OSError, ValueError):
+            lifecycle = _read_lifecycle(bridge_dir)
+            if lifecycle is not None:
+                _complete_bridge_deletion(
+                    bridge_dir, lifecycle.incarnation, admission_epoch=lifecycle.epoch
+                )
+        return retired
 
 
 def has_live_claude_settings_owners(bridge_dir: Path) -> bool:
     """Protect live or unacknowledged owners under the bridge cleanup lock."""
+    for path in bridge_dir.glob("claude-settings-*.request.lock"):
+        match = _REQUEST_FILE.fullmatch(path.name)
+        if match is not None:
+            if not _recognized_request(bridge_dir, match[1]):
+                return True
+            _prune_fenced_claims(bridge_dir, match[1])
     for path in bridge_dir.iterdir():
         if not path.name.startswith("claude-settings-"):
             continue
@@ -459,9 +596,13 @@ class ClaudeSettingsLease:
     _claim_fd: int | None = None
     _session_id: str | None = None
     _request_identity: tuple[int, int] | None = None
+    _fenced_binding: _FencedSettingsBinding | None = None
+    _close_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def _request_binding_matches(self) -> bool:
         """Verify the original generation after a newer epoch fences its admissions."""
+        if self._fenced_binding is not None:
+            return _read_fenced_binding(self.bridge_dir, self.generation) == self._fenced_binding
         if self._request_identity is None or self._admission_epoch is None:
             return False
         path = settings_generation_path(self.bridge_dir, self.generation).with_suffix(
@@ -533,7 +674,15 @@ class ClaudeSettingsLease:
                 assert self._bridge_fd is not None
                 bridge_fd = os.dup(self._bridge_fd)
                 claim_fd = _open_lock(claim, create=True)
+                if self._fenced_binding is not None:
+                    encoded = self._fenced_binding.encode(terminal=_fd_identity(claim_fd))
+                    if os.write(claim_fd, encoded) != len(encoded):
+                        raise OSError("Claude terminal ownership was not fully written")
+                    fcntl.flock(claim_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
             except BaseException:
+                with contextlib.suppress(OSError):
+                    if claim_fd is not None and _file_matches_fd(claim, claim_fd):
+                        claim.unlink(missing_ok=True)
                 _release(fd)
                 _release(bridge_fd)
                 _release(claim_fd)
@@ -549,12 +698,14 @@ class ClaudeSettingsLease:
             _claim_fd=claim_fd,
             _session_id=self._session_id,
             _request_identity=self._request_identity,
+            _fenced_binding=self._fenced_binding,
         )
 
     def attach(self, instance: TerminalInstance) -> None:
         """Retain inputs until confirmed terminal termination, including after transfer."""
         retained = self._retain_for_terminal()
         try:
+            retained._attach_process_lifetime(instance)
             instance.add_resource_cleanup(retained.close)
         except BaseException:
             retained.close()
@@ -568,14 +719,40 @@ class ClaudeSettingsLease:
             self._retain_for_terminal, dispose=ClaudeSettingsLease.close
         )
         try:
+            retained._attach_process_lifetime(instance)
             instance.add_resource_cleanup(retained.close)
         except BaseException:
             await _run_claude_settings_step(retained.close)
             raise
 
+    def _attach_process_lifetime(self, instance: TerminalInstance) -> None:
+        if self._fenced_binding is None:
+            return
+        from omnigent.inner.process_lifetime import ProcessLifetimeLease
+        from omnigent.inner.sandbox import with_additional_read_roots
+
+        assert self._terminal_claim is not None and self._claim_fd is not None
+        baseline = settings_generation_path(self.bridge_dir, self.generation)
+        path = baseline.with_suffix(".lease.lock")
+        instance.add_process_lifetime_lease(
+            ProcessLifetimeLease(
+                path,
+                self._fenced_binding.identities["lease"],
+                self._terminal_claim,
+                _fd_identity(self._claim_fd),
+                instance.private_dir / f"{self._terminal_claim.stem}.ready",
+            ),
+            self.close,
+        )
+        if instance.sandbox_policy is not None and instance.sandbox_policy.active:
+            instance.sandbox_policy = with_additional_read_roots(
+                instance.sandbox_policy, [path, self._terminal_claim]
+            )
+
     def close(self) -> None:
         """Release this owner and retire files only after every owner has released."""
-        fd, self._fd = self._fd, None
+        with self._close_lock:
+            fd, self._fd = self._fd, None
         if fd is None:
             return
         try:
@@ -640,6 +817,7 @@ class ClaudeSettingsRequest:
     generation: str
     _request_fd: int | None
     _lease: ClaudeSettingsLease
+    protocol: int = CLAUDE_SETTINGS_REQUEST_PROTOCOL
 
     def settings_path(self, bridge_dir: Path) -> Path:
         """Reject argument construction after release or for another bridge."""
@@ -657,13 +835,17 @@ class ClaudeSettingsRequest:
             claim = baseline.with_suffix(".dispatch.owner")
             fd = _open_lock(claim, create=True)
             try:
-                binding = _dispatch_binding(
-                    lifecycle,
-                    lifecycle.epoch,
-                    bridge=self._lease._bridge_fd,
-                    request=self._request_fd,
-                    lease=self._lease._fd,
-                    dispatch=fd,
+                binding = (
+                    self._lease._fenced_binding.encode(dispatch=_fd_identity(fd))
+                    if self._lease._fenced_binding is not None
+                    else _dispatch_binding(
+                        lifecycle,
+                        lifecycle.epoch,
+                        bridge=self._lease._bridge_fd,
+                        request=self._request_fd,
+                        lease=self._lease._fd,
+                        dispatch=fd,
+                    )
                 )
                 if os.write(fd, binding) != len(binding):
                     raise OSError("Claude settings dispatch binding was not fully written")
@@ -694,10 +876,14 @@ class ClaudeSettingsRequest:
         return True
 
     @classmethod
-    def create(cls, bridge_dir: Path) -> ClaudeSettingsRequest:
+    def create(
+        cls, bridge_dir: Path, *, protocol: int = CLAUDE_SETTINGS_REQUEST_PROTOCOL
+    ) -> ClaudeSettingsRequest:
         """Own a generation before argument construction can expose its pathname."""
         from omnigent.harnesses.claude_native.bridge import _ensure_secure_dir
 
+        if type(protocol) is not int or protocol not in {1, 2}:
+            raise ValueError("Unsupported Claude settings request protocol")
         request_fd: int | None = None
         lease_fd: int | None = None
         bridge_fd: int | None = None
@@ -719,9 +905,31 @@ class ClaudeSettingsRequest:
                 assert fcntl is not None
                 fcntl.flock(request_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 fcntl.flock(lease_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-                if os.write(request_fd, lifecycle.epoch.encode("ascii")) != 32:
+                fenced = (
+                    _FencedSettingsBinding(
+                        incarnation,
+                        lifecycle.epoch,
+                        lifecycle.session_id,
+                        {
+                            "bridge": _fd_identity(bridge_fd),
+                            "request": _fd_identity(request_fd),
+                            "lease": _fd_identity(lease_fd),
+                        },
+                    )
+                    if protocol == CLAUDE_SETTINGS_FENCED_REQUEST_PROTOCOL
+                    else None
+                )
+                binding = (
+                    fenced.encode() if fenced is not None else lifecycle.epoch.encode("ascii")
+                )
+                if os.write(request_fd, binding) != len(binding):
                     raise OSError("Claude settings request binding was not fully written")
             except BaseException:
+                for name, fd in (("request", request_fd), ("lease", lease_fd)):
+                    with contextlib.suppress(OSError):
+                        path = baseline.with_suffix(f".{name}.lock")
+                        if fd is not None and _file_matches_fd(path, fd):
+                            path.unlink(missing_ok=True)
                 _release(request_fd)
                 _release(lease_fd)
                 _release(bridge_fd)
@@ -740,7 +948,9 @@ class ClaudeSettingsRequest:
                 _bridge_fd=bridge_fd,
                 _session_id=lifecycle.session_id,
                 _request_identity=_fd_identity(request_fd),
+                _fenced_binding=fenced,
             ),
+            protocol,
         )
 
     def close(self) -> None:
@@ -750,6 +960,18 @@ class ClaudeSettingsRequest:
             return
         try:
             with bridge_dir_preparation_lock(self.bridge_dir):
+                binding = self._lease._fenced_binding
+                if (
+                    binding is not None
+                    and _read_fenced_binding(self.bridge_dir, self.generation) == binding
+                ):
+                    _remove_fenced_claim(
+                        settings_generation_path(self.bridge_dir, self.generation).with_suffix(
+                            ".dispatch.owner"
+                        ),
+                        binding,
+                        "dispatch",
+                    )
                 _release(fd)
                 fd = None
         finally:
@@ -806,7 +1028,13 @@ def _reject_expired_dispatch(
             _release(fd)
 
 
-def acquire_claude_settings_request(bridge_dir: Path, generation: str) -> ClaudeSettingsLease:
+def acquire_claude_settings_request(
+    bridge_dir: Path,
+    generation: str,
+    *,
+    protocol: int = CLAUDE_SETTINGS_REQUEST_PROTOCOL,
+    expected_session_id: str | None = None,
+) -> ClaudeSettingsLease:
     """Admit a live request before registry reuse, creation or any preparation await."""
     baseline = settings_generation_path(bridge_dir, generation)
     with bridge_dir_preparation_lock(bridge_dir):
@@ -814,9 +1042,25 @@ def acquire_claude_settings_request(bridge_dir: Path, generation: str) -> Claude
         if lifecycle is None or not _lifecycle_matches_bridge(bridge_dir, lifecycle):
             raise ClaudeSettingsRequestExpired()
         live, admission_epoch = _live_request_incarnation(baseline.with_suffix(".request.lock"))
+        fenced = None
+        if type(protocol) is not int or protocol not in {1, 2}:
+            raise ClaudeSettingsRequestExpired()
+        if protocol == CLAUDE_SETTINGS_FENCED_REQUEST_PROTOCOL:
+            fenced = _read_fenced_binding(bridge_dir, generation)
+            if (
+                fenced is None
+                or fenced.incarnation != lifecycle.incarnation
+                or fenced.session_id != lifecycle.session_id
+                or (expected_session_id is not None and fenced.session_id != expected_session_id)
+            ):
+                raise ClaudeSettingsRequestExpired()
+            admission_epoch = fenced.epoch
         if lifecycle.delete_for_session is not None or not live or not baseline.is_file():
-            rejected = admission_epoch is not None and _reject_expired_dispatch(
-                bridge_dir, generation, lifecycle, admission_epoch
+            rejected = (
+                _remove_fenced_claim(baseline.with_suffix(".dispatch.owner"), fenced, "dispatch")
+                if fenced is not None
+                else admission_epoch is not None
+                and _reject_expired_dispatch(bridge_dir, generation, lifecycle, admission_epoch)
             )
             _retire_unused(bridge_dir, generation)
             if rejected:
@@ -855,4 +1099,5 @@ def acquire_claude_settings_request(bridge_dir: Path, generation: str) -> Claude
         _bridge_fd=bridge_fd,
         _session_id=lifecycle.session_id,
         _request_identity=request_identity,
+        _fenced_binding=fenced,
     )

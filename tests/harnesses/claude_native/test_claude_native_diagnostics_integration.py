@@ -294,7 +294,13 @@ async def test_cli_launch_failure_drains_diagnostics_and_preserves_original_erro
         nonlocal original_error, receiver, admitted_settings
         if request.method == "GET":
             return httpx.Response(
-                200, json={"claude_settings_request_protocol": 1} if owned_request else {}
+                200,
+                json={
+                    "claude_settings_request_protocol": 1,
+                    "claude_settings_fenced_request_protocol": 2,
+                }
+                if owned_request
+                else {},
             )
         posted.append(json.loads(request.content))
         if failure_mode == "cancelled":
@@ -325,7 +331,7 @@ async def test_cli_launch_failure_drains_diagnostics_and_preserves_original_erro
         if owned_request:
             if failure_mode in uncertain_errors:
                 receiver = acquire_claude_settings_request(
-                    bridge_dir, posted[-1]["claude_settings_request"]
+                    bridge_dir, posted[-1]["claude_settings_request"], protocol=2
                 )
                 admitted_settings = (
                     bridge_dir / f"claude-settings-{receiver.generation}.json"
@@ -335,7 +341,7 @@ async def test_cli_launch_failure_drains_diagnostics_and_preserves_original_erro
                 )
                 raise original_error
             generation = posted[-1]["claude_settings_request"]
-            with acquire_claude_settings_request(bridge_dir, generation):
+            with acquire_claude_settings_request(bridge_dir, generation, protocol=2):
                 if failure_mode == "reactivated-ack":
                     request_claude_bridge_deletion(bridge_dir, "failed-child")
                     bridge.prepare_bridge_dir("failed-child", workspace=tmp_path)
@@ -377,16 +383,14 @@ async def test_cli_launch_failure_drains_diagnostics_and_preserves_original_erro
         assert ("claude_settings_request" in posted[0]) is owned_request
         if owned_request:
             generation = posted[0]["claude_settings_request"]
-            if failure_mode in {"rejected", "transport", "reactivated-ack", *undelivered_errors}:
+            if failure_mode not in uncertain_errors:
                 assert not list(bridge_dir.glob("claude-settings-*"))
             else:
                 settings = bridge_dir / f"claude-settings-{generation}.json"
                 assert settings.exists()
                 if admitted_settings is not None:
                     assert settings.read_bytes() == admitted_settings
-                assert (bridge_dir / f"claude-settings-{generation}.dispatch.owner").exists() is (
-                    failure_mode not in uncertain_errors and failure_mode != "reactivated-ack"
-                )
+                assert not (bridge_dir / f"claude-settings-{generation}.dispatch.owner").exists()
         assert "--debug-file" in posted[0]["spec"]["args"]
         make_follower.assert_called_once_with(bridge_dir)
         follower.close.assert_called_once_with("failed-child")
@@ -418,19 +422,27 @@ async def test_cli_settings_request_is_released_after_acknowledgement(
     posted = []
     terminal_closers: list[Callable[[], None]] = []
     terminal = Mock()
+    terminal.private_dir = tmp_path
+    terminal.sandbox_policy = None
     terminal.add_resource_cleanup.side_effect = terminal_closers.append
     reactivated_lifecycle: bytes | None = None
 
     def respond(request: httpx.Request) -> httpx.Response:
         nonlocal reactivated_lifecycle
         if request.method == "GET":
-            return httpx.Response(200, json={"claude_settings_request_protocol": 1})
+            return httpx.Response(
+                200,
+                json={
+                    "claude_settings_request_protocol": 1,
+                    "claude_settings_fenced_request_protocol": 2,
+                },
+            )
         body = json.loads(request.content)
         posted.append(body)
         generation = body["claude_settings_generation"]
         assert (bridge_dir / f"claude-settings-{generation}.json").exists()
         if reactivated:
-            with acquire_claude_settings_request(bridge_dir, generation) as receiver:
+            with acquire_claude_settings_request(bridge_dir, generation, protocol=2) as receiver:
                 receiver.attach(terminal)
             assert not (bridge_dir / f"claude-settings-{generation}.dispatch.owner").exists()
             request_claude_bridge_deletion(bridge_dir, "acknowledged-child")
@@ -508,8 +520,9 @@ async def test_cli_settings_ownership_drains_workers_after_repeated_cancellation
             if threading.get_ident() != loop_thread and not release.wait(timeout=5):
                 raise TimeoutError("settings ownership worker was not released")
 
-    def create_request(cls, bridge_dir: Path) -> ClaudeSettingsRequest:
-        request = create(bridge_dir)
+    def create_request(cls, bridge_dir: Path, *, protocol: int = 1) -> ClaudeSettingsRequest:
+        assert protocol == 2
+        request = create(bridge_dir, protocol=protocol)
         requests.append(request)
         descriptors.extend(
             fd
@@ -540,13 +553,19 @@ async def test_cli_settings_ownership_drains_workers_after_repeated_cancellation
 
     def respond(request: httpx.Request) -> httpx.Response:
         if request.method == "GET":
-            return httpx.Response(200, json={"claude_settings_request_protocol": 1})
+            return httpx.Response(
+                200,
+                json={
+                    "claude_settings_request_protocol": 1,
+                    "claude_settings_fenced_request_protocol": 2,
+                },
+            )
         body = json.loads(request.content)
         posted.append(body)
         if phase == "undelivered":
             raise httpx.ConnectError("request was not delivered", request=request)
         generation = body["claude_settings_request"]
-        with acquire_claude_settings_request(tmp_path, generation):
+        with acquire_claude_settings_request(tmp_path, generation, protocol=2):
             return httpx.Response(
                 200,
                 json={"id": "terminal_claude_main", "claude_settings_request_ack": generation},

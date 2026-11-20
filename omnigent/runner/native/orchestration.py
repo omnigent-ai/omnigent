@@ -10064,7 +10064,7 @@ async def _auto_create_claude_terminal(
                 ),
             )
         settings_request = await _run_claude_settings_step(
-            functools.partial(ClaudeSettingsRequest.create, bridge_dir),
+            functools.partial(ClaudeSettingsRequest.create, bridge_dir, protocol=2),
             dispose=ClaudeSettingsRequest.close,
         )
         claude_args = augment_claude_args(
@@ -10155,7 +10155,7 @@ async def _auto_create_claude_terminal(
         async def prepare_claude(instance: TerminalInstance) -> None:
             lease = await _run_claude_settings_step(
                 functools.partial(
-                    acquire_claude_settings_request, bridge_dir, settings_generation
+                    acquire_claude_settings_request, bridge_dir, settings_generation, protocol=2
                 ),
                 dispose=ClaudeSettingsLease.close,
             )

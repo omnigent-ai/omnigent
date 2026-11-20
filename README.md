@@ -348,58 +348,44 @@ Launches whose arguments are hidden inside serialized shell commands retain
 their existing behavior; this merge and validation apply to inspectable
 invocations.
 
-Each launch needs an immutable baseline and a terminal-owned output because
-overlapping launches can read the same bridge while using different caller
-settings. Request ownership protects queued preparation; admission transfers
-that protection to a receiver and terminal. A dispatch claim retains inputs
-when the sender cannot establish whether a POST was admitted. Admission epochs
-fence stale requests after reactivation, while deletion intents let the final
-known owner finish a pending deletion. Wrapper environment transport keeps
-validation and finalization in the terminal's selected environment without
-changing the host bootstrap environment.
+New peers negotiate fenced settings ownership through a dedicated v2 terminal
+route. Immutable baselines protect overlapping launches. A receiver acquires
+its own lease before bootstrap or settings reads; sender closure atomically
+fences later admission and withdraws only its dispatch claim. A response
+acknowledges admission, not completion of the receiver or model.
 
-Request and terminal owners release their own settings generations during normal
-cleanup, including after session rotation or reactivation when the original
-request inode and admission binding still match. A pending session deletion
-blocks new requests, admissions and terminal attachments until explicit bridge
-preparation reactivates it. Existing owners retain their files until confirmed
-release, and the final known owner completes a matching deletion intent.
+Before the native command starts, a resource guard holds its input leases and
+inherits them into the consumer. Sandboxed launchers acquire those leases after
+containment. The controller releases preparation ownership after that handoff;
+a detached consumer keeps its own kernel-held protection through termination.
+A private manifest also keeps finalized settings available during terminal
+cleanup and orphan reaping. Pending deletion fences new requests and attachments,
+and maintenance retires unused generations and finishes eligible deletions while
+the runner remains alive.
 
-Connection and connection-pool timeouts occur before delivery, so the sender
-can withdraw their dispatch claims. Read/write failures, cancellation and missing
-acknowledgements can leave delivery uncertain. Legacy launches without the
-ownership capability also create generations without request locks, which
-per-generation pruning skips. Crashes can leave dispatch or terminal claims
-that retain settings indefinitely. There is no automatic reconciliation of
-these uncertain or legacy claims.
+The dedicated route is probed before dispatch, so an older server or runner can
+fall back without consuming a v2 request. A dispatched v2 request is never
+retried through an older launch route. For peers without v2 support, this client uses the
+historical single settings file and argument precedence without allocating
+new untracked generations. Caller-settings composition requires the fenced
+path. Existing bundles and registration continue to work without migration.
 
-Before reclaiming a legacy generation or crash-left claim, the operator must
-identify its bridge, session, generation and peer versions, and establish that
-every possible consumer has finished: the sender, any in-flight launch or
-admitted receiver, and detached terminals, including older clients. Prefer each
-known owner's normal release path, and establish that queued launches or resumes
-cannot reuse its settings operands. Retain identity and completion evidence
-without copying credential-bearing settings. File age, runner-PID death and free
-locks do not establish reclaimability. If consumer completion cannot be proved,
-retain the files and escalate to the host maintainer.
+Older v1 records and historical untracked generations retain their conservative
+ownership rules. A crash-left v1 dispatch or terminal claim can still retain
+files indefinitely. Before reclaiming them, the operator must identify their
+bridge, session, generation and peer versions, and establish that every possible
+consumer has finished, including in-flight receivers and detached terminals.
+Prefer normal owner release and retain completion evidence without copying
+credential-bearing settings. Age, controller PID death and released controller
+locks alone do not establish reclaimability for those older records.
 
-A normal session change starts a new ownership incarnation. A closing owner
-checks its original bridge, lease and request identities before retiring its
-generation. Replaced resources and unknown ownership remain protected, and a
-release cannot delete a reactivated session through an old deletion intent.
-
-Explicit bridge preparation and session rotation replace malformed lifecycle
-JSON or damaged supported-schema fields with a fresh admission identity. They
-retain settings files, locks and ownership claims, so existing terminals keep
-their inputs and stale launches must rebuild their requests. This recovery
-assumes the sender and receiver use a coordinated release; it does not reconcile
-legacy or unknown claims.
-
-Future schemas, unknown fields and files that cannot be read safely remain
-blocked. Use a compatible runner; do not unlink claims or reset metadata to
-bypass the block. Disk lifecycle schema 2 is distinct from the advertised
-ownership wire protocol 1. Wire-v2 reconciliation, rollout and mixed-version
-recovery remain open work rather than guarantees of this cleanup protocol.
+Disk lifecycle schema 2 is unchanged. New per-generation request records carry
+v2 ownership bindings; older readers refuse those bindings, and v2 consumers
+verify their exact bridge, request, lease and terminal claim identities. Unknown
+or replaced resources, future formats and unsafe metadata remain protected.
+Explicit bridge preparation can repair damaged supported lifecycle metadata
+while retaining owned resources and fencing stale admissions. Historical claim
+reconciliation remains separate from the fully fenced path for new launches.
 
 </details>
 

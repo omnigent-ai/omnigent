@@ -1995,9 +1995,17 @@ def prune_orphaned_bridge_dirs() -> int:
     """
     from omnigent.harnesses.claude_native.settings_generation import (
         has_live_claude_settings_owners,
+        prune_unused_claude_settings,
     )
 
-    return native_bridge_common.prune_orphaned_dirs(
+    completed = 0
+    if _BRIDGE_ROOT.exists():
+        for path in _BRIDGE_ROOT.iterdir():
+            if path.name != ".locks" and path.is_dir() and not path.is_symlink():
+                with contextlib.suppress(OSError, ValueError):
+                    prune_unused_claude_settings(path)
+                    completed += not path.exists()
+    return completed + native_bridge_common.prune_orphaned_dirs(
         _BRIDGE_ROOT,
         should_prune=lambda path: (
             (path / native_bridge_common.OWNER_PID_FILENAME).is_file()
@@ -3173,6 +3181,7 @@ def augment_claude_args(
     turn_routing: bool = False,
     active_harnesses: Collection[str] | None = None,
     legacy_bridge_identity: bool = False,
+    legacy_peer: bool = False,
     settings_request: ClaudeSettingsRequest | None = None,
 ) -> list[str]:
     """
@@ -3231,6 +3240,7 @@ def augment_claude_args(
         ``False`` keeps every prompt off the routing round trip.
     :param legacy_bridge_identity: Include the canonical settings operand so older
         runners can discover a CLI launch's bridge. The generated settings win.
+    :param legacy_peer: Use the historical single settings file for an unfenced peer.
     :param settings_request: Explicit owner for a deferred launch generation.
     :returns: Augmented argument list for the terminal resource.
     """
@@ -3250,8 +3260,12 @@ def augment_claude_args(
     )
     args = _merge_disallowed_tools(list(claude_args), _OMNIGENT_DISALLOWED_TOOLS)
     args = _merge_allowed_tools(args, allowed_tools)
+    if legacy_peer and settings_request is not None:
+        raise ValueError("Legacy Claude launch cannot expose an owned generation")
     settings_path = (
-        settings_request.settings_path(bridge_dir)
+        bridge_dir / _INVOCATION_SETTINGS_FILE
+        if legacy_peer
+        else settings_request.settings_path(bridge_dir)
         if settings_request is not None
         else _generation_settings_path(bridge_dir, secrets.token_hex(16))
     )
@@ -3270,7 +3284,7 @@ def augment_claude_args(
     else:
         mcp_config = build_mcp_config(bridge_dir, python_executable=python_executable)
         args.extend(["--mcp-config", json.dumps(mcp_config, separators=(",", ":"))])
-    if legacy_bridge_identity:
+    if legacy_bridge_identity and not legacy_peer:
         identity_path = bridge_dir / _INVOCATION_SETTINGS_FILE
         try:
             fd = os.open(identity_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)

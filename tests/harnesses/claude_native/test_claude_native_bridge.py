@@ -6058,7 +6058,9 @@ def test_stale_claude_settings_release_cannot_mutate_recreated_bridge(
                 old_baseline.with_suffix(".request.lock"),
                 old_baseline.with_suffix(".lease.lock"),
             ):
-                path.write_text("replacement-owned")
+                path.write_text(
+                    "0" * 32 if path.name.endswith(".request.lock") else "replacement-owned"
+                )
             if lease._terminal_claim is not None:
                 lease._terminal_claim.write_text("replacement-owned")
             assert has_live_claude_settings_owners(bridge_dir) == (owner == "terminal")

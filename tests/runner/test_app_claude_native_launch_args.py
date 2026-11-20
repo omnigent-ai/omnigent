@@ -1711,7 +1711,11 @@ async def test_auto_create_claude_terminal_hands_off_before_cancelled_sender_rel
     retain = ClaudeSettingsLease._retain_for_terminal
     close = ClaudeSettingsRequest.close
     terminal = Mock(
-        running=True, socket_path=bridge_dir / "terminal.sock", tmux_target="claude:0.0"
+        running=True,
+        socket_path=bridge_dir / "terminal.sock",
+        tmux_target="claude:0.0",
+        private_dir=bridge_dir / "terminal-private",
+        sandbox_policy=None,
     )
     terminal.add_resource_cleanup.side_effect = callbacks.append
     registry = Mock(spec=SessionResourceRegistry)
@@ -1721,8 +1725,9 @@ async def test_auto_create_claude_terminal_hands_off_before_cancelled_sender_rel
     tasks: dict[str, asyncio.Task[object]] = {}
     events = Mock()
 
-    def create_request(cls, path: Path) -> ClaudeSettingsRequest:
-        request = create(path)
+    def create_request(cls, path: Path, *, protocol: int = 1) -> ClaudeSettingsRequest:
+        assert protocol == 2
+        request = create(path, protocol=protocol)
         requests.append(request)
         return request
 

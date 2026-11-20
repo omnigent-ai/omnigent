@@ -6857,12 +6857,17 @@ async def _launch_claude_terminal(
     """
     from omnigent.harnesses.claude_native.settings_generation import ClaudeSettingsRequest
 
+    request_protocol = await _supports_claude_settings_requests(client, session_id)
     settings_request = (
         await _run_claude_settings_step(
-            functools.partial(ClaudeSettingsRequest.create, bridge_dir),
+            functools.partial(
+                ClaudeSettingsRequest.create,
+                bridge_dir,
+                **({"protocol": 2} if request_protocol == 2 else {}),
+            ),
             dispose=ClaudeSettingsRequest.close,
         )
-        if await _supports_claude_settings_requests(client, session_id)
+        if request_protocol == 2
         else None
     )
     try:
@@ -6876,6 +6881,7 @@ async def _launch_claude_terminal(
             append_system_prompt=append_system_prompt,
             allowed_tools=allowed_tools,
             settings_request=settings_request,
+            legacy_peer=request_protocol != 2,
         )
         if settings_request is not None:
             withdraw_undelivered_dispatch = settings_request.cancel_undelivered_dispatch
@@ -6886,7 +6892,8 @@ async def _launch_claude_terminal(
         try:
             # Connection failures precede admission; an explicit routing refusal may be retried.
             resp = await client.post(
-                f"/v1/sessions/{url_component(session_id)}/resources/terminals",
+                f"/v1/sessions/{url_component(session_id)}/resources/"
+                + ("claude-settings-v2/terminals" if request_protocol == 2 else "terminals"),
                 json=body,
                 timeout=30.0,
                 auth=httpx.Auth(),
@@ -6943,9 +6950,12 @@ async def _launch_claude_terminal(
             await _run_claude_settings_step(settings_request.close)
 
 
-async def _supports_claude_settings_requests(client: httpx.AsyncClient, session_id: str) -> bool:
+async def _supports_claude_settings_requests(
+    client: httpx.AsyncClient, session_id: str
+) -> int | None:
     """Negotiate ownership before sending a generation to an older runner."""
     from omnigent.harnesses.claude_native.settings_generation import (
+        CLAUDE_SETTINGS_FENCED_REQUEST_PROTOCOL,
         CLAUDE_SETTINGS_REQUEST_PROTOCOL,
     )
 
@@ -6955,15 +6965,32 @@ async def _supports_claude_settings_requests(client: httpx.AsyncClient, session_
         )
         payload = response.json()
     except (httpx.HTTPError, ValueError):
-        return False
-    return (
-        response.status_code == 200
-        and isinstance(payload, dict)
-        and (
-            type(payload.get("claude_settings_request_protocol")) is int
-            and payload["claude_settings_request_protocol"] == CLAUDE_SETTINGS_REQUEST_PROTOCOL
-        )
-    )
+        return None
+    if response.status_code != 200 or not isinstance(payload, dict):
+        return None
+    for name, protocol in (
+        ("claude_settings_fenced_request_protocol", CLAUDE_SETTINGS_FENCED_REQUEST_PROTOCOL),
+        ("claude_settings_request_protocol", CLAUDE_SETTINGS_REQUEST_PROTOCOL),
+    ):
+        if type(payload.get(name)) is int and payload[name] == protocol:
+            if protocol == CLAUDE_SETTINGS_FENCED_REQUEST_PROTOCOL:
+                try:
+                    fenced = await client.get(
+                        f"/v1/sessions/{url_component(session_id)}/resources/claude-settings-v2/terminals",
+                        timeout=10.0,
+                    )
+                    capabilities = fenced.json()
+                except (httpx.HTTPError, ValueError):
+                    continue
+                if (
+                    fenced.status_code != 200
+                    or not isinstance(capabilities, dict)
+                    or type(capabilities.get(name)) is not int
+                    or capabilities[name] != protocol
+                ):
+                    continue
+            return protocol
+    return None
 
 
 async def _find_running_claude_terminal(
@@ -7082,6 +7109,7 @@ def _claude_terminal_request(
     append_system_prompt: str | None = None,
     allowed_tools: tuple[str, ...] = (),
     settings_request: ClaudeSettingsRequest | None = None,
+    legacy_peer: bool = False,
 ) -> _JsonObject:
     """
     Build the terminal resource creation body for Claude Code.
@@ -7102,6 +7130,7 @@ def _claude_terminal_request(
     :param allowed_tools: Optional narrowly scoped Claude tools preapproved
         for this native session.
     :param settings_request: Negotiated request owner, held through admission acknowledgement.
+    :param legacy_peer: Preserve the bounded historical settings file for an unfenced peer.
     :returns: JSON body for ``POST /resources/terminals``.
     """
     claude_args = _merge_default_model_arg(
@@ -7113,6 +7142,7 @@ def _claude_terminal_request(
         bridge_dir=bridge_dir,
         workspace=Path.cwd(),
         legacy_bridge_identity=True,
+        legacy_peer=legacy_peer,
         ap_server_url=ap_server_url,
         ap_auth_headers=ap_auth_headers,
         api_key_helper=claude_config.api_key_helper if claude_config is not None else None,
@@ -7183,9 +7213,11 @@ def _claude_terminal_request(
     }
     if settings_request is not None:
         request["claude_settings_request"] = settings_request.generation
+        if settings_request.protocol == 2:
+            request["claude_settings_request_protocol"] = 2
     # Opaque launcher payloads retain their original argv; do not parse shell
     # text or claim a deferred-settings boundary we cannot establish.
-    if claude_args_start is not None:
+    if claude_args_start is not None and not legacy_peer:
         request["claude_settings_generation"] = record_claude_settings_boundary(
             bridge_dir,
             args,

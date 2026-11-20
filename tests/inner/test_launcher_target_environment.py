@@ -308,3 +308,54 @@ def test_target_payload_cannot_restore_runner_secrets(
     assert not set(RUNNER_AUTH_SECRET_ENV_VARS).intersection(environment)
     assert SHARED_ENVIRONMENT_VAR not in environment
     assert (sb.HOST_SANDBOX_BACKEND_ENV in environment) is not active
+
+
+@pytest.mark.parametrize("with_environment", [False, True])
+def test_process_lifetime_is_acquired_only_after_containment_and_inherited_by_target(
+    tmp_path: Path, inert_launcher, with_environment: bool
+) -> None:
+    import fcntl
+
+    from omnigent.inner.process_lifetime import ProcessLifetimeLease, encode_process_leases
+
+    paths = [tmp_path / "lease.lock", tmp_path / "terminal.owner"]
+    for path in paths:
+        path.touch(mode=0o600)
+    lease = ProcessLifetimeLease(
+        paths[0],
+        (paths[0].stat().st_dev, paths[0].stat().st_ino),
+        paths[1],
+        (paths[1].stat().st_dev, paths[1].stat().st_ino),
+    )
+    inherited = []
+
+    def target(_command, *, env, pass_fds):
+        assert inert_launcher.events == [
+            "activate",
+            *(["payload-read"] if with_environment else []),
+        ]
+        assert len(pass_fds) == 2
+        for path, descriptor in zip(paths, pass_fds, strict=True):
+            assert os.fstat(descriptor).st_ino == path.stat().st_ino
+            with path.open() as independent, pytest.raises(BlockingIOError):
+                fcntl.flock(independent, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        inherited.extend(pass_fds)
+        assert env["HOME"] == (str(tmp_path / "owned-home") if with_environment else "/home")
+        return SimpleNamespace(returncode=0)
+
+    inert_launcher.run.side_effect = target
+    payload = _payload(tmp_path) if with_environment else None
+    with patch.dict(inert_launcher.environment, _bootstrap(wrapped=True), clear=True):
+        assert (
+            sb.run_launcher(
+                _encoded(_policy(True)),
+                _TARGET,
+                ["doctor"],
+                target_environment_path=str(payload) if payload is not None else None,
+                process_lifetime=encode_process_leases([lease]),
+            )
+            == 0
+        )
+    for descriptor in inherited:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)

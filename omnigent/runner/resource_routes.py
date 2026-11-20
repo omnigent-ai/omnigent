@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from omnigent.terminals.registry import TerminalListEntry, TerminalRegistry
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.responses import RangeNotSatisfiable
 
@@ -37,7 +37,10 @@ from omnigent.entities.session_resources import (
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import native_terminal_name
-from omnigent.harnesses.claude_native.settings_generation import ClaudeSettingsRequestExpired
+from omnigent.harnesses.claude_native.settings_generation import (
+    ClaudeSettingsLease,
+    ClaudeSettingsRequestExpired,
+)
 from omnigent.harnesses.claude_native.settings_validation import CallerSettingsError
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_agent_name,
@@ -237,6 +240,7 @@ def register_resource_routes(
     ) -> JSONResponse:
         from omnigent.entities.pagination import paginate_in_memory
         from omnigent.harnesses.claude_native.settings_generation import (
+            CLAUDE_SETTINGS_FENCED_REQUEST_PROTOCOL,
             CLAUDE_SETTINGS_REQUEST_PROTOCOL,
         )
 
@@ -262,7 +266,12 @@ def register_resource_routes(
                 "last_id": page.last_id,
                 "has_more": page.has_more,
                 **(
-                    {"claude_settings_request_protocol": CLAUDE_SETTINGS_REQUEST_PROTOCOL}
+                    {
+                        "claude_settings_request_protocol": CLAUDE_SETTINGS_REQUEST_PROTOCOL,
+                        "claude_settings_fenced_request_protocol": (
+                            CLAUDE_SETTINGS_FENCED_REQUEST_PROTOCOL
+                        ),
+                    }
                     if resource_type == "terminal"
                     else {}
                 ),
@@ -360,6 +369,7 @@ def register_resource_routes(
             content=content,
         )
 
+    @app.get("/v1/sessions/{session_id}/resources/claude-settings-v2/terminals")
     @app.get("/v1/sessions/{session_id}/resources/terminals")
     async def list_session_terminals(
         session_id: str,
@@ -377,10 +387,53 @@ def register_resource_routes(
             order=order,
         )
 
+    async def _admit_fenced_settings(
+        session_id: str, request: Request
+    ) -> AsyncIterator[tuple[str, ClaudeSettingsLease] | None]:
+        body = await request.json()
+        protocol = body.get("claude_settings_request_protocol") if isinstance(body, dict) else None
+        if type(protocol) is not int or protocol != 2:
+            yield None
+            return
+        from omnigent.harnesses.claude_native.bridge import (
+            _run_claude_settings_step,
+            bridge_dir_for_bridge_id,
+        )
+        from omnigent.harnesses.claude_native.settings_generation import (
+            acquire_claude_settings_request,
+        )
+
+        if not body.get("bridge_inject_dir"):
+            raise HTTPException(400, "Fenced Claude settings require native bridge injection")
+        bridge_id = await _claude_native_bridge_id_for_session(
+            server_client=server_client, session_id=session_id
+        )
+        try:
+            lease = await _run_claude_settings_step(
+                functools.partial(
+                    acquire_claude_settings_request,
+                    bridge_dir_for_bridge_id(bridge_id),
+                    body.get("claude_settings_request"),
+                    protocol=2,
+                    expected_session_id=session_id,
+                ),
+                dispose=ClaudeSettingsLease.close,
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                409, "Claude settings request expired; rebuild the request"
+            ) from exc
+        try:
+            yield bridge_id, lease
+        finally:
+            await _run_claude_settings_step(lease.close)
+
+    @app.post("/v1/sessions/{session_id}/resources/claude-settings-v2/terminals")
     @app.post("/v1/sessions/{session_id}/resources/terminals")
     async def create_session_terminal(
         session_id: str,
         request: Request,
+        fenced_admission: tuple[str, ClaudeSettingsLease] | None = Depends(_admit_fenced_settings),
     ) -> JSONResponse:
         body = await request.json()
         terminal_name = body.get("terminal")
@@ -626,9 +679,13 @@ def register_resource_routes(
         # the session (or that another path installed meanwhile) alone.
         launched_relay: ClaudeNativeToolRelay | None = None
         if bridge_inject:
-            bridge_id = await _claude_native_bridge_id_for_session(
-                server_client=server_client,
-                session_id=session_id,
+            bridge_id = (
+                fenced_admission[0]
+                if fenced_admission is not None
+                else await _claude_native_bridge_id_for_session(
+                    server_client=server_client,
+                    session_id=session_id,
+                )
             )
             relay_before = _session_comment_relays.get(session_id)
             await _ensure_comment_relay_started(session_id, bridge_id=bridge_id)
@@ -641,7 +698,7 @@ def register_resource_routes(
         from omnigent.harnesses.claude_native.bridge import _run_claude_settings_step
 
         prepare_claude: Callable[[TerminalInstance], Awaitable[None]] | None = None
-        settings_lease = None
+        settings_lease = fenced_admission[1] if fenced_admission is not None else None
         settings_request_ack: dict[str, str] = {}
         try:
             if bridge_inject:
@@ -660,14 +717,15 @@ def register_resource_routes(
                 generation = body.get("claude_settings_generation")
                 request_generation = body.get("claude_settings_request")
                 if request_generation is not None:
-                    settings_lease = await _run_claude_settings_step(
-                        functools.partial(
-                            acquire_claude_settings_request,
-                            bridge_dir_for_bridge_id(bridge_id),
-                            request_generation,
-                        ),
-                        dispose=ClaudeSettingsLease.close,
-                    )
+                    if settings_lease is None:
+                        settings_lease = await _run_claude_settings_step(
+                            functools.partial(
+                                acquire_claude_settings_request,
+                                bridge_dir_for_bridge_id(bridge_id),
+                                request_generation,
+                            ),
+                            dispose=ClaudeSettingsLease.close,
+                        )
                     settings_request_ack = {
                         "claude_settings_request_ack": settings_lease.generation
                     }
@@ -767,7 +825,7 @@ def register_resource_routes(
                     session_key=session_key,
                 )
         finally:
-            if settings_lease is not None:
+            if settings_lease is not None and fenced_admission is None:
                 await _run_claude_settings_step(settings_lease.close)
 
         return JSONResponse(
@@ -911,6 +969,7 @@ def register_resource_routes(
                         }
                     ),
                 ),
+                fenced_admission=None,
             )
         except Exception:
             _logger.exception(

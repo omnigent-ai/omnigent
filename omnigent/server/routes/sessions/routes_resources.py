@@ -1477,6 +1477,10 @@ def register_resources_routes(
         }
 
     @router.get(
+        "/sessions/{session_id}/resources/claude-settings-v2/terminals",
+        response_model=None,
+    )
+    @router.get(
         "/sessions/{session_id}/resources/terminals",
         response_model=None,
     )
@@ -1501,6 +1505,8 @@ def register_resources_routes(
         """
         conv = await _validate_session(session_id, request, LEVEL_READ)
         path = f"/v1/sessions/{session_id}/resources/terminals"
+        if request.url.path.endswith("/resources/claude-settings-v2/terminals"):
+            path = f"/v1/sessions/{session_id}/resources/claude-settings-v2/terminals"
         forwarded = {
             key: value
             for key, value in request.query_params.items()
@@ -1596,6 +1602,11 @@ def register_resources_routes(
             )
 
     @router.post(
+        "/sessions/{session_id}/resources/claude-settings-v2/terminals",
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    @router.post(
         "/sessions/{session_id}/resources/terminals",
         response_model=None,
         # CSRF hardening: body is parsed via request.json(); require a JSON
@@ -1689,6 +1700,8 @@ def register_resources_routes(
         )
         timings.mark("ensure_runner")
         path = f"/v1/sessions/{session_id}/resources/terminals"
+        if request.url.path.endswith("/resources/claude-settings-v2/terminals"):
+            path = f"/v1/sessions/{session_id}/resources/claude-settings-v2/terminals"
         router = runner_router or get_server_runner_router()
         if router is not None:
             await asyncio.to_thread(router.require_runtime_support, conv)

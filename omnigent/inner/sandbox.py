@@ -1508,6 +1508,7 @@ def run_launcher(
     cwd: str | None = None,
     target_environment_path: str | None = None,
     env_overrides: Mapping[str, str] | None = None,
+    process_lifetime: str | None = None,
 ) -> int:
     """
     Activate the sandbox and exec the wrapped target inside it.
@@ -1635,13 +1636,12 @@ def run_launcher(
             # The inline carries the RE-ENCODED policy so the in-wrap
             # pass decodes the same granted scratch root the profile
             # was built from.
-            inline = (
-                _launcher_inline_source(
-                    target_path, sandbox, cwd=cwd, target_environment_path=target_environment_path
-                )
-                if target_environment_path is not None
-                else _launcher_inline_source(target_path, sandbox, cwd=cwd)
-            )
+            inline_options = {"cwd": cwd}
+            if target_environment_path is not None:
+                inline_options["target_environment_path"] = target_environment_path
+            if process_lifetime is not None:
+                inline_options["process_lifetime"] = process_lifetime
+            inline = _launcher_inline_source(target_path, sandbox, **inline_options)
             launcher_argv = [sys.executable, "-I", "-c", inline, *argv]
             wrapped = list(
                 backend.wrap_launcher_argv(
@@ -1718,7 +1718,24 @@ def run_launcher(
     try:
         activate_sandbox(sandbox)
         logger.info("[omnigent-sandbox] activated; spawning target=%s", target_path)
-        if target_environment_path is None:
+        if process_lifetime is not None:
+            from omnigent.inner.process_lifetime import hold_process_leases
+
+            with hold_process_leases(process_lifetime) as descriptors:
+                target_environment = (
+                    _launcher_target_environment(target_environment_path)
+                    if target_environment_path is not None
+                    else dict(os.environ)
+                )
+                target_environment.pop(SHARED_ENVIRONMENT_VAR, None)
+                for secret_name in RUNNER_AUTH_SECRET_ENV_VARS:
+                    target_environment.pop(secret_name, None)
+                if sandbox.active:
+                    target_environment.pop(HOST_SANDBOX_BACKEND_ENV, None)
+                completed = subprocess.run(
+                    target_argv, env=target_environment, pass_fds=descriptors
+                )
+        elif target_environment_path is None:
             completed = subprocess.run(target_argv)
         else:
             target_environment = _launcher_target_environment(target_environment_path)
@@ -1765,6 +1782,7 @@ def _launcher_inline_source(
     cwd: str | None = None,
     target_environment_path: str | None = None,
     env_overrides_path: str | None = None,
+    process_lifetime: str | None = None,
 ) -> str:
     """Build the ``python -c`` program the exec launcher runs.
 
@@ -1782,13 +1800,14 @@ def _launcher_inline_source(
         if target_environment_path is not None
         else ""
     )
+    lifetime = f", process_lifetime={process_lifetime!r}" if process_lifetime is not None else ""
     return (
         "import logging, sys; "
         f"sys.path.insert(0, {str(_project_root())!r}); "
         "logging.basicConfig(level=logging.INFO, format='%(message)s', stream=sys.stderr); "
         "from omnigent.inner.sandbox import run_launcher, _read_launcher_env_overrides; "
         f"raise SystemExit(run_launcher({encoded!r}, {target_path!r}, sys.argv[1:], "
-        f"cwd={cwd!r}, env_overrides={overrides}{target_environment}))"
+        f"cwd={cwd!r}, env_overrides={overrides}{target_environment}{lifetime}))"
     )
 
 
@@ -2200,6 +2219,7 @@ def create_exec_launcher(
     cwd: str | None = None,
     target_environment_path: str | None = None,
     env_overrides: Mapping[str, str] | None = None,
+    process_lifetime: str | None = None,
 ) -> str:
     """Write an executable launcher that runs ``target_path`` inside ``sandbox``.
 
@@ -2262,6 +2282,8 @@ def create_exec_launcher(
                 inline_options["env_overrides_path"] = path
             if target_environment_path is not None:
                 inline_options["target_environment_path"] = target_environment_path
+            if process_lifetime is not None:
+                inline_options["process_lifetime"] = process_lifetime
             inline = _launcher_inline_source(target_path, sandbox, **inline_options)
             if os.name == "nt":
                 # The py launcher selects this interpreter through the shebang.
