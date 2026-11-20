@@ -12,25 +12,33 @@ date it was last updated. The session's own project comes first, then memories
 about the user and the user's feedback, then the rest. A model wrote the paths
 and descriptions, possibly from untrusted input, so the index is quoted JSON
 under a note that it is data, not instructions.
+
+The module also offers, once per Claude Code config dir, to import the notes
+Claude Code kept on the machine when its own auto memory is switched off. Those
+notes are counted, never read.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import itertools
 import json
 import logging
+import os
 import re
 import unicodedata
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from omnigent.errors import OmnigentError
+from omnigent.process_logging import data_dir
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.stores.memory_store import path_in_prefix, validate_path
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
-    from pathlib import Path
 
     import httpx
 
@@ -354,3 +362,133 @@ async def memory_startup_guidance(
     except Exception:
         _logger.debug("memory startup guidance unavailable for %s", session_id, exc_info=True)
         return None
+
+
+# Claude Code's auto memory keeps an index, MEMORY.md, and one note file per memory
+# under <config dir>/projects/<project>/memory/.
+_CLAUDE_INDEX_NAME = "MEMORY.md"
+# Caps that keep the count cheap on a large or unusual config dir.
+_CLAUDE_PROJECTS_SCAN_LIMIT = 500
+_CLAUDE_ENTRIES_SCAN_LIMIT = 1000
+_CLAUDE_COUNT_SECONDS = 2.0
+_CLAUDE_OFFER_DIR_NAME = "claude-memory-import-offers"
+
+_CLAUDE_MEMORY_IMPORT_NOTE = (
+    "## Claude Code's own memory\n"
+    "Claude Code's auto memory is off in this session because Omnigent memory is on, so "
+    "its notes are not loaded here. {count} note file{plural} from it {verb} still on this "
+    "machine under {directory}. In your first reply, ask the user once whether to import "
+    "them into Omnigent memory with the import-memory skill. If they decline, do not ask "
+    "again."
+)
+
+
+def _claude_config_dir(workspace: str | Path | None) -> Path:
+    """
+    The Claude Code config dir a native launch in *workspace* uses.
+
+    The launch inherits the runner's ``CLAUDE_CONFIG_DIR``. A relative value is
+    relative to the launch's working directory, as Claude Code resolves it.
+
+    :param workspace: The launch's working directory, or ``None`` for this process's.
+    :returns: ``$CLAUDE_CONFIG_DIR`` or ``~/.claude``, e.g. ``Path("/home/me/.claude")``.
+    """
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    if not configured:
+        return Path.home() / ".claude"
+    base = Path(workspace) if workspace is not None else Path.cwd()
+    return base / configured
+
+
+def _is_claude_note(entry: os.DirEntry[str]) -> bool:
+    """Whether a memory directory entry is a note file, by name alone."""
+    return entry.name.endswith(".md") and entry.name != _CLAUDE_INDEX_NAME and entry.is_file()
+
+
+def _count_claude_notes_in(memory_dir: str) -> int:
+    """Note files in one project's memory directory; a project without one has none."""
+    try:
+        entries = os.scandir(memory_dir)
+    except FileNotFoundError:
+        return 0
+    with entries:
+        return sum(
+            1
+            for entry in itertools.islice(entries, _CLAUDE_ENTRIES_SCAN_LIMIT)
+            if _is_claude_note(entry)
+        )
+
+
+def count_claude_memory_notes(config_dir: Path) -> int:
+    """
+    Count Claude Code's note files under *config_dir* without reading any of them.
+
+    :param config_dir: A Claude Code config dir, e.g. ``Path("/home/me/.claude")``.
+    :returns: The number of note files; ``0`` when the config dir has no projects.
+    :raises OSError: When a directory exists but cannot be read.
+    """
+    try:
+        projects = os.scandir(config_dir / "projects")
+    except FileNotFoundError:
+        return 0
+    with projects:
+        return sum(
+            _count_claude_notes_in(os.path.join(project.path, "memory"))
+            for project in itertools.islice(projects, _CLAUDE_PROJECTS_SCAN_LIMIT)
+            if project.is_dir(follow_symlinks=False)
+        )
+
+
+def _claude_offer_marker(config_dir: Path) -> Path:
+    """The runner's per-machine marker that the import offer was made for *config_dir*."""
+    digest = hashlib.sha256(str(config_dir.resolve()).encode("utf-8")).hexdigest()[:32]
+    return data_dir() / "runners" / _CLAUDE_OFFER_DIR_NAME / digest
+
+
+def _claim_claude_offer(config_dir: Path) -> bool:
+    """
+    Record that the offer is made for *config_dir*, once.
+
+    Creating the marker exclusively keeps two launches from both offering it.
+
+    :returns: ``False`` when an earlier launch already made the offer.
+    """
+    marker = _claude_offer_marker(config_dir)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with marker.open("x", encoding="utf-8") as handle:
+            handle.write(str(config_dir))
+    except FileExistsError:
+        return False
+    return True
+
+
+async def claude_memory_import_note(workspace: str | Path | None) -> str | None:
+    """
+    The one-time offer to import Claude Code's own notes, for a native launch.
+
+    Call it only when the launch has Claude Code's auto memory switched off. The
+    offer is made when the config dir holds note files and no earlier launch made
+    it for that dir; making it records the marker. Never raises: any failure means
+    no offer.
+
+    :param workspace: The launch's working directory, e.g. ``"/home/me/repo"``.
+    :returns: Launch instructions naming the note count and config dir, or ``None``.
+    """
+    try:
+        config_dir = _claude_config_dir(workspace)
+        count = await asyncio.wait_for(
+            asyncio.to_thread(count_claude_memory_notes, config_dir),
+            timeout=_CLAUDE_COUNT_SECONDS,
+        )
+        if count == 0 or not await asyncio.to_thread(_claim_claude_offer, config_dir):
+            return None
+    except Exception:
+        _logger.debug("Claude Code memory import offer unavailable", exc_info=True)
+        return None
+    return _CLAUDE_MEMORY_IMPORT_NOTE.format(
+        count=count,
+        plural="" if count == 1 else "s",
+        verb="is" if count == 1 else "are",
+        directory=json.dumps(str(config_dir), ensure_ascii=False),
+    )

@@ -15,6 +15,7 @@ from omnigent.host.frames import (
     HostSkillsResultFrame,
     encode_host_frame,
 )
+from omnigent.memory_availability import without_memory_tools
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import LEVEL_EDIT, AuthProvider
 from omnigent.server.feature_flags import Feature, FeatureFlags
@@ -181,14 +182,21 @@ def create_skills_router(
                 for skill in spec.skills
                 if skill.user_invocable
             ] + [skill for skill in skills if skill.name not in reserved]
-            if workflows_enabled:
-                # Framework skills come last, as in resolve_session_skills.
-                listed = reserved | {skill.name for skill in skills}
-                skills += [
-                    SkillSummary(name=skill.name, description=skill.description)
-                    for skill in framework_skills(spec)
-                    if skill.name not in listed
-                ]
+            # The stored spec doesn't know whether this server has memory; the runner's
+            # copy turns the memory group off the same way.
+            memory_available = getattr(request.app.state, "memory_available", None)
+            framework_spec = (
+                spec
+                if memory_available is not None and memory_available()
+                else without_memory_tools(spec)
+            )
+            # Framework skills come last, as in resolve_session_skills.
+            listed = reserved | {skill.name for skill in skills}
+            skills += [
+                SkillSummary(name=skill.name, description=skill.description)
+                for skill in framework_skills(framework_spec, workflows_enabled=workflows_enabled)
+                if skill.name not in listed
+            ]
         return SkillsResponse(skills=skills, warnings=result.warnings)
 
     return router

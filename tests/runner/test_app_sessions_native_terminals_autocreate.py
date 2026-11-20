@@ -2586,6 +2586,68 @@ async def test_auto_create_claude_terminal_turns_its_own_memory_off_with_omnigen
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("server_memory", "spec_memory", "offered"),
+    [(True, True, True), (False, True, False), (True, False, False)],
+    ids=["memory-on", "server-memory-off", "agent-memory-off"],
+)
+async def test_auto_create_claude_terminal_offers_its_own_notes_on_the_first_launch_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    server_memory: bool,
+    spec_memory: bool,
+    offered: bool,
+) -> None:
+    """Claude Code's existing notes are offered once, and only while its auto memory is off."""
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.delenv("CLAUDE_CODE_DISABLE_AUTO_MEMORY", raising=False)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "omnigent-data"))
+    note = tmp_path / "claude-config" / "projects" / "-home-me-repo" / "memory" / "role.md"
+    note.parent.mkdir(parents=True)
+    note.write_text("---\nname: role\ntype: user\n---\nBody.\n")
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
+        _no_op_forwarder,
+    )
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json={"memory": server_memory})
+        if request.url.path == "/v1/memory/entries":
+            return httpx.Response(200, json={"entries": [], "next_page_token": None})
+        return httpx.Response(200, json={"labels": {}})
+
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server", transport=httpx.MockTransport(_handle_request)
+    )
+    agent_spec = AgentSpec(
+        spec_version=1,
+        name="claude-agent",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+        tool_groups=ToolGroupsConfig(memory=spec_memory),
+    )
+
+    prompts: list[str] = []
+    for _ in range(2):
+        captured: dict[str, Any] = {}
+        await _auto_create_claude_terminal(
+            "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+            _RecordingClaudeRegistry(captured),
+            lambda _sid, _evt: None,
+            server_client=fake_client,
+            agent_spec=agent_spec,
+        )
+        args = captured["spec"].args
+        prompts.append(args[args.index("--append-system-prompt") + 1])
+
+    offers = [("Claude Code's own memory" in prompt) for prompt in prompts]
+    assert offers == ([True, False] if offered else [False, False])
+
+
+@pytest.mark.asyncio
 async def test_auto_create_claude_terminal_inherits_agent_sandbox(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
