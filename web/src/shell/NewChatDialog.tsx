@@ -6999,7 +6999,10 @@ function NewChatLandingContent({
           files,
           localConv.pendingMsgTempId,
           skill,
-          returnToCanvas ? (_to, options) => navigate(sessionLocation(data.id), options) : navigate,
+          returnToCanvas
+            ? (_to, options) => navigate(sessionLocation(data.id), options)
+            : // Still on the temporary session's page: its requests, such as a cited file, move too.
+              (to, options) => navigate(`${to}${window.location.search}`, options),
           () => stillViewingLocalSession(tempConvId),
           localProject,
           serverOwnsInitialInput,

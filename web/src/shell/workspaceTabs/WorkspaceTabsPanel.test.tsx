@@ -439,6 +439,67 @@ describe("pinning a tab from its menu", () => {
   });
 });
 
+describe("a browser view's tab", () => {
+  it("forgets its view once closing the tab closed it, so a link opens a fresh page", async () => {
+    const { openBrowserTab, readBrowserTabsState } = await import("@/hooks/useBrowserTabs");
+    renderPanels([{ conversationId: "s-web" }]);
+    const { store } = workspaceTabsSession("s-web");
+    // A chat link opened this view, which the session's browser state lists.
+    act(() => {
+      openBrowserTab("s-web", "v1");
+      store.openBrowserView("v1", { select: true, opener: "user" });
+    });
+    expect(readBrowserTabsState("s-web").tabs).toEqual(["v1"]);
+
+    act(pressCloseTab);
+
+    await waitFor(() => expect(readBrowserTabsState("s-web").tabs).toEqual([]));
+  });
+
+  it("logs a closed view the desktop app couldn't forget, rather than leaving it unhandled", async () => {
+    const { fakeMainTabs } = await import("@/components/BrowserPane/agentTools/fakeMainTabs");
+    const { loadTabs } = await import("@/components/BrowserPane/agentTools/tabStore");
+    const { writeBrowserAgentToolsEnabled } =
+      await import("@/components/BrowserPane/agentTools/preferences");
+    // The desktop app keeps the session's browser tabs, and closes the view but fails to save.
+    const main = fakeMainTabs();
+    main.otherWindow("s-web", (record) => ({ ...record, tabs: ["v1"], selected: "v1" }));
+    Object.assign(window, {
+      omnigentDesktop: {
+        browserClose: vi.fn().mockResolvedValue({ ok: true }),
+        onBrowserTabsChanged: main.onBrowserTabsChanged,
+        browserTabs: async (args: Record<string, unknown>) =>
+          args.op === "update"
+            ? { ok: false, error: "registry write failed" }
+            : main.browserTabs(args),
+      },
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      writeBrowserAgentToolsEnabled(true);
+      await loadTabs("s-web");
+      renderPanels([{ conversationId: "s-web" }]);
+      const { store } = workspaceTabsSession("s-web");
+      act(() => {
+        store.openBrowserView("v1", { select: true, opener: "user" });
+      });
+
+      act(pressCloseTab);
+
+      await waitFor(() =>
+        expect(warn).toHaveBeenCalledWith(
+          expect.stringContaining("Couldn't release the resource of closed workspace tab"),
+          expect.anything(),
+        ),
+      );
+      expect(browserTabCount("s-web")).toBe(0);
+    } finally {
+      Reflect.deleteProperty(window, "omnigentDesktop");
+      localStorage.clear();
+    }
+  });
+});
+
 describe("a shell's tab", () => {
   it("shows the session's live shell in upstream's terminal view", async () => {
     const { useTerminals } = await import("@/hooks/useTerminals");
