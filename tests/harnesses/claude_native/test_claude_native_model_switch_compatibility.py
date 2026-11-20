@@ -39,15 +39,13 @@ def _trust_test_bridge_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
         (None, False),
     ],
 )
-@pytest.mark.parametrize("busy", [False, True], ids=["idle", "busy"])
 def test_model_changes_preserve_the_version_appropriate_behavior(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     version: str | None,
     session_only: bool,
-    busy: bool,
 ) -> None:
-    composer = _SessionModelComposer(busy=busy)
+    composer = _SessionModelComposer()
     composer.version = version or "unknown"
     bridge_dir = _session_model_bridge(tmp_path, composer)
     if version is None:

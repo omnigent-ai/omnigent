@@ -97,11 +97,20 @@ export function ComposerAddMenu({
     onRunSavedWorkflow !== undefined;
   const pendingActionRef = useRef<(() => void) | null>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
-  const [geometry, setGeometry] = useState({ width: 456, alignOffset: 0, sideOffset: 6 });
+  const [geometry, setGeometry] = useState<{
+    width?: number;
+    alignOffset: number;
+    sideOffset: number;
+  }>({ width: 456, alignOffset: 0, sideOffset: 6 });
   const measure = useCallback(() => {
     const trigger = triggerRef.current;
-    const composer = trigger?.closest("[data-composer-card]");
+    const composer = trigger?.closest<HTMLElement>("[data-composer-card]");
     if (!trigger || !composer) return;
+    // A panel's card is its whole window, so the menu opens from the trigger at its own width.
+    if (composer.dataset.composerAppearance === "panel") {
+      setGeometry({ alignOffset: 0, sideOffset: 6 });
+      return;
+    }
     const triggerRect = trigger.getBoundingClientRect();
     const composerRect = composer.getBoundingClientRect();
     setGeometry({

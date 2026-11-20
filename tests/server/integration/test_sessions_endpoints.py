@@ -36,6 +36,7 @@ from omnigent.entities import (
     NewConversationItem,
 )
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.harnesses.claude_native import forwarder
 from omnigent.host.frames import HostHelloFrame
 from omnigent.llms.context_window import ModelPricing
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
@@ -6801,6 +6802,18 @@ async def test_post_external_session_status_propagates_runner_delivery_failure(
     # The runner's delivery-not-confirmed reason is retained in AP's error
     # message. If absent, Omnigent flattened the failure and made diagnosis harder.
     assert "missing_parent_inbox" in error["message"]
+
+    # The child's forwarder must stop resending a result no retry can deliver.
+    rejection = httpx.HTTPStatusError(
+        "rejected", request=status_resp.request, response=status_resp
+    )
+    monkeypatch.setattr(forwarder, "_forward_health", forwarder._ForwardHealth())
+    retries = forwarder._PostRetryTracker(base_delay_s=0.0)
+    decisions = [
+        retries.record_failure("hook:idle", rejection, session_id=child["id"])
+        for _ in range(forwarder._SUBAGENT_DELIVERY_NOT_CONFIRMED_MAX_ATTEMPTS)
+    ]
+    assert decisions[-1].exhausted, decisions[-1]
 
 
 async def test_post_external_output_text_delta_publishes_transient_delta(

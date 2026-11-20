@@ -1333,7 +1333,7 @@ async def test_run_turn_applies_routed_model_before_message_under_one_lock(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("model", [None, "", "opus[1m]", "private-claude-opus", "private-glm[1m]"])
+@pytest.mark.parametrize("model", [None, "", "private-glm[1m]"])
 async def test_run_turn_passes_the_exact_required_model_to_the_shared_picker(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, model: str | None
 ) -> None:

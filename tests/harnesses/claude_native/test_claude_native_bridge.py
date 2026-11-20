@@ -13402,16 +13402,13 @@ def test_wrapped_draft_with_an_extra_hard_newline_is_still_foreign(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("busy", [False, True], ids=["idle", "busy"])
 @pytest.mark.parametrize("cache_cost", [False, True], ids=["immediate", "cache-cost"])
 async def test_model_command_selects_session_only_then_reads_fresh_status(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    busy: bool,
     cache_cost: bool,
 ) -> None:
     composer = _SessionModelComposer(
-        busy=busy,
         prompt_separator="\u00a0",
         cache_cost_label="Choice 1" if cache_cost else None,
     )

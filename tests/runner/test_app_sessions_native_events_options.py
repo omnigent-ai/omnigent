@@ -1877,8 +1877,16 @@ async def test_events_model_change_requires_the_same_immediate_picker_receipt(
     async def drain_creation_events(_client: httpx.AsyncClient) -> None:
         _drain_session_event_queue(_session_event_queues_ref.get(_BOOT_SESSION_ID))
 
-    def select(_bridge: Path, *, model: str, timeout_s: float, ready_timeout_s: float) -> Any:
+    def select(
+        _bridge: Path,
+        *,
+        model: str,
+        timeout_s: float,
+        ready_timeout_s: float,
+        legacy_literal_model: bool = False,
+    ) -> Any:
         calls.append(model)
+        assert legacy_literal_model is bound
         assert 0 < timeout_s <= native_controls._CLAUDE_CONTROL_BUDGET_S
         assert 0 < ready_timeout_s <= native_controls._CLAUDE_CONTROL_PROMPT_WAIT_S
         assert _injection_deadline() is not None
