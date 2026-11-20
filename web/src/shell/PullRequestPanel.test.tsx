@@ -789,6 +789,7 @@ describe("PullRequestPanel", () => {
     for (const pr of state.stored.conv_1) {
       expect(usePullRequestInfo).toHaveBeenCalledWith("conv_1", { poll: false, prUrl: pr.url });
     }
+    expect(usePullRequestReadPriority).toHaveBeenLastCalledWith("conv_1", undefined);
 
     expect(refetchQueries).not.toHaveBeenCalled();
 
@@ -797,6 +798,8 @@ describe("PullRequestPanel", () => {
     for (const pr of state.stored.conv_1) {
       expect(usePullRequestInfo).toHaveBeenCalledWith("conv_1", { poll: "list", prUrl: pr.url });
     }
+    // List rows wait their turn; only an open details view reads ahead of them.
+    expect(usePullRequestReadPriority).toHaveBeenLastCalledWith("conv_1", undefined);
     // Turning the poll back on doesn't fetch by itself.
     expect(refetchQueries).toHaveBeenCalledWith({
       queryKey: ["github-info", "conv_1"],
@@ -807,6 +810,7 @@ describe("PullRequestPanel", () => {
       poll: true,
       prUrl: url,
     });
+    expect(usePullRequestReadPriority).toHaveBeenLastCalledWith("conv_1", url);
     fireEvent.mouseDown(screen.getByRole("tab", { name: "Changes" }));
     expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", {
       poll: true,
@@ -817,46 +821,26 @@ describe("PullRequestPanel", () => {
       poll: false,
       prUrl: url,
     });
+    expect(usePullRequestReadPriority).toHaveBeenLastCalledWith("conv_1", undefined);
     rerender(<PullRequestPanel conversationId="conv_1" active />);
     expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", {
       poll: true,
       prUrl: url,
     });
+    expect(usePullRequestReadPriority).toHaveBeenLastCalledWith("conv_1", url);
     await user.click(screen.getByRole("button", { name: "All pull requests (2)" }));
     expect(screen.getByRole("list", { name: "Pull requests" })).toBeVisible();
     expect(usePullRequestInfo).toHaveBeenCalledWith("conv_1", {
       poll: "list",
       prUrl: url,
     });
+    expect(usePullRequestReadPriority).toHaveBeenLastCalledWith("conv_1", undefined);
     await user.click(screen.getByRole("button", { name: "acme/app #6000 — chore: dummy PR" }));
     expect(screen.getByRole("tab", { name: "Summary" })).toHaveAttribute("aria-selected", "true");
     expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", {
       poll: true,
       prUrl: url,
     });
-  });
-
-  it("reads the PR open in details ahead of the queued list reads", async () => {
-    const user = userEvent.setup();
-    state.info!.data!.tracking_available = true;
-    const url = state.info!.data!.pr!.url;
-    state.stored.conv_1 = [
-      { url, host: "github.com", repository: "acme/app", number: 6000, relationship: "attached" },
-      {
-        url: "https://github.com/acme/app/pull/6001",
-        host: "github.com",
-        repository: "acme/app",
-        number: 6001,
-        relationship: "attached",
-      },
-    ];
-    const { rerender } = renderPanel(false, true);
-    expect(await screen.findByRole("list", { name: "Pull requests" })).toBeVisible();
-    expect(usePullRequestReadPriority).toHaveBeenLastCalledWith("conv_1", undefined);
-    await user.click(screen.getByRole("button", { name: "acme/app #6000 — chore: dummy PR" }));
-    expect(usePullRequestReadPriority).toHaveBeenLastCalledWith("conv_1", url);
-    rerender(<PullRequestPanel conversationId="conv_1" active={false} />);
-    expect(usePullRequestReadPriority).toHaveBeenLastCalledWith("conv_1", undefined);
   });
 
   it("shows cancelled and skipped checks as separate grey pills listing their jobs", async () => {

@@ -89,7 +89,8 @@ it("reads the pull request being viewed ahead of the queue", async () => {
 
 it("gives up a closed session's place in the queue, even for reads that never settle", async () => {
   const held = holdReads({ ignoreAbort: true });
-  const closed = renderHook(() => usePullRequestInfos("conv-1", pullRequestUrls(4)), {
+  const urls = pullRequestUrls(4);
+  const closed = renderHook(() => usePullRequestInfos("conv-1", urls), {
     wrapper: withQueryClient(),
   });
   await waitFor(() => expect(held).toHaveLength(2));
@@ -99,6 +100,7 @@ it("gives up a closed session's place in the queue, even for reads that never se
   const open = renderHook(() => usePullRequestInfos("conv-2", [next!]), {
     wrapper: withQueryClient(),
   });
-  await waitFor(() => expect(held.map((read) => read.prUrl)).toContain(next));
+  // The closed session's two waiting reads never start.
+  await waitFor(() => expect(held.map((read) => read.prUrl)).toEqual([...urls.slice(0, 2), next]));
   open.unmount();
 });

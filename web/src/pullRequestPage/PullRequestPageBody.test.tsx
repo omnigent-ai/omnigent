@@ -69,18 +69,13 @@ describe("PullRequestPageBody", () => {
   it("reads this pull request, polling only while its tab is on screen", () => {
     renderBody({ active: false });
     expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", { poll: false, prUrl: PR });
-    cleanup();
-    renderBody();
-    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: PR });
-    expect(captured.details).toMatchObject({ conversationId: "conv_1", showHeading: false });
-  });
-
-  it("reads this pull request ahead of queued background reads while its tab is on screen", () => {
-    renderBody({ active: false });
     expect(usePullRequestReadPriority).toHaveBeenLastCalledWith("conv_1", undefined);
     cleanup();
     renderBody();
+    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: PR });
+    // On screen, it reads ahead of queued background reads.
     expect(usePullRequestReadPriority).toHaveBeenLastCalledWith("conv_1", PR);
+    expect(captured.details).toMatchObject({ conversationId: "conv_1", showHeading: false });
   });
 
   it("shows this pull request as the server stored it while the host is offline", () => {

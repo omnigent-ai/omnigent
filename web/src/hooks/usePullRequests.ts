@@ -580,6 +580,9 @@ class PullRequestReadQueue {
     signal.throwIfAborted();
     const release = this.prioritized.has(key) ? undefined : await this.waitForTurn(key, signal);
     try {
+      // Closing a session frees its running reads' slots before it cancels the waiting ones,
+      // so a read can be handed a slot just as it's cancelled; it must not start then.
+      signal.throwIfAborted();
       return await read();
     } finally {
       release?.();
