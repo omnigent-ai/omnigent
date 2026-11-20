@@ -304,15 +304,40 @@ interface ElectronDesktopApi extends NativeShellApi {
    * macOS shells expose it. Resolves whether the shell started it.
    */
   startSystemDictation?: () => Promise<boolean>;
-  /** The "Show Omnigent from anywhere" shortcut; absent on shells predating it. */
-  getGlobalShortcut?: () => Promise<GlobalShortcutStatus | null>;
+  /**
+   * A system-wide shortcut, "show" when no id is given; absent on shells predating it. Only
+   * shells reporting `floatingComposerShortcut` know an id other than "show".
+   */
+  getGlobalShortcut?: (id?: GlobalShortcutId) => Promise<GlobalShortcutStatus | null>;
   /** Saves the shortcut; resolves `{ ok: false, error }` when the shell refuses the chord. */
-  setGlobalShortcut?: (change: GlobalShortcutChange) => Promise<GlobalShortcutSaveResult>;
+  setGlobalShortcut?: (
+    change: GlobalShortcutChange,
+    id?: GlobalShortcutId,
+  ) => Promise<GlobalShortcutSaveResult>;
   /** Takes the next chord ahead of the page's shortcuts and the menu; null when cancelled. */
-  recordGlobalShortcut?: () => Promise<string | null>;
+  recordGlobalShortcut?: (id?: GlobalShortcutId) => Promise<string | null>;
   cancelGlobalShortcutRecording?: () => Promise<boolean>;
   /** The attached browser page's view id if it has keyboard focus; absent on older shells. */
   browserFocusedView?: () => Promise<string | null>;
+  /** The floating New Agent panel; absent on shells predating it. */
+  floatingComposer?: FloatingComposerBridge;
+}
+
+/** Why the shell didn't open a path from the floating panel in a main window. */
+export type FloatingComposerOpenError = "not-composer" | "bad-path" | "window-loading";
+
+/** The desktop shell's floating New Agent panel. */
+export interface FloatingComposerBridge {
+  /** From a main window: this document can render the panel (version 1) for its server. */
+  announceSupport: (version: number) => void;
+  /** From the panel: hide it, keeping its draft. */
+  dismiss: () => void;
+  /** From the panel: show `/c/<id>` or an app page in a main window, then hide. */
+  openInMainWindow: (
+    path: string,
+  ) => Promise<{ ok: true } | { ok: false; error: FloatingComposerOpenError }>;
+  /** From the panel: its native file picker opened or closed. */
+  filePicker: (state: "open" | "closed") => void;
 }
 
 /** Native menu commands the desktop shell hands to the page (see lib/desktopCommands). */
@@ -502,6 +527,10 @@ export interface DesktopFeatures {
   arcaPreviewRecovery?: boolean;
   /** This shell can import the current site's cookies from local Google Chrome. */
   chromeCookieImport?: boolean;
+  /** This shell can show the floating New Agent panel (macOS). */
+  floatingComposer?: boolean;
+  /** This shell's shortcut calls take the "floatingComposer" id (macOS). */
+  floatingComposerShortcut?: boolean;
 }
 
 /** Status of the local `omni` CLI, from the desktop shell. */
@@ -543,7 +572,10 @@ export interface HostActionResult {
   authError?: boolean;
 }
 
-/** The "Show Omnigent from anywhere" shortcut; `accelerator` is an Electron accelerator. */
+/** "Show Omnigent from anywhere", or the floating New Agent panel's shortcut. */
+export type GlobalShortcutId = "show" | "floatingComposer";
+
+/** A system-wide shortcut's setting; `accelerator` is an Electron accelerator. */
 export interface GlobalShortcutSetting {
   enabled: boolean;
   accelerator: string;
@@ -752,6 +784,11 @@ export function updateBridge(): ElectronUpdateBridge | undefined {
   return electronApi()?.updates;
 }
 
+/** The floating New Agent panel bridge, or undefined outside Electron / older shells. */
+export function floatingComposerBridge(): FloatingComposerBridge | undefined {
+  return electronApi()?.floatingComposer;
+}
+
 /**
  * True when the desktop shell is new enough to host the embedded browser pane.
  * Older installed builds expose `omnigentDesktop` but predate the `browser*`
@@ -900,12 +937,19 @@ export function supportsGlobalShortcut(): boolean {
   );
 }
 
-/** The saved "Show Omnigent from anywhere" shortcut; `null` outside the shell or on failure. */
-export async function getGlobalShortcut(): Promise<GlobalShortcutStatus | null> {
+/** The id to pass the shell: none for "show", so that call is the one every shell takes. */
+function shortcutIdArgs(id: GlobalShortcutId): [] | [GlobalShortcutId] {
+  return id === "show" ? [] : [id];
+}
+
+/** The saved shortcut; `null` outside the shell or on failure. */
+export async function getGlobalShortcut(
+  id: GlobalShortcutId = "show",
+): Promise<GlobalShortcutStatus | null> {
   const electron = electronApi();
   if (!electron?.getGlobalShortcut) return null;
   try {
-    return await electron.getGlobalShortcut();
+    return await electron.getGlobalShortcut(...shortcutIdArgs(id));
   } catch (err) {
     console.warn("[nativeBridge] electron getGlobalShortcut failed:", err);
     return null;
@@ -918,11 +962,12 @@ export async function getGlobalShortcut(): Promise<GlobalShortcutStatus | null> 
  */
 export async function setGlobalShortcut(
   change: GlobalShortcutChange,
+  id: GlobalShortcutId = "show",
 ): Promise<GlobalShortcutSaveResult> {
   const electron = electronApi();
   if (!electron?.setGlobalShortcut) return { ok: false, error: "Couldn't save the shortcut." };
   try {
-    return await electron.setGlobalShortcut(change);
+    return await electron.setGlobalShortcut(change, ...shortcutIdArgs(id));
   } catch (err) {
     console.warn("[nativeBridge] electron setGlobalShortcut failed:", err);
     return { ok: false, error: "Couldn't save the shortcut." };
@@ -935,9 +980,9 @@ export function shellRecordsGlobalShortcut(): boolean {
 }
 
 /** The next chord, taken by the shell; null when recording was cancelled or failed. */
-export async function recordGlobalShortcut(): Promise<string | null> {
+export async function recordGlobalShortcut(id: GlobalShortcutId = "show"): Promise<string | null> {
   try {
-    return (await electronApi()?.recordGlobalShortcut?.()) ?? null;
+    return (await electronApi()?.recordGlobalShortcut?.(...shortcutIdArgs(id))) ?? null;
   } catch (err) {
     console.warn("[nativeBridge] electron recordGlobalShortcut failed:", err);
     return null;

@@ -1562,7 +1562,12 @@ function SidebarImpl({
                         inboxCountIncomplete,
                         inboxCountCapped,
                       )}
-                      className="ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-primary-cta px-1 text-sm text-primary-cta-foreground tabular-nums"
+                      className={cn(
+                        "ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[0.75em] font-medium text-[var(--sidebar-active-foreground)] tabular-nums",
+                        // The active Inbox row already paints the --sidebar-active wash;
+                        // repainting it on the badge would double-composite to a darker fill.
+                        isInboxPage ? "bg-transparent" : "bg-[var(--sidebar-active)]",
+                      )}
                     >
                       {inboxCount > 0 ? inboxCount : ""}
                       {inboxCountIncomplete || inboxCountCapped ? "+" : ""}

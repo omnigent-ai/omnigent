@@ -503,6 +503,35 @@ describe("sort order", () => {
       vi.useRealTimers();
     }
   });
+
+  it("sorts every row by name when Name is picked, and back by next run", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+    try {
+      setTasks([
+        task({ id: "z", name: "Zulu", state: "active", rrule: "FREQ=DAILY;BYHOUR=6" }),
+        task({ id: "m", name: "Mike", state: "active", rrule: "FREQ=DAILY;BYHOUR=18" }),
+        task({ id: "a", name: "Alpha", state: "paused", rrule: "FREQ=DAILY;BYHOUR=1" }),
+      ]);
+      renderPage();
+      const names = () =>
+        screen
+          .getAllByTestId("scheduled-task-row")
+          .map((r) => r.querySelector(".font-semibold")?.textContent);
+      expect(screen.getByTestId("tasks-sort")).toHaveTextContent("Next run");
+      expect(names()).toEqual(["Zulu", "Mike", "Alpha"]);
+
+      fireEvent.click(screen.getByTestId("tasks-sort"));
+      fireEvent.click(screen.getByRole("option", { name: "Name" }));
+      expect(names()).toEqual(["Alpha", "Mike", "Zulu"]);
+
+      fireEvent.click(screen.getByTestId("tasks-sort"));
+      fireEvent.click(screen.getByRole("option", { name: "Next run" }));
+      expect(names()).toEqual(["Zulu", "Mike", "Alpha"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("filtering + search", () => {

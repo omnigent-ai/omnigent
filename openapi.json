@@ -2643,9 +2643,16 @@
             "title": "Source Session Id"
           },
           "timezone": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "default": "UTC",
-            "title": "Timezone",
-            "type": "string"
+            "title": "Timezone"
           },
           "workspace": {
             "anyOf": [
@@ -8189,6 +8196,11 @@
           "scheduled_task_clone": {
             "default": false,
             "title": "Scheduled Task Clone",
+            "type": "boolean"
+          },
+          "scheduled_task_default_timezone": {
+            "default": true,
+            "title": "Scheduled Task Default Timezone",
             "type": "boolean"
           },
           "scheduled_task_harness_settings": {
@@ -14695,6 +14707,21 @@
           "objective"
         ],
         "title": "SetCodexGoalRequest",
+        "type": "object"
+      },
+      "SetDefaultTimezoneRequest": {
+        "additionalProperties": false,
+        "description": "Body for `PUT /v1/scheduled-tasks/default-timezone`.",
+        "properties": {
+          "timezone": {
+            "title": "Timezone",
+            "type": "string"
+          }
+        },
+        "required": [
+          "timezone"
+        ],
+        "title": "SetDefaultTimezoneRequest",
         "type": "object"
       },
       "SetProactiveAgentPrompt": {
@@ -21333,6 +21360,52 @@
           }
         },
         "summary": "Create Scheduled Task",
+        "tags": [
+          "scheduled_tasks"
+        ]
+      }
+    },
+    "/v1/scheduled-tasks/default-timezone": {
+      "put": {
+        "description": "Record the caller's local zone for tasks that explicitly request the default.",
+        "operationId": "set_default_timezone_v1_scheduled_tasks_default_timezone_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetDefaultTimezoneRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "title": "Response Set Default Timezone V1 Scheduled Tasks Default Timezone Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Default Timezone",
         "tags": [
           "scheduled_tasks"
         ]

@@ -1,7 +1,7 @@
 import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { PROACTIVE_AGENT_DISPLAY_NAME } from "@/lib/proactiveInbox";
 
-import { settingsEntry } from "./types";
+import { settingsEntry, settingsEntryFamily } from "./types";
 
 export const SUBMIT_WITH_MOD_ENTER_ENTRY = settingsEntry({
   id: "submit-with-mod-enter",
@@ -133,6 +133,27 @@ export const GLOBAL_SHORTCUT_ENTRY = settingsEntry({
   nameTemplates: { recorder: { before: "Shortcut: " } },
 });
 
+/** The desktop app's shortcut that opens the New Agent panel; macOS, with `floating_composer`. */
+export const FLOATING_COMPOSER_SHORTCUT_ENTRY = settingsEntry({
+  id: "floating-composer-shortcut",
+  available: (availability) => availability.floatingComposerShortcut,
+  section: "general",
+  label: "Open New Agent from anywhere",
+  description: "Opens the New Agent panel from any app to start a session.",
+  keywords: ["shortcut", "hotkey", "keyboard", "global", "desktop", "new agent", "panel"],
+  // Named by the chord it holds, or by the prompt while it records one.
+  parts: { recorder: "New Agent shortcut" },
+  nameTemplates: { recorder: { before: "New Agent shortcut: " } },
+});
+
+/** Both system-wide shortcuts' rows, by the shell's shortcut id; one control renders either. */
+export const GLOBAL_SHORTCUT_ENTRIES = settingsEntryFamily({
+  key: "global-shortcuts",
+  members: ["show", "floatingComposer"],
+  build: (shortcut) =>
+    shortcut === "show" ? GLOBAL_SHORTCUT_ENTRY : FLOATING_COMPOSER_SHORTCUT_ENTRY,
+});
+
 export const GENERAL_SETTINGS = [
   SUBMIT_WITH_MOD_ENTER_ENTRY,
   ALWAYS_STEER_ENTRY,
@@ -147,4 +168,5 @@ export const GENERAL_SETTINGS = [
   PROACTIVE_AGENT_ENTRY,
 
   GLOBAL_SHORTCUT_ENTRY,
+  FLOATING_COMPOSER_SHORTCUT_ENTRY,
 ] as const;

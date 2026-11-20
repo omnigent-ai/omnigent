@@ -170,6 +170,8 @@ export interface SettingsRowOverlay {
 export interface SettingsAvailability {
   /** The desktop shell offers ⇧⌘Space for New Agent from anywhere. */
   globalShortcut: boolean;
+  /** `floating_composer` is on and the shell can change the New Agent panel's shortcut. */
+  floatingComposerShortcut: boolean;
   /** The shell has an in-app browser for chat links. */
   inAppBrowser: boolean;
   /** This viewer is an admin, and the server offers its admin view. */

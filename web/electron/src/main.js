@@ -1740,11 +1740,17 @@ const updater = createDesktopUpdater({
   updatesEnabled: !app.isPackaged || !isDevBuild,
 });
 
+/** What each system-wide shortcut does, as its consent dialog names it. */
+const GLOBAL_SHORTCUT_CONSENT = {
+  show: { question: "show Omnigent", effect: "brings Omnigent to the front" },
+  floatingComposer: { question: "open New Agent", effect: "opens the New Agent panel" },
+};
+
 /**
  * Native consent before a system-wide shortcut registers. The IPC gate only proves the
  * request came from the pinned server's page, not that the user asked for it.
  */
-async function confirmGlobalShortcut(win, accelerator) {
+async function confirmGlobalShortcut(win, accelerator, id = "show") {
   const origin = win ? pinnedOrigin(win) : null;
   if (!origin) return false;
   let host = origin;
@@ -1759,10 +1765,10 @@ async function confirmGlobalShortcut(win, accelerator) {
     type: "question",
     icon: icon.isEmpty() ? undefined : icon,
     title: "Omnigent",
-    message: `Use ${label} to show Omnigent from any app?`,
+    message: `Use ${label} to ${GLOBAL_SHORTCUT_CONSENT[id].question} from any app?`,
     detail:
       `${host} wants to set a system-wide shortcut. While Omnigent is running, pressing ` +
-      `${label} in any app brings Omnigent to the front.\n\nOnly allow servers you trust.`,
+      `${label} in any app ${GLOBAL_SHORTCUT_CONSENT[id].effect}.\n\nOnly allow servers you trust.`,
     buttons: ["Don't Allow", "Allow"],
     defaultId: 0,
     cancelId: 0,
@@ -1820,6 +1826,16 @@ const globalShortcuts = createGlobalShortcuts({
   },
 });
 const globalShowShortcut = globalShortcuts.show;
+
+/** The shortcut a Settings call names, `show` when it names none; null for any other name. */
+function settingsShortcut(id = "show") {
+  // The panel's shortcut exists only where the panel does.
+  if (id === "floatingComposer" && process.platform !== "darwin") return null;
+  // A shortcut the consent dialog can't describe can't be offered.
+  return Object.hasOwn(globalShortcuts, id) && Object.hasOwn(GLOBAL_SHORTCUT_CONSENT, id)
+    ? globalShortcuts[id]
+    : null;
+}
 
 /** Main windows, most recently focused first; a closed one drops out on the next focus. */
 let mainWindowFocusOrder = [];
@@ -5263,32 +5279,39 @@ function registerIpc() {
     return true;
   });
 
-  // Settings → "Show Omnigent from anywhere" (opt-in, system-wide shortcut).
-  ipcMain.handle("omnigent:get-global-shortcut", (event) => {
+  // Settings → "Show Omnigent from anywhere" and the New Agent panel's shortcut, by id.
+  const requireSettingsShortcut = (id) => {
+    const shortcut = settingsShortcut(id);
+    if (!shortcut) throw new Error(`Unknown global shortcut: ${id}`);
+    return shortcut;
+  };
+  ipcMain.handle("omnigent:get-global-shortcut", (event, id) => {
     if (!isPinnedOriginSender(event)) {
       throw new Error("get-global-shortcut is only available to a connected server page");
     }
-    return globalShowShortcut.current();
+    return requireSettingsShortcut(id).current();
   });
-  ipcMain.handle("omnigent:set-global-shortcut", (event, setting) => {
+  ipcMain.handle("omnigent:set-global-shortcut", (event, setting, id = "show") => {
     if (!isPinnedOriginSender(event)) {
       throw new Error("set-global-shortcut is only available to a connected server page");
     }
+    const shortcut = requireSettingsShortcut(id);
     const win = BrowserWindow.fromWebContents(event.sender);
-    return globalShowShortcut.set(setting, (accelerator) =>
-      confirmGlobalShortcut(win, accelerator),
-    );
+    return shortcut.set(setting, (accelerator) => confirmGlobalShortcut(win, accelerator, id));
   });
   // The Settings recorder takes the next chord here, ahead of the page's shortcuts and the menu.
-  ipcMain.handle("omnigent:record-global-shortcut", (event) => {
+  ipcMain.handle("omnigent:record-global-shortcut", (event, id) => {
     if (!isPinnedOriginSender(event)) {
       throw new Error("record-global-shortcut is only available to a connected server page");
     }
-    return globalShowShortcut.record(event.sender);
+    const shortcut = requireSettingsShortcut(id);
+    // Each shortcut ends only its own recording, so end them all before this one takes the keys.
+    for (const other of Object.values(globalShortcuts)) other.cancelRecording();
+    return shortcut.record(event.sender);
   });
   ipcMain.handle("omnigent:cancel-global-shortcut-recording", (event) => {
     if (!isPinnedOriginSender(event)) return false;
-    globalShowShortcut.cancelRecording();
+    for (const shortcut of Object.values(globalShortcuts)) shortcut.cancelRecording();
     return true;
   });
 
@@ -5770,6 +5793,8 @@ function registerIpc() {
       chromeCookieImport: process.platform === "darwin",
       // The floating New Agent panel is a macOS panel window.
       floatingComposer: process.platform === "darwin",
+      // Settings can read and change the panel's shortcut by id.
+      floatingComposerShortcut: process.platform === "darwin",
     };
   });
 

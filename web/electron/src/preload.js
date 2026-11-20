@@ -44,6 +44,11 @@ if (process.platform === "darwin") {
   });
 }
 
+/** A shortcut id for the shell to check; anything else names the default "show". */
+function shortcutId(id) {
+  return typeof id === "string" ? id : undefined;
+}
+
 // Collapse the update states the in-page UpdateBanner renders on
 // (available / downloading / downloaded / error-security) to `idle` so the server page can
 // never show a banner — that UI is shell-owned (the corner overlay). Kept here
@@ -188,25 +193,30 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
         startSystemDictation: () => ipcRenderer.invoke("omnigent:start-system-dictation"),
       }
     : {}),
-  /** The "Show Omnigent from anywhere" shortcut (off by default). */
-  getGlobalShortcut: () => ipcRenderer.invoke("omnigent:get-global-shortcut"),
+  /**
+   * A system-wide shortcut by id: "show" (Show Omnigent from anywhere, off by default, and
+   * the default id) or "floatingComposer" (the New Agent panel, macOS).
+   */
+  getGlobalShortcut: (id) => ipcRenderer.invoke("omnigent:get-global-shortcut", shortcutId(id)),
   /**
    * Saves `{ enabled, accelerator }`, or turns the shortcut off for `{ enabled: false }`,
    * keeping the saved chord. Resolves `{ ok, setting?, error? }`; `ok: false` means the
    * saved setting is unchanged.
    */
-  setGlobalShortcut: ({ enabled, accelerator } = {}) =>
+  setGlobalShortcut: ({ enabled, accelerator } = {}, id) =>
     ipcRenderer.invoke(
       "omnigent:set-global-shortcut",
       enabled !== true && accelerator === undefined
         ? { enabled: false }
         : { enabled: enabled === true, accelerator: String(accelerator ?? "") },
+      shortcutId(id),
     ),
   /**
    * Takes the next chord in the shell, before the page's shortcuts and the menu see it.
    * Resolves its accelerator, or null when Escape or the cancel call ends recording.
    */
-  recordGlobalShortcut: () => ipcRenderer.invoke("omnigent:record-global-shortcut"),
+  recordGlobalShortcut: (id) =>
+    ipcRenderer.invoke("omnigent:record-global-shortcut", shortcutId(id)),
   cancelGlobalShortcutRecording: () =>
     ipcRenderer.invoke("omnigent:cancel-global-shortcut-recording"),
   /** The runner picked during onboarding for this server ("local" |

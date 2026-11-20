@@ -50,6 +50,7 @@ const HIDDEN_SECTION: SettingsEntry = {
 
 const SHOWN: SettingsAvailability = {
   globalShortcut: true,
+  floatingComposerShortcut: true,
   inAppBrowser: true,
   adminView: true,
   accountsEnabled: true,
@@ -59,6 +60,7 @@ const SHOWN: SettingsAvailability = {
 };
 const HIDDEN: SettingsAvailability = {
   globalShortcut: false,
+  floatingComposerShortcut: false,
   inAppBrowser: false,
   adminView: false,
   accountsEnabled: false,

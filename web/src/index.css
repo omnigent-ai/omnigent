@@ -1380,6 +1380,10 @@ html[data-electron-mac] .electron-drag-strip {
   height: var(--mac-titlebar-height);
   -webkit-app-region: drag;
 }
+/* The floating New Agent panel has no title bar; its header moves the window. */
+html[data-electron-mac] .floating-composer-header {
+  -webkit-app-region: drag;
+}
 /* Canvas clears the native title bar, including focus
  * and compact conversation states where the board is hidden. */
 html[data-electron-mac] .canvas-workspace {
