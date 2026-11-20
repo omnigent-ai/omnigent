@@ -1172,6 +1172,30 @@ describe.each(["textarea", "codemirror"] as const)(
       expect(props.onSend).toHaveBeenCalledWith("Read [Attached: readme.md]", undefined);
     });
 
+    it("re-picks a deleted file from the menu, then undoes and redoes its next deletion", async () => {
+      const props = composerProps();
+      await renderComposer(props);
+      typeAt("Read @rea");
+      fireEvent.click(screen.getByTitle("Attach readme.md"));
+      caretAt("Read @readme.md".length);
+      fireEvent.keyDown(composerInput(), { key: "Backspace" });
+
+      typeAt("@rea", "Read ".length);
+      fireEvent.click(screen.getByTitle("Attach readme.md"));
+      expect(tokens()).toEqual(["@readme.md"]);
+      caretAt("Read @readme.md".length);
+      fireEvent.keyDown(composerInput(), { key: "Backspace" });
+      expect(tokens()).toEqual([]);
+
+      undoTo("Read @readme.md ");
+      expect(tokens()).toEqual(["@readme.md"]);
+      redoTo("Read  ");
+      expect(tokens()).toEqual([]);
+      undoTo("Read @readme.md ");
+      fireEvent.submit(composerInput().closest("form")!);
+      expect(props.onSend).toHaveBeenCalledWith("Read [Attached: readme.md]", undefined);
+    });
+
     it("takes the pill away again on ⌘⇧Z redo", async () => {
       await renderComposer(composerProps());
       typeAt("Read @rea");

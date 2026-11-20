@@ -321,12 +321,16 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
   // reported themselves here.
   const lastSeenRef = useRef(new WeakMap<object, string>());
 
+  // True while the hook's own mention edit is in the input; its change isn't typing by hand.
+  const ownEditRef = useRef(false);
+
   const noteTextChange = (event: ComposerInputEvent) => {
     const input = event.currentTarget;
     const after = input.value;
     const before = lastSeenRef.current.get(input) ?? "";
     lastSeenRef.current.set(input, after);
     const released = releasedRef.current;
+    if (ownEditRef.current) return;
     if (released.files.length === 0 && released.sessions.length === 0) return;
     const owned = ownedMentionTokens();
     const countAfter = tokenCounts(after, owned);
@@ -379,8 +383,15 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     caret: number,
   ): boolean => {
     if (target?.isConnected) {
+      ownEditRef.current = true;
+      let inserted: boolean;
+      try {
+        inserted = insertComposerText(target, insert, start, end, { separateUndo: true });
+      } finally {
+        ownEditRef.current = false;
+      }
       // A locked input refuses the edit; callers then leave the tags as they were.
-      if (!insertComposerText(target, insert, start, end, { separateUndo: true })) return false;
+      if (!inserted) return false;
       if (target.selectionStart !== caret || target.selectionEnd !== caret) {
         target.setSelectionRange(caret, caret);
       }
