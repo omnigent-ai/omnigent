@@ -1193,6 +1193,7 @@ def _parse_os_env_sandbox(
     recursive = _parse_cwd_hidden_scan_recursive(raw.get("cwd_hidden_scan_recursive"))
     mask_paths = _parse_mask_paths(raw.get("mask_paths"))
     env_passthrough = _parse_env_passthrough(raw.get("env_passthrough"))
+    env_template = _parse_env_template(raw.get("env_template"))
     egress_rules = _parse_egress_rules(raw.get("egress_rules"))
     git_ssh = _parse_git_ssh(raw.get("git_ssh"))
     from omnigent.inner.tcp_egress_policy import parse_tcp_egress
@@ -1283,6 +1284,7 @@ def _parse_os_env_sandbox(
         cwd_hidden_scan_recursive=recursive,
         mask_paths=mask_paths,
         env_passthrough=env_passthrough,
+        env_template=env_template,
         egress_rules=egress_rules,
         egress_allow_private_destinations=allow_private,
         credential_proxy=credential_proxy,
@@ -1535,6 +1537,16 @@ def _parse_env_passthrough(raw: object) -> list[str] | None:
             )
         sanitized.append(entry)
     return sanitized
+
+
+def _parse_env_template(raw: object) -> dict[str, str] | None:
+    """Validate ``os_env.sandbox.env_template``, raising :class:`OmnigentError` if invalid."""
+    from omnigent.inner.env_template import validate_env_template
+
+    try:
+        return validate_env_template(raw)
+    except ValueError as exc:
+        raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
 
 
 def _parse_egress_rules(raw: object) -> list[str] | None:

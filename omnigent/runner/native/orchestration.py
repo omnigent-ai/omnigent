@@ -9331,6 +9331,7 @@ async def _auto_create_claude_terminal(
         validate_claude_hook_interpreter_compatibility,
     )
     from omnigent.harnesses.claude_native.forwarder import reset_transcript_forward_state
+    from omnigent.inner.agent_env import resolve_agent_env_template
     from omnigent.inner.bundle_skills import claude_agents_skill_overlay
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
@@ -10054,6 +10055,13 @@ async def _auto_create_claude_terminal(
 
     claude_terminal_env_unset = _claude_terminal_env_unset(claude_config)
     claude_auto_memory_env = await _claude_auto_memory_env(agent_spec, server_client)
+    # A sandboxed pane resolves env templates itself, with the sandbox's narrower filter.
+    agent_sandbox = agent_os_env.sandbox if agent_os_env is not None else None
+    claude_env_template = (
+        resolve_agent_env_template(agent_os_env, session_workspace=workspace)
+        if agent_sandbox is not None and agent_sandbox.type == "none"
+        else {}
+    )
 
     # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
     # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
@@ -10070,7 +10078,9 @@ async def _auto_create_claude_terminal(
         # Tool Search env plus ucode gateway env (ANTHROPIC_BASE_URL
         # etc.) when derived. Empty provider config still forces
         # ENABLE_TOOL_SEARCH=true so MCP schemas are loaded on demand.
+        # Env templates come first so Omnigent's own values win.
         env={
+            **claude_env_template,
             **build_native_claude_terminal_env(
                 claude_config,
                 client_surface=resource_registry.client_surface(session_id),

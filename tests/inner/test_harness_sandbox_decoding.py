@@ -190,3 +190,22 @@ def test_harness_rejects_invalid_nested_credential_policy(
     )
     with pytest.raises(ValueError, match=r"credential_proxy\.entries"):
         harness._resolve_os_env()
+
+
+def test_harness_carries_env_template_to_policy(
+    decode_sandbox: Callable[[OSEnvSandboxSpec], OSEnvSandboxSpec],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sandbox = OSEnvSandboxSpec(
+        type="linux_bwrap", env_template={"EDATA_OUTPUT_DIR": "${OMNIGENT_SESSION_WORKSPACE}/data"}
+    )
+    decoded = decode_sandbox(sandbox)
+    monkeypatch.setattr(bwrap_sandbox, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(bwrap_sandbox, "shutil", SimpleNamespace(which=lambda _: "/usr/bin/bwrap"))
+
+    policy = resolve_sandbox(OSEnvSpec(sandbox=decoded), tmp_path)
+
+    assert decoded == sandbox
+    assert policy.active
+    assert policy.env_template == sandbox.env_template

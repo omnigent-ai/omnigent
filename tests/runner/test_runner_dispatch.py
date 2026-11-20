@@ -3818,7 +3818,8 @@ async def test_runner_os_env_tools_default_to_conversation_workspace(monkeypatch
         assert Path(td, "conv_default_workspace", "workspace", "created.txt").read_text() == "hi"
 
 
-def test_clone_os_env_spec_preserves_all_sandbox_fields() -> None:
+@pytest.mark.parametrize("module", ["omnigent.runner.tool_dispatch", "omnigent.inner.terminal"])
+def test_clone_os_env_spec_preserves_all_sandbox_fields(module: str) -> None:
     """Cloning an OSEnvSpec must preserve every sandbox field.
 
     Regression guard for the same class of bug previously fixed in
@@ -3832,10 +3833,11 @@ def test_clone_os_env_spec_preserves_all_sandbox_fields() -> None:
     :returns: None.
     """
     import dataclasses
+    import importlib
 
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-    from omnigent.runner.tool_dispatch import _clone_os_env_spec
 
+    _clone_os_env_spec = importlib.import_module(module)._clone_os_env_spec
     sandbox = OSEnvSandboxSpec(
         type="darwin_seatbelt",
         read_paths=["~/.databrickscfg"],
@@ -3846,6 +3848,7 @@ def test_clone_os_env_spec_preserves_all_sandbox_fields() -> None:
         cwd_hidden_scan_max_entries=12345,
         cwd_hidden_scan_overflow="warn",
         env_passthrough=["DATABRICKS_HOST", "DATABRICKS_TOKEN"],
+        env_template={"EDATA_OUTPUT_DIR": "${OMNIGENT_SESSION_WORKSPACE}/data"},
         egress_rules=["GET api.github.com/repos/databricks/*/**"],
         egress_allow_private_destinations=True,
     )
@@ -3872,6 +3875,7 @@ def test_clone_os_env_spec_preserves_all_sandbox_fields() -> None:
         "write_files",
         "cwd_allow_hidden",
         "env_passthrough",
+        "env_template",
         "egress_rules",
     ):
         original_list = getattr(sandbox, name)

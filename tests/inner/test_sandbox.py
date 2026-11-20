@@ -356,6 +356,21 @@ def test_sandbox_policy_round_trips_spawn_env_allowlist() -> None:
     assert SandboxPolicy.from_jsonable(_noop_policy().to_jsonable()).spawn_env_allowlist is None
 
 
+def test_sandbox_policy_round_trips_and_clones_env_template() -> None:
+    """``env_template`` survives the launcher encoding and ``with_additional_*`` clones."""
+    from omnigent.inner.sandbox import with_additional_write_roots
+
+    policy = _noop_policy()
+    policy.env_template = {"EDATA_OUTPUT_DIR": "${OMNIGENT_SESSION_WORKSPACE}/data"}
+
+    decoded = SandboxPolicy.from_jsonable(policy.to_jsonable())
+    cloned = with_additional_write_roots(policy, [pathlib.Path("/tmp/extra")])
+
+    assert decoded.env_template == policy.env_template
+    assert cloned.env_template == policy.env_template
+    assert SandboxPolicy.from_jsonable(_noop_policy().to_jsonable()).env_template is None
+
+
 def test_credential_source_paths_survive_serialization_and_cloning(tmp_path: pathlib.Path) -> None:
     from omnigent.inner.sandbox import with_additional_read_roots, with_additional_write_roots
 

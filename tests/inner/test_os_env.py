@@ -165,6 +165,50 @@ def test_build_helper_env_desktop_session_policy(active: bool, explicit: bool) -
         assert env == parent
 
 
+@pytest.mark.parametrize("active", [False, True])
+def test_build_helper_env_resolves_env_template(active: bool) -> None:
+    """Both branches add resolved templates; active ones never reveal hidden names."""
+    parent = {
+        "PATH": "/usr/bin",
+        "OMNIGENT_RUNNER_WORKSPACE": "/repo",
+        "AWS_SECRET_ACCESS_KEY": "secret",
+    }
+    policy = _active_policy() if active else _inactive_policy()
+    policy.env_template = {
+        "EDATA_OUTPUT_DIR": "${OMNIGENT_SESSION_WORKSPACE}/data",
+        "LEAK": "${AWS_SECRET_ACCESS_KEY}",
+    }
+
+    env = build_helper_env(parent, policy, session_workspace="/wt/a")
+
+    assert env["EDATA_OUTPUT_DIR"] == "/wt/a/data"
+    if active:
+        assert "LEAK" not in env
+        assert "secret" not in env.values()
+    else:
+        # ``type: none`` already exposes the whole parent environment.
+        assert env["LEAK"] == "secret"
+
+
+@pytest.mark.parametrize(
+    ("inherited", "expected"),
+    [("/wt/session", "/wt/session/data"), (None, "/wt/cwd/data")],
+)
+def test_build_helper_env_prefers_inherited_session_workspace(
+    inherited: str | None, expected: str
+) -> None:
+    """A harness child's helper resolves the runner's session path, not its own cwd."""
+    parent = {"OMNIGENT_RUNNER_WORKSPACE": "/repo"}
+    if inherited is not None:
+        parent["OMNIGENT_SESSION_WORKSPACE"] = inherited
+    policy = _active_policy()
+    policy.env_template = {"EDATA_OUTPUT_DIR": "${OMNIGENT_SESSION_WORKSPACE}/data"}
+
+    env = build_helper_env(parent, policy, session_workspace="/wt/cwd")
+
+    assert env["EDATA_OUTPUT_DIR"] == expected
+
+
 # ---------------------------------------------------------------------------
 # _shell_impl — timeout result shape
 # ---------------------------------------------------------------------------

@@ -24,14 +24,24 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
+from pathlib import Path
 
 from omnigent._platform import WINDOWS_ENV_PASSTHROUGH
 from omnigent.databricks_ai_gateway import CI_CONTEXT_ENV, ci_request_tags
+from omnigent.inner.env_template import (
+    RESOLVED_TEMPLATE_NAMES_ENV_VAR,
+    SESSION_WORKSPACE_TEMPLATE_VAR,
+    declared_env_template,
+    resolve_env_template,
+    resolved_template_names,
+    workspace_template_context,
+)
 from omnigent.runner.identity import (
     OMNIGENT_SESSION_ENV_VAR,
     RUNNER_AUTH_SECRET_ENV_VARS,
     RUNNER_SESSION_ENV_NAMES_ENV_VAR,
+    RUNNER_WORKSPACE_ENV_VAR,
 )
 
 # Desktop access requires an explicit grant outside the sandbox.
@@ -97,6 +107,39 @@ BASE_ALLOW_EXACT: frozenset[str] = frozenset(
 )
 
 
+def agent_env_name_filter(
+    *,
+    allow_prefixes: Iterable[str] = (),
+    allow_exact: Iterable[str] = (),
+    deny_exact: Iterable[str] = (),
+    extra_allowed: Iterable[str] = (),
+    source: Mapping[str, str] | None = None,
+) -> Callable[[str], bool]:
+    """Return the name test :func:`clean_agent_env` applies; takes the same arguments."""
+    env_source = os.environ if source is None else source
+    prefixes = BASE_ALLOW_PREFIXES + tuple(allow_prefixes)
+    operator_names = {
+        name.strip()
+        for name in env_source.get("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "").split(",")
+        if name.strip()
+    }
+    extra = set(extra_allowed)
+    exact = (
+        BASE_ALLOW_EXACT
+        | set(allow_exact)
+        | extra
+        | operator_names
+        | forwarded_session_env_names(env_source)
+        | resolved_template_names(env_source)
+    )
+    denied = set(deny_exact) | RUNNER_AUTH_SECRET_ENV_VARS | (DESKTOP_SESSION_ENV_VARS - extra)
+
+    def is_allowed(name: str) -> bool:
+        return name not in denied and (name in exact or name.startswith(prefixes))
+
+    return is_allowed
+
+
 def clean_agent_env(
     *,
     allow_prefixes: Iterable[str] = (),
@@ -125,26 +168,16 @@ def clean_agent_env(
         variables require ``extra_allowed``.
     """
     env_source = os.environ if source is None else source
-    prefixes = BASE_ALLOW_PREFIXES + tuple(allow_prefixes)
-    operator_names = {
-        name.strip()
-        for name in env_source.get("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "").split(",")
-        if name.strip()
-    }
-    extra = set(extra_allowed)
-    exact = (
-        BASE_ALLOW_EXACT
-        | set(allow_exact)
-        | extra
-        | operator_names
-        | forwarded_session_env_names(env_source)
+    denied = frozenset(deny_exact)
+    is_allowed = agent_env_name_filter(
+        allow_prefixes=allow_prefixes,
+        allow_exact=allow_exact,
+        deny_exact=denied,
+        extra_allowed=extra_allowed,
+        source=env_source,
     )
-    denied = set(deny_exact) | RUNNER_AUTH_SECRET_ENV_VARS | (DESKTOP_SESSION_ENV_VARS - extra)
-    filtered = {
-        key: value
-        for key, value in env_source.items()
-        if key not in denied and (key in exact or key.startswith(prefixes))
-    }
+    filtered = {key: value for key, value in env_source.items() if is_allowed(key)}
+    # The CI context is synthesized, not inherited, so only an explicit deny drops it.
     if CI_CONTEXT_ENV not in denied and (tags := ci_request_tags(env_source)):
         filtered[CI_CONTEXT_ENV] = json.dumps(tags, separators=(",", ":"))
     return filtered
@@ -193,3 +226,43 @@ def declared_passthrough(os_env: object | None) -> tuple[str, ...]:
     if getattr(sandbox, "type", None) == "none":
         return tuple(names)
     return tuple(name for name in names if name not in DESKTOP_SESSION_ENV_VARS)
+
+
+def resolve_agent_env_template(
+    os_env: object | None,
+    *,
+    session_workspace: str | Path | None,
+    for_harness_child: bool = False,
+    source: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Resolve ``os_env.sandbox.env_template`` with the :func:`clean_agent_env` filter.
+
+    :param os_env: The agent's ``OSEnvSpec``, or ``None``.
+    :param session_workspace: The session's workspace; ``None`` uses the runner's.
+    :param for_harness_child: Also export the session workspace and the resolved
+        names, which the child's CLI filter and ``sys_os_*`` helper read.
+    :param source: Environment to read. Defaults to ``os.environ``.
+    :returns: Resolved variables, or ``{}`` when the spec declares no template.
+    """
+    template = declared_env_template(os_env)
+    if template is None:
+        return {}
+    env_source = os.environ if source is None else source
+    context = workspace_template_context(
+        session_workspace=session_workspace,
+        runner_workspace=env_source.get(RUNNER_WORKSPACE_ENV_VAR),
+    )
+    resolved = resolve_env_template(
+        template,
+        source_env=env_source,
+        is_allowed=agent_env_name_filter(
+            extra_allowed=declared_passthrough(os_env), source=env_source
+        ),
+        context=context,
+    )
+    if for_harness_child:
+        if resolved:
+            resolved[RESOLVED_TEMPLATE_NAMES_ENV_VAR] = ",".join(sorted(resolved))
+        if SESSION_WORKSPACE_TEMPLATE_VAR in context:
+            resolved[SESSION_WORKSPACE_TEMPLATE_VAR] = context[SESSION_WORKSPACE_TEMPLATE_VAR]
+    return resolved

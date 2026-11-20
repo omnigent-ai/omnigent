@@ -764,6 +764,7 @@ def _clone_sandbox_spec(sandbox: OSEnvSandboxSpec | None) -> OSEnvSandboxSpec | 
         env_passthrough=(
             list(sandbox.env_passthrough) if sandbox.env_passthrough is not None else None
         ),
+        env_template=dict(sandbox.env_template) if sandbox.env_template is not None else None,
         egress_rules=list(sandbox.egress_rules) if sandbox.egress_rules is not None else None,
         git_ssh=list(sandbox.git_ssh) if sandbox.git_ssh is not None else None,
         tcp_egress=list(sandbox.tcp_egress) if sandbox.tcp_egress is not None else None,
@@ -836,6 +837,7 @@ def terminal_pane_environment(
     env_unset: Iterable[str],
     launch_environment: Mapping[str, str] | None = None,
     sandbox_policy: SandboxPolicy | None = None,
+    session_workspace: str | Path | None = None,
 ) -> dict[str, str]:
     """
     Build the environment a terminal pane's command starts with.
@@ -850,6 +852,7 @@ def terminal_pane_environment(
         ``None`` when there are none.
     :param sandbox_policy: Active sandbox whose env allowlist filters the inherited
         environment, or ``None`` when the pane is not sandboxed.
+    :param session_workspace: The pane's launch directory, for env templates.
     :returns: The pane environment, e.g. ``{"HOME": "/home/user", "LANG": "C.UTF-8"}``.
     """
     # Do NOT advertise the tmux control socket path to the
@@ -861,7 +864,7 @@ def terminal_pane_environment(
     if not inherit_env:
         result: dict[str, str] = {}
     elif sandbox_policy is not None and sandbox_policy.active:
-        result = build_helper_env(os.environ, sandbox_policy)
+        result = build_helper_env(os.environ, sandbox_policy, session_workspace=session_workspace)
     else:
         result = os.environ.copy()
     result.pop("OMNIGENT_TMUX_SOCK", None)
@@ -1857,6 +1860,7 @@ class TerminalInstance:
             env_unset=self.env_unset,
             launch_environment=launch_environment,
             sandbox_policy=self.sandbox_policy,
+            session_workspace=cwd,
         )
         if self._clipboard_bridge is not None:
             self._clipboard_bridge.prepare_environment(env)

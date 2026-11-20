@@ -881,6 +881,7 @@ def _parse_os_env_sandbox_spec(data: YamlData | str | bool | None) -> OSEnvSandb
         _parse_git_ssh,
     )
 
+    from .env_template import validate_env_template
     from .tcp_egress_policy import parse_tcp_egress
 
     credential_proxy = _parse_credential_proxy(data.get("credential_proxy"))
@@ -943,6 +944,7 @@ def _parse_os_env_sandbox_spec(data: YamlData | str | bool | None) -> OSEnvSandb
         ),
         mask_paths=list(mask_paths_raw) if mask_paths_raw is not None else None,
         env_passthrough=data.get("env_passthrough"),
+        env_template=validate_env_template(data.get("env_template")),
         egress_rules=egress_rules,
         egress_allow_private_destinations=allow_private,
         credential_proxy=credential_proxy,
