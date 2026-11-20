@@ -277,13 +277,16 @@ jobs:
           pnpm install --frozen-lockfile --filter web
           pnpm --filter web run build
 
-      - name: Checkout desktop demonstration support
-        if: github.event.inputs.test_target == 'web/electron/e2e/desktop_databricks_vpn_reconnect.e2e.js'
+      - name: Checkout demonstration support
+        if: >-
+          github.event.inputs.test_target == 'web/electron/e2e/desktop_databricks_vpn_reconnect.e2e.js' ||
+          github.event.inputs.test_target == 'tests/e2e/test_claude_native_gateway_advisor_rejection_e2e.py'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.workflow_sha }}
           path: .demo-driver
           sparse-checkout: |
+            .github/scripts/capture-sdk-advisor-demo.py
             web/electron/e2e/desktop_databricks_vpn_reconnect.e2e.js
             web/electron/e2e/desktopDesignPromptHarness.js
             web/electron/e2e/fixtures/databricksStandInNetwork.cjs
@@ -339,6 +342,10 @@ jobs:
           mkdir -p artifacts "artifacts/basetemp-${{ matrix.attempt }}"
           git rev-parse HEAD > artifacts/demo-source.txt
           export OMNIGENT_E2E_RECORD_DIR="$PWD/artifacts/demo-videos"
+          if [[ "$TEST_TARGET" == "tests/e2e/test_claude_native_gateway_advisor_rejection_e2e.py" ]]; then
+            uv run python .demo-driver/.github/scripts/capture-sdk-advisor-demo.py
+            exit $?
+          fi
           if [[ "$TEST_TARGET" == "web/electron/e2e/desktop_databricks_vpn_reconnect.e2e.js" ]]; then
             export OMNIGENT_PYTHON="$PWD/.venv/bin/python"
             export OMNIGENT_PW_NO_SANDBOX=1
