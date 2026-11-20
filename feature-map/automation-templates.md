@@ -154,6 +154,13 @@ to customize.
   Custom schedule remains available for other recurrence patterns.
   The shared modal supports ten-minute connected-host schedules in
   either session mode and continued-sandbox schedules; new sandbox sessions stay hourly.
+- `rrule-editor`: the schedule picker opens with a Visual | RRULE toggle (RRULE needs
+  `automations_v2`). RRULE takes one rule line, seeded from the current schedule, with
+  the timezone below it and the end under Ends; the form checks only its shape, and the
+  server reports why a rule can't run on save. A saved rule the visual controls can't show,
+  such as hourly 9 AM to 5 PM on weekdays, opens on RRULE, and an edit that leaves it alone
+  saves it unchanged. Summaries show such rules as written. Rules with `COUNT=1` stay
+  unsupported in the form.
 - `capabilities`: Jira, Slack, GitHub, Linear, and PagerDuty templates require session continuity
   and orchestration. Unsupported servers still allow creation from scratch.
 - `tools-note`: the form says which tools the agent needs where the task runs,
