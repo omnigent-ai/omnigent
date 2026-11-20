@@ -63,6 +63,7 @@ import { writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import { writeLastHostChoice } from "@/lib/hostPreferences";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
+import { ARIA_MOD_KEY, ENTER_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ComposerPresentationContext, type ComposerPresentation } from "./composerPresentation";
 
@@ -731,11 +732,19 @@ describe("NewChatLandingScreen in the floating panel", () => {
     expect(composer).not.toHaveClass("composer-reference-surface");
     expect(composer).not.toHaveClass("border");
     expect(composer).not.toHaveClass("rounded-2xl");
+    // The prompt takes the panel's height and scrolls inside it.
+    expect(composer.querySelector("[data-composer-input-area]")).toHaveClass(
+      "flex-1",
+      "overflow-y-auto",
+    );
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveClass("flex-1", "max-h-none");
     expect(screen.getByTestId("new-chat-landing-actions")).toHaveClass("border-t");
-    expect(screen.getByTestId("new-chat-landing-send-shortcut")).toHaveTextContent("↵");
+    expect(screen.getByTestId("new-chat-landing-send-shortcut")).toHaveTextContent(
+      `${MOD_KEY}${ENTER_KEY}`,
+    );
     expect(screen.getByTestId("new-chat-landing-submit")).toHaveAttribute(
       "aria-keyshortcuts",
-      expect.stringMatching(/^(Meta|Control)\+Enter$/),
+      `${ARIA_MOD_KEY}+Enter`,
     );
   });
 
