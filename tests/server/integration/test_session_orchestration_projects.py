@@ -280,8 +280,9 @@ async def test_another_project_keeps_the_destination_policy(auth_client, auth_ap
     assert {session.id for session in store.list_conversations().data} == before
 
 
+@pytest.mark.parametrize("by_id", [False, True])
 async def test_the_tool_files_a_worker_in_a_named_project_without_its_defaults(
-    auth_client, auth_app, db_uri, monkeypatch
+    auth_client, auth_app, db_uri, monkeypatch, by_id
 ):
     auth_client.headers["X-Forwarded-Email"] = "alice"
     source = await _create_session_as(auth_client, "", "alice")
@@ -293,8 +294,19 @@ async def test_the_tool_files_a_worker_in_a_named_project_without_its_defaults(
         {"agent_id": other_agent, **_DEFAULTS_THAT_WOULD_CHANGE_THE_WORKER},
     )
 
+    if by_id:
+        from omnigent.server.feature_flags import Feature, FeatureFlags
+
+        auth_app.state.feature_flags = FeatureFlags(
+            auth_app.state.feature_flags.enabled_features | {Feature.SCRIPTED_SESSIONS}
+        )
     worker_id = await _start_worker(
-        auth_client, auth_app, db_uri, monkeypatch, source, tool_args={"project_name": "Elsewhere"}
+        auth_client,
+        auth_app,
+        db_uri,
+        monkeypatch,
+        source,
+        tool_args={"project_id": named} if by_id else {"project_name": "Elsewhere"},
     )
 
     worker = SqlAlchemyConversationStore(db_uri).get_conversation(worker_id)

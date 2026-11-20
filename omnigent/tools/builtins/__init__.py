@@ -24,6 +24,7 @@ from collections.abc import Callable
 
 from omnigent.spec.types import SkillSpec
 from omnigent.tools.base import Tool
+from omnigent.tools.browser_agent_tools import ADVANCED_BROWSER_TOOL_NAMES
 from omnigent.tools.builtins.advise_models import SysAdviseModelsTool
 from omnigent.tools.builtins.agents import (
     SysAgentDownloadTool,
@@ -35,6 +36,12 @@ from omnigent.tools.builtins.async_inbox import (
     SysCancelAsyncTool,
     SysReadInboxTool,
 )
+from omnigent.tools.builtins.journal import (
+    SysJournalReadTool,
+    SysJournalWriteNoteTool,
+    SysJournalWritePlanTool,
+    SysJournalWriteStatusTool,
+)
 from omnigent.tools.builtins.list_comments import ListCommentsTool
 from omnigent.tools.builtins.list_models import SysListModelsTool
 from omnigent.tools.builtins.load_skill import (
@@ -44,12 +51,20 @@ from omnigent.tools.builtins.load_skill import (
     format_skill_meta_text,
     list_skill_resources,
 )
+from omnigent.tools.builtins.memory import (
+    MemoryDeleteTool,
+    MemoryGetTool,
+    MemoryListTool,
+    MemorySearchTool,
+    MemoryWriteTool,
+)
 from omnigent.tools.builtins.nimble_extract import NimbleExtractTool
 from omnigent.tools.builtins.nimble_research import NimbleResearchTool
 from omnigent.tools.builtins.read_skill_file import (
     ReadSkillFileTool,
 )
 from omnigent.tools.builtins.scheduled_tasks import (
+    SysReminderSetTool,
     SysScheduledTaskCreateTool,
     SysScheduledTaskDeleteTool,
     SysScheduledTaskListTool,
@@ -58,6 +73,7 @@ from omnigent.tools.builtins.scheduled_tasks import (
 from omnigent.tools.builtins.session_projects import (
     SysProjectListTool,
     SysProjectUpdateTool,
+    SysSessionLinkPrTool,
     SysSessionUpdateTool,
 )
 from omnigent.tools.builtins.session_rename import SysSessionRenameTool
@@ -75,6 +91,7 @@ from omnigent.tools.builtins.timer import (
     SysTimerSetTool,
 )
 from omnigent.tools.builtins.update_comment import UpdateCommentTool
+from omnigent.tools.builtins.user_inbox import SysUserInboxListTool, SysUserInboxPostTool
 from omnigent.tools.builtins.web_read import WebReadTool
 from omnigent.tools.builtins.web_search import WebSearchTool
 
@@ -83,6 +100,11 @@ __all__ = [
     "INSTANTIABLE_BUILTINS",
     "ListCommentsTool",
     "LoadSkillTool",
+    "MemoryDeleteTool",
+    "MemoryGetTool",
+    "MemoryListTool",
+    "MemorySearchTool",
+    "MemoryWriteTool",
     "NimbleExtractTool",
     "NimbleResearchTool",
     "ReadSkillFileTool",
@@ -92,10 +114,15 @@ __all__ = [
     "SysAgentListTool",
     "SysCallAsyncTool",
     "SysCancelAsyncTool",
+    "SysJournalReadTool",
+    "SysJournalWriteNoteTool",
+    "SysJournalWritePlanTool",
+    "SysJournalWriteStatusTool",
     "SysListModelsTool",
     "SysProjectListTool",
     "SysProjectUpdateTool",
     "SysReadInboxTool",
+    "SysReminderSetTool",
     "SysScheduledTaskCreateTool",
     "SysScheduledTaskDeleteTool",
     "SysScheduledTaskListTool",
@@ -104,6 +131,7 @@ __all__ = [
     "SysSessionCreateTool",
     "SysSessionGetHistoryTool",
     "SysSessionGetInfoTool",
+    "SysSessionLinkPrTool",
     "SysSessionListTool",
     "SysSessionRenameTool",
     "SysSessionSendTool",
@@ -111,6 +139,8 @@ __all__ = [
     "SysSessionUpdateTool",
     "SysTimerCancelTool",
     "SysTimerSetTool",
+    "SysUserInboxListTool",
+    "SysUserInboxPostTool",
     "UpdateCommentTool",
     "WebReadTool",
     "WebSearchTool",
@@ -302,6 +332,7 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     "browser_click": None,
     "browser_type": None,
     "browser_screenshot": None,
+    **dict.fromkeys(sorted(ADVANCED_BROWSER_TOOL_NAMES)),
     "ui_open_file": None,
 }
 

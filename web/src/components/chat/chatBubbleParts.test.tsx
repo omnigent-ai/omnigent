@@ -6,11 +6,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ElicitationBlock } from "@/lib/blocks";
 import type { Bubble, RenderItem } from "@/lib/renderItems";
 import { SESSION_MENTION_HINT } from "@/lib/composerMentions";
+import { PEER_SESSION_MESSAGES_STORAGE_KEY } from "@/lib/peerSessionMessagePreferences";
 import { formatLocalReviewComments } from "@/lib/localReviewComments";
 import type { Comment } from "@/hooks/useComments";
 import { childSessionsQueryKey } from "@/hooks/useChildSessions";
 import { basenamedRouting, RoutingProvider } from "@/lib/routing";
 import { useChatStore, type ChatState } from "@/store/chatStore";
+import { trackPlanStop, usePlanStops } from "@/store/planStops";
 import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { NEW_SESSION_HANDOFF_PARAM, peekNewSessionHandoff } from "@/lib/newSessionHandoff";
@@ -89,9 +91,11 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  localStorage.removeItem(PEER_SESSION_MESSAGES_STORAGE_KEY);
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   useChatStore.setState(initialStoreState);
+  usePlanStops.setState({ requests: {}, settledStops: {} });
 });
 
 describe("Mermaid diagram width", () => {
@@ -410,6 +414,31 @@ describe("UserBubble messages from another session", () => {
     expect(screen.getByTestId("message-origin").textContent).toBe("From@Casual greeting");
     expect(screen.getByText("[System: build finished]")).toBeInTheDocument();
   });
+
+  it("collapses a message from another session to its first line until expanded", () => {
+    const client = new QueryClient();
+    client.setQueryData(["session", "s_src"], { title: "Reviewer", parentSessionId: null });
+    renderOriginBubble(client, "[Message from session s_src]\n\nVerdict: approve\nDetails follow");
+    expect(screen.getByTestId("collapsed-session-message")).toBeInTheDocument();
+    expect(screen.getByTestId("message-origin").textContent).toBe("From@Reviewer");
+    expect(screen.getByTestId("expand-session-message").textContent).toBe("Verdict: approve");
+    expect(screen.queryByTestId("user-message-content")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("expand-session-message"));
+    expect(screen.queryByTestId("collapsed-session-message")).not.toBeInTheDocument();
+    expect(screen.getByTestId("user-message-content").textContent).toContain("Details follow");
+
+    fireEvent.click(screen.getByTestId("collapse-session-message"));
+    expect(screen.getByTestId("collapsed-session-message")).toBeInTheDocument();
+  });
+
+  it("shows a message from another session in full when the reader chose to", () => {
+    localStorage.setItem(PEER_SESSION_MESSAGES_STORAGE_KEY, "show");
+    renderOriginBubble(new QueryClient(), "[Message from session s_src]\nfull text");
+    expect(screen.queryByTestId("collapsed-session-message")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("collapse-session-message")).not.toBeInTheDocument();
+    expect(screen.getByTestId("user-message-content").textContent).toContain("full text");
+  });
 });
 
 describe("UserBubble literal session markers", () => {
@@ -592,6 +621,8 @@ describe("UserBubble literal text", () => {
     expect(screen.getByText("<code>").tagName).toBe("CODE");
     expect(screen.getAllByRole("listitem")).toHaveLength(2);
     expect(screen.getByTestId("message-bubble")).toHaveTextContent("<exact lines>");
+    // An ordinary message, not a design-tool one: no design request card.
+    expect(screen.queryByTestId("design-request")).toBeNull();
   });
 });
 
@@ -631,6 +662,8 @@ describe("AssistantBubble error retry", () => {
 
   it("continues a transient upstream failure in place instead of resuming the runner", async () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({ queued: true, pending_id: "pending_retry" }));
+    // The session accepting the continuation also ends a run's Stop.
+    await trackPlanStop("conv_retry", async () => ({}));
     render(<BubbleView bubble={errorBubble("transient_upstream_error")} isLastAssistant />);
 
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
@@ -642,6 +675,7 @@ describe("AssistantBubble error retry", () => {
       type: "message",
       data: { role: "user", content: [{ type: "input_text", text: continuation }] },
     });
+    await waitFor(() => expect(usePlanStops.getState().requests.conv_retry).toBeUndefined());
   });
 
   it.each<[string, ElicitationBlock[]]>([
@@ -715,6 +749,7 @@ describe("AssistantBubble error retry", () => {
     fetchMock.mockResolvedValueOnce(testCase.response());
     const draft = { conversationId: "conv_retry", text: "Keep this draft", files: [] };
     useChatStore.setState({ failedSendDraft: draft });
+    await trackPlanStop("conv_retry", async () => ({}));
     render(<BubbleView bubble={errorBubble()} isLastAssistant />);
 
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
@@ -724,6 +759,8 @@ describe("AssistantBubble error retry", () => {
     );
     expect(screen.getByRole("button", { name: "Retry" })).toBeEnabled();
     expect(useChatStore.getState().failedSendDraft).toBe(draft);
+    // A run's Stop stays, since the session didn't take the continuation.
+    expect(usePlanStops.getState().requests.conv_retry).toMatchObject({ sent: true });
   });
 
   it.each<Partial<ChatState>>([

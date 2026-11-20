@@ -1086,10 +1086,23 @@ def shared_read_scope() -> Iterator[None]:
             _shared_read_sessions.reset(token)
 
 
+def rollback_shared_reads() -> None:
+    """Roll back the enclosing :func:`shared_read_scope` after a caught read failure.
+
+    A failed statement leaves a Postgres transaction aborted, so every later
+    read on the shared session fails until it is rolled back. Call this from
+    the ``except`` block that swallows a read error inside the scope; the next
+    read starts a fresh transaction. No-op outside a scope.
+    """
+    for session in (_shared_read_sessions.get() or {}).values():
+        session.rollback()
+
+
 def make_managed_session_maker(
     engine: Engine,
     *,
     immediate: bool = False,
+    reuse_shared_reads: bool = True,
 ) -> ManagedSessionMaker:
     """
     Create a context-manager factory for database sessions.
@@ -1114,6 +1127,8 @@ def make_managed_session_maker(
         the transaction with ``BEGIN IMMEDIATE`` to acquire the write
         lock before any read, preventing check-then-insert races.
         No-op on PostgreSQL (``SELECT ... FOR UPDATE`` is used there).
+    :param reuse_shared_reads: False when each read batch must end its own
+        transaction even inside a shared read scope.
     :returns: A callable that, when invoked, returns a context
         manager yielding a :class:`~sqlalchemy.orm.Session`.
     """
@@ -1156,7 +1171,7 @@ def make_managed_session_maker(
         scope's per-engine session is reused instead of a fresh checkout;
         the scope — not this block — owns its commit/close.
         """
-        if not immediate:
+        if not immediate and reuse_shared_reads:
             shared = _shared_read_sessions.get()
             if shared is not None:
                 key = id(engine)
@@ -1195,6 +1210,7 @@ def make_named_managed_session_maker(
     *,
     query_name_prefix: str,
     immediate: bool = False,
+    reuse_shared_reads: bool = True,
 ) -> NamedManagedSessionMaker:
     """Create managed sessions whose database work always has a semantic name.
 
@@ -1206,13 +1222,16 @@ def make_named_managed_session_maker(
     :param query_name_prefix: Stable namespace shared by the store's queries,
         e.g. ``"omnigent.file_store"``.
     :param immediate: Forwarded to :func:`make_managed_session_maker`.
+    :param reuse_shared_reads: Forwarded to :func:`make_managed_session_maker`.
     :returns: A callable accepting one semantic query-name suffix per session.
     """
     prefix = query_name_prefix.rstrip(".")
     if not prefix.strip():
         raise ValueError("query_name_prefix must not be empty")
 
-    managed_session = make_managed_session_maker(engine, immediate=immediate)
+    managed_session = make_managed_session_maker(
+        engine, immediate=immediate, reuse_shared_reads=reuse_shared_reads
+    )
 
     class _NamedManagedSessionMaker:
         """Bind transaction naming metadata to the managed session callable."""

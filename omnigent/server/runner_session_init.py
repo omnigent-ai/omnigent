@@ -186,6 +186,8 @@ class RunnerSessionInitializer:
         timeout: float,
         suppress_recovery_turn: bool = False,
         resume_interrupted_turn: bool = False,
+        recovery_id: str | None = None,
+        recovery_prompt: str | None = None,
         generation: int | None = None,
         store_slots: asyncio.Semaphore | None = None,
         trigger: str = "unspecified",
@@ -204,11 +206,11 @@ class RunnerSessionInitializer:
             and self._agent_store is not None
             and self._agent_cache is not None
         ):
-            from omnigent.server.mcp_compatibility import require_session_registry_mcp_support
+            from omnigent.server.runtime_compatibility import require_session_runtime_support
 
             async with store_slots or nullcontext():
                 await asyncio.to_thread(
-                    require_session_registry_mcp_support,
+                    require_session_runtime_support,
                     conversation,
                     connection.hello.capabilities,
                     component="runner",
@@ -254,7 +256,7 @@ class RunnerSessionInitializer:
         if task is None:
             decision = "start"
             init_attempt_id = uuid4().hex
-            recovery_id = (
+            recovery_id = recovery_id or (
                 self._recovery_ids.setdefault(key, uuid4().hex)
                 if resume_interrupted_turn
                 else None
@@ -265,6 +267,8 @@ class RunnerSessionInitializer:
                 suppress_recovery_turn=suppress_recovery_turn,
                 resume_interrupted_turn=resume_interrupted_turn,
                 recovery_id=recovery_id,
+                recovery_prompt=recovery_prompt,
+                require_recovery_admission=trigger == "host_recovery",
             )
 
             async def post_session_init() -> httpx.Response:

@@ -36,6 +36,7 @@ from omnigent.db.utils import (
     is_postgresql_family,
     make_managed_session_maker,
     normalize_database_url,
+    rollback_shared_reads,
     run_migrations_with_retry,
     run_write_transaction,
     set_lakebase_token_provider,
@@ -1164,21 +1165,24 @@ def test_shared_read_scope_is_noop_outside(db_uri: str) -> None:
     maker = make_managed_session_maker(engine)
     with maker() as session:
         session.execute(text("SELECT 1"))
+    rollback_shared_reads()
     assert _shared_read_sessions.get() is None
 
 
-def test_shared_read_scope_write_maker_bypasses_reuse(db_uri: str) -> None:
-    """A write maker (``immediate=True``) keeps its own session even in a scope,
-    so it never loses its ``BEGIN IMMEDIATE`` write isolation."""
+@pytest.mark.parametrize("maker_options", [{"immediate": True}, {"reuse_shared_reads": False}])
+def test_shared_read_scope_independent_maker_bypasses_reuse(
+    db_uri: str, maker_options: dict[str, bool]
+) -> None:
+    """Write isolation and bounded read batches keep their own sessions."""
     engine = get_or_create_engine(db_uri)
     read_maker = make_managed_session_maker(engine)
-    write_maker = make_managed_session_maker(engine, immediate=True)
+    independent_maker = make_managed_session_maker(engine, **maker_options)
 
     with shared_read_scope():
         with read_maker() as r1:
             pass
-        with write_maker() as w1:
-            assert w1 is not r1, "write makers must not join the read scope"
+        with independent_maker() as independent:
+            assert independent is not r1, "independent makers must not join the read scope"
         with read_maker() as r2:
             assert r2 is r1, "read makers still reuse the scope's session"
 
@@ -1316,6 +1320,31 @@ def test_shared_read_scope_closes_session_when_init_fails(
     assert counts["out"] == counts["in"], (
         f"a session that failed mid-init leaked its checkout: {counts}"
     )
+
+
+def test_rollback_shared_reads_recovers_the_scope_after_a_failed_read(
+    db_uri: str, record_terminators: Callable[[Engine], list[str]]
+) -> None:
+    """A caught statement failure must not poison the reads that follow it in the scope."""
+    from sqlalchemy.exc import SQLAlchemyError
+
+    engine = get_or_create_engine(db_uri)
+    maker = make_managed_session_maker(engine)
+    terminators = record_terminators(engine)
+    with shared_read_scope():
+        with maker() as session:
+            session.execute(text("SELECT 1"))
+        with pytest.raises(SQLAlchemyError):
+            with maker() as session:
+                session.execute(text("SELECT * FROM table_that_does_not_exist"))
+        before_recovery = len(terminators)
+        rollback_shared_reads()
+        # SQLite keeps the transaction usable after a failed statement, so the read
+        # below passes there either way; the terminator makes the recovery visible.
+        assert terminators[before_recovery:] == ["ROLLBACK"]
+        with maker() as session:
+            assert session.execute(text("SELECT 1")).scalar() == 1
+    assert _shared_read_sessions.get() is None
 
 
 # ── run_migrations_with_retry (cold-start resilience) ──────────────

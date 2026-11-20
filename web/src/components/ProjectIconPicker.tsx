@@ -57,11 +57,14 @@ export function ProjectLandingIcon({
   projectName,
   config,
   configReady,
+  small = false,
 }: {
   projectId: string | null;
   projectName: string;
   config: ProjectConfig | undefined;
   configReady: boolean;
+  /** A 48px tile instead of 56px. */
+  small?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const update = useUpdateProjectConfig();
@@ -87,7 +90,7 @@ export function ProjectLandingIcon({
   };
 
   return (
-    <span className="group/icon relative flex h-16 shrink-0 items-center">
+    <span className={cn("group/icon relative flex shrink-0 items-center", small ? "h-14" : "h-16")}>
       {/* Edit / remove affordances, revealed above the tile on hover. Remove is
           hidden until an emoji is set (nothing to reset to). */}
       <div className="absolute -top-1 left-1/2 flex -translate-x-1/2 -translate-y-full items-center gap-0.5 rounded-lg bg-popover p-0.5 opacity-0 shadow-menu ring-1 ring-foreground/10 transition-opacity focus-within:opacity-100 group-hover/icon:opacity-100">
@@ -124,16 +127,19 @@ export function ProjectLandingIcon({
             data-testid="project-icon-tile"
             onClick={openPicker}
             className={cn(
-              "flex size-14 cursor-pointer items-center justify-center rounded-xl transition-colors",
+              "flex cursor-pointer items-center justify-center rounded-xl transition-colors",
+              small ? "size-12 [&_svg]:size-5" : "size-14 [&_svg]:size-6",
               icon ? "bg-muted" : "bg-tag-pink",
             )}
           >
             {update.isPending ? (
-              <Loader2Icon className="size-6 animate-spin text-muted-foreground" />
+              <Loader2Icon className="animate-spin text-muted-foreground" />
             ) : icon ? (
-              <span className="text-[30px] leading-none">{icon}</span>
+              <span className={cn("leading-none", small ? "text-[26px]" : "text-[30px]")}>
+                {icon}
+              </span>
             ) : (
-              <FolderIcon className="size-6 text-brand-accent" />
+              <FolderIcon className="text-brand-accent" />
             )}
           </button>
         </PopoverAnchor>

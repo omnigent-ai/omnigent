@@ -20,6 +20,7 @@ import pytest
 
 from omnigent.inner import pi_native_executor as pne
 from omnigent.inner.executor import ExecutorError, TurnComplete
+from omnigent.telemetry.request_headers import client_identity_headers
 
 
 def test_supports_flags(tmp_path: Path) -> None:
@@ -137,7 +138,8 @@ async def test_turn_refreshes_baked_bearer(tmp_path: Path, monkeypatch) -> None:
 
     [_ async for _ in ex.run_turn([{"role": "user", "content": "hi"}], [], "")]
     assert await ex.enqueue_session_message("main", "steer") is True
-    assert refreshed == [{"Authorization": "Bearer tok"}, {"Authorization": "Bearer tok"}]
+    identity = client_identity_headers()
+    assert refreshed == [{**identity, "Authorization": "Bearer tok"}] * 2
     assert len(mint_threads) == 2
     assert threading.get_ident() not in mint_threads
 

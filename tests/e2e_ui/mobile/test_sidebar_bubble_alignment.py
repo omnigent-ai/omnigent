@@ -74,7 +74,7 @@ def _open_drawer(page: Page, base_url: str, session_id: str) -> None:
     """Load the session at phone width and open the sidebar drawer."""
     page.goto(f"{base_url}/c/{session_id}")
     expect(page.get_by_label("Message the agent")).to_be_visible(timeout=30_000)
-    assert page.evaluate("matchMedia('(max-width: 767.98px)').matches"), (
+    assert page.evaluate("matchMedia('(max-width: 1180.98px)').matches"), (
         "expected the mobile (max-md) layout branch to be in effect"
     )
 

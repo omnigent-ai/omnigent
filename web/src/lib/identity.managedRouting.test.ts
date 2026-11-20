@@ -280,9 +280,10 @@ describe("managed first-message routing", () => {
           ? `/v1/sessions/${SESSION_ID}`
           : EVENTS_URL;
     const headers = mode === "explicit-key" ? { [SLICE_KEY]: "caller-host" } : undefined;
+    const init = mode === "create" ? { method: "POST", body: "{}" } : {};
     fetchMock.mockImplementation(async () => wrongReplica());
 
-    expect((await authenticatedFetch(url, { headers })).status).toBe(400);
+    expect((await authenticatedFetch(url, { ...init, headers })).status).toBe(400);
     // A client-keyed create or snapshot still tries the unkeyed default replica once.
     expect(fetchMock).toHaveBeenCalledTimes(calls);
     if (calls === 2) expect(requestHeaders(1).has(SLICE_KEY)).toBe(false);
@@ -313,23 +314,111 @@ describe("managed first-message routing", () => {
     expect(isHostKeyless("new-host")).toBe(true);
   });
 
-  it("retries a scheduled-task create on the updates key unkeyed after a miss", async () => {
+  it("returns a scheduled-task create's wrong_replica as-is on the modal host key", async () => {
     const { authenticatedFetch, setSessionHost, resolveModalHost, isHostKeyless } = await setup();
     setSessionHost("other-session", "host_modal");
-    resolveModalHost();
-    fetchMock.mockResolvedValueOnce(wrongReplica()).mockResolvedValueOnce(Response.json({}));
+    resolveModalHost(["host_modal"]);
+    fetchMock.mockResolvedValueOnce(wrongReplica());
 
     const response = await authenticatedFetch("/v1/scheduled-tasks", {
       method: "POST",
       body: JSON.stringify({ name: "Nightly" }),
     });
 
-    expect(response.ok).toBe(true);
+    expect(response.status).toBe(400);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(requestHeaders(0).get(SLICE_KEY)).toBe("host_modal");
-    expect(requestHeaders(1).has(SLICE_KEY)).toBe(false);
-    expect(fetchMock.mock.calls[1][2]).toEqual({ unkeyed: true });
-    // The updates key isn't treated as a host proven keyless.
     expect(isHostKeyless("host_modal")).toBe(false);
+  });
+
+  it("looks up an unknown session before a root PATCH and keys it by its host", async () => {
+    const { authenticatedFetch, setSessionHost, setSessionHostResolver } = await setup();
+    const lookup = vi.fn(async (sessionId: string) => setSessionHost(sessionId, "host_known"));
+    setSessionHostResolver(lookup);
+    fetchMock.mockResolvedValueOnce(Response.json({}));
+
+    await authenticatedFetch(`/v1/sessions/${SESSION_ID}`, {
+      method: "PATCH",
+      body: JSON.stringify({ archived: true }),
+    });
+
+    expect(lookup).toHaveBeenCalledExactlyOnceWith(SESSION_ID);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(requestHeaders(0).get(SLICE_KEY)).toBe("host_known");
+  });
+
+  it("keeps the client key for an unknown session when its lookup fails", async () => {
+    const { authenticatedFetch, setSessionHostResolver } = await setup();
+    setSessionHostResolver(async () => {
+      throw new Error("lookup down");
+    });
+    fetchMock.mockResolvedValueOnce(Response.json({}));
+
+    const response = await authenticatedFetch(`/v1/sessions/${SESSION_ID}`, {
+      method: "PATCH",
+      body: JSON.stringify({ archived: true }),
+    });
+
+    expect(response.ok).toBe(true);
+    expect(requestHeaders(0).get(SLICE_KEY)).toMatch(CLIENT_KEY_RE);
+  });
+});
+
+describe("host-less requests", () => {
+  it.each([
+    "/v1/sessions?order=desc&limit=30",
+    "/v1/sessions/projects",
+    "/v1/sessions/orchestrated",
+    "/v1/sessions/updates",
+    "/v1/hosts",
+    "/health?session_ids=session-a,session-b",
+  ])("keys %s by the modal host once it resolves", async (url) => {
+    const { authenticatedFetch, setSessionHost, resolveModalHost } = await setup();
+    setSessionHost("session-a", "host_modal");
+    setSessionHost("session-b", "host_modal");
+    setSessionHost("session-c", "host_other");
+    resolveModalHost(["host_modal"]);
+    fetchMock.mockResolvedValueOnce(Response.json({}));
+
+    await authenticatedFetch(url);
+
+    expect(requestHeaders(0).get(SLICE_KEY)).toBe("host_modal");
+  });
+
+  it("keys a host-less request by this client's key before the modal host resolves", async () => {
+    const { authenticatedFetch } = await setup();
+    fetchMock.mockResolvedValueOnce(Response.json({}));
+
+    await authenticatedFetch("/v1/sessions?limit=30");
+
+    expect(requestHeaders(0).get(SLICE_KEY)).toMatch(CLIENT_KEY_RE);
+  });
+
+  it("returns a host-less wrong_replica as-is without demoting the modal host", async () => {
+    const { authenticatedFetch, setSessionHost, resolveModalHost, isHostKeyless } = await setup();
+    setSessionHost("session-a", "host_modal");
+    resolveModalHost(["host_modal"]);
+    fetchMock.mockResolvedValueOnce(wrongReplica());
+
+    const response = await authenticatedFetch("/v1/sessions?limit=30");
+
+    expect(response.status).toBe(400);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(isHostKeyless("host_modal")).toBe(false);
+  });
+
+  it("sends no slice key and writes no routing key when host routing is off", async () => {
+    window.localStorage.clear();
+    isWorkspace.mockReturnValue(false);
+    const { authenticatedFetch } = await setup();
+    fetchMock.mockResolvedValue(Response.json({}));
+
+    await authenticatedFetch("/v1/sessions?limit=30");
+    await authenticatedFetch(`/v1/sessions/${SESSION_ID}/events`, { method: "POST", body: "{}" });
+
+    expect(requestHeaders(0).has(SLICE_KEY)).toBe(false);
+    expect(requestHeaders(1).has(SLICE_KEY)).toBe(false);
+    expect(window.localStorage.getItem("omnigent:routing-key")).toBeNull();
   });
 });
 
