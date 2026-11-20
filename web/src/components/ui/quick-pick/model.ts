@@ -30,6 +30,8 @@ export interface QuickPickItem<Value = unknown> {
   highlights?: { label?: readonly MatchRange[]; description?: readonly MatchRange[] };
   /** How this row's matched text stands out; defaults to the picker's highlight. */
   matchHighlight?: MatchHighlight;
+  /** Accepting the item opens a child page; a chevron marks it, and Right Arrow opens it. */
+  opensPage?: boolean;
   /** Defaults to true; a free-text item is never remembered. */
   rememberInHistory?: boolean;
   /**

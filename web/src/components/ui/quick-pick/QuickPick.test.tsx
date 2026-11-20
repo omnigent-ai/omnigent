@@ -568,6 +568,57 @@ describe("QuickPick footer and alternate accept", () => {
   });
 });
 
+describe("QuickPick child pages", () => {
+  it("shows a back button and goes back with Escape, Backspace in an empty query, or the footer", () => {
+    const onBack = vi.fn();
+    const { input } = renderPicker({ onBack, backLabel: "Back to themes" });
+    expect(screen.getByRole("button", { name: "Back to themes" })).toBeVisible();
+    fireEvent.keyDown(input, { key: "Escape" });
+    fireEvent.keyDown(input, { key: "Backspace" });
+    fireEvent.click(screen.getByRole("button", { name: "Back (Escape)" }));
+    expect(onBack).toHaveBeenCalledTimes(3);
+  });
+
+  it("edits a non-empty query with Backspace instead of going back", () => {
+    const onBack = vi.fn();
+    const { input } = renderPicker({ onBack, query: "new" });
+    fireEvent.keyDown(input, { key: "Backspace" });
+    expect(onBack).not.toHaveBeenCalled();
+  });
+
+  it("goes back with Escape from the back button and returns focus to the query", () => {
+    const onBack = vi.fn();
+    const { input } = renderPicker({ onBack });
+    const back = screen.getByRole("button", { name: "Back" });
+    back.focus();
+    fireEvent.keyDown(back, { key: "Escape" });
+    expect(onBack).toHaveBeenCalledTimes(1);
+    expect(document.activeElement).toBe(input);
+  });
+
+  it("marks a row that opens a page and opens it with Right Arrow at the end of the query", () => {
+    const { input, onAccept } = renderPicker({
+      segments: [{ ...commands, items: [item("appearance", { opensPage: true }), item("plain")] }],
+    });
+    expect(screen.getByRole("option", { name: "appearance" }).querySelector("svg")).not.toBeNull();
+    fireEvent.keyDown(input, { key: "ArrowRight" });
+    expect(onAccept).toHaveBeenCalledWith(expect.objectContaining({ id: "appearance" }), {
+      alternate: false,
+    });
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    fireEvent.keyDown(input, { key: "ArrowRight" });
+    expect(onAccept).toHaveBeenCalledTimes(1);
+  });
+
+  it("lets the caller handle Right Arrow for the active row", () => {
+    const onExpand = vi.fn(() => true);
+    const { input, onAccept } = renderPicker({ onExpand });
+    fireEvent.keyDown(input, { key: "ArrowRight" });
+    expect(onExpand).toHaveBeenCalledWith(expect.objectContaining({ id: "new-session" }));
+    expect(onAccept).not.toHaveBeenCalled();
+  });
+});
+
 describe("QuickPick sidebar presentation", () => {
   const sidebarSegments: QuickPickSegment<string>[] = [
     {

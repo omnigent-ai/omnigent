@@ -9,7 +9,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { SearchIcon, XIcon } from "lucide-react";
+import { ChevronLeftIcon, ChevronRightIcon, SearchIcon, XIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { CompactShortcutKeys } from "@/components/ui/kbd";
@@ -75,6 +75,24 @@ export interface QuickPickProps<Value> {
    * active row's alternate, or returns undefined for a row without one.
    */
   alternateLabel?: string | ((item: QuickPickItem<Value>) => string | undefined);
+  /**
+   * Shown on a child page, such as one opened from a row: a back button, and
+   * Escape or Backspace in an empty query return to the parent page.
+   */
+  onBack?: () => void;
+  /** Accessible name for the back button, such as "Back to themes". */
+  backLabel?: string;
+  /**
+   * What the rows are, such as one opening of a child page. A new scope forgets the row the
+   * user picked, as a new query does, so a page doesn't inherit another page's pick.
+   */
+  selectionScope?: string;
+  /**
+   * Right Arrow with the caret at the end of the query: return true to have handled it for
+   * the active item, such as opening a related child page. Rows that `opensPage` open their
+   * page on Right Arrow even without this.
+   */
+  onExpand?: (item: QuickPickItem<Value>) => boolean;
   /** Remembers accepted items under this namespace and lists them first while the query is empty. */
   historyKey?: string;
   /** How rows' matched text stands out, unless a row sets its own. */
@@ -235,6 +253,10 @@ export function QuickPick<Value>({
   onAlternate,
   onDismiss,
   onClose = onDismiss,
+  onBack,
+  backLabel = "Back",
+  onExpand,
+  selectionScope,
   summary,
   acceptLabel = "Select",
   alternateLabel,
@@ -308,18 +330,20 @@ export function QuickPick<Value>({
   );
 
   // Until the user picks a row for this query, the top row stays active as results arrive.
-  // Any query change forgets the pick, so returning to an earlier query starts at the top.
-  const [activeChoice, setActiveChoice] = useState<{ query: string; id: string | null }>({
-    query,
-    id: null,
-  });
-  if (activeChoice.query !== query) setActiveChoice({ query, id: null });
+  // Any query or scope change forgets the pick, so returning to an earlier query starts at the top.
+  const [activeChoice, setActiveChoice] = useState<{
+    query: string;
+    scope: string | undefined;
+    id: string | null;
+  }>({ query, scope: selectionScope, id: null });
+  const choiceCurrent = activeChoice.query === query && activeChoice.scope === selectionScope;
+  if (!choiceCurrent) setActiveChoice({ query, scope: selectionScope, id: null });
   const activeIndex = reconcileActiveIndex(
     rows,
-    activeId ?? (activeChoice.query === query ? activeChoice.id : null),
+    activeId ?? (choiceCurrent ? activeChoice.id : null),
   );
   const pick = (id: string) => {
-    setActiveChoice({ query, id });
+    setActiveChoice({ query, scope: selectionScope, id });
     onActiveIdChange?.(id);
   };
   const activeRow = activeIndex === -1 ? null : (rows[activeIndex] as QuickPickItemRow<Value>);
@@ -372,12 +396,37 @@ export function QuickPick<Value>({
     else if (row) accept(row, alternate);
   };
 
-  /** Escape dismisses a picker that isn't inside a dialog, wherever focus is in it. */
+  // The back button leaves with the child page, so focus returns to the query field.
+  const goBack = () => {
+    onBack?.();
+    queryFieldRef.current?.focus();
+  };
+
+  /** Escape goes back on a child page, else dismisses, wherever focus is in the picker. */
   const handleEscape = (event: KeyboardEvent<HTMLElement>) => {
-    // A dialog around the picker already handled it.
-    if (event.defaultPrevented || !onDismiss) return;
-    event.preventDefault();
-    onDismiss();
+    // A dialog around the picker already handled it, such as going back.
+    if (event.defaultPrevented) return;
+    if (onBack) {
+      event.preventDefault();
+      goBack();
+    } else if (onDismiss) {
+      event.preventDefault();
+      onDismiss();
+    }
+  };
+
+  // Right Arrow at the end of the query opens the active row's page, so it still moves the caret.
+  const handleExpand = (event: KeyboardEvent<HTMLInputElement>) => {
+    const field = event.currentTarget;
+    const atEnd = field.selectionStart === query.length && field.selectionEnd === query.length;
+    if (!atEnd || event.shiftKey || event.altKey || event.metaKey || event.ctrlKey) return;
+    if (!activeRow || activeRow.item.disabledReason) return;
+    if (onExpand?.(activeRow.item)) {
+      event.preventDefault();
+    } else if (activeRow.item.opensPage) {
+      event.preventDefault();
+      accept(activeRow);
+    }
   };
 
   const handleKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
@@ -392,7 +441,21 @@ export function QuickPick<Value>({
       acceptWith(activeRow, hasCommandModifier(event, isMac));
     } else if (event.key === "Escape") {
       handleEscape(event);
+    } else if (event.key === "ArrowRight") {
+      handleExpand(event);
+    } else if (event.key === "Backspace" && onBack && query === "") {
+      event.preventDefault();
+      goBack();
     }
+  };
+
+  // The back and clear buttons take Tab too; the query handles its own Escape before this.
+  const handleHeaderKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== "Escape" || isImeCompositionKeyEvent(event)) return;
+    if (event.target === queryFieldRef.current) return;
+    handleEscape(event);
+    // Escape may remove the button that had focus, so focus returns to the query.
+    if (event.defaultPrevented) queryFieldRef.current?.focus();
   };
 
   // The footer's buttons take focus from Tab, so Escape works from them as from the query.
@@ -414,7 +477,8 @@ export function QuickPick<Value>({
     elapsedMs: elapsedValues.length > 0 ? Math.max(...elapsedValues) : undefined,
   };
   // An inline picker with no way to close, and nothing to summarize, keeps to its rows.
-  const showFooter = !sidebar && (onClose !== undefined || summary !== undefined);
+  const showFooter =
+    !sidebar && (onClose !== undefined || onBack !== undefined || summary !== undefined);
   // The footer's accept buttons do what Enter does, so they need a row Enter would accept.
   const canAcceptActive = activeRow !== null && !activeRow.item.disabledReason;
   const shownAlternateLabel =
@@ -440,7 +504,8 @@ export function QuickPick<Value>({
         // Hovering an enabled row makes it the user's pick, as in a menu, even when it
         // is already the top row, so a result arriving above it doesn't take over.
         onPointerMove={() => {
-          if (disabled || (activeId ?? activeChoice.id) === item.id) return;
+          if (disabled || (activeId ?? (choiceCurrent ? activeChoice.id : null)) === item.id)
+            return;
           pointerPickRef.current = true;
           pick(item.id);
         }}
@@ -525,6 +590,12 @@ export function QuickPick<Value>({
             {item.shortcut && (
               <CompactShortcutKeys keys={item.shortcut} className="shrink-0 self-center" />
             )}
+            {item.opensPage && (
+              <ChevronRightIcon
+                aria-hidden
+                className="size-4 shrink-0 self-center text-muted-foreground"
+              />
+            )}
           </>
         )}
       </div>
@@ -542,12 +613,29 @@ export function QuickPick<Value>({
       )}
     >
       <div
+        onKeyDown={handleHeaderKeyDown}
         className={cn(
           "flex items-center gap-2",
           sidebar ? "rounded-lg bg-muted px-2" : "border-b border-border px-3 py-2",
         )}
       >
-        <SearchIcon aria-hidden className="size-4 shrink-0 text-muted-foreground" />
+        {onBack ? (
+          // No tooltip: an open tooltip would take Escape from the dialog. The footer shows esc Back.
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            aria-label={backLabel}
+            data-slot="quick-pick-back"
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={goBack}
+            className="-ml-1 text-muted-foreground"
+          >
+            <ChevronLeftIcon />
+          </Button>
+        ) : (
+          <SearchIcon aria-hidden className="size-4 shrink-0 text-muted-foreground" />
+        )}
         <input
           ref={setQueryField}
           role="combobox"
@@ -702,9 +790,9 @@ export function QuickPick<Value>({
           <FooterAction
             keys={["esc"]}
             shortcut="Escape"
-            label="Close"
-            disabled={!onClose}
-            onClick={() => onClose?.()}
+            label={onBack ? "Back" : "Close"}
+            disabled={!onBack && !onClose}
+            onClick={() => (onBack ? goBack() : onClose?.())}
           />
         </div>
       )}
