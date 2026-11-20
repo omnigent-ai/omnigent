@@ -1454,7 +1454,8 @@ throws, the kit switches the design's styles off, shows its plain view and repor
 render_reports.
 
 model: radar (the radar record: headline, areas, sessions, scanned_at, window_days), areas (the
-areas that have an id and a title), sessions (the radar's sessions by ID), layout (the layout
+areas that have an id and a title), sessions (an object of the radar's sessions keyed by ID, not
+an array: use Object.values(model.sessions) to list them), layout (the layout
 record or null), width (root's width in pixels), preview.
 
 kit: el(tag, props, children) and svg(tag, props, children) make elements (props: class, text,
