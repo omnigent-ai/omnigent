@@ -11,6 +11,7 @@ import { describe, expect, it } from "vitest";
 import type {
   ElicitationRequest,
   SessionAgentChangedEvent,
+  SessionBackgroundTasksEvent,
   SessionCodexApprovalModeEvent,
   SessionCollaborationModeEvent,
   SessionChangedFilesInvalidatedEvent,
@@ -774,6 +775,22 @@ describe("response.elicitation_request (FLAT envelope)", () => {
     },
   );
 
+  it.each([
+    { directories: undefined },
+    { directories: null },
+    { directories: "/worktrees/branch" },
+    { directories: {} },
+    { directories: [""] },
+    { directories: ["/worktrees/branch", 123] },
+  ])("ignores malformed directory hints: $directories", ({ directories }) => {
+    const out = parse("response.elicitation_request", {
+      elicitation_id: "elicit_directory",
+      params: { message: "Approve Edit?", permission_directories: directories },
+    });
+    expect(out).toHaveLength(1);
+    expect((out[0] as ElicitationRequest).permissionDirectories).toBeUndefined();
+  });
+
   it("lifts the allow_all_edits hint for claude-native edit-tool prompts", () => {
     // The server stamps ``allow_all_edits`` on edit-tool
     // PermissionRequests so the card can offer "Accept & allow all
@@ -821,6 +838,38 @@ describe("response.elicitation_request (FLAT envelope)", () => {
     expect(out).toHaveLength(1);
     const ev = out[0] as ElicitationRequest;
     expect(ev.allowAllEdits).toBe(false);
+  });
+
+  it.each([
+    {
+      label: "a well-formed hint",
+      hint: { tool_name: "Edit", tool_input: { file_path: "/a.py" } },
+      expected: { toolName: "Edit", toolInput: { file_path: "/a.py" } },
+    },
+    { label: "a hint without a tool name", hint: { tool_input: {} }, expected: null },
+    {
+      label: "a hint whose input is not an object",
+      hint: { tool_name: "Edit", tool_input: [] },
+      expected: null,
+    },
+    { label: "no hint", hint: undefined, expected: null },
+  ])("parses file_edit from $label", ({ hint, expected }) => {
+    const out = parse("response.elicitation_request", {
+      type: "response.elicitation_request",
+      elicitation_id: "elicit_file_edit",
+      params: {
+        mode: "form",
+        message: "Claude wants to call **Edit**",
+        phase: "pre_tool_use",
+        policy_name: "claude_native_permission",
+        content_preview: "Edit({})",
+        requestedSchema: {},
+        file_edit: hint,
+      },
+    });
+
+    expect(out).toHaveLength(1);
+    expect((out[0] as ElicitationRequest).fileEdit).toEqual(expected);
   });
 
   it("lifts the remember_scope hint with a host for WebFetch prompts", () => {
@@ -1072,6 +1121,18 @@ describe("session.usage (FLAT envelope)", () => {
     const ev = out[0] as SessionUsageEvent;
     expect(ev.contextTokens).toBeUndefined();
     expect(ev.contextWindow).toBe(1000000);
+  });
+
+  it("lifts a cost-only cost_hidden broadcast", () => {
+    const out = parse("session.usage", {
+      type: "session.usage",
+      conversation_id: "conv_abc",
+      cost_hidden: true,
+    });
+    expect(out).toHaveLength(1);
+    const ev = out[0] as SessionUsageEvent;
+    expect(ev.costHidden).toBe(true);
+    expect(ev.totalCostUsd).toBeUndefined();
   });
 
   it("rejects payloads with neither field", () => {
@@ -1398,12 +1459,13 @@ describe("session.terminal_pending (FLAT envelope)", () => {
 });
 
 describe("session.sandbox_status (FLAT envelope)", () => {
-  it("lifts conversation_id, stage, and error", () => {
+  it("lifts conversation_id, stage, error, and provider", () => {
     const out = parse("session.sandbox_status", {
       type: "session.sandbox_status",
       conversation_id: "conv_abc",
       stage: "cloning",
       error: null,
+      provider: "arclet",
     });
     expect(out).toHaveLength(1);
     const ev = out[0] as SessionSandboxStatusEvent;
@@ -1411,6 +1473,7 @@ describe("session.sandbox_status (FLAT envelope)", () => {
     expect(ev.conversationId).toBe("conv_abc");
     expect(ev.stage).toBe("cloning");
     expect(ev.error).toBeNull();
+    expect(ev.provider).toBe("arclet");
   });
 
   it("carries the failure reason on stage=failed", () => {
@@ -1424,6 +1487,21 @@ describe("session.sandbox_status (FLAT envelope)", () => {
     const ev = out[0] as SessionSandboxStatusEvent;
     expect(ev.stage).toBe("failed");
     expect(ev.error).toBe("managed sandbox launch failed: spend limit reached");
+  });
+
+  it("keeps an action_required frame and what it asks the user to do", () => {
+    const out = parse("session.sandbox_status", {
+      type: "session.sandbox_status",
+      conversation_id: "conv_abc",
+      stage: "action_required",
+      error: null,
+      provider: "arclet",
+      details: "Refresh your dbcert on your laptop.",
+    });
+    expect(out).toHaveLength(1);
+    const ev = out[0] as SessionSandboxStatusEvent;
+    expect(ev.stage).toBe("action_required");
+    expect(ev.details).toBe("Refresh your dbcert on your laptop.");
   });
 
   it("drops frames with an unknown stage", () => {
@@ -1585,6 +1663,32 @@ describe("session.codex_approval_mode (FLAT envelope)", () => {
   });
 });
 
+describe("session.background_tasks (FLAT envelope)", () => {
+  it("lifts the count and each task's command", () => {
+    const events = parse("session.background_tasks", {
+      conversation_id: "conv_abc",
+      background_task_count: 1,
+      background_tasks: [{ id: "proc_0", command: "npm run dev" }],
+    });
+    expect(events).toEqual([
+      {
+        type: "session_background_tasks",
+        conversationId: "conv_abc",
+        backgroundTaskCount: 1,
+        backgroundTasks: [{ id: "proc_0", command: "npm run dev" }],
+      } satisfies SessionBackgroundTasksEvent,
+    ]);
+  });
+
+  it.each([
+    ["no conversation_id", { background_task_count: 1 }],
+    ["no count", { conversation_id: "conv_abc" }],
+    ["a negative count", { conversation_id: "conv_abc", background_task_count: -1 }],
+  ])("rejects %s", (_case, data) => {
+    expect(parse("session.background_tasks", data)).toEqual([]);
+  });
+});
+
 describe("session.agent_changed (FLAT envelope)", () => {
   it("lifts conversation_id, agent_id, and agent_name", () => {
     const events = parse("session.agent_changed", {
@@ -1733,6 +1837,30 @@ describe("session.presence (FLAT envelope)", () => {
         viewers: "nobody",
       }),
     ).toEqual([]);
+  });
+});
+
+describe("session.journal.appended (FLAT envelope)", () => {
+  it("carries the session and the new entry", () => {
+    const entry = { id: "e1", position: 1, kind: "note", content: { body: "hi" } };
+    const out = parse("session.journal.appended", {
+      type: "session.journal.appended",
+      conversation_id: "conv_abc",
+      entry,
+    });
+    expect(out).toEqual([{ type: "session_journal_appended", conversationId: "conv_abc", entry }]);
+  });
+
+  it("rejects an event without a usable entry", () => {
+    for (const entry of [undefined, [], { id: "e1" }, { position: 1 }]) {
+      expect(
+        parse("session.journal.appended", {
+          type: "session.journal.appended",
+          conversation_id: "conv_abc",
+          entry,
+        }),
+      ).toEqual([]);
+    }
   });
 });
 

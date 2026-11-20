@@ -18,14 +18,20 @@ from omnigent.inner._proc import process_alive
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")
-def test_sigkill_runner_reaps_signer_worker_helpers_and_socket(tmp_path: Path) -> None:
+@pytest.mark.parametrize("worker_delay", [0.0, 0.6], ids=["ready-worker", "delayed-worker"])
+def test_sigkill_runner_reaps_signer_worker_helpers_and_socket(
+    tmp_path: Path, worker_delay: float
+) -> None:
     worker = tmp_path / "worker.py"
     worker.write_text(
-        "import os, signal, time\n"
+        "import os, signal, time, sys\n"
+        "from pathlib import Path\n"
         "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "time.sleep(float(sys.argv[1]))\n"
         "if os.fork() == 0:\n"
         "    os.setsid()\n"
         "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "    Path(sys.argv[2]).touch()\n"
         "    while True: time.sleep(1)\n"
         "while True: time.sleep(1)\n",
         encoding="utf-8",
@@ -46,7 +52,8 @@ from omnigent.inner.model_egress import FrozenModelRoute
 from omnigent.inner.model_signer import SignerLaunchConfig, SubprocessModelSigner
 
 async def main():
-    state_path, worker_path = map(Path, sys.argv[1:])
+    state_path, worker_path = map(Path, sys.argv[1:3])
+    worker_ready = state_path.with_name("worker-ready")
     signer = SubprocessModelSigner(SignerLaunchConfig(
         binding_id="test-fake-provider-v1",
         endpoint="https://model.test/v1",
@@ -61,18 +68,25 @@ async def main():
         str(read_fd),
         sys.executable,
         str(worker_path),
+        sys.argv[3],
+        str(worker_ready),
         pass_fds=(read_fd,),
         **_proc.spawn_kwargs(),
     )
     _proc.remember_process_group(proc)
     os.close(read_fd)
-    await asyncio.sleep(0.3)
+    async with asyncio.timeout(5):
+        while not worker_ready.exists():
+            await asyncio.sleep(0.01)
     pids = [child.pid for child in psutil.Process().children(recursive=True)]
-    state_path.write_text(json.dumps({
+    # Publish atomically: the test polls for the path, then parses it.
+    pending = state_path.with_suffix(".pending")
+    pending.write_text(json.dumps({
         "pids": pids,
         "socket": str(readiness.socket_path),
         "public_dir": str(readiness.socket_path.parent),
     }))
+    pending.replace(state_path)
     while True:
         await asyncio.sleep(3600)
 
@@ -82,7 +96,7 @@ asyncio.run(main())
         encoding="utf-8",
     )
     proc = subprocess.Popen(
-        [sys.executable, str(runner), str(state_path), str(worker)],
+        [sys.executable, str(runner), str(state_path), str(worker), str(worker_delay)],
         start_new_session=True,
     )
     descendant_pids: list[int] = []

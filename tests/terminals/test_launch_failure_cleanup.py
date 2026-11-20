@@ -7,15 +7,20 @@ import contextlib
 import errno
 import json
 import logging
+import os
 import shutil
 import subprocess
+import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
 
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
+from omnigent.inner.claude_model_access import ClaudeModelAccess
+from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec, WritePathSpec
+from omnigent.inner.os_env import OSEnvironment
+from omnigent.inner.sandbox import SandboxPolicy
 from omnigent.inner.terminal import TerminalCreateResult, TerminalInstance
 from omnigent.terminals import TerminalRegistry, registry
 
@@ -61,6 +66,109 @@ def _launch_failed_event(caplog: pytest.LogCaptureFixture) -> logging.LogRecord:
     )
     assert record is not None, "expected a terminal_launch_failed log event"
     return record
+
+
+@pytest.mark.parametrize("held_stage", ["construction", "source_protection"])
+async def test_cancelled_terminal_preparation_keeps_loop_responsive_and_reclaims_instance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, held_stage: str
+) -> None:
+    private_dir = tmp_path / "private"
+    private_dir.mkdir()
+    instance = _stub_instance(private_dir)
+    instance.sandbox_policy = SandboxPolicy("linux_bwrap", True, [tmp_path], [tmp_path], [], False)
+    started = threading.Event()
+    release = threading.Event()
+
+    def hold_validation() -> None:
+        started.set()
+        assert release.wait(timeout=5)
+
+    def create(*_args: Any, **_kwargs: Any) -> TerminalCreateResult:
+        if held_stage == "construction":
+            hold_validation()
+        return TerminalCreateResult(instance, tmp_path)
+
+    monkeypatch.setattr(registry, "create_terminal_instance", create)
+    access = ClaudeModelAccess("https://model.test", "authorization", lambda: "key")
+    if held_stage == "source_protection":
+
+        def protect_sources(
+            self: ClaudeModelAccess, policy: SandboxPolicy, cwd: Path
+        ) -> SandboxPolicy:
+            hold_validation()
+            return policy
+
+        monkeypatch.setattr(ClaudeModelAccess, "protect_sources", protect_sources)
+
+    terminal_registry = TerminalRegistry()
+    spec = TerminalEnvSpec(
+        command="cat",
+        os_env=OSEnvSpec(cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+    )
+    task = asyncio.create_task(
+        terminal_registry.launch(
+            "owned-session",
+            "shell",
+            "main",
+            spec,
+            model_access_factory=(lambda: access) if held_stage == "source_protection" else None,
+        )
+    )
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        heartbeat = asyncio.Event()
+        asyncio.get_running_loop().call_soon(heartbeat.set)
+        await asyncio.wait_for(heartbeat.wait(), timeout=1)
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not private_dir.exists()
+        assert terminal_registry.active_conversation_ids() == []
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+
+async def test_cancelled_shared_environment_resolution_keeps_loop_responsive(
+    tmp_path: Path,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    terminal_registry = TerminalRegistry()
+
+    def resolve_environment(_session: str, _spec: OSEnvSpec) -> OSEnvironment:
+        started.set()
+        assert release.wait(timeout=5)
+        return cast(OSEnvironment, object())
+
+    terminal_registry.environment_resolver = resolve_environment
+    spec = TerminalEnvSpec(
+        command="cat",
+        os_env=OSEnvSpec(
+            cwd=str(tmp_path),
+            sandbox=OSEnvSandboxSpec(
+                type="linux_bwrap",
+                write_paths=[WritePathSpec(str(tmp_path), copy_on_write=True)],
+            ),
+        ),
+    )
+    launch = asyncio.create_task(terminal_registry.launch("owned-session", "shell", "main", spec))
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        heartbeat = asyncio.Event()
+        asyncio.get_running_loop().call_soon(heartbeat.set)
+        await asyncio.wait_for(heartbeat.wait(), timeout=1)
+        launch.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await launch
+        assert terminal_registry.active_conversation_ids() == []
+    finally:
+        release.set()
 
 
 @requires_tmux
@@ -273,11 +381,13 @@ async def test_immediate_exit_closes_once_and_keeps_exit_evidence(
 
 @requires_tmux
 @pytest.mark.parametrize("cancel_stage", ["spawn", "liveness"])
+@pytest.mark.parametrize("program_status_app", [None, "claude-code"])
 async def test_cancelled_launch_reaps_real_tmux(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     cancel_stage: str,
+    program_status_app: str | None,
 ) -> None:
     created = _capture_instances(monkeypatch)
     caplog.set_level(logging.INFO, logger=registry.__name__)
@@ -285,9 +395,15 @@ async def test_cancelled_launch_reaps_real_tmux(
     release = asyncio.Event()
     original_launch = TerminalInstance.launch
     original_alive = TerminalInstance.is_alive
+    child_pids: list[int] = []
 
     async def launch(instance: TerminalInstance, *, cwd: Path | None = None) -> None:
         await original_launch(instance, cwd=cwd)
+        if instance.program_status is not None:
+            async with asyncio.timeout(5):
+                while instance.program_status.child_pid is None:
+                    await asyncio.sleep(0.02)
+            child_pids.append(instance.program_status.child_pid)
         if cancel_stage == "spawn":
             reached.set()
             await release.wait()
@@ -303,7 +419,13 @@ async def test_cancelled_launch_reaps_real_tmux(
     monkeypatch.setattr(TerminalInstance, "is_alive", alive)
     terminal_registry = TerminalRegistry()
     task = asyncio.create_task(
-        terminal_registry.launch("owned-session", "shell", "main", _spec(tmp_path))
+        terminal_registry.launch(
+            "owned-session",
+            "shell",
+            "main",
+            _spec(tmp_path),
+            program_status_app=program_status_app,
+        )
     )
     try:
         await asyncio.wait_for(reached.wait(), timeout=5)
@@ -314,6 +436,14 @@ async def test_cancelled_launch_reaps_real_tmux(
         instance = created[0]
         assert not instance.private_dir.exists()
         assert not instance.running
+        for pid in child_pids:
+            async with asyncio.timeout(5):
+                while True:
+                    try:
+                        os.kill(pid, 0)
+                    except ProcessLookupError:
+                        break
+                    await asyncio.sleep(0.02)
         result = subprocess.run(
             ["tmux", "-S", str(instance.socket_path), "has-session"],
             check=False,

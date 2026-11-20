@@ -31,7 +31,13 @@ from pathlib import Path
 from typing import Any
 
 import respx
-from fakes import FakeOmnigentServer, RecordingSlackClient, sse_delta, sse_status
+from fakes import (
+    FakeOmnigentServer,
+    RecordingSlackClient,
+    resolve_test_auth,
+    sse_delta,
+    sse_status,
+)
 from omnigent_slack.models import UserConfig
 from omnigent_slack.omnigent import OmnigentClientPool
 from omnigent_slack.service import SlackOmnigentService
@@ -124,7 +130,7 @@ async def test_sdk_harness_turn_separates_back_to_back_messages(tmp_path: Path) 
             host_id="h1",
         ),
     )
-    pool = OmnigentClientPool()
+    pool = OmnigentClientPool(auth_resolver=resolve_test_auth)
     service = SlackOmnigentService(store=store, pool=pool, setup=_NoopSetup(), server_url=_SERVER)
     client = RecordingSlackClient()
 

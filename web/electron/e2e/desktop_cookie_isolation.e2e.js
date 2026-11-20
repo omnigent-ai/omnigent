@@ -17,9 +17,11 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { buildBrowserActionScript } = require("../src/browserActionScript.mjs");
 
 const {
   desktopDepsAvailable,
+  execInBrowserView,
   openBrowserFixture,
   spawnServer,
   launchDesktop,
@@ -34,13 +36,6 @@ async function openView(window, conversationId, url) {
   return openBrowserFixture(window, conversationId, url);
 }
 
-async function execInView(window, conversationId, js) {
-  return window.evaluate(
-    ([cid, code]) => window.omnigentDesktop.browserExecute(cid, code),
-    [conversationId, js],
-  );
-}
-
 async function setActive(window, conversationId) {
   const result = await window.evaluate(
     (cid) => window.omnigentDesktop.browserSetActive(cid),
@@ -51,17 +46,18 @@ async function setActive(window, conversationId) {
 
 // Cookie updates can reach sibling renderers after the writer returns.
 async function waitForIdentityCookie(window, conversationId, expected) {
-  await window.waitForFunction(
-    async ({ id, cookie }) => {
-      const result = await window.omnigentDesktop.browserExecute(id, "document.cookie");
-      const identity = String(result.result)
-        .split(/;\s*/)
-        .find((value) => value.startsWith("agent_identity="));
-      return result.ok && (identity ?? null) === cookie;
-    },
-    { id: conversationId, cookie: expected },
-    { timeout: 10_000 },
-  );
+  const deadline = Date.now() + 10000;
+  while (Date.now() < deadline) {
+    // oxlint-disable-next-line no-await-in-loop -- Wait for cookie propagation.
+    const result = await execInBrowserView(window, conversationId, "document.cookie");
+    const identity = String(result.result)
+      .split(/;\s*/)
+      .find((value) => value.startsWith("agent_identity="));
+    if (result.ok && (identity ?? null) === expected) return;
+    // oxlint-disable-next-line no-await-in-loop -- Wait for cookie propagation.
+    await window.waitForTimeout(100);
+  }
+  throw new Error("Identity cookie did not propagate");
 }
 
 // Poll until the view has actually LANDED on the target origin — an execute
@@ -75,7 +71,7 @@ async function waitForViewOnOrigin(window, conversationId, origin, timeoutMs = 3
   for (;;) {
     // oxlint-disable-next-line no-await-in-loop -- Poll each navigation probe sequentially.
     const r = await Promise.race([
-      execInView(window, conversationId, "location.origin"),
+      execInBrowserView(window, conversationId, "location.origin"),
       new Promise((resolve) => {
         setTimeout(() => resolve(null), 3_000);
       }),
@@ -123,6 +119,85 @@ describe(
     });
 
     it(
+      "performs snapshot, click and type through the preload bridge",
+      { timeout: 180_000 },
+      async () => {
+        const { electronApp, window, userDataDir, stopDisplayCapture } = await launchDesktop({
+          serverUrl: server.serverUrl,
+          recordDir,
+        });
+        const conversationId = "browser-actions";
+        try {
+          await window
+            .getByText("What should we build?")
+            .waitFor({ state: "visible", timeout: 20_000 });
+          await window.waitForFunction(() => !!window.omnigentDesktop?.browserPerformAction);
+          const opened = await openView(window, conversationId, `${server.serverUrl}/health`);
+          assert.equal(opened.ok, true, opened.error);
+          await setActive(window, conversationId);
+          await waitForViewOnOrigin(window, conversationId, new URL(server.serverUrl).origin);
+          // Test setup and observation use main-process access; actions use the
+          // production renderer -> preload -> IPC -> child WebContents path.
+          const fixture = await execInBrowserView(
+            window,
+            conversationId,
+            `
+          document.body.innerHTML = '<button>Save</button><input aria-label="Name"><p id="saved"></p>';
+          document.querySelector('button').addEventListener('click', () => {
+            document.querySelector('#saved').textContent = document.querySelector('input').value;
+          });
+        `,
+          );
+          assert.equal(fixture.ok, true, fixture.error);
+          /* oxlint-disable no-await-in-loop -- Both transports act sequentially on the same browser view. */
+          for (const transport of ["typed", "legacy"]) {
+            const perform = (action, params = {}) =>
+              transport === "typed"
+                ? window.evaluate(
+                    ({ cid, action: requestedAction, params: requestedParams }) =>
+                      window.omnigentDesktop.browserPerformAction(
+                        cid,
+                        requestedAction,
+                        requestedParams,
+                      ),
+                    { cid: conversationId, action, params },
+                  )
+                : window.evaluate(
+                    ({ cid, script }) => window.omnigentDesktop.browserExecute(cid, script),
+                    { cid: conversationId, script: buildBrowserActionScript(action, params) },
+                  );
+            const snapshot = await perform("snapshot");
+            assert.equal(snapshot.ok, true, snapshot.error);
+            const { tree, snapshot_id: snapshotId } = JSON.parse(snapshot.result);
+            const buttonRef = Number(tree.match(/button "Save" \[ref=(\d+)\]/)[1]);
+            const inputRef = Number(tree.match(/textbox "Name" \[ref=(\d+)\]/)[1]);
+            const typed = await perform("type", {
+              ref: inputRef,
+              snapshot_id: snapshotId,
+              text: `Ada ${transport}`,
+            });
+            assert.equal(typed.ok, true, typed.error);
+            const clicked = await perform("click", { ref: buttonRef, snapshot_id: snapshotId });
+            assert.equal(clicked.ok, true, clicked.error);
+            const observed = await execInBrowserView(
+              window,
+              conversationId,
+              "document.querySelector('#saved').textContent",
+            );
+            assert.equal(observed.ok, true, observed.error);
+            assert.equal(observed.result, `Ada ${transport}`);
+          }
+          /* oxlint-enable no-await-in-loop */
+        } finally {
+          await electronApp.close();
+          await stopDisplayCapture();
+          saveRecording(recordDir, "browser-typed-actions");
+          fs.rmSync(userDataDir, { recursive: true, force: true });
+        }
+      },
+    );
+
+    it(
       "tabs share login changes within conversation A while conversation B stays signed out",
       { timeout: 180_000 },
       async (t) => {
@@ -156,7 +231,7 @@ describe(
           assert.equal(openedA.ok, true, `conv_A open failed: ${openedA.error}`);
           await setActive(window, "conv_A");
           await waitForViewOnOrigin(window, "conv_A", server.serverUrl);
-          const signIn = await execInView(
+          const signIn = await execInBrowserView(
             window,
             "conv_A",
             `document.cookie = "agent_identity=alice; path=/";` +
@@ -186,7 +261,7 @@ describe(
             await waitForIdentityCookie(window, tab, "agent_identity=alice");
           }
           await setActive(window, secondTab);
-          const changed = await execInView(
+          const changed = await execInBrowserView(
             window,
             secondTab,
             'document.cookie = "agent_identity=bob; path=/"; document.cookie',
@@ -208,7 +283,7 @@ describe(
           assert.equal(openedB.ok, true, `conv_B open failed: ${openedB.error}`);
           await setActive(window, "conv_B");
           await waitForViewOnOrigin(window, "conv_B", server.serverUrl);
-          const readB = await execInView(
+          const readB = await execInBrowserView(
             window,
             "conv_B",
             bannerJs(
@@ -225,7 +300,7 @@ describe(
             !String(readB.result).includes("agent_identity"),
             `conv_B inherited conv_A's cookie — jars are shared: "${readB.result}"`,
           );
-          const loggedOut = await execInView(
+          const loggedOut = await execInBrowserView(
             window,
             secondTab,
             'document.cookie = "agent_identity=; max-age=0; path=/"; document.cookie',

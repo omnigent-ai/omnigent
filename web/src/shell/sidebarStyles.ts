@@ -1,3 +1,31 @@
 /** Shared row geometry for the home and Settings sidebars. */
 export const SIDEBAR_ROW =
   "sidebar-row sidebar-compact-text h-auto min-h-0 gap-2 rounded-[var(--radius-otto-button)] px-2 py-1.5 md:py-1";
+// On a list container, gives mobile rows 8px more inset inside their highlight.
+// A transparent border the highlight paints under adds to each row's own padding.
+export const SIDEBAR_ROW_MOBILE_INSET =
+  "max-md:[&_.sidebar-row]:border-x-8 max-md:[&_.sidebar-row]:border-transparent max-md:[&_.sidebar-row]:bg-clip-border";
+
+// Match the Settings sidebar's ghost-button hover treatment across every home
+// sidebar row.
+export const SIDEBAR_HOVER_HIGHLIGHT =
+  "hover:bg-muted hover:text-foreground dark:hover:bg-muted/50";
+// Keep a project-folder row highlighted while its actions menu is open (kebab
+// or header context menu, both flagged `data-state=open` inside `group/header`).
+// A right-click opens the context menu in a portal, dropping `:hover` from the
+// header, so the hover highlight alone would leave the row un-highlighted.
+export const SIDEBAR_OPEN_MENU_HIGHLIGHT =
+  "group-has-[[data-state=open]]/header:bg-muted group-has-[[data-state=open]]/header:text-foreground dark:group-has-[[data-state=open]]/header:bg-muted/50";
+// Active highlight also wins on hover so active items don't lose their
+// background and flash when the mouse enters them.
+export const SIDEBAR_ACTIVE_HIGHLIGHT =
+  "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)] hover:bg-[var(--sidebar-active)] hover:text-[var(--sidebar-active-foreground)] dark:hover:bg-[var(--sidebar-active)] dark:hover:text-[var(--sidebar-active-foreground)]";
+// Sessions shown in the displayed grid get half the active highlight.
+export const SIDEBAR_GRID_MEMBER_HIGHLIGHT =
+  "bg-[var(--sidebar-active)]/50 hover:bg-[var(--sidebar-active)]/50 dark:hover:bg-[var(--sidebar-active)]/50";
+// The focused grid pane's row adds an inset ring on top.
+export const SIDEBAR_GRID_SELECTED_RING = "ring-1 ring-inset ring-brand-accent/50";
+// Nested rows join into one line under the parent icon, inset 4px from the parent
+// row and the last nested row. Mobile follows the icon past SIDEBAR_ROW_MOBILE_INSET.
+export const SIDEBAR_FAMILY_LINE =
+  "pointer-events-none absolute -top-px bottom-0 -left-[7.5px] max-md:left-[0.5px] w-px bg-muted-foreground/40 [li:not([data-sibling-session]+li)>&]:top-[3px] [li:not(:has(+li[data-sibling-session]))>&]:bottom-1";

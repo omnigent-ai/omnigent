@@ -190,8 +190,8 @@ async def test_spawn_bounds_deferred_ask_write_does_not_regress_count(
     for _ in range(2):
         later = await fresh_engine().evaluate(_tool_ctx("sys_session_send"))
         assert later.action == PolicyAction.ASK
-        fresh_engine().apply_state_updates(later.state_updates)
-    fresh_engine().apply_state_updates(first.state_updates)
+        fresh_engine().apply_state_updates(later.state_updates, approved=True)
+    fresh_engine().apply_state_updates(first.state_updates, approved=True)
 
     # All three slots are consumed, so a fourth dispatch hits the cap.
     fourth = await fresh_engine().evaluate(_tool_ctx("sys_session_send"))

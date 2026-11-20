@@ -22,6 +22,9 @@ _SLOW_OPERATION_S = 1.0
 _REPORT_INTERVAL_S = 60.0
 _MAX_TRACKED_SENDS = 64
 _MAX_TRACKED_PINGS = 8
+# A healthy peer's last frame can predate a local stall by up to one ping
+# interval (30 s), so a stall this close to the silence explains all of it.
+_LOCAL_STALL_SLACK_S = 35.0
 
 
 class TunnelKeepaliveSettings(TypedDict, total=False):
@@ -47,6 +50,7 @@ class TunnelDiagnosticAttrs(TunnelKeepaliveSettings, total=False):
     send_errors: int
     send_cancellations: int
     last_send_outcome: str | None
+    last_send_error_type: str | None
     outbound_queue_depth: int | None
     outbound_queue_high_water: int | None
     app_pings_queued: int
@@ -104,6 +108,23 @@ class _Timing:
         }
 
 
+def silence_source(silent_s: float, attrs: TunnelDiagnosticAttrs) -> str:
+    """Name which end caused a tunnel's silence: this process or its peer.
+
+    A process whose own event loop stalled past the liveness window wakes to
+    find every peer silent, although the peers were fine. That timeout is a
+    local fault; any other silence means the peer or the path went away.
+
+    :param silent_s: Seconds since the peer's last frame.
+    :param attrs: This connection's :meth:`TunnelDiagnostics.snapshot`.
+    :returns: ``"local_event_loop"`` or ``"peer"``.
+    """
+    lag = attrs.get("loop_lag_s")
+    if lag is not None and lag >= silent_s - _LOCAL_STALL_SLACK_S:
+        return "local_event_loop"
+    return "peer"
+
+
 def _rounded(value: float | None) -> float | None:
     return None if value is None else round(value, 3)
 
@@ -138,6 +159,7 @@ class TunnelDiagnostics:
         self._send_errors = 0
         self._send_cancellations = 0
         self._last_send_outcome: str | None = None
+        self._last_send_error_type: str | None = None
         self._queue_depth: int | None = None
         self._queue_high_water: int | None = None
         self._queued_pings = 0
@@ -263,14 +285,16 @@ class TunnelDiagnostics:
                 self._pings.pop(next(iter(self._pings)))
                 self._ping_samples_dropped += 1
         outcome = "completed"
+        error_type: str | None = None
         try:
             await send_text(data)
         except asyncio.CancelledError:
             outcome = "cancelled"
             self._send_cancellations += 1
             raise
-        except Exception:
+        except Exception as exc:
             outcome = "error"
+            error_type = type(exc).__name__[:64]
             self._send_errors += 1
             raise
         else:
@@ -282,6 +306,7 @@ class TunnelDiagnostics:
             now = self._clock()
             self._send_duration.observe(now - started, now)
             self._last_send_outcome = outcome
+            self._last_send_error_type = error_type
             self._sends_in_flight -= 1
             self._active_sends.pop(token, None)
             if now - started >= _SLOW_OPERATION_S:
@@ -311,6 +336,7 @@ class TunnelDiagnostics:
             "send_errors": self._send_errors,
             "send_cancellations": self._send_cancellations,
             "last_send_outcome": self._last_send_outcome,
+            "last_send_error_type": self._last_send_error_type,
             "outbound_queue_depth": self._queue_depth,
             "outbound_queue_high_water": self._queue_high_water,
             "app_pings_queued": self._queued_pings,

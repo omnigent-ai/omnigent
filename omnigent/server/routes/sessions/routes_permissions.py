@@ -35,8 +35,6 @@ from omnigent.server.auth import (
     LEVEL_READ,
     RESERVED_USER_PUBLIC,
     AuthProvider,
-    SharingMode,
-    workspace_sharing_blocked,
 )
 from omnigent.server.routes._auth_helpers import (
     get_session_owner_id as _get_session_owner_id,
@@ -55,6 +53,7 @@ from omnigent.server.routes._sessions.common import (
 from omnigent.server.routes._sessions.helpers import (
     _announce_session_added,
 )
+from omnigent.server.routes.scheduled_task_permissions import automation_managing_session
 from omnigent.server.schemas import (
     AgentObject,
     GrantPermissionRequest,
@@ -63,17 +62,34 @@ from omnigent.server.schemas import (
     PolicySummary,
     SkillSummary,
 )
+from omnigent.server.session_sharing import (
+    require_public_grant_allowed,
+    require_sharing_mode_allows_grant,
+)
 from omnigent.spec.types import (
     FunctionPolicySpec,
     PolicySpec,
 )
 from omnigent.stores import AgentStore, ConversationStore
-from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.permission_store import MAX_GRANTS_PAGE_SIZE, PermissionStore
+
+
+class _ManagingAutomation(TypedDict):
+    id: str
+    name: str
 
 
 class _PermissionListResponse(TypedDict):
     permissions: list[PermissionObject]
     next_cursor: str | None
+    # The caller's automation that overwrites this session's sharing on each run.
+    managed_by_automation: _ManagingAutomation | None
+
+
+def _session_workspace(conversation_store: ConversationStore, session_id: str) -> str | None:
+    """Return the session's recorded working directory, or ``None`` if it has none."""
+    conversation = conversation_store.get_conversation(session_id)
+    return conversation.workspace if conversation is not None else None
 
 
 def register_permissions_routes(
@@ -100,7 +116,8 @@ def register_permissions_routes(
         """Grant or update a permission on a session.
 
         Requires manage-level access. Upserts the grant — can
-        upgrade or downgrade an existing level. Auto-creates the
+        upgrade or downgrade an existing level unless ``ensure_minimum``
+        preserves stronger access. Auto-creates the
         grantee user if they don't exist yet.
 
         :param request: The incoming FastAPI request (for auth).
@@ -115,36 +132,15 @@ def register_permissions_routes(
         await _require_access(
             user_id, session_id, LEVEL_MANAGE, permission_store, conversation_store
         )
-        # Server-wide sharing policy gate (see SharingMode). Applied only
-        # to *new* grants — revoke/list and owner grants are unaffected.
-        # ``getattr`` default keeps a hand-built app (a router mounted without
-        # create_app, e.g. in a focused test) from AttributeError-ing; every
-        # production path sets these via create_app.
-        _sharing_mode = getattr(request.app.state, "sharing_mode", lambda: SharingMode.ON)()
-        if _sharing_mode == SharingMode.OFF:
-            raise OmnigentError(
-                "Sharing has been disabled for this Omnigent server.",
-                code=ErrorCode.FORBIDDEN,
-            )
-        # RESTRICTED_READ_ONLY blocks sharing entirely (even read) for a session
-        # whose cwd is a home dir or the filesystem root — that workspace is too
-        # broad to expose. Other sessions fall through to the read-only cap.
-        if _sharing_mode == SharingMode.RESTRICTED_READ_ONLY:
-            _conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-            if _conv is not None and workspace_sharing_blocked(_conv.workspace):
-                raise OmnigentError(
-                    "This session's working directory (a home or root directory) "
-                    "cannot be shared on this Omnigent server.",
-                    code=ErrorCode.FORBIDDEN,
-                )
-        if (
-            _sharing_mode in (SharingMode.READ_ONLY, SharingMode.RESTRICTED_READ_ONLY)
-            and body.level > LEVEL_READ
-        ):
-            raise OmnigentError(
-                "Sharing is limited to read-only access on this Omnigent server.",
-                code=ErrorCode.FORBIDDEN,
-            )
+        # Server-wide sharing policy (see SharingMode), for new grants only. Runs off
+        # the event loop in every mode: the mode callable can read a file, and
+        # RESTRICTED_READ_ONLY also loads the session's workspace from the store.
+        await asyncio.to_thread(
+            require_sharing_mode_allows_grant,
+            request.app.state,
+            level=body.level,
+            load_workspace=lambda: _session_workspace(conversation_store, session_id),
+        )
         if permission_store is None:
             raise OmnigentError(
                 "Permissions not enabled",
@@ -156,25 +152,7 @@ def register_permissions_routes(
                 code=ErrorCode.FORBIDDEN,
             )
         if body.user_id == RESERVED_USER_PUBLIC:
-            # Public-access kill switch, independent of the sharing_mode gate
-            # above (see app.state.public_sharing). Blocks the anyone-with-the
-            # -link grant while leaving user-to-user sharing intact. ``getattr``
-            # default mirrors the sharing_mode read above (hand-built apps).
-            if not getattr(request.app.state, "public_sharing", lambda: True)():
-                raise OmnigentError(
-                    "Public access has been disabled for this Omnigent server.",
-                    code=ErrorCode.FORBIDDEN,
-                )
-            from omnigent.server.sharing_settings import PublicSharingMaxLevel
-
-            ceiling = getattr(
-                request.app.state, "public_sharing_max_level", lambda: PublicSharingMaxLevel.READ
-            )()
-            if body.level > ceiling.level:
-                raise OmnigentError(
-                    f"Public access is limited to {ceiling.value} (level {ceiling.level})",
-                    code=ErrorCode.INVALID_INPUT,
-                )
+            require_public_grant_allowed(request.app.state, level=body.level)
         target = await asyncio.to_thread(permission_store.get_user, body.user_id)
         with target_account_scope(body.user_id, target.account_generation if target else None):
             existing = await asyncio.to_thread(permission_store.get, body.user_id, session_id)
@@ -185,12 +163,16 @@ def register_permissions_routes(
                 )
             await asyncio.to_thread(permission_store.ensure_user, body.user_id)
             perm = await asyncio.to_thread(
-                permission_store.grant, body.user_id, session_id, body.level
+                permission_store.grant,
+                body.user_id,
+                session_id,
+                body.level,
+                ensure_minimum=body.ensure_minimum,
             )
         # Push the now-shared session to the GRANTEE's open tabs so it
         # appears in their sidebar without a list poll.
         _announce_session_added(body.user_id, session_id)
-        add_audit_attrs(target_user_id=body.user_id, level=body.level)
+        add_audit_attrs(target_user_id=body.user_id, level=perm.level)
         return PermissionObject(
             user_id=perm.user_id,
             conversation_id=perm.conversation_id,
@@ -310,7 +292,9 @@ def register_permissions_routes(
         await _require_access(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
-        return {"owner": _get_session_owner_id(session_id, permission_store)}
+        return {
+            "owner": await asyncio.to_thread(_get_session_owner_id, session_id, permission_store)
+        }
 
     @router.get(
         "/sessions/{session_id}/permissions",
@@ -319,19 +303,22 @@ def register_permissions_routes(
     async def list_permissions(
         request: Request,
         session_id: str,
-        limit: int = Query(default=100, ge=1, le=1000),
+        limit: int = Query(default=100, ge=1, le=MAX_GRANTS_PAGE_SIZE),
         after: str | None = Query(default=None, description="Cursor: user_id to start after"),
     ) -> _PermissionListResponse:
         """List permission grants on a session with cursor pagination.
 
-        Requires manage-level access.
+        Requires manage-level access. ``managed_by_automation`` names the caller's
+        shared continue-session automation that syncs this session's sharing on each
+        run, overwriting changes made here.
 
         :param request: The incoming FastAPI request (for auth).
         :param session_id: Session to list grants for,
             e.g. ``"conv_abc123"``.
         :param limit: Max grants to return (1–1000, default 100).
         :param after: Cursor — user_id to start after (exclusive).
-        :returns: ``{"permissions": [...], "next_cursor": str|null}``.
+        :returns: ``{"permissions": [...], "next_cursor": str|null,
+            "managed_by_automation": {"id": str, "name": str}|null}``.
         :raises OmnigentError: 404 if no session or no access.
         """
         user_id = _require_user(request, auth_provider)
@@ -346,6 +333,23 @@ def register_permissions_routes(
         grants, next_cursor = await asyncio.to_thread(
             permission_store.list_for_session, session_id, limit=limit, after_user_id=after
         )
+        state = request.app.state
+        try:
+            managing = await automation_managing_session(
+                session_id,
+                user_id,
+                conversation_store=conversation_store,
+                scheduled_task_store=(
+                    getattr(state, "scheduled_task_store", None)
+                    if getattr(state, "automations_available", lambda: False)()
+                    else None
+                ),
+                permission_store=permission_store,
+            )
+        except Exception:
+            # The marker only informs the share dialog; the grants list must still load.
+            _logger.exception("could not find the automation managing session %s", session_id)
+            managing = None
         return {
             "permissions": [
                 PermissionObject(
@@ -356,6 +360,9 @@ def register_permissions_routes(
                 for g in grants
             ],
             "next_cursor": next_cursor,
+            "managed_by_automation": (
+                {"id": managing.id, "name": managing.name} if managing is not None else None
+            ),
         }
 
 
@@ -414,6 +421,7 @@ def _to_agent_object(
     policies: list[PolicySummary] = []
     skills: list[SkillSummary] = []
     terminals: list[str] = []
+    loads_user_settings = True
     # Harness/kind for the UI; None until the spec loads (mirrors the
     # GET /v1/agents catalog so both endpoints report it consistently).
     harness: str | None = None
@@ -444,6 +452,7 @@ def _to_agent_object(
                 for s in loaded.spec.skills
                 if s.user_invocable
             ]
+            loads_user_settings = loaded.spec.loads_user_settings
             from omnigent.mcp_selection import selected_mcp_spec
 
             mcp_servers = [
@@ -497,4 +506,5 @@ def _to_agent_object(
         policies=policies,
         skills=skills,
         terminals=terminals,
+        loads_user_settings=loads_user_settings,
     )

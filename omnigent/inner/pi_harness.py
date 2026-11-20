@@ -58,11 +58,14 @@ Env vars read at startup:
   bundle skill.
 - ``HARNESS_PI_BUNDLE_DIR``: Absolute path to the agent
   bundle's extracted root. When set, the executor sources
-  bundled skills from ``<bundle>/skills/<dir>/`` for the
-  ``"all"`` and named-list cases. Unset for agents without a
-  bundled-skill directory.
+  bundled skills from ``<bundle>/skills/<dir>/`` and
+  ``<bundle>/.pi/skills/<dir>/`` for the ``"all"`` and named-list
+  cases, loads ``<bundle>/.pi/extensions`` via ``--extension``, and
+  appends a bundle-root context file (``AGENTS.md`` et al.) to the
+  system prompt. Unset for agents without a bundle directory.
 - ``HARNESS_PI_CONTEXT_FILES``: Whether Pi automatically loads context files
-  such as ``AGENTS.md`` and ``CLAUDE.md``. Defaults to true.
+  such as ``AGENTS.md`` and ``CLAUDE.md``, including the bundle-root one.
+  Defaults to true.
 - ``HARNESS_PI_SYSTEM_PROMPT_MODE``: ``append`` (default) or ``replace`` Pi's
   base prompt with Omnigent's composed instructions.
 - ``HARNESS_PI_AGENT_NAME``: Agent display name. Reserved for
@@ -210,8 +213,8 @@ def _build_pi_executor() -> Executor:
     Construct a :class:`PiExecutor` from env-var config.
 
     Called lazily by the :class:`ExecutorAdapter` on the first
-    turn. Heavyweight init (CLI discovery, eager Databricks
-    credential resolution) happens at this point — operators
+    turn. CLI discovery happens at this point; credentials resolve
+    asynchronously before the first request. Operators
     see the failure surface as a startup error on the first
     request, not at FastAPI app boot.
 
@@ -219,9 +222,7 @@ def _build_pi_executor() -> Executor:
     :raises ImportError: If the ``pi`` CLI isn't on PATH and
         ``OMNIGENT_PI_PATH`` (legacy ``HARNESS_PI_PATH``) isn't set — the inner executor's
         constructor surfaces this as a clear ImportError.
-    :raises OSError: If ``HARNESS_PI_GATEWAY`` is set but
-        credentials are missing — the inner executor's
-        constructor fails loud.
+    :raises OSError: If a gateway host is configured without an auth command.
     """
     bundle_dir_raw = os.environ.get(_ENV_BUNDLE_DIR, "").strip()
     bundle_dir = Path(bundle_dir_raw) if bundle_dir_raw else None
@@ -240,6 +241,8 @@ def _build_pi_executor() -> Executor:
         base_urls_override=_resolve_gateway_base_urls(),
         openai_wire_api=os.environ.get(_ENV_GATEWAY_OPENAI_WIRE_API) or None,
         gateway_auth_command=os.environ.get(_ENV_GATEWAY_AUTH_COMMAND) or None,
+        gateway_auth_refresh_interval_ms=os.environ.get(_ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS)
+        or None,
         bundle_dir=bundle_dir,
         agent_name=agent_name,
         skills_filter=_resolve_skills_filter(),

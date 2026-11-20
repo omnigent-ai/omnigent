@@ -11,8 +11,13 @@
 
 import { act, render, renderHook } from "@testing-library/react";
 import { StrictMode, useRef, useState, type ReactNode } from "react";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { useDictationInsert } from "./useDictationInsert";
+import type { ComposerTextTarget } from "@/components/composer/engine/composerInput";
+import {
+  createFakeComposerSurface,
+  type FakeComposerSurface,
+} from "@/components/composer/engine/testing/fakeComposerSurface";
 
 type Api = ReturnType<typeof useDictationInsert>;
 
@@ -372,5 +377,71 @@ describe("useDictationInsert", () => {
       });
       expect(composer.value).toBe("One. Two. TAIL");
     });
+  });
+});
+
+describe("useDictationInsert on a non-textarea composer surface", () => {
+  const mountedSurfaces: FakeComposerSurface[] = [];
+  afterEach(() => {
+    for (const surface of mountedSurfaces.splice(0)) {
+      surface.unregister();
+      surface.element.remove();
+    }
+  });
+
+  function renderSurfaceComposer(initial: string) {
+    const surface = createFakeComposerSurface(initial);
+    mountedSurfaces.push(surface);
+    const box: { api: Api | null } = { api: null };
+    function Composer() {
+      const [value, setValue] = useState(initial);
+      // The engine mirrors the controlled value, as a real editor would after render.
+      surface.value = value;
+      const ref = useRef<ComposerTextTarget>(surface);
+      box.api = useDictationInsert(value, setValue, ref);
+      return null;
+    }
+    render(<Composer />);
+    return {
+      surface,
+      api: () => box.api!,
+      click: (at: number) =>
+        act(() => {
+          surface.focus();
+          surface.setSelectionRange(at, at);
+          box.api!.noteFocus();
+        }),
+    };
+  }
+
+  it("inserts at the caret read across blur and places the caret after it without focusing", () => {
+    const composer = renderSurfaceComposer("PASTED CONTEXT");
+    composer.click(0);
+    act(() => composer.surface.blur());
+    composer.surface.scrollTop = 40;
+    // Browsers scroll an unfocused element to reveal a new selection; the hook must undo that.
+    const setSelection = composer.surface.setSelectionRange;
+    composer.surface.setSelectionRange = (start, end) => {
+      setSelection(start, end);
+      composer.surface.scrollTop = 0;
+    };
+
+    act(() => composer.api().appendFinal("Refactor this:"));
+
+    expect(composer.surface.value).toBe("Refactor this: PASTED CONTEXT");
+    expect(composer.surface.selectionStart).toBe("Refactor this:".length);
+    expect(document.activeElement).not.toBe(composer.surface.element);
+    expect(composer.surface.scrollTop).toBe(40);
+  });
+
+  it("revises a streaming partial in place at the caret", () => {
+    const composer = renderSurfaceComposer("PASTED CONTEXT");
+    composer.click(0);
+
+    act(() => composer.api().replaceInterim("refac"));
+    act(() => composer.api().replaceInterim("refactor thi"));
+
+    expect(composer.surface.value).toBe("refactor thi PASTED CONTEXT");
+    expect(composer.surface.selectionStart).toBe("refactor thi".length);
   });
 });

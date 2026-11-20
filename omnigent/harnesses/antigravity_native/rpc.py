@@ -1207,16 +1207,31 @@ def _list_agy_pids() -> list[int]:
         # can still be injected. ``exc_info`` records the real cause.
         _logger.debug("pgrep failed; falling back to /proc scan for agy pids", exc_info=True)
         return _list_agy_pids_from_proc()
-    return [int(line) for line in completed.stdout.split() if line.isdigit()]
+    pids = []
+    for line in completed.stdout.split():
+        if not line.isdigit():
+            continue
+        pid = int(line)
+        try:
+            argv = psutil.Process(pid).cmdline()
+        except psutil.Error:
+            continue
+        # Supervisors mention the agy command in their arguments, too.
+        if argv and _is_agy_executable(argv[0]):
+            pids.append(pid)
+    return pids
+
+
+def _is_agy_executable(executable: str) -> bool:
+    return executable == "bin/agy" or executable.endswith("/bin/agy")
 
 
 def _list_agy_pids_from_proc() -> list[int]:
     """
     Enumerate agy pids by scanning ``/proc/<pid>/cmdline`` (no ``pgrep`` needed).
 
-    The Linux-only fallback for :func:`_list_agy_pids`. Mirrors ``pgrep -f
-    bin/agy``: a process matches when its full (NUL-joined) command line
-    contains ``bin/agy``, which the launcher always satisfies because
+    The Linux-only fallback for :func:`_list_agy_pids`. Matches the executable
+    rather than wrapper arguments containing ``bin/agy``. The launcher satisfies this because
     :func:`omnigent.harnesses.antigravity_native.launch.agy_binary_path` resolves to an
     absolute ``.../bin/agy`` path. Unreadable or vanished ``/proc`` entries are
     skipped; a missing ``/proc`` (non-Linux) yields ``[]``.
@@ -1237,7 +1252,7 @@ def _list_agy_pids_from_proc() -> list[int]:
         except OSError:
             # Process exited between listdir and open, or cmdline is unreadable.
             continue
-        if b"bin/agy" in cmdline.replace(b"\0", b" "):
+        if _is_agy_executable(os.fsdecode(cmdline.split(b"\0", 1)[0])):
             pids.append(int(entry))
     return pids
 
@@ -1516,9 +1531,20 @@ def resolve_pane_agy_rpc_port(socket_path: Path, tmux_target: str) -> int | None
     return resolve_pane_agy_rpc_port_state(socket_path, tmux_target).port
 
 
+class ColdStartPortLog:
+    """Lets a caller that re-resolves repeatedly report the restricted-``/proc`` fallback once."""
+
+    __slots__ = ("fallback_reported",)
+
+    def __init__(self) -> None:
+        self.fallback_reported = False
+
+
 def resolve_cold_start_agy_rpc_port(
     tmux_socket: Path | None,
     tmux_target: str | None,
+    *,
+    log: ColdStartPortLog | None = None,
 ) -> int | None:
     """
     Pick the connect-RPC port a cold-start should ``StartCascade`` onto.
@@ -1558,6 +1584,9 @@ def resolve_cold_start_agy_rpc_port(
     :param tmux_socket: This session's tmux socket path, or ``None`` when no local
         pane is reachable (remote runner).
     :param tmux_target: This session's tmux target, or ``None`` as above.
+    :param log: Shared across a caller's repeated attempts so the restricted-
+        ``/proc`` candidate-scan fallback is logged at WARNING the first time it is
+        actually taken and at DEBUG afterwards; ``None`` always warns.
     :returns: The port to ``StartCascade`` onto, or ``None`` when the port is not
         resolvable yet (the caller keeps polling until its deadline).
     """
@@ -1587,12 +1616,15 @@ def resolve_cold_start_agy_rpc_port(
                 tmux_target,
             )
             return None
-        _logger.warning(
+        _logger.log(
+            logging.DEBUG if log is not None and log.fallback_reported else logging.WARNING,
             "agy cold-start: pane agy found for target=%s but no source attributes a "
             "port for ANY agy (restricted /proc); falling back to the host-wide "
             "candidate scan — safe only while this host runs a single agy",
             tmux_target,
         )
+        if log is not None:
+            log.fallback_reported = True
     candidates = _candidate_agy_rpc_ports()
     if not candidates:
         return None

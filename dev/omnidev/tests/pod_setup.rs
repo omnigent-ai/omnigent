@@ -1,7 +1,6 @@
 //! Exercises the non-TUI setup path: repo detection, pod dir tree, ports.
 
 use std::fs;
-use std::sync::{Mutex, MutexGuard};
 
 // The crate is a binary, so pull in the modules under test directly. Each test
 // target uses only part of the included source, so allow dead code.
@@ -21,6 +20,7 @@ mod ports;
 #[path = "../src/profile.rs"]
 mod profile;
 
+use paths::lock_test_env;
 use pod::Pod;
 use ports::Ports;
 
@@ -60,6 +60,7 @@ fn external_profile_accepts_another_project_layout() {
 /// Two different repo paths get distinct pod dirs; the same path is stable.
 #[test]
 fn pod_dir_is_per_repo_and_stable() {
+    let _guard = lock_test_env();
     let a1 = paths::default_pod_dir(std::path::Path::new("/repos/one")).unwrap();
     let a2 = paths::default_pod_dir(std::path::Path::new("/repos/one")).unwrap();
     let b = paths::default_pod_dir(std::path::Path::new("/repos/two")).unwrap();
@@ -158,17 +159,10 @@ fn pod_lock_is_exclusive() {
 
 const ALLOWED_ORIGINS_ENV: &str = "OMNIGENT_WS_ALLOWED_ORIGINS";
 
-/// Tests that read/write the process-global allowlist env var; serialize them.
-static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-fn lock_env() -> MutexGuard<'static, ()> {
-    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-}
-
 /// Run `body` with `OMNIGENT_WS_ALLOWED_ORIGINS` set to `value` (or unset when
 /// `None`), restoring the prior value afterward so tests don't leak env state.
 fn with_allowlist_env(value: Option<&str>, body: impl FnOnce()) {
-    let _guard = lock_env();
+    let _guard = lock_test_env();
     let prev = std::env::var(ALLOWED_ORIGINS_ENV).ok();
     match value {
         Some(v) => std::env::set_var(ALLOWED_ORIGINS_ENV, v),

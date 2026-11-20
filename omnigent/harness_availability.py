@@ -6,16 +6,30 @@ from collections.abc import Mapping
 from typing import Final, Literal, TypeGuard
 
 HARNESS_BINARY_MISSING: Final[Literal["binary-missing"]] = "binary-missing"
+# The CLI resolves but its ``--version`` probe timed out, so its version is unknown.
+HARNESS_CLI_UNRESPONSIVE: Final[Literal["cli-unresponsive"]] = "cli-unresponsive"
 HARNESS_NEEDS_AUTH: Final[Literal["needs-auth"]] = "needs-auth"
 HARNESS_VERSION_TOO_LOW: Final[Literal["version-too-low"]] = "version-too-low"
+# A native (tmux-backed) harness whose CLI is usable but the host's tmux is
+# missing, too old, or of unknown version. Older servers drop it from a hello and
+# reject a live readiness refresh that contains it.
+HARNESS_TMUX_UNAVAILABLE: Final[Literal["tmux-unavailable"]] = "tmux-unavailable"
 
-HarnessUnavailableReason = Literal["binary-missing", "needs-auth", "version-too-low"]
+HarnessUnavailableReason = Literal[
+    "binary-missing",
+    "cli-unresponsive",
+    "needs-auth",
+    "version-too-low",
+    "tmux-unavailable",
+]
 HarnessAvailability = Literal[
     True,
     False,
     "binary-missing",
+    "cli-unresponsive",
     "needs-auth",
     "version-too-low",
+    "tmux-unavailable",
 ]
 
 # Readiness and model-family checks must agree on every Codex spelling.
@@ -28,8 +42,10 @@ def is_harness_availability(value: object) -> TypeGuard[HarnessAvailability]:
     """Return whether a decoded value is a supported readiness state."""
     return isinstance(value, bool) or value in (
         HARNESS_BINARY_MISSING,
+        HARNESS_CLI_UNRESPONSIVE,
         HARNESS_NEEDS_AUTH,
         HARNESS_VERSION_TOO_LOW,
+        HARNESS_TMUX_UNAVAILABLE,
     )
 
 
@@ -57,6 +73,7 @@ def harness_launch_availability(
     harness: str | None,
     readiness: Mapping[str, object] | None,
 ) -> tuple[bool | None, str | None]:
-    """Treat host auth reports as advisory; sessions can supply credentials."""
+    """Treat auth and unresponsive-CLI reports as advisory; the host launch can still work."""
     available, reason = reported_harness_availability(harness, readiness)
-    return (None if reason == HARNESS_NEEDS_AUTH else available), reason
+    advisory = reason in (HARNESS_NEEDS_AUTH, HARNESS_CLI_UNRESPONSIVE)
+    return (None if advisory else available), reason

@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ServerInfo } from "./capabilities";
+import { FALLBACK_SERVER_INFO, type ServerInfo } from "./capabilities";
 import {
   createBootServerInfo,
   SERVER_INFO_OFFLINE_FALLBACK,
+  isBootFallbackInfo,
   withBootTimeout,
 } from "./bootCapabilities";
 
@@ -28,6 +29,8 @@ describe("createBootServerInfo", () => {
 
     await vi.advanceTimersByTimeAsync(1500);
     expect(initialResult).toHaveBeenCalledWith(SERVER_INFO_OFFLINE_FALLBACK);
+    // The stand-in is not the deployment's answer, so curation stays pending.
+    expect(isBootFallbackInfo(initialResult.mock.calls[0][0])).toBe(true);
 
     const branded = {
       ...SERVER_INFO_OFFLINE_FALLBACK,
@@ -41,6 +44,19 @@ describe("createBootServerInfo", () => {
     probe.resolve(branded);
 
     await expect(boot.settled).resolves.toEqual(branded);
+    expect(isBootFallbackInfo(await boot.settled)).toBe(false);
+  });
+});
+
+describe("isBootFallbackInfo", () => {
+  it.each([
+    ["a stalled probe's offline stand-in as the fallback", SERVER_INFO_OFFLINE_FALLBACK, true],
+    // A probe that failed outright is final: its unrestricted picker applies.
+    ["a failed probe as an answer", FALLBACK_SERVER_INFO, false],
+    // An older server reports no picker; its response is still an answer.
+    ["an older server's response as an answer", { ...SERVER_INFO_OFFLINE_FALLBACK }, false],
+  ])("reports %s", (_case, info, fallback) => {
+    expect(isBootFallbackInfo(info)).toBe(fallback);
   });
 });
 

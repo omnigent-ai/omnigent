@@ -46,6 +46,9 @@ omnigent/_build_info.py
 .claude/*
 !.claude/skills/
 
+# Exception: track .oss-scanner/ (OSS Scanner config) despite the .*/ rule above.
+!.oss-scanner/
+
 # Local helper scripts
 run-ap-chat.sh
 run-omnigents.sh

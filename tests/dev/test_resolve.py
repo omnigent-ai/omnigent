@@ -248,6 +248,7 @@ def test_ticket_only_launch_forwards_the_linear_key_to_the_runner(
     )
     monkeypatch.setenv("LINEAR_API_KEY", "lin-key")
     monkeypatch.delenv("DATABRICKS_LINEAR_API_KEY", raising=False)
+    monkeypatch.delenv("DATABRICKS_REPRO_LINEAR_TOKEN", raising=False)
     monkeypatch.delenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", raising=False)
 
     with pytest.raises(SystemExit):

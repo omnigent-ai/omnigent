@@ -66,6 +66,9 @@ instance runs old code: stop it and start a new one.
 
 1. Open the matching file in [feature map](../../README.md) and list every
    entry point for the behavior in question.
+   For harness work, use the shared [acceptance checklist](../../harness-acceptance.md)
+   to select existing bench/scenario coverage and record gaps per affected
+   harness, transport and surface. A bench API pass does not cover the browser.
 2. For each entry point, run the named test through the instance, recording on:
 
    ```sh
@@ -106,6 +109,13 @@ checks distinct. A map contract pass verifies references and structure; it is
 not evidence that the journeys ran. The proof standards are in the
 [feature map README](../../README.md#proof-and-coverage). Mock runs prove
 Omnigent's integration with Claude and Codex, not a live vendor model.
+
+For PR evidence, follow the [demo standard](../../README.md#pr-demo-standard):
+use a short real-app recording for interactive workflows, screenshots for
+static visuals, and nonvisual results for backend/docs/tests. Caption the
+revision, harness/version, configuration, mock/live provider and observed
+outcome. Upload redacted captures as GitHub attachments in Demo, not repository
+files; state recording/upload limitations and manual steps when unavailable.
 
 ## Cleanup
 

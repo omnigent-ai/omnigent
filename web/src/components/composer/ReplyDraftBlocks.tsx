@@ -2,17 +2,24 @@ import { useRef, type ComponentProps } from "react";
 import { XIcon } from "lucide-react";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import type { ReplyQuote } from "@/lib/replyDraft";
-import { ComposerTextInput } from "./ChatComposer";
+import type { ComposerTextTarget } from "@/components/composer/engine/composerInput";
+import { ComposerEngineInput } from "./ChatComposer";
 
-type TextInputProps = ComponentProps<typeof ComposerTextInput>;
+type TextInputProps = ComponentProps<typeof ComposerEngineInput>;
 
 function ReplyTextInput({ input, keyboard, onGrowth }: TextInputProps & { onGrowth?: () => void }) {
-  const ref = useRef<HTMLTextAreaElement>(null);
+  // The textarea grows by measuring itself; the CodeMirror engine grows on its own.
+  const ref = useRef<ComposerTextTarget | null>(null);
   useAutoGrowTextarea(ref, String(input.value ?? ""), Infinity, onGrowth);
   return (
-    <ComposerTextInput
+    <ComposerEngineInput
       keyboard={keyboard}
-      input={{ ...input, ref, className: "min-h-[20.8px] max-h-none overflow-y-hidden" }}
+      input={{
+        ...input,
+        ref,
+        heightMode: "unbounded",
+        className: "min-h-[20.8px] max-h-none overflow-y-hidden",
+      }}
     />
   );
 }
@@ -25,7 +32,6 @@ export function ReplyDraftBlocks({
   onGrowth,
   disabled,
   activeTextId,
-  showTextInputs = true,
 }: {
   quotes: ReplyQuote[];
   keyboard: TextInputProps["keyboard"];
@@ -34,18 +40,18 @@ export function ReplyDraftBlocks({
   onGrowth?: () => void;
   disabled: boolean;
   activeTextId: string | null;
-  showTextInputs?: boolean;
 }) {
   return (
     <div className="flex flex-col gap-1.5 pb-2" data-testid="composer-reply-blocks">
       {quotes.map((quote, index) => (
         <div key={quote.id} className="flex flex-col gap-1.5">
-          {showTextInputs && (quote.before !== "" || index > 0 || activeTextId === quote.id) && (
+          {(quote.before !== "" || index > 0 || activeTextId === quote.id) && (
             <ReplyTextInput
               keyboard={keyboard}
               onGrowth={onGrowth}
               input={{
                 ...inputFor(quote),
+                inputId: quote.id,
                 value: quote.before,
                 "aria-label": `Reply text before quote ${index + 1}`,
                 disabled,

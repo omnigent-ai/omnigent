@@ -96,6 +96,7 @@ def test_main_runs_the_agent_in_a_feat_worktree(
     monkeypatch.setattr("builtins.input", lambda prompt: "y")
     monkeypatch.setenv("LINEAR_API_KEY", "lin-key")
     monkeypatch.delenv("DATABRICKS_LINEAR_API_KEY", raising=False)
+    monkeypatch.delenv("DATABRICKS_REPRO_LINEAR_TOKEN", raising=False)
     monkeypatch.delenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", raising=False)
 
     with pytest.raises(SystemExit) as exit_info:

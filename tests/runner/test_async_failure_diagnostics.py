@@ -13,27 +13,40 @@ from omnigent.runner import _entry
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cancelled", [False, True])
+@pytest.mark.parametrize("partial", [False, True])
 async def test_callback_failure_identifies_callable_without_its_arguments(
-    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    cancelled: bool,
+    partial: bool,
 ) -> None:
     loop = asyncio.get_running_loop()
     future = loop.create_future()
-    future.cancel()
-    handle = asyncio.Handle(
-        functools.partial(future.set_result, "private-callback-value"), (), loop
-    )
+    if cancelled:
+        future.cancel()
+    else:
+        future.set_result("private-existing-result")
+    callback = future.set_result
+    callback_args = ("private-callback-value",)
+    if partial:
+        callback = functools.partial(callback, *callback_args)
+        callback_args = ()
     monkeypatch.setattr(_entry, "runner_primary_session_id", lambda: "session-example")
+    handled = asyncio.Event()
+    previous_handler = loop.get_exception_handler()
 
-    with caplog.at_level(logging.ERROR, logger=_entry.__name__):
-        _entry._handle_loop_exception(
-            loop,
-            {
-                "message": "Exception in callback with private-context-value",
-                "exception": asyncio.InvalidStateError("invalid state"),
-                "handle": handle,
-                "future": future,
-            },
-        )
+    def handle_error(loop, context):
+        _entry._handle_loop_exception(loop, context)
+        handled.set()
+
+    loop.set_exception_handler(handle_error)
+    try:
+        with caplog.at_level(logging.ERROR, logger=_entry.__name__):
+            loop.call_soon(callback, *callback_args)
+            await asyncio.wait_for(handled.wait(), timeout=1)
+    finally:
+        loop.set_exception_handler(previous_handler)
 
     row = record_to_row(caplog.records[-1], source="runner")
     assert row["session_id"] == "session-example"
@@ -42,9 +55,34 @@ async def test_callback_failure_identifies_callable_without_its_arguments(
     assert row["attributes"]["context_kind"] == "callback"
     assert row["attributes"]["exception_type"] == "InvalidStateError"
     assert row["attributes"]["future_done"] == "True"
-    assert row["attributes"]["future_cancelled"] == "True"
+    assert row["attributes"]["future_cancelled"] == str(cancelled)
     assert "private-callback-value" not in json.dumps(row)
-    assert "private-context-value" not in json.dumps(row)
+    assert "private-existing-result" not in json.dumps(row)
+
+
+@pytest.mark.asyncio
+async def test_explicit_context_future_takes_precedence_over_callback_receiver(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    loop = asyncio.get_running_loop()
+    context_future = loop.create_future()
+    callback_future = loop.create_future()
+    callback_future.cancel()
+    handle = asyncio.Handle(callback_future.set_result, ("private-callback-value",), loop)
+
+    with caplog.at_level(logging.ERROR, logger=_entry.__name__):
+        _entry._handle_loop_exception(
+            loop,
+            {
+                "exception": asyncio.InvalidStateError("invalid state"),
+                "handle": handle,
+                "future": context_future,
+            },
+        )
+
+    row = record_to_row(caplog.records[-1], source="runner")
+    assert row["attributes"]["future_done"] == "False"
+    assert row["attributes"]["future_cancelled"] == "False"
 
 
 @pytest.mark.asyncio

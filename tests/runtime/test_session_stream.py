@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import threading
 from collections.abc import Iterator
 from typing import Any, Literal
 
@@ -137,8 +138,7 @@ async def test_publish_drops_closed_loop_without_disturbing_healthy_subscriber()
     """A closed subscriber loop is removed while healthy peers still receive events."""
     conversation_id = "conv_closed_loop"
     stale_loop = asyncio.new_event_loop()
-    stale_queue: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()
-    stale_subscriber = (stale_queue, stale_loop)
+    stale_subscriber = session_stream._Subscriber(stale_loop)
     stale_loop.close()
     session_stream._subscribers.setdefault(conversation_id, set()).add(stale_subscriber)
 
@@ -155,8 +155,7 @@ async def test_close_drops_closed_loop_and_terminates_healthy_subscriber() -> No
     """Closing ignores a stale loop and still terminates healthy subscribers."""
     conversation_id = "conv_close_closed_loop"
     stale_loop = asyncio.new_event_loop()
-    stale_queue: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()
-    stale_subscriber = (stale_queue, stale_loop)
+    stale_subscriber = session_stream._Subscriber(stale_loop)
     stale_loop.close()
     session_stream._subscribers.setdefault(conversation_id, set()).add(stale_subscriber)
 
@@ -173,13 +172,12 @@ def test_schedule_delivery_does_not_count_already_removed_subscriber() -> None:
     """A slot removed after a publisher snapshot is no longer deliverable."""
     conversation_id = "conv_removed_before_schedule"
     loop = asyncio.new_event_loop()
-    queue: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()
-    subscriber = (queue, loop)
+    subscriber = session_stream._Subscriber(loop)
     try:
         assert not session_stream._schedule_delivery(
             conversation_id, subscriber, {"type": "event"}
         )
-        assert queue.empty()
+        assert not subscriber.pending
     finally:
         loop.close()
 
@@ -356,8 +354,10 @@ async def test_subscribers_are_isolated_across_workspaces() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("producer_thread", [False, True], ids=["same-loop", "thread"])
 async def test_slow_subscriber_overflow_is_bounded_and_disconnects(
     monkeypatch: pytest.MonkeyPatch,
+    producer_thread: bool,
 ) -> None:
     """
     A subscriber that falls behind is disconnected instead of growing forever.
@@ -375,18 +375,63 @@ async def test_slow_subscriber_overflow_is_bounded_and_disconnects(
     ready = await asyncio.wait_for(gen.__anext__(), timeout=1.0)
     assert ready == {"type": "test.ready"}
 
-    session_stream.publish(conv_id, {"type": "test.event", "i": 1})
-    session_stream.publish(conv_id, {"type": "test.event", "i": 2})
-    session_stream.publish(conv_id, {"type": "test.event", "i": 3})
-    await asyncio.sleep(0)
+    loop = asyncio.get_running_loop()
+    wakeups = 0
+    call_soon_threadsafe = loop.call_soon_threadsafe
 
-    ((queue, _loop),) = session_stream._subscribers[conv_id]
-    assert queue.maxsize == 2
-    assert queue.qsize() == 1, "overflow must replace the stale backlog with one signal"
+    def record_wakeup(*args: Any, **kwargs: Any) -> asyncio.Handle:
+        nonlocal wakeups
+        wakeups += 1
+        return call_soon_threadsafe(*args, **kwargs)
+
+    monkeypatch.setattr(loop, "call_soon_threadsafe", record_wakeup)
+
+    def publish_burst() -> None:
+        for index in range(1000):
+            session_stream.publish(conv_id, {"type": "test.event", "i": index})
+
+    if producer_thread:
+        thread = threading.Thread(target=publish_burst)
+        thread.start()
+        # Keep the consumer loop parked until every producer event has arrived.
+        thread.join(timeout=2.0)
+        assert not thread.is_alive()
+    else:
+        publish_burst()
+
+    (subscriber,) = session_stream._subscribers[conv_id]
+    assert len(subscriber.pending) == 1, "overflow must replace the entire stale backlog"
+    assert subscriber.overflowed
+    assert wakeups == 1, "pending loop callbacks must be bounded along with the mailbox"
 
     with pytest.raises(session_stream.SubscriberOverflowError, match=conv_id):
         await asyncio.wait_for(gen.__anext__(), timeout=1.0)
     assert conv_id not in session_stream._subscribers
+
+
+@pytest.mark.asyncio
+async def test_overflowed_subscriber_does_not_disturb_healthy_peer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(session_stream, "_SUBSCRIBER_QUEUE_MAX_EVENTS", 2)
+    conv_id = "conv_independent_overflow"
+    slow = session_stream.subscribe(conv_id, ready_event={"type": "test.ready"})
+    fast = session_stream.subscribe(conv_id, ready_event={"type": "test.ready"})
+    try:
+        await anext(slow)
+        await anext(fast)
+        for index in range(5):
+            event = {"type": "test.event", "i": index}
+            await asyncio.to_thread(session_stream.publish, conv_id, event)
+            assert await asyncio.wait_for(anext(fast), timeout=1.0) == event
+        with pytest.raises(session_stream.SubscriberOverflowError):
+            await anext(slow)
+        session_stream.close(conv_id)
+        with pytest.raises(StopAsyncIteration):
+            await asyncio.wait_for(anext(fast), timeout=1.0)
+    finally:
+        await slow.aclose()
+        await fast.aclose()
 
 
 # ── Side-channel: pending-elicitations index ─────────────────────────
@@ -552,9 +597,7 @@ async def test_heartbeat_interleaves_with_published_events() -> None:
         # Publish a real event; the next yield must be that event,
         # NOT a heartbeat (the queue.get fires before the timeout).
         session_stream.publish("conv_hb_mix", {"type": "real", "i": 1})
-        # ``call_soon_threadsafe`` enqueues the put; yield once so
-        # the producer side actually runs and the put_nowait lands
-        # on the queue before our wait_for starts.
+        # Let the producer's wakeup reach the subscriber before waiting.
         await asyncio.sleep(0)
         second = await asyncio.wait_for(gen.__anext__(), timeout=1.0)
         assert second == {"type": "real", "i": 1}, (
@@ -818,7 +861,7 @@ async def test_inflight_replay_via_pre_ready_snapshot_does_not_duplicate_window_
         for _ in range(8):
             try:
                 ev = await asyncio.wait_for(gen.__anext__(), timeout=0.3)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 break
             if ev.get("type") == "response.created":
                 created_replays += 1
@@ -1176,6 +1219,106 @@ def test_log_sse_event_noop_when_sink_disabled(monkeypatch: pytest.MonkeyPatch) 
     with _capturing_sse_logger() as records:
         session_stream._log_sse_event("conv_1", {"type": "response.completed"})
     assert records == []
+
+
+@pytest.mark.parametrize("event_type", ["session.usage", "response.completed"])
+def test_usage_reaches_debug_log_rows(monkeypatch: pytest.MonkeyPatch, event_type: str) -> None:
+    from omnigent.debug_logging import current_user_id_scope, record_to_row
+
+    monkeypatch.setattr(session_stream, "sse_logging_enabled", lambda: True)
+    usage = {
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "total_tokens": 135,
+        "cache_read_input_tokens": 10,
+        "cache_creation_input_tokens": 5,
+        "cost_usd": 0.25,
+        "prompt": "private prompt",
+    }
+    if event_type == "session.usage":
+        event = {
+            "type": event_type,
+            "usage_by_model": {
+                "private model name": usage,
+                "second": {
+                    "input_tokens": 50,
+                    "output_tokens": 10,
+                    "total_tokens": 60,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                },
+            },
+            "total_cost_usd": 0.5,
+        }
+    else:
+        event = {
+            "type": event_type,
+            "response": {"id": "response_1", "usage": usage, "output": "private output"},
+        }
+    with current_user_id_scope("owner@example.com"), _capturing_sse_logger() as records:
+        session_stream.publish("automation_session", event)
+        row = record_to_row(records[0], "server")
+
+    assert row["session_id"] == "automation_session"
+    assert row["user_id"] == "owner@example.com"
+    assert row["event_name"] == event_type
+    attrs = row["attributes"]
+    assert attrs["input_tokens"] == ("150" if event_type == "session.usage" else "100")
+    assert attrs["output_tokens"] == ("30" if event_type == "session.usage" else "20")
+    assert attrs["total_tokens"] == ("195" if event_type == "session.usage" else "135")
+    assert attrs["cache_read_input_tokens"] == "10"
+    assert attrs["cache_creation_input_tokens"] == "5"
+    if event_type == "session.usage":
+        assert attrs["usage_kind"] == "cumulative"
+        assert attrs["usage_scope"] == "session_subtree"
+        assert attrs["total_cost_usd"] == "0.5"
+        assert "cost_usd" not in attrs
+    else:
+        assert attrs["usage_kind"] == "delta"
+        assert attrs["usage_scope"] == "response"
+        assert attrs["cost_usd"] == "0.25"
+    assert "private" not in repr(row)
+
+
+@pytest.mark.parametrize(
+    "value", [None, -1, True, "private text", {}, [], float("nan"), float("inf")]
+)
+def test_sse_usage_omits_invalid_numbers(value: object) -> None:
+    usage = {"input_tokens": value, "cost_usd": value}
+    for event in (
+        {"type": "response.completed", "response": {"usage": usage}},
+        {"type": "session.usage", "usage_by_model": {"model": usage}},
+    ):
+        assert session_stream._sse_safe_attributes(event) == {}
+
+
+def test_sse_usage_keeps_missing_counts_unknown_and_ignores_other_events() -> None:
+    assert session_stream._sse_safe_attributes(
+        {"type": "session.usage", "context_tokens": 2000, "total_cost_usd": 0.25}
+    ) == {
+        "context_tokens": 2000,
+        "total_cost_usd": 0.25,
+        "usage_kind": "cumulative",
+        "usage_scope": "session_subtree",
+    }
+    for event_type in ("response.in_progress", "response.failed", "response.output_item.done"):
+        assert (
+            session_stream._sse_safe_attributes(
+                {"type": event_type, "response": {"usage": {"input_tokens": 100}}}
+            )
+            == {}
+        )
+
+
+@pytest.mark.parametrize("partial_bucket", [{"total_cost_usd": 0.5}, {"input_tokens": -1}, None])
+def test_sse_usage_does_not_report_partial_model_totals(partial_bucket: object) -> None:
+    assert session_stream._sse_safe_attributes(
+        {
+            "type": "session.usage",
+            "usage_by_model": {"reported": {"input_tokens": 100}, "unknown": partial_bucket},
+            "total_cost_usd": 1.0,
+        }
+    ) == {"total_cost_usd": 1.0, "usage_kind": "cumulative", "usage_scope": "session_subtree"}
 
 
 @contextlib.contextmanager

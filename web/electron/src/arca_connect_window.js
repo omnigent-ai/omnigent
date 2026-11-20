@@ -1,18 +1,17 @@
 "use strict";
 
 /**
- * The Arca connect console — a SHELL-OWNED modal window that replaces the
- * bare native consent dialog. It shows the exact `arca ssh` command that will
- * run and, after the user confirms, streams the command's live stdout/stderr
- * into an embedded terminal pane, so enrollment is fully transparent.
+ * The Arca connect console: a modal window owned by the shell, used in place of
+ * a native consent dialog. It shows the exact `arca ssh` command that will run
+ * and, after the user confirms, streams its live stdout/stderr into an embedded
+ * terminal pane.
  *
  * Trust model: this window is created by the main process and loads a bundled
- * file:// page with its own narrow preload. The server-served SPA can neither
- * draw over it, forge a click in it, nor reach its IPC channels — so a
- * Confirm click here carries the same authority as the old native dialog
- * (see confirmHostEnrollment for why consent must live outside the server's
- * page). Confirm/cancel messages are accepted only from this window's own
- * webContents.
+ * file:// page with its own narrow preload. The server-served page can neither
+ * draw over it, forge a click in it, nor reach its IPC channels, so a Confirm
+ * click here carries the same authority the native dialog had (see
+ * confirmHostEnrollment for why consent must live outside the server's page).
+ * Confirm/cancel messages are accepted only from this window's own webContents.
  *
  * All Electron surfaces are injected so the flow is unit-testable.
  */
@@ -200,16 +199,11 @@ function createArcaConnectFlow({
             runCommand();
             return;
           }
+          // The user's Connect click covers sign-in, so it starts without its own prompt.
           if (!login && result.authError && !loginAttempted) {
-            phase = "auth-required";
-            connect = null;
-            send("arca-connect:done", {
-              ok: false,
-              authRequired: true,
-              command: loginCommandLine(serverUrl),
-              error:
-                "This instance needs an Omnigent sign-in. Sign in through your browser, then we'll retry the connection.",
-            });
+            loginAttempted = true;
+            log(`arca connect: ${serverUrl} needs sign-in; starting it`);
+            runCommand(true);
             return;
           }
           phase = "done";
@@ -225,11 +219,6 @@ function createArcaConnectFlow({
         win,
         phase: () => phase,
         onConfirm: () => {
-          if (phase === "auth-required") {
-            loginAttempted = true;
-            runCommand(true);
-            return;
-          }
           if (phase !== "asking") return;
           log(`arca connect: user confirmed; running against ${serverUrl}`);
           runCommand();

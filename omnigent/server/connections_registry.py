@@ -29,12 +29,18 @@ class ConnectionProvider:
         to vend this provider's secret to a sandbox. ``None`` when the provider
         has no broker endpoint (connect-only, or on-demand delivery not built
         yet), in which case ``/hosts/{id}/credentials/{name}`` returns ``404``.
+    :param owner_identity_resolver: Same shape as *credential_resolver*, used
+        when the SERVER acts as the user against the provider's API — a
+        managed-sandbox launcher whose ``owner_credential_provider`` is this
+        provider (e.g. Databricks Sandboxes created and driven as their owner).
+        ``None`` when the provider cannot back an owner identity.
     """
 
     name: str
     client_factory: Callable[[Any], Any]
     router_factory: Callable[..., Any]
     credential_resolver: Callable[..., Awaitable[dict[str, Any] | None]] | None = None
+    owner_identity_resolver: Callable[..., Awaitable[dict[str, Any] | None]] | None = None
 
 
 def connection_providers() -> list[ConnectionProvider]:
@@ -43,8 +49,13 @@ def connection_providers() -> list[ConnectionProvider]:
     Imports are deferred so importing this module stays cheap and free of import
     cycles through the route modules.
     """
+    from functools import partial
+
     from omnigent.server.databricks_app_client import DatabricksAppClient
-    from omnigent.server.databricks_identity import resolve_databricks_credential
+    from omnigent.server.databricks_identity import (
+        OWNER_IDENTITY_REFRESH_MARGIN_S,
+        resolve_databricks_credential,
+    )
     from omnigent.server.github_app_client import GitHubAppClient
     from omnigent.server.github_identity import resolve_github_credential
     from omnigent.server.routes.connections_databricks import (
@@ -66,5 +77,39 @@ def connection_providers() -> list[ConnectionProvider]:
             client_factory=DatabricksAppClient,
             router_factory=create_connections_databricks_router,
             credential_resolver=resolve_databricks_credential,
+            owner_identity_resolver=partial(
+                resolve_databricks_credential,
+                refresh_margin_s=OWNER_IDENTITY_REFRESH_MARGIN_S,
+            ),
         ),
     ]
+
+
+def blocking_owner_resolver(
+    resolver: Callable[..., Awaitable[dict[str, Any] | None]],
+    *,
+    store: Any,
+    client: Any,
+) -> Callable[[str], dict[str, Any] | None]:
+    """Adapt an async owner-identity resolver to the blocking ``(user_id) -> payload``
+    shape managed-sandbox launchers call from worker threads.
+
+    Each call runs the resolver on a private event loop in the calling thread
+    (the store read and any token refresh are per-call, so nothing is shared
+    with the server loop). The caller's contextvars — notably the workspace
+    scope — carry into it. Never call this from an event-loop thread.
+
+    :param resolver: The provider's ``owner_identity_resolver``.
+    :param store: The provider's connection store.
+    :param client: The provider's OAuth/API client.
+    :returns: ``resolve(user_id)`` returning the payload or ``None``.
+    """
+    import asyncio
+
+    async def _resolve(user_id: str) -> dict[str, Any] | None:
+        return await resolver(user_id, store=store, client=client)
+
+    def resolve(user_id: str) -> dict[str, Any] | None:
+        return asyncio.run(_resolve(user_id))
+
+    return resolve

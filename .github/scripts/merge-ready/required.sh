@@ -10,6 +10,20 @@ REQUIRED=(
   "DCO"
   "Pre-commit checks"
   "Docker build"
+  "Web scope"
+  "Web coverage scope"
+  "Web result"
+  "Docker scope"
+  "Docker result"
+  "Build unsigned AAB"
+  "CI scope"
+  "CI coverage scope"
+  "CI result"
+  "UI scope"
+  "UI coverage scope"
+  "E2E UI result"
+  "Rust tests (omnidev)"
+  "Pytest (codex-parity)"
   "Pytest (runtime-harnesses)"
   "Pytest (runtime-policies)"
   "Pytest (runtime-core)"
@@ -26,10 +40,20 @@ REQUIRED=(
   "Pytest (stores)"
   "Pytest (misc)"
   "Pytest (databricks)"
+  "E2E Tests (shard 0/2)"
+  "E2E Tests (shard 1/2)"
   "E2E Tests (shard 0/4)"
   "E2E Tests (shard 1/4)"
   "E2E Tests (shard 2/4)"
   "E2E Tests (shard 3/4)"
+  "E2E Tests (shard 0/8)"
+  "E2E Tests (shard 1/8)"
+  "E2E Tests (shard 2/8)"
+  "E2E Tests (shard 3/8)"
+  "E2E Tests (shard 4/8)"
+  "E2E Tests (shard 5/8)"
+  "E2E Tests (shard 6/8)"
+  "E2E Tests (shard 7/8)"
   "E2E UI Tests (shard 0/10)"
   "E2E UI Tests (shard 1/10)"
   "E2E UI Tests (shard 2/10)"
@@ -40,6 +64,8 @@ REQUIRED=(
   "E2E UI Tests (shard 7/10)"
   "E2E UI Tests (shard 8/10)"
   "E2E UI Tests (shard 9/10)"
+  "E2E UI Tests (shard 0/2)"
+  "E2E UI Tests (shard 1/2)"
   "Browser Contract UI"
   "UI Snapshot (visual baselines)"
   "Integration (claude-sdk)"
@@ -49,6 +75,20 @@ REQUIRED=(
 
 ALLOW_SKIP=(
   "Docker build"
+  "Web scope"
+  "Web coverage scope"
+  "Web result"
+  "Docker scope"
+  "Docker result"
+  "Build unsigned AAB"
+  "CI scope"
+  "CI coverage scope"
+  "CI result"
+  "UI scope"
+  "UI coverage scope"
+  "E2E UI result"
+  "Rust tests (omnidev)"
+  "Pytest (codex-parity)"
   "Pytest (runtime-harnesses)"
   "Pytest (runtime-policies)"
   "Pytest (runtime-core)"
@@ -65,10 +105,20 @@ ALLOW_SKIP=(
   "Pytest (stores)"
   "Pytest (misc)"
   "Pytest (databricks)"
+  "E2E Tests (shard 0/2)"
+  "E2E Tests (shard 1/2)"
   "E2E Tests (shard 0/4)"
   "E2E Tests (shard 1/4)"
   "E2E Tests (shard 2/4)"
   "E2E Tests (shard 3/4)"
+  "E2E Tests (shard 0/8)"
+  "E2E Tests (shard 1/8)"
+  "E2E Tests (shard 2/8)"
+  "E2E Tests (shard 3/8)"
+  "E2E Tests (shard 4/8)"
+  "E2E Tests (shard 5/8)"
+  "E2E Tests (shard 6/8)"
+  "E2E Tests (shard 7/8)"
   "E2E UI Tests (shard 0/10)"
   "E2E UI Tests (shard 1/10)"
   "E2E UI Tests (shard 2/10)"
@@ -79,6 +129,8 @@ ALLOW_SKIP=(
   "E2E UI Tests (shard 7/10)"
   "E2E UI Tests (shard 8/10)"
   "E2E UI Tests (shard 9/10)"
+  "E2E UI Tests (shard 0/2)"
+  "E2E UI Tests (shard 1/2)"
   "Browser Contract UI"
   "UI Snapshot (visual baselines)"
   "Integration (claude-sdk)"
@@ -86,7 +138,27 @@ ALLOW_SKIP=(
   "Integration (codex)"
 )
 
-is_allow_skip() { printf '%s\n' "${ALLOW_SKIP[@]}" | grep -qxF "$1"; }
+# No `printf | grep -q`: under pipefail, grep exiting at its match makes printf
+# die of SIGPIPE on a later entry, and the pipeline reads as "not listed".
+is_allow_skip() {
+  local name
+  for name in "${ALLOW_SKIP[@]}"; do
+    [[ "$name" == "$1" ]] && return 0
+  done
+  return 1
+}
+
+# A result check may be absent on older workflows, but must run once its
+# selection job is present. An explicit skipped result is never green.
+scope_for_result() {
+  case "$1" in
+    "Web result") echo "Web scope,Web coverage scope" ;;
+    "Docker result") echo "Docker scope" ;;
+    "CI result") echo "CI scope,CI coverage scope" ;;
+    "E2E UI result") echo "UI scope,UI coverage scope" ;;
+    *) echo "" ;;
+  esac
+}
 
 # Maps an ALLOW_SKIP check to the workflow that produces it, so
 # evaluate-checks.sh can tell a genuine skip (a CI Pytest shard path-skip, or a
@@ -94,7 +166,11 @@ is_allow_skip() { printf '%s\n' "${ALLOW_SKIP[@]}" | grep -qxF "$1"; }
 # workflow is still queued or re-running.
 workflow_for() {
   case "$1" in
-    "Docker build")          echo "Docker build" ;;
+    "Web scope"|"Web coverage scope"|"Web result") echo "web Tests" ;;
+    "Build unsigned AAB") echo "Android Bundle" ;;
+    "Docker scope"|"Docker result"|"Docker build")          echo "Docker build" ;;
+    "CI scope"|"CI coverage scope"|"CI result"|"Rust tests (omnidev)") echo "CI" ;;
+    "UI scope"|"UI coverage scope"|"E2E UI result") echo "E2E UI Tests" ;;
     "Pytest ("*)             echo "CI" ;;
     "E2E Tests (shard "*)    echo "E2E Tests" ;;
     "E2E UI Tests (shard "*) echo "E2E UI Tests" ;;

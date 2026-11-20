@@ -94,15 +94,16 @@ async def test_launches_runner_on_live_host_then_connects(
     monkeypatch.setattr(orchestration, "_launch_runner_on_host", _launch)
     # Pinned runner_old is truly gone: the connect grace yields nothing, so
     # the helper relaunches rather than reusing it.
-    monkeypatch.setattr(orchestration, "_wait_for_host_bound_runner_client", _async_return(None))
     connected = object()
     waited: dict[str, Any] = {}
 
     async def _wait(*_a: Any, runner_id: str | None = None, **_k: Any) -> Any:
+        if runner_id == "runner_old":
+            return None
         waited["runner_id"] = runner_id
         return connected
 
-    monkeypatch.setattr(orchestration, "_wait_for_runner_client", _wait)
+    monkeypatch.setattr(orchestration, "_wait_for_host_bound_runner_client", _wait)
 
     conv = _conv(host_id="host_1", runner_id="runner_old", workspace="/w")
     host_registry = SimpleNamespace(get=lambda _hid: object())

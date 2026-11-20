@@ -26,7 +26,7 @@ class DatabricksLoginManagerTest {
     private val configuration =
         DatabricksOAuthConfiguration(
             "public-client",
-            URI("https://login.databricks.com/mobile-redirect"),
+            URI("ai.omnigent.android://mobile-redirect"),
         )
 
     @Test
@@ -66,13 +66,10 @@ class DatabricksLoginManagerTest {
         val browserIntent = launcher.launched!!
         assertEquals("/oidc/v1/authorize", browserIntent.data!!.path)
         assertEquals(
-            configuration.redirectUri.host,
-            browserIntent.getStringExtra(AuthTabIntent.EXTRA_HTTPS_REDIRECT_HOST),
+            configuration.redirectUri.scheme,
+            browserIntent.getStringExtra(AuthTabIntent.EXTRA_REDIRECT_SCHEME),
         )
-        assertEquals(
-            configuration.redirectUri.path,
-            browserIntent.getStringExtra(AuthTabIntent.EXTRA_HTTPS_REDIRECT_PATH),
-        )
+        assertNull(browserIntent.getStringExtra(AuthTabIntent.EXTRA_HTTPS_REDIRECT_HOST))
         val saved = firstPending.load()!!
 
         val issuer =
@@ -119,22 +116,49 @@ class DatabricksLoginManagerTest {
     }
 
     @Test
-    fun `HTTPS and private redirects share the exact compatibility receiver`() {
-        listOf(
-            configuration.redirectUri.toString(),
-            "ai.omnigent.android://mobile-redirect",
-        ).forEach { callback ->
-            val intent =
-                Intent(Intent.ACTION_VIEW, Uri.parse(callback))
-                    .addCategory(Intent.CATEGORY_BROWSABLE)
-            val receivers = context.packageManager.queryIntentActivities(intent, 0)
-
-            assertTrue(
-                receivers.any {
-                    it.activityInfo.name == OAuthCallbackActivity::class.java.name
-                },
+    fun `an HTTPS override still launches a verified HTTPS Auth Tab`() {
+        val httpsConfiguration =
+            configuration.copy(redirectUri = URI("https://login.databricks.com/mobile-redirect"))
+        val manager =
+            DatabricksLoginManager(
+                context,
+                httpsConfiguration,
+                DatabricksPendingAuthStore(
+                    context,
+                    EncryptedRecordStore(
+                        context,
+                        "https-${UUID.randomUUID()}",
+                        PlainRecordCipher(),
+                    ),
+                ),
+                DatabricksOAuthClient(RecordingTransport()),
+                DatabricksTokenManager(MemoryCredentialStore()),
             )
-        }
+        val launcher = RecordingLauncher()
+
+        assertTrue(manager.start(launcher, URI("https://dbc-123.cloud.databricks.com")))
+        assertEquals(
+            httpsConfiguration.redirectUri.host,
+            launcher.launched!!.getStringExtra(AuthTabIntent.EXTRA_HTTPS_REDIRECT_HOST),
+        )
+        assertEquals(
+            httpsConfiguration.redirectUri.path,
+            launcher.launched!!.getStringExtra(AuthTabIntent.EXTRA_HTTPS_REDIRECT_PATH),
+        )
+    }
+
+    @Test
+    fun `the private redirect reaches the compatibility receiver`() {
+        val intent =
+            Intent(Intent.ACTION_VIEW, Uri.parse(configuration.redirectUri.toString()))
+                .addCategory(Intent.CATEGORY_BROWSABLE)
+        val receivers = context.packageManager.queryIntentActivities(intent, 0)
+
+        assertTrue(
+            receivers.any {
+                it.activityInfo.name == OAuthCallbackActivity::class.java.name
+            },
+        )
     }
 
     @Test

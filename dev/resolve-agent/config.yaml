@@ -60,6 +60,7 @@ executor:
   reasoning_effort: xhigh
   config:
     harness: claude-sdk
+    system_prompt_preset: claude_code
     permission_mode: bypassPermissions
 
 # AGENTS.md routes phases to bundled skills; detailed procedures load on demand.

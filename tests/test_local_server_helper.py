@@ -3,6 +3,7 @@
 import os
 import subprocess
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -48,8 +49,30 @@ def test_startup_exit_reports_log_and_reaps_child(tmp_path: Path, monkeypatch: p
     assert len(children) == 1 and children[0].returncode == 23
 
 
-@pytest.mark.parametrize("inherit_env", [True, False])
-@pytest.mark.parametrize("failing_process", ["server", "runner"])
+def test_host_identity_overrides_are_rejected_before_spawn(monkeypatch: pytest.MonkeyPatch):
+    from tests._helpers.server_runner import ServerRunner
+
+    stack = ServerRunner.__new__(ServerRunner)
+    stack.host = None
+    spawn = Mock(side_effect=AssertionError("Host identity overrides must not spawn"))
+    monkeypatch.setattr(stack, "_spawn", spawn)
+    for key in ("OMNIGENT_HOST_ID", "OMNIGENT_HOST_NAME"):
+        for value in ("invalid", None):
+            with pytest.raises(ValueError, match="Host identity is owned"):
+                stack.start_host(env={key: value})
+            assert stack.host is None
+    spawn.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("failing_process", "inherit_env"),
+    [
+        ("server", True),
+        ("runner", True),
+        ("server", False),
+        ("runner", False),
+    ],
+)
 def test_stack_startup_failure_closes_started_processes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failing_process: str, inherit_env: bool
 ):
@@ -119,6 +142,10 @@ def test_host_failed_readiness_reaps_child_and_retains_isolated_diagnostics(
                 pytest.fail("owned environment must be rejected before starting a host")
         assert not (tmp_path / "home").exists()
 
+    with pytest.raises(ValueError, match="host identity"):
+        with isolated_host(tmp_path, "http://127.0.0.1:1", config={"host": {}}):
+            pytest.fail("caller must not override the host identity")
+
     handles = []
 
     def ready(host):
@@ -127,11 +154,14 @@ def test_host_failed_readiness_reaps_child_and_retains_isolated_diagnostics(
             host.wait_online(client, timeout=2, poll_interval=0.02)
 
     bootstrap = """
-import os, pathlib, time
+import os, pathlib, time, yaml
 assert 'REMOVE_TEST_SETTING' not in os.environ
 assert os.environ['EXPLICIT_TEST_SETTING'] == 'kept'
 assert pathlib.Path(os.environ['HOME']).is_relative_to(pathlib.Path.cwd())
-assert pathlib.Path(os.environ['OMNIGENT_CONFIG_HOME'], 'config.yaml').exists()
+config_path = pathlib.Path(os.environ['OMNIGENT_CONFIG_HOME'], 'config.yaml')
+config = yaml.safe_load(config_path.read_text())
+assert config['host']['host_id'] == os.environ['OMNIGENT_HOST_ID']
+assert config['auto_open_conversation'] is False
 print('isolated-host-startup-marker', flush=True)
 with open(os.environ['OMNIGENT_PROCESS_LOG_FILE'], 'a') as log:
     print('secondary-writer-marker', file=log)
@@ -146,6 +176,7 @@ print('stdout-after-logger-marker', flush=True)
             command=[sys.executable, "-c", bootstrap],
             cwd=tmp_path,
             ready=ready,
+            config={"auto_open_conversation": False},
         ):
             pytest.fail("an unready host must not be yielded")
     assert len(handles) == 1

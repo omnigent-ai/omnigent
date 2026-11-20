@@ -42,6 +42,7 @@ from omnigent_slack.events import (
     session_status,
 )
 from omnigent_slack.resume import SESSION_UNAVAILABLE_TEXT, ResumeError
+from omnigent_slack.user_agent import USER_AGENT_HEADERS
 
 __all__ = [
     "AuthRequiredError",
@@ -278,6 +279,7 @@ class OmnigentClient:
         timeout: float = 30.0,
         runner_launch_timeout_seconds: float = 60.0,
         auth: ClientAuth | None = None,
+        require_auth: bool = False,
     ) -> None:
         # Bounded read timeout for ordinary requests so a stalled server can't
         # hang a call indefinitely and wedge the per-thread turn queue. The
@@ -288,9 +290,11 @@ class OmnigentClient:
         self._client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
             timeout=httpx.Timeout(timeout),
+            headers=USER_AGENT_HEADERS,
         )
         self._runner_launch_timeout_seconds = runner_launch_timeout_seconds
         self._auth = auth
+        self._require_auth = require_auth
         self._logger = logging.getLogger(__name__)
 
     async def aclose(self) -> None:
@@ -299,6 +303,8 @@ class OmnigentClient:
     def _auth_headers(self) -> dict[str, str]:
         if self._auth is not None and self._auth.access_token:
             return {"Authorization": f"Bearer {self._auth.access_token}"}
+        if self._require_auth:
+            raise AuthRequiredError("Sign in before accessing Omnigent from Slack.")
         return {}
 
     @staticmethod
@@ -1220,9 +1226,9 @@ class OmnigentClientPool:
     their own delegated token, so clients are keyed per user (the server_url
     is part of the key mainly so cached clients are dropped cleanly if the
     operator repoints the bot). An optional ``auth_resolver`` supplies each
-    user's bearer token; when it is absent (or returns ``None``) the client
-    is unauthenticated — used by the setup/login probes before a token
-    exists.
+    user's bearer token. Pooled clients require that token before sending
+    requests, including against a server that accepts anonymous callers.
+    Login discovery uses its own unauthenticated client.
     """
 
     def __init__(
@@ -1257,7 +1263,9 @@ class OmnigentClientPool:
         async with self._lock:
             client = self._clients.get(key)
             if client is None:
-                client = OmnigentClient(key[0], timeout=self._timeout, auth=auth)
+                client = OmnigentClient(
+                    key[0], timeout=self._timeout, auth=auth, require_auth=True
+                )
                 self._clients[key] = client
             return client
 
