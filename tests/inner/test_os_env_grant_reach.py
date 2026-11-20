@@ -576,6 +576,12 @@ def test_resolve_sandbox_none_populates_grants_relative_to_cwd(tmp_path: Path) -
     assert policy.write_files == [(cwd / ".." / "sibling" / "f.json").resolve()]
 
 
+def test_resolve_sandbox_none_carries_env_template(tmp_path: Path) -> None:
+    template = {"EDATA_OUTPUT_DIR": "${OMNIGENT_SESSION_WORKSPACE}/data"}
+    spec = OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none", env_template=template))
+    assert resolve_sandbox(spec, tmp_path).env_template == template
+
+
 def test_relative_grant_resolves_against_cwd_outside_runner_workspace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

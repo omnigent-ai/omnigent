@@ -1139,6 +1139,44 @@ tools:
 
 For client-provided tools, use `runtime: client` and do not set `callable`.
 
+### Launch-time environment templates
+
+`os_env.sandbox.env_template` defines variables whose values the runner derives
+at each launch, for example a per-session output directory:
+
+```yaml
+os_env:
+  type: caller_process
+  sandbox:
+    env_template:
+      EDATA_OUTPUT_DIR: "${OMNIGENT_SESSION_WORKSPACE}/data"
+      CACHE_DIR: "${HOME}/.cache/edata"
+```
+
+Values are substituted once, when the agent CLI, the native Claude terminal, a
+sandboxed terminal, or the `sys_os_*` helper starts, and reach that process
+without an `env_passthrough` entry. They are not live bindings. References use `${NAME}`
+or `$NAME`; write `$$` for a literal dollar sign. Unlike connection settings,
+these references are not expanded on the client.
+
+A reference resolves only when it is:
+
+- `OMNIGENT_SESSION_WORKSPACE`: the session's workspace (its git worktree or
+  the repository root), falling back to the runner workspace.
+- `OMNIGENT_RUNNER_WORKSPACE`: the directory the runner was launched from.
+- A variable that process could already see: its default allowlist plus
+  `env_passthrough` (agent CLIs also honor `OMNIGENT_RUNNER_ENV_PASSTHROUGH`).
+  Sandboxed terminals use the sandbox's allowlist. Runner auth secrets never
+  resolve.
+
+A template therefore cannot reveal a variable hidden from the sandbox. If any
+reference is unset, empty, or not visible, the runner logs a warning naming the
+variable and omits it, rather than writing a blank or partial value.
+
+Template names must be POSIX environment variable names and cannot be `PATH`,
+`HOME`, or start with `OMNIGENT_` or `HARNESS_`. Omnigent does not create the
+directories that template values name.
+
 ### Linux desktop keyrings
 
 The host and runner inherit `DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR`

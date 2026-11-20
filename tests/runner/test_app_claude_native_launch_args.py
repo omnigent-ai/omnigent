@@ -1518,6 +1518,49 @@ async def test_auto_create_claude_terminal_logs_stage_timings(
     ) - len(stages)
 
 
+@pytest.mark.parametrize("sandbox_type", ["none", "linux_bwrap"])
+async def test_auto_create_claude_terminal_env_template(
+    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch, sandbox_type: str
+) -> None:
+    """Unsandboxed panes get templates below Omnigent's env; sandboxed panes resolve their own."""
+    from unittest.mock import Mock
+
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.runner.native import orchestration
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+
+    agent_os_env = OSEnvSpec(
+        sandbox=OSEnvSandboxSpec(
+            type=sandbox_type,
+            env_template={
+                "EDATA_OUTPUT_DIR": "${OMNIGENT_SESSION_WORKSPACE}/data",
+                "ENABLE_TOOL_SEARCH": "false",
+            },
+        )
+    )
+    monkeypatch.setattr(orchestration, "_agent_os_env_from_spec", lambda _spec: agent_os_env)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted",
+        lambda *_args, **_kwargs: None,
+    )
+    registry = Mock(spec=SessionResourceRegistry)
+    registry.client_surface_env.return_value = {}
+    registry.launch_required_terminal.side_effect = RuntimeError("stop at launch")
+
+    with pytest.raises(RuntimeError, match="stop at launch"):
+        await _auto_create_claude_terminal_for_test(
+            monkeypatch, session_id="conv_env_template", workspace=bridge_dir, registry=registry
+        )
+
+    env = registry.launch_required_terminal.await_args.kwargs["spec"].env
+    assert env["ENABLE_TOOL_SEARCH"] == "true"
+    if sandbox_type == "none":
+        assert env["EDATA_OUTPUT_DIR"] == f"{Path(bridge_dir).resolve()}/data"
+    else:
+        # The sandboxed pane resolves it with the sandbox's own filter.
+        assert "EDATA_OUTPUT_DIR" not in env
+
+
 @pytest.mark.parametrize(
     "subagent_started,turn_started",
     [(True, True), (True, False), (False, True), (False, False)],

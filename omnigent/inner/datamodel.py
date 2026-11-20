@@ -769,6 +769,9 @@ class OSEnvSandboxSpec:
     # secrets the agent legitimately needs, e.g.
     # ``env_passthrough: ["AWS_PROFILE", "GITHUB_TOKEN"]``.
     env_passthrough: list[str] | None = None
+    # Variables derived once per launch, e.g. ``EDATA_OUTPUT_DIR``; see
+    # :mod:`omnigent.inner.env_template` for resolution rules.
+    env_template: dict[str, str] | None = None
     # L7 egress policy rules. When non-empty, a MITM proxy is started
     # and all HTTP(S) traffic from the helper is routed through it.
     # Each rule is a string in the DSL: ``"METHODS host/path/glob"``

@@ -4736,3 +4736,46 @@ def test_parse_executor_reasoning_effort_absent(tmp_path: Path) -> None:
     spec = parse(tmp_path)
 
     assert spec.executor.reasoning_effort is None
+
+
+# ---------------------------------------------------------------------------
+# os_env.sandbox.env_template
+# ---------------------------------------------------------------------------
+
+
+def _write_env_template_config(tmp_path: Path, env_template: object) -> None:
+    config = {
+        "spec_version": 1,
+        "name": "env-template",
+        "os_env": {
+            "type": "caller_process",
+            "sandbox": {"type": "linux_bwrap", "env_template": env_template},
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+
+def test_parse_os_env_sandbox_env_template_kept_literal(tmp_path: Path) -> None:
+    """Templates are stored unexpanded; the runner resolves them at launch."""
+    template = {"EDATA_OUTPUT_DIR": "${OMNIGENT_SESSION_WORKSPACE}/data"}
+    _write_env_template_config(tmp_path, template)
+
+    spec = parse(tmp_path)
+
+    assert spec.os_env is not None and spec.os_env.sandbox is not None
+    assert spec.os_env.sandbox.env_template == template
+
+
+@pytest.mark.parametrize(
+    "env_template",
+    [["EDATA_OUTPUT_DIR"], {"1BAD": "x"}, {"A": 1}, {"A": "${UNCLOSED"}, {"PATH": "/bin"}],
+)
+def test_parse_os_env_sandbox_env_template_rejects_invalid(
+    tmp_path: Path, env_template: object
+) -> None:
+    _write_env_template_config(tmp_path, env_template)
+
+    with pytest.raises(OmnigentError) as exc_info:
+        parse(tmp_path)
+
+    assert exc_info.value.code == ErrorCode.INVALID_INPUT

@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 from unittest.mock import patch
 
+import pytest
+
 from omnigent.inner.sandbox import SandboxPolicy
 from omnigent.inner.terminal import terminal_pane_environment
 
@@ -71,3 +73,22 @@ def test_inherit_env_false_ignores_parent_even_in_sandbox() -> None:
             sandbox_policy=_sandbox(env_passthrough=["CUSTOM_ALLOWED"]),
         )
     assert "CUSTOM_ALLOWED" not in env
+
+
+def test_sandboxed_pane_resolves_env_template_against_its_launch_directory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", "/repo")
+    monkeypatch.delenv("OMNIGENT_SESSION_WORKSPACE", raising=False)
+    policy = _sandbox()
+    policy.env_template = {"EDATA_OUTPUT_DIR": "${OMNIGENT_SESSION_WORKSPACE}/data"}
+
+    env = terminal_pane_environment(
+        inherit_env=True,
+        env={},
+        env_unset=[],
+        sandbox_policy=policy,
+        session_workspace="/repo-worktrees/x",
+    )
+
+    assert env["EDATA_OUTPUT_DIR"] == "/repo-worktrees/x/data"

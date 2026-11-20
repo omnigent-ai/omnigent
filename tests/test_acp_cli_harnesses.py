@@ -206,6 +206,30 @@ def test_runner_dispatch_routes_catalog_rows(monkeypatch: pytest.MonkeyPatch) ->
     assert shlex.split(env["HARNESS_ACP_COMMAND"])[-2:] == ["agent", "stdio"]
 
 
+def test_runner_dispatch_resolves_env_template(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Resolved templates reach the harness child without an ``env_passthrough`` entry."""
+    from omnigent.runner.app import _build_spawn_env_from_spec
+
+    monkeypatch.setitem(ACP_CLI_HARNESSES, "fakecli", _FAKE_ROW)
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path))
+    os_env = OSEnvSpec(
+        sandbox=OSEnvSandboxSpec(
+            type="none",
+            env_template={"EDATA_OUTPUT_DIR": "${OMNIGENT_SESSION_WORKSPACE}/data"},
+        )
+    )
+    session_workspace = tmp_path / "worktree"
+
+    env = _build_spawn_env_from_spec(_spec("fakecli", os_env), "fakecli", cwd=session_workspace)
+
+    assert env is not None
+    assert env["EDATA_OUTPUT_DIR"] == f"{session_workspace}/data"
+    assert env["OMNIGENT_SESSION_WORKSPACE"] == str(session_workspace)
+    assert env["OMNIGENT_ENV_TEMPLATE_NAMES"] == "EDATA_OUTPUT_DIR"
+
+
 def test_fake_row_login_command() -> None:
     assert _FAKE_ROW.login_command == "fakecli login --device"
     assert _FAKE_ROW.label == "Fake CLI"

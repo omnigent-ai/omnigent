@@ -395,6 +395,8 @@ class SandboxPolicy:
         environment cannot leak it into the sandbox.
         ``None`` (the default) skips the prune for spawn sites that
         haven't opted in.
+    :param env_template: ``os_env.sandbox.env_template``, resolved by
+        :func:`omnigent.inner.os_env.build_helper_env`.
     :param bind_host_proc: Launcher-local bwrap choice. ``None`` means the
         process constructing the final launcher has not resolved it yet.
     :param egress_relay_port: TCP port the in-namespace relay listens
@@ -455,6 +457,7 @@ class SandboxPolicy:
     mask_paths: list[Path] | None = None
     env_passthrough: list[str] | None = None
     spawn_env_allowlist: list[str] | None = None
+    env_template: dict[str, str] | None = None
     bind_host_proc: bool | None = None
     egress_relay_port: int | None = None
     egress_socket_path: str | None = None
@@ -510,6 +513,11 @@ class SandboxPolicy:
             "spawn_env_allowlist": (
                 _json_string_list(self.spawn_env_allowlist)
                 if self.spawn_env_allowlist is not None
+                else None
+            ),
+            "env_template": (
+                cast(dict[str, JsonValue], dict(self.env_template))
+                if self.env_template is not None
                 else None
             ),
             "bind_host_proc": self.bind_host_proc,
@@ -572,6 +580,12 @@ class SandboxPolicy:
         spawn_env_allowlist: list[str] | None = None
         if isinstance(spawn_env_allowlist_data, list):
             spawn_env_allowlist = [str(name) for name in spawn_env_allowlist_data]
+        env_template_data = data.get("env_template")
+        env_template = (
+            {str(name): str(value) for name, value in env_template_data.items()}
+            if isinstance(env_template_data, dict)
+            else None
+        )
         egress_relay_port_raw = data.get("egress_relay_port")
         egress_relay_port: int | None = (
             int(egress_relay_port_raw) if isinstance(egress_relay_port_raw, (int, float)) else None
@@ -628,6 +642,7 @@ class SandboxPolicy:
             mask_paths=mask_paths,
             env_passthrough=env_passthrough,
             spawn_env_allowlist=spawn_env_allowlist,
+            env_template=env_template,
             bind_host_proc=bind_host_proc,
             egress_relay_port=egress_relay_port,
             egress_socket_path=egress_socket_path,
@@ -845,6 +860,7 @@ def _contained_relative_grant(cwd: Path, root: str, expanded: str) -> str:
 
 def resolve_sandbox(spec: OSEnvSpec, cwd: Path) -> SandboxPolicy:
     sandbox_spec = spec.sandbox or _default_sandbox_for_platform()
+    env_template = dict(sandbox_spec.env_template) if sandbox_spec.env_template else None
     if sandbox_spec.git_ssh:
         if sandbox_spec.type not in ("linux_bwrap", "darwin_seatbelt"):
             raise ValueError("git_ssh requires linux_bwrap or darwin_seatbelt")
@@ -899,8 +915,11 @@ def resolve_sandbox(spec: OSEnvSpec, cwd: Path) -> SandboxPolicy:
             write_roots=write_roots,
             write_files=write_files,
             allow_network=True,
+            env_template=env_template,
         )
     policy = _get_backend(sandbox_spec.type).resolve(spec, cwd)
+    if env_template is not None:
+        policy = replace(policy, env_template=env_template)
     if policy.tcp_egress:
         policy = replace(policy, allow_network=False)
     if policy.credential_proxy is not None:
@@ -1241,6 +1260,7 @@ def _clone_policy_with(
         spawn_env_allowlist=(
             list(policy.spawn_env_allowlist) if policy.spawn_env_allowlist is not None else None
         ),
+        env_template=dict(policy.env_template) if policy.env_template is not None else None,
         bind_host_proc=policy.bind_host_proc,
         egress_relay_port=policy.egress_relay_port,
         egress_socket_path=policy.egress_socket_path,

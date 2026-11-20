@@ -10065,10 +10065,19 @@ def _build_spawn_env_from_spec(
         return None
 
     if env is not None:
-        from omnigent.inner.agent_env import desktop_session_passthrough, strip_desktop_session_env
+        from omnigent.inner.agent_env import (
+            desktop_session_passthrough,
+            resolve_agent_env_template,
+            strip_desktop_session_env,
+        )
 
         env = strip_desktop_session_env(env)
         env.update(desktop_session_passthrough(effective_spec.os_env))
+        env.update(
+            resolve_agent_env_template(
+                effective_spec.os_env, session_workspace=cwd, for_harness_child=True
+            )
+        )
         if resource_registry is not None and session_id is not None:
             env.update(resource_registry.client_surface_env(session_id))
 

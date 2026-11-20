@@ -29,13 +29,14 @@ from urllib.parse import urlparse, urlunparse
 from omnigent._platform import IS_WINDOWS, WINDOWS_ENV_PASSTHROUGH
 from omnigent.runner.identity import (
     OMNIGENT_SESSION_ENV_VAR,
-    strip_runner_auth_secrets,
+    RUNNER_AUTH_SECRET_ENV_VARS,
+    RUNNER_WORKSPACE_ENV_VAR,
 )
 from omnigent.sandbox.copy_on_write import SHARED_ENVIRONMENT_VAR, CopyOnWriteEnvironment
 from omnigent.util.json_types import JsonValue
 
 from ._proc import run_isolated
-from .agent_env import strip_desktop_session_env
+from .agent_env import DESKTOP_SESSION_ENV_VARS
 from .async_utils import run_sync_on_thread
 from .credential_proxy import (
     CredentialProxyRuntime,
@@ -44,6 +45,11 @@ from .credential_proxy import (
     prepare_credential_proxy_runtime,
 )
 from .datamodel import CredentialProxySpec, OSEnvSpec
+from .env_template import (
+    SESSION_WORKSPACE_TEMPLATE_VAR,
+    resolve_env_template,
+    workspace_template_context,
+)
 from .git_ssh import GitSshBroker, apply_git_ssh_env, start_git_ssh_broker
 from .sandbox import (
     HOST_SANDBOX_BACKEND_ENV,
@@ -192,6 +198,8 @@ _DEFAULT_READ_LIMIT = 2_000
 def build_helper_env(
     parent_env: Mapping[str, str],
     sandbox: SandboxPolicy,
+    *,
+    session_workspace: str | Path | None = None,
 ) -> dict[str, str]:
     """
     Build the environment dict for the OS-env helper subprocess.
@@ -240,30 +248,44 @@ def build_helper_env(
         ``env=`` argument. Callers typically follow up with
         ``set_sandbox_env`` and an explicit ``PYTHONPATH`` write so those
         values take precedence over anything the parent might have set.
+        Also includes ``sandbox.env_template`` entries resolved with this filter.
+    :param session_workspace: Fallback for ``${OMNIGENT_SESSION_WORKSPACE}`` when
+        *parent_env* doesn't set it; ``None`` falls back to the runner workspace.
     """
+    is_allowed = helper_env_name_filter(sandbox)
+    env = {name: value for name, value in parent_env.items() if is_allowed(name)}
+    env.update(
+        resolve_env_template(
+            sandbox.env_template,
+            source_env=parent_env,
+            is_allowed=is_allowed,
+            context=workspace_template_context(
+                # A harness child inherits the runner's session path, which its cwd may not be.
+                session_workspace=(
+                    parent_env.get(SESSION_WORKSPACE_TEMPLATE_VAR) or session_workspace
+                ),
+                runner_workspace=parent_env.get(RUNNER_WORKSPACE_ENV_VAR),
+            ),
+        )
+    )
+    return env
+
+
+def helper_env_name_filter(sandbox: SandboxPolicy) -> Callable[[str], bool]:
+    """Return the name test :func:`build_helper_env` applies to inherited variables."""
+    # Runner-auth secrets never pass, even when named in ``env_passthrough``.
+    excluded = {SHARED_ENVIRONMENT_VAR} | RUNNER_AUTH_SECRET_ENV_VARS
     if not sandbox.active:
-        # Opted out of sandboxing (incl. env filtering): mirror parent
-        # env, but still drop the runner-auth secret — opting out of the
-        # sandbox must not also hand the agent the binding token.
-        env = strip_runner_auth_secrets(parent_env)
-        env.pop(SHARED_ENVIRONMENT_VAR, None)
-        return env
+        return lambda name: name not in excluded
+    excluded |= {HOST_SANDBOX_BACKEND_ENV} | DESKTOP_SESSION_ENV_VARS
+    allowed = set(_DEFAULT_ENV_PASSTHROUGH) | set(sandbox.env_passthrough or ())
 
-    allowed = set(_DEFAULT_ENV_PASSTHROUGH)
-    if sandbox.env_passthrough is not None:
-        allowed.update(sandbox.env_passthrough)
-    prefixes = _DEFAULT_ENV_PASSTHROUGH_PREFIXES
+    def is_allowed(name: str) -> bool:
+        return name not in excluded and (
+            name in allowed or name.startswith(_DEFAULT_ENV_PASSTHROUGH_PREFIXES)
+        )
 
-    env: dict[str, str] = {}
-    for name, value in strip_desktop_session_env(parent_env).items():
-        if name in allowed or any(name.startswith(prefix) for prefix in prefixes):
-            env[name] = value
-    # The default allowlist already excludes the runner-auth secrets,
-    # but strip again so a spec author can't re-admit one by naming it
-    # in ``sandbox.env_passthrough``.
-    env.pop(SHARED_ENVIRONMENT_VAR, None)
-    env.pop(HOST_SANDBOX_BACKEND_ENV, None)
-    return strip_runner_auth_secrets(env)
+    return is_allowed
 
 
 def _build_credential_proxy_parent_env(
@@ -578,7 +600,8 @@ class _HelperProcessClient:
         if self._relaunch_when_stale and self.sandbox.credential_proxy is not None:
             return True
         if self._launch_env is not None and (
-            build_helper_env(os.environ, self.sandbox) != self._launch_env
+            build_helper_env(os.environ, self.sandbox, session_workspace=self.cwd)
+            != self._launch_env
         ):
             return True
         if self._launch is None:
@@ -602,7 +625,7 @@ class _HelperProcessClient:
                 sandbox = self._model_access.protect_sources(sandbox, self.cwd)
         if self._copy_on_write_environment is not None:
             self._copy_on_write_environment.prepare(sandbox)
-        env = build_helper_env(os.environ, sandbox)
+        env = build_helper_env(os.environ, sandbox, session_workspace=self.cwd)
         self._launch_env = env.copy() if self._relaunch_when_stale else None
         project_root = str(_project_root())
         existing_pythonpath = env.get("PYTHONPATH")
