@@ -133,6 +133,7 @@ vi.mock("@/hooks/usePullRequests", async (importOriginal) => {
       isError: false,
     }),
     uploadPullRequestAttachment: vi.fn(),
+    usePullRequestReadPriority: vi.fn(),
     usePullRequestInfo: vi.fn((...args: Parameters<typeof original.usePullRequestInfo>) =>
       state.realPrHooks ? original.usePullRequestInfo(...args) : state.info,
     ),
@@ -230,6 +231,7 @@ vi.mock("@/components/ai-elements/message", () => ({
 import {
   usePullRequestInfo,
   usePullRequestChangedFiles,
+  usePullRequestReadPriority,
   usePullRequestRepoLabels,
   usePullRequestReviewCandidates,
 } from "@/hooks/usePullRequests";
@@ -787,6 +789,7 @@ describe("PullRequestPanel", () => {
     for (const pr of state.stored.conv_1) {
       expect(usePullRequestInfo).toHaveBeenCalledWith("conv_1", { poll: false, prUrl: pr.url });
     }
+    expect(usePullRequestReadPriority).toHaveBeenLastCalledWith("conv_1", undefined);
 
     expect(refetchQueries).not.toHaveBeenCalled();
 
@@ -795,6 +798,8 @@ describe("PullRequestPanel", () => {
     for (const pr of state.stored.conv_1) {
       expect(usePullRequestInfo).toHaveBeenCalledWith("conv_1", { poll: "list", prUrl: pr.url });
     }
+    // List rows wait their turn; only an open details view reads ahead of them.
+    expect(usePullRequestReadPriority).toHaveBeenLastCalledWith("conv_1", undefined);
     // Turning the poll back on doesn't fetch by itself.
     expect(refetchQueries).toHaveBeenCalledWith({
       queryKey: ["github-info", "conv_1"],
@@ -805,6 +810,7 @@ describe("PullRequestPanel", () => {
       poll: true,
       prUrl: url,
     });
+    expect(usePullRequestReadPriority).toHaveBeenLastCalledWith("conv_1", url);
     fireEvent.mouseDown(screen.getByRole("tab", { name: "Changes" }));
     expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", {
       poll: true,
@@ -815,17 +821,20 @@ describe("PullRequestPanel", () => {
       poll: false,
       prUrl: url,
     });
+    expect(usePullRequestReadPriority).toHaveBeenLastCalledWith("conv_1", undefined);
     rerender(<PullRequestPanel conversationId="conv_1" active />);
     expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", {
       poll: true,
       prUrl: url,
     });
+    expect(usePullRequestReadPriority).toHaveBeenLastCalledWith("conv_1", url);
     await user.click(screen.getByRole("button", { name: "All pull requests (2)" }));
     expect(screen.getByRole("list", { name: "Pull requests" })).toBeVisible();
     expect(usePullRequestInfo).toHaveBeenCalledWith("conv_1", {
       poll: "list",
       prUrl: url,
     });
+    expect(usePullRequestReadPriority).toHaveBeenLastCalledWith("conv_1", undefined);
     await user.click(screen.getByRole("button", { name: "acme/app #6000 — chore: dummy PR" }));
     expect(screen.getByRole("tab", { name: "Summary" })).toHaveAttribute("aria-selected", "true");
     expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", {

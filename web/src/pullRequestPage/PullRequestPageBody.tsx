@@ -6,7 +6,7 @@ import { RefreshCwIcon } from "lucide-react";
 import { useState } from "react";
 
 import { Button } from "@/components/ui/button";
-import { usePullRequestInfo } from "@/hooks/usePullRequests";
+import { usePullRequestInfo, usePullRequestReadPriority } from "@/hooks/usePullRequests";
 import { cn } from "@/lib/utils";
 import {
   PullRequestPanelDetails,
@@ -41,6 +41,7 @@ export function PullRequestPageBody({
 }: PullRequestPageBodyProps) {
   const queryClient = useQueryClient();
   const info = usePullRequestInfo(conversationId, { poll: active, prUrl });
+  usePullRequestReadPriority(conversationId, active ? prUrl : undefined);
   // Offline, the tab still shows the PR as the server stored it, as the panel does.
   const { storedPr, notSynced } = useStoredPullRequestFallback(conversationId, info, prUrl);
   const [refreshing, setRefreshing] = useState(false);

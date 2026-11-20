@@ -104,6 +104,7 @@ import {
   usePullRequestChangedFiles,
   usePullRequestDiff,
   usePullRequestInfo,
+  usePullRequestReadPriority,
   useSetPullRequestPreference,
   useUpdateSessionPr,
   type NormalizedPullRequestInfo,
@@ -1107,6 +1108,7 @@ export function PullRequestPanel({
     poll: active ? (selected && !showingDetails ? "list" : true) : false,
     prUrl: selected,
   });
+  usePullRequestReadPriority(conversationId, active && showingDetails ? selected : undefined);
   const showPullRequestList = () => {
     updateView({ showingDetails: false, subtab: "summary" });
   };
