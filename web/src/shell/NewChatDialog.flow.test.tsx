@@ -517,6 +517,18 @@ describe("NewChatLandingScreen in the floating panel", () => {
       expect(isComposerTargetFocused(target())).toBe(true);
       expect(target().value).toBe("half a thought");
       expect([target().selectionStart, target().selectionEnd]).toEqual([14, 14]);
+
+      // Another control the user moves to keeps the keyboard, across renders, until the next show.
+      const other = screen.getByTestId("new-chat-landing-submit");
+      act(() => other.focus());
+      if (engine === "codemirror") act(() => insertComposerText(target(), "!"));
+      else typeMessage("half a thought!");
+      act(() => other.focus());
+      expect(document.activeElement).toBe(other);
+      panel.shown();
+      expect(isComposerTargetFocused(target())).toBe(true);
+      expect(target().value).toBe("half a thought!");
+      expect([target().selectionStart, target().selectionEnd]).toEqual([15, 15]);
     });
   }
 

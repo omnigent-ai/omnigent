@@ -93,17 +93,15 @@ export function FloatingComposerPage() {
     const announce = () => {
       for (const listener of shownListeners.current) listener();
     };
-    const unsubscribe = floatingComposerBridge()?.onShown?.(announce);
     if (document.visibilityState === "visible") announce();
+    const unsubscribe = floatingComposerBridge()?.onShown?.(announce);
+    if (unsubscribe) return unsubscribe;
     // An older shell never says so; a window taking focus with nothing focused in it stands in.
     const onWindowFocus = () => {
       if (document.activeElement === document.body) announce();
     };
     window.addEventListener("focus", onWindowFocus);
-    return () => {
-      unsubscribe?.();
-      window.removeEventListener("focus", onWindowFocus);
-    };
+    return () => window.removeEventListener("focus", onWindowFocus);
   }, []);
 
   // Escape hides the panel, after any open picker or menu has taken its own Escape.

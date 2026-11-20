@@ -234,11 +234,7 @@ function createFloatingComposerController(deps) {
     if (panel.isDestroyed()) return;
     panel.webContents.focus();
     // To its current document only; a page still loading focuses its prompt once it renders.
-    try {
-      panel.webContents.send(FLOATING_COMPOSER_SHOWN_CHANNEL);
-    } catch {
-      // The panel went away between the check and the send.
-    }
+    if (!panel.webContents.isDestroyed()) panel.webContents.send(FLOATING_COMPOSER_SHOWN_CHANNEL);
   }
 
   function serverUrlFor(win) {

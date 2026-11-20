@@ -25,6 +25,7 @@ class FakePanel extends EventEmitter {
     this.webContents = Object.assign(new EventEmitter(), {
       focus: () => this.calls.push("webContents.focus"),
       send: (channel) => this.calls.push(`send:${channel}`),
+      isDestroyed: () => this.destroyed,
     });
   }
   isDestroyed() {

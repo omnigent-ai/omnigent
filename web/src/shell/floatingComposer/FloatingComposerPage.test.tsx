@@ -142,12 +142,19 @@ describe("FloatingComposerPage", () => {
   it("hands the shell's word that the panel took the keyboard to the composer", () => {
     landing.shown = 0;
     const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+    const stopListening = vi.fn();
+    vi.mocked(bridge.onShown).mockReturnValueOnce(stopListening);
     try {
-      render(<FloatingComposerPage />);
+      const page = render(<FloatingComposerPage />);
       expect(landing.shown).toBe(0);
       const shown = vi.mocked(bridge.onShown).mock.calls.at(-1)![0];
       act(() => shown());
       expect(landing.shown).toBe(1);
+      // With the shell saying so, a window focus alone doesn't move the keyboard.
+      act(() => window.dispatchEvent(new Event("focus")));
+      expect(landing.shown).toBe(1);
+      page.unmount();
+      expect(stopListening).toHaveBeenCalledTimes(1);
     } finally {
       visibility.mockRestore();
     }
