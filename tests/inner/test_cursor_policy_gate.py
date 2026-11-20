@@ -440,7 +440,8 @@ async def test_missing_api_key_fails_before_creating_the_policy_home(
 @pytest.mark.parametrize(
     ("tool", "sandbox", "message"),
     [
-        ("sys_os_shell", OSEnvSandboxSpec(type="none"), "active sandbox"),
+        ("sys_os_shell", OSEnvSandboxSpec(type="none"), "cannot isolate bridged OS tools"),
+        ("sys_os_shell", None, "cannot isolate bridged OS tools"),
         ("sys_terminal_launch", None, "terminal tools"),
     ],
 )

@@ -5377,6 +5377,18 @@ def test_resolve_sandbox_cwd_roots_relative_at_runner_workspace(monkeypatch) -> 
     assert _resolve_sandbox_cwd("src") == (workspace / "src").resolve(strict=False)
     assert _resolve_sandbox_cwd("/etc/foo") == Path("/etc/foo").resolve(strict=False)
 
+    session = workspace / "session"
+    for declared, selected, expected in (
+        (None, session, session),
+        (".", session, session),
+        ("repo", session, session),
+        ("./project", workspace, workspace / "project"),
+        ("./project", session, session),
+        ("repo", workspace.parent / "session", workspace.parent / "session"),
+        (str(workspace), workspace / "project", workspace / "project"),
+    ):
+        assert _resolve_sandbox_cwd(declared, selected_cwd=str(selected)) == expected
+
     # No workspace set → falls back to the process cwd (prior behavior).
     monkeypatch.delenv("OMNIGENT_RUNNER_WORKSPACE", raising=False)
     assert _resolve_sandbox_cwd(".") == Path("/tmp").resolve(strict=False)
@@ -5594,14 +5606,6 @@ async def test_sandboxed_sdk_exposes_bash_for_skill_expansion(
         "default",
         "default_allow_network",
         "spec_relative",
-        "spec_absolute",
-        "explicit_none",
-        "explicit_dot",
-        "explicit_relative",
-        "explicit_relative_root",
-        "explicit_relative_sibling",
-        "explicit_relative_outside",
-        "explicit_nested",
         "explicit_conflict",
     ],
 )
@@ -5624,30 +5628,10 @@ def test_prepare_claude_cli_path_probe_passes_target_and_still_wraps(
     elif cwd_source == "spec_relative":
         spec.cwd = "repo"
         expected_cwd = tmp_path / "repo"
-    elif cwd_source == "explicit_relative_root":
-        spec.cwd = "./project"
-        cwd = str(tmp_path)
-        expected_cwd = tmp_path / "project"
-    elif cwd_source in ("explicit_relative_sibling", "explicit_relative_outside"):
-        spec.cwd = "./project" if cwd_source == "explicit_relative_sibling" else "repo"
-        selected_root = tmp_path if cwd_source == "explicit_relative_sibling" else tmp_path.parent
-        expected_cwd = selected_root / "session"
-        cwd = str(expected_cwd)
-    elif cwd_source == "explicit_nested":
-        spec.cwd = str(tmp_path)
-        expected_cwd = tmp_path / "project"
-        cwd = str(expected_cwd)
-    elif cwd_source.startswith("explicit"):
-        spec.cwd = {
-            "explicit_none": None,
-            "explicit_dot": ".",
-            "explicit_relative": "repo",
-            "explicit_conflict": str(tmp_path / "other"),
-        }[cwd_source]
+    else:
+        spec.cwd = str(tmp_path / "other")
         expected_cwd = tmp_path / "repo"
         cwd = str(expected_cwd)
-    else:
-        expected_cwd = Path(spec.cwd).resolve()
 
     resolve = Mock(return_value=_active_policy(allow_network=allow_network))
     monkeypatch.setattr("omnigent.inner.claude_sdk_executor.resolve_sandbox", resolve)

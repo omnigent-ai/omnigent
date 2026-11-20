@@ -39,6 +39,7 @@ from omnigent.inner.model_signer_service import _VALIDATION_BEARER, _parse_stric
 from omnigent.inner.model_signing import SigningRejected
 from omnigent.inner.sandbox import (
     HarnessSandboxPreparationError,
+    HarnessSandboxValidationError,
     SandboxPolicy,
     _default_sandbox_for_platform,
 )
@@ -440,11 +441,22 @@ def test_custom_provider_config_cannot_be_granted_to_the_worker(tmp_path: Path) 
 
 
 @pytest.mark.parametrize(
-    "entrypoint,explicit_token",
-    [("resolver", None), ("resolver", "parent-only-provider-token"), ("prepared", None)],
+    "entrypoint,explicit_token,transport",
+    [
+        ("resolver", None, None),
+        ("resolver", "parent-only-provider-token", None),
+        ("prepared", None, None),
+        ("prepared", None, "CLAUDE_CODE_USE_BEDROCK"),
+        ("prepared", None, "CLAUDE_CODE_USE_VERTEX"),
+        ("prepared", None, "CLAUDE_CODE_USE_FOUNDRY"),
+    ],
 )
-def test_user_settings_helper_cannot_fall_back_to_saved_oauth(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entrypoint: str, explicit_token: str | None
+def test_model_access_configuration_preserves_refusal_guidance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entrypoint: str,
+    explicit_token: str | None,
+    transport: str | None,
 ) -> None:
     from omnigent.inner import claude_sdk_executor as claude
     from omnigent.inner.model_auth import ProviderAuthRequired
@@ -457,6 +469,8 @@ def test_user_settings_helper_cannot_fall_back_to_saved_oauth(
         "ANTHROPIC_BASE_URL": "https://gateway.example.test/anthropic",
         "CLAUDE_CONFIG_DIR": str(config_dir),
     }
+    if transport is not None:
+        env[transport] = "1"
     if explicit_token is not None:
         env["ANTHROPIC_AUTH_TOKEN"] = explicit_token
         access = resolve_claude_model_access(env, user_settings_has_api_key_helper=True)
@@ -476,19 +490,25 @@ def test_user_settings_helper_cannot_fall_back_to_saved_oauth(
         launcher = Mock()
         monkeypatch.setattr(claude, "start_egress_proxy", proxy)
         monkeypatch.setattr(claude, "create_exec_launcher", launcher)
-        with pytest.raises(ProviderAuthRequired) as raised:
+        error_type = HarnessSandboxValidationError if transport else ProviderAuthRequired
+        with pytest.raises(error_type) as raised:
             claude.prepare_claude_cli_path(
                 "/bin/claude",
                 OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
                 cwd=workspace,
                 worker_env=env,
-                user_settings_has_api_key_helper=True,
+                user_settings_has_api_key_helper=transport is None,
             )
         detail = ExecutorAdapter(executor_factory=Mock())._build_error_detail(raised.value)
-        assert detail.code == "PROVIDER_AUTH_REQUIRED"
-        assert detail.title is not None and "credential configuration" in detail.title
-        assert "user settings apiKeyHelper" in detail.message
-        assert "configure a supported provider credential" in detail.message
+        if transport is not None:
+            assert detail.code == "HarnessSandboxValidationError"
+            assert "Anthropic-compatible API" in detail.message
+            assert "Bedrock, Vertex or Foundry" in detail.message
+        else:
+            assert detail.code == "PROVIDER_AUTH_REQUIRED"
+            assert detail.title is not None and "credential configuration" in detail.title
+            assert "user settings apiKeyHelper" in detail.message
+            assert "configure a supported provider credential" in detail.message
         assert "parent-only-oauth" not in detail.message
         assert "parent-only-refresh" not in detail.message
         proxy.assert_not_called()

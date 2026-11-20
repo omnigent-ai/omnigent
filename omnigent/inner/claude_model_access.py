@@ -57,7 +57,7 @@ from .model_signing import (
     _validate_json_body,
     _validate_secret_value,
 )
-from .sandbox import SandboxPolicy, protect_credential_source
+from .sandbox import HarnessSandboxValidationError, SandboxPolicy, protect_credential_source
 
 HELPER_ENV = "OMNIGENT_CLAUDE_API_KEY_HELPER"
 _SECRET_ENV = frozenset(
@@ -880,7 +880,10 @@ def resolve_claude_model_access(
     """Resolve credentials in the trusted parent, before starting any worker."""
     for flag in _ALTERNATE_TRANSPORT_FLAGS:
         if env.get(flag) not in (None, "", "0", "false"):
-            raise ValueError("sandboxed Claude model relay requires an Anthropic-compatible API")
+            raise HarnessSandboxValidationError(
+                "sandboxed Claude model relay requires an Anthropic-compatible API",
+                reason="provider_transport",
+            )
     base_url = env.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com"
     config_dir = Path(env.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude"))
     # Claude resolves relative config paths from its cwd without expanding '~'.

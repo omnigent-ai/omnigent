@@ -863,6 +863,10 @@ class HarnessSandboxValidationError(ValueError):
         "credential_proxy": (
             "The selected harness does not support os_env.sandbox.credential_proxy."
         ),
+        "provider_transport": (
+            "Sandboxed Claude requires an Anthropic-compatible API. "
+            "Disable Bedrock, Vertex or Foundry transport settings and retry."
+        ),
         "git_ssh": "The selected harness does not support os_env.sandbox.git_ssh.",
         "tcp_egress": (
             "Inner harnesses cannot enforce worker-wide os_env.sandbox.tcp_egress. "
