@@ -252,6 +252,7 @@ def test_turn_end_eases_a_transcript_at_its_end_down(
     page.wait_for_function("() => window.__paragraphTops.length >= 5")
     row = page.get_by_test_id("working-indicator").bounding_box()
     assert row
+    page.evaluate(_RECORD_CLOSING_ROW)
 
     answer = message_item("turn-end-answer", "assistant", text, response_id=response_id)
     chat.emit({"event": "response.output_item.done", "data": {"item": answer}})
@@ -276,11 +277,26 @@ def test_turn_end_eases_a_transcript_at_its_end_down(
     ]
     steps = [step for _, step in moves]
     assert sum(steps) > 20, f"the transcript didn't move when the turn ended: {steps}"
-    # Timed rather than counted per frame: a slow runner paints few frames of the 180 ms
-    # ease, and the sampler only records frames whose layout changed, so the slow tail can
-    # go unrecorded (84 ms was seen). Removing the row at once moves it in one frame (0 ms).
-    span = moves[-1][0] - moves[0][0]
-    assert span >= 40, f"the transcript moved within {span:.0f} ms ({steps}), not eased"
+    # The frame sampler drops frames on a loaded runner, so its timing can't show the ease.
+    # The close animation's own duration can: removing the row at once runs no animation.
+    durations = page.evaluate("() => window.__closingDurations")
+    assert durations and max(durations) >= 40, (
+        f"the Working row closed at once, not eased: durations {durations}, steps {steps}"
+    )
+
+
+# Records the duration of each animation the Working row runs when it closes.
+_RECORD_CLOSING_ROW = """(() => {
+    window.__closingDurations = [];
+    const animate = Element.prototype.animate;
+    Element.prototype.animate = function (...args) {
+        const animation = animate.apply(this, args);
+        if (this.querySelector('[data-testid="working-indicator"]')) {
+            window.__closingDurations.push(animation.effect.getComputedTiming().duration);
+        }
+        return animation;
+    };
+})()"""
 
 
 # Pauses the indicator's animations and steps them through 3.4s, recording what moves.
