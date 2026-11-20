@@ -3110,10 +3110,14 @@ function ComposerImpl(
     [offeredBuiltinCommands, commandSkills, skillPrefix],
   );
   const slashCommandNames = useMemo(() => Object.keys(slashCommands), [slashCommands]);
-  // Submission lowercases the first word before matching a built-in, so `/Goal` runs too.
-  const offeredBuiltinNames = useMemo(
-    () => Object.keys(offeredBuiltinCommands),
-    [offeredBuiltinCommands],
+  // Submission lowercases the first word before matching a built-in, so `/Goal` runs too. Not
+  // `/btw` or Codex's `/side`: they go out as typed to case-sensitive handlers.
+  const anyCaseBuiltinNames = useMemo(
+    () =>
+      Object.keys(offeredBuiltinCommands).filter(
+        (name) => name !== "/btw" && !(name === "/side" && usesNativeSideChatFork(sessionHarness)),
+      ),
+    [offeredBuiltinCommands, sessionHarness],
   );
   // Skills always need an optional argument fill-in so the user can
   // type extra context after the name; built-in commands keep their
@@ -3217,7 +3221,7 @@ function ComposerImpl(
   const highlight = useComposerHighlight({
     value,
     commandNames: slashCommandNames,
-    anyCaseCommandNames: offeredBuiltinNames,
+    anyCaseCommandNames: anyCaseBuiltinNames,
     enabled: draft.quotes.length === 0 && files.length === 0,
     // Files go out as separate blocks, so the message is no longer a lone `!` text.
     shellEnabled: files.length === 0,

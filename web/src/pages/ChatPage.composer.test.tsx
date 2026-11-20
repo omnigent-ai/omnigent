@@ -7292,6 +7292,32 @@ describe("Composer reply quotes", () => {
   });
 });
 
+describe("Composer built-in tint by case", () => {
+  afterEach(() => {
+    cleanup();
+    composerSessionSnapshot.sideChatAllowed = null;
+  });
+
+  // Only built-ins the composer runs case-insensitively may tint in another case.
+  it.each([
+    { harness: "claude-native", text: "/Btw x", token: "/Btw", tinted: false },
+    { harness: "claude-native", text: "/btw x", token: "/btw", tinted: true },
+    { harness: "codex-native", text: "/Side x", token: "/Side", tinted: false },
+    { harness: "codex-native", text: "/side x", token: "/side", tinted: true },
+    { harness: "openai-agents", text: "/Side x", token: "/Side", tinted: true },
+    { harness: "codex-native", text: "/Goal x", token: "/Goal", tinted: true },
+  ])("tints $text on $harness: $tinted", ({ harness, text, token, tinted }) => {
+    composerSessionSnapshot.sideChatAllowed = true;
+    setComposerState({ conversationId: "conv_case", sessionHarness: harness, skills: [] });
+    render(<Composer {...composerProps({ permissionLevel: 4, showGoalControl: true })} />);
+    fireEvent.change(textarea(), { target: { value: text } });
+    expect(textarea().hasAttribute("data-slash-command")).toBe(tinted);
+    expect(screen.queryByText(token, { selector: `.${COMMAND_TOKEN_CLASS}` }) !== null).toBe(
+      tinted,
+    );
+  });
+});
+
 describe("Composer side-chat entry points", () => {
   beforeEach(() => {
     setComposerState({
