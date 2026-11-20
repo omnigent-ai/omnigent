@@ -141,6 +141,20 @@ def test_remote_resume_option_spellings(args: tuple[str, ...], expected: dict) -
             None,
         ),
         (("--sandbox", "workspace-write", "-c", 'approvals_reviewer="auto_review"'), None),
+        # Prompt text after ``--`` isn't a permission option.
+        (
+            (
+                "-c",
+                'default_permissions=":workspace"',
+                "-c",
+                'approval_policy="on-request"',
+                "-c",
+                'approvals_reviewer="user"',
+                "--",
+                "--approve-for-me",
+            ),
+            "ask-for-approval",
+        ),
         # A config profile's permissions can replace --sandbox...
         (
             (
