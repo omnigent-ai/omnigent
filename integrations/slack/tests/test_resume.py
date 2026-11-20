@@ -38,6 +38,7 @@ def test_parse(target):
         "resume https://wrong.example/c/a",
         "resume https://omni.example/v1/sessions/a",
         "resume https://omni.example/c/a?o=other",
+        "resume https://[invalid/c/conv_a",
     ],
 )
 def test_invalid(text):
@@ -284,9 +285,14 @@ async def test_readiness_timeout(environment):
     assert "timed out" in await resume(environment)
 
 
-async def test_invalid_routing(environment):
-    assert "Invalid session ID" in await resume(environment, text="resume ../oops")
+@pytest.mark.parametrize(
+    "target,expected",
+    [("../oops", "Invalid session ID"), ("https://[invalid/c/conv_a", "Invalid session URL")],
+)
+async def test_invalid_routing(environment, target, expected):
+    assert expected in await resume(environment, text=f"resume {target}")
     assert not environment[2]["requests"]
+    assert not environment[0]._active_threads
 
 
 @pytest.mark.parametrize("mention", [False, True])

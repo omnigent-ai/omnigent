@@ -23,7 +23,12 @@ def parse_resume(text: str, web_link: str) -> tuple[str, bool]:
     if target.startswith("<") and target.endswith(">"):
         target = target[1:-1].split("|", 1)[0]
     if "://" in target:
-        supplied, expected = urlsplit(target), urlsplit(web_link)
+        try:
+            supplied, expected = urlsplit(target), urlsplit(web_link)
+        except ValueError as exc:
+            raise ResumeError(
+                "Invalid session URL. Copy the conversation URL from Omnigent."
+            ) from exc
         prefix = expected.path.rsplit("/", 1)[0] + "/"
         if (supplied.scheme, supplied.netloc) != (
             expected.scheme,
