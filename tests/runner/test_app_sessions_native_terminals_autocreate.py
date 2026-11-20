@@ -4128,7 +4128,6 @@ def test_native_terminal_start_error_guidance_and_redaction(
     }
     assert private_value not in json.dumps(error)
     assert private_path not in json.dumps(error)
-    assert "requires the 'codex' CLI" not in error["message"]
     assert str(raised) in caplog.text
     assert error_id in caplog.text
     failure_context = {

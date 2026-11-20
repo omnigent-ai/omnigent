@@ -1197,8 +1197,10 @@ async def test_list_environments_proxies_to_runner(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_path", ["terminals", "claude-settings-v2/terminals"])
 async def test_list_terminals_forwards_pagination_params_to_runner(
     client: httpx.AsyncClient,
+    terminal_path: str,
 ) -> None:
     """GET /resources/terminals forwards order/limit to the runner.
 
@@ -1211,14 +1213,11 @@ async def test_list_terminals_forwards_pagination_params_to_runner(
     fake_runner = _FakeRunnerClient(payload={"object": "list", "data": []})
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
-    resp = await client.get(
-        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals?order=asc&limit=1000&bogus=1",
-    )
+    path = f"/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/{terminal_path}"
+    resp = await client.get(f"{path}?order=asc&limit=1000&bogus=1")
 
     assert resp.status_code == 200
-    assert fake_runner.calls == [
-        ("GET", "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals"),
-    ]
+    assert fake_runner.calls == [("GET", path)]
     # Exactly the runner endpoint's supported pagination params are
     # forwarded; an unknown param (``bogus``) must be dropped so the
     # proxy can't be used to smuggle arbitrary query strings. A ``None``
@@ -1963,9 +1962,11 @@ async def test_create_terminal_bootstrap_markers_do_not_bypass_gate_for_other_sh
         ],
     ],
 )
+@pytest.mark.parametrize("terminal_path", ["terminals", "claude-settings-v2/terminals"])
 async def test_create_terminal_surfaces_runner_error_without_crashing(
     client: httpx.AsyncClient,
     bash_terminal_spec: None,
+    terminal_path: str,
     runner_status: int,
     runner_payload: dict[str, Any],
     expected_status: int,
@@ -1998,7 +1999,7 @@ async def test_create_terminal_surfaces_runner_error_without_crashing(
     :param expected_ack: The acknowledgement expected in the public response, if any.
     :returns: None.
     """
-    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals"
+    path = f"/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/{terminal_path}"
     if settings_request_ack is not None:
         runner_payload = {**runner_payload, "claude_settings_request_ack": settings_request_ack}
     fake_runner = _FakeRunnerClient(responses={path: (runner_status, runner_payload)})

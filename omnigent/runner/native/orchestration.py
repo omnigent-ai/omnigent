@@ -10252,15 +10252,16 @@ async def _auto_create_claude_terminal(
                 dispose=ClaudeSettingsLease.close,
             )
             try:
-                await _run_claude_settings_step(lease.check_current)
-                await finalize_claude_caller_settings(
+                await lease.attach_async(
                     instance,
-                    bridge_dir=bridge_dir,
-                    generation=settings_generation,
-                    active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
-                    private_output=True,
+                    prepare=lambda: finalize_claude_caller_settings(
+                        instance,
+                        bridge_dir=bridge_dir,
+                        generation=settings_generation,
+                        active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
+                        private_output=True,
+                    ),
                 )
-                await lease.attach_async(instance)
             finally:
                 await _run_claude_settings_step(lease.close)
 

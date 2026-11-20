@@ -538,21 +538,29 @@ async def test_list_environments_returns_only_environment_resources(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_path", ["terminals", "claude-settings-v2/terminals"])
 async def test_list_terminals_returns_only_terminal_resources(
     client: httpx.AsyncClient,
+    terminal_path: str,
 ) -> None:
     """GET /resources/terminals filters to terminal type only."""
-    resp = await client.get("/v1/sessions/conv_abc/resources/terminals")
+    resp = await client.get(f"/v1/sessions/conv_abc/resources/{terminal_path}")
 
     assert resp.status_code == 200
     body = resp.json()
     assert body["claude_settings_request_protocol"] == 1
+    assert body["claude_settings_fenced_request_protocol"] == 2
     types = {r["type"] for r in body["data"]}
     assert types == {"terminal"}
     ids = [r["id"] for r in body["data"]]
     assert "terminal_bash_s1" in ids
     assert "terminal_python_s2" in ids
     assert DEFAULT_ENVIRONMENT_ID not in ids
+    for suffix in ("", "/environments"):
+        other = await client.get(f"/v1/sessions/conv_abc/resources{suffix}")
+        assert other.status_code == 200
+        assert "claude_settings_request_protocol" not in other.json()
+        assert "claude_settings_fenced_request_protocol" not in other.json()
 
 
 @pytest.mark.asyncio

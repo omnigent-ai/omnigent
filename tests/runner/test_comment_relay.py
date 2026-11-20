@@ -2208,6 +2208,8 @@ async def test_cli_caller_settings_finalize_under_terminal_policy(
         "invalid-settings",
         "validation-unavailable",
         "unexpected-validator-error",
+        "prepared-v2",
+        "expired-v2",
     ],
 )
 async def test_cli_settings_request_ownership_survives_admission_and_terminal_lifecycle(
@@ -2225,6 +2227,8 @@ async def test_cli_settings_request_ownership_survives_admission_and_terminal_li
     from omnigent.inner.terminal import TerminalInstance
     from omnigent.terminals import TerminalRegistry
 
+    protocol = 2 if mode.endswith("-v2") else 1
+    mode = mode.removesuffix("-v2")
     private_diagnostic = "private-validator-value /private/example/settings.json"
     if mode in {"invalid-settings", "validation-unavailable"}:
         fault = (
@@ -2258,7 +2262,7 @@ async def test_cli_settings_request_ownership_survives_admission_and_terminal_li
         tmp_path, _SwitchableServerClient("settings-agent"), {"settings-agent": spec}
     )
     bridge_dir = prepare_bridge_dir(session_id, workspace=tmp_path)
-    request = ClaudeSettingsRequest.create(bridge_dir)
+    request = ClaudeSettingsRequest.create(bridge_dir, protocol=protocol)
     caller = {
         "env": {"EXAMPLE": "caller", "FROM_FILE": "yes", "ORDER": "file"},
         **({"disableAllHooks": True} if mode == "failure" else {}),
@@ -2358,7 +2362,8 @@ async def test_cli_settings_request_ownership_survives_admission_and_terminal_li
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://runner"
         ) as client:
-            url = f"/v1/sessions/{session_id}/resources/terminals"
+            terminal_path = "claude-settings-v2/terminals" if protocol == 2 else "terminals"
+            url = f"/v1/sessions/{session_id}/resources/{terminal_path}"
             response = await client.post(url, json=body)
             if mode in {
                 "expired",
@@ -2468,7 +2473,7 @@ async def test_cli_settings_request_ownership_survives_admission_and_terminal_li
             assert replay.json()["error"]["code"] == "conflict"
             assert "expired" in replay.json()["error"]["message"]
             assert len(launched) == 1
-            with ClaudeSettingsRequest.create(bridge_dir) as unused:
+            with ClaudeSettingsRequest.create(bridge_dir, protocol=protocol) as unused:
                 unused_body = _claude_terminal_request(
                     (), command="claude", bridge_dir=bridge_dir, settings_request=unused
                 )
@@ -2483,8 +2488,14 @@ async def test_cli_settings_request_ownership_survives_admission_and_terminal_li
             if mode != "declared-replacement":
                 assert baseline.read_bytes() == baseline_bytes
             await terminals.cleanup_conversation("moved")
-            assert not instance.private_dir.exists()
-            assert not list(bridge_dir.glob(f"claude-settings-{request.generation}*"))
+            if protocol == 2:
+                assert instance.private_dir.exists()
+                assert instance._private_cleanup_thread is None
+                assert baseline.read_bytes() == baseline_bytes
+                assert prune_unused_claude_settings(bridge_dir) == 0
+            else:
+                assert not instance.private_dir.exists()
+                assert not list(bridge_dir.glob(f"claude-settings-{request.generation}*"))
     finally:
         request.close()
         await terminals.shutdown()
@@ -2493,6 +2504,9 @@ async def test_cli_settings_request_ownership_survives_admission_and_terminal_li
         ) as client:
             await client.delete(f"/v1/sessions/{session_id}")
         shutil.rmtree(bridge_dir, ignore_errors=True)
+        if protocol == 2:
+            for instance, _ in prepared:
+                shutil.rmtree(instance.private_dir, ignore_errors=True)
 
 
 @pytest.mark.asyncio

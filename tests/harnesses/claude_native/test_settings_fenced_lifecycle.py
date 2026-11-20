@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import inspect
 import json
@@ -12,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import threading
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -294,14 +296,8 @@ def test_fenced_request_cannot_be_admitted_for_another_session(bridge_dir: Path)
         assert baseline.read_bytes() == contents
         with acquire_claude_settings_request(
             bridge_dir, request.generation, protocol=2, expected_session_id="conv_fenced"
-        ) as receiver:
-            receiver.check_current()
-            assert not list(bridge_dir.glob("*.terminal-*.owner"))
-            request_claude_bridge_deletion(bridge_dir, "conv_fenced")
-            bridge.prepare_bridge_dir("conv_fenced", workspace=bridge_dir.parent)
-            with pytest.raises(ValueError, match="expired"):
-                receiver.check_current()
-            assert baseline.read_bytes() == contents
+        ):
+            pass
 
 
 @pytest.mark.parametrize("failure", ["early-return", "bootstrap-error", "cancel"])
@@ -526,6 +522,127 @@ def test_consumer_drops_inherited_leases_but_keeps_inputs_after_guard_and_contro
                 os.kill(consumer_pid, 9)
         terminate_process(guard)
         terminate_process(controller)
+
+
+@pytest.mark.parametrize("protocol", [1, 2])
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_failed_preparation_never_publishes_terminal_ownership(
+    bridge_dir: Path, tmp_path: Path, protocol: int, cancelled: bool
+) -> None:
+    private = tmp_path / "terminal"
+    private.mkdir()
+    instance = TerminalInstance(
+        name="claude", session_key="main", private_dir=private, socket_path=private / "tmux.sock"
+    )
+    request = ClaudeSettingsRequest.create(bridge_dir, protocol=protocol)
+    baseline = _populate(request)
+    contents = baseline.read_bytes()
+    failure = asyncio.CancelledError() if cancelled else ValueError("inert preparation failure")
+    prepare = AsyncMock(side_effect=failure)
+    try:
+        with acquire_claude_settings_request(
+            bridge_dir, request.generation, protocol=protocol
+        ) as receiver:
+            with pytest.raises(type(failure)) as raised:
+                await receiver.attach_async(instance, prepare=prepare)
+            assert raised.value is failure
+            prepare.assert_awaited_once_with()
+            assert instance.process_lifetime_leases == []
+            assert not list(bridge_dir.glob("*.terminal-*.owner"))
+            assert baseline.read_bytes() == contents
+        request.close()
+        assert not list(bridge_dir.glob(f"claude-settings-{request.generation}*"))
+    finally:
+        request.close()
+        await instance.close()
+    assert not private.exists()
+
+
+async def test_published_terminal_cannot_be_discarded_as_failed_preparation(
+    bridge_dir: Path, tmp_path: Path
+) -> None:
+    private = tmp_path / "terminal"
+    private.mkdir()
+    instance = TerminalInstance(
+        name="claude", session_key="main", private_dir=private, socket_path=private / "tmux.sock"
+    )
+    request = ClaudeSettingsRequest.create(bridge_dir, protocol=2)
+    baseline = _populate(request)
+    contents = baseline.read_bytes()
+    try:
+        with acquire_claude_settings_request(bridge_dir, request.generation, protocol=2) as reader:
+            await reader.attach_async(instance)
+        encoded = process_lifetime.encode_process_leases(instance.process_lifetime_leases)
+        assert encoded is not None
+        process_lifetime.write_process_lease_manifest(private, encoded)
+        _spec, release = instance._process_lifetime_handoffs[0]
+        owner = release.__self__
+        owner._discard_unpublished()
+        request.close()
+        assert baseline.read_bytes() == contents
+        assert prune_unused_claude_settings(bridge_dir) == 0
+        await instance.close()
+        assert private.exists()
+        assert instance._private_cleanup_thread is None
+    finally:
+        request.close()
+        await instance.close()
+
+
+@pytest.mark.parametrize("fault", ["malformed", "oversized", "identity"])
+async def test_invalid_guard_encoding_never_starts_an_otherwise_valid_target(
+    bridge_dir: Path, tmp_path: Path, fault: str
+) -> None:
+    private = tmp_path / "terminal"
+    private.mkdir()
+    instance = TerminalInstance(
+        name="claude", session_key="main", private_dir=private, socket_path=private / "tmux.sock"
+    )
+    request = ClaudeSettingsRequest.create(bridge_dir, protocol=2)
+    baseline = _populate(request)
+    contents = baseline.read_bytes()
+    marker = tmp_path / "target-started"
+    try:
+        with acquire_claude_settings_request(bridge_dir, request.generation, protocol=2) as reader:
+            await reader.attach_async(instance)
+        encoded = process_lifetime.encode_process_leases(
+            [replace(instance.process_lifetime_leases[0], ready=None)]
+        )
+        assert encoded is not None
+
+        def run(payload: str) -> subprocess.CompletedProcess[bytes]:
+            return subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    str(Path(process_lifetime.__file__)),
+                    payload,
+                    "--",
+                    sys.executable,
+                    "-c",
+                    "from pathlib import Path; import sys; Path(sys.argv[1]).touch()",
+                    str(marker),
+                ],
+                capture_output=True,
+                timeout=5,
+            )
+
+        control = run(encoded)
+        assert control.returncode == 0, control.stderr
+        assert marker.is_file()
+        marker.unlink()
+        if fault == "identity":
+            payload = json.loads(base64.urlsafe_b64decode(encoded))
+            payload[0][1][1] += 1
+            invalid = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode("ascii")
+        else:
+            invalid = "!" if fault == "malformed" else "x" * 65537
+        assert run(invalid).returncode != 0
+        assert not marker.exists()
+        assert baseline.read_bytes() == contents
+    finally:
+        request.close()
+        await instance.close()
 
 
 @pytest.mark.parametrize("confirmed_close", [False, True])

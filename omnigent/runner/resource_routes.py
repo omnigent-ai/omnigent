@@ -742,9 +742,7 @@ def register_resource_routes(
                     replaced_invocation = True
 
                 async def prepare_claude(instance: TerminalInstance) -> None:
-                    try:
-                        if settings_lease is not None and not replaced_invocation:
-                            await _run_claude_settings_step(settings_lease.check_current)
+                    async def finalize() -> None:
                         await finalize_claude_caller_settings(
                             instance,
                             bridge_dir=bridge_dir_for_bridge_id(bridge_id),
@@ -752,8 +750,12 @@ def register_resource_routes(
                             active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
                             private_output=settings_lease is not None,
                         )
+
+                    try:
                         if settings_lease is not None and not replaced_invocation:
-                            await settings_lease.attach_async(instance)
+                            await settings_lease.attach_async(instance, prepare=finalize)
+                        else:
+                            await finalize()
                     except (CallerSettingsError, ClaudeSettingsRequestExpired):
                         raise
                     except ValueError as exc:

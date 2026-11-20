@@ -11,7 +11,7 @@ import secrets
 import shutil
 import stat
 import threading
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -592,6 +592,7 @@ class ClaudeSettingsLease:
     _session_id: str | None = None
     _request_identity: tuple[int, int] | None = None
     _fenced_binding: _FencedSettingsBinding | None = None
+    _terminal_published: bool = field(default=False, init=False, repr=False)
     _close_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def _request_binding_matches(self) -> bool:
@@ -653,11 +654,6 @@ class ClaudeSettingsLease:
             raise ClaudeSettingsRequestExpired()
         return lifecycle
 
-    def check_current(self) -> None:
-        """Fence stale preparation before reading caller files or retaining a terminal."""
-        with bridge_dir_preparation_lock(self.bridge_dir):
-            self._require_current()
-
     def _retain_for_terminal(self) -> ClaudeSettingsLease:
         with bridge_dir_preparation_lock(self.bridge_dir):
             if self._fd is None:
@@ -711,13 +707,24 @@ class ClaudeSettingsLease:
             retained.close()
             raise
 
-    async def attach_async(self, instance: TerminalInstance) -> None:
-        """Drain retention before registering cleanup on the terminal's event loop."""
+    async def attach_async(
+        self,
+        instance: TerminalInstance,
+        *,
+        prepare: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
+        """Retain during preparation, then publish cleanup on the terminal's event loop."""
         from omnigent.harnesses.claude_native.bridge import _run_claude_settings_step
 
         retained = await _run_claude_settings_step(
-            self._retain_for_terminal, dispose=ClaudeSettingsLease.close
+            self._retain_for_terminal, dispose=ClaudeSettingsLease._discard_unpublished
         )
+        try:
+            if prepare is not None:
+                await prepare()
+        except BaseException:
+            await _run_claude_settings_step(retained._discard_unpublished)
+            raise
         try:
             retained._attach_process_lifetime(instance)
             instance.add_resource_cleanup(retained.close)
@@ -726,6 +733,10 @@ class ClaudeSettingsLease:
             raise
 
     def _attach_process_lifetime(self, instance: TerminalInstance) -> None:
+        with self._close_lock:
+            if self._fd is None:
+                raise ClaudeSettingsRequestExpired()
+            self._terminal_published = True
         if self._fenced_binding is None:
             return
         from omnigent.inner.process_lifetime import ProcessLifetimeLease
@@ -751,8 +762,16 @@ class ClaudeSettingsLease:
 
     def close(self) -> None:
         """Release this owner while retaining unconfirmed terminal consumption."""
+        self._close(discard_unpublished=False)
+
+    def _discard_unpublished(self) -> None:
+        """Discard preparation that never exposed its claim to a terminal."""
+        self._close(discard_unpublished=True)
+
+    def _close(self, *, discard_unpublished: bool) -> None:
         with self._close_lock:
             fd, self._fd = self._fd, None
+            unpublished = discard_unpublished and not self._terminal_published
         if fd is None:
             return
         try:
@@ -765,7 +784,7 @@ class ClaudeSettingsLease:
                         or not _file_matches_fd(self._terminal_claim, self._claim_fd)
                     ):
                         return
-                    if self._fenced_binding is not None:
+                    if self._fenced_binding is not None and not unpublished:
                         uncertain = self._terminal_claim.with_suffix(".unconfirmed.owner")
                         try:
                             uncertain_fd = _open_lock(uncertain, create=True)
