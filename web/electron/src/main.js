@@ -133,6 +133,7 @@ const { acceleratorLabel, createGlobalShortcuts } = require("./globalShowShortcu
 const {
   FLOATING_COMPOSER_PATH,
   FRAME_SETTINGS_KEY,
+  FLOATING_COMPOSER_PRELOAD_DELAY_MS,
   createFloatingComposerController,
   createFloatingComposerPreloader,
   fadeInFloatingComposer,
@@ -1883,7 +1884,7 @@ function floatingComposer() {
     quitting: () => appQuitting,
     // A panel lost after its page had loaded (a crash, a sign-out) is built again, out of sight.
     panelClosed: (_serverUrl, wasReady) => {
-      if (wasReady) floatingComposerPreloader.schedule();
+      if (wasReady) floatingComposerPreloader.rebuildOnce();
     },
     present: (panel, show) =>
       fadeInFloatingComposer(panel, show, {
@@ -5367,9 +5368,14 @@ function registerIpc() {
       contents.removeListener("render-process-gone", revoke);
       contents.removeListener("destroyed", revoke);
       floatingComposerSupport.revoke(contents.id);
-      // A panel built ahead for this server isn't needed once no page of it can render one.
+      // A panel built ahead for this server goes once no page of it can render one for a
+      // while; a reload announces again within moments and keeps it.
       if (!floatingComposerSupport.serves(serverUrl)) {
-        floatingComposerController?.releaseUnshown(serverUrl);
+        setTimeout(() => {
+          if (!floatingComposerSupport.serves(serverUrl)) {
+            floatingComposerController?.releaseUnshown(serverUrl);
+          }
+        }, FLOATING_COMPOSER_PRELOAD_DELAY_MS).unref?.();
       }
       if (!floatingComposerSupport.any()) applyFloatingComposerShortcut();
     };

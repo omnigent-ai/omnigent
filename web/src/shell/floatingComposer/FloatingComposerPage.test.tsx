@@ -95,6 +95,25 @@ describe("FloatingComposerPage", () => {
     }
   });
 
+  it("works with a shell too old to hear that the panel is ready", async () => {
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+      callback(0);
+      return 0;
+    });
+    const ready = bridge.ready;
+    try {
+      // Older shells lack `ready`; they show the panel after their own fallback.
+      Reflect.deleteProperty(bridge, "ready");
+      vi.resetModules();
+      const { FloatingComposerPage: FreshPage } = await import("./FloatingComposerPage");
+      expect(() => render(<FreshPage />)).not.toThrow();
+      expect(prompt()).toBeInTheDocument();
+    } finally {
+      Object.assign(bridge, { ready });
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("hides on Escape and keeps what was typed", () => {
     render(<FloatingComposerPage />);
     fireEvent.change(prompt(), { target: { value: "half a thought" } });

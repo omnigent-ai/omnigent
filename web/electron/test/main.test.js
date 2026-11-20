@@ -3777,6 +3777,36 @@ describe("CLI deep-link handoff", () => {
   }
 });
 
+/** Lets the harness window act as the panel the shell builds; returns its visible state. */
+function asPanelWindow(h) {
+  const panel = { visible: false, destroyed: false };
+  Object.assign(h.win, {
+    setAlwaysOnTop() {},
+    setVisibleOnAllWorkspaces() {},
+    setBounds() {},
+    getBounds: () => ({ x: 0, y: 0, width: 620, height: 360 }),
+    setOpacity() {},
+    moveTop() {},
+    showInactive: () => (panel.visible = true),
+    isVisible: () => panel.visible,
+    hide: () => (panel.visible = false),
+    isDestroyed: () => panel.destroyed,
+    destroy() {
+      panel.destroyed = true;
+      h.emitWindow("closed");
+    },
+  });
+  Object.assign(h.webContents, { isCrashed: () => false, focus() {} });
+  const display = { id: 1, workArea: { x: 0, y: 0, width: 1440, height: 900 } };
+  Object.assign(h.electron.screen, {
+    getAllDisplays: () => [display],
+    getCursorScreenPoint: () => ({ x: 10, y: 10 }),
+    getDisplayNearestPoint: () => display,
+  });
+  h.electron.systemPreferences.getAnimationSettings = () => ({ prefersReducedMotion: true });
+  return panel;
+}
+
 describe("floating panel wiring", () => {
   const chord = "CommandOrControl+Shift+Space";
   const serverUrl = "https://host.example/ml/omnigents";
@@ -3880,31 +3910,7 @@ describe("floating panel wiring", () => {
 
   /** Turns the harness window into its server's panel, opened as ⇧⌘Space would. */
   function openPanel(h, { ready = true } = {}) {
-    const panel = { visible: false, destroyed: false };
-    Object.assign(h.win, {
-      setAlwaysOnTop() {},
-      setVisibleOnAllWorkspaces() {},
-      setBounds() {},
-      getBounds: () => ({ x: 0, y: 0, width: 620, height: 360 }),
-      setOpacity() {},
-      moveTop() {},
-      showInactive: () => (panel.visible = true),
-      isVisible: () => panel.visible,
-      hide: () => (panel.visible = false),
-      isDestroyed: () => panel.destroyed,
-      destroy() {
-        panel.destroyed = true;
-        h.emitWindow("closed");
-      },
-    });
-    Object.assign(h.webContents, { isCrashed: () => false, focus() {} });
-    const display = { id: 1, workArea: { x: 0, y: 0, width: 1440, height: 900 } };
-    Object.assign(h.electron.screen, {
-      getAllDisplays: () => [display],
-      getCursorScreenPoint: () => ({ x: 10, y: 10 }),
-      getDisplayNearestPoint: () => display,
-    });
-    h.electron.systemPreferences.getAnimationSettings = () => ({ prefersReducedMotion: true });
+    const panel = asPanelWindow(h);
     h.api.floatingComposer().show(serverUrl);
     // Its page has loaded and rendered the composer.
     if (ready) h.api.floatingComposer().markReady(h.win);
@@ -7035,7 +7041,6 @@ describe("New Window keeps its source's server (src/main.js)", () => {
 });
 
 describe("floating panel loading", () => {
-  const chord = "CommandOrControl+Shift+Space";
   const announce = (h) => {
     const frame = { url: h.webContents.getURL() };
     h.webContents.mainFrame = frame;
@@ -7045,31 +7050,6 @@ describe("floating panel loading", () => {
     );
   };
   const panelsBuilt = (h) => (h.calls.windowOptions ?? []).filter((o) => o.type === "panel").length;
-  /** The harness window, able to act as the panel the shell builds; returns its visibility. */
-  const panelable = (h) => {
-    const panel = { visible: false };
-    Object.assign(h.win, {
-      setAlwaysOnTop() {},
-      setVisibleOnAllWorkspaces() {},
-      setBounds() {},
-      getBounds: () => ({ x: 0, y: 0, width: 620, height: 360 }),
-      setOpacity() {},
-      moveTop() {},
-      isVisible: () => panel.visible,
-      showInactive: () => (panel.visible = true),
-      hide: () => (panel.visible = false),
-    });
-    Object.assign(h.webContents, { isCrashed: () => false, focus() {} });
-    const display = { id: 1, workArea: { x: 0, y: 0, width: 1440, height: 900 } };
-    Object.assign(h.electron.screen, {
-      getAllDisplays: () => [display],
-      getCursorScreenPoint: () => ({ x: 10, y: 10 }),
-      getDisplayNearestPoint: () => display,
-    });
-    h.electron.systemPreferences.getAnimationSettings = () => ({ prefersReducedMotion: true });
-    return panel;
-  };
-
   it("shows no connection overlay over a panel, which loads out of sight", async (t) => {
     const h = loadNavigationHarness({ platform: "darwin", loadServer: async () => {} });
     t.after(h.cleanup);
@@ -7086,7 +7066,7 @@ describe("floating panel loading", () => {
     const h = loadNavigationHarness({ platform: "darwin" });
     t.after(h.cleanup);
     h.api.registerIpc();
-    const panel = panelable(h);
+    const panel = asPanelWindow(h);
     announce(h);
     t.mock.timers.tick(2999);
     assert.equal(panelsBuilt(h), 0);
@@ -7095,17 +7075,29 @@ describe("floating panel loading", () => {
     assert.equal(panel.visible, false, "built out of sight");
   });
 
-  it("lets an early ⇧⌘Space build the panel itself, with no second build after", (t) => {
+  it("cancels a pending build when ⇧⌘Space comes first, as live code", () => {
+    // The press builds the panel itself; the preloader's own test covers cancelling the wait.
+    assert.match(
+      liveCode,
+      /function openFloatingComposerFromShortcut\(\) \{\s*floatingComposerPreloader\.cancel\(\);/,
+    );
+  });
+
+  it("builds nothing ahead while the user has turned the shortcut off", (t) => {
     t.mock.timers.enable({ apis: ["setTimeout"] });
     const h = loadNavigationHarness({ platform: "darwin" });
     t.after(h.cleanup);
+    fs.writeFileSync(
+      h.settingsPath,
+      JSON.stringify({
+        floating_composer_shortcut: { enabled: false, accelerator: "CommandOrControl+Shift+Space" },
+      }),
+    );
     h.api.registerIpc();
-    panelable(h);
+    asPanelWindow(h);
     announce(h);
-    h.calls.presses.get(chord)();
-    assert.equal(panelsBuilt(h), 1);
     t.mock.timers.tick(3000);
-    assert.equal(panelsBuilt(h), 1);
+    assert.equal(panelsBuilt(h), 0);
   });
 
   it("builds nothing ahead off macOS", (t) => {

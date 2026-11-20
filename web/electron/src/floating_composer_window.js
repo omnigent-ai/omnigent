@@ -278,7 +278,8 @@ function createFloatingComposerController(deps) {
   function reveal(serverUrl, panel) {
     cancelReveal(panel);
     if (panel.isDestroyed()) return;
-    unshown.delete(panel);
+    // A document that has been on screen reopens at once, even one that never says it's ready.
+    ready.add(panel);
     panel.setBounds(targetFrame(serverUrl));
     if (deps.present) deps.present(panel, () => panel.showInactive());
     else panel.showInactive();
@@ -306,6 +307,12 @@ function createFloatingComposerController(deps) {
     show(serverUrl) {
       if (typeof serverUrl !== "string" || serverUrl.length === 0) return "unavailable";
       const panel = panelFor(serverUrl);
+      // Asked for now: no longer a build ahead that a release may drop, and another server's
+      // build ahead isn't needed.
+      unshown.delete(panel);
+      for (const [otherUrl, other] of [...panels]) {
+        if (unshown.has(other)) discard(otherUrl, other);
+      }
       if (panel.isVisible()) {
         // A visible panel that lost focus needs an explicit focus; showInactive won't key it.
         panel.moveTop();
@@ -413,6 +420,8 @@ function createFloatingComposerController(deps) {
 /**
  * Builds a panel hidden once the app has been quiet for a while, so ⇧⌘Space shows a page that
  * has already loaded. Each `schedule` restarts the wait; an open before it ends cancels it.
+ * `rebuildOnce` builds again after a loaded panel was lost, once until the next `schedule`, so a
+ * page that keeps crashing isn't rebuilt forever.
  *
  * @param {{
  *   target: () => string | null,
@@ -422,19 +431,29 @@ function createFloatingComposerController(deps) {
  */
 function createFloatingComposerPreloader(deps) {
   let timer = null;
+  let rebuilt = false;
   const cancel = () => {
     if (timer !== null) clearTimeout(timer);
     timer = null;
   };
+  const start = () => {
+    cancel();
+    timer = setTimeout(() => {
+      timer = null;
+      const serverUrl = deps.target();
+      if (serverUrl !== null) deps.preload(serverUrl);
+    }, deps.delayMs ?? FLOATING_COMPOSER_PRELOAD_DELAY_MS);
+    timer.unref?.();
+  };
   return {
     schedule() {
-      cancel();
-      timer = setTimeout(() => {
-        timer = null;
-        const serverUrl = deps.target();
-        if (serverUrl !== null) deps.preload(serverUrl);
-      }, deps.delayMs ?? FLOATING_COMPOSER_PRELOAD_DELAY_MS);
-      timer.unref?.();
+      rebuilt = false;
+      start();
+    },
+    rebuildOnce() {
+      if (rebuilt) return;
+      rebuilt = true;
+      start();
     },
     cancel,
   };

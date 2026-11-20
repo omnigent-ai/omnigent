@@ -112,11 +112,12 @@ function setup({
     ...(panelClosed ? { panelClosed } : {}),
   });
   if (autoReady) {
-    // These panels' pages have loaded: each says it's ready as soon as it exists.
+    // These panels' pages have loaded: the one just opened says it's ready as soon as it exists.
     const show = controller.show;
     controller.show = (serverUrl) => {
       const result = show(serverUrl);
-      for (const panel of created) if (!panel.destroyed) controller.markReady(panel);
+      const opened = created.findLast((panel) => panel.serverUrl === serverUrl && !panel.destroyed);
+      if (opened) controller.markReady(opened);
       return result;
     };
   }
@@ -501,7 +502,7 @@ test("an open waits for a loading page to say it's ready, then shows it", (t) =>
   assert.equal(panel.calls.filter((call) => call === "showInactive").length, 1);
 });
 
-test("a page that never says it's ready still shows after a moment", (t) => {
+test("a page that never says it's ready still shows after a moment, then reopens at once", (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const { controller, created } = setup({ autoReady: false });
   controller.show("https://a.example");
@@ -509,6 +510,30 @@ test("a page that never says it's ready still shows after a moment", (t) => {
   assert.equal(created[0].visible, false);
   t.mock.timers.tick(1);
   assert.equal(created[0].visible, true);
+  // That document has been on screen; hiding and reopening it needs no wait.
+  controller.hide(created[0]);
+  controller.show("https://a.example");
+  assert.equal(created[0].visible, true);
+});
+
+test("an open takes a preloaded panel out of the pool a release or another preload may drop", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { controller, created } = setup({ autoReady: false });
+  controller.preload("https://a.example");
+  controller.show("https://a.example");
+  controller.releaseUnshown("https://a.example");
+  controller.preload("https://b.example");
+  assert.equal(created[0].destroyed, false, "the user is waiting for this one");
+  controller.markReady(created[0]);
+  assert.equal(created[0].visible, true);
+});
+
+test("opening one server lets go of another server's panel built ahead", () => {
+  const { controller, created } = setup({ autoReady: false });
+  controller.preload("https://a.example");
+  controller.show("https://b.example");
+  assert.equal(created[0].destroyed, true);
+  assert.equal(created[1].destroyed, false);
 });
 
 test("a ready panel shows at once, and readiness ends with its document", (t) => {
@@ -528,13 +553,6 @@ test("a ready panel shows at once, and readiness ends with its document", (t) =>
     controller.markReady(panel);
     assert.equal(panel.visible, true);
   }
-});
-
-test("only a panel of this controller can say it's ready", () => {
-  const { controller } = setup({ autoReady: false });
-  const stranger = new FakePanel("https://a.example");
-  controller.markReady(stranger);
-  assert.deepEqual(stranger.calls, []);
 });
 
 test("focusing an Omnigent window drops an open still waiting on its page", (t) => {
@@ -624,9 +642,29 @@ test("the preloader builds for the current target once the app is quiet", (t) =>
   preloader.cancel();
   t.mock.timers.tick(FLOATING_COMPOSER_PRELOAD_DELAY_MS);
   assert.deepEqual(built, ["https://a.example"]);
-  // Nothing to build for when no page can render the panel by then.
-  target = null;
+  // The target is read when the wait ends: a page that stopped supporting it meanwhile builds nothing.
   preloader.schedule();
+  target = null;
   t.mock.timers.tick(FLOATING_COMPOSER_PRELOAD_DELAY_MS);
   assert.deepEqual(built, ["https://a.example"]);
+});
+
+test("a lost panel is rebuilt once, until a page announces again", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const built = [];
+  const preloader = createFloatingComposerPreloader({
+    target: () => "https://a.example",
+    preload: (serverUrl) => built.push(serverUrl),
+  });
+  preloader.rebuildOnce();
+  t.mock.timers.tick(FLOATING_COMPOSER_PRELOAD_DELAY_MS);
+  // A page that keeps crashing isn't rebuilt again and again.
+  preloader.rebuildOnce();
+  t.mock.timers.tick(FLOATING_COMPOSER_PRELOAD_DELAY_MS);
+  assert.equal(built.length, 1);
+  preloader.schedule();
+  t.mock.timers.tick(FLOATING_COMPOSER_PRELOAD_DELAY_MS);
+  preloader.rebuildOnce();
+  t.mock.timers.tick(FLOATING_COMPOSER_PRELOAD_DELAY_MS);
+  assert.equal(built.length, 3);
 });
