@@ -1431,9 +1431,11 @@ def test_forwarder_replayed_spawn_snapshot_does_not_revive_backfilled_completed_
     assert _child_statuses(posted) == []
 
 
+@pytest.mark.parametrize("turn_status", ["inProgress", "in_progress"])
 def test_forwarder_replayed_spawn_snapshot_marks_backfilled_running_child_working(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    turn_status: str,
 ) -> None:
     """
     A replayed spawn snapshot still marks a child busy when its resumed turn is live,
@@ -1441,7 +1443,7 @@ def test_forwarder_replayed_spawn_snapshot_marks_backfilled_running_child_workin
     """
     posted: list[tuple[str, dict[str, Any]]] = []
     codex_client = _PerThreadFakeCodexClient(
-        thread_responses={"thread_child": _child_resume_response(turn_status="inProgress")}
+        thread_responses={"thread_child": _child_resume_response(turn_status=turn_status)}
     )
     state, bridge_dir = _snapshot_test_state(tmp_path, monkeypatch, codex_client=codex_client)
 
