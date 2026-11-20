@@ -57,6 +57,22 @@ from omnigent.inner.egress.rules import (
 
 logger = logging.getLogger(__name__)
 
+RequestBodyTransform = Callable[[str, str, int, str, bytes], bytes]
+
+
+@dataclass(frozen=True)
+class HostScopedRequestBodyTransform:
+    """Apply a trusted body transform only to one destination host."""
+
+    host: str
+    transform: RequestBodyTransform
+
+    def __call__(self, method: str, host: str, port: int, path: str, body: bytes) -> bytes:
+        if host.lower() != self.host.lower():
+            return body
+        return self.transform(method, host, port, path, body)
+
+
 _CONNECT_RESPONSE = b"HTTP/1.1 200 Connection Established\r\n\r\n"
 _HTTP2_PREFACE_FIRST_LINE = b"PRI * HTTP/2.0\r\n"
 _BUF_SIZE = 65536
@@ -289,8 +305,10 @@ class EgressProxy:
         block_private_destinations: bool = True,
         auth_token: str | None = None,
         credential_rewrites: list[CredentialRewriteRule] | None = None,
+        request_body_transform: RequestBodyTransform | None = None,
     ) -> None:
         self._rules = rules
+        self._request_body_transform = request_body_transform
         self._cert_cache = HostCertCache(ca_cert_path, ca_key_path)
         # Build the upstream TLS verification context ONCE, at
         # construction time, from the configured bundle path. The
@@ -675,14 +693,19 @@ class EgressProxy:
                             tls_writer, "HTTP/2 cannot use a credential rewrite rule"
                         )
                         return
+                    if not self._allows_http2_passthrough(host):
+                        await self._send_forbidden(
+                            tls_writer, "HTTP/2 cannot bypass request inspection"
+                        )
+                        return
                     logger.info("ALLOW-H2 https://%s/**", host)
                     await self._forward_http2(tls_reader, tls_writer, host, port, inner_first)
                     return
 
                 try:
-                    inner_method, inner_path = self._parse_inner_request_line(inner_first)
+                    inner_method, inner_path = self._parse_tunnel_request_line(host, inner_first)
                     inner_headers_raw = await self._read_headers(tls_reader)
-                    content_length = self._parse_inner_content_length(inner_headers_raw)
+                    content_length = self._parse_tunnel_content_length(host, inner_headers_raw)
                 except ValueError:
                     await self._send_forbidden(tls_writer, "malformed inner request")
                     return
@@ -779,6 +802,16 @@ class EgressProxy:
     def _tls_connection_closed(self) -> None:
         """Notify a specialized relay when the inbound TLS tunnel ends."""
 
+    def _parse_tunnel_request_line(self, host: str, raw: bytes) -> tuple[str, str]:
+        """Parse a CONNECT request line using the relay's existing parser."""
+        del host
+        return self._parse_inner_request_line(raw)
+
+    def _parse_tunnel_content_length(self, host: str, headers_raw: bytes) -> int:
+        """Parse CONNECT body framing using the relay's existing parser."""
+        del host
+        return self._parse_inner_content_length(headers_raw)
+
     @staticmethod
     def _parse_inner_request_line(raw: bytes) -> tuple[str, str]:
         """Parse the generic proxy's inner HTTP request line."""
@@ -798,7 +831,32 @@ class EgressProxy:
 
     def _allows_http2_passthrough(self, host: str) -> bool:
         """Return whether opaque HTTP/2 relay is safe for *host*."""
-        return self._allows_unrestricted_host(host) and host.lower() not in self._cred_by_host
+        return (
+            (
+                self._request_body_transform is None
+                or (
+                    isinstance(self._request_body_transform, HostScopedRequestBodyTransform)
+                    and host.lower() != self._request_body_transform.host.lower()
+                )
+            )
+            and self._allows_unrestricted_host(host)
+            and host.lower() not in self._cred_by_host
+        )
+
+    def _transform_request_body(
+        self, method: str, host: str, port: int, path: str, headers: bytes, body: bytes
+    ) -> tuple[bytes, bytes]:
+        """Apply a trusted compatibility patch after request policy checks."""
+        if self._request_body_transform is None:
+            return headers, body
+        transformed = self._request_body_transform(method, host, port, path, body)
+        if transformed == body:
+            return headers, body
+        message = _parse_http_headers(headers)
+        del message["Content-Length"]
+        del message["Transfer-Encoding"]
+        message["Content-Length"] = str(len(transformed))
+        return message.as_bytes(policy=email.policy.HTTP), transformed
 
     async def _forward_http2(
         self,
@@ -858,6 +916,9 @@ class EgressProxy:
         body: bytes,
     ) -> bool:
         """Open a real TLS connection to the target and relay."""
+        headers_raw, body = self._transform_request_body(
+            method, host, port, path, headers_raw, body
+        )
         try:
             pinned_ip = await self._assert_destination_allowed(host, port)
         except PermissionError as exc:
@@ -1036,6 +1097,10 @@ class EgressProxy:
         body = b""
         if content_length > 0:
             body = await asyncio.wait_for(reader.readexactly(content_length), timeout=30)
+
+        headers_raw, body = self._transform_request_body(
+            method, host, port, path, headers_raw, body
+        )
 
         relative_line = f"{method} {path} HTTP/1.1\r\n".encode("latin-1")
         rewrite = await self._rewrite_authorization_async(

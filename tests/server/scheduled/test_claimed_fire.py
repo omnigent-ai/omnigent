@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
+from omnigent.db.account_authority import account_checks_scope
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
 from omnigent.server.auth import (
     LEVEL_EDIT,
@@ -116,6 +117,7 @@ def _claim(
     store: SqlAlchemyScheduledTaskStore,
     *,
     agent_id: str = _AGENT_ID,
+    user_id: str | None = None,
     one_time: bool = False,
     **kwargs: Any,
 ) -> _Claimed:
@@ -131,7 +133,7 @@ def _claim(
         "nightly",
         "do the thing",
         "FREQ=HOURLY;COUNT=1" if one_time else "FREQ=HOURLY",
-        None,
+        user_id,
         agent_id,
         "UTC",
         **kwargs,
@@ -173,8 +175,16 @@ def _runs(store: SqlAlchemyScheduledTaskStore, task: ScheduledTask) -> list[Sche
 # ── Starting a claimed run ───────────────────────────────────────────────────
 
 
-async def test_connected_fire_runs_on_the_claimed_run(store, debug_log_rows) -> None:
-    claimed = _claim(store)
+@pytest.mark.parametrize("external_auth", [False, True])
+async def test_connected_fire_runs_on_the_claimed_run(
+    store, debug_log_rows, monkeypatch, external_auth
+) -> None:
+    with account_checks_scope(not external_auth):
+        claimed = _claim(store, user_id="alice" if external_auth else None)
+    permissions = FakePermissionStore()
+    if external_auth:
+        owner = replace(permissions.get_user("alice"), account_generation="current")
+        monkeypatch.setattr(permissions, "get_user", lambda _user_id: owner)
     conversations = _ConversationStore()
     seen: list[ScheduledTaskRun] = []
 
@@ -183,9 +193,11 @@ async def test_connected_fire_runs_on_the_claimed_run(store, debug_log_rows) -> 
         await asyncio.to_thread(fire_mod._logger.info, "dispatch correlation probe")
 
     executor = ClaimedRunExecutor(
-        _deps(store, conversation_store=conversations), launch_dispatch=dispatch
+        _deps(store, conversation_store=conversations, permission_store=permissions),
+        launch_dispatch=dispatch,
     )
-    await executor.fire(claimed.task, claimed.lease)
+    with account_checks_scope(not external_auth):
+        await executor.fire(claimed.task, claimed.lease)
 
     [session_id] = conversations.ids
     # The session is on the run before its prompt is sent, so recovery can find it.

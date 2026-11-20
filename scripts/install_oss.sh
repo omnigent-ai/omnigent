@@ -537,9 +537,9 @@ install_omnigent() {
     target="${PACKAGE_NAME}${extras_suffix}"
     step "Installing Omnigent${extras_suffix:+ $extras_suffix} (Python $PYTHON_VERSION)"
   fi
-  # --force so re-running upgrades instead of no-op'ing; -q hides uv's
-  # "Installed N executables" summary (the package also ships an `omni` alias).
-  run_with_spinner "uv tool install" uv tool install --force -q --python "$(python_request)" "$target"
+  # --reinstall replaces existing hard-linked packages with private copies.
+  # -q hides uv's executable summary (the package also ships an `omni` alias).
+  run_with_spinner "uv tool install" uv tool install --force --reinstall -q --link-mode copy --python "$(python_request)" "$target"
 }
 
 install_databricks_cli() (

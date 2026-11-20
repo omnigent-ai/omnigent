@@ -7,23 +7,33 @@ import errno
 import json
 import logging
 import shutil
+import ssl
 import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import NoReturn
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
+import httpx
 import pytest
 
 import omnigent.inner.terminal as terminal_mod
 import omnigent.util.tmux_compat as tmux_compat
 from omnigent.errors import ErrorCategory, ErrorImpact, classify_exception
 from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
+from omnigent.inner.claude_model_access import ClaudeModelAccess
+from omnigent.inner.datamodel import (
+    GitSshBinding,
+    OSEnvSandboxSpec,
+    OSEnvSpec,
+    TcpEgressRoute,
+    TerminalEnvSpec,
+)
+from omnigent.inner.sandbox import SandboxPolicy
 from omnigent.inner.terminal import (
     TerminalInstance,
     _apply_utf8_locale_default,
@@ -39,7 +49,10 @@ from omnigent.inner.terminal_lifecycle import (
 from omnigent.native import owner_claim
 from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
 from omnigent.runner.resource_registry import trim_terminal_output
+from tests._helpers.egress_ca import prepare_isolated_egress_ca
+from tests._helpers.live_server import terminate_process
 from tests._helpers.polling import poll_until
+from tests._helpers.stdio_jsonrpc import read_json_line
 
 
 @dataclass
@@ -2585,11 +2598,7 @@ async def test_launch_discards_previous_exit_diagnostics_before_starting(
     monkeypatch.setattr(
         terminal_mod,
         "asyncio",
-        SimpleNamespace(
-            create_subprocess_exec=spawn,
-            subprocess=asyncio.subprocess,
-            to_thread=asyncio.to_thread,
-        ),
+        SimpleNamespace(**{**vars(asyncio), "create_subprocess_exec": spawn}),
     )
     if launch_fails:
         with pytest.raises(RuntimeError, match="tmux launch failed"):
@@ -2781,6 +2790,8 @@ def test_create_terminal_instance_propagates_keep_alive_after_exit(
     result = create_terminal_instance(name="bash", session_key="s1", spec=spec)
     try:
         assert result.instance.keep_alive_after_exit is keep_alive
+        assert result.instance.sandbox_policy is None
+        assert spec.os_env.sandbox is None
     finally:
         shutil.rmtree(result.instance.private_dir, ignore_errors=True)
 
@@ -3394,7 +3405,7 @@ async def test_terminal_desktop_session_follows_sandbox_policy(
     monkeypatch.setattr(
         terminal_mod,
         "asyncio",
-        SimpleNamespace(create_subprocess_exec=spawn, subprocess=terminal_mod.asyncio.subprocess),
+        SimpleNamespace(**{**vars(asyncio), "create_subprocess_exec": spawn}),
     )
     monkeypatch.setattr(terminal_mod, "create_exec_launcher", lambda *_: "/test/launcher")
     instance = TerminalInstance(
@@ -3853,6 +3864,412 @@ def test_create_terminal_instance_denies_control_socket_but_keeps_private_dir_wr
         )
     finally:
         shutil.rmtree(instance.private_dir, ignore_errors=True)
+
+
+@pytest.fixture
+def terminal_proxy_ca(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep terminal relay certificates separate from the host's cached CA."""
+    prepare_isolated_egress_ca(tmp_path / "ca", monkeypatch)
+
+
+@pytest.mark.parametrize("allow_private", [False, True])
+async def test_terminal_model_relay_honors_private_opt_in_without_egress_rules(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_proxy_ca: None,
+    allow_private: bool,
+) -> None:
+    """Automatic model access retains the spec's private-destination policy."""
+    policy = SandboxPolicy("linux_bwrap", True, [tmp_path], [tmp_path], [], False)
+    # Resolve a policy without requiring an installed OS sandbox or launching tmux.
+    monkeypatch.setattr(terminal_mod, "_require_supported_tmux", lambda: None)
+    monkeypatch.setattr("omnigent.inner.os_env.resolve_sandbox", lambda *_: policy)
+    created = create_terminal_instance(
+        "shell",
+        "main",
+        TerminalEnvSpec(),
+        parent_os_env_spec=OSEnvSpec(
+            cwd=str(tmp_path),
+            sandbox=OSEnvSandboxSpec(
+                allow_network=False,
+                egress_allow_private_destinations=allow_private,
+            ),
+        ),
+    )
+    instance = created.instance
+    instance.model_access = ClaudeModelAccess(
+        "https://127.0.0.1", "authorization", lambda: "parent-only-key"
+    )
+    try:
+        assert not instance.egress_rules
+        assert instance.sandbox_policy is not None
+        instance._bootstrap_egress_proxy(instance.sandbox_policy, {})
+        assert instance._egress_handle is not None
+        proxy = instance._egress_handle._proxy
+        # Exercise the real guard: replacing it would hide a dropped opt-in.
+        if allow_private:
+            assert await proxy._assert_destination_allowed("127.0.0.1", 443) is None
+        else:
+            with pytest.raises(PermissionError, match="egress_allow_private_destinations"):
+                await proxy._assert_destination_allowed("127.0.0.1", 443)
+    finally:
+        await instance.close()
+
+
+async def test_terminal_profile_credential_resolves_during_async_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, terminal_proxy_ca: None
+) -> None:
+    """The terminal starts its signer after minting a parent-only profile credential."""
+    credential = "parent-only-key"
+    access = ClaudeModelAccess(
+        "https://model.test",
+        "authorization",
+        lambda: asyncio.run(asyncio.sleep(0, result=credential)),
+    )
+    instance = TerminalInstance(
+        "shell",
+        "main",
+        tmp_path / "terminal/tmux.sock",
+        tmp_path / "terminal",
+        env={"MODEL_ALIAS": credential},
+        sandbox_policy=SandboxPolicy("linux_bwrap", True, [tmp_path], [tmp_path], [], False),
+        model_access=access,
+    )
+    spawn = AsyncMock(return_value=_SuccessfulProcess())
+    monkeypatch.setattr(terminal_mod.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(
+        terminal_mod, "create_exec_launcher", lambda *_args, **_kwargs: "/test/launcher"
+    )
+    monkeypatch.setattr(instance, "_tmux_base_cmd", lambda path_env=None: ["tmux"])
+    try:
+        await instance.launch(cwd=tmp_path)
+        environment = spawn.call_args.kwargs["env"]
+        assert environment["ANTHROPIC_AUTH_TOKEN"] == access.placeholder
+        assert credential not in str(environment)
+        assert instance._egress_handle is not None
+    finally:
+        instance.running = False
+        await instance.close()
+
+
+async def test_terminal_cancel_waits_for_egress_bootstrap_before_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancellation cannot leave a proxy starting after its owner has cleaned up."""
+    started = threading.Event()
+    release = threading.Event()
+    events: list[str] = []
+    instance = TerminalInstance(
+        "shell",
+        "main",
+        tmp_path / "terminal/tmux.sock",
+        tmp_path / "terminal",
+        sandbox_policy=SandboxPolicy("linux_bwrap", True, [tmp_path], [tmp_path], [], False),
+        egress_rules=["POST model.test/v1/messages"],
+    )
+
+    def bootstrap(policy: SandboxPolicy, env: dict[str, str]) -> SandboxPolicy:
+        started.set()
+        assert release.wait(timeout=5)
+        events.append("started")
+        return policy
+
+    monkeypatch.setattr(instance, "_bootstrap_egress_proxy", bootstrap)
+    monkeypatch.setattr(instance, "_stop_network_brokers", lambda: events.append("stopped"))
+    launch = asyncio.create_task(instance.launch(cwd=tmp_path))
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        launch.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await launch
+        assert events == ["started", "stopped"]
+    finally:
+        release.set()
+
+
+async def test_terminal_cancel_waits_for_launcher_validation_and_removes_script(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A late launcher result belongs to the cancelled terminal, not a future launch."""
+    started = threading.Event()
+    release = threading.Event()
+    launcher_path = tmp_path / "launcher.sh"
+    private_dir = tmp_path / "terminal"
+    private_dir.mkdir()
+    instance = TerminalInstance(
+        "shell",
+        "main",
+        private_dir / "tmux.sock",
+        private_dir,
+        sandbox_policy=SandboxPolicy("linux_bwrap", True, [tmp_path], [tmp_path], [], False),
+    )
+    stopped: list[bool] = []
+
+    def validate_and_create(*_args: object, **_kwargs: object) -> str:
+        started.set()
+        assert release.wait(timeout=5)
+        launcher_path.write_text("#!/bin/sh\n", encoding="utf-8")
+        return str(launcher_path)
+
+    monkeypatch.setattr(terminal_mod, "create_exec_launcher", validate_and_create)
+    monkeypatch.setattr(instance, "_stop_network_brokers", lambda: stopped.append(True))
+    launch = asyncio.create_task(instance.launch(cwd=tmp_path))
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        heartbeat = asyncio.Event()
+        asyncio.get_running_loop().call_soon(heartbeat.set)
+        await asyncio.wait_for(heartbeat.wait(), timeout=1)
+        launch.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await launch
+        assert not launcher_path.exists()
+        assert stopped == [True]
+    finally:
+        release.set()
+        if not launch.done():
+            launch.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await launch
+
+
+def test_failed_terminal_fork_removes_partially_created_private_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    private_dir = tmp_path / "private"
+    private_dir.mkdir()
+    monkeypatch.setattr(terminal_mod, "_require_supported_tmux", lambda: None)
+    monkeypatch.setattr(terminal_mod.tempfile, "mkdtemp", lambda **_kwargs: str(private_dir))
+
+    def fail_copy(*_args: object) -> None:
+        raise OSError("copy failed")
+
+    monkeypatch.setattr(terminal_mod, "_copy_tree", fail_copy)
+    spec = TerminalEnvSpec(
+        command="cat",
+        os_env=OSEnvSpec(cwd=str(tmp_path), fork=True),
+    )
+    with pytest.raises(OSError, match="copy failed"):
+        create_terminal_instance("shell", "main", spec)
+    assert not private_dir.exists()
+
+
+@pytest.mark.parametrize("spawn_fails", [False, True])
+async def test_terminal_launcher_is_owned_until_close_or_spawn_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spawn_fails: bool
+) -> None:
+    private_dir = tmp_path / "terminal"
+    private_dir.mkdir()
+    launcher_path = tmp_path / "launcher.sh"
+    instance = TerminalInstance(
+        "shell",
+        "main",
+        private_dir / "tmux.sock",
+        private_dir,
+        sandbox_policy=SandboxPolicy("linux_bwrap", True, [tmp_path], [tmp_path], [], False),
+    )
+
+    def create_launcher(*_args: object, **_kwargs: object) -> str:
+        launcher_path.write_text("#!/bin/sh\n", encoding="utf-8")
+        return str(launcher_path)
+
+    monkeypatch.setattr(terminal_mod, "create_exec_launcher", create_launcher)
+    monkeypatch.setattr(instance, "_tmux_base_cmd", lambda path_env=None: ["tmux"])
+    monkeypatch.setattr(instance, "_tmux", AsyncMock())
+    if spawn_fails:
+        monkeypatch.setattr(
+            terminal_mod.asyncio,
+            "create_subprocess_exec",
+            AsyncMock(side_effect=FileNotFoundError("tmux")),
+        )
+    else:
+        monkeypatch.setattr(
+            terminal_mod.asyncio,
+            "create_subprocess_exec",
+            AsyncMock(return_value=_SuccessfulProcess()),
+        )
+    try:
+        if spawn_fails:
+            with pytest.raises(FileNotFoundError, match="tmux"):
+                await instance.launch(cwd=tmp_path)
+            assert not launcher_path.exists()
+        else:
+            await instance.launch(cwd=tmp_path)
+            assert launcher_path.exists()
+    finally:
+        await instance.close()
+    assert not launcher_path.exists()
+
+
+@pytest.mark.parametrize("broker_kind", ["git_ssh", "tcp_egress"])
+async def test_terminal_cancel_waits_for_optional_broker_before_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, broker_kind: str
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    policy = SandboxPolicy("linux_bwrap", True, [tmp_path], [tmp_path], [], False)
+    if broker_kind == "git_ssh":
+        policy = replace(
+            policy,
+            git_ssh=[
+                GitSshBinding(
+                    "git.test", 22, "git", "repo", frozenset({"read"}), "key", "known_hosts"
+                )
+            ],
+        )
+    else:
+        policy = replace(policy, tcp_egress=[TcpEgressRoute("database", "db.test", 5432)])
+    instance = TerminalInstance(
+        "shell", "main", tmp_path / "tmux.sock", tmp_path, sandbox_policy=policy
+    )
+    stopped: list[bool] = []
+
+    def bootstrap(_policy: SandboxPolicy, _env: dict[str, str]) -> SandboxPolicy:
+        started.set()
+        assert release.wait(timeout=5)
+        return policy
+
+    monkeypatch.setattr(instance, f"_bootstrap_{broker_kind}", bootstrap)
+    monkeypatch.setattr(instance, "_stop_network_brokers", lambda: stopped.append(True))
+    launch = asyncio.create_task(instance.launch(cwd=tmp_path))
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        heartbeat = asyncio.Event()
+        asyncio.get_running_loop().call_soon(heartbeat.set)
+        await asyncio.wait_for(heartbeat.wait(), timeout=1)
+        launch.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await launch
+        assert stopped == [True]
+    finally:
+        release.set()
+
+
+async def test_terminal_model_relay_restores_thinking_only_for_selected_gateway(
+    tmp_path: Path,
+    terminal_proxy_ca: None,
+) -> None:
+    """The terminal's signer restores thinking without changing ordinary egress."""
+    access = ClaudeModelAccess(
+        "https://gateway.test/anthropic", "authorization", lambda: "parent-only-key"
+    )
+    instance = TerminalInstance(
+        "shell",
+        "main",
+        tmp_path / "terminal/tmux.sock",
+        tmp_path / "terminal",
+        model_access=access,
+        egress_rules=["POST other.test/**"],
+    )
+    policy = SandboxPolicy("linux_bwrap", True, [tmp_path], [tmp_path], [], False)
+    body = json.dumps(
+        {
+            "model": "databricks-claude-opus-4-8",
+            "thinking": {"type": "adaptive"},
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+    ).encode()
+    try:
+        instance._bootstrap_egress_proxy(policy, {})
+        assert instance._egress_handle is not None
+        proxy = instance._egress_handle._proxy
+        signed = proxy._reconstruct_request(
+            bearer_token="parent-only-key",
+            method="POST",
+            connect_host=access.host,
+            sni_host=access.host,
+            request_host=access.host,
+            target="/anthropic/v1/messages?beta=true",
+            headers=[
+                ("Authorization", f"Bearer {access.placeholder}"),
+                ("Content-Type", "application/json"),
+            ],
+            body=body,
+        )
+        expected = json.loads(body)
+        expected["thinking"]["display"] = "summarized"
+        assert json.loads(signed.body) == expected
+        assert signed.header("Content-Length") == str(len(signed.body))
+        assert signed.header("Authorization") == "Bearer parent-only-key"
+
+        for host, path in (
+            ("other.test", "/anthropic/v1/messages"),
+            (access.host, "/v1/messages"),
+            (access.host, "/anthropic/v1/messages/count_tokens"),
+        ):
+            headers = f"Content-Length: {len(body)}\r\n\r\n".encode()
+            assert proxy._transform_request_body("POST", host, 443, path, headers, body) == (
+                headers,
+                body,
+            )
+    finally:
+        await instance.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_model_relay_rejects_missing_or_wrong_placeholder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_proxy_ca: None,
+) -> None:
+    """A terminal's unauthenticated proxy port cannot resolve model credentials alone."""
+    credential = Mock(return_value="parent-only-key")
+    access = ClaudeModelAccess("https://model.test", "x-api-key", credential)
+    instance = TerminalInstance(
+        "shell",
+        "main",
+        tmp_path / "terminal/tmux.sock",
+        tmp_path / "terminal",
+        model_access=access,
+    )
+    policy = SandboxPolicy("linux_bwrap", True, [tmp_path], [tmp_path], [], False)
+    environment: dict[str, str] = {}
+    relay: subprocess.Popen[str] | None = None
+    try:
+        instance._bootstrap_egress_proxy(policy, environment)
+        handle = instance._egress_handle
+        assert handle is not None
+        assert environment["ANTHROPIC_AUTH_TOKEN"] == access.placeholder
+        assert "@" not in environment["HTTPS_PROXY"]
+        monkeypatch.setattr(
+            handle._proxy, "_assert_destination_allowed", AsyncMock(return_value="127.0.0.1")
+        )
+        credential.reset_mock()
+        relay_code = (
+            "import json, sys; from omnigent.inner.egress.relay import start_relay; "
+            "ready = start_relay(int(sys.argv[1]), sys.argv[2]); assert ready.wait(5); "
+            "print(json.dumps({'status': 'READY'}), flush=True); sys.stdin.read()"
+        )
+        relay = subprocess.Popen(
+            [sys.executable, "-c", relay_code, str(handle.relay_port), str(handle.socket_path)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        assert relay.stdout is not None
+        assert read_json_line(relay.stdout, timeout_s=10) == {"status": "READY"}
+        trust = ssl.create_default_context(cafile=str(handle.ca_bundle_path))
+        async with httpx.AsyncClient(
+            proxy=f"http://127.0.0.1:{handle.relay_port}",
+            verify=trust,
+            trust_env=False,
+            timeout=5,
+        ) as client:
+            for headers in ({}, {"x-api-key": "wrong"}):
+                response = await client.post(
+                    "https://model.test/v1/messages",
+                    json={"model": "claude-test", "messages": []},
+                    headers=headers,
+                )
+                assert response.status_code == 403
+        credential.assert_not_called()
+    finally:
+        if relay is not None:
+            terminate_process(relay, timeout_s=5)
+        await instance.close()
 
 
 # ── UTF-8 locale default for native TUI panes (issue #2427) ──────────────────

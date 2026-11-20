@@ -217,6 +217,22 @@ describe("useWorkflowRuns live refresh", () => {
     },
   );
 
+  it("reads whether a run's sandbox is launching, which older servers leave out", async () => {
+    let serverRuns: object[] = [
+      { ...RUNNING_RUN, session_status: "idle", sandbox_launching: true },
+    ];
+    vi.mocked(authenticatedFetch).mockImplementation(async () =>
+      Response.json({ data: serverRuns, next_cursor: null }),
+    );
+    const { result } = renderRuns();
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(result.current.data?.pages[0].runs[0]?.sandboxLaunching).toBe(true);
+
+    serverRuns = [{ ...RUNNING_RUN, session_status: "idle" }];
+    await act(() => vi.advanceTimersByTimeAsync(10_000));
+    expect(result.current.data?.pages[0].runs[0]?.sandboxLaunching).toBe(false);
+  });
+
   it("does not poll without a workflow ID", async () => {
     renderRuns("");
     await act(() => vi.advanceTimersByTimeAsync(30_000));
