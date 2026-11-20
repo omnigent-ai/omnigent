@@ -8,19 +8,25 @@ there the tabs code never loads.
 
 The flag is turned on by answering ``/v1/info`` with it added to the server's own features;
 the server side of the flag is covered by ``tests/server/test_feature_flags.py``. Pull
-requests come from the same stubs as ``test_github_tab.py``, so no ``gh`` runs.
+requests come from the same stubs as ``test_github_tab.py``, so no ``gh`` runs. The Changes
+journey runs on its own server and host, with ``workspace_api_server_access`` on, so its Git
+reads go through the workspace API.
 """
 
 from __future__ import annotations
 
 import re
+import subprocess
 from collections.abc import Iterator
+from pathlib import Path
 
+import httpx
 import pytest
 from playwright.sync_api import Locator, Page, Request, Route, expect
 
 from tests._helpers.pull_request_ui import open_session_pull_requests
-from tests.e2e_ui.conftest import open_right_rail
+from tests._helpers.server_runner import server_runner
+from tests.e2e_ui.conftest import _BUILD_OUTPUT, open_right_rail
 from tests.e2e_ui.files.test_file_autosave import (
     _cleanup_session_workdir,
     _seed_file,
@@ -310,3 +316,115 @@ def test_flag_off_keeps_the_classic_sidebar(
         expect(rail.get_by_text(_PR_TITLE)).to_be_visible(timeout=30_000)
         expect(rail.get_by_role("group", name="Workspace history")).to_have_count(0)
     _expect_no_tabs_code(page, scripts)
+
+
+def _commit(repository: Path, path: str, subject: str) -> None:
+    (repository / path).write_text(f"{subject}\n")
+    for args in (("add", path), ("commit", "-q", "-m", subject)):
+        subprocess.run(
+            ["git", "-c", "user.name=Example", "-c", "user.email=dev@example.com", *args],
+            cwd=repository,
+            check=True,
+        )
+
+
+@pytest.fixture
+def git_session(built_spa: None, tmp_path: Path) -> Iterator[tuple[str, str]]:
+    """A session on a real host whose workspace is a repository on a feature branch.
+
+    ``main`` has one commit, tagged ``v1.0``, and is ``origin``'s default branch;
+    ``feature`` adds two more.
+    """
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repository, check=True)
+    _commit(repository, "base.txt", "Add the base")
+    subprocess.run(["git", "tag", "v1.0"], cwd=repository, check=True)
+    # All branch changes compares with the merge base of origin's default branch.
+    for args in (
+        ("remote", "add", "origin", str(origin)),
+        ("push", "-q", "origin", "main"),
+        ("remote", "set-head", "origin", "main"),
+    ):
+        subprocess.run(["git", *args], cwd=repository, check=True)
+    subprocess.run(["git", "checkout", "-q", "-b", "feature"], cwd=repository, check=True)
+    _commit(repository, "feature_first.txt", "Add the first feature file")
+    _commit(repository, "feature_last.txt", "Add the last feature file")
+    server_env = {
+        "OMNIGENT_FEATURES": "workspace_api_server_access",
+        "OMNIGENT_WEB_UI_DIST": str(_BUILD_OUTPUT),
+    }
+    with (
+        server_runner(tmp_path / "stack", server_env=server_env) as stack,
+        httpx.Client(base_url=stack.base_url, timeout=60.0, trust_env=False) as client,
+    ):
+        stack.start_host()
+        agents = client.get("/v1/agents", params={"limit": 100})
+        agents.raise_for_status()
+        # An SDK agent needs no CLI on the host, and no turn runs here.
+        agent_id = next(
+            agent["id"] for agent in agents.json()["data"] if agent.get("harness") == "claude-sdk"
+        )
+        created = client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent_id,
+                "host_id": stack.host_id,
+                "workspace": str(repository),
+            },
+        )
+        created.raise_for_status()
+        yield stack.base_url, created.json()["id"]
+
+
+def test_changes_compare_branches_and_tags_through_the_workspace_api(
+    page: Page, git_session: tuple[str, str]
+) -> None:
+    """The picker suggests branches and tags; All branch changes and Last commit list files."""
+    base_url, session_id = git_session
+    _set_flag(page, True)
+    _open_session(page, base_url, session_id, "desktop")
+    open_right_rail(page)
+    sidebar = page.get_by_role("complementary", name="Workspace")
+    expect(sidebar.get_by_role("group", name="Workspace history")).to_be_visible(timeout=60_000)
+    _open_app(page, sidebar, "Diffs")
+
+    def compare(choice: str) -> Locator:
+        sidebar.get_by_role("button", name="Change compared revisions").click()
+        picker = page.get_by_role("dialog", name="Compared revisions")
+        picker.get_by_role("group", name="Compare").get_by_role("button", name=choice).click()
+        expect(picker).to_have_count(0)
+        return sidebar.get_by_role("button", name="Change compared revisions")
+
+    def changed(name: str) -> Locator:
+        return sidebar.get_by_role("button", name=f"Copy path {name}", exact=True)
+
+    # The branch's two commits, against where it left main, each with its diff.
+    expect(compare("All branch changes")).to_contain_text("All branch changes", timeout=30_000)
+    for name in ("feature_first.txt", "feature_last.txt"):
+        expect(changed(name)).to_be_visible(timeout=30_000)
+    expect(changed("base.txt")).to_have_count(0)
+    expect(sidebar.get_by_text("Add the first feature file", exact=True)).to_be_visible(
+        timeout=30_000
+    )
+    expect(sidebar.get_by_text("Couldn't load this diff.", exact=False)).to_have_count(0)
+
+    # Base and Head suggest the repository's branches and tag.
+    sidebar.get_by_role("button", name="Change compared revisions").click()
+    picker = page.get_by_role("dialog", name="Compared revisions")
+    expect(picker.get_by_role("combobox", name="Base revision")).to_be_visible()
+    suggested = picker.locator("datalist").first
+    for name in ("feature", "main", "v1.0"):
+        expect(suggested.locator(f'option[value="{name}"]')).to_have_count(1, timeout=30_000)
+    page.keyboard.press("Escape")
+
+    # The last commit alone.
+    expect(compare("Last commit")).to_contain_text("Last commit", timeout=30_000)
+    expect(changed("feature_last.txt")).to_be_visible(timeout=30_000)
+    expect(changed("feature_first.txt")).to_have_count(0)
+    expect(sidebar.get_by_text("Add the last feature file", exact=True)).to_be_visible(
+        timeout=30_000
+    )
+    expect(sidebar.get_by_text("Not available on this host yet.")).to_have_count(0)
