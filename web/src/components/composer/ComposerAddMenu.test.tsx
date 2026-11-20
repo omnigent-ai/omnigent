@@ -121,3 +121,55 @@ describe("ComposerAddMenu's Run a workflow", () => {
     await waitFor(() => expect(onWorkflow).toHaveBeenCalledWith("Bump deps"));
   });
 });
+
+describe("ComposerAddMenu's placement", () => {
+  afterEach(cleanup);
+
+  function rect(left: number, top: number, width: number, height: number): DOMRect {
+    return {
+      left,
+      top,
+      width,
+      height,
+      right: left + width,
+      bottom: top + height,
+      x: left,
+      y: top,
+      toJSON: () => ({}),
+    } as DOMRect;
+  }
+
+  /** Opens the menu inside a composer card measured at 640px wide, with the trigger near its foot. */
+  function openInCard(appearance?: "panel") {
+    render(
+      <div data-composer-card="" data-composer-appearance={appearance} data-testid="card">
+        <ComposerAddMenu
+          disabled={false}
+          planActive={false}
+          showGoal={false}
+          showPlan={false}
+          onAttach={vi.fn()}
+        />
+      </div>,
+    );
+    vi.spyOn(screen.getByTestId("card"), "getBoundingClientRect").mockReturnValue(
+      rect(20, 40, 640, 400),
+    );
+    const trigger = screen.getByRole("button", { name: "Add" });
+    vi.spyOn(trigger, "getBoundingClientRect").mockReturnValue(rect(32, 400, 28, 28));
+    fireEvent.pointerDown(trigger, { button: 0 });
+    return screen.getByTestId("composer-add-menu");
+  }
+
+  it("spans the composer card above it in a main window", () => {
+    expect(openInCard()).toHaveStyle({ width: "640px" });
+  });
+
+  // In a panel the card is the whole window, so card geometry would pin the menu to its top.
+  it("opens from the trigger at its own width in a panel", () => {
+    const menu = openInCard("panel");
+    expect(menu.style.width).toBe("");
+    expect(menu).toHaveAttribute("data-side", "top");
+    expect(menu).toHaveAttribute("data-align", "start");
+  });
+});
