@@ -972,6 +972,17 @@ install production desktop updates. `build:mac:release` retains
 cross-platform publishing and update-feed checklist, see [the desktop release
 runbook](RELEASING.md).
 
+The `.deb` runs `build/deb-after-install.sh` as its post-install script: a copy
+of electron-builder's default that always installs `/opt/Omnigent/chrome-sandbox`
+setuid root (`4755`). Chromium uses that helper only where the desktop user
+cannot create user namespaces (Ubuntu 24.04+ with
+`kernel.apparmor_restrict_unprivileged_userns=1`); electron-builder's default
+probes that as the root installer and leaves the helper `0755`, relying on its
+bundled AppArmor profile. Where that profile is not in effect, the app aborts at
+launch unless started with `--no-sandbox`. Re-sync the script with the upstream
+template when upgrading electron-builder; `test/linux_packaging.test.js` fails
+when they drift.
+
 macOS apps, including unpackaged development, default to V2 onboarding for both
 new and existing profiles. Windows/Linux keep the legacy default. The setup-page
 switch still persists an explicit choice on every platform, and
