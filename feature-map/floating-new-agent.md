@@ -15,7 +15,8 @@ off by default.
 - `dismiss`: Escape, the panel's Close button and ⌘W hide it, and so does
   focusing an Omnigent window, except while the panel's file picker is open.
   The draft, attachments and choices survive until the next open.
-- `launch`: ⌘↵ (or the send button) creates the session on This Mac in the chosen
+- `launch`: ⌘↵ (shown beside the send button; plain ↵ adds a line) or the send
+  button creates the session on This Mac in the chosen
   folder, or in a new sandbox. The session opens in an Omnigent window of the same
   server without coming forward, the panel hides, and the first message is
   delivered once. A successful launch clears the panel for the next prompt.
@@ -35,8 +36,8 @@ off by default.
 - Desktop app on macOS, from any app or Space: press ⇧⌘Space while an Omnigent
   window of a server with the flag on is open. The panel opens for the server of
   the most recently focused Omnigent window.
-- Settings → General → Desktop app → **Open New Agent from anywhere** turns
-  ⇧⌘Space off or records another chord. The row shows only with the flag on, in a
+- Settings → General → Desktop app → **Open New Agent from anywhere**, marked
+  System-wide, turns ⇧⌘Space off or records another chord. The row shows only with the flag on, in a
   desktop app that can show the panel. A chord **Show Omnigent from anywhere**
   already uses is refused.
 - There is no menu, Dock or command-palette entry yet.

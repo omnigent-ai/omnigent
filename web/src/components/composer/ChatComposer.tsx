@@ -131,7 +131,8 @@ type ChatComposerInputProps =
 type ChatComposerProps = ChatComposerBaseProps & ChatComposerInputProps;
 
 interface ChatComposerBaseProps extends Omit<ComponentPropsWithoutRef<"div">, "children"> {
-  appearance?: "default" | "glass";
+  /** `panel` fills a window that is itself the card: no border, the input grows, actions at the foot. */
+  appearance?: "default" | "glass" | "panel";
   /** Attachments, mentions, or feedback that need the expanded mobile layout. */
   hasContent?: boolean;
   keyboard: {
@@ -153,6 +154,14 @@ interface ChatComposerBaseProps extends Omit<ComponentPropsWithoutRef<"div">, "c
     trailingTestId?: string;
   };
 }
+
+/** The card's own surface for each appearance; a panel has none, since its window is the card. */
+const COMPOSER_SURFACE_CLASS = {
+  panel: "min-h-0 flex-1",
+  glass: "isolate rounded-[20px] border-0 bg-transparent md:min-h-[105px]",
+  default:
+    "composer-reference-surface rounded-2xl border transition-shadow duration-150 hover:shadow-[var(--composer-shadow)] has-[[data-composer-input]:focus]:shadow-[var(--composer-shadow)] md:min-h-[105px]",
+} as const;
 
 export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(function ChatComposer(
   {
@@ -198,10 +207,13 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
     Boolean(slots?.inputPrefix) ||
     String(input.value ?? uncontrolledValue).length > 0;
   const needsHintPlaceholder = input.placeholder === "" && Boolean(slots?.inputHint);
+  const panel = appearance === "panel";
   // Shared by both input paths: one row on mobile, and the label as a hint-only placeholder.
+  // In a panel the input takes all the height its area has, and the area scrolls.
   const inputLayout = {
     rows: input.rows ?? (isMobile ? 1 : undefined),
     placeholder: isMobile && needsHintPlaceholder ? input["aria-label"] : input.placeholder,
+    ...(panel && { className: cn(input.className, "max-h-none flex-1") }),
   };
   const trackUncontrolled = (value: string) => {
     if (input.value === undefined) setUncontrolledValue(value);
@@ -217,13 +229,8 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
       data-composer-card
       data-mobile-composer={isMobile ? (expanded ? "expanded" : "collapsed") : undefined}
       data-composer-hint-placeholder={needsHintPlaceholder || undefined}
-      className={cn(
-        "relative flex w-full flex-col rounded-2xl md:min-h-[105px]",
-        appearance === "glass"
-          ? "isolate rounded-[20px] border-0 bg-transparent"
-          : "composer-reference-surface border transition-shadow duration-150 hover:shadow-[var(--composer-shadow)] has-[[data-composer-input]:focus]:shadow-[var(--composer-shadow)]",
-        className,
-      )}
+      data-composer-appearance={panel ? "panel" : undefined}
+      className={cn("relative flex w-full flex-col", COMPOSER_SURFACE_CLASS[appearance], className)}
       {...props}
       onFocusCapture={(event) => {
         // Header controls bubble through React portals outside this card.
@@ -248,7 +255,10 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
       {slots?.beforeInput}
       <ComposerInputArea
         data-composer-input-area
-        className={slots?.inputPrefix ? "max-h-[320px] overflow-y-auto" : undefined}
+        className={cn(
+          panel && "flex min-h-0 flex-1 flex-col overflow-y-auto",
+          !panel && slots?.inputPrefix && "max-h-[320px] overflow-y-auto",
+        )}
       >
         <ComposerEngineContext.Provider value={renderedEngine}>
           {slots?.inputPrefix}
@@ -272,6 +282,7 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
                 ...input,
                 ...inputLayout,
                 inputId: input.inputId ?? COMPOSER_TAIL_INPUT_ID,
+                ...(panel && { heightMode: "unbounded" as const }),
                 onChange: (event) => {
                   trackUncontrolled(event.currentTarget.value);
                   input.onChange?.(event);
@@ -284,7 +295,12 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
         {slots?.inputHint}
       </ComposerInputArea>
       {slots?.attachments}
-      <ComposerActionRow ref={actionRowRef} data-composer-actions data-testid={actions.testId}>
+      <ComposerActionRow
+        ref={actionRowRef}
+        data-composer-actions
+        data-testid={actions.testId}
+        className={panel ? "shrink-0 border-t border-border py-2" : undefined}
+      >
         {/* Zero-height width probe: resize-observed instead of the row itself,
             whose height the collapse verdict can change. */}
         <div ref={actionWidthRef} className="absolute inset-x-0 top-0 h-0" />

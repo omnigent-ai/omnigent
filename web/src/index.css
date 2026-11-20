@@ -754,6 +754,16 @@
   border-color: color(srgb 0.960784 0.960784 0.956863 / 0.04);
 }
 
+/* The floating New Agent panel is itself the card, so its workspace row is a full-width
+   toolbar strip, set off from the prompt like the panel's header and footer. */
+[data-presentation="floating"] .composer-context-bar {
+  width: 100%;
+  margin: 0;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+}
+
 .composer-context-bar.rounded-t-none {
   border-top-width: 0;
   border-top-left-radius: 0;

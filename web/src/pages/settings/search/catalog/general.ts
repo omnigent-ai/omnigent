@@ -130,8 +130,19 @@ export const GLOBAL_SHORTCUT_ENTRY = settingsEntry({
   available: (availability) => availability.globalShortcut,
   section: "general",
   label: "Show Omnigent from anywhere",
-  description: "Brings Omnigent to the front from any app.",
-  keywords: ["shortcut", "hotkey", "keyboard", "global", "desktop", "bring to front", "window"],
+  description:
+    "A system-wide shortcut: it brings Omnigent to the front from any app, even when Omnigent is in the background.",
+  keywords: [
+    "shortcut",
+    "hotkey",
+    "keyboard",
+    "global",
+    "system-wide",
+    "any app",
+    "desktop",
+    "bring to front",
+    "window",
+  ],
   // Named by the chord it holds, or by the prompt while it records one.
   parts: { recorder: "Shortcut" },
   nameTemplates: { recorder: { before: "Shortcut: " } },
@@ -143,8 +154,19 @@ export const FLOATING_COMPOSER_SHORTCUT_ENTRY = settingsEntry({
   available: (availability) => availability.floatingComposerShortcut,
   section: "general",
   label: "Open New Agent from anywhere",
-  description: "Opens the New Agent panel from any app to start a session.",
-  keywords: ["shortcut", "hotkey", "keyboard", "global", "desktop", "new agent", "panel"],
+  description:
+    "A system-wide shortcut: it opens the New Agent panel from any app, even when Omnigent is in the background.",
+  keywords: [
+    "shortcut",
+    "hotkey",
+    "keyboard",
+    "global",
+    "system-wide",
+    "any app",
+    "desktop",
+    "new agent",
+    "panel",
+  ],
   // Named by the chord it holds, or by the prompt while it records one.
   parts: { recorder: "New Agent shortcut" },
   nameTemplates: { recorder: { before: "New Agent shortcut: " } },
