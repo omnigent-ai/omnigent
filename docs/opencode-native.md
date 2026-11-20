@@ -15,7 +15,15 @@ OpenCode **2.0.18 or a later 2.0.x patch** (`>=2.0.18,<2.1.0`), published on npm
 as `@opencode/cli`. Newer minors are refused until they are validated. OpenCode
 1.x (`opencode-ai`) is no longer supported. A host running an unsupported version
 reports the harness as *outdated* until it is upgraded.
-`OMNIGENT_OPENCODE_SKIP_VERSION_CHECK=1` bypasses the gate at your own risk.
+
+To run an OpenCode you can't change, such as a newer release your organization
+manages, set `OMNIGENT_OPENCODE_SKIP_VERSION_CHECK=1` (any non-empty value) in
+the environment of the host and runner. The host then reports any installed
+OpenCode as ready, setup doesn't offer to reinstall the pinned release, and
+`opencode serve` launches without the version check. A warning names the
+installed version and the supported range. This is at your own risk: releases
+outside the range, including 3.x, haven't been validated. A missing CLI is still
+reported as missing.
 
 ## Install and sign in
 
@@ -86,9 +94,11 @@ prompt: |
 Every tool call asks: the runner writes a `permissions` rule
 `{action: "*", resource: "*", effect: "ask"}` into the per-conversation config
 and never passes `--auto`. This routes every call through the Omnigent policy
-engine. Omnigent's relay tools, and any MCP servers merged from your own
-OpenCode config, run with Code Mode off, so each call is asked under its own
-`<server>_<tool>` name and a policy can gate it by name. OpenCode's own MCP
+engine. Native sessions include only the agent-declared MCP servers and the
+Omnigent relay; ambient MCP servers from your global OpenCode config are not
+inherited. Your providers, default model, and plugins still merge normally.
+The declared servers and relay run with Code Mode off, so each call is asked
+under its own `<server>_<tool>` name and a policy can gate it by name. OpenCode's own MCP
 builtins (`opencode_list_mcp_resources`, `opencode_read_mcp_resource`) can
 still reach any configured server and have no config switch to turn them off.
 They are gated as OS tools: `ask_on_os_tools` asks before each one.

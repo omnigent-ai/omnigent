@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest";
-import type { ImageContentBlock, MessageContentBlock } from "./blocks";
+import type { AnyBlock, ElicitationBlock, ImageContentBlock, MessageContentBlock } from "./blocks";
 import {
   attachmentLabel,
+  hasPendingOwnElicitation,
   imagePreview,
+  pendingWorkflowQuestions,
+  isPendingBlockingElicitation,
   isTextBlock,
   keyedAttachments,
   slashCommandDisplayName,
@@ -241,6 +244,60 @@ describe("isTextBlock", () => {
     expect(isTextBlock({ type: "input_file", filename: "notes.pdf" })).toBe(false);
     const block = { type: "input_text", text: { parts: ["hi"] } } as unknown as MessageContentBlock;
     expect(isTextBlock(block)).toBe(false);
+  });
+});
+
+describe("pending elicitation checks", () => {
+  const card: ElicitationBlock = {
+    type: "elicitation",
+    ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "resp_1", itemId: null },
+    elicitationId: "elic_1",
+    targetSessionId: null,
+    message: "Codex needs input",
+    phase: "codex_request_user_input",
+    policyName: "codex_native_request_user_input",
+    contentPreview: "{}",
+    requestedSchema: {},
+    url: null,
+    status: "pending",
+    response: null,
+  };
+
+  it("isPendingBlockingElicitation counts only a pending card the turn waits on", () => {
+    expect(isPendingBlockingElicitation(card)).toBe(true);
+    expect(isPendingBlockingElicitation({ ...card, isBlocking: false })).toBe(false);
+    expect(isPendingBlockingElicitation({ ...card, status: "responded" })).toBe(false);
+    const responseEnd = { type: "response_end", ctx: card.ctx, status: "pending", response: null };
+    expect(isPendingBlockingElicitation(responseEnd as AnyBlock)).toBe(false);
+  });
+
+  it("hasPendingOwnElicitation counts only this session's own blocking card", () => {
+    expect(hasPendingOwnElicitation([card], "conv_1")).toBe(true);
+    expect(hasPendingOwnElicitation([{ ...card, isBlocking: false }], "conv_1")).toBe(false);
+    expect(hasPendingOwnElicitation([{ ...card, targetSessionId: "conv_child" }], "conv_1")).toBe(
+      false,
+    );
+  });
+
+  it("pendingWorkflowQuestions pairs each of the session's own workflow questions with its task", () => {
+    const question = { ...card, phase: "workflow_request_input", journalStep: "deploy" };
+    expect(
+      pendingWorkflowQuestions(
+        [
+          question,
+          { ...question, elicitationId: "elic_2", journalStep: "docs" },
+          // Answered, another kind of prompt, a sub-agent's mirrored question, and one with no task.
+          { ...question, elicitationId: "elic_3", journalStep: "lint", status: "responded" },
+          { ...card, elicitationId: "elic_4" },
+          { ...question, elicitationId: "elic_5", targetSessionId: "conv_child" },
+          { ...question, elicitationId: "elic_6", journalStep: undefined },
+        ],
+        "conv_1",
+      ),
+    ).toEqual([
+      ["deploy", "elic_1"],
+      ["docs", "elic_2"],
+    ]);
   });
 });
 

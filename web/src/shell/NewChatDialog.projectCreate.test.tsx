@@ -32,19 +32,26 @@ vi.mock("@/hooks/useSidebarData", () => ({
 vi.mock("@/hooks/useSkills", () => ({
   useSkills: () => ({ skills: [], skillsStatus: "ready", refetch: vi.fn() }),
 }));
+vi.mock("@/lib/sessionHost", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionHostModule>()),
+  setSessionHost: vi.fn(),
+}));
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as HostWorktreesModule from "@/hooks/useHostWorktrees";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as ToastModule from "@/components/ui/toast";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
+import type * as SessionHostModule from "@/lib/sessionHost";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { discardNestedSessionDraft, type NestedSessionDraft } from "@/lib/nestedSessionDrafts";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 
 import { authenticatedFetch } from "@/lib/identity";
 import { composerContextToLabels } from "@/lib/composerContextAdapters";
 import { createBundledSession, getSessionSlim, launchRunner } from "@/lib/sessionsApi";
+import { setSessionHost } from "@/lib/sessionHost";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import type { Host } from "@/hooks/useHosts";
@@ -253,12 +260,15 @@ function setRepoIsGit(): void {
   });
 }
 
-function renderLanding(infoOverrides: Partial<ServerInfo> = {}): {
+function renderLanding(
+  infoOverrides: Partial<ServerInfo> = {},
+  landingProps: Parameters<typeof NewChatLandingScreen>[0] = {},
+  client = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+): {
   rerender: (ui: ReactNode) => void;
   unmount: () => void;
   client: QueryClient;
 } {
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const info = {
     accounts_enabled: false,
     single_user: false,
@@ -292,7 +302,9 @@ function renderLanding(infoOverrides: Partial<ServerInfo> = {}): {
       </QueryClientProvider>
     );
   }
-  const { rerender, unmount } = render(<NewChatLandingScreen />, { wrapper: Wrapper });
+  const { rerender, unmount } = render(<NewChatLandingScreen {...landingProps} />, {
+    wrapper: Wrapper,
+  });
   return { rerender, unmount, client };
 }
 
@@ -583,7 +595,7 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     // the server from filling them in.
     const config = { host_id: "host_1", workspace: REPO, agent_id: "ag_other" };
     setProjectConfig(config);
-    renderLanding({ managed_sandboxes_enabled: true });
+    renderLanding({ managed_sandboxes_enabled: true, request_managed_sandbox_host_id: true });
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
     );
@@ -597,7 +609,7 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     expect(body.workspace).toBeNull();
     expect("git" in body).toBe(true);
     expect(body.git).toBeNull();
-    expect("host_id" in body).toBe(false);
+    expect(body.host_id).toMatch(/^[0-9a-f]{32}$/);
     // The untouched config agent is still omitted for default-fill.
     expect("agent_id" in body).toBe(false);
     // The sandbox, not the config host, is remembered for the next session.
@@ -646,12 +658,83 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
       workspace: REPO,
     });
   });
+
+  it("omits host_id and skips setSessionHost on a managed bundled create", async () => {
+    vi.mocked(setSessionHost).mockClear();
+    vi.mocked(createBundledSession).mockResolvedValue({ id: "conv_new", agentId: "ag_pending" });
+    renderLanding({ managed_sandboxes_enabled: true, session_bundle_workspaces: true });
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+    fireEvent.click(screen.getByTestId("test-create-pending"));
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "hello" },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(vi.mocked(createBundledSession)).toHaveBeenCalled());
+    await waitFor(() => expect(navigateMock).toHaveBeenCalled());
+
+    // Bundle creates allocate their sandbox host server-side until multipart host_id ships.
+    const metadata = vi.mocked(createBundledSession).mock.calls[0][1] ?? {};
+    expect(metadata).toMatchObject({ host_type: "managed" });
+    expect("host_id" in metadata).toBe(false);
+    expect(setSessionHost).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { target: "a connected host", sandbox: false },
+    { target: "a durable sandbox", sandbox: true },
+  ])(
+    "delivers a pending custom agent's first message from the project home on $target",
+    async ({ sandbox }) => {
+      setProjectConfig({ host_id: "host_1", workspace: REPO });
+      vi.mocked(createBundledSession).mockResolvedValue({ id: "conv_new", agentId: "ag_pending" });
+      searchParams = new URLSearchParams();
+      const onSessionStarted = vi.fn();
+      renderLanding(
+        {
+          session_bundle_workspaces: true,
+          managed_sandboxes_enabled: sandbox,
+          durable_initial_input: sandbox,
+        },
+        { projectName: "Alpha", onSessionStarted },
+      );
+      await waitFor(() =>
+        expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain(
+          "alpha",
+        ),
+      );
+      if (sandbox) {
+        fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+        fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+      }
+      fireEvent.click(screen.getByTestId("test-create-pending"));
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "hello" },
+      });
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() => expect(onSessionStarted).toHaveBeenCalled());
+
+      const { setPendingInitialPrompt } = await import("@/store/chatStore");
+      if (sandbox) {
+        // The server delivers it once, so the board stays in view.
+        expect(setPendingInitialPrompt).not.toHaveBeenCalled();
+        expect(navigateMock).not.toHaveBeenCalled();
+      } else {
+        expect(setPendingInitialPrompt).toHaveBeenCalledWith(
+          "conv_new",
+          expect.objectContaining({ text: "hello" }),
+        );
+        expect(navigateMock).toHaveBeenCalledWith("/c/conv_new");
+      }
+    },
+  );
 });
 
 describe("NewChatLandingScreen nested agent creation", () => {
   it.each(["", "Nested task"])(
-    "preserves drafts across composer scopes: %s",
+    "resumes nested drafts across navigation and deletes only the chosen draft: %s",
     async (nestedText) => {
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
       vi.mocked(getSessionSlim).mockImplementation(async (id) => ({ ...SOURCE_SESSION, id }));
       const drafts = [
         { source: null, text: "Standalone task", file: "standalone.txt" },
@@ -660,7 +743,7 @@ describe("NewChatLandingScreen nested agent creation", () => {
       ];
       for (const draft of drafts) {
         searchParams = new URLSearchParams(draft.source ? `sibling=${draft.source}` : "");
-        renderLanding({ sibling_sessions: true });
+        renderLanding({ sibling_sessions: true }, {}, client);
         // oxlint-disable-next-line no-await-in-loop -- Each visit must unmount before the next.
         const input = await screen.findByTestId("new-chat-landing-input");
         expect(input).toHaveValue("");
@@ -672,9 +755,11 @@ describe("NewChatLandingScreen nested agent creation", () => {
         }
         cleanup();
       }
+      const parkedDrafts = client.getQueryData<NestedSessionDraft[]>(["nested-session-drafts"])!;
+      expect(parkedDrafts.map((draft) => draft.source.id)).toEqual(["first", "second"]);
       for (const draft of drafts) {
         searchParams = new URLSearchParams(draft.source ? `sibling=${draft.source}` : "");
-        renderLanding({ sibling_sessions: true });
+        renderLanding({ sibling_sessions: true }, {}, client);
         // oxlint-disable-next-line no-await-in-loop -- Each visit must unmount before the next.
         expect(await screen.findByTestId("new-chat-landing-input")).toHaveValue(draft.text);
         for (const other of drafts) {
@@ -683,6 +768,22 @@ describe("NewChatLandingScreen nested agent creation", () => {
         }
         cleanup();
       }
+      expect(client.getQueryData(["nested-session-drafts"])).toEqual(parkedDrafts);
+
+      searchParams = new URLSearchParams("sibling=first");
+      renderLanding({ sibling_sessions: true }, {}, client);
+      expect(await screen.findByTestId("new-chat-landing-input")).toHaveValue(nestedText);
+      act(() => {
+        discardNestedSessionDraft(client, parkedDrafts[0].key);
+      });
+      cleanup();
+      expect(client.getQueryData(["nested-session-drafts"])).toEqual([parkedDrafts[1]]);
+      renderLanding({ sibling_sessions: true }, {}, client);
+      expect(await screen.findByTestId("new-chat-landing-input")).toHaveValue("");
+      expect(screen.queryByText("first.txt")).toBeNull();
+      expect(client.getQueryData<NestedSessionDraft[]>(["nested-session-drafts"])?.[1].id).not.toBe(
+        parkedDrafts[0].id,
+      );
     },
   );
 
@@ -749,6 +850,10 @@ describe("NewChatLandingScreen nested agent creation", () => {
   it.each([false, true])(
     "submits the clicked source for JSON and uploaded agents (bundle=%s)",
     async (bundled) => {
+      // jsdom's default user agent names the OS running the tests; pin one the label maps.
+      const userAgent = vi
+        .spyOn(navigator, "userAgent", "get")
+        .mockReturnValue("Mozilla/5.0 (X11; Linux x86_64)");
       vi.mocked(getSessionSlim).mockImplementation(async (id) => ({ ...SOURCE_SESSION, id }));
       searchParams = new URLSearchParams("sibling=other");
       renderLanding({ sibling_sessions: true });
@@ -760,8 +865,9 @@ describe("NewChatLandingScreen nested agent creation", () => {
       });
       cleanup();
       searchParams = new URLSearchParams("sibling=source");
-      renderLanding({ sibling_sessions: true, session_bundle_workspaces: true });
+      const { client } = renderLanding({ sibling_sessions: true, session_bundle_workspaces: true });
       await screen.findByRole("heading", { name: "Add nested agent" });
+      const draftKey = client.getQueryData<NestedSessionDraft[]>(["nested-session-drafts"])![0].key;
       expect(useHosts).toHaveBeenCalledWith({ refetchOnFocus: true, sourceHostId: "host_1" });
       expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAttribute(
         "aria-label",
@@ -792,9 +898,13 @@ describe("NewChatLandingScreen nested agent creation", () => {
       }
       await waitFor(() => expect(navigateMock).toHaveBeenCalled());
       cleanup();
-      renderLanding({ sibling_sessions: true });
+      renderLanding({ sibling_sessions: true }, {}, client);
       expect(await screen.findByTestId("new-chat-landing-input")).toHaveValue("");
       expect(screen.queryByText("submitted.txt")).not.toBeInTheDocument();
+      expect(client.getQueryData(["nested-session-drafts"])).toEqual([
+        expect.objectContaining({ key: draftKey, created: true }),
+        expect.objectContaining({ key: expect.not.stringMatching(draftKey), creating: false }),
+      ]);
       cleanup();
       searchParams = new URLSearchParams("sibling=other");
       renderLanding({ sibling_sessions: true });
@@ -803,6 +913,7 @@ describe("NewChatLandingScreen nested agent creation", () => {
       );
       expect(screen.getByText("other.txt")).toBeVisible();
       expect(screen.queryByText("submitted.txt")).not.toBeInTheDocument();
+      userAgent.mockRestore();
     },
   );
 });

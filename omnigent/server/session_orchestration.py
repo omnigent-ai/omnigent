@@ -20,6 +20,7 @@ from omnigent.stores.conversation_store import (
     ConversationStore,
 )
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.tools.builtins.session_message import SESSION_MESSAGE_MAX_CHARS
 from omnigent.util.session_lifecycle import is_session_closed
 
 
@@ -107,11 +108,13 @@ def require_archive_outside_source_lineage(
     request: Request, session_id: str, conversations: ConversationStore
 ) -> None:
     """
-    Refuse an agent-tool archive of the calling session or any of its ancestors.
+    Refuse an agent-tool archive of any session the calling session runs under.
 
     Archiving stops the target's running sub-agents, so archiving an ancestor
-    would stop the caller. Cyclic or over-depth lineages are refused. Requests
-    without the orchestration-source header bypass this agent-only guard.
+    would stop the caller mid-turn. The caller may archive itself: the route
+    defers that teardown until its turn ends. Cyclic or over-depth lineages are
+    refused. Requests without the orchestration-source header bypass this
+    agent-only guard.
     """
     raw_source = request.headers.get(ORCHESTRATION_SOURCE_HEADER)
     if not raw_source:
@@ -121,9 +124,9 @@ def require_archive_outside_source_lineage(
     current = conversations.get_conversation(source_id) if source_id else None
     seen: set[str] = set()
     while current is not None:
-        if current.id == target:
+        if current.id == target and current.id != source_id:
             raise OmnigentError(
-                "An agent cannot archive its own session or a session it runs under",
+                "An agent cannot archive a session it runs under",
                 code=ErrorCode.FORBIDDEN,
             )
         if current.id in seen or len(seen) >= _MAX_ARCHIVE_LINEAGE_DEPTH:
@@ -185,8 +188,15 @@ def require_orchestration_source(
 
 def orchestration_message(source_id: str, message: object) -> SessionStartupInput:
     """Build a text-only task with a display label, not proof of message origin."""
-    if not isinstance(message, str) or not message.strip() or len(message) > 8000:
-        raise OmnigentError("Provide a message of 1–8000 characters", code=ErrorCode.INVALID_INPUT)
+    if (
+        not isinstance(message, str)
+        or not message.strip()
+        or len(message) > SESSION_MESSAGE_MAX_CHARS
+    ):
+        raise OmnigentError(
+            f"Provide a message of 1–{SESSION_MESSAGE_MAX_CHARS} characters",
+            code=ErrorCode.INVALID_INPUT,
+        )
     return SessionStartupInput(
         type="message",
         data={

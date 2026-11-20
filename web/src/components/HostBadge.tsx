@@ -101,6 +101,7 @@ export function HostBadge({
   starting = false,
   appearance = "status",
   readOnly = false,
+  launch: sessionLaunch,
 }: {
   sessionId: string;
   onReconnect?: () => void;
@@ -108,20 +109,22 @@ export function HostBadge({
   starting?: boolean;
   appearance?: "status" | "composer" | "header";
   readOnly?: boolean;
+  /** A grid cell passes its own session's launch; defaults to the open session's. */
+  launch?: SandboxStatus | null;
 }) {
   const [switchOpen, setSwitchOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const { session } = useSession(sessionId);
   const hostId = session?.hostId ?? null;
   // Keep sandbox hosts so managed sessions resolve to a provider label.
-  // Skip the fetch (and its 10s refetch loop) when there's no host to
-  // resolve — the badge renders nothing in that case anyway.
+  // Skip the fetch when there's no current host; the picker loads available hosts when opened.
   const { data: hosts } = useHosts({ includeSandbox: true, enabled: Boolean(hostId) });
   const liveOnline = useSessionHostOnline(sessionId);
 
   const host = hostId ? hosts?.find((h) => h.host_id === hostId) : undefined;
   // The open session's sandbox launch, which its chat progress banners also show.
-  const launch = useChatStore((s) => (s.conversationId === sessionId ? s.sandboxStatus : null));
+  const openLaunch = useChatStore((s) => (s.conversationId === sessionId ? s.sandboxStatus : null));
+  const launch = sessionLaunch === undefined ? openLaunch : sessionLaunch;
 
   // Host liveness is keyed by SESSION, not by host, and comes from a ~10s
   // poll. A host switch repoints `hostId` as soon as the session snapshot
@@ -158,7 +161,10 @@ export function HostBadge({
 
   const badge = resolveHostBadge({ hostId, host, online });
   const { switchHostDisabledReason } = useSessionActionRestrictions(sessionId);
-  const canSwitch = host !== undefined && !switchHostDisabledReason && !readOnly;
+  const canSwitch =
+    (host !== undefined || (session !== null && hostId === null && launch === null)) &&
+    !switchHostDisabledReason &&
+    !readOnly;
   useEffect(() => {
     if (!canSwitch) setSwitchOpen(false);
   }, [canSwitch]);

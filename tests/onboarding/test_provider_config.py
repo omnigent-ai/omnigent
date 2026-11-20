@@ -14,6 +14,7 @@ from omnigent.onboarding.provider_config import (
     PI_SURFACE,
     FamilyConfig,
     default_provider_for_harness,
+    drop_unserved_default_scopes,
     harness_family,
     load_providers,
     provider_families,
@@ -400,6 +401,52 @@ def test_databricks_does_not_serve_gemini_surface() -> None:
     bad = {"providers": {"dbx": {"kind": "databricks", "profile": "ws", "default": ["gemini"]}}}
     with pytest.raises(OmnigentError):
         load_providers(bad)
+
+
+@pytest.mark.parametrize(
+    "entry,expected",
+    [
+        (
+            {"kind": "databricks", "profile": "ws", "native_gemini": True, "default": "openai"},
+            {"kind": "databricks", "profile": "ws", "native_gemini": True},
+        ),
+        (
+            {
+                "kind": "databricks",
+                "profile": "ws",
+                "native_gemini": True,
+                "default": ["openai", "gemini"],
+            },
+            {"kind": "databricks", "profile": "ws", "native_gemini": True, "default": True},
+        ),
+        (
+            {"kind": "databricks", "profile": "ws", "default": ["anthropic", "pi", "gemini"]},
+            {"kind": "databricks", "profile": "ws", "default": ["anthropic", "pi"]},
+        ),
+        (
+            {
+                "kind": "gateway",
+                "anthropic": {"base_url": "https://gw.example.com/a", "api_key_ref": "env:K"},
+                "gemini": {"base_url": "https://gw.example.com/g", "api_key_ref": "env:G"},
+                "default": ["anthropic", "gemini", "openai"],
+            },
+            {
+                "kind": "gateway",
+                "anthropic": {"base_url": "https://gw.example.com/a", "api_key_ref": "env:K"},
+                "gemini": {"base_url": "https://gw.example.com/g", "api_key_ref": "env:G"},
+                "default": ["anthropic", "gemini"],
+            },
+        ),
+        ({"kind": "databricks", "native_gemini": True, "default": "openai"}, None),
+    ],
+)
+def test_drop_unserved_default_scopes(
+    entry: dict[str, object], expected: dict[str, object] | None
+) -> None:
+    repaired = drop_unserved_default_scopes("dbx", entry)
+    assert repaired == expected
+    if repaired is not None:
+        load_providers({"providers": {"dbx": repaired}})
 
 
 @pytest.mark.parametrize("native_gemini", [False, True])

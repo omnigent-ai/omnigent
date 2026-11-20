@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import uuid
 from pathlib import Path
 
 import pytest
@@ -279,8 +280,9 @@ async def test_another_project_keeps_the_destination_policy(auth_client, auth_ap
     assert {session.id for session in store.list_conversations().data} == before
 
 
+@pytest.mark.parametrize("by_id", [False, True])
 async def test_the_tool_files_a_worker_in_a_named_project_without_its_defaults(
-    auth_client, auth_app, db_uri, monkeypatch
+    auth_client, auth_app, db_uri, monkeypatch, by_id
 ):
     auth_client.headers["X-Forwarded-Email"] = "alice"
     source = await _create_session_as(auth_client, "", "alice")
@@ -292,8 +294,19 @@ async def test_the_tool_files_a_worker_in_a_named_project_without_its_defaults(
         {"agent_id": other_agent, **_DEFAULTS_THAT_WOULD_CHANGE_THE_WORKER},
     )
 
+    if by_id:
+        from omnigent.server.feature_flags import Feature, FeatureFlags
+
+        auth_app.state.feature_flags = FeatureFlags(
+            auth_app.state.feature_flags.enabled_features | {Feature.SCRIPTED_SESSIONS}
+        )
     worker_id = await _start_worker(
-        auth_client, auth_app, db_uri, monkeypatch, source, tool_args={"project_name": "Elsewhere"}
+        auth_client,
+        auth_app,
+        db_uri,
+        monkeypatch,
+        source,
+        tool_args={"project_id": named} if by_id else {"project_name": "Elsewhere"},
     )
 
     worker = SqlAlchemyConversationStore(db_uri).get_conversation(worker_id)
@@ -692,7 +705,7 @@ async def test_a_child_cannot_archive_its_rebound_parent(auth_client, peers, db_
         )
 
     result = await archive_parent()
-    assert "cannot archive its own session or a session it runs under" in result["error"], result
+    assert "cannot archive a session it runs under" in result["error"], result
     into_existing = await archive_parent(project="Existing")
     assert "a session it runs under" in into_existing["error"], into_existing
     into_new = await archive_parent(project="Brand new")
@@ -768,3 +781,69 @@ async def test_project_update_promotes_a_label_only_folder(auth_client, peers, d
     assert "Somewhere" not in {
         p["name"] for p in (await auth_client.get("/v1/projects")).json()["data"]
     }
+
+
+@_ONE_ENVIRONMENT
+@pytest.mark.parametrize(
+    ("undone", "via"),
+    [(False, "tool"), (True, "tool"), (False, "dashed-path")],
+    ids=["turn-ends", "undone", "turn-ends-dashed-path"],
+)
+async def test_a_session_archives_itself_and_stops_once_its_turn_ends(
+    auth_client, peers, db_uri, monkeypatch, undone, via
+):
+    source, _, _ = peers
+    store = SqlAlchemyConversationStore(db_uri)
+    torn_down: list[str] = []
+
+    async def record_teardown(session_id: str, _store, _runner_router) -> list[str]:
+        torn_down.append(session_id)
+        return []
+
+    monkeypatch.setattr(sessions_module, "_ARCHIVE_STOP_UNDO_GRACE_S", 0.0)
+    monkeypatch.setattr(orchestration, "_SELF_ARCHIVE_TURN_POLL_S", 0.01)
+    monkeypatch.setattr(sessions_module, "_best_effort_stop", record_teardown)
+    # The wait has seen the turn running twice, so it is looping rather than
+    # merely slow to start.
+    seen_running_twice = asyncio.Event()
+    running_reads = 0
+    real_status = orchestration._session_status_from_cache
+
+    def counted_status(session_id: str, *args):
+        nonlocal running_reads
+        status = real_status(session_id, *args)
+        if session_id == source["id"] and status == "running":
+            running_reads += 1
+            if running_reads >= 2:
+                seen_running_twice.set()
+        return status
+
+    monkeypatch.setattr(orchestration, "_session_status_from_cache", counted_status)
+    # The tool call happens mid-turn.
+    monkeypatch.setitem(sessions_common._session_status_cache, source["id"], "running")
+    if via == "tool":
+        result = await _project_tool(
+            auth_client, source, "sys_session_update", session_id=source["id"], archived=True
+        )
+        assert result["status"] == "updated" and result["archived"] is True, result
+    else:
+        # The path may spell the id with dashes; the wait and the pending stop
+        # still key it by the canonical id.
+        response = await auth_client.patch(
+            f"/v1/sessions/{uuid.UUID(source['id'])}",
+            headers={ORCHESTRATION_SOURCE_HEADER: source["id"]},
+            json={"archived": True},
+        )
+        assert response.status_code == 200, response.text
+    assert store.get_conversation(source["id"]).archived is True
+
+    await asyncio.wait_for(seen_running_twice.wait(), 5)
+    assert torn_down == [] and source["id"] in orchestration._pending_archive_stops
+    if undone:
+        # An Undo on another replica only clears the flag; the wait ends without
+        # the turn ending.
+        store.update_conversation(source["id"], archived=False)
+    else:
+        sessions_common._session_status_cache[source["id"]] = "idle"
+    await asyncio.wait_for(asyncio.gather(*list(orchestration._detached_stop_tasks)), 5)
+    assert torn_down == ([] if undone else [source["id"]])

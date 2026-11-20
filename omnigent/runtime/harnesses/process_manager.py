@@ -430,7 +430,10 @@ class _HarnessEndpoint:
         """The ``_runner`` CLI flags selecting this transport."""
         if self.socket_path is not None:
             return ["--socket", str(self.socket_path)]
-        return ["--bind", f"{self.host}:{self.port}"]
+        from omnigent.util.server_url import format_host_port
+
+        assert self.host is not None and self.port is not None
+        return ["--bind", format_host_port(self.host, self.port)]
 
     def make_transport(self) -> httpx.AsyncBaseTransport:
         """An httpx transport routed at this endpoint."""
@@ -443,7 +446,10 @@ class _HarnessEndpoint:
         """The httpx base URL. Under UDS the host is cosmetic; under TCP it routes."""
         if self.socket_path is not None:
             return "http://harness.local"
-        return f"http://{self.host}:{self.port}"
+        from omnigent.util.server_url import format_host_port
+
+        assert self.host is not None and self.port is not None
+        return f"http://{format_host_port(self.host, self.port)}"
 
     async def can_connect(self) -> bool:
         """Whether the runner is accepting connections at this endpoint yet."""

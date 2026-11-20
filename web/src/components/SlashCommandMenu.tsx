@@ -12,7 +12,7 @@ import type { SkillsStatus } from "@/lib/types";
 import { Link } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { MobileMenuGlassSurface } from "./MobileMenuGlassSurface";
 
 /**
@@ -29,11 +29,13 @@ import { MobileMenuGlassSurface } from "./MobileMenuGlassSurface";
 export const BUILTIN_SLASH_COMMANDS: Record<string, string> = {
   "/compact": "Compact conversation context to free up space",
   "/clear": "Clear the context and continue in a new chat on the same machine",
+  "/rewind": "Rewind the conversation to an earlier prompt and edit it",
   "/context": "Show context window usage for this session",
   "/effort": "Set reasoning effort: /effort low | medium | high | default",
   "/model": "Switch the model for this session: /model <name>",
   "/mcp": "Show MCP servers enabled for this session",
   "/permissions": "Change the approval mode for this session",
+  "/goal": "View or set the goal for this session",
   "/new": "Start a blank session in the same project",
   "/btw": "Ask a side question — answered in a dismissable overlay, not saved to the conversation",
   "/side":
@@ -609,12 +611,12 @@ function MenuRowButton({
   const { name, isBuiltin } = row;
   const descriptionRef = useRef<HTMLSpanElement>(null);
   const hoverTimerRef = useRef<number | undefined>(undefined);
-  const coarsePointer = useIsCoarsePointer();
-  // A highlight resting on a cut-off row opens its tooltip, except on touch screens where most
+  const mobileViewport = useIsMobileViewport();
+  // A highlight resting on a cut-off row opens its tooltip, except in the mobile layout where most
   // rows are cut off; a highlight move or new description closes it and drops a pending hover.
   useEffect(() => {
     const timer =
-      active && !coarsePointer
+      active && !mobileViewport
         ? window.setTimeout(
             () => onTooltipOpenChange(name, isCutOff(descriptionRef.current)),
             DESCRIPTION_TOOLTIP_DELAY_MS,
@@ -626,7 +628,7 @@ function MenuRowButton({
       hoverTimerRef.current = undefined;
       onTooltipOpenChange(name, false);
     };
-  }, [active, activeIndex, coarsePointer, name, onTooltipOpenChange, row.description]);
+  }, [active, activeIndex, mobileViewport, name, onTooltipOpenChange, row.description]);
   const tooltipRef = useRef<HTMLDivElement>(null);
   // The composer keeps focus, so PageUp/PageDown page through a description taller than the cap.
   useEffect(() => {

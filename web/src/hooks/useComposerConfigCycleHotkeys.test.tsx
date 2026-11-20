@@ -162,6 +162,30 @@ describe("useComposerConfigCycleHotkeys", () => {
     expect(select).toHaveBeenCalledOnce();
   });
 
+  it("applies on Enter from a composer input that is not a textarea", () => {
+    const apply = vi.fn();
+    renderHook(() =>
+      useComposerConfigCycleHotkeys(
+        [choice("next", { onSelect: vi.fn() })],
+        undefined,
+        true,
+        false,
+        { apply, cancel: vi.fn() },
+      ),
+    );
+    const composer = document.createElement("div");
+    composer.setAttribute("data-composer-card", "");
+    const surface = document.createElement("div");
+    surface.setAttribute("data-composer-input", "");
+    composer.appendChild(surface);
+    document.body.appendChild(composer);
+    act(() => surface.dispatchEvent(event()));
+    const enter = event({ code: "Enter", key: "Enter", ctrlKey: false, altKey: false });
+    act(() => surface.dispatchEvent(enter));
+    expect(enter.defaultPrevented).toBe(true);
+    expect(apply).toHaveBeenCalledOnce();
+  });
+
   it("unbinds when disabled and after unmount", () => {
     const select = vi.fn();
     const { rerender, unmount } = renderHook(
@@ -281,6 +305,7 @@ describe("useComposerConfigCycleHotkeys", () => {
     const composer = document.createElement("div");
     if (composerFocused) composer.setAttribute("data-composer-card", "");
     const input = document.createElement("textarea");
+    input.setAttribute("data-composer-input", "");
     input.addEventListener("keydown", submit);
     composer.appendChild(input);
     document.body.appendChild(composer);

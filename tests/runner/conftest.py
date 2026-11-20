@@ -813,6 +813,7 @@ class _BlockingHarnessClient(_ScriptedHarnessClient):
 
 def _build_interrupt_app(
     gate: asyncio.Event,
+    sse_frames: list[str] | None = None,
 ) -> tuple[FastAPI, _FakeProcessManager, _BlockingHarnessClient]:
     """Build a runner app whose harness emits dangling function_calls.
 
@@ -823,6 +824,8 @@ def _build_interrupt_app(
 
     :param gate: Event that unblocks the harness after the
         function_call frames.
+    :param sse_frames: Frames to stream instead; the gate blocks
+        before the second one.
     :returns: ``(app, process_manager, harness_client)`` tuple.
     """
     # Use the test-only harness so _build_spawn_env_from_spec returns None
@@ -833,7 +836,7 @@ def _build_interrupt_app(
         name="t",
         executor=ExecutorSpec(type="omnigent", config={"harness": "runner-test-default"}),
     )
-    sse_frames = [
+    default_frames = [
         _sse({"type": "response.created", "response": {"id": "resp_int"}}),
         _sse(
             {
@@ -860,7 +863,9 @@ def _build_interrupt_app(
         ),
         _sse({"type": "response.completed", "response": {"id": "resp_int"}}),
     ]
-    harness_client = _BlockingHarnessClient(sse_frames, gate)
+    harness_client = _BlockingHarnessClient(
+        default_frames if sse_frames is None else sse_frames, gate
+    )
     pm = _FakeProcessManager(harness_client)
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:

@@ -3,8 +3,14 @@ import type { Conversation, SessionSortBy } from "@/hooks/useConversations";
 import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 import { getOptimisticTitle } from "@/lib/optimisticTitles";
 import { PROJECT_LABEL_KEY, PINNED_LABEL_KEY } from "@/lib/sessionListCache";
+import {
+  DEFAULT_AUTOMATION_PROJECT,
+  SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
+  SCHEDULED_TASK_LAUNCH_LABEL_KEY,
+  SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+} from "@/lib/automationSessions";
 import type { SidebarCustomOrder } from "@/lib/sidebarViewPreferences";
-import { orderSessionFamilies, isIndividuallyPinnedSibling } from "@/lib/sessionFamilies";
+import { isIndentedSibling, isSessionPinned, orderSessionFamilies } from "@/lib/sessionFamilies";
 
 export const PINNED_CONVERSATION_IDS_STORAGE_KEY = "omnigent:pinned-conversation-ids";
 
@@ -190,6 +196,76 @@ export function sessionBelongsToProject(
   );
 }
 
+/**
+ * Whether *conversation* is another user's automation run shared with the
+ * viewer: the session a run created (a fork drops its initial-run label), or one
+ * launched from a run's session tree.
+ */
+export function isSharedAutomationRun(
+  conversation: Conversation,
+  viewerId: string | null,
+): boolean {
+  if (isOwnedByViewer(conversation, viewerId)) return false;
+  const labels = conversation.labels ?? {};
+  return Boolean(
+    (labels[SCHEDULED_TASK_ORIGIN_LABEL_KEY] && labels[SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY]) ||
+    labels[SCHEDULED_TASK_LAUNCH_LABEL_KEY],
+  );
+}
+
+/**
+ * Sidebar folder membership: {@link sessionBelongsToProject}, and with
+ * `includeSharedRuns` other users' automation runs shared with the viewer go
+ * in the default automation folder, wherever their owner filed them.
+ */
+export function sessionInSidebarFolder(
+  conversation: Conversation,
+  project: { id: string | null; name: string },
+  viewerId: string | null,
+  includeSharedRuns: boolean,
+): boolean {
+  return (
+    sessionBelongsToProject(conversation, project, viewerId) ||
+    (includeSharedRuns &&
+      project.name === DEFAULT_AUTOMATION_PROJECT &&
+      isSharedAutomationRun(conversation, viewerId))
+  );
+}
+
+/** A folder the sidebar shows for shared automation runs before the viewer has that project. */
+export interface PlaceholderProjectFolder {
+  id: null;
+  name: string;
+  placeholder: true;
+}
+
+/**
+ * The viewer's project folders, plus a placeholder default automation folder
+ * when `needed` and they have no project of that name. It takes the place a new
+ * project would: by name, as the server sorts, or last under a manual order.
+ * Creating the real project later replaces it in that spot.
+ */
+export function withAutomationFolder<Project extends { name: string }>(
+  projects: Project[],
+  needed: boolean,
+  manualOrder: boolean,
+): (Project | PlaceholderProjectFolder)[] {
+  if (!needed || projects.some((project) => project.name === DEFAULT_AUTOMATION_PROJECT)) {
+    return projects;
+  }
+  const folder: PlaceholderProjectFolder = {
+    id: null,
+    name: DEFAULT_AUTOMATION_PROJECT,
+    placeholder: true,
+  };
+  const index = manualOrder
+    ? -1
+    : projects.findIndex((project) => project.name > DEFAULT_AUTOMATION_PROJECT);
+  return index < 0
+    ? [...projects, folder]
+    : [...projects.slice(0, index), folder, ...projects.slice(index)];
+}
+
 export function conversationDisplayLabel(conversation: Conversation): string {
   if (conversation.title) return conversation.title;
   // Just-created session: its first prompt stands in until a real title lands.
@@ -238,14 +314,17 @@ export function sortConversations(
   sortBy: SessionSortBy = "updated_at",
   custom?: CustomSortOrder | null,
 ): Conversation[] {
-  const effective = (c: Conversation): number => {
+  const byId = new Map(conversations.map((row) => [row.id, row]));
+  const sortRow = (row: Conversation) =>
+    (row.provisional && byId.get(row.family?.representative_id ?? row.id)) || row;
+  const effective = (row: Conversation): number => {
+    const c = sortRow(row);
     const live = activeOverride?.id === c.id ? activeOverride.updatedAt : c.updated_at;
     const updatedAt = frozenKeys?.get(c.id) ?? live;
     frozenKeys?.set(c.id, updatedAt);
     return sortBy === "created_at" ? c.created_at : updatedAt;
   };
   // Custom: saved rows by position, later-created sessions above, history (ties too) below.
-  const byId = custom ? new Map(conversations.map((row) => [row.id, row])) : null;
   const rank = (c: Conversation): number => {
     if (!custom) return 0;
     const representative = byId?.get(c.family?.representative_id ?? c.id) ?? c;
@@ -255,11 +334,14 @@ export function sortConversations(
     );
   };
   return [...conversations].sort((a, b) => {
-    const aRank = rank(a);
-    const bRank = rank(b);
+    const aSort = sortRow(a);
+    const bSort = sortRow(b);
+    const aRank = rank(aSort);
+    const bRank = rank(bSort);
     if (aRank !== bRank) return aRank - bRank;
-    const byTime = aRank === -1 ? b.created_at - a.created_at : effective(b) - effective(a);
-    return byTime || b.id.localeCompare(a.id);
+    const byTime =
+      aRank === -1 ? bSort.created_at - aSort.created_at : effective(bSort) - effective(aSort);
+    return byTime || bSort.id.localeCompare(aSort.id);
   });
 }
 
@@ -473,9 +555,8 @@ export function orderByPinnedTimestamp(conversations: readonly Conversation[]): 
 
 // A pinned family member sorts by the family's pin time; NaN when there's no value.
 function pinnedSortValue(c: Conversation): number {
-  const raw = isIndividuallyPinnedSibling(c)
-    ? c.labels[PINNED_LABEL_KEY]
-    : (c.family?.pinned_at ?? c.labels?.[PINNED_LABEL_KEY]);
+  const raw =
+    c.family?.pinned_at ?? (!isIndentedSibling(c) ? c.labels?.[PINNED_LABEL_KEY] : undefined);
   return raw ? Number(raw) : NaN;
 }
 
@@ -488,9 +569,8 @@ export interface PinOrderWrite {
 /** A pinned family moves as one unit; nested rows only provide context. */
 export function isPinOrderUnit(conversation: Conversation): boolean {
   return (
-    isIndividuallyPinnedSibling(conversation) ||
-    !conversation.family?.pinned ||
-    conversation.family.representative_id === conversation.id
+    !conversation.family ||
+    (conversation.family.representative_id === conversation.id && isSessionPinned(conversation))
   );
 }
 
@@ -517,12 +597,7 @@ export function pinOrderWrites(
   const moved = [...pinned];
   const [row] = from < 0 ? [{ id: fromId } as Conversation] : moved.splice(from, 1);
   moved.splice(to, 0, row);
-  const value = (c: Conversation | undefined): number =>
-    Number(
-      c && isIndividuallyPinnedSibling(c)
-        ? c.labels[PINNED_LABEL_KEY]
-        : (c?.family?.pinned_at ?? c?.labels?.[PINNED_LABEL_KEY]),
-    );
+  const value = (c: Conversation | undefined): number => (c ? pinnedSortValue(c) : NaN);
   const prev = value(moved[to - 1]);
   const next = value(moved[to + 1]);
   let pinnedAt = prev + (next - prev) / 2;

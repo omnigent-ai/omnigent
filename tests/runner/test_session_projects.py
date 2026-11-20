@@ -44,7 +44,6 @@ def _client(handler) -> httpx.AsyncClient:
         ({"session_id": SOURCE, "pinned": "yes"}, "pinned must be true or false"),
         ({"session_id": SOURCE, "archived": 1}, "archived must be true or false"),
         ({"session_id": SOURCE, "archived": True, "pinned": True}, "cannot be pinned"),
-        ({"session_id": SOURCE, "archived": True}, "cannot archive itself"),
     ],
 )
 async def test_update_rejects_invalid_arguments_before_any_request(args, message):
@@ -466,6 +465,23 @@ async def test_list_forwards_search_and_filters_and_marks_pinned_and_archived():
     assert result["sessions"][0]["pinned"] is True and "archived" not in result["sessions"][0]
     assert result["sessions"][1]["archived"] is True and "pinned" not in result["sessions"][1]
     assert "pinned and include_archived must be true or false" in invalid["error"]
+
+
+async def test_update_lets_the_calling_session_archive_itself():
+    requests: list[httpx.Request] = []
+    snapshot = {"id": SOURCE, "runner_id": "runner-1", "labels": {}}
+    async with _client(_organize_server(requests, snapshot)) as client:
+        result = json.loads(
+            await execute_session_update({"session_id": SOURCE, "archived": True}, client, SOURCE)
+        )
+    assert result["status"] == "updated" and result["archived"] is True
+    assert "once this turn ends" in result["note"]
+    (patch,) = [r for r in requests if r.method == "PATCH"]
+    assert patch.url.path == f"/v1/sessions/{SOURCE}"
+    assert patch.headers[ORCHESTRATION_SOURCE_HEADER] == SOURCE
+    assert json.loads(patch.content) == {"archived": True}
+    # Its own runner is the one to stop, so the shared-runner lookup is skipped.
+    assert not [r for r in requests if "include_live_status" in r.url.params]
 
 
 async def test_update_refuses_to_archive_a_session_on_the_callers_runner():

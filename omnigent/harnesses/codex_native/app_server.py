@@ -22,6 +22,7 @@ from collections.abc import (
     Callable,
     Collection,
     Iterable,
+    Iterator,
     Mapping,
     Sequence,
 )
@@ -165,6 +166,9 @@ _STDERR_CHUNK_LIMIT = 65536
 _CODEX_STATE_DB_GLOB = "state_*.sqlite"
 _UDS_WEBSOCKET_HANDSHAKE_URI = "ws://localhost/rpc"
 _MAX_WEBSOCKET_MESSAGE_SIZE_BYTES = 128 << 20
+# Disable local keepalive so host stalls do not tear down Codex. A live but
+# deadlocked app-server will no longer time out.
+_APP_SERVER_PING_INTERVAL_SECONDS: float | None = None
 # hooks.json filename written into the private CODEX_HOME registering the
 # Omnigent policy hook. Codex discovers it as a ``user``-layer hook
 # source on every config load (see codex hooks ``discover_handlers``).
@@ -314,7 +318,12 @@ def _format_codex_version(version: tuple[int, int, int] | None) -> str:
 #: Omnigent tools the framework calls on every session's behalf, pre-approved
 #: so codex never raises an interactive prompt for them. The rename keeps a
 #: session's title current, which the framework does unprompted on any session.
-_FRAMEWORK_APPROVED_TOOLS: tuple[str, ...] = ("sys_session_rename",)
+# Automation mutations still require Omnigent's server-side human approval.
+_FRAMEWORK_APPROVED_TOOLS: tuple[str, ...] = (
+    "sys_session_rename",
+    "sys_scheduled_task_create",
+    "sys_scheduled_task_update",
+)
 
 #: Additionally pre-approved for an auto-harness Smart Routing session, whose
 #: spawns the router may move onto the counterpart harness family: these four
@@ -1334,6 +1343,7 @@ class CodexAppServerClient:
                 self._ws_url,
                 max_size=_MAX_WEBSOCKET_MESSAGE_SIZE_BYTES,
                 compression=None,
+                ping_interval=_APP_SERVER_PING_INTERVAL_SECONDS,
             )
         else:
             self._ws = await websockets.unix_connect(
@@ -1341,6 +1351,7 @@ class CodexAppServerClient:
                 uri=_UDS_WEBSOCKET_HANDSHAKE_URI,
                 max_size=_MAX_WEBSOCKET_MESSAGE_SIZE_BYTES,
                 compression=None,
+                ping_interval=_APP_SERVER_PING_INTERVAL_SECONDS,
             )
         # Fresh queue per connection so a previous stream's end marker
         # cannot end this connection's consumers.
@@ -1538,9 +1549,12 @@ class CodexAppServerClient:
 
         :returns: None.
         """
-        assert self._ws is not None
+        ws = self._ws
+        assert ws is not None
+        cancelled = False
+        failure: Exception | None = None
         try:
-            async for raw in self._ws:
+            async for raw in ws:
                 if not isinstance(raw, str):
                     continue
                 decoded: object = json.loads(raw)
@@ -1569,7 +1583,34 @@ class CodexAppServerClient:
                         future.set_result(message)
                     continue
                 await self._events.put(message)
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        except ConnectionClosed:
+            raise
+        except Exception as exc:
+            failure = exc
+            raise
         finally:
+            # Cancellation is our own close(); anything else ends the forwarder,
+            # so record why the stream stopped.
+            if failure is not None:
+                _logger.warning(
+                    "Codex app-server reader failed with the socket still open",
+                    exc_info=(type(failure), failure, failure.__traceback__),
+                    extra=debug_event("codex_app_server_reader_failed"),
+                )
+            elif not cancelled:
+                _logger.warning(
+                    "Codex app-server connection closed: code=%s reason=%r",
+                    ws.close_code,
+                    ws.close_reason,
+                    extra=debug_event(
+                        "codex_app_server_connection_closed",
+                        close_code=ws.close_code,
+                        close_reason=ws.close_reason,
+                    ),
+                )
             # Wake iter_events() consumers: no further events can arrive.
             self._events.put_nowait(None)
 
@@ -4103,6 +4144,30 @@ def databricks_profile_codex_models(profile: str) -> DatabricksCodexModelListing
 
 
 def _databricks_servable_codex_models(host: str, profile: str) -> DatabricksCodexModelListing:
+    """List codex-servable ids in Codex's preference order; empty when no listing reads."""
+    from omnigent.models.databricks_model_discovery import order_by_codex_catalog
+
+    listing = _databricks_listed_codex_models(host, profile)
+    if not listing.ids:
+        return listing
+    return DatabricksCodexModelListing(
+        order_by_codex_catalog(listing.ids, _codex_catalog_models()), cached=listing.cached
+    )
+
+
+def _codex_catalog_models() -> list[object]:
+    """Return the installed Codex's catalog rows, or ``[]`` when they cannot be read."""
+    codex_path = _find_codex_cli()
+    if codex_path is None:
+        return []
+    catalog = read_codex_model_catalog(
+        codex_path, _codex_home_config_source_from_env(), timeout=5.0
+    )
+    models = catalog.get("models") if catalog else None
+    return models if isinstance(models, list) else []
+
+
+def _databricks_listed_codex_models(host: str, profile: str) -> DatabricksCodexModelListing:
     """List codex-servable ids live, then from ucode's cached copy; empty when neither reads."""
     from omnigent.models.databricks_model_discovery import discover_databricks_codex_models
 
@@ -4254,8 +4319,10 @@ def build_codex_native_server(
         pinned_model = codex_spawn_model(databricks.model) or databricks.model
     if extra_config_overrides:
         config_overrides.extend(extra_config_overrides)
-    # The --remote TUI's launch args do not configure this app-server's MCP tools.
+    # The --remote TUI's launch args do not configure this app-server's MCP tools
+    # or context window, which govern the turns it runs.
     config_overrides.extend(codex_mcp_tool_approval_overrides(terminal_launch_args))
+    config_overrides.extend(codex_model_window_overrides(terminal_launch_args))
     if bypass_sandbox:
         # Mirror the --remote TUI's --dangerously-bypass-approvals-and-sandbox
         # on the app-server threads: never prompt for approval, and run
@@ -5141,20 +5208,11 @@ def _codex_config_string(raw_value: str) -> str:
     return value if isinstance(value, str) else ""
 
 
-def codex_mcp_tool_approval_overrides(
+def _codex_config_assignments(
     terminal_launch_args: Sequence[str] | None,
-) -> list[str]:
-    """Return the launch args' explicit approval modes for Omnigent ``sys_*`` tools.
-
-    These ``mcp_servers.omnigent.tools.<tool>.approval_mode`` assignments must
-    also reach the app-server that runs web-chat turns. Other MCP servers,
-    config keys, and the global approval policy are left untouched.
-
-    :param terminal_launch_args: Persisted Codex launch arguments.
-    :returns: ``-c`` assignment strings for :func:`build_codex_native_server`.
-    """
+) -> Iterator[tuple[str, str]]:
+    """Yield each ``-c``/``--config`` assignment in the launch args as ``(key, raw_value)``."""
     args = canonical_codex_launch_args(terminal_launch_args or ())
-    modes: dict[str, str | None] = {}
     index = 0
     while index < len(args):
         arg = args[index]
@@ -5168,13 +5226,60 @@ def codex_mcp_tool_approval_overrides(
             assignment = arg.split("=", 1)[1]
         if assignment is not None:
             key, _, raw_value = assignment.partition("=")
-            key = key.strip()
-            # Codex applies overrides in order: a later key or parent-table assignment wins.
-            for tracked_key in [tracked for tracked in modes if tracked.startswith(f"{key}.")]:
-                del modes[tracked_key]
-            if re.fullmatch(r"mcp_servers\.omnigent\.tools\.sys_[a-z_]+\.approval_mode", key):
-                modes[key] = _codex_config_string(raw_value)
+            yield key.strip(), raw_value
         index += 1
+
+
+# Model-window keys sized per session: the thread's context window and the
+# token count that triggers auto-compaction.
+_CODEX_MODEL_WINDOW_KEYS = ("model_context_window", "model_auto_compact_token_limit")
+
+
+def codex_model_window_overrides(terminal_launch_args: Sequence[str] | None) -> list[str]:
+    """Return the launch args' context-window overrides for the app-server.
+
+    The ``--remote`` TUI does not run turns, so a ``-c model_context_window=N``
+    on its argv alone leaves the thread at the model catalog's default window.
+    Only positive integers are carried; the last assignment of a key wins.
+
+    :param terminal_launch_args: Persisted Codex launch arguments, e.g.
+        ``["-c", "model_context_window=872000"]``.
+    :returns: ``-c`` assignment strings, e.g. ``["model_context_window=872000"]``.
+    """
+    windows: dict[str, int] = {}
+    for key, raw_value in _codex_config_assignments(terminal_launch_args):
+        if key not in _CODEX_MODEL_WINDOW_KEYS:
+            continue
+        try:
+            value = tomlkit.parse(f"value = {raw_value}")["value"]
+        except Exception:  # noqa: BLE001 - not a TOML value; Codex would reject it too.
+            value = None
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            windows[key] = int(value)
+        else:
+            windows.pop(key, None)
+    return [f"{key}={value}" for key, value in windows.items()]
+
+
+def codex_mcp_tool_approval_overrides(
+    terminal_launch_args: Sequence[str] | None,
+) -> list[str]:
+    """Return the launch args' explicit approval modes for Omnigent ``sys_*`` tools.
+
+    These ``mcp_servers.omnigent.tools.<tool>.approval_mode`` assignments must
+    also reach the app-server that runs web-chat turns. Other MCP servers,
+    config keys, and the global approval policy are left untouched.
+
+    :param terminal_launch_args: Persisted Codex launch arguments.
+    :returns: ``-c`` assignment strings for :func:`build_codex_native_server`.
+    """
+    modes: dict[str, str | None] = {}
+    for key, raw_value in _codex_config_assignments(terminal_launch_args):
+        # Codex applies overrides in order: a later key or parent-table assignment wins.
+        for tracked_key in [tracked for tracked in modes if tracked.startswith(f"{key}.")]:
+            del modes[tracked_key]
+        if re.fullmatch(r"mcp_servers\.omnigent\.tools\.sys_[a-z_]+\.approval_mode", key):
+            modes[key] = _codex_config_string(raw_value)
     # Only explicit grants and prompts are carried; Codex rejects "deny" at startup.
     return [
         f"{key}={json.dumps(mode)}" for key, mode in modes.items() if mode in {"approve", "prompt"}

@@ -6,7 +6,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
 from omnigent.entities import (
     Agent,
@@ -16,6 +16,11 @@ from omnigent.entities import (
     PagedList,
 )
 from omnigent.session_import import IMPORT_PROVENANCE_LABEL_KEYS
+from omnigent.session_recovery import SessionRecovery
+from omnigent.stores.conversation_store.activity_error import (
+    LATEST_ACTIVITY_ERROR_LABEL_KEY,
+    LATEST_ACTIVITY_ERROR_RESPONSE_LABEL_KEY,
+)
 from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY
 
 # Pending inputs share the item store, but are not harness transcript history yet.
@@ -127,6 +132,10 @@ class DailyCostState(TypedDict):
 # mirrors the canonical key as ``PINNED_LABEL_KEY``.
 PINNED_LABEL_KEY = "omnigent.pinned"
 
+# A viewer's mute (dimmed row, no notifications). Stored per-user and presented
+# under this bare key exactly like ``PINNED_LABEL_KEY``; deleted on unmute.
+MUTED_LABEL_KEY = "omnigent.muted"
+
 # Marks a top-level fork created as a side chat. A side chat surfaces only as a
 # Workspace-rail tab, so a conversation carrying this label is hidden from the
 # left sidebar (the ``GET /v1/sessions`` list filters it out). The fork
@@ -171,6 +180,17 @@ def pinned_label_key(user_id: str | None) -> str:
     return _scoped_pin_key(PINNED_LABEL_KEY + ".", user_id)
 
 
+def muted_label_key(user_id: str | None) -> str:
+    """
+    The per-user muted-label key for ``user_id``, derived like :func:`pinned_label_key`.
+
+    :param user_id: Authenticated user id, e.g. ``"alice@example.com"``, or
+        ``None`` in single-user / no-auth mode (→ the ``local`` sentinel).
+    :returns: ``"omnigent.muted.<suffix>"``.
+    """
+    return _scoped_pin_key(MUTED_LABEL_KEY + ".", user_id)
+
+
 # Epoch-SECONDS time a session was archived, written on archive and deleted on
 # unarchive. A label rather than a ``conversations`` column, so ageing out old
 # archived sessions needs no schema migration; readers fall back to
@@ -181,9 +201,23 @@ ARCHIVED_AT_LABEL_KEY = "omnigent.archived_at"
 # Server-owned origin, retained when a schedule's run history is deleted.
 SCHEDULED_TASK_ORIGIN_LABEL_KEY = "omnigent.scheduled_task_origin"
 SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY = "omnigent.scheduled_task_worktree_source_sha256"
+# Server-owned: the automation run this session serves, set before each run's
+# prompt is sent. Journal entries the session records are attributed to it.
+SCHEDULED_TASK_RUN_LABEL_KEY = "omnigent.scheduled_task_run"
+SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY = "omnigent.scheduled_task_initial_run"
+SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX = "omnigent.pending_scheduled_run."
+# The run whose agent has appended real activity; copied history never sets it.
+SCHEDULED_TASK_ACTIVITY_LABEL_KEY = "omnigent.scheduled_task_activity"
+
 # Server-owned: marks the copy an automation starts each run from (its source
 # session). The value is the task id; runs never inherit it.
 SCHEDULED_TASK_SOURCE_LABEL_KEY = "omnigent.scheduled_task_source"
+# Server-owned: the automation whose run's session tree launched this independent or
+# sibling session, directly or through other launches. Forks drop it.
+SCHEDULED_TASK_LAUNCH_LABEL_KEY = "omnigent.scheduled_task_launch"
+
+# Compare-and-swap rounds swap_label tries before giving up on a contended label.
+_LABEL_SWAP_ATTEMPTS = 5
 
 # Creation provenance only; this does not confer parentage or permissions.
 CREATED_BY_SESSION_LABEL_KEY = "omnigent.created_by_session_id"
@@ -248,9 +282,14 @@ _SANDBOX_REPO_LABEL_KEY = "omnigent.sandbox.repo"
 _SANDBOX_REQUESTED_HOST_ID_LABEL_KEY = "omnigent.sandbox.requested_host_id"
 _FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
     CREATED_BY_SESSION_LABEL_KEY,
+    SCHEDULED_TASK_RUN_LABEL_KEY,
+    SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
+    SCHEDULED_TASK_ACTIVITY_LABEL_KEY,
     ARCHIVED_AT_LABEL_KEY,
     # A fork of an automation's copy isn't what the automation runs from.
     SCHEDULED_TASK_SOURCE_LABEL_KEY,
+    # Nor is a fork of a session a run launched; the automation doesn't share it.
+    SCHEDULED_TASK_LAUNCH_LABEL_KEY,
     # Closing seals only that child (a stopped side chat, a closed sub-agent);
     # forking it is how the user continues it as a session of its own.
     CLOSED_LABEL_KEY,
@@ -258,6 +297,9 @@ _FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
     SIDE_CHAT_SOURCE_LABEL_KEY,
     _SANDBOX_REPO_LABEL_KEY,
     _SANDBOX_REQUESTED_HOST_ID_LABEL_KEY,
+    # A truncated fork's newest item differs; its next append recomputes it.
+    LATEST_ACTIVITY_ERROR_LABEL_KEY,
+    LATEST_ACTIVITY_ERROR_RESPONSE_LABEL_KEY,
 }
 
 
@@ -273,6 +315,14 @@ class CreatedSession:
 
     conversation: Conversation
     agent: Agent
+
+
+@dataclass(frozen=True)
+class SessionTodosUpdate:
+    """An accepted native task snapshot and the state it atomically replaced."""
+
+    id: str
+    previous: list[dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -334,6 +384,24 @@ class SessionConnectivity:
 
 
 @dataclass(frozen=True)
+class SpawnTreeUsage:
+    """
+    One spawn-tree member's place in the tree and its own recorded usage.
+
+    Returned by :meth:`ConversationStore.list_spawn_tree_usage` for cost
+    roll-ups that need neither labels nor content.
+
+    :param id: Conversation id.
+    :param parent_conversation_id: Parent id, or ``None`` for the root.
+    :param session_usage: This conversation's own ``session_usage`` document.
+    """
+
+    id: str
+    parent_conversation_id: str | None
+    session_usage: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class SessionActivity:
     """
     When a session last changed and what it is doing now.
@@ -350,6 +418,10 @@ class SessionActivity:
     :param pending_elicitation_count: Current unresolved session approvals/questions;
         ``None`` when not reported.
     :param runner_id: Bound runner, or ``None`` for an in-process session.
+    :param archived: Whether the session is archived; ``None`` when the store
+        doesn't report it.
+    :param current_run_id: The scheduled run the session is attributed to now,
+        e.g. ``"run_abc"``; ``None`` when unset or not reported.
     """
 
     updated_at: int
@@ -357,6 +429,8 @@ class SessionActivity:
     total_cost_usd: float | None = None
     pending_elicitation_count: int | None = None
     runner_id: str | None = None
+    archived: bool | None = None
+    current_run_id: str | None = None
 
 
 # Freshness window for ``omnigent_conversation_metadata.runner_last_seen``. The tunnel
@@ -521,6 +595,35 @@ class ConversationStore(ABC):
     ) -> bool:
         """Compare-and-set delivery state; None discards a canceled, unsent input."""
         raise NotImplementedError
+
+    supports_session_recovery = False
+
+    def admit_session_recovery(self, conversation_id: str, expected: SessionRecovery) -> bool:
+        """Order turn admission against new input and the current host/runner binding."""
+        del conversation_id, expected
+        return False
+
+    def get_session_recovery(self, conversation_id: str) -> SessionRecovery | None:
+        """Read private recovery intent; unsupported stores do not opt in."""
+        del conversation_id
+        return None
+
+    def get_session_interruption_time(self, conversation_id: str) -> int | None:
+        """Original disconnect-error timestamp, or None when unavailable."""
+        del conversation_id
+        return None
+
+    def replace_session_recovery(
+        self,
+        conversation_id: str,
+        expected: SessionRecovery | None,
+        recovery: SessionRecovery | None,
+        *,
+        expected_conversation: Conversation | None = None,
+    ) -> bool:
+        """Compare and replace recovery intent under the conversation input lock."""
+        del conversation_id, expected, recovery, expected_conversation
+        return False
 
     def list_host_conversation_ids(
         self,
@@ -727,8 +830,8 @@ class ConversationStore(ABC):
         """
         Return each session's last update time, live status and cost in one batch.
 
-        Reads activity and usage per id and no labels, so the cost is bounded by the
-        id count. Missing ids are omitted from the result.
+        Reads activity, usage and the current scheduled run label per id, so the
+        cost is bounded by the id count. Missing ids are omitted from the result.
 
         :param conversation_ids: Conversation ids, e.g. ``["conv_abc123"]``.
             Duplicates are tolerated; empty input returns ``{}`` without a query.
@@ -914,6 +1017,11 @@ class ConversationStore(ABC):
         of inserting a duplicate. The existence check rides the append's
         own transaction, so idempotency costs no extra query.
 
+        Implementations should fold the inserted items into the
+        ``LATEST_ACTIVITY_ERROR_LABEL_KEY`` label with
+        :func:`~omnigent.stores.conversation_store.activity_error.fold_activity_error`
+        in the same write. The label is maintained on append only.
+
         :param conversation_id: Unique conversation identifier,
             e.g. ``"conv_abc123"``.
         :param items: List of :class:`NewConversationItem` objects
@@ -1085,6 +1193,8 @@ class ConversationStore(ABC):
         query: str,
         conversation_id: str | None = None,
         limit: int = 20,
+        *,
+        accessible_by: str,
     ) -> list[ConversationItem]:
         """
         Full-text search over conversation items.
@@ -1098,6 +1208,8 @@ class ConversationStore(ABC):
         :param conversation_id: Optional conversation to scope
             the search to, e.g. ``"conv_abc123"``.
         :param limit: Maximum number of results to return.
+        :param accessible_by: Authenticated user whose session permissions
+            restrict matches before the result limit.
         :returns: A list of matching :class:`ConversationItem`
             objects ranked by relevance.
         """
@@ -1354,6 +1466,85 @@ class ConversationStore(ABC):
         """
         ...
 
+    def replace_label_if(
+        self,
+        conversation_id: str,
+        key: str,
+        *,
+        expected: str | None,
+        value: str | None,
+    ) -> bool:
+        """
+        Change one label only while it still holds *expected*.
+
+        Lets a writer undo its own label without clobbering a later writer's.
+        This default reads then writes, which is enough for stores without
+        concurrent writers; SQL stores override it with one conditional write.
+
+        :param conversation_id: The conversation to update.
+        :param key: The label key, e.g. ``"omnigent.scheduled_task_run"``.
+        :param expected: The value the label must still hold, or ``None`` for
+            a label that must still be absent.
+        :param value: The new value, or ``None`` to delete the label.
+        :returns: Whether the label held *expected* and was changed.
+        :raises ValueError: If *expected* and *value* are both ``None``.
+        """
+        if expected is None and value is None:
+            raise ValueError("replace_label_if needs an expected value or a new value")
+        conversation = self.get_conversation(conversation_id)
+        if conversation is None or conversation.labels.get(key) != expected:
+            return False
+        if value is None:
+            self.delete_label(conversation_id, key)
+        else:
+            self.set_labels(conversation_id, {key: value})
+        return True
+
+    def swap_label(self, conversation_id: str, key: str, value: str) -> str | None:
+        """
+        Set one label and return the value it replaced.
+
+        Built on :meth:`replace_label_if`, so the returned value is the one the
+        write actually replaced even while other writers change the label.
+
+        :param conversation_id: The conversation to update.
+        :param key: The label key, e.g. ``"omnigent.scheduled_task_run"``.
+        :param value: The new value.
+        :returns: The label's previous value, or ``None`` if it had none.
+        :raises RuntimeError: If other writers kept changing the label.
+        """
+        for _ in range(_LABEL_SWAP_ATTEMPTS):
+            conversation = self.get_conversation(conversation_id)
+            previous = conversation.labels.get(key) if conversation is not None else None
+            if self.replace_label_if(conversation_id, key, expected=previous, value=value):
+                return previous
+        raise RuntimeError(f"label {key!r} on {conversation_id!r} kept changing")
+
+    def update_scheduled_run_label(
+        self,
+        conversation_id: str,
+        run_id: str,
+        *,
+        action: Literal["begin", "commit", "rollback"],
+    ) -> None:
+        """Begin or settle a continued run's tentative session attribution.
+
+        A rollback removes this attempt from the pending chain even if another
+        attempt replaced it. A commit retains it as a valid predecessor once
+        sending may have begun. Each operation must be atomic across replicas.
+        """
+        raise NotImplementedError
+
+    def clear_scheduled_run_label(
+        self, conversation_id: str, run_id: str, *, pending_run_finished: bool = False
+    ) -> bool:
+        """End a human's inherited attribution without clearing a newer dispatch.
+
+        A pending dispatch is retained unless its run is terminal or its stamp
+        has exceeded the scheduler's stale-run window.
+        """
+        raise NotImplementedError
+
     @abstractmethod
     def list_projects(
         self,
@@ -1433,12 +1624,20 @@ class ConversationStore(ABC):
         self,
         conversation_id: str,
         todos: list[dict[str, Any]],
-    ) -> bool:
-        """Persist the native Plan snapshot; empty clears, missing metadata returns false."""
+    ) -> SessionTodosUpdate | None:
+        """Persist the Plan snapshot and return its update; missing metadata returns None."""
         raise NotImplementedError
 
-    def add_new_sibling(self, source_id: str, session_id: str, *, user_id: str | None) -> None:
+    def add_new_sibling(
+        self, source_id: str, session_id: str, *, user_id: str | None, move_existing: bool = False
+    ) -> None:
         """Assign a freshly created session to its source's family before launch."""
+        raise NotImplementedError
+
+    def set_session_nest(
+        self, session_id: str, source_id: str | None, *, user_id: str | None
+    ) -> None:
+        """Move one independent session into a nest, or detach it with ``None``."""
         raise NotImplementedError
 
     def get_session_family(self, session_id: str) -> list[Conversation]:
@@ -1983,6 +2182,10 @@ class ConversationStore(ABC):
         """Read host metadata and canonical profile labels by their complete unique keys."""
         raise NotImplementedError
 
+    def get_profile_labels(self, conversation_ids: list[str]) -> dict[str, dict[str, str]]:
+        """Read many sessions' canonical profile labels in one query; unlabeled ones are absent."""
+        raise NotImplementedError
+
     def bind_profiled_host(
         self,
         conversation_id: str,
@@ -2049,6 +2252,36 @@ class ConversationStore(ABC):
             data=rows,
             first_id=rows[0].id if rows else None,
             last_id=rows[-1].id if rows else None,
+            has_more=page.has_more,
+        )
+
+    def list_spawn_tree_usage(
+        self, root_conversation_id: str, *, limit: int
+    ) -> PagedList[SpawnTreeUsage]:
+        """Read one spawn tree's hierarchy and usage in a single bounded read.
+
+        Like :meth:`list_spawn_tree` but without labels or other row data, so
+        *limit* bounds all the work. ``has_more`` means the tree holds more
+        than *limit* rows; rows come in id order.
+
+        :param root_conversation_id: Root of the spawn tree.
+        :param limit: Maximum conversations to return.
+        :returns: The tree's members with their parent and own usage.
+        """
+        page = self.list_conversations(
+            limit=limit,
+            kind=None,
+            include_archived=True,
+            root_conversation_id=root_conversation_id,
+            order="asc",
+            sort_by="id",
+        )
+        return PagedList(
+            data=[
+                SpawnTreeUsage(c.id, c.parent_conversation_id, c.session_usage) for c in page.data
+            ],
+            first_id=page.first_id,
+            last_id=page.last_id,
             has_more=page.has_more,
         )
 
@@ -2260,6 +2493,7 @@ class ConversationStore(ABC):
         up_to_response_id: str | None = None,
         before_item_id: str | None = None,
         copy_items: bool = True,
+        copy_journal: bool = True,
         continue_source: bool = False,
         project_id: str | None = None,
         file_id_map: Mapping[str, str] | None = None,
@@ -2379,6 +2613,9 @@ class ConversationStore(ABC):
         :param copy_items: ``False`` copies no items at all, whatever the
             source holds when the fork commits, e.g. for ``/clear``. A
             truncation; exclusive with both cutoffs.
+        :param copy_journal: ``False`` leaves the source's journal behind, so
+            the fork starts with none, e.g. an automation run's copy of its
+            source session, which plans its own work.
         :param continue_source: Also copy the source's host, workspace and
             branch (in the same write that creates the fork), its routing
             switches and its workspace-file sharing, for a same-owner

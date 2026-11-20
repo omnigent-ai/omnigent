@@ -15,6 +15,7 @@ import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { PINNED_LABEL_KEY, PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
+import { MUTED_LABEL_KEY } from "@/lib/sessionMute";
 import { toast } from "sonner";
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { resetDesktopCommandsForTests } from "@/lib/desktopCommands";
@@ -236,6 +237,15 @@ describe("HeaderConversationMenu", () => {
     expect(screen.getByTestId("header-rename-conversation")).toBeInTheDocument();
   });
 
+  it("hides Mark as unread for a muted session", () => {
+    renderMenu({
+      conversation: { ...CONVERSATION, labels: { ...CONVERSATION.labels, [MUTED_LABEL_KEY]: "1" } },
+    });
+    openMenu();
+    expect(screen.queryByTestId("header-mark-unread-conversation")).toBeNull();
+    expect(screen.getByRole("menuitem", { name: "Rename" })).toBeInTheDocument();
+  });
+
   it("opens from the keyboard and focuses the first action", () => {
     renderMenu();
     const trigger = screen.getByRole("button", { name: "Conversation actions" });
@@ -287,6 +297,18 @@ describe("HeaderConversationMenu", () => {
     fireEvent(window, accepted);
     expect(accepted.defaultPrevented).toBe(true);
     expect(screen.getByTestId("location")).toHaveTextContent("/?sibling=conv-1");
+  });
+
+  it.each([false, true])("hides pin actions on nested sessions (legacy pin: %s)", (legacyPin) => {
+    renderMenu({
+      conversation: {
+        ...CONVERSATION,
+        labels: legacyPin ? { [PINNED_LABEL_KEY]: "1" } : {},
+        family: { id: "family", representative_id: "parent", pinned: false },
+      },
+    });
+    openMenu();
+    expect(screen.queryByTestId("header-pin-conversation")).toBeNull();
   });
 
   it("runs pin and mark-unread actions for the active session", () => {
@@ -853,6 +875,23 @@ describe("HeaderConversationMenu desktop menu commands", () => {
         }),
       ),
     );
+    view.rerender(
+      menuTree({
+        conversation: {
+          ...CONVERSATION,
+          labels: { [PINNED_LABEL_KEY]: "1" },
+          family: { id: "family", representative_id: "parent", pinned: true },
+        },
+      }),
+    );
+    await waitFor(() =>
+      expect(setDesktopCommandState).toHaveBeenLastCalledWith(
+        expect.objectContaining({ commands: ["archive-session", "fork-session"] }),
+      ),
+    );
+    mocks.togglePinned.mockClear();
+    act(() => sendCommand({ command: "toggle-pin-session", browserViewId: null }));
+    expect(mocks.togglePinned).not.toHaveBeenCalled();
   });
 
   it("disables Session → Pin while a pin write is pending", async () => {
