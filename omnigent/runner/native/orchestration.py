@@ -9072,6 +9072,7 @@ _ROUTED_SPAWN_ALLOWED_TOOLS: tuple[str, ...] = (
     "mcp__omnigent__sys_read_inbox",
 )
 
+
 def _routed_spawn_launch_args(
     auto_harness: bool, *, router_started: bool = True
 ) -> tuple[str | None, tuple[str, ...]]:

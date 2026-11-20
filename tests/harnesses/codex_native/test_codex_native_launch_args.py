@@ -10,7 +10,6 @@ import tomlkit
 
 from omnigent.errors import ErrorCategory, ErrorImpact, classify_exception
 from omnigent.harnesses.codex_native import app_server, launch_args
-from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
 from omnigent.harnesses.codex_native.launch_args import (
     absolute_codex_path,
     canonical_codex_launch_args,
@@ -19,6 +18,7 @@ from omnigent.harnesses.codex_native.launch_args import (
     redact_codex_launch_args,
     without_codex_positional_prompt,
 )
+from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
 
 
 def test_codex_paths_expand_home_without_resolving_symlinks(
@@ -98,7 +98,11 @@ def test_remote_resume_option_spellings(args: tuple[str, ...], expected: dict) -
         (("-s=workspace-write", "-a=on-request"), "ask-for-approval"),
         # A later reviewer setting replaces an earlier one.
         (
-            (*PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"], "-c", 'approvals_reviewer="user"'),
+            (
+                *PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
+                "-c",
+                'approvals_reviewer="user"',
+            ),
             "ask-for-approval",
         ),
         (("--sandbox", "read-only", "--ask-for-approval", "on-request"), "read-only"),

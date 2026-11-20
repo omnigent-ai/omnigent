@@ -161,4 +161,3 @@ def inherited_permission_mode(
         if mode_concept == concept and mode != "default"
     ]
     return matches[0] if len(matches) == 1 else None
-
