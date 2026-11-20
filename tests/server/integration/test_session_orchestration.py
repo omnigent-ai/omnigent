@@ -1534,6 +1534,21 @@ async def test_created_session_launches_in_the_requested_permission_mode(
 
 
 _CLAUDE_AUTO_PARENT = ("claude-native", {"omnigent.claude_native.permission_mode": "auto"}, None)
+# Codex rewrites its permission flags along with the mode label on each settings change.
+_CODEX_APPROVE_FOR_ME_FLAGS = [
+    "-c",
+    'default_permissions=":workspace"',
+    "-c",
+    'approval_policy="on-request"',
+    "-c",
+    'approvals_reviewer="auto_review"',
+]
+_CODEX_APPROVE_FOR_ME_LABEL = {"omnigent.codex_native.approval_mode": "approve-for-me"}
+_CODEX_APPROVE_FOR_ME_PARENT = (
+    "codex-native",
+    _CODEX_APPROVE_FOR_ME_LABEL,
+    _CODEX_APPROVE_FOR_ME_FLAGS,
+)
 
 
 def _set_native_parent(db_uri, session_id, parent) -> None:
@@ -1559,7 +1574,7 @@ def _set_native_parent(db_uri, session_id, parent) -> None:
             id="claude-auto-to-codex",
         ),
         pytest.param(
-            ("codex-native", {"omnigent.codex_native.approval_mode": "approve-for-me"}, None),
+            _CODEX_APPROVE_FOR_ME_PARENT,
             "claude-native",
             {},
             {},
@@ -1635,6 +1650,36 @@ def _set_native_parent(db_uri, session_id, parent) -> None:
             None,
             id="parent-bypasses-sandbox",
         ),
+        # Codex keeps its last label for settings no preset matches, so the flags decide.
+        pytest.param(
+            (
+                "codex-native",
+                _CODEX_APPROVE_FOR_ME_LABEL,
+                [
+                    "-c",
+                    'default_permissions="locked"',
+                    "-c",
+                    'approval_policy="on-request"',
+                ],
+            ),
+            "claude-native",
+            {},
+            {},
+            None,
+            id="stale-label-after-custom-profile",
+        ),
+        pytest.param(
+            (
+                "codex-native",
+                _CODEX_APPROVE_FOR_ME_LABEL,
+                ["--profile", "strict", *_CODEX_APPROVE_FOR_ME_FLAGS],
+            ),
+            "claude-native",
+            {},
+            {},
+            ["--permission-mode", "auto"],
+            id="back-to-built-in-preset",
+        ),
     ],
 )
 async def test_sub_agent_starts_in_its_parents_permission_mode(
@@ -1691,7 +1736,7 @@ async def test_custom_native_parent_passes_on_its_mode(auth_client, peers, db_ur
     ("parent", "spec_config", "expected"),
     [
         pytest.param(
-            ("codex-native", {"omnigent.codex_native.approval_mode": "approve-for-me"}, None),
+            _CODEX_APPROVE_FOR_ME_PARENT,
             {},
             ["--permission-mode", "auto"],
             id="codex-approve-for-me-to-claude",

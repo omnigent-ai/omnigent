@@ -5337,16 +5337,21 @@ def codex_launch_permission_preset(terminal_launch_args: Sequence[str] | None) -
 
     :param terminal_launch_args: Persisted Codex launch arguments.
     :returns: A preset, e.g. ``"approve-for-me"``, or ``None`` for Codex's default,
-        a custom profile, conflicting flags, or a sandbox left to the user's config.
+        a custom profile, conflicting flags, or a sandbox or approval policy left
+        to the user's config.
     """
     try:
-        if codex_config_profile(terminal_launch_args or ()) is not None:
-            return None
         params = _codex_resume_permission_params(terminal_launch_args)
+        selects_profile = codex_config_profile(terminal_launch_args or ()) is not None
     except ValueError:
         return None
-    # Without an explicit sandbox, config.toml may still make the session read-only.
-    if not isinstance(params.get("sandbox") or params.get("permissions"), str):
+    # Config decides any field the flags leave out, so a preset needs an explicit
+    # sandbox (the classifier also needs an explicit policy). A config profile's own
+    # permissions can replace --sandbox, so after one only a permission profile
+    # counts, which is what Codex records after a switch.
+    permissions = params.get("permissions")
+    explicit_permissions = permissions if selects_profile else params.get("sandbox") or permissions
+    if not isinstance(explicit_permissions, str):
         return None
     settings: dict[str, object] = {
         "approvalPolicy": params.get("approvalPolicy"),
