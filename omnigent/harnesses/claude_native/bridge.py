@@ -5732,6 +5732,8 @@ def _inject_legacy_model_command_locked(
     bridge_dir: Path, transaction: SessionOnlyModelSwitch, *, literal_model: bool = False
 ) -> ClaudeLegacyModelSwitchResult:
     from omnigent.models.claude_model_vocabulary import (
+        CLAUDE_MODEL_ALIASES,
+        alias_pins,
         claude_model_command_arg,
         public_claude_model_id,
     )
@@ -5742,12 +5744,13 @@ def _inject_legacy_model_command_locked(
         raise transaction.refuse(
             "Claude Code's version changed while waiting for model selection. Retry explicitly."
         )
+    model_env = read_model_env(bridge_dir)
     model_arg = (
         transaction.model
         if literal_model
         else claude_model_command_arg(
             transaction.model,
-            read_model_env(bridge_dir),
+            model_env,
             picker_values=read_model_picker_values(bridge_dir),
         )
     )
@@ -5789,14 +5792,24 @@ def _inject_legacy_model_command_locked(
     current = _read_json_file(bridge_dir / CONTEXT_RAW_FILE) or {}
     reported = current.get("model")
     current_model = reported.get("id") if isinstance(reported, dict) else None
-    expected_public = public_claude_model_id(transaction.model)
-    same_model = isinstance(current_model, str) and (
-        current_model == transaction.model
-        or (
-            expected_public is not None
-            and public_claude_model_id(current_model) == expected_public
-            and current_model.lower().endswith("[1m]")
-            == transaction.model.lower().endswith("[1m]")
+    alias = transaction.model.lower().removesuffix("[1m]")
+    pinned = alias_pins(model_env).get(alias) if not literal_model else None
+    expected_model = pinned or transaction.model
+    if transaction.model.lower().endswith("[1m]") and not expected_model.lower().endswith("[1m]"):
+        expected_model += "[1m]"
+    can_match = literal_model or alias not in CLAUDE_MODEL_ALIASES or pinned is not None
+    expected_public = public_claude_model_id(expected_model)
+    same_model = (
+        can_match
+        and isinstance(current_model, str)
+        and (
+            current_model == expected_model
+            or (
+                expected_public is not None
+                and public_claude_model_id(current_model) == expected_public
+                and current_model.lower().endswith("[1m]")
+                == expected_model.lower().endswith("[1m]")
+            )
         )
     )
     if (

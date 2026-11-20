@@ -501,6 +501,30 @@ def claude_settings_snapshot(path: Path) -> str:
     return json.dumps(payload, sort_keys=True)
 
 
+def claude_settings_unchanged(path: Path, before: str, session_id: str) -> bool:
+    """Compare settings using the CLI version reported by the routed session."""
+    from omnigent.harnesses.claude_native.bridge import CONTEXT_RAW_FILE
+    from omnigent.harnesses.claude_native.model_switch import supports_session_only_model_switch
+
+    after = claude_settings_snapshot(path)
+    try:
+        context = json.loads((claude_bridge_dir(session_id) / CONTEXT_RAW_FILE).read_text())
+    except (OSError, json.JSONDecodeError):
+        context = None
+    version = context.get("version") if isinstance(context, dict) else None
+    if supports_session_only_model_switch(version):
+        return before == after
+    try:
+        previous, current = json.loads(before), json.loads(after)
+    except json.JSONDecodeError:
+        return before == after
+    if not isinstance(previous, dict) or not isinstance(current, dict):
+        return before == after
+    return {key: value for key, value in previous.items() if key != "model"} == {
+        key: value for key, value in current.items() if key != "model"
+    }
+
+
 def grep_log(path: Path, needles: Sequence[str]) -> list[str]:
     """Return the lines of *path* containing any of *needles*.
 

@@ -40,6 +40,7 @@ from tests.e2e.routing._helpers import (
     capture_pane,
     claude_bridge_dir,
     claude_settings_snapshot,
+    claude_settings_unchanged,
     claude_user_settings_path,
     decisions,
     same_arm,
@@ -54,7 +55,6 @@ from tests.e2e.routing._mock_router import MockRouter, decide
 from tests.e2e.routing.conftest import (
     bypass_args,
     create_routed_session,
-    require_session_only_claude,
     require_tmux,
     trusted_workspace,
     unique_trivial_prompt,
@@ -111,7 +111,6 @@ def test_claude_routes_the_first_typed_message_exactly_once(
     type_into_tui: Callable[[str, str, str], None],
     tmp_path: Path,
 ) -> None:
-    require_session_only_claude()
     require_tmux()
     routing_arms("claude-native")  # type: ignore[operator]
     workspace = trusted_workspace(tmp_path, "claude_hook_ws")
@@ -195,7 +194,9 @@ def test_claude_routes_the_first_typed_message_exactly_once(
     )
 
     wait_for(
-        lambda: True if claude_settings_snapshot(settings_path) == settings_before else None,
+        lambda: (
+            True if claude_settings_unchanged(settings_path, settings_before, session_id) else None
+        ),
         timeout=10,
-        what=f"{settings_path}, including the saved default, to match its initial state",
+        what=f"{settings_path} to preserve the fields promised by the running CLI version",
     )

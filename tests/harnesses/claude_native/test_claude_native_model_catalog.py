@@ -432,23 +432,12 @@ async def test_catalog_excludes_unavailable_fable(
         )
     launches = _stub_picker(monkeypatch, models, control_failure=control_failure)
 
-    assert await claude_native.claude_model_catalog(None) == [
-        {
-            "id": "opus",
-            "model": "claude-opus-5",
-            "displayName": "Opus 5",
-            "isDefault": True,
-            "_claude_picker_options": [
-                {
-                    "value": "opus",
-                    "model": "claude-opus-5",
-                    "display_name": "Opus 5",
-                    "enabled": True,
-                    "provenance": "structured",
-                }
-            ],
-        }
-    ]
+    rows = await claude_native.claude_model_catalog(None)
+    assert rows is not None
+    assert [
+        {key: value for key, value in row.items() if key != "_claude_picker_options"}
+        for row in rows
+    ] == [{"id": "opus", "model": "claude-opus-5", "displayName": "Opus 5", "isDefault": True}]
     assert len(launches) == 1
 
 
@@ -481,22 +470,13 @@ async def test_catalog_uses_cli_managed_picker_for_every_launch_config(
     config = (
         claude_native.ClaudeNativeUcodeConfig(env={}, model="gateway-opus") if configured else None
     )
-    assert await claude_native.claude_model_catalog(config) == [
-        {
-            "id": "gateway-opus",
-            "model": "gateway-opus",
-            "displayName": "Opus",
-            "isDefault": True,
-            "_claude_picker_options": [
-                {
-                    "value": "gateway-opus",
-                    "model": "gateway-opus",
-                    "display_name": "Opus",
-                    "enabled": True,
-                    "provenance": "structured",
-                }
-            ],
-        }
+    rows = await claude_native.claude_model_catalog(config)
+    assert rows is not None
+    assert [
+        {key: value for key, value in row.items() if key != "_claude_picker_options"}
+        for row in rows
+    ] == [
+        {"id": "gateway-opus", "model": "gateway-opus", "displayName": "Opus", "isDefault": True}
     ]
 
 
@@ -642,36 +622,19 @@ async def test_catalog_keeps_enabled_fable_and_future_picker_models(
         ],
         default="claude-fable-5-1",
     )
-    assert await claude_native.claude_model_catalog(None) == [
+    rows = await claude_native.claude_model_catalog(None)
+    assert rows is not None
+    assert [
+        {key: value for key, value in row.items() if key != "_claude_picker_options"}
+        for row in rows
+    ] == [
         {
             "id": "fable",
             "model": "claude-fable-5-1",
             "displayName": "Fable 5.1",
             "isDefault": True,
-            "_claude_picker_options": [
-                {
-                    "value": "fable",
-                    "model": "claude-fable-5-1",
-                    "display_name": "Fable 5.1",
-                    "enabled": True,
-                    "provenance": "structured",
-                }
-            ],
         },
-        {
-            "id": "future",
-            "model": "vendor-future",
-            "displayName": "Future model",
-            "_claude_picker_options": [
-                {
-                    "value": "future",
-                    "model": "vendor-future",
-                    "display_name": "Future model",
-                    "enabled": True,
-                    "provenance": "structured",
-                }
-            ],
-        },
+        {"id": "future", "model": "vendor-future", "displayName": "Future model"},
     ]
 
 
@@ -888,12 +851,26 @@ async def test_picker_descriptors_preserve_raw_labels_and_deduplicated_aliases(
             {"value": "opus", "resolvedModel": "claude-opus-5", "displayName": "Opus"},
             {"value": "default", "resolvedModel": "off-list-model", "displayName": "Default"},
             {"value": "disabled", "resolvedModel": "disabled-model", "disabled": True},
+            {"value": "fable", "resolvedModel": "claude-fable-5-1", "displayName": "Fable 5.1"},
+            {"value": "future", "resolvedModel": "vendor-future", "displayName": "Future model"},
+            {
+                "value": "gateway-opus",
+                "resolvedModel": "gateway-opus",
+                "displayName": "Gateway Opus",
+            },
         ],
         default="off-list-model",
     )
     rows = await claude_native.claude_model_catalog(None)
     assert rows is not None
-    assert [row["id"] for row in rows] == ["opus[1m]", "opus", "off-list-model"]
+    assert [row["id"] for row in rows] == [
+        "opus[1m]",
+        "opus",
+        "fable",
+        "future",
+        "gateway-opus",
+        "off-list-model",
+    ]
     assert rows[0]["displayName"] == "Opus (1M context)"
     expected = [
         {
@@ -918,6 +895,20 @@ async def test_picker_descriptors_preserve_raw_labels_and_deduplicated_aliases(
             "provenance": "structured",
         },
     ]
+    expected.extend(
+        {
+            "value": value,
+            "model": model,
+            "display_name": label,
+            "enabled": True,
+            "provenance": "structured",
+        }
+        for value, model, label in [
+            ("fable", "claude-fable-5-1", "Fable 5.1"),
+            ("future", "vendor-future", "Future model"),
+            ("gateway-opus", "gateway-opus", "Gateway Opus"),
+        ]
+    )
     assert picker_model_options(rows) == expected
     assert picker_model_options([rows[-1]]) == []
     fingerprint = claude_native.claude_catalog_fingerprint(None)

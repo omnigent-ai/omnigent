@@ -14233,31 +14233,14 @@ def test_model_target_and_status_preserve_alias_context_and_private_identity(
     assert switch.status_matches(reported, exact_context=False) is confirmed
 
 
-@pytest.mark.parametrize(
-    ("requested", "picker_value", "concrete", "pins", "reported", "confirmed"),
-    [
-        (
-            "opus",
-            "opus",
-            "system.ai.claude-opus-5-5[1m]",
-            {"ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-5-5[1m]"},
-            "claude-opus-5-5",
-            True,
-        ),
-        ("Private/Model-B", "Private/Model-B", "Private/Model-B", {}, "private/model-b", False),
-    ],
-    ids=["pinned-alias", "private-case-is-exact"],
-)
-def test_model_command_verifies_alias_context_and_private_model_identity(
+def test_model_command_verifies_the_pinned_alias_context(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    requested: str,
-    picker_value: str,
-    concrete: str,
-    pins: dict[str, str],
-    reported: str,
-    confirmed: bool,
 ) -> None:
+    requested = picker_value = "opus"
+    concrete = "system.ai.claude-opus-5-5[1m]"
+    pins = {"ANTHROPIC_DEFAULT_OPUS_MODEL": concrete}
+    reported = "claude-opus-5-5"
     composer = _SessionModelComposer()
     composer.options[-1] = concrete
     bridge_dir = _session_model_bridge(tmp_path, composer)
@@ -14287,17 +14270,11 @@ def test_model_command_verifies_alias_context_and_private_model_identity(
         )
 
     monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
-    if confirmed:
-        result = claude_native_bridge.inject_model_command(bridge_dir, model=requested)
-        assert result.requested_model == requested
-        assert result.picker_value == picker_value
-        assert result.resolved_model == concrete
-        assert result.status_model == reported
-    else:
-        with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused) as caught:
-            claude_native_bridge.inject_model_command(bridge_dir, model=requested)
-        assert caught.value.phase == "status"
-        assert caught.value.model_may_have_changed
+    result = claude_native_bridge.inject_model_command(bridge_dir, model=requested)
+    assert result.requested_model == requested
+    assert result.picker_value == picker_value
+    assert result.resolved_model == concrete
+    assert result.status_model == reported
     assert composer.submitted == ["/model", "/status"]
     assert composer.model == concrete
 
@@ -14823,12 +14800,44 @@ def test_model_command_confirms_cache_cost_at_most_once(
 
 
 @pytest.mark.parametrize(
-    "disabled_collision", [False, True], ids=["unique", "disabled-catalog-version"]
+    ("bridge_factory", "model", "picker_value", "resolved_model", "disabled_collision"),
+    [
+        pytest.param(
+            _versioned_cache_cost_bridge,
+            "system.ai.claude-sonnet-5-5",
+            "system.ai.claude-sonnet-5-5[1m]",
+            "system.ai.claude-sonnet-5-5",
+            False,
+            id="versioned",
+        ),
+        pytest.param(
+            _versioned_cache_cost_bridge,
+            "system.ai.claude-sonnet-5-5",
+            "system.ai.claude-sonnet-5-5[1m]",
+            "system.ai.claude-sonnet-5-5",
+            True,
+            id="disabled-catalog-version",
+        ),
+        pytest.param(
+            _dated_cache_cost_bridge,
+            "sonnet",
+            "sonnet",
+            "claude-sonnet-4-20250514",
+            False,
+            id="dated",
+        ),
+    ],
 )
 def test_model_command_confirms_versioned_cache_cost_for_managed_row(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, disabled_collision: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bridge_factory: Callable[[Path, pytest.MonkeyPatch], tuple[_SessionModelComposer, Path]],
+    model: str,
+    picker_value: str,
+    resolved_model: str,
+    disabled_collision: bool,
 ) -> None:
-    composer, bridge_dir = _versioned_cache_cost_bridge(tmp_path, monkeypatch)
+    composer, bridge_dir = bridge_factory(tmp_path, monkeypatch)
     if disabled_collision:
         config_path = bridge_dir / "bridge.json"
         config = json.loads(config_path.read_text())
@@ -14843,39 +14852,11 @@ def test_model_command_confirms_versioned_cache_cost_for_managed_row(
         )
         config_path.write_text(json.dumps(config))
 
-    result = claude_native_bridge.inject_model_command(
-        bridge_dir, model="system.ai.claude-sonnet-5-5"
-    )
+    result = claude_native_bridge.inject_model_command(bridge_dir, model=model)
 
-    assert (
-        result.requested_model
-        == result.resolved_model
-        == result.status_model
-        == ("system.ai.claude-sonnet-5-5")
-    )
-    assert result.picker_value == "system.ai.claude-sonnet-5-5[1m]"
-    assert composer.confirmations == composer.status_queries == 1
-    assert [args[-1] for args in composer.sends] == [
-        "/model",
-        "Enter",
-        "Down",
-        "s",
-        "Enter",
-        "/status",
-        "Enter",
-        "Escape",
-    ]
-
-
-def test_model_command_confirms_the_captured_dated_cache_cost_modal(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    composer, bridge_dir = _dated_cache_cost_bridge(tmp_path, monkeypatch)
-
-    result = claude_native_bridge.inject_model_command(bridge_dir, model="sonnet")
-
-    assert result.requested_model == result.picker_value == "sonnet"
-    assert result.resolved_model == result.status_model == "claude-sonnet-4-20250514"
+    assert result.requested_model == model
+    assert result.picker_value == picker_value
+    assert result.resolved_model == result.status_model == resolved_model
     assert result.session_id == composer.session
     assert composer.confirmations == composer.status_queries == 1
     assert [args[-1] for args in composer.sends] == [

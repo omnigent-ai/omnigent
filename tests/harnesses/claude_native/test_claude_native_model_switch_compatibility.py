@@ -77,12 +77,33 @@ def test_model_changes_preserve_the_version_appropriate_behavior(
         assert "s" not in [args[-1] for args in composer.sends]
 
 
-@pytest.mark.parametrize("version", ["2.1.322", None, "2.1.323-preview"])
+@pytest.mark.parametrize(
+    ("version", "requested", "reported", "pin"),
+    [
+        ("2.1.322", None, None, None),
+        (None, None, None, None),
+        ("2.1.323-preview", None, None, None),
+        ("2.1.322", "opus", "claude-opus-4-8", "claude-opus-4-8"),
+        ("2.1.322", "opus", "claude-opus-4-8[1m]", "claude-opus-4-8[1m]"),
+        ("2.1.322", "opus[1m]", "claude-opus-4-8[1m]", "claude-opus-4-8"),
+    ],
+    ids=["older", "unverified", "preview", "pinned-alias", "pinned-context", "explicit-context"],
+)
 def test_legacy_matching_session_preserves_a_distinct_saved_default(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str | None
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    version: str | None,
+    requested: str | None,
+    reported: str | None,
+    pin: str | None,
 ) -> None:
     composer = _SessionModelComposer()
     composer.version = version or "unknown"
+    if reported is not None:
+        composer.model = composer.options[0] = reported
+    if requested is not None:
+        composer.options.append(requested)
+        composer.resolved_models[requested] = composer.model
     composer.saved_default = "separate-user-default"
     bridge_dir = _session_model_bridge(tmp_path, composer)
     if version is None:
@@ -91,15 +112,56 @@ def test_legacy_matching_session_preserves_a_distinct_saved_default(
         raw.pop("version")
         path.write_text(json.dumps(raw))
     composer.install(monkeypatch)
+    monkeypatch.setattr(
+        bridge,
+        "read_model_env",
+        lambda _: {"ANTHROPIC_DEFAULT_OPUS_MODEL": pin} if pin else {},
+    )
+    selected = requested or composer.model
 
-    result = bridge.inject_model_command(bridge_dir, model=composer.model)
+    result = bridge.inject_model_command(bridge_dir, model=selected)
 
     assert composer.saved_default == "separate-user-default"
     assert composer.sends == []
     assert composer.status_queries == 0
     assert isinstance(result, bridge.ClaudeLegacyModelSwitchResult)
     assert result.already_selected
-    assert result.requested_model == composer.model
+    assert result.requested_model == selected
+
+
+@pytest.mark.parametrize(
+    ("pin", "reported"),
+    [
+        (None, "claude-opus-4-8"),
+        ("claude-opus-5", "claude-opus-4-8"),
+        ("claude-opus-4-8", "claude-opus-4-8[1m]"),
+        ("claude-opus-4-8[1m]", "claude-opus-4-8"),
+        ("private-model", "Private-Model"),
+    ],
+    ids=["unpinned", "generation", "plain-context", "extended-context", "private-case"],
+)
+def test_legacy_alias_hint_requires_proven_generation_and_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pin: str | None, reported: str
+) -> None:
+    composer = _SessionModelComposer()
+    composer.version = "2.1.322"
+    composer.model = composer.options[0] = reported
+    composer.saved_default = "separate-user-default"
+    composer.options.append("opus")
+    composer.resolved_models["opus"] = pin or reported
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    composer.install(monkeypatch)
+    monkeypatch.setattr(
+        bridge,
+        "read_model_env",
+        lambda _: {"ANTHROPIC_DEFAULT_OPUS_MODEL": pin} if pin else {},
+    )
+
+    result = bridge.inject_model_command(bridge_dir, model="opus")
+
+    assert not result.already_selected
+    assert composer.saved_default != "separate-user-default"
+    assert [command for command in composer.submitted if command] == ["/model opus"]
 
 
 @pytest.mark.parametrize("reported_session", [None, "earlier-native-session"])

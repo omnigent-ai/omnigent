@@ -522,7 +522,7 @@ async def test_claude_model_confirmation_controls_public_patch_and_rollback(
         assert "did not confirm" in session.errors[0]["message"]
 
 
-@pytest.mark.parametrize("phase", ["commit", "status"])
+@pytest.mark.parametrize("phase", ["commit", "status", "legacy"])
 @pytest.mark.parametrize("applied", [False, True], ids=["previous-model", "requested-model"])
 async def test_unconfirmed_claude_model_change_keeps_intent_without_claiming_an_outcome(
     client: httpx.AsyncClient,
@@ -540,7 +540,11 @@ async def test_unconfirmed_claude_model_change_keeps_intent_without_claiming_an_
         if applied:
             pane.report_model(model)
         raise claude_bridge.ClaudeModelSwitchRefused(
-            "The session-only selection could not be confirmed.",
+            (
+                "The legacy selection may have changed the model and saved default."
+                if phase == "legacy"
+                else "The session-only selection could not be confirmed."
+            ),
             phase=phase,
             model_may_have_changed=True,
         )
@@ -549,6 +553,10 @@ async def test_unconfirmed_claude_model_change_keeps_intent_without_claiming_an_
     response = await _pick_model(client, session)
 
     session.assert_unconfirmed(response)
+    assert ("saved default" in response.text) is (phase == "legacy")
+    assert session.runner_replies[0].json().get("uncertainty_scope") == (
+        "session_and_saved_default" if phase == "legacy" else None
+    )
     session.assert_model_request()
     assert len(session.runner_replies) == 1
     assert pane.commands == [session.requested_model]

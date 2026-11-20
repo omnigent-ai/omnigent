@@ -4589,14 +4589,27 @@ def register_core_routes(
                     await _raise_if_runner_re_tunnelled_to_another_replica(
                         session_id, updated.runner_id, conversation_store
                     )
-                    raise OmnigentError(
-                        (
+                    if _model_forward is None:
+                        uncertainty_detail = (
                             "Could not reach the terminal, so the model change was not sent. "
                             "Your requested model is saved. Reconnect the terminal before retrying."
-                            if _model_forward is None
-                            else "Claude may have changed the session model, but the selection could "
+                        )
+                    elif (
+                        _runner_reply_field(_model_forward.body, "uncertainty_scope")
+                        == "session_and_saved_default"
+                    ):
+                        uncertainty_detail = (
+                            "Claude may have changed the session model and the saved default for "
+                            "future terminals, but the selection could not be confirmed. "
+                            "Check the terminal's current model before retrying."
+                        )
+                    else:
+                        uncertainty_detail = (
+                            "Claude may have changed the session model, but the selection could "
                             "not be confirmed. Check the terminal's current model before retrying."
-                        ),
+                        )
+                    raise OmnigentError(
+                        uncertainty_detail,
                         code=ErrorCode.RUNNER_UNAVAILABLE,
                     )
                 # Neither a lost request nor a refusal confirms a model switch, but an

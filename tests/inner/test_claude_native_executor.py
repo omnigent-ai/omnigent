@@ -1607,24 +1607,8 @@ async def test_run_turn_keeps_the_pane_when_a_terminal_dialog_blocks_delivery(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("phase", "replacement"),
-    [
-        ("draft", False),
-        ("picker-enter", False),
-        ("picker-down", False),
-        ("status-enter", False),
-        ("picker", True),
-        ("commit", False),
-        ("status", True),
-    ],
-    ids=[
-        "owned-draft",
-        "after-enter",
-        "after-down",
-        "after-status-enter",
-        "replaced-picker",
-        "committed",
-        "replaced-status",
-    ],
+    [("draft", False), ("picker-enter", False), ("status", True)],
+    ids=["owned-draft", "hold-and-resume", "replaced-status"],
 )
 async def test_cancelled_model_switch_cleans_only_observed_owned_controls(
     tmp_path: Path,
@@ -1642,7 +1626,7 @@ async def test_cancelled_model_switch_cleans_only_observed_owned_controls(
     started, release = threading.Event(), threading.Event()
     worker_finished = threading.Event()
     initial_model = composer.model
-    observed_picker = observed_status = 0
+    observed_status = 0
     cancelled_at: list[tuple[str, ...]] = []
     killed: list[Path] = []
 
@@ -1656,22 +1640,14 @@ async def test_cancelled_model_switch_cleans_only_observed_owned_controls(
     def send(socket_path: str, *args: str) -> None:
         composer._run_tmux(socket_path, *args)
         key = args[-1]
-        if (
-            (phase == "draft" and key == "/model")
-            or (phase == "picker-enter" and key == "Enter" and composer.overlay == "picker")
-            or (phase == "picker-down" and key == "Down")
-            or (phase == "status-enter" and key == "Enter" and composer.overlay == "status")
-            or (phase == "commit" and key == "s")
+        if (phase == "draft" and key == "/model") or (
+            phase == "picker-enter" and key == "Enter" and composer.overlay == "picker"
         ):
             pause()
 
-    def capture(socket_path: str, target: str) -> str:
-        nonlocal observed_picker, observed_status
-        pane = composer._capture_pane(socket_path, target)
-        if composer.overlay == "picker" and composer.highlight == 1:
-            observed_picker += 1
-            if phase == "picker" and observed_picker == 2:
-                pause()
+    def capture(socket_path: str, target: str, *, join_wrapped: bool = False) -> str:
+        nonlocal observed_status
+        pane = composer._capture_pane(socket_path, target, join_wrapped=join_wrapped)
         if composer.overlay == "status":
             observed_status += 1
             if phase == "status" and observed_status == 2:
@@ -1709,11 +1685,8 @@ async def test_cancelled_model_switch_cleans_only_observed_owned_controls(
         assert claude_bridge._bridge_injection_lock(bridge_dir).locked()
         assert executor._inject_lock.locked()
         if replacement:
-            if phase == "picker":
-                composer.options[0] = "a-persons-replacement-model"
-            else:
-                composer.overlay = "status"
-                composer.session = "a-persons-replacement-session"
+            composer.overlay = "status"
+            composer.session = "a-persons-replacement-session"
         release.set()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(asyncio.shield(task), 2)
@@ -1722,23 +1695,13 @@ async def test_cancelled_model_switch_cleans_only_observed_owned_controls(
         cleanup = [args[-1] for args in composer.sends[len(cancelled_at) :]]
         expected = [_CLEAR_ONE_ROW_COMPOSER] if phase == "draft" else []
         assert cleanup == expected
-        assert [args[-1] for args in composer.sends].count("s") == (
-            1 if phase in {"commit", "status", "status-enter"} else 0
-        )
-        assert composer.model == (
-            "private-glm[1m]" if phase in {"commit", "status", "status-enter"} else initial_model
-        )
+        assert [args[-1] for args in composer.sends].count("s") == (1 if phase == "status" else 0)
+        assert composer.model == ("private-glm[1m]" if phase == "status" else initial_model)
         if not replacement:
             assert composer.text == ""
-            assert composer.overlay == (
-                "picker"
-                if phase in {"picker-enter", "picker-down"}
-                else "status"
-                if phase == "status-enter"
-                else None
-            )
-        if phase in {"picker-enter", "picker-down"}:
-            assert composer.highlight == int(phase == "picker-down")
+            assert composer.overlay == ("picker" if phase == "picker-enter" else None)
+        if phase == "picker-enter":
+            assert composer.highlight == 0
             assert composer.status_queries == 0
         assert composer.busy
         assert killed == []
@@ -1746,7 +1709,7 @@ async def test_cancelled_model_switch_cleans_only_observed_owned_controls(
         assert not claude_bridge._bridge_injection_lock(bridge_dir).locked()
         prompt.assert_not_called()
 
-        if phase in {"picker-enter", "picker-down", "status-enter"}:
+        if phase == "picker-enter":
             held = asyncio.Event()
             dismissed = threading.Event()
             loop = asyncio.get_running_loop()

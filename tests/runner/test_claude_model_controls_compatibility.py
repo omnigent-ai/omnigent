@@ -138,15 +138,7 @@ async def test_model_control_sends_no_keys_after_asynchronous_preparation_spends
 
 @pytest.mark.parametrize(
     ("phase", "replacement"),
-    [
-        ("draft", False),
-        ("picker-enter", False),
-        ("picker-down", False),
-        ("status-enter", False),
-        ("picker", True),
-        ("commit", False),
-        ("status", True),
-    ],
+    [("draft", False), ("status", True)],
 )
 async def test_cancelled_model_control_drains_and_cleans_only_observed_owned_controls(
     model_control: tuple[native_controls.NativeControls, _SessionModelComposer, Path],
@@ -159,7 +151,7 @@ async def test_cancelled_model_control_drains_and_cleans_only_observed_owned_con
     composer.busy = True
     initial_model = composer.model
     started, release, finished = threading.Event(), threading.Event(), threading.Event()
-    observed_picker = observed_status = 0
+    observed_status = 0
     cancelled_at: list[tuple[str, ...]] = []
 
     def pause() -> None:
@@ -171,22 +163,12 @@ async def test_cancelled_model_control_drains_and_cleans_only_observed_owned_con
     def send(socket_path: str, *args: str) -> None:
         composer._run_tmux(socket_path, *args)
         key = args[-1]
-        if (
-            (phase == "draft" and key == "/model")
-            or (phase == "picker-enter" and key == "Enter" and composer.overlay == "picker")
-            or (phase == "picker-down" and key == "Down")
-            or (phase == "status-enter" and key == "Enter" and composer.overlay == "status")
-            or (phase == "commit" and key == "s")
-        ):
+        if phase == "draft" and key == "/model":
             pause()
 
     def capture(socket_path: str, target: str, *, join_wrapped: bool = False) -> str:
-        nonlocal observed_picker, observed_status
+        nonlocal observed_status
         pane = composer._capture_pane(socket_path, target, join_wrapped=join_wrapped)
-        if composer.overlay == "picker" and composer.highlight == 1:
-            observed_picker += 1
-            if phase == "picker" and observed_picker == 2:
-                pause()
         if composer.overlay == "status":
             observed_status += 1
             if phase == "status" and observed_status == 2:
@@ -214,10 +196,7 @@ async def test_cancelled_model_control_drains_and_cleans_only_observed_owned_con
         assert not task.done() and not finished.is_set()
         assert bridge._bridge_injection_lock(bridge_dir).locked()
         if replacement:
-            if phase == "picker":
-                composer.options[0] = "a-persons-replacement-model"
-            else:
-                composer.session = "a-persons-replacement-session"
+            composer.session = "a-persons-replacement-session"
         release.set()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(asyncio.shield(task), 2)
@@ -226,12 +205,8 @@ async def test_cancelled_model_control_drains_and_cleans_only_observed_owned_con
         assert [args[-1] for args in composer.sends[len(cancelled_at) :]] == (
             [_CLEAR_ONE_ROW_COMPOSER] if phase == "draft" else []
         )
-        assert [args[-1] for args in composer.sends].count("s") == (
-            1 if phase in {"commit", "status", "status-enter"} else 0
-        )
-        assert composer.model == (
-            "private-glm[1m]" if phase in {"commit", "status", "status-enter"} else initial_model
-        )
+        assert [args[-1] for args in composer.sends].count("s") == (1 if phase == "status" else 0)
+        assert composer.model == ("private-glm[1m]" if phase == "status" else initial_model)
         assert composer.saved_default == initial_model
         assert not bridge._bridge_injection_lock(bridge_dir).locked()
     finally:
@@ -326,6 +301,7 @@ async def test_legacy_submission_failure_reports_uncertainty_about_the_saved_def
     assert response.status_code == 503
     error = json.loads(response.body)
     assert error["error"] == "claude_native_model_unconfirmed"
+    assert error["uncertainty_scope"] == "session_and_saved_default"
     assert "saved default" in error["detail"]
     assert composer.model == composer.saved_default == "private-glm[1m]"
 

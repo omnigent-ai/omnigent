@@ -819,7 +819,9 @@ Cross-harness journeys:
   Older CLIs and CLIs with unavailable or unverified version metadata retain
   legacy `/model MODEL` submission, including its possible saved-default change.
   A matching status bound to the same native session needs no command, preserving
-  a separately saved default. Missing or mismatched session identity still uses
+  a separately saved default. Pinned aliases must match the recorded concrete
+  generation and context; an unpinned alias still uses legacy submission.
+  Missing or mismatched session identity still uses
   legacy submission; the newer fresh-status guarantee does not apply.
   Existing bridge metadata works without re-registration. Upgrading Claude Code
   is optional; default preservation and fresh native receipts apply only when
@@ -837,7 +839,10 @@ Cross-harness journeys:
   event shape. New runners choose the actuator from the running CLI's version,
   including for older servers; an uncertain selection returns 503 and preserves the pane.
   Current servers preserve intent on uncertainty replies and retain newer
-  metadata. Older servers may roll back intent or report the prior
+  metadata. When a current runner reports an uncertain legacy submission,
+  the public warning also names the possible saved-default change. Older
+  runners without that optional detail keep the generic warning.
+  Older servers may roll back intent or report the prior
   model after uncertainty. Older runners retain their existing CLI actuator and
   saved-default behavior. Legacy requests and both peer directions are covered by
   `tests/runner/test_app_sessions_native_events_options.py::test_events_model_change_requires_the_same_immediate_picker_receipt`,

@@ -1482,8 +1482,11 @@ def build_native_controls(
                 else "claude_native_model_failed"
             )
             detail = _claude_model_change_blocked_detail(exc) or safe_detail
+            uncertainty_scope: str | None = None
             if isinstance(exc, ClaudeModelSwitchRefused) and exc.model_may_have_changed:
                 error_code = "claude_native_model_unconfirmed"
+                if exc.phase == "legacy":
+                    uncertainty_scope = "session_and_saved_default"
                 detail = (
                     str(exc)
                     if exc.phase == "legacy"
@@ -1497,6 +1500,7 @@ def build_native_controls(
                 content={
                     "error": error_code,
                     "detail": detail,
+                    **({"uncertainty_scope": uncertainty_scope} if uncertainty_scope else {}),
                     **({"waiting_on_person": True} if _claude_waits_on_person(exc) else {}),
                 },
             )

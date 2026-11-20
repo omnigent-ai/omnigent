@@ -32,6 +32,7 @@ from omnigent.server.smart_routing import models_in_family
 from tests.e2e.routing._helpers import (
     arm_in,
     claude_settings_snapshot,
+    claude_settings_unchanged,
     claude_user_settings_path,
     decisions,
     same_arm,
@@ -45,7 +46,6 @@ from tests.e2e.routing.conftest import (
     create_routed_session,
     post_user_message,
     prompts,
-    require_session_only_claude,
     require_tmux,
     sequence,
     spawn_prompt,
@@ -74,7 +74,6 @@ def test_claude_session_create_routes_the_model_and_then_the_spawn(
     mock_router: MockRouter,
     tmp_path: Path,
 ) -> None:
-    require_session_only_claude()
     require_tmux()
     routing_arms("claude-native")  # type: ignore[operator]
     workspace = trusted_workspace(tmp_path, "claude_ui_ws")
@@ -172,9 +171,11 @@ def test_claude_session_create_routes_the_model_and_then_the_spawn(
         "the spawn's task text never reached the router"
     )
 
-    # Session-only selection leaves the saved default unchanged.
+    # Only newer CLIs promise to preserve the saved model default.
     wait_for(
-        lambda: True if claude_settings_snapshot(settings_path) == settings_before else None,
+        lambda: (
+            True if claude_settings_unchanged(settings_path, settings_before, session_id) else None
+        ),
         timeout=10,
-        what="Claude settings, including the saved default, to match their initial state",
+        what="Claude settings to preserve the fields promised by the running CLI version",
     )
