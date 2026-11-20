@@ -280,7 +280,10 @@ def gateway_1m_claude_rig(
 def create_pinned_claude_session(rig: Gateway1mRig) -> str:
     """Create the claude-native wrapper session; binding the rig runner launches Claude Code."""
     created = create_native_session(
-        _client, rig.base_url, harness="claude", metadata={"workspace": str(_REPO_ROOT)}
+        _client,
+        rig.base_url,
+        harness="claude",
+        metadata={"workspace": str(_REPO_ROOT), "permission_mode": "manual"},
     )
     session_id = str(created["session_id"])
     try:

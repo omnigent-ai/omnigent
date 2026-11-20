@@ -2805,22 +2805,59 @@ async def test_auto_create_claude_terminal_points_a_managed_relay_entry_at_its_b
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("model", "expected_launch"),
+    ("model", "provider_env", "expected_launch"),
     [
-        ("databricks-claude-opus-4-7", "databricks-claude-opus-4-7[1m]"),
-        ("databricks-claude-haiku-4-5", "databricks-claude-haiku-4-5"),
-        ("databricks-claude-opus-4-5", "databricks-claude-opus-4-5"),
+        pytest.param(
+            "databricks-claude-opus-4-7",
+            {"ANTHROPIC_BASE_URL": "https://gateway.example.test/anthropic"},
+            "databricks-claude-opus-4-7[1m]",
+            id="long-context",
+        ),
+        pytest.param(
+            "databricks-claude-haiku-4-5",
+            {"ANTHROPIC_BASE_URL": "https://gateway.example.test/anthropic"},
+            "databricks-claude-haiku-4-5",
+            id="haiku-default-window",
+        ),
+        pytest.param(
+            "databricks-claude-opus-4-5",
+            {"ANTHROPIC_BASE_URL": "https://gateway.example.test/anthropic"},
+            "databricks-claude-opus-4-5",
+            id="older-opus-default-window",
+        ),
+        pytest.param("claude-opus-4-7", {}, "claude-opus-4-7", id="direct-api-default-endpoint"),
+        pytest.param(
+            "claude-opus-4-7",
+            {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"},
+            "claude-opus-4-7",
+            id="direct-api-explicit-endpoint",
+        ),
+        pytest.param(
+            "claude-opus-4-7",
+            {"CLAUDE_CODE_USE_BEDROCK": "1"},
+            "claude-opus-4-7",
+            id="bedrock-default-endpoint",
+        ),
+        pytest.param(
+            "claude-opus-4-7",
+            {
+                "CLAUDE_CODE_USE_BEDROCK": "1",
+                "ANTHROPIC_BEDROCK_BASE_URL": "https://bedrock.example.test",
+            },
+            "claude-opus-4-7",
+            id="bedrock-custom-endpoint",
+        ),
     ],
-    ids=["long-context", "haiku-default-window", "older-opus-default-window"],
 )
 async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     model: str,
+    provider_env: dict[str, str],
     expected_launch: str,
 ) -> None:
     """
-    Host-spawned launch injects the ucode Databricks gateway config.
+    Host-spawned launches preserve the provider config and its context policy.
 
     On the daemon / web-UI path the runner — not the CLI — launches
     Claude, so it must reproduce the gateway auth the CLI normally
@@ -2857,9 +2894,8 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
         _no_op_forwarder,
     )
 
-    gateway_env = {"ANTHROPIC_BASE_URL": "https://gw.example/anthropic"}
     ucode = ClaudeNativeUcodeConfig(
-        env=dict(gateway_env),
+        env=dict(provider_env),
         api_key_helper="printf %s sk-sentinel-do-not-use",
         model=model,
         routable_models=(
@@ -2903,14 +2939,18 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
     # ENABLE_TOOL_SEARCH forces Claude Code to defer MCP tool schemas
     # instead of loading all 200+ bridge tools into startup context.
     assert spec.env == {
-        **gateway_env,
+        **provider_env,
         "CLAUDE_AGENT_SDK_CLIENT_APP": "omnigent",
         "ENABLE_TOOL_SEARCH": "true",
         "CLAUDE_CODE_DISABLE_AGENT_VIEW": "1",
         "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
         "CLAUDE_ENV_FILE": claude_tool_env_file(),
         "API_TIMEOUT_MS": "120000",
-        "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK": "1",
+        **(
+            {"CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK": "1"}
+            if provider_env.get("ANTHROPIC_BASE_URL") == "https://gateway.example.test/anthropic"
+            else {}
+        ),
     }
     assert spec.command == "claude"
     # The gateway default model is applied (no per-session override here).
