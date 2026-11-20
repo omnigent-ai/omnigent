@@ -9,10 +9,13 @@ import {
   useState,
 } from "react";
 import * as DialogPrimitive from "radix-ui/dialog";
-import { XIcon, ZoomInIcon, ZoomOutIcon } from "lucide-react";
+import { DownloadIcon, XIcon, ZoomInIcon, ZoomOutIcon } from "lucide-react";
+import { toast } from "sonner";
 
 import { getEmbedRoot } from "@/lib/host";
 import { Button } from "@/components/ui/button";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { canDownloadImage, downloadImage } from "@/hooks/useFileContent";
 import { cn } from "@/lib/utils";
 
 // Zoom bounds and step for the lightbox viewer. 1 = fit-to-card.
@@ -30,6 +33,56 @@ function clampZoom(z: number) {
 interface LightboxImage {
   src: string;
   alt: string;
+  /** Save-dialog name; defaults to `alt`. */
+  downloadName?: string;
+  /** App API path the image was read from, for sources the page can't save itself. */
+  downloadPath?: string;
+  /** The image's bytes; outlives an object URL its owner revokes while the preview is open. */
+  downloadBlob?: Blob;
+}
+
+function ImageDownloadButton({ image, className }: { image: LightboxImage; className?: string }) {
+  const [saving, setSaving] = useState(false);
+  // A ref, not state, so two clicks in one frame can't both pass the check.
+  const savingRef = useRef(false);
+  const name = image.downloadName || image.alt;
+  const save = () => {
+    if (savingRef.current) return;
+    savingRef.current = true;
+    setSaving(true);
+    downloadImage(image.src, name || "image", {
+      apiPath: image.downloadPath,
+      blob: image.downloadBlob,
+    })
+      .catch(() => toast.error("Download failed"))
+      .finally(() => {
+        savingRef.current = false;
+        setSaving(false);
+      });
+  };
+  return (
+    // Tests and stories render images without the app root's provider.
+    <TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            aria-label={name ? `Download image: ${name}` : "Download image"}
+            className={className}
+            disabled={saving}
+            onClick={(e) => {
+              e.stopPropagation();
+              save();
+            }}
+          >
+            <DownloadIcon />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">Download</TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  );
 }
 
 interface LightboxContextValue {
@@ -52,6 +105,12 @@ export interface ZoomableImageProps extends React.ComponentProps<"img"> {
   alt: string;
   /** Optional sizing for the button around the image. */
   buttonClassName?: string;
+  /** Save-dialog name; setting it also shows a download button on hover. */
+  downloadName?: string;
+  /** App API path the image was read from, for sources the page can't save itself. */
+  downloadPath?: string;
+  /** The image's bytes, so a save survives its owner revoking `src`. */
+  downloadBlob?: Blob;
 }
 
 /**
@@ -67,10 +126,13 @@ export function ZoomableImage({
   alt,
   className,
   buttonClassName,
+  downloadName,
+  downloadPath,
+  downloadBlob,
   ...imgProps
 }: ZoomableImageProps) {
   const { open } = useLightbox();
-  return (
+  const zoom = (
     <button
       type="button"
       aria-label={alt ? `Zoom image: ${alt}` : "Zoom image"}
@@ -79,11 +141,26 @@ export function ZoomableImage({
         buttonClassName,
       )}
       onClick={() => {
-        if (src) open({ src, alt });
+        if (src) open({ src, alt, downloadName, downloadPath, downloadBlob });
       }}
     >
       <img {...imgProps} src={src} alt={alt} className={className} />
     </button>
+  );
+  const source = { apiPath: downloadPath, blob: downloadBlob };
+  if (!downloadName || !src || !canDownloadImage(src, source)) return zoom;
+  return (
+    <span className="group/image relative inline-flex max-w-full">
+      {zoom}
+      <ImageDownloadButton
+        image={{ src, alt, downloadName, downloadPath, downloadBlob }}
+        className={cn(
+          "absolute top-1 right-1 bg-background/80 shadow-sm ring-1 ring-foreground/10 backdrop-blur-xs hover:bg-background/90",
+          // Touch screens never hover, so the hidden button must not take the zoom tap.
+          "pointer-events-none opacity-0 group-hover/image:pointer-events-auto group-hover/image:opacity-100 focus-visible:pointer-events-auto focus-visible:opacity-100",
+        )}
+      />
+    </span>
   );
 }
 
@@ -227,6 +304,9 @@ function ZoomViewer({ image, onClose }: { image: LightboxImage; onClose: () => v
         >
           <ZoomInIcon />
         </Button>
+        {canDownloadImage(image.src, { apiPath: image.downloadPath, blob: image.downloadBlob }) && (
+          <ImageDownloadButton image={image} />
+        )}
       </div>
     </>
   );
