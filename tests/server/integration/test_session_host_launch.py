@@ -4997,8 +4997,11 @@ async def test_rider_of_a_refused_relaunch_surfaces_the_refusal(
 class _HostFrameResponder:
     """Answer host round-trips in the background and record every stop request."""
 
-    def __init__(self, comm: ApplicationCommunicator) -> None:
+    def __init__(
+        self, comm: ApplicationCommunicator, *, runner_status: dict[str, str] | None = None
+    ) -> None:
         self._comm = comm
+        self._runner_status = runner_status or {}
         self.stopped_runner_ids: list[str] = []
         self.launch_frames: list[HostLaunchRunnerFrame] = []
         self._task: asyncio.Task[None] | None = None
@@ -5039,6 +5042,10 @@ class _HostFrameResponder:
                 reply = HostLaunchRunnerResultFrame(
                     request_id=frame.request_id, status="launched", runner_id="runner_from_host"
                 )
+            elif isinstance(frame, HostRunnerStatusFrame) and (
+                status := self._runner_status.get(frame.runner_id)
+            ):
+                reply = HostRunnerStatusResultFrame(request_id=frame.request_id, status=status)
             else:
                 continue
             await self._comm.send_input(
@@ -6111,6 +6118,58 @@ async def test_an_answer_during_a_runner_tunnel_gap_reaches_the_hook(
     assert not await _expect_no_launch(comm, budget_s=budget(0.2))
 
 
+@pytest.mark.parametrize("route", ["resolve", "approval_event"])
+async def test_an_admission_failure_after_the_tunnel_gap_still_reaches_the_hook(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    app: FastAPI,
+    route: str,
+) -> None:
+    """The asking runner reconnects but fails admission: its hook still gets the answer."""
+    from omnigent.errors import ErrorCode
+    from omnigent.runner.routing import RoutedRunner
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.runtime_compatibility import RuntimeSupportError
+
+    comm, session_id, hook_task, elicitation_id = await _park_on_claude_session(client, app)
+    runner_posts: list[tuple[str, dict[str, Any]]] = []
+    fake_runner = _recording_runner(runner_posts)
+
+    def _tunnel_gap(conversation_id: str, **kwargs: Any) -> RoutedRunner:
+        del conversation_id, kwargs
+        raise LookupError("no tunnel yet")
+
+    def _admission_fails(conversation_id: str, **kwargs: Any) -> RoutedRunner:
+        del conversation_id, kwargs
+        raise RuntimeSupportError("Cannot load /example/agent.yaml", code=ErrorCode.CONFLICT)
+
+    async def _connects(*args: Any, **kwargs: Any) -> object:
+        del args, kwargs
+        return object()
+
+    set_runner_client(None)
+    router = app.state.runner_router
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", budget(5.0))
+    monkeypatch.setattr(router, "client_for_session_control", _tunnel_gap)
+    monkeypatch.setattr(router, "client_for_session_resources", _admission_fails)
+    monkeypatch.setattr(app.state.tunnel_registry, "wait_for_runner", _connects)
+    try:
+        await _resolve_answer(client, session_id, elicitation_id, route=route)
+        hook_response = await asyncio.wait_for(hook_task, budget(5.0))
+    finally:
+        hook_task.cancel()
+        await asyncio.gather(hook_task, return_exceptions=True)
+        await fake_runner.aclose()
+
+    # The approval forward still meets the admission error, as before: check the hook.
+    decision = hook_response.json()["hookSpecificOutput"]["decision"]
+    assert decision["behavior"] == "allow", decision
+    assert decision["updatedInput"]["answers"] == {_QUESTION: "sqlite"}
+    assert _message_texts(runner_posts) == []
+    assert not await _expect_no_launch(comm, budget_s=budget(0.2))
+
+
 async def test_a_retry_after_the_original_runner_returns_reaches_the_hook(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -6148,38 +6207,6 @@ async def test_a_retry_after_the_original_runner_returns_reaches_the_hook(
     assert orchestration._stopped_session_answers.get((session_id, elicitation_id)) is None
 
 
-async def _serve_dead_runner_then_launch(
-    comm: ApplicationCommunicator, dead_runner_id: str
-) -> HostLaunchRunnerFrame:
-    """Report *dead_runner_id* dead on each status query, then serve the relaunch."""
-    deadline = Deadline(30.0)
-    for _ in range(80):
-        output = await comm.receive_output(timeout=deadline.next_wait(30.0))
-        if output["type"] != "websocket.send":
-            continue
-        frame = decode_host_frame(output["text"])
-        if isinstance(frame, HostRunnerStatusFrame) and frame.runner_id == dead_runner_id:
-            reply = HostRunnerStatusResultFrame(request_id=frame.request_id, status="dead")
-        elif isinstance(frame, HostStatFrame):
-            reply = HostStatResultFrame(
-                request_id=frame.request_id,
-                status="ok",
-                exists=True,
-                type="directory",
-                canonical_path=frame.path,
-            )
-        elif isinstance(frame, HostLaunchRunnerFrame):
-            reply = HostLaunchRunnerResultFrame(
-                request_id=frame.request_id, status="launched", runner_id="runner_from_host"
-            )
-        else:
-            continue
-        await comm.send_input({"type": "websocket.receive", "text": encode_host_frame(reply)})
-        if isinstance(frame, HostLaunchRunnerFrame):
-            return frame
-    raise AssertionError("host never received a launch frame")
-
-
 async def test_an_answer_waits_only_until_the_host_reports_the_runner_dead(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -6215,15 +6242,17 @@ async def test_an_answer_waits_only_until_the_host_reports_the_runner_dead(
     monkeypatch.setattr(sessions_module, "_get_runner_client", _no_runner)
     monkeypatch.setattr(sessions_module, "_wait_for_runner_client", _relaunched_only)
     monkeypatch.setattr(sessions_module, "_ensure_runner_relay_ready", _noop_relay_ready)
-    answer = asyncio.create_task(_resolve_answer(client, session_id, elicitation_id))
-    host = asyncio.create_task(_serve_dead_runner_then_launch(comm, conv.runner_id))
     try:
-        response = await asyncio.wait_for(answer, budget(10.0))
+        async with _HostFrameResponder(comm, runner_status={conv.runner_id: "dead"}) as host:
+            response = await asyncio.wait_for(
+                _resolve_answer(client, session_id, elicitation_id), budget(10.0)
+            )
     finally:
-        await _cancel_all(answer, host, hook_task)
+        await _cancel_all(hook_task)
         await fake_runner.aclose()
 
     assert response.status_code < 300 and response.json().get("queued") is True, response.text
+    assert host.launch_frames, "the dead report should lead to a relaunch"
     assert len(_message_texts(runner_posts)) == 1, runner_posts
 
 
@@ -6372,15 +6401,58 @@ async def test_a_cancelled_answer_can_be_answered_again(
     assert len(_message_texts(runner_posts)) == 1
 
 
+@pytest.mark.parametrize("route", ["resolve", "approval_event"])
+async def test_an_answer_reaches_the_local_hook_when_its_runner_is_live_on_another_replica(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    app: FastAPI,
+    db_uri: str,
+    route: str,
+) -> None:
+    """The runner re-tunnelled to a sibling replica: the hook parked here gets the answer."""
+    from omnigent.runtime import pending_elicitations, set_runner_client
+    from omnigent.server.routes._sessions import orchestration
+
+    comm, session_id, hook_task, elicitation_id = await _park_on_claude_session(client, app)
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.get_conversation(session_id)
+    assert conv is not None and conv.runner_id is not None
+    set_runner_client(None)
+    _stage_relaunched_runner(monkeypatch, None)
+    try:
+        await _disconnect_host(app, comm)
+        host = app.state.host_store.get_host(_HOST_ID)
+        app.state.host_store.upsert_on_connect(host.host_id, host.name, host.user_id)
+        # Another replica's tunnel stamps the runner; this process never wrote that stamp.
+        store.touch_runner_liveness([conv.runner_id], int(time.time()) + 1)
+        response = await _resolve_answer(client, session_id, elicitation_id, route=route)
+        hook_response = await asyncio.wait_for(hook_task, budget(5.0))
+    finally:
+        hook_task.cancel()
+        await asyncio.gather(hook_task, return_exceptions=True)
+
+    assert response.status_code == 202, response.text
+    assert response.json() == {"queued": False}
+    decision = hook_response.json()["hookSpecificOutput"]["decision"]
+    assert decision["behavior"] == "allow", decision
+    assert decision["updatedInput"]["answers"] == {_QUESTION: "sqlite"}
+    assert (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"] == []
+    assert orchestration._stopped_session_answers.get((session_id, elicitation_id)) is None
+    assert pending_elicitations.lookup(elicitation_id, conversation_id=session_id) is None
+
+
 async def test_answer_when_the_host_is_on_another_replica_redirects(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
     app: FastAPI,
+    db_uri: str,
 ) -> None:
-    """A routing miss re-addresses the client and leaves the question open."""
+    """A live host row alone re-addresses the client and leaves the question open."""
     from omnigent.runtime import pending_elicitations, set_runner_client
 
     comm, session_id, hook_task, elicitation_id = await _park_on_claude_session(client, app)
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None and conv.runner_last_seen is None
     set_runner_client(None)
     _stage_relaunched_runner(monkeypatch, None)
     try:

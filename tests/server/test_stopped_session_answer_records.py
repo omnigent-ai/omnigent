@@ -364,10 +364,11 @@ async def _gate_runner_check(
     return reached, release
 
 
-async def test_a_retry_that_waits_returns_the_finished_retry_ack(
-    question: _Question, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("other", ["finished", "delivering"])
+async def test_a_retry_that_waits_takes_the_other_delivery(
+    question: _Question, monkeypatch: pytest.MonkeyPatch, other: str
 ) -> None:
-    """A retry whose runner check outlasts another retry's delivery gets that delivery's ack."""
+    """A retry whose runner check outlasts another delivery gets that delivery's ack."""
     record = orchestration._StoppedSessionAnswer(
         started_at=time.time(),
         fingerprint=orchestration._harness_elicitation_fingerprint_or_none(_question_params()),
@@ -378,10 +379,19 @@ async def test_a_retry_that_waits_returns_the_finished_retry_ack(
     post_event, _reached, _release = _gated_post_event(question, [])
     retry = question.answer(post_event)
     await asyncio.wait_for(reached.wait(), 5.0)
-    record.acknowledgement = {"queued": True, "item_id": "item_other"}
-    release.set()
+    ack = {"queued": True, "item_id": "item_other"}
+    if other == "finished":
+        record.acknowledgement = ack
+        release.set()
+    else:
+        delivery = asyncio.get_running_loop().create_future()
+        record.delivery = delivery
+        release.set()
+        await asyncio.sleep(0)
+        assert not retry.done(), "the retry must wait for the delivery that started meanwhile"
+        delivery.set_result(ack)
 
-    assert await asyncio.wait_for(retry, 5.0) == {"queued": True, "item_id": "item_other"}
+    assert await asyncio.wait_for(retry, 5.0) == ack
     assert question.posts == []
 
 
@@ -410,6 +420,137 @@ async def test_an_answer_whose_question_changes_during_the_runner_check_is_not_s
     assert await asyncio.wait_for(answer, 5.0) is None
     assert question.posts == []
     assert orchestration._stopped_session_answers.get(question.key) is None
+
+
+class _Rows:
+    """A conversation store that serves one row and counts the reads."""
+
+    def __init__(self, conv: Conversation) -> None:
+        self.row: Conversation | None = conv
+        self.error: Exception | None = None
+        self.reads = 0
+
+    def get_conversation(self, session_id: str) -> Conversation | None:
+        del session_id
+        self.reads += 1
+        if self.error is not None:
+            raise self.error
+        return self.row
+
+
+def _bound_conv(**fields: Any) -> Conversation:
+    values: dict[str, Any] = {"host_id": "host_bound", "runner_id": "runner_bound", **fields}
+    return Conversation(
+        id="conv_bound",
+        created_at=0,
+        updated_at=0,
+        root_conversation_id="conv_bound",
+        **values,
+    )
+
+
+def _check_request(
+    monkeypatch: pytest.MonkeyPatch, wait: Callable[..., Awaitable[object]]
+) -> Request:
+    """Stage a runner check that misses here, has no host connection, and runs *wait*."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    async def _no_runner(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+
+    async def _not_offline(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+
+    monkeypatch.setattr(orchestration, "_get_runner_client", _no_runner)
+    monkeypatch.setattr(orchestration, "_session_offline_host_id", _not_offline)
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 30.0)
+    monkeypatch.setattr(sessions_module, "_wait_for_runner_client", wait)
+    app = SimpleNamespace(state=SimpleNamespace(host_registry=None, tunnel_registry=None))
+    return Request({"type": "http", "method": "POST", "path": "/", "headers": [], "app": app})
+
+
+@pytest.mark.parametrize("own_stamp", [False, True])
+async def test_a_runner_live_on_another_replica_skips_the_wait(
+    monkeypatch: pytest.MonkeyPatch, own_stamp: bool
+) -> None:
+    """A stamp newer than this process wrote means a sibling holds the runner; its own does not."""
+    from omnigent.server import session_live_state
+
+    stamp = int(time.time())
+    conv = _bound_conv(runner_last_seen=stamp)
+    if own_stamp:
+        monkeypatch.setitem(session_live_state._last_liveness_stamp, "runner_bound", stamp)
+    waits: list[object] = []
+
+    async def _wait(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        waits.append(True)
+
+    request = _check_request(monkeypatch, _wait)
+    rows = _Rows(_bound_conv())
+    reachable = await orchestration._session_runner_reachable(
+        request, conv.id, conv, None, cast("Any", rows), RunnerExitReports()
+    )
+
+    assert reachable is (not own_stamp)
+    assert waits == ([True] if own_stamp else [])
+
+
+@pytest.mark.parametrize("row", ["moved", "gone", "read_error"])
+async def test_a_runner_that_moves_during_the_wait_takes_the_answer(
+    monkeypatch: pytest.MonkeyPatch, row: str
+) -> None:
+    """The check after the wait sees a runner that re-tunnelled meanwhile; a lost row is a miss."""
+    conv = _bound_conv()
+    rows = _Rows(conv)
+
+    async def _wait(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        if row == "moved":
+            rows.row = _bound_conv(runner_last_seen=int(time.time()))
+        elif row == "gone":
+            rows.row = None
+        else:
+            rows.error = RuntimeError("store down")
+
+    request = _check_request(monkeypatch, _wait)
+    reachable = await orchestration._session_runner_reachable(
+        request, conv.id, conv, None, cast("Any", rows), RunnerExitReports()
+    )
+
+    assert reachable is (row == "moved")
+    assert rows.reads == 1
+
+
+@pytest.mark.parametrize("case", ["still_bound", "rebound", "wrong_replica"])
+async def test_an_admission_error_after_the_runner_connects_keeps_the_hook(
+    monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    """Admission fails only after the tunnel connected; other errors, or a rebound row, raise."""
+    conv = _bound_conv()
+    rows = _Rows(conv if case != "rebound" else _bound_conv(runner_id="runner_new"))
+    code = (
+        ErrorCode.WRONG_REPLICA
+        if case == "wrong_replica"
+        else ErrorCode.RUNNER_CAPABILITY_MISMATCH
+    )
+    error = OmnigentError("raised by the wait", code=code)
+
+    async def _wait(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise error
+
+    request = _check_request(monkeypatch, _wait)
+    check = orchestration._session_runner_reachable(
+        request, conv.id, conv, None, cast("Any", rows), RunnerExitReports()
+    )
+
+    if case == "still_bound":
+        assert await check is True
+    else:
+        with pytest.raises(OmnigentError) as raised:
+            await check
+        assert raised.value is error
 
 
 async def test_a_reported_exit_skips_the_offline_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -445,37 +586,14 @@ async def test_a_reported_exit_skips_the_offline_lookup(monkeypatch: pytest.Monk
     monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 30.0)
     monkeypatch.setattr(sessions_module, "_wait_for_runner_client", _wait)
 
+    rows = _Rows(conv)
     reachable = await orchestration._session_runner_reachable(
-        request, conv.id, conv, None, cast("Any", object()), reports
+        request, conv.id, conv, None, cast("Any", rows), reports
     )
 
     assert reachable is False
     assert waits == [reports]
-
-
-async def test_a_retry_that_waits_joins_a_delivery_that_started_meanwhile(
-    question: _Question, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A retry whose runner check outlasts the start of another delivery waits for it."""
-    record = orchestration._StoppedSessionAnswer(
-        started_at=time.time(),
-        fingerprint=orchestration._harness_elicitation_fingerprint_or_none(_question_params()),
-        runner_id=None,
-    )
-    orchestration._stopped_session_answers[question.key] = record
-    reached, release = await _gate_runner_check(monkeypatch)
-    post_event, _reached, _release = _gated_post_event(question, [])
-    retry = question.answer(post_event)
-    await asyncio.wait_for(reached.wait(), 5.0)
-    other = asyncio.get_running_loop().create_future()
-    record.delivery = other
-    release.set()
-    await asyncio.sleep(0)
-    assert not retry.done(), "the retry must wait for the delivery that started meanwhile"
-    other.set_result({"queued": True, "item_id": "item_other"})
-
-    assert await asyncio.wait_for(retry, 5.0) == {"queued": True, "item_id": "item_other"}
-    assert question.posts == []
+    assert rows.reads == 0
 
 
 async def test_an_offline_host_skips_the_runner_wait(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -508,8 +626,10 @@ async def test_an_offline_host_skips_the_runner_wait(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 30.0)
     monkeypatch.setattr(sessions_module, "_wait_for_runner_client", _wait)
 
+    rows = _Rows(conv)
     reachable = await orchestration._session_runner_reachable(
-        request, conv.id, conv, None, cast("Any", object()), RunnerExitReports()
+        request, conv.id, conv, None, cast("Any", rows), RunnerExitReports()
     )
 
     assert reachable is False
+    assert rows.reads == 0

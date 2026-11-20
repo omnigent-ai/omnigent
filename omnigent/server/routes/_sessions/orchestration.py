@@ -3188,21 +3188,47 @@ async def _session_runner_reachable(
     runner_exit_reports: RunnerExitReports | None,
 ) -> bool:
     """
-    Return whether the session's runner is reachable, after the message path's connect grace.
+    Return whether the runner that asked can still take the answer through its hook.
 
-    Same gates as the message path's runner wait in routes_events.py: no wait for a hostless
-    session or an offline host; the host reporting the runner dead, or an exit report, ends it.
+    True when it is reachable here, live on another replica (the hook it parked here waits), or
+    back within the message path's connect grace. The grace gates match routes_events.py.
     """
     if await _get_runner_client(session_id, runner_router, conversation=conv, for_control=True):
         return True
     from omnigent.server.routes import sessions as _facade
+    from omnigent.server.runtime_compatibility import RuntimeSupportError
 
-    grace_s = _facade._HOST_BOUND_RUNNER_CONNECT_GRACE_S
     runner_id = conv.runner_id
-    if conv.host_id is None or runner_id is None or conversation_store is None or grace_s <= 0:
+    if runner_id is None or conversation_store is None:
+        return False
+    store = conversation_store
+    known_exit = runner_exit_reports.get(runner_id) if runner_exit_reports is not None else None
+
+    def live_elsewhere(row: Conversation | None) -> bool:
+        return row is not None and _runner_live_on_another_replica_from_conversations(
+            [row], runner_id, session_live_state.last_liveness_stamp(runner_id)
+        )
+
+    async def fresh_row() -> Conversation | None:
+        try:
+            return await asyncio.to_thread(store.get_conversation, session_id)
+        except Exception:  # noqa: BLE001
+            _logger.warning(
+                "Could not re-read session %s for runner %s", session_id, runner_id, exc_info=True
+            )
+            return None
+
+    if known_exit is None and live_elsewhere(conv):
+        _logger.info(
+            "Runner %s is live on another replica; the answer goes to its hook",
+            runner_id,
+            extra={"session_id": session_id},
+        )
+        return True
+    grace_s = _facade._HOST_BOUND_RUNNER_CONNECT_GRACE_S
+    if conv.host_id is None or grace_s <= 0:
         return False
     app_state = request.app.state
-    known_exit = runner_exit_reports.get(runner_id) if runner_exit_reports is not None else None
     offline = (
         await _session_offline_host_id(conv, app_state, conversation_store)
         if known_exit is None
@@ -3219,27 +3245,52 @@ async def _session_runner_reachable(
         extra={"session_id": session_id},
     )
     tunnel_registry = getattr(app_state, "tunnel_registry", None)
-    if host_registry is not None and host_conn is not None:
-        client = await _wait_for_host_bound_runner_client(
-            session_id,
-            runner_router,
-            tunnel_registry,
-            runner_id=runner_id,
-            timeout_s=grace_s,
-            runner_exit_reports=runner_exit_reports,
-            host_conn=host_conn,
-            host_registry=host_registry,
-            conversation_store=conversation_store,
+    try:
+        if host_registry is not None and host_conn is not None:
+            client = await _wait_for_host_bound_runner_client(
+                session_id,
+                runner_router,
+                tunnel_registry,
+                runner_id=runner_id,
+                timeout_s=grace_s,
+                runner_exit_reports=runner_exit_reports,
+                host_conn=host_conn,
+                host_registry=host_registry,
+                conversation_store=conversation_store,
+            )
+        else:
+            client = await _wait_for_runner_client(
+                session_id,
+                runner_router,
+                tunnel_registry,
+                runner_id=runner_id,
+                timeout_s=grace_s,
+                runner_exit_reports=runner_exit_reports,
+            )
+    except OmnigentError as exc:
+        # Admission runs only after the tunnel connected; the hook still takes the answer.
+        admission = ErrorCode.RUNNER_CAPABILITY_MISMATCH
+        if not (isinstance(exc, RuntimeSupportError) or exc.code == admission):
+            raise
+        row = await fresh_row()
+        if row is None or row.runner_id != runner_id:
+            raise
+        _logger.info(
+            "Runner %s came back but failed admission (%s); the answer goes to its hook",
+            runner_id,
+            exc.code,
+            extra={"session_id": session_id},
         )
-    else:
-        client = await _wait_for_runner_client(
-            session_id,
-            runner_router,
-            tunnel_registry,
-            runner_id=runner_id,
-            timeout_s=grace_s,
-            runner_exit_reports=runner_exit_reports,
-        )
+        return True
+    exited = runner_exit_reports is not None and runner_exit_reports.get(runner_id) is not None
+    if client is None and not exited:
+        if live_elsewhere(await fresh_row()):
+            _logger.info(
+                "Runner %s moved to another replica during the wait; the answer goes to its hook",
+                runner_id,
+                extra={"session_id": session_id},
+            )
+            return True
     _logger.info(
         "Runner %s %s",
         runner_id,
