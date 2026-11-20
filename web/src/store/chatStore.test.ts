@@ -7493,24 +7493,20 @@ describe("chatStore — delivered-but-unacked send", () => {
     return { answerPost: () => answer(), postedBodies };
   }
 
-  it.each([
-    ["message", () => useChatStore.getState().send("summarize the deploy status", "agent_xyz")],
-    [
-      "slash command",
-      () => useChatStore.getState().sendSlashCommand("grill-me", "review this", "agent_xyz"),
-    ],
-  ])("stops waiting on a %s whose POST never answers", async (_kind, sendInput) => {
+  it("stops waiting on a slash command whose POST never answers until it accepts the command late", async () => {
     vi.useFakeTimers();
     onTestFinished(() => {
       vi.useRealTimers();
+      usePlanStops.setState({ requests: {}, settledStops: {} });
     });
     useChatStore.setState({
       conversationId: "conv_existing",
       abortController: new AbortController(),
     });
-    holdEventPosts();
+    await trackPlanStop("conv_existing", async () => ({}));
+    const { answerPost } = holdEventPosts();
 
-    const sent = sendInput();
+    const sent = useChatStore.getState().sendSlashCommand("grill-me", "review this", "agent_xyz");
     await vi.advanceTimersByTimeAsync(SEND_UNANSWERED_AFTER_MS - 1);
     expect(useChatStore.getState().pendingUserMessages).toEqual([
       expect.objectContaining({ stillSending: true }),
@@ -7526,6 +7522,12 @@ describe("chatStore — delivered-but-unacked send", () => {
       }),
     ]);
     await sent;
+    expect(usePlanStops.getState().requests.conv_existing).toMatchObject({ sent: true });
+
+    answerPost();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(errorCards()).toEqual([]);
+    expect(usePlanStops.getState().requests.conv_existing).toBeUndefined();
   });
 
   it("leaves another turn's response and background work alone when it gives up", async () => {
@@ -7645,8 +7647,14 @@ describe("chatStore — delivered-but-unacked send", () => {
     holdEventPosts();
 
     const sent = useChatStore.getState().send("summarize the deploy status", "agent_xyz");
-    await vi.advanceTimersByTimeAsync(SEND_UNANSWERED_AFTER_MS);
+    await vi.advanceTimersByTimeAsync(SEND_UNANSWERED_AFTER_MS - 1);
+    expect(useChatStore.getState().pendingUserMessages).toEqual([
+      expect.objectContaining({ stillSending: true }),
+    ]);
+    await vi.advanceTimersByTimeAsync(1);
 
+    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    expect(useChatStore.getState().status).toBe("idle");
     const draft = useChatStore.getState().failedSendDraft;
     expect(draft).toMatchObject({ text: "summarize the deploy status", serverRefused: false });
     const stableId = draft?.stableId;
@@ -22696,10 +22704,20 @@ describe("chatStore — client-side message queue", () => {
       expect(delivered).toEqual(["hung"]);
       expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["queued"]);
 
-      // Once the row stops showing a turn, the unanswered send fails and hands its text back.
+      // Once the row stops showing a turn, the queued send takes over the stranded latch
+      // before the unanswered send fails and hands its text back.
       seedConversationsCache([conv("conv_abc", "idle")]);
+      useChatStore.getState().maybeFlushQueuedHead();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(delivered).toEqual(["hung", "queued"]);
+      const queuedLatch = useChatStore.getState().sendLatchedAt;
+      expect(queuedLatch).not.toBeNull();
       await vi.advanceTimersByTimeAsync(SEND_STILL_SENDING_AFTER_MS);
       expect(useChatStore.getState().failedSendDraft).toMatchObject({ text: "hung" });
+      expect(useChatStore.getState()).toMatchObject({
+        status: "streaming",
+        sendLatchedAt: queuedLatch,
+      });
     } finally {
       vi.useRealTimers();
     }

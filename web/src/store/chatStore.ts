@@ -82,6 +82,7 @@ import {
   OLDER_HISTORY_PAGE_ITEMS,
   openSessionStream,
   postEvent,
+  type PostEventResponse,
   rewindSession,
   type RewindAttachment,
   SIGN_IN_EXPIRED_CODE,
@@ -2955,14 +2956,17 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         : pinnedId === null
           ? get().status === "streaming"
           : setterForState(pinnedId)?.status === "streaming";
+    // The latch this send holds, if any; a later send can take it over.
+    let latchedAt: number | null = null;
     if (!alreadyStreaming && !opensSideChat) {
+      latchedAt = Date.now();
       // Latch on the SAME entry as `status`, in one patch, so they can't
       // diverge — a new chat buffers both on root and `adoptPreSessionState`
       // moves them onto the entry together.
       pinnedSetter({
         status: "streaming",
         activeResponse: null,
-        sendLatchedAt: Date.now(),
+        sendLatchedAt: latchedAt,
         sendLatchSeenRunning: null,
       });
     }
@@ -3127,13 +3131,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       }
 
       if (initialDraft) {
+        latchedAt = Date.now();
         // From this point Interrupt belongs to the runner, not the local draft.
         setterFor(sessionId)((s) => ({
           pendingUserMessages: s.pendingUserMessages.map((p) =>
             p.tempId === tempId ? { ...p, initialDraft: undefined } : p,
           ),
           status: "streaming",
-          sendLatchedAt: Date.now(),
+          sendLatchedAt: latchedAt,
           sendLatchSeenRunning: null,
         }));
         initialDispatched = true;
@@ -3397,7 +3402,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
               : { unansweredSend: { stableId, ...(sentText ? { text: sentText } : {}) } }),
           };
       if (unanswered) {
-        settleUnansweredSend(failSet, callerHandlesError ? null : failureCard, !alreadyStreaming);
+        settleUnansweredSend(failSet, callerHandlesError ? null : failureCard, latchedAt);
       } else if (!alreadyStreaming) {
         if (failGet().activeResponse !== null) {
           // A response bubble already exists (the turn started, then failed)
@@ -3452,12 +3457,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       pinnedId === null
         ? get().status === "streaming"
         : setterForState(pinnedId)?.status === "streaming";
-    if (!alreadyStreaming) {
+    const latchedAt = alreadyStreaming ? null : Date.now();
+    if (latchedAt !== null) {
       // See `send`: latch and status on one entry, in one patch.
       pinnedSetter({
         status: "streaming",
         activeResponse: null,
-        sendLatchedAt: Date.now(),
+        sendLatchedAt: latchedAt,
         sendLatchSeenRunning: null,
       });
     }
@@ -3494,6 +3500,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
 
     // The session this command actually posts to, once resolved.
     let postedSessionId: string | null = null;
+    // Its POST, which can still answer after the command stops waiting on it.
+    let answer: Promise<PostEventResponse> | null = null;
 
     try {
       await waitForPrior();
@@ -3503,19 +3511,19 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // Same wire shape the REPL sends (repl/_repl.py). The server resolves
       // the skill, persists a visible receipt + hidden `<skill>` meta
       // message, and forwards the meta to the runner.
-      const postResult = await withStillSendingMark(sessionId, tempId, () =>
-        postEvent(sessionId, {
-          type: "slash_command",
-          data: {
-            kind: "skill",
-            name,
-            arguments: args,
-            ...(setterForState(sessionId)?.startupPending
-              ? { stable_id: randomUUID().replace(/-/g, "") }
-              : {}),
-          },
-        }),
-      );
+      const post = postEvent(sessionId, {
+        type: "slash_command",
+        data: {
+          kind: "skill",
+          name,
+          arguments: args,
+          ...(setterForState(sessionId)?.startupPending
+            ? { stable_id: randomUUID().replace(/-/g, "") }
+            : {}),
+        },
+      });
+      answer = post;
+      const postResult = await withStillSendingMark(sessionId, tempId, () => post);
       if (postResult.denied) {
         // Denied commands publish no receipt, so nothing will pop the
         // optimistic echo — roll it back here alongside the status settle.
@@ -3571,7 +3579,17 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       }));
       if (err instanceof UnansweredSendError) {
         const card = { ...makeClientErrorBlock(message, ""), title: SEND_UNANSWERED_TITLE };
-        settleUnansweredSend(failSet, card, !alreadyStreaming);
+        settleUnansweredSend(failSet, card, latchedAt);
+        // A late acceptance means the command went through, so withdraw its warning.
+        answer?.then(
+          (result) => {
+            if (result.denied) return;
+            endPlanStop();
+            failSet((s) => ({ blocks: s.blocks.filter((block) => block !== card) }));
+            queryClient?.invalidateQueries({ queryKey: ["conversations"] });
+          },
+          () => {},
+        );
       } else if (!alreadyStreaming) {
         finalizeActive(failSet, "failed", message, null);
         failSet({ status: "idle" });
@@ -4390,13 +4408,21 @@ async function withStillSendingMark<T>(
 }
 
 /**
- * Settle a send given up on unanswered: show its card, and end its own latch unless a turn
- * started since, which its own events settle.
+ * Settle a send given up on unanswered: show its card, and end the latch it set at
+ * *latchedAt* unless a later send took it over or a turn started since, which its own
+ * events settle.
  */
-function settleUnansweredSend(set: Setter, card: ErrorBlock | null, ownsLatch: boolean): void {
+function settleUnansweredSend(
+  set: Setter,
+  card: ErrorBlock | null,
+  latchedAt: number | null,
+): void {
   set((s) => ({
     ...(card === null ? {} : { blocks: [...s.blocks, card] }),
-    ...(ownsLatch && s.sessionStatus !== "running" && s.activeResponse?.state !== "streaming"
+    ...(latchedAt !== null &&
+    s.sendLatchedAt === latchedAt &&
+    s.sessionStatus !== "running" &&
+    s.activeResponse?.state !== "streaming"
       ? { status: "idle" as const, sendLatchedAt: null, sendLatchSeenRunning: null }
       : {}),
   }));
