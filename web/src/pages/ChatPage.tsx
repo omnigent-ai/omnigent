@@ -3176,6 +3176,7 @@ function ComposerImpl(
     attachSession,
     mentionTokens,
     tagFiles,
+    ownedMentionTokens,
     resetMentions,
     noteTextChange: noteMentionTextChange,
     handleTokenBackspace,
@@ -3251,12 +3252,13 @@ function ComposerImpl(
   // Read at drain time without re-running the effect on every keystroke.
   const tagFilesRef = useRef(tagFiles);
   tagFilesRef.current = tagFiles;
-  const mentionTokensRef = useRef(mentionTokens);
-  mentionTokensRef.current = mentionTokens;
+  const ownedMentionTokensRef = useRef(ownedMentionTokens);
+  ownedMentionTokensRef.current = ownedMentionTokens;
   useEffect(() => {
     if (pendingComposerAttachments.length === 0) return;
     const tokens = tagFilesRef.current(pendingComposerAttachments);
-    const taken = [...mentionTokensRef.current, ...tokens];
+    // The hook's own scan set, released spellings included, so both agree on what's present.
+    const taken = [...ownedMentionTokensRef.current(), ...tokens];
     // Each attachment lands as an inline token at the end of the draft.
     editText(null, (prev) => {
       // Scan with every known token at once, longest first, so a file token is
