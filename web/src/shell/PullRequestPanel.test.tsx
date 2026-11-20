@@ -133,6 +133,7 @@ vi.mock("@/hooks/usePullRequests", async (importOriginal) => {
       isError: false,
     }),
     uploadPullRequestAttachment: vi.fn(),
+    usePullRequestReadPriority: vi.fn(),
     usePullRequestInfo: vi.fn((...args: Parameters<typeof original.usePullRequestInfo>) =>
       state.realPrHooks ? original.usePullRequestInfo(...args) : state.info,
     ),
@@ -230,6 +231,7 @@ vi.mock("@/components/ai-elements/message", () => ({
 import {
   usePullRequestInfo,
   usePullRequestChangedFiles,
+  usePullRequestReadPriority,
   usePullRequestRepoLabels,
   usePullRequestReviewCandidates,
 } from "@/hooks/usePullRequests";
@@ -832,6 +834,29 @@ describe("PullRequestPanel", () => {
       poll: true,
       prUrl: url,
     });
+  });
+
+  it("reads the PR open in details ahead of the queued list reads", async () => {
+    const user = userEvent.setup();
+    state.info!.data!.tracking_available = true;
+    const url = state.info!.data!.pr!.url;
+    state.stored.conv_1 = [
+      { url, host: "github.com", repository: "acme/app", number: 6000, relationship: "attached" },
+      {
+        url: "https://github.com/acme/app/pull/6001",
+        host: "github.com",
+        repository: "acme/app",
+        number: 6001,
+        relationship: "attached",
+      },
+    ];
+    const { rerender } = renderPanel(false, true);
+    expect(await screen.findByRole("list", { name: "Pull requests" })).toBeVisible();
+    expect(usePullRequestReadPriority).toHaveBeenLastCalledWith("conv_1", undefined);
+    await user.click(screen.getByRole("button", { name: "acme/app #6000 — chore: dummy PR" }));
+    expect(usePullRequestReadPriority).toHaveBeenLastCalledWith("conv_1", url);
+    rerender(<PullRequestPanel conversationId="conv_1" active={false} />);
+    expect(usePullRequestReadPriority).toHaveBeenLastCalledWith("conv_1", undefined);
   });
 
   it("shows cancelled and skipped checks as separate grey pills listing their jobs", async () => {

@@ -142,6 +142,9 @@ identities must fit 12,000 stored bytes, checked when a request is added:
 linking at the limit fails with 409 before the host is asked, and reports past
 it are ignored. Titles and states fill the rest of the 16,000-byte document and
 are trimmed first when it overflows, so refreshing them never removes a link.
+The web reads individual linked requests' live status two at a time across all
+sessions, in display order, so a session with many linked requests fills in
+gradually; the request open in the panel's details view is read right away.
 
 **Unlinking.** `DELETE /v1/sessions/{id}/pull-requests?url=` unlinks on the
 server whether or not the host is online, and passes the unlink to the runner or
