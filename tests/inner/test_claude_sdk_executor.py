@@ -602,7 +602,9 @@ class TestConstructor(unittest.TestCase):
                 self.assertTrue(executor._os_env)
                 self.assertEqual(executor._os_env_spec, spec)
                 self.assertEqual(executor._cli_path, "/tmp/omnigent-claude-wrapper")
-                self.assertEqual(executor._cwd, prepared_cwd or str(Path(expected_cwd).resolve(strict=False)))
+                self.assertEqual(
+                    executor._cwd, prepared_cwd or str(Path(expected_cwd).resolve(strict=False))
+                )
                 self.assertEqual(executor._cli_sandbox_cwd, prepared_cwd)
 
     def test_prepare_claude_cli_path_adds_internal_roots_to_read_allowlist(self):
@@ -5557,7 +5559,22 @@ async def test_sandboxed_sdk_exposes_bash_for_skill_expansion(
 
 
 @pytest.mark.parametrize("allow_network", [True, False], ids=["network-allowed", "network-denied"])
-@pytest.mark.parametrize("cwd_source", ["default", "spec_relative", "spec_absolute", "explicit_none", "explicit_dot", "explicit_relative", "explicit_relative_root", "explicit_relative_sibling", "explicit_relative_outside", "explicit_nested", "explicit_conflict"])
+@pytest.mark.parametrize(
+    "cwd_source",
+    [
+        "default",
+        "spec_relative",
+        "spec_absolute",
+        "explicit_none",
+        "explicit_dot",
+        "explicit_relative",
+        "explicit_relative_root",
+        "explicit_relative_sibling",
+        "explicit_relative_outside",
+        "explicit_nested",
+        "explicit_conflict",
+    ],
+)
 def test_prepare_claude_cli_path_probe_passes_target_and_still_wraps(
     monkeypatch, tmp_path: Path, allow_network: bool, cwd_source: str
 ) -> None:

@@ -2114,11 +2114,6 @@ def prepare_claude_cli_path(
             and resolved_cwd == _resolve_sandbox_cwd(None)
         ):
             resolved_cwd = _resolve_sandbox_cwd(spec.cwd)
-        if model_access is not None and worker_env is None:
-            raise HarnessSandboxValidationError(
-                "Brokered Claude model access requires an owned worker environment",
-                reason="model_access",
-            )
         validate_harness_sandbox(
             spec,
             "Claude SDK",
@@ -2126,6 +2121,11 @@ def prepare_claude_cli_path(
             supports_egress_rules=worker_env is not None,
             supports_credential_proxy=worker_env is not None,
         )
+        if model_access is not None and worker_env is None:
+            raise HarnessSandboxValidationError(
+                "Brokered Claude model access requires an owned worker environment",
+                reason="model_access",
+            )
         sandbox_spec = spec.sandbox or OSEnvSandboxSpec()
         if sandbox_spec.type == "none":
             return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=True)

@@ -33,7 +33,7 @@ from omnigent.inner.datamodel import (
 )
 from omnigent.inner.egress.certs import HostCertCache
 from omnigent.inner.egress.proxy import EgressProxy
-from omnigent.inner.sandbox import SandboxPolicy
+from omnigent.inner.sandbox import HarnessSandboxValidationError, SandboxPolicy
 from tests._helpers.egress_ca import prepare_isolated_egress_ca
 from tests._helpers.live_server import terminate_process
 from tests._helpers.polling import poll_until
@@ -225,17 +225,20 @@ def test_brokered_model_access_requires_worker_environment(
     monkeypatch.setattr(claude, "create_private_tmpdir", create_runtime)
     access = ClaudeModelAccess("https://model.test", "x-api-key", lambda: "synthetic")
 
-    with pytest.raises(ValueError, match="owned worker environment"):
+    with pytest.raises(HarnessSandboxValidationError, match="owned worker environment") as failure:
         claude.prepare_claude_cli_path("/bin/claude", OSEnvSpec(), model_access=access)
+    assert failure.value.reason == "model_access"
 
-    with pytest.raises(ValueError, match="owned worker environment"):
+    with pytest.raises(HarnessSandboxValidationError, match="egress_rules") as failure:
         claude.prepare_claude_cli_path(
             "/bin/claude",
             OSEnvSpec(sandbox=OSEnvSandboxSpec(egress_rules=["POST model.test/v1/messages"])),
         )
+    assert failure.value.reason == "egress_rules"
 
-    with pytest.raises(OSError, match="caller_process"):
+    with pytest.raises(HarnessSandboxValidationError, match=r"os_env\.type") as failure:
         claude.prepare_claude_cli_path("/bin/claude", OSEnvSpec(type="none"), model_access=access)
+    assert failure.value.reason == "type"
 
     create_runtime.assert_not_called()
 
