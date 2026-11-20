@@ -1,4 +1,4 @@
-"""The Databricks native-Claude launch must survive a gateway that rejects the advisor tool."""
+"""An SDK-resolved Claude launch must survive a gateway that rejects the advisor tool."""
 
 from __future__ import annotations
 
@@ -15,9 +15,8 @@ from typing import Any
 
 import pytest
 
-from omnigent.harnesses.claude_native import main as claude_native
+from omnigent.inner import claude_sdk_executor as claude_sdk
 from omnigent.onboarding.ambient import CLAUDE_CODE_MANAGED_SETTINGS_PATHS
-from omnigent.runner.native.orchestration import _claude_terminal_env_unset
 from tests.server.integration.mock_llm_server import anthropic_sse_text_response
 
 _CLAUDE_BINARY = shutil.which("claude")
@@ -83,28 +82,12 @@ def _gateway_launch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gateway_url: str
 ) -> tuple[list[str], dict[str, str]]:
     """Build a gateway-provider launch for a user with the advisor enabled."""
-    from omnigent.onboarding.provider_config import load_providers
-
-    monkeypatch.setenv("CLAUDE_CODE_USE_GATEWAY", "1")
-    monkeypatch.setattr(
-        claude_native, "is_databricks_ai_gateway_url", lambda url: url == gateway_url
+    monkeypatch.setattr(claude_sdk, "is_databricks_ai_gateway_url", lambda url: url == gateway_url)
+    gateway_env = claude_sdk._resolve_gateway_env(
+        base_url_override=gateway_url,
+        auth_command_override="printf token",
     )
-    provider = load_providers(
-        {
-            "providers": {
-                "gateway": {
-                    "kind": "gateway",
-                    "anthropic": {
-                        "base_url": gateway_url,
-                        "auth_command": "printf token",
-                        "models": {"default": "claude-sonnet-test"},
-                    },
-                }
-            }
-        }
-    )["gateway"]
-    config = claude_native._provider_config_for_native_claude(provider)
-    assert config is not None and config.api_key_helper and config.model
+    api_key_helper = gateway_env.pop(claude_sdk._CLAUDE_API_KEY_HELPER_ENV_KEY)
 
     # advisorModel is what /advisor persists; the env flag stands in for the rollout flag.
     if any(
@@ -127,18 +110,16 @@ def _gateway_launch(
         "CLAUDE_CONFIG_DIR": str(config_dir),
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
         "CLAUDE_CODE_USE_GATEWAY": "1",
-        **claude_native.build_native_claude_terminal_env(config),
+        **gateway_env,
     }
-    for name in _claude_terminal_env_unset(config):
-        env.pop(name, None)
     argv = [
         str(_CLAUDE_BINARY),
         "-p",
         "Reply with one short sentence.",
         "--model",
-        config.model,
+        "claude-sonnet-test",
         "--settings",
-        json.dumps({"apiKeyHelper": config.api_key_helper}),
+        json.dumps({"apiKeyHelper": api_key_helper}),
         "--no-session-persistence",
     ]
     return argv, env
