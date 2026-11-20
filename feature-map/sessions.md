@@ -552,9 +552,8 @@ the new session opens beside that board; on narrow screens, Back to canvas
 returns to it. Reloading a temporary session before creation finishes returns to
 the same board. Open sidebar appears on the board or, when the board is hidden,
 in the conversation header. On desktop, hovering previews the sidebar and clicking
-opens it. At md and wider, the macOS app uses its existing titlebar toggle, Search,
-and Settings; in a narrower window it uses the conversation header's Open sidebar
-button and the drawer's Search and Settings, all right of or below the window buttons.
+opens it. The macOS app uses its existing titlebar toggle, Search, and Settings at
+every window width: the desktop app keeps the desktop layout in a narrow window.
 On macOS desktop, the board and its controls stay below the window title bar,
 including while focusing a conversation or using a narrow window.
 Open a Canvas session outside the loaded sidebar pages to see its current host
@@ -1390,8 +1389,8 @@ plain `uv run pytest`, which starts a private server for the test.
 For the desktop Close shortcut, select a side-chat tab in an ordinary
 session and press Cmd/Ctrl+W. Only that side chat should close; the parent and
 siblings stay open. If stopping the side chat fails, its tab, draft and queued
-messages must remain. Narrow the desktop window below 768 pixels and repeat:
-the hidden rail's tabs stay open and the app returns to the new-session page.
+messages must remain. A narrow desktop window keeps the rail, so the shortcut
+behaves the same there.
 Native accelerator delivery requires an Electron run; component tests cover
 selection, visibility, and stop failure.
 
