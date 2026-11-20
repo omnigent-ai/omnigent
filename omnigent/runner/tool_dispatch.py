@@ -5626,6 +5626,7 @@ async def _execute_scheduled_task_tool(
         {ORCHESTRATION_SOURCE_HEADER: conversation_id} if conversation_id is not None else None
     )
 
+    info = None
     try:
         if wants_project:
             # Older servers reject the field; refuse before creating a project for it.
@@ -5652,7 +5653,8 @@ async def _execute_scheduled_task_tool(
                 return refusal
             if payload.get("timezone") is None:
                 try:
-                    info = await server_client.get("/v1/info", timeout=30.0)
+                    if info is None:
+                        info = await server_client.get("/v1/info", timeout=30.0)
                     advertised = info.json() if info.status_code < 400 else {}
                 except (httpx.HTTPError, ValueError):
                     advertised = {}

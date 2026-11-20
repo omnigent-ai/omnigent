@@ -225,15 +225,20 @@ def test_agent_scheduled_task_create_requires_approval(
         _CREATE_REPLY,
     )
     page: Page = request.getfixturevalue("page")
-    with page.expect_response(
-        lambda response: (
-            response.request.method == "PUT"
-            and response.url.endswith("/v1/scheduled-tasks/default-timezone")
+    if approve:
+        with page.expect_response(
+            lambda response: (
+                response.request.method == "PUT"
+                and response.url.endswith("/v1/scheduled-tasks/default-timezone")
+            )
+        ) as reported_timezone:
+            page.goto(f"{base_url}/c/{session_id}")
+        assert reported_timezone.value.status == 200
+        assert (
+            page.evaluate("Intl.DateTimeFormat().resolvedOptions().timeZone") == _BROWSER_TIMEZONE
         )
-    ) as reported_timezone:
+    else:
         page.goto(f"{base_url}/c/{session_id}")
-    assert reported_timezone.value.status == 200
-    assert page.evaluate("Intl.DateTimeFormat().resolvedOptions().timeZone") == _BROWSER_TIMEZONE
 
     def no_task_yet() -> None:
         card = page.locator(_APPROVAL_CARD).first

@@ -553,6 +553,7 @@ async def test_project_name_is_sent_as_the_resolved_project_id(
         args["scheduled_task_id"] = _TASK_ID
     await _execute_scheduled_task_tool(tool_name, json.dumps(args), server_client=client)
 
+    assert [url for verb, url, _ in client.calls if verb == "GET"].count("/v1/info") == 1
     creates = [body for verb, url, body in client.calls if (verb, url) == ("POST", "/v1/projects")]
     assert creates == ([{"name": "triage"}] if created else [])
     _, url, body = client.calls[-1]

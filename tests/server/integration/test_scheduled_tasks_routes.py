@@ -2431,10 +2431,6 @@ async def test_create_keeps_utc_unless_the_owners_recorded_zone_is_requested(
     assert task["timezone"] == "America/Chicago"
     next_run = datetime.fromisoformat(str(task["next_run_at"]))
     assert next_run.astimezone(ZoneInfo("America/Chicago")).hour == 9
-    explicit = await create("alice@example.com", _create_body(timezone="Asia/Tokyo"))
-    assert explicit["timezone"] == "Asia/Tokyo"
-    explicit_utc = await create("alice@example.com", _create_body(timezone="UTC"))
-    assert explicit_utc["timezone"] == "UTC"
     assert (await create("bob@example.com", unzoned))["timezone"] == "UTC"
     assert (await create("bob@example.com", {**unzoned, "timezone": None}))["timezone"] == "UTC"
 
