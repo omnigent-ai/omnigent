@@ -58,6 +58,7 @@ import {
   type ChromeCookieImportResult,
   type ChromeCookiePreviewResult,
 } from "@/lib/nativeBridge";
+import { readSavedBrowserPage } from "@/lib/browserTabPages";
 import { browserViewOwnerId } from "@/lib/browserTabs";
 import { fetchSessionHostId } from "@/lib/fetchSessionHostId";
 import { normalizeTypedUrl } from "@/lib/normalizeTypedUrl";
@@ -134,6 +135,8 @@ interface BrowserPaneBridge {
   ) => () => void;
   browserHasView?: (conversationId: string) => Promise<{
     exists: boolean;
+    /** The page is open in another desktop window, not this one. */
+    elsewhere?: boolean;
     url?: string;
     canGoBack?: boolean;
     canGoForward?: boolean;
@@ -251,19 +254,48 @@ export function BrowserPane({
     let viewChanged = false;
     const urlEvents = urlEventsRef.current;
 
+    const submitSequence = submitSequenceRef.current;
+    // The shell destroyed this tab's view (sign-out, a session-expiry reconnect, quit):
+    // reopen the tab's saved page.
+    const reopenSavedPage = () => {
+      const saved = readSavedBrowserPage(conversationId);
+      if (!saved || !bridge.browserOpenOrNavigate) return;
+      if (!urlEditingRef.current) setCurrentUrl(saved.url);
+      const failed = (error?: string) => {
+        if (!cancelled) setNavigationError(error ?? "Unable to reopen this page.");
+      };
+      void fetchSessionHostId(browserViewOwnerId(conversationId))
+        .then(async (hostId) => {
+          // A navigation since then (the user's or an agent's) owns the view.
+          if (cancelled || viewChanged || submitSequenceRef.current !== submitSequence) return;
+          const result = await bridge.browserOpenOrNavigate!(
+            conversationId,
+            saved.url,
+            undefined,
+            navigationHostOptions(hostId),
+          );
+          if (!result.ok) failed(result.error);
+        })
+        .catch(() => failed());
+    };
+
     // A newer lifecycle event takes precedence over this asynchronous snapshot.
     void bridge.browserHasView?.(conversationId).then((r) => {
-      if (!cancelled && !viewChanged && r?.exists) {
-        setHasView(true);
-        // A navigation since it asked brought its own URL and back/forward state.
-        const fresh = urlEventsRef.current === urlEvents;
-        const url = fresh ? r.url : undefined;
-        if (url) setPageUrl(url);
-        if (!urlEditingRef.current && url) setCurrentUrl(url);
-        if (fresh) {
-          setCanGoBack(!!r.canGoBack);
-          setCanGoForward(!!r.canGoForward);
-        }
+      if (cancelled || viewChanged || !r) return;
+      if (!r.exists) {
+        // A page open in another window stays there.
+        if (!r.elsewhere) reopenSavedPage();
+        return;
+      }
+      setHasView(true);
+      // A navigation since it asked brought its own URL and back/forward state.
+      const fresh = urlEventsRef.current === urlEvents;
+      const url = fresh ? r.url : undefined;
+      if (url) setPageUrl(url);
+      if (!urlEditingRef.current && url) setCurrentUrl(url);
+      if (fresh) {
+        setCanGoBack(!!r.canGoBack);
+        setCanGoForward(!!r.canGoForward);
       }
     });
 

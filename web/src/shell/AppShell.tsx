@@ -102,6 +102,7 @@ import { browserViewOwnerId, openBrowserTab } from "@/hooks/useBrowserTabs";
 import { agentBrowserTabId } from "@/components/BrowserPane/agentTools/agentTabs";
 import { useRevealBrowserOnAgentTabs } from "@/components/BrowserPane/agentTools/useRevealBrowserOnAgentTabs";
 import { resyncBrowserSuppression } from "@/hooks/useSuppressBrowserView";
+import { startSavingBrowserPages } from "@/lib/browserTabPages";
 import {
   isAgentTerminalKey,
   PANEL_NO_TERMINAL_KEY,
@@ -1212,6 +1213,9 @@ function AppShellImpl() {
   useEffect(() => {
     resyncBrowserSuppression();
   }, []);
+
+  // Remember each browser tab's page, so a tab whose view the shell destroyed reopens it.
+  useEffect(() => startSavingBrowserPages(), []);
 
   // Design-mode submit routing. Lives here (with the hoisted relay) because the
   // in-page popup posts back via preload IPC delivered to the always-mounted
