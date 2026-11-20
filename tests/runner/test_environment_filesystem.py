@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -23,6 +24,7 @@ from fastapi import FastAPI
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
 from omnigent.entities.environment_filesystem import (
     DirectoryNotEmpty,
+    FilesystemEntry,
     FilesystemPathNotFound,
     InvalidPath,
     PathUnreachable,
@@ -34,6 +36,7 @@ from omnigent.runner import create_runner_app
 from omnigent.runner.environment_filesystem import CallerProcessFilesystem, search_indexed_paths
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.runtime.filesystem_registry import GitFilesystemRegistry
+from omnigent.workspace_file_search import walk_search
 from tests.runner.helpers import NullServerClient
 
 
@@ -2334,10 +2337,28 @@ async def test_content_search_limits_errors_and_hidden_files(
     assert len(match["text"]) <= 402
 
 
+@pytest.mark.asyncio
+async def test_content_search_keeps_matches_with_unicode_line_separators(
+    client: httpx.AsyncClient, workspace: Path
+) -> None:
+    """Minified bundles hold U+2028, U+2029 and U+0085, which Python also reads as line breaks."""
+    text = 'var s = "a\u2028b\u2029c\u0085d";'
+    (workspace / "bundle.js").write_text(text + "\n", encoding="utf-8")
+
+    response = await client.get(
+        "/v1/sessions/conv_test/resources/environments/default/content-search",
+        params={"q": "var s"},
+    )
+
+    result = response.json()
+    assert "error" not in result, result
+    assert [match["text"] for match in result["matches"]] == [text]
+
+
 @pytest.mark.parametrize("mode", ["missing", "timeout", "long-line"])
 def test_content_search_process_boundaries(tmp_path: Path, mode: str) -> None:
     """Exercise the sandbox script with controlled executables and a bounded timeout."""
-    from omnigent.runner.content_search import _SEARCH_SCRIPT
+    from omnigent.workspace_content_search import _SEARCH_SCRIPT, collect_records
 
     if mode != "missing":
         executable = tmp_path / "rg"
@@ -2350,6 +2371,7 @@ def test_content_search_process_boundaries(tmp_path: Path, mode: str) -> None:
         executable.chmod(0o755)
     parameters = (
         "query = 'needle'\ncase_sensitive = False\nregex = False\nlimit = 2\nglob_args = []\n"
+        "extra_args = []\nsearch_paths = ['.']\n"
     )
     timer = ""
     if mode == "timeout":
@@ -2370,7 +2392,7 @@ def test_content_search_process_boundaries(tmp_path: Path, mode: str) -> None:
         timeout=5,
         check=True,
     )
-    result = json.loads(completed.stdout)
+    result = collect_records(completed.stdout.splitlines())
     if mode == "missing":
         assert "Install ripgrep" in result["error"]
     elif mode == "timeout":
@@ -3412,6 +3434,51 @@ def test_search_indexed_paths_never_describes_a_symlink(tmp_path: Path) -> None:
     entries = search_indexed_paths(root, ["b-link", "a/b.txt", "b-docs", "real/b.md"], "b")
 
     assert [(e.path, e.type, e.bytes) for e in entries] == [("real/b.md", "file", 2)]
+
+
+def test_search_indexed_paths_hands_leaf_symlinks_to_describe_link(tmp_path: Path) -> None:
+    """A leaf link goes to the caller's describer with its own lstat; a path
+    beneath a symlinked parent is still never described."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "b.txt").write_text("12345")
+    root = tmp_path / "ws"
+    root.mkdir()
+    (root / "b-link").symlink_to(outside / "b.txt")
+    (root / "a").symlink_to(outside)
+    seen: list[tuple[str, bool]] = []
+
+    def describe(path: str, own: os.stat_result) -> FilesystemEntry:
+        seen.append((path, stat.S_ISLNK(own.st_mode)))
+        return FilesystemEntry(id=path, name=path, path=path, type="file")
+
+    entries = search_indexed_paths(root, ["b-link", "a/b.txt"], "b", describe_link=describe)
+
+    assert seen == [("b-link", True)]
+    assert [e.path for e in entries] == ["b-link"]
+
+
+def test_walk_search_hands_symlinks_to_describe_link(tmp_path: Path) -> None:
+    """Links to files and to directories go to the describer; real entries don't."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "b.txt").write_text("12345")
+    root = tmp_path / "ws"
+    root.mkdir()
+    (root / "b-file").symlink_to(outside / "b.txt")
+    (root / "b-dir").symlink_to(outside)
+    (root / "b.md").write_text("md")
+    seen: list[str] = []
+
+    def describe(path: str, own: os.stat_result) -> FilesystemEntry:
+        assert stat.S_ISLNK(own.st_mode)
+        seen.append(path)
+        return FilesystemEntry(id=path, name=path, path=path, type="file")
+
+    entries, _ = walk_search(root, "b", [], [], 10, budget=100, describe_link=describe)
+
+    assert sorted(seen) == ["b-dir", "b-file"]
+    assert {e.path: e.bytes for e in entries} == {"b-dir": None, "b-file": None, "b.md": 2}
 
 
 @pytest.mark.asyncio
