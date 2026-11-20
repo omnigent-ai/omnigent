@@ -1314,7 +1314,7 @@ def test_claude_native_picker_repeated_pins_reach_the_real_terminal(
     poll_until(
         lambda: (
             _live_claude_snapshot(base_url, session_id).get("llm_model")
-            == _PINNED_CLAUDE_MODELS["sonnet"]
+            == f"{_PINNED_CLAUDE_MODELS['sonnet']}[1m]"
         ),
         timeout_s=120,
     )
