@@ -329,6 +329,85 @@ async def test_slash_root_and_bot_parent(environment, store):
     assert key in service._active_threads
 
 
+@pytest.mark.parametrize("concurrent", [False, True])
+async def test_slash_redelivery_creates_one_root_and_binding(environment, store, concurrent):
+    await resume(environment)
+    service, slack, state, _ = environment
+    slack.reset_mock()
+    state["requests"].clear()
+    command = {
+        "team_id": "T1",
+        "channel_id": "C1",
+        "user_id": "U1",
+        "text": "resume conv_a --force",
+        "trigger_id": "trigger_1",
+    }
+    roots = []
+
+    async def post(**kwargs):
+        if "thread_ts" not in kwargs:
+            roots.append(f"{len(roots) + 3}.0")
+        return {"ts": roots[-1]}
+
+    slack.chat_postMessage.side_effect = post
+    if concurrent:
+        await asyncio.gather(*(service.handle_resume_command(command, slack) for _ in range(2)))
+    else:
+        await service.handle_resume_command(command, slack)
+    restarted = SlackOmnigentService(
+        store=SQLiteStore(store._path),
+        pool=service._pool,
+        setup=AsyncMock(),
+        server_url=SERVER,
+        bot_user_id="BOT",
+    )
+    try:
+        await restarted.handle_resume_command(command, slack)
+    finally:
+        await restarted.shutdown()
+    assert roots == ["3.0"]
+    assert await store.get_session(KEY) is None
+    assert await store.session_binding("conv_a") == ThreadKey("T1", "C1", "3.0")
+    assert all(request.method == "GET" for request in state["requests"])
+    await service.handle_resume_command({**command, "trigger_id": "trigger_2"}, slack)
+    assert roots == ["3.0", "4.0"]
+    assert await store.session_binding("conv_a") == ThreadKey("T1", "C1", "4.0")
+
+
+async def test_slash_failed_root_can_retry(environment, store):
+    service, slack, _, _ = environment
+    command = {
+        "team_id": "T1",
+        "channel_id": "C1",
+        "user_id": "U1",
+        "text": "resume conv_a",
+        "trigger_id": "trigger_1",
+    }
+    slack.chat_postMessage.side_effect = RuntimeError("post failed")
+    with pytest.raises(RuntimeError, match="post failed"):
+        await service.handle_resume_command(command, slack)
+    slack.chat_postMessage.side_effect = None
+    await service.handle_resume_command(command, slack)
+    assert await store.session_binding("conv_a") == ThreadKey("T1", "C1", "1.0")
+
+
+async def test_slash_failure_after_root_keeps_delivery_claim(environment):
+    service, slack, _, _ = environment
+    service._resume = AsyncMock(side_effect=RuntimeError("binding failed"))
+    command = {
+        "team_id": "T1",
+        "channel_id": "C1",
+        "user_id": "U1",
+        "text": "resume conv_a",
+        "trigger_id": "trigger_1",
+    }
+    with pytest.raises(RuntimeError, match="binding failed"):
+        await service.handle_resume_command(command, slack)
+    await service.handle_resume_command(command, slack)
+    slack.chat_postMessage.assert_awaited_once()
+    service._resume.assert_awaited_once()
+
+
 async def test_web_session_continues_via_slack_http_boundary(environment, store):
     import json
 

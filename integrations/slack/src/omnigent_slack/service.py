@@ -595,10 +595,20 @@ class SlackOmnigentService:
 
     async def handle_resume_command(self, command: dict[str, Any], client: Any) -> None:
         """Slash commands have no message timestamp; create a root for replies."""
-        root = await client.chat_postMessage(
-            channel=command["channel_id"],
-            text="Continue an Omnigent session here.",
-        )
+        trigger_id = command.get("trigger_id")
+        command_id = f"slash-resume:{command['team_id']}:{trigger_id}" if trigger_id else None
+        if not await self._store.claim_event(command_id):
+            return
+        try:
+            root = await client.chat_postMessage(
+                channel=command["channel_id"],
+                text="Continue an Omnigent session here.",
+            )
+        except Exception:
+            with contextlib.suppress(Exception):
+                await self._store.unclaim_event(command_id)
+            raise
+        # Keep the claim once a root exists, even if binding or recovery fails.
         await self._resume(
             key=ThreadKey(command["team_id"], command["channel_id"], root["ts"]),
             text=command["text"],
