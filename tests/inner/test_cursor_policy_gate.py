@@ -21,6 +21,7 @@ import pytest
 from omnigent.inner import cursor_policy_gate_hook
 from omnigent.inner.cursor_executor import CursorExecutor, _CursorSessionState
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.inner.sandbox import UnsupportedHarnessSandboxError
 from tests.inner.cursor_sdk_fake import install_fake_cursor_sdk
 
 _SHELL_REQUEST = json.dumps({"tool_name": "Shell", "tool_input": {"command": "printf hello"}})
@@ -464,7 +465,14 @@ async def test_bridged_tools_that_could_reach_the_policy_home_are_rejected(
     os_env = (
         OSEnvSpec(type="caller_process", cwd=str(tmp_path), sandbox=sandbox) if sandbox else None
     )
-    executor = CursorExecutor(cwd=str(tmp_path), os_env=os_env, api_key="test-key")
+    if sandbox is not None and sandbox.type != "none":
+        with pytest.raises(UnsupportedHarnessSandboxError, match="Cursor cannot enforce"):
+            CursorExecutor(cwd=str(tmp_path), os_env=os_env, api_key="test-key")
+        # Exercise the defense in depth after the constructor's earlier rejection.
+        executor = CursorExecutor(cwd=str(tmp_path), api_key="test-key")
+        executor._os_env_spec = os_env
+    else:
+        executor = CursorExecutor(cwd=str(tmp_path), os_env=os_env, api_key="test-key")
     with pytest.raises(RuntimeError, match=message):
         await executor._ensure_session(
             _CursorSessionState(), model="auto-smart", tools=[{"name": tool}]
@@ -472,7 +480,7 @@ async def test_bridged_tools_that_could_reach_the_policy_home_are_rejected(
 
 
 @requires_policy_gate
-def test_os_tools_confined_to_the_workspace_are_accepted(
+def test_bridged_tool_isolation_accepts_workspace_grants(
     home_and_workspace: tuple[Path, Path],
 ) -> None:
     _, workspace = home_and_workspace
@@ -481,7 +489,9 @@ def test_os_tools_confined_to_the_workspace_are_accepted(
         cwd=str(workspace),
         sandbox=OSEnvSandboxSpec(type=_PLATFORM_SANDBOX, write_paths=["."]),
     )
-    executor = CursorExecutor(cwd=str(workspace), os_env=os_env, api_key="test-key")
+    executor = CursorExecutor(cwd=str(workspace), api_key="test-key")
+    # Check the grant validator independently of unsupported harness containment.
+    executor._os_env_spec = os_env
     executor._check_bridged_tool_isolation([{"name": "sys_os_shell"}], str(workspace))
 
 

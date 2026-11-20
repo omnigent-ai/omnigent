@@ -37,7 +37,11 @@ from omnigent.inner.egress.proxy import EgressProxy
 from omnigent.inner.egress.rules import parse_rules
 from omnigent.inner.model_signer_service import _VALIDATION_BEARER, _parse_strict_request_headers
 from omnigent.inner.model_signing import SigningRejected
-from omnigent.inner.sandbox import SandboxPolicy, _default_sandbox_for_platform
+from omnigent.inner.sandbox import (
+    HarnessSandboxPreparationError,
+    SandboxPolicy,
+    _default_sandbox_for_platform,
+)
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals.registry import TerminalRegistry
@@ -741,8 +745,9 @@ def test_relative_config_dir_provenance_uses_session_cwd(
         start_proxy.reset_mock()
         launch.reset_mock()
         policy.read_roots.append(config)
-        with pytest.raises(ValueError, match="outside sandbox"):
+        with pytest.raises(HarnessSandboxPreparationError, match="outside sandbox") as raised:
             claude.prepare_claude_cli_path("/bin/claude", spec, worker_env=dict(env))
+        assert isinstance(raised.value.__cause__, ValueError)
         start_proxy.assert_not_called()
         launch.assert_not_called()
     else:
