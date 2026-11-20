@@ -166,10 +166,11 @@ function change(result: Rendered, value: string, fromHistory: boolean, name = "t
     currentTarget: input as unknown as ComposerTextTarget,
     fromHistory,
   };
+  // The text first, then the notice, as the grid cell's composer does.
   act(() => {
-    result.current.browser.noteTextChange(event);
     if (name === "tail") result.current.setText(value);
     else result.current.setQuote(value);
+    result.current.browser.noteTextChange(event);
   });
 }
 

@@ -1191,6 +1191,7 @@ function SideChatComposer({
   const applyMenuSelection = (cmd: string) => {
     if (Object.hasOwn(sideChatBuiltins, cmd)) {
       setText("");
+      resetMentions();
       if (cmd === "/help") showHelp();
       return;
     }
@@ -1217,7 +1218,10 @@ function SideChatComposer({
       !carriesMessageContext({ quotes, text }, files, sendContext),
     onSelect: applyMenuSelection,
     onTabComplete: completeMenuSelection,
-    clearText: () => setText(""),
+    clearText: () => {
+      setText("");
+      resetMentions();
+    },
   });
   const menuCommandNames = useMemo(() => Object.keys(menuCommands), [menuCommands]);
   // Codex forks from a `/side` message, so its pending text never reaches the shell; other

@@ -433,9 +433,9 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     const released = releasedRef.current.sessions.find((it) => it.id === session.id);
     const token =
       existing?.token ?? released?.token ?? sessionMentionToken(session, ownedMentionTokens());
-    if (!insertToken(mention, token)) return;
+    if (!insertToken(mention, token) || existing) return;
     if (released) reclaim({ files: [], sessions: [{ ...released, token }] });
-    else if (!existing) setMentionedSessions((prev) => [...prev, { ...session, token }]);
+    else setMentionedSessions((prev) => [...prev, { ...session, token }]);
   };
 
   const handleTokenBackspace = (e: ComposerKeyboardEvent): boolean => {
