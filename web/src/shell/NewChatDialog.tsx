@@ -7567,6 +7567,10 @@ function NewChatLandingContent({
     </NewChatWorkspaceControls>
   );
 
+  let composerAppearance: "panel" | "glass" | "default" = "default";
+  if (floating) composerAppearance = "panel";
+  else if (isMobileViewport) composerAppearance = "glass";
+
   return (
     // Desktop keeps the centered composition; mobile docks the composer. The
     // project home floats just the composer over its board.
@@ -7674,7 +7678,7 @@ function NewChatLandingContent({
               engine={composerEngine}
               dictating={dictation.hasInterim}
               onActiveInputChange={bindTextarea}
-              appearance={floating ? "panel" : isMobileViewport ? "glass" : "default"}
+              appearance={composerAppearance}
               hasContent={
                 files.length > 0 ||
                 mentionedItems.length > 0 ||

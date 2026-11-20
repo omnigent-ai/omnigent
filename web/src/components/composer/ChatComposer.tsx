@@ -155,6 +155,14 @@ interface ChatComposerBaseProps extends Omit<ComponentPropsWithoutRef<"div">, "c
   };
 }
 
+/** The card's own surface for each appearance; a panel has none, since its window is the card. */
+const COMPOSER_SURFACE_CLASS = {
+  panel: "min-h-0 flex-1",
+  glass: "isolate rounded-[20px] border-0 bg-transparent md:min-h-[105px]",
+  default:
+    "composer-reference-surface rounded-2xl border transition-shadow duration-150 hover:shadow-[var(--composer-shadow)] has-[[data-composer-input]:focus]:shadow-[var(--composer-shadow)] md:min-h-[105px]",
+} as const;
+
 export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(function ChatComposer(
   {
     appearance = "default",
@@ -222,15 +230,7 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
       data-mobile-composer={isMobile ? (expanded ? "expanded" : "collapsed") : undefined}
       data-composer-hint-placeholder={needsHintPlaceholder || undefined}
       data-composer-appearance={panel ? "panel" : undefined}
-      className={cn(
-        "relative flex w-full flex-col",
-        panel
-          ? "min-h-0 flex-1"
-          : appearance === "glass"
-            ? "isolate rounded-[20px] border-0 bg-transparent md:min-h-[105px]"
-            : "composer-reference-surface rounded-2xl border transition-shadow duration-150 hover:shadow-[var(--composer-shadow)] has-[[data-composer-input]:focus]:shadow-[var(--composer-shadow)] md:min-h-[105px]",
-        className,
-      )}
+      className={cn("relative flex w-full flex-col", COMPOSER_SURFACE_CLASS[appearance], className)}
       {...props}
       onFocusCapture={(event) => {
         // Header controls bubble through React portals outside this card.
@@ -253,13 +253,10 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
       {slots?.beforeInput}
       <ComposerInputArea
         data-composer-input-area
-        className={
-          panel
-            ? "flex min-h-0 flex-1 flex-col overflow-y-auto"
-            : slots?.inputPrefix
-              ? "max-h-[320px] overflow-y-auto"
-              : undefined
-        }
+        className={cn(
+          panel && "flex min-h-0 flex-1 flex-col overflow-y-auto",
+          !panel && slots?.inputPrefix && "max-h-[320px] overflow-y-auto",
+        )}
       >
         <ComposerEngineContext.Provider value={renderedEngine}>
           {slots?.inputPrefix}
