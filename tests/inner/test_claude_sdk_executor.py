@@ -582,6 +582,7 @@ class TestConstructor(unittest.TestCase):
             spec = OSEnvSpec(type="caller_process", cwd=declared_cwd)
             with (
                 self.subTest(selected_cwd=selected_cwd, prepared_cwd=prepared_cwd),
+                patch.dict(os.environ, {"OMNIGENT_RUNNER_WORKSPACE": "/tmp/work"}),
                 patch(
                     "omnigent.inner.claude_sdk_executor._find_system_claude",
                     return_value="/usr/bin/claude",
@@ -598,7 +599,9 @@ class TestConstructor(unittest.TestCase):
                 executor = ClaudeSDKExecutor(cwd=selected_cwd, os_env=spec)
 
                 self.assertEqual(prepare.call_args.args, ("/usr/bin/claude", spec))
-                self.assertEqual(prepare.call_args.kwargs["cwd"], selected_cwd)
+                self.assertEqual(
+                    prepare.call_args.kwargs["cwd"], str(Path(expected_cwd).resolve(strict=False))
+                )
                 self.assertTrue(executor._os_env)
                 self.assertEqual(executor._os_env_spec, spec)
                 self.assertEqual(executor._cli_path, "/tmp/omnigent-claude-wrapper")
