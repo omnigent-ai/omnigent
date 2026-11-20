@@ -61,13 +61,7 @@ export interface QuickPickDialogProps<Value> extends Omit<
   onCancel?: () => void;
 }
 
-/**
- * The standard modal QuickPick. Accepting an item closes the dialog unless
- * `onAccept` returns `"keepOpen"`; focus returns to where it was before opening,
- * and then an `afterClose` action that `onAccept` returned runs, free to move it.
- * An accept that returns a promise settles the same way once it resolves, unless a
- * cancel, a reopen or a newer accept came first.
- */
+/** The standard modal QuickPick; an accepted close restores focus before running its `afterClose`. */
 export function QuickPickDialog<Value>({
   open,
   onOpenChange,
@@ -161,10 +155,12 @@ export function QuickPickDialog<Value>({
   const begin = (result: QuickPickDialogAcceptResult): QuickPickAcceptResult => {
     const token = ownership.begin();
     if (isPromiseLike<QuickPickAcceptResult>(result)) {
-      // A failed result leaves the picker open for the caller to say why.
+      // A failed result leaves the picker open for the caller to say why; it's logged too.
       result.then(
         (settled) => settle(token, settled),
-        () => undefined,
+        (error: unknown) => {
+          if (ownership.isCurrent(token)) console.error("QuickPickDialog accept failed", error);
+        },
       );
       return "keepOpen";
     }

@@ -536,7 +536,9 @@ describe("QuickPickDialog deferred accepts", () => {
     expect(onCancel).not.toHaveBeenCalled();
   });
 
-  it("stays open when the result keeps it open or fails", async () => {
+  it("stays open when the result keeps it open or fails, and logs the failure", async () => {
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => logged.mockRestore());
     const results = [deferred(), deferred()];
     let next = 0;
     render(<Deferring accept={() => results[next++]!.promise} />);
@@ -545,8 +547,23 @@ describe("QuickPickDialog deferred accepts", () => {
     await settleWith(() => results[0]!.resolve("keepOpen"));
     expect(screen.getByRole("dialog")).toBeInTheDocument();
     await userEvent.keyboard("{Enter}");
-    await settleWith(() => results[1]!.reject(new Error("Couldn't load the row.")));
+    const failure = new Error("Couldn't load the row.");
+    await settleWith(() => results[1]!.reject(failure));
     expect(screen.getByRole("dialog")).toBeInTheDocument();
+    expect(logged).toHaveBeenCalledWith("QuickPickDialog accept failed", failure);
+  });
+
+  it("doesn't log a failure from an accept a cancel already dropped", async () => {
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    onTestFinished(() => logged.mockRestore());
+    const load = deferred();
+    render(<Deferring accept={() => load.promise} />);
+    await screen.findByRole("combobox", { name: "Pick" });
+    await userEvent.keyboard("{Enter}");
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() => expect(dialog()).toBeNull());
+    await settleWith(() => load.reject(new Error("Couldn't load the row.")));
+    expect(logged).not.toHaveBeenCalled();
   });
 
   it("drops a result that settles after Escape and a reopen, keeping the new opening", async () => {
@@ -603,23 +620,31 @@ describe("QuickPickDialog deferred accepts", () => {
     expect(abandoned).not.toHaveBeenCalled();
   });
 
-  it("acts only on the latest of two accepts, whichever settles first", async () => {
-    const first = deferred();
-    const second = deferred();
-    const results = [first, second];
-    let next = 0;
-    const firstAction = vi.fn();
-    const secondAction = vi.fn();
-    render(<Deferring accept={() => results[next++]!.promise} />);
-    await screen.findByRole("combobox", { name: "Pick" });
-    await userEvent.keyboard("{Enter}");
-    await userEvent.keyboard("{ArrowDown}{Enter}");
-    await settleWith(() => first.resolve({ afterClose: firstAction }));
-    expect(screen.getByRole("dialog")).toBeInTheDocument();
-    await settleWith(() => second.resolve({ afterClose: secondAction }));
-    await waitFor(() => expect(secondAction).toHaveBeenCalledOnce());
-    expect(firstAction).not.toHaveBeenCalled();
-  });
+  it.each(["older", "newer"] as const)(
+    "acts only on the latest of two accepts when the %s settles first",
+    async (settlesFirst) => {
+      const first = deferred();
+      const second = deferred();
+      const results = [first, second];
+      let next = 0;
+      const firstAction = vi.fn();
+      const secondAction = vi.fn();
+      render(<Deferring accept={() => results[next++]!.promise} />);
+      await screen.findByRole("combobox", { name: "Pick" });
+      await userEvent.keyboard("{Enter}");
+      await userEvent.keyboard("{ArrowDown}{Enter}");
+      if (settlesFirst === "older") {
+        await settleWith(() => first.resolve({ afterClose: firstAction }));
+        expect(screen.getByRole("dialog")).toBeInTheDocument();
+        await settleWith(() => second.resolve({ afterClose: secondAction }));
+      } else {
+        await settleWith(() => second.resolve({ afterClose: secondAction }));
+        await settleWith(() => first.resolve({ afterClose: firstAction }));
+      }
+      await waitFor(() => expect(secondAction).toHaveBeenCalledOnce());
+      expect(firstAction).not.toHaveBeenCalled();
+    },
+  );
 
   it("keeps each opening's accepts its own across a finished close, a cancel and a reopen", async () => {
     // The first opening's accept closed and ran its action; the second's is cancelled, so
