@@ -49,6 +49,9 @@ def _repository(root: Path) -> Path:
     _git(root, "init", "-q", "-b", "main")
     _git(root, "config", "user.email", "dev@example.com")
     _git(root, "config", "user.name", "Dev")
+    # Commit-triggered maintenance must finish before metadata snapshots begin.
+    _git(root, "config", "maintenance.auto", "false")
+    _git(root, "config", "gc.auto", "0")
     (root / "a.txt").write_text("a\n")
     _git(root, "add", "a.txt")
     _git(root, "commit", "-q", "-m", "first")
