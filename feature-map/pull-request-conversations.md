@@ -65,6 +65,13 @@ together in Comments.
 
 - `rail`: Open a session, expand Workspace, choose Pull Requests, then open Changes.
 - `composer-desktop`: Click the desktop composer's PR link, then open Changes.
+- `tabs-sidebar`: With `workspace_sidebar_v2` on, in a desktop app or desktop
+  browser (not a touch client), open a session and choose **New tab → Pull
+  Requests** in the workspace sidebar; in a window narrower than 1181px, choose
+  Pull Requests from the session-actions menu, which opens the Workspace drawer.
+  The list shows even when the session has one pull request; select one to open
+  it in that tab, then open Changes. The desktop composer's PR link opens a
+  session's only pull request in its own tab.
 - `session-mobile`: Open the session-actions menu, choose Pull Requests, then open Changes in the drawer.
 - `canvas`: Open a conversation beside Canvas, click its composer PR link,
   then open Changes.

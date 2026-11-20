@@ -9,7 +9,7 @@
  *  desktop build that predates the `browser*` bridge is treated as unsupported,
  *  so the relay never claims an action it couldn't fulfill. */
 import { useEffect } from "react";
-import { onBrowserActionRequest } from "@/lib/browserActionBus";
+import { emitBrowserActionSettled, onBrowserActionRequest } from "@/lib/browserActionBus";
 import type { BrowserActionRequestEvent } from "@/lib/events";
 import {
   navigationHostOptions,
@@ -374,6 +374,7 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
               { sessionHostProtocol: SESSION_HOST_PROTOCOL, sourceHostId: currentHostId },
             );
       }
+      emitBrowserActionSettled(evt, sourceConversationId, result);
       await postResult(sourceConversationId, evt.actionId, claimToken, result);
     };
 

@@ -57,6 +57,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "project_kanban": True,
         "project_repository_creation": True,
         "quick_pick_palette": False,
+        "workspace_sidebar_v2": False,
         "session_orchestration": True,
         "sibling_sessions": True,
         "codex_plan_at_launch": True,
@@ -221,6 +222,16 @@ def test_chat_composer_codemirror_is_an_opt_in_frontend_feature() -> None:
 
     assert flags.enabled(Feature.CHAT_COMPOSER_CODEMIRROR)
     assert flags.frontend_dict()["chat_composer_codemirror"] is True
+
+
+def test_workspace_sidebar_v2_is_an_opt_in_frontend_feature() -> None:
+    assert not resolve_feature_flags({}).enabled(Feature.WORKSPACE_SIDEBAR_V2)
+    assert resolve_feature_flags({}).frontend_dict()["workspace_sidebar_v2"] is False
+
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "workspace_sidebar_v2"})
+
+    assert flags.enabled(Feature.WORKSPACE_SIDEBAR_V2)
+    assert flags.frontend_dict()["workspace_sidebar_v2"] is True
 
 
 def test_sibling_sessions_explicit_enable_preserves_default_features() -> None:

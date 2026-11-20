@@ -78,15 +78,24 @@ export function showWorkspaceTabOrChooser(
 const latestAgentTabRequests = new Map<string, string>();
 let listeningForAgentTabs = false;
 
-function showBrowserView(sessionId: string, viewKey: string): void {
-  void routeToWorkspaceTabs(async (tabs) => {
-    if (tabs.openWorkspaceBrowserView(sessionId, viewKey, { background: false }) !== null) {
+/** Show a session's browser view in its tab, or say the strip is full, as other opens do. */
+export function showWorkspaceBrowserView(
+  sessionId: string,
+  viewKey: string,
+  { background }: { background: boolean },
+): Promise<void> {
+  return routeToWorkspaceTabs(async (tabs) => {
+    if (tabs.openWorkspaceBrowserView(sessionId, viewKey, { background }) !== null) {
       return { ok: true };
     }
-    // The strip is full: say so, as other opens do. Loaded with the tabs code, not eagerly.
+    // Loaded with the tabs code, not eagerly.
     const { TAB_CAP_REASON } = await import("./workspaceTabs/planOpen");
     return { ok: false, reason: TAB_CAP_REASON };
   });
+}
+
+function showBrowserView(sessionId: string, viewKey: string): void {
+  void showWorkspaceBrowserView(sessionId, viewKey, { background: false });
 }
 
 /** A new tab request's own outcome names its tab; it shows unless a later request replaced it. */

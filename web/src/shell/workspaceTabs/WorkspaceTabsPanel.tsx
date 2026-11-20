@@ -57,7 +57,7 @@ import { useNewBrowserHotkey } from "@/hooks/useNewBrowserHotkey";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import { terminalDisplayLabel, terminalTabKey, useTerminals } from "@/hooks/useTerminals";
 import { AGENT_BROWSER_TAB_ID, browserViewId } from "@/lib/browserTabs";
-import { closeBrowserView } from "@/hooks/useBrowserTabs";
+import { closeBrowserView, forgetBrowserTab } from "@/hooks/useBrowserTabs";
 import { isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import { shortcutAriaKeys, shortcutKeys } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
 import { supportsSideChat } from "@/lib/sideChat";
@@ -570,14 +570,17 @@ function WorkspaceTabsPanelImpl({
     }
     return undefined;
   };
-  /** A browser view goes after its tab, without holding the strip; a failure only says so. */
+  /**
+   * A browser view goes after its tab, without holding the strip; a failure only says so.
+   * Forgetting it is awaited so a failed save reaches the store's release log.
+   */
   const releaseFor = (tab: WorkspaceTab) => {
     const binding = tab.binding;
     if (binding?.kind !== "browser-view") return undefined;
     return async () => {
       const closed = await closeBrowserView(conversationId, binding.viewKey);
-      if (!closed)
-        toast.error("Couldn't close the browser page. It may keep running until you quit.");
+      if (closed) await forgetBrowserTab(conversationId, binding.viewKey);
+      else toast.error("Couldn't close the browser page. It may keep running until you quit.");
       return closed;
     };
   };
