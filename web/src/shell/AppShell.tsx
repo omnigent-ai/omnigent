@@ -341,7 +341,7 @@ function AppShellImpl() {
   // No-op off the iOS shell. Scoped here so auth pages keep normal scrolling.
   useIOSViewportLock();
 
-  // Automations an agent creates without a timezone run in this browser's zone.
+  // Report this browser's timezone for future agent-created automations.
   useReportLocalTimezone();
 
   const desktopUpdates = useMemo(() => updateBridge(), []);

@@ -772,7 +772,7 @@ def test_default_timezone_is_per_user_and_ignores_unusable_stored_values(
     def unexpected_zone_lookup(key: str) -> None:
         pytest.fail(f"Invalid or oversized storage reached timezone lookup: {key[:40]}")
 
-    for raw in (b"not an envelope", encode(json.dumps("x" * 1025))):
+    for raw in (b"not an envelope", b"\x00\x01bad", encode(json.dumps("x" * 1025))):
         with store._session("seed_invalid_timezone_preference") as session:
             session.execute(
                 update(SqlPreference)
