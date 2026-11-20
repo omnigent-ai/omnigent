@@ -3221,7 +3221,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     } catch (err) {
       if (initialDraft && !initialDispatched && !initialSendPending()) return;
       // Its commit already replaced the bubble, and the turn it started settles itself.
-      if (err instanceof UnansweredSendError && err.delivered) return;
+      if (err instanceof UnansweredSendError && err.delivered) {
+        endPlanStop();
+        queryClient?.invalidateQueries({ queryKey: ["conversations"] });
+        return;
+      }
       const unanswered = err instanceof UnansweredSendError;
       const { message, code } = describeSendFailure(err);
       if (opts?.external && !posting) {
@@ -3547,7 +3551,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       }
       queryClient?.invalidateQueries({ queryKey: ["conversations"] });
     } catch (err) {
-      if (err instanceof UnansweredSendError && err.delivered) return;
+      if (err instanceof UnansweredSendError && err.delivered) {
+        endPlanStop();
+        queryClient?.invalidateQueries({ queryKey: ["conversations"] });
+        return;
+      }
       const message = err instanceof Error ? err.message : String(err);
       // Settle the conversation this command targeted, wherever the user is
       // now: its echo must roll back and its status must not stay "streaming"
@@ -4360,7 +4368,8 @@ async function withStillSendingMark<T>(
         const giveUp = (): void => {
           const state = setterForState(sessionId);
           // A bubble its commit already replaced was delivered.
-          const delivered = !state?.pendingUserMessages.some((p) => p.tempId === tempId);
+          const delivered =
+            state !== null && !state.pendingUserMessages.some((p) => p.tempId === tempId);
           const running =
             cachedConversationStatus(sessionId) === "running" ||
             state?.sessionStatus === "running" ||
@@ -4455,7 +4464,7 @@ function queuedSendOptions(
           ],
         };
       });
-      // One that may still arrive names its send, so the commit retracts the card and retry.
+      // A send that may still arrive names its stable id; its commit retracts this card and retry.
       setterFor(message.conversationId)((s) => {
         const text = s.isNativeTerminalSession
           ? messageContentText([{ type: "input_text", text: message.text }])

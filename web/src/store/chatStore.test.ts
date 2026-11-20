@@ -7673,7 +7673,76 @@ describe("chatStore — delivered-but-unacked send", () => {
     await sent;
   });
 
-  it("settles a committed message without touching its turn when its POST never answers", async () => {
+  it.each([
+    [
+      "message",
+      () => useChatStore.getState().send("summarize the deploy status", "agent_xyz"),
+      (postedBodies: unknown[]) =>
+        handleSessionEvent({
+          type: "session_input_consumed",
+          itemId: (postedBodies[0] as { data: { stable_id: string } }).data.stable_id,
+          itemType: "message",
+          data: {
+            role: "user",
+            content: [{ type: "input_text", text: "summarize the deploy status" }],
+          },
+        }),
+    ],
+    [
+      "slash command",
+      () => useChatStore.getState().sendSlashCommand("grill-me", "review this", "agent_xyz"),
+      () =>
+        handleSessionEvent({
+          type: "slash_command",
+          kind: "skill",
+          name: "grill-me",
+          arguments: "review this",
+          output: null,
+          agentName: "claude-native-ui",
+          itemId: "item_slash_committed",
+          responseId: "resp_a",
+        }),
+    ],
+  ])(
+    "settles a committed %s without touching its turn when its POST never answers",
+    async (_kind, sendInput, commit) => {
+      vi.useFakeTimers();
+      onTestFinished(() => {
+        vi.useRealTimers();
+        usePlanStops.setState({ requests: {}, settledStops: {} });
+      });
+      useChatStore.setState({
+        conversationId: "conv_existing",
+        abortController: new AbortController(),
+      });
+      await trackPlanStop("conv_existing", async () => ({}));
+      const { postedBodies } = holdEventPosts();
+
+      const sent = sendInput();
+      await vi.advanceTimersByTimeAsync(SEND_STILL_SENDING_AFTER_MS);
+      commit(postedBodies);
+      useChatStore.setState({
+        sessionStatus: "running",
+        activeResponse: { responseId: "resp_a", state: "streaming", error: null },
+      });
+      let settled = false;
+      void sent.then(() => {
+        settled = true;
+      });
+      await vi.advanceTimersByTimeAsync(SEND_UNANSWERED_AFTER_MS);
+
+      expect(settled).toBe(true);
+      const state = useChatStore.getState();
+      expect(state.status).toBe("streaming");
+      expect(state.activeResponse?.state).toBe("streaming");
+      expect(state.failedSendDraft).toBeNull();
+      expect(errorCards()).toEqual([]);
+      expect(usePlanStops.getState().requests.conv_existing).toBeUndefined();
+      await sent;
+    },
+  );
+
+  it("tells the caller an unanswered send may still arrive after its conversation is released", async () => {
     vi.useFakeTimers();
     onTestFinished(() => {
       vi.useRealTimers();
@@ -7682,36 +7751,21 @@ describe("chatStore — delivered-but-unacked send", () => {
       conversationId: "conv_existing",
       abortController: new AbortController(),
     });
-    const { postedBodies } = holdEventPosts();
+    holdEventPosts();
+    const onError = vi.fn();
 
-    const sent = useChatStore.getState().send("summarize the deploy status", "agent_xyz");
+    const sent = useChatStore
+      .getState()
+      .send("summarize the deploy status", "agent_xyz", undefined, { onError });
     await vi.advanceTimersByTimeAsync(SEND_STILL_SENDING_AFTER_MS);
-    const stableId = (postedBodies[0] as { data: { stable_id: string } }).data.stable_id;
-    handleSessionEvent({
-      type: "session_input_consumed",
-      itemId: stableId,
-      itemType: "message",
-      data: {
-        role: "user",
-        content: [{ type: "input_text", text: "summarize the deploy status" }],
-      },
-    });
-    useChatStore.setState({
-      sessionStatus: "running",
-      activeResponse: { responseId: "resp_a", state: "streaming", error: null },
-    });
-    let settled = false;
-    void sent.then(() => {
-      settled = true;
-    });
+    releaseConversation("conv_existing");
     await vi.advanceTimersByTimeAsync(SEND_UNANSWERED_AFTER_MS);
 
-    expect(settled).toBe(true);
-    const state = useChatStore.getState();
-    expect(state.status).toBe("streaming");
-    expect(state.activeResponse?.state).toBe("streaming");
-    expect(state.failedSendDraft).toBeNull();
-    expect(errorCards()).toEqual([]);
+    expect(onError).toHaveBeenCalledWith(
+      expect.stringContaining("The server didn't answer"),
+      false,
+    );
+    await sent;
   });
 
   it("retracts the failed-send draft and card when its message commits under the send's stable id", async () => {
