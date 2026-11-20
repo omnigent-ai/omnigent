@@ -20,6 +20,8 @@ export interface QuickPickItem<Value = unknown> {
   /** Section heading label; items sharing one appear together in source order. */
   group?: string;
   icon?: ReactNode;
+  /** Quiet trailing text, such as a setting's current value. */
+  detail?: string;
   /** Quiet trailing content, such as a badge or an agent name. */
   accessory?: ReactNode;
   /** Key caps shown at the trailing edge, such as `["⌘", "K"]`. */
@@ -30,6 +32,8 @@ export interface QuickPickItem<Value = unknown> {
   highlights?: { label?: readonly MatchRange[]; description?: readonly MatchRange[] };
   /** How this row's matched text stands out; defaults to the picker's highlight. */
   matchHighlight?: MatchHighlight;
+  /** Ends or removes something, so it's styled as a menu's destructive item is. */
+  destructive?: boolean;
   /** Accepting the item opens a child page; a chevron marks it, and Right Arrow opens it. */
   opensPage?: boolean;
   /** Defaults to true; a free-text item is never remembered. */

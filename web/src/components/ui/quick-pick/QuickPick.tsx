@@ -517,8 +517,13 @@ export function QuickPick<Value>({
           sidebar
             ? "items-center gap-2 py-1.5 data-active:bg-[var(--sidebar-active)] data-active:text-[var(--sidebar-active-foreground)]"
             : "items-start gap-2 py-1.5 data-active:bg-muted data-active:text-foreground",
+          // Matches the menus' destructive item: red text, a red tint while active.
+          !sidebar &&
+            item.destructive &&
+            "text-destructive data-active:bg-destructive/10 data-active:text-destructive dark:data-active:bg-destructive/20",
           disabled && "cursor-default opacity-50",
         )}
+        data-variant={item.destructive ? "destructive" : undefined}
       >
         {sidebar ? (
           <>
@@ -556,14 +561,43 @@ export function QuickPick<Value>({
         {!sidebar && (
           <>
             {item.icon ? (
-              <span className="flex size-4 shrink-0 items-center justify-center self-center text-muted-foreground [&_svg]:size-4">
+              <span
+                className={cn(
+                  "flex size-4 shrink-0 items-center justify-center self-center text-muted-foreground [&_svg]:size-4",
+                  item.destructive && "text-destructive",
+                )}
+              >
                 {item.icon}
               </span>
             ) : null}
             <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-              <span data-slot="quick-pick-label" className="truncate">
-                <HighlightedText text={item.label} ranges={row.labelRanges} highlight={highlight} />
-              </span>
+              {row.sectionLabel ? (
+                <span className="flex min-w-0 items-baseline gap-1">
+                  {/* Rows ranked across groups name theirs, as a heading would; the heading isn't announced either. */}
+                  <span
+                    aria-hidden
+                    data-slot="quick-pick-section"
+                    className="shrink-0 text-muted-foreground"
+                  >
+                    {row.sectionLabel}:
+                  </span>
+                  <span data-slot="quick-pick-label" className="min-w-0 truncate">
+                    <HighlightedText
+                      text={item.label}
+                      ranges={row.labelRanges}
+                      highlight={highlight}
+                    />
+                  </span>
+                </span>
+              ) : (
+                <span data-slot="quick-pick-label" className="truncate">
+                  <HighlightedText
+                    text={item.label}
+                    ranges={row.labelRanges}
+                    highlight={highlight}
+                  />
+                </span>
+              )}
               {item.context}
               {item.description && (
                 <span className="truncate text-sm text-muted-foreground">
@@ -582,6 +616,11 @@ export function QuickPick<Value>({
                 className="min-w-0 shrink truncate self-center text-sm text-muted-foreground"
               >
                 {item.disabledReason}
+              </span>
+            )}
+            {!item.disabledReason && item.detail && (
+              <span className="shrink-0 self-center text-sm text-muted-foreground">
+                {item.detail}
               </span>
             )}
             {item.accessory && (

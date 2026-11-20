@@ -568,6 +568,45 @@ describe("QuickPick footer and alternate accept", () => {
   });
 });
 
+describe("QuickPick row styles", () => {
+  it("styles a destructive row as a menu's destructive item", () => {
+    renderPicker({ segments: [{ ...commands, items: [item("delete", { destructive: true })] }] });
+    expect(screen.getByRole("option", { name: "delete" }).dataset.variant).toBe("destructive");
+  });
+
+  it("shows a row's detail unless it is disabled", () => {
+    renderPicker({
+      segments: [
+        {
+          ...commands,
+          items: [
+            item("engine", { detail: "Ghostty" }),
+            item("other", { detail: "Hidden", disabledReason: "Not here" }),
+          ],
+        },
+      ],
+    });
+    expect(screen.getByRole("option", { name: /engine/ })).toHaveTextContent("Ghostty");
+    expect(screen.getByRole("option", { name: /other/ })).not.toHaveTextContent("Hidden");
+  });
+
+  it("names each row's group when rows are ranked across groups", () => {
+    const { input } = renderPicker({
+      segments: [
+        {
+          sourceId: "commands",
+          ranking: "client",
+          groupOrder: "match",
+          items: [item("theme-a", { label: "Terminal theme", group: "Settings" })],
+        },
+      ],
+    });
+    fireEvent.change(input, { target: { value: "theme" } });
+    const row = screen.getByRole("option", { name: "Terminal theme" });
+    expect(row.querySelector("[data-slot=quick-pick-section]")).toHaveTextContent("Settings:");
+  });
+});
+
 describe("QuickPick child pages", () => {
   it("shows a back button and goes back with Escape, Backspace in an empty query, or the footer", () => {
     const onBack = vi.fn();
