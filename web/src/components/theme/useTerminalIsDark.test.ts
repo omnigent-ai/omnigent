@@ -26,6 +26,8 @@ describe("useTerminalThemeMode", () => {
       applyImportedSettings({ version: 1, settings: { "omnigent:terminal-theme": "light" } });
     });
     expect(result.current).toBe("light");
+    // A reader mounted after the import, such as a reopened Settings page, agrees.
+    expect(renderHook(() => useTerminalThemeMode()).result.current).toBe("light");
     // An import without the key clears it back to the default.
     act(() => {
       applyImportedSettings({ version: 1, settings: {} });
