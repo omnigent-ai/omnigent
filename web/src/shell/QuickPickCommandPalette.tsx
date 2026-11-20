@@ -16,11 +16,13 @@ import type { QuickPickSegment } from "@/components/ui/quick-pick/presentation";
 import { type ActionCommand, useAppCommands } from "./appCommands";
 import type { CommandPaletteProps } from "./CommandPalette";
 import { PaletteSessionContext } from "./PaletteSessionContext";
+import { type FeaturePaletteRow, useFeaturePaletteCommands } from "./useFeaturePaletteCommands";
 import { type PaletteSession, usePaletteSessionSearch } from "./usePaletteSessionSearch";
 
 type PaletteRow =
   | { kind: "session"; id: string }
   | { kind: "action"; action: ActionCommand }
+  | { kind: "feature"; row: FeaturePaletteRow }
   | { kind: "more"; load: () => void; lastRowId: string | undefined };
 
 /** A blank icon slot, so session labels line up with the icon-prefixed actions. */
@@ -44,6 +46,7 @@ export function QuickPickCommandPalette({
     onToggleRightSidebar,
     rightSidebarShortcutEnabled,
   });
+  const featureCommands = useFeaturePaletteCommands(open && !sessionsOnly);
   // Show more parks the selection on its group's last row, so the next ArrowDown
   // reaches the rows it loads; the user's next move clears it.
   const [parkedId, setParkedId] = useState<string | null>(null);
@@ -134,6 +137,21 @@ export function QuickPickCommandPalette({
             value: { kind: "action", action },
           })),
     },
+    {
+      sourceId: "features",
+      ranking: "client",
+      fuzzyMatching: "words",
+      items: featureCommands.rows.map((row) => ({
+        id: `feature:${row.id}`,
+        label: row.label,
+        keywords: row.keywords,
+        group: row.heading,
+        icon: <row.icon />,
+        shortcut: row.shortcut,
+        disabledReason: row.disabledReason,
+        value: { kind: "feature", row },
+      })),
+    },
   ];
 
   const accept = (item: QuickPickItem<PaletteRow>): void => {
@@ -141,6 +159,10 @@ export function QuickPickCommandPalette({
     if (row.kind === "more") {
       setParkedId(row.lastRowId ?? null);
       row.load();
+      return;
+    }
+    if (row.kind === "feature") {
+      featureCommands.accept(row.row, close);
       return;
     }
     close();
@@ -223,6 +245,7 @@ export function QuickPickCommandPalette({
             : undefined
         }
         showCloseButton={false}
+        onCloseAutoFocus={featureCommands.onCloseAutoFocus}
       >
         <DialogTitle className="sr-only">{label}</DialogTitle>
         <QuickPick
