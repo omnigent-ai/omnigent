@@ -26,6 +26,12 @@ const LAPTOP_SYNC_WAIT_MS = 2 * 60_000;
 export type DbcertRefreshPhase = "idle" | "running" | "failed";
 
 /**
+ * How this view can renew the host's cert. `"companion-offline"` means only
+ * from the laptop, because the host's sign-in needs Arca Companion's tunnel.
+ */
+export type DbcertRefreshMode = "laptop" | "host" | "companion-offline";
+
+/**
  * Track the dbcert on the session's host, if it has one, and renew it. In the
  * desktop app a refresh renews the laptop's copy, which hosts pick up;
  * elsewhere it renews the host's own copy.
@@ -49,8 +55,10 @@ export function useHostDbcert(
   const target = sessionId && host ? `${sessionId} ${host.host_id}` : null;
   const [refreshCapability, setRefreshCapability] = useState<{
     target: string;
-    mode: "laptop" | "host";
+    mode: DbcertRefreshMode;
   } | null>(null);
+  // Bumped to probe the host again, e.g. when a click finds Companion's tunnel down.
+  const [capabilityProbe, setCapabilityProbe] = useState(0);
   const refreshMode = refreshCapability?.target === target ? refreshCapability.mode : null;
   const [cert, setCert] = useState<{ target: string; expiresAt: number } | null>(null);
   const expiresAt = cert?.target === target ? cert.expiresAt : null;
@@ -113,13 +121,16 @@ export function useHostDbcert(
         features?.databricksInternalFeatures === true && features.canRefreshDbcert === true;
       const hostCapability = onLaptop ? undefined : await canStartHostDbcertRefresh(sessionId);
       if (!active) return;
-      const mode: "laptop" | "host" | null = onLaptop
+      const mode: DbcertRefreshMode | null = onLaptop
         ? "laptop"
-        : hostCapability === true
+        : hostCapability === "ready"
           ? "host"
-          : null;
+          : hostCapability === "companion-offline"
+            ? "companion-offline"
+            : null;
       setRefreshCapability(mode ? { target, mode } : null);
-      if (!mode) scheduleRetry(hostCapability === false);
+      // Keep probing a disconnected tunnel so the button returns once Companion reconnects.
+      if (!mode || mode === "companion-offline") scheduleRetry(hostCapability === "unavailable");
     };
     checkWhenVisible();
     return () => {
@@ -127,7 +138,7 @@ export function useHostDbcert(
       clearTimeout(retry);
       document.removeEventListener("visibilitychange", checkWhenVisible);
     };
-  }, [sessionId, target]);
+  }, [sessionId, target, capabilityProbe]);
 
   const check = useCallback(async () => {
     if (!sessionId || !target || !refreshMode) return undefined;
@@ -161,12 +172,23 @@ export function useHostDbcert(
   }, [target, refreshMode, check, expired]);
 
   const refresh = useCallback(async () => {
-    if (!sessionId || !target || !refreshMode) return;
+    if (!sessionId || !target || !refreshMode || refreshMode === "companion-offline") return;
     setRefreshState({ target, phase: "running" });
-    const started =
-      refreshMode === "laptop"
-        ? (await refreshDbcert()).ok
-        : await startHostDbcertRefresh(sessionId);
+    let started: boolean;
+    if (refreshMode === "laptop") {
+      started = (await refreshDbcert()).ok;
+    } else {
+      const start = await startHostDbcertRefresh(sessionId);
+      if (start === "companion-offline") {
+        if (currentTarget.current === target) {
+          setRefreshCapability({ target, mode: "companion-offline" });
+          setRefreshState(null);
+          setCapabilityProbe((probe) => probe + 1);
+        }
+        return;
+      }
+      started = start === "started";
+    }
     const deadline =
       Date.now() + (refreshMode === "laptop" ? LAPTOP_SYNC_WAIT_MS : HOST_DBCERT_REFRESH_MS);
     // Poll the host until the renewed cert lands, the wait runs out, or the view moves on.

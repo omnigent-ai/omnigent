@@ -9,9 +9,20 @@ import { authenticatedFetch } from "@/lib/identity";
 export const DBCERT_EXPIRY_COMMAND =
   'f="$HOME/.dbcert/creds.cert.pem"; if [ -r "$f" ]; then openssl x509 -enddate -noout -in "$f"; else echo none; fi';
 
-/** Exits 1 when the host lacks a tool required to start a bounded sign-in. */
-export const DBCERT_REFRESH_CHECK_COMMAND =
-  'for c in dbcert setsid flock timeout; do command -v "$c" >/dev/null || exit 1; done';
+/** Arca Companion's tunnel forwards this host port to Companion on the laptop. */
+export const ARCA_COMPANION_TUNNEL_PORT = 19222;
+
+/**
+ * Exits 2 on a host that sends sign-in through Arca Companion while Companion's
+ * tunnel is down, since dbcert would then wait for a sign-in that never opens.
+ */
+export const COMPANION_TUNNEL_CHECK_COMMAND = `if [ -d "$HOME/.arca-client" ] && ! timeout 2 bash -c '</dev/tcp/127.0.0.1/${ARCA_COMPANION_TUNNEL_PORT}' 2>/dev/null; then exit 2; fi`;
+
+/**
+ * Exits 1 when the host lacks a tool required to start a bounded sign-in, and 2
+ * per {@link COMPANION_TUNNEL_CHECK_COMMAND}.
+ */
+export const DBCERT_REFRESH_CHECK_COMMAND = `for c in dbcert setsid flock timeout; do command -v "$c" >/dev/null || exit 1; done; ${COMPANION_TUNNEL_CHECK_COMMAND}`;
 
 /**
  * Starts `dbcert` on the host and returns at once, because its sign-in can
@@ -78,13 +89,25 @@ export async function readHostDbcertExpiry(sessionId: string): Promise<number | 
   return result?.exitCode === 0 ? parseDbcertExpiry(result.stdout) : undefined;
 }
 
-/** Whether the host has the tools to start sign-in, or undefined when it could not be asked. */
-export async function canStartHostDbcertRefresh(sessionId: string): Promise<boolean | undefined> {
+/**
+ * Whether the host can start sign-in: `"ready"`, `"companion-offline"` when it
+ * needs Arca Companion's tunnel and that is down, `"unavailable"` when it lacks
+ * the tools, or undefined when it could not be asked.
+ */
+export async function canStartHostDbcertRefresh(
+  sessionId: string,
+): Promise<"ready" | "companion-offline" | "unavailable" | undefined> {
   const result = await runHostShell(sessionId, DBCERT_REFRESH_CHECK_COMMAND);
-  return result ? result.exitCode === 0 : undefined;
+  if (!result) return undefined;
+  if (result.exitCode === 0) return "ready";
+  return result.exitCode === 2 ? "companion-offline" : "unavailable";
 }
 
-/** Start a dbcert sign-in on the host. Resolves whether it started. */
-export async function startHostDbcertRefresh(sessionId: string): Promise<boolean> {
-  return (await runHostShell(sessionId, DBCERT_REFRESH_COMMAND))?.exitCode === 0;
+/** Start a dbcert sign-in on the host. */
+export async function startHostDbcertRefresh(
+  sessionId: string,
+): Promise<"started" | "companion-offline" | "failed"> {
+  const exitCode = (await runHostShell(sessionId, DBCERT_REFRESH_COMMAND))?.exitCode;
+  if (exitCode === 0) return "started";
+  return exitCode === 2 ? "companion-offline" : "failed";
 }
