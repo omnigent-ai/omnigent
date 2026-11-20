@@ -356,6 +356,19 @@ labels do not establish what the screen displayed. Describe icon-only controls
 by their visible appearance. If frame inspection is unavailable, disclose that
 and limit claims to states the recording driver actually verified.
 
+A Playwright visibility check does not show that the viewer can see an element.
+`to_be_visible()` and `is_visible()` also pass for an element at `opacity: 0`,
+scrolled out of the viewport, or covered by another element. Hover-revealed
+content is the usual trap: on a desktop viewport the footer under a user's text
+message, including its timestamp and "The agent will read this after its current
+step" label, stays transparent until the bubble is hovered or focused. Before
+captioning such an element as shown, hover or focus its owner in the recorded
+journey and caption that action. Then assert its effective opacity (its own and
+its ancestors' computed `opacity` multiplied, as in
+`tests/browser_ui/chat/test_status_indicators.py`) and `to_be_in_viewport()`.
+Otherwise inspect a still from the captioned moment
+(`ffmpeg -ss <seconds> -i <clip> -frames:v 1 <still>.png`) or drop the claim.
+
 A driver check covers only the element it targets. The screen can show one
 state in several places: a session's activity appears as the chat pane's
 working indicator, a spinner on its sidebar row, and a sub-agent count badge.

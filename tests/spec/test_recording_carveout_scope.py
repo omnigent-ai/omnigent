@@ -103,6 +103,13 @@ def test_caption_rules_reach_the_agent_without_treating_hidden_labels_as_visible
     assert "Quote only text the viewer can see" in lanes
     assert "quote only visibly rendered text" in instructions
     assert "hidden accessibility labels and backend logs are not screen evidence" in instructions
+    resolve_recording = _normalized(_DEV / "resolve-agent/skills/resolve-author-fix/SKILL.md")
+    assert "also pass for an element at `opacity: 0`, scrolled out of the viewport" in lanes
+    assert "hover or focus its owner in the recorded journey" in lanes
+    assert "assert its effective opacity" in lanes
+    assert "`to_be_in_viewport()`" in lanes
+    assert "`to_be_visible()` alone also passes for transparent" in resolve_recording
+    assert "use the shared guide's on-screen check" in resolve_recording
 
 
 def test_caption_absence_claims_stay_scoped_to_the_checked_element() -> None:
