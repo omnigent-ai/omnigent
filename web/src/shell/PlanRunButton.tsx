@@ -1,6 +1,7 @@
 import { PlayIcon, SquareIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { Spinner } from "@/components/ui/spinner";
 import {
   isPlanComplete,
   type JournalEntry,
@@ -30,9 +31,21 @@ export function planRunControl(
   return pausedLabel(progress, entries, false, planRevision) ? "play" : null;
 }
 
+/** What a plan's run button shows: its control, or "Stopping…" from Stop until the run stops. */
+export type PlanRunButtonState = PlanRunControl | "stopping";
+
+/** Stop gives way to "Stopping…" while the run is stopping. */
+export function planRunButtonState(
+  control: PlanRunControl | null,
+  stopping: boolean,
+): PlanRunButtonState | null {
+  return control === "stop" && stopping ? "stopping" : control;
+}
+
 /**
  * A plan's play or stop button, in the Tasks tab's header and on a workflow
  * run's row: asks the main agent to stop or resume the plan and its workers.
+ * While the run stops, it's a disabled "Stopping…".
  */
 export function PlanRunButton({
   control,
@@ -41,12 +54,27 @@ export function PlanRunButton({
   size = "icon-sm",
   className,
 }: {
-  control: PlanRunControl;
-  onClick: () => void;
+  control: PlanRunButtonState;
+  onClick?: () => void;
   disabled?: boolean;
   size?: "icon-xs" | "icon-sm";
   className?: string;
 }) {
+  if (control === "stopping") {
+    return (
+      <Button
+        type="button"
+        variant="ghost"
+        size={size === "icon-xs" ? "xs" : "sm"}
+        className={cn("shrink-0 text-muted-foreground", className)}
+        disabled
+        data-testid="plan-stopping"
+      >
+        <Spinner aria-hidden className="size-3.5" />
+        Stopping…
+      </Button>
+    );
+  }
   const label = control === "stop" ? "Stop" : "Continue the plan";
   return (
     <Button

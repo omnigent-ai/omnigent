@@ -45,6 +45,7 @@ def test_account_generation_survives_delete_and_rejects_old_writes(db_uri: str) 
             lambda: permissions.grant("alice", uuid.uuid4().hex, 3),
             lambda: permissions.grant_if_absent("alice", uuid.uuid4().hex, 1),
             lambda: permissions.grant_for_scheduled_task("alice", uuid.uuid4().hex, 1),
+            lambda: permissions.grant_for_workflow("alice", uuid.uuid4().hex, 1),
             lambda: HostStore(db_uri).upsert_on_connect(uuid.uuid4().hex, "laptop", "alice"),
             lambda: DeviceGrantStore(db_uri).create_redeemed_grant(
                 "late-grant",
@@ -497,6 +498,148 @@ def test_reregistration_finishes_an_interrupted_workflow_cleanup(db_uri, monkeyp
         sa.event.remove(accounts._engine, "before_cursor_execute", interrupt_cleanup)
     assert accounts.create_user_with_password("alice", "replacement-hash").id == "alice"
     assert workflows.list_page(user_id="alice", limit=10) == ([], False)
+
+
+def _create_workflow(db_uri: str, owner: str) -> str:
+    return (
+        WorkflowStore(db_uri)
+        .create(user_id=owner, name=f"Plan {uuid.uuid4().hex[:8]}", description="Steps.", steps=[])
+        .id
+    )
+
+
+def test_deletion_removes_workflow_grants_held_and_on_owned_workflows(db_uri, monkeypatch):
+    from omnigent.db.db_models import workspace_scope
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    workflows = WorkflowStore(db_uri)
+    # One grant or workflow per batch, so each cleanup spans several transactions.
+    monkeypatch.setattr(accounts, "_cleanup_batch_size", 1)
+    with workspace_scope(202):
+        permissions.ensure_user("alice")
+        elsewhere = _create_workflow(db_uri, "dave")
+        permissions.grant_for_workflow("alice", elsewhere, 1)
+    accounts.create_user_with_password("alice", "alice-hash")
+    for grantee in ("carol", "erin"):
+        permissions.ensure_user(grantee)
+    owned, owned_too, other, another = (
+        _create_workflow(db_uri, owner) for owner in ("alice", "alice", "dave", "dave")
+    )
+    for workflow_id, grantee in (
+        (owned, "carol"),
+        (owned, "erin"),
+        (owned_too, "carol"),
+        (other, "alice"),
+        (other, "carol"),
+        (another, "alice"),
+    ):
+        permissions.grant_for_workflow(grantee, workflow_id, 1)
+
+    assert accounts.delete_user("alice") is True
+    for workflow_id in (owned, owned_too, another):
+        assert permissions.list_for_workflow(workflow_id) == ([], None)
+    assert workflows.get(owned, user_id="alice") is None
+    assert [grant.user_id for grant in permissions.list_for_workflow(other)[0]] == ["carol"]
+    with pytest.raises(OmnigentError, match="revoked"):
+        permissions.grant_for_workflow("alice", other, 1)
+    accounts.create_user_with_password("alice", "replacement-hash")
+    assert permissions.resolve_workflow_access(["alice"], other) is None
+    with workspace_scope(202):
+        assert permissions.resolve_workflow_access(["alice"], elsewhere) == 1
+
+
+def test_owned_workflows_lose_their_grants_a_bounded_batch_at_a_time(db_uri, monkeypatch):
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    monkeypatch.setattr(accounts, "_cleanup_batch_size", 2)
+    accounts.create_user_with_password("alice", "alice-hash")
+    owned = [_create_workflow(db_uri, "alice") for _ in range(3)]
+    for grantee in ("bob", "carol", "erin"):
+        permissions.ensure_user(grantee)
+        for workflow_id in owned:
+            permissions.grant_for_workflow(grantee, workflow_id, 1)
+    batches: list[int] = []
+    delete_grants = accounts_module.delete_grants_on_workflows
+
+    def recording(session, workflow_ids, *, batch_size):
+        batches.append(delete_grants(session, workflow_ids, batch_size=batch_size))
+        return batches[-1]
+
+    monkeypatch.setattr(accounts_module, "delete_grants_on_workflows", recording)
+    assert accounts.delete_user("alice") is True
+    assert sum(batches) == 9
+    assert max(batches) <= 2
+    for workflow_id in owned:
+        assert permissions.list_for_workflow(workflow_id) == ([], None)
+        assert WorkflowStore(db_uri).get(workflow_id, user_id="alice") is None
+
+
+def test_reregistration_finishes_an_interrupted_workflow_grant_cleanup(db_uri, monkeypatch):
+    from omnigent.db.db_models import SqlWorkflowShare
+    from omnigent.stores.permission_store import sqlalchemy_store as permission_module
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    monkeypatch.setattr(accounts, "_cleanup_batch_size", 1)
+    accounts.create_user_with_password("bob", "bob-hash")
+    workflow_ids = [_create_workflow(db_uri, "dave") for _ in range(3)]
+    for workflow_id in workflow_ids:
+        permissions.grant_for_workflow("bob", workflow_id, 1)
+
+    def held_grants() -> int:
+        return sum(
+            permissions.resolve_workflow_access(["bob"], workflow_id) is not None
+            for workflow_id in workflow_ids
+        )
+
+    delete_batch = permission_module._delete_grant_batch
+    batches = 0
+
+    def interrupted_after_one_batch(*args, **kwargs):
+        nonlocal batches
+        if kwargs["model"] is SqlWorkflowShare:
+            batches += 1
+            if batches > 1:
+                raise RuntimeError("test cleanup interruption")
+        return delete_batch(*args, **kwargs)
+
+    monkeypatch.setattr(permission_module, "_delete_grant_batch", interrupted_after_one_batch)
+    assert accounts.delete_user("bob") is True
+    assert held_grants() == 2
+    monkeypatch.setattr(permission_module, "_delete_grant_batch", delete_batch)
+
+    # A grant still held refuses the name; registration's own cleanup is skipped here.
+    finish_cleanup = accounts_module.delete_deleted_account_workflow_grants
+    monkeypatch.setattr(
+        accounts_module, "delete_deleted_account_workflow_grants", lambda *a, **k: 0
+    )
+    with pytest.raises(OmnigentError, match="workflow grants") as caught:
+        accounts.create_user_with_password("bob", "replacement-hash")
+    assert caught.value.code == ErrorCode.CONFLICT
+    assert accounts.get_user("bob") is None
+    monkeypatch.setattr(accounts_module, "delete_deleted_account_workflow_grants", finish_cleanup)
+
+    assert accounts.create_user_with_password("bob", "replacement-hash").id == "bob"
+    assert held_grants() == 0
+
+
+def test_deleted_accounts_names_only_tombstoned_users(db_uri):
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    accounts.create_user_with_password("alice", "alice-hash")
+    accounts.create_user_with_password("bob", "bob-hash")
+    assert accounts.delete_user("alice") is True
+    # "carol" has no account row, as an identity an SSO proxy supplies may not.
+    assert permissions.deleted_accounts(["alice", "bob", "carol", "alice"]) == {"alice"}
+    assert permissions.deleted_accounts([]) == set()
+    # MySQL's key folds case and accents, so a spelling it equates is deleted too,
+    # and comes back as given, which is how a workflow may store its owner.
+    variants = ["ALICE", "alíce"]
+    expected = set(variants) if permissions._engine.dialect.name == "mysql" else set()
+    assert permissions.deleted_accounts([*variants, "bob"]) == expected
+    accounts.create_user_with_password("alice", "replacement-hash")
+    assert permissions.deleted_accounts(["alice"]) == set()
 
 
 def test_deletion_removes_all_preferences_only_for_user_in_workspace(db_uri: str) -> None:

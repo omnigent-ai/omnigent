@@ -116,8 +116,9 @@ so nothing in the run may wait for a person:
 2. Use the current run's plan if one is already in the journal. Otherwise,
    write the plan with `sys_journal_write_plan` before executing its steps. Name
    the plan for its goal in a few words ("Cut GET /orders p95 by 20%"). Give
-   each step a short, stable ID (`profile`, `opt-pool`), a name, and its
-   dependencies. A new step needs an ID the journal hasn't used yet, since a
+   each step a short, stable ID (`profile`, `opt-pool`), a name, its
+   dependencies and a `goal` written for the user first (see "Step
+   descriptions"). A new step needs an ID the journal hasn't used yet, since a
    step's status is the newest one written under its ID.
 
    List the steps in the order you'll work on them. The Tasks tab numbers
@@ -142,6 +143,39 @@ so nothing in the run may wait for a person:
    "Before asking or declaring a blocker", ask it on a ready step with
    `sys_workflow_request_input`; don't turn routine uncertainty into a
    plan-review pause. In an unattended run, follow the automation rules.
+
+## Step descriptions
+
+A step's `goal`, in `sys_journal_write_plan`, is its description. The user
+reads it in the Tasks tab, and whoever runs the step, you or a nested agent,
+works from it. Write it for the user first, in plain language and short
+Markdown bullets, with these parts in this order:
+
+- **Inputs:** what the step reads and where it comes from, such as a Slack
+  channel, a pull request or another MCP server's tool.
+- **What it does:** a few short bullets.
+- **Outputs:** what it produces, such as a PR link or a report. This is what
+  done means for the step.
+- **Details:** the exact commands, paths, flags and checks the work needs,
+  last.
+
+Separate the parts with blank lines. A step simple enough for one sentence can
+be one sentence. For example:
+
+```markdown
+**Inputs:** the failing checks on the current branch's pull request.
+
+**What it does:**
+- Reproduces each failure locally.
+- Fixes its cause and pushes the fix.
+
+**Outputs:** the PR with passing checks.
+
+**Details:** list the checks with `gh pr checks <number>`, and run the suite with the repository's test command.
+```
+
+Saved workflows' steps use the same parts. Before you work on a step, read its
+whole goal: Details carries the commands, paths and checks it needs.
 
 ## Run a saved workflow
 
@@ -169,7 +203,8 @@ tests" (ID …)", or "run my triage workflow" in chat):
   `workflow_id` set to its ID, so the workflow's page lists this run. Put
   them in the order you'll work on them (see Plan), even if the saved order
   differs. Rename an ID only if this session's journal already used it. Fill
-  the run's details into the step names and goals.
+  the run's details into the step names and goals, keeping each goal's parts:
+  this run's inputs go in its Inputs, and their specifics in its Details.
 - Its description says what a run needs. Resolve missing details from the
   conversation, journal, current workspace and available tools, then use
   documented or reversible defaults. Any remaining missing input must meet
@@ -374,8 +409,8 @@ or Codex they come from the `omnigent` MCP server: in Claude Code,
    - `message`: the brief, at most 8000 characters; point to files for
      more. It must:
      - tell it to load the `workflow` skill and run the step as its
-       workflow: the step's name, goal and inputs, or a saved workflow's
-       name and ID
+       workflow: the step's name, its whole goal with its Details, and its
+       inputs, or a saved workflow's name and ID
      - give it everything it needs, since it doesn't see this conversation
      - include the relevant decisions, existing authorization and limits,
        and whether this is an unattended run; tell it to resolve routine

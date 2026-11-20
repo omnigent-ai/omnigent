@@ -13,14 +13,17 @@ elsewhere.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import shutil
+import threading
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -31,6 +34,104 @@ from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 
 _TEST_HARNESS_NAME = "executor_adapter_fixture"
 _TEST_HARNESS_MODULE = "tests.runtime.harnesses._test_executor_adapter_harness"
+
+
+@pytest.mark.parametrize("close_fails", [False, True])
+async def test_threaded_executor_factory_cancellation_closes_completed_startup(
+    caplog: pytest.LogCaptureFixture, close_fails: bool
+) -> None:
+    """A cancelled first turn must reap a proxy-owning executor built on a thread."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    started = threading.Event()
+    release = threading.Event()
+    executor = AsyncMock(spec=Executor)
+    if close_fails:
+        executor.close.side_effect = RuntimeError("injected close failure")
+
+    def build_executor() -> Executor:
+        started.set()
+        assert release.wait(timeout=5)
+        return executor
+
+    adapter = ExecutorAdapter(executor_factory=build_executor, executor_factory_on_thread=True)
+    startup = asyncio.create_task(adapter._ensure_executor_for_turn())
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        startup.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await startup
+        executor.close.assert_awaited_once()
+        assert adapter._executor is None
+        assert (
+            "Failed to close executor built for a cancelled turn" in caplog.text
+        ) is close_fails
+    finally:
+        release.set()
+
+
+async def test_shutdown_closes_executor_built_after_shutdown_begins() -> None:
+    """Shutdown must wait for a factory already building the first executor."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    started = threading.Event()
+    release = threading.Event()
+    executor = AsyncMock(spec=Executor)
+
+    def build_executor() -> Executor:
+        started.set()
+        assert release.wait(timeout=5)
+        return executor
+
+    adapter = ExecutorAdapter(executor_factory=build_executor, executor_factory_on_thread=True)
+    startup = asyncio.create_task(adapter._ensure_executor_for_turn())
+    shutdown: asyncio.Task[None] | None = None
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        shutdown = asyncio.create_task(adapter.on_shutdown())
+        await asyncio.sleep(0)
+        assert adapter._shutdown_started
+        assert not shutdown.done()
+        release.set()
+        with pytest.raises(RuntimeError, match="shutting down"):
+            await asyncio.wait_for(startup, 5)
+        await asyncio.wait_for(shutdown, 5)
+        executor.close.assert_awaited_once()
+        executor.close_session.assert_not_awaited()
+        assert adapter._executor is None
+    finally:
+        release.set()
+        await asyncio.gather(startup, return_exceptions=True)
+        if shutdown is not None:
+            await asyncio.gather(shutdown, return_exceptions=True)
+
+
+async def test_threaded_executor_factory_is_shared_by_overlapping_first_turns() -> None:
+    """Only one Claude executor may own the first turn's proxy and launcher."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    started = threading.Event()
+    release = threading.Event()
+    built: list[Executor] = []
+    executor = AsyncMock(spec=Executor)
+
+    def build_executor() -> Executor:
+        built.append(executor)
+        started.set()
+        assert release.wait(timeout=5)
+        return executor
+
+    adapter = ExecutorAdapter(executor_factory=build_executor, executor_factory_on_thread=True)
+    first = asyncio.create_task(adapter._ensure_executor_for_turn())
+    second = asyncio.create_task(adapter._ensure_executor_for_turn())
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        release.set()
+        assert await asyncio.gather(first, second) == [executor, executor]
+        assert built == [executor]
+    finally:
+        release.set()
 
 
 def _start_turn_body() -> dict[str, Any]:

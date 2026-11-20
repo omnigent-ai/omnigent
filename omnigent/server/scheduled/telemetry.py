@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import time
 from collections.abc import Iterator
 from contextvars import ContextVar
@@ -21,8 +22,10 @@ from omnigent.scheduled_context import (
 from omnigent.scheduled_context import (
     scheduled_run_scope as scheduled_run_scope,
 )
+from omnigent.server.schemas import MCP_REGISTRY_SERVICE_ID_PATTERN
 
 _logger = logging.getLogger(__name__)
+_MCP_SERVICE_ID = re.compile(MCP_REGISTRY_SERVICE_ID_PATTERN)
 _current_stage: ContextVar[tuple[ScheduledRunLogContext, str] | None] = ContextVar(
     "scheduled_fire_stage", default=None
 )
@@ -158,6 +161,12 @@ def startup_failure_stage(error_code: str | None) -> str | None:
     }.get(error_code or "")
 
 
+def _logged_mcp_services(services: tuple[str, ...]) -> str:
+    """Comma-joined registry service IDs, sorted; anything not shaped like one is ``other``."""
+    logged = {service if _MCP_SERVICE_ID.fullmatch(service) else "other" for service in services}
+    return ",".join(sorted(logged))
+
+
 def log_task_created(
     task: ScheduledTask, *, owner: str, source: str | None, template: str | None
 ) -> None:
@@ -191,5 +200,6 @@ def log_task_created(
                 kind=task.kind if task.kind in {"automation", "reminder"} else "unknown",
                 target=task.execution_target,
                 session_mode=task.session_mode,
+                mcp_services=_logged_mcp_services(task.mcp_services),
             ),
         )

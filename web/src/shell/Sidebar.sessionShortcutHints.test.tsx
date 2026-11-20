@@ -16,7 +16,8 @@ const mocks = vi.hoisted(() => ({
   mobile: false,
 }));
 
-vi.mock("@/hooks/useIsMobileViewport", () => ({
+vi.mock(import("@/hooks/useIsMobileViewport"), async (importOriginal) => ({
+  ...(await importOriginal()),
   useIsMobileViewport: () => mocks.mobile,
 }));
 
@@ -214,7 +215,7 @@ describe("Sidebar numbered-row shortcut hints", () => {
     expect(hints()).toHaveLength(0);
   });
 
-  it("shows no hints on touch layouts", async () => {
+  it("shows no hints on the mobile layout", async () => {
     mocks.mobile = true;
     renderSidebar();
     expect(rowOf("conv_a")).toBeTruthy();

@@ -165,6 +165,12 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
 
 import { Composer, detectMentionAt, mentionMarkerFor } from "./ChatPage";
 import { SESSION_MENTION_CAP, SESSION_MENTION_HINT } from "@/lib/composerMentions";
+import * as CodeMirrorModule from "@/components/composer/engine/CodeMirrorComposerInput";
+import { resetCodeMirrorComposerLoadForTests } from "@/components/composer/engine/codeMirrorComposerLoader";
+import { composerTargetOf } from "@/components/composer/engine/composerInput";
+import { insertComposerText } from "@/lib/composerText";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 
 function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) {
   return {
@@ -1025,5 +1031,48 @@ describe("Composer @-session mentions", () => {
     type("@src/");
     expect(screen.queryAllByTestId(/^session-mention-item-/)).toHaveLength(0);
     expect(screen.getByTitle("Attach server.ts")).toBeInTheDocument();
+  });
+});
+
+describe("Composer @-file mentions with the CodeMirror composer", () => {
+  const codeMirrorInfo = { ...FALLBACK_SERVER_INFO, features: { chat_composer_codemirror: true } };
+  beforeEach(() => {
+    resetWorkspaceMock();
+    declaredMentions.harnesses = new Set();
+    localStorage.clear();
+    useChatStore.setState({
+      conversationId: "conv_codemirror_mention",
+      sessionHarness: "claude-native",
+      pendingComposerAttachments: [],
+    });
+    resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+  });
+  afterEach(() => {
+    cleanup();
+    resetCodeMirrorComposerLoadForTests();
+    vi.restoreAllMocks();
+  });
+
+  it("shows an attached file as a pill inside the editor", async () => {
+    renderWithTooltips(
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <Composer {...composerProps()} />
+      </CapabilitiesProvider>,
+    );
+    await waitFor(() =>
+      expect(screen.getByLabelText("Message the agent")).toHaveClass("cm-content"),
+    );
+    const editor = screen.getByLabelText("Message the agent");
+
+    act(() => insertComposerText(composerTargetOf(editor)!, "@"));
+    fireEvent.click(screen.getByTitle("Attach readme.md"));
+
+    expect(editor.closest('[data-composer-engine="codemirror"]')).not.toBeNull();
+    expect(
+      Array.from(
+        editor.querySelectorAll('[data-testid="composer-mention-token"]'),
+        (token) => token.textContent,
+      ),
+    ).toEqual(["@readme.md"]);
   });
 });

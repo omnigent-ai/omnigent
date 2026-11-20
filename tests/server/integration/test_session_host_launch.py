@@ -40,6 +40,7 @@ from omnigent.host.connect import HostProcess
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
+    HostHarnessReadinessFrame,
     HostHelloFrame,
     HostLaunchRunnerFrame,
     HostLaunchRunnerResultFrame,
@@ -148,7 +149,7 @@ def app(runtime_init: None, db_uri: str, tmp_path) -> FastAPI:
     return _host_app(db_uri, tmp_path)
 
 
-def _host_app(db_uri: str, tmp_path: Path) -> FastAPI:
+def _host_app(db_uri: str, tmp_path: Path, **options: Any) -> FastAPI:
     """Build one server replica with independent host tunnels and shared stores."""
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
     return create_app(
@@ -162,7 +163,71 @@ def _host_app(db_uri: str, tmp_path: Path) -> FastAPI:
         ),
         comment_store=SqlAlchemyCommentStore(db_uri),
         host_store=HostStore(db_uri),
+        **options,
     )
+
+
+@pytest.mark.parametrize("retirement", ["blocked", "failed"])
+async def test_host_notifications_survive_recovery_retirement(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    retirement: str,
+) -> None:
+    from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
+    from omnigent.server.startup_inputs import ManagedStartupInputs
+    from tests._helpers.polling import poll_until_async
+
+    app = _host_app(
+        db_uri,
+        tmp_path,
+        host_session_recovery=True,
+        sandbox_config=ManagedSandboxDeployment.single(
+            ManagedSandboxConfig(
+                server_url="https://server.example.test",
+                launcher_factory=Mock(),
+                token_ttl_s=3600,
+                provider="test",
+            )
+        ),
+    )
+    entered = asyncio.Event()
+
+    async def retire(_connection: HostConnection) -> None:
+        entered.set()
+        if retirement == "failed":
+            raise RuntimeError("store unavailable")
+        await asyncio.Future()
+
+    service = app.state.host_session_recoverer
+    monkeypatch.setattr(service, "retire_disabled", retire)
+    announced, startup = Mock(), Mock()
+    monkeypatch.setattr("omnigent.server.app.announce_hosts_changed", announced)
+    monkeypatch.setattr(ManagedStartupInputs, "host_changed", startup)
+    comm = await _connect_host(app)
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=budget(5.0))
+        connection = app.state.host_registry.get(_HOST_ID)
+        assert not connection.hello.recover_interrupted_sessions
+        announced.assert_called_once_with(connection.owner)
+        startup.assert_called_once_with(app, _HOST_ID)
+        # A second host frame must be processed even while retirement is blocked.
+        await comm.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_host_frame(
+                    HostHarnessReadinessFrame(configured_harnesses={"codex-native": True})
+                ),
+            }
+        )
+        await poll_until_async(lambda: announced.call_count == 2, timeout_s=budget(5.0))
+        assert startup.call_count == 2
+    finally:
+        await service.shutdown()
+        assert not service._retirement_tasks
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        await comm.wait(timeout=budget(5.0))
 
 
 async def _connect_host(
@@ -4387,6 +4452,80 @@ async def test_relaunch_stops_the_superseded_runner(
 
 
 @pytest.mark.parametrize(
+    "cancel_after_rotation,snapshot_after_rotation",
+    [(False, False), (True, False), (True, True)],
+    ids=["before-binding", "after-binding-old-snapshot", "after-binding-new-snapshot"],
+)
+async def test_ordinary_launch_retries_cancelled_recovery(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    cancel_after_rotation: bool,
+    snapshot_after_rotation: bool,
+) -> None:
+    from omnigent.db.utils import now_epoch
+    from omnigent.server.routes._sessions.helpers import _launch_runner_on_host_impl
+    from omnigent.session_recovery import SessionRecovery
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    store = SqlAlchemyConversationStore(db_uri)
+    original = store.get_conversation(session["id"])
+    intent = SessionRecovery(_HOST_ID, original.runner_id, now_epoch(), phase="launching")
+    assert store.replace_session_recovery(original.id, None, intent)
+    entered, ordinary_entered = asyncio.Event(), asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    checks = 0
+
+    def allowed() -> bool:
+        nonlocal checks
+        checks += 1
+        if checks == (2 if cancel_after_rotation else 1):
+            loop.call_soon_threadsafe(entered.set)
+            assert release.wait(timeout=budget(10.0))
+            return False
+        return True
+
+    registry = app.state.host_registry
+    connection = registry.get(_HOST_ID)
+    recovery = asyncio.create_task(
+        _launch_runner_on_host_impl(
+            original, store, registry, connection, recovery=intent, recovery_allowed=allowed
+        )
+    )
+    ordinary = responder = None
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=budget(5.0))
+        snapshot = store.get_conversation(original.id) if snapshot_after_rotation else original
+
+        async def launch_ordinary() -> Any:
+            ordinary_entered.set()
+            return await _launch_runner_on_host_impl(snapshot, store, registry, connection)
+
+        ordinary = asyncio.create_task(launch_ordinary())
+        await asyncio.wait_for(ordinary_entered.wait(), timeout=budget(5.0))
+        responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+        release.set()
+        cancelled, result, frame = await asyncio.wait_for(
+            asyncio.gather(recovery, ordinary, responder), timeout=budget(10.0)
+        )
+        assert cancelled.error_code == "recovery_cancelled"
+        assert result.acknowledged and result.error_code is None
+        assert not frame.recovery
+        assert result.runner_id == token_bound_runner_id(frame.binding_token)
+        assert store.get_conversation(original.id).runner_id == result.runner_id
+    finally:
+        release.set()
+        tasks = [task for task in (recovery, ordinary, responder) if task is not None]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        await comm.wait(timeout=budget(5.0))
+
+
+@pytest.mark.parametrize(
     "snapshot_after_rotation", [False, True], ids=["old-binding", "new-binding"]
 )
 async def test_concurrent_relaunches_are_single_flight(
@@ -4529,27 +4668,50 @@ async def test_concurrent_relaunches_are_single_flight(
 
 
 @pytest.mark.parametrize(
-    "scenario", ["replaced", "gone", "denied", "replaced_again", "ack_timeout", "cancelled"]
+    "scenario",
+    [
+        "replaced",
+        "gone",
+        "denied",
+        "replaced_again",
+        "ack_timeout",
+        "cancelled",
+        "recovery_replaced",
+    ],
 )
 async def test_relaunch_recovers_only_a_rejected_enqueue(
     db_uri: str, monkeypatch: pytest.MonkeyPatch, scenario: str
 ) -> None:
-    """A replacement gets one identical launch, only before enqueue succeeds."""
+    """Ordinary launches retry once; recovery waits for the replacement's own request."""
+    from dataclasses import replace
+
     from omnigent.errors import ErrorCode, OmnigentError
     from omnigent.server.host_registry import HostRegistry
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes._sessions import helpers as sessions_helpers
+    from omnigent.session_recovery import SessionRecovery
 
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation()
     store.set_host_id(conv.id, _HOST_ID, workspace=_WORKSPACE)
     conv = store.get_conversation(conv.id)
     assert conv is not None
+    recovery = None
+    if scenario == "recovery_replaced":
+        recovery = SessionRecovery(
+            _HOST_ID, conv.runner_id or "", 100, phase="launching", attempts=1
+        )
+        assert store.replace_session_recovery(conv.id, None, recovery)
     registry = HostRegistry()
     host_store = HostStore(db_uri)
     host_store.upsert_on_connect(host_id=_HOST_ID, name="laptop", user_id="local")
     registry.launch_authorizer = host_store.admit_launch
-    hello = HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="laptop")
+    hello = HostHelloFrame(
+        version="0.1.0-test",
+        frame_protocol_version=1,
+        name="laptop",
+        recover_interrupted_sessions=recovery is not None,
+    )
     original = registry.register(_HOST_ID, _NoopRunnerWS(), hello, owner=None)
     connections = [original]
     admissions: list[HostConnection] = []
@@ -4576,7 +4738,7 @@ async def test_relaunch_recovers_only_a_rejected_enqueue(
                     registry.register(
                         _HOST_ID,
                         _NoopRunnerWS(),
-                        hello,
+                        replace(hello, recover_interrupted_sessions=False),
                         owner="different-owner@example.test" if scenario == "denied" else None,
                     )
                 )
@@ -4605,7 +4767,9 @@ async def test_relaunch_recovers_only_a_rejected_enqueue(
     monkeypatch.setattr(sessions_helpers, "_HOST_LAUNCH_RESULT_TIMEOUT_S", 0.01)
 
     async def launch() -> Any:
-        return await sessions_module._launch_runner_on_host(conv, store, registry, original)
+        return await sessions_module._launch_runner_on_host(
+            conv, store, registry, original, recovery=recovery, recovery_allowed=lambda: True
+        )
 
     if scenario == "denied":
         with pytest.raises(OmnigentError) as rejected:
@@ -4621,10 +4785,10 @@ async def test_relaunch_recovers_only_a_rejected_enqueue(
 
     assert len(bound_runner_ids) == 1
     assert store.get_conversation(conv.id).runner_id == bound_runner_ids[0]
-    expected_attempts = 1 if scenario in ("gone", "denied") else 2
+    expected_attempts = 1 if scenario in ("gone", "denied", "recovery_replaced") else 2
     assert len(attempted_frames) == expected_attempts
     assert len(set(attempted_frames)) == 1
-    assert len(admissions) == (1 if scenario == "gone" else 2)
+    assert len(admissions) == (1 if scenario in ("gone", "recovery_replaced") else 2)
     assert admissions == connections[: len(admissions)]
     assert len(accepted_frames) == (scenario in ("replaced", "ack_timeout", "cancelled"))
     if accepted_frames:
@@ -4633,6 +4797,12 @@ async def test_relaunch_recovers_only_a_rejected_enqueue(
         assert accepted_frames[0].session_id == conv.id
     assert all(not conn.pending_launches for conn in connections)
     assert all(future.done() for future in pending_futures)
+    if recovery is not None:
+        assert original.hello.recover_interrupted_sessions
+        assert not connections[-1].hello.recover_interrupted_sessions
+        frame = decode_host_frame(attempted_frames[0])
+        assert isinstance(frame, HostLaunchRunnerFrame) and frame.recovery
+        assert connections[-1].outbound_queue.empty()
 
 
 async def test_rider_of_a_refused_relaunch_surfaces_the_refusal(
@@ -5504,3 +5674,69 @@ async def test_switch_host_stops_before_releasing_the_old_binding(
     moved = (await client.get(f"/v1/sessions/{session['id']}")).json()
     assert moved["host_id"] == target_host_id
     assert moved["runner_id"] == launched.json()["runner_id"]
+
+
+async def test_recovery_binding_is_durable_before_host_receives_launch(
+    app: FastAPI, client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dataclasses import replace
+
+    from omnigent.runner.identity import token_bound_runner_id
+    from omnigent.server.routes.sessions import _launch_runner_on_host
+    from omnigent.session_recovery import SessionRecovery
+
+    comm = await _connect_host(app)
+    agent = await create_test_agent(client)
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    response = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+    )
+    await responder
+    assert response.status_code == 201
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.get_conversation(response.json()["id"])
+    assert conv is not None and conv.runner_id is not None
+    intent = SessionRecovery(
+        _HOST_ID, conv.runner_id, 100, phase="launching", attempts=1, attempt_id="interruption"
+    )
+    assert store.replace_session_recovery(conv.id, None, intent)
+    replace_runner_id = store.replace_runner_id
+
+    def bind_runner(session_id: str, runner_id: str, **kwargs: Any) -> Conversation:
+        assert store.get_session_recovery(session_id) == replace(
+            intent, launch_runner_id=runner_id
+        )
+        return replace_runner_id(session_id, runner_id, **kwargs)
+
+    monkeypatch.setattr(store, "replace_runner_id", bind_runner)
+    registry = app.state.host_registry
+    task = asyncio.create_task(
+        _launch_runner_on_host(
+            conv,
+            store,
+            registry,
+            registry.get(_HOST_ID),
+            recovery=intent,
+            recovery_allowed=lambda: True,
+        )
+    )
+    frame = await _wait_for_launch(comm, budget_s=5)
+    assert frame is not None and frame.recovery
+    bound_id = token_bound_runner_id(frame.binding_token)
+    assert store.get_session_recovery(conv.id) == replace(
+        intent, runner_id=bound_id, launch_runner_id=bound_id
+    )
+    assert store.get_conversation(conv.id).runner_id == bound_id
+    await comm.send_input(
+        {
+            "type": "websocket.receive",
+            "text": encode_host_frame(
+                HostLaunchRunnerResultFrame(
+                    request_id=frame.request_id, status="launched", runner_id=bound_id
+                )
+            ),
+        }
+    )
+    assert (await task).runner_id == bound_id
+    await comm.send_input({"type": "websocket.disconnect", "code": 1000})
