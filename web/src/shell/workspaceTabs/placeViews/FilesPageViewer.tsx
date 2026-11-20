@@ -118,7 +118,8 @@ export function FilesPageViewer({
         </Button>
       </div>
       <div className={cn("flex min-h-0 flex-1 flex-col", WORKSPACE_SIDEBAR_LAYOUT.content)}>
-        {file.isError ? (
+        {/* A failed refresh keeps the last content, so an open editor and its edits stay. */}
+        {file.isError && !file.data ? (
           <p role="alert" className="p-3 text-ui text-destructive">
             Couldn’t open {path}: {file.error.message}
           </p>
