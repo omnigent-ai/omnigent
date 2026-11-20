@@ -17,12 +17,6 @@ import yaml
 from playwright.sync_api import sync_playwright
 
 sys.path.insert(0, str(Path.cwd()))
-from omnigent.config import global_config_path
-from tests.e2e import test_codex_native_terminal_recovery_e2e as scenario
-from tests.e2e_ui.messages.test_native_codex_render_parity import (
-    _open_terminal_view,
-    _wait_terminal_connected,
-)
 
 assert os.environ.get("GITHUB_ACTIONS") == "true", "This capture only runs in hosted CI"
 output = Path(os.environ["OMNIGENT_E2E_RECORD_DIR"])
@@ -33,12 +27,34 @@ assert binary is not None
 version = subprocess.check_output([binary, "--version"], text=True).strip()
 assert version == "codex-cli 0.154.0", version
 observation: dict[str, Any] = {"cli_version": version, "frames": []}
+scenario: Any = None
+post_session: Any = None
+read_state: Any = None
+wait_pane: Any = None
 
 
 class CaptureConfig:
+    def pytest_collection_modifyitems(self, items: list[Any]) -> None:
+        global scenario, post_session, read_state, wait_pane
+        assert len(items) == 1
+        scenario = items[0].module
+        assert scenario.__name__.endswith("test_codex_native_terminal_recovery_e2e")
+        # Conftest owns data isolation before any bridge module is imported.
+        assert scenario.bridge_dir_for_bridge_id("demo-probe").is_relative_to(
+            Path(os.environ["OMNIGENT_DATA_DIR"])
+        )
+        post_session = scenario.post_operator_session
+        read_state = scenario.read_bridge_state
+        wait_pane = scenario._wait_for_pane_text
+        scenario.post_operator_session = capture_session
+        scenario.read_bridge_state = capture_state
+        scenario._wait_for_pane_text = capture_pane
+
     @pytest.hookimpl(hookwrapper=True)
     def pytest_fixture_setup(self, fixturedef: Any) -> Iterator[None]:
         if fixturedef.argname == "live_server":
+            from omnigent.config import global_config_path
+
             assert os.environ.get("OMNIGENT_CONFIG_HOME")
             path = global_config_path().resolve()
             assert path.is_relative_to(Path.cwd()) or path.is_relative_to(Path("/tmp"))
@@ -53,10 +69,24 @@ class CaptureConfig:
             observation["config_path"] = str(path)
         yield
 
+    @pytest.hookimpl(hookwrapper=True)
+    def pytest_runtest_makereport(self, item: Any) -> Iterator[Any]:
+        result = yield
+        if not result.get_result().failed:
+            return
+        from omnigent.process_logging import redact_log_text
 
-post_session = scenario.post_operator_session
-read_state = scenario.read_bridge_state
-wait_pane = scenario._wait_for_pane_text
+        factory = item.funcargs.get("tmp_path_factory")
+        roots = [Path(os.environ["OMNIGENT_DATA_DIR"])]
+        if factory is not None:
+            roots.append(factory.getbasetemp())
+        for index, root in enumerate(roots):
+            for source in root.rglob("*.log"):
+                target = output / "diagnostics" / str(index) / source.relative_to(root)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(redact_log_text(source.read_text(errors="replace")[-65536:]))
+
+
 current_url: str | None = None
 page: Any = None
 context: Any = None
@@ -76,6 +106,11 @@ def capture_session(post: Any, *args: Any, **kwargs: Any) -> Any:
 
 def frame(name: str) -> None:
     global context, page
+    from tests.e2e_ui.messages.test_native_codex_render_parity import (
+        _open_terminal_view,
+        _wait_terminal_connected,
+    )
+
     assert current_url and browser is not None
     if context is None:
         context = browser.new_context(extra_http_headers=headers, record_video_dir=str(output))
@@ -120,9 +155,6 @@ def capture_pane(socket: str, text: str) -> None:
         context.close()
 
 
-scenario.post_operator_session = capture_session
-scenario.read_bridge_state = capture_state
-scenario._wait_for_pane_text = capture_pane
 junit = Path("artifacts/pytest-attempt-1.xml")
 with sync_playwright() as playwright:
     browser = playwright.chromium.launch(args=["--no-sandbox"])
