@@ -26,6 +26,7 @@ from omnigent.harnesses.claude_native.main import (
     ClaudeNativeUcodeConfig,
     claude_native_model_options,
 )
+from omnigent.harnesses.claude_native.model_switch import supports_session_only_model_switch
 from omnigent.runner.background_titles.service import BACKGROUND_TITLE_INSTRUCTIONS
 from tests._helpers.host import isolated_host
 from tests._helpers.native_session import create_native_session
@@ -1077,6 +1078,36 @@ def _live_claude_snapshot(base_url: str, session_id: str) -> dict:
     return response.json()
 
 
+def _require_session_only_claude(base_url: str, session_id: str) -> None:
+    version: object = None
+
+    def version_reported() -> bool:
+        nonlocal version
+        snapshot = _live_claude_snapshot(base_url, session_id)
+        bridge_id = snapshot["labels"].get(BRIDGE_ID_LABEL_KEY) or session_id
+        bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        native_session = read_claude_session_id(bridge_dir)
+        try:
+            raw = json.loads((bridge_dir / CONTEXT_RAW_FILE).read_text())
+        except (OSError, ValueError):
+            return False
+        if (
+            not isinstance(raw, dict)
+            or not native_session
+            or raw.get("session_id") != native_session
+        ):
+            return False
+        version = raw.get("version")
+        return isinstance(version, str) and bool(version)
+
+    poll_until(version_reported, timeout_s=30, interval_s=0.1)
+    if not supports_session_only_model_switch(version):
+        pytest.skip(
+            "session-only model selection requires stable Claude Code 2.1.323+; "
+            f"the running session reports {version!r}"
+        )
+
+
 def _open_live_claude_model_menu(page: Page, entry: str = "gear") -> None:
     if entry == "hotkey":
         page.get_by_placeholder("Send a message…").focus()
@@ -1275,6 +1306,7 @@ def test_claude_native_picker_repeated_pins_reach_the_real_terminal(
     page.goto(f"{base_url}/c/{session_id}")
     _open_terminal_view(page)
     _wait_terminal_connected(page)
+    _require_session_only_claude(base_url, session_id)
     _ensure_chat_view(page)
     poll_until(
         lambda: (
@@ -1364,6 +1396,7 @@ def test_claude_native_refusal_preserves_a_newer_same_model_selection(
             page.goto(f"{live_server}/c/{session_id}")
             _open_terminal_view(page)
             _wait_terminal_connected(page)
+            _require_session_only_claude(live_server, session_id)
             _ensure_chat_view(page)
             reset_mock_llm(mock_llm_server_url)
             nonce = uuid.uuid4().hex[:8]

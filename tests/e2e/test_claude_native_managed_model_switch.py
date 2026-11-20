@@ -272,6 +272,11 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
                 await _wait_for_model(bridge_dir, model, socket_path)
                 await poll_until_async(lambda: _saved_model_matches(settings_path, _INITIAL_MODEL))
                 assert _status_model_matches(bridge_dir, model)
+                if model.lower().endswith("[1m]"):
+                    context = bridge.read_claude_context_state(bridge_dir)
+                    assert context is not None and context["context_window_size"] == 1_000_000, (
+                        context
+                    )
             await asyncio.to_thread(bridge.inject_slash_command, bridge_dir, command="/model")
             open_picker = await _wait_for_picker(socket_path)
             (tmp_path / "open-model-picker.txt").write_text(open_picker)

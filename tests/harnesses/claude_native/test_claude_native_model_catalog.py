@@ -31,6 +31,8 @@ def _isolated_model_probe_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
     monkeypatch.delenv("OMNIGENT_CLAUDE_LAUNCHER", raising=False)
+    for alias in ("OPUS", "SONNET", "HAIKU", "FABLE"):
+        monkeypatch.delenv(f"ANTHROPIC_DEFAULT_{alias}_MODEL", raising=False)
     monkeypatch.setattr("omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ())
 
 

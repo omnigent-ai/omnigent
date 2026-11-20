@@ -7,7 +7,7 @@ import json
 import time
 import uuid
 from collections.abc import Awaitable, Callable
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -1864,11 +1864,14 @@ async def _post_claude_control(
 
 
 @pytest.mark.parametrize("pane_status", ["idle", "running"], ids=["idle", "busy"])
+@pytest.mark.parametrize("bound", [False, True], ids=["catalog", "bound"])
 async def test_events_model_change_requires_the_same_immediate_picker_receipt(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, pane_status: str
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, pane_status: str, bound: bool
 ) -> None:
+    from omnigent.inference_config import inference_config_scope
     from omnigent.runner.app import _session_event_queues_ref
 
+    selected = "private-claude-opus[1m]" if bound else "claude-opus-4-7"
     calls: list[str] = []
 
     async def drain_creation_events(_client: httpx.AsyncClient) -> None:
@@ -1883,16 +1886,30 @@ async def test_events_model_change_requires_the_same_immediate_picker_receipt(
             model, model, model, model, "native-session"
         )
 
-    response = await _post_claude_control(
-        monkeypatch,
-        tmp_path,
-        select,
-        pane_status=pane_status,
-        before_control=drain_creation_events,
-    )
+    config = {
+        "providers": {"gateway": {"kind": "gateway"}},
+        "inference": {
+            "harnesses": {
+                "claude-native": {
+                    "provider": "gateway",
+                    "default_model": selected,
+                    "model_allowlist": [selected],
+                }
+            }
+        },
+    }
+    with inference_config_scope(config) if bound else nullcontext():
+        response = await _post_claude_control(
+            monkeypatch,
+            tmp_path,
+            select,
+            model=selected,
+            pane_status=pane_status,
+            before_control=drain_creation_events,
+        )
 
     assert response.status_code == 204, response.text
-    assert calls == ["claude-opus-4-7"]
+    assert calls == [selected]
     assert _drain_session_event_queue(_session_event_queues_ref.get(_BOOT_SESSION_ID)) == []
 
 
@@ -2042,39 +2059,6 @@ async def test_events_model_change_refuses_unsupported_queued_or_unconfirmed_sta
             else "claude_native_model_failed"
         )
         assert "inspect the terminal" in response.json()["detail"]
-
-
-async def test_bound_claude_switch_preserves_private_model_id(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    from omnigent.inference_config import inference_config_scope
-
-    selected = "private-claude-opus[1m]"
-    calls: list[str] = []
-
-    def select(_bridge: Path, *, model: str, **kwargs: Any) -> Any:
-        calls.append(model)
-        return claude_native_bridge.ClaudeModelSwitchResult(
-            model, model, model, model, "native-session"
-        )
-
-    config = {
-        "providers": {"gateway": {"kind": "gateway"}},
-        "inference": {
-            "harnesses": {
-                "claude-native": {
-                    "provider": "gateway",
-                    "default_model": selected,
-                    "model_allowlist": [selected],
-                }
-            }
-        },
-    }
-    with inference_config_scope(config):
-        response = await _post_claude_control(monkeypatch, tmp_path, select, model=selected)
-
-    assert response.status_code == 204, response.text
-    assert calls == [selected]
 
 
 @pytest.mark.parametrize("catalog_source", ["cached", "stored"])
