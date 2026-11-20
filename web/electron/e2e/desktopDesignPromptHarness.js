@@ -53,7 +53,7 @@ async function jsonRequest(url, init) {
   return JSON.parse(body);
 }
 
-async function startDesignBackend(tmpDir) {
+async function startDesignBackend(tmpDir, { serverEnv = {} } = {}) {
   assert.ok(fs.existsSync(path.join(WEB_UI_DIST, "index.html")), "Build the real web SPA first");
   const children = [];
   const logHandles = [];
@@ -124,7 +124,7 @@ async function startDesignBackend(tmpDir) {
         "--artifact-location",
         path.join(tmpDir, "artifacts"),
       ],
-      { ...providerEnv, OMNIGENT_WEB_UI_DIST: WEB_UI_DIST },
+      { ...providerEnv, OMNIGENT_WEB_UI_DIST: WEB_UI_DIST, ...serverEnv },
     );
     await eventually(() => jsonRequest(`${serverUrl}/health`), "real Omnigent server", 60_000);
 
@@ -180,7 +180,7 @@ async function startDesignBackend(tmpDir) {
     };
     const otherSessionId = await createSession();
     const sessionId = await createSession();
-    return { serverUrl, sessionId, otherSessionId, mockUrl, close };
+    return { serverUrl, sessionId, otherSessionId, mockUrl, createSession, close };
   } catch (error) {
     await close();
     throw error;
