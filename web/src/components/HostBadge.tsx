@@ -101,6 +101,7 @@ export function HostBadge({
   starting = false,
   appearance = "status",
   readOnly = false,
+  launch: sessionLaunch,
 }: {
   sessionId: string;
   onReconnect?: () => void;
@@ -108,6 +109,8 @@ export function HostBadge({
   starting?: boolean;
   appearance?: "status" | "composer" | "header";
   readOnly?: boolean;
+  /** A grid cell passes its own session's launch; defaults to the open session's. */
+  launch?: SandboxStatus | null;
 }) {
   const [switchOpen, setSwitchOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
@@ -120,7 +123,8 @@ export function HostBadge({
 
   const host = hostId ? hosts?.find((h) => h.host_id === hostId) : undefined;
   // The open session's sandbox launch, which its chat progress banners also show.
-  const launch = useChatStore((s) => (s.conversationId === sessionId ? s.sandboxStatus : null));
+  const openLaunch = useChatStore((s) => (s.conversationId === sessionId ? s.sandboxStatus : null));
+  const launch = sessionLaunch === undefined ? openLaunch : sessionLaunch;
 
   // Host liveness is keyed by SESSION, not by host, and comes from a ~10s
   // poll. A host switch repoints `hostId` as soon as the session snapshot

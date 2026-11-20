@@ -4,7 +4,7 @@
 
 import { createContext, type ReactElement, type ReactNode, useContext, useMemo } from "react";
 
-import { type SettingsEntry, settingsEntryMember } from "./catalog/types";
+import { SETTINGS_MAIN_CONTROL, type SettingsEntry, settingsEntryMember } from "./catalog/types";
 import {
   type SettingsAlternativeName,
   settingsControlId,
@@ -28,7 +28,7 @@ export function SettingsControl({
   part?: string;
   children: ReactElement;
 }) {
-  const id = useMemo(() => settingsControlId(entry, part), [entry, part]);
+  const id = useMemo(() => settingsControlId(entry, part ?? SETTINGS_MAIN_CONTROL), [entry, part]);
   return (
     <div className="contents" data-settings-widget={id}>
       <SettingsWidgetContext.Provider value={id}>{children}</SettingsWidgetContext.Provider>
@@ -92,12 +92,18 @@ export function SettingsContent({
   );
 }
 
+/**
+ * A `title` for an owned control that adds no tooltip. The wrapper otherwise sets the tooltip to
+ * the control's name, which would show Settings a hover its shared control never had.
+ */
+export const SETTINGS_NO_TOOLTIP = { title: "" } as const;
+
 /** Props for a dialog's or popover's content, linking it to the part that opens it. */
 export function settingsOverlayProps(
   entry: SettingsEntry,
   part?: string,
 ): { "data-settings-overlay-owner": string } {
-  return { "data-settings-overlay-owner": settingsControlId(entry, part) };
+  return { "data-settings-overlay-owner": settingsControlId(entry, part ?? SETTINGS_MAIN_CONTROL) };
 }
 
 /**
@@ -316,7 +322,7 @@ function makeOverlayParts(owner: SettingsOverlayOwnerValue | null): SettingsOver
         ? { ...props, title: options?.title ?? name }
         : props;
     },
-    overlay: () => settingsOverlayProps(entry, opener || undefined),
+    overlay: () => settingsOverlayProps(entry, opener),
     within: (members, withinOpener) => {
       const member = settingsEntryMember(entry);
       const inside =

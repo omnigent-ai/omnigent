@@ -67,7 +67,7 @@ function FixtureRow({ entry, mountAfter = 0 }: { entry: SettingsEntry; mountAfte
   if (!mounted) return null;
   return (
     <section data-settings-item={entry.id} ref={rowRef}>
-      <button type="button" data-settings-control={entry.id}>
+      <button type="button" data-settings-control={`${entry.id}:`}>
         Toggle
       </button>
       <input data-settings-control={`${entry.id}:field`} aria-label="Field" />

@@ -46,7 +46,8 @@ import { useIdleNotifications } from "@/hooks/useIdleNotifications";
 import { useSeedReadState } from "@/hooks/useUnseenConversations";
 import { useToggleUnreadHotkey } from "@/hooks/useToggleUnreadHotkey";
 import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
-import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { DESKTOP_VIEWPORT_QUERY, useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useIsSideBySideSidebarViewport } from "@/hooks/useIsSideBySideSidebarViewport";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
 import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
@@ -122,6 +123,7 @@ import {
 } from "@/lib/nativeCodingAgents";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled, isSingleUserMode, SHARING_OFF_REASON } from "@/lib/capabilities";
+import { useProjectKanbanEnabled } from "@/lib/projectKanbanPreferences";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import { holdsInitialDraft, isTempConvId, useChatStore } from "@/store/chatStore";
 import { useSessionTasksActions } from "@/store/sessionTasksActions";
@@ -136,6 +138,8 @@ import {
 import { useResizableInlinePanel } from "@/hooks/useResizableInlinePanel";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { ChatHeader } from "./ChatHeader";
+import { ProjectHomeHeaderActions, ProjectHomeTitle } from "@/projectHome/ProjectHomeHeader";
+import { projectNameFromHomePath } from "@/projectHome/projectHomeNavigation";
 import { MobileHeaderControlsProvider } from "./MobileHeaderControlsSlot";
 import { CREATED_BY_SESSION_LABEL_KEY } from "./CreatedBySession";
 import {
@@ -151,6 +155,7 @@ import { SubagentPanelOpenerContext } from "./subagentPanelOpener";
 import { isMobileViewport, Sidebar } from "./Sidebar";
 import { SidebarHeaderActions } from "./SidebarHeaderActions";
 import { useSettingsRoute } from "./settingsNav";
+import { useOpenSidebarForSettingsSearch } from "./settingsSearch/settingsSearchFocus";
 import { isCachedAncestor, useRootSessionId, useSession } from "@/hooks/useSession";
 import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
 import {
@@ -169,7 +174,12 @@ import { resolveDefaultShell } from "./preferredShell";
 import { WorkspacePanel } from "./WorkspacePanel";
 import { SessionRail } from "./SessionRail";
 import { TasksTabOnOpen } from "./TasksTabOnOpen";
-import { SessionCostButton, SessionOverview, useIsWideViewport } from "./SessionOverview";
+import {
+  SessionCostButton,
+  SessionOverview,
+  useDockedOverviewOpen,
+  useIsWideViewport,
+} from "./SessionOverview";
 import type { RightRailTab } from "./railTabs";
 
 /**
@@ -448,9 +458,21 @@ function AppShellImpl() {
     }
   }, [inSettings, location.pathname, rebasePath, setSidebarOpen]);
 
+  // ⌘K's "Search settings…" opens the sidebar so its field can be seen. From outside Settings the
+  // sidebar's state is recorded first, so Back restores a collapsed sidebar, as after any other trip.
+  useOpenSidebarForSettingsSearch(() => {
+    setSidebarOpen((wasOpen) => {
+      if (!inSettings && sidebarOpenBeforeSettingsRef.current === null) {
+        sidebarOpenBeforeSettingsRef.current = wasOpen;
+      }
+      return true;
+    });
+  });
+
   // Below md an open sidebar is a full-window drawer, so narrowing closes it
   // (except the settings menu) and remembers the desktop state for widening.
   const mobileViewport = useIsMobileViewport();
+  const sideBySideSidebar = useIsSideBySideSidebarViewport();
   const atSettingsRoot =
     inSettings && location.pathname.replace(/\/$/, "") === rebasePath("/settings");
   const lastMobileViewportRef = useRef(mobileViewport);
@@ -850,6 +872,12 @@ function AppShellImpl() {
     isChildSession && activeSession?.parentSessionId
       ? `/c/${activeSession.parentSessionId}`
       : undefined;
+  const projectKanban = useProjectKanbanEnabled();
+  const projectHomeName =
+    extensionId === undefined && projectKanban ? projectNameFromHomePath(location.pathname) : null;
+  // Beside a docked tablet sidebar the header is empty on plain pages, so they skip its clearance.
+  const headerClearanceHidden =
+    sideBySideSidebar && sidebarOpen && !conversationId && projectHomeName === null && !canvasMode;
   // Positive "this is a top-level session" signal for the top-level-only
   // actions (Share/Clone). Gating those on ``!isChildSession`` flickered:
   // while the snapshot loads ``activeSession`` is null, so ``isChildSession``
@@ -2985,7 +3013,7 @@ function AppShellImpl() {
     !filesPanelOpen,
   );
   // WIP(session_overview): docks beside chat when a wide window leaves the right side
-  // free; otherwise the header cost opens it over chat.
+  // free; otherwise it opens as a popover from the header cost.
   const sessionOverviewEnabled =
     serverConversationId !== undefined && isFeatureEnabled(serverInfo, "session_overview");
   const wideViewport = useIsWideViewport();
@@ -2996,17 +3024,21 @@ function AppShellImpl() {
     !executionLogsOpen &&
     !filesPanelOpen &&
     !canvasMode;
-  const [sessionOverviewDockedOpen, setSessionOverviewDockedOpen] = useState(true);
+  const [sessionOverviewDockedOpen, setSessionOverviewDockedOpen] = useDockedOverviewOpen();
   const [sessionOverviewOverlayOpen, setSessionOverviewOverlayOpen] = useState(false);
   const sessionOverviewOpen =
     sessionOverviewEnabled &&
     (sessionOverviewDocked ? sessionOverviewDockedOpen : sessionOverviewOverlayOpen);
-  const toggleSessionOverview = useCallback(() => {
-    const setOpen = sessionOverviewDocked
-      ? setSessionOverviewDockedOpen
-      : setSessionOverviewOverlayOpen;
-    setOpen((open) => !open);
-  }, [sessionOverviewDocked]);
+  const setSessionOverviewOpen = sessionOverviewDocked
+    ? setSessionOverviewDockedOpen
+    : setSessionOverviewOverlayOpen;
+  // One card for both placements; only one of them mounts it at a time.
+  const sessionOverviewCard = (
+    <SessionOverview
+      onClose={() => setSessionOverviewOpen(false)}
+      changesSessionId={showFilesPanel ? serverConversationId : undefined}
+    />
+  );
   useEffect(() => {
     if (!workspacePanelVisible || !focusWorkspaceTabsOnOpenRef.current) return;
     focusWorkspaceTabsOnOpenRef.current = false;
@@ -3137,6 +3169,7 @@ function AppShellImpl() {
                     "--workspace-panel-offset": workspacePanelVisible
                       ? `${inlinePanelWidth}px`
                       : "0px",
+                    "--omnigent-header-height": headerClearanceHidden ? "0px" : undefined,
                   } as CSSProperties
                 }
               >
@@ -3145,9 +3178,12 @@ function AppShellImpl() {
                     sessionOverviewControl={
                       sessionOverviewEnabled && (
                         <SessionCostButton
-                          expanded={sessionOverviewOpen}
-                          onToggle={toggleSessionOverview}
-                        />
+                          docked={sessionOverviewDocked}
+                          open={sessionOverviewOpen}
+                          onOpenChange={setSessionOverviewOpen}
+                        >
+                          {sessionOverviewCard}
+                        </SessionCostButton>
                       )
                     }
                     // Real docked state — deliberately NOT `|| sidebarPeek`. Peek
@@ -3172,6 +3208,16 @@ function AppShellImpl() {
                     projectName={headerProjectName}
                     projectIcon={headerProjectIcon}
                     titleLinkTo={headerTitleLinkTo}
+                    pageTitle={
+                      projectHomeName !== null ? (
+                        <ProjectHomeTitle projectName={projectHomeName} />
+                      ) : undefined
+                    }
+                    pageActions={
+                      projectHomeName !== null ? (
+                        <ProjectHomeHeaderActions projectName={projectHomeName} />
+                      ) : undefined
+                    }
                     boundAgent={boundAgent}
                     wrapperLabel={wrapperLabel}
                     canShare={canShare}
@@ -3233,6 +3279,7 @@ function AppShellImpl() {
                 )}
                 <GridSessionMain
                   className="relative flex min-h-0 min-w-0 flex-1 flex-col"
+                  data-flyout-boundary=""
                   data-shell-header={extensionOwnsHeader ? "hidden" : "visible"}
                   data-session-id={conversationId}
                 >
@@ -3243,17 +3290,6 @@ function AppShellImpl() {
                       </ShellCommandContext.Provider>
                     </RenderErrorBoundary>
                   </SubagentPanelOpenerContext.Provider>
-                  {sessionOverviewOpen && !sessionOverviewDocked && (
-                    <aside
-                      aria-label="Session overview"
-                      className="absolute right-2 top-12 z-20 w-64 max-md:hidden"
-                    >
-                      <SessionOverview
-                        onClose={toggleSessionOverview}
-                        changesSessionId={showFilesPanel ? serverConversationId : undefined}
-                      />
-                    </aside>
-                  )}
                 </GridSessionMain>
 
                 {sessionOverviewOpen && sessionOverviewDocked && (
@@ -3261,10 +3297,7 @@ function AppShellImpl() {
                     aria-label="Session overview"
                     className="flex w-64 shrink-0 flex-col overflow-y-auto px-2 pb-3 pt-12"
                   >
-                    <SessionOverview
-                      onClose={toggleSessionOverview}
-                      changesSessionId={showFilesPanel ? serverConversationId : undefined}
-                    />
+                    {sessionOverviewCard}
                   </aside>
                 )}
 
@@ -3506,11 +3539,10 @@ function AppShellImpl() {
 
 /**
  * Initial sidebar open state — open on desktop, closed on mobile. SSR-
- * safe (returns false when window is undefined). The threshold (`md`)
- * matches Tailwind's default 768px, used in the Sidebar's responsive
- * classes.
+ * safe (returns false when window is undefined). The threshold is
+ * Tailwind's `md` breakpoint, used in the Sidebar's responsive classes.
  */
 function initialSidebarOpen(): boolean {
   if (typeof window === "undefined") return false;
-  return window.matchMedia("(min-width: 768px)").matches;
+  return window.matchMedia(DESKTOP_VIEWPORT_QUERY).matches;
 }
