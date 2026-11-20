@@ -10556,6 +10556,26 @@ describe("NewChatLandingScreen @-file-mention", () => {
     fireEvent.change(input(), { target: { value: "read @README.md now", selectionStart: 19 } });
     expect(screen.queryByTestId("composer-mention-token")).not.toBeInTheDocument();
   });
+
+  it("brings a token deleted with Backspace back, still tagged, on undo", () => {
+    renderLanding();
+    fireEvent.change(input(), { target: { value: "@", selectionStart: 1 } });
+    fireEvent.click(screen.getByTitle("Attach README.md"));
+    fireEvent.change(input(), { target: { value: "Read @README.md", selectionStart: 15 } });
+    fireEvent.keyDown(input(), { key: "Backspace" });
+    expect(screen.queryByTestId("composer-mention-token")).not.toBeInTheDocument();
+
+    // The textarea's own undo reports itself as a historyUndo input.
+    const textarea = input() as HTMLTextAreaElement;
+    act(() => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(
+        textarea,
+        "Read @README.md",
+      );
+      textarea.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "historyUndo" }));
+    });
+    expect(screen.getByTestId("composer-mention-token").textContent).toBe("@README.md");
+  });
 });
 
 // ---------------------------------------------------------------------------
