@@ -558,11 +558,57 @@ def anthropic_sse_text_response(
     return "".join(events)
 
 
+def _anthropic_thinking_block_events(
+    index: int, thinking: str, signature: str
+) -> list[tuple[str, dict]]:
+    """Return the SSE events for one signed extended-thinking content block."""
+    events: list[tuple[str, dict]] = [
+        (
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": index,
+                "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+            },
+        )
+    ]
+    # Word-chunked deltas so a paced stream (``chunk_delay``) shows the
+    # thought arriving progressively, the way a real thinking turn does.
+    words = thinking.split(" ")
+    for at in range(0, len(words), 6):
+        events.append(
+            (
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {
+                        "type": "thinking_delta",
+                        "thinking": " ".join(words[at : at + 6]) + " ",
+                    },
+                },
+            )
+        )
+    events.append(
+        (
+            "content_block_delta",
+            {
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {"type": "signature_delta", "signature": signature},
+            },
+        )
+    )
+    events.append(("content_block_stop", {"type": "content_block_stop", "index": index}))
+    return events
+
+
 def anthropic_sse_thinking_text_response(
     thinking: str,
     text: str,
     model: str = "mock-model",
     usage: dict | None = None,
+    signature: str = "mock-signature",
 ) -> str:
     """Build Anthropic Messages API SSE stream: a thinking block, then text.
 
@@ -576,6 +622,7 @@ def anthropic_sse_thinking_text_response(
     :param text: The final assistant text streamed after the thought.
     :param usage: Optional prompt-usage overrides merged into
         ``message_start`` (see :func:`anthropic_sse_text_response`).
+    :param signature: Signature attached to the thinking block.
     """
     msg_id = f"msg_{_uuid_mod.uuid4().hex[:12]}"
     output_tokens = max(5, len(text.split()) + len(thinking.split()))
@@ -601,38 +648,8 @@ def anthropic_sse_thinking_text_response(
             },
         },
     )
-    _evt(
-        "content_block_start",
-        {
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {"type": "thinking", "thinking": "", "signature": ""},
-        },
-    )
-    # Word-chunked deltas so a paced stream (``chunk_delay``) shows the
-    # thought arriving progressively, the way a real thinking turn does.
-    words = thinking.split(" ")
-    for at in range(0, len(words), 6):
-        _evt(
-            "content_block_delta",
-            {
-                "type": "content_block_delta",
-                "index": 0,
-                "delta": {
-                    "type": "thinking_delta",
-                    "thinking": " ".join(words[at : at + 6]) + " ",
-                },
-            },
-        )
-    _evt(
-        "content_block_delta",
-        {
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "signature_delta", "signature": "mock-signature"},
-        },
-    )
-    _evt("content_block_stop", {"type": "content_block_stop", "index": 0})
+    for evt_type, data in _anthropic_thinking_block_events(0, thinking, signature):
+        _evt(evt_type, data)
     _evt(
         "content_block_start",
         {
@@ -665,8 +682,14 @@ def anthropic_sse_thinking_text_response(
 def anthropic_sse_tool_call_response(
     tool_calls: list[dict[str, str]],
     model: str = "mock-model",
+    thinking: str | None = None,
+    signature: str = "mock-signature",
 ) -> str:
-    """Build Anthropic Messages API SSE stream for tool use blocks."""
+    """Build Anthropic Messages API SSE stream for tool use blocks.
+
+    :param thinking: Optional thought streamed as a thinking block before the tools.
+    :param signature: Signature attached to that thinking block.
+    """
     msg_id = f"msg_{_uuid_mod.uuid4().hex[:12]}"
     events: list[str] = []
 
@@ -689,7 +712,12 @@ def anthropic_sse_tool_call_response(
             },
         },
     )
-    for idx, tc in enumerate(tool_calls):
+    first_tool_index = 0
+    if thinking:
+        for evt_type, data in _anthropic_thinking_block_events(0, thinking, signature):
+            _evt(evt_type, data)
+        first_tool_index = 1
+    for idx, tc in enumerate(tool_calls, start=first_tool_index):
         tool_id = tc.get("call_id", f"toolu_{_uuid_mod.uuid4().hex[:12]}")
         _evt(
             "content_block_start",
@@ -860,6 +888,8 @@ class QueuedResponse:
     # this text before the ``text`` block — scripts a turn where the model
     # visibly thinks before answering.
     thinking: str | None = None
+    # Signature on that thinking block; Claude Code derives block kinds from it.
+    thinking_signature: str = "mock-signature"
     # Seconds to sleep between SSE events on ``/v1/messages`` and
     # ``/v1/responses``. ``0`` keeps the historical single-chunk body; a small
     # value paces the stream so live surfaces (the web SPA, a native TUI)
@@ -1293,6 +1323,14 @@ async def create_message(
             extra["stop_details"] = {"type": "refusal", "category": qr.refusal_category}
             output_tokens = 5
         elif qr.tool_calls:
+            if qr.thinking:
+                content.append(
+                    {
+                        "type": "thinking",
+                        "thinking": qr.thinking,
+                        "signature": qr.thinking_signature,
+                    }
+                )
             content.extend(
                 {
                     "type": "tool_use",
@@ -1307,7 +1345,11 @@ async def create_message(
         else:
             if qr.thinking:
                 content.append(
-                    {"type": "thinking", "thinking": qr.thinking, "signature": "mock-signature"}
+                    {
+                        "type": "thinking",
+                        "thinking": qr.thinking,
+                        "signature": qr.thinking_signature,
+                    }
                 )
             content.append({"type": "text", "text": qr.text})
         return JSONResponse(
@@ -1326,10 +1368,19 @@ async def create_message(
     if qr.refusal_category is not None:
         sse_body = anthropic_sse_refusal_response(model=echo_model, category=qr.refusal_category)
     elif qr.tool_calls:
-        sse_body = anthropic_sse_tool_call_response(qr.tool_calls, model=echo_model)
+        sse_body = anthropic_sse_tool_call_response(
+            qr.tool_calls,
+            model=echo_model,
+            thinking=qr.thinking,
+            signature=qr.thinking_signature,
+        )
     elif qr.thinking:
         sse_body = anthropic_sse_thinking_text_response(
-            qr.thinking, qr.text, model=echo_model, usage=qr.usage
+            qr.thinking,
+            qr.text,
+            model=echo_model,
+            usage=qr.usage,
+            signature=qr.thinking_signature,
         )
     else:
         sse_body = anthropic_sse_text_response(qr.text, model=echo_model, usage=qr.usage)
@@ -1606,6 +1657,7 @@ async def configure(request: Request) -> dict[str, object]:
                     usage=entry.get("usage"),
                     refusal_category=entry.get("refusal_category"),
                     thinking=entry.get("thinking"),
+                    thinking_signature=entry.get("thinking_signature", "mock-signature"),
                     chunk_delay=entry.get("chunk_delay", 0.0),
                 )
             )
