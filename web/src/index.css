@@ -92,6 +92,8 @@
   --color-destructive-foreground: var(--destructive-foreground);
   --color-success: var(--success);
   --color-warning: var(--warning);
+  /* Matched text that finders make prominent, readable on popovers and their active row. */
+  --color-search-match: var(--search-match-foreground);
   --color-info: var(--info);
   /* Dedicated blue for the sub-agent "session active / idle-alive" states
      * (launching/idle/done) — distinct from the shared amber --warning (still
@@ -275,6 +277,8 @@
   --success: #2ea65c;
   --warning: #d4972a;
   --info: #3b8ff5;
+  /* The warning amber, deepened to read as text on every palette's popover. */
+  --search-match-foreground: #7b5300;
   /* Session active / idle-alive blue — a deeper, saturated azure
      * that harmonizes with the brand blues (#2272b4 / #3b8ff5) and reads
      * with strong contrast on the white card surface. */
@@ -338,6 +342,8 @@
   --success: #2ea65c;
   --warning: #d4972a;
   --info: #3b8ff5;
+  /* The warning amber, lightened to read as text on every dark palette's popover. */
+  --search-match-foreground: #efb14a;
   /* Session active / idle-alive blue, lightened for the dark glass card so
      * the small dot keeps adequate contrast against the dark canvas (the
      * light-mode #2f7fd4 reads too dim here). */

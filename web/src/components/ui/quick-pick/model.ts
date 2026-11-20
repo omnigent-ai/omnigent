@@ -20,6 +20,8 @@ export interface QuickPickItem<Value = unknown> {
   /** Section heading label; items sharing one appear together in source order. */
   group?: string;
   icon?: ReactNode;
+  /** Quiet trailing text, such as a setting's current value. */
+  detail?: string;
   /** Quiet trailing content, such as a badge or an agent name. */
   accessory?: ReactNode;
   /** Key caps shown at the trailing edge, such as `["⌘", "K"]`. */
@@ -30,6 +32,18 @@ export interface QuickPickItem<Value = unknown> {
   highlights?: { label?: readonly MatchRange[]; description?: readonly MatchRange[] };
   /** How this row's matched text stands out; defaults to the picker's highlight. */
   matchHighlight?: MatchHighlight;
+  /** Ends or removes something, so it's styled as a menu's destructive item is. */
+  destructive?: boolean;
+  /** Accepting the item opens a child page; a chevron marks it, and Right Arrow opens it. */
+  opensPage?: boolean;
+  /** Defaults to true; a free-text item is never remembered. */
+  rememberInHistory?: boolean;
+  /**
+   * With `sourcesFirst`, whether this item matching the query can move the items ahead of the
+   * sources. False for a label that names the user's data, such as a pull request's title, so
+   * a word from that title doesn't push the matching sessions down. Defaults to true.
+   */
+  leadsSources?: boolean;
   value: Value;
 }
 
@@ -38,6 +52,56 @@ export interface QuickPickItem<Value = unknown> {
  * - `provider`: the caller already filtered and ordered items for the query, such as a server search.
  */
 export type QuickPickRanking = "client" | "provider";
+
+export interface QuickPickLoadRequest<Value = unknown> {
+  query: string;
+  /** Aborted when a newer query, reload, or close supersedes this request. */
+  signal: AbortSignal;
+  /**
+   * Shows a partial snapshot while loading continues, for results that stream
+   * in. Each call replaces the previous snapshot; the settled value is final.
+   * Calls after abort or completion are ignored.
+   */
+  publish: (items: readonly QuickPickItem<Value>[]) => void;
+}
+
+/** Items a picker loads itself, such as a search that answers each query. */
+export interface QuickPickSource<Value = unknown> {
+  /**
+   * Stable identity; changing it resets the source's results. A new object with
+   * the same `id` does not reload, so callers need not memoize sources.
+   */
+  id: string;
+  load: (
+    request: QuickPickLoadRequest<Value>,
+  ) => readonly QuickPickItem<Value>[] | Promise<readonly QuickPickItem<Value>[]>;
+  /** Run `load` again as the query changes. Defaults to false (load once per open). */
+  queryDependent?: boolean;
+  /**
+   * Delay before a query-dependent reload. Previous results stay visible
+   * meanwhile, except provider-ranked ones, which match only their own query.
+   */
+  debounceMs?: number;
+  /** Changing this reloads the source and keeps its previous results visible. */
+  reloadKey?: string;
+  /**
+   * What the rows answer besides the query, such as search options. Changing it
+   * reloads after the debounce and, like a new query, hides the rows meanwhile.
+   */
+  resultKey?: string;
+  ranking?: QuickPickRanking;
+}
+
+export type QuickPickSourceStatus = "loading" | "ready" | "error";
+
+export interface QuickPickSourceState<Value = unknown> {
+  status: QuickPickSourceStatus;
+  /** Last successful results; retained while a newer load is in flight. */
+  items: readonly QuickPickItem<Value>[];
+  error?: string;
+  /** Duration of the most recent completed load. */
+  elapsedMs?: number;
+}
 
 export interface QuickPickHeadingRow {
   kind: "heading";
@@ -51,9 +115,39 @@ export interface QuickPickItemRow<Value = unknown> {
   item: QuickPickItem<Value>;
   labelRanges: readonly MatchRange[];
   descriptionRanges: readonly MatchRange[];
+  /** The heading the row is listed under, absent for a row outside any group. */
+  headingKey?: string;
+  /** True for the item made from the typed query. */
+  isFreeText: boolean;
+  /** The item's group, shown on the row when ranked rows from several groups interleave. */
+  sectionLabel?: string;
 }
 
 export type QuickPickRow<Value = unknown> = QuickPickHeadingRow | QuickPickItemRow<Value>;
 
-/** Returning `"keepOpen"` from `onAccept` leaves a dialog open, such as after loading more rows. */
-export type QuickPickAcceptResult = void | "keepOpen";
+/** Inline feedback when typed text cannot become an item. */
+export interface QuickPickInputError {
+  error: string;
+}
+
+export interface QuickPickStats {
+  /** Selectable results currently shown. */
+  resultCount: number;
+  /** True while any source is still loading. */
+  loading: boolean;
+  /** Slowest completed source load for the current results. */
+  elapsedMs?: number;
+}
+
+export interface QuickPickAcceptDetails {
+  /** ⌘↵ / Ctrl+↵ or a modified click. */
+  alternate: boolean;
+}
+
+/**
+ * What an accept asks of the wrapper around the picker, which owns closing. `"keepOpen"` asks
+ * it to stay open, such as after loading more rows; `{ afterClose }` asks it to run `afterClose`
+ * once it has closed and restored focus, so an action that moves focus keeps it. The picker
+ * itself only refreshes its recents on `"keepOpen"`.
+ */
+export type QuickPickAcceptResult = void | "keepOpen" | { afterClose: () => void };
