@@ -7987,7 +7987,13 @@ def _make_transport_with_process(returncode):
 
     class _Transport:
         def __init__(self):
-            self._process = SimpleNamespace(returncode=returncode, pid=4242, wait=AsyncMock())
+            self._process = SimpleNamespace(
+                returncode=returncode,
+                pid=None,
+                wait=AsyncMock(),
+                terminate=Mock(),
+                kill=Mock(),
+            )
             self._stdout_stream = None
             self._stdin_stream = None
             self._stderr_stream = None

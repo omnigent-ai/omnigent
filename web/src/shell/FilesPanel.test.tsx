@@ -1,3 +1,4 @@
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { type ComponentProps, useState } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
@@ -1513,6 +1514,19 @@ describe("FilesPanel scroll position persistence", () => {
     if (!section) throw new Error("scroll section not found");
     return { result, section };
   }
+
+  it("windows the Changes list against the same scroll container", () => {
+    const { container } = renderPanel({
+      conversationId: "conv_scroll_changes",
+      flatView: true,
+      files: [],
+      changedFiles: [changedFile("src/app.ts")],
+    });
+
+    const section = container.querySelector("section");
+    expect(section).not.toBeNull();
+    expect(vi.mocked(useVirtualizer).mock.lastCall?.[0].getScrollElement()).toBe(section);
+  });
 
   it("restores the saved scroll position when returning to a conversation", () => {
     const files = Array.from({ length: 50 }, (_, i) => file(`file-${i}.ts`));

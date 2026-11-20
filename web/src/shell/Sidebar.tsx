@@ -23,7 +23,7 @@ import {
   useProjectFolderPageSize,
 } from "@/lib/projectFolderPaginationPreferences";
 import { useSessionRowQuickActions } from "@/lib/sessionRowQuickActionsPreferences";
-import { useCuratedOutHarnesses } from "@/hooks/useCuratedOutHarnesses";
+import { offersAnyHarness, useCuratedOutHarnesses } from "@/hooks/useCuratedOutHarnesses";
 import { useInertRef } from "@/hooks/useInertRef";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { useMenuGuardedTooltip } from "@/hooks/useMenuGuardedTooltip";
@@ -246,7 +246,7 @@ import {
 import { collectUnreadInboxItems } from "@/lib/inbox";
 import { cn } from "@/lib/utils";
 import { useOmnigentAnalytics } from "@/lib/analytics";
-import { DESKTOP_VIEWPORT_QUERY, useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { isDesktopLayout, useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import {
   isSideBySideSidebarViewport,
   useIsSideBySideSidebarViewport,
@@ -324,7 +324,7 @@ import {
 import { SidebarServerPicker } from "./SidebarServerPicker";
 import { isRowFullyVisible } from "./sidebarRowVisibility";
 import { useHarnessLabels } from "@/lib/agentLabels";
-import { NATIVE_CODING_AGENTS, nativeCodingAgentForSession } from "@/lib/nativeCodingAgents";
+import { nativeCodingAgentForSession } from "@/lib/nativeCodingAgents";
 import { usePullRequestInfo } from "@/hooks/usePullRequests";
 import {
   getPullRequestStatus,
@@ -1366,7 +1366,7 @@ function SidebarImpl({
           <SettingsSidebar
             onNavClick={onNavClick}
             onCollapse={sideBySide ? onClose : undefined}
-            harnessesOffered={curatedOutHarnesses.size < NATIVE_CODING_AGENTS.length}
+            harnessesOffered={offersAnyHarness(curatedOutHarnesses)}
             onNavigate={onSearchNavigate}
           />
         ) : (
@@ -1562,7 +1562,12 @@ function SidebarImpl({
                         inboxCountIncomplete,
                         inboxCountCapped,
                       )}
-                      className="ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-primary-cta px-1 text-sm text-primary-cta-foreground tabular-nums"
+                      className={cn(
+                        "ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[0.75em] font-medium text-[var(--sidebar-active-foreground)] tabular-nums",
+                        // The active Inbox row already paints the --sidebar-active wash;
+                        // repainting it on the badge would double-composite to a darker fill.
+                        isInboxPage ? "bg-transparent" : "bg-[var(--sidebar-active)]",
+                      )}
                     >
                       {inboxCount > 0 ? inboxCount : ""}
                       {inboxCountIncomplete || inboxCountCapped ? "+" : ""}
@@ -7032,8 +7037,8 @@ function SessionShortcutHint({ slot, overlayTop }: { slot: number; overlayTop: s
  * Pinning lifts a session out of its project folder into the flat "Pinned"
  * section, dropping the visual project cue the folder provided. Hovering the
  * row surfaces it again: the session title, project name, and optional branch.
- * Mirrors {@link AgentHoverCard}'s Cursor-style placement (right / top-aligned)
- * and the muted, small-icon foreground used elsewhere in the sidebar.
+ * Uses a Cursor-style placement (right / top-aligned) and the muted,
+ * small-icon foreground used elsewhere in the sidebar.
  */
 function PinnedProjectFlyoutContent({
   title,
@@ -8345,7 +8350,7 @@ function BulkActionBar({
  */
 export function isMobileViewport(): boolean {
   if (typeof window === "undefined") return false;
-  return !window.matchMedia(DESKTOP_VIEWPORT_QUERY).matches;
+  return !isDesktopLayout();
 }
 
 // Default collapse state: every section (Pinned / Projects / Chats / Shared)

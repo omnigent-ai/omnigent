@@ -409,8 +409,8 @@ def _markdown_context(
     Only canonical assessment rows require every field to be populated.
     Disclosure balancing supports lowercase <details>/</details> without attributes
     at the first nonblank position; <summary> may share an opening line.
-    Multipart preflight rejects nested lists and container-prefixed or indented
-    fences outside active fences, and keeps ordinary list/quote blocks indivisible.
+    Multipart preflight keeps list/quote blocks, including nested lists, indivisible
+    and rejects container-prefixed or indented fences outside active fences.
     Tables require leading pipes; disclosure summaries must be canonical single-line
     headers that fit indivisibly. Other forms fail closed before multipart publication.
     Unambiguous same-line disclosure code spans stay literal and indivisible.
@@ -431,7 +431,6 @@ def _markdown_context(
     fence_line = ""
     table_header = ""
     assessment_table = False
-    nested_list = False
     previous = ""
     offset = previous_start = 0
     container_start = None
@@ -617,9 +616,6 @@ def _markdown_context(
                     "Polly review container fences are not supported in multipart comments."
                 )
             indentation = len(line) - len(line.lstrip(" \t"))
-            if indentation:
-                marker = container_marker.match(line, indentation)
-                nested_list |= marker is not None and marker[0] != ">"
             blank = not line.strip(" \t\r")
             if (
                 container_start is not None
@@ -934,8 +930,6 @@ def _markdown_context(
     protect_paragraph(len(text))
     if container_start is not None:
         protect_span(container_start, len(text), "Markdown container")
-    if nested_list:
-        raise ValueError("Polly review nested lists are not supported in multipart comments.")
     if raw_end is not None and protected_spans is not None:
         raise ValueError(
             "Polly review unclosed raw HTML blocks are not supported in multipart comments."

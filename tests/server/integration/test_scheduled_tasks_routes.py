@@ -15,10 +15,12 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -56,6 +58,7 @@ from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStor
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
     SqlAlchemyScheduledTaskStore,
 )
+from tests.budgets import budget
 from tests.debug_log_helpers import capture_debug_rows
 from tests.server.conftest import ControllableMockClient
 from tests.server.helpers import FakeSandboxLauncher
@@ -2364,7 +2367,10 @@ async def test_other_users_task_is_not_visible(
     assert listed.json()["scheduled_tasks"] == []
 
 
-@pytest.mark.parametrize("tz", ["Not/A_Timezone", "", "../UTC"])
+_INVALID_TIMEZONES = ["Not/A_Timezone", "", "../UTC", "America"]
+
+
+@pytest.mark.parametrize("tz", _INVALID_TIMEZONES)
 async def test_create_rejects_invalid_timezone(
     auth_client: httpx.AsyncClient, db_uri: str, tz: str
 ) -> None:
@@ -2377,7 +2383,7 @@ async def test_create_rejects_invalid_timezone(
     assert resp.status_code == 400, resp.text
 
 
-@pytest.mark.parametrize("tz", ["Bogus/Zone", "", "../UTC"])
+@pytest.mark.parametrize("tz", _INVALID_TIMEZONES)
 async def test_update_rejects_invalid_timezone(
     auth_client: httpx.AsyncClient, db_uri: str, tz: str
 ) -> None:
@@ -2393,6 +2399,89 @@ async def test_update_rejects_invalid_timezone(
         headers=_headers(),
     )
     assert bad.status_code == 400, bad.text
+
+
+async def test_create_keeps_utc_unless_the_owners_recorded_zone_is_requested(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri, "alice@example.com")
+    _make_user(db_uri, "bob@example.com")
+    unzoned = {
+        key: value
+        for key, value in _create_body().items()
+        if key not in ("timezone", "host_id", "workspace")
+    }
+
+    async def create(email: str, body: dict[str, object]) -> dict[str, object]:
+        resp = await auth_client.post("/v1/scheduled-tasks", json=body, headers=_headers(email))
+        assert resp.status_code == 200, resp.text
+        return resp.json()
+
+    assert (await create("alice@example.com", unzoned))["timezone"] == "UTC"
+    recorded = await auth_client.put(
+        "/v1/scheduled-tasks/default-timezone",
+        json={"timezone": "America/Chicago"},
+        headers=_headers("alice@example.com"),
+    )
+    assert recorded.status_code == 200, recorded.text
+    assert recorded.json() == {"timezone": "America/Chicago"}
+
+    assert (await create("alice@example.com", unzoned))["timezone"] == "UTC"
+    task = await create("alice@example.com", {**unzoned, "timezone": None})
+    assert task["timezone"] == "America/Chicago"
+    next_run = datetime.fromisoformat(str(task["next_run_at"]))
+    assert next_run.astimezone(ZoneInfo("America/Chicago")).hour == 9
+    assert (await create("bob@example.com", unzoned))["timezone"] == "UTC"
+    assert (await create("bob@example.com", {**unzoned, "timezone": None}))["timezone"] == "UTC"
+
+    changed = await auth_client.put(
+        "/v1/scheduled-tasks/default-timezone",
+        json={"timezone": "Asia/Tokyo"},
+        headers=_headers("alice@example.com"),
+    )
+    assert changed.status_code == 200, changed.text
+    retained = await auth_client.get(
+        f"/v1/scheduled-tasks/{task['id']}", headers=_headers("alice@example.com")
+    )
+    assert retained.status_code == 200, retained.text
+    assert retained.json()["timezone"] == "America/Chicago"
+    assert retained.json()["next_run_at"] == task["next_run_at"]
+
+
+async def test_set_default_timezone_reports_unsupported_store(
+    auth_client: httpx.AsyncClient,
+    auth_app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _make_user(db_uri)
+    monkeypatch.setattr(
+        auth_app.state.scheduled_task_store,
+        "set_default_timezone",
+        Mock(side_effect=NotImplementedError("preferences unsupported")),
+    )
+
+    response = await auth_client.put(
+        "/v1/scheduled-tasks/default-timezone",
+        json={"timezone": "America/Chicago"},
+        headers=_headers(),
+    )
+
+    assert response.status_code == 501, response.text
+    assert response.json() == {"detail": "default timezone is not supported"}
+
+
+@pytest.mark.parametrize("tz", _INVALID_TIMEZONES)
+async def test_set_default_timezone_rejects_invalid_timezone(
+    auth_client: httpx.AsyncClient, db_uri: str, tz: str
+) -> None:
+    _make_user(db_uri)
+    resp = await auth_client.put(
+        "/v1/scheduled-tasks/default-timezone",
+        json={"timezone": tz},
+        headers=_headers(),
+    )
+    assert resp.status_code == 400, resp.text
 
 
 async def test_scheduler_synced_on_create_and_delete(
@@ -4550,14 +4639,15 @@ async def test_a_cancelled_create_deletes_the_copy_once_its_writes_settle(
             headers=_headers(),
         )
     )
-    await asyncio.wait_for(entered.wait(), 5)
+    # CI can stall the event loop for several seconds, so the waits scale with CI's budget.
+    await asyncio.wait_for(entered.wait(), budget(5))
     pending.cancel()
     await asyncio.sleep(0)
     # A second cancellation must not interrupt the cleanup.
     pending.cancel()
     release.set()
     with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(pending, 5)
+        await asyncio.wait_for(pending, budget(5))
 
     assert {conv.id for conv in conversations.list_conversations(limit=100).data} == before
     assert len(released) == 1

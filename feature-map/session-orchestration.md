@@ -203,7 +203,8 @@ MCP independent creation.
 
 ### Scripted review sessions
 
-With the server release flag `scripted_sessions` enabled (default off),
+With the server release flag `scripted_sessions` enabled (default on;
+`OMNIGENT_FEATURES=-scripted_sessions` turns it off),
 `sys_session_create` also accepts `placement="host"`, an owned connected
 `host_id`, an absolute `workspace`, and optional
 `git: {branch_name, base_branch}`. The workspace is the source repository;
@@ -228,7 +229,7 @@ requires checking the session before retrying.
 creating a project; `project=""` lists unfiled sessions. Keep the same filter
 when continuing a cursor. The sub-agent view is unchanged.
 
-For a manual check, enable `scripted_sessions` on a test server and obtain an
+For a manual check, use a test server with `scripted_sessions` left on and obtain an
 owned host ID from a session's `sys_session_get_info` response. Create a review
 session with `placement="host"`, that host ID, the repository path,
 `git={"branch_name":"review-example","base_branch":"main"}` and a project ID.
