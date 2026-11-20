@@ -163,6 +163,12 @@ class GitHubPullRequests:
 
         return github_resource._pr_status_before(root, reference, deadline)
 
+    def open_pr_head(self, root: str, reference: PullRequestRef, deadline: float) -> str | None:
+        """Read an open PR's head commit with ``gh pr view`` before ``deadline``."""
+        from omnigent.runner import github_resource
+
+        return github_resource._open_pr_head_before(root, reference, deadline)
+
     def verify_accessible(self, root: str, reference: PullRequestRef) -> None:
         """Raise unless ``gh`` on the host can read the PR."""
         from omnigent.runner import github_resource
