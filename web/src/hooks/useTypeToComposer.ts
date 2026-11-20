@@ -10,6 +10,7 @@ import { useIsEmbedded } from "@/lib/embedded";
 import { getEmbedRoot } from "@/lib/host";
 import { isFocusInDialogOrMenu, isKeyOwningOverlayOpen, isTextEntry } from "@/lib/hotkeys";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
+import { isNativeShell } from "@/lib/nativeBridge";
 
 /** Whether `event` should carry its character into the composer. */
 export function typesIntoComposer(event: KeyboardEvent, conversation: HTMLElement | null): boolean {
@@ -46,9 +47,12 @@ export function useTypeToComposer(
     if (!enabled) return;
     // Bubble phase on window, so a waiting question's capture-phase keys go first.
     const handler = (event: KeyboardEvent): void => {
-      // Embedded, typing in the host page around the app stays there.
+      // Embedded, typing in the host page around the app stays there. A native
+      // shell has no host page, and its unfocusable root leaves a click on
+      // transcript text with focus on the body.
       const embedRoot = getEmbedRoot();
-      if (isEmbedded && (!embedRoot || !event.composedPath().includes(embedRoot))) return;
+      const inHostPage = !embedRoot || !event.composedPath().includes(embedRoot);
+      if (isEmbedded && !isNativeShell() && inHostPage) return;
       if (typesIntoComposer(event, conversation.current)) latest.current();
     };
     window.addEventListener("keydown", handler);

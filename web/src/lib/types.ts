@@ -193,7 +193,7 @@ export type SessionStatus = "idle" | "launching" | "running" | "waiting" | "fail
  * Mirrors `omnigent.server.schemas.SessionEventInput`.
  */
 export type SessionEventInput =
-  | { type: "message"; data: { role: "user"; content: ContentBlock[] } }
+  | { type: "message"; data: { role: "user"; content: ContentBlock[] }; workflow_run_id?: string }
   | { type: "function_call_output"; data: Record<string, unknown> }
   | { type: "approval"; data: Record<string, unknown> }
   | { type: "interrupt"; data?: Record<string, unknown> }
@@ -448,6 +448,8 @@ export interface Session {
    * unpriced, so unknown spend is never displayed as ``$0.00``.
    */
   totalCostUsd?: number | null;
+  /** True when the operator hides USD cost: clear a cached cost, keep tokens. */
+  costHidden?: boolean;
   /**
    * Per-model breakdown of the same subtree usage, keyed by the raw harness
    * model id (e.g. `"claude-sonnet-4-6"`). Each value is the model's token

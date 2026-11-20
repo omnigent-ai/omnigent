@@ -9,6 +9,7 @@ import {
   GitCompareIcon,
   GitForkIcon,
   GitPullRequestIcon,
+  ListChecksIcon,
   InfoIcon,
   ListIcon,
   Maximize2Icon,
@@ -110,6 +111,12 @@ interface MobileSessionMenuProps {
   githubPanelOpen: boolean;
   /** Open the mobile Pull Requests drawer. */
   onOpenGithub: () => void;
+  /** True while the mobile Tasks drawer is open. */
+  tasksPanelOpen: boolean;
+  /** Whether the session has a Tasks tab. */
+  showTasks: boolean;
+  /** Open the mobile Tasks drawer. */
+  onOpenTasks: () => void;
   /** True while the mobile Content search drawer is open. */
   contentSearchPanelOpen: boolean;
   /** Whether workspace content search is available for this session. */
@@ -138,7 +145,7 @@ interface ChatHeaderProps {
   sidebarOpen: boolean;
   /** Open the left sidebar. */
   onOpenSidebar: (peek?: boolean) => void;
-  /** Render the mobile settings-menu return affordance and fade. */
+  /** Render the mobile settings-menu toggle and fade. */
   settingsMode?: boolean;
   /** Whether the active session is a sub-agent (appends its identity). */
   isChildSession: boolean;
@@ -179,6 +186,10 @@ interface ChatHeaderProps {
    * making the title a way back out. ``undefined`` renders it as plain text.
    */
   titleLinkTo?: string;
+  /** Left-slot title for a page with no conversation, such as a project home; makes the header taller. */
+  pageTitle?: ReactNode;
+  /** Right-slot actions for a page with no conversation. */
+  pageActions?: ReactNode;
   /** The bound agent (mcp_servers + policies) for the info popover. */
   boundAgent: Agent | undefined;
   /**
@@ -353,6 +364,8 @@ export function ChatHeader({
   projectName,
   projectIcon,
   titleLinkTo,
+  pageTitle,
+  pageActions,
   boundAgent,
   wrapperLabel,
   canShare,
@@ -375,6 +388,7 @@ export function ChatHeader({
   const isMobile = useIsMobileViewport();
   const canvas = useCanvasWorkspace();
   const { trackClick } = useOmnigentAnalytics();
+  const hasPageTitle = !conversationId && pageTitle !== undefined;
   // Workspace-rail entries (Files · Changes · Agents · Shells · Logs), each
   // opening the matching rail tab as a full-screen drawer. Mobile only: they
   // ride in the header's single kebab rather than a second trigger of their
@@ -391,6 +405,7 @@ export function ChatHeader({
     !mobileMenu.subagentsPanelOpen &&
     !mobileMenu.shellsPanelOpen &&
     !mobileMenu.githubPanelOpen &&
+    !mobileMenu.tasksPanelOpen &&
     !mobileMenu.contentSearchPanelOpen &&
     !mobileMenu.sideChatsPanelOpen &&
     (hasRailContent || mobileMenu.debugMode) ? (
@@ -459,6 +474,16 @@ export function ChatHeader({
               : mobileMenu.agentCount}
           </span>
         </DropdownMenuItem>
+        {mobileMenu.showTasks && (
+          <DropdownMenuItem
+            onSelect={mobileMenu.onOpenTasks}
+            className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
+            data-testid="mobile-tasks-action"
+          >
+            <ListChecksIcon className="size-4" />
+            Tasks
+          </DropdownMenuItem>
+        )}
         {mobileMenu.showSideChats && (
           <DropdownMenuItem
             onSelect={mobileMenu.onOpenSideChats}
@@ -573,8 +598,12 @@ export function ChatHeader({
         // Desktop sessions fade scrolling content behind the header.
         // Mobile keeps only the individual glass button surfaces.
         "chat-header absolute inset-x-0 top-0 z-30 flex h-[76px] md:h-12 items-center justify-between px-4 py-4 md:py-3 md:right-[var(--workspace-panel-offset,0px)]",
-        conversationId && !isMobile && "session-header-glass",
-        settingsMode && "settings-mobile-header",
+        (conversationId || hasPageTitle) && !isMobile && "session-header-glass",
+        // On desktop a page title gets a taller header, with room above it for hover toolbars.
+        hasPageTitle && "md:h-26 md:pt-8 md:pb-0",
+        // Pages scroll under the header without a background, so only its controls take clicks.
+        !conversationId && "pointer-events-none *:pointer-events-auto",
+        settingsMode && !sidebarOpen && "settings-mobile-header",
       )}
     >
       {/* Left slot: sidebar toggle (when sidebar is closed) and a
@@ -639,6 +668,7 @@ export function ChatHeader({
         {conversationId && createdBySessionId && (
           <CreatedBySession key={createdBySessionId} sessionId={createdBySessionId} />
         )}
+        {hasPageTitle && pageTitle}
       </div>
 
       <MobileHeaderButtonGroup className="flex items-center gap-2 max-md:empty:hidden">
@@ -652,7 +682,6 @@ export function ChatHeader({
         {/* Desktop (md+) action buttons. On mobile these collapse into
             the three-dot "Session actions" menu below. Fork is also
             available from the session menus and assistant messages. */}
-        {!pending && conversationId && sessionOverviewControl}
         {pending && <PendingHeaderActions isMobile={isMobile} />}
         {/* Agent info: tools & policies for the bound agent. Desktop-only
             popover; self-hides when the agent has neither configured. */}
@@ -833,6 +862,8 @@ export function ChatHeader({
             Share
           </Button>
         ) : null}
+        {/* Beside the right-panel toggle: both show or hide a panel on the right. */}
+        {!pending && conversationId && sessionOverviewControl}
         {conversationId && hasRailContent && (
           <Tooltip>
             <TooltipTrigger asChild>
@@ -858,6 +889,7 @@ export function ChatHeader({
             </TooltipContent>
           </Tooltip>
         )}
+        {!conversationId && pageActions}
         {/* Mobile-only session-actions kebab, rightmost in the cluster. Same
             menu the desktop breadcrumb hangs off its title. */}
         {isMobile && conversationMenu}

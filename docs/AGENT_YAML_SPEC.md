@@ -136,6 +136,35 @@ executor:
     api_key: ${GEMINI_API_KEY}     # or ANTIGRAVITY_API_KEY
 ```
 
+### Codex tool switches
+
+With `harness: codex`, `web_search: false` turns off Codex's built-in web
+search and `disable_native_tools: true` turns off its native shell tools, so
+shell commands use Omnigent tools and policies. For a directory bundle using
+`config.yaml`, place them in `executor.config`:
+
+```yaml
+spec_version: 1
+name: codex-worker
+executor:
+  type: omnigent
+  config:
+    harness: codex
+    web_search: false
+    disable_native_tools: true
+```
+
+The switches accept YAML booleans; omitting either switch or setting it to YAML
+`null` leaves it unset and preserves operator restrictions. Boolean settings
+apply on every Codex route, including ChatGPT login, API-key providers and brokered
+gateways. They only restrict tools: `web_search: true` and
+`disable_native_tools: false` do not re-enable tools that the runner's operator
+turned off. Locked profiles still require `web_search: false` and
+`disable_native_tools: true`, and `broker_gateway` rejects `null`.
+
+Upgrade runners before relying on these restrictions on ordinary routes. Older
+runners ignore the spec's tool switches on those routes.
+
 ### Pi context files
 
 With `harness: pi` or `pi-native`, Pi automatically appends context files such
@@ -486,6 +515,92 @@ os_env:
     allow_network: true
 ```
 
+For `harness: claude-sdk`, an active sandbox contains the entire Claude CLI
+and its descendants, including inline skill shell expansion (``!`command` ``),
+hooks, and plugin subprocesses. Both system-installed and SDK-bundled CLIs use
+the same launcher. A sandbox resolution or launch failure stops startup;
+`OMNIGENT_CLAUDE_SDK_NO_SANDBOX` cannot bypass a requested sandbox. Bash is
+available in the contained CLI so skills can execute their shell commands.
+Native Bash calls pass an Omnigent `PreToolUse` policy gate even when Claude's
+permission mode approves tools automatically; Claude's own permission rules
+remain in force.
+Claude's own Bash sandbox is separate from this outer process boundary.
+Containment requires `linux_bwrap` or `darwin_seatbelt`. Windows
+`windows_jobobject` provides process containment without filesystem or network
+isolation and is rejected for sandboxed Claude SDK launches and callbacks.
+Omitting `os_env` or selecting `sandbox.type: none` does not request this
+boundary; skills, hooks, and local MCP commands can then run uncontained.
+On Linux, the optional default CLI wrapper still checks the installed Python
+runtime for mutable hard-link aliases. An integrity failure can stop startup
+even when `os_env` is omitted. Reinstall a `uv tool` environment with
+`uv tool upgrade --reinstall --link-mode copy omnigent` if this occurs.
+Setting `OMNIGENT_CLAUDE_SDK_NO_SANDBOX` while requesting a sandbox raises a
+startup error; use an explicit `sandbox.type: none` to opt out.
+
+Model access is automatic; no model egress rule is needed:
+
+```yaml
+executor:
+  harness: claude-sdk
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: auto
+    write_paths: ["."]
+    allow_network: false
+```
+
+The trusted parent derives the model host and gateway prefix from the selected
+provider. It signs only HTTPS `POST` requests to that provider's
+`/v1/messages` and `/v1/messages/count_tokens` routes, optionally with exactly
+`?beta=true`. Requests must have matching CONNECT, TLS SNI, and Host authorities,
+a session placeholder, and a bounded JSON body. The relay reconstructs upstream
+headers before attaching the provider credential. Broader `egress_rules` cannot
+expand this signing authority. Redirects, account APIs, and arbitrary model-host
+paths receive no credential. Gateway thinking compatibility is preserved.
+
+The CLI, sandboxed session terminals, and `sys_os_*` shell environments get this
+model relay automatically, including when `allow_network: false`. They can make
+inference requests using the placeholder; skills therefore have the session's inference
+capability. Real model tokens and auth commands stay in the trusted parent. The
+CLI, sandboxed session terminals, and `sys_os_*` shell environments use private
+HOME/config/scratch directories. Home-relative Git, package-manager, and shell
+configuration may therefore be unavailable in all three. Host Claude state and
+credential files are excluded; conflicting filesystem grants stop startup. macOS
+also denies Keychain service access. Bundled skills remain available; host Claude
+state and plugins are not imported into the private home. Only bundled skills
+and their supporting files are copied into a separate plugin directory. Keep
+the original agent bundle, including its credential-bearing `config.yaml` and
+MCP configuration, outside the sandbox workspace and read/write grants;
+conflicting layouts fail before execution. Omnigent's Python runtime and
+framework installation must also remain outside sandbox-writable paths.
+
+Direct networking is disabled for these contained launches, including policies
+that previously enabled it with `allow_network: true`. Additional ordinary
+HTTP(S) access requires `egress_rules`; those requests do not receive the model
+credential. API-key providers, explicit Anthropic bearer/OAuth tokens, and host
+Claude OAuth credentials are supported. Host OAuth credentials are reread from
+the credentials file or macOS Keychain; expired credentials require signing in
+again. Databricks profile credentials refresh in the trusted parent. Arbitrary shell auth helpers, HTTP/nonstandard-port model endpoints,
+and Bedrock/Vertex/Foundry transports fail closed. This automatic integration is
+specific to `claude-sdk`; it does not change `claude-native` launches or other
+harnesses' model-authentication policy.
+
+Profile authentication requires the trusted Python profile-token helper on the parent's `PATH`; a profile
+configured only through the Databricks CLI cannot start a sandboxed Claude worker.
+The helper requires an absolute Python interpreter shebang, and its interpreter
+and installed modules must stay outside sandbox write grants.
+The parent retains any `DATABRICKS_CONFIG_FILE` selection. Managed Claude policy
+remains in force, but managed configuration containing model credentials or
+`apiKeyHelper` is rejected before it becomes readable by the CLI. Store model
+credentials in the parent provider configuration instead. Validation includes
+settings-only directories, settings drop-ins, and macOS device and per-user MDM
+preference plists.
+
+See [Claude sandbox CLI verification](CLAUDE_SANDBOX_TESTING.md) for the real CLI
+test matrix, worker prerequisites, and reproducible commands.
+
 On Linux, the `openai-agents` harness supports disposable copy-on-write mounts:
 
 ```yaml
@@ -634,6 +749,20 @@ both explicitly disable the sandbox. For the full set of sandbox options, how
 to share one policy across `sys_os_*` and terminals, and how to set up network
 egress rules, see the `sandbox:` examples below and the sandbox source under
 `omnigent/inner/`.
+
+Runner-local `sys_os_read`, `sys_os_write` and `sys_os_edit` calls reuse a helper
+within a session when the environment spec, sandbox mounts and inherited
+environment values remain unchanged.
+Calls configured with `sandbox.credential_proxy` use a disposable environment for
+each runner-local tool invocation. Credential sources resolve at helper startup;
+snapshot and change-tracking reads share that helper with the requested operation.
+A safe retry can start a replacement and resolve the sources again. The next tool
+invocation starts a fresh helper, so these calls retain helper startup cost.
+A `sys_os_shell` call retires that tool helper before returning, including on
+success: shell descendants may outlive the command. The next tool call starts a
+fresh helper. Shell calls therefore still incur helper startup cost; warm shell
+reuse needs a complete per-request process lifetime boundary. This tool lease
+policy does not change shared copy-on-write environments or forked environments.
 
 ### Secretless credential proxy
 
@@ -929,6 +1058,14 @@ agents. These restrictions apply on multi-user servers and, starting in 0.19.0,
 on local single-user servers too, including bundles uploaded by `omnigent run`.
 Loopback requests can originate from agents as well as the operator.
 
+Uploaded bundles also cannot declare absolute, `~`, or `..` entries in
+`os_env.sandbox` `read_paths`, `write_paths`, or `write_files`. A host that
+needs to expose paths outside the workspace lists absolute paths under
+`runner.sandbox_grants.read_paths` / `write_paths` in its own `config.yaml`
+(`$OMNIGENT_CONFIG_HOME/config.yaml`, default `~/.omnigent/config.yaml`). The
+runner adds them to every agent, terminal, and nested agent with an
+`os_env.sandbox` block that the host runs.
+
 Invalid uploads return HTTP 400 before tools or policy handlers are imported.
 Existing uploaded agents using these features also fail bundle validation when
 adding, updating, or deleting MCP-server settings; rejected edits leave the
@@ -1156,14 +1293,38 @@ tool_groups:
   comments: false         # list_comments / update_comment
   policies: false         # sys_add_policy / sys_policy_registry
   agent_discovery: false  # sys_agent_get / sys_agent_download / sys_agent_list
+  journal: false          # sys_journal_read / _write_plan / _write_status / _write_note, sys_workflow_request_input / _save / _load / _list
   projects: false         # sys_project_* / sys_session_update
+  user_inbox: false       # sys_user_inbox_post / sys_user_inbox_list
+  memory: false           # memory_search / _get / _list / _write / _delete
 ```
 
 Every group defaults to `true`, so omitting the block changes nothing. Values
 must be booleans and group names must match exactly; a typo fails the load
-rather than silently leaving the group registered. Disabling `browser` also
-drops the embedded-browser guidance from the composed system prompt. The block
-is read the same way from a `config.yaml` bundle and a single-file agent YAML.
+rather than silently leaving the group registered. The `journal` group also
+requires the server's `workflows` feature flag, which defaults off; enable it
+with `OMNIGENT_FEATURES=workflows` on the server. The `user_inbox` group, which
+posts to and reads the session owner's Inbox, requires the server's `user_inbox`
+feature flag, which defaults on; turn it off with `OMNIGENT_FEATURES=-user_inbox`.
+Disabling `browser` also
+drops the embedded-browser guidance from the composed system prompt, and
+disabling `journal` also drops the `/workflow` and `/save-workflow` skills (see
+[Session journal](session-journal.md)). The block is read the same way from a
+`config.yaml` bundle and a single-file agent YAML.
+
+The `memory` group is the long-term memory tools. It applies only when the server
+has memory turned on (`OMNIGENT_FEATURES=memory`); otherwise no agent gets them,
+whatever the spec says. The tools persist across sessions, harnesses, models and
+forks, and belong to the signed-in user: the server decides whose memory it is,
+never the agent. They are refused in a session shared with anyone who can add
+input. Two kinds of spec get `memory: false` by default, and setting `memory: true`
+on them is an error:
+
+- Specs that still declare the deprecated `hindsight_*` builtins, with a warning.
+  Configure Hindsight as the server's memory backend instead with
+  `omnigent server --memory-backend hindsight`.
+- Specs with their own local tool or MCP server named like a memory tool, which
+  keep that tool. See [MEMORY.md](MEMORY.md).
 
 `agent_discovery: false` is rejected while `spawn: true` or the
 `scheduled_tasks` group is on: `sys_session_create` and

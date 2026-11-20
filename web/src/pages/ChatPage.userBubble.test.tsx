@@ -483,9 +483,7 @@ describe("UserBubble copy button", () => {
     renderBubble(userBubble("copy me please"));
 
     expect(screen.getByRole("button", { name: "Copy" })).toHaveAttribute("data-size", "icon-xxs");
-    expect(screen.getByRole("button", { name: "Copy" })).toHaveClass(
-      "[@media(pointer:coarse)]:size-8",
-    );
+    expect(screen.getByRole("button", { name: "Copy" })).toHaveClass("max-md:size-8");
   });
 
   it("copies the message text to the clipboard when clicked", async () => {

@@ -1,13 +1,19 @@
 syntax = "proto3";
 
-// Workspace API: read a session's workspace files.
+// Workspace API: read, search and compare a session's workspace files.
 //
 // One implementation serves every route: directly from the desktop app over a
 // local socket, and through the server for every other client. Which session
 // and workspace a call reads comes from its credentials, never from a message.
-// Paths in messages are always relative to the workspace root.
 //
-// v1alpha1 may still change incompatibly.
+// Paths in messages are relative to the workspace root (search results: to
+// the request's `path`), use "/" separators, and are empty for the root. A
+// path that is absolute, contains "..", or resolves through symlinks outside
+// the root is refused with INVALID_ARGUMENT or PERMISSION_DENIED.
+//
+// Clients call GetCapabilities first and skip what a server doesn't list, so a
+// newer client works with an older server. v1alpha1 may still change
+// incompatibly, except that ListDirectory and ReadFile keep their wire shapes.
 package omnigent.api.workspace.v1alpha1;
 
 import "google/protobuf/timestamp.proto";
@@ -25,13 +31,66 @@ service WorkspaceService {
 
   // Streams a file: metadata first, then its bytes in order.
   rpc ReadFile(ReadFileRequest) returns (stream ReadFileResponse);
+
+  // Describes one path, as ListDirectory describes its entries.
+  rpc StatPath(StatPathRequest) returns (StatPathResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // Finds files by path: ranked fuzzy matches for Go to File, or the REST
+  // file search's case-insensitive substring matches.
+  rpc SearchFiles(SearchFilesRequest) returns (SearchFilesResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // Streams the lines of workspace files that match a query, in batches.
+  rpc SearchText(SearchTextRequest) returns (stream SearchTextResponse);
+
+  // Git comparisons of the working copy, all read-only. Each answers with a
+  // typed reason, not an error, when no comparison can be made.
+
+  // Resolves a comparison's base and head commits.
+  rpc ResolveWorkingCopyBase(ResolveWorkingCopyBaseRequest) returns (ResolveWorkingCopyBaseResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // Lists the files a comparison changes.
+  rpc ListWorkingCopyChanges(ListWorkingCopyChangesRequest) returns (ListWorkingCopyChangesResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // Streams a file's content at a commit, as ReadFile streams a working file.
+  rpc ReadBaseFile(ReadBaseFileRequest) returns (stream ReadBaseFileResponse);
+
+  // Reads a symlink's own text, without following it.
+  rpc ReadLinkText(ReadLinkTextRequest) returns (ReadLinkTextResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // Lists branch and tag names to offer as a comparison's base or head.
+  rpc ListRepositoryRefs(ListRepositoryRefsRequest) returns (ListRepositoryRefsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // Lists the commits HEAD has beyond its merge base with a base, newest first.
+  rpc ListBranchCommits(ListBranchCommitsRequest) returns (ListBranchCommitsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // The checked-out branch, its commit, where it pushes, and the remotes, so a
+  // client can find the branch's pull request. Configuration values and remote
+  // URLs never appear in the answer.
+  rpc ResolveRepositoryContext(ResolveRepositoryContextRequest) returns (ResolveRepositoryContextResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
 }
 
 message GetCapabilitiesRequest {}
 
 message GetCapabilitiesResponse {
-  // Supported method names, e.g. "ListDirectory". Clients treat a missing
-  // name as unsupported and use another route.
+  // Supported method names, e.g. "ListDirectory", and optional features in
+  // lower snake case, e.g. "search_files.fuzzy". Clients treat a missing name
+  // as unsupported and use another route.
   repeated string capabilities = 1;
 }
 
@@ -45,6 +104,15 @@ message ListDirectoryRequest {
 
   // `next_page_token` from the previous response, to continue a listing.
   string page_token = 3;
+
+  // Leave out entries Git ignores. By default they are listed, with
+  // `Entry.ignored` set. Offered with the "gitignore" feature.
+  bool hide_ignored = 4;
+
+  // Fill each directory entry's `leaf_directory_path`, so a tree can show
+  // "a/b/c" on one row without a request per level. Hosts that don't support
+  // it leave `leaf_directory_path` empty.
+  bool collapse_single_child_directories = 5;
 }
 
 message ListDirectoryResponse {
@@ -67,7 +135,19 @@ message Entry {
   // File size in bytes. Unset for directories and broken symlinks.
   optional int64 size = 4;
 
+  // Seconds precision. For a broken symlink, the link's own time.
   google.protobuf.Timestamp modify_time = 5;
+
+  bool is_symlink = 6;
+
+  // Excluded by .gitignore, .git/info/exclude or the global excludes file,
+  // with Git's semantics. Always false outside a Git repository.
+  bool ignored = 7;
+
+  // With `collapse_single_child_directories`: the deepest directory reached
+  // by following this one while its only entry is another directory. Empty
+  // unless this directory's only entry is a directory.
+  string leaf_directory_path = 8;
 }
 
 enum EntryType {
@@ -79,6 +159,10 @@ enum EntryType {
 message ReadFileRequest {
   // File to read, e.g. "src/main.py".
   string path = 1;
+
+  // Bytes to read at most; 0 means the server's limit. Values above it are
+  // lowered to it. Older hosts ignore this field.
+  uint64 maximum_bytes = 2;
 }
 
 message ReadFileResponse {
@@ -102,6 +186,9 @@ message FileMetadata {
 
   // Guessed from the file name, e.g. "text/markdown". Empty when unknown.
   string content_type = 4;
+
+  // When the file was last modified, when known.
+  google.protobuf.Timestamp modify_time = 5;
 }
 
 enum ContentEncoding {
@@ -110,4 +197,506 @@ enum ContentEncoding {
   CONTENT_ENCODING_UTF8 = 1;
   // The delivered bytes are not valid UTF-8.
   CONTENT_ENCODING_BINARY = 2;
+}
+
+message StatPathRequest {
+  // Path to describe. Empty for the workspace root.
+  string path = 1;
+}
+
+message StatPathResponse {
+  Entry entry = 1;
+}
+
+enum FileSearchMode {
+  // The default: FILE_SEARCH_MODE_FUZZY.
+  FILE_SEARCH_MODE_UNSPECIFIED = 0;
+  // Ranked fuzzy match over file paths, best first. Feature "search_files.fuzzy".
+  FILE_SEARCH_MODE_FUZZY = 1;
+  // Files and directories whose path contains the query, ignoring case,
+  // sorted by path, as the REST file search returns them. Feature
+  // "search_files.substring".
+  FILE_SEARCH_MODE_SUBSTRING = 2;
+}
+
+message SearchFilesRequest {
+  // A blank query returns nothing.
+  string query = 1;
+
+  FileSearchMode mode = 2;
+
+  // 0 means 500; at most 10,000.
+  uint32 maximum_results = 3;
+
+  // Directory to search under. Empty for the workspace root. Result paths
+  // are relative to it.
+  string path = 4;
+
+  // Globs, one per entry, with the REST file search's syntax, e.g. "*.ts" or
+  // "src/**". When any are set, only matching paths are returned.
+  repeated string include = 5;
+
+  repeated string exclude = 6;
+
+  // Also search files Git ignores.
+  bool include_git_ignored = 7;
+
+  // Workspace-relative directories: results come only from beneath an
+  // include (when any) and never from beneath an exclude.
+  repeated string include_directories = 8;
+  repeated string exclude_directories = 9;
+
+  // Look for untracked files again now, even if a search just did. Send it
+  // once, for the user's retry, not on follow-up requests.
+  bool retry_untracked = 10;
+}
+
+// One match. The entry's path is relative to the request's `path`, and is
+// what the query matched against.
+message FileSearchResult {
+  Entry entry = 1;
+
+  // Higher is better. Zero in substring mode.
+  uint32 score = 2;
+
+  // Indices, in UTF-16 code units, of the entry's path characters that matched,
+  // for highlighting.
+  repeated uint32 matched_indices = 3;
+}
+
+// The statuses describe the file list the results came from.
+message SearchFilesResponse {
+  repeated FileSearchResult results = 1;
+
+  // More results matched than were returned.
+  bool truncated = 2;
+
+  // Paths in the list that was searched.
+  uint64 indexed_paths = 3;
+
+  // The list stopped at its size limit, so some files weren't searched.
+  bool index_incomplete = 4;
+
+  // A newer list is being built or was published since; ask again shortly.
+  bool refreshing = 5;
+
+  // Untracked files couldn't be listed, so new files not yet in Git may be
+  // missing. Ask again with `retry_untracked`.
+  bool untracked_unavailable = 6;
+}
+
+enum SearchOrder {
+  // The default: SEARCH_ORDER_WALK.
+  SEARCH_ORDER_UNSPECIFIED = 0;
+  // One walk of the scope, in no particular order.
+  SEARCH_ORDER_WALK = 1;
+  // `focused_paths` first, then their directories, then the directories with
+  // the most changes against `changed_against`, then the rest. Feature
+  // "text_search_priority".
+  SEARCH_ORDER_PRIORITY = 2;
+}
+
+message SearchTextRequest {
+  // One line, 1 to 4096 characters, and not blank.
+  string query = 1;
+
+  bool case_sensitive = 2;
+
+  // Interpret `query` as a regular expression, not a literal.
+  bool regular_expression = 3;
+
+  bool whole_word = 4;
+
+  // Comma-separated globs, as the REST content search takes them, e.g.
+  // "*.{js,ts}, src/**". An include also searches files ignore rules skip.
+  string include = 5;
+
+  string exclude = 6;
+
+  // Matching lines to return at most; 0 means 500.
+  uint32 maximum_results = 7;
+
+  // Also search files Git ignores.
+  bool include_git_ignored = 8;
+
+  // Workspace-relative directories. The search starts only at the includes
+  // (the whole root when there are none) and never enters an exclude, so
+  // scoping a search in a large repository also makes it faster.
+  repeated string include_directories = 9;
+  repeated string exclude_directories = 10;
+
+  SearchOrder order = 11;
+
+  // Workspace-relative files, the most important first; at most 16 are used.
+  repeated string focused_paths = 12;
+
+  // What changed directories are measured against; unspecified means the
+  // last commit.
+  ComparisonKind changed_against = 13;
+}
+
+// One matching line, for its first match, as the REST content search reports
+// it. Column and offsets count UTF-16 code units.
+message TextSearchMatch {
+  // Path from the workspace root, e.g. "src/main.py".
+  string path = 1;
+
+  // 1-based.
+  uint64 line = 2;
+
+  // 1-based.
+  uint32 column = 3;
+
+  // At most 400 characters of the line around the match, with "…" marking
+  // where it was cut.
+  string text = 4;
+
+  // Where the match starts and ends in `text`.
+  uint32 match_start = 5;
+  uint32 match_end = 6;
+}
+
+// Matches arrive in batches; concatenate every response's `matches`. The
+// last response has `done` set and carries the search's status.
+message SearchTextResponse {
+  repeated TextSearchMatch matches = 1;
+
+  bool done = 2;
+
+  // The search stopped early, so more lines may match.
+  bool truncated = 3;
+
+  // Why results may be incomplete, for the user. Empty when there is nothing
+  // to say.
+  string warning = 4;
+}
+
+enum ComparisonKind {
+  COMPARISON_KIND_UNSPECIFIED = 0;
+  // The last commit (HEAD).
+  COMPARISON_KIND_LAST_COMMIT = 1;
+  // The merge base of HEAD and the default branch: the tracked remote's
+  // default branch, else an upstream naming another branch, else origin/HEAD.
+  COMPARISON_KIND_BRANCH_POINT = 2;
+  // The merge base of `base_revision` and `head_revision`, compared with that
+  // head. Feature "revision_comparison".
+  COMPARISON_KIND_REVISIONS = 3;
+}
+
+// What to compare.
+message Comparison {
+  // Unspecified means COMPARISON_KIND_LAST_COMMIT.
+  ComparisonKind kind = 1;
+
+  // For COMPARISON_KIND_REVISIONS: any revision Git resolves to a commit. An
+  // empty base means the default branch, else HEAD.
+  string base_revision = 2;
+
+  // Empty compares with the working copy.
+  string head_revision = 3;
+}
+
+enum ComparisonProblem {
+  COMPARISON_PROBLEM_UNSPECIFIED = 0;
+  COMPARISON_PROBLEM_NOT_A_REPOSITORY = 1;
+  COMPARISON_PROBLEM_NO_COMMITS = 2;
+  COMPARISON_PROBLEM_NO_DEFAULT_BRANCH = 3;
+  COMPARISON_PROBLEM_NO_BRANCH_POINT = 4;
+  COMPARISON_PROBLEM_MISSING_OBJECT = 5;
+  COMPARISON_PROBLEM_PARTIAL_CLONE_NEEDS_NEWER_GIT = 6;
+  COMPARISON_PROBLEM_TIMEOUT = 7;
+  COMPARISON_PROBLEM_TOO_MANY_FILES = 8;
+  COMPARISON_PROBLEM_LISTING_TOO_LARGE = 9;
+  COMPARISON_PROBLEM_GIT_UNAVAILABLE = 10;
+  COMPARISON_PROBLEM_GIT_FAILED = 11;
+  // A repository nested inside the workspace's own, untracked by it.
+  COMPARISON_PROBLEM_MULTIPLE_REPOSITORIES = 12;
+  // A revision Git must not be asked about, such as one starting with "-".
+  COMPARISON_PROBLEM_INVALID_REVISION = 13;
+  COMPARISON_PROBLEM_BASE_NOT_FOUND = 14;
+  COMPARISON_PROBLEM_HEAD_NOT_FOUND = 15;
+  // The base and head share no commit.
+  COMPARISON_PROBLEM_NO_COMMON_HISTORY = 16;
+}
+
+// Which requested revision a problem is about.
+enum ComparisonField {
+  // The problem isn't about either revision.
+  COMPARISON_FIELD_UNSPECIFIED = 0;
+  COMPARISON_FIELD_BASE = 1;
+  COMPARISON_FIELD_HEAD = 2;
+  COMPARISON_FIELD_BOTH = 3;
+}
+
+// Why no comparison could be made.
+message ComparisonUnavailable {
+  ComparisonProblem problem = 1;
+
+  // For NO_BRANCH_POINT: the ref compared with, and whether the clone is
+  // shallow.
+  string reference = 2;
+  bool shallow = 3;
+
+  // For GIT_FAILED: Git's last error line, or the signal that stopped it.
+  string detail = 4;
+
+  ComparisonField field = 5;
+}
+
+// A resolved comparison. Commits are full object names.
+message WorkingCopyBase {
+  ComparisonKind kind = 1;
+  string head = 2;
+  string base = 3;
+
+  // For the branch point: the ref, e.g. "origin/main", and its commit.
+  string reference = 4;
+  string reference_commit = 5;
+
+  // Set when no comparison could be made; the other fields are then empty.
+  ComparisonUnavailable unavailable = 6;
+
+  // For COMPARISON_KIND_REVISIONS: `base` is the merge base, also in
+  // `merge_base`, and the displays are the revisions as asked for, or as
+  // defaulted.
+  string merge_base = 7;
+  string base_display = 8;
+  string head_display = 9;
+  bool head_is_working_copy = 10;
+}
+
+message ResolveWorkingCopyBaseRequest {
+  Comparison comparison = 1;
+}
+
+message ResolveWorkingCopyBaseResponse {
+  WorkingCopyBase base = 1;
+}
+
+enum ChangeStatus {
+  CHANGE_STATUS_UNSPECIFIED = 0;
+  CHANGE_STATUS_ADDED = 1;
+  CHANGE_STATUS_MODIFIED = 2;
+  CHANGE_STATUS_DELETED = 3;
+  CHANGE_STATUS_TYPE_CHANGED = 4;
+  CHANGE_STATUS_CONFLICTED = 5;
+}
+
+enum GitEntryKind {
+  // No entry on this side, e.g. the base of an added file.
+  GIT_ENTRY_KIND_UNSPECIFIED = 0;
+  GIT_ENTRY_KIND_FILE = 1;
+  GIT_ENTRY_KIND_SYMLINK = 2;
+  GIT_ENTRY_KIND_SUBMODULE = 3;
+}
+
+enum ChangedFileProblem {
+  // The file can be compared.
+  CHANGED_FILE_PROBLEM_UNSPECIFIED = 0;
+  // A Git filter, such as LFS, changes how this file is stored.
+  CHANGED_FILE_PROBLEM_FILTERED = 1;
+  // The file's base version isn't in this clone.
+  CHANGED_FILE_PROBLEM_MISSING_OBJECT = 2;
+}
+
+message ChangedFile {
+  // Relative to the workspace root.
+  string path = 1;
+
+  ChangeStatus status = 2;
+  GitEntryKind base_kind = 3;
+  GitEntryKind working_kind = 4;
+
+  // The base blob, for ReadBaseFile. Empty for added files.
+  string base_object = 5;
+  optional uint64 base_size = 6;
+
+  optional uint64 lines_added = 7;
+  optional uint64 lines_removed = 8;
+  bool binary = 9;
+  ChangedFileProblem problem = 10;
+
+  // Absent when there is no working file (deleted).
+  WorkingFileMetadata working = 11;
+
+  // For a committed head: the file's blob there, read with ReadBaseFile at
+  // that commit. Absent when the head is the working copy, or the file was
+  // deleted.
+  CommittedFile committed = 12;
+}
+
+message CommittedFile {
+  string object = 1;
+  optional uint64 size = 2;
+}
+
+// A working file's own metadata at listing time, by lstat: a symlink's, not
+// its target's. Any field changing means the file changed since the listing.
+message WorkingFileMetadata {
+  uint64 size = 1;
+  int64 modified_unix_nanos = 2;
+  int64 changed_unix_nanos = 3;
+  uint64 inode = 4;
+  uint64 device = 5;
+}
+
+message ListWorkingCopyChangesRequest {
+  Comparison comparison = 1;
+}
+
+// Files sorted by path, by byte value; at most 10,000.
+message ListWorkingCopyChangesResponse {
+  WorkingCopyBase base = 1;
+  repeated ChangedFile files = 2;
+
+  // Changed files left out because their names aren't valid UTF-8.
+  uint32 unrepresentable_names = 3;
+}
+
+// A file's content at `commit`, if its tree entry there is the blob `object`.
+// FAILED_PRECONDITION when it isn't; NOT_FOUND when the clone lacks the blob.
+message ReadBaseFileRequest {
+  // A full commit name, e.g. a WorkingCopyBase's `base`.
+  string commit = 1;
+
+  string path = 2;
+
+  // The blob, e.g. a ChangedFile's `base_object`.
+  string object = 3;
+
+  // Bytes to read at most; 0 means the server's limit. A larger blob sends
+  // only metadata, with `truncated` set.
+  uint64 maximum_bytes = 4;
+}
+
+// As ReadFileResponse: metadata first, then the bytes in order.
+message ReadBaseFileResponse {
+  // Set on the first message only.
+  FileMetadata metadata = 1;
+
+  // The next part of the content. Concatenate every message's `data`.
+  bytes data = 2;
+}
+
+// FAILED_PRECONDITION when the path isn't a symlink.
+message ReadLinkTextRequest {
+  string path = 1;
+}
+
+message ReadLinkTextResponse {
+  // The link's target as stored, which may not be valid UTF-8.
+  bytes target = 1;
+}
+
+message ListRepositoryRefsRequest {}
+
+// Short branch and tag names, local branches first. At most 1,000.
+message ListRepositoryRefsResponse {
+  repeated string refs = 1;
+  bool truncated = 2;
+
+  // The default branch's short name, e.g. "origin/main"; empty when unknown.
+  string default_branch_ref = 3;
+}
+
+message ListBranchCommitsRequest {
+  // Any revision Git resolves to a commit; empty means the default branch,
+  // else HEAD.
+  string base_revision = 1;
+}
+
+message BranchCommit {
+  // The full object name.
+  string object = 1;
+  string subject = 2;
+  string author_name = 3;
+  int64 author_time_unix = 4;
+
+  // It has no parent; compare it with the empty tree, which a revision
+  // comparison accepts as its base.
+  bool root = 5;
+}
+
+// At most 200 commits, newest first. Feature "branch_commits".
+message ListBranchCommitsResponse {
+  // The comparison of the base with HEAD, as for COMPARISON_KIND_REVISIONS;
+  // `unavailable` says why no commits could be listed.
+  WorkingCopyBase base = 1;
+  repeated BranchCommit commits = 2;
+  bool truncated = 3;
+}
+
+message ResolveRepositoryContextRequest {}
+
+enum RepositoryContextProblem {
+  // The context was read.
+  REPOSITORY_CONTEXT_PROBLEM_UNSPECIFIED = 0;
+  REPOSITORY_CONTEXT_PROBLEM_NOT_A_REPOSITORY = 1;
+  // URL rewrites, or remotes and branches defined outside the repository's
+  // own configuration, which the server doesn't resolve.
+  REPOSITORY_CONTEXT_PROBLEM_UNSUPPORTED_CONFIG = 2;
+  // The repository changed while it was read, twice; ask again.
+  REPOSITORY_CONTEXT_PROBLEM_REPOSITORY_CHANGING = 3;
+  REPOSITORY_CONTEXT_PROBLEM_TIMEOUT = 4;
+  REPOSITORY_CONTEXT_PROBLEM_GIT_UNAVAILABLE = 5;
+  REPOSITORY_CONTEXT_PROBLEM_GIT_FAILED = 6;
+}
+
+// Why a branch that may push somewhere has no push target.
+enum PushUnresolved {
+  // Not unresolved: there is a push target, or the branch doesn't push.
+  PUSH_UNRESOLVED_UNSPECIFIED = 0;
+  // Refspecs don't give one destination, or Git reports a different one.
+  PUSH_UNRESOLVED_REFSPEC = 1;
+  // The push URLs don't name one supported repository.
+  PUSH_UNRESOLVED_PUSH_URL = 2;
+  // push.default=matching, which can push many branches.
+  PUSH_UNRESOLVED_PUSH_DEFAULT = 3;
+}
+
+// A remote, as the host, owner and repository its URL names.
+message RepositoryRemote {
+  string name = 1;
+  string host = 2;
+  string owner = 3;
+  string repo = 4;
+}
+
+message PushTarget {
+  string remote_name = 1;
+
+  // The destination branch on the remote, without "refs/heads/".
+  string branch = 2;
+
+  // The repository the branch pushes to, from its push URLs.
+  string host = 3;
+  string owner = 4;
+  string repo = 5;
+
+  // The local tracking ref's commit, or empty when there is none or it
+  // describes a different repository than the push target.
+  string tracking_sha = 6;
+}
+
+message ResolveRepositoryContextResponse {
+  RepositoryContextProblem problem = 1;
+
+  // Without "refs/heads/"; empty when HEAD is detached.
+  string branch = 2;
+
+  // Empty in a repository without commits.
+  string head_sha = 3;
+
+  // Absent when the branch doesn't push, or not unambiguously.
+  PushTarget push = 4;
+  PushUnresolved push_unresolved = 5;
+
+  // The upstream's local tracking ref, only for telling contexts apart; never
+  // evidence of where the branch pushes.
+  string upstream_ref = 6;
+
+  // At most 8; remotes whose URL isn't supported are counted, not listed.
+  repeated RepositoryRemote remotes = 7;
+  uint32 unsupported_remote_count = 8;
+  bool truncated_remotes = 9;
 }

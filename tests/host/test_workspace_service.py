@@ -41,6 +41,8 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     GetCapabilitiesRequest,
     ListDirectoryRequest,
     ReadFileRequest,
+    SearchFilesRequest,
+    SearchTextRequest,
 )
 from omnigent.host.frames import (
     CAP_WORKSPACE_API,
@@ -352,6 +354,20 @@ async def test_capabilities_list_the_served_methods(tmp_path: Path, client_for: 
     response = await client.get_capabilities(GetCapabilitiesRequest())
 
     assert set(response.capabilities) == {"ListDirectory", "ReadFile"}
+
+
+async def test_methods_not_served_yet_answer_unimplemented(
+    tmp_path: Path, client_for: ClientFor
+) -> None:
+    """A client that skips GetCapabilities still gets a code it can fall back on."""
+    client = client_for(tmp_path)
+
+    with pytest.raises(ConnectError) as unary:
+        await client.search_files(SearchFilesRequest(query="main"))
+    with pytest.raises(ConnectError) as streamed:
+        [m async for m in client.search_text(SearchTextRequest(query="main"))]
+
+    assert unary.value.code == streamed.value.code == Code.UNIMPLEMENTED
 
 
 @PROTOCOLS

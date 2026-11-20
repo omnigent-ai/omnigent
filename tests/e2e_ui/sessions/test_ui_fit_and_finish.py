@@ -37,6 +37,30 @@ def test_keyboard_shortcuts_use_grouped_settings_cards(page: Page, live_server: 
     assert float(geometry["borderRadius"].removesuffix("px")) >= 10
 
 
+def test_settings_list_cards_share_the_settings_card_radius(page: Page, live_server: str) -> None:
+    """Custom agent and harness list cards use the same corner radius as Settings group cards."""
+    corner_radius = "element => getComputedStyle(element).borderTopLeftRadius"
+    page.goto(f"{live_server}/settings/general")
+    group_card = page.locator('[data-slot="settings-group-card"]').first
+    expect(group_card).to_be_visible(timeout=30_000)
+    standard_radius = group_card.evaluate(corner_radius)
+
+    page.get_by_test_id("settings-nav-custom-agents").click()
+    agent_card = page.get_by_role("region", name="Built-in agents").get_by_role("link").first
+    expect(agent_card).to_be_visible(timeout=30_000)
+    agent_radius = agent_card.evaluate(corner_radius)
+
+    page.get_by_test_id("settings-nav-harnesses").click()
+    harness_card = page.locator('[data-testid^="harness-card-"]').first
+    expect(harness_card).to_be_visible(timeout=30_000)
+    harness_radius = harness_card.evaluate(corner_radius)
+
+    assert {"custom agents": agent_radius, "harnesses": harness_radius} == {
+        "custom agents": standard_radius,
+        "harnesses": standard_radius,
+    }
+
+
 def test_sidebar_rows_and_section_titles_share_compact_height(
     page: Page,
     seeded_session: tuple[str, str],

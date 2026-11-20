@@ -45,6 +45,9 @@ vi.mock("@/hooks/useDefaultPolicies", () => ({
   useAddDefaultPolicy: vi.fn(),
   useUpdateDefaultPolicy: vi.fn(),
   useDeleteDefaultPolicy: vi.fn(),
+  // Same class the component imports (both resolve to this mocked module), so
+  // the component's `instanceof PoliciesForbiddenError` check matches.
+  PoliciesForbiddenError: class PoliciesForbiddenError extends Error {},
 }));
 vi.mock("@/hooks/usePolicies", () => ({ usePolicyRegistry: vi.fn() }));
 
@@ -77,6 +80,14 @@ function setPolicies(list: Policy[]) {
   vi.mocked(defaultPolicies.useDefaultPolicies).mockReturnValue({
     data: list,
     refetch: refetchMock,
+  } as never);
+}
+
+function setPoliciesForbidden() {
+  vi.mocked(defaultPolicies.useDefaultPolicies).mockReturnValue({
+    data: undefined,
+    refetch: refetchMock,
+    error: new defaultPolicies.PoliciesForbiddenError("nope"),
   } as never);
 }
 
@@ -127,6 +138,27 @@ describe("PoliciesPage gating", () => {
     ).toBeInTheDocument();
   });
 
+  it("hides the section with a permission message when the list call is forbidden", async () => {
+    // An admin whose workspace restricts global policies: the list call 403s,
+    // so the section is hidden behind the same message rather than rendering
+    // an empty page + Add button or a raw error.
+    setPoliciesForbidden();
+    const { unmount } = renderPage();
+    expect(
+      await screen.findByText("You don't have permission to manage global policies."),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Add policy" })).not.toBeInTheDocument();
+    unmount();
+
+    // Single-user mode skips the admin probe, so the 403 alone must hide the section.
+    serverInfoMocks.singleUser = true;
+    renderPage();
+    expect(
+      await screen.findByText("You don't have permission to manage global policies."),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Add policy" })).not.toBeInTheDocument();
+  });
+
   it("stays loading for an unauthenticated visitor (resolveIdentity redirects)", async () => {
     // resolveIdentity returns null AND owns the login redirect, so the page
     // never resolves its admin flag — it stays in the loading state.
@@ -162,6 +194,55 @@ describe("PoliciesPage list", () => {
     // factory_params render as a "Parameters" block.
     expect(screen.getByText("Parameters")).toBeInTheDocument();
     expect(screen.getByText("max_per_min:")).toBeInTheDocument();
+  });
+});
+
+describe("PoliciesPage Settings rows", () => {
+  it("renders the add and list rows, and each policy's actions, from their Settings catalog entries", async () => {
+    setPolicies([policy({ id: "p1", name: "block_canada", enabled: true })]);
+    renderPage();
+    await screen.findByText("block_canada");
+
+    expect(document.querySelector('[data-settings-item="policies-add"]')).not.toBeNull();
+    expect(document.querySelector('[data-settings-item="policies-list"]')).not.toBeNull();
+    expect(
+      document.querySelector('[data-settings-region="policies-list:policies"]'),
+    ).not.toBeNull();
+    const card = screen.getByText("block_canada").closest("[data-settings-region-row]");
+    expect(card).toBeInTheDocument();
+    expect(card?.querySelector('[data-settings-row-action="toggle"]')).not.toBeNull();
+    expect(card?.querySelector('[data-settings-row-action="remove"]')).not.toBeNull();
+  });
+
+  it("names the Add dialog's filter, policy name and submit from their entries", async () => {
+    vi.mocked(policies.usePolicyRegistry).mockReturnValue({
+      data: [
+        {
+          handler: "omnigent.policies.block_canada",
+          kind: "callable",
+          name: "Block Canada",
+          description: "Deny anything mentioning Canada.",
+          params_schema: null,
+        },
+      ],
+    } as never);
+    renderPage();
+    await screen.findByText(/No global policies configured/);
+    fireEvent.click(screen.getByRole("button", { name: /Add policy/ }));
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog.getAttribute("data-settings-overlay-owner")).toBe("policies-add:add");
+    expect(within(dialog).getByRole("textbox", { name: "Filter policies" })).toBeInTheDocument();
+    expect(
+      dialog.querySelector('[data-settings-row-action="choose"][data-settings-region-row]'),
+    ).not.toBeNull();
+
+    fireEvent.click(within(dialog).getByText("Block Canada"));
+    expect(within(dialog).getByRole("textbox", { name: "Policy name" })).toHaveValue(
+      "block_canada",
+    );
+    expect(
+      within(dialog).getByRole("button", { name: "Add" }).getAttribute("data-settings-control"),
+    ).toBe("policies-add:submit");
   });
 });
 
@@ -221,6 +302,7 @@ describe("PoliciesPage actions", () => {
     fireEvent.click(within(dialog).getByText("Budget Guard"));
 
     const combo = within(dialog).getByPlaceholderText("Select or type a value…");
+    expect(combo).toHaveAccessibleName("Parameter values: expensive_models");
     fireEvent.focus(combo);
     fireEvent.mouseDown(within(dialog).getByRole("button", { name: "opus" }));
     fireEvent.mouseDown(within(dialog).getByRole("button", { name: "haiku" }));

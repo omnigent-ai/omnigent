@@ -1,11 +1,4 @@
-import {
-  useEffect,
-  useRef,
-  useState,
-  type FormEvent,
-  type KeyboardEvent,
-  type ReactNode,
-} from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   ArchiveIcon,
   ArchiveRestoreIcon,
@@ -57,13 +50,13 @@ import { useIsMutating, useQueryClient } from "@tanstack/react-query";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isIndentedSibling, isSessionPinned } from "@/lib/sessionFamilies";
 import { PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
+import { canFlagUnread } from "@/lib/sessionMute";
 import { exportSessionTranscript } from "@/lib/sessionsApi";
 import { triggerBrowserDownload } from "@/hooks/useFileContent";
 import {
   type Conversation,
   useArchiveConversation,
   useMoveToProject,
-  useRenameConversation,
   useStopAndDeleteConversation,
   useTogglePinnedConversation,
   useAutomationsEnabled,
@@ -85,7 +78,6 @@ import { useIsEmbedded } from "@/lib/embedded";
 import { getEmbedRoot } from "@/lib/host";
 import { hasCommandModifier, isFocusInDialogOrMenu } from "@/lib/hotkeys";
 import { useNavigate } from "@/lib/routing";
-import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { showArchiveUndoToast } from "./archiveUndoToast";
 import { unpinWithUndo } from "./unpinUndoToast";
 import { useArchivePrompt } from "./ArchivePrompt";
@@ -93,6 +85,7 @@ import { cn } from "@/lib/utils";
 import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { conversationDisplayLabel } from "./sidebarNav";
 import { MobileHeaderButton } from "./MobileHeaderButton";
+import { RenameSessionDialog } from "./RenameSessionDialog";
 import { SessionMenuHeader } from "./SessionMenuHeader";
 
 interface HeaderConversationMenuProps {
@@ -143,7 +136,6 @@ export function HeaderConversationMenu({
   const togglePinned = useTogglePinnedConversation();
   // Pin writes don't overlap, so Pin/Unpin is disabled while one is saving.
   const pinSaving = useIsMutating({ mutationKey: PIN_WRITE_MUTATION_KEY }) > 0;
-  const rename = useRenameConversation();
   const moveToProject = useMoveToProject();
   const archive = useArchiveConversation();
   const archivePrompt = useArchivePrompt();
@@ -151,7 +143,6 @@ export function HeaderConversationMenu({
   const [menuOpen, setMenuOpen] = useState(false);
   const [projectPickerOpen, setProjectPickerOpen] = useState(false);
   const [renameOpen, setRenameOpen] = useState(false);
-  const [renameTitle, setRenameTitle] = useState(conversation.title ?? "");
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleteBranch, setDeleteBranch] = useState(false);
   const [automationOpen, setAutomationOpen] = useState(false);
@@ -184,20 +175,15 @@ export function HeaderConversationMenu({
   const gitBranch = conversation.git_branch ?? null;
 
   useEffect(() => {
-    if (!renameOpen) setRenameTitle(conversation.title ?? "");
-  }, [conversation.title, renameOpen]);
-
-  useEffect(() => {
     if (previousConversationId.current === conversation.id) return;
     previousConversationId.current = conversation.id;
     setMenuOpen(false);
     setProjectPickerOpen(false);
     setRenameOpen(false);
-    setRenameTitle(conversation.title ?? "");
     setDeleteOpen(false);
     setDeleteBranch(false);
     setAutomationOpen(false);
-  }, [conversation.id, conversation.title]);
+  }, [conversation.id]);
 
   useEffect(() => {
     if (!canAddAgent) return;
@@ -234,15 +220,6 @@ export function HeaderConversationMenu({
   const handleProjectSelect = (project: string) => {
     closeMenu();
     moveToProject.mutate({ id: conversation.id, project });
-  };
-
-  const submitRename = (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    const title = renameTitle.trim();
-    if (title && title !== (conversation.title ?? "")) {
-      rename.mutate({ id: conversation.id, title });
-    }
-    setRenameOpen(false);
   };
 
   const confirmDelete = async () => {
@@ -411,14 +388,17 @@ export function HeaderConversationMenu({
         <PencilIcon className="size-3.5" />
         Rename
       </DropdownMenuItem>
-      <DropdownMenuItem
-        data-testid="header-mark-unread-conversation"
-        className={itemClass}
-        onSelect={() => markConversationUnread(conversation.id, conversation.updated_at)}
-      >
-        <MailIcon className="size-3.5" />
-        Mark as unread
-      </DropdownMenuItem>
+      {/* A muted session can't be flagged unread, matching its row menu. */}
+      {canFlagUnread(conversation) && (
+        <DropdownMenuItem
+          data-testid="header-mark-unread-conversation"
+          className={itemClass}
+          onSelect={() => markConversationUnread(conversation.id, conversation.updated_at)}
+        >
+          <MailIcon className="size-3.5" />
+          Mark as unread
+        </DropdownMenuItem>
+      )}
       {canCreateAutomation && (
         <DropdownMenuItem
           data-testid="header-create-automation"
@@ -567,45 +547,12 @@ export function HeaderConversationMenu({
           onOpenChange={setAutomationOpen}
         />
       )}
-      <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
-        <DialogContent>
-          <form onSubmit={submitRename}>
-            <DialogHeader>
-              <DialogTitle>Rename session</DialogTitle>
-              <DialogDescription>Choose a short name that is easy to find later.</DialogDescription>
-            </DialogHeader>
-            <input
-              autoFocus
-              aria-label="Session name"
-              data-testid="header-rename-conversation-input"
-              maxLength={USER_SESSION_TITLE_MAX_CHARS}
-              value={renameTitle}
-              onChange={(event) => setRenameTitle(event.target.value)}
-              onKeyDown={(event: KeyboardEvent<HTMLInputElement>) => {
-                if (event.key === "Escape") setRenameOpen(false);
-              }}
-              className="mt-4 h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/50"
-            />
-            <DialogFooter className="mt-4 border-t-0 bg-transparent mobile-app:flex-col-reverse mobile-app:gap-1">
-              <Button
-                type="button"
-                variant="ghost"
-                className="mobile-touch-target mobile-app:w-full"
-                onClick={() => setRenameOpen(false)}
-              >
-                Cancel
-              </Button>
-              <Button
-                type="submit"
-                className="mobile-touch-target mobile-app:w-full"
-                disabled={!renameTitle.trim() || rename.isPending}
-              >
-                Rename
-              </Button>
-            </DialogFooter>
-          </form>
-        </DialogContent>
-      </Dialog>
+      <RenameSessionDialog
+        conversation={conversation}
+        open={renameOpen}
+        onOpenChange={setRenameOpen}
+        inputTestId="header-rename-conversation-input"
+      />
 
       <Dialog
         open={deleteOpen}
