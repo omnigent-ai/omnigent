@@ -96,6 +96,26 @@ def test_undo_restores_a_token_deleted_with_backspace(
     expect(tag).to_have_count(0)
 
 
+def test_undo_untags_a_pick_of_a_typed_file_name(
+    page: Page, chat_session_contract: ChatSessionContract
+) -> None:
+    chat = chat_session_contract
+    _stub_workspace_files(chat, ["report.md"])
+    environment = f"/v1/sessions/{chat.session_id}/resources/environments/default"
+    chat.contract.json(f"{environment}/search", _listing(("report.md", "file")))
+    composer = _session_composer(page, chat)
+    composer.press_sequentially("alpha bravo @report.md")
+    expect(page.get_by_title("Attach report.md")).to_be_visible()
+    composer.press("Tab")
+    expect(composer).to_have_value("alpha bravo @report.md ")
+    tag = page.get_by_test_id("composer-mention-token")
+    expect(tag).to_be_visible()
+
+    composer.press("ControlOrMeta+z")
+    expect(composer).to_have_value("alpha bravo @report.md")
+    expect(tag).to_have_count(0)
+
+
 def test_undo_reverts_a_clicked_mention_pick_in_the_launcher(
     page: Page, chat_session_contract: ChatSessionContract
 ) -> None:

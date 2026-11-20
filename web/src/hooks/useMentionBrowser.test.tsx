@@ -98,3 +98,28 @@ describe("useMentionBrowser without an editable input", () => {
     expect(setText).toHaveBeenCalledWith("hello @readme.md world");
   });
 });
+
+describe("useMentionBrowser when an undo returns to the typed name", () => {
+  it.each<[string, string, boolean, string[]]>([
+    ["untags the pick the undo reverted", "hello @readme.md", true, []],
+    ["keeps the tag when typing makes the same text", "hello @readme.md", false, ["readme.md"]],
+    ["keeps the tag of a pick that changed no text", "hello @readme.md world", true, ["readme.md"]],
+  ])("%s", (_case, draft, fromHistory, tagged) => {
+    const { result } = renderHook(() =>
+      useMentionBrowser({
+        mention: { query: "readme.md", start: 6, end: 16 },
+        setMention: () => {},
+        mentionEntries: [],
+        text: draft,
+        setText: () => {},
+        textareaRef: { current: null },
+      }),
+    );
+    act(() => result.current.attachMention("readme.md", false));
+    const input = Object.assign(document.createElement("textarea"), { value: draft });
+
+    act(() => result.current.untagUndonePicks({ currentTarget: input, fromHistory }));
+
+    expect(result.current.mentionedItems.map((item) => item.path)).toEqual(tagged);
+  });
+});

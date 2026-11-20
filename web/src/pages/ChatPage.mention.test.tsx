@@ -169,7 +169,7 @@ import * as CodeMirrorModule from "@/components/composer/engine/CodeMirrorCompos
 import { resetCodeMirrorComposerLoadForTests } from "@/components/composer/engine/codeMirrorComposerLoader";
 import { composerTargetOf } from "@/components/composer/engine/composerInput";
 import { insertComposerText } from "@/lib/composerText";
-import { undo } from "@codemirror/commands";
+import { redo, undo } from "@codemirror/commands";
 import { EditorView } from "@codemirror/view";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
@@ -1097,5 +1097,37 @@ describe("Composer @-file mentions with the CodeMirror composer", () => {
 
     act(() => void undo(EditorView.findFromDOM(editor)!));
     expect(target.value).toBe("@");
+  });
+
+  it("sends a file name as typed after undoing and redoing its pick", async () => {
+    const onSend = vi.fn();
+    useChatStore.setState({ conversationId: "conv_codemirror_mention_undo_tag" });
+    renderWithTooltips(
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <Composer {...composerProps({ onSend })} />
+      </CapabilitiesProvider>,
+    );
+    await waitFor(() =>
+      expect(screen.getByLabelText("Message the agent")).toHaveClass("cm-content"),
+    );
+    const editor = screen.getByLabelText("Message the agent");
+    const target = composerTargetOf(editor)!;
+    const view = EditorView.findFromDOM(editor)!;
+    const pills = () => editor.querySelectorAll('[data-testid="composer-mention-token"]');
+
+    act(() => insertComposerText(target, "@readme.md"));
+    fireEvent.click(screen.getByTitle("Attach readme.md"));
+    expect(target.value).toBe("@readme.md ");
+    expect(pills()).toHaveLength(1);
+
+    act(() => void undo(view));
+    expect(target.value).toBe("@readme.md");
+    expect(pills()).toHaveLength(0);
+    act(() => void redo(view));
+    expect(target.value).toBe("@readme.md ");
+    expect(pills()).toHaveLength(0);
+
+    fireEvent.submit(editor.closest("form")!);
+    expect(onSend).toHaveBeenCalledWith("@readme.md", undefined);
   });
 });
