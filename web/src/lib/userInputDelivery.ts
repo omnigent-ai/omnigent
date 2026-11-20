@@ -30,14 +30,18 @@ export function snapshotRefusesSend(session: Session, stableId: string): boolean
  *
  * @param sessionId - The session the send was posted to.
  * @param stableId - The send's stable id.
+ * @param signal - Aborts the snapshot read.
  * @returns `"refused"` or `"delivered"`, or `null` when the fetch itself fails.
  */
 export async function sendVerdictFromServer(
   sessionId: string,
   stableId: string,
+  signal?: AbortSignal,
 ): Promise<"refused" | "delivered" | null> {
   try {
-    const session = await getSessionSlim(sessionId);
+    const session = await (signal
+      ? getSessionSlim(sessionId, { signal })
+      : getSessionSlim(sessionId));
     return snapshotRefusesSend(session, stableId) ? "refused" : "delivered";
   } catch {
     return null;

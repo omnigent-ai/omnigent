@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { MOBILE_BREAKPOINT_PX as MD_BREAKPOINT } from "@/hooks/useIsMobileViewport";
+import { keepsDesktopLayout } from "@/lib/desktopAppLayout";
 import {
   readPanelSizePreference,
   writePanelSizePreference,
@@ -133,10 +134,13 @@ export function useResizablePanel(
 
   // Track whether we're on desktop — only apply inline width there.
   const [isDesktop, setIsDesktop] = useState(
-    () => typeof window !== "undefined" && window.innerWidth >= MD_BREAKPOINT,
+    () =>
+      typeof window !== "undefined" && (keepsDesktopLayout() || window.innerWidth >= MD_BREAKPOINT),
   );
 
   useEffect(() => {
+    // The desktop app keeps the desktop layout at every window width.
+    if (keepsDesktopLayout()) return;
     const mql = window.matchMedia(`(min-width: ${MD_BREAKPOINT}px)`);
     const handler = (e: MediaQueryListEvent) => setIsDesktop(e.matches);
     mql.addEventListener("change", handler);

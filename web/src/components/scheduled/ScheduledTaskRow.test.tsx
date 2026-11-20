@@ -1,5 +1,5 @@
 // Tests for ScheduledTaskRow: the server-sourced next-run text and the ⋯ menu
-// actions (Run now / Pause-Resume / Edit / Share / Delete) dispatching their callbacks.
+// actions (Run now / Pause-Resume / Edit / Share / Clone / Delete) dispatching their callbacks.
 //
 // The row is fully props-driven, so these render it directly with a built task
 // object — no hook mocking needed. The ⋯ menu is a Radix dropdown; opening it
@@ -166,6 +166,24 @@ describe("⋯ menu actions", () => {
     expect(onShare).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["⋯ menu", () => fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 })],
+    ["right-click menu", () => fireEvent.contextMenu(screen.getByTestId("scheduled-task-row"))],
+  ])("offers Clone in the %s only when the page passes onClone", (_label, open) => {
+    const onClone = vi.fn();
+    const t = task();
+    renderRow(t, { onClone });
+    open();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Clone" }));
+    expect(onClone).toHaveBeenCalledWith(t);
+
+    cleanup();
+    renderRow(t);
+    open();
+    expect(screen.getByTestId("task-edit")).toBeInTheDocument();
+    expect(screen.queryByTestId("task-clone")).toBeNull();
+  });
+
   it("disables the menu trigger while the row is busy", () => {
     renderRow(task(), { busy: true });
     expect(screen.getByTestId("task-row-menu")).toBeDisabled();
@@ -180,7 +198,14 @@ describe("an automation shared with the viewer", () => {
       ownerDisplayName: "Alice",
       ...overrides,
     });
-  const ACTIONS = ["task-run-now", "task-edit", "task-share", "task-pause-toggle", "task-delete"];
+  const ACTIONS = [
+    "task-run-now",
+    "task-edit",
+    "task-share",
+    "task-clone",
+    "task-pause-toggle",
+    "task-delete",
+  ];
 
   it("names the owner before the schedule", () => {
     renderRow(shared({ ownerDisplayName: null }));
@@ -202,6 +227,7 @@ describe("an automation shared with the viewer", () => {
       onRunNow: vi.fn(),
       onDelete: vi.fn(),
       onShare: vi.fn(),
+      onClone: vi.fn(),
     };
     renderRow(shared({ state: "paused" }), handlers);
     open();

@@ -39,6 +39,7 @@ const { createConnectionLoading } = require("./connection_loading");
 const { createAboutWindow, resolveAppIconDataUrl } = require("./about_window");
 const { registerFileReveal } = require("./fileReveal");
 const { registerFolderChooser } = require("./folderChooser");
+const { readFindSeed } = require("./findSeed");
 const fs = require("node:fs");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
@@ -81,6 +82,7 @@ const { createBrowserViewRegistry } = require("./browserViewRegistry");
 const { registerBrowserTabsIpc } = require("./browserTabs");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { goBack, goForward, registerBrowserIpc } = require("./browserIpc");
+const { isBrowserViewFocused, sharedDesignTools } = require("./designTools");
 const { arcaTarget, createArcaIdentityStore, isArcaAgentContext } = require("./arcaIdentity");
 const { createHostThisMachineChecker, SESSION_HOST_PROTOCOL } = require("./hostIdentity");
 const { isDeveloperModeEnabled } = require("./developer_mode");
@@ -2970,6 +2972,26 @@ function createWindow(targetUrl, opts = {}) {
     const state = windows.get(win);
     if (state) state.unresponsive = false;
   });
+  // A page's beforeunload objecting (unsaved changes) cancels a close or reload with no
+  // prompt unless main asks: ask, as a browser would.
+  win.webContents.on("will-prevent-unload", (event) => {
+    // Quitting has already stopped the server, so staying would leave a broken app.
+    if (quitConfirmation.isQuitting()) {
+      event.preventDefault();
+      return;
+    }
+    const choice = dialog.showMessageBoxSync(win, {
+      type: "question",
+      title: "Omnigent",
+      message: "Leave this page?",
+      detail: "Changes you made may not be saved.",
+      buttons: ["Leave", "Stay"],
+      defaultId: 0,
+      cancelId: 1,
+      noLink: true,
+    });
+    if (choice === 0) event.preventDefault();
+  });
   registerWorkspaceRootBounce(win.webContents, () => pinnedOrigin(win));
   // Show the return banner when the window navigates away from its server
   // (e.g. SSO) and stays away. The watch's on-away URL is the last committed
@@ -3018,7 +3040,11 @@ function createWindow(targetUrl, opts = {}) {
   // exception — an OAuth sign-in popup, whose callback needs window.opener
   // and the opener's localStorage — opens as a hardened child window.
   // Conditions in popupPolicy.js; hardening in hardenOauthPopup.
-  win.webContents.setWindowOpenHandler(({ url, disposition, features }) => {
+  win.webContents.setWindowOpenHandler(({ url, disposition, features, frameName }) => {
+    // A design tool's overlay: allowed only as about:blank, from the opening's owner, under
+    // the unclaimed frame name designTools.start issued. Null for any other open.
+    const designOverlay = sharedDesignTools().windowOpen(win, { url, frameName });
+    if (designOverlay) return designOverlay;
     const origin = pinnedOrigin(win);
     if (usesBrowserAuth(origin) && isDatabricksLoginUrl(url, origin)) {
       getDatabricksAuth().recover(win);
@@ -3195,6 +3221,10 @@ function attachContextMenu(win) {
  * @type {Map<BrowserWindow, BrowserWindow>} shell window → its find bar
  */
 const findBars = new Map();
+/** Count of find opens per shell window, so only the latest selection read applies. */
+const findOpenGenerations = new WeakMap();
+/** Per find bar, resolves once it has shown and its page can take a prefill. */
+const findBarsShown = new WeakMap();
 
 /**
  * Anchor a find bar to its parent's top-right content corner. Called at
@@ -3223,13 +3253,26 @@ function positionFindBar(target, bar) {
  * @param {BrowserWindow} target The shell window to search.
  */
 function openFindBar(target) {
+  const existing = findBars.get(target);
+  const isOpen = existing !== undefined && !existing.isDestroyed();
+  const generation = (findOpenGenerations.get(target) ?? 0) + 1;
+  findOpenGenerations.set(target, generation);
+  // Cmd/Ctrl+F from inside the bar keeps its query; from the page, a selection
+  // replaces it. Read before find-opened re-renders the transcript.
+  const seed =
+    isOpen && existing.isFocused() ? Promise.resolve(null) : readFindSeed(target.webContents);
+  // A later open, even from inside the bar, supersedes a read still in flight.
+  const prefill = (bar) =>
+    Promise.all([seed, findBarsShown.get(bar)]).then(([text]) => {
+      if (findOpenGenerations.get(target) === generation) prefillFindBar(bar, text);
+    });
   // The menu item opens the bar without a page keydown; the page must still
   // render every transcript row for find to reach off-screen messages.
   target.webContents.send("omnigent:find-opened");
-  const existing = findBars.get(target);
-  if (existing && !existing.isDestroyed()) {
+  if (isOpen) {
     existing.focus();
     existing.webContents.send("omnigent:find-activate");
+    void prefill(existing);
     return;
   }
   const bar = new BrowserWindow({
@@ -3250,6 +3293,12 @@ function openFindBar(target) {
     },
   });
   findBars.set(target, bar);
+  findBarsShown.set(
+    bar,
+    new Promise((resolve) => {
+      bar.once("ready-to-show", resolve);
+    }),
+  );
   void bar.loadFile(FIND_PAGE);
 
   const reposition = () => positionFindBar(target, bar);
@@ -3274,6 +3323,7 @@ function openFindBar(target) {
     reposition();
     bar.show();
   });
+  void prefill(bar);
   bar.on("closed", () => {
     findBars.delete(target);
     if (target.isDestroyed()) return;
@@ -3287,6 +3337,12 @@ function openFindBar(target) {
     target.webContents.stopFindInPage("clearSelection");
     target.focus();
   });
+}
+
+// Make the page's selected text the bar's query; a null seed leaves the bar as is.
+function prefillFindBar(bar, text) {
+  if (text === null || bar.isDestroyed()) return;
+  bar.webContents.send("omnigent:find-prefill", { text });
 }
 
 /** The conversation a shell URL shows, or null. Routes end in `/c/<id>` after any mount. */
@@ -4524,6 +4580,7 @@ function createBrowserRegistryForWindow(win) {
     resolveProxy: (url, partition) => session.fromPartition(partition).resolveProxy(url),
     onSuppressionChange: (suppressed) => {
       if (suppressed) browserPermissionPrompt.dismiss(win);
+      sharedDesignTools().visibilityChanged(win);
     },
     allowsLocalhost: (context) => {
       if (context?.revoked || win.isDestroyed() || !pinnedOrigin(win)) return false;
@@ -4542,8 +4599,13 @@ function createBrowserRegistryForWindow(win) {
     attachToHost: (view) => {
       win.contentView.addChildView(view);
       reconnectOverlay.raise(win);
+      // A design tool's overlay goes back just above its page (below the reconnect overlay).
+      sharedDesignTools().viewAttached(win, view);
     },
-    detachFromHost: (view) => win.contentView.removeChildView(view),
+    detachFromHost: (view) => {
+      win.contentView.removeChildView(view);
+      sharedDesignTools().viewDetached(win, view);
+    },
     sendToRenderer: (channel, payload) => {
       if (channel === "browser-host-active-changed") browserPermissionPrompt.dismiss(win);
       try {
@@ -6173,7 +6235,7 @@ function sendDesktopCommand(win, command, extra = {}) {
 
 /**
  * The embedded browser view (by view ID) holding keyboard focus in `win`, or
- * null. Only the attached view can hold focus, so checking it is enough.
+ * null. Only the attached view (or its design tool's overlay) can hold focus.
  *
  * @param {BrowserWindow} win
  * @returns {string | null}
@@ -6183,7 +6245,7 @@ function focusedBrowserViewId(win) {
   const viewId = registry?.activeConversationId() ?? null;
   if (viewId === null) return null;
   try {
-    return registry.get(viewId)?.view.webContents.isFocused() ? viewId : null;
+    return isBrowserViewFocused(registry.get(viewId)) ? viewId : null;
   } catch {
     return null;
   }
