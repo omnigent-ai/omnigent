@@ -159,10 +159,11 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   harness as text. A claude-sdk `/clear` continues in a new, empty session on
   the same machine and the view follows it. States: loading, error/retry,
   unavailable while disconnected, and an incomplete catalog.
-- `command-and-shell-tint`: in the main chat, side chats and the new-session
-  composer (textarea or CodeMirror), a leading known command or skill is tinted
-  and an unknown `/word` is not; the sent bubble keeps the tint, except for a
-  message relayed from another session. In Claude Code and Codex native
+- `command-and-shell-tint`: in the main chat, side chats, Canvas grid cells
+  and the new-session composer (textarea or CodeMirror), a leading known
+  command or skill is tinted (the main chat's built-ins in any case, as they
+  run) and an unknown `/word` is not; the sent bubble keeps the tint, except
+  for a message relayed from another session. In Claude Code and Codex native
   sessions a leading `!` is tinted with a "Shell command" hint (Codex skips
   leading whitespace and treats `!!` as text). States: known or unknown
   command; quotes or attachments (no tint); shell mode; refused shell send,
@@ -392,10 +393,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - In a Codex native chat, a Claude Code native chat, or a Polly session with a
   Goal control, send `/goal`, choose `/goal` from the slash menu, or open
   **+ → Goal**.
-- In the in-session composer, a side chat, or the new-session composer, type a
-  known command or skill such as `/help`; in a Claude Code or Codex native
-  session (or with that agent chosen on the new-session composer), type a draft
-  that starts with `!`.
+- In the in-session composer, a side chat, a Canvas grid cell, or the
+  new-session composer, type a known command or skill such as `/help`; in a
+  Claude Code or Codex native session (or with that agent chosen on the
+  new-session composer), type a draft that starts with `!`.
 
 **In-session composer** (open any session):
 
@@ -905,7 +906,7 @@ composer with its prompt`).
   `web/src/pages/ChatPage.userBubble.test.tsx` (sent-bubble tint). Manually,
   in a Codex native session as owner, type `!echo hi`: the `!` is tinted and
   the hint shows; add an @-tag and send to see the refusal. Repeat in a side
-  chat and on the new-session composer, with and without
+  chat, a Canvas grid cell and on the new-session composer, with and without
   `chat_composer_codemirror`.
 - **`goal-command`:**
   `tests/e2e_ui/chat/test_codex_goal_mode.py::test_codex_goal_mode_processes_first_message_with_untrusted_hooks`
