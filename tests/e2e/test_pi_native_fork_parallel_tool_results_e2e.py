@@ -146,6 +146,8 @@ def pi_fork_rig(
             " row = {'helper':os.getpid(),'pi':os.environ.get('OMNIGENT_PI_NATIVE_PID')}\n"
             " f.write(json.dumps(row) + '\\n')\n"
             "mode = (root / 'auth-mode').read_text()\n"
+            "if mode.endswith('_once'):\n"
+            " (root / 'auth-mode').write_text('ok'); mode = mode.removesuffix('_once')\n"
             "if mode == 'slow': time.sleep(40)\n"
             "if mode == 'failed_exit':\n"
             " print('PRIVATE-HELPER-ERROR',file=sys.stderr); sys.exit(7)\n"
@@ -158,6 +160,9 @@ def pi_fork_rig(
         }
         replies[2:] = [
             anthropic_sse_text_response(f"AUTH-RECOVERED-{i}", model=_MODEL) for i in range(3)
+        ] + [
+            anthropic_sse_text_response(f"AUTH-TRANSIENT-{kind}", model=_MODEL)
+            for kind in ("failed_exit", "empty")
         ]
 
     class Handler(BaseHTTPRequestHandler):
@@ -780,7 +785,7 @@ def test_pi_native_compacted_restart_then_fork(
 def test_pi_native_token_failure_recovers_without_replaying_tools(
     pi_fork_rig: PiForkRig, tmp_path: Path
 ) -> None:
-    """Real server/runner/Pi: refresh, classified failures, cleanup and same-PID recovery."""
+    """Real server/runner/Pi: refresh, persistent and one-off failures, cleanup and recovery."""
     client, stack, requests, _ = pi_fork_rig
     runner_id = stack.runner_id
     workspace = tmp_path / "workspace"
@@ -863,6 +868,25 @@ def test_pi_native_token_failure_recovers_without_replaying_tools(
             (workspace / "auth-mode").write_text("ok")
             send(f"Continue after authentication recovered {i}.")
             _wait(lambda i=i: f"AUTH-RECOVERED-{i}" in json.dumps(items()))
+            assert len(requests) == before + 1
+            assert native_pids() == pids
+        for kind in ("failed_exit", "empty"):
+            (workspace / "auth-mode").write_text(f"{kind}_once")
+            before = len(requests)
+            old_errors = {item["id"] for item in items() if item["type"] == "error"}
+            send(f"Continue through a one-off {kind} token result.")
+            outcome = _wait(
+                lambda kind=kind, old_errors=old_errors: next(
+                    (
+                        item
+                        for item in items()
+                        if (item["type"] == "error" and item["id"] not in old_errors)
+                        or f"AUTH-TRANSIENT-{kind}" in json.dumps(item)
+                    ),
+                    None,
+                )
+            )
+            assert outcome["type"] != "error", outcome
             assert len(requests) == before + 1
             assert native_pids() == pids
         history = json.dumps(requests[-1]["messages"])

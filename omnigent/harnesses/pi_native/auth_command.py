@@ -21,6 +21,9 @@ AUTH_DIR_ENV = "OMNIGENT_PI_NATIVE_AUTH_DIR"
 AUTH_DIR_NAME = "omnigent-auth"
 # Leave time for cleanup and delivery inside Pi's ten-second shell deadline.
 AUTH_TIMEOUT_MS = 8_000
+# Pi runs the command for every model request, so retry a failed or empty result
+# after these pauses instead of failing the turn; retries share the deadline.
+AUTH_RETRY_DELAYS_MS = (250, 1_000)
 
 
 def wrap_auth_command(
@@ -49,6 +52,7 @@ def wrap_auth_command(
         {
             "command": command,
             "timeoutMs": AUTH_TIMEOUT_MS,
+            "retryDelaysMs": list(AUTH_RETRY_DELAYS_MS),
             "refreshIntervalMs": refresh_interval_ms,
             "refreshTimeoutMs": refresh_timeout_ms,
             "cachePath": str(auth_dir / f"token-{cache_name}.json"),
