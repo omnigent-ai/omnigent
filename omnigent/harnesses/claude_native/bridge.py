@@ -10099,12 +10099,16 @@ def read_resume_cost_baseline(bridge_dir: Path) -> ResumeCostBaseline | None:
         return None
     if isinstance(cost_usd, bool) or not isinstance(cost_usd, (int, float)):
         return None
-    if not math.isfinite(cost_usd) or cost_usd <= 0:
+    try:
+        cost = float(cost_usd)
+    except OverflowError:  # an integer too large for a float
+        return None
+    if not math.isfinite(cost) or cost <= 0:
         return None
     if restored is not None and not isinstance(restored, bool):
         return None
     return ResumeCostBaseline(
-        claude_session_id=claude_session_id, cost_usd=float(cost_usd), restored=restored
+        claude_session_id=claude_session_id, cost_usd=cost, restored=restored
     )
 
 

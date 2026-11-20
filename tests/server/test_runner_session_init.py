@@ -296,7 +296,8 @@ def test_reconnect_init_envelope_carries_fork_history_directives(db_uri: str) ->
 
 
 @pytest.mark.parametrize(
-    ("session_usage", "expected"), [({"total_cost_usd": 1.25}, 1.25), ({}, None)]
+    ("session_usage", "expected"),
+    [({"total_cost_usd": 1.25}, 1.25), ({"total_cost_usd": 10**400}, None), ({}, None)],
 )
 def test_init_envelope_carries_the_sessions_own_cost(
     db_uri: str, session_usage: dict[str, float], expected: float | None

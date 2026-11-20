@@ -49,7 +49,11 @@ def _own_cost_usd(conversation: Conversation) -> float | None:
     cost = (conversation.session_usage or {}).get("total_cost_usd")
     if isinstance(cost, bool) or not isinstance(cost, (int, float)):
         return None
-    return float(cost) if math.isfinite(cost) and cost > 0 else None
+    try:
+        value = float(cost)
+    except OverflowError:  # an integer too large for a float
+        return None
+    return value if math.isfinite(value) and value > 0 else None
 
 
 class RunnerSessionInitEnvelope(BaseModel):  # type: ignore[explicit-any]  # Pydantic uses Any

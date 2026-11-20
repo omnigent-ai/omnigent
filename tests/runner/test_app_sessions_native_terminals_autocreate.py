@@ -3450,13 +3450,13 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
     # ``start_at_end`` must be correct *because* the resume branch ran, not
     # by coincidence: synthesis happens exactly when (and only when) the
     # snapshot carried an external session id.
-    # A cold resume keeps counting from the session's own cost; a fork's rebuild
-    # starts its own.
     if snapshot_external_id is not None:
         assert synth_calls == [snapshot_external_id]
+        # A cold resume keeps counting from the session's own cost.
         assert synth_costs == [1.25]
     else:
         assert len(synth_calls) == int(fork_carry_history)
+        # A fork's rebuild starts its own count.
         assert synth_costs == [None] * int(fork_carry_history)
 
     # Startup gets image guidance; session-title metadata stays out of it.

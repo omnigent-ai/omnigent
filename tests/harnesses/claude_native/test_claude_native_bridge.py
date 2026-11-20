@@ -18074,12 +18074,22 @@ def test_a_sandboxed_helper_accepts_the_bridge_under_its_read_only_pinned_tmpdir
         {"claude_session_id": "", "cost_usd": 1.0, "restored": None},
         {"claude_session_id": "sid", "cost_usd": 0, "restored": None},
         {"claude_session_id": "sid", "cost_usd": float("nan"), "restored": None},
+        {"claude_session_id": "sid", "cost_usd": 10**400, "restored": None},
         {"claude_session_id": "sid", "cost_usd": True, "restored": None},
         {"claude_session_id": "sid", "cost_usd": "1.0", "restored": None},
         {"claude_session_id": "sid", "cost_usd": 1.0, "restored": "yes"},
         ["sid", 1.0],
     ],
-    ids=["no-session", "zero", "nan", "bool", "string", "bad-decision", "not-an-object"],
+    ids=[
+        "no-session",
+        "zero",
+        "nan",
+        "overflow",
+        "bool",
+        "string",
+        "bad-decision",
+        "not-an-object",
+    ],
 )
 def test_read_resume_cost_baseline_ignores_a_malformed_record(
     tmp_path: Path, record: object
