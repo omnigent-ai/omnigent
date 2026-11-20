@@ -13859,6 +13859,7 @@ def _create_session_from_bundle(
     git_branch: str | None = None,
     created_by: str | None = None,
     agent_store: AgentStore | None = None,
+    parent: Conversation | None = None,
 ) -> CreatedSessionResponse:
     """
     Validate, store, and persist a bundled session request.
@@ -13889,6 +13890,8 @@ def _create_session_from_bundle(
         owner. ``None`` in single-user mode.
     :param agent_store: Store holding the uploader's agents. ``None``
         gives every upload its own row.
+    :param parent: The authorized parent session row of a child upload. A
+        child whose spec sets no launch args starts in its current mode.
     :returns: Response with the new session id.
     :raises OmnigentError: If bundle validation or agent insert
         integrity checks fail, or the parent session vanished
@@ -13924,6 +13927,10 @@ def _create_session_from_bundle(
                 f"invalid terminal_launch_args in bundled child spec: {exc}",
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
+        if terminal_launch_args is None:
+            terminal_launch_args = _inherited_parent_permission_launch_args(
+                parent, _spec_harness(spec), spec
+            )
         metadata = metadata.model_copy(update={"terminal_launch_args": terminal_launch_args})
     elif metadata.terminal_launch_args is None:
         # Top-level bundle create (the ``omnigent run <dir>`` shape): honor the

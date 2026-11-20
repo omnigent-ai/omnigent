@@ -1687,6 +1687,46 @@ async def test_custom_native_parent_passes_on_its_mode(auth_client, peers, db_ur
     assert child.terminal_launch_args == PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"]
 
 
+@pytest.mark.parametrize(
+    ("parent", "spec_config", "expected"),
+    [
+        pytest.param(
+            ("codex-native", {"omnigent.codex_native.approval_mode": "approve-for-me"}, None),
+            {},
+            ["--permission-mode", "auto"],
+            id="codex-approve-for-me-to-claude",
+        ),
+        pytest.param(_CLAUDE_AUTO_PARENT, {}, ["--permission-mode", "auto"], id="claude-auto"),
+        pytest.param(
+            _CLAUDE_AUTO_PARENT,
+            {"permission_mode": "plan"},
+            ["--permission-mode", "plan"],
+            id="spec-over-parent",
+        ),
+    ],
+)
+async def test_uploaded_child_starts_in_its_parents_permission_mode(
+    auth_client, peers, db_uri, parent, spec_config, expected
+):
+    from tests._helpers.session import post_session_bundle
+    from tests.server.helpers import build_agent_bundle
+
+    source, _, _ = peers
+    _set_native_parent(db_uri, source["id"], parent)
+    # sys_session_create(config_path=...) uploads the child's bundle under its parent.
+    bundle = build_agent_bundle(
+        "uploaded-claude-child",
+        executor={"config": {"harness": "claude-native", **spec_config}},
+    )
+    uploaded = await post_session_bundle(
+        auth_client.post, "/v1/sessions", bundle, metadata={"parent_session_id": source["id"]}
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    child = SqlAlchemyConversationStore(db_uri).get_conversation(uploaded.json()["session_id"])
+    assert child.parent_conversation_id == source["id"]
+    assert child.terminal_launch_args == expected
+
+
 async def test_added_agent_and_independent_worker_inheritance(
     auth_client, peers, db_uri, monkeypatch
 ):
