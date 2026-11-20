@@ -75,6 +75,11 @@ MCP independent creation.
   host. An automation that sets a mode gives it to its run's workers first (see
   `scheduled`), and a worker whose agent sets a mode keeps it. Coverage:
   `tests/e2e/test_nested_agent_permission_mode_e2e.py`.
+  Without one, a child (also one added from the Agents panel's Add agent) starts in
+  its Claude Code or Codex parent's current mode, mapped to its own harness (Claude
+  Code Auto ↔ Codex Approve for me), unless its agent spec or an automation sets a
+  mode. Approval-skipping, plan/read-only and default parent modes aren't passed on.
+  Covered by `tests/server/integration/test_session_orchestration.py::test_sub_agent_starts_in_its_parents_permission_mode`.
   An optional `workflow_id` (agent_id only) starts the session as a run of one
   of the owner's saved workflows, with that workflow's plan already in its
   journal. With workflows disabled, or on a server that doesn't advertise
