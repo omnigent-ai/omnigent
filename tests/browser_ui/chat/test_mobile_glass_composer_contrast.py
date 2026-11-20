@@ -157,10 +157,10 @@ def test_phone_glass_composer_draft_stays_readable_over_white_content(
     tag_scroller(page)
 
     composer = page.get_by_label("Message the agent")
-    _scroll_last_image_behind(page, composer)
     composer.click()
     composer.press_sequentially(_DRAFT, delay=20)
     expect(composer).to_have_value(_DRAFT)
+    _scroll_last_image_behind(page, composer)
 
     measured = _draft_contrast(composer)
     assert measured["ratio"] >= _MIN_TEXT_CONTRAST, measured
