@@ -364,6 +364,52 @@ def test_legacy_failure_never_authorizes_a_dependent_prompt(
         assert composer.sends == []
 
 
+@pytest.mark.parametrize("fault", ["delayed-submit-echo", "late-status"])
+def test_legacy_model_switch_sends_no_keys_after_its_observation_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    composer = _SessionModelComposer()
+    composer.version = "2.1.322"
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    composer.install(monkeypatch)
+    budget_s = 1.0
+    sent_at: list[float] = []
+    initial_model = composer.model
+    target = "private-glm[1m]"
+
+    def send(socket_path: str, *args: str) -> None:
+        bridge._check_injection_cancelled()
+        sent_at.append(bridge.time.monotonic())
+        composer._run_tmux(socket_path, *args)
+
+    def capture(socket_path: str, pane_target: str, *, join_wrapped: bool = False) -> str:
+        pane = composer._capture_pane(socket_path, pane_target, join_wrapped=join_wrapped)
+        delayed_echo = fault == "delayed-submit-echo" and composer.text == f"/model {target}"
+        late_status = fault == "late-status" and bool(composer.submitted)
+        if delayed_echo or late_status:
+            bridge.time.sleep(budget_s)
+            if late_status:
+                raw_path = bridge_dir / bridge.CONTEXT_RAW_FILE
+                raw = json.loads(raw_path.read_text())
+                raw["model"] = {"id": target}
+                raw_path.write_text(json.dumps(raw))
+            bridge._check_injection_cancelled()
+        return pane
+
+    monkeypatch.setattr(bridge, "_run_tmux", send)
+    monkeypatch.setattr(bridge, "_capture_pane", capture)
+
+    with pytest.raises(bridge.ClaudeModelSwitchRefused) as caught:
+        bridge.inject_model_command(bridge_dir, model=target, timeout_s=budget_s)
+
+    submitted = fault == "late-status"
+    assert caught.value.model_may_have_changed is submitted
+    assert composer.submitted == ([f"/model {target}"] if submitted else [])
+    assert composer.model == composer.saved_default == (target if submitted else initial_model)
+    assert sent_at and all(at < budget_s for at in sent_at)
+    assert composer.confirmations == 0
+
+
 @pytest.mark.parametrize("changed", ["advertisement", "target", "owner", "native-session"])
 def test_late_legacy_confirmation_stops_when_the_receiving_pane_or_session_changes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed: str

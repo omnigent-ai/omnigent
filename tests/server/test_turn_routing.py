@@ -1108,13 +1108,14 @@ async def test_replay_keeps_the_prompt_pending_when_the_model_actuator_is_not_tr
     ],
     ids=["picker-refusal", "unsupported-cli"],
 )
-async def test_replay_refused_model_switch_can_be_explicitly_retried(
+async def test_replay_refused_model_switch_can_be_rescheduled_by_the_caller(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     refusal: str,
     unsupported: bool,
     notification_fails: bool,
 ) -> None:
+    """Internal rescheduling preserves the prompt; no UI Retry action is invoked."""
     from omnigent.harnesses.claude_native.bridge import (
         ClaudeModelSwitchRefused,
         ClaudeModelSwitchResult,
@@ -1171,7 +1172,8 @@ async def test_replay_refused_model_switch_can_be_explicitly_retried(
                         ),
                         "remediation": (
                             "Open Terminal to check the current model and resolve the "
-                            "refusal. The saved message will not retry automatically."
+                            "refusal, then enter and send your message again. "
+                            "The saved message will not retry automatically."
                         ),
                     },
                 },

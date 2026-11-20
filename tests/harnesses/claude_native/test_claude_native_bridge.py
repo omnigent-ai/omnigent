@@ -13712,16 +13712,23 @@ def test_model_command_rechecks_an_owned_draft_before_clearing_it(
 
 
 @pytest.mark.parametrize(
-    ("expected", "actual", "matches"),
+    ("expected", "actual", "reported_session", "matches"),
     [
-        ("system.ai.claude-opus-4-8[1m]", "system.ai.claude-opus-4-8", True),
-        ("system.ai.claude-opus-4-8[1m]", "system.ai.claude-opus-4-8[1m]", True),
-        ("system.ai.claude-opus-4-8", "system.ai.claude-opus-4-8[1m]", False),
-        ("system.ai.claude-opus-5[1m]", "system.ai.claude-opus-5", False),
-        ("private-model[1m]", "private-model", False),
-        ("private-model[1m]", "private-model[1m]", True),
-        ("system.ai.claude-opus-4-8-Private[1m]", "system.ai.claude-opus-4-8-Private", False),
-        ("system.ai.claude-opus-4-8[1m]", "system.ai.claude-opus-5", False),
+        ("system.ai.claude-opus-4-8[1m]", "system.ai.claude-opus-4-8", "native-session", True),
+        ("system.ai.claude-opus-4-8[1m]", "system.ai.claude-opus-4-8[1m]", "native-session", True),
+        ("system.ai.claude-opus-4-8", "system.ai.claude-opus-4-8[1m]", "native-session", False),
+        ("system.ai.claude-opus-5[1m]", "system.ai.claude-opus-5", "native-session", False),
+        ("private-model[1m]", "private-model", "native-session", False),
+        ("private-model[1m]", "private-model[1m]", "native-session", True),
+        (
+            "system.ai.claude-opus-4-8-Private[1m]",
+            "system.ai.claude-opus-4-8-Private",
+            "native-session",
+            False,
+        ),
+        ("system.ai.claude-opus-4-8[1m]", "system.ai.claude-opus-5", "native-session", False),
+        ("system.ai.claude-opus-4-8[1m]", "system.ai.claude-opus-4-8", None, False),
+        ("system.ai.claude-opus-4-8[1m]", "system.ai.claude-opus-4-8", "earlier-session", False),
     ],
     ids=[
         "documented-native-context-spelling",
@@ -13732,16 +13739,22 @@ def test_model_command_rechecks_an_owned_draft_before_clearing_it(
         "exact-private-context",
         "public-looking-private-context-is-literal",
         "wrong-generation",
+        "missing-status-session",
+        "different-status-session",
     ],
 )
 def test_managed_model_status_check_preserves_exact_context_identity(
-    tmp_path: Path, expected: str, actual: str, matches: bool
+    tmp_path: Path, expected: str, actual: str, reported_session: str | None, matches: bool
 ) -> None:
     composer = _SessionModelComposer()
     composer.model = actual
     bridge_dir = _session_model_bridge(tmp_path, composer)
     raw_path = bridge_dir / claude_native_bridge.CONTEXT_RAW_FILE
     raw = json.loads(raw_path.read_text())
+    if reported_session is None:
+        raw.pop("session_id")
+    else:
+        raw["session_id"] = reported_session
     raw["context_window"] = {"context_window_size": 1_000_000}
     raw_path.write_text(json.dumps(raw))
 
