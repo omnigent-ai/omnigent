@@ -34,26 +34,14 @@ const FOCUSABLE = "button:not([disabled]), [href], [tabindex]:not([tabindex='-1'
 
 type RowSlot = Exclude<SessionControlSlot, "icon" | "create">;
 
-const ROWS: { slot: RowSlot; label: string }[] = [
-  { slot: "host", label: "Host" },
-  { slot: "permission", label: "Permissions" },
-  { slot: "harness", label: "Harness" },
-];
+// The controls name themselves, so the rows carry no labels.
+const ROWS: RowSlot[] = ["host", "permission", "harness"];
 
-function ControlRow({
-  sessionId,
-  slot,
-  label,
-}: {
-  sessionId: string | null;
-  slot: RowSlot;
-  label: string;
-}) {
+function ControlRow({ sessionId, slot }: { sessionId: string | null; slot: RowSlot }) {
   const ref = useSessionControlSlotRef(sessionId, slot);
   // A row whose control the composer doesn't offer (an empty slot) hides itself.
   return (
-    <div className="flex min-w-0 items-center gap-3 has-[>[data-control-slot]:empty]:hidden">
-      <span className="w-20 shrink-0 text-xs text-muted-foreground">{label}</span>
+    <div className="flex min-w-0 items-center has-[>[data-control-slot]:empty]:hidden">
       <div
         ref={ref}
         data-control-slot
@@ -291,8 +279,8 @@ export function ThingyOpenSessionButton({
         }}
       >
         <div ref={setContentRef} className="flex flex-col gap-2">
-          {ROWS.map((row) => (
-            <ControlRow key={row.slot} sessionId={sessionId} slot={row.slot} label={row.label} />
+          {ROWS.map((slot) => (
+            <ControlRow key={slot} sessionId={sessionId} slot={slot} />
           ))}
         </div>
         {creating && <CreateSlot onFilled={setCreateSlot} />}
