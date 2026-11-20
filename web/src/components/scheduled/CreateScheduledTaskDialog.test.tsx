@@ -2127,6 +2127,9 @@ describe("CreateScheduledTaskDialog submit", () => {
     fireEvent.keyDown(screen.getByLabelText("Repeat unit"), { key: "Enter" });
     fireEvent.click(await screen.findByRole("option", { name: "Hourly" }));
     fireEvent.change(screen.getByTestId("custom-interval"), { target: { value: "3" } });
+    // Without an hour limit, runs follow the interval rather than ending at 11 PM.
+    expect(screen.getByLabelText("Last run hour")).toHaveTextContent("End of day");
+    expect(screen.getByTestId("task-schedule-trigger")).toHaveTextContent("Every 3 hours");
     fireEvent.keyDown(screen.getByLabelText("First run hour"), { key: "Enter" });
     fireEvent.click(await screen.findByRole("option", { name: "9:00 AM" }));
     // 11 PM is not on the 3-hour step from 9 AM, so the last run moves to 9 PM.

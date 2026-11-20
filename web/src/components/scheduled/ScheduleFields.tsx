@@ -520,8 +520,11 @@ export function ScheduleFields({
                   className={inlineChoiceClass}
                   disabled={custom && !anchoredScheduling}
                   value={String(model.hourWindow.end)}
-                  options={hourOptions(model.minute, (hour) =>
-                    isReachableLastHour(model.hourWindow.start, hour, step),
+                  options={hourOptions(
+                    model.minute,
+                    (hour) => isReachableLastHour(model.hourWindow.start, hour, step),
+                    // 12 AM to 11 PM means no hour limit; with a wider step 11 PM isn't a run.
+                    model.hourWindow.start === 0 && step > 1,
                   )}
                   onChange={(value) =>
                     onChange({ ...model, hourWindow: { ...model.hourWindow, end: Number(value) } })
@@ -858,11 +861,12 @@ function WeekdayButtons({
 function hourOptions(
   minute: number,
   enabled: (hour: number) => boolean,
+  lastHourEndsDay = false,
 ): { value: string; label: string; disabled?: boolean }[] {
   const shownMinute = Number.isInteger(minute) && minute >= 0 && minute <= 59 ? minute : 0;
   return Array.from({ length: 24 }, (_, hour) => ({
     value: String(hour),
-    label: formatClockTime(hour, shownMinute),
+    label: lastHourEndsDay && hour === 23 ? "End of day" : formatClockTime(hour, shownMinute),
     disabled: !enabled(hour),
   }));
 }
