@@ -3081,3 +3081,145 @@ def test_draft_detected_when_single_long_paragraph_scrolled_with_more_lines() ->
     assert all(needle not in region for needle in needles)
     assert _mod._draft_in_input_region(pane, needles[0], baseline, tuple(needles[1:]))
     assert not _mod._draft_in_input_region(pane, needles[0], region, tuple(needles[1:]))
+
+
+def test_read_agy_settings_model_reads_isolated_settings(tmp_path: Path) -> None:
+    """Reads non-empty ``model`` from isolated settings.json and tolerates corrupt files."""
+    bridge_dir = tmp_path / "bridge"
+    assert _mod.read_agy_settings_model(bridge_dir) is None
+
+    settings_path = _mod.agy_settings_path(bridge_dir)
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text("{not json", encoding="utf-8")
+    assert _mod.read_agy_settings_model(bridge_dir) is None
+
+    settings_path.write_text('{"model": "   "}', encoding="utf-8")
+    assert _mod.read_agy_settings_model(bridge_dir) is None
+
+    settings_path.write_text('{"model": "Claude Sonnet 4.6 (Thinking)"}', encoding="utf-8")
+    assert _mod.read_agy_settings_model(bridge_dir) == "Claude Sonnet 4.6 (Thinking)"
+
+
+def test_inject_model_command_sends_slash_model_and_confirms_settings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-interactive ``/model <slug>`` clears draft, submits, and confirms via settings.json."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    _mod.write_tmux_target(bridge_dir, socket_path=tmp_path / "tmux.sock", tmux_target="main")
+    settings_path = _mod.agy_settings_path(bridge_dir)
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text('{"model": "Gemini 3.8 Flash (High)"}', encoding="utf-8")
+
+    tmux_calls: list[tuple[str, ...]] = []
+
+    def _fake_tmux(_socket: str, *args: str) -> None:
+        tmux_calls.append(args)
+        if args[-1] == "Enter":
+            settings_path.write_text('{"model": "Claude Sonnet 4.6 (Thinking)"}', encoding="utf-8")
+
+    monkeypatch.setattr(_mod, "_session_alive", lambda _s, _t: True)
+    monkeypatch.setattr(_mod, "_capture_pane", lambda _s, _t: "> \n? for shortcuts")
+    monkeypatch.setattr(_mod, "_run_tmux", _fake_tmux)
+    monkeypatch.setattr(_mod.time, "sleep", lambda _s: None)
+
+    confirmed = _mod.inject_model_command(
+        bridge_dir,
+        model="claude-sonnet-4-6",
+        expected_display_name="Claude Sonnet 4.6 (Thinking)",
+        timeout_s=1.0,
+        confirm_timeout_s=1.0,
+    )
+    assert confirmed == "Claude Sonnet 4.6 (Thinking)"
+    assert tmux_calls == [
+        ("send-keys", "-t", "main", "C-a"),
+        ("send-keys", "-t", "main", "C-k"),
+        ("send-keys", "-t", "main", "-l", "--", "/model claude-sonnet-4-6"),
+        ("send-keys", "-t", "main", "Enter"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "bad_model",
+    ["", "   ", "model\nrm -rf", "model with space", "m\x1b[31m", "m\x9b31m", "--evil"],
+)
+def test_inject_model_command_rejects_invalid_model_ids(tmp_path: Path, bad_model: str) -> None:
+    """Empty, whitespace, flag-shaped, or C0/C1 control model ids fail fast before tmux."""
+    with pytest.raises(ValueError):
+        _mod.inject_model_command(tmp_path, model=bad_model, expected_display_name="Any")
+
+
+@pytest.mark.parametrize(
+    ("pane", "expected_match"),
+    [
+        (
+            "? for shortcuts\n" + "\n".join(f"line {i}" for i in range(8)) + "\nesc to cancel",
+            "while a turn is running",
+        ),
+        ("Do you trust this project?\n[1] Yes\n[2] No", "not at an idle prompt"),
+        ("Verifying your account eligibility...\n? for shortcuts", "still verifying"),
+    ],
+)
+def test_inject_model_command_rejects_non_idle_panes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pane: str,
+    expected_match: str,
+) -> None:
+    """Busy, modal, or account-verifying panes fail loudly instead of typing ``/model``."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    _mod.write_tmux_target(bridge_dir, socket_path=tmp_path / "tmux.sock", tmux_target="main")
+    monkeypatch.setattr(_mod, "_session_alive", lambda _s, _t: True)
+    monkeypatch.setattr(_mod, "_capture_pane", lambda _s, _t: pane)
+
+    with pytest.raises(RuntimeError, match=expected_match):
+        _mod.inject_model_command(
+            bridge_dir,
+            model="claude-sonnet-4-6",
+            expected_display_name="Claude Sonnet 4.6 (Thinking)",
+            timeout_s=0.05,
+            confirm_timeout_s=0.1,
+        )
+
+
+def test_inject_model_command_fails_when_settings_never_confirms(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unconfirmed switches raise RuntimeError so the server rolls back model_override."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    _mod.write_tmux_target(bridge_dir, socket_path=tmp_path / "tmux.sock", tmux_target="main")
+    settings_path = _mod.agy_settings_path(bridge_dir)
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text('{"model": "Gemini 3.8 Flash (High)"}', encoding="utf-8")
+
+    monkeypatch.setattr(_mod, "_session_alive", lambda _s, _t: True)
+    monkeypatch.setattr(_mod, "_capture_pane", lambda _s, _t: "> \n? for shortcuts")
+    monkeypatch.setattr(_mod, "_run_tmux", lambda _s, *_a: None)
+    monkeypatch.setattr(_mod.time, "sleep", lambda _s: None)
+
+    with pytest.raises(RuntimeError, match="did not confirm switching"):
+        _mod.inject_model_command(
+            bridge_dir,
+            model="claude-sonnet-4-6",
+            expected_display_name="Claude Sonnet 4.6 (Thinking)",
+            timeout_s=0.1,
+            confirm_timeout_s=0.0,
+        )
+
+
+def test_inject_model_command_verifies_catalog_when_display_name_omitted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without expected_display_name, unknown slugs fail against the live catalog."""
+    monkeypatch.setattr(
+        _mod,
+        "_live_antigravity_model_options",
+        lambda: [{"id": "gemini-3.8-flash-high", "displayName": "Gemini 3.8 Flash (High)"}],
+    )
+    with pytest.raises(RuntimeError, match="not available in the live catalog"):
+        _mod.inject_model_command(tmp_path, model="nonexistent-model")

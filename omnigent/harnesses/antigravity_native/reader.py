@@ -74,6 +74,7 @@ from omnigent.harnesses.antigravity_native.bridge import (
     AntigravityNativeBridgeState,
     agy_conversation_db,
     is_placeholder_conversation_id,
+    read_agy_settings_model,
     read_bridge_state,
     read_tmux_info,
     update_conversation_id,
@@ -787,20 +788,21 @@ async def _post_event(
     client: httpx.AsyncClient,
     session_id: str,
     event: OutboundEvent,
-) -> None:
+) -> bool:
     """
     POST one mapped event with the shared bounded-retry delivery loop.
 
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :param event: The mapped event to deliver.
-    :returns: None. Delivery failures are logged inside the retry loop; an
-        ambiguous conversation-item failure is intentionally not retried (a
-        re-post would duplicate the item).
+    :returns: ``True`` when the server accepted the post, ``False`` otherwise.
+        Delivery failures are logged inside the retry loop; an ambiguous
+        conversation-item failure is intentionally not retried (a re-post would
+        duplicate the item).
     """
     url = f"/v1/sessions/{url_component(session_id)}/events"
     payload: dict[str, object] = {"type": event.event_type, "data": event.data}
-    await post_session_event_with_retry(
+    response = await post_session_event_with_retry(
         client=client,
         url=url,
         payload=payload,
@@ -811,6 +813,7 @@ async def _post_event(
         retry_delay=lambda attempt: _POST_RETRY_DELAY_SECONDS * attempt,
         logger_name=__name__,
     )
+    return response is not None and 200 <= response.status_code < 300
 
 
 def _resolve_cascade_id(bridge_dir: Path) -> str | None:
@@ -1021,6 +1024,7 @@ async def _watch_for_rotation(
     skip_cascade_ids: frozenset[str],
     on_rotation: Callable[[str], None],
     on_quiescent: Callable[[], Awaitable[None]] | None = None,
+    on_tick: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """
     Poll ``GetAllCascadeTrajectories`` for a ``/clear`` rotation, then signal once.
@@ -1068,6 +1072,15 @@ async def _watch_for_rotation(
     idle_ticks = 0
     while True:
         await _sleep(interval_s)
+        if on_tick is not None:
+            try:
+                await on_tick()
+            except Exception:
+                _logger.warning(
+                    "agy rotation detector tick callback failed; continuing: bound_cascade=%s",
+                    bound_cascade_id,
+                    exc_info=True,
+                )
         try:
             body = await asyncio.to_thread(get_all_cascade_trajectories, port)
         except httpx.ConnectError as exc:
@@ -1218,6 +1231,16 @@ async def supervise_reader(
         port=port,
     )
 
+    async def _poll_settings_model() -> None:
+        await _maybe_emit_settings_model_change(
+            bridge_dir,
+            client=client,
+            session_id=session_id,
+            state=state,
+        )
+
+    await _poll_settings_model()
+
     # Task T-G: the rotation detector records the new cascade id here and the
     # ``stop`` predicate the reader body consults flips to True so the body exits
     # cleanly at its next checkpoint (between stream re-entries / poll iterations).
@@ -1323,6 +1346,7 @@ async def supervise_reader(
             skip_cascade_ids=skip_cascade_ids,
             on_rotation=_on_rotation,
             on_quiescent=_close_turn_if_stranded,
+            on_tick=_poll_settings_model,
         ),
         name="antigravity-rotation-detector",
     )
@@ -1472,6 +1496,8 @@ class _ReaderState:
     reasoning_prefixes: dict[int, str] = field(default_factory=dict)
     turn_active: bool = False
     posted_model_enum: str | None = None
+    posted_model_name: str | None = None
+    last_seen_settings_model: str | None = None
     model_catalog: dict[str, object] | None = None
     port: int = 0
     cumulative_input_tokens: int = 0
@@ -2861,6 +2887,45 @@ async def _maybe_emit_session_usage(
     )
 
 
+def _normalized_model_key(model_name: str) -> str:
+    """Fold case and whitespace so settings.json and RPC model labels dedupe cleanly."""
+    return " ".join(model_name.casefold().split())
+
+
+async def _maybe_emit_settings_model_change(
+    bridge_dir: Path,
+    *,
+    client: httpx.AsyncClient,
+    session_id: str,
+    state: _ReaderState,
+) -> None:
+    """Mirror ``settings.json["model"]`` changes (including idle TUI ``/model`` picks)."""
+    model_name = await asyncio.to_thread(read_agy_settings_model, bridge_dir)
+    if not model_name:
+        return
+    key = _normalized_model_key(model_name)
+    # Ignore an unchanged settings.json so a --model launch or RPC spelling
+    # difference never ping-pongs against USER_INPUT model reports.
+    if key == state.last_seen_settings_model:
+        return
+    if key == state.posted_model_name:
+        state.last_seen_settings_model = key
+        return
+    delivered = await _post_event(
+        client,
+        session_id,
+        OutboundEvent(
+            event_type=_EXTERNAL_MODEL_CHANGE,
+            data={"model": model_name},
+            step_index=0,
+        ),
+    )
+    if delivered:
+        state.last_seen_settings_model = key
+        state.posted_model_name = key
+        state.posted_model_enum = None
+
+
 async def _maybe_emit_model_change(
     step: dict[str, object],
     *,
@@ -2893,6 +2958,10 @@ async def _maybe_emit_model_change(
         return
     catalog = await _ensure_catalog(state)
     display_name = _resolve_display_name(model_enum, catalog)
+    model_key = _normalized_model_key(display_name)
+    if model_key == state.posted_model_name:
+        state.posted_model_enum = model_enum
+        return
     step_idx = _step_index(step) or 0
     await _post_event(
         client,
@@ -2904,6 +2973,7 @@ async def _maybe_emit_model_change(
         ),
     )
     state.posted_model_enum = model_enum
+    state.posted_model_name = model_key
 
 
 async def _ensure_catalog(state: _ReaderState) -> dict[str, object]:

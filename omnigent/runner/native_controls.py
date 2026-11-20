@@ -50,6 +50,7 @@ from omnigent.runner.native import (
     _opencode_model_options_from_catalog,
     _opencode_model_ref,
     _readvertise_live_claude_tmux_target,
+    _session_labels_for_runner_spawn,
 )
 from omnigent.runner.resource_registry import CODEX_NATIVE_TERMINAL_ROLE, SessionResourceRegistry
 from omnigent.spec.types import AgentSpec
@@ -312,6 +313,9 @@ class NativeControls:
     handle_claude_native_permission_mode_change: Callable[
         [str, str | None], Coroutine[Any, Any, Response]
     ]
+    handle_antigravity_native_model_change: Callable[
+        [str, str | None], Coroutine[Any, Any, Response]
+    ]
     handle_claude_sdk_clear: Callable[[str], Coroutine[Any, Any, Response]]
     handle_claude_sdk_compact: Callable[[str], Coroutine[Any, Any, Response]]
     handle_codex_native_approval_mode_change: Callable[[str, str], Coroutine[Any, Any, Response]]
@@ -373,6 +377,7 @@ def build_native_controls(
     ],
     _run_turn_bg: Callable[[_JsonObject, str], Coroutine[Any, Any, None]],
     _sdk_compact_inprogress: set[str],
+    _session_antigravity_model_names: dict[str, dict[str, str]],
     _session_cursor_model_names: dict[str, dict[str, str]],
     _session_harness_name: Callable[[str], str | None],
     _session_histories: dict[str, list[_JsonObject]],
@@ -388,6 +393,9 @@ def build_native_controls(
     """
     # Weak values drop idle sessions, so a holder must keep its lock in a local.
     _codex_settings_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+        weakref.WeakValueDictionary()
+    )
+    _antigravity_model_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
         weakref.WeakValueDictionary()
     )
 
@@ -1721,6 +1729,67 @@ def build_native_controls(
             },
         )
 
+    async def _handle_antigravity_native_model_change(
+        conv_id: str,
+        model: str | None,
+    ) -> Response:
+        from omnigent.harnesses.antigravity_native.bridge import (
+            ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
+            bridge_dir_for_bridge_id,
+            inject_model_command,
+        )
+
+        if model is None or not model.strip():
+            return Response(status_code=204)
+        selected_model = model.strip()
+        labels = await _session_labels_for_runner_spawn(
+            server_client=server_client,
+            session_id=conv_id,
+        )
+        bridge_id = labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY) or conv_id
+        lock = _antigravity_model_locks.get(bridge_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            _antigravity_model_locks[bridge_id] = lock
+        async with lock:
+            bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+            expected_display_name = _session_antigravity_model_names.get(conv_id, {}).get(
+                selected_model
+            )
+            try:
+                confirmed_model = await asyncio.to_thread(
+                    inject_model_command,
+                    bridge_dir,
+                    model=selected_model,
+                    expected_display_name=expected_display_name,
+                    timeout_s=1.0,
+                )
+            except (RuntimeError, ValueError) as exc:
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "antigravity_native_model_failed",
+                        "detail": _client_safe_error_detail(
+                            exc, context="antigravity-native model change"
+                        ),
+                    },
+                )
+            try:
+                resp = await server_client.post(
+                    f"/v1/sessions/{urllib.parse.quote(conv_id, safe='')}/events",
+                    json={"type": "external_model_change", "data": {"model": confirmed_model}},
+                )
+                resp.raise_for_status()
+            except httpx.HTTPError:
+                _logger.debug(
+                    "Antigravity-native model mirror post skipped for session=%s; "
+                    "reader will mirror settings.json on next tick",
+                    conv_id,
+                    exc_info=True,
+                    extra={"session_id": conv_id},
+                )
+            return Response(status_code=204)
+
     async def _handle_cursor_native_model_change(
         conv_id: str,
         model: str | None,
@@ -2642,6 +2711,7 @@ def build_native_controls(
     return NativeControls(
         codex_native_model_options=_codex_native_model_options,
         handle_claude_native_btw_dismiss=_handle_claude_native_btw_dismiss,
+        handle_antigravity_native_model_change=_handle_antigravity_native_model_change,
         handle_claude_native_clear=_handle_claude_native_clear,
         handle_claude_native_compact=_handle_claude_native_compact,
         handle_claude_native_cost_popup=_handle_claude_native_cost_popup,

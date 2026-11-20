@@ -63,14 +63,17 @@ import contextlib
 import json
 import logging
 import os
+import re
 import shutil
+import subprocess
 import sys
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import TypedDict
 
 import click
 import httpx
@@ -162,6 +165,85 @@ _SESSION_LABELS = {
     _UI_MODE_LABEL_KEY: _UI_MODE_TERMINAL_VALUE,
     _WRAPPER_LABEL_KEY: _WRAPPER_LABEL_VALUE,
 }
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_AGY_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/\[\]-]*$")
+_AGY_HEADER_IDS = frozenset({"id", "model", "slug", "name"})
+_AGY_HEADER_LABELS = frozenset({"name", "display name", "description", "label"})
+
+
+class AntigravityModelOption(TypedDict):
+    """Picker row emitted by ``agy models`` for the in-session Web UI."""
+
+    id: str
+    displayName: str
+    isDefault: bool
+    isCurrent: bool
+
+
+def parse_antigravity_cli_model_options(output: str) -> list[AntigravityModelOption]:
+    """Parse ``agy models`` stdout into composer picker rows."""
+    options_by_id: dict[str, AntigravityModelOption] = {}
+    # Split on LF only so CR-overwritten spinner frames collapse to the final line.
+    for raw_line in output.split("\n"):
+        cleaned = _ANSI_ESCAPE_RE.sub("", raw_line.rstrip("\r").rsplit("\r", 1)[-1]).strip()
+        if not cleaned:
+            continue
+        if "\t" in cleaned:
+            parts = [part.strip() for part in cleaned.split("\t", 1)]
+        else:
+            parts = [part.strip() for part in re.split(r"\s{2,}", cleaned, maxsplit=1)]
+        model_id = parts[0]
+        if (
+            not _AGY_MODEL_ID_RE.fullmatch(model_id)
+            or model_id.endswith((":", "..."))
+            or model_id.lower() in _AGY_HEADER_IDS
+        ):
+            continue
+        raw_display = parts[1] if len(parts) > 1 and parts[1] else ""
+        if raw_display.lower() in _AGY_HEADER_LABELS:
+            continue
+        display_name = raw_display or model_id
+        options_by_id.setdefault(
+            model_id,
+            {
+                "id": model_id,
+                "displayName": display_name,
+                "isDefault": False,
+                "isCurrent": False,
+            },
+        )
+    options = list(options_by_id.values())
+    if not options:
+        raise ValueError("agy models output did not contain any valid models")
+    return options
+
+
+def list_antigravity_cli_model_options(
+    *,
+    env: Mapping[str, str] | None = None,
+    timeout_s: float = 15.0,
+) -> list[AntigravityModelOption]:
+    """Discover live model picker options from the installed ``agy`` CLI."""
+    from omnigent.harnesses.antigravity_native.gateway import PROFILE_ENV
+
+    executable = agy_binary_path()
+    run_env: dict[str, str] | None = dict(env) if env is not None else None
+    if run_env is None:
+        with contextlib.suppress(OmnigentError):
+            launch = resolve_native_antigravity_launch()
+            # Never pass the Databricks gateway placeholder key directly to `agy models`.
+            if launch.extra_env and PROFILE_ENV not in launch.extra_env:
+                run_env = {**os.environ, **launch.extra_env}
+    completed = subprocess.run(
+        [executable, "models"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=timeout_s,
+        env=run_env,
+    )
+    return parse_antigravity_cli_model_options(completed.stdout)
 
 
 @dataclass(frozen=True)

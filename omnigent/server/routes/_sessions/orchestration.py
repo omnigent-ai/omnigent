@@ -205,6 +205,7 @@ from omnigent.server.routes._session_create_validation import (
 # ``__all__`` and the facade's explicit re-exports, preserving its real runtime
 # bindings so a facade-level monkeypatch is honoured in this module too.
 from omnigent.server.routes._sessions.common import (  # noqa: F401
+    _ANTIGRAVITY_NATIVE_WRAPPER_LABEL_VALUE,
     _CLAUDE_NATIVE_MESSAGE_TIMEOUT_S,
     _CLAUDE_NATIVE_MODEL,
     _CLAUDE_NATIVE_UI_LABEL_KEY,
@@ -15108,14 +15109,19 @@ async def _get_session_snapshot(
 
     if refresh_state:
         wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
-        # Cursor effort/model changes refresh snapshots; keep its previous
-        # options visible until the asynchronous CLI re-fetch replaces them.
-        # Other live catalogs retain their existing drop-on-refresh contract.
+        # Cursor and Antigravity model changes refresh snapshots; keep their
+        # previous options visible until the asynchronous CLI re-fetch replaces
+        # them. Other live catalogs retain their drop-on-refresh contract.
         _invalidate_runner_backed_snapshot_state(
             session_id,
             cancel_inflight=False,
             drop_model_options=(
-                runner_client is not None and wrapper != _CURSOR_NATIVE_WRAPPER_LABEL_VALUE
+                runner_client is not None
+                and wrapper
+                not in (
+                    _CURSOR_NATIVE_WRAPPER_LABEL_VALUE,
+                    _ANTIGRAVITY_NATIVE_WRAPPER_LABEL_VALUE,
+                )
             ),
         )
 

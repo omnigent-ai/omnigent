@@ -41,6 +41,18 @@ it.each([
     expected: "system.ai.claude-sonnet-5[1m]",
   },
   { kind: "configured", requested: null, reported: "report", expected: "report" },
+  {
+    kind: "antigravity",
+    requested: "claude-sonnet-4-6",
+    reported: "Gemini 3.8 Flash (Low)",
+    expected: "gemini-3.8-flash-low",
+  },
+  {
+    kind: "antigravity",
+    requested: "claude-sonnet-4-6",
+    reported: null,
+    expected: "claude-sonnet-4-6",
+  },
 ] as const)(
   "resolves the selected model from $kind request=$requested report=$reported",
   ({ kind, requested, reported, expected }) => {
@@ -52,6 +64,8 @@ it.each([
           { id: "opus", model: "claude-opus-4-8" },
           { id: "opus[1m]", model: "claude-opus-4-8[1m]" },
           { id: "sonnet", model: "claude-sonnet-5" },
+          { id: "gemini-3.8-flash-low", displayName: "Gemini 3.8 Flash (Low)" },
+          { id: "claude-sonnet-4-6", displayName: "Claude Sonnet 4.6 (Thinking)" },
         ],
         requested,
         reported,
@@ -151,6 +165,16 @@ describe("shouldShowModelPicker", () => {
     // devin mirrors its live model into model_override (the executor types
     // /model when a routed model changes), like opencode/pi.
     expect(shouldShowModelPicker({ labels: { "omnigent.wrapper": "devin-native-ui" } })).toBe(true);
+    // antigravity discovers live models via `agy models` and switches via `/model <slug>`.
+    expect(shouldShowModelPicker({ labels: { "omnigent.wrapper": "antigravity-native-ui" } })).toBe(
+      true,
+    );
+    expect(
+      modelPickerKindForConv({ labels: { "omnigent.wrapper": "antigravity-native-ui" } }),
+    ).toBe("antigravity");
+    expect(modelPickerKindForConv({ labels: {}, harness: "antigravity-native" })).toBe(
+      "antigravity",
+    );
   });
 
   it("shows the picker for generic ACP sessions with a curated catalog", () => {
@@ -235,6 +259,12 @@ describe("shouldShowEffortPicker", () => {
     expect(shouldShowEffortPicker({ labels: { "omnigent.wrapper": "kiro-native-ui" } })).toBe(
       false,
     );
+  });
+
+  it("hides effort controls for antigravity-native (effort is part of the model variant)", () => {
+    expect(
+      shouldShowEffortPicker({ labels: { "omnigent.wrapper": "antigravity-native-ui" } }),
+    ).toBe(false);
   });
 });
 
