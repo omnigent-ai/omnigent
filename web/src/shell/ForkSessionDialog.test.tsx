@@ -453,9 +453,28 @@ describe("ForkSessionDialog", () => {
   it("forks with the edited title, refreshes the list, and navigates into the fork", async () => {
     forkSessionMock.mockResolvedValue({
       id: "conv_fork",
+      title: "My clone",
+      createdAt: 1_700_000_000,
+      labels: {},
+      permissionLevel: null,
+      agentId: "ag_source",
+      parentSessionId: null,
     } as unknown as Awaited<ReturnType<typeof forkSession>>);
 
-    const { invalidateSpy } = renderDialog();
+    const { client, invalidateSpy } = renderDialog();
+    const existing: Conversation = {
+      id: "conv_old",
+      object: "conversation",
+      title: "Older",
+      created_at: 1,
+      updated_at: 1,
+      labels: {},
+      permission_level: null,
+    };
+    client.setQueryData<ConversationsInfiniteData>(["conversations", "", false], {
+      pages: [{ data: [existing], first_id: "conv_old", last_id: "conv_old", has_more: false }],
+      pageParams: [undefined],
+    });
 
     openAdvanced();
     fireEvent.change(screen.getByTestId("fork-session-title-input"), {
@@ -483,42 +502,12 @@ describe("ForkSessionDialog", () => {
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
     expect(toastMock).not.toHaveBeenCalled();
     expect(toastMock.success).not.toHaveBeenCalled();
-  });
-
-  it("paints the fork into the cached sidebar list and arms the recently-created keep-alive", async () => {
-    // The fork must show even if the list refetch and the push both miss it.
-    forkSessionMock.mockResolvedValue({
-      id: "conv_fork",
-      title: "Fork of My session",
-      createdAt: 1_700_000_000,
-      labels: {},
-      permissionLevel: null,
-      agentId: "ag_source",
-      parentSessionId: null,
-    } as unknown as Awaited<ReturnType<typeof forkSession>>);
-    const { client } = renderDialog();
-    const existing: Conversation = {
-      id: "conv_old",
-      object: "conversation",
-      title: "Older",
-      created_at: 1,
-      updated_at: 1,
-      labels: {},
-      permission_level: null,
-    };
-    client.setQueryData<ConversationsInfiniteData>(["conversations", "", false], {
-      pages: [{ data: [existing], first_id: "conv_old", last_id: "conv_old", has_more: false }],
-      pageParams: [undefined],
-    });
-
-    fireEvent.click(screen.getByTestId("fork-session-submit"));
-    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
 
     const page = client.getQueryData<ConversationsInfiniteData>(["conversations", "", false])!
       .pages[0];
     expect(page.data.map((c) => c.id)).toEqual(["conv_fork", "conv_old"]);
     expect(page.data[0]).toMatchObject({
-      title: "Fork of My session",
+      title: "My clone",
       created_at: 1_700_000_000,
       updated_at: 1_700_000_000,
       agent_id: "ag_source",

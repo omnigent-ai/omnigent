@@ -27,11 +27,11 @@ _LIST_RE = re.compile(r"/v1/sessions\?[^/]*$")
 
 @dataclass
 class ForkVisibilityFaults:
-    """Hide new forks from list reads and live-updates frames for a lag window."""
+    """Hide new forks from list reads and live updates until the test releases lag."""
 
     stale_list_s: float = _STALE_LIST_S
     fork_ids: set[str] = field(default_factory=set)
-    stale_until: float = 0.0
+    list_lag_held: bool = False
     lag_started_at: float | None = None
     list_responses: list[dict[str, Any]] = field(default_factory=list)
     dropped_push_items: list[dict[str, Any]] = field(default_factory=list)
@@ -39,7 +39,7 @@ class ForkVisibilityFaults:
     sockets: list[str] = field(default_factory=list)
 
     def lagging(self) -> bool:
-        return time.monotonic() < self.stale_until
+        return self.list_lag_held
 
     def hides(self, item: dict[str, Any]) -> bool:
         # Title match: a push or list read can race the fork response; this test forks once.
@@ -66,7 +66,7 @@ class ForkVisibilityFaults:
 
     def _record_fork(self, route: Route) -> None:
         self.lag_started_at = time.monotonic()
-        self.stale_until = self.lag_started_at + self.stale_list_s
+        self.list_lag_held = True
         response = fetch_with_retry(route)
         if response.ok:
             self.fork_ids.add(response.json()["id"])
@@ -183,7 +183,8 @@ def test_fork_row_while_list_lags_and_push_misses_fork(
     assert faults.lagging(), faults.diagnostics()
 
     gaps: list[float | None] = []
-    while faults.lagging():
+    observation_until = time.monotonic() + faults.stale_list_s
+    while time.monotonic() < observation_until:
         page.wait_for_timeout(1_000)
         if row.count() == 0 or not row.first.is_visible():
             gaps.append(faults.elapsed())
@@ -192,5 +193,6 @@ def test_fork_row_while_list_lags_and_push_misses_fork(
         f"fork row disappeared at {gaps}s while the list lagged; {faults.diagnostics()}"
     )
 
+    faults.list_lag_held = False
     page.reload()
     expect(row).to_be_visible(timeout=_ROW_TIMEOUT_MS)
