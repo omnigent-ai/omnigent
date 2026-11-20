@@ -85,6 +85,7 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { showToast } from "@/components/ui/toast";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { markCommentsSeen } from "@/hooks/useSeenComments";
 import { useSidebarData } from "@/hooks/useSidebarData";
 import {
   clearUnreadOverride,
@@ -441,6 +442,28 @@ export function InboxPage() {
     .filter(Boolean)
     .join(" · ");
   const emptyState = EMPTY_STATES[filter];
+
+  // "Mark all as read" covers what the current tab lists as unread; approvals
+  // stay, since only an answer clears them.
+  const unreadSuggestions = visibleSuggestions.filter((item) => item.status === "unread");
+  const markAllReadCount =
+    visibleComments.length +
+    visibleUnread.length +
+    visibleAutomations.length +
+    unreadSuggestions.length;
+  const markAllRead = () => {
+    const clearedKeys = new Set(visibleUnread.map(({ row }) => `unread:${row.id}`));
+    const clearedSessions = new Set(visibleUnread.map(({ row }) => row.id));
+    const keep = <T,>(state: Record<string, T>, cleared: Set<string>) =>
+      Object.fromEntries(Object.entries(state).filter(([key]) => !cleared.has(key)));
+    setExpandedOverrides((prev) => keep(prev, clearedKeys));
+    setReplyDrafts((prev) => keep(prev, clearedSessions));
+    setReplyStatuses((prev) => keep(prev, clearedSessions));
+    for (const { row } of visibleUnread) markConversationRead(row.id, row.updated_at);
+    markCommentsSeen(visibleComments.map(({ comment }) => comment.id));
+    for (const item of visibleAutomations) automationInbox.markRead(item.runId);
+    for (const item of unreadSuggestions) void proactiveInbox.update(item.id, { status: "read" });
+  };
 
   const groups = groupInboxEntries<InboxEntry>([
     ...visibleSuggestions.map((item) => ({
@@ -1092,6 +1115,18 @@ export function InboxPage() {
             <span aria-hidden>{totalCount}</span>
             <span className="sr-only">{summary}</span>
           </span>
+        )}
+        {markAllReadCount > 0 && (
+          <Button
+            variant="outline"
+            size="xs"
+            className={`ml-auto ${OUTLINE_ACTION}`}
+            onClick={markAllRead}
+            componentId="inbox.mark_all_read"
+            data-testid="inbox-mark-all-read"
+          >
+            <CheckIcon className="size-3.5" /> Mark all as read
+          </Button>
         )}
       </div>
 

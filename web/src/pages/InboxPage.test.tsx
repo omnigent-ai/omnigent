@@ -46,6 +46,7 @@ import {
   resetReadStateForTests,
   seedReadState,
 } from "@/hooks/useUnseenConversations";
+import { getSeenCommentIds } from "@/hooks/useSeenComments";
 
 // Keep real controls for native delivery and directory grants.
 vi.mock("@/components/blocks/ApprovalCard", async (importActual) => {
@@ -2081,5 +2082,105 @@ describe("agent suggestions", () => {
 
     selectTab("Awaiting response");
     expect(screen.queryByTestId("inbox-suggestion")).toBeNull();
+  });
+});
+
+describe("InboxPage mark all as read", () => {
+  function suggestionItem(overrides: Partial<Suggestion>): Suggestion {
+    return {
+      id: "sug_unread",
+      kind: "followup",
+      title: "Ramp up the flag",
+      bodyMd: "",
+      links: [],
+      actions: [],
+      media: [],
+      sourceSessionId: "sess_src",
+      agentId: "agent_advisor",
+      status: "unread",
+      resolution: "none",
+      createdAt: 1_700_000_000,
+      ...overrides,
+    };
+  }
+
+  it("clears every unread kind in one click and leaves approvals for an answer", async () => {
+    // WHY: each kind keeps its own read state; one click must reach all of them.
+    const unread = unreadConversation();
+    const approval = conversation({ id: "sess_approval", title: "Approval Session" });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(
+      conversationsStub([unread, approval]),
+    );
+    vi.mocked(sessionsApi.getSession).mockResolvedValue({
+      pendingElicitations: [rawElicitation("eli_1", "Run the migration?")],
+    } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    vi.mocked(commentInboxHook.useCommentInbox).mockReturnValue(
+      commentInboxStub({
+        items: [
+          {
+            row: conversation({ id: "sess_1", pending_elicitations_count: 0 }),
+            comment: {
+              id: "cm_1",
+              path: "src/app.ts",
+              body: "Please reconsider this line.",
+              created_by: "alice",
+              created_at: 1_700_000_000,
+              updated_at: 1_700_000_000_000,
+              status: "draft",
+            } as CommentInbox["items"][number]["comment"],
+          },
+        ],
+      }),
+    );
+    const markRead = vi.fn();
+    vi.mocked(automationInboxHook.useAutomationInbox).mockReturnValue(
+      automationInboxStub({
+        markRead,
+        items: [
+          {
+            taskId: "task",
+            taskName: "Daily report",
+            runId: "run",
+            scheduledAt: 1_700_000_000,
+            finishedAt: 1_700_000_010,
+            errorCode: "host_offline",
+          },
+        ],
+      }),
+    );
+    const update = vi.fn().mockResolvedValue(true);
+    vi.mocked(proactiveInboxHook.useProactiveInbox).mockReturnValue(
+      proactiveInboxStub({
+        items: [suggestionItem({}), suggestionItem({ id: "sug_read", status: "read" })],
+        unreadCount: 1,
+        update,
+      }),
+    );
+    renderPage();
+    await screen.findByTestId("inbox-unread");
+
+    fireEvent.click(screen.getByRole("button", { name: "Mark all as read" }));
+
+    await waitFor(() => expect(screen.queryByTestId("inbox-unread")).not.toBeInTheDocument());
+    expect(isConversationUnseen(unread.id, unread.updated_at, unread.status)).toBe(false);
+    expect(getSeenCommentIds().has("cm_1")).toBe(true);
+    expect(markRead).toHaveBeenCalledWith("run");
+    expect(update).toHaveBeenCalledOnce();
+    expect(update).toHaveBeenCalledWith("sug_unread", { status: "read" });
+    expect(await screen.findByTestId("inbox-item")).toBeInTheDocument();
+  });
+
+  it("is offered only while the tab lists something unread", async () => {
+    renderPage();
+    expect(screen.queryByRole("button", { name: "Mark all as read" })).toBeNull();
+    cleanup();
+
+    const unread = unreadConversation();
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([unread]));
+    renderPage();
+    await screen.findByTestId("inbox-unread");
+    expect(screen.getByRole("button", { name: "Mark all as read" })).toBeInTheDocument();
+    selectTab("Awaiting response");
+    expect(screen.queryByRole("button", { name: "Mark all as read" })).toBeNull();
   });
 });
