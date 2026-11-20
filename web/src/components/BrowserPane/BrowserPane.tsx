@@ -61,6 +61,7 @@ import {
 import { readSavedBrowserPage } from "@/lib/browserTabPages";
 import { browserViewOwnerId } from "@/lib/browserTabs";
 import { fetchSessionHostId } from "@/lib/fetchSessionHostId";
+import { resolveIdentity } from "@/lib/identity";
 import { normalizeTypedUrl } from "@/lib/normalizeTypedUrl";
 import { cn } from "@/lib/utils";
 // Say when the tab's page is open in another desktop window.
@@ -255,28 +256,32 @@ export function BrowserPane({
     const urlEvents = urlEventsRef.current;
 
     const submitSequence = submitSequenceRef.current;
+    // A later navigation (the user's or an agent's) owns the view.
+    const superseded = () =>
+      cancelled || viewChanged || submitSequenceRef.current !== submitSequence;
     // The shell destroyed this tab's view (sign-out, a session-expiry reconnect, quit):
-    // reopen the tab's saved page.
-    const reopenSavedPage = () => {
-      const saved = readSavedBrowserPage(conversationId);
-      if (!saved || !bridge.browserOpenOrNavigate) return;
-      if (!urlEditingRef.current) setCurrentUrl(saved.url);
-      const failed = (error?: string) => {
-        if (!cancelled) setNavigationError(error ?? "Unable to reopen this page.");
-      };
-      void fetchSessionHostId(browserViewOwnerId(conversationId))
-        .then(async (hostId) => {
-          // A navigation since then (the user's or an agent's) owns the view.
-          if (cancelled || viewChanged || submitSequenceRef.current !== submitSequence) return;
-          const result = await bridge.browserOpenOrNavigate!(
-            conversationId,
-            saved.url,
-            undefined,
-            navigationHostOptions(hostId),
-          );
-          if (!result.ok) failed(result.error);
-        })
-        .catch(() => failed());
+    // reopen the page the signed-in user last had in it.
+    const reopenSavedPage = async () => {
+      const openOrNavigate = bridge.browserOpenOrNavigate;
+      if (!openOrNavigate) return;
+      try {
+        const saved = readSavedBrowserPage(conversationId, await resolveIdentity());
+        if (!saved || superseded()) return;
+        if (!urlEditingRef.current) setCurrentUrl(saved.url);
+        const hostId = await fetchSessionHostId(browserViewOwnerId(conversationId));
+        if (superseded()) return;
+        const result = await openOrNavigate(
+          conversationId,
+          saved.url,
+          undefined,
+          navigationHostOptions(hostId),
+        );
+        if (!result.ok && !superseded()) {
+          setNavigationError(result.error ?? "Unable to reopen this page.");
+        }
+      } catch {
+        if (!superseded()) setNavigationError("Unable to reopen this page.");
+      }
     };
 
     // A newer lifecycle event takes precedence over this asynchronous snapshot.
@@ -284,7 +289,7 @@ export function BrowserPane({
       if (cancelled || viewChanged || !r) return;
       if (!r.exists) {
         // A page open in another window stays there.
-        if (!r.elsewhere) reopenSavedPage();
+        if (!r.elsewhere) void reopenSavedPage();
         return;
       }
       setHasView(true);

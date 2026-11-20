@@ -163,9 +163,10 @@ it(
     } finally {
       if (app) {
         // Stop filming first, so the clip ends on the journey rather than the window closing.
-        await app.stopDisplayCapture();
+        await app.stopDisplayCapture().catch(() => {});
         await app.electronApp.close().catch(() => {});
         saveRecording(RECORD_DIR, "browser-tab-relogin");
+        fs.rmSync(app.userDataDir, { recursive: true, force: true });
       }
       await new Promise((resolve) => {
         fixture.close(resolve);

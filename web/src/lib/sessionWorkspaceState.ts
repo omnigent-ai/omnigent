@@ -61,6 +61,8 @@ export interface SessionWorkspaceState {
 export interface SavedBrowserPage {
   url: string;
   title?: string;
+  /** The signed-in user who visited it; only they may see or reopen it. */
+  owner: string;
 }
 
 export const SESSION_WORKSPACE_STATE_KEY = "omnigent:session-workspace-state";
@@ -74,6 +76,21 @@ const MAX_SESSIONS = 100;
 export const MAX_OPEN_TABS = 20;
 const MAX_BROWSER_URL_LENGTH = 8192;
 const MAX_BROWSER_TITLE_LENGTH = 512;
+// Query and fragment parameters that can carry a credential (OAuth codes and tokens,
+// signed links, API keys). An address carrying one is never saved or replayed.
+const CREDENTIAL_PARAM_NAME = /token|secret|passw|signature|credential|api[-_]?key|session[-_]?id/i;
+const CREDENTIAL_PARAM_NAMES = new Set([
+  "auth",
+  "authorization",
+  "code",
+  "jwt",
+  "key",
+  "otp",
+  "samlrequest",
+  "samlresponse",
+  "sig",
+  "ticket",
+]);
 
 function isValidWidth(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value > 0;
@@ -106,18 +123,35 @@ function uniqueIds(values: unknown[]): string[] {
   ];
 }
 
-/** A page a browser tab can reopen, or null for non-http(s), oversized, or malformed input. */
+function carriesCredential({ username, password, search, hash }: URL): boolean {
+  if (username !== "" || password !== "") return true;
+  const fragment = hash.slice(1);
+  const params = [
+    ...new URLSearchParams(search).keys(),
+    ...(fragment.includes("=") ? new URLSearchParams(fragment).keys() : []),
+  ];
+  return params.some(
+    (name) => CREDENTIAL_PARAM_NAMES.has(name.toLowerCase()) || CREDENTIAL_PARAM_NAME.test(name),
+  );
+}
+
+/**
+ * A page a browser tab can reopen, or null for a missing owner and for non-http(s),
+ * oversized, malformed, or credential-bearing addresses.
+ */
 export function sanitizeSavedBrowserPage(value: unknown): SavedBrowserPage | null {
   if (typeof value !== "object" || value === null) return null;
-  const { url, title } = value as Record<string, unknown>;
+  const { url, title, owner } = value as Record<string, unknown>;
+  if (typeof owner !== "string" || owner === "") return null;
   if (typeof url !== "string" || url.length > MAX_BROWSER_URL_LENGTH) return null;
   try {
-    const { protocol } = new URL(url);
-    if (protocol !== "http:" && protocol !== "https:") return null;
+    const parsed = new URL(url);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    if (carriesCredential(parsed)) return null;
   } catch {
     return null;
   }
-  const page: SavedBrowserPage = { url };
+  const page: SavedBrowserPage = { url, owner };
   if (typeof title === "string" && title.trim() !== "") {
     page.title = title.slice(0, MAX_BROWSER_TITLE_LENGTH);
   }
@@ -246,8 +280,9 @@ export function saveSessionWorkspaceState(
   if (next.openBrowsers && next.openBrowsers.length > MAX_OPEN_TABS) {
     next.openBrowsers = next.openBrowsers.slice(-MAX_OPEN_TABS);
   }
-  // A closed tab forgets its page.
-  if (next.browserPages) {
+  // A closed tab forgets its page. Only a tab-list write prunes: with the agent browser
+  // tools on, a newly opened tab's page can be saved before main's tab list reaches here.
+  if (patch.openBrowsers && next.browserPages) {
     const open = new Set(next.openBrowsers ?? []);
     next.browserPages = Object.fromEntries(
       Object.entries(next.browserPages).filter(([tabId]) => open.has(tabId)),

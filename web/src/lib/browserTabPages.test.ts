@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { mainBrowserTabs } from "@/components/BrowserPane/agentTools/tabStore";
 import { readSavedBrowserPage, saveBrowserPage, startSavingBrowserPages } from "./browserTabPages";
 import { AGENT_BROWSER_TAB_ID, browserViewId, parseBrowserViewId } from "./browserTabs";
 import {
@@ -7,8 +8,16 @@ import {
   writeSessionWorkspaceState,
 } from "./sessionWorkspaceState";
 
+const identity = vi.hoisted(() => ({ userId: "user-a" as string | null }));
+vi.mock("./identity", () => ({ getCurrentUserId: () => identity.userId }));
+vi.mock("@/components/BrowserPane/agentTools/tabStore", () => ({
+  mainBrowserTabs: vi.fn(() => null),
+}));
+
 afterEach(() => {
   localStorage.clear();
+  identity.userId = "user-a";
+  vi.mocked(mainBrowserTabs).mockReturnValue(null);
   Reflect.deleteProperty(window, "omnigentDesktop");
 });
 
@@ -53,6 +62,69 @@ describe("saved browser pages", () => {
     expect(readSavedBrowserPage(browserViewId("conv_a", "closed"))).toBeNull();
   });
 
+  it("saves a tab main holds before its tab list is stored, and keeps it on other writes", () => {
+    vi.mocked(mainBrowserTabs).mockReturnValue({
+      version: 1,
+      tabs: ["tab-1"],
+      selected: "tab-1",
+      agentTab: null,
+      navs: {},
+    });
+    saveBrowserPage(userTab, "https://docs.example/");
+    writeSessionWorkspaceState("conv_a", { widthPx: 400 });
+    expect(readSavedBrowserPage(userTab)).toEqual({ url: "https://docs.example/" });
+
+    writeSessionWorkspaceState("conv_a", { openBrowsers: [] });
+    expect(readSavedBrowserPage(userTab)).toBeNull();
+  });
+
+  it("shows a page only to the account that visited it", () => {
+    writeSessionWorkspaceState("conv_a", { openBrowsers: ["tab-1"] });
+    saveBrowserPage(userTab, "https://docs.example/private", "Private");
+
+    identity.userId = "user-b";
+    expect(readSavedBrowserPage(userTab)).toBeNull();
+    identity.userId = null;
+    expect(readSavedBrowserPage(userTab)).toBeNull();
+    saveBrowserPage(userTab, "https://docs.example/unowned");
+
+    identity.userId = "user-a";
+    expect(readSavedBrowserPage(userTab)).toEqual({
+      url: "https://docs.example/private",
+      title: "Private",
+    });
+    expect(readSavedBrowserPage(userTab, "user-b")).toBeNull();
+  });
+
+  it("never saves an address that carries a credential", () => {
+    writeSessionWorkspaceState("conv_a", { openBrowsers: ["tab-1"] });
+    saveBrowserPage(userTab, "https://docs.example/?q=release&page=2", "Search");
+    for (const url of [
+      "https://app.example/callback?code=abc&state=xyz",
+      "https://app.example/#access_token=abc&token_type=bearer",
+      "https://files.example/report.pdf?X-Amz-Signature=abc",
+      "https://app.example/login?API_KEY=abc",
+      "https://user:secret@app.example/",
+    ]) {
+      saveBrowserPage(userTab, url);
+    }
+
+    expect(readSavedBrowserPage(userTab)).toEqual({
+      url: "https://docs.example/?q=release&page=2",
+      title: "Search",
+    });
+  });
+
+  it("keeps a page's title when a navigation event to it has none", () => {
+    writeSessionWorkspaceState("conv_a", { openBrowsers: ["tab-1"] });
+    saveBrowserPage(userTab, "https://docs.example/", "Docs");
+    saveBrowserPage(userTab, "https://docs.example/", "");
+    expect(readSavedBrowserPage(userTab)).toEqual({ url: "https://docs.example/", title: "Docs" });
+
+    saveBrowserPage(userTab, "https://docs.example/next");
+    expect(readSavedBrowserPage(userTab)).toEqual({ url: "https://docs.example/next" });
+  });
+
   it("keeps the last page that can be reopened", () => {
     writeSessionWorkspaceState("conv_a", { openBrowsers: ["tab-1"] });
     saveBrowserPage(userTab, "https://docs.example/", "Docs");
@@ -71,7 +143,7 @@ describe("saved browser pages", () => {
     writeSessionWorkspaceState("conv_a", { openBrowsers: ["tab-2"] });
 
     expect(readSessionWorkspaceState("conv_a").browserPages).toEqual({
-      "tab-2": { url: "https://other.example/" },
+      "tab-2": { url: "https://other.example/", owner: "user-a" },
     });
   });
 
@@ -82,11 +154,13 @@ describe("saved browser pages", () => {
         {
           id: "conv_a",
           state: {
-            openBrowsers: ["tab-1", "tab-2", "tab-3"],
+            openBrowsers: ["tab-1", "tab-2", "tab-3", "tab-4", "tab-5"],
             browserPages: {
-              "tab-1": { url: "https://docs.example/", title: 7 },
-              "tab-2": { url: "javascript:alert(1)" },
+              "tab-1": { url: "https://docs.example/", title: 7, owner: "user-a" },
+              "tab-2": { url: "javascript:alert(1)", owner: "user-a" },
               "tab-3": "https://bare.example/",
+              "tab-4": { url: "https://unowned.example/" },
+              "tab-5": { url: "https://app.example/?token=abc", owner: "user-a" },
             },
           },
         },
@@ -94,7 +168,7 @@ describe("saved browser pages", () => {
     );
 
     expect(readSessionWorkspaceState("conv_a").browserPages).toEqual({
-      "tab-1": { url: "https://docs.example/" },
+      "tab-1": { url: "https://docs.example/", owner: "user-a" },
     });
   });
 
