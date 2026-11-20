@@ -189,15 +189,16 @@ def test_incomplete_reviews_are_rejected_regardless_of_size(review: str) -> None
 
 def test_split_review_rejects_nonprogress_on_escaped_pipe_whitespace() -> None:
     split = _HELPERS["split_review"]
-    encoded_lengths = []
-    cuts = []
+    encode_calls = 0
+    encode_limit = 64
 
-    # Bound the component fault before an empty slice can reach the parts list.
+    # Bound repeated work without requiring a particular sequence of cuts.
     class ProgressCheckedReview(str):
         def encode(self, encoding="utf-8", errors="strict"):
-            if len(encoded_lengths) >= 2:
-                raise AssertionError("Splitter exceeded the two bounded iterations")
-            encoded_lengths.append(len(self))
+            nonlocal encode_calls
+            if encode_calls >= encode_limit:
+                raise AssertionError("Splitter exceeded bounded component work")
+            encode_calls += 1
             return super().encode(encoding, errors)
 
         def __getitem__(self, key):
@@ -205,14 +206,12 @@ def test_split_review_rejects_nonprogress_on_escaped_pipe_whitespace() -> None:
                 if key.start is None and key.stop is not None:
                     if key.stop <= 0:
                         raise AssertionError("Splitter attempted a nonpositive cut")
-                    cuts.append(key.stop)
                 return type(self)(super().__getitem__(key))
             return super().__getitem__(key)
 
     with pytest.raises(ValueError, match="split cannot make progress"):
         split(ProgressCheckedReview("|aa\\|  \n"), 4)
-    assert encoded_lengths == [8, 5]
-    assert cuts == [3]
+    assert 0 < encode_calls <= encode_limit
 
 
 def _check_context_refusal(
@@ -1755,12 +1754,16 @@ def test_review_comments_preserve_identity_with_bounded_work(
         assert len(small_comments[0].encode("utf-8")) < 52000
         with monkeypatch.context() as render_patch:
             context = _HELPERS["_markdown_context"]
-            visited = set()
+            context_calls = 0
+            context_bytes = 0
+            visited: set[str] = set()
 
             def checked_context(text: str, **kwargs):
+                nonlocal context_calls, context_bytes
+                context_calls += 1
+                context_bytes += len(text.encode("utf-8"))
                 if text != composed and not text.startswith("<!--"):
                     assert text not in visited, "Accepted review prefix was parsed again"
-                    assert len(visited) < 32, "Exceeded bounded component context visits"
                     visited.add(text)
                 return context(text, **kwargs)
 
@@ -1770,6 +1773,16 @@ def test_review_comments_preserve_identity_with_bounded_work(
                 checked_context,
             )
             comments = _HELPERS["review_comments"](composed, **metadata)
+        assert context_calls <= 2 * len(comments) + 1 + 8, (
+            "Context parsing exceeded the part count plus a bounded retry allowance",
+            context_calls,
+            len(comments),
+        )
+        assert context_bytes <= 8 * len(composed.encode("utf-8")), (
+            "Context parsing exceeded eight input passes",
+            context_bytes,
+            len(composed.encode("utf-8")),
+        )
     else:
         comments = _rendered_comments(composed)
     expected = _HELPERS["split_table_row"](row.strip().strip("|"))
@@ -1781,7 +1794,7 @@ def test_review_comments_preserve_identity_with_bounded_work(
         for line in rows:
             cells = _HELPERS["split_table_row"](line.strip().strip("|"))
             fragments.append(cells)
-    assert len(comments) > 1
+    assert 1 < len(comments) <= _HELPERS["MAX_REVIEW_PARTS"]
     _assert_fragments(
         fragments, expected, rationale, minimum=2, ordinary_empty_cell=not large_identity
     )
@@ -3767,6 +3780,43 @@ def test_multipart_publication_is_retryable_and_completes_only_after_primary(
             "body": "Unrelated bot quoting an example:\n```text\n" + primary_header + "```\n",
         },
     ]
+    malformed_comments = [
+        {
+            "user": {"type": "Bot"},
+            "html_url": "https://example.test/malformed-metadata",
+            "body": body,
+        }
+        for body in (
+            "<!-- polly-review-bot -->\n"
+            f"Quoted example: <!-- polly-reviewed-sha: {'a' * 40} -->\n",
+            f"<!-- polly-skipped-sha: {'a' * 40} --> "
+            f"Quoted example: <!-- polly-reviewed-sha: {'a' * 40} -->\n",
+        )
+    ]
+    if failed_call is None:
+        for malformed in malformed_comments:
+            controls.write_text(json.dumps([malformed]))
+            assert not already_reviewed()
+            assert not (tmp_path / "skip.md").exists()
+        completions = [
+            {
+                "user": {"type": "Bot"},
+                "html_url": url,
+                "body": primary_header + "Completed review.\n",
+            }
+            for url in (
+                "https://example.test/first-completion",
+                "https://example.test/second-completion",
+            )
+        ]
+        controls.write_text(json.dumps([*completions, *malformed_comments]))
+        assert already_reviewed()
+        skip = tmp_path / "skip.md"
+        assert re.findall(r"\[review\]\(([^)]+)\)", skip.read_text()) == [
+            "https://example.test/second-completion"
+        ]
+        skip.unlink()
+    lookalikes.extend(malformed_comments)
     controls.write_text(json.dumps(lookalikes))
     assert not already_reviewed()
     assert not (tmp_path / "skip.md").exists()
