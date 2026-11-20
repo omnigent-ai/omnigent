@@ -21,6 +21,7 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from omnigent.entities import Conversation
+from omnigent.entities.conversation import ErrorData
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
     HostHelloFrame,
@@ -1150,9 +1151,14 @@ async def test_managed_create_returns_during_provision_and_message_rendezvouses(
     # cleanup path), so nothing leaks until the provider lifetime cap.
     assert fake.terminated == ["sb-fake-1"]
 
-    # The failure is retained on the snapshot (mirroring the tracker's
-    # failed-entry retention) so a client reloading the dead session
-    # still sees why the sandbox never came up, not a blank chat.
+    # The persisted diagnostic can follow the failure label; a reload must retain it.
+    await poll_until_async(
+        lambda: any(
+            isinstance(item.data, ErrorData) and "host startup failed" in item.data.message
+            for item in env.conv_store.list_items(session_id, type="error").data
+        ),
+        timeout_s=budget(5.0),
+    )
     failed_snapshot = await env.client.get(f"/v1/sessions/{session_id}")
     assert failed_snapshot.status_code == 200, failed_snapshot.text
     sandbox_status = failed_snapshot.json()["sandbox_status"]
