@@ -156,7 +156,10 @@ export interface MentionBrowser {
   tagFiles: (files: readonly MentionItem[]) => string[];
   /** Replace the draft's tags, forgetting released ones: a send, recall or new draft. */
   resetMentions: (mentions?: TaggedMentions) => void;
-  /** Feed every text change in, so an undo or redo that restores a token restores its tag. */
+  /**
+   * Feed every text change in, so an undo or redo that restores a token restores its tag. Call it
+   * before the change reaches the draft, so it sees the token leave the input while its tag is active.
+   */
   noteTextChange: (event: ComposerInputEvent) => void;
   /** Backspace at or inside a token deletes it whole; returns true when it did. */
   handleTokenBackspace: (e: ComposerKeyboardEvent) => boolean;
@@ -266,8 +269,6 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
   const releasedRef = useRef<TaggedMentions>(NO_TAGS);
   // Restore points by token: where a token was last removed, for an undo to bring it back.
   const restorePointsRef = useRef(new Map<string, RestorePoint>());
-  // Tokens a render released whose removing change notice hasn't arrived yet.
-  const releasedBeforeNoticeRef = useRef(new Set<string>());
   // The latest tags, for callers that run outside a render (the file viewer's drain).
   const activeRef = useRef<TaggedMentions>({ files: mentionedItems, sessions: mentionedSessions });
   useLayoutEffect(() => {
@@ -295,9 +296,6 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     if (goneFiles.length === 0 && goneSessions.length === 0) return;
     const gone = { files: goneFiles, sessions: goneSessions };
     releasedRef.current = mergeTags(releasedRef.current, gone);
-    for (const token of tagTokens(gone)) {
-      if (!restorePointsRef.current.has(token)) releasedBeforeNoticeRef.current.add(token);
-    }
     if (goneFiles.length > 0) {
       setMentionedItems((prev) => prev.filter((it) => present.has(fileMentionToken(it))));
     }
@@ -365,18 +363,16 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     const active = new Set(tagTokens(activeRef.current));
     for (const token of tokensIn([before], owned)) {
       if (afterTokens.has(token)) continue;
-      if (active.has(token) || releasedBeforeNoticeRef.current.has(token)) {
+      if (active.has(token)) {
         const reclaimedBy = direction === "undo" ? "redo" : "undo";
         restorePoints.set(token, { input, value: before, reclaimedBy });
       }
     }
-    releasedBeforeNoticeRef.current.clear();
   };
 
   const resetMentions = (mentions?: TaggedMentions) => {
     releasedRef.current = NO_TAGS;
     restorePointsRef.current.clear();
-    releasedBeforeNoticeRef.current.clear();
     setMentionedItems(mentions?.files ?? []);
     setMentionedSessions(mentions?.sessions ?? []);
   };
