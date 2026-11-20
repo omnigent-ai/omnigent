@@ -13997,7 +13997,7 @@ def _browser_login_callback_guidance() -> str:
         f"To finish the login, the browser must reach http://localhost:{port} on this "
         "machine, or whichever localhost port the browser's address bar shows after you "
         f"sign in (the CLI picks another port when {port} is busy). If the browser runs on "
-        "a different machine than this terminal (for example an SSH or Arca session), "
+        "a different machine than this terminal (for example over SSH), "
         "forward that port from the browser's machine first: "
         f"`ssh -L {port}:localhost:{port} -N <this-host>` (if the address bar shows a "
         f"different port, use it in both places instead of {port}), then reload the "
