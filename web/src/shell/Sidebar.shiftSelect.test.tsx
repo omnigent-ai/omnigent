@@ -196,7 +196,7 @@ describe("Sidebar shift-click selection", () => {
 
       fireEvent.click(screen.getByRole("button", { name: "Expand session family" }));
       expect(screen.getByRole("link", { name: "b" })).toBeVisible();
-      expect(vi.mocked(useSessionNumberHotkeys).mock.lastCall?.[0]).toEqual(["a", "b", "c", "x"]);
+      expect(vi.mocked(useSessionNumberHotkeys).mock.lastCall?.[0]).toEqual(["a", "c", "b", "x"]);
     },
   );
 

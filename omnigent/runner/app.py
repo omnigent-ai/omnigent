@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from omnigent.harnesses.claude_native.bridge import ClaudeNativeToolRelay
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
     from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState
+    from omnigent.inner.claude_model_access import ClaudeModelAccess
     from omnigent.runner.mcp_manager import RunnerMcpManager
     from omnigent.terminals.registry import TerminalRegistry
 
@@ -719,6 +720,8 @@ class _SessionSnapshot:
         a rebuilt work entry so wake suppression keyed on the child's
         ownership survives a reconnect / restart. ``None`` when unlabelled /
         the fetch failed.
+    :param harness: Server-reported effective harness, or the initialization
+        envelope's override, for resource launches after reconnect.
     """
 
     ok: bool
@@ -730,6 +733,7 @@ class _SessionSnapshot:
     parent_session_id: str | None = None
     agent_name: str | None = None
     wrapper_label: str | None = None
+    harness: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1477,6 +1481,7 @@ def create_runner_app(
         tuple[str, str, str | None, str | None], asyncio.Task[JSONResponse]
     ] = {}
     _recovery_turn_ids: dict[str, set[str]] = {}
+    _recovery_blocked_sessions: set[str] = set()
     _session_init_envelopes: dict[str, tuple[float, RunnerSessionInitEnvelope]] = {}
     # session_id → canonical reasoning effort, seeded from the session-init
     # snapshot and updated by ``effort_change``. In-process harnesses learn the
@@ -2651,6 +2656,7 @@ def create_runner_app(
             parent_session_id: str | None = None
             agent_name: str | None = None
             wrapper_label: str | None = None
+            harness: str | None = None
             try:
                 resp = await server_client.get(
                     f"/v1/sessions/{session_id}", params=_SESSION_METADATA_PARAMS
@@ -2675,6 +2681,9 @@ def create_runner_app(
                     if isinstance(raw_agent_name, str) and raw_agent_name:
                         agent_name = raw_agent_name
                     wrapper_label = wrapper_label_from_labels(body.get("labels"))
+                    raw_harness = body.get("harness")
+                    if isinstance(raw_harness, str) and raw_harness != "auto":
+                        harness = raw_harness
             except Exception:  # noqa: BLE001 — best-effort; created_at falls back to wall time
                 pass
             snapshot = _SessionSnapshot(
@@ -2687,6 +2696,7 @@ def create_runner_app(
                 parent_session_id=parent_session_id,
                 agent_name=agent_name,
                 wrapper_label=wrapper_label,
+                harness=harness,
             )
             if snapshot.ok and snapshot.agent_id is not None:
                 if _session_cache_generation_is_current(session_id, generation):
@@ -2778,6 +2788,7 @@ def create_runner_app(
             sub_agent_name=envelope.sub_agent_name,
             parent_session_id=snapshot.parent_session_id,
             wrapper_label=wrapper_label_from_labels(snapshot.labels),
+            harness=snapshot.harness_override,
         )
         _session_start_cache[session_id] = float(snapshot.created_at)
         _session_workspace_cache[session_id] = snapshot.workspace
@@ -3718,12 +3729,16 @@ def create_runner_app(
         forward_in_flight = _ingest_next_seq.get(session_id, 0) != _ingest_now_serving.get(
             session_id, 0
         )
-        execution_seen = (
-            initially_active
-            or forward_in_flight
-            or _turn_bind_epoch.get(session_id) != initial_turn_epoch
-            or resource_registry.session_activity_epoch(session_id) != initial_native_activity
-        )
+
+        def execution_observed() -> bool:
+            return (
+                initially_active
+                or _ingest_next_seq.get(session_id, 0) != _ingest_now_serving.get(session_id, 0)
+                or _turn_bind_epoch.get(session_id) != initial_turn_epoch
+                or resource_registry.session_activity_epoch(session_id) != initial_native_activity
+            )
+
+        execution_seen = execution_observed()
         recovery_turn = "none"
         if history and not execution_seen and session_id not in _active_turns:
             _session_histories[session_id] = history
@@ -3765,13 +3780,38 @@ def create_runner_app(
                 )
                 _background_tasks.add(_turn_task)
 
+        recovery_prompt = (
+            init_context.envelope.recovery_prompt if init_context.envelope is not None else None
+        )
         if recovery_id is not None and recovery_id not in _recovery_turn_ids.get(
             session_id, set()
         ):
+            admitted = True
+            if (
+                init_context.envelope is not None
+                and init_context.envelope.require_recovery_admission
+            ):
+                admission = await server_client.post(
+                    f"/v1/sessions/{session_id}/recovery/admit",
+                    params={"recovery_id": recovery_id},
+                    timeout=10.0,
+                )
+                admission.raise_for_status()
+                admitted = admission.json().get("admitted") is True
+                execution_seen = execution_observed()
+                forward_in_flight = _ingest_next_seq.get(session_id, 0) != _ingest_now_serving.get(
+                    session_id, 0
+                )
             # Active execution, including a newer message, takes precedence over
             # automatic continuation. Initialization alone cannot consume it.
             if (
-                not execution_seen
+                admitted
+                and not execution_seen
+                and (
+                    session_id not in _recovery_blocked_sessions
+                    or init_context.envelope is None
+                    or not init_context.envelope.require_recovery_admission
+                )
                 and session_id not in _active_turns
                 and not resource_registry.session_turn_is_active(session_id)
             ):
@@ -3788,17 +3828,25 @@ def create_runner_app(
                         {
                             "type": "input_text",
                             "text": (
-                                "Your runner was interrupted while this task was active. "
+                                recovery_prompt
+                                or "Your runner was interrupted while this task was active. "
                                 "Continue the existing task from its current state. "
                                 "Check any interrupted operation's outcome before repeating it."
                             ),
                         }
                     ],
                 }
+                if recovery_prompt is not None:
+                    recovery_body["stable_id"] = recovery_id
                 if not is_native_harness(harness_name):
-                    _session_histories.setdefault(session_id, []).append(
-                        {"type": "message", "role": "user", "content": recovery_body["content"]}
-                    )
+                    recovery_item: _JsonObject = {
+                        "type": "message",
+                        "role": "user",
+                        "content": recovery_body["content"],
+                    }
+                    if recovery_prompt is not None:
+                        recovery_item["is_meta"] = True
+                    _session_histories.setdefault(session_id, []).append(recovery_item)
                 recovery_task = asyncio.create_task(
                     _run_turn_bg(recovery_body, session_id), name=f"turn-recover-{session_id}"
                 )
@@ -3839,6 +3887,7 @@ def create_runner_app(
                 "id": session_id,
                 "agent_id": agent_id,
                 "status": status,
+                "recovery_turn": recovery_turn,
                 "created_at": int(_session_start_cache[session_id]),
                 "title": None,
                 "labels": {},
@@ -4098,6 +4147,7 @@ def create_runner_app(
         # Clear all desync/turn state so a recreated same-id session starts clean.
         _turn_bind_epoch.pop(session_id, None)
         _recovery_turn_ids.pop(session_id, None)
+        _recovery_blocked_sessions.discard(session_id)
         _desync_terminalized.pop(session_id, None)
         _desynced_sessions.discard(session_id)
         _required_terminal_exit_errors.pop(session_id, None)
@@ -4273,8 +4323,11 @@ def create_runner_app(
         # sub-agent whose spec says ``claude-native`` looking native while it
         # actually ran ``claude-sdk``, so its completion was never pushed to
         # the parent inbox (the native path that owes it never ran).
-        override = _session_harness_overrides.get(conv_id)
-        if override is not None:
+        snapshot = _session_snapshot_cache.get(conv_id)
+        override = _session_harness_overrides.get(conv_id) or (
+            snapshot.harness if snapshot is not None else None
+        )
+        if override and override != "auto":
             return canonicalize_harness(override) or override
         spec = _session_spec_cache.get(conv_id)
         if spec is None:
@@ -8232,6 +8285,8 @@ def create_runner_app(
                     _cond.notify_all()
 
         if body_type == "interrupt":
+            # Stop fences even recovery initialization that has not arrived yet.
+            _recovery_blocked_sessions.add(conversation_id)
             _cancel_claude_prompt_waiter(conversation_id)
             _harness = _session_harness_name(conversation_id)
             resource_registry.note_terminal_control_request(conversation_id, "interrupt")
@@ -8410,6 +8465,7 @@ def create_runner_app(
             return Response(status_code=204)
 
         if body_type == "stop_session":
+            _recovery_blocked_sessions.add(conversation_id)
             resource_registry.note_terminal_control_request(conversation_id, "stop_session")
             _cancel_claude_prompt_waiter(conversation_id)
             _harness = _session_harness_name(conversation_id)
@@ -8846,6 +8902,28 @@ def create_runner_app(
     async def _resolve_session_agent_spec(session_id: str) -> AgentSpec | None:
         entry = await _resolve_session_spec_entry(session_id)
         return _unwrap_spec_entry(entry)
+
+    async def _terminal_model_access(session_id: str, cwd: Path) -> ClaudeModelAccess | None:
+        from omnigent.harness_aliases import is_claude_sdk_harness_name
+        from omnigent.runtime.workflow import claude_terminal_model_access
+
+        entry = await _resolve_session_spec_entry(session_id)
+        spec = _unwrap_spec_entry(entry)
+        if spec is None:
+            snapshot = await _session_snapshot(session_id)
+            if not snapshot.ok or is_claude_sdk_harness_name(_session_harness_name(session_id)):
+                raise RuntimeError("Claude SDK terminals require a resolved session spec")
+            return None
+        return await asyncio.to_thread(
+            claude_terminal_model_access,
+            spec,
+            bundle_dir=_resolved_spec_workdir(entry),
+            effective_harness=_session_harness_name(session_id),
+            cwd=cwd,
+        )
+
+    if terminal_registry is not None:
+        terminal_registry.model_access_resolver = _terminal_model_access
 
     async def _resolve_session_agent_spec_or_none(session_id: str) -> AgentSpec | None:
         """Resolve the session agent spec, tolerating resolution failure.

@@ -8,6 +8,7 @@ SQLite database.
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -2994,3 +2995,37 @@ def test_inbox_mysql_deep_page_seeks_to_cursor(store):
         float(value) for value in re.findall(r"actual time=[^)]*? rows=([\d.]+)", plans[0])
     ]
     assert examined and max(examined) <= 51, plans[0]
+
+
+@pytest.mark.parametrize(
+    ("days_later", "expected"),
+    [
+        (2, (int(datetime(2026, 11, 21, 9, tzinfo=UTC).timestamp()), "active")),
+        (3, (None, "completed")),
+    ],
+)
+def test_a_schedule_anchor_keeps_count_from_the_anchor(
+    store: SqlAlchemyScheduledTaskStore,
+    monkeypatch: pytest.MonkeyPatch,
+    days_later: int,
+    expected: tuple[int | None, str],
+) -> None:
+    from omnigent.stores.scheduled_task_store import sqlalchemy_store
+
+    store.configure_dispatch(True)
+    anchor = int(datetime(2026, 11, 18, 12, tzinfo=UTC).timestamp())
+    # Runs on the 19th, 20th and 21st when anchored on the 18th.
+    monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: anchor + days_later * 86400)
+    task = store.create(
+        scheduled_task_id=_uid(f"st_anchor_{days_later}"),
+        name="copy",
+        prompt="p",
+        rrule="FREQ=DAILY;BYHOUR=9;BYMINUTE=0;COUNT=3",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+        schedule_anchor=anchor,
+    )
+    assert task.created_at == anchor
+    # Only the occurrences left after now remain; none, once COUNT is used up.
+    assert (task.next_run_at, task.state) == expected

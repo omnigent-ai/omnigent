@@ -382,7 +382,12 @@ function createBrowserViewRegistry({
   }
 
   function attachRecentSessionInput(entry) {
-    const wc = entry.view && entry.view.webContents;
+    // Another view taking keys for the page (the design tools' overlay) forwards them too.
+    entry.forwardRecentSessionInput = (wc) => forwardRecentSessionInputFrom(entry, wc);
+    forwardRecentSessionInputFrom(entry, entry.view && entry.view.webContents);
+  }
+
+  function forwardRecentSessionInputFrom(entry, wc) {
     if (!wc || typeof wc.on !== "function") return;
     wc.on("before-input-event", (event, input) => {
       if (!recentSessionSwitchSupported) return;

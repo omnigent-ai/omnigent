@@ -26,6 +26,13 @@ import httpx
 import pytest
 
 from omnigent.errors import OmnigentError
+from omnigent.inner.datamodel import (
+    HostWritePathSpec,
+    OSEnvSandboxSpec,
+    OSEnvSpec,
+    TerminalEnvSpec,
+    WritePathSpec,
+)
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.native import native_terminal
 from omnigent.policies.registry import (
@@ -40,12 +47,14 @@ from omnigent.runner._entry import (
     _agent_cache_dest,
     _AgentSpecCache,
     _apply_host_interactive_shells,
+    _apply_host_sandbox_grants,
     _host_interactive_shells_from_env,
     _ignore_finish_work_signal_until_handled,
     _InitialAuthTokenFactory,
     _install_crash_logging,
     _install_signal_handlers,
     _load_runner_idle_timeout_s_from_config,
+    _load_runner_sandbox_grants_from_config,
     _make_auth_token_factory,
     _make_managed_mint_factory,
     _ManagedMintTokenFactory,
@@ -86,6 +95,7 @@ from omnigent.runner.transports.ws_tunnel.serve import (
     RunnerTunnelAuthRejectedError,
 )
 from omnigent.spec.tar_utils import ExtractionError
+from omnigent.spec.types import AgentSpec
 from omnigent.util import event_loop_watchdog as watchdog
 from tests._helpers.session import bundle_files
 from tests.budgets import budget
@@ -130,6 +140,90 @@ def test_apply_host_interactive_shells_only_replaces_native_wrappers(
     assert native.terminals["zsh"].command is not None
     assert native.terminals["zsh"].command.endswith("zsh")
     assert custom.terminals == {"project": custom_terminal}
+
+
+def test_apply_host_sandbox_grants_extends_every_declared_sandbox(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Host grants reach the agent, its terminals, and nested agents, each path once."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "runner:\n"
+        "  sandbox_grants:\n"
+        "    read_paths: [/srv/example/repo/.git]\n"
+        "    write_paths: [/srv/example/cache, /srv/example/tmp]\n",
+        encoding="utf-8",
+    )
+    shared = OSEnvSandboxSpec(
+        read_paths=["docs"],
+        write_paths=[WritePathSpec("/srv/example/cache", copy_on_write=True)],
+    )
+    nested = OSEnvSandboxSpec(type="none")
+    spec = AgentSpec(
+        spec_version=1,
+        os_env=OSEnvSpec(sandbox=shared),
+        terminals={
+            "shell": TerminalEnvSpec(os_env=OSEnvSpec(sandbox=shared)),
+            "inherited": TerminalEnvSpec(os_env="inherit"),
+            "unsandboxed": TerminalEnvSpec(os_env=OSEnvSpec()),
+        },
+        sub_agents=[
+            AgentSpec(
+                spec_version=1,
+                sub_agents=[
+                    AgentSpec(
+                        spec_version=1,
+                        terminals={"shell": TerminalEnvSpec(os_env=OSEnvSpec(sandbox=nested))},
+                    )
+                ],
+            )
+        ],
+    )
+
+    _apply_host_sandbox_grants(spec)
+
+    assert shared.read_paths == ["docs", "/srv/example/repo/.git"]
+    assert shared.write_path_specs == [
+        WritePathSpec("/srv/example/cache", copy_on_write=True),
+        HostWritePathSpec("/srv/example/tmp"),
+    ]
+    assert shared.host_write_paths == ["/srv/example/tmp"]
+    assert nested == OSEnvSandboxSpec(
+        type="none",
+        read_paths=["/srv/example/repo/.git"],
+        write_paths=["/srv/example/cache", "/srv/example/tmp"],
+        host_write_paths=["/srv/example/cache", "/srv/example/tmp"],
+    )
+    assert spec.terminals is not None
+    assert spec.terminals["inherited"].os_env == "inherit"
+    assert spec.terminals["unsandboxed"].os_env == OSEnvSpec()
+    assert spec.sub_agents[0].os_env is None
+
+
+@pytest.mark.parametrize(
+    ("field", "expected"),
+    [
+        ("read_paths", {"read_paths": ["/srv/example/repo"]}),
+        (
+            "write_paths",
+            {"write_paths": ["/srv/example/repo"], "host_write_paths": ["/srv/example/repo"]},
+        ),
+    ],
+)
+def test_apply_host_sandbox_grants_leaves_unlisted_grant_kind_unset(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, field: str, expected: dict[str, list[str]]
+) -> None:
+    """A grant kind the host does not list keeps its authored ``None``."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        f"runner:\n  sandbox_grants:\n    {field}: [/srv/example/repo]\n",
+        encoding="utf-8",
+    )
+    sandbox = OSEnvSandboxSpec()
+
+    _apply_host_sandbox_grants(AgentSpec(spec_version=1, os_env=OSEnvSpec(sandbox=sandbox)))
+
+    assert sandbox == OSEnvSandboxSpec(**expected)
 
 
 class _TrackingTerminalRegistry:
@@ -2261,6 +2355,140 @@ def test_runner_threadpool_rejects_invalid_env(
         _runner_threadpool_max_workers()
 
 
+@pytest.mark.parametrize(
+    "config_text",
+    [
+        pytest.param(None, id="no-config"),
+        pytest.param("runner:\n  idle_timeout_s: 5\n", id="no-sandbox-grants"),
+        pytest.param("runner:\n  sandbox_grants:\n", id="empty-sandbox-grants"),
+    ],
+)
+def test_load_runner_sandbox_grants_defaults_to_no_grants(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, config_text: str | None
+) -> None:
+    """Hosts without ``runner.sandbox_grants`` grant nothing extra."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    if config_text is not None:
+        (tmp_path / "config.yaml").write_text(config_text, encoding="utf-8")
+
+    assert _load_runner_sandbox_grants_from_config() == ([], [])
+
+
+def test_load_runner_sandbox_grants_reads_absolute_paths(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Configured grants keep their order and drop repeated entries."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "runner:\n"
+        "  sandbox_grants:\n"
+        "    read_paths: [/srv/example/repo/.git, /srv/example/config, /srv/example/repo/.git]\n"
+        "    write_paths: [/srv/example/cache]\n",
+        encoding="utf-8",
+    )
+
+    assert _load_runner_sandbox_grants_from_config() == (
+        ["/srv/example/repo/.git", "/srv/example/config"],
+        ["/srv/example/cache"],
+    )
+
+
+@pytest.mark.parametrize(
+    ("grants_yaml", "message"),
+    [
+        pytest.param(" [/srv/example]", "runner.sandbox_grants must be a mapping", id="list"),
+        pytest.param(
+            "\n    write_files: [/srv/example/file]",
+            "runner.sandbox_grants.write_files is not supported",
+            id="unknown-key",
+        ),
+        pytest.param(
+            "\n    read_paths: /srv/example",
+            "runner.sandbox_grants.read_paths must be a list",
+            id="not-a-list",
+        ),
+        pytest.param(
+            "\n    read_paths: [relative/dir]",
+            "runner.sandbox_grants.read_paths entries must be absolute paths",
+            id="relative",
+        ),
+        pytest.param(
+            "\n    write_paths: ['~/cache']",
+            "runner.sandbox_grants.write_paths entries must be absolute paths",
+            id="home",
+        ),
+        pytest.param(
+            "\n    read_paths: ['']",
+            "runner.sandbox_grants.read_paths entries must be absolute paths",
+            id="empty",
+        ),
+        pytest.param(
+            "\n    read_paths: [42]",
+            "runner.sandbox_grants.read_paths entries must be absolute paths",
+            id="non-string",
+        ),
+        pytest.param(
+            "\n    write_paths: [{path: /srv/example/cache, copy_on_write: true}]",
+            "runner.sandbox_grants.write_paths entries must be absolute paths",
+            id="copy-on-write",
+        ),
+    ],
+)
+def test_load_runner_sandbox_grants_rejects_invalid_values(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, grants_yaml: str, message: str
+) -> None:
+    """Invalid host sandbox grants fail loud and name the offending field."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        f"runner:\n  sandbox_grants:{grants_yaml}\n", encoding="utf-8"
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        _load_runner_sandbox_grants_from_config()
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        pytest.param(r"\srv\example\cache", id="no-drive"),
+        pytest.param(r"\cache\..\data", id="no-drive-parent"),
+        pytest.param(r"C:cache", id="drive-relative"),
+    ],
+)
+def test_load_runner_sandbox_grants_rejects_windows_paths_without_drive_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, path: str
+) -> None:
+    """On Windows a grant must start at a drive root or UNC share, not just a backslash."""
+    monkeypatch.setattr("omnigent.runner._entry.IS_WINDOWS", True)
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        f"runner:\n  sandbox_grants:\n    write_paths: ['{path}']\n", encoding="utf-8"
+    )
+
+    with pytest.raises(RuntimeError, match="write_paths entries must be absolute paths"):
+        _load_runner_sandbox_grants_from_config()
+
+
+def test_load_runner_sandbox_grants_reads_windows_drive_and_unc_paths(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Fully qualified Windows drive and UNC paths are valid host grants."""
+    monkeypatch.setattr("omnigent.runner._entry.IS_WINDOWS", True)
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "runner:\n"
+        "  sandbox_grants:\n"
+        "    read_paths: ['C:\\srv\\example\\repo\\.git']\n"
+        "    write_paths: ['\\\\example-host\\share\\cache']\n",
+        encoding="utf-8",
+    )
+
+    assert _load_runner_sandbox_grants_from_config() == (
+        [r"C:\srv\example\repo\.git"],
+        [r"\\example-host\share\cache"],
+    )
+
+
 @pytest.mark.asyncio
 async def test_inactivity_monitor_requests_shutdown_when_idle() -> None:
     """Expired idle timeout requests graceful runner shutdown.
@@ -3324,6 +3552,41 @@ async def test_resolve_agent_spec_from_server_extracts_each_fetch_separately(
         True,
         True,
     ]
+
+
+async def test_resolve_agent_spec_from_server_applies_host_sandbox_grants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Grants from the host's config reach the sandbox of a server-fetched bundle."""
+    config_home = tmp_path / "config-home"
+    config_home.mkdir()
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    (config_home / "config.yaml").write_text(
+        "runner:\n  sandbox_grants:\n    read_paths: [/srv/example/repo/.git]\n",
+        encoding="utf-8",
+    )
+    bundle = bundle_files(
+        {
+            "config.yaml": (
+                b"spec_version: 1\nname: sandboxed-agent\n"
+                b"executor:\n  config:\n    harness: claude-sdk\n"
+                b"os_env:\n  type: caller_process\n"
+                b"  sandbox:\n    type: none\n    read_paths: [docs]\n"
+            )
+        }
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, content=bundle)),
+        base_url="http://server.test",
+    ) as client:
+        resolved = await _resolve_agent_spec_from_server(
+            client, _AgentSpecCache(tmp_path / "cache"), "ag_sandboxed", session_id="conv_test"
+        )
+
+    assert resolved is not None and resolved.spec.os_env is not None
+    assert resolved.spec.os_env.sandbox is not None
+    assert resolved.spec.os_env.sandbox.read_paths == ["docs", "/srv/example/repo/.git"]
 
 
 @pytest.mark.parametrize(

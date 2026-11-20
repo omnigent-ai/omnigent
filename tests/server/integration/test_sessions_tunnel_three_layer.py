@@ -39,7 +39,7 @@ import json
 import tarfile
 import threading
 from collections.abc import AsyncIterator, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -82,6 +82,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+from omnigent.stores.host_store import HostStore
 from tests.budgets import budget
 from tests.runner.helpers import NullServerClient
 from tests.runtime.harnesses._test_scaffold_harnesses import _EchoHarness
@@ -342,7 +343,9 @@ class _TunnelStack:
 
 
 @pytest_asyncio.fixture()
-async def tunnel_three_layer_stack(tmp_path: Path) -> AsyncIterator[_TunnelStack]:
+async def tunnel_three_layer_stack(
+    tmp_path: Path, request: pytest.FixtureRequest
+) -> AsyncIterator[_TunnelStack]:
     """Wire Omnigent server + WS-tunneled runner + EchoHarness in-process.
 
     Lifecycle: build stores, init runtime, override the test harness
@@ -411,6 +414,8 @@ async def tunnel_three_layer_stack(tmp_path: Path) -> AsyncIterator[_TunnelStack
         conversation_store=conv_store,
         artifact_store=artifact_store,
         agent_cache=agent_cache,
+        host_store=HostStore(db_uri) if getattr(request, "param", False) else None,
+        host_session_recovery=getattr(request, "param", False) == "recovery",
     )
     set_runner_router(ap_app.state.runner_router)
 
@@ -3003,3 +3008,216 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
                 await reconnect.send_input({"type": "websocket.disconnect", "code": 1000})
             with contextlib.suppress(asyncio.TimeoutError, Exception):
                 await reconnect.wait(timeout=budget(2.0))
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+@pytest.mark.parametrize("tunnel_three_layer_stack", ["recovery"], indirect=True)
+@pytest.mark.parametrize("new_input", [None, "before-snapshot", "after-snapshot"])
+async def test_accepted_input_supersedes_recovery_before_runner_delivery(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+    new_input: str | None,
+) -> None:
+    from omnigent.db.utils import now_epoch
+    from omnigent.host.frames import HostHelloFrame
+    from omnigent.runtime import get_conversation_store
+    from omnigent.session_recovery import RECOVERY_ATTEMPT_S, RECOVERY_NOTICE, SessionRecovery
+    from tests._helpers.polling import poll_until_async
+
+    stack = tunnel_three_layer_stack
+    session_id = await _bind_failed_session(
+        stack.ap_client, error_code="runner_disconnected", error_message="Disconnected"
+    )
+    store = get_conversation_store()
+    host_id = "a" * 32
+    store.set_host_id(session_id, host_id, workspace="/restored")
+    service = stack.ap_app.state.host_session_recoverer
+    service.host_store.upsert_on_connect(host_id, "recovery-host", "local")
+    connection = service.hosts.register(
+        host_id,
+        AsyncMock(),
+        HostHelloFrame(
+            version="test",
+            frame_protocol_version=1,
+            name="recovery-host",
+            recover_interrupted_sessions=True,
+        ),
+        owner="local",
+    )
+    intent = SessionRecovery(
+        host_id,
+        _RUNNER_ID,
+        now_epoch(),
+        phase="launching",
+        attempts=1,
+        attempt_id="interrupted-task",
+        retry_at=now_epoch() + RECOVERY_ATTEMPT_S,
+        launch_runner_id=_RUNNER_ID,
+        response_id="interrupted-response",
+    )
+    assert store.replace_session_recovery(session_id, None, intent)
+    history_entered, release_history = asyncio.Event(), asyncio.Event()
+    delivery_entered, release_delivery = asyncio.Event(), asyncio.Event()
+    get, post, dispatch, run_turn = (
+        NullServerClient.get,
+        NullServerClient.post,
+        dispatch_via_asgi,
+        _EchoHarness.run_turn,
+    )
+    executed: list[Any] = []
+
+    async def read_history(self: Any, url: str, **kwargs: Any) -> Any:
+        if url.rstrip("/").endswith(f"/{session_id}/items"):
+            snapshot = (
+                await stack.ap_client.get(url, **kwargs) if new_input == "after-snapshot" else None
+            )
+            history_entered.set()
+            await release_history.wait()
+            return snapshot if snapshot is not None else await stack.ap_client.get(url, **kwargs)
+        return await get(self, url, **kwargs)
+
+    async def admit(self: Any, url: str, **kwargs: Any) -> Any:
+        if url.endswith("/recovery/admit"):
+            return await stack.ap_client.post(url, **kwargs)
+        return await post(self, url, **kwargs)
+
+    async def delay_delivery(app: FastAPI, frame: RequestFrame, send: Any) -> None:
+        if frame.path == f"/v1/sessions/{session_id}/events" and frame.method == "POST":
+            body = json.loads(frame.body or "{}")
+            if body.get("type") == "message":
+                delivery_entered.set()
+                await release_delivery.wait()
+        await dispatch(app, frame, send)
+
+    async def record_execution(self: Any, request: Any, ctx: Any) -> None:
+        executed.append(request.input)
+        await run_turn(self, request, ctx)
+
+    monkeypatch.setattr(NullServerClient, "get", read_history)
+    monkeypatch.setattr(NullServerClient, "post", admit)
+    monkeypatch.setattr(
+        "tests.server.integration.test_sessions_tunnel_three_layer.dispatch_via_asgi",
+        delay_delivery,
+    )
+    monkeypatch.setattr(_EchoHarness, "run_turn", record_execution)
+    recovery = asyncio.create_task(
+        service._continue(connection, store.get_conversation(session_id), intent)
+    )
+    message = None
+    try:
+        await asyncio.wait_for(history_entered.wait(), timeout=budget(5.0))
+        if new_input is not None:
+            message = asyncio.create_task(
+                stack.ap_client.post(
+                    f"/v1/sessions/{session_id}/events",
+                    json={
+                        "type": "message",
+                        "data": {
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "New instruction"}],
+                        },
+                    },
+                )
+            )
+            await asyncio.wait_for(delivery_entered.wait(), timeout=budget(5.0))
+            assert store.get_session_recovery(session_id) is None
+        release_history.set()
+        await asyncio.wait_for(recovery, timeout=budget(5.0))
+        if new_input is not None:
+            assert not executed, "recovery ran ahead of already accepted input"
+            release_delivery.set()
+            assert (await message).status_code == 202
+        await poll_until_async(lambda: len(executed) == 1, timeout_s=budget(5.0))
+        turn = stack.runner_app.state.active_turns.get(session_id)
+        if turn is not None:
+            await asyncio.wait_for(turn, timeout=budget(5.0))
+        assert len(executed) == 1
+        assert (RECOVERY_NOTICE in str(executed)) is (new_input is None)
+    finally:
+        release_history.set()
+        release_delivery.set()
+        for task in (recovery, message):
+            if task is not None:
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (recovery, message) if task is not None), return_exceptions=True
+        )
+        service.hosts.deregister(host_id, conn=connection)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+@pytest.mark.parametrize("tunnel_three_layer_stack", ["recovery"], indirect=True)
+@pytest.mark.parametrize(
+    "host_enabled",
+    [pytest.param(False, id="legacy-fallback"), pytest.param(True, id="automatic-recovery")],
+)
+async def test_root_reconnect_requires_host_opt_in_before_suppressing_legacy_recovery(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+    host_enabled: bool,
+) -> None:
+    from omnigent.host.frames import HostHelloFrame
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
+    from omnigent.session_recovery import SessionRecovery
+
+    stack = tunnel_three_layer_stack
+    session_id = await _bind_failed_session(
+        stack.ap_client, error_code="runner_disconnected", error_message="Disconnected"
+    )
+    store = get_conversation_store()
+    host_id = "a" * 32
+    store.set_host_id(session_id, host_id, workspace="/restored")
+    service = stack.ap_app.state.host_session_recoverer
+    service.deployment_gate = True
+    service.sandbox_config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="https://server.example.test",
+            launcher_factory=lambda: None,
+            token_ttl_s=3600,
+            provider="test",
+            host_config={"host": {"recover_interrupted_sessions": host_enabled}},
+        )
+    )
+    monkeypatch.setattr(
+        service.host_store,
+        "get_host",
+        lambda _: SimpleNamespace(sandbox_provider=None, deleted_at=None, user_id=None),
+    )
+    stack.ap_app.state.host_registry.register(
+        host_id,
+        AsyncMock(),
+        HostHelloFrame(
+            version="test",
+            frame_protocol_version=1,
+            name="recovery-host",
+            recover_interrupted_sessions=host_enabled,
+        ),
+        owner=None,
+        registered_with_managed_token=False,
+    )
+    assert store.replace_session_recovery(
+        session_id, None, SessionRecovery(host_id, _RUNNER_ID, 100, phase="launching")
+    )
+    initializer = stack.ap_app.state.runner_session_initializer
+    spy = AsyncMock(wraps=initializer.initialize)
+    monkeypatch.setattr(initializer, "initialize", spy)
+    async with _reconnect_fires_connect_hook(
+        stack.ap_app, stack.fake_pm, wait_for_recover=session_id
+    ):
+        assert spy.call_args.kwargs["suppress_recovery_turn"] is host_enabled
+        assert store.get_session_recovery(session_id) is not None
+        from omnigent.server.routes._sessions import orchestration
+
+        probe = orchestration._relay_turn_held_for_host
+        assert probe is not None
+        assert await probe(_RUNNER_ID, session_id) is host_enabled
+        for phase in ("stopped", "failed"):
+            recovery = store.get_session_recovery(session_id)
+            assert recovery is not None
+            assert store.replace_session_recovery(
+                session_id, recovery, replace(recovery, phase=phase)
+            )
+            assert not await probe(_RUNNER_ID, session_id)
