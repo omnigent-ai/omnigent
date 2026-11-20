@@ -449,20 +449,55 @@ describe("a shell's tab", () => {
       sessionKey: "s1",
       running: true,
     };
-    vi.mocked(useTerminals).mockReturnValue({
-      terminals: [terminal],
-      isLoading: false,
-      error: null,
-      listCompleteAt: 1,
-    } as unknown as ReturnType<typeof useTerminals>);
-    renderPanels([{ conversationId: "s-shell", terminalKeys: ["terminal:term_1"] }]);
+    const listing = (listCompleteAt: number, error: Error | null = null) =>
+      vi.mocked(useTerminals).mockReturnValue({
+        terminals: listCompleteAt > 0 ? [terminal] : [],
+        isLoading: listCompleteAt === 0,
+        error,
+        listCompleteAt,
+      } as unknown as ReturnType<typeof useTerminals>);
+    const panels = [{ conversationId: "s-shell", terminalKeys: ["terminal:term_1"] }];
+    // Before the session's shells are listed, the tab connects rather than calling it ended.
+    listing(0);
+    const view = renderPanels(panels);
     const { store } = workspaceTabsSession("s-shell");
     await act(async () => {
       await store.open({ place: { kind: "terminal", key: "terminal:term_1" } }, { opener: "user" });
     });
+    expect(await screen.findByText("Connecting to the shell…")).toBeInTheDocument();
+    expect(screen.queryByText("This shell has ended.")).toBeNull();
+
+    listing(1);
+    view.rerender(panels);
     expect(await screen.findByTestId("terminal-view-stub")).toHaveAttribute(
       "data-terminal",
       "term_1",
     );
+
+    // A failed refresh of the list leaves the attached shell on screen, without remounting it.
+    const attached = screen.getByTestId("terminal-view-stub");
+    listing(2, new Error("offline"));
+    view.rerender(panels);
+    await waitFor(() => expect(store.resourceState(store.selectedTabId()!)).toBe("unknown"));
+    expect(screen.getByTestId("terminal-view-stub")).toBe(attached);
+    expect(screen.queryByText("This shell has ended.")).toBeNull();
+  });
+
+  it("says the session's shells can't be listed when that fails before the tab attaches", async () => {
+    const { useTerminals } = await import("@/hooks/useTerminals");
+    vi.mocked(useTerminals).mockReturnValue({
+      terminals: [],
+      isLoading: false,
+      error: new Error("offline"),
+      listCompleteAt: 0,
+    } as unknown as ReturnType<typeof useTerminals>);
+    renderPanels([{ conversationId: "s-shell-down", terminalKeys: ["terminal:term_1"] }]);
+    const { store } = workspaceTabsSession("s-shell-down");
+    await act(async () => {
+      await store.open({ place: { kind: "terminal", key: "terminal:term_1" } }, { opener: "user" });
+    });
+    expect(await screen.findByText("Couldn’t reach this session’s shells.")).toBeInTheDocument();
+    expect(screen.queryByText("This shell has ended.")).toBeNull();
+    expect(screen.queryByTestId("terminal-view-stub")).toBeNull();
   });
 });

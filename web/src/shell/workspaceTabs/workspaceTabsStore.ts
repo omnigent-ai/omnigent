@@ -1070,12 +1070,13 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
         : placeIdentity(candidate.place) === identity;
     });
     if (existing) {
-      removeTab(tabId, false);
-      markSelected(existing.id);
-      if (existing.unseen) replaceTab(withoutUnseen(existing));
-      history.recordStep(visitOf(existing));
-      commit();
-      return existing.id;
+      return transact(() => {
+        // Selected first, as openRecent does, so removing the New tab lands nowhere else.
+        if (!select(existing.id)) return null;
+        removeTab(tabId, false);
+        commit();
+        return existing.id;
+      });
     }
     const filesTab = knownTabs().some((candidate) => candidate.role === "files");
     const next: WorkspaceTab = {

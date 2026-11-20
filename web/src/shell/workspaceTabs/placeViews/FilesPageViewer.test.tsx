@@ -174,6 +174,22 @@ describe("FilesPageViewer", () => {
     expect(screen.getByRole("alert")).toHaveTextContent("Couldn’t open a.ts: not found");
   });
 
+  it("keeps a rich file in the app's viewer when a background refresh fails", () => {
+    const { rerender } = renderViewer("docs/guide.md", { data: file("docs/guide.md", "# Guide") });
+    const viewer = screen.getByTestId("file-viewer");
+    vi.mocked(useFileContent).mockReturnValue({
+      data: file("docs/guide.md", "# Guide"),
+      isError: true,
+      error: new Error("offline"),
+      isFetching: false,
+    } as unknown as FileResult);
+    rerender(
+      <FilesPageViewer conversationId="conv_1" path="docs/guide.md" active onClose={() => {}} />,
+    );
+    expect(screen.getByTestId("file-viewer")).toBe(viewer);
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
   describe("unsaved edits", () => {
     function renderDirty() {
       const unregister = vi.fn();
@@ -209,6 +225,32 @@ describe("FilesPageViewer", () => {
       });
       await userEvent.click(await screen.findByRole("button", { name: "Keep editing" }));
       await expect(answer!).resolves.toBe("cancel");
+    });
+
+    it("keeps the editor and its leave question when a background refresh fails", () => {
+      const { registerLeaveGuard, unregister, rerender } = renderDirty();
+      act(() => captured.editor!.onDirtyChange!(true));
+      const editor = screen.getByTestId("editor");
+      // A failed refetch keeps the last content alongside the error.
+      vi.mocked(useFileContent).mockReturnValue({
+        data: file("a.ts", "x"),
+        isError: true,
+        error: new Error("offline"),
+        isFetching: false,
+      } as unknown as FileResult);
+      rerender(
+        <FilesPageViewer
+          conversationId="conv_1"
+          path="a.ts"
+          active
+          onClose={() => {}}
+          registerLeaveGuard={registerLeaveGuard}
+        />,
+      );
+      // The same editor, not a remount, so its buffer and unsaved edits stay.
+      expect(screen.getByTestId("editor")).toBe(editor);
+      expect(screen.queryByRole("alert")).toBeNull();
+      expect(unregister).not.toHaveBeenCalled();
     });
 
     it("keeps the edits when the file closes while the question is open", async () => {
