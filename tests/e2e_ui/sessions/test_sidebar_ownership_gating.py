@@ -160,6 +160,13 @@ def test_owner_session_returns_to_my_sessions_after_brief_403_outage(
         load_error.get_by_role("button", name="Retry").click()
         # Retry refetches only the session list; the identity retry restores ownership.
         expect(_row(page, sid)).to_be_visible(timeout=60_000)
+        _open_row_menu(page, sid)
+        expect(page.get_by_test_id("rename-conversation")).not_to_have_attribute(
+            "data-disabled", re.compile(r".*")
+        )
+        expect(page.get_by_test_id("share-conversation")).not_to_have_attribute(
+            "data-disabled", re.compile(r".*")
+        )
 
 
 @pytest.mark.flaky(reruns=2, reruns_delay=5)
