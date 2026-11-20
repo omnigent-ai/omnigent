@@ -9,6 +9,8 @@ import { openKeyboardShortcuts } from "@/components/KeyboardShortcutsDialog";
 import { openFindFromCommand, useCanOpenFindFromCommand } from "@/lib/findRouting";
 import { AVAILABLE, HIDDEN, type PaletteCommand } from "@/store/paletteCommands";
 
+import { useSettingsCommands } from "./settingsCommands";
+
 export interface QuickPickAppCommandOptions {
   /** Switches the palette to searching sessions only; absent where it can't. */
   onGoToSession?: () => void;
@@ -18,6 +20,7 @@ export function useQuickPickAppCommands({
   onGoToSession,
 }: QuickPickAppCommandOptions = {}): PaletteCommand[] {
   const canOpenFind = useCanOpenFindFromCommand();
+  const settingsCommands = useSettingsCommands();
   return useMemo<PaletteCommand[]>(
     () => [
       ...(onGoToSession
@@ -55,7 +58,8 @@ export function useQuickPickAppCommands({
         movesFocus: true,
         run: openKeyboardShortcuts,
       },
+      ...settingsCommands,
     ],
-    [canOpenFind, onGoToSession],
+    [canOpenFind, onGoToSession, settingsCommands],
   );
 }

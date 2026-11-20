@@ -6,7 +6,9 @@ import { useState } from "react";
 import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 import { KEYBOARD_SHORTCUTS_EVENT } from "@/components/KeyboardShortcutsDialog";
+import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { registerFindSurface } from "@/lib/findRouting";
+import { readTerminalThemeMode } from "@/lib/terminalThemePreferences";
 
 import { QuickPickCommandPalette } from "./QuickPickCommandPalette";
 
@@ -112,6 +114,34 @@ describe("QuickPick ⌘K Go to Session…", () => {
   it("isn't offered where the palette can't switch", () => {
     renderPalette();
     expect(actionNames().some((name) => name.includes("Go to Session"))).toBe(false);
+  });
+});
+
+describe("QuickPick ⌘K setting rows", () => {
+  const heading = () =>
+    document.querySelector('[data-slot="quick-pick-heading"]')?.textContent ?? null;
+
+  it("changes Always steer from its row, back on the row showing the new value", async () => {
+    const input = renderPalette();
+    fireEvent.change(input, { target: { value: "always steer" } });
+    const row = screen.getByRole("option", { name: /Always steer/ });
+    expect(row).toHaveTextContent("On");
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(heading()).toBe("Always steer"));
+    fireEvent.change(input, { target: { value: "off" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(readAlwaysSteer()).toBe(false);
+    await waitFor(() => expect(heading()).toBeNull());
+    expect(screen.getByRole("option", { name: /Always steer/ })).toHaveTextContent("Off");
+  });
+
+  it("finds the terminal theme by a value's name and opens on it", async () => {
+    const input = renderPalette();
+    fireEvent.change(input, { target: { value: "terminal theme dark" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(heading()).toBe("Terminal theme"));
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(readTerminalThemeMode()).toBe("dark");
   });
 });
 
