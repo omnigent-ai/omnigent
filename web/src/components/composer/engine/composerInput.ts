@@ -118,16 +118,23 @@ export interface ComposerKeyboardEvent {
 /** A change, selection, focus or scroll on a composer input; React's textarea events satisfy it. */
 export interface ComposerInputEvent {
   readonly currentTarget: ComposerTextTarget;
-  /** An engine's undo or redo made this change; a textarea reports it as its `inputType`. */
-  readonly fromHistory?: boolean;
+  /** Set when an engine's undo or redo made this change; a textarea reports it as `inputType`. */
+  readonly historyDirection?: "undo" | "redo";
   readonly nativeEvent?: Event;
+}
+
+/** The undo or redo that made `event`'s change, on either engine; `null` for any other change. */
+export function historyDirectionOf(event: ComposerInputEvent): "undo" | "redo" | null {
+  if (event.historyDirection) return event.historyDirection;
+  const inputType = (event.nativeEvent as InputEvent | undefined)?.inputType;
+  if (inputType === "historyUndo") return "undo";
+  if (inputType === "historyRedo") return "redo";
+  return null;
 }
 
 /** Whether `event` is an undo or redo, on either engine. */
 export function isHistoryInput(event: ComposerInputEvent): boolean {
-  if (event.fromHistory) return true;
-  const inputType = (event.nativeEvent as InputEvent | undefined)?.inputType;
-  return inputType === "historyUndo" || inputType === "historyRedo";
+  return historyDirectionOf(event) !== null;
 }
 
 /**
