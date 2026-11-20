@@ -160,6 +160,9 @@ def test_gateway_launch_answers_when_gateway_rejects_advisor_tool(
         requests.clear()
         result = _run_claude(argv, env, tmp_path)
 
+    assert control_requests, "The control CLI did not reach the mock gateway: " + _describe(
+        control, control_requests
+    )
     if not _advisor_tools(control_requests):
         pytest.skip("this Claude Code CLI does not send the advisor tool even without the flag")
     assert control.returncode != 0 and "advisor_" in control.stdout + control.stderr, (
