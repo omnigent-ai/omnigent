@@ -2773,6 +2773,17 @@ function NewChatLandingContent({
     initialFiles: handoff?.files ?? restoredDraft?.files ?? [],
   });
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // The panel's prompt takes the keyboard each time the panel does, after any kept draft.
+  useEffect(() => {
+    if (!floating) return;
+    return floating.subscribeShown(() => {
+      const input = textareaRef.current;
+      if (!input) return;
+      const end = input.value.length;
+      input.setSelectionRange(end, end);
+      input.focus({ preventScroll: true });
+    });
+  }, [floating]);
   // A cancelled native picker fires `cancel`, which React has no prop for.
   useEffect(() => {
     const input = fileInputRef.current;

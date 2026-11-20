@@ -5,6 +5,7 @@ const { EventEmitter } = require("node:events");
 const {
   FLOATING_COMPOSER_PRELOAD_DELAY_MS,
   FLOATING_COMPOSER_READY_FALLBACK_MS,
+  FLOATING_COMPOSER_SHOWN_CHANNEL,
   createFloatingComposerController,
   createFloatingComposerPreloader,
   fadeInFloatingComposer,
@@ -23,6 +24,7 @@ class FakePanel extends EventEmitter {
     this.bounds = { x: 0, y: 0, width: 620, height: 360 };
     this.webContents = Object.assign(new EventEmitter(), {
       focus: () => this.calls.push("webContents.focus"),
+      send: (channel) => this.calls.push(`send:${channel}`),
     });
   }
   isDestroyed() {
@@ -160,7 +162,7 @@ test("a hidden panel comes on screen through present; showing a visible one focu
   panel.calls.length = 0;
   assert.equal(controller.show("https://a.example"), "focused");
   // Taking the keyboard back is the same call as on open, never one that activates the app.
-  assert.deepEqual(panel.calls, ["webContents.focus"]);
+  assert.deepEqual(panel.calls, ["webContents.focus", `send:${FLOATING_COMPOSER_SHOWN_CHANNEL}`]);
   assert.equal(presented.length, 1);
   assert.equal(panel.visible, true, "a second press never closes the panel");
 });
@@ -700,4 +702,42 @@ test("a press while a panel is open goes back to it, until the open ends", (t) =
     end();
     assert.equal(controller.openServerUrl(), null);
   }
+});
+
+test("each way the panel takes the keyboard tells its page right after, once", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { controller, created } = setup({ autoReady: false });
+  const shown = `send:${FLOATING_COMPOSER_SHOWN_CHANNEL}`;
+  // Ready at once, after ready, by fallback, and a second press.
+  controller.preload("https://a.example");
+  controller.markReady(created[0]);
+  controller.show("https://a.example");
+  controller.show("https://b.example");
+  controller.markReady(created[1]);
+  controller.show("https://c.example");
+  t.mock.timers.tick(FLOATING_COMPOSER_READY_FALLBACK_MS);
+  controller.show("https://c.example");
+  for (const [panel, opens] of [
+    [created[0], 1],
+    [created[1], 1],
+    [created[2], 2],
+  ]) {
+    assert.equal(panel.calls.filter((call) => call === shown).length, opens, panel.serverUrl);
+    panel.calls.forEach((call, index) => {
+      if (call === shown) assert.equal(panel.calls[index - 1], "webContents.focus");
+    });
+  }
+});
+
+test("a panel gone before its page was ready is never told it took the keyboard", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { controller, created } = setup({ autoReady: false });
+  controller.show("https://a.example");
+  controller.close(created[0]);
+  controller.markReady(created[0]);
+  t.mock.timers.tick(FLOATING_COMPOSER_READY_FALLBACK_MS);
+  assert.equal(
+    created[0].calls.some((call) => call.startsWith("send:")),
+    false,
+  );
 });
