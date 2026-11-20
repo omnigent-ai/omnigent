@@ -16,7 +16,11 @@ from fastapi import (
 )
 from fastapi.responses import Response
 
-from omnigent.automations_availability import AUTOMATIONS_HEADER, USER_INBOX_HEADER
+from omnigent.automations_availability import (
+    AUTOMATIONS_HEADER,
+    THINGIES_HEADER,
+    USER_INBOX_HEADER,
+)
 from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCode, OmnigentError
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 from omnigent.mcp_selection import MCP_SELECTION_HEADER, MCP_SELECTION_PREFIX, selected_mcp_spec
@@ -316,6 +320,10 @@ def register_agent_routes(
                 )
                 inbox_on = False
             selection_headers[USER_INBOX_HEADER] = "1" if inbox_on else "0"
+        thingies_available = getattr(request.app.state, "thingies_available", None)
+        selection_headers[THINGIES_HEADER] = (
+            "1" if thingies_available is not None and thingies_available() else "0"
+        )
         memory_available = getattr(request.app.state, "memory_available", None)
         selection_headers[MEMORY_HEADER] = (
             "1" if memory_available is not None and memory_available() else "0"
@@ -632,6 +640,7 @@ def register_agent_routes(
         if method == "tools/call":
             from omnigent.server.mcp_identity import mcp_policy_actor
             from omnigent.tools.builtins.journal import JOURNAL_TOOLS
+            from omnigent.tools.builtins.thingies import THINGY_TOOL_NAMES
 
             tool_name = params.get("name")
             if (
@@ -642,6 +651,12 @@ def register_agent_routes(
                 )
             ):
                 return _mcp_error_response(rpc_id, -32601, "Workflows are disabled on this server")
+            if isinstance(tool_name, str) and tool_name in THINGY_TOOL_NAMES:
+                thingies_available = getattr(request.app.state, "thingies_available", None)
+                if thingies_available is None or not thingies_available():
+                    return _mcp_error_response(
+                        rpc_id, -32601, "Thingies are disabled on this server"
+                    )
 
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             actor = mcp_policy_actor(request, conv, user_id) if conv else _build_actor(user_id)

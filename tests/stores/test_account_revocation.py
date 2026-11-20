@@ -1557,3 +1557,69 @@ def test_prompt_write_rechecks_the_admin_under_its_lock(db_uri: str) -> None:
         with pytest.raises(OmnigentError, match="revoked"):
             settings.set_prompt_override(None, actor="admin", require_admin=True)
     assert settings.read_prompt_override() == "Look for stale pull requests."
+
+
+def _thingies(db_uri: str, tmp_path, accounts: SqlAlchemyAccountStore):
+    from omnigent.stores.thingy_store.local import LocalThingyStore
+    from omnigent.thingies.access import PermissionStoreThingyAccess
+    from omnigent.thingies.accounts import DeletedAccountThingies
+    from omnigent.thingies.service import ThingyService, ThingyViewer
+
+    store = LocalThingyStore(str(tmp_path / "thingies"))
+    access = PermissionStoreThingyAccess(store, SqlAlchemyPermissionStore(db_uri))
+    accounts.attach_thingies(DeletedAccountThingies(store, access))
+    return store, access, lambda user: ThingyService(store, access, ThingyViewer(user))
+
+
+def test_deletion_removes_the_accounts_thingies_and_who_they_were_shared_with(
+    db_uri: str, tmp_path
+) -> None:
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    store, access, service = _thingies(db_uri, tmp_path, accounts)
+    accounts.create_user_with_password("alice", "alice-hash")
+    permissions.ensure_user("bob")
+    board = service("alice").create("Synthetic board")
+    kept = service("bob").create("Bob's board")
+    permissions.grant_for_thingy("bob", board["id"], 2)
+    permissions.grant_for_thingy("alice", kept["id"], 1)
+    service("alice").pin(kept["id"], {"pinned": True})
+
+    assert accounts.delete_user("alice") is True
+    assert store.list_owned("alice") == [] and store.get(board["id"]) is None
+    assert permissions.list_for_thingy(board["id"]) == ([], None)
+    assert access.shared_with("bob") == []
+
+    # The name starts over: no thingies, shares or pins come back with it.
+    accounts.create_user_with_password("alice", "replacement-hash")
+    assert service("alice").list_owned() == {"items": []}
+    assert service("alice").shelf()["pinned"] == []
+    assert service("alice").shared() == {"items": []}
+    assert store.get(kept["id"]) is not None
+
+
+def test_reregistration_waits_until_the_deleted_accounts_thingies_are_gone(
+    db_uri: str, tmp_path, monkeypatch
+) -> None:
+    accounts = SqlAlchemyAccountStore(db_uri)
+    store, _, service = _thingies(db_uri, tmp_path, accounts)
+    accounts.create_user_with_password("alice", "alice-hash")
+    board = service("alice").create("Synthetic board")
+    original = store.delete
+    # The thingy store is unavailable while the account is deleted and re-registered.
+    monkeypatch.setattr(store, "delete", lambda thingy_id: False)
+    assert accounts.delete_user("alice") is True
+    assert store.get(board["id"]) is not None
+    with pytest.raises(OmnigentError) as refused:
+        accounts.create_user_with_password("alice", "replacement-hash")
+    assert refused.value.code == ErrorCode.CONFLICT
+    assert "thingies" in refused.value.message
+    assert accounts.get_user("alice") is None
+
+    monkeypatch.setattr(store, "delete", original)
+    assert accounts.create_user_with_password("alice", "replacement-hash").id == "alice"
+    assert store.get(board["id"]) is None
+    # A live account's thingies are never touched by a late cleanup.
+    mine = service("alice").create("New board")
+    accounts._delete_deleted_thingies("alice")
+    assert store.get(mine["id"]) is not None

@@ -1315,6 +1315,19 @@ def _default_db_uri() -> str:
     return f"sqlite:///{_local_data_dir() / 'chat.db'}"
 
 
+def _default_thingy_location() -> str:
+    """Default thingy directory for ``omnigent server`` — ``<data_dir>/thingies``.
+
+    Beside the default database and artifacts, so ``OMNIGENT_DATA_DIR`` isolates
+    thingies too. The config file's ``thingy_location`` overrides it.
+
+    :returns: e.g. ``"/home/alice/.omnigent/thingies"``.
+    """
+    from omnigent.host.local_server import _local_data_dir
+
+    return str(_local_data_dir() / "thingies")
+
+
 def _default_artifact_location() -> str:
     """Default artifact dir for ``omnigent server`` — ``<data_dir>/artifacts``.
 
@@ -5015,6 +5028,12 @@ def server(
 
         preference_store = SqlAlchemyPreferenceStore(db_uri, authority_id=authority_id)
     artifact_store = _create_artifact_store(art_loc)
+    from omnigent.stores.thingy_store.local import LocalThingyStore
+
+    thingy_location = cfg.get("thingy_location") or _default_thingy_location()
+    if config_path and not Path(thingy_location).is_absolute():
+        thingy_location = str(Path(config_path).parent / thingy_location)
+    thingy_store = LocalThingyStore(thingy_location)
 
     # Initialize the runtime with store references so workflow code
     # can access them via getter functions (get_agent_cache(), etc.).
@@ -5225,6 +5244,7 @@ def server(
         project_store=project_store,
         preference_store=preference_store,
         memory_store=memory_store,
+        thingy_store=thingy_store,
         auth_provider=auth_provider,
         host_store=host_store,
         account_store=account_store,

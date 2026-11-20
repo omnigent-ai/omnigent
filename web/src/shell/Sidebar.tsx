@@ -282,6 +282,7 @@ import {
 } from "@/lib/sidebarViewPreferences";
 import { ExtensionPrimaryNavigation } from "@/extensions/ExtensionPrimaryNavigation";
 import { PrimaryNavLink } from "@/shell/PrimaryNavLink";
+import { ThingySidebarNav, useFullScreenThingyId } from "@/thingies/ui/ThingySidebarNav";
 import { useViewerId } from "@/hooks/useViewerId";
 import { useExtensions } from "@/extensions/ExtensionProvider";
 import { extensionPathParts, resolveExtensionPageFromPath } from "@/extensions/catalog";
@@ -607,6 +608,7 @@ function useActiveNavItem(): {
   isCanvasPage: boolean;
   isTasksPage: boolean;
   isWorkflowsPage: boolean;
+  isThingyPage: boolean;
   isUsagePage: boolean;
   activeExtensionPageId: string | null;
   newSessionProjectName: string | null;
@@ -632,6 +634,8 @@ function useActiveNavItem(): {
   // Likewise /workflows (list) and /workflows/:workflowId (a workflow's page).
   const isWorkflowsPage =
     !isExtensionRoute && (leaf === "workflows" || segments.at(-2) === "workflows");
+  // /thingy (list), /thingy/new and /thingy/:thingyId.
+  const isThingyPage = !isExtensionRoute && (leaf === "thingy" || segments.at(-2) === "thingy");
   const isUsagePage = !isExtensionRoute && leaf === "usage";
   const activeExtensionPageId =
     resolveExtensionPageFromPath(extensions, location.pathname)?.page.id ?? null;
@@ -646,6 +650,7 @@ function useActiveNavItem(): {
     !isCanvasPage &&
     !isTasksPage &&
     !isWorkflowsPage &&
+    !isThingyPage &&
     !isUsagePage &&
     !isExtensionRoute;
   const searchParams = new URLSearchParams(location.search);
@@ -663,6 +668,7 @@ function useActiveNavItem(): {
     isCanvasPage,
     isTasksPage,
     isWorkflowsPage,
+    isThingyPage,
     isUsagePage,
     activeExtensionPageId,
     newSessionProjectName,
@@ -964,16 +970,20 @@ function SidebarImpl({
 
   // Which top-level nav button to highlight for the current route.
   const {
-    isNewChatPage,
+    isNewChatPage: isNewChatRoute,
     isInboxPage,
     isCanvasPage,
     isTasksPage,
     isWorkflowsPage,
+    isThingyPage,
     isUsagePage,
     activeExtensionPageId,
     newSessionProjectName,
     projectHomeName,
   } = useActiveNavItem();
+  // A thingy filling the screen beside New session is what the sidebar marks, not New session.
+  const fullScreenThingyId = useFullScreenThingyId();
+  const isNewChatPage = isNewChatRoute && fullScreenThingyId === null;
   const navigate = useNavigate();
   const projectKanban = useProjectKanbanEnabled();
   const openProjectHome = useStableCallback((projectName: string) => {
@@ -1570,6 +1580,7 @@ function SidebarImpl({
                   )}
                 </Link>
               </Button>
+              <ThingySidebarNav active={isThingyPage} onNavigate={onNavClick} />
               {canvasEnabled && (
                 <PrimaryNavLink
                   to={canvasDestination.pathname + canvasDestination.search}

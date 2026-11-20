@@ -8950,9 +8950,9 @@ def _ensure_orchestrator_skills_in_bundle(
     enabled = {"build-omnigent"}
     spec = _unwrap_resolved_spec(agent_spec)
     if isinstance(spec, AgentSpec):
-        enabled.update(framework_skill_names(spec))
-    if not workflows_enabled:
-        enabled.difference_update({"workflow", "save-workflow"})
+        # ``thingy`` follows the spec's tool group, which the runner turns off for a
+        # server without thingies.
+        enabled.update(framework_skill_names(spec, workflows=workflows_enabled))
     for name, source in sources.items():
         target_dir = bundle_dir / "skills" / name
         try:

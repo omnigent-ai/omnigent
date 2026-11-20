@@ -58,6 +58,8 @@ export interface CommentsPanelProps {
    * owner/editor access).
    */
   canEdit?: boolean;
+  /** What the panel says to a viewer who can't comment; the default names a session. */
+  readOnlyMessage?: string;
   /**
    * Called when the user clicks the "Copy link" icon on a comment.
    * The caller is responsible for building the URL and writing to clipboard.
@@ -90,6 +92,7 @@ export function CommentsPanel({
   addressFileCount = 1,
   addressPending,
   canEdit = true,
+  readOnlyMessage = "You have read-only access to this session.",
   pendingBodyRef,
   onCopyCommentLink,
   now,
@@ -255,7 +258,7 @@ export function CommentsPanel({
 
       {!canEdit && (
         <div className="shrink-0 border-b border-border px-3 py-2 text-sm text-muted-foreground">
-          You have read-only access to this session.
+          {readOnlyMessage}
         </div>
       )}
 

@@ -1,10 +1,12 @@
 /**
- * Permissions management modal for a session, an automation or a workflow.
+ * Permissions management modal for a session, an automation, a workflow or a thingy.
  *
  * Displays current grants, allows granting/revoking access, and
  * toggling public visibility. Only accessible to users with
  * manage-level (3) permission on the session. An automation or a workflow
  * is shared by its owner at read access only, with no public or link sharing.
+ * A thingy is shared by its managers at Can view, Can edit or Can manage, also
+ * without public or link sharing.
  */
 
 import {
@@ -64,6 +66,8 @@ import { automationSharePath } from "@/lib/automationFromSession";
 import type { ScheduledTask } from "@/lib/scheduledTasksApi";
 import type { SavedWorkflow } from "@/hooks/useSavedWorkflows";
 import type { Session } from "@/lib/types";
+import type { Thingy } from "@/thingies/api/thingyApi";
+import { thingyLink } from "@/thingies/ui/thingyNavigation";
 import { cn } from "@/lib/utils";
 
 const PUBLIC_USER = "__public__";
@@ -82,6 +86,18 @@ export type SharedAutomation = Pick<ScheduledTask, "id" | "name" | "sessionMode"
 /** The workflow fields its share dialog shows. */
 export type SharedWorkflow = Pick<SavedWorkflow, "id" | "name">;
 
+/** The thingy fields its share dialog shows; with its owner and viewer, it lists the owner. */
+export type SharedThingy = Pick<Thingy, "id" | "name"> &
+  Partial<Pick<Thingy, "owner_id" | "viewer_id">>;
+
+/** The levels a thingy can be shared at (read, edit, manage), as its share dialog names them. */
+const THINGY_LEVELS = [
+  { value: 1, label: "Can view" },
+  { value: 2, label: "Can edit" },
+  { value: 3, label: "Can manage" },
+] as const;
+const THINGY_LEVELS_WITH_OWNER = [...THINGY_LEVELS, { value: 4, label: "Owner" }] as const;
+
 type PermissionsModalProps = {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -92,6 +108,7 @@ type PermissionsModalProps = {
       filePath?: string;
       automation?: undefined;
       workflow?: undefined;
+      thingy?: undefined;
     }
   | {
       automation: SharedAutomation;
@@ -99,6 +116,7 @@ type PermissionsModalProps = {
       workspace?: undefined;
       filePath?: undefined;
       workflow?: undefined;
+      thingy?: undefined;
     }
   | {
       workflow: SharedWorkflow;
@@ -106,12 +124,22 @@ type PermissionsModalProps = {
       workspace?: undefined;
       filePath?: undefined;
       automation?: undefined;
+      thingy?: undefined;
+    }
+  | {
+      thingy: SharedThingy;
+      sessionId?: undefined;
+      workspace?: undefined;
+      filePath?: undefined;
+      automation?: undefined;
+      workflow?: undefined;
     }
 );
 
 function shareTarget(props: PermissionsModalProps): ShareTarget {
   if (props.automation !== undefined) return { kind: "automation", id: props.automation.id };
   if (props.workflow !== undefined) return { kind: "workflow", id: props.workflow.id };
+  if (props.thingy !== undefined) return { kind: "thingy", id: props.thingy.id };
   return { kind: "session", id: props.sessionId };
 }
 
@@ -122,7 +150,11 @@ export function PermissionsModal(props: PermissionsModalProps) {
   // read the sessions its runs create. Nor does a workflow: its grantees run it.
   const automation = props.automation ?? null;
   const workflow = props.workflow ?? null;
+  const thingy = props.thingy ?? null;
+  // Only a session has public access, workspace files and a link.
   const readOnlyShare = target.kind !== "session";
+  // An automation or a workflow is shared at read access only; a thingy at any of its levels.
+  const fixedReadShare = readOnlyShare && thingy === null;
   const sessionId = target.kind === "session" ? target.id : null;
   // Server sharing policy. While the boot probe is in flight we treat the
   // server as "on" (fail open) so the modal renders its full controls; the
@@ -146,13 +178,15 @@ export function PermissionsModal(props: PermissionsModalProps) {
       : 1;
   // In "off" mode never fetch the grant list — the modal short-circuits to a
   // notice below. Closing keeps the loaded list through the close animation.
+  // With sharing off, a thingy's managers still see who has access, and can take it away.
+  const revokeOnly = sharingOff && thingy !== null;
   const {
     data: grantList,
     isLoading,
     isError: grantsFailed,
     error: grantsError,
     refetch: refreshPermissions,
-  } = useGrantList(target, open && !sharingOff);
+  } = useGrantList(target, open && (!sharingOff || revokeOnly));
   const permissions = grantList?.permissions;
   // The server names an automation only to its owner, while it replaces this
   // session's shares on each run.
@@ -165,6 +199,8 @@ export function PermissionsModal(props: PermissionsModalProps) {
   const [error, setError] = useState<string | null>(null);
   const [showQr, setShowQr] = useState(false);
   const [checkingPermissions, setCheckingPermissions] = useState(false);
+  // A change that takes the viewer's own Can manage away waits for them to confirm it.
+  const [selfChange, setSelfChange] = useState<{ level: number } | null>(null);
   const blockedNoticeId = useId();
 
   // Whether the owner shared the workspace files with view-level collaborators.
@@ -212,6 +248,15 @@ export function PermissionsModal(props: PermissionsModalProps) {
   }
 
   const userGrants = (permissions ?? []).filter((p) => p.user_id !== PUBLIC_USER);
+  // A thingy's owner is not a grant; the list names them first, fixed, for its other managers.
+  const thingyOwner =
+    thingy?.owner_id !== undefined
+      ? {
+          user_id: thingy.owner_id,
+          level: 4,
+          display_name: thingy.owner_id === thingy.viewer_id ? "You" : thingy.owner_id,
+        }
+      : null;
   const publicGrant = (permissions ?? []).find((p) => p.user_id === PUBLIC_USER);
   const publicLevel = publicGrant ? Math.min(publicGrant.level, publicMaxLevel) : 0;
 
@@ -258,6 +303,14 @@ export function PermissionsModal(props: PermissionsModalProps) {
         ? (await refreshPermissions({ throwOnError: true })).data?.permissions
         : undefined;
       const existingGrant = currentPermissions?.find((p) => p.user_id === trimmed);
+      // Granting a thingy grantee less than they have would quietly take access away.
+      const listed = thingy ? permissions?.find((p) => p.user_id === trimmed) : undefined;
+      if (listed && listed.level > parseInt(newLevel, 10)) {
+        const name = listed.display_name ?? listed.user_id;
+        const current = THINGY_LEVELS.find((level) => level.value === listed.level)?.label;
+        setError(`${name} already has ${current ?? "more access"}. Change it in the list above.`);
+        return;
+      }
       if (await grantAccess(trimmed, parseInt(newLevel, 10), existingGrant?.level, !!filePath)) {
         setNewUserId("");
         setNewLevel("1");
@@ -269,17 +322,42 @@ export function PermissionsModal(props: PermissionsModalProps) {
     }
   }
 
-  function handleRevoke(userId: string) {
+  // The viewer appears in a thingy's list only as a grantee, never as its owner.
+  const viewerId = thingy?.viewer_id;
+  const isViewerManage = (userId: string) =>
+    viewerId !== undefined &&
+    userId === viewerId &&
+    (permissions?.find((p) => p.user_id === userId)?.level ?? 0) >= 3;
+  // Losing Can manage closes the dialog, whose list only managers may read, and refreshes the
+  // thingy, which shows the viewer's new access.
+  function afterSelfChange() {
+    setSelfChange(null);
+    void queryClient.invalidateQueries({ queryKey: ["thingies"] });
+    onOpenChange(false);
+  }
+
+  function handleRevoke(userId: string, confirmed = false) {
     setError(null);
+    if (!confirmed && isViewerManage(userId)) {
+      setSelfChange({ level: 0 });
+      return;
+    }
     revoke.mutate(userId, {
+      onSuccess: () => {
+        if (userId === viewerId) afterSelfChange();
+      },
       onError: (err) => setError(err.message),
     });
   }
 
-  async function handleChangeLevel(userId: string, level: number) {
+  async function handleChangeLevel(userId: string, level: number, confirmed = false) {
     if (workspaceBlocked || fileShareUnavailable) return;
     setError(null);
-    await grantAccess(userId, level);
+    if (!confirmed && level < 3 && isViewerManage(userId)) {
+      setSelfChange({ level });
+      return;
+    }
+    if ((await grantAccess(userId, level)) && confirmed) afterSelfChange();
   }
 
   async function handlePublicLevel(value: string) {
@@ -301,6 +379,12 @@ export function PermissionsModal(props: PermissionsModalProps) {
   } else if (workflow) {
     description =
       "The people below can view this workflow, run it and make a copy. Their runs stay private.";
+  } else if (thingy && revokeOnly) {
+    description = `${SHARING_OFF_REASON} The people below keep their access until you remove it.`;
+  } else if (thingy) {
+    description = sharingReadOnly
+      ? "This server allows read-only sharing — invite others to view this thingy."
+      : "Can view lets people use it; Can edit also lets them change its data and publish versions; Can manage also lets them share and delete it.";
   } else if (filePath) {
     description = "This link opens the selected file in full screen.";
   } else if (sharingReadOnly) {
@@ -308,8 +392,9 @@ export function PermissionsModal(props: PermissionsModalProps) {
   }
 
   // "off" short-circuit: sharing is disabled server-wide, so skip the whole
-  // grant UI and show a plain notice instead. Mirrors the server's 403.
-  if (sharingOff) {
+  // grant UI and show a plain notice instead. Mirrors the server's 403. A thingy
+  // keeps its list, so existing grants can still be removed.
+  if (sharingOff && !revokeOnly) {
     return (
       <Dialog open={open} onOpenChange={onOpenChange}>
         <DialogContent className="sm:max-w-md">
@@ -336,9 +421,11 @@ export function PermissionsModal(props: PermissionsModalProps) {
               ? "Share this automation"
               : workflow
                 ? "Share this workflow"
-                : filePath
-                  ? "Share this file"
-                  : "Share this session"}
+                : thingy
+                  ? "Share this thingy"
+                  : filePath
+                    ? "Share this file"
+                    : "Share this session"}
           </DialogTitle>
           <DialogDescription asChild>
             <div className="space-y-3">
@@ -350,7 +437,7 @@ export function PermissionsModal(props: PermissionsModalProps) {
                   General access are kept.
                 </p>
               )}
-              {sharingReadOnly && !filePath && (
+              {sharingReadOnly && !filePath && !thingy && (
                 <p>
                   Please be careful when sharing. Read access will allow for reading of all session
                   outputs.
@@ -473,7 +560,7 @@ export function PermissionsModal(props: PermissionsModalProps) {
             <p role="alert" className="text-ui text-destructive py-2">
               Couldn&apos;t load who has access: {grantsError.message}
             </p>
-          ) : userGrants.length === 0 ? (
+          ) : userGrants.length === 0 && !thingyOwner ? (
             <p className="text-ui text-muted-foreground py-2">No grants yet.</p>
           ) : (
             <>
@@ -482,12 +569,28 @@ export function PermissionsModal(props: PermissionsModalProps) {
                 <span className="flex-1 text-sm font-medium uppercase tracking-wide text-muted-foreground">
                   Name
                 </span>
-                <span className="w-28 text-sm font-medium uppercase tracking-wide text-muted-foreground">
+                <span
+                  className={cn(
+                    "text-sm font-medium uppercase tracking-wide text-muted-foreground",
+                    thingy ? "w-32" : "w-28",
+                  )}
+                >
                   Permission
                 </span>
                 <span className="size-7 shrink-0" aria-hidden="true" />
               </div>
               <div className="max-h-48 overflow-y-auto">
+                {thingyOwner && (
+                  <GrantRow
+                    permission={thingyOwner}
+                    onRevoke={handleRevoke}
+                    onChangeLevel={handleChangeLevel}
+                    busy={shareBusy}
+                    levelDisabled
+                    readOnly
+                    levels={THINGY_LEVELS_WITH_OWNER}
+                  />
+                )}
                 {userGrants.map((p) => (
                   <GrantRow
                     key={p.user_id}
@@ -496,7 +599,18 @@ export function PermissionsModal(props: PermissionsModalProps) {
                     onChangeLevel={handleChangeLevel}
                     busy={shareBusy}
                     levelDisabled={fileShareUnavailable}
-                    readOnly={sharingReadOnly || readOnlyShare}
+                    readOnly={revokeOnly || (sharingReadOnly && !thingy) || fixedReadShare}
+                    levels={
+                      thingy
+                        ? sharingReadOnly
+                          ? // Read-only sharing still lets a grant go down to Can view.
+                            THINGY_LEVELS.filter(
+                              (level) => level.value === 1 || level.value === p.level,
+                            )
+                          : THINGY_LEVELS
+                        : undefined
+                    }
+                    youLabel={p.user_id === viewerId ? "you" : undefined}
                   />
                 ))}
               </div>
@@ -513,67 +627,120 @@ export function PermissionsModal(props: PermissionsModalProps) {
           </p>
         )}
 
-        {/* Add grant form */}
-        <form onSubmit={handleGrant} className="flex items-end gap-2">
-          <div className="flex-1">
-            <label htmlFor="perm-user" className="text-sm font-medium text-muted-foreground">
-              User ID
-            </label>
-            <AddUserField value={newUserId} onChange={setNewUserId} disabled={workspaceBlocked} />
-          </div>
-          {readOnlyShare ? (
-            <div>
-              <span className="text-sm font-medium text-muted-foreground">Level</span>
-              <p className="mt-1 flex h-8 w-24 items-center px-3 text-ui text-muted-foreground">
-                Read
+        {selfChange && (
+          <Alert role="alertdialog" aria-label="Change your own access" className="bg-muted/50">
+            <InfoIcon />
+            <AlertTitle>
+              {selfChange.level === 0 ? "Remove your own access?" : "Give up Can manage?"}
+            </AlertTitle>
+            <AlertDescription>
+              <p>
+                {selfChange.level === 0
+                  ? "You won’t be able to open this thingy again unless someone shares it with you."
+                  : "You won’t be able to share or delete this thingy, or see who has access, unless someone gives you Can manage again."}
               </p>
-            </div>
-          ) : (
-            <div>
-              <label htmlFor="perm-level" className="text-sm font-medium text-muted-foreground">
-                Level
+              <div className="mt-2 flex gap-2">
+                <Button
+                  size="sm"
+                  variant="destructive"
+                  loading={shareBusy}
+                  componentId="diagnostics.permissions.confirm_self_change"
+                  onClick={() => {
+                    if (viewerId === undefined) return;
+                    if (selfChange.level === 0) handleRevoke(viewerId, true);
+                    else void handleChangeLevel(viewerId, selfChange.level, true);
+                  }}
+                >
+                  {selfChange.level === 0 ? "Remove my access" : "Give up Can manage"}
+                </Button>
+                <Button size="sm" variant="outline" onClick={() => setSelfChange(null)}>
+                  Cancel
+                </Button>
+              </div>
+            </AlertDescription>
+          </Alert>
+        )}
+
+        {/* Add grant form */}
+        {!revokeOnly && (
+          <form onSubmit={handleGrant} className="flex items-end gap-2">
+            <div className="flex-1">
+              <label htmlFor="perm-user" className="text-sm font-medium text-muted-foreground">
+                User ID
               </label>
-              <Select
-                value={newLevel}
-                onValueChange={setNewLevel}
-                disabled={workspaceBlocked}
-                componentId="diagnostics.permissions.grant_level"
-                valueHasNoPii
-              >
-                <SelectTrigger className="mt-1 w-24" aria-label="New user permission">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent position="popper" align="start">
-                  <SelectItem value="1">Read</SelectItem>
-                  {/* Read-only sharing caps new grants at view; hide Edit. */}
-                  {!sharingReadOnly && <SelectItem value="2">Edit</SelectItem>}
-                </SelectContent>
-              </Select>
+              <AddUserField value={newUserId} onChange={setNewUserId} disabled={workspaceBlocked} />
             </div>
-          )}
-          <Button
-            type="submit"
-            size="sm"
-            loading={checkingPermissions || grant.isPending || shareWorkspace.isPending}
-            disabled={
-              workspaceBlocked ||
-              !newUserId.trim() ||
-              fileShareUnavailable ||
-              (!!filePath && permissions === undefined)
-            }
-            aria-describedby={workspaceBlocked ? blockedNoticeId : undefined}
-            componentId="diagnostics.permissions.grant"
-          >
-            <UserPlusIcon className="mr-1 size-3.5" />
-            Grant
-          </Button>
-        </form>
+            {fixedReadShare ? (
+              <div>
+                <span className="text-sm font-medium text-muted-foreground">Level</span>
+                <p className="mt-1 flex h-8 w-24 items-center px-3 text-ui text-muted-foreground">
+                  Read
+                </p>
+              </div>
+            ) : (
+              <div>
+                <label htmlFor="perm-level" className="text-sm font-medium text-muted-foreground">
+                  Level
+                </label>
+                <Select
+                  value={newLevel}
+                  onValueChange={setNewLevel}
+                  disabled={workspaceBlocked}
+                  componentId="diagnostics.permissions.grant_level"
+                  valueHasNoPii
+                >
+                  <SelectTrigger
+                    className={cn("mt-1", thingy ? "w-32" : "w-24")}
+                    aria-label="New user permission"
+                  >
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent position="popper" align="start">
+                    {thingy ? (
+                      // Read-only sharing caps new grants at view.
+                      THINGY_LEVELS.filter((level) => !sharingReadOnly || level.value === 1).map(
+                        (level) => (
+                          <SelectItem key={level.value} value={String(level.value)}>
+                            {level.label}
+                          </SelectItem>
+                        ),
+                      )
+                    ) : (
+                      <>
+                        <SelectItem value="1">Read</SelectItem>
+                        {/* Read-only sharing caps new grants at view; hide Edit. */}
+                        {!sharingReadOnly && <SelectItem value="2">Edit</SelectItem>}
+                      </>
+                    )}
+                  </SelectContent>
+                </Select>
+              </div>
+            )}
+            <Button
+              type="submit"
+              size="sm"
+              loading={checkingPermissions || grant.isPending || shareWorkspace.isPending}
+              disabled={
+                workspaceBlocked ||
+                !newUserId.trim() ||
+                fileShareUnavailable ||
+                (!!filePath && permissions === undefined)
+              }
+              aria-describedby={workspaceBlocked ? blockedNoticeId : undefined}
+              componentId="diagnostics.permissions.grant"
+            >
+              <UserPlusIcon className="mr-1 size-3.5" />
+              Grant
+            </Button>
+          </form>
+        )}
 
         {visibleError && <p className="text-sm text-destructive">{visibleError}</p>}
 
         {/* Keep the default stacking below sm: one row of Copy link + QR +
             Done overflows a phone-width dialog and widens the whole grid. */}
         <DialogFooter className="sm:justify-between">
+          {thingy && <ThingyCopyLinkButton thingyId={thingy.id} onError={setError} />}
           {sessionId !== null && (
             <div className="flex items-center gap-2">
               <CopyLinkButton
@@ -817,6 +984,40 @@ function getDeepLink(
   }
 }
 
+/** Copies the link that opens a thingy; only the people it is shared with can open it. */
+function ThingyCopyLinkButton({
+  thingyId,
+  onError,
+}: {
+  thingyId: string;
+  onError: (message: string | null) => void;
+}) {
+  const [copied, setCopied] = useState(false);
+  const rebasePath = useRebasePath();
+  useEffect(() => {
+    if (!copied) return;
+    const id = setTimeout(() => setCopied(false), 2000);
+    return () => clearTimeout(id);
+  }, [copied]);
+  return (
+    <Button
+      variant="ghost"
+      className="gap-1.5 text-primary"
+      componentId="diagnostics.permissions.copy_thingy_link"
+      onClick={() => {
+        onError(null);
+        copyText(thingyLink(thingyId, rebasePath)).then(
+          () => setCopied(true),
+          () => onError("Couldn’t copy the link."),
+        );
+      }}
+    >
+      {copied ? <CheckIcon className="size-3.5" /> : <LinkIcon className="size-3.5" />}
+      {copied ? "Copied" : "Copy link"}
+    </Button>
+  );
+}
+
 function CopyLinkButton({
   sessionId,
   filePath,
@@ -954,6 +1155,8 @@ function GrantRow({
   busy,
   levelDisabled,
   readOnly,
+  levels,
+  youLabel,
 }: {
   permission: ShareGrant;
   onRevoke: (userId: string) => void;
@@ -961,15 +1164,21 @@ function GrantRow({
   busy: boolean;
   levelDisabled: boolean;
   readOnly: boolean;
+  /** The levels the row offers, when the target names its own (a thingy). */
+  levels?: readonly { value: number; label: string }[];
+  /** Marks the viewer's own row. */
+  youLabel?: string;
 }) {
   const isOwner = permission.level === 4;
-  // Manage is not grantable from the UI, so a pre-existing manage grant
-  // renders as a fixed label rather than a dropdown choice. Unlike the
+  // Manage is not grantable from a session's dialog, so a pre-existing manage
+  // grant renders as a fixed label rather than a dropdown choice. Unlike the
   // owner row it can still be revoked.
-  const isManage = permission.level === 3;
+  const isManage = permission.level === 3 && levels === undefined;
   // Read-only sharing mode: existing grants can't be re-leveled, so the level
   // shows as a fixed label (like owner/manage) — but the row stays revocable.
-  const fixedLevel = isOwner || isManage || readOnly;
+  const fixedLevel = isOwner || isManage || readOnly || (levels !== undefined && levels.length < 2);
+  // A thingy's levels are longer words than a session's Read and Edit.
+  const levelWidth = levels ? "w-32" : "w-28";
   // An automation's grants carry a display name; the ID follows when it differs.
   const name = permission.display_name ?? permission.user_id;
 
@@ -980,13 +1189,18 @@ function GrantRow({
           carries the full id. */}
       <span className="flex-1 truncate text-ui" title={permission.user_id}>
         {name}
+        {youLabel && <span className="ml-1 text-muted-foreground">({youLabel})</span>}
         {name !== permission.user_id && (
           <span className="ml-2 text-sm text-muted-foreground">{permission.user_id}</span>
         )}
       </span>
       {fixedLevel ? (
-        <span className="flex h-8 w-28 items-center px-3 text-ui text-muted-foreground">
-          {LEVEL_LABELS[permission.level] ?? "Read"}
+        <span
+          className={cn("flex h-8 items-center px-3 text-ui text-muted-foreground", levelWidth)}
+        >
+          {levels?.find((level) => level.value === permission.level)?.label ??
+            LEVEL_LABELS[permission.level] ??
+            "Read"}
         </span>
       ) : (
         <Select
@@ -995,14 +1209,24 @@ function GrantRow({
           disabled={busy || levelDisabled}
         >
           <SelectTrigger
-            className="h-8 w-28"
+            className={cn("h-8", levelWidth)}
             aria-label={`Permission level for ${permission.user_id}`}
           >
             <SelectValue />
           </SelectTrigger>
           <SelectContent position="popper" align="start">
-            <SelectItem value="1">Read</SelectItem>
-            <SelectItem value="2">Edit</SelectItem>
+            {levels ? (
+              levels.map((level) => (
+                <SelectItem key={level.value} value={String(level.value)}>
+                  {level.label}
+                </SelectItem>
+              ))
+            ) : (
+              <>
+                <SelectItem value="1">Read</SelectItem>
+                <SelectItem value="2">Edit</SelectItem>
+              </>
+            )}
           </SelectContent>
         </Select>
       )}
@@ -1016,9 +1240,9 @@ function GrantRow({
           disabled={busy}
           className="shrink-0 text-muted-foreground hover:text-destructive"
           componentId="diagnostics.permissions.revoke"
+          aria-label={`Revoke access for ${name}`}
         >
           <Trash2Icon className="size-3.5" />
-          <span className="sr-only">Revoke</span>
         </Button>
       )}
     </div>

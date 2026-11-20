@@ -15,6 +15,7 @@ import {
   Maximize2Icon,
   MessagesSquareIcon,
   PanelLeftIcon,
+  PanelsTopLeftIcon,
   PanelRightCloseIcon,
   PanelRightIcon,
   SearchIcon,
@@ -129,6 +130,8 @@ interface MobileSessionMenuProps {
   showSideChats: boolean;
   /** Open the mobile side-chats drawer. */
   onOpenSideChats: () => void;
+  /** The thingies shown beside the session; each opens over it. */
+  thingies?: readonly { key: string; label: string; onSelect: () => void }[];
   /** Open the main execution-log push panel. */
   onOpenMainExecutionLog: () => void;
 }
@@ -493,6 +496,16 @@ export function ChatHeader({
             Side chats
           </DropdownMenuItem>
         )}
+        {mobileMenu.thingies?.map((thingy) => (
+          <DropdownMenuItem
+            key={thingy.key}
+            onSelect={thingy.onSelect}
+            className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
+          >
+            <PanelsTopLeftIcon className="size-4 shrink-0" />
+            <span className="min-w-0 truncate">{thingy.label}</span>
+          </DropdownMenuItem>
+        ))}
         {/* Shells — the mobile entry into the session's shells
             (desktop has no Shells tab; it opens shells as soft tabs):
             visible when a real shell exists, or when the agent spec

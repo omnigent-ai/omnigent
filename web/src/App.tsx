@@ -79,6 +79,18 @@ const WorkflowDetailPage = withPageView(
   "workflows.detail",
   lazy(() => import("@/pages/WorkflowDetailPage").then((m) => ({ default: m.WorkflowDetailPage }))),
 );
+const ThingyListPage = withPageView(
+  "thingies",
+  lazy(() => import("@/thingies/ui/ThingyListPage").then((m) => ({ default: m.ThingyListPage }))),
+);
+const ThingyStartPage = withPageView(
+  "thingies.new",
+  lazy(() => import("@/thingies/ui/ThingyStart").then((m) => ({ default: m.ThingyStartPage }))),
+);
+const ThingyOpenPage = withPageView(
+  "thingies.open",
+  lazy(() => import("@/thingies/ui/ThingyOpenPage").then((m) => ({ default: m.ThingyOpenPage }))),
+);
 const SettingsPage = lazy(() =>
   import("@/pages/SettingsPage").then((m) => ({ default: m.SettingsPage })),
 );
@@ -276,6 +288,30 @@ function AppRoutes({ basename }: AppProps) {
             element={
               <FeatureGatedPage feature="workflows">
                 <WorkflowDetailPage />
+              </FeatureGatedPage>
+            }
+          />
+          <Route
+            path={`${prefix}/thingy`}
+            element={
+              <FeatureGatedPage feature="thingies">
+                <ThingyListPage />
+              </FeatureGatedPage>
+            }
+          />
+          <Route
+            path={`${prefix}/thingy/new`}
+            element={
+              <FeatureGatedPage feature="thingies">
+                <ThingyStartPage />
+              </FeatureGatedPage>
+            }
+          />
+          <Route
+            path={`${prefix}/thingy/:thingyId`}
+            element={
+              <FeatureGatedPage feature="thingies">
+                <ThingyOpenPage />
               </FeatureGatedPage>
             }
           />

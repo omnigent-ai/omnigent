@@ -280,29 +280,39 @@ def resolve_harness_skills(ctx: SkillSourceContext, harness: str | None) -> list
 
 # Skills Omnigent ships, each for agents that have the tool group it drives.
 FRAMEWORK_SKILLS_DIR = Path(__file__).resolve().parent.parent / "resources" / "skills"
-_FRAMEWORK_SKILL_GROUPS = {"workflow": "journal", "save-workflow": "journal"}
+_FRAMEWORK_SKILL_GROUPS = {"workflow": "journal", "save-workflow": "journal", "thingy": "thingies"}
+# Offered only while the server enables workflows; the others follow their tool group alone
+# (the runner turns ``thingies`` off when the server has no thingies).
+WORKFLOW_SKILL_NAMES = frozenset({"workflow", "save-workflow"})
 
 
-def framework_skill_names(spec: AgentSpec | None = None) -> list[str]:
+def framework_skill_names(spec: AgentSpec | None = None, *, workflows: bool = True) -> list[str]:
     """Names of the skills Omnigent ships for the agent's tool groups, e.g. ``["workflow"]``.
 
     Each lives in ``FRAMEWORK_SKILLS_DIR / name``. Without a spec, return every
     framework name so reused bundles can remove disabled framework-owned links.
+
+    :param workflows: Whether the server enables workflows; ``False`` leaves out
+        :data:`WORKFLOW_SKILL_NAMES`.
     """
     return [
         name
         for name, group in _FRAMEWORK_SKILL_GROUPS.items()
-        if spec is None or getattr(spec.tool_groups, group)
+        if (spec is None or getattr(spec.tool_groups, group))
+        and (workflows or name not in WORKFLOW_SKILL_NAMES)
     ]
 
 
-def framework_skills(spec: AgentSpec) -> list[SkillSpec]:
+def framework_skills(spec: AgentSpec, *, workflows: bool = True) -> list[SkillSpec]:
     """The skills Omnigent ships for the agent's tool groups, e.g. ``workflow``.
 
     Like bundled skills, they ignore ``skills_filter``; an agent drops one by
     turning its tool group off, e.g. ``tool_groups.journal: false``.
+
+    :param workflows: Whether the server enables workflows (see
+        :func:`framework_skill_names`).
     """
-    names = set(framework_skill_names(spec))
+    names = set(framework_skill_names(spec, workflows=workflows))
     if not names or not FRAMEWORK_SKILLS_DIR.is_dir():
         return []
     return [
@@ -351,8 +361,11 @@ def resolve_session_skills(
             seen_dirs.add(resolved_dir)
         merged.append(skill)
     # Last, so an agent's or user's own skill of the same name wins.
-    if workflows_enabled:
-        merged.extend(skill for skill in framework_skills(spec) if skill.name not in seen)
+    merged.extend(
+        skill
+        for skill in framework_skills(spec, workflows=workflows_enabled)
+        if skill.user_invocable and skill.name not in seen
+    )
     return merged
 
 

@@ -181,6 +181,11 @@ import {
   useIsWideViewport,
 } from "./SessionOverview";
 import type { RightRailTab } from "./railTabs";
+import { requestThingyRailTab, useThingyRailRequest } from "@/lib/thingyRailTabs";
+import { thingyRailKey } from "@/thingies/host/thingySession";
+import { ThingyNewSessionPanel } from "@/thingies/ui/ThingyRailTabs";
+import { useSessionThingies } from "@/thingies/ui/thingyQueries";
+import { useAdoptStartedThingySession } from "@/thingies/ui/useAdoptStartedThingySession";
 
 /**
  * Top-level layout. The sidebar and right panels are responsive:
@@ -1648,7 +1653,8 @@ function AppShellImpl() {
       // "sidechat" is a dynamic mode (a side-chat tab is selected), not a
       // gated nav tab — always valid, and never a fallback target.
       if (tab === null) return fallbackTab;
-      if (tab === "sidechat") return tab;
+      // A thingy tab is a dynamic mode too; the rail falls back itself when it goes away.
+      if (tab === "sidechat" || tab === "thingy") return tab;
       if (tab === "content-search" && serverInfo === "loading") return tab;
       if (railTabsAvailable[tab]) return tab;
       return fallbackTab;
@@ -2057,6 +2063,13 @@ function AppShellImpl() {
   const restoreSidebarAfterMaximize = useCallback(() => {
     setSidebarOpen(sidebarOpenBeforeMaximizeRef.current);
   }, [setSidebarOpen]);
+  // A thingy opened from the sidebar fills the screen and leaves the sidebar open. A thingy
+  // tab never has a file selected, so the file URL is left alone.
+  const maximizeRightPanelKeepingSidebar = useCallback(() => {
+    if (rightPanelMaximized) return;
+    sidebarOpenBeforeMaximizeRef.current = sidebarOpen;
+    setRightPanelMaximized(true);
+  }, [rightPanelMaximized, sidebarOpen]);
   const toggleRightPanelMaximized = useCallback(() => {
     if (!rightPanelMaximized) {
       sidebarOpenBeforeMaximizeRef.current = sidebarOpen;
@@ -2331,6 +2344,31 @@ function AppShellImpl() {
     // Phones hide the rail, so the side chat opens in its drawer instead.
     if (isMobileViewport()) openSideChatsPanel();
   }, [sideChatToOpen, conversationId, openSideChatsPanel, setRightPanelOpenAnimated]);
+  // A thingy tab requested for this session shows the rail too.
+  const thingyRailRequest = useThingyRailRequest((state) => state.requested);
+  useEffect(() => {
+    if (thingyRailRequest !== null && thingyRailRequest.conversationId === conversationId)
+      setRightPanelOpenAnimated(true);
+  }, [thingyRailRequest, conversationId, setRightPanelOpenAnimated]);
+  // A session started beside a thingy shows that thingy once it is created.
+  useAdoptStartedThingySession();
+  // Phones list the session's thingies in its menu, which opens one over the session.
+  const sessionThingies = useSessionThingies(
+    serverConversationId ?? "",
+    serverConversationId !== undefined,
+  );
+  const mobileThingyItems = useMemo(
+    () =>
+      conversationId
+        ? (sessionThingies ?? []).map((thingy) => ({
+            key: thingyRailKey(thingy.id),
+            label: thingy.name,
+            onSelect: () =>
+              requestThingyRailTab(conversationId, thingyRailKey(thingy.id), { maximize: true }),
+          }))
+        : [],
+    [conversationId, sessionThingies],
+  );
   // The chat's task preview, a task's marker, or the agent's first plan asks
   // for this session's Tasks tab: open the rail on it, or its drawer on a phone
   // unless the agent asked, then clear the one-shot request.
@@ -3273,6 +3311,7 @@ function AppShellImpl() {
                       showContentSearch: railTabsAvailable["content-search"],
                       onOpenContentSearch: openContentSearchPanel,
                       onOpenSideChats: openSideChatsPanel,
+                      thingies: mobileThingyItems,
                       onOpenMainExecutionLog: openMainExecutionLog,
                     }}
                   />
@@ -3374,6 +3413,9 @@ function AppShellImpl() {
                     onCloseTerminal={requestCloseTerminal}
                     maximized={rightPanelMaximized}
                     onToggleMaximized={toggleRightPanelMaximized}
+                    onMaximizeKeepingSidebar={maximizeRightPanelKeepingSidebar}
+                    sidebarOpen={sidebarOpen}
+                    onOpenSidebar={handleSidebarOpen}
                     permissionLevel={permissionLevel}
                     filesPanelSort={filesPanelSort}
                     onSortChange={handleFilesSortChange}
@@ -3388,6 +3430,13 @@ function AppShellImpl() {
                     subagentPanelOpener={openSubagentInPanel}
                   />
                 )}
+                {/* The thingy a New session starts from, beside its composer. */}
+                <ThingyNewSessionPanel
+                  active={!conversationId}
+                  sidebarOpen={sidebarOpen}
+                  onOpenSidebar={handleSidebarOpen}
+                  onSidebarOpenChange={setSidebarOpen}
+                />
               </div>
 
               <AppShellWorkspacePanels

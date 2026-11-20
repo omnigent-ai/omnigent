@@ -1,0 +1,401 @@
+"""Progress of thingy actions, read from the sessions doing the work.
+
+A thingy session reports progress with ``sys_thingy_action_update``, but it can
+skip a call, and its runner can stop mid-action. So while an action is open its
+status comes from what the server records about the sessions themselves (live
+status, runner liveness, pending approvals, last error), and the agent's report
+only says how it ended and which session took the work. An action shows as
+running only while one of its sessions is running on a live runner; once they
+stop it settles.
+
+Which sessions belong to an action: the session the agent recorded on it and
+that session's children; otherwise the thingy session and the sessions started
+from it (child sessions, and independent ones that carry its
+``omnigent.created_by_session_id`` label) between this action's delivery and the
+next one's. A session is working while its turn runs or waits, or while a
+background task it left running is still going, the same rule the session's
+Tasks tab uses. Sessions are matched by creation time, so attribution without a
+recorded session can include an unrelated child and keep the action running
+longer, never shorter.
+"""
+
+from __future__ import annotations
+
+import time
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
+from typing import Any
+
+from omnigent.stores.conversation_store import (
+    CREATED_BY_SESSION_LABEL_KEY as CREATED_BY_SESSION_LABEL,
+)
+from omnigent.stores.conversation_store import runner_seen_is_fresh
+
+# Delivered but not started within this long: the message did not reach a turn.
+START_GRACE_S = 120
+# A session reported running with no recorded activity for this long is treated as stopped. Its
+# status is mirrored asynchronously, so a lost final update must not hold an action open forever.
+SILENT_RUNNING_LIMIT_S = 60 * 60
+# A message to a stopped thingy session marks it working before its runner is back; for this long
+# after the delivery that session is starting, not interrupted. Sandboxes can take minutes to wake.
+RUNNER_START_GRACE_S = 10 * 60
+# Child sessions considered per thingy session, and the caller's recent sessions searched for
+# independent ones it started.
+MAX_CHILD_SESSIONS = 100
+MAX_RECENT_SESSIONS = 50
+
+REPORTED_TERMINAL = ("done", "failed", "cancelled")
+OPEN_STATUSES = ("pending", "queued", "running", "needs_input")
+# What the thingy is told, most specific first.
+STATUSES = (
+    "pending",  # Requested; the web app has not delivered it to a session yet.
+    "queued",  # Delivered; the thingy session has not started it (busy with an earlier action).
+    "running",
+    "needs_input",  # A session doing the work waits for an approval or answer.
+    "done",
+    "failed",
+    "cancelled",
+    "finished_unreported",  # Its sessions stopped and the agent never reported how it ended.
+    "interrupted",  # A session doing the work failed, went offline, or never started it.
+)
+
+
+@dataclass(frozen=True)
+class SessionState:
+    """What the server records about one session. Times are epoch seconds."""
+
+    id: str
+    created_at: int
+    updated_at: int
+    parent_id: str | None
+    root_id: str
+    status: str  # idle, running, waiting or failed
+    runner_online: bool
+    background_work: bool
+    pending_inputs: int
+    error_code: str | None
+
+
+@dataclass(frozen=True)
+class Delivery:
+    session_id: str
+    delivered_at: int
+
+
+@dataclass(frozen=True)
+class ActionProgress:
+    status: str
+    reason: str | None
+    session_ids: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "reason": self.reason,
+            "session_ids": list(self.session_ids),
+        }
+
+
+def delivery_of(raw: Any) -> Delivery | None:
+    """A viewer's open-action record as a delivery, or ``None`` while it is not delivered yet."""
+    if not isinstance(raw, dict):
+        return None
+    session_id, delivered_at = raw.get("session_id"), raw.get("delivered_at")
+    if not isinstance(session_id, str) or type(delivered_at) is not int:
+        return None
+    return Delivery(session_id, delivered_at)
+
+
+def _descendants(root: str, sessions: dict[str, SessionState]) -> list[str]:
+    children: dict[str, list[str]] = {}
+    for state in sessions.values():
+        if state.parent_id is not None:
+            children.setdefault(state.parent_id, []).append(state.id)
+    found: list[str] = []
+    frontier = [root]
+    while frontier:
+        current = frontier.pop()
+        for child in children.get(current, []):
+            if child not in found and child != root:
+                found.append(child)
+                frontier.append(child)
+    return found
+
+
+def _attributed(
+    value: dict,
+    delivery: Delivery,
+    next_delivered_at: int | None,
+    sessions: dict[str, SessionState],
+) -> list[str]:
+    worker = value.get("session_id")
+    if isinstance(worker, str) and worker != delivery.session_id and worker in sessions:
+        return [worker, *_descendants(worker, sessions)]
+    started = [
+        session_id
+        for session_id in _descendants(delivery.session_id, sessions)
+        if sessions[session_id].created_at >= delivery.delivered_at
+        and (next_delivered_at is None or sessions[session_id].created_at < next_delivered_at)
+    ]
+    # A child's own children belong with it even when they started after the next delivery.
+    attributed = set(started)
+    for session_id in started:
+        attributed.update(_descendants(session_id, sessions))
+    return [delivery.session_id, *sorted(attributed)]
+
+
+def _working(state: SessionState) -> bool:
+    return state.status in ("running", "waiting") or (
+        state.background_work and state.status != "failed"
+    )
+
+
+def _busy(state: SessionState, now: int) -> bool:
+    return (
+        _working(state) and state.runner_online and now - state.updated_at < SILENT_RUNNING_LIMIT_S
+    )
+
+
+def derive_progress(
+    value: dict,
+    delivery: Delivery | None,
+    *,
+    sessions: dict[str, SessionState],
+    earlier_open: bool,
+    next_delivered_at: int | None,
+    now: int,
+) -> ActionProgress:
+    """The status of one ledger entry from its delivery and its sessions' recorded state.
+
+    ``earlier_open`` says an action delivered to the same thingy session before this one is still
+    open, so the thingy session being busy means it has not reached this one yet.
+    """
+    reported = value.get("state")
+    if reported in REPORTED_TERMINAL:
+        ids = tuple(_attributed(value, delivery, next_delivered_at, sessions)) if delivery else ()
+        return ActionProgress(str(reported), None, ids)
+    if delivery is None:
+        return ActionProgress("pending", None, ())
+    thingy = sessions.get(delivery.session_id)
+    if thingy is None:
+        return ActionProgress("interrupted", "session_unavailable", (delivery.session_id,))
+    ids = _attributed(value, delivery, next_delivered_at, sessions)
+    states = [sessions[session_id] for session_id in ids]
+    workers = [state for state in states if state.id != thingy.id]
+    if any(state.pending_inputs > 0 and _busy(state, now) for state in states):
+        return ActionProgress("needs_input", None, tuple(ids))
+    if any(_busy(state, now) for state in workers):
+        return ActionProgress("running", None, tuple(ids))
+    if _busy(thingy, now):
+        if earlier_open:
+            return ActionProgress("queued", None, tuple(ids))
+        return ActionProgress("running", None, tuple(ids))
+    stopped = [state for state in states if _working(state)]
+    if stopped:
+        offline = any(not state.runner_online for state in stopped)
+        waking = (
+            offline
+            and all(state.id == thingy.id for state in stopped)
+            and now - delivery.delivered_at < RUNNER_START_GRACE_S
+        )
+        if waking:
+            return ActionProgress("queued", None, tuple(ids))
+        return ActionProgress(
+            "interrupted", "runner_offline" if offline else "no_activity", tuple(ids)
+        )
+    # A session that failed at or after the delivery failed on this action, even in the same
+    # second: posting the message marks a session working, so an older failure would not
+    # still show. Other activity counts only after that second, which the post itself fills.
+    failed = [
+        state
+        for state in states
+        if state.status == "failed" and state.updated_at >= delivery.delivered_at
+    ]
+    if failed:
+        return ActionProgress("interrupted", failed[0].error_code or "session_failed", tuple(ids))
+    acted = [state for state in states if state.updated_at > delivery.delivered_at + 1]
+    if acted:
+        return ActionProgress("finished_unreported", None, tuple(ids))
+    if earlier_open:
+        return ActionProgress("queued", None, tuple(ids))
+    if now - delivery.delivered_at < START_GRACE_S:
+        return ActionProgress("queued", None, tuple(ids))
+    return ActionProgress("interrupted", "not_started", tuple(ids))
+
+
+def session_tree_status(
+    sessions: dict[str, SessionState], root_id: str, now: int | None = None
+) -> dict[str, Any]:
+    """Whether a session and the sessions it started are working, by the same rules as actions."""
+    clock = int(time.time()) if now is None else now
+    root = sessions.get(root_id)
+    if root is None:
+        return {"status": "unavailable", "reason": "session_unavailable"}
+    states = [root, *(sessions[session_id] for session_id in _descendants(root_id, sessions))]
+    if any(state.pending_inputs > 0 and _busy(state, clock) for state in states):
+        return {"status": "needs_input", "reason": None}
+    if any(_busy(state, clock) for state in states):
+        return {"status": "running", "reason": None}
+    stopped = [state for state in states if _working(state)]
+    if stopped:
+        offline = any(not state.runner_online for state in stopped)
+        return {"status": "interrupted", "reason": "runner_offline" if offline else "no_activity"}
+    if root.status == "failed":
+        return {"status": "interrupted", "reason": root.error_code or "session_failed"}
+    return {"status": "idle", "reason": None}
+
+
+def derive_ledger_progress(
+    entries: Iterable[tuple[str, dict, Delivery | None]],
+    *,
+    sessions: dict[str, SessionState],
+    now: int | None = None,
+) -> dict[str, ActionProgress]:
+    """Progress of several entries, taking delivery order within each thingy session into
+    account."""
+    clock = int(time.time()) if now is None else now
+    result: dict[str, ActionProgress] = {}
+    by_session: dict[str, list[tuple[int, str, dict, Delivery]]] = {}
+    for record_id, value, delivery in entries:
+        if delivery is None:
+            result[record_id] = derive_progress(
+                value,
+                None,
+                sessions=sessions,
+                earlier_open=False,
+                next_delivered_at=None,
+                now=clock,
+            )
+        else:
+            by_session.setdefault(delivery.session_id, []).append(
+                (delivery.delivered_at, record_id, value, delivery)
+            )
+    for delivered in by_session.values():
+        delivered.sort(key=lambda item: (item[0], item[1]))
+        earlier_open = False
+        for index, (_, record_id, value, delivery) in enumerate(delivered):
+            next_at = delivered[index + 1][0] if index + 1 < len(delivered) else None
+            progress = derive_progress(
+                value,
+                delivery,
+                sessions=sessions,
+                earlier_open=earlier_open,
+                next_delivered_at=next_at,
+                now=clock,
+            )
+            result[record_id] = progress
+            earlier_open = earlier_open or progress.status in OPEN_STATUSES
+    return result
+
+
+class SessionStateReader:
+    """Reads the recorded state of a caller's thingy sessions and their children.
+
+    ``can_read(session_id)`` checks the caller's access; sessions they cannot read are left out,
+    so an action delivered to one shows as interrupted instead of exposing its state.
+    """
+
+    def __init__(
+        self, conversation_store: Any, can_read: Callable[[str], bool], user_id: str | None = None
+    ) -> None:
+        self._store = conversation_store
+        self._can_read = can_read
+        self._user_id = user_id
+
+    def available(self, session_id: str) -> bool:
+        """Whether the session still exists, is not archived and the caller can read it."""
+        if not self._can_read(session_id):
+            return False
+        conversation = self._store.get_conversations([session_id]).get(session_id)
+        return conversation is not None and not getattr(conversation, "archived", False)
+
+    def read(self, session_ids: Iterable[str]) -> dict[str, SessionState]:
+        from omnigent.server.routes._sessions.helpers import (
+            _last_task_error_from_labels,
+            _session_status_from_cache,
+        )
+
+        roots = [
+            session_id for session_id in dict.fromkeys(session_ids) if self._can_read(session_id)
+        ]
+        if not roots:
+            return {}
+        conversations = dict(self._store.get_conversations(roots))
+        for conversation in list(conversations.values()):
+            page = self._store.list_conversations(
+                limit=MAX_CHILD_SESSIONS,
+                kind=None,
+                root_conversation_id=conversation.root_conversation_id,
+                include_archived=True,
+            )
+            for child in page.data:
+                conversations.setdefault(child.id, child)
+        # Independent sessions have no parent link, only a label naming the session that started
+        # them, and the store cannot filter on labels, so look through the caller's recent ones.
+        recent = self._store.list_conversations(
+            limit=MAX_RECENT_SESSIONS, kind=None, owned_by=self._user_id, include_archived=True
+        )
+        started = [
+            conversation
+            for conversation in recent.data
+            if conversation.id not in conversations
+            and (conversation.labels or {}).get(CREATED_BY_SESSION_LABEL) in conversations
+            and self._can_read(conversation.id)
+        ]
+        for conversation in started:
+            conversations[conversation.id] = conversation
+            page = self._store.list_conversations(
+                limit=MAX_CHILD_SESSIONS,
+                kind=None,
+                root_conversation_id=conversation.root_conversation_id,
+                include_archived=True,
+            )
+            for child in page.data:
+                conversations.setdefault(child.id, child)
+        connectivity = self._store.get_session_connectivity(list(conversations))
+        now = int(time.time())
+        own_liveness: dict[str, bool] = {}
+        for session_id, link in connectivity.items():
+            if link.runner_last_seen is not None:
+                own_liveness[session_id] = runner_seen_is_fresh(link.runner_last_seen, now)
+
+        def runner_online(session_id: str) -> bool:
+            # Children run in their parent's runner and may carry no stamp of their own; a tree
+            # with no stamp at all runs in-process, and the silent-running limit still applies.
+            seen: set[str] = set()
+            current: str | None = session_id
+            while current is not None and current not in seen:
+                if current in own_liveness:
+                    return own_liveness[current]
+                seen.add(current)
+                parent = conversations.get(current)
+                current = (
+                    (
+                        parent.parent_conversation_id
+                        or (parent.labels or {}).get(CREATED_BY_SESSION_LABEL)
+                    )
+                    if parent is not None
+                    else None
+                )
+            return True
+
+        states: dict[str, SessionState] = {}
+        for conversation in conversations.values():
+            status = _session_status_from_cache(conversation.id, conversation.live_status)
+            if conversation.live_status == "waiting" and status == "running":
+                status = "waiting"
+            error = _last_task_error_from_labels(conversation.labels or {})
+            states[conversation.id] = SessionState(
+                id=conversation.id,
+                created_at=int(conversation.created_at),
+                updated_at=int(conversation.updated_at),
+                parent_id=conversation.parent_conversation_id
+                or (conversation.labels or {}).get(CREATED_BY_SESSION_LABEL),
+                root_id=conversation.root_conversation_id,
+                status=status,
+                runner_online=runner_online(conversation.id),
+                background_work=conversation.background_work_running is True,
+                pending_inputs=int(conversation.pending_elicitation_count or 0),
+                error_code=error.get("code") if error else None,
+            )
+        return states

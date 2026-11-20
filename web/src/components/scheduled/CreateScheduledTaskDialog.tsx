@@ -237,6 +237,7 @@ export function CreateScheduledTaskDialog({
   initialPrompt,
   initialTrigger = null,
   initialTemplateId,
+  initialSchedule,
   sessionLink = "",
   editingTask = null,
   sourceSession = null,
@@ -251,6 +252,8 @@ export function CreateScheduledTaskDialog({
   /** Open on a Jira/Slack/GitHub/Linear trigger template instead of a plain prompt. */
   initialTrigger?: TriggerSource | null;
   initialTemplateId?: AutomationTemplateId;
+  /** RRULE a new automation starts from, for example from a thingy's link. */
+  initialSchedule?: string;
   /** Shareable session URL the trigger prompt links back with; see `SESSION_LINK_ID_PLACEHOLDER`. */
   sessionLink?: string;
   editingTask?: ScheduledTask | null;
@@ -705,7 +708,10 @@ export function CreateScheduledTaskDialog({
         setTrigger(sourceSession ? null : initialTrigger);
         setTriggerFields(emptyTriggerFields(initialTrigger ?? "jira"));
         setSchedule(
-          initialTrigger && !sourceSession ? defaultTriggerSchedule : DEFAULT_SCHEDULE_MODEL,
+          initialTrigger && !sourceSession
+            ? defaultTriggerSchedule
+            : ((initialSchedule ? parseRRuleToScheduleModel(initialSchedule) : null) ??
+                DEFAULT_SCHEDULE_MODEL),
         );
         setScheduleUnsupported(false);
         setHostId("");
@@ -724,6 +730,7 @@ export function CreateScheduledTaskDialog({
     initialName,
     initialPrompt,
     initialTrigger,
+    initialSchedule,
     defaultTriggerSchedule,
     editingTask,
     editingTriggerConfig,
