@@ -2,17 +2,11 @@
 
 from __future__ import annotations
 
-import atexit
 import contextlib
 import json
 import os
 import re
-import secrets
 import shutil
-import signal
-import socket
-import subprocess
-import sys
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -27,7 +21,14 @@ from websockets.exceptions import ConnectionClosed
 from websockets.sync.client import connect as ws_connect
 
 from tests._helpers.native_session import create_native_session
+from tests._helpers.server_runner import ServerRunner, server_runner
+from tests._helpers.session import bind_session_runner
 from tests.e2e_ui.conftest import set_fallback_mock_llm
+from tests.e2e_ui.messages.test_native_claude_render_parity import (
+    _open_terminal_view,
+    _type_into_tui,
+    _wait_terminal_connected,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -36,13 +37,9 @@ _SONNET = "system.ai.claude-sonnet-5"
 _REPLY = "context-window pin check: acknowledged."
 _ONE_MILLION = 1_000_000
 
-_TERMINAL = '[data-testid="terminal-view"]'
-_XTERM_INPUT = ".xterm-helper-textarea"
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 _WORKING = '[data-testid="working-indicator"]'
 _HEALTH_TIMEOUT_S = 90.0
-# claude-native auto-launch + first-run pre-accept + WS attach.
-_TERMINAL_READY_TIMEOUT_MS = 240_000
 _MOCK_TURN_TIMEOUT_MS = 120_000
 _CONTEXT_READOUT_TIMEOUT_S = 60.0
 _SNAPSHOT_WINDOW_TIMEOUT_S = 45.0
@@ -64,32 +61,19 @@ _AMBIENT_ENV_KEYS = frozenset(
     {"RUNNER_SERVER_URL", "OMNIGENT_REMOTE_AUTH_TOKEN", "OMNIGENT_CONFIG_HOME", "LLM_API_KEY"}
 )
 
-# Proxy-blind client: CI forces an egress proxy that must not intercept loopback.
-_client = httpx.Client(trust_env=False)
-atexit.register(_client.close)
-
 
 @dataclass
 class Gateway1mRig:
-    """A dedicated server + runner pair whose provider pins the 1M-capable Opus."""
+    """Scenario inputs and an HTTP client owned by the shared process stack."""
 
     base_url: str
     runner_id: str
-    work: Path
-    server_log: Path
-    runner_log: Path
+    client: httpx.Client
+    runtime: ServerRunner
 
     def runner_log_tail(self, chars: int = 2500) -> str:
-        """The runner's own log file under its data dir, else its captured stdout."""
-        logs = sorted((self.work / "data" / "logs" / "runner").glob("*.log"))
-        source = logs[-1] if logs else self.runner_log
-        return source.read_text(errors="replace")[-chars:]
-
-
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+        """Retain startup and rolling process diagnostics from the shared stack."""
+        return self.runtime.log_tail()[-chars:]
 
 
 def write_gateway_1m_provider(config_home: Path, mock_url: str) -> Path:
@@ -127,7 +111,7 @@ def _seed_claude_first_run(claude_dir: Path, workspace: Path) -> None:
     )
 
 
-def _rig_env(work: Path) -> dict[str, str]:
+def _rig_env() -> dict[str, str]:
     env = {
         key: value
         for key, value in os.environ.items()
@@ -147,118 +131,35 @@ def _rig_env(work: Path) -> dict[str, str]:
                 ],
             )
         ),
-        OMNIGENT_CONFIG_HOME=str(work / "config-home"),
-        OMNIGENT_DATA_DIR=str(work / "data"),
-        CLAUDE_CONFIG_DIR=str(work / "claude-config"),
-        OMNIGENT_DISABLE_CATALOG_LOOKUP="1",
-        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1",
     )
     return env
 
 
-def _wait_online(
-    base_url: str, runner_id: str, procs: list[subprocess.Popen[bytes]], logs: list[Path]
-) -> None:
-    deadline = time.monotonic() + _HEALTH_TIMEOUT_S
-    while time.monotonic() < deadline:
-        if any(proc.poll() is not None for proc in procs):
-            break
-        try:
-            if _client.get(f"{base_url}/health", timeout=2).status_code == 200:
-                status = _client.get(f"{base_url}/v1/runners/{runner_id}/status", timeout=2)
-                if status.status_code == 200 and status.json().get("online"):
-                    return
-        except httpx.HTTPError:
-            pass
-        time.sleep(0.5)
-    tails = "\n".join(f"{log.name}:\n{log.read_text(errors='replace')[-3000:]}" for log in logs)
-    crashed = [proc for proc in procs if proc.poll() is not None]
-    reason = (
-        f"a process exited early with codes {[proc.poll() for proc in crashed]}"
-        if crashed
-        else f"it did not come online within {_HEALTH_TIMEOUT_S:.0f}s"
-    )
-    raise RuntimeError(f"gateway-1m rig failed: {reason}.\n{tails}")
-
-
 @contextlib.contextmanager
 def gateway_1m_rig(work: Path, mock_url: str) -> Iterator[Gateway1mRig]:
-    """Boot an isolated server + runner whose provider config already pins the Opus.
-
-    The pin is written before the runner starts, so the launch reads it from its own
-    ``OMNIGENT_CONFIG_HOME`` regardless of where the test process runs.
-    """
-    from omnigent.runner.identity import token_bound_runner_id
-
+    """Write provider/onboarding inputs before the shared server and runner start."""
     write_gateway_1m_provider(work / "config-home", mock_url)
     _seed_claude_first_run(work / "claude-config", _REPO_ROOT)
-    artifacts = work / "artifacts"
-    artifacts.mkdir(exist_ok=True)
-    env = _rig_env(work)
-    port = _free_port()
-    base_url = f"http://127.0.0.1:{port}"
-    binding_token = secrets.token_urlsafe(32)
-    runner_id = token_bound_runner_id(binding_token)
-    server_log = work / "server.log"
-    runner_log = work / "runner.log"
-    procs: list[subprocess.Popen[bytes]] = []
-    with server_log.open("w") as server_out, runner_log.open("w") as runner_out:
-        try:
-            procs.append(
-                subprocess.Popen(
-                    [
-                        sys.executable,
-                        "-m",
-                        "omnigent.cli",
-                        "server",
-                        "--host",
-                        "127.0.0.1",
-                        "--port",
-                        str(port),
-                        "--database-uri",
-                        f"sqlite:///{work}/test.db",
-                        "--artifact-location",
-                        str(artifacts),
-                    ],
-                    env={**env, "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token},
-                    stdout=server_out,
-                    stderr=subprocess.STDOUT,
-                    cwd=str(_REPO_ROOT),
-                )
-            )
-            procs.append(
-                subprocess.Popen(
-                    [sys.executable, "-m", "omnigent.runner._entry"],
-                    env={
-                        **env,
-                        "OMNIGENT_RUNNER_ID": runner_id,
-                        "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
-                        "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
-                        "RUNNER_SERVER_URL": base_url,
-                    },
-                    stdout=runner_out,
-                    stderr=subprocess.STDOUT,
-                    cwd=str(_REPO_ROOT),
-                )
-            )
-            _wait_online(base_url, runner_id, procs, [server_log, runner_log])
-            yield Gateway1mRig(
-                base_url=base_url,
-                runner_id=runner_id,
-                work=work,
-                server_log=server_log,
-                runner_log=runner_log,
-            )
-        finally:
-            for proc in procs:
-                if proc.poll() is None:
-                    proc.send_signal(signal.SIGTERM)
-            for proc in procs:
-                try:
-                    proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(timeout=5)
+    provider_env = {
+        "OMNIGENT_CONFIG_HOME": str(work / "config-home"),
+        "CLAUDE_CONFIG_DIR": str(work / "claude-config"),
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    }
+    with (
+        server_runner(
+            work,
+            base_env=_rig_env(),
+            server_env=provider_env,
+            workspace=_REPO_ROOT,
+            server_cwd=_REPO_ROOT,
+            database_uri=f"sqlite:///{work / 'test.db'}",
+            health_timeout=_HEALTH_TIMEOUT_S,
+            wait_ready=False,
+        ) as runtime,
+        httpx.Client(trust_env=False) as client,
+    ):
+        runtime.start_runner(env=provider_env, cwd=_REPO_ROOT)
+        yield Gateway1mRig(runtime.base_url, runtime.runner_id, client, runtime)
 
 
 @pytest.fixture
@@ -280,30 +181,30 @@ def gateway_1m_claude_rig(
 def create_pinned_claude_session(rig: Gateway1mRig) -> str:
     """Create the claude-native wrapper session; binding the rig runner launches Claude Code."""
     created = create_native_session(
-        _client,
+        rig.client,
         rig.base_url,
         harness="claude",
-        metadata={"workspace": str(_REPO_ROOT), "permission_mode": "default"},
+        metadata={
+            "workspace": str(_REPO_ROOT),
+            "terminal_launch_args": ["--permission-mode", "default"],
+        },
     )
     session_id = str(created["session_id"])
     try:
-        bind = _client.patch(
-            f"{rig.base_url}/v1/sessions/{session_id}",
-            json={"runner_id": rig.runner_id},
-            timeout=10.0,
+        bind_session_runner(
+            rig.client.patch, rig.base_url, session_id, rig.runner_id, timeout=10.0
         )
-        bind.raise_for_status()
     except httpx.HTTPError:
         # The session (and its auto-launched terminal) exists before the bind
         # returns, so clean it up before propagating a bind failure.
         with contextlib.suppress(httpx.HTTPError):
-            _client.delete(f"{rig.base_url}/v1/sessions/{session_id}", timeout=10.0)
+            rig.client.delete(f"{rig.base_url}/v1/sessions/{session_id}", timeout=10.0)
         raise
     return session_id
 
 
-def _terminal_id(base_url: str, session_id: str) -> str | None:
-    response = _client.get(f"{base_url}/v1/sessions/{session_id}/resources", timeout=10.0)
+def _terminal_id(rig: Gateway1mRig, session_id: str) -> str | None:
+    response = rig.client.get(f"{rig.base_url}/v1/sessions/{session_id}/resources", timeout=10.0)
     response.raise_for_status()
     payload = response.json()
     rows = payload.get("data") if isinstance(payload, dict) else payload
@@ -313,13 +214,13 @@ def _terminal_id(base_url: str, session_id: str) -> str | None:
     return None
 
 
-def pane_text(base_url: str, session_id: str, *, seconds: float = 2.0) -> str:
+def pane_text(rig: Gateway1mRig, session_id: str, *, seconds: float = 2.0) -> str:
     """Render the terminal screen from a read-only attach, seeded by ``capture-pane``."""
-    terminal_id = _terminal_id(base_url, session_id)
+    terminal_id = _terminal_id(rig, session_id)
     if terminal_id is None:
         return ""
     url = (
-        base_url.replace("http://", "ws://", 1).replace("https://", "wss://", 1)
+        rig.base_url.replace("http://", "ws://", 1).replace("https://", "wss://", 1)
         + f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}/attach?read_only=true"
     )
     raw = bytearray()
@@ -340,11 +241,11 @@ def pane_text(base_url: str, session_id: str, *, seconds: float = 2.0) -> str:
     return "\n".join(line.rstrip() for line in screen.display)
 
 
-def wait_pane(base_url: str, session_id: str, needle: str, *, timeout_s: float) -> str:
+def wait_pane(rig: Gateway1mRig, session_id: str, needle: str, *, timeout_s: float) -> str:
     deadline = time.monotonic() + timeout_s
     text = ""
     while time.monotonic() < deadline:
-        text = pane_text(base_url, session_id)
+        text = pane_text(rig, session_id)
         if needle.lower() in text.lower():
             return text
         time.sleep(1.0)
@@ -361,27 +262,12 @@ def context_window_from_readout(pane: str) -> tuple[int | None, str]:
     return None, ""
 
 
-def open_terminal(page: Page, base_url: str, session_id: str) -> None:
-    page.goto(f"{base_url}/c/{session_id}")
-    expect(page.get_by_test_id("view-mode-toggle")).to_be_visible(
-        timeout=_TERMINAL_READY_TIMEOUT_MS
-    )
-    page.get_by_test_id("view-mode-terminal").click()
-    terminal = page.locator(_TERMINAL).last
-    expect(terminal).to_have_attribute(
-        "data-state", "connected", timeout=_TERMINAL_READY_TIMEOUT_MS
-    )
-    pane = wait_pane(base_url, session_id, "manual mode", timeout_s=90.0)
+def open_terminal(page: Page, rig: Gateway1mRig, session_id: str) -> None:
+    page.goto(f"{rig.base_url}/c/{session_id}")
+    _open_terminal_view(page)
+    _wait_terminal_connected(page)
+    pane = wait_pane(rig, session_id, "manual mode", timeout_s=90.0)
     assert "manual mode" in pane.lower(), f"terminal never reached manual mode:\n{pane[-1500:]}"
-
-
-def type_slash_command(page: Page, command: str) -> None:
-    xterm_input = page.locator(_TERMINAL).last.locator(_XTERM_INPUT)
-    expect(xterm_input).to_be_attached(timeout=30_000)
-    xterm_input.focus()
-    page.keyboard.type(command, delay=40)
-    page.wait_for_timeout(1000)
-    page.keyboard.press("Enter")
 
 
 def send_turn(page: Page) -> None:
@@ -396,10 +282,10 @@ def send_turn(page: Page) -> None:
     expect(page.locator(_WORKING)).to_have_count(0, timeout=_MOCK_TURN_TIMEOUT_MS)
 
 
-def snapshot_context_window(base_url: str, session_id: str) -> int | None:
+def snapshot_context_window(rig: Gateway1mRig, session_id: str) -> int | None:
     deadline = time.monotonic() + _SNAPSHOT_WINDOW_TIMEOUT_S
     while time.monotonic() < deadline:
-        response = _client.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
+        response = rig.client.get(f"{rig.base_url}/v1/sessions/{session_id}", timeout=10.0)
         if response.status_code != 200:
             # A transient 5xx may carry a non-JSON body; retry rather than fail
             # the poll with an opaque decode error.
@@ -426,11 +312,9 @@ def test_claude_native_1m_capable_default_model_gets_1m_window(
     session_id = create_pinned_claude_session(rig)
     try:
         page: Page = request.getfixturevalue("page")
-        open_terminal(page, rig.base_url, session_id)
-        type_slash_command(page, "/context")
-        pane = wait_pane(
-            rig.base_url, session_id, "tokens (", timeout_s=_CONTEXT_READOUT_TIMEOUT_S
-        )
+        open_terminal(page, rig, session_id)
+        _type_into_tui(page, "/context")
+        pane = wait_pane(rig, session_id, "tokens (", timeout_s=_CONTEXT_READOUT_TIMEOUT_S)
         # Setup check, not the bug: the launch must be running the pinned model at all.
         assert _OPUS in pane, (
             f"Claude Code is not running the pinned model {_OPUS}, so the provider pin "
@@ -448,11 +332,11 @@ def test_claude_native_1m_capable_default_model_gets_1m_window(
         )
 
         send_turn(page)
-        omnigent_window = snapshot_context_window(rig.base_url, session_id)
+        omnigent_window = snapshot_context_window(rig, session_id)
         assert (omnigent_window or 0) >= _ONE_MILLION, (
             f"Claude Code reported {claude_window:,} tokens for {_OPUS}, but Omnigent's "
             f"session snapshot sizes the composer ring at context_window={omnigent_window}"
         )
     finally:
         with contextlib.suppress(httpx.HTTPError):
-            _client.delete(f"{rig.base_url}/v1/sessions/{session_id}", timeout=10.0)
+            rig.client.delete(f"{rig.base_url}/v1/sessions/{session_id}", timeout=10.0)

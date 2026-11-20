@@ -1185,19 +1185,31 @@ def test_launch_model_takes_the_custom_slot_when_no_alias_names_it(
 
 
 @pytest.mark.parametrize(
-    "launch_model",
-    ["opus", "databricks-claude-opus-5", None, ""],
+    ("launch_model", "opus_pin"),
+    [
+        ("opus", "databricks-claude-opus-5"),
+        ("databricks-claude-opus-5", "databricks-claude-opus-5"),
+        ("databricks-claude-opus-5[1m]", "databricks-claude-opus-5[1m]"),
+        (None, "databricks-claude-opus-5"),
+        ("", "databricks-claude-opus-5"),
+    ],
 )
 def test_launch_model_needs_no_custom_slot_when_already_speakable(
     launch_model: str | None,
+    opus_pin: str,
 ) -> None:
     """Aliases and the pinned id resolve without the extra slot."""
     config = claude_native.ClaudeNativeUcodeConfig(
-        env={"ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-5"},
-        model="databricks-claude-opus-5",
+        env={
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": opus_pin,
+            "ANTHROPIC_CUSTOM_MODEL_OPTION": "other-picker-model",
+        },
+        model=opus_pin,
     )
+    initial_env = dict(config.env)
 
     assert claude_native.claude_config_with_launch_model_pinned(config, launch_model) is config
+    assert config.env == initial_env
     assert claude_native.claude_config_with_launch_model_pinned(None, "x") is None
 
 

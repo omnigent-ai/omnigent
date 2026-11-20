@@ -757,6 +757,7 @@ def claude_config_with_launch_model_pinned(
     """
     from omnigent.models.claude_model_vocabulary import (
         LONG_CONTEXT_MARKER,
+        alias_pins,
         claude_model_command_arg,
         normalized_model_id,
     )
@@ -773,15 +774,18 @@ def claude_config_with_launch_model_pinned(
         return claude_config
     custom_slot = claude_config.env.get(_ANTHROPIC_CUSTOM_MODEL_OPTION_ENV, "").strip()
     speakable = claude_model_command_arg(model, claude_config.env)
+    resolved_speakable = (
+        alias_pins(claude_config.env).get(speakable, speakable) if speakable is not None else None
+    )
     wants_marker = model.lower().endswith(LONG_CONTEXT_MARKER)
     if (
         speakable is not None
         and speakable != custom_slot
-        and speakable.lower().endswith(LONG_CONTEXT_MARKER) == wants_marker
+        and resolved_speakable is not None
+        and resolved_speakable.lower().endswith(LONG_CONTEXT_MARKER) == wants_marker
     ):
-        # An alias or verbatim id already spells this launch model at the same
-        # window. A family alias matches a [1m] model only by its bare id, which
-        # re-selects at 200K, so that does not count and the slot still needs it.
+        # A family alias preserves the window only when its configured pin
+        # carries the same marker.
         return claude_config
     if custom_slot == model:
         # The slot already holds this id byte-for-byte, marker included.

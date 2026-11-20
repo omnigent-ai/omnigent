@@ -240,11 +240,20 @@ def test_model_id_with_1m_marker_leaves_other_models_bare() -> None:
     assert model_id_with_1m_marker("sonnet") == "sonnet"
 
 
-def test_model_id_with_1m_marker_is_idempotent() -> None:
-    """An already-marked id is never double-marked, case-insensitively."""
-    assert model_id_with_1m_marker("system.ai.claude-opus-5[1m]") == "system.ai.claude-opus-5[1m]"
-    assert model_id_with_1m_marker("claude-sonnet-5[1M]") == "claude-sonnet-5[1M]"
-    assert model_id_with_1m_marker("") == ""
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "system.ai.claude-opus-5[1m]",
+        "claude-sonnet-5[1M]",
+        "claude-opus-4-6[1m]:0",
+        "claude-opus-4-6[1M]:0",
+        "  databricks-claude-opus-4-6[1M]:0  ",
+        "system.ai.claude-opus-4-6:0[1m]",
+        "",
+    ],
+)
+def test_model_id_with_1m_marker_is_idempotent(model_id: str) -> None:
+    assert model_id_with_1m_marker(model_id) == model_id.strip()
 
 
 def test_catalog_prefixes_match_the_routing_defaults() -> None:

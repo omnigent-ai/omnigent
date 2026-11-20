@@ -170,6 +170,7 @@ def model_id_with_1m_marker(model_id: str) -> str:
     if (
         canonical is None
         or spelled.lower().endswith(LONG_CONTEXT_MARKER)
+        or spelled.partition(":")[0].lower().endswith(LONG_CONTEXT_MARKER)
         or not _supports_long_context(canonical)
     ):
         return spelled
