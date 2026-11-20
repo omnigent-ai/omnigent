@@ -579,6 +579,7 @@ export function ThingyFrame({
               htmlContent={htmlContent}
               contentSecurityPolicy={THINGY_CONTENT_SECURITY_POLICY}
               title={title}
+              frameId={mount.frameId}
               onMessage={handleFrameMessage}
               onLoad={handleFrameLoad}
             />

@@ -10,6 +10,7 @@ import {
 } from "./ThingyFrame";
 import type { Thingy, ThingyContent } from "../api/thingyApi";
 import { THINGY_CONNECT_MESSAGE_TYPE, THINGY_HELLO_MESSAGE_TYPE } from "../sdk/thingyProtocol";
+import { setOmnigentHostConfig, type ThingyFrameHostProps } from "@/lib/host";
 
 class FakePort {
   postMessage = vi.fn();
@@ -121,6 +122,23 @@ describe("selectionPopupPosition", () => {
 });
 
 describe("ThingyFrame", () => {
+  afterEach(() => setOmnigentHostConfig({}));
+
+  it("gives a host's own frame the ID its SDK greets with", () => {
+    const hostFrame = vi.fn((_props: ThingyFrameHostProps) => <div />);
+    setOmnigentHostConfig({ thingyFrame: hostFrame });
+    render(
+      <MemoryRouter>
+        <ThingyFrame app={APP} content={CONTENT} onRevisionChanged={() => {}} />
+      </MemoryRouter>,
+    );
+
+    const props = hostFrame.mock.calls.at(-1)![0];
+    // The host can match its frame to the messages it relays: the bootstrap names this ID.
+    expect(props.frameId).toMatch(/^omnigent-thingy-/);
+    expect(props.htmlContent).toContain(`"frameId":"${props.frameId}"`);
+  });
+
   it("runs the thingy in a scripts-only sandbox", () => {
     const { frame } = renderFrame();
 

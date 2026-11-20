@@ -118,6 +118,11 @@ export interface ThingyFrameHostProps {
   /** Accessible title of the frame. */
   title: string;
   /**
+   * The ID this mount's SDK names in every message it posts, as in its first greeting. A host
+   * that checks which frame a message came from can use it as its frame's ID.
+   */
+  frameId: string;
+  /**
    * Call with each message the thingy document posts to its parent window. Pass only messages
    * whose source is that document's window; the SDK greets its host this way.
    */
