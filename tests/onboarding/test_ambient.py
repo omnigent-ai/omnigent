@@ -950,9 +950,7 @@ def test_claude_sideload_flags_disabled_requires_managed_boolean_true(
     assert ambient.claude_sideload_flags_disabled((path,)) is expected
 
 
-def test_remote_sideload_policy_is_ignored(
-    clean_env, monkeypatch
-) -> None:
+def test_remote_sideload_policy_is_ignored(clean_env, monkeypatch) -> None:
     """Claude's cached remote policy does not apply to Omnigent sessions."""
     remote = clean_env / ".claude" / "remote-settings.json"
     remote.parent.mkdir()
