@@ -1734,14 +1734,15 @@ def register_events_routes(
                     f"Invalid data payload for event type {body.type!r}: {exc}",
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
-        # Set when this message sends a file outside the default extensions, which
+        # Set when this message sends a file outside the legacy extensions, which
         # the bound runtime must be able to deliver as a file.
         outgoing_needs_delivery_capability = False
         if body.type in ("message", _SLASH_COMMAND_TYPE):
             from omnigent.inner.native_attachments import (
+                CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
                 DELIVERY_KEY,
+                filesystem_attachment_capability,
                 inline_filesystem_attachment_name,
-                requires_filesystem,
                 uses_filesystem_delivery,
             )
             from omnigent.runtime.content_resolver import attachment_delivery
@@ -1778,7 +1779,10 @@ def register_events_routes(
                         stored.filename, stored.source_metadata
                     ):
                         filesystem_name = filesystem_name or stored.filename
-                        if not requires_filesystem(stored.filename):
+                        if (
+                            filesystem_attachment_capability([stored.filename])
+                            == CAP_FILESYSTEM_ATTACHMENT_DELIVERY
+                        ):
                             outgoing_needs_delivery_capability = True
                 if filesystem_name is not None:
                     await _require_filesystem_attachment_harness(conv, filesystem_name)

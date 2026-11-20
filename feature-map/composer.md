@@ -271,7 +271,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - `new-command`: `/new` opens a blank new-session composer in the same project;
   working-directory selection follows the project's defaults, not the old session.
 - `attachments`: attach button, paste, and drop onto the transcript; chips can
-  be removed. State: unsupported file type rejected without losing the message.
+  be removed. MP4 uploads up to 50 MiB reach Claude Code and Codex as local files.
+  State: unsupported file type rejected without losing the message.
 - `at-mentions`: a bare `@` in the in-session or new-session composer shows a
   "Sessions" row. Opening it (click, Enter, Tab or →) shows a "Subagents" row
   for the current session's subagents, then every other session the sidebar

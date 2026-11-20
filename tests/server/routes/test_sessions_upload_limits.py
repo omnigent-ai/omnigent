@@ -107,30 +107,44 @@ def _upload(
 
 
 @pytest.mark.parametrize(
-    "filename,content_type",
+    "filename,content_type,delivery",
     [
-        ("notes.txt", "text/plain"),
-        ("archive.zip", "application/zip"),
-        ("deck.pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
-        ("app.db", "application/octet-stream"),
-        ("report.docx", "application/zip"),
-        ("data.csv", "application/vnd.ms-excel"),
+        ("notes.txt", "text/plain", None),
+        ("archive.zip", "application/zip", "filesystem"),
+        (
+            "deck.pptx",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "filesystem",
+        ),
+        ("app.db", "application/octet-stream", "filesystem"),
+        ("report.docx", "application/zip", "filesystem"),
+        ("data.csv", "application/vnd.ms-excel", None),
+        ("clip.mp4", "video/mp4", "filesystem"),
+        ("clip.MP4", "application/octet-stream", "filesystem"),
+        ("clip.mp4", "text/plain", "filesystem"),
     ],
 )
 def test_upload_supported_types(
-    upload_client: tuple[TestClient, str], filename: str, content_type: str
+    upload_client: tuple[TestClient, str],
+    db_uri: str,
+    filename: str,
+    content_type: str,
+    delivery: str | None,
 ) -> None:
     """Supported extensions remain usable even with common browser MIME mismatches."""
     client, session_id = upload_client
     response = _upload(client, session_id, filename, content_type=content_type)
     assert response.status_code == 201, response.text
     assert response.json()["name"] == filename
+    stored = SqlAlchemyFileStore(db_uri).get(response.json()["id"])
+    assert stored is not None
+    assert (stored.source_metadata or {}).get("delivery") == delivery
 
 
 def test_upload_rejects_unsupported_type(upload_client: tuple[TestClient, str]) -> None:
     """Unsupported formats are rejected with 415."""
     client, session_id = upload_client
-    resp = _upload(client, session_id, "clip.mp4", b"\x00\x00\x00 fake mp4 bytes", "video/mp4")
+    resp = _upload(client, session_id, "clip.webm", b"\x00\x00\x00 fake video bytes", "video/webm")
     assert resp.status_code == 415, resp.text
     assert "Unsupported attachment type" in resp.text
 
@@ -170,12 +184,14 @@ def test_all_types_policy_records_filesystem_delivery(
     assert (stored.source_metadata or {}).get("delivery") == delivery
 
 
-@pytest.mark.parametrize("filename,status", [("trace.gz", 409), ("bundle.zip", 201)])
+@pytest.mark.parametrize(
+    "filename,status", [("trace.gz", 409), ("bundle.zip", 201), ("clip.mp4", 409)]
+)
 @pytest.mark.usefixtures("all_types_policy")
 def test_host_without_delivery_support_refuses_only_new_types(
     upload_client: tuple[TestClient, str], filename: str, status: int
 ) -> None:
-    """A host that predates per-file delivery keeps accepting the default extensions."""
+    """A host that predates per-file delivery keeps accepting the original extensions."""
     client, session_id = upload_client
     host = client.app.state.host_registry.get("d75381f2c94b4e49a3c684946d4ddbc4")
     host.hello.capabilities = [CAP_FILESYSTEM_ATTACHMENTS]
@@ -185,11 +201,20 @@ def test_host_without_delivery_support_refuses_only_new_types(
         assert "this file type" in response.text
 
 
-@pytest.mark.parametrize("content_type", ["application/zip", "text/plain"])
+@pytest.mark.parametrize(
+    "filename,content_type",
+    [
+        ("bundle.zip", "application/zip"),
+        ("bundle.zip", "text/plain"),
+        ("clip.mp4", "video/mp4"),
+        ("clip.mp4", "text/plain"),
+    ],
+)
 def test_empty_policy_refuses_default_filesystem_types(
     upload_client: tuple[TestClient, str],
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    filename: str,
     content_type: str,
 ) -> None:
     """An empty extension list turns filesystem attachments off, even for a text MIME."""
@@ -198,9 +223,9 @@ def test_empty_policy_refuses_default_filesystem_types(
         lambda: FilesystemAttachmentPolicy(frozenset()),
     )
     client, session_id = upload_client
-    response = _upload(client, session_id, "bundle.zip", content_type=content_type)
+    response = _upload(client, session_id, filename, content_type=content_type)
     assert response.status_code == 415, response.text
-    assert "'application/zip'" in response.text
+    assert ("'video/mp4'" if filename.endswith(".mp4") else "'application/zip'") in response.text
     assert "Claude Code or Codex" not in response.text
     assert SqlAlchemyFileStore(db_uri).list(session_id).data == []
 
@@ -292,10 +317,11 @@ def test_quota_counts_files_recorded_for_filesystem_delivery(
     "filename,content_type,policy",
     [
         ("archive.zip", "application/zip", None),
+        ("clip.mp4", "video/mp4", None),
         # Configured types are still delivered as files, so they need native tools too.
         ("trace.gz", "application/gzip", FilesystemAttachmentPolicy(all_types=True)),
     ],
-    ids=["default-type", "all-types"],
+    ids=["default-type", "mp4", "all-types"],
 )
 def test_upload_rejects_filesystem_types_for_an_unsupported_harness(
     upload_client: tuple[TestClient, str],
@@ -334,6 +360,11 @@ def test_upload_rejects_filesystem_types_for_an_unsupported_harness(
             "filename": "payload.zip",
             "file_data": "data:application/zip;base64,UEs=",
         },
+        {
+            "type": "input_file",
+            "filename": "payload.mp4",
+            "file_data": "data:video/mp4;base64,AAAA",
+        },
     ],
 )
 def test_message_cannot_inline_a_filesystem_attachment(
@@ -346,7 +377,7 @@ def test_message_cannot_inline_a_filesystem_attachment(
         json={"type": "message", "data": {"role": "user", "content": [block]}},
     )
     assert resp.status_code == 400, resp.text
-    assert "payload.zip" in resp.text
+    assert block["filename"] in resp.text
 
 
 @pytest.mark.parametrize(
@@ -426,13 +457,15 @@ def test_send_rechecks_unsent_upload_after_fork_into_another_harness(
     assert conversations.list_items(session_id).data == before
 
 
+@pytest.mark.parametrize("filename", ["huge.zip", "huge.mp4"])
 def test_upload_rejects_oversized_filesystem_file(
     upload_client: tuple[TestClient, str],
+    filename: str,
 ) -> None:
-    """A zip over the filesystem per-file cap is rejected with 413."""
+    """A filesystem attachment over the per-file cap is rejected with 413."""
     client, session_id = upload_client
     oversized = b"\x00" * (MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES + 1)
-    resp = _upload(client, session_id, "huge.zip", oversized, "application/zip")
+    resp = _upload(client, session_id, filename, oversized)
     assert resp.status_code == 413, resp.status_code
 
 

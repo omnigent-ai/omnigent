@@ -244,7 +244,8 @@ def _unsupported_attachment_detail(content_type: str, policy: FilesystemAttachme
     )
     if policy == DEFAULT_FILESYSTEM_ATTACHMENT_POLICY:
         return (
-            f"{detail}, or use Claude Code or Codex for archives, Office documents, and databases."
+            f"{detail}, or use Claude Code or Codex for archives, Office documents, "
+            "databases, and MP4 videos."
         )
     if policy.extensions:
         extensions = ", ".join(sorted(policy.extensions))
