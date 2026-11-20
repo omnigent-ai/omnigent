@@ -57,6 +57,7 @@ export async function fetchFileDiff(
   const url =
     `/v1/sessions/${encodeURIComponent(conversationId)}` +
     `/resources/environments/${DEFAULT_ENVIRONMENT_ID}/diff/${encodedPath}`;
+  const requestedAt = Date.now();
   const res = await authenticatedFetch(url, signal ? { signal } : undefined);
   if (!res.ok) {
     // Surface the server's reason (e.g. "git status timed out after 5.0s")
@@ -71,7 +72,7 @@ export async function fetchFileDiff(
     }
     throw new FileDiffError(message, res.status);
   }
-  return (await res.json()) as FileDiffResponse;
+  return { ...((await res.json()) as FileDiffResponse), requestedAt };
 }
 
 /** The query key a file's diff is cached under, shared by every diff surface. */
