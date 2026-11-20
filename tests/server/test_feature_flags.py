@@ -63,6 +63,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "workspace_direct_access": False,
         "workspace_api_server_access": False,
         "floating_composer": False,
+        "google_docs": False,
     }
 
 
@@ -140,7 +141,13 @@ def test_explicit_disable_wins_and_preserves_other_features(override: str, featu
     } - {feature}
 
 
-@pytest.mark.parametrize("feature", ["usage_page", "canvas"])
+def test_google_docs_can_be_enabled_for_the_frontend() -> None:
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: Feature.GOOGLE_DOCS.value})
+
+    assert flags.frontend_dict()["google_docs"] is True
+
+
+@pytest.mark.parametrize("feature", ["usage_page", "canvas", "google_docs"])
 def test_default_off_features_can_also_be_explicitly_disabled(feature: str) -> None:
     flags = resolve_feature_flags({FEATURES_ENV_VAR: f"{feature},-{feature}"})
 

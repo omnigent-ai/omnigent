@@ -1566,6 +1566,13 @@ export async function getSession(sessionId: string): Promise<Session> {
   );
 }
 
+export async function getSessionLabels(
+  sessionId: string,
+): Promise<{ id: string; labels: Record<string, string> }> {
+  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/labels`);
+  return readJsonOrThrow(res);
+}
+
 export interface SessionRepositoryBranch {
   url: string;
   branch: string | null;
