@@ -117,8 +117,17 @@ export function ConnectionIndicator({
     return null;
   }
   if (unreachable) {
-    // The disabled composer says "reconnect below", and the composer's host
-    // trigger is icon-only, so this pill is the visible reconnect in every view.
+    // A host-bound session carries the reconnect affordance in the composer's
+    // host badge (ComposerStatusLine), which names the host that dropped — so
+    // render nothing here whenever that composer is on screen (sub-agent
+    // sessions included; their badge carries it just like a normal session's).
+    // The composer is hidden only in the terminal-first *terminal* view (the
+    // PTY owns the surface); there the banner still carries the affordance.
+    // `local_stranded` keeps the banner everywhere (no host, hence no badge).
+    const composerOnScreen = !(terminalFirst?.isTerminalFirst && terminalFirst.view === "terminal");
+    if (liveness.kind === "host_offline" && composerOnScreen) {
+      return null;
+    }
     return (
       <div className={cn("mx-auto mb-4 flex w-full justify-center px-6", CHAT_COLUMN_WIDTH)}>
         {/* Reconnect affordance styled as the destructive error pill (never

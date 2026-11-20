@@ -301,13 +301,14 @@ def test_host_badge_offline_host_keeps_name_when_runner_is_down_too(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """A fully unreachable session names its host and shows a visible reconnect.
+    """A fully unreachable session names its dropped host and offers Reconnect.
 
-    This is the ``host_offline`` liveness state. The badge keeps the host name,
-    which tells the user WHICH machine to go restart, but its trigger is
-    icon-only. The disabled composer says "reconnect below", so the "Host is
-    offline — click to reconnect" pill must sit under it and open the host
-    reconnect instructions.
+    This is the ``host_offline`` liveness state, which used to replace the host
+    name with "Host is offline". The name is what tells the
+    user WHICH machine to go restart, so it stays in the icon-only trigger's
+    label. The disabled composer says "reconnect below", so a visible "Offline ·
+    Reconnect" sits beside that trigger, under the text box, and opens the host
+    reconnect instructions; the separate band below the composer stays suppressed.
 
     :param page: Playwright page fixture.
     :param seeded_session: ``(base_url, session_id)`` for a real server-backed
@@ -335,14 +336,19 @@ def test_host_badge_offline_host_keeps_name_when_runner_is_down_too(
     composer = page.get_by_label("Message the agent")
     expect(composer).to_be_disabled(timeout=15_000)
     expect(composer).to_have_attribute("placeholder", re.compile("reconnect below"))
-    pill = page.get_by_test_id("disconnected-indicator")
-    expect(pill).to_be_visible()
-    expect(pill).to_have_text("Host is offline — click to reconnect")
-    pill_box, composer_box = pill.bounding_box(), composer.bounding_box()
-    assert pill_box is not None and composer_box is not None, (pill_box, composer_box)
-    assert pill_box["y"] >= composer_box["y"] + composer_box["height"], (pill_box, composer_box)
+    offline = page.get_by_test_id("composer-host-offline")
+    expect(offline).to_be_visible()
+    expect(offline).to_have_text(re.compile(r"^Offline\s*·\s*Reconnect$"))
+    offline_box, composer_box = offline.bounding_box(), composer.bounding_box()
+    assert offline_box is not None and composer_box is not None, (offline_box, composer_box)
+    assert offline_box["y"] >= composer_box["y"] + composer_box["height"], (
+        offline_box,
+        composer_box,
+    )
+    # The badge owns the affordance; the old band below the composer stays away.
+    expect(page.get_by_test_id("disconnected-indicator")).to_have_count(0)
 
-    pill.click()
+    offline.get_by_role("button", name="Reconnect host", exact=True).click()
     dialog = page.get_by_test_id("reconnect-session-dialog")
     expect(dialog).to_be_visible(timeout=15_000)
     page.get_by_test_id("reconnect-session-tab-reconnect").click()

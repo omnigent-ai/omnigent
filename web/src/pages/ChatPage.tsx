@@ -2829,6 +2829,10 @@ function ComposerImpl(
   const preventsKeyboardSubmit = isMobile;
   const isMobileRef = useRef(isMobile);
   isMobileRef.current = isMobile;
+  // Mobile moves the host button, with its Reconnect host item, into the header.
+  const offlinePlaceholder = isMobile
+    ? "Session offline — reconnect from the host menu"
+    : "Session offline — reconnect below to continue";
 
   // Ctrl+Shift+L focuses the composer input from anywhere in the session view.
   // No-op on mobile, where programmatic focus would pop the software keyboard.
@@ -4545,7 +4549,7 @@ function ComposerImpl(
               : isReadOnly
                 ? "You have read-only access to this session"
                 : unreachable && !sendReconnectsArca && sendDisabledReason === null
-                  ? "Session offline — reconnect below to continue"
+                  ? offlinePlaceholder
                   : hasPendingElicitation
                     ? "Respond to the pending request above to continue"
                     : disabled && sendDisabledReason === null
