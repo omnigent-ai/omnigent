@@ -301,12 +301,13 @@ def test_host_badge_offline_host_keeps_name_when_runner_is_down_too(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """A fully unreachable session names its dropped host instead of generic copy.
+    """A fully unreachable session names its host and shows a visible reconnect.
 
-    This is the ``host_offline`` liveness state, which used to replace the host
-    name with "Host is offline". The name is what tells the
-    user WHICH machine to go restart, so it stays; the separate band below the
-    composer stays suppressed.
+    This is the ``host_offline`` liveness state. The badge keeps the host name,
+    which tells the user WHICH machine to go restart, but its trigger is
+    icon-only. The disabled composer says "reconnect below", so the "Host is
+    offline — click to reconnect" pill must sit under it and open the host
+    reconnect instructions.
 
     :param page: Playwright page fixture.
     :param seeded_session: ``(base_url, session_id)`` for a real server-backed
@@ -330,8 +331,22 @@ def test_host_badge_offline_host_keeps_name_when_runner_is_down_too(
     expect(badge).to_have_attribute("aria-label", re.compile(re.escape("e2e-host")))
     expect(badge).to_have_attribute("aria-label", "Host e2e-host, offline", timeout=15_000)
     assert badge.evaluate("el => el.tagName") == "BUTTON"
-    # The badge owns the affordance; the old band below the composer stays away.
-    expect(page.get_by_test_id("disconnected-indicator")).to_have_count(0)
+
+    composer = page.get_by_label("Message the agent")
+    expect(composer).to_be_disabled(timeout=15_000)
+    expect(composer).to_have_attribute("placeholder", re.compile("reconnect below"))
+    pill = page.get_by_test_id("disconnected-indicator")
+    expect(pill).to_be_visible()
+    expect(pill).to_have_text("Host is offline — click to reconnect")
+    pill_box, composer_box = pill.bounding_box(), composer.bounding_box()
+    assert pill_box is not None and composer_box is not None, (pill_box, composer_box)
+    assert pill_box["y"] >= composer_box["y"] + composer_box["height"], (pill_box, composer_box)
+
+    pill.click()
+    dialog = page.get_by_test_id("reconnect-session-dialog")
+    expect(dialog).to_be_visible(timeout=15_000)
+    page.get_by_test_id("reconnect-session-tab-reconnect").click()
+    expect(page.get_by_test_id("reconnect-session-command")).to_contain_text("omnigent host")
 
 
 def test_host_badge_click_shows_host_reconnect_instructions(
