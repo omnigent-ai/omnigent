@@ -15,6 +15,7 @@ import pytest
 from omnigent.db.db_models import current_workspace_id, workspace_scope
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.scheduled.schedule import next_scheduled_time
+from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 
 pytestmark = pytest.mark.usefixtures("frozen_recurrence_clock")
@@ -704,6 +705,23 @@ def test_delete_missing_returns_false(store: SqlAlchemyScheduledTaskStore) -> No
 
 
 # ── default timezone ─────────────────────────────────────────────────────────
+
+
+def test_legacy_store_can_keep_implementing_only_its_existing_methods() -> None:
+    def unsupported(*args: object, **kwargs: object) -> None:
+        raise NotImplementedError
+
+    legacy_methods = {
+        name: unsupported
+        for name in ScheduledTaskStore.__abstractmethods__
+        if name not in {"get_default_timezone", "set_default_timezone"}
+    }
+    legacy_type = type("LegacyScheduledTaskStore", (ScheduledTaskStore,), legacy_methods)
+    legacy = legacy_type("memory")
+
+    assert legacy.get_default_timezone(None) is None
+    with pytest.raises(NotImplementedError):
+        legacy.set_default_timezone(None, "America/Chicago")
 
 
 def test_default_timezone_is_per_user_and_ignores_unusable_stored_values(

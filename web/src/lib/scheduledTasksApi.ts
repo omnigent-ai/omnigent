@@ -571,8 +571,7 @@ export async function listScheduledTaskRunPullRequests(
 
 /**
  * Create a scheduled task. Only the fields the user actually set are sent, so
- * the server applies its own defaults (`timezone` → the owner's recorded
- * default zone, else UTC) and the optional
+ * the server applies its own defaults (`timezone` → UTC) and the optional
  * host/workspace pair is omitted entirely when unset (server resolves the
  * connected host at fire time).
  */
@@ -621,7 +620,7 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
 
 /**
  * Record the browser's IANA zone as the caller's default for tasks created
- * without one, such as by an agent tool. Skipped when the zone is unknown, so a
+ * with an explicit default-zone request. Skipped when the zone is unknown, so a
  * UTC fallback never replaces another device's zone. Failures are ignored.
  */
 export async function reportLocalTimezone(): Promise<void> {

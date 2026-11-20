@@ -14,10 +14,12 @@ Covers the runner-side half:
 from __future__ import annotations
 
 import json
+from unittest.mock import Mock
 
 import httpx
 import jsonschema
 import pytest
+from pydantic import BaseModel, ValidationError
 
 from omnigent.errors import OmnigentError
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
@@ -31,6 +33,7 @@ from omnigent.runner.tool_dispatch import (
     execute_tool,
 )
 from omnigent.server.scheduled.harness_settings import validate_scheduled_permission_mode
+from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 from omnigent.tools.base import Tool
 from omnigent.tools.builtins.scheduled_tasks import (
     SysScheduledTaskCreateTool,
@@ -207,9 +210,117 @@ async def test_create_without_session_args_sends_no_session_fields() -> None:
         json.dumps({**_REVIEW_FIELDS, "name": "n", "rrule": "FREQ=DAILY", "agent_id": "ag_1"}),
         server_client=client,
     )
-    _, _, body = client.calls[0]
+    _, _, body = client.calls[-1]
     assert not {"session_mode", "session_id"} & set(body)
-    assert "/v1/info" not in [url for _, url, _ in client.calls]
+    assert [url for _, url, _ in client.calls] == ["/v1/info", "/v1/scheduled-tasks"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("current_server", [False, True], ids=["old-server", "new-server"])
+@pytest.mark.parametrize(
+    ("fields", "expected"),
+    [
+        ({}, "America/Chicago"),
+        ({"timezone": None}, "America/Chicago"),
+        ({"timezone": "UTC"}, "UTC"),
+        ({"timezone": "Asia/Tokyo"}, "Asia/Tokyo"),
+    ],
+    ids=["omitted-tool-zone", "explicit-local-opt-in", "explicit-utc", "explicit-zone"],
+)
+async def test_current_runner_timezone_contract_across_server_versions(
+    current_server: bool, fields: dict[str, str | None], expected: str
+) -> None:
+    from omnigent.server.app import ServerInfoResponse
+    from omnigent.server.routes.scheduled_tasks import (
+        CreateScheduledTaskRequest,
+        _resolve_create_timezone,
+    )
+
+    class LegacyRequest(BaseModel):
+        timezone: str = "UTC"
+
+    store = Mock(spec=ScheduledTaskStore)
+    store.get_default_timezone.return_value = "America/Chicago"
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/v1/info":
+            capability = (
+                {
+                    "scheduled_task_default_timezone": ServerInfoResponse.model_fields[
+                        "scheduled_task_default_timezone"
+                    ].default
+                }
+                if current_server
+                else {}
+            )
+            return httpx.Response(200, json=capability)
+        payload = json.loads(request.content)
+        try:
+            if current_server:
+                body = CreateScheduledTaskRequest.model_validate(payload)
+                timezone = _resolve_create_timezone(body, store, "owner@example.com")
+            else:
+                timezone = LegacyRequest.model_validate(payload).timezone
+        except ValidationError:
+            return httpx.Response(422, json={"detail": "timezone must be a string"})
+        return httpx.Response(200, json={"id": _TASK_ID, "timezone": timezone})
+
+    async with httpx.AsyncClient(
+        base_url="https://server.example", transport=httpx.MockTransport(respond)
+    ) as client:
+        result = await execute_tool(
+            tool_name="sys_scheduled_task_create",
+            arguments=json.dumps(
+                {
+                    **_REVIEW_FIELDS,
+                    "name": "daily",
+                    "rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+                    "agent_id": "ag_1",
+                    **fields,
+                }
+            ),
+            server_client=client,
+        )
+
+    if not current_server and fields.get("timezone") is None:
+        expected = "UTC"
+    assert json.loads(result) == {"id": _TASK_ID, "timezone": expected}
+    assert [request.method for request in requests] == (
+        ["GET", "POST"] if fields.get("timezone") is None else ["POST"]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["http", "transport", "json", "shape"])
+async def test_create_timezone_falls_back_when_capability_is_unavailable(failure: str) -> None:
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/v1/info":
+            if failure == "transport":
+                raise httpx.ConnectError("offline", request=request)
+            if failure == "json":
+                return httpx.Response(200, text="not json")
+            if failure == "shape":
+                return httpx.Response(200, json=[])
+            return httpx.Response(500)
+        assert "timezone" not in json.loads(request.content)
+        return httpx.Response(200, json={"id": _TASK_ID, "timezone": "UTC"})
+
+    async with httpx.AsyncClient(
+        base_url="https://server.example", transport=httpx.MockTransport(respond)
+    ) as client:
+        result = await _execute_scheduled_task_tool(
+            "sys_scheduled_task_create",
+            json.dumps({**_REVIEW_FIELDS, "name": "daily", "timezone": None}),
+            server_client=client,
+        )
+
+    assert json.loads(result) == {"id": _TASK_ID, "timezone": "UTC"}
+    assert [request.method for request in requests] == ["GET", "POST"]
 
 
 @pytest.mark.asyncio
@@ -679,6 +790,15 @@ def test_create_tool_schema_makes_workspace_and_host_optional() -> None:
         "agent_id",
         "permission_mode",
     }
+
+
+def test_current_create_schema_accepts_legacy_omission_and_local_opt_in() -> None:
+    schema = SysScheduledTaskCreateTool().get_schema()["function"]["parameters"]
+    arguments = {**_REVIEW_FIELDS, "name": "daily", "rrule": "FREQ=DAILY", "agent_id": "ag_1"}
+
+    jsonschema.validate(arguments, schema)
+    jsonschema.validate({**arguments, "timezone": None}, schema)
+    jsonschema.validate({**arguments, "timezone": "Asia/Tokyo"}, schema)
 
 
 def test_update_tool_schema_allows_connected_host_changes() -> None:

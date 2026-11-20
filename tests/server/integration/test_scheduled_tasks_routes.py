@@ -2400,7 +2400,7 @@ async def test_update_rejects_invalid_timezone(
     assert bad.status_code == 400, bad.text
 
 
-async def test_create_without_timezone_uses_the_owners_recorded_zone(
+async def test_create_keeps_utc_unless_the_owners_recorded_zone_is_requested(
     auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
     _make_user(db_uri, "alice@example.com")
@@ -2425,14 +2425,15 @@ async def test_create_without_timezone_uses_the_owners_recorded_zone(
     assert recorded.status_code == 200, recorded.text
     assert recorded.json() == {"timezone": "America/Chicago"}
 
-    task = await create("alice@example.com", unzoned)
+    assert (await create("alice@example.com", unzoned))["timezone"] == "UTC"
+    task = await create("alice@example.com", {**unzoned, "timezone": None})
     assert task["timezone"] == "America/Chicago"
     next_run = datetime.fromisoformat(str(task["next_run_at"]))
     assert next_run.astimezone(ZoneInfo("America/Chicago")).hour == 9
-    null_zone = await create("alice@example.com", {**unzoned, "timezone": None})
-    assert null_zone["timezone"] == "America/Chicago"
     explicit = await create("alice@example.com", _create_body(timezone="Asia/Tokyo"))
     assert explicit["timezone"] == "Asia/Tokyo"
+    explicit_utc = await create("alice@example.com", _create_body(timezone="UTC"))
+    assert explicit_utc["timezone"] == "UTC"
     assert (await create("bob@example.com", unzoned))["timezone"] == "UTC"
 
 

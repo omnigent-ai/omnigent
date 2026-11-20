@@ -428,25 +428,25 @@ class ScheduledTaskStore(ABC):
         """
         ...
 
-    @abstractmethod
     def get_default_timezone(self, user_id: str | None) -> str | None:
         """
         Return the IANA timezone a user's clients last reported.
 
         :param user_id: The owner; ``None`` in single-user mode.
-        :returns: The recorded zone, or ``None`` when none is recorded or valid.
+        :returns: The recorded zone, or ``None`` when unsupported, unset, or invalid.
         """
-        ...
+        del user_id
+        return None
 
-    @abstractmethod
     def set_default_timezone(self, user_id: str | None, timezone: str) -> None:
         """
-        Record the IANA timezone used when a new task omits one.
+        Record the IANA timezone used when a new task explicitly requests the default.
 
         :param user_id: The owner; ``None`` in single-user mode.
         :param timezone: A validated IANA timezone name.
+        :raises NotImplementedError: If this store does not persist timezone preferences.
         """
-        ...
+        raise NotImplementedError("this store does not persist timezone preferences")
 
     # ── Runs ─────────────────────────────────────────────────────
 

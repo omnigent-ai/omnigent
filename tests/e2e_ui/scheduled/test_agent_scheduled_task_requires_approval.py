@@ -332,7 +332,14 @@ def test_agent_created_automation_without_timezone_runs_in_browser_timezone(
         _CREATE_REPLY,
     )
     page: Page = request.getfixturevalue("page")
-    page.goto(f"{base_url}/c/{session_id}")
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PUT"
+            and response.url.endswith("/v1/scheduled-tasks/default-timezone")
+        )
+    ) as reported_timezone:
+        page.goto(f"{base_url}/c/{session_id}")
+    assert reported_timezone.value.status == 200
     assert page.evaluate("Intl.DateTimeFormat().resolvedOptions().timeZone") == _BROWSER_TIMEZONE
 
     outcome = _drive_gated_turn(

@@ -2632,6 +2632,7 @@
                 "type": "null"
               }
             ],
+            "default": "UTC",
             "title": "Timezone"
           },
           "workspace": {
@@ -8171,6 +8172,11 @@
           "scheduled_task_approval_skipping_modes": {
             "default": true,
             "title": "Scheduled Task Approval Skipping Modes",
+            "type": "boolean"
+          },
+          "scheduled_task_default_timezone": {
+            "default": true,
+            "title": "Scheduled Task Default Timezone",
             "type": "boolean"
           },
           "scheduled_task_harness_settings": {
@@ -21332,7 +21338,7 @@
     },
     "/v1/scheduled-tasks/default-timezone": {
       "put": {
-        "description": "Record the caller's local zone for tasks created without one, e.g. by an agent.",
+        "description": "Record the caller's local zone for tasks that explicitly request the default.",
         "operationId": "set_default_timezone_v1_scheduled_tasks_default_timezone_put",
         "requestBody": {
           "content": {
