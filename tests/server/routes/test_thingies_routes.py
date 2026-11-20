@@ -609,3 +609,27 @@ async def test_the_app_has_account_deletion_remove_thingies(
         thingy_store=stores.thingies,
     )
     assert isinstance(accounts._thingies, DeletedAccountThingies)
+
+
+def test_a_session_id_that_is_not_a_uuid_is_left_to_the_permission_store(
+    stores: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Deployments can plug in stores whose session IDs are not UUIDs (for example decimal IDs);
+    # the permission store, not the ID's format, decides. The stub stands in for such a
+    # deployment's access check.
+    import omnigent.server.thingies as thingy_routes
+
+    def check(user_id: str | None, session_id: str, *_args: object, **_kwargs: object) -> bool:
+        if session_id == "not-parseable":
+            raise ValueError("bad id")
+        return user_id == ALICE and session_id == "102717306144392"
+
+    monkeypatch.setattr(thingy_routes, "check_session_access", check)
+    can_read = thingy_routes.viewer_can_read_session
+    perms, convs = stores.permissions, stores.conversations
+    assert can_read(ALICE, "102717306144392", perms, convs)
+    assert not can_read(BOB, "102717306144392", perms, convs)
+    assert not can_read(ALICE, "not-parseable", perms, convs)
+    # Single-user mode has no permission store and takes any well-formed ID.
+    assert can_read(ALICE, "0" * 32, None, convs)
+    assert not can_read(ALICE, "102717306144392", None, convs)

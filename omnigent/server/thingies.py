@@ -190,6 +190,32 @@ class _ThingyRoute(APIRoute):
         return guarded
 
 
+def viewer_can_read_session(
+    user_id: str,
+    session_id: str,
+    permission_store: PermissionStore | None,
+    conversation_store: ConversationStore,
+) -> bool:
+    """Whether the viewer may show a thingy beside a session, or make it the thingy session.
+
+    The permission store decides: a deployment's session IDs need not be UUIDs, and an ID its
+    stores can't parse is one the viewer can't read. Without one (single-user mode) any
+    well-formed ID is taken.
+    """
+    if permission_store is None:
+        try:
+            uuid_to_bytes(session_id)
+        except InvalidUuidError:
+            return False
+        return True
+    try:
+        return check_session_access(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+    except (OmnigentError, ValueError):
+        return False
+
+
 def create_thingies_router(
     thingy_store: ThingyStore,
     thingy_access: ThingyAccess,
@@ -214,19 +240,12 @@ def create_thingies_router(
 
     def _sessions(user_id: str) -> SessionStateReader:
         def can_read(session_id: str) -> bool:
-            # The thingy session recorded for a viewer is any well-formed ID they sent.
-            try:
-                uuid_to_bytes(session_id)
-            except InvalidUuidError:
-                return False
-            if permission_store is None or auth_provider is None:
-                return True
-            try:
-                return check_session_access(
-                    user_id, session_id, LEVEL_READ, permission_store, conversation_store
-                )
-            except OmnigentError:
-                return False
+            return viewer_can_read_session(
+                user_id,
+                session_id,
+                None if auth_provider is None else permission_store,
+                conversation_store,
+            )
 
         owned_by = None if auth_provider is None else user_id
         return SessionStateReader(conversation_store, can_read, owned_by)
