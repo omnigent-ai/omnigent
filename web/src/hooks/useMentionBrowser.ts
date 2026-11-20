@@ -1,8 +1,11 @@
 import { type RefObject, useEffect, useRef, useState } from "react";
-import type {
-  ComposerKeyboardEvent,
-  ComposerTextTarget,
+import {
+  isHistoryInput,
+  type ComposerInputEvent,
+  type ComposerKeyboardEvent,
+  type ComposerTextTarget,
 } from "@/components/composer/engine/composerInput";
+import { insertComposerText } from "@/lib/composerText";
 
 import {
   detectMentionAt,
@@ -22,6 +25,42 @@ import { composerAttachmentKey } from "@/store/chatStore";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 
 const NO_FILE_ENTRIES: WorkspaceFile[] = [];
+const NO_TAGS: TaggedMentions = { files: [], sessions: [] };
+
+function sessionTagToken(session: SessionMention): string {
+  return session.token ?? `@${session.title}`;
+}
+
+function tagTokens(tags: TaggedMentions): string[] {
+  return [...tags.files.map(fileMentionToken), ...tags.sessions.map(sessionTagToken)];
+}
+
+/** How many times each of `tokens` stands in `text`. */
+function tokenCounts(text: string, tokens: readonly string[]): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const range of findMentionTokens(text, tokens)) {
+    counts.set(range.token, (counts.get(range.token) ?? 0) + 1);
+  }
+  return counts;
+}
+
+/** `tags` without anything `removed` names by token. */
+function withoutTags(tags: TaggedMentions, removed: TaggedMentions): TaggedMentions {
+  const gone = new Set(tagTokens(removed));
+  return {
+    files: tags.files.filter((it) => !gone.has(fileMentionToken(it))),
+    sessions: tags.sessions.filter((it) => !gone.has(sessionTagToken(it))),
+  };
+}
+
+/** `tags` plus `added`, which replace any with the same tokens. */
+function mergeTags(tags: TaggedMentions, added: TaggedMentions): TaggedMentions {
+  const kept = withoutTags(tags, added);
+  return {
+    files: [...kept.files, ...added.files],
+    sessions: [...kept.sessions, ...added.sessions],
+  };
+}
 
 /**
  * Inputs the host composer supplies. The data source (workspace API vs. host
@@ -102,6 +141,15 @@ export interface MentionBrowser {
   attachSession: (session: SessionMention) => void;
   /** Tokens of everything tagged so far, for highlighting and Backspace. */
   mentionTokens: string[];
+  /**
+   * Tag files from outside the menu (the file viewer's "Attach to agent"), reusing each one's
+   * token if it is already tagged or was released; returns the tokens, in order.
+   */
+  tagFiles: (files: readonly MentionItem[]) => string[];
+  /** Replace the draft's tags, forgetting released ones: a send, recall or new draft. */
+  resetMentions: (mentions?: TaggedMentions) => void;
+  /** Feed every text change in, so an undo or redo that restores a token restores its tag. */
+  noteTextChange: (event: ComposerInputEvent) => void;
   /** Backspace at or inside a token deletes it whole; returns true when it did. */
   handleTokenBackspace: (e: ComposerKeyboardEvent) => boolean;
   /** Handle a key event for the open menu; returns true when it consumed it. */
@@ -202,33 +250,92 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
 
   const mentionTokens = [
     ...mentionedItems.map(fileMentionToken),
-    ...mentionedSessions.map((it) => it.token ?? `@${it.title}`),
+    ...mentionedSessions.map(sessionTagToken),
+  ];
+
+  // Tags whose tokens left the draft. They keep their tokens, so no other target is given
+  // one while an undo could still bring it back; a reset forgets them.
+  const releasedRef = useRef<TaggedMentions>(NO_TAGS);
+  // The latest tags, for callers that run outside a render (the file viewer's drain).
+  const activeRef = useRef<TaggedMentions>({ files: mentionedItems, sessions: mentionedSessions });
+  activeRef.current = { files: mentionedItems, sessions: mentionedSessions };
+
+  // Every token a tag owns, active or released; new tags take none of them.
+  const ownedMentionTokens = () => [
+    ...tagTokens(activeRef.current),
+    ...tagTokens(releasedRef.current),
   ];
 
   // Release tags whose last token was deleted (Backspace, cut, select-and-type).
   // Scanning with every token at once keeps a token that is only the start of a
-  // longer one from counting as present.
+  // longer one from counting as present. Caller-owned tags are filtered by the caller.
   const draftSegments = segments ?? [text];
   const segmentsKey = draftSegments.join("\u0000");
   useEffect(() => {
     if (tags) return;
-    const tokens = [
-      ...mentionedItems.map(fileMentionToken),
-      ...mentionedSessions.map((it) => it.token ?? `@${it.title}`),
-    ];
-    if (tokens.length === 0) return;
+    const owned = ownedMentionTokens();
+    if (owned.length === 0) return;
     const present = new Set(
-      draftSegments.flatMap((segment) => findMentionTokens(segment, tokens).map((r) => r.token)),
+      draftSegments.flatMap((segment) => findMentionTokens(segment, owned).map((r) => r.token)),
     );
-    if (!mentionedItems.every((it) => present.has(fileMentionToken(it)))) {
+    const goneFiles = mentionedItems.filter((it) => !present.has(fileMentionToken(it)));
+    const goneSessions = mentionedSessions.filter((it) => !present.has(sessionTagToken(it)));
+    if (goneFiles.length === 0 && goneSessions.length === 0) return;
+    releasedRef.current = mergeTags(releasedRef.current, {
+      files: goneFiles,
+      sessions: goneSessions,
+    });
+    if (goneFiles.length > 0) {
       setMentionedItems((prev) => prev.filter((it) => present.has(fileMentionToken(it))));
     }
-    if (!mentionedSessions.every((it) => present.has(it.token ?? `@${it.title}`))) {
-      setMentionedSessions((prev) => prev.filter((it) => present.has(it.token ?? `@${it.title}`)));
+    if (goneSessions.length > 0) {
+      setMentionedSessions((prev) => prev.filter((it) => present.has(sessionTagToken(it))));
     }
     // draftSegments is captured through segmentsKey, which changes with its content.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [segmentsKey, mentionedItems, mentionedSessions]);
+
+  // Take released tags back as active ones, when an undo or redo brings their tokens back.
+  const reclaim = (restored: TaggedMentions) => {
+    if (restored.files.length === 0 && restored.sessions.length === 0) return;
+    releasedRef.current = withoutTags(releasedRef.current, restored);
+    if (restored.files.length > 0) setMentionedItems((prev) => [...prev, ...restored.files]);
+    if (restored.sessions.length > 0) {
+      setMentionedSessions((prev) => [...prev, ...restored.sessions]);
+    }
+  };
+
+  // Each input's text as its last change left it, with the draft text it was seen against.
+  const lastSeenRef = useRef(new WeakMap<object, { value: string; draftText: string }>());
+
+  const noteTextChange = (event: ComposerInputEvent) => {
+    const input = event.currentTarget;
+    const seen = lastSeenRef.current.get(input);
+    // A render since the last change (a controlled update) makes the draft text the newer one.
+    const before = seen && seen.draftText === text ? seen.value : text;
+    const after = input.value;
+    lastSeenRef.current.set(input, { value: after, draftText: text });
+    const released = releasedRef.current;
+    if (!isHistoryInput(event) || released === NO_TAGS) return;
+    // Only tokens the undo or redo itself brought back; others in the text stay literal.
+    const owned = ownedMentionTokens();
+    const countBefore = tokenCounts(before, owned);
+    const restored = new Set(
+      [...tokenCounts(after, owned)]
+        .filter(([token, count]) => count > (countBefore.get(token) ?? 0))
+        .map(([token]) => token),
+    );
+    reclaim({
+      files: released.files.filter((it) => restored.has(fileMentionToken(it))),
+      sessions: released.sessions.filter((it) => restored.has(sessionTagToken(it))),
+    });
+  };
+
+  const resetMentions = (mentions?: TaggedMentions) => {
+    releasedRef.current = NO_TAGS;
+    setMentionedItems(mentions?.files ?? []);
+    setMentionedSessions(mentions?.sessions ?? []);
+  };
 
   const placeCaret = (caret: number) =>
     queueMicrotask(() => {
@@ -237,21 +344,54 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
       ta?.focus();
     });
 
+  // The input's own text: keys typed in quick succession can run before `text` re-renders.
+  const liveText = (target: ComposerTextTarget | null) =>
+    target?.isConnected ? target.value : text;
+
+  // Replace [start, end) of the draft as its own undo step, with the caret placed in the
+  // same edit, so a key typed right after it lands at `caret`.
+  const editDraft = (
+    target: ComposerTextTarget | null,
+    start: number,
+    end: number,
+    insert: string,
+    caret: number,
+  ) => {
+    if (target?.isConnected) {
+      if (insertComposerText(target, insert, start, end, { separateUndo: true })) {
+        if (target.selectionStart !== caret || target.selectionEnd !== caret) {
+          target.setSelectionRange(caret, caret);
+        }
+        target.focus();
+      }
+      return;
+    }
+    setText(text.slice(0, start) + insert + text.slice(end));
+    placeCaret(caret);
+  };
+
   // Swap the typed "@query" for the token plus one space, caret after it.
   const insertToken = (active: MentionState, token: string) => {
-    const after = text.slice(active.end);
-    const gap = /^\s/.test(after) ? "" : " ";
-    setText(text.slice(0, active.start) + token + gap + after);
+    const gap = /^\s/.test(liveText(textareaRef.current).slice(active.end)) ? "" : " ";
+    editDraft(
+      textareaRef.current,
+      active.start,
+      active.end,
+      token + gap,
+      active.start + token.length + 1,
+    );
     setMention(null);
     setMentionIndex(-1);
-    placeCaret(active.start + token.length + 1);
   };
 
   const attachSession = (session: SessionMention) => {
     if (!mention) return;
     const existing = mentionedSessions.find((it) => it.id === session.id);
-    const token = existing?.token ?? sessionMentionToken(session, mentionTokens);
-    if (!existing) setMentionedSessions((prev) => [...prev, { ...session, token }]);
+    const released = releasedRef.current.sessions.find((it) => it.id === session.id);
+    const token =
+      existing?.token ?? released?.token ?? sessionMentionToken(session, ownedMentionTokens());
+    if (released) reclaim({ files: [], sessions: [{ ...released, token }] });
+    else if (!existing) setMentionedSessions((prev) => [...prev, { ...session, token }]);
     insertToken(mention, token);
   };
 
@@ -259,48 +399,72 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     if (e.key !== "Backspace" || e.altKey || e.metaKey || e.ctrlKey) return false;
     const ta = e.currentTarget;
     if (ta.selectionStart !== ta.selectionEnd) return false;
-    const range = mentionTokenAtCaret(text, ta.selectionStart, mentionTokens);
+    const current = liveText(ta);
+    const range = mentionTokenAtCaret(current, ta.selectionStart, mentionTokens);
     if (!range) return false;
     e.preventDefault();
-    const next = text.slice(0, range.start) + text.slice(range.end);
-    setText(next);
+    editDraft(ta, range.start, range.end, "", range.start);
     // The deleted token may have been the active "@" query; recompute it so a
     // following Enter can't complete a mention that no longer exists.
-    setMention(detectMentionAt(next, range.start));
+    setMention(
+      detectMentionAt(current.slice(0, range.start) + current.slice(range.end), range.start),
+    );
     setMentionIndex(-1);
-    placeCaret(range.start);
     return true;
+  };
+
+  // The tag for a file, reusing an active or released one with the same attachment key (path,
+  // dir-ness and range), the identity the store queue uses, so the "@" menu and the file
+  // viewer's "Attach to agent" never disagree about duplicates.
+  const claimFile = (
+    file: MentionItem,
+    taken: string[],
+  ): { item: MentionItem; source: "active" | "released" | "new" } => {
+    const itemKey = composerAttachmentKey(file);
+    const active = activeRef.current.files.find((it) => composerAttachmentKey(it) === itemKey);
+    if (active) return { item: active, source: "active" };
+    const released = releasedRef.current.files.find((it) => composerAttachmentKey(it) === itemKey);
+    if (released) return { item: released, source: "released" };
+    return { item: { ...file, token: newFileMentionToken(file, taken) }, source: "new" };
   };
 
   const attachMention = (path: string, isDir: boolean) => {
     if (!mention) return;
-    // Dedup on the shared attachment key (path + dir-ness + range) — the same
-    // identity the store queue uses — so the "@" menu and the file viewer's
-    // "Attach to agent" never disagree about what counts as a duplicate.
-    const itemKey = composerAttachmentKey({ path, isDir });
-    const existing = mentionedItems.find((it) => composerAttachmentKey(it) === itemKey);
-    const item: MentionItem = existing ?? {
-      path,
-      isDir,
-      token: newFileMentionToken({ path, isDir }, mentionTokens),
-    };
-    if (!existing) setMentionedItems((prev) => [...prev, item]);
+    const { item, source } = claimFile({ path, isDir }, ownedMentionTokens());
+    if (source === "released") reclaim({ files: [item], sessions: [] });
+    if (source === "new") setMentionedItems((prev) => [...prev, item]);
     insertToken(mention, fileMentionToken(item));
+  };
+
+  const tagFiles = (files: readonly MentionItem[]): string[] => {
+    const taken = ownedMentionTokens();
+    const fresh: MentionItem[] = [];
+    const reclaimed: MentionItem[] = [];
+    const tokens = files.map((file) => {
+      const pending = [...fresh, ...reclaimed].find(
+        (it) => composerAttachmentKey(it) === composerAttachmentKey(file),
+      );
+      if (pending) return fileMentionToken(pending);
+      const { item, source } = claimFile(file, taken);
+      if (source === "new") {
+        fresh.push(item);
+        taken.push(fileMentionToken(item));
+      }
+      if (source === "released") reclaimed.push(item);
+      return fileMentionToken(item);
+    });
+    reclaim({ files: reclaimed, sessions: [] });
+    if (fresh.length > 0) setMentionedItems((prev) => [...prev, ...fresh]);
+    return tokens;
   };
 
   const openMentionDir = (path: string) => {
     if (!mention) return;
     const inserted = `@${path}/`;
-    const next = text.slice(0, mention.start) + inserted + text.slice(mention.end);
-    setText(next);
     const caret = mention.start + inserted.length;
+    editDraft(textareaRef.current, mention.start, mention.end, inserted, caret);
     setMention({ query: `${path}/`, start: mention.start, end: caret });
     setMentionIndex(0);
-    queueMicrotask(() => {
-      const ta = textareaRef.current;
-      if (ta) ta.setSelectionRange(caret, caret);
-      ta?.focus();
-    });
   };
 
   const dismiss = () => {
@@ -394,6 +558,9 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     setMentionedSessions,
     attachSession,
     mentionTokens,
+    tagFiles,
+    resetMentions,
+    noteTextChange,
     handleTokenBackspace,
     handleKeyDown,
     dismiss,

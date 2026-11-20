@@ -1092,6 +1092,7 @@ function SideChatComposer({
     attachMention,
     openMentionDir,
     attachSession,
+    noteTextChange: noteMentionTextChange,
     handleKeyDown: handleMentionKeyDown,
     handleTokenBackspace,
     dismiss: dismissMention,
@@ -1474,6 +1475,7 @@ function SideChatComposer({
           value: text,
           onChange: (event) => {
             if (commandNotice !== null) setCommandNotice(null);
+            noteMentionTextChange(event);
             slashCompletion.onSelectionChange(event.currentTarget);
             setText(event.currentTarget.value);
             if (gridCell)

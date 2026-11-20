@@ -1,13 +1,19 @@
 import { act, renderHook } from "@testing-library/react";
-import { useRef } from "react";
+import { useRef, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import type {
+  ComposerInputEvent,
+  ComposerKeyboardEvent,
+  ComposerTextTarget,
+} from "@/components/composer/engine/composerInput";
+import { createFakeComposerSurface } from "@/components/composer/engine/testing/fakeComposerSurface";
 import {
   clearSessionDrafts,
   getSessionDraft,
   setSessionDraft,
   setSessionMentions,
 } from "@/lib/sessionDrafts";
-import type { TaggedMentions } from "@/lib/composerMentions";
+import type { MentionState, SessionMention, TaggedMentions } from "@/lib/composerMentions";
 import { useMentionBrowser } from "./useMentionBrowser";
 
 const childId = "conv_hook_child";
@@ -72,5 +78,176 @@ describe("useMentionBrowser with tags held by a session draft", () => {
       files: [],
       sessions: [fixSession, otherSession],
     });
+  });
+});
+
+// Without `input`, edits go through `setText`, as for an input that isn't on screen.
+function renderBrowser(input: ComposerTextTarget | null = null) {
+  return renderHook(() => {
+    const [text, setText] = useState(input?.value ?? "");
+    const [mention, setMention] = useState<MentionState | null>(null);
+    const browser = useMentionBrowser({
+      mention,
+      setMention,
+      mentionEntries: [],
+      text,
+      setText,
+      textareaRef: { current: input },
+    });
+    return { text, setText, setMention, browser };
+  });
+}
+
+type Rendered = ReturnType<typeof renderBrowser>["result"];
+
+const reviewSubagent: SessionMention = { id: "sub_review", title: "Review", isSubagent: true };
+
+function tagReadme(result: Rendered) {
+  act(() => result.current.setText("Read @rea"));
+  act(() => result.current.setMention({ query: "rea", start: 5, end: 9 }));
+  act(() => result.current.browser.attachMention("readme.md", false));
+}
+
+/** Tag `session` from the "@" query at the end of `typed`. */
+function tagSession(result: Rendered, session: SessionMention, typed: string) {
+  const start = typed.indexOf("@");
+  act(() => result.current.setText(typed));
+  act(() => result.current.setMention({ query: typed.slice(start + 1), start, end: typed.length }));
+  act(() => result.current.browser.attachSession(session));
+}
+
+/** An input's change, as the composer's onChange reports it. */
+function change(result: Rendered, value: string, fromHistory: boolean) {
+  const event: ComposerInputEvent = {
+    currentTarget: { value } as ComposerTextTarget,
+    fromHistory,
+  };
+  act(() => {
+    result.current.browser.noteTextChange(event);
+    result.current.setText(value);
+  });
+}
+
+describe("useMentionBrowser released tags", () => {
+  it("restores a deleted file tag when an undo brings its token back", () => {
+    const { result } = renderBrowser();
+    tagReadme(result);
+    change(result, "Read  ", false);
+    expect(result.current.browser.mentionTokens).toEqual([]);
+
+    change(result, "Read @readme.md ", true);
+    expect(result.current.browser.mentionTokens).toEqual(["@readme.md"]);
+  });
+
+  it("restores a deleted session tag when an undo brings its token back", () => {
+    const { result } = renderBrowser();
+    tagSession(result, { id: "sess_fix", title: "Fix CI", isSubagent: false }, "Ask @Fi");
+    expect(result.current.browser.mentionTokens).toEqual(["@Fix CI"]);
+    change(result, "Ask  ", false);
+    expect(result.current.browser.mentionTokens).toEqual([]);
+
+    change(result, "Ask @Fix CI ", true);
+    expect(result.current.browser.mentionTokens).toEqual(["@Fix CI"]);
+  });
+
+  it("restores a deleted subagent tag when an undo brings its token back", () => {
+    const { result } = renderBrowser();
+    tagSession(result, reviewSubagent, "Ask @Re");
+    change(result, "Ask  ", false);
+    expect(result.current.browser.mentionTokens).toEqual([]);
+
+    change(result, "Ask @Review ", true);
+    expect(result.current.browser.mentionTokens).toEqual(["@Review"]);
+  });
+
+  it("keeps a deleted tag's token as literal text when it is typed again", () => {
+    const { result } = renderBrowser();
+    tagReadme(result);
+    change(result, "Read  ", false);
+    change(result, "Read @readme.md ", false);
+    expect(result.current.browser.mentionTokens).toEqual([]);
+  });
+
+  it("keeps retyped literal text literal when an undo or redo changes something else", () => {
+    const { result } = renderBrowser();
+    tagReadme(result);
+    change(result, "Read  ", false);
+    change(result, "Literal @readme.md ", false);
+    change(result, "Literal @readme.md x", false);
+
+    change(result, "Literal @readme.md ", true);
+    expect(result.current.browser.mentionTokens).toEqual([]);
+    change(result, "Literal @readme.md x", true);
+    expect(result.current.browser.mentionTokens).toEqual([]);
+  });
+
+  it("forgets deleted tags on a reset, so an undo in the next draft can't restore them", () => {
+    const { result } = renderBrowser();
+    tagReadme(result);
+    change(result, "Read  ", false);
+    act(() => result.current.browser.resetMentions());
+
+    change(result, "Read @readme.md ", true);
+    expect(result.current.browser.mentionTokens).toEqual([]);
+  });
+
+  it("tags files from outside the menu, reusing a deleted tag's token for the same file", () => {
+    const { result } = renderBrowser();
+    tagReadme(result);
+    change(result, "Read  ", false);
+
+    // The drain appends the tokens to the draft in the same update.
+    let tokens: string[] = [];
+    act(() => {
+      tokens = result.current.browser.tagFiles([
+        { path: "readme.md", isDir: false },
+        { path: "notes.md", isDir: false },
+        { path: "notes.md", isDir: false },
+      ]);
+      result.current.setText(`Read  ${tokens[0]} ${tokens[1]} `);
+    });
+    expect(tokens).toEqual(["@readme.md", "@notes.md", "@notes.md"]);
+    expect(result.current.browser.mentionTokens).toEqual(["@readme.md", "@notes.md"]);
+  });
+});
+
+describe("useMentionBrowser edits on a live input", () => {
+  const backspace = (target: ComposerTextTarget): ComposerKeyboardEvent =>
+    ({
+      key: "Backspace",
+      altKey: false,
+      metaKey: false,
+      ctrlKey: false,
+      currentTarget: target,
+      preventDefault: () => {},
+    }) as unknown as ComposerKeyboardEvent;
+
+  it("completes a mention as its own undo step, with the caret after the token and its space", () => {
+    const input = createFakeComposerSurface("Read @rea");
+    const { result } = renderBrowser(input);
+    act(() => result.current.setMention({ query: "rea", start: 5, end: 9 }));
+    act(() => result.current.browser.attachMention("readme.md", false));
+    expect(input.inserts).toEqual([{ text: "@readme.md ", start: 5, end: 9, separateUndo: true }]);
+    expect(input.selectionStart).toBe("Read @readme.md ".length);
+    input.unregister();
+  });
+
+  it("deletes the token in the input's current text, even before the draft re-renders", () => {
+    const input = createFakeComposerSurface("Read @rea");
+    const { result } = renderBrowser(input);
+    act(() => result.current.setMention({ query: "rea", start: 5, end: 9 }));
+    // The input's change event brings its text into the draft, as the composer's onChange does.
+    act(() => {
+      result.current.browser.attachMention("readme.md", false);
+      result.current.setText(input.value);
+    });
+    // A Backspace deleted the trailing space, and the draft hasn't caught up yet.
+    input.value = "Read @readme.md";
+    input.setSelectionRange(15, 15);
+
+    act(() => void result.current.browser.handleTokenBackspace(backspace(input)));
+    expect(input.value).toBe("Read ");
+    expect(input.inserts.at(-1)).toEqual({ text: "", start: 5, end: 15, separateUndo: true });
+    input.unregister();
   });
 });

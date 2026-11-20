@@ -5658,13 +5658,13 @@ function NewChatLandingContent({
     mentionOpen,
     sessionMenu,
     mentionedItems,
-    setMentionedItems,
     attachMention,
     openMentionDir,
     mentionedSessions,
-    setMentionedSessions,
     attachSession,
     mentionTokens,
+    resetMentions,
+    noteTextChange: noteMentionTextChange,
     handleTokenBackspace,
     handleKeyDown: handleMentionKeyDown,
     dismiss: dismissMention,
@@ -5678,10 +5678,7 @@ function NewChatLandingContent({
     textareaRef,
     initialMentions: restoresDraftText ? restoredDraft?.mentions : undefined,
   });
-  clearTaggedMentionsRef.current = () => {
-    setMentionedItems([]);
-    setMentionedSessions([]);
-  };
+  clearTaggedMentionsRef.current = resetMentions;
   // The draft snapshot is built above the hook; add the tags it owns.
   draftRef.current.mentions = { files: mentionedItems, sessions: mentionedSessions };
   const skillCommandNames = useMemo(() => Object.keys(skillCommands), [skillCommands]);
@@ -6265,10 +6262,7 @@ function NewChatLandingContent({
       // they come back verbatim rather than through a re-validating replace.
       restoreFiles(returnedDraft.files);
       // Merged tags, so recovered tokens still expand to their own targets.
-      if (returnedDraft.mentions) {
-        setMentionedItems(returnedDraft.mentions.files);
-        setMentionedSessions(returnedDraft.mentions.sessions);
-      }
+      if (returnedDraft.mentions) resetMentions(returnedDraft.mentions);
     } else {
       writeLandingDraft(draftState, returnedDraft);
     }
@@ -7690,6 +7684,7 @@ function NewChatLandingContent({
                 mentionTokens,
                 onSelect: (e) => slashCompletion.onSelectionChange(e.currentTarget),
                 onChange: (e) => {
+                  noteMentionTextChange(e);
                   slashCompletion.onSelectionChange(e.currentTarget);
                   setMessage(e.currentTarget.value);
                   // A rejected attachment is never added, so there's no chip to
