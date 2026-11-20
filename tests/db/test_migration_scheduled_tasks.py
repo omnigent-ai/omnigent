@@ -20,10 +20,18 @@ from uuid import uuid4
 import pytest
 import sqlalchemy as sa
 from alembic import command
+from packaging.version import Version
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
-from omnigent.db.db_models import SqlScheduledTask, SqlScheduledTaskRun, SqlScheduledTaskShare
+from omnigent.db.cockroachdb import _crdb_server_version
+from omnigent.db.db_models import (
+    ConversationBase,
+    OmnigentBase,
+    SqlScheduledTask,
+    SqlScheduledTaskRun,
+    SqlScheduledTaskShare,
+)
 from omnigent.db.utils import (
     _build_alembic_config,
     clear_engine_cache,
@@ -671,7 +679,16 @@ def dispatch_migration_engine(tmp_path: Path) -> Iterator[Engine]:
         engine = sa.create_engine(uri)
         config = _build_alembic_config(uri)
         if engine.dialect.name == "cockroachdb":
-            # CRDB bootstraps metadata at head; pin rollback tests to this revision.
+            version = _crdb_server_version(engine)
+            # Create indexes with their new tables instead of separate schema-change jobs.
+            with engine.connect().execution_options(isolation_level="SERIALIZABLE") as conn:
+                if version >= Version("24.1"):
+                    conn.execute(sa.text("SET autocommit_before_ddl = false"))
+                    conn.commit()
+                with conn.begin():
+                    OmnigentBase.metadata.create_all(bind=conn)
+                    ConversationBase.metadata.create_all(bind=conn)
+            command.stamp(config, "head")
             engine.dispose()
             engine = get_or_create_engine(uri).execution_options(isolation_level="SERIALIZABLE")
             command.downgrade(config, _DISPATCH_REVISION)
