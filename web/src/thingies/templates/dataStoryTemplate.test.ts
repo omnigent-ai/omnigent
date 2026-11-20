@@ -116,6 +116,7 @@ function startStory({
   const stored: Record<string, Record<string, Doc>> = {};
   const writes: { collection: string; op: string; id: string; value: unknown }[] = [];
   const requests: { action: string; params: unknown }[] = [];
+  const opened: string[] = [];
   const collection = (name: string) => {
     const docs = (stored[name] ??= {});
     return {
@@ -152,7 +153,10 @@ function startStory({
     ui: { colorScheme: "light" },
     data: { collection },
     navigation: {
-      openSession: () => Promise.resolve({ opened: true }),
+      openSession: (sessionId: string) => {
+        opened.push(sessionId);
+        return Promise.resolve({ opened: true });
+      },
       newAutomation: () => Promise.resolve({ opened: true }),
     },
     agent: {
@@ -210,6 +214,7 @@ function startStory({
     load,
     writes,
     requests,
+    opened,
     reports: () => writes.filter((write) => write.collection === "render_reports"),
     ready: () => listeners.story !== undefined,
   };
@@ -266,15 +271,50 @@ describe("data story template", () => {
     expect(cards[0].textContent).toContain("Quick");
 
     (cards[0].querySelector("button.build") as HTMLButtonElement).click();
-    (byId("custom-text") as HTMLInputElement).value = "Weekly active users by plan";
-    byId("custom").dispatchEvent(new Event("submit", { cancelable: true }));
+    const field = byId("custom-text") as HTMLInputElement;
+    field.value = "Weekly active users by plan";
+    byId("custom-go").click();
+    expect(field.value).toBe("");
+    field.value = "Errors by service";
+    field.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
     expect(requests).toEqual([
       {
         action: "build_story",
         params: { idea_id: "signups", title: "Did the launch move signups?" },
       },
       { action: "build_story", params: { request: "Weekly active users by plan" } },
+      { action: "build_story", params: { request: "Errors by service" } },
     ]);
+  });
+
+  it("cites sessions with links that wrap with the text and open by click or Enter", async () => {
+    const { load, opened, ready } = startStory();
+    await waitFor(() => expect(ready()).toBe(true));
+    load({ ideas: IDEAS });
+
+    await waitFor(() => expect(document.querySelector("#idea-list .cite")).not.toBeNull());
+    const link = document.querySelector("#idea-list .cite") as HTMLElement;
+    // A button would stay one box on its own line when it wraps; a span flows with the text.
+    expect(link.tagName).toBe("SPAN");
+    expect(link.getAttribute("role")).toBe("link");
+    expect(link.tabIndex).toBe(0);
+    link.click();
+    link.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    expect(opened).toEqual(["s1", "s1"]);
+  });
+
+  it("points from a built story's header to the other stories folded under it", async () => {
+    const { load, ready } = startStory();
+    await waitFor(() => expect(ready()).toBe(true));
+    load({ ideas: IDEAS, story: STORY, series: { weekly: WEEKLY } });
+
+    await waitFor(() => expect(byId("others").hidden).toBe(false));
+    const ideas = byId("ideas") as HTMLDetailsElement;
+    expect(ideas.open).toBe(false);
+    expect(byId("others").textContent).toBe("Other stories (2)");
+    expect(byId("ideas-title").textContent).toBe("Other stories you could tell (2)");
+    byId("others").click();
+    expect(ideas.open).toBe(true);
   });
 
   it("shows a build's stages, then that it is designing once the story is written", async () => {
@@ -324,7 +364,7 @@ describe("data story template", () => {
     expect(byId("about").textContent).toContain("Caveats: October is incomplete.");
     // A built story folds its ideas away under it.
     expect((byId("ideas") as HTMLDetailsElement).open).toBe(false);
-    expect(byId("ideas-title").textContent).toBe("Other stories you could tell");
+    expect(byId("ideas-title").textContent).toBe("Other stories you could tell (2)");
     expect(byId("refresh").hidden).toBe(false);
   });
 
@@ -427,6 +467,10 @@ describe("data story designs", () => {
 });
 
 describe("data story revision", () => {
+  it("submits nothing through a form, which the sandboxed frame would drop", () => {
+    expect(DATA_STORY_HTML).not.toMatch(/<form[\s>]/);
+  });
+
   it("uses only schema keywords the server accepts", () => {
     for (const schema of Object.values(DATA_STORY_REVISION.collections)) {
       for (const keyword of keywords(schema, new Set())) {

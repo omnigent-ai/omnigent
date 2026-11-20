@@ -672,7 +672,7 @@ ${THINGY_KIT_HELPERS}
     var cited = (step.evidence && step.evidence.session_id) || step.session_id;
     if (cited) {
       why.push('From ');
-      why.push(el('button', { type: 'button', class: 'cite', text: sessionTitle(cited), on: { click: function () { openSession(cited); } } }));
+      why.push(cite(sessionTitle(cited), function () { openSession(cited); }));
       if (step.evidence && step.evidence.quote) why.push(el('span', { class: 'quote', text: ': “' + plain(step.evidence.quote) + '”' }));
     }
     var children = [main];
@@ -711,7 +711,7 @@ ${THINGY_KIT_HELPERS}
   }
 
   var kit = {
-    el: el, svg: svg, keyed: keyed, ago: ago, hash: hash, wrap: wrap, plain: plain,
+    el: el, svg: svg, keyed: keyed, ago: ago, hash: hash, wrap: wrap, plain: plain, cite: cite,
     stateColor: stateColor, stateSoft: stateSoft, stateLabel: stateLabel, stateOrder: STATE_ORDER,
     openSteps: openSteps, ordered: ordered, stepState: stepState, requestStep: requestStep,
     stepButton: stepButton, stepCard: stepCard, sessionCard: sessionCard, sessionTitle: sessionTitle,
@@ -1050,11 +1050,11 @@ ${THINGY_KIT_HELPERS}
     $('live').addEventListener('click', function () { setLive(!live.on); });
     $('daily').addEventListener('click', function () {
       var name = client.context.app.name;
-      automate('Refresh ' + name, 'Load the thingy skill and follow it. Refresh the thingy "' + name + '" (thingy_id ' + client.context.app.id + '): scan my sessions from the last ' + windowDays() + ' days as its guide describes under Scan.', 'FREQ=DAILY;BYHOUR=8;BYMINUTE=0');
+      automate('Refresh ' + name, 'Load the thingy skill and follow it. Without the thingy skill or sys_thingy_* tools, say the host of this session does not support thingies yet, name what is missing, and stop. Refresh the thingy "' + name + '" (thingy_id ' + client.context.app.id + '): scan my sessions from the last ' + windowDays() + ' days as its guide describes under Scan.', 'FREQ=DAILY;BYHOUR=8;BYMINUTE=0');
     });
     $('automate').addEventListener('click', function () {
       var name = client.context.app.name;
-      automate('Next step from ' + name, 'Load the thingy skill and follow it. In the thingy "' + name + '" (thingy_id ' + client.context.app.id + '), do this next step as its guide describes under Next steps: (say which step, for example: check the error rate after the latest ramp).', 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9;BYMINUTE=0');
+      automate('Next step from ' + name, 'Load the thingy skill and follow it. Without the thingy skill or sys_thingy_* tools, say the host of this session does not support thingies yet, name what is missing, and stop. In the thingy "' + name + '" (thingy_id ' + client.context.app.id + '), do this next step as its guide describes under Next steps: (say which step, for example: check the error rate after the latest ramp).', 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9;BYMINUTE=0');
     });
     if (window.ResizeObserver) {
       new ResizeObserver(function () {

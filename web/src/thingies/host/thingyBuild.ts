@@ -58,6 +58,13 @@ export function thingyNameFrom(description: string): string {
   return URL_START.test(name) ? name : name.charAt(0).toUpperCase() + name.slice(1);
 }
 
+/**
+ * How every prompt that hands work to a thingy session starts. A session whose host predates
+ * thingies has neither the skill nor the tools; it should say so rather than improvise.
+ */
+export const THINGY_SKILL_INSTRUCTION =
+  "Load the thingy skill and follow it. Without the thingy skill or sys_thingy_* tools, say this session's host doesn't support thingies yet, name what's missing, and stop.";
+
 /** How the session prompts name a thingy, so its sys_thingy_* tools reach it. */
 export function thingyPromptLabel(app: Pick<Thingy, "id" | "name">): string {
   return `${JSON.stringify(app.name)} (thingy_id ${app.id})`;
@@ -73,7 +80,7 @@ export function composeThingyBuildPrompt(
   description = "",
 ): string {
   const note = [
-    "Load the thingy skill and follow it.",
+    THINGY_SKILL_INSTRUCTION,
     `Please build my new thingy ${thingyPromptLabel(app)} from my description below, and publish it.`,
     "This is also my thingy session, where I'll send its actions and change requests.",
   ].join(" ");

@@ -372,7 +372,8 @@ describe("thingy session", () => {
     expect(prompt.startsWith("Load the thingy skill and follow it.")).toBe(true);
     expect(prompt).toContain('This is my thingy session for "Team board" (thingy_id app-1):');
     // A short note: the session reads how to coordinate from the thingy skill.
-    expect(prompt.split("\n\n")[0].length).toBeLessThan(300);
+    expect(prompt).toContain("sys_thingy_* tools");
+    expect(prompt.split("\n\n")[0].length).toBeLessThan(400);
     expect(
       prompt.endsWith(
         'Thingy action\n{"action_id":"act1","action":"run_card","params":{"cardId":"c1"}}',

@@ -47,7 +47,8 @@ describe("composeThingyBuildPrompt", () => {
 
     expect(note.startsWith("Load the thingy skill and follow it.")).toBe(true);
     expect(note).toContain('"Reading list" (thingy_id app-1)');
-    expect(note.length).toBeLessThan(300);
+    expect(note).toContain("host doesn't support thingies yet");
+    expect(note.length).toBeLessThan(400);
     expect(description).toBe("A reading list with title and author");
   });
 

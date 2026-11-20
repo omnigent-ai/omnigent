@@ -688,7 +688,7 @@ ${THINGY_KIT_HELPERS}
   }
 
   var kit = {
-    el: el, svg: svg, keyed: keyed, ago: ago, hash: hash, wrap: wrap, plain: plain, format: format, scale: scale,
+    el: el, svg: svg, keyed: keyed, ago: ago, hash: hash, wrap: wrap, plain: plain, cite: cite, format: format, scale: scale,
     color: color, tip: tip, chart: chart, headline: headline, section: section, openSession: openSession,
     ref: ref, rerender: function () { schedule(); }, calm: calm, canAct: false, canWrite: false, preview: false,
   };
@@ -868,7 +868,7 @@ ${THINGY_KIT_HELPERS}
     var parts = ['From '];
     cited.forEach(function (entry, index) {
       if (index) parts.push(' and ');
-      parts.push(el('button', { type: 'button', class: 'cite', text: entry.title || 'a session', on: { click: function () { openSession(entry.id); } } }));
+      parts.push(cite(entry.title || 'a session', function () { openSession(entry.id); }));
       if (entry.quote) parts.push(el('span', { class: 'quote', text: ': “' + plain(entry.quote) + '”' }));
     });
     return el('div', { class: 'cited' }, parts);
@@ -891,12 +891,17 @@ ${THINGY_KIT_HELPERS}
   function renderIdeas(found, value, build) {
     var box = $('ideas');
     box.hidden = !found;
-    if (!found) return;
+    if (!found) { $('others').hidden = true; return; }
     var list = ideaList();
     var busy = build.open && !build.undelivered;
     // Until a story is built the ideas are the page; then they fold away under it.
     if (!box.dataset.touched && ideasOpenSet !== !value) { ideasOpenSet = !value; box.open = ideasOpenSet; }
-    $('ideas-title').textContent = value ? 'Other stories you could tell' : 'Stories you could tell';
+    $('ideas-title').textContent = value
+      ? 'Other stories you could tell' + (list.length ? ' (' + list.length + ')' : '')
+      : 'Stories you could tell';
+    // Folded under a built story, the ideas are easy to miss: the header points to them.
+    $('others').hidden = !(value && list.length);
+    $('others').textContent = 'Other stories (' + list.length + ')';
     var note = [];
     if (found.example) note.push('Example ideas.');
     else if (found.scanned_at) note.push('From ' + (found.sessions_read || 0) + ' sessions in the last ' + found.window_days + ' days, ' + ago(found.scanned_at) + '.');
@@ -923,7 +928,7 @@ ${THINGY_KIT_HELPERS}
     var cited = (value.sessions || []).filter(function (entry) { return entry && entry.id; });
     if (cited.length) {
       parts.push(el('div', {}, [el('h3', { text: 'From your sessions' }), el('ul', {}, cited.map(function (entry) {
-        return el('li', {}, [el('button', { type: 'button', class: 'cite', text: entry.title || 'A session', on: { click: function () { openSession(entry.id); } } }), entry.quote ? el('span', { class: 'quote', text: ': “' + plain(entry.quote) + '”' }) : null]);
+        return el('li', {}, [cite(entry.title || 'A session', function () { openSession(entry.id); }), entry.quote ? el('span', { class: 'quote', text: ': “' + plain(entry.quote) + '”' }) : null]);
       }))]));
     }
     if (value.caveats) parts.push(el('p', { class: 'caveats', text: 'Caveats: ' + plain(value.caveats) }));
@@ -1013,15 +1018,26 @@ ${THINGY_KIT_HELPERS}
     $('find-empty').addEventListener('click', findStories);
     $('find').addEventListener('click', findStories);
     $('refresh').addEventListener('click', refreshData);
+    $('others').addEventListener('click', function () {
+      var box = $('ideas');
+      box.open = true;
+      box.dataset.touched = 'true';
+      box.scrollIntoView({ behavior: calm ? 'auto' : 'smooth', block: 'start' });
+      $('ideas-title').focus({ preventScroll: true });
+    });
     $('window').addEventListener('change', function () { $('window').dataset.touched = 'true'; });
     $('ideas').addEventListener('toggle', function () { if ($('ideas').open !== ideasOpenSet) $('ideas').dataset.touched = 'true'; });
-    $('custom').addEventListener('submit', function (event) {
-      event.preventDefault();
-      if (buildCustom($('custom-text').value)) $('custom-text').value = '';
+    // Not a form: the sandboxed frame may not submit forms, so Chrome would drop the submission.
+    function submitCustom() {
+      if (!$('custom-go').disabled && buildCustom($('custom-text').value)) $('custom-text').value = '';
+    }
+    $('custom-go').addEventListener('click', submitCustom);
+    $('custom-text').addEventListener('keydown', function (event) {
+      if (event.key === 'Enter' && !event.isComposing) { event.preventDefault(); submitCustom(); }
     });
     $('weekly').addEventListener('click', function () {
       var name = client.context.app.name;
-      automate('Refresh ' + name, 'Load the thingy skill and follow it. Refresh the data of the thingy "' + name + '" (thingy_id ' + client.context.app.id + ') as its guide describes under Refreshing.', 'FREQ=WEEKLY;BYDAY=MO;BYHOUR=8;BYMINUTE=0');
+      automate('Refresh ' + name, 'Load the thingy skill and follow it. Without the thingy skill or sys_thingy_* tools, say the host of this session does not support thingies yet, name what is missing, and stop. Refresh the data of the thingy "' + name + '" (thingy_id ' + client.context.app.id + ') as its guide describes under Refreshing.', 'FREQ=WEEKLY;BYDAY=MO;BYHOUR=8;BYMINUTE=0');
     });
     if (window.ResizeObserver) {
       new ResizeObserver(function () {
@@ -1099,6 +1115,7 @@ const KIT_BODY = `
           <option value="30">30 days</option>
         </select>
       </label>
+      <button type="button" id="others" class="quiet" aria-controls="ideas" hidden>Other stories</button>
       <button type="button" id="find" class="quiet" data-omnigent-requires="action" hidden>Suggest others</button>
       <button type="button" id="refresh" class="primary" data-omnigent-requires="action" hidden>Refresh data</button>
     </div>
@@ -1149,11 +1166,11 @@ const KIT_BODY = `
       <p id="ideas-note" class="ideas-note"></p>
       <div id="ideas-run" class="status" aria-live="polite" hidden></div>
       <div id="idea-list" class="ideas"></div>
-      <form id="custom" class="custom" hidden>
+      <div id="custom" class="custom" hidden>
         <label for="custom-text">Something else</label>
         <input type="text" id="custom-text" maxlength="500" placeholder="For example: weekly active users by plan since September">
-        <button type="submit" id="custom-go" class="quiet" data-omnigent-requires="action">Build it</button>
-      </form>
+        <button type="button" id="custom-go" class="quiet" data-omnigent-requires="action">Build it</button>
+      </div>
     </details>
   </section>
 
@@ -1266,6 +1283,7 @@ export const DATA_STORY_GUIDE = [
   "2. Read only a little of each: its title, its journal with `sys_journal_read` when that tool is available, else `sys_session_get_history` limited to its last few items. Never read whole transcripts, and never ask a session to start a journal.",
   "3. Look for data work: tables or files queried, metrics checked, analyses run, results or charts discussed, questions left open.",
   "4. Write 3 to 6 ideas, each a story worth telling from data the viewer already touched: `{id, title, question, why, chart_idea, effort: quick|medium|deep, sources: [{name, kind, detail}], sessions: [{id, title, quote}]}`. `question` is the one question the story answers; cite each idea's sessions with a short quote. On Suggest others, keep ideas the viewer may still want and replace the rest with different ones.",
+  "   Name only sources you saw: a file, table or path an idea cites must be one the session shows or one you checked exists (list the directory), never a guessed name.",
   "5. Replace the `ideas` record with `scanned_at`, `window_days`, `sessions_read` and `ideas`; add `note` when the window had little data work. Report the action `done` with a one-line summary.",
   "",
   "## Building a story",
@@ -1286,6 +1304,8 @@ export const DATA_STORY_GUIDE = [
   "- Make it readable in the docked side panel (about 400 px wide) and full screen, use the kit's colors so light and dark both work, respect `kit.calm`, and use inline SVG and CSS only: the frame blocks the network. Keep the HTML well under 1 MiB.",
   "- Give it at least one visual that carries the point beyond the kit's chart: an annotated before and after, a highlighted turning point, a reveal as the reader scrolls, an interactive breakdown. `kit.chart`, `kit.headline` and `kit.section` are there to reuse.",
   "- The story ideas, build and refresh progress, Refresh data, the look line, sources and the guide are the kit's: do not draw them again.",
+  "- `kit.section` already draws its heading, words, chart and takeaway: place it as it is, not inside another card with a second title. Each chart gets one title.",
+  '- Read your text back before publishing: a space between words and numbers ("up 45%", not "up45%"), no repeated titles, and units on every number.',
   "",
   "To publish a design:",
   "",

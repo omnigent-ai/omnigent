@@ -105,8 +105,9 @@ section { margin-top: 22px; }
 
 /* Links, quotes and the guide */
 .link-button { border: none; background: none; padding: 0; color: var(--accent); cursor: pointer; font-size: inherit; }
-.cite { border: none; background: none; padding: 0; color: var(--accent); cursor: pointer; font-size: inherit; }
+.cite { color: var(--accent); cursor: pointer; }
 .cite:hover { text-decoration: underline; }
+.cite:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; border-radius: 2px; }
 .quote { font-style: italic; }
 .guide { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 4px 16px; }
 .guide summary { cursor: pointer; font-weight: 600; padding: 10px 0; }
@@ -195,6 +196,13 @@ export const THINGY_KIT_HELPERS = `
     return node;
   }
   function $(elementId) { return document.getElementById(elementId); }
+  // A session link that wraps with the text around it, which a button would not.
+  function cite(textValue, activate) {
+    return el('span', { class: 'cite', role: 'link', tabindex: '0', text: textValue, on: {
+      click: activate,
+      keydown: function (event) { if (event.key === 'Enter') { event.preventDefault(); activate(); } },
+    } });
+  }
 
   // Keeps one element per key in parent, in the order of items, and moves an element that kept
   // its key from where it was (or fades a new one in), so a rescan animates instead of redrawing.

@@ -17,7 +17,7 @@ import {
 
 import type { ThingyActionRequest, ThingySelection } from "./thingyBridge";
 import { BridgeError } from "./thingyBridge";
-import { thingyPromptLabel } from "./thingyBuild";
+import { THINGY_SKILL_INSTRUCTION, thingyPromptLabel } from "./thingyBuild";
 import {
   composeThingyContextPrompt,
   thingyBoardNewSessionUrl,
@@ -132,7 +132,7 @@ export async function openThingyFullScreen(
  */
 export function composeThingySessionPrompt(app: Pick<Thingy, "id" | "name">): string {
   return [
-    "Load the thingy skill and follow it.",
+    THINGY_SKILL_INSTRUCTION,
     `This is my thingy session for ${thingyPromptLabel(app)}: I'll send its actions and change requests here.`,
     "Start with any actions already queued in its ledger.",
   ].join(" ");

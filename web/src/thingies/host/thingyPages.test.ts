@@ -21,7 +21,8 @@ describe("thingy pages", () => {
 
     expect(prompt.startsWith("Summarize the card\n\n---\n")).toBe(true);
     expect(prompt).toContain('"Team \\"board\\"" (thingy_id app-1)');
-    expect(prompt).toContain("load the thingy skill");
+    expect(prompt).toContain("Load the thingy skill and follow it.");
+    expect(prompt).toContain("name what's missing, and stop");
     expect(prompt).not.toMatch(/token|Authorization|mcp/i);
   });
 

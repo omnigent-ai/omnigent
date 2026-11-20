@@ -17,6 +17,7 @@ import {
   updateThingyComment,
 } from "@/thingies/api/thingyApi";
 import type { ThingySelection } from "@/thingies/host/thingyBridge";
+import { THINGY_SKILL_INSTRUCTION } from "@/thingies/host/thingyBuild";
 import { THINGIES_KEY } from "./thingyQueries";
 
 export function thingyCommentsKey(thingyId: string) {
@@ -29,7 +30,7 @@ export function thingyCommentsMessage(
   comments: readonly ThingyComment[],
 ): string {
   const lines = [
-    `Load the thingy skill and follow it. Address these comments on the thingy ${JSON.stringify(thingy.name)} (thingy_id ${thingy.id}). Change its page with sys_thingy_revision_create and sys_thingy_publish, or its records, as each asks. They are already marked addressed; sys_thingy_comment_list has them all.`,
+    `${THINGY_SKILL_INSTRUCTION} Address these comments on the thingy ${JSON.stringify(thingy.name)} (thingy_id ${thingy.id}). Change its page with sys_thingy_revision_create and sys_thingy_publish, or its records, as each asks. They are already marked addressed; sys_thingy_comment_list has them all.`,
     "",
   ];
   comments.forEach((comment, index) => {

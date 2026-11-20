@@ -12,6 +12,7 @@ import {
 import { thingyFixture } from "./testUtils";
 import { thingyCommentsMessage, useThingyComments } from "./useThingyComments";
 import type * as ThingyApiModule from "@/thingies/api/thingyApi";
+import { THINGY_SKILL_INSTRUCTION } from "@/thingies/host/thingyBuild";
 
 vi.mock("@/thingies/api/thingyApi", async (importOriginal) => ({
   ...(await importOriginal<typeof ThingyApiModule>()),
@@ -55,7 +56,7 @@ describe("thingy comments", () => {
       ]),
     ).toBe(
       [
-        'Load the thingy skill and follow it. Address these comments on the thingy "Launch board" (thingy_id board). Change its page with sys_thingy_revision_create and sys_thingy_publish, or its records, as each asks. They are already marked addressed; sys_thingy_comment_list has them all.',
+        `${THINGY_SKILL_INSTRUCTION} Address these comments on the thingy "Launch board" (thingy_id board). Change its page with sys_thingy_revision_create and sys_thingy_publish, or its records, as each asks. They are already marked addressed; sys_thingy_comment_list has them all.`,
         "",
         '1. On "Ship it" (Card, ref card-1), lee@example.com wrote:',
         "   Body of c1",

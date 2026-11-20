@@ -7,6 +7,7 @@
 // (`useRebasePath`) and resolve it against `window.location.origin`.
 
 import { THINGY_FULL_SCREEN_PARAM } from "@/lib/thingyRailTabs";
+import { THINGY_SKILL_INSTRUCTION } from "./thingyBuild";
 
 /**
  * The viewer's prompt followed by a note that names the thingy and points to the thingy skill,
@@ -20,7 +21,7 @@ export function composeThingyContextPrompt(
     prompt.trim(),
     "",
     "---",
-    `Omnigent added this note because the session was started from the thingy ${JSON.stringify(app.name)} (thingy_id ${app.id}). To work with its records, load the thingy skill and follow it.`,
+    `Omnigent added this note because the session was started from the thingy ${JSON.stringify(app.name)} (thingy_id ${app.id}). To work with its records: ${THINGY_SKILL_INSTRUCTION}`,
   ].join("\n");
 }
 
