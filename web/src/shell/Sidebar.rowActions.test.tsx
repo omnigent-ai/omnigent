@@ -1446,21 +1446,26 @@ describe("right-click context menu", () => {
     expect(screen.queryByTestId("open-session-window")).toBeNull();
   });
 
-  it("offers no new window for a pop-out's own session, only for others", () => {
+  it.each([
+    ["while it shows that session", "conv_1", false],
+    ["after it moved to another session", "conv_2", true],
+  ])("offers a pop-out's own session a new window only %s", (_name, shownId, offered) => {
     mockConversations([CONV, { ...CONV, id: "conv_2", title: "Other Session" }]);
     document.documentElement.dataset.sessionWindow = "true";
+    document.documentElement.dataset.sessionWindowFor = "conv_1";
     try {
-      renderSidebar("conv_1");
+      renderSidebar(shownId);
 
       fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
       expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
-      expect(screen.queryByTestId("open-session-window")).toBeNull();
+      expect(screen.queryByTestId("open-session-window") !== null).toBe(offered);
       fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
 
       fireEvent.contextMenu(screen.getByRole("link", { name: /Other Session/ }));
       expect(screen.getByTestId("open-session-window")).toBeInTheDocument();
     } finally {
       delete document.documentElement.dataset.sessionWindow;
+      delete document.documentElement.dataset.sessionWindowFor;
     }
   });
 
@@ -1539,24 +1544,27 @@ describe("right-click context menu", () => {
     (menu) => {
       const popup = { location: { pathname: "blank", href: "about:blank" }, focus: vi.fn() };
       const open = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
-      renderSidebar(undefined, undefined, { header: <CurrentPath /> });
+      try {
+        renderSidebar(undefined, undefined, { header: <CurrentPath /> });
 
-      if (menu === "kebab") {
-        fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
-      } else {
-        fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+        if (menu === "kebab") {
+          fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+        } else {
+          fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+        }
+        fireEvent.click(screen.getByTestId("open-session-window"));
+
+        expect(open).toHaveBeenCalledWith(
+          "",
+          "omnigent-session-conv_1",
+          "popup,width=960,height=820",
+        );
+        expect(popup.location.href).toBe("/c/conv_1?window=session");
+        expect(popup.focus).toHaveBeenCalled();
+        expect(screen.getByTestId("current-path")).toHaveTextContent(/^\/$/);
+      } finally {
+        open.mockRestore();
       }
-      fireEvent.click(screen.getByTestId("open-session-window"));
-
-      expect(open).toHaveBeenCalledWith(
-        "",
-        "omnigent-session-conv_1",
-        "popup,width=960,height=820",
-      );
-      expect(popup.location.href).toBe("/c/conv_1?window=session");
-      expect(popup.focus).toHaveBeenCalled();
-      expect(screen.getByTestId("current-path")).toHaveTextContent(/^\/$/);
-      open.mockRestore();
     },
   );
 

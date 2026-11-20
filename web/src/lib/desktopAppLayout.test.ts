@@ -6,6 +6,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
   delete document.documentElement.dataset.desktopApp;
   delete document.documentElement.dataset.sessionWindow;
+  delete document.documentElement.dataset.sessionWindowFor;
   window.history.replaceState(null, "", "/");
 });
 
@@ -32,6 +33,7 @@ describe("desktop app layout", () => {
 
     applyDesktopAppAttribute();
     expect(document.documentElement.dataset.sessionWindow === "true").toBe(expected);
+    expect(document.documentElement.dataset.sessionWindowFor).toBe(expected ? "conv_1" : undefined);
     expect(keepsDesktopLayout()).toBe(expected);
     expect(document.documentElement.hasAttribute("data-desktop-app")).toBe(expected);
   });

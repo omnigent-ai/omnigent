@@ -1,7 +1,7 @@
 // The desktop app and popped-out session windows keep the desktop layout at
 // every window width. Browsers and the mobile apps pick it from the viewport width.
 
-import { isSessionWindow, startsAsSessionWindow } from "./sessionWindow";
+import { isSessionWindow, startingSessionWindowId } from "./sessionWindow";
 
 /**
  * True in the desktop app and in a popped-out session window, where a window
@@ -17,10 +17,14 @@ export function keepsDesktopLayout(): boolean {
 
 /**
  * Mark `<html>` with `data-desktop-app` for the `md` / `max-md` variants in
- * index.css, and `data-session-window` on a popped-out session window. Neither
- * changes at runtime, so call once before first paint.
+ * index.css, and `data-session-window` (plus the session it was opened for) on a
+ * popped-out session window. Neither changes at runtime, so call once before first paint.
  */
 export function applyDesktopAppAttribute(): void {
-  if (startsAsSessionWindow()) document.documentElement.dataset.sessionWindow = "true";
+  const sessionWindowId = startingSessionWindowId();
+  if (sessionWindowId !== null) {
+    document.documentElement.dataset.sessionWindow = "true";
+    document.documentElement.dataset.sessionWindowFor = sessionWindowId;
+  }
   if (keepsDesktopLayout()) document.documentElement.dataset.desktopApp = "true";
 }

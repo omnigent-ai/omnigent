@@ -69,6 +69,24 @@ describe("useOpenSessionWindow", () => {
     expect(mocks.toastError).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["opens a popup quietly", { location: { pathname: "", href: "" }, focus: vi.fn() }, false],
+    ["explains a blocked popup", null, true],
+  ])("in a browser, %s", (_name, popup, warns) => {
+    const open = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window | null);
+
+    renderHook(() => useOpenSessionWindow()).result.current?.("conv_1");
+
+    expect(open).toHaveBeenCalledWith("", "omnigent-session-conv_1", expect.any(String));
+    if (warns) {
+      expect(mocks.toastError).toHaveBeenCalledWith(
+        "Your browser blocked the new window. Allow pop-ups for this site.",
+      );
+    } else {
+      expect(mocks.toastError).not.toHaveBeenCalled();
+    }
+  });
+
   it("tells the user when the desktop shell can't open the window", async () => {
     globals.omnigentDesktop = { kind: "electron", openSessionWindow: () => Promise.resolve(false) };
 
