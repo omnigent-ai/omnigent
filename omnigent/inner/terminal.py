@@ -2060,7 +2060,7 @@ class TerminalInstance:
             try:
                 proc = await asyncio.create_subprocess_exec(
                     *cmd,
-                    stdout=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     env=env,
                 )
@@ -2070,7 +2070,7 @@ class TerminalInstance:
                 self._launch_incomplete = previous_launch_incomplete
                 raise
             try:
-                _, stderr = await proc.communicate()
+                stdout, stderr = await proc.communicate()
             except BaseException:
                 cleanup = asyncio.create_task(
                     terminate_direct_subprocess(
@@ -2094,8 +2094,15 @@ class TerminalInstance:
                 raise
             self._launch_incomplete = previous_launch_incomplete
             if proc.returncode != 0:
+                # tmux can report launch failures on either stream.
+                reason = "; ".join(
+                    stream.decode(errors="replace").strip()
+                    for stream in (stderr, stdout)
+                    if stream.strip()
+                )
                 raise RuntimeError(
-                    f"tmux launch failed (rc={proc.returncode}): {stderr.decode().strip()}"
+                    f"tmux launch failed (rc={proc.returncode}): "
+                    f"{reason or '<tmux produced no output>'}"
                 )
         except BaseException:
             if self._clipboard_bridge is not None:

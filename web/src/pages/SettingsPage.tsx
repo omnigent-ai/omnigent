@@ -41,7 +41,6 @@ import {
   useMemo,
   useRef,
   useState,
-  useSyncExternalStore,
 } from "react";
 import { useViewerId } from "@/hooks/useViewerId";
 import { useProactiveAgentSettings } from "@/hooks/useProactiveAgentSettings";
@@ -197,10 +196,11 @@ import {
 } from "@/lib/databricksIntegration";
 import {
   getCurrentIsAdmin,
-  getCurrentAdminEligibility,
+  getCurrentUserId,
   resolveIdentity,
   subscribeIdentity,
 } from "@/lib/identity";
+import { useAdminViewSwitchShown } from "@/hooks/useAdminViewSwitchShown";
 import { isAdminViewEnabled, setAdminViewEnabled } from "@/lib/adminView";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
@@ -377,7 +377,7 @@ import {
   writeCustomTheme,
 } from "@/lib/customTheme";
 import { useHostTheme } from "@/lib/embedded";
-import { getOmnigentThemeSettingsUrl, isDatabricksWorkspace } from "@/lib/host";
+import { getOmnigentThemeSettingsUrl } from "@/lib/host";
 import {
   applyImportedSettings,
   collectSettings,
@@ -2158,17 +2158,7 @@ function TerminalClipboardControl() {
 }
 
 function AdminViewControl() {
-  const eligible = useSyncExternalStore(subscribeIdentity, getCurrentAdminEligibility, () => false);
-  const info = useServerInfo();
-  // Failed discovery has no capability flag; keep an existing off cookie recoverable.
-  if (
-    !eligible ||
-    info === "loading" ||
-    isBootFallbackInfo(info) ||
-    info.admin_view === false ||
-    (isAdminViewEnabled() && (!info.admin_view || info.single_user || isDatabricksWorkspace()))
-  )
-    return null;
+  if (!useAdminViewSwitchShown()) return null;
   return (
     <SettingsGroup title="Administration">
       <SettingsItem entry={ADMIN_VIEW_ENTRY} className="flex items-center justify-between gap-4">
@@ -2243,6 +2233,12 @@ function GeneralSection() {
         {supportsGlobalShortcut() && (
           <SettingsGroup title="Desktop app" testId="settings-group-desktop-app">
             <GlobalShortcutControl />
+            {isFeatureEnabled(info, "floating_composer") && (
+              // Empty, and hidden, unless the shell can change the panel's shortcut by id.
+              <div className="mt-4 border-t border-border pt-4 empty:hidden">
+                <GlobalShortcutControl shortcutId="floatingComposer" />
+              </div>
+            )}
           </SettingsGroup>
         )}
         <AdminViewControl />
@@ -2999,10 +2995,17 @@ function AccountSection() {
 
   useEffect(() => {
     if (capabilitiesLoading) return;
-    void (async () => {
-      const userId = await resolveIdentity();
+    let active = true;
+    const update = (userId: string | null) => {
+      if (!active) return;
       setMe(userId === null ? null : { id: userId, is_admin: getCurrentIsAdmin() });
-    })();
+    };
+    const unsubscribe = subscribeIdentity(() => update(getCurrentUserId()));
+    void resolveIdentity().then(update);
+    return () => {
+      active = false;
+      unsubscribe();
+    };
   }, [capabilitiesLoading]);
 
   const onSignOut = useCallback(() => signOutOfBrowserSession(accountsEnabled), [accountsEnabled]);

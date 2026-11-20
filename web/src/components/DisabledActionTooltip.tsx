@@ -51,7 +51,10 @@ export function DisabledActionTooltip({
             {children}
           </span>
         </TooltipTrigger>
-        {reason && <TooltipContent>{reason}</TooltipContent>}
+        {/* While shown, Escape closes the reason before any page shortcut acts on it. */}
+        {reason && (
+          <TooltipContent data-escape-owner={open ? "" : undefined}>{reason}</TooltipContent>
+        )}
       </Tooltip>
     </TooltipProvider>
   );

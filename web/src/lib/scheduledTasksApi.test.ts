@@ -22,6 +22,7 @@ import {
   listSharedScheduledTasks,
   listAutomationFailures,
   runScheduledTaskNow,
+  reportLocalTimezone,
   updateScheduledTask,
 } from "./scheduledTasksApi";
 
@@ -514,6 +515,52 @@ describe("deleteScheduledTask", () => {
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe("/v1/scheduled-tasks/st_1");
     expect(init.method).toBe("DELETE");
+  });
+});
+
+describe("reportLocalTimezone", () => {
+  const mockBrowserZone = (timeZone: string) =>
+    vi.spyOn(Intl.DateTimeFormat.prototype, "resolvedOptions").mockReturnValue({
+      timeZone,
+    } as Intl.ResolvedDateTimeFormatOptions);
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("PUTs the browser's zone as the caller's default", async () => {
+    mockBrowserZone("America/Chicago");
+    fetchMock.mockResolvedValueOnce(mockResponse({ timezone: "America/Chicago" }));
+    await reportLocalTimezone();
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/v1/scheduled-tasks/default-timezone");
+    expect(init.method).toBe("PUT");
+    expect(JSON.parse(init.body)).toEqual({ timezone: "America/Chicago" });
+  });
+
+  it.each(["empty", "throws"])("does not report a zone when discovery %s", async (failure) => {
+    if (failure === "throws") {
+      vi.spyOn(Intl.DateTimeFormat.prototype, "resolvedOptions").mockImplementationOnce(() => {
+        throw new Error("timezone discovery unavailable");
+      });
+    } else {
+      mockBrowserZone("");
+    }
+    await expect(reportLocalTimezone()).resolves.toBeUndefined();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a failed request", () => fetchMock.mockRejectedValueOnce(new TypeError("offline"))],
+    [
+      "a server that predates the endpoint",
+      () => fetchMock.mockResolvedValueOnce(mockResponse({}, { ok: false, status: 405 })),
+    ],
+  ])("ignores %s", async (_case, respond) => {
+    mockBrowserZone("America/Chicago");
+    respond();
+    await expect(reportLocalTimezone()).resolves.toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
 

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import secrets
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 
 from connectrpc.code import Code
@@ -27,16 +27,15 @@ from omnigent.api.workspace.v1alpha1.workspace_connect import (
 from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     GetCapabilitiesRequest,
     GetCapabilitiesResponse,
-    ListDirectoryRequest,
-    ListDirectoryResponse,
-    ReadFileRequest,
-    ReadFileResponse,
 )
 from omnigent.host.frames import HostWorkspaceCallFrame, HostWorkspaceReplyFrame, encode_host_frame
+from omnigent.host.workspace_methods import WORKSPACE_METHODS, WorkspaceMethod
 from omnigent.server.host_registry import HostConnection, HostRegistry
 
 # Each reply must arrive within this; a whole ReadFile can take longer.
 _REPLY_TIMEOUT_S = 30.0
+# Served only while the workspace_content_search flag is on.
+_CONTENT_SEARCH_METHOD = "SearchText"
 
 
 @dataclass(frozen=True)
@@ -56,36 +55,35 @@ class HostTarget:
 class HostWorkspaceService(WorkspaceServiceMethods):
     """Implements ``WorkspaceService`` by forwarding each call to the session's host.
 
-    Methods it doesn't forward yet answer UNIMPLEMENTED.
+    Every method goes to the host, which answers UNIMPLEMENTED for those it
+    doesn't serve and lists the ones it does in GetCapabilities.
 
     :param target: The session's host, or the error every call answers with
         when the session can't be served this way.
+    :param content_search: Whether SearchText is served; when off, it is
+        UNIMPLEMENTED and GetCapabilities omits it.
     """
 
-    def __init__(self, target: HostTarget | ConnectError) -> None:
+    def __init__(self, target: HostTarget | ConnectError, *, content_search: bool) -> None:
         self._target = target
+        self._content_search = content_search
 
     async def get_capabilities(
         self,
         request: GetCapabilitiesRequest,
         _ctx: RequestContext[GetCapabilitiesRequest, GetCapabilitiesResponse],
     ) -> GetCapabilitiesResponse:
-        return GetCapabilitiesResponse.FromString(await self._unary("GetCapabilities", request))
+        response = GetCapabilitiesResponse.FromString(
+            await self._unary("GetCapabilities", request)
+        )
+        if not self._content_search and _CONTENT_SEARCH_METHOD in response.capabilities:
+            names = [name for name in response.capabilities if name != _CONTENT_SEARCH_METHOD]
+            response = GetCapabilitiesResponse(capabilities=names)
+        return response
 
-    async def list_directory(
-        self,
-        request: ListDirectoryRequest,
-        _ctx: RequestContext[ListDirectoryRequest, ListDirectoryResponse],
-    ) -> ListDirectoryResponse:
-        return ListDirectoryResponse.FromString(await self._unary("ListDirectory", request))
-
-    async def read_file(
-        self,
-        request: ReadFileRequest,
-        _ctx: RequestContext[ReadFileRequest, ReadFileResponse],
-    ) -> AsyncIterator[ReadFileResponse]:
-        async for message in self._forward("ReadFile", request):
-            yield ReadFileResponse.FromString(message)
+    def _check_served(self, method: WorkspaceMethod) -> None:
+        if method.name == _CONTENT_SEARCH_METHOD and not self._content_search:
+            raise ConnectError(Code.UNIMPLEMENTED, "Workspace content search is disabled")
 
     async def _unary(self, method: str, request: Message) -> bytes:
         messages = [message async for message in self._forward(method, request)]
@@ -125,6 +123,35 @@ class HostWorkspaceService(WorkspaceServiceMethods):
                     return
         finally:
             target.host.pending_workspace_calls.pop(request_id, None)
+
+
+def _host_forwarder(method: WorkspaceMethod) -> Callable[..., object]:
+    """A HostWorkspaceService method that forwards ``method`` to the host."""
+    if method.streaming:
+
+        async def forward_stream(
+            self: HostWorkspaceService, request: Message, _ctx: RequestContext
+        ) -> AsyncIterator[Message]:
+            self._check_served(method)
+            async for message in self._forward(method.name, request):
+                yield method.response_type.FromString(message)
+
+        forward_stream.__name__ = method.python_name
+        return forward_stream
+
+    async def forward(
+        self: HostWorkspaceService, request: Message, _ctx: RequestContext
+    ) -> Message:
+        self._check_served(method)
+        return method.response_type.FromString(await self._unary(method.name, request))
+
+    forward.__name__ = method.python_name
+    return forward
+
+
+for _method in WORKSPACE_METHODS.values():
+    if _method.name != "GetCapabilities":
+        setattr(HostWorkspaceService, _method.python_name, _host_forwarder(_method))
 
 
 def _code(value: str) -> Code:

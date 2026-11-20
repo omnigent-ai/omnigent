@@ -34,6 +34,7 @@ import { useSessionAgent } from "@/hooks/useAgents";
 import { useOpenSessionRow } from "@/hooks/useOpenSessionRow";
 import type { Session, SessionStatus } from "@/lib/types";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
+import { useFloatingComposerSupport } from "@/hooks/useFloatingComposerSupport";
 import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
 import { useCommandPaletteHotkey } from "@/hooks/useCommandPaletteHotkey";
 import { useHistoryNavigation } from "@/hooks/useHistoryNavigation";
@@ -48,6 +49,7 @@ import { useToggleUnreadHotkey } from "@/hooks/useToggleUnreadHotkey";
 import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
 import { isDesktopLayout, useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useIsSideBySideSidebarViewport } from "@/hooks/useIsSideBySideSidebarViewport";
+import { useReportLocalTimezone } from "@/hooks/useReportLocalTimezone";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
 import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
@@ -334,11 +336,16 @@ function AppShellImpl() {
   // Cmd/Ctrl+Enter accepts the pending harness approval prompt. Bound once
   // here so it works on every chat route, regardless of where focus sits.
   useApproveHotkey();
+  // On macOS desktop with floating_composer on, ⇧⌘Space opens the New Agent panel.
+  useFloatingComposerSupport();
 
   // Lock the iOS shell to the visual viewport so the soft keyboard can't pan
   // the whole document (which would hide the header and break the layout).
   // No-op off the iOS shell. Scoped here so auth pages keep normal scrolling.
   useIOSViewportLock();
+
+  // Report this browser's timezone for future agent-created automations.
+  useReportLocalTimezone();
 
   const desktopUpdates = useMemo(() => updateBridge(), []);
   const [updateOverlayHeight, setUpdateOverlayHeight] = useState(0);
@@ -609,7 +616,7 @@ function AppShellImpl() {
   const [filesPanelShowHidden, setFilesPanelShowHidden] = useState(true);
   // Lifted so the Changes list order and the FileViewer prev/next order
   // share one source of truth (otherwise the "X/N" index won't match the
-  // list position). Default "recent" mirrors the prior FilesPanel default.
+  // list position). It starts from the last choice, or the alphabetical default.
   const [filesPanelSort, setFilesPanelSort] = useState<ChangedSort>(
     () => readFilesPanelPreferences().sort,
   );

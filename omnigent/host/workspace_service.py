@@ -24,6 +24,8 @@ import shutil
 import socket
 import tempfile
 from collections.abc import AsyncIterator, Callable
+from contextlib import aclosing
+from dataclasses import dataclass
 from pathlib import Path
 from typing import ParamSpec, TypeVar
 
@@ -47,16 +49,39 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     FileMetadata,
     GetCapabilitiesRequest,
     GetCapabilitiesResponse,
+    ListBranchCommitsRequest,
+    ListBranchCommitsResponse,
     ListDirectoryRequest,
     ListDirectoryResponse,
+    ListRepositoryRefsRequest,
+    ListRepositoryRefsResponse,
+    ListWorkingCopyChangesRequest,
+    ListWorkingCopyChangesResponse,
+    ReadBaseFileRequest,
+    ReadBaseFileResponse,
     ReadFileRequest,
     ReadFileResponse,
+    ReadLinkTextRequest,
+    ReadLinkTextResponse,
+    ResolveRepositoryContextRequest,
+    ResolveRepositoryContextResponse,
+    ResolveWorkingCopyBaseRequest,
+    ResolveWorkingCopyBaseResponse,
+    SearchFilesRequest,
+    SearchFilesResponse,
+    SearchTextRequest,
+    SearchTextResponse,
+    StatPathRequest,
+    StatPathResponse,
 )
 from omnigent.host.frames import HostWorkspaceCallFrame, HostWorkspaceReplyFrame
+from omnigent.host.workspace_git import comparison, context, working_copy
+from omnigent.host.workspace_methods import WORKSPACE_METHODS
+from omnigent.host.workspace_search import search_files, search_text
 from omnigent.host.workspace_tokens import new_token_key, verify_token
 from omnigent.inner.async_utils import run_sync_on_thread
 from omnigent.util.uvicorn_server import NoSignalServer
-from omnigent.workspace_fs import WorkspaceReader, WorkspaceReaderError
+from omnigent.workspace_fs import ListedEntry, WorkspaceReader, WorkspaceReaderError
 
 _logger = logging.getLogger(__name__)
 
@@ -64,11 +89,53 @@ _logger = logging.getLogger(__name__)
 _MAX_PAGE_SIZE = 1000
 # Small enough to keep a stream responsive, large enough to keep framing cheap.
 _READ_CHUNK_BYTES = 64 * 1024
-_CAPABILITIES = ("ListDirectory", "ReadFile")
-_ERROR_CODES = {400: Code.INVALID_ARGUMENT, 404: Code.NOT_FOUND}
+_ERROR_CODES = {
+    400: Code.INVALID_ARGUMENT,
+    404: Code.NOT_FOUND,
+    412: Code.FAILED_PRECONDITION,
+}
 # A local socket bind; seconds means something is wrong, and the host goes on without it.
 _SOCKET_STARTUP_TIMEOUT_S = 5.0
 _SOCKET_SHUTDOWN_TIMEOUT_S = 2.0
+
+
+@dataclass(frozen=True)
+class _Served:
+    """How this host serves one method.
+
+    :param features: Optional features it offers, e.g. ``"search_files.substring"``.
+    :param tool: A program it needs on ``PATH``; without it, the method isn't listed.
+    """
+
+    features: tuple[str, ...] = ()
+    tool: str | None = None
+
+
+# The methods this host answers. Only these, and GetCapabilities, are dispatched.
+_SERVED: dict[str, _Served] = {
+    "ListDirectory": _Served(),
+    "ReadFile": _Served(),
+    "StatPath": _Served(),
+    "ReadLinkText": _Served(),
+    "SearchFiles": _Served(features=("search_files.substring",), tool="git"),
+    "SearchText": _Served(tool="rg"),
+    "ResolveWorkingCopyBase": _Served(features=("revision_comparison",), tool="git"),
+    "ListWorkingCopyChanges": _Served(tool="git"),
+    "ReadBaseFile": _Served(tool="git"),
+    "ListRepositoryRefs": _Served(tool="git"),
+    "ListBranchCommits": _Served(features=("branch_commits",), tool="git"),
+    "ResolveRepositoryContext": _Served(tool="git"),
+}
+
+
+def capabilities() -> list[str]:
+    """The method and feature names GetCapabilities lists on this host."""
+    names: list[str] = []
+    for name, served in _SERVED.items():
+        if served.tool is None or shutil.which(served.tool):
+            names += [name, *served.features]
+    return names
+
 
 # The context is ``None`` for calls that arrive over the host tunnel.
 ReaderForCall = Callable[[RequestContext | None], WorkspaceReader]
@@ -102,7 +169,7 @@ class WorkspaceService(WorkspaceServiceMethods):
         _request: GetCapabilitiesRequest,
         _ctx: RequestContext[GetCapabilitiesRequest, GetCapabilitiesResponse] | None,
     ) -> GetCapabilitiesResponse:
-        return GetCapabilitiesResponse(capabilities=_CAPABILITIES)
+        return GetCapabilitiesResponse(capabilities=capabilities())
 
     async def list_directory(
         self,
@@ -118,16 +185,9 @@ class WorkspaceService(WorkspaceServiceMethods):
             limit=min(request.page_size or _MAX_PAGE_SIZE, _MAX_PAGE_SIZE),
             after=request.page_token or None,
         )
-        entries = [
-            Entry(
-                name=item["name"],
-                path=item["path"],
-                type=ENTRY_TYPE_DIRECTORY if item["type"] == "directory" else ENTRY_TYPE_FILE,
-                size=item["bytes"],
-                modify_time=Timestamp(seconds=item["modified_at"]),
-            )
-            for item in page.data
-        ]
+        # The REST listing has no symlink flag, so look at each entry itself.
+        links = await _read(_symlinks, reader.root, [item["path"] for item in page.data])
+        entries = [_entry(item, is_symlink=item["path"] in links) for item in page.data]
         # The cursor is the last entry's id; the proto keeps it opaque.
         next_page_token = page.last_id if page.has_more and page.last_id else ""
         return ListDirectoryResponse(entries=entries, next_page_token=next_page_token)
@@ -152,6 +212,112 @@ class WorkspaceService(WorkspaceServiceMethods):
         for start in range(0, len(file.data), _READ_CHUNK_BYTES):
             yield ReadFileResponse(data=file.data[start : start + _READ_CHUNK_BYTES])
 
+    async def stat_path(
+        self,
+        request: StatPathRequest,
+        ctx: RequestContext[StatPathRequest, StatPathResponse] | None,
+    ) -> StatPathResponse:
+        reader = await _read(self._reader_for, ctx)
+        item, is_symlink = await _read(reader.stat_entry, request.path)
+        return StatPathResponse(entry=_entry(item, is_symlink=is_symlink))
+
+    async def resolve_working_copy_base(
+        self,
+        request: ResolveWorkingCopyBaseRequest,
+        ctx: RequestContext[ResolveWorkingCopyBaseRequest, ResolveWorkingCopyBaseResponse] | None,
+    ) -> ResolveWorkingCopyBaseResponse:
+        reader = await _read(self._reader_for, ctx)
+        return await working_copy.resolve_working_copy_base(reader.root, request)
+
+    async def list_working_copy_changes(
+        self,
+        request: ListWorkingCopyChangesRequest,
+        ctx: RequestContext[ListWorkingCopyChangesRequest, ListWorkingCopyChangesResponse] | None,
+    ) -> ListWorkingCopyChangesResponse:
+        reader = await _read(self._reader_for, ctx)
+        return await working_copy.list_working_copy_changes(reader.root, request)
+
+    async def read_base_file(
+        self,
+        request: ReadBaseFileRequest,
+        ctx: RequestContext[ReadBaseFileRequest, ReadBaseFileResponse] | None,
+    ) -> AsyncIterator[ReadBaseFileResponse]:
+        reader = await _read(self._reader_for, ctx)
+        async with aclosing(working_copy.read_base_file(reader.root, request)) as responses:
+            async for response in responses:
+                yield response
+
+    async def list_repository_refs(
+        self,
+        request: ListRepositoryRefsRequest,
+        ctx: RequestContext[ListRepositoryRefsRequest, ListRepositoryRefsResponse] | None,
+    ) -> ListRepositoryRefsResponse:
+        reader = await _read(self._reader_for, ctx)
+        return await comparison.list_repository_refs(reader.root, request)
+
+    async def list_branch_commits(
+        self,
+        request: ListBranchCommitsRequest,
+        ctx: RequestContext[ListBranchCommitsRequest, ListBranchCommitsResponse] | None,
+    ) -> ListBranchCommitsResponse:
+        reader = await _read(self._reader_for, ctx)
+        return await comparison.list_branch_commits(reader.root, request)
+
+    async def resolve_repository_context(
+        self,
+        request: ResolveRepositoryContextRequest,
+        ctx: RequestContext[ResolveRepositoryContextRequest, ResolveRepositoryContextResponse]
+        | None,
+    ) -> ResolveRepositoryContextResponse:
+        reader = await _read(self._reader_for, ctx)
+        return await context.resolve_repository_context(reader.root, request)
+
+    async def search_files(
+        self,
+        request: SearchFilesRequest,
+        ctx: RequestContext[SearchFilesRequest, SearchFilesResponse] | None,
+    ) -> SearchFilesResponse:
+        reader = await _read(self._reader_for, ctx)
+        return await search_files(reader.root, request)
+
+    async def search_text(
+        self,
+        request: SearchTextRequest,
+        ctx: RequestContext[SearchTextRequest, SearchTextResponse] | None,
+    ) -> AsyncIterator[SearchTextResponse]:
+        reader = await _read(self._reader_for, ctx)
+        # Closing this stream early must stop ripgrep, not leave it to the GC.
+        async with aclosing(search_text(reader.root, request)) as responses:
+            async for response in responses:
+                yield response
+
+    async def read_link_text(
+        self,
+        request: ReadLinkTextRequest,
+        ctx: RequestContext[ReadLinkTextRequest, ReadLinkTextResponse] | None,
+    ) -> ReadLinkTextResponse:
+        if not request.path:
+            raise ConnectError(Code.INVALID_ARGUMENT, "path is required")
+        reader = await _read(self._reader_for, ctx)
+        # The link may point anywhere; only its parent must be in the workspace.
+        return ReadLinkTextResponse(target=await _read(reader.read_link_text, request.path))
+
+
+def _entry(item: ListedEntry, *, is_symlink: bool) -> Entry:
+    return Entry(
+        name=item["name"],
+        path=item["path"],
+        type=ENTRY_TYPE_DIRECTORY if item["type"] == "directory" else ENTRY_TYPE_FILE,
+        size=item["bytes"],
+        modify_time=Timestamp(seconds=item["modified_at"]),
+        is_symlink=is_symlink,
+    )
+
+
+def _symlinks(root: Path, paths: list[str]) -> set[str]:
+    """The ``paths`` under ``root`` that are symlinks themselves."""
+    return {path for path in paths if (root / path).is_symlink()}
+
 
 def _reader_at(
     reader_for_workspace: Callable[[str], WorkspaceReader], workspace: str
@@ -164,16 +330,23 @@ def _reader_at(
 
 
 async def _call(service: WorkspaceService, method: str, request: bytes) -> AsyncIterator[Message]:
-    """Run one serialized call against ``service``, yielding its responses."""
-    if method == "GetCapabilities":
-        yield await service.get_capabilities(GetCapabilitiesRequest.FromString(request), None)
-    elif method == "ListDirectory":
-        yield await service.list_directory(ListDirectoryRequest.FromString(request), None)
-    elif method == "ReadFile":
-        async for response in service.read_file(ReadFileRequest.FromString(request), None):
-            yield response
-    else:
+    """Run one serialized call against ``service``, yielding its responses.
+
+    The handler comes from the method table, never from an attribute the
+    caller names, so only served methods can run.
+    """
+    if method != "GetCapabilities" and method not in _SERVED:
         raise ConnectError(Code.UNIMPLEMENTED, f"Unknown workspace method {method!r}")
+    served = WORKSPACE_METHODS[method]
+    handler = getattr(service, served.python_name)
+    parsed = served.request_type.FromString(request)
+    if not served.streaming:
+        yield await handler(parsed, None)
+        return
+    # Closing this call early must stop the stream's work, not leave it to the GC.
+    async with aclosing(handler(parsed, None)) as responses:
+        async for response in responses:
+            yield response
 
 
 async def serve_tunnel_call(

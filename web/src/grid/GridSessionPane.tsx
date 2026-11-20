@@ -1,3 +1,4 @@
+import { DEFAULT_FILES_PANEL_PREFERENCES } from "@/lib/filesPanelPreferences";
 import {
   useCallback,
   useContext,
@@ -250,7 +251,7 @@ export function GridSessionPane({
   const updateWorkspace = useCallback((patch: SessionWorkspaceState) => {
     setWorkspace((previous) => ({ ...previous, ...patch }));
   }, []);
-  const [sort, setSort] = useState<ChangedSort>("recent");
+  const [sort, setSort] = useState<ChangedSort>(DEFAULT_FILES_PANEL_PREFERENCES.sort);
   const [showHidden, setShowHidden] = useState(false);
   const [position, setPosition] = useState<FilePosition>();
   const navigationGuard = useRef<FileNavigationGuard | null>(null);

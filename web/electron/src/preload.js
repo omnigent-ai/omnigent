@@ -44,6 +44,11 @@ if (process.platform === "darwin") {
   });
 }
 
+/** A shortcut id for the shell to check; anything else names the default "show". */
+function shortcutId(id) {
+  return typeof id === "string" ? id : undefined;
+}
+
 // Collapse the update states the in-page UpdateBanner renders on
 // (available / downloading / downloaded / error-security) to `idle` so the server page can
 // never show a banner — that UI is shell-owned (the corner overlay). Kept here
@@ -188,25 +193,30 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
         startSystemDictation: () => ipcRenderer.invoke("omnigent:start-system-dictation"),
       }
     : {}),
-  /** The "Show Omnigent from anywhere" shortcut (off by default). */
-  getGlobalShortcut: () => ipcRenderer.invoke("omnigent:get-global-shortcut"),
+  /**
+   * A system-wide shortcut by id: "show" (Show Omnigent from anywhere, off by default, and
+   * the default id) or "floatingComposer" (the New Agent panel, macOS).
+   */
+  getGlobalShortcut: (id) => ipcRenderer.invoke("omnigent:get-global-shortcut", shortcutId(id)),
   /**
    * Saves `{ enabled, accelerator }`, or turns the shortcut off for `{ enabled: false }`,
    * keeping the saved chord. Resolves `{ ok, setting?, error? }`; `ok: false` means the
    * saved setting is unchanged.
    */
-  setGlobalShortcut: ({ enabled, accelerator } = {}) =>
+  setGlobalShortcut: ({ enabled, accelerator } = {}, id) =>
     ipcRenderer.invoke(
       "omnigent:set-global-shortcut",
       enabled !== true && accelerator === undefined
         ? { enabled: false }
         : { enabled: enabled === true, accelerator: String(accelerator ?? "") },
+      shortcutId(id),
     ),
   /**
    * Takes the next chord in the shell, before the page's shortcuts and the menu see it.
    * Resolves its accelerator, or null when Escape or the cancel call ends recording.
    */
-  recordGlobalShortcut: () => ipcRenderer.invoke("omnigent:record-global-shortcut"),
+  recordGlobalShortcut: (id) =>
+    ipcRenderer.invoke("omnigent:record-global-shortcut", shortcutId(id)),
   cancelGlobalShortcutRecording: () =>
     ipcRenderer.invoke("omnigent:cancel-global-shortcut-recording"),
   /** The runner picked during onboarding for this server ("local" |
@@ -578,22 +588,23 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   openBrowserDevTools: (conversationId) =>
     ipcRenderer.invoke("omnigent:open-browser-devtools", { conversationId }),
   /**
-   * Inspect the user's local Google Chrome profiles for cookies in the site
-   * tree the conversation's view is currently on. Metadata only (profile name +
-   * per-scope counts): no Keychain access and no cookie values. macOS only.
+   * Inspect the user's local Google Chrome profiles for cookies: in the site
+   * tree the conversation's view is currently on (`profiles`), and across every
+   * website (`allSitesProfiles`). Metadata only (profile name + counts): no
+   * Keychain access and no cookie values. macOS only.
    * @param {string} conversationId
-   * @returns {Promise<{ ok: boolean, host?: string, scopes?: string[], profiles?: Array<{ id: string, name: string, cookieCount: number, scopes?: Array<{ host: string, cookieCount: number }> }>, error?: string }>}
+   * @returns {Promise<{ ok: boolean, host?: string, scopes?: string[], profiles?: Array<{ id: string, name: string, cookieCount: number, scopes?: Array<{ host: string, cookieCount: number }> }>, allSitesProfiles?: Array<{ id: string, name: string, cookieCount: number }>, error?: string }>}
    */
   browserChromeCookiePreview: (conversationId) =>
     ipcRenderer.invoke("omnigent:browser-chrome-cookie-preview", { conversationId }),
   /**
-   * Copy ONLY that site's cookies out of one Chrome profile into the
-   * conversation's own (in-memory) session. Decrypts via the Keychain, so the
-   * first import shows a system approval prompt. `expectedHost` must still match
-   * the view's site.
+   * Copy one Chrome profile's cookies into the conversation's own (in-memory)
+   * session. Decrypts via the Keychain, so the first import shows a system
+   * approval prompt.
    * @param {string} conversationId
-   * `scope` is the site tree to copy (the page's host or a parent domain); main
-   * rejects anything that isn't an ancestor of the page.
+   * `scope` is `"*"` for every website, or the site tree to copy (the page's
+   * host or a parent domain); main rejects a site that isn't an ancestor of the
+   * page, and `expectedHost` must then still match the view's site.
    * @param {{ profileId: string, expectedHost: string, scope?: string }} args
    * @returns {Promise<{ ok: boolean, imported?: number, skipped?: number, failed?: number, error?: string }>}
    */

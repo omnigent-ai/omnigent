@@ -321,6 +321,19 @@ def _list_accounts(root: str) -> tuple[bool, list[dict[str, Any]]]:
     return rc == 0, []
 
 
+def _gh_signed_in_to_host(root: str, host: str) -> bool:
+    """Whether ``gh`` reports a login on ``host``.
+
+    Some setups sign ``gh`` in to an enterprise host only when a command names that host,
+    so a host missing from the global listing is asked about directly.
+    """
+    _, accounts = _list_accounts(root)
+    if host in {account.get("host") for account in accounts}:
+        return True
+    rc, _, _ = _gh(["auth", "status", "-h", host], cwd=root)
+    return rc == 0
+
+
 def _resolved_base_nwo(root: str) -> str | None:
     """Return the gh-resolved base repo ``owner/repo`` for the checkout, or ``None``.
 
@@ -983,6 +996,19 @@ def _pr_view_json(root: str, fields: str, *, token: str | None = None) -> dict[s
     return _gh_pr_view([str(number), "-R", base_repo], fields, cwd=root, token=token)
 
 
+def _repo_payload(name_with_owner: str | None, url: object) -> dict[str, Any]:
+    """The ``repo`` payload; ``host`` is omitted when ``url`` names none.
+
+    This provider also serves Enterprise hosts, so clients need the host to tell
+    a github.com repo from an Enterprise repo with the same name.
+    """
+    repo: dict[str, Any] = {"name_with_owner": name_with_owner}
+    host = host_of(url) if isinstance(url, str) else None
+    if host:
+        repo["host"] = host
+    return repo
+
+
 def _workspace_github_info(root: str) -> dict[str, Any]:
     """Resolve GitHub context for the workspace: repo, branch, base, and PR.
 
@@ -1061,19 +1087,23 @@ def _workspace_github_info(root: str) -> dict[str, Any]:
             payload["pr"]["labels"] = _shape_labels(data["labels"])
         payload["authenticated"] = True
         payload["base_ref"] = data.get("baseRefName")
-        payload["repo"] = {"name_with_owner": _owner_repo_from_pr_url(data.get("url"))}
+        payload["repo"] = _repo_payload(_owner_repo_from_pr_url(data.get("url")), data.get("url"))
+        if payload["repo"]["name_with_owner"]:
+            payload["workspace_repo"] = dict(payload["repo"])
         return payload
 
     # No PR. Probe repo reachability to tell "no PR yet" from "can't reach repo".
-    rc, out, _ = _gh(["repo", "view", "--json", "nameWithOwner"], cwd=root, token=token)
+    rc, out, _ = _gh(["repo", "view", "--json", "nameWithOwner,url"], cwd=root, token=token)
     if rc == 0:
         try:
-            nwo = json.loads(out).get("nameWithOwner")
+            view = json.loads(out)
+            nwo, url = view.get("nameWithOwner"), view.get("url")
         except (ValueError, AttributeError):
-            nwo = None
+            nwo = url = None
         if nwo:
             payload["authenticated"] = True
-            payload["repo"] = {"name_with_owner": nwo}
+            payload["repo"] = _repo_payload(nwo, url)
+            payload["workspace_repo"] = dict(payload["repo"])
             return payload  # -> no-pr
 
     # Repo unreachable / not signed in — enumerate accounts so the panel can offer
@@ -1108,10 +1138,8 @@ def _pr_token(root: str, reference: PullRequestRef) -> str | None:
 
 
 def _pr_json(root: str, reference: PullRequestRef, fields: str) -> dict[str, Any] | None:
-    if reference.host != "github.com":
-        _, accounts = _list_accounts(root)
-        if reference.host not in {account.get("host") for account in accounts}:
-            return None
+    if reference.host != "github.com" and not _gh_signed_in_to_host(root, reference.host):
+        return None
     return _gh_pr_view(
         [str(reference.number), "-R", _repo_argument(reference)],
         fields,
@@ -1137,7 +1165,7 @@ def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
         "gh_available": shutil.which("gh") is not None,
         "authenticated": False,
         "pr": None,
-        "repo": {"name_with_owner": reference.repository},
+        "repo": {"name_with_owner": reference.repository, "host": reference.host},
         "selected_pr_url": reference.url,
     }
     if not info["gh_available"]:
@@ -1795,10 +1823,8 @@ def _pr_compare(
 
 
 def _host_args(root: str, reference: PullRequestRef) -> list[str]:
-    if reference.host != "github.com":
-        _, accounts = _list_accounts(root)
-        if reference.host not in {account.get("host") for account in accounts}:
-            raise ValueError("Sign in to this GitHub host with gh before viewing its PRs")
+    if reference.host != "github.com" and not _gh_signed_in_to_host(root, reference.host):
+        raise ValueError("Sign in to this GitHub host with gh before viewing its PRs")
     return ["--hostname", reference.host]
 
 

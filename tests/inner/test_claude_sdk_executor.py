@@ -1842,7 +1842,8 @@ class TestResolveGatewayEnv(unittest.TestCase):
         Blanket-disabling betas makes Claude Code strip ``interleaved-thinking``,
         which the Databricks gateway then rejects with a thinking-block 400. On a
         genuine gateway we set ``CLAUDE_CODE_USE_GATEWAY`` and leave the disable
-        flag off (matching claude-native).
+        flag off (matching claude-native), switching off only the advisor tool the
+        gateway rejects.
         """
         from omnigent.inner.claude_sdk_executor import _resolve_gateway_env
         from omnigent.inner.databricks_executor import DatabricksCredentials
@@ -1859,6 +1860,7 @@ class TestResolveGatewayEnv(unittest.TestCase):
         ):
             env = _resolve_gateway_env()
         self.assertEqual(env["CLAUDE_CODE_USE_GATEWAY"], "1")
+        self.assertEqual(env["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"], "1")
         self.assertNotIn("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", env)
         self.assertEqual(
             env["ANTHROPIC_CUSTOM_HEADERS"].splitlines(),
@@ -1891,6 +1893,7 @@ class TestResolveGatewayEnv(unittest.TestCase):
             env = _resolve_gateway_env()
         self.assertEqual(env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"], "1")
         self.assertNotIn("CLAUDE_CODE_USE_GATEWAY", env)
+        self.assertNotIn("CLAUDE_CODE_DISABLE_ADVISOR_TOOL", env)
 
     def test_strips_trailing_slash(self):
         from omnigent.inner.claude_sdk_executor import _resolve_gateway_env
@@ -2004,6 +2007,7 @@ class TestResolveGatewayEnv(unittest.TestCase):
                 "Databricks-Custom-Client-Surfaces: omnigent-web",
             ],
         )
+        self.assertEqual(env["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"], "1")
 
     def test_host_override_requires_base_url(self):
         from omnigent.inner.claude_sdk_executor import _resolve_gateway_env
@@ -7987,7 +7991,13 @@ def _make_transport_with_process(returncode):
 
     class _Transport:
         def __init__(self):
-            self._process = SimpleNamespace(returncode=returncode, pid=4242, wait=AsyncMock())
+            self._process = SimpleNamespace(
+                returncode=returncode,
+                pid=None,
+                wait=AsyncMock(),
+                terminate=Mock(),
+                kill=Mock(),
+            )
             self._stdout_stream = None
             self._stdin_stream = None
             self._stderr_stream = None

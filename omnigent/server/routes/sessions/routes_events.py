@@ -75,6 +75,7 @@ from omnigent.runner.launch_failure import (
     diagnose_codex_compaction_model_failure,
     diagnose_codex_model_rejection,
     diagnose_codex_provider_auth_failure,
+    diagnose_content_policy_refusal,
     turn_error_display_message,
 )
 from omnigent.runner.routing import RunnerRouter, routing_host_id
@@ -266,6 +267,7 @@ from omnigent.server.routes._sessions.helpers import (
     require_filesystem_attachment_runtime,
 )
 from omnigent.server.routes._sessions.orchestration import (
+    _await_exit_report,
     _best_effort_stop,
     _cancel_runner_relays,
     _child_session_summaries_from_conversations,
@@ -2910,12 +2912,12 @@ def register_events_routes(
                 else:
                     error_code = "native_turn_error"
                 classified_code = classify_native_turn_error(error_code, output)
-                # The old-CLI refusal carries the versions, so the card can name the fix.
-                diagnosis = (
-                    diagnose_client_update_required(output)
-                    if classified_code == "client_update_required"
-                    else None
-                )
+                # Claude Code's refusal text identifies the cause, so the card can name the fix.
+                diagnosis = None
+                if classified_code == "client_update_required":
+                    diagnosis = diagnose_client_update_required(output)
+                elif classified_code == "content_policy_refusal":
+                    diagnosis = diagnose_content_policy_refusal(output)
                 if harness == "codex-native" and classified_code in {
                     "codex_turn_error",
                     "native_turn_error",
@@ -3876,6 +3878,9 @@ def register_events_routes(
             # runner is bound — item events can't, because that
             # would desync conversation store and harness state.
             if relaunched_runner_id:
+                # The wait can end on a dead status before the runner's exit report arrives.
+                if not relaunched_launch_refused:
+                    await _await_exit_report(relaunched_runner_id, runner_exit_reports)
                 # Name the failed phase to users and log a correlated ERROR.
                 exit_report = (
                     runner_exit_reports.get(relaunched_runner_id)
