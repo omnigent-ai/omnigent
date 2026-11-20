@@ -211,6 +211,26 @@ describe("QuickPickCommandPalette feature commands", () => {
     expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 
+  it("keeps matching sessions above a command named after the user's data", () => {
+    useConversations.mockReturnValue({
+      data: {
+        pages: [
+          { data: [{ id: "c3", title: "Parser rewrite", agent_name: null, archived: false }] },
+        ],
+      },
+      isFetching: false,
+    });
+    offer([command("Open Parser rewrite pull request", { leadsSources: false })]);
+    const { input } = renderPalette();
+    fireEvent.change(input, { target: { value: "parser rewrite" } });
+    const options = screen.getAllByRole("option").map((option) => option.textContent ?? "");
+    expect(options[0]).toContain("Parser rewrite");
+    expect(options[0]).not.toContain("pull request");
+    expect(options.some((option) => option.includes("Open Parser rewrite pull request"))).toBe(
+      true,
+    );
+  });
+
   it("runs a command that moves focus only once the palette has closed", async () => {
     const focusFilter = command("Filter files", { movesFocus: true });
     offer([focusFilter]);

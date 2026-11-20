@@ -32,6 +32,15 @@ describe("paletteCommandItems", () => {
     ]);
   });
 
+  it("passes on a command's opt-out from leading the sessions", () => {
+    const items = paletteCommandItems(
+      [command("open-pr", { leadsSources: false }), command("new-chat")],
+      {},
+      "t",
+    );
+    expect(items.map((item) => item.leadsSources)).toEqual([false, undefined]);
+  });
+
   it("drops a hidden command and greys out one with a reason", () => {
     const items = paletteCommandItems(
       [

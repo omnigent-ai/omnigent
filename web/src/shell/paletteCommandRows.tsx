@@ -43,6 +43,7 @@ export function paletteCommandItem(
     detail: setting ? currentChoiceLabel(setting) : undefined,
     opensPage: setting || command.options ? true : undefined,
     destructive: command.destructive,
+    leadsSources: command.leadsSources,
     keywords: command.keywords,
     group: feature?.heading,
     icon: <Icon aria-hidden />,

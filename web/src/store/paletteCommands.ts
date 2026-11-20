@@ -58,6 +58,11 @@ export interface PaletteCommand {
   availability?: CommandAvailability;
   /** Ends or removes something, styled as a menu's destructive item is. */
   destructive?: boolean;
+  /**
+   * False when the label names the user's data, such as a pull request's title, so a query
+   * matching that title keeps the matching sessions above the commands.
+   */
+  leadsSources?: boolean;
   /** A setting's row, built by `settingCommand`: accepting it opens its values. */
   setting?: PaletteSetting;
   /**
