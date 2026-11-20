@@ -263,16 +263,20 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
   // Tags whose tokens left the draft. They keep their tokens, so no other target is given
   // one while an undo could still bring it back; a reset forgets them.
   const releasedRef = useRef<TaggedMentions>(NO_TAGS);
+  // Spellings of released tags given up to literal text. They can't be reclaimed, but new tags still
+  // avoid them until a reset, so a spelling never names two targets in one draft.
+  const retiredTokensRef = useRef<readonly string[]>([]);
   // The latest tags, for callers that run outside a render (the file viewer's drain).
   const activeRef = useRef<TaggedMentions>({ files: mentionedItems, sessions: mentionedSessions });
   useLayoutEffect(() => {
     activeRef.current = { files: mentionedItems, sessions: mentionedSessions };
   });
 
-  // Every token a tag owns, active or released; new tags take none of them.
+  // Every token a tag owns, active, released or retired; new tags take none of them.
   const ownedMentionTokens = () => [
     ...tagTokens(activeRef.current),
     ...tagTokens(releasedRef.current),
+    ...retiredTokensRef.current,
   ];
 
   // Release tags whose last token was deleted (Backspace, cut, select-and-type).
@@ -333,7 +337,9 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     if (!isHistoryInput(event)) {
       // A released token is in no draft segment, so one in this text was typed or pasted by hand:
       // it's literal now, and no later undo or redo may turn it back into the old tag.
-      releasedRef.current = withoutTags(released, releasedWith(new Set(countAfter.keys())));
+      const literal = releasedWith(new Set(countAfter.keys()));
+      releasedRef.current = withoutTags(released, literal);
+      retiredTokensRef.current = [...retiredTokensRef.current, ...tagTokens(literal)];
       return;
     }
     const countBefore = tokenCounts(before, owned);
@@ -347,6 +353,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
 
   const resetMentions = (mentions?: TaggedMentions) => {
     releasedRef.current = NO_TAGS;
+    retiredTokensRef.current = [];
     setMentionedItems(mentions?.files ?? []);
     setMentionedSessions(mentions?.sessions ?? []);
   };

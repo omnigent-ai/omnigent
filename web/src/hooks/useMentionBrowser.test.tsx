@@ -251,6 +251,33 @@ describe("useMentionBrowser released tags", () => {
     expect(result.current.browser.mentionedSessions).toEqual([]);
   });
 
+  it("keeps a token retired once pasted as literal text, so undo can't restore another target", () => {
+    const { result } = renderBrowser();
+    tagReadme(result);
+    change(result, "Read  ", false);
+    // The released token pasted back by hand: it's literal now, and its tag is given up.
+    change(result, "Read @readme.md ", false);
+
+    // A session titled "readme.md" still can't take that spelling.
+    const readmeSession = { id: "sess_readme", title: "readme.md", isSubagent: false };
+    change(result, "Read @readme.md @read", false);
+    act(() => result.current.setMention({ query: "read", start: 16, end: 21 }));
+    act(() => result.current.browser.attachSession(readmeSession));
+    change(result, "Read @readme.md @readme.md (sess_r) ", false);
+    expect(result.current.browser.mentionedSessions).toEqual([
+      { ...readmeSession, token: "@readme.md (sess_r)" },
+    ]);
+
+    // Undo back past the completion, the paste and the deletion: the original stays literal.
+    change(result, "Read @readme.md @read", true);
+    change(result, "Read @readme.md ", true);
+    change(result, "Read  ", true);
+    change(result, "Read @readme.md ", true);
+    expect(result.current.browser.mentionedItems).toEqual([]);
+    expect(result.current.browser.mentionedSessions).toEqual([]);
+    expect(result.current.browser.mentionTokens).toEqual([]);
+  });
+
   it("keeps a deleted tag's token as literal text when it is typed again", () => {
     const { result } = renderBrowser();
     tagReadme(result);
