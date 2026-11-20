@@ -16,7 +16,7 @@ import yaml
 from omnigent.errors import OmnigentError
 from omnigent.inner import terminal as terminal_module
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-from omnigent.inner.sandbox import SandboxPolicy
+from omnigent.inner.sandbox import HarnessSandboxPreparationError, SandboxPolicy
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.runtime import workflow
 from omnigent.spec import load
@@ -393,7 +393,7 @@ def test_redirected_user_settings_source_is_rejected_before_launch(
         spec_version=1,
         executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
         os_env=OSEnvSpec(
-            cwd=str(tmp_path / "configured-workspace"),
+            cwd=str(tmp_path),
             sandbox=OSEnvSandboxSpec(type="linux_bwrap"),
         ),
     )
@@ -411,12 +411,15 @@ def test_redirected_user_settings_source_is_rejected_before_launch(
         monkeypatch.setattr(claude, "resolve_sandbox", lambda *_: policy)
         monkeypatch.setattr(claude, "get_backend", no_launch)
         monkeypatch.setattr(claude, "create_private_tmpdir", no_launch)
-        with pytest.raises(ValueError, match="sandbox-writable paths"):
+        with pytest.raises(
+            HarnessSandboxPreparationError, match="sandbox-writable paths"
+        ) as failure:
             claude.ClaudeSDKExecutor(
                 cwd=str(workspace),
                 os_env=spec.os_env,
                 bundle_dir=tmp_path / "bundle",
             )
+        assert isinstance(failure.value.__cause__, ValueError)
         no_launch.assert_not_called()
 
 
@@ -477,6 +480,9 @@ def test_user_settings_helper_cannot_select_saved_oauth_for_custom_gateway(
             lambda *_: SandboxPolicy("linux_bwrap", True, [], [], [], False),
         )
         monkeypatch.setattr(claude, "get_backend", no_launch)
-        with pytest.raises(ValueError, match="user settings apiKeyHelper"):
+        with pytest.raises(
+            HarnessSandboxPreparationError, match="user settings apiKeyHelper"
+        ) as failure:
             claude.ClaudeSDKExecutor(cwd=str(workspace), os_env=spec.os_env)
+        assert isinstance(failure.value.__cause__, ValueError)
         no_launch.assert_not_called()
