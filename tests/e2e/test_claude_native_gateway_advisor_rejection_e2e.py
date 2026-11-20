@@ -109,7 +109,6 @@ def _gateway_launch(
         "HOME": str(tmp_path),
         "CLAUDE_CONFIG_DIR": str(config_dir),
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-        "CLAUDE_CODE_USE_GATEWAY": "1",
         **gateway_env,
     }
     argv = [
