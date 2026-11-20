@@ -1103,3 +1103,32 @@ describe("ToolGroupSummary", () => {
     expect(screen.getByText("Ran 1 shell command, read 2 files")).toBeInTheDocument();
   });
 });
+
+describe("Antigravity ToolCard rendering", () => {
+  it("renders run_command in ShellTerminalPanel with Cwd and non-zero exit code", () => {
+    const { container } = renderCard({
+      name: "run_command",
+      arguments: { CommandLine: "pytest -q", Cwd: "/home/u/ws" },
+      output: "1 failed\n[exit code: 2]",
+      state: "output-available",
+    });
+    const trigger = container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!;
+    expect(trigger.textContent).toContain("pytest -q");
+    fireEvent.click(trigger);
+
+    const terminal = screen.getByTestId("shell-tool-terminal");
+    expect(terminal).toHaveTextContent("/home/u/ws");
+    expect(terminal).toHaveTextContent("1 failed");
+    expect(terminal).toHaveTextContent("exit 2");
+  });
+
+  it("links Antigravity file:// URIs to FileViewer as workspace-relative paths", () => {
+    const openFile = vi.fn();
+    renderFileToolCard(
+      { openFile, workspaceRoot: "/home/u/ws", workspaceHome: "/home/u" },
+      { name: "view_file", arguments: { absolutePathUri: "file:///home/u/ws/src/app.ts" } },
+    );
+    fireEvent.click(screen.getByRole("link", { name: "src/app.ts" }));
+    expect(openFile).toHaveBeenCalledWith("src/app.ts");
+  });
+});

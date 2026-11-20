@@ -27,7 +27,15 @@ import {
 } from "lucide-react";
 import { isShellTool, splitToolName, toolCallCategory } from "@/lib/toolTitle";
 
-const WEB_TOOLS = new Set(["web_search", "web_fetch", "web_read", "WebSearch", "WebFetch"]);
+const WEB_TOOLS = new Set([
+  "web_search",
+  "web_fetch",
+  "web_read",
+  "WebSearch",
+  "WebFetch",
+  "search_web",
+  "read_url_content",
+]);
 // Plan / todo-list tools across harnesses (Claude, Codex, Pi, OpenCode).
 const PLAN_TOOLS = new Set(["TodoWrite", "update_plan", "manage_todo_list", "todowrite"]);
 
@@ -54,7 +62,7 @@ export function iconForTool(fullName: string, nativeToolType?: string): LucideIc
   if (name === "sys_terminal_close") return Ban;
   if (name.startsWith("sys_terminal_")) return Terminal;
   if (name === "sys_session_close") return Ban;
-  if (name.startsWith("sys_session_")) return Bot;
+  if (name.startsWith("sys_session_") || name === "invoke_subagent") return Bot;
   if (name === "sys_call_async") return Send;
   if (name === "sys_read_inbox") return Inbox;
   if (name === "list_tasks") return ListTodo;
