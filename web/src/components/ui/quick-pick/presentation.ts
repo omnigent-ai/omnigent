@@ -106,15 +106,16 @@ function groupedRows<Value>(
   }
   const rows: QuickPickRow<Value>[] = [];
   for (const group of groupOrder) {
+    const heading = group === undefined ? undefined : headingRow(sourceId, group);
     const groupRows: QuickPickRow<Value>[] = [];
     for (const item of itemsByGroup.get(group) ?? []) {
       const row = rowsByItem.get(item);
       if (!row || seen.has(item.id)) continue;
       seen.add(item.id);
-      groupRows.push(row);
+      groupRows.push(heading ? { ...row, headingKey: heading.key } : row);
     }
     if (groupRows.length === 0) continue;
-    if (group !== undefined) rows.push(headingRow(sourceId, group));
+    if (heading) rows.push(heading);
     rows.push(...groupRows);
   }
   return rows;
@@ -214,14 +215,18 @@ function recentRows<Value>(
       segment.items.filter((item) => recency.has(item.id) && item.rememberInHistory !== false),
     )
     .sort((first, second) => (recency.get(first.id) ?? 0) - (recency.get(second.id) ?? 0));
+  const heading: QuickPickHeadingRow = {
+    kind: "heading",
+    key: "heading:recent",
+    label: RECENT_HEADING_LABEL,
+  };
   const rows: QuickPickRow<Value>[] = [];
   for (const item of recentItems) {
     if (seen.has(item.id)) continue;
     seen.add(item.id);
-    rows.push(itemRow(item));
+    rows.push({ ...itemRow(item), headingKey: heading.key });
   }
-  if (rows.length === 0) return rows;
-  return [{ kind: "heading", key: "heading:recent", label: RECENT_HEADING_LABEL }, ...rows];
+  return rows.length === 0 ? rows : [heading, ...rows];
 }
 
 /**
@@ -295,14 +300,14 @@ export interface QuickPickNavigationOptions {
  */
 function owningHeadings(rows: readonly QuickPickRow<unknown>[]): number[] {
   let heading = -1;
-  let label: string | undefined;
+  let key: string | undefined;
   return rows.map((row, index) => {
     if (row.kind === "heading") {
       heading = index;
-      label = row.label;
+      key = row.key;
       return index;
     }
-    if (heading !== -1 && row.item.group === label) return heading;
+    if (heading !== -1 && row.headingKey === key) return heading;
     heading = -1;
     return -1;
   });

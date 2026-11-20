@@ -59,6 +59,8 @@ export interface QuickPickItemRow<Value = unknown> {
   item: QuickPickItem<Value>;
   labelRanges: readonly MatchRange[];
   descriptionRanges: readonly MatchRange[];
+  /** The heading the row is listed under, absent for a row outside any group. */
+  headingKey?: string;
   /** True for the item made from the typed query. */
   isFreeText: boolean;
   /** The item's group, shown on the row when ranked rows from several groups interleave. */

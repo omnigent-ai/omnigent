@@ -16,8 +16,9 @@ import { CompactShortcutKeys } from "@/components/ui/kbd";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { cn } from "@/lib/utils";
 
+import { readQuickPickHistory, recordQuickPickHistory } from "./history";
 import { HighlightedText, type MatchHighlight } from "./HighlightedText";
-import type { QuickPickItem, QuickPickItemRow, QuickPickRow } from "./model";
+import type { QuickPickAcceptResult, QuickPickItem, QuickPickItemRow, QuickPickRow } from "./model";
 import {
   buildQuickPickRows,
   navigateQuickPick,
@@ -34,7 +35,9 @@ export interface QuickPickProps<Value> {
   segments: readonly QuickPickSegment<Value>[];
   query: string;
   onQueryChange: (query: string) => void;
-  onAccept: (item: QuickPickItem<Value>) => void;
+  onAccept: (item: QuickPickItem<Value>) => QuickPickAcceptResult;
+  /** Remembers accepted items under this namespace and lists them first while the query is empty. */
+  historyKey?: string;
   /** How rows' matched text stands out, unless a row sets its own. */
   matchHighlight?: MatchHighlight;
   /** Shown and announced when no row is listed, such as "No results found"; null shows nothing. */
@@ -73,6 +76,10 @@ export interface QuickPickProps<Value> {
 
 export type QuickPickPresentation = "default" | "sidebar";
 
+function readRecents(historyKey: string | undefined): string[] {
+  return historyKey ? readQuickPickHistory(historyKey) : [];
+}
+
 interface RowSection<Value> {
   heading?: { key: string; label: string };
   rows: { row: QuickPickItemRow<Value>; index: number }[];
@@ -88,7 +95,8 @@ function sectionsOf<Value>(rows: readonly QuickPickRow<Value>[]): RowSection<Val
       return;
     }
     const current = sections.at(-1);
-    const belongs = current && (current.heading?.label ?? undefined) === row.item.group;
+    // Consecutive ungrouped rows share one unnamed section, as a heading's rows share its.
+    const belongs = current !== undefined && (current.heading?.key ?? undefined) === row.headingKey;
     if (current && belongs) current.rows.push({ row, index });
     else sections.push({ rows: [{ row, index }] });
   });
@@ -136,6 +144,7 @@ export function QuickPick<Value>({
   query,
   onQueryChange,
   onAccept,
+  historyKey,
   matchHighlight = "emphasis",
   emptyMessage,
   status,
@@ -160,9 +169,14 @@ export function QuickPick<Value>({
   // no row is listed (or can be picked) while collapsed.
   const collapsed = sidebar && query.trim().length === 0;
 
+  // Recents are read again when the namespace changes, such as switching scopes,
+  // and after an accept that keeps the picker open.
+  const [history, setHistory] = useState(() => ({ key: historyKey, ids: readRecents(historyKey) }));
+  if (history.key !== historyKey) setHistory({ key: historyKey, ids: readRecents(historyKey) });
+  const recentIds = history.ids;
   const rows = useMemo(
-    () => (collapsed ? [] : buildQuickPickRows({ segments, query })),
-    [collapsed, segments, query],
+    () => (collapsed ? [] : buildQuickPickRows({ segments, query, recentIds })),
+    [collapsed, segments, query, recentIds],
   );
   const sections = useMemo(() => sectionsOf(rows), [rows]);
   const resultCount = rows.filter((row) => row.kind === "item").length;
@@ -227,7 +241,13 @@ export function QuickPick<Value>({
   };
 
   const accept = (row: QuickPickItemRow<Value>) => {
-    if (!row.item.disabledReason) onAccept(row.item);
+    if (row.item.disabledReason) return;
+    if (historyKey && !row.isFreeText && row.item.rememberInHistory !== false) {
+      recordQuickPickHistory(historyKey, row.item.id);
+    }
+    if (onAccept(row.item) === "keepOpen") {
+      setHistory({ key: historyKey, ids: readRecents(historyKey) });
+    }
   };
 
   const handleKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {

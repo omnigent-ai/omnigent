@@ -2,11 +2,15 @@ import { cleanup, fireEvent, render, screen, within } from "@testing-library/rea
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { readQuickPickHistory, recordQuickPickHistory } from "./history";
 import type { QuickPickItem } from "./model";
 import type { QuickPickSegment } from "./presentation";
 import { QuickPick, type QuickPickProps } from "./QuickPick";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  localStorage.clear();
+});
 
 function item(id: string, overrides: Partial<QuickPickItem<string>> = {}): QuickPickItem<string> {
   return { id, label: id, value: id, ...overrides };
@@ -327,6 +331,77 @@ describe("QuickPick accepting", () => {
     fireEvent.click(screen.getByRole("option", { name: /archive/ }));
     fireEvent.keyDown(input, { key: "Enter" });
     expect(onAccept).not.toHaveBeenCalled();
+  });
+});
+
+describe("QuickPick sections", () => {
+  it("keeps consecutive ungrouped rows in one section, apart from a group after them", () => {
+    renderPicker({
+      segments: [
+        {
+          sourceId: "results",
+          ranking: "client",
+          items: [item("one"), item("two"), item("three"), item("grouped", { group: "Actions" })],
+        },
+      ],
+    });
+    const sections = screen.getAllByRole("group");
+    expect(sections.map((section) => within(section).getAllByRole("option").length)).toEqual([
+      3, 1,
+    ]);
+  });
+});
+
+describe("QuickPick history", () => {
+  it("records accepted items and lists them first next time", () => {
+    const { input, onAccept } = renderPicker({ historyKey: "commands" });
+    fireEvent.keyDown(input, { key: "End" });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onAccept).toHaveBeenCalled();
+    expect(readQuickPickHistory("commands")).toEqual(["open-settings"]);
+    cleanup();
+
+    const next = renderPicker({ historyKey: "commands" });
+    const recent = screen.getByRole("group", { name: "Recent" });
+    expect(
+      within(recent)
+        .getAllByRole("option")
+        .map((option) => option.textContent),
+    ).toEqual(["Open settings"]);
+    expect(activeOption(next.input)).toHaveTextContent("Open settings");
+  });
+
+  it("reads recents again when the namespace changes", () => {
+    recordQuickPickHistory("commands", "open-settings");
+    recordQuickPickHistory("sessions", "new-session");
+    const { input, rerender } = renderPicker({ historyKey: "commands" });
+    expect(activeOption(input)).toHaveTextContent("Open settings");
+    rerender(<Harness historyKey="sessions" />);
+    expect(activeOption(input)).toHaveTextContent("New session");
+  });
+
+  it("refreshes recents after an accept that keeps the picker open", () => {
+    const { input } = renderPicker({ historyKey: "commands", onAccept: () => "keepOpen" });
+    expect(screen.queryByRole("group", { name: "Recent" })).not.toBeInTheDocument();
+    fireEvent.keyDown(input, { key: "End" });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(screen.getByRole("group", { name: "Recent" })).toBeVisible();
+    expect(activeOption(input)).toHaveTextContent("Open settings");
+  });
+
+  it("does not remember an item that opts out", () => {
+    const { input } = renderPicker({
+      historyKey: "commands",
+      segments: [{ ...commands, items: [item("once", { rememberInHistory: false })] }],
+    });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(readQuickPickHistory("commands")).toEqual([]);
+  });
+
+  it("ignores history for items that no longer exist", () => {
+    recordQuickPickHistory("commands", "removed");
+    renderPicker({ historyKey: "commands" });
+    expect(screen.queryByRole("group", { name: "Recent" })).not.toBeInTheDocument();
   });
 });
 

@@ -256,6 +256,16 @@ describe("buildQuickPickRows with recents", () => {
     ]);
   });
 
+  it("moves from the Recent group to the next group with the group keys", () => {
+    const rows = buildQuickPickRows({
+      segments: [{ sourceId: "commands", ranking: "client", items: commands }],
+      query: "",
+      recentIds: ["open-settings", "new-session"],
+    });
+    const next = navigateQuickPick(rows, 1, { type: "nextGroup" });
+    expect(rows[next]?.kind === "item" && rows[next].item.id).toBe("archive-session");
+  });
+
   it("does not list items excluded from history as recents", () => {
     const rows = buildQuickPickRows({
       segments: [
