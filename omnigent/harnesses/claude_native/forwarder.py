@@ -170,11 +170,9 @@ _DEFAULT_POLL_INTERVAL_S = 0.25
 _TRANSCRIPT_DISCOVERY_WARNING_S = 30.0
 _TRANSCRIPT_DISCOVERY_ERROR_S = 180.0
 _OBSERVER_HOOK_STDERR_READ_BYTES = 64 * 1024
-# Minimum spacing between pane reads. One ``tmux capture-pane`` subprocess per
-# window feeds every pane-derived signal (permission mode, /btw overlay, API
-# retry row), so the cost is one subprocess regardless of how many signals are
-# parsed. They change on a human action or a retry backoff, so 2s of lag is
-# imperceptible and keeps the subprocess rate low.
+# Minimum spacing between pane reads. One ``tmux capture-pane`` per window feeds
+# every pane-derived signal; they change on a human action or a retry backoff,
+# so 2s of lag is imperceptible and keeps the subprocess rate low.
 _PANE_POLL_INTERVAL_S = 2.0
 # Claude Code names a retried request's status only from attempt 3 (or its last),
 # after its own credential refreshes, so a 401/403 there outlived a refresh.
@@ -1022,10 +1020,11 @@ class _ForwardDedupeState:
     # partial answer.
     btw_pending_key: str | None = None
     posted_btw_keys: dict[str, None] = field(default_factory=dict)
-    # The visible API retry already reported as failed / interrupted; both
-    # clear once the retry row leaves the pane.
+    # The visible API retry already reported as failed / interrupted, and its
+    # turn; they clear once the retry row leaves the pane or another turn starts.
     api_retry_reported: bool = False
     api_retry_interrupted: bool = False
+    api_retry_response_id: str | None = None
     # Session already logged as moved off this runner, so the notice is not
     # repeated for every item dropped afterwards.
     session_not_bound_logged_for: str | None = None
@@ -1767,10 +1766,7 @@ async def forward_claude_transcript_to_session(
                             bridge_dir=bridge_dir,
                             dedupe=dedupe,
                         )
-                        # Pane-derived signals (permission mode, /btw overlay, API
-                        # retry row) emit no event and live only in the rendered
-                        # pane. One throttled capture feeds them all, so none of
-                        # them spawns its own capture-pane subprocess.
+                        # Pane-only signals share one throttled capture.
                         await _forward_pane_signals(
                             client=client,
                             session_id=current_session_id,
@@ -6548,9 +6544,15 @@ async def _stop_rejected_api_retry(
     :param response_id: Active turn's response id, or ``None`` when unknown.
     :param dedupe: Shared per-session dedupe state; mutated in place.
     """
-    if retry is None:
+    # A prompt sent soon after an interrupt can retry before any capture shows no row.
+    if retry is None or (
+        dedupe.api_retry_response_id is not None
+        and response_id not in (None, dedupe.api_retry_response_id)
+    ):
         dedupe.api_retry_reported = False
         dedupe.api_retry_interrupted = False
+        dedupe.api_retry_response_id = None
+    if retry is None:
         return
     if retry.status not in _REJECTED_API_RETRY_STATUSES or dedupe.api_retry_interrupted:
         return
@@ -6588,6 +6590,7 @@ async def _stop_rejected_api_retry(
             )
             return
         dedupe.api_retry_reported = True
+        dedupe.api_retry_response_id = response_id
     try:
         await asyncio.to_thread(inject_interrupt, bridge_dir, timeout_s=1.0)
     except RuntimeError:
