@@ -242,7 +242,9 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
         onBlurCapture?.(event);
       }}
     >
-      {appearance === "glass" && <OmniGlassSurface borderRadius={20} className="-z-10" />}
+      {appearance === "glass" && (
+        <OmniGlassSurface variant="composer" borderRadius={20} className="-z-10" />
+      )}
       {slots?.beforeInput}
       <ComposerInputArea
         data-composer-input-area
