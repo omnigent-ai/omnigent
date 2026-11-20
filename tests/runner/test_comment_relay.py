@@ -2215,6 +2215,8 @@ async def test_cli_caller_settings_finalize_under_terminal_policy(
 async def test_cli_settings_request_ownership_survives_admission_and_terminal_lifecycle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str, terminal_registry_singleton
 ) -> None:
+    from types import SimpleNamespace
+
     from omnigent.harnesses.claude_native import settings_validation
     from omnigent.harnesses.claude_native.main import _claude_terminal_request
     from omnigent.harnesses.claude_native.settings_generation import (
@@ -2223,6 +2225,7 @@ async def test_cli_settings_request_ownership_survives_admission_and_terminal_li
         request_claude_bridge_deletion,
         settings_generation_path,
     )
+    from omnigent.inner import terminal as terminal_module
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.inner.terminal import TerminalInstance
     from omnigent.terminals import TerminalRegistry
@@ -2304,11 +2307,26 @@ async def test_cli_settings_request_ownership_survives_admission_and_terminal_li
         spec.terminals = {body["terminal"]: TerminalEnvSpec(command="bash", args=["-l"])}
     launched = []
     prepared = []
+    launch_terminal = TerminalInstance.launch
 
     async def spawn(instance, *, cwd=None):
+        await launch_terminal(instance, cwd=cwd)
         launched.append(instance)
-        instance.running = True
 
+    monkeypatch.setattr(
+        terminal_module,
+        "asyncio",
+        SimpleNamespace(
+            **{
+                **vars(asyncio),
+                "create_subprocess_exec": AsyncMock(
+                    return_value=SimpleNamespace(
+                        returncode=0, communicate=AsyncMock(return_value=(b"", b""))
+                    )
+                ),
+            }
+        ),
+    )
     monkeypatch.setattr(TerminalInstance, "launch", spawn)
     monkeypatch.setattr(TerminalInstance, "is_alive", AsyncMock(return_value=True))
     monkeypatch.setattr(TerminalInstance, "_tmux", AsyncMock(return_value=""))
