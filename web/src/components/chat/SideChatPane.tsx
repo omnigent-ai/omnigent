@@ -1105,6 +1105,8 @@ function SideChatComposer({
     setText,
     textareaRef,
     isMobile,
+    // A tag's token in the tail or a reply quote keeps the tag, as the shared draft does.
+    segments: [text, ...(composer?.quotes ?? []).map((reply) => reply.before)],
     tags: gridCell
       ? {
           mentions: sessionMentions ?? NO_TAGGED_MENTIONS,

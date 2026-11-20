@@ -3357,6 +3357,30 @@ describe("grid cell @-mention picker", () => {
     expect(getSessionDraft(childId)?.mentions).toBeUndefined();
   });
 
+  it("⌘Z brings back a Backspaced file tag after the draft prunes it, so the file attaches on send", () => {
+    mountCell();
+    typeText("@read");
+    fireEvent.click(screen.getByTitle("Attach readme.md"));
+    input().setSelectionRange(10, 10);
+    fireEvent.keyDown(input(), { key: "Backspace" });
+    expect(getSessionDraft(childId)?.mentions).toBeUndefined();
+
+    fireEvent.input(input(), {
+      target: { value: "@readme.md " },
+      inputType: "historyUndo",
+    });
+    expect(input()).toHaveValue("@readme.md ");
+    expect(getSessionDraft(childId)?.mentions).toEqual({ files: [readmeTag], sessions: [] });
+
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    expect(send).toHaveBeenCalledExactlyOnceWith(
+      "[Attached file: readme.md]",
+      "agent_side",
+      undefined,
+      { pinnedConversationId: childId },
+    );
+  });
+
   it("Shift+Tab with the picker open steps the permission mode and keeps the token", () => {
     const cyclePermissionMode = vi.fn(() => true);
     mountCell({ cyclePermissionMode });

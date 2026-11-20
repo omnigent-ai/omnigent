@@ -46,6 +46,7 @@ export function insertComposerText(
 /** Move the selection away and back, which ends the browser's open typing undo group. */
 function breakTypingGroup(textarea: HTMLTextAreaElement) {
   const { selectionStart, selectionEnd, selectionDirection } = textarea;
+  // shortcut: an empty field can't move the caret, so its typing group stays open; upgrade with a focus-free break.
   const elsewhere = selectionEnd === 0 ? Math.min(1, textarea.value.length) : 0;
   textarea.setSelectionRange(elsewhere, elsewhere);
   textarea.setSelectionRange(selectionStart, selectionEnd, selectionDirection ?? undefined);

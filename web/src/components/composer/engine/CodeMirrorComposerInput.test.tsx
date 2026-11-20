@@ -192,18 +192,21 @@ describe("CodeMirrorComposerInput", () => {
 });
 
 describe("CodeMirrorComposerInput change events", () => {
-  it("makes a programmatic insert, separateUndo or not, its own undo step apart from typing", () => {
-    const { content, target } = mount({ value: "" });
-    const editor = EditorView.findFromDOM(content)!;
-    act(
-      () =>
-        void editor.dispatch({ changes: { from: 0, insert: "typed" }, userEvent: "input.type" }),
-    );
-    act(() => insertComposerText(target(), " inserted", 5, 5, { separateUndo: true }));
-    expect(target().value).toBe("typed inserted");
-    act(() => void undo(editor));
-    expect(target().value).toBe("typed");
-  });
+  it.each([undefined, { separateUndo: true }])(
+    "makes a programmatic insert (%o) its own undo step apart from typing",
+    (options) => {
+      const { content, target } = mount({ value: "" });
+      const editor = EditorView.findFromDOM(content)!;
+      act(
+        () =>
+          void editor.dispatch({ changes: { from: 0, insert: "typed" }, userEvent: "input.type" }),
+      );
+      act(() => insertComposerText(target(), " inserted", 5, 5, options));
+      expect(target().value).toBe("typed inserted");
+      act(() => void undo(editor));
+      expect(target().value).toBe("typed");
+    },
+  );
 
   it("says when an undo or redo made the change", () => {
     const onChange = vi.fn((event: ComposerInputEvent) => isHistoryInput(event));
