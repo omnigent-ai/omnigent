@@ -367,12 +367,35 @@ export function hasOpenCodeFence(text: string): boolean {
 
 const StreamingTextContext = createContext(false);
 
+const MessageMarkdownContext = createContext("");
+
+/** Whether the markdown being rendered is still streaming in. */
+export function useIsStreamingText(): boolean {
+  return useContext(StreamingTextContext);
+}
+
+/** The markdown source of the message being rendered, which can be ahead of its rendered blocks. */
+export function useMessageMarkdown(): string {
+  return useContext(MessageMarkdownContext);
+}
+
+const BlockMarkdownContext = createContext("");
+
+/** The markdown of the block being rendered, which can lag the message's markdown. */
+export function useBlockMarkdown(): string {
+  return useContext(BlockMarkdownContext);
+}
+
 // Streamdown marks a block's open fence only while `isAnimating`, which also
 // disables its copy and download buttons, so mark it here for streaming text.
 function StreamingTextBlock(props: BlockProps) {
   const isStreaming = useContext(StreamingTextContext);
   const isIncomplete = props.isIncomplete || (isStreaming && hasOpenCodeFence(props.content));
-  return <Block {...props} isIncomplete={isIncomplete} />;
+  return (
+    <BlockMarkdownContext.Provider value={props.content}>
+      <Block {...props} isIncomplete={isIncomplete} />
+    </BlockMarkdownContext.Provider>
+  );
 }
 
 function getChatCodeControls(controls: StreamdownProps["controls"]): StreamdownProps["controls"] {
@@ -784,6 +807,7 @@ export const MessageResponse = memo(
       [components],
     );
 
+    const messageMarkdown = typeof props.children === "string" ? props.children : "";
     const messageControls = useMemo(() => getChatCodeControls(controls), [controls]);
     const mermaidOptions = useMemo(() => mermaidOptionsForTheme(themeMode), [themeMode]);
     let rehypePlugins = SECURE_STREAMDOWN_REHYPE_PLUGINS;
@@ -797,27 +821,28 @@ export const MessageResponse = memo(
         <ShellCommandContext.Provider value={shellAction}>
           <LocalReviewCommentRendererContext.Provider value={renderLocalReviewComment}>
             <StreamingTextContext.Provider value={isStreaming}>
-              {/* Streamdown is memoized and its comparator ignores the mermaid prop,
-              so remount on theme change to recolor already-rendered diagrams. */}
-              <Streamdown
-                key={themeMode}
-                // wrap-anywhere is inherited, giving every prose descendant (including inline code) a break opportunity.
-                className={cn(
-                  "message-markdown size-full wrap-anywhere [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
-                  className,
-                )}
-                plugins={STREAMDOWN_PLUGINS}
-                // Let links open on a plain click (and cmd/ctrl-click in a new tab)
-                // instead of Streamdown's default "Open external link?" modal.
-                linkSafety={CHAT_LINK_SAFETY}
-                {...props}
-                BlockComponent={StreamingTextBlock}
-                components={messageComponents}
-                controls={messageControls}
-                mermaid={mermaidOptions}
-                // Block remote image fetches that can exfiltrate data through URLs.
-                rehypePlugins={rehypePlugins}
-              />
+              <MessageMarkdownContext.Provider value={messageMarkdown}>
+                {/* Remount on theme change: Streamdown's memo ignores the mermaid prop. */}
+                <Streamdown
+                  key={themeMode}
+                  // wrap-anywhere is inherited, giving every prose descendant (including inline code) a break opportunity.
+                  className={cn(
+                    "message-markdown size-full wrap-anywhere [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
+                    className,
+                  )}
+                  plugins={STREAMDOWN_PLUGINS}
+                  // Let links open on a plain click (and cmd/ctrl-click in a new tab)
+                  // instead of Streamdown's default "Open external link?" modal.
+                  linkSafety={CHAT_LINK_SAFETY}
+                  {...props}
+                  BlockComponent={StreamingTextBlock}
+                  components={messageComponents}
+                  controls={messageControls}
+                  mermaid={mermaidOptions}
+                  // Block remote image fetches that can exfiltrate data through URLs.
+                  rehypePlugins={rehypePlugins}
+                />
+              </MessageMarkdownContext.Provider>
             </StreamingTextContext.Provider>
           </LocalReviewCommentRendererContext.Provider>
         </ShellCommandContext.Provider>

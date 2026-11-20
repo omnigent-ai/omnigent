@@ -18,6 +18,13 @@ MCP independent creation.
   the prefix. The title comes from sessions the sidebar, the viewed session's
   subagents or the session cache already hold, else one lookup; an unreadable
   sender reads "From another session". The prefix is a label, not proof of origin.
+- `session-id-pills`: a 32-character session ID in a chat message's prose or
+  inline code shows as an "@<title>" session pill (hover shows the ID) that opens
+  that session in the same tab or desktop window. It uses the same title lookup;
+  an ID naming no readable session stays as written. IDs in code blocks, links,
+  paths and URLs are left alone. Covered by
+  `web/src/components/blocks/ChatMarkdown.sessionIdReferences.test.tsx` and
+  `web/src/lib/sessionIdReferences.test.ts`.
 - `read-results`: the manager reads history/status; replies are not forwarded.
   Existing owner-authorized reads remain allowed when a session is shared.
 - `created-by`: independent workers record their creating session. The worker's
@@ -189,6 +196,8 @@ MCP independent creation.
   coverage: `tests/browser_ui/chat/test_nested_agent_workspace.py` (desktop/mobile,
   mocked backend); default and explicit worktree payloads:
   `web/src/shell/NewChatDialog.flow.test.tsx`.
+- Ask a manager which worker needs attention; when its reply names the worker by
+  session ID, click the "@<title>" pill to open the worker's Chat.
 - Open an independent worker in Chat or Terminal and follow its "Created by"
   link. On mobile web, the same link is in the header. Ask the manager to list
   its sessions and match `created_by_session_id` to its own session ID.

@@ -44,6 +44,7 @@ export function useSessionLabel(
     // An unreadable sender stays "another session" for the tab, not one lookup per bubble.
     retry: false,
     retryOnMount: false,
+    refetchOnReconnect: false,
   });
   if (row) return { title: row.title || "Untitled session", isSubagent: !!row.parent_session_id };
   if (child) return { title: childPrimaryLabel(child), isSubagent: true };

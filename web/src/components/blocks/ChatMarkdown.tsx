@@ -26,7 +26,12 @@ import { toast } from "sonner";
 import { defaultRemarkPlugins } from "streamdown";
 import remarkBreaks from "remark-breaks";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
-import { MessageResponse } from "@/components/ai-elements/message";
+import {
+  MessageResponse,
+  useBlockMarkdown,
+  useIsStreamingText,
+  useMessageMarkdown,
+} from "@/components/ai-elements/message";
 import {
   sameServerSessionPath,
   shortFileCitationLabel,
@@ -51,6 +56,14 @@ import { absoluteWorkspacePath } from "@/lib/composerContext";
 import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
 import { cn } from "@/lib/utils";
 import { parseMentionPillTitle } from "@/lib/mentionPills";
+import {
+  SESSION_ID_REFERENCE_HREF,
+  parseSessionIdReferenceTitle,
+  remarkSessionIdReferences,
+  sessionIdMayStillGrow,
+  type SessionIdReferenceTarget,
+} from "@/lib/sessionIdReferences";
+import { useSessionLabel } from "@/hooks/useSessionLabel";
 import {
   useFileViewer,
   useFileViewerConversationId,
@@ -611,6 +624,11 @@ function FileMentionPill({
 
 /** Links rendered as mention pills when their title carries the mention sentinel. */
 function MarkdownLink(props: WithHastNode<React.ComponentPropsWithoutRef<"a">>) {
+  const reference =
+    props.href === SESSION_ID_REFERENCE_HREF ? parseSessionIdReferenceTitle(props.title) : null;
+  if (reference) {
+    return <SessionIdReference {...reference}>{props.children}</SessionIdReference>;
+  }
   const target = parseMentionPillTitle(props.title);
   if (!target) return <WorkspaceFileLink {...props} />;
   if (target.kind === "file") {
@@ -627,9 +645,31 @@ function MarkdownLink(props: WithHastNode<React.ComponentPropsWithoutRef<"a">>) 
   );
 }
 
+/** A bare session id as a titled pill, or as written if it names no readable session. */
+function SessionIdReference({
+  id,
+  trailing,
+  children,
+}: SessionIdReferenceTarget & { children: React.ReactNode }) {
+  // An id that ends a block may be the start of a longer token that is still streaming in.
+  const markdown = useMessageMarkdown();
+  const streaming = useIsStreamingText();
+  const block = useBlockMarkdown();
+  const pending = trailing && sessionIdMayStillGrow(markdown, block, id, streaming);
+  const label = useSessionLabel(pending ? null : id, useFileViewerConversationId() ?? null);
+  if (!label) return children;
+  return (
+    <SessionMentionPill id={id} isSubagent={label.isSubagent} tooltip={`Session ${id}`}>
+      @{label.title}
+    </SessionMentionPill>
+  );
+}
+
 interface SessionMentionPillProps {
   id: string;
   isSubagent: boolean;
+  /** Hover text; defaults to the session's kind. */
+  tooltip?: string;
   children: React.ReactNode;
 }
 
@@ -645,13 +685,13 @@ export function SessionMentionPill(props: SessionMentionPillProps) {
 
 // The routing seam's Link rebases the href under an embed's mount, routes plain
 // clicks in-app and leaves modified clicks (new tab) to the browser.
-function RoutedSessionMentionPill({ id, isSubagent, children }: SessionMentionPillProps) {
+function RoutedSessionMentionPill({ id, isSubagent, tooltip, children }: SessionMentionPillProps) {
   return (
     <Link
       to={`/c/${encodeURIComponent(id)}`}
       data-testid="mention-pill"
       className={MENTION_PILL_CLASS}
-      title={isSubagent ? "Subagent" : "Session"}
+      title={tooltip ?? (isSubagent ? "Subagent" : "Session")}
       onClick={(event) => event.stopPropagation()}
     >
       <SessionPillContent isSubagent={isSubagent}>{children}</SessionPillContent>
@@ -659,13 +699,13 @@ function RoutedSessionMentionPill({ id, isSubagent, children }: SessionMentionPi
   );
 }
 
-function SessionPillLink({ id, isSubagent, children }: SessionMentionPillProps) {
+function SessionPillLink({ id, isSubagent, tooltip, children }: SessionMentionPillProps) {
   return (
     <a
       data-testid="mention-pill"
       href={withBasePath(`/c/${encodeURIComponent(id)}`)}
       className={MENTION_PILL_CLASS}
-      title={isSubagent ? "Subagent" : "Session"}
+      title={tooltip ?? (isSubagent ? "Subagent" : "Session")}
       onClick={(event) => event.stopPropagation()}
     >
       <SessionPillContent isSubagent={isSubagent}>{children}</SessionPillContent>
@@ -816,17 +856,14 @@ export function FilePathAwareMessageResponse({
 }: React.ComponentProps<typeof MessageResponse> & { breaks?: boolean; literalHtml?: boolean }) {
   const components = FILE_PATH_AWARE_COMPONENTS;
 
-  // Extend (don't replace) Streamdown's defaults so remark-gfm survives. With
-  // neither option set we pass `undefined` so Streamdown uses its defaults unchanged.
+  // Extend (don't replace) Streamdown's defaults so remark-gfm survives.
   const remarkPlugins = useMemo(
-    () =>
-      breaks || literalHtml
-        ? [
-            ...Object.values(defaultRemarkPlugins),
-            ...(literalHtml ? [remarkHtmlAsText] : []),
-            ...(breaks ? [remarkBreaks] : []),
-          ]
-        : undefined,
+    () => [
+      ...Object.values(defaultRemarkPlugins),
+      ...(literalHtml ? [remarkHtmlAsText] : []),
+      remarkSessionIdReferences,
+      ...(breaks ? [remarkBreaks] : []),
+    ],
     [breaks, literalHtml],
   );
 
