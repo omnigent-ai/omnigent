@@ -400,6 +400,18 @@ describe("Floating composer route", () => {
     expect(screen.queryByText("floating composer page")).toBeNull();
   });
 
+  it("shows only a quiet background while the panel's server info loads", () => {
+    (window as { omnigentDesktop?: unknown }).omnigentDesktop = { kind: "electron" };
+    renderRoute("/compose/floating", {}, "loading");
+    expect(screen.getByRole("status")).toHaveClass("bg-background");
+    expect(screen.queryByLabelText("Loading")).toBeNull();
+    cleanup();
+
+    // Other gated pages keep their spinner.
+    renderRoute("/workflows", {}, "loading");
+    expect(screen.getByLabelText("Loading")).toBeInTheDocument();
+  });
+
   it("renders the panel page in the desktop app with the flag on, outside the shell", async () => {
     (window as { omnigentDesktop?: unknown }).omnigentDesktop = { kind: "electron" };
     renderRoute("/compose/floating", { floating_composer: true });

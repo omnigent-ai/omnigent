@@ -12,6 +12,11 @@ off by default.
 - `open`: ⇧⌘Space from any app shows the panel on the pointer's display without
   activating Omnigent; pressing it again while the panel is up focuses it rather
   than hiding it.
+- `preload`: a few seconds after an Omnigent window can open the panel, the app
+  builds it out of sight, so the first ⇧⌘Space shows a composer that's already
+  loaded. The panel comes on screen only once its page has rendered, never with a
+  loading overlay or splash. A panel built ahead and never opened is let go when no
+  window of its server can open it any more.
 - `dismiss`: Escape, the panel's Close button and ⌘W hide it, and so does
   focusing an Omnigent window, except while the panel's file picker is open.
   The draft, attachments and choices survive until the next open.

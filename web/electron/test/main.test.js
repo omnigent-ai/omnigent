@@ -438,8 +438,9 @@ function loadNavigationHarness({
     clipboard: { writeText: (text) => clipboardWriteText(text) },
     dialog: {},
     globalShortcut: {
-      register: (accelerator) => {
+      register: (accelerator, press) => {
         (calls.globalShortcuts ??= []).push(["register", accelerator]);
+        (calls.presses ??= new Map()).set(accelerator, press);
         return true;
       },
       unregister: (accelerator) => (calls.globalShortcuts ??= []).push(["unregister", accelerator]),
@@ -3878,7 +3879,7 @@ describe("floating panel wiring", () => {
   });
 
   /** Turns the harness window into its server's panel, opened as ⇧⌘Space would. */
-  function openPanel(h) {
+  function openPanel(h, { ready = true } = {}) {
     const panel = { visible: false, destroyed: false };
     Object.assign(h.win, {
       setAlwaysOnTop() {},
@@ -3905,8 +3906,31 @@ describe("floating panel wiring", () => {
     });
     h.electron.systemPreferences.getAnimationSettings = () => ({ prefersReducedMotion: true });
     h.api.floatingComposer().show(serverUrl);
+    // Its page has loaded and rendered the composer.
+    if (ready) h.api.floatingComposer().markReady(h.win);
     return panel;
   }
+
+  it("shows the panel once its own top document on its panel page says it's ready", (t) => {
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const panel = openPanel(h, { ready: false });
+    assert.equal(panel.visible, false, "its page is still loading");
+    const ready = (frame, mainFrame = frame) => {
+      h.webContents.mainFrame = mainFrame;
+      h.ipc.get("omnigent:floating-composer:ready")({ sender: h.webContents, senderFrame: frame });
+    };
+    h.setUrl(`${serverUrl}/compose/floating`);
+    ready({ url: h.webContents.getURL() }, { url: "top" });
+    assert.equal(panel.visible, false, "a subframe can't speak for the panel");
+    h.setUrl(`${serverUrl}/`);
+    ready({ url: h.webContents.getURL() });
+    assert.equal(panel.visible, false, "a page that left the panel route can't either");
+    h.setUrl(`${serverUrl}/compose/floating`);
+    ready({ url: h.webContents.getURL() });
+    assert.equal(panel.visible, true);
+  });
 
   /** A main window of the panel's server, beside it, whose page is at `url`. */
   function addMain(h, { url = `${serverUrl}/`, minimized = false } = {}) {
@@ -7007,5 +7031,90 @@ describe("New Window keeps its source's server (src/main.js)", () => {
     h.api.buildMenu();
     h.calls.appMenu.getMenuItemById("new_window").click();
     assert.equal(h.api.windows.get(h.win).serverUrl, "https://host.example/ml/omnigents");
+  });
+});
+
+describe("floating panel loading", () => {
+  const chord = "CommandOrControl+Shift+Space";
+  const announce = (h) => {
+    const frame = { url: h.webContents.getURL() };
+    h.webContents.mainFrame = frame;
+    h.ipc.get("omnigent:floating-composer:announce")(
+      { sender: h.webContents, senderFrame: frame },
+      1,
+    );
+  };
+  const panelsBuilt = (h) => (h.calls.windowOptions ?? []).filter((o) => o.type === "panel").length;
+  /** The harness window, able to act as the panel the shell builds; returns its visibility. */
+  const panelable = (h) => {
+    const panel = { visible: false };
+    Object.assign(h.win, {
+      setAlwaysOnTop() {},
+      setVisibleOnAllWorkspaces() {},
+      setBounds() {},
+      getBounds: () => ({ x: 0, y: 0, width: 620, height: 360 }),
+      setOpacity() {},
+      moveTop() {},
+      isVisible: () => panel.visible,
+      showInactive: () => (panel.visible = true),
+      hide: () => (panel.visible = false),
+    });
+    Object.assign(h.webContents, { isCrashed: () => false, focus() {} });
+    const display = { id: 1, workArea: { x: 0, y: 0, width: 1440, height: 900 } };
+    Object.assign(h.electron.screen, {
+      getAllDisplays: () => [display],
+      getCursorScreenPoint: () => ({ x: 10, y: 10 }),
+      getDisplayNearestPoint: () => display,
+    });
+    h.electron.systemPreferences.getAnimationSettings = () => ({ prefersReducedMotion: true });
+    return panel;
+  };
+
+  it("shows no connection overlay over a panel, which loads out of sight", async (t) => {
+    const h = loadNavigationHarness({ platform: "darwin", loadServer: async () => {} });
+    t.after(h.cleanup);
+    h.api.windows.get(h.win).role = "panel";
+    await h.api.loadServerUrl(h.win, "https://example.com/");
+    assert.equal(
+      (h.calls.loading ?? []).some((call) => call.action === "show"),
+      false,
+    );
+  });
+
+  it("builds the panel hidden once the app is quiet after a page can render it", (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const panel = panelable(h);
+    announce(h);
+    t.mock.timers.tick(2999);
+    assert.equal(panelsBuilt(h), 0);
+    t.mock.timers.tick(1);
+    assert.equal(panelsBuilt(h), 1);
+    assert.equal(panel.visible, false, "built out of sight");
+  });
+
+  it("lets an early ⇧⌘Space build the panel itself, with no second build after", (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    panelable(h);
+    announce(h);
+    h.calls.presses.get(chord)();
+    assert.equal(panelsBuilt(h), 1);
+    t.mock.timers.tick(3000);
+    assert.equal(panelsBuilt(h), 1);
+  });
+
+  it("builds nothing ahead off macOS", (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const h = loadNavigationHarness({ platform: "linux" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    announce(h);
+    t.mock.timers.tick(3000);
+    assert.equal(panelsBuilt(h), 0);
   });
 });

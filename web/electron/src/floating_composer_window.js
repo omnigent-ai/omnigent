@@ -43,6 +43,10 @@ function floatingComposerAppPagePath(pagePath) {
 
 /** How long the panel takes to fade in when it opens; closing is instant. */
 const FLOATING_COMPOSER_FADE_MS = 120;
+/** How long an open waits for a page still loading to say it's ready before showing anyway. */
+const FLOATING_COMPOSER_READY_FALLBACK_MS = 1000;
+/** How long the app stays quiet after a page can render the panel before it's built hidden. */
+const FLOATING_COMPOSER_PRELOAD_DELAY_MS = 3000;
 /** Each panel's current fade, so reopening mid-fade stops the one before. */
 const fades = new WeakMap();
 
@@ -118,8 +122,11 @@ function floatingComposerWindowOptions() {
  *   isCurrent: (panel: import("electron").BrowserWindow, serverUrl: string) => boolean,
  *   quitting: () => boolean,
  *   present?: (panel: import("electron").BrowserWindow, show: () => void) => void,
+ *   panelClosed?: (serverUrl: string, wasReady: boolean) => void,
+ *   readyFallbackMs?: number,
  * }} deps `isCurrent` says whether a panel still shows its server's panel page; `present`
- *   puts a hidden panel on screen, such as with a fade, by calling `show`.
+ *   puts a hidden panel on screen, such as with a fade, by calling `show`; `panelClosed`
+ *   hears that a panel went away, and whether its page had ever been ready.
  */
 function createFloatingComposerController(deps) {
   /** @type {Map<string, import("electron").BrowserWindow>} */
@@ -131,6 +138,20 @@ function createFloatingComposerController(deps) {
   const pickerOpen = new Set();
   /** Each panel's pending debounced frame save. */
   const saveTimers = new Map();
+  /** Panels whose current document said its composer rendered; this ends with the document. */
+  const ready = new Set();
+  /** Panels that have rendered a page at least once, so losing one is worth building again. */
+  const everReady = new WeakSet();
+  /** Panels built hidden ahead of an open, and never shown since. */
+  const unshown = new Set();
+  /** Opens waiting for a loading page: the panel → its fallback timer. */
+  const pendingReveals = new Map();
+
+  function cancelReveal(panel) {
+    const timer = pendingReveals.get(panel);
+    if (timer !== undefined) clearTimeout(timer);
+    pendingReveals.delete(panel);
+  }
 
   function cancelSave(panel) {
     const timer = saveTimers.get(panel);
@@ -172,7 +193,10 @@ function createFloatingComposerController(deps) {
 
   function discard(serverUrl, panel) {
     cancelSave(panel);
+    cancelReveal(panel);
     pickerOpen.delete(panel);
+    ready.delete(panel);
+    unshown.delete(panel);
     if (panels.get(serverUrl) === panel) panels.delete(serverUrl);
     if (!panel.isDestroyed()) panel.destroy();
   }
@@ -180,6 +204,7 @@ function createFloatingComposerController(deps) {
   function hide(panel, { resetFrame = false } = {}) {
     for (const [serverUrl, candidate] of panels) {
       if (candidate !== panel || panel.isDestroyed()) continue;
+      cancelReveal(panel);
       // A picker its page never reported closed must not keep it up on a later open.
       pickerOpen.delete(panel);
       panel.hide();
@@ -193,6 +218,11 @@ function createFloatingComposerController(deps) {
   function isPanel(win) {
     for (const panel of panels.values()) if (panel === win) return true;
     return false;
+  }
+
+  function serverUrlFor(win) {
+    for (const [serverUrl, panel] of panels) if (panel === win) return serverUrl;
+    return null;
   }
 
   function panelFor(serverUrl) {
@@ -219,9 +249,13 @@ function createFloatingComposerController(deps) {
     };
     panel.on("moved", scheduleSave);
     panel.on("resized", scheduleSave);
-    // A new document, or a renderer that went away, can't still have the picker open.
-    panel.webContents.on("did-navigate", () => pickerOpen.delete(panel));
-    panel.webContents.on("render-process-gone", () => pickerOpen.delete(panel));
+    // A new document, or a renderer that went away, can't still have the picker open or be ready.
+    const endDocument = () => {
+      pickerOpen.delete(panel);
+      ready.delete(panel);
+    };
+    panel.webContents.on("did-navigate", endDocument);
+    panel.webContents.on("render-process-gone", endDocument);
     // ⌘W hides the panel like Escape, keeping its draft; only quitting closes it.
     panel.on("close", (event) => {
       if (deps.quitting()) return;
@@ -230,11 +264,25 @@ function createFloatingComposerController(deps) {
     });
     panel.on("closed", () => {
       cancelSave(panel);
+      cancelReveal(panel);
       if (panels.get(serverUrl) === panel) panels.delete(serverUrl);
       pickerOpen.delete(panel);
+      ready.delete(panel);
+      unshown.delete(panel);
+      deps.panelClosed?.(serverUrl, everReady.has(panel));
     });
     panels.set(serverUrl, panel);
     return panel;
+  }
+
+  function reveal(serverUrl, panel) {
+    cancelReveal(panel);
+    if (panel.isDestroyed()) return;
+    unshown.delete(panel);
+    panel.setBounds(targetFrame(serverUrl));
+    if (deps.present) deps.present(panel, () => panel.showInactive());
+    else panel.showInactive();
+    panel.webContents.focus();
   }
 
   function targetFrame(serverUrl) {
@@ -265,11 +313,46 @@ function createFloatingComposerController(deps) {
         panel.webContents.focus();
         return "focused";
       }
-      panel.setBounds(targetFrame(serverUrl));
-      if (deps.present) deps.present(panel, () => panel.showInactive());
-      else panel.showInactive();
-      panel.webContents.focus();
+      // A page still loading shows once it's ready, or after a moment if it never says so.
+      if (ready.has(panel)) reveal(serverUrl, panel);
+      else if (!pendingReveals.has(panel)) {
+        const timer = setTimeout(
+          () => reveal(serverUrl, panel),
+          deps.readyFallbackMs ?? FLOATING_COMPOSER_READY_FALLBACK_MS,
+        );
+        timer.unref?.();
+        pendingReveals.set(panel, timer);
+      }
       return "shown";
+    },
+
+    /**
+     * Build the panel for `serverUrl` hidden, so the next open shows a page that's already
+     * loaded. At most one panel waits unshown: another server's is let go first.
+     *
+     * @param {string} serverUrl
+     */
+    preload(serverUrl) {
+      const existing = panels.get(serverUrl);
+      if (existing && !existing.isDestroyed() && deps.isCurrent(existing, serverUrl)) return;
+      for (const [otherUrl, panel] of [...panels]) {
+        if (otherUrl !== serverUrl && unshown.has(panel)) discard(otherUrl, panel);
+      }
+      unshown.add(panelFor(serverUrl));
+    },
+
+    /** Let go of `serverUrl`'s panel if it was built ahead and never shown. */
+    releaseUnshown(serverUrl) {
+      const panel = panels.get(serverUrl);
+      if (panel && unshown.has(panel)) discard(serverUrl, panel);
+    },
+
+    /** The panel's current document rendered its composer: an open waiting on it shows now. */
+    markReady(panel) {
+      if (!isPanel(panel) || panel.isDestroyed()) return;
+      ready.add(panel);
+      everReady.add(panel);
+      if (pendingReveals.has(panel)) reveal(serverUrlFor(panel), panel);
     },
 
     /**
@@ -303,6 +386,8 @@ function createFloatingComposerController(deps) {
 
     /** One of Omnigent's own windows took focus: visible panels hide, like a click-away. */
     mainWindowFocused() {
+      // An open still waiting on its page is dropped too: the user moved on.
+      for (const panel of [...pendingReveals.keys()]) cancelReveal(panel);
       for (const [serverUrl, panel] of panels) {
         if (panel.isDestroyed() || !panel.isVisible() || pickerOpen.has(panel)) continue;
         panel.hide();
@@ -321,18 +406,48 @@ function createFloatingComposerController(deps) {
     isPanel,
 
     /** The server a panel is bound to, set by main when it built the panel, never by its page. */
-    serverUrlFor(win) {
-      for (const [serverUrl, panel] of panels) if (panel === win) return serverUrl;
-      return null;
+    serverUrlFor,
+  };
+}
+
+/**
+ * Builds a panel hidden once the app has been quiet for a while, so ⇧⌘Space shows a page that
+ * has already loaded. Each `schedule` restarts the wait; an open before it ends cancels it.
+ *
+ * @param {{
+ *   target: () => string | null,
+ *   preload: (serverUrl: string) => void,
+ *   delayMs?: number,
+ * }} deps `target` is the server to build for when the wait ends, or null for none.
+ */
+function createFloatingComposerPreloader(deps) {
+  let timer = null;
+  const cancel = () => {
+    if (timer !== null) clearTimeout(timer);
+    timer = null;
+  };
+  return {
+    schedule() {
+      cancel();
+      timer = setTimeout(() => {
+        timer = null;
+        const serverUrl = deps.target();
+        if (serverUrl !== null) deps.preload(serverUrl);
+      }, deps.delayMs ?? FLOATING_COMPOSER_PRELOAD_DELAY_MS);
+      timer.unref?.();
     },
+    cancel,
   };
 }
 
 module.exports = {
   FLOATING_COMPOSER_FADE_MS,
+  FLOATING_COMPOSER_PRELOAD_DELAY_MS,
+  FLOATING_COMPOSER_READY_FALLBACK_MS,
   FLOATING_COMPOSER_PATH,
   FRAME_SETTINGS_KEY,
   createFloatingComposerController,
+  createFloatingComposerPreloader,
   fadeInFloatingComposer,
   floatingComposerAppPagePath,
   floatingComposerSessionPath,

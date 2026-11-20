@@ -7,6 +7,7 @@ const bridge = vi.hoisted(() => ({
   dismiss: vi.fn(),
   filePicker: vi.fn(),
   announceSupport: vi.fn(),
+  ready: vi.fn(),
 }));
 vi.mock("@/lib/nativeBridge", () => ({ floatingComposerBridge: () => bridge }));
 vi.mock("./floatingLaunch", () => ({ launchFromPanel: vi.fn() }));
@@ -71,6 +72,29 @@ beforeEach(() => {
 });
 
 describe("FloatingComposerPage", () => {
+  it("tells the shell it's ready once per document, after the composer painted", async () => {
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    try {
+      // A fresh module is a fresh document.
+      vi.resetModules();
+      const { FloatingComposerPage: FreshPage } = await import("./FloatingComposerPage");
+      const first = render(<FreshPage />);
+      expect(bridge.ready).not.toHaveBeenCalled();
+      for (const frame of frames.splice(0)) frame(0);
+      expect(bridge.ready).toHaveBeenCalledTimes(1);
+      first.unmount();
+      render(<FreshPage />);
+      for (const frame of frames.splice(0)) frame(0);
+      expect(bridge.ready).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("hides on Escape and keeps what was typed", () => {
     render(<FloatingComposerPage />);
     fireEvent.change(prompt(), { target: { value: "half a thought" } });

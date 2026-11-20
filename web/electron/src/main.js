@@ -134,6 +134,7 @@ const {
   FLOATING_COMPOSER_PATH,
   FRAME_SETTINGS_KEY,
   createFloatingComposerController,
+  createFloatingComposerPreloader,
   fadeInFloatingComposer,
   floatingComposerAppPagePath,
   floatingComposerSessionPath,
@@ -1061,6 +1062,8 @@ function scheduleReconnect(
   returnUrl,
   { hint, finalMessage, network = false, blocked = false, interactive = false },
 ) {
+  // A panel never retries behind the overlay: it closes, and the next open builds it again.
+  if (!isMainWindow(win)) return false;
   restartReconnectsOnWake();
   const previous = reconnects.get(win);
   const same = previous?.serverUrl === serverUrl;
@@ -1878,12 +1881,35 @@ function floatingComposer() {
     },
     isCurrent: floatingComposerPanelIsCurrent,
     quitting: () => appQuitting,
+    // A panel lost after its page had loaded (a crash, a sign-out) is built again, out of sight.
+    panelClosed: (_serverUrl, wasReady) => {
+      if (wasReady) floatingComposerPreloader.schedule();
+    },
     present: (panel, show) =>
       fadeInFloatingComposer(panel, show, {
         reduceMotion: systemPreferences.getAnimationSettings?.().prefersReducedMotion === true,
       }),
   });
   return floatingComposerController;
+}
+
+// Builds the panel hidden once the app is quiet, so ⇧⌘Space shows a loaded page.
+const floatingComposerPreloader = createFloatingComposerPreloader({
+  target: floatingComposerPreloadTarget,
+  preload: (serverUrl) => floatingComposer().preload(serverUrl),
+});
+
+/** The server whose panel to build ahead: the one ⇧⌘Space would open now, if it can open. */
+function floatingComposerPreloadTarget() {
+  if (process.platform !== "darwin" || appQuitting) return null;
+  if (!globalShortcuts.floatingComposer.current().enabled) return null;
+  return floatingComposerTarget({
+    focused: null,
+    panelServerUrl: () => null,
+    mainWindowsByRecency: mainWindowsByRecency(mainWindowFocusOrder, mainWindows()),
+    serverUrlOf: (win) => windows.get(win)?.serverUrl ?? null,
+    supported: floatingComposerSupported,
+  });
 }
 
 /** Whether a panel still shows the panel page of `serverUrl`, or is still loading it. */
@@ -1911,6 +1937,8 @@ function floatingComposerServerUrl() {
 
 /** ⇧⌘Space: the panel for the most recent server, else Omnigent comes forward. */
 function openFloatingComposerFromShortcut() {
+  // The press builds the panel itself if it isn't there yet.
+  floatingComposerPreloader.cancel();
   const serverUrl = floatingComposerServerUrl();
   if (serverUrl !== null) {
     floatingComposer().show(serverUrl);
@@ -1979,6 +2007,14 @@ const aboutWindow = createAboutWindow({
 });
 
 const connectionLoading = createConnectionLoading({ BrowserWindow });
+
+/**
+ * The shell's connection indicator, over main windows only. It's a window of its own that shows
+ * even while its parent is hidden, and a panel loads hidden and shows once its page is ready.
+ */
+function showConnectionLoading(win, attempt, label) {
+  if (isMainWindow(win)) connectionLoading.show(win, attempt, label);
+}
 
 // Shell-owned update toast: renders the reused web UpdateBanner in a transparent
 // corner window so it shows even against servers running old omnigent web.
@@ -2532,7 +2568,7 @@ async function loadServerUrl(
       win.webContents.stop();
       // The reconnect overlay already says what's happening.
       if (!isSetupPageUrl(win.webContents.getURL()) && !reconnectOverlay.isShown(win)) {
-        connectionLoading.show(win, attempt, "Signing in…");
+        showConnectionLoading(win, attempt, "Signing in…");
       }
       try {
         const entered = new URL(serverUrl);
@@ -2614,7 +2650,7 @@ async function loadServerUrl(
         }
         updateSignOutMenuItem();
         if (!isSetupPageUrl(win.webContents.getURL())) {
-          connectionLoading.show(win, attempt, "Signing in…");
+          showConnectionLoading(win, attempt, "Signing in…");
         }
         const auth = getOidcAuth();
         try {
@@ -2649,7 +2685,7 @@ async function loadServerUrl(
         if (current()) setWindowServerManifest(win, nextManifest);
       });
     }
-    if (!reconnectOverlay.isShown(win)) connectionLoading.show(win, attempt, "Opening Omnigent…");
+    if (!reconnectOverlay.isShown(win)) showConnectionLoading(win, attempt, "Opening Omnigent…");
     await loadServerDocument(win, target, signal);
     assertCurrent();
     diagnostics.record("connection_result", { origin: originOf(serverUrl), outcome: "loaded" });
@@ -5331,12 +5367,26 @@ function registerIpc() {
       contents.removeListener("render-process-gone", revoke);
       contents.removeListener("destroyed", revoke);
       floatingComposerSupport.revoke(contents.id);
+      // A panel built ahead for this server isn't needed once no page of it can render one.
+      if (!floatingComposerSupport.serves(serverUrl)) {
+        floatingComposerController?.releaseUnshown(serverUrl);
+      }
       if (!floatingComposerSupport.any()) applyFloatingComposerShortcut();
     };
     contents.on("did-navigate", revoke);
     contents.on("render-process-gone", revoke);
     contents.on("destroyed", revoke);
     if (!hadSupport) applyFloatingComposerShortcut();
+    floatingComposerPreloader.schedule();
+  });
+
+  // From the panel: its composer rendered, so an open shows it at once.
+  ipcMain.on("omnigent:floating-composer:ready", (event) => {
+    const panel = BrowserWindow.fromWebContents(event.sender);
+    if (!isPinnedOriginSender(event) || !floatingComposerController?.isPanel(panel)) return;
+    // Only the panel's own top document, still on its panel page, speaks for it.
+    if (event.senderFrame !== event.sender.mainFrame || serverPageShown(panel) !== "panel") return;
+    floatingComposerController.markReady(panel);
   });
 
   // From the panel: hide it, keeping its draft.
