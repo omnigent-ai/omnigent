@@ -1157,7 +1157,7 @@ async def test_managed_create_returns_during_provision_and_message_rendezvouses(
             isinstance(item.data, ErrorData) and "host startup failed" in item.data.message
             for item in env.conv_store.list_items(session_id, type="error").data
         ),
-        timeout_s=5.0,
+        timeout_s=budget(5.0),
     )
     failed_snapshot = await env.client.get(f"/v1/sessions/{session_id}")
     assert failed_snapshot.status_code == 200, failed_snapshot.text
