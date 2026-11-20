@@ -617,7 +617,7 @@ def build_native_controls(
             model = (
                 settings.get("model")
                 or unmirrored.get("model")
-                or read_codex_config_model(bridge_dir)
+                or await asyncio.to_thread(read_codex_config_model, bridge_dir)
             )
         if "effort" in settings and settings["effort"] is None and not isinstance(model, str):
             return JSONResponse(
@@ -667,7 +667,8 @@ def build_native_controls(
                 effort = (
                     settings["effort"]
                     if "effort" in settings
-                    else unmirrored.get("effort") or read_codex_config_effort(bridge_dir)
+                    else unmirrored.get("effort")
+                    or await asyncio.to_thread(read_codex_config_effort, bridge_dir)
                 )
                 if (
                     "model" in settings
