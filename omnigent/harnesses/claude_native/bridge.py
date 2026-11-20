@@ -5881,6 +5881,56 @@ def _permission_mode_from_pane(pane: str) -> str | None:
     return None
 
 
+# Claude Code's spinner row while it retries a request, its error cut to the pane
+# width with "…". Transcript text is indented, so it never starts at column 0.
+_API_RETRY_ROW_RE = re.compile(
+    r"^✻ (?P<error>\S.*?) · Retrying in [^·]+"
+    r" · attempt (?P<attempt>\d+)/(?P<max_retries>\d+)\s*$"
+)
+_API_RETRY_STATUS_RE = re.compile(r"^(?P<status>[1-5]\d\d)\b")
+
+
+@dataclass(frozen=True)
+class ApiRetry:
+    """
+    Claude Code's visible retry of a failed API request.
+
+    :param status: HTTP status leading the error text, e.g. ``403``, or
+        ``None`` when the row shows no status (Claude's generic "API error").
+    :param error: The error text as rendered, possibly cut with ``"…"``.
+    :param attempt: The attempt the row reports, e.g. ``3``.
+    :param max_retries: Claude Code's retry limit, e.g. ``10``.
+    """
+
+    status: int | None
+    error: str
+    attempt: int
+    max_retries: int
+
+
+def _api_retry_from_pane(pane: str) -> ApiRetry | None:
+    """
+    Read Claude Code's API retry row off a captured pane.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: The retry the pane shows, or ``None`` when no request is
+        being retried.
+    """
+    for line in reversed(pane.splitlines()):
+        row = _API_RETRY_ROW_RE.match(line)
+        if row is None:
+            continue
+        error = row.group("error")
+        status = _API_RETRY_STATUS_RE.match(error)
+        return ApiRetry(
+            status=int(status.group("status")) if status else None,
+            error=error,
+            attempt=int(row.group("attempt")),
+            max_retries=int(row.group("max_retries")),
+        )
+    return None
+
+
 # ── /btw side-chat overlay ─────────────────────────────────────────
 # Claude Code's ``/btw`` ("by the way") opens an in-TUI overlay that
 # answers a side question without ever persisting it — not to the
@@ -5950,10 +6000,12 @@ class PaneSignals:
         ``"auto"``, or ``None`` when no mode footer is visible.
     :param btw_overlay: A settled ``/btw`` side-chat overlay, or ``None``
         when none is shown / it is still generating.
+    :param api_retry: The API request retry Claude Code shows, or ``None``.
     """
 
     permission_mode: str | None = None
     btw_overlay: BtwOverlay | None = None
+    api_retry: ApiRetry | None = None
 
 
 def _btw_overlay_parts(pane: str) -> tuple[list[str], str] | None:
@@ -9958,8 +10010,8 @@ def read_pane_signals(bridge_dir: Path) -> PaneSignals:
     Read every poll-time footer signal from ONE Claude pane capture.
 
     Non-blocking, best-effort, read-only. Captures the pane a single time
-    and parses both the permission-mode footer and any settled ``/btw``
-    overlay from it, so the forwarder spawns one ``capture-pane``
+    and parses the permission-mode footer, any settled ``/btw`` overlay and
+    any API retry row from it, so the forwarder spawns one ``capture-pane``
     subprocess per poll rather than one per signal. Returns an empty
     :class:`PaneSignals` when the terminal isn't up.
 
@@ -9978,6 +10030,7 @@ def read_pane_signals(bridge_dir: Path) -> PaneSignals:
     return PaneSignals(
         permission_mode=_permission_mode_from_pane(pane),
         btw_overlay=_btw_overlay_from_pane(pane),
+        api_retry=_api_retry_from_pane(pane),
     )
 
 

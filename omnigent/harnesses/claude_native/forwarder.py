@@ -26,6 +26,7 @@ from omnigent.errors import ErrorCode
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
     OBSERVER_HOOK_STDERR_FILE,
+    ApiRetry,
     BtwOverlay,
     ClaudeHookRecord,
     ClaudeMessageDelta,
@@ -37,6 +38,7 @@ from omnigent.harnesses.claude_native.bridge import (
     _transcript_items_from_entry,
     _transcript_timestamp,
     compute_transcript_cumulative_cost,
+    inject_interrupt,
     read_active_session_id,
     read_bridge_id,
     read_claude_context_state,
@@ -169,11 +171,14 @@ _TRANSCRIPT_DISCOVERY_WARNING_S = 30.0
 _TRANSCRIPT_DISCOVERY_ERROR_S = 180.0
 _OBSERVER_HOOK_STDERR_READ_BYTES = 64 * 1024
 # Minimum spacing between pane reads. One ``tmux capture-pane`` subprocess per
-# window feeds every footer-derived signal (permission mode + /btw overlay), so
-# the cost is one subprocess regardless of how many signals are parsed. Both
-# signals change only on a human action (shift+tab, a /btw), so 2s of lag is
+# window feeds every pane-derived signal (permission mode, /btw overlay, API
+# retry row), so the cost is one subprocess regardless of how many signals are
+# parsed. They change on a human action or a retry backoff, so 2s of lag is
 # imperceptible and keeps the subprocess rate low.
 _PANE_POLL_INTERVAL_S = 2.0
+# Claude Code names a retried request's status only from attempt 3 (or its last),
+# after its own credential refreshes, so a 401/403 there outlived a refresh.
+_REJECTED_API_RETRY_STATUSES = frozenset({401, 403})
 # Statuses with which a server rejects an ``external_permission_mode_change``
 # whose mode it does not know (a server older than this bridge). Unlike a
 # transport failure, the rejection does not clear on its own.
@@ -1017,6 +1022,10 @@ class _ForwardDedupeState:
     # partial answer.
     btw_pending_key: str | None = None
     posted_btw_keys: dict[str, None] = field(default_factory=dict)
+    # The visible API retry already reported as failed / interrupted; both
+    # clear once the retry row leaves the pane.
+    api_retry_reported: bool = False
+    api_retry_interrupted: bool = False
     # Session already logged as moved off this runner, so the notice is not
     # repeated for every item dropped afterwards.
     session_not_bound_logged_for: str | None = None
@@ -1758,16 +1767,16 @@ async def forward_claude_transcript_to_session(
                             bridge_dir=bridge_dir,
                             dedupe=dedupe,
                         )
-                        # Footer-derived signals (permission mode, /btw overlay)
-                        # emit no event and live only in the rendered pane. One
-                        # throttled capture feeds both, so a shift+tab switch and
-                        # a settled /btw exchange both reach the web view without
-                        # spawning a capture-pane subprocess per signal.
+                        # Pane-derived signals (permission mode, /btw overlay, API
+                        # retry row) emit no event and live only in the rendered
+                        # pane. One throttled capture feeds them all, so none of
+                        # them spawns its own capture-pane subprocess.
                         await _forward_pane_signals(
                             client=client,
                             session_id=current_session_id,
                             bridge_dir=bridge_dir,
                             dedupe=dedupe,
+                            response_id=state.current_response_id,
                         )
             except asyncio.CancelledError:
                 await _cancel_subagent_forward_task(subagent_task)
@@ -6475,6 +6484,7 @@ async def _forward_pane_signals(
     session_id: str,
     bridge_dir: Path,
     dedupe: _ForwardDedupeState,
+    response_id: str | None = None,
 ) -> None:
     """
     Capture the Claude pane ONCE per window and relay every footer signal.
@@ -6491,6 +6501,7 @@ async def _forward_pane_signals(
     :param session_id: Omnigent session/conversation id.
     :param bridge_dir: Native Claude bridge directory.
     :param dedupe: Shared per-session dedupe state; mutated in place.
+    :param response_id: Active turn's response id, or ``None`` when unknown.
     """
     now = time.monotonic()
     if now < dedupe.pane_next_read:
@@ -6503,6 +6514,91 @@ async def _forward_pane_signals(
     await _relay_btw_overlay(
         client, session_id=session_id, overlay=signals.btw_overlay, dedupe=dedupe
     )
+    await _stop_rejected_api_retry(
+        client,
+        session_id=session_id,
+        bridge_dir=bridge_dir,
+        retry=signals.api_retry,
+        response_id=response_id,
+        dedupe=dedupe,
+    )
+
+
+async def _stop_rejected_api_retry(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    retry: ApiRetry | None,
+    response_id: str | None,
+    dedupe: _ForwardDedupeState,
+) -> None:
+    """
+    Fail the turn and interrupt Claude Code while it retries a rejected request.
+
+    Claude Code reports a retry only in its pane, and fires ``StopFailure``
+    after its last attempt, minutes later. The ``failed`` status is posted
+    before the Escape so the interrupt's trailing idle cannot settle the turn
+    first. A failed post or keystroke is retried on the next capture.
+
+    :param client: Omnigent HTTP client.
+    :param session_id: Omnigent session/conversation id.
+    :param bridge_dir: Native Claude bridge directory.
+    :param retry: The retry row parsed from the pane, or ``None``.
+    :param response_id: Active turn's response id, or ``None`` when unknown.
+    :param dedupe: Shared per-session dedupe state; mutated in place.
+    """
+    if retry is None:
+        dedupe.api_retry_reported = False
+        dedupe.api_retry_interrupted = False
+        return
+    if retry.status not in _REJECTED_API_RETRY_STATUSES or dedupe.api_retry_interrupted:
+        return
+    if not dedupe.api_retry_reported:
+        detail = _display_text(
+            f"API Error: {retry.error}\n\nOmnigent stopped Claude Code from retrying this "
+            f"rejected request (attempt {retry.attempt} of {retry.max_retries}).",
+            is_api_error=True,
+        )
+        try:
+            await post_external_session_status(
+                client,
+                session_id=session_id,
+                status="failed",
+                response_id=response_id,
+                failure_detail=detail,
+                failure_context={
+                    "failure_id": native_failure_id("claude_api_retry", session_id, response_id),
+                    "failure_source": "claude_api_retry",
+                    "native_harness": "claude-native",
+                    "detail_source": "pane_retry_status",
+                    "failure_decision": "session_failed",
+                    "http_status": retry.status,
+                    "native_error_message": retry.error,
+                    "runner_version": VERSION,
+                },
+            )
+        except httpx.HTTPError:
+            _logger.warning(
+                "Failed to report Claude Code's rejected API retry; session=%s status=%s",
+                session_id,
+                retry.status,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+            return
+        dedupe.api_retry_reported = True
+    try:
+        await asyncio.to_thread(inject_interrupt, bridge_dir, timeout_s=1.0)
+    except RuntimeError:
+        _logger.warning(
+            "Failed to interrupt Claude Code's rejected API retry; session=%s",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+        return
+    dedupe.api_retry_interrupted = True
 
 
 async def _relay_permission_mode(
