@@ -453,7 +453,7 @@ describe("UserBubble awaiting-agent marker", () => {
   const content: MessageContentBlock[] = [{ type: "input_text", text: "steer" }];
 
   it.each([false, true])(
-    "shares the timestamp row while keeping mobile pending status visible (mobile=%s)",
+    "stays visible beside the hover-revealed timestamp and actions (mobile=%s)",
     (mobile) => {
       vi.stubGlobal("matchMedia", () => ({
         matches: mobile,
@@ -468,16 +468,18 @@ describe("UserBubble awaiting-agent marker", () => {
       renderBubble({ ...pending, createdAtS: 1_762_000_000 });
       const explanation = screen.getByTestId("message-awaiting-agent");
       expect(explanation).toHaveTextContent("The agent will read this after its current step");
-      const footer = screen.getByTestId("message-timestamp").parentElement;
-      expect(explanation.parentElement).toBe(footer);
-      expect(explanation.nextElementSibling).toBe(screen.getByTestId("message-timestamp"));
-      expect(footer).toContainElement(screen.getByRole("button", { name: "Copy" }));
-      expect(footer).toHaveClass("pt-1");
+      const row = explanation.parentElement;
+      const actions = screen.getByTestId("message-timestamp").parentElement;
+      expect(explanation.nextElementSibling).toBe(actions);
+      expect(actions).not.toContainElement(explanation);
+      expect(actions).toContainElement(screen.getByRole("button", { name: "Copy" }));
+      expect(row).toHaveClass("pt-1");
+      expect(row?.className).not.toMatch(/opacity|invisible/);
       if (mobile) {
-        expect(footer).toHaveClass("opacity-100");
-        expect(footer).not.toHaveClass("invisible");
+        expect(actions).toHaveClass("opacity-100");
+        expect(actions).not.toHaveClass("invisible");
       } else {
-        expect(footer).toHaveClass(
+        expect(actions).toHaveClass(
           "md:opacity-0",
           "md:group-hover:opacity-100",
           "md:group-focus-within:opacity-100",
@@ -502,11 +504,12 @@ describe("UserBubble awaiting-agent marker", () => {
     if (pending.kind !== "user") throw new Error("Expected a pending user bubble");
     renderBubble({ ...pending, createdAtS: 1_762_000_000 });
     const explanation = screen.getByTestId("message-awaiting-agent");
-    const footer = explanation.parentElement;
+    const actions = screen.getByTestId("message-timestamp").parentElement;
     expect(screen.queryByRole("button", { name: "Copy" })).toBeNull();
     expect(screen.getByTestId("copy-message-link")).toBeDisabled();
-    expect(footer).toHaveClass("opacity-100");
-    expect(footer).not.toHaveClass("md:opacity-0");
+    expect(explanation.parentElement?.className).not.toMatch(/opacity|invisible/);
+    expect(actions).toHaveClass("opacity-100");
+    expect(actions).not.toHaveClass("md:opacity-0");
   });
 
   it("stays hidden for a send that started a turn and for committed history", () => {
