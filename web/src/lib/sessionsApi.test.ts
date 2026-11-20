@@ -219,6 +219,7 @@ describe("createSession", () => {
       lastTotalTokens: undefined,
       usageIncluded: true,
       totalCostUsd: undefined,
+      costHidden: false,
       usageByModel: null,
       llmModel: undefined,
       harness: null,
@@ -332,6 +333,98 @@ describe("createSession", () => {
       parent_session_id: "conv_parent",
       sub_agent_name: null,
       title: "ui:claude-native-ui:1",
+    });
+  });
+
+  it("files a host start in its project with the chosen directory and launch settings", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_run",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 1704067200,
+      }),
+    );
+
+    await createSession("agent_xyz", [], {
+      projectId: "proj_tests",
+      hostId: "host_1",
+      workflowId: "0123456789abcdef0123456789abcdef",
+      workspace: "/home/you/project",
+      labels: { "omnigent.ui": "terminal" },
+      terminalLaunchArgs: ["--permission-mode", "plan"],
+      modelOverride: "claude-opus-4-7",
+      reasoningEffort: "high",
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({
+      agent_id: "agent_xyz",
+      initial_items: [],
+      project_id: "proj_tests",
+      git: null,
+      host_id: "host_1",
+      workflow_id: "0123456789abcdef0123456789abcdef",
+      workspace: "/home/you/project",
+      labels: { "omnigent.ui": "terminal" },
+      terminal_launch_args: ["--permission-mode", "plan"],
+      model_override: "claude-opus-4-7",
+      reasoning_effort: "high",
+    });
+  });
+
+  it("asks for a managed sandbox, with its first message, for a sandbox start", async () => {
+    const created = () =>
+      mockJsonResponse({
+        id: "conv_run",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 1704067200,
+      });
+    fetchMock.mockResolvedValueOnce(created()).mockResolvedValueOnce(created());
+    const firstMessage = {
+      type: "message",
+      data: { role: "user", content: [{ type: "input_text", text: "Run it" }] },
+    };
+
+    await createSession("agent_xyz", [], {
+      projectId: "proj_tests",
+      sandbox: {
+        provider: "modal",
+        profileId: "profile_1",
+        profileRevision: "rev_1",
+        workspaces: ["https://github.com/example/app#main"],
+        hostId: "0123456789abcdef0123456789abcdef",
+      },
+      initialInput: firstMessage,
+      workflowId: "0123456789abcdef0123456789abcdef",
+    });
+    await createSession("agent_xyz", [], { sandbox: { provider: null, workspaces: [] } });
+
+    const bodies = fetchMock.mock.calls.map(([, init]) =>
+      JSON.parse((init as RequestInit).body as string),
+    );
+    expect(bodies[0]).toEqual({
+      agent_id: "agent_xyz",
+      initial_items: [],
+      project_id: "proj_tests",
+      workspace: null,
+      git: null,
+      host_type: "managed",
+      sandbox_provider: "modal",
+      sandbox_profile_id: "profile_1",
+      sandbox_profile_revision: "rev_1",
+      workspaces: ["https://github.com/example/app#main"],
+      host_id: "0123456789abcdef0123456789abcdef",
+      initial_input: firstMessage,
+      workflow_id: "0123456789abcdef0123456789abcdef",
+    });
+    // No provider leaves the choice to the server; no repositories is an empty workspace.
+    expect(bodies[1]).toEqual({
+      agent_id: "agent_xyz",
+      initial_items: [],
+      host_type: "managed",
+      workspaces: [],
     });
   });
 
@@ -1570,6 +1663,7 @@ describe("getSessionUsage", () => {
     expect(usage).toEqual({
       id: "conv with space",
       totalCostUsd: 3.5,
+      costHidden: false,
       usageByModel: {
         "model-a": {
           inputTokens: 10,
@@ -1610,6 +1704,7 @@ describe("getSessionUsage", () => {
       expect(await getSessionUsage("conv_usage_projection")).toEqual({
         id: "conv_usage_projection",
         totalCostUsd: 3.5,
+        costHidden: false,
         usageByModel: null,
       });
       expect(getSessionHost("conv_usage_projection")).toBe("host_current");
@@ -1626,6 +1721,7 @@ describe("getSessionUsage", () => {
     expect(await getSessionUsage("conv_abc")).toEqual({
       id: "conv_abc",
       totalCostUsd: cost,
+      costHidden: false,
       usageByModel: null,
     });
   });
@@ -2152,6 +2248,25 @@ describe("approve", () => {
 });
 
 describe("importLocalSessions", () => {
+  it("sends the browser tools mode header on the import request", async () => {
+    const win = window as unknown as { omnigentDesktop?: unknown };
+    const before = win.omnigentDesktop;
+    win.omnigentDesktop = { browserTabs: () => undefined };
+    try {
+      fetchMock.mockResolvedValueOnce(
+        mockNdjsonResponse([
+          JSON.stringify({ event: "done", imported: 0, already_imported: 0, failed: 0 }),
+        ]),
+      );
+      await importLocalSessions("host_1", "all", 25);
+      const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+      expect(url).toBe("/v1/imports/local/stream");
+      expect(new Headers(init.headers).get("X-Omnigent-Browser-Agent-Tools")).toBe("on");
+    } finally {
+      win.omnigentDesktop = before;
+    }
+  });
+
   it("streams each session through onSession and returns the final tally", async () => {
     fetchMock.mockResolvedValueOnce(
       mockNdjsonResponse([

@@ -9,9 +9,11 @@
 
 import { useEffect, useRef } from "react";
 
+import { matchesShortcut } from "@/lib/shortcuts/registry";
+
 /** True for ⌃` — Control plus the key left of 1, with no other modifier. */
 export function isTerminalHotkey(e: globalThis.KeyboardEvent): boolean {
-  return e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && e.code === "Backquote";
+  return matchesShortcut(e, "terminal.new");
 }
 
 /**

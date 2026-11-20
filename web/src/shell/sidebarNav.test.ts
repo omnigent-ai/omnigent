@@ -14,17 +14,20 @@ import {
   groupConversations,
   getConversationAgentType,
   customSortOrder,
+  isSharedAutomationRun,
   migratePinnedConversationIds,
   moveCustomOrder,
   orderByPinnedTimestamp,
   pinOrderWrites,
   resolveSidebarDrop,
+  sessionInSidebarFolder,
   sessionsListAcceptsDrop,
   sortConversations,
   startCustomOrder,
   STATUS_BUCKETS,
   statusBucket,
   dateBucket,
+  withAutomationFolder,
 } from "./sidebarNav";
 
 function conversation(
@@ -1054,5 +1057,65 @@ describe("Custom order", () => {
     ]);
     expect(moveCustomOrder(order, rows, "s1", "s1", null, null)).toBeNull();
     expect(moveCustomOrder(order, rows, "s1", "deleted", null, null)).toBeNull();
+  });
+});
+
+describe("automation runs shared with the viewer", () => {
+  const ORIGIN = "omnigent.scheduled_task_origin";
+  const INITIAL_RUN = "omnigent.scheduled_task_initial_run";
+  const LAUNCH = "omnigent.scheduled_task_launch";
+  const session = (labels: Record<string, string>, owner: string | null = "alice@example.com") =>
+    ({ ...conversation("conv_1", "Run", new Date(0), { labels }), owner }) as Conversation;
+
+  it.each([
+    ["a run's own session", { [ORIGIN]: "st_1", [INITIAL_RUN]: "run_1" }, true],
+    ["a session a run's tree launched", { [LAUNCH]: "st_1" }, true],
+    ["a fork of a run's session", { [ORIGIN]: "st_1" }, false],
+    ["an initial-run label without an origin", { [INITIAL_RUN]: "run_1" }, false],
+    ["an ordinary shared session", {}, false],
+  ])("counts %s", (_label, labels, expected) => {
+    expect(isSharedAutomationRun(session(labels), "bob@example.com")).toBe(expected);
+  });
+
+  it("leaves the viewer's own runs to their own filing", () => {
+    const labels = { [ORIGIN]: "st_1", [INITIAL_RUN]: "run_1" };
+    expect(isSharedAutomationRun(session(labels, "bob@example.com"), "bob@example.com")).toBe(
+      false,
+    );
+    expect(isSharedAutomationRun(session(labels, null), "bob@example.com")).toBe(false);
+  });
+
+  it("files a shared run only in the default automation folder, when asked", () => {
+    const run = session({ [LAUNCH]: "st_1", omni_project: "Alpha" });
+    const automation = { id: "p_1", name: "Omnigent Automation" };
+    expect(sessionInSidebarFolder(run, automation, "bob@example.com", true)).toBe(true);
+    expect(sessionInSidebarFolder(run, automation, "bob@example.com", false)).toBe(false);
+    // Not where its owner filed it.
+    expect(sessionInSidebarFolder(run, { id: null, name: "Alpha" }, "bob@example.com", true)).toBe(
+      false,
+    );
+  });
+
+  it("places the default automation folder where a new project would go", () => {
+    const projects = [
+      { id: "p_a", name: "Alpha" },
+      { id: "p_z", name: "Zeta" },
+    ];
+    const placeholder = { id: null, name: "Omnigent Automation", placeholder: true };
+    expect(withAutomationFolder(projects, true, false)).toEqual([
+      projects[0],
+      placeholder,
+      projects[1],
+    ]);
+    // Uppercase sorts before lowercase, as the server compares names.
+    expect(withAutomationFolder([{ id: "p_l", name: "lower" }], true, false)).toEqual([
+      placeholder,
+      { id: "p_l", name: "lower" },
+    ]);
+    // A manual order puts unranked projects last.
+    expect(withAutomationFolder(projects, true, true)).toEqual([...projects, placeholder]);
+    expect(withAutomationFolder(projects, false, false)).toBe(projects);
+    const existing = [{ id: null, name: "Omnigent Automation" }];
+    expect(withAutomationFolder(existing, true, false)).toBe(existing);
   });
 });

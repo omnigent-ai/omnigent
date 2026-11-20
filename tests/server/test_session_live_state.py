@@ -17,11 +17,21 @@ from __future__ import annotations
 
 import threading
 import time
+from pathlib import Path
+from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 
+from omnigent.entities import FunctionCallData, MessageData, NewConversationItem, ResourceEventData
 from omnigent.runtime import pending_elicitations
 from omnigent.server import session_live_state
+from omnigent.stores.conversation_store import (
+    SCHEDULED_TASK_ACTIVITY_LABEL_KEY,
+    SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
+    SCHEDULED_TASK_RUN_LABEL_KEY,
+)
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
 
 def _wait_until(predicate, *, timeout_s: float = 10.0) -> None:
@@ -58,6 +68,10 @@ class _RecordingStore:
         self.blocked_writes: list[tuple[str, str | None]] = []
         self.touches: list[list[str]] = []
         self.clears: list[tuple[str, int | None]] = []
+        self.labels: dict[str, dict[str, str]] = {}
+
+    def get_conversation(self, conversation_id: str) -> SimpleNamespace:
+        return SimpleNamespace(labels=self.labels.get(conversation_id, {}))
 
     def set_session_live_status(self, conversation_id: str, status: str) -> None:
         self.status_writes.append((conversation_id, status))
@@ -224,13 +238,30 @@ def test_status_edges_set_and_clear_the_parked_reason() -> None:
     assert sessions_module._blocked_on_for(session_id, "permission prompt") == "permission prompt"
 
 
-def test_forget_live_status_drops_dedupe_state() -> None:
+def test_forget_live_status_drops_dedupe_state(recording_store: _RecordingStore) -> None:
     """A replica handing off a session must not keep its stale dedupe state."""
     session_live_state._last_status["conv_1"] = "running"
     session_live_state._last_blocked_on["conv_1"] = "permission prompt"
+    generation = session_live_state.handoff_count("conv_1")
+    for status in ("running", "waiting"):
+        session_live_state.record_child_status("conv_1", "parent", status, handoffs=generation)
+    session_live_state.record_child_status("conv_2", "parent", "running", handoffs=0)
+    assert session_live_state.has_active_child("parent")
     session_live_state.forget_live_status("conv_1")
     assert "conv_1" not in session_live_state._last_status
     assert "conv_1" not in session_live_state._last_blocked_on
+    assert session_live_state.has_active_child("parent")
+    # A queued event from the previous owner cannot restore the removed child.
+    session_live_state.record_child_status("conv_1", "parent", "running", handoffs=generation)
+    session_live_state.record_child_status("conv_2", "parent", "idle", handoffs=0)
+    assert not session_live_state.has_active_child("parent")
+
+    from omnigent.db.db_models import workspace_scope
+
+    with workspace_scope(17):
+        session_live_state.record_child_status("conv_1", "parent", "waiting", handoffs=0)
+        assert session_live_state.has_active_child("parent")
+    assert not session_live_state.has_active_child("parent")
 
 
 def test_pending_count_hook_persists_publish_and_resolve(
@@ -409,6 +440,25 @@ def test_unencodable_status_is_dropped_before_enqueue(
     assert recording_store.status_writes == [("conv_1", "running")]
 
 
+# When the fake store's running runs fired.
+_FIRED_AT = 1_000
+
+
+def _transcript_item(type: str, created_at: int, role: str | None = None) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=uuid4().hex, type=type, created_at=created_at, data=SimpleNamespace(role=role)
+    )
+
+
+# A run's session as a fire leaves it: runner bookkeeping, then the prompt.
+_RUN_STARTED = [
+    _transcript_item("resource_event", _FIRED_AT + 1),
+    _transcript_item("message", _FIRED_AT + 4, "user"),
+]
+_RUN_ANSWERED = [*_RUN_STARTED, _transcript_item("message", _FIRED_AT + 90, "assistant")]
+_SAME_SECOND_HISTORY = [_transcript_item("message", _FIRED_AT, "assistant")]
+
+
 class _FakeScheduledTaskStore:
     """Scheduled-task-store stand-in recording the hook's lookup + update."""
 
@@ -427,8 +477,8 @@ class _FakeScheduledTaskStore:
         run_id = self._running_by_conv.get(conversation_id)
         if run_id is None:
             return None
-        # Minimal object carrying only the ``id`` the hook reads.
-        return type("_Run", (), {"id": run_id})()
+        # Minimal object carrying only the fields the hook reads.
+        return SimpleNamespace(id=run_id, fired_at=_FIRED_AT, scheduled_at=_FIRED_AT)
 
     def update_run(
         self,
@@ -443,10 +493,20 @@ class _FakeScheduledTaskStore:
         return type("_Run", (), {"id": run_id, "status": status})()
 
 
-def test_scheduled_run_completion_idle_transitions_to_succeeded() -> None:
+@pytest.mark.parametrize("legacy_run", [False, True])
+def test_scheduled_run_completion_idle_transitions_to_succeeded(legacy_run: bool) -> None:
     """A terminal ``idle`` edge flips the conversation's running run to succeeded."""
     sched = _FakeScheduledTaskStore({"conv_1": "run_1"})
-    session_live_state.configure(_RecordingStore(), sched)  # type: ignore[arg-type]
+    conversations = _RecordingStore()
+    conversations.labels["conv_1"] = (
+        {}
+        if legacy_run
+        else {
+            SCHEDULED_TASK_RUN_LABEL_KEY: "run_1",
+            SCHEDULED_TASK_ACTIVITY_LABEL_KEY: "run_1",
+        }
+    )
+    session_live_state.configure(conversations, sched)  # type: ignore[arg-type]
     try:
         session_live_state.persist_scheduled_run_completion("conv_1", "succeeded")
         _wait_until(lambda: bool(sched.update_calls))
@@ -457,6 +517,127 @@ def test_scheduled_run_completion_idle_transitions_to_succeeded() -> None:
     run_id, status, error, error_code = sched.update_calls[0]
     assert (run_id, status) == ("run_1", "succeeded")
     assert error is None and error_code is None
+
+
+@pytest.mark.parametrize(
+    ("transcript", "ends_the_run", "copied_items"),
+    [
+        # Claude Code reports idle while it starts, before it has read the prompt.
+        pytest.param(_RUN_STARTED[:1], False, 0, id="agent-starting"),
+        pytest.param(_RUN_STARTED, False, 0, id="prompt-not-yet-read"),
+        # A run started from a copy of a session: the copy keeps its history's times.
+        pytest.param(
+            [
+                _transcript_item("message", _FIRED_AT - 600, "user"),
+                _transcript_item("message", _FIRED_AT - 590, "assistant"),
+                *_RUN_STARTED,
+            ],
+            False,
+            2,
+            id="copied-history",
+        ),
+        pytest.param(
+            [*_RUN_STARTED, _transcript_item("function_call", _FIRED_AT + 9)],
+            True,
+            0,
+            id="stopped-after-a-tool-call",
+        ),
+        pytest.param(_RUN_ANSWERED, True, 0, id="agent-replied"),
+        pytest.param(_SAME_SECOND_HISTORY, False, 1, id="same-second-history-before-prompt"),
+        pytest.param(
+            [*_SAME_SECOND_HISTORY, *_RUN_STARTED], False, 1, id="same-second-history-before-work"
+        ),
+        pytest.param(
+            [
+                *_SAME_SECOND_HISTORY,
+                _transcript_item("message", _FIRED_AT, "user"),
+                _transcript_item("message", _FIRED_AT, "assistant"),
+            ],
+            True,
+            1,
+            id="same-second-new-reply",
+        ),
+    ],
+)
+@pytest.mark.parametrize("bookkeeping_tail", [0, 50, 51])
+def test_an_idle_edge_ends_a_scheduled_run_only_after_its_agent_worked(
+    transcript: list[SimpleNamespace],
+    ends_the_run: bool,
+    copied_items: int,
+    bookkeeping_tail: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An idle edge ends the run only once its agent has written to the session."""
+    conversations = SqlAlchemyConversationStore(f"sqlite:///{tmp_path / 'completion.db'}")
+    conversation = conversations.create_conversation(
+        labels={SCHEDULED_TASK_RUN_LABEL_KEY: "older-run"}
+    )
+
+    def append_items(session_id: str, items: list[SimpleNamespace]) -> None:
+        for item in items:
+            monkeypatch.setattr(
+                "omnigent.stores.conversation_store.sqlalchemy_store.now_epoch",
+                lambda stamp=item.created_at: stamp,
+            )
+            if item.type == "message":
+                data = MessageData(
+                    role=item.data.role,
+                    agent="agent" if item.data.role == "assistant" else None,
+                    content=[{"type": "text", "text": "Run work"}],
+                )
+            elif item.type == "function_call":
+                data = FunctionCallData(
+                    agent="agent", call_id=item.id, name="check", arguments="{}"
+                )
+            else:
+                data = ResourceEventData(
+                    event_type="session.task.updated", resource_type="task", resource_id=item.id
+                )
+            conversations.append(
+                session_id, [NewConversationItem(type=item.type, response_id="turn", data=data)]
+            )
+
+    if copied_items:
+        append_items(conversation.id, transcript[:copied_items])
+        conversation = conversations.fork_conversation(conversation.id, copy_journal=False)
+    conversations.set_labels(
+        conversation.id,
+        {
+            SCHEDULED_TASK_RUN_LABEL_KEY: "run_1",
+            SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY: "run_1",
+        },
+    )
+    append_items(conversation.id, transcript[copied_items:])
+    if ends_the_run:
+        conversations.update_scheduled_run_label(conversation.id, "continuation", action="begin")
+        append_items(conversation.id, [_transcript_item("message", _FIRED_AT + 10, "assistant")])
+        assert (
+            conversations.get_conversation(conversation.id).labels[
+                SCHEDULED_TASK_ACTIVITY_LABEL_KEY
+            ]
+            == "run_1"
+        )
+    append_items(
+        conversation.id,
+        [_transcript_item("resource_event", _FIRED_AT + 100) for _ in range(bookkeeping_tail)],
+    )
+    sched = _FakeScheduledTaskStore({conversation.id: "run_1"})
+    session_live_state.configure(conversations, sched)  # type: ignore[arg-type]
+    try:
+        session_live_state.persist_scheduled_run_completion(conversation.id, "succeeded")
+        # One ordered worker: once this no-op has run, so has the hook.
+        session_live_state.submit("test_barrier", lambda: None).result(timeout=10)
+        # Evidence from this run must not complete a later invocation.
+        sched._running_by_conv[conversation.id] = "run_2"
+        conversations.set_labels(conversation.id, {SCHEDULED_TASK_RUN_LABEL_KEY: "run_2"})
+        session_live_state.persist_scheduled_run_completion(conversation.id, "succeeded")
+        session_live_state.submit("test_barrier", lambda: None).result(timeout=10)
+    finally:
+        session_live_state.configure(None)
+    assert [call[:2] for call in sched.update_calls] == (
+        [("run_1", "succeeded")] if ends_the_run else []
+    )
 
 
 def test_scheduled_run_completion_failed_carries_error_code() -> None:

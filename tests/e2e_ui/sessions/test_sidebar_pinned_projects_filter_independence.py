@@ -206,7 +206,7 @@ def test_project_folders_follow_archived_filter(
 
         project_button = page.get_by_role("button", name=project, exact=True)
         if project_button.get_attribute("aria-expanded") != "true":
-            project_button.click()
+            project_button.locator("[data-section-toggle]").first.click()
         expect(project_button).to_have_attribute("aria-expanded", "true")
         folder = page.get_by_role("button", name=project, exact=True).locator(
             "xpath=ancestor::section[1]"

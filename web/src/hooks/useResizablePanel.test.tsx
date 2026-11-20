@@ -119,4 +119,26 @@ describe("useResizablePanel persistence", () => {
     first.unmount();
     second.unmount();
   });
+
+  it("keeps a panel with its own storage key apart from the push panels", () => {
+    const push = renderHook(() => useResizablePanel(true));
+    const project = renderHook(() =>
+      useResizablePanel(true, 40, 320, "projectSessionPanelWidthPx"),
+    );
+
+    act(() => {
+      project.result.current.handleProps.onKeyDown({
+        key: "ArrowRight",
+        preventDefault: () => {},
+      } as React.KeyboardEvent);
+    });
+
+    expect(project.result.current.panelWidth).toBe(780);
+    expect(readPanelSizePreference("projectSessionPanelWidthPx")).toBe(780);
+    expect(push.result.current.panelWidth).toBe(1000);
+    expect(readPanelSizePreference("pushPanelWidthPx")).toBeNull();
+
+    push.unmount();
+    project.unmount();
+  });
 });

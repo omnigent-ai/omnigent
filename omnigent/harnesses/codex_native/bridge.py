@@ -399,6 +399,12 @@ def write_mcp_bridge_config(bridge_dir: Path) -> None:
             os.unlink(tmp_name)
 
 
+# Omnigent's tools can wait a day for a person, such as a workflow question;
+# Codex otherwise ends an MCP tool call after 60 seconds. A little over the
+# runner's wait, so the runner's own "no answer" reaches the agent first.
+OMNIGENT_MCP_TOOL_TIMEOUT_S = 86400 + 600
+
+
 def codex_mcp_config_overrides(
     bridge_dir: Path,
     *,
@@ -437,6 +443,7 @@ def codex_mcp_config_overrides(
     return [
         f'mcp_servers.omnigent.command="{python}"',
         f"mcp_servers.omnigent.args={args_toml}",
+        f"mcp_servers.omnigent.tool_timeout_sec={OMNIGENT_MCP_TOOL_TIMEOUT_S}",
         f"mcp_servers.omnigent.env.{DATA_DIR_ENV_VAR}={json.dumps(str(native_bridge_common.native_bridge_data_dir()))}",
     ]
 

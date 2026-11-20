@@ -3,7 +3,7 @@ import { useRef, useState } from "react";
 import { PullRequestStatusIcon } from "@/components/PullRequestStatusIcon";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import type { ComposerPullRequest } from "@/hooks/useComposerGitStatus";
-import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { gitProviderCopy } from "@/lib/gitProviders";
 import { followLinkWithPopupFallback, parseHttpUrl } from "@/lib/openLinkInApp";
 import {
@@ -105,7 +105,7 @@ export function ComposerPrLink({
   conversationId?: string;
   className?: string;
 }) {
-  const isCoarsePointer = useIsCoarsePointer();
+  const isMobileViewport = useIsMobileViewport();
   const [previewOpen, setPreviewOpen] = useState(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const previewRef = useRef<HTMLDivElement>(null);
@@ -139,7 +139,7 @@ export function ComposerPrLink({
   const status = prStatus ?? "unknown";
   const presentation = pullRequestStatusPresentation(status);
   const showPreview = prs.length > 0;
-  const showNativeHint = !showPreview || isCoarsePointer;
+  const showNativeHint = !showPreview || isMobileViewport;
   const openHint =
     prCount > 1
       ? "View these PRs in the Pull Requests tab"

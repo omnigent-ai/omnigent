@@ -245,7 +245,9 @@ def test_shared_loading_keeps_pins_and_projects_mounted(
     page.goto(base_url, wait_until="domcontentloaded")
     pin = page.get_by_text("Stable pinned session", exact=True)
     expect(pin).to_be_visible()
-    page.get_by_role("button", name="Stable project", exact=True).click()
+    page.get_by_role("button", name="Stable project", exact=True).locator(
+        "[data-section-toggle]"
+    ).first.click()
     folder_row = page.get_by_text("Stable project session", exact=True)
     expect(folder_row).to_be_visible()
     pin_element = pin.element_handle()
