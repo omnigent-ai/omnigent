@@ -2352,13 +2352,13 @@ def test_kimi_declared_auth_raises(
     ``--mcp-config-file``), so declared auth can't be threaded. Silently
     launching against whatever ambient ``~/.kimi-code/config.toml`` resolves to
     would be a confused-deputy / mis-attribution risk, so the builder raises
-    instead. Regression guard for the originally-dead ``OmnigentError``."""
-    from omnigent.errors import OmnigentError
+    instead. The typed error allows only this fixed guidance through to clients."""
+    from omnigent.errors import KimiAuthConfigurationError
 
     _write_config(config_home, {"providers": {}})
     spec = _make_spec(harness="kimi", auth=auth)
 
-    with pytest.raises(OmnigentError, match=r"kimi.*does not support"):
+    with pytest.raises(KimiAuthConfigurationError, match=r"kimi.*does not support"):
         _build_kimi_spawn_env(spec, cwd=None)
 
 

@@ -840,10 +840,12 @@ L7 egress proxy attaches the credential on the way out. It requires `egress_rule
 network-isolating backend (`linux_bwrap` or `darwin_seatbelt`). See
 `designs/SANDBOX_CREDENTIAL_PROXY.md` for the full type table.
 
-Inner workers accept `sandbox.credential_proxy` only with Codex's supported
-brokered gateway configuration. Nonbrokered Codex and non-Codex inner workers
-reject these policies. The general proxy types described below do not imply
-support for launching an inner worker with them.
+Inner workers accept `sandbox.credential_proxy` with Codex's supported brokered
+gateway configuration or Claude SDK's owned worker environment and credential
+broker. Direct Claude CLI preparation without an owned worker environment,
+nonbrokered Codex, and other inner adapters reject these policies. The general
+proxy types described below do not imply support for launching an inner worker
+with them.
 
 The `databricks_cli` type is for framework tools, not inner workers. It proxies
 the Databricks CLI. List the profiles to

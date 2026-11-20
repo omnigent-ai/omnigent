@@ -220,14 +220,13 @@ class pexpect_suppress:
 
 
 def test_kimi_auth_rejection_names_the_real_kimi_code_config_path(tmp_path: Path) -> None:
-    """The logged ``executor.auth`` rejection names Kimi Code's real config.
+    """The public ``executor.auth`` rejection names Kimi Code's real config.
 
     Journey: a configured Kimi Code install (CLI on PATH + login credential),
     launch a kimi agent whose spec declares ``executor.auth``. The launch is
-    rejected by design (kimi has no per-spawn auth injection). The CLI keeps
-    exception details private and points at the runner log. Follow that
-    reference to verify the launch reached the auth rejection and its
-    diagnostic names ``$KIMI_CODE_HOME/config.toml`` or the default
+    rejected by design (kimi has no per-spawn auth injection). The CLI shows
+    fixed configuration guidance and keeps private diagnostics in the runner
+    log. Verify both name ``$KIMI_CODE_HOME/config.toml`` or the default
     ``~/.kimi-code/config.toml``, rather than legacy ``~/.kimi/config.toml``.
     """
     home = tmp_path / "home"
@@ -278,9 +277,11 @@ def test_kimi_auth_rejection_names_the_real_kimi_code_config_path(tmp_path: Path
     output = proc.stdout + proc.stderr
 
     assert proc.returncode != 0, output
-    assert "turn setup failed: Request failed on the runner" in output, output
     auth_rejection = "The 'kimi' harness does not support per-invocation provider"
-    assert auth_rejection not in output, output
+    assert f"turn setup failed: {auth_rejection}" in output, output
+    assert "Remove ``executor.auth``" in output, output
+    assert "~/.kimi-code/config.toml" in output, output
+    assert "~/.kimi/config.toml" not in output, output
     assert str(home) not in output, output
     assert "sk-e2e-stub" not in output, output
 

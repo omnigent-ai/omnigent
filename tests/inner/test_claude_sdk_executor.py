@@ -5353,10 +5353,11 @@ def test_resolve_sandbox_cwd_roots_relative_at_runner_workspace(monkeypatch) -> 
     assert _resolve_sandbox_cwd(".") == Path("/tmp").resolve(strict=False)
 
 
-def test_prepare_claude_cli_path_rejects_bypass_for_requested_sandbox(monkeypatch) -> None:
+@pytest.mark.parametrize("bypass", ["1", "true", "yes"])
+def test_prepare_claude_cli_path_rejects_bypass_for_requested_sandbox(monkeypatch, bypass) -> None:
     from omnigent.inner.claude_sdk_executor import prepare_claude_cli_path
 
-    monkeypatch.setenv("OMNIGENT_CLAUDE_SDK_NO_SANDBOX", "1")
+    monkeypatch.setenv("OMNIGENT_CLAUDE_SDK_NO_SANDBOX", bypass)
     launcher = Mock()
     monkeypatch.setattr("omnigent.inner.claude_sdk_executor.create_exec_launcher", launcher)
     with pytest.raises(OSError, match="conflicts with the requested sandbox"):

@@ -38,6 +38,7 @@ from omnigent.entities import (
 )
 from omnigent.errors import (
     ErrorCode,
+    KimiAuthConfigurationError,
     OmnigentError,
     StaleCursorError,
     restart_on_stale_cursor,
@@ -2547,17 +2548,7 @@ def _build_kimi_spawn_env(
         launch against an unrelated ambient provider.
     """
     if spec.executor.auth is not None:
-        raise OmnigentError(
-            "The 'kimi' harness does not support per-invocation provider / "
-            "auth injection: upstream kimi has no per-spawn config override "
-            "(no ``--config-file`` / ``--mcp-config-file``). Remove "
-            "``executor.auth`` from the spec and configure the provider once "
-            "via `kimi provider add` in $KIMI_CODE_HOME/config.toml (default "
-            "~/.kimi-code/config.toml), then pin the "
-            "resulting model id in the agent spec. Omnigent-side provider "
-            "injection is a deferred follow-up.",
-            code=ErrorCode.INVALID_INPUT,
-        )
+        raise KimiAuthConfigurationError()
     env: dict[str, str] = {}
     model = _resolve_spec_model(spec)
     if model is not None:

@@ -2670,7 +2670,9 @@ async def test_background_setup_failure_preserves_replacement_turn(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure_kind", ["model-discovery", "other-setup"])
+@pytest.mark.parametrize(
+    "failure_kind", ["model-discovery", "other-setup", "public-config", "wrapped-public-config"]
+)
 async def test_runner_failed_status_carries_setup_error_message(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -2693,7 +2695,7 @@ async def test_runner_failed_status_carries_setup_error_message(
     """
     from unittest.mock import Mock
 
-    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.errors import ErrorCode, KimiAuthConfigurationError, OmnigentError
     from omnigent.models.model_resolver import ModelResolutionError
     from omnigent.runtime import workflow
 
@@ -2736,6 +2738,13 @@ async def test_runner_failed_status_carries_setup_error_message(
                 workflow._resolve_catalog_default_model(
                     "provider.example.test", "openai", context=raised_message
                 )
+            if failure_kind in ("public-config", "wrapped-public-config"):
+                try:
+                    raise KimiAuthConfigurationError() from ValueError(raised_message)
+                except KimiAuthConfigurationError as exc:
+                    if failure_kind == "wrapped-public-config":
+                        raise OmnigentError(raised_message, code=ErrorCode.INVALID_INPUT) from exc
+                    raise
             raise OmnigentError(raised_message, code=ErrorCode.INVALID_INPUT)
         return {}
 
@@ -2826,14 +2835,18 @@ async def test_runner_failed_status_carries_setup_error_message(
     assert failed_event is not None
     error = failed_event.get("error")
     assert isinstance(error, dict)
-    model_guidance = (
+    public_guidance = (
         "No default model could be resolved. Set 'executor.model' in the agent YAML "
         "or a provider 'models.default', or retry when model discovery is available. "
         if failure_kind == "model-discovery"
         else ""
     )
+    if failure_kind in ("public-config", "wrapped-public-config"):
+        public_guidance = f"{KimiAuthConfigurationError.client_message} "
+        assert "Remove ``executor.auth``" in error["message"]
+        assert "~/.kimi-code/config.toml" in error["message"]
     assert error["message"] == (
-        f"turn setup failed: {model_guidance}Request failed on the runner; "
+        f"turn setup failed: {public_guidance}Request failed on the runner; "
         f"see the runner log for details: {pinned_runner_log}"
     )
     assert undelivered["response"]["error"]["message"] == error["message"]

@@ -13,7 +13,7 @@ import httpx
 
 from omnigent.debug_logging import runner_primary_session_id
 from omnigent.entities.scheduled_task import ScheduledRunLogContext
-from omnigent.errors import OmnigentError
+from omnigent.errors import KimiAuthConfigurationError, OmnigentError
 from omnigent.inner.native_attachments import (
     framework_notice_block,
     has_unresolved_file_id,
@@ -88,6 +88,9 @@ def _client_safe_error_detail(exc: BaseException, *, context: str) -> str:
     log_reference = process_log_reference("runner")
     detail = f"Request failed on the runner; see the runner log for details: {log_reference}"
     policy_error = exc.__cause__ if isinstance(exc, OmnigentError) else exc
+    for candidate in (exc, policy_error):
+        if isinstance(candidate, KimiAuthConfigurationError):
+            return f"{candidate.client_message} {detail}"
     if isinstance(policy_error, HarnessSandboxValidationError):
         return f"{policy_error.client_message} {detail}"
     if isinstance(exc, OmnigentError) and isinstance(policy_error, ModelResolutionError):

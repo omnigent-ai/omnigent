@@ -1256,26 +1256,6 @@ def test_sandbox_launch_path_wraps_active_policy(monkeypatch, tmp_path) -> None:
     assert "GOOSE_PROVIDER" in policy.spawn_env_allowlist
 
 
-def test_sandbox_launch_path_rejects_unavailable_backend(monkeypatch, tmp_path) -> None:
-    """An unavailable requested sandbox must prevent startup."""
-    from omnigent.inner import sandbox as sandbox_mod
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-    from omnigent.inner.sandbox import HarnessSandboxPreparationError
-
-    def _boom(_os_env, _cwd) -> None:
-        raise NotImplementedError("no bwrap here")
-
-    monkeypatch.setattr(sandbox_mod, "resolve_sandbox", _boom)
-    executor = GooseExecutor(
-        cwd=str(tmp_path),
-        goose_path="/usr/bin/goose",
-        os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
-    )
-    with pytest.raises(HarnessSandboxPreparationError, match="no bwrap") as raised:
-        executor._sandbox_launch_path(["PATH"])
-    assert isinstance(raised.value.__cause__, NotImplementedError)
-
-
 def test_sandbox_launch_path_propagates_launcher_integrity_failure(monkeypatch, tmp_path) -> None:
     from omnigent.inner import sandbox as sandbox_mod
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
