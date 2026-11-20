@@ -64,7 +64,7 @@ def test_explicit_repo_is_used_for_all_pr_reads(
     monkeypatch.setattr(pr_resource, "_git_output", forbidden_git)
     info = github.github_info(tracked, session_id="session", pr_url=B)
     assert info["pr"]["title"] == "Second repository"
-    # Chat reads the base query for the checkout's repo, so an explicit read names none.
+    # Explicit PR reads omit the workspace repo.
     assert "workspace_repo" not in info
     assert {pr["url"] for pr in info["prs"]} == {A, B}
     assert (

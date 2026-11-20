@@ -75,6 +75,9 @@ describe("splitPullRequestRefs", () => {
     ["修复#4242", [`${PULL_REQUEST_REF_HREF_PREFIX}4242`]],
     ["修复了#1234。", [`${PULL_REQUEST_REF_HREF_PREFIX}1234`]],
     ["#1234を修正", [`${PULL_REQUEST_REF_HREF_PREFIX}1234`]],
+    // Japanese marks like the prolonged sound mark count with their scripts.
+    ["#4242ーを修正", [`${PULL_REQUEST_REF_HREF_PREFIX}4242`]],
+    ["ーー#4242", [`${PULL_REQUEST_REF_HREF_PREFIX}4242`]],
     [
       "修复#1234和#5678",
       [`${PULL_REQUEST_REF_HREF_PREFIX}1234`, `${PULL_REQUEST_REF_HREF_PREFIX}5678`],
@@ -122,6 +125,7 @@ describe("splitPullRequestRefs", () => {
     "docs/说明#1234",
     "docs/说明acme/app#12",
     "docs/𠀀明#1234",
+    "docs/ーデ#1234",
     "docs\\𠀀明#1234",
     "#1234é",
     "#4242.md",

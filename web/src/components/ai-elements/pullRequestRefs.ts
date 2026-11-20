@@ -18,7 +18,7 @@ export interface PullRequestRef {
 // Unicode letters, digits and marks on either side block a reference, as does an
 // extension (`#4242.md`); Han, kana and Hangul may border one outside a path segment.
 // Bare numbers need 4+ digits. A captured prefix replaces lookbehind for Safari < 16.4.
-const UNSPACED_SCRIPT = "\\p{sc=Han}\\p{sc=Hiragana}\\p{sc=Katakana}\\p{sc=Hangul}";
+const UNSPACED_SCRIPT = "\\p{scx=Han}\\p{scx=Hiragana}\\p{scx=Katakana}\\p{scx=Hangul}";
 export const PULL_REQUEST_REF = new RegExp(
   `(^|[^\\p{L}\\p{N}\\p{M}_&/#.-]|[${UNSPACED_SCRIPT}])` +
     "(?:([A-Za-z0-9][A-Za-z0-9-]{0,38})\\/([A-Za-z0-9._-]{1,100}))?#(\\d+)" +
