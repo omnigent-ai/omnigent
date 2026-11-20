@@ -174,7 +174,7 @@ export interface SettingsAvailability {
   floatingComposerShortcut: boolean;
   /** The shell has an in-app browser for chat links. */
   inAppBrowser: boolean;
-  /** This viewer is an admin, and the server offers its admin view. */
+  /** Settings shows the Admin view switch: to an admin-eligible viewer, where the server offers it. */
   adminView: boolean;
   /** The server signs people in with its own accounts, which have a password here. */
   accountsEnabled: boolean;
@@ -184,6 +184,12 @@ export interface SettingsAvailability {
   mcpServices: boolean;
   /** Which sandbox account connections the server lists in `enabled_connections`. */
   integrationProviders: { github: boolean; databricks: boolean };
+  /** The server turns on project kanban boards. */
+  projectKanban: boolean;
+  /** The server lets people write their own session title instructions. */
+  sessionTitleInstructions: boolean;
+  /** The server offers the proactive agent. */
+  proactiveAgent: boolean;
 }
 
 export interface SettingsEntry {

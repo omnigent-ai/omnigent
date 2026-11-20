@@ -36,6 +36,7 @@ import * as adminView from "@/lib/adminView";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import { UPDATE_MODE_ENTRY } from "@/pages/settings/search/catalog/updates";
 import { settingsDescriptionId } from "@/pages/settings/search/settingsControl";
+import { useSettingsAvailability } from "@/pages/settings/search/useSettingsAvailability";
 import { UI_FONT_SIZE_MOBILE_QUERY } from "@/lib/uiFontPreferences";
 import {
   CODE_BLOCK_WORD_WRAP_STORAGE_KEY,
@@ -298,6 +299,21 @@ function LocationProbe() {
   return <span data-testid="location">{useLocation().pathname}</span>;
 }
 
+/** Whether Settings search offers the Admin view row, read beside the page that shows it. */
+function AdminViewSearchProbe() {
+  return (
+    <span data-testid="search-offers-admin-view">
+      {String(useSettingsAvailability().adminView)}
+    </span>
+  );
+}
+
+/** Search offers Admin view exactly where the page shows its switch. */
+function expectSearchToMatchAdminViewSwitch() {
+  const shown = screen.queryByRole("switch", { name: "Admin view" }) !== null;
+  expect(screen.getByTestId("search-offers-admin-view")).toHaveTextContent(String(shown));
+}
+
 function renderPage(path = "/settings") {
   // The Appearance section lists the agent catalog (picker visibility), so the
   // page needs a query client like it has in the real app. Retries off so a
@@ -313,6 +329,7 @@ function renderPage(path = "/settings") {
           <MemoryRouter initialEntries={[path]}>
             <SettingsPage />
             <LocationProbe />
+            <AdminViewSearchProbe />
           </MemoryRouter>
         </Embed>
       </TooltipProvider>
@@ -476,6 +493,7 @@ describe("SettingsPage", () => {
       try {
         renderPage("/settings/general");
         expect(screen.queryByRole("switch", { name: "Admin view" })).toBeNull();
+        expectSearchToMatchAdminViewSwitch();
       } finally {
         document.cookie = "omnigent_admin_view=; Max-Age=0; Path=/";
       }
@@ -487,6 +505,7 @@ describe("SettingsPage", () => {
     vi.spyOn(host, "isDatabricksWorkspace").mockReturnValue(true);
     renderPage("/settings/general");
     expect(screen.queryByRole("switch", { name: "Admin view" })).toBeNull();
+    expectSearchToMatchAdminViewSwitch();
   });
 
   it.each([
@@ -507,6 +526,7 @@ describe("SettingsPage", () => {
       try {
         renderPage("/settings/general");
         const control = screen.getByRole("switch", { name: "Admin view" });
+        expectSearchToMatchAdminViewSwitch();
         expect(control).toHaveAttribute("aria-checked", String(enabled));
         fireEvent.click(control);
         expect(update).toHaveBeenCalledWith(!enabled);

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { SETTINGS_ENTRIES } from "./catalog";
 import type { SettingsAvailability, SettingsEntry } from "./catalog/types";
 import {
   searchSettings,
@@ -57,6 +58,9 @@ const SHOWN: SettingsAvailability = {
   archiveWorktreeCleanup: true,
   mcpServices: true,
   integrationProviders: { github: true, databricks: true },
+  projectKanban: true,
+  sessionTitleInstructions: true,
+  proactiveAgent: true,
 };
 const HIDDEN: SettingsAvailability = {
   globalShortcut: false,
@@ -67,6 +71,9 @@ const HIDDEN: SettingsAvailability = {
   archiveWorktreeCleanup: false,
   mcpServices: false,
   integrationProviders: { github: false, databricks: false },
+  projectKanban: false,
+  sessionTitleInstructions: false,
+  proactiveAgent: false,
 };
 
 const targets = settingsSearchTargets(
@@ -237,6 +244,21 @@ describe("availability", () => {
     expect(settingsSearchTargets([STEER], SECTIONS, HIDDEN).map((target) => target.key)).toEqual([
       "fixture.steer",
     ]);
+  });
+
+  // The General rows the page renders only where the build or server offers them, each by its own
+  // gate: turning off only that gate hides it, and turning on only that gate shows it.
+  it.each([
+    ["browser-agent-tools", "inAppBrowser"],
+    ["project-kanban-board", "projectKanban"],
+    ["session-title-instructions", "sessionTitleInstructions"],
+    ["proactive-agent", "proactiveAgent"],
+  ] as const)("offers the catalog's %s only where %s is on", (id, gate) => {
+    const offered = (availability: SettingsAvailability) =>
+      settingsSearchTargets(SETTINGS_ENTRIES, SECTIONS, availability).map((target) => target.key);
+    expect(offered(SHOWN)).toContain(id);
+    expect(offered({ ...SHOWN, [gate]: false })).not.toContain(id);
+    expect(offered({ ...HIDDEN, [gate]: true })).toContain(id);
   });
 });
 
