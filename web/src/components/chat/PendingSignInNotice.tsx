@@ -5,10 +5,7 @@ import { getSessionSignInLink } from "@/lib/sessionsApi";
 /** How often an empty native session asks its host whether the agent pane awaits a sign-in. */
 export const PENDING_SIGN_IN_POLL_MS = 5_000;
 
-/**
- * Offer the launcher sign-in a native session's agent pane is parked on before
- * the first message, which would otherwise only reveal it by failing.
- */
+/** Offer the sign-in a native agent pane is waiting on before the first message fails on it. */
 export function PendingSignInNotice({ sessionId }: { sessionId: string }) {
   const { data } = useQuery({
     queryKey: ["session-sign-in-link", sessionId],
