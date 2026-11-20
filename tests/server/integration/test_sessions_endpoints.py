@@ -1313,6 +1313,31 @@ async def test_session_snapshot_reflects_terminal_pending_cache(
         sessions_module._session_terminal_pending_cache.pop(session["id"], None)
 
 
+async def test_session_snapshot_drops_expired_terminal_pending(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A terminal-pending flag nothing clears stops marking the session.
+
+    Create sets the flag on the replica that serves it, and the runner's
+    clear lands on the replica that holds the runner's tunnel, so the flag
+    must expire on its own.
+    """
+    import time
+
+    from omnigent.server.routes import sessions as sessions_module
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    sessions_module._session_terminal_pending_cache[session["id"]] = True
+    now = time.monotonic()
+    monkeypatch.setattr(time, "monotonic", lambda: now + 601)
+    snap = await client.get(f"/v1/sessions/{session['id']}")
+    assert snap.status_code == 200
+    assert snap.json()["terminal_pending"] is False
+
+
 async def test_external_session_status_event_lands_in_status_cache(
     client: httpx.AsyncClient,
 ) -> None:
