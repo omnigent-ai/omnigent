@@ -3966,6 +3966,80 @@ describe("floating panel wiring", () => {
     sender: h.webContents,
     senderFrame: { url: h.webContents.getURL() },
   });
+  /**
+   * The harness window as the panel, beside a separate main window of its server that announces
+   * support, on mocked timers.
+   */
+  function preloadScenario(t) {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const panel = asPanelWindow(h);
+    h.api.windows.get(h.win).role = "panel";
+    h.setUrl(`${serverUrl}/compose/floating`);
+    const main = addMain(h);
+    const announceFromMain = () => {
+      const frame = { url: main.url };
+      main.webContents.mainFrame = frame;
+      h.ipc.get("omnigent:floating-composer:announce")(
+        { sender: main.webContents, senderFrame: frame },
+        1,
+      );
+    };
+    const built = () => (h.calls.windowOptions ?? []).filter((o) => o.type === "panel").length;
+    return { h, panel, main, announceFromMain, built };
+  }
+
+  it("an early ⇧⌘Space builds the panel itself and calls off the build ahead", (t) => {
+    const { h, announceFromMain, built } = preloadScenario(t);
+    announceFromMain();
+    t.mock.timers.tick(1000);
+    h.calls.presses.get(chord)();
+    assert.equal(built(), 1);
+    // A build ahead still pending would build the panel again once this one is gone.
+    h.api.floatingComposer().close(h.win);
+    t.mock.timers.tick(3000);
+    assert.equal(built(), 1);
+  });
+
+  it("a crashed panel built ahead isn't rebuilt until ⇧⌘Space", (t) => {
+    const { h, announceFromMain, built } = preloadScenario(t);
+    announceFromMain();
+    t.mock.timers.tick(3000);
+    assert.equal(built(), 1);
+    h.api.floatingComposer().markReady(h.win);
+    h.webContents.isCrashed = () => true;
+    h.webContents.emitWith("render-process-gone", {}, { reason: "crashed" });
+    t.mock.timers.tick(10_000);
+    assert.equal(built(), 1);
+    h.calls.presses.get(chord)();
+    assert.equal(built(), 2);
+  });
+
+  it("lets a panel built ahead go 3 s after its server's latest revoke, unless it announces again", (t) => {
+    const { panel, main, announceFromMain, built } = preloadScenario(t);
+    announceFromMain();
+    t.mock.timers.tick(3000);
+    assert.equal(built(), 1);
+    // A reload: the old document goes, the new one announces a second later.
+    main.webContents.emit("did-navigate");
+    t.mock.timers.tick(1000);
+    announceFromMain();
+    t.mock.timers.tick(3000);
+    assert.equal(panel.destroyed, false, "the announcement called the release off");
+    // Another reload, then the page goes again before its first release was due.
+    main.webContents.emit("did-navigate");
+    t.mock.timers.tick(1000);
+    announceFromMain();
+    t.mock.timers.tick(500);
+    main.webContents.emit("did-navigate");
+    t.mock.timers.tick(2999);
+    assert.equal(panel.destroyed, false, "the wait restarts from the latest revoke");
+    t.mock.timers.tick(1);
+    assert.equal(panel.destroyed, true);
+  });
+
   const openFromPanel = async (h, routePath) => ({
     ...(await h.ipc.get("omnigent:floating-composer:open-in-main-window")(fromPanel(h), routePath)),
   });
@@ -7073,14 +7147,6 @@ describe("floating panel loading", () => {
     t.mock.timers.tick(1);
     assert.equal(panelsBuilt(h), 1);
     assert.equal(panel.visible, false, "built out of sight");
-  });
-
-  it("cancels a pending build when ⇧⌘Space comes first, as live code", () => {
-    // The press builds the panel itself; the preloader's own test covers cancelling the wait.
-    assert.match(
-      liveCode,
-      /function openFloatingComposerFromShortcut\(\) \{\s*floatingComposerPreloader\.cancel\(\);/,
-    );
   });
 
   it("builds nothing ahead while the user has turned the shortcut off", (t) => {

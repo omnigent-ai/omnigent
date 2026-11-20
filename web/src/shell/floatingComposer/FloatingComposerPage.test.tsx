@@ -84,10 +84,14 @@ describe("FloatingComposerPage", () => {
       const { FloatingComposerPage: FreshPage } = await import("./FloatingComposerPage");
       const first = render(<FreshPage />);
       expect(bridge.ready).not.toHaveBeenCalled();
+      // The first frame's callback runs before that frame paints; ready waits for the next one.
+      for (const frame of frames.splice(0)) frame(0);
+      expect(bridge.ready).not.toHaveBeenCalled();
       for (const frame of frames.splice(0)) frame(0);
       expect(bridge.ready).toHaveBeenCalledTimes(1);
       first.unmount();
       render(<FreshPage />);
+      for (const frame of frames.splice(0)) frame(0);
       for (const frame of frames.splice(0)) frame(0);
       expect(bridge.ready).toHaveBeenCalledTimes(1);
     } finally {

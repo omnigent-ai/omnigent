@@ -122,11 +122,9 @@ function floatingComposerWindowOptions() {
  *   isCurrent: (panel: import("electron").BrowserWindow, serverUrl: string) => boolean,
  *   quitting: () => boolean,
  *   present?: (panel: import("electron").BrowserWindow, show: () => void) => void,
- *   panelClosed?: (serverUrl: string, wasReady: boolean) => void,
  *   readyFallbackMs?: number,
  * }} deps `isCurrent` says whether a panel still shows its server's panel page; `present`
- *   puts a hidden panel on screen, such as with a fade, by calling `show`; `panelClosed`
- *   hears that a panel went away, and whether its page had ever been ready.
+ *   puts a hidden panel on screen, such as with a fade, by calling `show`.
  */
 function createFloatingComposerController(deps) {
   /** @type {Map<string, import("electron").BrowserWindow>} */
@@ -140,8 +138,6 @@ function createFloatingComposerController(deps) {
   const saveTimers = new Map();
   /** Panels whose current document said its composer rendered; this ends with the document. */
   const ready = new Set();
-  /** Panels that have rendered a page at least once, so losing one is worth building again. */
-  const everReady = new WeakSet();
   /** Panels built hidden ahead of an open, and never shown since. */
   const unshown = new Set();
   /** Opens waiting for a loading page: the panel → its fallback timer. */
@@ -269,7 +265,6 @@ function createFloatingComposerController(deps) {
       pickerOpen.delete(panel);
       ready.delete(panel);
       unshown.delete(panel);
-      deps.panelClosed?.(serverUrl, everReady.has(panel));
     });
     panels.set(serverUrl, panel);
     return panel;
@@ -307,10 +302,12 @@ function createFloatingComposerController(deps) {
     show(serverUrl) {
       if (typeof serverUrl !== "string" || serverUrl.length === 0) return "unavailable";
       const panel = panelFor(serverUrl);
-      // Asked for now: no longer a build ahead that a release may drop, and another server's
-      // build ahead isn't needed.
+      // Asked for now: no longer a build ahead that a release may drop. Another server's build
+      // ahead isn't needed, and its open still waiting on its page is superseded.
       unshown.delete(panel);
       for (const [otherUrl, other] of [...panels]) {
+        if (other === panel) continue;
+        cancelReveal(other);
         if (unshown.has(other)) discard(otherUrl, other);
       }
       if (panel.isVisible()) {
@@ -358,7 +355,6 @@ function createFloatingComposerController(deps) {
     markReady(panel) {
       if (!isPanel(panel) || panel.isDestroyed()) return;
       ready.add(panel);
-      everReady.add(panel);
       if (pendingReveals.has(panel)) reveal(serverUrlFor(panel), panel);
     },
 
@@ -419,9 +415,8 @@ function createFloatingComposerController(deps) {
 
 /**
  * Builds a panel hidden once the app has been quiet for a while, so ⇧⌘Space shows a page that
- * has already loaded. Each `schedule` restarts the wait; an open before it ends cancels it.
- * `rebuildOnce` builds again after a loaded panel was lost, once until the next `schedule`, so a
- * page that keeps crashing isn't rebuilt forever.
+ * has already loaded. Each `schedule` restarts the wait; an open before it ends cancels it. A
+ * panel lost later is built by the next open, or ahead after the next announcement.
  *
  * @param {{
  *   target: () => string | null,
@@ -431,29 +426,19 @@ function createFloatingComposerController(deps) {
  */
 function createFloatingComposerPreloader(deps) {
   let timer = null;
-  let rebuilt = false;
   const cancel = () => {
     if (timer !== null) clearTimeout(timer);
     timer = null;
   };
-  const start = () => {
-    cancel();
-    timer = setTimeout(() => {
-      timer = null;
-      const serverUrl = deps.target();
-      if (serverUrl !== null) deps.preload(serverUrl);
-    }, deps.delayMs ?? FLOATING_COMPOSER_PRELOAD_DELAY_MS);
-    timer.unref?.();
-  };
   return {
     schedule() {
-      rebuilt = false;
-      start();
-    },
-    rebuildOnce() {
-      if (rebuilt) return;
-      rebuilt = true;
-      start();
+      cancel();
+      timer = setTimeout(() => {
+        timer = null;
+        const serverUrl = deps.target();
+        if (serverUrl !== null) deps.preload(serverUrl);
+      }, deps.delayMs ?? FLOATING_COMPOSER_PRELOAD_DELAY_MS);
+      timer.unref?.();
     },
     cancel,
   };

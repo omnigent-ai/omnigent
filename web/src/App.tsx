@@ -225,7 +225,10 @@ function AppRoutes({ basename }: AppProps) {
         <Route
           path={`${prefix}${FLOATING_COMPOSER_PATH}`}
           element={
-            <FeatureGatedPage feature="floating_composer" loading={<PageLoading quiet />}>
+            <FeatureGatedPage
+              feature="floating_composer"
+              loading={isElectronShell() ? <PageLoading quiet /> : undefined}
+            >
               {isElectronShell() ? (
                 // The panel boots out of sight, so it shows no loading screen of its own.
                 <Suspense fallback={<PageLoading quiet />}>

@@ -40,7 +40,8 @@ let readySent = false;
 function sayReady() {
   if (readySent) return;
   readySent = true;
-  requestAnimationFrame(() => floatingComposerBridge()?.ready?.());
+  // A frame callback runs before that frame paints; the next one runs after it has.
+  requestAnimationFrame(() => requestAnimationFrame(() => floatingComposerBridge()?.ready?.()));
 }
 
 export function FloatingComposerPage() {

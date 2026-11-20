@@ -1882,10 +1882,6 @@ function floatingComposer() {
     },
     isCurrent: floatingComposerPanelIsCurrent,
     quitting: () => appQuitting,
-    // A panel lost after its page had loaded (a crash, a sign-out) is built again, out of sight.
-    panelClosed: (_serverUrl, wasReady) => {
-      if (wasReady) floatingComposerPreloader.rebuildOnce();
-    },
     present: (panel, show) =>
       fadeInFloatingComposer(panel, show, {
         reduceMotion: systemPreferences.getAnimationSettings?.().prefersReducedMotion === true,
@@ -1912,6 +1908,9 @@ function floatingComposerPreloadTarget() {
     supported: floatingComposerSupported,
   });
 }
+
+/** Each server's pending release of its panel built ahead; an announcement clears it. */
+const floatingComposerReleases = new Map();
 
 /** Whether a panel still shows the panel page of `serverUrl`, or is still loading it. */
 function floatingComposerPanelIsCurrent(panel, serverUrl) {
@@ -5362,20 +5361,24 @@ function registerIpc() {
     const contents = win.webContents;
     const hadSupport = floatingComposerSupport.any();
     if (!floatingComposerSupport.announce(contents.id, serverUrl)) return;
+    // This server is supported again: a release still waiting for it is called off.
+    clearTimeout(floatingComposerReleases.get(serverUrl));
+    floatingComposerReleases.delete(serverUrl);
     // Support ends with this document: when another one commits, or its renderer goes away.
     const revoke = () => {
       contents.removeListener("did-navigate", revoke);
       contents.removeListener("render-process-gone", revoke);
       contents.removeListener("destroyed", revoke);
       floatingComposerSupport.revoke(contents.id);
-      // A panel built ahead for this server goes once no page of it can render one for a
-      // while; a reload announces again within moments and keeps it.
+      // A panel built ahead goes once its server has had no supporting page for a while; a
+      // reload announces again within moments, which calls the release off.
       if (!floatingComposerSupport.serves(serverUrl)) {
-        setTimeout(() => {
-          if (!floatingComposerSupport.serves(serverUrl)) {
-            floatingComposerController?.releaseUnshown(serverUrl);
-          }
-        }, FLOATING_COMPOSER_PRELOAD_DELAY_MS).unref?.();
+        const release = setTimeout(() => {
+          floatingComposerReleases.delete(serverUrl);
+          floatingComposerController?.releaseUnshown(serverUrl);
+        }, FLOATING_COMPOSER_PRELOAD_DELAY_MS);
+        release.unref?.();
+        floatingComposerReleases.set(serverUrl, release);
       }
       if (!floatingComposerSupport.any()) applyFloatingComposerShortcut();
     };
