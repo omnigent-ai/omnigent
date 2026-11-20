@@ -1,62 +1,34 @@
 // The workspace API methods the workspace sidebar reads through, with the signatures of
-// the workspace API client. Directory listing and file reads are served today; every
-// other method answers null, meaning no route serves it yet, until the client lands.
+// the workspace API client. Each answers null when no route serves it for the session.
 
 import type { FileContentResponse } from "@/hooks/useFileContent";
+import type { ContentSearchResult } from "@/lib/contentSearch";
 import {
+  type FileSearchOptions,
+  type FoundEntries,
+  listBranchCommitsViaWorkspaceApi,
   listDirectoryViaWorkspaceApi,
   type ListedEntry,
+  listRepositoryRefsViaWorkspaceApi,
+  listWorkingCopyChangesViaWorkspaceApi,
+  readBaseFileViaWorkspaceApi,
   readFileViaWorkspaceApi,
+  readLinkTextViaWorkspaceApi,
+  resolveRepositoryContextViaWorkspaceApi,
+  resolveWorkingCopyBaseViaWorkspaceApi,
+  searchFilesViaWorkspaceApi,
+  searchTextViaWorkspaceApi,
+  type TextSearchOptions,
 } from "@/lib/workspaceApi";
 
-// ── Search results, in the REST routes' shapes ────────────────────────────────
+// ── Search results, in the REST routes' shapes, as the client returns them ─────
 
-/** File search matches, in the REST search's shape. */
-export interface FoundEntries {
-  /** Paths relative to the searched directory, as the REST search reports them. */
-  data: ListedEntry[];
-  /** The search returned its limit, so more entries may match. */
-  hasMore: boolean;
-  /** Some files weren't searched, so a missing file may still exist. */
-  truncated: boolean;
-}
-
-export interface FileSearchOptions {
-  /** Workspace-relative directory to search under, `""` for the root. */
-  path: string;
-  /** Comma-separated globs, e.g. `"*.{js,ts}, src/**"`. */
-  include: string;
-  exclude: string;
-  /** Maximum entries, 1 to 500. */
-  limit: number;
-}
-
-export interface TextSearchOptions {
-  caseSensitive: boolean;
-  /** Read the query as a ripgrep regular expression. */
-  regex: boolean;
-  /** Comma-separated globs; an include also searches files ignore rules skip. */
-  include: string;
-  exclude: string;
-}
-
-/** One matching line, for its first match; offsets count UTF-16 code units. */
-export interface ContentMatch {
-  path: string;
-  line: number;
-  column: number;
-  text: string;
-  match_start: number;
-  match_end: number;
-}
-
-export interface ContentSearchResult {
-  matches: ContentMatch[];
-  truncated: boolean;
-  warning: string | null;
-}
+export type { ContentMatch, ContentSearchResult } from "@/lib/contentSearch";
+export type { FileSearchOptions, FoundEntries, TextSearchOptions } from "@/lib/workspaceApi";
 
 // ── Git comparisons, as the workspace API's messages ──────────────────────────
+// Plain views of the generated messages, so callers and tests build them as literals;
+// the client's answers are assigned to them below, so a changed message fails to compile.
 
 export const ComparisonKind = {
   UNSPECIFIED: 0,
@@ -331,21 +303,22 @@ export interface WorkspaceSidebarApi {
   ) => Promise<ResolveRepositoryContextResponse | null>;
 }
 
-const unserved = () => Promise.resolve(null);
-
-/** The methods served today: directory listing and file reads. */
+/**
+ * Every method goes through the workspace API client, which picks the direct or server
+ * route and answers null when no route's host serves the method.
+ */
 export const DEFAULT_WORKSPACE_SIDEBAR_API: WorkspaceSidebarApi = {
   listDirectory: listDirectoryViaWorkspaceApi,
   readFile: readFileViaWorkspaceApi,
-  searchFiles: unserved,
-  searchText: unserved,
-  resolveWorkingCopyBase: unserved,
-  listWorkingCopyChanges: unserved,
-  readBaseFile: unserved,
-  readLinkText: unserved,
-  listRepositoryRefs: unserved,
-  listBranchCommits: unserved,
-  resolveRepositoryContext: unserved,
+  searchFiles: searchFilesViaWorkspaceApi,
+  searchText: searchTextViaWorkspaceApi,
+  resolveWorkingCopyBase: resolveWorkingCopyBaseViaWorkspaceApi,
+  listWorkingCopyChanges: listWorkingCopyChangesViaWorkspaceApi,
+  readBaseFile: readBaseFileViaWorkspaceApi,
+  readLinkText: readLinkTextViaWorkspaceApi,
+  listRepositoryRefs: listRepositoryRefsViaWorkspaceApi,
+  listBranchCommits: listBranchCommitsViaWorkspaceApi,
+  resolveRepositoryContext: resolveRepositoryContextViaWorkspaceApi,
 };
 
 let currentApi = DEFAULT_WORKSPACE_SIDEBAR_API;

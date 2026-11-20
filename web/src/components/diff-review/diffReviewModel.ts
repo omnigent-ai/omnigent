@@ -3,7 +3,9 @@
 // pull request) produce `DiffReviewFile`s; the renderer only reads this model.
 
 import { getFiletypeFromFileName, type SupportedLanguages } from "@pierre/diffs";
-import { orderTreePaths } from "@/components/file-tree/vendored";
+// The module itself, not the tree's index: the index brings the tree's CSS, which the diff
+// worker would inject into a document it doesn't have.
+import { orderTreePaths } from "@/components/file-tree/vendored/order";
 import { isGeneratedPath, isTestPath } from "./fileClassification";
 
 /** How a file changed in the review. */

@@ -1,8 +1,18 @@
+import { Code, ConnectError } from "@connectrpc/connect";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const workspaceApi = vi.hoisted(() => ({
   listDirectoryViaWorkspaceApi: vi.fn(),
   readFileViaWorkspaceApi: vi.fn(),
+  searchFilesViaWorkspaceApi: vi.fn(),
+  searchTextViaWorkspaceApi: vi.fn(),
+  resolveWorkingCopyBaseViaWorkspaceApi: vi.fn(),
+  listWorkingCopyChangesViaWorkspaceApi: vi.fn(),
+  readBaseFileViaWorkspaceApi: vi.fn(),
+  readLinkTextViaWorkspaceApi: vi.fn(),
+  listRepositoryRefsViaWorkspaceApi: vi.fn(),
+  listBranchCommitsViaWorkspaceApi: vi.fn(),
+  resolveRepositoryContextViaWorkspaceApi: vi.fn(),
 }));
 vi.mock("@/lib/workspaceApi", () => workspaceApi);
 
@@ -43,29 +53,71 @@ describe("DEFAULT_WORKSPACE_SIDEBAR_API", () => {
     expect(workspaceApi.readFileViaWorkspaceApi).toHaveBeenCalledWith(SESSION, "a.ts", signal);
   });
 
-  it("serves no search or Git method yet, without sending anything", async () => {
-    const api = DEFAULT_WORKSPACE_SIDEBAR_API;
-    const comparison = { kind: ComparisonKind.BRANCH_POINT };
-    const answers = await Promise.all([
-      api.searchFiles(SESSION, "a", { path: "", include: "", exclude: "", limit: 10 }),
-      api.searchText(SESSION, "a", {
-        caseSensitive: false,
-        regex: false,
-        include: "",
-        exclude: "",
-      }),
-      api.resolveWorkingCopyBase(SESSION, comparison),
-      api.listWorkingCopyChanges(SESSION, comparison),
-      api.readBaseFile(SESSION, { commit: "c", path: "a.ts", object: "o" }),
-      api.readLinkText(SESSION, "link"),
-      api.listRepositoryRefs(SESSION),
-      api.listBranchCommits(SESSION, ""),
-      api.resolveRepositoryContext(SESSION),
-    ]);
-    expect(answers).toEqual(Array(9).fill(null));
-    expect(workspaceApi.listDirectoryViaWorkspaceApi).not.toHaveBeenCalled();
-    expect(workspaceApi.readFileViaWorkspaceApi).not.toHaveBeenCalled();
+  it("searches file paths and contents through the workspace API", async () => {
+    const signal = new AbortController().signal;
+    const fileOptions = { path: "src", include: "*.ts", exclude: "", limit: 10 };
+    const found = { data: [], hasMore: false, truncated: true };
+    workspaceApi.searchFilesViaWorkspaceApi.mockResolvedValue(found);
+    await expect(
+      DEFAULT_WORKSPACE_SIDEBAR_API.searchFiles(SESSION, "app", fileOptions, signal),
+    ).resolves.toBe(found);
+    expect(workspaceApi.searchFilesViaWorkspaceApi).toHaveBeenCalledWith(
+      SESSION,
+      "app",
+      fileOptions,
+      signal,
+    );
+
+    const textOptions = { caseSensitive: true, regex: false, include: "", exclude: "dist/**" };
+    // null: no route serves it, so the source searches through REST.
+    workspaceApi.searchTextViaWorkspaceApi.mockResolvedValue(null);
+    await expect(
+      DEFAULT_WORKSPACE_SIDEBAR_API.searchText(SESSION, "todo", textOptions, signal),
+    ).resolves.toBeNull();
+    expect(workspaceApi.searchTextViaWorkspaceApi).toHaveBeenCalledWith(
+      SESSION,
+      "todo",
+      textOptions,
+      signal,
+    );
   });
+
+  const signal = new AbortController().signal;
+  const comparison = { kind: ComparisonKind.REVISIONS, baseRevision: "main", headRevision: "" };
+  const baseFile = { commit: "c".repeat(40), path: "a.ts", object: "o".repeat(40) };
+  // Each Git method, the client function it calls, and its arguments after the session.
+  const GIT_METHODS = [
+    ["resolveWorkingCopyBase", "resolveWorkingCopyBaseViaWorkspaceApi", [comparison, signal]],
+    ["listWorkingCopyChanges", "listWorkingCopyChangesViaWorkspaceApi", [comparison, signal]],
+    ["readBaseFile", "readBaseFileViaWorkspaceApi", [baseFile, signal]],
+    ["readLinkText", "readLinkTextViaWorkspaceApi", ["link", signal]],
+    ["listRepositoryRefs", "listRepositoryRefsViaWorkspaceApi", [signal]],
+    ["listBranchCommits", "listBranchCommitsViaWorkspaceApi", ["main", signal]],
+    ["resolveRepositoryContext", "resolveRepositoryContextViaWorkspaceApi", [signal]],
+  ] as const;
+
+  it.each(GIT_METHODS)("reads %s through the workspace API", async (method, client, args) => {
+    const answer = { from: client };
+    workspaceApi[client].mockResolvedValue(answer);
+    const call = DEFAULT_WORKSPACE_SIDEBAR_API[method] as (...a: unknown[]) => Promise<unknown>;
+
+    await expect(call(SESSION, ...args)).resolves.toBe(answer);
+    expect(workspaceApi[client]).toHaveBeenCalledWith(SESSION, ...args);
+  });
+
+  it.each(GIT_METHODS)(
+    "passes on null and the host's refusal for %s",
+    async (method, client, args) => {
+      const call = DEFAULT_WORKSPACE_SIDEBAR_API[method] as (...a: unknown[]) => Promise<unknown>;
+      // null: no route serves it, so the sidebar says it isn't available on this host.
+      workspaceApi[client].mockResolvedValue(null);
+      await expect(call(SESSION, ...args)).resolves.toBeNull();
+
+      const refusal = new ConnectError("No revision 'main'", Code.NotFound);
+      workspaceApi[client].mockRejectedValue(refusal);
+      await expect(call(SESSION, ...args)).rejects.toBe(refusal);
+    },
+  );
 });
 
 describe("setWorkspaceSidebarApiForTests", () => {
