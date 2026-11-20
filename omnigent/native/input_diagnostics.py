@@ -71,6 +71,33 @@ def input_attributes(source: Mapping[str, object] | None) -> dict[str, str | int
     return attrs
 
 
+def native_input_client_id(source: Mapping[str, object]) -> str | None:
+    """Encode a server-owned input identity for a native transcript round trip."""
+    attrs = input_attributes(source)
+    attempt = attrs.get("delivery_attempt_id")
+    if attempt is None:
+        return None
+    stable_id = attrs.get("input_stable_id")
+    if stable_id is not None:
+        return f"omnigent:stable:{stable_id}"
+    return f"omnigent:attempt:{attempt}"
+
+
+def native_input_identity(client_id: object) -> dict[str, str]:
+    """Decode only Omnigent's namespaced, bounded native input identifiers."""
+    if not isinstance(client_id, str):
+        return {}
+    for prefix, field in (
+        ("omnigent:stable:", "input_stable_id"),
+        ("omnigent:attempt:", "delivery_attempt_id"),
+    ):
+        if client_id.startswith(prefix):
+            value = client_id[len(prefix) :]
+            if _IDENTIFIERS[field].fullmatch(value):
+                return {field: value}
+    return {}
+
+
 def _diagnostic_attributes(source: Mapping[str, object]) -> dict[str, object]:
     """Allow named identifiers, short code values, and bounded integers; reject content."""
     attrs: dict[str, object] = dict(input_attributes(source))

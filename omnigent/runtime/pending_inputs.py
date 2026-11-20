@@ -31,9 +31,9 @@ sender can adopt it and dedupe cleanly), and draining needs to run at
 the persist site so the ``session.input.consumed`` event can carry the
 cleared id. Both are caller-driven, so the access is explicit.
 
-Draining matches the mirrored text to its entry first and falls back to
-FIFO order (oldest first). Native gives no id channel back through the
-TUI to correlate the forwarded POST with the mirrored transcript item.
+Codex receipts with an Omnigent input identity settle only that entry,
+preserving every other input even when receipts arrive out of order.
+Legacy mirrors match text first and fall back to FIFO order (oldest first).
 Position alone is not safe either: a pasted message the TUI never
 recorded (a host that died mid-paste, a hook that failed closed) leaves
 its entry at the head of the queue, and every later message would then
@@ -115,7 +115,11 @@ from typing import Any, Literal
 
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
-from omnigent.native.input_diagnostics import input_attributes, log_input_event
+from omnigent.native.input_diagnostics import (
+    input_attributes,
+    log_input_event,
+    native_input_identity,
+)
 
 # A pending entry is evicted this many seconds after it was recorded
 # if it was never drained by a matching persisted message. Covers the
@@ -642,6 +646,38 @@ def resolve(conversation_id: str, pending_id: str) -> DrainedInput | None:
         if not entries:
             _pending.pop(conversation_id, None)
         return _drained_input(entry) if entry is not None else None
+
+
+def resolve_native_client_id(
+    conversation_id: str, client_id: str, *, hold: bool = False
+) -> DrainedInput | None:
+    """Settle only the input a native receipt names, preserving every other input."""
+    identity = native_input_identity(client_id)
+    if not identity:
+        return None
+    with _lock:
+        _evict_stale_locked(conversation_id, _now())
+        entries = _pending.get(conversation_id)
+        if entries is None:
+            return None
+        for pending_id, entry in entries.items():
+            if entry.held:
+                continue
+            matches = (
+                entry.stable_id == identity["input_stable_id"]
+                if "input_stable_id" in identity
+                else entry.delivery_attempt_id == identity["delivery_attempt_id"]
+            )
+            if not matches:
+                continue
+            if hold:
+                entry.held = True
+            else:
+                entries.pop(pending_id)
+                if not entries:
+                    _pending.pop(conversation_id, None)
+            return _drained_input(entry)
+    return None
 
 
 def resolve_oldest(conversation_id: str, *, hold: bool = False) -> DrainedInput | None:
