@@ -2,11 +2,13 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Conversation } from "@/hooks/useConversations";
-import type { ComponentProps, ReactNode } from "react";
+import { type ComponentProps, type ReactNode, useState } from "react";
 
 import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import * as commandPaletteModule from "./CommandPalette";
 import { CommandPalette } from "./CommandPalette";
+import type { WorkspaceHistoryFacts } from "./workspaceCommands/model";
+import { useWorkspaceHistoryCommands } from "./workspaceCommands/useWorkspaceHistoryCommands";
 
 const navigate = vi.fn();
 vi.mock("@/lib/routing", () => ({
@@ -1163,5 +1165,97 @@ describe("CommandPalette — empty state", () => {
     });
 
     expect(screen.getByText("No results found")).toBeTruthy();
+  });
+});
+
+describe("CommandPalette — commands a mounted feature offers", () => {
+  const BACK_ONLY: WorkspaceHistoryFacts = {
+    back: { target: "Files", waitingForPage: false },
+    forward: { target: null, waitingForPage: false },
+  };
+
+  /** The tabs sidebar's Back and Forward, registered as its host registers them. */
+  function WorkspaceHistory({ go }: { go: () => void }) {
+    useWorkspaceHistoryCommands({ conversationId: "conv_a", facts: BACK_ONLY, go }, true);
+    return null;
+  }
+
+  /** A palette opened from a button. */
+  function OpenedPalette({ go }: { go: () => void }) {
+    const [open, setOpen] = useState(false);
+    return (
+      <>
+        <button type="button" onClick={() => setOpen(true)}>
+          Open palette
+        </button>
+        <button type="button">Where the command moves focus</button>
+        <WorkspaceHistory go={go} />
+        <CommandPalette
+          open={open}
+          onOpenChange={setOpen}
+          onToggleLeftSidebar={vi.fn()}
+          onToggleRightSidebar={vi.fn()}
+        />
+      </>
+    );
+  }
+
+  const withSidebarFlag = (enabled: boolean) =>
+    serverInfo.mockReturnValue({
+      session_search_scope: true,
+      features: { workspace_sidebar_v2: enabled },
+    });
+
+  function openPalette(go: () => void) {
+    render(<OpenedPalette go={go} />, { wrapper: withQueryClient() });
+    const opener = screen.getByRole("button", { name: "Open palette" });
+    opener.focus();
+    fireEvent.click(opener);
+    return opener;
+  }
+
+  it("lists them with their chords, and one that can't run says why", async () => {
+    withSidebarFlag(true);
+    openPalette(vi.fn());
+    fireEvent.change(screen.getByTestId("command-palette-input"), {
+      target: { value: "in the workspace" },
+    });
+
+    const back = await screen.findByRole("option", { name: /Go back in the workspace/ });
+    expect(back.textContent).toContain("←");
+    const forward = screen.getByRole("option", { name: /Go forward in the workspace/ });
+    expect(forward).toHaveAttribute("aria-disabled", "true");
+    expect(forward.textContent).toContain("There's nothing to go forward to in the workspace.");
+  });
+
+  it("runs one that moves focus once the palette has closed, so the focus stays", async () => {
+    withSidebarFlag(true);
+    let dialogAtRun: Element | null = null;
+    const go = vi.fn(() => {
+      dialogAtRun = screen.queryByRole("dialog");
+      screen.getByText("Where the command moves focus").focus();
+    });
+    openPalette(go);
+
+    fireEvent.click(await screen.findByRole("option", { name: /Go back in the workspace/ }));
+    expect(go).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(go).toHaveBeenCalledOnce());
+    expect(dialogAtRun).toBeNull();
+    await new Promise((resolve) => {
+      setTimeout(resolve, 10);
+    });
+    // The dialog's own focus return, to the opener, came first and didn't undo it.
+    expect(document.activeElement).toBe(screen.getByText("Where the command moves focus"));
+  });
+
+  it("lists none without the workspace_sidebar_v2 flag", async () => {
+    withSidebarFlag(false);
+    openPalette(vi.fn());
+    fireEvent.change(screen.getByTestId("command-palette-input"), {
+      target: { value: "in the workspace" },
+    });
+
+    await screen.findByText("No results found");
+    expect(screen.queryByRole("option", { name: /Go back in the workspace/ })).toBeNull();
   });
 });
