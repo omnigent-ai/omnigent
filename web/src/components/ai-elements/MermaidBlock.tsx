@@ -1,7 +1,12 @@
 import { Button } from "@/components/ui/button";
 import { getEmbedRoot } from "@/lib/host";
 import { cn } from "@/lib/utils";
-import type { ComponentProps, ReactNode, RefObject } from "react";
+import type {
+  ComponentProps,
+  PointerEvent as ReactPointerEvent,
+  ReactNode,
+  RefObject,
+} from "react";
 import { cloneElement, isValidElement, useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
@@ -28,16 +33,90 @@ export function isMermaidPre(children: ReactNode): boolean {
   );
 }
 
+const MIN_SCALE = 0.5;
+const MAX_SCALE = 4;
+const ZOOM_STEP = 1.25;
+const WHEEL_NOTCH_PX = 100;
+const clampScale = (n: number) => Math.min(MAX_SCALE, Math.max(MIN_SCALE, n));
+
+const ZoomInIcon = (props: ComponentProps<"svg">) => (
+  <svg fill="none" height={16} viewBox="0 0 16 16" width={16} {...props}>
+    <path d="M8 3v10M3 8h10" stroke="currentColor" strokeLinecap="round" strokeWidth={1.5} />
+  </svg>
+);
+const ZoomOutIcon = (props: ComponentProps<"svg">) => (
+  <svg fill="none" height={16} viewBox="0 0 16 16" width={16} {...props}>
+    <path d="M3 8h10" stroke="currentColor" strokeLinecap="round" strokeWidth={1.5} />
+  </svg>
+);
+const ResetZoomIcon = (props: ComponentProps<"svg">) => (
+  <svg fill="none" height={16} viewBox="0 0 16 16" width={16} {...props}>
+    <path
+      d="M13 8a5 5 0 1 1-1.6-3.7M13 2.5v2.8h-2.8"
+      stroke="currentColor"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      strokeWidth={1.5}
+    />
+  </svg>
+);
+
 // Reuse the sanitized inline SVG without rerunning Mermaid or copying toolbar icons.
 function MermaidFullscreen({ blockRef }: { blockRef: RefObject<HTMLDivElement | null> }) {
   const [svgMarkup, setSvgMarkup] = useState<string | null>(null);
   const close = useCallback(() => setSvgMarkup(null), []);
+  const [scale, setScale] = useState(1);
+  const [offset, setOffset] = useState({ x: 0, y: 0 });
+  const [dragging, setDragging] = useState(false);
+  const dragRef = useRef<{ id: number; x: number; y: number } | null>(null);
+  // A drag that ends on empty space fires a click there; it must not dismiss the view.
+  const draggedRef = useRef(false);
+  const overlayRef = useRef<HTMLDivElement>(null);
+
+  const zoomIn = useCallback(() => setScale((s) => clampScale(s * ZOOM_STEP)), []);
+  const zoomOut = useCallback(() => setScale((s) => clampScale(s / ZOOM_STEP)), []);
+  const resetZoom = useCallback(() => {
+    setScale(1);
+    setOffset({ x: 0, y: 0 });
+  }, []);
+
+  const onPointerDown = useCallback((e: ReactPointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0 || dragRef.current) return;
+    dragRef.current = { id: e.pointerId, x: e.clientX, y: e.clientY };
+    draggedRef.current = false;
+    e.currentTarget.setPointerCapture?.(e.pointerId);
+    setDragging(true);
+  }, []);
+  const onPointerMove = useCallback((e: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    if (!drag || drag.id !== e.pointerId) return;
+    const dx = e.clientX - drag.x;
+    const dy = e.clientY - drag.y;
+    if (dx === 0 && dy === 0) return;
+    draggedRef.current = true;
+    dragRef.current = { id: drag.id, x: e.clientX, y: e.clientY };
+    setOffset((o) => ({ x: o.x + dx, y: o.y + dy }));
+  }, []);
+  const endDrag = useCallback((e: ReactPointerEvent<HTMLDivElement>) => {
+    if (dragRef.current?.id !== e.pointerId) return;
+    dragRef.current = null;
+    setDragging(false);
+    // Capture is already gone when this runs from lostpointercapture.
+    if (e.currentTarget.hasPointerCapture?.(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
+  }, []);
 
   const openFullscreen = useCallback(() => {
     // The rendered diagram is Mermaid's own <svg id="mermaid-…"> — scope to it so
     // we don't clone a toolbar/zoom-control icon (all 16×16 <svg>s in the block).
     const svg = blockRef.current?.querySelector('svg[id^="mermaid-"]');
     setSvgMarkup(svg ? svg.outerHTML : null);
+    setScale(1);
+    setOffset({ x: 0, y: 0 });
+    dragRef.current = null;
+    draggedRef.current = false;
+    setDragging(false);
   }, [blockRef]);
 
   useEffect(() => {
@@ -49,10 +128,27 @@ function MermaidFullscreen({ blockRef }: { blockRef: RefObject<HTMLDivElement | 
     return () => window.removeEventListener("keydown", onKey);
   }, [svgMarkup, close]);
 
+  // React's onWheel is passive, so preventDefault needs a native listener.
+  useEffect(() => {
+    const el = overlayRef.current;
+    if (svgMarkup == null || !el) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      if (e.deltaY === 0) return;
+      // A 100px notch is one step; small trackpad/pinch deltas zoom proportionally.
+      const px = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;
+      const delta = Math.max(-WHEEL_NOTCH_PX, Math.min(WHEEL_NOTCH_PX, px));
+      setScale((s) => clampScale(s * ZOOM_STEP ** (-delta / WHEEL_NOTCH_PX)));
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, [svgMarkup]);
+
   const overlay =
     svgMarkup != null
       ? createPortal(
           <div
+            ref={overlayRef}
             className="fixed inset-0 z-50 flex items-center justify-center bg-background/95 text-foreground backdrop-blur-sm"
             // Clicking the diagram must not dismiss it.
             onClick={(e) => {
@@ -62,9 +158,41 @@ function MermaidFullscreen({ blockRef }: { blockRef: RefObject<HTMLDivElement | 
             data-fullscreen-overlay=""
             role="presentation"
           >
+            <div className="absolute top-4 right-14 z-10 flex items-center gap-1">
+              <Button
+                aria-label="Zoom in"
+                onClick={zoomIn}
+                size="icon-sm"
+                title="Zoom in"
+                type="button"
+                variant="ghost"
+              >
+                <ZoomInIcon />
+              </Button>
+              <Button
+                aria-label="Zoom out"
+                onClick={zoomOut}
+                size="icon-sm"
+                title="Zoom out"
+                type="button"
+                variant="ghost"
+              >
+                <ZoomOutIcon />
+              </Button>
+              <Button
+                aria-label="Reset zoom"
+                onClick={resetZoom}
+                size="icon-sm"
+                title="Reset zoom"
+                type="button"
+                variant="ghost"
+              >
+                <ResetZoomIcon />
+              </Button>
+            </div>
             <Button
               aria-label="Exit fullscreen"
-              className="absolute top-4 right-4"
+              className="absolute top-4 right-4 z-10"
               onClick={close}
               size="icon-sm"
               title="Exit fullscreen"
@@ -77,10 +205,22 @@ function MermaidFullscreen({ blockRef }: { blockRef: RefObject<HTMLDivElement | 
               className="flex size-full items-center justify-center p-8 [&>svg]:h-auto [&>svg]:max-h-full [&>svg]:w-auto [&>svg]:max-w-full"
               // The cloned SVG is Mermaid's own trusted, already-sanitized render.
               dangerouslySetInnerHTML={{ __html: svgMarkup }}
+              data-testid="mermaid-fullscreen-content"
               onClick={(e) => {
-                if (e.target === e.currentTarget) close();
+                if (e.target === e.currentTarget && !draggedRef.current) close();
               }}
+              onLostPointerCapture={endDrag}
+              onPointerCancel={endDrag}
+              onPointerDown={onPointerDown}
+              onPointerMove={onPointerMove}
+              onPointerUp={endDrag}
               role="presentation"
+              style={{
+                transform: `translate(${offset.x}px, ${offset.y}px) scale(${scale})`,
+                cursor: dragging ? "grabbing" : "grab",
+                touchAction: "none",
+                userSelect: "none",
+              }}
             />
           </div>,
           getEmbedRoot() ?? document.body,
