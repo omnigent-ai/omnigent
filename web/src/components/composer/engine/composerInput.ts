@@ -26,9 +26,20 @@ export interface ComposerEditorSurface {
    * Replace `[start, end)` as typed input. Returns false when the input is locked
    * (read-only or disabled) and nothing changed.
    */
-  insertText: (text: string, start: number, end: number) => boolean;
+  insertText: (
+    text: string,
+    start: number,
+    end: number,
+    options?: ComposerInsertOptions,
+  ) => boolean;
   /** Scroll the caret's line into view. */
   revealCaret: () => void;
+}
+
+/** How an insert is recorded in the undo history. */
+export interface ComposerInsertOptions {
+  /** Make this edit its own undo step (the CodeMirror surface always does; textareas only when set). */
+  separateUndo?: boolean;
 }
 
 /** What the composer edits: a <textarea> as-is, or another engine's surface. */
