@@ -182,6 +182,9 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 - [Sandbox profiles](./sandbox-profiles.md) covers provider-owned discovery,
   desktop and mobile profile selection, and the boundary between browser
   request proof and live resource/network enforcement.
+- [Floating New Agent panel](./floating-new-agent.md) covers the macOS desktop
+  app's ⇧⌘Space panel: opening it from any app, hiding it with its draft, launching
+  on This Mac or a new sandbox, and its release flag.
 
 - [GitLab merge requests](./gitlab.md) covers the shared MR panel, composer,
   Canvas links, and native tracking.

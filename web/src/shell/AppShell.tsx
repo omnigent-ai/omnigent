@@ -34,6 +34,7 @@ import { useSessionAgent } from "@/hooks/useAgents";
 import { useOpenSessionRow } from "@/hooks/useOpenSessionRow";
 import type { Session, SessionStatus } from "@/lib/types";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
+import { useFloatingComposerSupport } from "@/hooks/useFloatingComposerSupport";
 import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
 import { useCommandPaletteHotkey } from "@/hooks/useCommandPaletteHotkey";
 import { useHistoryNavigation } from "@/hooks/useHistoryNavigation";
@@ -334,6 +335,8 @@ function AppShellImpl() {
   // Cmd/Ctrl+Enter accepts the pending harness approval prompt. Bound once
   // here so it works on every chat route, regardless of where focus sits.
   useApproveHotkey();
+  // On macOS desktop with floating_composer on, ⇧⌘Space opens the New Agent panel.
+  useFloatingComposerSupport();
 
   // Lock the iOS shell to the visual viewport so the soft keyboard can't pan
   // the whole document (which would hide the header and break the layout).
