@@ -3,8 +3,16 @@ import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import { GridSessionsProvider, useGridSessions } from "@/grid/GridSessionsContext";
 import { GridWorkspace } from "@/grid/GridWorkspace";
 import {
+  LazyWorkspaceTabsHost,
+  routeToWorkspaceTabs,
+  showAgentBrowserTab,
+  showWorkspaceTabOrChooser,
+  useTabsSidebar,
+} from "@/shell/workspaceTabsRouting";
+import {
   type ComponentProps,
   type CSSProperties,
+  Suspense,
   useCallback,
   useContext,
   useEffect,
@@ -155,6 +163,8 @@ import { selectPullRequestInPanel } from "./PullRequestPanel";
 import type { ChangedSort } from "./FlatFileList";
 import { SubagentPanelOpenerContext } from "./subagentPanelOpener";
 import { isMobileViewport, Sidebar } from "./Sidebar";
+import { MobilePanelDrawer } from "./MobilePanelDrawer";
+import { ResponsiveViewerSlot } from "./ResponsiveViewerSlot";
 import { SidebarHeaderActions } from "./SidebarHeaderActions";
 import { useSettingsRoute } from "./settingsNav";
 import { useOpenSidebarForSettingsSearch } from "./settingsSearch/settingsSearchFocus";
@@ -395,6 +405,20 @@ function AppShellImpl() {
   // create window (or on a stale temp reload, before ChatPage redirects).
   const serverConversationId = isTempConvId(conversationId) ? undefined : conversationId;
   const pendingConversation = conversationId != null && serverConversationId == null;
+  // With the workspace_sidebar_v2 flag, a desktop-layout window shows the sidebar as tabs;
+  // links, pages and shells then open there, never in the classic sidebar it replaces.
+  // The session ref is null while a new session waits for its server id: requests made
+  // meanwhile have no tabs to open in, so they do nothing.
+  const tabsSidebar = useTabsSidebar();
+  const tabsModeRef = useRef(false);
+  tabsModeRef.current = tabsSidebar;
+  const tabsSessionRef = useRef<string | null>(null);
+  tabsSessionRef.current = tabsSidebar ? (serverConversationId ?? null) : null;
+  // A narrow window shows the tabs in a drawer over the chat, as it does each classic panel.
+  const [tabsDrawerOpen, setTabsDrawerOpen] = useState(false);
+  const [tabsDrawerTarget, setTabsDrawerTarget] = useState<HTMLDivElement | null>(null);
+  // The classic drawers answer only in a narrow window without the tabs.
+  const classicDrawers = () => isMobileViewport() && !tabsModeRef.current;
   const [fileViewerCommentsOpen, setFileViewerCommentsOpen] = useState(false);
   const [mobileFileTarget, setMobileFileTarget] = useState<HTMLDivElement | null>(null);
   const [rightRailTab, setRightRailTab] = useState<RightRailTab | null>(() =>
@@ -406,6 +430,15 @@ function AppShellImpl() {
     conversationId ? (readSessionWorkspaceState(conversationId).openPanels ?? []) : [],
   );
   const selectRightRailTab = useCallback((next: RightRailTab | null) => {
+    // The tabs sidebar shows a page in its tab; the classic selection stays as it was saved.
+    if (tabsModeRef.current) {
+      const tabsSession = tabsSessionRef.current;
+      if (tabsSession === null) return;
+      void routeToWorkspaceTabs(async (tabs) =>
+        tabs.isWorkspacePage(next) ? tabs.openWorkspacePage(tabsSession, next) : { ok: true },
+      );
+      return;
+    }
     setRightRailTab(next);
     if (isDefaultWorkspaceTab(next) && !readPinnedWorkspaceTabs().includes(next)) {
       setOpenPanels((previous) => (previous.includes(next) ? previous : [...previous, next]));
@@ -479,6 +512,8 @@ function AppShellImpl() {
   // Below md an open sidebar is a full-window drawer, so narrowing closes it
   // (except the settings menu) and remembers the desktop state for widening.
   const mobileViewport = useIsMobileViewport();
+  // The tabs host sits in the Workspace drawer once a narrow window has mounted it.
+  const tabsInDrawer = mobileViewport && tabsDrawerTarget !== null;
   const sideBySideSidebar = useIsSideBySideSidebarViewport();
   const atSettingsRoot =
     inSettings && location.pathname.replace(/\/$/, "") === rebasePath("/settings");
@@ -681,6 +716,13 @@ function AppShellImpl() {
       // Just past the rail's 200 ms transition in index.css.
     }, 250);
   }, []);
+  /** Show the tabs sidebar: its drawer in a narrow window, else the rail. */
+  const revealTabsSidebar = useCallback(() => {
+    if (isMobileViewport()) setTabsDrawerOpen(true);
+    else setRightPanelOpenAnimated(true);
+  }, [setRightPanelOpenAnimated]);
+  // Another session's tabs start with their drawer put away.
+  useEffect(() => setTabsDrawerOpen(false), [conversationId]);
   useEffect(
     () => () => {
       if (rightPanelMotionTimerRef.current !== null) {
@@ -812,6 +854,7 @@ function AppShellImpl() {
     environmentQuery,
     showFilesPanel,
     changedCount,
+    changedFiles,
     isChangedPath,
   } = useWorkspaceResources({
     sessionId: serverConversationId,
@@ -1474,7 +1517,7 @@ function AppShellImpl() {
       if (showAgents) {
         nextTab = "subagents";
         setSelectedTerminalKey(null);
-        setSubagentsPanelOpen(isMobileViewport());
+        setSubagentsPanelOpen(classicDrawers());
       }
       setRightRailTab(nextTab);
       const restoredPanels = persisted.openPanels ?? [];
@@ -1545,6 +1588,8 @@ function AppShellImpl() {
   }
   // Honor incoming links even when the current session is already open.
   useEffect(() => {
+    // The tabs sidebar opens a linked file in its tab instead (see below).
+    if (tabsModeRef.current) return;
     const sessionJustRestored = fullscreenRestoreRef.current !== restoredWorkspace;
     fullscreenRestoreRef.current = restoredWorkspace;
     const localFileUrl = localFileUrlRef.current;
@@ -1700,9 +1745,10 @@ function AppShellImpl() {
     setTasksPanelOpen(false);
     setContentSearchPanelOpen(false);
     selectRightRailTab("subagents");
-    setRightPanelOpenImmediately(true);
-    setSubagentsPanelOpen(isMobileViewport());
-  }, [conversationId, agentsPanelRequested, setRightPanelOpenImmediately, selectRightRailTab]);
+    if (tabsModeRef.current) revealTabsSidebar();
+    else setRightPanelOpenImmediately(true);
+    setSubagentsPanelOpen(classicDrawers());
+  }, [conversationId, agentsPanelRequested, setRightPanelOpenImmediately, selectRightRailTab]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Persist the per-session rail tab + open file tabs whenever they change, to
   // the session the state belongs to (stateConvRef, set after each restore).
@@ -1725,6 +1771,19 @@ function AppShellImpl() {
 
   const commitFileNavigation = useCallback(
     (path: string, options?: OpenFileOptions) => {
+      if (tabsModeRef.current) {
+        const tabsSession = tabsSessionRef.current;
+        if (tabsSession === null) return;
+        // The file shows in its tab, or in the Changes review on screen when that shows it;
+        // the URL and the classic selection stay untouched.
+        void routeToWorkspaceTabs((tabs) =>
+          tabs.openWorkspaceFileLink(tabsSession, path, options, "user"),
+        );
+        setExecutionLogsKey(null);
+        revealTabsSidebar();
+        writeSessionWorkspaceState(tabsSession, { open: true });
+        return;
+      }
       const position = citedFilePosition(options);
       setSelectedFilePath(path);
       setFileNavigation({ conversationId, path, position });
@@ -1789,6 +1848,7 @@ function AppShellImpl() {
       );
     },
     [
+      revealTabsSidebar,
       setPanelInitialKey,
       terminalFirst,
       setSearchParams,
@@ -1841,8 +1901,22 @@ function AppShellImpl() {
       { replace: true },
     );
   }, [setSearchParams]);
+  // In the tabs sidebar, a ?file= link opens the file's tab at its cited line, and the
+  // request leaves the URL once it's handed over.
+  useEffect(() => {
+    const tabsSession = tabsSessionRef.current;
+    if (tabsSession === null || !citationPath) return;
+    const position = urlNavigation?.position;
+    void routeToWorkspaceTabs((tabs) =>
+      tabs.openWorkspaceFileLink(tabsSession, citationPath, position, "link"),
+    );
+    if (isMobileViewport()) setTabsDrawerOpen(true);
+    else setRightPanelOpenImmediately(true);
+    clearFileViewerUrl();
+  }, [tabsSidebar, conversationId, citationPath, urlNavigation, clearFileViewerUrl]); // eslint-disable-line react-hooks/exhaustive-deps
   const restoreSelectedFileUrl = useCallback(() => {
-    if (!selectedFilePath) return;
+    // The tabs sidebar keeps its own files; the classic selection would open as a tab.
+    if (!selectedFilePath || tabsModeRef.current) return;
     setSearchParams(
       (prev) => {
         const params = new URLSearchParams(prev);
@@ -1863,6 +1937,10 @@ function AppShellImpl() {
   // unsafe here), and strip file/diff/comment on collapse so the URL never
   // advertises a panel that isn't shown.
   const toggleRightPanel = useCallback(() => {
+    if (tabsModeRef.current && isMobileViewport()) {
+      setTabsDrawerOpen((open) => !open);
+      return;
+    }
     const next = !rightPanelOpen;
     if (conversationId) {
       writeSessionWorkspaceState(conversationId, { open: next });
@@ -1903,6 +1981,10 @@ function AppShellImpl() {
   }, []);
   const revealRightPanel = useCallback(() => {
     if (!conversationId) return;
+    if (tabsModeRef.current && isMobileViewport()) {
+      setTabsDrawerOpen(true);
+      return;
+    }
     if (!terminalFirst) setPanelInitialKey(null);
     setExecutionLogsKey(null);
     setFilesPanelOpen(false);
@@ -2280,6 +2362,15 @@ function AppShellImpl() {
   useEffect(() => {
     if (!supportsBrowser()) return;
     const surfaceBrowserTab = (sourceConversationId: string, tabId: string) => {
+      if (tabsModeRef.current) {
+        const current = sourceConversationId === conversationId;
+        void routeToWorkspaceTabs(async (tabs) => {
+          tabs.openWorkspaceBrowserView(sourceConversationId, tabId, { background: !current });
+          return { ok: true };
+        });
+        if (current) revealTabsSidebar();
+        return;
+      }
       // The mounted WorkspacePanel hook owns the active session's tab state.
       // Persist here only for background sessions that have no mounted hook.
       if (sourceConversationId !== conversationId) openBrowserTab(sourceConversationId, tabId);
@@ -2298,9 +2389,16 @@ function AppShellImpl() {
       unsubscribeLink();
       unsubscribeAction();
     };
-  }, [conversationId, handleRightRailTabChange, setRightPanelOpenAnimated]);
+  }, [conversationId, handleRightRailTabChange, setRightPanelOpenAnimated, revealTabsSidebar]);
   // An agent opening or selecting a tab (browser_tabs) surfaces the pane.
-  useRevealBrowserOnAgentTabs(conversationId, () => {
+  useRevealBrowserOnAgentTabs(conversationId, (request) => {
+    if (tabsModeRef.current) {
+      const tabsSession = tabsSessionRef.current;
+      if (tabsSession === null) return;
+      showAgentBrowserTab(tabsSession, request);
+      revealTabsSidebar();
+      return;
+    }
     handleRightRailTabChange("browser");
     setRightPanelOpenAnimated(true);
   });
@@ -2334,10 +2432,20 @@ function AppShellImpl() {
     // signal, so it stays queued). Keyed on `conversationId` too, so coming
     // back to the owner re-runs this and still reveals the tab.
     if (sideChatToOpen === null || sideChatToOpen.parentId !== conversationId) return;
+    if (tabsModeRef.current) {
+      revealTabsSidebar();
+      return;
+    }
     setRightPanelOpenAnimated(true);
     // Phones hide the rail, so the side chat opens in its drawer instead.
     if (isMobileViewport()) openSideChatsPanel();
-  }, [sideChatToOpen, conversationId, openSideChatsPanel, setRightPanelOpenAnimated]);
+  }, [
+    sideChatToOpen,
+    conversationId,
+    openSideChatsPanel,
+    setRightPanelOpenAnimated,
+    revealTabsSidebar,
+  ]);
   // The chat's task preview, a task's marker, or the agent's first plan asks
   // for this session's Tasks tab: open the rail on it, or its drawer on a phone
   // unless the agent asked, then clear the one-shot request.
@@ -2349,11 +2457,15 @@ function AppShellImpl() {
     if (!railTabsAvailable.tasks) return;
     if (isMobileViewport()) {
       // A drawer the agent opened would cover the chat it's working in.
-      if (!automatic) openTasksPanel();
-      return;
+      if (automatic) return;
+      if (!tabsModeRef.current) {
+        openTasksPanel();
+        return;
+      }
     }
     selectRightRailTab("tasks");
-    setRightPanelOpenAnimated(true);
+    if (tabsModeRef.current) revealTabsSidebar();
+    else setRightPanelOpenAnimated(true);
   });
   const canStartSideChat = useCanStartSideChat(serverConversationId, permissionLevel);
   const showSideChats = supportsSideChat(
@@ -2418,6 +2530,16 @@ function AppShellImpl() {
   // shell tab and a file tab can't both be "active".
   const openTerminalTab = useCallback(
     (key: string, { focus = true }: { focus?: boolean } = {}) => {
+      if (tabsModeRef.current) {
+        const tabsSession = tabsSessionRef.current;
+        if (tabsSession === null) return;
+        autoFocusTerminalRef.current = focus ? { conversationId: tabsSession, key } : null;
+        void routeToWorkspaceTabs((tabs) => tabs.openWorkspaceTerminal(tabsSession, key));
+        setExecutionLogsKey(null);
+        revealTabsSidebar();
+        writeSessionWorkspaceState(tabsSession, { open: true });
+        return;
+      }
       // The tab already exists (tabs derive 1:1 from the terminal list); this
       // just focuses it and reveals the rail. The selection is sticky (never
       // pruned off the list), so a fresh create that's still landing stays
@@ -2435,7 +2557,7 @@ function AppShellImpl() {
       setRightPanelOpenAnimated(true);
       if (conversationId) writeSessionWorkspaceState(conversationId, { open: true });
     },
-    [clearFileViewerUrl, conversationId, setRightPanelOpenAnimated],
+    [clearFileViewerUrl, conversationId, setRightPanelOpenAnimated, revealTabsSidebar],
   );
 
   // ⌃` and ⌘⌥T (Ctrl+Alt+T) open a new shell, as does the desktop menu's New
@@ -2497,7 +2619,7 @@ function AppShellImpl() {
             guardFileNavigation(null, undefined, () => {
               if (railSelectionRef.current.conversationId !== conversationId) return;
               const key = terminalTabKey(info);
-              if (isMobileViewport()) openTerminalsPanel(key);
+              if (classicDrawers()) openTerminalsPanel(key);
               else openTerminalTab(key);
             });
           },
@@ -2709,13 +2831,43 @@ function AppShellImpl() {
     setContentSearchPanelOpen(true);
   }
 
+  /** Show a built-in page in the tabs sidebar, as the session menu's entries do. */
+  function showTabsPage(
+    page: "files" | "changes" | "github" | "subagents" | "tasks" | "content-search",
+  ) {
+    selectRightRailTab(page);
+    revealTabsSidebar();
+  }
+
+  /** Show the tabs sidebar's shell or side chat, or a New tab to choose one in. */
+  function showTabsTabOf(kind: "terminal" | "chat") {
+    const tabsSession = tabsSessionRef.current;
+    if (tabsSession === null) return;
+    void showWorkspaceTabOrChooser(tabsSession, kind);
+    revealTabsSidebar();
+  }
+
   // Composer links open the mobile drawer or reveal the desktop Pull Requests tab.
   // Deselect files/shells so the chosen panel owns its content slot.
   const openGithubTab = useCallback(
     (prUrl?: string) => {
       if (prUrl && conversationId) selectPullRequestInPanel(queryClient, conversationId, prUrl);
-      if (isMobileViewport()) {
+      if (classicDrawers()) {
         openGithubPanel();
+        return;
+      }
+      if (tabsModeRef.current) {
+        const tabsSession = tabsSessionRef.current;
+        if (tabsSession === null) return;
+        // All of the session's pull requests, or the linked one, in a tab of its own.
+        void routeToWorkspaceTabs((tabs) =>
+          tabs.showWorkspacePullRequests(
+            tabsSession,
+            prUrl ? { kind: "pull", url: prUrl, overview: true } : { kind: "overview" },
+          ),
+        );
+        revealTabsSidebar();
+        writeSessionWorkspaceState(tabsSession, { open: true });
         return;
       }
       setSelectedFilePath(null);
@@ -2729,6 +2881,7 @@ function AppShellImpl() {
       if (conversationId) writeSessionWorkspaceState(conversationId, { open: true });
     },
     [
+      revealTabsSidebar,
       conversationId,
       queryClient,
       terminalFirst,
@@ -2751,7 +2904,7 @@ function AppShellImpl() {
       guardFileNavigation(absolutePath, undefined, () => {
         if (!conversationId) return;
         revealFolderInFilesPanel(conversationId, absolutePath);
-        if (isMobileViewport()) {
+        if (classicDrawers()) {
           openFilesDrawer(false);
           return;
         }
@@ -2762,10 +2915,12 @@ function AppShellImpl() {
         setFilesPanelOpen(false);
         setSubagentsPanelOpen(false);
         selectRightRailTab("files");
-        setRightPanelOpenAnimated(true);
+        if (tabsModeRef.current) revealTabsSidebar();
+        else setRightPanelOpenAnimated(true);
         writeSessionWorkspaceState(conversationId, { open: true });
       }),
     [
+      revealTabsSidebar,
       guardFileNavigation,
       conversationId,
       openFilesDrawer,
@@ -3270,16 +3425,23 @@ function AppShellImpl() {
                       changedCount,
                       subagentsWorking,
                       agentCount,
-                      onOpenFiles: openFilesPanel,
-                      onOpenChanges: openChangesPanel,
-                      onOpenShells: openShellsPanel,
-                      onOpenSubagents: openSubagentsPanel,
-                      onOpenGithub: openGithubPanel,
+                      // With the tabs, each entry opens the Workspace drawer on its page.
+                      onOpenFiles: tabsSidebar ? () => showTabsPage("files") : openFilesPanel,
+                      onOpenChanges: tabsSidebar ? () => showTabsPage("changes") : openChangesPanel,
+                      onOpenShells: tabsSidebar ? () => showTabsTabOf("terminal") : openShellsPanel,
+                      onOpenSubagents: tabsSidebar
+                        ? () => showTabsPage("subagents")
+                        : openSubagentsPanel,
+                      onOpenGithub: tabsSidebar ? () => showTabsPage("github") : openGithubPanel,
                       showTasks: railTabsAvailable.tasks,
-                      onOpenTasks: openTasksPanel,
+                      onOpenTasks: tabsSidebar ? () => showTabsPage("tasks") : openTasksPanel,
                       showContentSearch: railTabsAvailable["content-search"],
-                      onOpenContentSearch: openContentSearchPanel,
-                      onOpenSideChats: openSideChatsPanel,
+                      onOpenContentSearch: tabsSidebar
+                        ? () => showTabsPage("content-search")
+                        : openContentSearchPanel,
+                      onOpenSideChats: tabsSidebar
+                        ? () => showTabsTabOf("chat")
+                        : openSideChatsPanel,
                       onOpenMainExecutionLog: openMainExecutionLog,
                     }}
                   />
@@ -3332,7 +3494,69 @@ function AppShellImpl() {
               rectangle (e.g. a no-filesystem agent with no terminals).
               Sits inside the group so the header overlay spans it; the
               push panels below sit outside the group. */}
-                {conversationId && workspacePanelMounted && (
+                {conversationId && workspacePanelMounted && tabsSidebar && (
+                  // One host for the rail and the narrow drawer, so a resize moves it with its drafts.
+                  <ResponsiveViewerSlot
+                    mobile={mobileViewport}
+                    mobileTarget={tabsDrawerTarget}
+                    layout="contents"
+                  >
+                    <Suspense fallback={null}>
+                      <LazyWorkspaceTabsHost
+                        placement={tabsInDrawer ? "drawer" : "rail"}
+                        conversationId={conversationId}
+                        pending={pendingConversation}
+                        width={inlinePanelWidth}
+                        inert={
+                          tabsInDrawer
+                            ? !tabsDrawerOpen
+                            : !workspacePanelVisible || inlinePanelWidth === 0
+                        }
+                        open={tabsInDrawer ? tabsDrawerOpen : workspacePanelVisible}
+                        resizing={inlinePanelResizing}
+                        animateVisibility={rightPanelVisibilityAnimating}
+                        handleProps={inlinePanelHandleProps}
+                        tabListRef={workspaceTabListRef}
+                        showFilesPanel={showFilesPanel}
+                        showGithubTab={railTabsAvailable.github}
+                        showTasksTab={railTabsAvailable.tasks}
+                        showContentSearch={railTabsAvailable["content-search"]}
+                        showBrowserTab={railTabsAvailable.browser}
+                        onReveal={revealRightPanel}
+                        // The drawer's own Close puts it away.
+                        onHide={!tabsInDrawer && rightPanelOpen ? toggleRightPanel : undefined}
+                        changedCount={changedCount}
+                        changedFiles={changedFiles}
+                        subagentsWorking={subagentsWorking}
+                        agentCount={agentCount}
+                        rootSessionId={rootSessionId}
+                        terminals={terminals}
+                        // Until the session's labels load, its agent's own terminal can pass for a shell.
+                        terminalKeys={
+                          activeConv != null || activeSession != null ? openTerminals : null
+                        }
+                        autoFocusTerminalKey={
+                          autoFocusTerminalRef.current?.conversationId === conversationId
+                            ? autoFocusTerminalRef.current.key
+                            : null
+                        }
+                        openTerminalTab={openTerminalTab}
+                        maximized={rightPanelMaximized}
+                        onToggleMaximized={toggleRightPanelMaximized}
+                        permissionLevel={permissionLevel}
+                        filesPanelSort={filesPanelSort}
+                        onSortChange={handleFilesSortChange}
+                        filesPanelShowHidden={filesPanelShowHidden}
+                        onShowHiddenChange={setFilesPanelShowHidden}
+                        liveness={liveness}
+                        onShellCreateStart={markShellCreateStarted}
+                        onShellCreateFailed={clearShellCreatePending}
+                        subagentPanelOpener={openSubagentInPanel}
+                      />
+                    </Suspense>
+                  </ResponsiveViewerSlot>
+                )}
+                {conversationId && workspacePanelMounted && !tabsSidebar && (
                   <WorkspacePanel
                     conversationId={conversationId}
                     pending={pendingConversation}
@@ -3397,6 +3621,19 @@ function AppShellImpl() {
                 )}
               </div>
 
+              {conversationId && workspacePanelMounted && tabsSidebar && mobileViewport && (
+                // The narrow layout's Workspace drawer, where the one tabs host moves; kept
+                // mounted so its shells and pages stay live.
+                <MobilePanelDrawer
+                  open={tabsDrawerOpen}
+                  title="Workspace"
+                  onClose={() => setTabsDrawerOpen(false)}
+                  testId="workspace-tabs-drawer"
+                  keepMounted
+                >
+                  <div ref={setTabsDrawerTarget} className="contents" />
+                </MobilePanelDrawer>
+              )}
               <AppShellWorkspacePanels
                 conversationId={conversationId}
                 terminalFirst={terminalFirst}

@@ -24,7 +24,10 @@ it("reveals the pane when an agent opens or selects a tab in the shown session",
   renderHook(() => useRevealBrowserOnAgentTabs("conv_a", reveal));
   request("tabs", { action: "new" }, "conv_a");
   request("tabs", { action: "select", tab_id: "t1" }, "conv_a");
-  expect(reveal).toHaveBeenCalledTimes(2);
+  expect(reveal.mock.calls).toEqual([
+    [{ actionId: "a1", action: "new" }],
+    [{ actionId: "a1", action: "select", tabId: "t1" }],
+  ]);
   // Listing or closing tabs, other actions and other sessions leave the pane alone.
   request("tabs", { action: "list" }, "conv_a");
   request("tabs", { action: "close" }, "conv_a");

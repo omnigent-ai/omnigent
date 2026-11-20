@@ -931,6 +931,40 @@ describe("NewChatLandingScreen create flow", () => {
     },
   );
 
+  it("moves the new session to its real id with the requests in its URL, such as a cited file", async () => {
+    const tempConvId = "temp:1234567890abcdef1234567890abcdef";
+    beginLocalConversationMock.mockReturnValue({
+      tempConvId,
+      pendingMsgTempId: "pend_file",
+      createToken: "1234567890abcdef1234567890abcdef",
+    });
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding([]);
+    await waitForWorkspaceSeed();
+    typeMessage("Open the readme");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(hydrateLocalConversationMock).toHaveBeenCalledOnce());
+
+    const hydrateNavigate = hydrateLocalConversationMock.mock.calls[0][7];
+    const previousUrl = window.location.href;
+    try {
+      window.history.replaceState(
+        {},
+        "",
+        `/c/${encodeURIComponent(tempConvId)}?file=README.md&line=4`,
+      );
+      hydrateNavigate("/c/conv_new", { replace: true });
+      expect(navigateMock).toHaveBeenLastCalledWith("/c/conv_new?file=README.md&line=4", {
+        replace: true,
+      });
+    } finally {
+      window.history.replaceState({}, "", previousUrl);
+    }
+  });
+
   it.each([
     { query: "canvas=main", canvasId: "main", project: undefined },
     {
@@ -1369,7 +1403,8 @@ describe("NewChatLandingScreen create flow", () => {
         [],
         "pend_1",
         null,
-        navigateMock,
+        // Hydration navigates through a wrapper that keeps the page's query.
+        expect.any(Function),
         expect.any(Function),
         project,
         false,
@@ -1477,7 +1512,8 @@ describe("NewChatLandingScreen create flow", () => {
         [],
         "pend_1",
         null,
-        navigateMock,
+        // Hydration navigates through a wrapper that keeps the page's query.
+        expect.any(Function),
         expect.any(Function),
         undefined,
         false,
@@ -1524,7 +1560,8 @@ describe("NewChatLandingScreen create flow", () => {
         [],
         "pend_managed",
         null,
-        navigateMock,
+        // Hydration navigates through a wrapper that keeps the page's query.
+        expect.any(Function),
         expect.any(Function),
         undefined,
         false,
@@ -1777,7 +1814,8 @@ describe("NewChatLandingScreen create flow", () => {
         [],
         "pend_b",
         null,
-        navigateMock,
+        // Hydration navigates through a wrapper that keeps the page's query.
+        expect.any(Function),
         expect.any(Function),
         undefined,
         false,

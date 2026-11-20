@@ -24,7 +24,7 @@ vi.mock("@/lib/sessionsApi", () => ({
 import { setSessionHost, setSessionParent } from "@/lib/sessionHost";
 import { readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 
-import { emitBrowserActionRequest } from "@/lib/browserActionBus";
+import { emitBrowserActionRequest, onBrowserActionSettled } from "@/lib/browserActionBus";
 import type { BrowserActionRequestEvent } from "@/lib/events";
 import { useBrowserAgentRelay } from "./useBrowserAgentRelay";
 import { fetchSessionHostId } from "@/lib/fetchSessionHostId";
@@ -181,6 +181,32 @@ describe("useBrowserAgentRelay — claim-first protocol", () => {
     const body = postedResult();
     expect(body.claim_token).toBe("tok_1");
     expect((body.result as { ok: boolean }).ok).toBe(true);
+  });
+
+  it("tells this window how an action it ran ended, with the result it posts", async () => {
+    installBridge();
+    authenticatedFetch.mockResolvedValueOnce(WON).mockResolvedValueOnce(jsonResponse({}));
+    const settled = vi.fn();
+    const stop = onBrowserActionSettled(settled);
+    const event = actionEvent("navigate", { url: "https://example.com" });
+
+    await runAction(event);
+    stop();
+
+    expect(settled).toHaveBeenCalledOnce();
+    expect(settled).toHaveBeenCalledWith(event, CONV, postedResult().result);
+  });
+
+  it("says nothing of an action another window claimed", async () => {
+    installBridge();
+    authenticatedFetch.mockResolvedValueOnce(jsonResponse({ claimed: false }));
+    const settled = vi.fn();
+    const stop = onBrowserActionSettled(settled);
+
+    await runAction(actionEvent("screenshot"), { expectResult: false });
+    stop();
+
+    expect(settled).not.toHaveBeenCalled();
   });
 
   it("routes claim, dispatch, and result to the delivering conversation, not the mounted one", async () => {

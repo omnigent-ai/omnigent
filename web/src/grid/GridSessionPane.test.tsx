@@ -233,6 +233,38 @@ vi.mock("@/components/chat/SideChatPane", () => ({
     );
   },
 }));
+// The tabs sidebar's routing: off unless a test turns the flag on.
+const tabsRouting = vi.hoisted(() => ({
+  enabled: false,
+  routes: [] as [string, ...unknown[]][],
+  hosts: [] as { conversationId: string; bindsHistory?: boolean; open?: boolean }[],
+}));
+vi.mock("@/shell/workspaceTabsRouting", () => ({
+  useTabsSidebar: () => tabsRouting.enabled,
+  LazyWorkspaceTabsHost: (props: {
+    conversationId: string;
+    bindsHistory?: boolean;
+    open?: boolean;
+  }) => {
+    tabsRouting.hosts.push(props);
+    return <aside aria-label="Workspace tabs" data-testid={`tabs-${props.conversationId}`} />;
+  },
+  routeToWorkspaceTabs: async (open: (tabs: Record<string, unknown>) => Promise<unknown>) => {
+    const record =
+      (name: string) =>
+      async (...args: unknown[]) => {
+        tabsRouting.routes.push([name, ...args]);
+        return { ok: true };
+      };
+    await open({
+      isWorkspacePage: (value: string | null) => value === "files" || value === "github",
+      openWorkspacePage: record("openWorkspacePage"),
+      openWorkspaceFileLink: record("openWorkspaceFileLink"),
+      openWorkspaceTerminal: record("openWorkspaceTerminal"),
+      showWorkspacePullRequests: record("showWorkspacePullRequests"),
+    });
+  },
+}));
 vi.mock("@/shell/WorkspacePanel", () => ({
   WorkspacePanel: (props: ComponentProps<typeof WorkspacePanel>) => {
     const [draft, setDraft] = useState("");
@@ -994,4 +1026,38 @@ it("keeps a Claude Code sub-agent child's picker disabled, with no PATCH, even w
   expect(screen.queryByTestId("composer-agent-edit")).not.toBeInTheDocument();
   expect(updateSession).not.toHaveBeenCalled();
   view.unmount();
+});
+
+it("shows each cell's sidebar as tabs with the flag on, routing its links there", async () => {
+  tabsRouting.enabled = true;
+  tabsRouting.routes = [];
+  tabsRouting.hosts = [];
+  vi.mocked(selectPullRequestInPanel).mockClear();
+  onTestFinished(() => {
+    tabsRouting.enabled = false;
+    // Later cases assert this reveal was never asked for their cells.
+    vi.mocked(revealFolderInFilesPanel).mockClear();
+  });
+  render(twoCellGrid());
+
+  expect(screen.queryByTestId("workspace-first")).toBeNull();
+  expect(screen.getByTestId("tabs-first")).toBeInTheDocument();
+  // Only the selected cell binds Back and Forward.
+  const latest = (id: string) =>
+    tabsRouting.hosts.filter((host) => host.conversationId === id).at(-1);
+  expect(latest("first")?.bindsHistory).toBe(true);
+  expect(latest("second")?.bindsHistory).toBe(false);
+
+  const first = within(screen.getByRole("region", { name: "first (active)" }));
+  fireEvent.click(first.getByText("Open citation"));
+  fireEvent.click(first.getByText("Open PR"));
+  fireEvent.click(first.getByText("Open folder"));
+  await waitFor(() =>
+    expect(tabsRouting.routes).toEqual([
+      ["openWorkspaceFileLink", "first", "notes.md", { line: 7, endLine: 9 }, "user"],
+      ["showWorkspacePullRequests", "first", { kind: "pull", url: LINKED_PR, overview: true }],
+      ["openWorkspacePage", "first", "files"],
+    ]),
+  );
+  expect(selectPullRequestInPanel).not.toHaveBeenCalled();
 });
