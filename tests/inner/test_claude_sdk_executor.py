@@ -5566,6 +5566,7 @@ async def test_sandboxed_sdk_exposes_bash_for_skill_expansion(
     "cwd_source",
     [
         "default",
+        "default_allow_network",
         "spec_relative",
         "spec_absolute",
         "explicit_none",
@@ -5587,11 +5588,11 @@ def test_prepare_claude_cli_path_probe_passes_target_and_still_wraps(
     """
     from omnigent.inner.claude_sdk_executor import prepare_claude_cli_path
 
-    allow_network = False
+    allow_network = cwd_source == "default_allow_network"
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path))
     spec = _wrap_probe_spec(allow_network=allow_network)
     cwd = None
-    if cwd_source == "default":
+    if cwd_source in ("default", "default_allow_network"):
         spec.cwd = None
         expected_cwd = tmp_path
     elif cwd_source == "spec_relative":

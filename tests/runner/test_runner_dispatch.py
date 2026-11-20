@@ -1648,6 +1648,8 @@ async def test_runner_post_releases_turn_when_spec_resolution_fails(
     body = response.json()
     if failure != "outage":
         assert body["error"]["code"] == "invalid_input"
+        # Older servers read the flat detail instead of the structured error.
+        assert body["detail"] == body["error"]["message"]
         detail = (
             f"Request failed on the runner; see the runner log for details: {pinned_runner_log}"
         )

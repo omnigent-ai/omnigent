@@ -3352,7 +3352,7 @@ def create_runner_app(
                 if isinstance(policy_error, HarnessSandboxValidationError):
                     return JSONResponse(
                         status_code=exc.http_status if isinstance(exc, OmnigentError) else 400,
-                        content={"error": error},
+                        content={"error": error, "detail": error["message"]},
                     )
                 raise
             if spawn_env is None:
@@ -6887,6 +6887,7 @@ def create_runner_app(
             except _CopyOnWriteSetupError as exc:
                 return _copy_on_write_setup_failure(conv_id, exc)
             except (ValueError, OmnigentError) as exc:
+                detail = _client_safe_error_detail(exc, context="harness config")
                 return JSONResponse(
                     status_code=exc.http_status if isinstance(exc, OmnigentError) else 400,
                     content={
@@ -6894,8 +6895,9 @@ def create_runner_app(
                             "code": exc.code
                             if isinstance(exc, OmnigentError)
                             else "invalid_input",
-                            "message": _client_safe_error_detail(exc, context="harness config"),
-                        }
+                            "message": detail,
+                        },
+                        "detail": detail,
                     },
                 )
             except (httpx.HTTPError, RuntimeError) as exc:

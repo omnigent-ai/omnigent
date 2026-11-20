@@ -823,6 +823,9 @@ Claude SDK additionally resolves a named relative directory such as `./project`
 against the runner base when that base is still the selected workspace; `.`
 continues to use the selected workspace. Other adapters retain the selected
 workspace rather than applying that Claude-specific directory selection.
+Claude's CLI-preparation callbacks already resolve named relative directories;
+the SDK uses that prepared cwd for settings, credentials, execution, and transcript
+lookup so the process runs in the directory its sandbox protects.
 An absolute `os_env.cwd` must contain the selected session workspace; conflicting
 absolute boundaries refuse launch. Codex skips optional provider discovery when
 the worker policy blocks its loopback transport; configured providers still apply.

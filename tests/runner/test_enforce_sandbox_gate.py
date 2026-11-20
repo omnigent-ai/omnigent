@@ -623,6 +623,8 @@ async def test_session_init_checks_sandbox_before_spawn(
             "provider": "Provider configuration is unavailable.",
         }[guidance]
         error = response.json()["error"]
+        if guidance != "provider":
+            assert response.json()["detail"] == error["message"]
         assert error == {
             "code": "unauthorized" if guidance == "provider" else "invalid_input",
             "message": (
