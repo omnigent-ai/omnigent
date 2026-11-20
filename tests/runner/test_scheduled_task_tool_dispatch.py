@@ -138,6 +138,7 @@ async def test_create_posts_payload() -> None:
     )
     verb, url, body = client.calls[-1]
     assert (verb, url) == ("POST", "/v1/scheduled-tasks")
+    assert [url for verb, url, _ in client.calls if verb == "GET"] == ["/v1/info"]
     assert body == {
         **_REVIEW_FIELDS,
         "name": "nightly",
