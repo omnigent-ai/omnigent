@@ -84,6 +84,9 @@ describe("classifyAttachment", () => {
     (mime) => {
       expect(classifyAttachment(makeFile("clip.MP4", mime))).toBe("file");
       expect(
+        classifyAttachment(makeFile("clip.MP4", mime), { extensions: [".zip"], all_types: true }),
+      ).toBe("file");
+      expect(
         classifyAttachment(makeFile("clip.MP4", mime), { extensions: [], all_types: false }),
       ).toBeNull();
     },

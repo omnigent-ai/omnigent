@@ -210,8 +210,8 @@ export function classifyAttachment(
 
   // Match the server even when a browser mislabels a ZIP as text/plain.
   if (filesystemExtensions.has(ext)) return "file";
-  // A default filesystem type the server leaves out is refused, not inlined.
-  if (DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS.has(ext)) return null;
+  // Default filesystem types must stay out of inline delivery.
+  if (DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS.has(ext)) return policy?.all_types ? "file" : null;
   if (type.startsWith("image/")) return "image";
   if (type === "application/pdf" || ext === ".pdf") return "pdf";
   if (
