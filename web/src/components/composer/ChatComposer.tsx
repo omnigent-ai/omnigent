@@ -91,6 +91,7 @@ type TextareaComposerInput = Omit<ComponentPropsWithRef<"textarea">, "onKeyDown"
   onKeyDown?: (event: KeyboardEvent<HTMLTextAreaElement>, intent: ComposerKeyIntent) => void;
   "data-testid"?: string;
   "data-slash-command"?: string;
+  "data-shell-command"?: string;
   "data-has-draft"?: string;
 };
 
@@ -484,7 +485,25 @@ export function ComposerEngineInput({
 }) {
   const engine = useContext(ComposerEngineContext);
   const load = useCodeMirrorComposerLoad();
-  const { onKeyDown, ref, rows, heightMode, inputId, className, ...rest } = input;
+  const {
+    onKeyDown,
+    ref,
+    rows,
+    heightMode,
+    inputId,
+    className,
+    mentionTokens,
+    commandToken,
+    autoFocus,
+    ...rest
+  } = input;
+  // Only the first input mount may take focus. An engine switch remounts the input, and the
+  // handoff already restores whichever input had focus.
+  const inputMounted = useRef(false);
+  useLayoutEffect(() => {
+    inputMounted.current = true;
+  }, []);
+  const autoFocusOnMount = autoFocus && !inputMounted.current;
   const handleKeyDown = (event: ComposerKeyboardEvent) =>
     handleComposerKeyDown(event, keyboard, onKeyDown);
   const setTextarea = useCallback(
@@ -499,6 +518,9 @@ export function ComposerEngineInput({
         ref={ref}
         inputId={inputId}
         heightMode={heightMode}
+        mentionTokens={mentionTokens}
+        commandToken={commandToken}
+        autoFocus={autoFocusOnMount}
         onKeyDown={handleKeyDown}
       />
     );
@@ -509,6 +531,7 @@ export function ComposerEngineInput({
       rows={rows}
       {...(inputId ? { [COMPOSER_INPUT_ID_ATTRIBUTE]: inputId } : {})}
       className={className}
+      autoFocus={autoFocusOnMount}
       ref={setTextarea}
       onKeyDown={handleKeyDown}
     />

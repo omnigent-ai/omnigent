@@ -7,7 +7,9 @@ SQLite database.
 
 from __future__ import annotations
 
+import json
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -726,12 +728,15 @@ def test_legacy_store_can_keep_implementing_only_its_existing_methods() -> None:
 
 def test_default_timezone_is_per_user_and_ignores_unusable_stored_values(
     store: SqlAlchemyScheduledTaskStore,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The recorded zone round-trips per user; an unusable stored value reads as unset."""
-    from sqlalchemy import update
+    from sqlalchemy import text, update
     from sqlalchemy.orm import Session
 
+    from omnigent.db.compression import encode
     from omnigent.db.db_models import SqlPreference
+    from omnigent.stores.scheduled_task_store import sqlalchemy_store
 
     assert store.get_default_timezone(None) is None
     store.set_default_timezone(None, "America/Chicago")
@@ -748,6 +753,27 @@ def test_default_timezone_is_per_user_and_ignores_unusable_stored_values(
             )
             session.commit()
         assert store.get_default_timezone(None) is None, stored
+
+    def unexpected_zone_lookup(key: str) -> None:
+        pytest.fail(f"Invalid or oversized storage reached timezone lookup: {key[:40]}")
+
+    for raw in (b"not an envelope", encode(json.dumps("x" * 1025))):
+        with store._session("seed_invalid_timezone_preference") as session:
+            session.execute(
+                text(
+                    "UPDATE preferences SET value = :raw WHERE workspace_id = :workspace "
+                    "AND user_id = :user AND key = :key"
+                ),
+                {
+                    "raw": raw,
+                    "workspace": current_workspace_id(),
+                    "user": "local",
+                    "key": "scheduled_task_default_timezone",
+                },
+            )
+        with monkeypatch.context() as patch:
+            patch.setattr(sqlalchemy_store, "ZoneInfo", unexpected_zone_lookup)
+            assert store.get_default_timezone(None) is None
     assert store.get_default_timezone("alice@example.com") == "Asia/Tokyo"
 
 
@@ -3042,3 +3068,37 @@ def test_inbox_mysql_deep_page_seeks_to_cursor(store):
         float(value) for value in re.findall(r"actual time=[^)]*? rows=([\d.]+)", plans[0])
     ]
     assert examined and max(examined) <= 51, plans[0]
+
+
+@pytest.mark.parametrize(
+    ("days_later", "expected"),
+    [
+        (2, (int(datetime(2026, 11, 21, 9, tzinfo=UTC).timestamp()), "active")),
+        (3, (None, "completed")),
+    ],
+)
+def test_a_schedule_anchor_keeps_count_from_the_anchor(
+    store: SqlAlchemyScheduledTaskStore,
+    monkeypatch: pytest.MonkeyPatch,
+    days_later: int,
+    expected: tuple[int | None, str],
+) -> None:
+    from omnigent.stores.scheduled_task_store import sqlalchemy_store
+
+    store.configure_dispatch(True)
+    anchor = int(datetime(2026, 11, 18, 12, tzinfo=UTC).timestamp())
+    # Runs on the 19th, 20th and 21st when anchored on the 18th.
+    monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: anchor + days_later * 86400)
+    task = store.create(
+        scheduled_task_id=_uid(f"st_anchor_{days_later}"),
+        name="copy",
+        prompt="p",
+        rrule="FREQ=DAILY;BYHOUR=9;BYMINUTE=0;COUNT=3",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+        schedule_anchor=anchor,
+    )
+    assert task.created_at == anchor
+    # Only the occurrences left after now remain; none, once COUNT is used up.
+    assert (task.next_run_at, task.state) == expected

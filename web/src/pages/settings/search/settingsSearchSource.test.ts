@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 
 import {
   catalogFromModules,
@@ -49,14 +49,17 @@ function guardCatalog() {
   return { catalog, families };
 }
 
+/** A guard run's sources: one program, parsed and type-checked once, that every walk shares. */
+let settingsSources: { rootFiles: string[]; program: ReturnType<typeof createSettingsProgram> };
+
+/** Generous under coverage, which runs the guard several times slower than a plain run. */
+const GUARD_TIMEOUT_MS = 180_000;
+
 /** The guard's violations, walked from the given functions or from every root module. */
 function violationsFrom(entryFunctions?: readonly { file: string; name: string }[]) {
-  const rootFiles = settingsRootFiles(WEB_ROOT);
-  const program = createSettingsProgram(WEB_ROOT, rootFiles);
   return guardSettingsSource({
-    program,
+    ...settingsSources,
     webRoot: WEB_ROOT,
-    rootFiles,
     entryFunctions,
     ...guardCatalog(),
   });
@@ -95,108 +98,173 @@ function pageFunction(file: string, name: string) {
 }
 
 describe("Settings source guard", () => {
+  beforeAll(() => {
+    const rootFiles = settingsRootFiles(WEB_ROOT);
+    const program = createSettingsProgram(WEB_ROOT, rootFiles);
+    // Checked here, so the first walk doesn't pay for the type checker the others reuse.
+    program.getTypeChecker();
+    settingsSources = { rootFiles, program };
+  }, GUARD_TIMEOUT_MS);
+
   it("lists every entry the catalog declares where search reads it", () => {
     expect(catalogFromModules(catalogModules(), SETTINGS_ENTRIES).unlisted).toEqual([]);
   });
 
-  it("finds an owner for every Settings control, or a baseline reason for none", () => {
-    expect(unexpectedViolations(violationsFrom(), true)).toEqual([]);
-  }, 60_000);
+  it(
+    "finds an owner for every Settings control, or a baseline reason for none",
+    () => {
+      expect(unexpectedViolations(violationsFrom(), true)).toEqual([]);
+    },
+    GUARD_TIMEOUT_MS,
+  );
 
-  it("finds an owner for every control General renders", () => {
-    expect(
-      unexpectedViolations(
-        violationsFrom([pageFunction("SettingsPage.tsx", "GeneralSection")]),
-        false,
-      ),
-    ).toEqual([]);
-  }, 60_000);
-
-  it("finds an owner for every control Appearance renders", () => {
-    expect(
-      unexpectedViolations(
-        violationsFrom([pageFunction("SettingsPage.tsx", "AppearanceSection")]),
-        false,
-      ),
-    ).toEqual([]);
-  }, 60_000);
-
-  it("finds an owner for every control Git and Sandbox Integrations render", () => {
-    expect(
-      unexpectedViolations(
-        violationsFrom([
-          pageFunction("SettingsPage.tsx", "GitSection"),
-          pageFunction("SettingsPage.tsx", "IntegrationsSection"),
-        ]),
-        false,
-      ),
-    ).toEqual([]);
-  }, 60_000);
-
-  it("finds an owner for every control MCP and Account render", () => {
-    expect(
-      unexpectedViolations(
-        violationsFrom([
-          pageFunction("SettingsPage.tsx", "AccountSection"),
-          // MCP's section renders this component alone.
-          {
-            file: path.join(WEB_ROOT, "src/components/McpRegistry.tsx"),
-            name: "McpRegistryConnections",
-          },
-        ]),
-        false,
-      ),
-    ).toEqual([]);
-  }, 60_000);
-
-  it("finds an owner for every control Members renders, its rows' dialogs too", () => {
-    expect(
-      unexpectedViolations(violationsFrom([pageFunction("MembersPage.tsx", "MembersPage")]), false),
-    ).toEqual([]);
-  }, 60_000);
-
-  it("finds an owner for every control Policies renders, its add dialog and rows' dialogs too", () => {
-    expect(
-      unexpectedViolations(
-        violationsFrom([pageFunction("PoliciesPage.tsx", "PoliciesPage")]),
-        false,
-      ),
-    ).toEqual([]);
-  }, 60_000);
-
-  it("finds an owner for every control Archived sessions renders, its bar and rows' dialogs too", () => {
-    expect(
-      unexpectedViolations(
-        violationsFrom([pageFunction("SettingsPage.tsx", "ArchivedSection")]),
-        false,
-      ),
-    ).toEqual([]);
-  }, 60_000);
-
-  it("finds an owner for every control Custom agents renders, its create form too", () => {
-    expect(
-      unexpectedViolations(
-        violationsFrom([
-          {
-            file: path.join(WEB_ROOT, "src/pages/settings/SettingsCustomAgentsSection.tsx"),
-            name: "SettingsCustomAgentsSection",
-          },
-        ]),
-        false,
-      ),
-    ).toEqual([]);
-  }, 60_000);
-
-  it("finds an owner for every control the Harnesses grid renders", () => {
-    // The grid's own components, walked as the page renders them; the detail page comes later.
-    const section = path.join(WEB_ROOT, "src/pages/settings/SettingsHarnessesSection.tsx");
-    expect(
-      unexpectedViolations(
-        violationsFrom(
-          ["HostSelect", "HarnessCard", "SetupButton"].map((name) => ({ file: section, name })),
+  it(
+    "finds an owner for every control General renders",
+    () => {
+      expect(
+        unexpectedViolations(
+          violationsFrom([pageFunction("SettingsPage.tsx", "GeneralSection")]),
+          false,
         ),
-        false,
-      ),
-    ).toEqual([]);
-  }, 60_000);
+      ).toEqual([]);
+    },
+    GUARD_TIMEOUT_MS,
+  );
+
+  it(
+    "finds an owner for every control Appearance renders",
+    () => {
+      expect(
+        unexpectedViolations(
+          violationsFrom([pageFunction("SettingsPage.tsx", "AppearanceSection")]),
+          false,
+        ),
+      ).toEqual([]);
+    },
+    GUARD_TIMEOUT_MS,
+  );
+
+  it(
+    "finds an owner for every control Git and Sandbox Integrations render",
+    () => {
+      expect(
+        unexpectedViolations(
+          violationsFrom([
+            pageFunction("SettingsPage.tsx", "GitSection"),
+            pageFunction("SettingsPage.tsx", "IntegrationsSection"),
+          ]),
+          false,
+        ),
+      ).toEqual([]);
+    },
+    GUARD_TIMEOUT_MS,
+  );
+
+  it(
+    "finds an owner for every control MCP and Account render",
+    () => {
+      expect(
+        unexpectedViolations(
+          violationsFrom([
+            pageFunction("SettingsPage.tsx", "AccountSection"),
+            // MCP's section renders this component alone.
+            {
+              file: path.join(WEB_ROOT, "src/components/McpRegistry.tsx"),
+              name: "McpRegistryConnections",
+            },
+          ]),
+          false,
+        ),
+      ).toEqual([]);
+    },
+    GUARD_TIMEOUT_MS,
+  );
+
+  it(
+    "finds an owner for every control Members renders, its rows' dialogs too",
+    () => {
+      expect(
+        unexpectedViolations(
+          violationsFrom([pageFunction("MembersPage.tsx", "MembersPage")]),
+          false,
+        ),
+      ).toEqual([]);
+    },
+    GUARD_TIMEOUT_MS,
+  );
+
+  it(
+    "finds an owner for every control Policies renders, its add dialog and rows' dialogs too",
+    () => {
+      expect(
+        unexpectedViolations(
+          violationsFrom([pageFunction("PoliciesPage.tsx", "PoliciesPage")]),
+          false,
+        ),
+      ).toEqual([]);
+    },
+    GUARD_TIMEOUT_MS,
+  );
+
+  it(
+    "finds an owner for every control Archived sessions renders, its bar and rows' dialogs too",
+    () => {
+      expect(
+        unexpectedViolations(
+          violationsFrom([pageFunction("SettingsPage.tsx", "ArchivedSection")]),
+          false,
+        ),
+      ).toEqual([]);
+    },
+    GUARD_TIMEOUT_MS,
+  );
+
+  it(
+    "finds an owner for every control Custom agents renders, its create form too",
+    () => {
+      expect(
+        unexpectedViolations(
+          violationsFrom([
+            {
+              file: path.join(WEB_ROOT, "src/pages/settings/SettingsCustomAgentsSection.tsx"),
+              name: "SettingsCustomAgentsSection",
+            },
+          ]),
+          false,
+        ),
+      ).toEqual([]);
+    },
+    GUARD_TIMEOUT_MS,
+  );
+
+  it(
+    "finds an owner for every control the Harnesses section renders, each fix dialog opener's too",
+    () => {
+      const section = path.join(WEB_ROOT, "src/pages/settings/SettingsHarnessesSection.tsx");
+      expect(
+        unexpectedViolations(
+          violationsFrom([{ file: section, name: "SettingsHarnessesSection" }]),
+          false,
+        ),
+      ).toEqual([]);
+    },
+    GUARD_TIMEOUT_MS,
+  );
+
+  it(
+    "finds an owner for every control the Harnesses grid renders",
+    () => {
+      // The grid's own components, walked as the page renders them; the detail page comes later.
+      const section = path.join(WEB_ROOT, "src/pages/settings/SettingsHarnessesSection.tsx");
+      expect(
+        unexpectedViolations(
+          violationsFrom(
+            ["HostSelect", "HarnessCard", "SetupButton"].map((name) => ({ file: section, name })),
+          ),
+          false,
+        ),
+      ).toEqual([]);
+    },
+    GUARD_TIMEOUT_MS,
+  );
 });

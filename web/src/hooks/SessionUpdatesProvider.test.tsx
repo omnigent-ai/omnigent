@@ -9,17 +9,25 @@ import { act, cleanup, render, renderHook, waitFor } from "@testing-library/reac
 import { QueryClient, QueryClientProvider, QueryObserver } from "@tanstack/react-query";
 import { MemoryRouter, useNavigate } from "react-router-dom";
 import type { ContextType, ReactNode } from "react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 import {
   clearSessionTombstones,
   useArchiveConversation,
   useConversations,
   useMoveToProject,
+  useSetConversationMuted,
   type Conversation,
   type ConversationsPage,
 } from "@/hooks/useConversations";
 import { clearRecentlyCreated, type ConversationsInfiniteData } from "@/lib/sessionListCache";
+import {
+  beginMuteSave,
+  isConversationMuted,
+  MUTE_REINDEX_GRACE_MS,
+  MUTED_LABEL_KEY,
+  settleMuteSave,
+} from "@/lib/sessionMute";
 import { childSessionsQueryKey } from "@/hooks/useChildSessions";
 
 // Mock the socket transport so setWatched is observable and start/stop are
@@ -871,6 +879,119 @@ describe("SessionUpdatesProvider move-to-project in flight", () => {
       json: async () => ({ ...moving, project_id: "p_new", updated_at: 10 }),
     });
     await waitFor(() => expect(move.result.current.isSuccess).toBe(true));
+  });
+});
+
+describe("SessionUpdatesProvider mute in flight", () => {
+  it.each([
+    { muted: true, success: true },
+    { muted: false, success: true },
+    { muted: true, success: false },
+    { muted: false, success: false },
+  ])(
+    "keeps mute=$muted through stale frames until the reindex window passes, success=$success",
+    async ({ muted, success }) => {
+      let resolvePatch!: (value: unknown) => void;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(
+          () =>
+            new Promise((resolve) => {
+              resolvePatch = resolve;
+            }),
+        ),
+      );
+      const client = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+      const original: Conversation = {
+        ...conv("conv_a"),
+        labels: muted ? {} : { [MUTED_LABEL_KEY]: "1" },
+      };
+      const key = ["conversations", "", false];
+      client.setQueryData<ConversationsInfiniteData>(key, {
+        pages: [{ data: [original], first_id: original.id, last_id: original.id, has_more: false }],
+        pageParams: [undefined],
+      });
+      renderProvider(client, ["/"]);
+      const handler = frameHandler();
+      const wrapper = ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      );
+      const mute = renderHook(() => useSetConversationMuted(), { wrapper });
+      const row = () => client.getQueryData<ConversationsInfiniteData>(key)!.pages[0].data[0];
+      act(() => mute.result.current.mutate({ id: original.id, muted }));
+      await waitFor(() => expect(resolvePatch).toBeDefined());
+      act(() =>
+        handler({
+          type: "changed",
+          items: [
+            { ...original, labels: { ...original.labels, other: "new" }, title: "Late edit" },
+          ],
+        }),
+      );
+      expect(row().labels[MUTED_LABEL_KEY]).toBe(muted ? "1" : undefined);
+      expect(row().title).toBe("Late edit");
+      resolvePatch({
+        ok: success,
+        status: success ? 200 : 500,
+        json: async () => ({ labels: muted ? { [MUTED_LABEL_KEY]: "1" } : {} }),
+      });
+      await waitFor(() => expect(client.isMutating()).toBe(0));
+      const saved = success ? muted : !muted;
+      expect(row().labels).toEqual({ other: "new", ...(saved ? { [MUTED_LABEL_KEY]: "1" } : {}) });
+      // A frame read before the save, or from a lagging index, can still arrive
+      // after it settles; it can't undo the saved preference.
+      act(() => handler({ type: "changed", items: [original] }));
+      expect(row().labels).toEqual(saved ? { [MUTED_LABEL_KEY]: "1" } : {});
+      expect(isConversationMuted(row())).toBe(saved);
+      // Once the reindex window passes, a frame reports another device's change.
+      const later = performance.now() + MUTE_REINDEX_GRACE_MS;
+      const clock = vi.spyOn(performance, "now").mockReturnValue(later);
+      onTestFinished(() => clock.mockRestore());
+      const remote = !saved;
+      act(() =>
+        handler({
+          type: "changed",
+          items: [{ ...original, labels: remote ? { [MUTED_LABEL_KEY]: "1" } : {} }],
+        }),
+      );
+      expect(isConversationMuted(row())).toBe(remote);
+    },
+  );
+});
+
+describe("SessionUpdatesProvider mute recheck", () => {
+  it("re-reads only the lists holding a session once a frame it masked has aged out", () => {
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient();
+      const key = ["conversations", "", false];
+      seedConversations(client, ["conv_a", "conv_b"]);
+      seedProjectFolder(client, "Alpha", ["conv_x"]);
+      beginMuteSave("conv_a", true);
+      settleMuteSave("conv_a", true);
+      client.setQueryData<ConversationsInfiniteData>(key, (old) => ({
+        ...old!,
+        pages: old!.pages.map((page) => ({
+          ...page,
+          data: page.data.map((row) =>
+            row.id === "conv_a" ? { ...row, labels: { [MUTED_LABEL_KEY]: "1" } } : row,
+          ),
+        })),
+      }));
+      renderProvider(client, ["/"]);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+
+      // Another device unmutes it before this tab's save could have reindexed.
+      act(() => frameHandler()({ type: "changed", items: [conv("conv_a")] }));
+      expect(isConversationMuted({ id: "conv_a" })).toBe(true);
+      act(() => vi.advanceTimersByTime(MUTE_REINDEX_GRACE_MS - 1));
+      expect(invalidatedKeys(client, invalidate)).toEqual([]);
+
+      act(() => vi.advanceTimersByTime(1 + 300)); // the window, then the reconcile debounce
+      expect(invalidatedKeys(client, invalidate)).toEqual([JSON.stringify(key)]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

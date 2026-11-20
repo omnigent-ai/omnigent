@@ -293,7 +293,19 @@ async def test_current_runner_timezone_contract_across_server_versions(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["http", "transport", "json", "shape"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "http",
+        "transport",
+        "json",
+        "shape",
+        "false",
+        "truthy-string",
+        "truthy-integer",
+        "truthy-object",
+    ],
+)
 async def test_create_timezone_falls_back_when_capability_is_unavailable(failure: str) -> None:
     requests: list[httpx.Request] = []
 
@@ -306,6 +318,16 @@ async def test_create_timezone_falls_back_when_capability_is_unavailable(failure
                 return httpx.Response(200, text="not json")
             if failure == "shape":
                 return httpx.Response(200, json=[])
+            capabilities = {
+                "false": False,
+                "truthy-string": "true",
+                "truthy-integer": 1,
+                "truthy-object": {"enabled": True},
+            }
+            if failure in capabilities:
+                return httpx.Response(
+                    200, json={"scheduled_task_default_timezone": capabilities[failure]}
+                )
             return httpx.Response(500)
         assert "timezone" not in json.loads(request.content)
         return httpx.Response(200, json={"id": _TASK_ID, "timezone": "UTC"})

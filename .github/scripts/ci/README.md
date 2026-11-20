@@ -28,6 +28,10 @@ Whenever the web test job runs, it also tests and builds the VS Code extension,
 checks the web extension SDK and example, and runs the Electron Node suites.
 These consumer checks run in both focused dependency CI and full CI, including
 catalog additions and pushes to main. PR runs also validate changed npm peers.
+Pull requests run the Vitest suite as four shards without coverage. Pushes to
+main run that suite once with coverage and publish the UI coverage artifact.
+`Web result` requires the shard job on pull requests and accepts a skipped
+shard job on push.
 
 The UI filter uses pytest's resolved fixture closure, so tests depending on
 `mocked_native_codex_session` indirectly are included. Filtering happens before
