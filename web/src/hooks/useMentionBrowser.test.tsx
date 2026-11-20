@@ -13,12 +13,7 @@ import {
   setSessionDraft,
   setSessionMentions,
 } from "@/lib/sessionDrafts";
-import {
-  presentTaggedMentions,
-  type MentionState,
-  type SessionMention,
-  type TaggedMentions,
-} from "@/lib/composerMentions";
+import type { MentionState, SessionMention, TaggedMentions } from "@/lib/composerMentions";
 import { useMentionBrowser } from "./useMentionBrowser";
 
 const childId = "conv_hook_child";
@@ -106,9 +101,7 @@ function renderBrowser(input: ComposerTextTarget | null = null) {
   });
 }
 
-type Rendered =
-  | ReturnType<typeof renderBrowser>["result"]
-  | ReturnType<typeof renderCallerOwnedBrowser>["result"];
+type Rendered = ReturnType<typeof renderBrowser>["result"];
 
 const reviewSubagent: SessionMention = { id: "sub_review", title: "Review", isSubagent: true };
 
@@ -126,32 +119,6 @@ function tagSession(result: Rendered, session: SessionMention, typed: string) {
   act(() => result.current.browser.attachSession(session));
 }
 
-/**
- * The hook with its tags held by the caller, as a grid cell holds them: the caller drops a tag
- * whose token left the text on every text change, as its shared draft does.
- */
-function renderCallerOwnedBrowser() {
-  return renderHook(() => {
-    const [text, setTextState] = useState("");
-    const [mentions, setMentions] = useState<TaggedMentions>(NO_TAGS);
-    const [mention, setMention] = useState<MentionState | null>(null);
-    const setText = (next: string) => {
-      setTextState(next);
-      setMentions((previous) => presentTaggedMentions(previous, [next]) ?? NO_TAGS);
-    };
-    const browser = useMentionBrowser({
-      mention,
-      setMention,
-      mentionEntries: [],
-      text,
-      setText,
-      textareaRef: { current: null },
-      tags: { mentions, updateMentions: (update) => setMentions((previous) => update(previous)) },
-    });
-    return { text, setText, setQuote: () => {}, setMention, browser, mentions };
-  });
-}
-
 // One stable fake input per name, as a mounted composer input is the same object across events.
 const fakeInputs = new WeakMap<Rendered, Map<string, { value: string }>>();
 
@@ -166,7 +133,6 @@ function change(result: Rendered, value: string, fromHistory: boolean, name = "t
     currentTarget: input as unknown as ComposerTextTarget,
     fromHistory,
   };
-  // The text first, then the notice, as the grid cell's composer does.
   act(() => {
     if (name === "tail") result.current.setText(value);
     else result.current.setQuote(value);
@@ -316,53 +282,6 @@ describe("useMentionBrowser released tags", () => {
     });
     expect(tokens).toEqual(["@readme.md", "@notes.md", "@notes.md"]);
     expect(result.current.browser.mentionTokens).toEqual(["@readme.md", "@notes.md"]);
-  });
-});
-
-describe("useMentionBrowser with caller-owned tags", () => {
-  it("restores a tag the caller dropped on a delete when an undo brings its token back", () => {
-    const { result } = renderCallerOwnedBrowser();
-    tagReadme(result);
-    expect(result.current.browser.mentionTokens).toEqual(["@readme.md"]);
-
-    change(result, "Read  ", false);
-    expect(result.current.browser.mentionTokens).toEqual([]);
-
-    change(result, "Read @readme.md ", true);
-    expect(result.current.browser.mentionTokens).toEqual(["@readme.md"]);
-  });
-
-  it("archives a dropped tag that's only the start of a kept one, so an undo restores both", () => {
-    const { result } = renderCallerOwnedBrowser();
-    const fix: SessionMention = { id: "sess_fix", title: "Fix", isSubagent: false };
-    const fixCi: SessionMention = { id: "sess_fix_ci", title: "Fix CI", isSubagent: false };
-    tagSession(result, fix, "Ask @Fi");
-    act(() => result.current.setText("Ask @Fix @Fi"));
-    act(() => result.current.setMention({ query: "Fi", start: 9, end: 12 }));
-    act(() => result.current.browser.attachSession(fixCi));
-    expect(result.current.text).toBe("Ask @Fix @Fix CI ");
-
-    change(result, "Ask  @Fix CI ", false);
-    expect(result.current.mentions.sessions.map((session) => session.id)).toEqual(["sess_fix_ci"]);
-
-    change(result, "Ask @Fix @Fix CI ", true);
-    expect(result.current.mentions.sessions.map((session) => session.id).sort()).toEqual([
-      "sess_fix",
-      "sess_fix_ci",
-    ]);
-  });
-
-  it("forgets the tags a reset clears, so an undo in the next draft can't restore them", () => {
-    const { result } = renderCallerOwnedBrowser();
-    tagReadme(result);
-    act(() => {
-      result.current.browser.resetMentions();
-      result.current.setText("");
-    });
-    change(result, "", false);
-
-    change(result, "Read @readme.md ", true);
-    expect(result.current.browser.mentionTokens).toEqual([]);
   });
 });
 

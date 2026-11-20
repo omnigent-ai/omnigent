@@ -3255,7 +3255,6 @@ function ComposerImpl(
   mentionTokensRef.current = mentionTokens;
   useEffect(() => {
     if (pendingComposerAttachments.length === 0) return;
-    // Each item keeps the token it already owns; a new one gets a token no tag owns.
     const tokens = tagFilesRef.current(pendingComposerAttachments);
     const taken = [...mentionTokensRef.current, ...tokens];
     // Each attachment lands as an inline token at the end of the draft.

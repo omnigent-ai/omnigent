@@ -302,30 +302,6 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [segmentsKey, mentionedItems, mentionedSessions]);
 
-  // Caller-owned tags: the caller drops a tag as soon as its token leaves the draft, so the
-  // hook archives the tags that vanished that way, and an undo can still reclaim them.
-  const callerTagsRef = useRef<TaggedMentions>({
-    files: mentionedItems,
-    sessions: mentionedSessions,
-  });
-  useEffect(() => {
-    if (!tags) return;
-    const previous = callerTagsRef.current;
-    const current = { files: mentionedItems, sessions: mentionedSessions };
-    callerTagsRef.current = current;
-    const dropped = withoutTags(previous, current);
-    // Every token at once, so a dropped tag that's only the start of another counts as gone.
-    const present = tokensIn(draftSegments, [...tagTokens(dropped), ...ownedMentionTokens()]);
-    const released = {
-      files: dropped.files.filter((it) => !present.has(fileMentionToken(it))),
-      sessions: dropped.sessions.filter((it) => !present.has(sessionTagToken(it))),
-    };
-    if (released.files.length === 0 && released.sessions.length === 0) return;
-    releasedRef.current = mergeTags(releasedRef.current, released);
-    // draftSegments is captured through segmentsKey, as in the effect above.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [segmentsKey, mentionedItems, mentionedSessions]);
-
   // Take released tags back as active ones, when an undo or redo brings their tokens back.
   const reclaim = (restored: TaggedMentions) => {
     if (restored.files.length === 0 && restored.sessions.length === 0) return;
@@ -371,8 +347,6 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
 
   const resetMentions = (mentions?: TaggedMentions) => {
     releasedRef.current = NO_TAGS;
-    // A reset isn't a deletion: the caller-owned diff must not archive the tags it cleared.
-    callerTagsRef.current = mentions ?? NO_TAGS;
     setMentionedItems(mentions?.files ?? []);
     setMentionedSessions(mentions?.sessions ?? []);
   };

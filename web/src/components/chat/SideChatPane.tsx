@@ -1023,8 +1023,10 @@ function SideChatComposer({
     (!pending && files.length > 0) ||
     reviewComments.length > 0;
   // The tags and review comments a send carries. A grid cell's come from its session draft.
-  const draftSegments = [text, ...quotes.map((replyQuote) => replyQuote.before)];
-  const sharedTags = presentTaggedMentions(sessionMentions, draftSegments);
+  const sharedTags = presentTaggedMentions(sessionMentions, [
+    text,
+    ...quotes.map((replyQuote) => replyQuote.before),
+  ]);
   const sendContext: ComposerSendContext = {
     mentions: composerInlineMentions(
       sharedTags?.files ?? [],
@@ -1090,8 +1092,6 @@ function SideChatComposer({
     attachMention,
     openMentionDir,
     attachSession,
-    noteTextChange: noteMentionTextChange,
-    resetMentions,
     handleKeyDown: handleMentionKeyDown,
     handleTokenBackspace,
     dismiss: dismissMention,
@@ -1104,8 +1104,6 @@ function SideChatComposer({
     setText,
     textareaRef,
     isMobile,
-    // A tag's token in the tail or a reply quote keeps the tag, as the shared draft does.
-    segments: draftSegments,
     tags: gridCell
       ? {
           mentions: sessionMentions ?? NO_TAGGED_MENTIONS,
@@ -1191,7 +1189,6 @@ function SideChatComposer({
   const applyMenuSelection = (cmd: string) => {
     if (Object.hasOwn(sideChatBuiltins, cmd)) {
       setText("");
-      resetMentions();
       if (cmd === "/help") showHelp();
       return;
     }
@@ -1218,10 +1215,7 @@ function SideChatComposer({
       !carriesMessageContext({ quotes, text }, files, sendContext),
     onSelect: applyMenuSelection,
     onTabComplete: completeMenuSelection,
-    clearText: () => {
-      setText("");
-      resetMentions();
-    },
+    clearText: () => setText(""),
   });
   const menuCommandNames = useMemo(() => Object.keys(menuCommands), [menuCommands]);
   // Codex forks from a `/side` message, so its pending text never reaches the shell; other
@@ -1298,7 +1292,6 @@ function SideChatComposer({
       : null;
     const runSkill = (match: { command: string; args: string }) => {
       clearComposer(composerKey);
-      resetMentions();
       onSend();
       void sendSlashCommand(match.command.slice(1), match.args, agentId, {
         pinnedConversationId: childId,
@@ -1313,7 +1306,6 @@ function SideChatComposer({
     }
     if (builtin !== null) {
       setText("");
-      resetMentions();
       if (builtin.command === "/help") showHelp();
       return;
     }
@@ -1343,7 +1335,6 @@ function SideChatComposer({
       )
     ) {
       clearComposer(composerKey);
-      resetMentions();
       if (gridCell) clearLocalReviewContexts(childId);
       onSend();
       enqueueMessage(
@@ -1357,7 +1348,6 @@ function SideChatComposer({
     // A running Codex chat refuses a steered /compact; keep the draft as the main composer does.
     if (isCompactControl(harness, message, outgoing) && rejectBusyCompact(childId)) return;
     clearComposer(composerKey);
-    resetMentions();
     if (gridCell) clearLocalReviewContexts(childId);
     onSend();
     void send(message, agentId, outgoing, {
@@ -1486,8 +1476,6 @@ function SideChatComposer({
             if (commandNotice !== null) setCommandNotice(null);
             slashCompletion.onSelectionChange(event.currentTarget);
             setText(event.currentTarget.value);
-            // After the text reaches the shared draft, so a restored tag lands in a draft that exists.
-            noteMentionTextChange(event);
             if (gridCell)
               setTypedMention(
                 detectMentionAt(
@@ -1551,10 +1539,7 @@ function SideChatComposer({
                 keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
                 disabled={!ready}
                 inputFor={(replyQuote) => ({
-                  onChange: (event) => {
-                    editText(replyQuote.id, event.currentTarget.value);
-                    noteMentionTextChange(event);
-                  },
+                  onChange: (event) => editText(replyQuote.id, event.currentTarget.value),
                   onFocus: (event) => focusText(replyQuote.id, event.currentTarget),
                   onKeyDown: handleKeyDown,
                   onPaste,
