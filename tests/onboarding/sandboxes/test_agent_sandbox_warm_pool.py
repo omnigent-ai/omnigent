@@ -707,6 +707,27 @@ def test_failed_preparation_is_reported_even_when_readiness_turns_false(
         harness.launcher.start_host(_HANDLE.encode(), **_START_ARGS)
 
 
+def test_crash_looping_bootstrap_fails_with_its_log_tail(harness: _Harness) -> None:
+    """A warm bootstrap that crash-loops fails fast and carries its own log tail."""
+    crashed = copy.deepcopy(harness.pod)
+    for container in crashed.status.container_statuses:
+        if container.name == warm.BOOTSTRAP_CONTAINER:
+            container.ready = False
+            container.restart_count = 2
+            container.state = SimpleNamespace(
+                running=None,
+                waiting=SimpleNamespace(reason="CrashLoopBackOff", message="back-off 40s"),
+                terminated=None,
+            )
+    harness.core.read_namespaced_pod.return_value = crashed
+    harness.core.read_namespaced_pod_log.return_value = "prepare failed: no route to host\n"
+    with pytest.raises(click.ClickException, match="Warm Sandbox startup failed") as excinfo:
+        harness.launcher.start_host(_HANDLE.encode(), **_START_ARGS)
+    message = str(excinfo.value)
+    assert "crash-looping" in message
+    assert "Container 'bootstrap' log tail: prepare failed: no route to host" in message
+
+
 def test_activation_cannot_follow_a_replacement_pod(
     harness: _Harness, monkeypatch: pytest.MonkeyPatch
 ) -> None:

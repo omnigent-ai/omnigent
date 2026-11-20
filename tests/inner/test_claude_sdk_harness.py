@@ -17,12 +17,16 @@ the e2e suite and requires API keys.
 
 from __future__ import annotations
 
+import asyncio
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from omnigent.inner import claude_sdk_harness
+from omnigent.inner.claude_model_access import ClaudeModelAccess
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 
 
@@ -54,6 +58,31 @@ def test_create_app_returns_fastapi_with_required_routes() -> None:
     # discriminated-event endpoint per §The Harness API Subset.
     assert "/health" in paths
     assert "/v1/sessions/{conversation_id}/events" in paths
+
+
+async def test_profile_credential_resolves_during_async_executor_startup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The Claude harness factory can mint a credential with a live event loop."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    access = ClaudeModelAccess(
+        "https://model.test", "authorization", lambda: asyncio.run(asyncio.sleep(0, result="key"))
+    )
+    worker_env = {"MODEL_ALIAS": "key"}
+    executor = SimpleNamespace(close=AsyncMock())
+
+    def build_executor() -> Any:
+        access.worker_environment(worker_env, tmp_path / "home")
+        return executor
+
+    monkeypatch.setattr(claude_sdk_harness, "_build_claude_sdk_executor", build_executor)
+    with patch.object(ExecutorAdapter, "build", lambda self: self):
+        adapter = claude_sdk_harness.create_app()
+    assert isinstance(adapter, ExecutorAdapter)
+    assert await adapter._ensure_executor_for_turn() is executor
+    assert worker_env["ANTHROPIC_AUTH_TOKEN"] == access.placeholder
+    assert "MODEL_ALIAS" not in worker_env
 
 
 def test_executor_factory_reads_env_vars(
@@ -353,6 +382,31 @@ def test_databricks_env_var_truthy_parsing(
 
 @pytest.mark.parametrize(
     "raw_value, expected",
+    [("1000000", 1_000_000), (" 200000 ", 200_000), ("", None), ("1M", None), ("0", None)],
+)
+def test_context_window_env_var_parsing(
+    raw_value: str,
+    expected: int | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only a positive integer reaches the executor; anything else resolves from the model."""
+    monkeypatch.setenv("HARNESS_CLAUDE_SDK_CONTEXT_WINDOW", raw_value)
+    captured: dict[str, Any] = {}
+
+    def _fake_init(self: Any, **kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    with patch(
+        "omnigent.inner.claude_sdk_harness.ClaudeSDKExecutor.__init__",
+        _fake_init,
+    ):
+        claude_sdk_harness._build_claude_sdk_executor()
+
+    assert captured["context_window"] == expected
+
+
+@pytest.mark.parametrize(
+    "raw_value, expected",
     [
         ('"all"', "all"),
         ('"none"', "none"),
@@ -495,3 +549,20 @@ def test_bundle_dir_unset_passes_none(
 
     assert captured["bundle_dir"] is None
     assert captured["agent_name"] is None
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [(None, None), ("[]", []), ('["claude","codex"]', ["claude", "codex"]), ("bad", None)],
+)
+def test_mcp_executor_factory_activation(monkeypatch, raw, expected):
+    from omnigent.runner.identity import RUNNER_MCP_DISABLED_SERVERS_ACTIVE_HARNESSES_ENV_VAR
+
+    monkeypatch.setenv("HARNESS_CLAUDE_SDK_GATEWAY", "false")
+    if raw is None:
+        monkeypatch.delenv(RUNNER_MCP_DISABLED_SERVERS_ACTIVE_HARNESSES_ENV_VAR, raising=False)
+    else:
+        monkeypatch.setenv(RUNNER_MCP_DISABLED_SERVERS_ACTIVE_HARNESSES_ENV_VAR, raw)
+    with patch.object(claude_sdk_harness, "ClaudeSDKExecutor") as executor:
+        claude_sdk_harness._build_claude_sdk_executor()
+    assert executor.call_args.kwargs["active_harnesses"] == expected

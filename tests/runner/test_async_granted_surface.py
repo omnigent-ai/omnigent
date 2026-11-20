@@ -9,6 +9,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from omnigent.inner.datamodel import OSEnvSpec
 from omnigent.runner import tool_dispatch
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 
@@ -163,26 +164,49 @@ async def test_execute_tool_refuses_ungranted_tool_directly(
     assert executed == []
 
 
-async def test_native_harness_spec_keeps_relayed_sys_os_tools(
+@pytest.mark.parametrize("harness", ["claude-native", "cursor-native", "kiro-native"])
+@pytest.mark.parametrize("os_env", [None, OSEnvSpec()], ids=["no-os-env", "os-env"])
+async def test_native_harness_refuses_sys_os_tools_on_every_path(
     monkeypatch: pytest.MonkeyPatch,
+    os_env: OSEnvSpec | None,
+    harness: str,
 ) -> None:
-    """Native harnesses get ``sys_os_*`` from the relay regardless of ``os_env``."""
+    """A native harness gets no ``sys_os_*`` grant.
 
-    async def _fake_os_env(tool_name: str, *_a: Any, **_kw: Any) -> str:
-        return f"ran {tool_name}"
+    Its relay never offers them, so neither ``execute_tool`` nor a
+    ``sys_call_async`` naming ``sys_os_shell`` may run them, even when the spec
+    declares ``os_env``.
+    """
+    executed: list[str] = []
 
-    monkeypatch.setattr(tool_dispatch, "_execute_os_env_tool", _fake_os_env)
+    async def _record_os_env(tool_name: str, *_a: Any, **_kw: Any) -> str:
+        executed.append(tool_name)
+        return "should not run"
+
+    monkeypatch.setattr(tool_dispatch, "_execute_os_env_tool", _record_os_env)
     spec = AgentSpec(
         spec_version=1,
-        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+        async_enabled=True,
+        os_env=os_env,
+        executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
     )
 
-    out = await tool_dispatch.execute_tool(
-        tool_name="sys_os_read",
-        arguments=json.dumps({"path": "x"}),
-        agent_spec=spec,
+    direct = json.loads(
+        await tool_dispatch.execute_tool(
+            tool_name="sys_os_shell",
+            arguments=json.dumps({"command": "id"}),
+            agent_spec=spec,
+        )
     )
-    assert out == "ran sys_os_read"
+    assert "not enabled" in direct["error"]
+
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] = {}
+    spawned = await _call_sys_call_async(spec, "sys_os_shell", inbox=inbox, tasks=tasks)
+    assert spawned.startswith("Error: sys_call_async refused:")
+    assert tasks == {}
+    await asyncio.sleep(0)
+    assert executed == []
 
 
 async def test_granted_tool_names_cached_per_spec_instance() -> None:
@@ -195,50 +219,52 @@ async def test_granted_tool_names_cached_per_spec_instance() -> None:
     # A different effective harness is a different surface, so a different entry.
     native = tool_dispatch._granted_tool_names(spec, "claude-native")
     assert native is not first
-    assert "sys_os_shell" in native
+    assert "sys_os_shell" not in native
 
 
-async def test_native_override_on_non_native_spec_keeps_relayed_sys_os_tools(
+async def test_native_override_on_os_env_spec_refuses_sys_os_tools(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A session pinned to a native harness gets the relay's ``sys_os_*``.
+    """A session pinned to a native harness gets no ``sys_os_*``.
 
-    The spec declares ``claude-sdk`` and no ``os_env``, but the session runs
-    ``claude-native``, whose relay advertises ``sys_os_*`` unconditionally.
-    Gating on the spec's declaration instead of the session's harness would
-    refuse tools the model was actually shown.
+    The spec declares ``claude-sdk`` with ``os_env``, which would grant them to
+    an SDK session, but the session runs ``cursor-native``, whose relay offers
+    none. Gating on the spec's declaration instead of the session's harness
+    would grant a shell the model was never shown.
     """
+    executed: list[str] = []
 
-    async def _fake_os_env(tool_name: str, *_a: Any, **_kw: Any) -> str:
-        return f"ran {tool_name}"
+    async def _record_os_env(tool_name: str, *_a: Any, **_kw: Any) -> str:
+        executed.append(tool_name)
+        return "should not run"
 
-    monkeypatch.setattr(tool_dispatch, "_execute_os_env_tool", _fake_os_env)
+    monkeypatch.setattr(tool_dispatch, "_execute_os_env_tool", _record_os_env)
     spec = AgentSpec(
         spec_version=1,
         async_enabled=True,
+        os_env=OSEnvSpec(),
         executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
     )
 
-    direct = await tool_dispatch.execute_tool(
-        tool_name="sys_os_read",
-        arguments=json.dumps({"path": "x"}),
-        agent_spec=spec,
-        effective_harness="claude-native",
+    direct = json.loads(
+        await tool_dispatch.execute_tool(
+            tool_name="sys_os_read",
+            arguments=json.dumps({"path": "x"}),
+            agent_spec=spec,
+            effective_harness="cursor-native",
+        )
     )
-    assert direct == "ran sys_os_read"
+    assert "not enabled" in direct["error"]
 
     inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] = {}
-    handle = json.loads(
-        await _call_sys_call_async(
-            spec, "sys_os_read", inbox=inbox, tasks=tasks, harness="claude-native"
-        )
+    spawned = await _call_sys_call_async(
+        spec, "sys_os_read", inbox=inbox, tasks=tasks, harness="cursor-native"
     )
-    assert handle["status"] == "in_progress"
-    await tasks[handle["handle_id"]][0]
-    item = inbox.get_nowait()
-    assert item["status"] == "completed"
-    assert item["output"] == "ran sys_os_read"
+    assert spawned.startswith("Error: sys_call_async refused:")
+    assert tasks == {}
+    await asyncio.sleep(0)
+    assert executed == []
 
 
 async def test_sdk_override_on_native_spec_refuses_sys_os_tools(
@@ -312,7 +338,7 @@ async def test_surface_probe_does_not_fork_the_working_tree(
     request_schemas = tool_dispatch.ToolManager(spec, os_env_schema_only=True).get_tool_schemas()
 
     assert granted >= tool_dispatch._OS_ENV_TOOLS
-    assert {schema["name"] for schema in schemas} >= tool_dispatch._OS_ENV_TOOLS
+    assert {schema["name"] for schema in schemas}.isdisjoint(tool_dispatch._OS_ENV_TOOLS)
     assert {
         schema["function"]["name"] for schema in request_schemas
     } >= tool_dispatch._OS_ENV_TOOLS

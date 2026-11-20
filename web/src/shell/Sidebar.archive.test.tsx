@@ -3,22 +3,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
-// Tests for the archive flow in the sidebar. Contract: archiving sends ONLY
-// the archive PATCH (`archived: true`) — no client stop. The row leaves the
-// sidebar optimistically (useArchiveConversation flips the cached `archived`
-// flag in onMutate; the list filters archived rows out client-side), so there
-// is no "Archiving…" status row — the row simply unmounts, like delete's. The
-// only synchronous side effect is the Undo pill (which also links to Settings).
-// The runner stop is the server's job once the flag commits — a client stop
-// would race the server's against the same runner, and put the runner's stop
-// timeouts in front of the flag flip. The kebab's user-facing "Stop session"
-// action is a separate affordance covered by Sidebar.stop.test.tsx.
-// The optimistic cache overlay + error reconcile is covered in
-// sessionListCache.test.ts / useConversations.test.ts.
-//
-// Archived sessions are no longer listed in the sidebar (they moved to the
-// Settings page), so unarchiving is covered by SettingsPage.test.tsx; this
-// file exercises the archive path from a row's kebab.
+// Archiving from a row sends only the PATCH (the server stops the runner) and
+// the row leaves optimistically, except the open session's (Sidebar.openSession.test.tsx).
+// Settings unarchive: SettingsPage.test.tsx; cache overlays: useConversations.test.ts.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
@@ -31,6 +18,7 @@ import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 // vi.mock factory can reference them.
 const mocks = vi.hoisted(() => ({
   archive: { mutate: vi.fn() },
+  bulkArchive: { mutate: vi.fn() },
   stop: { mutate: vi.fn() },
 }));
 
@@ -39,6 +27,7 @@ vi.mock("@/hooks/useConversations", async () => {
   return {
     ...conversationHooksMock(),
     useArchiveConversation: () => mocks.archive,
+    useBulkArchiveConversations: () => mocks.bulkArchive,
     useStopSession: () => mocks.stop,
   };
 });
@@ -97,6 +86,7 @@ function clickArchive() {
 
 beforeEach(() => {
   mocks.archive.mutate.mockReset();
+  mocks.bulkArchive.mutate.mockReset();
   mocks.stop.mutate.mockReset();
 });
 
@@ -160,6 +150,8 @@ describe("archive flow", () => {
     fireEvent.click(screen.getByTestId("quick-archive-conversation"));
 
     // Same single-PATCH contract as the kebab item, just a different affordance.
+    // An idle session skips the running-session confirmation.
+    expect(screen.queryByTestId("archive-running-dialog")).not.toBeInTheDocument();
     expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
     expect(mocks.archive.mutate).toHaveBeenCalledWith({
       id: "conv_1",
@@ -272,5 +264,107 @@ describe("archive worktree prompt", () => {
       archived: true,
       deleteWorktree: true,
     });
+  });
+});
+
+describe("archive running-session prompt", () => {
+  const RUNNING_CONV: Conversation = { ...CONV, status: "running" };
+
+  it("asks before archiving a running session from the quick button, and Cancel keeps it", async () => {
+    mockConversations([RUNNING_CONV]);
+    renderSidebar();
+    fireEvent.click(screen.getByTestId("quick-archive-conversation"));
+
+    const dialog = await screen.findByTestId("archive-running-dialog");
+    expect(dialog).toHaveTextContent("Archive running session?");
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId("archive-running-cancel"));
+
+    expect(screen.queryByTestId("archive-running-dialog")).not.toBeInTheDocument();
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    expect(screen.getByRole("link", { name: /My Session/ })).toBeInTheDocument();
+  });
+
+  it("archives a running session from the row menu once confirmed", async () => {
+    mockConversations([RUNNING_CONV]);
+    renderSidebar();
+    clickArchive();
+
+    await screen.findByTestId("archive-running-dialog");
+    fireEvent.click(screen.getByTestId("archive-running-confirm"));
+
+    expect(mocks.archive.mutate).toHaveBeenCalledWith({
+      id: "conv_1",
+      archived: true,
+      deleteWorktree: false,
+    });
+    expect(await screen.findByText("Archived 1 session")).toBeInTheDocument();
+  });
+
+  it("cancels the archive when the running prompt is dismissed", async () => {
+    mockConversations([RUNNING_CONV]);
+    renderSidebar();
+    clickArchive();
+
+    const dialog = await screen.findByTestId("archive-running-dialog");
+    fireEvent.keyDown(dialog, { key: "Escape" });
+
+    expect(screen.queryByTestId("archive-running-dialog")).not.toBeInTheDocument();
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+  });
+
+  it("continues to the worktree prompt after confirming a running worktree session", async () => {
+    mockConversations([{ ...RUNNING_CONV, git_branch: "feature/x" }]);
+    renderSidebar();
+    clickArchive();
+
+    fireEvent.click(await screen.findByTestId("archive-running-confirm"));
+    await screen.findByTestId("archive-worktree-dialog");
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId("archive-worktree-delete"));
+
+    expect(mocks.archive.mutate).toHaveBeenCalledWith({
+      id: "conv_1",
+      archived: true,
+      deleteWorktree: true,
+    });
+  });
+
+  it("asks once for a bulk archive that includes a running session", async () => {
+    mockConversations([
+      { ...CONV, id: "conv_idle", title: "Idle Session" },
+      { ...RUNNING_CONV, id: "conv_busy", title: "Busy Session" },
+    ]);
+    renderSidebar();
+    fireEvent.click(screen.getByRole("button", { name: "Select sessions" }));
+    fireEvent.click(screen.getByRole("link", { name: /Idle Session/ }));
+    fireEvent.click(screen.getByRole("link", { name: /Busy Session/ }));
+    fireEvent.click(screen.getByTestId("bulk-archive"));
+
+    const dialog = await screen.findByTestId("archive-running-dialog");
+    expect(dialog).toHaveTextContent("Archive a running session?");
+    expect(dialog).toHaveTextContent("1 of the 2 sessions you're archiving has an agent");
+    expect(mocks.bulkArchive.mutate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId("archive-running-confirm"));
+
+    expect(mocks.bulkArchive.mutate).toHaveBeenCalledTimes(1);
+    const [{ ids, archived }] = mocks.bulkArchive.mutate.mock.calls[0];
+    expect(archived).toBe(true);
+    expect([...ids].sort()).toEqual(["conv_busy", "conv_idle"]);
+  });
+});
+
+describe("session row quick actions setting", () => {
+  it("keeps Pin and Archive in the row menu only when the quick buttons are turned off", () => {
+    localStorage.setItem("omnigent:session-row-quick-actions", "false");
+    mockConversations([CONV]);
+    renderSidebar();
+
+    expect(screen.queryByTestId("quick-pin-conversation")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("quick-archive-conversation")).not.toBeInTheDocument();
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    expect(screen.getByTestId("archive-conversation")).toBeInTheDocument();
+    // Desktop hides the menu's Pin only while the hover button stands in for it.
+    expect(screen.getByTestId("pin-conversation")).not.toHaveClass("md:hidden");
   });
 });

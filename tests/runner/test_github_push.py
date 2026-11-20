@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
 
-from omnigent.runner import github_resource
+from omnigent.runner import github_resource, pr_observer
 from omnigent.runner.git_providers import github_push
 from omnigent.runner.git_providers.github_push import push_operation, pushed_prs
-from omnigent.runner.pr_observer import _shell_segments
+from omnigent.runner.pr_observer import _shell_segments, observe_tool_completion
+from omnigent.runner.session_prs import SessionPrRegistry
 
 PR_URL = "https://github.com/upstream/project/pull/42"
 PUSH_OUTPUT = (
@@ -258,3 +261,27 @@ def test_multiple_repositories_share_one_lookup_deadline(
         urls[:1] if deadline_expires else urls
     )
     assert gh.call_count == (1 if deadline_expires else 2)
+
+
+def test_serialized_shell_envelope_reaches_the_push_lookup_decoded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``sys_os_shell`` serializes its envelope; git's status lines arrive in its stderr."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    row = {
+        "state": "open",
+        "head": {"ref": "feature/topic", "repo": {"full_name": "contributor/project"}},
+        "html_url": PR_URL,
+    }
+    monkeypatch.setattr(github_resource, "_gh", Mock(return_value=(0, json.dumps([row]), "")))
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        monkeypatch.setattr(pr_observer, "_lookup_pool", pool)
+        observe_tool_completion(
+            "conv_push",
+            tool_name="sys_os_shell",
+            arguments={"command": "git push origin local:feature/topic"},
+            result=json.dumps({"stdout": "", "stderr": PUSH_OUTPUT, "exit_code": 0}),
+            call_id="push",
+        )
+    entries = SessionPrRegistry("conv_push").list()
+    assert [(entry.url, entry.relationship) for entry in entries] == [(PR_URL, "worked_on")]

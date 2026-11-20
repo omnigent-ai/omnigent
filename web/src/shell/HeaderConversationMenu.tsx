@@ -1,15 +1,9 @@
-import {
-  useEffect,
-  useRef,
-  useState,
-  type FormEvent,
-  type KeyboardEvent,
-  type ReactNode,
-} from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   ArchiveIcon,
   ArchiveRestoreIcon,
   ChevronLeftIcon,
+  ClockPlusIcon,
   DownloadIcon,
   EllipsisIcon,
   FolderInputIcon,
@@ -20,13 +14,20 @@ import {
   PencilIcon,
   PinIcon,
   PinOffIcon,
+  PlusIcon,
   ShareIcon,
   Trash2Icon,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+import {
+  ARIA_MOD_KEY,
+  ARCHIVE_SESSION_KEYS,
+  FORK_SESSION_KEYS,
+  CompactShortcutKeys,
+  PIN_SESSION_KEYS,
+} from "@/components/KeyboardShortcut";
 import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
-import { PresenceAvatars } from "@/components/PresenceAvatars";
 import {
   Dialog,
   DialogContent,
@@ -39,7 +40,6 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuSub,
   DropdownMenuSubContent,
@@ -47,33 +47,50 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { useIsMutating, useQueryClient } from "@tanstack/react-query";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isIndentedSibling, isSessionPinned } from "@/lib/sessionFamilies";
 import { PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
+import { canFlagUnread } from "@/lib/sessionMute";
 import { exportSessionTranscript } from "@/lib/sessionsApi";
 import { triggerBrowserDownload } from "@/hooks/useFileContent";
 import {
-  PINNED_LABEL_KEY,
   type Conversation,
   useArchiveConversation,
   useMoveToProject,
-  useRenameConversation,
   useStopAndDeleteConversation,
   useTogglePinnedConversation,
+  useAutomationsEnabled,
 } from "@/hooks/useConversations";
+import { CreateAutomationFromSessionDialog } from "@/components/scheduled/CreateAutomationFromSessionDialog";
+import { AutomationSourceDeleteNotice } from "@/components/scheduled/AutomationSourceDeleteNotice";
+import {
+  canCreateAutomationFromSession,
+  automationDeletedWith,
+  useDeleteSourceAutomations,
+} from "@/lib/automationFromSession";
 import { ProjectPicker } from "./ProjectPicker";
 import { markConversationUnread } from "@/hooks/useUnseenConversations";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useDesktopCommand } from "@/lib/desktopCommands";
+import { supportsDesktopCommands } from "@/lib/nativeBridge";
+import { useIsEmbedded } from "@/lib/embedded";
+import { getEmbedRoot } from "@/lib/host";
+import { hasCommandModifier, isFocusInDialogOrMenu } from "@/lib/hotkeys";
 import { useNavigate } from "@/lib/routing";
-import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { showArchiveUndoToast } from "./archiveUndoToast";
 import { unpinWithUndo } from "./unpinUndoToast";
-import { useArchiveWorktreePrompt } from "./ArchiveWorktreeDialog";
+import { useArchivePrompt } from "./ArchivePrompt";
 import { cn } from "@/lib/utils";
 import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { conversationDisplayLabel } from "./sidebarNav";
+import { MobileHeaderButton } from "./MobileHeaderButton";
+import { RenameSessionDialog } from "./RenameSessionDialog";
+import { SessionMenuHeader } from "./SessionMenuHeader";
 
 interface HeaderConversationMenuProps {
   conversation: Conversation;
+  workingDirectory?: string | null;
   currentProject: string | null;
   canShare: boolean;
   canFork: boolean;
@@ -96,6 +113,7 @@ interface HeaderConversationMenuProps {
 
 export function HeaderConversationMenu({
   conversation,
+  workingDirectory = conversation.workspace,
   currentProject,
   canShare,
   canFork,
@@ -110,29 +128,43 @@ export function HeaderConversationMenu({
   workspaceItems = null,
 }: HeaderConversationMenuProps) {
   const navigate = useNavigate();
+  const info = useServerInfo();
   const queryClient = useQueryClient();
   const isMobile = useIsMobileViewport();
+  const isEmbedded = useIsEmbedded();
   const { trackClick } = useOmnigentAnalytics();
   const togglePinned = useTogglePinnedConversation();
   // Pin writes don't overlap, so Pin/Unpin is disabled while one is saving.
   const pinSaving = useIsMutating({ mutationKey: PIN_WRITE_MUTATION_KEY }) > 0;
-  const rename = useRenameConversation();
   const moveToProject = useMoveToProject();
   const archive = useArchiveConversation();
-  const archiveWorktreePrompt = useArchiveWorktreePrompt();
+  const archivePrompt = useArchivePrompt();
   const deleteConversation = useStopAndDeleteConversation();
   const [menuOpen, setMenuOpen] = useState(false);
   const [projectPickerOpen, setProjectPickerOpen] = useState(false);
   const [renameOpen, setRenameOpen] = useState(false);
-  const [renameTitle, setRenameTitle] = useState(conversation.title ?? "");
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleteBranch, setDeleteBranch] = useState(false);
+  const [automationOpen, setAutomationOpen] = useState(false);
+  const automationsEnabled = useAutomationsEnabled();
+  // This menu is only offered to the session's owner (see ChatHeader).
+  const canCreateAutomation = canCreateAutomationFromSession({
+    info,
+    automationsEnabled,
+    conversation,
+    isOwner: true,
+  });
+  const automationSourceOf = automationDeletedWith(info, conversation);
+  const deleteSourceAutomations = useDeleteSourceAutomations();
   const previousConversationId = useRef(conversation.id);
-  const isPinned = conversation.labels?.[PINNED_LABEL_KEY] != null;
+  const isPinned = isSessionPinned(conversation);
+  const canPin = !isIndentedSibling(conversation);
   const isArchived = conversation.archived === true;
+  const canAddAgent = !isArchived && info !== "loading" && info.sibling_sessions;
+  const addAgentPath = `/?sibling=${encodeURIComponent(conversation.id)}`;
   const label = conversationDisplayLabel(conversation);
   // Mobile taps need a bigger target than the dense desktop row.
-  const itemClass = isMobile ? "gap-2.5 px-2.5 py-2" : undefined;
+  const itemClass = cn("mobile-touch-target", isMobile && "gap-2.5 px-2.5 py-2");
   // Share and Agent info reach this menu on mobile from the header's legacy
   // Share · Agent info menu, which reported them under these ids. Keep
   // emitting the same ones so the metric series stays continuous, and only on
@@ -143,19 +175,42 @@ export function HeaderConversationMenu({
   const gitBranch = conversation.git_branch ?? null;
 
   useEffect(() => {
-    if (!renameOpen) setRenameTitle(conversation.title ?? "");
-  }, [conversation.title, renameOpen]);
-
-  useEffect(() => {
     if (previousConversationId.current === conversation.id) return;
     previousConversationId.current = conversation.id;
     setMenuOpen(false);
     setProjectPickerOpen(false);
     setRenameOpen(false);
-    setRenameTitle(conversation.title ?? "");
     setDeleteOpen(false);
     setDeleteBranch(false);
-  }, [conversation.id, conversation.title]);
+    setAutomationOpen(false);
+  }, [conversation.id]);
+
+  useEffect(() => {
+    if (!canAddAgent) return;
+    const handleAddAgent = (event: globalThis.KeyboardEvent) => {
+      if (
+        event.defaultPrevented ||
+        event.repeat ||
+        event.isComposing ||
+        !hasCommandModifier(event) ||
+        !event.altKey ||
+        event.shiftKey ||
+        event.getModifierState("AltGraph") ||
+        event.code !== "KeyA"
+      ) {
+        return;
+      }
+      const embedRoot = getEmbedRoot();
+      if (isEmbedded && (!embedRoot || !event.composedPath().includes(embedRoot))) return;
+      if (isFocusInDialogOrMenu() || document.activeElement?.closest(".xterm, .monaco-editor"))
+        return;
+      event.preventDefault();
+      event.stopPropagation();
+      navigate(addAgentPath);
+    };
+    window.addEventListener("keydown", handleAddAgent);
+    return () => window.removeEventListener("keydown", handleAddAgent);
+  }, [addAgentPath, canAddAgent, isEmbedded, navigate]);
 
   const closeMenu = () => {
     setMenuOpen(false);
@@ -167,19 +222,16 @@ export function HeaderConversationMenu({
     moveToProject.mutate({ id: conversation.id, project });
   };
 
-  const submitRename = (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    const title = renameTitle.trim();
-    if (title && title !== (conversation.title ?? "")) {
-      rename.mutate({ id: conversation.id, title });
-    }
-    setRenameOpen(false);
-  };
-
-  const confirmDelete = () => {
+  const confirmDelete = async () => {
     setDeleteOpen(false);
     setDeleteBranch(false);
-    navigate("/", { replace: true });
+    // "Delete both": the automation first, so no run starts from a missing session.
+    if (automationSourceOf === null) {
+      navigate("/", { replace: true });
+    } else if (!(await deleteSourceAutomations([automationSourceOf], [conversation.id]))) {
+      toast.error("Couldn't delete the automation, so the session was kept");
+      return;
+    }
     deleteConversation.mutate({
       id: conversation.id,
       deleteBranch: gitBranch !== null && deleteBranch,
@@ -206,7 +258,7 @@ export function HeaderConversationMenu({
       archive.mutate({ id: conversation.id, archived: false });
       return;
     }
-    archiveWorktreePrompt.requestArchive([conversation], (deleteWorktreeIds) =>
+    archivePrompt.requestArchive([conversation], (deleteWorktreeIds) =>
       archiveNow(deleteWorktreeIds.has(conversation.id)),
     );
   };
@@ -226,24 +278,51 @@ export function HeaderConversationMenu({
     showArchiveUndoToast(queryClient, [conversation], navigate);
   };
 
+  const togglePin = () =>
+    isPinned
+      ? unpinWithUndo(queryClient, togglePinned.mutateAsync, conversation.id, conversation)
+      : togglePinned.mutate({ id: conversation.id, pinned: true });
+  // Desktop Session → Pin (⌥⌘P), Archive (⇧⌘A) and Fork (⌥⌘F) act on the session shown here.
+  // Like the menu item, Pin waits out a pending pin write (from any row).
+  useDesktopCommand("toggle-pin-session", pinSaving || !canPin ? null : togglePin, {
+    active: isPinned,
+  });
+  useDesktopCommand("archive-session", archiveConversation, { active: isArchived });
+  useDesktopCommand("fork-session", canFork && !forkDisabledReason ? onFork : null);
+  const desktopShortcuts = supportsDesktopCommands();
+
   const mainItems = (
     <>
-      {/* Chat/Terminal switch leads the menu on terminal-first sessions; it
-          renders its own trailing separator (null on other sessions). */}
+      {canAddAgent && (
+        <>
+          <DropdownMenuItem
+            data-testid="add-sibling-session"
+            className={itemClass}
+            aria-keyshortcuts={`${ARIA_MOD_KEY}+Alt+A`}
+            onSelect={() => navigate(addAgentPath)}
+          >
+            <PlusIcon className="size-3.5" />
+            Add nested agent
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+        </>
+      )}
+      {/* Chat/Terminal renders its own trailing separator (null on other sessions). */}
       {viewItems}
-      <DropdownMenuItem
-        data-testid="header-pin-conversation"
-        className={itemClass}
-        disabled={pinSaving}
-        onSelect={() =>
-          isPinned
-            ? unpinWithUndo(queryClient, togglePinned.mutateAsync, conversation.id, conversation)
-            : togglePinned.mutate({ id: conversation.id, pinned: true })
-        }
-      >
-        {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
-        {isPinned ? "Unpin" : "Pin"}
-      </DropdownMenuItem>
+      {canPin && (
+        <DropdownMenuItem
+          data-testid="header-pin-conversation"
+          className={itemClass}
+          disabled={pinSaving}
+          onSelect={togglePin}
+        >
+          {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
+          {isPinned ? "Unpin" : "Pin"}
+          {desktopShortcuts && (
+            <CompactShortcutKeys keys={PIN_SESSION_KEYS} className="ml-auto pl-4" />
+          )}
+        </DropdownMenuItem>
+      )}
       {canShare && (
         <DropdownMenuItem
           data-testid="header-share-conversation"
@@ -272,6 +351,9 @@ export function HeaderConversationMenu({
         >
           <GitForkIcon className="size-3.5" />
           Fork
+          {desktopShortcuts && (
+            <CompactShortcutKeys keys={FORK_SESSION_KEYS} className="ml-auto pl-4" />
+          )}
         </SessionActionMenuItem>
       )}
       <DropdownMenuItem
@@ -306,47 +388,61 @@ export function HeaderConversationMenu({
         <PencilIcon className="size-3.5" />
         Rename
       </DropdownMenuItem>
-      <DropdownMenuItem
-        data-testid="header-mark-unread-conversation"
-        className={itemClass}
-        onSelect={() => markConversationUnread(conversation.id, conversation.updated_at)}
-      >
-        <MailIcon className="size-3.5" />
-        Mark as unread
-      </DropdownMenuItem>
+      {/* A muted session can't be flagged unread, matching its row menu. */}
+      {canFlagUnread(conversation) && (
+        <DropdownMenuItem
+          data-testid="header-mark-unread-conversation"
+          className={itemClass}
+          onSelect={() => markConversationUnread(conversation.id, conversation.updated_at)}
+        >
+          <MailIcon className="size-3.5" />
+          Mark as unread
+        </DropdownMenuItem>
+      )}
+      {canCreateAutomation && (
+        <DropdownMenuItem
+          data-testid="header-create-automation"
+          className={itemClass}
+          onSelect={() => setAutomationOpen(true)}
+        >
+          <ClockPlusIcon className="size-3.5" />
+          Create automation
+        </DropdownMenuItem>
+      )}
       {/* Move to project is also reachable on desktop via the breadcrumb's
           folder tag (HeaderProjectTag); on mobile the native shells hide the
           breadcrumb, so this menu is the sole entry point. */}
-      {isMobile ? (
-        // Mobile has no room for a side flyout, so this item swaps the menu body
-        // to the project picker in place (see the `projectPickerOpen` branch).
-        <DropdownMenuItem
-          data-testid="header-move-to-project"
-          className={cn("whitespace-nowrap", itemClass)}
-          onSelect={(event) => {
-            event.preventDefault();
-            setProjectPickerOpen(true);
-          }}
-        >
-          <FolderInputIcon className="size-3.5" />
-          {currentProject ? "Move session" : "Add to project"}
-        </DropdownMenuItem>
-      ) : (
-        <DropdownMenuSub>
-          <DropdownMenuSubTrigger
+      {!isIndentedSibling(conversation) &&
+        (isMobile ? (
+          // Mobile has no room for a side flyout, so this item swaps the menu body
+          // to the project picker in place (see the `projectPickerOpen` branch).
+          <DropdownMenuItem
             data-testid="header-move-to-project"
-            className="whitespace-nowrap"
+            className={cn("whitespace-nowrap", itemClass)}
+            onSelect={(event) => {
+              event.preventDefault();
+              setProjectPickerOpen(true);
+            }}
           >
             <FolderInputIcon className="size-3.5" />
             {currentProject ? "Move session" : "Add to project"}
-          </DropdownMenuSubTrigger>
-          {/* A native submenu flyout — no separate popover layer, so no
+          </DropdownMenuItem>
+        ) : (
+          <DropdownMenuSub>
+            <DropdownMenuSubTrigger
+              data-testid="header-move-to-project"
+              className="whitespace-nowrap"
+            >
+              <FolderInputIcon className="size-3.5" />
+              {currentProject ? "Move session" : "Add to project"}
+            </DropdownMenuSubTrigger>
+            {/* A native submenu flyout — no separate popover layer, so no
               open/dismiss race with the parent menu. */}
-          <DropdownMenuSubContent className="min-w-56">
-            <ProjectPicker currentProject={currentProject} onSelect={handleProjectSelect} />
-          </DropdownMenuSubContent>
-        </DropdownMenuSub>
-      )}
+            <DropdownMenuSubContent className="min-w-56">
+              <ProjectPicker currentProject={currentProject} onSelect={handleProjectSelect} />
+            </DropdownMenuSubContent>
+          </DropdownMenuSub>
+        ))}
       {workspaceItems && (
         <>
           <DropdownMenuSeparator />
@@ -365,6 +461,9 @@ export function HeaderConversationMenu({
           <ArchiveIcon className="size-3.5" />
         )}
         {isArchived ? "Unarchive" : "Archive"}
+        {desktopShortcuts && (
+          <CompactShortcutKeys keys={ARCHIVE_SESSION_KEYS} className="ml-auto pl-4" />
+        )}
       </DropdownMenuItem>
       <DropdownMenuItem
         data-testid="header-delete-conversation"
@@ -395,33 +494,28 @@ export function HeaderConversationMenu({
         }}
       >
         <DropdownMenuTrigger asChild>
-          <Button
+          <MobileHeaderButton
             type="button"
             variant="ghost"
             size={isMobile ? "icon" : "icon-xs"}
             aria-label="Conversation actions"
             data-testid="header-conversation-actions"
-            className="shrink-0 border-none text-muted-foreground hover:text-foreground max-md:size-11"
+            className="mobile-touch-target shrink-0 border-none text-muted-foreground hover:text-foreground max-md:size-11"
           >
             <EllipsisIcon className={isMobile ? "size-5" : "size-3.5"} />
-          </Button>
+          </MobileHeaderButton>
         </DropdownMenuTrigger>
         <DropdownMenuContent
           align={isMobile ? "end" : "start"}
+          collisionPadding={isMobile ? 16 : undefined}
           className={cn(
             "min-w-56",
             MOBILE_GLASS_SURFACE,
-            isMobile && "max-w-[min(20rem,calc(100vw-1rem))]",
+            isMobile && "w-[calc(100vw-2rem)] max-w-[calc(100vw-2rem)]",
           )}
         >
           {isMobile && !projectPickerOpen && (
-            <>
-              <DropdownMenuLabel className="flex items-center gap-2 px-2.5 pb-1.5 text-foreground">
-                <span className="min-w-0 flex-1 truncate">{label}</span>
-                <PresenceAvatars />
-              </DropdownMenuLabel>
-              <DropdownMenuSeparator />
-            </>
+            <SessionMenuHeader title={label} workingDirectory={workingDirectory} />
           )}
           {projectPickerOpen ? (
             <>
@@ -445,37 +539,20 @@ export function HeaderConversationMenu({
         </DropdownMenuContent>
       </DropdownMenu>
 
-      {archiveWorktreePrompt.dialog}
-      <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
-        <DialogContent>
-          <form onSubmit={submitRename}>
-            <DialogHeader>
-              <DialogTitle>Rename session</DialogTitle>
-              <DialogDescription>Choose a short name that is easy to find later.</DialogDescription>
-            </DialogHeader>
-            <input
-              autoFocus
-              aria-label="Session name"
-              data-testid="header-rename-conversation-input"
-              maxLength={USER_SESSION_TITLE_MAX_CHARS}
-              value={renameTitle}
-              onChange={(event) => setRenameTitle(event.target.value)}
-              onKeyDown={(event: KeyboardEvent<HTMLInputElement>) => {
-                if (event.key === "Escape") setRenameOpen(false);
-              }}
-              className="mt-4 h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/50"
-            />
-            <DialogFooter className="mt-4 border-t-0 bg-transparent">
-              <Button type="button" variant="ghost" onClick={() => setRenameOpen(false)}>
-                Cancel
-              </Button>
-              <Button type="submit" disabled={!renameTitle.trim() || rename.isPending}>
-                Rename
-              </Button>
-            </DialogFooter>
-          </form>
-        </DialogContent>
-      </Dialog>
+      {archivePrompt.dialog}
+      {automationOpen && (
+        <CreateAutomationFromSessionDialog
+          conversation={conversation}
+          open
+          onOpenChange={setAutomationOpen}
+        />
+      )}
+      <RenameSessionDialog
+        conversation={conversation}
+        open={renameOpen}
+        onOpenChange={setRenameOpen}
+        inputTestId="header-rename-conversation-input"
+      />
 
       <Dialog
         open={deleteOpen}
@@ -486,12 +563,23 @@ export function HeaderConversationMenu({
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Delete conversation?</DialogTitle>
+            <DialogTitle>
+              {automationSourceOf !== null ? "Delete session and automation?" : "Delete session?"}
+            </DialogTitle>
             <DialogDescription>
               <span className="font-medium break-all">{label}</span> and all of its history will be
               removed. This cannot be undone.
             </DialogDescription>
           </DialogHeader>
+          {automationSourceOf !== null && (
+            <AutomationSourceDeleteNotice
+              taskId={automationSourceOf}
+              onNavigate={() => {
+                setDeleteOpen(false);
+                setDeleteBranch(false);
+              }}
+            />
+          )}
           {gitBranch !== null && (
             <div className="flex flex-col gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-3">
               <p className="text-sm text-muted-foreground">
@@ -528,10 +616,10 @@ export function HeaderConversationMenu({
             <Button
               type="button"
               variant="destructive"
-              onClick={confirmDelete}
+              onClick={() => void confirmDelete()}
               disabled={deleteConversation.isPending}
             >
-              Delete
+              {automationSourceOf !== null ? "Delete both" : "Delete"}
             </Button>
           </DialogFooter>
         </DialogContent>

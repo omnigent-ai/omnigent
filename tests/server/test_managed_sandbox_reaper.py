@@ -420,6 +420,7 @@ async def test_deleted_host_cleanup_retries_without_offline_age() -> None:
     hosts = _FakeHostStore(
         {
             7: [
+                _host("host_offline", provider="modal", sandbox_id="sb-offline", updated_at=0),
                 _host(
                     "host_deleted",
                     provider="modal",
@@ -427,13 +428,14 @@ async def test_deleted_host_cleanup_retries_without_offline_age() -> None:
                     updated_at=now,
                     status="online",
                     deleted_at=now,
-                )
+                ),
             ]
         }
     )
     reaper = ManagedSandboxReaper(
         host_store=hosts,  # type: ignore[arg-type]
         sandbox_config=_deployment([modal]),
+        reap_offline=False,
     )
 
     assert await reaper.sweep_once(now=now) == 0
@@ -443,6 +445,8 @@ async def test_deleted_host_cleanup_retries_without_offline_age() -> None:
     assert await reaper.sweep_once(now=now) == 1
     assert modal.terminated == ["sb-deleted"]
     assert "host_deleted" not in hosts.hosts[7]
+
+    assert "host_offline" in hosts.hosts[7]
 
 
 async def test_provider_identity_failure_does_not_stop_other_sandboxes() -> None:
@@ -764,6 +768,59 @@ async def test_owner_identity_reaps_each_sandbox_as_its_own_owner() -> None:
 
     assert current["alice"].terminated == ["alice:sb-a"]
     assert current["bob"].terminated == ["bob:sb-b"]
+
+
+@pytest.mark.parametrize("instance_hook", [False, True], ids=["class-hook", "instance-hook"])
+async def test_reaper_binds_each_candidates_owner_for_bind_owner_launchers(
+    instance_hook: bool,
+) -> None:
+    now = 4_000_000
+    terminated: list[str] = []
+
+    class _BoundOwnerLauncher:
+        provider = "databricks"
+        active_owner: str | None = None
+
+        def record_owner(self, owner: str) -> None:
+            self.owner = owner
+
+        @contextlib.contextmanager
+        def reaper_identity(self, workspace_id: int) -> Iterator[None]:
+            self.active_owner = self.owner
+            try:
+                yield
+            finally:
+                self.active_owner = None
+
+        def terminate(self, sandbox_id: str) -> None:
+            terminated.append(f"{self.active_owner}:{sandbox_id}")
+
+    class _ClassHookLauncher(_BoundOwnerLauncher):
+        bind_owner = _BoundOwnerLauncher.record_owner
+
+    class _InstanceHookLauncher(_BoundOwnerLauncher):
+        def __init__(self) -> None:
+            self.bind_owner = self.record_owner
+
+    deployment = ManagedSandboxDeployment(
+        configs=(
+            ManagedSandboxConfig(
+                server_url="https://s.example.com",
+                launcher_factory=_InstanceHookLauncher if instance_hook else _ClassHookLauncher,  # type: ignore[arg-type]
+                token_ttl_s=3600,
+                provider="databricks",
+            ),
+        ),
+        reaper=ManagedSandboxReaperConfig(enabled=True, terminate_after_offline_days=1),
+    )
+    reaper = ManagedSandboxReaper(
+        host_store=_alice_and_bob_stale_hosts(now),  # type: ignore[arg-type]
+        sandbox_config=deployment,
+    )
+
+    assert await reaper.sweep_once(now=now) == 2
+
+    assert sorted(terminated) == ["alice:sb-a", "bob:sb-b"]
 
 
 async def test_disconnected_owner_stays_pending_while_other_owners_are_reaped(

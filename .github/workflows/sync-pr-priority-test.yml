@@ -1,0 +1,48 @@
+name: Sync PR Priority Test
+
+# Offline tests for the PR priority sync and the issue triage wiring that runs
+# it. Runs on PR head without secrets, only when those files change.
+
+on:
+  pull_request:
+    paths:
+      - .github/scripts/sync_pr_priority.py
+      - .github/scripts/sync_pr_priority_test.py
+      - .github/triage_v2/tests/test_bundle_configuration.py
+      - .github/workflows/issue-prioritization-v2.yml
+      - .github/workflows/issue-triage.yml
+      - .github/workflows/needs-info-response.yml
+      - .github/workflows/sync-pr-priority.yml
+      - .github/workflows/sync-pr-priority-test.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-pr-priority-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version-file: .python-version
+      - name: Install test dependencies
+        run: python3 -m pip install 'PyYAML==6.0.3' 'pytest==9.0.3'
+      - name: Run sync-pr-priority unit test
+        run: python3 .github/scripts/sync_pr_priority_test.py
+      - name: Check issue triage v2 runs the sync with PR write access
+        env:
+          PYTHONPATH: .github/triage_v2/src
+        run: >-
+          python3 -m pytest -c .github/triage_v2/pyproject.toml
+          .github/triage_v2/tests/test_bundle_configuration.py
+          -k test_v2_mirrors_priority_onto_linked_prs

@@ -347,7 +347,7 @@ def test_guided_custom_theme_applies_to_both_modes_and_persists(
     _pick_palette(page, "GitHub")
     page.get_by_test_id("custom-theme-accent-trigger").click()
     accent = page.get_by_test_id("custom-theme-accent-input")
-    expect(accent).to_have_value("#1F883D")
+    expect(accent).to_have_value("#0969DA")
     accent.fill("#2563eb")
 
     expect(_color_theme_select(page)).to_contain_text("Custom")
@@ -357,6 +357,7 @@ def test_guided_custom_theme_applies_to_both_modes_and_persists(
     assert stored is not None
     assert stored["basePalette"] == "github"
     assert stored["accent"] == "#2563eb"
+    assert stored["darkAccent"] == "#58a6ff"
 
     translucent_sidebar = page.get_by_test_id("custom-theme-translucent-sidebar")
     translucent_sidebar.click()
@@ -384,7 +385,7 @@ def test_guided_custom_theme_applies_to_both_modes_and_persists(
 
     page.reload()
     expect(_color_theme_select(page)).to_contain_text("Custom")
-    expect(page.get_by_test_id("custom-theme-accent-trigger")).to_contain_text("#2563EB")
+    expect(page.get_by_test_id("custom-theme-accent-trigger")).to_contain_text("#58A6FF")
     assert _data_theme(page) == "custom"
 
     page.goto(f"{base_url}/c/{session_id}")
@@ -486,8 +487,8 @@ def test_omnigent_selection_keeps_the_brand_tint(
     """Selected chat text on the default palette is the translucent brand pink.
 
     Omnigent's selection is the sidebar's active-item tint, not an opaque
-    primary-colour block: ``rgba(240, 1, 150, 0.1)`` with plum text in light
-    mode and ``rgba(240, 1, 150, 0.15)`` with pink text in dark mode.
+    primary-colour block: ``rgba(223, 60, 133, 0.1)`` with plum text in light
+    mode and ``rgba(223, 60, 133, 0.15)`` with pink text in dark mode.
     """
     base_url, session_id = chat_session_contract.base_url, chat_session_contract.session_id
     chat_session_contract.set_items(
@@ -499,8 +500,8 @@ def test_omnigent_selection_keeps_the_brand_tint(
         ]
     )
     expected = {
-        "Light": ["rgba(240, 1, 150, 0.1)", "rgb(101, 18, 73)"],
-        "Dark": ["rgba(240, 1, 150, 0.15)", "rgb(249, 168, 212)"],
+        "Light": ["rgba(223, 60, 133, 0.1)", "rgb(101, 18, 73)"],
+        "Dark": ["rgba(223, 60, 133, 0.15)", "rgb(249, 168, 212)"],
     }
     _open_appearance(page, base_url)
     _pick_palette(page, "Omnigent")

@@ -16,7 +16,7 @@ reproduce in — reproducing on the running app **is** the reproduction. Your
 whole session is browsable in that app afterward.
 
 **Environment note:** when you run under `--server` you're inside a
-Databricks-network session where the public npm/PyPI registries are blocked —
+network-restricted session where the public npm/PyPI registries are blocked —
 point package installs at the internal proxies. See
 [`dev/agent-environment.md`](../agent-environment.md) before running any
 `npm`/`pnpm`/`pip`/`uv` install.
@@ -554,7 +554,7 @@ retryable rather than becoming a product verdict.
   Capture the evidence (snapshot, response, log excerpt).
 - Failure reproduces, but only against a **stand-in** for the reported
   environment you could not drive (for example the CI egress proxy standing in
-  for a Databricks-network host) → **`likely_repro`**. Name the stand-in in
+  for a network-restricted host) → **`likely_repro`**. Name the stand-in in
   `environment_fidelity` (see below). It still dispatches the fix workflow.
 - The failure depends on **native behaviour this environment cannot exercise**
   (the iOS soft keyboard, WebKit-only rendering, a native-chrome layout) and the
@@ -685,7 +685,10 @@ Follow these rules for each clip:
 - **Caption the screen from screen evidence.** Check that claimed elements are
   in view and unobstructed, and quote only visibly rendered text. DOM attributes,
   hidden accessibility labels and backend logs are not screen evidence. Disclose
-  unavailable frame inspection and limit claims to verified states. Follow
+  unavailable frame inspection and limit claims to verified states. An absence
+  check covers only the element it targets: name the checked element, as in
+  "the chat pane shows no working indicator" after checking only the chat pane,
+  unless every place showing that state was checked. Follow
   `dev/recording-lanes.md` and correct captions that conflict with the frames.
 - For CLI or terminal output, record the real command and its output, even if
   only an error message changes. For example, run `omnigent host` with an
@@ -814,7 +817,7 @@ Field meanings:
   reproduced here). When you reproduced the failure only against a **stand-in**
   for the reported environment — the verdict is then `likely_repro` — set
   `stand-in: <what you drove> — could not drive <the reported surface>`, e.g.
-  `stand-in: CI egress proxy — could not drive the Databricks-network host`, and
+  `stand-in: CI egress proxy — could not drive the network-restricted host`, and
   say the same in `journey` and `evidence`. (When the stand-in *cannot exhibit*
   the reported failure at all — a native-chrome bug on the web SPA — you do not
   get a verdict from it: that is `needs_manual_review`, and you name the
