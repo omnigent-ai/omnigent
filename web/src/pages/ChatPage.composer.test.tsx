@@ -6127,6 +6127,34 @@ describe("Composer placeholder", () => {
     expect(textarea().placeholder).toMatch(/send a follow-up/i);
   });
 
+  it.each([
+    {
+      viewport: "desktop",
+      hostId: "host-a",
+      copy: "Session offline — reconnect below to continue",
+    },
+    {
+      viewport: "mobile",
+      hostId: "host-a",
+      copy: "Session offline — reconnect from the host menu",
+    },
+    { viewport: "mobile", hostId: null, copy: "Session offline — reconnect below to continue" },
+  ])(
+    "points an offline $viewport session with host $hostId at its reconnect control",
+    ({ viewport, hostId, copy }) => {
+      // Mobile moves a bound host's button into the header; a session with no
+      // host reconnects from the banner below the composer instead.
+      if (viewport === "mobile") onTestFinished(forceMobileViewport());
+      composerSessionSnapshot.hostId = hostId;
+      onTestFinished(() => {
+        composerSessionSnapshot.hostId = null;
+      });
+      render(<Composer {...composerProps({ unreachable: true })} />);
+      expect(textarea()).toBeDisabled();
+      expect(textarea().placeholder).toBe(copy);
+    },
+  );
+
   it("resets the native text input when the Send button moves focus first", () => {
     const props = composerProps({ status: "streaming", isWorking: true });
     render(<Composer {...props} />);

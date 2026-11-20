@@ -614,6 +614,23 @@ describe("HostBadge", () => {
     expect(screen.getByRole("menuitem", { name: "Switch host…" })).toBeInTheDocument();
   });
 
+  it("keeps the same composer host trigger mounted as the reconnect label comes and goes", () => {
+    // Remounting the menu as liveness flips would drop focus and strand its open state.
+    const onReconnect = vi.fn();
+    const badge = () => (
+      <HostBadge sessionId="conv_1" appearance="composer" onReconnect={onReconnect} />
+    );
+    const { rerender } = render(badge());
+    const trigger = screen.getByTestId("composer-host-select");
+    useSessionHostOnlineMock.mockReturnValue(false);
+    rerender(badge());
+    expect(screen.getByTestId("composer-host-offline")).toContainElement(trigger);
+    useSessionHostOnlineMock.mockReturnValue(true);
+    rerender(badge());
+    expect(screen.queryByTestId("composer-host-offline")).not.toBeInTheDocument();
+    expect(screen.getByTestId("composer-host-select")).toBe(trigger);
+  });
+
   it.each<{
     state: string;
     online: boolean;

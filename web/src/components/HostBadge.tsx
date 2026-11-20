@@ -209,8 +209,7 @@ export function HostBadge({
     }
     // The composer trigger is icon-only, so a disconnected host the user can
     // reconnect also gets a visible label and a one-click Reconnect beside it.
-    const showReconnect =
-      appearance === "composer" && reconnectable && !asleep && !hostStarting && !readOnly;
+    const showReconnect = reconnectable && !asleep && !hostStarting && !readOnly;
     const hostMenu = (
       <DropdownMenu modal={appearance !== "header"} onOpenChange={setMenuOpen}>
         <ComposerMenuTooltip
@@ -268,29 +267,34 @@ export function HostBadge({
     );
     return (
       <>
-        {showReconnect ? (
+        {appearance === "composer" ? (
+          // One stable wrapper, so the menu and its trigger stay mounted as the label toggles.
           <div
-            className="flex shrink-0 items-center rounded-lg bg-muted"
-            data-testid="composer-host-offline"
+            className={cn("flex shrink-0 items-center rounded-lg", showReconnect && "bg-muted")}
+            data-testid={showReconnect ? "composer-host-offline" : undefined}
           >
             {hostMenu}
-            <span
-              className={cn(
-                "text-ui leading-5 text-muted-foreground",
-                COMPOSER_COLLAPSED_LABEL_CLASS,
-              )}
-            >
-              Offline<span aria-hidden> ·</span>
-            </span>
-            <button
-              type="button"
-              onClick={onReconnect}
-              aria-label="Reconnect host"
-              className="flex h-8 mobile-touch-target cursor-pointer items-center rounded-lg px-1.5 text-ui leading-5 font-medium text-foreground transition-colors hover:bg-muted md:h-7"
-              data-testid="composer-host-reconnect"
-            >
-              Reconnect
-            </button>
+            {showReconnect && (
+              <>
+                <span
+                  className={cn(
+                    "text-ui leading-5 text-muted-foreground",
+                    COMPOSER_COLLAPSED_LABEL_CLASS,
+                  )}
+                >
+                  Offline<span aria-hidden> ·</span>
+                </span>
+                <button
+                  type="button"
+                  onClick={onReconnect}
+                  aria-label="Reconnect host"
+                  className="flex h-8 mobile-touch-target cursor-pointer items-center rounded-lg px-1.5 text-ui leading-5 font-medium text-foreground transition-colors hover:bg-muted md:h-7"
+                  data-testid="composer-host-reconnect"
+                >
+                  Reconnect
+                </button>
+              </>
+            )}
           </div>
         ) : (
           hostMenu
