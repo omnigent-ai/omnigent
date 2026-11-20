@@ -51,6 +51,11 @@ MCP independent creation.
   An optional `permission_mode` starts the session in a mode of its harness;
   modes that skip approval are refused, and on a server that doesn't advertise
   `session_create_permission_modes` the tool refuses the call before creating anything.
+  Without one, a child (also one added from the Agents panel's Add agent) starts in
+  its Claude Code or Codex parent's current mode, mapped to its own harness (Claude
+  Code Auto ↔ Codex Approve for me), unless its agent spec or an automation sets a
+  mode. Approval-skipping, plan/read-only and default parent modes aren't passed on.
+  Covered by `tests/server/integration/test_session_orchestration.py::test_sub_agent_starts_in_its_parents_permission_mode`.
   An optional `workflow_id` (agent_id only) starts the session as a run of one
   of the owner's saved workflows, with that workflow's plan already in its
   journal. With workflows disabled, or on a server that doesn't advertise

@@ -95,7 +95,12 @@ from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
 )
-from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
+from omnigent.native.permission_modes import (
+    PERMISSION_LAUNCH_ARGS,
+    created_session_launch_args,
+    inherited_permission_mode,
+    launch_args_permission_mode,
+)
 from omnigent.native.session_todos import validate_session_todos
 from omnigent.policies.types import EvaluationContext
 from omnigent.runner.identity import (
@@ -331,6 +336,7 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     ARCHIVED_AT_LABEL_KEY,
+    CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     FORK_SOURCE_LABEL_KEY,
     MUTED_LABEL_KEY,
     PINNED_LABEL_KEY,
@@ -11280,6 +11286,74 @@ def _derive_terminal_launch_args_from_spec(
     return None
 
 
+# Spec keys that declare a native session's own approval stance.
+_SPEC_PERMISSION_KEYS = ("permission_mode", "exec_mode", "yolo")
+
+
+def _session_live_permission_mode(conv: Conversation) -> tuple[str, str] | None:
+    """
+    The harness and permission mode a native session is running in now.
+
+    The mode labels track switches made after launch, so they win over the
+    launch flags they may have replaced.
+
+    :param conv: The session row, e.g. a sub-agent's parent.
+    :returns: ``(harness, mode)``, e.g. ``("claude-native", "auto")``, or ``None``
+        when the session isn't a Claude Code or Codex session with a known mode.
+    """
+    native_agent = native_coding_agent_for_wrapper_label(
+        conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+    )
+    if native_agent is None:
+        return None
+    harness = native_agent.harness
+    launch_args = list(conv.terminal_launch_args or [])
+    if harness == _CLAUDE_NATIVE_HARNESS:
+        mode = conv.labels.get(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY)
+    elif harness == _CODEX_NATIVE_HARNESS:
+        if (
+            conv.labels.get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == "1"
+            or "--dangerously-bypass-approvals-and-sandbox" in launch_args
+        ):
+            return harness, "bypass"
+        mode = conv.labels.get(_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY)
+    else:
+        return None
+    mode = mode or launch_args_permission_mode(harness, launch_args)
+    return (harness, mode) if mode else None
+
+
+def _inherited_parent_permission_launch_args(
+    parent: Conversation | None, harness: str | None, spec: AgentSpec | None
+) -> list[str] | None:
+    """
+    Launch args that start a sub-agent in the closest match to its parent's mode.
+
+    A child spec that declares its own stance keeps it. A parent mode that skips
+    approval isn't inherited, the same as one the creating agent requests.
+
+    :param parent: The child's parent session, or ``None``.
+    :param harness: The child's canonical harness, e.g. ``"codex-native"``.
+    :param spec: The child's own agent spec, when it loaded.
+    :returns: The CLI args, or ``None`` to keep the harness default.
+    """
+    if parent is None or harness is None:
+        return None
+    if spec is not None and _spec_harness(spec) == harness:
+        if any(spec.executor.config.get(key) is not None for key in _SPEC_PERMISSION_KEYS):
+            return None
+    live = _session_live_permission_mode(parent)
+    if live is None:
+        return None
+    mode = inherited_permission_mode(live[0], live[1], harness)
+    if mode is None:
+        return None
+    try:
+        return created_session_launch_args(harness, mode)
+    except ValueError:
+        return None
+
+
 def _native_subagent_wrapper_labels_from_spec(sub_spec: AgentSpec) -> dict[str, str]:
     """
     Resolve terminal-first wrapper labels from an already-loaded sub-spec.
@@ -13141,6 +13215,7 @@ __all__ = [
     "_handle_mcp_tools_list",
     "_host_model_options_via_registry",
     "_if_none_match_matches",
+    "_inherited_parent_permission_launch_args",
     "_invalidate_runner_backed_snapshot_state",
     "_is_claude_native_subagent",
     "_is_codex_native_subagent",
