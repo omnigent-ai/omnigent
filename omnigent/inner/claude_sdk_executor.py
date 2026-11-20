@@ -2739,6 +2739,20 @@ class ClaudeSDKExecutor(Executor):
             self._extra_env[_CLAUDE_API_KEY_HELPER_ENV_KEY] = api_key_helper
         self._model_auth_helper = self._extra_env.get(_CLAUDE_API_KEY_HELPER_ENV_KEY)
 
+        effective_cwd = (
+            _resolve_sandbox_cwd(self._os_env_spec.cwd, selected_cwd=self._cwd)
+            if self._os_env_spec is not None
+            else None
+        )
+        if self._os_env_spec is not None:
+            validate_harness_sandbox(
+                self._os_env_spec,
+                "Claude SDK",
+                cwd=effective_cwd,
+                supports_egress_rules=True,
+                supports_credential_proxy=True,
+            )
+
         # Prefer system-installed claude over the SDK's bundled CLI.
         # The bundled CLI may be older and send beta flags that the
         # Databricks gateway doesn't support.
@@ -2758,7 +2772,6 @@ class ClaudeSDKExecutor(Executor):
         self._cli_sandbox_cwd: str | None = None
         if self._cli_path:
             if self._os_env_spec is not None:
-                effective_cwd = _resolve_sandbox_cwd(self._os_env_spec.cwd, selected_cwd=self._cwd)
                 user_settings_source_paths: tuple[pathlib.Path, ...] = ()
                 user_settings_has_api_key_helper = False
                 if not self._gateway and (

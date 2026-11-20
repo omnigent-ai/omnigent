@@ -552,6 +552,7 @@ class TestConstructor(unittest.TestCase):
     def test_os_env_spec_with_no_sandbox_keeps_native_tools_enabled(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
         from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+        from omnigent.inner.sandbox import HarnessSandboxValidationError
 
         for declared_cwd, selected_cwd, expected_cwd in (
             (None, None, None),
@@ -570,6 +571,31 @@ class TestConstructor(unittest.TestCase):
                 self.assertTrue(executor._os_env)
                 self.assertIsNotNone(executor._os_env_spec)
                 self.assertEqual(executor._cwd, expected_cwd)
+
+        # The SDK may select its own CLI; policy refusal must not depend on installation.
+        for cli_path in (None, "/usr/bin/claude"):
+            for reason in (None, "none_network", "fork"):
+                with (
+                    self.subTest(cli_path=cli_path, reason=reason),
+                    patch(
+                        "omnigent.inner.claude_sdk_executor._find_system_claude",
+                        return_value=cli_path,
+                    ),
+                ):
+                    spec = OSEnvSpec(
+                        fork=reason == "fork",
+                        sandbox=OSEnvSandboxSpec(
+                            type="none", allow_network=reason != "none_network"
+                        ),
+                    )
+                    if reason is None:
+                        executor = ClaudeSDKExecutor(os_env=spec)
+                        self.assertTrue(executor._os_env)
+                        self.assertEqual(executor._cli_path, cli_path)
+                    else:
+                        with self.assertRaises(HarnessSandboxValidationError) as failure:
+                            ClaudeSDKExecutor(os_env=spec)
+                        self.assertEqual(failure.exception.reason, reason)
 
     def test_os_env_spec_wraps_cli_and_enables_native_tools(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, PreparedClaudeCli
