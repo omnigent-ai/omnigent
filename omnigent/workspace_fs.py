@@ -33,18 +33,20 @@ search, and file content work identically in both modes.
 from __future__ import annotations
 
 import base64
+import bisect
 import mimetypes
 import os
 import re
+import stat
 import subprocess
-from collections import deque
+import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TypeAlias, cast
+from typing import TypeAlias, TypedDict, cast
 
 from omnigent.entities.environment_filesystem import FilesystemEntry, InvalidPath
-from omnigent.entities.pagination import paginate_in_memory
-from omnigent.inner._cwd_scan import _DEFAULT_DEPRIORITIZED_DIRS
+from omnigent.entities.pagination import PagedList, paginate_in_memory
 from omnigent.runner import pr_resource
 from omnigent.runner.environment_filesystem import (
     _SEARCH_SCAN_BUDGET,
@@ -56,16 +58,32 @@ from omnigent.runner.environment_filesystem import (
     split_glob_list,
 )
 from omnigent.runtime.filesystem_registry import (
+    FilesystemRegistry,
     GitStatusUnavailable,
     create_filesystem_registry,
 )
+from omnigent.workspace_file_search import walk_search
 
 # Match the runner's caps so a host-served read is truncated identically.
 _MAX_READ_BYTES = 10 * 1024 * 1024  # 10 MiB
+# Longer than any platform's PATH_MAX, so a real link always fits.
+_MAX_LINK_TEXT_BYTES = 4096
 _REPOSITORY_BRANCH_TIMEOUT_S = 3.0
 _MAX_REPOSITORY_BRANCHES = 10
 
 _WorkspacePayload: TypeAlias = dict[str, object]
+
+
+class ListedEntry(TypedDict):
+    """One directory entry, in the runner's listing shape."""
+
+    id: str
+    object: str
+    name: str
+    path: str
+    type: str
+    bytes: int | None
+    modified_at: int
 
 
 def _repository_branch(url: str, checkout: Path) -> _WorkspacePayload:
@@ -124,6 +142,56 @@ class WorkspaceReaderError(Exception):
         self.message = message
 
 
+@dataclass(frozen=True)
+class FileBytes:
+    """A file's bytes, capped at the read limit, and how to present them.
+
+    :param data: The bytes to serve, at most ``_MAX_READ_BYTES``.
+    :param truncated: Whether the file was longer than the cap.
+    :param is_text: Whether ``data`` is valid UTF-8.
+    :param content_type: MIME type guessed from the name, e.g. ``"text/markdown"``.
+    """
+
+    data: bytes
+    truncated: bool
+    is_text: bool
+    content_type: str | None
+
+
+def guess_content_type(rel: str) -> str | None:
+    """The MIME type a file read reports for ``rel``, from its name alone.
+
+    Uses this machine's MIME table, e.g. ``"text/markdown"`` for ``"notes.md"``.
+    """
+    content_type, _ = mimetypes.guess_type(rel)
+    return content_type
+
+
+def _cap_file_bytes(rel: str, raw: bytes) -> FileBytes:
+    """Cap ``raw`` at the read limit and decide whether it is UTF-8 text."""
+    content_type = guess_content_type(rel)
+    truncated = len(raw) > _MAX_READ_BYTES
+    capped = raw[:_MAX_READ_BYTES] if truncated else raw
+    try:
+        capped.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        # The cap may split a trailing codepoint: drop that partial tail so oversize
+        # text stays text, as the runner does. Earlier invalid bytes mean binary.
+        if not (truncated and exc.start >= len(capped) - 3):
+            return FileBytes(capped, truncated, is_text=False, content_type=content_type)
+        capped = capped[: exc.start]
+    return FileBytes(capped, truncated, is_text=True, content_type=content_type)
+
+
+def is_utf8_encodable(text: str) -> bool:
+    """Return whether ``text`` has no surrogate-escaped bytes, so it encodes as UTF-8."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def _resolve_workspace_path(root: Path, path: str) -> Path:
     """Resolve a relative path, including symlinks, within the workspace root."""
     try:
@@ -162,6 +230,38 @@ def read_repository_branches(root: Path, repositories: list[dict[str, str]]) -> 
     return {"repositories": branches}
 
 
+def _describe_entry(full: Path, name: str, rel: str) -> ListedEntry | None:
+    """Describe one directory entry as the runner's ``list_dir`` does.
+
+    Classifies it by its target's type (following a symlink) and lists a
+    broken symlink as a file with no size, rather than dropping it.
+
+    :returns: The entry, or ``None`` when even ``lstat`` fails.
+    """
+    try:
+        st = full.stat()  # follows symlinks, like the runner
+        entry_type = "directory" if stat.S_ISDIR(st.st_mode) else "file"
+        size = st.st_size if entry_type == "file" else None
+        mtime = int(st.st_mtime)
+    except OSError:
+        try:
+            ls = full.lstat()
+        except OSError:
+            return None
+        entry_type = "file"
+        size = None
+        mtime = int(ls.st_mtime)
+    return {
+        "id": rel,
+        "object": "session.environment.filesystem.entry",
+        "name": name,
+        "path": rel,
+        "type": entry_type,
+        "bytes": size,
+        "modified_at": mtime,
+    }
+
+
 class WorkspaceReader:
     """Read-only view of a workspace directory, confined to its root.
 
@@ -171,11 +271,28 @@ class WorkspaceReader:
 
     def __init__(self, root: Path) -> None:
         self._root = Path(root).resolve()
-        # The change registry (git or edit-tracking) is chosen the same
-        # way the runner chooses it, so git workspaces get git-status
-        # semantics and everything else degrades to an empty list.
-        self._registry = create_filesystem_registry(self._root)
-        self._registry.start()
+        self._started_registry: FilesystemRegistry | None = None
+        self._registry_lock = threading.Lock()
+
+    @property
+    def _registry(self) -> FilesystemRegistry:
+        """The change registry, started on first use by changes, diffs or search.
+
+        Chosen the way the runner chooses it, so git workspaces get git-status
+        semantics and everything else degrades to an empty list. Starting it
+        may write the repository's config, so readers that only list or read
+        files never start it.
+        """
+        with self._registry_lock:
+            if self._started_registry is None:
+                self._started_registry = create_filesystem_registry(self._root)
+                self._started_registry.start()
+            return self._started_registry
+
+    @property
+    def root(self) -> Path:
+        """The workspace directory, resolved."""
+        return self._root
 
     # ── Path confinement ──────────────────────────────────────────
 
@@ -215,6 +332,106 @@ class WorkspaceReader:
             return self._list_dir(path, resolved, limit, after, before, order)
         return self._read_file(path, resolved)
 
+    def list_directory(
+        self, path: str, *, limit: int, after: str | None
+    ) -> PagedList[ListedEntry]:
+        """List a directory in ascending name order, like ``list_or_read``.
+
+        :param path: Relative directory path (``""`` for the workspace root).
+        :param limit: Max entries to return.
+        :param after: Return entries after this entry id. An id whose entry
+            was removed since still resumes at its place in name order.
+        :returns: The page of entries.
+        :raises WorkspaceReaderError: 404 when ``path`` is not a readable directory.
+        """
+        entries = self._list_entries(path, self._resolve(path))
+        # Ids sort like names (one shared parent), so the cursor needn't still exist.
+        start = bisect.bisect_right([e["id"] for e in entries], after) if after else 0
+        page = entries[start : start + limit]
+        return PagedList(
+            data=page,
+            first_id=page[0]["id"] if page else None,
+            last_id=page[-1]["id"] if page else None,
+            has_more=start + limit < len(entries),
+        )
+
+    def read_file_bytes(self, path: str) -> FileBytes:
+        """Read a file's capped bytes, exactly as ``list_or_read`` would serve them.
+
+        :param path: Relative file path.
+        :returns: The capped bytes and their presentation.
+        :raises WorkspaceReaderError: 400 on an invalid path, 404 when ``path``
+            is not a readable regular file.
+        """
+        return _cap_file_bytes(path, self._read_capped(path, self._resolve(path)))
+
+    def stat_entry(self, path: str) -> tuple[ListedEntry, bool]:
+        """Describe one path exactly as listing its parent would.
+
+        The parent must stay inside the workspace; the leaf itself may be a
+        symlink, even one pointing outside, as a listing shows it.
+
+        :param path: Relative path (``""`` for the workspace root).
+        :returns: The entry, and whether the path itself is a symlink.
+        :raises WorkspaceReaderError: 400 on an invalid path or escaping
+            parent, 404 when the path doesn't exist.
+        """
+        leaf, parent = self._leaf_beneath(path)
+        if parent is None:
+            entry = _describe_entry(self._root, self._root.name, "")
+            if entry is None:
+                raise WorkspaceReaderError(404, "not_found", "The workspace is not accessible")
+            return entry, False
+        full = parent / leaf.rsplit("/", 1)[-1]
+        entry = _describe_entry(full, full.name, leaf)
+        if entry is None or not is_utf8_encodable(full.name):
+            raise WorkspaceReaderError(404, "not_found", f"Path {path!r} not found")
+        return entry, full.is_symlink()
+
+    def read_link_text(self, path: str) -> bytes:
+        """Return a symlink's own text, without following it.
+
+        The link may point anywhere, even outside the workspace or nowhere;
+        only its parent must stay inside the workspace.
+
+        :param path: Relative path of the link.
+        :returns: The stored target, at most :data:`_MAX_LINK_TEXT_BYTES`.
+        :raises WorkspaceReaderError: 400 on an invalid path, escaping parent
+            or oversized link, 404 when missing, 412 when not a symlink.
+        """
+        leaf, parent = self._leaf_beneath(path)
+        if parent is None:
+            raise WorkspaceReaderError(412, "not_a_symlink", "The workspace root is not a link")
+        full = parent / leaf.rsplit("/", 1)[-1]
+        try:
+            st = full.lstat()
+        except OSError as exc:
+            raise WorkspaceReaderError(404, "not_found", f"Path {path!r} not found") from exc
+        if not stat.S_ISLNK(st.st_mode):
+            raise WorkspaceReaderError(412, "not_a_symlink", f"Path {path!r} is not a symlink")
+        try:
+            target = os.readlink(os.fsencode(full))
+        except OSError as exc:
+            raise WorkspaceReaderError(404, "not_found", f"Path {path!r} not found") from exc
+        if len(target) > _MAX_LINK_TEXT_BYTES:
+            raise WorkspaceReaderError(400, "link_too_long", f"Link {path!r} is too long")
+        return target
+
+    def _leaf_beneath(self, path: str) -> tuple[str, Path | None]:
+        """Validate *path* and resolve its parent inside the workspace.
+
+        :returns: The validated path, and its resolved parent, or ``None``
+            for the workspace root.
+        """
+        try:
+            leaf = _validate_path(path) if path else ""
+        except InvalidPath as exc:
+            raise WorkspaceReaderError(400, "invalid_path", str(exc)) from exc
+        if not leaf:
+            return "", None
+        parent_rel = leaf.rsplit("/", 1)[0] if "/" in leaf else ""
+        return leaf, self._resolve(parent_rel)
+
     def _list_dir(
         self,
         rel: str,
@@ -224,54 +441,10 @@ class WorkspaceReader:
         before: str | None,
         order: str,
     ) -> _WorkspacePayload:
-        """Build the directory-listing payload for a resolved directory.
-
-        Classifies entries by target type (follows symlinks) and skips
-        per-entry ``OSError`` (e.g. a broken symlink) so one bad entry
-        does not fail the listing — matching the runner's ``list_dir``.
-        """
-        validated = _validate_path(rel) if rel else ""
-        entries: list[_WorkspacePayload] = []
-        try:
-            names = sorted(os.listdir(resolved))
-        except OSError as exc:
-            raise WorkspaceReaderError(
-                404, "not_found", f"Directory {rel!r} not found or not accessible"
-            ) from exc
-        for name in names:
-            full = resolved / name
-            child_rel = os.path.join(validated, name) if validated else name
-            try:
-                st = full.stat()  # follows symlinks, like the runner
-                is_dir = full.is_dir()
-                entry_type = "directory" if is_dir else "file"
-                size = st.st_size if entry_type == "file" else None
-                mtime = int(st.st_mtime)
-            except OSError:
-                # Broken symlink (target gone): fall back to lstat and list it
-                # as a file with no size, matching the runner's list_dir rather
-                # than dropping the entry.
-                try:
-                    ls = full.lstat()
-                except OSError:
-                    continue
-                entry_type = "file"
-                size = None
-                mtime = int(ls.st_mtime)
-            entries.append(
-                {
-                    "id": child_rel,
-                    "object": "session.environment.filesystem.entry",
-                    "name": name,
-                    "path": child_rel,
-                    "type": entry_type,
-                    "bytes": size,
-                    "modified_at": mtime,
-                }
-            )
+        """Build the directory-listing payload for a resolved directory."""
         page = paginate_in_memory(
-            entries,
-            id_fn=lambda entry: cast(str, entry["id"]),
+            self._list_entries(rel, resolved),
+            id_fn=lambda entry: entry["id"],
             limit=limit,
             after=after,
             before=before,
@@ -284,6 +457,32 @@ class WorkspaceReader:
             "last_id": page.last_id,
             "has_more": page.has_more,
         }
+
+    def _list_entries(self, rel: str, resolved: Path) -> list[ListedEntry]:
+        """List a resolved directory's entries in name order.
+
+        Classifies entries by target type (follows symlinks) and skips
+        per-entry ``OSError`` (e.g. a broken symlink) so one bad entry
+        does not fail the listing — matching the runner's ``list_dir``.
+        """
+        validated = _validate_path(rel) if rel else ""
+        entries: list[ListedEntry] = []
+        try:
+            names = sorted(os.listdir(resolved))
+        except OSError as exc:
+            raise WorkspaceReaderError(
+                404, "not_found", f"Directory {rel!r} not found or not accessible"
+            ) from exc
+        for name in names:
+            if not is_utf8_encodable(name):
+                # A non-UTF-8 name comes back surrogate-escaped; no JSON or protobuf
+                # answer can carry it, so skip it rather than fail the listing.
+                continue
+            child_rel = os.path.join(validated, name) if validated else name
+            entry = _describe_entry(resolved / name, name, child_rel)
+            if entry is not None:
+                entries.append(entry)
+        return entries
 
     def _read_file(
         self,
@@ -300,15 +499,31 @@ class WorkspaceReader:
         Reads at most ``_MAX_READ_BYTES + 1`` from disk, bounding memory
         use before decoding oversized files.
         """
+        return self._file_content_payload(rel, self._read_capped(rel, resolved))
+
+    def _read_capped(self, rel: str, resolved: Path) -> bytes:
+        """Read up to the cap plus one byte of a regular file.
+
+        Opens without blocking and refuses anything but a regular file, so a
+        FIFO or device in the workspace answers "not found" instead of hanging.
+        """
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+        flags |= getattr(os, "O_CLOEXEC", 0)
         try:
-            with resolved.open("rb") as fh:
-                # One extra byte lets us detect (and flag) truncation
-                # without loading the rest of a large file into memory.
-                capped = fh.read(_MAX_READ_BYTES + 1)
+            fd = os.open(resolved, flags)
         except OSError as exc:
             raise WorkspaceReaderError(404, "not_found", f"Path {rel!r} not found") from exc
-
-        return self._file_content_payload(rel, capped)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise WorkspaceReaderError(404, "not_found", f"Path {rel!r} not found")
+            with os.fdopen(fd, "rb", closefd=False) as fh:
+                # One extra byte lets us detect (and flag) truncation
+                # without loading the rest of a large file into memory.
+                return fh.read(_MAX_READ_BYTES + 1)
+        except OSError as exc:
+            raise WorkspaceReaderError(404, "not_found", f"Path {rel!r} not found") from exc
+        finally:
+            os.close(fd)
 
     def _file_content_payload(
         self,
@@ -316,46 +531,18 @@ class WorkspaceReader:
         raw: bytes,
     ) -> _WorkspacePayload:
         """Assemble the file-content dict from raw bytes."""
-        content_type_guess, _ = mimetypes.guess_type(rel)
-        truncated = False
-        capped = raw
-        if len(capped) > _MAX_READ_BYTES:
-            capped = capped[:_MAX_READ_BYTES]
-            truncated = True
-
-        text: str | None = None
-        try:
-            text = capped.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            # A byte-cap truncation can split a multi-byte codepoint at the very
-            # end, which would otherwise flip an oversize *text* file to base64.
-            # When the only invalid bytes are a partial trailing codepoint (the
-            # error starts within the last 3 bytes of the truncated buffer),
-            # drop them and retry — matching the runner's boundary-safe
-            # truncation so the same file serves as text from either side. A
-            # genuinely binary file has invalid bytes earlier in the buffer, so
-            # this guard doesn't rescue it and it falls through to base64.
-            if truncated and exc.start >= len(capped) - 3:
-                capped = capped[: exc.start]
-                text = capped.decode("utf-8")
-
-        payload: _WorkspacePayload = {
+        file = _cap_file_bytes(rel, raw)
+        return {
             "object": "session.environment.filesystem.file_content",
             "path": rel,
-            "content_type": content_type_guess,
+            "content_type": file.content_type,
+            "bytes": len(file.data),
+            "truncated": file.truncated,
+            "encoding": "utf-8" if file.is_text else "base64",
+            "content": file.data.decode("utf-8")
+            if file.is_text
+            else base64.b64encode(file.data).decode(),
         }
-        if text is not None:
-            data = text.encode("utf-8")
-            payload["bytes"] = len(data)
-            payload["truncated"] = truncated
-            payload["encoding"] = "utf-8"
-            payload["content"] = text
-        else:
-            payload["bytes"] = len(capped)
-            payload["truncated"] = truncated
-            payload["encoding"] = "base64"
-            payload["content"] = base64.b64encode(capped).decode()
-        return payload
 
     # ── Search ─────────────────────────────────────────────────────
 
@@ -404,122 +591,9 @@ class WorkspaceReader:
             limit=limit,
         )
 
-        results: list[FilesystemEntry] = []
-        # State the two-pass walk mutates via closures (rebound through the
-        # `nonlocal` in scan()). deferred is a FIFO of noise-dir roots to drain
-        # in pass 2.
-        deferred: deque[str] = deque()
-        scanned = 0
-        truncated = False
-        stop = False
-
-        # os.walk is handed the absolute root, so an entry's path relative to
-        # it is a slice of dirpath -- no per-entry relpath(), whose abspath()
-        # work used to dominate the walk's runtime.
-        # rstrip: a bare root ("/", "C:\\") already ends in the separator the
-        # slice skips.
-        cut = len(str(self._root).rstrip(os.sep)) + 1
-
-        def rel(dirpath: str, name: str) -> str:
-            # Entries always use '/', like the git-index paths they merge with.
-            rel_dir = dirpath[cut:]
-            if os.sep != "/":
-                rel_dir = rel_dir.replace(os.sep, "/")
-            return f"{rel_dir}/{name}" if rel_dir else name
-
-        def match(dirpath: str, name: str, *, is_dir: bool) -> None:
-            # A directory carries no byte size; a file stats for size + mtime.
-            p = rel(dirpath, name)
-            if exc and any(r.match(p) for r in exc):
-                return
-            if inc and not any(r.match(p) for r in inc):
-                return
-            if q not in name.lower() and q not in p.lower():
-                return
-            try:
-                st = (Path(dirpath) / name).stat()
-                size: int | None = None if is_dir else st.st_size
-                mtime: int | None = int(st.st_mtime)
-            except OSError:
-                size = None
-                mtime = None
-            results.append(
-                FilesystemEntry(
-                    id=p,
-                    name=name,
-                    path=p,
-                    type="directory" if is_dir else "file",
-                    bytes=size,
-                    modified_at=mtime,
-                )
-            )
-
-        def scan(root: str, defer: bool) -> None:
-            # A query matching little or nothing never fills the result cap, so
-            # the walk needs its own bound. Counted per entry: a per-directory
-            # check lets one huge directory overshoot before `truncated` trips.
-            nonlocal scanned, truncated, stop
-            for dirpath, dirnames, filenames in os.walk(root):
-                kept = []
-                for d in sorted(dirnames):
-                    if d == ".git":
-                        # Git's own store is never a search target, and in a
-                        # plain clone its reflogs alone can outnumber the tree.
-                        continue
-                    full = os.path.join(dirpath, d)
-                    dp = rel(dirpath, d)
-                    if any(r.match(dp) for r in exc):
-                        continue
-                    if defer and d in _DEFAULT_DEPRIORITIZED_DIRS:
-                        # Match the dir now, but walk its subtree later (pass 2)
-                        # so it can't starve the real tree of scan budget. Never
-                        # defer a symlinked dir: os.walk(root) follows a top-level
-                        # symlink, so a committed 'node_modules -> ..' would let
-                        # pass 2 escape the workspace. os.walk(followlinks=False)
-                        # never crosses symlinks mid-tree; deferring only real
-                        # dirs keeps that boundary intact.
-                        if not os.path.islink(full):
-                            deferred.append(full)
-                    kept.append(d)
-                dirnames[:] = [d for d in kept if not (defer and d in _DEFAULT_DEPRIORITIZED_DIRS)]
-                for dname in kept:
-                    # Count then check `> budget`, not `>= budget`: a tree of
-                    # exactly `budget` entries is fully enumerable and must not
-                    # report truncated.
-                    scanned += 1
-                    if scanned > _SEARCH_SCAN_BUDGET:
-                        truncated = True
-                        stop = True
-                        return
-                    match(dirpath, dname, is_dir=True)
-                    if len(results) >= limit:
-                        stop = True
-                        return
-                for fname in sorted(filenames):
-                    scanned += 1
-                    if scanned > _SEARCH_SCAN_BUDGET:
-                        truncated = True
-                        stop = True
-                        return
-                    match(dirpath, fname, is_dir=False)
-                    if len(results) >= limit:
-                        stop = True
-                        return
-
-        # Pass 1 walks the real tree and defers dependency/cache subtrees;
-        # reordering siblings isn't enough, because a deep node_modules nested
-        # under an earlier-sorted real dir would still swallow the whole budget
-        # before the walk reached a later top-level dir. Pass 2 drains the
-        # deferred roots only if budget remains. Mirrors the runner's walk.
-        scan(str(self._root), True)
-        while deferred and not stop:
-            scan(deferred.popleft(), False)
-        # When the walk stops early it is always because scan() tripped the
-        # budget (which sets truncated) or the result limit (signaled by
-        # has_more); the loop exits only once deferred is drained or stop is
-        # set, so no extra truncation flag is needed here.
-
-        results.sort(key=lambda entry: entry.path)
+        results, truncated = walk_search(
+            self._root, q, inc, exc, limit, budget=_SEARCH_SCAN_BUDGET
+        )
         if indexed is not None:
             results = merge_entries(indexed, results, limit)
         return self._search_payload(results, limit, truncated=truncated)
@@ -570,6 +644,7 @@ class WorkspaceReader:
                 "modified_at": rec.get("modified_at"),
                 "lines_added": rec.get("lines_added"),
                 "lines_removed": rec.get("lines_removed"),
+                "untracked_lines": rec.get("untracked_lines"),
             }
             for rec in raw_changes
         ]

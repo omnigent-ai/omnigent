@@ -128,6 +128,8 @@ function createQuitConfirmation({
     quitStarted: () => {
       quitting = true;
     },
+    /** Whether the app has started quitting (and shutting its server down). */
+    isQuitting: () => quitting,
   };
 }
 

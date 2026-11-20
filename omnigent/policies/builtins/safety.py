@@ -395,7 +395,7 @@ def ask_on_add_policy(event: PolicyEvent) -> PolicyResponse:
 # ``ask_on_scheduled_task_change`` into every engine and exempts these names
 # from its no-policy fast path; both read this set so they cannot drift.
 SCHEDULED_TASK_APPROVAL_TOOLS: frozenset[str] = frozenset(
-    {"sys_scheduled_task_create", "sys_scheduled_task_update"}
+    {"sys_scheduled_task_create", "sys_scheduled_task_update", "sys_reminder_set"}
 )
 
 
@@ -529,8 +529,44 @@ def _scheduled_task_review(args: dict[str, object], *, action: str, subject: str
     )
 
 
+def _reminder_review(args: dict[str, object]) -> PolicyResponse:
+    """ASK to set a reminder, showing when it fires and its full message."""
+    message = args.get("message")
+    if not isinstance(message, str) or not message.strip():
+        return {
+            "result": "DENY",
+            "reason": "Cannot set a reminder. The reminder message must be a non-empty string.",
+        }
+    from datetime import UTC, datetime
+
+    from omnigent.tools.builtins.scheduled_tasks import resolve_reminder_time
+
+    # Resolve the time exactly as the tool will, so padding or a long fraction in
+    # the raw argument can't hide the moment being approved.
+    resolved = resolve_reminder_time(args, datetime.now(UTC))
+    if isinstance(resolved, str):
+        return {"result": "DENY", "reason": f"Cannot set a reminder. {resolved}"}
+    if args.get("at") is not None:
+        when = f"at {resolved:%Y-%m-%d %H:%M} UTC"
+    else:
+        when = f"{args['delay_seconds']} seconds after approval, rounded up to the next minute"
+    # Quote every line, so a multiline message can't pass for the prompt's own text.
+    quoted = "\n".join(f"> {line}" for line in message.splitlines())
+    return {
+        "result": "ASK",
+        "reason": (
+            f"Agent wants to set a reminder for this session {when}.\n"
+            "When it fires, this message is sent into the session as a new turn, "
+            "even if nobody is watching (each line quoted with '> '):\n"
+            f"{quoted}\n"
+            "Approve?"
+        ),
+    }
+
+
 def ask_on_scheduled_task_change(event: PolicyEvent) -> PolicyResponse:
-    """ASK for user approval before an agent creates or updates a scheduled task.
+    """ASK for user approval before an agent creates or updates a scheduled task,
+    or sets a reminder (a one-time task that continues the session).
 
     Matches ``event["target"]`` (the dispatched tool identity) rather than
     ``data["name"]``, which an earlier policy may have transformed. Reads
@@ -550,6 +586,8 @@ def ask_on_scheduled_task_change(event: PolicyEvent) -> PolicyResponse:
     args = data.get("arguments") if isinstance(data, dict) else None
     if not isinstance(args, dict):
         args = {}
+    if tool == "sys_reminder_set":
+        return _reminder_review(args)
     action = "create" if tool == "sys_scheduled_task_create" else "update"
     # Older runners expose optional review fields. Current runners enforce the
     # complete contract before dispatch, including when paired with an old server.

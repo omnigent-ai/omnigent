@@ -120,7 +120,7 @@ def test_native_clear_keeps_project_and_title(
         expect(page.get_by_test_id("header-title")).to_have_text(title, timeout=15_000)
         folder = page.get_by_role("button", name=project_name, exact=True)
         if folder.get_attribute("aria-expanded") != "true":
-            folder.click()
+            folder.locator("[data-section-toggle]").first.click()
         expect(_section(page, project_name).locator(f'a[href="/c/{session_id}"]')).to_be_visible(
             timeout=15_000
         )

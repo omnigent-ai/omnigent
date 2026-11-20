@@ -1131,9 +1131,12 @@ def _terminal_failure(pod: object) -> tuple[str, str] | None:
 
     - The **Pod phase** is ``Failed`` (the Job controller gave up after
       exhausting ``backoffLimit``), OR
-    - The host container is in ``CrashLoopBackOff`` (the kubelet is still
-      retrying, but the container is crash-looping and unlikely to self-heal
-      during the launch window).
+    - An init container is crash-looping (see :func:`_init_container_crash_looping`;
+      the Pod stays ``Pending``, e.g. the workspace-prep clone keeps failing), OR
+    - The host container is in ``CrashLoopBackOff`` (the Pod is ``Running``).
+
+    Either way the container is unlikely to self-heal during the launch window,
+    so the failure names it and the caller attaches its log tail.
 
     :param pod: A ``V1Pod`` read from the API.
     :returns: The failed container name + summary, or ``None``.
@@ -1163,20 +1166,81 @@ def _terminal_failure(pod: object) -> tuple[str, str] | None:
                 )
         return _CONTAINER_NAME, "entered terminal phase 'Failed'"
 
-    # Host container in CrashLoopBackOff while the Pod is still Running —
-    # the kubelet is retrying but the host is crash-looping.
+    # A crash-looping container won't self-heal during the launch window. An init
+    # container crash-loops with the Pod still Pending; the host container with
+    # the Pod Running.
+    for cs in getattr(status, "init_container_statuses", None) or []:
+        if _init_container_crash_looping(cs):
+            name = getattr(cs, "name", None) or _INIT_CONTAINER_NAME
+            return name, _crash_loop_summary("init container", name, cs)
     for cs in getattr(status, "container_statuses", None) or []:
         waiting = getattr(getattr(cs, "state", None), "waiting", None)
-        if waiting is not None:
-            wr = getattr(waiting, "reason", None)
-            if wr == "CrashLoopBackOff":
-                restart_count = getattr(cs, "restart_count", "?")
-                return getattr(cs, "name", _CONTAINER_NAME), (
-                    f"host container is crash-looping "
-                    f"(restarts: {restart_count}, CrashLoopBackOff)"
-                )
+        if getattr(waiting, "reason", None) == "CrashLoopBackOff":
+            name = getattr(cs, "name", None) or _CONTAINER_NAME
+            return name, _crash_loop_summary("host container", name, cs)
 
     return None
+
+
+def _init_container_crash_looping(cs: object) -> bool:
+    """
+    Return whether an init container is crash-looping rather than retrying once.
+
+    Crash-looping means the kubelet is backing it off (``CrashLoopBackOff``), or
+    it has restarted after a non-zero exit and has not since completed. The second
+    case catches the window where the retry is running again, which the waiting
+    reason does not show. A container that exits 0 after a retry is done.
+
+    :param cs: A container status from ``status.init_container_statuses``.
+    :returns: ``True`` when the init container is crash-looping.
+    """
+    state = getattr(cs, "state", None)
+    if getattr(getattr(state, "waiting", None), "reason", None) == "CrashLoopBackOff":
+        return True
+    if getattr(getattr(state, "terminated", None), "exit_code", None) == 0:
+        return False
+    last = getattr(getattr(cs, "last_state", None), "terminated", None)
+    restart_count = getattr(cs, "restart_count", 0) or 0
+    return last is not None and (getattr(last, "exit_code", 0) or 0) != 0 and restart_count >= 1
+
+
+def _container_failed_attempt(pod: object, name: str) -> bool:
+    """
+    Return whether a container's last attempt exited non-zero.
+
+    A retry that is running or still connecting shows no failure in its current
+    state, so the failed attempt is only visible in ``last_state``.
+
+    :param pod: A ``V1Pod`` read from the API.
+    :param name: The container's name.
+    :returns: ``True`` when ``last_state.terminated`` reports a non-zero exit.
+    """
+    for cs in _all_container_statuses(pod):
+        if getattr(cs, "name", None) != name:
+            continue
+        last = getattr(getattr(cs, "last_state", None), "terminated", None)
+        if last is not None and (getattr(last, "exit_code", 0) or 0) != 0:
+            return True
+    return False
+
+
+def _crash_loop_summary(kind: str, name: str, cs: object) -> str:
+    """
+    Describe a crash-looping container for the start-failure message.
+
+    :param kind: ``"init container"`` or ``"host container"``.
+    :param name: The container's name.
+    :param cs: The container status, read for its restart count and state.
+    :returns: A ``"<kind> '<name>' is crash-looping (...)"`` summary.
+    """
+    restart_count = getattr(cs, "restart_count", "?")
+    waiting = getattr(getattr(cs, "state", None), "waiting", None)
+    if getattr(waiting, "reason", None) == "CrashLoopBackOff":
+        detail = f"restarts: {restart_count}, CrashLoopBackOff"
+    else:
+        last = getattr(getattr(cs, "last_state", None), "terminated", None)
+        detail = f"restarts: {restart_count}, last exit {getattr(last, 'exit_code', '?')}"
+    return f"{kind} '{name}' is crash-looping ({detail})"
 
 
 def _fatal_waiting_reason(pod: object) -> str | None:
@@ -1784,15 +1848,15 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                 time.sleep(_POD_READY_POLL_S)
                 continue
 
-            # Check for terminal failure BEFORE accepting Running — a
-            # crash-looping host container stays in phase Running under
-            # OnFailure, so phase alone is not proof of liveness.
+            # Check for terminal failure BEFORE accepting Running — under
+            # OnFailure a crash-looping container leaves the phase at Running
+            # (host) or Pending (init), so phase alone is not proof of liveness.
             failure = _terminal_failure(pod)
             if failure is not None:
                 container, summary = failure
                 raise click.ClickException(
                     self._pod_failure_message(
-                        namespace, pod_name, summary, log_container=container
+                        namespace, pod_name, summary, log_container=container, pod=pod
                     )
                 )
             phase = _pod_phase(pod)
@@ -1825,6 +1889,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         summary: str,
         *,
         log_container: str | None = None,
+        pod: object | None = None,
     ) -> str:
         """
         Build a pod-start failure message with recent events, an optional
@@ -1839,6 +1904,8 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         :param pod_name: The failed Pod.
         :param summary: What went wrong.
         :param log_container: Container whose log tail to append, or ``None``.
+        :param pod: The Pod as last read. When the container's last attempt
+            failed, its log is the tail, not the current attempt's progress.
         :returns: The full error message.
         """
         message = f"Kubernetes sandbox pod '{pod_name}' {summary}."
@@ -1846,7 +1913,10 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         if events:
             message += f" Recent events: {events}"
         if log_container is not None:
-            tail = self._pod_log_tail(namespace, pod_name, log_container).strip()
+            failed_attempt = pod is not None and _container_failed_attempt(pod, log_container)
+            tail = self._pod_log_tail(
+                namespace, pod_name, log_container, failed_attempt=failed_attempt
+            ).strip()
             if tail:
                 message += f" Container '{log_container}' log tail: {tail[-1500:]}"
         message += f" Inspect with `kubectl describe pod {pod_name} -n {namespace}`."
@@ -1880,33 +1950,51 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                 parts.append(f"{reason or '?'}: {message or ''}".strip())
         return "; ".join(parts)
 
-    def _pod_log_tail(self, namespace: str, pod_name: str, container: str) -> str:
+    def _pod_log_tail(
+        self,
+        namespace: str,
+        pod_name: str,
+        container: str,
+        *,
+        failed_attempt: bool = False,
+    ) -> str:
         """
         Return the last :data:`_LOG_TAIL_LINES` lines of a container's log, or
         empty when unavailable.
 
+        When the container's last attempt failed, the previous attempt's log is
+        the tail: a retry that is still connecting prints progress that hides the
+        fatal error. Otherwise the current attempt is read, falling back to the
+        previous one when it is still empty.
+
         :param namespace: Namespace the Pod lives in.
         :param pod_name: The Pod to read logs from.
         :param container: The container whose log to tail.
+        :param failed_attempt: Read the failed (previous) attempt first.
         :returns: The log tail, or ``""``.
         """
         from kubernetes.client.rest import ApiException
         from urllib3.exceptions import HTTPError
 
-        try:
-            log = cast(
-                str,
-                self._load_core().read_namespaced_pod_log(
-                    pod_name,
-                    namespace,
-                    container=container,
-                    tail_lines=_LOG_TAIL_LINES,
-                    _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
-                ),
-            )
-        except (ApiException, HTTPError):
-            return ""
-        return log
+        core = self._load_core()
+        for previous in (True, None) if failed_attempt else (None, True):
+            try:
+                log = cast(
+                    str,
+                    core.read_namespaced_pod_log(
+                        pod_name,
+                        namespace,
+                        container=container,
+                        previous=previous,
+                        tail_lines=_LOG_TAIL_LINES,
+                        _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
+                    ),
+                )
+            except (ApiException, HTTPError):
+                continue
+            if log.strip():
+                return log
+        return ""
 
     def _best_effort_delete(self, namespace: str, job_name: str, secret_name: str) -> None:
         """

@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import threading
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -32,9 +33,16 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 from starlette.datastructures import Headers
 
+from omnigent.db.account_authority import account_checks_scope
 from omnigent.db.db_models import current_workspace_id
 from omnigent.db.utils import generate_agent_id
-from omnigent.entities import ScheduledTask, ScheduledTaskRun, StoredFile
+from omnigent.entities import (
+    ScheduledTask,
+    ScheduledTaskPermission,
+    ScheduledTaskRun,
+    SessionPermission,
+    StoredFile,
+)
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.bundles import bundle_location
 from omnigent.server.routes._host_worktree import (
@@ -67,6 +75,7 @@ from omnigent.stores.conversation_store import (
     SCHEDULED_TASK_SOURCE_LABEL_KEY,
     SessionActivity,
 )
+from omnigent.stores.permission_store import PermissionStore
 from tests.server.helpers import build_agent_bundle
 
 # The trigger form's saved state; see encodeTriggerPrompt in web/.../triggerTemplates.ts.
@@ -367,6 +376,18 @@ class FakeConversationStore:
     def set_labels(self, conversation_id: str, labels: dict[str, str]) -> None:
         self.label_writes[conversation_id] = dict(labels)
 
+    def swap_label(self, conversation_id: str, key: str, value: str) -> str | None:
+        self.set_labels(conversation_id, {key: value})
+        return None
+
+    def update_scheduled_run_label(
+        self, conversation_id: str, run_id: str, *, action: str
+    ) -> None:
+        from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
+
+        if action == "begin":
+            self.swap_label(conversation_id, SCHEDULED_TASK_RUN_LABEL_KEY, run_id)
+
     def clear_host_binding(self, conversation_id: str, **kwargs: Any) -> None:
         self.updated.append({"id": conversation_id, "clear_host_binding": kwargs})
 
@@ -414,9 +435,13 @@ class FakePermissionStore:
         fail_grant: bool = False,
         fail_grant_users: set[str] | None = None,
         users: set[str] | None = None,
+        task_grantees: list[str] | None = None,
     ) -> None:
         self.ensured: list[str] = []
         self.grants: list[tuple[str, str, int]] = []
+        # The automation's grantees; ``None`` is a store without automation grants.
+        self.task_grantees = task_grantees
+        self.deleted_task_grants: list[str] = []
         self.grant_workspace_ids: list[int] = []
         self.fail_grant = fail_grant
         # Fail only grants to these user ids (e.g. just the public grant),
@@ -450,6 +475,39 @@ class FakePermissionStore:
         self.grants.append((user_id, conversation_id, level))
         return None
 
+    def grant_if_absent(self, user_id: str, conversation_id: str, level: int) -> bool:
+        if self.get(user_id, conversation_id) is not None:
+            return False
+        self.grant(user_id, conversation_id, level)
+        return True
+
+    def get(self, user_id: str, conversation_id: str) -> SessionPermission | None:
+        held = [g for g in self.grants if g[:2] == (user_id, conversation_id)]
+        return SessionPermission(*held[-1]) if held else None
+
+    @property
+    def supports_scheduled_task_grants(self) -> bool:
+        return self.task_grantees is not None
+
+    def list_for_scheduled_task(self, scheduled_task_id: str, **_: Any) -> tuple[list[Any], None]:
+        grantees = self.task_grantees or []
+        return [ScheduledTaskPermission(u, scheduled_task_id, LEVEL_READ) for u in grantees], None
+
+    def resolve_scheduled_task_access(self, principals: list[str], task_id: str) -> int | None:
+        return LEVEL_READ if set(principals) & set(self.task_grantees or []) else None
+
+    def list_for_session(self, conversation_id: str, **_: Any) -> tuple[list[Any], None]:
+        return [SessionPermission(*g) for g in self.grants if g[1] == conversation_id], None
+
+    # Its session reads are already direct, as the store defaults assume.
+    get_direct = PermissionStore.get_direct
+    list_direct_for_session = PermissionStore.list_direct_for_session
+    public_grantees = PermissionStore.public_grantees
+
+    def delete_for_scheduled_task(self, scheduled_task_id: str) -> int:
+        self.deleted_task_grants.append(scheduled_task_id)
+        return 0
+
 
 @dataclass
 class _FakeHost:
@@ -466,8 +524,26 @@ class _FakeHost:
 class _FakeSandboxConfig:
     """Minimal stand-in for ManagedSandboxDeployment in fire tests."""
 
-    def __init__(self, *, managed_launch_supported: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        managed_launch_supported: bool = True,
+        mcp_selection: Any | None = None,
+        others: Mapping[str, Any] | None = None,
+    ) -> None:
         self.managed_launch_supported = managed_launch_supported
+        # The provider a fresh managed run launches on, and how it records MCP services.
+        self.default = SimpleNamespace(provider="box", mcp_selection=mcp_selection)
+        self.configs = (
+            self.default,
+            *(
+                SimpleNamespace(provider=name, mcp_selection=selection)
+                for name, selection in (others or {}).items()
+            ),
+        )
+
+    def recorded(self, provider: str | None) -> Any:
+        return next((c for c in self.configs if c.provider == provider), self.default)
 
 
 class FakeHostStore:
@@ -756,9 +832,11 @@ async def test_active_creates_session_grant_and_run(
     assert not [
         k for k in conv_store.created[0]["labels"] if k.startswith("omnigent.mcp_service.")
     ]
-    assert conv_store.created[0]["title"] == (
-        "[automation job] nightly" if trigger and session_mode == "continue" else "nightly"
-    )
+    title = conv_store.created[0]["title"]
+    if session_mode == "continue":
+        assert title == ("[automation job] nightly" if trigger else "nightly")
+    else:
+        assert re.fullmatch(r"nightly \(\d{4}-\d{2}-\d{2} \d{2}:\d{2}\)", title)
     # NULL owner resolved to "local" and granted LEVEL_OWNER.
     assert perm.ensured == [RESERVED_USER_LOCAL]
     assert perm.grants and perm.grants[0][0] == RESERVED_USER_LOCAL
@@ -784,32 +862,45 @@ class _ListLabelSelection:
         return tuple(json.loads(labels.get("deployment.mcp_services", "[]")))
 
 
+_REGISTRY_LABELS = {"omnigent.mcp_service.github": "1", "omnigent.mcp_service.linear": "1"}
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("app_state", "expected"),
+    ("execution_target", "provider_selection", "expected"),
     [
+        ("connected_host", None, _REGISTRY_LABELS),
+        ("managed_sandbox", None, _REGISTRY_LABELS),
         (
-            None,
-            {"omnigent.mcp_service.github": "1", "omnigent.mcp_service.linear": "1"},
-        ),
-        (
-            SimpleNamespace(session_mcp_selection=_ListLabelSelection()),
+            "managed_sandbox",
+            _ListLabelSelection(),
             {"deployment.mcp_services": '["github", "linear"]'},
         ),
+        # A provider's own selection never applies to a run on a connected host.
+        ("connected_host", _ListLabelSelection(), _REGISTRY_LABELS),
     ],
-    ids=["registry-default", "deployment-override"],
+    ids=["host", "sandbox-provider-without-one", "sandbox-provider-selection", "host-ignores-it"],
 )
 async def test_every_fired_session_starts_with_the_task_mcp_services(
-    app_state: Any, expected: dict[str, str]
+    execution_target: str, provider_selection: Any, expected: dict[str, str]
 ) -> None:
     conv_store = FakeConversationStore()
-    store = FakeScheduledTaskStore(rows={"task_1": _task(mcp_services=("github", "linear"))})
+    store = FakeScheduledTaskStore(
+        rows={
+            "task_1": _task(mcp_services=("github", "linear"), execution_target=execution_target)
+        }
+    )
 
     async def _launch(conv: Any, task: Any) -> None:
         return None
 
     on_fire = build_on_fire(
-        _deps(store, conversation_store=conv_store, app_state=app_state),
+        _deps(
+            store,
+            conversation_store=conv_store,
+            permission_store=FakePermissionStore(),
+            sandbox_config=_FakeSandboxConfig(mcp_selection=provider_selection),
+        ),
         launch_dispatch=_launch,
     )
     await on_fire(0, "task_1")
@@ -1013,9 +1104,16 @@ async def test_a_task_saved_on_another_users_agent_moves_to_its_owners_copy(
 
 
 @pytest.mark.asyncio
-async def test_existing_owner_is_granted_without_ensure_user() -> None:
+@pytest.mark.parametrize(
+    ("checks_enabled", "owner_generation"), [(True, None), (False, "current")]
+)
+async def test_existing_owner_is_granted_without_ensure_user(
+    monkeypatch: pytest.MonkeyPatch, checks_enabled: bool, owner_generation: str | None
+) -> None:
     """A real owner's row is never (re)created by the fire path."""
     perm = FakePermissionStore(users={"alice"})
+    owner = replace(perm.get_user("alice"), account_generation=owner_generation)
+    monkeypatch.setattr(perm, "get_user", lambda _user_id: owner)
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(rows={"task_1": _task(user_id="alice")})
 
@@ -1026,8 +1124,9 @@ async def test_existing_owner_is_granted_without_ensure_user() -> None:
         _deps(store, permission_store=perm, conversation_store=conv_store),
         launch_dispatch=_launch,
     )
-    await on_fire(0, "task_1")
-    await _drain()
+    with account_checks_scope(checks_enabled):
+        await on_fire(0, "task_1")
+        await _drain()
 
     assert len(conv_store.created) == 1
     assert perm.ensured == []
@@ -1035,32 +1134,73 @@ async def test_existing_owner_is_granted_without_ensure_user() -> None:
 
 
 @pytest.mark.asyncio
-async def test_deleted_owner_disables_task_and_records_failed_run() -> None:
+@pytest.mark.parametrize("dispatch_enabled", [False, True])
+async def test_deleted_owner_disables_task_and_records_failed_run(dispatch_enabled: bool) -> None:
     """A task whose owner no longer exists is disabled, not resurrected."""
     perm = FakePermissionStore(users=set())
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(rows={"task_1": _task(user_id="alice")})
+    scheduler = Mock()
+    app_state = SimpleNamespace(
+        scheduled_task_scheduler=scheduler,
+        scheduled_task_dispatch_enabled=dispatch_enabled,
+    )
     launched: list[Any] = []
 
     async def _launch(conv: Any, task: Any) -> None:
         launched.append(conv)
 
     on_fire = build_on_fire(
-        _deps(store, permission_store=perm, conversation_store=conv_store),
+        _deps(store, permission_store=perm, conversation_store=conv_store, app_state=app_state),
         launch_dispatch=_launch,
     )
-    await on_fire(0, "task_1")
-    await _drain()
+    with account_checks_scope(False):
+        await on_fire(0, "task_1")
+        await _drain()
 
     assert launched == []
     assert conv_store.created == []
     assert perm.ensured == []
     assert perm.grants == []
     assert {"id": "task_1", "state": "deleted"} in store.updates
+    assert perm.deleted_task_grants == ["task_1"]
     assert len(store.runs) == 1
     assert store.runs[0]["status"] == "failed"
     assert store.runs[0]["error_code"] == "owner_deleted"
     assert "alice" in store.runs[0]["error"]
+    if dispatch_enabled:
+        scheduler.remove.assert_not_called()
+    else:
+        scheduler.remove.assert_called_once_with("task_1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("checks_enabled", "task_generation", "owner_generation", "expected_deleted"),
+    [
+        (False, None, "current", False),
+        (True, None, "current", True),
+        (False, "current", "current", False),
+        (True, "current", "current", False),
+        (False, "old", "current", True),
+        (True, "old", "current", True),
+    ],
+)
+async def test_owner_generation_check(
+    monkeypatch: pytest.MonkeyPatch,
+    checks_enabled: bool,
+    task_generation: str | None,
+    owner_generation: str | None,
+    expected_deleted: bool,
+) -> None:
+    perm = FakePermissionStore(users={"alice"})
+    owner = replace(perm.get_user("alice"), account_generation=owner_generation)
+    monkeypatch.setattr(perm, "get_user", lambda _user_id: owner)
+    task = _task(user_id="alice", account_generation=task_generation)
+    deps = _deps(FakeScheduledTaskStore(), permission_store=perm)
+
+    with account_checks_scope(checks_enabled):
+        assert await fire_mod._owner_is_deleted(deps, task) is expected_deleted
 
 
 def _claude_agent_deps(
@@ -1592,6 +1732,7 @@ async def test_sent_prompt_tells_the_agent_no_one_is_watching(
         sessions_routes, "_dispatch_session_event_to_runner", _dispatch_session_event_to_runner
     )
     task = _task(prompt=f"{header}Merge the open Dependabot PRs.\n")
+    monkeypatch.setattr(fire_mod.time, "time", lambda: 1_794_895_414.9)
 
     await fire_mod._send_prompt(
         _deps(FakeScheduledTaskStore(rows={"task_1": task})),
@@ -1604,7 +1745,8 @@ async def test_sent_prompt_tells_the_agent_no_one_is_watching(
         [
             {
                 "type": "input_text",
-                "text": f"Merge the open Dependabot PRs.\n\n{fire_mod.UNATTENDED_RUN_NOTE}",
+                "text": "Merge the open Dependabot PRs.\n\n"
+                + fire_mod.unattended_run_note(1_794_895_414),
             }
         ]
     ]
@@ -2362,9 +2504,13 @@ async def test_managed_fire_saves_prompt_then_launches_fresh_sandbox(
     assert [label[REQUESTED_HOST_ID_LABEL_KEY] for label in labels] == launched_host_ids
     for saved in startup.enqueued:
         assert saved["user_id"] == RESERVED_USER_LOCAL
-        assert saved["event"].data["content"] == [
-            {"type": "input_text", "text": f"do the thing\n\n{fire_mod.UNATTENDED_RUN_NOTE}"}
-        ]
+        [content] = saved["event"].data["content"]
+        assert content["type"] == "input_text"
+        run_time = re.search(r"\(Unix time (\d+)\)", content["text"])
+        assert run_time is not None
+        assert content["text"] == "do the thing\n\n" + fire_mod.unattended_run_note(
+            int(run_time.group(1))
+        )
         assert saved["headers"].get("x-omnigent-background-session-titles") == "on"
     for call in managed_launch.await_args_list:
         assert call.kwargs["sandbox_config"] is config
@@ -2802,6 +2948,28 @@ async def test_public_grant_failure_does_not_cancel_run() -> None:
     assert len(launched) == 1
     assert store.runs and store.runs[0]["status"] == "running"
     assert not any(r.get("error_code") == "owner_grant_failed" for r in store.runs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["grant", "list"])
+async def test_a_failed_share_never_fails_the_run(failure: str) -> None:
+    """Sharing a run with the automation's grantees is best-effort; the run still starts."""
+    perm = FakePermissionStore(
+        task_grantees=["alice@example.com", "bob@example.com"],
+        fail_grant_users={"alice@example.com"},
+    )
+    if failure == "list":
+        perm.list_for_scheduled_task = Mock(side_effect=RuntimeError("list failed"))
+    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+
+    launched = await _fire_once(_deps(store, permission_store=perm))
+
+    [conv] = launched
+    shared = [g[0] for g in perm.grants if g[2] == LEVEL_READ]
+    assert shared == ([] if failure == "list" else ["bob@example.com"])
+    assert [(run["status"], run["conversation_id"]) for run in store.runs] == [
+        ("running", conv.id)
+    ]
 
 
 # ── Continuing one session ───────────────────────────────────────────────────
@@ -3261,6 +3429,29 @@ async def test_continue_starts_a_new_session_when_the_old_one_was_deleted() -> N
 
 
 @pytest.mark.asyncio
+async def test_a_one_time_task_fails_instead_of_replacing_its_deleted_session() -> None:
+    """A reminder belongs to its session: with the session gone, nothing runs elsewhere."""
+    conv_store = _ExistingConversationStore()  # conv_prev is gone
+    reminder = _continuing_task(
+        rrule="FREQ=YEARLY;BYMONTH=11;BYMONTHDAY=12;BYHOUR=23;BYMINUTE=0;BYSECOND=0;COUNT=1"
+    )
+    store = FakeScheduledTaskStore(rows={"task_1": reminder})
+
+    launched = await _fire_once(_deps(store, conversation_store=conv_store))
+
+    assert launched == []
+    assert conv_store.created == []
+    assert store.released == []
+    assert store.adopted == []
+    assert [(run["status"], run.get("error_code")) for run in store.runs] == [
+        ("failed", "continued_session_missing")
+    ]
+    # It has no next run, so the hint for recurring tasks would mislead.
+    assert "next run" not in store.runs[0]["error"]
+    assert "set a new reminder" in store.runs[0]["error"]
+
+
+@pytest.mark.asyncio
 async def test_continue_follows_a_replacement_another_run_recorded_first() -> None:
     """Two runs find the session gone; the loser continues the winner's new session."""
     conv_store = _ExistingConversationStore(_continued_session(id="conv_new"))
@@ -3495,6 +3686,42 @@ async def test_only_a_sandbox_session_whose_launch_failed_unbound_is_replaced(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["joins", "relaunches"])
+async def test_a_run_on_the_tasks_existing_sandbox_keeps_its_providers_mcp_labels(
+    monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """The task's sandbox stays on the provider it was launched on, not today's default."""
+    from omnigent.server.routes import sessions
+
+    joins = path == "joins"
+    task = _sandbox_continue_task(
+        last_run_conversation_id="conv_prev" if joins else None, mcp_services=("slack",)
+    )
+    own = continued_sandbox_host_id(task.id, task.workspace_id)
+    conv_store = _ExistingConversationStore(
+        _continued_session(host_id=own, workspace="/sandbox/ws", labels={})
+    )
+    monkeypatch.setattr(sessions, "_run_managed_launch", AsyncMock())
+    store = FakeScheduledTaskStore(rows={"task_1": task})
+    hosts = FakeHostStore({own: _FakeHost(own, "local", sandbox_provider="older")})
+    # The default moved to "box" after the task's sandbox was launched on "older".
+    deployment = _FakeSandboxConfig(
+        mcp_selection=_ListLabelSelection("box.mcp"),
+        others={"older": _ListLabelSelection("older.mcp")},
+    )
+
+    await _fire_once(
+        _deps(store, conversation_store=conv_store, host_store=hosts, sandbox_config=deployment)
+    )
+
+    [created] = conv_store.created
+    if joins:
+        assert created["host_id"] == own
+    assert created["labels"]["older.mcp"] == '["slack"]'
+    assert "box.mcp" not in created["labels"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("repository", [None, "https://github.com/example/runtime"])
 async def test_a_new_session_joins_the_tasks_sandbox_in_an_earlier_sessions_workspace(
     monkeypatch: pytest.MonkeyPatch,
@@ -3601,6 +3828,227 @@ async def test_continue_records_the_run_once_the_prompt_is_delivered() -> None:
     assert [(run["status"], run["conversation_id"]) for run in store.runs] == [
         ("succeeded", "conv_prev")
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("continued", [False, True])
+async def test_a_legacy_fire_names_its_run_on_the_session_before_sending(continued: bool) -> None:
+    """Legacy timers write the run row only after dispatch, so its ID is chosen first.
+
+    A new session is created with the label; a continued one gets it just before
+    the prompt goes in. Either way it names the row the fire then writes.
+    """
+    from omnigent.stores.conversation_store import (
+        SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
+        SCHEDULED_TASK_RUN_LABEL_KEY,
+    )
+
+    if continued:
+        conv_store: Any = _ExistingConversationStore(_continued_session())
+        store = FakeScheduledTaskStore(rows={"task_1": _continuing_task()})
+    else:
+        conv_store = FakeConversationStore()
+        store = FakeScheduledTaskStore(rows={"task_1": _task()})
+    at_dispatch: list[tuple[str | None, int]] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        at_dispatch.append((conv.labels.get(SCHEDULED_TASK_RUN_LABEL_KEY), len(store.runs)))
+
+    await build_on_fire(_deps(store, conversation_store=conv_store), launch_dispatch=_launch)(
+        0, "task_1"
+    )
+    await _drain()
+
+    [run] = store.runs
+    assert at_dispatch == [(run["run_id"], 0)]
+    if continued:
+        assert conv_store.label_writes["conv_prev"] == {
+            SCHEDULED_TASK_RUN_LABEL_KEY: run["run_id"]
+        }
+    else:
+        assert conv_store.created[0]["labels"][SCHEDULED_TASK_RUN_LABEL_KEY] == run["run_id"]
+        assert (
+            conv_store.created[0]["labels"][SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY] == run["run_id"]
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_continued_session_that_cannot_be_stamped_records_a_failed_run() -> None:
+    """Without the label, the journal entries could land on another run, so nothing is sent."""
+    conv_store = _ExistingConversationStore(_continued_session())
+    store = FakeScheduledTaskStore(rows={"task_1": _continuing_task()})
+
+    def _fail(conversation_id: str, key: str, value: str) -> str | None:
+        raise RuntimeError("database unavailable")
+
+    conv_store.swap_label = _fail  # type: ignore[method-assign]
+    launched: list[str] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv.id)
+
+    await build_on_fire(_deps(store, conversation_store=conv_store), launch_dispatch=_launch)(
+        0, "task_1"
+    )
+    await _drain()
+
+    assert launched == []
+    [run] = store.runs
+    assert (run["status"], run["error_code"]) == ("failed", "launch_failed")
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "before_send",
+        "while_sending",
+        "after_a_later_stamp",
+        "after_an_earlier_stamp",
+        "cancelled_before_send",
+        "cancelled_while_stamping",
+        "two_before_send_first_fails_first",
+        "two_before_send_last_fails_first",
+        "settlement_failure",
+        "abandoned_pending",
+    ],
+)
+async def test_a_continued_dispatch_that_fails_keeps_the_label_honest(
+    monkeypatch: pytest.MonkeyPatch, db_uri: str, failure: str
+) -> None:
+    """A prompt that never went in gives attribution back to the run still working.
+
+    Run A is still working in the session when run B's dispatch fails. If B's
+    prompt was never sent, what A records afterwards must land on A, so the
+    label goes back to A, also when B's fire is cancelled. Once sending began
+    the prompt may have gone in, so B keeps it. Another run C's stamp is never
+    lost: not one written after B's, nor one written after B checked the session
+    but before B's stamp. If both later dispatches fail before sending, A gets
+    the label back regardless of which failure settles first.
+    """
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    real = SqlAlchemyConversationStore(db_uri)
+    session_id = real.create_conversation().id
+    run_a, run_c = "a" * 32, "c" * 32
+    real.set_labels(session_id, {SCHEDULED_TASK_RUN_LABEL_KEY: run_a})
+    stamp_entered, stamp_released = threading.Event(), threading.Event()
+
+    class _Conversations(_ExistingConversationStore):
+        """The continued session's checks read the fake; its labels live in the database."""
+
+        def get_conversation(self, conversation_id: str) -> _FakeConversation | None:
+            conv = super().get_conversation(conversation_id)
+            if conv is not None:
+                conv.labels = dict(real.get_conversation(conversation_id).labels)
+            return conv
+
+        def update_scheduled_run_label(
+            self, conversation_id: str, run_id: str, *, action: Any
+        ) -> None:
+            if action != "begin" and failure in {"settlement_failure", "abandoned_pending"}:
+                raise RuntimeError("settlement storage unavailable")
+            if action == "begin":
+                if failure == "after_an_earlier_stamp":
+                    real.set_labels(conversation_id, {SCHEDULED_TASK_RUN_LABEL_KEY: run_c})
+                elif failure == "cancelled_while_stamping":
+                    stamp_entered.set()
+                    assert stamp_released.wait(10)
+            SqlAlchemyConversationStore(db_uri).update_scheduled_run_label(
+                conversation_id, run_id, action=action
+            )
+
+    overlapping = failure.startswith("two_before_send")
+    entered = {task_id: asyncio.Event() for task_id in ("task_1", "task_2")}
+    released = {task_id: asyncio.Event() for task_id in entered}
+    tasks = {"task_1": _task(session_mode="continue", session_id=session_id)}
+    if overlapping:
+        tasks["task_2"] = _task(id="task_2", session_mode="continue", session_id=session_id)
+    store = FakeScheduledTaskStore(rows=tasks)
+    sent: list[str] = []
+
+    async def _runner_start(conv_id: str, *args: Any) -> None:
+        if failure == "after_a_later_stamp":
+            real.set_labels(conv_id, {SCHEDULED_TASK_RUN_LABEL_KEY: run_c})
+        if failure == "cancelled_before_send":
+            raise asyncio.CancelledError
+        if failure != "while_sending":
+            raise RuntimeError("runner never came up")
+
+    async def _runner_send(conv_id: str, *args: Any, **kwargs: Any) -> Any:
+        sent.append(conv_id)
+        raise RuntimeError("the runner dropped the connection")
+
+    import omnigent.server.routes.sessions as sessions_routes
+
+    monkeypatch.setattr(sessions_routes, "_ensure_runner_session_initialized", _runner_start)
+    monkeypatch.setattr(sessions_routes, "_dispatch_session_event_to_runner", _runner_send)
+    deps = _deps(store, conversation_store=_Conversations(_continued_session(id=session_id)))
+
+    async def _launch(conv: Any, task: Any) -> None:
+        if overlapping:
+            entered[task.id].set()
+            await released[task.id].wait()
+        await fire_mod._send_prompt(deps, conv, object(), task)
+
+    on_fire = build_on_fire(deps, launch_dispatch=_launch)
+    await on_fire(0, "task_1")
+    if overlapping:
+        await asyncio.wait_for(entered["task_1"].wait(), 10)
+        [first_fire] = fire_mod._PENDING_FIRES
+        await on_fire(0, "task_2")
+        await asyncio.wait_for(entered["task_2"].wait(), 10)
+        [second_fire] = fire_mod._PENDING_FIRES - {first_fire}
+        attempts = [("task_1", first_fire), ("task_2", second_fire)]
+        if failure == "two_before_send_last_fails_first":
+            attempts.reverse()
+        for task_id, attempt in attempts:
+            released[task_id].set()
+            await asyncio.wait_for(asyncio.shield(attempt), 10)
+    if failure == "cancelled_while_stamping":
+        assert await asyncio.to_thread(stamp_entered.wait, 10)
+        for fire in fire_mod._PENDING_FIRES:
+            fire.cancel()
+        await asyncio.sleep(0)
+        stamp_released.set()
+    await _drain()
+
+    run_b = store.runs[0]["run_id"] if store.runs else None
+    if failure.startswith("cancelled"):
+        assert store.runs == []
+    else:
+        assert [(run["status"], run["error_code"]) for run in store.runs] == [
+            ("failed", "launch_failed")
+        ] * (2 if overlapping else 1)
+    assert sent == ([session_id] if failure == "while_sending" else [])
+    if failure in {"settlement_failure", "abandoned_pending"}:
+        from omnigent.server.scheduled.run_reconciler import STALE_RUN_MAX_AGE_SECONDS
+        from omnigent.stores.conversation_store import SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX
+
+        assert run_b is not None
+        fresh = SqlAlchemyConversationStore(db_uri)
+        assert fresh.get_conversation(session_id).labels[SCHEDULED_TASK_RUN_LABEL_KEY] == run_b
+        assert not fresh.clear_scheduled_run_label(session_id, run_a, pending_run_finished=True)
+        assert not fresh.clear_scheduled_run_label(session_id, run_b)
+        if failure == "abandoned_pending":
+            later = int(time.time()) + STALE_RUN_MAX_AGE_SECONDS + 1
+            monkeypatch.setattr(
+                "omnigent.stores.conversation_store.sqlalchemy_store.now_epoch", lambda: later
+            )
+        assert fresh.clear_scheduled_run_label(
+            session_id, run_b, pending_run_finished=failure == "settlement_failure"
+        )
+        fresh.update_scheduled_run_label(session_id, run_b, action="rollback")
+        labels = fresh.get_conversation(session_id).labels
+        assert SCHEDULED_TASK_RUN_LABEL_KEY not in labels
+        assert SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX + run_b not in labels
+    else:
+        label = real.get_conversation(session_id).labels[SCHEDULED_TASK_RUN_LABEL_KEY]
+        assert label == {
+            "while_sending": run_b,
+            "after_a_later_stamp": run_c,
+            "after_an_earlier_stamp": run_c,
+        }.get(failure, run_a)
 
 
 @pytest.mark.asyncio
@@ -4218,6 +4666,34 @@ def test_session_approval_skipping_mode(
     assert fire_mod.session_approval_skipping_mode(conv) == expected
 
 
+def test_unattended_run_note_opens_with_the_run_time_in_utc() -> None:
+    note = fire_mod.unattended_run_note(1_794_895_414.9)
+
+    assert note == fire_mod.UNATTENDED_RUN_NOTE.replace(
+        "<omnigent-automation-context>\n",
+        "<omnigent-automation-context>\nRun time: 2026-11-17T06:03:34Z (Unix time 1794895414).\n",
+    )
+
+
+def test_new_session_run_titles_carry_the_fire_time_in_the_task_timezone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 2026-11-13 17:05 UTC.
+    monkeypatch.setattr(fire_mod.time, "time", lambda: 1_794_589_500.0)
+
+    assert fire_mod._scheduled_session_title(_task(name="NHPC rollout check")) == (
+        "NHPC rollout check (2026-11-13 17:05)"
+    )
+    assert fire_mod._scheduled_session_title(
+        _task(name="NHPC rollout check", timezone="America/Los_Angeles")
+    ) == ("NHPC rollout check (2026-11-13 09:05)")
+    assert fire_mod._scheduled_session_title(_task(timezone="Not/AZone")) == (
+        "nightly (2026-11-13 17:05)"
+    )
+    # A continued session spans many runs, so one run's time would mislabel it.
+    assert fire_mod._scheduled_session_title(_task(session_mode="continue")) == "nightly"
+
+
 # ── Runs that start from a copy of a session ───────────────────────────────
 
 
@@ -4244,13 +4720,12 @@ async def test_a_run_starts_from_a_copy_of_the_source_session() -> None:
 
     assert conv_store.created == []
     (fork,) = conv_store.forked
-    assert (fork["source_id"], fork["agent_id"], fork["title"]) == (
-        "conv_source",
-        "ag_1",
-        "nightly",
-    )
+    assert (fork["source_id"], fork["agent_id"]) == ("conv_source", "ag_1")
+    assert fork["title"].startswith("nightly (")
     # The run rebuilds its native transcript from its own copy, never another session's file.
     assert fork["resume_source_native_session"] is False
+    # It plans its own work: the source's journal stays behind.
+    assert fork["copy_journal"] is False
     assert {
         FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
         FORK_SOURCE_LABEL_KEY,
@@ -4300,7 +4775,8 @@ async def test_a_copied_run_uses_the_task_mcp_services_instead_of_the_source(
 class _ListLabelSelection:
     """A deployment that keeps the whole selection, even an empty one, in one label."""
 
-    key = "deployment.mcp_services"
+    def __init__(self, key: str = "deployment.mcp_services") -> None:
+        self.key = key
 
     async def validate(self, *args: Any, **kwargs: Any) -> tuple[str, ...]:
         raise AssertionError("firing does not revalidate")
@@ -4314,20 +4790,31 @@ class _ListLabelSelection:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("task_services", "written"),
-    [(("github",), '["github"]'), ((), None)],
-    ids=["task-selection-replaces", "no-task-selection-keeps-the-copy"],
+    ("source_labels", "task_services", "written"),
+    [
+        ({"deployment.mcp_services": '["slack"]'}, ("github",), '["github"]'),
+        ({"deployment.mcp_services": '["slack"]'}, (), None),
+        # A registry selection the task's provider can't read is replaced too.
+        ({"omnigent.mcp_service.slack": "1"}, ("github",), '["github"]'),
+    ],
+    ids=["task-selection-replaces", "no-task-selection-keeps-the-copy", "replaces-a-registry-one"],
 )
-async def test_a_copied_run_keeps_a_one_label_selection_unless_the_task_has_one(
-    task_services: tuple[str, ...], written: str | None
+async def test_a_copied_run_keeps_its_source_selection_unless_the_task_has_one(
+    source_labels: dict[str, str], task_services: tuple[str, ...], written: str | None
 ) -> None:
     selection = _ListLabelSelection()
     conv_store = FakeConversationStore()
     conv_store.get_conversation = lambda conversation_id: _FakeConversation(  # type: ignore[method-assign]
-        id=conversation_id, agent_id="ag_1", labels={selection.key: '["slack"]'}
+        id=conversation_id, agent_id="ag_1", labels=source_labels
     )
     store = FakeScheduledTaskStore(
-        rows={"task_1": _task(source_session_id="conv_source", mcp_services=task_services)}
+        rows={
+            "task_1": _task(
+                source_session_id="conv_source",
+                mcp_services=task_services,
+                execution_target="managed_sandbox",
+            )
+        }
     )
 
     async def _launch(conv: Any, task: Any) -> None:
@@ -4336,14 +4823,15 @@ async def test_a_copied_run_keeps_a_one_label_selection_unless_the_task_has_one(
     deps = _deps(
         store,
         conversation_store=conv_store,
-        app_state=SimpleNamespace(session_mcp_selection=selection),
+        permission_store=FakePermissionStore(),
+        sandbox_config=_FakeSandboxConfig(mcp_selection=selection),
     )
     await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
     await _drain()
 
     (fork,) = conv_store.forked
-    # The copy's own label survives unless the task writes its selection over it.
-    assert (selection.key in fork["dropped_label_keys"]) == (written is not None)
+    # The copy's own selection survives unless the task writes its selection over it.
+    assert (set(source_labels) <= fork["dropped_label_keys"]) == (written is not None)
     assert fork["extra_labels"].get(selection.key) == written
 
 

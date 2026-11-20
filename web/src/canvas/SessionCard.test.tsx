@@ -5,6 +5,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import { resetReadStateForTests, seedReadState } from "@/hooks/useUnseenConversations";
 import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
+import { MUTED_LABEL_KEY } from "@/lib/sessionMute";
 import { SessionCard, type SessionCardData, type SessionCardNode } from "./SessionCard";
 
 const FORGE_DISPLAY = {
@@ -73,15 +74,22 @@ describe("SessionCard", () => {
     expect(screen.getAllByText("Needs response").length).toBeGreaterThan(0);
   });
 
-  it("shows the unread dot for finished output the user has not seen", () => {
-    // The list seeds the viewer's last-seen baseline; a later updated_at reads as unseen.
-    seedReadState([{ id: "conv_1", viewer_last_seen: 50, updated_at: 100 }]);
-    const { card } = renderCard({
-      conversation: conversation({ status: "idle", updated_at: 100 }),
-    });
-    expect(card).toHaveAttribute("data-state", "unseen");
-    expect(screen.getByText("New messages")).toBeInTheDocument();
-  });
+  it.each([false, true])(
+    "shows the unread dot for finished output the user has not seen, muted=%s",
+    (muted) => {
+      // The list seeds the viewer's last-seen baseline; a later updated_at reads as unseen.
+      seedReadState([{ id: "conv_1", viewer_last_seen: 50, updated_at: 100 }]);
+      const { card } = renderCard({
+        conversation: conversation({
+          status: "idle",
+          updated_at: 100,
+          labels: muted ? { [MUTED_LABEL_KEY]: "1" } : {},
+        }),
+      });
+      expect(card).toHaveAttribute("data-state", muted ? "idle" : "unseen");
+      expect(screen.queryByText("New messages") !== null).toBe(!muted);
+    },
+  );
 
   it("falls back to idle and failed labels", () => {
     renderCard({ conversation: conversation({ status: "idle" }) });

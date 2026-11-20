@@ -15,6 +15,7 @@ from omnigent.runner.git_providers import (
     ProviderCapabilities,
     PullRequestAuth,
     PullRequestFacet,
+    PullRequestStatus,
     ReviewerRef,
     ShellPrOp,
     ShellSegment,
@@ -153,6 +154,14 @@ class GitHubPullRequests:
         from omnigent.runner import github_resource
 
         return github_resource._pr_title_before(root, reference, deadline)
+
+    def pr_status(
+        self, root: str, reference: PullRequestRef, deadline: float
+    ) -> tuple[PullRequestStatus | None, bool]:
+        """Look up one PR's title, state and draft flag before ``deadline``."""
+        from omnigent.runner import github_resource
+
+        return github_resource._pr_status_before(root, reference, deadline)
 
     def verify_accessible(self, root: str, reference: PullRequestRef) -> None:
         """Raise unless ``gh`` on the host can read the PR."""

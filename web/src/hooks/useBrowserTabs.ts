@@ -7,6 +7,18 @@ import { fetchSessionHostId } from "@/lib/fetchSessionHostId";
 import { type BrowserHostOptions, navigationHostOptions } from "@/lib/nativeBridge";
 import { onInAppLinkOpen } from "@/lib/openLinkInApp";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import {
+  startRailClose,
+  useBrowserTabsChanged,
+} from "@/components/BrowserPane/agentTools/railClose";
+import {
+  agentTabAmong,
+  changeTabsNow,
+  changeTabsNowSaved,
+  countNavigation,
+  handTabsBackTo,
+  mainBrowserTabs,
+} from "@/components/BrowserPane/agentTools/tabStore";
 
 export { AGENT_BROWSER_TAB_ID, browserViewId, browserViewOwnerId } from "@/lib/browserTabs";
 
@@ -24,6 +36,7 @@ interface BrowserPage {
 }
 
 interface BrowserTabsBridge {
+  browserClose?: (viewId: string) => Promise<{ ok: boolean }>;
   browserOpenOrNavigate?: (
     viewId: string,
     url: string,
@@ -65,11 +78,23 @@ function noteBrowserSelection(conversationId: string): number {
   return count;
 }
 
-function agentNavigationEpoch(conversationId: string): number {
+export function agentNavigationEpoch(conversationId: string): number {
   return agentNavigationEpochs.get(conversationId) ?? 0;
 }
 
-function readBrowserTabsState(conversationId: string): BrowserTabsState {
+export function saveBrowserTabsState(conversationId: string, next: BrowserTabsState): void {
+  writeSessionWorkspaceState(conversationId, {
+    openBrowsers: next.tabs,
+    selectedBrowserId: next.selected,
+  });
+}
+// Tabs main held while the agent browser tools were on come back here when they go off.
+handTabsBackTo(saveBrowserTabsState);
+
+export function readBrowserTabsState(conversationId: string): BrowserTabsState {
+  // While the agent browser tools are on, the desktop app's main process keeps the tabs.
+  const inMain = mainBrowserTabs(conversationId);
+  if (inMain) return inMain;
   const saved = readSessionWorkspaceState(conversationId);
   const tabs = saved.openBrowsers ?? [];
   return {
@@ -83,34 +108,47 @@ export function openBrowserTab(conversationId: string, tabId: string): BrowserTa
   if (tabId === AGENT_BROWSER_TAB_ID) {
     agentNavigationEpochs.set(conversationId, agentNavigationEpoch(conversationId) + 1);
   }
-  const current = readBrowserTabsState(conversationId);
-  const next = {
+  const withTab = (current: BrowserTabsState): BrowserTabsState => ({
     tabs: current.tabs.includes(tabId) ? current.tabs : [...current.tabs, tabId],
     selected: tabId,
-  };
-  writeSessionWorkspaceState(conversationId, {
-    openBrowsers: next.tabs,
-    selectedBrowserId: next.selected,
   });
+  if (mainBrowserTabs(conversationId)) {
+    // Counted per tab, so a rail close started before this navigation keeps the tab.
+    return changeTabsNow(conversationId, (current) => countNavigation(withTab(current), tabId));
+  }
+  const next = withTab(readBrowserTabsState(conversationId));
+  saveBrowserTabsState(conversationId, next);
   return next;
 }
 
-/** Persist the agent browser as a selected soft tab for a session. */
-export function openAgentBrowserTab(conversationId: string): BrowserTabsState {
-  return openBrowserTab(conversationId, AGENT_BROWSER_TAB_ID);
+/** The tab agents act on: the reserved agent tab unless an agent picked another one. */
+export function agentBrowserTabId(conversationId: string): string {
+  return agentTabAmong(conversationId, readBrowserTabsState(conversationId), AGENT_BROWSER_TAB_ID);
+}
+
+/** Persist the agent browser (or the agent's `tabId`) as a selected soft tab for a session. */
+export function openAgentBrowserTab(
+  conversationId: string,
+  tabId: string = AGENT_BROWSER_TAB_ID,
+): BrowserTabsState {
+  return openBrowserTab(conversationId, tabId);
 }
 
 function updateBrowserTabs(
   conversationId: string,
   mutate: (current: BrowserTabsState) => BrowserTabsState,
-): void {
-  const next = mutate(readBrowserTabsState(conversationId));
-  // Saving is best effort; mounted rails take the new state either way.
-  writeSessionWorkspaceState(conversationId, {
-    openBrowsers: next.tabs,
-    selectedBrowserId: next.selected,
-  });
+): Promise<void> {
+  let next: BrowserTabsState;
+  let saved: Promise<void> = Promise.resolve();
+  if (mainBrowserTabs(conversationId)) {
+    ({ shown: next, saved } = changeTabsNowSaved(conversationId, mutate));
+  } else {
+    next = mutate(readBrowserTabsState(conversationId));
+    // Saving is best effort; mounted rails take the new state either way.
+    saveBrowserTabsState(conversationId, next);
+  }
   for (const listener of browserTabsListeners) listener(conversationId, next);
+  return saved;
 }
 
 /**
@@ -143,10 +181,18 @@ async function openBrowserTabAt(
     request > (shownReopens.get(conversationId) ?? 0) &&
     mayShow();
   if (latest) shownReopens.set(conversationId, request);
-  updateBrowserTabs(conversationId, (current) => ({
-    tabs: [...current.tabs, tabId],
-    selected: latest ? tabId : current.selected,
-  }));
+  try {
+    await updateBrowserTabs(conversationId, (current) => ({
+      tabs: [...current.tabs, tabId],
+      selected: latest ? tabId : current.selected,
+    }));
+  } catch (error) {
+    // The tab never reached the record, so its page would be left running unseen.
+    void browserTabsBridge()
+      ?.browserClose?.(browserViewId(conversationId, tabId))
+      .catch(() => undefined);
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
   return { ok: true };
 }
 
@@ -258,8 +304,11 @@ export function useBrowserTabs(conversationId: string) {
     browserPageLabel(pages[browserViewId(conversationId, tabId)], `Browser ${index + 1}`);
 
   const update = useCallback(
-    (mutate: (current: BrowserTabsState) => BrowserTabsState) =>
-      updateBrowserTabs(conversationId, mutate),
+    (mutate: (current: BrowserTabsState) => BrowserTabsState) => {
+      updateBrowserTabs(conversationId, mutate).catch((error: unknown) =>
+        console.warn("[browserTabs] couldn't save the tabs:", error),
+      );
+    },
     [conversationId],
   );
 
@@ -277,7 +326,7 @@ export function useBrowserTabs(conversationId: string) {
     };
     const unsubscribeAction = onBrowserActionRequest((event, sourceConversationId) => {
       if (sourceConversationId === conversationId && event.action === "navigate") {
-        selectBrowser(sourceConversationId, AGENT_BROWSER_TAB_ID);
+        selectBrowser(sourceConversationId, agentBrowserTabId(conversationId));
       }
     });
     const unsubscribeLink = onInAppLinkOpen(selectBrowser);
@@ -286,6 +335,9 @@ export function useBrowserTabs(conversationId: string) {
       unsubscribeLink();
     };
   }, [conversationId]);
+
+  // Re-read when an agent changes this session's tabs (browser_tabs), here or in another window.
+  useBrowserTabsChanged(conversationId, () => setState(readBrowserTabsState(conversationId)));
 
   /** Open and select a tab, loading `url` into its view before the pane mounts; returns its id. */
   const add = (url?: string): string => {
@@ -332,6 +384,7 @@ export function useBrowserTabs(conversationId: string) {
     { beforeClose }: { beforeClose?: () => Promise<void> } = {},
   ): Promise<BrowserTabCloseResult> => {
     const navigationEpoch = agentNavigationEpoch(conversationId);
+    const railClose = startRailClose(conversationId, tabId);
     // A fresh agent navigation supersedes an older close of the reserved agent view.
     const superseded = () =>
       tabId === AGENT_BROWSER_TAB_ID && agentNavigationEpoch(conversationId) !== navigationEpoch;
@@ -340,17 +393,29 @@ export function useBrowserTabs(conversationId: string) {
     const desktop = (
       window as unknown as {
         omnigentDesktop?: {
-          browserClose?: (viewId: string) => Promise<{ ok: boolean }>;
+          browserClose?: (
+            viewId: string,
+            reason?: string,
+            opts?: { expectedNavs?: { tabId: string; count: number } },
+          ) => Promise<{ ok: boolean; superseded?: boolean }>;
         };
       }
     ).omnigentDesktop;
-    const result = await desktop
-      ?.browserClose?.(browserViewId(conversationId, tabId))
-      .catch(() => ({ ok: false }));
+    // Main keeps the page if the tab was navigated since the close began.
+    const { expectedNavs } = railClose;
+    const viewId = browserViewId(conversationId, tabId);
+    const result = await (
+      expectedNavs
+        ? desktop?.browserClose?.(viewId, undefined, { expectedNavs })
+        : desktop?.browserClose?.(viewId)
+    )?.catch(() => ({ ok: false }));
+    if (result && "superseded" in result && result.superseded) return "kept";
     if (result && !result.ok) return "failed";
     // The view closed, but a navigation since recreated the tab: keep it selected.
     if (superseded()) return "closed";
     update((previous) => {
+      // An agent navigated this tab while main closed its page: keep it.
+      if (railClose.superseded(previous)) return previous;
       const index = previous.tabs.indexOf(tabId);
       if (index === -1) return previous;
       const tabs = previous.tabs.filter((id) => id !== tabId);
