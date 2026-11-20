@@ -2,11 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { mainBrowserTabs } from "@/components/BrowserPane/agentTools/tabStore";
 import { readSavedBrowserPage, saveBrowserPage, startSavingBrowserPages } from "./browserTabPages";
 import { AGENT_BROWSER_TAB_ID, browserViewId, parseBrowserViewId } from "./browserTabs";
-import {
-  readSessionWorkspaceState,
-  SESSION_WORKSPACE_STATE_KEY,
-  writeSessionWorkspaceState,
-} from "./sessionWorkspaceState";
+import { readSessionWorkspaceState, writeSessionWorkspaceState } from "./sessionWorkspaceState";
 
 const identity = vi.hoisted(() => ({ userId: "user-a" as string | null }));
 vi.mock("./identity", () => ({ getCurrentUserId: () => identity.userId }));
@@ -105,6 +101,13 @@ describe("saved browser pages", () => {
       "https://files.example/report.pdf?X-Amz-Signature=abc",
       "https://app.example/login?API_KEY=abc",
       "https://user:secret@app.example/",
+      "https://app.example/#/callback?code=abc&state=xyz",
+      "https://app.example/#/settings?Key=abc",
+      "https://app.example/#route=home?sig=abc",
+      "https://app.example/return?auth_code=abc",
+      "https://app.example/return?accessCode=abc",
+      "https://app.example/return?oauth_verifier=abc",
+      "https://app.example/login?pwd=abc",
     ]) {
       saveBrowserPage(userTab, url);
     }
@@ -144,31 +147,6 @@ describe("saved browser pages", () => {
 
     expect(readSessionWorkspaceState("conv_a").browserPages).toEqual({
       "tab-2": { url: "https://other.example/", owner: "user-a" },
-    });
-  });
-
-  it("drops stored pages that cannot be reopened", () => {
-    localStorage.setItem(
-      SESSION_WORKSPACE_STATE_KEY,
-      JSON.stringify([
-        {
-          id: "conv_a",
-          state: {
-            openBrowsers: ["tab-1", "tab-2", "tab-3", "tab-4", "tab-5"],
-            browserPages: {
-              "tab-1": { url: "https://docs.example/", title: 7, owner: "user-a" },
-              "tab-2": { url: "javascript:alert(1)", owner: "user-a" },
-              "tab-3": "https://bare.example/",
-              "tab-4": { url: "https://unowned.example/" },
-              "tab-5": { url: "https://app.example/?token=abc", owner: "user-a" },
-            },
-          },
-        },
-      ]),
-    );
-
-    expect(readSessionWorkspaceState("conv_a").browserPages).toEqual({
-      "tab-1": { url: "https://docs.example/", owner: "user-a" },
     });
   });
 

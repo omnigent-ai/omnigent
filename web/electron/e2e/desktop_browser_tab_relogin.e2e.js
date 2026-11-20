@@ -12,7 +12,11 @@ const os = require("node:os");
 const path = require("node:path");
 
 const { desktopDepsAvailable, spawnServer, saveRecording } = require("./desktopHarness");
-const { launchThisMachineDesktop } = require("./desktopBrowserTabHarness");
+const {
+  launchThisMachineDesktop,
+  openSessionBrowserTab,
+  openSessionRail,
+} = require("./desktopBrowserTabHarness");
 const { startFakeOidcIdp, oidcServerEnv } = require("./fixtures/fakeOidcIdp");
 
 const deps = desktopDepsAvailable();
@@ -64,13 +68,6 @@ async function signIn(window, serverUrl) {
   await window.getByText("What should we build?").waitFor({ state: "visible", timeout: 30_000 });
 }
 
-async function openSession(window, serverUrl, sessionId) {
-  await window.goto(`${serverUrl}/c/${sessionId}`);
-  await window.getByRole("button", { name: /^(Expand|Collapse) right panel$/ }).waitFor();
-  const expand = window.getByRole("button", { name: "Expand right panel", exact: true });
-  if (await expand.isVisible()) await expand.click();
-}
-
 it(
   "reopens a session's Browser tab page after signing out and back in",
   { skip: deps.ok ? false : `missing deps: ${deps.missing.join(", ")}`, timeout: 180_000 },
@@ -110,6 +107,7 @@ it(
       const sessionId = await window.evaluate(async () => {
         const agents = await (await fetch("/v1/agents?limit=100")).json();
         const agent = agents.data.find((candidate) => candidate.name === "hello_world");
+        if (!agent) throw new Error("the server has no hello_world agent");
         const response = await fetch("/v1/sessions", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -120,9 +118,7 @@ it(
       });
       assert.equal(typeof sessionId, "string");
       backend.sessionId = sessionId;
-      await openSession(window, server.serverUrl, sessionId);
-      await window.getByRole("button", { name: "Open new", exact: true }).click();
-      await window.getByRole("menuitem", { name: "Browser", exact: true }).click();
+      await openSessionBrowserTab(window, server.serverUrl, sessionId);
       const bar = window.getByRole("textbox", { name: "Address bar" });
       await bar.fill(pageUrl);
       await bar.press("Enter");
@@ -145,7 +141,7 @@ it(
 
       // 3. Sign back in and return to the session: the tab reopens its page.
       await signIn(window, server.serverUrl);
-      await openSession(window, server.serverUrl, sessionId);
+      await openSessionRail(window, server.serverUrl, sessionId);
       await waitFor(
         async () => (await bar.inputValue()) === pageUrl,
         "the address bar did not show the tab's page after signing back in",

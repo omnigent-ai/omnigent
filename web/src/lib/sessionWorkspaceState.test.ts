@@ -234,5 +234,25 @@ describe("sessionWorkspaceState", () => {
     expect(readSessionWorkspaceState("conv_c")).toEqual({
       openSubagentTabs: ["subagent:a", "subagent:b"],
     });
+
+    // Saved browser pages keep only owned http(s) addresses without a credential.
+    localStorage.setItem(
+      STORAGE_KEY,
+      `[{"id":"conv_d","state":{"browserPages":{
+        "tab-1":{"url":"https://docs.example/#/guide?section=2","title":7,"owner":"user-a"},
+        "tab-2":{"url":"javascript:alert(1)","owner":"user-a"},
+        "tab-3":"https://bare.example/",
+        "tab-4":{"url":"https://unowned.example/"},
+        "tab-5":{"url":"https://app.example/?token=abc","owner":"user-a"},
+        "tab-6":{"url":"https://app.example/#/callback?code=abc","owner":"user-a"},
+        "__proto__":{"url":"https://proto.example/","owner":"user-a"}
+      }}}]`,
+    );
+    const pages = readSessionWorkspaceState("conv_d").browserPages;
+    expect(Object.entries(pages ?? {})).toEqual([
+      ["tab-1", { url: "https://docs.example/#/guide?section=2", owner: "user-a" }],
+      ["__proto__", { url: "https://proto.example/", owner: "user-a" }],
+    ]);
+    expect(pages?.url).toBeUndefined();
   });
 });

@@ -145,6 +145,44 @@ describe("browser IPC pending navigation lifecycle", () => {
       assert.equal(recoveries, action === "recovery teardown" ? 1 : 0);
     });
   }
+
+  it("lets a tab's restore yield to an open still being checked or a page it has", async () => {
+    const { createBrowserViewRegistry } = require("../src/browserViewRegistry");
+    const registry = createBrowserViewRegistry();
+    const agentCheck = Promise.withResolvers();
+    const opened = [];
+    registry.checkAgentNavigation = (_id, url) =>
+      url === "https://agent.example/" ? agentCheck.promise : Promise.resolve({ ok: true });
+    registry.openOrNavigate = (_id, url) => {
+      opened.push(url);
+      return { ok: true, created: false };
+    };
+    const ipcMain = makeIpcMain();
+    registerBrowserIpc({
+      ipcMain,
+      isPinnedOriginSender: () => true,
+      getRegistryForEvent: () => registry,
+    });
+    const navigate = (url, opts) =>
+      ipcMain.invoke(
+        "omnigent:browser-open-or-navigate",
+        {},
+        { conversationId: "conv", url, opts },
+      );
+    const agentOpen = navigate("https://agent.example/", { agent: true });
+    const restore = await navigate("https://saved.example/", { restore: true });
+    assert.equal(restore.ok, false);
+    assert.equal(restore.superseded, true);
+    agentCheck.resolve({ ok: true });
+    assert.equal((await agentOpen).ok, true);
+    assert.deepEqual(opened, ["https://agent.example/"], "the agent's page wins");
+
+    assert.equal((await navigate("https://saved.example/", { restore: true })).ok, true);
+    registry.get = () => ({ view: {} });
+    const overPage = await navigate("https://saved.example/", { restore: true });
+    assert.equal(overPage.superseded, true);
+    assert.deepEqual(opened, ["https://agent.example/", "https://saved.example/"]);
+  });
 });
 
 describe("browser IPC Arca context", () => {
