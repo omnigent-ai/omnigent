@@ -865,7 +865,11 @@ async def test_create_app_metrics_middleware_counts_http_requests(
     """
     from omnigent.server import app as server_app
 
-    before = app.state.server_metrics.snapshot()
+    metrics = app.state.server_metrics
+    inputs = _FakeMetricInputs(wall=metrics._clock())
+    # Rolling windows measure the metrics clock, independent of HTTP scheduling.
+    monkeypatch.setattr(metrics, "_clock", inputs.clock)
+    before = metrics.snapshot()
 
     access_log_durations: list[float | None] = []
 
@@ -895,7 +899,7 @@ async def test_create_app_metrics_middleware_counts_http_requests(
         },
     )
 
-    after = app.state.server_metrics.snapshot()
+    after = metrics.snapshot()
     assert resp.status_code == 200
     assert after.total_started == before.total_started + 1
     assert after.total_completed == before.total_completed + 1
