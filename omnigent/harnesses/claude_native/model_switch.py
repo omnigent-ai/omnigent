@@ -66,6 +66,9 @@ class ClaudeLegacyModelSwitchResult:
     picker_value: str
     pane: ClaudeLegacyModelPane | None = None
     already_selected: bool = False
+    confirmation_model: str | None = None
+    confirmation_label: str | None = None
+    confirmation_pending: bool = False
 
 
 def supports_session_only_model_switch(version: object) -> bool:

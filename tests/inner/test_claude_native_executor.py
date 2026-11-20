@@ -1980,23 +1980,6 @@ async def test_run_turn_holds_model_selection_until_prompt_is_answered(
     assert composer.submitted == ["/model", "/status"]
     assert composer.status_queries == 1
     assert composer.confirmations == int(cache_cost)
-    assert [args[-1] for args in composer.sends] == [
-        "/model",
-        "Enter",
-        "Down",
-        "s",
-        *(["Enter"] if cache_cost else []),
-        "/status",
-        "Enter",
-        "Escape",
-    ]
-    assert next(args for args in composer.sends if args[-1] == "s") == (
-        "send-keys",
-        "-l",
-        "-t",
-        "claude:0.0",
-        "s",
-    )
 
 
 @pytest.mark.asyncio

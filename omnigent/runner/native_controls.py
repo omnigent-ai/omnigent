@@ -1507,6 +1507,7 @@ def build_native_controls(
         if (
             isinstance(receipt, ClaudeLegacyModelSwitchResult)
             and not receipt.already_selected
+            and receipt.confirmation_pending
             and receipt.pane is not None
             and _claude_model_requests.get(conv_id) is deadline
         ):

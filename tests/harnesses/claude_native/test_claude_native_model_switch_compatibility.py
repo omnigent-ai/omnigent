@@ -7,6 +7,7 @@ import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
@@ -412,3 +413,87 @@ def test_late_legacy_confirmation_rechecks_the_session_after_capture(
     with pytest.raises(bridge.ClaudeModelSwitchRefused, match="session changed"):
         bridge.confirm_legacy_model_dialog(bridge_dir, receipt=receipt)
     assert composer.sends == before
+
+
+@pytest.mark.parametrize("phase", ["completed", "queued", "catalog-replaced", "legacy-metadata"])
+def test_legacy_alias_watch_never_confirms_a_later_different_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    queued = phase in {"queued", "catalog-replaced"}
+    composer = _SessionModelComposer(
+        busy=queued,
+        legacy_dialog_delay_s=bridge._CONFIRM_DIALOG_TIMEOUT_S + 5 if queued else None,
+    )
+    composer.version = "2.1.322"
+    composer.options[1] = "opus"
+    composer.resolved_models["opus"] = "claude-opus-4-8"
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    config_path = bridge_dir / "bridge.json"
+    if phase == "legacy-metadata":
+        config = json.loads(config_path.read_text())
+        config.pop("model_picker_options")
+        config_path.write_text(json.dumps(config))
+    composer.install(monkeypatch)
+
+    receipt = bridge.inject_model_command(bridge_dir, model="opus")
+    assert isinstance(receipt, bridge.ClaudeLegacyModelSwitchResult)
+    if not queued:
+        assert composer.model == "claude-opus-4-8"
+    raw_path = bridge_dir / bridge.CONTEXT_RAW_FILE
+    raw = json.loads(raw_path.read_text())
+    raw["model"] = {"id": composer.model}
+    raw_path.write_text(json.dumps(raw))
+    foreign_label = "Sonnet 5.5"
+    if phase == "catalog-replaced":
+        config = json.loads(config_path.read_text())
+        config["model_picker_options"][1].update(
+            model="private-other-choice", display_name="Different Model"
+        )
+        config_path.write_text(json.dumps(config))
+        foreign_label = "Different Model"
+    composer._legacy_pending = None
+    composer.overlay = "cache-cost"
+    composer.cache_cost_label = foreign_label
+    composer.highlight = 0
+    before = list(composer.sends)
+    original_model, original_default = composer.model, composer.saved_default
+
+    outcome = bridge.confirm_legacy_model_dialog(bridge_dir, receipt=receipt)
+
+    assert composer.sends == before
+    assert composer.confirmations == 0
+    assert composer.overlay == "cache-cost"
+    assert composer.model == original_model and composer.saved_default == original_default
+    assert outcome is not False
+
+
+def test_late_legacy_confirmation_rechecks_its_target_before_enter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    composer = _SessionModelComposer(
+        busy=True, legacy_dialog_delay_s=bridge._CONFIRM_DIALOG_TIMEOUT_S + 5
+    )
+    composer.version = "2.1.322"
+    composer.options[1] = "opus"
+    composer.resolved_models["opus"] = "claude-opus-4-8"
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    composer.install(monkeypatch)
+    receipt = bridge.inject_model_command(bridge_dir, model="opus")
+    assert isinstance(receipt, bridge.ClaudeLegacyModelSwitchResult)
+    composer._legacy_pending = None
+    composer.overlay = "cache-cost"
+    composer.cache_cost_label = "Opus 4.8"
+    before = list(composer.sends)
+    confirm = bridge._confirm_and_verify_dialog_closed
+
+    def replace_dialog(*args: Any, **kwargs: Any) -> None:
+        composer.cache_cost_label = "Sonnet 5.5"
+        composer.highlight = 0
+        confirm(*args, **kwargs)
+
+    monkeypatch.setattr(bridge, "_confirm_and_verify_dialog_closed", replace_dialog)
+    with pytest.raises(bridge.ClaudeModelSwitchRefused, match="changed"):
+        bridge.confirm_legacy_model_dialog(bridge_dir, receipt=receipt)
+    assert composer.sends == before
+    assert composer.confirmations == 0
+    assert composer.overlay == "cache-cost"

@@ -821,6 +821,10 @@ Cross-harness journeys:
   A matching status bound to the same native session needs no command, preserving
   a separately saved default. Pinned aliases must match the recorded concrete
   generation and context; an unpinned alias still uses legacy submission.
+  Legacy confirmations use the concrete target and unique label captured when
+  the command was submitted. Completed requests stop watching, and a changed
+  dialog receives no Enter. Without a proven label, the command is still
+  submitted and any terminal confirmation is left for the person to answer.
   Missing or mismatched session identity still uses
   legacy submission; the newer fresh-status guarantee does not apply.
   Existing bridge metadata works without re-registration. Upgrading Claude Code

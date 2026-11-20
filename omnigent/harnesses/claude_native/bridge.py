@@ -57,7 +57,7 @@ import unicodedata
 import urllib.parse
 from collections.abc import Awaitable, Callable, Collection, Iterator, Mapping, Sequence
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from http import HTTPStatus
 from http.client import HTTPConnection, HTTPException
@@ -5731,11 +5731,11 @@ def _inject_model_command_locked(
 def _inject_legacy_model_command_locked(
     bridge_dir: Path, transaction: SessionOnlyModelSwitch, *, literal_model: bool = False
 ) -> ClaudeLegacyModelSwitchResult:
+    from omnigent.harnesses.claude_native.model_switch import _target
     from omnigent.models.claude_model_vocabulary import (
         CLAUDE_MODEL_ALIASES,
         alias_pins,
         claude_model_command_arg,
-        public_claude_model_id,
     )
 
     raw = _read_json_file(bridge_dir / CONTEXT_RAW_FILE) or {}
@@ -5798,20 +5798,7 @@ def _inject_legacy_model_command_locked(
     if transaction.model.lower().endswith("[1m]") and not expected_model.lower().endswith("[1m]"):
         expected_model += "[1m]"
     can_match = literal_model or alias not in CLAUDE_MODEL_ALIASES or pinned is not None
-    expected_public = public_claude_model_id(expected_model)
-    same_model = (
-        can_match
-        and isinstance(current_model, str)
-        and (
-            current_model == expected_model
-            or (
-                expected_public is not None
-                and public_claude_model_id(current_model) == expected_public
-                and current_model.lower().endswith("[1m]")
-                == expected_model.lower().endswith("[1m]")
-            )
-        )
-    )
+    same_model = can_match and _legacy_model_status_matches(expected_model, current_model)
     if (
         origin.active_session_id is not None
         and origin.session_id is not None
@@ -5831,6 +5818,32 @@ def _inject_legacy_model_command_locked(
             transaction.model, model_arg, origin, already_selected=True
         )
 
+    confirmation_model = expected_model if can_match else None
+    confirmation_label = None
+    try:
+        choice = _target(
+            transaction.model,
+            read_model_picker_options(bridge_dir),
+            read_model_picker_values(bridge_dir),
+            model_env,
+        )
+    except ClaudeModelSwitchRefused:
+        pass
+    else:
+        if literal_model or choice.model.lower().removesuffix("[1m]") not in (
+            *CLAUDE_MODEL_ALIASES,
+            "default",
+            "opusplan",
+        ):
+            confirmation_model = choice.model
+            confirmation_label = choice.confirmation_label
+    receipt = ClaudeLegacyModelSwitchResult(
+        transaction.model,
+        model_arg,
+        origin,
+        confirmation_model=confirmation_model,
+        confirmation_label=confirmation_label,
+    )
     _logger.warning(
         "Claude Code version %r uses legacy /model submission; "
         "the command may also change the saved default",
@@ -5842,11 +5855,17 @@ def _inject_legacy_model_command_locked(
             command=f"/model {model_arg}",
             timeout_s=transaction.deadline.remaining_s(),
             ready_timeout_s=transaction.ready_timeout_s,
-            auto_confirm=True,
-            confirm_hint=SWITCH_MODEL_DIALOG_HINT,
             before_edit=revalidate_version,
             before_submit=submitting,
         )
+        until = min(time.monotonic() + _CONFIRM_DIALOG_TIMEOUT_S, transaction.deadline.at)
+        while True:
+            if _confirm_legacy_model_dialog_locked(bridge_dir, receipt=receipt) is not False:
+                return receipt
+            remaining = until - time.monotonic()
+            if remaining <= 0:
+                return replace(receipt, confirmation_pending=True)
+            time.sleep(min(_CLAUDE_READY_POLL_INTERVAL_S, remaining))
     except (RuntimeError, ValueError, OSError) as exc:
         if transaction.submitted:
             raise transaction.refuse(
@@ -5854,7 +5873,20 @@ def _inject_legacy_model_command_locked(
                 "Check the terminal before retrying; the dependent prompt was not sent."
             ) from exc
         raise
-    return ClaudeLegacyModelSwitchResult(transaction.model, model_arg, origin)
+
+
+def _legacy_model_status_matches(expected: str, actual: object) -> bool:
+    """Match a fixed concrete target without inferring an alias or private identity."""
+    from omnigent.models.claude_model_vocabulary import public_claude_model_id
+
+    if not isinstance(actual, str):
+        return False
+    canonical = public_claude_model_id(expected)
+    return actual == expected or (
+        canonical is not None
+        and public_claude_model_id(actual) == canonical
+        and actual.lower().endswith("[1m]") == expected.lower().endswith("[1m]")
+    )
 
 
 def _legacy_model_pane(bridge_dir: Path) -> ClaudeLegacyModelPane | None:
@@ -5879,7 +5911,21 @@ def confirm_legacy_model_dialog(
     bridge_dir: Path, *, receipt: ClaudeLegacyModelSwitchResult
 ) -> bool | None:
     """Confirm a queued command's visible dialog; None ends an obsolete watch."""
-    from omnigent.harnesses.claude_native.model_switch import _cache_cost_confirmation
+    if receipt.pane is None or _legacy_model_pane(bridge_dir) != receipt.pane:
+        return None
+    if not receipt.confirmation_pending:
+        return True
+    return _confirm_legacy_model_dialog_locked(bridge_dir, receipt=receipt)
+
+
+def _confirm_legacy_model_dialog_locked(
+    bridge_dir: Path, *, receipt: ClaudeLegacyModelSwitchResult
+) -> bool | None:
+    """Keep immediate and delayed confirmations bound to the submitted target."""
+    from omnigent.harnesses.claude_native.model_switch import (
+        _cache_cost_confirmation,
+        _model_control_surface,
+    )
 
     origin = receipt.pane
 
@@ -5893,20 +5939,37 @@ def confirm_legacy_model_dialog(
         return None
     if receipt.already_selected:
         return True
-    if read_claude_status_model(bridge_dir) in (receipt.requested_model, receipt.picker_value):
+    status = read_claude_status_model(bridge_dir)
+    if status in (receipt.requested_model, receipt.picker_value) or (
+        receipt.confirmation_model is not None
+        and _legacy_model_status_matches(receipt.confirmation_model, status)
+    ):
         return True
+    label = receipt.confirmation_label
+    if label is None:
+        return None
     pane = _capture_pane(origin.socket_path, origin.tmux_target)
     require_origin()
     _raise_if_user_prompt_pending(bridge_dir, pane)
-    choice = re.search(r"(?m)^\s*❯\s+1\. Yes, switch to (.+?)\s*$", pane)
-    if choice is None or not _cache_cost_confirmation(pane, choice[1], yes_selected=True):
-        return False
+    if not _cache_cost_confirmation(pane, label, yes_selected=True):
+        return None if _model_control_surface(pane) is not None else False
+
+    def require_owned_dialog() -> None:
+        require_origin()
+        latest = _capture_pane(origin.socket_path, origin.tmux_target)
+        require_origin()
+        _raise_if_user_prompt_pending(bridge_dir, latest)
+        if not _cache_cost_confirmation(latest, label, yes_selected=True):
+            raise ClaudeModelSwitchRefused(
+                "The legacy model command's confirmation changed; it was left untouched."
+            )
+
     _confirm_and_verify_dialog_closed(
         origin.socket_path,
         origin.tmux_target,
         hint=SWITCH_MODEL_DIALOG_HINT,
         bridge_dir=bridge_dir,
-        before_confirm=require_origin,
+        before_confirm=require_owned_dialog,
     )
     return True
 
