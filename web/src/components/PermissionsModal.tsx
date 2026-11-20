@@ -1,10 +1,10 @@
 /**
- * Permissions management modal for a session or an automation.
+ * Permissions management modal for a session, an automation or a workflow.
  *
  * Displays current grants, allows granting/revoking access, and
  * toggling public visibility. Only accessible to users with
- * manage-level (3) permission on the session. An automation is shared
- * by its owner at read access only, with no public or link sharing.
+ * manage-level (3) permission on the session. An automation or a workflow
+ * is shared by its owner at read access only, with no public or link sharing.
  */
 
 import {
@@ -62,6 +62,7 @@ import { workspaceSharingBlocked } from "@/lib/permissionsApi";
 import { useRebasePath } from "@/lib/routing";
 import { automationSharePath } from "@/lib/automationFromSession";
 import type { ScheduledTask } from "@/lib/scheduledTasksApi";
+import type { SavedWorkflow } from "@/hooks/useSavedWorkflows";
 import type { Session } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -78,28 +79,50 @@ const LEVEL_LABELS: Record<number, string> = {
 /** The automation fields its share dialog shows. */
 export type SharedAutomation = Pick<ScheduledTask, "id" | "name" | "sessionMode">;
 
+/** The workflow fields its share dialog shows. */
+export type SharedWorkflow = Pick<SavedWorkflow, "id" | "name">;
+
 type PermissionsModalProps = {
   open: boolean;
   onOpenChange: (open: boolean) => void;
 } & (
-  | { sessionId: string; workspace?: string | null; filePath?: string; automation?: undefined }
+  | {
+      sessionId: string;
+      workspace?: string | null;
+      filePath?: string;
+      automation?: undefined;
+      workflow?: undefined;
+    }
   | {
       automation: SharedAutomation;
       sessionId?: undefined;
       workspace?: undefined;
       filePath?: undefined;
+      workflow?: undefined;
+    }
+  | {
+      workflow: SharedWorkflow;
+      sessionId?: undefined;
+      workspace?: undefined;
+      filePath?: undefined;
+      automation?: undefined;
     }
 );
 
+function shareTarget(props: PermissionsModalProps): ShareTarget {
+  if (props.automation !== undefined) return { kind: "automation", id: props.automation.id };
+  if (props.workflow !== undefined) return { kind: "workflow", id: props.workflow.id };
+  return { kind: "session", id: props.sessionId };
+}
+
 export function PermissionsModal(props: PermissionsModalProps) {
   const { workspace, filePath, open, onOpenChange } = props;
-  const target: ShareTarget =
-    props.automation !== undefined
-      ? { kind: "automation", id: props.automation.id }
-      : { kind: "session", id: props.sessionId };
+  const target = shareTarget(props);
   // An automation has no public access, workspace files or link: its grantees
-  // read the sessions its runs create.
+  // read the sessions its runs create. Nor does a workflow: its grantees run it.
   const automation = props.automation ?? null;
+  const workflow = props.workflow ?? null;
+  const readOnlyShare = target.kind !== "session";
   const sessionId = target.kind === "session" ? target.id : null;
   // Server sharing policy. While the boot probe is in flight we treat the
   // server as "on" (fail open) so the modal renders its full controls; the
@@ -114,7 +137,9 @@ export function PermissionsModal(props: PermissionsModalProps) {
     sharingMode === "restricted_read_only" && workspaceSharingBlocked(sharingWorkspace);
   // Disabling public sharing prevents new grants but still permits revocation.
   const publicSharingEnabled = info === "loading" ? true : info.public_sharing_enabled;
-  const { data: livePublicMaxLevel } = usePublicSharingMaxLevel(open && !sharingOff && !automation);
+  const { data: livePublicMaxLevel } = usePublicSharingMaxLevel(
+    open && !sharingOff && !readOnlyShare,
+  );
   const publicMaxLevel =
     (livePublicMaxLevel ?? (info === "loading" ? "read" : info.public_sharing_max_level)) === "edit"
       ? 2
@@ -273,6 +298,9 @@ export function PermissionsModal(props: PermissionsModalProps) {
   let description = "Invite others to view or collaborate on this session.";
   if (automation) {
     description = "Each run's session is shared with the people below, with Read access.";
+  } else if (workflow) {
+    description =
+      "The people below can view this workflow, run it and make a copy. Their runs stay private.";
   } else if (filePath) {
     description = "This link opens the selected file in full screen.";
   } else if (sharingReadOnly) {
@@ -306,9 +334,11 @@ export function PermissionsModal(props: PermissionsModalProps) {
           <DialogTitle className="flex items-center gap-2">
             {automation
               ? "Share this automation"
-              : filePath
-                ? "Share this file"
-                : "Share this session"}
+              : workflow
+                ? "Share this workflow"
+                : filePath
+                  ? "Share this file"
+                  : "Share this session"}
           </DialogTitle>
           <DialogDescription asChild>
             <div className="space-y-3">
@@ -354,7 +384,7 @@ export function PermissionsModal(props: PermissionsModalProps) {
           </Alert>
         )}
 
-        {!automation && (publicSharingEnabled || publicGrant) && (
+        {!readOnlyShare && (publicSharingEnabled || publicGrant) && (
           <div className="flex min-w-0 items-center justify-between gap-3 rounded-lg border px-3 py-2">
             <div className="min-w-0">
               <p className="text-ui font-medium">General access</p>
@@ -466,7 +496,7 @@ export function PermissionsModal(props: PermissionsModalProps) {
                     onChangeLevel={handleChangeLevel}
                     busy={shareBusy}
                     levelDisabled={fileShareUnavailable}
-                    readOnly={sharingReadOnly || !!automation}
+                    readOnly={sharingReadOnly || readOnlyShare}
                   />
                 ))}
               </div>
@@ -491,7 +521,7 @@ export function PermissionsModal(props: PermissionsModalProps) {
             </label>
             <AddUserField value={newUserId} onChange={setNewUserId} disabled={workspaceBlocked} />
           </div>
-          {automation ? (
+          {readOnlyShare ? (
             <div>
               <span className="text-sm font-medium text-muted-foreground">Level</span>
               <p className="mt-1 flex h-8 w-24 items-center px-3 text-ui text-muted-foreground">

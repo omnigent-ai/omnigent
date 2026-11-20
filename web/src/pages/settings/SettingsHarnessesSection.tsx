@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   CheckCircle2Icon,
@@ -14,7 +14,8 @@ import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
   DropdownMenuContent,
-  DropdownMenuItem,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -32,7 +33,6 @@ import {
 } from "@/hooks/useHosts";
 import { ApiError } from "@/lib/sessionsApi";
 import { useCuratedOutHarnesses } from "@/hooks/useCuratedOutHarnesses";
-import { INVENTORY_HARNESS_IDS, INVENTORY_HARNESSES } from "@/hooks/useHarnessInventory";
 import {
   HARNESS_CREDENTIAL_COPY,
   harnessInstallableOnHost,
@@ -50,38 +50,41 @@ import {
   harnessFixMode,
   harnessStatus,
   type HarnessFixMode,
+  type HarnessFixResult,
 } from "@/lib/harnessFix";
 import { useSettingsRoute } from "../../shell/settingsNav";
+import {
+  HARNESS_CARD_ENTRIES,
+  HARNESS_CREDENTIAL_ENTRIES,
+  HARNESS_DESCRIPTIONS,
+  HARNESS_DETAIL_ENTRIES,
+  type HarnessCredentialActionName,
+  type HarnessFixActionName,
+  harnessInventoryPage,
+  HARNESSES_GRID_ENTRY,
+  type NativeHarnessId,
+  type FixOpener,
+} from "./search/catalog/harnesses";
+import { SettingsItem } from "./search/SettingsItem";
+import {
+  SettingsOverlayOwner,
+  SettingsOwner,
+  settingsOverlayProps,
+  settingsRuntimeChoiceProps,
+} from "./search/settingsOwnership";
+import { type SettingsControlProps, settingsControlProps } from "./search/settingsControl";
 
 interface HarnessEntry {
   /** Native harness slug (e.g. "claude-native") — the readiness/install key. */
-  harness: string;
+  harness: NativeHarnessId;
   name: string;
   description: string;
   agentName: string;
 }
 
-// One-line descriptions per harness, keyed by native slug. The server catalog
-// (/v1/harnesses) carries no descriptions, so these live here; the rest of each
-// entry (name, icon, order) comes from NATIVE_CODING_AGENTS.
-const HARNESS_DESCRIPTIONS: Record<string, string> = {
-  "claude-native": "Anthropic’s agent for coding and development workflows.",
-  "codex-native": "OpenAI’s coding agent for building features and fixing bugs.",
-  "opencode-native": "An open-source coding agent for terminal, IDE, and desktop.",
-  "cursor-native": "An AI editor with agents for navigating and editing code.",
-  "pi-native": "A minimal, extensible terminal coding agent.",
-  "devin-native": "Cognition’s autonomous coding agent.",
-  "antigravity-native": "Google’s agent platform for software development.",
-  "kiro-native": "An agentic IDE for spec-driven development.",
-  "qwen-native": "An open-source terminal coding agent powered by Qwen.",
-  "goose-native": "An open-source local agent for coding and automation.",
-  "kimi-native": "A terminal coding agent for editing code and running commands.",
-  "hermes-native": "An agent that learns reusable skills from experience.",
-};
-
 // The harness catalog, derived from the shared native-agent registry so this
-// list stays in step with the rest of the app; descriptions come from the map
-// above. Sorted by the registry's own picker order.
+// list stays in step with the rest of the app; descriptions come from the Settings
+// catalog. Sorted by the registry's own picker order.
 const HARNESS_ENTRIES: HarnessEntry[] = [...NATIVE_CODING_AGENTS]
   .sort((a, b) => a.sortRank - b.sortRank)
   .map((spec) => ({
@@ -166,9 +169,42 @@ export const SettingsHarnessesSection = () => {
     entry: HarnessEntry;
     host: Host;
     mode: HarnessFixMode;
+    opener: FixOpener;
   } | null>(null);
-  const openFix = (entry: HarnessEntry, targetHost: Host, mode: HarnessFixMode) =>
-    setFixTarget({ entry, host: targetHost, mode });
+  // The fix dialog's result: record the host's new state and the notice it leaves behind.
+  const handleFixed = ({
+    configuredHarnesses,
+    credentialKind,
+    version,
+    gatewayInference,
+    harnessAccounts,
+  }: HarnessFixResult) => {
+    if (!fixTarget) return;
+    const { host: fixedHost, entry } = fixTarget;
+    applyHarnessFixResult(queryClient, fixedHost.host_id, {
+      configuredHarnesses,
+      harnessAccounts,
+      gatewayInference,
+    });
+    if (credentialKind) {
+      setCredentialKinds((current) => ({
+        ...current,
+        [hostHarnessKey(fixedHost.host_id, entry.harness)]: credentialKind,
+      }));
+    }
+    setReadyNotice({
+      harness: entry.harness,
+      hostId: fixedHost.host_id,
+      version,
+      account: harnessAccounts?.[harnessAccountKey(entry.harness)],
+    });
+  };
+  const openFix = (
+    entry: HarnessEntry,
+    targetHost: Host,
+    mode: HarnessFixMode,
+    opener: FixOpener,
+  ) => setFixTarget({ entry, host: targetHost, mode, opener });
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -203,39 +239,45 @@ export const SettingsHarnessesSection = () => {
               ? readyNotice
               : null
           }
-          onFix={(mode) => selectedHost && openFix(detail, selectedHost, mode)}
+          onFix={(mode, opener) => selectedHost && openFix(detail, selectedHost, mode, opener)}
         />
       ) : (
         <>
-          <div className="flex flex-wrap items-center justify-between gap-4 pb-6">
-            <h1 className="settings-page-title text-2xl font-medium">Harnesses</h1>
-            <HostSelect hosts={sortedHosts} selected={selectedHost} onSelect={setSelectedHostId} />
-          </div>
-          <div className="mb-6 flex items-center gap-2">
-            <div className="flex h-8 flex-1 items-center gap-2 rounded-lg border border-border px-2.5">
-              <SearchIcon className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
-              <input
-                type="search"
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                placeholder="Search agent harnesses..."
-                aria-label="Search agent harnesses"
-                data-testid="harness-search"
-                className="min-w-0 flex-1 bg-transparent text-ui outline-none placeholder:text-muted-foreground/50"
+          <SettingsItem entry={HARNESSES_GRID_ENTRY}>
+            <div className="flex flex-wrap items-center justify-between gap-4 pb-6">
+              <h1 className="text-2xl font-medium">Harnesses</h1>
+              <HostSelect
+                hosts={sortedHosts}
+                selected={selectedHost}
+                onSelect={setSelectedHostId}
               />
             </div>
-            <Tabs
-              value={installedOnly ? "installed" : "all"}
-              onValueChange={(v) => setInstalledOnly(v === "installed")}
-            >
-              <TabsList>
-                <TabsTrigger value="all">All</TabsTrigger>
-                <TabsTrigger value="installed" data-testid="harness-filter-installed">
-                  Configured
-                </TabsTrigger>
-              </TabsList>
-            </Tabs>
-          </div>
+            <div className="mb-6 flex items-center gap-2">
+              <div className="flex h-8 flex-1 items-center gap-2 rounded-lg border border-border px-2.5">
+                <SearchIcon className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
+                <input
+                  type="search"
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  placeholder="Search agent harnesses..."
+                  {...settingsControlProps(HARNESSES_GRID_ENTRY, "search")}
+                  data-testid="harness-search"
+                  className="min-w-0 flex-1 bg-transparent text-ui outline-none placeholder:text-muted-foreground/50"
+                />
+              </div>
+              <Tabs
+                value={installedOnly ? "installed" : "all"}
+                onValueChange={(v) => setInstalledOnly(v === "installed")}
+              >
+                <TabsList {...settingsControlProps(HARNESSES_GRID_ENTRY, "filter")}>
+                  <TabsTrigger value="all">All</TabsTrigger>
+                  <TabsTrigger value="installed" data-testid="harness-filter-installed">
+                    Configured
+                  </TabsTrigger>
+                </TabsList>
+              </Tabs>
+            </div>
+          </SettingsItem>
           {!selectedHost && <NoHostNotice loading={hostsLoading} />}
           {filtered.length === 0 && (
             <p className="text-ui text-muted-foreground">
@@ -264,47 +306,59 @@ export const SettingsHarnessesSection = () => {
                     ? credentialKinds[hostHarnessKey(selectedHost.host_id, entry.harness)]
                     : undefined
                 }
-                onFix={(mode) => selectedHost && openFix(entry, selectedHost, mode)}
+                onFix={(mode) => selectedHost && openFix(entry, selectedHost, mode, "setUp")}
               />
             ))}
           </div>
         </>
       )}
-      {fixTarget && (
-        <HarnessFixDialog
-          open
-          onOpenChange={(open) => !open && setFixTarget(null)}
-          mode={fixTarget.mode}
-          host={fixTarget.host}
-          harness={fixTarget.entry.harness}
-          harnessLabel={fixTarget.entry.name}
-          onFixed={({
-            configuredHarnesses,
-            credentialKind,
-            version,
-            gatewayInference,
-            harnessAccounts,
-          }) => {
-            const { host: fixedHost, entry } = fixTarget;
-            applyHarnessFixResult(queryClient, fixedHost.host_id, {
-              configuredHarnesses,
-              harnessAccounts,
-              gatewayInference,
-            });
-            if (credentialKind) {
-              setCredentialKinds((current) => ({
-                ...current,
-                [hostHarnessKey(fixedHost.host_id, entry.harness)]: credentialKind,
-              }));
-            }
-            setReadyNotice({
-              harness: entry.harness,
-              hostId: fixedHost.host_id,
-              version,
-              account: harnessAccounts?.[harnessAccountKey(entry.harness)],
-            });
-          }}
-        />
+      {fixTarget?.opener === "setUp" && (
+        <SettingsOverlayOwner
+          entry={HARNESS_CARD_ENTRIES.entry(fixTarget.entry.harness)}
+          opener="setUp"
+        >
+          <HarnessFixDialog
+            open
+            onOpenChange={(open) => !open && setFixTarget(null)}
+            mode={fixTarget.mode}
+            host={fixTarget.host}
+            harness={fixTarget.entry.harness}
+            harnessLabel={fixTarget.entry.name}
+            onFixed={handleFixed}
+          />
+        </SettingsOverlayOwner>
+      )}
+      {fixTarget?.opener === "fixAction" && (
+        <SettingsOverlayOwner
+          entry={HARNESS_DETAIL_ENTRIES.entry(fixTarget.entry.harness)}
+          opener="fixAction"
+        >
+          <HarnessFixDialog
+            open
+            onOpenChange={(open) => !open && setFixTarget(null)}
+            mode={fixTarget.mode}
+            host={fixTarget.host}
+            harness={fixTarget.entry.harness}
+            harnessLabel={fixTarget.entry.name}
+            onFixed={handleFixed}
+          />
+        </SettingsOverlayOwner>
+      )}
+      {fixTarget?.opener === "credentialAction" && (
+        <SettingsOverlayOwner
+          entry={HARNESS_CREDENTIAL_ENTRIES.entry(fixTarget.entry.harness)}
+          opener="credentialAction"
+        >
+          <HarnessFixDialog
+            open
+            onOpenChange={(open) => !open && setFixTarget(null)}
+            mode={fixTarget.mode}
+            host={fixTarget.host}
+            harness={fixTarget.entry.harness}
+            harnessLabel={fixTarget.entry.name}
+            onFixed={handleFixed}
+          />
+        </SettingsOverlayOwner>
       )}
     </div>
   );
@@ -358,30 +412,42 @@ function HostSelect({
             className="h-8 shrink-0 gap-1.5"
             data-testid="harness-host-select"
             componentId="settings.harnesses.host"
+            {...settingsControlProps(HARNESSES_GRID_ENTRY, "machine", {
+              runtime: selected?.name ?? "Select a host",
+            })}
           >
             <HostStatusDot online={selected?.status === "online"} />
             <span className="max-w-40 truncate">{selected?.name ?? "Select a host"}</span>
             <ChevronDownIcon className="size-3.5 shrink-0 text-muted-foreground" />
           </Button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="start" className="min-w-52">
-          {hosts.map((h) => {
-            const online = h.status === "online";
-            return (
-              <DropdownMenuItem
-                key={h.host_id}
-                disabled={!online}
-                onSelect={() => online && onSelect(h.host_id)}
-                data-active={h.host_id === selected?.host_id ? "true" : undefined}
-                data-testid={`harness-host-${h.host_id}`}
-                className="gap-1.5 data-[active=true]:bg-muted dark:data-[active=true]:bg-muted/50"
-              >
-                <HostStatusDot online={online} />
-                <span className="min-w-0 flex-1 truncate">{h.name}</span>
-                {!online && <span className="text-xs text-muted-foreground">Offline</span>}
-              </DropdownMenuItem>
-            );
-          })}
+        <DropdownMenuContent
+          align="start"
+          className="min-w-52"
+          {...settingsOverlayProps(HARNESSES_GRID_ENTRY, "machine")}
+        >
+          {/* One host is the selected one, so its item is checked. */}
+          <DropdownMenuRadioGroup value={selected?.host_id ?? ""}>
+            {hosts.map((h) => {
+              const online = h.status === "online";
+              return (
+                <DropdownMenuRadioItem
+                  key={h.host_id}
+                  value={h.host_id}
+                  disabled={!online}
+                  onSelect={() => online && onSelect(h.host_id)}
+                  data-active={h.host_id === selected?.host_id ? "true" : undefined}
+                  data-testid={`harness-host-${h.host_id}`}
+                  {...settingsRuntimeChoiceProps(HARNESSES_GRID_ENTRY, "machine")}
+                  className="gap-1.5 data-[active=true]:bg-muted dark:data-[active=true]:bg-muted/50"
+                >
+                  <HostStatusDot online={online} />
+                  <span className="min-w-0 flex-1 truncate">{h.name}</span>
+                  {!online && <span className="text-xs text-muted-foreground">Offline</span>}
+                </DropdownMenuRadioItem>
+              );
+            })}
+          </DropdownMenuRadioGroup>
         </DropdownMenuContent>
       </DropdownMenu>
     </div>
@@ -545,7 +611,7 @@ function SetupButton({ entry, onSetup }: { entry: HarnessEntry; onSetup: () => v
       variant="ghost"
       size="icon-sm"
       className="shrink-0"
-      aria-label={`Set up ${entry.name}`}
+      {...settingsControlProps(HARNESS_CARD_ENTRIES.entry(entry.harness), "setUp")}
       data-testid={`harness-action-${entry.harness}`}
       componentId="settings.harnesses.setup"
       onClick={(event) => {
@@ -580,6 +646,10 @@ function HarnessCard({
   const needsAttention = status.needsSetup || status.reason === "cli-unresponsive";
   const opensDetail = status.ready || (needsAttention && canFix);
   const navigate = useNavigate();
+  const card = HARNESS_CARD_ENTRIES.entry(entry.harness);
+  // The link is named by the harness; its status and description are its description.
+  const statusId = useId();
+  const descriptionId = useId();
   const body = (
     <>
       <div className="flex items-start justify-between gap-2">
@@ -587,23 +657,25 @@ function HarnessCard({
           <HarnessIcon entry={entry} />
           <div className="flex min-w-0 flex-col">
             <span className="truncate text-ui font-medium text-foreground">{entry.name}</span>
-            <HarnessStatusText
-              status={status}
-              enhanced={canSetup}
-              configuredCredential={
-                status.ready && canSetup
-                  ? (configuredAccountLabel(host, entry.harness) ??
-                    credentialPresentation(host, entry.harness, credentialKind).label)
-                  : undefined
-              }
-            />
+            <div id={statusId}>
+              <HarnessStatusText
+                status={status}
+                enhanced={canSetup}
+                configuredCredential={
+                  status.ready && canSetup
+                    ? (configuredAccountLabel(host, entry.harness) ??
+                      credentialPresentation(host, entry.harness, credentialKind).label)
+                    : undefined
+                }
+              />
+            </div>
           </div>
         </div>
         {(status.ready || (needsAttention && canFix && mode !== "install")) && (
           <Button
             size="icon-sm"
             variant="ghost"
-            aria-label={`${entry.name} settings`}
+            {...settingsControlProps(card, "settings")}
             data-testid={`harness-settings-${entry.harness}`}
             componentId="settings.harnesses.open_settings"
             onClick={(e) => {
@@ -620,28 +692,37 @@ function HarnessCard({
           <SetupButton entry={entry} onSetup={() => onFix("install")} />
         )}
       </div>
-      <p className="line-clamp-2 text-sm text-muted-foreground">{entry.description}</p>
+      <p id={descriptionId} className="line-clamp-2 text-sm text-muted-foreground">
+        {entry.description}
+      </p>
     </>
   );
   const className =
     "flex flex-col gap-2 rounded-xl border border-border bg-card p-4 transition-colors";
-  return opensDetail ? (
-    <Link
-      to={`/settings/harnesses/${entry.harness}${status.ready ? "" : "?tab=settings"}`}
-      // Only cards that open a details page get the hover, so it reads as clickable.
-      className={cn(
-        className,
-        "hover:border-foreground/20 hover:bg-muted/50 focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none",
+  // The grid cell wraps the card so search can reveal it; the card still fills the cell's height.
+  return (
+    <SettingsItem entry={card} className="grid">
+      {opensDetail ? (
+        <Link
+          {...settingsControlProps(card, "open")}
+          aria-describedby={`${statusId} ${descriptionId}`}
+          to={`/settings/harnesses/${entry.harness}${status.ready ? "" : "?tab=settings"}`}
+          // Only cards that open a details page get the hover, so it reads as clickable.
+          className={cn(
+            className,
+            "hover:border-foreground/20 hover:bg-muted/50 focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none",
+          )}
+          data-testid={`harness-card-${entry.harness}`}
+          componentId="settings.harnesses.open"
+        >
+          {body}
+        </Link>
+      ) : (
+        <div className={className} data-testid={`harness-card-${entry.harness}`}>
+          {body}
+        </div>
       )}
-      data-testid={`harness-card-${entry.harness}`}
-      componentId="settings.harnesses.open"
-    >
-      {body}
-    </Link>
-  ) : (
-    <div className={className} data-testid={`harness-card-${entry.harness}`}>
-      {body}
-    </div>
+    </SettingsItem>
   );
 }
 
@@ -668,7 +749,7 @@ function HarnessDetail({
     version?: string;
     account?: HarnessAccount;
   } | null;
-  onFix: (mode: HarnessFixMode) => void;
+  onFix: (mode: HarnessFixMode, opener: FixOpener) => void;
 }) {
   const status = harnessStatus(entry.harness, host);
   const credentialProblem = isCredentialProblem(status.reason);
@@ -691,14 +772,29 @@ function HarnessDetail({
           description: `${accountDetails(account)} — new sessions on ${host?.name ?? "this host"} can’t use ${entry.name} until you sign in again.`,
         }
       : presentedCredential;
+  const detail = HARNESS_DETAIL_ENTRIES.entry(entry.harness);
+  const credentialEntry = HARNESS_CREDENTIAL_ENTRIES.entry(entry.harness);
+  const credentialAction = (name?: HarnessCredentialActionName) => ({
+    label:
+      name === undefined
+        ? credentialEntry.parts.credentialAction
+        : credentialEntry.nameAlternatives.credentialAction[name],
+    control: settingsControlProps(
+      credentialEntry,
+      "credentialAction",
+      name === undefined ? undefined : { alternative: name },
+    ),
+  });
   const header = (
     <>
-      <BackButton label="Harnesses" to="/settings/harnesses" />
+      <SettingsOwner entry={HARNESS_DETAIL_ENTRIES.entry(entry.harness)} part="back">
+        <BackButton label="Harnesses" to="/settings/harnesses" />
+      </SettingsOwner>
       <div className="flex items-start justify-between gap-4">
         <div className="flex min-w-0 items-center gap-3">
           <HarnessIcon entry={entry} />
           <div className="flex min-w-0 flex-col">
-            <h1 className="settings-page-title truncate text-2xl font-medium">{entry.name}</h1>
+            <h1 className="truncate text-2xl font-medium">{entry.name}</h1>
             <HarnessStatusText
               status={status}
               enhanced={canSetup}
@@ -715,41 +811,46 @@ function HarnessDetail({
     </>
   );
   const credentialCard = (
-    <CredentialCard
-      label={
-        account?.expired && credentialProblem
-          ? "Sign-in expired"
-          : credentialProblem
-            ? "Not signed in"
-            : credential.label
-      }
-      description={
-        account?.expired && credentialProblem
-          ? credential.description
-          : credentialProblem && host
-            ? missingHarnessCredentialCopy(entry.harness, entry.name, host.name)
-            : credential.description
-      }
-      ready={status.ready}
-      warning={credentialProblem}
-      showStatus={canSetup}
-      statusLabel={
-        status.reason === "cli-unresponsive"
-          ? "Not checked"
-          : status.reason === "binary-missing" || status.reason === "unconfigured"
-            ? reconfigurationReason(status.reason)
-            : "Needs reconfiguration"
-      }
-      action={
-        status.ready && canFix && canSwitchHarnessAccount(host, entry.harness)
-          ? { label: "Switch account", onClick: () => onFix("switch") }
-          : status.reason === "needs-auth" && account?.expired && canFix
-            ? { label: "Sign in again", onClick: () => onFix(mode) }
-            : credentialProblem && canFix
-              ? { label: "Reconfigure", onClick: () => onFix(mode) }
-              : undefined
-      }
-    />
+    <SettingsItem entry={credentialEntry}>
+      <CredentialCard
+        label={
+          account?.expired && credentialProblem
+            ? "Sign-in expired"
+            : credentialProblem
+              ? "Not signed in"
+              : credential.label
+        }
+        description={
+          account?.expired && credentialProblem
+            ? credential.description
+            : credentialProblem && host
+              ? missingHarnessCredentialCopy(entry.harness, entry.name, host.name)
+              : credential.description
+        }
+        ready={status.ready}
+        warning={credentialProblem}
+        showStatus={canSetup}
+        statusLabel={
+          status.reason === "cli-unresponsive"
+            ? "Not checked"
+            : status.reason === "binary-missing" || status.reason === "unconfigured"
+              ? reconfigurationReason(status.reason)
+              : "Needs reconfiguration"
+        }
+        action={
+          status.ready && canFix && canSwitchHarnessAccount(host, entry.harness)
+            ? { ...credentialAction("switch"), onClick: () => onFix("switch", "credentialAction") }
+            : status.reason === "needs-auth" && account?.expired && canFix
+              ? {
+                  ...credentialAction("signInAgain"),
+                  onClick: () => onFix(mode, "credentialAction"),
+                }
+              : credentialProblem && canFix
+                ? { ...credentialAction(), onClick: () => onFix(mode, "credentialAction") }
+                : undefined
+        }
+      />
+    </SettingsItem>
   );
   const settings = host ? (
     <div className="flex flex-col gap-6">
@@ -768,7 +869,7 @@ function HarnessDetail({
           mode={mode}
           reason={status.reason}
           installable={installable}
-          onFix={onFix}
+          onFix={(fixMode) => onFix(fixMode, "fixAction")}
         />
       )}
       {credentialCard}
@@ -776,20 +877,22 @@ function HarnessDetail({
     </div>
   ) : null;
   // The host inventory only covers these families' MCP servers, skills, and plugins.
-  const family = INVENTORY_HARNESSES.find((f) => INVENTORY_HARNESS_IDS[f] === entry.harness);
-  if (host && family && (status.ready || canFix)) {
+  const inventoryPage = harnessInventoryPage(entry.harness);
+  if (host && inventoryPage && (status.ready || canFix)) {
     return (
-      <HarnessCatalog
-        header={header}
-        settings={settings}
-        host={host}
-        family={family}
-        defaultTab={status.ready ? "mcps" : "settings"}
-      />
+      <SettingsItem entry={detail}>
+        <HarnessCatalog
+          header={header}
+          settings={settings}
+          host={host}
+          entries={inventoryPage}
+          defaultTab={status.ready ? "mcps" : "settings"}
+        />
+      </SettingsItem>
     );
   }
   return (
-    <>
+    <SettingsItem entry={detail}>
       {header}
       <div className="mt-6 flex flex-col gap-6">
         {!host ? (
@@ -818,7 +921,7 @@ function HarnessDetail({
                 mode={mode}
                 reason={status.reason}
                 installable={installable}
-                onFix={onFix}
+                onFix={(fixMode) => onFix(fixMode, "fixAction")}
               />
             )}
             {credentialCard}
@@ -830,7 +933,7 @@ function HarnessDetail({
           </p>
         )}
       </div>
-    </>
+    </SettingsItem>
   );
 }
 
@@ -874,16 +977,10 @@ function HarnessWarning({
           : mode === "update"
             ? `${entry.name} is out of date on ${host.name}. Update it so new sessions can use ${entry.name}.`
             : `${entry.name} isn’t set up on ${host.name}, so new sessions can’t use ${entry.name}.`;
-  const action =
-    mode === "tmux"
-      ? "Set up tmux"
-      : !installable
-        ? "Set up"
-        : mode === "update"
-          ? "Update"
-          : mode === "install"
-            ? "Install"
-            : "Reconfigure";
+  const detail = HARNESS_DETAIL_ENTRIES.entry(entry.harness);
+  const fixKey = fixActionKey(mode, installable);
+  const actionLabel =
+    fixKey === undefined ? detail.parts.fixAction : detail.nameAlternatives.fixAction[fixKey];
   return (
     <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-4 text-ui">
       <div className="flex min-w-0 flex-1 items-start gap-3">
@@ -891,12 +988,32 @@ function HarnessWarning({
         <p>{copy}</p>
       </div>
       {!host.sandbox_provider && reason !== "cli-unresponsive" && (
-        <Button size="sm" onClick={() => onFix(mode)}>
-          {action}
+        <Button
+          size="sm"
+          {...settingsControlProps(
+            detail,
+            "fixAction",
+            fixKey === undefined ? undefined : { alternative: fixKey },
+          )}
+          onClick={() => onFix(mode)}
+        >
+          {actionLabel}
         </Button>
       )}
     </div>
   );
+}
+
+/** The fix a setup warning's button names, by key; undefined is the plain "Set up". */
+function fixActionKey(
+  mode: HarnessFixMode,
+  installable: boolean,
+): HarnessFixActionName | undefined {
+  if (mode === "tmux") return "tmux";
+  if (!installable) return undefined;
+  if (mode === "update") return "update";
+  if (mode === "install") return "install";
+  return "reconfigure";
 }
 
 function ReadyNotice({
@@ -1044,7 +1161,7 @@ function CredentialCard({
   warning: boolean;
   showStatus: boolean;
   statusLabel: string;
-  action?: { label: string; onClick: () => void };
+  action?: { label: string; onClick: () => void; control: SettingsControlProps };
 }) {
   const body = (
     <>
@@ -1094,7 +1211,7 @@ function CredentialCard({
       {action ? (
         <button
           type="button"
-          aria-label={action.label}
+          {...action.control}
           className={cn(
             "flex w-full cursor-pointer items-center gap-3 rounded-xl border p-3 text-left transition-colors focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none",
             warning

@@ -78,10 +78,12 @@ from omnigent.harnesses.claude_native import (
 from omnigent.harnesses.claude_native.failure_telemetry import claude_failure_context
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.model_switch import (
+    ClaudeLegacyModelSwitchResult,
     ClaudeModelSwitchRefused,
     ClaudeModelSwitchResult,
     ModelSwitchDeadline,
     SessionOnlyModelSwitch,
+    supports_session_only_model_switch,
 )
 from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
 from omnigent.harnesses.claude_native.submit_verification import (
@@ -493,8 +495,7 @@ _MODE_CYCLE_MAX_PRESSES = 8
 _MODE_FOOTER_SETTLE_TIMEOUT_S = 2.0
 _MODE_FOOTER_POLL_INTERVAL_S = 0.1
 # Footer Claude Code's interactive ``/model`` picker renders while it is open.
-# Omnigent never drives that picker — it switches with ``/model <id>`` — but a
-# picker the person opened by hand covers the input box, so an injection would
+# A picker the person opened by hand covers the input box, so an injection would
 # be lost; the readiness gate treats it as "not ready".
 _MODEL_PICKER_OPEN_HINT = "use this session only"
 # How long to keep dismissing an occupying surface that verifiably stays on
@@ -5685,12 +5686,13 @@ def inject_model_command(
     timeout_s: float = _TMUX_READY_TIMEOUT_S,
     ready_timeout_s: float | None = None,
     owned_draft: str | None = None,
-) -> ClaudeModelSwitchResult:
-    """Select a model for this session and require a fresh local status receipt.
+) -> ClaudeModelSwitchResult | ClaudeLegacyModelSwitchResult:
+    """Use session-only selection when supported, otherwise submit the legacy command.
 
-    ``owned_draft`` is only for the exact persisted prompt whose routing hook
-    proved it blocked. Unrelated drafts and dialogs receive no clearing keys.
-    The timeout covers lock waits and every step; no dependent prompt is sent.
+    The session-only path clears only the exact ``owned_draft`` whose routing
+    hook proved it blocked. The timeout covers lock waits and every step;
+    this function never sends the dependent prompt.
+    Older or unverified CLIs retain their default-changing command behavior.
     """
     deadline = ModelSwitchDeadline(timeout_s, _INJECTION_CANCEL_EVENT.get(), time.monotonic)
     transaction = SessionOnlyModelSwitch(
@@ -5712,8 +5714,51 @@ def inject_model_command(
 @_serialize_model_injection
 def _inject_model_command_locked(
     bridge_dir: Path, transaction: SessionOnlyModelSwitch
-) -> ClaudeModelSwitchResult:
-    del bridge_dir
+) -> ClaudeModelSwitchResult | ClaudeLegacyModelSwitchResult:
+    raw = _read_json_file(bridge_dir / CONTEXT_RAW_FILE) or {}
+    version = raw.get("version")
+    if not supports_session_only_model_switch(version):
+        from omnigent.models.claude_model_vocabulary import claude_model_command_arg
+
+        model_arg = claude_model_command_arg(
+            transaction.model,
+            read_model_env(bridge_dir),
+            picker_values=read_model_picker_values(bridge_dir),
+        )
+        if model_arg is None:
+            raise transaction.refuse(
+                f"This Claude terminal has no /model spelling for {transaction.model}.",
+                unsupported=True,
+            )
+        _logger.warning(
+            "Claude Code version %r uses legacy /model submission; "
+            "the command may also change the saved default",
+            version,
+        )
+        transaction.phase = "legacy"
+
+        def submitting() -> None:
+            transaction.submitted = True
+            transaction.commit_attempted = True
+
+        try:
+            _inject_slash_command_locked(
+                bridge_dir,
+                command=f"/model {model_arg}",
+                timeout_s=transaction.deadline.remaining_s(),
+                ready_timeout_s=transaction.ready_timeout_s,
+                auto_confirm=True,
+                confirm_hint=SWITCH_MODEL_DIALOG_HINT,
+                before_submit=submitting,
+            )
+        except (RuntimeError, ValueError, OSError) as exc:
+            if transaction.submitted:
+                raise transaction.refuse(
+                    "Claude's legacy model command may have changed the model and saved default. "
+                    "Check the terminal before retrying; the dependent prompt was not sent."
+                ) from exc
+            raise
+        return ClaudeLegacyModelSwitchResult(transaction.model, model_arg)
     return transaction.run()
 
 
@@ -5771,14 +5816,38 @@ def inject_slash_command(
         if a ``tmux send-keys`` invocation fails, if the typed
         command verifiably never left the input box (submit swallowed).
     """
+    raw = _read_json_file(bridge_dir / CONTEXT_RAW_FILE) or {}
+    if re.match(r"^/model\s+\S", command) and supports_session_only_model_switch(
+        raw.get("version")
+    ):
+        raise ClaudeModelSwitchRefused(
+            "Automated model selections must use the session-only picker."
+        )
+    _inject_slash_command_locked(
+        bridge_dir,
+        command=command,
+        timeout_s=timeout_s,
+        auto_confirm=auto_confirm,
+        confirm_hint=confirm_hint,
+        ready_timeout_s=ready_timeout_s,
+    )
+
+
+def _inject_slash_command_locked(
+    bridge_dir: Path,
+    *,
+    command: str,
+    timeout_s: float,
+    auto_confirm: bool = False,
+    confirm_hint: str | None = None,
+    ready_timeout_s: float | None = None,
+    before_submit: Callable[[], None] | None = None,
+) -> None:
+    """Submit a slash command while the caller owns both bridge injection locks."""
     if not command or not command.startswith("/"):
         raise ValueError(f"slash command must start with '/'; got {command!r}")
     if "\n" in command:
         raise ValueError("slash command must be a single line")
-    if re.match(r"^/model\s+\S", command):
-        raise ClaudeModelSwitchRefused(
-            "Automated model selections must use the session-only picker."
-        )
     dialog_hint: str | None = None
     if auto_confirm:
         if not confirm_hint:
@@ -5824,6 +5893,8 @@ def inject_slash_command(
         raise ClaudeUserPromptPending(
             "Claude is waiting for an explicit answer; settings command not sent."
         )
+    if before_submit is not None:
+        before_submit()
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     if draft_seen:
         # Retry only while the command remains drafted and no user decision
@@ -10533,7 +10604,7 @@ _CLI_SCAFFOLDING_MARKERS: tuple[str, ...] = (
 #   web message that opens one would never be confirmed delivered.
 # - SURFACED — commands that change the next turn's behavior or the
 #   conversation state (``/effort high``, ``/clear``, ``/compact``,
-#   ``/model``, ``/ultrareview``). A web observer needs to see these,
+#   ``/goal``, ``/model``, ``/ultrareview``). A web observer needs to see these,
 #   otherwise the next assistant turn appears to shift unprompted.
 #
 # Unknown names fall through to the Skill branch — a safer default
@@ -10584,6 +10655,7 @@ _CLAUDE_CLI_SURFACED_COMMANDS: frozenset[str] = frozenset(
         "clear",
         "compact",
         "effort",
+        "goal",
         "model",
         "ultrareview",
     }

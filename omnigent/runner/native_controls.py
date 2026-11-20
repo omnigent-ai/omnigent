@@ -1364,6 +1364,7 @@ def build_native_controls(
         model: str | None,
     ) -> Response:
         from omnigent.harnesses.claude_native.bridge import (
+            ClaudeLegacyModelSwitchResult,
             ClaudeModelSwitchRefused,
             ClaudeModelSwitchResult,
             bridge_dir_for_bridge_id,
@@ -1426,11 +1427,11 @@ def build_native_controls(
                 ready_timeout_s=min(_CLAUDE_CONTROL_PROMPT_WAIT_S, deadline.remaining_s()),
             )
             if (
-                not isinstance(receipt, ClaudeModelSwitchResult)
+                not isinstance(receipt, ClaudeModelSwitchResult | ClaudeLegacyModelSwitchResult)
                 or receipt.requested_model != resolved_model
             ):
                 raise ClaudeModelSwitchRefused(
-                    "Claude did not provide a fresh session-only model-selection receipt."
+                    "Claude did not return a matching model-selection result."
                 )
         except (RuntimeError, ValueError, OSError) as exc:
             safe_detail = _client_safe_error_detail(exc, context="claude-native model change")
@@ -1445,8 +1446,12 @@ def build_native_controls(
             if isinstance(exc, ClaudeModelSwitchRefused) and exc.model_may_have_changed:
                 error_code = "claude_native_model_unconfirmed"
                 detail = (
-                    "Claude may have changed the session model, but the selection could not "
-                    "be confirmed. Check the terminal's current model before retrying."
+                    str(exc)
+                    if exc.phase == "legacy"
+                    else (
+                        "Claude may have changed the session model, but the selection could not "
+                        "be confirmed. Check the terminal's current model before retrying."
+                    )
                 )
             return JSONResponse(
                 status_code=503,

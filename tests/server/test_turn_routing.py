@@ -1008,8 +1008,9 @@ def test_settle_probe_reads_the_pane_for_claude_and_the_turn_id_for_codex(
     assert codex_probe("turn_1") is True
 
 
+@pytest.mark.parametrize("version", ["2.1.323", "2.1.322"], ids=["session-only", "legacy"])
 async def test_replay_switches_the_claude_pane_before_delivering(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str
 ) -> None:
     from omnigent.harnesses.claude_native import bridge
     from omnigent.inner import claude_native_executor
@@ -1023,6 +1024,8 @@ async def test_replay_switches_the_claude_pane_before_delivering(
     monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path)
     monkeypatch.setenv(bridge.REQUEST_SESSION_ID_ENV_VAR, "web-session")
     composer = _SessionModelComposer(draft="hello")
+    composer.version = version
+    session_only = version == "2.1.323"
     model = composer.options[-1]
     bridge_dir = _session_model_bridge(tmp_path, composer)
     composer.install(monkeypatch)
@@ -1037,7 +1040,10 @@ async def test_replay_switches_the_claude_pane_before_delivering(
 
     def deliver(_bridge: Path, *, content: str, timeout_s: float = 30.0) -> None:
         assert composer.model == model
-        assert composer.status_queries > status_queries_at_handoff[0]
+        if session_only:
+            assert composer.status_queries > status_queries_at_handoff[0]
+        else:
+            assert composer.status_queries == 0
         delivered.append(content)
 
     def publish_current_status() -> None:
@@ -1054,7 +1060,7 @@ async def test_replay_switches_the_claude_pane_before_delivering(
         assert json["model_override"] == model
         assert composer.model == model
         assert composer.text == ""
-        assert sum(args[-1] == "s" for args in composer.sends) == 1
+        assert sum(args[-1] == "s" for args in composer.sends) == int(session_only)
         status_queries_at_handoff.append(composer.status_queries)
         publish_current_status()
         response = await original_post(url, json=json, timeout=timeout)
@@ -1084,7 +1090,9 @@ async def test_replay_switches_the_claude_pane_before_delivering(
     )
 
     assert len(status_queries_at_handoff) == 1
-    assert sum(args[-1] == "s" for args in composer.sends) == 1
+    assert sum(args[-1] == "s" for args in composer.sends) == int(session_only)
+    if not session_only:
+        assert [command for command in composer.submitted if command] == [f"/model {model}"] * 2
     assert delivered == ["hello"]
     assert len(client.messages) == 1
     assert turn_routing.read_pending_replay(bridge_dir) is None
@@ -1571,10 +1579,14 @@ async def test_server_relay_hands_the_routed_model_to_the_replay(
 
 
 @pytest.mark.parametrize("receipt_model", ["private-model", "another-model", None])
-async def test_replay_requires_a_fresh_same_model_receipt(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, receipt_model: str | None
+@pytest.mark.parametrize("legacy", [False, True], ids=["session-only", "legacy"])
+async def test_replay_requires_a_matching_model_selection_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, receipt_model: str | None, legacy: bool
 ) -> None:
-    from omnigent.harnesses.claude_native.bridge import ClaudeModelSwitchResult
+    from omnigent.harnesses.claude_native.bridge import (
+        ClaudeLegacyModelSwitchResult,
+        ClaudeModelSwitchResult,
+    )
 
     _mark(tmp_path)
     turn_routing.write_pending_replay(
@@ -1583,11 +1595,15 @@ async def test_replay_requires_a_fresh_same_model_receipt(
     client = _FakeServerClient()
     checked: list[str] = []
 
-    def select(_bridge: Path, *, model: str, **kwargs: object) -> ClaudeModelSwitchResult | None:
+    def select(
+        _bridge: Path, *, model: str, **kwargs: object
+    ) -> ClaudeModelSwitchResult | ClaudeLegacyModelSwitchResult | None:
         checked.append(model)
         return (
             None
             if receipt_model is None
+            else ClaudeLegacyModelSwitchResult(receipt_model, receipt_model)
+            if legacy
             else ClaudeModelSwitchResult(
                 receipt_model, receipt_model, receipt_model, receipt_model, "native-session", True
             )

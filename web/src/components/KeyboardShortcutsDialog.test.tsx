@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { MemoryRouter } from "react-router-dom";
 
 import {
   KeyboardShortcutsDialog,
@@ -83,11 +84,11 @@ describe("KeyboardShortcutsList composer rows", () => {
     expect(keysFor("New line in message")).toEqual(["↵"]);
   });
 
-  it("does not advertise inactive composer chords on touch-primary devices", () => {
+  it("does not advertise inactive composer chords in the mobile layout", () => {
     const matchMedia = window.matchMedia;
     vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
       ...matchMedia(query),
-      matches: query.includes("pointer: coarse"),
+      matches: query.includes("max-width"),
     }));
     render(<KeyboardShortcutsList />);
 
@@ -98,7 +99,11 @@ describe("KeyboardShortcutsList composer rows", () => {
 
 describe("KeyboardShortcutsList settings layout", () => {
   it("groups shortcut rows into settings cards", () => {
-    render(<KeyboardShortcutsList variant="settings" />);
+    render(
+      <MemoryRouter>
+        <KeyboardShortcutsList variant="settings" />
+      </MemoryRouter>,
+    );
 
     const heading = screen.getByRole("heading", { name: "General" });
     const list = heading.closest("section")?.querySelector("ul");
@@ -148,10 +153,15 @@ describe("KeyboardShortcutsDialog", () => {
   });
 
   it("keeps native new-session keys and updates the Settings reference", () => {
-    const { rerender } = render(<KeyboardShortcutsList variant="settings" />);
+    const settingsList = () => (
+      <MemoryRouter>
+        <KeyboardShortcutsList variant="settings" />
+      </MemoryRouter>
+    );
+    const { rerender } = render(settingsList());
     expect(keysFor("Start a new session")).toEqual(["Ctrl", "Shift", "O"]);
     isNativeShell.mockReturnValue(true);
-    rerender(<KeyboardShortcutsList variant="settings" />);
+    rerender(settingsList());
     expect(keysFor("Start a new session")).toEqual(["Ctrl", "N"]);
     expect(keysFor("Toggle conversations sidebar")).toEqual(["Ctrl", "B"]);
     expect(keysFor("Toggle workspace sidebar")).toEqual(["Ctrl", "⇧", "B"]);
@@ -298,11 +308,11 @@ describe("KeyboardShortcutsList question rows", () => {
     expect(keysFor("Cancel pending question")).toEqual(["Esc"]);
   });
 
-  it("hides the question keys on touch-primary devices", () => {
+  it("hides the question keys in the mobile layout", () => {
     const matchMedia = window.matchMedia;
     vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
       ...matchMedia(query),
-      matches: query.includes("pointer: coarse"),
+      matches: query.includes("max-width"),
     }));
     render(<KeyboardShortcutsList />);
 

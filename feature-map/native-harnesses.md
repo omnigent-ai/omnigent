@@ -39,6 +39,15 @@ implements them separately, so a fix for one harness does not reach the others.
 - `pi-host-mcp`: managed Pi sessions (pi-native with an Omnigent provider, and the
   Pi gateway executor) also get the MCP servers configured for Claude Code, Codex
   and Cursor; the user's own `~/.pi/agent/mcp.json` entries win and it is not written.
+- `pi-claude-plugins`: with `OMNIGENT_FEATURES=pi_claude_plugins` in the environment of
+  the host or runner process that launches Pi, managed Pi sessions (pi-native and the
+  Pi gateway executor) load the skills, `/<plugin>:<command>` (the command name is the
+  path under `commands/`, or the frontmatter `name` when set, as plugin command discovery
+  names them)
+  prompts and Pi packages of the Claude Code plugins enabled for the user. Disabled
+  plugins stay out, and a resource the user's Pi settings already list by the same
+  path is not added again. Excluding one resource of a plugin is not supported yet:
+  disable the plugin in Claude Code to drop it.
 - `claude-managed-mcp-relay`: on a machine with Claude Code's enterprise
   `managed-mcp.json`, Claude Code refuses `--mcp-config`, so Claude native
   sessions (web-launched and `omnigent claude`) reach Omnigent's tools through
@@ -807,18 +816,23 @@ Cross-harness journeys:
   clean container if machine-managed settings override the fixture's picker.
   It makes no model calls and does not verify browser rendering or live gateway
   servability.
-  On an older CLI with a valid version and known session, pinned Chat can
-  continue when fresh local status confirms the exact current model. A different
-  or unconfirmed model is refused before opening the picker; keep using the
-  current model in Terminal or update and relaunch to enable automatic changes.
-  Same-model confirmation and stale-status refusal are covered by
+  Older CLIs and CLIs with unavailable or unverified version metadata retain
+  legacy `/model MODEL` submission, including its possible saved-default change.
+  Existing bridge metadata works without re-registration. Upgrading Claude Code
+  is optional; default preservation and fresh native receipts apply only when
+  the running terminal reports a stable version of 2.1.323 or newer. A failure on
+  that supported path never falls back to a persistent model command.
+  Version boundaries and legacy bridge/control behavior are covered by
+  `tests/harnesses/claude_native/test_claude_native_model_switch_compatibility.py`
+  and `tests/runner/test_claude_model_controls_compatibility.py`.
+  Same-model confirmation and stale-status refusal on supported versions are covered by
   `tests/harnesses/claude_native/test_claude_native_bridge.py::test_model_command_uses_a_fresh_status_for_same_model_requests`
-  and `tests/inner/test_claude_native_executor.py::test_run_turn_does_not_send_without_a_fresh_model_receipt`.
+  and `tests/inner/test_claude_native_executor.py::test_run_turn_requires_a_matching_model_selection_result`.
   Each switch keeps its initially resolved target descriptor; later catalog
   refreshes do not invalidate that selection. The live picker and fresh status
   must still confirm that target. Live changes keep the original `type`/`model`
-  event shape. New runners use the same session-only selector and fresh receipt
-  for older servers; an uncertain selection returns 503 and preserves the pane.
+  event shape. New runners choose the actuator from the running CLI's version,
+  including for older servers; an uncertain selection returns 503 and preserves the pane.
   Current servers preserve intent on uncertainty replies and retain newer
   metadata. Older servers may roll back intent or report the prior
   model after uncertainty. Older runners retain their existing CLI actuator and
@@ -1292,6 +1306,15 @@ Cross-harness journeys:
   `{"name": {"enabled": false}}` there turns it off. `~/.pi/agent` stays unchanged.
   A server whose env or headers use `${VAR}` connects only when the runner gets
   that variable, for example through `OMNIGENT_RUNNER_ENV_PASSTHROUGH=VAR`.
+- **`pi-claude-plugins`:** run `tests/inner/test_pi_claude_plugins.py` and
+  `tests/e2e/omnigent/test_pi_claude_plugins_e2e.py` (real Pi, mock model). Manually,
+  set `OMNIGENT_FEATURES=pi_claude_plugins` in the environment of the host or runner that
+  launches Pi (a server-only setting does not reach it), enable a marketplace
+  plugin with a skill and a command in Claude Code, then start `omnigent pi` with an
+  Omnigent provider. Run `/<plugin>:<command> focus`: the body expands with the
+  arguments. The skill is listed for the model and `/skill:<name>` works. Disable the
+  plugin in Claude Code and launch again: both are gone. `~/.pi/agent` stays unchanged.
+  Without the flag, nothing changes.
 - **`cleanup`:** no single cross-harness test. For each harness in scope, start
   a session, stop it (and separately cancel one during startup), then confirm
   no helper process from that session is still running.

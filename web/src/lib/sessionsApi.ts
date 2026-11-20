@@ -22,6 +22,7 @@ import { backgroundSessionTitlesRequestHeaders } from "./backgroundSessionTitles
 import { browserAgentToolsRequestHeaders } from "@/components/BrowserPane/agentTools/preferences";
 import { timezoneRequestHeaders } from "./timezones";
 import { parseBackgroundTasks } from "./sse";
+import { muteReadMarker, reconcileMuteLabel } from "./sessionMute";
 import type {
   BackgroundTaskInfo,
   ModelUsage,
@@ -206,6 +207,8 @@ interface SessionResponseWire {
   last_total_tokens?: number | null;
   usage_included?: boolean;
   total_cost_usd?: number | null;
+  /** `true` when the operator hides USD cost; clients clear any cached cost. */
+  cost_hidden?: boolean | null;
   /**
    * Per-model breakdown of the same subtree usage, keyed by the raw harness
    * model id. Each value is a `ModelUsage` (the five token buckets + optional
@@ -402,6 +405,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     lastTotalTokens: wire.last_total_tokens,
     usageIncluded: wire.usage_included ?? true,
     totalCostUsd: wire.total_cost_usd,
+    costHidden: wire.cost_hidden === true,
     usageByModel: usageByModelFromWire(wire.usage_by_model),
     lastTaskError: wire.last_task_error,
     pendingElicitations: wire.pending_elicitations ?? [],
@@ -1551,8 +1555,12 @@ export async function bindOnlyOnlineRunner(sessionId: string): Promise<Session |
  * with no transient (delta) coverage.
  */
 export async function getSession(sessionId: string): Promise<Session> {
+  const readMarker = muteReadMarker();
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}`);
-  return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
+  return reconcileMuteLabel(
+    sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res)),
+    readMarker,
+  );
 }
 
 export interface SessionRepositoryBranch {
@@ -1610,11 +1618,15 @@ export async function getSessionSlim(
     include_usage: "false",
   });
   if (options.refreshState === true) params.set("refresh_state", "true");
+  const readMarker = muteReadMarker();
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(sessionId)}?${params.toString()}`,
     { signal: options.signal },
   );
-  return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
+  return reconcileMuteLabel(
+    sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res)),
+    readMarker,
+  );
 }
 
 export interface SessionSignInLink {
@@ -1643,6 +1655,7 @@ export async function getSessionSignInLink(
 export interface SessionUsageSnapshot {
   id: string;
   totalCostUsd: number | null;
+  costHidden: boolean;
   usageByModel: Record<string, ModelUsage> | null;
 }
 
@@ -1662,12 +1675,13 @@ export async function getSessionUsage(
     { signal: options.signal },
   );
   const wire =
-    await readJsonOrThrow<Pick<SessionResponseWire, "id" | "total_cost_usd" | "usage_by_model">>(
-      res,
-    );
+    await readJsonOrThrow<
+      Pick<SessionResponseWire, "id" | "total_cost_usd" | "cost_hidden" | "usage_by_model">
+    >(res);
   return {
     id: wire.id,
     totalCostUsd: wire.total_cost_usd ?? null,
+    costHidden: wire.cost_hidden === true,
     usageByModel: usageByModelFromWire(wire.usage_by_model),
   };
 }

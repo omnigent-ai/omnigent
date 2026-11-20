@@ -20,6 +20,7 @@ from omnigent.harnesses.claude_native.bridge import (
     REQUEST_SESSION_ID_ENV_VAR,
     ClaudeComposerNotCleared,
     ClaudeInputBoxOccupied,
+    ClaudeLegacyModelSwitchResult,
     ClaudeMessageNotAccepted,
     ClaudeModelSwitchRefused,
     ClaudeModelSwitchResult,
@@ -191,11 +192,13 @@ class ClaudeNativeExecutor(Executor):
                     preserve_session_on_cancel=True,
                 )
                 if (
-                    not isinstance(receipt, ClaudeModelSwitchResult)
+                    not isinstance(
+                        receipt, ClaudeModelSwitchResult | ClaudeLegacyModelSwitchResult
+                    )
                     or receipt.requested_model != wanted_model
                 ):
                     raise ClaudeModelSwitchRefused(
-                        "Claude did not provide a fresh model-selection receipt; "
+                        "Claude did not return a matching model-selection result; "
                         "the prompt was not sent."
                     )
             await self._inject_prompt(text, notices)
@@ -528,7 +531,7 @@ class ClaudeNativeExecutor(Executor):
             return
         except ClaudeModelSwitchRefused as exc:
             _logger.warning(
-                "claude-native: session-only model switch refused delivery; message not delivered",
+                "claude-native: model switch refused delivery; message not delivered",
                 extra={"session_id": self._request_session_id},
             )
             yield ExecutorError(

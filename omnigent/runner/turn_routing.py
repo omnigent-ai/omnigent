@@ -1482,6 +1482,7 @@ async def _apply_routed_model(
     from omnigent.harnesses.claude_native.bridge import (
         CLAUDE_INPUT_HOLD_S,
         ClaudeComposerNotCleared,
+        ClaudeLegacyModelSwitchResult,
         ClaudeModelSwitchRefused,
         ClaudeModelSwitchResult,
         ClaudeTerminalDialog,
@@ -1559,12 +1560,20 @@ async def _apply_routed_model(
         ):
             return False
         break
-    if not isinstance(receipt, ClaudeModelSwitchResult) or receipt.requested_model != model:
+    if (
+        not isinstance(receipt, ClaudeModelSwitchResult | ClaudeLegacyModelSwitchResult)
+        or receipt.requested_model != model
+    ):
         _logger.warning(
-            "route-turn: model switch returned no fresh receipt for session=%s", session_id
+            "route-turn: model switch returned no matching result for session=%s", session_id
         )
         return False
-    _logger.info("route-turn: session=%s confirmed on %s", session_id, receipt.resolved_model)
+    if isinstance(receipt, ClaudeModelSwitchResult):
+        _logger.info("route-turn: session=%s confirmed on %s", session_id, receipt.resolved_model)
+    else:
+        _logger.info(
+            "route-turn: session=%s submitted legacy /model %s", session_id, receipt.picker_value
+        )
     return True
 
 

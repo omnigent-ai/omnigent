@@ -207,6 +207,7 @@ class _SessionModelComposer(_EditableComposer):
         self.picker_labels: dict[str, str] = {}
         self.resolved_models: dict[str, str] = {}
         self.model = self.options[0]
+        self.saved_default = self.model
         self.highlight = 0
         self.overlay: str | None = None
         self.busy = busy
@@ -264,6 +265,11 @@ class _SessionModelComposer(_EditableComposer):
         super()._run_tmux(socket_path, *args)
         if key == "Enter" and command == "/model":
             self.overlay = "picker"
+        elif key == "Enter" and command.startswith("/model "):
+            selected = command.removeprefix("/model ")
+            assert selected in self.options
+            self.model = self.resolved_models.get(selected, selected)
+            self.saved_default = self.model
         elif key == "Enter" and command == "/status":
             self.status_queries += 1
             self.overlay = "status"

@@ -19,6 +19,7 @@ import pytest
 from omnigent.harnesses.claude_native import bridge as claude_bridge
 from omnigent.harnesses.claude_native.bridge import (
     REQUEST_SESSION_ID_ENV_VAR,
+    ClaudeLegacyModelSwitchResult,
     ClaudeModelSwitchRefused,
     ClaudeModelSwitchResult,
     ClaudePromptTimeout,
@@ -1371,11 +1372,12 @@ async def test_run_turn_passes_the_exact_required_model_to_the_shared_picker(
     [
         "absent",
         "different-target",
+        "legacy-different-target",
         "older-cli-confirmed",
         "older-cli-different-model",
     ],
 )
-async def test_run_turn_does_not_send_without_a_fresh_model_receipt(
+async def test_run_turn_requires_a_matching_model_selection_result(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, receipt_kind: str
 ) -> None:
     monkeypatch.delenv(REQUEST_SESSION_ID_ENV_VAR, raising=False)
@@ -1395,6 +1397,8 @@ async def test_run_turn_does_not_send_without_a_fresh_model_receipt(
         receipt = (
             None
             if receipt_kind == "absent"
+            else ClaudeLegacyModelSwitchResult("another-model", "another-model")
+            if receipt_kind == "legacy-different-target"
             else ClaudeModelSwitchResult(
                 "another-model",
                 "another-model",
@@ -1422,8 +1426,8 @@ async def test_run_turn_does_not_send_without_a_fresh_model_receipt(
         )
     ]
 
-    confirmed = receipt_kind == "older-cli-confirmed"
-    if confirmed:
+    accepted = receipt_kind.startswith("older-cli-")
+    if accepted:
         assert events == [TurnComplete(response=None)]
         assert delivered == ["hello"]
     else:
@@ -1431,10 +1435,9 @@ async def test_run_turn_does_not_send_without_a_fresh_model_receipt(
         assert events[0].undelivered and events[0].preserve_session
         assert delivered == []
     if receipt_kind.startswith("older-cli-"):
-        assert composer.model == composer.options[-1 if confirmed else 0]
-        assert [args[-1] for args in composer.sends] == (
-            ["/status", "Enter", "Escape"] if confirmed else []
-        )
+        assert composer.model == composer.saved_default == composer.options[-1]
+        assert [command for command in composer.submitted if command] == ["/model private-model"]
+        assert composer.status_queries == 0
 
 
 @pytest.mark.asyncio

@@ -38,4 +38,10 @@ contextBridge.exposeInMainWorld("omnigentFind", {
   onActivate: (callback) => {
     ipcRenderer.on("omnigent:find-activate", () => callback());
   },
+  /** Fires with the searched page's selected text when find opened over one. */
+  onPrefill: (callback) => {
+    ipcRenderer.on("omnigent:find-prefill", (_event, prefill) =>
+      callback(String(prefill?.text ?? "")),
+    );
+  },
 });

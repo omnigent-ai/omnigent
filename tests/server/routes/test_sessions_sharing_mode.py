@@ -1127,26 +1127,30 @@ async def test_admin_put_is_atomic_across_mixed_writability(db_uri: str, tmp_pat
         assert read_sharing_mode_override() is None
 
 
-# ── Read-only collaborators may pin a shared session ─────────────────
+# ── Read-only collaborators may set personal preferences ─────────────
 
 
-async def test_read_only_grantee_can_pin_shared_session(db_uri: str, tmp_path: Path) -> None:
-    """Pinning is a personal, per-viewer preference, not an edit to the session.
-    A ``LEVEL_READ`` collaborator on a session shared with them must be able to
-    pin it — a pin-only PATCH needs only read access, and the pin is stored under
-    the caller's own per-user key (not visible to other viewers)."""
+@pytest.mark.parametrize(
+    ("label_key", "value"),
+    [("omnigent.pinned", "1721760000000"), ("omnigent.muted", "1")],
+    ids=["pin", "mute"],
+)
+async def test_read_only_grantee_sets_preference_only_for_themselves(
+    db_uri: str, tmp_path: Path, label_key: str, value: str
+) -> None:
+    """READ collaborators can set and clear preferences without affecting the owner."""
     from omnigent.db.utils import generate_agent_id
-    from omnigent.stores.conversation_store import pinned_label_key
+    from omnigent.stores.conversation_store import muted_label_key, pinned_label_key
 
+    scoped_key = pinned_label_key if label_key == "omnigent.pinned" else muted_label_key
     permission_store = SqlAlchemyPermissionStore(db_uri)
     conversation_store = SqlAlchemyConversationStore(db_uri)
     agent_store = SqlAlchemyAgentStore(db_uri)
     agent_id = generate_agent_id()
-    agent_store.create(agent_id, name="pin-agent", bundle_location="test:///bundle")
+    agent_store.create(agent_id, name="preference-agent", bundle_location="test:///bundle")
     conv = conversation_store.create_conversation(agent_id=agent_id)
     permission_store.ensure_user(_OWNER)
     permission_store.grant(_OWNER, conv.id, LEVEL_OWNER)
-    # Share it read-only with the grantee.
     permission_store.ensure_user(_GRANTEE)
     permission_store.grant(_GRANTEE, conv.id, LEVEL_READ)
     app = _build_app(
@@ -1157,36 +1161,28 @@ async def test_read_only_grantee_can_pin_shared_session(db_uri: str, tmp_path: P
     )
 
     async with _client(app, _GRANTEE) as c:
-        resp = await c.patch(
-            f"/v1/sessions/{conv.id}",
-            json={"labels": {"omnigent.pinned": "1721760000000"}},
-        )
+        resp = await c.patch(f"/v1/sessions/{conv.id}", json={"labels": {label_key: value}})
         assert resp.status_code == 200, resp.text
-        assert resp.json()["labels"].get("omnigent.pinned") == "1721760000000"
+        assert resp.json()["labels"].get(label_key) == value
+        if label_key == "omnigent.pinned":
+            listed = await c.get("/v1/sessions?pinned=true")
+            assert listed.status_code == 200, listed.text
+            assert conv.id in [row["id"] for row in listed.json()["data"]]
+    stored = conversation_store.get_conversation(conv.id)
+    assert stored is not None
+    assert stored.labels.get(scoped_key(_GRANTEE)) == value
 
-    # Stored under the grantee's per-user key, and it surfaces on their
-    # ``?pinned=true`` list.
-    conv = conversation_store.get_conversation(conv.id)
-    assert conv is not None
-    assert conv.labels.get(pinned_label_key(_GRANTEE)) == "1721760000000"
+    async with _client(app, _OWNER) as c:
+        owner_view = await c.get(f"/v1/sessions/{conv.id}")
+        assert owner_view.status_code == 200, owner_view.text
+        assert label_key not in owner_view.json()["labels"]
 
     async with _client(app, _GRANTEE) as c:
-        listed = await c.get("/v1/sessions?pinned=true")
-        assert listed.status_code == 200, listed.text
-        assert conv.id in [s["id"] for s in listed.json()["data"]]
-
-        # Unpin takes the other branch (the ``delete_label`` clear loop) but is
-        # still pin-only, so it also needs just read access: an empty value
-        # clears the grantee's own per-user key.
-        resp = await c.patch(
-            f"/v1/sessions/{conv.id}",
-            json={"labels": {"omnigent.pinned": ""}},
-        )
+        resp = await c.patch(f"/v1/sessions/{conv.id}", json={"labels": {label_key: ""}})
         assert resp.status_code == 200, resp.text
-
-    conv = conversation_store.get_conversation(conv.id)
-    assert conv is not None
-    assert pinned_label_key(_GRANTEE) not in conv.labels
+    stored = conversation_store.get_conversation(conv.id)
+    assert stored is not None
+    assert scoped_key(_GRANTEE) not in stored.labels
 
 
 async def test_read_only_grantee_cannot_edit_other_labels(db_uri: str, tmp_path: Path) -> None:
@@ -1224,6 +1220,13 @@ async def test_read_only_grantee_cannot_edit_other_labels(db_uri: str, tmp_path:
             json={"labels": {"omnigent.pinned": "1721760000000", "omni_project": "Moonshot"}},
         )
         assert resp.status_code == 403, resp.text
+        # Same for a mute bundled with another label.
+        resp = await c.patch(
+            f"/v1/sessions/{conv.id}",
+            json={"labels": {"omnigent.muted": "1", "omni_project": "Moonshot"}},
+        )
+        assert resp.status_code == 403, resp.text
+    assert conversation_store.get_conversation(conv.id).labels == {}
 
 
 @pytest.mark.parametrize("value", [None, "", "typo", 7])

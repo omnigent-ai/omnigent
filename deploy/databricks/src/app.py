@@ -329,6 +329,7 @@ try:
             databricks_store = DatabricksConnectionStore(DB_URI, dbx_cipher)
 
     app = create_app(
+        host_session_recovery=True,
         agent_store=agent_store,
         file_store=file_store,
         conversation_store=conversation_store,

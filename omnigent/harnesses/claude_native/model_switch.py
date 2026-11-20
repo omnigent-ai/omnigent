@@ -47,6 +47,20 @@ class ClaudeModelSwitchResult:
     already_selected: bool = False
 
 
+@dataclass(frozen=True)
+class ClaudeLegacyModelSwitchResult:
+    """A legacy command was submitted; it may also change Claude's saved default."""
+
+    requested_model: str
+    picker_value: str
+
+
+def supports_session_only_model_switch(version: object) -> bool:
+    """Use session-only selection only on a verified stable CLI version."""
+    parsed = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", version) if isinstance(version, str) else None
+    return parsed is not None and tuple(map(int, parsed.groups())) >= _MIN_PICKER_VERSION
+
+
 class ModelSwitchDeadline(threading.Event):
     """Apply one deadline to lock acquisition, pane reads and every key."""
 

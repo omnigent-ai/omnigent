@@ -1,0 +1,1886 @@
+"""Containment must cover commands a Claude CLI executes without tool callbacks."""
+
+from __future__ import annotations
+
+import json
+import os
+import shlex
+import shutil
+import signal
+import socket
+import ssl
+import subprocess
+import sys
+import tempfile
+import threading
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock
+
+import httpx
+import pytest
+
+from omnigent.inner import claude_sdk_executor as claude
+from omnigent.inner.claude_model_access import ClaudeModelAccess
+from omnigent.inner.credential_proxy import CredentialRewriteRule
+from omnigent.inner.datamodel import (
+    CredentialProxyEntry,
+    CredentialProxySpec,
+    CredentialSourceSpec,
+    OSEnvSandboxSpec,
+    OSEnvSpec,
+)
+from omnigent.inner.egress.certs import HostCertCache
+from omnigent.inner.egress.proxy import EgressProxy
+from omnigent.inner.sandbox import SandboxPolicy
+from tests._helpers.egress_ca import prepare_isolated_egress_ca
+from tests._helpers.live_server import terminate_process
+from tests._helpers.polling import poll_until
+from tests._helpers.stdio_jsonrpc import read_json_line
+
+
+@pytest.fixture(autouse=True)
+def isolated_claude_auth(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Synthetic providers must never receive an ambient account's credential.
+    for name in tuple(os.environ):
+        if name.startswith(("ANTHROPIC_", "CLAUDE_", "HARNESS_", "DATABRICKS_")):
+            monkeypatch.delenv(name)
+    monkeypatch.delenv("OMNIGENT_CLAUDE_API_KEY_HELPER", raising=False)
+
+
+def _require_cli_e2e() -> None:
+    if os.environ.get("OMNIGENT_CLAUDE_CLI_E2E") != "1":
+        pytest.skip("set OMNIGENT_CLAUDE_CLI_E2E=1 in a clean CLI integration worker")
+
+
+def _start_test_server(server: ThreadingHTTPServer, request: pytest.FixtureRequest) -> None:
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    def close() -> None:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    request.addfinalizer(close)
+
+
+def _assert_tool_result(requests, tool_use_id: str, marker: str) -> None:
+    results = [
+        block
+        for request in requests
+        for message in request["body"]["messages"]
+        if message["role"] == "user" and isinstance(message["content"], list)
+        for block in message["content"]
+        if block.get("type") == "tool_result" and block.get("tool_use_id") == tool_use_id
+    ]
+    assert results, f"no user tool result for {tool_use_id}"
+    assert any(
+        not result.get("is_error", False) and marker in json.dumps(result.get("content"))
+        for result in results
+    ), results
+
+
+@pytest.fixture
+def worker_policy(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SandboxPolicy:
+    policy = SandboxPolicy(
+        backend_type="linux_bwrap",
+        active=True,
+        read_roots=[tmp_path],
+        write_roots=[tmp_path],
+        write_files=[],
+        allow_network=False,
+    )
+    monkeypatch.setattr(claude, "resolve_sandbox", lambda *_: policy)
+    monkeypatch.setattr(claude, "_claude_internal_write_roots", list)
+    monkeypatch.setattr(claude, "_claude_internal_write_files", list)
+    backend = Mock()
+    backend.wrap_launcher_argv.side_effect = lambda argv, *a, **k: ["bwrap", *argv]
+    monkeypatch.setattr(claude, "get_backend", lambda _: backend)
+    monkeypatch.setattr(
+        claude,
+        "resolve_claude_model_access",
+        lambda *a, **k: ClaudeModelAccess("https://model.test", "x-api-key", lambda: "synthetic"),
+    )
+    monkeypatch.setattr(
+        claude,
+        "start_egress_proxy",
+        Mock(
+            return_value=Mock(
+                relay_port=34567,
+                socket_path=tmp_path / "relay.sock",
+                ca_bundle_path=tmp_path / "ca.pem",
+            )
+        ),
+    )
+    return policy
+
+
+def test_backend_that_does_not_wrap_is_rejected(
+    worker_policy: SandboxPolicy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = Mock()
+    backend.wrap_launcher_argv.side_effect = lambda argv, *a, **k: argv
+    monkeypatch.setattr(claude, "get_backend", lambda _: backend)
+    with pytest.raises(OSError, match="cannot contain"):
+        claude.prepare_claude_cli_path("/bin/claude", OSEnvSpec())
+
+
+def test_inactive_policy_cannot_silently_disable_a_requested_sandbox(
+    worker_policy: SandboxPolicy,
+) -> None:
+    worker_policy.active = False
+    with pytest.raises(OSError, match="inactive policy"):
+        claude.prepare_claude_cli_path("/bin/claude", OSEnvSpec())
+
+
+def test_worker_uses_the_resolved_workspace_for_policy_and_spawn(
+    worker_policy: SandboxPolicy, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path))
+    monkeypatch.setattr(claude, "_find_system_claude", lambda: "/bin/claude")
+    launcher = Mock(return_value=str(tmp_path / "launcher"))
+    monkeypatch.setattr(claude, "create_exec_launcher", launcher)
+    executor = claude.ClaudeSDKExecutor(os_env=OSEnvSpec(cwd="."))
+    try:
+        assert executor._cwd == str(tmp_path)
+        assert launcher.call_args.kwargs["cwd"] == str(tmp_path)
+        assert executor._prepared_cli is not None
+        scratch = executor._prepared_cli._runtime_tmpdir
+        assert scratch is not None
+        assert scratch.is_dir()
+        assert executor._extra_env["CLAUDE_CODE_TMPDIR"] == str(scratch)
+    finally:
+        assert executor._prepared_cli is not None
+        executor._prepared_cli.close()
+    assert not scratch.exists()
+
+
+def test_missing_cli_cannot_delegate_uncontained_discovery_to_the_sdk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(claude, "_find_system_claude", lambda: None)
+    monkeypatch.setattr(claude, "_find_bundled_claude", lambda: None)
+    with pytest.raises(OSError, match="system or SDK-bundled CLI"):
+        claude.ClaudeSDKExecutor(os_env=OSEnvSpec())
+
+
+def test_sdk_bundled_cli_uses_the_same_required_sandbox(
+    worker_policy: SandboxPolicy, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(claude, "_find_system_claude", lambda: None)
+    monkeypatch.setattr(claude, "_find_bundled_claude", lambda: "/sdk/_bundled/claude")
+    launcher = Mock(return_value=str(tmp_path / "launcher"))
+    monkeypatch.setattr(claude, "create_exec_launcher", launcher)
+    executor = claude.ClaudeSDKExecutor(os_env=OSEnvSpec())
+    try:
+        assert launcher.call_args.args[0] == "/sdk/_bundled/claude"
+        assert executor._cli_path == str(tmp_path / "launcher")
+    finally:
+        assert executor._prepared_cli is not None
+        executor._prepared_cli.close()
+
+
+@pytest.mark.parametrize(
+    "stop_error", [None, OSError("stop failed")], ids=["stopped", "stop-error"]
+)
+def test_egress_failure_releases_proxy_and_preserves_caller_environment(
+    worker_policy: SandboxPolicy,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stop_error: OSError | None,
+) -> None:
+    proxy = Mock(
+        relay_port=34567,
+        socket_path=tmp_path / "relay.sock",
+        ca_bundle_path=tmp_path / "ca.pem",
+    )
+    proxy.stop.side_effect = stop_error
+    monkeypatch.setattr(claude, "start_egress_proxy", Mock(return_value=proxy))
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(claude, "create_private_tmpdir", lambda: scratch)
+    monkeypatch.setattr(
+        claude, "create_exec_launcher", Mock(side_effect=OSError("launcher unavailable"))
+    )
+    env = {"NO_PROXY": "*"}
+    with pytest.raises(OSError, match="launcher unavailable"):
+        claude.prepare_claude_cli_path(
+            "/bin/claude",
+            OSEnvSpec(
+                sandbox=OSEnvSandboxSpec(egress_rules=["POST api.anthropic.com/v1/messages"])
+            ),
+            worker_env=env,
+        )
+    assert env == {"NO_PROXY": "*"}
+    proxy.stop.assert_called_once()
+    assert not scratch.exists()
+
+
+def test_brokered_model_access_requires_worker_environment(
+    worker_policy: SandboxPolicy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    create_runtime = Mock(side_effect=AssertionError("must reject before runtime creation"))
+    monkeypatch.setattr(claude, "create_private_tmpdir", create_runtime)
+    access = ClaudeModelAccess("https://model.test", "x-api-key", lambda: "synthetic")
+
+    with pytest.raises(ValueError, match="owned worker environment"):
+        claude.prepare_claude_cli_path("/bin/claude", OSEnvSpec(), model_access=access)
+
+    with pytest.raises(ValueError, match="owned worker environment"):
+        claude.prepare_claude_cli_path(
+            "/bin/claude",
+            OSEnvSpec(sandbox=OSEnvSandboxSpec(egress_rules=["POST model.test/v1/messages"])),
+        )
+
+    with pytest.raises(OSError, match="caller_process"):
+        claude.prepare_claude_cli_path("/bin/claude", OSEnvSpec(type="none"), model_access=access)
+
+    create_runtime.assert_not_called()
+
+
+@pytest.fixture
+def real_worker_spec(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> OSEnvSpec:
+    if sys.platform == "darwin" and shutil.which("sandbox-exec"):
+        backend = "darwin_seatbelt"
+    elif sys.platform == "linux" and shutil.which("bwrap"):
+        backend = "linux_bwrap"
+    else:
+        pytest.skip("requires Seatbelt or bubblewrap")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state = tmp_path / "claude-state"
+    state.mkdir()
+    monkeypatch.setattr(claude, "_claude_internal_write_roots", lambda: [state])
+    monkeypatch.setattr(claude, "_claude_internal_write_files", list)
+    return OSEnvSpec(
+        cwd=str(workspace),
+        sandbox=OSEnvSandboxSpec(
+            type=backend,
+            write_paths=["."],
+            allow_network=False,
+        ),
+    )
+
+
+def test_cli_internal_shell_inherits_filesystem_network_and_env_restrictions(
+    real_worker_spec: OSEnvSpec,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+) -> None:
+    """The child shell runs without an Omnigent or vendor tool permission hook."""
+    private_dir = tempfile.TemporaryDirectory(prefix="omnigent-private-canary-", dir=Path.home())
+    request.addfinalizer(private_dir.cleanup)
+    private = Path(private_dir.name) / "private-canary"
+    private.write_text("private-canary-value")
+    outside = tmp_path / "forbidden-write"
+    workspace = Path(real_worker_spec.cwd or "")
+    monkeypatch.setenv("OMNIGENT_SKILL_PRIVATE_CANARY", "private-env-value")
+    worker_env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path / "claude-state")}
+    listener = socket.socket()
+    request.addfinalizer(listener.close)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(4)
+    port = listener.getsockname()[1]
+    # Prove the destination is reachable before testing the sandbox's denial.
+    socket.create_connection(("127.0.0.1", port), timeout=1).close()
+    probe = f"""
+import json, os, pathlib, socket, subprocess
+result = {{}}
+subprocess.run(['/bin/sh', '-c', 'printf allowed > skill-ran'], check=True)
+for name, op in [
+    ('read', lambda: pathlib.Path({str(private)!r}).read_text()),
+    ('write', lambda: pathlib.Path({str(outside)!r}).write_text('forbidden')),
+    ('network', lambda: socket.create_connection(('127.0.0.1', {port}), timeout=1)),
+]:
+    try:
+        op()
+        result[name] = 'allowed'
+    except OSError:
+        result[name] = 'blocked'
+result['env'] = os.environ.get('OMNIGENT_SKILL_PRIVATE_CANARY')
+print(json.dumps(result))
+"""
+    prepared = claude.prepare_claude_cli_path(
+        sys.executable,
+        real_worker_spec,
+        worker_env=worker_env,
+        model_access=ClaudeModelAccess("https://model.test", "x-api-key", lambda: "synthetic-key"),
+    )
+    assert prepared.cli_path is not None
+    try:
+        result = subprocess.run(
+            [prepared.cli_path, "-c", probe],
+            cwd=workspace,
+            env={**os.environ, **worker_env},
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        assert result.returncode == 0, result.stderr
+        report = json.loads(result.stdout)
+        # A private /tmp may accept writes, but the host path must stay absent.
+        assert report.pop("write") in ("allowed", "blocked")
+        assert report == {"read": "blocked", "network": "blocked", "env": None}
+        assert (workspace / "skill-ran").read_text() == "allowed"
+        assert not outside.exists()
+    finally:
+        prepared.close()
+        listener.close()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux bound host procfs")
+def test_bound_host_proc_does_not_expose_synthetic_parent(
+    real_worker_spec: OSEnvSpec,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A visible parent PID must not expose its root, environment, or descriptors."""
+    private = tmp_path / "parent-private"
+    private.write_text("parent-file-canary")
+    ready = tmp_path / "parent-ready"
+    parent = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import os, signal, sys\n"
+            "descriptor = os.open(sys.argv[1], os.O_RDONLY)\n"
+            "with open(sys.argv[2], 'w') as ready: ready.write(str(descriptor))\n"
+            "signal.pause()\n",
+            str(private),
+            str(ready),
+        ],
+        env={"PATH": os.environ["PATH"], "PROC_TEST_CANARY": "parent-env-canary"},
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        poll_until(
+            lambda: ready.exists() or parent.poll() is not None, timeout_s=5, interval_s=0.05
+        )
+        assert ready.exists(), (
+            parent.stderr.read().decode()
+            if parent.poll() is not None and parent.stderr
+            else "synthetic parent did not become ready"
+        )
+        assert parent.poll() is None
+        descriptor = int(ready.read_text())
+        parent_proc = Path(f"/proc/{parent.pid}")
+        root_alias = parent_proc / "root" / private.relative_to("/")
+        env_alias = parent_proc / "environ"
+        descriptor_alias = parent_proc / "fd" / str(descriptor)
+        assert root_alias.read_text() == "parent-file-canary"
+        assert b"PROC_TEST_CANARY=parent-env-canary" in env_alias.read_bytes()
+        assert descriptor_alias.read_text() == "parent-file-canary"
+        parent_comm = (parent_proc / "comm").read_text().strip()
+
+        monkeypatch.setattr("omnigent.inner.bwrap_sandbox._should_bind_host_proc", lambda: True)
+        workspace = Path(real_worker_spec.cwd or "")
+        worker_env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path / "claude-state")}
+        probe = f"""
+import json, pathlib
+result = {{'comm': pathlib.Path({str(parent_proc / "comm")!r}).read_text().strip()}}
+for name, path in [
+    ('root', {str(root_alias)!r}),
+    ('environ', {str(env_alias)!r}),
+    ('descriptor', {str(descriptor_alias)!r}),
+]:
+    try:
+        pathlib.Path(path).read_bytes()
+        result[name] = 'exposed'
+    except OSError:
+        result[name] = 'blocked'
+print(json.dumps(result))
+"""
+        prepared = claude.prepare_claude_cli_path(
+            sys.executable,
+            real_worker_spec,
+            worker_env=worker_env,
+            model_access=ClaudeModelAccess(
+                "https://model.test", "x-api-key", lambda: "synthetic-key"
+            ),
+        )
+        assert prepared.cli_path is not None
+        try:
+            result = subprocess.run(
+                [prepared.cli_path, "-c", probe],
+                cwd=workspace,
+                env={**os.environ, **worker_env},
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            assert result.returncode == 0, result.stderr
+            assert json.loads(result.stdout) == {
+                "comm": parent_comm,
+                "root": "blocked",
+                "environ": "blocked",
+                "descriptor": "blocked",
+            }
+        finally:
+            prepared.close()
+    finally:
+        terminate_process(parent, timeout_s=5)
+        if parent.stderr:
+            parent.stderr.close()
+
+
+def test_filtered_worker_networking_preserves_policy_credentials_and_gateway_thinking(
+    real_worker_spec: OSEnvSpec,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+) -> None:
+    """An allowed model request works while direct and forbidden requests fail."""
+    requests: list[tuple[str | None, bytes]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            requests.append((self.headers.get("Authorization"), body))
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    request.addfinalizer(server.server_close)
+    _start_test_server(server, request)
+    port = server.server_port
+    base_url = f"http://127.0.0.1:{port}/gateway"
+    assert real_worker_spec.sandbox is not None
+    real_worker_spec.sandbox.allow_network = True
+    real_worker_spec.sandbox.egress_rules = ["POST 127.0.0.1/gateway/v1/messages"]
+    real_worker_spec.sandbox.egress_allow_private_destinations = True
+    real_worker_spec.sandbox.credential_proxy = CredentialProxySpec(
+        entries=[
+            CredentialProxyEntry(
+                host="127.0.0.1",
+                scheme="bearer",
+                source=CredentialSourceSpec(kind="env", env="CLAUDE_TEST_PARENT_SECRET"),
+                inject_env=["ANTHROPIC_AUTH_TOKEN"],
+            )
+        ]
+    )
+    monkeypatch.setenv("CLAUDE_TEST_PARENT_SECRET", "real-parent-secret")
+    monkeypatch.setenv("NO_PROXY", "*")
+    env = {
+        "HOME": str(tmp_path / "claude-state"),
+        "PATH": os.environ["PATH"],
+        "NO_PROXY": "*",
+    }
+    prepared = claude.prepare_claude_cli_path(
+        sys.executable,
+        real_worker_spec,
+        worker_env=env,
+        request_body_transform=claude.gateway_body_transform(base_url),
+        model_access=ClaudeModelAccess("https://model.test", "x-api-key", lambda: "synthetic-key"),
+    )
+    launcher = Path(prepared.cli_path or "")
+    scratch = prepared._runtime_tmpdir
+    assert scratch is not None
+    settings_path = prepared.settings_for_cli(None)
+    probe = f"""
+import json, os, socket, urllib.request, urllib.error
+with open({settings_path!r}) as settings:
+    os.environ.update(json.load(settings)['env'])
+assert 'NO_PROXY' not in os.environ
+assert 'CLAUDE_TEST_PARENT_SECRET' not in os.environ
+assert os.environ['ANTHROPIC_AUTH_TOKEN'].startswith('oa_cred_')
+result = {{}}
+try:
+    socket.create_connection(('127.0.0.1', {port}), timeout=1)
+    result['direct'] = 'allowed'
+except OSError:
+    result['direct'] = 'blocked'
+body = json.dumps({{'model': 'databricks-claude-opus-4-8',
+                   'thinking': {{'type': 'adaptive'}}}}).encode()
+for name, method, path in [('allowed', 'POST', '/v1/messages'),
+                           ('path', 'POST', '/forbidden'),
+                           ('method', 'GET', '/v1/messages')]:
+    req = urllib.request.Request({base_url!r} + path, data=body, method=method,
+        headers={{'Authorization': 'Bearer ' + os.environ['ANTHROPIC_AUTH_TOKEN']}})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as response:
+            result[name] = response.status
+    except urllib.error.HTTPError as exc:
+        result[name] = exc.code
+print(json.dumps(result))
+"""
+    try:
+        result = subprocess.run(
+            [str(launcher), "-c", probe],
+            cwd=real_worker_spec.cwd,
+            env={**os.environ, **env},
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout) == {
+            "direct": "blocked",
+            "allowed": 200,
+            "path": 403,
+            "method": 403,
+        }
+        assert len(requests) == 1
+        auth, body = requests[0]
+        assert auth == "Bearer real-parent-secret"
+        assert json.loads(body)["thinking"]["display"] == "summarized"
+    finally:
+        prepared.close()
+        prepared.close()
+    assert not launcher.exists()
+    assert not scratch.exists()
+
+
+@pytest.mark.parametrize("proxy_factory", ["generic", "automatic-model"])
+def test_prepared_cli_authenticates_shared_loopback_credential_relay(
+    real_worker_spec: OSEnvSpec,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+    proxy_factory: str,
+) -> None:
+    """A host-local client needs the CLI's proxy capability before credentials resolve."""
+    cert, key, bundle = prepare_isolated_egress_ca(tmp_path / "ca", monkeypatch)
+    captured: list[tuple[str | None, str | None, bytes]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            captured.append(
+                (self.headers.get("Authorization"), self.headers.get("Proxy-Authorization"), body)
+            )
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.socket = (
+        HostCertCache(cert, key)
+        .get_ssl_context("localhost")
+        .wrap_socket(server.socket, server_side=True)
+    )
+    accept_upstream = Mock(wraps=server.get_request)
+    monkeypatch.setattr(server, "get_request", accept_upstream)
+    _start_test_server(server, request)
+    endpoint = f"https://localhost:{server.server_port}/credential-bound"
+    assert real_worker_spec.sandbox is not None
+    real_worker_spec.sandbox.egress_rules = ["POST localhost/credential-bound"]
+    real_worker_spec.sandbox.egress_allow_private_destinations = True
+    real_worker_spec.sandbox.credential_proxy = CredentialProxySpec(
+        entries=[
+            CredentialProxyEntry(
+                host="localhost",
+                scheme="bearer",
+                source=CredentialSourceSpec(kind="env", env="CLAUDE_TEST_PARENT_SECRET"),
+            )
+        ]
+    )
+    monkeypatch.setenv("CLAUDE_TEST_PARENT_SECRET", "synthetic-parent-credential")
+    original_resolver = CredentialRewriteRule.resolve_secret
+    resolve_credential = Mock(side_effect=original_resolver)
+    monkeypatch.setattr(
+        CredentialRewriteRule, "resolve_secret", lambda rule: resolve_credential(rule)
+    )
+    resolve_model = Mock(
+        side_effect=AssertionError("non-model traffic must not resolve model auth")
+    )
+    access = ClaudeModelAccess(
+        "https://model.test", "x-api-key", resolve_model, static_credential_value="synthetic-key"
+    )
+    if proxy_factory == "generic":
+        monkeypatch.setattr(
+            ClaudeModelAccess,
+            "create_proxy",
+            lambda self, *args, **kwargs: EgressProxy(*args, **kwargs),
+        )
+    monkeypatch.setattr(
+        claude, "create_exec_launcher", Mock(return_value=str(tmp_path / "unused-launcher"))
+    )
+    environment = {"PATH": os.environ["PATH"]}
+    prepared = claude.prepare_claude_cli_path(
+        sys.executable, real_worker_spec, worker_env=environment, model_access=access
+    )
+    handle = prepared._egress_handle
+    assert handle is not None
+    scratch = prepared._runtime_tmpdir
+    assert scratch is not None
+    relay_code = (
+        "import json, sys; from omnigent.inner.egress.relay import start_relay; "
+        "ready = start_relay(int(sys.argv[1]), sys.argv[2]); assert ready.wait(5); "
+        "print(json.dumps({'status': 'READY'}), flush=True); sys.stdin.read()"
+    )
+    try:
+        # Run outside a network namespace so another host process can reach the relay.
+        with subprocess.Popen(
+            [sys.executable, "-c", relay_code, str(handle.relay_port), str(handle.socket_path)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        ) as relay:
+            try:
+                assert relay.stdout is not None
+                assert read_json_line(relay.stdout, timeout_s=10) == {"status": "READY"}
+                trust = ssl.create_default_context(cafile=str(bundle))
+                with httpx.Client(
+                    proxy=f"http://127.0.0.1:{handle.relay_port}",
+                    verify=trust,
+                    trust_env=False,
+                    timeout=5,
+                ) as unauthorized:
+                    message = unauthorized.build_request("POST", endpoint, content=b"unauthorized")
+                    assert "Authorization" not in message.headers
+                    assert "Proxy-Authorization" not in message.headers
+                    try:
+                        response = unauthorized.send(message)
+                    except httpx.ProxyError as error:
+                        assert "407 Proxy Authentication Required" in str(error)
+                    else:
+                        pytest.fail(
+                            f"unauthenticated client received {response.status_code}; "
+                            f"credential resolutions={resolve_credential.call_count}, "
+                            f"upstream requests={len(captured)}"
+                        )
+                resolve_credential.assert_not_called()
+                resolve_model.assert_not_called()
+                accept_upstream.assert_not_called()
+                assert captured == []
+                assert handle.auth_token is not None
+                settings = prepared.settings_for_cli(None)
+                assert settings is not None
+                settings_path = Path(settings)
+                assert settings_path.is_relative_to(scratch)
+                assert settings_path.stat().st_mode & 0o777 == 0o600
+                settings_text = settings_path.read_text()
+                assert "synthetic-parent-credential" not in settings_text
+                assert "synthetic-parent-credential" not in json.dumps(environment)
+                assert handle.auth_token not in json.dumps(environment)
+                proxy_url = json.loads(settings_text)["env"]["HTTPS_PROXY"]
+                with httpx.Client(
+                    proxy=proxy_url, verify=trust, trust_env=False, timeout=5
+                ) as authorized:
+                    message = authorized.build_request("POST", endpoint, content=b"authorized")
+                    assert "Authorization" not in message.headers
+                    response = authorized.send(message)
+                assert response.status_code == 200
+                assert response.content == b"ok"
+                resolve_credential.assert_called_once()
+                resolve_model.assert_not_called()
+                accept_upstream.assert_called_once()
+                assert captured == [("Bearer synthetic-parent-credential", None, b"authorized")]
+            finally:
+                terminate_process(relay, timeout_s=5)
+    finally:
+        prepared.close()
+    assert relay.poll() is not None
+    assert not handle._thread.is_alive()
+    assert not handle.socket_path.exists()
+    assert not scratch.exists()
+    assert not settings_path.exists()
+
+
+def test_model_inference_is_automatic_and_credentials_stay_outside_real_worker(
+    real_worker_spec: OSEnvSpec,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+) -> None:
+    """The production launcher must work with network denied and no egress rules."""
+    cert, key, _ = prepare_isolated_egress_ca(tmp_path / "ca", monkeypatch)
+    requests: list[tuple[str | None, bytes]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self) -> None:
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            requests.append((self.headers.get("x-api-key"), body))
+            payload = b"ok"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    request.addfinalizer(server.server_close)
+    context = HostCertCache(cert, key).get_ssl_context("model.test")
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    _start_test_server(server, request)
+    env = {"PATH": os.environ["PATH"], "ANTHROPIC_API_KEY": "parent-secret"}
+    access = ClaudeModelAccess("https://model.test", "x-api-key", lambda: "parent-secret")
+    prepared = claude.prepare_claude_cli_path(
+        sys.executable, real_worker_spec, worker_env=env, model_access=access
+    )
+    assert prepared._egress_handle is not None
+    proxy = prepared._egress_handle._proxy
+    monkeypatch.setattr(proxy, "_provider_port", server.server_port)
+    monkeypatch.setattr(proxy, "_assert_destination_allowed", AsyncMock(return_value="127.0.0.1"))
+    settings_path = prepared.settings_for_cli(None)
+    probe = (
+        f"""
+import json, os
+with open({settings_path!r}) as settings:
+    os.environ.update(json.load(settings)['env'])
+"""
+        + """
+import json, os, urllib.request, urllib.error
+assert 'ANTHROPIC_API_KEY' not in os.environ
+assert 'parent-secret' not in json.dumps(dict(os.environ))
+headers = {'Authorization': 'Bearer ' + os.environ['ANTHROPIC_AUTH_TOKEN'],
+           'Content-Type': 'application/json'}
+body = json.dumps({'model': 'claude-test', 'messages': []}).encode()
+result = {}
+for path in ('/v1/messages', '/v1/messages/count_tokens', '/v1/models'):
+    request = urllib.request.Request('https://model.test' + path, data=body, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            result[path] = response.status
+    except urllib.error.HTTPError as exc:
+        result[path] = exc.code
+print(json.dumps(result))
+"""
+    )
+    try:
+        result = subprocess.run(
+            [prepared.cli_path or "", "-c", probe],
+            cwd=real_worker_spec.cwd,
+            env={**os.environ, **env},
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        assert result.returncode == 0, (result.stdout, result.stderr)
+        assert json.loads(result.stdout) == {
+            "/v1/messages": 200,
+            "/v1/messages/count_tokens": 200,
+            "/v1/models": 403,
+        }
+        assert len(requests) == 2
+        assert all(key == "parent-secret" for key, _ in requests)
+    finally:
+        prepared.close()
+
+
+@pytest.fixture(params=["bundled", "system"])
+def real_claude_cli(request: pytest.FixtureRequest) -> str:
+    """Exercise both CLI discovery paths without changing host-managed policy."""
+    _require_cli_e2e()
+    for path in (
+        Path("/Library/Application Support/ClaudeCode/managed-settings.json"),
+        Path("/etc/claude-code/managed-settings.json"),
+    ):
+        if path.is_file():
+            endpoint = json.loads(path.read_text()).get("env", {}).get("ANTHROPIC_BASE_URL")
+            if endpoint and endpoint != "https://model.test":
+                pytest.skip("run in a clean worker: machine-managed endpoint overrides test API")
+    cli = (
+        claude._find_bundled_claude()
+        if request.param == "bundled"
+        else claude._find_system_claude()
+    )
+    if cli is None:
+        pytest.skip(f"requires the {request.param} Claude CLI")
+    return cli
+
+
+@pytest.fixture
+def cli_model_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+):
+    """Real TLS provider; only its address is substituted, after relay validation."""
+    cert, key, _ = prepare_isolated_egress_ca(tmp_path / "cli-ca", monkeypatch)
+    requests = []
+    replies = []
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            requests.append({"path": self.path, "headers": dict(self.headers), "body": body})
+            nested_terminal = not body.get("tools") and "TERMINAL_NESTED_PROBE" in json.dumps(
+                body["messages"]
+            )
+            if replies and not nested_terminal:
+                next_reply = replies.pop(0)
+                blocks = next_reply() if callable(next_reply) else next_reply
+            else:
+                blocks = [{"type": "text", "text": "CLI_E2E_OK"}]
+            message = {
+                "id": f"msg_cli_{len(requests)}",
+                "type": "message",
+                "role": "assistant",
+                "model": body["model"],
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 1, "output_tokens": 0},
+            }
+            events = [{"type": "message_start", "message": message}]
+            for index, block in enumerate(blocks):
+                tool = block["type"] == "tool_use"
+                start = {**block, "input": {}} if tool else {"type": "text", "text": ""}
+                delta = (
+                    {"type": "input_json_delta", "partial_json": json.dumps(block["input"])}
+                    if tool
+                    else {"type": "text_delta", "text": block["text"]}
+                )
+                events.extend(
+                    [
+                        {"type": "content_block_start", "index": index, "content_block": start},
+                        {"type": "content_block_delta", "index": index, "delta": delta},
+                        {"type": "content_block_stop", "index": index},
+                    ]
+                )
+            events.extend(
+                [
+                    {
+                        "type": "message_delta",
+                        "delta": {
+                            "stop_reason": "tool_use"
+                            if any(b["type"] == "tool_use" for b in blocks)
+                            else "end_turn",
+                            "stop_sequence": None,
+                        },
+                        "usage": {"output_tokens": 1},
+                    },
+                    {"type": "message_stop"},
+                ]
+            )
+            payload = "".join(
+                f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format, *args):
+            pass
+
+    port = getattr(request, "param", 0)
+    params = request.node.callspec.params
+    host = "api.anthropic.com" if params.get("auth_kind") == "oauth" else "model.test"
+    if port:
+        import fcntl
+
+        lock = (Path(tempfile.gettempdir()) / "omnigent-claude-cli-443.lock").open("a")
+        request.addfinalizer(lock.close)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    request.addfinalizer(server.server_close)
+    server.socket = (
+        HostCertCache(cert, key)
+        .get_ssl_context("localhost" if port == 443 else host)
+        .wrap_socket(server.socket, server_side=True)
+    )
+    _start_test_server(server, request)
+    # All authorized model traffic ends on this listener; nothing goes off-machine.
+    from omnigent.inner.claude_model_access import _ClaudeRelay
+
+    original_init = _ClaudeRelay.__init__
+
+    def local_relay(self, **kwargs):
+        original_init(self, **kwargs)
+        self._provider_port = server.server_port
+
+    monkeypatch.setattr(_ClaudeRelay, "__init__", local_relay)
+    monkeypatch.setattr(
+        _ClaudeRelay, "_assert_destination_allowed", AsyncMock(return_value="127.0.0.1")
+    )
+    yield requests, replies
+
+
+def _cli_args(
+    prompt: str,
+    *,
+    streaming: bool = False,
+    tools: str = "",
+    bare: bool = True,
+    prepared: claude.PreparedClaudeCli | None = None,
+    settings: dict | None = None,
+) -> list[str]:
+    payload = json.dumps(settings if settings is not None else {"disableAllHooks": True})
+    settings_arg = prepared.settings_for_cli(payload) if prepared is not None else payload
+    assert settings_arg is not None
+    return [
+        *(["--bare"] if bare else []),
+        "--print",
+        "--model",
+        "claude-sonnet-4-6",
+        "--output-format",
+        "stream-json" if streaming else "json",
+        *(["--verbose", "--include-partial-messages"] if streaming else []),
+        "--setting-sources",
+        "",
+        "--settings",
+        settings_arg,
+        "--max-turns",
+        "3",
+        "--tools",
+        tools,
+        "--allowed-tools",
+        tools,
+        "--",
+        prompt,
+    ]
+
+
+@pytest.mark.parametrize("auth_kind", ["api_key", "bearer", "oauth"])
+def test_real_cli_completes_streamed_inference_with_parent_owned_auth(
+    real_claude_cli: str, real_worker_spec: OSEnvSpec, cli_model_server, auth_kind: str
+) -> None:
+    requests, _ = cli_model_server
+    host = "api.anthropic.com" if auth_kind == "oauth" else "model.test"
+    env = {"PATH": os.environ["PATH"], "ANTHROPIC_BASE_URL": f"https://{host}"}
+    env[
+        {
+            "api_key": "ANTHROPIC_API_KEY",
+            "bearer": "ANTHROPIC_AUTH_TOKEN",
+            "oauth": "CLAUDE_CODE_OAUTH_TOKEN",
+        }[auth_kind]
+    ] = "parent-only-cli-secret"
+    if auth_kind == "api_key":
+        # Claude resolves a relative config directory from its workspace.
+        env["CLAUDE_CONFIG_DIR"] = "../claude-state"
+    prepared = claude.prepare_claude_cli_path(real_claude_cli, real_worker_spec, worker_env=env)
+    try:
+        if auth_kind == "api_key":
+            assert prepared.model_access is not None
+            assert prepared.sandbox is not None
+            assert Path(real_worker_spec.cwd or "").parent / "claude-state" in (
+                prepared.sandbox.credential_source_paths or []
+            )
+        result = subprocess.run(
+            [
+                prepared.cli_path,
+                # Bare mode deliberately skips the CLI's OAuth login flow.
+                *_cli_args(
+                    "Say the test marker.",
+                    streaming=True,
+                    bare=auth_kind != "oauth",
+                    prepared=prepared,
+                ),
+            ],
+            cwd=real_worker_spec.cwd,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 0, result.stdout + "\n" + result.stderr
+        events = [json.loads(line) for line in result.stdout.splitlines()]
+        assert events[-1]["type"] == "result"
+        assert events[-1]["result"] == "CLI_E2E_OK"
+        assert any(
+            e["type"] == "stream_event" and e["event"]["type"] == "content_block_delta"
+            for e in events
+        )
+        assert requests
+        expected = (
+            "parent-only-cli-secret" if auth_kind == "api_key" else "Bearer parent-only-cli-secret"
+        )
+        header = "x-api-key" if auth_kind == "api_key" else "authorization"
+        assert all(
+            {k.lower(): v for k, v in r["headers"].items()}[header] == expected for r in requests
+        )
+        assert all(r["path"].split("?")[0] == "/v1/messages" for r in requests)
+        assert "parent-only-cli-secret" not in result.stdout + result.stderr + json.dumps(env)
+    finally:
+        prepared.close()
+
+
+def test_real_cli_bash_tool_round_trip_and_inline_skill_finish(
+    real_claude_cli: str,
+    real_worker_spec: OSEnvSpec,
+    cli_model_server,
+    tmp_path: Path,
+    execution_probe,
+) -> None:
+    requests, replies = cli_model_server
+    assert real_worker_spec.sandbox is not None
+    real_worker_spec.sandbox.allow_network = True
+    workspace = Path(real_worker_spec.cwd)
+    private = tmp_path / "parent-secret-file"
+    private.write_text("parent-file-canary")
+    state = tmp_path / "claude-state"
+    credential_file = state / ".credentials.json"
+    credential_file.write_text(
+        json.dumps(
+            {"claudeAiOauth": {"accessToken": "fake-access", "refreshToken": "fake-refresh"}}
+        )
+    )
+    bundle = tmp_path / "private-agent-bundle"
+    (bundle / ".claude-plugin").mkdir(parents=True)
+    (bundle / ".claude-plugin/plugin.json").write_text('{"name":"cli-probe"}')
+    (bundle / "config.yaml").write_text("api_key: parent-only-cli-secret\n")
+    (bundle / ".mcp.json").write_text('{"env":{"token":"parent-only-cli-secret"}}')
+    skill = bundle / "skills/probe"
+    skill.mkdir(parents=True)
+    # Inline expansion must run, but both credentials and private paths must be absent.
+    probe = (
+        execution_probe[0] + "; "
+        "printf SKILL_OK > skill-marker; "
+        "env > skill-env; "
+        f"cat {shlex.quote(str(credential_file))} > credential-leak 2>/dev/null; "
+        f"cat {shlex.quote(str(bundle / 'config.yaml'))} > bundle-leak 2>/dev/null; "
+        f"cat {shlex.quote(str(private))} > private-leak 2>/dev/null; "
+        f"printf forbidden > {shlex.quote(str(tmp_path / 'outside-write'))} 2>/dev/null; "
+        "printf INLINE_OK"
+    )
+    (skill / "SKILL.md").write_text(
+        "---\nname: probe\ndescription: CLI isolation probe\nallowed-tools: Bash\n---\n"
+        f"!`/bin/sh -c {shlex.quote(probe)}`\nReport the result.\n"
+    )
+    real_worker_spec.sandbox.cwd_allow_hidden = [".claude-plugin"]
+    command, _, outside = execution_probe
+    bash_report = workspace / "bash-execution-report.json"
+    bash_command = command + " --report " + shlex.quote(str(bash_report))
+    replies.append(
+        [
+            {
+                "type": "tool_use",
+                "id": "toolu_cli_probe",
+                "name": "Bash",
+                "input": {
+                    "command": bash_command
+                    + "; printf TOOL_OK > tool-marker; printf TOOL_ROUNDTRIP_OK"
+                },
+            }
+        ]
+    )
+    env = {
+        "HOME": str(state),
+        "CLAUDE_CONFIG_DIR": str(state),
+        "PATH": os.environ["PATH"],
+        "ANTHROPIC_BASE_URL": "https://model.test",
+        "ANTHROPIC_API_KEY": "parent-only-cli-secret",
+    }
+    prepared = claude.prepare_claude_cli_path(
+        real_claude_cli,
+        real_worker_spec,
+        worker_env=env,
+        bundle_dir=bundle,
+        agent_name="cli-probe",
+    )
+    try:
+        result = subprocess.run(
+            [
+                prepared.cli_path,
+                "--plugin-dir",
+                str(prepared.plugin_dir),
+                "--permission-mode",
+                "bypassPermissions",
+                *_cli_args("/cli-probe:probe", tools="Bash,Skill", prepared=prepared),
+            ],
+            cwd=workspace,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=40,
+        )
+        assert result.returncode == 0, (result.stdout, result.stderr)
+        assert json.loads(result.stdout)["result"] == "CLI_E2E_OK"
+        assert (workspace / "skill-marker").read_text() == "SKILL_OK"
+        assert (workspace / "tool-marker").is_file(), (
+            result.stdout,
+            result.stderr,
+            [
+                [tool.get("name") for tool in request["body"].get("tools", [])]
+                for request in requests
+            ],
+            replies,
+        )
+        assert (workspace / "tool-marker").read_text() == "TOOL_OK"
+        assert (workspace / "private-leak").read_text() == ""
+        assert (workspace / "credential-leak").read_text() == ""
+        assert (workspace / "bundle-leak").read_text() == ""
+        assert prepared.plugin_dir is not None
+        assert not (prepared.plugin_dir / "config.yaml").exists()
+        assert not (prepared.plugin_dir / ".mcp.json").exists()
+        assert not (tmp_path / "outside-write").exists()
+        assert "parent-only-cli-secret" not in (workspace / "skill-env").read_text()
+        assert "fake-refresh" not in (workspace / "skill-env").read_text()
+        assert "fake-access" not in (workspace / "skill-env").read_text()
+        assert "INLINE_OK" in json.dumps(requests[0]["body"])
+        _assert_tool_result(requests, "toolu_cli_probe", "TOOL_ROUNDTRIP_OK")
+        _assert_tool_result(requests, "toolu_cli_probe", "EXECUTION_PROBE_OK")
+        _assert_execution_probe(execution_probe)
+        _assert_execution_probe((bash_command, bash_report, outside))
+        assert all("parent-file-canary" not in json.dumps(r["body"]) for r in requests)
+        assert all("fake-refresh" not in json.dumps(r["body"]) for r in requests)
+    finally:
+        prepared.close()
+
+
+@pytest.mark.parametrize(
+    "permission_mode,policy_action,approved",
+    [
+        ("bypassPermissions", "POLICY_ACTION_DENY", False),
+        ("auto", "POLICY_ACTION_DENY", False),
+        ("bypassPermissions", "POLICY_ACTION_ALLOW", True),
+        ("auto", "POLICY_ACTION_ASK", True),
+    ],
+    ids=["bypass-deny", "auto-deny", "bypass-allow", "auto-ask-approved"],
+)
+async def test_sdk_real_cli_bash_policy_runs_before_execution(
+    real_claude_cli: str,
+    real_worker_spec: OSEnvSpec,
+    cli_model_server,
+    monkeypatch: pytest.MonkeyPatch,
+    permission_mode: str,
+    policy_action: str,
+    approved: bool,
+) -> None:
+    from omnigent.inner.executor import ExecutorConfig, ExecutorError, TurnComplete
+    from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
+
+    requests, replies = cli_model_server
+    workspace = Path(real_worker_spec.cwd)
+    marker = workspace / "bash-policy-marker"
+    arguments = {"command": "printf BASH_POLICY_OK > bash-policy-marker; printf BASH_POLICY_OK"}
+    replies.append(
+        [{"type": "tool_use", "id": "toolu_bash_policy", "name": "Bash", "input": arguments}]
+    )
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://model.test")
+    monkeypatch.setattr(claude, "_find_system_claude", lambda: real_claude_cli)
+    executor = claude.ClaudeSDKExecutor(
+        os_env=real_worker_spec,
+        model="claude-sonnet-4-6",
+        permission_mode=permission_mode,
+        api_key_helper="printf %s parent-only-cli-secret",
+        skills_filter="none",
+    )
+    tool_calls = []
+
+    async def evaluate(phase, data):
+        if phase == "PHASE_TOOL_CALL":
+            assert not marker.exists(), "Bash executed before its policy hook"
+            tool_calls.append(data)
+            return PolicyVerdictPayload(action=policy_action, reason="shell policy")
+        return PolicyVerdictPayload(action="POLICY_ACTION_ALLOW")
+
+    async def approve(tool_name, tool_input):
+        assert not marker.exists(), "Bash executed before approval"
+        assert (tool_name, tool_input) == ("Bash", arguments)
+        return approved
+
+    executor._policy_evaluator = evaluate
+    executor._elicitation_handler = AsyncMock(side_effect=approve)
+    permission_callback = AsyncMock(wraps=executor._can_use_tool_for_permission)
+    monkeypatch.setattr(executor, "_can_use_tool_for_permission", permission_callback)
+    try:
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "Run the Bash probe.", "session_id": "bash-policy"}],
+                [],
+                "Execute the requested tool and report its result.",
+                ExecutorConfig(extra={"max_tokens": 1000, "max_turns": 3}),
+            )
+        ]
+        assert not [event for event in events if isinstance(event, ExecutorError)], events
+        assert any(isinstance(event, TurnComplete) for event in events)
+        assert tool_calls == [{"name": "Bash", "arguments": arguments}]
+        assert marker.exists() is approved
+        if approved:
+            assert marker.read_text() == "BASH_POLICY_OK"
+            _assert_tool_result(requests, "toolu_bash_policy", "BASH_POLICY_OK")
+        else:
+            assert "shell policy" in json.dumps(requests[-1]["body"])
+        if policy_action == "POLICY_ACTION_ASK":
+            executor._elicitation_handler.assert_awaited_once_with("Bash", arguments)
+        elif policy_action == "POLICY_ACTION_DENY" or permission_mode == "bypassPermissions":
+            executor._elicitation_handler.assert_not_awaited()
+        if permission_mode == "bypassPermissions":
+            # The CLI never asks permission in bypass; policy must run in PreToolUse.
+            permission_callback.assert_not_awaited()
+    finally:
+        await executor.close()
+
+
+async def test_sdk_real_cli_keeps_working_across_turns(
+    real_claude_cli: str,
+    real_worker_spec: OSEnvSpec,
+    cli_model_server,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from omnigent.inner.executor import ExecutorConfig, ExecutorError, TurnComplete
+
+    requests, _ = cli_model_server
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://model.test")
+    workspace = Path(real_worker_spec.cwd)
+    forwarding_cli = tmp_path / "forwarding-claude"
+    forwarding_cli.write_text(
+        '#!/bin/sh\ncase "$1" in -v) phase=version ;; *) phase=main ;; esac\n'
+        f"/usr/bin/env > {shlex.quote(str(workspace))}/sdk-$phase.env\n"
+        f'exec {shlex.quote(real_claude_cli)} "$@"\n'
+    )
+    forwarding_cli.chmod(0o755)
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "host-bearer-must-not-enter")
+    monkeypatch.setenv("ANTHROPIC_FOUNDRY_API_KEY", "inactive-credential-foundry")
+    monkeypatch.setenv("CLAUDE_CODE_CLIENT_KEY_PASSPHRASE", "inactive-credential-passphrase")
+    monkeypatch.setattr(claude, "_find_system_claude", lambda: str(forwarding_cli))
+    executor = claude.ClaudeSDKExecutor(
+        os_env=real_worker_spec,
+        model="claude-sonnet-4-6",
+        permission_mode="default",
+        api_key_helper="printf %s parent-only-cli-secret",
+        skills_filter="none",
+    )
+    messages = [{"role": "user", "content": "CLI_FIRST_TURN", "session_id": "cli-e2e"}]
+    try:
+        for turn in range(2):
+            events = [
+                event
+                async for event in executor.run_turn(
+                    messages,
+                    [],
+                    "Reply with the marker.",
+                    ExecutorConfig(extra={"max_tokens": 1000}),
+                )
+            ]
+            assert not [event for event in events if isinstance(event, ExecutorError)], events
+            assert any(isinstance(e, TurnComplete) and e.response == "CLI_E2E_OK" for e in events)
+            messages.extend(
+                [
+                    {"role": "assistant", "content": "CLI_E2E_OK"},
+                    {"role": "user", "content": f"CLI_NEXT_TURN_{turn}", "session_id": "cli-e2e"},
+                ]
+            )
+        assert len(requests) >= 2
+        assert "CLI_FIRST_TURN" in json.dumps(requests[-1]["body"])
+        assert "CLI_NEXT_TURN_0" in json.dumps(requests[-1]["body"])
+        assert requests[-1]["body"]["max_tokens"] == 1000
+        for phase in ("version", "main"):
+            inherited = (workspace / f"sdk-{phase}.env").read_text()
+            assert "host-bearer-must-not-enter" not in inherited
+            assert "inactive-credential-" not in inherited
+            assert "parent-only-cli-secret" not in inherited
+            assert "ANTHROPIC_AUTH_TOKEN=oa_cred_" in inherited
+            assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS=1000\n" in inherited
+            assert "CLAUDE_AGENT_SDK_CLIENT_APP=omnigent\n" in inherited
+            assert "ENABLE_CLAUDEAI_MCP_SERVERS=false\n" in inherited
+            assert f"HOME={Path.home()}\n" not in inherited
+        prepared = executor._prepared_cli
+        assert prepared is not None and prepared._runtime_tmpdir is not None
+        assert len(list(prepared._runtime_tmpdir.glob("cli-settings-*.json"))) == 1
+    finally:
+        await executor.close()
+
+
+def _nested_cli_path_and_read_roots(cli: str) -> tuple[Path, list[str]]:
+    """Declare an external CLI installation used from inside a test sandbox."""
+    cli_path = Path(cli).resolve()
+    if cli_path.is_relative_to(Path(sys.prefix)):
+        return cli_path, []
+    roots = [cli_path.parent]
+    if node_path := shutil.which("node"):
+        roots.append(Path(node_path).resolve().parent)
+    return cli_path, [str(root) for root in roots]
+
+
+async def test_session_terminal_runs_real_cli_with_automatic_model_access(
+    real_claude_cli: str,
+    real_worker_spec: OSEnvSpec,
+    cli_model_server,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    execution_probe,
+) -> None:
+    import asyncio
+
+    from omnigent.inner.datamodel import TerminalEnvSpec
+    from omnigent.runtime.workflow import claude_terminal_model_access
+    from omnigent.spec.types import AgentSpec, ApiKeyAuth, ExecutorSpec
+    from omnigent.terminals.registry import TerminalRegistry
+
+    if shutil.which("tmux") is None:
+        pytest.skip("requires tmux")
+    requests, _ = cli_model_server
+    real_worker_spec.sandbox.allow_network = True
+    cli_path, read_roots = _nested_cli_path_and_read_roots(real_claude_cli)
+    if read_roots:
+        real_worker_spec.sandbox.read_paths = read_roots
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://model.test")
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "parent-config"))
+    spec = AgentSpec(
+        spec_version=1,
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": "claude-sdk"},
+            auth=ApiKeyAuth(api_key="parent-only-cli-secret"),
+        ),
+    )
+    registry = TerminalRegistry()
+    workspace = Path(real_worker_spec.cwd)
+    try:
+        terminal = await registry.launch(
+            "cli-e2e",
+            "shell",
+            "main",
+            TerminalEnvSpec(
+                command="/bin/bash", args=["--noprofile", "--norc"], keep_alive_after_exit=True
+            ),
+            parent_os_env=real_worker_spec,
+            model_access_factory=lambda: claude_terminal_model_access(spec),
+        )
+        assert terminal.model_access is not None
+        command = shlex.join([str(cli_path), *_cli_args("Say the terminal marker.")])
+        sent = await terminal.send(
+            f"OMNIGENT_PROBE_CONTROL_SOCKET={shlex.quote(str(terminal.socket_path))} "
+            f"{execution_probe[0]} > terminal-probe-stdout; "
+            f"{command} > cli-result.json 2> cli-stderr; printf '%s' $? > cli-exit"
+        )
+        assert sent == {"status": "sent"}, sent
+        try:
+            async with asyncio.timeout(15):
+                while not (workspace / "cli-exit").exists():
+                    await asyncio.sleep(0.1)
+        except TimeoutError:
+            pytest.fail(str(await terminal.read(scrollback=100)))
+        assert (workspace / "cli-exit").read_text() == "0", (
+            (workspace / "cli-result.json").read_text(),
+            (workspace / "cli-stderr").read_text(),
+        )
+        assert json.loads((workspace / "cli-result.json").read_text())["result"] == "CLI_E2E_OK"
+        _assert_execution_probe(execution_probe, control_socket=True)
+        assert requests
+        assert all(
+            r["headers"].get("authorization") == "Bearer parent-only-cli-secret" for r in requests
+        )
+    finally:
+        await registry.close("cli-e2e", "shell", "main")
+
+
+@pytest.mark.parametrize("cli_model_server", [443], indirect=True)
+@pytest.mark.parametrize(
+    "cli_tool",
+    [None, "Bash", "mcp__omnigent__sys_os_shell", "terminal"],
+    ids=["inference", "bash-roundtrip", "os-shell-roundtrip", "terminal-roundtrip"],
+)
+def test_omnigent_run_cli_with_contained_claude(
+    real_claude_cli: str,
+    real_worker_spec: OSEnvSpec,
+    cli_model_server,
+    tmp_path: Path,
+    cli_tool: str | None,
+    execution_probe,
+) -> None:
+    """The public CLI must reach a TLS provider using the production relay."""
+    import yaml
+
+    requests, replies = cli_model_server
+    workspace = Path(real_worker_spec.cwd)
+    nested_cli_path, nested_read_roots = _nested_cli_path_and_read_roots(real_claude_cli)
+    if cli_tool == "terminal":
+        terminal_command = (
+            execution_probe[0]
+            + "; "
+            + shlex.join([str(nested_cli_path), *_cli_args("TERMINAL_NESTED_PROBE")])
+            + " > terminal-result.json 2> terminal-stderr; printf '%s' $? > terminal-exit"
+        )
+        replies.append(
+            [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_terminal_launch",
+                    "name": "mcp__omnigent__sys_terminal_launch",
+                    "input": {"terminal": "shell", "session": "probe"},
+                }
+            ]
+        )
+
+        def finish_after_terminal() -> list[dict[str, str]]:
+            try:
+                poll_until(lambda: (workspace / "terminal-exit").is_file(), timeout_s=30)
+            except AssertionError:
+                return [{"type": "text", "text": "TERMINAL_TIMEOUT"}]
+            return [{"type": "text", "text": "CLI_E2E_OK"}]
+
+        replies.append(finish_after_terminal)
+    elif cli_tool:
+        command = execution_probe[0]
+        if cli_tool == "mcp__omnigent__sys_os_shell":
+            command += (
+                "; "
+                + shlex.join([str(nested_cli_path), *_cli_args("TERMINAL_NESTED_PROBE")])
+                + " > callback-result.json 2> callback-stderr; "
+                "printf '%s' $? > callback-exit"
+            )
+        replies.append(
+            [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_public_cli",
+                    "name": cli_tool,
+                    "input": {
+                        "command": command + "; printf PUBLIC_TOOL_OK > public-tool-marker; "
+                        "printf PUBLIC_TOOL_ROUNDTRIP_OK"
+                    },
+                }
+            ]
+        )
+    sandbox_settings = {
+        "type": "auto",
+        "allow_network": False,
+        "write_paths": ["."],
+        "egress_allow_private_destinations": True,
+    }
+    if cli_tool in ("terminal", "mcp__omnigent__sys_os_shell") and nested_read_roots:
+        sandbox_settings["read_paths"] = nested_read_roots
+    terminal_args = ["--noprofile", "--norc"]
+    if cli_tool == "terminal":
+        terminal_args.extend(["-c", terminal_command])
+    spec_path = tmp_path / "agent" / "config.yaml"
+    spec_path.parent.mkdir()
+    spec_path.write_text(
+        yaml.safe_dump(
+            {
+                "spec_version": 1,
+                "name": "sandboxed-cli-probe",
+                "prompt": "Reply with the test marker. Execute any requested Bash tool.",
+                "executor": {
+                    "type": "omnigent",
+                    "config": {
+                        "harness": "claude-sdk",
+                        "model": "claude-sonnet-4-6",
+                        "permission_mode": "bypassPermissions",
+                    },
+                    "auth": {"type": "api_key", "api_key": "parent-only-cli-secret"},
+                },
+                "terminals": {"shell": {"command": "/bin/bash", "args": terminal_args}},
+                "os_env": {
+                    "type": "caller_process",
+                    "cwd": str(workspace),
+                    "sandbox": sandbox_settings,
+                },
+            }
+        )
+    )
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("ANTHROPIC_", "CLAUDE_", "HARNESS_", "DATABRICKS_", "OMNIGENT_"))
+    }
+    env.update(
+        {
+            "ANTHROPIC_BASE_URL": "https://localhost",
+            "OMNIGENT_CLAUDE_PATH": real_claude_cli,
+            "OMNIGENT_CONFIG_HOME": str(tmp_path / "parent-config"),
+            "OMNIGENT_DATA_DIR": str(tmp_path / "parent-data"),
+            "OMNIGENT_SKIP_ONBOARD": "1",
+            "OMNIGENT_NO_UPDATE_CHECK": "1",
+            "OMNIGENT_DISABLE_CATALOG_LOOKUP": "1",
+            "SSL_CERT_FILE": str(tmp_path / "cli-ca/ca.pem"),
+        }
+    )
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "omnigent",
+            "run",
+            str(spec_path),
+            "-p",
+            "Return the marker.",
+            "--no-log",
+            "--no-session",
+        ],
+        env=env,
+        cwd=workspace,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=60)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        stdout, stderr = proc.communicate(timeout=5)
+        pytest.fail(f"public CLI timed out: {stdout}\n{stderr}")
+    result = subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "CLI_E2E_OK" in result.stdout, (result.stdout, result.stderr)
+    assert requests
+    assert all(
+        r["headers"].get("authorization") == "Bearer parent-only-cli-secret" for r in requests
+    )
+    assert "parent-only-cli-secret" not in result.stdout + result.stderr
+    if cli_tool == "terminal":
+        _assert_tool_result(requests, "toolu_terminal_launch", "launched")
+        _assert_execution_probe(execution_probe)
+        assert (workspace / "terminal-exit").read_text() == "0"
+        assert (
+            json.loads((workspace / "terminal-result.json").read_text())["result"] == "CLI_E2E_OK"
+        )
+    elif cli_tool:
+        _assert_tool_result(requests, "toolu_public_cli", "EXECUTION_PROBE_OK")
+        _assert_execution_probe(execution_probe)
+        assert (workspace / "public-tool-marker").exists(), [
+            r["body"]["messages"] for r in requests[1:]
+        ]
+        assert (workspace / "public-tool-marker").read_text() == "PUBLIC_TOOL_OK"
+        _assert_tool_result(requests, "toolu_public_cli", "PUBLIC_TOOL_ROUNDTRIP_OK")
+        if cli_tool == "mcp__omnigent__sys_os_shell":
+            assert (workspace / "callback-exit").read_text() == "0", (
+                workspace / "callback-stderr"
+            ).read_text()
+            assert (
+                json.loads((workspace / "callback-result.json").read_text())["result"]
+                == "CLI_E2E_OK"
+            )
+
+
+@pytest.fixture
+def execution_probe(real_worker_spec: OSEnvSpec, tmp_path: Path):
+    """Use the same attack from each CLI execution entry point."""
+    workspace = Path(real_worker_spec.cwd)
+    private = tmp_path / "private-execution-canary"
+    private.write_text("parent-file-canary")
+    outside = tmp_path / "execution-outside-write"
+    report = workspace / "execution-report.json"
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(8)
+    port = listener.getsockname()[1]
+    socket.create_connection(("127.0.0.1", port), timeout=1).close()
+    child = f"""
+import json, os, pathlib, socket
+result = {{}}
+try:
+    result['private'] = pathlib.Path({str(private)!r}).read_text()
+except OSError:
+    result['private'] = None
+try:
+    with socket.create_connection(('127.0.0.1', {port}), timeout=1):
+        result['network'] = 'allowed'
+except OSError:
+    result['network'] = 'blocked'
+try:
+    pathlib.Path({str(outside)!r}).write_text('forbidden')
+except OSError:
+    pass
+result['credential_leaked'] = 'parent-only-cli-secret' in json.dumps(dict(os.environ))
+control = os.environ.get('OMNIGENT_PROBE_CONTROL_SOCKET')
+result['control_socket'] = 'not-requested'
+if control:
+    try:
+        with socket.socket(socket.AF_UNIX) as client:
+            client.connect(control)
+        result['control_socket'] = 'allowed'
+    except OSError:
+        result['control_socket'] = 'blocked'
+
+print(json.dumps(result))
+"""
+    script = workspace / "execution-probe.py"
+    script.write_text(
+        "import json, pathlib, subprocess, sys\n"
+        f"code = {child!r}\n"
+        "result = json.loads(subprocess.check_output([sys.executable, '-c', code]))\n"
+        f"report = pathlib.Path({str(report)!r})\n"
+        "if '--report' in sys.argv:\n"
+        "    report = pathlib.Path(sys.argv[sys.argv.index('--report') + 1])\n"
+        "report.write_text(json.dumps(result))\n"
+        "if '--mcp' not in sys.argv:\n"
+        "    print('EXECUTION_PROBE_OK')\n"
+        "else:\n"
+        "    for line in sys.stdin:\n"
+        "        request = json.loads(line)\n"
+        "        if 'id' not in request:\n"
+        "            continue\n"
+        "        method = request['method']\n"
+        "        if method == 'initialize':\n"
+        "            response = {'protocolVersion': request['params']['protocolVersion'],\n"
+        "                'capabilities': {'tools': {}},\n"
+        "                'serverInfo': {'name': 'isolation-probe', 'version': '1'}}\n"
+        "        elif method == 'tools/list':\n"
+        "            response = {'tools': [{'name': 'attack_probe',\n"
+        "                'description': 'Report process isolation',\n"
+        "                'inputSchema': {'type': 'object', 'properties': {}}}]}\n"
+        "        elif method == 'tools/call':\n"
+        "            response = {'content': [{'type': 'text', 'text': 'EXECUTION_PROBE_OK'}]}\n"
+        "        else:\n"
+        "            response = {}\n"
+        "        print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': response}),\n"
+        "              flush=True)\n"
+    )
+    try:
+        yield shlex.join([sys.executable, str(script)]), report, outside
+    finally:
+        listener.close()
+
+
+def _assert_execution_probe(probe, *, control_socket: bool = False) -> None:
+    _, report, outside = probe
+    assert report.is_file(), "the execution entry point never ran the probe"
+    assert json.loads(report.read_text()) == {
+        "private": None,
+        "network": "blocked",
+        "credential_leaked": False,
+        "control_socket": "blocked" if control_socket else "not-requested",
+    }
+    assert not outside.exists(), "the subprocess wrote outside its host filesystem grants"
+
+
+@pytest.mark.parametrize("execution_path", ["hook", "plugin-mcp", "api-key-helper"])
+def test_each_cli_execution_path_inherits_the_sandbox(
+    real_claude_cli: str,
+    real_worker_spec: OSEnvSpec,
+    cli_model_server,
+    execution_probe,
+    execution_path: str,
+) -> None:
+    """A successful CLI response alone cannot prove its children were contained."""
+    requests, _ = cli_model_server
+    real_worker_spec.sandbox.allow_network = True
+    command, _, _ = execution_probe
+    env = {
+        "PATH": os.environ["PATH"],
+        "ANTHROPIC_BASE_URL": "https://model.test",
+        "ANTHROPIC_API_KEY": "parent-only-cli-secret",
+    }
+    settings = {"disableAllHooks": True}
+    extra_args = []
+    tools = ""
+    if execution_path == "hook":
+        settings = {
+            "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": command}]}]}
+        }
+    elif execution_path == "plugin-mcp":
+        plugin = Path(real_worker_spec.cwd) / "execution-plugin"
+        (plugin / ".claude-plugin").mkdir(parents=True)
+        (plugin / ".claude-plugin/plugin.json").write_text('{"name":"execution-probe"}')
+        (plugin / ".mcp.json").write_text(
+            json.dumps(
+                {
+                    "attack": {
+                        "command": sys.executable,
+                        "args": [str(Path(real_worker_spec.cwd) / "execution-probe.py"), "--mcp"],
+                    }
+                }
+            )
+        )
+        real_worker_spec.sandbox.cwd_allow_hidden = [".claude-plugin", ".mcp.json"]
+        extra_args = ["--plugin-dir", str(plugin)]
+    target_cli = real_claude_cli
+    if execution_path == "api-key-helper":
+        # The forwarding script execs a second path after launcher validation.
+        real_worker_spec.sandbox.read_paths = [
+            str(Path(real_claude_cli).parent),
+            str(Path(real_claude_cli).resolve().parent),
+        ]
+        # Unset after the launcher restores its safe environment snapshot.
+        forwarding_cli = Path(real_worker_spec.cwd) / "helper-claude"
+        forwarding_cli.write_text(
+            f'#!/bin/sh\nunset ANTHROPIC_AUTH_TOKEN\nexec {shlex.quote(real_claude_cli)} "$@"\n'
+        )
+        forwarding_cli.chmod(0o755)
+        target_cli = str(forwarding_cli)
+    prepared = claude.prepare_claude_cli_path(target_cli, real_worker_spec, worker_env=env)
+    if execution_path == "api-key-helper":
+        placeholder = env["ANTHROPIC_AUTH_TOKEN"]
+        settings["apiKeyHelper"] = f"{command} >/dev/null; printf %s {shlex.quote(placeholder)}"
+    args = _cli_args(
+        "Run the isolation probe, then return the marker.",
+        tools=tools,
+        bare=False,
+        prepared=prepared,
+        settings=settings,
+    )
+    try:
+        result = subprocess.run(
+            [prepared.cli_path, *extra_args, *args],
+            cwd=real_worker_spec.cwd,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=40,
+        )
+        assert result.returncode == 0, result.stdout + "\n" + result.stderr
+        assert json.loads(result.stdout)["result"] == "CLI_E2E_OK"
+        _assert_execution_probe(execution_probe)
+        assert requests
+    finally:
+        prepared.close()
+
+
+@pytest.fixture
+def login_keychain_probe(
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+) -> tuple[str, Path]:
+    _require_cli_e2e()
+    # A unique service avoids colliding with concurrent Claude credential lookups.
+    account = f"omnigent-containment-probe-{uuid.uuid4().hex}"
+    service = f"{account}-credentials"
+    keychain = (
+        subprocess.check_output(
+            ["/usr/bin/security", "default-keychain", "-d", "user"], text=True, timeout=10
+        )
+        .strip()
+        .strip('"')
+    )
+    subprocess.run(
+        [
+            "/usr/bin/security",
+            "add-generic-password",
+            "-a",
+            account,
+            "-s",
+            service,
+            "-w",
+            "keychain-canary",
+            keychain,
+        ],
+        capture_output=True,
+        check=True,
+        timeout=10,
+    )
+    request.addfinalizer(
+        lambda: subprocess.run(
+            [
+                "/usr/bin/security",
+                "delete-generic-password",
+                "-a",
+                account,
+                "-s",
+                service,
+                keychain,
+            ],
+            capture_output=True,
+            check=True,
+            timeout=10,
+        )
+    )
+    retrieve = [
+        "/usr/bin/security",
+        "find-generic-password",
+        "-a",
+        account,
+        "-s",
+        service,
+        "-w",
+        keychain,
+    ]
+    parent = subprocess.run(retrieve, capture_output=True, text=True, check=True, timeout=10)
+    assert parent.stdout.strip() == "keychain-canary"
+    lookup = (
+        "import ctypes; lib = ctypes.CDLL('/usr/lib/libSystem.B.dylib'); "
+        "port = ctypes.c_uint(); "
+        "lookup = lib.bootstrap_look_up(ctypes.c_uint.in_dll(lib, 'bootstrap_port').value, "
+        "b'com.apple.SecurityServer', ctypes.byref(port)); "
+    )
+    parent_lookup = subprocess.check_output(
+        [sys.executable, "-c", lookup + "print(lookup)"], text=True, timeout=10
+    )
+    assert int(parent_lookup) == 0
+    report = tmp_path / "workspace" / "keychain-report.json"
+    code = (
+        "import json, pathlib, subprocess; "
+        + lookup
+        + f"r = subprocess.run({retrieve!r}, capture_output=True, text=True, timeout=5); "
+        + "result = {'code': r.returncode, 'stdout': r.stdout, "
+        "'stderr': r.stderr, 'lookup': lookup}; "
+        + f"pathlib.Path({str(report)!r}).write_text(json.dumps(result))"
+    )
+    return code, report
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS Keychain IPC")
+def test_contained_child_cannot_retrieve_keychain_canary(
+    real_worker_spec: OSEnvSpec, login_keychain_probe: tuple[str, Path]
+) -> None:
+    """Deny the default login Keychain and its IPC service, even when the parent can read."""
+    code, report = login_keychain_probe
+    env = {"PATH": os.environ["PATH"], "ANTHROPIC_API_KEY": "synthetic"}
+    prepared = claude.prepare_claude_cli_path(sys.executable, real_worker_spec, worker_env=env)
+    try:
+        subprocess.run(
+            [prepared.cli_path, "-c", code],
+            cwd=real_worker_spec.cwd,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=15,
+        )
+        result = json.loads(report.read_text())
+        assert result["code"] != 0
+        assert result["lookup"] != 0
+        assert "keychain-canary" not in result["stdout"] + result["stderr"]
+    finally:
+        prepared.close()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS Keychain IPC")
+def test_real_cli_hook_cannot_retrieve_login_keychain_canary(
+    real_claude_cli: str,
+    real_worker_spec: OSEnvSpec,
+    cli_model_server,
+    login_keychain_probe: tuple[str, Path],
+) -> None:
+    code, report = login_keychain_probe
+    env = {
+        "PATH": os.environ["PATH"],
+        "ANTHROPIC_API_KEY": "parent-only-cli-secret",
+        "ANTHROPIC_BASE_URL": "https://model.test",
+    }
+    prepared = claude.prepare_claude_cli_path(real_claude_cli, real_worker_spec, worker_env=env)
+    args = _cli_args(
+        "Return the marker.",
+        bare=False,
+        prepared=prepared,
+        settings={
+            "hooks": {
+                "SessionStart": [
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": shlex.join([sys.executable, "-c", code]),
+                            }
+                        ]
+                    }
+                ]
+            }
+        },
+    )
+    try:
+        child = subprocess.run(
+            [prepared.cli_path, *args],
+            cwd=real_worker_spec.cwd,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=40,
+        )
+        assert child.returncode == 0, child.stdout + "\n" + child.stderr
+        assert json.loads(child.stdout)["result"] == "CLI_E2E_OK"
+        result = json.loads(report.read_text())
+        assert result["code"] != 0
+        assert result["lookup"] != 0
+        assert "keychain-canary" not in result["stdout"] + result["stderr"]
+        assert cli_model_server[0]
+    finally:
+        prepared.close()
