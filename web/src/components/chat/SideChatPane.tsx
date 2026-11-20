@@ -1023,10 +1023,9 @@ function SideChatComposer({
     (!pending && files.length > 0) ||
     reviewComments.length > 0;
   // The tags and review comments a send carries. A grid cell's come from its session draft.
-  const sharedTags = presentTaggedMentions(sessionMentions, [
-    text,
-    ...quotes.map((replyQuote) => replyQuote.before),
-  ]);
+  // The draft's text segments, shared by the send path and the mention hook.
+  const draftSegments = [text, ...quotes.map((replyQuote) => replyQuote.before)];
+  const sharedTags = presentTaggedMentions(sessionMentions, draftSegments);
   const sendContext: ComposerSendContext = {
     mentions: composerInlineMentions(
       sharedTags?.files ?? [],
@@ -1106,7 +1105,7 @@ function SideChatComposer({
     textareaRef,
     isMobile,
     // A tag's token in the tail or a reply quote keeps the tag, as the shared draft does.
-    segments: [text, ...(composer?.quotes ?? []).map((reply) => reply.before)],
+    segments: draftSegments,
     tags: gridCell
       ? {
           mentions: sessionMentions ?? NO_TAGGED_MENTIONS,

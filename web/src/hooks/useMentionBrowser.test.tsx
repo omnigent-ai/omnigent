@@ -302,6 +302,19 @@ describe("useMentionBrowser with caller-owned tags", () => {
     change(result, "Read @readme.md ", true);
     expect(result.current.browser.mentionTokens).toEqual(["@readme.md"]);
   });
+
+  it("forgets the tags a reset clears, so an undo in the next draft can't restore them", () => {
+    const { result } = renderCallerOwnedBrowser();
+    tagReadme(result);
+    act(() => {
+      result.current.browser.resetMentions();
+      result.current.setText("");
+    });
+    change(result, "", false);
+
+    change(result, "Read @readme.md ", true);
+    expect(result.current.browser.mentionTokens).toEqual([]);
+  });
 });
 
 describe("useMentionBrowser edits on a live input", () => {

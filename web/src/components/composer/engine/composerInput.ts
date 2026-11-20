@@ -38,7 +38,7 @@ export interface ComposerEditorSurface {
 
 /** How an insert is recorded in the undo history. */
 export interface ComposerInsertOptions {
-  /** Make this edit its own undo step, never merged with typing before or after it. */
+  /** Make this edit its own undo step (the CodeMirror surface always does; textareas only when set). */
   separateUndo?: boolean;
 }
 

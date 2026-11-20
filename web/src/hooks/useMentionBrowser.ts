@@ -343,7 +343,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     const before = lastSeenRef.current.get(input) ?? after;
     lastSeenRef.current.set(input, after);
     const released = releasedRef.current;
-    if (released === NO_TAGS) return;
+    if (released.files.length === 0 && released.sessions.length === 0) return;
     const owned = ownedMentionTokens();
     const countBefore = tokenCounts(before, owned);
     const added = new Set(
@@ -366,6 +366,8 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
 
   const resetMentions = (mentions?: TaggedMentions) => {
     releasedRef.current = NO_TAGS;
+    // A reset isn't a deletion: the caller-owned diff must not archive the tags it cleared.
+    callerTagsRef.current = mentions ?? NO_TAGS;
     setMentionedItems(mentions?.files ?? []);
     setMentionedSessions(mentions?.sessions ?? []);
   };
