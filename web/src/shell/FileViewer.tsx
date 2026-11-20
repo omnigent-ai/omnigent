@@ -347,6 +347,13 @@ function useToolbarOverflow(actionsKey: string): {
 // FileViewer
 // ---------------------------------------------------------------------------
 
+/** The Unsaved changes dialog's pending choice; `answersHost` marks a host's leave question. */
+interface PendingLeave {
+  apply: () => void;
+  cancel?: () => void;
+  answersHost?: boolean;
+}
+
 interface FileViewerProps {
   syncUrl?: boolean;
   agentId?: string | null;
@@ -381,6 +388,11 @@ interface FileViewerProps {
   viewport?: "desktop" | "mobile";
   /** Called after confirming unsaved edits when closing the active file tab. */
   onCloseTab?: () => void;
+  /**
+   * Registers the question a host asks before it leaves this file, while the editor has
+   * unsaved edits. It asks this viewer's own Unsaved changes dialog; returns the unregister.
+   */
+  registerLeaveGuard?: (guard: () => Promise<"leave" | "cancel">) => () => void;
   /** Set while the viewer fills the workspace full screen; Escape then exits full screen. */
   onExitFullScreen?: () => void;
   /** Called when the comments panel opens or closes inside the viewer. */
@@ -424,6 +436,7 @@ function FileViewerBody({
   path,
   onClose,
   onCloseTab,
+  registerLeaveGuard,
   onExitFullScreen,
   onNavigateTo,
   onShare,
@@ -553,10 +566,13 @@ function FileViewerBody({
   // Brief "copied" feedback for the copy-link button.
   const [linkCopied, setLinkCopied] = useState(false);
   const linkCopiedTimerRef = useRef<number>(0);
-  const [pendingAction, setPendingAction] = useState<{
-    apply: () => void;
-    cancel?: () => void;
-  } | null>(null);
+  const [pendingAction, setPendingAction] = useState<PendingLeave | null>(null);
+  // Mirrors the dialog's action, so a newer request can answer the one it replaces.
+  const pendingActionRef = useRef<PendingLeave | null>(null);
+  const showPendingAction = useCallback((next: PendingLeave | null) => {
+    pendingActionRef.current = next;
+    setPendingAction(next);
+  }, []);
   // TOC panel state (for markdown preview)
   const [tocOpen, setTocOpen] = useState(false);
   // Reset selection state whenever the file changes.
@@ -611,13 +627,46 @@ function FileViewerBody({
     return () => window.removeEventListener("beforeunload", handler);
   }, [isEditorDirty]);
 
-  const guardDirty = useCallback((action: () => void, cancel?: () => void) => {
-    if (isEditorDirtyRef.current) {
-      setPendingAction({ apply: action, cancel });
-      return;
-    }
-    action();
-  }, []);
+  const guardDirty = useCallback(
+    (action: () => void, cancel?: () => void, answersHost = false) => {
+      if (isEditorDirtyRef.current) {
+        const replaced = pendingActionRef.current;
+        showPendingAction({ apply: action, cancel, answersHost });
+        // A host still waiting on the dialog hears "cancel": a newer request took its place.
+        if (replaced?.answersHost) replaced.cancel?.();
+        return;
+      }
+      action();
+    },
+    [showPendingAction],
+  );
+
+  // A host leaving the file, such as a tab closing, asks the same question first.
+  useEffect(() => {
+    if (!isEditorDirty || !registerLeaveGuard) return undefined;
+    const waiting = new Set<(answer: "leave" | "cancel") => void>();
+    const unregister = registerLeaveGuard(
+      () =>
+        new Promise((resolve) => {
+          const answer = (choice: "leave" | "cancel") => {
+            waiting.delete(answer);
+            resolve(choice);
+          };
+          waiting.add(answer);
+          guardDirty(
+            () => answer("leave"),
+            () => answer("cancel"),
+            true,
+          );
+        }),
+    );
+    return () => {
+      unregister();
+      // Unmounting, or the edits going away, answers a question still open.
+      if (waiting.size > 0 && pendingActionRef.current?.answersHost) showPendingAction(null);
+      for (const answer of [...waiting]) answer("cancel");
+    };
+  }, [isEditorDirty, registerLeaveGuard, guardDirty, showPendingAction]);
 
   useEffect(
     () => () => {
@@ -2170,7 +2219,7 @@ function FileViewerBody({
         onOpenChange={(isOpen) => {
           if (!isOpen) {
             pendingAction?.cancel?.();
-            setPendingAction(null);
+            showPendingAction(null);
           }
         }}
       >
@@ -2186,7 +2235,7 @@ function FileViewerBody({
               variant="outline"
               onClick={() => {
                 pendingAction?.cancel?.();
-                setPendingAction(null);
+                showPendingAction(null);
               }}
             >
               Keep editing
@@ -2196,7 +2245,7 @@ function FileViewerBody({
               onClick={() => {
                 handleDirtyChange(false);
                 pendingAction?.apply();
-                setPendingAction(null);
+                showPendingAction(null);
               }}
             >
               Discard changes
