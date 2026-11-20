@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 from omnigent.errors import ErrorCategory
 from omnigent.llms.errors import REQUEST_SIZE_OVERFLOW_GUIDANCE
+from omnigent.runner import launch_failure
 from omnigent.runner.launch_failure import (
     FailureDiagnosis,
     classify_native_turn_error,
@@ -17,6 +20,12 @@ from omnigent.runner.launch_failure import (
     diagnose_codex_provider_auth_failure,
     diagnose_model_unavailable,
     turn_error_display_message,
+)
+
+# Prepended to the user-lookup probe so its child sees a known or unknown user.
+_KNOWN_USER = "import pwd\npwd.getpwuid = lambda uid: None\n"
+_UNKNOWN_USER = (
+    "import pwd\ndef _unknown(uid):\n    raise KeyError(uid)\npwd.getpwuid = _unknown\n"
 )
 
 # The tail Claude Code prints when refusing --dangerously-skip-permissions as
@@ -152,6 +161,93 @@ def test_classifies_missing_binary_by_output() -> None:
     )
     assert diagnosis is not None
     assert diagnosis.title == "Agent command not found"
+
+
+def test_classifies_lost_macos_login_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "platform", "darwin")
+
+    diagnosis = classify_terminal_failure(
+        command="claude",
+        exit_status=1,
+        output="failed to get current user: user: unknown userid 502",
+    )
+
+    assert diagnosis is not None
+    assert diagnosis.title == "The host lost its macOS login session"
+    assert diagnosis.remediation is not None
+    assert "host stop" in diagnosis.remediation
+    assert "host --background" in diagnosis.remediation
+    assert "host enable" in diagnosis.remediation
+
+
+def test_unknown_user_outside_macos_is_not_a_lost_login_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A container uid without a passwd entry fails the same lookup on Linux.
+    monkeypatch.setattr(sys, "platform", "linux")
+
+    diagnosis = classify_terminal_failure(
+        command="claude",
+        exit_status=1,
+        output="failed to get current user: user: unknown userid 1000680000",
+    )
+
+    assert diagnosis is None
+
+
+@pytest.mark.parametrize(
+    ("platform", "user_lookup", "expected_title"),
+    [
+        ("linux", _UNKNOWN_USER, None),
+        ("darwin", _KNOWN_USER, None),
+        ("darwin", _UNKNOWN_USER, "The host lost its macOS login session"),
+    ],
+    ids=["linux-skips-user-lookup", "macos-known-user", "macos-unknown-user"],
+)
+def test_lost_login_session_probe_looks_up_the_user_in_a_child(
+    monkeypatch: pytest.MonkeyPatch, platform: str, user_lookup: str, expected_title: str | None
+) -> None:
+    children: list[object] = []
+    run_child = launch_failure.subprocess.run
+
+    def _spy_run(*args: object, **kwargs: object) -> object:
+        children.append(args)
+        return run_child(*args, **kwargs)
+
+    monkeypatch.setattr(sys, "platform", platform)
+    monkeypatch.setattr(launch_failure.subprocess, "run", _spy_run)
+    monkeypatch.setattr(
+        launch_failure, "_USER_LOOKUP_PROBE", user_lookup + launch_failure._USER_LOOKUP_PROBE
+    )
+
+    diagnosis = launch_failure.diagnose_lost_login_session()
+
+    assert (diagnosis.title if diagnosis else None) == expected_title
+    assert len(children) == (1 if platform == "darwin" else 0)
+
+
+@pytest.mark.parametrize(
+    ("executable", "probe_prefix"),
+    [
+        ("/nonexistent/python", ""),
+        (sys.executable, "import time\ntime.sleep(10)\n"),
+        (sys.executable, "import sys\nsys.exit(1)\n"),
+    ],
+    ids=["probe-cannot-start", "probe-times-out", "probe-exits-unexpectedly"],
+)
+def test_lost_login_session_probe_failure_is_not_a_diagnosis(
+    monkeypatch: pytest.MonkeyPatch, executable: str, probe_prefix: str
+) -> None:
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(sys, "executable", executable)
+    monkeypatch.setattr(launch_failure, "_USER_LOOKUP_PROBE_TIMEOUT_S", 0.5)
+    monkeypatch.setattr(
+        launch_failure,
+        "_USER_LOOKUP_PROBE",
+        probe_prefix + _UNKNOWN_USER + launch_failure._USER_LOOKUP_PROBE,
+    )
+
+    assert launch_failure.diagnose_lost_login_session() is None
 
 
 @pytest.mark.parametrize(
