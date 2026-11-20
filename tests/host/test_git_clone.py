@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -61,6 +62,21 @@ def test_clone_checks_out_the_requested_branch(
         ["git", "-C", str(destination), "branch", "--show-current"], text=True
     ).strip()
     assert current == (branch or "main")
+
+
+def test_clone_logs_the_destination_but_not_the_url(
+    local_repository: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A credential in the URL's path never reaches the host log."""
+    destination = tmp_path / "checkout"
+    with caplog.at_level(logging.INFO, logger="omnigent.host.git_clone"):
+        result = clone_repository(
+            HostCloneRepositoryFrame("clone", REPOSITORY_URL, str(destination))
+        )
+    assert result.status == "ok", result.error
+    assert str(destination) in caplog.text
+    assert REPOSITORY_URL not in caplog.text
+    assert "git.example.com" not in caplog.text
 
 
 def test_clone_keeps_other_branches_for_later_worktrees(
