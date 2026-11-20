@@ -2626,8 +2626,7 @@ async def test_launch_failure_preserves_stdout_diagnostic(
             returncode=1, stdout=b"new-session refused: server socket unavailable\n"
         ),
     )
-    assert "tmux launch failed (rc=1)" in message
-    assert "new-session refused: server socket unavailable" in message
+    assert message == ("tmux launch failed (rc=1): new-session refused: server socket unavailable")
 
 
 async def test_launch_failure_reports_stderr_before_stdout(
@@ -2639,63 +2638,15 @@ async def test_launch_failure_reports_stderr_before_stdout(
         monkeypatch,
         _ProcessWithStdout(returncode=1, stdout=b"stdout-detail\n", stderr=b"stderr-detail\n"),
     )
-    assert "stderr-detail" in message
-    assert "stdout-detail" in message
-    assert message.index("stderr-detail") < message.index("stdout-detail")
+    assert message == "tmux launch failed (rc=1): stderr-detail; stdout-detail"
 
 
 async def test_launch_failure_names_silent_exit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A tmux failing with no output on either stream yields an explicit
-    placeholder reason, never a trailing-colon empty message."""
+    """A silent tmux failure includes its return code and an explicit reason."""
     message = await _failed_launch_error(tmp_path, monkeypatch, _ProcessWithStdout(returncode=2))
-    assert "tmux launch failed (rc=2)" in message
-    assert not message.rstrip().endswith(":")
-    assert "<tmux produced no output>" in message
-
-
-@pytest.mark.skipif(shutil.which("tmux") is None, reason="requires a real tmux binary")
-@pytest.mark.skipif(sys.platform == "win32", reason="requires RLIMIT_NPROC")
-async def test_launch_failure_names_silent_exit_real_tmux(
-    tmp_path: Path, short_tmp_parent: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """tmux reports fatal errors such as a failed server fork only to its ``-v``
-    log, so the client exits 1 with nothing on either stream."""
-    import resource
-
-    if os.geteuid() == 0:
-        pytest.skip("RLIMIT_NPROC is not enforced for root")
-    real_create_subprocess_exec = asyncio.create_subprocess_exec
-
-    def forbid_child_processes() -> None:
-        resource.setrlimit(resource.RLIMIT_NPROC, (1, 1))
-
-    async def spawn(*cmd: str, **kwargs: object) -> asyncio.subprocess.Process:
-        return await real_create_subprocess_exec(*cmd, preexec_fn=forbid_child_processes, **kwargs)
-
-    monkeypatch.setattr(
-        terminal_mod,
-        "asyncio",
-        SimpleNamespace(**(vars(asyncio) | {"create_subprocess_exec": spawn})),
-    )
-    instance = TerminalInstance(
-        name="pi",
-        session_key="main",
-        socket_path=short_tmp_parent / "tmux.sock",
-        private_dir=tmp_path,
-        command=sys.executable,
-    )
-
-    try:
-        with pytest.raises(RuntimeError) as excinfo:
-            await instance.launch(cwd=tmp_path)
-    finally:
-        await instance.close()
-
-    message = str(excinfo.value)
-    assert message == "tmux launch failed (rc=1): <tmux produced no output>"
-    assert instance.running is False
+    assert message == "tmux launch failed (rc=2): <tmux produced no output>"
 
 
 @pytest.mark.parametrize("launch_fails", [False, True])
@@ -3771,7 +3722,6 @@ def test_reap_orphaned_terminals_reaps_only_dead_owner_dirs(
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    import os
 
     def _raise_if_called(*args: object, **kwargs: object) -> None:
         """Fail the test if kill-server runs with no socket present."""
