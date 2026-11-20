@@ -13758,6 +13758,9 @@ def test_managed_model_status_check_preserves_exact_context_identity(
         (True, True, True, 1, "configured-default"),
         (True, False, None, 1, "observed-default"),
         (False, True, None, 0, "observed-default"),
+        (True, True, True, 1, "missing-catalog"),
+        (True, False, None, 1, "missing-catalog"),
+        (True, True, True, 1, "empty-catalog"),
     ],
     ids=[
         "fresh-same-model",
@@ -13767,6 +13770,9 @@ def test_managed_model_status_check_preserves_exact_context_identity(
         "descriptorless-configured-current",
         "descriptorless-stale-target-hint",
         "descriptorless-stale-other-hint",
+        "undiscovered-current",
+        "undiscovered-stale-target-hint",
+        "empty-catalog-current",
     ],
 )
 def test_model_command_uses_a_fresh_status_for_same_model_requests(
@@ -13780,11 +13786,28 @@ def test_model_command_uses_a_fresh_status_for_same_model_requests(
 ) -> None:
     owned_draft = "blocked prompt" if catalog == "configured-default" else None
     composer = _SessionModelComposer(draft=owned_draft or "")
-    if catalog == "observed-default":
+    if catalog in {"observed-default", "missing-catalog", "empty-catalog"}:
         composer.options[-1] = "system.ai.claude-sonnet-4-6"
     bridge_dir = _session_model_bridge(tmp_path, composer)
     target = composer.options[-1]
-    if catalog != "picker":
+    if catalog == "missing-catalog":
+        config_path = bridge_dir / claude_native_bridge._CONFIG_FILE
+        config = json.loads(config_path.read_text())
+        config.pop("model_picker_values", None)
+        config.pop("model_picker_options", None)
+        config_path.write_text(json.dumps(config))
+        assert claude_native_bridge.read_model_picker_values(bridge_dir) == []
+        assert claude_native_bridge.read_model_picker_options(bridge_dir) is None
+    elif catalog == "empty-catalog":
+        claude_native_bridge.record_model_vocabulary(
+            bridge_dir,
+            launch_env=None,
+            launch_model=None,
+            picker_values=[],
+            picker_options=[],
+        )
+        assert target not in claude_native_bridge.read_model_picker_values(bridge_dir)
+    elif catalog != "picker":
         descriptors = claude_native_bridge.read_model_picker_options(bridge_dir)
         assert descriptors is not None
         rows = [

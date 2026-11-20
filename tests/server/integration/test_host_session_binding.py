@@ -1151,10 +1151,7 @@ async def test_managed_create_returns_during_provision_and_message_rendezvouses(
     # cleanup path), so nothing leaks until the provider lifetime cap.
     assert fake.terminated == ["sb-fake-1"]
 
-    # The failure is retained on the snapshot (mirroring the tracker's
-    # failed-entry retention) so a client reloading the dead session
-    # still sees why the sandbox never came up, not a blank chat.
-    # Failure labels settle before queued-input diagnostics are persisted.
+    # The persisted diagnostic can follow the failure label; a reload must retain it.
     await poll_until_async(
         lambda: any(
             isinstance(item.data, ErrorData) and "host startup failed" in item.data.message

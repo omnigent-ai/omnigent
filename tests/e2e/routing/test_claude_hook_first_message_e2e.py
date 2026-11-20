@@ -18,8 +18,9 @@ What is scored:
   twice means the replay itself was routed again.
 * **The switch actually lands.** The apply layer selects the model through
   Claude's session-only picker action, and the pane must confirm it before
-  replay. Session-only selection leaves the saved default unchanged. This
-  check compares the full settings snapshot, including that default.
+  replay. On supported stable CLIs, session-only selection leaves the saved
+  default unchanged, and this comparison includes it. Older or unverified CLIs
+  retain their existing model-setting behavior.
 * **One decision, one turn.** A leaked replay shows up as two user messages for
   one thing typed.
 * **The second prompt fast-skips.** Turn 2 must issue **zero** routing calls —

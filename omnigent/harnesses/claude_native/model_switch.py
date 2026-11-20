@@ -396,19 +396,20 @@ def _target(
                     option.get("provenance") == "structured",
                     confirmation_label,
                 )
-    if resolved in values and base not in pins and resolved == requested:
+    if base not in pins and resolved == requested:
         # Old bridges can select an exact canonical row, never a guessed family label.
-        if options is None:
+        if resolved in values and options is None:
             return _Target(resolved, resolved, None, False)
         described = {
             public_claude_model_id(identity) or claude_picker_model_key(identity)
-            for option in options
+            for option in options or ()
             for field in ("value", "model")
             if isinstance(identity := option.get(field), str)
         }
-        # Synthetic defaults have no picker descriptor; only their current status is usable.
+        # A current concrete model needs fresh status proof, not a selectable row.
         if (
             base.lower() not in (*CLAUDE_MODEL_ALIASES, "default", "opusplan")
+            and (resolved in values or (canonical is not None and not options and not values))
             and (canonical or requested) not in described
         ):
             return _Target(resolved, resolved, None, False, status_only=True)

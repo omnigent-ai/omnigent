@@ -1375,23 +1375,39 @@ async def test_run_turn_passes_the_exact_required_model_to_the_shared_picker(
         "legacy-different-target",
         "older-cli-confirmed",
         "older-cli-different-model",
+        "undiscovered-current",
+        "undiscovered-stale",
     ],
 )
 async def test_run_turn_requires_a_matching_model_selection_result(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, receipt_kind: str
 ) -> None:
     monkeypatch.delenv(REQUEST_SESSION_ID_ENV_VAR, raising=False)
-    if receipt_kind.startswith("older-cli-"):
+    target = "private-model"
+    if receipt_kind.startswith(("older-cli-", "undiscovered-")):
         monkeypatch.setattr(claude_bridge, "_TRUSTED_PARENT", tmp_path)
         monkeypatch.setattr(claude_bridge, "_BRIDGE_ROOT", tmp_path)
         monkeypatch.setenv(REQUEST_SESSION_ID_ENV_VAR, "web-session")
         composer = _SessionModelComposer()
-        composer.version = "2.1.322"
-        composer.options[-1] = "private-model"
-        if receipt_kind == "older-cli-confirmed":
+        if receipt_kind.startswith("older-cli-"):
+            composer.version = "2.1.322"
+        else:
+            target = "system.ai.claude-sonnet-4-6"
+        composer.options[-1] = target
+        if receipt_kind == "older-cli-confirmed" or receipt_kind.startswith("undiscovered-"):
             composer.model = composer.options[-1]
         initial_default = composer.saved_default
         bridge_dir = _session_model_bridge(tmp_path, composer)
+        if receipt_kind.startswith("undiscovered-"):
+            config_path = bridge_dir / claude_bridge._CONFIG_FILE
+            config = json.loads(config_path.read_text())
+            config.pop("model_picker_values", None)
+            config.pop("model_picker_options", None)
+            config_path.write_text(json.dumps(config))
+            assert claude_bridge.read_model_picker_values(bridge_dir) == []
+            assert claude_bridge.read_model_picker_options(bridge_dir) is None
+            if receipt_kind == "undiscovered-stale":
+                composer.model = composer.options[0]
         composer.install(monkeypatch)
     else:
         bridge_dir = tmp_path / "bridge"
@@ -1423,11 +1439,11 @@ async def test_run_turn_requires_a_matching_model_selection_result(
             messages=[{"role": "user", "content": "hello"}],
             tools=[],
             system_prompt="",
-            config=ExecutorConfig(model="private-model"),
+            config=ExecutorConfig(model=target),
         )
     ]
 
-    accepted = receipt_kind.startswith("older-cli-")
+    accepted = receipt_kind.startswith("older-cli-") or receipt_kind == "undiscovered-current"
     if accepted:
         assert events == [TurnComplete(response=None)]
         assert delivered == ["hello"]
@@ -1445,6 +1461,10 @@ async def test_run_turn_requires_a_matching_model_selection_result(
             [] if already_selected else ["/model private-model"]
         )
         assert composer.status_queries == 0
+    elif receipt_kind.startswith("undiscovered-"):
+        assert composer.status_queries == 1
+        assert composer.saved_default == initial_default
+        assert [command for command in composer.submitted if command] == ["/status"]
 
 
 @pytest.mark.asyncio
