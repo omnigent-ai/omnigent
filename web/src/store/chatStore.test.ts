@@ -7476,58 +7476,130 @@ describe("chatStore — delivered-but-unacked send", () => {
   });
 
   /** Hold every events POST for conv_existing open until answered, recording its body. */
-  function holdEventPosts(): { answerPost: () => void; postedBodies: unknown[] } {
+  function holdEventPosts(): { answerPost: (body?: object) => void; postedBodies: unknown[] } {
     const postedBodies: unknown[] = [];
-    let answer: () => void = () => {};
+    let answer: (body: object) => void = () => {};
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       if (String(input).endsWith("/v1/sessions/conv_existing/events") && init?.method === "POST") {
         postedBodies.push(JSON.parse(String(init.body)));
         // Rejects on abort like a real fetch, so the settled send shows it was never cancelled.
         return new Promise<Response>((resolve, reject) => {
           init.signal?.addEventListener("abort", () => reject(init.signal?.reason));
-          answer = () => resolve(mockResponse({ queued: true, item_id: "ci_mock" }));
+          answer = (body) => resolve(mockResponse(body));
         });
       }
       return defaultFetchHandler(input, init);
     });
-    return { answerPost: () => answer(), postedBodies };
+    return {
+      answerPost: (body = { queued: true, item_id: "ci_mock" }) => answer(body),
+      postedBodies,
+    };
   }
 
-  it("stops waiting on a slash command whose POST never answers until it accepts the command late", async () => {
+  it.each([
+    ["accepts", { queued: true, item_id: "ci_mock" }, true],
+    ["denies", { queued: false, denied: true }, false],
+  ])(
+    "stops waiting on a slash command whose POST never answers until it %s the command late",
+    async (_verb, lateAnswer, withdrawn) => {
+      vi.useFakeTimers();
+      onTestFinished(() => {
+        vi.useRealTimers();
+        usePlanStops.setState({ requests: {}, settledStops: {} });
+      });
+      useChatStore.setState({
+        conversationId: "conv_existing",
+        abortController: new AbortController(),
+      });
+      await trackPlanStop("conv_existing", async () => ({}));
+      const { answerPost } = holdEventPosts();
+
+      const sent = useChatStore.getState().sendSlashCommand("grill-me", "review this", "agent_xyz");
+      await vi.advanceTimersByTimeAsync(SEND_UNANSWERED_AFTER_MS - 1);
+      expect(useChatStore.getState().pendingUserMessages).toEqual([
+        expect.objectContaining({ stillSending: true }),
+      ]);
+      await vi.advanceTimersByTimeAsync(1);
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+      expect(useChatStore.getState().status).toBe("idle");
+      expect(errorCards()).toEqual([
+        expect.objectContaining({
+          title: "Message not confirmed",
+          message: expect.stringContaining("The server didn't answer"),
+        }),
+      ]);
+      await sent;
+      expect(usePlanStops.getState().requests.conv_existing).toMatchObject({ sent: true });
+
+      answerPost(lateAnswer);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(useChatStore.getState().status).toBe("idle");
+      expect(errorCards()).toHaveLength(withdrawn ? 0 : 1);
+      expect(usePlanStops.getState().requests.conv_existing === undefined).toBe(withdrawn);
+    },
+  );
+
+  it.each([
+    [
+      "message",
+      () => ({
+        sent: useChatStore.getState().send("summarize the deploy status", "agent_xyz"),
+        expectReported: () => {
+          expect(useChatStore.getState().failedSendDraft).toMatchObject({
+            text: "summarize the deploy status",
+          });
+          expect(errorCards()).toEqual([
+            expect.objectContaining({ title: "Message not confirmed" }),
+          ]);
+        },
+      }),
+    ],
+    [
+      "queued message",
+      () => {
+        const onError = vi.fn();
+        return {
+          sent: useChatStore
+            .getState()
+            .send("summarize the deploy status", "agent_xyz", undefined, { onError }),
+          expectReported: () =>
+            expect(onError).toHaveBeenCalledWith(
+              expect.stringContaining("The server didn't answer"),
+              false,
+            ),
+        };
+      },
+    ],
+    [
+      "slash command",
+      () => ({
+        sent: useChatStore.getState().sendSlashCommand("grill-me", "review this", "agent_xyz"),
+        expectReported: () =>
+          expect(errorCards()).toEqual([
+            expect.objectContaining({ title: "Message not confirmed" }),
+          ]),
+      }),
+    ],
+  ])("still reports an unanswered %s after Stop clears its bubble", async (_kind, start) => {
     vi.useFakeTimers();
     onTestFinished(() => {
       vi.useRealTimers();
-      usePlanStops.setState({ requests: {}, settledStops: {} });
     });
     useChatStore.setState({
       conversationId: "conv_existing",
       abortController: new AbortController(),
     });
-    await trackPlanStop("conv_existing", async () => ({}));
-    const { answerPost } = holdEventPosts();
+    holdEventPosts();
 
-    const sent = useChatStore.getState().sendSlashCommand("grill-me", "review this", "agent_xyz");
-    await vi.advanceTimersByTimeAsync(SEND_UNANSWERED_AFTER_MS - 1);
-    expect(useChatStore.getState().pendingUserMessages).toEqual([
-      expect.objectContaining({ stillSending: true }),
-    ]);
-    await vi.advanceTimersByTimeAsync(1);
-
+    const { sent, expectReported } = start();
+    await vi.advanceTimersByTimeAsync(SEND_STILL_SENDING_AFTER_MS);
+    useChatStore.getState().stop();
     expect(useChatStore.getState().pendingUserMessages).toEqual([]);
-    expect(useChatStore.getState().status).toBe("idle");
-    expect(errorCards()).toEqual([
-      expect.objectContaining({
-        title: "Message not confirmed",
-        message: expect.stringContaining("The server didn't answer"),
-      }),
-    ]);
-    await sent;
-    expect(usePlanStops.getState().requests.conv_existing).toMatchObject({ sent: true });
+    await vi.advanceTimersByTimeAsync(SEND_UNANSWERED_AFTER_MS);
 
-    answerPost();
-    await vi.advanceTimersByTimeAsync(0);
-    expect(errorCards()).toEqual([]);
-    expect(usePlanStops.getState().requests.conv_existing).toBeUndefined();
+    expectReported();
+    await sent;
   });
 
   it("leaves another turn's response and background work alone when it gives up", async () => {
@@ -7689,6 +7761,21 @@ describe("chatStore — delivered-but-unacked send", () => {
         handleSessionEvent({
           type: "session_input_consumed",
           itemId: (postedBodies[0] as { data: { stable_id: string } }).data.stable_id,
+          itemType: "message",
+          data: {
+            role: "user",
+            content: [{ type: "input_text", text: "summarize the deploy status" }],
+          },
+        }),
+    ],
+    [
+      "mirrored native message",
+      () => useChatStore.getState().send("summarize the deploy status", "agent_xyz"),
+      () =>
+        handleSessionEvent({
+          type: "session_input_consumed",
+          itemId: "item_native_mirror",
+          clearedPendingId: "pending_native_mirror",
           itemType: "message",
           data: {
             role: "user",
@@ -16819,6 +16906,70 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await drainAsync(2);
     await loop;
   });
+
+  it.each([
+    ["message", undefined],
+    ["queued message", vi.fn()],
+  ])(
+    "hands back an unanswered %s the reconnect snapshot records the runner refusing",
+    async (_kind, onError) => {
+      const id = "conv_unanswered_rejected";
+      const before = userMessage(`${id}_pre`, "before the gap");
+      seedSession(id, [before]);
+      const sinks = routeStreamOpens();
+      const routed = fetchMock.getMockImplementation()!;
+      const postedBodies: { data: { stable_id: string } }[] = [];
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).endsWith(`/v1/sessions/${id}/events`) && init?.method === "POST") {
+          postedBodies.push(JSON.parse(String(init.body)));
+          return new Promise<Response>(() => {});
+        }
+        return routed(input, init);
+      });
+      const controller = new AbortController();
+      useChatStore.setState({
+        conversationId: id,
+        abortController: controller,
+        blocks: itemsToBlocks([before]),
+      });
+      const loop = startStreamPump(id, controller, setState, getState);
+      await drainAsync();
+      expect(sinks).toHaveLength(1);
+
+      const sent = useChatStore
+        .getState()
+        .send("resend me", "agent_xyz", undefined, onError ? { onError } : undefined);
+      await drainAsync();
+      const stableId = postedBodies[0]!.data.stable_id;
+
+      // The live rejection is lost with the socket; the snapshot has the persisted item.
+      serveRunnerRejectedSnapshot(id, stableId);
+      seedSessionItems(id, [before, { ...userMessage(`${id}_gap`, "resend me"), id: stableId }]);
+      sinks[0]!.error();
+      await drainAsync();
+      expect(sinks).toHaveLength(2);
+      expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+
+      await vi.advanceTimersByTimeAsync(SEND_UNANSWERED_AFTER_MS);
+      await drainAsync();
+      await sent;
+      if (onError) {
+        expect(onError).toHaveBeenCalledWith(expect.any(String), false);
+      } else {
+        expect(useChatStore.getState().failedSendDraft).toMatchObject({
+          stableId,
+          text: "resend me",
+          serverRefused: true,
+        });
+      }
+
+      const last = sinks.at(-1)!;
+      last.push("data: [DONE]\n\n");
+      last.close();
+      await drainAsync(2);
+      await loop;
+    },
+  );
 
   it("keeps an attributed rejection in force after the session has moved on", async () => {
     const stableId = "e".repeat(32);

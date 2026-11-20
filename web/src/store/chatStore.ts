@@ -1873,6 +1873,23 @@ const sendChains = new Map<string | symbol, SendChain>();
  */
 const inFlightSends = new Map<string, boolean>();
 
+/**
+ * Sends awaiting their POST, by pending bubble, flagged `true` once a receipt took the
+ * bubble. Stop and other resets clear bubbles too, so only this flag shows delivery.
+ */
+const awaitedReceipts = new Map<string, boolean>();
+
+/** Flag each awaited send whose bubble a receipt took from *before*, leaving *after*. */
+function noteReceipts(
+  before: readonly PendingUserMessage[],
+  after: readonly PendingUserMessage[],
+): void {
+  const kept = new Set(after.map((p) => p.tempId));
+  for (const { tempId } of before) {
+    if (!kept.has(tempId) && awaitedReceipts.has(tempId)) awaitedReceipts.set(tempId, true);
+  }
+}
+
 // Sends with no conversation id yet (brand-new chat) serialize together: the
 // session is created inside the chained work, so they can't key by id. A
 // non-string key can never collide with a conversation id.
@@ -2116,7 +2133,7 @@ const SEND_UNANSWERED_TITLE = "Message not confirmed";
 const SEND_UNANSWERED_MESSAGE =
   "The server didn't answer, so this may have reached the agent. If it doesn't appear, send it again.";
 
-/** A send given up on with its POST still open; `delivered` when its bubble already committed. */
+/** A send given up on with its POST still open; `delivered` once a receipt took its bubble. */
 class UnansweredSendError extends Error {
   readonly delivered: boolean;
   constructor(delivered: boolean) {
@@ -3225,8 +3242,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       queryClient?.invalidateQueries({ queryKey: ["conversations"] });
     } catch (err) {
       if (initialDraft && !initialDispatched && !initialSendPending()) return;
-      // Its commit already replaced the bubble, and the turn it started settles itself.
-      if (err instanceof UnansweredSendError && err.delivered) {
+      // It was delivered, and the turn it started settles itself.
+      if (
+        err instanceof UnansweredSendError &&
+        (err.delivered || inFlightSends.get(stableId) === true)
+      ) {
         endPlanStop();
         queryClient?.invalidateQueries({ queryKey: ["conversations"] });
         return;
@@ -4378,6 +4398,7 @@ async function withStillSendingMark<T>(
     }));
   }, SEND_STILL_SENDING_AFTER_MS);
   let unanswered: ReturnType<typeof setTimeout> | undefined;
+  awaitedReceipts.set(tempId, false);
   try {
     // Never cancelled: the server may already have accepted the send.
     return await Promise.race([
@@ -4385,9 +4406,7 @@ async function withStillSendingMark<T>(
       new Promise<never>((_resolve, reject) => {
         const giveUp = (): void => {
           const state = setterForState(sessionId);
-          // A bubble its commit already replaced was delivered.
-          const delivered =
-            state !== null && !state.pendingUserMessages.some((p) => p.tempId === tempId);
+          const delivered = awaitedReceipts.get(tempId) === true;
           const running =
             cachedConversationStatus(sessionId) === "running" ||
             state?.sessionStatus === "running" ||
@@ -4404,6 +4423,7 @@ async function withStillSendingMark<T>(
   } finally {
     clearTimeout(timer);
     clearTimeout(unanswered);
+    awaitedReceipts.delete(tempId);
   }
 }
 
@@ -9038,6 +9058,15 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
     applyToConversation(patch);
   };
 
+  /** {@link applyToConversation} for a receipt, flagging awaited sends whose bubbles it took. */
+  const applyReceipt = (patch: (s: ChatState) => Partial<ConversationState>): void => {
+    applyToConversation((s) => {
+      const next = patch(s);
+      if (next.pendingUserMessages) noteReceipts(s.pendingUserMessages, next.pendingUserMessages);
+      return next;
+    });
+  };
+
   const settleLegacyPiCompact = (): void => {
     if (sourceConversationId === null) return;
     const s = setterForState(sourceConversationId);
@@ -9715,7 +9744,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       //   3. No pending entry — render the event payload as a fresh
       //      committed bubble (TUI-typed message, marker, or another
       //      client).
-      applyToConversation((s) => {
+      applyReceipt((s) => {
         const eventContent = userContentFromEvent(event);
         const pendingHead = s.pendingUserMessages[0];
         // Bare envelopes typed in the terminal must not consume unrelated web input.
@@ -9860,7 +9889,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // until refresh. Pop the FIFO head here to ack the local
       // send; observing clients and drafts still held locally cannot
       // acknowledge a send, so they just render the block.
-      applyToConversation((s) => {
+      applyReceipt((s) => {
         if (s.pendingUserMessages.length === 0 || s.pendingUserMessages[0]?.initialDraft) return {};
         const [, ...rest] = s.pendingUserMessages;
         return { pendingUserMessages: rest };
@@ -9870,7 +9899,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // Shell inputs have no consumed receipt; remove only the matching sent bubble.
       const command = event.kind === "input" ? event.input : null;
       if (command === null) return;
-      applyToConversation((s) => {
+      applyReceipt((s) => {
         if (s.settledShellInputs.some((entry) => entry.itemId === event.itemId)) return {};
         const at = s.pendingUserMessages.findIndex((p) => isShellCommandBubble(p, command));
         const popped = s.pendingUserMessages[at];
