@@ -731,7 +731,7 @@ function loadNavigationHarness({
   const source =
     fs.readFileSync(mainPath, "utf8") +
     "\nmodule.exports.sshHosts = sshHosts;" +
-    "\nmodule.exports.panelTestApi = { activeWindow, mainWindows, enqueueDeepLink, floatingComposer, floatingComposerPanelIsCurrent, closePanelsOnSignIn, loadSetupPage, beginConnectionAttempt };" +
+    "\nmodule.exports.panelTestApi = { activeWindow, mainWindows, enqueueDeepLink, floatingComposer, floatingComposerPanelIsCurrent, closePanelsOnSignIn, loadSetupPage, beginConnectionAttempt, openFloatingComposerFromShortcut, focusAfterBrowserSignIn };" +
     "\nmodule.exports.quitStarted = () => quitConfirmation.quitStarted();" +
     "\nmodule.exports.testApi = { handleDeepLink, buildMenu, openFindBar, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, setBlockedHintDelayMs: (ms) => { blockedHintDelayMs = ms; }, blockedHintDelayMs: () => blockedHintDelayMs, setServerResponseTimeoutMs: (ms) => { serverResponseTimeoutMs = ms; }, serverResponseTimeoutMs: () => serverResponseTimeoutMs, cancelReconnect };";
   const module = { exports: {} };
@@ -4072,10 +4072,7 @@ describe("floating panel wiring", () => {
     ...(await h.ipc.get("omnigent:floating-composer:open-in-main-window")(fromPanel(h), routePath)),
   });
 
-  for (const [routePath, comesForward] of [
-    ["/c/abc", false],
-    ["/settings/import", true],
-  ]) {
+  for (const routePath of ["/c/abc", "/settings/import"]) {
     it(`opens ${routePath} in its server's main window, then hides the panel`, async (t) => {
       t.mock.timers.enable({ apis: ["setTimeout"] });
       const h = loadNavigationHarness({ platform: "darwin" });
@@ -4083,20 +4080,27 @@ describe("floating panel wiring", () => {
       h.api.registerIpc();
       let hides = 0;
       h.electron.app.hide = () => (hides += 1);
+      const steals = [];
+      h.electron.app.focus = (options) => steals.push(options);
       // Opened over another app.
       const panel = openPanel(h);
       const main = addMain(h, { minimized: true });
       assert.equal(panel.visible, true);
       assert.deepEqual(await openFromPanel(h, routePath), { ok: true });
       assert.deepEqual(main.sent, [["omnigent:open-path", routePath]]);
-      // A linked page comes forward, restored; a launched session waits behind the app in front.
-      assert.equal(main.focused, comesForward ? 1 : 0);
-      assert.equal(main.restored, comesForward ? 1 : 0);
+      // What the panel launched or links to comes forward, restored, over the app in front.
+      assert.equal(main.focused, 1);
+      assert.equal(main.restored, 1);
+      assert.equal(steals.length, 1);
+      assert.equal(steals[0].steal, true);
       assert.equal(panel.visible, false);
-      // A launch isn't putting the panel away: Omnigent isn't hidden afterwards.
-      h.electron.BrowserWindow.getFocusedWindow = () => main;
+      // Putting the panel away now, at once or a tick later, hides nothing.
+      h.ipc.get("omnigent:floating-composer:dismiss")(fromPanel(h));
+      t.mock.timers.tick(0);
+      h.ipc.get("omnigent:floating-composer:dismiss")(fromPanel(h));
       t.mock.timers.tick(0);
       assert.equal(hides, 0);
+      assert.equal(main.focused, 1);
     });
   }
 
@@ -4178,13 +4182,8 @@ describe("floating panel wiring", () => {
     assert.equal(panel.visible, false);
   });
 
-  for (const [platform, from, appHidden] of [
-    ["darwin", "another app", 1],
-    ["darwin", "an Omnigent window", 0],
-    ["darwin", "an Omnigent utility window", 0],
-    ["linux", "another app", 0],
-  ]) {
-    it(`on ${platform}, the close button opened from ${from} ${appHidden ? "goes back to that app" : "leaves the app as it is"}`, (t) => {
+  for (const platform of ["darwin", "linux"]) {
+    it(`on ${platform}, the close button puts away only the panel and raises nothing`, (t) => {
       t.mock.timers.enable({ apis: ["setTimeout"] });
       const h = loadNavigationHarness({ platform });
       t.after(h.cleanup);
@@ -4192,19 +4191,69 @@ describe("floating panel wiring", () => {
       const main = addMain(h);
       let hides = 0;
       h.electron.app.hide = () => (hides += 1);
-      const about = { isDestroyed: () => false };
-      if (from === "an Omnigent window") h.electron.BrowserWindow.getFocusedWindow = () => main;
-      if (from === "an Omnigent utility window")
-        h.electron.BrowserWindow.getFocusedWindow = () => about;
+      const steals = [];
+      h.electron.app.focus = (options) => steals.push(options);
+      // Opened over another app.
       const panel = openPanel(h);
-      // Putting the key panel away makes the app's next window key, as AppKit does.
-      h.electron.BrowserWindow.getFocusedWindow = () => main;
       h.ipc.get("omnigent:floating-composer:dismiss")(fromPanel(h));
       t.mock.timers.tick(0);
       assert.equal(panel.visible, false);
-      assert.equal(hides, appHidden);
+      assert.equal(panel.destroyed, false, "the draft stays");
+      assert.equal(hides, 0, "Omnigent's other windows stay as they were");
+      assert.deepEqual(steals, []);
+      assert.equal(main.focused, 0);
     });
   }
+
+  it("a panel waiting for its page comes on screen without activating the app", (t) => {
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const main = addMain(h);
+    const steals = [];
+    h.electron.app.focus = (options) => steals.push(options);
+    let shown = 0;
+    h.win.show = () => (shown += 1);
+    const panel = openPanel(h, { ready: false });
+    assert.equal(panel.visible, false);
+    h.api.floatingComposer().markReady(h.win);
+    assert.equal(panel.visible, true);
+    assert.equal(shown, 0, "show() keys a window by ordering it front with the app");
+    assert.deepEqual(steals, []);
+    assert.equal(main.focused, 0);
+  });
+
+  it("⇧⌘Space while the panel is open goes back to it, never to raising a window", (t) => {
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const panel = openPanel(h);
+    // The most recent main window can't open the panel now (its page hasn't announced).
+    const main = addMain(h);
+    const steals = [];
+    h.electron.app.focus = (options) => steals.push(options);
+    h.api.openFloatingComposerFromShortcut();
+    assert.equal(panel.visible, true);
+    assert.equal(main.focused, 0);
+    assert.deepEqual(steals, []);
+  });
+
+  it("signing in brings a main window forward, never a panel", (t) => {
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    const steals = [];
+    h.electron.app.focus = (options) => steals.push(options);
+    let shown = 0;
+    h.win.show = () => (shown += 1);
+    h.win.focus = () => {};
+    h.api.focusAfterBrowserSignIn(h.win);
+    assert.equal(shown, 1);
+    assert.equal(steals.length, 1);
+    h.api.windows.get(h.win).role = "panel";
+    h.api.focusAfterBrowserSignIn(h.win);
+    assert.equal(shown, 1);
+    assert.equal(steals.length, 1);
+  });
 
   it("hides the panel when its page dismisses it", (t) => {
     const h = loadNavigationHarness({ platform: "darwin" });

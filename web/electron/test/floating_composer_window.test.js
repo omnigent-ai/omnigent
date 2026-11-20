@@ -78,15 +78,7 @@ class FakePanel extends EventEmitter {
 const laptop = { id: 1, workArea: { x: 0, y: 25, width: 1512, height: 920 } };
 const external = { id: 2, workArea: { x: 1512, y: 0, width: 2560, height: 1415 } };
 
-function setup({
-  present,
-  quitting = () => false,
-  saveFrames,
-  loadFrames,
-  autoReady = true,
-  omnigentInFront,
-  returnToPreviousApp,
-} = {}) {
+function setup({ present, quitting = () => false, saveFrames, loadFrames, autoReady = true } = {}) {
   const created = [];
   const stale = new Set();
   let frames = {};
@@ -110,8 +102,6 @@ function setup({
     isCurrent: (panel) => !stale.has(panel),
     quitting,
     ...(present ? { present } : {}),
-    ...(omnigentInFront ? { omnigentInFront } : {}),
-    ...(returnToPreviousApp ? { returnToPreviousApp } : {}),
   });
   if (autoReady) {
     // These panels' pages have loaded: the one just opened says it's ready as soon as it exists.
@@ -169,7 +159,8 @@ test("a hidden panel comes on screen through present; showing a visible one focu
   assert.ok(panel.calls.includes("showInactive"));
   panel.calls.length = 0;
   assert.equal(controller.show("https://a.example"), "focused");
-  assert.deepEqual(panel.calls, ["moveTop", "focus", "webContents.focus"]);
+  // Taking the keyboard back is the same call as on open, never one that activates the app.
+  assert.deepEqual(panel.calls, ["webContents.focus"]);
   assert.equal(presented.length, 1);
   assert.equal(panel.visible, true, "a second press never closes the panel");
 });
@@ -572,7 +563,7 @@ test("a ready panel shows at once, and readiness ends with its document", (t) =>
 });
 
 for (const [how, end] of [
-  ["putting it away", (controller, panel) => controller.dismiss(panel)],
+  ["putting it away", (controller, panel) => controller.hide(panel)],
   ["closing it", (controller, panel) => controller.close(panel)],
 ]) {
   test(`${how} drops an open still waiting on its page`, (t) => {
@@ -664,50 +655,46 @@ test("the preloader builds for the current target once the app is quiet", (t) =>
   assert.deepEqual(built, ["https://a.example"]);
 });
 
-test("putting away a panel opened over another app hands focus back to that app", () => {
-  let returned = 0;
-  let inFront = false;
-  const { controller, created } = setup({
-    omnigentInFront: () => inFront,
-    returnToPreviousApp: () => (returned += 1),
-  });
+test("every open takes the keyboard the same way, and none of them activates the app", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { controller, created } = setup({ autoReady: false });
+  const activating = (panel) =>
+    panel.calls.filter((call) => ["show", "focus", "moveTop"].includes(call));
+  // Ready at once (built ahead).
+  controller.preload("https://a.example");
+  controller.markReady(created[0]);
   controller.show("https://a.example");
-  // A second press while it's up keeps where it was opened from.
-  inFront = true;
-  controller.show("https://a.example");
-  assert.equal(controller.dismiss(created[0]), true);
-  assert.equal(created[0].visible, false);
-  assert.equal(returned, 1);
-  // ⌘W puts it away the same way.
-  inFront = false;
-  controller.show("https://a.example");
-  created[0].close();
-  assert.equal(created[0].destroyed, false, "⌘W keeps the draft");
-  assert.equal(returned, 2);
+  // Waiting for the page, then ready.
+  controller.show("https://b.example");
+  controller.markReady(created[1]);
+  // Waiting for a page that never says so.
+  controller.show("https://c.example");
+  t.mock.timers.tick(FLOATING_COMPOSER_READY_FALLBACK_MS);
+  // A second press while it's up.
+  controller.show("https://c.example");
+  for (const panel of created) {
+    assert.equal(panel.visible, true);
+    assert.deepEqual(activating(panel), [], `${panel.serverUrl} must not activate the app`);
+    assert.ok(panel.calls.includes("webContents.focus"));
+  }
 });
 
-test("a panel opened from an Omnigent window goes back to it when put away", () => {
-  let returned = 0;
-  const { controller, created } = setup({
-    omnigentInFront: () => true,
-    returnToPreviousApp: () => (returned += 1),
-  });
+test("a press while a panel is open goes back to it, until the open ends", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { controller, created } = setup({ autoReady: false });
+  assert.equal(controller.openServerUrl(), null);
   controller.show("https://a.example");
-  controller.dismiss(created[0]);
-  assert.equal(returned, 0);
-});
-
-test("a launch or a click on an Omnigent window isn't putting the panel away", () => {
-  let returned = 0;
-  const { controller, created } = setup({
-    omnigentInFront: () => false,
-    returnToPreviousApp: () => (returned += 1),
-  });
-  controller.show("https://a.example");
-  controller.hide(created[0], { resetFrame: true });
-  controller.show("https://a.example");
-  controller.mainWindowFocused();
-  // Hidden by those, so a later dismiss of the hidden panel goes nowhere either.
-  controller.dismiss(created[0]);
-  assert.equal(returned, 0);
+  assert.equal(controller.openServerUrl(), "https://a.example", "waiting for its page counts");
+  controller.markReady(created[0]);
+  assert.equal(controller.openServerUrl(), "https://a.example");
+  // Each exit ends the open: putting it away, launching, clicking an Omnigent window.
+  for (const end of [
+    () => controller.hide(created[0]),
+    () => controller.hide(created[0], { resetFrame: true }),
+    () => controller.mainWindowFocused(),
+  ]) {
+    controller.show("https://a.example");
+    end();
+    assert.equal(controller.openServerUrl(), null);
+  }
 });

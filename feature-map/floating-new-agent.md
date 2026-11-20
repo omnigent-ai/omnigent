@@ -2,9 +2,9 @@
 
 On macOS, the desktop app's ⇧⌘Space opens a small New Agent panel over whatever
 app is in front, without switching to Omnigent. The user types a prompt, picks
-where it runs, and presses ⌘↵: the session starts in an Omnigent window behind
-the panel, the panel hides, and the user stays in their app. Escape hides the
-panel and keeps the draft. It is behind the `floating_composer` release flag,
+where it runs, and presses ⌘↵: the session opens in an Omnigent window that
+comes forward, and the panel hides. Escape hides the panel, keeps the draft, and
+leaves the user in the app they were in. It is behind the `floating_composer` release flag,
 off by default.
 
 ## Sub-features
@@ -26,7 +26,7 @@ off by default.
 - `launch`: ⌘↵ (shown beside the send button; plain ↵ adds a line) or the send
   button creates the session on This Mac in the chosen
   folder, or in a new sandbox. The session opens in an Omnigent window of the same
-  server without coming forward, the panel hides, and the first message is
+  server, which comes forward, the panel hides, and the first message is
   delivered once. A successful launch clears the panel for the next prompt.
 - `launch-failure`: when the first message can't be delivered (the server never
   stored it, or the runner refused it), the panel keeps the prompt and says why.
@@ -61,9 +61,8 @@ Follow the [verification skill](skills/verify-omnigent/SKILL.md) for the server.
    press ⇧⌘Space. The panel appears over Notes, and Notes stays the active app.
 2. Type a prompt and press Escape. The panel hides. Press ⇧⌘Space again: the
    prompt is still there.
-3. Pick This Mac and a folder, then press ⌘↵. The panel hides, Notes stays in
-   front, and the Omnigent window behind shows the new session, which receives the
-   prompt.
+3. Pick This Mac and a folder, then press ⌘↵. The panel hides, and the Omnigent
+   window comes forward showing the new session, which receives the prompt.
 4. Repeat with a new sandbox when the server has a sandbox provider.
 5. In Settings → General, turn **Open New Agent from anywhere** off: ⇧⌘Space
    reaches other apps. Turn it on, record ⌃⌥Space and allow it: ⌃⌥Space opens the
@@ -106,8 +105,9 @@ Component and unit coverage for each part:
   so a press shows a loaded composer. A press before then, or after the panel's
   page crashed, builds it on the spot and shows it once its page is ready, at most
   a second later. Later presses reuse the hidden panel.
-- Putting the panel away after opening it over another app hides Omnigent (as ⌘H
-  does), so its other windows stay hidden until the app is used again.
+- The panel never activates Omnigent, so putting it away leaves the user in the
+  app they were in. If Omnigent was hidden (⌘H), opening the panel shows its other
+  windows again, as macOS does for any window of a hidden app.
 - The panel's draft lives in that panel's page: it survives hiding, but not
   quitting the app or a rebuilt panel.
 - A panel that needs to sign in again closes instead of signing in inside the panel.

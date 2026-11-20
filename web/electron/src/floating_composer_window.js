@@ -123,12 +123,8 @@ function floatingComposerWindowOptions() {
  *   quitting: () => boolean,
  *   present?: (panel: import("electron").BrowserWindow, show: () => void) => void,
  *   readyFallbackMs?: number,
- *   omnigentInFront?: () => boolean,
- *   returnToPreviousApp?: () => void,
  * }} deps `isCurrent` says whether a panel still shows its server's panel page; `present`
- *   puts a hidden panel on screen, such as with a fade, by calling `show`;
- *   `omnigentInFront` says whether any Omnigent window has focus as the panel opens, rather than
- *   another app; `returnToPreviousApp` hands focus back to that app.
+ *   puts a hidden panel on screen, such as with a fade, by calling `show`.
  */
 function createFloatingComposerController(deps) {
   /** @type {Map<string, import("electron").BrowserWindow>} */
@@ -146,8 +142,11 @@ function createFloatingComposerController(deps) {
   const unshown = new Set();
   /** Opens waiting for a loading page: the panel → its fallback timer. */
   const pendingReveals = new Map();
-  /** Panels opened while another app was in front; putting one away goes back to that app. */
-  const openedOverOtherApp = new Set();
+  /**
+   * Panels the user has open, on screen or waiting for their page, in the order opened. An open
+   * ends three ways: putting the panel away, launching from it, or clicking an Omnigent window.
+   */
+  const open = new Set();
 
   function cancelReveal(panel) {
     const timer = pendingReveals.get(panel);
@@ -199,7 +198,7 @@ function createFloatingComposerController(deps) {
     pickerOpen.delete(panel);
     ready.delete(panel);
     unshown.delete(panel);
-    openedOverOtherApp.delete(panel);
+    open.delete(panel);
     if (panels.get(serverUrl) === panel) panels.delete(serverUrl);
     if (!panel.isDestroyed()) panel.destroy();
   }
@@ -208,7 +207,7 @@ function createFloatingComposerController(deps) {
     for (const [serverUrl, candidate] of panels) {
       if (candidate !== panel || panel.isDestroyed()) continue;
       cancelReveal(panel);
-      openedOverOtherApp.delete(panel);
+      open.delete(panel);
       // A picker its page never reported closed must not keep it up on a later open.
       pickerOpen.delete(panel);
       panel.hide();
@@ -225,14 +224,12 @@ function createFloatingComposerController(deps) {
   }
 
   /**
-   * The user put the panel away (its close button, Escape, ⌘W). One opened over another app
-   * hands focus back to that app rather than to an Omnigent window.
+   * Give the panel the keyboard. For a panel-type window this makes it key without activating
+   * the app, so no other Omnigent window comes forward; putting it away hands the keyboard back
+   * to whatever app had it.
    */
-  function dismiss(panel) {
-    const returning = openedOverOtherApp.has(panel);
-    if (!hide(panel)) return false;
-    if (returning) deps.returnToPreviousApp?.();
-    return true;
+  function takeKeyboard(panel) {
+    panel.webContents.focus();
   }
 
   function serverUrlFor(win) {
@@ -275,7 +272,7 @@ function createFloatingComposerController(deps) {
     panel.on("close", (event) => {
       if (deps.quitting()) return;
       event.preventDefault();
-      dismiss(panel);
+      hide(panel);
     });
     panel.on("closed", () => {
       cancelSave(panel);
@@ -284,7 +281,7 @@ function createFloatingComposerController(deps) {
       pickerOpen.delete(panel);
       ready.delete(panel);
       unshown.delete(panel);
-      openedOverOtherApp.delete(panel);
+      open.delete(panel);
     });
     panels.set(serverUrl, panel);
     return panel;
@@ -298,7 +295,7 @@ function createFloatingComposerController(deps) {
     panel.setBounds(targetFrame(serverUrl));
     if (deps.present) deps.present(panel, () => panel.showInactive());
     else panel.showInactive();
-    panel.webContents.focus();
+    takeKeyboard(panel);
   }
 
   function targetFrame(serverUrl) {
@@ -313,8 +310,8 @@ function createFloatingComposerController(deps) {
 
   return {
     /**
-     * Show the panel for `serverUrl` as the key window without activating the app. If it is
-     * already visible but not focused, focus it.
+     * Open the panel for `serverUrl` as the key window without activating the app. A panel
+     * already open (on screen or waiting for its page) takes the keyboard again.
      *
      * @param {string} serverUrl
      * @returns {"shown" | "focused" | "unavailable"}
@@ -330,16 +327,13 @@ function createFloatingComposerController(deps) {
         cancelReveal(other);
         if (unshown.has(other)) discard(otherUrl, other);
       }
+      // The latest open goes last, so a press while it's open comes back to it.
+      open.delete(panel);
+      open.add(panel);
       if (panel.isVisible()) {
-        // A visible panel that lost focus needs an explicit focus; showInactive won't key it.
-        panel.moveTop();
-        panel.focus();
-        panel.webContents.focus();
+        takeKeyboard(panel);
         return "focused";
       }
-      // Where focus goes back to when the user puts it away.
-      if (deps.omnigentInFront?.() === false) openedOverOtherApp.add(panel);
-      else openedOverOtherApp.delete(panel);
       // A page still loading shows once it's ready, or after a moment if it never says so.
       if (ready.has(panel)) reveal(serverUrl, panel);
       else if (!pendingReveals.has(panel)) {
@@ -391,7 +385,11 @@ function createFloatingComposerController(deps) {
      */
     hide,
 
-    dismiss,
+    /** The server of the panel the user has open now, or null; ⇧⌘Space then goes back to it. */
+    openServerUrl() {
+      const latest = [...open].at(-1);
+      return latest === undefined ? null : serverUrlFor(latest);
+    },
 
     /**
      * Close every panel whose server matches, such as on sign-out; the next open builds a
@@ -415,11 +413,14 @@ function createFloatingComposerController(deps) {
     /** One of Omnigent's own windows took focus: visible panels hide, like a click-away. */
     mainWindowFocused() {
       // An open still waiting on its page is dropped too: the user moved on.
-      for (const panel of [...pendingReveals.keys()]) cancelReveal(panel);
+      for (const panel of [...pendingReveals.keys()]) {
+        cancelReveal(panel);
+        open.delete(panel);
+      }
       for (const [serverUrl, panel] of panels) {
         if (panel.isDestroyed() || !panel.isVisible() || pickerOpen.has(panel)) continue;
-        // The user chose that window, so focus already went where they wanted.
-        openedOverOtherApp.delete(panel);
+        // The user chose that window; it keeps the focus.
+        open.delete(panel);
         panel.hide();
         rememberFrame(serverUrl, panel);
       }

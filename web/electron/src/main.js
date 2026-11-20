@@ -1352,7 +1352,8 @@ function rememberOidcServer(serverUrl, cookieName) {
 
 /** Bring a window back to the front after the user signed in in their browser. */
 function focusAfterBrowserSignIn(win) {
-  if (win.isDestroyed()) return;
+  // A panel comes on screen only through ⇧⌘Space, and never activates the app.
+  if (win.isDestroyed() || !isMainWindow(win)) return;
   if (win.isMinimized()) win.restore();
   win.show();
   win.focus();
@@ -1883,17 +1884,6 @@ function floatingComposer() {
     },
     isCurrent: floatingComposerPanelIsCurrent,
     quitting: () => appQuitting,
-    // Any Omnigent window, About included, means the user wasn't in another app.
-    omnigentInFront: () => BrowserWindow.getFocusedWindow() !== null,
-    // Focusing the panel so it takes typing activates the app (macOS 14+), so putting it away makes
-    // an Omnigent window key and front. When it was opened over another app, hand focus back like
-    // ⌘H: that also hides Omnigent's other windows until the app is next used.
-    returnToPreviousApp: () => {
-      if (process.platform !== "darwin") return;
-      setTimeout(() => {
-        if (isMainWindow(BrowserWindow.getFocusedWindow())) app.hide();
-      }, 0);
-    },
     present: (panel, show) =>
       fadeInFloatingComposer(panel, show, {
         reduceMotion: systemPreferences.getAnimationSettings?.().prefersReducedMotion === true,
@@ -1951,7 +1941,8 @@ function floatingComposerServerUrl() {
 function openFloatingComposerFromShortcut() {
   // The press builds the panel itself if it isn't there yet.
   floatingComposerPreloader.cancel();
-  const serverUrl = floatingComposerServerUrl();
+  // A panel the user has open takes the press, so it never falls through to raising a window.
+  const serverUrl = floatingComposerController?.openServerUrl() ?? floatingComposerServerUrl();
   if (serverUrl !== null) {
     floatingComposer().show(serverUrl);
     return;
@@ -5411,11 +5402,11 @@ function registerIpc() {
     floatingComposerController.markReady(panel);
   });
 
-  // From the panel: put it away, keeping its draft, and go back to where the user was.
+  // From the panel: put it away, keeping its draft; the keyboard goes back to the app it had.
   ipcMain.on("omnigent:floating-composer:dismiss", (event) => {
     const panel = BrowserWindow.fromWebContents(event.sender);
     if (!isPinnedOriginSender(event) || !floatingComposerController?.isPanel(panel)) return;
-    floatingComposerController.dismiss(panel);
+    floatingComposerController.hide(panel);
   });
 
   // From the panel: while its native file picker is open, focusing a main window keeps it up.
@@ -5446,16 +5437,14 @@ function registerIpc() {
     if (target && connectionAttempts.get(target)?.pending === true) {
       return { ok: false, error: "window-loading" };
     }
+    // A launched session or a linked page comes forward, over the app the user was in.
     if (target) {
       sendOpenPath(target, openPath);
-      // A linked page comes forward; a launched session waits behind the app the user is in.
-      if (sessionPath === null) {
-        focusAndRestore(target);
-        app.focus({ steal: true });
-      }
+      focusAndRestore(target);
     } else {
       createWindow(undefined, { serverUrl, path: openPath });
     }
+    app.focus({ steal: true });
     // After a launch the next open starts at the default placement again.
     floatingComposerController.hide(panel, { resetFrame: sessionPath !== null });
     return { ok: true };
