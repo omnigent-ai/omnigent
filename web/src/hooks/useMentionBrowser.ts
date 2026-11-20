@@ -336,9 +336,9 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     }
   };
 
-  // Each input's text as its last change left it. An undo compares against the same input only:
-  // a controlled replacement clears that input's undo history, so its baseline can't go stale.
-  // An input's first change can't be an undo, so a released token in it was typed or pasted.
+  // Each input's text as its last change left it, the baseline for its next undo or redo. A
+  // controlled replacement clears that input's undo history, so an undo only replays changes that
+  // reported themselves here.
   const lastSeenRef = useRef(new WeakMap<object, string>());
 
   const noteTextChange = (event: ComposerInputEvent) => {
@@ -349,23 +349,24 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     const released = releasedRef.current;
     if (released.files.length === 0 && released.sessions.length === 0) return;
     const owned = ownedMentionTokens();
+    const countAfter = tokenCounts(after, owned);
+    const releasedWith = (tokens: ReadonlySet<string>): TaggedMentions => ({
+      files: released.files.filter((it) => tokens.has(fileMentionToken(it))),
+      sessions: released.sessions.filter((it) => tokens.has(sessionTagToken(it))),
+    });
+    if (!isHistoryInput(event)) {
+      // A released token is in no draft segment, so one in this text was typed or pasted by hand:
+      // it's literal now, and no later undo or redo may turn it back into the old tag.
+      releasedRef.current = withoutTags(released, releasedWith(new Set(countAfter.keys())));
+      return;
+    }
     const countBefore = tokenCounts(before, owned);
-    const added = new Set(
-      [...tokenCounts(after, owned)]
+    const restored = new Set(
+      [...countAfter]
         .filter(([token, count]) => count > (countBefore.get(token) ?? 0))
         .map(([token]) => token),
     );
-    const addedTags = {
-      files: released.files.filter((it) => added.has(fileMentionToken(it))),
-      sessions: released.sessions.filter((it) => added.has(sessionTagToken(it))),
-    };
-    if (isHistoryInput(event)) {
-      reclaim(addedTags);
-    } else {
-      // A released token typed or pasted by hand is literal text, so no later undo or redo may
-      // turn it back into the old tag.
-      releasedRef.current = withoutTags(released, addedTags);
-    }
+    reclaim(releasedWith(restored));
   };
 
   const resetMentions = (mentions?: TaggedMentions) => {
