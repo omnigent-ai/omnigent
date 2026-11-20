@@ -25,20 +25,22 @@ def stalled_tunnel_server(tmp_path: Path) -> Iterator[tuple[str, FaultProxy, Eve
     with isolated_local_server(tmp_path / "server") as base_url:
         loop = LoopThread("slow-host-registration")
         loop.start()
-        upstream_port = int(base_url.rsplit(":", 1)[1])
-        events = EventLog(tmp_path / "network.jsonl")
-        proxy = FaultProxy(
-            "host",
-            ("127.0.0.1", upstream_port),
-            loop=loop,
-            events=events,
-            classify=host_link,
-        )
-        proxy.start()
         try:
-            yield base_url, proxy, events
+            upstream_port = int(base_url.rsplit(":", 1)[1])
+            events = EventLog(tmp_path / "network.jsonl")
+            proxy = FaultProxy(
+                "host",
+                ("127.0.0.1", upstream_port),
+                loop=loop,
+                events=events,
+                classify=host_link,
+            )
+            try:
+                proxy.start()
+                yield base_url, proxy, events
+            finally:
+                proxy.stop()
         finally:
-            proxy.stop()
             loop.stop()
 
 
