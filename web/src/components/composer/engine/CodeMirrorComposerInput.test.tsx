@@ -509,6 +509,27 @@ describe("CodeMirrorComposerInput command token", () => {
     expect(commandMarks(view.container)).toEqual([["/review", COMMAND_TOKEN_CLASS]]);
   });
 
+  it("tints a placed `!` behind a control character, with its command right after it", () => {
+    const { container } = mount({ value: "\x01!pwd", commandToken: { token: "!", start: 1 } });
+    expect(commandMarks(container)).toEqual([["!", COMMAND_TOKEN_CLASS]]);
+  });
+
+  it("places a token by the value's offset when the editor folds its CRLF line breaks", () => {
+    const view = mount({ value: "\r\n!ls", commandToken: { token: "!", start: 2 } });
+    expect(commandMarks(view.container)).toEqual([["!", COMMAND_TOKEN_CLASS]]);
+
+    // A new value and token reconfigure the mark through the same offset mapping.
+    view.rerender(
+      <CodeMirrorComposerInput
+        aria-label="Message the agent"
+        value={"\r\n\r\n!ls"}
+        commandToken={{ token: "!", start: 4 }}
+      />,
+    );
+    expect(commandMarks(view.container)).toEqual([["!", COMMAND_TOKEN_CLASS]]);
+    expect(view.container.querySelector(".cm-content")?.textContent).toBe("!ls");
+  });
+
   it("never marks text the token no longer leads, even before the token prop catches up", () => {
     const { container, target } = mount({ value: "/context", commandToken: "/context" });
     act(() => {
@@ -527,5 +548,14 @@ describe("leadingCommandSpan", () => {
     expect(leadingCommandSpan("/contexts", "/context")).toBeNull();
     expect(leadingCommandSpan("say /context", "/context")).toBeNull();
     expect(leadingCommandSpan("/context", null)).toBeNull();
+  });
+
+  it("places a positioned token only where the text still holds it", () => {
+    expect(leadingCommandSpan("!ls", { token: "!", start: 0 })).toEqual({ start: 0, end: 1 });
+    expect(leadingCommandSpan("\x01!ls", { token: "!", start: 1 })).toEqual({ start: 1, end: 2 });
+    expect(leadingCommandSpan("ls", { token: "!", start: 0 })).toBeNull();
+    // The bare-string rule would refuse both: no word break after `!`, and \x01 isn't whitespace.
+    expect(leadingCommandSpan("!ls", "!")).toBeNull();
+    expect(leadingCommandSpan("\x01! ls", "!")).toBeNull();
   });
 });

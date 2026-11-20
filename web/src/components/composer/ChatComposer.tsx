@@ -91,6 +91,7 @@ type TextareaComposerInput = Omit<ComponentPropsWithRef<"textarea">, "onKeyDown"
   onKeyDown?: (event: KeyboardEvent<HTMLTextAreaElement>, intent: ComposerKeyIntent) => void;
   "data-testid"?: string;
   "data-slash-command"?: string;
+  "data-shell-command"?: string;
   "data-has-draft"?: string;
 };
 
