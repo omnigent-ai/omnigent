@@ -3010,7 +3010,7 @@ async def test_scripted_pr_link_checks_source_and_target(
     source, target, _ = peers
     auth_app.state.feature_flags = resolve_feature_flags(
         {
-            FEATURES_ENV_VAR: ""
+            FEATURES_ENV_VAR: "-scripted_sessions"
             if scenario in ("disabled", "legacy_disabled")
             else "scripted_sessions"
         }
@@ -3065,7 +3065,7 @@ async def test_explicit_host_endpoint_refuses_without_capability_or_source(
 ):
     source, _, _ = peers
     auth_app.state.feature_flags = resolve_feature_flags(
-        {FEATURES_ENV_VAR: "scripted_sessions" if enabled else ""}
+        {FEATURES_ENV_VAR: "scripted_sessions" if enabled else "-scripted_sessions"}
     )
     store = SqlAlchemyConversationStore(db_uri)
     before = {session.id for session in store.list_conversations().data}

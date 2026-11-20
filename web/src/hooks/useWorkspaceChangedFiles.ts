@@ -23,7 +23,7 @@ import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { useSession } from "@/hooks/useSession";
 import { livenessRowFromSession, useSessionLiveness } from "@/hooks/useSessionLiveness";
 import { authenticatedFetch } from "@/lib/identity";
-import { listDirectoryViaWorkspaceApi } from "@/lib/workspaceApi";
+import { listDirectoryViaWorkspaceApi, searchFilesViaWorkspaceApi } from "@/lib/workspaceApi";
 import { isTempConvId } from "@/lib/tempConversationId";
 import { useChatStore } from "@/store/chatStore";
 
@@ -594,6 +594,9 @@ export interface WorkspaceFileSearchResult {
   unavailable: boolean;
 }
 
+// One cap for both routes, so the API and REST return the same matches.
+const FILE_SEARCH_LIMIT = 500;
+
 async function fetchWorkspaceFileSearch(
   conversationId: string,
   query: string,
@@ -602,7 +605,29 @@ async function fetchWorkspaceFileSearch(
   location: string,
   signal?: AbortSignal,
 ): Promise<WorkspaceFileSearchResult> {
-  const params = new URLSearchParams({ limit: "500" });
+  // The workspace API only searches inside the workspace.
+  if (!browseLocationBase(location)) {
+    const viaApi = await searchFilesViaWorkspaceApi(
+      conversationId,
+      query,
+      { path: location, include, exclude, limit: FILE_SEARCH_LIMIT },
+      signal,
+    );
+    if (viaApi) {
+      return {
+        // Already relative to `location`; stripping it again would break a nested same-named folder.
+        files: mapFilesystemEntries({
+          object: "list",
+          data: viaApi.data,
+          has_more: viaApi.hasMore,
+        }),
+        truncated: viaApi.truncated,
+        hasMore: viaApi.hasMore,
+        unavailable: false,
+      };
+    }
+  }
+  const params = new URLSearchParams({ limit: String(FILE_SEARCH_LIMIT) });
   if (query) params.set("q", query);
   if (include) params.set("include", include);
   if (exclude) params.set("exclude", exclude);

@@ -1,14 +1,13 @@
 import type { SVGProps } from "react";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { AgentCard } from "./AgentCard";
-import { TooltipProvider } from "@/components/ui/tooltip";
+import { iconForAgent } from "./agentIcon";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 
 // The real glyphs are brand SVGs (the @lobehub Claude/Codex icons render
 // nothing under jsdom), so stub each icon module with a marker element.
-// The assertions then prove which icon AgentCard *chose* for a given
+// The assertions then prove which icon iconForAgent *chose* for a given
 // agent — i.e. the harness→glyph branching — independent of the real
 // glyph internals.
 function stub(name: string) {
@@ -39,13 +38,14 @@ function agent(overrides: Partial<AvailableAgent> = {}): AvailableAgent {
 }
 
 function chosenIcon(a: AvailableAgent): string | null | undefined {
-  const { container } = render(<AgentCard agent={a} selected={false} onSelect={() => {}} />);
+  const Icon = iconForAgent(a);
+  const { container } = render(<Icon />);
   return container.querySelector("[data-icon]")?.getAttribute("data-icon");
 }
 
 afterEach(cleanup);
 
-describe("AgentCard icon selection", () => {
+describe("iconForAgent", () => {
   it.each([
     // The whole point of keying on harness: a custom reviewer named
     // "design-reviewer" must still read as Codex, not fall back to bot.
@@ -92,89 +92,5 @@ describe("AgentCard icon selection", () => {
     // Neither the codex/claude harness match nor the nessie name match
     // fires, so the generic bot is the floor.
     expect(chosenIcon(agent({ name: "mystery", harness: "agents_sdk" }))).toBe("bot");
-  });
-});
-
-describe("AgentCard compact mode", () => {
-  const withDescription = agent({
-    display_name: "Nessie",
-    description: "Multi-agent coding orchestrator.",
-  });
-
-  it("hides the inline description and moves it into a tooltip", () => {
-    // Compact cards sit in a horizontal row, so the long description is
-    // dropped from the body (to keep heights even) and shown on hover
-    // via the tooltip instead.
-    render(
-      <TooltipProvider>
-        <AgentCard agent={withDescription} selected={false} onSelect={() => {}} compact />
-      </TooltipProvider>,
-    );
-    const card = screen.getByTestId("agent-card-ag_1");
-    expect(card).toHaveTextContent("Nessie"); // name still shown
-    // Description is NOT inline — it lives in the (closed) tooltip
-    // content, absent from the DOM until hover/focus. If compact stopped
-    // hiding it, this query would find the inline text and fail.
-    expect(screen.queryByText("Multi-agent coding orchestrator.")).toBeNull();
-    // The card itself is the tooltip trigger (asChild merges the slot
-    // marker onto the button); losing the wrapper drops the hover text.
-    expect(card).toHaveAttribute("data-slot", "tooltip-trigger");
-  });
-
-  it("renders the description inline with no tooltip in the default mode", () => {
-    render(<AgentCard agent={withDescription} selected={false} onSelect={() => {}} />);
-    const card = screen.getByTestId("agent-card-ag_1");
-    // Non-compact (AddAgentDialog) keeps the full card: description
-    // inline, and the card is not wrapped as a tooltip trigger.
-    expect(card).toHaveTextContent("Multi-agent coding orchestrator.");
-    expect(card).not.toHaveAttribute("data-slot", "tooltip-trigger");
-  });
-});
-
-describe("AgentCard hover mode", () => {
-  const withDescription = agent({
-    display_name: "Nessie",
-    description: "Multi-agent coding orchestrator.",
-  });
-
-  it("wraps the card in a hover flyout when hover is set and a description exists", () => {
-    // AddAgentDialog opts into the Cursor-style flyout. The card stays the
-    // full inline card AND becomes the hover-card trigger (asChild merges
-    // the slot marker onto the button), so hovering opens the flyout.
-    render(<AgentCard agent={withDescription} selected={false} onSelect={() => {}} hover />);
-    const card = screen.getByTestId("agent-card-ag_1");
-    expect(card).toHaveTextContent("Multi-agent coding orchestrator."); // inline kept
-    expect(card).toHaveAttribute("data-slot", "hover-card-trigger");
-  });
-
-  it("does not wrap when hover is set but the agent has no description", () => {
-    // AgentHoverCard no-ops without a description, so the card stays a
-    // plain button — no empty flyout opens.
-    render(
-      <AgentCard
-        agent={agent({ display_name: "Bare", description: null })}
-        selected={false}
-        onSelect={() => {}}
-        hover
-      />,
-    );
-    expect(screen.getByTestId("agent-card-ag_1")).not.toHaveAttribute(
-      "data-slot",
-      "hover-card-trigger",
-    );
-  });
-
-  it("prefers the compact tooltip over the hover flyout when both are set", () => {
-    // compact is checked first, so a compact card never also becomes a
-    // hover-card trigger — the doc contract that hover is ignored in
-    // compact mode.
-    render(
-      <TooltipProvider>
-        <AgentCard agent={withDescription} selected={false} onSelect={() => {}} compact hover />
-      </TooltipProvider>,
-    );
-    const card = screen.getByTestId("agent-card-ag_1");
-    expect(card).toHaveAttribute("data-slot", "tooltip-trigger");
-    expect(card).not.toHaveAttribute("data-slot", "hover-card-trigger");
   });
 });

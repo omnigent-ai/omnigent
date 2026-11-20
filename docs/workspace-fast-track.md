@@ -25,6 +25,26 @@ API skips the runner and streams protobuf messages through without re-encoding
 them. A route that fails for a session is skipped for five minutes. Error
 answers such as "not found" go to REST, so callers keep the errors they expect.
 
+## Methods a host serves
+
+`ListDirectory` and `ReadFile` came with the API, so every host that serves it
+has them. Before any other method (file and content search, Git comparisons)
+the page asks the route's host with `GetCapabilities`, once per route every
+five minutes, shared by concurrent calls and never cancelled by one of them.
+A method or feature the host doesn't list goes straight to REST, or reads as
+unavailable where REST has no equivalent. An `unimplemented` answer, or one the
+page can't use (a content search that ends early), skips only that method on
+that route for five minutes. Either way the route keeps serving what the host
+has, so an older host still reads files. Git comparisons have no REST
+equivalent, so a request the host refuses, such as an unknown revision, fails
+with the host's message instead.
+
+Go to File and Content search try the workspace API first and fall back to
+their REST routes. Content search is only asked for while the server's
+`workspace_content_search` flag is on. Neither route can stop a search on the
+host once it has started: a search the user abandons runs until it ends on
+its own.
+
 ## Turning it on
 
 | Where       | What                                                                                                    |
@@ -120,6 +140,5 @@ source with Rust.
 
 ## Not covered yet
 
-- Go to File and content search still use REST.
 - Hosts on other machines with no record and no inferable alias use the server API route.
 - Windows has no direct route.

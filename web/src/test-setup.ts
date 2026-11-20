@@ -90,16 +90,9 @@ if (typeof globalThis.ResizeObserver === "undefined") {
   };
 }
 
-// @tanstack/react-virtual windows rows off the scroll element's measured
-// height, but jsdom does no layout — every element is 0×0, so the real
-// virtualizer renders nothing and component tests can't see any rows. Replace
-// it with a pass-through that renders every item; the windowing itself is
-// browser behaviour verified manually, and the components' logic (flatten /
-// expand / lazy-load for FolderTree; bubble building / history load /
-// indicators for the transcript) is what the unit tests assert. Shared by both
-// consumers, so the shape is the superset they read — honouring `getItemKey`
-// and exposing the offset/range/scroll handles the transcript's
-// VirtualBubbleList touches, so its real path doesn't throw under jsdom.
+// jsdom does no layout, so the real virtualizer renders no rows. This pass-through
+// renders every item and exposes the superset of handles its consumers read.
+// Tests of the windowing itself `vi.unmock` it and stub element sizes.
 const ROW = 200;
 vi.mock("@tanstack/react-virtual", async (importOriginal) => ({
   measureElement: (await importOriginal<typeof ReactVirtualModule>()).measureElement,
@@ -116,6 +109,7 @@ vi.mock("@tanstack/react-virtual", async (importOriginal) => ({
       return {
         getVirtualItems: () => items,
         getTotalSize: () => count * ROW,
+        measure: () => {},
         measureElement: () => {},
         scrollToIndex: () => {},
         getVirtualItemForOffset: (offset: number) =>
