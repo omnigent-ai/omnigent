@@ -13734,30 +13734,51 @@ def test_model_command_refuses_whitespace_normalized_draft_ownership(
     assert composer.model == "claude-sonnet-5-5"
 
 
+@pytest.mark.parametrize(
+    ("owned", "replacement", "wrap_columns"),
+    [("blocked prompt", "a person's replacement", None), ("abcd\nefgh", "abcdefgh", 4)],
+    ids=["visible-replacement", "equal-physical-rows"],
+)
+@pytest.mark.parametrize("replace_after_first_observation", [False, True])
 def test_model_command_rechecks_an_owned_draft_before_clearing_it(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    owned: str,
+    replacement: str,
+    wrap_columns: int | None,
+    replace_after_first_observation: bool,
 ) -> None:
-    composer = _SessionModelComposer(draft="blocked prompt")
+    composer = _SessionModelComposer(draft=owned)
+    composer.wrap_columns = wrap_columns
+    owned_pane = composer._capture_pane("", "")
+    composer.text = replacement
+    if wrap_columns is not None:
+        assert composer._capture_pane("", "") == owned_pane
+        assert composer._capture_pane("", "", join_wrapped=True) != owned_pane
+    if replace_after_first_observation:
+        composer.text = owned
     bridge_dir = _session_model_bridge(tmp_path, composer)
     composer.install(monkeypatch)
     captures = 0
 
     def capture(socket_path: str, target: str, *, join_wrapped: bool = False) -> str:
         nonlocal captures
-        captures += 1
-        if captures == 3:
-            composer.text = "a person's replacement"
+        if not join_wrapped:
+            captures += 1
+            if captures == 3 and replace_after_first_observation:
+                composer.text = replacement
         return composer._capture_pane(socket_path, target, join_wrapped=join_wrapped)
 
     monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
 
     with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused):
         claude_native_bridge.inject_model_command(
-            bridge_dir, model="private-glm[1m]", owned_draft="blocked prompt"
+            bridge_dir, model="private-glm[1m]", owned_draft=owned
         )
 
     assert composer.sends == []
-    assert composer.text == "a person's replacement"
+    assert composer.submitted == []
+    assert composer.text == replacement
 
 
 @pytest.mark.parametrize(
@@ -14624,8 +14645,8 @@ def test_model_command_refuses_queued_or_unrecognized_pickers_without_selecting(
             composer.text = "/model" if surface == "queued" else ""
             composer.cursor = len(composer.text)
 
-    def capture(socket_path: str, target: str) -> str:
-        pane = composer._capture_pane(socket_path, target)
+    def capture(socket_path: str, target: str, *, join_wrapped: bool = False) -> str:
+        pane = composer._capture_pane(socket_path, target, join_wrapped=join_wrapped)
         if surface == "queued-hint":
             return "\n".join(
                 [
@@ -14752,9 +14773,9 @@ def test_model_command_stops_selection_at_cancellation_or_deadline(
         if reached:
             stop_here()
 
-    def capture(socket_path: str, target: str) -> str:
+    def capture(socket_path: str, target: str, *, join_wrapped: bool = False) -> str:
         nonlocal picker_reads, status_reads, confirmation_reads
-        pane = composer._capture_pane(socket_path, target)
+        pane = composer._capture_pane(socket_path, target, join_wrapped=join_wrapped)
         if composer.overlay == "picker" and composer.highlight == 1:
             picker_reads += 1
             if phase == "observed-picker" and picker_reads == 2:
@@ -15303,7 +15324,7 @@ def test_model_command_does_not_dismiss_a_replacement_permission_prompt(
     composer.install(monkeypatch)
     status_reads = confirmation_reads = 0
 
-    def capture(socket_path: str, target: str) -> str:
+    def capture(socket_path: str, target: str, *, join_wrapped: bool = False) -> str:
         nonlocal status_reads, confirmation_reads
         sent = [args[-1] for args in composer.sends]
         if composer.overlay == "cache-cost":
@@ -15324,7 +15345,7 @@ def test_model_command_does_not_dismiss_a_replacement_permission_prompt(
             status_reads += 1
             if status_reads >= 2:
                 return _PERMISSION_PROMPT_PANE
-        return composer._capture_pane(socket_path, target)
+        return composer._capture_pane(socket_path, target, join_wrapped=join_wrapped)
 
     monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
 

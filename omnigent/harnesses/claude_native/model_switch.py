@@ -557,9 +557,9 @@ class SessionOnlyModelSwitch:
         self.send("Enter")
 
     def draft_matches(self, pane: str, expected: str) -> bool:
-        if _draft(pane) == expected:
-            return True
-        # tmux joins only soft wraps; explicit newlines and whitespace stay exact.
+        if _draft(pane) is None:
+            return False
+        # Physical rows can match another draft containing explicit newlines.
         return _draft(self.pane(join_wrapped=True)) == expected
 
     def clear_owned_draft(self, expected: str) -> None:

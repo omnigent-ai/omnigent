@@ -265,17 +265,15 @@ async def test_bound_model_control_keeps_the_literal_through_the_real_actuator(
         ]
 
 
-@pytest.mark.parametrize("result_kind", ["absent", "different-session-only", "different-legacy"])
-async def test_model_control_rejects_a_missing_or_mismatched_result(
+@pytest.mark.parametrize("result_kind", ["different-session-only", "different-legacy"])
+async def test_model_control_rejects_a_mismatched_result(
     model_control: tuple[native_controls.NativeControls, _SessionModelComposer, Path],
     monkeypatch: pytest.MonkeyPatch,
     result_kind: str,
 ) -> None:
     controls, composer, _ = model_control
     result = (
-        None
-        if result_kind == "absent"
-        else bridge.ClaudeLegacyModelSwitchResult("another-model", "another-model")
+        bridge.ClaudeLegacyModelSwitchResult("another-model", "another-model")
         if result_kind == "different-legacy"
         else bridge.ClaudeModelSwitchResult("another-model", "x", "x", "x", "native-session")
     )

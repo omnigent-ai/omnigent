@@ -1101,13 +1101,21 @@ async def test_replay_keeps_the_prompt_pending_when_the_model_actuator_is_not_tr
     [
         ("No exact picker choice", False),
         ("post-clear-picker-refusal", False),
+        ("physical-row-collision", False),
+        ("physical-row-collision-after-read", False),
         (
             "Session-only model switching requires Claude Code 2.1.323 or newer. "
             "Update Claude Code and relaunch this terminal.",
             True,
         ),
     ],
-    ids=["picker-refusal", "post-clear-picker-refusal", "unsupported-cli"],
+    ids=[
+        "picker-refusal",
+        "post-clear-picker-refusal",
+        "physical-row-collision",
+        "physical-row-collision-after-read",
+        "unsupported-cli",
+    ],
 )
 async def test_replay_refused_model_switch_can_be_rescheduled_by_the_caller(
     tmp_path: Path,
@@ -1122,8 +1130,15 @@ async def test_replay_refused_model_switch_can_be_rescheduled_by_the_caller(
         ClaudeModelSwitchResult,
     )
 
-    actual_picker = refusal == "post-clear-picker-refusal"
-    prompt = "Recover this exact draft: <literal> `message`  " if actual_picker else "hello"
+    collision = refusal.startswith("physical-row-collision")
+    actual_picker = refusal == "post-clear-picker-refusal" or collision
+    prompt = (
+        "abcdefgh\nijklmnop"
+        if collision
+        else "Recover this exact draft: <literal> `message`  "
+        if actual_picker
+        else "hello"
+    )
     bridge_dir = tmp_path
     if actual_picker:
         from omnigent.harnesses.claude_native import bridge
@@ -1137,8 +1152,25 @@ async def test_replay_refused_model_switch_can_be_rescheduled_by_the_caller(
         composer = _SessionModelComposer(draft=prompt)
         composer.options[-1] = "private-model"
         bridge_dir = _session_model_bridge(tmp_path, composer)
-        composer.options[-1] = "different-private-model"
+        if collision:
+            composer.wrap_columns = 8
+            if refusal == "physical-row-collision":
+                composer.text = "abcdefghijklmnop"
+        else:
+            composer.options[-1] = "different-private-model"
         composer.install(monkeypatch)
+        if refusal == "physical-row-collision-after-read":
+            captures = 0
+
+            def capture(socket_path: str, target: str, *, join_wrapped: bool = False) -> str:
+                nonlocal captures
+                if not join_wrapped:
+                    captures += 1
+                    if captures == 3:
+                        composer.text = "abcdefghijklmnop"
+                return composer._capture_pane(socket_path, target, join_wrapped=join_wrapped)
+
+            monkeypatch.setattr(bridge, "_capture_pane", capture)
         monkeypatch.setenv(bridge.REQUEST_SESSION_ID_ENV_VAR, "web-session")
         actuator = bridge.inject_model_command
     _mark(bridge_dir)
@@ -1185,8 +1217,13 @@ async def test_replay_refused_model_switch_can_be_rescheduled_by_the_caller(
     assert not client.messages
     assert (bridge_dir / turn_routing.PENDING_FILE).read_bytes() == pending_before
     if actual_picker:
-        assert composer.text == ""
-        assert composer.submitted == ["/model"]
+        if collision:
+            assert composer.text == "abcdefghijklmnop"
+            assert composer.sends == []
+            assert composer.submitted == []
+        else:
+            assert composer.text == ""
+            assert composer.submitted == ["/model"]
         assert composer.model == composer.options[0]
         assert prompt not in composer.submitted
     assert client.posts == [
@@ -1216,6 +1253,10 @@ async def test_replay_refused_model_switch_can_be_rescheduled_by_the_caller(
             },
         )
     ]
+    if collision:
+        # The person explicitly clears the replacement before resubmitting the saved text.
+        composer.text = ""
+        composer.cursor = 0
     refusing = False
     client.fail = False
     await replay()
