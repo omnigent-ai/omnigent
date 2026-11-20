@@ -292,25 +292,6 @@ def _transcript_posts(
     ]
 
 
-def _status_posts(
-    posted: list[tuple[str, dict[str, Any]]],
-    session_id: str,
-) -> list[str]:
-    """
-    Return the ``external_session_status`` statuses posted to one session, in order.
-
-    :param posted: All captured Omnigent posts as ``(path, body)`` tuples.
-    :param session_id: Omnigent session id to filter for.
-    :returns: Status literals, e.g. ``["running", "idle"]``.
-    """
-    return [
-        body["data"]["status"]
-        for path, body in posted
-        if path == f"/v1/sessions/{session_id}/events"
-        and body["type"] == "external_session_status"
-    ]
-
-
 def _registration_posts(
     posted: list[tuple[str, dict[str, Any]]],
     parent_session_id: str,
@@ -1219,17 +1200,7 @@ def _snapshot_test_state(
     *,
     codex_client: _FakeCodexAppServerClient | None = None,
 ) -> tuple[codex_native_forwarder._CodexForwarderState, Path]:
-    """
-    Build forwarder state for a snapshot test and isolate its bridge files.
-
-    Child turn events use the current directory as their bridge dir, so the
-    test runs from a scratch cwd distinct from the parent's bridge dir.
-
-    :param tmp_path: Test scratch directory.
-    :param monkeypatch: Pytest monkeypatch fixture.
-    :param codex_client: Optional app-server double enabling child backfill.
-    :returns: ``(forwarder_state, parent_bridge_dir)``.
-    """
+    """Child resume replay reads bridge state from cwd, so use a scratch directory."""
     cwd = tmp_path / "cwd"
     cwd.mkdir()
     monkeypatch.chdir(cwd)
@@ -1364,7 +1335,7 @@ def test_forwarder_collab_snapshot_does_not_revive_settled_child(
         posted,
     )
 
-    assert _status_posts(posted, "conv_child") == ["running", settled_status]
+    assert _child_statuses(posted) == ["running", settled_status]
 
 
 def test_forwarder_collab_snapshot_posts_status_for_child_without_own_lifecycle(
@@ -1384,7 +1355,7 @@ def test_forwarder_collab_snapshot_posts_status_for_child_without_own_lifecycle(
         posted,
     )
 
-    assert _status_posts(posted, "conv_child") == ["running"]
+    assert _child_statuses(posted) == ["running"]
 
 
 def test_forwarder_collab_snapshot_marks_child_running_after_new_turn_starts(
@@ -1410,7 +1381,7 @@ def test_forwarder_collab_snapshot_marks_child_running_after_new_turn_starts(
         posted,
     )
 
-    assert _status_posts(posted, "conv_child") == ["running", "idle", "running", "running"]
+    assert _child_statuses(posted) == ["running", "idle", "running", "running"]
 
 
 def test_forwarder_collab_snapshot_does_not_settle_running_child(
@@ -1434,7 +1405,7 @@ def test_forwarder_collab_snapshot_does_not_settle_running_child(
         posted,
     )
 
-    assert _status_posts(posted, "conv_child") == ["running"]
+    assert _child_statuses(posted) == ["running"]
 
 
 def test_forwarder_replayed_spawn_snapshot_does_not_revive_backfilled_completed_child(
@@ -1457,7 +1428,7 @@ def test_forwarder_replayed_spawn_snapshot_does_not_revive_backfilled_completed_
     _deliver_parent_events(state, bridge_dir, [_running_snapshot_event()], posted)
 
     assert len(_transcript_posts(posted, "conv_child")) == 1, "child backfill did not replay"
-    assert _status_posts(posted, "conv_child") == []
+    assert _child_statuses(posted) == []
 
 
 def test_forwarder_replayed_spawn_snapshot_marks_backfilled_running_child_working(
@@ -1479,7 +1450,7 @@ def test_forwarder_replayed_spawn_snapshot_marks_backfilled_running_child_workin
     )
 
     assert len(_transcript_posts(posted, "conv_child")) == 1, "child backfill did not replay"
-    assert _status_posts(posted, "conv_child") == ["running"]
+    assert _child_statuses(posted) == ["running"]
 
 
 @pytest.mark.parametrize(
@@ -1507,7 +1478,7 @@ def test_forwarder_backfill_seeds_child_status_from_newest_turn(
 
     _deliver_parent_events(state, bridge_dir, [_running_snapshot_event()], posted)
 
-    assert _status_posts(posted, "conv_child") == expected_posts
+    assert _child_statuses(posted) == expected_posts
 
 
 def test_forwarder_backfilled_status_does_not_overwrite_live_child_turn(
@@ -1550,5 +1521,5 @@ def test_forwarder_backfilled_status_does_not_overwrite_live_child_turn(
     asyncio.run(run())
 
     assert len(_transcript_posts(posted, "conv_child")) == 1, "child backfill did not replay"
-    assert _status_posts(posted, "conv_child") == ["running", "running"]
+    assert _child_statuses(posted) == ["running", "running"]
     assert state.child_turn_status("thread_child") == "running"
