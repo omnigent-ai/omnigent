@@ -855,6 +855,7 @@ describe("Arca extend IPC", () => {
         // Managed-feature fixtures simulate macOS on every test host.
         chromeCookieImport: true,
         floatingComposer: true,
+        floatingComposerShortcut: true,
       },
     );
     assert.deepEqual(await extend(event, "overnight"), { ok: true, shutdownAt: null });
@@ -3845,6 +3846,7 @@ describe("floating panel wiring", () => {
     assert.equal(h.calls.globalShortcuts, undefined);
     const event = { sender: h.webContents, senderFrame: { url: h.webContents.getURL() } };
     assert.equal(h.ipc.get("omnigent:get-desktop-features")(event).floatingComposer, false);
+    assert.equal(h.ipc.get("omnigent:get-desktop-features")(event).floatingComposerShortcut, false);
   });
 
   it("Find does nothing while a panel has focus, instead of searching the window behind", (t) => {
@@ -5158,6 +5160,7 @@ describe("browser-view teardown on server change (src/main.js)", () => {
         // Managed-feature fixtures simulate macOS on every test host.
         chromeCookieImport: true,
         floatingComposer: true,
+        floatingComposerShortcut: true,
       },
     );
   });
