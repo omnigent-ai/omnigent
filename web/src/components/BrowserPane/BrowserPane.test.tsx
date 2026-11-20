@@ -9,6 +9,7 @@ import {
   within,
 } from "@testing-library/react";
 import type * as NativeBridge from "@/lib/nativeBridge";
+import type * as FetchSessionHostId from "@/lib/fetchSessionHostId";
 import type * as Identity from "@/lib/identity";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resetDesktopCommandsForTests, useDesktopCommand } from "@/lib/desktopCommands";
@@ -17,11 +18,31 @@ import { BrowserPane } from "./BrowserPane";
 
 const getSessionSlim = vi.fn();
 const identity = vi.hoisted(() => ({ userId: "user-a" as string | null }));
+// Lookups the pane awaits while reopening a saved page. A test that awaits one resumes
+// after the pane's own continuation, so its assertions see what that step did.
+const restoreLookups = vi.hoisted(() => ({
+  identity: [] as Promise<unknown>[],
+  host: [] as Promise<unknown>[],
+}));
 vi.mock("@/lib/identity", async (importOriginal) => ({
   ...(await importOriginal<typeof Identity>()),
   getCurrentUserId: () => identity.userId,
-  resolveIdentity: async () => identity.userId,
+  resolveIdentity: () => {
+    const lookup = Promise.resolve(identity.userId);
+    restoreLookups.identity.push(lookup);
+    return lookup;
+  },
 }));
+vi.mock("@/lib/fetchSessionHostId", async (importOriginal) => {
+  const { fetchSessionHostId } = await importOriginal<typeof FetchSessionHostId>();
+  return {
+    fetchSessionHostId: (...args: Parameters<typeof fetchSessionHostId>) => {
+      const lookup = fetchSessionHostId(...args);
+      restoreLookups.host.push(lookup);
+      return lookup;
+    },
+  };
+});
 vi.mock("@/lib/sessionsApi", () => ({
   getSessionSlim: (...args: unknown[]) => getSessionSlim(...args),
 }));
@@ -116,6 +137,8 @@ afterEach(() => {
   vi.clearAllMocks();
   localStorage.clear();
   identity.userId = "user-a";
+  restoreLookups.identity = [];
+  restoreLookups.host = [];
   (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop = undefined;
 });
 
@@ -154,13 +177,12 @@ describe("BrowserPane cold-start (no view yet)", () => {
       openBrowsers: ["two"],
       browserPages: { two: { url: "https://example.com/report", title: "Report", owner } },
     });
-  // Drains a fixed number of microtask hops; the restore path uses no timers.
-  const flushPromises = () =>
-    Array.from({ length: 20 }).reduce<Promise<void>>(
-      (chain) => chain.then(() => undefined),
-      Promise.resolve(),
-    );
-  const settle = () => act(flushPromises);
+  // Waits for promises the pane awaited, after the pane has handled them.
+  const handled = (promises: unknown[]) =>
+    act(async () => {
+      await Promise.allSettled(promises);
+    });
+  const firstResult = (mock: ReturnType<typeof vi.fn>) => handled([mock.mock.results[0]?.value]);
   const deferredHost = () => {
     let resolveHost: (session: unknown) => void = () => {};
     getSessionSlim.mockImplementation(
@@ -172,7 +194,7 @@ describe("BrowserPane cold-start (no view yet)", () => {
     return (hostId: string | null = null) =>
       act(async () => {
         resolveHost({ id: "conv_a", hostId, parentSessionId: null });
-        await flushPromises();
+        await Promise.allSettled(restoreLookups.host);
       });
   };
 
@@ -231,7 +253,7 @@ describe("BrowserPane cold-start (no view yet)", () => {
       installBridge({ browserOpenOrNavigate });
       render(<BrowserPane conversationId="browser-tab:conv_a:two" agentBrowser={false} />);
       await waitFor(() => expect(browserOpenOrNavigate).toHaveBeenCalledOnce());
-      await settle();
+      await firstResult(browserOpenOrNavigate);
 
       expect(screen.queryByRole("alert")).toBeNull();
       expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveValue(bar);
@@ -242,8 +264,8 @@ describe("BrowserPane cold-start (no view yet)", () => {
     savedReport("user-b");
     const bridge = installBridge();
     render(<BrowserPane conversationId="browser-tab:conv_a:two" agentBrowser={false} />);
-    await waitFor(() => expect(bridge.browserHasView).toHaveBeenCalled());
-    await settle();
+    await waitFor(() => expect(restoreLookups.identity).toHaveLength(1));
+    await handled(restoreLookups.identity);
 
     expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
     expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveValue("");
@@ -256,7 +278,7 @@ describe("BrowserPane cold-start (no view yet)", () => {
     });
     render(<BrowserPane conversationId="browser-tab:conv_a:two" agentBrowser={false} />);
     await waitFor(() => expect(bridge.browserHasView).toHaveBeenCalled());
-    await settle();
+    await firstResult(bridge.browserHasView);
 
     expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
     expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveValue("");
@@ -337,7 +359,7 @@ describe("BrowserPane cold-start (no view yet)", () => {
     await act(async () => {
       finishReopen({ ok: false, error: "navigation superseded or closed" });
     });
-    await settle();
+    await firstResult(browserOpenOrNavigate);
 
     expect(screen.queryByRole("alert")).toBeNull();
   });

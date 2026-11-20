@@ -17,6 +17,7 @@ const {
   openSessionBrowserTab,
   openSessionRail,
 } = require("./desktopBrowserTabHarness");
+const { eventually } = require("./desktopDesignPromptHarness");
 const { startFakeOidcIdp, oidcServerEnv } = require("./fixtures/fakeOidcIdp");
 
 const deps = desktopDepsAvailable();
@@ -32,20 +33,6 @@ const pause = (ms = 2_500) =>
   new Promise((resolve) => {
     setTimeout(resolve, RECORDING ? ms : 0);
   });
-
-async function waitFor(check, message, timeoutMs = 20_000) {
-  const deadline = Date.now() + timeoutMs;
-  // oxlint-disable no-await-in-loop -- polling.
-  while (Date.now() < deadline) {
-    const value = await check();
-    if (value) return value;
-    await new Promise((resolve) => {
-      setTimeout(resolve, 200);
-    });
-  }
-  // oxlint-enable no-await-in-loop
-  throw new Error(message);
-}
 
 /** URL and title of every embedded browser view the shell holds. */
 const embeddedPages = (electronApp) =>
@@ -122,9 +109,9 @@ it(
       const bar = window.getByRole("textbox", { name: "Address bar" });
       await bar.fill(pageUrl);
       await bar.press("Enter");
-      await waitFor(
+      await eventually(
         async () => (await embeddedPages(electronApp)).some((page) => page.title === PAGE_TITLE),
-        "the page did not load in the Browser tab",
+        "the page to load in the Browser tab",
       );
       await pause();
 
@@ -142,16 +129,16 @@ it(
       // 3. Sign back in and return to the session: the tab reopens its page.
       await signIn(window, server.serverUrl);
       await openSessionRail(window, server.serverUrl, sessionId);
-      await waitFor(
+      await eventually(
         async () => (await bar.inputValue()) === pageUrl,
-        "the address bar did not show the tab's page after signing back in",
+        "the address bar to show the tab's page after signing back in",
       );
-      const reopened = await waitFor(
+      const reopened = await eventually(
         async () =>
           (await embeddedPages(electronApp)).find(
             (page) => page.url === pageUrl && page.title === PAGE_TITLE,
           ),
-        "the Browser tab did not reopen its page after signing back in",
+        "the Browser tab to reopen its page after signing back in",
       );
       assert.match(reopened.id, new RegExp(`^browser-tab:${sessionId}:`));
       await window.getByRole("tab", { name: PAGE_TITLE }).waitFor({ timeout: 10_000 });

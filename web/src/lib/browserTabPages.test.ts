@@ -94,7 +94,11 @@ describe("saved browser pages", () => {
 
   it("never saves an address that carries a credential", () => {
     writeSessionWorkspaceState("conv_a", { openBrowsers: ["tab-1"] });
-    saveBrowserPage(userTab, "https://docs.example/?q=release&page=2", "Search");
+    saveBrowserPage(
+      userTab,
+      "https://docs.example/?q=release&page=2&author=jane&keyword=notes",
+      "Search",
+    );
     for (const url of [
       "https://app.example/callback?code=abc&state=xyz",
       "https://app.example/#access_token=abc&token_type=bearer",
@@ -108,12 +112,17 @@ describe("saved browser pages", () => {
       "https://app.example/return?accessCode=abc",
       "https://app.example/return?oauth_verifier=abc",
       "https://app.example/login?pwd=abc",
+      "https://files.example/report?authkey=abc",
+      "https://files.example/report#authkey=abc",
+      "https://files.example/report#/route?authkey=abc",
+      "https://app.example/verify?passcode=abc",
+      "https://app.example/export?PrivateKey=abc",
     ]) {
       saveBrowserPage(userTab, url);
     }
 
     expect(readSavedBrowserPage(userTab)).toEqual({
-      url: "https://docs.example/?q=release&page=2",
+      url: "https://docs.example/?q=release&page=2&author=jane&keyword=notes",
       title: "Search",
     });
   });
@@ -134,9 +143,12 @@ describe("saved browser pages", () => {
     for (const url of ["about:blank", "file:///etc/hosts", "data:text/html,x", "not a url", ""]) {
       saveBrowserPage(userTab, url, "Other");
     }
-    saveBrowserPage(userTab, `https://docs.example/${"x".repeat(9000)}`);
-
+    const atLimit = `https://docs.example/${"x".repeat(8192 - "https://docs.example/".length)}`;
+    saveBrowserPage(userTab, `${atLimit}y`);
     expect(readSavedBrowserPage(userTab)).toEqual({ url: "https://docs.example/", title: "Docs" });
+
+    saveBrowserPage(userTab, atLimit, "t".repeat(600));
+    expect(readSavedBrowserPage(userTab)).toEqual({ url: atLimit, title: "t".repeat(512) });
   });
 
   it("forgets a tab's page when the tab closes", () => {

@@ -77,10 +77,16 @@ export const MAX_OPEN_TABS = 20;
 const MAX_BROWSER_URL_LENGTH = 8192;
 const MAX_BROWSER_TITLE_LENGTH = 512;
 // Query and fragment parameters that can carry a credential (OAuth codes and tokens,
-// signed links, API keys), by part of their name or by its last word (auth_code, apiKey).
-// An address carrying one is never saved or replayed.
-const CREDENTIAL_PARAM_PART =
-  /token|secret|passw|signature|credential|verifier|api[-_]?key|session[-_]?id|saml(request|response)/i;
+// signed links, API keys), by part of their name (authkey, passcode) or by its last
+// word (auth_code, apiKey). An address carrying one is never saved or replayed.
+const CREDENTIAL_PARAM_PART = new RegExp(
+  [
+    "token|secret|passw|signature|credential|verifier|api[-_]?key|session[-_]?id",
+    "saml(request|response)",
+    "(access|auth|login|pass|private|secure|signing)[-_.]?(code|key|pwd|sig|ticket)",
+  ].join("|"),
+  "i",
+);
 const CREDENTIAL_PARAM_WORD = /(^|[-_.])(auth|authorization|code|jwt|key|otp|pass|pwd|sig|ticket)$/;
 
 function isValidWidth(value: unknown): value is number {
