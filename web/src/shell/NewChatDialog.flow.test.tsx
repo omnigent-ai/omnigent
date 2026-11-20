@@ -732,6 +732,12 @@ describe("NewChatLandingScreen in the floating panel", () => {
     expect(composer).not.toHaveClass("composer-reference-surface");
     expect(composer).not.toHaveClass("border");
     expect(composer).not.toHaveClass("rounded-2xl");
+    // The prompt takes the panel's height and scrolls inside it.
+    expect(composer.querySelector("[data-composer-input-area]")).toHaveClass(
+      "flex-1",
+      "overflow-y-auto",
+    );
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveClass("flex-1", "max-h-none");
     expect(screen.getByTestId("new-chat-landing-actions")).toHaveClass("border-t");
     expect(screen.getByTestId("new-chat-landing-send-shortcut")).toHaveTextContent(
       `${MOD_KEY}${ENTER_KEY}`,
