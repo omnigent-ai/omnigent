@@ -115,6 +115,19 @@ def test_remote_resume_option_spellings(args: tuple[str, ...], expected: dict) -
             None,
         ),
         (("-a", "on-request", "-c", 'approvals_reviewer="auto_review"'), None),
+        # A custom permission profile matches no on-request preset.
+        (
+            (
+                "-c",
+                'default_permissions="locked"',
+                "-a",
+                "on-request",
+                "-c",
+                'approvals_reviewer="auto_review"',
+            ),
+            None,
+        ),
+        (("-c", 'default_permissions=":workspace"', "--approve-for-me"), "approve-for-me"),
         ((), None),
     ],
 )
