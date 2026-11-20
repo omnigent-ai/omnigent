@@ -2989,6 +2989,10 @@ def _stopped_session_answer_text(
     return "\n\n".join(lines)
 
 
+class _AnswerHostOffline(OmnigentError):
+    """The session's host is offline: the answer is not sent, so its card and hook stay."""
+
+
 def _recovery_record_changed(key: tuple[str, str], record: _StoppedSessionAnswer | None) -> bool:
     """Return whether another request replaced, started or finished this question's recovery."""
     current = _stopped_session_answers.get(key)
@@ -3057,6 +3061,7 @@ async def _deliver_answer_to_stopped_session(
             record.replaced = True
             return None
     if record is not None and record.delivery is None and record.acknowledgement is not None:
+        # A delivered answer also answers a later decline or cancel: the card was closed for it.
         if isinstance(params, dict):
             _close_answered_card(session_id, elicitation_id, params)
         return record.acknowledgement
@@ -3081,8 +3086,9 @@ async def _deliver_answer_to_stopped_session(
         or not _is_native_terminal_session(conv)
     ):
         return None
+    routing_host: str | None = None
     if conv.host_id is None:
-        host_id = (
+        host_id = routing_host = (
             await asyncio.to_thread(routing_host_id, conv, conversation_store)
             if conversation_store is not None
             else None
@@ -3114,9 +3120,25 @@ async def _deliver_answer_to_stopped_session(
             return None
     # Check the runner on a first answer or under the same runner id; a new runner never asked.
     if record is None or record.runner_id == conv.runner_id:
-        hook_can_take = await _session_runner_reachable(
-            request, session_id, conv, runner_router, conversation_store, runner_exit_reports
-        )
+        try:
+            hook_can_take = await _session_runner_reachable(
+                request,
+                session_id,
+                conv,
+                runner_router,
+                conversation_store,
+                runner_exit_reports,
+                routing_host=routing_host,
+            )
+        except _AnswerHostOffline:
+            if _stopped_session_answers.get(key) is None:
+                # Pin the asking runner: a retry under a new runner id goes as a message.
+                _stopped_session_answers[key] = _StoppedSessionAnswer(
+                    started_at=time.time(),
+                    fingerprint=_harness_elicitation_fingerprint_or_none(params),
+                    runner_id=conv.runner_id,
+                )
+            raise
         if _recovery_record_changed(key, record):
             # Another request changed this question's recovery record during the wait.
             return await _deliver_answer_to_stopped_session(
@@ -3264,13 +3286,15 @@ async def _session_runner_reachable(
     runner_router: RunnerRouter | None,
     conversation_store: ConversationStore | None,
     runner_exit_reports: RunnerExitReports | None,
+    *,
+    routing_host: str | None = None,
 ) -> bool:
     """
     Return whether the runner that asked can still take the answer through its hook.
 
     True when it is reachable here, live on another replica, or back within the connect grace
-    even if admission then fails. Other wait errors propagate, as does an admission error for a
-    rebound or missing row. The grace gates match routes_events.py.
+    even if admission then fails. An offline host raises ``_AnswerHostOffline``; other wait errors
+    and an admission error for a rebound or missing row propagate. ``routing_host``: a side chat's.
     """
     if await _get_runner_client(session_id, runner_router, conversation=conv, for_control=True):
         return True
@@ -3309,7 +3333,8 @@ async def _session_runner_reachable(
         )
         return True
     grace_s = _facade._HOST_BOUND_RUNNER_CONNECT_GRACE_S
-    if conv.host_id is None or grace_s <= 0:
+    host_id = conv.host_id or routing_host
+    if host_id is None or grace_s <= 0:
         return False
     app_state = request.app.state
     offline = (
@@ -3318,9 +3343,14 @@ async def _session_runner_reachable(
         else None
     )
     host_registry = getattr(app_state, "host_registry", None)
-    host_conn = host_registry.get(conv.host_id) if host_registry is not None else None
+    host_conn = host_registry.get(host_id) if host_registry is not None else None
     if offline is not None and host_conn is None:
-        return False
+        # The message path would wait for the host and could cancel a hook that comes back.
+        raise _AnswerHostOffline(
+            "The host for this session is offline. "
+            f"Start it with `{cli_invocation()} host` (or reconnect it) and answer again.",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        )
     _logger.info(
         "Waiting up to %.1fs for runner %s before sending an answer as a message",
         grace_s,

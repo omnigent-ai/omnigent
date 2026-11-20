@@ -414,6 +414,46 @@ async def test_a_retry_whose_question_is_answered_during_the_host_lookup_is_not_
     assert orchestration._stopped_session_answers.get(question.key) is None
 
 
+async def test_an_offline_host_answer_pins_the_asking_runner(
+    question: _Question, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed offline answer records the asking runner, so a new runner's retry is a message."""
+    question.conv.runner_id = "runner_asking"
+
+    async def _offline(*args: object, **kwargs: object) -> bool:
+        raise orchestration._AnswerHostOffline("host offline", code=ErrorCode.RUNNER_UNAVAILABLE)
+
+    async def _post_event(*args: object, **kwargs: object) -> dict[str, bool]:
+        raise AssertionError("an offline-host answer must not be sent")
+
+    monkeypatch.setattr(orchestration, "_session_runner_reachable", _offline)
+
+    with pytest.raises(OmnigentError) as failed:
+        await asyncio.wait_for(question.answer(_post_event), 5.0)
+
+    assert failed.value.code == ErrorCode.RUNNER_UNAVAILABLE
+    assert question.pending()
+    record = orchestration._stopped_session_answers.get(question.key)
+    assert record is not None
+    assert record.runner_id == "runner_asking"
+    assert record.delivery is None and record.acknowledgement is None
+
+
+async def test_a_late_decline_after_delivery_gets_the_acknowledgement(
+    question: _Question,
+) -> None:
+    """A decline after a delivered answer gets that answer's acknowledgement and sends nothing."""
+    post_event, _reached, release = _gated_post_event(question, [{"queued": True}])
+    release.set()
+    assert await asyncio.wait_for(question.answer(post_event), 5.0) == {"queued": True}
+    question.publish(_question_params())
+
+    late = await asyncio.wait_for(question.answer(post_event, action="decline"), 5.0)
+
+    assert late == {"queued": True}
+    assert len(question.posts) == 1
+
+
 async def test_a_denied_answer_keeps_the_question_open(question: _Question) -> None:
     """A denial fails the request and keeps the card open; a later answer is delivered."""
     denial = {"queued": False, "denied": True, "reason": "blocked"}
@@ -808,8 +848,10 @@ async def test_a_reported_exit_skips_the_host_lookup_and_the_sibling_stamp(
     assert rows.reads == 0
 
 
-async def test_an_offline_host_skips_the_runner_wait(monkeypatch: pytest.MonkeyPatch) -> None:
-    """An offline host cannot bring the runner back, so the check does not wait."""
+async def test_an_offline_host_fails_the_answer_and_keeps_the_hook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An offline host fails the answer at once, as the message path would cancel its hook."""
     from omnigent.server.routes import sessions as sessions_module
 
     conv = Conversation(
@@ -831,7 +873,7 @@ async def test_an_offline_host_skips_the_runner_wait(monkeypatch: pytest.MonkeyP
         return "host_offline"
 
     async def _wait(*args: object, **kwargs: object) -> None:
-        raise AssertionError("an offline host must skip the runner wait")
+        raise AssertionError("an offline host must not wait for the runner")
 
     monkeypatch.setattr(orchestration, "_get_runner_client", _no_runner)
     monkeypatch.setattr(orchestration, "_session_offline_host_id", _offline)
@@ -839,9 +881,56 @@ async def test_an_offline_host_skips_the_runner_wait(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(sessions_module, "_wait_for_runner_client", _wait)
 
     rows = _Rows(conv)
+    with pytest.raises(orchestration._AnswerHostOffline) as offline:
+        await orchestration._session_runner_reachable(
+            request, conv.id, conv, None, cast("Any", rows), RunnerExitReports()
+        )
+
+    assert offline.value.code == ErrorCode.RUNNER_UNAVAILABLE
+    assert "offline" in offline.value.message
+    assert rows.reads == 0
+
+
+@pytest.mark.parametrize("routing_host", ["host_parent", None])
+async def test_a_side_chat_waits_on_its_inherited_host(
+    monkeypatch: pytest.MonkeyPatch, routing_host: str | None
+) -> None:
+    """A side chat with no host of its own waits for its runner on the host it inherits."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    conv = _bound_conv(host_id=None)
+    host_conn = object()
+    registry = SimpleNamespace(get=lambda host_id: host_conn if host_id == "host_parent" else None)
+    seen: list[object] = []
+    client = object()
+
+    async def _no_runner(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+
+    async def _not_offline(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+
+    async def _host_bound_wait(*args: object, **kwargs: object) -> object:
+        del args
+        seen.append(kwargs.get("host_conn"))
+        return client
+
+    monkeypatch.setattr(orchestration, "_get_runner_client", _no_runner)
+    monkeypatch.setattr(orchestration, "_session_offline_host_id", _not_offline)
+    monkeypatch.setattr(orchestration, "_wait_for_host_bound_runner_client", _host_bound_wait)
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 30.0)
+    app = SimpleNamespace(state=SimpleNamespace(host_registry=registry, tunnel_registry=None))
+    request = Request({"type": "http", "method": "POST", "path": "/", "headers": [], "app": app})
+
     reachable = await orchestration._session_runner_reachable(
-        request, conv.id, conv, None, cast("Any", rows), RunnerExitReports()
+        request,
+        conv.id,
+        conv,
+        None,
+        cast("Any", _Rows(conv)),
+        RunnerExitReports(),
+        routing_host=routing_host,
     )
 
-    assert reachable is False
-    assert rows.reads == 0
+    assert reachable is (routing_host is not None)
+    assert seen == ([host_conn] if routing_host is not None else [])
