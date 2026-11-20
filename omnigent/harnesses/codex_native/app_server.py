@@ -5347,8 +5347,10 @@ def codex_launch_permission_preset(terminal_launch_args: Sequence[str] | None) -
         to the user's config.
     """
     try:
-        params = _codex_resume_permission_params(terminal_launch_args)
-        selects_profile = codex_config_profile(terminal_launch_args or ()) is not None
+        # The prompt and anything after ``--`` are text, not permission options.
+        options = without_codex_positional_prompt(terminal_launch_args or ())
+        params = _codex_resume_permission_params(options)
+        selects_profile = codex_config_profile(options) is not None
     except ValueError:
         return None
     # Config decides any field the flags leave out, so a preset needs an explicit
