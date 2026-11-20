@@ -11,6 +11,7 @@
 
 import type { GitProviderDisplay } from "./gitProviders";
 import { authenticatedFetch } from "./identity";
+import { resolvedLocalTimezone } from "./timezones";
 import type { JournalEntry, JournalPlanStep } from "./sessionJournal";
 import { startTimedInteraction } from "./analyticsEmit";
 import { browserAgentToolsRequestHeaders } from "@/components/BrowserPane/agentTools/preferences";
@@ -614,6 +615,25 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
   } catch (error) {
     interaction.fail();
     throw error;
+  }
+}
+
+/**
+ * Record the browser's IANA zone as the caller's default for tasks created
+ * with an explicit default-zone request. Skipped when the zone is unknown, so a
+ * UTC fallback never replaces another device's zone. Failures are ignored.
+ */
+export async function reportLocalTimezone(): Promise<void> {
+  const timezone = resolvedLocalTimezone();
+  if (timezone === null) return;
+  try {
+    await authenticatedFetch("/v1/scheduled-tasks/default-timezone", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ timezone }),
+    });
+  } catch {
+    // The next app load retries.
   }
 }
 

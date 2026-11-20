@@ -74,11 +74,9 @@ import {
 import { useRequestedComposerEngine } from "@/components/composer/engine/composerEnginePolicy";
 import type { ComposerTextTarget } from "@/components/composer/engine/composerInput";
 import {
-  ComposerMirror,
-  MIRRORED_TEXTAREA_CLASS,
-  renderMentionTokens,
-  useComposerMirrorAlignment,
-} from "@/components/composer/MentionTokenOverlay";
+  SHELL_MENTION_REFUSAL,
+  useComposerHighlight,
+} from "@/components/composer/composerHighlight";
 import {
   SandboxProfilePicker,
   useSandboxProfileCatalog,
@@ -108,7 +106,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { LaptopDbcertBanner } from "@/components/DbcertBanner";
-import { iconForAgent } from "@/components/AgentCard";
+import { iconForAgent } from "@/components/agentIcon";
 import claudeCodeLogo from "@/assets/claude-code-logo.svg";
 import { showToast } from "@/components/ui/toast";
 import {
@@ -179,6 +177,7 @@ import {
   isNativeOpenCodeHarness,
   MIN_TMUX_VERSION,
   skillInvocationPrefix,
+  supportsNativeShellInput,
 } from "@/lib/harnessSetup";
 
 // Re-exported for tests that import the readiness helpers from this module.
@@ -407,7 +406,6 @@ import {
 import {
   composerInlineMentions,
   expandMentionTokens,
-  findMentionTokens,
   presentMentions,
   type TaggedMentions,
   withSessionMentionHint,
@@ -422,6 +420,7 @@ import { SkillPills } from "@/components/SkillPills";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import type { CostControlMode } from "@/components/CostRoutingControl";
 import {
+  ARIA_MOD_KEY,
   composerSendShortcutKeys,
   CompactShortcutKeys,
   KeyboardShortcutTooltipContent,
@@ -5645,7 +5644,6 @@ function NewChatLandingContent({
     debouncedQuery: useDebouncedValue(mention?.query ?? "", MENTION_SEARCH_DEBOUNCE_MS),
     currentSessionId: null,
   });
-  const mirrorRef = useRef<HTMLDivElement>(null);
   // Closed-but-loading window: don't let Enter send the half-typed "@dir/".
   // ``isPlaceholderData`` covers the drill-down window where react-query is
   // still serving the previous directory's rows (``isLoading`` stays false).
@@ -5687,8 +5685,30 @@ function NewChatLandingContent({
   };
   // The draft snapshot is built above the hook; add the tags it owns.
   draftRef.current.mentions = { files: mentionedItems, sessions: mentionedSessions };
-  const mentionTokensShown = findMentionTokens(message, mentionTokens).length > 0;
-  useComposerMirrorAlignment(mirrorRef, textareaRef, mentionTokensShown, textareaNode);
+  const skillCommandNames = useMemo(() => Object.keys(skillCommands), [skillCommands]);
+  const taggedMentions = useMemo(
+    () =>
+      presentMentions(
+        composerInlineMentions(mentionedItems, mentionedSessions, selectedAgent?.harness ?? null),
+        [message],
+      ),
+    [mentionedItems, mentionedSessions, selectedAgent?.harness, message],
+  );
+  const highlight = useComposerHighlight({
+    value: message,
+    commandNames: skillCommandNames,
+    enabled: files.length === 0,
+    nativeShell: supportsNativeShellInput(skillsHarness) ? skillsHarness : null,
+    classifyValue: sanitizeInitialPrompt(message),
+    mentionTokens,
+    textareaRef,
+    textareaNode,
+    sendContext: { mentions: taggedMentions },
+  });
+  // However the tag goes (an edit, Backspace over its token), its refusal goes with it.
+  useEffect(() => {
+    if (highlight.refusal === null && createError === SHELL_MENTION_REFUSAL) setCreateError(null);
+  }, [highlight.refusal, createError]);
 
   const workspaceTarget = JSON.stringify([projectParam, selectedHostId, sandboxSelected]);
   const [workspaceReadyTarget, setWorkspaceReadyTarget] = useState<string | null>(null);
@@ -6267,6 +6287,10 @@ function NewChatLandingContent({
       handleBlockedSubmit();
       return;
     }
+    if (highlight.refusal !== null) {
+      setCreateError(highlight.refusal);
+      return;
+    }
     if (createAttemptRef.current !== null) return;
     const createAttempt = Symbol();
     createAttemptRef.current = createAttempt;
@@ -6456,13 +6480,9 @@ function NewChatLandingContent({
       // from the marker; no upload happens. Folders carry a trailing "/".
       // Computed BEFORE the create so `smart_routing_message` classifies the
       // prompt the agent actually receives, not the raw textarea value.
-      const liveMentions = presentMentions(
-        composerInlineMentions(mentionedItems, mentionedSessions, selectedAgent?.harness ?? null),
-        [message],
-      );
       const initialPrompt = withSessionMentionHint(
-        expandMentionTokens(sanitizeInitialPrompt(message), liveMentions),
-        liveMentions.some((m) => m.marker.startsWith("[Session: ")),
+        expandMentionTokens(sanitizeInitialPrompt(message), taggedMentions),
+        taggedMentions.some((m) => m.marker.startsWith("[Session: ")),
       );
       // Native terminal agents open terminal-first: `omnigent.ui: terminal`
       // tells the UI to render the terminal wrapper, and `omnigent.wrapper`
@@ -7547,6 +7567,12 @@ function NewChatLandingContent({
     </NewChatWorkspaceControls>
   );
 
+  // The chord the panel advertises beside Send, in ARIA's spelling.
+  const sendKeyShortcuts = submitWithModEnter ? `${ARIA_MOD_KEY}+Enter` : "Enter";
+  let composerAppearance: "panel" | "glass" | "default" = "default";
+  if (floating) composerAppearance = "panel";
+  else if (isMobileViewport) composerAppearance = "glass";
+
   return (
     // Desktop keeps the centered composition; mobile docks the composer. The
     // project home floats just the composer over its board.
@@ -7648,13 +7674,13 @@ function NewChatLandingContent({
               e.preventDefault();
               void handleCreate();
             }}
-            className="relative z-30"
+            className={cn("relative z-30", floating && "flex min-h-0 flex-1 flex-col")}
           >
             <ChatComposer
               engine={composerEngine}
               dictating={dictation.hasInterim}
               onActiveInputChange={bindTextarea}
-              appearance={isMobileViewport ? "glass" : "default"}
+              appearance={composerAppearance}
               hasContent={
                 files.length > 0 ||
                 mentionedItems.length > 0 ||
@@ -7662,16 +7688,13 @@ function NewChatLandingContent({
                 attachmentError !== null
               }
               keyboard={{ submitWithModEnter, preventsKeyboardSubmit }}
-              className={cn(isDragActive && "ring-2 ring-ring ring-inset")}
+              className={cn(isDragActive && "ring-2 ring-ring ring-inset", highlight.cardClassName)}
               data-testid="new-chat-landing-composer"
               input={{
                 ref: bindTextarea,
                 value: message,
+                ...highlight.input,
                 mentionTokens,
-                className: mentionTokensShown ? MIRRORED_TEXTAREA_CLASS : undefined,
-                onScroll: (e) => {
-                  if (mirrorRef.current) mirrorRef.current.scrollTop = e.currentTarget.scrollTop;
-                },
                 onSelect: (e) => slashCompletion.onSelectionChange(e.currentTarget),
                 onChange: (e) => {
                   slashCompletion.onSelectionChange(e.currentTarget);
@@ -7680,6 +7703,8 @@ function NewChatLandingContent({
                   // remove and nothing else would ever clear this. Left sticky it
                   // reads as a blocker on a composer the user can actually submit.
                   if (attachmentError !== null) clearError();
+                  // The refusal names the draft as typed, so any edit makes it stale.
+                  if (createError === SHELL_MENTION_REFUSAL) setCreateError(null);
                   // Recompute the active "@"-mention from the caret each keystroke.
                   // Sessions are taggable for every agent; files need ``mentionEnabled``.
                   setMention(
@@ -7729,11 +7754,7 @@ function NewChatLandingContent({
                 "data-testid": "new-chat-landing-input",
               }}
               slots={{
-                inputBackdrop: mentionTokensShown && (
-                  <ComposerMirror ref={mirrorRef}>
-                    {renderMentionTokens(message, mentionTokens)}
-                  </ComposerMirror>
-                ),
+                inputBackdrop: highlight.backdrop,
                 beforeInput: (
                   <>
                     {/* Skill suggestions — floats above the composer box. */}
@@ -7770,6 +7791,7 @@ function NewChatLandingContent({
                 ),
                 inputHint: (
                   <>
+                    {highlight.hint}
                     {/* Gated on an empty draft so it reads as the placeholder.
                   pointer-events-none lets clicks fall through to focus the
                   textarea; the pills themselves opt back in. */}
@@ -8295,6 +8317,12 @@ function NewChatLandingContent({
                       onTranscript={dictation.appendFinal}
                       onInterim={dictation.replaceInterim}
                     />
+                    {/* Plain ↵ adds a line in the panel, so its send chord stays in view. */}
+                    {floating && (
+                      <span className="px-1" data-testid="new-chat-landing-send-shortcut">
+                        <CompactShortcutKeys keys={composerSendShortcutKeys(submitWithModEnter)} />
+                      </span>
+                    )}
                     <TooltipProvider>
                       <Tooltip
                         open={submitTooltipState !== "closed"}
@@ -8335,6 +8363,7 @@ function NewChatLandingContent({
                               disabled={!canSubmit}
                               label={creating ? "Starting session" : "Start session"}
                               busy={creating}
+                              aria-keyshortcuts={floating ? sendKeyShortcuts : undefined}
                               data-testid="new-chat-landing-submit"
                             />
                           </span>

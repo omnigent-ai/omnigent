@@ -152,7 +152,8 @@ class CreateScheduledTaskRequest(BaseModel):
     prompt: str
     rrule: str
     agent_id: str
-    timezone: str = "UTC"
+    # Only explicit null opts into the owner's recorded zone; omission stays UTC.
+    timezone: str | None = "UTC"
     model_override: str | None = None
     reasoning_effort: str | None = None
     # Native-harness permission or execution mode; validated against the agent.
@@ -205,6 +206,14 @@ class CreateScheduledTaskRequest(BaseModel):
             self.base_branch, self.execution_target, self.host_id, self.workspace
         )
         return self
+
+
+class SetDefaultTimezoneRequest(BaseModel):
+    """Body for ``PUT /v1/scheduled-tasks/default-timezone``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    timezone: str
 
 
 class UpdateScheduledTaskRequest(BaseModel):
@@ -431,11 +440,22 @@ def _validate_timezone_or_400(timezone: str) -> None:
     """Raise a 400 ``OmnigentError`` if *timezone* is not a valid IANA timezone."""
     try:
         ZoneInfo(timezone)
-    except (ZoneInfoNotFoundError, KeyError, ValueError) as exc:
+    except (ZoneInfoNotFoundError, KeyError, ValueError, OSError) as exc:
         raise OmnigentError(
             f"invalid timezone {timezone!r}: must be a valid IANA timezone name",
             code=ErrorCode.INVALID_INPUT,
         ) from exc
+
+
+def _resolve_create_timezone(
+    body: CreateScheduledTaskRequest, store: ScheduledTaskStore, user_id: str | None
+) -> str:
+    """Resolve an explicit request for the owner's default without changing legacy creates."""
+    timezone = body.timezone
+    if timezone is None:
+        timezone = store.get_default_timezone(user_id) or "UTC"
+    _validate_timezone_or_400(timezone)
+    return timezone
 
 
 async def _workflow_reuse_problem(prompt: str, session_mode: str) -> str | None:
@@ -1189,7 +1209,8 @@ def create_scheduled_tasks_router(
                 "first_run_at needs one-time automations, which this server does not enable",
                 code=ErrorCode.INVALID_INPUT,
             )
-        _validate_timezone_or_400(body.timezone)
+        owner_id = None if owner == RESERVED_USER_LOCAL else owner
+        timezone = await asyncio.to_thread(_resolve_create_timezone, body, store, owner_id)
         permission_mode = validate_scheduled_permission_mode(body.permission_mode)
         agent, workspace, model_override, reasoning_effort = await _validate_launch_inputs(
             request,
@@ -1202,7 +1223,6 @@ def create_scheduled_tasks_router(
             permission_mode=permission_mode,
             execution_target=body.execution_target,
         )
-        owner_id = None if owner == RESERVED_USER_LOCAL else owner
         project_owner = _project_owner(owner)
         # Known before the task exists, since a sandbox session must run on the
         # sandbox host derived from it.
@@ -1226,7 +1246,7 @@ def create_scheduled_tasks_router(
                         rrule=body.rrule,
                         user_id=owner_id,
                         agent_id=agent.id,
-                        timezone=body.timezone,
+                        timezone=timezone,
                         created_at=0,
                         workspace=workspace,
                         base_branch=body.base_branch,
@@ -1278,7 +1298,7 @@ def create_scheduled_tasks_router(
                     rrule=body.rrule,
                     user_id=owner_id,
                     agent_id=bound.id,
-                    timezone=body.timezone,
+                    timezone=timezone,
                     model_override=model_override,
                     reasoning_effort=reasoning_effort,
                     permission_mode=permission_mode,
@@ -1353,6 +1373,26 @@ def create_scheduled_tasks_router(
             shareable=scheduled_task_shareable(permission_store, task.id),
             next_run_at=_next_run_at(task, request),
         )
+
+    @router.put("/scheduled-tasks/default-timezone")
+    async def set_default_timezone(
+        request: Request,
+        body: SetDefaultTimezoneRequest,
+    ) -> dict[str, str]:
+        """Record the caller's local zone for tasks that explicitly request the default."""
+        owner = _owner(request)
+        _validate_timezone_or_400(body.timezone)
+        try:
+            await asyncio.to_thread(
+                store.set_default_timezone,
+                None if owner == RESERVED_USER_LOCAL else owner,
+                body.timezone,
+            )
+        except NotImplementedError as exc:
+            raise HTTPException(
+                status_code=501, detail="default timezone is not supported"
+            ) from exc
+        return {"timezone": body.timezone}
 
     @router.get("/scheduled-tasks")
     async def list_scheduled_tasks(

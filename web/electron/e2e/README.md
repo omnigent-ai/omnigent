@@ -168,6 +168,13 @@ from the repository root. This checks real Electron zoom from 50% to 150%,
 Native traffic lights require a human visual check: use View → Zoom Out and
 Actual Size, then collapse/reopen the sidebar and open Settings.
 
+`desktop_find_selection_prefill.e2e.js` selects words in a chat reply and opens
+find with Ctrl+F (bar closed and open, and inside the bar) and Edit → Find…,
+checking the bar's query and match count. It needs Linux, an X display with
+XTEST, and a built SPA:
+`OMNIGENT_PW_NO_SANDBOX=1 xvfb-run -a node --test e2e/desktop_find_selection_prefill.e2e.js`
+from `web/electron`.
+
 1. Copy `desktop_connect.e2e.js` to `e2e/desktop_<slug>.e2e.js`.
 2. If the bug's failure is **past** connect, pass `serverUrl` to
    `launchDesktop` so the app boots straight into the shell; if the bug is in

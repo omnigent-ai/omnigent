@@ -1,5 +1,5 @@
 import claudeCodeLogo from "@/assets/claude-code-logo.svg";
-import { iconForAgent } from "@/components/AgentCard";
+import { iconForAgent } from "@/components/agentIcon";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { nativeCodingAgentForAvailableAgent } from "@/lib/nativeCodingAgents";
 import { cn } from "@/lib/utils";

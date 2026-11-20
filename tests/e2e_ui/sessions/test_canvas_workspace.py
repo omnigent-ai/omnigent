@@ -75,23 +75,17 @@ def test_canvas_controls_clear_the_macos_titlebar(
     expand = page.get_by_role("button", name="Open sidebar", exact=True)
     expect(expand).to_have_count(1)
     expect(page.get_by_role("navigation", name="Collapsed sidebar")).to_have_count(0)
-    for control in (expand, heading) if width < 1181 else (heading,):
-        bounds = control.bounding_box()
-        assert bounds is not None and bounds["y"] >= titlebar_bottom, (
-            f"Canvas control overlaps the native titlebar: {bounds}, bottom={titlebar_bottom}"
-        )
-    if width >= 1181:
-        expect(
-            page.locator(".electron-sidebar-header-actions").get_by_role(
-                "button", name="Open sidebar", exact=True
-            )
-        ).to_be_visible()
-        bounds = expand.bounding_box()
-        assert bounds and bounds["y"] + bounds["height"] <= titlebar_bottom
-    # At 720x900 the sidebar docks beside the board, so it closes from its own toggle.
-    close_scope = (
-        "aside[aria-label='Conversations']" if width < 1181 else ".electron-sidebar-header-actions"
+    bounds = heading.bounding_box()
+    assert bounds is not None and bounds["y"] >= titlebar_bottom, (
+        f"Canvas heading overlaps the native titlebar: {bounds}, bottom={titlebar_bottom}"
     )
+    # The desktop app keeps the title-bar cluster at every window width, 720px included.
+    close_scope = ".electron-sidebar-header-actions"
+    expect(
+        page.locator(close_scope).get_by_role("button", name="Open sidebar", exact=True)
+    ).to_be_visible()
+    bounds = expand.bounding_box()
+    assert bounds and bounds["y"] + bounds["height"] <= titlebar_bottom
     expand.click()
     expect(page.get_by_test_id("canvas-nav")).to_be_visible()
     page.locator(close_scope).get_by_role("button", name="Close sidebar", exact=True).click()

@@ -121,3 +121,67 @@ describe("ComposerAddMenu's Run a workflow", () => {
     await waitFor(() => expect(onWorkflow).toHaveBeenCalledWith("Bump deps"));
   });
 });
+
+describe("ComposerAddMenu's placement", () => {
+  afterEach(cleanup);
+
+  function rect(left: number, top: number, width: number, height: number): DOMRect {
+    return {
+      left,
+      top,
+      width,
+      height,
+      right: left + width,
+      bottom: top + height,
+      x: left,
+      y: top,
+      toJSON: () => ({}),
+    } as DOMRect;
+  }
+
+  /** Opens the menu inside a composer card measured at 640px wide, with the trigger near its foot. */
+  function openInCard(appearance?: "panel") {
+    render(
+      <div data-composer-card="" data-composer-appearance={appearance} data-testid="card">
+        <ComposerAddMenu
+          disabled={false}
+          planActive={false}
+          showGoal={false}
+          showPlan={false}
+          onAttach={vi.fn()}
+        />
+      </div>,
+    );
+    vi.spyOn(screen.getByTestId("card"), "getBoundingClientRect").mockReturnValue(
+      rect(20, 40, 640, 400),
+    );
+    const trigger = screen.getByRole("button", { name: "Add" });
+    vi.spyOn(trigger, "getBoundingClientRect").mockReturnValue(rect(32, 400, 28, 28));
+    fireEvent.pointerDown(trigger, { button: 0 });
+    return screen.getByTestId("composer-add-menu");
+  }
+
+  /** Where the popper placed the menu, once it has measured. */
+  async function placement(menu: HTMLElement): Promise<string> {
+    const wrapper = menu.closest<HTMLElement>("[data-radix-popper-content-wrapper]")!;
+    await waitFor(() => expect(wrapper.style.transform).toMatch(/translate/));
+    return wrapper.style.transform;
+  }
+
+  it("spans the composer card, just above it, in a main window", async () => {
+    const menu = openInCard();
+    expect(menu).toHaveStyle({ width: "640px" });
+    // Its bottom edge sits on the card's top (40), not on the trigger (400).
+    expect(await placement(menu)).toMatch(/, 34px\)$/);
+  });
+
+  // In a panel the card is the whole window, so card geometry would pin the menu to its top.
+  it("opens from the trigger at its own width in a panel", async () => {
+    const menu = openInCard("panel");
+    expect(menu.style.width).toBe("");
+    expect(menu).toHaveAttribute("data-side", "top");
+    expect(menu).toHaveAttribute("data-align", "start");
+    // Starts at the trigger's left (32) and ends 6px above its top (400).
+    expect(await placement(menu)).toBe("translate(32px, 394px)");
+  });
+});

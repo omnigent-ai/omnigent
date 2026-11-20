@@ -12,6 +12,8 @@ import { isFeatureEnabled, type FeatureKey } from "@/lib/capabilities";
 import { useProjectKanbanBoardPreference } from "@/lib/projectKanbanPreferences";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AppShell } from "@/shell/AppShell";
+import { FLOATING_COMPOSER_PATH } from "@/lib/floatingComposer/floatingComposerRoute";
+import { isElectronShell } from "@/lib/nativeBridge";
 import { ExtensionPageRoute } from "@/extensions/ExtensionPageRoute";
 
 // Bind a page component to its analytics page-view id. Declaring the id here,
@@ -50,6 +52,14 @@ const SetupPage = withPageView(
 const ApprovePage = withPageView(
   "approve",
   lazy(() => import("@/pages/ApprovePage").then((m) => ({ default: m.ApprovePage }))),
+);
+const FloatingComposerPage = withPageView(
+  "floating_composer",
+  lazy(() =>
+    import("@/shell/floatingComposer/FloatingComposerPage").then((m) => ({
+      default: m.FloatingComposerPage,
+    })),
+  ),
 );
 const InboxPage = withPageView(
   "inbox",
@@ -202,6 +212,15 @@ function AppRoutes({ basename }: AppProps) {
           </>
         )}
         <Route path={`${prefix}/approve/:sessionId/:elicitationId`} element={<ApprovePage />} />
+        {/* The desktop's floating New Agent panel: the composer alone, without the shell. */}
+        <Route
+          path={`${prefix}${FLOATING_COMPOSER_PATH}`}
+          element={
+            <FeatureGatedPage feature="floating_composer">
+              {isElectronShell() ? <FloatingComposerPage /> : <NotFoundPage />}
+            </FeatureGatedPage>
+          }
+        />
         <Route element={<AppShell />}>
           <Route path={prefix || "/"} element={<ChatPage />} />
           <Route path={`${prefix}/c/:conversationId`} element={<ChatPage />} />

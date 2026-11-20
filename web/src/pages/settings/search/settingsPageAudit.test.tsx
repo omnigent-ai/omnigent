@@ -391,6 +391,7 @@ const PROACTIVE_AGENT_OFF =
 const GENERAL_WEB_HIDES = {
   "open-links-in-app": DESKTOP_ONLY,
   "global-shortcut": DESKTOP_ONLY,
+  "floating-composer-shortcut": DESKTOP_ONLY,
   "browser-agent-tools": DESKTOP_ONLY,
   "admin-view": ADMIN_VIEW_NOT_LOADED,
   "project-kanban-board": PROJECT_KANBAN_OFF,
@@ -1296,7 +1297,12 @@ const LEFT_OUT_ENTRIES: Readonly<Record<string, string>> = {
       ]),
   ),
   ...Object.fromEntries(
-    ["open-links-in-app", "global-shortcut", "browser-agent-tools"].map((id) => [id, DESKTOP_ONLY]),
+    [
+      "open-links-in-app",
+      "global-shortcut",
+      "floating-composer-shortcut",
+      "browser-agent-tools",
+    ].map((id) => [id, DESKTOP_ONLY]),
   ),
   "admin-view": ADMIN_VIEW_NOT_LOADED,
   "project-kanban-board": PROJECT_KANBAN_OFF,
