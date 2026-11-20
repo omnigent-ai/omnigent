@@ -228,24 +228,6 @@ function AllFilesPathsProbe({
   return null;
 }
 
-function DirectoryPathsProbe({
-  id,
-  path,
-  location,
-  onPaths,
-}: {
-  id: string;
-  path: string;
-  location: string;
-  onPaths: (paths: string[]) => void;
-}) {
-  const query = useWorkspaceDirectory(id, path, location);
-  useEffect(() => {
-    if (query.isSuccess) onPaths(query.data.map((f) => f.path));
-  }, [query.isSuccess, query.data, onPaths]);
-  return null;
-}
-
 function AllFilesProbeAt({ id, location }: { id: string; location: string }) {
   useWorkspaceAllFiles(id, {}, location);
   return null;
@@ -2018,61 +2000,43 @@ describe("browse-location listings normalize to paths relative to the location",
   });
 
   it.each([
-    ["reports", "reports/quarterly/q3.csv", "a relative location echoes the whole target"],
-    ["/elsewhere/reports", "q3.csv", "an absolute one lists bare"],
-  ])("roots a lazily-expanded directory's children under it (%s)", async (location, wirePath) => {
-    // Children address themselves relative to the tree's root, not to the
-    // directory that was listed -- otherwise expanding one level deeper
-    // would request the wrong path.
-    fetchMock.mockResolvedValueOnce(entries(wirePath));
-    const onPaths = vi.fn();
-
-    render(
-      <Wrap>
-        <DirectoryPathsProbe id="conv_dir" path="quarterly" location={location} onPaths={onPaths} />
-      </Wrap>,
-    );
-    await waitFor(() => expect(onPaths).toHaveBeenCalled());
-
-    expect(onPaths).toHaveBeenLastCalledWith(["quarterly/q3.csv"]);
-  });
-
-  it.each([
-    ["reports", "REST", "reports/quarterly/2026"],
-    ["/elsewhere/reports", "REST", "2026"],
-    ["reports", "the workspace API", "reports/quarterly/2026"],
+    ["reports", "REST", "reports/quarterly/"],
+    ["/elsewhere/reports", "REST", ""],
+    ["reports", "the workspace API", "reports/quarterly/"],
   ])(
-    "roots a lazily-expanded directory's chain end under it too (%s, through %s)",
-    async (location, route, wirePath) => {
-      const entry = {
-        id: wirePath,
-        name: "2026",
-        path: wirePath,
-        type: "directory" as const,
-        bytes: null,
+    "roots a lazily-expanded directory's children and chain ends under it (%s, through %s)",
+    async (location, route, wirePrefix) => {
+      // Children address themselves relative to the tree's root, not to the directory that
+      // was listed; a relative location echoes the whole target, an absolute one lists bare.
+      const listing = [
+        { id: "q3.csv", name: "q3.csv", type: "file" as const, bytes: 1, leaf: undefined },
+        { id: "2026", name: "2026", type: "directory" as const, bytes: null, leaf: "2026/q3" },
+      ].map(({ id, leaf, ...entry }) => ({
+        ...entry,
+        id: `${wirePrefix}${id}`,
+        path: `${wirePrefix}${id}`,
         modified_at: null,
-        leaf_directory_path: `${wirePath}/q3`,
-      };
+        ...(leaf ? { leaf_directory_path: `${wirePrefix}${leaf}` } : {}),
+      }));
       if (route === "REST") {
         fetchMock.mockResolvedValueOnce(
-          jsonResponse({ object: "list", data: [entry], has_more: false }),
+          jsonResponse({ object: "list", data: listing, has_more: false }),
         );
       } else {
         vi.mocked(listDirectoryViaWorkspaceApi).mockResolvedValueOnce({
-          data: [entry],
+          data: listing,
           hasMore: false,
         });
       }
 
       const { result } = renderHook(
-        () => useWorkspaceDirectory("conv_leaf", "quarterly", location),
-        {
-          wrapper: Wrap,
-        },
+        () => useWorkspaceDirectory("conv_dir", "quarterly", location),
+        { wrapper: Wrap },
       );
 
       await waitFor(() => expect(result.current.data).toBeDefined());
       expect(result.current.data?.map((file) => [file.path, file.leaf_directory_path])).toEqual([
+        ["quarterly/q3.csv", undefined],
         ["quarterly/2026", "quarterly/2026/q3"],
       ]);
     },

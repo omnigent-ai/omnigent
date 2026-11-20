@@ -1075,7 +1075,7 @@ describe("hasRawHtmlNode", () => {
 });
 
 describe("hasNoTextDiff", () => {
-  it.each(["logo.png", "logo.svg", "report.pdf", "clip.mp4", "part.stl", "archive.zip"])(
+  it.each(["logo.png", "logo.svg", "report.pdf", "clip.mov", "part.stl", "archive.zip"])(
     "has no text diff for %s",
     (path) => {
       expect(hasNoTextDiff(path)).toBe(true);
