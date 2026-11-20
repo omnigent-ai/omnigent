@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { browserPageLabel } from "@/lib/browserPageLabel";
+import { readSavedBrowserPage, saveBrowserPage } from "@/lib/browserTabPages";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
 import { AGENT_BROWSER_TAB_ID, browserViewId, browserViewOwnerId } from "@/lib/browserTabs";
 import { fetchSessionHostId } from "@/lib/fetchSessionHostId";
@@ -317,15 +318,15 @@ export function useBrowserTabs(conversationId: string) {
         const page = await bridge.browserHasView?.(viewId);
         // Live updates take precedence over an earlier restore snapshot.
         if (!active || updated.has(viewId) || !page) return;
-        setPage(
-          viewId,
-          page.exists
-            ? {
-                url: page.url && page.url !== "about:blank" ? page.url : page.pendingUrl,
-                title: page.title,
-              }
-            : {},
-        );
+        if (!page.exists) {
+          // A tab whose view the shell destroyed keeps its saved page's label.
+          setPage(viewId, readSavedBrowserPage(viewId) ?? {});
+          return;
+        }
+        const url = page.url && page.url !== "about:blank" ? page.url : page.pendingUrl;
+        // A tab added after its view's first navigation saves that page here.
+        saveBrowserPage(viewId, url, page.title);
+        setPage(viewId, { url, title: page.title });
       } catch {
         // A closed view or an older shell can leave the default tab label.
       }
@@ -407,7 +408,7 @@ export function useBrowserTabs(conversationId: string) {
     const page = await browserTabsBridge()
       ?.browserHasView?.(viewId)
       .catch(() => undefined);
-    if (!page?.exists) return undefined;
+    if (!page?.exists) return readSavedBrowserPage(viewId)?.url;
     return page.url && page.url !== "about:blank" ? page.url : page.pendingUrl;
   };
 
