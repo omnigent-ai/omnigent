@@ -8,10 +8,12 @@
 
 import { createContext, useContext, useSyncExternalStore } from "react";
 
+import { keepsDesktopLayout } from "@/lib/desktopAppLayout";
+
 /** Tailwind's `md` breakpoint: tablets up to an iPad Air in landscape (1180px) get the mobile layout. */
 export const MOBILE_BREAKPOINT_PX = 1181;
 /** Matches viewports at or above `md`, the desktop layout. */
-export const DESKTOP_VIEWPORT_QUERY = `(min-width: ${MOBILE_BREAKPOINT_PX}px)`;
+const DESKTOP_VIEWPORT_QUERY = `(min-width: ${MOBILE_BREAKPOINT_PX}px)`;
 
 // Mirror Tailwind's `max-md` variant exactly so this hook stays in lockstep
 // with the `max-md:` / `md:` classes already used across the shell.
@@ -26,7 +28,16 @@ function subscribe(callback: () => void): () => void {
 
 function getSnapshot(): boolean {
   if (typeof window === "undefined" || !window.matchMedia) return false;
-  return window.matchMedia(MOBILE_QUERY).matches;
+  return !keepsDesktopLayout() && window.matchMedia(MOBILE_QUERY).matches;
+}
+
+/**
+ * Non-reactive read of the layout: true at `md` and up, and at every width in
+ * the desktop app. Mirrors the `md` variant in index.css.
+ */
+export function isDesktopLayout(): boolean {
+  if (typeof window === "undefined" || !window.matchMedia) return false;
+  return keepsDesktopLayout() || window.matchMedia(DESKTOP_VIEWPORT_QUERY).matches;
 }
 
 /**
@@ -37,9 +48,10 @@ export const DesktopWindowContext = createContext(false);
 
 /**
  * True when the viewport is narrower than Tailwind's `md` breakpoint (1181px)
- * — i.e. the "mobile" layout the shell's `max-md:` classes target. Reactive:
- * components re-render when the viewport crosses the breakpoint. SSR-safe
- * (returns `false` on the server, matching `initialSidebarOpen`).
+ * — i.e. the "mobile" layout the shell's `max-md:` classes target. Always false
+ * in the desktop app, which keeps the desktop layout. Reactive: components
+ * re-render when the viewport crosses the breakpoint. SSR-safe (returns `false`
+ * on the server, matching `initialSidebarOpen`).
  */
 export function useIsMobileViewport(): boolean {
   const desktopWindow = useContext(DesktopWindowContext);

@@ -934,6 +934,42 @@ describe("Composer send shortcut", () => {
     }
   });
 
+  it("sends on plain Enter in a desktop app window narrower than the mobile breakpoint", () => {
+    // The desktop app keeps the desktop layout when narrow, so Enter stays the send key.
+    const restoreViewport = forceMobileViewport();
+    vi.stubGlobal("omnigentDesktop", { kind: "electron" });
+    const onSend = vi.fn();
+    try {
+      render(<Composer {...composerProps({ onSend })} />);
+      fireEvent.change(textarea(), { target: { value: "narrow window" } });
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(onSend).toHaveBeenCalledWith("narrow window", undefined);
+    } finally {
+      vi.unstubAllGlobals();
+      restoreViewport();
+    }
+  });
+
+  it("keeps the alternate send shortcut in a narrow desktop app window", async () => {
+    const restoreViewport = forceMobileViewport();
+    vi.stubGlobal("omnigentDesktop", { kind: "electron" });
+    localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, "true");
+    const onSend = vi.fn();
+    try {
+      const user = userEvent.setup();
+      render(<Composer {...composerProps({ onSend })} />);
+      await user.type(textarea(), "first{Enter}second");
+      expect(textarea().value).toBe("first\nsecond");
+      expect(onSend).not.toHaveBeenCalled();
+
+      fireEvent.keyDown(textarea(), { key: "Enter", metaKey: true });
+      expect(onSend.mock.calls[0]?.[0]).toBe("first\nsecond");
+    } finally {
+      vi.unstubAllGlobals();
+      restoreViewport();
+    }
+  });
+
   it("keeps plain Enter completion while Mod+Enter bypasses an open slash menu", () => {
     localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, "true");
     const onSend = vi.fn();
