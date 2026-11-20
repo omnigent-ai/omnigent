@@ -262,6 +262,8 @@ _CODEX_SUBAGENT_ACTIVITY_ITEM_TYPE = "subAgentActivity"
 _CODEX_COLLAB_SPAWN_TOOL = "spawnAgent"
 _CODEX_COLLAB_RUNNING_STATUSES = frozenset({"pendingInit", "running"})
 _CODEX_COLLAB_FAILED_STATUSES = frozenset({"errored", "notFound"})
+# Codex turn.status values for a turn that is still running.
+_CODEX_ACTIVE_TURN_STATUSES = frozenset({"inProgress", "in_progress"})
 # Omnigent control event type sent when a Codex child thread is discovered.
 _EXTERNAL_CODEX_SUBAGENT_START_TYPE = "external_codex_subagent_start"
 # Items that register child threads stay on the ordered parent path so a
@@ -623,6 +625,8 @@ class _CodexForwarderState:
         non-retryable error this connection (guards against re-replay
         or a repeated doomed attempt if the same collab item is observed
         multiple times).
+    :param child_turn_status_by_thread: Latest status from each child's own
+        lifecycle or initial resume, which outranks conflicting collab snapshots.
     :param lineage_checked_threads: Unregistered Codex thread ids already
         checked for descent from the forwarder's thread this connection, so
         each costs at most one lineage lookup.
@@ -744,6 +748,7 @@ class _CodexForwarderState:
     subagents_by_thread: dict[str, str] = field(default_factory=dict)
     pending_child_threads: dict[str, str | None] = field(default_factory=dict)
     subscribed_child_threads: set[str] = field(default_factory=set)
+    child_turn_status_by_thread: dict[str, str] = field(default_factory=dict)
     lineage_checked_threads: set[str] = field(default_factory=set)
     child_streams: dict[str, _CodexChildStream] = field(default_factory=dict)
     child_delivery_slots: asyncio.Semaphore = field(
@@ -1156,6 +1161,35 @@ class _CodexForwarderState:
         :returns: None.
         """
         self.subscribed_child_threads.add(thread_id)
+
+    def note_child_turn_status(self, thread_id: str, status: str) -> None:
+        """
+        Record the status a child thread's own lifecycle most recently produced.
+
+        :param thread_id: Codex child thread id, e.g. ``"thread_child"``.
+        :param status: Omnigent status literal, e.g. ``"running"`` or ``"idle"``.
+        :returns: None.
+        """
+        self.child_turn_status_by_thread[thread_id] = status
+
+    def seed_child_turn_status(self, thread_id: str, status: str) -> None:
+        """
+        Record a backfilled status unless the child's live lifecycle already spoke.
+
+        :param thread_id: Codex child thread id, e.g. ``"thread_child"``.
+        :param status: Omnigent status literal from the child's resume payload.
+        :returns: None.
+        """
+        self.child_turn_status_by_thread.setdefault(thread_id, status)
+
+    def child_turn_status(self, thread_id: str) -> str | None:
+        """
+        Return the status a child's own lifecycle last reported.
+
+        :param thread_id: Codex child thread id, e.g. ``"thread_child"``.
+        :returns: Omnigent status literal, or ``None`` when nothing was observed.
+        """
+        return self.child_turn_status_by_thread.get(thread_id)
 
     def note_user_message_posted(self, turn_id: str) -> None:
         """
@@ -3903,9 +3937,7 @@ def _omnigent_status_from_resume_turn(turn: _JsonObject) -> str | None:
     # A ``turn.error`` forces ``failed`` regardless of the recorded status.
     if _terminal_error_from_turn({"turn": turn}) is not None:
         return "failed"
-    status = turn.get("status")
-    if isinstance(status, dict):
-        status = status.get("type") or status.get("status")
+    status = _raw_turn_status(turn)
     if status == "inProgress":
         return "running"
     if status in {"completed", "interrupted", "cancelled", "canceled"}:
@@ -3913,6 +3945,55 @@ def _omnigent_status_from_resume_turn(turn: _JsonObject) -> str | None:
     if status in {"failed", "errored"}:
         return "failed"
     return None
+
+
+def _newest_resume_turn(turns: list[object]) -> _JsonObject | None:
+    """
+    Return the newest turn object in a Codex resume turn list.
+
+    :param turns: Raw Codex resume turn list, oldest first.
+    :returns: The last turn dict, or ``None`` when the list holds none.
+    """
+    for turn in reversed(turns):
+        if isinstance(turn, dict):
+            return turn
+    return None
+
+
+def _raw_turn_status(turn: _JsonObject) -> object:
+    """
+    Return a Codex turn's status literal, unwrapping the object form.
+
+    :param turn: Codex turn object, e.g. ``{"id": "turn_123", "status":
+        "completed"}`` or with ``{"status": {"type": "completed"}}``.
+    :returns: The status value, e.g. ``"completed"``, or ``None`` when absent.
+    """
+    status = turn.get("status")
+    if isinstance(status, dict):
+        return status.get("type") or status.get("status")
+    return status
+
+
+def _latest_resume_turn_status(response: CodexMessage) -> str | None:
+    """
+    Return the Omnigent status of the newest turn in a ``thread/resume`` payload.
+
+    :param response: Codex ``thread/resume`` (or ``thread/read``) response
+        envelope.
+    :returns: ``"idle"`` / ``"failed"`` when the newest turn is terminal,
+        ``"running"`` when it is still active, or ``None`` when its status is
+        unrecognized or the payload carries no turns.
+    """
+    result = response.get("result")
+    thread = result.get("thread") if isinstance(result, dict) else None
+    turns = thread.get("turns") if isinstance(thread, dict) else None
+    turn = _newest_resume_turn(turns) if isinstance(turns, list) else None
+    if turn is None:
+        return None
+    status = _omnigent_status_from_resume_turn(turn)
+    if status is not None:
+        return status
+    return "running" if _raw_turn_status(turn) in _CODEX_ACTIVE_TURN_STATUSES else None
 
 
 async def _handle_event(
@@ -4143,6 +4224,7 @@ async def _handle_event(
         elicitation_tracker=elicitation_tracker,
         codex_client=codex_client,
         forwarder_state=event_state,
+        on_status_edge=_child_turn_status_recorder(forwarder_state, params) if is_child else None,
     ):
         if child_coalescer is not None:
             await child_coalescer.flush()
@@ -4184,6 +4266,31 @@ async def _handle_event(
             await elicitation_tracker.close_async_questions_for_user_message(
                 client, session_id=route_session_id, params=params
             )
+
+
+def _child_turn_status_recorder(
+    forwarder_state: _CodexForwarderState | None,
+    params: _JsonObject,
+) -> Callable[[_CodexTurnStatusEdge], None] | None:
+    """
+    Build a callback recording a child thread's own status edges on the state.
+
+    Child turn events run without the parent's forwarder state, so this is
+    how the child's authoritative lifecycle reaches
+    ``child_turn_status_by_thread``.
+
+    :param forwarder_state: Mutable state holding child-thread mappings.
+    :param params: Codex notification params carrying the child ``threadId``.
+    :returns: Recorder callback, or ``None`` when nothing can be recorded.
+    """
+    thread_id = _thread_id_from_params(params)
+    if forwarder_state is None or thread_id is None:
+        return None
+
+    def record(edge: _CodexTurnStatusEdge) -> None:
+        forwarder_state.note_child_turn_status(thread_id, edge.status)
+
+    return record
 
 
 def _resolve_event_session(
@@ -5127,6 +5234,7 @@ async def _maybe_handle_turn_event(
     elicitation_tracker: _CodexElicitationTaskTracker,
     codex_client: CodexAppServerClient | None,
     forwarder_state: _CodexForwarderState | None,
+    on_status_edge: Callable[[_CodexTurnStatusEdge], None] | None = None,
 ) -> bool:
     """
     Handle turn/thread-level Codex events.
@@ -5141,6 +5249,7 @@ async def _maybe_handle_turn_event(
     :param elicitation_tracker: Background Codex elicitation tracker.
     :param codex_client: Optional app-server client for Plan prompts.
     :param forwarder_state: Optional forwarder state.
+    :param on_status_edge: Optional callback for an observed native status edge.
     :returns: ``True`` when this event was handled.
     """
     if method == "error":
@@ -5215,18 +5324,17 @@ async def _maybe_handle_turn_event(
                     )
                 except Exception:  # the failure still posts, undiagnosed.
                     _logger.warning("Could not read the Codex rollout's last model", exc_info=True)
-            await _post_turn_status_edge(
-                client,
-                session_id,
-                _CodexTurnStatusEdge(
-                    status="failed",
-                    turn_id=turn_id,
-                    source="error",
-                    error=error,
-                    compaction_model=compaction_model,
-                    selected_model=selected_model if compaction_model else None,
-                ),
+            edge = _CodexTurnStatusEdge(
+                status="failed",
+                turn_id=turn_id,
+                source="error",
+                error=error,
+                compaction_model=compaction_model,
+                selected_model=selected_model if compaction_model else None,
             )
+            if on_status_edge is not None:
+                on_status_edge(edge)
+            await _post_turn_status_edge(client, session_id, edge)
             await usage_coalescer.flush()
         if forwarder_state is not None:
             await forwarder_state.forget_posted_terminals()
@@ -5235,7 +5343,9 @@ async def _maybe_handle_turn_event(
         async with _conversation_item_delivery_scope(session_id):
             if delta_coalescer is not None:
                 await delta_coalescer.flush()
-            published = await _handle_turn_started(client, session_id, bridge_dir, params)
+            published = await _handle_turn_started(
+                client, session_id, bridge_dir, params, on_status_edge=on_status_edge
+            )
             if forwarder_state is not None and bridge_dir is not None:
                 if published:
                     forwarder_state.running_reported_turn_id = _turn_id_from_payload(
@@ -5282,6 +5392,7 @@ async def _maybe_handle_turn_event(
             elicitation_tracker=elicitation_tracker,
             codex_client=codex_client,
             forwarder_state=forwarder_state,
+            on_status_edge=on_status_edge,
         )
         return True
     if method == "thread/tokenUsage/updated":
@@ -5478,6 +5589,7 @@ async def _handle_terminal_turn_boundary(
     elicitation_tracker: _CodexElicitationTaskTracker,
     codex_client: CodexAppServerClient | None,
     forwarder_state: _CodexForwarderState | None,
+    on_status_edge: Callable[[_CodexTurnStatusEdge], None] | None = None,
 ) -> None:
     """Serialize terminal cleanup behind any unfinished authoritative replay."""
     async with _conversation_item_delivery_scope(session_id):
@@ -5492,6 +5604,7 @@ async def _handle_terminal_turn_boundary(
             elicitation_tracker=elicitation_tracker,
             codex_client=codex_client,
             forwarder_state=forwarder_state,
+            on_status_edge=on_status_edge,
         )
 
 
@@ -5507,6 +5620,7 @@ async def _handle_terminal_turn_boundary_inner(
     elicitation_tracker: _CodexElicitationTaskTracker,
     codex_client: CodexAppServerClient | None,
     forwarder_state: _CodexForwarderState | None,
+    on_status_edge: Callable[[_CodexTurnStatusEdge], None] | None = None,
 ) -> None:
     """
     Handle a Codex terminal turn completion/failure boundary.
@@ -5523,6 +5637,7 @@ async def _handle_terminal_turn_boundary_inner(
     :param codex_client: Optional app-server client used for
         synthesized Plan-mode implementation prompts and safety-block drops.
     :param forwarder_state: Optional Plan-mode prompt state.
+    :param on_status_edge: Optional callback for an observed native status edge.
     :returns: None.
     """
     # Reconcile control state before any network-backed output flush. Transcript
@@ -5580,6 +5695,8 @@ async def _handle_terminal_turn_boundary_inner(
     # Keep this post in the current handler, preserving native event order.
     try:
         if terminal.edge is not None:
+            if on_status_edge is not None:
+                on_status_edge(terminal.edge)
             await _post_turn_status_edge(client, session_id, terminal.edge)
             if forwarder_state is not None and terminal.edge.status == "failed":
                 forwarder_state.turn_failure_surfaced = True
@@ -6964,6 +7081,8 @@ async def _handle_turn_started(
     session_id: str,
     bridge_dir: Path | None,
     params: _JsonObject,
+    *,
+    on_status_edge: Callable[[_CodexTurnStatusEdge], None] | None = None,
 ) -> bool:
     """
     Forward a Codex terminal turn start event.
@@ -6972,9 +7091,12 @@ async def _handle_turn_started(
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :param bridge_dir: Native Codex bridge directory.
     :param params: Codex ``turn/started`` params.
+    :param on_status_edge: Optional callback for the observed running edge.
     :returns: ``True`` when the running edge was published and accepted.
     """
     edge = _turn_started_status_edge(bridge_dir, params)
+    if on_status_edge is not None:
+        on_status_edge(edge)
     return await _post_turn_status_edge(client, session_id, edge)
 
 
@@ -8098,6 +8220,11 @@ async def _apply_child_resume(
     :param forwarder_state: Mutable state for sub-agent mappings.
     :returns: None.
     """
+    # A child lifecycle edge outranks the resume snapshot, including one
+    # received while the resume request was awaiting its response.
+    resumed_status = _latest_resume_turn_status(response)
+    if resumed_status is not None:
+        forwarder_state.seed_child_turn_status(child_thread_id, resumed_status)
     await _upsert_child_name_from_resume(
         client,
         parent_session_id=parent_session_id,
@@ -8232,8 +8359,19 @@ async def _post_collab_agent_statuses(
         if child_session_id is None:
             continue
         ap_status = _omnigent_status_from_collab_state(state)
-        if ap_status is not None:
-            await _post_status(client, child_session_id, ap_status)
+        if ap_status is None:
+            continue
+        own_status = forwarder_state.child_turn_status(thread_id)
+        if own_status is not None and ap_status != own_status:
+            _logger.info(
+                "Codex forwarder ignored collab snapshot %s for child with own status %s: "
+                "thread_id=%s",
+                ap_status,
+                own_status,
+                thread_id,
+            )
+            continue
+        await _post_status(client, child_session_id, ap_status)
 
 
 def _omnigent_status_from_collab_state(state: _JsonObject) -> str | None:
