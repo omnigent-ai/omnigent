@@ -47,39 +47,54 @@ import { WorkspacePanel } from "./WorkspacePanel";
 // Each stub renders a testid (plus, for FileViewer, the path it was asked to
 // show) so we can prove which child mounted without dragging in Monaco / hook
 // stacks / xterm.
+const paneRenders = vi.hoisted(() => vi.fn());
 vi.mock("./FileViewer", () => ({
   FileViewer: ({
     path,
     open,
     mediaActive,
+    onExitFullScreen,
   }: {
     path: string;
     open: boolean;
     mediaActive: boolean;
-  }) => (
-    <div data-testid="file-viewer-stub" data-open={open} data-media-active={mediaActive}>
-      {path}
-    </div>
-  ),
+    onExitFullScreen?: () => void;
+  }) => {
+    paneRenders("file");
+    return (
+      <div data-testid="file-viewer-stub" data-open={open} data-media-active={mediaActive}>
+        {path}
+        {onExitFullScreen && (
+          <button type="button" onClick={onExitFullScreen}>
+            Viewer Escape
+          </button>
+        )}
+      </div>
+    );
+  },
 }));
 vi.mock("./FilesPanel", () => ({
   // Echo the fixed scope so tests can prove the Files tab renders the tree
   // (flatView=false) and the Changes tab the changed-only list (flatView=true).
-  FilesPanel: ({ flatView, conversationId }: { flatView: boolean; conversationId: string }) => (
-    <div
-      data-testid="files-panel-stub"
-      data-session={conversationId}
-      data-flat-view={String(flatView)}
-    />
-  ),
+  FilesPanel: ({ flatView, conversationId }: { flatView: boolean; conversationId: string }) => {
+    paneRenders("files");
+    return (
+      <div
+        data-testid="files-panel-stub"
+        data-session={conversationId}
+        data-flat-view={String(flatView)}
+      />
+    );
+  },
 }));
 vi.mock("./SubagentsPanel", () => ({
   SubagentsPanel: () => <div data-testid="subagents-stub" />,
 }));
 vi.mock("./ContentSearchPanel", () => ({
-  ContentSearchPanel: ({ inputRef }: { inputRef: RefObject<HTMLInputElement | null> }) => (
-    <input data-testid="content-search-stub" ref={inputRef} />
-  ),
+  ContentSearchPanel: ({ inputRef }: { inputRef: RefObject<HTMLInputElement | null> }) => {
+    paneRenders("search");
+    return <input data-testid="content-search-stub" ref={inputRef} />;
+  },
 }));
 vi.mock("@/components/BrowserPane/BrowserPane", () => ({
   BrowserPane: ({
@@ -107,9 +122,18 @@ vi.mock("@/components/blocks/TerminalView", () => ({
 vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   ...(await importOriginal<typeof UseTerminalsModule>()),
   useTerminals: vi.fn(() => ({ terminals: [], isLoading: false, error: null })),
-  useCreateTerminal: vi.fn(() => ({ mutate: vi.fn(), isPending: false, isError: false })),
+  useCreateTerminal: vi.fn(() => ({
+    mutate: vi.fn(),
+    launch: vi.fn(),
+    isPending: false,
+    isError: false,
+  })),
 }));
 // The "+" menu reads the agent's declared terminals to gate the Shell entry.
+const requestSandboxWakeMock = vi.fn();
+vi.mock("@/hooks/useSandboxAutoWake", () => ({
+  requestSandboxWake: (id: string) => requestSandboxWakeMock(id),
+}));
 vi.mock("@/hooks/useAgents", () => ({
   useSessionAgent: vi.fn(() => ({ data: undefined })),
 }));
@@ -168,6 +192,7 @@ afterEach(() => {
   useTerminalsMock.mockReturnValue({ terminals: [], isLoading: false, error: null });
   useCreateTerminalMock.mockReturnValue({
     mutate: vi.fn(),
+    launch: vi.fn(),
     isPending: false,
     isError: false,
   } as unknown as ReturnType<typeof useCreateTerminal>);
@@ -343,6 +368,51 @@ function renderWorkspace(
   };
 }
 
+describe("WorkspacePanel render failures", () => {
+  it.each([
+    ["file", { selectedFilePath: "results.csv", openFiles: ["results.csv"] }],
+    ["files", {}],
+    ["search", { rightRailTab: "content-search", showContentSearch: true }],
+    ["files", { selectedFilePath: "results.csv", openFiles: ["results.csv"] }],
+    ["search", { selectedFilePath: "results.csv", showContentSearch: true }],
+  ] satisfies [string, Parameters<typeof renderWorkspace>[0]][])(
+    "contains a %s failure while keeping pane navigation available (%j)",
+    (pane, overrides) => {
+      const error = new Error("Workspace content failed");
+      const suppressExpectedError = (event: ErrorEvent) => {
+        if (event.error === error) event.preventDefault();
+      };
+      window.addEventListener("error", suppressExpectedError);
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      paneRenders.mockImplementation((name) => {
+        if (name === pane) throw error;
+      });
+      try {
+        const { rerender, onRightRailTabChange } = renderWorkspace(overrides);
+        expect(screen.getByRole("alert")).toHaveTextContent(
+          "Unable to display this workspace pane.",
+        );
+        if (pane !== "file" && "selectedFilePath" in overrides) {
+          expect(screen.getByTestId("file-viewer-stub")).toHaveTextContent("results.csv");
+        }
+        const changesTab = screen.getByRole("tab", { name: "Changes" });
+        expect(changesTab).toBeEnabled();
+        fireEvent.mouseDown(changesTab, { button: 0, ctrlKey: false });
+        expect(onRightRailTabChange).toHaveBeenCalledWith("changes");
+
+        paneRenders.mockReset();
+        rerender({ rightRailTab: "changes", selectedFilePath: null });
+        expect(screen.getByTestId("files-panel-stub")).toBeInTheDocument();
+        if (pane === "search") rerender({ rightRailTab: "content-search" });
+        expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      } finally {
+        paneRenders.mockReset();
+        window.removeEventListener("error", suppressExpectedError);
+      }
+    },
+  );
+});
+
 describe("WorkspacePanel surface presentation", () => {
   it("offers unpinned pages in + without requiring shell or browser support", () => {
     writePinnedWorkspaceTabs(["files", "subagents"]);
@@ -370,6 +440,10 @@ describe("WorkspacePanel surface presentation", () => {
 
     expect(screen.getByRole("tab", { name: "Changes" })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByTestId("files-panel-stub")).toHaveAttribute("data-flat-view", "true");
+    requestSandboxWakeMock.mockClear();
+    // An opened unpinned tab is a pick like a pinned one.
+    fireEvent.click(screen.getByRole("tab", { name: "Changes" }));
+    expect(requestSandboxWakeMock).toHaveBeenCalledOnce();
     fireEvent.click(screen.getByRole("button", { name: "Close Changes" }));
     expect(onClosePanel).toHaveBeenCalledWith("changes");
     fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
@@ -553,6 +627,22 @@ describe("WorkspacePanel surface presentation", () => {
 
     await waitFor(() => expect(screen.getByRole("tab", { name: "Files" })).toHaveFocus());
     expect(onRightRailTabChange).toHaveBeenCalledWith("files");
+  });
+
+  it("asks to wake the sandbox when Files, Changes or Pull Requests is picked, not Agents", () => {
+    requestSandboxWakeMock.mockClear();
+    writeDefaultWorkspaceTab("changes");
+    renderWorkspace({ showGithubTab: true, showBrowserTab: true, rightRailTab: "changes" });
+
+    expect(pressTabNumber(2)).toBe(false);
+    expect(requestSandboxWakeMock).toHaveBeenCalledTimes(1);
+    expect(pressTabNumber(4)).toBe(false);
+    expect(requestSandboxWakeMock).toHaveBeenCalledTimes(1);
+    expect(pressTabNumber(1)).toBe(false);
+    expect(requestSandboxWakeMock).toHaveBeenCalledTimes(2);
+    // Pull Requests also loads its details from the host.
+    expect(pressTabNumber(3)).toBe(false);
+    expect(requestSandboxWakeMock).toHaveBeenCalledTimes(3);
   });
 
   it("selects fixed tabs by their visible number from anywhere, revealing the rail", () => {
@@ -898,6 +988,22 @@ describe("WorkspacePanel shell tabs", () => {
     expect(screen.getByTestId("content-search-stub").parentElement).toHaveClass("hidden");
   });
 
+  it("shows a selected shell over an open file, and the file while its terminal is missing", async () => {
+    useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
+    const { rerender } = renderWorkspace({
+      rightRailTab: "files",
+      selectedFilePath: "src/App.tsx",
+      selectedTerminalKey: termKey,
+      openTerminals: [termKey],
+    });
+    expect(await screen.findByTestId("terminal-view-stub")).toHaveTextContent("terminal_zsh_s1");
+    expect(screen.queryByTestId("file-viewer-stub")).toBeNull();
+
+    rerender({ openTerminals: [] });
+    expect(screen.queryByTestId("terminal-view-stub")).toBeNull();
+    expect(screen.getByTestId("file-viewer-stub")).toHaveTextContent("src/App.tsx");
+  });
+
   it("keeps the Files tab panel mounted but hidden behind the active shell", async () => {
     useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
     const { rerender } = renderWorkspace({ rightRailTab: "files", openTerminals: [termKey] });
@@ -1073,11 +1179,11 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     // is handed to openTerminalTab.
     declaresShell();
     const created = { id: "terminal_zsh_s1", name: "zsh", session: "u-1", running: true };
-    const mutate = vi.fn((_name: string, opts?: { onSuccess?: (info: unknown) => void }) =>
-      opts?.onSuccess?.(created),
+    const launch = vi.fn((_name: string, opts?: { onOpen?: (info: unknown) => void }) =>
+      opts?.onOpen?.(created),
     );
     useCreateTerminalMock.mockReturnValue({
-      mutate,
+      launch,
       isPending: false,
       isError: false,
     } as unknown as ReturnType<typeof useCreateTerminal>);
@@ -1088,7 +1194,7 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     fireEvent.click(await screen.findByRole("menuitem", { name: /shell/i }));
 
     // Launches the first declared shell and opens the created terminal's tab.
-    expect(mutate).toHaveBeenCalledWith("zsh", expect.any(Object));
+    expect(launch).toHaveBeenCalledWith("zsh", expect.any(Object));
     expect(openTerminalTab).toHaveBeenCalledWith("terminal:terminal_zsh_s1");
 
     // The menu closes on its own after the launch.
@@ -1103,11 +1209,11 @@ describe('WorkspacePanel "+" new-tab menu', () => {
       data: { terminals: ["zsh", "bash", "fish"] },
     } as unknown as ReturnType<typeof useSessionAgent>);
     const created = { id: "terminal_zsh_s1", name: "zsh", session: "u-2", running: true };
-    const mutate = vi.fn((_name: string, opts?: { onSuccess?: (info: unknown) => void }) =>
-      opts?.onSuccess?.(created),
+    const launch = vi.fn((_name: string, opts?: { onOpen?: (info: unknown) => void }) =>
+      opts?.onOpen?.(created),
     );
     useCreateTerminalMock.mockReturnValue({
-      mutate,
+      launch,
       isPending: false,
       isError: false,
     } as unknown as ReturnType<typeof useCreateTerminal>);
@@ -1120,7 +1226,7 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     fireEvent.click(shellItem);
 
     // Launches the default (first-declared) shell without a further pick.
-    expect(mutate).toHaveBeenCalledWith("zsh", expect.any(Object));
+    expect(launch).toHaveBeenCalledWith("zsh", expect.any(Object));
     expect(openTerminalTab).toHaveBeenCalledWith("terminal:terminal_zsh_s1");
 
     // The menu closes on its own after the launch.
@@ -1158,9 +1264,9 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     useSessionAgentMock.mockReturnValue({
       data: { terminals: ["zsh", "bash", "fish"] },
     } as unknown as ReturnType<typeof useSessionAgent>);
-    const mutate = vi.fn();
+    const launch = vi.fn();
     useCreateTerminalMock.mockReturnValue({
-      mutate,
+      launch,
       isPending: false,
       isError: false,
     } as unknown as ReturnType<typeof useCreateTerminal>);
@@ -1172,7 +1278,7 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     expect(shellItem).toHaveTextContent(/offline/i);
     expect(shellItem).toHaveAttribute("aria-disabled", "true");
     fireEvent.click(shellItem);
-    expect(mutate).not.toHaveBeenCalled();
+    expect(launch).not.toHaveBeenCalled();
   });
 
   it("lists only the OTHER types in the flyout and remembers a pick as the new default (persisted)", async () => {
@@ -1180,9 +1286,9 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     useSessionAgentMock.mockReturnValue({
       data: { terminals: ["zsh", "bash", "fish"] },
     } as unknown as ReturnType<typeof useSessionAgent>);
-    const mutate = vi.fn();
+    const launch = vi.fn();
     useCreateTerminalMock.mockReturnValue({
-      mutate,
+      launch,
       isPending: false,
       isError: false,
     } as unknown as ReturnType<typeof useCreateTerminal>);
@@ -1204,20 +1310,20 @@ describe('WorkspacePanel "+" new-tab menu', () => {
 
     // Pick "bash": launches it and persists as the preferred type (app-global).
     fireEvent.click(screen.getByRole("menuitem", { name: /^bash$/i }));
-    expect(mutate).toHaveBeenCalledWith("bash", expect.any(Object));
+    expect(launch).toHaveBeenCalledWith("bash", expect.any(Object));
     expect(window.localStorage.getItem("omnigent:preferred-shell")).toBe("bash");
 
     // A fresh menu seeds its default from the persisted pick — the row now reads
     // "Shell (bash)" and launches bash on click.
     cleanup();
-    mutate.mockClear();
+    launch.mockClear();
     useSessionAgentMock.mockReturnValue({
       data: { terminals: ["zsh", "bash", "fish"] },
     } as unknown as ReturnType<typeof useSessionAgent>);
     renderWorkspace({ showBrowserTab: false });
     fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
     fireEvent.click(await screen.findByRole("menuitem", { name: /shell \(bash\)/i }));
-    expect(mutate).toHaveBeenCalledWith("bash", expect.any(Object));
+    expect(launch).toHaveBeenCalledWith("bash", expect.any(Object));
 
     window.localStorage.removeItem("omnigent:preferred-shell");
   });
@@ -1226,9 +1332,9 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     // A runner merely asleep (host up) is reconnected transparently by the
     // server on create, so the item stays clickable and launches as normal.
     declaresShell();
-    const mutate = vi.fn();
+    const launch = vi.fn();
     useCreateTerminalMock.mockReturnValue({
-      mutate,
+      launch,
       isPending: false,
       isError: false,
     } as unknown as ReturnType<typeof useCreateTerminal>);
@@ -1239,15 +1345,15 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     const shell = await screen.findByRole("menuitem", { name: /shell/i });
     expect(shell).not.toHaveAttribute("aria-disabled", "true");
     fireEvent.click(shell);
-    expect(mutate).toHaveBeenCalledWith("zsh", expect.any(Object));
+    expect(launch).toHaveBeenCalledWith("zsh", expect.any(Object));
   });
 
   it("keeps unpinned pages accessible while a shell reconnects", async () => {
     declaresShell();
     writePinnedWorkspaceTabs([]);
-    const mutate = vi.fn();
+    const launch = vi.fn();
     useCreateTerminalMock.mockReturnValue({
-      mutate,
+      launch,
       isPending: true,
       isError: false,
     } as unknown as ReturnType<typeof useCreateTerminal>);
@@ -1260,7 +1366,7 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     const shell = await screen.findByRole("menuitem", { name: /reconnecting/i });
     expect(shell).toHaveAttribute("aria-disabled", "true");
     fireEvent.click(shell);
-    expect(mutate).not.toHaveBeenCalled();
+    expect(launch).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("menuitem", { name: "Changes" }));
     expect(onRightRailTabChange).toHaveBeenCalledWith("changes");
   });
@@ -1269,9 +1375,9 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     // host_offline / local_stranded need a CLI reconnect — the browser can't
     // wake them, so the item is disabled and marked Offline.
     declaresShell();
-    const mutate = vi.fn();
+    const launch = vi.fn();
     useCreateTerminalMock.mockReturnValue({
-      mutate,
+      launch,
       isPending: false,
       isError: false,
     } as unknown as ReturnType<typeof useCreateTerminal>);
@@ -1283,7 +1389,7 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     expect(shell).toHaveTextContent(/offline/i);
     expect(shell).toHaveAttribute("aria-disabled", "true");
     fireEvent.click(shell);
-    expect(mutate).not.toHaveBeenCalled();
+    expect(launch).not.toHaveBeenCalled();
   });
 });
 
@@ -1310,6 +1416,36 @@ describe("WorkspacePanel maximize", () => {
     const panel = screen.getByRole("complementary", { name: "Workspace" });
     expect(panel).toHaveClass("md:absolute", "md:inset-0", "md:border-l");
     expect(panel).not.toHaveClass("md:shrink-0", "md:m-2", "md:rounded-lg");
+  });
+
+  it("lets Escape in a full-screen file exit full screen rather than close the tab", () => {
+    const { onToggleMaximized, onCloseFile, rerender } = renderWorkspace({
+      selectedFilePath: "docs/README.md",
+      openFiles: ["docs/README.md"],
+      maximized: true,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Viewer Escape" }));
+    expect(onToggleMaximized).toHaveBeenCalledTimes(1);
+    expect(onCloseFile).not.toHaveBeenCalled();
+
+    // Outside full screen the viewer gets no exit-full-screen handler.
+    rerender({ maximized: false });
+    expect(screen.queryByRole("button", { name: "Viewer Escape" })).toBeNull();
+  });
+
+  it.each([
+    { name: "a file", selectedFilePath: "docs/README.md", keys: ["Esc"] },
+    { name: "the Files tab", selectedFilePath: null, keys: [] },
+  ])("lists Esc on Exit full screen only for $name", async ({ selectedFilePath, keys }) => {
+    renderWorkspace({ selectedFilePath, openFiles: ["docs/README.md"], maximized: true });
+    fireEvent.pointerMove(screen.getByRole("button", { name: "Exit full screen" }).parentElement!, {
+      pointerType: "mouse",
+    });
+    const tip = await screen.findByRole("tooltip");
+    expect(tip).toHaveTextContent("Exit full screen");
+    expect(
+      Array.from(tip.querySelectorAll('[data-slot="kbd"]')).map((key) => key.textContent),
+    ).toEqual(keys);
   });
 });
 
@@ -1582,6 +1718,49 @@ describe("WorkspacePanel restored side chats", () => {
       expect(screen.getByTestId("side-chat-pane-stub")).not.toHaveAttribute("data-read-only");
     } finally {
       useChatStore.setState({ sessionHarness: before.sessionHarness });
+    }
+  });
+});
+
+describe("WorkspacePanel side chat start", () => {
+  it("points a pending tab at the server-forked child and seeds its question", async () => {
+    const previousHarness = useChatStore.getState().sessionHarness;
+    useChatStore.setState({
+      sessionHarness: "openai-agents",
+      sideChatComposers: { "pending:one": { text: "question", files: [] } },
+      sideChatDrafts: {},
+    });
+    const create = vi
+      .spyOn(sessionsApi, "createSideChat")
+      .mockResolvedValueOnce({ childSessionId: "conv_fork" } as Awaited<
+        ReturnType<typeof sessionsApi.createSideChat>
+      >);
+    try {
+      writeSessionWorkspaceState("conv_ws", {
+        openSideChats: ["pending:one"],
+        selectedSideChatId: "pending:one",
+      });
+      renderWorkspace({ rightRailTab: "sidechat" });
+
+      fireEvent.click(screen.getByRole("button", { name: "Start side chat" }));
+
+      await waitFor(() =>
+        expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_fork"),
+      );
+      expect(create).toHaveBeenCalledWith("conv_ws", undefined);
+      expect(useChatStore.getState().sideChatComposers["pending:one"]).toBeUndefined();
+      expect(useChatStore.getState().sideChatDrafts.conv_fork).toBe("question");
+      expect(readSessionWorkspaceState("conv_ws")).toMatchObject({
+        openSideChats: ["conv_fork"],
+        selectedSideChatId: "conv_fork",
+      });
+    } finally {
+      create.mockRestore();
+      useChatStore.setState({
+        sessionHarness: previousHarness,
+        sideChatComposers: {},
+        sideChatDrafts: {},
+      });
     }
   });
 });
@@ -1872,6 +2051,25 @@ describe("WorkspacePanel sub-agent tabs", () => {
 
     expect(screen.getByTestId("side-chat-pane-stub")).toHaveAttribute("data-read-only", "true");
     expect(screen.getByTestId("subagent-tab-read-only")).toHaveTextContent(reason);
+  });
+
+  it("allows a closed Codex side chat to resume in a sub-agent tab", () => {
+    writeSessionWorkspaceState("conv_ws", {
+      openSubagentTabs: [SUBAGENT_TAB],
+      selectedSideChatId: SUBAGENT_TAB,
+    });
+    renderWorkspace({
+      rightRailTab: "sidechat",
+      queryClient: clientWithSubagent("Side chat", {
+        "omnigent.closed": "true",
+        "omnigent.wrapper": "codex-native-ui-subagent",
+        "omnigent.codex_native.agent_nickname": "Side chat",
+        "omnigent.codex_native.side_chat_resume": "true",
+      }),
+    });
+
+    expect(screen.getByTestId("side-chat-pane-stub")).toHaveAttribute("data-read-only", "false");
+    expect(screen.queryByTestId("subagent-tab-read-only")).toBeNull();
   });
 
   it("selects a session's open side-chat tab instead of adding a sub-agent tab for it", () => {

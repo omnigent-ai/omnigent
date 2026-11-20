@@ -193,7 +193,7 @@ export type SessionStatus = "idle" | "launching" | "running" | "waiting" | "fail
  * Mirrors `omnigent.server.schemas.SessionEventInput`.
  */
 export type SessionEventInput =
-  | { type: "message"; data: { role: "user"; content: ContentBlock[] } }
+  | { type: "message"; data: { role: "user"; content: ContentBlock[] }; workflow_run_id?: string }
   | { type: "function_call_output"; data: Record<string, unknown> }
   | { type: "approval"; data: Record<string, unknown> }
   | { type: "interrupt"; data?: Record<string, unknown> }
@@ -280,7 +280,16 @@ export interface BackgroundTaskInfo {
   command?: string;
 }
 
+export interface SessionFamily {
+  id: string;
+  representative_id: string | null;
+  representative_title?: string | null;
+  pinned: boolean;
+  pinned_at?: string | null;
+}
+
 export interface Session {
+  family?: SessionFamily | null;
   sandboxProfile?: SandboxProfile | null;
   projectId?: string | null;
   /**
@@ -319,10 +328,9 @@ export interface Session {
   /** Current host reachability; absent when the snapshot omits liveness. */
   hostOnline?: boolean;
   /**
-   * Whether this session's host is a dormant resumable managed host the
-   * server can wake on the next message. Carried on the snapshot so the open
-   * view shows a wakeable "asleep" state instead of the terminal host_offline
-   * dead-end. `false`/absent otherwise.
+   * Whether this session's host is a managed host the server can resume on
+   * the next message. Lets the open view show a resumable state instead of a
+   * terminal host_offline. `false`/absent otherwise.
    */
   hostResumable?: boolean;
   /**
@@ -344,7 +352,14 @@ export interface Session {
    * the count).
    */
   backgroundTasks?: BackgroundTaskInfo[];
+  /**
+   * Background agents a finished claude-native turn left running, while
+   * {@link status} is ``"waiting"``. Absent otherwise.
+   */
+  backgroundAgents?: BackgroundTaskInfo[];
   createdAt: number;
+  /** Unix seconds of the last persisted change (the sidebar's sort key); absent on older servers. */
+  updatedAt?: number | null;
   /**
    * Human-readable session title, e.g. ``"researcher:auth"`` for a
    * sub-agent (the spawn tool seeds this) or a user-supplied string
@@ -435,6 +450,8 @@ export interface Session {
    * unpriced, so unknown spend is never displayed as ``$0.00``.
    */
   totalCostUsd?: number | null;
+  /** True when the operator hides USD cost: clear a cached cost, keep tokens. */
+  costHidden?: boolean;
   /**
    * Per-model breakdown of the same subtree usage, keyed by the raw harness
    * model id (e.g. `"claude-sonnet-4-6"`). Each value is the model's token
@@ -545,8 +562,7 @@ export interface Session {
    * Managed-sandbox launch progress. Present while the session's
    * background sandbox launch is in flight or has failed; `null` for
    * sessions without a managed launch and once the launch succeeds.
-   * Sourced from the server's `_session_sandbox_status_cache` at
-   * snapshot build time so a client opening the session mid-launch
+   * Included in the snapshot so a client that opens the session mid-launch
    * sees the current stage.
    */
   sandboxStatus?: SandboxStatus | null;

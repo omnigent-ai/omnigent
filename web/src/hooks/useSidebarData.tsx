@@ -16,10 +16,11 @@ import {
   readSidebarViewPreferences,
   sidebarBaseOrdering,
   writeSidebarViewPreferences,
+  type SidebarShowField,
   type SidebarViewPreferences,
 } from "@/lib/sidebarViewPreferences";
 import { parseProjectSessionsQueryKey, recentlyCreatedSessions } from "@/lib/sessionListCache";
-import { customSortOrder, sidebarSortBy } from "@/shell/sidebarNav";
+import { customSortOrder, isPinOrderUnit, sidebarSortBy } from "@/shell/sidebarNav";
 import type { SessionFilter } from "@/lib/sessionFilterPreferences";
 import {
   dedupeSessionRows,
@@ -42,6 +43,7 @@ import { filterSessionScope, sessionVisibility } from "@/lib/sessionVisibility";
 import { useIdentityReady, useViewerId } from "./useViewerId";
 import { sumPendingApprovals } from "@/lib/inbox";
 import { useAutomationInbox } from "./useAutomationInbox";
+import { useProactiveInbox } from "./useProactiveInbox";
 import { useCommentInbox } from "./useCommentInbox";
 import {
   usePinnedConversations,
@@ -237,8 +239,14 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
   );
   const comments = useCommentInbox(inboxRows);
   const automationInbox = useAutomationInbox(identityReady);
+  const proactiveInbox = useProactiveInbox(identityReady);
   const inboxCount =
-    sumPendingApprovals(inboxRows) + comments.items.length + automationInbox.items.length;
+    sumPendingApprovals(inboxRows) +
+    comments.items.length +
+    automationInbox.items.length +
+    proactiveInbox.unreadCount;
+  // The server stops counting unread suggestions at its limit.
+  const inboxCountCapped = proactiveInbox.unreadCountCapped;
   const watchedIds = useMemo(() => loadedRows.map((row) => row.id), [loadedRows]);
   const mineCursor = mine.data?.pages.at(-1)?.last_id;
   const sharedCursor = shared.data?.pages.at(-1)?.last_id;
@@ -332,8 +340,10 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
     serverInboxRows,
     inboxCount,
     inboxCountIncomplete: automationInbox.hasNextPage,
+    inboxCountCapped,
     comments,
     automationInbox,
+    proactiveInbox,
     watchedIds,
     registerFolder,
     applyLocalResolutions,
@@ -357,7 +367,9 @@ export function SidebarDataProvider({
     <SidebarConfigContext.Provider value={config}>
       <SidebarDataContext.Provider value={data}>
         <PinCapacityContext.Provider
-          value={(data.pinned.data?.conversations.length ?? 0) >= config.pinCap}
+          value={
+            (data.pinned.data?.conversations.filter(isPinOrderUnit).length ?? 0) >= config.pinCap
+          }
         >
           {children}
         </PinCapacityContext.Provider>
@@ -391,6 +403,21 @@ export function useSidebarData() {
 export function useLoadedConversations() {
   const { loadedData: data, serverLoadedRows: serverRows, all } = useSidebarData();
   return { data, serverRows, isLoading: data === undefined && all.isLoading };
+}
+
+/** Loaded rows when a SidebarDataProvider is mounted, else ``undefined``. */
+export function useOptionalLoadedConversations() {
+  return useContext(SidebarDataContext)?.loadedData;
+}
+
+/** The sidebar's "Show" row metadata when a SidebarDataProvider is mounted, else none. */
+export function useOptionalSidebarShow(): readonly SidebarShowField[] {
+  return useContext(SidebarDataContext)?.view.show ?? DEFAULT_SIDEBAR_VIEW.show;
+}
+
+/** The caller's own sessions when a SidebarDataProvider is mounted, else ``undefined``. */
+export function useOptionalMineSessions() {
+  return useContext(SidebarDataContext)?.mine;
 }
 
 /** Register the mounted sidebar's persisted selection; unmount releases its demand. */

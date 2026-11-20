@@ -387,8 +387,8 @@ function resolveCliPath(configuredPath, deps = {}) {
 }
 
 /**
- * Normalize a CLI invocation. Public paths pass a string (`/path/omnigent`);
- * Databricks-internal host enrollment passes an executable + fixed argv prefix
+ * Normalize a CLI invocation. A plain path passes a string (`/path/omnigent`);
+ * managed host enrollment passes an executable + fixed argv prefix
  * (`/usr/local/bin/isaac`, `["omni"]`). Both stay shell-free.
  *
  * @param {string | {
@@ -474,16 +474,16 @@ function cliFailureOf(err) {
  *
  * @param {Parameters<typeof cliCommandParts>[0]} command
  * @param {string[]} args
- * @param {{ timeoutMs?: number }} [opts]
+ * @param {{ timeoutMs?: number, signal?: AbortSignal }} [opts] `signal` kills the child when aborted.
  * @returns {Promise<{ code: number, stdout: string, stderr: string, failure?: CliFailure }>}
  */
-function runCli(command, args, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+function runCli(command, args, { timeoutMs = DEFAULT_TIMEOUT_MS, signal } = {}) {
   const { executable, prefixArgs } = cliCommandParts(command);
   return new Promise((resolve) => {
     execFile(
       executable,
       [...prefixArgs, ...args],
-      { timeout: timeoutMs, encoding: "utf8" },
+      { timeout: timeoutMs, encoding: "utf8", ...(signal ? { signal } : {}) },
       (err, stdout, stderr) => {
         const code = err ? (typeof err.code === "number" ? err.code : 1) : 0;
         resolve({
@@ -540,11 +540,11 @@ function serverAuthed(serverUrl) {
  *
  * @param {string} cliPath
  * @param {string} serverUrl
- * @param {{ timeoutMs?: number }} [opts]
+ * @param {{ timeoutMs?: number, signal?: AbortSignal }} [opts]
  * @returns {Promise<{ ok: boolean, output: string, failure?: CliFailure }>}
  */
-async function loginServer(cliPath, serverUrl, { timeoutMs = LOGIN_TIMEOUT_MS } = {}) {
-  const res = await runCli(cliPath, ["login", serverUrl], { timeoutMs });
+async function loginServer(cliPath, serverUrl, { timeoutMs = LOGIN_TIMEOUT_MS, signal } = {}) {
+  const res = await runCli(cliPath, ["login", serverUrl], { timeoutMs, signal });
   return {
     ok: res.code === 0,
     output: (res.stdout || res.stderr).trim(),
@@ -1025,7 +1025,7 @@ const WORKSPACE_API_PATH = "/api/2.0/omnigent";
 /**
  * Whether requests to `serverUrl` should carry a host's routing key, by the same
  * rule as `databricks_request_headers()` (omnigent/cli_auth.py): on by default
- * for the host-sharded workspace mount, opt-in on other servers with
+ * for workspace mounts, opt-in on other servers with
  * `OMNIGENT_HOST_SLICE_KEY_ENABLED=1`, and off for either when it is "0".
  *
  * @param {string} serverUrl
@@ -1108,10 +1108,10 @@ async function probeHostTunnel(serverUrl, hostId, { timeoutMs = 2000 } = {}) {
  * and let the connect attempt raise its own, clearer error. Never throws.
  *
  * @param {string} serverUrl
- * @param {{ timeoutMs?: number }} [opts]
+ * @param {{ timeoutMs?: number, signal?: AbortSignal }} [opts] aborting `signal` ends the probe early.
  * @returns {Promise<{ authed: boolean, reachable: boolean }>}
  */
-async function probeServerAuth(serverUrl, { timeoutMs = 10000 } = {}) {
+async function probeServerAuth(serverUrl, { timeoutMs = 10000, signal } = {}) {
   if (typeof serverUrl !== "string" || serverUrl === "") {
     return { authed: false, reachable: false };
   }
@@ -1123,7 +1123,9 @@ async function probeServerAuth(serverUrl, { timeoutMs = 10000 } = {}) {
     const resp = await fetch(`${base}/v1/me`, {
       headers,
       redirect: "manual",
-      signal: AbortSignal.timeout(timeoutMs),
+      signal: signal
+        ? AbortSignal.any([AbortSignal.timeout(timeoutMs), signal])
+        : AbortSignal.timeout(timeoutMs),
     });
     return { authed: resp.status === 200, reachable: true };
   } catch {

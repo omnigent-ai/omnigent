@@ -33,7 +33,7 @@ mid-session. This test is a **stand-in**: a local single-user ``omnigent server`
 subprocess with the flaky forwarder->server POST injected as a fault at the
 exact production seam. The message-loss BEHAVIOUR being asserted is product code
 and environment-independent, but the triggering flaky POST is induced here
-rather than arising from the real Databricks network -- so this reproduces the
+rather than arising from the real network -- so this reproduces the
 *likely mechanism*, not the reported environment itself.
 
 This drives the REAL user path: a real ``omnigent server`` subprocess (so the

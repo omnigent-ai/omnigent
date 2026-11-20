@@ -127,7 +127,8 @@ def test_failed_launch_hands_the_message_and_attachment_to_a_new_session(
 
 async def _drive_failed_launch(rig: ManagedReplicas) -> None:
     async with async_playwright() as playwright, httpx.AsyncClient(timeout=10) as client:
-        (await client.post(f"{rig.a}/__test/provision/fail")).raise_for_status()
+        # The reserved host ID routes this attachment create to replica B.
+        (await client.post(f"{rig.b}/__test/provision/fail")).raise_for_status()
         browser = await playwright.chromium.launch()
         page = await browser.new_page(viewport={"width": 1440, "height": 960})
         try:
@@ -142,8 +143,8 @@ async def _drive_failed_launch(rig: ManagedReplicas) -> None:
             await page.get_by_test_id("new-chat-landing-input").fill(_PROMPT)
             await page.get_by_test_id("new-chat-landing-submit").click()
             await expect(page).to_have_url(re.compile(r"/c/[a-f0-9]+"), timeout=30_000)
-            await _poll(client, f"{rig.a}/__test/state", lambda body: body["provisioning"])
-            (await client.post(f"{rig.a}/__test/provision/release")).raise_for_status()
+            await _poll(client, f"{rig.b}/__test/state", lambda body: body["provisioning"])
+            (await client.post(f"{rig.b}/__test/provision/release")).raise_for_status()
 
             # Live, then after a reload: the message stays, marked undelivered.
             prompt = page.locator('[data-testid="message-bubble"][data-role="user"]').filter(
@@ -163,5 +164,5 @@ async def _drive_failed_launch(rig: ManagedReplicas) -> None:
             await expect(page.get_by_role("button", name="Remove context.txt")).to_be_visible()
             await page.screenshot(path=str(rig.logs / "new-session-prefilled.png"))
         finally:
-            await client.post(f"{rig.a}/__test/provision/release")
+            await client.post(f"{rig.b}/__test/provision/release")
             await browser.close()

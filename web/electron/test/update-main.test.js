@@ -50,6 +50,7 @@ function loadMainHarness({
     windowCloses: 0,
     webContentsFocuses: 0,
     globalShortcuts: [],
+    firstResponderActions: [],
   };
 
   const sender = {
@@ -75,6 +76,7 @@ function loadMainHarness({
       calls.windowCloses += 1;
     },
   };
+  let focusedWindow = win;
 
   class FakeSemVer {
     constructor(version) {
@@ -127,12 +129,13 @@ function loadMainHarness({
     },
     BrowserWindow: Object.assign(function BrowserWindow() {}, {
       fromWebContents: (webContents) => (webContents === sender ? win : null),
-      getFocusedWindow: () => win,
+      getFocusedWindow: () => focusedWindow,
       getAllWindows: () => [win],
     }),
     Menu: {
       buildFromTemplate: (template) => ({ template }),
       setApplicationMenu: (menu) => calls.setApplicationMenu.push(menu),
+      sendActionToFirstResponder: (action) => calls.firstResponderActions.push(action),
     },
     Notification: { isSupported: () => false },
     clipboard: {},
@@ -249,7 +252,7 @@ function loadMainHarness({
   // into the menu, the IPC surface, and the before-quit install handoff.
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    '\nmodule.exports.testApi = { buildMenu, registerIpc, windows, updater, setQuitTimeouts: (o) => { if (typeof (o && o.cleanup) === "number") quitCleanupTimeoutMs = o.cleanup; if (typeof (o && o.installFallback) === "number") quitInstallFallbackMs = o.installFallback; } }';
+    '\nmodule.exports.testApi = { buildMenu, registerIpc, windows, updater, workspaceSshForwards, setQuitTimeouts:(o) => { if (typeof (o && o.cleanup) === "number") quitCleanupTimeoutMs = o.cleanup; if (typeof (o && o.installFallback) === "number") quitInstallFallbackMs = o.installFallback; } }';
 
   const module = { exports: {} };
   const sandbox = {
@@ -309,6 +312,9 @@ function loadMainHarness({
     ipcHandlers,
     ipcListeners,
     win,
+    setFocusedWindow: (next) => {
+      focusedWindow = next;
+    },
     pendingMainImmediates: () => mainImmediates.length,
     readSettings: () => JSON.parse(fs.readFileSync(path.join(userData, "settings.json"), "utf8")),
     runMainImmediates: () => {
@@ -682,6 +688,14 @@ describe("desktop command menu items", () => {
     ]);
   });
 
+  it("says closing the last main window quits off macOS, even with a panel open", (t) => {
+    const harness = loadMainHarness({ platform: "linux" });
+    t.after(harness.cleanup);
+    harness.api.windows.set({ isDestroyed: () => false }, { role: "panel" });
+    findMenuItem(reportState(harness, { commands: ["close"] }), "close").click();
+    assert.equal(harness.calls.sent.at(-1).payload.closingQuits, true);
+  });
+
   it("steps a focused web page's own history, else hands Back/Forward to the app", (t) => {
     const harness = loadMainHarness({ platform: "darwin" });
     t.after(harness.cleanup);
@@ -862,6 +876,76 @@ describe("close-window request", () => {
       false,
     );
     assert.equal(harness.calls.windowCloses, 0);
+  });
+});
+
+describe("system dictation request", () => {
+  it("starts macOS Dictation in the page's focused field", async (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+
+    const started = harness.ipcHandlers.get("omnigent:start-system-dictation")(
+      harness.events.pinned,
+    );
+    assert.equal(harness.calls.webContentsFocuses, 1);
+    // macOS must register the refocused field first, so Dictation starts after a pause.
+    assert.deepEqual(harness.calls.firstResponderActions, []);
+    assert.equal(await started, true);
+    assert.deepEqual(harness.calls.firstResponderActions, ["startDictation:"]);
+  });
+
+  it("doesn't start when the window loses focus during the pause", async (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+
+    const started = harness.ipcHandlers.get("omnigent:start-system-dictation")(
+      harness.events.pinned,
+    );
+    harness.setFocusedWindow(null);
+    assert.equal(await started, false);
+    assert.deepEqual(harness.calls.firstResponderActions, []);
+  });
+
+  it("refuses a page off the pinned server", async (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+
+    assert.equal(
+      await harness.ipcHandlers.get("omnigent:start-system-dictation")(harness.events.unpinned),
+      false,
+    );
+    assert.deepEqual(harness.calls.firstResponderActions, []);
+  });
+
+  it("refuses a window that isn't focused", async (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+    const start = harness.ipcHandlers.get("omnigent:start-system-dictation");
+
+    // Dictation types into the key window, so a background window must not start it.
+    for (const focused of [null, { isDestroyed: () => false }]) {
+      harness.setFocusedWindow(focused);
+      // oxlint-disable-next-line no-await-in-loop -- Each case reads the call log afterwards.
+      assert.equal(await start(harness.events.pinned), false);
+    }
+    assert.equal(harness.calls.webContentsFocuses, 0);
+    assert.deepEqual(harness.calls.firstResponderActions, []);
+  });
+
+  it("does nothing off macOS", async (t) => {
+    const harness = loadMainHarness({ platform: "linux" });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+
+    assert.equal(
+      await harness.ipcHandlers.get("omnigent:start-system-dictation")(harness.events.pinned),
+      false,
+    );
+    assert.deepEqual(harness.calls.firstResponderActions, []);
   });
 });
 
@@ -1419,6 +1503,13 @@ describe("auto-update main-process wiring", () => {
     const harness = loadMainHarness({ settings: { update_mode: "manual" } });
     t.after(harness.cleanup);
     harness.api.setQuitTimeouts({ cleanup: 10 });
+    // Forced exits skip will-quit, so SSH teardown must have run before any app.exit.
+    const { closeAll } = harness.api.workspaceSshForwards;
+    const exitCountsAtTeardown = [];
+    harness.api.workspaceSshForwards.closeAll = () => {
+      exitCountsAtTeardown.push(harness.calls.appExit);
+      closeAll();
+    };
 
     harness.appEvents.get("before-quit")({ preventDefault: () => {} });
     await flushPromises();
@@ -1433,6 +1524,7 @@ describe("auto-update main-process wiring", () => {
       setTimeout(resolve, 30);
     });
     assert.equal(harness.calls.appExit, 1);
+    assert.deepEqual(exitCountsAtTeardown, [0]);
   });
 
   it("cancels the normal quit fallback once quit is reached", async (t) => {

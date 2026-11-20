@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import sys
@@ -22,7 +23,10 @@ from omnigent.harnesses.claude_native.bridge import (
     bridge_dir_for_conversation_id,
 )
 from omnigent.harnesses.codex_native import bridge as codex_native_bridge
-from omnigent.harnesses.codex_native.side_chat import SideChatEffortUnavailable
+from omnigent.harnesses.codex_native.side_chat import (
+    SideChatEffortUnavailable,
+    SideChatValidationError,
+)
 from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
 from omnigent.harnesses.cursor_native import main as cursor_native
 from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
@@ -30,6 +34,8 @@ from omnigent.harnesses.kiro_native import main as kiro_native
 from omnigent.runner import create_runner_app, model_option_routes, subagent_work
 from omnigent.runner.resource_registry import (
     KIRO_NATIVE_TERMINAL_ROLE,
+    TerminalExitEvent,
+    TerminalLifecycle,
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
@@ -1758,6 +1764,9 @@ async def test_codex_model_catalog_writeback_uses_session_provider(
     cfg = tmp_path / "databrickscfg"
     cfg.write_text("[default]\nhost = https://a.example\n[other]\nhost = https://b.example\n")
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+    source_home = tmp_path / "source-home"
+    source_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
     monkeypatch.setattr(codex, "_find_codex_cli", lambda: sys.executable)
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
     profile = "default" if case == "default" else "other"
@@ -2754,6 +2763,91 @@ async def test_events_interrupt_codex_side_chat_leaves_parent_turn_running(
     )
     parent_state = codex_native_bridge.read_bridge_state(bridge_dir)
     assert parent_state is not None and parent_state.active_turn_id == "turn_parent"
+    assert pm.cancelled == []
+    assert pm.released == []
+    assert conv_id not in app.state.interrupted_sessions
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("child_id", "failure", "status"),
+    [
+        ("conv_side", None, 200),
+        (None, None, 400),
+        ("", None, 400),
+        (12, None, 400),
+        ("conv_side", SideChatValidationError("Internal validation detail"), 400),
+        ("conv_side", json.JSONDecodeError("Internal parser detail", "invalid", 0), 503),
+        ("conv_side", RuntimeError("The forwarder is unavailable."), 503),
+        ("conv_side", httpx.ConnectError("Connection lost"), 503),
+    ],
+    ids=[
+        "resumed",
+        "missing-id",
+        "empty-id",
+        "invalid-id",
+        "wrong-child",
+        "invalid-history",
+        "unavailable",
+        "disconnected",
+    ],
+)
+async def test_events_resume_codex_side_chat_leaves_parent_turn_running(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    child_id: str | int | None,
+    failure: Exception | None,
+    status: int,
+) -> None:
+    from omnigent.harnesses.codex_native import side_chat
+
+    conv_id = "acbeddbbce38421b921a7abbe82f7176"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path="ws://127.0.0.1:43210",
+            thread_id="thread_parent",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_parent",
+        ),
+    )
+    resume = AsyncMock(side_effect=failure)
+    monkeypatch.setattr(side_chat, "resume_side_chat", resume)
+    app, pm = await _build_app_for_spec(_harness_spec("codex-native"))
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions", json={"session_id": conv_id, "agent_id": "agent_side"}
+        )
+        assert created.status_code == 201, created.text
+        spawns_before = list(pm.get_client_calls)
+        response = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "codex_side_chat_resume", "codex_side_session_id": child_id},
+        )
+
+    assert response.status_code == status, response.text
+    if status == 200:
+        assert response.json() == {"resumed": True}
+    elif isinstance(failure, SideChatValidationError):
+        assert response.json() == {
+            "error": "invalid_request",
+            "detail": "This session is not a side chat of the active Codex parent.",
+        }
+    elif status == 503:
+        assert response.json() == {
+            "error": "codex_side_chat_unavailable",
+            "detail": "The Codex side chat could not be resumed; try again.",
+        }
+    if isinstance(child_id, str) and child_id:
+        resume.assert_awaited_once_with(bridge_dir, child_id)
+    else:
+        resume.assert_not_awaited()
+    parent_state = codex_native_bridge.read_bridge_state(bridge_dir)
+    assert parent_state is not None and parent_state.active_turn_id == "turn_parent"
+    assert pm.get_client_calls == spawns_before
     assert pm.cancelled == []
     assert pm.released == []
     assert conv_id not in app.state.interrupted_sessions
@@ -4469,6 +4563,70 @@ async def test_events_stop_session_closes_terminal_and_publishes_deleted(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "replacement", ["running_turn", "completed_turn", "terminal", "app_server", None]
+)
+async def test_terminal_exit_release_preserves_a_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, replacement: str | None
+) -> None:
+    """A queued exit cleanup owns its old runtime, even after a fast retry finishes."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.runner.native import orchestration
+    from tests.runner.helpers import make_test_terminal_instance
+
+    monkeypatch.setattr(runner_app, "_TERMINAL_EXIT_RELEASE_GRACE_S", 0.0)
+    teardown = AsyncMock()
+    monkeypatch.setattr(orchestration, "teardown_codex_native_app_server", teardown)
+    session_id = uuid.uuid4().hex
+    terminals = TerminalRegistry()
+    manager = _FakeProcessManager(_ScriptedHarnessClient([]))
+    manager._sessions.add(session_id)
+    app = create_runner_app(
+        process_manager=manager, terminal_registry=terminals, server_client=NullServerClient()
+    )
+    resources = app.state.session_resource_registry
+    publish_exit = resources._terminal_exit_publisher
+    assert publish_exit is not None
+    publish_exit(
+        TerminalExitEvent(
+            session_id=session_id,
+            terminal_id="terminal_worker_main",
+            terminal_name="worker",
+            session_key="main",
+            lifecycle=TerminalLifecycle.REQUIRED,
+            session_was_idle=True,
+        )
+    )
+    release = next(
+        task
+        for task in asyncio.all_tasks()
+        if task.get_name() == f"required-terminal-release:{session_id}"
+    )
+    try:
+        if replacement in {"running_turn", "completed_turn"}:
+            app.state.turn_bind_epoch[session_id] = 1
+            if replacement == "running_turn":
+                app.state.live_response_id[session_id] = "replacement-response"
+        elif replacement == "terminal":
+            terminals._by_conversation[session_id] = {
+                ("worker", "main"): make_test_terminal_instance("worker", "main", tmp_path)
+            }
+        elif replacement == "app_server":
+            monkeypatch.setitem(orchestration._AUTO_CODEX_APP_SERVERS, session_id, object())
+        await asyncio.wait_for(release, timeout=budget(1.0))
+        keep_harness = replacement in {"running_turn", "completed_turn", "terminal"}
+        assert manager.released == ([] if keep_harness else [session_id])
+        assert manager.has_session(session_id) == keep_harness
+        if replacement is None:
+            teardown.assert_awaited_once_with(session_id)
+        else:
+            teardown.assert_not_awaited()
+    finally:
+        _session_event_queues_ref.pop(session_id, None)
+
+
+@pytest.mark.asyncio
 async def test_required_terminal_exit_publishes_deleted_and_failed(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -5207,11 +5365,13 @@ async def test_external_idle_status_makes_required_terminal_exit_clean(tmp_path:
         on_activity: object | None = None,
         on_exit: object | None = None,
         on_tick: object | None = None,
+        idle_poll_backoff_allowed: object | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
         replace: bool = False,
     ) -> None:
-        del on_idle, on_activity, on_tick, idle_threshold_s, poll_interval_s, replace
+        del on_idle, on_activity, on_tick, idle_poll_backoff_allowed
+        del idle_threshold_s, poll_interval_s, replace
         callbacks["on_exit"] = on_exit
 
     instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]

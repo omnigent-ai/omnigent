@@ -6,16 +6,19 @@ const vm = require("node:vm");
 
 const PRELOAD = fs.readFileSync(path.join(__dirname, "../src/preload.js"), "utf8");
 
-function loadPreload() {
+function loadPreload({ platform = "linux", fullScreen = false } = {}) {
   const exposed = new Map();
   const listeners = new Map();
+  const windowListeners = new Map();
   const invokes = [];
   const sends = [];
+  const attributes = new Set();
   let updateStatus = { state: "idle" };
   const ipcRenderer = {
     invoke: async (channel, args) => {
       invokes.push({ channel, args });
       if (channel === "omnigent:get-update-status") return updateStatus;
+      if (channel === "omnigent:is-full-screen") return fullScreen;
       return null;
     },
     send: (channel, args) => sends.push({ channel, args }),
@@ -26,12 +29,25 @@ function loadPreload() {
   };
   vm.runInNewContext(PRELOAD, {
     console,
-    process: { platform: "linux" },
+    process: { platform },
+    document: {
+      documentElement: {
+        style: { setProperty: () => {} },
+        toggleAttribute: (name, force) => {
+          if (force) attributes.add(name);
+          else attributes.delete(name);
+        },
+      },
+    },
+    window: {
+      addEventListener: (name, listener) => windowListeners.set(name, listener),
+    },
     require: (specifier) => {
       assert.equal(specifier, "electron");
       return {
         contextBridge: { exposeInMainWorld: (name, value) => exposed.set(name, value) },
         ipcRenderer,
+        webFrame: { getZoomFactor: () => 1 },
         webUtils: { getPathForFile: (file) => file.path },
       };
     },
@@ -42,11 +58,25 @@ function loadPreload() {
       updateStatus = status;
     },
     emit: (channel, payload) => listeners.get(channel)?.({}, payload),
+    emitWindow: (name) => windowListeners.get(name)?.(),
+    hasAttribute: (name) => attributes.has(name),
     hasListener: (channel) => listeners.has(channel),
     invokes,
     sends,
   };
 }
+
+describe("macOS fullscreen titlebar bridge", () => {
+  it("tracks native fullscreen state on initial load and shell events", async () => {
+    const h = loadPreload({ platform: "darwin", fullScreen: true });
+    h.emitWindow("DOMContentLoaded");
+    await Promise.resolve();
+    assert.equal(h.hasAttribute("data-electron-full-screen"), true);
+
+    h.emit("omnigent:full-screen-changed", false);
+    assert.equal(h.hasAttribute("data-electron-full-screen"), false);
+  });
+});
 
 describe("local folder bridge", () => {
   it("forwards the folder chooser and resolves dropped file paths", async () => {
@@ -126,6 +156,28 @@ describe("server-page update bridge", () => {
     assert.deepEqual(
       h.invokes
         .filter(({ channel }) => channel === "omnigent:browser-set-recent-session-switch-supported")
+        .map(({ args }) => args.supported),
+      [true, false],
+    );
+  });
+
+  it("forwards modifier-clicked link requests and advertises support", async () => {
+    const h = loadPreload();
+    const received = [];
+    const unsubscribe = h.desktop.onBrowserOpenTab((request) => received.push(request));
+
+    h.emit("browser-open-tab", { conversationId: "browser-tab:s:t", url: "https://example.com/" });
+    assert.deepEqual(received, [
+      { conversationId: "browser-tab:s:t", url: "https://example.com/" },
+    ]);
+    unsubscribe();
+    assert.equal(h.hasListener("browser-open-tab"), false);
+
+    await h.desktop.browserSetOpenTabSupported(true);
+    await h.desktop.browserSetOpenTabSupported(false);
+    assert.deepEqual(
+      h.invokes
+        .filter(({ channel }) => channel === "omnigent:browser-set-open-tab-supported")
         .map(({ args }) => args.supported),
       [true, false],
     );
@@ -254,5 +306,19 @@ describe("global show shortcut bridge", () => {
     assert.equal(h.invokes.at(-1).channel, "omnigent:record-global-shortcut");
     await h.desktop.cancelGlobalShortcutRecording();
     assert.equal(h.invokes.at(-1).channel, "omnigent:cancel-global-shortcut-recording");
+  });
+});
+
+describe("system dictation bridge", () => {
+  it("is exposed on macOS only", async () => {
+    assert.equal(loadPreload({ platform: "linux" }).desktop.startSystemDictation, undefined);
+    assert.equal(loadPreload({ platform: "win32" }).desktop.startSystemDictation, undefined);
+
+    const h = loadPreload({ platform: "darwin" });
+    await h.desktop.startSystemDictation();
+    assert.deepEqual(h.invokes.at(-1), {
+      channel: "omnigent:start-system-dictation",
+      args: undefined,
+    });
   });
 });

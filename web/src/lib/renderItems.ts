@@ -37,6 +37,7 @@ import {
 } from "./routingDecision";
 import type { AssistantMessagePhase } from "./conversationItems";
 import { isSystemUserContent } from "./systemMessage";
+import { repeatsTaskMarker } from "./taskActivity";
 import type { AgyPermission, CodexPersistMode, FileEditRequest, RememberScope } from "./types";
 import type { ActiveResponse } from "@/store/types";
 
@@ -161,6 +162,7 @@ export type RenderItem =
         cwd: string | null;
         reason: string | null;
         execPolicyAmendment: string[] | null;
+        requestFingerprint?: string | null;
       } | null;
       allowAllEdits?: boolean;
       allowAutoMode?: boolean;
@@ -179,6 +181,10 @@ export type Bubble =
       pending?: boolean;
       /** Pending input sent mid-turn that the agent hasn't read yet. */
       awaitingAgent?: boolean;
+      /** Pending input whose send request has not been answered for a while. */
+      stillSending?: boolean;
+      /** Pending input the server accepted (its send request succeeded). */
+      accepted?: boolean;
       /** Saved startup message the server never delivered (the launch failed). */
       undelivered?: boolean;
       content: MessageContentBlock[];
@@ -1691,17 +1697,18 @@ function buildAssistantItems(
       // reducer only ever emits one per group, but the schema permits
       // many — preserve that shape).
       for (const ex of b.executions) {
-        items.push(
-          toolItem(
-            ex,
-            b.ctx.itemId,
-            b.ctx.timestamp,
-            // Rid-scoped lookup: a reused callId can't adopt another turn's output.
-            crossBubbleResults.get(`${b.ctx.responseId}:${ex.callId}`),
-            lifecycle,
-            liveToolCallIds.has(ex.callId),
-          ),
+        const item = toolItem(
+          ex,
+          b.ctx.itemId,
+          b.ctx.timestamp,
+          // Rid-scoped lookup: a reused callId can't adopt another turn's output.
+          crossBubbleResults.get(`${b.ctx.responseId}:${ex.callId}`),
+          lifecycle,
+          liveToolCallIds.has(ex.callId),
         );
+        // A journal write the chat marks with a task or plan line gets no row of its own.
+        if (repeatsTaskMarker(ex.name, item.output, item.state === "input-available")) continue;
+        items.push(item);
       }
       i += 1;
       continue;
@@ -1930,7 +1937,7 @@ function toolItem(
   result: ToolResultBlock | undefined,
   lifecycle: ActiveResponse["state"],
   isLiveToolCall: boolean,
-): RenderItem {
+): Extract<RenderItem, { kind: "tool" }> {
   const output = result?.output ?? execution.output ?? null;
   const startedAt = startedAtTimestamp > 0 ? startedAtTimestamp : null;
   const duration =
@@ -2005,6 +2012,8 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
       a.itemId !== b.itemId ||
       Boolean(a.pending) !== Boolean(b.pending) ||
       Boolean(a.awaitingAgent) !== Boolean(b.awaitingAgent) ||
+      Boolean(a.stillSending) !== Boolean(b.stillSending) ||
+      Boolean(a.accepted) !== Boolean(b.accepted) ||
       Boolean(a.undelivered) !== Boolean(b.undelivered) ||
       a.createdBy !== b.createdBy ||
       a.createdAtS !== b.createdAtS ||

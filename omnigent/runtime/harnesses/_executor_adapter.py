@@ -18,7 +18,7 @@ import secrets
 import time
 import uuid
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from typing import Any
 
 from fastapi import Response
@@ -26,6 +26,7 @@ from fastapi import Response
 from omnigent.debug_logging import phase_scope
 from omnigent.errors import ElicitationDeclinedError, ErrorPhase
 from omnigent.harnesses.codex_native.shell_input import native_shell_authorization
+from omnigent.inner._subprocess_lifecycle import await_cleanup_task
 from omnigent.inner.executor import (
     CompactionComplete,
     CompactionStarted,
@@ -33,7 +34,10 @@ from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    ExecutorWait,
     InjectionDeliveryAmbiguous,
+    LiveMcpHarnessNotRunning,
+    LiveMcpServerStatus,
     Message,
     ReasoningChunk,
     SubAgentCompleted,
@@ -86,8 +90,11 @@ _MCP_TOOL_NAME_PREFIX = "mcp__"
 # starving the reap (subprocess-backed executors terminate only in close/close_session).
 # _INTERRUPT_SLICE_S must exceed _PiRpcSession.close()'s inner 2.0s process.wait() so the
 # slice never fires first and inject a CancelledError that bypasses the SIGKILL fallback.
-INTERRUPT_TIMEOUT_S = 3.0
 _INTERRUPT_SLICE_S = 3.0
+
+# How long a harness that keeps its native session may take to end an interrupted turn.
+# Stays under the runner's 3s interrupt POST so the clean stop lands before it cancels the turn.
+_INTERRUPT_SETTLE_TIMEOUT_S = 2.0
 
 # Interrupting an executor abandoned by an abnormal exit usually fails because the
 # harness is already gone -- that absence is what abandoned it. Its socket refuses or
@@ -152,6 +159,21 @@ def _is_host_tool(tool_name: str) -> bool:
     return _strip_mcp_tool_prefix(tool_name).startswith(_HOST_TOOL_PREFIX)
 
 
+def _keep_turn_usage(event: ExecutorEvent, ctx: TurnContext) -> None:
+    """
+    Keep the usage that an interrupted turn's event reports, for its terminal event.
+
+    An interrupted executor can still end its turn with the usage of the model
+    calls it made, such as the Claude CLI's final result. The server counts the
+    usage on ``response.cancelled`` too, so the session's cost includes them.
+
+    :param event: An event of the interrupted turn.
+    :param ctx: The turn's context, whose ``provider_usage`` the terminal event reads.
+    """
+    if isinstance(event, (TurnComplete, TurnCancelled, ExecutorError)) and event.usage is not None:
+        ctx.provider_usage = event.usage
+
+
 class InnerExecutorError(RuntimeError):
     """
     An executor-reported failure with a code or explicit delivery evidence.
@@ -197,9 +219,13 @@ class ExecutorAdapter(HarnessApp):
         executor_factory: Callable[[], Executor],
         session_key: str | None = None,
         harness_label: str = "Claude",
+        executor_factory_on_thread: bool = False,
     ) -> None:
         super().__init__()
         self._executor_factory = executor_factory
+        self._executor_factory_on_thread = executor_factory_on_thread
+        self._executor_factory_lock = asyncio.Lock()
+        self._shutdown_started = False
         self._session_key = session_key or uuid.uuid4().hex
         # Harness label used in elicitation messages, e.g. "Claude wants to call **Bash**".
         self._harness_label = harness_label
@@ -220,6 +246,9 @@ class ExecutorAdapter(HarnessApp):
         # until completion; drained before recovery and on shutdown.
         self._bg_tasks: set[asyncio.Task[bool]] = set()
         self._abandoned_executor_cleanup: asyncio.Task[bool] | None = None
+        # Set when the latest run_turn has unwound, so an interrupt can confirm the stop.
+        self._turn_finished = asyncio.Event()
+        self._turn_finished.set()
         # Consecutive orphaned-callback counter and reset guard for the Tier-1 SDK watchdog.
         self._orphan_callback_count = 0
         self._resyncing = False
@@ -243,11 +272,12 @@ class ExecutorAdapter(HarnessApp):
         Lazily constructs the executor on the first call; subsequent calls reuse the cached
         instance. Installs stable tool/elicitation/policy bridges once on first use.
         """
-        executor = self._ensure_executor()
+        executor = await self._ensure_executor_for_turn()
         messages = _translate_input_to_messages(
             request.input,
             include_tool_history=executor.replays_tool_history(),
             preserve_content_blocks=executor.preserves_message_content_blocks(),
+            preserve_empty_initiating_message=executor.preserves_empty_initiating_message(),
         )
         # Stamp session_key on every message so the inner executor keys its client consistently,
         # matching the key used by enqueue_session_message (steering delivery depends on this).
@@ -340,6 +370,8 @@ class ExecutorAdapter(HarnessApp):
 
         user_message = _extract_last_user_message(request.input)
 
+        turn_finished = asyncio.Event()
+        self._turn_finished = turn_finished
         # Watcher forwards mid-turn steering injections into the in-flight executor session.
         injection_watcher = asyncio.create_task(
             self._watch_injections(ctx, executor),
@@ -364,6 +396,18 @@ class ExecutorAdapter(HarnessApp):
                 log_input_event(
                     _logger, "native_input_execution_started", session_id=turn_session_id
                 )
+                if ctx.cancelled.is_set() and executor.resumes_after_interrupt():
+                    # Its interrupt arrived before this turn began, so nothing waited for it.
+                    log_input_event(
+                        _logger,
+                        "native_input_execution_finished",
+                        session_id=turn_session_id,
+                        outcome="cancelled",
+                    )
+                    input_outcome_logged = True
+                    _turn_outcome = "cancelled"
+                    clean_exit = True
+                    return
                 if tctx is not None:
                     agent_span = tctx.start_agent_span(
                         agent_name=request.model or "unknown",
@@ -372,12 +416,13 @@ class ExecutorAdapter(HarnessApp):
                     )
 
                 response_text: str | None = None
-                async for event in executor.run_turn(
+                turn_events = executor.run_turn(
                     messages=messages,
                     tools=tools,
                     system_prompt=system_prompt,
                     config=config,
-                ):
+                )
+                async for event in turn_events:
                     if ctx.cancelled.is_set():
                         log_input_event(
                             _logger,
@@ -396,7 +441,12 @@ class ExecutorAdapter(HarnessApp):
                         # the finally's _safe_interrupt fallback still fires.
                         await executor.interrupt_session(self._session_key)
                         _turn_outcome = "cancelled"
-                        clean_exit = True
+                        _keep_turn_usage(event, ctx)
+                        clean_exit = (
+                            await self._settle_interrupted_turn(event, turn_events, ctx)
+                            if executor.resumes_after_interrupt()
+                            else True
+                        )
                         return
                     # --- Tracing: emit spans per event ---
                     if tctx is not None:
@@ -461,6 +511,7 @@ class ExecutorAdapter(HarnessApp):
                         clean_exit = True
                         return
                     if isinstance(event, TurnCancelled):
+                        _keep_turn_usage(event, ctx)
                         log_input_event(
                             _logger,
                             "native_input_execution_finished",
@@ -516,13 +567,20 @@ class ExecutorAdapter(HarnessApp):
                                 undelivered=event.undelivered,
                             )
                         raise RuntimeError(f"inner executor error: {detail}")
+                # A kept native session can end its interrupted turn without another event.
+                interrupted_turn_ended = (
+                    ctx.cancelled.is_set() and executor.resumes_after_interrupt()
+                )
                 log_input_event(
                     _logger,
                     "native_input_execution_finished",
                     session_id=turn_session_id,
-                    outcome="executor_stream_ended",
+                    outcome="cancelled" if interrupted_turn_ended else "executor_stream_ended",
                 )
                 input_outcome_logged = True
+                if interrupted_turn_ended:
+                    _turn_outcome = "cancelled"
+                    clean_exit = True
         except ElicitationDeclinedError:
             if input_identity and not input_outcome_logged:
                 log_input_event(
@@ -597,26 +655,95 @@ class ExecutorAdapter(HarnessApp):
             if self._current_ctx is ctx:
                 self._current_ctx = None
                 self._current_agent = None
-            # Detach before background cleanup so a continuation cannot reuse this executor.
             if not clean_exit:
-                abandoned_executor = self._executor
-                self._executor = None
-                interrupt_task = asyncio.create_task(
-                    self._safe_interrupt(abandoned_executor, self._session_key)
-                )
-                self._abandoned_executor_cleanup = interrupt_task
-                self._bg_tasks.add(interrupt_task)
-                interrupt_task.add_done_callback(self._bg_tasks.discard)
+                self._abandon_executor(executor)
+            turn_finished.set()
+
+    def _abandon_executor(
+        self, executor: Executor, pending_interrupt: asyncio.Task[bool] | None = None
+    ) -> None:
+        """Detach *executor* and reap it in the background so no later turn can reuse it.
+
+        No-op once *executor* is detached: whoever detached it owns its teardown, and a
+        late-ending turn must not reap the executor that replaced it. The reap finishes
+        *pending_interrupt* instead of starting another interrupt.
+        """
+        if self._executor is not executor:
+            return
+        self._executor = None
+        cleanup = asyncio.create_task(
+            self._safe_interrupt(executor, self._session_key, pending_interrupt)
+        )
+        self._abandoned_executor_cleanup = cleanup
+        self._bg_tasks.add(cleanup)
+        cleanup.add_done_callback(self._bg_tasks.discard)
+
+    async def _settle_interrupted_turn(
+        self, event: ExecutorEvent, turn_events: AsyncIterator[ExecutorEvent], ctx: TurnContext
+    ) -> bool:
+        """Discard an interrupted turn's events, from *event* on, until its harness ends it.
+
+        Keeps the usage that the turn reports as it ends, as its model calls were spent.
+        Returns ``False`` when the turn does not end in time or reports a session-ending
+        error, so the caller drops the executor instead of resuming its native session.
+        """
+        try:
+            async with asyncio.timeout(_INTERRUPT_SETTLE_TIMEOUT_S):
+                while True:
+                    _keep_turn_usage(event, ctx)
+                    if isinstance(event, ExecutorError) and not event.preserve_session:
+                        _logger.warning(
+                            "interrupted turn of inner session %s ended with an error: %s",
+                            self._session_key,
+                            event.message,
+                        )
+                        return False
+                    event = await anext(turn_events)
+        except StopAsyncIteration:
+            return True
+        except Exception:
+            _logger.warning(
+                "interrupted turn of inner session %s did not end cleanly",
+                self._session_key,
+                exc_info=True,
+            )
+            return False
 
     async def _handle_interrupt_event(self) -> Response:
-        """Cancel the turn and drop the inner executor session synchronously.
+        """Cancel the turn and stop the inner executor's in-flight generation.
 
         Extends the base handler to also call ``interrupt_session`` — ensuring the in-flight
-        generation stops even when the run loop is blocked awaiting the first token.
+        generation stops even when the run loop is blocked awaiting the first token. When the
+        executor keeps its native session, waits for the turn to end so the next turn cannot
+        reach a session that is still running; an unconfirmed stop drops the executor at once
+        and reaps it in the background, so the response stays within the runner's deadline.
         """
         response = await super()._handle_interrupt_event()
-        if self._executor is not None:
-            await self._executor.interrupt_session(self._session_key)
+        executor = self._executor
+        if executor is None:
+            return response
+        if not executor.resumes_after_interrupt():
+            await executor.interrupt_session(self._session_key)
+            return response
+        turn_finished = self._turn_finished
+        # The deadline bounds only this response: cancelling the executor's fallback cleanup
+        # could skip its process kill, so a late interrupt keeps running for the reap.
+        interrupt = asyncio.create_task(executor.interrupt_session(self._session_key))
+        self._bg_tasks.add(interrupt)
+        interrupt.add_done_callback(self._bg_tasks.discard)
+        try:
+            async with asyncio.timeout(_INTERRUPT_SETTLE_TIMEOUT_S):
+                await asyncio.shield(interrupt)
+                await turn_finished.wait()
+        except Exception:
+            if interrupt.done() and turn_finished.is_set():
+                return response
+            _logger.warning(
+                "inner session %s did not confirm the interrupt; dropping it",
+                self._session_key,
+                exc_info=True,
+            )
+            self._abandon_executor(executor, interrupt)
         return response
 
     async def _prepare_turn_retry(self) -> bool:
@@ -624,12 +751,18 @@ class ExecutorAdapter(HarnessApp):
         cleanup = self._abandoned_executor_cleanup
         return cleanup is not None and await asyncio.shield(cleanup)
 
-    async def _safe_interrupt(self, executor: Executor | None, session_key: str) -> bool:
+    async def _safe_interrupt(
+        self,
+        executor: Executor | None,
+        session_key: str,
+        pending_interrupt: asyncio.Task[bool] | None = None,
+    ) -> bool:
         """Best-effort bounded interrupt + close of a detached abandoned executor.
 
         Scheduled from run_turn's finally and awaited before any recovery retry. The interrupt
         gets a short slice; the reap (close_session + close) always runs under its own budget so
-        a wedged interrupt can never starve the subprocess reap.
+        a wedged interrupt can never starve the subprocess reap. A *pending_interrupt* already
+        started by the interrupt handler is awaited in place of a new one, and never cancelled.
 
         An interrupt that only proves the harness is already gone
         (:data:`_HARNESS_ALREADY_GONE_ERRORS`) logs a warning naming the cause; every other
@@ -639,7 +772,10 @@ class ExecutorAdapter(HarnessApp):
             return True
         try:
             await asyncio.wait_for(
-                executor.interrupt_session(session_key), timeout=_INTERRUPT_SLICE_S
+                executor.interrupt_session(session_key)
+                if pending_interrupt is None
+                else asyncio.shield(pending_interrupt),
+                timeout=_INTERRUPT_SLICE_S,
             )
         except _HARNESS_ALREADY_GONE_ERRORS as exc:
             _logger.warning(
@@ -670,7 +806,7 @@ class ExecutorAdapter(HarnessApp):
             return closed
 
         try:
-            return await asyncio.wait_for(_reap(), timeout=INTERRUPT_TIMEOUT_S)
+            return await asyncio.wait_for(_reap(), timeout=executor.close_timeout())
         except Exception:
             _logger.exception("abandoned executor teardown failed or timed out")
             return False
@@ -716,7 +852,7 @@ class ExecutorAdapter(HarnessApp):
                         await exc.close()
 
                 with contextlib.suppress(Exception):
-                    await asyncio.wait_for(_close(), timeout=INTERRUPT_TIMEOUT_S)
+                    await asyncio.wait_for(_close(), timeout=executor.close_timeout())
         finally:
             self._resyncing = False
 
@@ -734,10 +870,9 @@ class ExecutorAdapter(HarnessApp):
             if injection is None:
                 # None signals a sentinel or protocol change; bail to avoid spinning.
                 return
-            content = (
-                _normalize_message_content(injection.input, preserve_content_blocks=True)
-                if executor.preserves_message_content_blocks()
-                else _extract_user_text(injection.input)
+            content = _extract_injection_content(
+                injection.input,
+                preserve_content_blocks=executor.preserves_message_content_blocks(),
             )
             if not content:
                 _logger.warning(
@@ -1063,6 +1198,26 @@ class ExecutorAdapter(HarnessApp):
         evaluation_id = f"poleval_{secrets.token_hex(16)}"
         return await ctx.evaluate_policy(evaluation_id, phase, data)
 
+    def supports_live_mcp_control(self) -> bool:
+        """Whether the inner executor reports its MCP connections.
+
+        Before the first turn builds the executor, nothing is connected yet, so
+        the harness answers as not running rather than unsupported.
+        """
+        return self._executor is None or self._executor.supports_live_mcp_control()
+
+    async def live_mcp_statuses(self) -> list[LiveMcpServerStatus] | None:
+        """The inner executor's MCP connections for this conversation."""
+        if self._executor is None:
+            return None
+        return await self._executor.live_mcp_statuses(self._session_key)
+
+    async def reconnect_live_mcp_server(self, name: str) -> None:
+        """Reconnect one of the inner executor's MCP servers for this conversation."""
+        if self._executor is None:
+            raise LiveMcpHarnessNotRunning
+        await self._executor.reconnect_live_mcp_server(self._session_key, name)
+
     def _ensure_executor(self) -> Executor:
         """
         Construct the inner executor on first use; return cached
@@ -1070,13 +1225,54 @@ class ExecutorAdapter(HarnessApp):
 
         :returns: The per-conversation inner :class:`Executor`.
         """
+        if self._shutdown_started:
+            raise RuntimeError("Executor adapter is shutting down")
         if self._executor is None:
             self._executor = self._executor_factory()
         return self._executor
 
+    async def _ensure_executor_for_turn(self) -> Executor:
+        if self._shutdown_started:
+            raise RuntimeError("Executor adapter is shutting down")
+        if not self._executor_factory_on_thread:
+            return self._ensure_executor()
+        async with self._executor_factory_lock:
+            if self._shutdown_started:
+                raise RuntimeError("Executor adapter is shutting down")
+            if self._executor is not None:
+                return self._executor
+            build_task = asyncio.create_task(asyncio.to_thread(self._executor_factory))
+            try:
+                executor = await asyncio.shield(build_task)
+            except BaseException:
+                # A cancelled turn still owns any proxy and launcher the factory created.
+                try:
+                    await await_cleanup_task(build_task)
+                except BaseException:
+                    pass
+                else:
+                    cleanup_task = asyncio.create_task(build_task.result().close())
+                    try:
+                        await await_cleanup_task(cleanup_task)
+                    except BaseException:
+                        _logger.exception("Failed to close executor built for a cancelled turn")
+                raise
+            if self._shutdown_started:
+                cleanup_task = asyncio.create_task(executor.close())
+                try:
+                    await await_cleanup_task(cleanup_task)
+                except BaseException:
+                    _logger.exception("Failed to close executor built during shutdown")
+                raise RuntimeError("Executor adapter is shutting down")
+            self._executor = executor
+            return executor
+
     def _translate_event(self, event: ExecutorEvent, ctx: TurnContext) -> None:
         """Translate one inner ExecutorEvent into Omnigent SSE events via ``ctx.emit``."""
-        if isinstance(event, TextChunk):
+        if isinstance(event, ExecutorWait):
+            if ctx._hold_idle_watchdog is not None:
+                ctx._hold_idle_watchdog()
+        elif isinstance(event, TextChunk):
             ctx.emit(
                 OutputTextDeltaEvent(
                     type="response.output_text.delta",
@@ -1216,6 +1412,7 @@ class ExecutorAdapter(HarnessApp):
             # Capture provider-reported usage for the response.completed payload.
             if event.usage is not None:
                 ctx.provider_usage = event.usage
+            ctx.native_acceptance = event.native_acceptance
         elif isinstance(event, CompactionStarted):
             from omnigent.server.schemas import CompactionInProgressEvent
 
@@ -1338,13 +1535,42 @@ class ExecutorAdapter(HarnessApp):
 
     async def on_shutdown(self) -> None:
         """Drain background interrupt tasks, then close the executor session and executor."""
-        if self._bg_tasks:
-            await asyncio.gather(*list(self._bg_tasks), return_exceptions=True)
-            self._bg_tasks.clear()
-        if self._executor is not None:
-            await self._executor.close_session(self._session_key)
-            await self._executor.close()
-            self._executor = None
+        self._shutdown_started = True
+
+        async def release_owned_resources() -> None:
+            first_error: BaseException | None = None
+            if self._bg_tasks:
+                try:
+                    await asyncio.gather(*list(self._bg_tasks), return_exceptions=True)
+                except BaseException as exc:
+                    first_error = exc
+                finally:
+                    self._bg_tasks.clear()
+            async with self._executor_factory_lock:
+                executor, self._executor = self._executor, None
+            if executor is not None:
+                try:
+                    await executor.close_session(self._session_key)
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+                try:
+                    await executor.close()
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+            if first_error is not None:
+                raise first_error
+
+        cleanup_task = asyncio.create_task(release_owned_resources())
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            try:
+                await await_cleanup_task(cleanup_task)
+            except BaseException:
+                _logger.warning("Executor adapter cleanup failed after cancellation")
+            raise
 
 
 def _classify_openai_exception(exception: BaseException) -> str | None:
@@ -1553,18 +1779,29 @@ def _extract_last_user_message(
     return last_user_text
 
 
-def _extract_user_text(
+def _extract_injection_content(
     input_value: str | list[dict[str, Any]],
-) -> str:
-    """Extract concatenated text from an injection input for ``enqueue_session_message``."""
-    if isinstance(input_value, str):
-        return input_value
-    parts: list[str] = []
-    for block in input_value:
-        text_value = block.get("text")
-        if isinstance(text_value, str):
-            parts.append(text_value)
-    return "\n".join(parts)
+    *,
+    preserve_content_blocks: bool,
+) -> str | list[dict[str, Any]]:
+    """Extract only the newest user input, preserving blocks for capable executors."""
+    content: Any = input_value
+    if isinstance(input_value, list) and any(_is_role_keyed_message(item) for item in input_value):
+        newest_user = next(
+            (
+                item
+                for item in reversed(input_value)
+                if _is_role_keyed_message(item) and item.get("role") == "user"
+            ),
+            None,
+        )
+        # A textless newest message must never replay an older user request.
+        content = newest_user.get("content") if newest_user is not None else None
+    if preserve_content_blocks:
+        return _normalize_message_content(content, preserve_content_blocks=True)
+    if isinstance(content, str):
+        return content
+    return _join_text_blocks(content) if isinstance(content, list) else ""
 
 
 def _translate_input_to_messages(
@@ -1572,6 +1809,7 @@ def _translate_input_to_messages(
     *,
     include_tool_history: bool = False,
     preserve_content_blocks: bool = False,
+    preserve_empty_initiating_message: bool = False,
 ) -> list[Message]:
     """Convert a CreateResponseRequest input to inner Message list.
 
@@ -1586,6 +1824,7 @@ def _translate_input_to_messages(
         input_value,
         include_tool_history=include_tool_history,
         preserve_content_blocks=preserve_content_blocks,
+        preserve_empty_initiating_message=preserve_empty_initiating_message,
     )
     if history_messages:
         return history_messages
@@ -1601,6 +1840,7 @@ def _extract_role_keyed_messages(
     *,
     include_tool_history: bool,
     preserve_content_blocks: bool,
+    preserve_empty_initiating_message: bool,
 ) -> list[Message]:
     """Extract role-keyed messages from an Omnigent input list.
 
@@ -1629,15 +1869,22 @@ def _extract_role_keyed_messages(
         if include_tool_history and item_type == "function_call_output":
             messages.append(_tool_result_message(item))
             continue
-        if item_type != "message" or "role" not in item:
+        if not _is_role_keyed_message(item):
             continue
         role = item["role"]
         content = _normalize_message_content(
             item.get("content"), preserve_content_blocks=preserve_content_blocks
         )
-        if not content:
+        is_initiating_user = role == "user" and item is input_value[-1]
+        # Opted-in executors need the empty item's identity and position.
+        if not content and not (is_initiating_user and preserve_empty_initiating_message):
             continue
-        messages.append({"role": role, "content": content})
+        message: Message = {"role": role, "content": content}
+        # Only the final input item can identify this turn. Filtered tool history
+        # must not make an older user message look like the initiating item.
+        if is_initiating_user:
+            message["input_item_id"] = item.get("id")
+        messages.append(message)
     return messages
 
 
@@ -1709,9 +1956,18 @@ def _normalize_message_content(
     )
     if has_multimodal:
         return content
+    return _join_text_blocks(content)
 
+
+def _is_role_keyed_message(item: Any) -> bool:
+    """Whether *item* is a conversation-shaped ``message`` item that carries a ``role``."""
+    return isinstance(item, dict) and item.get("type") == "message" and "role" in item
+
+
+def _join_text_blocks(blocks: list[Any]) -> str:
+    """Join the ``text`` of dict content blocks with newlines, skipping non-text blocks."""
     parts: list[str] = []
-    for block in content:
+    for block in blocks:
         if not isinstance(block, dict):
             continue
         text_value = block.get("text")

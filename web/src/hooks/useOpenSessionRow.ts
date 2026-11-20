@@ -4,6 +4,7 @@ import { type QueryClient, useQuery, useQueryClient } from "@tanstack/react-quer
 import { useCallback, useEffect, useSyncExternalStore } from "react";
 import type { Conversation } from "@/hooks/useConversations";
 import { authenticatedFetch } from "@/lib/identity";
+import { muteReadMarker, reconcileMuteLabel } from "@/lib/sessionMute";
 import { isOwnerLevel } from "@/lib/permissionsApi";
 import { sessionRoutingHostId, setSessionHost, setSessionParent } from "@/lib/sessionHost";
 import { findCachedListRow, LIST_ROW_QUERY_ROOTS } from "@/lib/sessionListCache";
@@ -16,8 +17,12 @@ import { findCachedListRow, LIST_ROW_QUERY_ROOTS } from "@/lib/sessionListCache"
  *
  * @param id - Session id, e.g. ``"conv_abc123"``.
  */
-export async function fetchConversationById(id: string): Promise<Conversation | null> {
+export async function fetchConversationById(
+  id: string,
+  queryClient?: QueryClient,
+): Promise<Conversation | null> {
   const params = new URLSearchParams({ include_items: "false", include_usage: "false" });
+  const readMarker = muteReadMarker();
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(id)}?${params}`);
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
@@ -26,33 +31,40 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
   // session-scoped requests key their replica off the host map.
   setSessionHost(wire.id, sessionRoutingHostId(wire.host_id, wire.labels));
   setSessionParent(wire.id, wire.parent_session_id, wire.labels);
-  return {
-    id: wire.id,
-    object: "conversation",
-    title: wire.title ?? null,
-    created_at: wire.created_at,
-    updated_at: wire.updated_at ?? wire.created_at,
-    labels: wire.labels ?? {},
-    permission_level: wire.permission_level ?? null,
-    owner: wire.owner ?? null,
-    runner_id: wire.runner_id ?? null,
-    host_id: wire.host_id ?? null,
-    workspace: wire.workspace ?? null,
-    agent_id: wire.agent_id,
-    agent_name: wire.agent_name ?? null,
-    harness: wire.harness ?? null,
-    // The detail response lists the outstanding prompts instead of counting them.
-    pending_elicitations_count: Array.isArray(wire.pending_elicitations)
-      ? wire.pending_elicitations.length
-      : 0,
-    status: wire.status ?? "idle",
-    runner_online: wire.runner_online ?? undefined,
-    host_online: wire.host_online ?? undefined,
-    git_branch: wire.git_branch ?? null,
-    archived: wire.archived ?? false,
-    parent_session_id: wire.parent_session_id ?? null,
-    project_id: wire.project_id ?? null,
-  };
+  return reconcileMuteLabel<Conversation>(
+    {
+      id: wire.id,
+      object: "conversation",
+      title: wire.title ?? null,
+      created_at: wire.created_at,
+      updated_at: wire.updated_at ?? wire.created_at,
+      labels: wire.labels ?? {},
+      permission_level: wire.permission_level ?? null,
+      family: wire.family,
+      owner:
+        wire.owner ??
+        queryClient?.getQueryData<Conversation | null>(["conversation-backfill", id])?.owner ??
+        null,
+      runner_id: wire.runner_id ?? null,
+      host_id: wire.host_id ?? null,
+      workspace: wire.workspace ?? null,
+      agent_id: wire.agent_id,
+      agent_name: wire.agent_name ?? null,
+      harness: wire.harness ?? null,
+      // The detail response lists the outstanding prompts instead of counting them.
+      pending_elicitations_count: Array.isArray(wire.pending_elicitations)
+        ? wire.pending_elicitations.length
+        : 0,
+      status: wire.status ?? "idle",
+      runner_online: wire.runner_online ?? undefined,
+      host_online: wire.host_online ?? undefined,
+      git_branch: wire.git_branch ?? null,
+      archived: wire.archived ?? false,
+      parent_session_id: wire.parent_session_id ?? null,
+      project_id: wire.project_id ?? null,
+    },
+    readMarker,
+  );
 }
 
 /**
@@ -106,17 +118,7 @@ export function useOpenSessionRow(id: string | null): Conversation | null {
     staleTime: 30_000,
     // A 404 resolves to null and is not retried; a failed request is.
     retry: 2,
-    queryFn: async () => {
-      const fetched = await fetchConversationById(id as string);
-      // The detail response has no owner, so keep the one a list row gave.
-      const knownOwner = queryClient.getQueryData<Conversation | null>([
-        "conversation-backfill",
-        id,
-      ])?.owner;
-      return fetched && fetched.owner === null && knownOwner
-        ? { ...fetched, owner: knownOwner }
-        : fetched;
-    },
+    queryFn: () => fetchConversationById(id as string, queryClient),
   });
   const row = listRow ?? data;
   if (id === null || !row || row.id !== id) return null;

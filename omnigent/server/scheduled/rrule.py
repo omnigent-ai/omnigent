@@ -11,7 +11,9 @@ timezone), so occurrence phase is deterministic: an hourly rule fires on the
 hour, a daily rule at its ``BYHOUR``/``BYMINUTE``. :func:`validate_rrule`
 additionally enforces a minimum interval based on execution target and session mode and
 rejects rules that never fire or fire only once within the search window — each
-fire starts or continues real agent work, so a runaway cadence is expensive.
+fire starts or continues real agent work, so a runaway cadence is expensive. A
+caller whose scheduler counts ``COUNT`` from the task's creation can opt in to
+one-time schedules, which must say so with an explicit ``COUNT=1``.
 
 Schedules use a single rule, at most 24 distinct values per BY field and 24 time
 combinations, an eight-year occurrence horizon, and work and elapsed-time limits.
@@ -267,12 +269,30 @@ def _parse(
         raise RRuleValidationError(f"Invalid RRULE {rule_str!r}: {exc}") from exc
 
 
+_COUNT_ONE_RE = re.compile(r"(?:^|;)COUNT=0*1(?:;|$)")
+
+
+def is_one_time_rule(rule_str: str) -> bool:
+    """Whether a rule asks for exactly one occurrence with an explicit ``COUNT=1``.
+
+    A rule that fires once only because of a tight ``UNTIL`` is not one: requiring
+    ``COUNT=1`` keeps the "fires only once" check for misconfigured recurrences.
+
+    :param rule_str: An RFC 5545 recurrence rule, e.g.
+        ``"FREQ=YEARLY;BYMONTH=11;BYMONTHDAY=12;BYHOUR=15;BYMINUTE=0;COUNT=1"``.
+    :returns: ``True`` when the rule carries ``COUNT=1``.
+    """
+    text = rule_str.strip().upper().removeprefix("RRULE:").replace(" ", "")
+    return _COUNT_ONE_RE.search(text) is not None
+
+
 def validate_rrule(
     rule_str: str,
     tz: ZoneInfo | None = None,  # noqa: ARG001
     *,
     session_mode: str = "new",
     execution_target: str | None = None,
+    allow_single_fire: bool = False,
 ) -> RRuleTrigger:
     """Parse and validate an RRULE string for use as a recurring trigger.
 
@@ -291,6 +311,10 @@ def validate_rrule(
     :param session_mode: Continued sessions permit the ten-minute minimum.
     :param execution_target: Connected hosts also permit ten-minute new sessions.
         Omit to retain the conservative new-session hourly floor.
+    :param allow_single_fire: Accept a rule with an explicit ``COUNT=1``, e.g. a
+        reminder. Only the database scheduler, which counts ``COUNT`` from the
+        task's creation, may pass ``True``: the legacy timer counts from midnight
+        of each re-arm, so a one-time rule would fire again after a restart.
     :returns: An :class:`RRuleTrigger`.
     :raises RRuleValidationError: On bad syntax, never-fires, fires-once, or a
         sub-minimum interval.
@@ -320,7 +344,9 @@ def validate_rrule(
     if count == 0:
         raise RRuleValidationError("RRULE never fires")
     if count == 1:
-        raise RRuleValidationError("RRULE fires only once")
+        if not (allow_single_fire and is_one_time_rule(rule_str)):
+            raise RRuleValidationError("RRULE fires only once")
+        return RRuleTrigger(rule=rule_str)
     minimum = (
         MIN_SUBHOUR_INTERVAL_SECONDS
         if session_mode == "continue" or execution_target == "connected_host"

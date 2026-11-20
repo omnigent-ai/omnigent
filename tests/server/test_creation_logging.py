@@ -310,3 +310,22 @@ async def test_bundle_creation_links_persistence_before_launch_failure(
     end = next(row for row in rows if row["event_name"] == final_name)
     assert end["session_id"] == created[0]["session_id"]
     assert (response.status_code >= 400) is managed
+
+
+@pytest.mark.parametrize("creator", [None, "manager"])
+def test_independent_creation_reports_authorized_creator(creator: str | None) -> None:
+    debug_logging.reset_request_audit_attrs()
+    try:
+        creation_logging.creation_metadata(
+            parent_session_id=None, host_type="managed", created_by_session_id=creator
+        )
+        with capture_debug_rows("server") as rows:
+            creation_logging.session_created("worker", created_by_session_id=creator)
+        attrs = rows[0]["attributes"]
+        assert attrs.get("created_by_session_id") == creator
+        assert "parent_session_id" not in attrs
+        assert attrs["session_kind"] == "default"
+        assert debug_logging.current_request_audit_attrs().get("created_by_session_id") == creator
+    finally:
+        debug_logging.reset_request_audit_attrs()
+        debug_logging.set_current_session_id(None)

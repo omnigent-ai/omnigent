@@ -6,10 +6,10 @@ Covers the runner-side half of the feature:
   server ``/browser/action_request`` route — correct URL / ``action`` /
   ``args`` payload, verbatim JSON passthrough, and the clean timeout
   error on ``httpx.ReadTimeout``.
-- Registration in ``omnigent.tools.builtins``: the five ``browser_*``
+- Registration in ``omnigent.tools.builtins``: the ``browser_*``
   names are always registered.
 - Native-relay exposure: ``build_native_relay_tool_schemas`` surfaces the
-  five ``browser_*`` schemas when the spec declares them — native
+  ``browser_*`` schemas when the spec declares them — native
   harnesses see the relay as their only tool surface, so a miss here
   means the feature is dead on the desktop app.
 """
@@ -113,14 +113,8 @@ async def test_browser_tool_posts_action_request_with_stripped_prefix() -> None:
 
 @pytest.mark.asyncio
 async def test_browser_tool_strips_prefix_for_every_action() -> None:
-    """Each of the five tools maps to the correct wire ``action``."""
-    expected = {
-        "browser_navigate": "navigate",
-        "browser_snapshot": "snapshot",
-        "browser_click": "click",
-        "browser_type": "type",
-        "browser_screenshot": "screenshot",
-    }
+    """Each browser tool maps to the correct wire ``action``."""
+    expected = {name: name.removeprefix("browser_") for name in _EXPECTED_BROWSER_NAMES}
     for tool_name, action in expected.items():
         client = _RecordingClient()
         await _execute_browser_tool(tool_name, {}, server_client=client, conversation_id="conv_x")
@@ -192,16 +186,26 @@ async def test_browser_tool_requires_server_and_session() -> None:
 
 _EXPECTED_BROWSER_NAMES = {
     "browser_navigate",
+    "browser_go_back",
+    "browser_go_forward",
+    "browser_reload",
+    "browser_tabs",
     "browser_snapshot",
     "browser_click",
+    "browser_hover",
+    "browser_drag",
+    "browser_scroll",
     "browser_type",
+    "browser_press_key",
+    "browser_select_option",
+    "browser_check",
     "browser_screenshot",
 }
 
 
 def test_browser_names_reserved_framework_owned() -> None:
     """
-    The five ``browser_*`` names are reserved in the builtin registry so
+    The ``browser_*`` names are reserved in the builtin registry so
     user specs can't shadow them, but they are FRAMEWORK-OWNED — like
     ``list_comments`` / ``update_comment``, they are NOT instantiable via
     ``get_builtin_tool`` (registration is ToolManager's job). This pins
@@ -218,7 +222,7 @@ def test_browser_names_reserved_framework_owned() -> None:
 def test_toolmanager_always_registers_browser_tools() -> None:
     """
     EVERY session — even a spec with NO ``tools.builtins`` declared — has
-    all five ``browser_*`` tools registered on its ToolManager. This is
+    all ``browser_*`` tools registered on its ToolManager. This is
     the invariant the earlier per-spec registration missed (agents fell
     back to WebFetch because no shipped spec declared browser_*).
     """
@@ -243,7 +247,7 @@ def test_browser_tools_in_native_relay_union() -> None:
 
 def test_native_relay_includes_browser_for_bare_spec() -> None:
     """
-    A spec with NO ``tools.builtins`` still surfaces all five
+    A spec with NO ``tools.builtins`` still surfaces all the
     ``browser_*`` schemas on the native relay — because ToolManager
     always registers them, the relay (which filters ToolManager's
     schemas by the union) always emits them. The desktop app runs native
@@ -286,7 +290,7 @@ def test_strip_browser_tool_schemas_drops_nested_and_flat_shapes() -> None:
 
 
 def test_strip_browser_tool_schemas_covers_every_browser_name() -> None:
-    """All five ``browser_*`` names are stripped, none survives."""
+    """All ``browser_*`` names are stripped, none survives."""
     schemas = [{"type": "function", "function": {"name": n}} for n in sorted(_BROWSER_TOOLS)]
     schemas.append({"type": "function", "function": {"name": "keepme"}})
     kept = strip_browser_tool_schemas(schemas)

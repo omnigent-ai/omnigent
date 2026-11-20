@@ -175,7 +175,7 @@ jobs:
           # Namespaced away from e2e-ui.yml's host venv: this venv is built with
           # the container's system Python (different interpreter path), so they
           # must not share a key or a cross-restore would mismatch.
-          key: venv-uisnapshot-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
+          key: venv-uisnapshot-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}-${{ hashFiles('uv.toml') }}
 
       - name: Install project + test dependencies
         run: uv sync --extra all --group test

@@ -24,7 +24,7 @@ Two design points this exercises end-to-end that the unit test cannot:
 No LLM turn is needed — this is pure client-side keyboard + layout state — so
 it skips the nightly/real-agent markers the approval suites carry. The seeded
 session renders both rails on the desktop viewport these tests run at: the
-sidebar defaults open (``min-width: 768px``), the Workspace rail defaults open
+sidebar defaults open (``min-width: 1181px``), the Workspace rail defaults open
 and always has content (the Agents tab is unconditional).
 """
 
@@ -149,15 +149,15 @@ def test_sidebar_peek_is_opaque_in_dark_mode(
     page.get_by_role("button", name="Open sidebar").hover()
     expect(conversations).to_have_class(_PEEK_CLASS)
 
-    colors = conversations.evaluate(
-        """element => {
+    expected_color = page.evaluate(
+        """() => {
           const probe = document.createElement("div");
           probe.style.backgroundColor = "var(--card-solid)";
           document.body.appendChild(probe);
           const expected = getComputedStyle(probe).backgroundColor;
-          const actual = getComputedStyle(element).backgroundColor;
           probe.remove();
-          return { actual, expected };
+          return expected;
         }"""
     )
-    assert colors["actual"] == colors["expected"]
+    # The peek class can be present before its background transition settles.
+    expect(conversations).to_have_css("background-color", expected_color)
