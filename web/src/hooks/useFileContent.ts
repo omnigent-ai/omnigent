@@ -245,13 +245,13 @@ function imageExtensions(type: string): readonly string[] | undefined {
 function withImageExtension(name: string, type: string): string {
   const extensions = imageExtensions(type);
   if (!extensions) return name;
-  const extension = /\.([^./\s]+)$/.exec(name)?.[1].toLowerCase();
+  const extension = name.match(/\.([^./\s]+)$/)?.[1].toLowerCase();
   return extension && extensions.includes(extension) ? name : `${name}.${extensions[0]}`;
 }
 
 /** The type a `data:` URL declares, e.g. ``"image/png"``; undefined for other sources. */
 function dataUrlType(src: string): string | undefined {
-  return /^data:([^;,]*)/i.exec(src)?.[1];
+  return src.match(/^data:([^;,]*)/i)?.[1];
 }
 
 /** Only the app's own API is re-read; anything else would be a new request elsewhere. */
