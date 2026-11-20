@@ -2974,20 +2974,22 @@ async def test_on_runner_connect_defers_idle_tree_initialization_until_demand(
 
 
 @pytest.mark.asyncio
-async def test_on_runner_connect_logs_deferred_init_event_for_idle_and_archived(
+async def test_on_runner_connect_logs_deferred_init_events(
     db_uri: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Reconnect logs runner_session_init_deferred event with reason for idle/archived sessions."""
+    """Reconnect defers idle, archived, and sign-in-refused sessions and logs each reason."""
     from omnigent.entities import Conversation
     from omnigent.runner.routing import RoutedRunner
     from omnigent.server.routes import sessions as sessions_routes
 
     app, captured = _build_minimal_app(db_uri, tmp_path, monkeypatch)
     runner_id = "runner_deferred_event_test"
-    idle_id, archived_id, active_id = _bind_sessions(db_uri, runner_id, count=3)
+    idle_id, archived_id, active_id, sign_in_id, failed_id = _bind_sessions(
+        db_uri, runner_id, count=5
+    )
     store = SqlAlchemyConversationStore(db_uri)
     idle = store.get_conversation(idle_id)
     archived = store.get_conversation(archived_id)
@@ -2997,6 +2999,18 @@ async def test_on_runner_connect_logs_deferred_init_event_for_idle_and_archived(
     store.set_session_live_status(archived.id, "running")
     store.update_conversation(archived.id, archived=True)
     store.set_session_live_status(active.id, "running")
+    for session_id, code in (
+        (sign_in_id, "databricks_sign_in_pending"),
+        (failed_id, "codex_turn_error"),
+    ):
+        store.set_session_live_status(session_id, "failed")
+        store.set_labels(
+            session_id,
+            {
+                "omnigent.last_task_error_code": code,
+                "omnigent.last_task_error_message": "The turn failed.",
+            },
+        )
     connection = _attach_live_connection(app, monkeypatch, runner_id)
     monkeypatch.setattr(
         app.state.tunnel_registry, "get", lambda rid: connection if rid == runner_id else None
@@ -3026,14 +3040,15 @@ async def test_on_runner_connect_logs_deferred_init_event_for_idle_and_archived(
         if r.name == "omnigent.server.app"
         and getattr(r, "event_name", "") == "runner_session_init_deferred"
     ]
-    # Check we have events for idle and archived sessions, but not active
-    assert len(deferred_events) == 2
+    assert len(deferred_events) == 3
     messages = {r.getMessage() for r in deferred_events}
-    # Verify both idle and archived session IDs appear in the logs with the right reason
     assert any(f"session={idle.id}" in msg and "reason=idle" in msg for msg in messages)
     assert any(f"session={archived.id}" in msg and "reason=archived" in msg for msg in messages)
-    # Verify active session does not have a deferred event
+    assert any(
+        f"session={sign_in_id}" in msg and "reason=sign_in_pending" in msg for msg in messages
+    )
     assert not any(f"session={active.id}" in msg for msg in messages)
+    assert not any(f"session={failed_id}" in msg for msg in messages)
     decisions = {
         record.session_id: record.attributes
         for record in caplog.records
@@ -3047,6 +3062,10 @@ async def test_on_runner_connect_logs_deferred_init_event_for_idle_and_archived(
     assert decisions[archived.id]["reason"] == "archived"
     assert decisions[archived.id]["archived"] is True
     assert decisions[active.id]["decision"] == "initialize_now"
+    assert decisions[sign_in_id]["decision"] == "defer"
+    assert decisions[sign_in_id]["has_last_task_error"] is True
+    assert decisions[failed_id]["decision"] == "initialize_now"
+    assert decisions[failed_id]["reason"] == "recovery_required"
     for attrs in decisions.values():
         assert attrs["runner_generation"] == 1
         assert attrs["runner_id"] == runner_id
