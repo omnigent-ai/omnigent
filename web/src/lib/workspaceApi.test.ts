@@ -322,6 +322,7 @@ describe("readFileViaWorkspaceApi", () => {
                 path: "src/a",
                 type: EntryType.DIRECTORY,
                 modifyTime: { seconds: 1700000000n },
+                leafDirectoryPath: "src/a/b",
               },
             ],
             nextPageToken: "src/a",
@@ -343,6 +344,7 @@ describe("readFileViaWorkspaceApi", () => {
           type: "directory",
           bytes: null,
           modified_at: 1700000000,
+          leaf_directory_path: "src/a/b",
         },
         {
           id: "src/b.ts",

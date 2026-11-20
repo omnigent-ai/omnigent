@@ -24,7 +24,7 @@ import {
   useWorkspaceEnvironment,
   useWorkspaceServeable,
 } from "@/hooks/useWorkspaceChangedFiles";
-import { useFileDiff } from "./useFileDiff";
+import { fetchFileDiff, fileDiffQueryKey, useFileDiff } from "./useFileDiff";
 
 const serveableMock = vi.mocked(useWorkspaceServeable);
 const changedFilesMock = vi.mocked(useWorkspaceChangedFiles);
@@ -311,5 +311,25 @@ describe("useFileDiff — error handling", () => {
     expect(result.current.error).toMatchObject({
       message: "git status timed out after 5.0s",
     });
+  });
+});
+
+describe("fetchFileDiff", () => {
+  it("reads one file's diff, and can be cancelled", async () => {
+    fetchMock.mockResolvedValue(mockResponse({ path: "a.ts", before: "old", after: "new" }));
+    const controller = new AbortController();
+
+    expect(await fetchFileDiff("conv_1", "src/a.ts", controller.signal)).toMatchObject({
+      after: "new",
+    });
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(String(url)).toContain(
+      "/v1/sessions/conv_1/resources/environments/default/diff/src/a.ts",
+    );
+    expect((init as RequestInit | undefined)?.signal).toBe(controller.signal);
+  });
+
+  it("keys every diff surface's cache the same way", () => {
+    expect(fileDiffQueryKey("conv_1", "a.ts")).toEqual(["file-diff", "conv_1", "a.ts"]);
   });
 });
