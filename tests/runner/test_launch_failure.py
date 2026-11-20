@@ -769,6 +769,13 @@ def test_content_policy_refusal_diagnosis_explains_the_block_and_recovery() -> N
         "I can't help with this request right now.",
         "API Error: 400 Usage policy violation detected in tool schema",
         "The reply said the prompt appears to violate our Usage Policy, so I rephrased it.",
+        "The terminal printed 'safeguards flagged this message' on an earlier turn.",
+        *(
+            f'The terminal previously printed "{message}".'
+            for message in _CONTENT_POLICY_REFUSAL_OUTPUTS
+        ),
+        *(f'"{message}"' for message in _CONTENT_POLICY_REFUSAL_OUTPUTS),
+        *(f"```text\n{message}\n```" for message in _CONTENT_POLICY_REFUSAL_OUTPUTS),
         _GATEWAY_499_OUTPUT,
         "",
     ],

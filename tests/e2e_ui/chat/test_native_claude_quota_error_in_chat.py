@@ -191,16 +191,18 @@ def _expand_pill(page: Page) -> str:
     return body.inner_text() if body.count() else ""
 
 
-def _save_evidence(name: str, payload: object) -> None:
+def _save_evidence(case_id: str, name: str, payload: object) -> None:
     if evidence_dir := os.environ.get("E2E_SCREENSHOT_DIR"):
-        Path(evidence_dir).mkdir(parents=True, exist_ok=True)
-        (Path(evidence_dir) / name).write_text(json.dumps(payload, indent=2, default=str))
+        destination = Path(evidence_dir) / case_id
+        destination.mkdir(parents=True, exist_ok=True)
+        (destination / name).write_text(json.dumps(payload, indent=2, default=str))
 
 
-def _screenshot(page: Page, name: str) -> None:
+def _screenshot(page: Page, case_id: str, name: str) -> None:
     if screenshot_dir := os.environ.get("E2E_SCREENSHOT_DIR"):
-        Path(screenshot_dir).mkdir(parents=True, exist_ok=True)
-        page.screenshot(path=str(Path(screenshot_dir) / name))
+        destination = Path(screenshot_dir) / case_id
+        destination.mkdir(parents=True, exist_ok=True)
+        page.screenshot(path=str(destination / name))
 
 
 @pytest.mark.nightly
@@ -256,6 +258,7 @@ def test_native_claude_provider_error_surfaces_in_chat_as_classified_pill(
     :param retry_buttons: Expected number of Retry buttons on the pill.
     """
     base_url, session_id = native_claude_mock_session
+    case_id = request.node.callspec.id
     _log.info("claude-native session %s on %s", session_id, base_url)
     reset_mock_llm(mock_llm_server_url)
 
@@ -267,7 +270,7 @@ def test_native_claude_provider_error_surfaces_in_chat_as_classified_pill(
     page.wait_for_timeout(8_000)
     idle_pane = _terminal_screen_text(base_url, session_id)
     _log.info("idle pane:\n%s", idle_pane)
-    _screenshot(page, "1-terminal-idle.png")
+    _screenshot(page, case_id, "1-terminal-idle.png")
     _select_view_mode(page, "Chat")
 
     # The provider rejects every request from here on.
@@ -282,7 +285,7 @@ def test_native_claude_provider_error_surfaces_in_chat_as_classified_pill(
     composer.fill(prompt)
     page.get_by_role("button", name="Send", exact=True).click()
     expect(page.locator(_USER, has_text=prompt)).to_have_count(1, timeout=60_000)
-    _screenshot(page, "2-chat-sent.png")
+    _screenshot(page, case_id, "2-chat-sent.png")
 
     requests_seen = _wait_until_claude_gives_up(page, mock_llm_server_url, baseline) - baseline
     _log.info("Claude Code gave up after %d provider requests", requests_seen)
@@ -293,7 +296,7 @@ def test_native_claude_provider_error_surfaces_in_chat_as_classified_pill(
     page.wait_for_timeout(3_000)
     failed_pane = _terminal_screen_text(base_url, session_id)
     _log.info("pane after failure:\n%s", failed_pane)
-    _screenshot(page, "3-terminal-api-error.png")
+    _screenshot(page, case_id, "3-terminal-api-error.png")
     page.wait_for_timeout(_HOLD_MS)
     items = _transcript_items(base_url, session_id)
 
@@ -303,10 +306,10 @@ def test_native_claude_provider_error_surfaces_in_chat_as_classified_pill(
     expect(page.locator(_USER, has_text=prompt)).to_be_visible(timeout=30_000)
     page.wait_for_timeout(3_000)
     live_state = _pill_state(page)
-    _screenshot(page, "4-chat-after-failure.png")
+    _screenshot(page, case_id, "4-chat-after-failure.png")
     live_expanded = _expand_pill(page)
     page.wait_for_timeout(_HOLD_MS)
-    _screenshot(page, "5-chat-pill-expanded.png")
+    _screenshot(page, case_id, "5-chat-pill-expanded.png")
 
     page.reload()
     if page.get_by_test_id("view-mode-toggle").count():
@@ -314,10 +317,11 @@ def test_native_claude_provider_error_surfaces_in_chat_as_classified_pill(
     expect(page.locator(_USER, has_text=prompt)).to_be_visible(timeout=30_000)
     page.wait_for_timeout(3_000)
     reloaded_state = _pill_state(page)
-    _screenshot(page, "6-chat-after-reload.png")
+    _screenshot(page, case_id, "6-chat-after-reload.png")
     page.wait_for_timeout(_HOLD_MS)
 
     _save_evidence(
+        case_id,
         "evidence.json",
         {
             "session_id": session_id,

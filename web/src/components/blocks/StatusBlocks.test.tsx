@@ -630,15 +630,11 @@ describe("ErrorBanner", () => {
     expect(screen.getByRole("button", { name: "View diagnostics" })).toBeInTheDocument();
   });
 
-  it("does not invent retry for non-retryable variants", () => {
-    render(
-      <ErrorBanner
-        message="The conversation is too long."
-        source="llm"
-        code="context_length_exceeded"
-        onRetry={vi.fn()}
-      />,
-    );
+  it.each([
+    { code: "context_length_exceeded", message: "The conversation is too long." },
+    { code: "content_policy_refusal", message: "The model's safeguards blocked this message." },
+  ])("does not invent retry for the $code variant", ({ code, message }) => {
+    render(<ErrorBanner message={message} source="llm" code={code} onRetry={vi.fn()} />);
     expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
   });
 

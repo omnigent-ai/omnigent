@@ -360,9 +360,10 @@ _CLIENT_UPDATE_REQUIRED = re.compile(
 # Claude Code's reply when the model's safeguards refuse a request (``stop_reason: refusal``),
 # in its current and older wordings. The request succeeded, so the text has no HTTP status.
 _CONTENT_POLICY_REFUSAL = re.compile(
-    r"safeguards flagged this message"
-    r"|can['’]t help with this\. Start a new session to continue"
-    r"|unable to respond to this request, which appears to violate our Usage Policy",
+    r"\A\s*(?:API Error:\s+[^\r\n]+?(?:['’]s safeguards flagged this message\b"
+    r"| can['’]t help with this\. Start a new session to continue\b)"
+    r"|(?:API Error:\s+)?Claude Code is unable to respond to this request, "
+    r"which appears to violate our Usage Policy\b)",
     re.IGNORECASE,
 )
 # Codex's report that a model provider's ``auth.command`` gave it no token, e.g.
