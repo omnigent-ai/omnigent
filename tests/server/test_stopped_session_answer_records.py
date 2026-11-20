@@ -469,15 +469,16 @@ def _check_request(
     return Request({"type": "http", "method": "POST", "path": "/", "headers": [], "app": app})
 
 
-@pytest.mark.parametrize("own_stamp", [False, True])
+@pytest.mark.parametrize(("own_stamp", "hostless"), [(False, False), (True, False), (False, True)])
 async def test_a_runner_live_on_another_replica_skips_the_wait(
-    monkeypatch: pytest.MonkeyPatch, own_stamp: bool
+    monkeypatch: pytest.MonkeyPatch, own_stamp: bool, hostless: bool
 ) -> None:
     """A stamp newer than this process wrote means a sibling holds the runner; its own does not."""
     from omnigent.server import session_live_state
+    from omnigent.server.routes import sessions as sessions_module
 
     stamp = int(time.time())
-    conv = _bound_conv(runner_last_seen=stamp)
+    conv = _bound_conv(runner_last_seen=stamp, **({"host_id": None} if hostless else {}))
     if own_stamp:
         monkeypatch.setitem(session_live_state._last_liveness_stamp, "runner_bound", stamp)
     waits: list[object] = []
@@ -487,6 +488,9 @@ async def test_a_runner_live_on_another_replica_skips_the_wait(
         waits.append(True)
 
     request = _check_request(monkeypatch, _wait)
+    if hostless:
+        # The sibling check does not need a host or a grace.
+        monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
     rows = _Rows(_bound_conv())
     reachable = await orchestration._session_runner_reachable(
         request, conv.id, conv, None, cast("Any", rows), RunnerExitReports()
@@ -522,19 +526,27 @@ async def test_a_runner_that_moves_during_the_wait_takes_the_answer(
     assert rows.reads == 1
 
 
-@pytest.mark.parametrize("case", ["still_bound", "rebound", "wrong_replica"])
+@pytest.mark.parametrize(
+    "case", ["still_bound", "runtime_support", "rebound", "row_gone", "row_error", "wrong_replica"]
+)
 async def test_an_admission_error_after_the_runner_connects_keeps_the_hook(
     monkeypatch: pytest.MonkeyPatch, case: str
 ) -> None:
     """Admission fails only after the tunnel connected; other errors, or a rebound row, raise."""
+    from omnigent.server.runtime_compatibility import RuntimeSupportError
+
     conv = _bound_conv()
     rows = _Rows(conv if case != "rebound" else _bound_conv(runner_id="runner_new"))
-    code = (
-        ErrorCode.WRONG_REPLICA
-        if case == "wrong_replica"
-        else ErrorCode.RUNNER_CAPABILITY_MISMATCH
+    if case == "row_gone":
+        rows.row = None
+    elif case == "row_error":
+        rows.error = RuntimeError("store down")
+    mismatch = ErrorCode.RUNNER_CAPABILITY_MISMATCH
+    error: OmnigentError = OmnigentError(
+        "raised by the wait", code=ErrorCode.WRONG_REPLICA if case == "wrong_replica" else mismatch
     )
-    error = OmnigentError("raised by the wait", code=code)
+    if case == "runtime_support":
+        error = RuntimeSupportError("Cannot load /example/agent.yaml", code=ErrorCode.CONFLICT)
 
     async def _wait(*args: object, **kwargs: object) -> None:
         del args, kwargs
@@ -545,7 +557,7 @@ async def test_an_admission_error_after_the_runner_connects_keeps_the_hook(
         request, conv.id, conv, None, cast("Any", rows), RunnerExitReports()
     )
 
-    if case == "still_bound":
+    if case in ("still_bound", "runtime_support"):
         assert await check is True
     else:
         with pytest.raises(OmnigentError) as raised:
@@ -554,7 +566,7 @@ async def test_an_admission_error_after_the_runner_connects_keeps_the_hook(
 
 
 async def test_a_reported_exit_skips_the_offline_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A reported runner exit skips the host lookup, as the message path does."""
+    """A reported runner exit skips the host lookup and the sibling stamp."""
     from omnigent.server.routes import sessions as sessions_module
 
     reports = RunnerExitReports()
@@ -566,6 +578,7 @@ async def test_a_reported_exit_skips_the_offline_lookup(monkeypatch: pytest.Monk
         root_conversation_id="conv_exit",
         host_id="host_exit",
         runner_id="runner_gone",
+        runner_last_seen=int(time.time()),
     )
     app = SimpleNamespace(state=SimpleNamespace(host_registry=None, tunnel_registry=None))
     request = Request({"type": "http", "method": "POST", "path": "/", "headers": [], "app": app})

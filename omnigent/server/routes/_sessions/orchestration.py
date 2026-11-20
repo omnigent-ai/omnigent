@@ -3047,7 +3047,7 @@ async def _deliver_answer_to_stopped_session(
         return None
     # Check the runner on a first answer or under the same runner id; a new runner never asked.
     if record is None or record.runner_id == conv.runner_id:
-        runner_back = await _session_runner_reachable(
+        hook_can_take = await _session_runner_reachable(
             request, session_id, conv, runner_router, conversation_store, runner_exit_reports
         )
         current = _stopped_session_answers.get(key)
@@ -3067,8 +3067,8 @@ async def _deliver_answer_to_stopped_session(
                 runner_exit_reports=runner_exit_reports,
             )
         after = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
-        if after is None or after[1].get("params") != params or runner_back:
-            # Resolved elsewhere, asked again, or the runner is back: the caller resolves it.
+        if after is None or after[1].get("params") != params or hook_can_take:
+            # Resolved elsewhere, asked again, or its hook can take it: the caller resolves it.
             _stopped_session_answers.pop(key, None)
             return None
     if record is None:
@@ -3190,8 +3190,9 @@ async def _session_runner_reachable(
     """
     Return whether the runner that asked can still take the answer through its hook.
 
-    True when it is reachable here, live on another replica (the hook it parked here waits), or
-    back within the message path's connect grace. The grace gates match routes_events.py.
+    True when it is reachable here, live on another replica (its hook, parked here, still waits),
+    or back within the connect grace, also when it then fails admission. The grace gates match
+    routes_events.py; other wait errors propagate.
     """
     if await _get_runner_client(session_id, runner_router, conversation=conv, for_control=True):
         return True
@@ -3212,9 +3213,13 @@ async def _session_runner_reachable(
     async def fresh_row() -> Conversation | None:
         try:
             return await asyncio.to_thread(store.get_conversation, session_id)
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001 - a failed re-read only means no sibling evidence
             _logger.warning(
-                "Could not re-read session %s for runner %s", session_id, runner_id, exc_info=True
+                "Could not re-read session %s for runner %s",
+                session_id,
+                runner_id,
+                exc_info=True,
+                extra={"session_id": session_id},
             )
             return None
 
@@ -3276,9 +3281,10 @@ async def _session_runner_reachable(
         if row is None or row.runner_id != runner_id:
             raise
         _logger.info(
-            "Runner %s came back but failed admission (%s); the answer goes to its hook",
+            "Runner %s came back but failed admission (%s: %s); the answer goes to its hook",
             runner_id,
             exc.code,
+            exc,
             extra={"session_id": session_id},
         )
         return True

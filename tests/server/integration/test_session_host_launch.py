@@ -6023,6 +6023,15 @@ async def test_answer_on_a_stopped_claude_session_relaunches_and_delivers_it(
     assert "updatedInput" not in decision, decision
 
 
+def _fail_admission(conversation_id: str, **kwargs: Any) -> Any:
+    """Stand in for resource routing whose runtime admission fails."""
+    from omnigent.errors import ErrorCode
+    from omnigent.server.runtime_compatibility import RuntimeSupportError
+
+    del conversation_id, kwargs
+    raise RuntimeSupportError("Cannot load /example/agent.yaml", code=ErrorCode.CONFLICT)
+
+
 @pytest.mark.parametrize("lookup", ["live", "admission_error"])
 async def test_answer_with_a_live_runner_reaches_the_hook_and_sends_no_message(
     client: httpx.AsyncClient,
@@ -6031,9 +6040,7 @@ async def test_answer_with_a_live_runner_reaches_the_hook_and_sends_no_message(
     lookup: str,
 ) -> None:
     """A reachable runner gets the answer through its hook, also when admission fails."""
-    from omnigent.errors import ErrorCode
     from omnigent.runner.routing import RoutedRunner
-    from omnigent.server.runtime_compatibility import RuntimeSupportError
 
     comm, session_id, hook_task, elicitation_id = await _park_on_claude_session(client, app)
     runner_posts: list[tuple[str, dict[str, Any]]] = []
@@ -6042,16 +6049,12 @@ async def test_answer_with_a_live_runner_reaches_the_hook_and_sends_no_message(
         _stage_live_runner(monkeypatch, fake_runner)
     else:
 
-        def _admission_fails(conversation_id: str, **kwargs: Any) -> RoutedRunner:
-            del conversation_id, kwargs
-            raise RuntimeSupportError("Cannot load /example/agent.yaml", code=ErrorCode.CONFLICT)
-
         def _control_route(conversation_id: str, **kwargs: Any) -> RoutedRunner:
             del conversation_id, kwargs
             return RoutedRunner(runner_id="runner_live", client=fake_runner)
 
         router = app.state.runner_router
-        monkeypatch.setattr(router, "client_for_session_resources", _admission_fails)
+        monkeypatch.setattr(router, "client_for_session_resources", _fail_admission)
         monkeypatch.setattr(router, "client_for_session_control", _control_route)
     try:
         response = await _resolve_answer(client, session_id, elicitation_id)
@@ -6126,11 +6129,9 @@ async def test_an_admission_failure_after_the_tunnel_gap_still_reaches_the_hook(
     route: str,
 ) -> None:
     """The asking runner reconnects but fails admission: its hook still gets the answer."""
-    from omnigent.errors import ErrorCode
     from omnigent.runner.routing import RoutedRunner
     from omnigent.runtime import set_runner_client
     from omnigent.server.routes import sessions as sessions_module
-    from omnigent.server.runtime_compatibility import RuntimeSupportError
 
     comm, session_id, hook_task, elicitation_id = await _park_on_claude_session(client, app)
     runner_posts: list[tuple[str, dict[str, Any]]] = []
@@ -6140,10 +6141,6 @@ async def test_an_admission_failure_after_the_tunnel_gap_still_reaches_the_hook(
         del conversation_id, kwargs
         raise LookupError("no tunnel yet")
 
-    def _admission_fails(conversation_id: str, **kwargs: Any) -> RoutedRunner:
-        del conversation_id, kwargs
-        raise RuntimeSupportError("Cannot load /example/agent.yaml", code=ErrorCode.CONFLICT)
-
     async def _connects(*args: Any, **kwargs: Any) -> object:
         del args, kwargs
         return object()
@@ -6152,7 +6149,7 @@ async def test_an_admission_failure_after_the_tunnel_gap_still_reaches_the_hook(
     router = app.state.runner_router
     monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", budget(5.0))
     monkeypatch.setattr(router, "client_for_session_control", _tunnel_gap)
-    monkeypatch.setattr(router, "client_for_session_resources", _admission_fails)
+    monkeypatch.setattr(router, "client_for_session_resources", _fail_admission)
     monkeypatch.setattr(app.state.tunnel_registry, "wait_for_runner", _connects)
     try:
         await _resolve_answer(client, session_id, elicitation_id, route=route)
@@ -6162,7 +6159,7 @@ async def test_an_admission_failure_after_the_tunnel_gap_still_reaches_the_hook(
         await asyncio.gather(hook_task, return_exceptions=True)
         await fake_runner.aclose()
 
-    # The approval forward still meets the admission error, as before: check the hook.
+    # The route may still return the admission error; the hook already has the answer.
     decision = hook_response.json()["hookSpecificOutput"]["decision"]
     assert decision["behavior"] == "allow", decision
     assert decision["updatedInput"]["answers"] == {_QUESTION: "sqlite"}
