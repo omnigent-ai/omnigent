@@ -9,7 +9,13 @@ import {
   useRef,
   useState,
 } from "react";
-import { ChevronLeftIcon, ChevronRightIcon, SearchIcon, XIcon } from "lucide-react";
+import {
+  AlertCircleIcon,
+  ChevronLeftIcon,
+  ChevronRightIcon,
+  SearchIcon,
+  XIcon,
+} from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { CompactShortcutKeys } from "@/components/ui/kbd";
@@ -23,6 +29,7 @@ import { HighlightedText, type MatchHighlight } from "./HighlightedText";
 import type {
   QuickPickAcceptDetails,
   QuickPickAcceptResult,
+  QuickPickInputError,
   QuickPickItem,
   QuickPickItemRow,
   QuickPickRow,
@@ -93,6 +100,11 @@ export interface QuickPickProps<Value> {
    * page on Right Arrow even without this.
    */
   onExpand?: (item: QuickPickItem<Value>) => boolean;
+  /**
+   * Turns typed text into a selectable first row, such as a new project's name.
+   * Return `{ error }` to explain why the text can't be used, or null to ignore it.
+   */
+  createItem?: (query: string) => QuickPickItem<Value> | QuickPickInputError | null;
   /** Remembers accepted items under this namespace and lists them first while the query is empty. */
   historyKey?: string;
   /** How rows' matched text stands out, unless a row sets its own. */
@@ -135,6 +147,10 @@ export type QuickPickPresentation = "default" | "sidebar";
 
 function readRecents(historyKey: string | undefined): string[] {
   return historyKey ? readQuickPickHistory(historyKey) : [];
+}
+
+function isInputError(value: unknown): value is QuickPickInputError {
+  return typeof value === "object" && value !== null && "error" in value;
 }
 
 interface RowSection<Value> {
@@ -260,6 +276,7 @@ export function QuickPick<Value>({
   summary,
   acceptLabel = "Select",
   alternateLabel,
+  createItem,
   historyKey,
   matchHighlight = "emphasis",
   emptyMessage,
@@ -278,6 +295,7 @@ export function QuickPick<Value>({
 }: QuickPickProps<Value>) {
   const baseId = useId();
   const listId = `${baseId}-list`;
+  const errorId = `${baseId}-error`;
   // Keyed by the row, not its position, so an option keeps its ID when results above it change.
   const optionId = (row: QuickPickRow<Value>) => `${baseId}-option-${encodeURIComponent(row.key)}`;
   const sidebar = presentation === "sidebar";
@@ -303,12 +321,25 @@ export function QuickPick<Value>({
     ],
     [segments, sources, states],
   );
+  const freeText = useMemo(() => {
+    const trimmed = query.trim();
+    if (!createItem || trimmed.length === 0) return { item: null, error: null };
+    const created = createItem(trimmed);
+    if (isInputError(created)) return { item: null, error: created.error };
+    return { item: created, error: null };
+  }, [createItem, query]);
   const rows = useMemo(
     () =>
       collapsed
         ? []
-        : buildQuickPickRows({ segments: allSegments, query, recentIds, sourcesFirst }),
-    [collapsed, allSegments, query, recentIds, sourcesFirst],
+        : buildQuickPickRows({
+            segments: allSegments,
+            query,
+            recentIds,
+            freeTextItem: freeText.item,
+            sourcesFirst,
+          }),
+    [collapsed, allSegments, query, recentIds, freeText.item, sourcesFirst],
   );
   const sourceStates = sources.map((source) => states[source.id]);
   const loading = sourceStates.some((state) => !state || state.status === "loading");
@@ -478,7 +509,11 @@ export function QuickPick<Value>({
   };
   // An inline picker with no way to close, and nothing to summarize, keeps to its rows.
   const showFooter =
-    !sidebar && (onClose !== undefined || onBack !== undefined || summary !== undefined);
+    !sidebar &&
+    (onClose !== undefined ||
+      onBack !== undefined ||
+      summary !== undefined ||
+      freeText.error !== null);
   // The footer's accept buttons do what Enter does, so they need a row Enter would accept.
   const canAcceptActive = activeRow !== null && !activeRow.item.disabledReason;
   const shownAlternateLabel =
@@ -682,6 +717,8 @@ export function QuickPick<Value>({
           aria-expanded={!collapsed}
           aria-controls={collapsed ? undefined : listId}
           aria-autocomplete="list"
+          aria-invalid={freeText.error ? true : undefined}
+          aria-describedby={freeText.error && showFooter ? errorId : undefined}
           data-testid={inputTestId}
           aria-activedescendant={activeRow === null ? undefined : optionId(activeRow)}
           autoFocus={autoFocus}
@@ -808,7 +845,19 @@ export function QuickPick<Value>({
           className="flex min-h-9 items-center gap-3 border-t border-border px-3 py-1.5 text-sm text-muted-foreground"
         >
           <span data-slot="quick-pick-summary" className="min-w-0 flex-1 truncate">
-            {summary?.(stats)}
+            {/* An error shares the summary's fixed slot, so it never shifts the list. */}
+            {freeText.error ? (
+              <span
+                id={errorId}
+                title={freeText.error}
+                className="flex items-center gap-1.5 text-destructive"
+              >
+                <AlertCircleIcon aria-hidden className="size-3.5 shrink-0" />
+                <span className="truncate">{freeText.error}</span>
+              </span>
+            ) : (
+              summary?.(stats)
+            )}
           </span>
           <FooterAction
             keys={["↵"]}

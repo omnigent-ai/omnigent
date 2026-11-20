@@ -125,6 +125,11 @@ export interface QuickPickItemRow<Value = unknown> {
 
 export type QuickPickRow<Value = unknown> = QuickPickHeadingRow | QuickPickItemRow<Value>;
 
+/** Inline feedback when typed text cannot become an item. */
+export interface QuickPickInputError {
+  error: string;
+}
+
 export interface QuickPickStats {
   /** Selectable results currently shown. */
   resultCount: number;

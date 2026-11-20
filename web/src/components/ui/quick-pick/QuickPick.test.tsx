@@ -568,6 +568,32 @@ describe("QuickPick footer and alternate accept", () => {
   });
 });
 
+describe("QuickPick free text", () => {
+  const createItem = (query: string) =>
+    query.length > 20
+      ? { error: "Project names are at most 20 characters." }
+      : item(`new:${query}`, { label: `Create "${query}"` });
+
+  it("lists a row made from the typed text first and doesn't remember it", () => {
+    const { input, onAccept } = renderPicker({ createItem, historyKey: "projects" });
+    fireEvent.change(input, { target: { value: "New ideas" } });
+    expect(optionNames()[0]).toBe('Create "New ideas"');
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onAccept).toHaveBeenCalledWith(expect.objectContaining({ id: "new:New ideas" }), {
+      alternate: false,
+    });
+    expect(readQuickPickHistory("projects")).toEqual([]);
+  });
+
+  it("explains why typed text can't be used, tied to the query field", () => {
+    const { input } = renderPicker({ createItem });
+    fireEvent.change(input, { target: { value: "a name that is far too long" } });
+    expect(input.getAttribute("aria-invalid")).toBe("true");
+    const error = document.getElementById(input.getAttribute("aria-describedby") ?? "");
+    expect(error).toHaveTextContent("Project names are at most 20 characters.");
+  });
+});
+
 describe("QuickPick row styles", () => {
   it("styles a destructive row as a menu's destructive item", () => {
     renderPicker({ segments: [{ ...commands, items: [item("delete", { destructive: true })] }] });
