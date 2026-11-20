@@ -65,3 +65,60 @@ export function chordMatches(
     ? keys.key === chord.key
     : keys.key.toLowerCase() === chord.key.toLowerCase();
 }
+
+/** Modifier key caps: symbols on macOS, words elsewhere; Shift is ⇧ everywhere. */
+export function modifierGlyphs(mac: boolean = isMacPlatform()) {
+  return {
+    mod: mac ? "⌘" : "Ctrl",
+    ctrl: mac ? "⌃" : "Ctrl",
+    alt: mac ? "⌥" : "Alt",
+    shift: "⇧",
+  } as const;
+}
+
+const CODE_LABELS: Record<string, string> = {
+  Backquote: "`",
+  BracketLeft: "[",
+  BracketRight: "]",
+  Backslash: "\\",
+  Comma: ",",
+  Minus: "-",
+  Slash: "/",
+};
+
+const KEY_LABELS: Record<string, string> = {
+  enter: "↵",
+  escape: "Esc",
+  arrowup: "↑",
+  arrowdown: "↓",
+  arrowleft: "←",
+  arrowright: "→",
+  tab: "Tab",
+  " ": "Space",
+};
+
+/** The key cap for a chord's key, without modifiers. */
+export function chordKeyLabel(chord: Chord): string {
+  if (chord.code !== undefined) {
+    if (Object.hasOwn(CODE_LABELS, chord.code)) return CODE_LABELS[chord.code]!;
+    const match = /^(?:Key|Digit)(.+)$/.exec(chord.code);
+    return match ? match[1]! : chord.code;
+  }
+  const key = chord.key ?? "";
+  const lowerKey = key.toLowerCase();
+  if (Object.hasOwn(KEY_LABELS, lowerKey)) return KEY_LABELS[lowerKey]!;
+  return key.length === 1 ? key.toUpperCase() : key;
+}
+
+/** Key caps for a chord, left to right: command modifier, Control, Alt, Shift, then the key. */
+export function chordKeys(chord: Chord, mac: boolean = isMacPlatform()): string[] {
+  const glyphs = modifierGlyphs(mac);
+  const keys: string[] = [];
+  if (chord.mod) keys.push(glyphs.mod);
+  // Off macOS the command modifier already is Control.
+  if (chord.ctrl && !(chord.mod && !mac)) keys.push(glyphs.ctrl);
+  if (chord.alt) keys.push(glyphs.alt);
+  if (chord.shift) keys.push(glyphs.shift);
+  keys.push(chordKeyLabel(chord));
+  return keys;
+}

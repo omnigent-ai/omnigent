@@ -700,7 +700,11 @@ describe("GoalDialog", () => {
         queueGoalMutations("save", nextRequest.promise);
         // A background poll on a slow runner would add reads this test counts.
         const { rerender } = render(<ManagedDialog pollingEnabled={false} />);
-        await waitFor(() => expect(screen.getByTestId("goal-save")).toBeEnabled());
+        // Save enables one commit before the draft copies the goal; an empty draft refuses to save.
+        await waitFor(() => {
+          expect(screen.getByTestId("goal-save")).toBeEnabled();
+          expect(screen.getByTestId("goal-objective")).toHaveValue(ACTIVE_GOAL.objective);
+        });
         fireEvent.click(screen.getByTestId(button));
         if (boundary === "reopen") {
           rerender(<ManagedDialog pollingEnabled={false} open={false} />);
@@ -708,7 +712,10 @@ describe("GoalDialog", () => {
         } else {
           rerender(<ManagedDialog key="replacement" pollingEnabled={false} />);
         }
-        await waitFor(() => expect(screen.queryByText("Loading goal")).not.toBeInTheDocument());
+        await waitFor(() => {
+          expect(screen.queryByText("Loading goal")).not.toBeInTheDocument();
+          expect(screen.getByTestId("goal-objective")).toHaveValue(ACTIVE_GOAL.objective);
+        });
 
         // The old mutation must still block writes after the new opening read settles.
         for (const { button: mutationButton } of mutations) {

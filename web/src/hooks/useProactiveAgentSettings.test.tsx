@@ -30,6 +30,7 @@ function settings(enabled: boolean): ProactiveAgentSettings {
     user_enabled: enabled,
     enabled,
     can_manage_workspace: false,
+    agent_id: "agent_advisor",
   };
 }
 
