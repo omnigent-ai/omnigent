@@ -1,6 +1,14 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { spawnSync } from "node:child_process";
+import { once } from "node:events";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { type AddressInfo, createServer } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { authenticatedFetch } from "@/lib/identity";
 import {
+  ARCA_COMPANION_TUNNEL_PORT,
+  COMPANION_TUNNEL_CHECK_COMMAND,
   DBCERT_EXPIRY_COMMAND,
   DBCERT_REFRESH_CHECK_COMMAND,
   DBCERT_REFRESH_COMMAND,
@@ -67,21 +75,61 @@ describe("host shell calls", () => {
 
   it("checks whether the host can renew dbcert without starting a sign-in", async () => {
     vi.mocked(authenticatedFetch).mockResolvedValueOnce(shellResult(""));
-    expect(await canStartHostDbcertRefresh("s")).toBe(true);
+    expect(await canStartHostDbcertRefresh("s")).toBe("ready");
     const init = vi.mocked(authenticatedFetch).mock.calls[0][1];
     expect(JSON.parse(String(init?.body)).command).toBe(DBCERT_REFRESH_CHECK_COMMAND);
     vi.mocked(authenticatedFetch).mockResolvedValueOnce(shellResult("", 1));
-    expect(await canStartHostDbcertRefresh("s")).toBe(false);
+    expect(await canStartHostDbcertRefresh("s")).toBe("unavailable");
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce(shellResult("", 2));
+    expect(await canStartHostDbcertRefresh("s")).toBe("companion-offline");
     vi.mocked(authenticatedFetch).mockResolvedValueOnce(new Response("{}", { status: 502 }));
     expect(await canStartHostDbcertRefresh("s")).toBeUndefined();
   });
 
   it("starts dbcert in the background and reports whether the shell ran", async () => {
     vi.mocked(authenticatedFetch).mockResolvedValueOnce(shellResult(""));
-    expect(await startHostDbcertRefresh("s")).toBe(true);
+    expect(await startHostDbcertRefresh("s")).toBe("started");
     const init = vi.mocked(authenticatedFetch).mock.calls[0][1];
     expect(JSON.parse(String(init?.body)).command).toBe(DBCERT_REFRESH_COMMAND);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce(shellResult("", 2));
+    expect(await startHostDbcertRefresh("s")).toBe("companion-offline");
     vi.mocked(authenticatedFetch).mockResolvedValueOnce(new Response("{}", { status: 502 }));
-    expect(await startHostDbcertRefresh("s")).toBe(false);
+    expect(await startHostDbcertRefresh("s")).toBe("failed");
+  });
+});
+
+describe.runIf(process.platform === "linux")("COMPANION_TUNNEL_CHECK_COMMAND", () => {
+  const home = mkdtempSync(join(tmpdir(), "dbcert-home-"));
+  afterAll(() => rmSync(home, { recursive: true, force: true }));
+
+  function runCheck(port: number): number | null {
+    const command = COMPANION_TUNNEL_CHECK_COMMAND.replace(
+      String(ARCA_COMPANION_TUNNEL_PORT),
+      String(port),
+    );
+    return spawnSync("bash", ["-c", command], { env: { ...process.env, HOME: home } }).status;
+  }
+
+  /** Run with a port that accepts connections while `run` executes. */
+  async function withListener<T>(run: (port: number) => T): Promise<T> {
+    const server = createServer().listen(0, "127.0.0.1");
+    await once(server, "listening");
+    try {
+      return run((server.address() as AddressInfo).port);
+    } finally {
+      server.close();
+    }
+  }
+
+  it("passes a host that doesn't use Arca Companion", async () => {
+    const closedPort = await withListener((port) => port);
+    expect(runCheck(closedPort)).toBe(0);
+  });
+
+  it("exits 2 only when Companion's tunnel port is closed", async () => {
+    mkdirSync(join(home, ".arca-client"));
+    expect(await withListener(runCheck)).toBe(0);
+    const closedPort = await withListener((port) => port);
+    expect(runCheck(closedPort)).toBe(2);
   });
 });

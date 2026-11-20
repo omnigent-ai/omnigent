@@ -80,8 +80,8 @@ beforeEach(() => {
   state.hosts = [{ host_id: "arca", name: "jackson's arca", status: "online" }];
   vi.mocked(isDatabricksWorkspace).mockReset().mockReturnValue(true);
   vi.mocked(readHostDbcertExpiry).mockReset().mockResolvedValue(EXPIRED);
-  vi.mocked(canStartHostDbcertRefresh).mockReset().mockResolvedValue(true);
-  vi.mocked(startHostDbcertRefresh).mockReset().mockResolvedValue(true);
+  vi.mocked(canStartHostDbcertRefresh).mockReset().mockResolvedValue("ready");
+  vi.mocked(startHostDbcertRefresh).mockReset().mockResolvedValue("started");
   desktopRefresh.mockReset().mockResolvedValue({ ok: true });
   desktopCheck.mockReset().mockResolvedValue({ ok: true, valid: true });
   desktopFeatures
@@ -165,7 +165,7 @@ describe("DbcertBanner", () => {
       kind: "electron",
       getDesktopFeatures: desktopFeatures,
     };
-    vi.mocked(canStartHostDbcertRefresh).mockResolvedValue(false);
+    vi.mocked(canStartHostDbcertRefresh).mockResolvedValue("unavailable");
     renderBanner();
     await settle();
     expect(desktopFeatures).not.toHaveBeenCalled();
@@ -176,7 +176,7 @@ describe("DbcertBanner", () => {
 
   it("backs off remote capability checks and resumes after a hidden tab returns", async () => {
     delete (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop;
-    vi.mocked(canStartHostDbcertRefresh).mockResolvedValue(false);
+    vi.mocked(canStartHostDbcertRefresh).mockResolvedValue("unavailable");
     const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
     try {
       renderBanner();
@@ -191,7 +191,7 @@ describe("DbcertBanner", () => {
       visibility.mockReturnValue("hidden");
       await settle(60_000);
       expect(canStartHostDbcertRefresh).toHaveBeenCalledTimes(initialChecks + 1);
-      vi.mocked(canStartHostDbcertRefresh).mockResolvedValue(true);
+      vi.mocked(canStartHostDbcertRefresh).mockResolvedValue("ready");
       visibility.mockReturnValue("visible");
       fireEvent(document, new Event("visibilitychange"));
       await settle();
@@ -218,7 +218,7 @@ describe("DbcertBanner", () => {
 
   it("reports a remote-host refresh failure without calling Electron", async () => {
     delete (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop;
-    vi.mocked(startHostDbcertRefresh).mockResolvedValue(false);
+    vi.mocked(startHostDbcertRefresh).mockResolvedValue("failed");
     renderBanner();
     await settle();
     fireEvent.click(screen.getByRole("button", { name: "Refresh dbcert" }));
@@ -228,6 +228,36 @@ describe("DbcertBanner", () => {
     expect(screen.getByText(/run dbcert on the host/)).toBeTruthy();
     expect(screen.queryByText(/Arca Companion/)).toBeNull();
     expect(screen.getByRole("button", { name: "Try again" })).toBeTruthy();
+  });
+
+  it("points at the laptop without a button while Companion's tunnel is down", async () => {
+    delete (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop;
+    state.hosts = [ARCLET];
+    vi.mocked(canStartHostDbcertRefresh).mockResolvedValue("companion-offline");
+    render(banner("arclet"));
+    await settle();
+    expect(screen.getByText(/omnigent-arclet-891349936151385 has expired/)).toBeTruthy();
+    expect(screen.getByText(/Run dbcert on your laptop/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Refresh dbcert" })).toBeNull();
+    // The button returns once Companion reconnects.
+    vi.mocked(canStartHostDbcertRefresh).mockResolvedValue("ready");
+    await settle(60_000);
+    expect(screen.getByRole("button", { name: "Refresh dbcert" })).toBeTruthy();
+    expect(screen.queryByText(/Run dbcert on your laptop/)).toBeNull();
+  });
+
+  it("stops at once when a click finds Companion's tunnel down", async () => {
+    delete (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop;
+    state.hosts = [ARCLET];
+    vi.mocked(startHostDbcertRefresh).mockResolvedValue("companion-offline");
+    render(banner("arclet"));
+    await settle();
+    vi.mocked(canStartHostDbcertRefresh).mockResolvedValue("companion-offline");
+    fireEvent.click(screen.getByRole("button", { name: "Refresh dbcert" }));
+    await settle();
+    expect(screen.getByText(/Run dbcert on your laptop/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Refresh|Refreshing|Try again/ })).toBeNull();
+    expect(screen.queryByText(/Opening browser sign-in/)).toBeNull();
   });
 
   it("warns about an expired dbcert on the session's Arca host", async () => {
@@ -387,7 +417,7 @@ describe("DbcertBanner", () => {
     const view = renderBanner();
     await settle();
     expect(screen.getByText(/jackson's arca has expired/)).toBeTruthy();
-    vi.mocked(canStartHostDbcertRefresh).mockResolvedValue(false);
+    vi.mocked(canStartHostDbcertRefresh).mockResolvedValue("unavailable");
     view.rerender(banner("arclet"));
     expect(screen.queryByText(/has expired/)).toBeNull();
     await settle();

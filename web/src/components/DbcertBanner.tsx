@@ -20,9 +20,20 @@ export function DbcertBanner({
 }) {
   const dbcert = useHostDbcert(conversationId, hostId);
   if (!dbcert.show) return null;
+  const message = `The dbcert on ${dbcert.hostName || "this host"} has expired. Certain internal tools will fail until you refresh it.`;
+  if (dbcert.refreshMode === "companion-offline") {
+    return (
+      <DbcertRefreshBanner
+        message={message}
+        running={false}
+        error="Arca Companion isn't connected to this host, so it can't be refreshed from here. Run dbcert on your laptop, and Companion copies the new cert here when it reconnects."
+        onDismiss={dbcert.dismiss}
+      />
+    );
+  }
   return (
     <DbcertRefreshBanner
-      message={`The dbcert on ${dbcert.hostName || "this host"} has expired. Certain internal tools will fail until you refresh it.`}
+      message={message}
       running={dbcert.phase === "running"}
       error={
         dbcert.phase === "failed"
@@ -97,7 +108,8 @@ function DbcertRefreshBanner({
   message: string;
   running: boolean;
   error: string | null;
-  onRefresh: () => void;
+  /** Omitted when the cert can't be refreshed from this view. */
+  onRefresh?: () => void;
   onDismiss: () => void;
 }) {
   return (
@@ -121,17 +133,19 @@ function DbcertRefreshBanner({
         )}
         {error && <p className="mt-0.5 opacity-80">{error}</p>}
       </div>
-      <button
-        type="button"
-        disabled={running}
-        onClick={onRefresh}
-        className={cn(
-          "shrink-0 rounded-md border border-amber-400 px-2 py-0.5 font-medium hover:bg-amber-200 disabled:opacity-60",
-          "dark:border-amber-700 dark:hover:bg-amber-900",
-        )}
-      >
-        {running ? "Refreshing…" : error ? "Try again" : "Refresh dbcert"}
-      </button>
+      {onRefresh && (
+        <button
+          type="button"
+          disabled={running}
+          onClick={onRefresh}
+          className={cn(
+            "shrink-0 rounded-md border border-amber-400 px-2 py-0.5 font-medium hover:bg-amber-200 disabled:opacity-60",
+            "dark:border-amber-700 dark:hover:bg-amber-900",
+          )}
+        >
+          {running ? "Refreshing…" : error ? "Try again" : "Refresh dbcert"}
+        </button>
+      )}
       <button
         type="button"
         onClick={onDismiss}
