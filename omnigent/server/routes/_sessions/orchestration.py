@@ -2942,7 +2942,7 @@ def _harness_elicitation_fingerprint_or_none(params: Any) -> str | None:
 @dataclass
 class _StoppedSessionAnswer:
     """
-    One question's recovery on this replica: a running delivery, then its acknowledgement.
+    One question's recovery on this replica: a delivery and its ack, or a pinned runner.
 
     ``runner_id``: the session's runner at the first answer; a retry waits only for that runner.
     ``replaced``: a different question under this id was answered during the running delivery.
@@ -3037,7 +3037,7 @@ async def _deliver_answer_to_stopped_session(
 
     The message path relaunches the runner; the card closes only after it accepts the message.
     :returns: The acknowledgement (also for a later answer), or ``None``: the caller resolves it.
-    :raises OmnigentError: 403 on a policy denial, or the message path's error; a 409 as 503.
+    :raises OmnigentError: 403 on a policy denial; 503 for an offline host; a message path error.
     """
     elicitation_id = data.get("elicitation_id")
     if post_event is None or not isinstance(request, Request):
@@ -3131,8 +3131,16 @@ async def _deliver_answer_to_stopped_session(
                 routing_host=routing_host,
             )
         except _AnswerHostOffline:
-            if _stopped_session_answers.get(key) is None:
+            now = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
+            asked = now is not None and now[1].get("params") == params
+            if asked and _stopped_session_answers.get(key) is None:
                 # Pin the asking runner: a retry under a new runner id goes as a message.
+                _logger.info(
+                    "Host offline; %s stays open for runner %s",
+                    elicitation_id,
+                    conv.runner_id,
+                    extra={"session_id": session_id},
+                )
                 _stopped_session_answers[key] = _StoppedSessionAnswer(
                     started_at=time.time(),
                     fingerprint=_harness_elicitation_fingerprint_or_none(params),
@@ -3294,7 +3302,7 @@ async def _session_runner_reachable(
 
     True when it is reachable here, live on another replica, or back within the connect grace
     even if admission then fails. An offline host raises ``_AnswerHostOffline``; other wait errors
-    and an admission error for a rebound or missing row propagate. ``routing_host``: a side chat's.
+    and an admission error for a rebound or missing row propagate. ``routing_host``: inherited.
     """
     if await _get_runner_client(session_id, runner_router, conversation=conv, for_control=True):
         return True
@@ -3345,7 +3353,7 @@ async def _session_runner_reachable(
     host_registry = getattr(app_state, "host_registry", None)
     host_conn = host_registry.get(host_id) if host_registry is not None else None
     if offline is not None and host_conn is None:
-        # The message path would wait for the host and could cancel a hook that comes back.
+        # Raise, not False: the message path would wait, then cancel a returning runner's hook.
         raise _AnswerHostOffline(
             "The host for this session is offline. "
             f"Start it with `{cli_invocation()} host` (or reconnect it) and answer again.",

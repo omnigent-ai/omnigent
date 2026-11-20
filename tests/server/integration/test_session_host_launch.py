@@ -6462,7 +6462,7 @@ async def test_answer_while_the_host_is_offline_keeps_the_question_open(
     app: FastAPI,
     db_uri: str,
 ) -> None:
-    """A failed wake keeps the card; a retry after a new runner registers still delivers."""
+    """An offline-host answer keeps the card; a retry under a new runner id sends a message."""
     from omnigent.runtime import pending_elicitations, set_runner_client
     from omnigent.server.routes import sessions as sessions_module
 

@@ -439,6 +439,27 @@ async def test_an_offline_host_answer_pins_the_asking_runner(
     assert record.delivery is None and record.acknowledgement is None
 
 
+async def test_an_offline_host_answer_for_a_resolved_question_pins_nothing(
+    question: _Question, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A question resolved during the offline check gets the 503 but no pinned runner."""
+    question.conv.runner_id = "runner_asking"
+
+    async def _resolved_then_offline(*args: object, **kwargs: object) -> bool:
+        pending_elicitations.resolve(question.session_id, question.elicitation_id)
+        raise orchestration._AnswerHostOffline("host offline", code=ErrorCode.RUNNER_UNAVAILABLE)
+
+    async def _post_event(*args: object, **kwargs: object) -> dict[str, bool]:
+        raise AssertionError("an offline-host answer must not be sent")
+
+    monkeypatch.setattr(orchestration, "_session_runner_reachable", _resolved_then_offline)
+
+    with pytest.raises(OmnigentError):
+        await asyncio.wait_for(question.answer(_post_event), 5.0)
+
+    assert orchestration._stopped_session_answers.get(question.key) is None
+
+
 async def test_a_late_decline_after_delivery_gets_the_acknowledgement(
     question: _Question,
 ) -> None:
@@ -452,6 +473,8 @@ async def test_a_late_decline_after_delivery_gets_the_acknowledgement(
 
     assert late == {"queued": True}
     assert len(question.posts) == 1
+    assert not question.pending()
+    assert question.resolved.count(question.elicitation_id) == 2
 
 
 async def test_a_denied_answer_keeps_the_question_open(question: _Question) -> None:
@@ -851,7 +874,7 @@ async def test_a_reported_exit_skips_the_host_lookup_and_the_sibling_stamp(
 async def test_an_offline_host_fails_the_answer_and_keeps_the_hook(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An offline host fails the answer at once, as the message path would cancel its hook."""
+    """An offline host fails the answer at once, because the message path would cancel its hook."""
     from omnigent.server.routes import sessions as sessions_module
 
     conv = Conversation(
