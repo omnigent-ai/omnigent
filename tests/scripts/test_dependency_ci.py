@@ -7,17 +7,43 @@ import json
 import os
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
 
+from tests.scripts.test_merge_ready_compute_gate import (
+    _parse_github_output,
+)
+from tests.scripts.test_merge_ready_compute_gate import (
+    _run as _run_compute_gate,
+)
+
 ROOT = Path(__file__).resolve().parents[2]
 CI = ROOT / ".github/scripts/ci"
 OMNIDEV = "dev/omnidev/Cargo.lock"
 SIDECAR = "tests/codex_parity/sidecar/Cargo.lock"
 HOOKS = ".pre-commit-config.yaml"
+
+
+def test_merge_gate_skip_membership_with_a_large_check_list():
+    """A matching check stays skippable when the list exceeds the pipe buffer."""
+    subprocess.run(
+        [
+            "bash",
+            "-e",
+            "-o",
+            "pipefail",
+            "-c",
+            'source "$1"; printf -v padding "%100000s" ""; ALLOW_SKIP+=("$padding"); '
+            'is_allow_skip "Pytest (inner-rest)"; ! is_allow_skip "unknown check"',
+            "bash",
+            str(ROOT / ".github/scripts/merge-ready/required.sh"),
+        ],
+        check=True,
+    )
 
 
 @pytest.fixture
@@ -177,10 +203,242 @@ def test_configuration_changes_keep_full_coverage(scope_module, path, before, af
     )
     assert selection["dependency"] == "false"
     assert selection["ui"] == "full"
-    assert selection["database"] == "true"
+    assert (
+        selection["database"]
+        == str(path in {"pyproject.toml", ".github/workflows/ci.yml"}).lower()
+    )
     assert json.loads(selection["python_matrix"])["include"] == json.loads(
         (CI / "python-matrix.json").read_text()
     )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "omnigent/stores/host_store.py",
+        "omnigent/connections/github/__init__.py",
+        "omnigent/server/accounts_store.py",
+        "omnigent/server/device_grant_store.py",
+        "omnigent/server/host_session_recovery.py",
+        "omnigent/server/journal_markers.py",
+        "omnigent/server/routes/_sessions/helpers.py",
+        "omnigent/server/session_families.py",
+        "omnigent/server/session_live_state.py",
+        "omnigent/util/uuid.py",
+        "omnigent/entities/comment.py",
+        "omnigent/db/db_models.py",
+        "omnigent/db/migrations/versions/new_migration.py",
+        "omnigent/db/alembic.ini",
+        "omnigent/db/utils.py",
+        "tests/stores/test_host_store.py",
+        "tests/db/test_utils.py",
+        "tests/conftest.py",
+        "deploy/cockroachdb/docker-compose.yml",
+        ".github/workflows/ci.yml",
+        ".github/scripts/ci/dependency_scope.py",
+        ".github/scripts/ci/require_results.py",
+        ".github/actions/dependency-ci-scope/action.yml",
+        ".github/actions/setup-uv/action.yml",
+        ".python-version",
+        "uv.lock",
+        "pyproject.toml",
+    ],
+)
+def test_database_paths_run_dialect_lanes(scope_module, path):
+    selection = scope_module.select_scope([{"filename": path, "status": "modified"}])
+    assert selection["database"] == "true"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "omnigent/server/app.py",
+        "omnigent/server/auth.py",
+        "omnigent/server/scheduled/schedule.py",
+        "omnigent/entities/agent.py",
+        "omnigent/runtime/policies/engine.py",
+        "omnigent/repl/app.py",
+        "web/src/App.tsx",
+        "README.md",
+        "deploy/docker/Dockerfile",
+    ],
+)
+def test_unrelated_changes_skip_dialect_lanes(scope_module, path):
+    selection = scope_module.select_scope([{"filename": path, "status": "modified"}])
+    assert selection["database"] == "false"
+    assert selection["backend"] == "true"
+
+
+def test_added_store_file_runs_dialect_lanes(scope_module):
+    selection = scope_module.select_scope(
+        [{"filename": "omnigent/stores/new_store.py", "status": "A"}]
+    )
+    assert selection["database"] == "true"
+
+
+def test_added_unrelated_file_skips_dialect_lanes(scope_module):
+    selection = scope_module.select_scope(
+        [{"filename": "omnigent/server/new_route.py", "status": "A"}]
+    )
+    assert selection["database"] == "false"
+    assert selection["backend"] == "true"
+
+
+def test_database_path_among_unrelated_changes_runs_dialect_lanes(scope_module):
+    selection = scope_module.select_scope(
+        [
+            {"filename": "omnigent/server/app.py", "status": "modified"},
+            {"filename": "omnigent/stores/host_store.py", "status": "modified"},
+        ]
+    )
+    assert selection["database"] == "true"
+
+
+@pytest.mark.parametrize(
+    "path,status,runs_tooling",
+    [
+        ("omnigent/server/app.py", "modified", False),
+        ("web/src/App.tsx", "modified", False),
+        ("tests/server/test_app.py", "A", False),
+        (".github/workflows/merge-ready.yml", "modified", True),
+        (".github/scripts/merge-ready/required.sh", "modified", True),
+        ("scripts/install_oss.sh", "modified", True),
+        ("dev/lint/custom_lint.py", "modified", True),
+        ("tests/scripts/test_dependency_ci.py", "modified", True),
+        ("tests/conftest.py", "modified", True),
+        ("uv.lock", "modified", True),
+        ("deploy/docker/Dockerfile.alpine", "A", True),
+        ("examples/new-extension/web/package.json", "D", True),
+    ],
+)
+def test_ci_tooling_tests_run_only_when_tooling_can_change(
+    scope_module, path, status, runs_tooling
+):
+    selection = scope_module.select_scope([{"filename": path, "status": status}])
+    groups = [row["group"] for row in json.loads(selection["python_matrix"])["include"]]
+    assert ("ci-tooling" in groups) == runs_tooling
+    assert "misc" in groups
+
+
+@pytest.mark.parametrize("reason", ["Push, scheduled and manual runs use full CI", ""])
+def test_unscoped_runs_include_ci_tooling(scope_module, reason):
+    selection = scope_module.select_scope([], reason=reason)
+    assert json.loads(selection["python_matrix"])["include"] == json.loads(
+        (CI / "python-matrix.json").read_text()
+    )
+
+
+def test_ci_tooling_tests_leave_the_catch_all_shard():
+    groups = {
+        row["group"]: row["paths"].split()
+        for row in json.loads((CI / "python-matrix.json").read_text())
+    }
+    assert groups["ci-tooling"] == ["tests/scripts"]
+    assert "--ignore=tests/scripts" in groups["misc"]
+
+
+def _pytest_matrix() -> list[dict[str, Any]]:
+    return json.loads((CI / "python-matrix.json").read_text())
+
+
+def _matrix_tokens(paths: str) -> tuple[list[str], list[str]]:
+    roots: list[str] = []
+    ignored: list[str] = []
+    for token in paths.split():
+        if token.startswith("--ignore="):
+            ignored.append(token.removeprefix("--ignore="))
+        else:
+            assert not token.startswith("-"), token
+            roots.append(token)
+    return roots, ignored
+
+
+def _is_test_file(path: Path) -> bool:
+    return path.is_file() and (path.name.startswith("test_") or path.name.endswith("_test.py"))
+
+
+def _covers(root: str, rel: str) -> bool:
+    return rel == root or rel.startswith(root.rstrip("/") + "/")
+
+
+def _collected_matrix_files(paths: str) -> set[str]:
+    """Test files pytest collects from a matrix `paths` string."""
+    roots, ignored = _matrix_tokens(paths)
+    collected: set[str] = set()
+    for root in roots:
+        path = ROOT / root
+        assert path.exists(), root
+        candidates = [path] if path.is_file() else list(path.rglob("*.py"))
+        for candidate in candidates:
+            if not _is_test_file(candidate):
+                continue
+            rel = candidate.relative_to(ROOT).as_posix()
+            if any(_covers(item, rel) for item in ignored):
+                continue
+            collected.add(rel)
+    return collected
+
+
+def test_each_test_path_belongs_to_one_pytest_group(scope_module):
+    """Default shards partition test files; the databricks mark is a second pass."""
+    matrix = _pytest_matrix()
+    assert len({row["group"] for row in matrix}) == len(matrix)
+    rows = [row for row in matrix if row.get("markexpr") != "databricks"]
+    owner: dict[str, str] = {}
+    for row in rows:
+        for rel in _collected_matrix_files(row["paths"]):
+            assert rel not in owner, f"{rel} is in {owner[rel]} and {row['group']}"
+            owner[rel] = row["group"]
+
+    for directory in ("tests/server/integration", "tests/stores"):
+        files = {
+            path.relative_to(ROOT).as_posix()
+            for path in (ROOT / directory).rglob("*.py")
+            if _is_test_file(path)
+        }
+        missing = sorted(files - owner.keys())
+        assert not missing, f"{directory} files missing from the matrix: {missing}"
+        assert files == {rel for rel in owner if _covers(directory, rel)}
+
+    for row in rows:
+        _roots, ignored = _matrix_tokens(row["paths"])
+        for item in ignored:
+            if not (ROOT / item).is_file():
+                continue
+            assert owner.get(item) not in {None, row["group"]}, item
+
+    databricks = next(row for row in matrix if row.get("markexpr") == "databricks")
+    assert _collected_matrix_files(databricks["paths"]) <= owner.keys()
+
+    by_name = {row["group"]: row for row in matrix}
+    core = by_name["server-integration-core"]
+    integration = by_name["server-integration"]
+    assert core["workers"] == integration["workers"]
+    assert core["dist"] == integration["dist"]
+    assert "workers" not in by_name["stores"] and "workers" not in by_name["stores-core"]
+    assert by_name["stores-core"]["dist"] == by_name["stores"]["dist"]
+
+    selection = scope_module.select_scope(
+        [{"filename": "omnigent/stores/host_store.py", "status": "modified"}]
+    )
+    selected = {row["group"] for row in json.loads(selection["python_matrix"])["include"]}
+    assert {
+        "server-integration",
+        "server-integration-core",
+        "stores",
+        "stores-core",
+    } <= selected
+
+    workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+    assert (
+        workflow["jobs"]["pytest"]["strategy"]["matrix"]
+        == "${{ fromJSON(needs.scope.outputs.python_matrix) }}"
+    )
+    assert "pytest" in workflow["jobs"]["result"]["needs"]
+    required = (ROOT / ".github/scripts/merge-ready/required.sh").read_text()
+    for name in ("stores", "server-rest"):
+        assert f'"Pytest ({name})"' in required
+        assert name in by_name
 
 
 def test_gradle_wrapper_bundle_keeps_the_android_profile(scope_module):
@@ -426,6 +684,69 @@ def test_merge_diff_selects_union_and_drives_existing_matrices(
         assert bool(matrix["include"]) == selected
 
 
+@pytest.mark.parametrize("script", ["integration-matrix.sh", "e2e-shard-matrix.sh"])
+@pytest.mark.parametrize(
+    ("event", "draft", "run_tests", "selected"),
+    [
+        ("pull_request", "false", "false", False),
+        ("pull_request", "true", "true", False),
+        ("pull_request", "false", "true", True),
+        ("schedule", "", "true", True),
+        ("workflow_dispatch", "", "true", True),
+    ],
+)
+def test_matrix_skip_output_matches_job_guard(tmp_path, script, event, draft, run_tests, selected):
+    output = tmp_path / "output"
+    subprocess.run(
+        ["bash", str(CI / script)],
+        env=dict(
+            os.environ,
+            GITHUB_OUTPUT=str(output),
+            EVENT_NAME=event,
+            IS_DRAFT=draft,
+            RUN_TESTS=run_tests,
+            NUM_SHARDS="4",
+        ),
+        check=True,
+    )
+    matrix = output.read_text().strip().removeprefix("matrix=")
+    assert (matrix != '{"include":[]}') == selected
+    assert bool(json.loads(matrix)["include"]) == selected
+
+
+@pytest.mark.parametrize(
+    ("dependency", "ui_scope", "rendered"),
+    [
+        ("true", "full", True),
+        ("true", "none", False),
+        ("true", "sidecar", False),
+        ("false", "full", True),
+    ],
+)
+def test_ui_snapshot_detect_renders_web_dependency_bumps(tmp_path, dependency, ui_scope, rendered):
+    workflow = yaml.safe_load((ROOT / ".github/workflows/ui-snapshot.yml").read_text())
+    step = next(s for s in workflow["jobs"]["detect"]["steps"] if s.get("id") == "changes")
+    fake_gh = tmp_path / "bin" / "gh"
+    fake_gh.parent.mkdir()
+    fake_gh.write_text("#!/bin/sh\nprintf 'pnpm-lock.yaml\\nweb/package.json\\n'\n")
+    fake_gh.chmod(0o755)
+    output = tmp_path / "output"
+    subprocess.run(
+        ["bash", "-c", step["run"]],
+        env=dict(
+            os.environ,
+            PATH=f"{fake_gh.parent}{os.pathsep}{os.environ['PATH']}",
+            GITHUB_OUTPUT=str(output),
+            DEPENDENCY=dependency,
+            UI_SCOPE=ui_scope,
+            PR="1",
+            REPO="omnigent-ai/omnigent",
+        ),
+        check=True,
+    )
+    assert output.read_text().strip() == f"ui={str(rendered).lower()}"
+
+
 @pytest.mark.parametrize(
     "fault",
     [
@@ -464,6 +785,9 @@ def test_unknown_or_non_pr_input_keeps_full_coverage(tmp_path, merged_repo, faul
     )
     assert scope["backend"] == scope["e2e"] == scope["omnidev"] == scope["sidecar"] == "true"
     assert scope["ui"] == "full"
+    assert scope["database"] == str(fault not in {"deleted", "renamed"}).lower()
+    if fault in {"push", "schedule", "workflow_dispatch"}:
+        assert scope["reason"] == "Push, scheduled and manual runs use full CI"
 
 
 def test_workflows_connect_selection_to_jobs():
@@ -479,6 +803,11 @@ def test_workflows_connect_selection_to_jobs():
         assert any(
             step.get("uses") == "./.github/actions/dependency-ci-scope" for step in setup["steps"]
         )
+    for name in ("integration", "e2e", "e2e-ui"):
+        job = workflows[name]["jobs"][name]
+        # Job conditions run before GitHub expands (and rejects) an empty matrix.
+        assert job.get("if") == "needs.setup.outputs.matrix != '{\"include\":[]}'"
+        assert job["strategy"]["matrix"] == "${{ fromJSON(needs.setup.outputs.matrix) }}"
     assert workflows["ci"]["jobs"]["scope"]["name"] == "CI coverage scope"
     assert workflows["e2e"]["jobs"]["setup"]["name"] == "E2E coverage scope"
     assert workflows["e2e-ui"]["jobs"]["setup"]["name"] == "UI coverage scope"
@@ -490,8 +819,38 @@ def test_workflows_connect_selection_to_jobs():
     peer_check = next(
         step for step in web_steps if step.get("name") == "Validate changed dependency peers"
     )
-    assert "needs.scope.outputs.dependency == 'true'" in peer_check["if"]
+    assert peer_check["if"] == "github.event_name == 'pull_request'"
     assert "check_npm_peers.py --base HEAD^1" in peer_check["run"]
+    peer_setup = next(
+        step
+        for step in web_steps
+        if step.get("name") == "Set up uv for dependency peer validation"
+    )
+    assert peer_setup["if"] == peer_check["if"]
+    # Full CI must retain the consumers checked for dependency-only changes.
+    for name in ("Install other workspace dependencies", "Test and build workspace consumers"):
+        step = next(step for step in web_steps if step.get("name") == name)
+        assert "if" not in step
+    assert workflows["web-tests"]["jobs"]["web-test"]["name"] == "web test"
+    coverage = next(step for step in web_steps if step.get("name") == "Run tests with coverage")
+    assert coverage["if"] == "github.event_name == 'push'"
+    assert "test:coverage" in coverage["run"]
+    for name in ("Summarize coverage", "Upload UI coverage summary"):
+        step = next(step for step in web_steps if step.get("name") == name)
+        assert step["if"] == "always() && github.event_name == 'push'"
+    vitest = workflows["web-tests"]["jobs"]["web-vitest"]
+    assert vitest["needs"] == "scope"
+    assert vitest["if"] == (
+        "${{ github.event_name == 'pull_request' && !github.event.pull_request.draft "
+        "&& needs.scope.outputs.web == 'true' }}"
+    )
+    assert vitest["strategy"]["fail-fast"] is False
+    assert vitest["strategy"]["matrix"]["shard"] == [1, 2, 3, 4]
+    vitest_run = next(step["run"] for step in vitest["steps"] if step.get("name") == "Run tests")
+    # pnpm's `--` is forwarded to Vitest and disables --shard. exec must pass it.
+    assert vitest_run == (
+        "pnpm --filter web exec vitest run --shard=${{ matrix.shard }}/${{ strategy.job-total }}"
+    )
     e2e_steps = workflows["e2e"]["jobs"]["e2e"]["steps"]
     e2e_run = next(step for step in e2e_steps if step.get("uses") == "./.github/actions/e2e-run")
     action = yaml.safe_load((ROOT / ".github/actions/e2e-run/action.yml").read_text())
@@ -502,7 +861,7 @@ def test_workflows_connect_selection_to_jobs():
     matrix = next(
         step for step in workflows["e2e"]["jobs"]["setup"]["steps"] if step.get("id") == "matrix"
     )
-    assert matrix["env"]["NUM_SHARDS"] == "4"
+    assert matrix["env"]["NUM_SHARDS"] == "8"
     jobs = workflows["ci"]["jobs"]
     sidecar_cache = next(
         step for step in jobs["codex-parity"]["steps"] if step.get("id") == "sidecar-cache"
@@ -529,6 +888,53 @@ def test_workflows_connect_selection_to_jobs():
     assert sdk_check["if"] == "matrix.group == 'server-rest'"
     assert "kubernetes._ensure_sdk()" in sdk_check["run"]
     assert "openshell._ensure_sdk()" in sdk_check["run"]
+    claude_job = jobs["claude-containment"]
+    assert claude_job["needs"] == "scope"
+    assert "needs.scope.outputs.backend == 'true'" in claude_job["if"]
+    cli_test = next(
+        step
+        for step in claude_job["steps"]
+        if step.get("name") == "Test real CLI skill and child execution paths"
+    )
+    assert cli_test["env"]["OMNIGENT_CLAUDE_CLI_E2E"] == "1"
+    assert "--reruns 0" in cli_test["run"]
+    assert "test_real_cli_bash_tool_round_trip_and_inline_skill_finish" in cli_test["run"]
+    assert "test_sdk_real_cli_bash_policy_runs_before_execution" in cli_test["run"]
+    assert "test_each_cli_execution_path_inherits_the_sandbox" in cli_test["run"]
+    assert "test_bound_host_proc_does_not_expose_synthetic_parent" in cli_test["run"]
+    assert "test_session_terminal_runs_real_cli_with_automatic_model_access" in cli_test["run"]
+    assert "test_omnigent_run_cli_with_contained_claude" in cli_test["run"]
+    assert "os-shell-roundtrip or terminal-roundtrip" in cli_test["run"]
+    bubblewrap_step = next(
+        step for step in claude_job["steps"] if step.get("name") == "Enable Bubblewrap"
+    )
+    assert "bubblewrap ripgrep tmux" in bubblewrap_step["run"]
+    assert "net.ipv4.ip_unprivileged_port_start=0" in bubblewrap_step["run"]
+    assert "len(cases) != 23 or skipped" in cli_test["run"]
+    seatbelt_job = jobs["seatbelt-containment"]
+    assert seatbelt_job["needs"] == "scope"
+    assert seatbelt_job["runs-on"] == "macos-15"
+    assert "needs.scope.outputs.backend == 'true'" in seatbelt_job["if"]
+    assert any(
+        step.get("uses", "").startswith("actions/setup-node@")
+        and step["with"]["node-version"] == "22"
+        for step in seatbelt_job["steps"]
+    )
+    seatbelt_test = next(
+        step
+        for step in seatbelt_job["steps"]
+        if step.get("name")
+        == "Test Seatbelt process, CLI skill/hook, hardlink, and Keychain boundaries"
+    )
+    assert seatbelt_test["env"]["OMNIGENT_CLAUDE_CLI_E2E"] == "1"
+    assert "--reruns 0" in seatbelt_test["run"]
+    assert "test_sibling_cannot_read_process_arguments" in seatbelt_test["run"]
+    assert "test_seatbelt_denies_new_hardlink_from_readonly_source" in seatbelt_test["run"]
+    assert "test_real_callback_cannot_read_parent_keychain" in seatbelt_test["run"]
+    assert "test_real_cli_bash_tool_round_trip_and_inline_skill_finish" in seatbelt_test["run"]
+    assert "test_real_cli_hook_cannot_retrieve_login_keychain_canary" in seatbelt_test["run"]
+    assert any(step.get("with", {}).get("harness") == "claude" for step in seatbelt_job["steps"])
+    assert "len(cases) != 8 or skipped" in seatbelt_test["run"]
     for name in ("pytest", "stores-postgres", "stores-cockroachdb", "stores-mysql"):
         assert jobs[name]["needs"] == "scope"
         output = "backend" if name == "pytest" else "database"
@@ -574,15 +980,20 @@ def test_workflows_connect_selection_to_jobs():
         validate = result["steps"][-1]
         assert validate["env"]["NEEDS"] == "${{ toJSON(needs) }}"
         assert validate["run"] == f"python3 .github/scripts/ci/require_results.py {suite}"
+        if suite == "web":
+            assert validate["env"]["EVENT_NAME"] == "${{ github.event_name }}"
 
 
 def _run_merge_gate(
-    tmp_path: Path, snapshots: list[dict[str, Any]]
+    tmp_path: Path,
+    snapshots: list[dict[str, Any]],
+    now: str = "2026-10-19T12:00:00Z",
 ) -> subprocess.CompletedProcess[str]:
     """Run evaluate-checks.sh against a fake ``gh`` serving API snapshots.
 
     Each read of the check runs advances to the next snapshot (the last one
     repeats), so a test can model checks that GitHub updates between reads.
+    The fake date fixes the policy clock without a production override.
     """
     fixtures = tmp_path / "api.json"
     fixtures.write_text(json.dumps(snapshots))
@@ -598,11 +1009,19 @@ def _run_merge_gate(
         "    count += 1\n"
         "    reads.write_text(str(count))\n"
         "api = snapshots[min(max(count, 1), len(snapshots)) - 1]\n"
-        "response = api['checks' if '/check-runs' in sys.argv[2] else 'runs']\n"
+        "endpoint = 'checks' if '/check-runs' in sys.argv[2] else 'runs'\n"
+        "if api.get('api_error') == endpoint:\n"
+        "    sys.exit(1)\n"
+        "response = api[endpoint]\n"
         "subprocess.run(['jq', '-r', sys.argv[sys.argv.index('--jq')+1]], "
         "input=json.dumps(response), text=True, check=True)\n"
     )
     gh.chmod(0o755)
+    date = tmp_path / "date"
+    date.write_text(
+        f"#!/bin/sh\nprintf '%s\\n' '{int(datetime.fromisoformat(now).timestamp())}'\n"
+    )
+    date.chmod(0o755)
     return subprocess.run(
         ["bash", str(ROOT / ".github/scripts/merge-ready/evaluate-checks.sh")],
         env=dict(
@@ -616,7 +1035,7 @@ def _run_merge_gate(
         ),
         text=True,
         capture_output=True,
-        timeout=30,
+        timeout=120,
     )
 
 
@@ -706,6 +1125,35 @@ def test_merge_gate_waits_for_selected_rust_checks(tmp_path, fault):
             "Rust tests (omnidev)",
         ):
             del checks[name]
+    workflows = {
+        name: index
+        for index, name in enumerate(
+            (
+                "CI",
+                "E2E Tests",
+                "E2E UI Tests",
+                "Integration Tests",
+                "Lint",
+                "web Tests",
+                "Docker build",
+                "Android Bundle",
+            ),
+            start=1,
+        )
+    }
+    check_workflows = {
+        "Pre-commit checks": "Lint",
+        "UI coverage scope": "E2E UI Tests",
+        "UI scope": "E2E UI Tests",
+        "E2E UI result": "E2E UI Tests",
+        "E2E UI Tests (shard 0/2)": "E2E UI Tests",
+        "E2E UI Tests (shard 1/2)": "E2E UI Tests",
+        "Web coverage scope": "web Tests",
+        "Web result": "web Tests",
+        "Docker scope": "Docker build",
+        "Docker result": "Docker build",
+        "Build unsigned AAB": "Android Bundle",
+    }
     api = {
         "checks": {
             "check_runs": [
@@ -715,6 +1163,7 @@ def test_merge_gate_waits_for_selected_rust_checks(tmp_path, fault):
                     "status": status,
                     "conclusion": result,
                     "completed_at": "2026-10-19T10:00:00Z",
+                    "check_suite": {"id": workflows[check_workflows.get(name, "CI")]},
                 }
                 for index, (name, (status, result)) in enumerate(checks.items(), start=1)
             ]
@@ -726,8 +1175,9 @@ def test_merge_gate_waits_for_selected_rust_checks(tmp_path, fault):
                     "status": run_status,
                     "conclusion": conclusion,
                     "created_at": "2026-10-19T10:00:00Z",
+                    "check_suite_id": suite_id,
                 }
-                for name in ("CI", "E2E Tests", "E2E UI Tests", "Integration Tests")
+                for name, suite_id in workflows.items()
             ]
         },
     }
@@ -748,8 +1198,8 @@ def test_merge_gate_waits_for_selected_rust_checks(tmp_path, fault):
     )
 
 
-_E2E_SHARDS = [f"E2E Tests (shard {index}/4)" for index in range(4)] + [
-    f"E2E Tests (shard {index}/2)" for index in range(2)
+_E2E_SHARDS = [
+    f"E2E Tests (shard {index}/{count})" for count in (2, 4, 8) for index in range(count)
 ]
 
 
@@ -758,30 +1208,32 @@ def _gate_snapshot(
     e2e_runs: tuple[tuple[str, str], ...] = (("completed", "2026-10-19T10:00:00Z"),),
     failed: str | None = None,
 ) -> dict[str, Any]:
-    """One API snapshot in which only ``E2E Tests (shard 1/4)`` may be unfinished.
+    """One API snapshot in which only ``E2E Tests (shard 7/8)`` may be unfinished.
 
     :param shard_status: Status of that shard's check run.
     :param e2e_runs: ``(status, created_at)`` for each E2E Tests workflow run.
     :param failed: A required check to report as completed with a failure.
     """
     checks = dict.fromkeys(["DCO", "Pre-commit checks", *_E2E_SHARDS], "completed")
-    checks["E2E Tests (shard 1/4)"] = shard_status
+    checks["E2E Tests (shard 7/8)"] = shard_status
     runs = [
         {
             "name": name,
             "status": "completed",
             "conclusion": "success",
             "created_at": "2026-10-19T10:00:00Z",
+            "check_suite_id": suite_id,
         }
-        for name in ("CI", "E2E UI Tests", "Integration Tests")
+        for suite_id, name in enumerate(("Lint", "CI", "E2E UI Tests", "Integration Tests"), 1)
     ] + [
         {
             "name": "E2E Tests",
             "status": status,
             "conclusion": "success" if status == "completed" else None,
             "created_at": created_at,
+            "check_suite_id": 100 + index,
         }
-        for status, created_at in e2e_runs
+        for index, (status, created_at) in enumerate(e2e_runs, 1)
     ]
     return {
         "checks": {
@@ -795,12 +1247,44 @@ def _gate_snapshot(
                         if status == "completed"
                         else None
                     ),
+                    "check_suite": {
+                        "id": 1 if name == "Pre-commit checks" else 100 + len(e2e_runs)
+                    },
                 }
                 for index, (name, status) in enumerate(checks.items(), start=1)
             ]
         },
         "runs": {"workflow_runs": runs},
     }
+
+
+@pytest.mark.parametrize(
+    ("status", "conclusion", "green"),
+    [
+        ("completed", "success", True),
+        ("completed", "failure", False),
+        ("completed", "cancelled", False),
+        ("in_progress", None, False),
+    ],
+)
+def test_merge_gate_requires_successful_workflow_for_empty_integration(
+    tmp_path, status, conclusion, green
+):
+    snapshot = _gate_snapshot("completed")
+    snapshot["checks"]["check_runs"].append(
+        {
+            "id": 100,
+            "name": "Integration (${{ matrix.name }})",
+            "status": "completed",
+            "conclusion": "skipped",
+        }
+    )
+    run = next(
+        run for run in snapshot["runs"]["workflow_runs"] if run["name"] == "Integration Tests"
+    )
+    run.update(status=status, conclusion=conclusion)
+    process = _run_merge_gate(tmp_path, [snapshot])
+    assert (process.returncode == 0) == green, process.stdout + process.stderr
 
 
 def test_merge_gate_rereads_a_check_that_lags_its_completed_workflow(tmp_path):
@@ -813,11 +1297,19 @@ def test_merge_gate_rereads_a_check_that_lags_its_completed_workflow(tmp_path):
     assert "All required checks green" in process.stdout
 
 
+@pytest.mark.parametrize("shard_id", range(8))
+def test_merge_gate_blocks_each_failed_eight_shard_check(tmp_path, shard_id):
+    name = f"E2E Tests (shard {shard_id}/8)"
+    process = _run_merge_gate(tmp_path, [_gate_snapshot("completed", failed=name)])
+    assert process.returncode == 1, process.stdout + process.stderr
+    assert name in (tmp_path / "gate-output").read_text()
+
+
 def test_merge_gate_reports_red_after_the_lag_rereads_run_out(tmp_path):
     process = _run_merge_gate(tmp_path, [_gate_snapshot("in_progress")])
     assert process.returncode == 1, process.stdout + process.stderr
     assert _check_reads(tmp_path) == 6
-    assert "E2E Tests (shard 1/4)" in (tmp_path / "gate-output").read_text()
+    assert "E2E Tests (shard 7/8)" in (tmp_path / "gate-output").read_text()
 
 
 @pytest.mark.parametrize(
@@ -848,6 +1340,147 @@ def test_merge_gate_follows_the_newest_workflow_run_when_rereading(tmp_path):
     )
     assert process.returncode == 0, process.stdout + process.stderr
     assert _check_reads(tmp_path) == 2
+
+
+@pytest.mark.parametrize(
+    ("created_at", "fresh"),
+    [
+        ("2026-10-18T11:59:59Z", False),
+        ("2026-10-18T12:00:00Z", False),
+        ("2026-10-18T12:00:01Z", True),
+    ],
+)
+def test_merge_gate_expires_original_workflow_after_24_hours(tmp_path, created_at, fresh):
+    snapshot = _gate_snapshot("completed")
+    lint = snapshot["runs"]["workflow_runs"][0]
+    lint.update(
+        created_at=created_at,
+        run_attempt=2,
+        run_started_at="2026-10-19T11:00:00Z",
+        updated_at="2026-10-19T11:30:00Z",
+    )
+    snapshot["checks"]["check_runs"][1]["completed_at"] = "2026-10-19T11:30:00Z"
+    process = _run_merge_gate(tmp_path, [snapshot])
+    output = (tmp_path / "gate-output").read_text()
+    assert (process.returncode == 0) == fresh, process.stdout + process.stderr
+    assert f"freshness_failed={str(not fresh).lower()}" in output
+    assert "api_failed=false" in output
+    if fresh:
+        assert "expires_at=2026-10-19T12:00:01Z" in output
+    else:
+        assert "`Pre-commit checks` (CI is at least 24 hours old" in output
+        assert "update the branch to run fresh CI" in output
+        assert _check_reads(tmp_path) == 1
+
+
+@pytest.mark.parametrize("new_check", [False, True])
+def test_merge_gate_ages_selected_check_suite_not_newest_workflow(tmp_path, new_check):
+    snapshot = _gate_snapshot("completed")
+    lint = snapshot["runs"]["workflow_runs"][0]
+    lint["created_at"] = "2026-10-16T10:00:00Z"
+    snapshot["runs"]["workflow_runs"].append(
+        dict(lint, check_suite_id=999, created_at="2026-10-19T11:00:00Z")
+    )
+    if new_check:
+        snapshot["checks"]["check_runs"].append(
+            dict(snapshot["checks"]["check_runs"][1], id=1000, check_suite={"id": 999})
+        )
+    process = _run_merge_gate(tmp_path, [snapshot])
+    assert (process.returncode == 0) == new_check, process.stdout + process.stderr
+    assert (
+        f"freshness_failed={str(not new_check).lower()}" in (tmp_path / "gate-output").read_text()
+    )
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["suite", "run", "created_at", "invalid_created_at", "invalid_calendar", "future_created_at"],
+)
+def test_merge_gate_fails_closed_without_valid_workflow_provenance(tmp_path, fault):
+    snapshot = _gate_snapshot("completed")
+    lint = snapshot["runs"]["workflow_runs"][0]
+    if fault == "suite":
+        del snapshot["checks"]["check_runs"][1]["check_suite"]
+    elif fault == "run":
+        snapshot["runs"]["workflow_runs"].remove(lint)
+    elif fault == "created_at":
+        del lint["created_at"]
+    else:
+        lint["created_at"] = {
+            "invalid_created_at": "not-a-timestamp",
+            "invalid_calendar": "2026-09-31T10:00:00Z",
+            "future_created_at": "2026-10-20T00:00:00Z",
+        }[fault]
+    process = _run_merge_gate(tmp_path, [snapshot])
+    output = (tmp_path / "gate-output").read_text()
+    assert process.returncode == 1, process.stdout + process.stderr
+    assert "freshness_failed=true" in output
+    assert "`Pre-commit checks` (CI age could not be verified" in output
+
+
+@pytest.mark.parametrize("endpoint", ["checks", "runs"])
+def test_merge_gate_emits_freshness_failure_when_api_read_fails(tmp_path, endpoint):
+    snapshot = _gate_snapshot("completed")
+    snapshot["api_error"] = endpoint
+    process = _run_merge_gate(tmp_path, [snapshot])
+    output = (tmp_path / "gate-output").read_text()
+    assert process.returncode == 1, process.stdout + process.stderr
+    assert "freshness_failed=true" in output
+    assert "GitHub API request failed; retry Merge Ready" in output
+    assert "expires_at=\n" in output
+
+    outputs = _parse_github_output(output)
+    gate = _run_compute_gate(
+        tmp_path,
+        eval_outcome="failure",
+        failed=outputs["failed"],
+        freshness_failed=outputs["freshness_failed"],
+        api_failed=outputs.get("api_failed", "false"),
+        expires_at=outputs["expires_at"],
+        dependency_required="false",
+    )
+    assert gate["state"] == "failure"
+    assert gate["post_status"] == "true"
+    assert gate["short_desc"] == "GitHub API request failed; retry Merge Ready"
+    assert "update branch" not in gate["short_desc"]
+
+
+def test_merge_gate_does_not_expire_dco_or_intentionally_skipped_checks(tmp_path):
+    snapshot = _gate_snapshot("completed")
+    dco = snapshot["checks"]["check_runs"][0]
+    del dco["check_suite"]
+    dco["completed_at"] = "2026-10-01T10:00:00Z"
+    for check in snapshot["checks"]["check_runs"][2:]:
+        check.update(conclusion="skipped", check_suite={"id": 999})
+    process = _run_merge_gate(tmp_path, [snapshot])
+    output = (tmp_path / "gate-output").read_text()
+    assert process.returncode == 0, process.stdout + process.stderr
+    assert "freshness_failed=false" in output
+    assert "expires_at=2026-10-20T10:00:00Z" in output
+
+
+@pytest.mark.parametrize("conclusion", ["success", "skipped", "no-run"])
+def test_merge_gate_stale_workflow_cannot_vouch_for_absent_checks(tmp_path, conclusion):
+    snapshot = _gate_snapshot("completed")
+    integration = snapshot["runs"]["workflow_runs"][3]
+    integration.update(created_at="2026-10-16T10:00:00Z", conclusion=conclusion)
+    if conclusion == "no-run":
+        snapshot["runs"]["workflow_runs"].remove(integration)
+    process = _run_merge_gate(tmp_path, [snapshot])
+    output = (tmp_path / "gate-output").read_text()
+    stale = conclusion == "success"
+    assert (process.returncode == 1) == stale, process.stdout + process.stderr
+    assert f"freshness_failed={str(stale).lower()}" in output
+    if stale:
+        assert "`Integration (claude-sdk)` (CI is at least 24 hours old" in output
+
+
+def test_merge_gate_expiry_includes_workflows_vouching_for_absent_checks(tmp_path):
+    snapshot = _gate_snapshot("completed")
+    snapshot["runs"]["workflow_runs"][3]["created_at"] = "2026-10-18T13:00:00Z"
+    process = _run_merge_gate(tmp_path, [snapshot])
+    assert process.returncode == 0, process.stdout + process.stderr
+    assert "expires_at=2026-10-19T13:00:00Z" in (tmp_path / "gate-output").read_text()
 
 
 @pytest.mark.parametrize(

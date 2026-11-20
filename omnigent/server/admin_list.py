@@ -27,7 +27,9 @@ Design decisions (locked with the product owner):
   still picking up edits without a restart.
 
 File format: one identity per line, lowercased on read. ``#`` starts a
-comment (inline or whole-line); blank lines are ignored. Example::
+comment (inline or whole-line); blank lines are ignored. Example:
+
+.. code-block:: text
 
     # Omnigent admins
     alice@example.com

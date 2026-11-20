@@ -1039,3 +1039,31 @@ def test_build_evaluation_context_request_dict_still_works() -> None:
     # ``content`` fallback also honored.
     ctx2 = _build_evaluation_context(Phase.REQUEST, {"content": "hi"}, {})
     assert ctx2.content == {"user_content": "hi", "attachments": []}
+
+
+def test_build_evaluation_context_tool_result_keeps_reported_failure() -> None:
+    """A producer's ``is_error: true`` reaches result policies.
+
+    ``detect_thrashing`` counts it as an error even when the result text
+    doesn't look like one.
+    """
+    ctx = _build_evaluation_context(
+        Phase.TOOL_RESULT,
+        {"result": "cat: /nonexistent: No such file or directory", "is_error": True},
+        {"request_data": {"name": "exec"}},
+    )
+    assert ctx.content == {
+        "result": "cat: /nonexistent: No such file or directory",
+        "is_error": True,
+    }
+
+
+@pytest.mark.parametrize("flag", [False, "true", 1])
+def test_build_evaluation_context_tool_result_drops_other_flags(flag: object) -> None:
+    """Only a boolean ``True`` passes through, so policies never see a guess."""
+    ctx = _build_evaluation_context(
+        Phase.TOOL_RESULT,
+        {"result": "ok", "is_error": flag},
+        {"request_data": {"name": "exec"}},
+    )
+    assert ctx.content == {"result": "ok"}

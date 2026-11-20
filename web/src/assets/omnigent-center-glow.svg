@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 700" preserveAspectRatio="none">
+  <defs>
+    <radialGradient id="glow" cx="50%" cy="46%" r="56%" color-interpolation="linearRGB">
+      <stop offset="0%" stop-color="white" stop-opacity="0.26" />
+      <stop offset="20%" stop-color="white" stop-opacity="0.23" />
+      <stop offset="38%" stop-color="white" stop-opacity="0.17" />
+      <stop offset="54%" stop-color="white" stop-opacity="0.11" />
+      <stop offset="70%" stop-color="white" stop-opacity="0.055" />
+      <stop offset="84%" stop-color="white" stop-opacity="0.018" />
+      <stop offset="100%" stop-color="white" stop-opacity="0" />
+    </radialGradient>
+
+    <filter id="microDither" x="0" y="0" width="100%" height="100%">
+      <feTurbulence
+        type="fractalNoise"
+        baseFrequency="1.15"
+        numOctaves="1"
+        seed="7"
+        stitchTiles="stitch"
+        result="noise"
+      />
+      <feColorMatrix in="noise" type="saturate" values="0" result="monochromeNoise" />
+      <feComponentTransfer in="monochromeNoise" result="microNoise">
+        <feFuncR type="linear" slope="0.012" intercept="0.494" />
+        <feFuncG type="linear" slope="0.012" intercept="0.494" />
+        <feFuncB type="linear" slope="0.012" intercept="0.494" />
+      </feComponentTransfer>
+      <feBlend in="SourceGraphic" in2="microNoise" mode="soft-light" result="smoothedGlow" />
+      <feComposite in="smoothedGlow" in2="SourceGraphic" operator="in" />
+    </filter>
+  </defs>
+
+  <rect width="1000" height="700" fill="url(#glow)" filter="url(#microDither)" opacity="0.32" />
+</svg>

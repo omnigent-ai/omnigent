@@ -231,3 +231,50 @@ def test_build_host_mirror_urls_are_not_baked_into_generated_formula(monkeypatch
     monkeypatch.setenv("HOMEBREW_CARGO_INDEX_URL", "https://cargo.example.com/index/")
 
     assert _generate_formula_with_pillow(monkeypatch) == original
+
+
+def test_cooldown_exemptions_reads_dated_packages_from_uv_toml(tmp_path) -> None:
+    (tmp_path / "uv.toml").write_text(
+        'exclude-newer = "P7D"\n'
+        "exclude-newer-package = "
+        '{ certifi = "2026-10-21T00:00:00Z", Mlflow_Skinny = "2026-09-05T00:00:00Z" }\n'
+    )
+
+    assert gf.cooldown_exemptions(tmp_path) == {
+        "certifi": "2026-10-21T00:00:00Z",
+        "mlflow-skinny": "2026-09-05T00:00:00Z",
+    }
+    assert gf.cooldown_exemptions(tmp_path / "missing") == {}
+
+
+def test_resolve_closure_passes_uv_toml_exemptions_to_uv(monkeypatch) -> None:
+    """A dependency the lockfile exempts (e.g. a fresh security fix) must resolve too."""
+    commands: list[list[str]] = []
+
+    def fake_run(cmd, capture_output, text):
+        commands.append(cmd)
+        Path(cmd[cmd.index("-o") + 1]).write_text("certifi==2026.10.19\n")
+        return gf.subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(gf.subprocess, "run", fake_run)
+
+    closure = gf.resolve_closure(
+        "0.19.1",
+        ["aarch64-apple-darwin"],
+        [],
+        gf.DEFAULT_PYTHON_VERSION,
+        gf.DEFAULT_INDEX_URL,
+        "uv",
+        7,
+        exemptions={"certifi": "2026-10-21T00:00:00Z", "omnigent": "2000-01-01T00:00:00Z"},
+    )
+
+    assert closure == {"certifi": "2026.10.19"}
+    (cmd,) = commands
+    cutoffs = dict(
+        cmd[i + 1].split("=", 1) for i, arg in enumerate(cmd) if arg == "--exclude-newer-package"
+    )
+    assert cutoffs["certifi"] == "2026-10-21T00:00:00Z"
+    # The packages being released are always exempt up to now, even if uv.toml dates them earlier.
+    assert set(gf.LOCKSTEP_PACKAGES) <= cutoffs.keys()
+    assert cutoffs["omnigent"] > "2026-01-01"

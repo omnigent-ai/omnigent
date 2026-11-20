@@ -1,0 +1,27 @@
+name: tcp-egress-local-http
+executor:
+  harness: claude-sdk
+prompt: |
+  Run network checks only through sys_os_shell. Report each command, exit code,
+  stdout, and stderr. Do not change the sandbox configuration or read server files.
+
+  1. Fetch the test marker through the granted route:
+     printf 'GET /marker.txt HTTP/1.0\r\nHost: tcp-demo\r\n\r\n' | omnigent-egress-connect local_http
+     Expect HTTP 200 and the marker in the response body.
+  2. Try the same destination directly:
+     python3 -c "import socket; socket.create_connection(('192.0.2.10', 8765), 2)"
+     Expect a nonzero exit with a sandbox network denial.
+  3. Try an ungranted route:
+     omnigent-egress-connect ungranted_route </dev/null
+     Expect a nonzero exit and a route denial.
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: auto
+    allow_network: false
+    tcp_egress:
+      - name: local_http
+        host: 192.0.2.10
+        port: 8765
+        allowed_cidrs: [192.0.2.10/32]

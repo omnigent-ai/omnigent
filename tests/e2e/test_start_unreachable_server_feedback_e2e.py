@@ -19,15 +19,18 @@ Run with::
 from __future__ import annotations
 
 import os
-import socket
 import subprocess
 import sys
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+
+from tests._helpers.live_server import find_free_port, reserve_port
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -59,14 +62,19 @@ class _StartRun:
         return self.lines[0][0] if self.lines else None
 
 
-def _free_localhost_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+@pytest.fixture(scope="module")
+def _unreachable_server_port() -> Iterator[int]:
+    # Linux refuses connections to a bound, non-listening socket. Darwin waits
+    # instead, so retain its closed-port behavior.
+    reservation = reserve_port() if sys.platform == "linux" else nullcontext(None)
+    with reservation as reserved_socket:
+        yield reserved_socket.getsockname()[1] if reserved_socket is not None else find_free_port()
 
 
 @pytest.fixture(scope="module")
-def unreachable_start_run(tmp_path_factory: pytest.TempPathFactory) -> _StartRun:
+def unreachable_start_run(
+    tmp_path_factory: pytest.TempPathFactory, _unreachable_server_port: int
+) -> _StartRun:
     """Run `omnigent start --non-interactive` once against a dead server."""
     base = tmp_path_factory.mktemp("start-unreachable")
     home = base / "home"
@@ -75,7 +83,7 @@ def unreachable_start_run(tmp_path_factory: pytest.TempPathFactory) -> _StartRun
     for directory in (home, config_home, data_dir):
         directory.mkdir()
 
-    port = _free_localhost_port()
+    port = _unreachable_server_port
     (config_home / "config.yaml").write_text(f"server: http://127.0.0.1:{port}\n")
 
     env = {

@@ -183,3 +183,59 @@ def test_created_file_absolute_path_link_opens_file(
         f"I created the report for you: [{_FILE}]({root}/{_FILE})",
     )
     _assert_link_opens_file_viewer(page)
+
+
+def test_workspace_images_render_in_assistant_reply(
+    page: Page,
+    created_file_session: tuple[str, str, str, str],
+    mock_llm_server_url: str,
+) -> None:
+    """A workspace screenshot loads through the file API, zooms, and survives reload."""
+    base_url, session_id, root, model = created_file_session
+    screenshot = Path(root) / "screenshot.png"
+    image_bytes = (Path(__file__).parents[2] / "resources" / "test_image.png").read_bytes()
+    screenshot.write_bytes(image_bytes)
+    reply = (
+        "Here is the screenshot:\n\n"
+        "![Workspace screenshot](screenshot.png)\n\n"
+        f"![Absolute screenshot]({screenshot})\n\n"
+        "![Missing screenshot](missing.png)"
+    )
+    configure_mock_llm(mock_llm_server_url, [{"text": reply}], key=model)
+    set_fallback_mock_llm(mock_llm_server_url, model, reply)
+
+    file_response = httpx.get(
+        f"{base_url}/v1/sessions/{session_id}"
+        "/resources/environments/default/filesystem/screenshot.png",
+        params={"scope": "workspace"},
+        timeout=10.0,
+    )
+    file_response.raise_for_status()
+    assert file_response.headers["X-Omnigent-File-Scope"] == "workspace"
+    assert file_response.json()["bytes"] == len(image_bytes)
+
+    page.goto(f"{base_url}/c/{session_id}")
+    composer = page.get_by_placeholder(_COMPOSER)
+    expect(composer).to_be_visible(timeout=30_000)
+    composer.fill("Show me screenshot.png inline in your reply.")
+    page.get_by_role("button", name="Send", exact=True).click()
+    expect(page.locator(_ASSISTANT).last).to_contain_text(
+        "Here is the screenshot:", timeout=60_000
+    )
+    expect(page.locator(_WORKING)).to_have_count(0, timeout=60_000)
+
+    for reload in (False, True):
+        if reload:
+            page.reload()
+        for alt in ("Workspace screenshot", "Absolute screenshot"):
+            image = page.get_by_alt_text(alt, exact=True)
+            expect(image).to_be_visible(timeout=30_000)
+            expect(image).to_have_attribute("src", re.compile(r"^blob:"))
+            expect(image).to_have_js_property("complete", True)
+            assert image.evaluate("image => image.naturalWidth > 0")
+        expect(page.get_by_text("missing.png", exact=True)).to_be_visible()
+
+    page.get_by_role("button", name="Zoom image: Workspace screenshot", exact=True).click()
+    expect(page.get_by_role("dialog")).to_be_visible()
+    page.keyboard.press("Escape")
+    expect(page.get_by_role("dialog")).to_have_count(0)

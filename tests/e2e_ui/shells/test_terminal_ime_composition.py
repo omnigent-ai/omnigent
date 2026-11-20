@@ -32,7 +32,9 @@ rail's "+" menu — no LLM turn is involved.
 from __future__ import annotations
 
 import re
+import shlex
 import time
+from pathlib import Path
 
 from playwright.sync_api import Page, expect
 
@@ -195,14 +197,12 @@ def test_shift_enter_mid_composition_commits_composed_text(
 
 
 def test_inbound_output_leaves_preedit_intact(
-    page: Page, terminal_session: tuple[str, str]
+    page: Page, terminal_session: tuple[str, str], tmp_path: Path
 ) -> None:
     """Inbound PTY output arriving mid-composition must not disturb the preedit.
 
-    Journey: open a shell → type a command that emits output shortly after
-    Enter (inside the old 750 ms post-keystroke window the removed
-    ``writeSync`` echo path keyed on) → begin an IME composition immediately
-    → the command's output arrives while the preedit is uncommitted.
+    Journey: open a shell → run a command waiting for a release file → begin
+    an IME composition → release output while the preedit is uncommitted.
 
     Expected: the preedit overlay survives the repaint — the composition
     stays active with its text intact, exactly as xterm's ordered public
@@ -222,17 +222,21 @@ def test_inbound_output_leaves_preedit_intact(
     # The quotes make the *output* differ from the echoed keystrokes, so the
     # marker below can only match the command's own output line.
     marker = "PREEDITREPAINTMARKER"
-    page.keyboard.type('sleep 0.3; echo PREEDIT"REPAINT"MARKER')
+    release_output = tmp_path / "release-output"
+    page.keyboard.type(
+        f"while [ ! -f {shlex.quote(str(release_output))} ]; do sleep 0.05; done; "
+        'echo PREEDIT"REPAINT"MARKER'
+    )
     page.keyboard.press("Enter")
 
-    # Begin composing immediately — well inside the window in which the
-    # command's output will land on the pane.
     _begin_composition(textarea, COMPOSED_TEXT)
     composition_view = terminal_view.locator(".composition-view")
     expect(composition_view).to_have_class(re.compile(r"\bactive\b"))
     expect(composition_view).to_have_text(COMPOSED_TEXT)
 
+    # The shell shares this host's tmp_path; release only after capture is ready.
     baseline = len(received)
+    release_output.touch()
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
         if marker.encode("utf-8") in b"".join(received[baseline:]):

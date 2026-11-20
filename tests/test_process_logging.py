@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 import contextlib
+import io
 import logging
 import os
 import re
+import subprocess
 import sys
+import textwrap
+import threading
 import time
+import weakref
 from pathlib import Path
 
 import pytest
 
+from omnigent import process_logging
 from omnigent._platform import IS_POSIX
 from omnigent.debug_logging import record_to_row
 from omnigent.process_logging import (
@@ -22,6 +28,7 @@ from omnigent.process_logging import (
     PROCESS_LOG_FILE_ENV_VAR,
     RedactingLogFormatter,
     TerminalLogFormatter,
+    TerminalWriter,
     _debug_sink_target_loggers,
     _log_once_seen,
     _unlink_if_empty,
@@ -31,12 +38,21 @@ from omnigent.process_logging import (
     ensure_stdio_survives_unencodable_output,
     log_info_once,
     log_once,
+    nonblocking_terminal_stdio,
     process_log_dir_reference,
     process_log_reference,
     redact_log_text,
     terminal_stream_handler,
     terminal_supports_color,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolated_terminal_writers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep one test's terminal writers and mirror mode out of the next test."""
+    monkeypatch.setattr(process_logging, "_shared_terminal_writers", {})
+    monkeypatch.setattr(process_logging, "_live_terminal_writers", weakref.WeakSet())
+    monkeypatch.setattr(process_logging, "_threaded_terminal_mirrors", 0)
 
 
 @pytest.mark.skipif(not IS_POSIX, reason="pass_fds is POSIX-only")
@@ -86,6 +102,525 @@ def test_terminal_stream_handler_writes_to_explicit_log_fd(
         for fd in (read_fd, write_fd):
             with contextlib.suppress(OSError):
                 os.close(fd)
+
+
+_LOG_THEN_EXIT = """
+import logging, os, sys
+from omnigent.process_logging import nonblocking_terminal_stdio, terminal_stream_handler
+
+if OPT_IN:
+    nonblocking_terminal_stdio()
+handler = terminal_stream_handler()
+handler.setFormatter(logging.Formatter("%(message)s"))
+for index in range(200):
+    handler.handle(logging.makeLogRecord({"msg": "line %d", "args": (index,)}))
+EXIT_CALL
+"""
+
+
+@pytest.mark.skipif(not IS_POSIX, reason="fd-based terminal mirroring is POSIX-only")
+@pytest.mark.parametrize(
+    ("opt_in", "exit_call"),
+    [(False, "os._exit(0)"), (True, "sys.exit(0)")],
+    ids=["synchronous-then-os-exit", "threaded-then-normal-exit"],
+)
+def test_terminal_mirror_keeps_lines_logged_just_before_exit(opt_in: bool, exit_call: str) -> None:
+    """Outside the opt-in ``os._exit`` loses nothing; inside it the exit drain writes the rest."""
+    script = textwrap.dedent(_LOG_THEN_EXIT).replace("OPT_IN", str(opt_in))
+    read_fd, write_fd = os.pipe()
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", script.replace("EXIT_CALL", exit_call)],
+            env={**os.environ, LOG_TTY_FD_ENV_VAR: str(write_fd)},
+            pass_fds=(write_fd,),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    finally:
+        os.close(write_fd)
+    with os.fdopen(read_fd, encoding="utf-8") as mirror_output:
+        lines = mirror_output.read().splitlines()
+
+    assert completed.returncode == 0, completed.stderr
+    assert lines == [f"line {index}" for index in range(200)]
+
+
+class _FakeTerminal(io.StringIO):
+    """In-memory terminal whose writes can be held until the test releases them."""
+
+    def __init__(self, *, tty: bool = True, fail_with: Exception | None = None) -> None:
+        super().__init__()
+        self._tty = tty
+        self.fail_with = fail_with
+        self.reading = threading.Event()
+        self.reading.set()
+        self.write_calls = 0
+
+    def isatty(self) -> bool:
+        return self._tty
+
+    def write(self, text: str) -> int:
+        self.write_calls += 1
+        if self.fail_with is not None:
+            raise self.fail_with
+        self.reading.wait()
+        return super().write(text)
+
+
+def _record(message: str, *args: object) -> logging.LogRecord:
+    return logging.LogRecord("test", logging.INFO, __file__, 1, message, args, None)
+
+
+@pytest.mark.skipif(not IS_POSIX, reason="fd-based terminal mirroring is POSIX-only")
+def test_terminal_stream_handler_does_not_wait_for_a_stalled_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Logging continues while the terminal is not read; skipped lines are reported later."""
+    monkeypatch.setattr(process_logging, "_TERMINAL_BACKLOG_CHARS", 4096)
+    read_fd, write_fd = os.pipe()  # nothing reads until every line is logged
+    handler: logging.Handler | None = None
+    # As in the foreground host, whose terminal mirrors write from a thread.
+    restore = nonblocking_terminal_stdio()
+    try:
+        monkeypatch.setenv(LOG_TTY_FD_ENV_VAR, str(write_fd))
+        handler = terminal_stream_handler()
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        assert isinstance(handler, logging.StreamHandler)
+        writer = handler.stream
+        assert isinstance(writer, TerminalWriter)
+
+        # About 200 KB: more than the pipe buffer plus the backlog.
+        logging_thread = threading.Thread(
+            target=lambda: [
+                handler.handle(_record("line %04d %s", index, "x" * 90)) for index in range(2000)
+            ],
+            daemon=True,
+        )
+        logging_thread.start()
+        logging_thread.join(10)
+        assert not logging_thread.is_alive(), "logging waited for the stalled terminal"
+
+        # The terminal reads again. Nothing else is logged, so drops are reported by the writer.
+        output = bytearray()
+        os.set_blocking(read_fd, False)
+        deadline = time.monotonic() + 10
+        while not writer.drain(0.05):
+            assert time.monotonic() < deadline, "queued output was never written"
+            with contextlib.suppress(BlockingIOError):
+                output.extend(os.read(read_fd, 65536))
+        with contextlib.suppress(BlockingIOError):
+            while chunk := os.read(read_fd, 65536):
+                output.extend(chunk)
+    finally:
+        restore()
+        if handler is not None:
+            handler.close()
+        for fd in (read_fd, write_fd):
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+    shown = output.decode().splitlines()
+    # Every line is either shown in order or counted by a notice where it was dropped.
+    next_index = 0
+    notices = 0
+    for text in shown:
+        notice = re.fullmatch(
+            r"\[omnigent\] (\d+) lines? (?:was|were) not shown because this terminal "
+            r"stopped reading output; any log lines among them are in the log file\.",
+            text,
+        )
+        if notice is not None:
+            notices += 1
+            next_index += int(notice.group(1))
+        else:
+            assert text == f"line {next_index:04d} {'x' * 90}"
+            next_index += 1
+    # Trailing drops are counted only through the writer's catch-up notice.
+    assert next_index == 2000
+    assert notices > 0
+
+
+@pytest.mark.skipif(not IS_POSIX, reason="fd-based terminal mirroring is POSIX-only")
+def test_terminal_stream_handlers_share_one_writer_per_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mirrors of one stream or mirror fd share a writer, so their lines keep the order logged."""
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setattr(sys, "stderr", _FakeTerminal())
+    restore = nonblocking_terminal_stdio()
+    try:
+        monkeypatch.setenv(LOG_TTY_FD_ENV_VAR, str(write_fd))
+        first, second = terminal_stream_handler(), terminal_stream_handler()
+        assert isinstance(first, logging.StreamHandler)
+        assert isinstance(second, logging.StreamHandler)
+        writer = first.stream
+        assert isinstance(writer, TerminalWriter)
+        assert second.stream is writer
+        for handler in (first, second):
+            handler.setFormatter(logging.Formatter("%(message)s"))
+        for index in range(20):
+            (first, second)[index % 2].handle(_record("line %d", index))
+        assert writer.drain(5)
+        assert os.read(read_fd, 65536).decode().splitlines() == [f"line {i}" for i in range(20)]
+
+        monkeypatch.delenv(LOG_TTY_FD_ENV_VAR)
+        mirror = terminal_stream_handler()
+        assert isinstance(mirror, logging.StreamHandler)
+        assert mirror.stream is sys.stderr
+    finally:
+        restore()
+        for fd in (read_fd, write_fd):
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [OSError(5, "Input/output error"), UnicodeEncodeError("ascii", "✓", 0, 1, "not ASCII")],
+    ids=["hang-up", "unencodable"],
+)
+def test_terminal_writer_stops_writing_after_a_terminal_error(
+    error: Exception, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A terminal write error ends mirroring instead of retrying or raising to the caller."""
+    terminal = _FakeTerminal(fail_with=error)
+    writer = TerminalWriter(terminal)
+
+    writer.write("first\n")
+    assert writer.drain(5)
+    writer.write("second\n")
+    assert writer.drain(5)
+
+    assert terminal.write_calls == 1
+    assert not writer.writable()
+    # The log file records why the terminal went quiet; the writer thread logs it after failing.
+    deadline = time.monotonic() + 5
+    while "terminal output stopped after a write error" not in caplog.text:
+        assert time.monotonic() < deadline, "the stopped mirror was never logged"
+        time.sleep(0.01)
+    assert type(error).__name__ in caplog.text
+    assert "✓" not in caplog.text  # the rejected text stays out of the log file
+
+
+def test_terminal_writer_stops_when_it_cannot_reopen_after_fork() -> None:
+    """A forked child that can't get its own fd must not write to the inherited stream."""
+    writer = TerminalWriter(_FakeTerminal())  # no fileno() to duplicate
+
+    writer._reopen_after_fork()
+
+    assert not writer.writable()
+
+
+def test_terminal_writer_keeps_partial_lines_until_flush() -> None:
+    """Text without a newline is written once it is flushed, as ``print(..., end="")`` expects."""
+    terminal = _FakeTerminal()
+    writer = TerminalWriter(terminal)
+
+    print("Waiting", end="", file=writer)
+    time.sleep(0.05)  # time for the writer thread to write, had the text been queued
+    assert terminal.getvalue() == ""
+    print(" for login...", end="", file=writer, flush=True)
+    assert writer.drain(5)
+
+    assert terminal.getvalue() == "Waiting for login..."
+
+
+def test_terminal_writer_drains_even_when_its_character_count_is_off() -> None:
+    """An interrupt between queueing a chunk and counting or announcing it can't hang drain()."""
+    terminal = _FakeTerminal()
+    writer = TerminalWriter(terminal)
+    writer.write("first\n")
+    assert writer.drain(5)
+    with writer._condition:  # as if interrupted after the append, before the count and notify
+        writer._chunks.append("second\n")
+
+    assert writer.drain(5)
+    assert terminal.getvalue() == "first\nsecond\n"
+
+
+def test_terminal_writer_keeps_writing_after_a_refused_thread_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refused writer thread (e.g. at shutdown) drops that output, not later output."""
+    terminal = _FakeTerminal()
+    writer = TerminalWriter(terminal)
+    real_start = threading.Thread.start
+    refusals = [RuntimeError("can't create new thread at interpreter shutdown")]
+
+    def start(thread: threading.Thread) -> None:
+        if refusals and thread.name == "omnigent-terminal-writer":
+            raise refusals.pop()
+        real_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", start)
+    writer.write("refused\n")
+    writer.write("written\n")
+    assert writer.drain(5)
+
+    assert terminal.getvalue() == "written\n"
+
+
+def test_terminal_writer_bounds_text_without_a_newline(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Long output without a newline or flush is written instead of growing in memory."""
+    monkeypatch.setattr(process_logging, "_TERMINAL_PARTIAL_LINE_CHARS", 16)
+    terminal = _FakeTerminal()
+    writer = TerminalWriter(terminal)
+
+    for _ in range(10):
+        writer.write("\r#####")
+
+    # Every third 6-character write reaches the 16-character limit and is queued.
+    deadline = time.monotonic() + 5
+    while len(terminal.getvalue()) < 54:
+        assert time.monotonic() < deadline, "partial line was never queued"
+        time.sleep(0.01)
+    assert terminal.getvalue() == "\r#####" * 9
+    assert writer.drain(5)
+    assert terminal.getvalue() == "\r#####" * 10
+
+
+_FORK_WHILE_WRITING = """
+import os, select, sys, threading, time, warnings
+from omnigent.process_logging import TerminalWriter
+
+read_fd, write_fd = os.pipe()
+writer = TerminalWriter(os.fdopen(write_fd, "w", buffering=1))
+# More than the pipe holds: the writer thread blocks mid-write, holding the stream's lock.
+writer.write("x" * 70000 + "\\n")
+time.sleep(0.5)
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore", DeprecationWarning)
+    pid = os.fork()
+if pid == 0:
+    writer.write("from the child\\n")
+    EXIT_CALL(0 if writer.drain(10) else 1)
+output = bytearray()
+deadline = time.monotonic() + 10
+while b"from the child\\n" not in output and time.monotonic() < deadline:
+    if select.select([read_fd], [], [], max(0.0, deadline - time.monotonic()))[0]:
+        output.extend(os.read(read_fd, 65536))
+_, status = os.waitpid(pid, 0)
+print(os.waitstatus_to_exitcode(status), b"from the child\\n" in output)
+"""
+
+
+@pytest.mark.skipif(not IS_POSIX, reason="os.fork is POSIX-only")
+@pytest.mark.parametrize("exit_call", ["os._exit", "sys.exit"])
+def test_terminal_writer_in_a_child_forked_mid_write_writes_to_a_fresh_fd(exit_call: str) -> None:
+    """A child forked while a parent writer holds the stream's lock still writes and exits."""
+    script = textwrap.dedent(_FORK_WHILE_WRITING).replace("EXIT_CALL", exit_call)
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.split() == ["0", "True"]
+
+
+def test_terminal_writer_shows_one_write_larger_than_the_backlog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The backlog limits queued text; a large write to an idle terminal is still shown."""
+    monkeypatch.setattr(process_logging, "_TERMINAL_BACKLOG_CHARS", 64)
+    terminal = _FakeTerminal()
+    writer = TerminalWriter(terminal)
+    traceback_text = "".join(f'  File "module_{index}.py", line {index}\n' for index in range(20))
+
+    writer.write(traceback_text)
+    assert writer.drain(5)
+
+    assert terminal.getvalue() == traceback_text
+
+
+def test_nonblocking_terminal_stdio_wraps_only_terminals(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Terminal stdio is routed through a writer and restored once its output is written."""
+    terminal = _FakeTerminal()
+    log_file = _FakeTerminal(tty=False)
+    monkeypatch.setattr(sys, "stdout", terminal)
+    monkeypatch.setattr(sys, "stderr", log_file)
+
+    restore = nonblocking_terminal_stdio()
+    assert isinstance(sys.stdout, TerminalWriter)
+    assert sys.stderr is log_file
+    print("✓ Connected")
+    # A stream another component replaced meanwhile stays theirs; stdout is still restored.
+    replacement = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", replacement)
+    restore()
+
+    assert sys.stdout is terminal
+    assert sys.stderr is replacement
+    assert terminal.getvalue() == "✓ Connected\n"
+
+
+@pytest.mark.skipif(not IS_POSIX, reason="fd-based terminal mirroring is POSIX-only")
+def test_nonblocking_terminal_stdio_routes_handlers_that_already_write_to_the_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Handlers attached before the host starts, e.g. under ``--log-to-stderr``, are moved too.
+
+    They are handed back only once every writer has caught up: a mirror blocked mid-write
+    holds its stream's lock, so its handler would block on the next line.
+    """
+    monkeypatch.setattr(process_logging, "_TERMINAL_EXIT_DRAIN_S", 0.05)
+    read_fd, write_fd = os.pipe()  # nothing reads until the restore has been refused
+    logger = logging.getLogger("tests.terminal_routing")
+    terminal = _FakeTerminal()
+    monkeypatch.setattr(sys, "stderr", terminal)
+    monkeypatch.setenv(LOG_TTY_FD_ENV_VAR, str(write_fd))
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    mirror = terminal_stream_handler()  # synchronous: opened before the opt-in
+    other_mirror = terminal_stream_handler()  # a second one, on its own dup of the same fd
+    assert isinstance(mirror, logging.StreamHandler)
+    assert isinstance(other_mirror, logging.StreamHandler)
+    mirror_stream, other_mirror_stream = mirror.stream, other_mirror.stream
+    log_file = logging.FileHandler(os.devnull)
+    handlers: list[logging.Handler] = [stderr_handler, mirror, other_mirror, log_file]
+    for handler in handlers:
+        logger.addHandler(handler)
+    restore = nonblocking_terminal_stdio()
+    try:
+        assert stderr_handler.stream is sys.stderr
+        assert isinstance(sys.stderr, TerminalWriter)
+        writer = mirror.stream
+        assert isinstance(writer, TerminalWriter)
+        assert other_mirror.stream is writer
+        assert not isinstance(log_file.stream, TerminalWriter)
+        # A mirror opened later for the same file shares the existing mirror's writer.
+        later = terminal_stream_handler()
+        assert isinstance(later, logging.StreamHandler)
+        assert later.stream is writer
+        logger.addHandler(later)
+        handlers.append(later)
+
+        # More than the pipe holds, so the mirror's writer blocks mid-write.
+        for index in range(100):
+            mirror.handle(_record("line %d %s", index, "x" * 1000))
+        restore()
+        assert mirror.stream is writer
+        assert isinstance(sys.stderr, TerminalWriter)
+
+        # The terminal reads again; now everything is handed back, once.
+        os.set_blocking(read_fd, False)
+        deadline = time.monotonic() + 10
+        while not writer.drain(0.05):
+            assert time.monotonic() < deadline, "queued output was never written"
+            with contextlib.suppress(BlockingIOError):
+                os.read(read_fd, 65536)
+        restore()
+        assert sys.stderr is terminal
+        assert stderr_handler.stream is terminal
+        assert mirror.stream is mirror_stream
+        assert other_mirror.stream is other_mirror_stream
+        assert not isinstance(later.stream, TerminalWriter)
+        assert process_logging._threaded_terminal_mirrors == 0
+        restore()
+        assert process_logging._threaded_terminal_mirrors == 0
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(read_fd)  # unblocks a writer the test left blocked
+        restore()
+        for handler in handlers:
+            logger.removeHandler(handler)
+        log_file.close()
+        with contextlib.suppress(OSError):
+            os.close(write_fd)
+
+
+@pytest.mark.skipif(not IS_POSIX, reason="fd-based terminal mirroring is POSIX-only")
+def test_terminal_mirror_closes_its_dup_when_it_cannot_open_the_mirror(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mirror that fails after duplicating its fd closes the duplicate."""
+    read_fd, write_fd = os.pipe()
+    real_key = process_logging._mirror_fd_key
+    keyed: list[int] = []
+
+    def key_fails_for_the_duplicate(fd: int) -> tuple[object, ...]:
+        keyed.append(fd)
+        if len(keyed) == 2:
+            raise OSError(9, "Bad file descriptor")
+        return real_key(fd)
+
+    monkeypatch.setattr(process_logging, "_mirror_fd_key", key_fails_for_the_duplicate)
+    monkeypatch.setenv(LOG_TTY_FD_ENV_VAR, str(write_fd))
+    restore = nonblocking_terminal_stdio()
+    try:
+        # dup() returns the lowest free fd, so a leaked duplicate would take this number.
+        lowest_free = os.dup(write_fd)
+        os.close(lowest_free)
+        handler = terminal_stream_handler()
+        again = os.dup(write_fd)
+        os.close(again)
+    finally:
+        restore()
+        for fd in (read_fd, write_fd):
+            os.close(fd)
+
+    assert isinstance(handler, logging.NullHandler)
+    assert len(keyed) == 2
+    assert again == lowest_free
+
+
+def test_nonblocking_terminal_stdio_nested_installs_restore_latest_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An inner restore leaves the outer install in place; the outer one puts everything back."""
+    terminal = _FakeTerminal()
+    monkeypatch.setattr(sys, "stdout", terminal)
+    logger = logging.getLogger("tests.terminal_nesting")
+    handler = logging.StreamHandler(terminal)
+    logger.addHandler(handler)
+    try:
+        outer = nonblocking_terminal_stdio()
+        writer = sys.stdout
+        assert isinstance(writer, TerminalWriter)
+        inner = nonblocking_terminal_stdio()
+        assert sys.stdout is writer
+        assert handler.stream is writer
+        assert process_logging._threaded_terminal_mirrors == 2
+
+        inner()
+        assert sys.stdout is writer
+        assert handler.stream is writer
+        assert process_logging._threaded_terminal_mirrors == 1
+
+        outer()
+        assert sys.stdout is terminal
+        assert handler.stream is terminal
+        assert process_logging._threaded_terminal_mirrors == 0
+    finally:
+        logger.removeHandler(handler)
+
+
+def test_nonblocking_terminal_stdio_keeps_the_writer_while_the_terminal_is_stalled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Restoring a terminal that still is not reading would let the exit-time flush block."""
+    monkeypatch.setattr(process_logging, "_TERMINAL_EXIT_DRAIN_S", 0.05)
+    terminal = _FakeTerminal()
+    terminal.reading.clear()
+    monkeypatch.setattr(sys, "stdout", terminal)
+
+    restore = nonblocking_terminal_stdio()
+    writer = sys.stdout
+    try:
+        print("↓ Runner stopped", flush=True)
+        restore()
+        assert sys.stdout is writer
+        # The exit-time drain does not wait again for a terminal that already timed out.
+        started = time.monotonic()
+        assert not process_logging.drain_terminal_output(5)
+        assert time.monotonic() - started < 1
+    finally:
+        terminal.reading.set()
+    assert isinstance(writer, TerminalWriter)
+    assert writer.drain(5)
+    assert terminal.getvalue() == "↓ Runner stopped\n"
 
 
 def test_terminal_log_formatter_colors_level_name() -> None:

@@ -30,8 +30,8 @@ _PROMPT = "Continue the changes we discussed."
 _ANSWER = "The implementation plan is saved in this conversation."
 _SOURCE_NOTICE = "The original session’s workspace was unavailable."
 _DESCRIPTION = (
-    "Choose an existing directory to continue this conversation in a new session. "
-    "Files from the missing workspace won’t be restored."
+    "Choose an existing directory to continue this conversation in a new session, "
+    "optionally in a new git worktree. Files from the missing workspace won’t be restored."
 )
 
 
@@ -52,7 +52,7 @@ def test_continue_missing_workspace_in_another_directory(
 ) -> None:
     """Reject another absent path, then fork into a selected existing directory."""
     chat = chat_session_contract
-    page.set_viewport_size({"width": width, "height": 900 if width > 768 else 844})
+    page.set_viewport_size({"width": width, "height": 900 if width > 1181 else 844})
     chat.set_catalog(harness="claude-native", models=[], selected_model="")
     chat.update_session(
         title="Workspace recovery example",
@@ -217,7 +217,7 @@ def test_continue_missing_workspace_in_another_directory(
     contract.json(f"/v1/hosts/{chat.host_id}/runners", launch, method="POST")
 
     def activate(control: Locator) -> None:
-        if width < 768:
+        if width < 1181:
             control.tap()
         else:
             control.click()
@@ -257,7 +257,7 @@ def test_continue_missing_workspace_in_another_directory(
             f"localStorage.setItem('omnigent.sideChatInherited:{chat.session_id}', '[]');"
         )
         page.goto(parent.url)
-        if width < 768:
+        if width < 1181:
             activate(page.get_by_role("button", name="Conversation actions", exact=True))
             activate(page.get_by_role("menuitem", name="Side chats", exact=True))
             expect(page.get_by_test_id("side-chats-panel-drawer")).to_have_attribute(
@@ -285,6 +285,9 @@ def test_continue_missing_workspace_in_another_directory(
     directory = dialog.get_by_role("combobox", name="Working directory path")
     expect(directory).to_be_visible()
     expect(directory).to_have_value("")
+    worktree = dialog.get_by_role("textbox", name="Git worktree (optional)")
+    expect(worktree).to_be_visible()
+    expect(worktree).to_have_value("")
     submit = dialog.get_by_role("button", name="Continue", exact=True)
     expect(submit).to_be_disabled()
     page.screenshot(path=str(artifacts / "choose-another-directory.png"), full_page=True)
@@ -299,7 +302,7 @@ def test_continue_missing_workspace_in_another_directory(
     activate(dialog.get_by_role("button", name="Browse directories", exact=True))
     picker = page.get_by_test_id("workspace-picker")
     expect(picker).to_be_visible()
-    activate(picker.get_by_role("button", name="project", exact=True))
+    activate(picker.get_by_role("option", name="project", exact=True))
     expect(picker.get_by_role("textbox", name="Current folder path")).to_have_value(_DESTINATION)
     activate(picker.get_by_test_id("workspace-picker-select"))
     expect(picker).not_to_be_visible()

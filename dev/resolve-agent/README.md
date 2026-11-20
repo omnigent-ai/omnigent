@@ -23,6 +23,20 @@ tests), then does one of two things:
   the PR itself, prepares a reviewer-facing body for a workflow-owned publisher,
   or stops after a local commit when `skip_push` is enabled.
 
+## Prompt trial
+
+Resolve opts into `executor.config.system_prompt_preset: claude_code`: Claude
+Code's coding prompt plus Resolve's existing instructions. Tools, permissions,
+model settings, and review requirements are unchanged. Other SDK agents keep
+their current prompt unless they opt in.
+
+After 3–5 days, compare time to a validated fix, review rounds, unresolved
+findings, and token cost with the preceding period, separating new fixes from
+reviews of existing PRs. The harness logs `system_prompt_preset=claude_code`;
+use that marker to identify trial sessions. This is a before/after observation,
+not a controlled benchmark. Remove the setting from `config.yaml` to roll back
+for new sessions; there is no automatic expiry.
+
 ## Prerequisites
 
 - A configured Claude provider (`omnigent setup` — an Anthropic API key, a
@@ -186,7 +200,8 @@ to the publisher. No new test-selection gate is introduced.
      findings, including non-blocking notes. Fixes needed changes and records
      evidenced invalid/not-needed dispositions. After every push, dispatches
      both workflows (the bot equivalent of `/review` and `/ocr`) and waits for
-     current-head completion proof. There is no fixed round cap. A bundled live
+     current-head completion proof. Without a workflow budget it stops after three
+     rounds and reassesses the approach. A bundled live
      checker rejects missing reviews, stale receipts, and missing dispositions;
      a concrete blocker or execution deadline produces an incomplete checkpoint.
    - Writes a **paste-to-an-agent live-validation prompt** into the PR body so a

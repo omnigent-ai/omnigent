@@ -9,6 +9,7 @@ import re
 import shutil
 import signal
 import socket
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -22,13 +23,18 @@ from playwright.sync_api import sync_playwright
 
 from tests._helpers.live_server import isolated_local_server, isolated_process_env
 from tests._helpers.polling import poll_until
-from tests.e2e._host_login_workspace import USER_EMAIL, HostLoginWorkspace
+from tests.e2e._host_login_workspace import (
+    MOUNT,
+    USER_EMAIL,
+    WORKSPACE_ID,
+    HostLoginWorkspace,
+)
 
 pytestmark = [
     pytest.mark.skipif(sys.platform != "linux", reason="browser opener uses Linux xdg-open"),
     pytest.mark.skipif(
-        not shutil.which("databricks") or not shutil.which("openssl"),
-        reason="real Databricks CLI and openssl required",
+        not shutil.which("openssl"),
+        reason="openssl required for the local test CA",
     ),
     pytest.mark.timeout(180),
 ]
@@ -108,6 +114,79 @@ class _UnansweredListener(contextlib.AbstractContextManager):
             connection.close()
 
 
+def test_login_rejects_truncated_workspace_selector(tmp_path: Path) -> None:
+    """The real CLI checks an accepted bearer against the edge's workspace identity."""
+    with (
+        isolated_local_server(tmp_path / "server") as base_url,
+        HostLoginWorkspace(tmp_path / "workspace", base_url) as workspace,
+    ):
+        home = tmp_path / "cli-home"
+        workspace.seed_login(home)
+        data = home / ".omnigent"
+        auth_file = data / "auth_tokens.json"
+        original_auth = auth_file.read_bytes()
+        config_file = data / "config.yaml"
+        config_file.write_text("server: http://127.0.0.1:1\n")
+        original_config = config_file.read_bytes()
+        profile_file = home / ".databrickscfg"
+        env = isolated_process_env(
+            home,
+            {
+                "OMNIGENT_CONFIG_HOME": str(data),
+                "OMNIGENT_NO_UPDATE_CHECK": "1",
+                "DATABRICKS_CONFIG_FILE": str(profile_file),
+                "DATABRICKS_CONFIG_PROFILE": "local-test",
+                "SSL_CERT_FILE": str(workspace.cert),
+                "REQUESTS_CA_BUNDLE": str(workspace.cert),
+            },
+            None,
+        )
+        # Loopback probes disable trust_env (and hence SSL_CERT_FILE); provide
+        # the test CA as the CLI process's default bundle, keeping TLS verified.
+        cli_argv = [
+            sys.executable,
+            "-c",
+            "import os, certifi\n"
+            "certifi.where = lambda: os.environ['SSL_CERT_FILE']\n"
+            "from omnigent.cli import main\n"
+            "main()\n",
+            "login",
+        ]
+        result = subprocess.run(
+            [*cli_argv, f"{workspace.server_url}?o=123"],
+            env=env,
+            cwd=home,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        output = result.stdout + result.stderr
+        (tmp_path / "mismatched-login.txt").write_text(output)
+        assert f"{MOUNT}/v1/me?o=123" in workspace.authenticated_requests
+        assert result.returncode != 0, output
+        assert "Requested workspace 123," in output
+        assert f"reports workspace {WORKSPACE_ID}." in output
+        assert "truncated" in output
+        assert "omnigent stop" not in output
+        assert auth_file.read_bytes() == original_auth
+        assert config_file.read_bytes() == original_config
+
+        retry = subprocess.run(
+            [*cli_argv, f"{workspace.server_url}?o={WORKSPACE_ID}"],
+            env=env,
+            cwd=home,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        (tmp_path / "corrected-login.txt").write_text(retry.stdout + retry.stderr)
+        assert retry.returncode == 0, retry.stdout + retry.stderr
+        assert f"Logged in as {USER_EMAIL}" in retry.stdout
+        assert json.loads(auth_file.read_text())[workspace.server_url]["org_id"] == WORKSPACE_ID
+        assert workspace.authorizations == 0
+
+
+@pytest.mark.skipif(not shutil.which("databricks"), reason="real Databricks CLI required")
 def test_first_host_login_registers_and_reuses_credentials(tmp_path: Path) -> None:
     """Missing CLI gives an install hint; retry signs in, registers, and reuses its login."""
     with sync_playwright() as playwright:
@@ -200,6 +279,7 @@ def _stop_interactively(child: pexpect.spawn) -> None:
     child.close(force=True)
 
 
+@pytest.mark.skipif(not shutil.which("databricks"), reason="real Databricks CLI required")
 def test_start_reports_unfinished_login_when_browser_callback_hangs(tmp_path: Path) -> None:
     """The terminal must not stay silent while the browser's localhost callback goes unanswered."""
     with contextlib.ExitStack() as stack:

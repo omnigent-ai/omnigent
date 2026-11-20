@@ -6,7 +6,10 @@ import pytest
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import HostHelloFrame, decode_host_frame, encode_host_frame
-from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
+from omnigent.inner.native_attachments import (
+    CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
+    CAP_FILESYSTEM_ATTACHMENTS,
+)
 from omnigent.runner.transports.ws_tunnel.frames import HelloFrame, decode_frame, encode_frame
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.server.host_registry import HostRegistry
@@ -27,10 +30,19 @@ from omnigent.server.routes._sessions.helpers import require_filesystem_attachme
         (None, None, ErrorCode.CONFLICT),
     ],
 )
+@pytest.mark.parametrize(
+    "required", [CAP_FILESYSTEM_ATTACHMENTS, CAP_FILESYSTEM_ATTACHMENT_DELIVERY]
+)
 async def test_connected_builds_must_advertise_attachment_support(
-    host_capable: bool | None, runner_capable: bool | None, expected: str | None
+    host_capable: bool | None,
+    runner_capable: bool | None,
+    expected: str | None,
+    required: str,
 ) -> None:
     """Legacy omitted tokens fail closed, including a stale runner under a new daemon."""
+    # A build lacking per-file delivery still advertises the original token.
+    older = [] if required == CAP_FILESYSTEM_ATTACHMENTS else [CAP_FILESYSTEM_ATTACHMENTS]
+    advertised = {True: [*older, required], False: older}
     hosts = HostRegistry()
     runners = TunnelRegistry()
     if host_capable is not None:
@@ -40,7 +52,7 @@ async def test_connected_builds_must_advertise_attachment_support(
                     version="0.14.0",
                     frame_protocol_version=1,
                     name="host",
-                    capabilities=[CAP_FILESYSTEM_ATTACHMENTS] if host_capable else [],
+                    capabilities=advertised[host_capable],
                 )
             )
         )
@@ -52,7 +64,7 @@ async def test_connected_builds_must_advertise_attachment_support(
                 HelloFrame(
                     runner_version="0.14.0",
                     frame_protocol_version=1,
-                    capabilities=[CAP_FILESYSTEM_ATTACHMENTS] if runner_capable else [],
+                    capabilities=advertised[runner_capable],
                 )
             )
         )
@@ -63,6 +75,7 @@ async def test_connected_builds_must_advertise_attachment_support(
         "runner_id": "runner_test" if runner_capable is not None else None,
         "host_registry": hosts,
         "tunnel_registry": runners,
+        "capability": required,
     }
     if expected is None:
         require_filesystem_attachment_runtime(**kwargs)

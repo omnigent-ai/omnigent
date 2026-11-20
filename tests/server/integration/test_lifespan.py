@@ -10,12 +10,15 @@ lifespan exits.
 from __future__ import annotations
 
 import asyncio
+import threading
 from pathlib import Path
 from unittest.mock import Mock
 
 import httpx
 import pytest
 from fastapi import FastAPI
+
+from tests.budgets import budget
 
 pytestmark = pytest.mark.asyncio
 
@@ -160,5 +163,14 @@ async def test_lifespan_starts_periodic_metrics_otel_publisher(
         fake_publisher,
     )
 
+    threads_before = set(threading.enumerate())
     async with app.router.lifespan_context(app):
         await asyncio.wait_for(publisher_started.wait(), timeout=1.0)
+        watchdogs = [
+            thread
+            for thread in set(threading.enumerate()) - threads_before
+            if thread.name == "omnigent-event-loop-watchdog"
+        ]
+        assert len(watchdogs) == 1
+    watchdogs[0].join(timeout=budget(3))
+    assert not watchdogs[0].is_alive()

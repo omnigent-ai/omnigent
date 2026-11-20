@@ -90,6 +90,22 @@ describe("MarkdownSearchBar", () => {
     expect(screen.getByText(`1 / ${highlighted}`)).toBeDefined();
   });
 
+  it("recounts when another writer's update replaces the document", async () => {
+    renderBar();
+    await act(async () => {
+      type("the");
+    });
+    expect(screen.getByText("1 / 2")).toBeDefined();
+    // External updates are applied without an "update" event (see applyExternalMarkdown).
+    await act(async () => {
+      editor!.commands.setContent("A story about the end.", {
+        emitUpdate: false,
+        contentType: "markdown",
+      });
+    });
+    expect(screen.getByText("1 / 1")).toBeDefined();
+  });
+
   it("shows 'No results' when nothing matches", async () => {
     renderBar();
     await act(async () => {
@@ -97,6 +113,16 @@ describe("MarkdownSearchBar", () => {
     });
     expect(screen.getByText("No results")).toBeDefined();
     expect(editor!.view.dom.querySelectorAll(".md-search-match")).toHaveLength(0);
+  });
+
+  it("stays on the current match on the Enter that confirms an IME candidate", async () => {
+    renderBar();
+    const input = await act(async () => type("the"));
+    expect(screen.getByText("1 / 2")).toBeDefined();
+    await act(async () => {
+      fireEvent.keyDown(input, { key: "Enter", keyCode: 229 });
+    });
+    expect(screen.getByText("1 / 2")).toBeDefined();
   });
 
   it("advances to the next match on Enter and wraps around", async () => {

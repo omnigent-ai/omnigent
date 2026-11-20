@@ -18,7 +18,7 @@ class DatabricksOAuthConfigurationTest {
         )
 
     @Test
-    fun `requires a public client id and exact HTTPS redirect`() {
+    fun `requires a public client id and an exact registered redirect`() {
         assertThrows(IllegalArgumentException::class.java) {
             DatabricksOAuthConfiguration("", configuration.redirectUri)
         }
@@ -32,6 +32,11 @@ class DatabricksOAuthConfigurationTest {
             "https://login.databricks.com",
             "https://login.databricks.com/mobile-redirect?next=x",
             "https://login.databricks.com/mobile-redirect#fragment",
+            "ai.omnigent.android://other",
+            "ai.omnigent.android://mobile-redirect/extra",
+            "ai.omnigent.android://user@mobile-redirect",
+            "ai.omnigent.android://mobile-redirect?next=x",
+            "ai.omnigent.android://mobile-redirect#fragment",
         ).forEach { redirect ->
             assertThrows(IllegalArgumentException::class.java) {
                 DatabricksOAuthConfiguration("public-client", URI(redirect))
@@ -73,6 +78,22 @@ class DatabricksOAuthConfigurationTest {
         ).forEach { callback ->
             assertFalse(configuration.matchesCallback(URI(callback)))
         }
+    }
+
+    @Test
+    fun `private redirect rejects HTTPS callbacks`() {
+        val private =
+            DatabricksOAuthConfiguration(
+                "public-client",
+                URI("ai.omnigent.android://mobile-redirect"),
+            )
+        assertTrue(private.isPrivateRedirect)
+        assertTrue(private.matchesCallback(URI("${private.redirectUri}?code=c&state=s")))
+        assertFalse(
+            private.matchesCallback(
+                URI("https://login.databricks.com/mobile-redirect?code=c&state=s"),
+            ),
+        )
     }
 
     @Test

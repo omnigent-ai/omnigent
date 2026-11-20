@@ -1,8 +1,7 @@
 """End-to-end test: ``instructions:`` field loading (mock LLM).
 
-Migrated to mock LLM: the mock server returns the marker string
-so the test proves the instructions file was loaded and used as
-the system prompt.
+The model request must contain the instructions, and the one-shot CLI
+must print the scripted reply.
 
 **What breaks if this fails:**
 - ``omnigent/inner/loader.py::_resolve_instructions`` regresses.
@@ -14,10 +13,16 @@ the system prompt.
 
 from __future__ import annotations
 
+import json
 import subprocess
+from collections.abc import Iterator
 from pathlib import Path
 
-from tests.e2e.conftest import configure_mock_llm, reset_mock_llm
+import pytest
+
+from omnigent.testing.process_reaper import reap_leaked_omnigent_processes
+from tests._helpers.live_server import isolated_process_env
+from tests.e2e.conftest import configure_mock_llm, get_mock_requests, reset_mock_llm
 
 _HARNESS = "openai-agents"
 _MODEL = "mock-instructions-model"
@@ -26,6 +31,41 @@ _RUN_TIMEOUT_SEC = 60
 
 _MARKER_PATH_CASE = "OMNI_INSTR_PATH_QXZP"
 _MARKER_INLINE_CASE = "OMNI_INSTR_INLINE_QXZP"
+
+
+@pytest.fixture
+def instructions_env(
+    mock_credentials_env: dict[str, str], tmp_path: Path
+) -> Iterator[dict[str, str]]:
+    home = tmp_path / "home"
+    config = home / ".omnigent"
+    config.mkdir(parents=True)
+    (config / "config.yaml").write_text("auth:\n  type: api_key\n", encoding="utf-8")
+    env = isolated_process_env(
+        home,
+        {
+            "OMNIGENT_CONFIG_HOME": str(config),
+            "OMNIGENT_SKIP_ONBOARD": "1",
+            "OMNIGENT_NO_UPDATE_CHECK": "1",
+        },
+        base_env=mock_credentials_env,
+    )
+    try:
+        yield env
+    finally:
+        _, survivors = reap_leaked_omnigent_processes(config)
+        assert not survivors, f"Test runtime processes survived cleanup: {survivors}"
+
+
+def _system_instructions(mock_url: str) -> str:
+    parts: list[str] = []
+    for request in get_mock_requests(mock_url, key=_MODEL):
+        if isinstance(request.get("instructions"), str):
+            parts.append(request["instructions"])
+        for message in request.get("input", request.get("messages", [])):
+            if isinstance(message, dict) and message.get("role") in ("system", "developer"):
+                parts.append(json.dumps(message["content"]))
+    return "\n".join(parts)
 
 
 def _argv_run_omnigent(
@@ -54,7 +94,7 @@ def _argv_run_omnigent(
 def test_instructions_path_field_loaded_via_omnigent_run_omnigent(
     omnigent_python: Path,
     omnigent_repo_root: Path,
-    mock_credentials_env: dict[str, str],
+    instructions_env: dict[str, str],
     mock_llm_server_url: str,
     tmp_path: Path,
 ) -> None:
@@ -62,8 +102,7 @@ def test_instructions_path_field_loaded_via_omnigent_run_omnigent(
     A YAML with ``instructions: AGENTS.md`` runs through
     ``omnigent run`` and the agent starts successfully.
 
-    The mock LLM is configured to return the marker, proving
-    the instructions file was resolved and injected.
+    Inspect the system prompt as well as the scripted reply.
     """
     reset_mock_llm(mock_llm_server_url)
     configure_mock_llm(
@@ -94,7 +133,7 @@ instructions: AGENTS.md
             yaml_path=yaml_path,
             prompt="say hi",
         ),
-        env=mock_credentials_env,
+        env=instructions_env,
         cwd=str(omnigent_repo_root),
         capture_output=True,
         text=True,
@@ -104,6 +143,9 @@ instructions: AGENTS.md
         f"omnigent run exited {result.returncode}. "
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
+    system = _system_instructions(mock_llm_server_url)
+    assert _MARKER_PATH_CASE in system, system
+    assert "ignored placeholder that must NOT win over instructions" not in system, system
     assert _MARKER_PATH_CASE in result.stdout, (
         f"Marker {_MARKER_PATH_CASE!r} not in stdout -- the "
         f"instructions file did not reach the LLM.\n"
@@ -115,7 +157,7 @@ instructions: AGENTS.md
 def test_instructions_inline_text_treated_as_system_prompt(
     omnigent_python: Path,
     omnigent_repo_root: Path,
-    mock_credentials_env: dict[str, str],
+    instructions_env: dict[str, str],
     mock_llm_server_url: str,
     tmp_path: Path,
 ) -> None:
@@ -123,7 +165,7 @@ def test_instructions_inline_text_treated_as_system_prompt(
     A YAML with ``instructions: |`` (multiline literal) treats
     the string as inline text and injects it as the system prompt.
 
-    The mock LLM returns the marker to confirm.
+    Inspect the system prompt as well as the scripted reply.
     """
     reset_mock_llm(mock_llm_server_url)
     configure_mock_llm(
@@ -151,7 +193,7 @@ instructions: |
             yaml_path=yaml_path,
             prompt="say hi",
         ),
-        env=mock_credentials_env,
+        env=instructions_env,
         cwd=str(omnigent_repo_root),
         capture_output=True,
         text=True,
@@ -161,6 +203,8 @@ instructions: |
         f"omnigent run exited {result.returncode}. "
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
+    system = _system_instructions(mock_llm_server_url)
+    assert _MARKER_INLINE_CASE in system, system
     assert _MARKER_INLINE_CASE in result.stdout, (
         f"Marker {_MARKER_INLINE_CASE!r} not in stdout -- the "
         f"inline instructions text did not reach the LLM.\n"
