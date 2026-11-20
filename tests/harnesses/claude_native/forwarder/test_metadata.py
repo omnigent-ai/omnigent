@@ -18,6 +18,7 @@ import omnigent.harnesses.claude_native.forwarder as forwarder
 from omnigent.harnesses.claude_native.bridge import (
     BtwOverlay,
     ClaudeTranscriptItem,
+    record_hook_event,
     write_tmux_target,
 )
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, EFFORT_CLEAR_VALUES
@@ -1112,62 +1113,85 @@ def _failed_status_posts(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
+@pytest.mark.parametrize(
+    ("rejection", "status"),
+    [
+        pytest.param(_BUDGET_RETRY_ERROR, 403, id="budget-403"),
+        pytest.param(
+            '401 {"type":"error","error":{"type":"authentication_error"}}', 401, id="auth-401"
+        ),
+    ],
+)
 @pytest.mark.asyncio
 async def test_forward_pane_signals_fails_and_interrupts_a_rejected_api_retry(
+    rejection: str,
+    status: int,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """
-    A 403 retry row fails the turn with its error, then sends one Escape.
+    A 401/403 retry row fails the turn with its error, then sends one Escape.
 
     Claude Code retries a gateway budget rejection ten times while the web
     shows only a working spinner. The row stays visible through its backoff,
     so repeat polls must not post or interrupt again. A rejection is reported
-    afresh once the row leaves the pane, or in a turn sent before any poll
-    saw the pane without one.
+    afresh once the row leaves the pane, or for a newer prompt submitted
+    before any poll saw the pane without one. A rejection before any output
+    has no response id, so only the prompt tells the turns apart.
     """
     bridge_dir, panes, sent_keys = _fake_tmux_pane(monkeypatch, tmp_path)
     calls, transport = _btw_recording_client_calls()
     dedupe = forwarder._ForwardDedupeState()
+    hook_state = forwarder.HookForwardState(event_cursor=0, byte_offset=0)
 
-    async def _poll(pane: str, response_id: str = "resp_1") -> None:
-        panes.append(pane)
-        await forwarder._forward_pane_signals(
-            client,
+    async def _submit_prompt() -> None:
+        nonlocal hook_state
+        record_hook_event(bridge_dir, {"hook_event_name": "UserPromptSubmit"})
+        hook_state = await forwarder._forward_available_status_events(
+            client=client,
             session_id="conv1",
             bridge_dir=bridge_dir,
+            state=hook_state,
+            retry_tracker=forwarder._PostRetryTracker(),
             dedupe=dedupe,
-            response_id=response_id,
+            task_subjects={},
+            task_statuses={},
+            task_order=[],
+        )
+
+    async def _poll(pane: str) -> None:
+        panes.append(pane)
+        await forwarder._forward_pane_signals(
+            client, session_id="conv1", bridge_dir=bridge_dir, dedupe=dedupe
         )
 
     async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
-        await _poll(_claude_pane(f"✻ {_BUDGET_RETRY_ERROR} · Retrying in 2s · attempt 3/10"))
-        await _poll(_claude_pane(f"✻ {_BUDGET_RETRY_ERROR} · Retrying in 1s · attempt 3/10"))
+        await _submit_prompt()
+        await _poll(_claude_pane(f"✻ {rejection} · Retrying in 2s · attempt 3/10"))
+        await _poll(_claude_pane(f"✻ {rejection} · Retrying in 1s · attempt 3/10"))
 
         (failed,) = _failed_status_posts(calls)
-        assert failed["response_id"] == "resp_1"
-        assert failed["failure_detail"].startswith(f"API Error: {_BUDGET_RETRY_ERROR}")
+        assert "response_id" not in failed
+        assert failed["failure_detail"].startswith(f"API Error: {rejection}")
         assert "attempt 3 of 10" in failed["failure_detail"]
-        assert failed["failure_context"]["http_status"] == 403
+        assert failed["failure_context"]["http_status"] == status
         assert failed["failure_context"]["failure_source"] == "claude_api_retry"
         assert len(sent_keys) == 1
         assert sent_keys[0][-1] == "Escape"
 
         await _poll(_claude_pane("✻ Billowing…"))
-        await _poll(_claude_pane(f"✻ {_BUDGET_RETRY_ERROR} · Retrying in 3s · attempt 3/10"))
+        await _poll(_claude_pane(f"✻ {rejection} · Retrying in 3s · attempt 3/10"))
         assert len(_failed_status_posts(calls)) == 2
         assert len(sent_keys) == 2
 
-        await _poll(_claude_pane("✻ API error · Retrying in 1s · attempt 2/10"), "resp_2")
-        await _poll(
-            _claude_pane(f"✻ {_BUDGET_RETRY_ERROR} · Retrying in 2s · attempt 3/10"), "resp_2"
-        )
+        await _submit_prompt()
+        await _poll(_claude_pane("✻ API error · Retrying in 1s · attempt 2/10"))
+        await _poll(_claude_pane(f"✻ {rejection} · Retrying in 2s · attempt 3/10"))
+        await _poll(_claude_pane(f"✻ {rejection} · Retrying in 1s · attempt 3/10"))
 
-    assert [post["response_id"] for post in _failed_status_posts(calls)] == [
-        "resp_1",
-        "resp_1",
-        "resp_2",
-    ]
+    failure_ids = [post["failure_context"]["failure_id"] for post in _failed_status_posts(calls)]
+    assert len(failure_ids) == 3
+    assert failure_ids[0] == failure_ids[1] != failure_ids[2]
     assert len(sent_keys) == 3
 
 
@@ -1175,6 +1199,8 @@ async def test_forward_pane_signals_fails_and_interrupts_a_rejected_api_retry(
     "status_row",
     [
         pytest.param("✻ 429 Too many requests · Retrying in 4s · attempt 3/10", id="rate-limit"),
+        pytest.param("✻ 500 Internal server error · Retrying in 4s · attempt 3/10", id="500"),
+        pytest.param("✻ 503 Service unavailable · Retrying in 4s · attempt 3/10", id="503"),
         pytest.param("✻ Waiting for API response · Retrying in 4s · attempt 1/10", id="no-status"),
     ],
 )
