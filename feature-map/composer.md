@@ -306,7 +306,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   which then uses its own Dictation controls, and is absent elsewhere.
 - `send-shortcut`: Enter or Mod+Enter, chosen in settings; only one gesture sends.
   Shift+Enter and Alt/Option+Enter insert a newline in both composers. The
-  Inbox reply box follows the same shortcut.
+  Inbox reply box follows the same shortcut. On a touch-primary device, or in a
+  phone-width browser window, plain Enter inserts a newline and only the Send
+  button sends; a desktop browser window in the tablet range of the mobile
+  layout keeps the chosen shortcut.
 - `blocked-start`: hovering or focusing disabled Start explains the missing
   setup. Clicking, tapping, or trying to submit pins that explanation until
   dismissed or the missing setup is completed.
