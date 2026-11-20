@@ -2398,12 +2398,12 @@ async def test_cli_settings_request_ownership_survives_admission_and_terminal_li
                     assert not baseline.with_suffix(".dispatch.owner").exists()
                 request.close()
                 if mode == "expired-before-admission":
-                    assert baseline.read_bytes() == baseline_bytes
+                    assert not baseline.exists()
                     request_claude_bridge_deletion(bridge_dir, session_id)
                     assert not bridge_dir.exists()
                 if mode == "expired-after-admission":
-                    assert baseline.read_bytes() == baseline_bytes
-                    assert prune_unused_claude_settings(bridge_dir) == 1
+                    assert not baseline.exists()
+                    assert prune_unused_claude_settings(bridge_dir) == 0
                 assert not list(bridge_dir.glob(f"claude-settings-{request.generation}*"))
                 if mode in {"expired", "expired-before-admission", "expired-after-admission"}:
                     assert response.json()["error"]["code"] == "conflict"

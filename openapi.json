@@ -25519,6 +25519,88 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/resources/claude-settings-v2/terminals": {
+      "get": {
+        "description": "Return only terminal resources for a session.\n\nThe runner endpoint's pagination params (`limit` / `after` /\n`before` / `order`) are forwarded from the incoming query\nstring \u2014 without this, a client-requested `order=asc` (the web\nterminal tabs rely on creation order to keep the session's own\nterminal first) would be silently dropped and the runner's\n`desc` default would apply.\n\n**Returns:** `PaginatedList` of terminal resources.",
+        "operationId": "list_session_terminals_v1_sessions__session_id__resources_claude_settings_v2_terminals_get",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Session Terminals",
+        "tags": [
+          "session_resources"
+        ]
+      },
+      "post": {
+        "description": "Launch or return an existing terminal resource.\n\nPreserves `sys_terminal_launch` idempotency: an\nalready-running `(terminal, session_key)` returns the\nexisting resource.\n\nUser-initiated creates are gated on the agent's terminal\naccess: the requested `terminal` must be one of the names\ndeclared in the agent spec's `terminals:` block. Native\nharness bootstrap requests (marked `ensure_native_terminal`\nor `bridge_inject_dir` \u2014 the `omnigent claude` / `codex`\nwrappers launching the session's own CLI terminal) are exempt:\nthey launch undeclared names via the runner's\nsynthesize-from-body path and predate the gate. The markers\nare client-controlled, so the exemption is narrowed to the\nexact shape those wrappers send \u2014 a registered native terminal\nname with `session_key` `\"main\"` from a session owner.\nOther callers still pass the declared-name gate, because the\nbootstrap path may synthesize a terminal from the request body.\n\n**Returns:** The terminal resource object.\n\n**Raises**\n\n- `OmnigentError` \u2014 400 when the requested terminal is not declared by the agent spec (or the agent has no `terminals:` block at all).",
+        "operationId": "create_session_terminal_v1_sessions__session_id__resources_claude_settings_v2_terminals_post",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Session Terminal",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/resources/environments": {
       "get": {
         "description": "Return only environment resources for a session.\n\n**Returns:** `PaginatedList` of environment resources.",

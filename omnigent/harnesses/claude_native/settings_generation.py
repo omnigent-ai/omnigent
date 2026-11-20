@@ -653,6 +653,11 @@ class ClaudeSettingsLease:
             raise ClaudeSettingsRequestExpired()
         return lifecycle
 
+    def check_current(self) -> None:
+        """Fence stale preparation before reading caller files or retaining a terminal."""
+        with bridge_dir_preparation_lock(self.bridge_dir):
+            self._require_current()
+
     def _retain_for_terminal(self) -> ClaudeSettingsLease:
         with bridge_dir_preparation_lock(self.bridge_dir):
             if self._fd is None:

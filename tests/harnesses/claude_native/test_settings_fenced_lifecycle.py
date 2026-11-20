@@ -294,8 +294,14 @@ def test_fenced_request_cannot_be_admitted_for_another_session(bridge_dir: Path)
         assert baseline.read_bytes() == contents
         with acquire_claude_settings_request(
             bridge_dir, request.generation, protocol=2, expected_session_id="conv_fenced"
-        ):
-            pass
+        ) as receiver:
+            receiver.check_current()
+            assert not list(bridge_dir.glob("*.terminal-*.owner"))
+            request_claude_bridge_deletion(bridge_dir, "conv_fenced")
+            bridge.prepare_bridge_dir("conv_fenced", workspace=bridge_dir.parent)
+            with pytest.raises(ValueError, match="expired"):
+                receiver.check_current()
+            assert baseline.read_bytes() == contents
 
 
 @pytest.mark.parametrize("failure", ["early-return", "bootstrap-error", "cancel"])
