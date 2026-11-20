@@ -1483,19 +1483,31 @@ def test_forwarder_backfill_seeds_child_status_from_newest_turn(
     assert _child_statuses(posted) == expected_posts
 
 
+@pytest.mark.parametrize(
+    ("resume_status", "live_event", "expected_statuses", "expected_state"),
+    [
+        ("completed", _child_turn_event("turn/started"), ["running", "running"], "running"),
+        ("inProgress", _child_turn_event("turn/completed"), ["idle"], "idle"),
+        ("inProgress", _child_turn_event("turn/failed"), ["failed"], "failed"),
+    ],
+    ids=["live-start", "live-completion", "live-failure"],
+)
 def test_forwarder_backfilled_status_does_not_overwrite_live_child_turn(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    resume_status: str,
+    live_event: dict[str, Any],
+    expected_statuses: list[str],
+    expected_state: str,
 ) -> None:
     """
-    A child's live turn edge wins over a stale terminal status in its backfill.
+    A live child lifecycle edge wins over a delayed resume status in either direction.
 
-    The child starts a new turn while its ``thread/resume`` is still pending, so
-    the resumed completed turn must not settle a child that is running.
+    A completion or failure during resume also defeats a later stale running snapshot.
     """
     posted: list[tuple[str, dict[str, Any]]] = []
     codex_client = _SuspendingResumeClient(
-        {"thread_child": _child_resume_response(turn_status="completed")}
+        {"thread_child": _child_resume_response(turn_status=resume_status)}
     )
     state, bridge_dir = _snapshot_test_state(tmp_path, monkeypatch, codex_client=codex_client)
 
@@ -1516,12 +1528,14 @@ def test_forwarder_backfilled_status_does_not_overwrite_live_child_turn(
 
             spawn = asyncio.create_task(handle(_running_snapshot_event()))
             await asyncio.wait_for(codex_client.resume_started.wait(), timeout=5)
-            await handle(_child_turn_event("turn/started"))
+            await handle(live_event)
             codex_client.release_resume.set()
             await asyncio.wait_for(spawn, timeout=5)
+            if expected_state != "running":
+                await handle(_running_snapshot_event())
 
     asyncio.run(run())
 
     assert len(_transcript_posts(posted, "conv_child")) == 1, "child backfill did not replay"
-    assert _child_statuses(posted) == ["running", "running"]
-    assert state.child_turn_status("thread_child") == "running"
+    assert _child_statuses(posted) == expected_statuses
+    assert state.child_turn_status("thread_child") == expected_state
