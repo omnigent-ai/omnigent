@@ -1,9 +1,10 @@
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { useState } from "react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { readQuickPickHistory, recordQuickPickHistory } from "./history";
-import type { QuickPickItem } from "./model";
+import type { QuickPickItem, QuickPickSource } from "./model";
 import type { QuickPickSegment } from "./presentation";
 import { QuickPick, type QuickPickProps } from "./QuickPick";
 
@@ -402,6 +403,87 @@ describe("QuickPick history", () => {
     recordQuickPickHistory("commands", "removed");
     renderPicker({ historyKey: "commands" });
     expect(screen.queryByRole("group", { name: "Recent" })).not.toBeInTheDocument();
+  });
+});
+
+describe("QuickPick async sources", () => {
+  it("shows loading, then the loaded rows", async () => {
+    let resolve: (items: QuickPickItem<string>[]) => void = () => {};
+    const source: QuickPickSource<string> = {
+      id: "remote",
+      load: () =>
+        new Promise((settle) => {
+          resolve = settle;
+        }),
+    };
+    renderPicker({ segments: [], sources: [source] });
+    expect(screen.getByRole("status")).toHaveTextContent("Loading results…");
+    await act(async () => resolve([item("remote-1")]));
+    expect(screen.getByRole("option", { name: "remote-1" })).toBeVisible();
+    expect(screen.getByRole("status").textContent).toBe("1 result");
+  });
+
+  it("explains a failure and recovers with Try again", async () => {
+    let attempts = 0;
+    const source: QuickPickSource<string> = {
+      id: "remote",
+      load: async () => {
+        attempts += 1;
+        if (attempts === 1) throw new Error("Couldn't reach the server.");
+        return [item("recovered")];
+      },
+    };
+    renderPicker({ segments: [], sources: [source] });
+    expect(await screen.findByRole("status")).toHaveTextContent("Couldn't reach the server.");
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    expect(await screen.findByRole("option", { name: "recovered" })).toBeVisible();
+  });
+
+  it("returns focus to the query when Try again is pressed from the keyboard", async () => {
+    let attempts = 0;
+    const source: QuickPickSource<string> = {
+      id: "remote",
+      load: async () => {
+        attempts += 1;
+        if (attempts === 1) throw new Error("Couldn't reach the server.");
+        return [item("recovered")];
+      },
+    };
+    const { input } = renderPicker({ segments: [], sources: [source] });
+    const retry = await screen.findByRole("button", { name: "Try again" });
+    retry.focus();
+    await userEvent.keyboard("{Enter}");
+    expect(await screen.findByRole("option", { name: "recovered" })).toBeVisible();
+    expect(document.activeElement).toBe(input);
+  });
+
+  it("keeps the rows it has and offers Try again beside them after a later failure", async () => {
+    const source: QuickPickSource<string> = {
+      id: "remote",
+      queryDependent: true,
+      load: async ({ query }) => {
+        if (query) throw new Error("Search failed.");
+        return [item("first-result")];
+      },
+    };
+    const { input } = renderPicker({ segments: [], sources: [source] });
+    expect(await screen.findByRole("option", { name: "first-result" })).toBeVisible();
+    fireEvent.change(input, { target: { value: "first" } });
+    expect(await screen.findByText("Search failed.")).toBeVisible();
+    expect(screen.getByRole("option", { name: "first-result" })).toBeVisible();
+    // Screen readers hear the failure too, with the rows that remain.
+    expect(screen.getByRole("status")).toHaveTextContent("1 result. Search failed.");
+    expect(screen.getByRole("button", { name: "Try again" })).toBeVisible();
+  });
+
+  it("lists the sources' rows first with sourcesFirst", () => {
+    const source: QuickPickSource<string> = {
+      id: "sessions",
+      ranking: "provider",
+      load: () => [item("Recent session")],
+    };
+    renderPicker({ sources: [source], sourcesFirst: true });
+    expect(optionNames()[0]).toBe("Recent session");
   });
 });
 

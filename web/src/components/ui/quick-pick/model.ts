@@ -47,6 +47,56 @@ export interface QuickPickItem<Value = unknown> {
  */
 export type QuickPickRanking = "client" | "provider";
 
+export interface QuickPickLoadRequest<Value = unknown> {
+  query: string;
+  /** Aborted when a newer query, reload, or close supersedes this request. */
+  signal: AbortSignal;
+  /**
+   * Shows a partial snapshot while loading continues, for results that stream
+   * in. Each call replaces the previous snapshot; the settled value is final.
+   * Calls after abort or completion are ignored.
+   */
+  publish: (items: readonly QuickPickItem<Value>[]) => void;
+}
+
+/** Items a picker loads itself, such as a search that answers each query. */
+export interface QuickPickSource<Value = unknown> {
+  /**
+   * Stable identity; changing it resets the source's results. A new object with
+   * the same `id` does not reload, so callers need not memoize sources.
+   */
+  id: string;
+  load: (
+    request: QuickPickLoadRequest<Value>,
+  ) => readonly QuickPickItem<Value>[] | Promise<readonly QuickPickItem<Value>[]>;
+  /** Run `load` again as the query changes. Defaults to false (load once per open). */
+  queryDependent?: boolean;
+  /**
+   * Delay before a query-dependent reload. Previous results stay visible
+   * meanwhile, except provider-ranked ones, which match only their own query.
+   */
+  debounceMs?: number;
+  /** Changing this reloads the source and keeps its previous results visible. */
+  reloadKey?: string;
+  /**
+   * What the rows answer besides the query, such as search options. Changing it
+   * reloads after the debounce and, like a new query, hides the rows meanwhile.
+   */
+  resultKey?: string;
+  ranking?: QuickPickRanking;
+}
+
+export type QuickPickSourceStatus = "loading" | "ready" | "error";
+
+export interface QuickPickSourceState<Value = unknown> {
+  status: QuickPickSourceStatus;
+  /** Last successful results; retained while a newer load is in flight. */
+  items: readonly QuickPickItem<Value>[];
+  error?: string;
+  /** Duration of the most recent completed load. */
+  elapsedMs?: number;
+}
+
 export interface QuickPickHeadingRow {
   kind: "heading";
   key: string;

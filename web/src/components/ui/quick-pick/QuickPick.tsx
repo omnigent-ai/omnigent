@@ -13,12 +13,19 @@ import { SearchIcon, XIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { CompactShortcutKeys } from "@/components/ui/kbd";
+import { Spinner } from "@/components/ui/spinner";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { cn } from "@/lib/utils";
 
 import { readQuickPickHistory, recordQuickPickHistory } from "./history";
 import { HighlightedText, type MatchHighlight } from "./HighlightedText";
-import type { QuickPickAcceptResult, QuickPickItem, QuickPickItemRow, QuickPickRow } from "./model";
+import type {
+  QuickPickAcceptResult,
+  QuickPickItem,
+  QuickPickItemRow,
+  QuickPickRow,
+  QuickPickSource,
+} from "./model";
 import {
   buildQuickPickRows,
   navigateQuickPick,
@@ -26,13 +33,24 @@ import {
   type QuickPickSegment,
   reconcileActiveIndex,
 } from "./presentation";
+import { useQuickPickSources } from "./useQuickPickSources";
+
+const NO_SEGMENTS: readonly QuickPickSegment<never>[] = [];
+const NO_SOURCES: readonly QuickPickSource<never>[] = [];
 
 export interface QuickPickProps<Value> {
   /** Accessible name for the query field and results, such as "Command palette". */
   label: string;
   placeholder?: string;
   /** Runs of items in display order, such as search results and then commands. */
-  segments: readonly QuickPickSegment<Value>[];
+  segments?: readonly QuickPickSegment<Value>[];
+  /** Loaders for items that arrive asynchronously, listed after `segments`. */
+  sources?: readonly QuickPickSource<Value>[];
+  /**
+   * List `sources`' rows before `segments`, for a picker whose async results lead, unless an
+   * item matches the whole query from a word's start, such as a typed command name.
+   */
+  sourcesFirst?: boolean;
   query: string;
   onQueryChange: (query: string) => void;
   onAccept: (item: QuickPickItem<Value>) => QuickPickAcceptResult;
@@ -140,7 +158,9 @@ function navigationFor(
 export function QuickPick<Value>({
   label,
   placeholder,
-  segments,
+  segments = NO_SEGMENTS,
+  sources = NO_SOURCES,
+  sourcesFirst = false,
   query,
   onQueryChange,
   onAccept,
@@ -174,10 +194,29 @@ export function QuickPick<Value>({
   const [history, setHistory] = useState(() => ({ key: historyKey, ids: readRecents(historyKey) }));
   if (history.key !== historyKey) setHistory({ key: historyKey, ids: readRecents(historyKey) });
   const recentIds = history.ids;
-  const rows = useMemo(
-    () => (collapsed ? [] : buildQuickPickRows({ segments, query, recentIds })),
-    [collapsed, segments, query, recentIds],
+  const { states, retry } = useQuickPickSources(sources, query);
+  const allSegments = useMemo(
+    () => [
+      ...segments,
+      ...sources.map((source): QuickPickSegment<Value> => ({
+        sourceId: source.id,
+        ranking: source.ranking ?? "client",
+        origin: "source",
+        items: states[source.id]?.items ?? [],
+      })),
+    ],
+    [segments, sources, states],
   );
+  const rows = useMemo(
+    () =>
+      collapsed
+        ? []
+        : buildQuickPickRows({ segments: allSegments, query, recentIds, sourcesFirst }),
+    [collapsed, allSegments, query, recentIds, sourcesFirst],
+  );
+  const sourceStates = sources.map((source) => states[source.id]);
+  const loading = sourceStates.some((state) => !state || state.status === "loading");
+  const sourceError = sourceStates.find((state) => state?.status === "error")?.error ?? null;
   const sections = useMemo(() => sectionsOf(rows), [rows]);
   const resultCount = rows.filter((row) => row.kind === "item").length;
   const showEmpty = !collapsed && resultCount === 0;
@@ -436,15 +475,56 @@ export function QuickPick<Value>({
         )}
       >
         {status && <div data-slot="quick-pick-status">{status}</div>}
-        {/* Announces the empty message, shown, or the result count, visually hidden. */}
+        {/* Announces the empty message, shown, or the result count, visually hidden, with a
+            failure beside rows that remain. */}
         <div
           role="status"
           aria-live="polite"
           data-slot={showEmpty ? "quick-pick-empty" : undefined}
-          className={showEmpty && emptyMessage ? "py-6 text-center text-ui" : "sr-only"}
+          className={
+            showEmpty && (loading || sourceError || emptyMessage)
+              ? "flex items-center justify-center gap-2 py-6 text-center text-ui"
+              : "sr-only"
+          }
         >
-          {collapsed ? null : showEmpty ? emptyMessage : resultCountText(resultCount)}
+          {collapsed ? null : showEmpty ? (
+            loading ? (
+              <>
+                <Spinner aria-hidden role="presentation" />
+                Loading results…
+              </>
+            ) : (
+              (sourceError ?? emptyMessage)
+            )
+          ) : sourceError ? (
+            `${resultCountText(resultCount)}. ${sourceError}`
+          ) : (
+            resultCountText(resultCount)
+          )}
         </div>
+        {sourceError && !collapsed && (
+          // Outside the status region, which announces the failure itself.
+          <div
+            className={cn(
+              "flex items-center justify-center gap-2 text-sm",
+              showEmpty ? "pb-4" : "px-2 py-1.5 text-destructive",
+            )}
+          >
+            {!showEmpty && <span>{sourceError}</span>}
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                retry();
+                // The button leaves once the retry starts, so the query keeps the keys.
+                queryFieldRef.current?.focus();
+              }}
+            >
+              Try again
+            </Button>
+          </div>
+        )}
         <div id={listId} role="listbox" aria-label={label}>
           {sections.map((section, sectionIndex) => {
             const headingId = section.heading ? `${baseId}-heading-${sectionIndex}` : undefined;
