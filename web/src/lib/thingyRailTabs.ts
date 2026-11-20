@@ -19,6 +19,12 @@ interface ThingyRailState {
   newSessionMaximized: boolean;
   /** The thingy filling the screen now, in a session's side panel or beside New session. */
   fullScreenThingyId: string | null;
+  /**
+   * Whether the full screen thingy's Create session menu should open: a request from the thingy
+   * before its session exists waits there for the viewer to create one. The menu takes it when it
+   * opens, which can be after the navigation that made the request.
+   */
+  createSessionMenuRequested: boolean;
 }
 
 export const useThingyRailRequest = create<ThingyRailState>(() => ({
@@ -26,6 +32,7 @@ export const useThingyRailRequest = create<ThingyRailState>(() => ({
   exitFullScreen: null,
   newSessionMaximized: false,
   fullScreenThingyId: null,
+  createSessionMenuRequested: false,
 }));
 
 /**
@@ -80,6 +87,27 @@ export function setThingyNewSessionTabMaximized(maximized: boolean): void {
   useThingyRailRequest.setState({ newSessionMaximized: maximized });
 }
 
+/**
+ * Whether the thingy `thingyId` fills the screen now: in a session's side panel, or beside New
+ * session, where the full screen thingy is the only one showing.
+ */
+export function thingyFillsScreen(thingyId: string): boolean {
+  const state = useThingyRailRequest.getState();
+  return state.fullScreenThingyId === thingyId || state.newSessionMaximized;
+}
+
+/** Opens the Create session menu beside the full screen thingy that has no session yet. */
+export function requestThingyCreateSessionMenu(): void {
+  useThingyRailRequest.setState({ createSessionMenuRequested: true });
+}
+
+/** Takes a request to open the Create session menu; true when there was one. */
+export function takeThingyCreateSessionMenuRequest(): boolean {
+  if (!useThingyRailRequest.getState().createSessionMenuRequested) return false;
+  useThingyRailRequest.setState({ createSessionMenuRequested: false });
+  return true;
+}
+
 export function clearThingyRailRequest(): void {
   useThingyRailRequest.setState({ requested: null });
 }
@@ -91,5 +119,6 @@ export function resetThingyRailRequests(): void {
     exitFullScreen: null,
     newSessionMaximized: false,
     fullScreenThingyId: null,
+    createSessionMenuRequested: false,
   });
 }

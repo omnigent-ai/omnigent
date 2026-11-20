@@ -249,7 +249,7 @@ import {
   subscribeSessionHostChanges,
 } from "@/lib/sessionHost";
 import { HostBadge } from "@/components/HostBadge";
-import { MobileHeaderControlPortal } from "@/shell/MobileHeaderControlsSlot";
+import { MobileHeaderControlPortal, SessionControlPortal } from "@/shell/MobileHeaderControlsSlot";
 import {
   type McpServerRow,
   BUILTIN_SLASH_COMMANDS,
@@ -4791,7 +4791,7 @@ function ComposerImpl(
                 onOpen={savedWorkflows.refresh}
               />
               {!subAgentLabel && composerSessionId && (
-                <MobileHeaderControlPortal sessionId={composerSessionId}>
+                <MobileHeaderControlPortal sessionId={composerSessionId} popoverSlot="host">
                   <HostBadge
                     sessionId={composerSessionId}
                     appearance={isMobile ? "header" : "composer"}
@@ -4807,31 +4807,40 @@ function ComposerImpl(
                 </MobileHeaderControlPortal>
               )}
               {(showClaudePermissionMode || showCodexApprovalMode) && (
-                <ComposerPermissionPicker
-                  label="Permission mode"
-                  value={permissionLabel || "Permission mode"}
-                  harness={sessionHarness}
-                  selectedValue={selectedPermissionMode}
-                  options={permissionOptions}
-                  disabled={!permissionControlInteractive || configBusy}
-                  disabledReason={
-                    isOwnerLevel(permissionLevel)
-                      ? undefined
-                      : "Only the session owner can change the permission mode"
-                  }
-                  // The message box takes ⇧Tab, so not while it's disabled.
-                  shortcut={
-                    nextFromSelected === null || inputDisabled ? undefined : [SHIFT_KEY, "Tab"]
-                  }
-                  onSelect={(mode) => void changePermission(mode)}
-                  openNonce={permissionPickerOpenNonce}
-                />
+                <SessionControlPortal
+                  sessionId={composerSessionId}
+                  slot="permission"
+                  offered={composerSessionId !== null}
+                >
+                  <ComposerPermissionPicker
+                    label="Permission mode"
+                    value={permissionLabel || "Permission mode"}
+                    harness={sessionHarness}
+                    selectedValue={selectedPermissionMode}
+                    options={permissionOptions}
+                    disabled={!permissionControlInteractive || configBusy}
+                    disabledReason={
+                      isOwnerLevel(permissionLevel)
+                        ? undefined
+                        : "Only the session owner can change the permission mode"
+                    }
+                    // The message box takes ⇧Tab, so not while it's disabled.
+                    shortcut={
+                      nextFromSelected === null || inputDisabled ? undefined : [SHIFT_KEY, "Tab"]
+                    }
+                    onSelect={(mode) => void changePermission(mode)}
+                    openNonce={permissionPickerOpenNonce}
+                  />
+                </SessionControlPortal>
               )}
             </>
           ),
           trailing: (
             <>
-              <MobileHeaderControlPortal sessionId={composerSessionId}>
+              <MobileHeaderControlPortal
+                sessionId={composerSessionId}
+                popoverSlot={composerSessionId === null ? undefined : "harness"}
+              >
                 <div className="flex min-w-0 items-center rounded-lg">
                   <SessionHarnessPicker
                     appearance={isMobile ? "header" : "composer"}
@@ -4840,6 +4849,16 @@ function ComposerImpl(
                     setBusy={setConfigBusy}
                     openNonce={pickerOpenNonce}
                     modelPickerShortcutEnabled={modelPickerHotkeyEnabled}
+                    renderIcon={(icon) => (
+                      <SessionControlPortal
+                        sessionId={composerSessionId}
+                        slot="icon"
+                        inPlace={false}
+                        offered={composerSessionId !== null}
+                      >
+                        {icon}
+                      </SessionControlPortal>
+                    )}
                     {...sessionHarnessPicker}
                   />
                 </div>

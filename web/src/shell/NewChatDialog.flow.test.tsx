@@ -58,6 +58,9 @@ import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
+import { requestThingyCreateSessionMenu, resetThingyRailRequests } from "@/lib/thingyRailTabs";
+import { ThingyOpenSessionButton } from "@/thingies/ui/ThingyOpenSessionButton";
+import { MobileHeaderControlsProvider } from "./MobileHeaderControlsSlot";
 import { NewChatLandingScreen, resetLandingDraft, sanitizeInitialPrompt } from "./NewChatDialog";
 import { writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import { writeLastHostChoice } from "@/lib/hostPreferences";
@@ -275,6 +278,7 @@ function renderLanding(
   cachedSessionIds: string[] = [],
   infoOverrides: Partial<ServerInfo> = {},
   presentation: ComposerPresentation = { kind: "page" },
+  beside?: ReactNode,
 ): QueryClient {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -326,7 +330,17 @@ function renderLanding(
       </QueryClientProvider>
     );
   }
-  render(<NewChatLandingScreen />, { wrapper: Wrapper });
+  render(
+    beside === undefined ? (
+      <NewChatLandingScreen />
+    ) : (
+      <MobileHeaderControlsProvider>
+        {beside}
+        <NewChatLandingScreen />
+      </MobileHeaderControlsProvider>
+    ),
+    { wrapper: Wrapper },
+  );
   return client;
 }
 
@@ -451,6 +465,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  resetThingyRailRequests();
   cleanup();
   localStorage.clear();
 });
@@ -504,6 +519,45 @@ describe("NewChatLandingScreen in the floating panel", () => {
     expect(beginLocalConversationMock).not.toHaveBeenCalled();
     expect(setPendingInitialPromptMock).not.toHaveBeenCalled();
     expect(navigateMock).not.toHaveBeenCalled();
+  });
+
+  it("starts the session from a full screen thingy's Create session menu as Start does", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    const panel = floatingPanel();
+    const onOpenSession = vi.fn();
+
+    renderLanding(
+      [],
+      {},
+      panel,
+      <ThingyOpenSessionButton sessionId={null} onOpenSession={onOpenSession} />,
+    );
+    await waitForWorkspaceSeed();
+    typeMessage("inspect the repo");
+    act(() => {
+      requestThingyCreateSessionMenu();
+    });
+    const create = await screen.findByTestId("thingy-create-session");
+    // The menu holds New session's own controls.
+    expect(
+      within(screen.getByTestId("thingy-open-session-popover")).getByTestId(
+        "new-chat-landing-agent-select",
+      ),
+    ).toBeInTheDocument();
+    await waitFor(() => expect(create).toBeEnabled());
+    fireEvent.click(create);
+
+    await waitFor(() =>
+      expect(panel.launch).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionId: "conv_new", text: "inspect the repo" }),
+      ),
+    );
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toMatchObject({ host_id: "host_1" });
+    expect(onOpenSession).not.toHaveBeenCalled();
   });
 
   it.each([true, undefined])(

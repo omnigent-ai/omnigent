@@ -292,7 +292,7 @@ ${THINGY_KIT_HELPERS}
   var OPEN = ['pending', 'queued', 'running', 'needs_input'];
   var PENDING_MS = 10 * 60 * 1000;
   var FIND_TEXT = {
-    pending: 'Start your thingy session in New session beside this page, and it looks.',
+    pending: 'Create your thingy session, and it looks.',
     queued: 'Waiting for your thingy session to pick it up…',
     running: 'Reading your recent sessions for data work…',
     needs_input: 'Your thingy session is waiting for you.',
@@ -303,7 +303,7 @@ ${THINGY_KIT_HELPERS}
     interrupted: 'It stopped before it finished. Ask again.',
   };
   var BUILD_TEXT = {
-    pending: 'Start your thingy session in New session beside this page, and it builds the story.',
+    pending: 'Create your thingy session, and it builds the story.',
     queued: 'Waiting for your thingy session to pick it up…',
     running: 'Building your story…',
     needs_input: 'Your thingy session needs you to go on: open it.',
@@ -314,7 +314,7 @@ ${THINGY_KIT_HELPERS}
     interrupted: 'It stopped before it finished. Build it again.',
   };
   var REFRESH_TEXT = {
-    pending: 'Start your thingy session in New session beside this page, and it refreshes the data.',
+    pending: 'Create your thingy session, and it refreshes the data.',
     queued: 'Waiting for your thingy session to pick it up…',
     running: 'Refreshing the data…',
     needs_input: 'Your thingy session needs you to go on: open it.',
@@ -324,7 +324,7 @@ ${THINGY_KIT_HELPERS}
     finished_unreported: 'Your thingy session stopped before it reported.',
     interrupted: 'It stopped before it finished.',
   };
-  var RESTORE_TEXT = { pending: 'Start your thingy session, and it goes back.', running: 'Going back to the previous look…' };
+  var RESTORE_TEXT = { pending: 'Create your thingy session, and it goes back.', running: 'Going back to the previous look…' };
 
   var client = null;
   var preview = false;
@@ -768,7 +768,7 @@ ${THINGY_KIT_HELPERS}
     var button = $('refresh');
     button.hidden = !value || !canAct || Boolean(value.example);
     button.disabled = refresh.open && !refresh.undelivered;
-    button.textContent = refresh.open ? 'Refreshing…' : refresh.undelivered ? 'Start my thingy session' : 'Refresh data';
+    button.textContent = refresh.open ? 'Refreshing…' : refresh.undelivered ? 'Create my thingy session' : 'Refresh data';
   }
 
   function stages(listId, now) {
@@ -782,7 +782,7 @@ ${THINGY_KIT_HELPERS}
   function renderFindStatus(found, find, empty) {
     [$('find-empty'), $('find')].forEach(function (button) {
       button.disabled = !canAct || (find.open && !find.undelivered);
-      button.textContent = find.open ? 'Looking…' : find.undelivered ? 'Start my thingy session' : button.id === 'find' ? 'Suggest others' : 'Find stories in my work';
+      button.textContent = find.open ? 'Looking…' : find.undelivered ? 'Create my thingy session' : button.id === 'find' ? 'Suggest others' : 'Find stories in my work';
     });
     $('find').hidden = !canAct || !(found || story());
     $('window-label').hidden = !canAct;

@@ -832,7 +832,7 @@ describe("reference Kanban runs in a session", () => {
 
     expect(
       await within(cardItem("Fix login")).findByText(
-        "Start your thingy session beside the board to run this card.",
+        "Create your thingy session to run this card.",
       ),
     ).toBeVisible();
 

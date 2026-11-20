@@ -15,7 +15,11 @@ import {
 import { getOmnigentThingyFrame } from "@/lib/host";
 import { randomUUID } from "@/lib/randomUUID";
 import { useNavigate, useRebasePath } from "@/lib/routing";
-import { requestThingyRailTab } from "@/lib/thingyRailTabs";
+import {
+  requestThingyCreateSessionMenu,
+  requestThingyRailTab,
+  thingyFillsScreen,
+} from "@/lib/thingyRailTabs";
 
 import type {
   ThingyActionRequest,
@@ -271,12 +275,16 @@ export function ThingyFrame({
       }
       const current = { id: latestRef.current.app.id, name: latestRef.current.app.name };
       let path: string;
+      let createSessionMenu = false;
       switch (request.kind) {
         case "newSession": {
           const prompt = request.prompt ? composeThingyContextPrompt(request.prompt, current) : "";
+          // A full screen thingy stays so: New session's composer holds the prompt, and the
+          // Create session menu beside the thingy starts the session.
+          createSessionMenu = request.display === "panel" && thingyFillsScreen(current.id);
           path =
             request.display === "panel"
-              ? thingyBoardNewSessionUrl(current.id, prompt)
+              ? thingyBoardNewSessionUrl(current.id, prompt, { fullScreen: createSessionMenu })
               : thingyNewSessionUrl(prompt);
           break;
         }
@@ -300,6 +308,7 @@ export function ThingyFrame({
         window.open(url.href, "_blank", "noopener,noreferrer");
       } else {
         navigationRef.current.navigate(path);
+        if (createSessionMenu) requestThingyCreateSessionMenu();
       }
       return true;
     },

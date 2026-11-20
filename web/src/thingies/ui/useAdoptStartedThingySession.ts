@@ -25,6 +25,15 @@ import { invalidateThingies } from "./thingyQueries";
 let starting: string | null = null;
 // Thingies this tab created for New session to build, until a session adopts them.
 const unbuilt = new Set<string>();
+// Thingies filling the screen beside New session: the session started there shows them full
+// screen too, so creating it from the Create session menu keeps the view.
+const fullScreenStarts = new Set<string>();
+
+/** Notes whether the thingy beside New session fills the screen, for the session started there. */
+export function noteThingyStartFullScreen(thingyId: string, fullScreen: boolean): void {
+  if (fullScreen) fullScreenStarts.add(thingyId);
+  else fullScreenStarts.delete(thingyId);
+}
 
 /** Marks a thingy as created for New session to build; it goes again if New session is left. */
 export function rememberUnbuiltThingy(thingyId: string): void {
@@ -50,6 +59,7 @@ async function discardIfUnbuilt(thingyId: string, queryClient: QueryClient): Pro
  */
 export function leaveThingyStart(thingyId: string, queryClient: QueryClient): void {
   if (starting === thingyId) starting = null;
+  fullScreenStarts.delete(thingyId);
   void discardIfUnbuilt(thingyId, queryClient);
 }
 
@@ -57,6 +67,7 @@ export function leaveThingyStart(thingyId: string, queryClient: QueryClient): vo
 export function resetThingyStarts(): void {
   starting = null;
   unbuilt.clear();
+  fullScreenStarts.clear();
 }
 
 export function useAdoptStartedThingySession(): void {
@@ -93,8 +104,14 @@ export function useAdoptStartedThingySession(): void {
     }
     starting = null;
     unbuilt.delete(thingyId);
+    const fullScreen = fullScreenStarts.delete(thingyId);
     adoptStartedThingySession(thingyId, sessionId)
-      .then(() => requestThingyRailTab(sessionId, thingyRailKey(thingyId)))
+      .then(() => {
+        const key = thingyRailKey(thingyId);
+        // Started beside a full screen thingy: it stays full screen, the sidebar as it was.
+        if (fullScreen) requestThingyRailTab(sessionId, key, { maximize: true, keepSidebar: true });
+        else requestThingyRailTab(sessionId, key);
+      })
       // The session still runs; the thingy stays on its own page.
       .catch(() => undefined);
   }, [pathname, queryClient, search, sessionPrefix, replaceSearchParams]);

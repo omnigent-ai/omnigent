@@ -28,7 +28,7 @@ import { useNavigate, useReplaceSearchParams, useSearchParams } from "@/lib/rout
 import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
 import { CANVAS_QUERY_PARAM, canvasLocation } from "@/canvas/canvasNavigation";
 import { projectHomePath } from "@/projectHome/projectHomeNavigation";
-import { MobileHeaderControlPortal } from "./MobileHeaderControlsSlot";
+import { MobileHeaderControlPortal, SessionControlPortal } from "./MobileHeaderControlsSlot";
 import { OmniGlassSurface } from "@/components/OmniGlassSurface";
 import {
   ComposerWorkspaceBar,
@@ -7866,7 +7866,7 @@ function NewChatLandingContent({
                       )}
                     </div>
                     {/* Host chip */}
-                    <MobileHeaderControlPortal sessionId={null}>
+                    <MobileHeaderControlPortal sessionId={null} popoverSlot="host">
                       <DropdownMenu
                         onOpenChange={(open) => {
                           setHostMenuOpen(open);
@@ -8106,49 +8106,51 @@ function NewChatLandingContent({
                       </DropdownMenu>
                     </MobileHeaderControlPortal>
 
-                    {noExecutionTargetSelected ? (
-                      <ComposerPermissionPicker
-                        label="Permission mode"
-                        value="No host selected"
-                        harness={selectedNativeHarness}
-                        disabled
-                        iconOnly
-                        options={directModeOptions}
-                        onSelect={selectDirectMode}
-                        testIdPrefix="new-chat-landing"
-                      />
-                    ) : pickerLoading && !interactiveWhileLoading && cachedPermission === null ? (
-                      <NewChatPickerLoading
-                        label="Loading permissions"
-                        testId="new-chat-landing-permission-loading"
-                      />
-                    ) : visiblePermissionRow ? (
-                      <ComposerPermissionPicker
-                        label={visiblePermissionRow.label}
-                        value={visiblePermissionRow.value}
-                        harness={selectedNativeHarness}
-                        selectedValue={
-                          selectedNativeHarness === "claude-native"
-                            ? permissionMode
-                            : selectedNativeHarness === "codex-native"
-                              ? bypassSandbox
-                                ? CODEX_NATIVE_BYPASS_APPROVAL_VALUE
-                                : approvalMode
-                              : selectedNativeHarness === "cursor-native"
-                                ? cursorExecMode
-                                : selectedNativeHarness === "antigravity-native"
-                                  ? agySkipMode
-                                  : selectedNativeHarness === "devin-native"
-                                    ? devinPermissionMode
-                                    : undefined
-                        }
-                        loading={pickerLoading}
-                        interactiveWhileLoading={interactiveWhileLoading}
-                        options={directModeOptions}
-                        onSelect={selectDirectMode}
-                        testIdPrefix="new-chat-landing"
-                      />
-                    ) : null}
+                    <SessionControlPortal sessionId={null} slot="permission">
+                      {noExecutionTargetSelected ? (
+                        <ComposerPermissionPicker
+                          label="Permission mode"
+                          value="No host selected"
+                          harness={selectedNativeHarness}
+                          disabled
+                          iconOnly
+                          options={directModeOptions}
+                          onSelect={selectDirectMode}
+                          testIdPrefix="new-chat-landing"
+                        />
+                      ) : pickerLoading && !interactiveWhileLoading && cachedPermission === null ? (
+                        <NewChatPickerLoading
+                          label="Loading permissions"
+                          testId="new-chat-landing-permission-loading"
+                        />
+                      ) : visiblePermissionRow ? (
+                        <ComposerPermissionPicker
+                          label={visiblePermissionRow.label}
+                          value={visiblePermissionRow.value}
+                          harness={selectedNativeHarness}
+                          selectedValue={
+                            selectedNativeHarness === "claude-native"
+                              ? permissionMode
+                              : selectedNativeHarness === "codex-native"
+                                ? bypassSandbox
+                                  ? CODEX_NATIVE_BYPASS_APPROVAL_VALUE
+                                  : approvalMode
+                                : selectedNativeHarness === "cursor-native"
+                                  ? cursorExecMode
+                                  : selectedNativeHarness === "antigravity-native"
+                                    ? agySkipMode
+                                    : selectedNativeHarness === "devin-native"
+                                      ? devinPermissionMode
+                                      : undefined
+                          }
+                          loading={pickerLoading}
+                          interactiveWhileLoading={interactiveWhileLoading}
+                          options={directModeOptions}
+                          onSelect={selectDirectMode}
+                          testIdPrefix="new-chat-landing"
+                        />
+                      ) : null}
+                    </SessionControlPortal>
                     {codexPlanModeSelectable && codexPlanMode && (
                       <span
                         data-testid="new-chat-landing-plan-mode"
@@ -8166,7 +8168,44 @@ function NewChatLandingContent({
                 ),
                 trailing: (
                   <>
-                    <MobileHeaderControlPortal sessionId={null}>
+                    {/* Create session, in the full screen thingy's menu: starts this session
+                    as the Start button does, while the thingy stays full screen. */}
+                    <SessionControlPortal sessionId={null} slot="create" inPlace={false}>
+                      <div className="flex flex-col gap-2">
+                        {createError && (
+                          <p role="alert" className="text-xs text-destructive">
+                            {createError}
+                          </p>
+                        )}
+                        {submitDisabledReason !== null && !creating && (
+                          <p className="text-xs text-muted-foreground">{submitDisabledReason}</p>
+                        )}
+                        <Button
+                          type="button"
+                          size="sm"
+                          className="w-full"
+                          disabled={creating || submitDisabledReason !== null}
+                          loading={creating}
+                          data-testid="thingy-create-session"
+                          onClick={() => void handleCreate()}
+                        >
+                          <PlusIcon className="size-4" aria-hidden />
+                          Create session
+                        </Button>
+                      </div>
+                    </SessionControlPortal>
+                    {/* The harness New session will start, on the full screen thingy's Open
+                    session button. */}
+                    {selectedAgent && (
+                      <SessionControlPortal sessionId={null} slot="icon" inPlace={false}>
+                        {smartRoutingHarnessSelected ? (
+                          <WandSparklesIcon aria-hidden="true" />
+                        ) : (
+                          <ComposerAgentIcon agent={selectedAgent} />
+                        )}
+                      </SessionControlPortal>
+                    )}
+                    <MobileHeaderControlPortal sessionId={null} popoverSlot="harness">
                       <div className="flex min-w-0 items-center rounded-lg">
                         {/* One trigger combines the harness glyph with model / effort;
                     the selected entry's submenu owns run configuration. */}

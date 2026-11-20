@@ -6,7 +6,7 @@
 // thingy there covers the session instead.
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { MaximizeIcon, MessagesSquareIcon, PanelsTopLeftIcon, XIcon } from "lucide-react";
+import { MaximizeIcon, PanelsTopLeftIcon, XIcon } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
@@ -61,7 +61,8 @@ import {
   useThingiesEnabled,
   useThingy,
 } from "./thingyQueries";
-import { leaveThingyStart } from "./useAdoptStartedThingySession";
+import { leaveThingyStart, noteThingyStartFullScreen } from "./useAdoptStartedThingySession";
+import { ThingyOpenSessionButton } from "./ThingyOpenSessionButton";
 
 export const THINGY_DRAFT_KEY = "thingy-draft";
 const DRAFT_LABEL = "New thingy";
@@ -776,6 +777,10 @@ export function ThingyNewSessionPanel({
   useEffect(() => {
     if (!shown) setThingyNewSessionTabMaximized(false);
   }, [shown]);
+  // The session started here shows the thingy as it is now; leaving New session keeps the note.
+  useEffect(() => {
+    if (shown && thingyId !== null) noteThingyStartFullScreen(thingyId, maximized);
+  }, [shown, thingyId, maximized]);
 
   // The URL names the thingy while it fills the screen, as on a session's page: a reload or
   // Forward opens it so again.
@@ -901,28 +906,31 @@ export function ThingyNewSessionPanel({
           </div>
         )}
         <div className="ml-auto flex shrink-0 items-center gap-1 pl-1">
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon-xs"
-                aria-label={maximized ? "Open session" : "Full screen"}
-                className={PANEL_ICON_BUTTON}
-                onClick={() => setFullScreen(!maximized)}
-              >
-                {maximized ? (
-                  // Leaving full screen shows New session, so the button shows the chat.
-                  <MessagesSquareIcon className="size-4" />
-                ) : (
+          {maximized ? (
+            // Leaving full screen shows New session, so the button shows the harness New session
+            // will start, in grey until it starts, with New session's controls in a popover.
+            <ThingyOpenSessionButton
+              sessionId={null}
+              onOpenSession={() => setFullScreen(false)}
+              className={PANEL_ICON_BUTTON}
+            />
+          ) : (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label="Full screen"
+                  className={PANEL_ICON_BUTTON}
+                  onClick={() => setFullScreen(true)}
+                >
                   <MaximizeIcon className="size-4" />
-                )}
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent side="bottom">
-              {maximized ? "Open session" : "Full screen"}
-            </TooltipContent>
-          </Tooltip>
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">Full screen</TooltipContent>
+            </Tooltip>
+          )}
           {!maximized && (
             <Tooltip>
               <TooltipTrigger asChild>

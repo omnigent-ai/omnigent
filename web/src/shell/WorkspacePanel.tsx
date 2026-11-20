@@ -116,6 +116,7 @@ import {
   ThingyRailTabStrip,
   useThingyRailTabState,
 } from "@/thingies/ui/ThingyRailTabs";
+import { ThingyOpenSessionButton } from "@/thingies/ui/ThingyOpenSessionButton";
 
 const TerminalView = lazy(() =>
   import("@/components/blocks/TerminalView").then((m) => ({ default: m.TerminalView })),
@@ -1024,11 +1025,7 @@ function WorkspacePanelImpl({
   // In full screen a thingy shows alone: the strip holds its controls and Open session.
   const thingyFullScreen = maximized && thingySelected;
   const [thingyToolbar, setThingyToolbar] = useState<HTMLElement | null>(null);
-  const fullScreenLabel = thingyFullScreen
-    ? "Open session"
-    : maximized
-      ? "Exit full screen"
-      : "Full screen";
+  const fullScreenLabel = maximized ? "Exit full screen" : "Full screen";
   const returnPointRef = useRef<ReturnPoint | null>(null);
   // The latest returnFrom, so a close that finishes later uses the tabs open by then.
   const returnFromRef = useRef<(point: ReturnPoint) => void>(() => {});
@@ -2118,31 +2115,38 @@ function WorkspacePanelImpl({
                 </DropdownMenuContent>
               </DropdownMenu>
             )}
-            <WorkspaceTabTooltip
-              label={fullScreenLabel}
-              // Escape exits full screen only from a file; other tabs keep Escape for themselves.
-              shortcut={fileViewerInFront && maximized && !isMobile ? [ESC_KEY] : undefined}
-            >
-              <Button
-                type="button"
-                variant="ghost"
-                aria-label={fullScreenLabel}
-                aria-pressed={thingyFullScreen ? undefined : maximized}
-                onClick={onToggleMaximized}
-                disabled={pending}
-                size="icon-xs"
-                className="flex size-6 text-muted-foreground hover:text-foreground"
+            {thingyFullScreen ? (
+              // Leaving a full screen thingy shows its session, so the button shows the session's
+              // harness, with its composer controls in a popover.
+              <ThingyOpenSessionButton
+                sessionId={conversationId}
+                onOpenSession={onToggleMaximized}
+                className="text-muted-foreground hover:text-foreground"
+              />
+            ) : (
+              <WorkspaceTabTooltip
+                label={fullScreenLabel}
+                // Escape exits full screen only from a file; other tabs keep Escape for themselves.
+                shortcut={fileViewerInFront && maximized && !isMobile ? [ESC_KEY] : undefined}
               >
-                {thingyFullScreen ? (
-                  // Leaving a full screen thingy shows its session, so the button shows the chat.
-                  <MessagesSquareIcon className="size-4" />
-                ) : maximized ? (
-                  <MinimizeIcon className="size-4" />
-                ) : (
-                  <MaximizeIcon className="size-4" />
-                )}
-              </Button>
-            </WorkspaceTabTooltip>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  aria-label={fullScreenLabel}
+                  aria-pressed={maximized}
+                  onClick={onToggleMaximized}
+                  disabled={pending}
+                  size="icon-xs"
+                  className="flex size-6 text-muted-foreground hover:text-foreground"
+                >
+                  {maximized ? (
+                    <MinimizeIcon className="size-4" />
+                  ) : (
+                    <MaximizeIcon className="size-4" />
+                  )}
+                </Button>
+              </WorkspaceTabTooltip>
+            )}
           </div>
         </div>
         {/* Single content slot: an open shell or file tab, else the selected tab's view. */}

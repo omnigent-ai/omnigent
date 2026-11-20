@@ -9,8 +9,10 @@ import { sendUserMessage } from "@/lib/sessionsApi";
 import { queueThingyComposerQuote } from "@/lib/thingyComposerQuotes";
 import {
   exitThingyRailFullScreen,
+  requestThingyCreateSessionMenu,
   requestThingyRailTab,
   setThingyNewSessionTabMaximized,
+  thingyFillsScreen,
 } from "@/lib/thingyRailTabs";
 
 import type { ThingyActionRequest, ThingySelection } from "./thingyBridge";
@@ -34,7 +36,7 @@ const PENDING_TTL_MS = 30 * 60 * 1000;
 // Thingies whose thingy session this page opened New session for, when, and the actions its
 // prompt carries. In memory: the pane reaches the created session without a reload, and after one
 // the next request starts again.
-const pendingStarts = new Map<string, { at: number; actionIds: string[] }>();
+const pendingStarts = new Map<string, { at: number; actionIds: string[]; messages: string[] }>();
 const SESSION_ID = /^[A-Za-z0-9_-]{1,128}$/;
 
 type ThingyInfo = Pick<Thingy, "id" | "name" | "permissions">;
@@ -145,16 +147,39 @@ export function thingyActionMessage(entry: {
   return `Thingy action\n${JSON.stringify({ action_id: entry.id, action: entry.action, params: entry.params })}`;
 }
 
+/** Forgets every session this tab was about to start for a thingy; for tests. */
+export function forgetThingySessionStarts(): void {
+  pendingStarts.clear();
+}
+
 /** Remembers that this tab opened New session for the thingy's session, so it is adopted once started. */
 export function markThingySessionPending(appId: string): void {
   markPending(appId);
 }
 
-function markPending(appId: string, actionId?: string): void {
+function markPending(appId: string, actionId?: string, message?: string): void {
   pendingStarts.set(appId, {
     at: Date.now(),
     actionIds: actionId ? [actionId] : [],
+    messages: message ? [message] : [],
   });
+}
+
+/**
+ * Adds a request to the session the viewer is about to start for the thingy, so requests made
+ * before it starts all go in its first message; returns that message's requests.
+ */
+function addPendingRequest(appId: string, message: string, actionId?: string): string[] {
+  const current = pendingStarts.get(appId);
+  const fresh = current !== undefined && Date.now() - current.at <= PENDING_TTL_MS;
+  const actionIds = fresh ? current.actionIds : [];
+  const messages = fresh ? current.messages : [];
+  pendingStarts.set(appId, {
+    at: Date.now(),
+    actionIds: actionId && !actionIds.includes(actionId) ? [...actionIds, actionId] : actionIds,
+    messages: messages.includes(message) ? messages : [...messages, message],
+  });
+  return pendingStarts.get(appId)?.messages ?? [message];
 }
 
 async function deliverMessage(
@@ -259,9 +284,17 @@ export async function openThingySession(
       }
     }
   }
-  markPending(app.id, actionId);
-  // New session's composer holds the request; its link leaves a full screen thingy docked.
-  navigate(thingyBoardNewSessionUrl(app.id, `${composeThingySessionPrompt(app)}\n\n${message}`));
+  const requests = addPendingRequest(app.id, message, actionId);
+  const prompt = [composeThingySessionPrompt(app), ...requests].join("\n\n");
+  if (thingyFillsScreen(app.id)) {
+    // The thingy stays full screen: New session's composer holds the requests, and the Create
+    // session menu beside the thingy starts it there.
+    navigate(thingyBoardNewSessionUrl(app.id, prompt, { fullScreen: true }));
+    requestThingyCreateSessionMenu();
+    return "starting";
+  }
+  // New session's composer holds the request; its link leaves a docked thingy beside it.
+  navigate(thingyBoardNewSessionUrl(app.id, prompt));
   return "starting";
 }
 

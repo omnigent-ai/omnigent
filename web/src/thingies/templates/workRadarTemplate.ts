@@ -257,7 +257,7 @@ ${THINGY_KIT_HELPERS}
   var STATE_LABELS = { active: 'Active', blocked: 'Blocked', waiting: 'Waiting', done: 'Done' };
   var STATE_ORDER = { blocked: 0, active: 1, waiting: 2, done: 3 };
   var SCAN_TEXT = {
-    pending: 'Start your thingy session in New session beside this page, and it scans.',
+    pending: 'Create your thingy session, and it scans.',
     queued: 'Waiting for your thingy session to pick it up…',
     running: 'Reading your recent sessions…',
     needs_input: 'Your thingy session is waiting for you.',
@@ -268,7 +268,7 @@ ${THINGY_KIT_HELPERS}
     interrupted: 'The scan stopped before it finished. Click Rescan to try again.',
   };
   var STEP_TEXT = {
-    pending: 'Start your thingy session in New session beside this page, and it runs this.',
+    pending: 'Create your thingy session, and it runs this.',
     queued: 'Waiting for your thingy session to pick it up…',
     running: 'Working on it…',
     needs_input: 'Waiting for you in the session',
@@ -830,7 +830,7 @@ ${THINGY_KIT_HELPERS}
     var written = working && value && !value.example && !isNaN(requested) && Date.parse(value.scanned_at) >= requested;
     [$('scan'), $('scan-empty')].forEach(function (button) {
       button.disabled = !canAct || (open && !undelivered);
-      button.textContent = open ? 'Scanning…' : undelivered ? 'Start my thingy session' : button.id === 'scan' ? 'Rescan' : 'Scan my recent work';
+      button.textContent = open ? 'Scanning…' : undelivered ? 'Create my thingy session' : button.id === 'scan' ? 'Rescan' : 'Scan my recent work';
     });
     // The first scan also designs the page: once its records are written and until a layout
     // exists, a running scan is designing.

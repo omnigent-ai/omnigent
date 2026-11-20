@@ -6,6 +6,7 @@ import type * as SessionsApiModule from "@/lib/sessionsApi";
 import { BridgeError } from "./thingyBridge";
 import {
   adoptStartedThingySession,
+  forgetThingySessionStarts,
   onSessionThingiesChanged,
   openThingyFullScreen,
   openThingyInSession,
@@ -27,6 +28,9 @@ const requestThingyRailTab = vi.fn(
 );
 const exitThingyRailFullScreen = vi.fn((_sessionId: string | null) => {});
 const setThingyNewSessionTabMaximized = vi.fn((_maximized: boolean) => {});
+// Whether the thingy fills the screen; a test sets it.
+let fillsScreen = false;
+const requestThingyCreateSessionMenu = vi.fn(() => {});
 vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
   ...(await importOriginal<typeof SessionsApiModule>()),
   sendUserMessage: (sessionId: string, text: string) => sendUserMessage(sessionId, text),
@@ -43,6 +47,8 @@ vi.mock("@/lib/thingyRailTabs", () => ({
   exitThingyRailFullScreen: (sessionId: string | null) => exitThingyRailFullScreen(sessionId),
   setThingyNewSessionTabMaximized: (maximized: boolean) =>
     setThingyNewSessionTabMaximized(maximized),
+  thingyFillsScreen: () => fillsScreen,
+  requestThingyCreateSessionMenu: () => requestThingyCreateSessionMenu(),
 }));
 vi.mock("@/lib/identity", async (importOriginal) => ({
   ...(await importOriginal<typeof IdentityModule>()),
@@ -180,6 +186,9 @@ describe("thingy session", () => {
     requestThingyRailTab.mockClear();
     exitThingyRailFullScreen.mockClear();
     setThingyNewSessionTabMaximized.mockClear();
+    requestThingyCreateSessionMenu.mockClear();
+    fillsScreen = false;
+    forgetThingySessionStarts();
     navigate.mockClear();
   });
 
@@ -378,6 +387,63 @@ describe("thingy session", () => {
     expect(await (await linked).json()).toEqual({ linked: true });
     // The action rode in the started session's first message, so it was delivered there.
     expect(await (await delivered).json()).toEqual({ session_id: "s_new" });
+  });
+
+  it("keeps a full screen thingy full screen and opens its Create session menu", async () => {
+    fillsScreen = true;
+    server.use(
+      rest.post(`${API}/app-1/actions`, (_req, res, ctx) => res(ctx.status(201), ctx.json(ENTRY))),
+      rest.get(`${API}/app-1/session`, (_req, res, ctx) =>
+        res(ctx.json({ session_id: null, version: null })),
+      ),
+    );
+
+    const receipt = await requestThingyAction(
+      EDITOR,
+      { action: "run_card", params: { cardId: "c1" } },
+      navigate,
+    );
+
+    expect(receipt).toEqual({ actionId: "act1", delivery: "starting" });
+    const opened = parse(navigate.mock.calls[0][0]);
+    expect(opened.searchParams.get("thingy_start")).toBe("app-1");
+    // The URL keeps the thingy full screen beside New session.
+    expect(opened.searchParams.get("thingy")).toBe("app-1");
+    expect(opened.searchParams.get("prompt")).toContain('"action_id":"act1"');
+    expect(requestThingyCreateSessionMenu).toHaveBeenCalledTimes(1);
+    expect(exitThingyRailFullScreen).not.toHaveBeenCalled();
+  });
+
+  it("starts one session for several requests made before it exists", async () => {
+    const second = { ...ENTRY, id: "act2", value: { ...ENTRY.value, params: { cardId: "c2" } } };
+    let next = ENTRY;
+    server.use(
+      rest.post(`${API}/app-1/actions`, (_req, res, ctx) => res(ctx.status(201), ctx.json(next))),
+      rest.get(`${API}/app-1/session`, (_req, res, ctx) =>
+        res(ctx.json({ session_id: null, version: null })),
+      ),
+      rest.put(`${API}/app-1/sessions/:sessionId`, (_req, res, ctx) =>
+        res(ctx.json({ items: [] })),
+      ),
+      rest.post(`${API}/app-1/actions/:actionId/delivery`, (_req, res, ctx) =>
+        res(ctx.json({ items: [] })),
+      ),
+    );
+
+    await requestThingyAction(EDITOR, { action: "run_card", params: { cardId: "c1" } }, navigate);
+    next = second;
+    await requestThingyAction(EDITOR, { action: "run_card", params: { cardId: "c2" } }, navigate);
+
+    // The second link carries both requests, so the one session started handles both.
+    const prompt = parse(navigate.mock.calls[1][0]).searchParams.get("prompt") ?? "";
+    expect(prompt).toContain('"action_id":"act1"');
+    expect(prompt).toContain('"action_id":"act2"');
+    expect(prompt.match(/Load the thingy skill/g)).toHaveLength(1);
+    const first = waitForRequest("post", `${API}/app-1/actions/act1/delivery`);
+    const other = waitForRequest("post", `${API}/app-1/actions/act2/delivery`);
+    expect(await adoptStartedThingySession("app-1", "s_new")).toBe(true);
+    expect(await (await first).json()).toEqual({ session_id: "s_new" });
+    expect(await (await other).json()).toEqual({ session_id: "s_new" });
   });
 
   it("sends actions and quotes to the session the thingy is shown beside", async () => {

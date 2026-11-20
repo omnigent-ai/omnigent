@@ -197,7 +197,7 @@ const SCRIPT = `
   var actionItems = [];
   var actionWatch = null;
   var ACTION_LABELS = {
-    pending: 'Start your thingy session beside the board to run this card.',
+    pending: 'Create your thingy session to run this card.',
     queued: 'Waiting for your thingy session',
     running: 'Running in your thingy session',
     needs_input: 'Waiting for your input in the session',
@@ -619,7 +619,7 @@ const SCRIPT = `
     if (pending) {
       children.push(pending.error
         ? el('div', { class: 'run-state', 'data-run': 'failed', role: 'alert', text: pending.error })
-        : el('div', { class: 'run-state', 'data-run': 'pending' }, [el('span', { class: 'spinner', 'aria-hidden': 'true' }), el('span', { text: pending.delivery === 'starting' ? 'Start your thingy session beside the board to run this card.' : pending.delivery === 'sent' || pending.delivery === 'merged' ? 'Sent to your thingy session.' : 'Sending to your thingy session…' })]));
+        : el('div', { class: 'run-state', 'data-run': 'pending' }, [el('span', { class: 'spinner', 'aria-hidden': 'true' }), el('span', { text: pending.delivery === 'starting' ? 'Create your thingy session to run this card.' : pending.delivery === 'sent' || pending.delivery === 'merged' ? 'Sent to your thingy session.' : 'Sending to your thingy session…' })]));
     } else if (action && Object.prototype.hasOwnProperty.call(ACTION_LABELS, action.status)) {
       var open = isOpenAction(action);
       var shown = action.status === 'interrupted' || action.status === 'finished_unreported' ? 'failed' : action.status;

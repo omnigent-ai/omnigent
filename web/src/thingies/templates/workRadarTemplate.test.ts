@@ -314,9 +314,9 @@ describe("work radar template", () => {
 
     byId("scan-empty").click();
 
-    await waitFor(() => expect(byId("scan-empty").textContent).toBe("Start my thingy session"));
+    await waitFor(() => expect(byId("scan-empty").textContent).toBe("Create my thingy session"));
     expect((byId("scan-empty") as HTMLButtonElement).disabled).toBe(false);
-    expect(byId("empty-run").textContent).toContain("Start your thingy session in New session");
+    expect(byId("empty-run").textContent).toContain("Create your thingy session, and it");
   });
 
   it("follows the scan still running when a later one was merged into it", async () => {

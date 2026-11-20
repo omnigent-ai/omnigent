@@ -7,6 +7,7 @@ import { resetThingyRailRequests, useThingyRailRequest } from "@/lib/thingyRailT
 import { deleteThingy, getThingy, getThingyThingySession } from "@/thingies/api/thingyApi";
 import { adoptStartedThingySession } from "@/thingies/host/thingySession";
 import {
+  noteThingyStartFullScreen,
   rememberUnbuiltThingy,
   resetThingyStarts,
   useAdoptStartedThingySession,
@@ -77,6 +78,37 @@ describe("a session started beside a thingy", () => {
       expect(useThingyRailRequest.getState().requested).toMatchObject({
         conversationId: "conv_9",
         key: "thingy:board",
+      }),
+    );
+  });
+
+  it("keeps a thingy full screen in the session started beside it in full screen", async () => {
+    renderShell();
+    noteThingyStartFullScreen("board", true);
+
+    fireEvent.click(screen.getByRole("button", { name: "Created" }));
+
+    await waitFor(() =>
+      expect(useThingyRailRequest.getState().requested).toEqual({
+        conversationId: "conv_9",
+        key: "thingy:board",
+        maximize: true,
+        keepSidebar: true,
+      }),
+    );
+  });
+
+  it("docks a thingy that was docked beside New session", async () => {
+    renderShell();
+    noteThingyStartFullScreen("board", true);
+    noteThingyStartFullScreen("board", false);
+
+    fireEvent.click(screen.getByRole("button", { name: "Created" }));
+
+    await waitFor(() =>
+      expect(useThingyRailRequest.getState().requested).toMatchObject({
+        conversationId: "conv_9",
+        maximize: false,
       }),
     );
   });
