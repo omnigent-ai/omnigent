@@ -788,6 +788,7 @@ describe("ErrorBanner", () => {
       "The model's response hit its maximum output length and was cut off.",
     );
     expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
   });
 
   it.each(["executor_error", "connection_error", "runner_error", "wrong_replica"])(

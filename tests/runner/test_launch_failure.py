@@ -465,6 +465,9 @@ def test_classifies_output_limit_exceeded(code: str, message: str) -> None:
         "API Error: 400 max_output_tokens must be at most 32000",
         # An unrelated limit that happens to share the rewrite's opening words.
         "Terminal output limit reached while capturing logs",
+        f'The terminal previously printed "{_RAW_OUTPUT_LIMIT_ERROR}".',
+        "The guide explains why the response exceeded the model's maximum output length.",
+        "```text\nClaude Code ended the turn with an API error (max_output_tokens).\n```",
     ],
 )
 def test_output_limit_wording_alone_is_not_the_limit_error(message: str) -> None:

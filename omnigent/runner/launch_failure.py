@@ -333,13 +333,13 @@ _BUDGET_EXHAUSTED_FRAGMENTS = (
     "has reached its limit",
     "rate limit is set to 0",
 )
-# Claude Code's output-token-limit error: the raw constant ("...exceeded the 32000 output
-# token maximum"), the bridge's rewrite ("...exceeded the model's maximum output length"),
-# or the forwarder's category-only fallback "...API error (max_output_tokens)".
+# Match Claude Code's raw output limit, the bridge's guidance, or the forwarder's fallback.
+# Anchor CLI forms so assistant explanations quoting them stay generic.
 _OUTPUT_LIMIT_ERROR = re.compile(
-    r"response exceeded the [\d,]+ output token maximum"
-    r"|response exceeded the model['’]s maximum output length"
-    r"|\bAPI error \(max_output_tokens\)",
+    r"\A\s*(?:API Error:\s*)?(?:"
+    r"(?:Claude['’]s )?response exceeded the [\d,]+ output token maximum\b"
+    r"|Output limit reached\s*[—:-]\s*the response exceeded the model['’]s maximum output length\b"
+    r"|Claude Code ended the turn with an API error \(max_output_tokens\))",
     re.IGNORECASE,
 )
 # Mid-stream upstream failures the gateway usually recovers from on its own;
