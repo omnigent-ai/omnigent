@@ -74,7 +74,16 @@ def test_explicit_repo_is_used_for_all_pr_reads(
         == "second-repo-patch"
     )
     assert calls[0][calls[0].index("-R") + 1] == "github.com/example/two"
-    assert calls[1] == ["pr", "view", "42", "-R", "github.com/example/one", "--json", "title"]
+    # The title refresh reads the state in the same call.
+    assert calls[1] == [
+        "pr",
+        "view",
+        "42",
+        "-R",
+        "github.com/example/one",
+        "--json",
+        github._PR_STATUS_FIELDS,
+    ]
     assert calls[2][-1] == "repos/example/two/pulls/42/files?per_page=100"
     assert calls[3][-2:] == ["-R", "github.com/example/two"]
 
@@ -96,8 +105,8 @@ def test_titles_include_unselected_prs_and_are_cached_between_polls(
         B: "Second",
     }
     assert [call[-1] for call in calls] == [
-        github._PR_VIEW_FIELDS + ",headRefOid,baseRefOid",
-        "title",
+        github._PR_VIEW_FIELDS + ",headRefOid,baseRefOid,headRepository,headRepositoryOwner",
+        github._PR_STATUS_FIELDS,
     ]
     registry = SessionPrRegistry("session")
     assert {pr.url: pr.title for pr in registry.list()} == {A: "First repository", B: "Second"}
@@ -111,6 +120,49 @@ def test_titles_include_unselected_prs_and_are_cached_between_polls(
     assert {pr["url"]: pr["title"] for pr in info["prs"]}[B] == "Renamed second PR"
     assert {pr.url: pr.title for pr in registry.list()}[B] == "Renamed second PR"
     assert len(calls) == 4
+
+
+def test_a_title_refresh_reports_each_unselected_prs_state(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The server stores every listed PR's state; only PRs looked up now carry one."""
+
+    def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        if args[-1] == github._PR_STATUS_FIELDS:
+            return 0, json.dumps({"title": "First", "state": "MERGED", "isDraft": False}), ""
+        return 0, json.dumps({"number": 42, "title": "Second", "state": "OPEN"}), ""
+
+    monkeypatch.setattr(github, "_gh", gh)
+    info = github.github_info(tracked, session_id="session", pr_url=B)
+    listed = {pr["url"]: pr for pr in info["prs"]}
+    assert (listed[A]["title"], listed[A]["state"], listed[A]["is_draft"]) == (
+        "First",
+        "MERGED",
+        False,
+    )
+    # The selected PR's state is the full read's, outside its listed entry.
+    assert "state" not in listed[B]
+    # Cached titles are not looked up again, so they carry no state.
+    info = github.github_info(tracked, session_id="session", pr_url=B)
+    assert all("state" not in pr for pr in info["prs"])
+
+
+def test_a_provider_without_status_lookups_reports_titles_alone(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class TitleOnly:
+        def titles_available(self, _root: str) -> bool:
+            return True
+
+        def pr_title(self, _root: str, _reference: object, _deadline: float) -> tuple[str, bool]:
+            return "Title only", False
+
+    monkeypatch.setattr(pr_resource, "_facet", lambda _provider: TitleOnly())
+    registry = SessionPrRegistry("session")
+    rows = pr_resource._session_prs_with_titles(
+        tracked, {}, registry, registry.list(), time.monotonic() + 5
+    )
+    assert [(row["title"], "state" in row) for row in rows] == [("Title only", False)] * 2
 
 
 def test_titles_refresh_after_cache_expiry_and_keep_last_known_on_failure(
@@ -219,7 +271,7 @@ def test_slow_title_lookups_preserve_metadata_and_leave_queued_prs_for_next_poll
 
     def run(argv: list[str], *, timeout: float, **_kwargs: object) -> tuple[int | None, str, str]:
         nonlocal clock
-        if argv[-1] != "title":
+        if argv[-1] != github._PR_STATUS_FIELDS:
             assert github._gh_deadline.get() is None
             assert timeout == github._gh_timeout_seconds()
             return 0, '{"title": "Selected PR"}', ""
@@ -265,7 +317,7 @@ def test_title_retries_do_not_starve_queued_prs_after_backoff_expires(
 
     def run(argv: list[str], *, timeout: float, **_kwargs: object) -> tuple[int | None, str, str]:
         nonlocal clock
-        if argv[-1] != "title":
+        if argv[-1] != github._PR_STATUS_FIELDS:
             return 0, '{"title": "Selected PR"}', ""
         attempted.append(argv[3])
         clock += timeout
@@ -343,7 +395,7 @@ def test_slow_selected_metadata_does_not_get_extra_title_work(
 
     def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
         nonlocal clock
-        assert args[-1] != "title"
+        assert args[-1] != github._PR_STATUS_FIELDS
         clock += pr_resource._PR_TITLE_REQUEST_SECONDS + 0.1
         return 0, '{"title": "Selected PR"}', ""
 
@@ -367,7 +419,7 @@ def test_title_timeout_at_request_deadline_retries_after_short_backoff(
 
     def run(argv: list[str], *, timeout: float, **_kwargs: object) -> tuple[int | None, str, str]:
         nonlocal clock
-        if argv[-1] != "title":
+        if argv[-1] != github._PR_STATUS_FIELDS:
             clock += 6.5
             return 0, '{"title": "Selected PR"}', ""
         timeouts.append(timeout)
@@ -421,7 +473,7 @@ def test_non_deadline_failures_keep_normal_title_cache(
 
     def run(argv: list[str], **_kwargs: object) -> tuple[int | None, str, str]:
         nonlocal clock, attempted
-        if argv[-1] != "title":
+        if argv[-1] != github._PR_STATUS_FIELDS:
             return 0, '{"title": "Selected PR"}', ""
         attempted += 1
         clock += command_seconds
@@ -499,6 +551,163 @@ def test_context_uses_fork_head_and_merge_base(
         github.github_file_diff(
             tracked, "main", "new.py", session_id="session", pr_url=B, head_sha="stale"
         )
+
+
+async def test_changes_route_pins_revision_and_reports_truncation(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    head, base = "a" * 40, "b" * 40
+
+    def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        if args[-1] == "repos/example/two/pulls/42":
+            pr = {"head": {"sha": head}, "base": {"sha": base}, "changed_files": 3001}
+            return 0, json.dumps(pr), ""
+        assert args[-1] == "repos/example/two/pulls/42/files?per_page=100"
+        page = [{"filename": f"f{index}.py", "status": "added"} for index in range(3000)]
+        return 0, json.dumps([page]), ""
+
+    monkeypatch.setattr(github, "_gh", gh)
+    app = create_runner_app(
+        runner_workspace=Path(tracked),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        response = await client.get(
+            "/v1/sessions/session/resources/github/changes",
+            params={"pr_url": B, "head_sha": head, "base_sha": base},
+        )
+        partial = await client.get(
+            "/v1/sessions/session/resources/github/changes",
+            params={"pr_url": B, "head_sha": head},
+        )
+
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert len(result["data"]) == 3000
+    assert {key: result[key] for key in ("has_more", "total_count", "head_sha", "base_sha")} == {
+        "has_more": True,
+        "total_count": 3001,
+        "head_sha": head,
+        "base_sha": base,
+    }
+    assert result["warning"] == "The provider lists at most 3000 files; 1 files are not shown."
+    assert partial.status_code == 400
+    assert partial.json()["detail"] == "Expected full head and base commit SHAs"
+
+
+@pytest.mark.parametrize("bad_sha", ["", "abc", "A" * 40, "a" * 39, "a" * 41])
+def test_commit_ids_must_be_full_lowercase_shas(
+    tracked: str, monkeypatch: pytest.MonkeyPatch, bad_sha: str
+) -> None:
+    def forbidden_gh(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("A malformed commit id must not reach gh")
+
+    monkeypatch.setattr(github, "_gh", forbidden_gh)
+    with pytest.raises(ValueError, match="full commit SHA"):
+        pr_resource.pr_commits(tracked, session_id="session", pr_url=B, head_sha=bad_sha)
+    with pytest.raises(ValueError, match="full commit SHA"):
+        pr_resource.pr_commit_diff(tracked, session_id="session", pr_url=B, commit_sha=bad_sha)
+    with pytest.raises(ValueError, match="full commit SHA"):
+        pr_resource.pr_compare_diff(
+            tracked, session_id="session", pr_url=B, head_sha="a" * 40, from_sha=bad_sha
+        )
+
+
+async def test_commits_route_pins_head_and_diff_route_reads_one_commit(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    head, commit = "a" * 40, "c" * 40
+    pr = {"head": {"sha": head}, "base": {"sha": "b" * 40}, "commits": 1}
+    listing = [
+        [
+            {
+                "sha": commit,
+                "commit": {
+                    "message": "Fix the thing\n\nDetails",
+                    "author": {"name": "Ada", "date": "2026-11-01T10:00:00Z"},
+                },
+            }
+        ]
+    ]
+    gh_args: list[list[str]] = []
+
+    def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        gh_args.append(args)
+        if args[-1] == "repos/example/two/pulls/42":
+            return 0, json.dumps(pr), ""
+        if args[-1] == "repos/example/two/pulls/42/commits?per_page=100":
+            return 0, json.dumps(listing), ""
+        if args[-1] == f"repos/example/two/compare/{commit}...{head}":
+            return 0, "compare-patch", ""
+        if "graphql" in args:
+            return 1, "", "no associated PRs here"
+        assert args[-1] == f"repos/example/two/commits/{commit}"
+        return 0, "commit-patch", ""
+
+    monkeypatch.setattr(github, "_gh", gh)
+    app = create_runner_app(
+        runner_workspace=Path(tracked),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        commits = await client.get(
+            "/v1/sessions/session/resources/github/commits",
+            params={"pr_url": B, "head_sha": head},
+        )
+        unpinned = await client.get(
+            "/v1/sessions/session/resources/github/commits", params={"pr_url": B}
+        )
+        moved = await client.get(
+            "/v1/sessions/session/resources/github/commits",
+            params={"pr_url": B, "head_sha": "d" * 40},
+        )
+        patch = await client.get(
+            "/v1/sessions/session/resources/github/commit-diff",
+            params={"pr_url": B, "commit_sha": commit},
+        )
+        malformed = await client.get(
+            "/v1/sessions/session/resources/github/commit-diff",
+            params={"pr_url": B, "commit_sha": "abc"},
+        )
+        foreign = await client.get(
+            "/v1/sessions/session/resources/github/commit-diff",
+            params={"pr_url": B, "commit_sha": "e" * 40},
+        )
+        compared = await client.get(
+            "/v1/sessions/session/resources/github/compare-diff",
+            params={"pr_url": B, "head_sha": head, "from_sha": commit},
+        )
+
+    assert commits.status_code == 200, commits.text
+    assert commits.json() == {
+        "object": "list",
+        "has_more": False,
+        "data": [
+            {
+                "object": "session.github.commit",
+                "sha": commit,
+                "title": "Fix the thing",
+                "author": "Ada",
+                "date": "2026-11-01T10:00:00Z",
+            }
+        ],
+    }
+    assert unpinned.status_code == 400
+    assert unpinned.json()["detail"] == "Expected head_sha to be a full commit SHA"
+    assert moved.status_code == 400
+    assert "pull request changed" in moved.json()["detail"]
+    assert patch.status_code == 200, patch.text
+    assert patch.json() == {"object": "session.github.pr_diff", "patch": "commit-patch"}
+    assert compared.status_code == 200, compared.text
+    assert compared.json() == {"object": "session.github.pr_diff", "patch": "compare-patch"}
+    assert any("Accept: application/vnd.github.diff" in args for args in gh_args)
+    assert malformed.status_code == 400
+    assert foreign.status_code == 400
+    assert foreign.json()["detail"] == "That commit is not part of the selected pull request."
 
 
 @pytest.fixture
@@ -783,7 +992,7 @@ def test_default_selection_matches_metadata_and_all_pages(
 ) -> None:
     def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
         if args[:2] == ["pr", "view"]:
-            if args[-1] == "title":
+            if args[-1] == github._PR_STATUS_FIELDS:
                 assert args[args.index("-R") + 1] == "github.com/example/two"
                 return 0, json.dumps({"title": "Second repository"}), ""
             assert args[args.index("-R") + 1] == "github.com/example/one"

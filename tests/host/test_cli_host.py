@@ -475,6 +475,44 @@ def test_host_enable_does_not_wait_on_a_dead_daemon(
     assert terminated == [target]
 
 
+@pytest.mark.parametrize(
+    "args",
+    [pytest.param([], id="waits-for-turns"), pytest.param(["--force"], id="force")],
+)
+def test_host_enable_keeps_running_host_when_wrapper_is_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    args: list[str],
+) -> None:
+    """An uninstallable service must not replace the host that is already running."""
+    target = "https://server.example.com"
+    monkeypatch.setattr("omnigent.cli._resolve_host_server", lambda server: target)
+    monkeypatch.setattr("omnigent.cli._ensure_databricks_server_auth", lambda *a, **k: None)
+    monkeypatch.setattr("omnigent.cli._find_daemon_record", _record_for)
+    monkeypatch.setattr("omnigent.cli._daemon_owner_is_live", lambda record: True)
+    monkeypatch.setattr(
+        "omnigent.cli._wait_for_running_sessions",
+        lambda *a, **k: pytest.fail("waited for running sessions"),
+    )
+    monkeypatch.setattr(
+        "omnigent.cli._terminate_daemon",
+        lambda record, *, force: pytest.fail("stopped the running host"),
+    )
+    monkeypatch.setattr(
+        "omnigent.cli._build_host_daemon_env",
+        lambda *, server_url: {"PATH": str(tmp_path), "OMNIGENT_WRAPPER_COMMAND": "wrapper omni"},
+    )
+    monkeypatch.setattr(
+        "omnigent.host.service.enable_user_host_service",
+        lambda server_url, *, environment: pytest.fail("installed the service"),
+    )
+
+    result = CliRunner().invoke(cli, ["host", "enable", "--server", target, *args])
+
+    assert result.exit_code == 1, result.output
+    assert "Cannot find 'wrapper'" in result.output
+
+
 def test_host_disable_subcommand_removes_user_service(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1016,21 +1054,41 @@ def test_host_background_spawns_detached_daemon(
     assert "server: http://127.0.0.1:6767" in result.output
 
 
+@pytest.mark.parametrize(
+    ("probe_result", "expected_error", "expected_terminated"),
+    [
+        pytest.param(
+            cli_module._HostHttpResult(status_code=200, body={"status": "offline"}),
+            "did not register with the server",
+            [],
+            id="server-answers-daemon-keeps-retrying",
+        ),
+        pytest.param(
+            cli_module._HostHttpResult(
+                status_code=0,
+                body="ConnectError: [Errno 111] Connection refused",
+                unreachable=True,
+            ),
+            "Could not reach the Omnigent server",
+            [4242],
+            id="server-unreachable-daemon-stopped",
+        ),
+    ],
+)
 def test_host_background_fails_when_daemon_never_registers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    probe_result: cli_module._HostHttpResult,
+    expected_error: str,
+    expected_terminated: list[int],
 ) -> None:
-    """A live PID without a registered channel must not be reported as started."""
-    _spawned, log_path = _patch_background_host_spawn(monkeypatch, tmp_path)
+    """A live PID without a registered channel is never reported as started; the
+    daemon is left running only while the server answers, and a rerun adopts it."""
+    spawned, log_path = _patch_background_host_spawn(monkeypatch, tmp_path)
     log_path.write_text("Host registration failed: database unavailable\n")
     monkeypatch.setattr("omnigent.cli._daemon_host_online", lambda record, **kwargs: False)
-    # The server answers (host row offline), so the failure is the generic
-    # registration timeout rather than the unreachable-server error.
     monkeypatch.setattr(
-        "omnigent.cli._daemon_host_status_probe",
-        lambda record, **kwargs: cli_module._HostHttpResult(
-            status_code=200, body={"status": "offline"}
-        ),
+        "omnigent.cli._daemon_host_status_probe", lambda record, **kwargs: probe_result
     )
     monkeypatch.setattr("omnigent.cli._BACKGROUND_HOST_REGISTRATION_GRACE_S", 0.0)
     monkeypatch.setattr(
@@ -1042,16 +1100,62 @@ def test_host_background_fails_when_daemon_never_registers(
         lambda record, *, force: terminated.append(record.pid),
     )
 
-    result = CliRunner().invoke(
-        cli,
-        ["host", "--background", "--server", "https://example.databricksapps.com"],
-    )
+    server_url = "https://example.com"
+
+    result = CliRunner().invoke(cli, ["host", "--background", "--server", server_url])
 
     assert result.exit_code != 0
-    assert "did not register with the server" in result.output
+    assert expected_error in result.output
     assert "database unavailable" in result.output
     assert "Started the host daemon" not in result.output
-    assert terminated == [4242]
+    assert terminated == expected_terminated
+    if not expected_terminated:
+        assert "still running (pid 4242)" in result.output
+        assert f"host stop --server {server_url}" in result.output
+        pending_rerun = CliRunner().invoke(cli, ["host", "--background", "--server", server_url])
+        assert pending_rerun.exit_code != 0, pending_rerun.output
+        assert "still running (pid 4242)" in pending_rerun.output
+        assert len(spawned) == 1, "a pending rerun must retain the existing daemon"
+        assert terminated == []
+        monkeypatch.setattr(
+            "omnigent.cli._daemon_host_status_probe",
+            lambda record, **kwargs: cli_module._HostHttpResult(
+                status_code=200, body={"status": "online"}
+            ),
+        )
+        rerun = CliRunner().invoke(cli, ["host", "--background", "--server", server_url])
+        assert rerun.exit_code == 0, rerun.output
+        assert "already running (pid 4242" in rerun.output
+        assert len(spawned) == 1, "the rerun must adopt the pending daemon"
+        assert terminated == []
+
+
+def test_local_host_background_keeps_pending_daemon_while_server_answers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A local daemon whose server answers but whose host is not online yet is left running."""
+    _patch_background_host_spawn(monkeypatch, tmp_path)
+    monkeypatch.setattr("omnigent.cli._daemon_host_online", lambda record, **kwargs: False)
+    monkeypatch.setattr(
+        "omnigent.cli._daemon_host_status_probe",
+        lambda record, **kwargs: cli_module._HostHttpResult(
+            status_code=404, body={"detail": "host not found"}
+        ),
+    )
+    monkeypatch.setattr("omnigent.cli._BACKGROUND_HOST_REGISTRATION_GRACE_S", 0.0)
+    terminated: list[int] = []
+    monkeypatch.setattr(
+        "omnigent.cli._terminate_daemon",
+        lambda record, *, force: terminated.append(record.pid),
+    )
+
+    result = CliRunner().invoke(cli, ["host", "--background"])
+
+    assert result.exit_code != 0
+    assert "did not register with the server at http://127.0.0.1:6767" in result.output
+    assert "still running (pid 4242)" in result.output
+    assert terminated == []
 
 
 def test_host_background_does_not_block(
@@ -1419,6 +1523,7 @@ def _seed_same_workspace_daemon(
     *,
     vanity_org_id: str = "1",
     age_s: int = 0,
+    legacy: bool = False,
 ) -> None:
     """
     Record a live daemon on the workspace host and log both URLs in.
@@ -1429,6 +1534,7 @@ def _seed_same_workspace_daemon(
         ``"1"`` for the daemon's own workspace.
     :param age_s: How long ago the daemon started, e.g. ``60``. ``0`` is
         within the startup grace, so its host status isn't checked.
+    :param legacy: Omit the routing pin to represent an older running host.
     """
     from omnigent.cli_auth import store_databricks_auth
 
@@ -1451,6 +1557,7 @@ def _seed_same_workspace_daemon(
             log_path=str(tmp_path / "existing.log"),
             started_at=int(time.time()) - age_s,
             host_id="a" * 32,
+            org_pin=None if legacy else f"{_WORKSPACE_API}?o=1",
         )
     )
 
@@ -1627,12 +1734,14 @@ def _same_workspace_sibling(*, age_s: int = 60) -> cli_module._HostDaemonRecord:
         (_HOST_REJECTED, _HOST_ONLINE, None),
     ],
 )
+@pytest.mark.parametrize("legacy", [False, True])
 def test_host_background_reuses_same_workspace_daemon_only_when_online(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     via_requested_url: cli_module._HostHttpResult,
     via_own_url: cli_module._HostHttpResult,
     refusal: str | None,
+    legacy: bool,
 ) -> None:
     """
     A same-workspace daemon whose host is offline is neither reused nor joined.
@@ -1645,7 +1754,7 @@ def test_host_background_reuses_same_workspace_daemon_only_when_online(
     monkeypatch.setattr(
         "omnigent.cli._pid_alive", lambda checked: checked in {4242, _SAME_WORKSPACE_PID}
     )
-    _seed_same_workspace_daemon(monkeypatch, tmp_path, age_s=60)
+    _seed_same_workspace_daemon(monkeypatch, tmp_path, age_s=60, legacy=legacy)
     _stub_host_status_by_url(
         monkeypatch, {_VANITY_API: via_requested_url, _WORKSPACE_API: via_own_url}
     )
@@ -2027,6 +2136,7 @@ def _seed_yielding_spawn(
                 started_at=int(time.time()),
                 host_id="a" * 32,
                 workspace_id="1",
+                org_pin=f"{winner_target}?o=1",
             )
         )
 
@@ -2158,6 +2268,7 @@ def test_ensure_host_daemon_reports_a_config_change_when_another_url_serves(
                 started_at=int(time.time()),
                 host_id="a" * 32,
                 workspace_id="1",
+                org_pin=f"{_WORKSPACE_API}?o=1",
             )
         )
         monkeypatch.setattr(

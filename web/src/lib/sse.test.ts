@@ -256,6 +256,15 @@ describe("parseEvent — session.superseded", () => {
     } satisfies SessionSupersededEvent);
   });
 
+  it("keeps a rewind reason", () => {
+    const ev = parseEvent("session.superseded", {
+      conversation_id: "conv_old",
+      target_conversation_id: "conv_new",
+      reason: "rewind",
+    });
+    expect(ev).toMatchObject({ type: "session_superseded", reason: "rewind" });
+  });
+
   it("returns null when the target conversation id is missing", () => {
     expect(parseEvent("session.superseded", { conversation_id: "conv_old" })).toBeNull();
   });
@@ -362,6 +371,26 @@ describe("parseEvent — session.status (background_tasks detail)", () => {
     expect(bgTasks({ background_tasks: "nope" })).toBeUndefined();
     expect(bgTasks({ background_tasks: [] })).toBeUndefined();
     expect(bgTasks({ background_tasks: ["junk", 1] })).toBeUndefined();
+  });
+});
+
+describe("parseEvent — session.status (background_agents)", () => {
+  function agents(status: string, data: Record<string, unknown>) {
+    const ev = parseEvent("session.status", { conversation_id: "conv_a", status, ...data });
+    return (ev as SessionStatusEvent | null)?.backgroundAgents;
+  }
+
+  it("names the agents a claude-native waiting edge waits on", () => {
+    expect(
+      agents("waiting", {
+        background_agents: [{ id: "a1", type: "subagent", description: "Audit" }, "junk"],
+      }),
+    ).toEqual([{ id: "a1", type: "subagent", description: "Audit" }]);
+  });
+
+  it("ignores agents on any edge other than waiting", () => {
+    expect(agents("running", { background_agents: [{ id: "a1" }] })).toBeUndefined();
+    expect(agents("waiting", {})).toBeUndefined();
   });
 });
 

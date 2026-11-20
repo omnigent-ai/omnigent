@@ -43,6 +43,7 @@ import logging
 import os
 import tempfile
 import threading
+import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
@@ -58,6 +59,7 @@ from fastapi.responses import StreamingResponse as _StreamingResponse
 
 import omnigent.runtime.harnesses._executor_adapter as _adapter_mod_recovery
 from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE
+from omnigent.inner._proc import process_alive
 from omnigent.inner.executor import (
     Executor as _RecoveryExecutor,
 )
@@ -70,6 +72,7 @@ from omnigent.inner.executor import (
 from omnigent.inner.executor import (
     Message as _RecoveryMessage,
 )
+from omnigent.inner.executor import NativeTurnAcceptance
 from omnigent.inner.executor import (
     ToolSpec as _RecoveryToolSpec,
 )
@@ -89,6 +92,7 @@ from omnigent.runner.app import (
 from omnigent.runner.policy_proxy import (
     _evaluate_policy_via_omnigent,
 )
+from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses._executor_adapter import (
     _ORPHAN_RESYNC_THRESHOLD,
@@ -96,11 +100,18 @@ from omnigent.runtime.harnesses._executor_adapter import (
 )
 from omnigent.runtime.harnesses._scaffold import ToolResultEvent as _ToolResultEvent
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-from omnigent.runtime.prompt import EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
+from omnigent.runtime.prompt import (
+    EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
+    WORKSPACE_IMAGE_INSTRUCTION,
+)
 from omnigent.server.schemas import CreateResponseRequest as _CreateResponseRequest
 from omnigent.spec.types import AgentSpec, ExecutorSpec, SharePolicy, ToolsConfig
 from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
+from tests._helpers.polling import poll_until_async
 from tests._helpers.providers import isolate_provider_resolution
+from tests.runner.conftest import (
+    _BlockingHarnessClient as _RecoveryBlockingHarnessClient,
+)
 from tests.runner.conftest import (
     _FakeProcessManager as _RecoveryFakeProcessManager,
 )
@@ -110,7 +121,7 @@ from tests.runner.conftest import (
 from tests.runner.conftest import (
     _ScriptedHarnessClient as _RecoveryScriptedHarnessClient,
 )
-from tests.runner.helpers import NullServerClient
+from tests.runner.helpers import NullServerClient, accept_subagent_turn
 
 _TEST_HARNESS_NAME = "runner-test-default"
 _TEST_HARNESS_MODULE = "tests._fixtures.runner_test_harness"
@@ -2348,6 +2359,118 @@ async def test_runner_background_turn_emits_failed_when_spawn_env_build_raises(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["error", "cancelled"])
+@pytest.mark.parametrize("replacement", ["unchanged", "starting", "running", "finished"])
+async def test_background_setup_failure_preserves_replacement_turn(
+    outcome: str,
+    replacement: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A setup callback may settle only the turn that started its lookup."""
+    from tests.runner.conftest import _drain_session_event_queue
+
+    session_id = "conv_setup_ownership"
+    lookup_started = asyncio.Event()
+    release_lookup = asyncio.Event()
+
+    async def resolve_spec(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        lookup_started.set()
+        await release_lookup.wait()
+        if outcome == "cancelled":
+            raise asyncio.CancelledError("retired setup cancelled")
+        raise ValueError("synthetic setup lookup failure")
+
+    manager = _RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=manager,  # type: ignore[arg-type]
+        spec_resolver=resolve_spec,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    successor = asyncio.create_task(asyncio.Event().wait())
+    original: asyncio.Task[None] | None = None
+    try:
+        async with _runner_test_client(app) as http:
+            response = await http.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "agent_setup",
+                    "model": "x",
+                    "content": [{"role": "user", "content": "original input"}],
+                    "stable_id": "a" * 32,
+                    "pending_id": "pending_" + "b" * 32,
+                },
+            )
+            assert response.status_code == 202, response.text
+            await asyncio.wait_for(lookup_started.wait(), timeout=5)
+            original = app.state.active_turns[session_id]
+            assert isinstance(original, asyncio.Task)
+            original_epoch = app.state.turn_bind_epoch[session_id]
+            _drain_session_event_queue(app.state.session_event_queues.get(session_id))
+
+            if replacement != "unchanged":
+                app.state.begin_turn_slot(session_id, {"pending_id": "new-pending"})
+                if replacement == "running":
+                    app.state.active_turns[session_id] = successor
+                    app.state.live_response_id[session_id] = "new-response"
+                    manager.mark_in_flight(session_id, "new-response")
+                elif replacement == "finished":
+                    app.state.active_turns.pop(session_id)
+                app.state.interrupted_sessions.add(session_id)
+            expected_active = dict(app.state.active_turns)
+            expected_responses = dict(app.state.live_response_id)
+            expected_clears = list(manager.cleared_in_flight)
+            expected_epoch = app.state.turn_bind_epoch[session_id]
+
+            with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+                release_lookup.set()
+                if outcome == "cancelled":
+                    with pytest.raises(asyncio.CancelledError):
+                        await asyncio.wait_for(original, timeout=5)
+                else:
+                    await asyncio.wait_for(original, timeout=5)
+            events = _drain_session_event_queue(app.state.session_event_queues.get(session_id))
+
+            if replacement == "unchanged":
+                assert session_id not in app.state.active_turns
+                assert session_id in manager.cleared_in_flight
+                failures = [event for event in events if event.get("status") == "failed"]
+                assert len(failures) == 1
+                assert "turn setup failed" in failures[0]["error"]["message"]
+                if outcome == "error":
+                    refused = [event for event in events if event["type"] == "response.failed"]
+                    assert len(refused) == 1
+                    assert refused[0]["input_stable_id"] == "a" * 32
+                    assert refused[0]["pending_id"] == "pending_" + "b" * 32
+            else:
+                assert expected_epoch != original_epoch
+                assert app.state.active_turns == expected_active
+                assert app.state.live_response_id == expected_responses
+                assert manager.cleared_in_flight == expected_clears
+                assert session_id in app.state.interrupted_sessions
+                assert not events
+                diagnostic_level = logging.ERROR if outcome == "cancelled" else logging.WARNING
+                diagnostic_message = (
+                    "turn cancelled" if outcome == "cancelled" else "turn setup failed"
+                )
+                assert any(
+                    record.levelno == diagnostic_level
+                    and diagnostic_message in record.message
+                    and record.exc_info is not None
+                    for record in caplog.records
+                )
+    finally:
+        release_lookup.set()
+        for task in (original, successor):
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        app.state.active_turns.pop(session_id, None)
+
+
+@pytest.mark.asyncio
 async def test_runner_failed_status_carries_setup_error_message(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2634,6 +2757,7 @@ async def test_runner_publishes_terminal_failed_when_harness_stream_fails(
         )
 
     statuses = [event.get("status") for event in events]
+    assert conv not in subagent_work._pending_child_acceptances
     # The turn must reach the parametrized terminal state. Without the fix,
     # the failed-stream cases regress in two distinct ways: codex-native
     # publishes only ["running"] (idle is suppressed, so the drain times out
@@ -2660,12 +2784,70 @@ async def test_runner_publishes_terminal_failed_when_harness_stream_fails(
 # ── Runner-local OS env dispatch ────────────────────────
 
 
-@pytest.mark.asyncio
-async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+async def _os_env_helper_pid(
+    registry: SessionResourceRegistry, spec: AgentSpec, session_id: str
+) -> int:
+    """Start the helper with a file read and inspect its process without running a shell."""
+    from omnigent.inner.os_env import CallerProcessOSEnvironment
     from omnigent.runner.tool_dispatch import _execute_os_env_tool
+
+    assert spec.os_env is not None and spec.os_env.cwd is not None
+    note = Path(spec.os_env.cwd) / "note.txt"
+    if not note.exists():
+        note.write_text("ready\n")
+    read = json.loads(
+        await _execute_os_env_tool(
+            "sys_os_read",
+            {"path": "note.txt"},
+            agent_spec=spec,
+            conversation_id=session_id,
+            resource_registry=registry,
+        )
+    )
+    assert "error" not in read
+    assert read["content"] == note.read_text()
+    lease = await registry.lease_tool_environment(session_id, spec.os_env)
+    assert lease is not None
+    try:
+        assert isinstance(lease.environment, CallerProcessOSEnvironment)
+        proc = lease.environment._helper._proc
+        assert proc is not None
+        return proc.pid
+    finally:
+        await lease.release(reusable=True)
+
+
+async def _wait_until_dead(pid: int, timeout: float = 5.0) -> None:
+    """Wait until *pid* has exited (a zombie counts), so the next call sees it dead."""
+    await poll_until_async(lambda: not process_alive(pid), timeout_s=timeout, interval_s=0.02)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("credential_proxy", [False, True], ids=["reusable", "credential-proxy"])
+async def test_runner_os_env_tools_use_agent_spec_cwd(
+    monkeypatch: pytest.MonkeyPatch, credential_proxy: bool
+) -> None:
+    from subprocess import Popen
+    from unittest.mock import AsyncMock
+
+    from omnigent.inner.datamodel import CredentialProxySpec, OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.os_env import _HelperProcessClient
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+    from omnigent.runtime.filesystem_registry import AgentEditFilesystemRegistry
     from omnigent.spec.types import AgentSpec
 
+    registry = SessionResourceRegistry()
+    lease_environment = AsyncMock(wraps=registry.lease_tool_environment)
+    monkeypatch.setattr(registry, "lease_tool_environment", lease_environment)
+    processes: list[Popen[str]] = []
+    start_helper = _HelperProcessClient._start_locked
+
+    def record_start(helper: _HelperProcessClient) -> None:
+        start_helper(helper)
+        assert helper._proc is not None
+        processes.append(helper._proc)
+
+    monkeypatch.setattr(_HelperProcessClient, "_start_locked", record_start)
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         spec = AgentSpec(
@@ -2673,45 +2855,419 @@ async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
             os_env=OSEnvSpec(
                 type="caller_process",
                 cwd=str(root),
-                sandbox=OSEnvSandboxSpec(type="none"),
+                sandbox=OSEnvSandboxSpec(
+                    type="none",
+                    credential_proxy=CredentialProxySpec(entries=[]) if credential_proxy else None,
+                ),
             ),
         )
+        try:
+            write = await _execute_os_env_tool(
+                "sys_os_write",
+                {"path": "created.txt", "content": "Привет 世界\nplanet\n"},
+                agent_spec=spec,
+                conversation_id="conv_runner_os_env_test",
+                resource_registry=registry,
+            )
+            assert json.loads(write)["created"] is True
+            assert root.joinpath("created.txt").read_text() == "Привет 世界\nplanet\n"
+            assert len(processes) == 1
 
-        write = await _execute_os_env_tool(
-            "sys_os_write",
-            {"path": "note.txt", "content": "Привет 世界\nplanet\n"},
-            agent_spec=spec,
-            conversation_id="conv_runner_os_env_test",
-        )
-        assert json.loads(write)["created"] is True
-        assert root.joinpath("note.txt").read_text() == "Привет 世界\nplanet\n"
+            filesystem_registry = AgentEditFilesystemRegistry(watch_path=root)
+            original_text = root.joinpath("created.txt").read_bytes().decode("utf-8")
+            edit = await _execute_os_env_tool(
+                "sys_os_edit",
+                {"path": "created.txt", "oldText": "planet", "newText": "world"},
+                agent_spec=spec,
+                conversation_id="conv_runner_os_env_test",
+                resource_registry=registry,
+                filesystem_registry=filesystem_registry,
+            )
+            assert json.loads(edit)["replacements"] == 1
+            assert filesystem_registry.get_baseline("created.txt") == original_text
+            assert [
+                entry["status"]
+                for entry in filesystem_registry.list_changed_files(
+                    "conv_runner_os_env_test", limit=10
+                )
+            ] == ["modified"]
+            assert len(processes) == (2 if credential_proxy else 1)
 
-        edit = await _execute_os_env_tool(
+            read = await _execute_os_env_tool(
+                "sys_os_read",
+                {"path": "created.txt"},
+                agent_spec=spec,
+                conversation_id="conv_runner_os_env_test",
+                resource_registry=registry,
+            )
+            assert "Привет 世界" in read
+            assert json.loads(read)["content"] == "Привет 世界\nworld\n"
+            assert len(processes) == (3 if credential_proxy else 1)
+            if credential_proxy:
+                lease_environment.assert_not_awaited()
+            else:
+                assert lease_environment.await_count == 3
+        finally:
+            await registry.cleanup_session("conv_runner_os_env_test")
+        assert all(process.poll() is not None for process in processes)
+
+
+@pytest.mark.asyncio
+@pytest.mark.posix_only
+async def test_runner_os_env_helper_retires_after_returned_error_and_shell(
+    tmp_path: Path,
+) -> None:
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+
+    spec = AgentSpec(
+        spec_version=1,
+        os_env=OSEnvSpec(
+            type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none")
+        ),
+    )
+    registry = SessionResourceRegistry()
+    try:
+        helper_pid = await _os_env_helper_pid(registry, spec, "conv_retire")
+        assert await _os_env_helper_pid(registry, spec, "conv_retire") == helper_pid
+        error = await _execute_os_env_tool(
             "sys_os_edit",
-            {"path": "note.txt", "oldText": "planet", "newText": "world"},
+            {"path": "note.txt", "oldText": "absent", "newText": "unused"},
             agent_spec=spec,
-            conversation_id="conv_runner_os_env_test",
+            conversation_id="conv_retire",
+            resource_registry=registry,
         )
-        assert json.loads(edit)["replacements"] == 1
-
-        read = await _execute_os_env_tool(
-            "sys_os_read",
-            {"path": "note.txt"},
-            agent_spec=spec,
-            conversation_id="conv_runner_os_env_test",
-        )
-        assert "Привет 世界" in read
-        assert json.loads(read)["content"] == "Привет 世界\nworld\n"
+        assert json.loads(error)["error"].startswith("Could not find oldText")
+        assert not process_alive(helper_pid)
+        assert (tmp_path / "note.txt").read_text() == "ready\n"
+        replacement = await _os_env_helper_pid(registry, spec, "conv_retire")
+        assert replacement != helper_pid
 
         shell = await _execute_os_env_tool(
             "sys_os_shell",
-            {"command": "pwd"},
+            {"command": "pwd; echo $PPID"},
             agent_spec=spec,
-            conversation_id="conv_runner_os_env_test",
+            conversation_id="conv_retire",
+            resource_registry=registry,
         )
         shell_result = json.loads(shell)
         assert shell_result["exit_code"] == 0
-        assert Path(shell_result["stdout"].strip()).resolve() == root.resolve()
+        cwd, pid = shell_result["stdout"].split()
+        assert Path(cwd).resolve() == tmp_path.resolve()
+        assert int(pid) != replacement
+        assert not process_alive(int(pid))
+        assert process_alive(replacement)
+        after_shell = await _os_env_helper_pid(registry, spec, "conv_retire")
+        assert after_shell == replacement
+    finally:
+        await registry.cleanup_session("conv_retire")
+    assert not process_alive(after_shell)
+
+
+@pytest.mark.asyncio
+@pytest.mark.posix_only
+async def test_runner_os_env_helper_restarts_replaces_workspace_and_times_out(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Crashes and workspace changes replace file helpers; timed-out shells close their own."""
+    import signal
+    from subprocess import Popen
+
+    from omnigent.inner import os_env as os_env_module
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+
+    def agent(cwd: Path) -> AgentSpec:
+        cwd.mkdir(exist_ok=True)
+        return AgentSpec(
+            spec_version=1,
+            os_env=OSEnvSpec(
+                type="caller_process", cwd=str(cwd), sandbox=OSEnvSandboxSpec(type="none")
+            ),
+        )
+
+    registry = SessionResourceRegistry()
+    try:
+        spec = agent(tmp_path / "a")
+        crashed = await _os_env_helper_pid(registry, spec, "conv_a")
+        os.kill(crashed, signal.SIGKILL)
+        # Once the death is visible the next call restarts the helper before sending;
+        # a request already in flight to it is not replayed.
+        await _wait_until_dead(crashed)
+        restarted = await _os_env_helper_pid(registry, spec, "conv_a")
+        assert restarted != crashed
+        assert await _os_env_helper_pid(registry, spec, "conv_a") == restarted
+
+        moved = await _os_env_helper_pid(registry, agent(tmp_path / "b"), "conv_a")
+        assert moved != restarted
+        assert not process_alive(restarted)
+
+        processes: list[Popen[str]] = []
+        start_helper = os_env_module._HelperProcessClient._start_locked
+
+        def record_start(helper: os_env_module._HelperProcessClient) -> None:
+            start_helper(helper)
+            assert helper._proc is not None
+            processes.append(helper._proc)
+
+        monkeypatch.setattr(os_env_module._HelperProcessClient, "_start_locked", record_start)
+        # A timed-out command's descendants may outlive it, so its helper is retired.
+        timed_out = await _execute_os_env_tool(
+            "sys_os_shell",
+            {"command": "sleep 30", "timeout": 1},
+            agent_spec=agent(tmp_path / "b"),
+            conversation_id="conv_a",
+            resource_registry=registry,
+        )
+        assert json.loads(timed_out)["timed_out"] is True
+        assert len(processes) == 1
+        assert processes[0].poll() is not None
+        assert process_alive(moved)
+        assert await _os_env_helper_pid(registry, agent(tmp_path / "b"), "conv_a") == moved
+
+    finally:
+        await registry.cleanup_session("conv_a")
+    assert not process_alive(moved)
+
+
+@pytest.mark.asyncio
+@pytest.mark.posix_only
+async def test_runner_os_env_busy_helper_serves_concurrent_calls_and_cancellation_retires_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A held file helper forces fallback; shell cancellation closes only its own helper."""
+    import errno
+    from subprocess import Popen
+    from unittest.mock import Mock
+
+    import omnigent.inner.os_env as os_env_module
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+
+    spec = AgentSpec(
+        spec_version=1,
+        os_env=OSEnvSpec(
+            type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none")
+        ),
+    )
+    registry = SessionResourceRegistry()
+    held_lease = None
+    blocked: asyncio.Task[str] | None = None
+    gate_fd: int | None = None
+    fifo = tmp_path / "gate"
+    processes: list[Popen[str]] = []
+    start_helper = os_env_module._HelperProcessClient._start_locked
+
+    def record_start(helper: os_env_module._HelperProcessClient) -> None:
+        start_helper(helper)
+        assert helper._proc is not None
+        processes.append(helper._proc)
+
+    monkeypatch.setattr(os_env_module._HelperProcessClient, "_start_locked", record_start)
+
+    def open_gate() -> bool:
+        nonlocal gate_fd
+        try:
+            gate_fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+        except OSError as exc:
+            if exc.errno == errno.ENXIO:
+                return False
+            raise
+        return True
+
+    try:
+        session_helper = await _os_env_helper_pid(registry, spec, "conv_busy")
+        held_lease = await registry.lease_tool_environment("conv_busy", spec.os_env)
+        assert held_lease is not None
+        os.mkfifo(fifo)
+        (tmp_path / "note.txt").write_text("hi\n")
+        blocked = asyncio.create_task(
+            _execute_os_env_tool(
+                "sys_os_shell",
+                {"command": "read line < gate; echo $PPID $line", "timeout": 10},
+                agent_spec=spec,
+                conversation_id="conv_busy",
+                resource_registry=registry,
+            )
+        )
+        await poll_until_async(open_gate, timeout_s=5)
+        fallback_closures = []
+        create_environment = os_env_module.create_os_environment
+        with monkeypatch.context() as fallback_patch:
+
+            def create_fallback(*args, **kwargs):
+                environment = create_environment(*args, **kwargs)
+                close = Mock(wraps=environment.close)
+                fallback_patch.setattr(environment, "close", close)
+                fallback_closures.append(close)
+                return environment
+
+            fallback_patch.setattr(os_env_module, "create_os_environment", create_fallback)
+            read = await _execute_os_env_tool(
+                "sys_os_read",
+                {"path": "note.txt"},
+                agent_spec=spec,
+                conversation_id="conv_busy",
+                resource_registry=registry,
+            )
+            assert json.loads(read)["content"] == "hi\n"
+            assert len(fallback_closures) == 1
+            fallback_closures[0].assert_called_once_with()
+        assert not blocked.done()
+        blocked.cancel()
+        assert gate_fd is not None
+        os.write(gate_fd, b"open\n")
+        os.close(gate_fd)
+        gate_fd = None
+        with pytest.raises(asyncio.CancelledError):
+            await blocked
+        assert len(processes) == 3
+        assert processes[1].poll() is not None
+        assert process_alive(session_helper)
+        await held_lease.release(reusable=False)
+        held_lease = None
+        assert not process_alive(session_helper)
+        replacement = await _os_env_helper_pid(registry, spec, "conv_busy")
+        assert replacement != session_helper
+    finally:
+        if gate_fd is not None:
+            os.close(gate_fd)
+        if blocked is not None:
+            blocked.cancel()
+            await asyncio.gather(blocked, return_exceptions=True)
+        if held_lease is not None:
+            await held_lease.release(reusable=False)
+        await registry.cleanup_session("conv_busy")
+    assert not process_alive(replacement)
+    assert all(process.poll() is not None for process in processes)
+
+
+_REVERT_NATIVE_TEXT = f"one{os.linesep}two{os.linesep}"
+_REVERT_ALTERNATE_TEXT = "one\ntwo\n" if os.linesep == "\r\n" else "one\r\ntwo\r\n"
+
+
+@pytest.mark.parametrize(
+    "original,calls,statuses,read_cap,baseline",
+    [
+        pytest.param(
+            _REVERT_NATIVE_TEXT.encode(),
+            [
+                ("sys_os_edit", {"oldText": "two", "newText": "three"}),
+                ("sys_os_edit", {"oldText": "three", "newText": "two"}),
+            ],
+            [],
+            None,
+            _REVERT_NATIVE_TEXT,
+            id="edit-reverted",
+        ),
+        pytest.param(
+            _REVERT_NATIVE_TEXT.encode(),
+            [
+                ("sys_os_write", {"content": "replaced\n"}),
+                ("sys_os_write", {"content": "one\ntwo\n"}),
+            ],
+            [],
+            None,
+            _REVERT_NATIVE_TEXT,
+            id="write-reverted",
+        ),
+        pytest.param(
+            _REVERT_NATIVE_TEXT.encode(),
+            [
+                ("sys_os_edit", {"oldText": "one", "newText": "uno"}),
+                ("sys_os_edit", {"oldText": "two", "newText": "dos"}),
+                ("sys_os_edit", {"oldText": "uno", "newText": "one"}),
+            ],
+            ["modified"],
+            None,
+            _REVERT_NATIVE_TEXT,
+            id="partially-reverted",
+        ),
+        pytest.param(
+            _REVERT_ALTERNATE_TEXT.encode(),
+            [
+                ("sys_os_edit", {"oldText": "two", "newText": "three"}),
+                ("sys_os_edit", {"oldText": "three", "newText": "two"}),
+            ],
+            ["modified"],
+            None,
+            _REVERT_ALTERNATE_TEXT,
+            id="line-endings-changed",
+        ),
+        pytest.param(
+            b"\x89PNG\r\n\x1a\n\x00\xff",
+            [("sys_os_write", {"content": ""}), ("sys_os_write", {"content": ""})],
+            ["modified"],
+            None,
+            None,
+            id="binary-original",
+        ),
+        pytest.param(
+            _REVERT_NATIVE_TEXT.encode(),
+            [
+                ("sys_os_write", {"content": "replaced\n"}),
+                ("sys_os_write", {"content": "one\ntwo\n"}),
+            ],
+            ["modified"],
+            4,
+            None,
+            id="original-beyond-read-cap",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_runner_os_env_change_restoring_the_original_leaves_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    original: bytes,
+    calls: list[tuple[str, dict[str, str]]],
+    statuses: list[str],
+    read_cap: int | None,
+    baseline: str | None,
+) -> None:
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+    from omnigent.runtime.filesystem_registry import AgentEditFilesystemRegistry
+    from omnigent.spec.types import AgentSpec
+
+    if read_cap is not None:
+        monkeypatch.setattr("omnigent.runner.environment_filesystem._MAX_READ_BYTES", read_cap)
+    (tmp_path / "file.txt").write_bytes(original)
+    spec = AgentSpec(
+        spec_version=1,
+        os_env=OSEnvSpec(
+            type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none")
+        ),
+    )
+    filesystem_registry = AgentEditFilesystemRegistry(watch_path=tmp_path)
+
+    resource_registry = SessionResourceRegistry()
+    try:
+        helper_pid = await _os_env_helper_pid(resource_registry, spec, "conv_revert")
+        for step, (tool_name, args) in enumerate(calls, start=1):
+            result = await _execute_os_env_tool(
+                tool_name,
+                {"path": "file.txt", **args},
+                agent_spec=spec,
+                conversation_id="conv_revert",
+                filesystem_registry=filesystem_registry,
+                resource_registry=resource_registry,
+            )
+            assert "error" not in json.loads(result)
+            if step < len(calls):
+                assert filesystem_registry.list_changed_files("conv_revert", limit=10)
+
+        listed = filesystem_registry.list_changed_files("conv_revert", limit=10)
+        assert [entry["status"] for entry in listed] == statuses
+        assert filesystem_registry.get_baseline("file.txt") == baseline
+        if baseline is not None:
+            assert ((tmp_path / "file.txt").read_bytes() != original) is bool(statuses)
+
+        assert await _os_env_helper_pid(resource_registry, spec, "conv_revert") == helper_pid
+    finally:
+        await resource_registry.cleanup_session("conv_revert")
 
 
 @pytest.mark.asyncio
@@ -2835,28 +3391,175 @@ async def test_runner_os_env_surrogate_path_is_httpx_transport_safe(
 
 
 @pytest.mark.asyncio
+async def test_claude_callback_uses_selected_workspace_for_model_credentials(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from unittest.mock import AsyncMock, Mock
+
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+    from omnigent.runtime import workflow
+
+    workspace = tmp_path / "selected"
+    workspace.mkdir()
+    configured = tmp_path / "configured"
+    configured.mkdir()
+    access = Mock()
+    resolve_access = Mock(return_value=access)
+    monkeypatch.setattr(workflow, "claude_terminal_model_access", resolve_access)
+    environment = Mock()
+    environment.read = AsyncMock(return_value={"content": "ok"})
+    create_environment = Mock(return_value=environment)
+    monkeypatch.setattr("omnigent.inner.os_env.create_os_environment", create_environment)
+    spec = AgentSpec(
+        spec_version=1,
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+        os_env=OSEnvSpec(cwd=str(configured), sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+    )
+
+    result = await _execute_os_env_tool(
+        "sys_os_read",
+        {"path": "notes.txt"},
+        agent_spec=spec,
+        runner_workspace=workspace,
+    )
+
+    assert json.loads(result) == {"content": "ok"}
+    assert resolve_access.call_args.kwargs["cwd"] == str(workspace)
+    assert create_environment.call_args.args[0].cwd == str(workspace)
+    assert create_environment.call_args.kwargs["model_access"] is access
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "shared_copy_on_write,credential_proxy",
+    [
+        pytest.param(True, False, id="shared-cow"),
+        pytest.param(False, False, id="fork"),
+        pytest.param(False, True, id="credential-proxy"),
+    ],
+)
+async def test_runner_os_env_dispatch_preserves_shared_and_fork_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    shared_copy_on_write: bool,
+    credential_proxy: bool,
+) -> None:
+    """Overlays borrow their owner; forks and credential proxies use disposable helpers."""
+    from unittest.mock import AsyncMock, Mock, call
+
+    from omnigent.entities import DEFAULT_ENVIRONMENT_ID
+    from omnigent.inner.datamodel import (
+        CredentialProxySpec,
+        OSEnvSandboxSpec,
+        OSEnvSpec,
+        WritePathSpec,
+    )
+    from omnigent.inner.os_env import OSEnvironment
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+
+    primary = Mock(spec=OSEnvironment)
+    primary.read = AsyncMock(return_value={"content": "primary"})
+    disposable = [Mock(spec=OSEnvironment) for _ in range(2)]
+    for index, environment in enumerate(disposable):
+        environment.read = AsyncMock(return_value={"content": f"fork-{index}"})
+    create_environment = Mock(side_effect=disposable)
+    monkeypatch.setattr("omnigent.inner.os_env.create_os_environment", create_environment)
+    registry = Mock(spec=SessionResourceRegistry)
+    registry.resolve_environment.return_value = primary
+    registry.lease_tool_environment = AsyncMock(side_effect=AssertionError("unexpected lease"))
+    skills_dir = tmp_path / "skills"
+    registry.codex_skills_dir.return_value = skills_dir
+    spec = AgentSpec(
+        spec_version=1,
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=str(tmp_path),
+            fork=not (shared_copy_on_write or credential_proxy),
+            sandbox=OSEnvSandboxSpec(
+                type="none",
+                write_paths=[WritePathSpec(".", copy_on_write=shared_copy_on_write)],
+                credential_proxy=CredentialProxySpec(entries=[]) if credential_proxy else None,
+            ),
+        ),
+    )
+    session_id = "conv_dispatch_ownership"
+    results = [
+        json.loads(
+            await _execute_os_env_tool(
+                "sys_os_read",
+                {"path": "notes.txt"},
+                agent_spec=spec,
+                conversation_id=session_id,
+                resource_registry=registry,
+            )
+        )
+        for _ in range(2)
+    ]
+
+    registry.lease_tool_environment.assert_not_awaited()
+    primary.close.assert_not_called()
+    if shared_copy_on_write:
+        assert results == [{"content": "primary"}] * 2
+        assert (
+            registry.resolve_environment.call_args_list
+            == [call(session_id, DEFAULT_ENVIRONMENT_ID, spec)] * 2
+        )
+        assert primary.read.await_count == 2
+        create_environment.assert_not_called()
+        for environment in disposable:
+            environment.read.assert_not_awaited()
+            environment.close.assert_not_called()
+    else:
+        assert results == [{"content": f"fork-{index}"} for index in range(2)]
+        registry.resolve_environment.assert_not_called()
+        primary.read.assert_not_awaited()
+        assert (
+            create_environment.call_args_list
+            == [call(spec.os_env, additional_read_roots=[skills_dir], model_access=None)] * 2
+        )
+        for environment in disposable:
+            environment.read.assert_awaited_once()
+            environment.close.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("registered", [False, True], ids=["standalone", "registered"])
 async def test_runner_os_env_error_is_httpx_transport_safe(
     caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    registered: bool,
 ) -> None:
-    """OS-tool exception results stay readable and UTF-8 encodable."""
+    """OS-tool exceptions remain transport-safe and retire their failed environment."""
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.runner.tool_dispatch import _execute_os_env_tool
 
-    class _FailingEnvironment:
+    class _ReadEnvironment:
+        def __init__(self) -> None:
+            self.cwd = tmp_path.resolve()
+            self.close_count = 0
+
         async def read(self, *, path: str, offset: int, limit: object) -> dict[str, object]:
             del path, offset, limit
-            raise RuntimeError("ошибка для recording-\udcff.txt")
+            if self is environments[0]:
+                raise RuntimeError("ошибка для recording-\udcff.txt")
+            return {"content": "recovered"}
 
         def close(self) -> None:
-            return None
+            self.close_count += 1
+
+    environments: list[_ReadEnvironment] = []
+
+    def create_environment(*args: object, **kwargs: object) -> _ReadEnvironment:
+        environment = _ReadEnvironment()
+        environments.append(environment)
+        return environment
 
     caplog.set_level(logging.CRITICAL + 1, logger="omnigent.runner.tool_dispatch")
-    environment = _FailingEnvironment()
     monkeypatch.setattr(
         "omnigent.inner.os_env.create_os_environment",
-        lambda *args, **kwargs: environment,
+        create_environment,
     )
     spec = AgentSpec(
         spec_version=1,
@@ -2867,22 +3570,181 @@ async def test_runner_os_env_error_is_httpx_transport_safe(
         ),
     )
 
-    result = await _execute_os_env_tool(
-        "sys_os_read",
-        {"path": "recording-\udcff.txt"},
-        agent_spec=spec,
-        conversation_id="conv_runner_surrogate_error",
-    )
+    registry = SessionResourceRegistry()
+    session_id = "conv_runner_surrogate_error"
+    try:
+        result = await _execute_os_env_tool(
+            "sys_os_read",
+            {"path": "recording-\udcff.txt"},
+            agent_spec=spec,
+            conversation_id=session_id,
+            resource_registry=registry if registered else None,
+        )
 
-    assert "ошибка" in result
-    assert "\\udcff" in result
-    assert json.loads(result) == {"error": "ошибка для recording-\udcff.txt"}
-    request = httpx.Request(
-        "POST",
-        "https://harness.test/v1/sessions/test/events",
-        json={"type": "tool_result", "output": result},
+        assert "ошибка" in result
+        assert "\\udcff" in result
+        assert json.loads(result) == {"error": "ошибка для recording-\udcff.txt"}
+        request = httpx.Request(
+            "POST",
+            "https://harness.test/v1/sessions/test/events",
+            json={"type": "tool_result", "output": result},
+        )
+        request.content.decode("utf-8")
+        assert len(environments) == 1
+        assert environments[0].close_count == 1
+
+        retry = await _execute_os_env_tool(
+            "sys_os_read",
+            {"path": "recording-\udcff.txt"},
+            agent_spec=spec,
+            conversation_id=session_id,
+            resource_registry=registry if registered else None,
+        )
+        assert json.loads(retry) == {"content": "recovered"}
+        assert len(environments) == 2
+        assert environments[1].close_count == (0 if registered else 1)
+    finally:
+        await registry.cleanup_session(session_id)
+    assert [environment.close_count for environment in environments] == [1, 1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "start_in_scratch,outcome",
+    [
+        pytest.param(False, "success", id="cold-success"),
+        pytest.param(False, "error", id="cold-error"),
+        pytest.param(False, "timeout", id="cold-timeout"),
+        pytest.param(False, "raised", id="cold-raised"),
+        pytest.param(False, "cancelled", id="cold-cancelled"),
+        pytest.param(True, "success", id="scratch-workspace-retired"),
+    ],
+)
+async def test_runner_os_env_cold_shell_preserves_file_helper(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    start_in_scratch: bool,
+    outcome: str,
+) -> None:
+    """Cold shell calls leave file leases intact; scratch calls retain their workspace."""
+    from functools import partial
+    from unittest.mock import AsyncMock, Mock, call
+
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.os_env import OSEnvironment
+    from omnigent.inner.sandbox import SandboxPolicy
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+
+    shell_started = asyncio.Event()
+    shell_blocked = asyncio.Event()
+    shell_result = {
+        "success": {"stdout": "done", "exit_code": 0},
+        "error": {"error": "command failed", "exit_code": 1},
+        "timeout": {"error": "command timed out", "timed_out": True},
+        "raised": {"error": "shell failed"},
+    }
+
+    async def shell(**kwargs: object) -> dict[str, object]:
+        del kwargs
+        shell_started.set()
+        if outcome == "cancelled":
+            await shell_blocked.wait()
+        if outcome == "raised":
+            raise RuntimeError("shell failed")
+        return shell_result[outcome]
+
+    environments: list[Mock] = []
+
+    def create_environment(*args: object, **kwargs: object) -> Mock:
+        del args, kwargs
+        environment = Mock(spec=OSEnvironment)
+        environment.cwd = tmp_path.resolve()
+        environment.read = AsyncMock(return_value={"content": "file"})
+        environment.shell = AsyncMock(side_effect=shell)
+        environments.append(environment)
+        return environment
+
+    create = Mock(side_effect=create_environment)
+    monkeypatch.setattr("omnigent.inner.os_env.create_os_environment", create)
+    monkeypatch.setattr(
+        "omnigent.runner.resource_registry.resolve_sandbox",
+        lambda *_: SandboxPolicy(
+            backend_type="linux_bwrap",
+            active=True,
+            read_roots=None,
+            write_roots=[tmp_path],
+            write_files=[],
+            allow_network=False,
+        ),
     )
-    request.content.decode("utf-8")
+    spec = AgentSpec(
+        spec_version=1,
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=str(tmp_path),
+            start_in_scratch=start_in_scratch,
+            sandbox=OSEnvSandboxSpec(type="linux_bwrap"),
+        ),
+    )
+    session_id = "conv_cold_shell"
+    registry = SessionResourceRegistry()
+    execute = partial(
+        _execute_os_env_tool,
+        agent_spec=spec,
+        conversation_id=session_id,
+        resource_registry=registry,
+    )
+    task: asyncio.Task[str] | None = None
+    try:
+        assert json.loads(await execute("sys_os_read", {"path": "note.txt"})) == {
+            "content": "file"
+        }
+        file_environment = environments[0]
+        task = asyncio.create_task(
+            execute("sys_os_shell", {"command": "example-command", "timeout": 7})
+        )
+        await asyncio.wait_for(shell_started.wait(), timeout=1.0)
+        if outcome == "cancelled":
+            assert not task.done()
+            assert json.loads(await execute("sys_os_read", {"path": "note.txt"})) == {
+                "content": "file"
+            }
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            assert json.loads(await task) == shell_result[outcome]
+
+        assert len(environments) == (1 if start_in_scratch else 2)
+        shell_environment = environments[0 if start_in_scratch else 1]
+        shell_environment.shell.assert_awaited_once_with(command="example-command", timeout=7)
+        shell_environment.close.assert_called_once_with()
+        if start_in_scratch:
+            assert create.call_count == 1
+        else:
+            file_environment.shell.assert_not_awaited()
+            file_environment.close.assert_not_called()
+            shell_environment.read.assert_not_awaited()
+            assert create.call_args_list[1] == call(
+                spec.os_env,
+                additional_read_roots=[registry.codex_skills_dir(session_id)],
+                model_access=None,
+            )
+        assert json.loads(await execute("sys_os_read", {"path": "note.txt"})) == {
+            "content": "file"
+        }
+        assert create.call_count == 2
+        assert file_environment.read.await_count == (
+            1 if start_in_scratch else 3 if outcome == "cancelled" else 2
+        )
+        environments[1 if start_in_scratch else 0].close.assert_not_called()
+    finally:
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await registry.cleanup_session(session_id)
+    for environment in environments:
+        environment.close.assert_called_once_with()
 
 
 @pytest.mark.asyncio
@@ -3775,9 +4637,11 @@ def test_subagent_read_tools_are_runner_local() -> None:
         pytest.param({"input": "continue"}, id="object-input-contract"),
     ],
 )
+@pytest.mark.parametrize("runner_features", [None, "-peer_session_messaging"])
 async def test_sys_session_send_reuses_existing_child_session(
     monkeypatch: pytest.MonkeyPatch,
     subagent_args: str | dict[str, str],
+    runner_features: str | None,
 ) -> None:
     """
     Re-sending to the same ``(agent, title)`` continues the existing child.
@@ -3791,10 +4655,15 @@ async def test_sys_session_send_reuses_existing_child_session(
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param subagent_args: ``sys_session_send`` ``args`` payload.
+    :param runner_features: Local feature override; ``None`` uses defaults.
     """
     from omnigent.runner import app as runner_app
     from omnigent.runner.tool_dispatch import execute_tool
 
+    if runner_features is None:
+        monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
+    else:
+        monkeypatch.setenv("OMNIGENT_FEATURES", runner_features)
     create_posts = 0
     event_posts: list[dict[str, Any]] = []
     dispatch_stamps: list[dict[str, Any]] = []
@@ -7932,7 +8801,7 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
 
     # agent_name forwarded to the server-side filter.
     assert sessions_params.get("agent_name") == "researcher"
-    assert sessions_params.get("visibility") == "all"
+    assert sessions_params.get("visibility") == "mine"
     # Both sessions projected with status + connectivity from the single
     # shared-runner status lookup.
     assert out["sessions"] == [
@@ -7945,6 +8814,7 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
             "runner_online": True,
             "parent_session_id": None,
             "created_by_session_id": "conv_x",
+            "family": None,
         },
         {
             "session_id": "s2",
@@ -7955,6 +8825,7 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
             "runner_online": True,
             "parent_session_id": None,
             "created_by_session_id": None,
+            "family": None,
         },
     ]
     # Connectivity resolved once per UNIQUE runner — two sessions share
@@ -8296,18 +9167,33 @@ async def test_sys_session_create_maps_agent_not_found() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sys_session_create_spawns_child_under_caller() -> None:
+@pytest.mark.parametrize(
+    "failure",
+    [None, "message-post", "parent-snapshot", "child-snapshot"],
+    ids=[
+        "message-sent",
+        "message-failed",
+        "malformed-parent-snapshot",
+        "malformed-child-snapshot",
+    ],
+)
+async def test_sys_session_create_spawns_child_under_caller(failure: str | None) -> None:
     """
     ``sys_session_create`` POSTs a JSON create with
     ``parent_session_id`` forced to the caller (child-only), passes the
-    agent_id, title, and a queued initial message, and returns a handle
-    carrying the new child's id. If parent_session_id weren't forced to
-    the caller, an orchestrator could create top-level/sibling sessions —
-    so the asserted request body is the security-critical check.
+    agent_id and title, and returns a handle carrying the new child's id.
+    If parent_session_id weren't forced to the caller, an orchestrator could
+    create top-level/sibling sessions — so the asserted request body is the
+    security-critical check. The initial message is sent like a by-id
+    ``sys_session_send`` so the child's completion is tracked as sub-agent
+    work that reaches the caller's inbox and wakes it. A failed send, including
+    a malformed snapshot while preparing it, leaves no tracked work and reports
+    the error with the created child's id.
     """
     from omnigent.runner.tool_dispatch import execute_tool
 
     captured: dict[str, Any] = {}
+    posted: list[dict[str, Any]] = []
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         if request.method == "POST" and request.url.path == "/v1/sessions":
@@ -8321,29 +9207,74 @@ async def test_sys_session_create_spawns_child_under_caller() -> None:
                     "status": "idle",
                 },
             )
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
+            if failure == "parent-snapshot":
+                return httpx.Response(200, content=b"<html>proxy error</html>")
+            return httpx.Response(404, json={"error": "not found"})
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_child":
+            if failure == "child-snapshot":
+                return httpx.Response(200, json=["conv_child"])
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_child",
+                    "title": "auth",
+                    "agent_name": "researcher",
+                    "parent_session_id": "conv_caller",
+                    "labels": {},
+                    "busy": False,
+                },
+            )
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_child":
+            return httpx.Response(200, json={"ok": True})
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_child/events":
+            posted.append(json.loads(request.content))
+            if failure == "message-post":
+                return httpx.Response(500, json={"error": "events unavailable"})
+            return httpx.Response(202, json={"queued": True})
         return httpx.Response(404, json={"error": str(request.url)})
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(_server_handler),
         base_url="http://server",
     ) as server_client:
-        output = await execute_tool(
-            tool_name="sys_session_create",
-            arguments=json.dumps({"agent_id": "ag_x", "title": "auth", "message": "start"}),
-            server_client=server_client,
-            conversation_id="conv_caller",
-        )
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps({"agent_id": "ag_x", "title": "auth", "message": "start"}),
+                server_client=server_client,
+                conversation_id="conv_caller",
+            )
+            entry = subagent_work.get_subagent_work("conv_child")
+        finally:
+            subagent_work.unregister_subagent_work("conv_child")
 
-    # Child-only: parent forced to the caller; agent + title + queued
-    # message threaded through to the create body.
+    # Child-only: parent forced to the caller; agent + title threaded
+    # through to the create body.
     assert captured["parent_session_id"] == "conv_caller"
     assert captured["agent_id"] == "ag_x"
     assert captured["title"] == "auth"
-    assert captured["initial_items"][0]["data"]["content"][0]["text"] == "start"
+    assert "initial_items" not in captured
+    assert [event["data"]["content"][0]["text"] for event in posted] == (
+        [] if failure in ("parent-snapshot", "child-snapshot") else ["start"]
+    )
     handle = json.loads(output)
-    assert handle["conversation_id"] == "conv_child"
+    assert handle["conversation_id"] == "conv_child", output
+    if failure is not None:
+        assert handle["error"].startswith("child session created but message failed"), output
+        assert "Do not create a replacement" in handle["error"]
+        assert entry is None
+        return
+    assert entry is not None, output
+    assert (entry.parent_session_id, entry.agent, entry.title) == (
+        "conv_caller",
+        "researcher",
+        "auth",
+    )
     assert handle["agent_id"] == "ag_x"
     assert handle["agent_name"] == "researcher"
+    assert handle["handle_id"] == "conv_child"
+    assert handle["status"] == "launching"
 
 
 @pytest.mark.asyncio
@@ -8420,8 +9351,8 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
 ) -> None:
     """
     Bundle mode bundles a local agent config, POSTs the multipart
-    create with ``parent_session_id`` forced to the caller, queues the
-    optional message as the child's first event, and returns a handle
+    create with ``parent_session_id`` forced to the caller, sends the
+    optional message as tracked sub-agent work, and returns a handle
     built from the server's created-agent identifiers.
 
     The asserted multipart metadata is the security-critical check
@@ -8441,6 +9372,8 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
     event_bodies: list[dict[str, Any]] = []
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/info":
+            return httpx.Response(200, json={"session_bundle_model_override": True})
         if request.method == "POST" and request.url.path == "/v1/sessions":
             create_requests.append(request)
             return httpx.Response(
@@ -8451,6 +9384,20 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
                     "agent_name": "helper",
                 },
             )
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_child":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_child",
+                    "title": "auth",
+                    "agent_name": "helper",
+                    "parent_session_id": "conv_caller",
+                    "labels": {},
+                    "busy": False,
+                },
+            )
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_child":
+            return httpx.Response(200, json={"ok": True})
         if request.method == "POST" and request.url.path == "/v1/sessions/conv_child/events":
             event_bodies.append(json.loads(request.content))
             return httpx.Response(200, json={})
@@ -8460,23 +9407,39 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
         transport=httpx.MockTransport(_server_handler),
         base_url="http://server",
     ) as server_client:
-        output = await execute_tool(
-            tool_name="sys_session_create",
-            arguments=json.dumps(
-                {"config_path": "helper.yaml", "title": "auth", "message": "start"}
-            ),
-            server_client=server_client,
-            conversation_id="conv_caller",
-            runner_workspace=tmp_path,
-        )
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps(
+                    {
+                        "config_path": "helper.yaml",
+                        "title": "auth",
+                        "message": "start",
+                        "model": "databricks-claude-sonnet-4-6",
+                        "reasoning_effort": "low",
+                    }
+                ),
+                server_client=server_client,
+                conversation_id="conv_caller",
+                runner_workspace=tmp_path,
+            )
+            entry = subagent_work.get_subagent_work("conv_child")
+        finally:
+            subagent_work.unregister_subagent_work("conv_child")
 
     # Exactly one multipart create; parent forced to the caller
-    # (child-only) and the title threaded into the metadata part.
+    # (child-only), and title, model and effort threaded into the
+    # metadata part as the agent_id create sends them.
     assert len(create_requests) == 1, (
         f"expected exactly one create POST, got {len(create_requests)}"
     )
     parts = _parse_multipart_create(create_requests[0])
-    assert parts["metadata"] == {"parent_session_id": "conv_caller", "title": "auth"}
+    assert parts["metadata"] == {
+        "parent_session_id": "conv_caller",
+        "title": "auth",
+        "model_override": "databricks-claude-sonnet-4-6",
+        "reasoning_effort": "low",
+    }
 
     # The uploaded bundle is a gzipped tar holding the authored config
     # verbatim — proves the local file traversed materialize → tar.
@@ -8487,10 +9450,12 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
         assert member is not None
         assert member.read().decode() == config_text
 
-    # The optional message was queued as the child's first user event —
-    # this is what starts the child's turn (same pattern as named send).
+    # The optional message is the child's first user event and its turn is
+    # tracked, so the completion reaches the caller like a by-id send.
     assert len(event_bodies) == 1
     assert event_bodies[0]["data"]["content"][0]["text"] == "start"
+    assert entry is not None, output
+    assert entry.parent_session_id == "conv_caller"
 
     handle = json.loads(output)
     assert handle["conversation_id"] == "conv_child"
@@ -8498,6 +9463,111 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
     # not the caller's args — the orchestrator needs the NEW agent's id.
     assert handle["agent_id"] == "ag_new"
     assert handle["agent_name"] == "helper"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("info", "args", "error"),
+    [
+        pytest.param(
+            {}, {"model": "databricks-claude-sonnet-4-6"}, "server_too_old", id="old-server"
+        ),
+        pytest.param(
+            None, {"model": "databricks-claude-sonnet-4-6"}, "could not check", id="no-info"
+        ),
+        pytest.param(
+            {"session_bundle_model_override": True},
+            {"reasoning_effort": 3},
+            "must be a string",
+            id="non-string-effort",
+        ),
+    ],
+)
+async def test_sys_session_create_config_path_refuses_unsendable_overrides(
+    tmp_path: Path, info: dict[str, Any] | None, args: dict[str, Any], error: str
+) -> None:
+    """
+    A config_path create never drops a requested override: a server that does
+    not report ``session_bundle_model_override`` (or whose info cannot be read)
+    and a non-string value both fail with a named error before any upload.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    (tmp_path / "helper.yaml").write_text("name: helper\nprompt: help\n")
+    creates: list[httpx.Request] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json=info) if info is not None else httpx.Response(503)
+        creates.append(request)
+        return httpx.Response(201, json={"session_id": "conv_child", "agent_id": "ag_new"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler), base_url="http://server"
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"config_path": "helper.yaml", **args}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            runner_workspace=tmp_path,
+        )
+
+    assert error in output
+    assert creates == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("harness", "effort", "sent"),
+    [
+        pytest.param("claude-sdk", "ultra", "xhigh", id="alias-folds"),
+        pytest.param("claude-sdk", "minimal", None, id="outside-vocabulary"),
+        pytest.param("cursor", "low", None, id="no-effort-support"),
+        pytest.param(None, "low", "low", id="unclassified-harness-passes"),
+    ],
+)
+async def test_sys_session_create_config_path_checks_effort_against_the_bundle_harness(
+    tmp_path: Path, harness: str | None, effort: str, sent: str | None
+) -> None:
+    """
+    A config_path effort the bundled child's harness cannot use fails before
+    any upload instead of being stored and dropped at every turn; an alias
+    folds to the harness's value, and an unclassified harness passes through.
+
+    :param harness: The local config's harness, or ``None`` for none set.
+    :param effort: The requested effort.
+    :param sent: The effort the metadata carries, or ``None`` when refused.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    config = "name: helper\nprompt: help\n"
+    if harness is not None:
+        config += f"executor:\n  harness: {harness}\n"
+    (tmp_path / "helper.yaml").write_text(config)
+    creates: list[httpx.Request] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        creates.append(request)
+        return httpx.Response(201, json={"session_id": "conv_child", "agent_id": "ag_new"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler), base_url="http://server"
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"config_path": "helper.yaml", "reasoning_effort": effort}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            runner_workspace=tmp_path,
+        )
+
+    if sent is None:
+        assert "invalid 'reasoning_effort'" in output
+        assert creates == []
+        return
+    assert len(creates) == 1, output
+    assert _parse_multipart_create(creates[0])["metadata"]["reasoning_effort"] == sent
 
 
 @pytest.mark.asyncio
@@ -8976,8 +10046,8 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
     """
     ``sys_session_get_info`` projects ``GET /v1/sessions/{id}`` metadata
     and folds in live runner connectivity from ``GET
-    /v1/runners/{id}/status`` and host harness readiness from ``GET
-    /v1/hosts/{id}``.
+    /v1/runners/{id}/status``, host harness readiness from ``GET
+    /v1/hosts/{id}`` and the project name from ``GET /v1/projects/{id}``.
 
     Proves the full runner-dispatch path: read the session snapshot,
     derive the effective model (a per-session ``model_override`` wins
@@ -8994,6 +10064,8 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
         if request.method == "GET" and request.url.path == "/v1/sessions/conv_target":
             assert request.url.params["include_items"] == "false"
             assert request.url.params["include_liveness"] == "false"
+            # Usage feeds no projected field, so the costly aggregate is skipped.
+            assert request.url.params["include_usage"] == "false"
             return httpx.Response(
                 200,
                 json={
@@ -9013,6 +10085,9 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
                     "model_override": "claude-opus-4-8",
                     "workspace": "/repo",
                     "git_branch": "feature/x",
+                    "project_id": "proj_1",
+                    "total_cost_usd": 1.25,
+                    "usage_by_model": {"example-model": {"input_tokens": 12, "output_tokens": 4}},
                     "pending_elicitations": [{"id": "el_1"}, {"id": "el_2"}],
                 },
             )
@@ -9023,6 +10098,8 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
                 200,
                 json={"configured_harnesses": {"codex-native": True, "cursor-native": False}},
             )
+        if request.method == "GET" and request.url.path == "/v1/projects/proj_1":
+            return httpx.Response(200, json={"id": "proj_1", "name": "Auth work"})
         return httpx.Response(404, json={"error": str(request.url)})
 
     async with httpx.AsyncClient(
@@ -9053,6 +10130,8 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
         "cursor-native": False,
     }
     assert info["parent_session_id"] == "conv_parent"
+    assert info["project_id"] == "proj_1"
+    assert info["project_name"] == "Auth work"
     # Effective model: the per-session override wins over the spec
     # default. "anthropic/claude-sonnet-4-6" here would mean the
     # override was ignored.
@@ -9063,22 +10142,26 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
     # blocked session is waiting on.
     assert info["pending_elicitation_count"] == 2
     assert info["pending_elicitations"] == [{"id": "el_1"}, {"id": "el_2"}]
-    # Metadata-only: the full transcript is never embedded.
+    # Metadata-only: the full transcript and usage totals are never embedded.
     assert "items" not in info
+    assert "total_cost_usd" not in info
+    assert "usage_by_model" not in info
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("host_response", [httpx.Response(503), httpx.Response(200, text="bad")])
-async def test_sys_session_get_info_tolerates_host_readiness_failure(
-    host_response: httpx.Response,
+@pytest.mark.parametrize("read_response", [httpx.Response(503), httpx.Response(200, text="bad")])
+async def test_sys_session_get_info_tolerates_host_and_project_read_failures(
+    read_response: httpx.Response,
 ) -> None:
     from omnigent.runner.tool_dispatch import execute_tool
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/sessions/conv_target":
-            return httpx.Response(200, json={"id": "conv_target", "host_id": "host_1"})
-        if request.url.path == "/v1/hosts/host_1":
-            return host_response
+            return httpx.Response(
+                200, json={"id": "conv_target", "host_id": "host_1", "project_id": "proj_1"}
+            )
+        if request.url.path in ("/v1/hosts/host_1", "/v1/projects/proj_1"):
+            return read_response
         return httpx.Response(404)
 
     async with httpx.AsyncClient(
@@ -9092,7 +10175,10 @@ async def test_sys_session_get_info_tolerates_host_readiness_failure(
             conversation_id="conv_caller",
         )
 
-    assert json.loads(output)["configured_harnesses"] is None
+    info = json.loads(output)
+    assert info["configured_harnesses"] is None
+    assert info["project_id"] == "proj_1"
+    assert info["project_name"] is None
 
 
 @pytest.mark.asyncio
@@ -9955,6 +11041,68 @@ async def test_spawn_async_tool_cancels_losing_future_no_leak(
     await asyncio.sleep(0)
     assert inbox.get_nowait()["status"] == "cancelled"
     assert _leaked(before) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["completed", "failed", "cancelled"])
+async def test_spawn_async_tool_requests_wake_for_uncancelled_results(
+    monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    """
+    A completed or failed background result asks the runner to wake its
+    session once the result is in the inbox. A cancelled task does not: the
+    caller that cancelled it is not waiting for the result.
+    """
+    from omnigent.runner import tool_dispatch
+
+    release = asyncio.Event()
+
+    async def _tool(**_kw: Any) -> str:
+        await release.wait()
+        if outcome == "failed":
+            raise RuntimeError("tool broke")
+        return "ok"
+
+    monkeypatch.setattr(tool_dispatch, "execute_tool", _tool)
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] = {}
+    wakes: list[tuple[str, str, str, str, int]] = []
+
+    def _wake(session_id: str, handle_id: str, tool_name: str, status: str) -> None:
+        wakes.append((session_id, handle_id, tool_name, status, inbox.qsize()))
+
+    handle = json.loads(
+        tool_dispatch._spawn_async_tool(
+            {"tool": "slow", "args": "{}"},
+            session_inbox=inbox,
+            session_async_tasks=tasks,
+            wake_on_async_result=_wake,
+            server_client=None,
+            terminal_registry=None,
+            resource_registry=None,
+            agent_spec=None,
+            conversation_id="conv_wake",
+            task_id=None,
+            agent_id=None,
+            agent_name=None,
+            runner_workspace=None,
+            mcp_manager=None,
+            filesystem_registry=None,
+        )
+    )
+    bg_task, cancel_event = tasks[handle["handle_id"]]
+    await asyncio.sleep(0)  # let _bg reach asyncio.wait
+    if outcome == "cancelled":
+        cancel_event.set()
+    else:
+        release.set()
+    await bg_task
+
+    assert inbox.get_nowait()["status"] == outcome
+    expected = (
+        [] if outcome == "cancelled" else [("conv_wake", handle["handle_id"], "slow", outcome, 1)]
+    )
+    assert wakes == expected
 
 
 @pytest.mark.asyncio
@@ -10923,6 +12071,183 @@ async def test_on_proxy_stream_end_spares_superseded_response() -> None:
         app.state.active_turns.pop(conv, None)
 
 
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "read_error",
+        "failed",
+        "completed",
+        "empty",
+        "rejected",
+        "precreated_read_error",
+        "precreated_empty",
+        "late_created",
+    ],
+)
+@pytest.mark.parametrize(
+    ("successor", "native_receipt"),
+    [
+        pytest.param("starting", False, id="starting"),
+        pytest.param("running", False, id="running"),
+        pytest.param("finished", False, id="finished"),
+        pytest.param("unchanged", False, id="unchanged"),
+        pytest.param("starting", True, id="native-starting"),
+        pytest.param("running", True, id="native-running"),
+    ],
+)
+@pytest.mark.parametrize("delivery", ["stream", "background"])
+@pytest.mark.asyncio
+async def test_superseded_harness_stream_cannot_settle_newer_turn(
+    outcome: str,
+    successor: str,
+    native_receipt: bool,
+    delivery: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Late stream outcomes cannot consume a successor's status or exit evidence."""
+    conv = "conv_late_stream"
+    harness = _RecoveryScriptedHarnessClient([])
+    pm = _RecoveryFakeProcessManager(harness)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    newer = asyncio.create_task(asyncio.Event().wait())
+    exit_error = {"code": "required_terminal_exited", "message": "successor terminal exited"}
+    clears_at_boundary: list[str] = []
+    old_requests: set[subagent_work._ChildAcceptanceRequest] = set()
+    successor_request: subagent_work._ChildAcceptanceRequest | None = None
+    successor_work: subagent_work._SubagentWorkEntry | None = None
+    successor_acceptance = NativeTurnAcceptance(conv, "thread_new", "codex_new")
+
+    def replace_turn() -> None:
+        nonlocal successor_request, successor_work
+        if successor != "unchanged":
+            app.state.begin_turn_slot(conv)
+            app.state.active_turns[conv] = newer
+            app.state.live_response_id.pop(conv, None)
+            if successor in {"running", "finished"}:
+                app.state.live_response_id[conv] = "resp_new"
+                pm.mark_in_flight(conv, "resp_new")
+            if successor == "finished":
+                app.state.on_proxy_stream_end(conv, owner_response_id="resp_new")
+        if native_receipt:
+            old_requests.update(subagent_work._pending_child_acceptances[conv])
+            assert len(old_requests) == 1
+            successor_work = subagent_work.register_subagent_work(
+                parent_session_id="parent_late_stream",
+                child_session_id=conv,
+                agent="codex-native",
+                title="successor",
+                wrapper_label="codex-native-ui",
+            )
+            subagent_work.mark_subagent_work_started(conv)
+            successor_request = subagent_work.begin_subagent_child_acceptance(conv)
+            subagent_work.arm_subagent_child_start_timeout(
+                conv, acceptance=successor_acceptance, request=successor_request, now=5000.0
+            )
+            assert subagent_work._pending_child_acceptances[conv] == old_requests | {
+                successor_request
+            }
+            assert successor_work.awaiting_child_start_since == 5000.0
+        app.state.required_terminal_exit_errors[conv] = exit_error
+        clears_at_boundary[:] = pm.cleared_in_flight
+        queue = app.state.session_event_queues[conv]
+        while not queue.empty():
+            queue.get_nowait()
+
+    async def frames() -> AsyncIterator[str]:
+        if outcome not in {"precreated_read_error", "precreated_empty", "late_created"}:
+            yield _SSE_RESPONSE_CREATED
+        replace_turn()
+        if outcome in {"read_error", "precreated_read_error"}:
+            raise httpx.ReadError("retired stream closed")
+        if outcome == "failed":
+            yield _SSE_RESPONSE_FAILED
+        elif outcome in {"completed", "late_created"}:
+            if outcome == "late_created":
+                yield _SSE_RESPONSE_CREATED
+            completed = _SSE_RESPONSE_COMPLETED
+            if native_receipt:
+                event = json.loads(completed.split("data: ", 1)[1])
+                event["native_acceptance"] = {
+                    "session_id": conv,
+                    "thread_id": "thread_old",
+                    "response_id": "codex_old",
+                }
+                completed = f"event: response.completed\ndata: {json.dumps(event)}\n\n"
+            yield completed
+
+    @asynccontextmanager
+    async def stream(*args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+        if outcome == "rejected":
+            replace_turn()
+        yield SimpleNamespace(status_code=503 if outcome == "rejected" else 200, aiter_text=frames)
+
+    monkeypatch.setattr(harness, "stream", stream)
+    try:
+        async with _recovery_runner_client(app) as http:
+            response = await http.post(
+                f"/v1/sessions/{conv}/events?stream={'true' if delivery == 'stream' else 'false'}",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "harness": "codex-native" if native_receipt else "openai-agents",
+                    **({"harness_override": "codex-native"} if native_receipt else {}),
+                    "content": [{"type": "input_text", "text": "original work"}],
+                },
+            )
+            assert response.status_code == (200 if delivery == "stream" else 202)
+            await _await_bg_turn_task(conv)
+
+            if native_receipt:
+                assert subagent_work.get_subagent_work(conv) is successor_work
+                assert successor_work is not None
+                assert successor_work.status == "running"
+                assert successor_work.native_acceptance == successor_acceptance
+                assert successor_work.awaiting_child_start_since == 5000.0
+                assert subagent_work._pending_child_acceptances[conv] == {successor_request}
+                assert successor_request is not None
+                assert successor_request.finished is False
+                assert successor_request.started_response_ids == set()
+                assert successor_request.settled_response_ids == set()
+                assert successor_request.unidentified_settlement is False
+                assert all(request.finished for request in old_requests)
+
+            if successor == "unchanged":
+                assert conv not in app.state.active_turns
+                assert conv in pm.cleared_in_flight
+                events = app.state.session_event_queues[conv]
+                assert any(
+                    events.get_nowait().get("type") == "response.failed"
+                    for _ in range(events.qsize())
+                )
+                return
+
+            queue = app.state.session_event_queues[conv]
+            assert queue.empty()
+            assert pm.cleared_in_flight == clears_at_boundary
+            assert app.state.required_terminal_exit_errors[conv] is exit_error
+            assert "response.failed" not in response.text
+            assert "response.completed" not in response.text
+            if successor == "finished":
+                assert conv not in app.state.active_turns
+                assert conv not in app.state.live_response_id
+            else:
+                assert app.state.active_turns[conv] is newer
+                assert app.state.live_response_id.get(conv) == (
+                    "resp_new" if successor == "running" else None
+                )
+    finally:
+        newer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await newer
+        app.state.active_turns.pop(conv, None)
+        if successor_request is not None:
+            subagent_work.finish_subagent_child_acceptance(successor_request)
+        subagent_work.unregister_subagent_work_for_session(conv)
+
+
 @pytest.mark.parametrize("replacement", ["none", "task", "stream", "finished"])
 @pytest.mark.asyncio
 async def test_interrupt_cleanup_is_scoped_to_turn_generation(replacement: str) -> None:
@@ -10974,6 +12299,81 @@ async def test_interrupt_cleanup_is_scoped_to_turn_generation(replacement: str) 
             with contextlib.suppress(asyncio.CancelledError):
                 await task
         app.state.active_turns.pop(conv, None)
+
+
+async def _stop_session_without_a_turn(
+    stop_type: str, setup: str
+) -> tuple[httpx.Response, list[str]]:
+    """POST *stop_type* to a session with no turn after *setup*; return response and statuses."""
+    conv = f"conv_stop_{stop_type}_{setup}"
+    child = f"{conv}_child"
+    pm = _RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    if setup not in {"unknown_session", "cache_only_session"}:
+        await pm.get_client(conv, _TEST_HARNESS_NAME)
+    if setup == "finished_task_slot":
+        finished = asyncio.create_task(asyncio.sleep(0))
+        await finished
+        app.state.active_turns[conv] = finished
+    elif setup == "subagent_running":
+        subagent_work.register_subagent_work(
+            parent_session_id=conv, child_session_id=child, agent="worker", title="task"
+        )
+    elif setup == "in_flight_response":
+        pm.mark_in_flight(conv, "resp_live")
+    elif setup == "buffered_message":
+        app.state.session_message_buffers[conv] = [{"type": "message"}]
+    elif setup == "failed_setup":
+        app.state.native_pane_status[conv] = "failed"
+    try:
+        async with _recovery_runner_client(app) as http:
+            if setup == "cache_only_session":
+                initialized = await http.post(
+                    "/v1/sessions", json={"session_id": conv, "agent_id": "ag_stop"}
+                )
+                assert initialized.status_code == 201, initialized.text
+                assert pm.has_session(conv)
+                await pm.release(conv)
+                assert not pm.has_session(conv)
+                retained = await http.get(f"/v1/sessions/{conv}")
+                assert retained.status_code == 200, retained.text
+                assert retained.json()["created_at"] == initialized.json()["created_at"]
+            response = await http.post(f"/v1/sessions/{conv}/events", json={"type": stop_type})
+            if setup == "cache_only_session":
+                assert not pm.has_session(conv)
+    finally:
+        subagent_work.unregister_subagent_work(child)
+    events = _drain_recovery_status_events(app.state.session_event_queues, conv)
+    return response, [event["status"] for event in events]
+
+
+@pytest.mark.parametrize("stop_type", ["interrupt", "stop_session"])
+@pytest.mark.parametrize(
+    "setup", ["no_turn_slot", "finished_task_slot", "subagent_running", "cache_only_session"]
+)
+@pytest.mark.asyncio
+async def test_stop_without_a_turn_settles_idle(stop_type: str, setup: str) -> None:
+    """Stop with no turn publishes ``idle``, like stopping a live turn does."""
+    response, statuses = await _stop_session_without_a_turn(stop_type, setup)
+    assert response.status_code == 204, response.text
+    assert statuses == ["idle"]
+
+
+@pytest.mark.parametrize("stop_type", ["interrupt", "stop_session"])
+@pytest.mark.parametrize(
+    "setup", ["in_flight_response", "buffered_message", "failed_setup", "unknown_session"]
+)
+@pytest.mark.asyncio
+async def test_stop_without_a_turn_leaves_remaining_work_to_report(
+    stop_type: str, setup: str
+) -> None:
+    """Stop publishes nothing while work remains, after failed setup, or for unknown sessions."""
+    response, statuses = await _stop_session_without_a_turn(stop_type, setup)
+    assert response.status_code == 204, response.text
+    assert statuses == []
 
 
 @pytest.mark.asyncio
@@ -12233,7 +13633,9 @@ _CONTRACT_CALLER_INSTRUCTIONS = "Caller-supplied instructions."
 
 def _contract_composed_instructions(*parts: str) -> str:
     """Compose expected author/request text with framework guidance."""
-    return "\n\n".join((*parts, EMBEDDED_BROWSER_PRIORITY_INSTRUCTION))
+    return "\n\n".join(
+        (*parts, EMBEDDED_BROWSER_PRIORITY_INSTRUCTION, WORKSPACE_IMAGE_INSTRUCTION)
+    )
 
 
 async def _contract_run_no_harness(
@@ -12624,7 +14026,8 @@ def _running_child_server_handler(
     accidental untracked create is caught. ``events_status`` forces the child's
     /events response code (e.g. 500 to exercise a post failure), and any DELETE
     of the child is recorded in ``delete_posts`` so a test can assert a still-live
-    turn is never torn down.
+    turn is never torn down. The child's /events answers with the server's real
+    ``queued`` acknowledgement, which does not say whether the message started a turn.
     """
 
     async def _handler(request: httpx.Request) -> httpx.Response:
@@ -12660,7 +14063,9 @@ def _running_child_server_handler(
             return httpx.Response(204)
         if request.method == "POST" and path == f"/v1/sessions/{child_id}/events":
             event_posts.append(json.loads(request.content))
-            return httpx.Response(events_status, json={"ok": events_status < 400})
+            if events_status >= 400:
+                return httpx.Response(events_status, json={"error": "event post failed"})
+            return httpx.Response(202, json={"queued": True, "item_id": "item_steer"})
         return httpx.Response(404, json={"error": str(request.url)})
 
     return _handler
@@ -12804,18 +14209,25 @@ async def test_named_send_reused_in_flight_post_failure_keeps_tracking(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provisional_failure", "reported_start", "acceptance_before_adoption"),
+    [
+        pytest.param(False, True, True, id="already-running"),
+        pytest.param(True, True, True, id="late-running-after-provisional-failure"),
+        pytest.param(True, False, True, id="silent-after-timeout-accept-before-adoption"),
+        pytest.param(True, False, False, id="silent-after-timeout-accept-after-adoption"),
+    ],
+)
 async def test_named_send_adopts_busy_child_as_running_not_launching(
     monkeypatch: pytest.MonkeyPatch,
+    provisional_failure: bool,
+    reported_start: bool,
+    acceptance_before_adoption: bool,
 ) -> None:
-    """A server-busy child with no local work entry is adopted as a running turn.
+    """A busy child is adopted as running while retaining its native turn evidence.
 
-    After a runner restart the in-flight turn's local bookkeeping is gone, but the
-    server still reports the child busy. Pre-PR this was refused ("is already
-    running"); the fix adopts it -- stamping a dispatch id and registering one
-    entry so its result is delivered (review issue #1) -- and registers that entry
-    directly in ``running`` (not ``launching``), so the launch-timeout reaper
-    cannot fail a long-running steered turn whose buffered nudge is waiting for it
-    to yield (review issue #3).
+    A reported start keeps it exempt. A silent, unresolved turn keeps its original
+    acceptance time after provisional failure and replacement.
     """
     from omnigent.runner import app as runner_app
 
@@ -12835,11 +14247,69 @@ async def test_named_send_adopts_busy_child_as_running_not_launching(
         create_posts=create_posts,
         child_busy=True,
     )
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    subagent_work._session_inboxes_ref[parent_id] = inbox
+    dispatch: subagent_work._SubagentWorkEntry | None = None
     try:
+        if provisional_failure:
+            dispatch = subagent_work.register_subagent_work(
+                parent_session_id=parent_id,
+                child_session_id=child_id,
+                agent="claude",
+                title="merge-task",
+            )
+            dispatch.status = "running"
+            accept_subagent_turn(
+                child_id,
+                thread_id="thread_busy",
+                response_id="codex_busy",
+                now=None if reported_start else 1000.0,
+            )
+            if not reported_start:
+                assert (
+                    subagent_work.reap_stalled_subagent_launches(now=1179.0, timeout_s=180.0) == []
+                )
+            provisional = subagent_work.reap_stalled_subagent_launches(
+                now=time.time() + 7200.0 if reported_start else 1181.0, timeout_s=180.0
+            )
+            assert [entry.child_session_id for entry in provisional] == [child_id]
+            assert dispatch.status == "failed"
+        # The late report outlives any provisional failure and precedes adoption.
+        if reported_start:
+            subagent_work.note_subagent_child_start_reported(child_id, response_id="codex_busy")
+        elif acceptance_before_adoption:
+            accept_subagent_turn(
+                child_id, thread_id="thread_busy", response_id="codex_busy", now=1300.0
+            )
         output = await _run_named_continuation(parent_id, handler)
         work = subagent_work.get_subagent_work(child_id)
+        assert work is not None
+        assert work.status == "running"
+        if reported_start:
+            assert work.child_start_reported is True
+        else:
+            assert work.child_start_reported is False
+        # A real start keeps the bound disarmed; a silent turn retains its acceptance age.
+        accept_subagent_turn(
+            child_id,
+            thread_id="thread_busy",
+            response_id="codex_busy",
+            now=None if reported_start else 1300.0,
+        )
+        if reported_start:
+            reaped = subagent_work.reap_stalled_subagent_launches(
+                now=work.created_at + 7200.0, timeout_s=180.0
+            )
+        else:
+            assert work.awaiting_child_start_since == 1000.0
+            assert subagent_work._children_accepted_turns[child_id].accepted_at == 1000.0
+            reaped = subagent_work.reap_stalled_subagent_launches(now=1301.0, timeout_s=180.0)
+            assert reaped == [work]
+            assert work.status == "failed"
+            assert work.launch_timed_out
+            assert subagent_work.reap_stalled_subagent_launches(now=1302.0, timeout_s=180.0) == []
     finally:
-        subagent_work.unregister_subagent_work(child_id)
+        subagent_work.unregister_subagent_work_for_session(child_id)
         subagent_work._session_inboxes_ref.pop(parent_id, None)
 
     assert "already has a launching or running turn" not in output
@@ -12851,14 +14321,42 @@ async def test_named_send_adopts_busy_child_as_running_not_launching(
     assert len(stamped) == 1, "an untracked server-busy turn must be adopted with one stamp"
     # Adopted directly as running (not launching) so it is safe from the reaper,
     # and the entry carries the freshly stamped id so its completion delivers.
-    assert work is not None and work.work_id == stamped[0]
-    assert work.status == "running"
+    assert work.work_id == stamped[0]
+    if reported_start:
+        assert reaped == []
+        assert work.status == "running"
     assert len(event_posts) == 1
+    if not reported_start:
+        assert dispatch is not None
+        assert inbox.qsize() == 2
+        notices = [inbox.get_nowait(), inbox.get_nowait()]
+        assert [notice["work_id"] for notice in notices] == [dispatch.work_id, work.work_id]
+        assert all(notice["status"] == "failed" for notice in notices)
+        assert all("no turn start" in notice["output"] for notice in notices)
+        assert inbox.empty()
+    elif provisional_failure:
+        assert inbox.qsize() == 1
+        assert inbox.get_nowait()["status"] == "failed"
+    else:
+        assert inbox.empty()
 
 
+@pytest.mark.parametrize(
+    ("drain_during_post", "delayed_failure"),
+    [
+        pytest.param(False, None, id="False"),
+        pytest.param(True, None, id="True"),
+        pytest.param(False, "unidentified", id="retained-unidentified-failure"),
+        pytest.param(True, "unidentified", id="drained-unidentified-failure"),
+        pytest.param(False, "identified", id="retained-identified-failure"),
+        pytest.param(True, "identified", id="drained-identified-failure"),
+    ],
+)
 @pytest.mark.asyncio
 async def test_named_send_registers_fresh_when_tracked_turn_already_ended(
     monkeypatch: pytest.MonkeyPatch,
+    drain_during_post: bool,
+    delayed_failure: str | None,
 ) -> None:
     """The busy→ended race registers a fresh entry, not the drained one.
 
@@ -12877,9 +14375,34 @@ async def test_named_send_registers_fresh_when_tracked_turn_already_ended(
     stamped: list[str] = []
     event_posts: list[dict[str, Any]] = []
     create_posts: list[int] = []
+    parent_wakes: list[str] = []
+    pending_requests: list[subagent_work._ChildAcceptanceRequest] = []
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    delivery_gate = asyncio.Event()
+    acceptance = NativeTurnAcceptance(child_id, "thread_fresh", "codex_fresh")
+    harness = _RecoveryBlockingHarnessClient(
+        [
+            'data: {"type":"response.created","response":{"id":"resp_fresh"}}\n\n',
+            "data: "
+            + json.dumps(
+                {
+                    "type": "response.completed",
+                    "response": {"id": "resp_fresh", "status": "completed"},
+                    "native_acceptance": {
+                        "session_id": acceptance.session_id,
+                        "thread_id": acceptance.thread_id,
+                        "response_id": acceptance.response_id,
+                    },
+                }
+            )
+            + "\n\n",
+        ],
+        delivery_gate,
+    )
 
     monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
     monkeypatch.setattr(subagent_work, "register_child_session", lambda *a, **k: None)
+    monkeypatch.setattr(subagent_work.time, "time", lambda: 5000.0)
 
     # A stale entry from the turn that just ended: terminal and already delivered.
     stale = subagent_work.register_subagent_work(
@@ -12888,8 +14411,12 @@ async def test_named_send_registers_fresh_when_tracked_turn_already_ended(
     stale.status = "completed"
     stale.delivered = True
     stale_work_id = stale.work_id
+    if delayed_failure:
+        stale.status = "running"
+        stale.delivered = False
+        subagent_work.note_subagent_child_start_reported(child_id, response_id="codex_previous")
 
-    handler = _running_child_server_handler(
+    base_handler = _running_child_server_handler(
         parent_id,
         child_id,
         stamped=stamped,
@@ -12897,24 +14424,185 @@ async def test_named_send_registers_fresh_when_tracked_turn_already_ended(
         create_posts=create_posts,
         child_busy=True,
     )
-    try:
-        output = await _run_named_continuation(parent_id, handler)
-        work = subagent_work.get_subagent_work(child_id)
-    finally:
-        subagent_work.unregister_subagent_work(child_id)
-        subagent_work._session_inboxes_ref.pop(parent_id, None)
 
-    payload = json.loads(output)
-    assert payload["status"] == "running"
-    # A fresh entry is registered under a NEW dispatch id (not the drained one),
-    # in "running", so the new turn's completion has a live entry to deliver to.
-    assert len(stamped) == 1
-    assert work is not None
-    assert work.work_id == stamped[0]
-    assert work.work_id != stale_work_id
-    assert work.status == "running"
-    assert work.delivered is False
-    assert len(event_posts) == 1
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == f"/v1/sessions/{parent_id}/events":
+            parent_wakes.append(json.loads(request.content)["data"]["content"][0]["text"])
+            return httpx.Response(202, json={"queued": True})
+        if (
+            delayed_failure
+            and request.method == "POST"
+            and request.url.path == f"/v1/sessions/{child_id}/events"
+        ):
+            response = await client.post(
+                f"/v1/sessions/{child_id}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag_child",
+                    "model": "test-agent",
+                    "harness_override": "codex-native",
+                    "content": [{"type": "input_text", "text": "Continue the merge."}],
+                },
+            )
+            assert response.status_code == 202, response.text
+            await asyncio.wait_for(harness.post_seen.wait(), timeout=5.0)
+            pending_requests.extend(subagent_work._pending_child_acceptances[child_id])
+            assert len(pending_requests) == 1
+            failure = {"status": "failed", "output": "Previous goal failed."}
+            if delayed_failure == "identified":
+                failure["response_id"] = "codex_previous"
+            response = await client.post(
+                f"/v1/sessions/{child_id}/events",
+                json={"type": "external_session_status", "data": failure},
+            )
+            assert response.status_code == 204, response.text
+            assert stale.status == "failed"
+            assert stale.delivered
+            await poll_until_async(lambda: len(parent_wakes) == 1, timeout_s=5.0)
+            assert inbox.get_nowait()["output"] == "Previous goal failed."
+        if (
+            drain_during_post
+            and request.method == "POST"
+            and request.url.path == f"/v1/sessions/{child_id}/events"
+        ):
+            # An inbox drain consumes the stale result while the steer's POST is in flight.
+            subagent_work.unregister_subagent_work(
+                child_id, work_id=stale_work_id, remember_drained_delivery=True
+            )
+        return await base_handler(request)
+
+    reaped: list[subagent_work._SubagentWorkEntry] = []
+    # Codex accepts the new turn before the message POST returns to the parent, so the
+    # acceptance lands while the stale entry is still the child's only record.
+    if not delayed_failure:
+        accept_subagent_turn(child_id, thread_id="thread_fresh", response_id="codex_fresh")
+    subagent_work._session_inboxes_ref[parent_id] = inbox
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://server"
+        ) as server_client:
+            app = create_runner_app(
+                process_manager=_RecoveryFakeProcessManager(harness),  # type: ignore[arg-type]
+                server_client=server_client,
+            )
+            async with _runner_test_client(app) as client:
+                output = await _run_named_continuation(parent_id, handler)
+                work = subagent_work.get_subagent_work(child_id)
+                assert work is not None
+                if delayed_failure:
+                    assert work.native_acceptance is None
+                    assert work.awaiting_child_start_since is None
+                    assert not pending_requests[0].finished
+                    delivery_gate.set()
+                    await _await_bg_turn_task(child_id)
+                    assert pending_requests[0].finished
+                    assert not pending_requests[0].settled_response_ids
+                    assert not pending_requests[0].unidentified_settlement
+                    assert not pending_requests[0].unidentified_settlement_work_ids
+                    assert child_id not in subagent_work._pending_child_acceptances
+                # Acceptance may precede registration or finish after the previous
+                # turn's failure and replacement, but still bounds this silent turn.
+                assert work.child_start_reported is False
+                assert work.awaiting_child_start_since is not None
+                assert work.awaiting_child_start_since == 5000.0
+                assert work.native_acceptance is not None
+                assert work.native_acceptance.session_id == child_id
+                assert work.native_acceptance.thread_id == "thread_fresh"
+                assert work.native_acceptance.response_id == "codex_fresh"
+                assert work.delivered is False
+                if delayed_failure:
+                    response = await client.post(
+                        f"/v1/sessions/{parent_id}/events",
+                        json={
+                            "type": "message",
+                            "role": "user",
+                            "agent_id": "ag_parent",
+                            "model": "test-agent",
+                            "harness": "openai-agents",
+                            "content": [{"type": "input_text", "text": "Read the old failure."}],
+                        },
+                    )
+                    assert response.status_code == 202, response.text
+                    await _await_bg_turn_task(parent_id)
+                wakes_before_timeout = len(parent_wakes)
+                assert (
+                    subagent_work.reap_stalled_subagent_launches(now=5179.0, timeout_s=180.0) == []
+                )
+                reaped = subagent_work.reap_stalled_subagent_launches(
+                    now=5181.0,
+                    timeout_s=180.0,
+                    mark_terminal=app.state.mark_subagent_terminal_and_wake,
+                )
+
+                payload = json.loads(output)
+                assert payload["status"] == "running"
+                # The replacement's dispatch id must own its eventual completion.
+                assert len(stamped) == 1
+                assert work.work_id == stamped[0]
+                assert work.work_id != stale_work_id
+                assert len(event_posts) == 1
+                assert [entry.child_session_id for entry in reaped] == [child_id]
+                assert work.status == "failed"
+                notice = inbox.get_nowait()
+                assert notice["status"] == "failed"
+                assert "no turn start" in notice["output"]
+                assert work.launch_timed_out
+                assert inbox.empty()
+                assert (
+                    subagent_work.reap_stalled_subagent_launches(now=9000.0, timeout_s=180.0) == []
+                )
+                await poll_until_async(
+                    lambda: len(parent_wakes) == wakes_before_timeout + 1, timeout_s=5.0
+                )
+                assert "finished (failed)" in parent_wakes[-1]
+                response = await client.post(
+                    f"/v1/sessions/{parent_id}/events",
+                    json={
+                        "type": "message",
+                        "role": "user",
+                        "agent_id": "ag_parent",
+                        "model": "test-agent",
+                        "harness": "openai-agents",
+                        "content": [
+                            {"type": "input_text", "text": "Read the provisional failure."}
+                        ],
+                    },
+                )
+                assert response.status_code == 202, response.text
+                delivery_gate.set()
+                await _await_bg_turn_task(parent_id)
+                response = await client.post(
+                    f"/v1/sessions/{child_id}/events",
+                    json={
+                        "type": "external_session_status",
+                        "data": {
+                            "status": "idle",
+                            "turn_outcome": "completed",
+                            "response_id": acceptance.response_id,
+                            "output": "Fresh merge result.",
+                        },
+                    },
+                )
+                assert response.status_code == 204, response.text
+                assert subagent_work.get_subagent_work(child_id) is work
+                assert work.status == "completed"
+                assert not work.launch_timed_out
+                result = inbox.get_nowait()
+                assert result["status"] == "completed"
+                assert result["output"] == "Fresh merge result."
+                assert inbox.empty()
+                await poll_until_async(
+                    lambda: len(parent_wakes) == wakes_before_timeout + 2, timeout_s=5.0
+                )
+                assert "finished (completed)" in parent_wakes[-1]
+    finally:
+        delivery_gate.set()
+        await _await_bg_turn_task(child_id)
+        await _await_bg_turn_task(parent_id)
+        subagent_work.unregister_subagent_work_for_session(child_id)
+        subagent_work._session_inboxes_ref.pop(child_id, None)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
 
 
 @pytest.mark.asyncio
@@ -13197,7 +14885,7 @@ _SIGN_IN_PROMPT_SCREEN = (
     "\n\thttps://databricks.okta.com/oauth2/v1/authorize?client_id=0oa1&state=T4IU\n\n"
 )
 _SIGNED_IN_SCREENS = {
-    # Codex draws inline: dbcert's lines stay above its banner.
+    # Codex draws inline: the launcher's lines stay above its banner.
     "codex-native": (
         _SIGN_IN_PROMPT_SCREEN + "dbcert: All credentials successfully written\n"
         "╭── OpenAI Codex (v0.156.1) ──╮\n"

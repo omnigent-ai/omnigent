@@ -22,6 +22,7 @@ describe("getFileEditDiff", () => {
       removals: 1,
       countsArePerMatch: false,
       countsAreInexact: false,
+      replacesAll: false,
     });
   });
 
@@ -227,7 +228,7 @@ describe("getFileEditDiff", () => {
   });
 
   it("counts a lone replace-all edit per match, and a batch with one as inexact", () => {
-    const perMatch = { countsArePerMatch: true, countsAreInexact: false };
+    const perMatch = { countsArePerMatch: true, countsAreInexact: false, replacesAll: true };
     expect(
       getFileEditDiff("Edit", { old_string: "a", new_string: "b", replace_all: true }),
     ).toMatchObject({ additions: 1, removals: 1, ...perMatch });
@@ -241,10 +242,11 @@ describe("getFileEditDiff", () => {
           { old_string: "c", new_string: "d", replace_all: true },
         ],
       }),
-    ).toMatchObject({ countsArePerMatch: false, countsAreInexact: true });
+    ).toMatchObject({ countsArePerMatch: false, countsAreInexact: true, replacesAll: true });
     expect(getFileEditDiff("Edit", { old_string: "a", new_string: "b" })).toMatchObject({
       countsArePerMatch: false,
       countsAreInexact: false,
+      replacesAll: false,
     });
   });
 
@@ -319,6 +321,7 @@ describe("getFileEditDiff", () => {
         removals: 0,
         countsArePerMatch: false,
         countsAreInexact: false,
+        replacesAll: false,
       });
     });
 

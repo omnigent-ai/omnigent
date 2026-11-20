@@ -1,18 +1,36 @@
 import {
+  createContext,
   forwardRef,
+  useCallback,
+  useContext,
   useLayoutEffect,
   useRef,
+  useState,
   type ComponentPropsWithRef,
   type ComponentPropsWithoutRef,
   type KeyboardEvent,
   type ReactNode,
+  type Ref,
   type RefObject,
 } from "react";
 import { ArrowUpIcon, Loader2Icon, SquareIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { OmniGlassSurface } from "@/components/OmniGlassSurface";
 import { cn } from "@/lib/utils";
 import { insertComposerText } from "@/lib/composerText";
+import {
+  COMPOSER_INPUT_ID_ATTRIBUTE,
+  COMPOSER_INPUT_MARKER,
+  COMPOSER_TAIL_INPUT_ID,
+  type ComposerInputEngine,
+  type ComposerInputProps,
+  type ComposerKeyboardEvent,
+  type ComposerTextTarget,
+} from "@/components/composer/engine/composerInput";
+import { useCodeMirrorComposerLoad } from "@/components/composer/engine/composerEnginePolicy";
+import { useComposerEngineHandoff } from "@/components/composer/engine/useComposerEngineHandoff";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import {
   isComposerAltNewlineKey,
   isComposerSendKey,
@@ -68,16 +86,57 @@ export interface ComposerKeyIntent {
   shouldSteerAllFromKeyboard: boolean;
 }
 
-interface ChatComposerProps extends Omit<ComponentPropsWithoutRef<"div">, "children"> {
+/** Input props for a composer that only ever renders today's textarea. */
+type TextareaComposerInput = Omit<ComponentPropsWithRef<"textarea">, "onKeyDown"> & {
+  onKeyDown?: (event: KeyboardEvent<HTMLTextAreaElement>, intent: ComposerKeyIntent) => void;
+  "data-testid"?: string;
+  "data-slash-command"?: string;
+  "data-shell-command"?: string;
+  "data-has-draft"?: string;
+};
+
+/** Input props for a composer that can run any input engine. */
+export type EngineComposerInput = Omit<ComposerInputProps, "onKeyDown"> & {
+  onKeyDown?: (event: ComposerKeyboardEvent, intent: ComposerKeyIntent) => void;
+  /** The textarea's rows; the editor sizes itself. */
+  rows?: number;
+};
+
+/** The engine a ChatComposer renders, for the inputs inside it (the tail and quote blocks). */
+const ComposerEngineContext = createContext<ComposerInputEngine>("textarea");
+
+type ChatComposerInputProps =
+  | {
+      engine?: undefined;
+      input: TextareaComposerInput;
+      dictating?: undefined;
+      draftKey?: undefined;
+      activeInputId?: undefined;
+      onActiveInputChange?: undefined;
+    }
+  | {
+      /** The engine to switch to; the composer hands off once that is safe. */
+      engine: ComposerInputEngine;
+      input: EngineComposerInput;
+      /** Dictation is streaming into the draft, so an engine switch waits. */
+      dictating?: boolean;
+      /** The draft shown, such as its session; a new one forgets the last one's inputs. */
+      draftKey?: string | null;
+      /** The input the owner treats as active ("tail" or a quote's id). */
+      activeInputId?: string | null;
+      /** The active input, on its new engine, after a switch. */
+      onActiveInputChange?: (target: ComposerTextTarget) => void;
+    };
+
+type ChatComposerProps = ChatComposerBaseProps & ChatComposerInputProps;
+
+interface ChatComposerBaseProps extends Omit<ComponentPropsWithoutRef<"div">, "children"> {
+  appearance?: "default" | "glass";
+  /** Attachments, mentions, or feedback that need the expanded mobile layout. */
+  hasContent?: boolean;
   keyboard: {
     submitWithModEnter: boolean;
     preventsKeyboardSubmit: boolean;
-  };
-  input: Omit<ComponentPropsWithRef<"textarea">, "onKeyDown"> & {
-    onKeyDown?: (event: KeyboardEvent<HTMLTextAreaElement>, intent: ComposerKeyIntent) => void;
-    "data-testid"?: string;
-    "data-slash-command"?: string;
-    "data-has-draft"?: string;
   };
   slots?: {
     beforeInput?: ReactNode;
@@ -96,35 +155,136 @@ interface ChatComposerProps extends Omit<ComponentPropsWithoutRef<"div">, "child
 }
 
 export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(function ChatComposer(
-  { className, input, keyboard, slots, actions, ...props },
+  {
+    appearance = "default",
+    hasContent = false,
+    className,
+    input,
+    engine,
+    dictating,
+    draftKey,
+    activeInputId,
+    onActiveInputChange,
+    keyboard,
+    slots,
+    actions,
+    onFocusCapture,
+    onBlurCapture,
+    ...props
+  },
   ref,
 ) {
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const setRoot = useCallback(
+    (element: HTMLDivElement | null) => {
+      rootRef.current = element;
+      assignRef(ref, element);
+    },
+    [ref],
+  );
+  const isMobile = useIsMobileViewport();
+  // The editor renders only once its chunk has loaded; until then the textarea stays.
+  const chunkReady = useCodeMirrorComposerLoad().status === "ready";
+  const renderedEngine = useComposerEngineHandoff(
+    engine === "codemirror" && chunkReady ? "codemirror" : "textarea",
+    rootRef,
+    { dictating, draftKey, activeInputId, onActiveInputChange },
+  );
+  const [focusWithin, setFocusWithin] = useState(false);
+  const [uncontrolledValue, setUncontrolledValue] = useState(input.defaultValue ?? "");
+  const expanded =
+    focusWithin ||
+    hasContent ||
+    Boolean(slots?.inputPrefix) ||
+    String(input.value ?? uncontrolledValue).length > 0;
+  const needsHintPlaceholder = input.placeholder === "" && Boolean(slots?.inputHint);
+  // Shared by both input paths: one row on mobile, and the label as a hint-only placeholder.
+  const inputLayout = {
+    rows: input.rows ?? (isMobile ? 1 : undefined),
+    placeholder: isMobile && needsHintPlaceholder ? input["aria-label"] : input.placeholder,
+  };
+  const trackUncontrolled = (value: string) => {
+    if (input.value === undefined) setUncontrolledValue(value);
+  };
   const actionRowRef = useRef<HTMLDivElement>(null);
   const actionWidthRef = useRef<HTMLDivElement>(null);
   const leadingRef = useRef<HTMLDivElement>(null);
   const trailingRef = useRef<HTMLDivElement>(null);
-  useCollapsedComposerLabels(actionRowRef, actionWidthRef, leadingRef, trailingRef);
+  useCollapsedComposerLabels(actionRowRef, actionWidthRef, leadingRef, trailingRef, isMobile);
   return (
     <div
-      ref={ref}
+      ref={setRoot}
       data-composer-card
+      data-mobile-composer={isMobile ? (expanded ? "expanded" : "collapsed") : undefined}
+      data-composer-hint-placeholder={needsHintPlaceholder || undefined}
       className={cn(
-        "composer-reference-surface relative flex w-full flex-col rounded-2xl border transition-shadow duration-150 has-[textarea:focus]:shadow-[var(--composer-shadow-focus)] md:min-h-[105px]",
+        "relative flex w-full flex-col rounded-2xl md:min-h-[105px]",
+        appearance === "glass"
+          ? "isolate rounded-[20px] border-0 bg-transparent"
+          : "composer-reference-surface border transition-shadow duration-150 hover:shadow-[var(--composer-shadow)] has-[[data-composer-input]:focus]:shadow-[var(--composer-shadow)]",
         className,
       )}
       {...props}
+      onFocusCapture={(event) => {
+        // Header controls bubble through React portals outside this card.
+        if (
+          event.currentTarget.contains(event.target) &&
+          !event.target.closest('[data-composer-action="add"]')
+        ) {
+          setFocusWithin(true);
+        }
+        onFocusCapture?.(event);
+      }}
+      onBlurCapture={(event) => {
+        if (event.currentTarget.contains(event.target)) {
+          setFocusWithin(event.currentTarget.contains(event.relatedTarget));
+        }
+        onBlurCapture?.(event);
+      }}
     >
+      {appearance === "glass" && (
+        <OmniGlassSurface variant="composer" borderRadius={20} className="-z-10" />
+      )}
       {slots?.beforeInput}
       <ComposerInputArea
+        data-composer-input-area
         className={slots?.inputPrefix ? "max-h-[320px] overflow-y-auto" : undefined}
       >
-        {slots?.inputPrefix}
-        {slots?.inputBackdrop}
-        <ComposerTextInput input={input} keyboard={keyboard} />
+        <ComposerEngineContext.Provider value={renderedEngine}>
+          {slots?.inputPrefix}
+          {/* The backdrop paints a command's tint behind the textarea's transparent text. */}
+          {renderedEngine === "textarea" && slots?.inputBackdrop}
+          {engine === undefined ? (
+            <ComposerTextInput
+              input={{
+                ...input,
+                ...inputLayout,
+                onChange: (event) => {
+                  trackUncontrolled(event.currentTarget.value);
+                  input.onChange?.(event);
+                },
+              }}
+              keyboard={keyboard}
+            />
+          ) : (
+            <ComposerEngineInput
+              input={{
+                ...input,
+                ...inputLayout,
+                inputId: input.inputId ?? COMPOSER_TAIL_INPUT_ID,
+                onChange: (event) => {
+                  trackUncontrolled(event.currentTarget.value);
+                  input.onChange?.(event);
+                },
+              }}
+              keyboard={keyboard}
+            />
+          )}
+        </ComposerEngineContext.Provider>
         {slots?.inputHint}
       </ComposerInputArea>
       {slots?.attachments}
-      <ComposerActionRow ref={actionRowRef} data-testid={actions.testId}>
+      <ComposerActionRow ref={actionRowRef} data-composer-actions data-testid={actions.testId}>
         {/* Zero-height width probe: resize-observed instead of the row itself,
             whose height the collapse verdict can change. */}
         <div ref={actionWidthRef} className="absolute inset-x-0 top-0 h-0" />
@@ -157,6 +317,7 @@ function useCollapsedComposerLabels(
   widthRef: RefObject<HTMLDivElement | null>,
   leadingRef: RefObject<HTMLDivElement | null>,
   trailingRef: RefObject<HTMLDivElement | null>,
+  isMobile: boolean,
 ) {
   useLayoutEffect(() => {
     const row = rowRef.current;
@@ -171,21 +332,33 @@ function useCollapsedComposerLabels(
       // Not laid out yet (hidden, or jsdom): keep the current verdict.
       if (!(available > 0)) return;
       delete row.dataset.labels;
+      const previousWrap = leading.style.flexWrap;
+      leading.style.flexWrap = "nowrap";
       const gap = Math.max(parseFloat(style.columnGap) || 0, COMPOSER_LABELS_MIN_GAP_PX);
       if (leading.scrollWidth + trailing.scrollWidth + gap > available)
         row.dataset.labels = "collapsed";
+      leading.style.flexWrap = previousWrap;
     };
     measure();
     if (typeof ResizeObserver === "undefined") return;
     const resizeObserver = new ResizeObserver(measure);
     resizeObserver.observe(width);
+    resizeObserver.observe(leading);
+    resizeObserver.observe(trailing);
     const mutationObserver = new MutationObserver(measure);
-    mutationObserver.observe(row, { childList: true, characterData: true, subtree: true });
+    // Portaled controls can change appearance without resizing their collapsed groups.
+    mutationObserver.observe(row, {
+      childList: true,
+      characterData: true,
+      attributes: true,
+      attributeFilter: ["class"],
+      subtree: true,
+    });
     return () => {
       resizeObserver.disconnect();
       mutationObserver.disconnect();
     };
-  }, [rowRef, widthRef, leadingRef, trailingRef]);
+  }, [rowRef, widthRef, leadingRef, trailingRef, isMobile]);
 }
 
 /**
@@ -232,60 +405,148 @@ export function useCollapsedWorkspaceLabels(barRef: RefObject<HTMLElement | null
   }, [barRef]);
 }
 
+type ComposerKeyboard = ChatComposerBaseProps["keyboard"];
+
+/**
+ * The composer's own keys, shared by every engine: ⌥↵ newlines, list continuation, and the
+ * send intent handed to `onKeyDown`.
+ */
+function handleComposerKeyDown<Event extends ComposerKeyboardEvent>(
+  event: Event,
+  keyboard: ComposerKeyboard,
+  onKeyDown: ((event: Event, intent: ComposerKeyIntent) => void) | undefined,
+) {
+  const keyEvent = { ...event, isComposing: event.nativeEvent.isComposing };
+  // A newline in every mode and on touch devices; completion menus never see it.
+  if (isComposerAltNewlineKey(keyEvent)) {
+    event.preventDefault();
+    insertComposerText(event.currentTarget, "\n");
+    return;
+  }
+  if (keyboard.preventsKeyboardSubmit && event.key === "Enter") return;
+  const insertNewline =
+    event.key === "Enter" &&
+    (event.shiftKey || keyboard.submitWithModEnter) &&
+    !event.altKey &&
+    !event.metaKey &&
+    !event.ctrlKey;
+  const listEdit = insertNewline ? composerListEdit(event.currentTarget) : null;
+  const listStartEdit =
+    event.key === " " && !event.altKey && !event.shiftKey && !event.metaKey && !event.ctrlKey
+      ? composerListStartEdit(event.currentTarget)
+      : null;
+  const shouldSubmitFromKeyboard = isComposerSendKey(
+    keyEvent,
+    keyboard.submitWithModEnter,
+    keyboard.preventsKeyboardSubmit,
+  );
+  const shouldSteerAllFromKeyboard = isComposerSteerAllKey(
+    keyEvent,
+    keyboard.submitWithModEnter,
+    keyboard.preventsKeyboardSubmit,
+  );
+  onKeyDown?.(event, {
+    shouldSubmitFromKeyboard,
+    shouldPreferSendOverCompletion: keyboard.submitWithModEnter && shouldSubmitFromKeyboard,
+    shouldSteerAllFromKeyboard,
+  });
+  if (event.defaultPrevented) return;
+  const edit = listStartEdit ?? listEdit;
+  if (edit) {
+    event.preventDefault();
+    insertComposerText(event.currentTarget, edit.text, edit.start, edit.end);
+  }
+}
+
+/** Today's textarea input, for composers that don't choose an engine. */
 export function ComposerTextInput({
   input,
   keyboard,
-}: Pick<ChatComposerProps, "input" | "keyboard">) {
+}: {
+  input: TextareaComposerInput;
+  keyboard: ComposerKeyboard;
+}) {
   return (
     <ComposerTextarea
       {...input}
-      onKeyDown={(event) => {
-        // A newline in every mode and on touch devices; completion menus never see it.
-        if (isComposerAltNewlineKey({ ...event, isComposing: event.nativeEvent.isComposing })) {
-          event.preventDefault();
-          insertComposerText(event.currentTarget, "\n");
-          return;
-        }
-        if (keyboard.preventsKeyboardSubmit && event.key === "Enter") return;
-        const insertNewline =
-          event.key === "Enter" &&
-          (event.shiftKey || keyboard.submitWithModEnter) &&
-          !event.altKey &&
-          !event.metaKey &&
-          !event.ctrlKey;
-        const listEdit = insertNewline ? composerListEdit(event.currentTarget) : null;
-        const listStartEdit =
-          event.key === " " && !event.altKey && !event.shiftKey && !event.metaKey && !event.ctrlKey
-            ? composerListStartEdit(event.currentTarget)
-            : null;
-        const shouldSubmitFromKeyboard = isComposerSendKey(
-          { ...event, isComposing: event.nativeEvent.isComposing },
-          keyboard.submitWithModEnter,
-          keyboard.preventsKeyboardSubmit,
-        );
-        const shouldSteerAllFromKeyboard = isComposerSteerAllKey(
-          { ...event, isComposing: event.nativeEvent.isComposing },
-          keyboard.submitWithModEnter,
-          keyboard.preventsKeyboardSubmit,
-        );
-        input.onKeyDown?.(event, {
-          shouldSubmitFromKeyboard,
-          shouldPreferSendOverCompletion: keyboard.submitWithModEnter && shouldSubmitFromKeyboard,
-          shouldSteerAllFromKeyboard,
-        });
-        if (event.defaultPrevented) return;
-        const edit = listStartEdit ?? listEdit;
-        if (edit) {
-          event.preventDefault();
-          insertComposerText(event.currentTarget, edit.text, edit.start, edit.end);
-        }
-      }}
+      onKeyDown={(event) => handleComposerKeyDown(event, keyboard, input.onKeyDown)}
     />
   );
 }
 
-function composerListStartEdit(textarea: HTMLTextAreaElement) {
-  const { value, selectionStart, selectionEnd } = textarea;
+/**
+ * A composer input on the engine its ChatComposer renders. `className` styles only the
+ * textarea; the CodeMirror engine sizes and styles itself.
+ */
+export function ComposerEngineInput({
+  input,
+  keyboard,
+}: {
+  input: EngineComposerInput;
+  keyboard: ComposerKeyboard;
+}) {
+  const engine = useContext(ComposerEngineContext);
+  const load = useCodeMirrorComposerLoad();
+  const {
+    onKeyDown,
+    ref,
+    rows,
+    heightMode,
+    inputId,
+    className,
+    mentionTokens,
+    commandToken,
+    autoFocus,
+    ...rest
+  } = input;
+  // Only the first input mount may take focus. An engine switch remounts the input, and the
+  // handoff already restores whichever input had focus.
+  const inputMounted = useRef(false);
+  useLayoutEffect(() => {
+    inputMounted.current = true;
+  }, []);
+  const autoFocusOnMount = autoFocus && !inputMounted.current;
+  const handleKeyDown = (event: ComposerKeyboardEvent) =>
+    handleComposerKeyDown(event, keyboard, onKeyDown);
+  const setTextarea = useCallback(
+    (element: HTMLTextAreaElement | null) => assignRef(ref, element),
+    [ref],
+  );
+  if (engine === "codemirror" && load.status === "ready") {
+    const CodeMirrorInput = load.Component;
+    return (
+      <CodeMirrorInput
+        {...rest}
+        ref={ref}
+        inputId={inputId}
+        heightMode={heightMode}
+        mentionTokens={mentionTokens}
+        commandToken={commandToken}
+        autoFocus={autoFocusOnMount}
+        onKeyDown={handleKeyDown}
+      />
+    );
+  }
+  return (
+    <ComposerTextarea
+      {...rest}
+      rows={rows}
+      {...(inputId ? { [COMPOSER_INPUT_ID_ATTRIBUTE]: inputId } : {})}
+      className={className}
+      autoFocus={autoFocusOnMount}
+      ref={setTextarea}
+      onKeyDown={handleKeyDown}
+    />
+  );
+}
+
+function assignRef<T>(ref: Ref<T> | undefined, value: T | null) {
+  if (typeof ref === "function") ref(value);
+  else if (ref) (ref as { current: T | null }).current = value;
+}
+
+function composerListStartEdit(target: ComposerTextTarget) {
+  const { value, selectionStart, selectionEnd } = target;
   if (selectionStart !== selectionEnd) return null;
   const lineStart = value.lastIndexOf("\n", selectionStart - 1) + 1;
   const prefix = value.slice(lineStart, selectionStart);
@@ -299,8 +560,8 @@ function composerListStartEdit(textarea: HTMLTextAreaElement) {
   };
 }
 
-function composerListEdit(textarea: HTMLTextAreaElement) {
-  const { value, selectionStart, selectionEnd } = textarea;
+function composerListEdit(target: ComposerTextTarget) {
+  const { value, selectionStart, selectionEnd } = target;
   const lineStart = value.lastIndexOf("\n", selectionStart - 1) + 1;
   const lineEndIndex = value.indexOf("\n", selectionEnd);
   const lineEnd = lineEndIndex < 0 ? value.length : lineEndIndex;
@@ -391,6 +652,8 @@ export const ComposerTextarea = forwardRef<
         className,
       )}
       {...props}
+      {...COMPOSER_INPUT_MARKER}
+      data-composer-engine="textarea"
       onCompositionStart={(event) => {
         isComposingRef.current = true;
         onCompositionStart?.(event);
@@ -412,7 +675,7 @@ export const ComposerActionRow = forwardRef<HTMLDivElement, ComponentPropsWithou
       <div
         ref={ref}
         className={cn(
-          "group/composer-actions @container/composer-actions relative flex min-w-0 flex-nowrap items-center justify-between gap-2 pt-1 pb-2",
+          "group/composer-actions relative flex min-w-0 flex-nowrap mobile-app:flex-wrap items-center justify-between gap-2 pt-1 pb-2",
           COMPOSER_CONTENT_INSET_CLASS,
           className,
         )}
@@ -429,9 +692,12 @@ export const ComposerActionGroup = forwardRef<
   return (
     <div
       ref={ref}
+      data-composer-action-group={side}
       className={cn(
-        "flex min-w-0 items-center gap-1",
-        side === "left" ? "flex-none overflow-visible" : "ml-auto max-w-full shrink-0",
+        "flex min-w-0 items-center gap-1 mobile-app:max-w-full",
+        side === "left"
+          ? "flex-none overflow-visible mobile-app:flex-wrap mobile-app:shrink"
+          : "ml-auto max-w-full shrink",
         className,
       )}
       {...props}
@@ -457,13 +723,14 @@ export const ComposerSendButton = forwardRef<
       size="icon"
       variant={interrupt ? "destructive" : "default"}
       className={cn(
-        "size-8 shrink-0 rounded-lg transition-opacity md:size-7",
+        "size-8 mobile-touch-target shrink-0 rounded-lg transition-opacity md:size-7",
         !interrupt &&
           "hover:opacity-80 disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100",
         className,
       )}
       aria-label={label}
       aria-busy={busy}
+      data-composer-action="send"
       {...props}
     >
       {busy ? (

@@ -29,6 +29,7 @@ from omnigent.host.daemon_lifecycle import (
     write_daemon_record,
 )
 from omnigent.host.identity import HostIdentity
+from omnigent.telemetry.request_headers import client_user_agent
 from omnigent.util.tls import client_ssl_context
 
 
@@ -289,9 +290,17 @@ def test_background_daemon_claims_record_before_connecting(
 
     connected: list[str] = []
 
-    def _run(*, server_url: str, daemon_target: str, lifecycle_lock: object) -> None:
+    def _run(
+        *,
+        server_url: str,
+        daemon_target: str,
+        lifecycle_lock: object,
+        server_still_ours: object,
+    ) -> None:
         assert record_flock_is_held(daemon_record_path(target, base_dir=tmp_path)) is True
         assert lifecycle_lock is not None
+        # An explicit server URL is the user's choice; there is no local server to own.
+        assert server_still_ours is None
         # The workspace stays claimed while the daemon serves.
         other = DaemonLifecycleLock.for_workspace(_HOST_ID, "7", base_dir=tmp_path)
         assert other.try_acquire() is False
@@ -311,6 +320,48 @@ def test_background_daemon_claims_record_before_connecting(
     released = DaemonLifecycleLock.for_workspace(_HOST_ID, "7", base_dir=tmp_path)
     assert released.try_acquire() is True
     released.release()
+
+
+def test_local_daemon_binds_reconnects_to_its_own_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``--local`` daemon only reconnects while its own server holds the URL."""
+    from omnigent.host import _daemon_entry, local_server
+    from omnigent.host import identity as identity_module
+    from omnigent.process_logging import DATA_DIR_ENV_VAR
+
+    monkeypatch.setenv(DATA_DIR_ENV_VAR, str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["omnigent.host._daemon_entry", "--local"])
+    monkeypatch.setattr(
+        "omnigent.process_logging.configure_process_logging",
+        lambda *_a, **_kw: tmp_path / "host.log",
+    )
+    monkeypatch.setattr(
+        identity_module,
+        "load_or_create_host_identity",
+        lambda: HostIdentity(host_id="host_local", name="local"),
+    )
+    monkeypatch.setattr(
+        local_server,
+        "ensure_local_omnigent_server",
+        lambda: local_server.LocalServerStartup(url="http://127.0.0.1:6767", spawned=True),
+    )
+    checked: list[str] = []
+    monkeypatch.setattr(
+        local_server, "local_server_still_serves", lambda url: checked.append(url) or False
+    )
+    checks: list[object] = []
+    monkeypatch.setattr(
+        "omnigent.host.connect.run_host_process",
+        lambda **kwargs: checks.append(kwargs["server_still_ours"]),
+    )
+
+    _daemon_entry.main()
+
+    [check] = checks
+    assert callable(check)
+    assert check() is False
+    assert checked == ["http://127.0.0.1:6767"]
 
 
 @pytest.mark.parametrize("held", ["target", "workspace"])
@@ -1077,7 +1128,10 @@ def test_probe_workspace_id_reads_the_org_header(
     assert call["verify"] is client_ssl_context()
     # The selector is forwarded only when known, no credentials are sent, and
     # a login redirect is never followed.
-    assert call["headers"] == ({"X-Databricks-Org-Id": org_id} if org_id else {})
+    assert call["headers"] == {
+        "User-Agent": client_user_agent(),
+        **({"X-Databricks-Org-Id": org_id} if org_id else {}),
+    }
     assert call["follow_redirects"] is False
 
 
@@ -1176,7 +1230,7 @@ def test_daemon_entry_keys_by_workspace_but_connects_to_the_bare_url(
     monkeypatch.setattr(
         connect,
         "run_host_process",
-        lambda *, server_url, daemon_target, lifecycle_lock: seen.update(
+        lambda *, server_url, daemon_target, lifecycle_lock, server_still_ours: seen.update(
             server_url=server_url, daemon_target=daemon_target
         ),
     )

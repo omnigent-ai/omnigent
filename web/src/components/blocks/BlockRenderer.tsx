@@ -24,6 +24,7 @@ import { ChevronRightIcon } from "lucide-react";
 import { LIVE_ITEM_PREFIX } from "@/lib/blocks";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { ConversationScrollLockContext } from "@/components/ai-elements/conversation";
+import { formatDuration } from "@/lib/relativeTime";
 import type { RenderItem } from "@/lib/renderItems";
 import type { SessionStatus } from "@/lib/types";
 import type { ActiveResponse } from "@/store/types";
@@ -33,7 +34,8 @@ import { ElicitationCard } from "./ApprovalCard";
 import { ReasoningView } from "./ReasoningView";
 import { SlashCommandCard } from "./SlashCommandCard";
 import { SmartRoutingCard } from "./SmartRoutingCard";
-import { SubagentActivityMessage } from "./SubagentActivityMessage";
+import { readTaskActivity } from "@/lib/taskActivity";
+import { ActivityNotice } from "./TaskActivityMessage";
 import { TerminalCommandCard } from "./TerminalCommandCard";
 import { ErrorBanner, PolicyDeniedBanner, RetryIndicator } from "./StatusBlocks";
 import { ToolCard, ToolGroupSummary } from "./ToolCard";
@@ -158,14 +160,17 @@ function isFailureItem(item: RenderItem | undefined): boolean {
   return item?.kind === "error" || item?.kind === "retry" || item?.kind === "policy_denied";
 }
 
-/** Narration folds only in a turn that finished cleanly; otherwise it explains the outcome. */
+/**
+ * Narration folds only in a turn that finished cleanly; otherwise it explains the outcome.
+ * Codex labels its messages, so its commentary folds without the opt-in.
+ */
 function foldsNarration({
   items,
   turnLifecycle,
   foldNarration = false,
 }: Pick<FoldInputs, "items" | "turnLifecycle" | "foldNarration">): boolean {
   return (
-    foldNarration &&
+    (foldNarration || items.some(hasMessagePhase)) &&
     (turnLifecycle === undefined || turnLifecycle === "completed") &&
     // A retry that later succeeded stays in the transcript; a trailing one blocks any fold.
     !items.some((item) => item.kind === "error" || item.kind === "policy_denied")
@@ -183,6 +188,9 @@ function hasFoldableShape(
     .findLast((item) => !isTrailingWrapup(item) && item.kind !== "subagent_activity");
   // A terminal failure or denial must stay visible beside the assistant text.
   if (isFailureItem(lastItem)) return false;
+  // A turn that moves tasks keeps its task markers in view: they're the turn's
+  // outline, and its tool calls stay in their own "Called N tools" groups.
+  if (items.some(isTaskMarker)) return false;
   return (
     !isProvisionalTrace(items) &&
     segments.some((segment) => segment.kind === "work") &&
@@ -477,6 +485,11 @@ function isTrailingWrapup(item: RenderItem): boolean {
  * Split work from assistant text while preserving order. Every completed
  * message stays visible unless `foldNarration` asks to fold narration.
  */
+/** A task's start or end, or a plan change, in the chat (sub-agent notices aren't). */
+function isTaskMarker(item: RenderItem): boolean {
+  return item.kind === "subagent_activity" && readTaskActivity(item.data) !== null;
+}
+
 function partitionTurn(
   items: RenderItem[],
   foldNarration = false,
@@ -567,10 +580,7 @@ function foldNoticeRuns(segments: TurnSegment[]): TurnSegment[] {
  * answer phase (Codex) folds only commentary; otherwise all but its last message.
  */
 function narrationFolds(items: RenderItem[]): (item: RenderItem, index: number) => boolean {
-  const hasAnswerPhase = items.some(
-    (item) =>
-      item.kind === "text" && (item.phase === "final_answer" || item.phase === "partial_answer"),
-  );
+  const hasAnswerPhase = items.some((item) => hasMessagePhase(item) && item.phase !== "commentary");
   if (hasAnswerPhase) return (item) => item.kind === "text" && item.phase === "commentary";
   // Keep the last non-blank message visible, even in a continued bubble; blank
   // text after it stays with it rather than opening a second fold.
@@ -578,6 +588,10 @@ function narrationFolds(items: RenderItem[]): (item: RenderItem, index: number) 
     (item) => item.kind === "text" && item.text.trim() !== "",
   );
   return (_item, index) => index < answerIndex;
+}
+
+function hasMessagePhase(item: RenderItem): item is Extract<RenderItem, { kind: "text" }> {
+  return item.kind === "text" && item.phase !== undefined;
 }
 
 function isPendingElicitation(item: RenderItem): boolean {
@@ -637,19 +651,26 @@ function TurnWorkedFold({
   defaultOpen: boolean;
   children: ReactNode;
 }) {
-  const label = workedForS !== undefined ? `Worked for ${formatWorkedFor(workedForS)}` : "Worked";
+  const label = workedForS !== undefined ? `Worked for ${formatDuration(workedForS)}` : "Worked";
   const [open, setOpen] = useState(animateCollapse || defaultOpen);
+  // Closing over the trace it replaces, the fold keeps that trace laid out as it was on
+  // screen, so only its height changes; an opened fold indents it under the row.
+  const [inPlace, setInPlace] = useState(animateCollapse && !defaultOpen);
   const userChangedOpenRef = useRef(false);
   useLayoutEffect(() => {
     // History hydration can identify an interjection after this fold mounted.
     // Honor that late default unless the user has already made their own choice.
-    if (defaultOpen && !userChangedOpenRef.current) setOpen(true);
+    if (defaultOpen && !userChangedOpenRef.current) {
+      setInPlace(false);
+      setOpen(true);
+    }
   }, [defaultOpen]);
   useEffect(() => {
-    if (!animateCollapse || defaultOpen) return;
+    // Keyed to state, not the one-render prop: a re-render before the frame must not cancel it.
+    if (!inPlace || !open) return;
     const frame = requestAnimationFrame(() => setOpen(false));
     return () => cancelAnimationFrame(frame);
-  }, [animateCollapse, defaultOpen]);
+  }, [inPlace, open]);
 
   // A USER-initiated expand (never the animateCollapse mount-close)
   // opens INSTANTLY — no height animation — and snaps the fold row to
@@ -670,6 +691,7 @@ function TurnWorkedFold({
     userChangedOpenRef.current = true;
     scrollOnOpenRef.current = next;
     setUserOpened(next);
+    setInPlace(false);
     setOpen(next);
   };
   useLayoutEffect(() => {
@@ -711,11 +733,21 @@ function TurnWorkedFold({
       className="group/turn-fold not-prose w-full"
       data-testid="turn-worked-fold"
     >
-      <div ref={rowRef} className={cn("turn-fold-row", animateCollapse && "turn-fold-row-enter")}>
-        <CollapsibleTrigger className="flex cursor-pointer items-center gap-2 rounded-sm py-1 text-left text-muted-foreground text-ui outline-none transition-colors hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50">
-          <span className="shrink-0">{label}</span>
-          <ChevronRightIcon className="size-2.5 shrink-0 transition-transform group-data-[state=open]/turn-fold:rotate-90" />
-        </CollapsibleTrigger>
+      <div
+        ref={rowRef}
+        className={cn("turn-fold-row", inPlace && "turn-fold-row-enter")}
+        // The grown row stops clipping, so the trigger's focus ring shows.
+        onAnimationEnd={(event) => {
+          if (event.animationName === "turn-fold-row-in") setInPlace(false);
+        }}
+      >
+        {/* The grow-in collapses this wrapper; the trigger's padding would floor it. */}
+        <div>
+          <CollapsibleTrigger className="flex cursor-pointer items-center gap-2 rounded-sm py-1 text-left text-muted-foreground text-ui outline-none transition-colors hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50">
+            <span className="shrink-0">{label}</span>
+            <ChevronRightIcon className="size-2.5 shrink-0 transition-transform group-data-[state=open]/turn-fold:rotate-90" />
+          </CollapsibleTrigger>
+        </div>
       </div>
       {/* Height animation lives in index.css (it needs Radix's measured
           --radix-collapsible-content-height) and is disabled under
@@ -726,12 +758,14 @@ function TurnWorkedFold({
       <CollapsibleContent
         className={cn("turn-fold-content", userOpened && "turn-fold-content-instant")}
       >
-        <div className="relative flex flex-col gap-1 pt-2 pl-4">
-          <span
-            aria-hidden
-            className="absolute top-2 bottom-0 left-1 w-px bg-border"
-            data-testid="turn-worked-fold-pin-line"
-          />
+        <div className={cn("relative flex flex-col", inPlace ? "gap-1.5" : "gap-1 pt-2 pl-4")}>
+          {!inPlace && (
+            <span
+              aria-hidden
+              className="absolute top-2 bottom-0 left-1 w-px bg-border"
+              data-testid="turn-worked-fold-pin-line"
+            />
+          )}
           {children}
         </div>
       </CollapsibleContent>
@@ -746,18 +780,6 @@ function nearestScrollContainer(el: HTMLElement): HTMLElement | null {
     if (overflowY === "auto" || overflowY === "scroll") return p;
   }
   return null;
-}
-
-/** "8s", "1m 46s", "1h 2m" — matches the native CLIs' worked-for stamps. */
-function formatWorkedFor(seconds: number): string {
-  const s = Math.max(1, Math.round(seconds));
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  const rem = s % 60;
-  if (m < 60) return rem > 0 ? `${m}m ${rem}s` : `${m}m`;
-  const h = Math.floor(m / 60);
-  const mm = m % 60;
-  return mm > 0 ? `${h}h ${mm}m` : `${h}h`;
 }
 
 /**
@@ -867,8 +889,11 @@ function renderItem(
           className={cn("min-w-0", followsText && "mt-2")}
         >
           <FilePathAwareMessageResponse
-            className="chat-markdown"
-            mode={isTextStreaming ? "streaming" : "static"}
+            className="chat-markdown text-message"
+            allowWorkspaceImages
+            allowShellCommands
+            mode={isTextStreaming || keepsStreamingMode(item) ? "streaming" : "static"}
+            isStreaming={isTextStreaming}
           >
             {item.text}
           </FilePathAwareMessageResponse>
@@ -991,17 +1016,64 @@ function renderItem(
     case "elicitation":
       return <ElicitationCard key={key} item={item} />;
     case "subagent_activity":
-      return <SubagentActivityMessage key={key} data={item.data} />;
+      return <ActivityNotice key={key} data={item.data} />;
   }
 }
 
+// Any indent: a list item's continuation lines carry its content indent. A caret
+// followed by more label text is a footnote; a bare `[^]` is an ordinary label.
+const REFERENCE_DEFINITION = /^\s*\[(?!\^[^\]])(?:[^[\]\\]|\\.)+\]:/;
+// A label opened on this line and still open at its end (where a backslash may end
+// it), then the rest of one.
+const LABEL_OPEN = /^\s*\[(?!\^[^\]])((?:[^[\]\\]|\\.)*\\?)$/;
+const LABEL_REST = /^((?:[^[\]\\]|\\.)*\\?)(\]:)?/;
+const LINE_ENDING = /\r\n?|\n/;
+const MAX_LABEL_LENGTH = 999;
+// Blockquote and list markers at any indent, so nested containers are read too.
+const CONTAINER_PREFIX = /^(?:\s*(?:>|[-*+]|\d{1,9}[.)]))+/;
+
 /**
- * Stable key for each render item. Prefer the server-assigned item id;
- * fall back to call_id for tools (unique within a response) or to
- * position for pre-finalization fragments that don't carry an item id
- * yet (text/reasoning chunks emitted before their `output_item.done`).
+ * Conservatively detects a reference link definition, which resolves only when
+ * static mode renders the whole document. It reads past blockquote and list markers
+ * and doesn't exclude code, so it can match where markdown wouldn't but shouldn't
+ * miss a definition. One pass over the lines, so long or pathological text stays linear.
+ */
+export function mayDefineReferenceLink(text: string): boolean {
+  // Length of a label left open by earlier lines, or -1.
+  let openLabel = -1;
+  for (const line of text.split(LINE_ENDING)) {
+    const content = line.replace(CONTAINER_PREFIX, "");
+    if (openLabel >= 0) {
+      // A label continues over non-blank lines of label characters, up to 999 of them.
+      const [matched = "", chars = "", closed] = LABEL_REST.exec(content) ?? [];
+      openLabel += chars.length + 1;
+      if (closed && openLabel <= MAX_LABEL_LENGTH) return true;
+      const continues = matched === content && content.trim() !== "";
+      openLabel = continues && openLabel <= MAX_LABEL_LENGTH ? openLabel : -1;
+      if (openLabel >= 0) continue;
+    }
+    if (REFERENCE_DEFINITION.test(content)) return true;
+    openLabel = LABEL_OPEN.exec(content)?.[1]?.length ?? -1;
+  }
+  return false;
+}
+
+/**
+ * Streamed text stays in streaming mode once it settles: static mode renders a
+ * different tree, so switching would remount every block of the reply.
+ */
+function keepsStreamingMode(item: Extract<RenderItem, { kind: "text" }>): boolean {
+  return item.streamKey !== undefined && !mayDefineReferenceLink(item.text);
+}
+
+/**
+ * Stable key for each render item. Text that streamed into this page keeps
+ * its `streamKey` while its item id commits; otherwise prefer the
+ * server-assigned item id, then call_id for tools (unique within a
+ * response), then position for fragments that don't carry an item id yet.
  */
 function keyFor(item: RenderItem, index: number): string {
+  if (item.kind === "text" && item.streamKey) return item.streamKey;
   if (item.itemId) return `${item.kind}:${item.itemId}`;
   if (item.kind === "tool") return `tool:${item.execution.callId}`;
   if (item.kind === "elicitation") return `elicitation:${item.elicitationId}`;

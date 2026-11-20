@@ -24,7 +24,7 @@ Endpoints (all mounted at the app root):
 Mounted in ``accounts`` and ``oidc`` (standard OIDC) auth modes when
 ``OMNIGENT_DEVICE_GRANT_ENABLED`` is set. GitHub OAuth (``provider_type=="github"``)
 and header mode are excluded: GitHub does not support ``prompt=login``/
-``max_age=0`` so the anti-phishing re-auth gate cannot be enforced;
+``max_age`` so the anti-phishing re-auth gate cannot be enforced;
 header mode has no server-mintable identity.
 
 See ``designs/DEVICE_AUTH.md`` for the full design + threat model.

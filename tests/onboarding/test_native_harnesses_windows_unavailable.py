@@ -35,7 +35,7 @@ def _all_clis_installed(monkeypatch: pytest.MonkeyPatch) -> None:
     def _stub_run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
         if len(argv) >= 2 and argv[1] == "--version":
             if argv[0].endswith("opencode"):
-                version = "1.17.7\n"
+                version = "opencode v2.0.18\n"
             elif argv[0].endswith("cursor-agent") or argv[0].endswith("hermes"):
                 version = "2026.07.01\n"
             else:
@@ -45,6 +45,7 @@ def _all_clis_installed(monkeypatch: pytest.MonkeyPatch) -> None:
             return subprocess.CompletedProcess(args=argv, returncode=1, stdout="", stderr="")
         raise AssertionError(f"unexpected subprocess in readiness tests: {argv!r}")
 
+    monkeypatch.setattr(hi, "run_isolated", _stub_run)
     monkeypatch.setattr(hi.subprocess, "run", _stub_run)
     monkeypatch.setattr(hi, "harness_cli_logged_in", lambda _key, **_kw: True)
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -10,6 +11,7 @@ import httpx
 import pytest
 
 from omnigent.harnesses.codex_native import forwarder as fwd
+from omnigent.inner.databricks_executor import DatabricksAuthError
 from tests.harnesses.codex_native.forwarder._support import (
     _RaisingPostClient,
     _RecordingClient,
@@ -144,7 +146,7 @@ async def test_post_session_event_dead_letters_usage_on_permanent_failure(
 class _SequencedPostClient:
     """Return or raise configured POST outcomes in order."""
 
-    def __init__(self, outcomes: list[httpx.Response | httpx.HTTPError]) -> None:
+    def __init__(self, outcomes: list[httpx.Response | Exception]) -> None:
         self._outcomes = outcomes
         self.calls: list[tuple[str, object, float | None]] = []
 
@@ -157,9 +159,93 @@ class _SequencedPostClient:
     ) -> httpx.Response:
         self.calls.append((url, json, timeout))
         outcome = self._outcomes.pop(0)
-        if isinstance(outcome, httpx.HTTPError):
+        if isinstance(outcome, Exception):
             raise outcome
         return outcome
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event_type", "data", "durable", "replayable", "prior_transport"),
+    [
+        (
+            "external_conversation_item",
+            {"item_type": "message", "source_id": "thread:turn:item"},
+            True,
+            True,
+            False,
+        ),
+        (
+            "external_conversation_item",
+            {"item_type": "message", "source_id": "thread:turn:item"},
+            True,
+            True,
+            True,
+        ),
+        ("external_conversation_item", {"item_type": "message"}, True, False, False),
+        ("external_session_usage", {"context_tokens": 1234}, True, False, False),
+        ("external_output_text_delta", {"delta": "preview"}, False, False, False),
+        ("external_session_status", {"status": "idle"}, False, False, False),
+    ],
+)
+async def test_auth_failure_preserves_durable_events_for_safe_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    event_type: str,
+    data: dict,
+    durable: bool,
+    replayable: bool,
+    prior_transport: bool,
+) -> None:
+    """Credential failure retains durable data; only idempotent items replay."""
+    failure = DatabricksAuthError("private credential service detail")
+    outcomes: list[httpx.Response | Exception] = []
+    if prior_transport:
+        outcomes.append(
+            httpx.ReadTimeout("response lost", request=httpx.Request("POST", "http://test"))
+        )
+    outcomes.append(failure)
+    client = _SequencedPostClient(outcomes)
+    monkeypatch.setattr(fwd, "_sleep", AsyncMock())
+    fwd._reset_forward_health()
+    token = fwd._dead_letter_dir.set(tmp_path)
+    try:
+        with pytest.raises(DatabricksAuthError) as caught:
+            await fwd._post_session_event(
+                client,  # type: ignore[arg-type]
+                "conv_auth",
+                event_type=event_type,
+                data=data,
+                max_attempts=1 + int(prior_transport),
+            )
+        assert caught.value is failure
+        assert len(client.calls) == 1 + int(prior_transport)
+    finally:
+        fwd._dead_letter_dir.reset(token)
+        fwd._reset_forward_health()
+
+    dead_letter = tmp_path / "dead_letter.jsonl"
+    if durable:
+        record = json.loads(dead_letter.read_text())
+        assert record["payload"] == data
+        assert record["session_id"] == "conv_auth"
+        assert record["event_type"] == event_type
+        assert record["delivered_ambiguous"] is True
+        assert record["transport_error"] == "DatabricksAuthError"
+        assert record["http_status"] is None
+        assert "private credential" not in dead_letter.read_text()
+    else:
+        assert not dead_letter.exists()
+
+    recovered_client = _RecordingClient()
+    await fwd._replay_dead_letters_before_resume(recovered_client, tmp_path)  # type: ignore[arg-type]
+    await fwd._replay_dead_letters_before_resume(recovered_client, tmp_path)  # type: ignore[arg-type]
+    assert recovered_client.posts == (
+        [("/v1/sessions/conv_auth/events", {"type": event_type, "data": data})]
+        if replayable
+        else []
+    )
+    assert dead_letter.exists() is (durable and not replayable)
 
 
 @pytest.mark.asyncio

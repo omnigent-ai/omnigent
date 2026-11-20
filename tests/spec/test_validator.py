@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TcpEgressRoute
 from omnigent.spec.types import (
     AgentSpec,
     CompactionConfig,
@@ -618,27 +618,27 @@ def _os_env(**sandbox_kwargs: object) -> OSEnvSpec:
     )
 
 
-def test_os_env_egress_rules_requires_hard_enforcing_backend() -> None:
-    """``egress_rules`` on ``sandbox.type=none`` is rejected — the
-    ``none`` backend doesn't isolate the network namespace so the
-    rules would be inert decoration on the policy. The error names
-    both hard-enforcing backends so the spec author knows the fix.
-    """
+@pytest.mark.parametrize("egress_key", ["egress_rules", "tcp_egress"])
+def test_os_env_egress_rules_requires_hard_enforcing_backend(egress_key: str) -> None:
+    """Egress policies require a backend that enforces network isolation."""
+    rules = (
+        ["GET api.example.test/**"]
+        if egress_key == "egress_rules"
+        else [TcpEgressRoute("api", "api.example.test", 8443)]
+    )
     spec = _minimal_spec(
-        os_env=_os_env(
-            type="none",
-            egress_rules=["* api.github.com/**"],
-        ),
+        os_env=_os_env(type="none", **{egress_key: rules}),
     )
     result = validate(spec)
     assert not result.valid
-    matches = [e for e in result.errors if e.path == "os_env.sandbox.egress_rules"]
-    assert matches, f"expected egress_rules error, got: {result.errors}"
+    matches = [e for e in result.errors if e.path == f"os_env.sandbox.{egress_key}"]
+    assert matches, f"expected {egress_key} error, got: {result.errors}"
     message = matches[0].message
     assert "linux_bwrap" in message
     assert "darwin_seatbelt" in message
-    assert "Fix:" in message
-    assert "do not use sandbox.type=none with egress_rules" in message
+    if egress_key == "egress_rules":
+        assert "Fix:" in message
+        assert "do not use sandbox.type=none with egress_rules" in message
 
 
 def test_os_env_egress_rules_accepted_for_bwrap() -> None:
@@ -668,6 +668,23 @@ def test_os_env_egress_rules_accepted_for_seatbelt() -> None:
     egress_errors = [e for e in result.errors if "egress" in e.path]
     assert egress_errors == [], (
         f"egress_rules on seatbelt should pass validation, got: {result.errors}"
+    )
+
+
+@pytest.mark.parametrize("backend", ["linux_bwrap", "darwin_seatbelt"])
+def test_os_env_tcp_egress_cannot_coexist_with_http_rules(backend: str) -> None:
+    spec = _minimal_spec(
+        os_env=_os_env(
+            type=backend,
+            egress_rules=["GET api.example.test/**"],
+            tcp_egress=[TcpEgressRoute("api", "alias.example.test", 8443)],
+        ),
+    )
+    result = validate(spec)
+    assert not result.valid
+    assert any(
+        error.path == "os_env.sandbox.tcp_egress" and "cannot coexist" in error.message
+        for error in result.errors
     )
 
 

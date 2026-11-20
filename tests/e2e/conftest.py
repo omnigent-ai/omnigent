@@ -59,7 +59,13 @@ from tests._helpers.operator_agents import operator_agent_store, post_operator_s
 from tests._helpers.session import post_session_bundle
 from tests._model_pools import current_attempt, resolve_model
 from tests.e2e._harness_probes import skip_if_harness_cli_missing
-from tests.e2e.helpers import HEALTH_TIMEOUT_S, POLL_INTERVAL_S, lookup_databricks_host
+from tests.e2e.helpers import (
+    HEALTH_TIMEOUT_S,
+    POLL_INTERVAL_S,
+    harness_model_base_url,
+    lookup_databricks_host,
+    model_base_url,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -609,6 +615,13 @@ def live_runner_id() -> str:
     return _live_runner_state["runner_id"]
 
 
+# Test-only policy handler modules the live server may reference from fixture agents.
+_E2E_POLICY_MODULES = [
+    "omnigent._e2e_policy_callables",
+    "tests.resources.examples._shared.search_rate_limit_policy",
+]
+
+
 @pytest.fixture(scope="session")
 def live_server(
     request: pytest.FixtureRequest,
@@ -685,7 +698,9 @@ def live_server(
         # include /v1 in the base so the SDK hits /v1/responses.
         env["OPENAI_BASE_URL"] = f"{mock_llm_server_url}/v1"
     elif databricks_workspace_host is not None:
-        env["OPENAI_BASE_URL"] = f"{databricks_workspace_host}/serving-endpoints"
+        env["OPENAI_BASE_URL"] = harness_model_base_url(
+            databricks_workspace_host, request.config.getoption("--harness")
+        )
         # Thread --profile so claude-sdk and other harnesses that read
         # ~/.databrickscfg directly pick the right profile. Without it
         # ClaudeSDKExecutor falls through and 403s.
@@ -736,13 +751,14 @@ def live_server(
         server_cfg.write_text(
             yaml.safe_dump(
                 {
+                    "policy_modules": _E2E_POLICY_MODULES,
                     "llm": {
                         "model": "_policy_llm_",
                         "connection": {
                             "base_url": f"{mock_llm_server_url}/v1",
                             "api_key": "mock-key",
                         },
-                    }
+                    },
                 }
             )
         )
@@ -752,15 +768,16 @@ def live_server(
         server_cfg.write_text(
             yaml.safe_dump(
                 {
+                    "policy_modules": _E2E_POLICY_MODULES,
                     "llm": {
                         # Stable key: session-scoped server must not
                         # depend on which test boots it first.
                         "model": resolve_model("databricks-gpt-5-4-mini", key="live-server"),
                         "connection": {
-                            "base_url": f"{databricks_workspace_host}/serving-endpoints",
+                            "base_url": model_base_url(databricks_workspace_host, "mlflow/v1"),
                             "api_key": llm_api_key,
                         },
-                    }
+                    },
                 }
             )
         )
@@ -1902,7 +1919,7 @@ def resume_test_server(
     # primary live_server fixture above).
     apply_server_env(env, _REPO_ROOT)
     if databricks_workspace_host is not None:
-        env["OPENAI_BASE_URL"] = f"{databricks_workspace_host}/serving-endpoints"
+        env["OPENAI_BASE_URL"] = model_base_url(databricks_workspace_host, "codex/v1")
     # See docstring: an allow-list would reject the CLI's own runner.
     env.pop("OMNIGENT_RUNNER_TUNNEL_TOKEN", None)
 

@@ -28,6 +28,8 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests.e2e_ui.conftest import switch_markdown_view_mode
+
 # Files land in ``<repo-root>/<session_id>/`` (the agent spec uses
 # ``os_env.cwd: .``), so clean that per-session dir up in teardown.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -281,23 +283,26 @@ def test_non_markdown_edit_autosaves(page: Page, seeded_python: tuple[str, str, 
 
 
 def test_large_markdown_source_autosaves(page: Page, seeded_session: tuple[str, str]) -> None:
-    """Source fallback preserves the whole file and stays mounted across a smaller save."""
+    """Large Markdown opens in Preview, edits in source, and stays there across a smaller save."""
     base_url, session_id = seeded_session
     path = "large-autosave.md"
     line = "A paragraph in a large Markdown document.\n\n"
-    original = "# Large document\n\n" + line * (1024 * 1024 // len(line) + 1)
+    original = "# Large document\n\n" + line * (512 * 1024 // len(line))
     original += "Large document end.\n"
     _seed_file(base_url, session_id, path, original)
     try:
         page.goto(f"{base_url}/c/{session_id}?file={path}")
         viewer = page.locator('[data-testid="file-viewer"]:visible')
+        expect(viewer.get_by_role("heading", name="Large document")).to_be_visible(timeout=30_000)
+        expect(viewer.locator(".tiptap")).to_have_count(0)
+        expect(viewer.locator(".monaco-editor")).to_have_count(0)
+        switch_markdown_view_mode(page, viewer, "Edit")
         expect(
-            viewer.get_by_text("Large Markdown file opened as source", exact=False)
+            viewer.get_by_text("Large Markdown file edited as source", exact=False)
         ).to_be_visible()
         editor = viewer.locator(".monaco-editor")
         expect(editor).to_be_visible(timeout=30_000)
         expect(viewer.locator(".tiptap")).to_have_count(0)
-        expect(viewer.get_by_role("button", name="View mode", exact=False)).to_have_count(0)
         viewer.locator(".view-lines").click()
         page.keyboard.press("ControlOrMeta+End")
         expect(viewer.locator(".view-lines")).to_contain_text("Large document end.")
@@ -306,6 +311,10 @@ def test_large_markdown_source_autosaves(page: Page, seeded_session: tuple[str, 
         page.keyboard.type(sentinel)
         assert _wait_for_persisted(base_url, session_id, path, sentinel) == sentinel + original
         page.reload()
+        expect(viewer.get_by_role("heading", name="Saved large Markdown")).to_be_visible(
+            timeout=30_000
+        )
+        switch_markdown_view_mode(page, viewer, "Edit")
         expect(viewer.locator(".view-lines")).to_contain_text("Saved large Markdown")
         viewer.locator(".view-lines").click()
         page.keyboard.press("ControlOrMeta+f")
