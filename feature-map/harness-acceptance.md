@@ -41,7 +41,7 @@ does not make the surfaces interchangeable.
 | Web new session | Pick a native harness or SDK custom agent, host/workspace, model and effort, then send. See [Composer](./composer.md) and [Custom agents](./custom-agents.md). |
 | Web existing session | Send follow-ups, edit configuration, interrupt, answer approvals, reload or fork. See [Composer](./composer.md), [Sessions](./sessions.md) and [Native harnesses](./native-harnesses.md). |
 | Native terminal / CLI | Launch using the harness's CLI entry, use supported native controls, and switch Terminal ↔ Chat. See [Native harnesses](./native-harnesses.md) and [Terminals](./terminals.md). |
-| SDK CLI / API | Launch a custom agent with `omnigent run` or the session API; verify the server/runner contract. The [bench](../tests/harness_bench/README.md#transport-selection) uses this boundary, not browser rendering. |
+| SDK CLI / API | Launch a custom agent with `omnigent run` or the session API; verify the server/runner contract, including [confinement refusal and retry](#custom-agent-confinement-and-retry). The [bench](../tests/harness_bench/README.md#transport-selection) uses this boundary, not browser rendering. |
 | Alternate UI surfaces | Exercise mobile, fork-dialog configuration and Inbox approvals when the change affects them. Use the owning recipes above, not desktop Chat as a substitute. |
 
 ## Driving it with the repro environment
@@ -143,6 +143,35 @@ in the existing drivers/[primitives](../tests/_helpers/README.md). Keep input
 matrices at the lowest reliable layer; retain browser/process cases for distinct
 boundaries. Do not move or replace working regression coverage just to fit the
 checklist.
+
+### Custom-agent confinement and retry
+
+For `launch-reply`, a custom agent's `os_env` restrictions must be enforced or
+startup must fail before launching its worker. Copilot, Cursor, Hermes and
+Antigravity inner adapters refuse requested process confinement. An `os_env`
+without an explicit sandbox type requests the platform default too. When its
+parent has no `os_env`, the `web_fetch` researcher inherits the parent's harness
+and requests platform-default confinement, so it also refuses startup on those
+adapters. Select a sandbox-capable harness
+when confinement is required; see the [worker policy limits](../docs/AGENT_YAML_SPEC.md#local-os-access)
+for supported configurations. These restrictions concern custom-agent workers,
+separately from provider sandbox profiles used to provision sessions.
+
+On a supported adapter, submit a policy containing an unsupported option such
+as `os_env.fork: true`. Confirm the session reports refusal, then correct that
+option and retry in the same session while retaining its sandbox and path/network
+restrictions. The retry must execute an allowed operation and still deny access
+outside the policy. Do not remove confinement to turn a refusal into a pass.
+The CLI journey similarly requires correcting the policy before rerunning
+`omnigent run`; a fresh CLI invocation does not establish same-session recovery.
+
+`tests/e2e/test_codex_sandbox_policy_retry_e2e.py` covers API refusal and
+same-session recovery with a real server, runner and Codex worker plus a scripted
+provider. It verifies allowed reads, denied private reads and denied workspace
+writes after policy repair. That scenario does not establish recovery for every
+adapter, native-wrapper session or provider sandbox profile; use the owning
+adapter's component checks for its launch refusals and record other entry points
+as unverified until exercised.
 
 ### Pi SDK large tool requests
 

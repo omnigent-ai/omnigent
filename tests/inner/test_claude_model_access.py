@@ -439,10 +439,17 @@ def test_custom_provider_config_cannot_be_granted_to_the_worker(tmp_path: Path) 
     assert repr(str(tmp_path.resolve())) in str(error.value)
 
 
-@pytest.mark.parametrize("explicit_token", [None, "parent-only-provider-token"])
+@pytest.mark.parametrize(
+    "entrypoint,explicit_token",
+    [("resolver", None), ("resolver", "parent-only-provider-token"), ("prepared", None)],
+)
 def test_user_settings_helper_cannot_fall_back_to_saved_oauth(
-    tmp_path: Path, explicit_token: str | None
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entrypoint: str, explicit_token: str | None
 ) -> None:
+    from omnigent.inner import claude_sdk_executor as claude
+    from omnigent.inner.model_auth import ProviderAuthRequired
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
     config_dir = tmp_path / "claude-config"
     config_dir.mkdir()
     _write_oauth(config_dir / ".credentials.json", "parent-only-oauth")
@@ -454,9 +461,38 @@ def test_user_settings_helper_cannot_fall_back_to_saved_oauth(
         env["ANTHROPIC_AUTH_TOKEN"] = explicit_token
         access = resolve_claude_model_access(env, user_settings_has_api_key_helper=True)
         assert access.credential() == explicit_token
-    else:
-        with pytest.raises(ValueError, match="user settings apiKeyHelper"):
+    elif entrypoint == "resolver":
+        with pytest.raises(ProviderAuthRequired, match="user settings apiKeyHelper"):
             resolve_claude_model_access(env, user_settings_has_api_key_helper=True)
+    else:
+        for name in tuple(os.environ):
+            if name.startswith(("CLAUDE_", "ANTHROPIC_", "HARNESS_")):
+                monkeypatch.delenv(name)
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        policy = SandboxPolicy("linux_bwrap", True, [workspace], [], [], False)
+        monkeypatch.setattr(claude, "resolve_sandbox", lambda *_: policy)
+        proxy = Mock()
+        launcher = Mock()
+        monkeypatch.setattr(claude, "start_egress_proxy", proxy)
+        monkeypatch.setattr(claude, "create_exec_launcher", launcher)
+        with pytest.raises(ProviderAuthRequired) as raised:
+            claude.prepare_claude_cli_path(
+                "/bin/claude",
+                OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+                cwd=workspace,
+                worker_env=env,
+                user_settings_has_api_key_helper=True,
+            )
+        detail = ExecutorAdapter(executor_factory=Mock())._build_error_detail(raised.value)
+        assert detail.code == "PROVIDER_AUTH_REQUIRED"
+        assert detail.title is not None and "credential configuration" in detail.title
+        assert "user settings apiKeyHelper" in detail.message
+        assert "configure a supported provider credential" in detail.message
+        assert "parent-only-oauth" not in detail.message
+        assert "parent-only-refresh" not in detail.message
+        proxy.assert_not_called()
+        launcher.assert_not_called()
 
 
 @pytest.mark.parametrize("custom_home", [False, True])

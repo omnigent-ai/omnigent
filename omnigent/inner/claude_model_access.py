@@ -247,6 +247,20 @@ class ClaudeAuthRequired(ProviderAuthRequired):
         super().__init__("Claude model authentication is unavailable; sign in again and retry.")
 
 
+class ClaudeCredentialConfigurationError(ProviderAuthRequired):
+    """Fixed guidance for an unsupported credential configuration."""
+
+    title = "Claude credential configuration required"
+    cause = "A user settings apiKeyHelper cannot fall back to saved OAuth in a sandbox."
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Sandboxed Claude cannot use a user settings apiKeyHelper with OAuth fallback; "
+            "configure a supported provider credential, such as ANTHROPIC_AUTH_TOKEN or "
+            "ANTHROPIC_API_KEY, then retry."
+        )
+
+
 def validate_claude_sandbox_backend(policy: SandboxPolicy) -> None:
     """Require an active backend that enforces filesystem and network isolation."""
     if not policy.active:
@@ -960,10 +974,7 @@ def resolve_claude_model_access(
             )
 
     if user_settings_has_api_key_helper:
-        raise ValueError(
-            "sandboxed Claude cannot use a user settings apiKeyHelper with OAuth fallback; "
-            "configure a supported provider credential"
-        )
+        raise ClaudeCredentialConfigurationError()
 
     credential_path = config_dir / ".credentials.json"
     canonical_credential_path = credential_path.resolve()
