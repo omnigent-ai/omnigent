@@ -30,6 +30,7 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeMessageDelta,
     ClaudeTranscriptItem,
     HookReadResult,
+    ResumeCostBaseline,
     TranscriptReadResult,
     _display_text,
     _transcript_items_from_entry,
@@ -43,6 +44,7 @@ from omnigent.harnesses.claude_native.bridge import (
     read_hook_events_since_with_position,
     read_message_deltas_from_offset,
     read_pane_signals,
+    read_resume_cost_baseline,
     read_seen_claude_session_ids,
     read_transcript_items_from_offset,
     read_transcript_items_since_with_position,
@@ -51,6 +53,7 @@ from omnigent.harnesses.claude_native.bridge import (
     transcript_has_recent_local_command,
     url_component,
     write_active_session_id,
+    write_resume_cost_baseline,
 )
 from omnigent.harnesses.claude_native.diagnostics import ClaudeDebugLogFollower
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
@@ -973,6 +976,10 @@ class _ForwardDedupeState:
     # Session already logged as moved off this runner, so the notice is not
     # repeated for every item dropped afterwards.
     session_not_bound_logged_for: str | None = None
+    # The cost a cold resume seeded into this Claude process, read from the
+    # bridge dir once (see ``_resume_adjusted_status_cost``).
+    resume_cost_baseline: ResumeCostBaseline | None = None
+    resume_cost_baseline_read: bool = False
 
 
 @dataclass(frozen=True)
@@ -3114,6 +3121,88 @@ def _cumulative_cost_from_status_state(state: dict[str, object] | None) -> float
     return float(raw)
 
 
+# Claude restores the seeded cost exactly; the slack only absorbs rounding.
+_RESUME_COST_RESTORE_TOLERANCE_USD = 0.01
+
+
+def _resume_adjusted_status_cost(
+    *,
+    bridge_dir: Path,
+    transcript_path: Path,
+    status_cost: float | None,
+    dedupe: _ForwardDedupeState,
+    session_id: str,
+) -> float | None:
+    """
+    Add back the cost a cold resume seeded when Claude didn't restore it.
+
+    A cold resume seeds the session's recorded cost into Claude through a
+    ``cost-state`` transcript record in Claude Code's own format. A release
+    that stops reading it would restart the statusLine total at $0, and the
+    server, which keeps only the highest total, would stall the session cost.
+    The resumed process's first non-zero cost tells the cases apart: at least
+    the seeded cost when restored, a fresh count when not. The decision is
+    persisted, so a restarted forwarder keeps it.
+
+    Reads and writes the bridge dir; call via :func:`asyncio.to_thread`.
+
+    :param bridge_dir: Native Claude bridge directory holding the baseline.
+    :param transcript_path: Transcript being forwarded; its stem is the
+        running Claude session id.
+    :param status_cost: The statusLine total, or ``None`` when not captured.
+    :param dedupe: Caches the baseline and its decision; mutated in place.
+    :param session_id: Omnigent session id, e.g. ``"conv_abc123"``, for logs.
+    :returns: *status_cost*, plus the seeded cost when Claude counted from
+        zero.
+    """
+    if not dedupe.resume_cost_baseline_read:
+        dedupe.resume_cost_baseline_read = True
+        try:
+            dedupe.resume_cost_baseline = read_resume_cost_baseline(bridge_dir)
+        except (OSError, ValueError):
+            _logger.warning(
+                "Could not read the cost seeded on cold resume; session=%s",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+    baseline = dedupe.resume_cost_baseline
+    if (
+        baseline is None
+        or status_cost is None
+        or transcript_path.stem != baseline.claude_session_id
+    ):
+        return status_cost
+    if baseline.restored is None:
+        if status_cost <= 0:
+            # Nothing billed yet, so a restored and a fresh count look alike.
+            return status_cost
+        restored = status_cost + _RESUME_COST_RESTORE_TOLERANCE_USD >= baseline.cost_usd
+        baseline = replace(baseline, restored=restored)
+        dedupe.resume_cost_baseline = baseline
+        try:
+            write_resume_cost_baseline(bridge_dir, baseline)
+        except (OSError, RuntimeError):
+            _logger.warning(
+                "Could not persist the cold-resume cost decision; session=%s",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+        if not restored:
+            _logger.warning(
+                "Claude Code did not restore the cost seeded on cold resume; adding "
+                "$%.4f to its total; session=%s claude_session=%s",
+                baseline.cost_usd,
+                session_id,
+                baseline.claude_session_id,
+                extra={"session_id": session_id},
+            )
+    if baseline.restored:
+        return status_cost
+    return baseline.cost_usd + status_cost
+
+
 def _transcript_cost_size_cached(
     transcript_path: Path,
     *,
@@ -3271,6 +3360,9 @@ async def _forward_session_cost(
     gate uses the higher live ``C``) is intentional and reconciles at the
     turn boundary when ``S`` jumps; ``max`` keeps both monotonic.
 
+    After a cold resume that Claude counted from $0, ``S`` includes the
+    seeded cost (see :func:`_resume_adjusted_status_cost`).
+
     Best-effort, like the other forwarder posts: a failed POST is retried
     on the next poll (the ``dedupe`` baselines advance only on success).
 
@@ -3292,8 +3384,19 @@ async def _forward_session_cost(
     """
     if time.monotonic() < dedupe.cost_retry_not_before:
         return
-    status_state = await asyncio.to_thread(read_claude_context_state, bridge_dir)
-    status_cost = _cumulative_cost_from_status_state(status_state)
+
+    def read_status_cost() -> tuple[dict[str, object] | None, float | None]:
+        state = read_claude_context_state(bridge_dir)
+        cost = _resume_adjusted_status_cost(
+            bridge_dir=bridge_dir,
+            transcript_path=parent_transcript_path,
+            status_cost=_cumulative_cost_from_status_state(state),
+            dedupe=dedupe,
+            session_id=session_id,
+        )
+        return state, cost
+
+    status_state, status_cost = await asyncio.to_thread(read_status_cost)
     active_subagents = [
         entry for entry in subagent_state.subagents.values() if entry.child_conversation_id
     ]

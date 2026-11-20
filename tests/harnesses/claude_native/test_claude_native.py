@@ -6192,8 +6192,21 @@ async def test_ensure_local_claude_resume_transcript_restores_the_session_cost(
     ``claude --resume`` reads its running cost back only from a ``cost-state``
     record and skips a partial one. Without the record a cold-resumed session
     counts from zero, and its reports stay below the session's stored total,
-    which only moves up.
+    which only moves up. The bridge dir records the seeded cost for the
+    forwarder's check, replacing an earlier launch's, and drops the previous
+    process's statusLine snapshot, which would read as the new process's cost.
     """
+    from omnigent.harnesses.claude_native import bridge as claude_bridge
+
+    monkeypatch.setattr(claude_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
+    bridge_dir = claude_bridge.bridge_dir_for_conversation_id("conv_abc")
+    claude_bridge.record_resume_cost_baseline(
+        bridge_dir, claude_session_id="sid-earlier", cost_usd=0.5
+    )
+    snapshots = [bridge_dir / "context.json", bridge_dir / "context_raw.json"]
+    for snapshot in snapshots:
+        snapshot.write_text('{"total_cost_usd": 0.5}', encoding="utf-8")
     monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", tmp_path / "projects")
     client = await _httpx_client_with_canned_response(None, 200)
     async with client:
@@ -6210,7 +6223,13 @@ async def test_ensure_local_claude_resume_transcript_restores_the_session_cost(
     cost_states = [record for record in records if record.get("type") == "cost-state"]
     if resume_cost_usd is None:
         assert cost_states == []
+        assert claude_bridge.read_resume_cost_baseline(bridge_dir) is None
+        assert all(snapshot.exists() for snapshot in snapshots)
         return
+    assert claude_bridge.read_resume_cost_baseline(bridge_dir) == (
+        claude_bridge.ResumeCostBaseline(claude_session_id="sid123", cost_usd=1.25)
+    )
+    assert not any(snapshot.exists() for snapshot in snapshots)
     assert cost_states == [records[-1]]
     assert set(records[-1]) == {
         "type",
@@ -8531,6 +8550,57 @@ def test_copy_transcript_with_cwd_keeps_background_handles_for_the_same_session(
     moved = json.loads(target.read_text(encoding="utf-8"))
     assert moved["toolUseResult"] == _BACKGROUND_AGENT_HANDLE
     assert moved["cwd"] == str(tmp_path)
+
+
+def test_clone_claude_transcript_drops_the_source_cost(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A fork counts its own spend, so its clone drops the source's ``cost-state``.
+
+    Claude restores its running cost from that record on ``--resume``; a clone
+    that kept it would start the fork at the source's total and count that
+    spend twice. Moving a session's own transcript keeps the record.
+    """
+    projects_dir = tmp_path / ".claude" / "projects"
+    source_workspace = tmp_path / "source"
+    source_workspace.mkdir()
+    clone_workspace = tmp_path / "clone"
+    clone_workspace.mkdir()
+    source_uuid = "11111111-1111-1111-1111-111111111111"
+    source_path = (
+        projects_dir
+        / claude_native._sanitize_claude_project_name(str(source_workspace.resolve()))
+        / f"{source_uuid}.jsonl"
+    )
+    source_path.parent.mkdir(parents=True)
+    turn = {
+        "type": "user",
+        "cwd": str(source_workspace.resolve()),
+        "sessionId": source_uuid,
+        "uuid": "u1",
+        "parentUuid": None,
+    }
+    cost_state = claude_native._claude_cost_state_record(source_uuid, 2.5)
+    source_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in (turn, cost_state)), encoding="utf-8"
+    )
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
+
+    clone = claude_native._clone_claude_transcript(
+        source_external_session_id=source_uuid,
+        target_external_session_id="22222222-2222-2222-2222-222222222222",
+        clone_workspace=clone_workspace.resolve(),
+    )
+    moved = tmp_path / "moved.jsonl"
+    claude_native._copy_transcript_with_cwd(source=source_path, target=moved, current=tmp_path)
+
+    assert clone is not None
+    cloned_types = [json.loads(line)["type"] for line in clone.read_text().splitlines()]
+    assert cloned_types == ["user"]
+    moved_records = [json.loads(line) for line in moved.read_text().splitlines()]
+    assert moved_records[-1] == cost_state
 
 
 def test_clone_claude_transcript_repairs_stale_image_duplication(
