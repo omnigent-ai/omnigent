@@ -18,6 +18,7 @@ import {
 import { occurrenceRanges } from "@/components/ui/quick-pick/match";
 import { usePaletteCommandsStore } from "@/store/paletteCommands";
 import { useAppCommands } from "./appCommands";
+import { useQuickPickAppCommands } from "./quickPickAppCommands";
 import type { CommandPaletteProps } from "./CommandPalette";
 import {
   type CommandRegion,
@@ -92,12 +93,16 @@ export function QuickPickCommandPalette({
   const region = useCommandRegion(open);
   const readRegion = useCommandRegionReader();
   const targetKey = commandTargetKey(context, region);
+  const appCommands = useQuickPickAppCommands();
+  // Every registry row: the app's own, ungrouped, then each feature's under its heading.
   const commandItems = useMemo(
-    () => paletteCommandItems([], featureGroups, targetKey),
-    [featureGroups, targetKey],
+    () => paletteCommandItems(appCommands, featureGroups, targetKey),
+    [appCommands, featureGroups, targetKey],
   );
   const latestContext = useRef(context);
   latestContext.current = context;
+  const latestAppCommands = useRef(appCommands);
+  latestAppCommands.current = appCommands;
   /** The command row `itemId` offers now for `rowTargetKey`, with focus in `inRegion`. */
   const commandFor = (
     itemId: string,
@@ -105,7 +110,7 @@ export function QuickPickCommandPalette({
     inRegion: CommandRegion | null = readRegion(),
   ) =>
     currentPaletteCommand(itemId, rowTargetKey, {
-      appCommands: [],
+      appCommands: latestAppCommands.current,
       featureGroups: usePaletteCommandsStore.getState().groups,
       targetKey: commandTargetKey(latestContext.current, inRegion),
     });
@@ -219,17 +224,27 @@ export function QuickPickCommandPalette({
       fuzzyMatching: "words",
       items: sessionsOnly
         ? []
-        : actions.map((action) => ({
-            id: `action:${action.id}`,
-            label: action.label,
-            keywords: action.keywords,
-            group: "Actions",
-            // A command is a short name; a quiet underline marks the words the query hit.
-            matchHighlight: "underline",
-            icon: <action.icon />,
-            shortcut: action.shortcut,
-            value: { kind: "action", action },
-          })),
+        : [
+            ...actions.map((action): QuickPickItem<PaletteRow> => ({
+              id: `action:${action.id}`,
+              label: action.label,
+              keywords: action.keywords,
+              group: "Actions",
+              // A command is a short name; a quiet underline marks the words the query hit.
+              matchHighlight: "underline",
+              icon: <action.icon />,
+              shortcut: action.shortcut,
+              value: { kind: "action", action },
+            })),
+            // The app's registry commands join its other actions.
+            ...commandItems
+              .filter((item) => item.group === undefined)
+              .map((item): QuickPickItem<PaletteRow> => ({
+                ...item,
+                group: "Actions",
+                matchHighlight: "underline",
+              })),
+          ],
     },
     {
       sourceId: "features",
@@ -237,7 +252,9 @@ export function QuickPickCommandPalette({
       fuzzyMatching: "words",
       items: sessionsOnly
         ? []
-        : commandItems.map((item) => ({ ...item, matchHighlight: "underline" })),
+        : commandItems
+            .filter((item) => item.group !== undefined)
+            .map((item) => ({ ...item, matchHighlight: "underline" })),
     },
   ];
   const segments: QuickPickSegment<PaletteRow>[] = pageItems
