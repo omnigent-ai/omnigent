@@ -172,6 +172,9 @@ def test_right_panel_terminals_and_file_viewer(
         rail.get_by_role("button", name="Close zsh · main", exact=True).click()
         page.get_by_role("button", name="Close shell").click()
         expect(terminal_view).to_have_count(0)
+        # The tab leaves, and the rail hides, once the kill returns; wait for that
+        # before reopening it.
+        expect(page.get_by_role("button", name="Expand right panel")).to_be_visible(timeout=30_000)
         open_right_rail(page)
 
         # Switch to the Files tab and open the seeded file. The

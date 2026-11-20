@@ -107,6 +107,47 @@ describe("WorkspaceTabsScroller compact mode", () => {
     return <span data-testid="probe">{useCompactWorkspaceTabs() ? "icons" : "labels"}</span>;
   }
 
+  it("keeps the selected tab in view once tabs switch to icons", () => {
+    // A 100px strip whose selected middle tab sits at 400px with labels and 150px as an icon.
+    let scrollLeft = 0;
+    const isViewport = (element: Element) => element.hasAttribute("data-workspace-tabs-viewport");
+    vi.spyOn(Element.prototype, "scrollLeft", "get").mockImplementation(function (this: Element) {
+      return isViewport(this) ? scrollLeft : 0;
+    });
+    vi.spyOn(Element.prototype, "scrollLeft", "set").mockImplementation(function (
+      this: Element,
+      value: number,
+    ) {
+      if (isViewport(this)) scrollLeft = value;
+    });
+    vi.spyOn(Element.prototype, "clientWidth", "get").mockImplementation(function (this: Element) {
+      return isViewport(this) ? 100 : 0;
+    });
+    vi.spyOn(Element.prototype, "scrollWidth", "get").mockImplementation(function (this: Element) {
+      return this.parentElement && isViewport(this.parentElement) ? 600 : 0;
+    });
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (
+      this: Element,
+    ) {
+      if (isViewport(this)) return rect(0, 100);
+      if (this.getAttribute("aria-current") !== "true") return rect(0, 0);
+      return this.closest("[data-compact]")
+        ? rect(150 - scrollLeft, 30)
+        : rect(400 - scrollLeft, 60);
+    });
+
+    render(
+      <WorkspaceTabsScroller tabCount={12}>
+        <span aria-current="true">selected</span>
+      </WorkspaceTabsScroller>,
+    );
+
+    const box = screen.getByText("selected").getBoundingClientRect();
+    expect(document.querySelector("[data-compact]")).not.toBeNull();
+    expect(box.left).toBeGreaterThanOrEqual(0);
+    expect(box.right).toBeLessThanOrEqual(100);
+  });
+
   it("compacts crowded tabs, restores labels when they fit, and remeasures on a tab change", () => {
     const resizeCallbacks: ResizeObserverCallback[] = [];
     vi.stubGlobal(

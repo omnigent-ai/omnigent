@@ -82,7 +82,8 @@ with their own terminal retain the switcher.
   terminal stays open. Cmd/Ctrl+Shift+W closes the window.
 - Right-click any open workspace tab, or open the rail's panel picker (⌄), and
   choose Close other tabs or Close all tabs. Shells in the batch close together
-  after one confirmation ("Close N shells?"); cancelling keeps them open.
+  after one confirmation ("Close N shells?"). The batch's other tabs close
+  right away, so cancelling keeps only the shells open.
   Closing the last open tab yourself hides the rail; tabs the agent closes
   leave it open.
 

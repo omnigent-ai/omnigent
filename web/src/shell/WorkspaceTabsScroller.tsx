@@ -55,6 +55,13 @@ export function scrollTabIntoView(tab: HTMLElement | null): void {
   }
 }
 
+/** Scrolls the strip to show the selected tab inside `content`, if any. */
+function revealActiveTab(content: HTMLElement | null): void {
+  scrollTabIntoView(
+    content?.querySelector<HTMLElement>('[aria-current="true"], [aria-selected="true"]') ?? null,
+  );
+}
+
 /**
  * Scroll open tabs horizontally with a hidden scrollbar. When their labels overflow the
  * strip, tabs switch to icons only (see {@link useCompactWorkspaceTabs}).
@@ -101,6 +108,8 @@ export function WorkspaceTabsScroller({
       }
     }
     fitRef.current();
+    // Switching between labels and icons moves every tab; keep the selected one in view.
+    revealActiveTab(contentRef.current);
   }, [tabCount, compact]);
 
   useEffect(() => {
@@ -121,9 +130,7 @@ export function WorkspaceTabsScroller({
     // Keep the active tab in view as the rail or tab list resizes.
     const observer = new ResizeObserver(() => {
       fitRef.current();
-      scrollTabIntoView(
-        content.querySelector<HTMLElement>('[aria-current="true"], [aria-selected="true"]'),
-      );
+      revealActiveTab(content);
     });
     observer.observe(viewport);
     observer.observe(content);
