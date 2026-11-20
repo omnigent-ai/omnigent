@@ -7383,6 +7383,19 @@ describe("AppShell desktop Close", () => {
     resetDesktopCommandsForTests();
   });
 
+  it("starts a popped-out session window with the sidebar collapsed but reopenable", () => {
+    document.documentElement.dataset.sessionWindow = "true";
+    try {
+      mockConversations([{ id: "conv_popped", permission_level: null }]);
+      renderShell("/c/conv_popped");
+      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+      fireEvent.click(screen.getByRole("button", { name: /open sidebar/i }));
+      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+    } finally {
+      delete document.documentElement.dataset.sessionWindow;
+    }
+  });
+
   it("opens New Terminal over an open file only once its viewer allows it", () => {
     const createShell = vi.fn();
     vi.mocked(useCreateTerminal).mockReturnValue({

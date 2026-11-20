@@ -55,6 +55,7 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import {
+  AppWindowIcon,
   ArchiveIcon,
   BellIcon,
   BellOffIcon,
@@ -256,6 +257,7 @@ import { collectUnreadInboxItems } from "@/lib/inbox";
 import { cn } from "@/lib/utils";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { isDesktopLayout, useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useOpenSessionWindow } from "@/hooks/useOpenSessionWindow";
 import {
   isSideBySideSidebarViewport,
   useIsSideBySideSidebarViewport,
@@ -5239,6 +5241,7 @@ export function ConversationMenuItems({
   // to the side. `view` swaps between the main actions and that sub-view;
   // desktop always renders the native side-flyout submenu regardless.
   const isMobile = useIsMobileViewport();
+  const openSessionWindow = useOpenSessionWindow();
   const { trackClick } = useOmnigentAnalytics();
   const [view, setView] = useState<"main" | "move" | "projects" | "nests">("main");
 
@@ -5352,6 +5355,16 @@ export function ConversationMenuItems({
             ))}
           </C.SubContent>
         </C.Sub>
+      )}
+      {openSessionWindow && (
+        <C.Item
+          className="mobile-touch-target"
+          data-testid="open-session-window"
+          onSelect={() => openSessionWindow(conversation.id)}
+        >
+          <AppWindowIcon className="size-3.5" />
+          Open in new window
+        </C.Item>
       )}
       {/* Desktop pins from the hover button unless Settings hides it; archived
           rows omit Pin (archive outranks pin). */}
