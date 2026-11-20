@@ -11,7 +11,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { renderHook, waitFor } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
   useWorkspaceChangedFiles: vi.fn(),
@@ -327,6 +327,23 @@ describe("fetchFileDiff", () => {
       "/v1/sessions/conv_1/resources/environments/default/diff/src/a.ts",
     );
     expect((init as RequestInit | undefined)?.signal).toBe(controller.signal);
+  });
+
+  it("stamps a diff with when its request started, not when it arrived", async () => {
+    let answer: (response: Response) => void = () => {};
+    fetchMock.mockReturnValue(
+      new Promise<Response>((resolve) => {
+        answer = resolve;
+      }),
+    );
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    onTestFinished(() => now.mockRestore());
+    const reading = fetchFileDiff("conv_1", "a.ts");
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    now.mockReturnValue(5_000);
+    answer(mockResponse({ path: "a.ts", before: "old", after: "new" }));
+
+    expect((await reading).requestedAt).toBe(1_000);
   });
 
   it("keys every diff surface's cache the same way", () => {
