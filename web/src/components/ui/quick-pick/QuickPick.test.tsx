@@ -773,3 +773,76 @@ describe("QuickPick sidebar presentation", () => {
     expect(onKeyDown).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("QuickPick cards", () => {
+  const apps: QuickPickSegment<string> = {
+    sourceId: "apps",
+    ranking: "client",
+    fuzzyMatching: "words",
+    items: [
+      item("terminal", {
+        label: "Terminal",
+        group: "Apps",
+        layout: "card",
+        description: "Run commands in zsh",
+        shortcut: ["⌘", "⌥", "T"],
+      }),
+      item("files", { label: "Files", group: "Apps", layout: "card", description: "Browse files" }),
+      item("changes", {
+        label: "Changes",
+        group: "Apps",
+        layout: "card",
+        disabledReason: "Nothing changed yet",
+      }),
+      item("browser", { label: "Browser", group: "More" }),
+    ],
+  };
+  /** Each option's label, and whether it shows as a card inside the card grid. */
+  const layouts = () =>
+    screen
+      .getAllByRole("option")
+      .map((option) => [
+        option.querySelector("[data-slot=quick-pick-label]")?.textContent,
+        option.dataset.layout === "card" && option.closest("[data-slot=quick-pick-cards]") !== null,
+      ]);
+
+  it("shows card items in a grid, with their hint and shortcut, and other rows as a list", () => {
+    renderPicker({ segments: [apps] });
+    expect(layouts()).toEqual([
+      ["Terminal", true],
+      ["Files", true],
+      ["Changes", true],
+      ["Browser", false],
+    ]);
+    // The cards stay in their group, which is named by its heading.
+    const [appsGroup] = screen.getAllByRole("group");
+    expect(within(appsGroup!).getAllByRole("option")).toHaveLength(3);
+    const terminal = screen.getByRole("option", { name: /Terminal/ });
+    expect(terminal).toHaveTextContent("Run commands in zsh");
+    expect(terminal.querySelector("[data-slot=shortcut-keys]")).not.toBeNull();
+    // A disabled card says why in place of its hint.
+    expect(screen.getByRole("option", { name: /Changes/ })).toHaveTextContent(
+      "Nothing changed yet",
+    );
+  });
+
+  it("moves through cards and rows in reading order, skipping a disabled card, and accepts with Enter", () => {
+    const { input, onAccept } = renderPicker({ segments: [apps] });
+    expect(activeOption(input)).toHaveTextContent("Terminal");
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    expect(activeOption(input)).toHaveTextContent("Files");
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    expect(activeOption(input)).toHaveTextContent("Browser");
+    fireEvent.keyDown(input, { key: "ArrowUp" });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onAccept).toHaveBeenLastCalledWith(expect.objectContaining({ id: "files" }), {
+      alternate: false,
+    });
+  });
+
+  it("shows cards as ranked list rows while there's a query", () => {
+    const { input } = renderPicker({ segments: [apps] });
+    fireEvent.change(input, { target: { value: "files" } });
+    expect(layouts()).toEqual([["Files", false]]);
+  });
+});

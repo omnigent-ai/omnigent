@@ -1,5 +1,5 @@
-// The page an empty workspace tab shows: the workspace's apps in a filterable,
-// keyboard-driven list. Picking one turns the tab into that app; the tab store
+// The page an empty workspace tab shows: the workspace's apps as cards over a
+// filterable, keyboard-driven list. Picking one turns the tab into that app; the tab store
 // decides how (show a place, or run a command such as starting a shell). The
 // shell chooser is part of the tab's place (`omnigent://new?app=terminal`), so
 // links, restore and Back can open it, and opening it updates the tab.
@@ -145,7 +145,7 @@ function toItem(
     ...(shortcut ? { shortcut } : {}),
     ...(entry.disabledReason ? { disabledReason: entry.disabledReason } : {}),
     ...(grouped && CARD_APPS.includes(entry.id)
-      ? { group: "Apps", description: appHint(entry, sandbox) }
+      ? { group: "Apps", layout: "card" as const, description: appHint(entry, sandbox) }
       : grouped
         ? { group: "More" }
         : {}),

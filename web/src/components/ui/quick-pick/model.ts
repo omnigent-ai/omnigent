@@ -44,6 +44,11 @@ export interface QuickPickItem<Value = unknown> {
    * a word from that title doesn't push the matching sessions down. Defaults to true.
    */
   leadsSources?: boolean;
+  /**
+   * `card`, without a query, shows the item as a card (icon, label and shortcut, then the
+   * description as a hint), two to a line when there's room; with a query it's a plain row.
+   */
+  layout?: "card";
   value: Value;
 }
 
