@@ -25,7 +25,7 @@ function AgentFlyoutBody({ agent }: { agent: AvailableAgent }) {
 
 /**
  * Cursor-style hover flyout for one catalog agent, for use OUTSIDE a
- * dropdown menu (e.g. the agent cards in AddAgentDialog).
+ * dropdown menu (e.g. a non-compact AgentCard).
  *
  * Wraps an arbitrary trigger so hovering it opens a flyout to the
  * right with the agent's ``display_name`` (bold) and ``description``.

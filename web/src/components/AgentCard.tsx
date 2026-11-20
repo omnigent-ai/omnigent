@@ -70,8 +70,7 @@ export function iconForAgent(
 /**
  * Selectable card for one available agent.
  *
- * Shared by the new-session picker (NewChatDialog) and the "Add agent"
- * picker (AddAgentDialog) so both render the agent catalog identically.
+ * Renders one entry of the agent catalog.
  * Claude, Codex, and pi agents reuse their own glyphs; qwen falls back
  * to a generic bot icon for now. Nessie matches by name. Everything else
  * falls back to a generic bot icon.
