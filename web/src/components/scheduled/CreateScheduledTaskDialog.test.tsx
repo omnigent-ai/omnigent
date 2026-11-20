@@ -1485,6 +1485,22 @@ describe("CreateScheduledTaskDialog edit mode", () => {
 });
 
 describe("CreateScheduledTaskDialog edit mode for agent-written rules", () => {
+  it("opens a lower-case rule with COUNT first under Ends and keeps it on save", async () => {
+    const rrule = "rrule:count=3;freq=daily;byhour=9;byminute=0";
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ rrule })}
+      />,
+    );
+    expect(screen.getByTestId("task-ending-trigger")).toHaveTextContent("After 3 occurrences");
+    fireEvent.change(screen.getByLabelText("Automation title"), { target: { value: "Renamed" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input.rrule).toBe(rrule);
+  });
+
   it("opens a rule the visual controls can't show as RRULE text and keeps it on save", async () => {
     // Reordered, lower-case and zero-padded, so a rebuilt rule would differ byte for byte.
     const rrule = "byminute=00;FREQ=WEEKLY;BYHOUR=09,10,11,12,13,14,15,16,17;byday=MO,TU,WE,TH,FR";
@@ -6116,6 +6132,9 @@ describe("scheduler capabilities", () => {
           .getAllByRole("radio")
           .map((option) => option.textContent),
       ).toEqual(["Every hour", "Every day", "Every weekday", "Every week"]);
+      expect(screen.getByRole("tab", { name: "RRULE" })).toBeDisabled();
+      await userEvent.click(screen.getByRole("tab", { name: "RRULE" }));
+      expect(screen.queryByLabelText("RRULE string")).not.toBeInTheDocument();
       selectSchedulePreset("Every hour");
       openTopLevelPopover("task-ending-trigger");
       expect(

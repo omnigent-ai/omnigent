@@ -108,7 +108,8 @@ export function buildRecurringRule(model: ScheduleModel): string {
  * UNTIL, e.g. a one-time `COUNT=1`.
  */
 export function parseRRuleToScheduleModel(rrule: string): ScheduleModel | null {
-  const parts = parseRuleParts(rrule);
+  // The server accepts any case, a lower-case prefix and surrounding spaces.
+  const parts = parseRuleParts(normalizeRuleText(rrule));
   if (parts === null) return null;
   const end = parseEnd(parts);
   if (end === null) return null;

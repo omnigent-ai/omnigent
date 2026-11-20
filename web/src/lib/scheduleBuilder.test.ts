@@ -145,6 +145,30 @@ describe("parseRRuleToScheduleModel", () => {
   });
 
   it.each([
+    [
+      "rrule:count=3;freq=daily;byhour=9;byminute=0",
+      { preset: "daily", hour: 9, end: { type: "count", count: 3 } },
+    ],
+    [
+      "  RRULE:FREQ=WEEKLY;BYDAY=MO;BYHOUR=8;BYMINUTE=30  ",
+      { preset: "weekly", weekdays: ["MO"], hour: 8, minute: 30 },
+    ],
+    [
+      " freq=monthly;byday=1mo;byhour=9;byminute=0;until=20271231T155959Z ",
+      {
+        customFreq: "rule",
+        rule: "FREQ=MONTHLY;BYDAY=1MO;BYHOUR=9;BYMINUTE=0",
+        end: { type: "until", until: "20271231T155959Z" },
+      },
+    ],
+  ] as [string, Partial<ScheduleModel>][])(
+    "reads a stored rule in any case, prefix and spacing: %j",
+    (rule, expected) => {
+      expect(parseRRuleToScheduleModel(rule)).toMatchObject(expected);
+    },
+  );
+
+  it.each([
     "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;COUNT=1",
     "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;BYHOUR=10",
     "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;COUNT=3;UNTIL=20271231T155959Z",
