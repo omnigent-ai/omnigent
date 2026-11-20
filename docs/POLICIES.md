@@ -72,10 +72,14 @@ After starting, you can also add or remove policies at runtime through the REST 
 The upload, copy, and fork routes apply additional server settings to files
 delivered through the harness's filesystem tools: by default `.zip`, `.docx`,
 `.xlsx`, `.pptx`, `.db`, `.sqlite`, `.sqlite3`, and `.mp4` files. These files require
-Claude Code or Codex and an updated execution host/runner that supports their
-delivery and restoration. They are stored without extraction; the harness
+an updated execution host/runner and a supported native coding agent for their
+delivery. They are stored without extraction; the harness
 reads a local copy outside the working checkout. See
 [attached files and sandbox access](DATA_DIR_LAYOUT.md#attached-files).
+
+Supported agents are Claude Code, Codex, Pi, Cursor, Kiro, Goose, Antigravity,
+Qwen Code, Kimi, Hermes, and Devin. OpenCode and API/SDK harnesses do not support
+filesystem attachments. Forking sent file history requires Claude Code or Codex.
 
 | Server config key | Default | Scope |
 |-------------------|---------|-------|
@@ -91,8 +95,8 @@ reads a local copy outside the working checkout. See
   Files match on their last extension, so list `.gz` for `.tar.gz` files; a
   compound entry such as `.tar.gz` is skipped with a warning.
   A listed text or image type, such as `.log` or `.png`, is delivered as a file,
-  with its original bytes, instead of inline. It then needs a Claude Code or
-  Codex session, like any other file delivered as a file.
+  with its original bytes, instead of inline. It then needs a supported native
+  coding-agent session, like any other file delivered as a file.
   A default extension left off the list is refused, even when the browser
   labels it as text.
 - `[]`, which turns filesystem attachments off.
