@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 
 from omnigent.harnesses.claude_native import main as claude_native
+from omnigent.onboarding.ambient import CLAUDE_CODE_MANAGED_SETTINGS_PATHS
 from omnigent.runner.native.orchestration import _claude_terminal_env_unset
 from tests.server.integration.mock_llm_server import anthropic_sse_text_response
 
@@ -106,6 +107,10 @@ def _gateway_launch(
     assert config is not None and config.api_key_helper and config.model
 
     # advisorModel is what /advisor persists; the env flag stands in for the rollout flag.
+    if any(
+        path.is_file() and path.read_text().strip() for path in CLAUDE_CODE_MANAGED_SETTINGS_PATHS
+    ):
+        pytest.skip("requires clean system config so machine policy cannot reroute test calls")
     config_dir = tmp_path / "claude-config"
     config_dir.mkdir()
     (config_dir / "settings.json").write_text(

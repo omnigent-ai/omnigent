@@ -1893,6 +1893,7 @@ class TestResolveGatewayEnv(unittest.TestCase):
             env = _resolve_gateway_env()
         self.assertEqual(env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"], "1")
         self.assertNotIn("CLAUDE_CODE_USE_GATEWAY", env)
+        self.assertNotIn("CLAUDE_CODE_DISABLE_ADVISOR_TOOL", env)
 
     def test_strips_trailing_slash(self):
         from omnigent.inner.claude_sdk_executor import _resolve_gateway_env
@@ -2006,6 +2007,7 @@ class TestResolveGatewayEnv(unittest.TestCase):
                 "Databricks-Custom-Client-Surfaces: omnigent-web",
             ],
         )
+        self.assertEqual(env["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"], "1")
 
     def test_host_override_requires_base_url(self):
         from omnigent.inner.claude_sdk_executor import _resolve_gateway_env
