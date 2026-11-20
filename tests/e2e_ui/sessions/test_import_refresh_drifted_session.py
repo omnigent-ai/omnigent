@@ -24,7 +24,7 @@ from playwright.sync_api import Page, expect
 from tests._helpers.host import Host, isolated_host
 from tests.e2e_ui.conftest import configure_mock_llm
 
-pytestmark = pytest.mark.min_server_version("0.20.0")
+pytestmark = pytest.mark.min_server_version("0.24.0")
 
 _CLAUDE_MODEL = "claude-sonnet-4-20250514"
 
