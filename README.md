@@ -355,13 +355,13 @@ fences later admission and withdraws only its dispatch claim. A response
 acknowledges admission, not completion of the receiver or model.
 
 Before the native command starts, a resource guard holds its input leases and
-inherits them into the consumer. Sandboxed launchers acquire those leases after
-containment. The controller releases preparation ownership after that handoff;
-a detached consumer keeps its own kernel-held protection through termination.
-A private manifest also keeps finalized settings available during terminal
-cleanup and orphan reaping. Pending deletion fences new requests and attachments,
-and maintenance retires unused generations and finishes eligible deletions while
-the runner remains alive.
+passes them to the selected command. Sandboxed launchers acquire those leases
+after containment. Arbitrary wrappers can close inherited descriptors or leave
+descendants, so released locks and guard exit do not establish that all consumers
+have finished. Terminal cleanup preserves an independent uncertainty claim and
+its private settings; orphan reaping retains those records without a polling
+thread. Pending deletion fences new requests and attachments. Maintenance still
+retires generations with no terminal claims after their request readers release.
 
 The dedicated route is probed before dispatch, so an older server or runner can
 fall back without consuming a v2 request. A dispatched v2 request is never
@@ -370,22 +370,23 @@ historical single settings file and argument precedence without allocating
 new untracked generations. Caller-settings composition requires the fenced
 path. Existing bundles and registration continue to work without migration.
 
-Older v1 records and historical untracked generations retain their conservative
-ownership rules. A crash-left v1 dispatch or terminal claim can still retain
-files indefinitely. Before reclaiming them, the operator must identify their
-bridge, session, generation and peer versions, and establish that every possible
-consumer has finished, including in-flight receivers and detached terminals.
-Prefer normal owner release and retain completion evidence without copying
-credential-bearing settings. Age, controller PID death and released controller
-locks alone do not establish reclaimability for those older records.
+Terminal claims in new v2 generations, older v1 records and historical untracked
+generations retain conservative ownership rules. Terminal preparation, shutdown
+or a crash can leave files indefinitely, including after the direct child exits.
+Before reclaiming them, the operator must identify their bridge, session,
+generation and peer versions and establish that every possible consumer has
+finished, including in-flight receivers and detached terminals. Retain completion
+evidence without copying credential-bearing settings. Age, controller PID death,
+guard exit and released file locks alone do not establish reclaimability.
 
 Disk lifecycle schema 2 is unchanged. New per-generation request records carry
 v2 ownership bindings; older readers refuse those bindings, and v2 consumers
 verify their exact bridge, request, lease and terminal claim identities. Unknown
 or replaced resources, future formats and unsafe metadata remain protected.
 Explicit bridge preparation can repair damaged supported lifecycle metadata
-while retaining owned resources and fencing stale admissions. Historical claim
-reconciliation remains separate from the fully fenced path for new launches.
+while retaining owned resources and fencing stale admissions. Automatic
+reconciliation of uncertain terminal completion remains unfinished for both
+historical and new records.
 
 </details>
 

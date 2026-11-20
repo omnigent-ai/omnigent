@@ -1,4 +1,4 @@
-"""Kernel-held resource leases for a terminal command and its consumer process."""
+"""Protect terminal inputs without inferring completion from an opaque wrapper."""
 
 from __future__ import annotations
 
@@ -134,6 +134,10 @@ def _unused_manifest_leases(directory: Path, descriptors: list[int]) -> bool:
     import fcntl
 
     for lease in leases:
+        if os.path.lexists(lease.claim) or os.path.lexists(
+            lease.claim.with_suffix(".unconfirmed.owner")
+        ):
+            raise ValueError("Process resource consumer completion is unconfirmed")
         try:
             fd = os.open(lease.path, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
         except FileNotFoundError:
@@ -151,7 +155,7 @@ def _unused_manifest_leases(directory: Path, descriptors: list[int]) -> bool:
 
 @contextlib.contextmanager
 def finish_process_leases(directory: Path) -> Iterator[bool | None]:
-    """Fence late joins while deleting terminal files; preserve unknown manifests."""
+    """Fence late joins and preserve files with unconfirmed consumer completion."""
     descriptors: list[int] = []
     try:
         try:
@@ -204,7 +208,7 @@ def hold_process_leases(encoded: str | None) -> Iterator[tuple[int, ...]]:
 
 
 def run_guard(encoded: str, command: Sequence[str]) -> int:
-    """Retain the lease through target completion and inherit it into that target."""
+    """Hold the guard's leases and pass them to the selected command."""
     with hold_process_leases(encoded) as descriptors:
         process = subprocess.Popen(command, pass_fds=descriptors)
         previous = {}

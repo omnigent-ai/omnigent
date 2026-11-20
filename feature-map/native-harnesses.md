@@ -1584,7 +1584,7 @@ the message arrives as a new turn about 15 minutes later, and that
 - For user/project defaults and startup-argument precedence, use
   [Preferences and config defaults](./preferences.md). The read-only Startup
   configuration and plugin inventory do not expose shared-preference controls.
-- Claude settings left by legacy launches or uncertain ownership need host
+- Claude settings left by legacy or new launches with uncertain completion need host
   operator investigation. A deleted session, old file, dead runner or free lock
   does not prove that a detached terminal stopped using its settings. See
   caller-settings recovery ownership and limitations in the [README](../README.md).

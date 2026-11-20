@@ -482,9 +482,11 @@ async def test_cli_settings_request_is_released_after_acknowledgement(
         for close in terminal_closers:
             close()
     if reactivated:
-        assert not list(bridge_dir.glob("*.terminal-*.owner"))
+        claims = list(bridge_dir.glob("*.terminal-*.owner"))
+        assert len(claims) == 1 and claims[0].name.endswith(".unconfirmed.owner")
         assert prune_unused_claude_settings(bridge_dir) == 0
-        assert not list(bridge_dir.glob("claude-settings-*"))
+        assert (bridge_dir / f"claude-settings-{generation}.json").exists()
+        assert lifecycle_path.read_bytes() == reactivated_lifecycle
 
 
 @pytest.mark.parametrize("phase", ["create", "dispatch", "acknowledge", "undelivered", "close"])

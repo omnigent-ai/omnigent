@@ -1822,7 +1822,9 @@ async def test_auto_create_claude_terminal_hands_off_before_cancelled_sender_rel
         stop_turn.assert_awaited_once_with(session_id, turn_router)
         await asyncio.to_thread(callbacks[0])
         assert retained[0]._fd is None
-        assert not list(request.bridge_dir.glob("claude-settings-*"))
+        assert baseline.read_bytes() == baseline_bytes
+        claims = list(request.bridge_dir.glob("*.terminal-*.owner"))
+        assert len(claims) == 1 and claims[0].name.endswith(".unconfirmed.owner")
         registry.launch_required_terminal.assert_awaited_once()
     finally:
         release_close.set()

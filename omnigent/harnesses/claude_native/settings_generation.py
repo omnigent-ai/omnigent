@@ -30,7 +30,6 @@ _logger = logging.getLogger(__name__)
 _GENERATION = re.compile(r"[0-9a-f]{32}")
 _REQUEST_FILE = re.compile(r"claude-settings-([0-9a-f]{32})\.request\.lock")
 _OWNERSHIP_LOCK = re.compile(r"claude-settings-[0-9a-f]{32}\.(?:request|lease)\.lock")
-_TERMINAL_CLAIM = re.compile(r"claude-settings-[0-9a-f]{32}\.terminal-[0-9a-f]{32}\.owner")
 _LIFECYCLE_FILE = ".claude-settings-lifecycle.json"
 CLAUDE_SETTINGS_REQUEST_PROTOCOL = 1
 CLAUDE_SETTINGS_FENCED_REQUEST_PROTOCOL = 2
@@ -415,6 +414,7 @@ def _remove_fenced_claim(path: Path, binding: _FencedSettingsBinding, kind: str)
 
 
 def _prune_fenced_claims(bridge_dir: Path, generation: str) -> None:
+    """Withdraw unused senders without inferring opaque terminal completion."""
     try:
         if _read_lifecycle(bridge_dir) is None:
             return
@@ -427,11 +427,6 @@ def _prune_fenced_claims(bridge_dir: Path, generation: str) -> None:
     with _unused(baseline.with_suffix(".request.lock")) as unused:
         if unused:
             _remove_fenced_claim(baseline.with_suffix(".dispatch.owner"), binding, "dispatch")
-    for path in bridge_dir.glob(f"claude-settings-{generation}.terminal-*.owner"):
-        if _TERMINAL_CLAIM.fullmatch(path.name):
-            with contextlib.suppress(OSError, ValueError), _unused(path) as unused:
-                if unused:
-                    _remove_fenced_claim(path, binding, "terminal")
 
 
 def _release(fd: int | None) -> None:
@@ -750,7 +745,7 @@ class ClaudeSettingsLease:
             )
 
     def close(self) -> None:
-        """Release this owner and retire files only after every owner has released."""
+        """Release this owner while retaining unconfirmed terminal consumption."""
         with self._close_lock:
             fd, self._fd = self._fd, None
         if fd is None:
@@ -765,6 +760,19 @@ class ClaudeSettingsLease:
                         or not _file_matches_fd(self._terminal_claim, self._claim_fd)
                     ):
                         return
+                    if self._fenced_binding is not None:
+                        uncertain = self._terminal_claim.with_suffix(".unconfirmed.owner")
+                        try:
+                            uncertain_fd = _open_lock(uncertain, create=True)
+                        except FileExistsError:
+                            pass
+                        else:
+                            with os.fdopen(uncertain_fd, "wb") as stream:
+                                stream.write(
+                                    self._fenced_binding.encode(
+                                        terminal=_fd_identity(self._claim_fd)
+                                    )
+                                )
                     self._terminal_claim.unlink(missing_ok=True)
                     self._terminal_claim = None
                 lifecycle = _read_lifecycle(self.bridge_dir)

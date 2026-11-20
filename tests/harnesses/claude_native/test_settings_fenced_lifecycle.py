@@ -399,6 +399,7 @@ sys.stdin.read()
 _CONSUMER = """
 import json,os,sys
 from pathlib import Path
+os.closerange(3,256)
 path=Path(sys.argv[1])
 print(json.dumps({'pid':os.getpid(),'contents':path.read_text()}),flush=True)
 sys.stdin.readline()
@@ -407,8 +408,49 @@ sys.stdin.read()
 """
 
 
-@pytest.mark.parametrize("kill_guard", [False, True], ids=["guardian", "inherited-consumer"])
-def test_consumer_lease_survives_controller_and_guard_death_then_completes_deletion(
+@pytest.mark.parametrize("existing_uncertainty", [False, True])
+async def test_unconfirmed_consumer_completion_retains_generation_and_private_files(
+    bridge_dir: Path, tmp_path: Path, existing_uncertainty: bool
+) -> None:
+    private = tmp_path / "terminal"
+    private.mkdir()
+    instance = TerminalInstance(
+        name="claude", session_key="main", private_dir=private, socket_path=private / "tmux.sock"
+    )
+    request = ClaudeSettingsRequest.create(bridge_dir, protocol=2)
+    baseline = _populate(request)
+    contents = baseline.read_bytes()
+    with acquire_claude_settings_request(bridge_dir, request.generation, protocol=2) as receiver:
+        receiver.attach(instance)
+    encoded = process_lifetime.encode_process_leases(instance.process_lifetime_leases)
+    assert encoded is not None
+    process_lifetime.write_process_lease_manifest(private, encoded)
+    output = private / "settings.json"
+    output.write_bytes(contents)
+    uncertain = instance.process_lifetime_leases[0].claim.with_suffix(".unconfirmed.owner")
+    if existing_uncertainty:
+        uncertain.write_text("unrecognized completion record")
+    try:
+        with process_lifetime.hold_process_leases(encoded):
+            instance._release_process_lifetime_handoffs(ready_only=True)
+            request.close()
+        assert prune_unused_claude_settings(bridge_dir) == 0
+        assert baseline.read_bytes() == contents
+        assert has_live_claude_settings_owners(bridge_dir)
+        with process_lifetime.finish_process_leases(private) as unused:
+            assert unused is None
+        await instance.close()
+        assert output.read_bytes() == contents
+        assert instance._private_cleanup_thread is None
+        if existing_uncertainty:
+            assert uncertain.read_text() == "unrecognized completion record"
+    finally:
+        request.close()
+        await instance.close()
+
+
+@pytest.mark.parametrize("kill_guard", [False, True], ids=["guard-alive", "guard-killed"])
+def test_consumer_drops_inherited_leases_but_keeps_inputs_after_guard_and_controller_death(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kill_guard: bool
 ) -> None:
     controller = subprocess.Popen(
@@ -469,8 +511,9 @@ def test_consumer_lease_survives_controller_and_guard_death_then_completes_delet
         if not kill_guard:
             assert guard.wait(timeout=5) == 0
         consumer_pid = None
-        prune_unused_claude_settings(directory)
-        assert not directory.exists()
+        assert prune_unused_claude_settings(directory) == 0
+        assert baseline.read_text() == contents
+        assert has_live_claude_settings_owners(directory)
     finally:
         if consumer_pid is not None:
             with contextlib.suppress(ProcessLookupError):
@@ -501,7 +544,7 @@ async def test_late_terminal_guard_refuses_retired_operands_before_target_starts
             )
         await instance.close()
         assert private.exists() is not confirmed_close
-    assert not baseline.exists()
+    assert baseline.exists()
     marker = tmp_path / "target-started"
     result = subprocess.run(
         [
@@ -525,7 +568,7 @@ async def test_late_terminal_guard_refuses_retired_operands_before_target_starts
         await instance.close()
 
 
-async def test_live_controller_hands_ownership_to_consumer_without_retaining_finished_generation(
+async def test_live_controller_handoff_retains_unconfirmed_consumer_ownership(
     bridge_dir: Path, tmp_path: Path
 ) -> None:
     private = tmp_path / "terminal"
@@ -570,15 +613,16 @@ async def test_live_controller_hands_ownership_to_consumer_without_retaining_fin
         assert await asyncio.to_thread(transferred.wait, 5)
         request.close()
         assert baseline.exists()
-        assert not list(bridge_dir.glob("*.terminal-*.owner"))
+        claims = list(bridge_dir.glob("*.terminal-*.owner"))
+        assert len(claims) == 1 and claims[0].name.endswith(".unconfirmed.owner")
         assert prune_unused_claude_settings(bridge_dir) == 0
         guard.stdin.write("finish\n")
         guard.stdin.flush()
         read_json_line(guard.stdout, timeout_s=5)
         guard.stdin.close()
         assert guard.wait(timeout=5) == 0
-        assert prune_unused_claude_settings(bridge_dir) == 1
-        assert not baseline.exists()
+        assert prune_unused_claude_settings(bridge_dir) == 0
+        assert baseline.exists()
     finally:
         terminate_process(guard)
         request.close()
@@ -586,7 +630,7 @@ async def test_live_controller_hands_ownership_to_consumer_without_retaining_fin
 
 
 @pytest.mark.parametrize("cleanup", ["close", "orphan"])
-async def test_finalized_private_settings_survive_until_actual_consumer_exits(
+async def test_finalized_private_settings_survive_unconfirmed_consumer_completion(
     bridge_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleanup: str
 ) -> None:
     from omnigent.inner import terminal
@@ -649,13 +693,12 @@ async def test_finalized_private_settings_survive_until_actual_consumer_exits(
         guard.stdin.close()
         assert guard.wait(timeout=5) == 0
         if cleanup == "close":
-            assert instance._private_cleanup_thread is not None
-            await asyncio.to_thread(instance._private_cleanup_thread.join, 5)
+            assert instance._private_cleanup_thread is None
         else:
-            assert terminal.reap_orphaned_terminals() == 1
-        assert not private.exists()
-        prune_unused_claude_settings(bridge_dir)
-        assert not list(bridge_dir.glob("claude-settings-*"))
+            assert terminal.reap_orphaned_terminals() == 0
+        assert output.exists()
+        assert prune_unused_claude_settings(bridge_dir) == 0
+        assert list(bridge_dir.glob("claude-settings-*"))
     finally:
         terminate_process(guard)
         request.close()
