@@ -1967,7 +1967,7 @@ async def test_added_agent_and_independent_worker_inheritance(
     _set_native_parent(db_uri, source["id"], _CLAUDE_AUTO_PARENT)
     store = SqlAlchemyConversationStore(db_uri)
     worker_agent_id = await _upload_native_worker(auth_client)
-    # The Agents panel's Add agent dialog creates the child with a plain REST call.
+    # A REST client creates the child with a plain POST /v1/sessions call.
     response = await auth_client.post(
         "/v1/sessions",
         json={"agent_id": worker_agent_id, "parent_session_id": source["id"]},

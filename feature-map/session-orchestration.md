@@ -75,10 +75,12 @@ MCP independent creation.
   host. An automation that sets a mode gives it to its run's workers first (see
   `scheduled`), and a worker whose agent sets a mode keeps it. Coverage:
   `tests/e2e/test_nested_agent_permission_mode_e2e.py`.
-  Without one, a child (also one added from the Agents panel's Add agent) starts in
-  its Claude Code or Codex parent's current mode, mapped to its own harness (Claude
-  Code Auto ↔ Codex Approve for me), unless its agent spec or an automation sets a
-  mode. Approval-skipping, plan/read-only and default parent modes aren't passed on.
+  Without one, a child (also one created by `POST /v1/sessions` with
+  `parent_session_id`) starts in its Claude Code or Codex parent's current mode,
+  mapped to its own harness (Claude Code Auto ↔ Codex Approve for me), unless its
+  agent spec or an automation sets a mode. Approval-skipping, plan/read-only and
+  default parent modes aren't passed on, and neither is a Codex custom permission
+  profile. Codex's Ask for approval is a preset, so a Codex child gets it too.
   A `config_path` child gets the same, except an undeclared Codex or Cursor child
   keeps its headless full-bypass default. A named sub-agent (`sub_agent_name`) keeps
   the launch settings its sub-spec declares.
