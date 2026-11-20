@@ -9612,19 +9612,56 @@ def _confirm_background_host_alive(record: _HostDaemonRecord) -> None:
         time.sleep(0.1)
 
 
+# The daemon logs each failed tunnel attempt as "Host tunnel disconnected:
+# <reason>. Reconnecting in ..." (``omnigent.host.connect``); a reason can span lines.
+_TUNNEL_DISCONNECT_PREFIX = "Host tunnel disconnected: "
+_TUNNEL_DISCONNECT_SUFFIX = ". Reconnecting in "
+_SERVER_SIDE_TUNNEL_FAILURE_RE = re.compile(
+    r"server rejected WebSocket connection: HTTP 5\d\d|timed out during handshake"
+)
+
+
+def _background_host_log_tail(path: Path, max_bytes: int = 4096) -> str:
+    """Return the last *max_bytes* of a host log, or ``""`` if it cannot be read."""
+    try:
+        return path.read_bytes()[-max_bytes:].decode("utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+
+
 def _background_host_log_detail(log_path: str | None) -> str:
     """Return the host log path and a short failure tail."""
     if log_path is None:
         return ""
     path = Path(log_path)
     detail = f"\nHost log: {path}"
-    try:
-        tail = path.read_bytes()[-4096:].decode("utf-8", errors="replace").strip()
-    except OSError:
-        return detail
+    tail = _background_host_log_tail(path)
     if tail:
         detail += "\n--- host log tail ---\n" + "\n".join(tail.splitlines()[-12:])
     return detail
+
+
+def _server_side_tunnel_failure(log_path: str | None) -> str | None:
+    """Return the daemon's latest tunnel failure when the server side caused it.
+
+    :param log_path: The daemon's log file, or ``None``.
+    :returns: The failure, e.g. ``"server rejected WebSocket connection: HTTP
+        504"``, when the most recent tunnel attempt in the log got a 5xx
+        upgrade response or timed out during the handshake; otherwise ``None``.
+    """
+    if log_path is None:
+        return None
+    # Other loggers can push the latest tunnel attempt out of the displayed tail.
+    tail = _background_host_log_tail(Path(log_path), max_bytes=64 * 1024)
+    start = tail.rfind(_TUNNEL_DISCONNECT_PREFIX)
+    if start < 0:
+        return None
+    reason, found, _ = tail[start + len(_TUNNEL_DISCONNECT_PREFIX) :].partition(
+        _TUNNEL_DISCONNECT_SUFFIX
+    )
+    if found and _SERVER_SIDE_TUNNEL_FAILURE_RE.fullmatch(reason):
+        return reason
+    return None
 
 
 def _registration_target_display(record: _HostDaemonRecord) -> str:
@@ -9672,8 +9709,9 @@ def _background_registration_timeout(
     :param transport_error: Last probe transport failure, e.g.
         ``"ConnectError: [Errno 111] Connection refused"``.
     :returns: The exception to raise — an unreachable server is named
-        together with its transport failure instead of the generic
-        registration-timeout wording.
+        together with its transport failure, and a tunnel upgrade the server
+        side failed is named together with that failure, instead of the
+        generic registration-timeout wording.
     """
     from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR
 
@@ -9688,6 +9726,19 @@ def _background_registration_timeout(
         )
         # A server nothing answered at cannot be a stale-host HTTP 401
         # tunnel rejection, so the recovery hint would mislead here.
+        setattr(exc, SUPPRESS_RECOVERY_HINT_ATTR, True)
+        return exc
+    tunnel_failure = _server_side_tunnel_failure(record.log_path) if server_responded else None
+    if tunnel_failure is not None:
+        exc = click.ClickException(
+            "The host daemon started but could not open its tunnel to the server at "
+            f"{target} within {_BACKGROUND_HOST_REGISTRATION_GRACE_S:.0f}s. The server "
+            "answered HTTP requests, but the tunnel's WebSocket upgrade failed "
+            f"({tunnel_failure}). The server or a gateway in front of it is failing "
+            "WebSocket connections. Try again later, and contact the server's "
+            f"administrator if it persists.{log_detail}"
+        )
+        # Stale local host processes cannot cause a 5xx or an unanswered handshake.
         setattr(exc, SUPPRESS_RECOVERY_HINT_ATTR, True)
         return exc
     return click.ClickException(
