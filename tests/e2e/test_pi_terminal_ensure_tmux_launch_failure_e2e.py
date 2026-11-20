@@ -9,15 +9,14 @@ import io
 import os
 import re
 import subprocess
-import time
 import warnings
 from pathlib import Path
 
 import pytest
 
+from tests._helpers.polling import poll_until
 from tests.e2e._harness_probes import cli_unavailable_reason
 from tests.e2e._native_resume_helpers import cli_env, omnigent_console_script
-from tests.e2e.helpers import POLL_INTERVAL_S
 
 pexpect = pytest.importorskip("pexpect")
 
@@ -105,11 +104,19 @@ def _runner_log_text(data_dir: Path) -> str:
 
 
 def _wait_for_runner_log(data_dir: Path, needle: str, timeout_s: float) -> str:
-    deadline = time.monotonic() + timeout_s
-    text = _runner_log_text(data_dir)
-    while needle not in text and time.monotonic() < deadline:
-        time.sleep(POLL_INTERVAL_S)
+    text = ""
+
+    def observed() -> bool:
+        nonlocal text
         text = _runner_log_text(data_dir)
+        return needle in text
+
+    try:
+        poll_until(observed, timeout_s=timeout_s)
+    except AssertionError as exc:
+        raise AssertionError(
+            f"Runner log did not record {needle!r}. Log tail:\n{text[-2500:]}"
+        ) from exc
     return text
 
 
@@ -165,13 +172,17 @@ def test_pi_terminal_ensure_failure_keeps_tmux_diagnostic(tmp_path: Path) -> Non
             [rb"Pi terminal ensure failed", pexpect.EOF, pexpect.TIMEOUT],
             timeout=_JOURNEY_TIMEOUT_S,
         )
-        with contextlib.suppress(Exception):
-            child.expect(pexpect.EOF, timeout=15)
         cli_output = _plain_text(captured.getvalue())
         assert outcome == 0, (
             "`omnigent pi` with a launch-failing tmux never printed 'Pi terminal "
             f"ensure failed' within {_JOURNEY_TIMEOUT_S}s (outcome={outcome}). "
             f"CLI output tail:\n{cli_output[-2500:]}"
+        )
+        child.expect(pexpect.EOF, timeout=15)
+        child.close(force=False)
+        assert child.exitstatus is not None and child.exitstatus != 0, (
+            f"CLI did not exit unsuccessfully: exit={child.exitstatus}, "
+            f"signal={child.signalstatus}"
         )
 
         log_text = _wait_for_runner_log(

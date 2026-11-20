@@ -2694,8 +2694,7 @@ async def test_launch_failure_names_silent_exit_real_tmux(
         await instance.close()
 
     message = str(excinfo.value)
-    assert message.startswith("tmux launch failed (rc=1): ")
-    assert not message.rstrip().endswith(":"), message
+    assert message == "tmux launch failed (rc=1): <tmux produced no output>"
     assert instance.running is False
 
 
