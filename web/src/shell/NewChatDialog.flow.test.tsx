@@ -506,6 +506,24 @@ describe("NewChatLandingScreen in the floating panel", () => {
     expect(navigateMock).not.toHaveBeenCalled();
   });
 
+  // The panel keeps the prompt when delivery fails, and remounts the composer when it succeeds.
+  it("keeps the prompt in the composer after it hands a create to the panel", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    const panel = floatingPanel();
+
+    renderLanding([], {}, panel);
+    await waitForWorkspaceSeed();
+    typeMessage("inspect the repo");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(panel.launch).toHaveBeenCalled());
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("inspect the repo");
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
+  });
+
   it.each([true, undefined])(
     "says whether a sandbox create took the first message (durable input %s)",
     async (durable) => {

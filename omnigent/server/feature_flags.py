@@ -59,6 +59,7 @@ class Feature(StrEnum):
     PI_CLAUDE_PLUGINS = "pi_claude_plugins"
     MEMORY = "memory"
     QUICK_PICK_PALETTE = "quick_pick_palette"
+    FLOATING_COMPOSER = "floating_composer"
 
 
 @dataclass(frozen=True)
@@ -325,6 +326,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Run the ⌘K command palette on the fuzzy-matching QuickPick list",
         owner="web",
         review_by_release="0.24.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.FLOATING_COMPOSER,
+        description="The desktop app's floating New Agent panel, opened with Shift+Cmd+Space",
+        owner="web",
+        review_by_release="0.27.0",
     ),
 )
 

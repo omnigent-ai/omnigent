@@ -2065,7 +2065,8 @@ async function rewindAttachmentFiles(
   return downloads.filter((file): file is File => file !== null);
 }
 
-async function uploadFileBlocks(
+/** Upload `files` to a session in order, as the content blocks a user message carries. */
+export async function uploadFileBlocks(
   sessionId: string,
   files: readonly File[],
 ): Promise<ContentBlock[]> {

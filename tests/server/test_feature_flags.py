@@ -61,6 +61,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "codex_plan_at_launch": True,
         "workspace_direct_access": False,
         "workspace_api_server_access": False,
+        "floating_composer": False,
     }
 
 
@@ -199,6 +200,12 @@ def test_canvas_is_a_frontend_visible_feature() -> None:
         "user_inbox",
         "workspace_content_search",
     )
+
+
+def test_floating_composer_is_a_frontend_visible_feature() -> None:
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "floating_composer"})
+    assert flags.enabled(Feature.FLOATING_COMPOSER)
+    assert flags.frontend_dict()["floating_composer"] is True
 
 
 def test_chat_composer_codemirror_is_an_opt_in_frontend_feature() -> None:
