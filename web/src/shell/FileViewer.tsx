@@ -9,6 +9,7 @@
 //   │  - gutter icon → add comment    │                  │
 //   └──────────────────────────────────┴──────────────────┘
 
+import { DEFAULT_FILES_PANEL_PREFERENCES } from "@/lib/filesPanelPreferences";
 import { FileViewerContext, useWorkspacePaths, type FilePosition } from "./FileViewerContext";
 import {
   revealInFileManager,
@@ -400,7 +401,7 @@ interface FileViewerProps {
   /**
    * Sort order for the prev/next navigation. Must match the order the
    * Changes list (`FilesPanel` → `FlatFileList`) is sorted by, or the
-   * "X/N" index won't line up with the list. Defaults to "recent".
+   * "X/N" index won't line up with the list. Defaults to the panel's default sort.
    */
   sort?: ChangedSort;
 }
@@ -446,7 +447,7 @@ function FileViewerBody({
   mobileOverlay = false,
   viewport,
   onCommentsOpenChange,
-  sort = "recent",
+  sort = DEFAULT_FILES_PANEL_PREFERENCES.sort,
 }: FileViewerProps) {
   // null = single-user mode (no enforcement); undefined = prop not provided (treat as unrestricted).
   // LEVEL_EDIT = 2; levels below 2 are read-only.

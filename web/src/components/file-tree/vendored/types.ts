@@ -101,5 +101,7 @@ export interface FileTreeScrollToPathOptions {
 export interface FileTreeScrollRequest {
   id: number;
   offset: FileTreeScrollOffset;
+  /** The row to reveal, whose index can move if the tree changes before it's shown. */
+  path: string;
   visibleIndex: number;
 }

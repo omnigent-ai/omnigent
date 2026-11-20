@@ -305,7 +305,11 @@ describe("FileTreeModel scroll requests", () => {
     model.scrollToPath("test/index.test.ts", { offset: "center" });
 
     const request = model.getScrollRequest();
-    expect(request).toMatchObject({ offset: "center", visibleIndex: 8 });
+    expect(request).toMatchObject({
+      offset: "center",
+      path: "test/index.test.ts",
+      visibleIndex: 8,
+    });
     expect(model.getFocusedPath()).toBe("test/index.test.ts");
     model.clearScrollRequest(request!.id);
     expect(model.getScrollRequest()).toBeNull();
@@ -317,6 +321,14 @@ describe("FileTreeModel scroll requests", () => {
 
     expect(model.getScrollRequest()).toMatchObject({ offset: "nearest", visibleIndex: 6 });
     expect(model.getFocusedPath()).toBe("README.md");
+  });
+
+  it("finds a path's current row, and none for a hidden or unknown path", () => {
+    const model = create({ initialExpansion: "open" });
+    expect(model.getVisibleIndexOfPath("test/index.test.ts")).toBe(8);
+    directory(model, "src/").collapse();
+    expect(model.getVisibleIndexOfPath("src/index.ts")).toBe(-1);
+    expect(model.getVisibleIndexOfPath("missing.txt")).toBe(-1);
   });
 
   it("ignores paths that are hidden or unknown", () => {

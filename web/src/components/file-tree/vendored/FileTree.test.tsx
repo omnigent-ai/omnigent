@@ -1,7 +1,7 @@
 import { act, StrictMode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { FileTree, type FileTreeModel, useFileTree } from ".";
+import { FILE_TREE_ITEM_HEIGHT, FileTree, type FileTreeModel, useFileTree } from ".";
 import type { FileTreeOptions } from "./types";
 
 beforeAll(() => {
@@ -289,6 +289,168 @@ describe("FileTree", () => {
 
       expect(scroller.scrollTop).toBe(18_000);
       expect(row(tree, "file-0600.ts")).toBeTruthy();
+    });
+
+    it("finishes a centered reveal the browser snapped to a whole pixel, so a resize or scroll keeps the reader's place", async () => {
+      // 421px centers row 600 at 17,804.5, which the browser snaps to 17,805.
+      const element = stubScrollElement({ height: 421, snap: true });
+      try {
+        const { model, tree } = await renderTree({ paths: manyPaths });
+        await act(async () => model.scrollToPath("file-0600.ts", { offset: "center" }));
+        expect(element.scrollTop()).toBe(17_805);
+
+        // A later resize doesn't center row 600 again.
+        await element.show(300);
+        expect(element.scrollTop()).toBe(17_805);
+
+        await element.userScrollsTo(tree, 0);
+        await element.show(421);
+        expect(element.scrollTop()).toBe(0);
+      } finally {
+        element.restore();
+      }
+    });
+
+    it("drops a reveal still waiting once the reader scrolls the shown tree", async () => {
+      // The tree has a size but hasn't taken the write yet, so the reveal waits.
+      const element = stubScrollElement({ height: 420 });
+      element.ignoreWrites(true);
+      try {
+        const { model, tree } = await renderTree({ paths: manyPaths });
+        await act(async () => model.scrollToPath("file-0600.ts", { offset: "top" }));
+        expect(element.scrollTop()).toBe(0);
+
+        await element.userScrollsTo(tree, 600);
+        element.ignoreWrites(false);
+        await element.show(420);
+        expect(element.scrollTop()).toBe(600);
+      } finally {
+        element.restore();
+      }
+    });
+
+    /**
+     * Stubs the tree's scroll element: `height` tall (zero while hidden, which ignores scrollTop
+     * writes), snapping writes to whole pixels when `snap` is set, as browsers do. `show`
+     * resizes it and tells its resize observers. Undo with `restore`.
+     */
+    function stubScrollElement({ height: initialHeight = 0, snap = false } = {}) {
+      let height = initialHeight;
+      let applied = 0;
+      let acceptsWrites = true;
+      const resized = new Set<ResizeObserverCallback>();
+      vi.stubGlobal(
+        "ResizeObserver",
+        class {
+          private readonly callback: ResizeObserverCallback;
+          constructor(callback: ResizeObserverCallback) {
+            this.callback = callback;
+          }
+          observe() {
+            resized.add(this.callback);
+          }
+          unobserve() {}
+          disconnect() {
+            resized.delete(this.callback);
+          }
+        },
+      );
+      const rect = vi
+        .spyOn(HTMLElement.prototype, "getBoundingClientRect")
+        .mockImplementation(() => ({ height, width: 200 }) as DOMRect);
+      Object.defineProperty(HTMLElement.prototype, "scrollTop", {
+        configurable: true,
+        get: () => applied,
+        set: (value: number) => {
+          if (height > 0 && acceptsWrites) applied = snap ? Math.round(value) : value;
+        },
+      });
+      return {
+        scrollTop: () => applied,
+        /** Whether row `index` is inside the shown viewport. */
+        showsRow: (index: number) =>
+          index * FILE_TREE_ITEM_HEIGHT >= applied &&
+          (index + 1) * FILE_TREE_ITEM_HEIGHT <= applied + height,
+        /** Makes scrollTop writes no-ops while the element keeps its size. */
+        ignoreWrites: (ignored: boolean) => {
+          acceptsWrites = !ignored;
+        },
+        show: async (shownHeight: number) => {
+          height = shownHeight;
+          await act(async () => {
+            for (const callback of [...resized]) callback([], {} as ResizeObserver);
+          });
+        },
+        /** Scrolls as the reader would, with the scroll event that follows. */
+        userScrollsTo: async (tree: HTMLElement, top: number) => {
+          applied = top;
+          const scroller = tree.querySelector<HTMLElement>("[data-file-tree-scroll]")!;
+          await act(async () => scroller.dispatchEvent(new Event("scroll")));
+        },
+        restore: () => {
+          rect.mockRestore();
+          vi.unstubAllGlobals();
+          delete (HTMLElement.prototype as { scrollTop?: number }).scrollTop;
+        },
+      };
+    }
+
+    it("reveals a row it was asked to while hidden once it's shown", async () => {
+      const hidden = stubScrollElement();
+      try {
+        const { tree } = await renderTree({
+          paths: manyPaths,
+          initialSelectedPaths: ["file-0900.ts"],
+        });
+        // The hidden element still shows its top rows, so the tree draws them rather than a gap.
+        expect(renderedPaths(tree).slice(0, 3)).toEqual([
+          "file-0000.ts",
+          "file-0001.ts",
+          "file-0002.ts",
+        ]);
+
+        await hidden.show(420);
+
+        expect(hidden.showsRow(900)).toBe(true);
+        expect(row(tree, "file-0900.ts")?.getAttribute("aria-selected")).toBe("true");
+        expect(renderedPaths(tree)).not.toContain("file-0000.ts");
+      } finally {
+        hidden.restore();
+      }
+    });
+
+    it("reveals the row where it is when shown, after the hidden tree's listing changes", async () => {
+      const hidden = stubScrollElement();
+      try {
+        const { model, tree } = await renderTree({
+          paths: manyPaths,
+          initialSelectedPaths: ["file-0900.ts"],
+        });
+        // A refresh while hidden moves the selected file from row 900 to row 100.
+        await act(async () => model.resetPaths(manyPaths.slice(800)));
+
+        await hidden.show(420);
+
+        expect(hidden.showsRow(100)).toBe(true);
+        expect(row(tree, "file-0900.ts")?.getAttribute("aria-selected")).toBe("true");
+      } finally {
+        hidden.restore();
+      }
+    });
+
+    it("reveals a row once shown in a viewport shorter than the hidden tree assumed", async () => {
+      const hidden = stubScrollElement();
+      try {
+        // Row 10 sits inside the 420px a hidden tree assumes, but below a 150px viewport.
+        await renderTree({ paths: manyPaths, initialSelectedPaths: ["file-0010.ts"] });
+
+        await hidden.show(150);
+
+        expect(hidden.scrollTop()).toBeGreaterThan(0);
+        expect(hidden.showsRow(10)).toBe(true);
+      } finally {
+        hidden.restore();
+      }
     });
 
     it("reveals the initially selected row", async () => {

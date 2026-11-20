@@ -616,7 +616,7 @@ function AppShellImpl() {
   const [filesPanelShowHidden, setFilesPanelShowHidden] = useState(true);
   // Lifted so the Changes list order and the FileViewer prev/next order
   // share one source of truth (otherwise the "X/N" index won't match the
-  // list position). Default "recent" mirrors the prior FilesPanel default.
+  // list position). It starts from the last choice, or the alphabetical default.
   const [filesPanelSort, setFilesPanelSort] = useState<ChangedSort>(
     () => readFilesPanelPreferences().sort,
   );
