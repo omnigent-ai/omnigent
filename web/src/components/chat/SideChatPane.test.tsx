@@ -3416,6 +3416,40 @@ describe("grid cell @-mention picker", () => {
     expect(screen.getByTestId("file-mention-menu")).toBeInTheDocument();
   });
 
+  it("⌘Z in a quote's text brings back a cut file tag, so the file still attaches on send", () => {
+    const replyDraft: StoredReplyDraft = {
+      version: 1,
+      quotes: [{ before: "@readme.md ", text: "Quoted line" }],
+      text: "",
+    };
+    setSessionDraft(childId, {
+      text: serializeReplyDraft(replyDraft),
+      files: [],
+      replyDraft,
+      mentions: { files: [readmeTag], sessions: [] },
+    });
+    useChatStore.setState({
+      sideChatComposers: {
+        [gridCellComposerKey(childId)]: {
+          text: "",
+          files: [],
+          quotes: [{ id: "q", before: "@readme.md ", text: "Quoted line" }],
+        },
+      },
+    });
+    mountCell();
+    const preamble = screen.getByLabelText("Reply text before quote 1");
+
+    fireEvent.change(preamble, { target: { value: " " } });
+    expect(getSessionDraft(childId)?.mentions).toBeUndefined();
+    fireEvent.input(preamble, { target: { value: "@readme.md " }, inputType: "historyUndo" });
+    expect(getSessionDraft(childId)?.mentions).toEqual({ files: [readmeTag], sessions: [] });
+
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    expect(send).toHaveBeenCalledOnce();
+    expect(send.mock.calls[0]?.[0]).toContain("[Attached file: readme.md]");
+  });
+
   it("a quote card's text opens no picker, and moving focus there closes the main text's", () => {
     const replyDraft: StoredReplyDraft = {
       version: 1,

@@ -184,6 +184,17 @@ describe("useMentionBrowser released tags", () => {
     expect(result.current.browser.mentionTokens).toEqual(["@readme.md"]);
   });
 
+  it("keeps a token pasted as an input's first edit literal through its undo and redo", () => {
+    const { result } = renderBrowser();
+    tagReadme(result);
+    change(result, "Read  ", false);
+    change(result, "@readme.md", false, "quote");
+
+    change(result, "", true, "quote");
+    change(result, "@readme.md", true, "quote");
+    expect(result.current.browser.mentionTokens).toEqual([]);
+  });
+
   it("compares a quote's undo with that quote's own text, not the tail's", () => {
     const { result } = renderBrowser();
     tagReadme(result);

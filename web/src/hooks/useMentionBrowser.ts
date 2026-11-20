@@ -338,12 +338,13 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
 
   // Each input's text as its last change left it. An undo compares against the same input only:
   // a controlled replacement clears that input's undo history, so its baseline can't go stale.
+  // An input's first change can't be an undo, so a released token in it was typed or pasted.
   const lastSeenRef = useRef(new WeakMap<object, string>());
 
   const noteTextChange = (event: ComposerInputEvent) => {
     const input = event.currentTarget;
     const after = input.value;
-    const before = lastSeenRef.current.get(input) ?? after;
+    const before = lastSeenRef.current.get(input) ?? "";
     lastSeenRef.current.set(input, after);
     const released = releasedRef.current;
     if (released.files.length === 0 && released.sessions.length === 0) return;
