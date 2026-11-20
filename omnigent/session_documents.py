@@ -67,7 +67,7 @@ def validate_google_docs_url(url: str) -> GoogleDocsReference:
     # URL parsers may repair malformed paths or strip control characters.
     if (
         url[:origin_length].lower() != _GOOGLE_DOCS_ORIGIN
-        or any(char.isspace() or ord(char) < 32 or char in "\\\x7f" for char in url)
+        or any(char.isspace() or ord(char) < 32 or char in "\\\x7f\ufeff" for char in url)
         or (match := _EDITOR_PATH.fullmatch(url[origin_length:])) is None
     ):
         raise ValueError("Expected an HTTPS Google Docs editor URL")
@@ -75,13 +75,14 @@ def validate_google_docs_url(url: str) -> GoogleDocsReference:
     document_id, query, fragment = match.groups()
     query_params = parse_qsl(query or "", keep_blank_values=True)
     fragment_params = parse_qsl(fragment or "", keep_blank_values=True)
+    if any(key != "tab" and key not in _CONTEXT_QUERY_PARAMS for key, _ in query_params) or (
+        fragment and (not fragment_params or any(key != "tab" for key, _ in fragment_params))
+    ):
+        raise ValueError("This Google Docs target must be opened in Google Docs")
+
     query_tab = _tab_id(query_params)
     fragment_tab = _tab_id(fragment_params)
-    if (
-        any(key != "tab" and key not in _CONTEXT_QUERY_PARAMS for key, _ in query_params)
-        or (fragment and (fragment_tab is None or len(fragment_params) != 1))
-        or (query_tab and fragment_tab and query_tab != fragment_tab)
-    ):
+    if query_tab and fragment_tab and query_tab != fragment_tab:
         raise ValueError("This Google Docs target must be opened in Google Docs")
 
     tab_id = query_tab or fragment_tab

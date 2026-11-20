@@ -48,7 +48,7 @@ export function classifyGoogleDocsUrl(originalUrl: string): GoogleDocsLink {
   // URL parsers may repair malformed paths or strip control characters.
   if (
     url.slice(0, originLength).toLowerCase() !== GOOGLE_DOCS_ORIGIN ||
-    /[\s\\]/.test(url) ||
+    /[\s\u0085\\]/.test(url) ||
     Array.from(url).some((char) => char.charCodeAt(0) < 32 || char.charCodeAt(0) === 127) ||
     !match
   ) {
@@ -58,6 +58,15 @@ export function classifyGoogleDocsUrl(originalUrl: string): GoogleDocsLink {
   const [, documentId, query = "", fragment = ""] = match;
   const queryParams = new URLSearchParams("?" + query);
   const fragmentParams = new URLSearchParams("?" + fragment);
+  // External access and navigation targets can depend on the full original link.
+  if (
+    [...queryParams.keys()].some((key) => key !== "tab" && !CONTEXT_QUERY_PARAMS.has(key)) ||
+    (fragment &&
+      (!fragmentParams.has("tab") || [...fragmentParams.keys()].some((key) => key !== "tab")))
+  ) {
+    return { kind: "external", originalUrl };
+  }
+
   const queryTabs = queryParams.getAll("tab");
   const fragmentTabs = fragmentParams.getAll("tab");
   if (
@@ -70,11 +79,7 @@ export function classifyGoogleDocsUrl(originalUrl: string): GoogleDocsLink {
 
   const [queryTab] = queryTabs;
   const [fragmentTab] = fragmentTabs;
-  if (
-    [...queryParams.keys()].some((key) => key !== "tab" && !CONTEXT_QUERY_PARAMS.has(key)) ||
-    (fragment && (!fragmentTab || [...fragmentParams.keys()].some((key) => key !== "tab"))) ||
-    (queryTab && fragmentTab && queryTab !== fragmentTab)
-  ) {
+  if (queryTab && fragmentTab && queryTab !== fragmentTab) {
     return { kind: "external", originalUrl };
   }
 
