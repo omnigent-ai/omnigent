@@ -636,6 +636,7 @@ describe("ErrorBanner", () => {
   ])("does not invent retry for the $code variant", ({ code, message }) => {
     render(<ErrorBanner message={message} source="llm" code={code} onRetry={vi.fn()} />);
     expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
   });
 
   it("keeps causally related error messages in order inside one expanded banner", () => {
