@@ -727,7 +727,7 @@ def test_sandbox_launch_path_wraps_when_sandbox_requested(
     assert Path("/srv/custom-kimi-home") in captured_write_roots
     assert Path.home() / ".kimi-code" not in captured_write_roots
 
-    def _reject_launcher(_target: str, _policy: _ActivePolicy) -> str:
+    def _reject_launcher(_target: str, _policy: _ActivePolicy, *, cwd: str) -> str:
         raise OSError("trusted runtime is writable")
 
     monkeypatch.setattr(sandbox_mod, "create_exec_launcher", _reject_launcher)

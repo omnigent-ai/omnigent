@@ -5580,7 +5580,7 @@ def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(
 
     if layout == "standalone":
 
-        def _reject_launcher(_target: str, _policy: SandboxPolicy) -> str:
+        def _reject_launcher(_target: str, _policy: SandboxPolicy, *, cwd: str) -> str:
             raise OSError("trusted runtime is writable")
 
         monkeypatch.setattr(sandbox_mod, "create_exec_launcher", _reject_launcher)

@@ -784,8 +784,9 @@ Use a sandbox-capable harness for this confined research path.
 
 ACP, Claude SDK, Codex, Goose, Kimi, Pi, and Qwen worker containment supports
 `os_env.type: caller_process` and rejects `fork`, `start_in_scratch`, and
-`sandbox.git_ssh`. Worker `egress_rules` are supported only by Codex, and worker
-`credential_proxy` requires Codex's supported brokered gateway configuration.
+`sandbox.git_ssh`. Worker `egress_rules` are supported by Codex and Claude SDK.
+Worker `credential_proxy` requires Codex's supported brokered gateway
+configuration or Claude SDK's owned worker environment and credential broker.
 When a later turn supplies a changed OS policy, the runtime replaces its retained
 worker before running that turn so the new policy reaches a fresh process.
 Launch-policy overrides such as `enforce_sandbox` are reapplied before deriving
@@ -793,14 +794,14 @@ the spawn environment, including after an agent revision changes.
 Whole-process `allow_network: false` also blocks network-based model-provider
 access, so those providers cannot run under that policy.
 
-**Migration:** Claude SDK agents that declare worker `egress_rules`,
-`credential_proxy`, or `tcp_egress` now fail startup. Those configurations did
-not confine the Claude process. `sys_os_shell` shares the agent's primary
-`os_env`, so moving a call there does not make these Claude SDK policies valid.
+Claude SDK routes supported HTTP egress and credential injection through an
+owned broker outside its confined worker. Direct CLI preparation without an
+owned worker environment rejects these settings. `sys_os_shell` shares the
+agent's primary `os_env`; it cannot substitute for worker containment.
 
-- For HTTP egress on the primary worker policy, change to Codex's supported
-  egress configuration. Credentialed `sys_os_shell` operations also require
-  the [brokered Codex gateway configuration](#secretless-credential-proxy)
+- For HTTP egress on the primary worker policy, use Claude SDK's owned broker
+  or Codex's supported egress configuration. Credentialed Codex operations
+  require the [brokered Codex gateway configuration](#secretless-credential-proxy)
   below, including `broker_gateway: true` and its required gateway binding.
   Nonbrokered or signer-backed Codex is not a substitute for that configuration.
 - For terminal-only HTTP or TCP egress without credentials, put `egress_rules`

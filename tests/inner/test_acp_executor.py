@@ -90,7 +90,7 @@ def test_sandbox_launcher_validation_failure_stops_acp_spawn(
     policy = SandboxPolicy("linux_bwrap", True, [], [], [], False)
     monkeypatch.setattr(sandbox_module, "resolve_sandbox", lambda *_args: policy)
 
-    def _reject_launcher(_target: str, _policy: SandboxPolicy) -> str:
+    def _reject_launcher(_target: str, _policy: SandboxPolicy, *, cwd: str) -> str:
         raise OSError("trusted runtime is writable")
 
     monkeypatch.setattr(sandbox_module, "create_exec_launcher", _reject_launcher)

@@ -429,7 +429,7 @@ def test_sandbox_launch_path_wraps_active_policy(
     assert "PATH" in policy.spawn_env_allowlist
     assert "OPENAI_BASE_URL" in policy.spawn_env_allowlist
 
-    def _reject_launcher(_target: str, _policy: SandboxPolicy) -> str:
+    def _reject_launcher(_target: str, _policy: SandboxPolicy, *, cwd: str) -> str:
         raise OSError("trusted runtime is writable")
 
     monkeypatch.setattr(sandbox_mod, "create_exec_launcher", _reject_launcher)

@@ -16,6 +16,7 @@ import logging
 import re
 import secrets
 import time
+import traceback
 import uuid
 from collections import deque
 from collections.abc import AsyncIterator, Callable, Sequence
@@ -1490,7 +1491,10 @@ class ExecutorAdapter(HarnessApp):
         from omnigent.server.schemas import ErrorDetail
 
         if isinstance(exception, (HarnessSandboxPreparationError, HarnessSandboxValidationError)):
-            _logger.warning("Harness sandbox setup failed", exc_info=exception)
+            # Launcher task frames can retain the entire worker state; omit locals.
+            _logger.warning(
+                "Harness sandbox setup failed:\n%s", "".join(traceback.format_exception(exception))
+            )
             return ErrorDetail(code=type(exception).__name__, message=exception.client_message)
         if isinstance(exception, ProviderAuthRequired):
             return ErrorDetail(

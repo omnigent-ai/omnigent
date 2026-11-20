@@ -164,7 +164,11 @@ def test_requested_sandbox_never_falls_back_to_bare_worker(
     cause = failure.value.__cause__
     if fault == "inactive":
         assert isinstance(cause, OSError)
-        assert "requires an active sandbox" in str(cause)
+        assert (
+            "resolved to an inactive policy"
+            if harness == "claude-sdk"
+            else "requires an active sandbox"
+        ) in str(cause)
     else:
         if fault == "cwd":
             failed_operation = cwd_resolution
@@ -542,11 +546,12 @@ print(json.dumps({{'contained': True}}))
     assert not (writable / "denied.txt").exists()
 
 
-def test_claude_sdk_missing_system_cli_rejects_requested_sandbox(
+def test_claude_sdk_missing_system_and_bundled_cli_rejects_requested_sandbox(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(claude_sdk_executor, "_find_system_claude", lambda: None)
-    with pytest.raises(OSError, match="requires a CLI path"):
+    monkeypatch.setattr(claude_sdk_executor, "_find_bundled_claude", lambda: None)
+    with pytest.raises(OSError, match="requires a system or SDK-bundled CLI"):
         claude_sdk_executor.ClaudeSDKExecutor(os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec()))
 
 

@@ -123,6 +123,7 @@ from .executor import (
 )
 from .native_attachments import framework_notices, unresolved_attachment_marker
 from .sandbox import (
+    HarnessSandboxValidationError,
     SandboxPolicy,
     cleanup_private_tmpdir,
     create_exec_launcher,
@@ -2113,8 +2114,15 @@ def prepare_claude_cli_path(
             and resolved_cwd == _resolve_sandbox_cwd(None)
         ):
             resolved_cwd = _resolve_sandbox_cwd(spec.cwd)
+        if model_access is not None and worker_env is None:
+            raise HarnessSandboxValidationError(
+                "Brokered Claude model access requires an owned worker environment",
+                reason="model_access",
+            )
         validate_harness_sandbox(
-            spec, "Claude SDK", cwd=resolved_cwd if cwd is not None else None,
+            spec,
+            "Claude SDK",
+            cwd=resolved_cwd if cwd is not None else None,
             supports_egress_rules=worker_env is not None,
             supports_credential_proxy=worker_env is not None,
         )
@@ -2126,15 +2134,13 @@ def prepare_claude_cli_path(
         if _sandbox_disabled_by_env():
             raise OSError("OMNIGENT_CLAUDE_SDK_NO_SANDBOX conflicts with the requested sandbox")
 
-        if model_access is not None and worker_env is None:
-            raise ValueError("Brokered Claude model access requires an owned worker environment")
-
-        cwd = resolved_cwd
-        sandbox = resolve_sandbox(spec, cwd)
+        sandbox = resolve_sandbox(spec, resolved_cwd)
         if not sandbox.active:
             raise OSError("The configured Claude sandbox resolved to an inactive policy")
 
-        sandbox = with_additional_read_roots(sandbox, [pathlib.Path(__file__).resolve().parents[1]])
+        sandbox = with_additional_read_roots(
+            sandbox, [pathlib.Path(__file__).resolve().parents[1]]
+        )
         if worker_env is not None:
             parent_env = {**os.environ, **worker_env}
             if "ANTHROPIC_API_KEY" not in worker_env:
@@ -2149,7 +2155,7 @@ def prepare_claude_cli_path(
             if model_access is None:
                 model_access = resolve_claude_model_access(
                     parent_env,
-                    cwd=cwd,
+                    cwd=resolved_cwd,
                     databricks_profile=databricks_profile,
                     source_paths=user_settings_source_paths,
                     source_env_names=frozenset(credential_env_names),
@@ -2165,17 +2171,19 @@ def prepare_claude_cli_path(
                     model_access, response_header_timeout_seconds=response_header_timeout_seconds
                 )
             model_access = model_access.with_bundle_sources(bundle_dir)
-            sandbox = model_access.protect_sources(sandbox, cwd)
+            sandbox = model_access.protect_sources(sandbox, resolved_cwd)
         else:
             sandbox = with_additional_read_roots(sandbox, _claude_internal_write_roots())
             sandbox = with_additional_write_roots(sandbox, _claude_internal_write_roots())
             sandbox = with_additional_write_files(sandbox, _claude_internal_write_files())
         probe_argv = [sys.executable, "-c", "pass"]
         wrapped_argv = get_backend(sandbox.backend_type).wrap_launcher_argv(
-            probe_argv, sandbox, cwd, target=real_cli_path
+            probe_argv, sandbox, resolved_cwd, target=real_cli_path
         )
         if wrapped_argv == probe_argv:
-            raise OSError(f"Sandbox backend {sandbox.backend_type!r} cannot contain the Claude CLI")
+            raise OSError(
+                f"Sandbox backend {sandbox.backend_type!r} cannot contain the Claude CLI"
+            )
         egress_rules = list(sandbox_spec.egress_rules or [])
         if egress_rules and worker_env is None:
             raise ValueError("Egress-filtered Claude requires an owned worker environment")
@@ -2222,7 +2230,7 @@ def prepare_claude_cli_path(
                     if sandbox.credential_proxy is not None
                     else {},
                     sandbox=sandbox,
-                    cwd=cwd,
+                    cwd=resolved_cwd,
                 )
                 staged_env.update(credential_runtime.helper_env_updates)
                 if sandbox.credential_proxy is not None:
@@ -2278,16 +2286,18 @@ def prepare_claude_cli_path(
                 names = [name for name in names if name not in source_env_names]
                 sandbox = with_spawn_env_allowlist(sandbox, names)
             launcher = pathlib.Path(
-                create_exec_launcher(real_cli_path, sandbox, cwd=str(cwd), env_overrides=staged_env)
+                create_exec_launcher(
+                    real_cli_path, sandbox, cwd=str(resolved_cwd), env_overrides=staged_env
+                )
                 if worker_env is not None
-                else create_exec_launcher(real_cli_path, sandbox, cwd=str(cwd))
+                else create_exec_launcher(real_cli_path, sandbox, cwd=str(resolved_cwd))
             )
             if worker_env is not None:
                 worker_env.clear()
                 worker_env.update(staged_env)
             return PreparedClaudeCli(
                 cli_path=str(launcher),
-                cwd=str(cwd),
+                cwd=str(resolved_cwd),
                 enable_native_tools=True,
                 sandbox=sandbox,
                 sandboxed=True,
@@ -2787,7 +2797,10 @@ class ClaudeSDKExecutor(Executor):
                 self._prepared_cli = prepared
                 self._cli_sandbox = prepared.sandbox
                 self._cli_sandbox_cwd = prepared.cwd
-                self._cwd = prepared.cwd if prepared.cwd is not None else str(effective_cwd)
+                if prepared.cwd is not None:
+                    self._cwd = prepared.cwd
+                elif self._cwd is None:
+                    self._cwd = self._os_env_spec.cwd
                 self._os_env = prepared.enable_native_tools
                 if prepared.cli_path != self._cli_path:
                     self._cli_wrapper_path = prepared.cli_path
@@ -2795,12 +2808,17 @@ class ClaudeSDKExecutor(Executor):
             else:
                 prepared = prepare_tight_cli_process(self._cli_path, cwd=self._cwd)
                 self._cli_sandbox = prepared.sandbox
+                self._cli_sandbox_cwd = prepared.cwd
+                if prepared.cwd is not None:
+                    self._cwd = prepared.cwd
                 if prepared.cli_path != self._cli_path:
                     self._cli_wrapper_path = prepared.cli_path
                     self._cli_path = prepared.cli_path
             logger.info("Using %s claude CLI: %s", cli_source, self._cli_path)
         else:
             logger.info("No system claude found; SDK will use bundled CLI")
+        if self._os_env_spec is not None and self._cwd is None:
+            self._cwd = self._os_env_spec.cwd
 
     def __del__(self) -> None:
         prepared = getattr(self, "_prepared_cli", None)
