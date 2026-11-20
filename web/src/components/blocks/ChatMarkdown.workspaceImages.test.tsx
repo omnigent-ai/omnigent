@@ -123,6 +123,33 @@ describe("assistant workspace markdown images", () => {
     },
   );
 
+  it("saves the loaded image from its download button without reading it again", async () => {
+    let respond: (response: Response) => void = () => {};
+    fetchMock.mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          respond = resolve;
+        }),
+    );
+    const clicked: [string, string][] = [];
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
+      this: HTMLAnchorElement,
+    ) {
+      clicked.push([this.getAttribute("href") ?? "", this.download]);
+    });
+    renderMarkdown("![Screenshot](/workspace/project/shots/shot.png)");
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    expect(screen.queryByRole("button", { name: "Download image: shot.png" })).toBeNull();
+    respond(imageResponse());
+    fireEvent.click(await screen.findByRole("button", { name: "Download image: shot.png" }));
+
+    expect(clicked).toEqual([["blob:workspace-image-1", "shot.png"]]);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("dialog")).toBeNull();
+    vi.restoreAllMocks();
+  });
+
   it("loads a typed WebP blob when MIME metadata is absent", async () => {
     const content =
       "UklGRj4AAABXRUJQVlA4IDIAAADQAQCdASoBAAEAAUAmJaACdLoB+AADsAD+6SIf+8+fufP3" +

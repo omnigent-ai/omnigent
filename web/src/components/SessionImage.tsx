@@ -109,6 +109,7 @@ export function SessionImage({ path, alt, className, variant }: SessionImageProp
         alt={alt}
         className={className}
         variant={variant}
+        downloadPath={path}
       />
     );
   }
@@ -127,11 +128,14 @@ export function InlineImage({
   alt,
   className,
   variant = "preview",
+  downloadPath,
 }: {
   src?: string;
   alt: string;
   className?: string;
   variant?: SessionImageProps["variant"];
+  /** App API path `src` loads, for saving a source the page holds no bytes for. */
+  downloadPath?: string;
 }) {
   // Tracked by source rather than as a bare flag, so a later block swapping in a
   // different `src` on the same slot retries instead of staying stuck failed.
@@ -165,6 +169,8 @@ export function InlineImage({
           className,
         )}
         buttonClassName={variant === "userAttachment" ? USER_ATTACHMENT_BUTTON : undefined}
+        downloadName={alt}
+        downloadPath={downloadPath}
         // Offscreen history images cost nothing until scrolled to, and decoding
         // off the main thread keeps the swap from blocking paint.
         loading="lazy"
@@ -307,6 +313,7 @@ function EmbeddedSessionImage({ path, alt, className, variant = "preview" }: Ses
           className,
         )}
         buttonClassName={variant === "userAttachment" ? USER_ATTACHMENT_BUTTON : undefined}
+        downloadName={alt}
         decoding="async"
       />
     </div>

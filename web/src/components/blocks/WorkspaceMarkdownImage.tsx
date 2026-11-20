@@ -88,16 +88,20 @@ export function WorkspaceMarkdownImage({ path, alt }: { path: string; alt: strin
   }
 
   return (
-    <ZoomableImage
-      src={loaded.url}
-      alt={alt || filename}
-      className="my-2 max-h-96 max-w-full rounded-md object-contain"
-      loading="lazy"
-      decoding="async"
-      onError={() => {
-        URL.revokeObjectURL(loaded.url);
-        setFailedKey(imageKey);
-      }}
-    />
+    // The margin sits outside the image so the download button hugs its corner.
+    <span className="my-2 inline-flex max-w-full">
+      <ZoomableImage
+        src={loaded.url}
+        alt={alt || filename}
+        className="max-h-96 max-w-full rounded-md object-contain"
+        downloadName={filename}
+        loading="lazy"
+        decoding="async"
+        onError={() => {
+          URL.revokeObjectURL(loaded.url);
+          setFailedKey(imageKey);
+        }}
+      />
+    </span>
   );
 }

@@ -17,6 +17,8 @@ const authenticatedFetch = vi.fn();
 
 vi.mock("@/lib/host", () => ({
   getOmnigentHostConfig: () => getOmnigentHostConfig(),
+  getEmbedRoot: () => null,
+  isDatabricksWorkspace: () => false,
 }));
 
 vi.mock("@/lib/identity", () => ({
@@ -57,7 +59,19 @@ afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
   vi.clearAllMocks();
+  vi.restoreAllMocks();
 });
+
+/** Record each synthetic download link's `[href, download]` instead of navigating. */
+function captureDownloads(): [string, string][] {
+  const clicked: [string, string][] = [];
+  vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
+    this: HTMLAnchorElement,
+  ) {
+    clicked.push([this.getAttribute("href") ?? "", this.download]);
+  });
+  return clicked;
+}
 
 describe("SessionImage (standalone, no host fetcher)", () => {
   beforeEach(() => {
@@ -94,6 +108,22 @@ describe("SessionImage (standalone, no host fetcher)", () => {
     fireEvent.error(img);
 
     expect(screen.getByRole("img", { name: "pending" }).tagName).toBe("IMG");
+  });
+
+  it("downloads a user attachment from the file path its image loads", () => {
+    const clicked = captureDownloads();
+    render(
+      <SessionImage
+        path="/v1/sessions/a/resources/files/x/content"
+        alt="shot.png"
+        variant="userAttachment"
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Download image: shot.png" }));
+
+    expect(clicked).toEqual([["/v1/sessions/a/resources/files/x/content", "shot.png"]]);
+    expect(authenticatedFetch).not.toHaveBeenCalled();
   });
 
   it("reserves a square for a user attachment before its session path resolves", () => {
@@ -149,6 +179,25 @@ describe("SessionImage (embedded, host fetcher present)", () => {
     expect(image.closest("div")).toHaveClass("size-20");
     expect(image).toHaveClass("max-h-20", "max-w-20", "object-contain");
     expect(screen.getByRole("button", { name: "Zoom image: shot.png" })).toHaveClass("size-20");
+  });
+
+  it("downloads the fetched bytes without a second request", async () => {
+    let resolveFetch: (response: { ok: boolean; blob: () => Promise<Blob> }) => void = () => {};
+    authenticatedFetch.mockImplementation(
+      () =>
+        new Promise<{ ok: boolean; blob: () => Promise<Blob> }>((resolve) => {
+          resolveFetch = resolve;
+        }),
+    );
+    const clicked = captureDownloads();
+    render(<SessionImage path="/thumbnail" alt="shot.png" variant="userAttachment" />);
+    expect(screen.queryByRole("button", { name: "Download image: shot.png" })).toBeNull();
+
+    resolveFetch({ ok: true, blob: () => Promise.resolve(new Blob(["x"])) });
+    fireEvent.click(await screen.findByRole("button", { name: "Download image: shot.png" }));
+
+    expect(clicked).toEqual([["blob:fake-url", "shot.png"]]);
+    expect(authenticatedFetch).toHaveBeenCalledOnce();
   });
 
   it("keeps a failed user attachment in the same square", async () => {

@@ -9,10 +9,13 @@ import {
   useState,
 } from "react";
 import * as DialogPrimitive from "radix-ui/dialog";
-import { XIcon, ZoomInIcon, ZoomOutIcon } from "lucide-react";
+import { DownloadIcon, XIcon, ZoomInIcon, ZoomOutIcon } from "lucide-react";
+import { toast } from "sonner";
 
 import { getEmbedRoot } from "@/lib/host";
 import { Button } from "@/components/ui/button";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { canDownloadImage, downloadImage } from "@/hooks/useFileContent";
 import { cn } from "@/lib/utils";
 
 // Zoom bounds and step for the lightbox viewer. 1 = fit-to-card.
@@ -30,6 +33,42 @@ function clampZoom(z: number) {
 interface LightboxImage {
   src: string;
   alt: string;
+  /** Save-dialog name; defaults to `alt`. */
+  downloadName?: string;
+  /** App API path the image was read from, for sources the page can't save itself. */
+  downloadPath?: string;
+}
+
+function saveImage({ src, alt, downloadName, downloadPath }: LightboxImage) {
+  downloadImage(src, downloadName || alt || "image", downloadPath).catch(() =>
+    toast.error("Download failed"),
+  );
+}
+
+function ImageDownloadButton({ image, className }: { image: LightboxImage; className?: string }) {
+  const name = image.downloadName || image.alt;
+  return (
+    // Local provider: images also render where no app-level provider exists.
+    <TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            aria-label={name ? `Download image: ${name}` : "Download image"}
+            className={className}
+            onClick={(e) => {
+              e.stopPropagation();
+              saveImage(image);
+            }}
+          >
+            <DownloadIcon />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">Download</TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  );
 }
 
 interface LightboxContextValue {
@@ -52,6 +91,10 @@ export interface ZoomableImageProps extends React.ComponentProps<"img"> {
   alt: string;
   /** Optional sizing for the button around the image. */
   buttonClassName?: string;
+  /** Save-dialog name; setting it also shows a download button on hover. */
+  downloadName?: string;
+  /** App API path the image was read from, for sources the page can't save itself. */
+  downloadPath?: string;
 }
 
 /**
@@ -67,10 +110,12 @@ export function ZoomableImage({
   alt,
   className,
   buttonClassName,
+  downloadName,
+  downloadPath,
   ...imgProps
 }: ZoomableImageProps) {
   const { open } = useLightbox();
-  return (
+  const zoom = (
     <button
       type="button"
       aria-label={alt ? `Zoom image: ${alt}` : "Zoom image"}
@@ -79,11 +124,24 @@ export function ZoomableImage({
         buttonClassName,
       )}
       onClick={() => {
-        if (src) open({ src, alt });
+        if (src) open({ src, alt, downloadName, downloadPath });
       }}
     >
       <img {...imgProps} src={src} alt={alt} className={className} />
     </button>
+  );
+  if (!downloadName || !src || !canDownloadImage(src, downloadPath)) return zoom;
+  return (
+    <span className="group/image relative inline-flex max-w-full">
+      {zoom}
+      <ImageDownloadButton
+        image={{ src, alt, downloadName, downloadPath }}
+        className={cn(
+          "absolute top-1 right-1 bg-background/80 shadow-sm ring-1 ring-foreground/10 backdrop-blur-xs hover:bg-background/90",
+          "opacity-0 group-hover/image:opacity-100 focus-visible:opacity-100",
+        )}
+      />
+    </span>
   );
 }
 
@@ -227,6 +285,7 @@ function ZoomViewer({ image, onClose }: { image: LightboxImage; onClose: () => v
         >
           <ZoomInIcon />
         </Button>
+        {canDownloadImage(image.src, image.downloadPath) && <ImageDownloadButton image={image} />}
       </div>
     </>
   );

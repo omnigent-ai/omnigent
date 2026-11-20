@@ -192,7 +192,11 @@ function clickDownloadLink(href: string, filename: string): void {
  */
 export async function downloadWorkspaceFile(conversationId: string, path: string): Promise<void> {
   const url = workspaceFileUrl(conversationId, path, { download: "true" });
-  const filename = path.split("/").pop() ?? path;
+  await downloadApiFile(url, path.split("/").pop() ?? path);
+}
+
+/** Save an app API response's bytes as `filename`; see {@link downloadWorkspaceFile}. */
+async function downloadApiFile(url: string, filename: string): Promise<void> {
   if (!isDatabricksWorkspace() && !isIOSShell() && !isAndroidShell()) {
     // A direct anchor navigation, so it must carry the deployment subpath the
     // fetch paths get for free via hostFetch/authenticatedFetch. Without it a
@@ -205,6 +209,44 @@ export async function downloadWorkspaceFile(conversationId: string, path: string
   const res = await authenticatedFetch(url);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   triggerBrowserDownload(await res.blob(), filename);
+}
+
+// The page already holds these bytes, so saving them sends no request.
+const IN_MEMORY_IMAGE_SOURCE = /^(?:blob|data):/i;
+
+/**
+ * Whether {@link downloadImage} can save an on-screen image.
+ *
+ * :param src: The source the `<img>` displays.
+ * :param apiPath: The app API path the image was read from, if any.
+ */
+export function canDownloadImage(src: string | undefined, apiPath?: string): boolean {
+  return src !== undefined && (IN_MEMORY_IMAGE_SOURCE.test(src) || apiPath !== undefined);
+}
+
+/**
+ * Save an image the page is showing.
+ *
+ * `blob:` and `data:` sources are saved from the bytes already loaded. Any
+ * other source is re-read from `apiPath` the way {@link downloadWorkspaceFile}
+ * reads a file; a remote URL without one is never fetched.
+ *
+ * :param src: The source the `<img>` displays.
+ * :param filename: The suggested filename for the save dialog.
+ * :param apiPath: The app API path the image was read from, e.g.
+ *     ``"/v1/sessions/s/resources/files/f/content"``.
+ */
+export async function downloadImage(
+  src: string,
+  filename: string,
+  apiPath?: string,
+): Promise<void> {
+  if (IN_MEMORY_IMAGE_SOURCE.test(src)) {
+    clickDownloadLink(src, filename);
+    return;
+  }
+  if (apiPath === undefined) throw new Error("This image can't be downloaded");
+  await downloadApiFile(apiPath, filename);
 }
 
 /** How often an on-screen text file is re-read to show other writers' edits. */
