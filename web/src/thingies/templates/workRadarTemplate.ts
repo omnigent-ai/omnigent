@@ -12,6 +12,12 @@
 // backslashes.
 
 import type { CreateThingyRevisionRequest } from "../api/thingyApi";
+import {
+  THINGY_KIT_HELPERS,
+  THINGY_KIT_STYLE,
+  THINGY_LAYOUT_SCHEMA,
+  THINGY_RENDER_REPORT_SCHEMA,
+} from "./templateKit";
 
 export const WORK_RADAR_COLLECTION = "radar";
 // The one record in `radar` and in `layout`; each scan or design replaces it.
@@ -122,48 +128,8 @@ export const WORK_RADAR_SCHEMA = {
   },
 } satisfies Record<string, unknown>;
 
-// What the session designed: the structure it chose and why, and the revisions it moved between.
-export const WORK_RADAR_LAYOUT_SCHEMA = {
-  type: "object",
-  additionalProperties: false,
-  required: ["structure", "revision_id", "changed_at"],
-  properties: {
-    structure: id(200),
-    why: text(600),
-    revision_id: id(64),
-    previous_revision_id: text(64),
-    changed_at: time,
-    change_note: text(200),
-    history: {
-      type: "array",
-      maxItems: 12,
-      items: {
-        type: "object",
-        additionalProperties: false,
-        required: ["revision_id", "at"],
-        properties: {
-          revision_id: id(64),
-          at: time,
-          note: text(200),
-          structure: text(200),
-        },
-      },
-    },
-  },
-} satisfies Record<string, unknown>;
-
-// Written by the page: whether a revision's design drew, keyed by the revision's ID.
-export const WORK_RADAR_REPORT_SCHEMA = {
-  type: "object",
-  additionalProperties: false,
-  required: ["state", "at"],
-  properties: {
-    state: { type: "string", enum: ["ok", "failed"] },
-    error: text(400),
-    view: text(80),
-    at: time,
-  },
-} satisfies Record<string, unknown>;
+export const WORK_RADAR_LAYOUT_SCHEMA = THINGY_LAYOUT_SCHEMA;
+export const WORK_RADAR_REPORT_SCHEMA = THINGY_RENDER_REPORT_SCHEMA;
 
 export const WORK_RADAR_STEP_RUN_SCHEMA = {
   type: "object",
@@ -187,55 +153,7 @@ export const WORK_RADAR_DISMISSED_SCHEMA = {
 } satisfies Record<string, unknown>;
 
 const KIT_STYLE = `
-:root {
-  color-scheme: light;
-  --bg: #f7f8fa; --surface: #ffffff; --text: #17191c; --muted: #646a73; --faint: #eceef2; --line: #d8dce3;
-  --accent: #4f46e5; --accent-soft: #eceafd; --focus: #2563eb;
-  --active: #4f46e5; --active-soft: #e8e7fc; --blocked: #dc2626; --blocked-soft: #fde4e4;
-  --waiting: #d97706; --waiting-soft: #fdf0dc; --done: #16a34a; --done-soft: #def5e5;
-  --sans: system-ui, -apple-system, 'Segoe UI', sans-serif;
-}
-body[data-theme='dark'] {
-  color-scheme: dark;
-  --bg: #121317; --surface: #1b1d22; --text: #eceef2; --muted: #9aa1ac; --faint: #24272e; --line: #343842;
-  --accent: #8b84ff; --accent-soft: #2a2850; --focus: #60a5fa;
-  --active: #8b84ff; --active-soft: #27264a; --blocked: #f87171; --blocked-soft: #3d2023;
-  --waiting: #fbbf24; --waiting-soft: #3a2f17; --done: #4ade80; --done-soft: #1b3324;
-}
-* { box-sizing: border-box; }
-[hidden] { display: none !important; }
-body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 var(--sans); }
-main { max-width: 1040px; margin: 0 auto; padding: 20px 18px 56px; }
-h1 { font-size: 24px; line-height: 1.2; margin: 0; letter-spacing: -0.01em; }
-h2 { font-size: 15px; margin: 0 0 10px; }
-h3 { font-size: 15px; margin: 0; }
-button { font: inherit; color: inherit; }
-button:focus-visible, select:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
-.top { display: flex; flex-wrap: wrap; gap: 12px 20px; align-items: flex-end; justify-content: space-between; }
-.kicker { display: flex; align-items: center; gap: 8px; margin: 0 0 4px; font-size: 12px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--accent); }
-.badge { font-size: 11px; font-weight: 600; letter-spacing: 0; text-transform: none; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); background: var(--surface); }
-.meta { margin-top: 4px; font-size: 13px; color: var(--muted); }
-.headline { margin: 10px 0 0; font-size: 15px; max-width: 760px; }
-.toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-.primary { border: 1px solid var(--accent); background: var(--accent); color: #fff; border-radius: 8px; padding: 6px 14px; font-weight: 600; cursor: pointer; }
-.primary:disabled { opacity: 0.55; cursor: default; }
-.quiet { border: 1px solid var(--line); background: var(--surface); border-radius: 8px; padding: 5px 10px; cursor: pointer; }
-.quiet[aria-pressed='true'] { border-color: var(--accent); background: var(--accent-soft); }
-.quiet:disabled { opacity: 0.55; cursor: default; }
-select { font: inherit; color: inherit; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 4px 6px; }
-.window { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; }
-.status { display: flex; align-items: center; gap: 8px; min-height: 22px; margin-top: 10px; font-size: 13px; color: var(--muted); }
-.spinner { width: 12px; height: 12px; border: 2px solid var(--accent); border-right-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite; flex: none; }
-@keyframes spin { to { transform: rotate(360deg); } }
-.notice { margin: 10px 0 0; padding: 9px 12px; border-radius: 8px; background: var(--faint); font-size: 13px; }
-.notice[data-kind='error'] { background: var(--blocked-soft); color: var(--blocked); }
-section { margin-top: 22px; }
-
-/* Empty state */
-.empty { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 24px; align-items: center; padding: 26px; background: var(--surface); border: 1px solid var(--line); border-radius: 16px; }
-.empty h2 { font-size: 20px; margin-bottom: 6px; }
-.empty p { margin: 0 0 12px; color: var(--muted); }
-
+${THINGY_KIT_STYLE}
 /* Next up */
 .next-list { display: flex; flex-wrap: wrap; gap: 8px; }
 .next-chip { display: inline-flex; align-items: center; gap: 8px; max-width: 100%; text-align: left; border: 1px solid var(--line); background: var(--surface); border-radius: 999px; padding: 6px 12px 6px 8px; cursor: pointer; }
@@ -269,7 +187,6 @@ section { margin-top: 22px; }
 .kind-icon.kind-icon circle, .kind-icon.kind-icon path { fill: none; stroke: var(--accent); stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 .kind-icon .kind-fill.kind-fill { fill: var(--accent); stroke: none; }
 .step-why { margin: 3px 0 0 26px; font-size: 12.5px; color: var(--muted); }
-.quote { font-style: italic; }
 .step-run { display: flex; align-items: center; gap: 6px; margin: 6px 0 0 26px; font-size: 12.5px; }
 .step[data-run='done'] .step-run { color: var(--done); }
 .step[data-run='failed'] .step-run { color: var(--blocked); }
@@ -296,10 +213,7 @@ section { margin-top: 22px; }
 .steps-bar i[data-s='started'] { background: var(--active); }
 .steps-bar i[data-s='needs_input'] { background: var(--waiting); }
 .steps-bar i[data-s='failed'] { background: var(--blocked); }
-.cite { border: none; background: none; padding: 0; color: var(--accent); cursor: pointer; font-size: inherit; }
-.cite:hover { text-decoration: underline; }
 .dismissed-note { margin-top: 8px; font-size: 12px; color: var(--muted); }
-.link-button { border: none; background: none; padding: 0; color: var(--accent); cursor: pointer; font-size: inherit; }
 
 /* Done recently and the guide */
 .done-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
@@ -315,43 +229,10 @@ section { margin-top: 22px; }
 .next-chip.finished[data-state='failed'] .mark { color: var(--blocked); }
 @keyframes done-in { from { transform: translateY(4px); opacity: 0.4; } to { transform: none; opacity: 1; } }
 @keyframes pop { 0% { transform: scale(0.4); } 60% { transform: scale(1.3); } 100% { transform: scale(1); } }
-.guide { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 4px 16px; }
-.guide summary { cursor: pointer; font-weight: 600; padding: 10px 0; }
-.guide-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px 28px; padding-bottom: 14px; }
-.guide h3 { font-size: 13px; margin: 8px 0 6px; }
-.guide ul { margin: 0; padding-left: 18px; color: var(--muted); }
-.guide li { margin: 3px 0; }
-.guide .ask { color: var(--text); }
-.layers { display: grid; gap: 8px; }
-.layer { display: grid; grid-template-columns: 26px minmax(0, 1fr); gap: 8px; align-items: start; color: var(--muted); }
-.layer b { color: var(--text); }
-.layer svg { width: 26px; height: 26px; }
-footer { margin-top: 26px; font-size: 12px; color: var(--muted); }
 @media (max-width: 640px) {
-  main { padding: 14px 12px 40px; }
-  .empty { grid-template-columns: minmax(0, 1fr); padding: 18px; }
-  .guide-grid { grid-template-columns: minmax(0, 1fr); }
   .areas { grid-template-columns: minmax(0, 1fr); }
 }
-@media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after { animation: none !important; transition: none !important; }
-}
 
-/* The look line and first-scan progress */
-.look { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin-top: 8px; font-size: 13px; color: var(--muted); }
-.look b { color: var(--text); font-weight: 600; }
-.look[data-kind='failed'] { padding: 8px 12px; border-radius: 8px; background: var(--blocked-soft); color: var(--blocked); }
-.look[data-kind='failed'] b { color: var(--blocked); }
-.look .quiet { font-size: 12.5px; padding: 3px 9px; }
-.progress { list-style: none; margin: 14px 0 0; padding: 0; display: grid; gap: 6px; }
-.progress li { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
-.progress li::before { content: ''; flex: none; width: 10px; height: 10px; border-radius: 50%; border: 2px solid var(--line); }
-.progress li[data-now='true'] { color: var(--text); font-weight: 600; }
-.progress li[data-now='true']::before { border-color: var(--accent); border-right-color: transparent; animation: spin 0.8s linear infinite; }
-.progress li[data-done='true']::before { border-color: var(--done); background: var(--done); }
-.view { margin-top: 22px; }
-.elapsed { font-variant-numeric: tabular-nums; }
-.view:empty { display: none; }
 
 /* The empty state's radar */
 .radar-art { width: 100%; height: auto; display: block; }
@@ -370,7 +251,7 @@ footer { margin-top: 26px; font-size: 12px; color: var(--muted); }
 const KIT_SCRIPT = `
 (function () {
   'use strict';
-  var SVG_NS = 'http://www.w3.org/2000/svg';
+${THINGY_KIT_HELPERS}
   var OPEN = ['pending', 'queued', 'running', 'needs_input'];
   var PENDING_MS = 10 * 60 * 1000;
   var STATE_LABELS = { active: 'Active', blocked: 'Blocked', waiting: 'Waiting', done: 'Done' };
@@ -430,7 +311,6 @@ const KIT_SCRIPT = `
   var viewDirty = true;
   var previewSeeded = false;
   var lastWidth = 0;
-  var calm = Boolean(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
 
   // ---- The view, and the fallback to the plain one
 
@@ -440,18 +320,6 @@ const KIT_SCRIPT = `
   var started = false;
   var reported = {};
 
-  function message(error) { return error && error.message ? error.message : String(error); }
-  // Text an agent wrote, without its Markdown marks: quotes come from session messages.
-  function plain(value) {
-    return String(value || '')
-      .replace(/\\[([^\\]]*)\\]\\([^)]*\\)/g, '$1')
-      .replace(/(\\*\\*|__|\\*|_|\`)(\\S(?:.*?\\S)?)\\1/g, '$2')
-      .replace(/^\\s{0,3}(?:#{1,6}\\s+|>\\s?|[-*+]\\s+)/gm, '')
-      .replace(/\\s+/g, ' ')
-      .trim();
-  }
-  // A sentence to go before more text: without its closing period.
-  function clause(value) { return String(value || '').replace(/[\\s.]+$/, ''); }
 
   // A design that throws while it loads or draws is replaced by the plain view, its styles are
   // switched off, and the page reports it in render_reports for the thingy session.
@@ -516,105 +384,8 @@ const KIT_SCRIPT = `
     };
   }
 
-  // ---- DOM helpers
+  // ---- States
 
-  function setProps(node, props) {
-    Object.keys(props || {}).forEach(function (key) {
-      var value = props[key];
-      if (value === null || value === undefined || value === false) return;
-      if (key === 'text') node.textContent = value;
-      else if (key === 'on') Object.keys(value).forEach(function (type) { node.addEventListener(type, value[type]); });
-      else node.setAttribute(key, value === true ? '' : String(value));
-    });
-  }
-  function el(tag, props, children) {
-    var node = document.createElement(tag);
-    setProps(node, props);
-    (children || []).forEach(function (child) {
-      if (child !== null && child !== undefined && child !== false) node.appendChild(typeof child === 'string' ? document.createTextNode(child) : child);
-    });
-    return node;
-  }
-  function svg(tag, props, children) {
-    var node = document.createElementNS(SVG_NS, tag);
-    setProps(node, props);
-    (children || []).forEach(function (child) {
-      if (child !== null && child !== undefined && child !== false) node.appendChild(typeof child === 'string' ? document.createTextNode(child) : child);
-    });
-    return node;
-  }
-  function $(elementId) { return document.getElementById(elementId); }
-
-  // Keeps one element per key in parent, in the order of items, and moves an element that kept
-  // its key from where it was (or fades a new one in), so a rescan animates instead of redrawing.
-  function keyed(parent, items, keyOf, build) {
-    var before = {};
-    if (!calm) {
-      Array.prototype.forEach.call(parent.children, function (child) {
-        var key = child.getAttribute('data-key');
-        if (key) before[key] = child.getBoundingClientRect();
-      });
-    }
-    var nodes = items.map(function (item, index) {
-      var node = build(item, index);
-      node.setAttribute('data-key', String(keyOf(item, index)));
-      return node;
-    });
-    parent.replaceChildren.apply(parent, nodes);
-    if (!calm) {
-      nodes.forEach(function (node) {
-        if (typeof node.animate !== 'function') return;
-        var from = before[node.getAttribute('data-key')];
-        if (!from) {
-          node.animate([{ opacity: 0, transform: 'translateY(6px)' }, { opacity: 1, transform: 'none' }], { duration: 360, easing: 'ease-out' });
-          return;
-        }
-        var to = node.getBoundingClientRect();
-        var dx = from.left - to.left;
-        var dy = from.top - to.top;
-        if (Math.abs(dx) + Math.abs(dy) > 1) {
-          node.animate([{ transform: 'translate(' + dx + 'px, ' + dy + 'px)' }, { transform: 'none' }], { duration: 480, easing: 'cubic-bezier(0.2, 0.8, 0.2, 1)' });
-        }
-      });
-    }
-    return nodes;
-  }
-
-  function ago(iso) {
-    var at = Date.parse(iso || '');
-    if (isNaN(at)) return '';
-    var minutes = Math.round((Date.now() - at) / 60000);
-    if (minutes < 1) return 'just now';
-    if (minutes < 60) return minutes + ' min ago';
-    var hours = Math.round(minutes / 60);
-    if (hours < 24) return hours + ' h ago';
-    var days = Math.round(hours / 24);
-    return days === 1 ? 'yesterday' : days + ' days ago';
-  }
-  function hash(textValue) {
-    var h = 2166136261;
-    for (var i = 0; i < textValue.length; i += 1) { h ^= textValue.charCodeAt(i); h = Math.imul(h, 16777619); }
-    return (h >>> 0) / 4294967295;
-  }
-  // Lines of at most maxChars for SVG text, which does not wrap on its own.
-  function wrap(textValue, maxChars, maxLines) {
-    var words = String(textValue).split(' ');
-    var lines = [];
-    var line = '';
-    var i = 0;
-    for (; i < words.length; i += 1) {
-      var next = line ? line + ' ' + words[i] : words[i];
-      if (next.length <= maxChars || !line) { line = next; continue; }
-      lines.push(line);
-      line = words[i];
-      if (lines.length === maxLines) break;
-    }
-    if (lines.length < maxLines && line) { lines.push(line); line = ''; }
-    var cut = lines.length === maxLines && (line || i < words.length);
-    lines = lines.map(function (entry) { return entry.length > maxChars ? entry.slice(0, maxChars - 1) + '…' : entry; });
-    if (cut) lines[maxLines - 1] = lines[maxLines - 1].slice(0, Math.max(1, maxChars - 1)) + '…';
-    return lines;
-  }
   function stateKey(state) { return STATE_LABELS[state] ? state : 'active'; }
   function stateColor(state) { return 'var(--' + stateKey(state) + ')'; }
   function stateSoft(state) { return 'var(--' + stateKey(state) + '-soft)'; }
@@ -1040,11 +811,6 @@ const KIT_SCRIPT = `
     liveButton.textContent = live.on ? 'Live status on' : 'Show live status';
   }
 
-  function elapsed(since) {
-    var seconds = Math.max(0, Math.round((Date.now() - since) / 1000));
-    var rest = seconds % 60;
-    return Math.floor(seconds / 60) + ':' + (rest < 10 ? '0' : '') + rest;
-  }
 
   function renderScanStatus(value) {
     var box = $('run');

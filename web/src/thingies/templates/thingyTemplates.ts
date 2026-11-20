@@ -1,7 +1,8 @@
 // Starting points for a new thingy, each a working example of the SDK's patterns. A template's
-// revision is uploaded and published as the thingy's first version. The data story seeds
-// synthetic sample data on first load; the work radar starts empty until its session scans the
-// viewer's own sessions and designs the page for them.
+// revision is uploaded and published as the thingy's first version. Both start empty: the work
+// radar until its session scans the viewer's sessions, the data story until its session finds
+// story ideas in them and builds the one the viewer picks. Each session then designs the page;
+// only a template's preview shows an example.
 
 import { DATA_STORY_REVISION } from "./dataStoryTemplate";
 import type { CreateThingyRevisionRequest } from "../api/thingyApi";
@@ -37,14 +38,16 @@ const messages = {
   radarSuggestWindow: "Scan 7 days by default and leave out trivial sessions",
   storyName: "Data story",
   storyDescription:
-    "A scrolling, interactive report with annotated charts that an agent refreshes from a SQL table.",
-  storyShowsHeadline: "A headline metric with its trend",
-  storyShowsCharts: "Hand-drawn charts with annotations the agent writes",
-  storyShowsInteraction: "Filters, brushing and drill-down",
-  storyShowsRefresh: "A Refresh action with live progress, and Ask in side chat on any point",
-  storySuggestConnect: "Connect it to my table",
-  storySuggestExplain: "Explain the biggest change this week",
-  storySuggestBreakdown: "Add a breakdown by region",
+    "Finds the stories in your recent data work, then builds the one you pick from real data.",
+  storyShowsIdeas:
+    "Story ideas from your recent sessions: the tables you queried and the metrics you checked",
+  storyShowsBuild:
+    "The story you pick, built from real data: a headline number, annotated charts, the takeaways",
+  storyShowsDesign: "A page your thingy session designs for that story, so no two look alike",
+  storyShowsRefresh: "Refresh data, Back to the previous look, and where every number comes from",
+  storySuggestFind: "Find stories in my sessions from the last 7 days",
+  storySuggestOwn: "Build a story about my team's weekly active users",
+  storySuggestWindow: "Look back 30 days for story ideas",
   blankName: "Blank",
   blankDescription: "An empty thingy. Describe what it should do in its session.",
   blankShows: "Nothing yet: its session builds it with you",
@@ -73,16 +76,12 @@ export const THINGY_TEMPLATES: readonly ThingyTemplate[] = [
     name: messages.storyName,
     description: messages.storyDescription,
     shows: [
-      messages.storyShowsHeadline,
-      messages.storyShowsCharts,
-      messages.storyShowsInteraction,
+      messages.storyShowsIdeas,
+      messages.storyShowsBuild,
+      messages.storyShowsDesign,
       messages.storyShowsRefresh,
     ],
-    suggestions: [
-      messages.storySuggestConnect,
-      messages.storySuggestExplain,
-      messages.storySuggestBreakdown,
-    ],
+    suggestions: [messages.storySuggestFind, messages.storySuggestOwn, messages.storySuggestWindow],
     revision: DATA_STORY_REVISION,
   },
   {
