@@ -1432,6 +1432,30 @@ describe("mark as unread", () => {
 });
 
 describe("right-click context menu", () => {
+  it("opens the session in its own window without leaving the current page", () => {
+    const popup = { location: { pathname: "blank", href: "about:blank" }, focus: vi.fn() };
+    const open = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
+    renderSidebar();
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Open in new window" }));
+
+    expect(open).toHaveBeenCalledWith("", "omnigent-session-conv_1", "popup,width=960,height=820");
+    expect(popup.location.href).toBe("/c/conv_1?window=session");
+    expect(popup.focus).toHaveBeenCalled();
+    open.mockRestore();
+  });
+
+  it("offers no new window on a mobile viewport", () => {
+    mocks.isMobile = true;
+    renderSidebar();
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+
+    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+    expect(screen.queryByTestId("open-session-window")).toBeNull();
+  });
+
   it("offers Fork for a managed source", () => {
     mockConversations([{ ...CONV, labels: { "omnigent.host_type": "managed" } }]);
     renderSidebar();

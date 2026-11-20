@@ -7006,3 +7006,66 @@ describe("New Window keeps its source's server (src/main.js)", () => {
     assert.equal(h.api.windows.get(h.win).serverUrl, "https://host.example/ml/omnigents");
   });
 });
+
+describe("session windows (src/main.js)", () => {
+  const serverUrl = "https://host.example/omnigent";
+  const flush = () =>
+    new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+
+  function openSessionWindow(h, sessionId, frameUrl = h.webContents.getURL()) {
+    h.api.registerIpc();
+    const event = { sender: h.webContents, senderFrame: { url: frameUrl } };
+    return h.ipc.get("omnigent:open-session-window")(event, sessionId);
+  }
+
+  it("opens the session in a new window on the sender's server", async (t) => {
+    const h = loadNavigationHarness({ serverUrl });
+    t.after(h.cleanup);
+    assert.equal(openSessionWindow(h, "conv_1"), true);
+    await flush();
+    assert.deepEqual(
+      { width: h.calls.windowOptions.at(-1).width, height: h.calls.windowOptions.at(-1).height },
+      { width: 960, height: 820 },
+    );
+    assert.equal(h.calls.loadURL.at(-1)[0], `${serverUrl}/c/conv_1?window=session`);
+    const state = h.api.windows.get(h.win);
+    assert.equal(state.serverUrl, serverUrl);
+    assert.equal(state.sessionWindowId, "conv_1");
+    assert.equal(state.role, "main");
+  });
+
+  it("keeps the main window's saved bounds when a session window moves or closes", async (t) => {
+    const h = loadNavigationHarness({ serverUrl });
+    t.after(h.cleanup);
+    const saved = { x: 10, y: 20, width: 1400, height: 900, maximized: false };
+    fs.writeFileSync(h.settingsPath, JSON.stringify({ window_bounds: saved }));
+    openSessionWindow(h, "conv_1");
+    await flush();
+    assert.equal(h.calls.windowOptions.at(-1).x, undefined);
+    h.emitWindow("close");
+    assert.deepEqual(JSON.parse(fs.readFileSync(h.settingsPath, "utf8")).window_bounds, saved);
+  });
+
+  it("brings an open window for the session forward instead of opening another", (t) => {
+    const h = loadNavigationHarness({ serverUrl });
+    t.after(h.cleanup);
+    h.api.windows.get(h.win).sessionWindowId = "conv_1";
+    h.setUrl(`${serverUrl}/c/conv_1?window=session`);
+    const before = h.calls.windowOptions?.length ?? 0;
+    const focusedBefore = h.calls.focused ?? 0;
+    assert.equal(openSessionWindow(h, "conv_1"), true);
+    assert.equal(h.calls.windowOptions?.length ?? 0, before);
+    assert.equal(h.calls.focused, focusedBefore + 1);
+  });
+
+  it("refuses untrusted pages and malformed session ids", (t) => {
+    const h = loadNavigationHarness({ serverUrl });
+    t.after(h.cleanup);
+    assert.equal(openSessionWindow(h, "conv_1", "https://evil.example"), false);
+    assert.equal(openSessionWindow(h, "../settings"), false);
+    assert.equal(openSessionWindow(h, { id: "conv_1" }), false);
+    assert.equal(h.calls.windowOptions, undefined);
+  });
+});

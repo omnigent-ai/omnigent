@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
+  AppWindowIcon,
   ArchiveIcon,
   ArchiveRestoreIcon,
   ChevronLeftIcon,
@@ -72,6 +73,7 @@ import { ProjectPicker } from "./ProjectPicker";
 import { markConversationUnread } from "@/hooks/useUnseenConversations";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useOpenSessionWindow } from "@/hooks/useOpenSessionWindow";
 import { useDesktopCommand } from "@/lib/desktopCommands";
 import { supportsDesktopCommands } from "@/lib/nativeBridge";
 import { useIsEmbedded } from "@/lib/embedded";
@@ -132,6 +134,7 @@ export function HeaderConversationMenu({
   const queryClient = useQueryClient();
   const isMobile = useIsMobileViewport();
   const isEmbedded = useIsEmbedded();
+  const openSessionWindow = useOpenSessionWindow();
   const { trackClick } = useOmnigentAnalytics();
   const togglePinned = useTogglePinnedConversation();
   // Pin writes don't overlap, so Pin/Unpin is disabled while one is saving.
@@ -309,6 +312,16 @@ export function HeaderConversationMenu({
       )}
       {/* Chat/Terminal renders its own trailing separator (null on other sessions). */}
       {viewItems}
+      {openSessionWindow && (
+        <DropdownMenuItem
+          data-testid="header-open-session-window"
+          className={itemClass}
+          onSelect={() => openSessionWindow(conversation.id)}
+        >
+          <AppWindowIcon className="size-3.5" />
+          Open in new window
+        </DropdownMenuItem>
+      )}
       {canPin && (
         <DropdownMenuItem
           data-testid="header-pin-conversation"

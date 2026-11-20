@@ -223,6 +223,7 @@ describe("HeaderConversationMenu", () => {
     // breadcrumb title (HeaderTitle) and folder tag (HeaderProjectTag) shortcuts.
     expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
       "Add nested agent",
+      "Open in new window",
       "Pin",
       "Share",
       "Fork",
@@ -235,6 +236,30 @@ describe("HeaderConversationMenu", () => {
     ]);
     expect(screen.getByTestId("header-move-to-project")).toBeInTheDocument();
     expect(screen.getByTestId("header-rename-conversation")).toBeInTheDocument();
+  });
+
+  it("opens the session in a sized popup from Open in new window", () => {
+    const popup = { location: { pathname: "blank", href: "about:blank" }, focus: vi.fn() };
+    const open = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
+    renderMenu();
+    openMenu();
+    fireEvent.click(screen.getByTestId("header-open-session-window"));
+    expect(open).toHaveBeenCalledWith("", "omnigent-session-conv-1", "popup,width=960,height=820");
+    expect(popup.location.href).toBe("/c/conv-1?window=session");
+    expect(popup.focus).toHaveBeenCalled();
+    expect(screen.getByTestId("location")).toHaveTextContent("/c/conv-1");
+    open.mockRestore();
+  });
+
+  it("explains a blocked popup", () => {
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+    renderMenu();
+    openMenu();
+    fireEvent.click(screen.getByTestId("header-open-session-window"));
+    expect(mocks.toastError).toHaveBeenCalledWith(
+      "Your browser blocked the new window. Allow pop-ups for this site.",
+    );
+    open.mockRestore();
   });
 
   it("hides Mark as unread for a muted session", () => {
@@ -262,7 +287,7 @@ describe("HeaderConversationMenu", () => {
       openMenu();
       expect(screen.queryByRole("menuitem", { name: "Add nested agent" })).toBeNull();
       expect(screen.getByRole("menu").firstElementChild).toBe(
-        screen.getByRole("menuitem", { name: "Pin" }),
+        screen.getByRole("menuitem", { name: "Open in new window" }),
       );
     },
   );
