@@ -283,7 +283,12 @@ def test_watchers_leave_scrollback_alone_when_nothing_is_on_screen(pane: _Pane) 
 
     assert bridge.dismiss_btw_overlay(pane.bridge_dir) is False
     receipt = bridge.ClaudeLegacyModelSwitchResult(
-        "private-model", "private-model", bridge._legacy_model_pane(pane.bridge_dir)
+        "private-model",
+        "private-model",
+        bridge._legacy_model_pane(pane.bridge_dir),
+        confirmation_model="private-model",
+        confirmation_label="private-model",
+        confirmation_pending=True,
     )
     assert receipt.pane is not None
     assert bridge.confirm_legacy_model_dialog(pane.bridge_dir, receipt=receipt) is False
