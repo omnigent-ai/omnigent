@@ -533,6 +533,9 @@ test("opening another server calls off an open still waiting on its page", (t) =
   controller.markReady(created[0]);
   t.mock.timers.tick(FLOATING_COMPOSER_READY_FALLBACK_MS);
   assert.equal(created[0].visible, false);
+  // A's open is over too: once B goes, a press doesn't go back to A.
+  controller.hide(created[1]);
+  assert.equal(controller.openServerUrl(), null);
 });
 
 test("opening one server lets go of another server's panel built ahead", () => {

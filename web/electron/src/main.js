@@ -5364,7 +5364,7 @@ function registerIpc() {
     const contents = win.webContents;
     const hadSupport = floatingComposerSupport.any();
     if (!floatingComposerSupport.announce(contents.id, serverUrl)) return;
-    // Cancel any pending release for this server.
+    // A new announcement means a reload finished, so the panel built ahead stays.
     clearTimeout(floatingComposerReleases.get(serverUrl));
     floatingComposerReleases.delete(serverUrl);
     // Support ends with this document: when another one commits, or its renderer goes away.

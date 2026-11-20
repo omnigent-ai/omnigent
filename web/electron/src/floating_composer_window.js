@@ -324,7 +324,10 @@ function createFloatingComposerController(deps) {
       unshown.delete(panel);
       for (const [otherUrl, other] of [...panels]) {
         if (other === panel) continue;
-        cancelReveal(other);
+        if (pendingReveals.has(other)) {
+          cancelReveal(other);
+          open.delete(other);
+        }
         if (unshown.has(other)) discard(otherUrl, other);
       }
       // The latest open goes last, so a press while it's open comes back to it.

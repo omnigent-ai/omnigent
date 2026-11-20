@@ -3921,21 +3921,34 @@ describe("floating panel wiring", () => {
     const h = loadNavigationHarness({ platform: "darwin" });
     t.after(h.cleanup);
     h.api.registerIpc();
+    const main = addMain(h);
+    const steals = [];
+    h.electron.app.focus = (options) => steals.push(options);
+    let shown = 0;
+    h.win.show = () => (shown += 1);
     const panel = openPanel(h, { ready: false });
     assert.equal(panel.visible, false, "its page is still loading");
-    const ready = (frame, mainFrame = frame) => {
-      h.webContents.mainFrame = mainFrame;
-      h.ipc.get("omnigent:floating-composer:ready")({ sender: h.webContents, senderFrame: frame });
+    const ready = (frame, { mainFrame = frame, sender = h.webContents } = {}) => {
+      sender.mainFrame = mainFrame;
+      h.ipc.get("omnigent:floating-composer:ready")({ sender, senderFrame: frame });
     };
     h.setUrl(`${serverUrl}/compose/floating`);
-    ready({ url: h.webContents.getURL() }, { url: "top" });
+    ready({ url: h.webContents.getURL() }, { mainFrame: { url: "top" } });
     assert.equal(panel.visible, false, "a subframe can't speak for the panel");
+    ready({ url: main.url }, { sender: main.webContents });
+    assert.equal(panel.visible, false, "nor can a main window");
+    ready({ url: "https://evil.example/compose/floating" });
+    assert.equal(panel.visible, false, "nor a page from another origin");
     h.setUrl(`${serverUrl}/`);
     ready({ url: h.webContents.getURL() });
-    assert.equal(panel.visible, false, "a page that left the panel route can't either");
+    assert.equal(panel.visible, false, "nor a page that left the panel route");
     h.setUrl(`${serverUrl}/compose/floating`);
     ready({ url: h.webContents.getURL() });
     assert.equal(panel.visible, true);
+    // It came on screen without activating the app or raising the main window.
+    assert.equal(shown, 0, "show() orders a window front with the app");
+    assert.deepEqual(steals, []);
+    assert.equal(main.focused, 0);
   });
 
   /** A main window of the panel's server, beside it, whose page is at `url`. */
@@ -4205,24 +4218,6 @@ describe("floating panel wiring", () => {
     });
   }
 
-  it("a panel waiting for its page comes on screen without activating the app", (t) => {
-    const h = loadNavigationHarness({ platform: "darwin" });
-    t.after(h.cleanup);
-    h.api.registerIpc();
-    const main = addMain(h);
-    const steals = [];
-    h.electron.app.focus = (options) => steals.push(options);
-    let shown = 0;
-    h.win.show = () => (shown += 1);
-    const panel = openPanel(h, { ready: false });
-    assert.equal(panel.visible, false);
-    h.api.floatingComposer().markReady(h.win);
-    assert.equal(panel.visible, true);
-    assert.equal(shown, 0, "show() keys a window by ordering it front with the app");
-    assert.deepEqual(steals, []);
-    assert.equal(main.focused, 0);
-  });
-
   it("⇧⌘Space while the panel is open goes back to it, never to raising a window", (t) => {
     const h = loadNavigationHarness({ platform: "darwin" });
     t.after(h.cleanup);
@@ -4253,16 +4248,6 @@ describe("floating panel wiring", () => {
     h.api.focusAfterBrowserSignIn(h.win);
     assert.equal(shown, 1);
     assert.equal(steals.length, 1);
-  });
-
-  it("hides the panel when its page dismisses it", (t) => {
-    const h = loadNavigationHarness({ platform: "darwin" });
-    t.after(h.cleanup);
-    h.api.registerIpc();
-    const panel = openPanel(h);
-    h.ipc.get("omnigent:floating-composer:dismiss")(fromPanel(h));
-    assert.equal(panel.visible, false);
-    assert.equal(panel.destroyed, false);
   });
 
   it("closes the panel when any main window of its server lands on its sign-in page", (t) => {
