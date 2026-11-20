@@ -43,7 +43,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TypeAlias, TypedDict, cast
+from typing import Any, TypeAlias, TypedDict, cast
 
 from omnigent.entities.environment_filesystem import FilesystemEntry, InvalidPath
 from omnigent.entities.pagination import PagedList, paginate_in_memory
@@ -645,8 +645,9 @@ class WorkspaceReader:
             raw_changes = self._registry.list_changed_files(session_id, limit=10_000)
         except GitStatusUnavailable as exc:
             raise WorkspaceReaderError(500, "git_status_failed", exc.reason) from exc
-        data = [
-            {
+        data: list[dict[str, Any]] = []
+        for rec in raw_changes:
+            entry: dict[str, Any] = {
                 "object": "session.environment.filesystem.entry",
                 "path": rec["path"],
                 "name": rec["path"].split("/")[-1],
@@ -657,8 +658,11 @@ class WorkspaceReader:
                 "lines_removed": rec.get("lines_removed"),
                 "untracked_lines": rec.get("untracked_lines"),
             }
-            for rec in raw_changes
-        ]
+            if "staged" in rec:
+                entry["staged"] = rec["staged"]
+            if "unstaged" in rec:
+                entry["unstaged"] = rec["unstaged"]
+            data.append(entry)
         return {"object": "list", "data": data, "has_more": False}
 
     def diff(self, session_id: str, relative_path: str) -> _WorkspacePayload:
