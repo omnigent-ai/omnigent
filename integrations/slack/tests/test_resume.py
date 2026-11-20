@@ -100,6 +100,7 @@ async def test_binding_inflight_and_other_owner(store):
     await bind(store)
     await store.set_turn_inflight(KEY, True)
     assert (await bind(store, OTHER, force=True))[0] == "busy"
+    assert (await bind(store, OTHER, force=True, allow_abandoned_turn=True))[0] == "busy"
     assert (
         await store.bind_session(
             OTHER,
@@ -451,13 +452,46 @@ async def test_recovery_wait_timeout_uses_real_readiness_loop(environment):
     omni.resume_snapshot.assert_awaited()
 
 
-async def test_force_during_active_old_thread(environment, store):
+@pytest.mark.parametrize("inflight", [False, True])
+async def test_force_during_active_old_thread(environment, store, inflight):
     await resume(environment)
+    await store.set_turn_inflight(KEY, inflight)
     environment[0]._active_threads.add(KEY)
     assert "existing Slack thread is busy" in await resume(
         environment, OTHER, "resume conv_a --force"
     )
     assert await store.get_session(OTHER) is None
+
+
+@pytest.mark.parametrize(
+    "snapshot,can_move",
+    [
+        ({}, True),
+        ({"status": "running"}, False),
+        ({"status": "waiting"}, False),
+        ({"pending_elicitations": [{"id": "question"}]}, False),
+        ({"runner_online": False}, False),
+        ({"status": None}, False),
+    ],
+)
+async def test_force_after_abandoned_turn(environment, store, snapshot, can_move):
+    await resume(environment)
+    await store.set_turn_inflight(KEY, True)
+    service, slack, state, _ = environment
+    state["snapshot"].update(snapshot)
+    state["requests"].clear()
+    slack.reset_mock()
+    text = await resume(environment, OTHER, "resume conv_a --force")
+    if can_move:
+        assert "Ready" in text
+        assert await store.get_session(KEY) is None
+        assert not (await store.get_session(OTHER)).turn_inflight
+    else:
+        assert "existing Slack thread is busy" in text
+        assert (await store.get_session(KEY)).turn_inflight
+        assert await store.get_session(OTHER) is None
+    assert not service._active_threads
+    assert all(request.method == "GET" for request in state["requests"])
 
 
 async def test_recovery_refreshes_assigned_host(environment, store):

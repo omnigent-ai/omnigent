@@ -252,8 +252,13 @@ class SQLiteStore:
         host_type: HostType,
         force: bool = False,
         reserve_previous: Callable[[ThreadKey], bool] | None = None,
+        allow_abandoned_turn: bool = False,
     ) -> tuple[str, ThreadKey | None]:
-        """Atomically bind, refusing occupied destinations and conflicting owners."""
+        """Atomically bind, refusing occupied destinations and conflicting owners.
+
+        Allow abandoned markers only after the caller confirms server idleness;
+        the previous thread must still be reserved inside this transaction.
+        """
         async with aiosqlite.connect(self._path) as db:
             await db.execute("BEGIN IMMEDIATE")
             cursor = await db.execute(
@@ -283,7 +288,7 @@ class SQLiteStore:
                 await db.rollback()
                 return "conflict", previous
             if row and (
-                row[4]
+                (row[4] and not (allow_abandoned_turn and reserve_previous is not None))
                 or (reserve_previous is not None and not reserve_previous(ThreadKey(*row[:3])))
             ):
                 await db.rollback()

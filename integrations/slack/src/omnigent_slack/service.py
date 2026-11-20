@@ -689,6 +689,11 @@ class SlackOmnigentService:
                 host_type=host_type,
                 force=force,
                 reserve_previous=reserve_previous,
+                allow_abandoned_turn=(
+                    snapshot.get("status") == "idle"
+                    and snapshot.get("runner_online") is True
+                    and not snapshot.get("pending_elicitations")
+                ),
             )
             if outcome == "busy":
                 await post("The existing Slack thread is busy. Wait before moving its session.")
