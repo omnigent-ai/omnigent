@@ -59,6 +59,14 @@ the header menu), and each place is a separate entry point.
   sessions shown before typing leave them out. Results show project and parent
   session breadcrumbs when available, including when the parent did not match
   the search. Desktop and mobile search use the same context.
+- `palette-session-commands`: with `quick_pick_palette`, ⌘K also lists the open
+  session's header-menu actions under **Session**: Add nested agent, Pin or
+  Unpin, Share, Fork, Export, Rename, Mark as unread, Create automation,
+  Archive or Unarchive, and Delete. They're offered to the session's owner, as
+  the header menu is; one that can't run stays listed with the reason, and a
+  dialog such as Rename opens with focus in it. **Go to Session…** turns the
+  open palette into the session switcher; Escape returns focus to where ⌘K was
+  opened.
 - `archive`: archived sessions leave the main list and appear in the archived
   view, which can be filtered by project and paged. On a server with worktree
   cleanup, archiving a session that has a git worktree first asks whether to
