@@ -25,7 +25,6 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
-from omnigent.runner.launch_failure import _CONTENT_POLICY_REFUSAL
 from tests.e2e_ui.conftest import configure_mock_llm, reset_mock_llm
 from tests.e2e_ui.messages.test_message_render_parity import (
     _ASSISTANT,
@@ -50,6 +49,11 @@ _QUOTA_ERROR = (
 _PROVIDER_RESPONSES = 400
 _RATE_LIMIT_HEADLINE = "The model's rate limit was reached. You can retry this turn."
 _REFUSAL_HEADLINE = "The model's safeguards blocked this message"
+_REFUSAL_OUTPUT = re.compile(
+    r"safeguards flagged this message|can't help with this\. Start a new session"
+    r"|appears to violate our Usage Policy",
+    re.IGNORECASE,
+)
 
 # Claude Code retries a 429 with backoff for roughly three minutes before it
 # gives up on the turn.
@@ -226,7 +230,7 @@ def _screenshot(page: Page, case_id: str, name: str) -> None:
         ),
         pytest.param(
             {"refusal_category": ""},
-            _CONTENT_POLICY_REFUSAL,
+            _REFUSAL_OUTPUT,
             ("stays in this session's history", "Start a new session"),
             _REFUSAL_HEADLINE,
             0,
