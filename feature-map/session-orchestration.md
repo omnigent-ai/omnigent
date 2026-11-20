@@ -51,16 +51,13 @@ MCP independent creation.
   An optional `permission_mode` starts the session in a mode of its harness;
   modes that skip approval are refused, and on a server that doesn't advertise
   `session_create_permission_modes` the tool refuses the call before creating anything.
-  Without one, a child (also one created by `POST /v1/sessions` with
-  `parent_session_id`) starts in its Claude Code or Codex parent's current mode,
-  mapped to its own harness (Claude Code Auto ↔ Codex Approve for me), unless its
-  agent spec or an automation sets a mode. Approval-skipping, plan/read-only and
-  default parent modes aren't passed on, and neither is a Codex custom permission
-  profile. Codex's Ask for approval is a preset, so a Codex child gets it too. A
-  Codex parent's mode comes from its current permission flags, which Codex rewrites
-  on every switch; a mode label that disagrees with them, or an approval policy
-  other than on-request, passes nothing on. Claude Code flags after `--` are prompt
-  text, not options.
+  Without one, a child of a Claude Code parent (also one created by
+  `POST /v1/sessions` with `parent_session_id`) starts in the parent's current mode,
+  mapped to its own harness (Claude Code Auto → Codex Approve for me), unless its
+  agent spec or an automation sets a mode. Approval-skipping, plan and default
+  parent modes aren't passed on, and Claude Code flags after `--` are prompt text,
+  not options. A Codex or other parent passes nothing on: its recorded mode can go
+  stale or be left to config.
   A `config_path` child gets the same, except an undeclared Codex or Cursor child
   keeps its headless full-bypass default. A named sub-agent (`sub_agent_name`) keeps
   the launch settings its sub-spec declares.

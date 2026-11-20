@@ -137,18 +137,6 @@ def test_preset_from_thread_settings_none_for_unmapped() -> None:
     """A non-mapping / custom payload resolves to None rather than guessing."""
     assert codex_permission_preset_from_thread_settings(None) is None
     assert codex_permission_preset_from_thread_settings({}) is None
-    custom = {"activePermissionProfile": {"id": "locked", "extends": ":workspace"}}
-    for settings in (_APPROVE_FOR_ME_SETTINGS, _ASK_FOR_APPROVAL_SETTINGS):
-        assert codex_permission_preset_from_thread_settings({**settings, **custom}) is None
-    # Full access stays recognizable under a custom profile.
-    assert codex_permission_preset_from_thread_settings({**_FULL_ACCESS_SETTINGS, **custom}) == (
-        "full-access"
-    )
-    # The auto reviewer maps to Approve for me only under an on-request policy.
-    untrusted = {**_APPROVE_FOR_ME_SETTINGS, "approvalPolicy": "untrusted"}
-    assert codex_permission_preset_from_thread_settings(untrusted) is None
-    no_policy = {k: v for k, v in _APPROVE_FOR_ME_SETTINGS.items() if k != "approvalPolicy"}
-    assert codex_permission_preset_from_thread_settings(no_policy) is None
 
 
 @pytest.mark.parametrize("sandbox_type", [{}, []])

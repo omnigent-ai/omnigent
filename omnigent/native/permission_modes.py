@@ -141,8 +141,7 @@ def inherited_permission_mode(
     The same harness keeps the parent's mode. Another harness gets its one mode
     with the same concept, e.g. Claude Code ``auto`` becomes Codex ``approve-for-me``.
     Approval-skipping, planning and read-only modes, and a parent's harness
-    default, aren't inherited. Codex ``ask-for-approval`` is a preset rather than
-    Codex's default, so a Codex child keeps it.
+    default, aren't inherited.
 
     :param parent_harness: The parent's canonical harness, e.g. ``"claude-native"``.
     :param parent_mode: The parent's current mode in that harness, e.g. ``"auto"``.

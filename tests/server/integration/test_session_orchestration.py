@@ -1534,20 +1534,10 @@ async def test_created_session_launches_in_the_requested_permission_mode(
 
 
 _CLAUDE_AUTO_PARENT = ("claude-native", {"omnigent.claude_native.permission_mode": "auto"}, None)
-# Codex rewrites its permission flags along with the mode label on each settings change.
-_CODEX_APPROVE_FOR_ME_FLAGS = [
-    "-c",
-    'default_permissions=":workspace"',
-    "-c",
-    'approval_policy="on-request"',
-    "-c",
-    'approvals_reviewer="auto_review"',
-]
-_CODEX_APPROVE_FOR_ME_LABEL = {"omnigent.codex_native.approval_mode": "approve-for-me"}
 _CODEX_APPROVE_FOR_ME_PARENT = (
     "codex-native",
-    _CODEX_APPROVE_FOR_ME_LABEL,
-    _CODEX_APPROVE_FOR_ME_FLAGS,
+    {"omnigent.codex_native.approval_mode": "approve-for-me"},
+    PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
 )
 
 
@@ -1573,13 +1563,14 @@ def _set_native_parent(db_uri, session_id, parent) -> None:
             PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
             id="claude-auto-to-codex",
         ),
+        # A Codex parent's recorded mode can go stale, so it passes nothing on.
         pytest.param(
             _CODEX_APPROVE_FOR_ME_PARENT,
             "claude-native",
             {},
             {},
-            ["--permission-mode", "auto"],
-            id="codex-approve-for-me-to-claude",
+            None,
+            id="codex-parent-passes-nothing",
         ),
         pytest.param(
             _CLAUDE_AUTO_PARENT,
@@ -1591,11 +1582,11 @@ def _set_native_parent(db_uri, session_id, parent) -> None:
         ),
         # The parent's launch flags stand in until its runtime reports the mode.
         pytest.param(
-            ("codex-native", {}, PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"]),
-            "claude-native",
+            ("claude-native", {}, ["--permission-mode", "auto"]),
+            "codex-native",
             {},
             {},
-            ["--permission-mode", "auto"],
+            PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
             id="parent-launch-args",
         ),
         # A switch made after launch replaces the launch flags.
@@ -1633,52 +1624,6 @@ def _set_native_parent(db_uri, session_id, parent) -> None:
             {},
             None,
             id="parent-skips-approval",
-        ),
-        # A bypass launch turns the sandbox off whatever approval preset Codex reports.
-        pytest.param(
-            (
-                "codex-native",
-                {
-                    "omnigent.codex_native.bypass_sandbox": "1",
-                    "omnigent.codex_native.approval_mode": "approve-for-me",
-                },
-                None,
-            ),
-            "claude-native",
-            {},
-            {},
-            None,
-            id="parent-bypasses-sandbox",
-        ),
-        # Codex keeps its last label for settings no preset matches, so the flags decide.
-        pytest.param(
-            (
-                "codex-native",
-                _CODEX_APPROVE_FOR_ME_LABEL,
-                [
-                    "-c",
-                    'default_permissions="locked"',
-                    "-c",
-                    'approval_policy="on-request"',
-                ],
-            ),
-            "claude-native",
-            {},
-            {},
-            None,
-            id="stale-label-after-custom-profile",
-        ),
-        pytest.param(
-            (
-                "codex-native",
-                _CODEX_APPROVE_FOR_ME_LABEL,
-                ["--profile", "strict", *_CODEX_APPROVE_FOR_ME_FLAGS],
-            ),
-            "claude-native",
-            {},
-            {},
-            ["--permission-mode", "auto"],
-            id="back-to-built-in-preset",
         ),
     ],
 )
@@ -1735,12 +1680,6 @@ async def test_custom_native_parent_passes_on_its_mode(auth_client, peers, db_ur
 @pytest.mark.parametrize(
     ("parent", "spec_config", "expected"),
     [
-        pytest.param(
-            _CODEX_APPROVE_FOR_ME_PARENT,
-            {},
-            ["--permission-mode", "auto"],
-            id="codex-approve-for-me-to-claude",
-        ),
         pytest.param(_CLAUDE_AUTO_PARENT, {}, ["--permission-mode", "auto"], id="claude-auto"),
         pytest.param(
             _CLAUDE_AUTO_PARENT,

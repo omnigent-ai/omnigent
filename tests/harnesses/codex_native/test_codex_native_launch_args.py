@@ -18,7 +18,6 @@ from omnigent.harnesses.codex_native.launch_args import (
     redact_codex_launch_args,
     without_codex_positional_prompt,
 )
-from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
 
 
 def test_codex_paths_expand_home_without_resolving_symlinks(
@@ -88,101 +87,6 @@ def test_remote_resume_option_spellings(args: tuple[str, ...], expected: dict) -
     assert app_server.build_codex_remote_args(
         codex_args=args, thread_id="thread-test", remote_url="ws://127.0.0.1:9876"
     ) == ["resume", "--remote", "ws://127.0.0.1:9876", "thread-test"]
-
-
-@pytest.mark.parametrize(
-    ("args", "expected"),
-    [
-        (tuple(PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"]), "approve-for-me"),
-        (("-m", "gpt", "--approve-for-me"), "approve-for-me"),
-        (("-s=workspace-write", "-a=on-request"), "ask-for-approval"),
-        # A later reviewer setting replaces an earlier one.
-        (
-            (
-                *PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
-                "-c",
-                'approvals_reviewer="user"',
-            ),
-            "ask-for-approval",
-        ),
-        (("--sandbox", "read-only", "--ask-for-approval", "on-request"), "read-only"),
-        (("--dangerously-bypass-approvals-and-sandbox",), "full-access"),
-        (("--approve-for-me", "--sandbox", "read-only"), None),
-        (("--profile", "strict"), None),
-        # A profile or the user's config may set the sandbox the flags leave out.
-        (
-            ("--profile", "strict", "-a", "on-request", "-c", 'approvals_reviewer="auto_review"'),
-            None,
-        ),
-        (("-a", "on-request", "-c", 'approvals_reviewer="auto_review"'), None),
-        # A custom permission profile matches no on-request preset.
-        (
-            (
-                "-c",
-                'default_permissions="locked"',
-                "-a",
-                "on-request",
-                "-c",
-                'approvals_reviewer="auto_review"',
-            ),
-            None,
-        ),
-        (("-c", 'default_permissions=":workspace"', "--approve-for-me"), "approve-for-me"),
-        # ``untrusted`` gates commands differently, and an omitted policy is config's.
-        (
-            (
-                "--sandbox",
-                "workspace-write",
-                "--ask-for-approval",
-                "untrusted",
-                "-c",
-                'approvals_reviewer="auto_review"',
-            ),
-            None,
-        ),
-        (("--sandbox", "workspace-write", "-c", 'approvals_reviewer="auto_review"'), None),
-        # Prompt text after ``--`` isn't a permission option.
-        (
-            (
-                "-c",
-                'default_permissions=":workspace"',
-                "-c",
-                'approval_policy="on-request"',
-                "-c",
-                'approvals_reviewer="user"',
-                "--",
-                "--approve-for-me",
-            ),
-            "ask-for-approval",
-        ),
-        # A config profile's permissions can replace --sandbox...
-        (
-            (
-                "--profile",
-                "strict",
-                *PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
-            ),
-            None,
-        ),
-        # ...but not an explicit permission profile, which Codex records after a switch.
-        (
-            (
-                "--profile",
-                "strict",
-                "-c",
-                'default_permissions=":workspace"',
-                "-c",
-                'approval_policy="on-request"',
-                "-c",
-                'approvals_reviewer="auto_review"',
-            ),
-            "approve-for-me",
-        ),
-        ((), None),
-    ],
-)
-def test_codex_launch_permission_preset(args: tuple[str, ...], expected: str | None) -> None:
-    assert app_server.codex_launch_permission_preset(args) == expected
 
 
 @pytest.mark.parametrize(
