@@ -17,6 +17,7 @@ import pytest
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Page, expect
 
+from tests._helpers.polling import poll_until
 from tests.e2e_ui.conftest import (
     _CLAUDE_MOCK_MODEL,
     configure_mock_llm,
@@ -26,7 +27,7 @@ from tests.e2e_ui.messages.test_message_render_parity import (
     _ASSISTANT,
     _USER,
     _WORKING,
-    _select_view_mode,
+    _ensure_chat_view,
     _send,
 )
 
@@ -55,12 +56,6 @@ _FAULT_SETTLE_S = 150.0
 _MIRROR_GRACE_S = 8.0
 
 
-def _ensure_chat_view(page: Page) -> None:
-    """Switch the terminal-first native session to its chat bubble view."""
-    expect(page.get_by_test_id("view-mode-toggle")).to_be_visible(timeout=_FIRST_TURN_TIMEOUT_MS)
-    _select_view_mode(page, "Chat")
-
-
 def _session_snapshot(base_url: str, session_id: str) -> dict:
     """Return the session's ``GET /v1/sessions/{id}`` body."""
     resp = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=15.0)
@@ -70,13 +65,16 @@ def _session_snapshot(base_url: str, session_id: str) -> dict:
 
 def _wait_for_status(base_url: str, session_id: str, status: str, timeout_s: float) -> None:
     """Poll ``GET /v1/sessions/{id}`` until the session reports *status*."""
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
+
+    def reached_status() -> bool:
         with contextlib.suppress(httpx.HTTPError):
-            if str(_session_snapshot(base_url, session_id).get("status") or "") == status:
-                return
-        time.sleep(1.0)
-    pytest.fail(f"session never reached status {status!r} within {timeout_s:.0f}s")
+            return str(_session_snapshot(base_url, session_id).get("status") or "") == status
+        return False
+
+    try:
+        poll_until(reached_status, timeout_s=timeout_s, interval_s=1.0)
+    except AssertionError:
+        pytest.fail(f"session never reached status {status!r} within {timeout_s:.0f}s")
 
 
 def _transcript_blob(base_url: str, session_id: str) -> str:
@@ -189,6 +187,7 @@ def test_output_token_limit_turn_is_not_a_raw_dead_end(
     # Non-browser setup is complete; the recorded page starts at the first navigation.
     page: Page = request.getfixturevalue("page")
     page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_test_id("view-mode-toggle")).to_be_visible(timeout=_FIRST_TURN_TIMEOUT_MS)
     _ensure_chat_view(page)
 
     # Turn 1 — sanity: a broken pipeline can never masquerade as a fixed build.
