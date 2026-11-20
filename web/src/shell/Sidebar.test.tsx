@@ -4317,7 +4317,7 @@ describe("Sidebar view options", () => {
     ];
     seedReadState(rows.map((row) => ({ id: row.id, viewer_last_seen: 199 })));
     mockConversations(rows);
-    renderGroupingSidebar();
+    renderLoadedSidebar();
     expect(within(groupSection("Done")).getByText("muted_idle")).toBeInTheDocument();
     expect(within(groupSection("Unread")).getByText("ordinary_unread")).toBeInTheDocument();
     expect(within(groupSection("Working")).getByText("muted_running")).toBeInTheDocument();
