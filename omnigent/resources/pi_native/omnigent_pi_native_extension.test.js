@@ -924,6 +924,245 @@ async function testTheFinalPollReadsEveryReadyChild() {
     finalUsage.every((data) => data?.cumulative_input_tokens === 140), JSON.stringify(finalUsage));
   assert("a fully priced child reports its cumulative cost",
     finalUsage.every((data) => data?.cost_complete === true && data.cumulative_cost_usd === 0.5), JSON.stringify(finalUsage));
+  await testRegularPollsShareOneDeadlineAndRotate();
+}
+
+// Simulated costs: a full-chunk read takes 600ms and a registration 600ms, against a 500ms poll budget.
+async function testRegularPollsShareOneDeadlineAndRotate() {
+  const g = childFixture();
+  const watcher = g.watcher();
+  const ids = ["a", "b", "c", "d"];
+  const lateIds = ["e", "f"];
+  const write = (id) => writeChildFile(g, `${id}/session.jsonl`,
+    childSessionLines({ id, parentFile: g.parentFile, agent: "worker" }) + assistantLine("model-a", 2000, 100, 10));
+  const files = ids.map(write);
+  await watcher.poll();
+  const backlog = () => toolResultLine(1100) + "\n" + assistantLine("model-a", 3000, 20, 2, "stop");
+  files.forEach((file) => fs.appendFileSync(file, backlog()));
+  // New children appear in the same poll as the backlogs.
+  const lateFiles = lateIds.map(write);
+  lateFiles.forEach((file) => fs.appendFileSync(file, backlog()));
+  const allFiles = [...files, ...lateFiles];
+  const names = [...ids, ...lateIds];
+
+  const { readSync, openSync, closeSync } = fs;
+  const realNow = Date.now;
+  const realFetch = global.fetch;
+  const fdFiles = new Map();
+  let skew = 0;
+  let pollStart = 0;
+  let poll = 0;
+  const reads = [];
+  const lateStarts = [];
+  fs.openSync = (...args) => {
+    const fd = openSync(...args);
+    fdFiles.set(fd, args[0]);
+    return fd;
+  };
+  fs.readSync = (...args) => {
+    const file = fdFiles.get(args[0]);
+    // Header sniffing during discovery reads 64 KiB and is not a bounded child read.
+    if (allFiles.includes(file) && args[3] !== 64 * 1024) {
+      reads.push({ poll, name: names[allFiles.indexOf(file)] });
+      if (Date.now() >= pollStart + 500) lateStarts.push({ poll, file });
+    }
+    if (args[3] === 1024 * 1024) skew += 600;
+    return readSync(...args);
+  };
+  global.fetch = async (url, opts) => {
+    if (JSON.parse(opts.body).type === "external_acp_subagent_start") skew += 600;
+    return realFetch(url, opts);
+  };
+  Date.now = () => realNow() + skew;
+  const reported = () => names.every((id) => childUsage(g.posts, `conv_${id}`).at(-1)?.cumulative_input_tokens === 140);
+  let firstPollReads;
+  try {
+    while (!reported() && poll < 20) {
+      poll += 1;
+      pollStart = Date.now();
+      await watcher.poll();
+      if (poll === 1) firstPollReads = reads.filter((read) => read.poll === 1).map((read) => read.name);
+    }
+  } finally {
+    fs.readSync = readSync;
+    fs.openSync = openSync;
+    fs.closeSync = closeSync;
+    global.fetch = realFetch;
+    Date.now = realNow;
+  }
+  assert("no chunk starts at or after a regular poll's single deadline, even after slow registrations",
+    lateStarts.length === 0 && firstPollReads.length === 1, JSON.stringify({ lateStarts, firstPollReads }));
+  assert("children registered during a backlogged poll are registered at once but read only later",
+    lateIds.every((id) => g.posts.some((p) => p.body.type === "external_acp_subagent_start" && p.body.data.subagent_id === id)) &&
+      !firstPollReads.some((name) => lateIds.includes(name)),
+    JSON.stringify(firstPollReads));
+  assert("repeated regular polls eventually report every backlogged child",
+    reported() && poll <= 12, `${poll} polls`);
+  assert("the starting child rotates, so a backlog does not starve later children",
+    new Set(reads.filter((read) => read.poll <= 6).map((read) => read.name)).size === 6,
+    JSON.stringify(reads));
+}
+
+// Simulated costs against a 500ms poll budget: a listing or header read takes 200ms, an open
+// 100ms and a full-chunk read 600ms, so neither discovery nor a backlog fits one poll.
+async function testDiscoveryResumesWithinEachPollDeadline() {
+  const f = childFixture({ shutdownTimeoutMs: 20_000 });
+  const childDir = path.join(f.sessions, path.basename(f.parentFile, ".jsonl"));
+  const write = (relative, id, header = childSessionLines({ id, parentFile: f.parentFile, agent: "worker" })) =>
+    writeChildFile(f, relative, header + assistantLine("model-a", 2000, 100, 10));
+  const backlogged = write("r/session.jsonl", "r");
+  const watcher = f.watcher();
+  await watcher.poll();
+  fs.appendFileSync(backlogged, toolResultLine(2200) + "\n" + assistantLine("model-a", 3000, 20, 2, "stop"));
+  const ids = ["a", "b", "c", "d"];
+  ids.forEach((id) => write(`${id}/session.jsonl`, id));
+
+  const sim = simulateChildIo(childDir, (kind, _target, length) =>
+    ({ list: 200, open: 100, read: { [64 * 1024]: 200, [1024 * 1024]: 600 }[length] || 0 })[kind] || 0);
+  const { io, lateStarts } = sim;
+  let poll = 0;
+  const started = (subagentId, sessionId = "conv_parent") => f.posts.some((p) =>
+    p.sessionId === sessionId && p.body.type === "external_acp_subagent_start" && p.body.data.subagent_id === subagentId);
+  const lastInput = (id) => childUsage(f.posts, `conv_${id}`).at(-1)?.cumulative_input_tokens;
+  const reported = () => ids.every((id) => lastInput(id) === 110) && lastInput("r") === 140;
+  try {
+    while (!reported() && poll < 30) {
+      sim.poll = poll += 1;
+      sim.deadline = Date.now() + 500;
+      await watcher.poll();
+    }
+    const regularPolls = poll;
+    const pollsWith = (kind, target) => new Set(io.filter((entry) => entry.kind === kind &&
+      (!target || entry.target === target)).map((entry) => entry.poll));
+    assert("no child listing, open, stat or read starts at or after a regular poll's deadline",
+      lateStarts.length === 0, JSON.stringify(lateStarts));
+    assert("discovery resumes across regular polls until every child is reported",
+      reported() && pollsWith("list").size > 2 && regularPolls <= 20, `${regularPolls} polls`);
+    assert("discovery and a registered backlog each progress within the first two constrained polls",
+      pollsWith("list").has(1) && [1, 2].some((n) => pollsWith("read", path.join("r", "session.jsonl")).has(n)),
+      JSON.stringify(io.filter((entry) => entry.poll <= 2)));
+
+    // Late children appear just before shutdown: an untitled one and one nested under a scanned child.
+    write("late/session.jsonl", "late",
+      JSON.stringify({ type: "session", id: "late", timestamp: new Date(1000).toISOString(), parentSession: f.parentFile }) + "\n");
+    write("a/nested/session.jsonl", "nested",
+      childSessionLines({ id: "nested", parentFile: path.join(childDir, "a", "session.jsonl"), agent: "scout" }));
+    sim.poll = poll += 1;
+    sim.deadline = Date.now() + 500;
+    await watcher.poll();
+    sim.poll = poll += 1;
+    lateStarts.length = 0;
+    sim.deadline = Date.now() + 10_000;
+    await watcher.stop();
+    assert("shutdown starts no child I/O at or after its read deadline", lateStarts.length === 0, JSON.stringify(lateStarts));
+    assert("late untitled and nested children are reported at shutdown",
+      f.posts.some((p) => p.body.type === "external_acp_subagent_start" && p.body.data.subagent_id === "late" &&
+        p.body.data.title === "subagent") && started("nested", "conv_a") &&
+        lastInput("late") === 110 && lastInput("nested") === 110,
+      JSON.stringify(f.posts.filter((p) => ["conv_late", "conv_a", "conv_nested"].includes(p.sessionId))));
+
+    // A shutdown poll whose read deadline already passed starts no child I/O.
+    write("after/session.jsonl", "after");
+    io.length = 0;
+    sim.poll = poll += 1;
+    sim.deadline = Infinity;
+    await f.watcher().poll(true, Date.now());
+    assert("an already-expired shutdown poll lists, opens, stats and reads no child file",
+      io.length === 0 && !started("after"), JSON.stringify(io));
+  } finally {
+    sim.restore();
+  }
+}
+
+// A slow incomplete header and a slow untitled one, each a 600ms read against a 500ms budget,
+// are listed ahead of ready children.
+async function testSlowHeadersDoNotBlockLaterChildren() {
+  const f = childFixture();
+  const childDir = path.join(f.sessions, path.basename(f.parentFile, ".jsonl"));
+  const untitledHeader = (id) =>
+    JSON.stringify({ type: "session", id, timestamp: new Date(1000).toISOString(), parentSession: f.parentFile }) + "\n";
+  writeChildFile(f, "a-incomplete/session.jsonl", untitledHeader("incomplete").slice(0, 40));
+  writeChildFile(f, "b-untitled/session.jsonl", untitledHeader("untitled") + assistantLine("model-a", 2000, 100, 10));
+  for (const id of ["c", "d"])
+    writeChildFile(f, `${id}-ready/session.jsonl`,
+      childSessionLines({ id, parentFile: f.parentFile, agent: "worker" }) + assistantLine("model-a", 2000, 100, 10));
+  const retitled = writeChildFile(f, "e-retitled/session.jsonl", untitledHeader("retitled"));
+  const slow = ["a-incomplete", "b-untitled"].map((dir) => path.join(dir, "session.jsonl"));
+  let clock = Date.now();
+  const watcher = f.watcher(() => clock);
+  const sim = simulateChildIo(childDir, (kind, target) => (kind === "read" && slow.includes(target) ? 600 : 0));
+  const starts = () => f.posts.filter((p) => p.body.type === "external_acp_subagent_start").map((p) => p.body.data);
+  const startedAt = {};
+  const pollOnce = async () => {
+    sim.poll += 1;
+    sim.deadline = Date.now() + 500;
+    await watcher.poll();
+    for (const { subagent_id: id } of starts()) startedAt[id] ??= sim.poll;
+  };
+  try {
+    for (let polls = 0; polls < 4; polls += 1) await pollOnce();
+    assert("ready children listed after slow headers register without waiting on them",
+      startedAt.c <= 4 && startedAt.d <= 4 && !startedAt.untitled && !startedAt.retitled, JSON.stringify(startedAt));
+    // A title written during the grace period is used once the header is reread.
+    fs.appendFileSync(retitled, JSON.stringify({ type: "session_info", name: "retitled" }) + "\n");
+    for (let polls = 0; polls < 6 && !startedAt.retitled; polls += 1) await pollOnce();
+    clock += 60_000;
+    for (let polls = 0; polls < 10 && !startedAt.untitled; polls += 1) await pollOnce();
+  } finally {
+    sim.restore();
+  }
+  const titles = Object.fromEntries(starts().map((data) => [data.subagent_id, data.title]));
+  assert("a child titled during the grace period registers under that title",
+    titles.retitled === "retitled" && starts().filter((data) => data.subagent_id === "retitled").length === 1,
+    JSON.stringify(starts()));
+  assert("a slow untitled header registers under the fallback title after the grace period",
+    titles.untitled === "subagent" && childUsage(f.posts, "conv_untitled").at(-1)?.cumulative_input_tokens === 110,
+    JSON.stringify(startedAt));
+  assert("an incomplete header never registers, and no child I/O starts at or after a deadline",
+    !("incomplete" in titles) && sim.lateStarts.length === 0, JSON.stringify(sim.lateStarts));
+}
+
+// Skews the clock by each child-tree operation's simulated cost, sorts listings and records each
+// operation; one starting at or after `deadline` is also recorded as late.
+function simulateChildIo(childDir, cost) {
+  const real = { readdirSync: fs.readdirSync, openSync: fs.openSync, readSync: fs.readSync, statSync: fs.statSync };
+  const realNow = Date.now;
+  const fdFiles = new Map();
+  let skew = 0;
+  const sim = {
+    poll: 0, deadline: Infinity, io: [], lateStarts: [],
+    restore() {
+      Object.assign(fs, real);
+      Date.now = realNow;
+    },
+  };
+  const record = (kind, target, length) => {
+    if (typeof target !== "string" || !target.startsWith(childDir)) return;
+    const entry = { poll: sim.poll, kind, target: path.relative(childDir, target) };
+    sim.io.push(entry);
+    if (Date.now() >= sim.deadline) sim.lateStarts.push(entry);
+    skew += cost(kind, entry.target, length);
+  };
+  fs.readdirSync = (dir, ...rest) => {
+    record("list", dir);
+    return real.readdirSync(dir, ...rest).sort((a, b) => (a.name < b.name ? -1 : 1));
+  };
+  fs.openSync = (file, ...rest) => {
+    record("open", file);
+    const fd = real.openSync(file, ...rest);
+    fdFiles.set(fd, file);
+    return fd;
+  };
+  fs.statSync = (target, ...rest) => {
+    record("stat", target);
+    return real.statSync(target, ...rest);
+  };
+  fs.readSync = (...args) => {
+    record("read", fdFiles.get(args[0]), args[3]);
+    return real.readSync(...args);
+  };
+  Date.now = () => realNow() + skew;
+  return sim;
 }
 
 async function testShutdownDrainsPastAStalledRegistration() {
@@ -1145,7 +1384,53 @@ async function testAnOversizedRecordIsSkippedWithoutBuffering() {
     JSON.stringify(childUsage(f.posts, "conv_child")));
 }
 
+// Shutdown with several backlogged children: a 600ms chunk read outlasts the 500ms final read window.
+async function testShutdownStartsNoReadAfterItsDeadlineAcrossChildren() {
+  const f = childFixture({ shutdownTimeoutMs: 1000 });
+  const watcher = f.watcher();
+  const ids = ["a", "b", "c", "d"];
+  const files = ids.map((id) => writeChildFile(f, `${id}/session.jsonl`,
+    childSessionLines({ id, parentFile: f.parentFile, agent: "worker" }) + assistantLine("model-a", 2000, 100, 10)));
+  await watcher.poll();
+  files.forEach((file) => fs.appendFileSync(file, toolResultLine(1100) + "\n" + assistantLine("model-a", 3000, 20, 2, "stop")));
+  const { readSync, openSync, statSync } = fs;
+  const realNow = Date.now;
+  const fdFiles = new Map();
+  const touched = [];
+  const lateStarts = [];
+  let skew = 0;
+  fs.openSync = (...args) => {
+    const fd = openSync(...args);
+    fdFiles.set(fd, args[0]);
+    return fd;
+  };
+  fs.statSync = (target, ...rest) => {
+    if (files.includes(target)) touched.push(target);
+    return statSync(target, ...rest);
+  };
+  const stopStart = realNow();
+  fs.readSync = (...args) => {
+    if (files.includes(fdFiles.get(args[0])) && Date.now() >= stopStart + 500) lateStarts.push(fdFiles.get(args[0]));
+    if (args[3] === 1024 * 1024) skew += 600;
+    return readSync(...args);
+  };
+  Date.now = () => realNow() + skew;
+  try {
+    await watcher.stop();
+  } finally {
+    fs.readSync = readSync;
+    fs.openSync = openSync;
+    fs.statSync = statSync;
+    Date.now = realNow;
+  }
+  assert("shutdown starts no chunk at or after its read deadline across backlogged children",
+    lateStarts.length === 0, JSON.stringify(lateStarts));
+  assert("shutdown does not touch children left after the deadline",
+    touched.length === 1, JSON.stringify(touched));
+}
+
 async function testShutdownStopsReadingAtItsDeadline() {
+  await testShutdownStartsNoReadAfterItsDeadlineAcrossChildren();
   const f = childFixture();
   const watcher = f.watcher();
   const file = writeChildFile(f, "run/session.jsonl",
@@ -1273,6 +1558,8 @@ async function testShutdownIsBoundedWhenTheServerNeverResponds() {
     await testChildSessionsAreRegisteredWithTheirOwnModels();
     await testChildReadsIncrementallyAndSurvivesRestart();
     await testTheFinalPollReadsEveryReadyChild();
+    await testDiscoveryResumesWithinEachPollDeadline();
+    await testSlowHeadersDoNotBlockLaterChildren();
     await testShutdownDrainsPastAStalledRegistration();
     await testChildrenWrittenAfterTheLastPollAreReportedAtShutdown();
     await testAnAbortedPollStartsNoFurtherPosts();

@@ -1184,11 +1184,13 @@ const _CHILD_SCAN_MAX_DEPTH = 10;
 // pi-subagents names each child session ``subagent-<agent>-<run uuid>-<n>``.
 const _PI_SUBAGENTS_SESSION_NAME = /^subagent-(.+)-[0-9a-f-]{36}-\d+$/;
 
-function readFileRange(file, position, length) {
+// Callers check the deadline before the open; an open that ends at or after it reads nothing.
+function readFileRange(file, position, length, deadline) {
   let fd;
   try {
     fd = fs.openSync(file, "r");
     const buffer = Buffer.alloc(length);
+    if (Date.now() >= deadline) return null;
     return buffer.subarray(0, fs.readSync(fd, buffer, 0, length, position));
   } catch (_err) {
     return null;
@@ -1206,26 +1208,12 @@ function parseJsonLine(text) {
   }
 }
 
-function listSessionFiles(dir, depth, found) {
-  if (depth > _CHILD_SCAN_MAX_DEPTH) return;
-  let entries;
-  try {
-    entries = fs.readdirSync(dir, { withFileTypes: true });
-  } catch (_err) {
-    return;
-  }
-  for (const entry of entries) {
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) listSessionFiles(full, depth + 1, found);
-    else if (entry.isFile() && entry.name.endsWith(".jsonl")) found.push(full);
-  }
-}
-
-// Returns null while the header line is incomplete.
-function readChildHeader(file) {
-  const head = readFileRange(file, 0, _CHILD_HEADER_BYTES);
-  const newline = head ? head.indexOf(10) : -1;
-  if (newline < 0) return head && head.length >= _CHILD_HEADER_BYTES ? { ignore: true } : null;
+// Returns null when unread by the deadline, and { pending: true } while the header line is incomplete.
+function readChildHeader(file, deadline) {
+  const head = readFileRange(file, 0, _CHILD_HEADER_BYTES, deadline);
+  if (!head) return null;
+  const newline = head.indexOf(10);
+  if (newline < 0) return head.length >= _CHILD_HEADER_BYTES ? { ignore: true } : { pending: true };
   const header = parseJsonLine(head.subarray(0, newline).toString("utf8"));
   if (header?.type !== "session" || typeof header.id !== "string" || !header.id ||
     typeof header.parentSession !== "string" || !header.parentSession)
@@ -1299,27 +1287,67 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now, shutdo
     if (JSON.stringify(state) !== saved.text) writeJsonAtomic(statePath, state);
   }
 
-  function discover(final) {
-    for (const root of roots) {
+  // Directories and files still to visit in the current scan; regular polls resume it, and a
+  // drained scan restarts from the roots, revisiting deferred files.
+  let scan = [];
+
+  // Starts no directory listing, header read or stat at or after the deadline.
+  function discover(final, deadline) {
+    // The final poll rescans so files deferred earlier in a partial scan skip the title grace.
+    if (final || !scan.length) {
       // Pi stores delegated sessions below the parent session directory.
-      const files = [];
-      listSessionFiles(path.join(path.dirname(root), path.basename(root, ".jsonl")), 0, files);
-      for (const file of files) {
-        if (ignoredFiles.has(file) || children.some(child => child.file === file)) continue;
-        const header = readChildHeader(file);
-        if (!header) continue;
-        if (header.ignore || children.some(child => child.key === header.key)) {
-          ignoredFiles.add(file);
-          continue;
+      scan = roots.map(root => ({ dir: path.join(path.dirname(root), path.basename(root, ".jsonl")), depth: 0 }));
+    }
+    while (scan.length && Date.now() < deadline) {
+      const item = scan.pop();
+      if (item.dir) {
+        let entries = [];
+        try {
+          entries = fs.readdirSync(item.dir, { withFileTypes: true });
+        } catch (_err) {}
+        // Reversed onto the stack, entries are visited in listing order.
+        for (const entry of entries.reverse()) {
+          const full = path.join(item.dir, entry.name);
+          if (entry.isDirectory() && item.depth < _CHILD_SCAN_MAX_DEPTH) scan.push({ dir: full, depth: item.depth + 1 });
+          else if (entry.isFile() && entry.name.endsWith(".jsonl")) scan.push({ file: full });
         }
-        // Give Pi a moment to write the session name used as the title.
-        if (!final && header.title === "subagent" && now() - (fs.statSync(file, { throwIfNoEntry: false })?.mtimeMs ?? 0) < 5_000)
-          continue;
-        children.push({
-          ...header, file, childId: null, offset: 0, lastStop: null,
-          usage: { input: 0, output: 0, cacheRead: 0, costUsd: 0, completeCost: true, model: null },
-        });
+        continue;
       }
+      const file = item.file;
+      if (ignoredFiles.has(file) || children.some(child => child.file === file)) continue;
+      // An item whose next step has not started keeps its place, carrying a header already read.
+      if (Date.now() >= deadline) {
+        scan.push(item);
+        break;
+      }
+      const readAt = item.readAt ?? Date.now();
+      const header = item.header || readChildHeader(file, deadline);
+      // A header whose open outlasted the deadline is retried once after the scan's other items.
+      if (!header) {
+        if (!item.retried) scan.unshift({ file, retried: true });
+        continue;
+      }
+      // An incomplete header waits for the next scan.
+      if (header.pending) continue;
+      if (header.ignore || children.some(child => child.key === header.key)) {
+        ignoredFiles.add(file);
+        continue;
+      }
+      // Give Pi a moment to write the session name used as the title.
+      if (!final && header.title === "subagent") {
+        if (Date.now() >= deadline) {
+          scan.push({ file, header, readAt });
+          break;
+        }
+        // Within the grace period, or once written after its header was read, the next scan
+        // rereads the header so a later title applies.
+        const mtimeMs = fs.statSync(file, { throwIfNoEntry: false })?.mtimeMs ?? 0;
+        if (now() - mtimeMs < 5_000 || (item.header && mtimeMs >= readAt)) continue;
+      }
+      children.push({
+        ...header, file, childId: null, offset: 0, lastStop: null,
+        usage: { input: 0, output: 0, cacheRead: 0, costUsd: 0, completeCost: true, model: null },
+      });
     }
   }
 
@@ -1366,7 +1394,8 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now, shutdo
   }
 
   // Consume complete lines appended since the last poll, chunk by chunk up to the observed size.
-  // Stops at the deadline with the cursor on a line boundary, so the next poll resumes there.
+  // Starts no chunk at or after the deadline and stops with the cursor on a line boundary, so the
+  // next poll resumes there.
   function readNew(child, deadline) {
     let stat;
     try {
@@ -1379,10 +1408,10 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now, shutdo
     // ``length`` counts its bytes read so far, and ``parts`` holds them while within the cap.
     if (!child.pending || child.offset + child.pending.length > stat.size) child.pending = { parts: [], length: 0 };
     const pending = child.pending;
-    // Each pass reads at least one chunk, so a record longer than one pass still completes.
-    for (let started = false; child.offset + pending.length < stat.size && (!started || Date.now() < deadline); started = true) {
+    // A record longer than one pass completes across polls through the in-memory pending state.
+    while (child.offset + pending.length < stat.size && Date.now() < deadline) {
       const part = readFileRange(child.file, child.offset + pending.length,
-        Math.min(stat.size - child.offset - pending.length, _CHILD_READ_CHUNK_BYTES));
+        Math.min(stat.size - child.offset - pending.length, _CHILD_READ_CHUNK_BYTES), deadline);
       if (!part?.length) return;
       const first = part.indexOf(10);
       const { parts, length } = pending;
@@ -1441,23 +1470,42 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now, shutdo
     } catch (_err) {}
   }
 
+  let resumeChild = null;
+  // The phase a deadline cut short, discovery or registered reads, leads the next poll.
+  let discoveryLeads = true;
+
   async function runPoll(final, readDeadline, signal) {
+    // One absolute deadline from poll start bounds discovery and every read, including late registrations.
+    const readUntil = final ? readDeadline : Math.min(Date.now() + _CHILD_READ_BUDGET_MS, readDeadline);
     const current = sessionFile();
     if (current && !roots.includes(path.resolve(current))) roots.push(path.resolve(current));
-    discover(final);
+    const discoveredFirst = discoveryLeads;
+    if (discoveredFirst) discover(final, readUntil);
     const reports = [];
+    let skipped = null;
     // Persist cursors and totals before reporting them.
     const flush = ready => {
       // Once shutdown aborts this poll, it neither posts nor writes state.
       if (signal.aborted) return;
-      // The final poll reads up to its own deadline rather than the regular pass limit.
-      const readUntil = final ? readDeadline : Math.min(Date.now() + _CHILD_READ_BUDGET_MS, readDeadline);
-      ready.forEach(child => readNew(child, readUntil));
+      for (const child of ready) {
+        // Past the deadline no further child is touched; the first one skipped leads the next poll.
+        if (Date.now() >= readUntil) {
+          skipped = resumeChild = skipped || child;
+          break;
+        }
+        readNew(child, readUntil);
+      }
       persist();
       reports.push(...ready.map(child => report(child, final, signal)));
     };
-    // Registered children report without waiting on new registrations.
-    flush(children.filter(child => child.childId));
+    // Registered children report without waiting on new registrations; the first one the
+    // deadline skipped starts the next poll, so backlogs cannot starve later children.
+    const registered = children.filter(child => child.childId);
+    const start = Math.max(0, registered.indexOf(resumeChild));
+    flush([...registered.slice(start), ...registered.slice(0, start)]);
+    if (!skipped) resumeChild = registered[(start + 1) % registered.length] || null;
+    if (!discoveredFirst) discover(final, readUntil);
+    discoveryLeads = Date.now() < readUntil || !discoveredFirst;
     // Each registration is tried once per poll; registering a launcher lets its nested children attach.
     const attempted = new Set();
     const register = async () => {
