@@ -312,6 +312,29 @@ function WorkspaceTabsPanelImpl({
     error: terminalsError,
   } = useTerminals(pending ? null : conversationId);
   const terminalsLoaded = (listCompleteAt ?? 0) > 0 && terminalsError === null;
+  // Shell tabs that have shown their terminal, by tab and shell, so a failed list refresh
+  // keeps them mounted. Recorded after commit and pruned to the tabs still open.
+  const shellTabKeys = knownTabs.flatMap((tab) =>
+    tab.binding?.kind === "terminal" ? [attachedShellKey(tab.id, tab.binding.key)] : [],
+  );
+  const liveShellTabKeys = knownTabs.flatMap((tab) =>
+    tab.binding?.kind === "terminal" && store.resourceState(tab.id) === "live"
+      ? [attachedShellKey(tab.id, tab.binding.key)]
+      : [],
+  );
+  const shellTabsSignature = shellTabKeys.join("\n");
+  const liveShellTabsSignature = liveShellTabKeys.join("\n");
+  const [attachedShells, setAttachedShells] = useState<ReadonlySet<string>>(() => new Set());
+  useEffect(() => {
+    const openShells = new Set(shellTabsSignature ? shellTabsSignature.split("\n") : []);
+    const live = liveShellTabsSignature ? liveShellTabsSignature.split("\n") : [];
+    setAttachedShells((previous) => {
+      const next = new Set([...previous].filter((key) => openShells.has(key)));
+      for (const key of live) next.add(key);
+      const unchanged = next.size === previous.size && [...next].every((key) => previous.has(key));
+      return unchanged ? previous : next;
+    });
+  }, [shellTabsSignature, liveShellTabsSignature]);
   useEffect(() => {
     if (pending) return;
     store.setTerminalInventory(
@@ -863,9 +886,24 @@ function WorkspaceTabsPanelImpl({
             }
           />
         );
-      case "terminal":
-        if (tab.binding?.kind !== "terminal" || store.resourceState(tab.id) !== "live") {
+      case "terminal": {
+        const shellState = store.resourceState(tab.id);
+        if (tab.binding?.kind !== "terminal" || shellState === "gone") {
           return <Unavailable text="This shell has ended." />;
+        }
+        // Until the shell list confirms it, a shell isn't ended; an attached one stays put.
+        if (
+          shellState !== "live" &&
+          !attachedShells.has(attachedShellKey(tab.id, tab.binding.key))
+        ) {
+          return terminalsError ? (
+            <Unavailable text="Couldn’t reach this session’s shells." />
+          ) : (
+            <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 text-muted-foreground">
+              <Spinner />
+              <span className="text-ui">Connecting to the shell…</span>
+            </div>
+          );
         }
         return (
           <RailTerminalView
@@ -875,6 +913,7 @@ function WorkspaceTabsPanelImpl({
             autoFocus={active && autoFocusTerminalKey === tab.binding.key}
           />
         );
+      }
       case "web": {
         if (!showBrowserTab || tab.binding?.kind !== "browser-view") {
           return <Unavailable text="Web pages open in the desktop app." />;
@@ -1215,6 +1254,11 @@ function AttentionBar({
       </Button>
     </div>
   );
+}
+
+/** Names a shell tab showing one shell; a tab rebound to another shell is a new entry. */
+function attachedShellKey(tabId: TabId, terminalKey: string): string {
+  return `${tabId}\u0000${terminalKey}`;
 }
 
 function Unavailable({ text }: { text: string }) {
