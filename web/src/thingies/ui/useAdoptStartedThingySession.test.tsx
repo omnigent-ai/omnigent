@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { MemoryRouter, useNavigate } from "react-router-dom";
+import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { resetThingyRailRequests, useThingyRailRequest } from "@/lib/thingyRailTabs";
@@ -29,8 +29,13 @@ vi.mock("@/thingies/api/thingyApi", async (importOriginal) => ({
 function Shell() {
   useAdoptStartedThingySession();
   const navigate = useNavigate();
+  const location = useLocation();
   return (
     <>
+      <span aria-label="location">{location.pathname + location.search}</span>
+      <button type="button" onClick={() => navigate("/c/conv_9?o=1&thingy_start=board")}>
+        Created, query kept
+      </button>
       <button type="button" onClick={() => navigate("/c/temp:abc")}>
         Creating
       </button>
@@ -74,6 +79,18 @@ describe("a session started beside a thingy", () => {
         key: "thingy:board",
       }),
     );
+  });
+
+  it("adopts the thingy once when the host keeps the query on the session's page", async () => {
+    renderShell();
+    fireEvent.click(screen.getByRole("button", { name: "Created, query kept" }));
+
+    await waitFor(() =>
+      expect(screen.getByLabelText("location")).toHaveTextContent("/c/conv_9?o=1"),
+    );
+    expect(screen.getByLabelText("location").textContent).toBe("/c/conv_9?o=1");
+    expect(adoptStartedThingySession).toHaveBeenCalledTimes(1);
+    expect(adoptStartedThingySession).toHaveBeenCalledWith("board", "conv_9");
   });
 
   it("forgets the thingy when New session is left without starting it", () => {
