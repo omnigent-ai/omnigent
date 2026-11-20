@@ -283,7 +283,7 @@ def create_pinned_claude_session(rig: Gateway1mRig) -> str:
         _client,
         rig.base_url,
         harness="claude",
-        metadata={"workspace": str(_REPO_ROOT), "permission_mode": "manual"},
+        metadata={"workspace": str(_REPO_ROOT), "permission_mode": "default"},
     )
     session_id = str(created["session_id"])
     try:
