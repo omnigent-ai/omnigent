@@ -295,6 +295,35 @@ def test_reconnect_init_envelope_carries_fork_history_directives(db_uri: str) ->
     assert metadata.fork_source_external_id == "src-claude-sid"
 
 
+@pytest.mark.parametrize(
+    ("session_usage", "expected"), [({"total_cost_usd": 1.25}, 1.25), ({}, None)]
+)
+def test_init_envelope_carries_the_sessions_own_cost(
+    db_uri: str, session_usage: dict[str, float], expected: float | None
+) -> None:
+    """The runner restores a cold-resumed Claude's running cost from the envelope.
+
+    Drives the real store so the value is the one ``session_usage`` persists.
+    """
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    conversation_store = SqlAlchemyConversationStore(db_uri)
+    agent = agent_store.create(generate_agent_id(), "claude-native-ui", "bundle/loc")
+    session = conversation_store.create_conversation(agent_id=agent.id, workspace="/tmp/ws")
+    conversation_store.set_session_usage(session.id, session_usage)
+    stored = conversation_store.get_conversation(session.id)
+    assert stored is not None
+
+    envelope = parse_runner_session_init_envelope(
+        build_runner_session_init_payload(stored, server_version="0.6.0.dev0")
+    )
+
+    assert envelope is not None
+    assert envelope.snapshot.own_cost_usd == expected
+    from omnigent.runner.app import _claude_launch_metadata_from_envelope
+
+    assert _claude_launch_metadata_from_envelope(envelope).resume_cost_usd == expected
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("trigger", ["child_recovery", "host_recovery"])
 async def test_recovery_has_own_readiness_and_stable_identity_across_failed_posts(

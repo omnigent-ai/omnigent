@@ -3343,6 +3343,7 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
 
     # A missing transcript must not replay an already consumed initial prompt.
     synth_calls: list[str] = []
+    synth_costs: list[float | None] = []
 
     async def _fake_synth(
         client: Any,
@@ -3352,12 +3353,14 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
         workspace: Path,
         bridge_dir: Path,
         resume_copy: bool = False,
+        resume_cost_usd: float | None = None,
     ) -> Path | None:
-        """Record the resume id and optionally provide a transcript."""
+        """Record the resume id and cost and optionally provide a transcript."""
         assert not resume_copy
         assert bridge_dir == bridge_dir_for_bridge_id(session_id)
         del client, session_id, workspace
         synth_calls.append(external_session_id)
+        synth_costs.append(resume_cost_usd)
         if not resume_transcript_available:
             return None
         transcript_path = tmp_path / f"{external_session_id}.jsonl"
@@ -3372,6 +3375,7 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
     initial_prompt = "Reply with READY once.\nThen wait for a new instruction."
     snapshot: dict[str, Any] = {
         "terminal_launch_args": [initial_prompt, "--permission-mode", "auto", "--verbose"],
+        "native_usage_baseline": {"cumulative_cost_usd": 1.25},
     }
     if snapshot_external_id is not None:
         snapshot["external_session_id"] = snapshot_external_id
@@ -3446,10 +3450,14 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
     # ``start_at_end`` must be correct *because* the resume branch ran, not
     # by coincidence: synthesis happens exactly when (and only when) the
     # snapshot carried an external session id.
+    # A cold resume keeps counting from the session's own cost; a fork's rebuild
+    # starts its own.
     if snapshot_external_id is not None:
         assert synth_calls == [snapshot_external_id]
+        assert synth_costs == [1.25]
     else:
         assert len(synth_calls) == int(fork_carry_history)
+        assert synth_costs == [None] * int(fork_carry_history)
 
     # Startup gets image guidance; session-title metadata stays out of it.
     assert (
@@ -3507,6 +3515,7 @@ async def test_auto_create_claude_terminal_resumes_a_copy_while_a_background_job
         workspace: Path,
         bridge_dir: Path,
         resume_copy: bool,
+        resume_cost_usd: float | None = None,
     ) -> Path:
         """Record the id the transcript is rebuilt under."""
         assert resume_copy
@@ -3574,6 +3583,7 @@ async def test_auto_create_claude_terminal_resumes_in_place_when_the_registry_ch
         workspace: Path,
         bridge_dir: Path,
         resume_copy: bool,
+        resume_cost_usd: float | None = None,
     ) -> Path:
         """Record the id the transcript is rebuilt under."""
         assert not resume_copy
@@ -3773,6 +3783,7 @@ async def test_auto_create_claude_terminal_cold_resume_fallback_uses_pre_wipe_br
         workspace: Path,
         bridge_dir: Path,
         resume_copy: bool,
+        resume_cost_usd: float | None = None,
     ) -> Path:
         assert bridge_dir == bridge_dir_for_bridge_id(session_id)
         assert not resume_copy

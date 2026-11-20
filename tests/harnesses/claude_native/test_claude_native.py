@@ -6179,6 +6179,126 @@ async def test_resolve_cold_resume_args_replaces_existing_local_claude_transcrip
     assert [record["message"]["content"] for record in records] == ["fresh Omnigent text"]
 
 
+@pytest.mark.parametrize("resume_cost_usd", [1.25, None], ids=["cost", "no-cost"])
+@pytest.mark.asyncio
+async def test_ensure_local_claude_resume_transcript_restores_the_session_cost(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    resume_cost_usd: float | None,
+) -> None:
+    """
+    The rebuilt transcript ends with the record Claude restores its cost from.
+
+    ``claude --resume`` reads its running cost back only from a ``cost-state``
+    record and skips a partial one. Without the record a cold-resumed session
+    counts from zero, and its reports stay below the session's stored total,
+    which only moves up.
+    """
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", tmp_path / "projects")
+    client = await _httpx_client_with_canned_response(None, 200)
+    async with client:
+        written = await claude_native._ensure_local_claude_resume_transcript(
+            client,
+            session_id="conv_abc",
+            external_session_id="sid123",
+            workspace=tmp_path / "workspace",
+            resume_cost_usd=resume_cost_usd,
+        )
+
+    assert written is not None
+    records = [json.loads(line) for line in written.read_text(encoding="utf-8").splitlines()]
+    cost_states = [record for record in records if record.get("type") == "cost-state"]
+    if resume_cost_usd is None:
+        assert cost_states == []
+        return
+    assert cost_states == [records[-1]]
+    assert set(records[-1]) == {
+        "type",
+        "sessionId",
+        "totalCostUSD",
+        "totalAPIDuration",
+        "totalAPIDurationWithoutRetries",
+        "totalToolDuration",
+        "totalLinesAdded",
+        "totalLinesRemoved",
+        "totalDuration",
+        "startTime",
+        "hasUnknownModelCost",
+        "modelUsage",
+    }
+    assert records[-1]["sessionId"] == "sid123"
+    assert records[-1]["totalCostUSD"] == 1.25
+
+
+@pytest.mark.asyncio
+async def test_resolve_cold_resume_args_restores_the_session_cost(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A CLI cold resume carries the server's own-session cost into the transcript."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    projects = tmp_path / "projects"
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    snapshot = _conversation_response_body(
+        labels={"omnigent.wrapper": "claude-code-native-ui"},
+        external_session_id="claude-uuid-abc",
+    )
+    snapshot["native_usage_baseline"] = {"cumulative_cost_usd": 2.5}
+    client = await _httpx_client_with_canned_response(snapshot, 200)
+    async with client:
+        args = await claude_native._resolve_cold_resume_args(client, "conv_abc")
+
+    assert args == ("--resume", "claude-uuid-abc")
+    transcript = (
+        projects
+        / claude_native._sanitize_claude_project_name(str(workspace.resolve()))
+        / "claude-uuid-abc.jsonl"
+    )
+    last_record = json.loads(transcript.read_text(encoding="utf-8").splitlines()[-1])
+    assert last_record["type"] == "cost-state"
+    assert last_record["totalCostUSD"] == 2.5
+
+
+@pytest.mark.parametrize(
+    ("snapshot", "expected"),
+    [
+        ({"native_usage_baseline": {"cumulative_cost_usd": 2.5}}, 2.5),
+        ({"native_usage_baseline": {"cumulative_cost_usd": 3}}, 3.0),
+        ({"native_usage_baseline": {"cumulative_cost_usd": 0}}, None),
+        ({"native_usage_baseline": {"cumulative_cost_usd": -1.0}}, None),
+        ({"native_usage_baseline": {"cumulative_cost_usd": float("nan")}}, None),
+        ({"native_usage_baseline": {"cumulative_cost_usd": float("inf")}}, None),
+        ({"native_usage_baseline": {"cumulative_cost_usd": True}}, None),
+        ({"native_usage_baseline": {"cumulative_cost_usd": "2.5"}}, None),
+        ({"native_usage_baseline": {"cumulative_cost_usd": None}}, None),
+        ({"native_usage_baseline": None}, None),
+        ({}, None),
+        (None, None),
+    ],
+    ids=[
+        "float",
+        "int",
+        "zero",
+        "negative",
+        "nan",
+        "inf",
+        "bool",
+        "string",
+        "null-cost",
+        "null-baseline",
+        "older-server",
+        "not-a-dict",
+    ],
+)
+def test_claude_resume_cost_from_snapshot_accepts_only_a_positive_cost(
+    snapshot: object, expected: float | None
+) -> None:
+    """Only a positive, finite own-session cost is restored into Claude."""
+    assert claude_native._claude_resume_cost_from_snapshot(snapshot) == expected
+
+
 @pytest.mark.asyncio
 async def test_resolve_cold_resume_args_resumes_a_copy_while_a_background_job_runs_it(
     monkeypatch: pytest.MonkeyPatch,

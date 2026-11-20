@@ -14,6 +14,7 @@ import functools
 import importlib.resources
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -5670,6 +5671,7 @@ async def _resolve_cold_resume_args(
         workspace=Path.cwd().resolve(),
         bridge_dir=bridge_dir_for_bridge_id(labels.get(BRIDGE_ID_LABEL_KEY) or session_id),
         resume_copy=resume_session_id != external_session_id,
+        resume_cost_usd=_claude_resume_cost_from_snapshot(payload),
     )
     if transcript is None:
         # No resumable records: ``claude --resume`` against an empty (or
@@ -5743,6 +5745,52 @@ def _claude_resume_session_id(external_session_id: str, *, session_id: str) -> s
     return copy_session_id
 
 
+def _claude_resume_cost_from_snapshot(snapshot: object) -> float | None:
+    """
+    Read a session's own recorded cost from its ``GET /v1/sessions`` snapshot.
+
+    :param snapshot: Parsed session response, e.g.
+        ``{"native_usage_baseline": {"cumulative_cost_usd": 1.25}}``.
+    :returns: The positive own-session cost in USD, or ``None`` when the
+        server reports none (an older server, or nothing spent yet).
+    """
+    baseline = snapshot.get("native_usage_baseline") if isinstance(snapshot, dict) else None
+    cost = baseline.get("cumulative_cost_usd") if isinstance(baseline, dict) else None
+    if isinstance(cost, bool) or not isinstance(cost, (int, float)):
+        return None
+    return float(cost) if math.isfinite(cost) and cost > 0 else None
+
+
+def _claude_cost_state_record(external_session_id: str, cost_usd: float) -> _JsonObject:
+    """
+    Build the record Claude Code restores its running session cost from.
+
+    Claude appends a ``cost-state`` record when it exits and reads the last one
+    back on ``--resume``. It skips a partial record, so every field it writes is
+    present; durations and per-model usage start empty because only the total
+    is stored.
+
+    :param external_session_id: Claude session id the record belongs to, e.g.
+        ``"02857840-6362-408f-b41f-309e396ed7c6"``.
+    :param cost_usd: Session cost to resume from, e.g. ``1.25``.
+    :returns: The JSONL record.
+    """
+    return {
+        "type": "cost-state",
+        "sessionId": external_session_id,
+        "totalCostUSD": cost_usd,
+        "totalAPIDuration": 0,
+        "totalAPIDurationWithoutRetries": 0,
+        "totalToolDuration": 0,
+        "totalLinesAdded": 0,
+        "totalLinesRemoved": 0,
+        "totalDuration": 0,
+        "startTime": int(datetime.now(UTC).timestamp() * 1000),
+        "hasUnknownModelCost": False,
+        "modelUsage": {},
+    }
+
+
 async def _ensure_local_claude_resume_transcript(
     client: httpx.AsyncClient,
     *,
@@ -5751,6 +5799,7 @@ async def _ensure_local_claude_resume_transcript(
     workspace: Path,
     bridge_dir: Path | None = None,
     resume_copy: bool = False,
+    resume_cost_usd: float | None = None,
 ) -> Path | None:
     """
     Refresh Claude Code's local JSONL transcript for cold resume.
@@ -5778,6 +5827,10 @@ async def _ensure_local_claude_resume_transcript(
     :param bridge_dir: Launch bridge path identifying the attachment cache.
         Defaults to the legacy session-id bridge when omitted.
     :param resume_copy: Mark a temporary native copy so local import excludes it.
+    :param resume_cost_usd: The session's own recorded cost, e.g. ``1.25``.
+        The rebuilt transcript carries it so the resumed Claude keeps counting
+        from it instead of from zero. ``None`` when there is no cost to
+        restore, such as for a fork, which starts its own.
     :returns: Path to the local transcript that was written; ``None`` if
         *external_session_id* is not a safe transcript stem, or if the AP
         history yields no resumable records (an empty transcript would make
@@ -5834,6 +5887,8 @@ async def _ensure_local_claude_resume_transcript(
     # launches fresh instead of resuming nothing.
     if not records:
         return None
+    if resume_cost_usd is not None:
+        records.append(_claude_cost_state_record(external_session_id, resume_cost_usd))
     target_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     tmp = target.with_suffix(".jsonl.tmp")
     try:
