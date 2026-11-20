@@ -30,6 +30,14 @@ export interface QuickPickItem<Value = unknown> {
   highlights?: { label?: readonly MatchRange[]; description?: readonly MatchRange[] };
   /** How this row's matched text stands out; defaults to the picker's highlight. */
   matchHighlight?: MatchHighlight;
+  /** Defaults to true; a free-text item is never remembered. */
+  rememberInHistory?: boolean;
+  /**
+   * With `sourcesFirst`, whether this item matching the query can move the items ahead of the
+   * sources. False for a label that names the user's data, such as a pull request's title, so
+   * a word from that title doesn't push the matching sessions down. Defaults to true.
+   */
+  leadsSources?: boolean;
   value: Value;
 }
 
@@ -51,6 +59,10 @@ export interface QuickPickItemRow<Value = unknown> {
   item: QuickPickItem<Value>;
   labelRanges: readonly MatchRange[];
   descriptionRanges: readonly MatchRange[];
+  /** True for the item made from the typed query. */
+  isFreeText: boolean;
+  /** The item's group, shown on the row when ranked rows from several groups interleave. */
+  sectionLabel?: string;
 }
 
 export type QuickPickRow<Value = unknown> = QuickPickHeadingRow | QuickPickItemRow<Value>;
