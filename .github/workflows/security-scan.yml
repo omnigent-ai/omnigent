@@ -41,7 +41,7 @@ concurrency:
 jobs:
   scan:
     name: Security Scan
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
       # Route uv at PyPI for the semgrep fetch.
@@ -163,7 +163,7 @@ jobs:
 
       - name: Install uv
         if: ${{ steps.gate.outputs.scan == 'true' }}
-        uses: omnigent-ai/omnigent/.github/actions/setup-uv@25521b2eb074b11ebe51fe5e3eaeb494e20101eb # self-contained setup
+        uses: omnigent-ai/omnigent/.github/actions/setup-uv@c144e4b1a1c2f9ed45aa6596b90c3672b3faf1c8 # self-contained setup
 
       - name: OSV advisory scan (uv.lock)
         # Checks every package version pinned in the PR's uv.lock against the

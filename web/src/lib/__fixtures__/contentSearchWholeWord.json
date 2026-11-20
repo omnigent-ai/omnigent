@@ -1,0 +1,225 @@
+{
+  "corpus": [
+    "needle",
+    "needles",
+    "(needle) here",
+    "needle_x",
+    "needle2",
+    "pre-needle-post",
+    "Needle",
+    "café",
+    "cafe\u0301",
+    "cafés",
+    "игла",
+    "иглы",
+    "𝐀needle",
+    "C++ code",
+    "C++x",
+    "foo.bar(1)",
+    "pin",
+    "pins",
+    "x(needle)y",
+    "a+b",
+    "x#y",
+    "a~b",
+    "a&b",
+    "[x]",
+    "\ud839\udec0",
+    "x«quote»y",
+    "xcafé",
+    "caféx",
+    "иглаx"
+  ],
+  "cases": [
+    {
+      "name": "plain word",
+      "query": "needle",
+      "regex": false,
+      "caseSensitive": true,
+      "wholeWord": true,
+      "pattern": "\\bneedle\\b",
+      "sentRegex": true,
+      "lines": [1, 3, 6, 19]
+    },
+    {
+      "name": "plain word, ignoring case",
+      "query": "needle",
+      "regex": false,
+      "caseSensitive": false,
+      "wholeWord": true,
+      "pattern": "\\bneedle\\b",
+      "sentRegex": true,
+      "lines": [1, 3, 6, 7, 19]
+    },
+    {
+      "name": "whole word off keeps a substring search",
+      "query": "needle",
+      "regex": false,
+      "caseSensitive": true,
+      "wholeWord": false,
+      "pattern": "needle",
+      "sentRegex": false,
+      "lines": [1, 2, 3, 4, 5, 6, 13, 19]
+    },
+    {
+      "name": "composed accent",
+      "query": "café",
+      "regex": false,
+      "caseSensitive": true,
+      "wholeWord": true,
+      "pattern": "\\bcaf(?:[\\x{E9}&&\\w]\\b|[\\x{E9}&&\\W])",
+      "sentRegex": true,
+      "lines": [8]
+    },
+    {
+      "name": "decomposed accent",
+      "query": "cafe\u0301",
+      "regex": false,
+      "caseSensitive": true,
+      "wholeWord": true,
+      "pattern": "\\bcafe(?:[\\x{301}&&\\w]\\b|[\\x{301}&&\\W])",
+      "sentRegex": true,
+      "lines": [9]
+    },
+    {
+      "name": "non-Latin letters",
+      "query": "игла",
+      "regex": false,
+      "caseSensitive": true,
+      "wholeWord": true,
+      "pattern": "(?:\\b[\\x{438}&&\\w]|[\\x{438}&&\\W])гл(?:[\\x{430}&&\\w]\\b|[\\x{430}&&\\W])",
+      "sentRegex": true,
+      "lines": [11]
+    },
+    {
+      "name": "punctuation end matches as typed, including C++x",
+      "query": "C++",
+      "regex": false,
+      "caseSensitive": true,
+      "wholeWord": true,
+      "pattern": "\\bC\\+\\+",
+      "sentRegex": true,
+      "lines": [14, 15]
+    },
+    {
+      "name": "punctuation end after a word",
+      "query": "foo.bar(",
+      "regex": false,
+      "caseSensitive": true,
+      "wholeWord": true,
+      "pattern": "\\bfoo\\.bar\\(",
+      "sentRegex": true,
+      "lines": [16]
+    },
+    {
+      "name": "punctuation on both edges matches inside a word",
+      "query": "(needle)",
+      "regex": false,
+      "caseSensitive": true,
+      "wholeWord": true,
+      "pattern": "\\(needle\\)",
+      "sentRegex": true,
+      "lines": [3, 19]
+    },
+    {
+      "name": "regex alternation is bounded as a whole",
+      "query": "needle|pin",
+      "regex": true,
+      "caseSensitive": true,
+      "wholeWord": true,
+      "pattern": "\\b(?:needle|pin)\\b",
+      "sentRegex": true,
+      "lines": [1, 3, 6, 17, 19]
+    },
+    {
+      "name": "regex with whole word off is unchanged",
+      "query": "needle|pin",
+      "regex": true,
+      "caseSensitive": true,
+      "wholeWord": false,
+      "pattern": "needle|pin",
+      "sentRegex": true,
+      "lines": [1, 2, 3, 4, 5, 6, 13, 17, 18, 19]
+    },
+    {
+      "name": "regex wildcard",
+      "query": "nee.le",
+      "regex": true,
+      "caseSensitive": true,
+      "wholeWord": true,
+      "pattern": "\\b(?:nee.le)\\b",
+      "sentRegex": true,
+      "lines": [1, 3, 6, 19]
+    },
+    {
+      "name": "escaped plus",
+      "query": "a+b",
+      "regex": false,
+      "caseSensitive": true,
+      "wholeWord": true,
+      "pattern": "\\ba\\+b\\b",
+      "sentRegex": true,
+      "lines": [20]
+    },
+    {
+      "name": "escaped hash",
+      "query": "x#y",
+      "regex": false,
+      "caseSensitive": true,
+      "wholeWord": true,
+      "pattern": "\\bx\\#y\\b",
+      "sentRegex": true,
+      "lines": [21]
+    },
+    {
+      "name": "escaped tilde",
+      "query": "a~b",
+      "regex": false,
+      "caseSensitive": true,
+      "wholeWord": true,
+      "pattern": "\\ba\\~b\\b",
+      "sentRegex": true,
+      "lines": [22]
+    },
+    {
+      "name": "escaped ampersand",
+      "query": "a&b",
+      "regex": false,
+      "caseSensitive": true,
+      "wholeWord": true,
+      "pattern": "\\ba\\&b\\b",
+      "sentRegex": true,
+      "lines": [23]
+    },
+    {
+      "name": "escaped brackets",
+      "query": "[x]",
+      "regex": false,
+      "caseSensitive": true,
+      "wholeWord": true,
+      "pattern": "\\[x\\]",
+      "sentRegex": true,
+      "lines": [24]
+    },
+    {
+      "name": "ripgrep classifies a non-ASCII edge, even where Unicode versions disagree",
+      "query": "\ud839\udec0",
+      "regex": false,
+      "caseSensitive": true,
+      "wholeWord": true,
+      "pattern": "(?:\\b[\\x{1E6C0}&&\\w]\\b|[\\x{1E6C0}&&\\W])",
+      "sentRegex": true,
+      "lines": [25]
+    },
+    {
+      "name": "non-ASCII punctuation edges match as typed",
+      "query": "«quote»",
+      "regex": false,
+      "caseSensitive": true,
+      "wholeWord": true,
+      "pattern": "(?:\\b[\\x{AB}&&\\w]|[\\x{AB}&&\\W])quote(?:[\\x{BB}&&\\w]\\b|[\\x{BB}&&\\W])",
+      "sentRegex": true,
+      "lines": [26]
+    }
+  ]
+}

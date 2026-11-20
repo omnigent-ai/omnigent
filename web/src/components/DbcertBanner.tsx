@@ -2,12 +2,7 @@ import { AlertTriangleIcon, XIcon } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
 import { useHostDbcert } from "@/hooks/useHostDbcert";
-import {
-  checkDbcert,
-  getDesktopFeatures,
-  hasDbcertRefreshBridge,
-  refreshDbcert,
-} from "@/lib/nativeBridge";
+import { checkDbcert, refreshDbcert } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 
 /**
@@ -16,34 +11,13 @@ import { cn } from "@/lib/utils";
  * `StreamBudgetBanner` and stacked with it in a `FloatingBannerStack`.
  * Dismissable per expired certificate.
  */
-interface DbcertBannerProps {
+export function DbcertBanner({
+  conversationId,
+  hostId,
+}: {
   conversationId: string | null | undefined;
   hostId: string | null | undefined;
-}
-
-export function DbcertBanner({ conversationId, hostId }: DbcertBannerProps) {
-  const [supported, setSupported] = useState(false);
-
-  useEffect(() => {
-    if (!hasDbcertRefreshBridge()) return;
-    let active = true;
-    void getDesktopFeatures().then((features) => {
-      if (active) {
-        setSupported(
-          features?.databricksInternalFeatures === true && features.canRefreshDbcert === true,
-        );
-      }
-    });
-    return () => {
-      active = false;
-    };
-  }, []);
-
-  if (!supported) return null;
-  return <SupportedDbcertBanner conversationId={conversationId} hostId={hostId} />;
-}
-
-function SupportedDbcertBanner({ conversationId, hostId }: DbcertBannerProps) {
+}) {
   const dbcert = useHostDbcert(conversationId, hostId);
   if (!dbcert.show) return null;
   return (
@@ -52,7 +26,9 @@ function SupportedDbcertBanner({ conversationId, hostId }: DbcertBannerProps) {
       running={dbcert.phase === "running"}
       error={
         dbcert.phase === "failed"
-          ? "Couldn't refresh it from here. Click dbcert in the Arca Companion menu on your laptop."
+          ? dbcert.refreshMode === "host"
+            ? "Sign-in didn't complete. Try again, or run dbcert on the host."
+            : "Couldn't refresh it from here. Click dbcert in the Arca Companion menu on your laptop."
           : null
       }
       onRefresh={() => void dbcert.refresh()}

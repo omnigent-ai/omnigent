@@ -48,6 +48,7 @@ import {
   type RoutingDecisionItem,
   type SlashCommandItem,
   type TerminalCommandItem,
+  assistantMessagePhase,
   isCompactionItem,
   isErrorItem,
   isFunctionCallItem,
@@ -63,6 +64,8 @@ import { nativePolicyNameForAgentName } from "./nativeCodingAgents";
 import { routingExtrasFromWire } from "./routingDecision";
 import { isClaudeAgentMessageContent, taskNotificationMarkerContent } from "./systemMessage";
 import { readSubagentActivity } from "./subagentActivity";
+import { subagentHandbackReport } from "./subagentHandback";
+import { readTaskActivity } from "./taskActivity";
 
 // Claude built-ins whose call is a question TO the user rather than work
 // the agent did on its own. The elicitation that carried the card is
@@ -93,8 +96,19 @@ export function itemsToBlocks(items: ConversationItem[]): AnyBlock[] {
   const blocks: AnyBlock[] = [];
   const outputs = toolOutputsByCallId(items);
   const agents = agentNamesByResponseId(items);
+  const handbacks = new Set<string>();
   for (const item of items) {
     if (!item.response_id) continue;
+    if (isFunctionCallItem(item)) {
+      const report = handbackReportBlock(item);
+      if (report !== null) {
+        handbacks.add(item.call_id);
+        blocks.push(report);
+        continue;
+      }
+    }
+    // The handback's result only confirms delivery; the report already shows.
+    if (isFunctionCallOutputItem(item) && handbacks.has(item.call_id)) continue;
     if (isSlashCommandItem(item)) {
       const echo = skillEchoBlock(item);
       if (echo !== null) blocks.push(echo);
@@ -241,7 +255,8 @@ function answersFromToolResult(
 
 function itemToBlock(item: ConversationItem, agentName?: string | null): AnyBlock | null {
   const data = item as unknown as Record<string, unknown>;
-  if (readSubagentActivity(data)) {
+  // Task markers place and fold like sub-agent markers, so they share the notice kind.
+  if (readSubagentActivity(data) || readTaskActivity(data)) {
     return {
       type: "native_tool",
       ctx: ctxFor(item),
@@ -350,6 +365,7 @@ function userMessageToBlock(item: MessageItem): UserMessageBlock {
 }
 
 function assistantMessageToBlock(item: MessageItem): TextDone {
+  const phase = assistantMessagePhase(item.phase);
   const text = item.content
     .filter((b): b is { type: "output_text"; text: string } => b.type === "output_text")
     .map((b) => b.text)
@@ -360,16 +376,32 @@ function assistantMessageToBlock(item: MessageItem): TextDone {
     fullText: text,
     hasCodeBlocks: text.includes("```"),
     ...(item.interrupted === true ? { interrupted: true } : {}),
+    ...(phase !== undefined ? { phase } : {}),
+  };
+}
+
+function parsedArguments(item: FunctionCallItem): Record<string, unknown> {
+  try {
+    return JSON.parse(item.arguments) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
+/** A sub-agent's handback call rendered as its final answer, or ``null``. */
+function handbackReportBlock(item: FunctionCallItem): TextDone | null {
+  const report = subagentHandbackReport(item.name, parsedArguments(item));
+  if (report === null) return null;
+  return {
+    type: "text_done",
+    ctx: ctxFor(item),
+    fullText: report,
+    hasCodeBlocks: report.includes("```"),
   };
 }
 
 function functionCallToBlock(item: FunctionCallItem): ToolGroup {
-  let args: Record<string, unknown>;
-  try {
-    args = JSON.parse(item.arguments) as Record<string, unknown>;
-  } catch {
-    args = {};
-  }
+  const args = parsedArguments(item);
   const execution: ToolExecution = {
     name: item.name,
     arguments: args,

@@ -182,6 +182,18 @@ describe("parseEvent — response.output_item.done (message)", () => {
       messageId: "codex:thread_1:turn_1:agentMessage:item_1",
     } satisfies MessageDone);
   });
+
+  it("carries a known assistant phase and drops an unknown one", () => {
+    const item = { id: "it_1", type: "message", response_id: "resp_1", content: [] };
+    const known = parseEvent("response.output_item.done", {
+      item: { ...item, phase: "final_answer" },
+    });
+    expect(known).toMatchObject({ type: "message_done", phase: "final_answer" });
+    const unknown = parseEvent("response.output_item.done", {
+      item: { ...item, phase: "summary" },
+    });
+    expect(unknown).not.toHaveProperty("phase");
+  });
 });
 
 describe("parseEvent — response.output_item.done (reasoning)", () => {
@@ -242,6 +254,15 @@ describe("parseEvent — session.superseded", () => {
       targetConversationId: "conv_new",
       reason: "clear",
     } satisfies SessionSupersededEvent);
+  });
+
+  it("keeps a rewind reason", () => {
+    const ev = parseEvent("session.superseded", {
+      conversation_id: "conv_old",
+      target_conversation_id: "conv_new",
+      reason: "rewind",
+    });
+    expect(ev).toMatchObject({ type: "session_superseded", reason: "rewind" });
   });
 
   it("returns null when the target conversation id is missing", () => {
@@ -350,6 +371,26 @@ describe("parseEvent — session.status (background_tasks detail)", () => {
     expect(bgTasks({ background_tasks: "nope" })).toBeUndefined();
     expect(bgTasks({ background_tasks: [] })).toBeUndefined();
     expect(bgTasks({ background_tasks: ["junk", 1] })).toBeUndefined();
+  });
+});
+
+describe("parseEvent — session.status (background_agents)", () => {
+  function agents(status: string, data: Record<string, unknown>) {
+    const ev = parseEvent("session.status", { conversation_id: "conv_a", status, ...data });
+    return (ev as SessionStatusEvent | null)?.backgroundAgents;
+  }
+
+  it("names the agents a claude-native waiting edge waits on", () => {
+    expect(
+      agents("waiting", {
+        background_agents: [{ id: "a1", type: "subagent", description: "Audit" }, "junk"],
+      }),
+    ).toEqual([{ id: "a1", type: "subagent", description: "Audit" }]);
+  });
+
+  it("ignores agents on any edge other than waiting", () => {
+    expect(agents("running", { background_agents: [{ id: "a1" }] })).toBeUndefined();
+    expect(agents("waiting", {})).toBeUndefined();
   });
 });
 
