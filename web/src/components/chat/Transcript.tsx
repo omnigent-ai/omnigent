@@ -1215,18 +1215,21 @@ export function VirtualBubbleList({
   }, [onGeometryChange, scrollToItem, activeTurnId, rangeNonce]);
 
   if (disableVirtualization) {
+    // Same wrapper and keyed rows as the virtualized list, so mounted rows keep
+    // their DOM nodes and the reader's selection survives into native find.
     return (
-      <div className="flex w-full flex-col gap-4">
+      <div className="flex w-full flex-col" style={{ rowGap: ROW_GAP_PX }}>
         {bubbles.map((bubble, index) => (
-          <BubbleView
-            key={rowKey(bubble)}
-            bubble={bubble}
-            isLastAssistant={index === lastAssistantIndex}
-            showsWorking={showsWorking && index === lastAssistantIndex}
-            actionsPersistent={
-              index === lastMessageIndex && bubble.kind === "assistant" && actionsPersist
-            }
-          />
+          <div key={rowKey(bubble)} className="relative">
+            <BubbleView
+              bubble={bubble}
+              isLastAssistant={index === lastAssistantIndex}
+              showsWorking={showsWorking && index === lastAssistantIndex}
+              actionsPersistent={
+                index === lastMessageIndex && bubble.kind === "assistant" && actionsPersist
+              }
+            />
+          </div>
         ))}
       </div>
     );
