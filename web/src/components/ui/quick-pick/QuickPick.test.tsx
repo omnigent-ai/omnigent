@@ -287,6 +287,24 @@ describe("QuickPick caller-chosen active row", () => {
   });
 });
 
+describe("QuickPick shown active row", () => {
+  it("reports each row that becomes active, by keys or as a query filters the list", () => {
+    const onActiveRowShown = vi.fn();
+    const { input } = renderPicker({ onActiveRowShown });
+    expect(onActiveRowShown).toHaveBeenLastCalledWith("new-session");
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    expect(onActiveRowShown).toHaveBeenLastCalledWith("open-settings");
+    fireEvent.keyDown(input, { key: "ArrowUp" });
+    // A query that leaves another row on top shows it, though the user didn't move.
+    fireEvent.change(input, { target: { value: "settings" } });
+    expect(onActiveRowShown).toHaveBeenLastCalledWith("open-settings");
+    // Nothing matching reports nothing, so a preview keeps the last row.
+    onActiveRowShown.mockClear();
+    fireEvent.change(input, { target: { value: "zzz" } });
+    expect(onActiveRowShown).not.toHaveBeenCalled();
+  });
+});
+
 describe("QuickPick groups", () => {
   it("keeps ungrouped rows out of the group above them", () => {
     renderPicker({

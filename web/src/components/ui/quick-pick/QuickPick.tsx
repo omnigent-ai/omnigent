@@ -4,6 +4,7 @@ import {
   type MutableRefObject,
   type ReactNode,
   useCallback,
+  useEffect,
   useId,
   useLayoutEffect,
   useMemo,
@@ -128,6 +129,11 @@ export interface QuickPickProps<Value> {
    */
   activeId?: string | null;
   onActiveIdChange?: (id: string) => void;
+  /**
+   * Called whenever a different row becomes active, by the user or as results change, such
+   * as a query filtering the active one out, for a caller previewing it. Not while none is.
+   */
+  onActiveRowShown?: (id: string) => void;
   /** `data-testid` for the query field. */
   inputTestId?: string;
   /** Arrow keys wrap around at the ends; off by default, as in a menu. */
@@ -304,6 +310,7 @@ export function QuickPick<Value>({
   autoFocus = true,
   activeId = null,
   onActiveIdChange,
+  onActiveRowShown,
   inputTestId,
   loop = false,
   fillHeight = false,
@@ -398,6 +405,12 @@ export function QuickPick<Value>({
     onActiveIdChange?.(id);
   };
   const activeRow = activeIndex === -1 ? null : (rows[activeIndex] as QuickPickItemRow<Value>);
+  const shownRowId = activeRow?.item.id ?? null;
+  const onActiveRowShownRef = useRef(onActiveRowShown);
+  onActiveRowShownRef.current = onActiveRowShown;
+  useEffect(() => {
+    if (shownRowId !== null) onActiveRowShownRef.current?.(shownRowId);
+  }, [shownRowId]);
 
   // Whenever the active row changes, by keys, a new query or new results, scroll it
   // into view; a row the pointer picked is already visible, so the list stays put.
