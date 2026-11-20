@@ -149,6 +149,7 @@ import {
   DELETE_WORKTREES_ON_ARCHIVE_ENTRY,
 } from "@/pages/settings/search/catalog/git";
 import {
+  CLAUDE_CONNECTION_ENTRY,
   DATABRICKS_CONNECTION_ENTRY,
   GITHUB_CONNECTION_ENTRY,
 } from "@/pages/settings/search/catalog/integrations";
@@ -194,6 +195,12 @@ import {
   fetchDatabricksStatus,
   type DatabricksConnectionStatus,
 } from "@/lib/databricksIntegration";
+import {
+  disconnectClaude,
+  fetchClaudeStatus,
+  saveClaudeToken,
+  type ClaudeConnectionStatus,
+} from "@/lib/claudeIntegration";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { useAdminViewSwitchShown } from "@/hooks/useAdminViewSwitchShown";
 import { isAdminViewEnabled, setAdminViewEnabled } from "@/lib/adminView";
@@ -1564,6 +1571,7 @@ function GithubMark({ className }: { className?: string }) {
 const CONNECTION_PANELS: Record<string, ComponentType> = {
   github: GithubIntegrationControl,
   databricks: DatabricksIntegrationControl,
+  claude: ClaudeIntegrationControl,
 };
 
 /**
@@ -1911,6 +1919,135 @@ function DatabricksIntegrationControl() {
                 onClick={() => beginDatabricksConnect(workspace.trim(), returnTo)}
               >
                 Connect Databricks
+              </Button>
+            </>
+          )}
+        </div>
+      </div>
+    </SettingsItem>
+  );
+}
+
+/**
+ * Connect / disconnect a Claude subscription. The user pastes the token
+ * ``claude setup-token`` prints (Claude has no OAuth redirect for third-party
+ * servers); once saved, new managed sandboxes launched by this user run Claude
+ * Code on that subscription. The token is never shown again after saving.
+ */
+function ClaudeIntegrationControl() {
+  const [status, setStatus] = useState<ClaudeConnectionStatus | null | "loading">("loading");
+  const [busy, setBusy] = useState(false);
+  const [token, setToken] = useState("");
+  const [error, setError] = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      setStatus(await fetchClaudeStatus());
+    } catch {
+      setStatus(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  const onSave = useCallback(async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      setStatus(await saveClaudeToken(token.trim()));
+      setToken("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Couldn't save the token.");
+    } finally {
+      setBusy(false);
+    }
+  }, [token]);
+
+  const onDisconnect = useCallback(async () => {
+    setBusy(true);
+    try {
+      await disconnectClaude();
+      await refresh();
+    } finally {
+      setBusy(false);
+    }
+  }, [refresh]);
+
+  // Feature not configured on this server: render nothing (like a build without it).
+  if (status !== "loading" && status !== null && !status.enabled) {
+    return null;
+  }
+  if (status === "loading" || status === null) {
+    return (
+      <SettingsItem entry={CLAUDE_CONNECTION_ENTRY}>
+        <SettingsEntryLabel entry={CLAUDE_CONNECTION_ENTRY} labelClassName="text-sm" />
+        <p className="text-sm text-muted-foreground">
+          {status === "loading" ? "Checking…" : "Claude status is unavailable."}
+        </p>
+      </SettingsItem>
+    );
+  }
+
+  return (
+    <SettingsItem entry={CLAUDE_CONNECTION_ENTRY} className="flex flex-col gap-4">
+      {error && (
+        <div
+          role="alert"
+          className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+        >
+          {error}
+        </div>
+      )}
+
+      <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+        <SettingsEntryLabel
+          entry={CLAUDE_CONNECTION_ENTRY}
+          labelClassName="text-sm"
+          className="flex-1"
+          description={
+            status.connected
+              ? "Subscription connected. New sandboxes run Claude Code on your subscription."
+              : CLAUDE_CONNECTION_ENTRY.description
+          }
+        />
+        <div className="flex shrink-0 items-center gap-2">
+          {status.connected ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-9"
+              {...settingsControlProps(CLAUDE_CONNECTION_ENTRY, "disconnect")}
+              disabled={busy}
+              data-testid="claude-disconnect"
+              onClick={() => void onDisconnect()}
+            >
+              Disconnect
+            </Button>
+          ) : (
+            <>
+              <Input
+                {...settingsControlProps(CLAUDE_CONNECTION_ENTRY, "token")}
+                type="password"
+                autoComplete="off"
+                spellCheck={false}
+                placeholder="sk-ant-oat01-…"
+                aria-label="Claude setup token"
+                className="h-9 w-64"
+                value={token}
+                onChange={(e) => setToken(e.target.value)}
+                data-testid="claude-token"
+              />
+              <Button
+                size="sm"
+                className="h-9"
+                {...settingsControlProps(CLAUDE_CONNECTION_ENTRY, "connect")}
+                disabled={busy || token.trim() === ""}
+                data-testid="claude-connect"
+                onClick={() => void onSave()}
+              >
+                Connect Claude
               </Button>
             </>
           )}

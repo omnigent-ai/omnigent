@@ -37,6 +37,7 @@ export function useSettingsAvailability(): SettingsAvailability {
   const mcpServices = providers.includes("mcp");
   const github = providers.includes("github");
   const databricks = providers.includes("databricks");
+  const claude = providers.includes("claude");
   const projectKanban = isFeatureEnabled(info, "project_kanban");
   const sessionTitleInstructions = loaded?.session_title_instructions === true;
   const proactiveAgent = loaded?.proactive_agent_available === true;
@@ -49,7 +50,7 @@ export function useSettingsAvailability(): SettingsAvailability {
       accountsEnabled,
       archiveWorktreeCleanup,
       mcpServices,
-      integrationProviders: { github, databricks },
+      integrationProviders: { github, databricks, claude },
       projectKanban,
       sessionTitleInstructions,
       proactiveAgent,
@@ -64,6 +65,7 @@ export function useSettingsAvailability(): SettingsAvailability {
       mcpServices,
       github,
       databricks,
+      claude,
       projectKanban,
       sessionTitleInstructions,
       proactiveAgent,

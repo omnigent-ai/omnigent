@@ -183,7 +183,7 @@ export interface SettingsAvailability {
   /** The server lists managed MCP services in `enabled_connections`. */
   mcpServices: boolean;
   /** Which sandbox account connections the server lists in `enabled_connections`. */
-  integrationProviders: { github: boolean; databricks: boolean };
+  integrationProviders: { github: boolean; databricks: boolean; claude: boolean };
   /** The server turns on project kanban boards. */
   projectKanban: boolean;
   /** The server lets people write their own session title instructions. */
