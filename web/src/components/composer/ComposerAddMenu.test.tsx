@@ -161,15 +161,27 @@ describe("ComposerAddMenu's placement", () => {
     return screen.getByTestId("composer-add-menu");
   }
 
-  it("spans the composer card above it in a main window", () => {
-    expect(openInCard()).toHaveStyle({ width: "640px" });
+  /** Where the popper placed the menu, once it has measured. */
+  async function placement(menu: HTMLElement): Promise<string> {
+    const wrapper = menu.closest<HTMLElement>("[data-radix-popper-content-wrapper]")!;
+    await waitFor(() => expect(wrapper.style.transform).toMatch(/translate/));
+    return wrapper.style.transform;
+  }
+
+  it("spans the composer card, just above it, in a main window", async () => {
+    const menu = openInCard();
+    expect(menu).toHaveStyle({ width: "640px" });
+    // Its bottom edge sits on the card's top (40), not on the trigger (400).
+    expect(await placement(menu)).toMatch(/, 34px\)$/);
   });
 
   // In a panel the card is the whole window, so card geometry would pin the menu to its top.
-  it("opens from the trigger at its own width in a panel", () => {
+  it("opens from the trigger at its own width in a panel", async () => {
     const menu = openInCard("panel");
     expect(menu.style.width).toBe("");
     expect(menu).toHaveAttribute("data-side", "top");
     expect(menu).toHaveAttribute("data-align", "start");
+    // Starts at the trigger's left (32) and ends 6px above its top (400).
+    expect(await placement(menu)).toBe("translate(32px, 394px)");
   });
 });
