@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 import time
 import uuid
 from collections.abc import Callable
@@ -26,6 +27,7 @@ from omnigent.harnesses.qwen_native import bridge as qwen_native_bridge
 from omnigent.runner import create_runner_app, native_controls
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
+from tests.budgets import budget
 from tests.runner.conftest import (
     _build_app_for_spec,
     _drain_session_event_queue,
@@ -1792,8 +1794,20 @@ async def test_events_native_dispatch_resolves_bridge_id_via_label_lookup(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "blocked_read",
+    [
+        None,
+        "omnigent.harnesses.claude_native.bridge.read_model_env",
+        "omnigent.harnesses.claude_native.bridge.read_model_picker_values",
+        "omnigent.harnesses.claude_native.main.stored_claude_catalog_rows",
+        "omnigent.harnesses.claude_native.main.stored_claude_picker_values",
+        "omnigent.inference_config.load_runtime_inference_config",
+    ],
+)
 async def test_events_model_change_on_native_session_types_slash_command(
     monkeypatch: pytest.MonkeyPatch,
+    blocked_read: str | None,
 ) -> None:
     """
     POST ``/events`` with ``{"type":"model_change","model":"claude-opus-4-7"}``
@@ -1827,6 +1841,13 @@ async def test_events_model_change_on_native_session_types_slash_command(
         "read_model_env",
         lambda _bridge_dir: {"ANTHROPIC_CUSTOM_MODEL_OPTION": "claude-opus-4-7"},
     )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.resolve_native_claude_config", lambda **_: None
+    )
+    monkeypatch.setattr(claude_native_bridge, "read_model_picker_values", lambda _: [])
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.stored_claude_catalog_rows", lambda _: None
+    )
 
     native_spec = _harness_spec("claude-native")
 
@@ -1848,10 +1869,43 @@ async def test_events_model_change_on_native_session_types_slash_command(
             _session_event_queues_ref.get("57c7c1acc5eeec3978c5e62043da51a4")
         )
 
-        resp = await client.post(
-            "/v1/sessions/57c7c1acc5eeec3978c5e62043da51a4/events",
-            json={"type": "model_change", "model": "claude-opus-4-7"},
+        entered = threading.Event()
+        release = threading.Event()
+        if blocked_read is not None:
+            import importlib
+
+            module_name, function_name = blocked_read.rsplit(".", 1)
+            original_read = getattr(importlib.import_module(module_name), function_name)
+
+            def held_read(*args: Any, **kwargs: Any) -> Any:
+                entered.set()
+                release.wait()
+                return original_read(*args, **kwargs)
+
+            monkeypatch.setattr(blocked_read, held_read)
+
+        # The external release also bounds a regression that blocks the event loop.
+        safety_release = threading.Timer(budget(3.0), release.set)
+        safety_release.start()
+        model_change = asyncio.create_task(
+            client.post(
+                "/v1/sessions/57c7c1acc5eeec3978c5e62043da51a4/events",
+                json={"type": "model_change", "model": "claude-opus-4-7"},
+            )
         )
+        try:
+            if blocked_read is not None:
+                assert await asyncio.to_thread(entered.wait, budget(3.0))
+                health = await client.get("/health")
+                assert health.status_code == 200
+                assert not release.is_set(), "model configuration I/O blocked the runner"
+                assert not captured, "a model command preceded its configuration read"
+            release.set()
+            resp = await model_change
+        finally:
+            release.set()
+            safety_release.cancel()
+            await model_change
 
         # Drain the event queue before delete clears it. model_change
         # is a control signal, not a state change — no events should
