@@ -192,7 +192,7 @@ describe("CodeMirrorComposerInput", () => {
 });
 
 describe("CodeMirrorComposerInput change events", () => {
-  it("makes an edit marked separateUndo its own undo step, apart from the typing before it", () => {
+  it("makes a programmatic insert, separateUndo or not, its own undo step apart from typing", () => {
     const { content, target } = mount({ value: "" });
     const editor = EditorView.findFromDOM(content)!;
     act(

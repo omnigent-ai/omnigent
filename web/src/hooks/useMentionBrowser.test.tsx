@@ -85,6 +85,8 @@ describe("useMentionBrowser with tags held by a session draft", () => {
 function renderBrowser(input: ComposerTextTarget | null = null) {
   return renderHook(() => {
     const [text, setText] = useState(input?.value ?? "");
+    // A reply quote's text, which ChatPage passes alongside the tail as a draft segment.
+    const [quote, setQuote] = useState("");
     const [mention, setMention] = useState<MentionState | null>(null);
     const browser = useMentionBrowser({
       mention,
@@ -93,8 +95,9 @@ function renderBrowser(input: ComposerTextTarget | null = null) {
       text,
       setText,
       textareaRef: { current: input },
+      segments: [text, quote],
     });
-    return { text, setText, setMention, browser };
+    return { text, setText, setQuote, setMention, browser };
   });
 }
 
@@ -116,15 +119,24 @@ function tagSession(result: Rendered, session: SessionMention, typed: string) {
   act(() => result.current.browser.attachSession(session));
 }
 
-/** An input's change, as the composer's onChange reports it. */
-function change(result: Rendered, value: string, fromHistory: boolean) {
+// One stable fake input per name, as a mounted composer input is the same object across events.
+const fakeInputs = new WeakMap<Rendered, Map<string, { value: string }>>();
+
+/** A change in input `name` ("tail" or a reply quote), as the composer's onChange reports it. */
+function change(result: Rendered, value: string, fromHistory: boolean, name = "tail") {
+  const inputs = fakeInputs.get(result) ?? new Map<string, { value: string }>();
+  fakeInputs.set(result, inputs);
+  const input = inputs.get(name) ?? { value: "" };
+  inputs.set(name, input);
+  input.value = value;
   const event: ComposerInputEvent = {
-    currentTarget: { value } as ComposerTextTarget,
+    currentTarget: input as unknown as ComposerTextTarget,
     fromHistory,
   };
   act(() => {
     result.current.browser.noteTextChange(event);
-    result.current.setText(value);
+    if (name === "tail") result.current.setText(value);
+    else result.current.setQuote(value);
   });
 }
 
@@ -137,6 +149,18 @@ describe("useMentionBrowser released tags", () => {
 
     change(result, "Read @readme.md ", true);
     expect(result.current.browser.mentionTokens).toEqual(["@readme.md"]);
+  });
+
+  it("compares a quote's undo with that quote's own text, not the tail's", () => {
+    const { result } = renderBrowser();
+    tagReadme(result);
+    change(result, "Read  ", false);
+    // The token retyped by hand in a quote stays literal text.
+    change(result, "y @readme.md", false, "quote");
+    change(result, "Read  x", false);
+    // An undo in the quote that only removes "y " brings no token back.
+    change(result, "@readme.md", true, "quote");
+    expect(result.current.browser.mentionTokens).toEqual([]);
   });
 
   it("restores a deleted session tag when an undo brings its token back", () => {

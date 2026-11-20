@@ -305,16 +305,15 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     }
   };
 
-  // Each input's text as its last change left it, with the draft text it was seen against.
-  const lastSeenRef = useRef(new WeakMap<object, { value: string; draftText: string }>());
+  // Each input's text as its last change left it. An undo compares against the same input only:
+  // a controlled replacement clears that input's undo history, so its baseline can't go stale.
+  const lastSeenRef = useRef(new WeakMap<object, string>());
 
   const noteTextChange = (event: ComposerInputEvent) => {
     const input = event.currentTarget;
-    const seen = lastSeenRef.current.get(input);
-    // A render since the last change (a controlled update) makes the draft text the newer one.
-    const before = seen && seen.draftText === text ? seen.value : text;
     const after = input.value;
-    lastSeenRef.current.set(input, { value: after, draftText: text });
+    const before = lastSeenRef.current.get(input) ?? after;
+    lastSeenRef.current.set(input, after);
     const released = releasedRef.current;
     if (!isHistoryInput(event) || released === NO_TAGS) return;
     // Only tokens the undo or redo itself brought back; others in the text stay literal.

@@ -130,7 +130,7 @@ describe("CodeMirror composer keys on macOS", () => {
   });
 
   it.each([
-    // Caret at the end: ⌃W and ⌃U kill the pill, the trailing space, and the word before it.
+    // Caret at the end: ⌃W kills the pill and its trailing space; ⌃U kills the whole line.
     { key: "w", caret: 20, killed: "ask " },
     { key: "u", caret: 20, killed: "" },
     // Caret before the pill: ⌃K kills to the line end, which takes the pill whole.
