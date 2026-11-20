@@ -65,6 +65,17 @@ function flattenProfileLabel(value, fallback) {
 function buildCookieImportPrompt({ host, scope, profileName, cookieCount }) {
   const count = Number.isFinite(cookieCount) && cookieCount > 0 ? cookieCount : 0;
   const what = count > 0 ? `${count} cookie${count === 1 ? "" : "s"}` : "Chrome's cookies";
+  if (scope === chromeCookieStoreModule.ALL_SITES_SCOPE) {
+    return {
+      message: `Import ${what} for all websites into Omnigent?`,
+      detail:
+        `From Chrome profile "${flattenProfileLabel(profileName, "Unknown")}", for every website ` +
+        "it has cookies for.\n\n" +
+        "They stay available to this conversation's embedded browser tabs, including any the " +
+        "agent controls, until you quit Omnigent. The agent can act as you on every site you " +
+        "are signed in to in that profile.",
+    };
+  }
   // The scope is usually the tab's own host; name the tab too when an ancestor
   // was picked, so the prompt says which page the copy lands in.
   const where =
@@ -861,9 +872,10 @@ function registerBrowserIpc({
   });
 
   // ── Import cookies from Google Chrome (macOS) ────────────────────────────
-  // Copies only the current site's cookies into this conversation's in-memory
-  // partition: a metadata-only preview (no Keychain), then the import. The site
-  // comes from the view's real URL in main and is re-checked before writing.
+  // Copies one Chrome profile's cookies into this conversation's in-memory
+  // partition, for every website or only the current site: a metadata-only
+  // preview (no Keychain), then the import. A site scope comes from the view's
+  // real URL in main and is re-checked before writing.
 
   const siteForEntry = (entry) => {
     let parsed;
@@ -890,7 +902,14 @@ function registerBrowserIpc({
     const site = siteForEntry(entry);
     if (site.error) return { ok: false, error: site.error };
     try {
-      return await chromeCookieStore.previewSiteCookies({ host: site.host });
+      const preview = await chromeCookieStore.previewSiteCookies({ host: site.host });
+      if (!preview?.ok || typeof chromeCookieStore.previewAllSitesCookies !== "function") {
+        return preview;
+      }
+      // Additive, so a pane that predates "All websites" reads the same site preview.
+      const allSites = await chromeCookieStore.previewAllSitesCookies().catch(() => null);
+      // A failed lookup leaves the field out: an empty list would claim no website has cookies.
+      return allSites?.ok ? { ...preview, allSitesProfiles: allSites.profiles ?? [] } : preview;
     } catch (e) {
       return { ok: false, error: e && e.message ? e.message : String(e) };
     }
@@ -905,6 +924,43 @@ function registerBrowserIpc({
     const { conversationId, profileId, expectedHost, scope } = args ?? {};
     const entry = g.registry.get(conversationId);
     if (!entry) return { ok: false, error: "No browser view" };
+    const importError = (e) => {
+      const msg = e && e.message ? e.message : String(e);
+      if (msg.includes("Object has been destroyed")) return { ok: false, error: "browser closed" };
+      return { ok: false, error: msg };
+    };
+    if (scope === chromeCookieStoreModule.ALL_SITES_SCOPE) {
+      // Every website: nothing ties the copy to the tab's current site, so only
+      // the profile is validated. The count the user approves is still main's own.
+      if (typeof profileId !== "string" || !profileId) {
+        return { ok: false, error: "Pick a Chrome profile to import from." };
+      }
+      if (
+        typeof chromeCookieStore.previewAllSitesCookies !== "function" ||
+        typeof chromeCookieStore.importAllSitesCookies !== "function"
+      ) {
+        return { ok: false, error: "That site scope isn't available for this tab." };
+      }
+      try {
+        const preview = await chromeCookieStore.previewAllSitesCookies();
+        const profile = (preview?.profiles ?? []).find((candidate) => candidate.id === profileId);
+        if (!profile) return { ok: false, error: "That Chrome profile has no cookies to import." };
+        const approved = await confirmCookieImport({
+          host: "",
+          scope: chromeCookieStoreModule.ALL_SITES_SCOPE,
+          profileName: profile.name,
+          cookieCount: profile.cookieCount,
+          parentWindow: getWindowForEvent(event) ?? null,
+        });
+        if (!approved) return { ok: false, cancelled: true };
+        return await chromeCookieStore.importAllSitesCookies({
+          profileId,
+          cookiesApi: entry.view.webContents.session.cookies,
+        });
+      } catch (e) {
+        return importError(e);
+      }
+    }
     const site = siteForEntry(entry);
     if (site.error) return { ok: false, error: site.error };
     // Fall back to the real module only for stores that are pure stubs.
@@ -973,9 +1029,7 @@ function registerBrowserIpc({
         },
       });
     } catch (e) {
-      const msg = e && e.message ? e.message : String(e);
-      if (msg.includes("Object has been destroyed")) return { ok: false, error: "browser closed" };
-      return { ok: false, error: msg };
+      return importError(e);
     }
   });
 
