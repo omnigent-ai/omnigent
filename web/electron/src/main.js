@@ -1063,7 +1063,8 @@ function scheduleReconnect(
   returnUrl,
   { hint, finalMessage, network = false, blocked = false, interactive = false },
 ) {
-  // A panel never retries behind the overlay: it closes, and the next open builds it again.
+  // A panel never retries behind the overlay: the failure then loads setup, which closes a panel
+  // instead (see loadSetupPage), and the next open builds it again.
   if (!isMainWindow(win)) return false;
   restartReconnectsOnWake();
   const previous = reconnects.get(win);
@@ -5386,6 +5387,7 @@ function registerIpc() {
       // A panel built ahead goes once its server has had no supporting page for a while; a
       // reload announces again within moments, which calls the release off.
       if (!floatingComposerSupport.serves(serverUrl)) {
+        clearTimeout(floatingComposerReleases.get(serverUrl));
         const release = setTimeout(() => {
           floatingComposerReleases.delete(serverUrl);
           floatingComposerController?.releaseUnshown(serverUrl);

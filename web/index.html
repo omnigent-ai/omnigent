@@ -67,7 +67,10 @@
     <script>
       // Only the desktop app's panel; the path must match FLOATING_COMPOSER_PATH in
       // src/lib/floatingComposer/floatingComposerRoute.ts.
-      if (window.omnigentDesktop && /\/compose\/floating\/?$/.test(location.pathname)) {
+      if (
+        window.omnigentDesktop?.kind === "electron" &&
+        /\/compose\/floating\/?$/.test(location.pathname)
+      ) {
         document.documentElement.classList.add("quiet-boot");
       }
     </script>

@@ -3970,9 +3970,9 @@ describe("floating panel wiring", () => {
    * The harness window as the panel, beside a separate main window of its server that announces
    * support, on mocked timers.
    */
-  function preloadScenario(t) {
+  function preloadScenario(t, { platform = "darwin" } = {}) {
     t.mock.timers.enable({ apis: ["setTimeout"] });
-    const h = loadNavigationHarness({ platform: "darwin" });
+    const h = loadNavigationHarness({ platform });
     t.after(h.cleanup);
     h.api.registerIpc();
     const panel = asPanelWindow(h);
@@ -3990,6 +3990,34 @@ describe("floating panel wiring", () => {
     const built = () => (h.calls.windowOptions ?? []).filter((o) => o.type === "panel").length;
     return { h, panel, main, announceFromMain, built };
   }
+
+  it("builds the panel hidden once the app is quiet after a page can render it", (t) => {
+    const { panel, announceFromMain, built } = preloadScenario(t);
+    announceFromMain();
+    t.mock.timers.tick(2999);
+    assert.equal(built(), 0);
+    t.mock.timers.tick(1);
+    assert.equal(built(), 1);
+    assert.equal(panel.visible, false, "built out of sight");
+  });
+
+  it("builds nothing ahead while the user has turned the shortcut off", (t) => {
+    const { h, announceFromMain, built } = preloadScenario(t);
+    fs.writeFileSync(
+      h.settingsPath,
+      JSON.stringify({ floating_composer_shortcut: { enabled: false, accelerator: chord } }),
+    );
+    announceFromMain();
+    t.mock.timers.tick(3000);
+    assert.equal(built(), 0);
+  });
+
+  it("builds nothing ahead off macOS", (t) => {
+    const { announceFromMain, built } = preloadScenario(t, { platform: "linux" });
+    announceFromMain();
+    t.mock.timers.tick(3000);
+    assert.equal(built(), 0);
+  });
 
   it("an early ⇧⌘Space builds the panel itself and calls off the build ahead", (t) => {
     const { h, announceFromMain, built } = preloadScenario(t);
@@ -7155,15 +7183,6 @@ describe("New Window keeps its source's server (src/main.js)", () => {
 });
 
 describe("floating panel loading", () => {
-  const announce = (h) => {
-    const frame = { url: h.webContents.getURL() };
-    h.webContents.mainFrame = frame;
-    h.ipc.get("omnigent:floating-composer:announce")(
-      { sender: h.webContents, senderFrame: frame },
-      1,
-    );
-  };
-  const panelsBuilt = (h) => (h.calls.windowOptions ?? []).filter((o) => o.type === "panel").length;
   it("shows no connection overlay over a panel, which loads out of sight", async (t) => {
     const h = loadNavigationHarness({ platform: "darwin", loadServer: async () => {} });
     t.after(h.cleanup);
@@ -7173,46 +7192,5 @@ describe("floating panel loading", () => {
       (h.calls.loading ?? []).some((call) => call.action === "show"),
       false,
     );
-  });
-
-  it("builds the panel hidden once the app is quiet after a page can render it", (t) => {
-    t.mock.timers.enable({ apis: ["setTimeout"] });
-    const h = loadNavigationHarness({ platform: "darwin" });
-    t.after(h.cleanup);
-    h.api.registerIpc();
-    const panel = asPanelWindow(h);
-    announce(h);
-    t.mock.timers.tick(2999);
-    assert.equal(panelsBuilt(h), 0);
-    t.mock.timers.tick(1);
-    assert.equal(panelsBuilt(h), 1);
-    assert.equal(panel.visible, false, "built out of sight");
-  });
-
-  it("builds nothing ahead while the user has turned the shortcut off", (t) => {
-    t.mock.timers.enable({ apis: ["setTimeout"] });
-    const h = loadNavigationHarness({ platform: "darwin" });
-    t.after(h.cleanup);
-    fs.writeFileSync(
-      h.settingsPath,
-      JSON.stringify({
-        floating_composer_shortcut: { enabled: false, accelerator: "CommandOrControl+Shift+Space" },
-      }),
-    );
-    h.api.registerIpc();
-    asPanelWindow(h);
-    announce(h);
-    t.mock.timers.tick(3000);
-    assert.equal(panelsBuilt(h), 0);
-  });
-
-  it("builds nothing ahead off macOS", (t) => {
-    t.mock.timers.enable({ apis: ["setTimeout"] });
-    const h = loadNavigationHarness({ platform: "linux" });
-    t.after(h.cleanup);
-    h.api.registerIpc();
-    announce(h);
-    t.mock.timers.tick(3000);
-    assert.equal(panelsBuilt(h), 0);
   });
 });

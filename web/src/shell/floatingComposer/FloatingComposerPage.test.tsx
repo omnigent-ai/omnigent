@@ -72,6 +72,18 @@ beforeEach(() => {
 });
 
 describe("FloatingComposerPage", () => {
+  it("tells a hidden panel's shell it's ready at once, since a hidden window gets no frames", async () => {
+    const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+    try {
+      vi.resetModules();
+      const { FloatingComposerPage: FreshPage } = await import("./FloatingComposerPage");
+      render(<FreshPage />);
+      expect(bridge.ready).toHaveBeenCalledTimes(1);
+    } finally {
+      visibility.mockRestore();
+    }
+  });
+
   it("tells the shell it's ready once per document, after the composer painted", async () => {
     const frames: FrameRequestCallback[] = [];
     vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
@@ -106,7 +118,7 @@ describe("FloatingComposerPage", () => {
     });
     const ready = bridge.ready;
     try {
-      // Older shells lack `ready`; they show the panel after their own fallback.
+      // Older shells show the panel without a readiness signal.
       Reflect.deleteProperty(bridge, "ready");
       vi.resetModules();
       const { FloatingComposerPage: FreshPage } = await import("./FloatingComposerPage");

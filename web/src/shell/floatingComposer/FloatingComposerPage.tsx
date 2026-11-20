@@ -40,8 +40,11 @@ let readySent = false;
 function sayReady() {
   if (readySent) return;
   readySent = true;
+  const send = () => floatingComposerBridge()?.ready?.();
+  // A hidden window gets no frames, and nothing paints until it shows; its content is laid out.
+  if (document.visibilityState === "hidden") send();
   // A frame callback runs before that frame paints; the next one runs after it has.
-  requestAnimationFrame(() => requestAnimationFrame(() => floatingComposerBridge()?.ready?.()));
+  else requestAnimationFrame(() => requestAnimationFrame(send));
 }
 
 export function FloatingComposerPage() {

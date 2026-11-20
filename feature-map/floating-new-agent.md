@@ -14,12 +14,15 @@ off by default.
   than hiding it.
 - `preload`: a few seconds after an Omnigent window can open the panel, the app
   builds it out of sight, so the first ⇧⌘Space shows a composer that's already
-  loaded. The panel comes on screen only once its page has rendered, never with a
-  loading overlay or splash. A panel built ahead and never opened is let go when no
-  window of its server can open it any more.
+  loaded. The panel comes on screen once its page has rendered, or after a second
+  if its page never says so, and never with a loading overlay or splash. A panel
+  built ahead and never opened is let go when no window of its server can open it
+  any more.
 - `dismiss`: Escape, the panel's Close button and ⌘W hide it, and so does
   focusing an Omnigent window, except while the panel's file picker is open.
-  The draft, attachments and choices survive until the next open.
+  The draft, attachments and choices survive until the next open. Put away after
+  opening over another app, the panel goes back to that app instead of raising an
+  Omnigent window.
 - `launch`: ⌘↵ (shown beside the send button; plain ↵ adds a line) or the send
   button creates the session on This Mac in the chosen
   folder, or in a new sandbox. The session opens in an Omnigent window of the same
@@ -99,8 +102,12 @@ Component and unit coverage for each part:
   announce again; a window still showing an older web bundle doesn't count.
 - Turning the flag off on a running server doesn't unregister ⇧⌘Space until the
   Omnigent windows reload.
-- The first press after launch builds the panel, so it opens only once the page
-  has loaded. Later presses reuse the hidden panel.
+- A few seconds after an Omnigent window loads, the panel is built out of sight,
+  so a press shows a loaded composer. A press before then, or after the panel's
+  page crashed, builds it on the spot and shows it once its page is ready, at most
+  a second later. Later presses reuse the hidden panel.
+- Putting the panel away after opening it over another app hides Omnigent (as ⌘H
+  does), so its other windows stay hidden until the app is used again.
 - The panel's draft lives in that panel's page: it survives hiding, but not
   quitting the app or a rebuilt panel.
 - A panel that needs to sign in again closes instead of signing in inside the panel.
