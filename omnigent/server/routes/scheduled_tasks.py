@@ -1210,7 +1210,7 @@ def create_scheduled_tasks_router(
                 code=ErrorCode.INVALID_INPUT,
             )
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
-        timezone = _resolve_create_timezone(body, store, owner_id)
+        timezone = await asyncio.to_thread(_resolve_create_timezone, body, store, owner_id)
         permission_mode = validate_scheduled_permission_mode(body.permission_mode)
         agent, workspace, model_override, reasoning_effort = await _validate_launch_inputs(
             request,
@@ -1383,7 +1383,8 @@ def create_scheduled_tasks_router(
         owner = _owner(request)
         _validate_timezone_or_400(body.timezone)
         try:
-            store.set_default_timezone(
+            await asyncio.to_thread(
+                store.set_default_timezone,
                 None if owner == RESERVED_USER_LOCAL else owner,
                 body.timezone,
             )
