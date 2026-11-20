@@ -898,6 +898,14 @@ describe("UserBubble command tint", () => {
     expect(token.closest("p")).toHaveTextContent("/team fix the bug");
   });
 
+  it("tints the command and pills a tagged file in the same paragraph", () => {
+    renderScoped(userBubble("/team review [Attached: src/a.ts] now"), <PublishCommands />);
+    const token = screen.getByText("/team");
+    expect(token).toHaveClass("text-brand-accent");
+    expect(pills()).toEqual(["@src/a.ts"]);
+    expect(token.closest("p")).toHaveTextContent("/team review @src/a.ts now");
+  });
+
   it.each([
     ["a reply quote", userBubble("/team fix it\n\n> the quoted line")],
     [
@@ -953,6 +961,12 @@ describe("UserBubble command tint", () => {
     rerender(null);
     expect(tinted()).toBeNull();
     expect(text()).toBe("/team fix it");
+  });
+
+  it("tints a built-in the composer sent canonicalized, such as `/Goal` as `/goal`", () => {
+    renderScoped(userBubble("/goal Fix CI"), <PublishCommands commands={["/goal"]} />);
+    expect(screen.getByText("/goal")).toHaveClass("text-brand-accent");
+    expect(screen.getByTestId("user-message-content")).toHaveTextContent("/goal Fix CI");
   });
 
   it("adds no trailing space after a command sent without args", () => {
