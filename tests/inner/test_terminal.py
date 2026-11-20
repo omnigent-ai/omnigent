@@ -6,6 +6,7 @@ import asyncio
 import errno
 import json
 import logging
+import os
 import shutil
 import ssl
 import subprocess
@@ -2575,6 +2576,79 @@ async def _capture_launch_argv(
     return captured[0]
 
 
+async def _failed_launch_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process: _ProcessWithStdout,
+) -> str:
+    """Launch with a failing mocked tmux and return the raised error message."""
+
+    async def fake_create_subprocess_exec(
+        *cmd: str,
+        stdout: object,
+        stderr: object,
+        env: dict[str, str],
+    ) -> _ProcessWithStdout:
+        """Check both streams are captured, then hand back the failing process."""
+        del cmd, env
+        assert stdout is asyncio.subprocess.PIPE
+        assert stderr is asyncio.subprocess.PIPE
+        return process
+
+    monkeypatch.setattr(
+        terminal_mod,
+        "asyncio",
+        SimpleNamespace(
+            **(vars(asyncio) | {"create_subprocess_exec": fake_create_subprocess_exec})
+        ),
+    )
+
+    instance = TerminalInstance(
+        name="bash",
+        session_key="s1",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        await instance.launch(cwd=tmp_path)
+    assert instance.running is False
+    return str(excinfo.value)
+
+
+async def test_launch_failure_preserves_stdout_diagnostic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tmux launch failure must retain a stdout-only diagnostic."""
+    message = await _failed_launch_error(
+        tmp_path,
+        monkeypatch,
+        _ProcessWithStdout(
+            returncode=1, stdout=b"new-session refused: server socket unavailable\n"
+        ),
+    )
+    assert message == ("tmux launch failed (rc=1): new-session refused: server socket unavailable")
+
+
+async def test_launch_failure_reports_stderr_before_stdout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When both streams carry text, stderr leads and stdout is preserved."""
+    message = await _failed_launch_error(
+        tmp_path,
+        monkeypatch,
+        _ProcessWithStdout(returncode=1, stdout=b"stdout-detail\n", stderr=b"stderr-detail\n"),
+    )
+    assert message == "tmux launch failed (rc=1): stderr-detail; stdout-detail"
+
+
+async def test_launch_failure_names_silent_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A silent tmux failure includes its return code and an explicit reason."""
+    message = await _failed_launch_error(tmp_path, monkeypatch, _ProcessWithStdout(returncode=2))
+    assert message == "tmux launch failed (rc=2): <tmux produced no output>"
+
+
 @pytest.mark.parametrize("launch_fails", [False, True])
 async def test_launch_discards_previous_exit_diagnostics_before_starting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, launch_fails: bool
@@ -3648,7 +3722,6 @@ def test_reap_orphaned_terminals_reaps_only_dead_owner_dirs(
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    import os
 
     def _raise_if_called(*args: object, **kwargs: object) -> None:
         """Fail the test if kill-server runs with no socket present."""
