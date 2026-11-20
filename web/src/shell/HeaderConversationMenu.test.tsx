@@ -252,6 +252,18 @@ describe("HeaderConversationMenu", () => {
     open.mockRestore();
   });
 
+  it("hides Open in new window inside the session's own window", () => {
+    document.documentElement.dataset.sessionWindow = "true";
+    try {
+      renderMenu();
+      openMenu();
+      expect(screen.queryByTestId("header-open-session-window")).toBeNull();
+      expect(screen.getByRole("menuitem", { name: "Rename" })).toBeInTheDocument();
+    } finally {
+      delete document.documentElement.dataset.sessionWindow;
+    }
+  });
+
   it("explains a blocked popup", () => {
     const open = vi.spyOn(window, "open").mockReturnValue(null);
     renderMenu();

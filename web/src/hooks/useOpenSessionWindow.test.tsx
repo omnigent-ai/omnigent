@@ -63,7 +63,9 @@ describe("useOpenSessionWindow", () => {
 
     expect(openSessionWindow).toHaveBeenCalledWith("conv_1");
     expect(open).not.toHaveBeenCalled();
-    await Promise.resolve();
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
     expect(mocks.toastError).not.toHaveBeenCalled();
   });
 

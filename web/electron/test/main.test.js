@@ -7601,6 +7601,21 @@ describe("New Window keeps its source's server (src/main.js)", () => {
     h.calls.appMenu.getMenuItemById("new_window").click();
     assert.equal(h.api.windows.get(h.win).serverUrl, "https://host.example/ml/omnigents");
   });
+
+  it("opens a window cloned from a session pop-out as a normal window", async (t) => {
+    const h = loadNavigationHarness();
+    t.after(h.cleanup);
+    h.api.createWindow("https://host.example/ml/omnigents");
+    h.setUrl("https://host.example/ml/omnigents/c/conv_1?window=session&tab=files");
+    h.electron.BrowserWindow.getFocusedWindow = () => h.win;
+    h.api.buildMenu();
+    h.calls.appMenu.getMenuItemById("new_window").click();
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+    assert.equal(h.calls.loadURL.at(-1)[0], "https://host.example/ml/omnigents/c/conv_1?tab=files");
+    assert.equal(h.api.windows.get(h.win).sessionWindowId, undefined);
+  });
 });
 
 describe("floating panel loading", () => {
@@ -7668,6 +7683,28 @@ describe("session windows (src/main.js)", () => {
     assert.equal(h.calls.windowOptions?.length ?? 0, before);
     assert.equal(h.calls.focused, focusedBefore + 1);
   });
+
+  for (const [state, pageUrl] of [
+    ["still loading", ""],
+    ["signing in", "https://idp.example/authorize"],
+  ]) {
+    it(`focuses a pop-out that is ${state} instead of opening a duplicate`, (t) => {
+      const h = loadNavigationHarness({ serverUrl });
+      t.after(h.cleanup);
+      const popOut = {
+        focused: 0,
+        isDestroyed: () => false,
+        isMinimized: () => false,
+        focus: () => (popOut.focused += 1),
+        webContents: { getURL: () => pageUrl },
+      };
+      h.api.windows.set(popOut, { serverUrl, role: "main", sessionWindowId: "conv_1" });
+      assert.equal(openSessionWindow(h, "conv_1"), true);
+      assert.equal(openSessionWindow(h, "conv_1"), true);
+      assert.equal(h.calls.windowOptions, undefined);
+      assert.equal(popOut.focused, 2);
+    });
+  }
 
   it("refuses untrusted pages and malformed session ids", (t) => {
     const h = loadNavigationHarness({ serverUrl });

@@ -1,5 +1,4 @@
-// "Open in new window" pops a session out into its own desktop window, and opening it again
-// brings that window forward instead of stacking a duplicate.
+// "Open in new window" pops a session out; opening it again brings that window forward.
 // Run: OMNIGENT_PW_NO_SANDBOX=1 xvfb-run -a node --test e2e/desktop_session_window.e2e.js
 // Env: OMNIGENT_PYTHON (backend), OMNIGENT_DESKTOP_RECORD_DIR (paced recording).
 

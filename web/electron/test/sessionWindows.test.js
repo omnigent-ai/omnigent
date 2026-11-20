@@ -1,7 +1,11 @@
 "use strict";
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
-const { findSessionWindow, sessionWindowPath } = require("../src/sessionWindows");
+const {
+  findSessionWindow,
+  sessionWindowPath,
+  withoutSessionWindowQuery,
+} = require("../src/sessionWindows");
 
 const serverUrl = "https://host.example/omnigent";
 
@@ -30,14 +34,32 @@ test("finds a live pop-out of the same session on the same server", () => {
   );
 });
 
-test("skips pop-outs that closed or navigated to another session", () => {
+test("skips pop-outs that closed or navigated to another page on the server", () => {
   const windows = new Map([
     [
       fakeWindow(`${serverUrl}/c/conv_1`, { destroyed: true }),
       { serverUrl, sessionWindowId: "conv_1" },
     ],
     [fakeWindow(`${serverUrl}/c/conv_9`), { serverUrl, sessionWindowId: "conv_1" }],
-    [fakeWindow("not a url"), { serverUrl, sessionWindowId: "conv_1" }],
+    [fakeWindow(`${serverUrl}/settings`), { serverUrl, sessionWindowId: "conv_1" }],
   ]);
   assert.equal(findSessionWindow(windows, { serverUrl, sessionId: "conv_1" }), null);
+});
+
+test("finds a pop-out that is still loading or signing in", () => {
+  for (const url of ["", "not a url", "https://idp.example/authorize?client=omnigent"]) {
+    const pending = fakeWindow(url);
+    const windows = new Map([[pending, { serverUrl, sessionWindowId: "conv_1" }]]);
+    assert.equal(findSessionWindow(windows, { serverUrl, sessionId: "conv_1" }), pending, url);
+  }
+});
+
+test("drops only the pop-out marker from a cloned window's URL", () => {
+  assert.equal(
+    withoutSessionWindowQuery(`${serverUrl}/c/conv_1?window=session&tab=files`),
+    `${serverUrl}/c/conv_1?tab=files`,
+  );
+  for (const unchanged of [`${serverUrl}/c/conv_1?tab=files`, "", undefined, "not a url"]) {
+    assert.equal(withoutSessionWindowQuery(unchanged), unchanged, String(unchanged));
+  }
 });

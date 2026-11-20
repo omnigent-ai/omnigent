@@ -75,6 +75,7 @@ import { markConversationUnread } from "@/hooks/useUnseenConversations";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useOpenSessionWindow } from "@/hooks/useOpenSessionWindow";
+import { isSessionWindow } from "@/lib/sessionWindow";
 import { useDesktopCommand } from "@/lib/desktopCommands";
 import { supportsDesktopCommands } from "@/lib/nativeBridge";
 import { useIsEmbedded } from "@/lib/embedded";
@@ -370,7 +371,8 @@ export function HeaderConversationMenu({
       )}
       {/* Chat/Terminal renders its own trailing separator (null on other sessions). */}
       {viewItems}
-      {openSessionWindow && (
+      {/* A pop-out already is this session's own window. */}
+      {openSessionWindow && !isSessionWindow() && (
         <DropdownMenuItem
           data-testid="header-open-session-window"
           className={itemClass}

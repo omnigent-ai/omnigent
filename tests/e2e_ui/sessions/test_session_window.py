@@ -11,11 +11,11 @@ from __future__ import annotations
 import os
 import re
 
-import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.conftest import configure_mock_llm, seed_committed_turn
+from tests.e2e_ui.sessions._sidebar_helpers import patch_session
 
 # Unique markers so assertions can't match UI chrome or another test's transcript.
 _HISTORY_MARKER = "quince-popout-history"
@@ -32,13 +32,6 @@ def _hold_for_viewer(page: Page, milliseconds: int) -> None:
     """Leave a recorded demo time to show each step; unrecorded runs don't wait."""
     if os.environ.get("OMNIGENT_E2E_RECORD_DIR"):
         page.wait_for_timeout(milliseconds)
-
-
-def _title_session(base_url: str, session_id: str, title: str) -> None:
-    response = httpx.patch(
-        f"{base_url}/v1/sessions/{session_id}", json={"title": title}, timeout=10.0
-    )
-    response.raise_for_status()
 
 
 def _expect_session_popup(popup: Page, session_id: str, title: str) -> None:
@@ -60,7 +53,7 @@ def test_header_menu_pops_the_session_out_and_chats_there(
     """Header ⋯ → Open in new window opens a popup that chats; the original stays put."""
     base_url, session_id = seeded_session
     title = "Quarterly planning"
-    _title_session(base_url, session_id, title)
+    patch_session(base_url, session_id, title=title)
     seed_committed_turn(
         session_id,
         prompt=f"Summarize the plan. {_HISTORY_MARKER}",
@@ -120,8 +113,8 @@ def test_sidebar_row_menu_pops_another_session_out(
 ) -> None:
     """Right-click a different session's row → Open in new window opens that session."""
     base_url, current_id, other_id = seeded_session_pair
-    _title_session(base_url, current_id, "Release checklist")
-    _title_session(base_url, other_id, "Design review notes")
+    patch_session(base_url, current_id, title="Release checklist")
+    patch_session(base_url, other_id, title="Design review notes")
     seed_committed_turn(
         other_id,
         prompt=f"List the open design questions. {_HISTORY_MARKER}",
