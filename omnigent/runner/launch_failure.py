@@ -37,6 +37,7 @@ __all__ = [
     "diagnose_codex_compaction_model_failure",
     "diagnose_codex_model_rejection",
     "diagnose_codex_provider_auth_failure",
+    "diagnose_content_policy_refusal",
     "diagnose_model_unavailable",
     "is_codex_provider_auth_failure",
 ]
@@ -365,6 +366,15 @@ _CLIENT_UPDATE_REQUIRED = re.compile(
     r"\s+version\s+(?P<required>\S+)\s+or newer is required",
     re.IGNORECASE,
 )
+# Claude Code's reply when the model's safeguards refuse a request (``stop_reason: refusal``),
+# in its current and older wordings. The request succeeded, so the text has no HTTP status.
+_CONTENT_POLICY_REFUSAL = re.compile(
+    r"\A\s*(?:API Error:\s+[^\r\n]+?(?:['’]s safeguards flagged this message\b"
+    r"| can['’]t help with this\. Start a new session to continue\b)"
+    r"|(?:API Error:\s+)?Claude Code is unable to respond to this request, "
+    r"which appears to violate our Usage Policy\b)",
+    re.IGNORECASE,
+)
 # Codex's report that a model provider's ``auth.command`` gave it no token, e.g.
 # "provider auth command `isaac` exited with status exit status: 1: <helper stderr>".
 _CODEX_PROVIDER_AUTH_FAILURE = re.compile(
@@ -382,16 +392,12 @@ _LABEL_LIMIT = 256
 def classify_native_turn_error(code: str, message: str) -> str:
     """Refine a native turn's generic code when its text identifies the cause.
 
-    Recognizes rate limits and transient upstream model-gateway failures so
-    the web UI can offer a one-click retry instead of a terminal error, a
-    Claude Code too old for the selected model, a content-length cap
-    rejection (a request carrying an oversized transcript, refused by the
-    deployment's byte cap before the model sees it), and a reply cut off by
-    the model's output-token cap. Also corrects
-    ``codex_reauth_required`` when the message reveals that the real
-    cause is a budget/usage-limit exhaustion (older runners misclassify the
-    gateway's 403 as auth; the server fixes it on deploy), or a failed model
-    provider token command, which ``codex login`` cannot renew.
+    Recognizes rate limits, transient upstream failures, unsupported CLI versions,
+    safeguard refusals, request-size caps and output-token limits. Specific error
+    codes retain precedence over matching text in an unrelated diagnosis.
+
+    Also corrects ``codex_reauth_required`` for budget exhaustion and failed provider
+    token commands, which ``codex login`` cannot renew.
 
     :param code: Existing error code; specific diagnoses are preserved.
     :param message: Native harness error text, from its status or transcript.
@@ -411,6 +417,8 @@ def classify_native_turn_error(code: str, message: str) -> str:
         return code
     if _CLIENT_UPDATE_REQUIRED.search(message):
         return "client_update_required"
+    if _CONTENT_POLICY_REFUSAL.search(message):
+        return "content_policy_refusal"
     if is_request_size_rejection(message):
         return "context_length_exceeded"
     if _OUTPUT_LIMIT_ERROR.search(message):
@@ -471,6 +479,30 @@ def diagnose_client_update_required(message: str) -> FailureDiagnosis | None:
             f"version {match.group('required')} or newer is required."
         ),
         remediation="Run `claude update` on the host, then start a new session.",
+    )
+
+
+def diagnose_content_policy_refusal(message: str) -> FailureDiagnosis | None:
+    """Explain the model's safeguards refusing a turn, and how to continue.
+
+    :param message: Turn error text, e.g. ``"API Error: Claude can't help with
+        this. Start a new session to continue."``.
+    :returns: The refusal diagnosis, or ``None`` when *message* is not that refusal.
+    """
+    if _CONTENT_POLICY_REFUSAL.search(message) is None:
+        return None
+    return FailureDiagnosis(
+        title="The model's safeguards blocked this message",
+        cause=(
+            "The model provider's usage-policy safeguards refused this request, which can "
+            "happen with ordinary content. The flagged content stays in this session's "
+            "history, so later turns here may be refused too."
+        ),
+        remediation=(
+            "Start a new session and rephrase the request without the flagged content, "
+            "or choose a different model with the model picker or /model."
+        ),
+        category=ErrorCategory.UPSTREAM,
     )
 
 
@@ -737,6 +769,10 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
     "client_update_required": (
         "The agent CLI on the host is too old for the selected model. Update it on the "
         "host, then start a new session."
+    ),
+    "content_policy_refusal": (
+        "The model's safeguards refused this message. Start a new session and rephrase "
+        "it without the flagged content."
     ),
     "host_disk_full": "The host's disk is full, so the agent can't save the conversation.",
     "harness_not_configured": "The harness isn't set up on the host, so this session can't start.",
