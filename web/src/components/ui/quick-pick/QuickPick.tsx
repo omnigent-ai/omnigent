@@ -1,5 +1,6 @@
 import {
   type KeyboardEvent,
+  type MouseEvent,
   type MutableRefObject,
   type ReactNode,
   useCallback,
@@ -176,6 +177,23 @@ function sectionsOf<Value>(rows: readonly QuickPickRow<Value>[]): RowSection<Val
   return sections;
 }
 
+interface RowRun<Value> {
+  cards: boolean;
+  rows: RowSection<Value>["rows"];
+}
+
+// Consecutive card items form one run, laid out as a grid; every other row stands alone.
+function runsOf<Value>(rows: RowSection<Value>["rows"], cardsShown: boolean): RowRun<Value>[] {
+  const runs: RowRun<Value>[] = [];
+  for (const entry of rows) {
+    const card = cardsShown && entry.row.item.layout === "card";
+    const last = runs.at(-1);
+    if (card && last?.cards) last.rows.push(entry);
+    else runs.push({ cards: card, rows: [entry] });
+  }
+  return runs;
+}
+
 function resultCountText(resultCount: number): string {
   return resultCount === 1 ? "1 result" : `${resultCount.toLocaleString()} results`;
 }
@@ -349,6 +367,8 @@ export function QuickPick<Value>({
   );
   const isMac = useMemo(() => isMacPlatform(), []);
   const sections = useMemo(() => sectionsOf(rows), [rows]);
+  // Card items show as cards only until the user types; results are plain rows in rank order.
+  const cardsShown = query.trim().length === 0;
   const resultCount = rows.filter((row) => row.kind === "item").length;
   const showEmpty = !collapsed && resultCount === 0;
   const queryFieldRef = useRef<HTMLInputElement | null>(null);
@@ -523,30 +543,85 @@ export function QuickPick<Value>({
         : undefined
       : alternateLabel;
 
-  const renderOption = (row: QuickPickItemRow<Value>, index: number) => {
+  const optionProps = (row: QuickPickItemRow<Value>, index: number) => {
     const { item } = row;
     const isActive = index === activeIndex;
     const disabled = Boolean(item.disabledReason);
-    const highlight = item.matchHighlight ?? matchHighlight;
+    return {
+      key: row.key,
+      id: optionId(row),
+      role: "option",
+      "aria-selected": isActive,
+      "aria-disabled": disabled || undefined,
+      "data-active": isActive || undefined,
+      // Hovering an enabled row makes it the user's pick, as in a menu, even when it
+      // is already the top row, so a result arriving above it doesn't take over.
+      onPointerMove: () => {
+        if (disabled || (activeId ?? (choiceCurrent ? activeChoice.id : null)) === item.id) return;
+        pointerPickRef.current = true;
+        pick(item.id);
+      },
+      // Keep focus in the query field.
+      onMouseDown: (event: { preventDefault: () => void }) => event.preventDefault(),
+      onClick: (event: MouseEvent<HTMLDivElement>) =>
+        acceptWith(row, hasCommandModifier(event, isMac)),
+    };
+  };
+
+  const renderCard = (row: QuickPickItemRow<Value>, index: number) => {
+    const { item } = row;
+    const { key, ...props } = optionProps(row, index);
     return (
       <div
-        key={row.key}
-        id={optionId(row)}
-        role="option"
-        aria-selected={isActive}
-        aria-disabled={disabled || undefined}
-        data-active={isActive || undefined}
-        // Hovering an enabled row makes it the user's pick, as in a menu, even when it
-        // is already the top row, so a result arriving above it doesn't take over.
-        onPointerMove={() => {
-          if (disabled || (activeId ?? (choiceCurrent ? activeChoice.id : null)) === item.id)
-            return;
-          pointerPickRef.current = true;
-          pick(item.id);
-        }}
-        // Keep focus in the query field.
-        onMouseDown={(event) => event.preventDefault()}
-        onClick={(event) => acceptWith(row, hasCommandModifier(event, isMac))}
+        key={key}
+        {...props}
+        data-layout="card"
+        className={cn(
+          "@container/card flex cursor-pointer items-start gap-2.5 rounded-lg border border-border bg-muted/30 p-2.5 text-ui select-none",
+          "data-active:border-ring/50 data-active:bg-muted data-active:text-foreground",
+          item.disabledReason && "cursor-default opacity-50",
+        )}
+      >
+        {item.icon && (
+          <span className="flex size-7 shrink-0 items-center justify-center rounded-md bg-muted text-foreground [&_svg]:size-4">
+            {item.icon}
+          </span>
+        )}
+        <span className="flex min-w-0 flex-1 flex-col">
+          <span className="flex items-center gap-1.5">
+            <span data-slot="quick-pick-label" className="min-w-0 truncate font-medium">
+              {item.label}
+            </span>
+            {/* A tight card keeps its name whole; ⌘K and the menus still show the chord. */}
+            {item.shortcut && (
+              <CompactShortcutKeys
+                keys={item.shortcut}
+                className="ml-auto hidden shrink-0 @[13rem]/card:flex"
+              />
+            )}
+          </span>
+          {/* Two lines are kept for every hint, so the cards in a line match. */}
+          <span
+            data-slot={item.disabledReason ? "quick-pick-disabled-reason" : undefined}
+            title={item.disabledReason ?? item.description}
+            className="line-clamp-2 min-h-[2lh] text-xs text-muted-foreground"
+          >
+            {item.disabledReason ?? item.description}
+          </span>
+        </span>
+      </div>
+    );
+  };
+
+  const renderOption = (row: QuickPickItemRow<Value>, index: number) => {
+    const { item } = row;
+    const disabled = Boolean(item.disabledReason);
+    const highlight = item.matchHighlight ?? matchHighlight;
+    const { key, ...props } = optionProps(row, index);
+    return (
+      <div
+        key={key}
+        {...props}
         className={cn(
           "flex cursor-pointer select-none rounded-lg px-2 text-ui",
           sidebar
@@ -831,7 +906,23 @@ export function QuickPick<Value>({
                     {section.heading.label}
                   </div>
                 )}
-                {section.rows.map(({ row, index }) => renderOption(row, index))}
+                {runsOf(section.rows, cardsShown).map((run) =>
+                  run.cards ? (
+                    // Cards flow two to a line where the list is wide enough; arrows keep reading order.
+                    <div
+                      key={run.rows[0].row.key}
+                      role="presentation"
+                      data-slot="quick-pick-cards"
+                      className="@container/cards"
+                    >
+                      <div className="grid grid-cols-1 gap-1 p-0.5 @[22rem]/cards:grid-cols-2">
+                        {run.rows.map(({ row, index }) => renderCard(row, index))}
+                      </div>
+                    </div>
+                  ) : (
+                    run.rows.map(({ row, index }) => renderOption(row, index))
+                  ),
+                )}
               </div>
             );
           })}

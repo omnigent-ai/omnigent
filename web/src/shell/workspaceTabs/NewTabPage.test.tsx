@@ -136,6 +136,7 @@ describe("NewTabPage", () => {
   it("opens the workspace text search from Search text, with its shortcut, and leaves the tab", async () => {
     const { onTextSearch, onOpenPlace, onRunCommand } = renderPage({ textSearch: true });
     const row = screen.getByRole("option", { name: /^Search text/ });
+    expect(row).not.toHaveAttribute("data-layout", "card");
     expect(row).toHaveTextContent(shortcutKeys("palette.text")!.join(""));
     await userEvent.click(row);
     expect(onTextSearch).toHaveBeenCalledTimes(1);
@@ -277,6 +278,10 @@ describe("NewTabPage sections", () => {
     expect(options[0]).toHaveTextContent("Side chat");
     expect(options.at(-1)).toHaveTextContent("Pull Requests");
     expect(labelsIn(groups()[0]!)).toEqual(["Side chat", "Diffs", "Files", "Pull Requests"]);
+    const cards = Array.from(document.querySelectorAll("[data-layout=card]")).map(
+      (card) => card.querySelector("[data-slot=quick-pick-label]")?.textContent,
+    );
+    expect(cards).toEqual(["Side chat", "Diffs", "Files", "Pull Requests"]);
     expect(screen.getAllByRole("option", { name: /^Pull Requests/ })[0]).toHaveTextContent(
       "Review the pull requests for this workspace",
     );
