@@ -212,9 +212,8 @@ function createDatabricksAuth({
             origin: ctx.origin,
             code: error?.errorCode,
           });
-          await schedule(ctx).catch((scheduleError) => {
-            if (!replaced()) fail(ctx, scheduleError);
-          });
+          // A joining caller still needs the original renewal failure's retry semantics.
+          await schedule(ctx).catch(() => undefined);
         }
         if (!replaced()) fail(ctx, error);
       })
