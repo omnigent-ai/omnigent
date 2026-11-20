@@ -265,7 +265,7 @@ export function ThingyOpenSessionButton({
       <PopoverContent
         side="bottom"
         align="end"
-        className="group w-72 p-3"
+        className="group w-max min-w-44 max-w-64 p-2"
         data-testid="thingy-open-session-popover"
         aria-label={creating ? "Create session" : LABEL}
         // Focus stays on the button; ArrowDown, or a request that opens the menu, moves it in.
@@ -290,7 +290,7 @@ export function ThingyOpenSessionButton({
           size="sm"
           variant={creating ? "outline" : "default"}
           className={cn(
-            "mt-3 w-full",
+            "mt-2 w-full",
             creating && "group-has-[[data-create-slot]:not(:empty)]:hidden",
           )}
           data-testid="thingy-open-session-button"
