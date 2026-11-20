@@ -418,6 +418,27 @@ describe("AskUserQuestionForm — unseen questions", () => {
   });
 });
 
+describe("AskUserQuestionForm — unanswered questions", () => {
+  it("moves Submit to an earlier unanswered question and says what it needs", () => {
+    const { onSubmit } = renderForm([snacks, color], { keyboardActive: false });
+    fireEvent.click(screen.getByTestId("ask-user-question-next"));
+    expect(progress()).toBe("Question 2 of 2:");
+
+    fireEvent.click(screen.getByTestId("ask-user-question-submit"));
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(progress()).toBe("Question 1 of 2:");
+    expect(screen.getByTestId("ask-user-question-missing")).toHaveTextContent(
+      "Select at least one option to submit.",
+    );
+
+    fireEvent.click(screen.getByLabelText("Popcorn"));
+    expect(screen.queryByTestId("ask-user-question-missing")).toBeNull();
+    fireEvent.click(screen.getByTestId("ask-user-question-next"));
+    fireEvent.click(screen.getByTestId("ask-user-question-submit"));
+    expect(onSubmit).toHaveBeenCalledWith({ snacks: ["Popcorn"], color: "Red" });
+  });
+});
+
 describe("AskUserQuestionForm — digits", () => {
   it("leaves digits to a side chat's focused control", () => {
     renderForm([framework], {

@@ -1,5 +1,6 @@
 // Question carousel for structured elicitation, with single- or multi-select answers.
-// isOther controls custom input; submit requires an answer to every question.
+// isOther controls custom input; submit requires an answer to every question and
+// otherwise moves to the first unanswered one.
 //
 // Keyboard: Enter advances or submits, 1-9 pick options, Esc cancels. Keys pressed
 // outside the form reach it only when keyboardActive is set.
@@ -161,6 +162,8 @@ export function AskUserQuestionForm({
     draft?.customSelected ?? initial.customSelected,
   );
   const [customInputs, setCustomInputs] = useState(draft?.customInputs ?? initial.customInputs);
+  // Set when Submit is tried with an unanswered question, to say what it still needs.
+  const [showMissingAnswer, setShowMissingAnswer] = useState(false);
 
   useEffect(() => {
     const answers = {
@@ -282,10 +285,19 @@ export function AskUserQuestionForm({
         customSelected[key] ?? false,
         customInputs[key] ?? "",
       );
-      if (answer === null) return; // unreachable while ``allAnswered`` gates the button
+      if (answer === null) return; // unreachable: callers check ``allAnswered`` first
       finalAnswers[key] = answer;
     }
     onSubmit(finalAnswers);
+  };
+
+  const handleSubmitClick = () => {
+    if (allAnswered) {
+      handleSubmit();
+      return;
+    }
+    setShowMissingAnswer(true);
+    setCurrentIndex(firstUnansweredIndex);
   };
 
   // Inside the form every key is handled here. Outside it, only the keyboardActive
@@ -352,6 +364,9 @@ export function AskUserQuestionForm({
               : firstUnansweredIndex
             : currentIndex + 1;
         if (nextIndex === currentIndex) return;
+        if (currentIndex === questions.length - 1 && firstUnansweredIndex !== -1) {
+          setShowMissingAnswer(true);
+        }
         focusQuestionOnMoveRef.current = inside;
         setCurrentIndex(nextIndex);
       });
@@ -578,6 +593,17 @@ export function AskUserQuestionForm({
             ))}
           </div>
         )}
+        {showMissingAnswer && !isAnswered(current) && (
+          <p
+            className="text-sm text-destructive"
+            role="alert"
+            data-testid="ask-user-question-missing"
+          >
+            {current.multiSelect
+              ? "Select at least one option to submit."
+              : "Answer this question to submit."}
+          </p>
+        )}
       </fieldset>
 
       <div className="flex items-center gap-2 mobile-app:flex-wrap">
@@ -612,9 +638,9 @@ export function AskUserQuestionForm({
         {isLast && (
           <Button
             size="sm"
-            onClick={handleSubmit}
-            disabled={!allAnswered}
-            className="mobile-touch-target mobile-app:h-auto mobile-app:whitespace-normal"
+            onClick={handleSubmitClick}
+            aria-disabled={!allAnswered}
+            className="mobile-touch-target mobile-app:h-auto mobile-app:whitespace-normal aria-disabled:opacity-50"
             data-testid="ask-user-question-submit"
             componentId="question.submit"
           >

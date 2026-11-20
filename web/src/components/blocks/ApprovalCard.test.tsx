@@ -1080,12 +1080,12 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     );
 
     const submit = screen.getByRole("button", { name: /submit/i });
-    expect(submit.hasAttribute("disabled")).toBe(true);
+    expect(submit).toHaveAttribute("aria-disabled", "true");
 
     fireEvent.click(screen.getByLabelText("Popcorn"));
-    expect(submit.hasAttribute("disabled")).toBe(false);
+    expect(submit).toHaveAttribute("aria-disabled", "false");
     fireEvent.click(screen.getByLabelText("Popcorn"));
-    expect(submit.hasAttribute("disabled")).toBe(true);
+    expect(submit).toHaveAttribute("aria-disabled", "true");
   });
 
   it.each(["React", "Vue"])("submits the chosen answer %s only on Submit", (answer) => {
@@ -1388,7 +1388,7 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
       ).toBeDefined();
       expect(screen.queryByText("Claude has questions")).toBeNull();
       const submit = screen.getByTestId("ask-user-question-submit");
-      expect(submit.hasAttribute("disabled")).toBe(!textInput && options.length === 0);
+      expect(submit.getAttribute("aria-disabled")).toBe(String(!textInput && options.length === 0));
       if (textInput) {
         expect(screen.getByTestId("ask-user-question-custom-input")).toHaveValue(textInput.default);
       }
@@ -1663,7 +1663,10 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     expect(
       (screen.getByTestId("ask-user-question-custom-toggle") as HTMLInputElement).checked,
     ).toBe(true);
-    expect(screen.getByTestId("ask-user-question-submit").hasAttribute("disabled")).toBe(false);
+    expect(screen.getByTestId("ask-user-question-submit")).toHaveAttribute(
+      "aria-disabled",
+      "false",
+    );
   });
 
   const twoPane = {
@@ -1699,7 +1702,10 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     expect(previewText()).not.toContain("[editor only]");
     expect(screen.getByLabelText(/Two-pane/)).toBeChecked();
     expect(screen.getAllByRole("radio", { checked: true })).toHaveLength(1);
-    expect(screen.getByTestId("ask-user-question-submit")).toBeEnabled();
+    expect(screen.getByTestId("ask-user-question-submit")).toHaveAttribute(
+      "aria-disabled",
+      "false",
+    );
 
     // Description is concatenated into the label text by the DOM
     // so a literal ``getByLabelText("Single")`` doesn't match;
@@ -1713,11 +1719,14 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
 
     fireEvent.click(screen.getByTestId("ask-user-question-custom-toggle"));
     expect(previewText()).toBeNull();
-    expect(screen.getByTestId("ask-user-question-submit")).toBeDisabled();
+    expect(screen.getByTestId("ask-user-question-submit")).toHaveAttribute("aria-disabled", "true");
     fireEvent.change(screen.getByTestId("ask-user-question-custom-input"), {
       target: { value: "A different layout" },
     });
-    expect(screen.getByTestId("ask-user-question-submit")).toBeEnabled();
+    expect(screen.getByTestId("ask-user-question-submit")).toHaveAttribute(
+      "aria-disabled",
+      "false",
+    );
     expect(previewText()).toBeNull();
   });
 
