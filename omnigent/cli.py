@@ -9686,10 +9686,17 @@ def _background_registration_timeout(
     )
     if not server_responded:
         return click.ClickException(f"{timeout_message}{log_detail}")
+    redacted_stop_command = redact_secrets(stop_command)
+    redaction_hint = (
+        " Replace [REDACTED] with your configured server credentials before running "
+        "the stop command."
+        if redacted_stop_command != stop_command
+        else ""
+    )
     return _HostRegistrationPending(
         f"{timeout_message} It is still running (pid {record.pid}) and may "
         f"still register. Check it with `{cli_invocation()} host status`, or "
-        f"stop it with `{redact_secrets(stop_command)}`.{log_detail}"
+        f"stop it with `{redacted_stop_command}`.{redaction_hint}{log_detail}"
     )
 
 

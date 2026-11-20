@@ -1125,6 +1125,7 @@ def test_registration_diagnostics_never_expose_url_credentials(
     assert "Waiting for the host daemon to register with http://127.0.0.1:59999" in captured.err
     if not probe_result.unreachable:
         assert "host stop --server http://[REDACTED]@127.0.0.1:59999" in message
+        assert "Replace [REDACTED] with your configured server credentials" in message
 
 
 def test_registration_target_display_preserves_ipv6_brackets() -> None:
@@ -1196,6 +1197,8 @@ def test_registration_timeout_keeps_stale_host_hint_when_server_answers(
     assert isinstance(excinfo.value, cli._HostRegistrationPending)
     assert "still running (pid 4242)" in message
     assert "`omnigent stop`" in message
+    assert "host status`" in message
+    assert "Replace [REDACTED]" not in message
 
 
 def test_registration_timeout_reports_daemon_that_exits_before_deadline_check(
