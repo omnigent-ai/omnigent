@@ -1066,13 +1066,14 @@ def _claude_pane(status_row: str) -> str:
 
 
 def _fake_tmux_pane(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, failed_send_keys: int = 0
 ) -> tuple[Path, list[str], list[list[str]]]:
     """
     Advertise a tmux pane whose capture returns the last entry of ``panes``.
 
+    :param failed_send_keys: Number of initial ``send-keys`` calls that fail.
     :returns: The bridge directory, the mutable ``panes`` list and the
-        recorded ``send-keys`` commands.
+        recorded successful ``send-keys`` commands.
     """
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(
@@ -1082,13 +1083,18 @@ def _fake_tmux_pane(
     )
     panes: list[str] = []
     sent_keys: list[list[str]] = []
+    send_keys_attempts = 0
 
     def _fake_run(cmd: list[str], **kwargs: object) -> object:
         """Serve the current pane and record keystrokes."""
+        nonlocal send_keys_attempts
         del kwargs
         if "capture-pane" in cmd:
             return SimpleNamespace(returncode=0, stdout=panes[-1], stderr="")
         if "send-keys" in cmd:
+            send_keys_attempts += 1
+            if send_keys_attempts <= failed_send_keys:
+                return SimpleNamespace(returncode=1, stdout="", stderr="no client")
             sent_keys.append(cmd)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
@@ -1116,21 +1122,22 @@ async def test_forward_pane_signals_fails_and_interrupts_a_rejected_api_retry(
 
     Claude Code retries a gateway budget rejection ten times while the web
     shows only a working spinner. The row stays visible through its backoff,
-    so repeat polls must not post or interrupt again; once it leaves the pane
-    a later rejection is reported afresh.
+    so repeat polls must not post or interrupt again. A rejection is reported
+    afresh once the row leaves the pane, or in a turn sent before any poll
+    saw the pane without one.
     """
     bridge_dir, panes, sent_keys = _fake_tmux_pane(monkeypatch, tmp_path)
     calls, transport = _btw_recording_client_calls()
     dedupe = forwarder._ForwardDedupeState()
 
-    async def _poll(pane: str) -> None:
+    async def _poll(pane: str, response_id: str = "resp_1") -> None:
         panes.append(pane)
         await forwarder._forward_pane_signals(
             client,
             session_id="conv1",
             bridge_dir=bridge_dir,
             dedupe=dedupe,
-            response_id="resp_1",
+            response_id=response_id,
         )
 
     async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
@@ -1148,9 +1155,20 @@ async def test_forward_pane_signals_fails_and_interrupts_a_rejected_api_retry(
 
         await _poll(_claude_pane("✻ Billowing…"))
         await _poll(_claude_pane(f"✻ {_BUDGET_RETRY_ERROR} · Retrying in 3s · attempt 3/10"))
+        assert len(_failed_status_posts(calls)) == 2
+        assert len(sent_keys) == 2
 
-    assert len(_failed_status_posts(calls)) == 2
-    assert len(sent_keys) == 2
+        await _poll(_claude_pane("✻ API error · Retrying in 1s · attempt 2/10"), "resp_2")
+        await _poll(
+            _claude_pane(f"✻ {_BUDGET_RETRY_ERROR} · Retrying in 2s · attempt 3/10"), "resp_2"
+        )
+
+    assert [post["response_id"] for post in _failed_status_posts(calls)] == [
+        "resp_1",
+        "resp_1",
+        "resp_2",
+    ]
+    assert len(sent_keys) == 3
 
 
 @pytest.mark.parametrize(
@@ -1193,9 +1211,10 @@ async def test_forward_pane_signals_interrupts_a_rejected_api_retry_only_after_r
     An unreported rejection is not interrupted; the next poll reports it, then interrupts.
 
     The Escape's trailing idle would otherwise settle the turn without the
-    error, leaving the web with no explanation for the stopped reply.
+    error, leaving the web with no explanation for the stopped reply. A failed
+    Escape is retried on the next poll without reporting the rejection again.
     """
-    bridge_dir, panes, sent_keys = _fake_tmux_pane(monkeypatch, tmp_path)
+    bridge_dir, panes, sent_keys = _fake_tmux_pane(monkeypatch, tmp_path, failed_send_keys=1)
     panes.append(_claude_pane(f"✻ {_BUDGET_RETRY_ERROR} · Retrying in 2s · attempt 3/10"))
     calls: list[dict[str, Any]] = []
 
@@ -1223,6 +1242,10 @@ async def test_forward_pane_signals_interrupts_a_rejected_api_retry_only_after_r
 
         await _poll()
         assert len(_failed_status_posts(calls)) == 1
+        assert sent_keys == []
+
+        await _poll()
+        assert len(_failed_status_posts(calls)) == 2
         assert sent_keys == []
 
         await _poll()
