@@ -4039,14 +4039,16 @@ def build_owner_launcher(
     owner: str,
 ) -> SandboxHostLauncher:
     """
-    Build *entry*'s launcher, bound to *owner*'s credential when it needs one.
+    Build *entry*'s launcher, bound to *owner* and, when it needs one, to
+    *owner*'s credential.
 
     The single place a managed-host path turns a provider config into a
-    launcher. A launcher that acts as the host's owner (its
-    ``owner_credential_provider`` names a connection provider, e.g.
-    ``"databricks"``) is bound to the deployment's resolver for that provider,
-    curried with *owner*. With no resolver (the server has no connect flow for
-    that provider) the launcher stays unbound and refuses at first use with
+    launcher. The launcher is told its owner first (``bind_owner``). A launcher
+    that acts as the host's owner (its ``owner_credential_provider`` names a
+    connection provider, e.g. ``"databricks"``) is bound to the deployment's
+    resolver for that provider, curried with *owner*. With no resolver (the
+    server has no connect flow for that provider) the launcher stays unbound
+    and refuses at first use with
     :class:`~omnigent.onboarding.sandboxes.base.OwnerCredentialMissingError` —
     there is never a fallback to a shared server identity.
 
@@ -4059,6 +4061,9 @@ def build_owner_launcher(
     """
     launcher = entry.launcher_factory()
     # getattr: embedding deployments may inject duck-typed launchers.
+    bind_owner = getattr(launcher, "bind_owner", None)
+    if bind_owner is not None:
+        bind_owner(owner)
     needed = getattr(launcher, "owner_credential_provider", None)
     if needed is not None and deployment is not None:
         resolver = deployment.owner_credentials.get(needed)

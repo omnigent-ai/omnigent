@@ -5,6 +5,7 @@ import { readFileSync } from "node:fs";
 // lightningcss is the minifier @tailwindcss/vite runs during `vite build`
 // (resolved from its dependency tree, so we test the version the build uses).
 import { transform } from "lightningcss";
+import { compile } from "tailwindcss";
 import { type ComponentProps, createElement } from "react";
 import { createPortal } from "react-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -48,13 +49,22 @@ const cssSource = `${generatedPaletteCssSource}\n${indexCssSource}`;
 // every rule-extraction below so the block grammar lives in one place.
 const cssBlocks = [...cssSource.matchAll(/[^{}]+\{[^{}]*\}/g)];
 
-// Raw `@media` width rules in index.css repeat Tailwind's md breakpoint in rem.
+// The layout variants and native-shell `@media` rules repeat Tailwind's md breakpoint in rem.
 const BREAKPOINT_MD = `${MOBILE_BREAKPOINT_PX / 16}rem`;
+/** `BREAKPOINT_MD` as regex source. */
+const BREAKPOINT_MD_SOURCE = BREAKPOINT_MD.replace(/[\\.]/g, "\\$&");
 
-/** Regex source for an `@media (width <comparison> md) {` opener. */
-function mdWidthMedia(comparison: "<" | ">="): string {
-  return String.raw`@media \(width ${comparison} ${BREAKPOINT_MD.replace(/\./g, "\\.")}\) \{`;
+/** Regex source for a `selector { @variant md|max-md {` opener: a raw rule on one side of the layout split. */
+function layoutVariantRule(selector: string, variant: "md" | "max-md"): string {
+  return String.raw`${selector} \{\s*@variant ${variant} \{`;
 }
+
+/** Top-level `@media` blocks in index.css that test the md breakpoint directly. */
+const rawMdMediaBlocks = [
+  ...indexCssSource.matchAll(
+    new RegExp(String.raw`^@media [^{]*${BREAKPOINT_MD_SOURCE}[^{]*\{\n[\s\S]*?\n\}\n`, "gm"),
+  ),
+].map(([block]) => block);
 
 describe("shared glass fallback", () => {
   it("uses the solid theme surface only when both backdrop filters are unsupported", () => {
@@ -899,6 +909,61 @@ describe("index.css md breakpoint", () => {
   });
 });
 
+describe("index.css layout variants", () => {
+  const variantBlock = (name: string) =>
+    indexCssSource.match(new RegExp(String.raw`@custom-variant ${name} \{[\s\S]*?\n\}`))?.[0];
+
+  it("compiles the variants to the desktop-app split, alone and stacked", async () => {
+    const dark = indexCssSource.match(/@custom-variant dark [^\n]*/)?.[0];
+    const compiler = await compile(
+      `${variantBlock("md")}\n${variantBlock("max-md")}\n${dark}\n@tailwind utilities;`,
+    );
+    const classes = ["dark:hidden", "md:flex", "max-md:hidden", "dark:max-md:block"];
+    const css = compiler.build([...classes, "hover:max-md:grid"]).replace(/\s+/g, " ");
+    const desktopApp = "[data-desktop-app], [data-desktop-app] *";
+    const mobileOnly = (declaration: string) =>
+      `@media (width < ${BREAKPOINT_MD}) { &:where(:not(${desktopApp})) { ${declaration} } }`;
+
+    expect(css).toContain(
+      String.raw`.md\:flex { @media (width >= ${BREAKPOINT_MD}) { display: flex; } ` +
+        `&:where(${desktopApp}) { display: flex; } }`,
+    );
+    expect(css).toContain(String.raw`.max-md\:hidden { ${mobileOnly("display: none;")} }`);
+    expect(css).toContain(
+      String.raw`.dark\:max-md\:block { &:is(.dark *) { ${mobileOnly("display: block;")} } }`,
+    );
+    expect(css).toContain(
+      String.raw`.hover\:max-md\:grid { &:hover { @media (hover: hover) { ${mobileOnly("display: grid;")} } } }`,
+    );
+    // Pins the emitted order, which decides ties between equally specific utilities.
+    const positions = classes.map((name) =>
+      css.indexOf(`.${name.replaceAll(":", String.raw`\:`)} {`),
+    );
+    expect(positions).toEqual([...positions].sort((a, b) => a - b));
+    expect(positions[0]).toBeGreaterThanOrEqual(0);
+  });
+
+  it("routes the touch variant and the touch-target floor through max-md", () => {
+    expect(variantBlock("mobile-app")).toMatch(/@variant max-md \{\s*@slot;/);
+    expect(indexCssSource).toMatch(/@utility mobile-touch-target \{[^@]*@variant max-md \{/);
+  });
+
+  it("keeps raw md media rules for native mobile shells only", () => {
+    // A raw width rule skips the desktop-app split, so only rules the desktop app
+    // can never match may use one; every other rule goes through the variants.
+    expect(rawMdMediaBlocks.length).toBeGreaterThan(0);
+    for (const block of rawMdMediaBlocks) {
+      const selectors = [
+        ...block.replace(/\/\*[\s\S]*?\*\//g, "").matchAll(/^ {2}(\S[^{}]*)\{/gm),
+      ].flatMap(([, selectorList]) => selectorList.split(/,\n/));
+      expect(selectors.length).toBeGreaterThan(0);
+      for (const selector of selectors) {
+        expect(selector).toMatch(/\[data-(?:ios|android)-native\]/);
+      }
+    }
+  });
+});
+
 /* Regression test for the "inline <code> renders at 9.75px" bug.
  *
  * code/kbd/samp/pre carry preflight's `font-size: 1em`, so they inherit their
@@ -907,7 +972,7 @@ describe("index.css md breakpoint", () => {
  */
 describe("index.css desktop typography ramp", () => {
   const desktopMap = cssSource.match(
-    new RegExp(String.raw`${mdWidthMedia(">=")}\s*:root \{[^}]*\}`),
+    new RegExp(String.raw`${layoutVariantRule(":root", "md")}[^}]*\}`),
   )?.[0];
 
   const anchorDivisor = Number(
@@ -949,10 +1014,10 @@ describe("index.css desktop typography ramp", () => {
  * at every size the Appearance setting allows. */
 describe("index.css body text tokens", () => {
   const desktopMap = cssSource.match(
-    new RegExp(String.raw`${mdWidthMedia(">=")}\s*:root \{[^}]*\}`),
+    new RegExp(String.raw`${layoutVariantRule(":root", "md")}[^}]*\}`),
   )?.[0];
   const mobileMap = cssSource.match(
-    new RegExp(String.raw`${mdWidthMedia("<")}\s*(?:\/\*[\s\S]*?\*\/\s*)?:root \{[^}]*\}`),
+    new RegExp(String.raw`${layoutVariantRule(":root", "max-md")}[^}]*\}`),
   )?.[0];
   const BODY_LINE_HEIGHT_RATIO = 1.6;
   const CAPTION_LINE_HEIGHT_RATIO = 1.3;
@@ -1026,7 +1091,7 @@ describe("index.css body text tokens", () => {
     // vendor markup (streamdown) this app does not control.
     expect(cssSource).toContain("--text-xs: var(--text-sm)");
     expect(cssSource).toContain("--text-xs--line-height: var(--text-sm--line-height)");
-    // And it must NOT be remapped in the media queries, or the alias is moot.
+    // And it must NOT be remapped in the layout variants, or the alias is moot.
     expect(desktopMap).not.toContain("--text-xs:");
     expect(mobileMap).not.toContain("--text-xs:");
   });
@@ -1084,7 +1149,7 @@ describe("index.css shadow tokens", () => {
 describe("index.css mobile sidebar transparency", () => {
   const mobileRule = cssSource.match(
     new RegExp(
-      String.raw`${mdWidthMedia("<")}[^@]*?\.conversations-sidebar[^{]*\{[^}]*background:\s*transparent[^}]*\}`,
+      String.raw`${layoutVariantRule(String.raw`\n\.conversations-sidebar`, "max-md")}[^}]*background:\s*transparent[^}]*\}`,
     ),
   )?.[0];
 
@@ -1124,7 +1189,11 @@ describe("index.css text selection colors", () => {
 });
 
 describe("index.css mobile settings header", () => {
-  const headerFadeRule = cssSource.match(/\.settings-mobile-header::before \{[^}]*\}/)?.[0];
+  const headerFadeRule = cssSource.match(
+    new RegExp(
+      String.raw`${layoutVariantRule(String.raw`\.settings-mobile-header`, "max-md")}\s*&::before \{[^}]*\}`,
+    ),
+  )?.[0];
 
   it("keeps settings page titles in the page instead of the header row", () => {
     expect(cssSource).not.toContain(".settings-page-title");
@@ -1421,19 +1490,14 @@ describe("index.css electron-mac sidebar header", () => {
     expect(settingsHeaderRule).toContain("padding-top: calc(var(--mac-titlebar-height) + 0.5rem)");
   });
 
-  it("hands the phone layout's headers the lights' corner below md", () => {
-    // Electron's 720px minimum is below md, where the drawer and chat header
-    // carry their own controls; a fixed rem pad would drift with zoom.
-    const narrowBlock = cssSource.match(
-      new RegExp(
-        String.raw`${mdWidthMedia("<")}(?=\s*html\[data-electron-mac\] \.electron-sidebar-header-actions \{)(?:[^{}]|\{[^{}]*\})*\}`,
-      ),
-    )?.[0];
-    expect(narrowBlock, "expected the macOS sub-md header block").toBeDefined();
-    expect(narrowBlock).toMatch(/\.electron-sidebar-header-actions \{\s*display: none;/);
-    expect(narrowBlock).toMatch(
-      /\.traffic-light-clearance,\s*html\[data-electron-mac\] \.sidebar-header-row \{\s*padding-left: var\(--mac-traffic-light-width\);/,
+  it("keeps the title-bar cluster and header rows at every window width", () => {
+    // Electron's 720px minimum is below md, but the desktop app keeps the desktop
+    // layout there, so no mac shell rule may depend on the window width.
+    expect(indexCssSource).not.toMatch(
+      /html\[data-electron-mac\][^{}]*\{\s*@(?:variant (?:max-)?md\b|media [^{]*width)/,
     );
+    for (const block of rawMdMediaBlocks) expect(block).not.toContain("[data-electron-mac]");
+    expect(cssSource).not.toMatch(/\.electron-sidebar-header-actions \{\s*display: none;/);
   });
 
   it("keeps every header rule scoped to the desktop shell", () => {

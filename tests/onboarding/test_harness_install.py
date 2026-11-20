@@ -1831,6 +1831,21 @@ def test_harness_cli_installed_checks_version_for_versioned_specs(
     assert hi.harness_cli_installed(hi.OPENCODE_KEY) is expected
 
 
+@pytest.mark.parametrize("skip_env,expected", [(None, False), ("1", True)])
+def test_opencode_skip_version_check_counts_newer_cli_as_installed(
+    monkeypatch: pytest.MonkeyPatch, skip_env: str | None, expected: bool
+) -> None:
+    """With the skip env var a 3.x CLI counts as installed, so setup offers no
+    reinstall that would downgrade it to the pinned release."""
+    if skip_env is None:
+        monkeypatch.delenv("OMNIGENT_OPENCODE_SKIP_VERSION_CHECK", raising=False)
+    else:
+        monkeypatch.setenv("OMNIGENT_OPENCODE_SKIP_VERSION_CHECK", skip_env)
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+    _stub_opencode_version(monkeypatch, "3.0.0")
+    assert hi.harness_cli_installed(hi.OPENCODE_KEY) is expected
+
+
 @pytest.mark.parametrize(
     "key",
     [

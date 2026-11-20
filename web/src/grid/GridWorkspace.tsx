@@ -377,6 +377,7 @@ export function RearrangeableGrid({
           </header>
           <div
             className="relative grid min-h-0 min-w-0 flex-1 grid-cols-2 grid-rows-2 gap-2 overflow-auto p-2 pt-0"
+            data-flyout-boundary=""
             data-testid="session-grid"
           >
             {gridPanes(layout).map(({ sessionId, area }) => (

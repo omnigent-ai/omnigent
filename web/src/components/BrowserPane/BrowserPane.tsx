@@ -64,6 +64,10 @@ import { normalizeTypedUrl } from "@/lib/normalizeTypedUrl";
 import { cn } from "@/lib/utils";
 // Say when the tab's page is open in another desktop window.
 import { OpenElsewhereHint } from "@/components/BrowserPane/agentTools/OpenElsewhereHint";
+import {
+  DesktopDesignTools,
+  useHasDesktopDesignTools,
+} from "@/components/BrowserPane/designTools/LazyDesktopDesignTools";
 
 /** Renderer CSS-pixel bounds pushed to the main process (converted to window
  *  DIPs there via the host zoom factor). */
@@ -198,9 +202,14 @@ export function BrowserPane({
   // the arrow buttons.
   const [currentUrl, setCurrentUrl] = useState("");
   const [navigationError, setNavigationError] = useState<string | null>(null);
+  // The page the view has loaded, not what's typed in the address bar: the design tools'
+  // requests name it.
+  const [pageUrl, setPageUrl] = useState("");
   // Ref (not state): read synchronously in the url-changed listener; a
   // stale-closure state read would race.
   const urlEditingRef = useRef(false);
+  // Counts url-changed events, so an older view probe can't overwrite a newer URL.
+  const urlEventsRef = useRef(0);
   const submitSequenceRef = useRef(0);
   useEffect(
     () => () => {
@@ -214,6 +223,8 @@ export function BrowserPane({
   // routing lives in AppShell. This flag only drives the button + enable/disable IPC.
   const [designMode, setDesignMode] = useState(false);
   const designModeRef = useRef(false);
+  // The design tools replace design mode, unless the shell predates them or they can't load.
+  const hasDesignTools = useHasDesktopDesignTools();
   // "Import cookies from Chrome" needs BOTH an optional bridge method (older
   // shells predate it) and the shell's desktop feature flag (macOS only).
   const [cookieImportSupported, setCookieImportSupported] = useState(false);
@@ -238,14 +249,21 @@ export function BrowserPane({
     if (!bridge) return;
     let cancelled = false;
     let viewChanged = false;
+    const urlEvents = urlEventsRef.current;
 
     // A newer lifecycle event takes precedence over this asynchronous snapshot.
     void bridge.browserHasView?.(conversationId).then((r) => {
       if (!cancelled && !viewChanged && r?.exists) {
         setHasView(true);
-        if (!urlEditingRef.current && r.url) setCurrentUrl(r.url);
-        setCanGoBack(!!r.canGoBack);
-        setCanGoForward(!!r.canGoForward);
+        // A navigation since it asked brought its own URL and back/forward state.
+        const fresh = urlEventsRef.current === urlEvents;
+        const url = fresh ? r.url : undefined;
+        if (url) setPageUrl(url);
+        if (!urlEditingRef.current && url) setCurrentUrl(url);
+        if (fresh) {
+          setCanGoBack(!!r.canGoBack);
+          setCanGoForward(!!r.canGoForward);
+        }
       }
     });
 
@@ -258,6 +276,7 @@ export function BrowserPane({
       if (payload.conversationId !== conversationId) return;
       viewChanged = true;
       setHasView(false);
+      setPageUrl("");
       setCanGoBack(false);
       setCanGoForward(false);
     });
@@ -277,6 +296,8 @@ export function BrowserPane({
     if (!bridge) return;
     const unsubUrl = bridge.onBrowserUrlChanged?.((payload) => {
       if (payload.conversationId !== conversationId) return;
+      urlEventsRef.current += 1;
+      setPageUrl(payload.url);
       if (urlEditingRef.current) return;
       setCurrentUrl(payload.url);
     });
@@ -490,6 +511,14 @@ export function BrowserPane({
       setDesignMode(false);
     }
   }, [hasView, active, designMode]);
+
+  // The tools loading late (their chunk retried) replace design mode: turn its picker off.
+  useEffect(() => {
+    if (!hasDesignTools || !designMode) return;
+    designModeRef.current = false;
+    void getBridge()?.browserDisableDesignMode?.(conversationId);
+    setDesignMode(false);
+  }, [hasDesignTools, designMode, conversationId]);
 
   // Measure the placeholder and push bounds to the main process. These are
   // renderer CSS pixels; the main process converts to WebContentsView DIPs
@@ -734,9 +763,17 @@ export function BrowserPane({
             <CookieIcon className="size-4" />
           </button>
         )}
+        <DesktopDesignTools
+          viewId={conversationId}
+          hasView={hasView}
+          active={active}
+          url={pageUrl}
+          container={containerRef}
+        />
         <button
           type="button"
           onClick={handleToggleDesignMode}
+          hidden={hasDesignTools}
           disabled={!hasView}
           aria-pressed={designMode}
           aria-label={designMode ? "Exit design mode" : "Enter design mode"}

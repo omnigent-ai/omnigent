@@ -36,6 +36,7 @@ import {
 } from "@/components/ai-elements/streamdown-security";
 import { WorkspaceMarkdownImage } from "./WorkspaceMarkdownImage";
 import { ZoomableImage } from "@/components/ImageLightbox";
+import { COMMAND_TOKEN_CLASS } from "@/components/composer/commandToken";
 import {
   ContextMenu,
   ContextMenuContent,
@@ -695,6 +696,12 @@ const FILE_PATH_AWARE_COMPONENTS = {
   a: MarkdownLink,
 };
 
+function LeadingCommandToken({ children }: WithHastNode<React.ComponentPropsWithoutRef<"kbd">>) {
+  return <span className={COMMAND_TOKEN_CLASS}>{children}</span>;
+}
+
+const LEADING_COMMAND_COMPONENTS = { ...FILE_PATH_AWARE_COMPONENTS, kbd: LeadingCommandToken };
+
 // How often the live (growing) assistant bubble re-parses its markdown. The
 // store pump commits a new, longer text up to once per animation frame (~60/s);
 // without this the whole accumulated message is re-parsed on every commit. ~10/s
@@ -781,6 +788,26 @@ interface MarkdownNode {
   children?: MarkdownNode[];
 }
 
+interface MarkdownTextNode extends MarkdownNode {
+  value?: string;
+  data?: { hName?: string };
+}
+
+/** Tag the leading token in mdast, as sanitize strips classes from raw HTML. */
+function remarkLeadingCommand(token: string) {
+  return (tree: MarkdownTextNode) => {
+    const paragraph = tree.children?.[0];
+    if (paragraph?.type !== "paragraph" || !paragraph.children) return;
+    const first: MarkdownTextNode | undefined = paragraph.children[0];
+    if (first?.type !== "text" || !first.value?.startsWith(token)) return;
+    const rest = first.value.slice(token.length);
+    if (rest !== "" && !/^\s/.test(rest)) return;
+    const marked: MarkdownTextNode[] = [{ type: "text", value: token, data: { hName: "kbd" } }];
+    if (rest) marked.push({ type: "text", value: rest });
+    paragraph.children.splice(0, 1, ...marked);
+  };
+}
+
 /** Turns raw HTML nodes into text nodes holding the same source. */
 function remarkHtmlAsText() {
   const visit = (node: MarkdownNode) => {
@@ -806,28 +833,40 @@ function remarkHtmlAsText() {
  *
  * When `literalHtml` is set, raw HTML shows as written instead of rendering,
  * so markup or comments in a tool's text can't hide part of it.
+ *
+ * `leadingCommand` tints that token where it opens the text, without changing
+ * how the rest parses. Only for text whose raw HTML renders as text.
  */
 export function FilePathAwareMessageResponse({
   children,
   breaks = false,
   literalHtml = false,
+  leadingCommand,
   isStreaming = false,
   ...props
-}: React.ComponentProps<typeof MessageResponse> & { breaks?: boolean; literalHtml?: boolean }) {
-  const components = FILE_PATH_AWARE_COMPONENTS;
+}: React.ComponentProps<typeof MessageResponse> & {
+  breaks?: boolean;
+  literalHtml?: boolean;
+  leadingCommand?: string;
+}) {
+  const components =
+    leadingCommand === undefined ? FILE_PATH_AWARE_COMPONENTS : LEADING_COMMAND_COMPONENTS;
 
   // Extend (don't replace) Streamdown's defaults so remark-gfm survives. With
-  // neither option set we pass `undefined` so Streamdown uses its defaults unchanged.
+  // no option set we pass `undefined` so Streamdown uses its defaults unchanged.
   const remarkPlugins = useMemo(
     () =>
-      breaks || literalHtml
+      breaks || literalHtml || leadingCommand !== undefined
         ? [
             ...Object.values(defaultRemarkPlugins),
             ...(literalHtml ? [remarkHtmlAsText] : []),
+            ...(leadingCommand !== undefined
+              ? [[remarkLeadingCommand, leadingCommand] as [typeof remarkLeadingCommand, string]]
+              : []),
             ...(breaks ? [remarkBreaks] : []),
           ]
         : undefined,
-    [breaks, literalHtml],
+    [breaks, literalHtml, leadingCommand],
   );
 
   // Throttle the markdown so the live (still-growing) bubble re-parses a few
@@ -858,6 +897,9 @@ export function FilePathAwareMessageResponse({
 
   return (
     <MessageResponse
+      // Streamdown's memo ignores plugin changes, so a command published after
+      // the first render needs a fresh tree.
+      key={leadingCommand}
       {...props}
       components={components}
       remarkPlugins={remarkPlugins}

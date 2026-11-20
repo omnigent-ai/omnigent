@@ -653,6 +653,43 @@ export async function updateScheduledTask(
   return taskFromWire(await readJsonOrThrow<ScheduledTaskWire>(res));
 }
 
+/**
+ * Create a copy of an automation, under a new ID, with its settings and schedule but
+ * none of its runs. The copy is paused when the original is; otherwise both run.
+ */
+export async function cloneScheduledTask(
+  task: Pick<ScheduledTask, "id" | "hostId">,
+): Promise<ScheduledTask> {
+  const res = await authenticatedFetch(`/v1/scheduled-tasks/${encodeURIComponent(task.id)}/clone`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-omnigent-automation-source": "ui",
+      // A copied source session takes its browser tools mode from this request.
+      ...browserAgentToolsRequestHeaders(),
+    },
+    // The create checks the original's host over its tunnel, so the request
+    // routes to that host's replica by this host_id.
+    body: JSON.stringify(task.hostId ? { host_id: task.hostId } : {}),
+  });
+  return taskFromWire(await readJsonOrThrow<ScheduledTaskWire>(res));
+}
+
+/** The toast after a clone: what the copy is, and what's left to do. */
+export function cloneCreatedMessage(clone: Pick<ScheduledTask, "state" | "nextRunAt">): string {
+  if (clone.state === "paused") return "Automation cloned. The copy is paused like the original.";
+  // An active copy is always armed, so no next run means a finite schedule ran out.
+  if (clone.nextRunAt === null) return "Automation cloned. Its schedule has no runs left.";
+  return "Automation cloned. Pause or delete the original so they don't both run.";
+}
+
+/** The toast when a clone fails, with the server's reason when it gave one. */
+export function cloneFailedMessage(err: unknown): string {
+  return err instanceof ScheduledTaskApiError && err.status < 500
+    ? `Couldn't clone the automation: ${err.message}`
+    : "Couldn't clone the automation";
+}
+
 /** Delete a task so it no longer fires. */
 export async function deleteScheduledTask(id: string): Promise<void> {
   const res = await authenticatedFetch(`/v1/scheduled-tasks/${encodeURIComponent(id)}`, {

@@ -16,6 +16,8 @@ reattach when the session moves to another host.
   Automatic recovery runs once when opening Terminal. Leaving it open does not
   revive an idle-reaped pane. Failed recovery stays manual across view switches.
 - `user-shell`: open a shell, type into it, and close it.
+- `sandboxed-claude-inference`: in a sandboxed Claude SDK session, a terminal
+  can use Claude inference automatically while parent credentials stay hidden.
 - `scrollback`: scroll back with the mouse wheel (including programs that track
   the mouse), by touch on phones, and by keyboard.
 - `reconnect`: after the terminal connection drops, the terminal shows that it
@@ -70,6 +72,9 @@ with their own terminal retain the switcher.
 
 - Open a new shell from the workspace rail on desktop, or from the header menu
   on a phone.
+- In a sandboxed Claude SDK session, use that shell or an agent-launched
+  terminal to run the Claude CLI; model access is available without entering a
+  credential in the shell.
 - Press Control+` (on every platform) to open a shell of the remembered default
   type, also from a focused terminal. The chord is inert while the host is
   offline, the session is stranded, or a shell is still being created.
@@ -131,6 +136,14 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   `tests/e2e_ui/shells/test_new_shell.py::test_shell_program_gets_one_reply_to_a_cursor_position_query`.
   Closing a shell has no e2e coverage: close its tab, confirm, and expect the
   tab to disappear.
+- **`sandboxed-claude-inference`:**
+  `tests/inner/test_claude_worker_containment.py` runs the real Claude CLI in a
+  sandboxed tmux shell and through `sys_terminal_launch` / `sys_terminal_send`
+  against a local TLS model provider. It checks successful inference, hidden
+  parent credentials and denied direct network access. Set
+  `OMNIGENT_CLAUDE_CLI_E2E=1` and follow
+  [the worker prerequisites](../docs/CLAUDE_SANDBOX_TESTING.md); a passing
+  mock-provider run does not establish live Anthropic authentication.
 - **`agent-terminal-view`, `user-shell`, `split-panes`, keyboard:** no e2e
   coverage; component tests `web/src/hooks/useViewModeToggleHotkey.test.tsx`,
   `web/src/hooks/useNewShellHotkey.test.tsx`,
