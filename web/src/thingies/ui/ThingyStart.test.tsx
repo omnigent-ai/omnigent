@@ -76,30 +76,30 @@ describe("New thingy", () => {
   });
 
   it("previews a template, names it, publishes it and opens it", async () => {
-    const created = thingyFixture({ id: "radar-1", name: "Team work radar", version: "v0" });
+    const created = thingyFixture({ id: "where-1", name: "Team where was I", version: "v0" });
     vi.mocked(createThingy).mockResolvedValue(created);
     vi.mocked(createThingyRevision).mockResolvedValue({ id: "rev-9" });
     vi.mocked(publishThingyRevision).mockResolvedValue(created);
     renderWithThingies(<ThingyStartPage />, { path: "/thingy/new" });
 
-    fireEvent.click(screen.getByRole("button", { name: "Work radar" }));
-    const preview = await screen.findByRole("dialog", { name: "Work radar" });
+    fireEvent.click(screen.getByRole("button", { name: "Where was I?" }));
+    const preview = await screen.findByRole("dialog", { name: "Where was I?" });
     expect(within(preview).getByTestId("thingy-frame")).toBeInTheDocument();
     fireEvent.click(within(preview).getByRole("button", { name: "Use template" }));
 
     const naming = await screen.findByRole("dialog", { name: "Name your thingy" });
     const name = within(naming).getByRole("textbox", { name: "Name" });
-    expect(name).toHaveValue("Work radar");
-    fireEvent.change(name, { target: { value: "Team work radar" } });
+    expect(name).toHaveValue("Where was I?");
+    fireEvent.change(name, { target: { value: "Team where was I" } });
     fireEvent.click(within(naming).getByRole("button", { name: "Create" }));
 
-    await waitFor(() => expect(location().pathname).toBe("/thingy/radar-1"));
-    expect(createThingy).toHaveBeenCalledWith("Team work radar");
+    await waitFor(() => expect(location().pathname).toBe("/thingy/where-1"));
+    expect(createThingy).toHaveBeenCalledWith("Team where was I");
     expect(createThingyRevision).toHaveBeenCalledWith(
-      "radar-1",
+      "where-1",
       expect.objectContaining({ html: expect.any(String) }),
     );
-    expect(publishThingyRevision).toHaveBeenCalledWith("radar-1", "rev-9", "v0");
+    expect(publishThingyRevision).toHaveBeenCalledWith("where-1", "rev-9", "v0");
   });
 
   it("starts a blank thingy in New session", async () => {

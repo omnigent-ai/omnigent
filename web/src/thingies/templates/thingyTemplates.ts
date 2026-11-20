@@ -1,14 +1,14 @@
 // Starting points for a new thingy, each a working example of the SDK's patterns. A template's
-// revision is uploaded and published as the thingy's first version. Both start empty: the work
-// radar until its session scans the viewer's sessions, the data story until its session finds
+// revision is uploaded and published as the thingy's first version. Both start empty: Where was
+// I? until its session scans the viewer's sessions, the data story until its session finds
 // story ideas in them and builds the one the viewer picks. Each session then designs the page;
 // only a template's preview shows an example.
 
 import { DATA_STORY_REVISION } from "./dataStoryTemplate";
 import type { CreateThingyRevisionRequest } from "../api/thingyApi";
-import { WORK_RADAR_REVISION } from "./workRadarTemplate";
+import { WHERE_WAS_I_REVISION } from "./whereWasITemplate";
 
-export type ThingyTemplateId = "work-radar" | "data-story" | "blank";
+export type ThingyTemplateId = "where-was-i" | "data-story" | "blank";
 
 export interface ThingyTemplate {
   id: ThingyTemplateId;
@@ -24,7 +24,7 @@ export interface ThingyTemplate {
 
 // Shown in the New thingy dialog and the template preview.
 const messages = {
-  radarName: "Work radar",
+  radarName: "Where was I?",
   radarDescription: "Sees what your recent sessions add up to, and what to do next.",
   radarShowsSummary:
     "What your recent sessions add up to, grouped by goal, with what is blocked or waiting on you",
@@ -55,7 +55,7 @@ const messages = {
 
 export const THINGY_TEMPLATES: readonly ThingyTemplate[] = [
   {
-    id: "work-radar",
+    id: "where-was-i",
     name: messages.radarName,
     description: messages.radarDescription,
     shows: [
@@ -69,7 +69,7 @@ export const THINGY_TEMPLATES: readonly ThingyTemplate[] = [
       messages.radarSuggestLanes,
       messages.radarSuggestWindow,
     ],
-    revision: WORK_RADAR_REVISION,
+    revision: WHERE_WAS_I_REVISION,
   },
   {
     id: "data-story",

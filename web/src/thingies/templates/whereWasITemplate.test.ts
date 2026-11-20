@@ -4,12 +4,12 @@ import { waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
-  WORK_RADAR_GUIDE,
-  WORK_RADAR_HTML,
-  WORK_RADAR_REVISION,
-  WORK_RADAR_VIEW_END,
-  WORK_RADAR_VIEW_START,
-} from "./workRadarTemplate";
+  WHERE_WAS_I_GUIDE,
+  WHERE_WAS_I_HTML,
+  WHERE_WAS_I_REVISION,
+  WHERE_WAS_I_VIEW_END,
+  WHERE_WAS_I_VIEW_START,
+} from "./whereWasITemplate";
 
 interface Doc {
   id: string;
@@ -68,10 +68,10 @@ const LAYOUT = {
 
 /** The template with its view region replaced, as the thingy session publishes a design. */
 function withView(style: string, script: string): string {
-  const start = WORK_RADAR_HTML.indexOf(WORK_RADAR_VIEW_START);
-  const end = WORK_RADAR_HTML.indexOf(WORK_RADAR_VIEW_END) + WORK_RADAR_VIEW_END.length;
-  const region = `${WORK_RADAR_VIEW_START}\n<style id="lanes-style">${style}</style>\n<script>${script}</script>\n${WORK_RADAR_VIEW_END}`;
-  return WORK_RADAR_HTML.slice(0, start) + region + WORK_RADAR_HTML.slice(end);
+  const start = WHERE_WAS_I_HTML.indexOf(WHERE_WAS_I_VIEW_START);
+  const end = WHERE_WAS_I_HTML.indexOf(WHERE_WAS_I_VIEW_END) + WHERE_WAS_I_VIEW_END.length;
+  const region = `${WHERE_WAS_I_VIEW_START}\n<style id="lanes-style">${style}</style>\n<script>${script}</script>\n${WHERE_WAS_I_VIEW_END}`;
+  return WHERE_WAS_I_HTML.slice(0, start) + region + WHERE_WAS_I_HTML.slice(end);
 }
 
 const LANES_VIEW = withView(
@@ -89,7 +89,7 @@ const LANES_VIEW = withView(
 // SDK faked at window.omnigent, the external boundary. As in a browser, a script that throws
 // reports the error to the window's error listeners and the next script still runs.
 function startRadar({
-  html = WORK_RADAR_HTML,
+  html = WHERE_WAS_I_HTML,
   preview = false,
   canAct = true,
   canWrite = true,
@@ -133,7 +133,7 @@ function startRadar({
   };
   const client = {
     context: {
-      app: { id: "app1", name: "Work radar" },
+      app: { id: "app1", name: "Where was I?" },
       revisionId: REVISION,
       viewer: { id: "1001", displayName: "viewer@example.com" },
       permissions: { writeData: canWrite, publish: canAct },
@@ -214,7 +214,7 @@ afterEach(() => {
   document.body.replaceChildren();
 });
 
-describe("work radar template", () => {
+describe("where was I template", () => {
   it("starts empty with a scan button and seeds nothing", async () => {
     const { emit, writes, requests, ready } = startRadar();
     await waitFor(() => expect(ready()).toBe(true));
@@ -498,14 +498,14 @@ describe("work radar template", () => {
 
     expect(automations).toEqual([
       expect.objectContaining({
-        name: "Next step from Work radar",
+        name: "Next step from Where was I?",
         prompt: expect.stringContaining("thingy_id app1"),
       }),
     ]);
   });
 });
 
-describe("work radar designs", () => {
+describe("where was I designs", () => {
   it("draws a design with the kit's pieces and reports that it drew", async () => {
     const { emit, emitActions, reports, requests, ready } = startRadar({ html: LANES_VIEW });
     await waitFor(() => expect(ready()).toBe(true));
@@ -645,9 +645,9 @@ function keywords(schema: unknown, out: Set<string>): Set<string> {
   return out;
 }
 
-describe("work radar revision", () => {
+describe("where was I revision", () => {
   it("uses only schema keywords the server accepts", () => {
-    for (const schema of Object.values(WORK_RADAR_REVISION.collections)) {
+    for (const schema of Object.values(WHERE_WAS_I_REVISION.collections)) {
       for (const keyword of keywords(schema, new Set())) {
         expect(SUPPORTED_KEYWORDS).toContain(keyword);
       }
@@ -655,29 +655,29 @@ describe("work radar revision", () => {
   });
 
   it("has one view region a design replaces, after the kit and before the start", () => {
-    const html = WORK_RADAR_HTML;
-    expect(html.split(WORK_RADAR_VIEW_START)).toHaveLength(2);
-    expect(html.split(WORK_RADAR_VIEW_END)).toHaveLength(2);
+    const html = WHERE_WAS_I_HTML;
+    expect(html.split(WHERE_WAS_I_VIEW_START)).toHaveLength(2);
+    expect(html.split(WHERE_WAS_I_VIEW_END)).toHaveLength(2);
     expect(html.indexOf('<script id="radar-kit">')).toBeLessThan(
-      html.indexOf(WORK_RADAR_VIEW_START),
+      html.indexOf(WHERE_WAS_I_VIEW_START),
     );
-    expect(html.indexOf(WORK_RADAR_VIEW_END)).toBeLessThan(html.indexOf("Radar.start()"));
+    expect(html.indexOf(WHERE_WAS_I_VIEW_END)).toBeLessThan(html.indexOf("Radar.start()"));
   });
 
   it("tells the session to publish a design as one edit of the view region", () => {
-    expect(WORK_RADAR_GUIDE).toContain("`base_revision_id` the published revision and one edit");
-    expect(WORK_RADAR_GUIDE).toContain(`start: "${WORK_RADAR_VIEW_START}"`);
-    expect(WORK_RADAR_GUIDE).toContain("Do not send `html`");
-    expect(WORK_RADAR_GUIDE).toContain("at least one visual element that carries meaning");
+    expect(WHERE_WAS_I_GUIDE).toContain("`base_revision_id` the published revision and one edit");
+    expect(WHERE_WAS_I_GUIDE).toContain(`start: "${WHERE_WAS_I_VIEW_START}"`);
+    expect(WHERE_WAS_I_GUIDE).toContain("Do not send `html`");
+    expect(WHERE_WAS_I_GUIDE).toContain("at least one visual element that carries meaning");
   });
 
   it("fits the server's limits", () => {
-    expect(new TextEncoder().encode(WORK_RADAR_GUIDE).length).toBeLessThanOrEqual(16 * 1024);
-    expect(new TextEncoder().encode(WORK_RADAR_HTML).length).toBeLessThan(1024 * 1024);
+    expect(new TextEncoder().encode(WHERE_WAS_I_GUIDE).length).toBeLessThanOrEqual(16 * 1024);
+    expect(new TextEncoder().encode(WHERE_WAS_I_HTML).length).toBeLessThan(1024 * 1024);
   });
 
   it("declares the actions the page requests", () => {
-    expect(WORK_RADAR_REVISION.actions?.map((action) => action.name)).toEqual([
+    expect(WHERE_WAS_I_REVISION.actions?.map((action) => action.name)).toEqual([
       "scan",
       "do_next_step",
       "restore_look",

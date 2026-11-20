@@ -4,7 +4,7 @@
 // the session gathers the data with its own tools, writes the story into fixed records and
 // designs the page for it, so every story's page is its own.
 //
-// The page is a kit plus a view, like the Work radar. The kit keeps the story ideas, build and
+// The page is a kit plus a view, like Where was I?. The kit keeps the story ideas, build and
 // refresh progress, the look line with Back to the previous look, sources, the guide, a plain
 // story view, and the fallback to that view when a design fails to draw. The view sits between
 // the VIEW_START and VIEW_END markers; the session replaces only that region with its design,

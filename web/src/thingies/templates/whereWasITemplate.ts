@@ -1,4 +1,4 @@
-// Work radar template: what the viewer's recent sessions add up to, and what needs them next.
+// Where was I? template: what the viewer's recent sessions add up to, and what needs them next.
 // The thingy session writes fixed records (the whole picture as one `radar` record per scan) and
 // designs the page itself to fit the viewer's work, so different people see different pages.
 //
@@ -19,13 +19,13 @@ import {
   THINGY_RENDER_REPORT_SCHEMA,
 } from "./templateKit";
 
-export const WORK_RADAR_COLLECTION = "radar";
+export const WHERE_WAS_I_COLLECTION = "radar";
 // The one record in `radar` and in `layout`; each scan or design replaces it.
-export const WORK_RADAR_RECORD_ID = "current";
-export const WORK_RADAR_LAYOUT_COLLECTION = "layout";
-export const WORK_RADAR_REPORTS_COLLECTION = "render_reports";
-export const WORK_RADAR_VIEW_START = "<!-- radar:view:start -->";
-export const WORK_RADAR_VIEW_END = "<!-- radar:view:end -->";
+export const WHERE_WAS_I_RECORD_ID = "current";
+export const WHERE_WAS_I_LAYOUT_COLLECTION = "layout";
+export const WHERE_WAS_I_REPORTS_COLLECTION = "render_reports";
+export const WHERE_WAS_I_VIEW_START = "<!-- radar:view:start -->";
+export const WHERE_WAS_I_VIEW_END = "<!-- radar:view:end -->";
 
 const AREA_STATES = ["active", "blocked", "waiting", "done"];
 const STEP_STATUSES = ["started", "done", "needs_input", "failed"];
@@ -34,7 +34,7 @@ const id = (max: number) => ({ type: "string", minLength: 1, maxLength: max });
 const text = (max: number) => ({ type: "string", maxLength: max });
 const time = { type: "string", minLength: 10, maxLength: 40 };
 
-export const WORK_RADAR_SCHEMA = {
+export const WHERE_WAS_I_SCHEMA = {
   type: "object",
   additionalProperties: false,
   required: ["scanned_at", "window_days", "areas"],
@@ -128,10 +128,10 @@ export const WORK_RADAR_SCHEMA = {
   },
 } satisfies Record<string, unknown>;
 
-export const WORK_RADAR_LAYOUT_SCHEMA = THINGY_LAYOUT_SCHEMA;
-export const WORK_RADAR_REPORT_SCHEMA = THINGY_RENDER_REPORT_SCHEMA;
+export const WHERE_WAS_I_LAYOUT_SCHEMA = THINGY_LAYOUT_SCHEMA;
+export const WHERE_WAS_I_REPORT_SCHEMA = THINGY_RENDER_REPORT_SCHEMA;
 
-export const WORK_RADAR_STEP_RUN_SCHEMA = {
+export const WHERE_WAS_I_STEP_RUN_SCHEMA = {
   type: "object",
   additionalProperties: false,
   required: ["label", "state"],
@@ -145,7 +145,7 @@ export const WORK_RADAR_STEP_RUN_SCHEMA = {
   },
 } satisfies Record<string, unknown>;
 
-export const WORK_RADAR_DISMISSED_SCHEMA = {
+export const WHERE_WAS_I_DISMISSED_SCHEMA = {
   type: "object",
   additionalProperties: false,
   required: ["at"],
@@ -992,7 +992,7 @@ ${THINGY_KIT_HELPERS}
     if (snapshot.status === 'loading') return;
     // A newer revision means the session published a look; Omnigent loads it in a moment.
     if (snapshot.status === 'stale' && snapshot.error && snapshot.error.code === 'REVISION_CHANGED') notice('Loading the new look…');
-    else if (snapshot.status === 'stale' && snapshot.error) notice('Could not load the radar: ' + message(snapshot.error), 'error');
+    else if (snapshot.status === 'stale' && snapshot.error) notice('Could not load your work: ' + message(snapshot.error), 'error');
     var current = (snapshot.items || []).filter(function (doc) { return doc.id === 'current'; })[0] || null;
     var key = stamp(current ? [current] : []);
     if (radarLoaded && key === seen.radar) return;
@@ -1125,8 +1125,8 @@ const KIT_BODY = `
 <main>
   <div class="top">
     <div>
-      <p class="kicker">Work radar <span class="badge" title="Built from the owner's own sessions. Anyone you share this thingy with sees these summaries.">Personal</span></p>
-      <h1 id="title">Work radar</h1>
+      <p class="kicker">Where was I? <span class="badge" title="Built from the owner's own sessions. Anyone you share this thingy with sees these summaries.">Personal</span></p>
+      <h1 id="title">Where was I?</h1>
       <div class="meta" id="meta"></div>
     </div>
     <div class="toolbar">
@@ -1183,7 +1183,7 @@ const KIT_BODY = `
         <div>
           <h3>How this works</h3>
           <div class="layers">
-            <div class="layer"><svg viewBox="0 0 26 26" aria-hidden="true"><circle cx="13" cy="13" r="9" fill="var(--active-soft)" stroke="var(--active)" stroke-width="2"/></svg><div><b>The radar</b> comes from your thingy session. On Scan it reads your recent sessions (their titles, journals and last messages, not whole transcripts), works out what they add up to and what needs you, and writes it down.</div></div>
+            <div class="layer"><svg viewBox="0 0 26 26" aria-hidden="true"><circle cx="13" cy="13" r="9" fill="var(--active-soft)" stroke="var(--active)" stroke-width="2"/></svg><div><b>This page</b> comes from your thingy session. On Scan it reads your recent sessions (their titles, journals and last messages, not whole transcripts), works out what they add up to and what needs you, and writes it down.</div></div>
             <div class="layer"><svg viewBox="0 0 26 26" aria-hidden="true"><rect x="5" y="5" width="16" height="16" rx="3" fill="none" stroke="var(--accent)" stroke-width="2"/><path d="M5 12 H21 M12 12 V21" stroke="var(--accent)" stroke-width="2"/></svg><div><b>The page</b> is designed for your work. After the first scan your thingy session designs it to fit what you do; later scans update it in place. It changes the design only when your work no longer fits, and says what changed. <b>Back to the previous look</b> undoes a change.</div></div>
             <div class="layer"><svg viewBox="0 0 26 26" aria-hidden="true"><rect x="8" y="8" width="10" height="10" rx="2" transform="rotate(45 13 13)" fill="var(--accent)"/></svg><div><b>Next steps</b> go to your thingy session, which does them, hands them to the session they came from, or starts a new one. Each step shows its progress here. Hide the ones you do not need with ×.</div></div>
             <div class="layer"><svg viewBox="0 0 26 26" aria-hidden="true"><circle cx="13" cy="13" r="5" fill="var(--active)"/><circle cx="13" cy="13" r="10" fill="none" stroke="var(--active)" stroke-width="1.5" stroke-dasharray="3 3"/></svg><div><b>Live status</b> is optional. Turn it on and this page shows, without asking the agent, which linked sessions are running or need your input.</div></div>
@@ -1241,17 +1241,17 @@ Next up, Done recently, the scan status, Rescan, the look line and the guide are
 not draw them again.
 -->`;
 
-const PLAIN_VIEW = `${WORK_RADAR_VIEW_START}
+const PLAIN_VIEW = `${WHERE_WAS_I_VIEW_START}
 <style id="radar-view-style"></style>
 <script id="radar-view">Radar.view(Radar.plainView);</script>
-${WORK_RADAR_VIEW_END}`;
+${WHERE_WAS_I_VIEW_END}`;
 
-export const WORK_RADAR_HTML = `<!DOCTYPE html>
+export const WHERE_WAS_I_HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="omnigent-template" content="work-radar">
-<title>Work radar</title>
+<meta name="omnigent-template" content="where-was-i">
+<title>Where was I?</title>
 <style id="radar-kit-style">${KIT_STYLE}</style>
 </head>
 <body>
@@ -1264,8 +1264,8 @@ ${PLAIN_VIEW}
 </html>
 `;
 
-export const WORK_RADAR_GUIDE = [
-  "# Work radar",
+export const WHERE_WAS_I_GUIDE = [
+  "# Where was I?",
   "",
   "What the viewer's recent sessions add up to, and what needs them next: built from their own sessions and organized by goal, not by session. It is personal: it summarizes the owner's sessions.",
   "",
@@ -1364,30 +1364,30 @@ export const WORK_RADAR_GUIDE = [
   'People ask the thingy session to change the page ("show my reviews as lanes"), the scan ("scan 7 days by default", "leave out the docs sessions") or how work is grouped. Change the page as Changing the page says and the scan rules in this guide; keep the collections, since a published collection\'s schema cannot change.',
 ].join("\n");
 
-export const WORK_RADAR_REVISION: CreateThingyRevisionRequest = {
-  html: WORK_RADAR_HTML,
+export const WHERE_WAS_I_REVISION: CreateThingyRevisionRequest = {
+  html: WHERE_WAS_I_HTML,
   sdk_version: 1,
   capabilities: ["data.read", "data.write", "sessions.read"],
   collections: {
-    [WORK_RADAR_COLLECTION]: WORK_RADAR_SCHEMA,
-    [WORK_RADAR_LAYOUT_COLLECTION]: WORK_RADAR_LAYOUT_SCHEMA,
-    step_runs: WORK_RADAR_STEP_RUN_SCHEMA,
-    dismissed: WORK_RADAR_DISMISSED_SCHEMA,
-    [WORK_RADAR_REPORTS_COLLECTION]: WORK_RADAR_REPORT_SCHEMA,
+    [WHERE_WAS_I_COLLECTION]: WHERE_WAS_I_SCHEMA,
+    [WHERE_WAS_I_LAYOUT_COLLECTION]: WHERE_WAS_I_LAYOUT_SCHEMA,
+    step_runs: WHERE_WAS_I_STEP_RUN_SCHEMA,
+    dismissed: WHERE_WAS_I_DISMISSED_SCHEMA,
+    [WHERE_WAS_I_REPORTS_COLLECTION]: WHERE_WAS_I_REPORT_SCHEMA,
   },
-  guide: WORK_RADAR_GUIDE,
+  guide: WHERE_WAS_I_GUIDE,
   constraints: [
     {
       name: "one_radar",
       kind: "max_records",
-      collection: WORK_RADAR_COLLECTION,
+      collection: WHERE_WAS_I_COLLECTION,
       max: 1,
       message: "The radar is one record with ID current: replace it instead of creating another.",
     },
     {
       name: "one_layout",
       kind: "max_records",
-      collection: WORK_RADAR_LAYOUT_COLLECTION,
+      collection: WHERE_WAS_I_LAYOUT_COLLECTION,
       max: 1,
       message: "The layout is one record with ID current: replace it instead of creating another.",
     },
