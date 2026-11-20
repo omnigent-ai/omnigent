@@ -6,9 +6,13 @@ import json
 import httpx
 import pytest
 
-from omnigent.llms._responses_to_chat import chat_stream_to_response_events
+from omnigent.llms._responses_to_chat import (
+    chat_stream_to_response_events,
+    responses_input_to_chat_messages,
+)
 from omnigent.llms.adapters.gemini import (
     GeminiAdapter,
+    _build_model_path,
     _chat_to_gemini,
     _convert_tools,
     _extract_usage,
@@ -17,8 +21,14 @@ from omnigent.llms.adapters.gemini import (
     _normalize_finish_reason,
     _translate_part_to_gemini,
 )
-from omnigent.llms.errors import ContextWindowExceededError
-from omnigent.llms.types import FunctionCallOutput
+from omnigent.llms.errors import ContextWindowExceededError, PermanentLLMError
+from omnigent.llms.types import (
+    FunctionCallOutput,
+    MessageOutput,
+    ResponseReasoningStartedEvent,
+    ResponseReasoningTextDeltaEvent,
+    ResponseTextDeltaEvent,
+)
 from omnigent.runtime.llm_retry import classify_llm_error
 
 # ── Request translation ──────────────────────────────────
@@ -626,3 +636,458 @@ def test_streamed_400_overflow_classified_as_context_window_exceeded(
     assert err.actual_tokens == 1194139
     assert err.detail is not None
     assert "input token count" in (err.detail.response_body or "")
+
+
+# ── Gemini 3.x thinking, thoughtSignature & multi-turn tools ──
+
+
+def test_gemini_thought_signature_preserved_non_streaming() -> None:
+    """``thoughtSignature`` on ``functionCall`` parts survives ``_gemini_to_chat``."""
+    resp = {
+        "candidates": [
+            {
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {
+                            "functionCall": {
+                                "id": "fc_native_1",
+                                "name": "get_weather",
+                                "args": {"city": "London"},
+                            },
+                            "thoughtSignature": "sig_turn1_abc",
+                        },
+                        {
+                            "functionCall": {
+                                "name": "get_time",
+                                "args": {"tz": "UTC"},
+                            },
+                        },
+                    ],
+                },
+                "finishReason": "STOP",
+            }
+        ],
+        "usageMetadata": {},
+    }
+    chat = _gemini_to_chat(resp, "gemini-3-pro-preview")
+    tool_calls = chat["choices"][0]["message"]["tool_calls"]
+    assert len(tool_calls) == 2
+    assert tool_calls[0]["id"] == "fc_native_1"
+    assert tool_calls[0]["thoughtSignature"] == "sig_turn1_abc"
+    assert tool_calls[1]["id"].startswith("call_")
+    assert "thoughtSignature" not in tool_calls[1]
+
+
+def test_identical_parallel_function_calls_get_distinct_call_ids() -> None:
+    """Identical parallel ``functionCall`` parts without native ids never share a ``call_id``."""
+    resp = {
+        "candidates": [
+            {
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {"functionCall": {"name": "get_time", "args": {"tz": "UTC"}}},
+                        {"functionCall": {"name": "get_time", "args": {"tz": "UTC"}}},
+                    ],
+                },
+                "finishReason": "STOP",
+            }
+        ],
+        "usageMetadata": {},
+    }
+    chat = _gemini_to_chat(resp, "gemini-3-pro-preview")
+    tool_calls = chat["choices"][0]["message"]["tool_calls"]
+    assert len(tool_calls) == 2
+    assert tool_calls[0]["id"] != tool_calls[1]["id"]
+    assert tool_calls[0]["id"].startswith("call_")
+    assert tool_calls[1]["id"].startswith("call_")
+
+
+def test_empty_and_none_text_parts_ignored_and_do_not_shadow_function_call() -> None:
+    """Empty/None text parts neither corrupt ``content`` nor shadow ``functionCall``."""
+    resp = {
+        "candidates": [
+            {
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {"text": "Hello"},
+                        {"text": "", "thoughtSignature": "sig_trailing"},
+                        {"text": None},
+                        {
+                            "text": "",
+                            "functionCall": {"name": "ping", "args": {}},
+                            "thoughtSignature": "sig_fc",
+                        },
+                    ],
+                },
+                "finishReason": "STOP",
+            }
+        ],
+        "usageMetadata": {},
+    }
+    chat = _gemini_to_chat(resp, "gemini-3-pro-preview")
+    msg = chat["choices"][0]["message"]
+    assert msg["content"] == "Hello"
+    assert len(msg["tool_calls"]) == 1
+    assert msg["tool_calls"][0]["function"]["name"] == "ping"
+    assert msg["tool_calls"][0]["thoughtSignature"] == "sig_fc"
+
+    # Streaming skips empty/None text chunks and still emits functionCall.
+    chunks = list(_gemini_stream_chunk_to_chat(resp))
+    deltas = [c["choices"][0]["delta"] for c in chunks if c["choices"][0]["delta"]]
+    assert deltas[0] == {"content": "Hello"}
+    assert len(deltas) == 2
+    assert deltas[1]["tool_calls"][0]["function"]["name"] == "ping"
+
+
+def test_gemini_thought_signature_reattached_on_request() -> None:
+    """Outgoing ``functionCall`` parts echo ``thoughtSignature`` from native or compat fields."""
+    messages = [
+        {"role": "user", "content": "Check London weather and UTC time"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": '{"city": "London"}'},
+                    "thoughtSignature": "sig_direct",
+                },
+                {
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {"name": "get_time", "arguments": '{"tz": "UTC"}'},
+                    "extra_content": {"google": {"thought_signature": "sig_compat"}},
+                },
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "Rainy, 15C"},
+        {"role": "tool", "tool_call_id": "call_2", "content": "14:00 UTC"},
+        {"role": "user", "content": "Thanks!"},
+    ]
+    payload = _chat_to_gemini(messages, None, {}, model="gemini-3-pro-preview")
+
+    # Model turn carries both signatures verbatim on their respective parts.
+    model_parts = payload["contents"][1]["parts"]
+    assert model_parts[0]["thoughtSignature"] == "sig_direct"
+    assert model_parts[1]["thoughtSignature"] == "sig_compat"
+
+    # Parallel tool responses are merged into one user turn with resolved function names.
+    tool_turn = payload["contents"][2]
+    assert tool_turn["role"] == "user"
+    assert tool_turn["parts"] == [
+        {"functionResponse": {"name": "get_weather", "response": {"result": "Rainy, 15C"}}},
+        {"functionResponse": {"name": "get_time", "response": {"result": "14:00 UTC"}}},
+    ]
+
+    # Subsequent regular user message stays a separate user turn.
+    assert payload["contents"][3] == {"role": "user", "parts": [{"text": "Thanks!"}]}
+
+
+def test_gemini_thought_parts_separated_non_streaming() -> None:
+    """``thought: true`` parts go to ``reasoning_content`` and never leak into ``content``."""
+    resp = {
+        "candidates": [
+            {
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {"text": "Let me reason carefully.", "thought": True},
+                        {"text": "", "thought": True},
+                        {"text": '{"action": "allow"}'},
+                    ],
+                },
+                "finishReason": "STOP",
+            }
+        ],
+        "usageMetadata": {},
+    }
+    chat = _gemini_to_chat(resp, "gemini-3-pro-preview")
+    msg = chat["choices"][0]["message"]
+    assert msg["content"] == '{"action": "allow"}'
+    assert msg["reasoning_content"] == "Let me reason carefully."
+
+
+@pytest.mark.asyncio
+async def test_gemini_stream_thought_parts_and_signed_function_call() -> None:
+    """Streamed thought parts emit reasoning events and signed tool calls survive accumulation."""
+    frames = [
+        {
+            "candidates": [
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": [
+                            {"text": "Step 1: check weather.", "thought": True},
+                            {"text": "", "thought": True},
+                        ],
+                    }
+                }
+            ]
+        },
+        {
+            "candidates": [
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": [
+                            {"text": "Checking now."},
+                            {
+                                "functionCall": {
+                                    "name": "get_weather",
+                                    "args": {"city": "Tokyo"},
+                                },
+                                "thoughtSignature": "sig_stream_xyz",
+                            },
+                        ],
+                    },
+                    "finishReason": "STOP",
+                }
+            ]
+        },
+    ]
+
+    async def _chunks():
+        for frame in frames:
+            for chunk in _gemini_stream_chunk_to_chat(frame):
+                yield chunk
+
+    events = [
+        e async for e in chat_stream_to_response_events(_chunks(), model="gemini-3-pro-preview")
+    ]
+    reasoning_started = [e for e in events if isinstance(e, ResponseReasoningStartedEvent)]
+    reasoning_deltas = [e for e in events if isinstance(e, ResponseReasoningTextDeltaEvent)]
+    text_deltas = [e for e in events if isinstance(e, ResponseTextDeltaEvent)]
+
+    assert len(reasoning_started) == 1
+    assert [e.delta for e in reasoning_deltas] == ["Step 1: check weather."]
+    assert [e.delta for e in text_deltas] == ["Checking now."]
+
+    response = events[-1].response
+    messages = [o for o in response.output if isinstance(o, MessageOutput)]
+    calls = [o for o in response.output if isinstance(o, FunctionCallOutput)]
+    assert len(messages) == 1
+    assert messages[0].content[0].text == "Checking now."
+    assert len(calls) == 1
+    assert calls[0].name == "get_weather"
+    assert calls[0].thought_signature == "sig_stream_xyz"
+
+    # Full round-trip back into a Gemini turn-2 request payload.
+    turn2_items = [
+        {"role": "user", "content": "Weather in Tokyo?"},
+        {
+            "type": "function_call",
+            "call_id": calls[0].call_id,
+            "name": calls[0].name,
+            "arguments": calls[0].arguments,
+            "thought_signature": calls[0].thought_signature,
+        },
+        {
+            "type": "function_call_output",
+            "call_id": calls[0].call_id,
+            "output": "Sunny, 24C",
+        },
+    ]
+    chat_messages = responses_input_to_chat_messages(turn2_items, None)
+    payload = _chat_to_gemini(chat_messages, None, {}, model="gemini-3-pro-preview")
+    assert payload["contents"][1]["parts"][0]["thoughtSignature"] == "sig_stream_xyz"
+    assert payload["contents"][2]["parts"][0]["functionResponse"]["name"] == "get_weather"
+
+
+def test_stream_request_multi_frame_parallel_tool_calls_keep_distinct_indices(
+    serve_streamed_response,
+) -> None:
+    """Parallel ``functionCall`` parts arriving in separate SSE frames get distinct indices."""
+    frame1 = json.dumps(
+        {
+            "candidates": [
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": [
+                            {
+                                "functionCall": {"name": "get_weather", "args": {"city": "Paris"}},
+                                "thoughtSignature": "sig_first",
+                            }
+                        ],
+                    }
+                }
+            ]
+        }
+    )
+    frame2 = json.dumps(
+        {
+            "candidates": [
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": [
+                            {
+                                "functionCall": {"name": "get_time", "args": {"tz": "CET"}},
+                            }
+                        ],
+                    },
+                    "finishReason": "STOP",
+                }
+            ]
+        }
+    )
+    sse_body = f"data: {frame1}\n\ndata: {frame2}\n\n".encode()
+    serve_streamed_response(200, sse_body)
+
+    adapter = GeminiAdapter()
+
+    async def _collect():
+        gen = adapter._stream_request(
+            "https://fake-host/v1beta/models/gemini-3-pro-preview:streamGenerateContent?alt=sse",
+            {},
+            {"contents": []},
+        )
+        return [e async for e in chat_stream_to_response_events(gen, model="gemini-3-pro-preview")]
+
+    events = asyncio.run(_collect())
+    calls = [o for o in events[-1].response.output if isinstance(o, FunctionCallOutput)]
+    assert len(calls) == 2
+    assert calls[0].name == "get_weather"
+    assert calls[0].thought_signature == "sig_first"
+    assert calls[1].name == "get_time"
+    assert calls[1].thought_signature is None
+
+
+@pytest.mark.parametrize(
+    ("model", "effort", "expected_config"),
+    [
+        (
+            "gemini-3-pro-preview",
+            "high",
+            {"thinkingLevel": "HIGH", "includeThoughts": True},
+        ),
+        (
+            "gemini-3.5-flash",
+            "low",
+            {"thinkingLevel": "LOW", "includeThoughts": True},
+        ),
+        (
+            "gemini-4-pro",
+            "medium",
+            {"thinkingLevel": "MEDIUM", "includeThoughts": True},
+        ),
+        (
+            "gemini-2.5-pro",
+            "high",
+            {"thinkingBudget": 24576, "includeThoughts": True},
+        ),
+        (
+            "gemini-2.5-flash",
+            "low",
+            {"thinkingBudget": 1024, "includeThoughts": True},
+        ),
+        (
+            "gemini-2.5-flash-lite",
+            "medium",
+            {"thinkingBudget": 8192, "includeThoughts": True},
+        ),
+    ],
+)
+def test_reasoning_effort_translates_to_thinking_config(
+    model: str,
+    effort: str,
+    expected_config: dict[str, object],
+) -> None:
+    """``reasoning_effort`` maps to ``thinkingLevel`` on Gemini 3+ and budget on 2.5."""
+    payload = _chat_to_gemini(
+        [{"role": "user", "content": "Solve this"}],
+        None,
+        {"reasoning_effort": effort},
+        model=model,
+    )
+    assert payload["generationConfig"]["thinkingConfig"] == expected_config
+
+
+def test_reasoning_effort_none_omits_thinking_config() -> None:
+    """A ``None`` or empty ``reasoning_effort`` leaves ``thinkingConfig`` unset."""
+    payload = _chat_to_gemini(
+        [{"role": "user", "content": "Hi"}],
+        None,
+        {"reasoning_effort": None},
+        model="gemini-3-pro-preview",
+    )
+    assert "generationConfig" not in payload
+
+
+@pytest.mark.parametrize("bad_effort", ["xhigh", "minimal", "bogus", 0, False])
+def test_invalid_reasoning_effort_raises_permanent_llm_error(bad_effort: object) -> None:
+    """Unsupported effort levels fail fast with ``PermanentLLMError``."""
+    with pytest.raises(PermanentLLMError) as exc_info:
+        _chat_to_gemini(
+            [{"role": "user", "content": "Hi"}],
+            None,
+            {"reasoning_effort": bad_effort},
+            model="gemini-3-pro-preview",
+        )
+    assert exc_info.value.code == "unsupported_reasoning_effort"
+
+
+@pytest.mark.parametrize("legacy_model", ["gemini-1.5-pro", "gemini-2.0-flash"])
+def test_non_thinking_legacy_model_rejects_reasoning_effort(legacy_model: str) -> None:
+    """Gemini <2.5 non-thinking models fail fast when ``reasoning_effort`` is requested."""
+    with pytest.raises(PermanentLLMError) as exc_info:
+        _chat_to_gemini(
+            [{"role": "user", "content": "Hi"}],
+            None,
+            {"reasoning_effort": "high"},
+            model=legacy_model,
+        )
+    assert exc_info.value.code == "unsupported_reasoning_effort"
+
+
+def test_gemini_25_thinking_budget_clamps_to_max_tokens() -> None:
+    """Gemini 2.5 ``thinkingBudget`` does not exceed caller's ``max_tokens``."""
+    payload = _chat_to_gemini(
+        [{"role": "user", "content": "Hi"}],
+        None,
+        {"reasoning_effort": "high", "max_tokens": 2048},
+        model="gemini-2.5-pro",
+    )
+    assert payload["generationConfig"]["maxOutputTokens"] == 2048
+    assert payload["generationConfig"]["thinkingConfig"] == {
+        "thinkingBudget": 2048,
+        "includeThoughts": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("endpoint_base", "model", "expected"),
+    [
+        (
+            "https://generativelanguage.googleapis.com/v1beta",
+            "gemini-3-pro-preview",
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-preview",
+        ),
+        (
+            "https://aiplatform.googleapis.com/v1/projects/p/locations/global/publishers/google/models",
+            "gemini-3-pro-preview",
+            "https://aiplatform.googleapis.com/v1/projects/p/locations/global/publishers/google/models/gemini-3-pro-preview",
+        ),
+        (
+            "https://generativelanguage.googleapis.com/v1beta/",
+            "models/gemini-2.5-pro",
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro",
+        ),
+        (
+            "https://generativelanguage.googleapis.com/v1beta/",
+            "/models/gemini-3-pro-preview",
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-preview",
+        ),
+    ],
+)
+def test_build_model_path_avoids_duplicate_models_segment(
+    endpoint_base: str,
+    model: str,
+    expected: str,
+) -> None:
+    """``_build_model_path`` handles both AI Studio and Vertex ``/models`` base URLs."""
+    assert _build_model_path(endpoint_base, model) == expected

@@ -9,7 +9,7 @@ Responses API format that the public ``Client`` exposes.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from typing import Any
 
 from omnigent.llms.types import (
@@ -30,6 +30,28 @@ from omnigent.llms.types import (
 
 # Block types that carry plain text in a ``text`` field.
 _TEXT_BLOCK_TYPES = {"input_text", "output_text", "text"}
+
+
+def extract_thought_signature(payload: Mapping[str, Any]) -> str | None:
+    """Extract a Gemini ``thoughtSignature`` from a part, tool call, or input item.
+
+    Accepts native Gemini camelCase (``thoughtSignature``), snake_case
+    (``thought_signature``), and OpenAI-compatible nested
+    ``extra_content.google.thought_signature`` shapes.
+    """
+    for key in ("thoughtSignature", "thought_signature"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    extra = payload.get("extra_content")
+    if isinstance(extra, Mapping):
+        google = extra.get("google")
+        if isinstance(google, Mapping):
+            for key in ("thought_signature", "thoughtSignature"):
+                value = google.get(key)
+                if isinstance(value, str) and value:
+                    return value
+    return None
 
 
 def _translate_content(
@@ -140,16 +162,17 @@ def responses_input_to_chat_messages(
         item_type = item.get("type")
 
         if item_type == "function_call":
-            pending_tool_calls.append(
-                {
-                    "id": item["call_id"],
-                    "type": "function",
-                    "function": {
-                        "name": item["name"],
-                        "arguments": item["arguments"],
-                    },
-                }
-            )
+            tool_call: dict[str, Any] = {
+                "id": item["call_id"],
+                "type": "function",
+                "function": {
+                    "name": item["name"],
+                    "arguments": item["arguments"],
+                },
+            }
+            if thought_signature := extract_thought_signature(item):
+                tool_call["thoughtSignature"] = thought_signature
+            pending_tool_calls.append(tool_call)
             continue
 
         # Flush any pending tool calls into an assistant message
@@ -233,6 +256,7 @@ def chat_response_to_response(
                 call_id=tc["id"],
                 name=func["name"],
                 arguments=func["arguments"],
+                thought_signature=extract_thought_signature(tc),
             )
         )
 
@@ -337,7 +361,7 @@ async def chat_stream_to_response_events(
         e.g. ``"kimi-k2-instruct"``.
     """
     accumulated_text = ""
-    # tool_calls_by_index: {index: {"id": ..., "name": ..., "arguments": ...}}
+    # tool_calls_by_index: {index: {"id", "name", "arguments", "thought_signature"}}
     tool_calls_by_index: dict[int, dict[str, str]] = {}
     usage_dict: dict[str, Any] | None = None
     # Tracks whether a reasoning.started event has been emitted for the
@@ -392,10 +416,13 @@ async def chat_stream_to_response_events(
                     "id": "",
                     "name": "",
                     "arguments": "",
+                    "thought_signature": "",
                 }
             entry = tool_calls_by_index[idx]
             if tc_id := tc_delta.get("id"):
                 entry["id"] = tc_id
+            if thought_signature := extract_thought_signature(tc_delta):
+                entry["thought_signature"] = thought_signature
             if func := tc_delta.get("function"):
                 if name := func.get("name"):
                     entry["name"] = name
@@ -417,6 +444,7 @@ async def chat_stream_to_response_events(
                 call_id=tc["id"],
                 name=tc["name"],
                 arguments=tc["arguments"],
+                thought_signature=tc["thought_signature"] or None,
             )
         )
 
