@@ -355,7 +355,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
       // Text typed or pasted back to a restore point's value is literal now, so that point is stale.
       // An undo chain that later reaches the original deletion restores plain text, not the tag.
       for (const [token, point] of restorePoints) {
-        if (point.value === after) restorePoints.delete(token);
+        if (point.input === input && point.value === after) restorePoints.delete(token);
       }
     }
     // A change that removes an active tag's token records where it was removed from. An undo's
