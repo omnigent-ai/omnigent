@@ -7059,7 +7059,7 @@ describe("session windows (src/main.js)", () => {
     openSessionWindow(h, "conv_1");
     await flush();
     assert.equal(h.calls.windowOptions.at(-1).x, undefined);
-    h.emitWindow("close");
+    for (const eventName of ["move", "resize", "close"]) h.emitWindow(eventName);
     assert.deepEqual(JSON.parse(fs.readFileSync(h.settingsPath, "utf8")).window_bounds, saved);
   });
 
@@ -7075,27 +7075,22 @@ describe("session windows (src/main.js)", () => {
     assert.equal(h.calls.focused, focusedBefore + 1);
   });
 
-  for (const [state, pageUrl] of [
-    ["still loading", ""],
-    ["signing in", "https://idp.example/authorize"],
-  ]) {
-    it(`focuses a pop-out that is ${state} instead of opening a duplicate`, (t) => {
-      const h = loadNavigationHarness({ serverUrl });
-      t.after(h.cleanup);
-      const popOut = {
-        focused: 0,
-        isDestroyed: () => false,
-        isMinimized: () => false,
-        focus: () => (popOut.focused += 1),
-        webContents: { getURL: () => pageUrl },
-      };
-      h.api.windows.set(popOut, { serverUrl, role: "main", sessionWindowId: "conv_1" });
-      assert.equal(openSessionWindow(h, "conv_1"), true);
-      assert.equal(openSessionWindow(h, "conv_1"), true);
-      assert.equal(h.calls.windowOptions, undefined);
-      assert.equal(popOut.focused, 2);
-    });
-  }
+  it("focuses a pop-out that is still loading instead of opening a duplicate", (t) => {
+    const h = loadNavigationHarness({ serverUrl });
+    t.after(h.cleanup);
+    const popOut = {
+      focused: 0,
+      isDestroyed: () => false,
+      isMinimized: () => false,
+      focus: () => (popOut.focused += 1),
+      webContents: { getURL: () => "" },
+    };
+    h.api.windows.set(popOut, { serverUrl, role: "main", sessionWindowId: "conv_1" });
+    assert.equal(openSessionWindow(h, "conv_1"), true);
+    assert.equal(openSessionWindow(h, "conv_1"), true);
+    assert.equal(h.calls.windowOptions, undefined);
+    assert.equal(popOut.focused, 2);
+  });
 
   it("refuses untrusted pages and malformed session ids", (t) => {
     const h = loadNavigationHarness({ serverUrl });

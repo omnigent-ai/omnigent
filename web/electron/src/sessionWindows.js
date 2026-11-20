@@ -44,8 +44,9 @@ function withoutSessionWindowQuery(pageUrl) {
 }
 
 /**
- * Whether a pop-out has left `sessionId` for another page on its server. A window still
- * loading (blank URL) or signing in (identity provider's URL) has not left it.
+ * Whether a pop-out has left `sessionId`: for another page on its server, or for a bundled
+ * page such as the connect-failure screen. A window still loading (blank) or signing in
+ * (on the identity provider's site) has not left it.
  *
  * @param {string} pageUrl
  * @param {string} serverUrl
@@ -53,13 +54,17 @@ function withoutSessionWindowQuery(pageUrl) {
  * @returns {boolean}
  */
 function leftSession(pageUrl, serverUrl, sessionId) {
+  if (pageUrl === "" || pageUrl === "about:blank") return false;
   let page;
+  let server;
   try {
     page = new URL(pageUrl);
-    if (page.origin !== new URL(serverUrl).origin) return false;
+    server = new URL(serverUrl);
   } catch {
-    return false;
+    return true;
   }
+  if (page.protocol !== "https:" && page.protocol !== "http:") return true;
+  if (page.origin !== server.origin) return false;
   return !page.pathname.replace(/\/+$/, "").endsWith(`/c/${sessionId}`);
 }
 
