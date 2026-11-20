@@ -98,6 +98,8 @@ async def resolve_project_session_create(
     if (
         managed
         and "sandbox_provider" not in fields_set
+        # A chosen profile resolves under the server default when no provider is sent.
+        and getattr(body, "sandbox_profile_id", None) is None
         and isinstance(saved_provider, str)
         and saved_provider in launchable_sandbox_providers
     ):
