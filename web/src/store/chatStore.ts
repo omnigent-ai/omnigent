@@ -2111,8 +2111,19 @@ export const ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS = SESSION_READ_TIMEOUT_M
 export const SEND_STILL_SENDING_AFTER_MS = 10_000;
 // A send still pending after this fails, so its draft comes back for a retry.
 export const SEND_UNANSWERED_AFTER_MS = SEND_CHAIN_MAX_WAIT_MS;
+const SEND_UNANSWERED_TITLE = "Message not confirmed";
 const SEND_UNANSWERED_MESSAGE =
   "The server didn't answer, so this may have reached the agent. If it doesn't appear, send it again.";
+
+/** A send given up on with its POST still open; `delivered` when its bubble already committed. */
+class UnansweredSendError extends Error {
+  readonly delivered: boolean;
+  constructor(delivered: boolean) {
+    super(SEND_UNANSWERED_MESSAGE);
+    this.name = "UnansweredSendError";
+    this.delivered = delivered;
+  }
+}
 // After the stream reconnects, `reconcileActiveSessionStatus` runs once
 // immediately — but a server that just restarted may not have reprocessed the
 // in-flight turn's completion yet, so that read can see a stale "running" and
@@ -3209,6 +3220,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       queryClient?.invalidateQueries({ queryKey: ["conversations"] });
     } catch (err) {
       if (initialDraft && !initialDispatched && !initialSendPending()) return;
+      // Its commit already replaced the bubble, and the turn it started settles itself.
+      if (err instanceof UnansweredSendError && err.delivered) return;
+      const unanswered = err instanceof UnansweredSendError;
       const { message, code } = describeSendFailure(err);
       if (opts?.external && !posting) {
         // Never posted (held back, or its upload failed or was stopped): drop only this
@@ -3257,7 +3271,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       }
       const callerHandlesError = heldForHost || opts?.onError !== undefined;
       // An external send hears of the failure below, once it's known.
-      if (!heldForHost && !opts?.external) opts?.onError?.(message);
+      // `refused: false` tells the caller an unanswered send may still arrive.
+      if (!heldForHost && !opts?.external) {
+        if (unanswered) opts?.onError?.(message, false);
+        else opts?.onError?.(message);
+      }
       // Hand the failed message back to the composer so the user can retry it —
       // a failed send has no server-side record, so nothing else would restore
       // it. Keyed by the session it was meant for, so it lands in the right
@@ -3369,11 +3387,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         ? null
         : {
             ...makeClientErrorBlock(message, code),
+            ...(unanswered ? { title: SEND_UNANSWERED_TITLE } : {}),
             ...(serverRefused
               ? {}
               : { unansweredSend: { stableId, ...(sentText ? { text: sentText } : {}) } }),
           };
-      if (!alreadyStreaming) {
+      if (unanswered) {
+        settleUnansweredSend(failSet, callerHandlesError ? null : failureCard, !alreadyStreaming);
+      } else if (!alreadyStreaming) {
         if (failGet().activeResponse !== null) {
           // A response bubble already exists (the turn started, then failed)
           // — mark it failed so the error rides on that bubble.
@@ -3526,6 +3547,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       }
       queryClient?.invalidateQueries({ queryKey: ["conversations"] });
     } catch (err) {
+      if (err instanceof UnansweredSendError && err.delivered) return;
       const message = err instanceof Error ? err.message : String(err);
       // Settle the conversation this command targeted, wherever the user is
       // now: its echo must roll back and its status must not stay "streaming"
@@ -3539,7 +3561,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       failSet((s) => ({
         pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
       }));
-      if (!alreadyStreaming) {
+      if (err instanceof UnansweredSendError) {
+        const card = { ...makeClientErrorBlock(message, ""), title: SEND_UNANSWERED_TITLE };
+        settleUnansweredSend(failSet, card, !alreadyStreaming);
+      } else if (!alreadyStreaming) {
         finalizeActive(failSet, "failed", message, null);
         failSet({ status: "idle" });
       } else {
@@ -4311,8 +4336,8 @@ export function sendableQueuedHead(
 }
 
 /**
- * Await a send's POST, marking its pending bubble once slow; fail it if still pending after
- * {@link SEND_UNANSWERED_AFTER_MS}, unless the session's row shows a turn running.
+ * Await a send's POST, marking its pending bubble once slow; stop waiting after
+ * {@link SEND_UNANSWERED_AFTER_MS} with an {@link UnansweredSendError}, deferred while a turn runs.
  */
 async function withStillSendingMark<T>(
   sessionId: string,
@@ -4333,15 +4358,17 @@ async function withStillSendingMark<T>(
       post(),
       new Promise<never>((_resolve, reject) => {
         const giveUp = (): void => {
-          // A bubble its commit already replaced was delivered: its turn may be running.
-          const pending = setterForState(sessionId)?.pendingUserMessages.some(
-            (p) => p.tempId === tempId && p.posted !== true,
-          );
-          if (!pending) return;
-          if (cachedConversationStatus(sessionId) === "running") {
+          const state = setterForState(sessionId);
+          // A bubble its commit already replaced was delivered.
+          const delivered = !state?.pendingUserMessages.some((p) => p.tempId === tempId);
+          const running =
+            cachedConversationStatus(sessionId) === "running" ||
+            state?.sessionStatus === "running" ||
+            state?.activeResponse?.state === "streaming";
+          if (!delivered && running) {
             unanswered = setTimeout(giveUp, SEND_STILL_SENDING_AFTER_MS);
           } else {
-            reject(new Error(SEND_UNANSWERED_MESSAGE));
+            reject(new UnansweredSendError(delivered));
           }
         };
         unanswered = setTimeout(giveUp, SEND_UNANSWERED_AFTER_MS);
@@ -4351,6 +4378,19 @@ async function withStillSendingMark<T>(
     clearTimeout(timer);
     clearTimeout(unanswered);
   }
+}
+
+/**
+ * Settle a send given up on unanswered: show its card, and end its own latch unless a turn
+ * started since, which its own events settle.
+ */
+function settleUnansweredSend(set: Setter, card: ErrorBlock | null, ownsLatch: boolean): void {
+  set((s) => ({
+    ...(card === null ? {} : { blocks: [...s.blocks, card] }),
+    ...(ownsLatch && s.sessionStatus !== "running" && s.activeResponse?.state !== "streaming"
+      ? { status: "idle" as const, sendLatchedAt: null, sendLatchSeenRunning: null }
+      : {}),
+  }));
 }
 
 /**
@@ -4396,7 +4436,7 @@ function queuedSendOptions(
     replyDraft: message.replyDraft,
     stableId,
     pinnedConversationId: message.conversationId,
-    onError: (error) => {
+    onError: (error, refused) => {
       setActive((s) => {
         if (s.queuedMessages.some((m) => m.queueId === message.queueId)) return {};
         // Keep failed sends in batch order, ahead of newly queued messages.
@@ -4415,9 +4455,25 @@ function queuedSendOptions(
           ],
         };
       });
-      setterFor(message.conversationId)((s) => ({
-        blocks: [...s.blocks, makeClientErrorBlock(error, "")],
-      }));
+      // One that may still arrive names its send, so the commit retracts the card and retry.
+      setterFor(message.conversationId)((s) => {
+        const text = s.isNativeTerminalSession
+          ? messageContentText([{ type: "input_text", text: message.text }])
+          : "";
+        const card = makeClientErrorBlock(error, "");
+        return {
+          blocks: [
+            ...s.blocks,
+            refused === false
+              ? {
+                  ...card,
+                  title: SEND_UNANSWERED_TITLE,
+                  unansweredSend: { stableId, ...(text ? { text } : {}) },
+                }
+              : card,
+          ],
+        };
+      });
     },
   };
 }
@@ -6606,6 +6662,7 @@ async function rehydrateWindowOnReconnect(
       // Same persisted-item evidence as the reconnect path: a rehydrated item
       // can be a send whose POST died in the gap.
       ...reconcileSendDraftWithSnapshot(s, freshItemIds, session),
+      ...withoutDeliveredQueuedRetries(s, s.blocks, currentBlocks),
       blocks:
         snapshotCompactionSpinners(blocks, s.activeResponse, statusPatch.activeResponse) ?? blocks,
       hasMoreHistory: fresh.hasMore,
@@ -6807,12 +6864,14 @@ async function reconcileOnReconnect(
       nextBlocks =
         at >= 0 ? [...kept.slice(0, at), ...unseen, ...kept.slice(at)] : [...kept, ...unseen];
     }
+    const undelivered = nextBlocks;
     nextBlocks = withoutDeliveredSendFailureCards(
       nextBlocks,
       snapshotItemIds,
       committedUserTextsOf(unseen),
       session,
     );
+    Object.assign(patch, withoutDeliveredQueuedRetries(s, undelivered, nextBlocks));
     // Recover elicitation state the dead socket swallowed: gap-fired
     // prompts, gap-resolved cards, and re-parked prompts whose card
     // was auto-cleared. Items can't resupply these (elicitations are
@@ -8630,6 +8689,34 @@ function withoutDeliveredSendFailureCards(
 }
 
 /**
+ * Drop the queued retries of sends whose unanswered cards `after` no longer holds: a
+ * commit retracted them, so those sends were delivered after all.
+ *
+ * @returns The queue patch, empty when no retry is dropped.
+ */
+function withoutDeliveredQueuedRetries(
+  s: ChatState,
+  before: AnyBlock[],
+  after: AnyBlock[],
+): Partial<ChatState> {
+  if (after === before) return {};
+  const unansweredIds = (blocks: AnyBlock[]): string[] =>
+    blocks.flatMap((b) =>
+      b.type === "error" && b.unansweredSend ? [b.unansweredSend.stableId] : [],
+    );
+  const kept = new Set(unansweredIds(after));
+  const delivered = new Set(unansweredIds(before).filter((id) => !kept.has(id)));
+  const queuedMessages = s.queuedMessages.filter(
+    (m) =>
+      !m.requiresRetry ||
+      m.conversationId !== s.conversationId ||
+      m.stableId === undefined ||
+      !delivered.has(m.stableId),
+  );
+  return queuedMessages.length === s.queuedMessages.length ? {} : { queuedMessages };
+}
+
+/**
  * Build the committed user-message content from a consumed event,
  * preserving optimistic file blocks the native transcript drops.
  *
@@ -9563,6 +9650,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         );
         return {
           ...retractDeliveredSendDraft(s, committedIds, "consumed"),
+          ...withoutDeliveredQueuedRetries(s, s.blocks, blocks),
           ...(blocks === s.blocks ? {} : { blocks }),
         };
       });
