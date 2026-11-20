@@ -13,7 +13,7 @@ import type * as UseSidebarDataModule from "@/hooks/useSidebarData";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
-import { useChatStore } from "@/store/chatStore";
+import { handleSessionEvent, useChatStore } from "@/store/chatStore";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 
@@ -902,6 +902,32 @@ describe("Composer @-session mentions", () => {
       expect(onSend.mock.calls[0]![0]).toBe(
         `Ask [Session: "Alpha planning" id=s_alpha subagent=no] to review today\n\n${SESSION_MENTION_HINT}`,
       );
+    });
+
+    it("forgets a retracted restore's tags, so the next draft tags a same-title session plainly", () => {
+      renderWithTooltips(<Composer {...composerProps()} />);
+      const stableId = "9".repeat(32);
+      const failed = `Ask [Session: "Alpha planning" id=s_other subagent=no] to review\n\n${SESSION_MENTION_HINT}`;
+      act(() =>
+        useChatStore.setState({
+          failedSendDraft: { conversationId: currentId, text: failed, files: [], stableId },
+        }),
+      );
+      expect(tokens()).toEqual(["@Alpha planning"]);
+      // The send was delivered after all, so the untouched restored draft is retracted.
+      act(() =>
+        handleSessionEvent({
+          type: "session_input_consumed",
+          itemId: stableId,
+          itemType: "message",
+          data: { role: "user", content: [{ type: "input_text", text: failed }] },
+        }),
+      );
+      expect(textarea().value).toBe("");
+
+      type("@alpha");
+      fireEvent.click(screen.getByTitle("Tag session Alpha planning"));
+      expect(tokens()).toEqual(["@Alpha planning"]);
     });
 
     it("merges a failed send into newer input without retargeting either tag", () => {
