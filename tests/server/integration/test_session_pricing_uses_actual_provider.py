@@ -119,10 +119,6 @@ async def test_named_provider_session_priced_at_named_rate_not_default(
 ) -> None:
     """A session launched with a named, non-default provider is priced at the
     named provider's custom rate — not the harness default provider's rate.
-
-    Reproduces the relay accounting path resolves pricing via
-    ``default_provider_for_harness()``, so it charges the DEFAULT provider's
-    rate for a session actually served by a different named provider.
     """
     from omnigent.server.routes import sessions as sessions_routes
 
@@ -432,9 +428,7 @@ def test_resolve_session_provider_entry_warns_once_for_unconfigured_name(
     monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
     from omnigent.db.workspace_cache import WorkspaceScopedSet
 
-    monkeypatch.setattr(
-        orchestration, "_WARNED_PRICING_LOOKUPS", WorkspaceScopedSet()
-    )
+    monkeypatch.setattr(orchestration, "_WARNED_PRICING_LOOKUPS", WorkspaceScopedSet())
 
     conv = SimpleNamespace(id="s-missing", agent_id="a-missing", sub_agent_name=None)
     with caplog.at_level(logging.WARNING):

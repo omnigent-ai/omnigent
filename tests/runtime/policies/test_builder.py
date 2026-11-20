@@ -363,7 +363,7 @@ llm:
                 "kind": "local",
                 "default": True,
                 "anthropic": {
-                    "base_url": "http://cheap.local/v1",
+                    "base_url": "https://cheap.example/v1",
                     "api_key": "test",
                     "pricing": {"input_per_million": 1.0, "output_per_million": 2.0},
                 },
@@ -371,7 +371,7 @@ llm:
             "expensive-named": {
                 "kind": "local",
                 "anthropic": {
-                    "base_url": "http://expensive.local/v1",
+                    "base_url": "https://expensive.example/v1",
                     "api_key": "test",
                     "pricing": {"input_per_million": 10.0, "output_per_million": 20.0},
                 },
@@ -433,7 +433,7 @@ def test_build_subagent_prices_on_its_own_named_provider(
                 "kind": "local",
                 "default": True,
                 "anthropic": {
-                    "base_url": "http://cheap.local/v1",
+                    "base_url": "https://cheap.example/v1",
                     "api_key": "test",
                     "pricing": {"input_per_million": 1.0, "output_per_million": 2.0},
                 },
@@ -441,7 +441,7 @@ def test_build_subagent_prices_on_its_own_named_provider(
             "expensive-named": {
                 "kind": "local",
                 "anthropic": {
-                    "base_url": "http://expensive.local/v1",
+                    "base_url": "https://expensive.example/v1",
                     "api_key": "test",
                     "pricing": {"input_per_million": 10.0, "output_per_million": 20.0},
                 },

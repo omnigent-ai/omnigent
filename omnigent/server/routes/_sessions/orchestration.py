@@ -1910,8 +1910,14 @@ def _resolve_session_provider_entry(
     cache and returns the named entry when the auth is a ProviderAuth, else
     None so the caller falls back to the default-provider lookup.
 
-    Errors are silenced and return None so a broken spec never breaks cost
-    accounting — the caller falls back to catalog or default-provider pricing.
+    A failed lookup returns None with a warning, so it never breaks cost
+    accounting; the caller then falls back to catalog or default-provider pricing.
+
+    Known limitation: the provider is read from the agent's current bundle, not
+    the identity captured at launch. Republishing an agent with a different
+    named provider while one of its sessions is running can misattribute that
+    session's cost until the session restarts. Persisting the launch identity
+    needs an additive column, tracked as a follow-up in a separate schema PR.
     """
     if conv is None or not getattr(conv, "agent_id", None):
         return None
@@ -1922,6 +1928,9 @@ def _resolve_session_provider_entry(
         from omnigent.runtime import get_agent_cache, get_agent_store
         from omnigent.spec.types import ProviderAuth
 
+        # Bundle-resolution site: this reads the agent's CURRENT bundle (see the
+        # known limitation in the docstring), not the provider the live process
+        # launched with.
         agent = get_agent_store().get(conv.agent_id)
         if agent is None:
             return None
