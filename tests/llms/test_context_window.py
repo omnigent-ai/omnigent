@@ -422,3 +422,38 @@ def test_get_model_context_window_encoded_and_offline_fallback(
     assert get_model_context_window("claude-opus-4-8[1m]") == 1_000_000
     assert get_model_context_window("anthropic/claude-opus-4-8[1m]") == 1_000_000
     assert get_model_context_window("uncatalogued-model") == 128_000
+
+
+def test_find_model_context_window_uses_live_gemini_metadata_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Uncatalogued Gemini models resolve their live ``inputTokenLimit`` from cache."""
+    from omnigent.llms.gemini_model_metadata import (
+        _clear_model_metadata_cache,
+        record_gemini_model_metadata,
+    )
+    from omnigent.models.model_metadata import ModelMetadata
+
+    _clear_model_metadata_cache()
+    try:
+        monkeypatch.delenv("AP_CONTEXT_WINDOW_OVERRIDE", raising=False)
+        monkeypatch.setattr(context_window, "find_catalog_models", lambda _model: [])
+
+        assert find_model_context_window("gemini/gemini-9-preview") is None
+        assert get_model_context_window("gemini/gemini-9-preview") == 128_000
+
+        record_gemini_model_metadata(
+            "models/gemini-9-preview",
+            ModelMetadata(context_window=1_048_576, max_output_tokens=65_536),
+        )
+
+        assert find_model_context_window("gemini-9-preview") == 1_048_576
+        assert find_model_context_window("gemini/gemini-9-preview") == 1_048_576
+        assert find_model_context_window("vertex/gemini-9-preview") == 1_048_576
+        assert get_model_context_window("gemini/gemini-9-preview") == 1_048_576
+
+        # Explicit env override still takes precedence over cached live metadata.
+        monkeypatch.setenv("AP_CONTEXT_WINDOW_OVERRIDE", "256000")
+        assert find_model_context_window("gemini/gemini-9-preview") == 256_000
+    finally:
+        _clear_model_metadata_cache()

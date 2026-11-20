@@ -1183,6 +1183,13 @@ def _resolve_provider_for_build(
     if bound is not None:
         return bound
     harness = _provider_harness_name(harness_type)
+    # Preserve native harness identity when it maps to a distinct family (e.g.
+    # antigravity-native -> gemini vs legacy antigravity -> openai).
+    lookup_harness = (
+        actual_harness
+        if actual_harness and harness_family(actual_harness) is not None
+        else harness
+    )
     auth = spec.executor.auth
     if isinstance(auth, ProviderAuth):
         # A named provider is resolved against the explicit config merged with
@@ -1226,7 +1233,7 @@ def _resolve_provider_for_build(
         )
 
     # No spec auth. Most explicit wins, ambient last, then a launch-only fallback.
-    explicit_default = default_provider_for_harness(explicit_config, harness)
+    explicit_default = default_provider_for_harness(explicit_config, lookup_harness)
     if explicit_default is not None:
         return explicit_default
     global_auth = _load_global_auth()
@@ -1245,7 +1252,7 @@ def _resolve_provider_for_build(
         # The model name itself signals Databricks intent (no pinned profile).
         return _legacy_databricks_provider(None, harness_type=harness_type, for_launch=for_launch)
     effective = effective_config_with_detected(explicit_config)
-    ambient_default = default_provider_for_harness(effective, harness)
+    ambient_default = default_provider_for_harness(effective, lookup_harness)
     if ambient_default is not None:
         return ambient_default
     # A saved CLI subscription suppresses its ambient detection. Keep managed
@@ -1266,7 +1273,7 @@ def _resolve_provider_for_build(
     # persisted; the startup creds line names the same provider via
     # :func:`first_available_provider`, so the readout cannot disagree.
     if for_launch:
-        family = harness_family(harness)
+        family = harness_family(lookup_harness)
         if family is not None:
             return first_available_provider(effective, family)
     return None

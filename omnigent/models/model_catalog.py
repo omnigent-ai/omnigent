@@ -16,6 +16,8 @@ Enumeration is deterministic per provider kind:
   token minted from the profile (source ``"gateway"``).
 - ``key`` with the ``anthropic`` family → ``GET <base_url>/v1/models``
   with ``x-api-key`` headers (source ``"anthropic-api"``).
+- ``key`` with the ``gemini`` family → ``GET <base_url>/models`` (or
+  ``/v1beta/models``) with ``x-goog-api-key`` headers (source ``"gemini-api"``).
 - ``key`` (openai family) / ``gateway`` / ``local`` →
   ``GET <base_url>/v1/models`` with a bearer token (source
   ``"openai-compatible"``).
@@ -48,6 +50,16 @@ from cachetools import TTLCache
 from omnigent._platform import default_shell_argv
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.llms.anthropic_model_metadata import parse_anthropic_model_metadata
+from omnigent.llms.gemini_model_metadata import (
+    _clear_model_metadata_cache as _clear_gemini_metadata_cache,
+)
+from omnigent.llms.gemini_model_metadata import (
+    extract_gemini_model_id,
+    gemini_models_url,
+    parse_gemini_model_metadata,
+    record_gemini_model_metadata,
+    supports_gemini_generate_content,
+)
 from omnigent.models.model_metadata import (
     ModelCapability,
     ModelCostTier,
@@ -72,6 +84,7 @@ from omnigent.onboarding.provider_config import (
     BEDROCK_KIND,
     CLI_CONFIG_KIND,
     DATABRICKS_KIND,
+    GEMINI_FAMILY,
     KEY_KIND,
     OPENAI_FAMILY,
     SUBSCRIPTION_KIND,
@@ -114,6 +127,8 @@ _LLM_TASK_TOKENS = ("chat", "completion")
 _MODEL_SERVICES_PARENT = "schemas/system.ai"
 _MODEL_SERVICES_MAX_RESULTS = 100
 _MODEL_SERVICES_MAX_PAGES = 100
+_GEMINI_MODELS_PAGE_SIZE = 1000
+_GEMINI_MODELS_MAX_PAGES = 20
 
 _ProviderHarness: TypeAlias = Literal[
     "claude-sdk",
@@ -121,6 +136,7 @@ _ProviderHarness: TypeAlias = Literal[
     "pi",
     "openai-agents-sdk",
     "antigravity",
+    "antigravity-native",
     "kimi",
     "qwen",
     "acp",
@@ -159,12 +175,12 @@ _PROVIDER_RESOLUTION_HARNESS: dict[str, _ProviderHarness] = {
     # models: map from the resolved entry (see acp_curated_models).
     "acp": "acp",
     "qwen": "qwen",
-    # The native agy TUI bridge resolves its provider via the SDK sibling,
-    # mirroring the claude-native -> claude-sdk rule above.
-    "antigravity-native": "antigravity",
-    "native-antigravity": "antigravity",
-    "agy-native": "antigravity",
-    "native-agy": "antigravity",
+    # The native agy TUI bridge consumes the gemini family directly, distinct
+    # from the legacy SDK harness's openai-family mapping.
+    "antigravity-native": "antigravity-native",
+    "native-antigravity": "antigravity-native",
+    "agy-native": "antigravity-native",
+    "native-agy": "antigravity-native",
 }
 
 # cursor-agent always routes through its own stored login — there is no
@@ -182,17 +198,19 @@ _DEVIN_HARNESSES: frozenset[str] = frozenset({"devin-native", "native-devin"})
 # SDK harnesses whose CLI-login launch shares a native model-probe catalog.
 _SDK_PROBE_CLI: dict[str, str] = {"claude-sdk": "claude", "claude_sdk": "claude", "codex": "codex"}
 
-# Preferred inline family per single-family harness (pi consumes both).
+# Preferred inline family per single-family harness (pi consumes anthropic/openai).
 _KEY_AUTH_FAMILY: dict[str, str] = {
     "claude-sdk": ANTHROPIC_FAMILY,
     "codex": OPENAI_FAMILY,
     "openai-agents-sdk": OPENAI_FAMILY,
     "antigravity": OPENAI_FAMILY,
+    "antigravity-native": GEMINI_FAMILY,
     "qwen": OPENAI_FAMILY,
 }
 
-# Multi-family providers (pi): anthropic first, matching _apply_provider_to_pi.
+# Multi-family providers: pi consumes anthropic/openai only; acp can also resolve gemini.
 _FAMILY_PREFERENCE = (ANTHROPIC_FAMILY, OPENAI_FAMILY)
+_ACP_FAMILY_PREFERENCE = (ANTHROPIC_FAMILY, OPENAI_FAMILY, GEMINI_FAMILY)
 
 
 @dataclass(frozen=True)
@@ -222,8 +240,8 @@ class ModelListing:
     """A worker's enumerated model list plus its provenance.
 
     :param source: Where the list came from — ``"gateway"``,
-        ``"openai-compatible"``, ``"anthropic-api"``, ``"cli"``,
-        ``"static"``, or ``"none"``.
+        ``"openai-compatible"``, ``"anthropic-api"``, ``"gemini-api"``,
+        ``"cli"``, ``"static"``, or ``"none"``.
     :param verified: ``True`` when the list was fetched live from the
         provider; ``False`` for static/curated or empty listings.
     :param models: The enumerated models, e.g.
@@ -399,6 +417,7 @@ def clear_model_catalog_cache() -> None:
     """
     with _listing_cache_lock:
         _listing_cache.clear()
+    _clear_gemini_metadata_cache()
 
 
 def model_family_token(model_id: str) -> str:
@@ -639,13 +658,15 @@ def _resolve_model_provider_unsafe(spec: object, harness: str | None) -> Resolve
         )
 
     agent_spec = cast("AgentSpec", spec)
-    entry = (
-        _acp_provider_entry(agent_spec)
-        if harness_type == "acp"
-        else _resolve_provider_for_build(
-            agent_spec, harness_type=harness_type, actual_harness=harness
+    if harness_type == "acp":
+        entry = _acp_provider_entry(agent_spec)
+    else:
+        build_harness_type = (
+            "antigravity" if harness_type == "antigravity-native" else harness_type
         )
-    )
+        entry = _resolve_provider_for_build(
+            agent_spec, harness_type=build_harness_type, actual_harness=harness
+        )
     provider = (
         _provider_from_entry(entry, harness_type)
         if entry is not None
@@ -698,13 +719,10 @@ def _provider_from_legacy_auth(
         # at all -- the vendor CLI owns its auth. Curation comes from named
         # providers (spec/global ``providers:``), not the legacy fields.
         return _legacy_acp_provider(spec)
-    if harness_type in ("openai-agents-sdk", "antigravity"):
-        # Both resolve spec/global ``auth:`` api-key blocks via this branch.
-        # NB: the antigravity spawn-env builder (unlike openai-agents) ignores
-        # ``config["profile"]`` — it's Gemini-native with no Databricks/gateway
-        # path — so for a profile-only antigravity spec this readout can
-        # over-report; api-key (and Vertex) specs resolve correctly.
+    if harness_type == "openai-agents-sdk":
         return _legacy_openai_agents_provider(spec)
+    if harness_type in ("antigravity", "antigravity-native"):
+        return _legacy_antigravity_provider(spec)
     return _legacy_profile_only_provider(spec, harness_type)
 
 
@@ -809,6 +827,27 @@ def _legacy_openai_agents_provider(spec: AgentSpec) -> ResolvedModelProvider:
     prefix = _databricks_prefix_provider(spec)
     if prefix is not None:
         return prefix
+    return ResolvedModelProvider(kind=NONE_KIND, detail="no model provider configured")
+
+
+def _legacy_antigravity_provider(spec: AgentSpec) -> ResolvedModelProvider:
+    """Mirror antigravity's Gemini-native spec ``auth:`` api-key branch.
+
+    Deliberately skips ``_load_global_auth()``: global ``auth:`` carries
+    OpenAI/gateway keys that must never be forwarded to Google's Gemini API.
+    """
+    from omnigent.onboarding.configure_models import default_base_url_for_family
+    from omnigent.spec.types import ApiKeyAuth
+
+    spec_auth = spec.executor.auth
+    if isinstance(spec_auth, ApiKeyAuth) and spec_auth.api_key:
+        return ResolvedModelProvider(
+            kind=KEY_KIND,
+            family=GEMINI_FAMILY,
+            base_url=spec_auth.base_url or default_base_url_for_family(GEMINI_FAMILY),
+            api_key=spec_auth.api_key,
+            detail="api_key auth",
+        )
     return ResolvedModelProvider(kind=NONE_KIND, detail="no model provider configured")
 
 
@@ -1064,11 +1103,12 @@ def _provider_from_entry(entry: ProviderEntry, harness_type: str) -> ResolvedMod
     # Inline-family kinds: single-family harnesses get exactly their family;
     # pi and generic acp take the first whose credential resolves, anthropic
     # preferred (acp vendors own their routing, so no single key family exists).
-    if harness_type in ("pi", "acp"):
-        preferred = None
+    if harness_type == "pi":
+        candidates: tuple[str, ...] = _FAMILY_PREFERENCE
+    elif harness_type == "acp":
+        candidates = _ACP_FAMILY_PREFERENCE
     else:
-        preferred = _KEY_AUTH_FAMILY[harness_type]
-    candidates = (preferred,) if preferred is not None else _FAMILY_PREFERENCE
+        candidates = (_KEY_AUTH_FAMILY[harness_type],)
     for family_name in candidates:
         try:
             family = entry.family(family_name)
@@ -1366,6 +1406,8 @@ def _listing_for_provider(
             listing = _fetch_databricks_listing(provider, transport=transport)
         elif provider.kind == KEY_KIND and provider.family == ANTHROPIC_FAMILY:
             listing = _fetch_anthropic_listing(provider, transport=transport)
+        elif provider.family == GEMINI_FAMILY:
+            listing = _fetch_gemini_listing(provider, transport=transport)
         else:
             listing = _fetch_openai_compatible_listing(provider, transport=transport)
     except (
@@ -2151,4 +2193,81 @@ def _fetch_anthropic_listing(
         verified=True,
         models=tuple(models),
         note=f"models reported by {_models_url(provider.base_url)}",
+    )
+
+
+def _fetch_gemini_listing(
+    provider: ResolvedModelProvider,
+    *,
+    transport: httpx.BaseTransport | None,
+) -> ModelListing:
+    """List generative models from the Google Gemini Models API.
+
+    Queries ``GET <base>/v1beta/models`` (normalizing ``/v1beta/openai`` when
+    present) with ``x-goog-api-key``, paginates ``nextPageToken``, filters to
+    ``generateContent``-capable models, and records discovered token limits in
+    the live Gemini metadata cache.
+    """
+    if not provider.base_url:
+        raise ValueError("provider has no base_url to list models from")
+    token = _resolve_bearer_token(provider)
+    url = gemini_models_url(provider.base_url)
+
+    raw_models: list[object] = []
+    page_token: str | None = None
+    seen_tokens: set[str] = set()
+    with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as client:
+        for _ in range(_GEMINI_MODELS_MAX_PAGES):
+            params: dict[str, str] = {"pageSize": str(_GEMINI_MODELS_PAGE_SIZE)}
+            if page_token is not None:
+                params["pageToken"] = page_token
+            resp = client.get(url, headers={"x-goog-api-key": token}, params=params)
+            resp.raise_for_status()
+            payload = resp.json()
+            page = payload.get("models") if isinstance(payload, dict) else None
+            if isinstance(page, list):
+                raw_models.extend(page)
+            raw_next = payload.get("nextPageToken") if isinstance(payload, dict) else None
+            if not isinstance(raw_next, str) or not raw_next:
+                break
+            if raw_next in seen_tokens:
+                _logger.warning(
+                    "Gemini models pagination repeated a page token; "
+                    "returning the %d entries collected so far",
+                    len(raw_models),
+                )
+                break
+            seen_tokens.add(raw_next)
+            page_token = raw_next
+        else:
+            _logger.warning(
+                "Gemini models listing truncated after %d pages; the model list may be incomplete",
+                _GEMINI_MODELS_MAX_PAGES,
+            )
+
+    models: list[ModelEntry] = []
+    seen_ids: set[str] = set()
+    for item in raw_models:
+        if not isinstance(item, dict):
+            continue
+        if not supports_gemini_generate_content(item):
+            continue
+        model_id = extract_gemini_model_id(item)
+        if not model_id or model_id in seen_ids:
+            continue
+        seen_ids.add(model_id)
+        metadata = parse_gemini_model_metadata(item)
+        record_gemini_model_metadata(model_id, metadata, base_url=url)
+        models.append(
+            ModelEntry(
+                id=model_id,
+                family=model_family_token(model_id),
+                metadata=metadata,
+            )
+        )
+    return ModelListing(
+        source="gemini-api",
+        verified=True,
+        models=tuple(models),
+        note=f"models reported by {url}",
     )
