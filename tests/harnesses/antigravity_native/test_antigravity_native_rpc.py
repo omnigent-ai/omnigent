@@ -1,7 +1,8 @@
 """Tests for the native Antigravity (agy) connect-RPC client.
 
 No live agy is launched here. The OS seams (``lsof`` / ``pgrep``) are
-monkeypatched and the HTTP layer is driven through ``httpx.MockTransport`` so
+monkeypatched, except for a stand-in process named ``agy`` that checks real
+``pgrep`` matching. The HTTP layer is driven through ``httpx.MockTransport`` so
 each RPC's URL / headers / body shape is asserted without a real socket.
 """
 
@@ -9,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import struct
 import subprocess
 import threading
@@ -23,6 +25,7 @@ import httpx
 import pytest
 
 import omnigent.harnesses.antigravity_native.rpc as rpc
+from tests._helpers.live_server import terminate_process
 
 # Realistic two-port agy ``lsof`` output: the LOWER (52548) is the TLS
 # connect-RPC port; the higher (52549) is plain HTTP. Mirrors the verified
@@ -931,14 +934,29 @@ def test_list_agy_pids_skips_supervisors_and_finds_child(
         100: ["python", "-m", "gateway", "--", "/usr/local/bin/agy"],
         200: ["/usr/local/bin/agy"],
         300: ["/usr/local/bin/agy-helper"],
+        400: ["agy", "--csrf_token=user"],
+        500: ["/bin/sh", "/tmp/slow-agy/agy"],
     }
-    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: _completed("100\n200\n300\n"))
+    monkeypatch.setattr(
+        subprocess, "run", lambda *a, **kw: _completed("100\n200\n300\n400\n500\n")
+    )
     monkeypatch.setattr(
         rpc.psutil, "Process", lambda pid: SimpleNamespace(cmdline=lambda: commands[pid])
     )
     monkeypatch.setattr(rpc, "_child_pids", lambda pid: [200] if pid == 100 else [])
-    assert rpc._list_agy_pids() == [200]
+    assert rpc._list_agy_pids() == [200, 400]
     assert rpc._agy_pid_in_pane_subtree(100) == 200
+
+
+@pytest.mark.posix_only
+@pytest.mark.parametrize("argv0", ["agy", "/opt/vendor-bin/agy"])
+def test_list_agy_pids_finds_agy_outside_a_bin_directory(argv0: str) -> None:
+    """A user's agy started from a shell has the bare ``agy`` argv0 that pgrep must match."""
+    sleeper = subprocess.Popen([argv0, "60"], executable=shutil.which("sleep"))
+    try:
+        assert sleeper.pid in rpc._list_agy_pids()
+    finally:
+        terminate_process(sleeper)
 
 
 def test_list_agy_pids_falls_back_to_proc_when_pgrep_missing(
@@ -982,7 +1000,7 @@ def test_list_agy_pids_falls_back_to_proc_on_pgrep_timeout(
 def test_list_agy_pids_from_proc_matches_bin_agy(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The /proc scan matches ``bin/agy`` cmdlines and skips everything else."""
+    """The /proc scan matches executables named ``agy`` and skips everything else."""
 
     def _write(pid: str, argv: list[str]) -> None:
         proc_dir = tmp_path / pid
@@ -994,10 +1012,12 @@ def test_list_agy_pids_from_proc_matches_bin_agy(
     _write("333", ["/data/.local/bin/agy"])  # installer-default path → matches
     _write("555", ["python", "-m", "gateway", "--", "/usr/local/bin/agy"])
     _write("666", ["/usr/local/bin/agy-helper"])
+    _write("777", ["agy", "--gemini_dir=/tmp/session"])  # started from a shell → matches
+    _write("888", ["/bin/sh", "/tmp/slow-agy/agy"])  # script shim → skipped
     (tmp_path / "not-a-pid").mkdir()  # non-numeric entry → skipped
 
     monkeypatch.setattr(rpc, "_PROC_FS", str(tmp_path))
-    assert sorted(rpc._list_agy_pids_from_proc()) == [111, 333]
+    assert sorted(rpc._list_agy_pids_from_proc()) == [111, 333, 777]
 
 
 def test_list_agy_pids_from_proc_skips_empty_cmdline(
