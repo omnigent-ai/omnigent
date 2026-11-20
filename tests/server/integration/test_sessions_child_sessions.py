@@ -26,6 +26,7 @@ import tarfile
 import threading
 from dataclasses import dataclass
 from typing import Any, NoReturn
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -34,6 +35,7 @@ from fastapi import FastAPI
 
 from omnigent.entities import Conversation
 from omnigent.entities.conversation import MessageData, NewConversationItem
+from omnigent.host.frames import CAP_CODEX_SIDE_CHAT_RESUME, HostHelloFrame
 from omnigent.runtime import session_stream
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.server.routes.sessions import routes_events as routes_events_module
@@ -2434,120 +2436,133 @@ async def test_subagent_message_503s_when_heal_finds_no_live_ancestor(
     assert resp.status_code == 503, resp.text
 
 
-@pytest.mark.parametrize(
-    ("parent_runner", "expected_status"),
-    [("runner_replacement", 409), ("runner_side", 409), ("runner_side", 202)],
-    ids=["parent-relaunched", "host-reports-runner-gone", "transient-outage"],
-)
-async def test_side_chat_message_after_runner_loss(
+@pytest.mark.parametrize("event_type", ["message", "retry_session"])
+@pytest.mark.parametrize("closed", [False, True])
+async def test_side_chat_recovers_on_parent_runner(
     client: httpx.AsyncClient,
+    app: FastAPI,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
-    request: pytest.FixtureRequest,
-    parent_runner: str,
-    expected_status: int,
+    event_type: str,
+    closed: bool,
 ) -> None:
-    """Only a replaced parent runner proves the fork is gone; an outage is not sealed."""
-    child = await _create_native_child(client, name=f"msg-side-chat-{request.node.callspec.id}")
-    conv_store = SqlAlchemyConversationStore(db_uri)
-    conv_store.set_labels(
-        child["id"],
-        {
-            "omnigent.wrapper": "codex-native-ui-subagent",
-            "omnigent.codex_native.agent_nickname": "Side chat",
-        },
-    )
-    conv_store.replace_runner_id(child["id"], "runner_side")
-    conv_store.replace_runner_id(child["parent_session_id"], parent_runner)
+    """A lost or closed native side chat resumes in place without changing its history."""
+    from omnigent.server.routes._sessions import orchestration
 
-    async def _none(*_args: Any, **_kwargs: Any) -> None:
-        return None
-
-    monkeypatch.setattr(routes_events_module, "_get_runner_client", _none)
-    monkeypatch.setattr(routes_events_module, "_heal_subagent_runner_binding_via_parent", _none)
-
-    real_fork_lost = routes_events_module._codex_side_chat_fork_lost
-
-    async def _fork_lost(*args: Any, **kwargs: Any) -> bool:
-        # Stand in for the launching host's "dead" verdict; the helper has its own unit test.
-        if request.node.callspec.id == "host-reports-runner-gone":
-            return True
-        return await real_fork_lost(*args, **kwargs)
-
-    async def _no_policy(*_args: Any, **_kwargs: Any) -> None:
-        # A denying policy would persist a reply, so a lost fork must be rejected first.
-        if expected_status == 409:
-            pytest.fail("input policy ran for a side chat whose fork is gone")
-
-    monkeypatch.setattr(routes_events_module, "_codex_side_chat_fork_lost", _fork_lost)
-    monkeypatch.setattr(routes_events_module, "_evaluate_input_policy", _no_policy)
-
-    message = {
-        "type": "message",
-        "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+    child = await _create_native_child(client, name="side-chat-resume")
+    store = SqlAlchemyConversationStore(db_uri)
+    labels = {
+        "omnigent.wrapper": "codex-native-ui-subagent",
+        "omnigent.codex_native.agent_nickname": "Side chat",
+        "omnigent.codex_native.subagent_thread_id": "thread_side",
     }
-    resp = await client.post(f"/v1/sessions/{child['id']}/events", json=message)
+    if closed:
+        labels[CLOSED_LABEL_KEY] = CLOSED_LABEL_VALUE
+    store.set_labels(child["id"], labels)
+    store.replace_runner_id(child["id"], "runner_old")
+    store.replace_runner_id(child["parent_session_id"], "runner_live")
+    register_test_runner(app, "runner_live", capabilities=[CAP_CODEX_SIDE_CHAT_RESUME])
+    snapshot = await client.get(f"/v1/sessions/{child['id']}")
+    assert snapshot.status_code == 200, snapshot.text
+    assert (snapshot.json()["labels"].get(CLOSED_LABEL_KEY) == CLOSED_LABEL_VALUE) == closed
+    parent = store.get_conversation(child["parent_session_id"])
+    store.append(
+        child["id"],
+        [
+            NewConversationItem(
+                type="message",
+                response_id="side_history",
+                data=MessageData(
+                    role="user", content=[{"type": "input_text", "text": "Remember this"}]
+                ),
+            )
+        ],
+    )
+    before = store.list_items(child["id"]).data
+    forwarded: list[dict[str, Any]] = []
 
-    assert resp.status_code == expected_status, resp.text
-    after = conv_store.get_conversation(child["id"])
-    assert after is not None
-    if expected_status == 409:
-        assert conv_store.list_items(child["id"]).data == []
-        assert after.labels.get(CLOSED_LABEL_KEY) == CLOSED_LABEL_VALUE
-    else:
-        assert CLOSED_LABEL_KEY not in after.labels
+    def capture(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == f"/v1/sessions/{parent.id}/events"
+        payload = json.loads(request.content)
+        forwarded.append(payload)
+        return httpx.Response(200, json={"resumed": True})
+
+    async with httpx.AsyncClient(
+        base_url="http://runner", transport=httpx.MockTransport(capture)
+    ) as runner:
+        ensure = AsyncMock(return_value=(runner, parent))
+        monkeypatch.setattr(orchestration, "ensure_runner_connected", ensure)
+        monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=runner))
+        monkeypatch.setattr(
+            routes_events_module, "_get_runner_client", AsyncMock(return_value=runner)
+        )
+        monkeypatch.setattr(
+            routes_events_module,
+            "_ensure_runner_session_initialized",
+            AsyncMock(return_value=False),
+        )
+        monkeypatch.setattr(routes_events_module, "_ensure_runner_relay_ready", AsyncMock())
+        response = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json={
+                "type": event_type,
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "Continue"}]}
+                if event_type == "message"
+                else {},
+            },
+        )
+
+    assert response.status_code == 202, response.text
+    assert forwarded[0] == {"type": "codex_side_chat_resume", "codex_side_session_id": child["id"]}
+    assert len(forwarded) == (2 if event_type == "message" else 1)
+    if event_type == "message":
+        assert forwarded[1]["codex_side_thread_id"] == "thread_side"
+        assert forwarded[1]["content"][0]["text"] == "Continue"
+    recovered = store.get_conversation(child["id"])
+    assert recovered.runner_id == "runner_live"
+    assert CLOSED_LABEL_KEY not in recovered.labels
+    assert store.list_items(child["id"]).data == before
+    assert store.get_conversation(parent.id).runner_id == "runner_live"
 
 
-@pytest.mark.parametrize(
-    ("parent_runner", "host_reports_dead", "expected_status"),
-    [
-        ("runner_replacement", False, 409),
-        ("runner_side", True, 409),
-        ("runner_side", False, 503),
-    ],
-    ids=["parent-relaunched", "host-reports-runner-gone", "transient-outage"],
-)
-async def test_side_chat_retry_after_runner_loss(
+@pytest.mark.parametrize("event_type", ["message", "retry_session"])
+async def test_side_chat_recovery_failure_preserves_closed_history(
     client: httpx.AsyncClient,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
-    parent_runner: str,
-    host_reports_dead: bool,
-    expected_status: int,
+    event_type: str,
 ) -> None:
-    """Resume seals a lost fork, while a temporary outage remains recoverable."""
-    child = await _create_native_child(client, name="retry-side-chat")
-    conv_store = SqlAlchemyConversationStore(db_uri)
-    conv_store.set_labels(
+    """An unavailable parent leaves closed chats retryable without consuming input."""
+    child = await _create_native_child(client, name="side-chat-unavailable")
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_labels(
         child["id"],
         {
             "omnigent.wrapper": "codex-native-ui-subagent",
             "omnigent.codex_native.agent_nickname": "Side chat",
+            "omnigent.codex_native.subagent_thread_id": "thread_side",
+            CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE,
         },
     )
-    conv_store.replace_runner_id(child["id"], "runner_side")
-    conv_store.replace_runner_id(child["parent_session_id"], parent_runner)
-
-    async def _none(*_args: Any, **_kwargs: Any) -> None:
-        return None
-
-    real_fork_lost = routes_events_module._codex_side_chat_fork_lost
-
-    async def _fork_lost(*args: Any, **kwargs: Any) -> bool:
-        return host_reports_dead or await real_fork_lost(*args, **kwargs)
-
-    monkeypatch.setattr(routes_events_module, "_get_runner_client", _none)
-    monkeypatch.setattr(routes_events_module, "_codex_side_chat_fork_lost", _fork_lost)
+    conv = store.get_conversation(child["id"])
+    monkeypatch.setattr(
+        routes_events_module,
+        "_recover_side_chat_runner_via_source",
+        AsyncMock(return_value=(None, conv)),
+    )
     response = await client.post(
         f"/v1/sessions/{child['id']}/events",
-        json={"type": "retry_session", "data": {}},
+        json={
+            "type": event_type,
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "Continue"}]}
+            if event_type == "message"
+            else {},
+        },
     )
 
-    assert response.status_code == expected_status, response.text
-    after = conv_store.get_conversation(child["id"])
-    assert after is not None
-    assert (after.labels.get(CLOSED_LABEL_KEY) == CLOSED_LABEL_VALUE) == (expected_status == 409)
-    assert conv_store.list_items(child["id"]).data == []
+    assert response.status_code == 503, response.text
+    assert store.get_conversation(child["id"]).labels[CLOSED_LABEL_KEY] == CLOSED_LABEL_VALUE
+    assert store.list_items(child["id"]).data == []
 
 
 async def test_non_subagent_session_not_healed_via_parent(
@@ -2750,10 +2765,14 @@ async def test_side_chat_settings_support_follows_parent_runner_handshake(
     supported = runner_state == "current"
     if runner_state != "offline":
         register_test_runner(
-            app, "runner_parent", capabilities=[CAP_SIDE_CHAT_SETTINGS] if supported else []
+            app,
+            "runner_parent",
+            capabilities=[CAP_SIDE_CHAT_SETTINGS, CAP_CODEX_SIDE_CHAT_RESUME] if supported else [],
         )
     register_test_runner(
-        app, "runner_stale", capabilities=[] if supported else [CAP_SIDE_CHAT_SETTINGS]
+        app,
+        "runner_stale",
+        capabilities=[] if supported else [CAP_SIDE_CHAT_SETTINGS, CAP_CODEX_SIDE_CHAT_RESUME],
     )
     parent = await _create_parent_session(client)
     store = SqlAlchemyConversationStore(db_uri)
@@ -2775,9 +2794,25 @@ async def test_side_chat_settings_support_follows_parent_runner_handshake(
     response = await client.get(f"/v1/sessions/{child_id}")
     assert response.status_code == 200, response.text
     assert response.json()["side_chat_settings_supported"] is supported
+    resume_label = "omnigent.codex_native.side_chat_resume"
+    assert response.json()["labels"][resume_label] == str(supported).lower()
+    assert resume_label not in store.get_conversation(child_id).labels
     assert (await client.get(f"/v1/sessions/{parent['id']}")).json()[
         "side_chat_settings_supported"
     ] is False
+    host_id = "98b5b7bc904d461ab181cd077af84445"
+    store.set_host_id(parent["id"], host_id, workspace="/workspace")
+    host = app.state.host_registry.register(
+        host_id,
+        AsyncMock(),
+        HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="test-host"),
+        owner=None,
+    )
+    unsupported_host = await client.get(f"/v1/sessions/{child_id}")
+    assert unsupported_host.json()["labels"][resume_label] == str(supported).lower()
+    host.hello.capabilities.append(CAP_CODEX_SIDE_CHAT_RESUME)
+    host_fallback = await client.get(f"/v1/sessions/{child_id}")
+    assert host_fallback.json()["labels"][resume_label] == str(runner_state != "old").lower()
     if supported:
         registry.deregister("runner_parent", retire=False)
         assert (await client.get(f"/v1/sessions/{child_id}")).json()[
@@ -2787,10 +2822,13 @@ async def test_side_chat_settings_support_follows_parent_runner_handshake(
     refused = await client.patch(f"/v1/sessions/{child_id}", json={"reasoning_effort": "low"})
     assert refused.status_code == 503, refused.text
     assert store.get_conversation(child_id).reasoning_effort is None
-    register_test_runner(app, "runner_parent", capabilities=[CAP_SIDE_CHAT_SETTINGS])
+    register_test_runner(
+        app, "runner_parent", capabilities=[CAP_SIDE_CHAT_SETTINGS, CAP_CODEX_SIDE_CHAT_RESUME]
+    )
     recovered = await client.patch(f"/v1/sessions/{child_id}", json={"reasoning_effort": "low"})
     assert recovered.status_code == 200, recovered.text
     assert recovered.json()["side_chat_settings_supported"] is True
+    assert recovered.json()["labels"][resume_label] == "true"
     assert recovered.json()["reasoning_effort"] == "low"
 
 

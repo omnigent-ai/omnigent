@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { Link, Outlet, MemoryRouter, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { PROJECT_KANBAN_BOARD_STORAGE_KEY } from "@/lib/projectKanbanPreferences";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { RoutingProvider, basenamedRouting, reactRouterRouting } from "@/lib/routing";
 
@@ -17,17 +18,30 @@ vi.mock("@/shell/AppShell", () => ({
     </div>
   ),
 }));
-vi.mock("@/pages/ChatPage", () => ({
-  ChatPage: () => (
-    <div>
-      chat page
-      <input aria-label="Page draft" />
-      <Link to="/c/other">Another chat</Link>
-    </div>
-  ),
+vi.mock("@/pages/ChatPage", async () => {
+  const { useLocation } = await import("react-router-dom");
+  return {
+    ChatPage: () => {
+      const { pathname, search } = useLocation();
+      return (
+        <div>
+          chat page
+          <input aria-label="Page draft" />
+          <Link to="/c/other">Another chat</Link>
+          <span data-testid="chat-location">{pathname + search}</span>
+        </div>
+      );
+    },
+  };
+});
+vi.mock("@/pages/ProjectHomePage", () => ({
+  ProjectHomePage: () => <div>project home page</div>,
 }));
 vi.mock("@/pages/NotFoundPage", () => ({ NotFoundPage: () => <div>not found</div> }));
 vi.mock("@/pages/UsagePage", () => ({ UsagePage: () => <div>usage page</div> }));
+vi.mock("@/shell/floatingComposer/FloatingComposerPage", () => ({
+  FloatingComposerPage: () => <div>floating composer page</div>,
+}));
 vi.mock("@/pages/TaskDetailPage", () => ({ TaskDetailPage: () => <div>task detail page</div> }));
 vi.mock("@/pages/WorkflowsPage", () => ({ WorkflowsPage: () => <div>workflows page</div> }));
 vi.mock("@/pages/WorkflowDetailPage", () => ({
@@ -276,6 +290,21 @@ describe("Workflow routes", () => {
   });
 });
 
+describe("Project home route", () => {
+  afterEach(() => localStorage.clear());
+
+  it("opens the board, or the project's composer once the board is turned off", async () => {
+    renderRoute("/projects/My%20Project", { project_kanban: true });
+    expect(await screen.findByText("project home page")).toBeInTheDocument();
+    cleanup();
+
+    localStorage.setItem(PROJECT_KANBAN_BOARD_STORAGE_KEY, "false");
+    renderRoute("/projects/My%20Project", { project_kanban: true });
+    expect(await screen.findByTestId("chat-location")).toHaveTextContent("/?project=My%20Project");
+    expect(screen.queryByText("project home page")).toBeNull();
+  });
+});
+
 describe("Canvas route", () => {
   it("preserves healthy chat state across pathname changes", () => {
     renderRoute("/c/first");
@@ -354,6 +383,31 @@ describe("Extension page routes", () => {
   });
 });
 
+describe("Floating composer route", () => {
+  afterEach(() => {
+    delete (window as { omnigentDesktop?: unknown }).omnigentDesktop;
+  });
+
+  it("is not found with the flag off, or outside the desktop app", async () => {
+    (window as { omnigentDesktop?: unknown }).omnigentDesktop = { kind: "electron" };
+    renderRoute("/compose/floating");
+    expect(await screen.findByText("not found")).toBeInTheDocument();
+    cleanup();
+
+    delete (window as { omnigentDesktop?: unknown }).omnigentDesktop;
+    renderRoute("/compose/floating", { floating_composer: true });
+    expect(await screen.findByText("not found")).toBeInTheDocument();
+    expect(screen.queryByText("floating composer page")).toBeNull();
+  });
+
+  it("renders the panel page in the desktop app with the flag on, outside the shell", async () => {
+    (window as { omnigentDesktop?: unknown }).omnigentDesktop = { kind: "electron" };
+    renderRoute("/compose/floating", { floating_composer: true });
+    expect(await screen.findByText("floating composer page")).toBeInTheDocument();
+    expect(screen.queryByText("app shell")).toBeNull();
+  });
+});
+
 describe("Usage release feature route", () => {
   it("does not register /usage while the feature is off", async () => {
     renderUsageRoute(false);
@@ -368,7 +422,32 @@ describe("Usage release feature route", () => {
   });
 });
 
-describe("Automation detail release feature route", () => {
+describe("Automation routes", () => {
+  it.each(["/tasks", "/tasks/templates", "/tasks/st_1"])(
+    "blocks %s when automations are disabled",
+    async (path) => {
+      renderRoute(
+        path,
+        {},
+        {
+          ...FALLBACK_SERVER_INFO,
+          automations_enabled: false,
+          features: { automations_v2: true },
+        },
+      );
+      expect(await screen.findByText("not found")).toBeInTheDocument();
+      expect(screen.queryByText("task detail page")).toBeNull();
+      expect(screen.queryByText("Tasks recovered")).toBeNull();
+    },
+  );
+
+  it("waits for server info before loading automations", () => {
+    renderRoute("/tasks", {}, "loading");
+    expect(screen.getByRole("status")).toHaveTextContent("Loading Omnigent");
+    expect(screen.queryByText("not found")).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
   it("does not register /tasks/:taskId while automations_v2 is off", async () => {
     renderRoute("/tasks/st_1");
     expect(await screen.findByText("not found")).toBeInTheDocument();

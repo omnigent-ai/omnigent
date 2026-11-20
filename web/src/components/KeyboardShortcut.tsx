@@ -4,6 +4,7 @@ export { CompactKbd, CompactShortcutKeys } from "@/components/ui/kbd";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { isMacPlatform } from "@/lib/hotkeys";
 import { isNativeShell, supportsDesktopCommands } from "@/lib/nativeBridge";
+import { shortcutKeys } from "@/lib/shortcuts/registry";
 import type { TerminalSplitAxis } from "@/lib/terminalSplitLayout";
 import { cn } from "@/lib/utils";
 
@@ -22,18 +23,19 @@ export const ARROW_DOWN_KEY = "↓";
 export const ARROW_LEFT_KEY = "←";
 export const ARROW_RIGHT_KEY = "→";
 export const ARIA_MOD_KEY = IS_MAC ? "Meta" : "Control";
-export const VIEW_MODE_TOGGLE_KEYS = [MOD_KEY, ALT_KEY, "\\"] as const;
+export const VIEW_MODE_TOGGLE_KEYS = shortcutKeys("view.mode");
 export const SPLIT_TERMINAL_KEYS: Record<TerminalSplitAxis, string[]> = {
-  columns: [MOD_KEY, ALT_KEY, SHIFT_KEY, "\\"],
-  rows: [MOD_KEY, ALT_KEY, "-"],
+  columns: shortcutKeys("terminal.splitRight"),
+  rows: shortcutKeys("terminal.splitDown"),
 };
 // ⌃` opens a shell in every runtime; the rest are desktop menu chords (see the
 // accelerators in web/electron/src/main.js).
-export const NEW_TERMINAL_KEYS = [CTRL_KEY, "`"] as const;
+export const NEW_TERMINAL_KEYS = shortcutKeys("terminal.new");
 export const NEW_BROWSER_TAB_KEYS = [MOD_KEY, "T"] as const;
 export const CLOSE_KEYS = [MOD_KEY, "W"] as const;
 export const CLOSE_WINDOW_KEYS = [MOD_KEY, SHIFT_KEY, "W"] as const;
 export const PIN_SESSION_KEYS = [MOD_KEY, ALT_KEY, "P"] as const;
+export const TOGGLE_UNREAD_KEYS = [MOD_KEY, ALT_KEY, "U"] as const;
 export const ARCHIVE_SESSION_KEYS = [MOD_KEY, SHIFT_KEY, "A"] as const;
 export const FORK_SESSION_KEYS = [MOD_KEY, ALT_KEY, "F"] as const;
 export const QUIT_KEYS = [MOD_KEY, "Q"] as const;
@@ -42,12 +44,13 @@ export const ADDRESS_BAR_KEYS = [MOD_KEY, "L"] as const;
 export const REOPEN_TAB_KEYS = [MOD_KEY, SHIFT_KEY, "T"] as const;
 export const PREVIOUS_TAB_KEYS = [MOD_KEY, SHIFT_KEY, "["] as const;
 export const NEXT_TAB_KEYS = [MOD_KEY, SHIFT_KEY, "]"] as const;
-export const BACK_KEYS = [MOD_KEY, "["] as const;
-export const FORWARD_KEYS = [MOD_KEY, "]"] as const;
-export const COMMAND_PALETTE_KEYS = [MOD_KEY, "K"] as const;
-export const SIDEBAR_TOGGLE_KEYS = [MOD_KEY, ALT_KEY, "["] as const;
-export const RIGHT_SIDEBAR_TOGGLE_KEYS = [MOD_KEY, ALT_KEY, "]"] as const;
-export const SETTINGS_KEYS = [MOD_KEY, ALT_KEY, ","] as const;
+export const BACK_KEYS = shortcutKeys("history.back");
+export const FORWARD_KEYS = shortcutKeys("history.forward");
+export const COMMAND_PALETTE_KEYS = shortcutKeys("palette.commands");
+// The browser chords; the desktop app's are below.
+export const SIDEBAR_TOGGLE_KEYS = shortcutKeys("sidebar.left", { native: false });
+export const RIGHT_SIDEBAR_TOGGLE_KEYS = shortcutKeys("sidebar.right", { native: false });
+export const SETTINGS_KEYS = shortcutKeys("settings.open", { desktopMenu: false });
 
 /** A chord as plain text for native `title` tooltips: "⌘R" on macOS, "Ctrl+R" elsewhere. */
 export function shortcutText(keys: readonly string[]): string {
@@ -79,7 +82,7 @@ export function settingsAriaShortcut(desktopMenu = supportsDesktopCommands()): s
  * ⌘⌥[ in a browser, where ⌘B can open the browser's bookmarks.
  */
 export function sidebarToggleShortcutKeys(native = isNativeShell()): string[] {
-  return native ? [MOD_KEY, "B"] : [...SIDEBAR_TOGGLE_KEYS];
+  return shortcutKeys("sidebar.left", { native });
 }
 
 export function sidebarToggleAriaShortcut(native = isNativeShell()): string {
@@ -88,7 +91,7 @@ export function sidebarToggleAriaShortcut(native = isNativeShell()): string {
 
 /** Keys that toggle the right (Workspace) sidebar: ⇧⌘B in the desktop app, ⌘⌥] in a browser. */
 export function rightSidebarToggleShortcutKeys(native = isNativeShell()): string[] {
-  return native ? [MOD_KEY, SHIFT_KEY, "B"] : [...RIGHT_SIDEBAR_TOGGLE_KEYS];
+  return shortcutKeys("sidebar.right", { native });
 }
 
 export function rightSidebarToggleAriaShortcut(native = isNativeShell()): string {

@@ -12,12 +12,15 @@
 // client-recomputed instant can't match the server anchor for INTERVAL>1 rules)
 // is not violated. Paused rows are NOT dimmed — the title stays fully legible
 // and the pill is the sole paused signal. A hover-revealed ellipsis (⋯) action
-// menu (Run now / Edit / Share / Pause or Resume / Delete) sits on the right;
-// right-clicking the card opens the same actions as a context menu.
+// menu (Run now / Edit / Share / Clone / Pause or Resume / Delete) sits on the right;
+// right-clicking the card opens the same actions as a context menu. On an
+// automation shared with the viewer the subline names its owner, and every
+// action shows disabled with a tooltip saying only the owner can take it.
 
 import { useId, useMemo, useState, type ComponentType, type ReactNode } from "react";
 import {
   CirclePlayIcon,
+  CopyIcon,
   MoreHorizontalIcon,
   PauseIcon,
   PencilIcon,
@@ -46,6 +49,7 @@ import {
 import { cn } from "@/lib/utils";
 import { describeSchedule, formatNextRunAt } from "@/lib/scheduleText";
 import { isTriggerPrompt } from "./triggerTemplates";
+import { automationOwnerName, isSharedWithViewer, OWNER_ONLY_REASONS } from "./ownerOnlyActions";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import type { ScheduledTask } from "@/lib/scheduledTasksApi";
 
@@ -58,6 +62,7 @@ export function ScheduledTaskRow({
   onDelete,
   onShare,
   shareDisabledReason,
+  onClone,
   busy,
 }: {
   task: ScheduledTask;
@@ -74,6 +79,8 @@ export function ScheduledTaskRow({
   onShare?: (task: ScheduledTask) => void;
   /** Shows Share disabled with this reason, e.g. while the server turns sharing off. */
   shareDisabledReason?: string;
+  /** Offers Clone when set: the server can copy an automation under a new ID. */
+  onClone?: (task: ScheduledTask) => void;
   busy: boolean;
 }) {
   const navigate = useNavigate();
@@ -84,6 +91,7 @@ export function ScheduledTaskRow({
   const failureLabelId = useId();
   const failed = task.lastRunStatus === "failed";
   const paused = task.state === "paused";
+  const readOnly = isSharedWithViewer(task);
   // Subtitle: the schedule summary, plus the SERVER's next-run time when armed
   // (active tasks only — a paused task has null nextRunAt). We only format the
   // delta from the server value against the ticking `now`; we never recompute
@@ -129,6 +137,12 @@ export function ScheduledTaskRow({
         )}
       </span>
       <span className="truncate text-ui text-muted-foreground/80" data-testid="task-schedule-line">
+        {readOnly && (
+          <>
+            <span data-testid="task-owner">Shared by {automationOwnerName(task)}</span>
+            {" · "}
+          </>
+        )}
         {triggerMode ? "Runs when new items match" : scheduleSummary}
         {!triggerMode && nextRun && (
           <>
@@ -144,12 +158,14 @@ export function ScheduledTaskRow({
     task,
     paused,
     triggerMode,
+    readOnly,
     onEdit,
     onPauseToggle,
     onRunNow,
     onDelete,
     onShare,
     shareDisabledReason,
+    onClone,
   };
 
   const card = (
@@ -252,6 +268,33 @@ interface TaskMenuItemProps {
   "data-testid"?: string;
 }
 
+// A menu action shown but disabled, with a tooltip saying why. Disabled items
+// take no pointer events, so the wrapper owns the hover.
+function DisabledTaskMenuItem({
+  Item,
+  reason,
+  testId,
+  children,
+}: {
+  Item: ComponentType<TaskMenuItemProps>;
+  reason: string;
+  testId: string;
+  children: ReactNode;
+}) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <div>
+          <Item disabled data-testid={testId}>
+            {children}
+          </Item>
+        </div>
+      </TooltipTrigger>
+      <TooltipContent side="left">{reason}</TooltipContent>
+    </Tooltip>
+  );
+}
+
 // The action list, authored once and rendered under both the ⋯ dropdown and the
 // card's right-click context menu.
 function TaskMenuItems({
@@ -259,62 +302,94 @@ function TaskMenuItems({
   task,
   paused,
   triggerMode,
+  readOnly,
   onEdit,
   onPauseToggle,
   onRunNow,
   onDelete,
   onShare,
   shareDisabledReason,
+  onClone,
 }: {
   Item: ComponentType<TaskMenuItemProps>;
   task: ScheduledTask;
   paused: boolean;
   triggerMode: boolean;
+  /** The automation is shared with the viewer, so every action is the owner's. */
+  readOnly: boolean;
   onEdit: (task: ScheduledTask) => void;
   onPauseToggle: (task: ScheduledTask) => void;
   onRunNow: (task: ScheduledTask) => void;
   onDelete: (task: ScheduledTask) => void;
   onShare?: (task: ScheduledTask) => void;
   shareDisabledReason?: string;
+  onClone?: (task: ScheduledTask) => void;
 }) {
   const { trackClick } = useOmnigentAnalytics();
+  // One action: disabled with the owner-only reason on a shared automation.
+  function action(
+    testId: string,
+    ownerOnlyReason: string,
+    onSelect: () => void,
+    children: ReactNode,
+    variant?: TaskMenuItemProps["variant"],
+  ) {
+    if (readOnly) {
+      return (
+        <DisabledTaskMenuItem Item={Item} reason={ownerOnlyReason} testId={testId}>
+          {children}
+        </DisabledTaskMenuItem>
+      );
+    }
+    return (
+      <Item variant={variant} onSelect={onSelect} data-testid={testId}>
+        {children}
+      </Item>
+    );
+  }
+  const share = (
+    <>
+      <ShareIcon className="size-4" />
+      Share
+    </>
+  );
   return (
     <>
-      {!triggerMode && (
-        <Item
-          onSelect={() => {
+      {!triggerMode &&
+        action(
+          "task-run-now",
+          OWNER_ONLY_REASONS.runNow,
+          () => {
             trackClick("tasks.scheduled.run_now", "button");
             onRunNow(task);
-          }}
-          data-testid="task-run-now"
-        >
-          <PlayIcon className="size-4" />
-          Run now
-        </Item>
-      )}
-      <Item
-        onSelect={() => {
+          },
+          <>
+            <PlayIcon className="size-4" />
+            Run now
+          </>,
+        )}
+      {action(
+        "task-edit",
+        OWNER_ONLY_REASONS.edit,
+        () => {
           trackClick("tasks.scheduled.edit", "button");
           onEdit(task);
-        }}
-        data-testid="task-edit"
-      >
-        <PencilIcon className="size-4" />
-        Edit
-      </Item>
-      {onShare &&
+        },
+        <>
+          <PencilIcon className="size-4" />
+          Edit
+        </>,
+      )}
+      {readOnly ? (
+        <DisabledTaskMenuItem Item={Item} reason={OWNER_ONLY_REASONS.share} testId="task-share">
+          {share}
+        </DisabledTaskMenuItem>
+      ) : (
+        onShare &&
         (shareDisabledReason ? (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <div>
-                <Item disabled data-testid="task-share">
-                  <ShareIcon className="size-4" />
-                  Share
-                </Item>
-              </div>
-            </TooltipTrigger>
-            <TooltipContent side="left">{shareDisabledReason}</TooltipContent>
-          </Tooltip>
+          <DisabledTaskMenuItem Item={Item} reason={shareDisabledReason} testId="task-share">
+            {share}
+          </DisabledTaskMenuItem>
         ) : (
           <Item
             onSelect={() => {
@@ -323,18 +398,31 @@ function TaskMenuItems({
             }}
             data-testid="task-share"
           >
-            <ShareIcon className="size-4" />
-            Share
+            {share}
           </Item>
-        ))}
-      <Item
-        onSelect={() => {
+        ))
+      )}
+      {onClone &&
+        action(
+          "task-clone",
+          OWNER_ONLY_REASONS.clone,
+          () => {
+            trackClick("tasks.scheduled.clone", "button");
+            onClone(task);
+          },
+          <>
+            <CopyIcon className="size-4" />
+            Clone
+          </>,
+        )}
+      {action(
+        "task-pause-toggle",
+        paused ? OWNER_ONLY_REASONS.resume : OWNER_ONLY_REASONS.pause,
+        () => {
           trackClick("tasks.scheduled.pause_resume", "button");
           onPauseToggle(task);
-        }}
-        data-testid="task-pause-toggle"
-      >
-        {paused ? (
+        },
+        paused ? (
           <>
             <CirclePlayIcon className="size-4" />
             Resume
@@ -344,19 +432,21 @@ function TaskMenuItems({
             <PauseIcon className="size-4" />
             Pause
           </>
-        )}
-      </Item>
-      <Item
-        variant="destructive"
-        onSelect={() => {
+        ),
+      )}
+      {action(
+        "task-delete",
+        OWNER_ONLY_REASONS.delete,
+        () => {
           trackClick("tasks.scheduled.delete", "button");
           onDelete(task);
-        }}
-        data-testid="task-delete"
-      >
-        <Trash2Icon className="size-4" />
-        Delete
-      </Item>
+        },
+        <>
+          <Trash2Icon className="size-4" />
+          Delete
+        </>,
+        "destructive",
+      )}
     </>
   );
 }

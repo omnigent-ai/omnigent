@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { ButtonGroup, ButtonGroupText } from "@/components/ui/button-group";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { copyText } from "@/lib/clipboard";
+import { toggleCodeBlockWordWrap, useCodeBlockWordWrap } from "@/lib/codeWrapPreferences";
 import { getEmbedRoot } from "@/lib/host";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { cn } from "@/lib/utils";
@@ -117,7 +118,8 @@ export const MessageAction = ({
       type="button"
       variant={variant}
       className={cn(
-        "mobile-touch-target mobile-app:[&_svg]:size-5!",
+        // Full-height touch targets, narrowed so a row of actions sits closer together.
+        "mobile-touch-target mobile-app:min-w-8! mobile-app:[&_svg]:size-4!",
         "text-muted-foreground hover:text-foreground",
         className,
       )}
@@ -657,9 +659,8 @@ export function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
   const showShellAction = shellCommands && /^(bash|sh|zsh|fish|shell)$/.test(language);
   // Soft-wrap long lines by default so users don't have to scroll horizontally
   // to read code blocks. The toggle restores Streamdown's native
-  // horizontal-scroll view for when column alignment matters.
-  const [wrap, setWrap] = useState(true);
-  const toggleWrap = useCallback(() => setWrap((w) => !w), []);
+  // horizontal-scroll view for every block, and the choice persists.
+  const wrap = useCodeBlockWordWrap();
   const isMermaid = isMermaidPre(children);
   const fenceOpen = useIsCodeFenceIncomplete();
   // A diagram drawn from a fence that is still streaming redraws on every update,
@@ -690,7 +691,7 @@ export function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
       {/* Match Streamdown's action-pill height and reserve its rightmost slot
           for download. All controls stay anchored to the header. */}
       <div className="absolute top-2 right-12 z-10 -mr-1.5 flex items-center gap-0.5 border-y border-transparent py-1">
-        <ChatCodeBlockWrapToggle onToggle={toggleWrap} wrap={wrap} />
+        <ChatCodeBlockWrapToggle onToggle={toggleCodeBlockWordWrap} wrap={wrap} />
         {showShellAction && (
           <Button
             aria-label="Open in a new shell"

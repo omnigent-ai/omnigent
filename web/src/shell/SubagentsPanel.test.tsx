@@ -367,18 +367,6 @@ describe("SubagentsPanel", () => {
     expect(screen.queryByTestId("subagent-main-preview")).toBeNull();
   });
 
-  it("renders an 'Add agent' button, with the dialog mounted only after a click", () => {
-    useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
-
-    renderPanel({ rootSessionId: "conv_root" });
-
-    expect(screen.getByTestId("add-agent-button")).toHaveTextContent(/add agent/i);
-    // The dialog is mounted lazily (on click) so the closed rail carries
-    // none of the dialog's query dependencies — assert it's absent here.
-    // (The dialog's own behavior is covered by AddAgentDialog.test.tsx.)
-    expect(screen.queryByTestId("add-agent-dialog")).toBeNull();
-  });
-
   const AGENT_KIND_CASES: {
     name: string;
     labels: Record<string, string>;

@@ -16,6 +16,7 @@ import {
   readSidebarViewPreferences,
   sidebarBaseOrdering,
   writeSidebarViewPreferences,
+  type SidebarShowField,
   type SidebarViewPreferences,
 } from "@/lib/sidebarViewPreferences";
 import { parseProjectSessionsQueryKey, recentlyCreatedSessions } from "@/lib/sessionListCache";
@@ -42,6 +43,7 @@ import { filterSessionScope, sessionVisibility } from "@/lib/sessionVisibility";
 import { useIdentityReady, useViewerId } from "./useViewerId";
 import { sumPendingApprovals } from "@/lib/inbox";
 import { useAutomationInbox } from "./useAutomationInbox";
+import { useProactiveInbox } from "./useProactiveInbox";
 import { useCommentInbox } from "./useCommentInbox";
 import {
   usePinnedConversations,
@@ -237,8 +239,14 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
   );
   const comments = useCommentInbox(inboxRows);
   const automationInbox = useAutomationInbox(identityReady);
+  const proactiveInbox = useProactiveInbox(identityReady);
   const inboxCount =
-    sumPendingApprovals(inboxRows) + comments.items.length + automationInbox.items.length;
+    sumPendingApprovals(inboxRows) +
+    comments.items.length +
+    automationInbox.items.length +
+    proactiveInbox.unreadCount;
+  // The server stops counting unread suggestions at its limit.
+  const inboxCountCapped = proactiveInbox.unreadCountCapped;
   const watchedIds = useMemo(() => loadedRows.map((row) => row.id), [loadedRows]);
   const mineCursor = mine.data?.pages.at(-1)?.last_id;
   const sharedCursor = shared.data?.pages.at(-1)?.last_id;
@@ -332,8 +340,10 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
     serverInboxRows,
     inboxCount,
     inboxCountIncomplete: automationInbox.hasNextPage,
+    inboxCountCapped,
     comments,
     automationInbox,
+    proactiveInbox,
     watchedIds,
     registerFolder,
     applyLocalResolutions,
@@ -398,6 +408,11 @@ export function useLoadedConversations() {
 /** Loaded rows when a SidebarDataProvider is mounted, else ``undefined``. */
 export function useOptionalLoadedConversations() {
   return useContext(SidebarDataContext)?.loadedData;
+}
+
+/** The sidebar's "Show" row metadata when a SidebarDataProvider is mounted, else none. */
+export function useOptionalSidebarShow(): readonly SidebarShowField[] {
+  return useContext(SidebarDataContext)?.view.show ?? DEFAULT_SIDEBAR_VIEW.show;
 }
 
 /** The caller's own sessions when a SidebarDataProvider is mounted, else ``undefined``. */

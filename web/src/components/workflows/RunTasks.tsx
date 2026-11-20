@@ -14,12 +14,16 @@ import { Link, useNavigate } from "@/lib/routing";
 import { parseEvent } from "@/lib/sse";
 import { cn } from "@/lib/utils";
 import { continuePlanMessage, stopPlanMessage, taskActionMessage } from "@/lib/workflow";
-import { PlanRunButton, type PlanRunControl } from "@/shell/PlanRunButton";
+import { PlanRunButton, type PlanRunButtonState } from "@/shell/PlanRunButton";
 import { ProgressStrip, taskMenuAction, type TaskMenuAction } from "@/shell/TasksPanel";
+import { supersedePlanStop, trackPlanStop } from "@/store/planStops";
 import { openTasksTab } from "@/store/sessionTasksActions";
 
 /** The queries that list a run, e.g. `["workflow-runs", workflowId]`. */
 type RunRefreshKeys = readonly (readonly unknown[])[];
+
+// A run row's workflow link and graph button share one box, so they line up side by side.
+const RUN_ICON_BUTTON_CLASS_NAME = "z-10 shrink-0 text-muted-foreground hover:text-foreground";
 
 /**
  * Messages a run's session from a page other than its chat, then
@@ -39,15 +43,25 @@ function useRunSession(sessionId: string, refreshKeys: RunRefreshKeys, runId: st
       setPending(false);
     }
   };
-  const post = async (text: string) => {
-    if (!runId) return;
+  // Resolves to the session's receipt, or null when it didn't take the message.
+  const deliver = async (text: string) => {
+    if (!runId) return null;
     const result = await sendUserMessage(sessionId, text, runId);
-    if (result.denied) toast.error("A policy blocked the message.");
+    if (!result.denied) return result;
+    toast.error("A policy blocked the message.");
+    return null;
+  };
+  // Any other message the session takes ends the Stop in progress when it was sent.
+  const post = async (text: string) => {
+    const endPlanStop = supersedePlanStop(sessionId);
+    if (await deliver(text)) endPlanStop();
   };
   return {
     pending,
     act: (request: () => Promise<void>) => void act(request),
     send: (text: string) => void act(() => post(text)),
+    stop: (planName: string | null) =>
+      void act(() => trackPlanStop(sessionId, () => deliver(stopPlanMessage(planName)))),
     post,
   };
 }
@@ -72,12 +86,14 @@ async function pendingQuestionFor(sessionId: string, stepId: string): Promise<st
  * runs, continues, retries or stops its task in the run's session.
  *
  * @param sessionId - The run's session; null when it has none, or takes no actions.
+ * @param stopping - Whether the run is already stopping, so its tasks offer no Stop.
  * @returns What a task's ⋯ menu offers, or undefined without a session.
  */
 export function useRunTaskMenus(
   sessionId: string | null | undefined,
   refreshKeys: RunRefreshKeys,
   runId: string | null,
+  stopping = false,
 ): ((item: StepProgress) => TaskMenuAction | undefined) | undefined {
   const session = useRunSession(sessionId ?? "", refreshKeys, runId);
   const navigate = useNavigate();
@@ -98,7 +114,7 @@ export function useRunTaskMenus(
     const menuAction = taskMenuAction(
       item,
       (action, taskName) => session.send(taskActionMessage(action, taskName)),
-      () => session.send(stopPlanMessage(null)),
+      stopping ? undefined : () => session.stop(null),
     );
     return menuAction?.action === "proceed"
       ? { ...menuAction, onSelect: () => proceed(item) }
@@ -154,7 +170,7 @@ export function RunPlanButton({
   runId: string;
   /** The plan's name for the control message, e.g. the workflow's. */
   planName: string | null;
-  control: PlanRunControl;
+  control: PlanRunButtonState;
   refreshKeys: RunRefreshKeys;
   className?: string;
 }) {
@@ -165,7 +181,7 @@ export function RunPlanButton({
       disabled={session.pending}
       className={cn("z-10", className)}
       onClick={() =>
-        session.send(control === "stop" ? stopPlanMessage(planName) : continuePlanMessage(planName))
+        control === "stop" ? session.stop(planName) : session.send(continuePlanMessage(planName))
       }
     />
   );
@@ -187,7 +203,7 @@ export function RunGraphButton({
       type="button"
       variant="ghost"
       size="icon-sm"
-      className={cn("z-10 shrink-0 text-muted-foreground hover:text-foreground", className)}
+      className={cn(RUN_ICON_BUTTON_CLASS_NAME, className)}
       aria-label={`View ${runName} on the graph`}
       title="View this run on the graph"
       data-testid="run-graph-button"
@@ -199,7 +215,14 @@ export function RunGraphButton({
 }
 
 /** Opens the saved workflow a run follows, on the workflow's page. */
-export function RunWorkflowButton({ workflowId }: { workflowId: string }) {
+export function RunWorkflowButton({
+  workflowId,
+  className,
+}: {
+  workflowId: string;
+  /** The row's placement, the same as its graph button's, e.g. `relative -my-1` on a title line. */
+  className?: string;
+}) {
   const { workflows } = useSavedWorkflows();
   const name = workflows.find((workflow) => workflow.id === workflowId)?.name;
   const label = name ? `Open workflow “${name}”` : "Open the workflow";
@@ -208,7 +231,7 @@ export function RunWorkflowButton({ workflowId }: { workflowId: string }) {
       asChild
       variant="ghost"
       size="icon-sm"
-      className="z-10 shrink-0 text-muted-foreground hover:text-foreground"
+      className={cn(RUN_ICON_BUTTON_CLASS_NAME, className)}
     >
       <Link
         to={`/workflows/${encodeURIComponent(workflowId)}`}

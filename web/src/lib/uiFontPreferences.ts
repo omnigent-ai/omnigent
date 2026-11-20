@@ -19,6 +19,7 @@
 // and must be set on the scope root instead. Standalone `getStyleRoot()` IS the
 // document root, so behavior is unchanged.
 
+import { keepsDesktopLayout } from "./desktopAppLayout";
 import { getStyleRoot } from "./host";
 
 const STORAGE_KEY = "omnigent:ui-font-size";
@@ -29,7 +30,7 @@ export const UI_FONT_SIZE_MIN = 11;
 export const UI_FONT_SIZE_MAX = 18;
 export const UI_FONT_SIZE_STEP = 1;
 // Legacy syntax keeps matchMedia compatible with the SPA's Safari 15 target.
-export const UI_FONT_SIZE_MOBILE_QUERY = "not all and (min-width: 48rem)";
+export const UI_FONT_SIZE_MOBILE_QUERY = "not all and (min-width: 73.8125rem)";
 
 /** Clamp an arbitrary number into the supported px range. */
 export function clampUiFontSizePx(px: number): number {
@@ -44,6 +45,7 @@ function defaultUiFontSizePx(): number {
   if (
     typeof window !== "undefined" &&
     typeof window.matchMedia === "function" &&
+    !keepsDesktopLayout() &&
     window.matchMedia(UI_FONT_SIZE_MOBILE_QUERY).matches
   ) {
     return UI_FONT_SIZE_MOBILE_DEFAULT;

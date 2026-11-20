@@ -54,7 +54,10 @@ The newest status for a step is its current one:
   uncertainty and pending CI, jobs or workers do not need this status.
   The agent asks with `sys_workflow_request_input`, which writes the status for
   it, so the question reaches the user's Inbox. It shows as Waiting for you,
-  in pink.
+  in pink. The tool waits about four minutes for the answer. After that the
+  question stays open in the Inbox and chat, the agent ends its turn, and an
+  answer (or a dismissal) reaches the session as a `[System: …]` message that
+  starts the agent's next turn. An unanswered question expires after a day.
 - `failed`: the step's own work failed.
 
 The workflow skill keeps the agent working while any step is ready or started:
@@ -107,10 +110,10 @@ spec can drop it with `tool_groups.journal: false` (see
 | Tool                                                               | Does                                                                                                                                                                                                                                                                            |
 | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `sys_journal_read(conversation_id?, kind?, step?, cursor?, limit?)` | Returns entries as compact lines, oldest first within the page, and `page.next_cursor` for older ones. With no arguments it reads the caller's newest entries. `kind: "plan"` returns plans with their full graphs. Another session's journal needs read access to that session. |
-| `sys_journal_write_plan(name, steps, workflow_id?)`                | Sets the session's plan: its name and the whole graph; returns `{id, position, version}`. `workflow_id` names the saved workflow the plan starts a run of.                                                                                                                      |
+| `sys_journal_write_plan(name, steps, workflow_id?, description?)`  | Sets the session's plan: its name and the whole graph; returns `{id, position, version}`. `workflow_id` names the saved workflow the plan starts a run of. `description` is a workflow planning chat's proposed workflow description; the server refuses one too large to save as the workflow's. |
 | `sys_journal_write_status(status, step?, text?)`                    | Records a step's status. `step` may be left out when the plan has one step. Every status needs every step it depends on to be done first; otherwise the write fails with `step_not_ready`, naming them.                                                                         |
 | `sys_journal_write_note(body, step?)`                               | Adds a note.                                                                                                                                                                                                                                                                    |
-| `sys_workflow_request_input(step, questions)`                      | Asks the user about a task in the current plan and waits for the answer. It marks the task `needs_input` with the first question, raises the questions as an elicitation in the Inbox with the options as buttons, and returns `{answered, answers}`.                           |
+| `sys_workflow_request_input(step, questions)`                      | Asks the user about a task in the current plan and waits a few minutes for the answer. It marks the task `needs_input` with the first question, raises the questions as an elicitation in the Inbox with the options as buttons, and returns `{answered, answers}`, or `{answered: false, still_open: true}` when no answer came in time; a later answer reaches the session as a message. |
 | `sys_workflow_save(name, description, steps)` | Saves a reusable workflow for the session's owner through `POST /v1/workflows`, and returns `{id, name}`, or `name_taken`. The session's current plan is then written again naming the workflow, with no new chat line. The `save-workflow` skill says how to make the steps generic. A save from a session shared with edit access is refused. |
 | `sys_workflow_load(workflow)` | Loads one of the owner's saved workflows by ID or name, with its steps. A name with no exact match returns `workflow_not_found` with the closest names. |
 | `sys_workflow_list(cursor?, limit?)` | Lists the owner's saved workflows by name, 20 at a time unless `limit` says otherwise (at most 50): each one's ID, name and the start of its description, without steps. `next_cursor` pages to the rest. |
@@ -165,16 +168,24 @@ duplicating external actions. An unrecoverable step fails with a reason while
 independent work continues. A worker's claimed blocker must meet the same
 evidence requirement before the coordinator accepts it.
 
-A workflow can run another workflow as one of its steps, such as getting each
-PR in a stack ready to merge. The agent starts the other workflow in its own
-session on the same host, with the workflow skill running. That session
-reports back with `sys_session_message` when its plan finishes, and the agent
-also checks on it periodically with a background timer of its own. Workers get
-the relevant inputs, decisions, authorization and limits, and report blockers
-to their coordinating session. That session resolves them or consolidates the
-remaining human question instead of sending the user to each worker. With the
-`sibling_sessions` feature on, these sessions are grouped with the session that
-started them.
+The agent hands off steps to nested agents rather than its harness's
+sub-agents: steps that run at the same time, long work, and steps that are
+workflows of their own, such as getting each PR in a stack ready to merge.
+Each nested agent is a session of its own, named for its step, where the step
+runs as its workflow and you can follow and message it. The agent chooses
+where each one runs for the step: on its own host and workspace, in a new
+worktree on a host, or in a new managed sandbox, falling back when the server
+doesn't offer one. It also chooses the nested agent's harness, model and
+reasoning effort for the step's complexity, starting from its own.
+For a saved workflow, the agent passes `workflow_id` to `sys_session_create`,
+so that session starts with the workflow's plan and appears in the workflow's
+runs. That session reports back with `sys_session_message` when its plan
+finishes, and the agent also checks on it periodically with a background timer
+of its own. Workers get the relevant inputs, decisions, authorization and
+limits, and report blockers to their coordinating session. That session
+resolves them or consolidates the remaining human question instead of sending
+the user to each worker. With the `sibling_sessions` feature on, these sessions
+are grouped with the session that started them.
 
 ## Saving and reusing a workflow
 
@@ -194,7 +205,15 @@ and the agent writes its plan in the journal and saves it without another
 confirmation. An explicit request to draft, review or try it before saving
 still controls that order. Creating a workflow does not run its steps.
 In the workflow page's planning chat, the agent publishes proposals only;
-**Save plan** applies them to the workflow that already exists.
+**Save plan** applies them to the workflow that already exists. Each proposal
+carries a description for its steps, in the current description's wording
+where that still fits. When a proposal changes the description, the page shows
+the current and proposed descriptions side by side, and Save plan keeps the
+current one unless you choose the proposal's. Either way it records the
+proposal, so a declined description isn't offered again. A proposal's
+description is offered only if it is newer than where the description came
+from: the proposal it was saved from or kept over, or else the workflow's last
+change. A description another client saved after the page loaded stays.
 
 Authoring reads the referenced SOPs, runbooks and relevant linked procedures
 before proposing execution steps. The plan carries forward their actions,
@@ -216,9 +235,14 @@ also ask for a saved workflow by name in chat ("run my flaky-test triage
 workflow").
 
 To run a saved workflow on a schedule or a trigger, pick it in New
-automation's **Workflow (optional)** field. Each run follows the workflow
-without a plan review, and the automation's **Additional instructions**
-customize it. No one is watching the run, so nothing in it waits for you.
+automation's **Workflow (optional)** field. Each run follows the workflow as
+saved, without a plan review. No one is watching the run, so nothing in it
+waits for you.
+Each run gets its own new session: a schedule can't continue one session, and
+a trigger starts a session for each match rather than one task session. On a
+server that advertises `session_create_workflow_id` in `/v1/info`, a trigger's
+session starts as a run of the workflow, so the workflow's page lists it right
+away; otherwise the session loads the workflow when it starts work.
 The agent first looks up missing inputs, chooses reversible defaults and tries
 bounded recovery within your existing authorization. It records its choices
 in the journal. Missing input or approval justifies a failure only with the
@@ -241,6 +265,24 @@ agent writes the saved workflow's steps as its plan, so runs from before this
 release don't appear. Hover a step in the graph to see all of it. In a run's
 graph, the card says where the task stands, as the strip's does, and a step's
 **⋯** menu has its task's action.
+
+A run that started other workflow runs, as in "A workflow can run another
+workflow" above, shows **Ran N workflows** under its tasks. The list holds every
+workflow run below it, flat, each right after the run that started it. Each
+session its session started before its next run adds the workflow run that
+session began with, and so on below: each of those sessions adds only the
+sessions it started before its own next run. Session start times are in whole
+seconds, so a session started in the same second as its starter's next run
+counts toward that next run. The list starts open while any of them is working
+or waiting, including runs past the first 20, which **Show more** loads. Only
+runs of your own workflows link to their workflow or offer actions. A run there that another of them started, and a run on the
+called workflow's own page, says **Started by** and links to the session that
+started it. A session's Tasks tab shows the same list for its current run when
+that run follows a saved workflow, for anyone who can read the session. The
+links follow the `omnigent.created_by_session_id` label and session family of
+the sessions `sys_session_create` starts on a host or sandbox, so they need the
+default `sibling_sessions` feature. Child sessions, and sessions started in
+another project, aren't listed.
 
 ## Automations
 
@@ -302,7 +344,10 @@ beside "Updated …", asks the agent to continue the plan from where it left off
 Continue, Run and Retry also ask it to resume or restart needed background
 tasks, agents and Omnigent sessions recursively, checking their state to avoid
 duplicating live or completed work. The header's Stop remains available while
-background tasks or child agents run after the main turn ends. A run's row on a
+background tasks or child agents run after the main turn ends. Once pressed, it
+shows a disabled **Stopping…** until the session stops working, then the play
+button. A stop message that doesn't go through brings Stop back, and so does
+another message the session takes, such as Continue. A run's row on a
 workflow's or an automation's page has the same buttons, and its strip and its
 graph the same task menus, which message the run's session. A summary line and a strip
 count the tasks in each state, and stay at the top as you scroll: hover a
@@ -310,7 +355,9 @@ segment of the strip for a card with that task's status and its **⋯** menu, or
 click it to jump to the task. In
 a plan, the strip links two neighboring tasks when one waits on the other, so a
 gap between them means they can run at the same time; hovering a task's segment
-arcs it to the tasks it waits on and the tasks that wait on it. When the agent replans, the new
+arcs it to the tasks it waits on and the tasks that wait on it. To see a plan's
+parallel branches, the graph button beside "Updated …" opens the plan's graph
+full screen, as a run's row does, with each task's state and **⋯** menu. When the agent replans, the new
 tasks simply appear. A task's chevron opens what it waits on, its goal and its
 history: each status, oldest first. Tasks from the agent's own list show only
 their name and state.
@@ -373,8 +420,8 @@ servers that keep journals.
 
 ## Saved workflows
 
-A saved workflow is a named plan its owner can run, private to that owner, with
-steps in the plan's step format. Running one will copy its steps into the
+A saved workflow is a named plan its owner can run, private to that owner unless
+they share it (see below), with steps in the plan's step format. Running one will copy its steps into the
 session's journal as the plan, and the entries written under it carry its ID in
 `workflow_id`. Saving a session's plan as a workflow names it the same way, so
 the Tasks tab marks the plan with a Workflow chip either way. Saving uses
@@ -393,10 +440,35 @@ it ran.
   and `steps`. Text within the character limit can exceed the stored-byte limit;
   the server rejects it without saving and reports the stored size and limit.
 - `GET /v1/workflows/{id}`: one workflow, with its steps. Another user's
-  workflow is 404.
+  workflow is 404 unless it is shared with the caller. `viewer_role` is `owner`
+  or `viewer`, and a viewer also gets `owner_display_name`.
+- `GET /v1/workflows/shared`: the workflows other people shared with the caller,
+  ordered by ID; `limit` (1–100, default 50) and `after` (the previous page's
+  `next_cursor`). A page can be short, even empty, while `next_cursor` is set.
 - `PATCH /v1/workflows/{id}`: any of `name`, `description` and `steps`; fields
-  left out keep their values.
-- `DELETE /v1/workflows/{id}`: deletes it.
+  left out keep their values. With `expected_description`, the new description
+  applies only while the stored one is still that text. `description_source`
+  names the planning-chat proposal the description was saved from or kept
+  over; the workflow returns it until the description is written without one or
+  another planning chat is attached.
+- `DELETE /v1/workflows/{id}`: deletes it, then who it was shared with.
+
+### Sharing a workflow
+
+The owner shares a workflow through `/v1/workflows/{id}/permissions`, like an
+automation: `GET` lists the grants, `PUT` with `user_id` and `level` adds one,
+and `DELETE /v1/workflows/{id}/permissions/{user_id}` removes one. Grants are
+Read only and never public, and only the owner may call these routes; agents
+may not. People a workflow is shared with, directly or through a group, can
+view it, run it and copy it, but only its owner can change, share or delete it.
+A run is the runner's own session, so runs stay private: the runs list shows
+each caller the runs in sessions they can read. An agent can load a shared
+workflow by ID, so a run of one can read its description; lookups by name and
+`sys_workflow_list` keep to the caller's own workflows. Each workflow reports
+`shareable: false` when the server can't keep its grants, such as one saved
+before sharing was available, and `GET /v1/info` reports `workflow_sharing:
+true` on servers that share workflows. The server's sharing mode applies: with
+sharing off, nothing new can be shared.
 
 Workflows live in `workflows`, keyed by workspace and ID, with encoded JSON
 steps of at most 16,383 bytes stored. A unique index enforces names per workspace
@@ -404,9 +476,10 @@ and owner; single-user mode stores the reserved `local` owner. Names follow the
 database's collation: case-insensitive on MySQL, case-sensitive on SQLite and
 PostgreSQL. `GET /v1/info` reports `workflows: true` on servers that store them.
 
-Deleting an account removes its saved workflows in bounded batches. Reusing a
-deleted username waits for any interrupted cleanup to finish, so a new account
-cannot inherit the old workflows. Rotating credentials preserves workflows.
+Deleting an account removes its saved workflows, the grants on them and the
+workflow grants it held, in bounded batches. Reusing a deleted username waits
+for any interrupted cleanup to finish, so a new account cannot inherit the old
+workflows or grants. Rotating credentials preserves workflows.
 
 ## Usage telemetry
 

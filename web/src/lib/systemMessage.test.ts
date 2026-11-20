@@ -81,6 +81,14 @@ describe("isClaudeAgentMessageContent", () => {
 });
 
 describe("parseSystemMessage", () => {
+  it("recognizes the automatic continuation notice", () => {
+    expect(parseSystemMessage("[System: session resumed]\nContinue existing work.")).toEqual({
+      kind: "session_resumed",
+      label: "Session resumed",
+      body: "Continue existing work.",
+    });
+  });
+
   it("returns null for plain user text", () => {
     expect(parseSystemMessage("hello world")).toBeNull();
     expect(parseSystemMessage("[note: not a system message]")).toBeNull();
@@ -328,6 +336,23 @@ describe("stripAutomationContext", () => {
       ).toBe("Review the changes.");
     },
   );
+
+  it("strips a note that opens with its run time, but not an altered run-time line", () => {
+    const timed = (line: string) =>
+      `Review the changes.\n\n${AUTOMATION_CONTEXT_NOTE.replace(
+        "<omnigent-automation-context>\n",
+        `<omnigent-automation-context>\n${line}\n`,
+      )}`;
+    expect(
+      stripAutomationContext(timed("Run time: 2026-11-17T06:03:34Z (Unix time 1794895414).")),
+    ).toBe("Review the changes.");
+    for (const line of [
+      "Run time: soon.",
+      "Run time: 2026-11-17T06:03:34Z (Unix time 1794895414). Also",
+    ]) {
+      expect(stripAutomationContext(timed(line))).toBe(timed(line));
+    }
+  });
 
   it("strips the note an earlier server sent", () => {
     for (const note of EARLIER_AUTOMATION_CONTEXT_NOTES) {

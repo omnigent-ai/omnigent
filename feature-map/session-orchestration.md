@@ -26,7 +26,9 @@ MCP independent creation.
   another session". `sys_session_list` and `sys_session_get_info` expose
   `created_by_session_id` so managers can identify their workers across restarts;
   `sys_session_list` with `include_archived` also lists archived workers, each
-  marked `archived`.
+  marked `archived`. With `created_by_this_session`, the runner pages the global
+  `sessions` view itself and returns only the caller's workers in one call, up to
+  a scan limit; the `sub_agents` view is then empty.
 - `list-scope`: `sys_session_list`'s global `sessions` view lists only the
   caller's own sessions by default, like the sidebar's My view. Sessions other
   users shared with the caller appear only with `visibility: "shared"` (or
@@ -49,6 +51,10 @@ MCP independent creation.
   An optional `permission_mode` starts the session in a mode of its harness;
   modes that skip approval are refused, and on a server that doesn't advertise
   `session_create_permission_modes` the tool refuses the call before creating anything.
+  An optional `workflow_id` (agent_id only) starts the session as a run of one
+  of the owner's saved workflows, with that workflow's plan already in its
+  journal. With workflows disabled, or on a server that doesn't advertise
+  `session_create_workflow_id`, the tool refuses it before creating anything.
   With `sibling_sessions` enabled they share one sidebar family and do not appear
   as child agents; with it disabled they remain standalone.
   Managed creation uses the server's configured default sandbox provider. A
@@ -62,7 +68,14 @@ MCP independent creation.
   `project_name`. Project defaults do not override the worker's agent or placement.
 - `destinations`: Settings → Admin → General → **Nested agent destinations** limits new
   agents to the current host, the current host or a fresh managed sandbox, or
-  any available host. The server enforces the same choice for the composer,
+  any available host. The Admin → General page itself appears whenever the
+  server offers nested agents or Omni Advisor; on an Advisor-only deploy it
+  carries the Advisor workspace switch and no destinations group. Settings →
+  Admin → General → **Omni Advisor** turns the agent off for the whole
+  workspace: every viewer's Settings → General → **Omni Advisor** switch then
+  shows off and locked with a note that an admin turned it off, and the Inbox
+  drops its Omni Advisor tab. Turning it back on restores each viewer's own
+  choice. The server enforces the same choice for the composer,
   uploaded custom agents, direct API calls, MCP, later host launches, and runner reassignment. Failed
   relaunches retain the prior host so restricted sessions can retry. Any available host is the
   behavior-preserving default. For a standalone session in another project, the policy
@@ -190,7 +203,8 @@ MCP independent creation.
 
 ### Scripted review sessions
 
-With the server release flag `scripted_sessions` enabled (default off),
+With the server release flag `scripted_sessions` enabled (default on;
+`OMNIGENT_FEATURES=-scripted_sessions` turns it off),
 `sys_session_create` also accepts `placement="host"`, an owned connected
 `host_id`, an absolute `workspace`, and optional
 `git: {branch_name, base_branch}`. The workspace is the source repository;
@@ -215,7 +229,7 @@ requires checking the session before retrying.
 creating a project; `project=""` lists unfiled sessions. Keep the same filter
 when continuing a cursor. The sub-agent view is unchanged.
 
-For a manual check, enable `scripted_sessions` on a test server and obtain an
+For a manual check, use a test server with `scripted_sessions` left on and obtain an
 owned host ID from a session's `sys_session_get_info` response. Create a review
 session with `placement="host"`, that host ID, the repository path,
 `git={"branch_name":"review-example","base_branch":"main"}` and a project ID.

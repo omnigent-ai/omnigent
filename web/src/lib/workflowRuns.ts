@@ -22,6 +22,8 @@ export interface WorkflowRun {
   sessionStatus: "idle" | "running" | "failed";
   /** Work that outlives the parent turn, such as background shells or an active goal. */
   backgroundWorkRunning?: boolean;
+  /** The session's sandbox is still launching, so the run is starting; absent on older servers. */
+  sandboxLaunching?: boolean;
   archived: boolean;
   /** The run's latest steps, counted by their current status. */
   progress: {
@@ -35,11 +37,40 @@ export interface WorkflowRun {
   steps: JournalPlanStep[];
   /** Each of those steps' newest status entry. */
   statuses: JournalEntry[];
+  /** The saved workflow the run follows; absent on older servers. */
+  workflowId?: string;
+  /** The session that started the run, when another session did and you can read it. */
+  startedBy?: WorkflowRunStarter;
+  /** Its workflow's name when the workflow is yours; `null` for someone else's or a deleted one. */
+  workflowName?: string | null;
+  /** The first page of the workflow runs below this one, each right after the run that started it. */
+  descendantRuns?: WorkflowRun[];
+  /** How many workflow runs are below this one, on every page. */
+  descendantRunCount?: number;
+  /** Continues `descendantRuns`; `null` when they are all here. */
+  descendantRunsCursor?: string | null;
+  /** Whether any run below this one, on any page, is working or waiting for input. */
+  descendantRunsActive?: boolean;
 }
 
-/** The session's turn, delegated work, or work left running between turns. */
+/** The session that started a workflow run. */
+export interface WorkflowRunStarter {
+  sessionId: string;
+  /** Its title; empty when it has none yet. */
+  title: string;
+}
+
+/** The run is starting: its session waits on a sandbox that is still launching. */
+export function isWorkflowRunLaunching(run: WorkflowRun): boolean {
+  return run.isCurrent && run.sandboxLaunching === true;
+}
+
+/** The session's turn, delegated work, work left running between turns, or its sandbox launch. */
 export function isWorkflowRunWorking(run: WorkflowRun): boolean {
-  return run.isCurrent && (run.sessionStatus === "running" || run.backgroundWorkRunning === true);
+  return (
+    isWorkflowRunLaunching(run) ||
+    (run.isCurrent && (run.sessionStatus === "running" || run.backgroundWorkRunning === true))
+  );
 }
 
 /** Where each of the run's steps stands, as the Tasks tab works it out. */

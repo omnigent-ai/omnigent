@@ -273,6 +273,15 @@ def create_default_policies_router(
                 "Authentication required",
                 code=ErrorCode.UNAUTHORIZED,
             )
+        # Backends may restrict who can see server-wide (global) policies; the
+        # default allows everyone. Run off-loop as the check may do I/O.
+        if permission_store is not None and not await asyncio.to_thread(
+            permission_store.can_list_default_policies, user_id
+        ):
+            raise OmnigentError(
+                "Not permitted to list default policies",
+                code=ErrorCode.FORBIDDEN,
+            )
         policies = store.list_defaults()
         data = [_entity_to_response(p) for p in policies]
         data.extend(_config_policies_to_response())
