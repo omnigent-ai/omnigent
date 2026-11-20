@@ -12,6 +12,7 @@ import {
   getSelectionOffsets,
   indexToLine,
   getModelFormat,
+  hasNoTextDiff,
   isBinaryPath,
   isImageFile,
   isModelFile,
@@ -1070,5 +1071,18 @@ describe("hasRawHtmlNode", () => {
     [{ type: "root" }, false],
   ])("detects raw HTML in case %#", (tree, expected) => {
     expect(hasRawHtmlNode(tree)).toBe(expected);
+  });
+});
+
+describe("hasNoTextDiff", () => {
+  it.each(["logo.png", "logo.svg", "report.pdf", "clip.mp4", "part.stl", "archive.zip"])(
+    "has no text diff for %s",
+    (path) => {
+      expect(hasNoTextDiff(path)).toBe(true);
+    },
+  );
+
+  it.each(["src/app.ts", "README.md", "config.json"])("diffs %s as text", (path) => {
+    expect(hasNoTextDiff(path)).toBe(false);
   });
 });

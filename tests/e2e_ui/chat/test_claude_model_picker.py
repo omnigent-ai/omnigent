@@ -6,6 +6,7 @@ import json
 import os
 import re
 import signal
+import subprocess
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -15,6 +16,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, Route, expect
 
+from omnigent.harnesses.claude_native import bridge, model_switch
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
     CONTEXT_RAW_FILE,
@@ -1299,6 +1301,7 @@ def test_claude_native_picker_repeated_pins_reach_the_real_terminal(
     page: Page,
     native_claude_pinned_mock_session: tuple[str, str],
     mock_llm_server_url: str,
+    tmp_path: Path,
 ) -> None:
     """Repeated alias picks retain their generation and context on subsequent turns."""
     base_url, session_id = native_claude_pinned_mock_session
@@ -1379,6 +1382,79 @@ def test_claude_native_picker_repeated_pins_reach_the_real_terminal(
     _open_terminal_view(page)
     _wait_terminal_connected(page)
     _screenshot(page, "real-native-pinned-model-switches")
+
+    advert = _tmux_advert(base_url, session_id)
+    assert advert is not None, "The owned Claude terminal advertised no tmux pane"
+    tmux = ["tmux", "-S", advert["socket_path"]]
+    target = advert["tmux_target"]
+    columns = int(
+        subprocess.check_output(
+            [*tmux, "display-message", "-p", "-t", target, "#{pane_width}"],
+            text=True,
+            timeout=5,
+        )
+    )
+    long_draft = "draft-start " + "0123456789 " * (columns // 8 + 1) + "draft-end"
+    split_at = long_draft.index(" ", columns // 2)
+    drafts = {
+        "soft-wrap": long_draft,
+        "hard-newline": long_draft[:split_at] + "\n" + long_draft[split_at:],
+    }
+    evidence = Path(os.environ.get("OMNIGENT_E2E_RECORD_DIR", str(tmp_path)))
+    evidence.mkdir(parents=True, exist_ok=True)
+    with httpx.Client(base_url=base_url, timeout=40) as client:
+        for kind, draft in drafts.items():
+            buffer_name = f"owned-renderer-{uuid.uuid4().hex}"
+            subprocess.run(
+                [*tmux, "load-buffer", "-b", buffer_name, "-"],
+                input=draft,
+                text=True,
+                check=True,
+                timeout=5,
+            )
+            subprocess.run(
+                [*tmux, "paste-buffer", "-d", "-p", "-b", buffer_name, "-t", target],
+                check=True,
+                timeout=5,
+            )
+            poll_until(
+                lambda: "draft-end" in bridge._capture_pane(advert["socket_path"], target),
+                timeout_s=10,
+            )
+            raw = bridge._capture_pane(advert["socket_path"], target)
+            joined = bridge._capture_pane(advert["socket_path"], target, join_wrapped=True)
+            (evidence / f"{kind}-renderer.json").write_text(
+                json.dumps(
+                    {"columns": columns, "input": draft, "raw": raw, "joined": joined},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            box = bridge._composer_box(raw)
+            assert box is not None and box.framed and len(box.rows) > 1
+            assert model_switch._draft(joined) == draft, (
+                "The actual renderer did not preserve draft newline provenance; "
+                f"inspect {kind}-renderer.json before accepting model-control ownership"
+            )
+            refused = client.patch(f"/v1/sessions/{session_id}", json={"model_override": "opus"})
+            assert refused.status_code == 503, refused.text
+            assert (
+                model_switch._draft(
+                    bridge._capture_pane(advert["socket_path"], target, join_wrapped=True)
+                )
+                == draft
+            )
+            assert _live_claude_snapshot(base_url, session_id)["llm_model"] == (
+                _native_claude_wire_model(_PINNED_CLAUDE_MODELS["sonnet"])
+            )
+            _screenshot(page, f"real-native-{kind}-draft-refused")
+            subprocess.run([*tmux, "send-keys", "-t", target, "C-c"], check=True, timeout=5)
+            poll_until(
+                lambda: (
+                    model_switch._draft(bridge._capture_pane(advert["socket_path"], target)) == ""
+                ),
+                timeout_s=10,
+            )
 
 
 @pytest.mark.nightly

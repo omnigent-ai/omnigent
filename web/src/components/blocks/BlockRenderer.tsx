@@ -894,6 +894,7 @@ function renderItem(
             allowShellCommands
             mode={isTextStreaming || keepsStreamingMode(item) ? "streaming" : "static"}
             isStreaming={isTextStreaming}
+            linkPullRequestRefs
           >
             {item.text}
           </FilePathAwareMessageResponse>

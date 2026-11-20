@@ -600,11 +600,12 @@ def _find_codex_cli() -> str | None:
     return resolve_cli_binary("codex", env_var=_CODEX_PATH_ENV)
 
 
-async def _codex_cli_version_text(codex_path: str) -> str | None:
+async def _codex_cli_version_text(codex_path: str, *leading_args: str) -> str | None:
     """Return the exact version token reported by ``codex --version``."""
     try:
         proc = await _create_subprocess_exec(
             codex_path,
+            *leading_args,
             "--version",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
@@ -615,12 +616,16 @@ async def _codex_cli_version_text(codex_path: str) -> str | None:
         stdout, _ = await asyncio.wait_for(
             proc.communicate(), timeout=_CODEX_VERSION_PROBE_TIMEOUT_SECONDS
         )
-    except TimeoutError:
-        with suppress(ProcessLookupError):
-            proc.kill()
-        with suppress(Exception):
-            await asyncio.wait_for(proc.wait(), timeout=1)
-        close_subprocess_transport(proc)
+    except (TimeoutError, asyncio.CancelledError) as error:
+        try:
+            with suppress(ProcessLookupError):
+                proc.kill()
+            with suppress(Exception):
+                await asyncio.wait_for(proc.wait(), timeout=1)
+        finally:
+            close_subprocess_transport(proc)
+        if isinstance(error, asyncio.CancelledError):
+            raise
         return None
     match = re.fullmatch(
         r"\s*codex-cli\s+(\d+\.\d+\.\d+(?:[-.][A-Za-z0-9.-]+)?)\s*",
@@ -629,7 +634,7 @@ async def _codex_cli_version_text(codex_path: str) -> str | None:
     return match.group(1) if match is not None else None
 
 
-async def _codex_cli_version(codex_path: str) -> tuple[int, int, int] | None:
+async def _codex_cli_version(codex_path: str, *leading_args: str) -> tuple[int, int, int] | None:
     """
     Return the codex CLI version as a ``(major, minor, patch)`` tuple.
 
@@ -640,12 +645,14 @@ async def _codex_cli_version(codex_path: str) -> tuple[int, int, int] | None:
 
     :param codex_path: Path to the codex CLI, e.g.
         ``"/usr/local/bin/codex"``.
+    :param leading_args: Args placed before ``--version``, such as a
+        configured wrapper's prefix, e.g. ``("codex", "--")``.
     :returns: The parsed version, e.g. ``(0, 136, 0)``, or ``None`` if
         the command cannot be run, times out, or its output has no
         ``X.Y.Z`` token (caller treats ``None`` as "version unknown", not
         "too old").
     """
-    raw = await _codex_cli_version_text(codex_path)
+    raw = await _codex_cli_version_text(codex_path, *leading_args)
     if raw is None:
         return None
     match = re.match(r"(\d+)\.(\d+)\.(\d+)", raw)

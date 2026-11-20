@@ -1974,6 +1974,8 @@ def _resolve_gateway_env(
     # that cannot negotiate betas keeps the original workaround.
     if is_databricks_ai_gateway_url(base_url):
         gateway_env["CLAUDE_CODE_USE_GATEWAY"] = "1"
+        # The gateway rejects advisor tools instead of retrying without them.
+        gateway_env["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"] = "1"
         gateway_env[_ANTHROPIC_CUSTOM_HEADERS_ENV] = with_gateway_attribution_lines(
             gateway_env.get(_ANTHROPIC_CUSTOM_HEADERS_ENV),
             CLAUDE_CODE_AGENT,
