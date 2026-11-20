@@ -315,19 +315,25 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     const before = lastSeenRef.current.get(input) ?? after;
     lastSeenRef.current.set(input, after);
     const released = releasedRef.current;
-    if (!isHistoryInput(event) || released === NO_TAGS) return;
-    // Only tokens the undo or redo itself brought back; others in the text stay literal.
+    if (released === NO_TAGS) return;
     const owned = ownedMentionTokens();
     const countBefore = tokenCounts(before, owned);
-    const restored = new Set(
+    const added = new Set(
       [...tokenCounts(after, owned)]
         .filter(([token, count]) => count > (countBefore.get(token) ?? 0))
         .map(([token]) => token),
     );
-    reclaim({
-      files: released.files.filter((it) => restored.has(fileMentionToken(it))),
-      sessions: released.sessions.filter((it) => restored.has(sessionTagToken(it))),
-    });
+    const addedTags = {
+      files: released.files.filter((it) => added.has(fileMentionToken(it))),
+      sessions: released.sessions.filter((it) => added.has(sessionTagToken(it))),
+    };
+    if (isHistoryInput(event)) {
+      reclaim(addedTags);
+    } else {
+      // A released token typed or pasted by hand is literal text, so no later undo or redo may
+      // turn it back into the old tag.
+      releasedRef.current = withoutTags(released, addedTags);
+    }
   };
 
   const resetMentions = (mentions?: TaggedMentions) => {

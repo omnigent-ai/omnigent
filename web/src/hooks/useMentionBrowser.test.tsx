@@ -205,6 +205,28 @@ describe("useMentionBrowser released tags", () => {
     expect(result.current.browser.mentionTokens).toEqual([]);
   });
 
+  it("keeps a retyped token literal when an undo and redo replay that typing", () => {
+    const { result } = renderBrowser();
+    tagReadme(result);
+    change(result, "Read  ", false);
+    change(result, "Read @readme.md ", false);
+
+    change(result, "Read  ", true);
+    change(result, "Read @readme.md ", true);
+    expect(result.current.browser.mentionTokens).toEqual([]);
+  });
+
+  it("keeps a retyped token literal when an undo brings back its deletion", () => {
+    const { result } = renderBrowser();
+    tagReadme(result);
+    change(result, "Read  ", false);
+    change(result, "Read @readme.md ", false);
+    change(result, "Read  ", false);
+
+    change(result, "Read @readme.md ", true);
+    expect(result.current.browser.mentionTokens).toEqual([]);
+  });
+
   it("forgets deleted tags on a reset, so an undo in the next draft can't restore them", () => {
     const { result } = renderBrowser();
     tagReadme(result);
