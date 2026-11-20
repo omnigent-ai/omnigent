@@ -653,8 +653,9 @@ def test_occurrence_uniqueness_is_scoped_to_workspace_and_task(
 
 
 @pytest.fixture
-def dispatch_migration_engine(tmp_path: Path) -> Iterator[Engine]:
+def dispatch_migration_engine(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[Engine]:
     """Pin rollback tests without rewinding the shared, head-migrated worker DB."""
+    starting_revision = getattr(request, "param", _DISPATCH_REVISION)
     root_uri = os.environ.get("OMNIGENT_TEST_DB_URI")
     admin = sa.create_engine(root_uri, isolation_level="AUTOCOMMIT") if root_uri else None
     uri = f"sqlite:///{tmp_path / 'dispatch.db'}"
@@ -674,9 +675,9 @@ def dispatch_migration_engine(tmp_path: Path) -> Iterator[Engine]:
             # CRDB bootstraps metadata at head; pin rollback tests to this revision.
             engine.dispose()
             engine = get_or_create_engine(uri).execution_options(isolation_level="SERIALIZABLE")
-            command.downgrade(config, _DISPATCH_REVISION)
+            command.downgrade(config, starting_revision)
         else:
-            command.upgrade(config, _DISPATCH_REVISION)
+            command.upgrade(config, starting_revision)
         yield engine
     finally:
         if engine is not None:
@@ -1038,14 +1039,12 @@ def _conversation_indexes(engine: Engine) -> dict[str, list[str]]:
     }
 
 
+@pytest.mark.parametrize("dispatch_migration_engine", [_SESSION_MODE_PREVIOUS], indirect=True)
 def test_session_mode_migration_defaults_existing_tasks_and_round_trips(
     dispatch_migration_engine: Engine,
 ) -> None:
     engine = dispatch_migration_engine
     config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
-    with engine.begin() as conn:
-        config.attributes["connection"] = conn
-        command.upgrade(config, _SESSION_MODE_PREVIOUS)
     values = {
         "name": "nightly",
         "prompt": b"p",
@@ -1099,14 +1098,12 @@ def test_session_mode_migration_defaults_existing_tasks_and_round_trips(
     }
 
 
+@pytest.mark.parametrize("dispatch_migration_engine", [_MCP_SERVICES_PREVIOUS], indirect=True)
 def test_mcp_services_migration_keeps_existing_tasks_and_round_trips(
     dispatch_migration_engine: Engine,
 ) -> None:
     engine = dispatch_migration_engine
     config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
-    # Later migrations open their own autocommit blocks on PostgreSQL, so this
-    # upgrade cannot run inside an outer transaction.
-    command.upgrade(config, _MCP_SERVICES_PREVIOUS)
     values = {
         "name": "nightly",
         "prompt": b"p",
@@ -1144,14 +1141,12 @@ def test_mcp_services_migration_keeps_existing_tasks_and_round_trips(
         assert conn.execute(sa.select(tasks.c.mcp_services)).scalars().all() == [None, None]
 
 
+@pytest.mark.parametrize("dispatch_migration_engine", [_KIND_PREVIOUS], indirect=True)
 def test_kind_migration_makes_existing_tasks_automations_and_round_trips(
     dispatch_migration_engine: Engine,
 ) -> None:
     engine = dispatch_migration_engine
     config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
-    # Later migrations open their own autocommit blocks on PostgreSQL, so this
-    # upgrade cannot run inside an outer transaction.
-    command.upgrade(config, _KIND_PREVIOUS)
     values = {
         "name": "nightly",
         "prompt": b"p",
@@ -1186,14 +1181,12 @@ def test_kind_migration_makes_existing_tasks_automations_and_round_trips(
         assert conn.execute(sa.select(tasks.c.kind)).scalars().all() == [1, 1]
 
 
+@pytest.mark.parametrize("dispatch_migration_engine", [_SMART_ROUTING_PREVIOUS], indirect=True)
 def test_smart_routing_migration_leaves_existing_tasks_unset_and_round_trips(
     dispatch_migration_engine: Engine,
 ) -> None:
     engine = dispatch_migration_engine
     config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
-    # Later migrations open their own autocommit blocks on PostgreSQL, so this
-    # upgrade cannot run inside an outer transaction.
-    command.upgrade(config, _SMART_ROUTING_PREVIOUS)
     values = {
         "name": "nightly",
         "prompt": b"p",
