@@ -973,11 +973,13 @@ class _ForwardDedupeState:
     # partial answer.
     btw_pending_key: str | None = None
     posted_btw_keys: dict[str, None] = field(default_factory=dict)
-    # The visible API retry already reported as failed / interrupted, and its
-    # turn; they clear once the retry row leaves the pane or another turn starts.
+    # Hook cursor of the latest parent prompt; it identifies a turn before any output.
+    prompt_submit_cursor: int | None = None
+    # The visible API retry already reported as failed / interrupted, and its prompt;
+    # they clear once the retry row leaves the pane or a newer prompt is submitted.
     api_retry_reported: bool = False
     api_retry_interrupted: bool = False
-    api_retry_response_id: str | None = None
+    api_retry_prompt_cursor: int | None = None
     # Session already logged as moved off this runner, so the notice is not
     # repeated for every item dropped afterwards.
     session_not_bound_logged_for: str | None = None
@@ -4475,6 +4477,7 @@ async def _forward_available_status_events(
             if record.event_name == "UserPromptSubmit" and not _is_subagent_hook_record(
                 record, parent_claude_session_ids=parent_claude_session_ids
             ):
+                dedupe.prompt_submit_cursor = record.event_cursor
                 with contextlib.suppress(Exception):
                     # This proves Claude saw a submit; later hooks can still block the turn.
                     _logger.info(
@@ -6351,13 +6354,10 @@ async def _stop_rejected_api_retry(
     :param dedupe: Shared per-session dedupe state; mutated in place.
     """
     # A prompt sent soon after an interrupt can retry before any capture shows no row.
-    if retry is None or (
-        dedupe.api_retry_response_id is not None
-        and response_id not in (None, dedupe.api_retry_response_id)
-    ):
+    if retry is None or dedupe.api_retry_prompt_cursor != dedupe.prompt_submit_cursor:
         dedupe.api_retry_reported = False
         dedupe.api_retry_interrupted = False
-        dedupe.api_retry_response_id = None
+        dedupe.api_retry_prompt_cursor = dedupe.prompt_submit_cursor
     if retry is None:
         return
     if retry.status not in _REJECTED_API_RETRY_STATUSES or dedupe.api_retry_interrupted:
@@ -6376,7 +6376,9 @@ async def _stop_rejected_api_retry(
                 response_id=response_id,
                 failure_detail=detail,
                 failure_context={
-                    "failure_id": native_failure_id("claude_api_retry", session_id, response_id),
+                    "failure_id": native_failure_id(
+                        "claude_api_retry", session_id, dedupe.api_retry_prompt_cursor, response_id
+                    ),
                     "failure_source": "claude_api_retry",
                     "native_harness": "claude-native",
                     "detail_source": "pane_retry_status",
@@ -6396,7 +6398,6 @@ async def _stop_rejected_api_retry(
             )
             return
         dedupe.api_retry_reported = True
-        dedupe.api_retry_response_id = response_id
     try:
         await asyncio.to_thread(inject_interrupt, bridge_dir, timeout_s=1.0)
     except RuntimeError:
