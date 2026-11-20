@@ -1,5 +1,5 @@
-# Configuration reference: whole-process network denial blocks network model providers.
-# See README.md before running this Claude SDK example.
+# Configuration reference: Claude SDK does not support worker TCP-egress routing.
+# Brokered model inference is supported. See README.md for the routing limitation.
 name: tcp-egress-local-http
 executor:
   harness: claude-sdk

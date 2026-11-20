@@ -867,6 +867,10 @@ class HarnessSandboxValidationError(ValueError):
             "Sandboxed Claude requires an Anthropic-compatible API. "
             "Disable Bedrock, Vertex or Foundry transport settings and retry."
         ),
+        "model_access": (
+            "Brokered Claude model access requires an owned worker environment. "
+            "Pass worker_env when preparing the CLI and retry."
+        ),
         "git_ssh": "The selected harness does not support os_env.sandbox.git_ssh.",
         "tcp_egress": (
             "Inner harnesses cannot enforce worker-wide os_env.sandbox.tcp_egress. "

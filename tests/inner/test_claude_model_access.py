@@ -446,6 +446,7 @@ def test_custom_provider_config_cannot_be_granted_to_the_worker(tmp_path: Path) 
         ("resolver", None, None),
         ("resolver", "parent-only-provider-token", None),
         ("prepared", None, None),
+        ("prepared-unowned", None, None),
         ("prepared", None, "CLAUDE_CODE_USE_BEDROCK"),
         ("prepared", None, "CLAUDE_CODE_USE_VERTEX"),
         ("prepared", None, "CLAUDE_CODE_USE_FOUNDRY"),
@@ -490,17 +491,38 @@ def test_model_access_configuration_preserves_refusal_guidance(
         launcher = Mock()
         monkeypatch.setattr(claude, "start_egress_proxy", proxy)
         monkeypatch.setattr(claude, "create_exec_launcher", launcher)
-        error_type = HarnessSandboxValidationError if transport else ProviderAuthRequired
+        unowned_environment = entrypoint == "prepared-unowned"
+        error_type = (
+            HarnessSandboxValidationError
+            if transport or unowned_environment
+            else ProviderAuthRequired
+        )
         with pytest.raises(error_type) as raised:
             claude.prepare_claude_cli_path(
                 "/bin/claude",
                 OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
                 cwd=workspace,
-                worker_env=env,
+                worker_env=None if unowned_environment else env,
+                model_access=(
+                    ClaudeModelAccess(
+                        "https://model.example.test",
+                        "x-api-key",
+                        lambda: "parent-only-provider-token",
+                    )
+                    if unowned_environment
+                    else None
+                ),
                 user_settings_has_api_key_helper=transport is None,
             )
         detail = ExecutorAdapter(executor_factory=Mock())._build_error_detail(raised.value)
-        if transport is not None:
+        if unowned_environment:
+            assert detail.code == "HarnessSandboxValidationError"
+            assert (
+                "Brokered Claude model access requires an owned worker environment"
+                in detail.message
+            )
+            assert "Pass worker_env when preparing the CLI and retry" in detail.message
+        elif transport is not None:
             assert detail.code == "HarnessSandboxValidationError"
             assert "Anthropic-compatible API" in detail.message
             assert "Bedrock, Vertex or Foundry" in detail.message
