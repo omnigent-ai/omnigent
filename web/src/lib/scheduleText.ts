@@ -378,6 +378,9 @@ export function describeSchedule(rrule: string, timezone?: string): string {
     return `Once: ${describeSchedule(recurring)}`;
   }
 
+  // A summary that skipped a field would describe a different schedule.
+  if (!phrasesStateEveryField(o)) return rrule;
+
   if (o.freq === RRule.MINUTELY) {
     // The library's toText() drops minute-rule filters; preserve them verbatim.
     const filtered = Object.entries(o).some(
@@ -440,6 +443,55 @@ export function describeSchedule(rrule: string, timezone?: string): string {
     return capitalize(rule.toText());
   } catch {
     return rrule;
+  }
+}
+
+/**
+ * Whether the phrases in `describeSchedule` state every field of a rule: the shapes the
+ * visual builder makes. Rules with, e.g., BYSETPOS or several hours are shown as written.
+ */
+function phrasesStateEveryField(o: RRule["origOptions"]): boolean {
+  if (o.bysetpos != null || o.byyearday != null || o.byweekno != null || o.byeaster != null)
+    return false;
+  if (normalizeNums(o.bysecond).some((second) => second !== 0)) return false;
+  const hours = normalizeNums(o.byhour);
+  const minutes = normalizeNums(o.byminute);
+  const months = normalizeNums(o.bymonth);
+  const monthDays = normalizeNums(o.bymonthday);
+  const weekdays = o.byweekday == null ? [] : [o.byweekday].flat();
+  // A numbered weekday such as 1MO (the first Monday) has no phrase.
+  if (weekdays.some((day) => typeof day === "object" && day.n != null && day.n !== 0)) return false;
+  if (hours.length > 1 || minutes.length > 1) return false;
+  const inRange = (values: number[], min: number, max: number) =>
+    values.every((value) => value >= min && value <= max);
+  if (!inRange(hours, 0, 23) || !inRange(minutes, 0, 59)) return false;
+  if (!inRange(months, 1, 12) || !inRange(monthDays, 1, 31)) return false;
+  const interval = typeof o.interval === "number" ? o.interval : 1;
+  const dayFilters = weekdays.length + months.length + monthDays.length;
+  switch (o.freq) {
+    case RRule.MINUTELY:
+      // Minute rules show any filter as written below.
+      return true;
+    case RRule.SECONDLY:
+      return dayFilters + hours.length + minutes.length === 0;
+    case RRule.HOURLY:
+      return hours.length === 0 && dayFilters === 0;
+    case RRule.DAILY:
+      return dayFilters === 0;
+    case RRule.WEEKLY: {
+      // WKST changes which weeks a multi-week interval groups together.
+      const wkst = typeof o.wkst === "object" && o.wkst !== null ? o.wkst.weekday : o.wkst;
+      return (
+        months.length + monthDays.length === 0 && !(interval > 1 && wkst != null && wkst !== 0)
+      );
+    }
+    case RRule.MONTHLY:
+      return weekdays.length + months.length === 0;
+    case RRule.YEARLY:
+      // Without BYMONTH, BYMONTHDAY runs in every month.
+      return weekdays.length === 0 && (monthDays.length === 0 || months.length > 0);
+    default:
+      return false;
   }
 }
 
