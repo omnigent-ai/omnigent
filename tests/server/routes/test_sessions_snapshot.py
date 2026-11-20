@@ -899,6 +899,16 @@ async def test_session_snapshot_classifies_preexisting_native_rate_limit_errors(
             "API Error: Sonnet 4 can't help with this. Start a new session to continue.",
             "content_policy_refusal",
         ),
+        (
+            "Output limit reached — the response exceeded the model’s maximum output "
+            "length and was cut off. Ask for a shorter answer, or break the request "
+            "into smaller pieces and continue step by step.",
+            "output_limit_exceeded",
+        ),
+        (
+            "Claude Code ended the turn with an API error (max_output_tokens).",
+            "output_limit_exceeded",
+        ),
     ],
 )
 async def test_session_snapshot_classifies_preexisting_generic_native_errors(
