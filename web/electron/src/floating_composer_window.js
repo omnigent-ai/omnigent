@@ -123,12 +123,12 @@ function floatingComposerWindowOptions() {
  *   quitting: () => boolean,
  *   present?: (panel: import("electron").BrowserWindow, show: () => void) => void,
  *   readyFallbackMs?: number,
- *   focusedMainWindow?: () => unknown,
+ *   omnigentInFront?: () => boolean,
  *   returnToPreviousApp?: () => void,
  * }} deps `isCurrent` says whether a panel still shows its server's panel page; `present`
  *   puts a hidden panel on screen, such as with a fade, by calling `show`;
- *   `focusedMainWindow` is the Omnigent window with focus when the panel opens, or null when
- *   another app is in front; `returnToPreviousApp` hands focus back to that app.
+ *   `omnigentInFront` says whether any Omnigent window has focus as the panel opens, rather than
+ *   another app; `returnToPreviousApp` hands focus back to that app.
  */
 function createFloatingComposerController(deps) {
   /** @type {Map<string, import("electron").BrowserWindow>} */
@@ -322,8 +322,8 @@ function createFloatingComposerController(deps) {
     show(serverUrl) {
       if (typeof serverUrl !== "string" || serverUrl.length === 0) return "unavailable";
       const panel = panelFor(serverUrl);
-      // Asked for now: no longer a build ahead that a release may drop. Another server's build
-      // ahead isn't needed, and its open still waiting on its page is superseded.
+      // The user asked for this panel, so it's kept; other servers' builds ahead and waiting
+      // opens are dropped.
       unshown.delete(panel);
       for (const [otherUrl, other] of [...panels]) {
         if (other === panel) continue;
@@ -338,7 +338,7 @@ function createFloatingComposerController(deps) {
         return "focused";
       }
       // Where focus goes back to when the user puts it away.
-      if (deps.focusedMainWindow?.() === null) openedOverOtherApp.add(panel);
+      if (deps.omnigentInFront?.() === false) openedOverOtherApp.add(panel);
       else openedOverOtherApp.delete(panel);
       // A page still loading shows once it's ready, or after a moment if it never says so.
       if (ready.has(panel)) reveal(serverUrl, panel);

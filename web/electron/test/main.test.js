@@ -4077,9 +4077,13 @@ describe("floating panel wiring", () => {
     ["/settings/import", true],
   ]) {
     it(`opens ${routePath} in its server's main window, then hides the panel`, async (t) => {
+      t.mock.timers.enable({ apis: ["setTimeout"] });
       const h = loadNavigationHarness({ platform: "darwin" });
       t.after(h.cleanup);
       h.api.registerIpc();
+      let hides = 0;
+      h.electron.app.hide = () => (hides += 1);
+      // Opened over another app.
       const panel = openPanel(h);
       const main = addMain(h, { minimized: true });
       assert.equal(panel.visible, true);
@@ -4089,6 +4093,10 @@ describe("floating panel wiring", () => {
       assert.equal(main.focused, comesForward ? 1 : 0);
       assert.equal(main.restored, comesForward ? 1 : 0);
       assert.equal(panel.visible, false);
+      // A launch isn't putting the panel away: Omnigent isn't hidden afterwards.
+      h.electron.BrowserWindow.getFocusedWindow = () => main;
+      t.mock.timers.tick(0);
+      assert.equal(hides, 0);
     });
   }
 
@@ -4173,6 +4181,7 @@ describe("floating panel wiring", () => {
   for (const [platform, from, appHidden] of [
     ["darwin", "another app", 1],
     ["darwin", "an Omnigent window", 0],
+    ["darwin", "an Omnigent utility window", 0],
     ["linux", "another app", 0],
   ]) {
     it(`on ${platform}, the close button opened from ${from} ${appHidden ? "goes back to that app" : "leaves the app as it is"}`, (t) => {
@@ -4183,7 +4192,10 @@ describe("floating panel wiring", () => {
       const main = addMain(h);
       let hides = 0;
       h.electron.app.hide = () => (hides += 1);
-      if (from !== "another app") h.electron.BrowserWindow.getFocusedWindow = () => main;
+      const about = { isDestroyed: () => false };
+      if (from === "an Omnigent window") h.electron.BrowserWindow.getFocusedWindow = () => main;
+      if (from === "an Omnigent utility window")
+        h.electron.BrowserWindow.getFocusedWindow = () => about;
       const panel = openPanel(h);
       // Putting the key panel away makes the app's next window key, as AppKit does.
       h.electron.BrowserWindow.getFocusedWindow = () => main;
@@ -4193,22 +4205,6 @@ describe("floating panel wiring", () => {
       assert.equal(hides, appHidden);
     });
   }
-
-  it("a launch from a panel opened over another app still brings its window forward", async (t) => {
-    t.mock.timers.enable({ apis: ["setTimeout"] });
-    const h = loadNavigationHarness({ platform: "darwin" });
-    t.after(h.cleanup);
-    h.api.registerIpc();
-    const main = addMain(h);
-    let hides = 0;
-    h.electron.app.hide = () => (hides += 1);
-    openPanel(h);
-    h.electron.BrowserWindow.getFocusedWindow = () => main;
-    assert.deepEqual(await openFromPanel(h, "/settings/import"), { ok: true });
-    t.mock.timers.tick(0);
-    assert.ok(main.focused > 0);
-    assert.equal(hides, 0);
-  });
 
   it("hides the panel when its page dismisses it", (t) => {
     const h = loadNavigationHarness({ platform: "darwin" });

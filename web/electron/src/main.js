@@ -1883,10 +1883,8 @@ function floatingComposer() {
     },
     isCurrent: floatingComposerPanelIsCurrent,
     quitting: () => appQuitting,
-    focusedMainWindow: () => {
-      const focused = BrowserWindow.getFocusedWindow();
-      return isMainWindow(focused) ? focused : null;
-    },
+    // Any Omnigent window, About included, means the user wasn't in another app.
+    omnigentInFront: () => BrowserWindow.getFocusedWindow() !== null,
     // Focusing the panel so it takes typing activates the app (macOS 14+), so putting it away makes
     // an Omnigent window key and front. When it was opened over another app, hand focus back like
     // ⌘H: that also hides Omnigent's other windows until the app is next used.
@@ -5375,7 +5373,7 @@ function registerIpc() {
     const contents = win.webContents;
     const hadSupport = floatingComposerSupport.any();
     if (!floatingComposerSupport.announce(contents.id, serverUrl)) return;
-    // This server is supported again: a release still waiting for it is called off.
+    // Cancel any pending release for this server.
     clearTimeout(floatingComposerReleases.get(serverUrl));
     floatingComposerReleases.delete(serverUrl);
     // Support ends with this document: when another one commits, or its renderer goes away.

@@ -84,7 +84,7 @@ function setup({
   saveFrames,
   loadFrames,
   autoReady = true,
-  focusedMainWindow,
+  omnigentInFront,
   returnToPreviousApp,
 } = {}) {
   const created = [];
@@ -110,7 +110,7 @@ function setup({
     isCurrent: (panel) => !stale.has(panel),
     quitting,
     ...(present ? { present } : {}),
-    ...(focusedMainWindow ? { focusedMainWindow } : {}),
+    ...(omnigentInFront ? { omnigentInFront } : {}),
     ...(returnToPreviousApp ? { returnToPreviousApp } : {}),
   });
   if (autoReady) {
@@ -571,6 +571,23 @@ test("a ready panel shows at once, and readiness ends with its document", (t) =>
   }
 });
 
+for (const [how, end] of [
+  ["putting it away", (controller, panel) => controller.dismiss(panel)],
+  ["closing it", (controller, panel) => controller.close(panel)],
+]) {
+  test(`${how} drops an open still waiting on its page`, (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const { controller, created } = setup({ autoReady: false });
+    controller.show("https://a.example");
+    const [panel] = created;
+    end(controller, panel);
+    controller.markReady(panel);
+    t.mock.timers.tick(FLOATING_COMPOSER_READY_FALLBACK_MS);
+    assert.equal(panel.calls.includes("showInactive"), false);
+    assert.equal(panel.calls.includes("webContents.focus"), false);
+  });
+}
+
 test("focusing an Omnigent window drops an open still waiting on its page", (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const { controller, created } = setup({ autoReady: false });
@@ -649,20 +666,20 @@ test("the preloader builds for the current target once the app is quiet", (t) =>
 
 test("putting away a panel opened over another app hands focus back to that app", () => {
   let returned = 0;
-  let focused = null;
+  let inFront = false;
   const { controller, created } = setup({
-    focusedMainWindow: () => focused,
+    omnigentInFront: () => inFront,
     returnToPreviousApp: () => (returned += 1),
   });
   controller.show("https://a.example");
   // A second press while it's up keeps where it was opened from.
-  focused = { main: true };
+  inFront = true;
   controller.show("https://a.example");
   assert.equal(controller.dismiss(created[0]), true);
   assert.equal(created[0].visible, false);
   assert.equal(returned, 1);
   // ⌘W puts it away the same way.
-  focused = null;
+  inFront = false;
   controller.show("https://a.example");
   created[0].close();
   assert.equal(created[0].destroyed, false, "⌘W keeps the draft");
@@ -672,7 +689,7 @@ test("putting away a panel opened over another app hands focus back to that app"
 test("a panel opened from an Omnigent window goes back to it when put away", () => {
   let returned = 0;
   const { controller, created } = setup({
-    focusedMainWindow: () => ({ main: true }),
+    omnigentInFront: () => true,
     returnToPreviousApp: () => (returned += 1),
   });
   controller.show("https://a.example");
@@ -683,7 +700,7 @@ test("a panel opened from an Omnigent window goes back to it when put away", () 
 test("a launch or a click on an Omnigent window isn't putting the panel away", () => {
   let returned = 0;
   const { controller, created } = setup({
-    focusedMainWindow: () => null,
+    omnigentInFront: () => false,
     returnToPreviousApp: () => (returned += 1),
   });
   controller.show("https://a.example");
