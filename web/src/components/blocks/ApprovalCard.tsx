@@ -96,8 +96,8 @@ const AUTO_RESOLVED_DETAIL =
 
 const QUESTION_TITLES = [
   ["agy_", "Antigravity needs your input"],
-  ["codex_", "Codex needs input"],
-  ["cursor_", "Cursor has questions"],
+  ["codex_", "Codex needs your input"],
+  ["cursor_", "Cursor needs your input"],
   ["pi_", "Pi needs your input"],
   ["devin_", "Devin needs your input"],
 ] as const;
@@ -109,7 +109,7 @@ function questionPromptTitle(policyName: string, phase: string, message: string)
   const match = QUESTION_TITLES.find(
     ([prefix]) => policyName.startsWith(prefix) || phase.startsWith(prefix),
   );
-  return match?.[1] ?? "Claude has questions";
+  return match?.[1] ?? "Claude needs your input";
 }
 
 /**
