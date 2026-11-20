@@ -739,6 +739,10 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # ``OMNIGENT_RUNNER_ENV_PASSTHROUGH=OMNIGENT_CLAUDE_SDK_NO_SANDBOX``).
         # Safe to propagate: not a secret.
         "OMNIGENT_CLAUDE_SDK_NO_SANDBOX",
+        # OpenCode version-range bypass (a non-secret boolean). Host readiness
+        # honors it, so the runner's launch check in OpenCodeNativeServer.start()
+        # must see it too; otherwise readiness says ready and the launch still fails.
+        "OMNIGENT_OPENCODE_SKIP_VERSION_CHECK",
         # Native-Claude launcher plugin selector: the entry-point NAME of a
         # launcher registered in the ``omnigent.claude_launcher`` group (e.g.
         # ``isaac``). Read by omnigent.claude_launcher.resolve_claude_launch in

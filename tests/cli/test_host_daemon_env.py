@@ -102,6 +102,30 @@ def test_pi_env_denylist_reaches_runner_through_host_daemon(
 
 
 @pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
+def test_opencode_version_check_skip_reaches_runner_through_host_daemon(
+    monkeypatch: pytest.MonkeyPatch,
+    server_url: str | None,
+) -> None:
+    """The runner's OpenCode launch check sees the skip the host readiness check saw."""
+    monkeypatch.delenv(RUNNER_ENV_PASSTHROUGH_ENV_VAR, raising=False)
+    monkeypatch.setenv("OMNIGENT_OPENCODE_SKIP_VERSION_CHECK", "1")
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
+
+    daemon_env = _build_host_daemon_env(server_url=server_url)
+    runner_env = _build_runner_env(
+        daemon_env,
+        server_url=server_url or "http://localhost:6767",
+        runner_id="runner_opencode_skip",
+        binding_token="binding-opencode-skip",
+        workspace="/tmp/workspace",
+        parent_pid=12345,
+    )
+
+    for env in (daemon_env, runner_env):
+        assert env["OMNIGENT_OPENCODE_SKIP_VERSION_CHECK"] == "1"
+
+
+@pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
 def test_runner_can_read_keyring_from_cli_desktop_session(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
