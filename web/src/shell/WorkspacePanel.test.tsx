@@ -529,9 +529,9 @@ describe("WorkspacePanel surface presentation", () => {
     expect(onHide).not.toHaveBeenCalled();
   });
 
-  it("hides the rail only for shells the user confirmed closing", () => {
+  it("hides the rail only for shells the user confirmed closing", async () => {
     writePinnedWorkspaceTabs(["files", "subagents"]);
-    const { rerender, onCloseTerminal, onHide } = renderWorkspace({
+    const { rerender, onCloseTerminal, onCloseTerminals, onHide } = renderWorkspace({
       openTerminals: ["terminal:zsh"],
     });
 
@@ -541,10 +541,23 @@ describe("WorkspacePanel surface presentation", () => {
     rerender({ openTerminals: [] });
     expect(onHide).not.toHaveBeenCalled();
 
+    // Confirmed but its kill failed: a bulk close may try it again, and its later
+    // removal by the agent still keeps the rail.
     rerender({ openTerminals: ["terminal:zsh"] });
     fireEvent.click(screen.getByRole("button", { name: "Close zsh" }));
-    const callbacks = onCloseTerminal.mock.calls[1][1] as ShellCloseCallbacks;
-    callbacks.onConfirmed?.();
+    const failed = onCloseTerminal.mock.calls[1][1] as ShellCloseCallbacks;
+    failed.onConfirmed?.();
+    failed.onFailed?.("terminal:zsh");
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Close all tabs" }));
+    expect(onCloseTerminals.mock.calls.map(([keys]) => keys)).toEqual([["terminal:zsh"]]);
+    rerender({ openTerminals: [] });
+    expect(onHide).not.toHaveBeenCalled();
+
+    rerender({ openTerminals: ["terminal:zsh"] });
+    fireEvent.click(screen.getByRole("button", { name: "Close zsh" }));
+    const confirmed = onCloseTerminal.mock.calls[2][1] as ShellCloseCallbacks;
+    confirmed.onConfirmed?.();
     rerender({ openTerminals: [] });
     expect(onHide).toHaveBeenCalledOnce();
   });
