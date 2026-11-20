@@ -1829,7 +1829,34 @@ def test_review_comments_preserve_identity_with_bounded_work(
     return
 
 
-def test_multipart_nested_lists_are_refused(
+@pytest.mark.parametrize(("outer", "inner"), [("-", "  -"), ("7.", "   1.")])
+def test_multipart_keeps_bounded_nested_lists_together(outer: str, inner: str) -> None:
+    from markdown_it import MarkdownIt
+
+    metadata = {"head_sha": "a" * 40, "run_id": "10-1", "run_url": "https://example.test/run"}
+    composed = _HELPERS["compose_review"](
+        _REVIEW, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
+    )
+    calibration = _HELPERS["review_comments"]("x" * 130000 + "\n\n" + composed, **metadata)
+    capacity = len(_multipart_content(calibration[0]))
+    nested = "".join(
+        f"{outer} Finding {index}\n{inner} Nested `case {index}` [details](https://example.test/finding)\n"
+        for index in range(3)
+    )
+    review = "x" * (capacity - 20) + "\n\n" + nested + "\n" + composed
+
+    comments = _HELPERS["review_comments"](review, **metadata)
+
+    assert len(comments) > 1
+    assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
+    assert "".join(_multipart_content(comment) for comment in comments) == review
+    parser = MarkdownIt("commonmark").enable("table")
+    expected = parser.render(nested)
+    assert sum(expected in parser.render(comment) for comment in comments) == 1
+    assert sum(comment.count(nested) for comment in comments) == 1
+
+
+def test_multipart_oversized_nested_list_is_refused_before_publication(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from markdown_it import MarkdownIt
@@ -1865,7 +1892,9 @@ def test_multipart_nested_lists_are_refused(
     )
     with pytest.raises(ValueError) as error:
         _published_comments(review, review_path, receipt)
-    assert str(error.value) == "Polly review nested lists are not supported in multipart comments."
+    assert (
+        str(error.value) == "Polly review Markdown container cannot fit within comment capacity."
+    )
     assert not posts and not receipt.exists()
     assert sorted(path.name for path in tmp_path.iterdir()) == ["review.md"]
     return
@@ -3671,7 +3700,7 @@ def test_unicode_and_wrapper_bytes_are_included_in_comment_limit() -> None:
     for content, refusal in (
         (
             "- Outer assessment\n  - Nested assessment",
-            "Polly review nested lists are not supported in multipart comments.",
+            None,
         ),
         (
             "<div>Assessment details.</div>",
@@ -3689,6 +3718,15 @@ def test_unicode_and_wrapper_bytes_are_included_in_comment_limit() -> None:
         assert len(exact_comments[0].encode("utf-8")) == 60000
         overflow_assessment = assessment + "x"
         assert len(overflow_assessment.encode("utf-8")) + wrapper_bytes == 60001
+        if refusal is None:
+            overflow_comments = _HELPERS["review_comments"](overflow_assessment, **review_metadata)
+            assert len(overflow_comments) > 1
+            assert all(len(comment.encode("utf-8")) <= 60000 for comment in overflow_comments)
+            assert (
+                "".join(_multipart_content(comment) for comment in overflow_comments)
+                == overflow_assessment
+            )
+            continue
         with pytest.raises(ValueError) as error:
             _HELPERS["review_comments"](overflow_assessment, **review_metadata)
         assert str(error.value) == refusal

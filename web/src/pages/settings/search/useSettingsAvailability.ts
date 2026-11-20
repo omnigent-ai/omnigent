@@ -3,7 +3,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 
-import { useIsAdmin } from "@/hooks/useIsAdmin";
+import { useAdminViewSwitchShown } from "@/hooks/useAdminViewSwitchShown";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { getDesktopFeatures, supportsBrowser, supportsGlobalShortcut } from "@/lib/nativeBridge";
@@ -12,7 +12,6 @@ import type { SettingsAvailability } from "./catalog/types";
 
 export function useSettingsAvailability(): SettingsAvailability {
   const info = useServerInfo();
-  const isAdmin = useIsAdmin();
   const loaded = info === "loading" ? null : info;
   const providers = loaded?.enabled_connections ?? [];
   const globalShortcut = supportsGlobalShortcut();
@@ -32,12 +31,15 @@ export function useSettingsAvailability(): SettingsAvailability {
   const floatingComposerShortcut =
     globalShortcut && floatingComposerFlag && shellTakesPanelShortcut;
   const inAppBrowser = supportsBrowser();
-  const adminView = isAdmin && loaded?.admin_view !== false;
+  const adminView = useAdminViewSwitchShown();
   const accountsEnabled = loaded?.accounts_enabled === true;
   const archiveWorktreeCleanup = loaded?.archive_worktree_cleanup === true;
   const mcpServices = providers.includes("mcp");
   const github = providers.includes("github");
   const databricks = providers.includes("databricks");
+  const projectKanban = isFeatureEnabled(info, "project_kanban");
+  const sessionTitleInstructions = loaded?.session_title_instructions === true;
+  const proactiveAgent = loaded?.proactive_agent_available === true;
   return useMemo(
     () => ({
       globalShortcut,
@@ -48,6 +50,9 @@ export function useSettingsAvailability(): SettingsAvailability {
       archiveWorktreeCleanup,
       mcpServices,
       integrationProviders: { github, databricks },
+      projectKanban,
+      sessionTitleInstructions,
+      proactiveAgent,
     }),
     [
       globalShortcut,
@@ -59,6 +64,9 @@ export function useSettingsAvailability(): SettingsAvailability {
       mcpServices,
       github,
       databricks,
+      projectKanban,
+      sessionTitleInstructions,
+      proactiveAgent,
     ],
   );
 }

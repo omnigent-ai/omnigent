@@ -462,6 +462,20 @@ describe("editing custom agents", () => {
       "custom-agent-create:submit",
     );
   });
+  it("marks the create page's required fields required, though their names drop the asterisk", async () => {
+    mount("/settings/custom-agents/new");
+    const required = [
+      await screen.findByRole("textbox", { name: "Name" }),
+      screen.getByRole("combobox", { name: "Harness" }),
+      screen.getByRole("textbox", { name: "Model" }),
+    ];
+    for (const field of required) expect(field).toBeRequired();
+    for (const field of [
+      screen.getByRole("textbox", { name: "Description" }),
+      screen.getByRole("textbox", { name: "System instructions" }),
+    ])
+      expect(field).not.toBeRequired();
+  });
   it("renders the agent page from its Settings catalog entry, with Cancel owning the discard dialog", async () => {
     configResponses();
     await openEditor();
