@@ -377,6 +377,8 @@ export function QuickPickCommandPalette({
     <QuickPickDialog
       open={open}
       onOpenChange={onOpenChange}
+      // ⌘K steps with Ctrl-N/Ctrl-P, trading the query's readline caret keys for row steps.
+      stepsWithCtrlNP
       // The full-screen sheet fills the visible viewport, clear of the title bar and home bar.
       contentClassName={
         isMobile

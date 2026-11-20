@@ -149,6 +149,17 @@ describe("QuickPickCommandPalette ordering", () => {
     expect(commandHistory()).toEqual([]);
   });
 
+  it("steps through its rows with Ctrl-N and Ctrl-P", () => {
+    const { input } = renderPalette();
+    const active = () =>
+      document.getElementById(input.getAttribute("aria-activedescendant") ?? "")?.textContent;
+    const first = active();
+    expect(fireEvent.keyDown(input, { key: "n", code: "KeyN", ctrlKey: true })).toBe(false);
+    expect(active()).not.toBe(first);
+    fireEvent.keyDown(input, { key: "p", code: "KeyP", ctrlKey: true });
+    expect(active()).toBe(first);
+  });
+
   it("puts a command the query names ahead of the sessions that match it", () => {
     useConversations.mockReturnValue({
       data: {

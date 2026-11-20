@@ -96,6 +96,51 @@ describe("QuickPick accessibility", () => {
   });
 });
 
+describe("QuickPick keyboard", () => {
+  it("steps with Ctrl-N and Ctrl-P like the arrows once opted in, skipping disabled rows", async () => {
+    const { input, onAccept } = renderPicker({
+      stepsWithCtrlNP: true,
+      segments: [
+        {
+          ...commands,
+          items: [
+            commands.items[0],
+            item("archive", {
+              label: "Archive session",
+              group: "Actions",
+              disabledReason: "Open a session first",
+            }),
+            commands.items[1],
+          ],
+        },
+      ],
+    });
+    await userEvent.keyboard("{Control>}n{/Control}");
+    expect(activeOption(input)).toHaveTextContent("Open settings");
+    await userEvent.keyboard("{Control>}p{/Control}");
+    expect(activeOption(input)).toHaveTextContent("New session");
+    await userEvent.keyboard("{Control>}n{/Control}");
+    expect(input).toHaveValue("");
+    await userEvent.keyboard("{Enter}");
+    expect(onAccept).toHaveBeenCalledWith(commands.items[1], expect.anything());
+  });
+
+  it("leaves ⌘N and Ctrl-Shift-N alone when opted in", () => {
+    const { input } = renderPicker({ stepsWithCtrlNP: true });
+    for (const chord of [{ metaKey: true }, { ctrlKey: true, shiftKey: true }]) {
+      expect(fireEvent.keyDown(input, { key: "n", code: "KeyN", ...chord })).toBe(true);
+      expect(activeOption(input)).toHaveTextContent("New session");
+    }
+  });
+
+  it("marks its query field as an open pick list's only when it steps with Ctrl-N/P", () => {
+    const { input, unmount } = renderPicker({ stepsWithCtrlNP: true });
+    expect(input).toHaveAttribute("data-pick-list-input");
+    unmount();
+    expect(renderPicker().input).not.toHaveAttribute("data-pick-list-input");
+  });
+});
+
 describe("QuickPick rows", () => {
   it("keeps an option's ID when rows above it change", () => {
     const { input } = renderPicker();

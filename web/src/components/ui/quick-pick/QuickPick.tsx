@@ -22,6 +22,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { CompactShortcutKeys } from "@/components/ui/kbd";
 import { Spinner } from "@/components/ui/spinner";
+import { pickListInputProps, readlineListStep } from "@/lib/listNavigationKeys";
 import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { cn } from "@/lib/utils";
@@ -134,6 +135,11 @@ export interface QuickPickProps<Value> {
    * as a query filtering the active one out, for a caller previewing it. Not while none is.
    */
   onActiveRowShown?: (id: string) => void;
+  /**
+   * Ctrl-N/Ctrl-P step through rows instead of moving the caret, as macOS text fields do.
+   * Off by default, so the query keeps its readline caret keys.
+   */
+  stepsWithCtrlNP?: boolean;
   /** `data-testid` for the query field. */
   inputTestId?: string;
   /** Arrow keys wrap around at the ends; off by default, as in a menu. */
@@ -259,7 +265,11 @@ function FooterAction({
 function navigationFor(
   event: KeyboardEvent<HTMLInputElement>,
   pageSize: () => number,
+  stepsWithCtrlNP: boolean,
 ): QuickPickNavigation | null {
+  // An opted-in picker steps with Ctrl-N/Ctrl-P, as menus with a filter do.
+  const readlineStep = stepsWithCtrlNP ? readlineListStep(event) : null;
+  if (readlineStep) return { type: readlineStep };
   switch (event.key) {
     case "ArrowDown":
     case "ArrowUp": {
@@ -311,6 +321,7 @@ export function QuickPick<Value>({
   activeId = null,
   onActiveIdChange,
   onActiveRowShown,
+  stepsWithCtrlNP = false,
   inputTestId,
   loop = false,
   fillHeight = false,
@@ -496,7 +507,7 @@ export function QuickPick<Value>({
   const handleKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
     // Keys that drive an IME composition, including its Enter, belong to the composition.
     if (isImeCompositionKeyEvent(event)) return;
-    const navigation = navigationFor(event, pageSize);
+    const navigation = navigationFor(event, pageSize, stepsWithCtrlNP);
     if (navigation) {
       event.preventDefault();
       navigate(navigation);
@@ -801,6 +812,7 @@ export function QuickPick<Value>({
         <input
           ref={setQueryField}
           role="combobox"
+          {...pickListInputProps(stepsWithCtrlNP)}
           aria-label={label}
           aria-expanded={!collapsed}
           aria-controls={collapsed ? undefined : listId}
