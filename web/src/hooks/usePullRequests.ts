@@ -188,6 +188,9 @@ export interface PullRequest {
 
 export interface PullRequestRepo {
   name_with_owner: string | null;
+  /** Host of the repo's forge instance, e.g. "github.com"; absent from older hosts and
+   *  providers that don't report it. */
+  host?: string;
 }
 
 /** A `gh`-configured account — one option in the panel's account selector. */
@@ -299,7 +302,11 @@ export interface PullRequestInfo {
    *  @deprecated Legacy GitHub field; read `auth.authenticated`. Removal in 0.19.0. */
   authenticated?: boolean;
   branch?: string;
+  /** The selected PR's repo when one is tracked, else the workspace's. */
   repo?: PullRequestRepo | null;
+  /** The workspace checkout's own repo, whatever PR is selected; absent from older hosts,
+   *  explicit PR reads, and checkouts whose preferred remote isn't recognized. */
+  workspace_repo?: PullRequestRepo;
   /** The PR's base branch; null when there's no PR (the tab is a PR view). */
   base_ref?: string | null;
   pr?: PullRequest | null;
@@ -599,6 +606,22 @@ export function usePullRequestInfo(
     "github-info",
   );
   return useQuery(pullRequestInfoQueryOptions(context, options));
+}
+
+/**
+ * Reads the shared GitHub-info entry without refetching on mount or focus. An empty
+ * entry still loads, with the context's retries; a failed one waits for another
+ * reader such as {@link usePullRequestInfo} or an invalidation.
+ */
+export function usePullRequestInfoSnapshot(rawConversationId: string | undefined) {
+  const context = usePullRequestQueryContext(rawConversationId);
+  return useQuery({
+    ...pullRequestInfoQueryOptions(context),
+    refetchOnMount: false,
+    // Otherwise every newly mounted reader refetches a failed query.
+    retryOnMount: false,
+    refetchOnWindowFocus: false,
+  });
 }
 
 /** Linked PR details at the list cadence; the session's base query handles turn-end refresh. */
@@ -1023,7 +1046,15 @@ export function useUpdateSessionPr(conversationId: string) {
       updateSessionPr(conversationId, body),
     onSuccess: async (info, body) => {
       await queryClient.cancelQueries({ queryKey: ["github-info", conversationId] });
-      queryClient.setQueryData(["github-info", conversationId], info);
+      // An attach reply reads only that PR; attaching doesn't change the workspace's repo.
+      const workspaceRepo = queryClient.getQueryData<PullRequestInfo>([
+        "github-info",
+        conversationId,
+      ])?.workspace_repo;
+      queryClient.setQueryData(
+        ["github-info", conversationId],
+        info.workspace_repo || !workspaceRepo ? info : { ...info, workspace_repo: workspaceRepo },
+      );
       if (info.selected_pr_url) {
         queryClient.setQueryData(["github-info", conversationId, info.selected_pr_url], info);
       }

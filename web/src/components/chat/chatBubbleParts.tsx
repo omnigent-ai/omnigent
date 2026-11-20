@@ -985,6 +985,7 @@ function UserMessageMarkdown({ text, leadingCommand }: { text: string; leadingCo
       className="text-message"
       breaks
       mode="static"
+      linkPullRequestRefs
       remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
       renderLocalReviewComment={renderLocalReviewComment}
       leadingCommand={leadingCommand}
