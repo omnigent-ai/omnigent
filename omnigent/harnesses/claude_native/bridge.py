@@ -78,6 +78,7 @@ from omnigent.harnesses.claude_native import (
 from omnigent.harnesses.claude_native.failure_telemetry import claude_failure_context
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.model_switch import (
+    ClaudeLegacyModelPane,
     ClaudeLegacyModelSwitchResult,
     ClaudeModelSwitchRefused,
     ClaudeModelSwitchResult,
@@ -5686,6 +5687,7 @@ def inject_model_command(
     timeout_s: float = _TMUX_READY_TIMEOUT_S,
     ready_timeout_s: float | None = None,
     owned_draft: str | None = None,
+    legacy_literal_model: bool = False,
 ) -> ClaudeModelSwitchResult | ClaudeLegacyModelSwitchResult:
     """Use session-only selection when supported, otherwise submit the legacy command.
 
@@ -5706,7 +5708,9 @@ def inject_model_command(
         with cancellable_injection(deadline):
             raw = _read_json_file(bridge_dir / CONTEXT_RAW_FILE) or {}
             if not supports_session_only_model_switch(raw.get("version")):
-                return _inject_legacy_model_command_locked(bridge_dir, transaction)
+                return _inject_legacy_model_command_locked(
+                    bridge_dir, transaction, literal_model=legacy_literal_model
+                )
             return _inject_model_command_locked(bridge_dir, transaction)
     except ClaudeInjectionCancelled as exc:
         raise transaction.refuse(
@@ -5724,7 +5728,7 @@ def _inject_model_command_locked(
 
 @_serialize_bridge_injection
 def _inject_legacy_model_command_locked(
-    bridge_dir: Path, transaction: SessionOnlyModelSwitch
+    bridge_dir: Path, transaction: SessionOnlyModelSwitch, *, literal_model: bool = False
 ) -> ClaudeLegacyModelSwitchResult:
     from omnigent.models.claude_model_vocabulary import claude_model_command_arg
 
@@ -5734,12 +5738,20 @@ def _inject_legacy_model_command_locked(
         raise transaction.refuse(
             "Claude Code's version changed while waiting for model selection. Retry explicitly."
         )
-    model_arg = claude_model_command_arg(
-        transaction.model,
-        read_model_env(bridge_dir),
-        picker_values=read_model_picker_values(bridge_dir),
+    model_arg = (
+        transaction.model
+        if literal_model
+        else claude_model_command_arg(
+            transaction.model,
+            read_model_env(bridge_dir),
+            picker_values=read_model_picker_values(bridge_dir),
+        )
     )
-    if model_arg is None:
+    if (
+        model_arg is None
+        or not model_arg
+        or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in model_arg)
+    ):
         raise transaction.refuse(
             f"This Claude terminal has no /model spelling for {transaction.model}.",
             unsupported=True,
@@ -5750,8 +5762,27 @@ def _inject_legacy_model_command_locked(
         version,
     )
     transaction.phase = "legacy"
+    _wait_for_tmux_info(bridge_dir, timeout_s=transaction.deadline.remaining_s())
+    origin = _legacy_model_pane(bridge_dir)
+    if origin is None:
+        raise transaction.refuse(
+            "Claude's terminal changed before model selection. Retry explicitly."
+        )
+
+    def revalidate_version() -> None:
+        current = _read_json_file(bridge_dir / CONTEXT_RAW_FILE) or {}
+        if supports_session_only_model_switch(current.get("version")):
+            raise transaction.refuse(
+                "Claude Code's version changed while waiting for model selection. "
+                "Retry explicitly."
+            )
+        if _legacy_model_pane(bridge_dir) != origin:
+            raise transaction.refuse(
+                "Claude's terminal or session changed during model selection. Retry explicitly."
+            )
 
     def submitting() -> None:
+        revalidate_version()
         transaction.submitted = True
         transaction.commit_attempted = True
 
@@ -5763,6 +5794,7 @@ def _inject_legacy_model_command_locked(
             ready_timeout_s=transaction.ready_timeout_s,
             auto_confirm=True,
             confirm_hint=SWITCH_MODEL_DIALOG_HINT,
+            before_edit=revalidate_version,
             before_submit=submitting,
         )
     except (RuntimeError, ValueError, OSError) as exc:
@@ -5772,7 +5804,59 @@ def _inject_legacy_model_command_locked(
                 "Check the terminal before retrying; the dependent prompt was not sent."
             ) from exc
         raise
-    return ClaudeLegacyModelSwitchResult(transaction.model, model_arg)
+    return ClaudeLegacyModelSwitchResult(transaction.model, model_arg, origin)
+
+
+def _legacy_model_pane(bridge_dir: Path) -> ClaudeLegacyModelPane | None:
+    info = read_tmux_target(bridge_dir)
+    if info is None:
+        return None
+    try:
+        advertised = (bridge_dir / _TMUX_FILE).stat()
+    except OSError:
+        return None
+    return ClaudeLegacyModelPane(
+        info["socket_path"],
+        info["tmux_target"],
+        read_active_session_id(bridge_dir),
+        read_claude_session_id(bridge_dir),
+        (advertised.st_ino, advertised.st_mtime_ns),
+    )
+
+
+@_serialize_model_injection
+def confirm_legacy_model_dialog(
+    bridge_dir: Path, *, receipt: ClaudeLegacyModelSwitchResult
+) -> bool | None:
+    """Confirm a queued command's visible dialog; None ends an obsolete watch."""
+    from omnigent.harnesses.claude_native.model_switch import _cache_cost_confirmation
+
+    origin = receipt.pane
+
+    def require_origin() -> None:
+        if origin is None or _legacy_model_pane(bridge_dir) != origin:
+            raise ClaudeModelSwitchRefused(
+                "The legacy model command's terminal or session changed."
+            )
+
+    if origin is None or _legacy_model_pane(bridge_dir) != origin:
+        return None
+    if read_claude_status_model(bridge_dir) in (receipt.requested_model, receipt.picker_value):
+        return True
+    pane = _capture_pane(origin.socket_path, origin.tmux_target)
+    require_origin()
+    _raise_if_user_prompt_pending(bridge_dir, pane)
+    choice = re.search(r"(?m)^\s*❯\s+1\. Yes, switch to (.+?)\s*$", pane)
+    if choice is None or not _cache_cost_confirmation(pane, choice[1], yes_selected=True):
+        return False
+    _confirm_and_verify_dialog_closed(
+        origin.socket_path,
+        origin.tmux_target,
+        hint=SWITCH_MODEL_DIALOG_HINT,
+        bridge_dir=bridge_dir,
+        before_confirm=require_origin,
+    )
+    return True
 
 
 @_serialize_bridge_injection
@@ -5829,13 +5913,7 @@ def inject_slash_command(
         if a ``tmux send-keys`` invocation fails, if the typed
         command verifiably never left the input box (submit swallowed).
     """
-    raw = _read_json_file(bridge_dir / CONTEXT_RAW_FILE) or {}
-    if re.match(r"^/model\s+\S", command) and supports_session_only_model_switch(
-        raw.get("version")
-    ):
-        raise ClaudeModelSwitchRefused(
-            "Automated model selections must use the session-only picker."
-        )
+    _require_legacy_model_command(bridge_dir, command)
     _inject_slash_command_locked(
         bridge_dir,
         command=command,
@@ -5846,6 +5924,16 @@ def inject_slash_command(
     )
 
 
+def _require_legacy_model_command(bridge_dir: Path, command: str) -> None:
+    if not re.match(r"^/model\s+\S", command):
+        return
+    raw = _read_json_file(bridge_dir / CONTEXT_RAW_FILE) or {}
+    if supports_session_only_model_switch(raw.get("version")):
+        raise ClaudeModelSwitchRefused(
+            "Automated model selections must use the session-only picker."
+        )
+
+
 def _inject_slash_command_locked(
     bridge_dir: Path,
     *,
@@ -5854,6 +5942,7 @@ def _inject_slash_command_locked(
     auto_confirm: bool = False,
     confirm_hint: str | None = None,
     ready_timeout_s: float | None = None,
+    before_edit: Callable[[], None] | None = None,
     before_submit: Callable[[], None] | None = None,
 ) -> None:
     """Submit a slash command while the caller owns both bridge injection locks."""
@@ -5884,6 +5973,9 @@ def _inject_slash_command_locked(
             "Answer the pending Claude question or permission request before changing settings.",
             nothing_typed=True,
         )
+    if before_edit is not None:
+        before_edit()
+    _require_legacy_model_command(bridge_dir, command)
     # Clear the user's draft so the command is not appended to it.
     # Unlike Escape, this leaves an in-flight generation running.
     _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
@@ -5906,6 +5998,7 @@ def _inject_slash_command_locked(
         raise ClaudeUserPromptPending(
             "Claude is waiting for an explicit answer; settings command not sent."
         )
+    _require_legacy_model_command(bridge_dir, command)
     if before_submit is not None:
         before_submit()
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
@@ -6348,6 +6441,7 @@ def _confirm_and_verify_dialog_closed(
     *,
     hint: str,
     bridge_dir: Path | None = None,
+    before_confirm: Callable[[], None] | None = None,
 ) -> None:
     """
     Press Enter on the *hint* dialog, re-pressing while it stays on screen.
@@ -6370,6 +6464,8 @@ def _confirm_and_verify_dialog_closed(
         raise ClaudeUserPromptPending(
             "Claude is waiting for an explicit answer; settings dialog not confirmed."
         )
+    if before_confirm is not None:
+        before_confirm()
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     last_enter = time.monotonic()
     deadline = last_enter + _CONFIRM_DIALOG_ACCEPT_TIMEOUT_S
@@ -6382,6 +6478,8 @@ def _confirm_and_verify_dialog_closed(
             return
         _raise_if_user_prompt_pending(bridge_dir, pane)
         if hint in pane and time.monotonic() - last_enter >= _CONFIRM_DIALOG_RETRY_INTERVAL_S:
+            if before_confirm is not None:
+                before_confirm()
             _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
             last_enter = time.monotonic()
 

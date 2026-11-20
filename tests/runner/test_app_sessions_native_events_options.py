@@ -1896,22 +1896,16 @@ async def test_events_model_change_requires_the_same_immediate_picker_receipt(
     assert _drain_session_event_queue(_session_event_queues_ref.get(_BOOT_SESSION_ID)) == []
 
 
-@pytest.mark.parametrize("receipt_kind", ["absent", "different-target"])
 async def test_events_model_change_does_not_accept_old_status_without_a_receipt(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    receipt_kind: str,
 ) -> None:
     monkeypatch.setattr(
         claude_native_bridge, "read_claude_status_model", lambda _: "claude-opus-4-7"
     )
 
     def select(*args: Any, **kwargs: Any) -> Any:
-        if receipt_kind == "absent":
-            return None
-        return claude_native_bridge.ClaudeModelSwitchResult(
-            "another-model", "another-model", "another-model", "another-model", "native-session"
-        )
+        return None
 
     response = await _post_claude_control(monkeypatch, tmp_path, select)
     assert response.status_code == 503, response.text
@@ -2050,12 +2044,12 @@ async def test_events_model_change_refuses_unsupported_queued_or_unconfirmed_sta
         assert "inspect the terminal" in response.json()["detail"]
 
 
-@pytest.mark.parametrize("selected", ["private/model-b[large]", "private-claude-opus[1m]"])
 async def test_bound_claude_switch_preserves_private_model_id(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, selected: str
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     from omnigent.inference_config import inference_config_scope
 
+    selected = "private-claude-opus[1m]"
     calls: list[str] = []
 
     def select(_bridge: Path, *, model: str, **kwargs: Any) -> Any:

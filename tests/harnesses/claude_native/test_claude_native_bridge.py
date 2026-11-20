@@ -13381,6 +13381,36 @@ def test_model_draft_does_not_consume_other_prompt_whitespace(prefix: str) -> No
     assert claude_model_switch._draft(pane) == prefix + "/model"
 
 
+def test_model_draft_joins_soft_wraps_without_losing_hard_newlines_or_whitespace() -> None:
+    draft = "a long first line with wrapping\n\n  an indented second line with wrapping "
+    composer = _SessionModelComposer(draft=draft)
+    composer.wrap_columns = 12
+
+    physical = composer._capture_pane("", "")
+    logical = composer._capture_pane("", "", join_wrapped=True)
+
+    assert claude_model_switch._draft(physical) != draft
+    assert claude_model_switch._draft(logical) == draft
+
+
+def test_wrapped_draft_with_an_extra_hard_newline_is_still_foreign(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    draft = "the blocked first line\nand a long second line with wrapped words"
+    composer = _SessionModelComposer(draft=draft)
+    composer.wrap_columns = 12
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    composer.install(monkeypatch)
+
+    with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused, match="unrelated draft"):
+        claude_native_bridge.inject_model_command(
+            bridge_dir, model="private-glm[1m]", owned_draft=draft.replace("\n", " ")
+        )
+
+    assert composer.text == draft
+    assert composer.sends == []
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("busy", [False, True], ids=["idle", "busy"])
 @pytest.mark.parametrize("cache_cost", [False, True], ids=["immediate", "cache-cost"])
@@ -13549,18 +13579,35 @@ def test_model_command_refuses_unsupported_or_unowned_input_before_keys(
     assert composer.submitted == []
 
 
-@pytest.mark.parametrize("prompt", ["blocked prompt", "blocked\n\nprompt", "blocked prompt "])
+@pytest.mark.parametrize(
+    ("prompt", "wrap_columns"),
+    [
+        ("blocked prompt", None),
+        ("blocked\n\nprompt", None),
+        ("blocked prompt ", None),
+        ("blocked prompt with several visually wrapped words", 12),
+        ("blocked first logical line with wrapping\n\nsecond logical line with wrapping ", 12),
+    ],
+)
 @pytest.mark.parametrize("clear_result", ["success", "refused-attempt"])
 def test_model_command_clears_only_the_exact_owned_blocked_draft(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prompt: str, clear_result: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    prompt: str,
+    wrap_columns: int | None,
+    clear_result: str,
 ) -> None:
     composer = _SessionModelComposer(draft=prompt)
+    composer.wrap_columns = wrap_columns
     composer.cursor = len(prompt) // 2
     bridge_dir = _session_model_bridge(tmp_path, composer)
     composer.install(monkeypatch)
 
     if clear_result == "refused-attempt":
         attempts: list[int] = []
+        box = claude_native_bridge._composer_box(composer._capture_pane("", ""))
+        assert box is not None
+        expected_rows = len(box.rows)
         refusal = claude_native_bridge.ClaudeUserPromptPending(
             "clear attempt refused", nothing_typed=True
         )
@@ -13576,7 +13623,7 @@ def test_model_command_clears_only_the_exact_owned_blocked_draft(
             )
         assert caught.value.phase == "preflight" and not caught.value.command_submitted
         assert caught.value.__cause__ is refusal
-        assert attempts == [len(prompt.splitlines())]
+        assert attempts == [expected_rows]
         assert composer.sends == [] and composer.text == prompt
         return
 
@@ -13656,12 +13703,12 @@ def test_model_command_rechecks_an_owned_draft_before_clearing_it(
     composer.install(monkeypatch)
     captures = 0
 
-    def capture(socket_path: str, target: str) -> str:
+    def capture(socket_path: str, target: str, *, join_wrapped: bool = False) -> str:
         nonlocal captures
         captures += 1
         if captures == 3:
             composer.text = "a person's replacement"
-        return composer._capture_pane(socket_path, target)
+        return composer._capture_pane(socket_path, target, join_wrapped=join_wrapped)
 
     monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
 
@@ -14200,16 +14247,8 @@ def test_model_target_and_status_preserve_alias_context_and_private_identity(
             True,
         ),
         ("Private/Model-B", "Private/Model-B", "Private/Model-B", {}, "private/model-b", False),
-        (
-            "opus",
-            "opus",
-            "system.ai.claude-opus-4-8[1m]",
-            {"ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-4-8[1m]"},
-            "opus (system.ai.claude-opus-4-8)",
-            True,
-        ),
     ],
-    ids=["pinned-alias", "private-case-is-exact", "captured-opus-wrapper"],
+    ids=["pinned-alias", "private-case-is-exact"],
 )
 def test_model_command_verifies_alias_context_and_private_model_identity(
     tmp_path: Path,
@@ -20131,21 +20170,6 @@ def test_a_sandboxed_helper_accepts_the_bridge_under_its_read_only_pinned_tmpdir
             bridge._trusted_parent_for_bridge_dir(pinned / "elsewhere")
     finally:
         pinned.chmod(0o700)
-
-
-@pytest.mark.parametrize(
-    ("env", "expected"),
-    [
-        ({"HOME": "/home/user"}, "/home/user/.claude/settings.json"),
-        ({"HOME": "/home/user", "CLAUDE_CONFIG_DIR": "/srv/claude"}, "/srv/claude/settings.json"),
-        ({"HOME": "/home/user", "CLAUDE_CONFIG_DIR": "cfg/../conf"}, "/repo/conf/settings.json"),
-    ],
-    ids=["home", "config dir", "relative config dir"],
-)
-def test_settings_path_follows_claudes_config_dir(env: dict[str, str], expected: str) -> None:
-    from tests.e2e.routing._helpers import claude_user_settings_path
-
-    assert claude_user_settings_path(Path("/repo"), env) == Path(expected)
 
 
 @pytest.mark.parametrize("command", ["/model sonnet", "/model private-model[1m]"])

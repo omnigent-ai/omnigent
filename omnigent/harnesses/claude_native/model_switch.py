@@ -48,11 +48,23 @@ class ClaudeModelSwitchResult:
 
 
 @dataclass(frozen=True)
+class ClaudeLegacyModelPane:
+    """The session and pane that received a queued legacy model command."""
+
+    socket_path: str
+    tmux_target: str
+    active_session_id: str | None
+    session_id: str | None
+    advertisement: tuple[int, int]
+
+
+@dataclass(frozen=True)
 class ClaudeLegacyModelSwitchResult:
     """A legacy command was submitted; it may also change Claude's saved default."""
 
     requested_model: str
     picker_value: str
+    pane: ClaudeLegacyModelPane | None = None
 
 
 def supports_session_only_model_switch(version: object) -> bool:
@@ -466,10 +478,14 @@ class SessionOnlyModelSwitch:
                 "The Claude session changed during model selection. Retry explicitly."
             )
 
-    def pane(self) -> str:
+    def pane(self, *, join_wrapped: bool = False) -> str:
         self.check()
         self.raise_if_exited()
-        pane = self.bridge._capture_pane(self.info["socket_path"], self.info["tmux_target"])
+        pane = self.bridge._capture_pane(
+            self.info["socket_path"],
+            self.info["tmux_target"],
+            **({"join_wrapped": True} if join_wrapped else {}),
+        )
         self.check()
         self.bridge._raise_if_user_prompt_pending(
             self.bridge_dir, pane, nothing_typed=not self.control_attempted
@@ -535,9 +551,15 @@ class SessionOnlyModelSwitch:
             self.submitted = True
         self.send("Enter")
 
+    def draft_matches(self, pane: str, expected: str) -> bool:
+        if _draft(pane) == expected:
+            return True
+        # tmux joins only soft wraps; explicit newlines and whitespace stay exact.
+        return _draft(self.pane(join_wrapped=True)) == expected
+
     def clear_owned_draft(self, expected: str) -> None:
         pane = self.pane()
-        if _draft(pane) != expected:
+        if not self.draft_matches(pane, expected):
             raise self.refuse(
                 "Claude's input draft changed. Inspect the terminal before retrying."
             )
@@ -797,8 +819,8 @@ class SessionOnlyModelSwitch:
             raise self.refuse(unsupported_version_message, unsupported=True)
         pane = self.pane()
         draft = _draft(pane)
-        if draft:
-            if self.owned_draft is None or draft != self.owned_draft:
+        if draft or (draft is None and self.owned_draft is not None):
+            if self.owned_draft is None or not self.draft_matches(pane, self.owned_draft):
                 raise self.refuse(
                     "An unrelated draft occupies Claude's input box. Finish it, then retry."
                 )

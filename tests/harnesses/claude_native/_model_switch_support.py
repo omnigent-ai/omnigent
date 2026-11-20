@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -69,6 +70,7 @@ class _EditableComposer:
         visible_rows: int | None = None,
         pane_rows: int | None = None,
         unavailable_clear_captures: int = 0,
+        wrap_columns: int | None = None,
     ) -> None:
         """
         :param draft: Text the person left in the box.
@@ -90,6 +92,7 @@ class _EditableComposer:
         self._pane_rows = pane_rows
         self._unavailable_clear_captures = unavailable_clear_captures
         self._clearing_started = False
+        self.wrap_columns = wrap_columns
         self.submitted: list[str] = []
         self._paste_buffer = ""
         self._actions = {
@@ -128,12 +131,29 @@ class _EditableComposer:
             self.submitted.append(self.text)
             self.text, self.cursor = "", 0
 
-    def _capture_pane(self, socket_path: str, tmux_target: str) -> str:
+    def _capture_pane(
+        self, socket_path: str, tmux_target: str, *, join_wrapped: bool = False
+    ) -> str:
         del socket_path, tmux_target
         if self._clearing_started and self._unavailable_clear_captures:
             self._unavailable_clear_captures -= 1
             return ""
-        first, *rest = self.text.split("\n")
+        lines = self.text.split("\n")
+        if self.wrap_columns is not None and not join_wrapped:
+            lines = [
+                row
+                for line in lines
+                for row in (
+                    textwrap.wrap(
+                        line,
+                        width=self.wrap_columns,
+                        replace_whitespace=False,
+                        drop_whitespace=False,
+                    )
+                    or [""]
+                )
+            ]
+        first, *rest = lines
         rows = [f"❯ {first}", *(f"  {row}" for row in rest)]
         if self._visible_rows is not None and len(rows) >= self._visible_rows:
             # The rows take every line the pane has: no closing rule.
@@ -201,6 +221,7 @@ class _SessionModelComposer(_EditableComposer):
         busy: bool = False,
         prompt_separator: str = " ",
         cache_cost_label: str | None = None,
+        legacy_dialog_delay_s: float | None = None,
     ) -> None:
         super().__init__(draft, cursor=len(draft))
         self.options = ["claude-sonnet-5-5", "private-glm[1m]"]
@@ -218,6 +239,9 @@ class _SessionModelComposer(_EditableComposer):
         self.version = "2.1.323"
         self.cache_cost_label = cache_cost_label
         self.confirmations = 0
+        self.legacy_dialog_delay_s = legacy_dialog_delay_s
+        self._legacy_pending: str | None = None
+        self._legacy_dialog_at = 0.0
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
         super().install(monkeypatch)
@@ -255,6 +279,9 @@ class _SessionModelComposer(_EditableComposer):
             self.model = self.resolved_models.get(
                 self.options[self.highlight], self.options[self.highlight]
             )
+            if self._legacy_pending is not None:
+                self.saved_default = self.model
+                self._legacy_pending = None
             self.overlay = None
             return
         if self.overlay == "status":
@@ -268,13 +295,28 @@ class _SessionModelComposer(_EditableComposer):
         elif key == "Enter" and command.startswith("/model "):
             selected = command.removeprefix("/model ")
             assert selected in self.options
-            self.model = self.resolved_models.get(selected, selected)
-            self.saved_default = self.model
+            if self.legacy_dialog_delay_s is None:
+                self.model = self.resolved_models.get(selected, selected)
+                self.saved_default = self.model
+            else:
+                self._legacy_pending = selected
+                self.highlight = self.options.index(selected)
+                self._legacy_dialog_at = (
+                    claude_native_bridge.time.monotonic() + self.legacy_dialog_delay_s
+                )
+                self.cache_cost_label = f"Choice {self.highlight}"
         elif key == "Enter" and command == "/status":
             self.status_queries += 1
             self.overlay = "status"
 
-    def _capture_pane(self, socket_path: str, tmux_target: str) -> str:
+    def _capture_pane(
+        self, socket_path: str, tmux_target: str, *, join_wrapped: bool = False
+    ) -> str:
+        if (
+            self._legacy_pending is not None
+            and claude_native_bridge.time.monotonic() >= self._legacy_dialog_at
+        ):
+            self.overlay = "cache-cost"
         if self.overlay == "cache-cost":
             assert self.cache_cost_label is not None
             return _cache_cost_confirmation_pane(self.cache_cost_label)
@@ -297,7 +339,7 @@ class _SessionModelComposer(_EditableComposer):
                 f"   Model: {self.model}\n"
                 "   Esc to cancel\n"
             )
-        pane = super()._capture_pane(socket_path, tmux_target)
+        pane = super()._capture_pane(socket_path, tmux_target, join_wrapped=join_wrapped)
         pane = pane.replace("\n❯ ", f"\n❯{self.prompt_separator}", 1)
         return ("Working…\n" if self.busy else "") + pane
 

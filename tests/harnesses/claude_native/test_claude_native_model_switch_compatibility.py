@@ -132,8 +132,9 @@ def test_legacy_model_switch_keeps_composer_height_recovery(
     assert [command for command in composer.submitted if command] == ["/model private-glm[1m]"]
 
 
+@pytest.mark.parametrize("publication", ["lock-wait", "readiness-wait"])
 def test_legacy_model_switch_rechecks_the_version_after_lock_wait(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, publication: str
 ) -> None:
     composer = _SessionModelComposer()
     composer.version = "2.1.322"
@@ -147,12 +148,23 @@ def test_legacy_model_switch_rechecks_the_version_after_lock_wait(
         result = original_read(path)
         if path.name == bridge.CONTEXT_RAW_FILE:
             reads += 1
-            if reads > 1:
+            if publication == "lock-wait" and reads > 1:
                 assert result is not None
                 return {**result, "version": "2.1.323"}
         return result
 
     monkeypatch.setattr(bridge, "_read_json_file", read)
+    if publication == "readiness-wait":
+        original_ready = bridge._reclaim_and_wait_for_prompt
+
+        def ready(*args: object, **kwargs: object) -> None:
+            original_ready(*args, **kwargs)
+            path = bridge_dir / bridge.CONTEXT_RAW_FILE
+            raw = json.loads(path.read_text())
+            raw["version"] = "2.1.323"
+            path.write_text(json.dumps(raw))
+
+        monkeypatch.setattr(bridge, "_reclaim_and_wait_for_prompt", ready)
 
     with pytest.raises(bridge.ClaudeModelSwitchRefused, match="version changed"):
         bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
@@ -241,3 +253,54 @@ def test_legacy_failure_never_authorizes_a_dependent_prompt(
         assert composer.model == composer.saved_default == "private-glm[1m]"
     else:
         assert composer.sends == []
+
+
+@pytest.mark.parametrize("changed", ["advertisement", "target", "owner", "native-session"])
+def test_late_legacy_confirmation_stops_when_the_receiving_pane_or_session_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed: str
+) -> None:
+    composer = _SessionModelComposer(cache_cost_label="Choice 1")
+    composer.version = "2.1.322"
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    composer.install(monkeypatch)
+    receipt = bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
+    assert isinstance(receipt, bridge.ClaudeLegacyModelSwitchResult)
+    composer.overlay = "cache-cost"
+    before = list(composer.sends)
+    if changed in {"advertisement", "target"}:
+        assert receipt.pane is not None
+        bridge.write_tmux_target(
+            bridge_dir,
+            socket_path=Path(receipt.pane.socket_path),
+            tmux_target="another:0.0" if changed == "target" else receipt.pane.tmux_target,
+        )
+    elif changed == "owner":
+        bridge.write_active_session_id(bridge_dir, "another-web-session")
+    else:
+        (bridge_dir / "state.json").write_text('{"claude_session_id":"another-native-session"}')
+
+    assert bridge.confirm_legacy_model_dialog(bridge_dir, receipt=receipt) is None
+    assert composer.sends == before
+
+
+def test_late_legacy_confirmation_rechecks_the_session_after_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    composer = _SessionModelComposer(cache_cost_label="Choice 1")
+    composer.version = "2.1.322"
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    composer.install(monkeypatch)
+    receipt = bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
+    assert isinstance(receipt, bridge.ClaudeLegacyModelSwitchResult)
+    composer.overlay = "cache-cost"
+    before = list(composer.sends)
+
+    def capture(socket_path: str, target: str) -> str:
+        pane = composer._capture_pane(socket_path, target)
+        bridge.write_active_session_id(bridge_dir, "another-web-session")
+        return pane
+
+    monkeypatch.setattr(bridge, "_capture_pane", capture)
+    with pytest.raises(bridge.ClaudeModelSwitchRefused, match="session changed"):
+        bridge.confirm_legacy_model_dialog(bridge_dir, receipt=receipt)
+    assert composer.sends == before

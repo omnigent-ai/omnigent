@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
+    from omnigent.harnesses.claude_native.model_switch import ClaudeLegacyModelSwitchResult
     from omnigent.harnesses.codex_native.app_server import CodexNativeAppServer
     from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState
 
@@ -79,6 +80,9 @@ _CLAUDE_CONTROL_PROMPT_WAIT_S = 9.0
 # Whole-request budget for a control, under the server's ~20s forward timeout.
 _CLAUDE_CONTROL_BUDGET_S = 18.0
 
+_CLAUDE_MODEL_LATE_DIALOG_BUDGET_S = 1200.0
+_CLAUDE_MODEL_LATE_DIALOG_POLL_S = 2.0
+
 
 class _ClaudeControlDeadline(threading.Event):
     """A ``cancellable_injection`` flag that sets itself once the control's budget is spent.
@@ -88,9 +92,9 @@ class _ClaudeControlDeadline(threading.Event):
     control back.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, seconds: float | None = None) -> None:
         super().__init__()
-        self.at = time.monotonic() + _CLAUDE_CONTROL_BUDGET_S
+        self.at = time.monotonic() + (_CLAUDE_CONTROL_BUDGET_S if seconds is None else seconds)
 
     def remaining_s(self) -> float:
         return max(0.0, self.at - time.monotonic())
@@ -383,6 +387,10 @@ def build_native_controls(
     """
     # Weak values drop idle sessions, so a holder must keep its lock in a local.
     _codex_settings_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+        weakref.WeakValueDictionary()
+    )
+    _claude_model_dialog_watches: dict[str, tuple[asyncio.Task[None], _ClaudeControlDeadline]] = {}
+    _claude_model_requests: weakref.WeakValueDictionary[str, _ClaudeControlDeadline] = (
         weakref.WeakValueDictionary()
     )
 
@@ -1359,6 +1367,30 @@ def build_native_controls(
             )
         return Response(status_code=204)
 
+    async def _watch_late_model_dialog(
+        conv_id: str,
+        bridge_dir: Path,
+        receipt: ClaudeLegacyModelSwitchResult,
+        deadline: _ClaudeControlDeadline,
+    ) -> None:
+        """Handle a legacy command's queued confirmation on its original pane."""
+        from omnigent.harnesses.claude_native.bridge import confirm_legacy_model_dialog
+
+        try:
+            while not deadline.is_set():
+                done = await _drive_claude_pane(
+                    deadline, confirm_legacy_model_dialog, bridge_dir, receipt=receipt
+                )
+                if done is not False:
+                    return
+                await asyncio.sleep(min(_CLAUDE_MODEL_LATE_DIALOG_POLL_S, deadline.remaining_s()))
+        except Exception:
+            _logger.debug("Late model confirmation stopped for session=%s", conv_id, exc_info=True)
+        finally:
+            current = _claude_model_dialog_watches.get(conv_id)
+            if current is not None and current[1] is deadline:
+                _claude_model_dialog_watches.pop(conv_id, None)
+
     async def _handle_claude_native_model_change(
         conv_id: str,
         model: str | None,
@@ -1387,7 +1419,12 @@ def build_native_controls(
 
         if model is None or not model.strip():
             return Response(status_code=204)
+        previous = _claude_model_dialog_watches.pop(conv_id, None)
+        if previous is not None:
+            previous[1].set()
+            previous[0].cancel()
         deadline = _ClaudeControlDeadline()
+        _claude_model_requests[conv_id] = deadline
         bridge_id = await _claude_native_bridge_id_for_session(
             server_client=server_client, session_id=conv_id
         )
@@ -1399,7 +1436,8 @@ def build_native_controls(
             resolve_claude_native_model_selection(selected_model, claude_config) or selected_model
         )
         inference_config = load_runtime_inference_config()
-        if binding_for_harness(inference_config, "claude-native") is not None:
+        bound_model = binding_for_harness(inference_config, "claude-native") is not None
+        if bound_model:
             resolved_model = resolve_bound_model(inference_config, "claude-native", selected_model)
         cached_options = _claude_model_options_rows.get(conv_id)
         rows = (
@@ -1423,6 +1461,7 @@ def build_native_controls(
                 inject_model_command,
                 bridge_dir,
                 model=resolved_model,
+                **({"legacy_literal_model": True} if bound_model else {}),
                 timeout_s=deadline.remaining_s(),
                 ready_timeout_s=min(_CLAUDE_CONTROL_PROMPT_WAIT_S, deadline.remaining_s()),
             )
@@ -1461,6 +1500,19 @@ def build_native_controls(
                     **({"waiting_on_person": True} if _claude_waits_on_person(exc) else {}),
                 },
             )
+        if (
+            isinstance(receipt, ClaudeLegacyModelSwitchResult)
+            and receipt.pane is not None
+            and _claude_model_requests.get(conv_id) is deadline
+        ):
+            watch_deadline = _ClaudeControlDeadline(seconds=_CLAUDE_MODEL_LATE_DIALOG_BUDGET_S)
+            task = asyncio.create_task(
+                _watch_late_model_dialog(conv_id, bridge_dir, receipt, watch_deadline),
+                name=f"claude-legacy-model-dialog-{conv_id}",
+            )
+            _claude_model_dialog_watches[conv_id] = (task, watch_deadline)
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
         return Response(status_code=204)
 
     async def _handle_cursor_native_model_change(
