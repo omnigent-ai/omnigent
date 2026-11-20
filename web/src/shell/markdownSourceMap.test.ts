@@ -108,6 +108,8 @@ const cases: [string, string, number, string?][] = [
     "word ⟦word⟧ [Details][ref]\n\n[ref]: https://example.com/word",
     1,
   ],
+  ["footnote definition before text", "[^1]: word\n\n⟦word⟧ word[^1]", 0],
+  ["footnote definition after text", "word[^1] ⟦word⟧\n\n[^1]: https://example.com/word", 1],
   ["entities before selection", "&amp; &lt; &#119;ord word ⟦word⟧", 2],
   ["escaped punctuation", "word \\* ⟦word⟧", 1],
   ["table", "| word | B |\n| --- | --- |\n| word | ⟦word⟧ |", 2],

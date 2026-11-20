@@ -368,8 +368,10 @@ function startDisplayCapture(recordDir, display) {
  *   e.g. a scratch `HOME` so credential files stay out of the real one.
  * @param {string[]} [opts.preload] Modules the main process requires before
  *   `main.js`, e.g. a stand-in system browser that must exist from launch.
+ * @param {boolean} [opts.waitForShell] `false` returns right after launch with
+ *   `window: null`, for journeys whose shell may never load a page.
  * @returns {Promise<{ electronApp: import("playwright").ElectronApplication,
- *   window: import("playwright").Page, userDataDir: string,
+ *   window: import("playwright").Page | null, userDataDir: string,
  *   stopDisplayCapture: () => Promise<void> }>} `stopDisplayCapture` must be
  *   awaited before `saveRecording` (it finalizes the composited capture; a
  *   no-op when no display capture ran).
@@ -436,6 +438,10 @@ async function launchDesktop(opts) {
   } catch (err) {
     await stopDisplayCapture();
     throw err;
+  }
+  // Journeys whose shell window may never commit a document locate it themselves.
+  if (opts.waitForShell === false) {
+    return { electronApp, window: null, userDataDir, stopDisplayCapture };
   }
   // If locating the shell fails after launch succeeds, close the app so the
   // Electron process isn't orphaned (the caller never got a handle to close).

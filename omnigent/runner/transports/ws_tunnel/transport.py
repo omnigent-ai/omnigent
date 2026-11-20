@@ -22,6 +22,7 @@ abort propagates as a ``ConnectionError`` from the body iterator.
 
 from __future__ import annotations
 
+import re
 import uuid
 from collections.abc import AsyncIterator
 
@@ -36,6 +37,10 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     encode_frame,
 )
 from omnigent.runner.transports.ws_tunnel.registry import RequestState, TunnelRegistry
+
+# A session event sent to the runner: a user message, approval, or other input
+# that can start work there.
+_SESSION_EVENTS_PATH = re.compile(r"^/v1/sessions/[^/]+/events$")
 
 
 class _TunneledByteStream(httpx.AsyncByteStream):
@@ -173,6 +178,8 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
                     )
                 ),
             )
+            if request.method == "POST" and _SESSION_EVENTS_PATH.match(request.url.path):
+                self._registry.note_work_dispatched(self._runner_id)
             # Block until the response head arrives (or the tunnel
             # aborts the request).
             head = await state.head_future
@@ -191,6 +198,14 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
             headers=[(k, v) for k, v in head.headers],
             stream=stream,
             request=request,
+            extensions={
+                "omnigent_runner_connection": {
+                    "runner_id": state.session.runner_id,
+                    "runner_version": state.session.hello.runner_version,
+                    "connection_id": state.session.hello.connection_id,
+                    "generation": state.session.generation,
+                }
+            },
         )
 
     async def aclose(self) -> None:

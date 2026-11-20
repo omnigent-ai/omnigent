@@ -1,5 +1,9 @@
 # Manual QA plan — opencode-native gap closure (PR #1303)
 
+> **Superseded.** These checks target OpenCode 1.17.7. For OpenCode 2.x, use the
+> manual checklist in the v2 spec's implementation plan and
+> [`docs/opencode-native.md`](../docs/opencode-native.md).
+
 Validates every change in PR #1303 against a real `opencode serve`. Each area
 has **preconditions → steps → expected**. Items marked **[live-verified]** were
 already confirmed against opencode 1.17.7 during development; re-run them as a

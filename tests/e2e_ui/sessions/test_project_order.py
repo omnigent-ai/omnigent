@@ -27,12 +27,11 @@ def test_drag_project_order_persists_and_resets(
             group.click()
         header = page.locator('button[data-slot="context-menu-trigger"]').filter(has_text=names[2])
         header.hover()
-        # A normal click and Enter keep their expand/collapse behavior.
-        header.click()
+        header.locator("[data-section-toggle]").first.click()
         expect(header).to_have_attribute("aria-expanded", "true")
-        header.press("Enter")
+        header.press("ArrowLeft")
         expect(header).to_have_attribute("aria-expanded", "false")
-        header.click()
+        header.press("ArrowRight")
         expect(header).to_have_attribute("aria-expanded", "true")
         expect(page.locator(".lucide-grip-vertical")).to_have_count(0)
         source = page.get_by_role("button", name=names[2], exact=True)
@@ -167,7 +166,7 @@ def test_project_drag_preview_keeps_grab_offset(
         expanded_names = [names[0], names[2], names[3]]
         for name in expanded_names:
             header = page.get_by_role("button", name=name, exact=True)
-            header.click()
+            header.locator("[data-section-toggle]").first.click()
             expect(header).to_have_attribute("aria-expanded", "true")
             # Folder loading placeholders have a different height from empty rows.
             expect(
@@ -267,7 +266,7 @@ def test_filed_session_drag_preview_keeps_grab_offset(
         for name in names:
             header = page.get_by_role("button", name=name, exact=True)
             if header.get_attribute("aria-expanded") == "false":
-                header.click()
+                header.locator("[data-section-toggle]").first.click()
         source = page.get_by_role("link", name=title, exact=True)
         expect(source).to_be_visible()
         if peek:

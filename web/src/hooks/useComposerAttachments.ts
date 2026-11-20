@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { attachmentAccept, clipboardFiles, validateAttachments } from "@/lib/attachments";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { insertPastedText } from "@/lib/composerText";
+import type { ComposerPasteEvent } from "@/components/composer/engine/composerInput";
 
 export interface UseComposerAttachmentsOptions {
   /**
@@ -39,10 +41,10 @@ export interface ComposerAttachmentsApi {
   restoreFiles: (files: File[]) => void;
   /**
    * Attach file-kind clipboard items instead of letting them insert as
-   * text. The event is claimed only when a usable file was present, so a
-   * plain-text paste keeps its native behavior.
+   * text. Without a usable file, plain text is inserted as typed input
+   * (see insertPastedText).
    */
-  onPaste: (e: React.ClipboardEvent<HTMLTextAreaElement>) => void;
+  onPaste: (e: ComposerPasteEvent) => void;
   clearError: () => void;
   clear: () => void;
 }
@@ -114,12 +116,14 @@ export function useComposerAttachments({
   }, []);
 
   const onPaste = useCallback(
-    (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    (e: ComposerPasteEvent) => {
       const pasted = clipboardFiles(e.clipboardData);
-      if (pasted.length > 0) {
-        e.preventDefault();
-        addFiles(pasted);
+      if (pasted.length === 0) {
+        insertPastedText(e);
+        return;
       }
+      e.preventDefault();
+      addFiles(pasted);
     },
     [addFiles],
   );

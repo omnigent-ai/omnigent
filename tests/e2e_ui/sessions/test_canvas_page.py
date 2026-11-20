@@ -14,8 +14,20 @@ from tests._helpers.session import post_session_bundle
 from tests.e2e_ui.conftest import _build_hello_world_bundle
 
 
-def _stub_server_info(page: Page, *, canvas: bool, usage: bool = False) -> None:
-    """Advertise one deterministic ``canvas`` release-feature value."""
+def _stub_server_info(
+    page: Page,
+    *,
+    canvas: bool,
+    usage: bool = False,
+    session_pull_requests: bool = False,
+    comment_anchor_metadata: bool = False,
+) -> None:
+    """Advertise one deterministic ``canvas`` release-feature value.
+
+    :param session_pull_requests: Whether the server stores session PRs, so
+        Canvas cards read them from the session list rather than each runner.
+    :param comment_anchor_metadata: Whether session comments preserve PR anchors.
+    """
     body = json.dumps(
         {
             "accounts_enabled": False,
@@ -25,12 +37,29 @@ def _stub_server_info(page: Page, *, canvas: bool, usage: bool = False) -> None:
             "features": {"canvas": canvas, "usage_page": usage, "harness_install": False},
             "harness_install_enabled": False,
             "installable_harnesses": [],
+            "session_pull_requests": session_pull_requests,
+            "comment_anchor_metadata": comment_anchor_metadata,
         }
     )
     page.route(
         "**/v1/info",
         lambda route: route.fulfill(status=200, content_type="application/json", body=body),
     )
+
+
+def _refuse_live_pull_requests(page: Page) -> list[str]:
+    """Fail every live PR lookup, so a card can only show the session list's PR.
+
+    :returns: The refused lookups' URLs, which the test can assert stay empty.
+    """
+    refused: list[str] = []
+
+    def refuse(route: Route) -> None:
+        refused.append(route.request.url)
+        route.abort()
+
+    page.route(re.compile(r"/resources/github(?:\?|$)"), refuse)
+    return refused
 
 
 def _session(
@@ -119,7 +148,7 @@ def test_canvas_page_groups_sessions_by_project_and_opens_them(
     page.route("**/v1/sessions/projects", lambda route: route.fulfill(json=projects))
 
     page.goto(live_server)
-    if width < 768:
+    if width < 1181:
         page.get_by_role("button", name="Open sidebar", exact=True).click()
     expect(page.get_by_text("Main session 0", exact=True).first).to_be_visible()
     page.get_by_test_id("canvas-nav").click()
@@ -151,7 +180,7 @@ def test_canvas_page_groups_sessions_by_project_and_opens_them(
 
     # Leaving and coming back through the sidebar reopens the last selected canvas.
     page.goto(live_server)
-    if width < 768:
+    if width < 1181:
         page.get_by_role("button", name="Open sidebar", exact=True).click()
     expect(page.get_by_text("Main session 0", exact=True).first).to_be_visible()
     page.get_by_test_id("canvas-nav").click()
@@ -163,7 +192,7 @@ def test_canvas_page_groups_sessions_by_project_and_opens_them(
 
     cards.click()
     expect(page).to_have_url(re.compile(r"/canvas/c/project-session\?canvas=project-release$"))
-    if width < 768:
+    if width < 1181:
         page.get_by_role("button", name="Back to canvas", exact=True).click()
         expect(cards).to_have_count(1)
     expect(page.get_by_role("region", name="Canvas pane", exact=True)).to_be_visible()

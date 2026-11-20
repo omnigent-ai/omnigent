@@ -1,5 +1,6 @@
 import { renderSidebar as renderSidebarAt } from "@/test/sidebarTestHelpers";
 import { conversationPage } from "@/test/sidebarMockHelpers";
+import { PROJECT_KANBAN_BOARD_STORAGE_KEY } from "@/lib/projectKanbanPreferences";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
@@ -80,6 +81,8 @@ describe("project folder header icon/chevron", () => {
       "sidebar-compact-text",
       "text-foreground",
     );
+    // Project names sit heavier than the regular-weight session rows below.
+    expect(within(header).getByText("My Project")).toHaveClass("font-medium");
 
     const folder = header.querySelector(".lucide-folder") as HTMLElement;
     expect(folder).not.toBeNull();
@@ -118,16 +121,18 @@ describe("project folder header icon/chevron", () => {
     expect(classOf(trailing)).not.toMatch(/md:group-hover:opacity-100/);
   });
 
-  it("highlights the project row instead of global New session for a project-scoped composer", () => {
+  it("lists a highlighted ghost row under the project for a project-scoped composer", () => {
     renderSidebar("/?project=My%20Project");
 
     const header = headerButton("My Project");
-    expect(header).toHaveAttribute("aria-current", "page");
-    expect(header).toHaveClass(
+    expect(header).not.toHaveAttribute("aria-current");
+    expect(header).not.toHaveClass("bg-[var(--sidebar-active)]");
+    expect(header.querySelector(".lucide-folder")).toHaveClass("text-muted-foreground");
+
+    const ghost = within(header.closest("section")!).getByRole("link", { name: /^New session$/ });
+    expect(ghost).toHaveAttribute("href", "/?project=My%20Project");
+    expect(ghost).toHaveClass(
       "bg-[var(--sidebar-active)]",
-      "text-[var(--sidebar-active-foreground)]",
-    );
-    expect(header.querySelector(".lucide-folder")).toHaveClass(
       "text-[var(--sidebar-active-foreground)]",
     );
 
@@ -204,4 +209,56 @@ describe("project folder header icon/chevron", () => {
     expect(classOf(chevron)).not.toMatch(/md:hidden/);
     expect(classOf(chevron)).toMatch(/md:group-hover:opacity-100/);
   });
+});
+
+it("opens the project home from the row and expands or collapses it only from the chevron", () => {
+  localStorage.clear();
+  renderSidebarAt({ features: { project_kanban: true } });
+  const header = headerButton("My Project");
+  const title = within(header).getByText("My Project");
+  const chevron = header.querySelector("[data-section-toggle]")!;
+  expect(header).toHaveAttribute("aria-expanded", "false");
+
+  fireEvent.click(title);
+  expect(header).toHaveAttribute("aria-expanded", "false");
+  expect(header).toHaveAttribute("aria-current", "page");
+  expect(screen.getByTestId("new-chat-button")).not.toHaveClass("bg-[var(--sidebar-active)]");
+
+  fireEvent.click(chevron);
+  expect(header).toHaveAttribute("aria-expanded", "true");
+  expect(
+    within(header.closest("section")!).queryByRole("link", { name: /^New session$/ }),
+  ).toBeNull();
+  fireEvent.click(title);
+  expect(header).toHaveAttribute("aria-expanded", "true");
+  fireEvent.click(chevron);
+  expect(header).toHaveAttribute("aria-expanded", "false");
+  expect(header).toHaveAttribute("aria-current", "page");
+});
+
+it("keeps the project row a collapse toggle when the board is turned off in Settings", () => {
+  localStorage.clear();
+  localStorage.setItem(PROJECT_KANBAN_BOARD_STORAGE_KEY, "false");
+  renderSidebarAt({ features: { project_kanban: true } });
+  const header = headerButton("My Project");
+  const title = within(header).getByText("My Project");
+
+  fireEvent.click(title);
+  expect(header).toHaveAttribute("aria-expanded", "true");
+  expect(header).not.toHaveAttribute("aria-current");
+  fireEvent.click(title);
+  expect(header).toHaveAttribute("aria-expanded", "false");
+  localStorage.clear();
+});
+
+it("opens New project without toggling the Projects header", () => {
+  renderSidebar();
+  const projects = headerButton("Projects");
+  const expanded = projects.getAttribute("aria-expanded");
+  fireEvent.click(projects);
+  expect(projects.getAttribute("aria-expanded")).not.toBe(expanded);
+  const afterToggle = projects.getAttribute("aria-expanded");
+  fireEvent.click(screen.getByRole("button", { name: "New project" }));
+  expect(screen.getByRole("dialog", { name: "New project" })).toBeVisible();
+  expect(projects.getAttribute("aria-expanded")).toBe(afterToggle);
 });

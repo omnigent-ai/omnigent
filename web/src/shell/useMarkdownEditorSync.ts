@@ -21,6 +21,17 @@ interface Options {
   setContentRef?: RefObject<((content: string) => void) | null>;
 }
 
+/**
+ * Finish a pre-write conflict check.
+ *
+ * :param serverContent: The fetched raw file content, or null when the GET
+ *     failed or returned a binary file.
+ * :returns: ``"conflict"`` when an external edit is pending (raised now or by a
+ *     refresh during the GET), so the caller must not write; ``"stale"`` when a
+ *     refresh landed during the GET; ``"write"`` when the save may proceed.
+ */
+export type FinishServerCheck = (serverContent: string | null) => "write" | "conflict" | "stale";
+
 interface Result {
   /** Incremented each time the editor should remount. */
   editorKey: number;
@@ -42,16 +53,14 @@ interface Result {
    */
   markSaved: (content: string) => void;
   /**
-   * Reconcile server content fetched outside the query (the pre-write
-   * conflict check, since the query isn't refetched mid-turn). When it
-   * differs from the last-known server state — and isn't our own save — it's
-   * an external edit: on a dirty editor, stash it and raise hasExternalUpdate.
+   * Start a pre-write conflict check, before GETting the file outside the
+   * query. Call the returned function with what the GET returned.
    *
-   * :param serverContent: The freshly fetched raw file content.
-   * :returns: True when a conflict was raised (caller must skip its write);
-   *     False when already known and the write may proceed.
+   * A refresh that lands during the GET may be newer than its response, and
+   * the editor may have changed meanwhile, so the check then reports "stale":
+   * the caller should start its save over from the current buffer.
    */
-  reconcileServerContent: (serverContent: string) => boolean;
+  beginServerCheck: () => FinishServerCheck;
 }
 
 export function useMarkdownEditorSync({
@@ -80,6 +89,9 @@ export function useMarkdownEditorSync({
 
   const prevContentRef = useRef(content);
   const prevPathRef = useRef(path);
+  // Counts server content the query delivered, so a pre-write check can tell
+  // whether a refresh landed while its GET was in flight.
+  const serverVersionRef = useRef(0);
 
   // True when a path change is waiting for the new file's query to settle.
   const pendingRemountRef = useRef(false);
@@ -125,6 +137,7 @@ export function useMarkdownEditorSync({
   //   the UI can warn the user their save will overwrite the incoming change.
   useEffect(() => {
     if (prevContentRef.current === content) return;
+    serverVersionRef.current += 1;
     // Self-save echo: server reports exactly what we just saved. Skip it —
     // re-applying would reset the cursor and (if typing resumed) misfire a conflict.
     if (content === lastSavedRef.current) {
@@ -185,30 +198,31 @@ export function useMarkdownEditorSync({
 
   // Imperative counterpart to the content-change effect, for content fetched
   // outside the query (the pre-write conflict check). See the Result doc.
-  const reconcileServerContent = useCallback(
-    (serverContent: string): boolean => {
-      // Already known (last-seen server state or our own save) — nothing to do.
-      if (serverContent === prevContentRef.current || serverContent === lastSavedRef.current) {
-        return false;
+  const beginServerCheck = useCallback((): FinishServerCheck => {
+    const version = serverVersionRef.current;
+    return (serverContent) => {
+      // A pending conflict, possibly raised by a refresh during the GET, blocks
+      // the write until the user picks Keep mine or Load latest.
+      if (pendingContentRef.current !== null) return "conflict";
+      if (serverVersionRef.current !== version) return "stale";
+      // Unknown (failed GET), known (last-seen server state or our own save), or
+      // nothing to conflict with.
+      if (
+        serverContent === null ||
+        serverContent === prevContentRef.current ||
+        serverContent === lastSavedRef.current ||
+        !isDirtyRef.current
+      ) {
+        return "write";
       }
       // Adopt as the latest known server state — this also lets a later "Keep
       // mine" overwrite through, while a *newer* external edit re-raises.
       prevContentRef.current = serverContent;
-      if (isDirtyRef.current) {
-        pendingContentRef.current = serverContent;
-        setHasExternalUpdate(true);
-        return true;
-      }
-      // Clean editor: adopt the content (nothing to conflict with).
-      if (setContentRef?.current) {
-        setContentRef.current(serverContent);
-      } else {
-        setEditorKey((k) => k + 1);
-      }
-      return false;
-    },
-    [setContentRef],
-  );
+      pendingContentRef.current = serverContent;
+      setHasExternalUpdate(true);
+      return "conflict";
+    };
+  }, []);
 
   return {
     editorKey,
@@ -218,6 +232,6 @@ export function useMarkdownEditorSync({
     discardAndApplyExternal,
     dismissExternalUpdate,
     markSaved,
-    reconcileServerContent,
+    beginServerCheck,
   };
 }

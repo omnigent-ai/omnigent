@@ -124,7 +124,7 @@ into the nearby floating editor, and confirm the field remains `W41`. Escape
 should close only the editor. Reopen it and use Send or Enter to submit an
 instruction to chat. No instruction bar should appear below the browser URL.
 
-## Arclet laptop credentials
+## Arclet credentials
 
 `desktop_dbcert_preflight.e2e.js` drives New Session → Arclet Sandbox through
 the real SPA, preload, main process, CLI subprocess, and local server. It checks
@@ -135,8 +135,7 @@ sync, verifies the local credentials before clearing the banner, and skips
 renewal for valid credentials. Choosing Skip during a pending check starts one
 session without waiting; the component suite covers late-result UI state.
 The dbcert executable and machine policy
-are fixtures; cloud allocation remains gated. This test does not cover macOS
-SSO or Companion's credential transfer.
+are fixtures. This test does not cover macOS SSO.
 
 ```sh
 OMNIGENT_PYTHON=/path/to/venv/bin/python \
@@ -145,14 +144,13 @@ OMNIGENT_PYTHON=/path/to/venv/bin/python \
   xvfb-run -a node --test e2e/desktop_dbcert_preflight.e2e.js
 ```
 
-Human check: use the updated desktop shell and web bundle on a managed server,
-with Arca Companion running. With an expired or missing laptop dbcert, submit
-a task to Arclet Sandbox. Confirm a yellow banner appears, the draft stays, and
-no browser or sandbox opens. Click Refresh dbcert, finish browser sign-in, and
-confirm the banner clears without launching anything. Submit again to launch
-the original task. Prelaunch refresh waits for local renewal and validation, not
-sync to an existing Arca; Companion transfers credentials separately. Repeat
-with a valid dbcert and confirm no sign-in opens.
+Human check: use the updated desktop shell and web bundle on a managed server.
+With expired or missing local credentials, submit a task to Arclet Sandbox.
+Confirm a yellow banner appears, the draft stays, and no browser or sandbox
+opens. Click Refresh dbcert, finish browser sign-in, and confirm the banner
+clears without launching anything. Submit again to launch the original task.
+Prelaunch refresh waits only for local renewal and validation. Repeat with a
+valid dbcert and confirm no sign-in opens.
 Dismiss the warning while the cert is invalid and submit again: the warning
 must return without creating an Arclet. A canceled or failed refresh should
 leave the draft and offer a retry.
@@ -170,6 +168,13 @@ from the repository root. This checks real Electron zoom from 50% to 150%,
 Native traffic lights require a human visual check: use View → Zoom Out and
 Actual Size, then collapse/reopen the sidebar and open Settings.
 
+`desktop_find_selection_prefill.e2e.js` selects words in a chat reply and opens
+find with Ctrl+F (bar closed and open, and inside the bar) and Edit → Find…,
+checking the bar's query and match count. It needs Linux, an X display with
+XTEST, and a built SPA:
+`OMNIGENT_PW_NO_SANDBOX=1 xvfb-run -a node --test e2e/desktop_find_selection_prefill.e2e.js`
+from `web/electron`.
+
 1. Copy `desktop_connect.e2e.js` to `e2e/desktop_<slug>.e2e.js`.
 2. If the bug's failure is **past** connect, pass `serverUrl` to
    `launchDesktop` so the app boots straight into the shell; if the bug is in
@@ -185,6 +190,15 @@ Actual Size, then collapse/reopen the sidebar and open Settings.
    footage. Use `saveRecording(RECORD_DIR, "before-<facet>")` (or
    `fixed-<facet>`), then write the journey `caption` for the handoff exactly as
    the other lanes do (see `dev/repro-agent/AGENTS.md`, Step 4).
+
+## Security-key notice
+
+`desktop_browser_webauthn_prompt.e2e.js` opens an Okta-style verify page in a
+session's Browser tab. That page requests a WebAuthn assertion that nothing can
+answer. The test checks that the shell's security-key notice appears for the
+page's origin while the request is still pending. Its **Open in browser** button
+must hand the same URL to `fixtures/fakeSystemBrowser.cjs`. It runs on Linux
+under `xvfb-run` and needs no security key.
 
 ## Navigation policy runtime boundary
 

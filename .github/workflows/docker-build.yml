@@ -62,7 +62,7 @@ jobs:
   scope:
     name: Docker scope
     needs: gate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       docker: ${{ steps.scope.outputs.docker }}
     steps:
@@ -79,7 +79,7 @@ jobs:
     # Draft PRs skip the build (ready_for_review re-fires the workflow), matching
     # the pytest job in ci.yml.
     if: ${{ !github.event.pull_request.draft && needs.scope.outputs.docker == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - name: Checkout
@@ -191,7 +191,7 @@ jobs:
     name: Docker result
     if: always()
     needs: [scope, build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Require successful test selection

@@ -1,9 +1,14 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { Editor } from "@tiptap/core";
+import { NodeSelection } from "@tiptap/pm/state";
 import { createMarkdownDocumentExtensions } from "./markdownDocumentExtensions";
 import { installMarkdownParserPatch } from "./tiptapMarkdownPatches";
 import type { Node as ProseMirrorNode } from "@tiptap/pm/model";
-import { findPmRangeForComment, computeSelectionData } from "./TipTapEditorHelpers";
+import {
+  applyExternalMarkdown,
+  findPmRangeForComment,
+  computeSelectionData,
+} from "./TipTapEditorHelpers";
 import type { Comment } from "@/hooks/useComments";
 
 installMarkdownParserPatch();
@@ -303,5 +308,143 @@ describe("computeSelectionData", () => {
       end_index: text.length,
       anchor_content: text,
     });
+  });
+});
+
+describe("applyExternalMarkdown", () => {
+  let editor: Editor | undefined;
+  afterEach(() => {
+    editor?.destroy();
+    editor = undefined;
+  });
+
+  function newEditor(markdown: string): Editor {
+    return new Editor({
+      extensions: createMarkdownDocumentExtensions("conversation", "doc.md"),
+      content: markdown,
+      contentType: "markdown",
+    });
+  }
+
+  function openEditor(markdown: string): Editor {
+    editor = newEditor(markdown);
+    return editor;
+  }
+
+  /** The document a full replace (TipTap's setContent) shows for this Markdown. */
+  function replacedDocument(markdown: string): unknown {
+    const reference = newEditor("");
+    reference.commands.setContent(markdown, { contentType: "markdown" });
+    const json = reference.state.doc.toJSON();
+    reference.destroy();
+    return json;
+  }
+
+  function positionAfter(doc: ProseMirrorNode, text: string): number {
+    let found = -1;
+    doc.descendants((node, pos) => {
+      const at = node.isText ? node.text!.indexOf(text) : -1;
+      if (found === -1 && at !== -1) found = pos + at + text.length;
+    });
+    expect(found).not.toBe(-1);
+    return found;
+  }
+
+  it("keeps the cursor on its text when another writer edits before or after it", () => {
+    const ed = openEditor("First paragraph.\n\nSecond paragraph.\n");
+    ed.commands.setTextSelection(positionAfter(ed.state.doc, "First"));
+    const onUpdate = vi.fn();
+    ed.on("update", onUpdate);
+
+    for (const next of [
+      "# Added title\n\nFirst paragraph.\n\nSecond paragraph.\n",
+      "# Added title\n\nFirst paragraph.\n\nSecond paragraph.\n\nAdded at the end.\n",
+    ]) {
+      applyExternalMarkdown(ed, next);
+      expect(ed.state.doc.toJSON()).toEqual(replacedDocument(next));
+      expect(ed.state.selection.from).toBe(positionAfter(ed.state.doc, "First"));
+    }
+    // The viewer re-baselines itself; an update event would mark it dirty.
+    expect(onUpdate).not.toHaveBeenCalled();
+  });
+
+  const changes = [
+    ["text inside a paragraph", "Alpha beta gamma.", "Alpha BETA gamma."],
+    ["repeated characters", "aaa", "aaaa"],
+    ["a new list item", "- one\n- two", "- one\n- two\n- three"],
+    ["a checked task", "- [ ] task", "- [x] task"],
+    ["a heading level", "# Title\n\nBody", "## Title\n\nBody"],
+    ["a table cell", "| A | B |\n| --- | --- |\n| 1 | 2 |", "| A | B |\n| --- | --- |\n| 1 | 3 |"],
+    ["a code block", "```ts\nconst a = 1;\n```", "```ts\nconst a = 2;\n```"],
+    ["a removed block", "One\n\nTwo\n\nThree", "One\n\nThree"],
+    ["a split paragraph", "One two", "One\n\ntwo"],
+    [
+      "a table cell and the block after it",
+      "| A | B |\n| --- | --- |\n| 1 | 2 |\n\n### Title",
+      "| A | B |\n| --- | --- |\n| 1 | 9 |\n\n```\ncode\n```",
+    ],
+    [
+      "a new table row and the paragraph after it",
+      "| A |\n| --- |\n| 1 |\n\nAfter.",
+      "| A |\n| --- |\n| 1 |\n| 2 |\n\nAfter, edited.",
+    ],
+    [
+      "a paragraph between two tables",
+      "| A |\n| --- |\n| 1 |\n\nMiddle.\n\n| B |\n| --- |\n| 2 |",
+      "| A |\n| --- |\n| 1 |\n\nMiddle, edited.\n\n| B |\n| --- |\n| 3 |",
+    ],
+  ];
+  it.each(
+    changes.flatMap(([name, before, after]) => [
+      [`${name}, caret before it`, `Anchor here.\n\n${before}\n`, `Anchor here.\n\n${after}\n`],
+      [`${name}, caret after it`, `${before}\n\nAnchor here.\n`, `${after}\n\nAnchor here.\n`],
+    ]),
+  )("matches a full replace and keeps the caret: %s", (_name, before, after) => {
+    const ed = openEditor(before);
+    ed.commands.setTextSelection(positionAfter(ed.state.doc, "Anchor"));
+    applyExternalMarkdown(ed, after);
+    expect(ed.state.doc.toJSON()).toEqual(replacedDocument(after));
+    expect(ed.state.selection.from).toBe(positionAfter(ed.state.doc, "Anchor"));
+  });
+
+  it("tells selection listeners where the caret ended up", () => {
+    const ed = openEditor("First paragraph.\n\nSecond paragraph.\n");
+    ed.commands.setTextSelection(positionAfter(ed.state.doc, "Second"));
+    const seen: number[] = [];
+    ed.on("selectionUpdate", ({ editor: updated }) => seen.push(updated.state.selection.from));
+
+    applyExternalMarkdown(ed, "# Added title\n\nFirst paragraph.\n\nSecond paragraph.\n");
+    expect(seen.at(-1)).toBe(positionAfter(ed.state.doc, "Second"));
+  });
+
+  it("keeps a selected node selected when another writer edits elsewhere", () => {
+    const ed = openEditor("Above.\n\n---\n\nBelow.\n");
+    let rule = -1;
+    ed.state.doc.descendants((node, pos) => {
+      if (node.type.name === "horizontalRule") rule = pos;
+    });
+    ed.commands.setNodeSelection(rule);
+
+    applyExternalMarkdown(ed, "Above, edited.\n\n---\n\nBelow.\n");
+    const { selection } = ed.state;
+    expect(selection).toBeInstanceOf(NodeSelection);
+    expect((selection as NodeSelection).node.type.name).toBe("horizontalRule");
+  });
+
+  it("clears undo history so undo cannot revert another writer's edit", () => {
+    const ed = openEditor("Hello world.\n");
+    ed.commands.setTextSelection(positionAfter(ed.state.doc, "Hello world."));
+    ed.commands.insertContent(" Mine.");
+    applyExternalMarkdown(ed, "Hello world. Theirs.\n");
+
+    ed.commands.undo();
+    expect(ed.state.doc.toJSON()).toEqual(replacedDocument("Hello world. Theirs.\n"));
+  });
+
+  it("keeps the caret when the content is unchanged", () => {
+    const ed = openEditor("Same text.\n");
+    ed.commands.setTextSelection(positionAfter(ed.state.doc, "Same"));
+    applyExternalMarkdown(ed, "Same text.\n");
+    expect(ed.state.selection.from).toBe(positionAfter(ed.state.doc, "Same"));
   });
 });

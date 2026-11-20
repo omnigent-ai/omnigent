@@ -1933,6 +1933,36 @@ def test_worker_bounds_readiness_dispatch_for_each_head(tmp_path, api, condition
 
 
 @pytest.mark.parametrize(
+    "maximum,merge_count,reason",
+    [
+        (4, 3, None),
+        (4, 4, "Base refresh limit reached (4/4)"),
+        (0, 0, "Base refresh limit reached (0/0)"),
+        (None, 0, "max_base_refreshes must be a non-negative integer"),
+        (-1, 0, "max_base_refreshes must be a non-negative integer"),
+        (True, 0, "max_base_refreshes must be a non-negative integer"),
+        ("20", 0, "max_base_refreshes must be a non-negative integer"),
+        (2.5, 0, "max_base_refreshes must be a non-negative integer"),
+    ],
+)
+def test_base_refresh_budget_uses_trusted_policy(
+    tmp_path, monkeypatch, policy_module, maximum, merge_count, reason
+):
+    worker = importlib.import_module("dependabot_automerge")
+    policy_file = tmp_path / "policy.json"
+    policy_file.write_text(json.dumps({"max_base_refreshes": maximum}))
+    monkeypatch.setattr(worker, "POLICY", policy_file)
+    commits = [{"parents": [{"sha": BASE}]}] + [
+        {"parents": [{"sha": BASE}, {"sha": "c" * 40}]} for _ in range(merge_count)
+    ]
+    if reason is None:
+        worker.require_base_refresh_budget(commits)
+    else:
+        with pytest.raises(ValueError, match=re.escape(reason)):
+            worker.require_base_refresh_budget(commits)
+
+
+@pytest.mark.parametrize(
     "condition",
     [
         "green",
@@ -1945,6 +1975,7 @@ def test_worker_bounds_readiness_dispatch_for_each_head(tmp_path, api, condition
         "hold",
         "head_moved",
         "two_merges",
+        "nineteen_merges",
         "two_pages",
         "limit_two_pages",
         "incomplete_two_pages",
@@ -2005,17 +2036,18 @@ def test_worker_refreshes_only_green_stale_candidates(tmp_path, api, condition):
         del pull["head"]["ref"]
     pull["commits"] = 1
     commits = [{"sha": HEAD, "parents": [{"sha": BASE}]}]
-    if condition in {"limit", "two_merges"}:
+    if condition in {"limit", "two_merges", "green", "nineteen_merges"}:
+        merge_count = {"limit": 20, "two_merges": 2, "green": 3, "nineteen_merges": 19}[condition]
         commits = [
-            {"sha": str(index) * 40, "parents": [{"sha": BASE}, {"sha": tip}]}
-            for index in range(3 if condition == "limit" else 2)
+            {"sha": f"{index:040x}", "parents": [{"sha": BASE}, {"sha": tip}]}
+            for index in range(merge_count)
         ] + commits
         pull["commits"] = len(commits)
     elif condition in {"two_pages", "limit_two_pages", "incomplete_two_pages"}:
         commits = [
             {"sha": f"{index:040x}", "parents": [{"sha": BASE}]} for index in range(100)
         ] + commits
-        for index in (0, 100) if condition != "limit_two_pages" else (0, 99, 100):
+        for index in (0, 100) if condition != "limit_two_pages" else (*range(19), 100):
             commits[index]["parents"].append({"sha": tip})
         pull["commits"] = len(commits)
         api["routes"][f"{PREFIX}/pulls/123/commits?per_page=100&page=2"] = (
@@ -2095,6 +2127,7 @@ def test_worker_refreshes_only_green_stale_candidates(tmp_path, api, condition):
         in {
             "green",
             "two_merges",
+            "nineteen_merges",
             "two_pages",
             "update_rejected",
             "update_rejected_without_http",
@@ -2106,6 +2139,7 @@ def test_worker_refreshes_only_green_stale_candidates(tmp_path, api, condition):
     reason = {
         "green": "waiting for fresh policy, scans and CI",
         "two_merges": "waiting for fresh policy, scans and CI",
+        "nineteen_merges": "waiting for fresh policy, scans and CI",
         "two_pages": "waiting for fresh policy, scans and CI",
         "approval_recoverable": "waiting for fresh policy, scans and CI",
         "mixed_bases": "one identifiable base",
@@ -2119,8 +2153,8 @@ def test_worker_refreshes_only_green_stale_candidates(tmp_path, api, condition):
         "failed": "Latest e2e.yml run did not succeed",
         "pending": "Latest e2e.yml run did not succeed",
         "advisory": "CVE-update requires human review",
-        "limit": "Base refresh limit reached",
-        "limit_two_pages": "Base refresh limit reached",
+        "limit": "Base refresh limit reached (20/20)",
+        "limit_two_pages": "Base refresh limit reached (20/20)",
         "incomplete": "Incomplete commit inventory",
         "incomplete_two_pages": "Incomplete commit inventory",
         "hold": "A hold or scan-waiver label is present",

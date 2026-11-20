@@ -145,19 +145,16 @@ describe("RunnerStartingIndicator", () => {
   });
 
   it.each(["hero", "row"] as const)(
-    "%s: renders nothing for a FAILED sandbox launch",
+    "%s: shows the failure in place of launch progress",
     (variant) => {
-      // Failure belongs to the destructive SandboxFailedIndicator band —
-      // rendering a spinner here would read as "still launching".
       useChatStore.setState({
         sandboxStatus: { stage: "failed", error: "managed sandbox launch failed: boom" },
       });
-      const { container } = renderWithContext(
-        variant,
-        makeCtx({ isTerminalFirst: false, terminalStartingUp: false }),
-      );
+      renderWithContext(variant, makeCtx({ isTerminalFirst: false, terminalStartingUp: false }));
       expect(screen.queryByTestId("runner-starting-indicator")).toBeNull();
-      expect(container).toBeEmptyDOMElement();
+      expect(screen.getByTestId("sandbox-failed-indicator")).toHaveTextContent(
+        "Sandbox launch failed",
+      );
     },
   );
 });
