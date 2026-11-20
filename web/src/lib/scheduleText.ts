@@ -323,20 +323,17 @@ const MONTH_NAMES = [
 ];
 
 /**
- * Human-readable summary of an RRULE's recurrence. Handles every shape the
- * create form can produce — the simple presets and all five Custom
- * frequencies, including INTERVAL (>1), multi-day BYMONTHDAY, and yearly
- * BYMONTH — e.g.:
+ * Human-readable summary of an RRULE's recurrence, e.g.:
  *   - "Weekdays at 8:00 AM"
- *   - "Every day at 9:00 AM"
- *   - "Weekly on Monday and Friday at 2:30 PM"
- *   - "Every 2 hours at :15"
- *   - "Every 3 months on the 1st and 15th at 6:00 AM"
+ *   - "Every day at 9:00 AM and 5:00 PM"
+ *   - "Hourly from 9:00 AM to 5:00 PM on weekdays"
+ *   - "Every 15 minutes during 9:00 AM–5:00 PM on weekdays"
+ *   - "Monthly on the first Monday at 9:00 AM"
  *   - "Every 2 years in March on the 1st at 9:00 AM"
  *
- * Falls back to the library's `.toText()` (then the raw rule) for anything this
- * formatter doesn't special-case, so a valid-but-unusual rule still renders
- * something readable rather than blank.
+ * Rules with fields these phrases can't state exactly fall back to the library's
+ * `.toText()` where it is faithful, then to the raw rule, so a summary never
+ * describes a different schedule.
  */
 export function describeSchedule(rrule: string, timezone?: string): string {
   const rule = tryParse(rrule);
@@ -346,8 +343,6 @@ export function describeSchedule(rrule: string, timezone?: string): string {
   const hour = firstOf(o.byhour) ?? 0;
   const minute = firstOf(o.byminute) ?? 0;
   const timeSuffix = ` at ${formatClockTime(hour, minute)}`;
-  const days = normalizeWeekdays(o.byweekday);
-  const interval = typeof o.interval === "number" && o.interval > 1 ? o.interval : 1;
 
   // A one-time rule, such as a reminder, runs at its first match and then completes.
   if (o.count === 1) {
@@ -378,66 +373,239 @@ export function describeSchedule(rrule: string, timezone?: string): string {
     return `Once: ${describeSchedule(recurring)}`;
   }
 
+  return summarizeRecurrence(o) ?? fallbackText(rule, rrule);
+}
+
+/** The phrase for a rule whose every field it can state, or null. */
+function summarizeRecurrence(o: RRule["origOptions"]): string | null {
+  const interval = typeof o.interval === "number" && o.interval > 1 ? o.interval : 1;
+  if (o.byyearday != null || o.byweekno != null || o.byeaster != null) return null;
+  if (normalizeNums(o.bysecond).some((second) => second !== 0)) return null;
+  // WKST only changes which weeks a multi-week interval groups together.
+  if (o.freq === RRule.WEEKLY && interval > 1 && o.wkst != null && weekdayIndex(o.wkst) !== 0)
+    return null;
+  const days = weekdayParts(o.byweekday);
+  const hours = normalizeNums(o.byhour);
+  const minutes = normalizeNums(o.byminute);
+  const months = normalizeNums(o.bymonth);
+  const monthDays = normalizeNums(o.bymonthday);
+  const setPositions = normalizeNums(o.bysetpos);
+  const monthly = o.freq === RRule.MONTHLY || o.freq === RRule.YEARLY;
+  if (!monthly && (days.nth.length > 0 || months.length > 0 || monthDays.length > 0)) return null;
+  if (setPositions.length > 0 && o.freq !== RRule.MONTHLY) return null;
+
   if (o.freq === RRule.MINUTELY) {
-    // The library's toText() drops minute-rule filters; preserve them verbatim.
-    const filtered = Object.entries(o).some(
-      ([name, value]) => name.startsWith("by") && value !== null && value !== undefined,
-    );
-    if (filtered) return rrule;
-    return interval === 1 ? "Every minute" : `Every ${interval} minutes`;
+    if (minutes.length > 0) return null;
+    const every = interval === 1 ? "Every minute" : `Every ${interval} minutes`;
+    const during =
+      hours.length > 0 && hours.length < 24 ? ` during ${formatHourRanges(hours)}` : "";
+    return `${every}${during}${onDaysSuffix(days.plain)}`;
   }
 
   if (o.freq === RRule.HOURLY) {
-    // Time-of-day is meaningless hourly; show the minute offset instead.
-    const min = `:${minute.toString().padStart(2, "0")}`;
-    if (interval > 1) return `Every ${interval} hours at ${min}`;
-    // interval 1: bare "Hourly" only when it fires on the hour; otherwise show
-    // the non-zero BYMINUTE so ":30" isn't silently dropped.
-    return minute === 0 ? "Hourly" : `Hourly at ${min}`;
+    const on = onDaysSuffix(days.plain);
+    const runMinutes = minutes.length > 0 ? minutes : [0];
+    if (hours.length === 0 || hours.length === 24) {
+      // Bare "Hourly" only when it fires on the hour, so ":30" isn't silently dropped.
+      const at =
+        interval === 1 && runMinutes.length === 1 && runMinutes[0] === 0
+          ? ""
+          : ` at ${joinList(runMinutes.map((value) => `:${value.toString().padStart(2, "0")}`))}`;
+      return `${interval > 1 ? `Every ${interval} hours` : "Hourly"}${at}${on}`;
+    }
+    // INTERVAL with BYHOUR counts from the creation day's midnight; no phrase states that.
+    if (interval > 1) return null;
+    return capitalize(timesOfDayText(hours, runMinutes)) + on;
   }
 
+  const times = timesOfDayText(hours.length > 0 ? hours : [0], minutes.length > 0 ? minutes : [0]);
+  const listedTimes = timesOfDayText(
+    hours.length > 0 ? hours : [0],
+    minutes.length > 0 ? minutes : [0],
+    false,
+  );
+
   if (o.freq === RRule.DAILY) {
-    if (interval > 1) return `Every ${interval} days${timeSuffix}`;
-    return `Every day${timeSuffix}`;
+    if (days.plain.length > 0) {
+      if (interval > 1) return null;
+      return times.startsWith("at ")
+        ? `${weekdayText(days.plain)} ${times}`
+        : capitalize(times) + onDaysSuffix(days.plain);
+    }
+    if (interval > 1) return `Every ${interval} days ${listedTimes}`;
+    return times.startsWith("at ") ? `Every day ${times}` : capitalize(times);
   }
 
   if (o.freq === RRule.WEEKLY) {
-    const dayText = weekdayText(days);
     if (interval > 1) {
       // "Every 2 weeks on Monday…" — a named weekday set reads better than the
       // Weekdays/Weekends shorthands once an interval is involved.
-      const on = days.length > 0 ? ` on ${dayLabelList(days)}` : "";
-      return `Every ${interval} weeks${on}${timeSuffix}`;
+      const on = days.plain.length > 0 ? ` on ${dayLabelList(days.plain)}` : "";
+      return `Every ${interval} weeks${on} ${listedTimes}`;
     }
-    if (days.length === 0) return `Weekly${timeSuffix}`;
-    return `${dayText}${timeSuffix}`;
+    if (days.plain.length === 0) return `Weekly ${listedTimes}`;
+    return times.startsWith("at ")
+      ? `${weekdayText(days.plain)} ${times}`
+      : capitalize(times) + onDaysSuffix(days.plain);
   }
 
-  if (o.freq === RRule.MONTHLY) {
-    const monthDays = normalizeNums(o.bymonthday);
-    const on = monthDays.length > 0 ? ` on the ${ordinalList(monthDays)}` : "";
-    if (interval > 1) return `Every ${interval} months${on}${timeSuffix}`;
-    return `Monthly${on}${timeSuffix}`;
+  if (monthly) {
+    const singleTime = Math.max(hours.length, 1) * Math.max(minutes.length, 1) === 1;
+    const on = monthDayText(monthDays, days, setPositions, singleTime);
+    if (on === null) return null;
+    const inMonths =
+      months.length > 0 ? ` in ${joinList(months.map((month) => MONTH_NAMES[month - 1]!))}` : "";
+    const unit = o.freq === RRule.MONTHLY ? "month" : "year";
+    const every =
+      interval > 1 ? `Every ${interval} ${unit}s` : unit === "month" ? "Monthly" : "Yearly";
+    return `${every}${inMonths}${on === "" ? "" : ` on the ${on}`} ${listedTimes}`;
   }
 
-  if (o.freq === RRule.YEARLY) {
-    const monthNums = normalizeNums(o.bymonth);
-    const monthDays = normalizeNums(o.bymonthday);
-    const inMonth =
-      monthNums.length > 0
-        ? ` in ${monthNums
-            .map((m) => MONTH_NAMES[m - 1])
-            .filter(Boolean)
-            .join(", ")}`
-        : "";
-    const on = monthDays.length > 0 ? ` on the ${ordinalList(monthDays)}` : "";
-    if (interval > 1) return `Every ${interval} years${inMonth}${on}${timeSuffix}`;
-    return `Yearly${inMonth}${on}${timeSuffix}`;
-  }
+  return null;
+}
 
-  // Anything else: defer to the library's text, then the raw rule.
+/** The days of the month a monthly or yearly rule names, "" for none, or null. */
+function monthDayText(
+  monthDays: number[],
+  days: ReturnType<typeof weekdayParts>,
+  setPositions: number[],
+  singleTime: boolean,
+): string | null {
+  const weekdays = days.plain.length > 0 || days.nth.length > 0;
+  if (monthDays.length > 0) {
+    if (weekdays || setPositions.length > 0 || monthDays.some((day) => day < -1)) return null;
+    const ordered = [...monthDays.filter((day) => day > 0), ...monthDays.filter((day) => day < 0)];
+    return joinList(ordered.map((day) => (day === -1 ? "last day" : ordinal(day))));
+  }
+  if (setPositions.length > 0) {
+    // BYSETPOS picks among every run in the month, so it reads as one day only for one time.
+    if (days.nth.length > 0 || days.plain.length === 0 || !singleTime) return null;
+    const positions = positionWords(setPositions);
+    let kind: string | null = null;
+    if (days.plain.length === 1) kind = DAY_LABELS[days.plain[0]!] ?? null;
+    else if (sameSet(days.plain, WEEKDAYS)) kind = "weekday";
+    else if (sameSet(days.plain, [RRule.SA.weekday, RRule.SU.weekday])) kind = "weekend day";
+    else if (sameSet(days.plain, ALL_DAYS)) kind = "day";
+    return positions === null || kind === null ? null : `${positions} ${kind}`;
+  }
+  if (days.plain.length > 0) return null;
+  if (days.nth.length === 0) return "";
+  const byDay = new Map<number, number[]>();
+  for (const { weekday, n } of days.nth) byDay.set(weekday, [...(byDay.get(weekday) ?? []), n]);
+  const phrases: string[] = [];
+  for (const [weekday, positions] of byDay) {
+    const words = positionWords(positions);
+    if (words === null) return null;
+    phrases.push(`${words} ${DAY_LABELS[weekday]}`);
+  }
+  return joinList(phrases);
+}
+
+const POSITION_WORDS: Record<number, string> = {
+  1: "first",
+  2: "second",
+  3: "third",
+  4: "fourth",
+  5: "fifth",
+  [-1]: "last",
+};
+
+/** "first and third", or null for positions without a word (e.g. -2). */
+function positionWords(positions: number[]): string | null {
+  const ordered = [...positions.filter((n) => n > 0), ...positions.filter((n) => n < 0)];
+  if (ordered.some((n) => POSITION_WORDS[n] === undefined)) return null;
+  return joinList([...new Set(ordered)].map((n) => POSITION_WORDS[n]!));
+}
+
+/**
+ * "at 9:00 AM and 5:00 PM", or for three or more evenly spaced hours at one minute
+ * "hourly from 9:00 AM to 5:00 PM" / "every 4 hours from 9:00 AM to 5:00 PM".
+ */
+function timesOfDayText(hours: number[], minutes: number[], allowWindow = true): string {
+  const sequence = allowWindow && minutes.length === 1 ? hourSequence(hours) : null;
+  if (sequence !== null) {
+    const cadence = sequence.step === 1 ? "hourly" : `every ${sequence.step} hours`;
+    const first = formatClockTime(sequence.first, minutes[0]!);
+    const last = formatClockTime(sequence.last, minutes[0]!);
+    return `${cadence} from ${first} to ${last}`;
+  }
+  const times = hours.flatMap((hour) => minutes.map((value) => formatClockTime(hour, value)));
+  return `at ${joinList(times)}`;
+}
+
+/** Three or more hours with one step between them, e.g. 9 AM to 5 PM every 4 hours. */
+function hourSequence(hours: number[]): { first: number; last: number; step: number } | null {
+  if (hours.length < 3 || hours.length === 24) return null;
+  const ordered = fromWidestGap(hours);
+  const step = (ordered[1]! - ordered[0]! + 24) % 24;
+  const even = ordered.every(
+    (hour, index) => index === 0 || (hour - ordered[index - 1]! + 24) % 24 === step,
+  );
+  return even ? { first: ordered[0]!, last: ordered[ordered.length - 1]!, step } : null;
+}
+
+/** "9:00 AM–5:00 PM" for the hours a minute rule runs during, joining runs of hours. */
+function formatHourRanges(hours: number[]): string {
+  const ranges: [number, number][] = [];
+  for (const hour of fromWidestGap(normalizeNums(hours))) {
+    const last = ranges[ranges.length - 1];
+    if (last && (last[1] + 1) % 24 === hour) last[1] = hour;
+    else ranges.push([hour, hour]);
+  }
+  return joinList(
+    ranges.map(
+      ([first, last]) => `${formatClockTime(first, 0)}–${formatClockTime((last + 1) % 24, 0)}`,
+    ),
+  );
+}
+
+/** Sorted hours rotated to start after the widest gap, so 10 PM to 6 AM stays in order. */
+function fromWidestGap(hours: number[]): number[] {
+  const gapBefore = (index: number) =>
+    (hours[index]! - hours[(index + hours.length - 1) % hours.length]! + 24) % 24 || 24;
+  let start = 0;
+  for (let index = 1; index < hours.length; index++)
+    if (gapBefore(index) > gapBefore(start)) start = index;
+  return [...hours.slice(start), ...hours.slice(0, start)];
+}
+
+/** " on weekdays", " on weekends" or " on <days>"; empty when every day runs. */
+function onDaysSuffix(days: number[]): string {
+  if (days.length === 0 || sameSet(days, ALL_DAYS)) return "";
+  if (sameSet(days, WEEKDAYS)) return " on weekdays";
+  if (sameSet(days, [RRule.SA.weekday, RRule.SU.weekday])) return " on weekends";
+  return ` on ${dayLabelList(days)}`;
+}
+
+/** Plain weekdays (MO) and numbered ones (1MO, -1FR) from rrule's `byweekday`. */
+function weekdayParts(byweekday: RRule["origOptions"]["byweekday"]): {
+  plain: number[];
+  nth: { weekday: number; n: number }[];
+} {
+  const items = byweekday == null ? [] : Array.isArray(byweekday) ? byweekday : [byweekday];
+  const plain = new Set<number>();
+  const nth: { weekday: number; n: number }[] = [];
+  for (const item of items) {
+    if (typeof item === "object" && item.n) nth.push({ weekday: item.weekday, n: item.n });
+    else plain.add(weekdayIndex(item));
+  }
+  return { plain: [...plain].sort((a, b) => a - b), nth };
+}
+
+function weekdayIndex(day: number | string | { weekday: number }): number {
+  if (typeof day === "number") return day;
+  if (typeof day === "string") return RRule[day as "MO"].weekday;
+  return day.weekday;
+}
+
+/** The library's text where it states the rule faithfully, otherwise the rule itself. */
+function fallbackText(rule: RRule, rrule: string): string {
+  const o = rule.origOptions;
+  // The library drops minute-rule filters and misreads BYSETPOS and BYEASTER.
+  if (o.freq === RRule.MINUTELY || o.freq === RRule.SECONDLY) return rrule;
+  if (o.bysetpos != null || o.byeaster != null || o.byhour != null) return rrule;
   try {
-    return capitalize(rule.toText());
+    return rule.isFullyConvertibleToText() ? capitalize(rule.toText()) : rrule;
   } catch {
     return rrule;
   }
@@ -566,24 +734,6 @@ function ordinal(n: number): string {
     default:
       return `${n}th`;
   }
-}
-
-/** "1st", "1st and 15th", "1st, 15th, and 28th". */
-function ordinalList(days: number[]): string {
-  return joinList(days.map(ordinal));
-}
-
-/**
- * Normalize rrule's `byweekday` (which can be a Weekday, number, or arrays of
- * either, in any order) into a sorted array of weekday indices (0=MO..6=SU).
- */
-function normalizeWeekdays(byweekday: RRule["origOptions"]["byweekday"]): number[] {
-  if (byweekday == null) return [];
-  const arr = Array.isArray(byweekday) ? byweekday : [byweekday];
-  const nums = arr
-    .map((d) => (typeof d === "number" ? d : (d as { weekday: number }).weekday))
-    .filter((n): n is number => typeof n === "number");
-  return [...new Set(nums)].sort((a, b) => a - b);
 }
 
 function sameSet(a: number[], b: number[]): boolean {

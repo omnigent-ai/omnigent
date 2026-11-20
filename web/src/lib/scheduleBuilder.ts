@@ -5,8 +5,8 @@ import type { ScheduledTaskExecutionTarget } from "@/lib/scheduledTasksApi";
 /** The frequency dropdown's top-level options. */
 export type SchedulePreset = "hourly" | "daily" | "weekdays" | "weekly" | "custom";
 
-/** The frequency sub-selector shown under the "custom" preset. */
-export type CustomFreq = "minutely" | "hourly" | "daily" | "weekly" | "monthly" | "yearly";
+/** The frequency sub-selector shown under the "custom" preset; `rule` is RRULE text. */
+export type CustomFreq = "minutely" | "hourly" | "daily" | "weekly" | "monthly" | "yearly" | "rule";
 
 /** Weekday codes as used by RRULE `BYDAY` (MO..SU), in calendar order. */
 export const WEEKDAY_CODES = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"] as const;
@@ -33,6 +33,8 @@ export interface ScheduleModel {
   monthDays: number[];
   /** Month 1–12 for Custom Yearly. */
   month: number;
+  /** RRULE text for `customFreq === "rule"`, without COUNT or UNTIL, which `end` holds. */
+  rule: string;
   /** Omitted for schedules that never end; UNTIL is an RFC-5545 UTC instant. */
   end?: { type: "count"; count: number } | { type: "until"; until: string };
 }
@@ -62,6 +64,7 @@ export const DEFAULT_SCHEDULE_MODEL: ScheduleModel = {
   interval: 1,
   monthDays: [1],
   month: 1,
+  rule: "",
 };
 
 /**
@@ -77,7 +80,8 @@ export function buildRRule(model: ScheduleModel): string {
   return rule;
 }
 
-function buildRecurringRule(model: ScheduleModel): string {
+/** The rule without its COUNT or UNTIL, e.g. to seed the RRULE editor. */
+export function buildRecurringRule(model: ScheduleModel): string {
   const { hour, minute } = model;
   switch (model.preset) {
     case "hourly":
@@ -98,9 +102,41 @@ function buildRecurringRule(model: ScheduleModel): string {
   }
 }
 
+/**
+ * Read a stored rule into the form. Rules the visual controls express exactly open in
+ * them; any other rule opens as RRULE text. Null only when Ends can't show its COUNT or
+ * UNTIL, e.g. a one-time `COUNT=1`.
+ */
 export function parseRRuleToScheduleModel(rrule: string): ScheduleModel | null {
   const parts = parseRuleParts(rrule);
   if (parts === null) return null;
+  const end = parseEnd(parts);
+  if (end === null) return null;
+  const recurring = new Map([...parts].filter(([key]) => key !== "COUNT" && key !== "UNTIL"));
+  const model = parseVisualRule(recurring) ?? {
+    ...DEFAULT_SCHEDULE_MODEL,
+    preset: "custom",
+    customFreq: "rule",
+    rule: [...recurring].map(([key, value]) => `${key}=${value}`).join(";"),
+  };
+  return end.value === undefined ? model : { ...model, end: end.value };
+}
+
+function parseEnd(parts: Map<string, string>): { value: ScheduleModel["end"] } | null {
+  if (parts.has("COUNT") && parts.has("UNTIL")) return null;
+  if (parts.has("COUNT")) {
+    const count = parseNumberPart(parts.get("COUNT"), 2, 2147483647);
+    return count === null ? null : { value: { type: "count", count } };
+  }
+  if (parts.has("UNTIL")) {
+    const until = parts.get("UNTIL")!;
+    return parseUntil(until) ? { value: { type: "until", until } } : null;
+  }
+  return { value: undefined };
+}
+
+/** The visual controls for a rule without COUNT or UNTIL, or null if they can't show it. */
+function parseVisualRule(parts: Map<string, string>): ScheduleModel | null {
   const frequency = parts.get("FREQ")?.toLowerCase();
   if (!["minutely", "hourly", "daily", "weekly", "monthly", "yearly"].includes(frequency ?? ""))
     return null;
@@ -119,7 +155,7 @@ export function parseRRuleToScheduleModel(rrule: string): ScheduleModel | null {
       ? DEFAULT_SCHEDULE_MODEL.hour
       : parseNumberPart(parts.get("BYHOUR"), 0, 23);
   if (interval === null || hour === null || minute === null) return null;
-  const allowed = ["FREQ", "INTERVAL", "COUNT", "UNTIL"];
+  const allowed = ["FREQ", "INTERVAL"];
   if (customFreq !== "minutely") allowed.push("BYMINUTE");
   if (customFreq !== "hourly" && customFreq !== "minutely") allowed.push("BYHOUR");
   if (customFreq === "weekly") allowed.push("BYDAY");
@@ -158,17 +194,6 @@ export function parseRRuleToScheduleModel(rrule: string): ScheduleModel | null {
     if (customFreq === "weekly" && model.weekdays.join(",") === "MO,TU,WE,TH,FR")
       model.preset = "weekdays";
   }
-  if (parts.has("COUNT") && parts.has("UNTIL")) return null;
-  if (parts.has("COUNT")) {
-    const count = parseNumberPart(parts.get("COUNT"), 2, 2147483647);
-    if (count === null) return null;
-    model.end = { type: "count", count };
-  }
-  if (parts.has("UNTIL")) {
-    const until = parts.get("UNTIL")!;
-    if (!parseUntil(until)) return null;
-    model.end = { type: "until", until };
-  }
   return validateSchedule(model, {
     allowPastEnd: true,
     sessionMode: "continue",
@@ -196,6 +221,7 @@ export function formatUntil(date: Date): string {
 
 function buildCustomRRule(model: ScheduleModel): string {
   const { hour, minute } = model;
+  if (model.customFreq === "rule") return normalizeRuleText(model.rule);
   const interval = clampInterval(model.interval);
   switch (model.customFreq) {
     case "minutely":
@@ -286,6 +312,12 @@ export function validateSchedule(
     subhourSupported?: boolean;
   } = {},
 ): string | null {
+  if (model.preset === "custom" && model.customFreq === "rule") {
+    return (
+      validateRuleText(model.rule, { sessionMode, executionTarget, subhourSupported }) ??
+      validateEnd(model, allowPastEnd, now)
+    );
+  }
   const minutely = model.preset === "custom" && model.customFreq === "minutely";
   if (!minutely && (!Number.isInteger(model.minute) || model.minute < 0 || model.minute > 59)) {
     return model.preset === "hourly" ? "Enter a valid minute from 0 to 59." : "Enter a valid time.";
@@ -334,16 +366,8 @@ export function validateSchedule(
     (!Number.isInteger(model.month) || model.month < 1 || model.month > 12)
   )
     return "Pick a valid month.";
-  if (
-    model.end?.type === "count" &&
-    (!Number.isInteger(model.end.count) || model.end.count < 2 || model.end.count > 2147483647)
-  )
-    return "Enter at least 2 occurrences (at most 2,147,483,647).";
-  if (model.end?.type === "until") {
-    const until = parseUntil(model.end.until);
-    if (!until) return "Choose a valid end date.";
-    if (!allowPastEnd && until <= now) return "Choose an end date in the future.";
-  }
+  const endError = validateEnd(model, allowPastEnd, now);
+  if (endError !== null) return endError;
   if (model.preset === "custom" && model.customFreq === "yearly") {
     const daysInMonth = new Date(Date.UTC(2016, model.month, 0)).getUTCDate();
     if (!model.monthDays.some((day) => day <= daysInMonth))
@@ -364,6 +388,150 @@ export function validateSchedule(
     }).all();
     if (occurrences.length < 2)
       return "Choose a recurrence that runs at least twice within eight years.";
+  }
+  return null;
+}
+
+function validateEnd(model: ScheduleModel, allowPastEnd: boolean, now: Date): string | null {
+  if (
+    model.end?.type === "count" &&
+    (!Number.isInteger(model.end.count) || model.end.count < 2 || model.end.count > 2147483647)
+  )
+    return "Enter at least 2 occurrences (at most 2,147,483,647).";
+  if (model.end?.type === "until") {
+    const until = parseUntil(model.end.until);
+    if (!until) return "Choose a valid end date.";
+    if (!allowPastEnd && until <= now) return "Choose an end date in the future.";
+  }
+  return null;
+}
+
+/** RRULE editor text as the server reads it: no `RRULE:` prefix, upper case. */
+export function normalizeRuleText(rule: string): string {
+  return rule
+    .trim()
+    .replace(/^RRULE:/i, "")
+    .toUpperCase();
+}
+
+const RULE_FREQUENCIES = ["SECONDLY", "MINUTELY", "HOURLY", "DAILY", "WEEKLY", "MONTHLY", "YEARLY"];
+const RULE_FIELDS = new Set([
+  "FREQ",
+  "INTERVAL",
+  "WKST",
+  "BYSECOND",
+  "BYMINUTE",
+  "BYHOUR",
+  "BYDAY",
+  "BYMONTHDAY",
+  "BYYEARDAY",
+  "BYWEEKNO",
+  "BYMONTH",
+  "BYSETPOS",
+  "BYEASTER",
+]);
+// The server samples eight years of runs from 2016-01-01 (see validate_rrule). 9988 has
+// the same weekdays and leap years, and rrule.js stops a rule that never matches at 9999.
+const RULE_SAMPLE_START = Date.UTC(9988, 0, 1);
+const RULE_SAMPLE_END = Date.UTC(9996, 0, 1);
+const RULE_GAP_WINDOW_MS = 25 * 60 * 60 * 1000;
+const MAX_RULE_GAP_SAMPLES = 2000;
+const ruleValidationCache = new Map<string, string | null>();
+
+/** Check RRULE text the way the server's `validate_rrule` does. */
+export function validateRuleText(
+  rule: string,
+  {
+    sessionMode = "new",
+    executionTarget,
+    subhourSupported = false,
+  }: {
+    sessionMode?: "new" | "continue";
+    executionTarget?: ScheduledTaskExecutionTarget;
+    subhourSupported?: boolean;
+  } = {},
+): string | null {
+  // The form validates on every render, and sampling runs can take a few milliseconds.
+  const key = JSON.stringify([rule, sessionMode, executionTarget, subhourSupported]);
+  if (!ruleValidationCache.has(key)) {
+    if (ruleValidationCache.size >= 100) ruleValidationCache.clear();
+    ruleValidationCache.set(
+      key,
+      checkRuleText(rule, sessionMode, executionTarget, subhourSupported),
+    );
+  }
+  return ruleValidationCache.get(key)!;
+}
+
+function checkRuleText(
+  rule: string,
+  sessionMode: "new" | "continue",
+  executionTarget: ScheduledTaskExecutionTarget | undefined,
+  subhourSupported: boolean,
+): string | null {
+  const text = normalizeRuleText(rule);
+  if (text === "") return "Enter a recurrence rule, such as FREQ=DAILY;BYHOUR=9;BYMINUTE=0.";
+  if (text.length > 4096) return "Use a rule of at most 4,096 characters.";
+  if (/[\r\n]/.test(text))
+    return "Enter one RRULE line. Choose the timezone below instead of DTSTART;TZID.";
+  const parts = parseRuleParts(text);
+  if (parts === null)
+    return "Write the rule as NAME=VALUE pairs separated by semicolons, using each name once.";
+  if (parts.has("COUNT") || parts.has("UNTIL"))
+    return "Set when the schedule ends under Ends instead of with COUNT or UNTIL.";
+  const unknown = [...parts.keys()].find((key) => !RULE_FIELDS.has(key));
+  if (unknown !== undefined) return `${unknown} isn't a supported rule field.`;
+  const frequency = parts.get("FREQ") ?? "";
+  if (!RULE_FREQUENCIES.includes(frequency))
+    return "Include a FREQ such as MINUTELY, HOURLY, DAILY, WEEKLY, MONTHLY or YEARLY.";
+  const maxInterval = 366 * ({ SECONDLY: 3600, MINUTELY: 60 }[frequency] ?? 1);
+  if (parseNumberPart(parts.get("INTERVAL") ?? "1", 1, maxInterval) === null)
+    return `INTERVAL must be a whole number from 1 to ${maxInterval}.`;
+  let timesPerDay = 1;
+  for (const [key, value] of parts) {
+    if (!key.startsWith("BY")) continue;
+    const values = new Set(value.split(","));
+    const pattern = key === "BYDAY" ? /^[+-]?\d*(MO|TU|WE|TH|FR|SA|SU)$/ : /^[+-]?\d+$/;
+    if ([...values].some((item) => !pattern.test(item))) return `${key} has an invalid value.`;
+    if (values.size > 24) return `${key} can list at most 24 values.`;
+    if (["BYHOUR", "BYMINUTE", "BYSECOND"].includes(key)) timesPerDay *= values.size;
+  }
+  if (timesPerDay > 24) return "BYHOUR, BYMINUTE and BYSECOND can combine to at most 24 times.";
+
+  let runs = 0;
+  let minimumGap = Infinity;
+  try {
+    let first: number | null = null;
+    let previous: number | null = null;
+    new RRule({
+      ...RRule.parseString(text),
+      dtstart: new Date(RULE_SAMPLE_START),
+      until: new Date(RULE_SAMPLE_END),
+    }).all((date) => {
+      const time = date.getTime();
+      runs += 1;
+      if (previous !== null) minimumGap = Math.min(minimumGap, time - previous);
+      first ??= time;
+      previous = time;
+      return runs < MAX_RULE_GAP_SAMPLES && time < first + RULE_GAP_WINDOW_MS;
+    });
+  } catch (error) {
+    return `This rule isn't valid: ${error instanceof Error ? error.message : String(error)}`;
+  }
+  if (runs === 0) return "This rule never runs.";
+  if (runs === 1) return "This rule runs only once. Change it so it repeats.";
+  const minimum = minimumScheduleInterval(
+    "minutely",
+    sessionMode,
+    subhourSupported,
+    executionTarget,
+  );
+  if (minimumGap < minimum * 60_000) {
+    if (minimumGap >= MIN_SUBHOUR_MINUTE_INTERVAL * 60_000) {
+      if (!subhourSupported) return "This server requires schedules of at least 60 minutes.";
+      return "New sandbox sessions require schedules of at least 60 minutes. Continue in the same session or use a connected host for shorter intervals.";
+    }
+    return `Runs must be at least ${minimum} minutes apart.`;
   }
   return null;
 }
