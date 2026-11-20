@@ -387,13 +387,19 @@ export function describeSchedule(rrule: string, timezone?: string): string {
     return interval === 1 ? "Every minute" : `Every ${interval} minutes`;
   }
 
+  const hourWindow = hourWindowText(o, days, interval);
+  if (hourWindow !== null) return hourWindow;
+
   if (o.freq === RRule.HOURLY) {
     // Time-of-day is meaningless hourly; show the minute offset instead.
     const min = `:${minute.toString().padStart(2, "0")}`;
-    if (interval > 1) return `Every ${interval} hours at ${min}`;
+    // Hours combined with an interval depend on the rule's anchor; restate the rule.
+    if (normalizeNums(o.byhour).length > 0) return libraryText(rule, rrule);
+    const on = days.length > 0 ? ` on ${weekdayPhrase(days)}` : "";
+    if (interval > 1) return `Every ${interval} hours at ${min}${on}`;
     // interval 1: bare "Hourly" only when it fires on the hour; otherwise show
     // the non-zero BYMINUTE so ":30" isn't silently dropped.
-    return minute === 0 ? "Hourly" : `Hourly at ${min}`;
+    return (minute === 0 ? "Hourly" : `Hourly at ${min}`) + on;
   }
 
   if (o.freq === RRule.DAILY) {
@@ -436,11 +442,42 @@ export function describeSchedule(rrule: string, timezone?: string): string {
   }
 
   // Anything else: defer to the library's text, then the raw rule.
+  return libraryText(rule, rrule);
+}
+
+function libraryText(rule: RRule, rrule: string): string {
   try {
     return capitalize(rule.toText());
   } catch {
     return rrule;
   }
+}
+
+/** "Hourly from 9:00 AM to 5:00 PM on weekdays" for one minute of evenly spaced
+ * hours (HOURLY with BYHOUR, or DAILY/WEEKLY with several). Otherwise null. */
+function hourWindowText(o: RRule["origOptions"], days: number[], interval: number): string | null {
+  const hours = normalizeNums(o.byhour);
+  const minutes = normalizeNums(o.byminute);
+  const hourly = o.freq === RRule.HOURLY && hours.length > 0;
+  const multiHour = (o.freq === RRule.DAILY || o.freq === RRule.WEEKLY) && hours.length > 1;
+  if (!(hourly || multiHour) || interval > 1 || minutes.length > 1) return null;
+  if (o.freq === RRule.WEEKLY && days.length === 0) return null;
+  const minute = minutes[0] ?? 0;
+  const step = hours.length > 1 ? hours[1]! - hours[0]! : 1;
+  const times =
+    hours.length === 1 || hours.some((hour, index) => hour !== hours[0]! + index * step)
+      ? `at ${joinList(hours.map((hour) => formatClockTime(hour, minute)))}`
+      : `${step === 1 ? "Hourly" : `Every ${step} hours`} from ${formatClockTime(hours[0]!, minute)} to ${formatClockTime(hours[hours.length - 1]!, minute)}`;
+  const on = days.length > 0 && !sameSet(days, ALL_DAYS) ? ` on ${weekdayPhrase(days)}` : "";
+  return capitalize(times) + on;
+}
+
+/** "weekdays", "weekends" or the named days, for a phrase like "Hourly on …". */
+function weekdayPhrase(days: number[]): string {
+  if (sameSet(days, WEEKDAYS)) return "weekdays";
+  if (sameSet(days, [RRule.SA.weekday, RRule.SU.weekday])) return "weekends";
+  if (sameSet(days, ALL_DAYS)) return "every day";
+  return dayLabelList(days);
 }
 
 /** Weekday-set phrasing for the interval-1 weekly case (with shorthands). */

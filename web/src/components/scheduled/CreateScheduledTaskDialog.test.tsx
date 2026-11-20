@@ -1434,7 +1434,7 @@ describe("CreateScheduledTaskDialog edit mode", () => {
       <CreateScheduledTaskDialog
         open
         onOpenChange={vi.fn()}
-        editingTask={scheduledTask({ rrule: "FREQ=DAILY;BYHOUR=9,17;BYMINUTE=0" })}
+        editingTask={scheduledTask({ rrule: "FREQ=DAILY;BYHOUR=9,10,17;BYMINUTE=0" })}
       />,
       { collapseAdvanced: true },
     );
@@ -1447,6 +1447,36 @@ describe("CreateScheduledTaskDialog edit mode", () => {
     expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
   });
 
+  it("keeps an agent-created business-hours schedule when saving other edits", async () => {
+    const rrule = "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9,10,11,12,13,14,15,16,17;BYMINUTE=0";
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ rrule })}
+      />,
+    );
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByTestId("task-schedule-trigger")).toHaveTextContent(
+      "Hourly from 9:00 AM to 5:00 PM on weekdays",
+    );
+    openAutomationSection("Schedule");
+    expect(screen.getByRole("radio", { name: "Every hour" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(screen.getByLabelText("First run hour")).toHaveTextContent("9:00 AM");
+    expect(screen.getByLabelText("Last run hour")).toHaveTextContent("5:00 PM");
+    expect(screen.getByLabelText("Days to run")).toHaveTextContent("Weekdays");
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Renamed" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
+      name: "Renamed",
+      rrule: "FREQ=HOURLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9,10,11,12,13,14,15,16,17;BYMINUTE=0",
+    });
+  });
+
   it.each(["Every day", "Every hour", "Custom schedule"])(
     "blocks unsupported rules until explicitly replaced with %s",
     async (frequency) => {
@@ -1454,7 +1484,7 @@ describe("CreateScheduledTaskDialog edit mode", () => {
         <CreateScheduledTaskDialog
           open
           onOpenChange={vi.fn()}
-          editingTask={scheduledTask({ rrule: "FREQ=DAILY;BYHOUR=9,17;BYMINUTE=0" })}
+          editingTask={scheduledTask({ rrule: "FREQ=DAILY;BYHOUR=9,10,17;BYMINUTE=0" })}
         />,
       );
       expect(screen.getByRole("alert")).toHaveTextContent("This schedule can't be edited");
@@ -2059,6 +2089,53 @@ describe("CreateScheduledTaskDialog submit", () => {
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
     expect(mutateAsync.mock.calls[0][0].rrule).toBe("FREQ=HOURLY;BYMINUTE=7");
+  });
+
+  it("limits an hourly schedule to business hours on weekdays", async () => {
+    renderDialog();
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "T" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "P" } });
+    selectSchedulePreset("Every hour");
+    expect(screen.getByLabelText("First run hour")).toHaveTextContent("12:00 AM");
+    expect(screen.getByLabelText("Last run hour")).toHaveTextContent("11:00 PM");
+    expect(screen.getByLabelText("Days to run")).toHaveTextContent("Every day");
+    fireEvent.keyDown(screen.getByLabelText("First run hour"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "9:00 AM" }));
+    fireEvent.keyDown(screen.getByLabelText("Last run hour"), { key: "Enter" });
+    expect(await screen.findByRole("option", { name: "8:00 AM" })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+    fireEvent.click(screen.getByRole("option", { name: "5:00 PM" }));
+    await userEvent.click(screen.getByRole("button", { name: "Days to run" }));
+    fireEvent.click(screen.getByRole("button", { name: "Saturday" }));
+    fireEvent.click(screen.getByRole("button", { name: "Sunday" }));
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.getByLabelText("Days to run")).toHaveTextContent("Weekdays");
+    expect(screen.getByTestId("task-schedule-trigger")).toHaveTextContent(
+      "Hourly from 9:00 AM to 5:00 PM on weekdays",
+    );
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0].rrule).toBe(
+      "FREQ=HOURLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9,10,11,12,13,14,15,16,17;BYMINUTE=0",
+    );
+  });
+
+  it("requires at least one day for an hourly schedule", async () => {
+    renderDialog();
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "T" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "P" } });
+    selectSchedulePreset("Every hour");
+    await userEvent.click(screen.getByRole("button", { name: "Days to run" }));
+    for (const day of ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"])
+      fireEvent.click(screen.getByRole("button", { name: day }));
+    expect(screen.queryByTestId("schedule-error")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Sunday" }));
+    expect(screen.getByTestId("schedule-error")).toHaveTextContent(
+      "Pick at least one day of the week.",
+    );
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
   });
 
   it.each(["Every hour", "Custom schedule"])(

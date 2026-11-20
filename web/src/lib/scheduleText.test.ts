@@ -281,6 +281,31 @@ describe("describeSchedule", () => {
     expect(describeSchedule("FREQ=HOURLY;INTERVAL=2;BYMINUTE=15")).toBe("Every 2 hours at :15");
   });
 
+  it("describes hourly rules limited to hours and days", () => {
+    const hours = "BYHOUR=9,10,11,12,13,14,15,16,17";
+    expect(describeSchedule(`FREQ=HOURLY;BYDAY=MO,TU,WE,TH,FR;${hours};BYMINUTE=0`)).toBe(
+      "Hourly from 9:00 AM to 5:00 PM on weekdays",
+    );
+    expect(describeSchedule(`FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;${hours};BYMINUTE=0`)).toBe(
+      "Hourly from 9:00 AM to 5:00 PM on weekdays",
+    );
+    expect(describeSchedule("FREQ=HOURLY;BYHOUR=8,11,14,17;BYMINUTE=30")).toBe(
+      "Every 3 hours from 8:30 AM to 5:30 PM",
+    );
+    expect(describeSchedule("FREQ=DAILY;BYHOUR=9,13;BYMINUTE=0")).toBe(
+      "Every 4 hours from 9:00 AM to 1:00 PM",
+    );
+    expect(describeSchedule("FREQ=HOURLY;BYDAY=MO,FR;BYHOUR=9,10,14;BYMINUTE=0")).toBe(
+      "At 9:00 AM, 10:00 AM, and 2:00 PM on Monday and Friday",
+    );
+    expect(describeSchedule("FREQ=HOURLY;BYDAY=SA,SU;BYMINUTE=15")).toBe(
+      "Hourly at :15 on weekends",
+    );
+    expect(describeSchedule("FREQ=HOURLY;INTERVAL=2;BYDAY=MO;BYMINUTE=0")).toBe(
+      "Every 2 hours at :00 on Monday",
+    );
+  });
+
   it("renders interval daily / weekly", () => {
     expect(describeSchedule("FREQ=DAILY;INTERVAL=3;BYHOUR=9;BYMINUTE=30")).toBe(
       "Every 3 days at 9:30 AM",

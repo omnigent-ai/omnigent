@@ -12,6 +12,14 @@ export type CustomFreq = "minutely" | "hourly" | "daily" | "weekly" | "monthly" 
 export const WEEKDAY_CODES = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"] as const;
 export type WeekdayCode = (typeof WEEKDAY_CODES)[number];
 
+/** Inclusive hours of the day (0–23) an hourly schedule runs within. */
+export interface HourWindow {
+  start: number;
+  end: number;
+}
+
+export const ALL_DAY_HOURS: HourWindow = { start: 0, end: 23 };
+
 /** Months 1–12 for the Custom Yearly `BYMONTH`. */
 export const MONTHS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] as const;
 
@@ -33,6 +41,10 @@ export interface ScheduleModel {
   monthDays: number[];
   /** Month 1–12 for Custom Yearly. */
   month: number;
+  /** Hours an hourly schedule runs within; the whole day when 0–23. */
+  hourWindow: HourWindow;
+  /** Days an hourly schedule runs on; every day when all seven are selected. */
+  hourlyDays: WeekdayCode[];
   /** Omitted for schedules that never end; UNTIL is an RFC-5545 UTC instant. */
   end?: { type: "count"; count: number } | { type: "until"; until: string };
 }
@@ -62,6 +74,8 @@ export const DEFAULT_SCHEDULE_MODEL: ScheduleModel = {
   interval: 1,
   monthDays: [1],
   month: 1,
+  hourWindow: ALL_DAY_HOURS,
+  hourlyDays: [...WEEKDAY_CODES],
 };
 
 /**
@@ -81,8 +95,7 @@ function buildRecurringRule(model: ScheduleModel): string {
   const { hour, minute } = model;
   switch (model.preset) {
     case "hourly":
-      // Honor the snapped minute while keeping one fire per hour.
-      return `FREQ=HOURLY;BYMINUTE=${minute}`;
+      return buildHourlyRRule(model, 1);
     case "daily":
       return `FREQ=DAILY;BYHOUR=${hour};BYMINUTE=${minute}`;
     case "weekdays":
@@ -104,6 +117,8 @@ export function parseRRuleToScheduleModel(rrule: string): ScheduleModel | null {
   const frequency = parts.get("FREQ")?.toLowerCase();
   if (!["minutely", "hourly", "daily", "weekly", "monthly", "yearly"].includes(frequency ?? ""))
     return null;
+  const hourlyModel = parseHourlyWindowRule(parts, frequency!);
+  if (hourlyModel !== undefined) return hourlyModel;
   const customFreq = frequency as CustomFreq;
   const interval = parseNumberPart(
     parts.get("INTERVAL") ?? "1",
@@ -121,6 +136,7 @@ export function parseRRuleToScheduleModel(rrule: string): ScheduleModel | null {
   if (interval === null || hour === null || minute === null) return null;
   const allowed = ["FREQ", "INTERVAL", "COUNT", "UNTIL"];
   if (customFreq !== "minutely") allowed.push("BYMINUTE");
+  if (customFreq === "hourly") allowed.push("BYDAY");
   if (customFreq !== "hourly" && customFreq !== "minutely") allowed.push("BYHOUR");
   if (customFreq === "weekly") allowed.push("BYDAY");
   if (customFreq === "monthly" || customFreq === "yearly") allowed.push("BYMONTHDAY");
@@ -135,6 +151,11 @@ export function parseRRuleToScheduleModel(rrule: string): ScheduleModel | null {
     hour,
     minute,
   };
+  if (customFreq === "hourly") {
+    const filters = parseHourlyFilters(parts);
+    if (filters === null) return null;
+    model.hourlyDays = filters.hourlyDays;
+  }
   if (customFreq === "weekly") {
     const weekdays = parseWeekdaysPart(parts.get("BYDAY"));
     if (!weekdays?.length) return null;
@@ -158,6 +179,11 @@ export function parseRRuleToScheduleModel(rrule: string): ScheduleModel | null {
     if (customFreq === "weekly" && model.weekdays.join(",") === "MO,TU,WE,TH,FR")
       model.preset = "weekdays";
   }
+  return withParsedEnd(model, parts);
+}
+
+/** Apply a rule's COUNT or UNTIL and keep the model only if the form accepts it. */
+function withParsedEnd(model: ScheduleModel, parts: Map<string, string>): ScheduleModel | null {
   if (parts.has("COUNT") && parts.has("UNTIL")) return null;
   if (parts.has("COUNT")) {
     const count = parseNumberPart(parts.get("COUNT"), 2, 2147483647);
@@ -176,6 +202,36 @@ export function parseRRuleToScheduleModel(rrule: string): ScheduleModel | null {
   }) === null
     ? model
     : null;
+}
+
+/** Parse a rule that runs at one minute of several hours (HOURLY, or DAILY/WEEKLY
+ * with a BYHOUR list). Returns undefined for rules the general parser handles. */
+function parseHourlyWindowRule(
+  parts: Map<string, string>,
+  frequency: string,
+): ScheduleModel | null | undefined {
+  const hourCount = parts.get("BYHOUR")?.split(",").length ?? 0;
+  const hourly = frequency === "hourly" && parts.has("BYHOUR");
+  const multiHour = (frequency === "daily" || frequency === "weekly") && hourCount > 1;
+  if (!hourly && !multiHour) return undefined;
+  const allowed = new Set(["FREQ", "INTERVAL", "BYDAY", "BYHOUR", "BYMINUTE", "COUNT", "UNTIL"]);
+  if ([...parts.keys()].some((key) => !allowed.has(key))) return null;
+  // An interval would skip hours, days or weeks that the hour list alone cannot express.
+  if ((parts.get("INTERVAL") ?? "1") !== "1") return null;
+  if (frequency === "weekly" && !parts.has("BYDAY")) return null;
+  const minute = parseNumberPart(parts.get("BYMINUTE"), 0, 59);
+  const filters = parseHourlyFilters(parts);
+  if (minute === null || filters === null) return null;
+  const model: ScheduleModel = {
+    ...DEFAULT_SCHEDULE_MODEL,
+    preset: filters.step === 1 ? "hourly" : "custom",
+    customFreq: "hourly",
+    interval: filters.step,
+    minute,
+    hourWindow: filters.hourWindow,
+    hourlyDays: filters.hourlyDays,
+  };
+  return withParsedEnd(model, parts);
 }
 
 /** Parse a UTC RRULE cutoff without allowing Date to normalize invalid dates. */
@@ -201,8 +257,7 @@ function buildCustomRRule(model: ScheduleModel): string {
     case "minutely":
       return `FREQ=MINUTELY;INTERVAL=${interval}`;
     case "hourly":
-      // every X hours at minute Y
-      return `FREQ=HOURLY;INTERVAL=${interval};BYMINUTE=${minute}`;
+      return buildHourlyRRule(model, interval);
     case "daily":
       return `FREQ=DAILY;INTERVAL=${interval};BYHOUR=${hour};BYMINUTE=${minute}`;
     case "weekly": {
@@ -221,6 +276,58 @@ function buildCustomRRule(model: ScheduleModel): string {
     default:
       return `FREQ=DAILY;INTERVAL=${interval};BYHOUR=${hour};BYMINUTE=${minute}`;
   }
+}
+
+/** Whether an hourly schedule runs only within part of the day. */
+export function hasHourWindow(model: ScheduleModel): boolean {
+  return model.hourWindow.start !== 0 || model.hourWindow.end !== 23;
+}
+
+/** Whether an hourly schedule runs only on some days of the week. */
+export function hasHourlyDays(model: ScheduleModel): boolean {
+  return normalizeWeekdays(model.hourlyDays).length !== WEEKDAY_CODES.length;
+}
+
+function buildHourlyRRule(model: ScheduleModel, interval: number): string {
+  const byday = hasHourlyDays(model)
+    ? `;BYDAY=${normalizeWeekdays(model.hourlyDays).join(",")}`
+    : "";
+  if (!hasHourWindow(model)) {
+    const every = interval === 1 && model.preset === "hourly" ? "" : `;INTERVAL=${interval}`;
+    return `FREQ=HOURLY${every}${byday};BYMINUTE=${model.minute}`;
+  }
+  // List the window's hours explicitly: INTERVAL with BYHOUR depends on the rule's anchor.
+  const hours: number[] = [];
+  for (let hour = model.hourWindow.start; hour <= model.hourWindow.end; hour += interval)
+    hours.push(hour);
+  return `FREQ=HOURLY${byday};BYHOUR=${hours.join(",")};BYMINUTE=${model.minute}`;
+}
+
+/** Read an hourly rule's hours and days. Evenly spaced hours become a window
+ * plus an interval; uneven hours have no visual equivalent. */
+function parseHourlyFilters(
+  parts: Map<string, string>,
+): { hourWindow: HourWindow; hourlyDays: WeekdayCode[]; step: number } | null {
+  let hourlyDays: WeekdayCode[] = [...WEEKDAY_CODES];
+  if (parts.has("BYDAY")) {
+    const days = parseWeekdaysPart(parts.get("BYDAY"));
+    if (!days?.length) return null;
+    hourlyDays = days;
+  }
+  if (!parts.has("BYHOUR")) return { hourWindow: ALL_DAY_HOURS, hourlyDays, step: 1 };
+  const hours = parts
+    .get("BYHOUR")!
+    .split(",")
+    .map((hour) => parseNumberPart(hour, 0, 23));
+  if (hours.some((hour) => hour === null)) return null;
+  const sorted = [...new Set(hours as number[])].sort((a, b) => a - b);
+  const step = sorted.length > 1 ? sorted[1] - sorted[0] : 1;
+  if (sorted.some((hour, index) => hour !== sorted[0] + index * step)) return null;
+  const hourWindow = { start: sorted[0], end: sorted[sorted.length - 1] };
+  // Every hour of the day is the same schedule as no hour limit.
+  if (step === 1 && hourWindow.start === 0 && hourWindow.end === 23)
+    return { hourWindow: ALL_DAY_HOURS, hourlyDays, step };
+  return { hourWindow, hourlyDays, step };
 }
 
 function parseRuleParts(rrule: string): Map<string, string> | null {
@@ -296,6 +403,14 @@ export function validateSchedule(
     (!Number.isInteger(model.hour) || model.hour < 0 || model.hour > 23)
   ) {
     return "Enter a valid time.";
+  }
+
+  if (model.preset === "hourly" || (model.preset === "custom" && model.customFreq === "hourly")) {
+    const { start, end } = model.hourWindow;
+    if (![start, end].every((hour) => Number.isInteger(hour) && hour >= 0 && hour <= 23))
+      return "Choose valid hours.";
+    if (end < start) return "Choose an end hour at or after the start hour.";
+    if (model.hourlyDays.length === 0) return "Pick at least one day of the week.";
   }
 
   // Multi-selects must have at least one selection.

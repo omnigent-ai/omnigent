@@ -143,6 +143,111 @@ describe("parseRRuleToScheduleModel", () => {
   });
 });
 
+describe("hourly schedules limited to hours and days", () => {
+  const businessHours = model({
+    preset: "hourly",
+    minute: 0,
+    hourWindow: { start: 9, end: 17 },
+    hourlyDays: ["MO", "TU", "WE", "TH", "FR"],
+  });
+
+  it("lists the window's hours and days in the rule", () => {
+    expect(buildRRule(businessHours)).toBe(
+      "FREQ=HOURLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9,10,11,12,13,14,15,16,17;BYMINUTE=0",
+    );
+    expect(buildRRule(model({ preset: "hourly", minute: 30, hourlyDays: ["SU", "SA"] }))).toBe(
+      "FREQ=HOURLY;BYDAY=SA,SU;BYMINUTE=30",
+    );
+  });
+
+  it("steps a custom interval from the first hour of the window", () => {
+    const rule = buildRRule(
+      model({
+        preset: "custom",
+        customFreq: "hourly",
+        interval: 3,
+        minute: 15,
+        hourWindow: { start: 8, end: 18 },
+      }),
+    );
+    expect(rule).toBe("FREQ=HOURLY;BYHOUR=8,11,14,17;BYMINUTE=15");
+    expect(parseRRuleToScheduleModel(rule)).toMatchObject({
+      preset: "custom",
+      customFreq: "hourly",
+      interval: 3,
+      hourWindow: { start: 8, end: 17 },
+    });
+  });
+
+  it("keeps the unrestricted hourly rules unchanged", () => {
+    expect(buildRRule(model({ preset: "hourly", minute: 5 }))).toBe("FREQ=HOURLY;BYMINUTE=5");
+    expect(buildRRule(model({ preset: "custom", customFreq: "hourly", interval: 2 }))).toBe(
+      "FREQ=HOURLY;INTERVAL=2;BYMINUTE=0",
+    );
+  });
+
+  it.each([
+    "FREQ=HOURLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9,10,11,12,13,14,15,16,17;BYMINUTE=0",
+    // The shape agents create through the scheduled-task tool.
+    "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9,10,11,12,13,14,15,16,17;BYMINUTE=0",
+  ])("opens %s in the hourly controls", (rule) => {
+    const parsed = parseRRuleToScheduleModel(rule);
+    expect(parsed).toMatchObject({
+      preset: "hourly",
+      minute: 0,
+      hourWindow: { start: 9, end: 17 },
+      hourlyDays: ["MO", "TU", "WE", "TH", "FR"],
+    });
+    expect(buildRRule(parsed!)).toBe(buildRRule(businessHours));
+  });
+
+  it("round-trips days and hours with each ending", () => {
+    for (const end of [
+      undefined,
+      { type: "count", count: 5 },
+      { type: "until", until: "20271231T155959Z" },
+    ] as ScheduleModel["end"][]) {
+      const rule = buildRRule({ ...businessHours, end });
+      expect(buildRRule(parseRRuleToScheduleModel(rule)!)).toBe(rule);
+    }
+    const daysOnly = "FREQ=HOURLY;INTERVAL=2;BYDAY=SA,SU;BYMINUTE=0";
+    expect(parseRRuleToScheduleModel(daysOnly)).toMatchObject({
+      preset: "custom",
+      interval: 2,
+      hourlyDays: ["SA", "SU"],
+    });
+    expect(buildRRule(parseRRuleToScheduleModel(daysOnly)!)).toBe(daysOnly);
+  });
+
+  it("treats every hour of the day as no hour limit", () => {
+    const allHours = Array.from({ length: 24 }, (_, hour) => hour).join(",");
+    const parsed = parseRRuleToScheduleModel(`FREQ=HOURLY;BYHOUR=${allHours};BYMINUTE=0`);
+    expect(buildRRule(parsed!)).toBe("FREQ=HOURLY;BYMINUTE=0");
+  });
+
+  it.each([
+    "FREQ=HOURLY;BYHOUR=9,10,14;BYMINUTE=0",
+    "FREQ=HOURLY;INTERVAL=2;BYHOUR=9,11;BYMINUTE=0",
+    "FREQ=HOURLY;BYHOUR=9,10;BYMINUTE=0,30",
+    "FREQ=WEEKLY;INTERVAL=2;BYDAY=MO;BYHOUR=9,10;BYMINUTE=0",
+    "FREQ=WEEKLY;BYHOUR=9,10;BYMINUTE=0",
+    "FREQ=HOURLY;BYHOUR=9,24;BYMINUTE=0",
+    "FREQ=HOURLY;BYDAY=1MO;BYMINUTE=0",
+  ])("leaves rules without a visual equivalent unsupported: %s", (rule) => {
+    expect(parseRRuleToScheduleModel(rule)).toBeNull();
+  });
+
+  it("validates the window and days", () => {
+    expect(validateSchedule(businessHours)).toBeNull();
+    expect(validateSchedule({ ...businessHours, hourWindow: { start: 17, end: 9 } })).toBe(
+      "Choose an end hour at or after the start hour.",
+    );
+    expect(validateSchedule({ ...businessHours, hourlyDays: [] })).toBe(
+      "Pick at least one day of the week.",
+    );
+  });
+});
+
 describe("visual schedule validation", () => {
   it.each([
     { customFreq: "weekly", interval: 209, weekdays: ["MO"] },

@@ -18,6 +18,7 @@ import { ScheduleTimePicker } from "./ScheduleTimePicker";
 import { useScheduleEscape } from "./useScheduleEscape";
 import { cn } from "@/lib/utils";
 import { commonTimezones, dateInTimezone, endOfDayInTimezone } from "@/lib/timezones";
+import { formatClockTime } from "@/lib/scheduleText";
 import {
   DEFAULT_SCHEDULE_MODEL,
   MAX_MINUTE_INTERVAL,
@@ -500,6 +501,74 @@ export function ScheduleFields({
             </ScheduleDaysPopover>
           </div>
         )}
+        {hourly && (
+          <>
+            <div
+              className="flex min-w-0 items-center justify-between gap-3 py-3"
+              data-testid="schedule-hour-window"
+            >
+              <span className="shrink-0">Hours</span>
+              <div className="flex min-w-0 items-center gap-1 text-muted-foreground">
+                <ScheduleChoice
+                  label="First run hour"
+                  testId="schedule-hour-window-start"
+                  className={inlineChoiceClass}
+                  disabled={custom && !anchoredScheduling}
+                  value={String(model.hourWindow.start)}
+                  options={hourOptions(model.minute)}
+                  onChange={(value) => {
+                    const start = Number(value);
+                    onChange({
+                      ...model,
+                      hourWindow: { start, end: Math.max(start, model.hourWindow.end) },
+                    });
+                  }}
+                  onOpenChange={onSelectOpenChange}
+                />
+                <span>to</span>
+                <ScheduleChoice
+                  label="Last run hour"
+                  testId="schedule-hour-window-end"
+                  className={inlineChoiceClass}
+                  disabled={custom && !anchoredScheduling}
+                  value={String(model.hourWindow.end)}
+                  options={hourOptions(model.minute, model.hourWindow.start)}
+                  onChange={(value) =>
+                    onChange({ ...model, hourWindow: { ...model.hourWindow, end: Number(value) } })
+                  }
+                  onOpenChange={onSelectOpenChange}
+                />
+              </div>
+            </div>
+            <div className="flex min-w-0 items-center justify-between gap-3 py-3">
+              <span>On</span>
+              <ScheduleDaysPopover onOpenChange={onSelectOpenChange}>
+                <PopoverTrigger asChild>
+                  <Button
+                    variant="outline"
+                    className={cn(
+                      inlineChoiceClass,
+                      "h-8 min-w-0 max-w-[85%] gap-2 px-2 font-normal",
+                      pickerTriggerClass,
+                    )}
+                    disabled={custom && !anchoredScheduling}
+                    aria-label="Days to run"
+                    data-testid="schedule-hourly-days-trigger"
+                  >
+                    <span className="truncate">{hourlyDaysLabel(model.hourlyDays)}</span>
+                    <ChevronDownIcon className="size-3.5" />
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent align="end" className="w-auto max-w-[calc(100vw-2rem)] p-3">
+                  <WeekdayButtons
+                    days={model.hourlyDays}
+                    onChange={(hourlyDays) => onChange({ ...model, hourlyDays })}
+                  />
+                </PopoverContent>
+              </ScheduleDaysPopover>
+            </div>
+          </>
+        )}
         {!(custom && minutely) && (
           <div className="space-y-0.5">
             <div
@@ -811,6 +880,27 @@ function WeekdayButtons({
       ))}
     </div>
   );
+}
+
+/** Hour choices labelled with the run time they produce, e.g. "9:30 AM". */
+function hourOptions(
+  minute: number,
+  earliest = 0,
+): { value: string; label: string; disabled?: boolean }[] {
+  const shownMinute = Number.isInteger(minute) && minute >= 0 && minute <= 59 ? minute : 0;
+  return Array.from({ length: 24 }, (_, hour) => ({
+    value: String(hour),
+    label: formatClockTime(hour, shownMinute),
+    disabled: hour < earliest,
+  }));
+}
+
+function hourlyDaysLabel(days: WeekdayCode[]): string {
+  const selected = new Set(days);
+  if (selected.size === WEEKDAY_CODES.length) return "Every day";
+  if (selected.size === 5 && !selected.has("SA") && !selected.has("SU")) return "Weekdays";
+  if (selected.size === 2 && selected.has("SA") && selected.has("SU")) return "Weekends";
+  return weekdayLabel(days);
 }
 
 function weekdayLabel(days: WeekdayCode[]): string {
