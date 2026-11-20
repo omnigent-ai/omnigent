@@ -247,6 +247,19 @@ describe("useMentionBrowser released tags", () => {
     expect(result.current.browser.mentionTokens).toEqual(["@readme.md"]);
   });
 
+  it("keeps a quote's restore point when another input's edit happens to land on its text", () => {
+    const { result } = renderBrowser();
+    tagReadme(result);
+    change(result, "Ref @readme.md ", null, "quote");
+    change(result, "Read ", null);
+    change(result, "Ref ", null, "quote");
+    // An ordinary edit in the tail that matches the quote's pre-deletion text.
+    change(result, "Ref @readme.md ", null);
+
+    change(result, "Ref @readme.md ", "undo", "quote");
+    expect(result.current.browser.mentionTokens).toEqual(["@readme.md"]);
+  });
+
   it("restores a deleted file with its identity when undo walks past a disambiguated completion", () => {
     const { result } = renderBrowser();
     tagReadme(result);
