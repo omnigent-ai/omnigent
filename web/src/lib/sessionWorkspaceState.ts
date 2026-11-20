@@ -135,10 +135,7 @@ function carriesCredential({ username, password, search, hash }: URL): boolean {
   );
 }
 
-/**
- * A page a browser tab can reopen, or null for a missing owner and for non-http(s),
- * oversized, malformed, or credential-bearing addresses.
- */
+/** A page a tab can reopen, or null without an owner or for a non-http(s), oversized, or credential-bearing URL. */
 export function sanitizeSavedBrowserPage(value: unknown): SavedBrowserPage | null {
   if (typeof value !== "object" || value === null) return null;
   const { url, title, owner } = value as Record<string, unknown>;

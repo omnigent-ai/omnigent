@@ -27,10 +27,7 @@ export interface BrowserTabPage {
   title?: string;
 }
 
-/**
- * The saved page of a browser view's tab, or null when none was recorded or
- * another account visited it. `userId` defaults to the signed-in user.
- */
+/** A view's saved page for `userId` (default: the signed-in user), or null if another account visited it. */
 export function readSavedBrowserPage(
   viewId: string,
   userId: string | null = getCurrentUserId(),
