@@ -845,11 +845,20 @@ async def _forward_status_cost(
         (1.25, [(0.0, 0), (0.05, 900)], [1.25, 1.30]),
         (0.005, [(0.0, 0), (0.003, 900)], [0.005, 0.008]),
         (0.05, [(0.0, 0), (0.10, 900)], [0.05, 0.15]),
-        # The total from before the first call was missed, but one below the seed
-        # still proves a fresh count.
+        # The total from before the first call was missed, but any total below the
+        # seed still proves a fresh count, however close to the seed it is.
         (1.25, [(0.05, 900)], [1.30]),
+        (0.005, [(0.003, 900)], [0.008]),
+        (100.0, [(99.995, 900)], [199.995]),
     ],
-    ids=["dollar-seed", "sub-cent-seed", "first-call-over-seed", "missed-startup-total"],
+    ids=[
+        "dollar-seed",
+        "sub-cent-seed",
+        "first-call-over-seed",
+        "missed-startup-total",
+        "missed-startup-sub-cent-seed",
+        "missed-startup-just-below-seed",
+    ],
 )
 @pytest.mark.asyncio
 async def test_forward_session_cost_adds_a_seeded_cost_claude_did_not_restore(

@@ -3137,10 +3137,6 @@ def _api_duration_from_status_state(state: dict[str, object] | None) -> float | 
     return float(raw)
 
 
-# Absorbs rounding when a total after the first API call is compared with the seed.
-_RESUME_COST_RESTORE_TOLERANCE_USD = 0.01
-
-
 def _resume_adjusted_status_cost(
     *,
     bridge_dir: Path,
@@ -3158,12 +3154,13 @@ def _resume_adjusted_status_cost(
     that stops reading it would restart the statusLine total at $0, and the
     server, which keeps only the highest total, would stall the session cost.
 
-    The decision is made before the resumed process's first API call, when
-    its total is exactly the restored seed or $0, so it doesn't depend on
-    what that call costs. If the forwarder only sees a total after a call,
-    only a total below the seed proves a fresh count; a higher one is taken
-    as restored, which can't count the seed twice. The decision is
-    persisted, so a restarted forwarder keeps it.
+    Claude restores the seed exactly and only adds to it, so a total below
+    the seed proves a fresh count. The decision is made before the resumed
+    process's first API call, when its total is the seed or $0, so it
+    doesn't depend on what that call costs. If the forwarder only sees a
+    total after a call, one at or above the seed is taken as restored,
+    which can't count the seed twice. The decision is persisted, so a
+    restarted forwarder keeps it.
 
     Reads and writes the bridge dir; call via :func:`asyncio.to_thread`.
 
@@ -3197,12 +3194,10 @@ def _resume_adjusted_status_cost(
     ):
         return status_cost
     if baseline.restored is None:
-        if api_duration_ms == 0:
-            restored = status_cost >= baseline.cost_usd / 2
-        elif status_cost > 0:
-            restored = status_cost + _RESUME_COST_RESTORE_TOLERANCE_USD >= baseline.cost_usd
-        else:
+        if status_cost <= 0 and api_duration_ms != 0:
+            # No total from before the first API call, and none billed yet.
             return status_cost
+        restored = status_cost >= baseline.cost_usd
         baseline = replace(baseline, restored=restored)
         dedupe.resume_cost_baseline = baseline
         try:
