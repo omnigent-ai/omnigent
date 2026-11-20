@@ -1112,6 +1112,11 @@ def test_host_background_fails_when_daemon_never_registers(
     if not expected_terminated:
         assert "still running (pid 4242)" in result.output
         assert f"host stop --server {server_url}" in result.output
+        pending_rerun = CliRunner().invoke(cli, ["host", "--background", "--server", server_url])
+        assert pending_rerun.exit_code != 0, pending_rerun.output
+        assert "still running (pid 4242)" in pending_rerun.output
+        assert len(spawned) == 1, "a pending rerun must retain the existing daemon"
+        assert terminated == []
         monkeypatch.setattr(
             "omnigent.cli._daemon_host_status_probe",
             lambda record, **kwargs: cli_module._HostHttpResult(
@@ -1122,6 +1127,7 @@ def test_host_background_fails_when_daemon_never_registers(
         assert rerun.exit_code == 0, rerun.output
         assert "already running (pid 4242" in rerun.output
         assert len(spawned) == 1, "the rerun must adopt the pending daemon"
+        assert terminated == []
 
 
 def test_local_host_background_keeps_pending_daemon_while_server_answers(

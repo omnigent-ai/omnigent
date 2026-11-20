@@ -21,21 +21,22 @@ _ONLINE_AFTER_START_S = 75.0
 
 
 @pytest.fixture
-def stalled_tunnel_server(tmp_path: Path) -> Iterator[tuple[str, FaultProxy]]:
+def stalled_tunnel_server(tmp_path: Path) -> Iterator[tuple[str, FaultProxy, EventLog]]:
     with isolated_local_server(tmp_path / "server") as base_url:
         loop = LoopThread("slow-host-registration")
         loop.start()
         upstream_port = int(base_url.rsplit(":", 1)[1])
+        events = EventLog(tmp_path / "network.jsonl")
         proxy = FaultProxy(
             "host",
             ("127.0.0.1", upstream_port),
             loop=loop,
-            events=EventLog(tmp_path / "network.jsonl"),
+            events=events,
             classify=host_link,
         )
         proxy.start()
         try:
-            yield base_url, proxy
+            yield base_url, proxy, events
         finally:
             proxy.stop()
             loop.stop()
@@ -53,9 +54,9 @@ def _host_status(client: httpx.Client, host_id: str) -> str:
 
 @pytest.mark.timeout(400)
 def test_start_brings_host_online_when_registration_outlasts_wait(
-    tmp_path: Path, stalled_tunnel_server: tuple[str, FaultProxy]
+    tmp_path: Path, stalled_tunnel_server: tuple[str, FaultProxy, EventLog]
 ) -> None:
-    base_url, proxy = stalled_tunnel_server
+    base_url, proxy, events = stalled_tunnel_server
     home = tmp_path / "cli-home"
     config_home = home / ".omnigent"
     config_home.mkdir(parents=True)
@@ -82,6 +83,9 @@ def test_start_brings_host_online_when_registration_outlasts_wait(
             "`omnigent start` should fail while the tunnel is held and leave the daemon "
             f"running (exit {start.returncode}):\n{output}"
         )
+        assert any(
+            event.fields.get("tag") == "host.tunnel" for event in events.events(kind="connect")
+        ), f"the pending daemon never attempted the faulted tunnel:\n{output}"
         fault.clear()
         with httpx.Client(base_url=base_url, trust_env=False) as client:
             observed: list[str] = []
