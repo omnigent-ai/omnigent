@@ -72,7 +72,10 @@ import {
   ComposerSendButton,
 } from "@/components/composer/ChatComposer";
 import { useRequestedComposerEngine } from "@/components/composer/engine/composerEnginePolicy";
-import type { ComposerTextTarget } from "@/components/composer/engine/composerInput";
+import {
+  isComposerTextarea,
+  type ComposerTextTarget,
+} from "@/components/composer/engine/composerInput";
 import {
   SHELL_MENTION_REFUSAL,
   useComposerHighlight,
@@ -2773,6 +2776,20 @@ function NewChatLandingContent({
     initialFiles: handoff?.files ?? restoredDraft?.files ?? [],
   });
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // The panel's prompt takes the keyboard each time the panel does, after any kept draft.
+  useEffect(() => {
+    if (!floating) return;
+    return floating.subscribeShown(() => {
+      const input = textareaRef.current;
+      if (!input) return;
+      const end = input.value.length;
+      input.setSelectionRange(end, end);
+      input.focus({ preventScroll: true });
+      // Setting the caret doesn't scroll, so a long draft shows its end where typing goes.
+      if (isComposerTextarea(input)) input.scrollTop = input.scrollHeight;
+      else input.revealCaret();
+    });
+  }, [floating]);
   // A cancelled native picker fires `cancel`, which React has no prop for.
   useEffect(() => {
     const input = fileInputRef.current;
