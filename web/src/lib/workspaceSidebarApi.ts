@@ -1,6 +1,6 @@
 // The workspace API methods the workspace sidebar reads through, with the signatures of
-// the workspace API client. Directory listing and file reads are served today; every
-// other method answers null, meaning no route serves it yet, until the client lands.
+// the workspace API client. Directory listing, file reads and searches are served today;
+// every other method answers null, meaning no route serves it yet.
 
 import type { FileContentResponse } from "@/hooks/useFileContent";
 import type { ContentSearchResult } from "@/lib/contentSearch";
@@ -10,6 +10,8 @@ import {
   listDirectoryViaWorkspaceApi,
   type ListedEntry,
   readFileViaWorkspaceApi,
+  searchFilesViaWorkspaceApi,
+  searchTextViaWorkspaceApi,
   type TextSearchOptions,
 } from "@/lib/workspaceApi";
 
@@ -297,12 +299,12 @@ export interface WorkspaceSidebarApi {
 
 const unserved = () => Promise.resolve(null);
 
-/** The methods served today: directory listing and file reads. */
+/** The methods served today: directory listing, file reads and searches. */
 export const DEFAULT_WORKSPACE_SIDEBAR_API: WorkspaceSidebarApi = {
   listDirectory: listDirectoryViaWorkspaceApi,
   readFile: readFileViaWorkspaceApi,
-  searchFiles: unserved,
-  searchText: unserved,
+  searchFiles: searchFilesViaWorkspaceApi,
+  searchText: searchTextViaWorkspaceApi,
   resolveWorkingCopyBase: unserved,
   listWorkingCopyChanges: unserved,
   readBaseFile: unserved,
