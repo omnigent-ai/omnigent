@@ -1,13 +1,13 @@
 // Starting points for a new thingy, each a working example of the SDK's patterns. A template's
 // revision is uploaded and published as the thingy's first version. The data story seeds
-// synthetic sample data on first load; the work map starts empty until its session scans the
-// viewer's own sessions.
+// synthetic sample data on first load; the work radar starts empty until its session scans the
+// viewer's own sessions and designs the page for them.
 
 import { DATA_STORY_REVISION } from "./dataStoryTemplate";
 import type { CreateThingyRevisionRequest } from "../api/thingyApi";
-import { WORK_MAP_REVISION } from "./workMapTemplate";
+import { WORK_RADAR_REVISION } from "./workRadarTemplate";
 
-export type ThingyTemplateId = "work-map" | "data-story" | "blank";
+export type ThingyTemplateId = "work-radar" | "data-story" | "blank";
 
 export interface ThingyTemplate {
   id: ThingyTemplateId;
@@ -23,19 +23,18 @@ export interface ThingyTemplate {
 
 // Shown in the New thingy dialog and the template preview.
 const messages = {
-  workMapName: "My work map",
-  workMapDescription:
-    "A map of what you have been working on, drawn from your recent sessions, with the next steps you can hand to an agent in one click.",
-  workMapShowsMap:
-    "Your efforts grouped by goal on an animated map, with what is blocked or waiting",
-  workMapShowsSteps:
-    "Next steps it can point to, such as ramping a flag or checking a metric, each a click away",
-  workMapShowsLive:
-    "Links to the sessions worth watching, with their journal outcome and live status",
-  workMapShowsGuide: "A guide on the page for rescanning and making it your own",
-  workMapSuggestScan: "Scan my sessions from the last 3 days",
-  workMapSuggestReviews: "Add an area for my pull request reviews",
-  workMapSuggestDaily: "Scan 7 days by default and leave out trivial sessions",
+  radarName: "Work radar",
+  radarDescription: "Sees what your recent sessions add up to, and what to do next.",
+  radarShowsSummary:
+    "What your recent sessions add up to, grouped by goal, with what is blocked or waiting on you",
+  radarShowsDesign:
+    "A page your thingy session designs for your work, such as a rollout as stages or reviews as lanes",
+  radarShowsSteps:
+    "Next steps such as ramping a flag or checking a metric, each a click away, with their progress",
+  radarShowsBack: "Back to the previous look whenever a new design misses",
+  radarSuggestScan: "Scan my sessions from the last 3 days",
+  radarSuggestLanes: "Show my pull request reviews as lanes",
+  radarSuggestWindow: "Scan 7 days by default and leave out trivial sessions",
   storyName: "Data story",
   storyDescription:
     "A scrolling, interactive report with annotated charts that an agent refreshes from a SQL table.",
@@ -53,21 +52,21 @@ const messages = {
 
 export const THINGY_TEMPLATES: readonly ThingyTemplate[] = [
   {
-    id: "work-map",
-    name: messages.workMapName,
-    description: messages.workMapDescription,
+    id: "work-radar",
+    name: messages.radarName,
+    description: messages.radarDescription,
     shows: [
-      messages.workMapShowsMap,
-      messages.workMapShowsSteps,
-      messages.workMapShowsLive,
-      messages.workMapShowsGuide,
+      messages.radarShowsSummary,
+      messages.radarShowsDesign,
+      messages.radarShowsSteps,
+      messages.radarShowsBack,
     ],
     suggestions: [
-      messages.workMapSuggestScan,
-      messages.workMapSuggestReviews,
-      messages.workMapSuggestDaily,
+      messages.radarSuggestScan,
+      messages.radarSuggestLanes,
+      messages.radarSuggestWindow,
     ],
-    revision: WORK_MAP_REVISION,
+    revision: WORK_RADAR_REVISION,
   },
   {
     id: "data-story",

@@ -2,7 +2,7 @@
 // before it is created. The New thingy dialog, the create page and a session's New thingy tab
 // offer them.
 import { type FormEvent, useId, useMemo, useState } from "react";
-import { ChartLineIcon, FilePlusIcon, type LucideIcon, OrbitIcon } from "lucide-react";
+import { ChartLineIcon, FilePlusIcon, type LucideIcon, RadarIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -41,7 +41,7 @@ export const MAX_THINGY_NAME_LENGTH = 120;
 const UNTITLED_THINGY = "Untitled thingy";
 
 const TEMPLATE_ICONS: Record<ThingyTemplate["id"], LucideIcon> = {
-  "work-map": OrbitIcon,
+  "work-radar": RadarIcon,
   "data-story": ChartLineIcon,
   blank: FilePlusIcon,
 };
