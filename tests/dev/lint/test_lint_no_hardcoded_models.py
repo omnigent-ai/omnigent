@@ -66,6 +66,20 @@ def test_scan_ignores_model_family_fragments(tmp_path: Path) -> None:
     assert scan(clean) == []
 
 
+def test_scan_ignores_pi_mistral_api_name_but_flags_mistral_models(tmp_path: Path) -> None:
+    source = tmp_path / "pi_api.py"
+    source.write_text(
+        'PI_API = "mistral-conversations"\n'
+        'MODEL = "mistral-large-latest"\n'
+        'VERSIONED = "mistral-conversations-2"\n'
+    )
+
+    assert [(hit.line, hit.model) for hit in scan(source)] == [
+        (2, "mistral-large-latest"),
+        (3, "mistral-conversations-2"),
+    ]
+
+
 def test_scan_ignores_python_docstrings(tmp_path: Path) -> None:
     clean = tmp_path / "clean.py"
     clean.write_text(

@@ -70,6 +70,7 @@ from omnigent.onboarding.provider_config import (
     GATEWAY_KIND,
     KEY_KIND,
     LOCAL_KIND,
+    PI_MISTRAL_API,
     PI_SURFACE,
     FamilyConfig,
     ProviderEntry,
@@ -113,6 +114,9 @@ _PI_OPENAI_PROVIDER_ID = "omnigent-openai"
 _PI_COMPLETIONS_PROVIDER_ID = "omnigent-completions"
 _PI_MLFLOW_PROVIDER_ID = "omnigent-mlflow"
 
+# Provider id for a family that opts into Pi's Mistral client (``pi_api``).
+_PI_MISTRAL_PROVIDER_ID = "omnigent-mistral"
+
 # Which provider id serves each Databricks gateway surface. The Anthropic
 # surface is the primary provider, so it is registered inline, not here.
 _SURFACE_PROVIDER_IDS: dict[DatabricksPiSurface, str] = {
@@ -121,7 +125,9 @@ _SURFACE_PROVIDER_IDS: dict[DatabricksPiSurface, str] = {
     DatabricksPiSurface.MLFLOW: _PI_MLFLOW_PROVIDER_ID,
 }
 
-_PI_MANAGED_PROVIDER_IDS = frozenset({_PI_PROVIDER_ID, *_SURFACE_PROVIDER_IDS.values()})
+_PI_MANAGED_PROVIDER_IDS = frozenset(
+    {_PI_PROVIDER_ID, _PI_MISTRAL_PROVIDER_ID, *_SURFACE_PROVIDER_IDS.values()}
+)
 # Databricks Unity Gateway Anthropic Messages surface. Pi speaks this protocol
 # natively (``api: anthropic-messages``); the gateway authenticates with a
 # workspace bearer token, so we set ``authHeader`` (Authorization: Bearer).
@@ -892,6 +898,28 @@ def _databricks_openai_provider(
     }
 
 
+def _pi_mistral_base_url(base_url: str) -> str:
+    """Drop a trailing ``/v1``: Pi's Mistral client appends ``v1/chat/completions``."""
+    return base_url.rstrip("/").removesuffix("/v1")
+
+
+def _pi_mistral_provider(
+    api_key: str, base_url: str, models: list[_PiModelEntry]
+) -> _PiProviderPayload:
+    """Build a Pi provider for a Mistral Chat Completions endpoint (``pi_api``).
+
+    Pi's Mistral client parses the chunked ``thinking`` / ``text`` content that
+    Mistral reasoning models stream, which the OpenAI client cannot render.
+    """
+    return {
+        "baseUrl": _pi_mistral_base_url(base_url),
+        "apiKey": api_key,
+        "api": PI_MISTRAL_API,
+        "authHeader": True,
+        "models": models,
+    }
+
+
 _AUTH_COMMAND_REAP_TIMEOUT_S = 2.0
 
 
@@ -1184,6 +1212,7 @@ def _databricks_gateway_pi_provider(
     auth_command: str | None = None,
     static_api_key: str | None = None,
     declared_surface: DatabricksPiSurface | None = None,
+    declared_pi_api: str | None = None,
     configured_context_window: int | None = None,
     configured_max_output_tokens: int | None = None,
 ) -> PiProviderConfig:
@@ -1207,6 +1236,10 @@ def _databricks_gateway_pi_provider(
     :param declared_surface: The surface *gateway_base_url* names when *model*
         is a configured default. A default the listing omits is registered
         there rather than classified by name, so it keeps its own endpoint.
+    :param declared_pi_api: The family's ``pi_api`` when *model* is its
+        configured default, e.g. ``"mistral-conversations"``. The default is
+        then registered on its own provider speaking that API at
+        *gateway_base_url*, ahead of any surface that also lists it.
     :param configured_context_window: The provider entry's explicit context
         limit for its configured default; applied to that default's entry,
         listed or not, ahead of any catalog value.
@@ -1297,6 +1330,16 @@ def _databricks_gateway_pi_provider(
         "configured_context_window": configured_context_window,
         "configured_max_output_tokens": configured_max_output_tokens,
     }
+    if declared_pi_api == PI_MISTRAL_API:
+        # Listed first so Pi opens the default on this provider, not a surface
+        # whose OpenAI client cannot read Mistral's chunked content.
+        mistral = _pi_mistral_provider(
+            api_key, gateway_base_url, [pi_generic_model_json_entry(config.model, **limits)]
+        )
+        return replace(
+            config,
+            additional_providers={_PI_MISTRAL_PROVIDER_ID: mistral, **config.additional_providers},
+        )
     listed = config._model_registered_in_additional() or any(
         entry.get("id") == config.model for entry in config.extra_models
     )
@@ -1571,6 +1614,8 @@ def _inline_family_pi_provider(
         # Determine the API type based on family and wire_api setting.
         if family_name == "anthropic":
             api = "anthropic-messages"
+        elif family.pi_api is not None:
+            api = family.pi_api
         elif family.wire_api == CHAT_WIRE_API:
             api = "openai-completions"
         else:
@@ -1633,6 +1678,7 @@ def _inline_family_pi_provider(
                 auth_command=family.auth_command,
                 static_api_key=family.api_key,
                 declared_surface=declared_surface if is_configured_default else None,
+                declared_pi_api=family.pi_api if is_configured_default else None,
                 configured_context_window=family.context_window,
                 configured_max_output_tokens=family.max_output_tokens,
             )
@@ -1660,7 +1706,9 @@ def _inline_family_pi_provider(
                 )
         return PiProviderConfig(
             provider_id=_PI_PROVIDER_ID,
-            base_url=family.base_url,
+            base_url=(
+                _pi_mistral_base_url(family.base_url) if api == PI_MISTRAL_API else family.base_url
+            ),
             api=api,
             model=resolved_model,
             api_key=api_key,
@@ -1745,6 +1793,7 @@ def resolve_pi_native_provider(
                 "anthropic-messages": _PI_PROVIDER_ID,
                 "openai-responses": _PI_OPENAI_PROVIDER_ID,
                 "openai-completions": _PI_COMPLETIONS_PROVIDER_ID,
+                PI_MISTRAL_API: _PI_MISTRAL_PROVIDER_ID,
             }
             for model_id in binding.model_allowlist:
                 routed = _inline_family_pi_provider(entry, model=model_id, preserve_model_ids=True)

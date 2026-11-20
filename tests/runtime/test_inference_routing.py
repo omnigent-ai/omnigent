@@ -572,6 +572,31 @@ def test_pi_mixed_shortlist_registers_each_models_wire() -> None:
     assert [row["id"] for row in rendered["omnigent-openai"]["models"]] == ["gpt-primary"]
 
 
+def test_pi_bound_mistral_family_keeps_allowlist_on_pi_mistral_client() -> None:
+    profile = _profile()
+    del profile["providers"]["bifrost"]["anthropic"]
+    profile["providers"]["bifrost"]["openai"].update(
+        wire_api="chat", pi_api="mistral-conversations"
+    )
+    profile["inference"] = {
+        "harnesses": {
+            "pi-native": {
+                "provider": "bifrost",
+                "default_model": "model-a",
+                "model_allowlist": ["model-a", "model-b"],
+            }
+        }
+    }
+    with inference_config_scope(profile):
+        provider = resolve_pi_native_provider()
+    assert provider is not None
+    rendered = provider.to_models_config()["providers"]
+    assert list(rendered) == ["omnigent-mistral"]
+    assert rendered["omnigent-mistral"]["api"] == "mistral-conversations"
+    assert rendered["omnigent-mistral"]["baseUrl"] == "https://bifrost.example"
+    assert [row["id"] for row in rendered["omnigent-mistral"]["models"]] == ["model-a", "model-b"]
+
+
 @pytest.mark.parametrize(
     ("selection", "model", "api"),
     [
