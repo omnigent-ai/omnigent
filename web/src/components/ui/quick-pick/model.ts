@@ -119,5 +119,24 @@ export interface QuickPickItemRow<Value = unknown> {
 
 export type QuickPickRow<Value = unknown> = QuickPickHeadingRow | QuickPickItemRow<Value>;
 
-/** Returning `"keepOpen"` from `onAccept` leaves a dialog open, such as after loading more rows. */
-export type QuickPickAcceptResult = void | "keepOpen";
+export interface QuickPickStats {
+  /** Selectable results currently shown. */
+  resultCount: number;
+  /** True while any source is still loading. */
+  loading: boolean;
+  /** Slowest completed source load for the current results. */
+  elapsedMs?: number;
+}
+
+export interface QuickPickAcceptDetails {
+  /** ⌘↵ / Ctrl+↵ or a modified click. */
+  alternate: boolean;
+}
+
+/**
+ * What an accept asks of the wrapper around the picker, which owns closing. `"keepOpen"` asks
+ * it to stay open, such as after loading more rows; `{ afterClose }` asks it to run `afterClose`
+ * once it has closed and restored focus, so an action that moves focus keeps it. The picker
+ * itself only refreshes its recents on `"keepOpen"`.
+ */
+export type QuickPickAcceptResult = void | "keepOpen" | { afterClose: () => void };

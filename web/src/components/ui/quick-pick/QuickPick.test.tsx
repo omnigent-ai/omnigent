@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { readQuickPickHistory, recordQuickPickHistory } from "./history";
 import type { QuickPickItem, QuickPickSource } from "./model";
 import type { QuickPickSegment } from "./presentation";
-import { QuickPick, type QuickPickProps } from "./QuickPick";
+import { formatQuickPickSummary, QuickPick, type QuickPickProps } from "./QuickPick";
 
 afterEach(() => {
   cleanup();
@@ -265,7 +265,9 @@ describe("QuickPick pointer and query picks", () => {
     fireEvent.pointerMove(screen.getByRole("option", { name: /archive/ }));
     expect(activeOption(input)?.textContent).toContain("New session");
     fireEvent.keyDown(input, { key: "Enter" });
-    expect(onAccept).toHaveBeenCalledWith(expect.objectContaining({ id: "new-session" }));
+    expect(onAccept).toHaveBeenCalledWith(expect.objectContaining({ id: "new-session" }), {
+      alternate: false,
+    });
   });
 });
 
@@ -304,12 +306,16 @@ describe("QuickPick accepting", () => {
   it("accepts the active row with Enter and a clicked row by pointer", () => {
     const { input, onAccept } = renderPicker();
     fireEvent.keyDown(input, { key: "Enter" });
-    expect(onAccept).toHaveBeenLastCalledWith(expect.objectContaining({ id: "new-session" }));
+    expect(onAccept).toHaveBeenLastCalledWith(expect.objectContaining({ id: "new-session" }), {
+      alternate: false,
+    });
     const settings = screen.getByRole("option", { name: /Open settings/ });
     // jsdom never moves focus on click, so check the press can't take focus from the query.
     expect(fireEvent.mouseDown(settings)).toBe(false);
     fireEvent.click(settings);
-    expect(onAccept).toHaveBeenLastCalledWith(expect.objectContaining({ id: "open-settings" }));
+    expect(onAccept).toHaveBeenLastCalledWith(expect.objectContaining({ id: "open-settings" }), {
+      alternate: false,
+    });
   });
 
   it("leaves Enter to an IME composition", () => {
@@ -484,6 +490,81 @@ describe("QuickPick async sources", () => {
     };
     renderPicker({ sources: [source], sourcesFirst: true });
     expect(optionNames()[0]).toBe("Recent session");
+  });
+});
+
+describe("QuickPick footer and alternate accept", () => {
+  it("shows no footer for an inline picker that can't close", () => {
+    renderPicker();
+    expect(document.querySelector("[data-slot=quick-pick-footer]")).toBeNull();
+  });
+
+  it("summarizes the results and runs Select and Close from its hints", () => {
+    const onClose = vi.fn();
+    const { onAccept } = renderPicker({ onClose, summary: formatQuickPickSummary });
+    expect(document.querySelector("[data-slot=quick-pick-summary]")).toHaveTextContent("2 results");
+    fireEvent.click(screen.getByRole("button", { name: "Select (Enter)" }));
+    expect(onAccept).toHaveBeenCalledWith(expect.objectContaining({ id: "new-session" }), {
+      alternate: false,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Close (Escape)" }));
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("accepts the active row as alternate with the command modifier or its hint", () => {
+    const { input, onAccept } = renderPicker({ onClose: vi.fn(), alternateLabel: "Open beside" });
+    fireEvent.keyDown(input, { key: "Enter", ctrlKey: true });
+    expect(onAccept).toHaveBeenLastCalledWith(expect.objectContaining({ id: "new-session" }), {
+      alternate: true,
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^Open beside/ }));
+    expect(onAccept).toHaveBeenCalledTimes(2);
+    expect(onAccept).toHaveBeenLastCalledWith(expect.anything(), { alternate: true });
+  });
+
+  it("runs the picker's own alternate instead of the row when it has one", () => {
+    const onAlternate = vi.fn();
+    const { input, onAccept } = renderPicker({ onAlternate });
+    fireEvent.keyDown(input, { key: "Enter", ctrlKey: true });
+    expect(onAlternate).toHaveBeenCalledTimes(1);
+    expect(onAccept).not.toHaveBeenCalled();
+  });
+
+  it("names the active row's alternate, and hides the hint for a row without one", () => {
+    const { input } = renderPicker({
+      onClose: vi.fn(),
+      alternateLabel: (row) => (row.id === "new-session" ? "Open beside" : undefined),
+    });
+    expect(screen.getByRole("button", { name: /^Open beside/ })).toBeVisible();
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    expect(screen.queryByRole("button", { name: /^Open beside/ })).toBeNull();
+  });
+
+  it("dismisses with Escape outside a dialog", () => {
+    const onDismiss = vi.fn();
+    const { input } = renderPicker({ onDismiss });
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(onDismiss).toHaveBeenCalledTimes(1);
+  });
+
+  it("dismisses with Escape from a control among the results, returning focus to the query", () => {
+    const onDismiss = vi.fn();
+    const { input } = renderPicker({
+      onDismiss,
+      listEnd: <button type="button">Show more</button>,
+    });
+    const showMore = screen.getByRole("button", { name: "Show more" });
+    showMore.focus();
+    fireEvent.keyDown(showMore, { key: "Escape" });
+    expect(onDismiss).toHaveBeenCalledTimes(1);
+    expect(document.activeElement).toBe(input);
+  });
+
+  it("formats loading and timing in the default summary", () => {
+    expect(formatQuickPickSummary({ resultCount: 2000, loading: false, elapsedMs: 41.6 })).toBe(
+      "2,000 results · 42 ms",
+    );
+    expect(formatQuickPickSummary({ resultCount: 1, loading: true })).toBe("1 result · Searching…");
   });
 });
 

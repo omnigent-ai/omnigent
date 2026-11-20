@@ -14,17 +14,20 @@ import { SearchIcon, XIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { CompactShortcutKeys } from "@/components/ui/kbd";
 import { Spinner } from "@/components/ui/spinner";
+import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { cn } from "@/lib/utils";
 
 import { readQuickPickHistory, recordQuickPickHistory } from "./history";
 import { HighlightedText, type MatchHighlight } from "./HighlightedText";
 import type {
+  QuickPickAcceptDetails,
   QuickPickAcceptResult,
   QuickPickItem,
   QuickPickItemRow,
   QuickPickRow,
   QuickPickSource,
+  QuickPickStats,
 } from "./model";
 import {
   buildQuickPickRows,
@@ -53,7 +56,25 @@ export interface QuickPickProps<Value> {
   sourcesFirst?: boolean;
   query: string;
   onQueryChange: (query: string) => void;
-  onAccept: (item: QuickPickItem<Value>) => QuickPickAcceptResult;
+  onAccept: (item: QuickPickItem<Value>, details: QuickPickAcceptDetails) => QuickPickAcceptResult;
+  /**
+   * ⌘↵ for the whole picker instead of the active row, such as handing its search to a
+   * panel; it works with no row active. Without it, ⌘↵ accepts the active row as alternate.
+   */
+  onAlternate?: () => QuickPickAcceptResult;
+  /** Called for Escape when the picker is not inside a dialog. */
+  onDismiss?: () => void;
+  /** The footer's Close button, for a picker whose Escape is handled around it, such as a dialog. */
+  onClose?: () => void;
+  /** Footer text summarizing results, such as `formatQuickPickSummary`. */
+  summary?: (stats: QuickPickStats) => ReactNode;
+  /** Footer hint for Enter; defaults to Select. */
+  acceptLabel?: string;
+  /**
+   * Footer hint for ⌘↵ / Ctrl+↵; omit when there is no alternate action. A function names the
+   * active row's alternate, or returns undefined for a row without one.
+   */
+  alternateLabel?: string | ((item: QuickPickItem<Value>) => string | undefined);
   /** Remembers accepted items under this namespace and lists them first while the query is empty. */
   historyKey?: string;
   /** How rows' matched text stands out, unless a row sets its own. */
@@ -125,6 +146,53 @@ function resultCountText(resultCount: number): string {
   return resultCount === 1 ? "1 result" : `${resultCount.toLocaleString()} results`;
 }
 
+/** Default footer summary, such as "2,000 results · 42 ms". */
+export function formatQuickPickSummary({
+  resultCount,
+  elapsedMs,
+  loading,
+}: QuickPickStats): string {
+  const count = resultCountText(resultCount);
+  if (loading) return `${count} · Searching…`;
+  return elapsedMs === undefined ? count : `${count} · ${Math.round(elapsedMs)} ms`;
+}
+
+/** A footer hint that also works by click: it does what its keys do, keeping focus in the query. */
+function FooterAction({
+  keys,
+  shortcut,
+  label,
+  onClick,
+  disabled = false,
+}: {
+  keys: readonly string[];
+  /** The keys as `aria-keyshortcuts` names them, such as "Meta+Enter". */
+  shortcut: string;
+  label: string;
+  onClick: () => void;
+  disabled?: boolean;
+}) {
+  // The key caps are hidden from assistive tech, so the name says the key.
+  const spokenKey = shortcut.replace("Meta+", "⌘").replace("Control+", "Ctrl+");
+  return (
+    <Button
+      type="button"
+      variant="ghost"
+      size="xs"
+      data-slot="quick-pick-footer-action"
+      aria-label={`${label} (${spokenKey})`}
+      aria-keyshortcuts={shortcut}
+      disabled={disabled}
+      onMouseDown={(event) => event.preventDefault()}
+      onClick={onClick}
+      className="-mx-1 shrink-0 gap-1.5 px-1 font-normal text-muted-foreground hover:text-foreground"
+    >
+      <CompactShortcutKeys keys={keys} />
+      <span>{label}</span>
+    </Button>
+  );
+}
+
 /**
  * Keyboard-first picker: a query field over fuzzy-ranked rows grouped under
  * headings. The caller owns the query and what accepting a row does.
@@ -164,6 +232,12 @@ export function QuickPick<Value>({
   query,
   onQueryChange,
   onAccept,
+  onAlternate,
+  onDismiss,
+  onClose = onDismiss,
+  summary,
+  acceptLabel = "Select",
+  alternateLabel,
   historyKey,
   matchHighlight = "emphasis",
   emptyMessage,
@@ -217,6 +291,10 @@ export function QuickPick<Value>({
   const sourceStates = sources.map((source) => states[source.id]);
   const loading = sourceStates.some((state) => !state || state.status === "loading");
   const sourceError = sourceStates.find((state) => state?.status === "error")?.error ?? null;
+  const elapsedValues = sourceStates.flatMap((state) =>
+    state?.elapsedMs === undefined ? [] : [state.elapsedMs],
+  );
+  const isMac = useMemo(() => isMacPlatform(), []);
   const sections = useMemo(() => sectionsOf(rows), [rows]);
   const resultCount = rows.filter((row) => row.kind === "item").length;
   const showEmpty = !collapsed && resultCount === 0;
@@ -279,14 +357,27 @@ export function QuickPick<Value>({
     return Math.max(1, Math.floor(list.clientHeight / option.offsetHeight) - 1);
   };
 
-  const accept = (row: QuickPickItemRow<Value>) => {
+  const accept = (row: QuickPickItemRow<Value>, alternate = false) => {
     if (row.item.disabledReason) return;
     if (historyKey && !row.isFreeText && row.item.rememberInHistory !== false) {
       recordQuickPickHistory(historyKey, row.item.id);
     }
-    if (onAccept(row.item) === "keepOpen") {
+    if (onAccept(row.item, { alternate }) === "keepOpen") {
       setHistory({ key: historyKey, ids: readRecents(historyKey) });
     }
+  };
+  // ⌘↵ or a modified click runs the picker's own alternate where there is one.
+  const acceptWith = (row: QuickPickItemRow<Value> | null, alternate: boolean) => {
+    if (alternate && onAlternate) onAlternate();
+    else if (row) accept(row, alternate);
+  };
+
+  /** Escape dismisses a picker that isn't inside a dialog, wherever focus is in it. */
+  const handleEscape = (event: KeyboardEvent<HTMLElement>) => {
+    // A dialog around the picker already handled it.
+    if (event.defaultPrevented || !onDismiss) return;
+    event.preventDefault();
+    onDismiss();
   };
 
   const handleKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
@@ -298,9 +389,40 @@ export function QuickPick<Value>({
       navigate(navigation);
     } else if (event.key === "Enter") {
       event.preventDefault();
-      if (activeRow) accept(activeRow);
+      acceptWith(activeRow, hasCommandModifier(event, isMac));
+    } else if (event.key === "Escape") {
+      handleEscape(event);
     }
   };
+
+  // The footer's buttons take focus from Tab, so Escape works from them as from the query.
+  const handleFooterKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.key === "Escape" && !isImeCompositionKeyEvent(event)) handleEscape(event);
+  };
+
+  // Controls among the results, such as Try again or Show more, take Tab too. Escape from
+  // one may remove it, so focus returns to the query.
+  const handleResultsKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== "Escape" || isImeCompositionKeyEvent(event)) return;
+    handleEscape(event);
+    if (event.defaultPrevented) queryFieldRef.current?.focus();
+  };
+
+  const stats: QuickPickStats = {
+    resultCount,
+    loading,
+    elapsedMs: elapsedValues.length > 0 ? Math.max(...elapsedValues) : undefined,
+  };
+  // An inline picker with no way to close, and nothing to summarize, keeps to its rows.
+  const showFooter = !sidebar && (onClose !== undefined || summary !== undefined);
+  // The footer's accept buttons do what Enter does, so they need a row Enter would accept.
+  const canAcceptActive = activeRow !== null && !activeRow.item.disabledReason;
+  const shownAlternateLabel =
+    typeof alternateLabel === "function"
+      ? activeRow
+        ? alternateLabel(activeRow.item)
+        : undefined
+      : alternateLabel;
 
   const renderOption = (row: QuickPickItemRow<Value>, index: number) => {
     const { item } = row;
@@ -324,7 +446,7 @@ export function QuickPick<Value>({
         }}
         // Keep focus in the query field.
         onMouseDown={(event) => event.preventDefault()}
-        onClick={() => accept(row)}
+        onClick={(event) => acceptWith(row, hasCommandModifier(event, isMac))}
         className={cn(
           "flex cursor-pointer select-none rounded-lg px-2 text-ui",
           sidebar
@@ -468,6 +590,7 @@ export function QuickPick<Value>({
       <div
         ref={scrollRef}
         data-slot="quick-pick-scroll"
+        onKeyDown={handleResultsKeyDown}
         className={cn(
           "overflow-y-auto p-1",
           fillHeight ? "min-h-0 flex-1" : "max-h-72",
@@ -551,6 +674,40 @@ export function QuickPick<Value>({
         </div>
         {listEnd}
       </div>
+      {showFooter && (
+        <div
+          onKeyDown={handleFooterKeyDown}
+          data-slot="quick-pick-footer"
+          className="flex min-h-9 items-center gap-3 border-t border-border px-3 py-1.5 text-sm text-muted-foreground"
+        >
+          <span data-slot="quick-pick-summary" className="min-w-0 flex-1 truncate">
+            {summary?.(stats)}
+          </span>
+          <FooterAction
+            keys={["↵"]}
+            shortcut="Enter"
+            label={acceptLabel}
+            disabled={!canAcceptActive}
+            onClick={() => activeRow && accept(activeRow)}
+          />
+          {shownAlternateLabel && (
+            <FooterAction
+              keys={[isMac ? "⌘" : "Ctrl", "↵"]}
+              shortcut={isMac ? "Meta+Enter" : "Control+Enter"}
+              label={shownAlternateLabel}
+              disabled={!onAlternate && !canAcceptActive}
+              onClick={() => acceptWith(activeRow, true)}
+            />
+          )}
+          <FooterAction
+            keys={["esc"]}
+            shortcut="Escape"
+            label="Close"
+            disabled={!onClose}
+            onClick={() => onClose?.()}
+          />
+        </div>
+      )}
     </div>
   );
 }
