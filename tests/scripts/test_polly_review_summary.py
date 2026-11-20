@@ -3772,20 +3772,43 @@ def test_multipart_publication_is_retryable_and_completes_only_after_primary(
             "body": "Unrelated bot quoting an example:\n```text\n" + primary_header + "```\n",
         },
     ]
-    for body in (
-        f"<!-- polly-review-bot -->\nQuoted example: <!-- polly-reviewed-sha: {'a' * 40} -->\n",
-        f"<!-- polly-skipped-sha: {'a' * 40} --> "
-        f"Quoted example: <!-- polly-reviewed-sha: {'a' * 40} -->\n",
-    ):
-        malformed = {
+    malformed_comments = [
+        {
             "user": {"type": "Bot"},
             "html_url": "https://example.test/malformed-metadata",
             "body": body,
         }
-        controls.write_text(json.dumps([malformed]))
-        assert not already_reviewed()
-        assert not (tmp_path / "skip.md").exists()
-        lookalikes.append(malformed)
+        for body in (
+            "<!-- polly-review-bot -->\n"
+            f"Quoted example: <!-- polly-reviewed-sha: {'a' * 40} -->\n",
+            f"<!-- polly-skipped-sha: {'a' * 40} --> "
+            f"Quoted example: <!-- polly-reviewed-sha: {'a' * 40} -->\n",
+        )
+    ]
+    if failed_call is None:
+        for malformed in malformed_comments:
+            controls.write_text(json.dumps([malformed]))
+            assert not already_reviewed()
+            assert not (tmp_path / "skip.md").exists()
+        completions = [
+            {
+                "user": {"type": "Bot"},
+                "html_url": url,
+                "body": primary_header + "Completed review.\n",
+            }
+            for url in (
+                "https://example.test/first-completion",
+                "https://example.test/second-completion",
+            )
+        ]
+        controls.write_text(json.dumps([*completions, *malformed_comments]))
+        assert already_reviewed()
+        skip = tmp_path / "skip.md"
+        assert re.findall(r"\[review\]\(([^)]+)\)", skip.read_text()) == [
+            "https://example.test/second-completion"
+        ]
+        skip.unlink()
+    lookalikes.extend(malformed_comments)
     controls.write_text(json.dumps(lookalikes))
     assert not already_reviewed()
     assert not (tmp_path / "skip.md").exists()
