@@ -1,6 +1,10 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { useState } from "react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { FlagIcon } from "lucide-react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { type PaletteCommand, usePaletteCommandsStore } from "@/store/paletteCommands";
 
 import { QuickPickCommandPalette } from "./QuickPickCommandPalette";
 
@@ -31,7 +35,10 @@ beforeEach(() => {
     isFetching: false,
   });
 });
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  usePaletteCommandsStore.setState({ groups: {} });
+});
 
 function renderPalette() {
   const onOpenChange = vi.fn();
@@ -82,5 +89,77 @@ describe("QuickPickCommandPalette", () => {
     fireEvent.keyDown(input, { key: "Enter" });
     expect(onOpenChange).toHaveBeenCalledWith(false);
     expect(navigate).toHaveBeenCalledWith("/");
+  });
+});
+
+describe("QuickPickCommandPalette feature commands", () => {
+  // No sessions, so the command the query names is the first row.
+  beforeEach(() => useConversations.mockReturnValue({ data: { pages: [] }, isFetching: false }));
+  const offer = (commands: PaletteCommand[]) =>
+    act(() =>
+      usePaletteCommandsStore.getState().register("tabs", { heading: "Workspace", commands }),
+    );
+  const command = (id: string, overrides: Partial<PaletteCommand> = {}): PaletteCommand => ({
+    id,
+    label: id,
+    icon: FlagIcon,
+    keywords: [],
+    run: vi.fn(),
+    ...overrides,
+  });
+  const accept = (input: HTMLElement, query: string) => {
+    fireEvent.change(input, { target: { value: query } });
+    fireEvent.keyDown(input, { key: "Enter" });
+  };
+
+  it("lists a feature's commands under its heading and runs one", () => {
+    const reopen = command("Reopen closed tab");
+    offer([reopen]);
+    const { input, onOpenChange } = renderPalette();
+    expect(
+      within(screen.getByRole("group", { name: "Workspace" })).getByRole("option", {
+        name: /Reopen closed tab/,
+      }),
+    ).toBeTruthy();
+    accept(input, "reopen closed");
+    expect(reopen.run).toHaveBeenCalledOnce();
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("runs a command that moves focus only once the palette has closed", async () => {
+    const focusFilter = command("Filter files", { movesFocus: true });
+    offer([focusFilter]);
+    function Palette() {
+      const [open, setOpen] = useState(true);
+      return (
+        <QuickPickCommandPalette
+          open={open}
+          onOpenChange={setOpen}
+          onToggleLeftSidebar={vi.fn()}
+          onToggleRightSidebar={vi.fn()}
+        />
+      );
+    }
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Palette />
+      </QueryClientProvider>,
+    );
+    accept(screen.getByTestId("command-palette-input"), "filter files");
+    expect(focusFilter.run).not.toHaveBeenCalled();
+    await waitFor(() => expect(focusFilter.run).toHaveBeenCalledOnce());
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("keeps the palette open when the accepted row's command was withdrawn or greyed out since", () => {
+    const later = command("Later");
+    offer([later]);
+    const { input, onOpenChange } = renderPalette();
+    fireEvent.change(input, { target: { value: "later" } });
+    // Withdrawn between the render and the accept, as a feature unmounting would.
+    usePaletteCommandsStore.setState({ groups: {} });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(later.run).not.toHaveBeenCalled();
+    expect(onOpenChange).not.toHaveBeenCalled();
   });
 });

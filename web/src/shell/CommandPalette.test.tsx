@@ -1280,14 +1280,18 @@ describe("CommandPalette — commands a mounted feature offers", () => {
     expect(document.activeElement).toBe(screen.getByText("Where the command moves focus"));
   });
 
-  it("lists none without the workspace_sidebar_v2 flag", async () => {
-    withSidebarFlag(false);
-    openPalette(vi.fn());
-    fireEvent.change(screen.getByTestId("command-palette-input"), {
-      target: { value: "in the workspace" },
-    });
+  // The QuickPick palette lists them under its own flag; its own test covers that.
+  it.skipIf("QUICK_PICK_PALETTE" in commandPaletteModule)(
+    "lists none without the workspace_sidebar_v2 flag",
+    async () => {
+      withSidebarFlag(false);
+      openPalette(vi.fn());
+      fireEvent.change(screen.getByTestId("command-palette-input"), {
+        target: { value: "in the workspace" },
+      });
 
-    await screen.findByText("No results found");
-    expect(screen.queryByRole("option", { name: /Go back in the workspace/ })).toBeNull();
-  });
+      await screen.findByText("No results found");
+      expect(screen.queryByRole("option", { name: /Go back in the workspace/ })).toBeNull();
+    },
+  );
 });

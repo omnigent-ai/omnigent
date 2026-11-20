@@ -1,28 +1,42 @@
 // ⌘K on QuickPick: the same Sessions, In messages and Actions rows as CommandPalette,
-// with fuzzy-ranked actions and keyboard navigation from the QuickPick list.
+// with fuzzy-ranked actions and keyboard navigation from the QuickPick list, and the
+// commands features on screen offer through `usePaletteCommands`, under their headings.
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { XIcon } from "lucide-react";
 import { useNavigate } from "@/lib/routing";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
-import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
-import { QuickPick } from "@/components/ui/quick-pick/QuickPick";
+import {
+  type QuickPickAcceptResult,
+  QuickPickDialog,
+  type QuickPickItem,
+  type QuickPickSegment,
+} from "@/components/ui/quick-pick";
 import { occurrenceRanges } from "@/components/ui/quick-pick/match";
-import type { QuickPickItem } from "@/components/ui/quick-pick/model";
-import type { QuickPickSegment } from "@/components/ui/quick-pick/presentation";
+import { usePaletteCommandsStore } from "@/store/paletteCommands";
 import { type ActionCommand, useAppCommands } from "./appCommands";
 import type { CommandPaletteProps } from "./CommandPalette";
+import {
+  type CommandRegion,
+  commandTargetKey,
+  useCommandContext,
+  useCommandRegion,
+  useCommandRegionReader,
+} from "./commandContext";
+import {
+  currentPaletteCommand,
+  type PaletteCommandRow,
+  paletteCommandItems,
+} from "./paletteCommandRows";
 import { PaletteSessionContext } from "./PaletteSessionContext";
-import { type FeaturePaletteRow, useFeaturePaletteCommands } from "./useFeaturePaletteCommands";
 import { type PaletteSession, usePaletteSessionSearch } from "./usePaletteSessionSearch";
 
 type PaletteRow =
   | { kind: "session"; id: string }
   | { kind: "action"; action: ActionCommand }
-  | { kind: "feature"; row: FeaturePaletteRow }
+  | PaletteCommandRow
   | { kind: "more"; load: () => void; lastRowId: string | undefined };
 
 /** A blank icon slot, so session labels line up with the icon-prefixed actions. */
@@ -46,7 +60,26 @@ export function QuickPickCommandPalette({
     onToggleRightSidebar,
     rightSidebarShortcutEnabled,
   });
-  const featureCommands = useFeaturePaletteCommands(open && !sessionsOnly);
+  const featureGroups = usePaletteCommandsStore((state) => state.groups);
+  const context = useCommandContext();
+  // Only an open palette follows focus between regions; a closed one skips those renders.
+  const region = useCommandRegion(open);
+  const readRegion = useCommandRegionReader();
+  const targetKey = commandTargetKey(context, region);
+  const latestContext = useRef(context);
+  latestContext.current = context;
+  /** The command `item` runs now, with focus in `inRegion`, or null once it no longer applies. */
+  const currentCommand = (
+    item: QuickPickItem<PaletteRow>,
+    inRegion: CommandRegion | null = readRegion(),
+  ) =>
+    item.value.kind === "command"
+      ? currentPaletteCommand(item.id, item.value.targetKey, {
+          appCommands: [],
+          featureGroups: usePaletteCommandsStore.getState().groups,
+          targetKey: commandTargetKey(latestContext.current, inRegion),
+        })
+      : null;
   // Show more parks the selection on its group's last row, so the next ArrowDown
   // reaches the rows it loads; the user's next move clears it.
   const [parkedId, setParkedId] = useState<string | null>(null);
@@ -143,37 +176,46 @@ export function QuickPickCommandPalette({
       sourceId: "features",
       ranking: "client",
       fuzzyMatching: "words",
-      items: featureCommands.rows.map((row) => ({
-        id: `feature:${row.id}`,
-        label: row.label,
-        keywords: row.keywords,
-        group: row.heading,
-        icon: <row.icon />,
-        shortcut: row.shortcut,
-        disabledReason: row.disabledReason,
-        value: { kind: "feature", row },
-      })),
+      items: sessionsOnly
+        ? []
+        : paletteCommandItems([], featureGroups, targetKey)
+            // Rows that open a page of values or options wait until the palette has pages.
+            .filter((item) => !item.opensPage)
+            .map((item) => ({ ...item, matchHighlight: "underline" })),
     },
   ];
 
-  const accept = (item: QuickPickItem<PaletteRow>): void => {
+  const accept = (item: QuickPickItem<PaletteRow>): QuickPickAcceptResult => {
     const row = item.value;
     if (row.kind === "more") {
       setParkedId(row.lastRowId ?? null);
       row.load();
-      return;
+      return "keepOpen";
     }
-    if (row.kind === "feature") {
-      featureCommands.accept(row.row, close);
-      return;
-    }
-    close();
     if (row.kind === "action") {
       row.action.run();
-      return;
+      return undefined;
+    }
+    if (row.kind === "command") {
+      const command = currentCommand(item);
+      // A row withdrawn or built for another target since stays open, now showing what applies.
+      if (!command) return "keepOpen";
+      if (command.keepsPaletteOpen) {
+        command.run();
+        return "keepOpen";
+      }
+      // A command that moves focus runs once the palette has closed and restored it; it's read
+      // again then, in case the close changed what applies.
+      if (command.movesFocus) {
+        const acceptedIn = readRegion();
+        return { afterClose: () => currentCommand(item, acceptedIn)?.run() };
+      }
+      command.run();
+      return undefined;
     }
     search.rememberSearchRow(row.id);
     navigate(`/c/${row.id}`);
+    return undefined;
   };
 
   const label = sessionsOnly ? "Switch session" : "Command palette";
@@ -226,68 +268,46 @@ export function QuickPickCommandPalette({
   );
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent
-        aria-describedby={undefined}
-        className={cn(
-          "overflow-hidden p-0",
-          isMobile
-            ? "inset-x-0 top-0 h-full max-h-full w-full max-w-full translate-x-0 translate-y-0 gap-0 rounded-none border-0 shadow-none sm:max-w-full"
-            : "top-1/4 translate-y-0 rounded-xl sm:max-w-2xl",
-        )}
-        style={
-          isMobile
-            ? {
-                top: 0,
-                height: "var(--omnigent-viewport-height, 100dvh)",
-                maxHeight: "var(--omnigent-viewport-height, 100dvh)",
-                paddingTop: "var(--mac-titlebar-height, var(--omnigent-safe-top, 0px))",
-                paddingBottom: "var(--omnigent-safe-bottom, 0px)",
-              }
-            : undefined
-        }
-        showCloseButton={false}
-        onCloseAutoFocus={featureCommands.onCloseAutoFocus}
-      >
-        <DialogTitle className="sr-only">{label}</DialogTitle>
-        <QuickPick
-          label={label}
-          placeholder={
-            sessionsOnly ? "Search sessions by name…" : "Search sessions or run a command"
-          }
-          segments={segments}
-          query={query}
-          onQueryChange={(next) => {
-            setParkedId(null);
-            search.setQuery(next);
-          }}
-          onAccept={accept}
-          activeId={parkedId}
-          onActiveIdChange={() => setParkedId(null)}
-          inputTestId="command-palette-input"
-          // As in today's palette, a load error or loading message stands in for the empty one.
-          emptyMessage={
-            loadStatus ? null : search.searchFetching ? "Searching…" : "No results found"
-          }
-          status={status}
-          listEnd={olderSessions}
-          inputEnd={
-            isMobile && (
-              // The full-screen sheet has no ⌘K/Esc affordance, so touch users close it here.
-              <Button
-                variant="ghost"
-                size="icon-lg"
-                className="shrink-0 rounded-full"
-                onClick={close}
-                aria-label="Close search"
-              >
-                <XIcon className="size-5 text-muted-foreground" />
-              </Button>
-            )
-          }
-          fillHeight={isMobile}
-        />
-      </DialogContent>
-    </Dialog>
+    <QuickPickDialog
+      open={open}
+      onOpenChange={onOpenChange}
+      // The full-screen sheet fills the visible viewport, clear of the title bar and home bar.
+      contentClassName={
+        isMobile
+          ? "inset-x-0 top-0 flex h-(--omnigent-viewport-height,100dvh) max-h-(--omnigent-viewport-height,100dvh) w-full max-w-full translate-x-0 flex-col rounded-none border-0 pt-(--mac-titlebar-height,var(--omnigent-safe-top,0px)) pb-(--omnigent-safe-bottom,0px) shadow-none sm:max-w-full"
+          : "top-1/4 sm:max-w-2xl"
+      }
+      label={label}
+      placeholder={sessionsOnly ? "Search sessions by name…" : "Search sessions or run a command"}
+      segments={segments}
+      query={query}
+      onQueryChange={(next) => {
+        setParkedId(null);
+        search.setQuery(next);
+      }}
+      onAccept={accept}
+      activeId={parkedId}
+      onActiveIdChange={() => setParkedId(null)}
+      inputTestId="command-palette-input"
+      // As in today's palette, a load error or loading message stands in for the empty one.
+      emptyMessage={loadStatus ? null : search.searchFetching ? "Searching…" : "No results found"}
+      status={status}
+      listEnd={olderSessions}
+      inputEnd={
+        isMobile && (
+          // The full-screen sheet has no ⌘K/Esc affordance, so touch users close it here.
+          <Button
+            variant="ghost"
+            size="icon-lg"
+            className="shrink-0 rounded-full"
+            onClick={close}
+            aria-label="Close search"
+          >
+            <XIcon className="size-5 text-muted-foreground" />
+          </Button>
+        )
+      }
+      fillHeight={isMobile}
+    />
   );
 }
