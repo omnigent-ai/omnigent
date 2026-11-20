@@ -138,35 +138,35 @@ def test_owner_sees_session_under_my_sessions_with_enabled_actions(
 
 
 def test_owner_session_returns_to_my_sessions_after_brief_403_outage(
-    browser: Browser,
+    page: Page,
     multi_user_server: MultiUserServer,
 ) -> None:
     """A reload during a brief edge 403 outage must not hide owned sessions once access returns."""
     server = multi_user_server
     sid = server.session_id
-    with user_page(browser, headers={"X-Forwarded-Email": ADMIN_EMAIL}) as page:
-        page.goto(f"{server.public_url}/")
-        expect(_row(page, sid)).to_be_visible(timeout=30_000)
+    page.set_extra_http_headers({"X-Forwarded-Email": ADMIN_EMAIL})
+    page.goto(f"{server.public_url}/")
+    expect(_row(page, sid)).to_be_visible(timeout=30_000)
 
-        def deny(route: Route) -> None:
-            route.fulfill(status=403, content_type="application/json", body=_EDGE_DENIED_BODY)
+    def deny(route: Route) -> None:
+        route.fulfill(status=403, content_type="application/json", body=_EDGE_DENIED_BODY)
 
-        page.route(_API, deny)
-        page.reload()
-        load_error = page.get_by_role("status").filter(has_text="Failed to load")
-        expect(load_error).to_be_visible(timeout=30_000)
+    page.route(_API, deny)
+    page.reload()
+    load_error = page.get_by_role("status").filter(has_text="Failed to load")
+    expect(load_error).to_be_visible(timeout=30_000)
 
-        page.unroute(_API, deny)
-        load_error.get_by_role("button", name="Retry").click()
-        # Retry refetches only the session list; the identity retry restores ownership.
-        expect(_row(page, sid)).to_be_visible(timeout=60_000)
-        _open_row_menu(page, sid)
-        expect(page.get_by_test_id("rename-conversation")).not_to_have_attribute(
-            "data-disabled", re.compile(r".*")
-        )
-        expect(page.get_by_test_id("share-conversation")).not_to_have_attribute(
-            "data-disabled", re.compile(r".*")
-        )
+    page.unroute(_API, deny)
+    load_error.get_by_role("button", name="Retry").click()
+    # Retry refetches only the session list; the identity retry restores ownership.
+    expect(_row(page, sid)).to_be_visible(timeout=60_000)
+    _open_row_menu(page, sid)
+    expect(page.get_by_test_id("rename-conversation")).not_to_have_attribute(
+        "data-disabled", re.compile(r".*")
+    )
+    expect(page.get_by_test_id("share-conversation")).not_to_have_attribute(
+        "data-disabled", re.compile(r".*")
+    )
 
 
 @pytest.mark.flaky(reruns=2, reruns_delay=5)
