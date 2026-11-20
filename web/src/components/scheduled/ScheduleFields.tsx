@@ -25,7 +25,10 @@ import {
   minimumScheduleInterval,
   MIN_SUBHOUR_MINUTE_INTERVAL,
   formatUntil,
+  hourlyStep,
+  isReachableLastHour,
   parseUntil,
+  snapHourWindow,
   validateSchedule,
   WEEKDAY_CODES,
   type CustomFreq,
@@ -152,6 +155,7 @@ export function ScheduleFields({
   const minutely = model.preset === "custom" && model.customFreq === "minutely";
   const custom = model.preset === "custom" && (!minutely || customMinutes);
   const hourly = model.preset === "hourly" || (custom && model.customFreq === "hourly");
+  const step = hourlyStep(model);
   const weekly = model.preset === "weekly" || (custom && model.customFreq === "weekly");
   const monthDays = custom && (model.customFreq === "monthly" || model.customFreq === "yearly");
   let selectedFrequency: string = model.preset;
@@ -423,32 +427,14 @@ export function ScheduleFields({
           </>
         )}
         {weekly && (
-          <div className="flex min-w-0 items-center justify-between gap-3 py-3">
-            <span>On</span>
-            <ScheduleDaysPopover onOpenChange={onSelectOpenChange}>
-              <PopoverTrigger asChild>
-                <Button
-                  variant="outline"
-                  className={cn(
-                    inlineChoiceClass,
-                    "h-8 min-w-0 max-w-[85%] gap-2 px-2 font-normal",
-                    pickerTriggerClass,
-                  )}
-                  disabled={custom && !anchoredScheduling}
-                  aria-label="Days of the week"
-                >
-                  <span className="truncate">{weekdayLabel(model.weekdays)}</span>
-                  <ChevronDownIcon className="size-3.5" />
-                </Button>
-              </PopoverTrigger>
-              <PopoverContent align="end" className="w-auto max-w-[calc(100vw-2rem)] p-3">
-                <WeekdayButtons
-                  days={model.weekdays}
-                  onChange={(weekdays) => onChange({ ...model, weekdays })}
-                />
-              </PopoverContent>
-            </ScheduleDaysPopover>
-          </div>
+          <WeekdayPickerRow
+            ariaLabel="Days of the week"
+            label={weekdayLabel(model.weekdays)}
+            days={model.weekdays}
+            disabled={custom && !anchoredScheduling}
+            onChange={(weekdays) => onChange({ ...model, weekdays })}
+            onOpenChange={onSelectOpenChange}
+          />
         )}
         {monthDays && (
           <div className="flex min-w-0 items-center justify-between gap-3 py-3">
@@ -515,14 +501,16 @@ export function ScheduleFields({
                   className={inlineChoiceClass}
                   disabled={custom && !anchoredScheduling}
                   value={String(model.hourWindow.start)}
-                  options={hourOptions(model.minute)}
-                  onChange={(value) => {
-                    const start = Number(value);
+                  options={hourOptions(model.minute, (hour) => hour === 0 || hour + step <= 23)}
+                  onChange={(value) =>
                     onChange({
                       ...model,
-                      hourWindow: { start, end: Math.max(start, model.hourWindow.end) },
-                    });
-                  }}
+                      hourWindow: snapHourWindow(
+                        { start: Number(value), end: model.hourWindow.end },
+                        step,
+                      ),
+                    })
+                  }
                   onOpenChange={onSelectOpenChange}
                 />
                 <span>to</span>
@@ -532,7 +520,9 @@ export function ScheduleFields({
                   className={inlineChoiceClass}
                   disabled={custom && !anchoredScheduling}
                   value={String(model.hourWindow.end)}
-                  options={hourOptions(model.minute, model.hourWindow.start)}
+                  options={hourOptions(model.minute, (hour) =>
+                    isReachableLastHour(model.hourWindow.start, hour, step),
+                  )}
                   onChange={(value) =>
                     onChange({ ...model, hourWindow: { ...model.hourWindow, end: Number(value) } })
                   }
@@ -540,33 +530,15 @@ export function ScheduleFields({
                 />
               </div>
             </div>
-            <div className="flex min-w-0 items-center justify-between gap-3 py-3">
-              <span>On</span>
-              <ScheduleDaysPopover onOpenChange={onSelectOpenChange}>
-                <PopoverTrigger asChild>
-                  <Button
-                    variant="outline"
-                    className={cn(
-                      inlineChoiceClass,
-                      "h-8 min-w-0 max-w-[85%] gap-2 px-2 font-normal",
-                      pickerTriggerClass,
-                    )}
-                    disabled={custom && !anchoredScheduling}
-                    aria-label="Days to run"
-                    data-testid="schedule-hourly-days-trigger"
-                  >
-                    <span className="truncate">{hourlyDaysLabel(model.hourlyDays)}</span>
-                    <ChevronDownIcon className="size-3.5" />
-                  </Button>
-                </PopoverTrigger>
-                <PopoverContent align="end" className="w-auto max-w-[calc(100vw-2rem)] p-3">
-                  <WeekdayButtons
-                    days={model.hourlyDays}
-                    onChange={(hourlyDays) => onChange({ ...model, hourlyDays })}
-                  />
-                </PopoverContent>
-              </ScheduleDaysPopover>
-            </div>
+            <WeekdayPickerRow
+              ariaLabel="Days to run"
+              testId="schedule-hourly-days-trigger"
+              label={hourlyDaysLabel(model.hourlyDays)}
+              days={model.hourlyDays}
+              disabled={custom && !anchoredScheduling}
+              onChange={(hourlyDays) => onChange({ ...model, hourlyDays })}
+              onOpenChange={onSelectOpenChange}
+            />
           </>
         )}
         {!(custom && minutely) && (
@@ -885,14 +857,59 @@ function WeekdayButtons({
 /** Hour choices labelled with the run time they produce, e.g. "9:30 AM". */
 function hourOptions(
   minute: number,
-  earliest = 0,
+  enabled: (hour: number) => boolean,
 ): { value: string; label: string; disabled?: boolean }[] {
   const shownMinute = Number.isInteger(minute) && minute >= 0 && minute <= 59 ? minute : 0;
   return Array.from({ length: 24 }, (_, hour) => ({
     value: String(hour),
     label: formatClockTime(hour, shownMinute),
-    disabled: hour < earliest,
+    disabled: !enabled(hour),
   }));
+}
+
+function WeekdayPickerRow({
+  ariaLabel,
+  testId,
+  label,
+  days,
+  disabled,
+  onChange,
+  onOpenChange,
+}: {
+  ariaLabel: string;
+  testId?: string;
+  label: string;
+  days: WeekdayCode[];
+  disabled: boolean;
+  onChange: (days: WeekdayCode[]) => void;
+  onOpenChange?: (open: boolean) => void;
+}) {
+  return (
+    <div className="flex min-w-0 items-center justify-between gap-3 py-3">
+      <span>On</span>
+      <ScheduleDaysPopover onOpenChange={onOpenChange}>
+        <PopoverTrigger asChild>
+          <Button
+            variant="outline"
+            className={cn(
+              inlineChoiceClass,
+              "h-8 min-w-0 max-w-[85%] gap-2 px-2 font-normal",
+              pickerTriggerClass,
+            )}
+            disabled={disabled}
+            aria-label={ariaLabel}
+            data-testid={testId}
+          >
+            <span className="truncate">{label}</span>
+            <ChevronDownIcon className="size-3.5" />
+          </Button>
+        </PopoverTrigger>
+        <PopoverContent align="end" className="w-auto max-w-[calc(100vw-2rem)] p-3">
+          <WeekdayButtons days={days} onChange={onChange} />
+        </PopoverContent>
+      </ScheduleDaysPopover>
+    </div>
+  );
 }
 
 function hourlyDaysLabel(days: WeekdayCode[]): string {

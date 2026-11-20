@@ -2122,6 +2122,37 @@ describe("CreateScheduledTaskDialog submit", () => {
     );
   });
 
+  it("keeps a custom hourly window's last hour on the interval", async () => {
+    renderDialog();
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "T" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "P" } });
+    selectSchedulePreset("Custom schedule");
+    fireEvent.keyDown(screen.getByLabelText("Repeat unit"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Hourly" }));
+    fireEvent.change(screen.getByTestId("custom-interval"), { target: { value: "3" } });
+    fireEvent.keyDown(screen.getByLabelText("First run hour"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "9:00 AM" }));
+    // 11 PM is not on the 3-hour step from 9 AM, so the last run moves to 9 PM.
+    expect(screen.getByLabelText("Last run hour")).toHaveTextContent("9:00 PM");
+    fireEvent.keyDown(screen.getByLabelText("Last run hour"), { key: "Enter" });
+    expect(await screen.findByRole("option", { name: "10:00 AM" })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+    fireEvent.click(screen.getByRole("option", { name: "3:00 PM" }));
+    expect(screen.getByTestId("task-schedule-trigger")).toHaveTextContent(
+      "Every 3 hours from 9:00 AM to 3:00 PM",
+    );
+    fireEvent.change(screen.getByTestId("custom-interval"), { target: { value: "4" } });
+    expect(screen.getByTestId("schedule-error")).toHaveTextContent(
+      "Choose a last run hour a whole number of intervals after the first.",
+    );
+    fireEvent.change(screen.getByTestId("custom-interval"), { target: { value: "3" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0].rrule).toBe("FREQ=HOURLY;BYHOUR=9,12,15;BYMINUTE=0");
+  });
+
   it("requires at least one day for an hourly schedule", async () => {
     renderDialog();
     fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "T" } });

@@ -393,9 +393,9 @@ export function describeSchedule(rrule: string, timezone?: string): string {
   if (o.freq === RRule.HOURLY) {
     // Time-of-day is meaningless hourly; show the minute offset instead.
     const min = `:${minute.toString().padStart(2, "0")}`;
-    // Hours combined with an interval depend on the rule's anchor; restate the rule.
+    // BYHOUR with an interval or several minutes isn't summarized; defer to the library.
     if (normalizeNums(o.byhour).length > 0) return libraryText(rule, rrule);
-    const on = days.length > 0 ? ` on ${weekdayPhrase(days)}` : "";
+    const on = onDaysSuffix(days);
     if (interval > 1) return `Every ${interval} hours at ${min}${on}`;
     // interval 1: bare "Hourly" only when it fires on the hour; otherwise show
     // the non-zero BYMINUTE so ":30" isn't silently dropped.
@@ -468,16 +468,15 @@ function hourWindowText(o: RRule["origOptions"], days: number[], interval: numbe
     hours.length === 1 || hours.some((hour, index) => hour !== hours[0]! + index * step)
       ? `at ${joinList(hours.map((hour) => formatClockTime(hour, minute)))}`
       : `${step === 1 ? "Hourly" : `Every ${step} hours`} from ${formatClockTime(hours[0]!, minute)} to ${formatClockTime(hours[hours.length - 1]!, minute)}`;
-  const on = days.length > 0 && !sameSet(days, ALL_DAYS) ? ` on ${weekdayPhrase(days)}` : "";
-  return capitalize(times) + on;
+  return capitalize(times) + onDaysSuffix(days);
 }
 
-/** "weekdays", "weekends" or the named days, for a phrase like "Hourly on …". */
-function weekdayPhrase(days: number[]): string {
-  if (sameSet(days, WEEKDAYS)) return "weekdays";
-  if (sameSet(days, [RRule.SA.weekday, RRule.SU.weekday])) return "weekends";
-  if (sameSet(days, ALL_DAYS)) return "every day";
-  return dayLabelList(days);
+/** " on weekdays", " on weekends" or " on <days>"; empty when every day runs. */
+function onDaysSuffix(days: number[]): string {
+  if (days.length === 0 || sameSet(days, ALL_DAYS)) return "";
+  if (sameSet(days, WEEKDAYS)) return " on weekdays";
+  if (sameSet(days, [RRule.SA.weekday, RRule.SU.weekday])) return " on weekends";
+  return ` on ${dayLabelList(days)}`;
 }
 
 /** Weekday-set phrasing for the interval-1 weekly case (with shorthands). */

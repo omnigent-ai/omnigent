@@ -9,7 +9,9 @@ import { describe, expect, it } from "vitest";
 import {
   buildRRule,
   DEFAULT_SCHEDULE_MODEL,
+  isReachableLastHour,
   parseRRuleToScheduleModel,
+  snapHourWindow,
   type ScheduleModel,
   validateSchedule,
   parseUntil,
@@ -167,7 +169,7 @@ describe("hourly schedules limited to hours and days", () => {
         customFreq: "hourly",
         interval: 3,
         minute: 15,
-        hourWindow: { start: 8, end: 18 },
+        hourWindow: { start: 8, end: 17 },
       }),
     );
     expect(rule).toBe("FREQ=HOURLY;BYHOUR=8,11,14,17;BYMINUTE=15");
@@ -233,18 +235,59 @@ describe("hourly schedules limited to hours and days", () => {
     "FREQ=WEEKLY;BYHOUR=9,10;BYMINUTE=0",
     "FREQ=HOURLY;BYHOUR=9,24;BYMINUTE=0",
     "FREQ=HOURLY;BYDAY=1MO;BYMINUTE=0",
+    // Twice a day at midnight and 11 PM; the full-day window would mean every 23 hours.
+    "FREQ=HOURLY;BYHOUR=0,23;BYMINUTE=0",
+    "FREQ=DAILY;BYHOUR=0,23;BYMINUTE=0",
+    "FREQ=WEEKLY;BYDAY=MO,FR;BYHOUR=0,23;BYMINUTE=0",
+    // One hour a day is a daily schedule, not an hourly window.
+    "FREQ=HOURLY;BYHOUR=9;BYMINUTE=0",
   ])("leaves rules without a visual equivalent unsupported: %s", (rule) => {
     expect(parseRRuleToScheduleModel(rule)).toBeNull();
   });
 
   it("validates the window and days", () => {
     expect(validateSchedule(businessHours)).toBeNull();
-    expect(validateSchedule({ ...businessHours, hourWindow: { start: 17, end: 9 } })).toBe(
-      "Choose an end hour at or after the start hour.",
-    );
+    for (const hourWindow of [
+      { start: 17, end: 9 },
+      { start: 9, end: 9 },
+    ])
+      expect(validateSchedule({ ...businessHours, hourWindow })).toBe(
+        "Choose a last run hour after the first run hour.",
+      );
+    const everyThreeHours = { ...businessHours, preset: "custom", customFreq: "hourly" } as const;
+    expect(
+      validateSchedule({ ...everyThreeHours, interval: 3, hourWindow: { start: 9, end: 15 } }),
+    ).toBeNull();
+    for (const end of [10, 16])
+      expect(
+        validateSchedule({ ...everyThreeHours, interval: 3, hourWindow: { start: 9, end } }),
+      ).toBe("Choose a last run hour a whole number of intervals after the first.");
+    // 12 AM to 11 PM means no hour limit, whatever the interval.
+    expect(
+      validateSchedule({ ...everyThreeHours, interval: 5, hourWindow: { start: 0, end: 23 } }),
+    ).toBeNull();
     expect(validateSchedule({ ...businessHours, hourlyDays: [] })).toBe(
       "Pick at least one day of the week.",
     );
+  });
+});
+
+describe("hour window steps", () => {
+  it("accepts last hours at least one step after the first, on the step", () => {
+    expect(isReachableLastHour(9, 17, 1)).toBe(true);
+    expect(isReachableLastHour(9, 9, 1)).toBe(false);
+    expect(isReachableLastHour(9, 15, 3)).toBe(true);
+    expect(isReachableLastHour(9, 16, 3)).toBe(false);
+    expect(isReachableLastHour(0, 23, 5)).toBe(true);
+  });
+
+  it("moves the last hour onto the step when the first hour changes", () => {
+    expect(snapHourWindow({ start: 9, end: 17 }, 1)).toEqual({ start: 9, end: 17 });
+    expect(snapHourWindow({ start: 9, end: 16 }, 2)).toEqual({ start: 9, end: 15 });
+    expect(snapHourWindow({ start: 18, end: 17 }, 1)).toEqual({ start: 18, end: 19 });
+    expect(snapHourWindow({ start: 0, end: 23 }, 5)).toEqual({ start: 0, end: 23 });
+    // No reachable last hour remains; validation reports it.
+    expect(snapHourWindow({ start: 22, end: 17 }, 3)).toEqual({ start: 22, end: 22 });
   });
 });
 

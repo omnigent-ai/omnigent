@@ -146,6 +146,10 @@ to customize.
   expose it beside the end date only when Ends is On date.
   Interval is the first option and needs no popup or Apply step.
   Hourly schedules accept a typed minute from 0 to 59 directly in the Time row.
+  Every hour and Custom hourly schedules also have Hours (first and last run hour)
+  and On (days to run) rows. A limited window saves explicit BYHOUR values; the last
+  hour must be a whole number of intervals after the first. Agent-written equivalent
+  WEEKLY/DAILY hour lists open in these controls; uneven or overnight hours stay unsupported.
   Weekly schedules have a separate On row for their weekday selector.
   Custom schedule expands inline into Repeats, Every, On (for weekly/monthly/yearly),
   Month (yearly), and Start time rows. Changes apply to the form immediately;

@@ -304,6 +304,11 @@ describe("describeSchedule", () => {
     expect(describeSchedule("FREQ=HOURLY;INTERVAL=2;BYDAY=MO;BYMINUTE=0")).toBe(
       "Every 2 hours at :00 on Monday",
     );
+    const everyDay = "BYDAY=MO,TU,WE,TH,FR,SA,SU";
+    expect(describeSchedule(`FREQ=HOURLY;${everyDay};BYMINUTE=0`)).toBe("Hourly");
+    expect(describeSchedule(`FREQ=HOURLY;INTERVAL=2;${everyDay};BYMINUTE=0`)).toBe(
+      "Every 2 hours at :00",
+    );
   });
 
   it("renders interval daily / weekly", () => {

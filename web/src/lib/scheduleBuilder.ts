@@ -283,6 +283,27 @@ export function hasHourWindow(model: ScheduleModel): boolean {
   return model.hourWindow.start !== 0 || model.hourWindow.end !== 23;
 }
 
+/** Hours between runs inside an hourly window; 1 while the interval is unset. */
+export function hourlyStep(model: ScheduleModel): number {
+  if (model.preset !== "custom") return 1;
+  return Number.isInteger(model.interval) && model.interval >= 1 ? model.interval : 1;
+}
+
+/** Whether `hour` can end a window starting at `start`: at least two runs, on the step.
+ * 11 PM also ends the all-day window, which means no hour limit. */
+export function isReachableLastHour(start: number, hour: number, step: number): boolean {
+  if (start === 0 && hour === 23) return true;
+  return hour >= start + step && (hour - start) % step === 0;
+}
+
+/** Move a window's last hour onto the step after its first hour changes. */
+export function snapHourWindow(window: HourWindow, step: number): HourWindow {
+  const { start, end } = window;
+  if (isReachableLastHour(start, end, step)) return window;
+  const snapped = start + Math.max(1, Math.floor((end - start) / step)) * step;
+  return { start, end: snapped <= 23 ? snapped : Math.max(start, end) };
+}
+
 /** Whether an hourly schedule runs only on some days of the week. */
 export function hasHourlyDays(model: ScheduleModel): boolean {
   return normalizeWeekdays(model.hourlyDays).length !== WEEKDAY_CODES.length;
@@ -321,12 +342,14 @@ function parseHourlyFilters(
     .map((hour) => parseNumberPart(hour, 0, 23));
   if (hours.some((hour) => hour === null)) return null;
   const sorted = [...new Set(hours as number[])].sort((a, b) => a - b);
-  const step = sorted.length > 1 ? sorted[1] - sorted[0] : 1;
+  // A window runs at least twice a day.
+  if (sorted.length < 2) return null;
+  const step = sorted[1] - sorted[0];
   if (sorted.some((hour, index) => hour !== sorted[0] + index * step)) return null;
   const hourWindow = { start: sorted[0], end: sorted[sorted.length - 1] };
-  // Every hour of the day is the same schedule as no hour limit.
-  if (step === 1 && hourWindow.start === 0 && hourWindow.end === 23)
-    return { hourWindow: ALL_DAY_HOURS, hourlyDays, step };
+  // 12 AM to 11 PM means no hour limit, so only every hour has the same schedule.
+  if (hourWindow.start === 0 && hourWindow.end === 23)
+    return step === 1 ? { hourWindow: ALL_DAY_HOURS, hourlyDays, step } : null;
   return { hourWindow, hourlyDays, step };
 }
 
@@ -409,7 +432,9 @@ export function validateSchedule(
     const { start, end } = model.hourWindow;
     if (![start, end].every((hour) => Number.isInteger(hour) && hour >= 0 && hour <= 23))
       return "Choose valid hours.";
-    if (end < start) return "Choose an end hour at or after the start hour.";
+    if (end <= start) return "Choose a last run hour after the first run hour.";
+    if (!isReachableLastHour(start, end, hourlyStep(model)))
+      return "Choose a last run hour a whole number of intervals after the first.";
     if (model.hourlyDays.length === 0) return "Pick at least one day of the week.";
   }
 
