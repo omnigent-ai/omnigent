@@ -3107,6 +3107,11 @@ async def _deliver_answer_to_stopped_session(
                 conversation_store=conversation_store,
                 runner_exit_reports=runner_exit_reports,
             )
+        after = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
+        if after is None or after[1].get("params") != params:
+            # Resolved elsewhere or asked again during the read: the caller resolves it.
+            _stopped_session_answers.pop(key, None)
+            return None
     # Check the runner on a first answer or under the same runner id; a new runner never asked.
     if record is None or record.runner_id == conv.runner_id:
         hook_can_take = await _session_runner_reachable(

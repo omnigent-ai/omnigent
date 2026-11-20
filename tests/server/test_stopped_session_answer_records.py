@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from collections.abc import Awaitable, Callable, Iterator
 from types import SimpleNamespace
@@ -351,8 +352,6 @@ async def test_two_retries_across_the_host_lookup_deliver_one_message(
     question: _Question, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Two retries that both wait on the host lookup of a side chat still send one message."""
-    import threading
-
     question.conv.host_id = None
     question.conv.runner_id = "runner_new"
     orchestration._stopped_session_answers[question.key] = orchestration._StoppedSessionAnswer(
@@ -360,10 +359,11 @@ async def test_two_retries_across_the_host_lookup_deliver_one_message(
         fingerprint=orchestration._harness_elicitation_fingerprint_or_none(_question_params()),
         runner_id="runner_old",
     )
-    release, waiting = threading.Event(), [0]
+    release, lock, waiting = threading.Event(), threading.Lock(), [0]
 
     def _gated_host(conv: object, store: object) -> str:
-        waiting[0] += 1
+        with lock:
+            waiting[0] += 1
         release.wait(5.0)
         return "host_parent"
 
@@ -379,6 +379,39 @@ async def test_two_retries_across_the_host_lookup_deliver_one_message(
 
     assert await asyncio.wait_for(asyncio.gather(*answers), 5.0) == [{"queued": True}] * 2
     assert len(question.posts) == 1
+
+
+async def test_a_retry_whose_question_is_answered_during_the_host_lookup_is_not_sent(
+    question: _Question, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A question answered at its hook while a side chat's host lookup runs is not sent again."""
+    question.conv.host_id = None
+    question.conv.runner_id = "runner_new"
+    orchestration._stopped_session_answers[question.key] = orchestration._StoppedSessionAnswer(
+        started_at=time.time(),
+        fingerprint=orchestration._harness_elicitation_fingerprint_or_none(_question_params()),
+        runner_id="runner_old",
+    )
+    entered, release = threading.Event(), threading.Event()
+
+    def _gated_host(conv: object, store: object) -> str:
+        entered.set()
+        release.wait(5.0)
+        return "host_parent"
+
+    monkeypatch.setattr(orchestration, "routing_host_id", _gated_host)
+    post_event, _reached, post_release = _gated_post_event(question, [{"queued": True}])
+    post_release.set()
+    answer = question.answer(post_event, conversation_store=_Rows(question.conv))
+    try:
+        await poll_until_async(entered.is_set, timeout_s=5.0, interval_s=0.01)
+        pending_elicitations.resolve(question.session_id, question.elicitation_id)
+    finally:
+        release.set()
+
+    assert await asyncio.wait_for(answer, 5.0) is None
+    assert question.posts == []
+    assert orchestration._stopped_session_answers.get(question.key) is None
 
 
 async def test_a_denied_answer_keeps_the_question_open(question: _Question) -> None:
