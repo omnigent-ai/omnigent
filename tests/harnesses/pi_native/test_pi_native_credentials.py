@@ -4606,7 +4606,9 @@ def test_fetch_pi_model_lists_marks_catalog_reasoning_models(
     assert "reasoning" not in by_id["system.ai.llama-4-maverick"]
 
 
-@pytest.mark.parametrize("outcome", ["timeout", "cancelled", "shell_parent", "output_limit", "ok"])
+@pytest.mark.parametrize(
+    "outcome", ["timeout", "cancelled", "shell_parent", "output_limit", "ok", "retried"]
+)
 def test_native_token_helper_reaps_its_process_group(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
 ) -> None:
@@ -4630,6 +4632,13 @@ def test_native_token_helper_reaps_its_process_group(
     if outcome == "ok":
         command += (
             f" >/dev/null & while [ ! -f {shlex.quote(str(pid_file))} ]; do sleep 0.02; done;"
+            " printf private-token"
+        )
+    elif outcome == "retried":
+        marker = shlex.quote(str(tmp_path / "attempted"))
+        command = (
+            f"if [ ! -f {marker} ]; then : > {marker}; {command} >/dev/null &"
+            f" while [ ! -f {shlex.quote(str(pid_file))} ]; do sleep 0.02; done; exit 1; fi;"
             " printf private-token"
         )
     else:
@@ -4656,8 +4665,8 @@ def test_native_token_helper_reaps_its_process_group(
             assert process.returncode != 0
             assert time.monotonic() - started < 6
         else:
-            assert process.returncode == (0 if outcome == "ok" else 1)
-        assert stdout == (b"private-token" if outcome == "ok" else b"")
+            assert process.returncode == (0 if outcome in ("ok", "retried") else 1)
+        assert stdout == (b"private-token" if outcome in ("ok", "retried") else b"")
         pid = int(pid_file.read_text())
         deadline = time.monotonic() + 2
         while process_alive(pid) and time.monotonic() < deadline:
@@ -4667,7 +4676,7 @@ def test_native_token_helper_reaps_its_process_group(
         if outcome == "shell_parent":
             assert kind in ("timeout", "cancelled")
         else:
-            assert kind == outcome
+            assert kind == ("ok" if outcome == "retried" else outcome)
     finally:
         if process.poll() is None:
             process.terminate()
