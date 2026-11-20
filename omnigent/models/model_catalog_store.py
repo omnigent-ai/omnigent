@@ -196,18 +196,23 @@ async def ensure_catalog(
     harness: str,
     fingerprint: str,
     resolve: Callable[[], Awaitable[list[dict[str, Any]] | None]],
+    *,
+    is_fingerprint_current: Callable[[], bool] | None = None,
 ) -> list[dict[str, Any]] | None:
     """Store-first catalog access with a single probe in flight per key.
 
     A hit serves immediately; a miss runs *resolve* once (concurrent
     callers join it), persists a successful answer even when empty, and
-    returns it. A hit older than :data:`CATALOG_STALE_AFTER_S` still serves
-    immediately but kicks *resolve* in the background so the store converges.
+    returns it, or a fresh catalog published by another process while waiting.
+    A hit older than :data:`CATALOG_STALE_AFTER_S` still serves immediately
+    but kicks *resolve* in the background so the store converges.
     The probe's own budgets bound the background work.
 
     :param harness: Canonical harness name.
     :param fingerprint: The launch-config fingerprint.
     :param resolve: Probe coroutine factory producing verbatim rows.
+    :param is_fingerprint_current: Validate a publication found while waiting;
+        if false, await the original local probe instead.
     :returns: Catalog rows, or ``None`` when no catalog could be obtained.
     """
     cached = read_catalog(harness, fingerprint)
@@ -229,8 +234,18 @@ async def ensure_catalog(
             return rows
 
         task = asyncio.create_task(_run(), name=f"model-catalog-{harness}")
+        # All waiters may leave before the probe fails, including on a disk hit.
+        task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
         _inflight[key] = task
-    return await asyncio.shield(task)
+    while True:
+        done, _ = await asyncio.wait({task}, timeout=0.05)
+        if done:
+            return task.result()
+        cached = read_catalog(harness, fingerprint)
+        if cached is not None and not catalog_is_stale(harness, fingerprint):
+            if is_fingerprint_current is not None and not is_fingerprint_current():
+                return await asyncio.shield(task)
+            return cached
 
 
 def _refresh_in_background(
