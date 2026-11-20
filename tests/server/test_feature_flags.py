@@ -23,12 +23,19 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
 
     assert flags.enabled_features == frozenset(
         {
+            Feature.AUTOMATIONS,
+            Feature.AUTOMATIONS_V2,
             Feature.CLAUDE_OSC_STATUS,
             Feature.CODEX_PLAN_AT_LAUNCH,
-            Feature.CUSTOM_AGENTS_SETTINGS_UI,
+            Feature.GRID_SESSIONS_DISPLAY_UI,
             Feature.PEER_SESSION_MESSAGING,
+            Feature.PROJECT_KANBAN,
+            Feature.PROJECT_REPOSITORY_CREATION,
             Feature.SESSION_ORCHESTRATION,
+            Feature.SIBLING_SESSIONS,
             Feature.SIDEBAR_GROUPING_UI,
+            Feature.USER_INBOX,
+            Feature.WORKSPACE_CONTENT_SEARCH,
         }
     )
     assert flags.frontend_dict() == {
@@ -36,18 +43,24 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "usage_page": False,
         "harness_install": False,
         "canvas": False,
-        "arca_shutdown_warnings": False,
         "import_review": False,
-        "custom_agents_settings_ui": True,
         "sidebar_grouping_ui": True,
-        "workspace_content_search": False,
-        "grid_sessions_display_ui": False,
-        "automations_v2": False,
+        "workspace_content_search": True,
+        "grid_sessions_display_ui": True,
+        "automations_v2": True,
         "splittable_terminal_view_ui": False,
         "sidebar_windowed_rows": False,
+        "chat_composer_codemirror": False,
+        "workflows": False,
+        "session_overview": False,
+        "project_kanban": True,
+        "project_repository_creation": True,
+        "quick_pick_palette": False,
         "session_orchestration": True,
-        "sibling_sessions": False,
+        "sibling_sessions": True,
         "codex_plan_at_launch": True,
+        "workspace_direct_access": False,
+        "workspace_api_server_access": False,
     }
 
 
@@ -57,14 +70,21 @@ def test_resolves_comma_separated_enabled_set() -> None:
     assert flags.enabled(Feature.USAGE_PAGE)
     assert flags.enabled(Feature.HARNESS_INSTALL)
     assert flags.enabled_names() == (
+        "automations",
+        "automations_v2",
         "claude_osc_status",
         "codex_plan_at_launch",
-        "custom_agents_settings_ui",
+        "grid_sessions_display_ui",
         "harness_install",
         "peer_session_messaging",
+        "project_kanban",
+        "project_repository_creation",
         "session_orchestration",
+        "sibling_sessions",
         "sidebar_grouping_ui",
         "usage_page",
+        "user_inbox",
+        "workspace_content_search",
     )
 
 
@@ -79,11 +99,18 @@ def test_resolves_comma_separated_enabled_set() -> None:
 @pytest.mark.parametrize(
     "feature",
     [
+        "automations",
+        "automations_v2",
         "claude_osc_status",
-        "custom_agents_settings_ui",
+        "grid_sessions_display_ui",
         "peer_session_messaging",
+        "project_kanban",
+        "project_repository_creation",
         "session_orchestration",
+        "sibling_sessions",
         "sidebar_grouping_ui",
+        "user_inbox",
+        "workspace_content_search",
     ],
 )
 def test_explicit_disable_wins_and_preserves_other_features(override: str, feature: str) -> None:
@@ -91,28 +118,53 @@ def test_explicit_disable_wins_and_preserves_other_features(override: str, featu
     flags = resolve_feature_flags({FEATURES_ENV_VAR: f"usage_page,{features}"})
 
     assert set(flags.enabled_names()) == {
+        "automations",
+        "automations_v2",
         "claude_osc_status",
         "codex_plan_at_launch",
-        "custom_agents_settings_ui",
+        "grid_sessions_display_ui",
         "peer_session_messaging",
+        "project_kanban",
+        "project_repository_creation",
         "session_orchestration",
+        "sibling_sessions",
         "sidebar_grouping_ui",
         "usage_page",
+        "user_inbox",
+        "workspace_content_search",
     } - {feature}
 
 
-@pytest.mark.parametrize("feature", ["usage_page", "sibling_sessions"])
+@pytest.mark.parametrize("feature", ["usage_page", "canvas"])
 def test_default_off_features_can_also_be_explicitly_disabled(feature: str) -> None:
     flags = resolve_feature_flags({FEATURES_ENV_VAR: f"{feature},-{feature}"})
 
     assert flags.enabled_names() == (
+        "automations",
+        "automations_v2",
         "claude_osc_status",
         "codex_plan_at_launch",
-        "custom_agents_settings_ui",
+        "grid_sessions_display_ui",
         "peer_session_messaging",
+        "project_kanban",
+        "project_repository_creation",
         "session_orchestration",
+        "sibling_sessions",
         "sidebar_grouping_ui",
+        "user_inbox",
+        "workspace_content_search",
     )
+
+
+@pytest.mark.parametrize("override", ["custom_agents_settings_ui", "-custom_agents_settings_ui"])
+def test_retired_feature_is_ignored_with_warning(
+    override: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING):
+        flags = resolve_feature_flags({FEATURES_ENV_VAR: f"usage_page,{override}"})
+
+    assert flags == resolve_feature_flags({FEATURES_ENV_VAR: "usage_page"})
+    assert f"{override} has been retired" in caplog.text
 
 
 def test_removed_harness_install_variable_fails_with_migration_hint() -> None:
@@ -132,32 +184,41 @@ def test_canvas_is_a_frontend_visible_feature() -> None:
     assert flags.enabled(Feature.CANVAS)
     assert flags.frontend_dict()["canvas"] is True
     assert flags.enabled_names() == (
+        "automations",
+        "automations_v2",
         "canvas",
         "claude_osc_status",
         "codex_plan_at_launch",
-        "custom_agents_settings_ui",
+        "grid_sessions_display_ui",
         "peer_session_messaging",
+        "project_kanban",
+        "project_repository_creation",
         "session_orchestration",
+        "sibling_sessions",
         "sidebar_grouping_ui",
+        "user_inbox",
+        "workspace_content_search",
     )
 
 
-def test_arca_shutdown_warnings_are_frontend_visible() -> None:
-    flags = resolve_feature_flags({FEATURES_ENV_VAR: "arca_shutdown_warnings"})
+def test_chat_composer_codemirror_is_an_opt_in_frontend_feature() -> None:
+    assert not resolve_feature_flags({}).enabled(Feature.CHAT_COMPOSER_CODEMIRROR)
 
-    assert flags.enabled(Feature.ARCA_SHUTDOWN_WARNINGS)
-    assert flags.frontend_dict()["arca_shutdown_warnings"] is True
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "chat_composer_codemirror"})
+
+    assert flags.enabled(Feature.CHAT_COMPOSER_CODEMIRROR)
+    assert flags.frontend_dict()["chat_composer_codemirror"] is True
 
 
-def test_sibling_sessions_can_be_enabled_without_other_opt_in_features() -> None:
+def test_sibling_sessions_explicit_enable_preserves_default_features() -> None:
     flags = resolve_feature_flags({FEATURES_ENV_VAR: "sibling_sessions"})
-    assert flags.enabled_features == resolve_feature_flags({}).enabled_features | {
-        Feature.SIBLING_SESSIONS
-    }
+    assert flags.enabled_features == resolve_feature_flags({}).enabled_features
     assert flags.frontend_dict()["sibling_sessions"] is True
 
 
-@pytest.mark.parametrize("feature", [Feature.CLAUDE_OSC_STATUS, Feature.PEER_SESSION_MESSAGING])
+@pytest.mark.parametrize(
+    "feature", [Feature.AUTOMATIONS, Feature.CLAUDE_OSC_STATUS, Feature.PEER_SESSION_MESSAGING]
+)
 def test_backend_features_are_not_frontend_visible(feature: Feature) -> None:
     flags = resolve_feature_flags({FEATURES_ENV_VAR: feature.value})
 
@@ -253,3 +314,9 @@ def test_mcp_harness_feature_mapping_is_complete():
     from omnigent.server.feature_flags import MCP_DISABLED_SERVERS_HARNESS_FEATURES
 
     assert MCP_DISABLED_SERVERS_HARNESS_FEATURES.keys() == HARNESS_EXECUTORS.keys()
+
+
+def test_memory_is_opt_in_and_backend_only() -> None:
+    assert not resolve_feature_flags({}).enabled(Feature.MEMORY)
+    assert resolve_feature_flags({FEATURES_ENV_VAR: "memory"}).enabled(Feature.MEMORY)
+    assert "memory" not in resolve_feature_flags({FEATURES_ENV_VAR: "memory"}).frontend_dict()

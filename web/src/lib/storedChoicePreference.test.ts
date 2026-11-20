@@ -28,7 +28,7 @@ it("stores only a non-default choice and reads only the listed choices", () => {
   preference.write("large");
   expect(localStorage.getItem(STORAGE_KEY)).toBe("large");
 
-  preference.write("medium");
+  expect(preference.write("medium")).toBe(true);
   expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
 });
 
@@ -51,9 +51,9 @@ it("keeps the stored choice when saving or removing another fails", () => {
   vi.spyOn(Storage.prototype, "removeItem").mockImplementation(() => {
     throw new Error("access denied");
   });
-  expect(() => preference.write("small")).not.toThrow();
+  expect(preference.write("small")).toBe(false);
   expect(preference.read()).toBe("large");
-  expect(() => preference.write("medium")).not.toThrow();
+  expect(preference.write("medium")).toBe(false);
   expect(preference.read()).toBe("large");
 });
 

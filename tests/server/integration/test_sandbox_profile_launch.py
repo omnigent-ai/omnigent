@@ -15,6 +15,7 @@ import pytest
 from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient, Response
 
+from omnigent.entities import MessageData, NewConversationItem
 from omnigent.host.frames import HostHelloFrame
 from omnigent.onboarding.sandboxes.profiles import (
     SandboxProfileAccessDenied,
@@ -89,6 +90,9 @@ async def test_unprofiled_session_survives_provider_opt_in(env, controller, oper
     session_id = await env.settled(await env.create("json"))
     before = env.conversations.get_conversation(session_id)
     assert env.recording.allocations == [None]
+    # A long-lived host accumulates many older unprofiled sessions.
+    for _ in range(250):
+        env.conversations.create_conversation(host_id=before.host_id, workspace="/workspace")
 
     env.app.state.feature_flags = FeatureFlags(frozenset({Feature.SANDBOX_PROFILES}))
     env.app.state.sandbox_config = ManagedSandboxDeployment.single(enabled_config)
@@ -238,24 +242,11 @@ async def test_default_profile_is_authorized_like_an_explicit_selection(env):
     assert env.recording.allocations == []
 
 
-@pytest.mark.parametrize(
-    ("env", "reset"),
-    [
-        ("provider", "repo-change"),
-        ("controller", "repo-change"),
-        ("controller", "deleted-session"),
-        ("provider", "revoked"),
-        ("controller", "revoked"),
-    ],
-    indirect=["env"],
-)
-async def test_scheduled_sandbox_preserves_its_default_profile_after_reset(env, reset, db_uri):
-    _with_default_profile(env, "build")
+async def _first_continue_fire(env: _Env, db_uri: str) -> tuple[FireDeps, Any, str, str]:
+    """Fire a new continue automation once; return its deps, task, session, and host."""
     response = await env.client.post("/v1/sessions", json={"agent_id": env.agent_id})
     assert response.status_code == 201, response.text
     session_id = response.json()["id"]
-    conversation = env.conversations.get_conversation(session_id)
-    assert conversation is not None
     schedules = SqlAlchemyScheduledTaskStore(db_uri)
     deps = FireDeps(
         scheduled_task_store=schedules,
@@ -281,13 +272,37 @@ async def test_scheduled_sandbox_preserves_its_default_profile_after_reset(env, 
     )
     env.conversations.set_labels(session_id, _session_labels(task))
     host_id = continued_sandbox_host_id(task.id, task.workspace_id)
+    launch = await _fire_session(env, deps, task, session_id, host_id)
+    assert launch.error is None, launch.error
+    return deps, task, session_id, host_id
+
+
+async def _fire_session(env: _Env, deps: FireDeps, task: Any, session_id: str, host_id: str):
+    conversation = env.conversations.get_conversation(session_id)
+    assert conversation is not None
     launching = _make_managed_sandbox_start(deps)(
         conversation, task, host_id, _STAGED_LAUNCH_ERRORS
     )
     launch = env.app.state.managed_launches.get(session_id)
     assert launch is not None
     await asyncio.wait_for(launching, timeout=10)
-    assert launch.error is None, launch.error
+    return launch
+
+
+@pytest.mark.parametrize(
+    ("env", "reset"),
+    [
+        ("provider", "repo-change"),
+        ("controller", "repo-change"),
+        ("controller", "deleted-session"),
+        ("provider", "revoked"),
+        ("controller", "revoked"),
+    ],
+    indirect=["env"],
+)
+async def test_scheduled_sandbox_preserves_its_default_profile_after_reset(env, reset, db_uri):
+    _with_default_profile(env, "build")
+    deps, task, session_id, host_id = await _first_continue_fire(env, db_uri)
     snapshot = env.catalog.get_session_snapshot(session_id)
     assert snapshot is not None and snapshot["id"] == "build"
     assert env.recording.allocations == [_PROVIDER_CONFIG]
@@ -313,12 +328,7 @@ async def test_scheduled_sandbox_preserves_its_default_profile_after_reset(env, 
     replacement_id = response.json()["id"]
     replacement = env.conversations.get_conversation(replacement_id)
     assert replacement is not None and replacement.host_id is None
-    launching = _make_managed_sandbox_start(deps)(
-        replacement, task, host_id, _STAGED_LAUNCH_ERRORS
-    )
-    launch = env.app.state.managed_launches.get(replacement_id)
-    assert launch is not None
-    await asyncio.wait_for(launching, timeout=10)
+    launch = await _fire_session(env, deps, task, replacement_id, host_id)
     if reset == "revoked":
         assert launch.error is not None
         assert "access denied" in launch.error.lower()
@@ -330,6 +340,29 @@ async def test_scheduled_sandbox_preserves_its_default_profile_after_reset(env, 
         assert env.catalog.get_session_snapshot(replacement_id) == snapshot
         assert env.conversations.get_conversation(replacement_id).host_id == host_id
         assert env.recording.allocations == [_PROVIDER_CONFIG, _PROVIDER_CONFIG]
+
+
+async def test_scheduled_reset_after_its_sessions_are_deleted_takes_the_default(env, db_uri):
+    # The default provider cannot report a sandbox's profile, so the host's only
+    # record is the session the owner deletes.
+    _with_default_profile(env, "build")
+    deps, task, session_id, host_id = await _first_continue_fire(env, db_uri)
+    snapshot = env.catalog.get_session_snapshot(session_id)
+    assert snapshot is not None and snapshot["id"] == "build"
+    await env.conversations.delete_conversation(session_id)
+    assert env.catalog.get_host_snapshot(host_id) is None
+
+    response = await env.client.post("/v1/sessions", json={"agent_id": env.agent_id})
+    assert response.status_code == 201, response.text
+    replacement_id = response.json()["id"]
+    task = dataclasses.replace(task, last_run_conversation_id=session_id)
+    launch = await _fire_session(env, deps, task, replacement_id, host_id)
+
+    assert launch.error is None, launch.error
+    assert env.catalog.get_session_snapshot(replacement_id) == snapshot
+    assert env.conversations.get_conversation(replacement_id).host_id == host_id
+    assert env.catalog.get_host_snapshot(host_id) == snapshot
+    assert env.recording.allocations == [_PROVIDER_CONFIG, _PROVIDER_CONFIG]
 
 
 @pytest.mark.parametrize("mode", ["profile", "ordinary", "flag-off", "legacy-managed"])
@@ -1603,15 +1636,16 @@ class TestProviderManagedProfiles:
         assert (replacement.sandbox_id != host.sandbox_id) is gone
 
     @pytest.mark.parametrize("revoked", [False, True])
+    @pytest.mark.parametrize("command", ["clear", "rewind"])
     async def test_offline_clear_continuation_keeps_the_accepted_profile(
-        self, env: _Env, monkeypatch: pytest.MonkeyPatch, revoked: bool
+        self, env: _Env, monkeypatch: pytest.MonkeyPatch, command: str, revoked: bool
     ) -> None:
-        """A claude-sdk ``/clear`` with no live runner hands on the sandbox profile.
+        """A claude-sdk ``/clear`` or ``/rewind`` with no live runner hands on the profile.
 
         The continuation is bound to the source's host alone, so it must carry
         the accepted reference itself: after the source is deleted it still
         wakes the sandbox. A profile revoked since it was accepted refuses the
-        clear, leaving no continuation and the source where it was.
+        command, leaving no continuation and the source where it was.
         """
         source_id = await env.settled(await env.create("json", sandbox_profile_id="build"))
         source = env.conversations.get_conversation(source_id)
@@ -1620,12 +1654,27 @@ class TestProviderManagedProfiles:
         assert snapshot is not None
         monkeypatch.setattr(sessions_routes, "_resolve_harness", lambda *_a, **_k: "claude-sdk")
         monkeypatch.setattr(sessions_routes, "_get_runner_client", AsyncMock(return_value=None))
+        if command == "rewind":
+            [prompt] = env.conversations.append(
+                source_id,
+                [
+                    NewConversationItem(
+                        type="message",
+                        response_id="resp_rewind",
+                        data=MessageData(
+                            role="user", content=[{"type": "input_text", "text": "Q1"}]
+                        ),
+                    )
+                ],
+            )
         sessions_before = env.persisted()[0]
         if revoked:
             env.recording.allowed_users.clear()
 
-        cleared = await env.client.post(
-            f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}
+        cleared = await (
+            env.client.post(f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}})
+            if command == "clear"
+            else env.client.post(f"/v1/sessions/{source_id}/rewind", json={"item_id": prompt.id})
         )
 
         if revoked:
@@ -1640,7 +1689,7 @@ class TestProviderManagedProfiles:
             )
             assert env.catalog.get_session_snapshot(source_id) == snapshot
             return
-        assert cleared.status_code == 202, cleared.text
+        assert cleared.status_code == (202 if command == "clear" else 200), cleared.text
         continuation_id = cleared.json()["session_id"]
         continuation = env.conversations.get_conversation(continuation_id)
         assert continuation is not None
@@ -2038,11 +2087,15 @@ async def test_flag_off_init_rollback_keeps_legacy_store_calls(
     replace = env.conversations.replace_runner_id
     clear = env.conversations.clear_runner_id
 
-    def legacy_replace(session_id, runner_id):
-        return replace(session_id, runner_id)
+    # A runner write requires the runner the request read (so a move's claim
+    # taken meanwhile survives); nothing profile-specific is passed.
+    def legacy_replace(session_id, runner_id, **kwargs):
+        assert set(kwargs) <= {"expected_runner"}
+        return replace(session_id, runner_id, **kwargs)
 
-    def legacy_clear(session_id):
-        return clear(session_id)
+    def legacy_clear(session_id, **kwargs):
+        assert set(kwargs) <= {"expected_runner"}
+        return clear(session_id, **kwargs)
 
     monkeypatch.setattr(env.conversations, "replace_runner_id", legacy_replace)
     monkeypatch.setattr(env.conversations, "clear_runner_id", legacy_clear)

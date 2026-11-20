@@ -8,10 +8,11 @@
 import { useEffect, useRef } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { withBasePath } from "@/lib/basePath";
-import { isDatabricksWorkspace, resolveMediaUrl } from "@/lib/host";
+import { isDatabricksWorkspace, isHostRoutingEnabled, resolveMediaUrl } from "@/lib/host";
 import { authenticatedFetch } from "@/lib/identity";
 import { getSessionHost, isHostKeyless } from "@/lib/sessionHost";
 import { readVideoResponse } from "@/lib/videoFetch";
+import { readFileViaWorkspaceApi } from "@/lib/workspaceApi";
 import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
 import { isTempConvId } from "@/lib/tempConversationId";
 import {
@@ -69,8 +70,9 @@ function workspaceFileUrl(
  *
  * A `<video src>` load sends no request headers, so the session host's routing
  * key rides `?omnigent_slice_key=`, as the terminal attach WebSocket does. A
- * host already proven to route keyless is left unkeyed, matching
- * `authenticatedFetch`.
+ * host already proven to route keyless is left unkeyed. With the host unknown,
+ * returns null so the load goes through `authenticatedFetch`, which recovers
+ * from a wrong-replica miss.
  *
  * :param conversationId: The session/conversation ID, e.g. ``"sess_abc123"``.
  * :param path: Workspace-relative or host-absolute file path.
@@ -78,6 +80,7 @@ function workspaceFileUrl(
 export function workspaceFileMediaUrl(conversationId: string, path: string): string | null {
   const query: Record<string, string> = { download: "true" };
   const hostId = getSessionHost(conversationId);
+  if (isHostRoutingEnabled() && hostId === null) return null;
   if (hostId && !isHostKeyless(hostId)) query.omnigent_slice_key = hostId;
   return resolveMediaUrl(workspaceFileUrl(conversationId, path, query));
 }
@@ -106,12 +109,18 @@ export async function fetchFileContent(
   conversationId: string,
   path: string,
   signal?: AbortSignal,
-  options: { scope?: "workspace" } = {},
+  options: { scope?: "workspace"; sshTarget?: string | null } = {},
 ): Promise<FileContentResponse> {
-  const res = await authenticatedFetch(workspaceFileUrl(conversationId, path, options), { signal });
+  const { sshTarget, ...query } = options;
+  // The workspace API reads only inside the workspace, so it serves either scope.
+  if (!browseLocationBase(path)) {
+    const viaApi = await readFileViaWorkspaceApi(conversationId, path, signal, sshTarget);
+    if (viaApi) return viaApi;
+  }
+  const res = await authenticatedFetch(workspaceFileUrl(conversationId, path, query), { signal });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   // Older servers ignore scope; automatic previews must fail closed there.
-  if (options.scope && res.headers.get("X-Omnigent-File-Scope") !== options.scope) {
+  if (query.scope && res.headers.get("X-Omnigent-File-Scope") !== query.scope) {
     throw new Error("Workspace-constrained file reads are unavailable");
   }
   return (await res.json()) as FileContentResponse;
@@ -242,11 +251,13 @@ export function fileContentPollInterval(
  *
  * :param options.visible: True while the viewer is on screen, e.g. an open
  *     panel in the active viewport.
+ * :param options.sshTarget: The host's SSH alias, which the desktop may use to
+ *     read a host on another machine directly.
  */
 export function useFileContent(
   conversationId: string | undefined,
   path: string | null,
-  options: { retry?: boolean; visible?: boolean } = {},
+  options: { retry?: boolean; visible?: boolean; sshTarget?: string | null } = {},
 ) {
   const visible = options.visible ?? false;
   // A `temp:*` id (navigate-first new-chat window) has no server session yet,
@@ -288,7 +299,7 @@ export function useFileContent(
       await fileWritesSettled(serverId!, path!);
       // Cancelled while waiting (a newer write started): don't send the read.
       signal.throwIfAborted();
-      return fetchFileContent(serverId!, path!, signal);
+      return fetchFileContent(serverId!, path!, signal, { sshTarget: options.sshTarget });
     },
     enabled: !!serverId && !!path && serveable !== false,
     staleTime: 5_000,

@@ -69,6 +69,8 @@ services:
       # Deliberately value-less: an unset .env entry stays unset in the
       # container (keep all), while an explicit empty value keeps none.
       OMNIGENT_SEEDED_AGENTS:
+      # "1" hides USD cost in the session view; token counts stay. See README.
+      OMNIGENT_HIDE_COST: "${OMNIGENT_HIDE_COST:-}"
       # Anchor the server's data dir on the persistent volume so
       # file-backed operator config survives container restarts:
       # the admin roster (/data/admins) and allowed-domains file
@@ -129,6 +131,9 @@ services:
       # Set to 0 for IdPs (e.g. Cloudflare Access) that omit auth_time on
       # forced re-authentication. Empty keeps the check; see .env.example.
       OMNIGENT_OIDC_REQUIRE_REAUTH: "${OMNIGENT_OIDC_REQUIRE_REAUTH:-}"
+      # Set to 0 (with REQUIRE_REAUTH=0) for IdPs (e.g. GitLab) that fail
+      # prompt=login. Empty keeps sending it; see .env.example.
+      OMNIGENT_OIDC_REAUTH_PROMPT: "${OMNIGENT_OIDC_REAUTH_PROMPT:-}"
       # Opt-in OIDC invites (admin pre-authorizes one off-domain email).
       # Off unless set. The admin list (/data/admins) and the optional
       # allowed-domains file (/data/allowed_domains) need no env var —

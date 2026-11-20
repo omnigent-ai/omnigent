@@ -69,6 +69,20 @@ be able to write resources without a separate Omnigent account.
   only in the app's own window.
   Hidden where **Run on Arca** is offered (the managed-features flag on a
   managed server).
+- `desktop-join-install-cli`: in desktop onboarding (the V2 server selector,
+  the macOS default), a new user without the `omnigent` CLI who joins a server
+  from the **Join your team** list, or from the managed-server landing when the
+  server has no runner to set up, chooses **Just join** (the default: opens the
+  server, installs nothing) or **Install CLI first** (installs the CLI, signs
+  in, connects this laptop as a host, then opens the server). States: a failed
+  install or host connect (Retry, Back, or Continue anyway without a host),
+  **Cancel** while installing or waiting on the sign-in (returns to the choice;
+  a cancelled sign-in stops and never connects the laptop; the installer and a
+  host connect already underway keep going), no Cancel while starting the local
+  server or connecting a remote environment, no
+  in-app install on Windows/Linux (manual instructions), and no choice for
+  returning users, an installed CLI, the local install, or a server that brings
+  its own host CLI.
 - `embedded-resource-write`: an identity from a custom `AuthProvider` can
   create, rename, and reorder its own projects; unauthenticated and other users
   remain restricted.
@@ -316,6 +330,11 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   changing forwarded credentials. `host enable` saves explicitly forwarded values
   in plaintext in the per-user service definition, readable only by its owner
   (0600), so the service can retain them across logins.
+- Under a CLI wrapper (`OMNIGENT_WRAPPER_COMMAND`), `host enable` launches the
+  service through the wrapper's resolved path and the hidden `host-service-entry`
+  command, not the current interpreter, which can live in a cache venv deleted
+  between boots. Re-running `host enable` repairs a service definition that still
+  names a missing cache interpreter.
 - **Find out which credential kind the reporter's host uses before trusting a
   root cause.** A user OAuth login refreshes itself and a personal access
   token does not, so a story about a "stale pinned token" can be true for one

@@ -28,6 +28,7 @@ import remarkBreaks from "remark-breaks";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
 import { MessageResponse } from "@/components/ai-elements/message";
 import {
+  sameServerSessionPath,
   shortFileCitationLabel,
   splitWorkspaceFileCitation,
   WORKSPACE_FILE_LINK_ATTR,
@@ -35,6 +36,7 @@ import {
 } from "@/components/ai-elements/streamdown-security";
 import { WorkspaceMarkdownImage } from "./WorkspaceMarkdownImage";
 import { ZoomableImage } from "@/components/ImageLightbox";
+import { COMMAND_TOKEN_CLASS } from "@/components/composer/commandToken";
 import {
   ContextMenu,
   ContextMenuContent,
@@ -293,6 +295,37 @@ function PullRequestLinkLabel({ children }: { children: React.ReactNode }) {
 }
 
 /**
+ * The in-app chat path for an `omnigent://<host>/c/<id>` link to the server this
+ * page is on, or null. Links to other servers keep their deep-link href.
+ */
+function currentServerSessionPath(href: unknown): string | null {
+  if (typeof href !== "string" || typeof window === "undefined") return null;
+  return sameServerSessionPath(href, window.location);
+}
+
+/** A session link to this server, routed in the app like a session mention pill. */
+function ServerSessionLink({
+  path,
+  className,
+  children,
+  target: _target,
+  rel: _rel,
+  ...props
+}: React.ComponentPropsWithoutRef<"a"> & { path: string }) {
+  const linkClass = cn(STREAMDOWN_LINK_CLASS, className);
+  // Markdown also renders outside the router (stories, embeds); there the href navigates.
+  return useInRouterContext() ? (
+    <Link to={path} className={linkClass} data-streamdown="link" {...props}>
+      {children}
+    </Link>
+  ) : (
+    <a href={withBasePath(path)} className={linkClass} data-streamdown="link" {...props}>
+      {children}
+    </a>
+  );
+}
+
+/**
  * Anchor renderer for markdown links. A link to a workspace file, its href
  * parked on a fragment by `markWorkspaceFileLinks` and the real path moved to
  * `WORKSPACE_FILE_LINK_ATTR`, opens the FileViewer instead of navigating,
@@ -335,6 +368,14 @@ function WorkspaceFileLink({
           src={href}
           title={typeof children === "string" ? children : "Video recording"}
         />
+      );
+    }
+    const sessionPath = currentServerSessionPath(href);
+    if (sessionPath) {
+      return (
+        <ServerSessionLink path={sessionPath} className={className} title={title} {...props}>
+          {children}
+        </ServerSessionLink>
       );
     }
     // Rebase an app-internal link (e.g. an agent's `/clear` "the new chat"
@@ -655,6 +696,12 @@ const FILE_PATH_AWARE_COMPONENTS = {
   a: MarkdownLink,
 };
 
+function LeadingCommandToken({ children }: WithHastNode<React.ComponentPropsWithoutRef<"kbd">>) {
+  return <span className={COMMAND_TOKEN_CLASS}>{children}</span>;
+}
+
+const LEADING_COMMAND_COMPONENTS = { ...FILE_PATH_AWARE_COMPONENTS, kbd: LeadingCommandToken };
+
 // How often the live (growing) assistant bubble re-parses its markdown. The
 // store pump commits a new, longer text up to once per animation frame (~60/s);
 // without this the whole accumulated message is re-parsed on every commit. ~10/s
@@ -741,6 +788,26 @@ interface MarkdownNode {
   children?: MarkdownNode[];
 }
 
+interface MarkdownTextNode extends MarkdownNode {
+  value?: string;
+  data?: { hName?: string };
+}
+
+/** Tag the leading token in mdast, as sanitize strips classes from raw HTML. */
+function remarkLeadingCommand(token: string) {
+  return (tree: MarkdownTextNode) => {
+    const paragraph = tree.children?.[0];
+    if (paragraph?.type !== "paragraph" || !paragraph.children) return;
+    const first: MarkdownTextNode | undefined = paragraph.children[0];
+    if (first?.type !== "text" || !first.value?.startsWith(token)) return;
+    const rest = first.value.slice(token.length);
+    if (rest !== "" && !/^\s/.test(rest)) return;
+    const marked: MarkdownTextNode[] = [{ type: "text", value: token, data: { hName: "kbd" } }];
+    if (rest) marked.push({ type: "text", value: rest });
+    paragraph.children.splice(0, 1, ...marked);
+  };
+}
+
 /** Turns raw HTML nodes into text nodes holding the same source. */
 function remarkHtmlAsText() {
   const visit = (node: MarkdownNode) => {
@@ -766,28 +833,40 @@ function remarkHtmlAsText() {
  *
  * When `literalHtml` is set, raw HTML shows as written instead of rendering,
  * so markup or comments in a tool's text can't hide part of it.
+ *
+ * `leadingCommand` tints that token where it opens the text, without changing
+ * how the rest parses. Only for text whose raw HTML renders as text.
  */
 export function FilePathAwareMessageResponse({
   children,
   breaks = false,
   literalHtml = false,
+  leadingCommand,
   isStreaming = false,
   ...props
-}: React.ComponentProps<typeof MessageResponse> & { breaks?: boolean; literalHtml?: boolean }) {
-  const components = FILE_PATH_AWARE_COMPONENTS;
+}: React.ComponentProps<typeof MessageResponse> & {
+  breaks?: boolean;
+  literalHtml?: boolean;
+  leadingCommand?: string;
+}) {
+  const components =
+    leadingCommand === undefined ? FILE_PATH_AWARE_COMPONENTS : LEADING_COMMAND_COMPONENTS;
 
   // Extend (don't replace) Streamdown's defaults so remark-gfm survives. With
-  // neither option set we pass `undefined` so Streamdown uses its defaults unchanged.
+  // no option set we pass `undefined` so Streamdown uses its defaults unchanged.
   const remarkPlugins = useMemo(
     () =>
-      breaks || literalHtml
+      breaks || literalHtml || leadingCommand !== undefined
         ? [
             ...Object.values(defaultRemarkPlugins),
             ...(literalHtml ? [remarkHtmlAsText] : []),
+            ...(leadingCommand !== undefined
+              ? [[remarkLeadingCommand, leadingCommand] as [typeof remarkLeadingCommand, string]]
+              : []),
             ...(breaks ? [remarkBreaks] : []),
           ]
         : undefined,
-    [breaks, literalHtml],
+    [breaks, literalHtml, leadingCommand],
   );
 
   // Throttle the markdown so the live (still-growing) bubble re-parses a few
@@ -818,6 +897,9 @@ export function FilePathAwareMessageResponse({
 
   return (
     <MessageResponse
+      // Streamdown's memo ignores plugin changes, so a command published after
+      // the first render needs a fresh tree.
+      key={leadingCommand}
       {...props}
       components={components}
       remarkPlugins={remarkPlugins}
@@ -827,5 +909,28 @@ export function FilePathAwareMessageResponse({
     >
       {isString ? throttledText : children}
     </MessageResponse>
+  );
+}
+
+// Keeps headings at the surrounding text's size; `!` beats the unlayered rules in index.css.
+const PROSE_MARKDOWN_CLASS =
+  "[&_:is(h1,h2,h3,h4,h5,h6)]:mt-3! [&_:is(h1,h2,h3,h4,h5,h6)]:mb-1! [&_[data-streamdown^=heading]]:text-sm!";
+
+/**
+ * Finished Markdown written for people outside a chat bubble, such as a tool's
+ * prose or a workflow step's description. Its headings keep the surrounding
+ * size, its line breaks stay, and raw HTML, such as a `<date>` placeholder,
+ * shows as written.
+ */
+export function ProseMarkdown({ children, className }: { children: string; className?: string }) {
+  return (
+    <FilePathAwareMessageResponse
+      mode="static"
+      breaks
+      literalHtml
+      className={cn(PROSE_MARKDOWN_CLASS, className)}
+    >
+      {children}
+    </FilePathAwareMessageResponse>
   );
 }

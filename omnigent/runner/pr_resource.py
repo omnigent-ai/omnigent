@@ -39,10 +39,14 @@ from omnigent.git_providers import (
 from omnigent.runner import pr_reports
 from omnigent.runner.git_providers import (
     PR_DIFF_OBJECT,
+    AccountMergeFacet,
+    CommitCompareFacet,
     CommitsFacet,
     PinnedRevisionFacet,
     ProviderCapabilities,
     PullRequestFacet,
+    PullRequestStatus,
+    PullRequestStatusFacet,
     ReviewerRef,
     ReviewThreadsFacet,
     local_git,
@@ -360,6 +364,8 @@ def _session_prs_with_titles(
     facets = _title_facets(root, entries)
     now = time.time()
     titles: dict[str, str | None] = {}
+    # States looked up during this request, which the server stores as of its request.
+    statuses: dict[str, PullRequestStatus] = {}
     timed_out_urls: set[str] = set()
     pending: list[SessionPullRequest] = []
     for entry in entries:
@@ -382,25 +388,35 @@ def _session_prs_with_titles(
     pending.sort(key=lambda entry: entry.title_checked_at)
     deadline = min(request_deadline, time.monotonic() + _PR_TITLE_LOOKUP_SECONDS)
 
-    def fetch_title(entry: SessionPullRequest) -> tuple[str, str | None, bool] | None:
+    def fetch_title(
+        entry: SessionPullRequest,
+    ) -> tuple[str, str | None, bool, PullRequestStatus | None] | None:
         if time.monotonic() >= deadline:
             return None
+        facet = facets[entry.provider]
         try:
-            title, timed_out = facets[entry.provider].pr_title(root, entry, deadline)
+            # The same request a title lookup makes also carries the state, when the
+            # provider can return both.
+            if isinstance(facet, PullRequestStatusFacet):
+                status, timed_out = facet.pr_status(root, entry, deadline)
+                return entry.url, status.title if status else None, timed_out, status
+            title, timed_out = facet.pr_title(root, entry, deadline)
         except Exception:  # keep the existing cache when an optional lookup fails
             _logger.warning("Git provider %s failed in pr_title", entry.provider, exc_info=True)
             return None
-        return entry.url, title, timed_out
+        return entry.url, title, timed_out, None
 
     may_cache = time.monotonic() < request_deadline
     if pending and time.monotonic() < deadline:
         with ThreadPoolExecutor(max_workers=min(4, len(pending))) as executor:
             for result in executor.map(fetch_title, pending):
                 if result is not None:
-                    url, title, timed_out = result
+                    url, title, timed_out, status = result
                     titles[url] = title
                     if timed_out:
                         timed_out_urls.add(url)
+                    if status is not None and status.state is not None:
+                        statuses[url] = status
     if titles and may_cache:
         try:
             registry.update_titles(titles, timestamp=now, timed_out_urls=timed_out_urls)
@@ -412,6 +428,11 @@ def _session_prs_with_titles(
             **entry.model_dump(),
             "title": titles.get(entry.url) or entry.title,
             "provider_display": provider_display(entry.provider),
+            **(
+                {"state": status.state, "is_draft": status.is_draft}
+                if (status := statuses.get(entry.url)) is not None
+                else {}
+            ),
         }
         for entry in entries
     ]
@@ -800,6 +821,15 @@ def pr_merge_options(
     return facet.merge_options(root, reference)
 
 
+def _merge_request(merge_method: object, expected_head: object) -> tuple[str, str]:
+    """Validate a merge's method and head, which must reach the provider unchanged."""
+    if not isinstance(merge_method, str) or merge_method not in _MERGE_METHODS:
+        raise ValueError("Expected merge_method to be merge, squash, or rebase")
+    if not isinstance(expected_head, str) or not _COMMIT_SHA.fullmatch(expected_head):
+        raise ValueError("Expected expected_head to be the pull request's head commit SHA")
+    return merge_method, expected_head
+
+
 def merge_pr(
     root: str,
     *,
@@ -816,12 +846,43 @@ def merge_pr(
     :raises ValueError: On an unknown method or malformed SHA, without a
         selected tracked PR, or when the provider refuses the merge.
     """
-    if not isinstance(merge_method, str) or merge_method not in _MERGE_METHODS:
-        raise ValueError("Expected merge_method to be merge, squash, or rebase")
-    if not isinstance(expected_head, str) or not _COMMIT_SHA.fullmatch(expected_head):
-        raise ValueError("Expected expected_head to be the pull request's head commit SHA")
+    method, head = _merge_request(merge_method, expected_head)
     facet, reference = _merge_target(session_id, pr_url)
-    return facet.merge(root, reference, merge_method=merge_method, expected_head=expected_head)
+    return facet.merge(root, reference, merge_method=method, expected_head=head)
+
+
+def merge_pr_as(
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    merge_method: object = None,
+    expected_head: object = None,
+    account: object = None,
+) -> dict[str, Any]:
+    """Merge like :func:`merge_pr`, as ``account``, the account the user confirmed.
+
+    The merge runs as ``account`` even when the panel's view of the saved account
+    is stale, and ``account`` becomes the PR's account for later requests.
+
+    :raises ValueError: Also on a missing account, or when the provider can't
+        merge as a chosen account. It never merges as the saved account instead.
+    """
+    method, head = _merge_request(merge_method, expected_head)
+    if not isinstance(account, str) or not account.strip():
+        raise ValueError("Expected account to be an account login")
+    facet, reference = _merge_target(session_id, pr_url)
+    capabilities = facet.capabilities
+    if not (
+        capabilities.account_switching
+        and capabilities.merge_as_account
+        and isinstance(facet, AccountMergeFacet)
+    ):
+        raise ValueError("This provider can't merge as a chosen account.")
+    facet.set_preference(root, reference, account=account, remote=None)
+    return facet.merge_as(
+        root, reference, merge_method=method, expected_head=head, account=account
+    )
 
 
 def disable_pr_auto_merge(
@@ -1277,6 +1338,30 @@ def pr_commit_diff(
     """
     facet, reference = _commits_target(session_id, pr_url)
     return facet.commit_diff(root, reference, commit_sha=_commit_sha(commit_sha, "commit_sha"))
+
+
+def pr_compare_diff(
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    head_sha: object = None,
+    from_sha: object = None,
+) -> dict[str, Any]:
+    """Return the selected PR's changes after one of its commits, up to its head.
+
+    :raises ValueError: Without a selected tracked PR, when its provider cannot list
+        commits, or when either commit is not a full commit id.
+    """
+    facet, reference = _commits_target(session_id, pr_url)
+    if not isinstance(facet, CommitCompareFacet):
+        raise ValueError("This provider does not show changes since a commit")
+    return facet.compare_diff(
+        root,
+        reference,
+        head_sha=_commit_sha(head_sha, "head_sha"),
+        from_sha=_commit_sha(from_sha, "from_sha"),
+    )
 
 
 def pr_file_diff(

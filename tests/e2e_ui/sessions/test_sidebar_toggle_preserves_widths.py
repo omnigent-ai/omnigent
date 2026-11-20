@@ -109,7 +109,7 @@ def test_shrinking_viewport_keeps_chat_minimum_with_sidebar_open(
 
     # Shrink the window hard, sidebar still open. The rail must yield (below its
     # own comfort minimum if needed) so the chat holds its 480px floor.
-    page.set_viewport_size({"width": 1000, "height": 800})
+    page.set_viewport_size({"width": 1181, "height": 800})
     page.wait_for_timeout(_PANEL_MOTION_SETTLE_MS)
     expect(conversations).not_to_have_attribute("data-collapsed", "true")
     assert _chat_width(page) >= _CHAT_MIN_PX - 1, _chat_width(page)

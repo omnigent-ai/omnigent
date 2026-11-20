@@ -41,7 +41,7 @@ from omnigent._platform import IS_WINDOWS
 from omnigent.debug_logging import debug_event
 from omnigent.harness_plugins import missing_install_packages
 from omnigent.inner import _proc
-from omnigent.inner._subprocess_lifecycle import close_subprocess_transport
+from omnigent.inner._subprocess_lifecycle import await_cleanup_task, close_subprocess_transport
 from omnigent.inner.agent_env import strip_desktop_session_env
 from omnigent.native.owner_claim import owner_is_gone, read_owner_claim, write_owner_claim
 from omnigent.runner.identity import strip_runner_auth_secrets
@@ -430,7 +430,10 @@ class _HarnessEndpoint:
         """The ``_runner`` CLI flags selecting this transport."""
         if self.socket_path is not None:
             return ["--socket", str(self.socket_path)]
-        return ["--bind", f"{self.host}:{self.port}"]
+        from omnigent.util.server_url import format_host_port
+
+        assert self.host is not None and self.port is not None
+        return ["--bind", format_host_port(self.host, self.port)]
 
     def make_transport(self) -> httpx.AsyncBaseTransport:
         """An httpx transport routed at this endpoint."""
@@ -443,7 +446,10 @@ class _HarnessEndpoint:
         """The httpx base URL. Under UDS the host is cosmetic; under TCP it routes."""
         if self.socket_path is not None:
             return "http://harness.local"
-        return f"http://{self.host}:{self.port}"
+        from omnigent.util.server_url import format_host_port
+
+        assert self.host is not None and self.port is not None
+        return f"http://{format_host_port(self.host, self.port)}"
 
     async def can_connect(self) -> bool:
         """Whether the runner is accepting connections at this endpoint yet."""
@@ -1328,7 +1334,15 @@ class HarnessProcessManager:
             ``_SPAWN_READY_TIMEOUT_S``.
         """
         module_path = _resolve_module_path(harness)
-        self._ensure_instance_dir()
+        preparation = asyncio.create_task(asyncio.to_thread(self._ensure_instance_dir))
+        try:
+            await asyncio.shield(preparation)
+        except asyncio.CancelledError:
+            # Keep the spawn lock until disk writes finish so shutdown cannot
+            # remove the directory while the worker is still recreating it.
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await await_cleanup_task(preparation)
+            raise
         endpoint = _HarnessEndpoint.create(self._instance_dir, conversation_id)
         # Defensive: a stale socket file from a previous spawn
         # (released but not cleaned up because of an OS quirk)

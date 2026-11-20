@@ -168,6 +168,13 @@ from the repository root. This checks real Electron zoom from 50% to 150%,
 Native traffic lights require a human visual check: use View → Zoom Out and
 Actual Size, then collapse/reopen the sidebar and open Settings.
 
+`desktop_find_selection_prefill.e2e.js` selects words in a chat reply and opens
+find with Ctrl+F (bar closed and open, and inside the bar) and Edit → Find…,
+checking the bar's query and match count. It needs Linux, an X display with
+XTEST, and a built SPA:
+`OMNIGENT_PW_NO_SANDBOX=1 xvfb-run -a node --test e2e/desktop_find_selection_prefill.e2e.js`
+from `web/electron`.
+
 1. Copy `desktop_connect.e2e.js` to `e2e/desktop_<slug>.e2e.js`.
 2. If the bug's failure is **past** connect, pass `serverUrl` to
    `launchDesktop` so the app boots straight into the shell; if the bug is in
@@ -183,6 +190,15 @@ Actual Size, then collapse/reopen the sidebar and open Settings.
    footage. Use `saveRecording(RECORD_DIR, "before-<facet>")` (or
    `fixed-<facet>`), then write the journey `caption` for the handoff exactly as
    the other lanes do (see `dev/repro-agent/AGENTS.md`, Step 4).
+
+## Security-key notice
+
+`desktop_browser_webauthn_prompt.e2e.js` opens an Okta-style verify page in a
+session's Browser tab. That page requests a WebAuthn assertion that nothing can
+answer. The test checks that the shell's security-key notice appears for the
+page's origin while the request is still pending. Its **Open in browser** button
+must hand the same URL to `fixtures/fakeSystemBrowser.cjs`. It runs on Linux
+under `xvfb-run` and needs no security key.
 
 ## Navigation policy runtime boundary
 

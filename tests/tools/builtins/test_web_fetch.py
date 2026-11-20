@@ -354,10 +354,17 @@ def test_researcher_drops_every_framework_tool_group() -> None:
     }
 
     assert not {
-        n for n in names if n.startswith(("browser_", "sys_scheduled_task_", "sys_agent_"))
+        n
+        for n in names
+        if n.startswith(("browser_", "sys_scheduled_task_", "sys_agent_", "memory_"))
     }
     assert not names & {"list_comments", "update_comment", "sys_add_policy", "sys_policy_registry"}
-    assert not names & {"sys_project_list", "sys_session_update"}
+    assert not names & {"sys_user_inbox_post", "sys_user_inbox_list"}
+    assert not names & {
+        "sys_project_list",
+        "sys_session_update",
+        "sys_project_update",
+    }
     assert "sys_os_shell" in names
     composed = build_instructions_nullable(researcher, None, [])
     assert composed is not None

@@ -87,6 +87,19 @@ function spacedMention(before: string, sessionTitles: readonly string[]): RegExp
 }
 
 /**
+ * Whether a session's agent opens an "@"-mentioned workspace path: native
+ * wrappers via the agent registry, other harnesses when the server declares
+ * ``workspace_file_mentions`` for them (``useFileMentionHarnesses``).
+ */
+export function harnessSupportsFileMentions(
+  harness: string | null | undefined,
+  declared: ReadonlySet<string>,
+): boolean {
+  if (harness == null) return false;
+  return nativeCodingAgentForHarness(harness) !== undefined || declared.has(harness);
+}
+
+/**
  * Build the attachment marker for an "@"-tagged workspace ``path``, in the
  * wording the given native harness's executor uses for file delivery.
  *
@@ -295,6 +308,25 @@ export function presentMentions<T extends InlineMention>(
   const tokens = mentions.map((m) => m.token);
   const found = new Set(texts.flatMap((t) => findMentionTokens(t, tokens).map((r) => r.token)));
   return mentions.filter((m) => found.has(m.token));
+}
+
+/**
+ * The tags whose token still appears in ``texts``; a tag whose token was deleted
+ * drops out, so retyping that text later stays literal.
+ */
+export function presentTaggedMentions(
+  mentions: TaggedMentions | undefined,
+  texts: readonly string[],
+): TaggedMentions | undefined {
+  if (!mentions) return undefined;
+  const inline = composerInlineMentions(mentions.files, mentions.sessions, null);
+  const present = new Set(presentMentions(inline, texts).map((mention) => mention.token));
+  const fileCount = mentions.files.length;
+  const files = mentions.files.filter((_, index) => present.has(inline[index]!.token));
+  const sessions = mentions.sessions.filter((_, index) =>
+    present.has(inline[fileCount + index]!.token),
+  );
+  return files.length > 0 || sessions.length > 0 ? { files, sessions } : undefined;
 }
 
 /** Replace each token in ``text`` with its marker, in place. */
