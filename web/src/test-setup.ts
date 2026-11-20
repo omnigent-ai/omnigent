@@ -96,8 +96,8 @@ if (typeof globalThis.ResizeObserver === "undefined") {
 // it with a pass-through that renders every item; the windowing itself is
 // browser behaviour verified manually, and the components' logic (flatten /
 // expand / lazy-load for FolderTree; bubble building / history load /
-// indicators for the transcript) is what the unit tests assert. Shared by both
-// consumers, so the shape is the superset they read — honouring `getItemKey`
+// indicators for the transcript) is what the unit tests assert. Shared by every
+// consumer, so the shape is the superset they read — honouring `getItemKey`
 // and exposing the offset/range/scroll handles the transcript's
 // VirtualBubbleList touches, so its real path doesn't throw under jsdom.
 const ROW = 200;
@@ -116,6 +116,7 @@ vi.mock("@tanstack/react-virtual", async (importOriginal) => ({
       return {
         getVirtualItems: () => items,
         getTotalSize: () => count * ROW,
+        measure: () => {},
         measureElement: () => {},
         scrollToIndex: () => {},
         getVirtualItemForOffset: (offset: number) =>
