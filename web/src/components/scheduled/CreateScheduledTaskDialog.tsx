@@ -1073,10 +1073,9 @@ export function CreateScheduledTaskDialog({
   // host/workspace pairing at all, so the rule doesn't apply.
   const workspaceWithoutHost = !sandboxMode && workspace.trim() !== "" && hostId === "";
   // Metadata edits can preserve an expired schedule; rescheduling requires a future cutoff.
-  const allowPastEnd =
-    savedSchedule !== null &&
-    timezone === editingTask?.timezone &&
-    buildRRule(schedule) === buildRRule(savedSchedule);
+  const scheduleUnchanged =
+    savedSchedule !== null && buildRRule(schedule) === buildRRule(savedSchedule);
+  const allowPastEnd = scheduleUnchanged && timezone === editingTask?.timezone;
   const requiresAnchoredScheduling = schedule.preset === "custom" || schedule.end?.type === "count";
   const unsupportedByScheduler = !anchoredScheduling && requiresAnchoredScheduling;
   // The source an edited trigger watches now: its open form, or its prompt's opening line.
@@ -1700,7 +1699,8 @@ export function CreateScheduledTaskDialog({
       const input = {
         name: name.trim(),
         prompt: systemPrompt === null ? effectivePrompt.trim() : effectivePrompt,
-        rrule: buildRRule(schedule),
+        // An untouched schedule keeps its stored spelling, so the pending run isn't rescheduled.
+        rrule: editingTask && scheduleUnchanged ? editingTask.rrule : buildRRule(schedule),
         timezone,
         ...(maxCostUsd !== (editingTask?.maxCostUsd ?? null) ? { maxCostUsd } : {}),
         ...(executionTargetChanged ? { executionTarget } : {}),
@@ -1991,9 +1991,6 @@ export function CreateScheduledTaskDialog({
                               onFocusOutside={keepParentPopoverOpenOnFocus}
                               onInteractOutside={keepParentPopoverOpenForNestedMenu}
                             >
-                              <PickerSectionHeader className="px-5 pt-3 pb-2">
-                                Schedule
-                              </PickerSectionHeader>
                               {recurrenceFields}
                               {scheduleUnsupported && (
                                 <p className="px-4 pb-3 text-sm text-destructive" role="alert">
@@ -2489,9 +2486,6 @@ export function CreateScheduledTaskDialog({
                                   onFocusOutside={keepParentPopoverOpenOnFocus}
                                   onInteractOutside={keepParentPopoverOpenForNestedMenu}
                                 >
-                                  <PickerSectionHeader className="px-5 pt-3 pb-2">
-                                    Schedule
-                                  </PickerSectionHeader>
                                   {recurrenceFields}
                                   {scheduleUnsupported && (
                                     <p className="px-4 pb-3 text-sm text-destructive" role="alert">
