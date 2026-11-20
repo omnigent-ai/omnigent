@@ -1405,6 +1405,49 @@ def install_harness_cli(key: str) -> bool:
     return try_install_harness_cli(key).installed
 
 
+def _claude_launcher_override(key: str) -> str | None:
+    """Return the ``OMNIGENT_CLAUDE_PATH`` launcher for Claude's login probe, if set.
+
+    Sessions start Claude through ``OMNIGENT_CLAUDE_PATH`` when it is set (a
+    wrapper that may supply credentials per launch, e.g. an enterprise gateway).
+    The login probe must ask the same launcher, or a host whose credentials come
+    only from that wrapper reads "needs-auth" although every launch would work.
+
+    :param key: A harness family, e.g. ``"anthropic"``.
+    :returns: The launcher path when *key* is Claude's family and the variable
+        names an executable file, else ``None``.
+    """
+    if key != ANTHROPIC_FAMILY:
+        return None
+    path = os.environ.get("OMNIGENT_CLAUDE_PATH", "").strip()
+    if path and os.path.isfile(path) and os.access(path, os.X_OK):
+        return path
+    return None
+
+
+def _status_json(stdout: str) -> object:
+    """Parse a CLI status JSON object, skipping any banner lines printed before it.
+
+    A launcher wrapper may print its own lines before the CLI's JSON, so when the
+    whole output is not JSON, parse from the first line that starts with ``{``.
+
+    :param stdout: The status command's standard output.
+    :returns: The parsed value, or ``None`` when no JSON object is found.
+    """
+    try:
+        return json.loads(stdout)
+    except (json.JSONDecodeError, ValueError):
+        pass
+    lines = stdout.splitlines()
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith("{"):
+            try:
+                return json.loads("\n".join(lines[i:]))
+            except (json.JSONDecodeError, ValueError):
+                return None
+    return None
+
+
 def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_S) -> bool:
     """Return whether the harness CLI itself reports a usable login.
 
@@ -1439,7 +1482,9 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
     spec = harness_install_spec(key)
     if spec is None or spec.status_args is None:
         return False
-    binary = resolve_cli_binary(spec.binary) if key == GEMINI_FAMILY else shutil.which(spec.binary)
+    binary = _claude_launcher_override(key) or (
+        resolve_cli_binary(spec.binary) if key == GEMINI_FAMILY else shutil.which(spec.binary)
+    )
     if binary is None:
         return False
     probe_cwd = _cli_probe_cwd()
@@ -1477,10 +1522,7 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
     status_key = spec.login_status_key
     logged_in = result.returncode == 0
     if status_key is not None:
-        try:
-            payload = json.loads(result.stdout)
-        except (json.JSONDecodeError, ValueError):
-            payload = None
+        payload = _status_json(result.stdout)
         if isinstance(payload, dict) and status_key in payload:
             logged_in = bool(payload[status_key])
     if logged_in:
