@@ -814,10 +814,6 @@ Inner workers cannot enforce `tcp_egress`. If that restriction must cover the
 worker itself, there is no supported inner-harness migration yet. Retain the
 restriction and treat the configuration as unsupported.
 
-Check inherited `web_fetch` policies during migration too: its researcher can
-now refuse to start when the inherited harness cannot enforce confinement.
-Choose a sandbox-capable harness for that research path.
-
 Relative `os_env.cwd` does not override a workspace selected by the runner.
 Claude SDK additionally resolves a named relative directory such as `./project`
 against the runner base when that base is still the selected workspace; `.`
