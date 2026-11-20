@@ -1194,19 +1194,49 @@ describe.each(["textarea", "codemirror"] as const)(
       expect(caretOf()).toBe("Read @readme.md ".length);
     });
 
-    it("keeps a deleted pill's retyped text literal rather than re-tagging it", async () => {
-      const props = composerProps();
-      await renderComposer(props);
-      typeAt("Read @rea");
-      fireEvent.click(screen.getByTitle("Attach readme.md"));
-      caretAt("Read @readme.md".length);
-      fireEvent.keyDown(composerInput(), { key: "Backspace" });
+    it.runIf(engine === "codemirror")(
+      "steps undo and redo back through a completed mention and a folder drill-in",
+      async () => {
+        await renderComposer(composerProps());
+        typeAt("Read @rea");
+        fireEvent.click(screen.getByTitle("Attach readme.md"));
+        typeAt("then @sr");
+        fireEvent.click(screen.getByTitle("Open src"));
+        const drilled = "Read @readme.md then @src/";
+        expect(valueOf()).toBe(drilled);
 
-      typeAt("@readme.md ");
-      expect(valueOf()).toBe("Read  @readme.md ");
-      expect(tokens()).toEqual([]);
-      fireEvent.submit(composerInput().closest("form")!);
-      expect(props.onSend).toHaveBeenCalledWith("Read  @readme.md", undefined);
-    });
+        undoTo("Read @readme.md then @sr");
+        expect(caretOf()).toBe("Read @readme.md then @sr".length);
+        undoTo("Read @readme.md ");
+        expect(caretOf()).toBe("Read @readme.md ".length);
+        undoTo("Read @rea");
+        expect(caretOf()).toBe("Read @rea".length);
+
+        redoTo("Read @readme.md ");
+        expect(caretOf()).toBe("Read @readme.md ".length);
+        redoTo("Read @readme.md then @sr");
+        expect(caretOf()).toBe("Read @readme.md then @sr".length);
+        redoTo(drilled);
+        expect(caretOf()).toBe(drilled.length);
+      },
+    );
+
+    it.runIf(engine === "codemirror")(
+      "keeps a deleted pill's retyped text literal rather than re-tagging it",
+      async () => {
+        const props = composerProps();
+        await renderComposer(props);
+        typeAt("Read @rea");
+        fireEvent.click(screen.getByTitle("Attach readme.md"));
+        caretAt("Read @readme.md".length);
+        fireEvent.keyDown(composerInput(), { key: "Backspace" });
+
+        typeAt("@readme.md ");
+        expect(valueOf()).toBe("Read  @readme.md ");
+        expect(tokens()).toEqual([]);
+        fireEvent.submit(composerInput().closest("form")!);
+        expect(props.onSend).toHaveBeenCalledWith("Read  @readme.md", undefined);
+      },
+    );
   },
 );

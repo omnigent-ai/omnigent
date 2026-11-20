@@ -6,7 +6,10 @@ import type {
   ComposerKeyboardEvent,
   ComposerTextTarget,
 } from "@/components/composer/engine/composerInput";
-import { createFakeComposerSurface } from "@/components/composer/engine/testing/fakeComposerSurface";
+import {
+  createFakeComposerSurface,
+  type FakeComposerSurface,
+} from "@/components/composer/engine/testing/fakeComposerSurface";
 import {
   clearSessionDrafts,
   getSessionDraft,
@@ -149,6 +152,9 @@ describe("useMentionBrowser released tags", () => {
 
     change(result, "Read @readme.md ", true);
     expect(result.current.browser.mentionTokens).toEqual(["@readme.md"]);
+    expect(result.current.browser.mentionedItems).toEqual([
+      { path: "readme.md", isDir: false, token: "@readme.md" },
+    ]);
   });
 
   it("keeps a token pasted as an input's first edit literal through its undo and redo", () => {
@@ -200,6 +206,9 @@ describe("useMentionBrowser released tags", () => {
 
     change(result, "Ask @Fix CI ", true);
     expect(result.current.browser.mentionTokens).toEqual(["@Fix CI"]);
+    expect(result.current.browser.mentionedSessions).toEqual([
+      { id: "sess_fix", title: "Fix CI", isSubagent: false, token: "@Fix CI" },
+    ]);
   });
 
   it("restores a deleted subagent tag when an undo brings its token back", () => {
@@ -210,6 +219,36 @@ describe("useMentionBrowser released tags", () => {
 
     change(result, "Ask @Review ", true);
     expect(result.current.browser.mentionTokens).toEqual(["@Review"]);
+    expect(result.current.browser.mentionedSessions).toEqual([
+      { id: "sub_review", title: "Review", isSubagent: true, token: "@Review" },
+    ]);
+  });
+
+  it("keeps a released file's token reserved, so a new same-token target gets another", () => {
+    const { result } = renderBrowser();
+    tagReadme(result);
+    change(result, "Read  ", false);
+
+    // A session titled "readme.md" naturally takes the released token "@readme.md".
+    const readmeSession = { id: "sess_readme", title: "readme.md", isSubagent: false };
+    change(result, "Read  @read", false);
+    act(() => result.current.setMention({ query: "read", start: 6, end: 11 }));
+    act(() => result.current.browser.attachSession(readmeSession));
+    change(result, "Read  @readme.md (sess_r) ", false);
+    expect(result.current.browser.mentionedItems).toEqual([]);
+    expect(result.current.browser.mentionedSessions).toEqual([
+      { ...readmeSession, token: "@readme.md (sess_r)" },
+    ]);
+
+    // Undo the completion, the typing, then the original deletion, one edit at a time.
+    change(result, "Read  @read", true);
+    change(result, "Read  ", true);
+    change(result, "Read @readme.md ", true);
+    expect(result.current.browser.mentionTokens).toEqual(["@readme.md"]);
+    expect(result.current.browser.mentionedItems).toEqual([
+      { path: "readme.md", isDir: false, token: "@readme.md" },
+    ]);
+    expect(result.current.browser.mentionedSessions).toEqual([]);
   });
 
   it("keeps a deleted tag's token as literal text when it is typed again", () => {
@@ -286,6 +325,20 @@ describe("useMentionBrowser released tags", () => {
 });
 
 describe("useMentionBrowser edits on a live input", () => {
+  const mountedSurfaces: FakeComposerSurface[] = [];
+  afterEach(() => {
+    for (const surface of mountedSurfaces.splice(0)) {
+      surface.unregister();
+      surface.element.remove();
+    }
+  });
+
+  function mountSurface(initial: string, options?: { locked?: boolean }) {
+    const surface = createFakeComposerSurface(initial, options);
+    mountedSurfaces.push(surface);
+    return surface;
+  }
+
   const backspace = (target: ComposerTextTarget): ComposerKeyboardEvent =>
     ({
       key: "Backspace",
@@ -297,28 +350,26 @@ describe("useMentionBrowser edits on a live input", () => {
     }) as unknown as ComposerKeyboardEvent;
 
   it("leaves the tags and the open menu alone when a locked input refuses the pick", () => {
-    const input = createFakeComposerSurface("Read @rea", { locked: true });
+    const input = mountSurface("Read @rea", { locked: true });
     const { result } = renderBrowser(input);
     act(() => result.current.setMention({ query: "rea", start: 5, end: 9 }));
     act(() => result.current.browser.attachMention("readme.md", false));
     expect(input.value).toBe("Read @rea");
     expect(result.current.mention).toEqual({ query: "rea", start: 5, end: 9 });
     expect(result.current.browser.mentionTokens).toEqual([]);
-    input.unregister();
   });
 
   it("completes a mention as its own undo step, with the caret after the token and its space", () => {
-    const input = createFakeComposerSurface("Read @rea");
+    const input = mountSurface("Read @rea");
     const { result } = renderBrowser(input);
     act(() => result.current.setMention({ query: "rea", start: 5, end: 9 }));
     act(() => result.current.browser.attachMention("readme.md", false));
     expect(input.inserts).toEqual([{ text: "@readme.md ", start: 5, end: 9, separateUndo: true }]);
     expect(input.selectionStart).toBe("Read @readme.md ".length);
-    input.unregister();
   });
 
   it("deletes the token in the input's current text, even before the draft re-renders", () => {
-    const input = createFakeComposerSurface("Read @rea");
+    const input = mountSurface("Read @rea");
     const { result } = renderBrowser(input);
     act(() => result.current.setMention({ query: "rea", start: 5, end: 9 }));
     // The input's change event brings its text into the draft, as the composer's onChange does.
@@ -333,6 +384,5 @@ describe("useMentionBrowser edits on a live input", () => {
     act(() => void result.current.browser.handleTokenBackspace(backspace(input)));
     expect(input.value).toBe("Read ");
     expect(input.inserts.at(-1)).toEqual({ text: "", start: 5, end: 15, separateUndo: true });
-    input.unregister();
   });
 });
