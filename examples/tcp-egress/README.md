@@ -8,17 +8,18 @@ Both files select the Claude SDK harness. Its preparation path does not start
 the parent TCP-egress broker, so these configurations are rejected before the
 Claude CLI launches. They cannot perform the prompted connector checks.
 Configuring model credentials with `omnigent setup` or passing `--model` does
-not supply that broker. An unwrapped CLI fallback is not supported.
+not supply the TCP-egress broker. An unwrapped CLI fallback is not supported.
 
-Both files also set `allow_network: false`, which blocks ordinary model-provider
-connections from the whole CLI process. Supporting the broker alone would not
-grant those connections.
+Both files also set `allow_network: false`, which blocks direct external
+connections from the CLI. Claude SDK's owned worker environment already provides
+supported model inference through a separate broker. That model transport does
+not implement the named TCP routes these examples require.
 
 Named TCP routes grant access only through the connector. They do not authorize
 ordinary provider HTTPS requests. Supporting these examples as agent-driven
-demos requires Claude SDK integration with the parent broker and a model
-transport compatible with the requested confinement. Do not enable unrestricted networking to make the
-network-denial checks appear to pass.
+demos requires Claude SDK integration with the parent TCP-egress broker.
+Do not enable unrestricted networking to make the network-denial checks appear
+to pass.
 
 ## Local connector verification
 
@@ -32,7 +33,7 @@ PYTHONPATH="$PWD:$PWD/sdks/python-client:$PWD/sdks/ui" \
 ```
 
 This verifies the connector contract; it does not establish that a Claude
-agent can reach its model while whole-process networking is disabled.
+worker can use named TCP routes.
 
 ## Route templates
 
@@ -46,8 +47,8 @@ a compatible execution environment.
 `public-ssh.yaml` grants `github.com:22` and describes reading an SSH greeting
 without authentication. The broker requires every DNS answer to be public;
 networks that block port 22 prevent the connection. A greeting does not verify
-the remote server's identity. This template has the same broker and model transport
-requirements as the local example.
+the remote server's identity. This template has the same TCP-egress integration
+requirement as the local example.
 
 `sandbox.type: auto` selects Seatbelt on macOS and Bubblewrap on Linux; Linux
 requires `bwrap` and enabled user namespaces. Opaque TCP routes cannot use ports

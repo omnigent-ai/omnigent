@@ -791,8 +791,9 @@ When a later turn supplies a changed OS policy, the runtime replaces its retaine
 worker before running that turn so the new policy reaches a fresh process.
 Launch-policy overrides such as `enforce_sandbox` are reapplied before deriving
 the spawn environment, including after an agent revision changes.
-Whole-process `allow_network: false` also blocks network-based model-provider
-access, so those providers cannot run under that policy.
+Whole-process `allow_network: false` denies direct external network connections
+from the worker. Supported brokered inference, including Claude SDK's owned
+model broker, can remain available without granting direct provider connections.
 
 Claude SDK routes supported HTTP egress and credential injection through an
 owned broker outside its confined worker. Direct CLI preparation without an
