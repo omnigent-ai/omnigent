@@ -1,6 +1,6 @@
 import { type RefObject, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
-  isHistoryInput,
+  historyDirectionOf,
   type ComposerInputEvent,
   type ComposerKeyboardEvent,
   type ComposerTextTarget,
@@ -35,10 +35,14 @@ function tagTokens(tags: TaggedMentions): string[] {
   return [...tags.files.map(fileMentionToken), ...tags.sessions.map(sessionTagToken)];
 }
 
-/** Where a deleted tag's token was removed: the input, and its text just before that change. */
+/**
+ * Where a deleted tag's token was removed: the input, its text just before that change, and the
+ * one history direction whose change may reclaim the tag.
+ */
 interface RestorePoint {
   input: ComposerTextTarget;
   value: string;
+  reclaimedBy: "undo" | "redo";
 }
 
 /** The tokens of `tokens` that stand in any of `segments`. */
@@ -333,13 +337,15 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     lastSeenRef.current.set(input, after);
     const owned = ownedMentionTokens();
     const restorePoints = restorePointsRef.current;
-    if (isHistoryInput(event)) {
-      // An undo or redo reclaims a released tag only in the input its token was removed from, and
-      // only at exactly the text from before that removal.
+    const direction = historyDirectionOf(event);
+    if (direction !== null) {
+      // Reclaim only in the input the token left, at its pre-removal text, in the reversing
+      // direction. Walking back, that text is first reached by the reversing undo: an ordinary
+      // change landing on it earlier would have dropped the point. Redo mirrors this.
       const released = releasedRef.current;
       const restores = (token: string) => {
         const point = restorePoints.get(token);
-        return point?.input === input && point.value === after;
+        return point?.input === input && point.reclaimedBy === direction && point.value === after;
       };
       reclaim({
         files: released.files.filter((it) => restores(fileMentionToken(it))),
@@ -352,13 +358,16 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
         if (point.value === after) restorePoints.delete(token);
       }
     }
-    // A change that removes an active tag's token records where it was removed from.
+    // A change that removes an active tag's token records where it was removed from. An undo's
+    // removal leaves its text ahead in history, so a redo reclaims it; any other removal leaves it
+    // behind, so an undo does.
     const afterTokens = tokensIn([after], owned);
     const active = new Set(tagTokens(activeRef.current));
     for (const token of tokensIn([before], owned)) {
       if (afterTokens.has(token)) continue;
       if (active.has(token) || releasedBeforeNoticeRef.current.has(token)) {
-        restorePoints.set(token, { input, value: before });
+        const reclaimedBy = direction === "undo" ? "redo" : "undo";
+        restorePoints.set(token, { input, value: before, reclaimedBy });
       }
     }
     releasedBeforeNoticeRef.current.clear();

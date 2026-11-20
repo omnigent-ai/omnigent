@@ -220,6 +220,22 @@ describe("CodeMirrorComposerInput change events", () => {
     expect(onChange.mock.results.map((result) => result.value)).toEqual([false, true, true]);
   });
 
+  it("reports an undo as 'undo' and a redo as 'redo', and an ordinary edit with no direction", () => {
+    const onChange = vi.fn<(event: ComposerInputEvent) => void>();
+    const { content, target } = mount({ onChange });
+    act(() => {
+      insertComposerText(target(), "draft", 0, 0);
+    });
+    const editor = EditorView.findFromDOM(content)!;
+    act(() => void undo(editor));
+    act(() => void redo(editor));
+    expect(onChange.mock.calls.map(([event]) => event.historyDirection)).toEqual([
+      undefined,
+      "undo",
+      "redo",
+    ]);
+  });
+
   it("takes a controlled value without reporting it or making it undoable", () => {
     const onChange = vi.fn();
     const { content, target, rerender, setTarget } = mount({ value: "", onChange });
