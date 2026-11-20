@@ -8,6 +8,7 @@ lockstep).
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from omnigent.inner.bundle_skills import (
     claude_agents_skill_args,
     claude_native_skill_args,
     ensure_bundle_plugin_manifest,
+    stage_contained_bundle_skills,
 )
 
 
@@ -74,6 +76,165 @@ def _make_bundle_with_skill(root: Path) -> Path:
     (bundle / "skills" / "only").mkdir(parents=True)
     (bundle / "skills" / "only" / "SKILL.md").write_text("# only\n")
     return bundle
+
+
+@pytest.mark.parametrize("agent_name", [None, "contained-agent"])
+def test_stage_contained_bundle_skills_excludes_bundle_credentials(
+    tmp_path: Path, agent_name: str | None
+) -> None:
+    bundle = _make_bundle_with_skill(tmp_path)
+    for name in ("agent.yaml", "config.yaml", ".mcp.json"):
+        (bundle / name).write_text("parent-only-credential")
+    (bundle / ".claude-plugin").mkdir()
+    manifest = bundle / ".claude-plugin/plugin.json"
+    manifest.write_text('{"name":"untrusted","mcpServers":"../.mcp.json"}')
+    script = bundle / "skills/only/scripts/probe.sh"
+    script.parent.mkdir()
+    script.write_text("#!/bin/sh\nprintf skill-output\n")
+    script.chmod(0o755)
+
+    destination = tmp_path / "runtime/plugin"
+    assert stage_contained_bundle_skills(bundle, destination, agent_name) == destination
+
+    assert {entry.name for entry in destination.iterdir()} == {"skills", ".claude-plugin"}
+    assert (destination / "skills/only/SKILL.md").read_text() == "# only\n"
+    staged_script = destination / "skills/only/scripts/probe.sh"
+    assert staged_script.read_bytes() == script.read_bytes()
+    assert staged_script.stat().st_mode & 0o777 == 0o755
+    assert not os.path.samefile(staged_script, script)
+    generated = json.loads((destination / ".claude-plugin/plugin.json").read_text())
+    assert generated["name"] == (agent_name or bundle.name)
+    assert set(generated) == {"name", "description"}
+    assert "mcpServers" in manifest.read_text()
+    assert all(
+        "parent-only-credential" not in entry.read_text()
+        for entry in destination.rglob("*")
+        if entry.is_file()
+    )
+
+
+@pytest.mark.parametrize("target_kind", ["config", "directory", "root", "dangling-root"])
+def test_stage_contained_bundle_skills_rejects_escaping_symlinks(
+    tmp_path: Path, target_kind: str
+) -> None:
+    bundle = _make_bundle_with_skill(tmp_path)
+    secret = bundle / "agent.yaml"
+    secret.write_text("parent-only-credential")
+    if target_kind == "config":
+        (bundle / "skills/only/credential").symlink_to("../../agent.yaml")
+    elif target_kind == "directory":
+        (bundle / "skills/only/outside").symlink_to(bundle, target_is_directory=True)
+    else:
+        shutil.rmtree(bundle / "skills")
+        target = bundle if target_kind == "root" else tmp_path / "missing"
+        (bundle / "skills").symlink_to(target, target_is_directory=True)
+    destination = tmp_path / "runtime/plugin"
+
+    with pytest.raises(ValueError, match="symlink"):
+        stage_contained_bundle_skills(bundle, destination, None)
+
+    assert not destination.exists()
+    assert secret.read_text() == "parent-only-credential"
+
+
+def test_stage_contained_bundle_skills_rejects_hardlinked_configuration(tmp_path: Path) -> None:
+    bundle = _make_bundle_with_skill(tmp_path)
+    secret = bundle / ".mcp.json"
+    secret.write_text("parent-only-credential")
+    (bundle / "skills/only/reference.json").hardlink_to(secret)
+    destination = tmp_path / "runtime/plugin"
+
+    with pytest.raises(ValueError, match="hard-linked"):
+        stage_contained_bundle_skills(bundle, destination, None)
+
+    assert not destination.exists()
+    assert secret.read_text() == "parent-only-credential"
+
+
+def test_stage_contained_bundle_skills_materializes_internal_links(tmp_path: Path) -> None:
+    bundle = _make_bundle_with_skill(tmp_path)
+    skill = bundle / "skills/only"
+    (skill / "alias.md").symlink_to("SKILL.md")
+    (bundle / "skills/alias").symlink_to("only", target_is_directory=True)
+    destination = stage_contained_bundle_skills(bundle, tmp_path / "plugin", None)
+
+    for relative in ("skills/only/alias.md", "skills/alias/SKILL.md"):
+        staged = destination / relative
+        assert staged.read_text() == "# only\n"
+        assert not staged.is_symlink()
+        assert not os.path.samefile(staged, skill / "SKILL.md")
+    assert not (destination / "skills/alias").is_symlink()
+
+
+def test_stage_contained_bundle_skills_rejects_cycles(tmp_path: Path) -> None:
+    bundle = _make_bundle_with_skill(tmp_path)
+    (bundle / "skills/only/cycle").symlink_to("..", target_is_directory=True)
+    destination = tmp_path / "plugin"
+
+    with pytest.raises(ValueError, match="cycles"):
+        stage_contained_bundle_skills(bundle, destination, None)
+
+    assert not destination.exists()
+
+
+def test_stage_contained_bundle_skills_rejects_special_files(tmp_path: Path) -> None:
+    bundle = _make_bundle_with_skill(tmp_path)
+    os.mkfifo(bundle / "skills/only/pipe")
+    destination = tmp_path / "plugin"
+
+    with pytest.raises(ValueError, match="regular files and directories"):
+        stage_contained_bundle_skills(bundle, destination, None)
+
+    assert not destination.exists()
+
+
+def test_stage_contained_bundle_skills_cannot_follow_a_swapped_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = _make_bundle_with_skill(tmp_path)
+    source = bundle / "skills/only/SKILL.md"
+    secret = bundle / "agent.yaml"
+    secret.write_text("parent-only-credential")
+    destination = tmp_path / "plugin"
+    original_open = os.open
+
+    def swap_source(path, flags, mode=0o777, *, dir_fd=None):
+        if path == "SKILL.md" and dir_fd is not None:
+            # Replace the file after validation, immediately before the actual read.
+            source.unlink()
+            source.symlink_to(secret)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", swap_source)
+    monkeypatch.setattr(os, "supports_dir_fd", os.supports_dir_fd | {swap_source})
+
+    with pytest.raises(OSError):
+        stage_contained_bundle_skills(bundle, destination, None)
+
+    assert not destination.exists()
+    assert secret.read_text() == "parent-only-credential"
+
+
+def test_stage_contained_bundle_skills_without_skills_is_manifest_only(tmp_path: Path) -> None:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    destination = stage_contained_bundle_skills(bundle, tmp_path / "plugin", None)
+    assert {entry.name for entry in destination.iterdir()} == {".claude-plugin"}
+
+
+def test_stage_contained_bundle_skills_requires_a_fresh_destination(tmp_path: Path) -> None:
+    bundle = _make_bundle_with_skill(tmp_path)
+    destination = tmp_path / "plugin"
+    destination.mkdir()
+    existing = destination / ".mcp.json"
+    existing.write_text("leave-existing-content")
+
+    with pytest.raises(FileExistsError):
+        stage_contained_bundle_skills(bundle, destination, None)
+
+    assert existing.read_text() == "leave-existing-content"
+    with pytest.raises(ValueError, match="outside the original bundle"):
+        stage_contained_bundle_skills(bundle, bundle / "plugin", None)
 
 
 @pytest.mark.parametrize(

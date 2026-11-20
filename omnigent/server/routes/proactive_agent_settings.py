@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider, local_single_user_enabled
+from omnigent.server.proactive_agent import PROACTIVE_AGENT_ID
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.stores import PermissionStore
 from omnigent.stores.proactive_agent_settings_store import ProactiveAgentSettingsStore
@@ -27,12 +28,14 @@ class ProactiveAgentSettings(BaseModel):
     :param user_enabled: The caller's own setting.
     :param enabled: Whether the agent runs for the caller: both settings on.
     :param can_manage_workspace: Whether the caller may change the workspace setting.
+    :param agent_id: The proactive agent's id, which its Inbox items carry.
     """
 
     workspace_enabled: bool
     user_enabled: bool
     enabled: bool
     can_manage_workspace: bool
+    agent_id: str
 
 
 class ProactiveAgentToggle(BaseModel):
@@ -84,6 +87,7 @@ def create_proactive_agent_settings_router(
             user_enabled=user_enabled,
             enabled=workspace_enabled and user_enabled,
             can_manage_workspace=await _can_manage(user_id),
+            agent_id=PROACTIVE_AGENT_ID,
         )
 
     @router.get("/proactive-agent/settings", response_model=ProactiveAgentSettings)

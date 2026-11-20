@@ -1,24 +1,30 @@
 /**
  * A workflow's plan, its planning conversation, and the sessions that ran it.
- * Drafts become runnable when the user saves the agent's proposed plan.
+ * Drafts become runnable when the user saves the agent's proposed plan. Someone a
+ * workflow is shared with sees it read-only, with Run and Clone, and their own runs.
  */
 
-import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import {
   ChevronDownIcon,
   ChevronLeftIcon,
   ClockIcon,
+  CopyIcon,
   Loader2Icon,
   PencilIcon,
   PlayIcon,
   SaveIcon,
+  ShareIcon,
   Trash2Icon,
   WorkflowIcon,
 } from "lucide-react";
 
+import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { KeyboardShortcutTooltip } from "@/components/KeyboardShortcut";
 import { PageScroll } from "@/components/PageScroll";
+import { PermissionsModal } from "@/components/PermissionsModal";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
+import { CardRadioGroup } from "@/components/theme/CardRadioGroup";
 import { DeleteWorkflowDialog } from "@/components/workflows/DeleteWorkflowDialog";
 import { WorkflowAutomations } from "@/components/workflows/WorkflowAutomations";
 import { Button } from "@/components/ui/button";
@@ -29,19 +35,11 @@ import {
   type WorkflowSessionRequest,
   WorkflowSessionDialog,
 } from "@/components/workflows/WorkflowSessionDialog";
-import {
-  RunGraphButton,
-  RunPlanButton,
-  RunTimeline,
-  useRunTaskMenus,
-} from "@/components/workflows/RunTasks";
-import { planRunControl } from "@/shell/PlanRunButton";
-import {
-  WorkflowGraphOverlay,
-  WorkflowStepsGraph,
-} from "@/components/workflows/WorkflowStepsGraph";
+import { WorkflowRunRow } from "@/components/workflows/WorkflowRunRow";
+import { WorkflowStepsGraph } from "@/components/workflows/WorkflowStepsGraph";
 import { useNow } from "@/hooks/useNow";
 import {
+  useCloneWorkflow,
   useWorkflow,
   useWorkflowRuns,
   useSaveWorkflowDescription,
@@ -49,7 +47,6 @@ import {
   WorkflowNotFoundError,
 } from "@/hooks/useWorkflow";
 import { useJournalEntryPosition, useSessionJournal } from "@/hooks/useSessionJournal";
-import { useSessionWorking } from "@/hooks/useSessionWorking";
 import { useAutomationsEnabled } from "@/hooks/useConversations";
 import { useSession } from "@/hooks/useSession";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
@@ -57,23 +54,23 @@ import { WorkflowPlanningChat } from "@/components/workflows/WorkflowPlanningCha
 import { automationPagePath } from "@/lib/automationFromSession";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isSharingOff, SHARING_OFF_REASON } from "@/lib/capabilities";
+import { UNSHAREABLE_WORKFLOW_MESSAGE, workflowSharingAvailable } from "@/lib/permissionsApi";
 import { Link, useNavigate, useParams } from "@/lib/routing";
-import { formatRunTimestamp } from "@/lib/scheduleText";
 import { cn } from "@/lib/utils";
-import { currentPlan, planDescription, planSteps, type StepState } from "@/lib/sessionJournal";
+import { currentPlan, planDescription, planSteps } from "@/lib/sessionJournal";
 import { ApiError } from "@/lib/sessionsApi";
-import {
-  describeWorkflowRun,
-  isWorkflowRunWorking,
-  runStepProgress,
-  type WorkflowRun,
-  type WorkflowRunState,
-} from "@/lib/workflowRuns";
-import { StepGlyph } from "@/shell/TasksPanel";
 import { useChatStore } from "@/store/chatStore";
 
 // The planning chat's outline flash lasts as long as `.animate-user-msg-flash`.
 const PLANNING_CHAT_FLASH_MS = 800;
+
+/** Why someone a workflow is shared with can't take each action only its owner takes. */
+const OWNER_ONLY_REASONS = {
+  edit: "Only the workflow's owner can edit it.",
+  share: "Only the workflow's owner can share it.",
+  delete: "Only the workflow's owner can delete it.",
+} as const;
 
 export function WorkflowDetailPage() {
   const { workflowId = "" } = useParams<{ workflowId: string }>();
@@ -93,14 +90,20 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
   const [sessionRequest, setSessionRequest] = useState<WorkflowSessionRequest | null>(null);
   const [sessionOpen, setSessionOpen] = useState(false);
   const [automationOpen, setAutomationOpen] = useState(false);
+  const [shareOpen, setShareOpen] = useState(false);
+  const cloneWorkflow = useCloneWorkflow();
   const [plannerOpen, setPlannerOpen] = useState<boolean | null>(null);
   const [plannerExpanded, setPlannerExpanded] = useState(false);
   // Non-zero while the open planning chat flashes; each press restarts it.
   const [plannerFlash, setPlannerFlash] = useState(0);
-  const showPlanner = plannerOpen ?? workflow?.is_draft ?? false;
+  // The proposal whose description the user chose over the current one; each is reviewed anew.
+  const [acceptedProposalId, setAcceptedProposalId] = useState<string | null>(null);
+  // Someone it is shared with only reads it, and its planning chat is its owner's.
+  const isViewer = workflow?.viewer_role === "viewer";
+  const showPlanner = !isViewer && (plannerOpen ?? workflow?.is_draft ?? false);
   const isMobile = useIsMobileViewport();
   const { session: planningSession, error: planningSessionError } = useSession(
-    workflow?.planning_session_id,
+    isViewer ? undefined : workflow?.planning_session_id,
   );
   // Known archived or deleted; a session still loading may yet open.
   const planningSessionGone =
@@ -111,7 +114,8 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
     canReadProposal ? planningSession.id : undefined,
     canReadProposal,
   );
-  // The proposal the description was saved from; the server places one outside the loaded pages.
+  // The proposal the description was saved from or kept over; the server places one outside
+  // the loaded pages.
   const source = workflow?.description_source ?? undefined;
   const savedFrom = source ? journal.entries.find((entry) => entry.id === source) : undefined;
   const sourcePosition = useJournalEntryPosition(
@@ -169,22 +173,23 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
   const runList = runs.data?.pages.flatMap((page) => page.runs) ?? [];
   const proposal = canReadProposal ? currentPlan(journal.entries) : null;
   const proposedSteps = proposal ? planSteps(proposal) : null;
-  // A proposal replaces the description only if it's newer than where the description came
-  // from, so an edit made since stands: the proposal Save plan took it from, by journal order,
-  // or else the workflow's last write, in whole seconds, where a tie keeps the description.
-  // Where that proposal sits in this journal: null when it came from another planning chat,
-  // undefined until the server places it, which offers no description meanwhile.
+  // Where the description's source sits in this journal: null when it came from another
+  // planning chat, undefined until the server places it, which offers no description meanwhile.
   const sourceAt = savedFrom ? savedFrom.position : sourcePosition.data;
+  // Only a proposal newer than that source, or else than the workflow's last write in whole
+  // seconds (a tie keeps the description), offers its description, so an edit made since stands.
   const proposalIsNewer =
     proposal !== null &&
     (!source || sourceAt === null
       ? proposal.created_at > (workflow.updated_at ?? 0)
       : sourceAt !== undefined && proposal.position > sourceAt);
   const proposedDescription = proposalIsNewer ? planDescription(proposal) : null;
+  // A different description is only offered: Save plan keeps the current one unless accepted.
   const newDescription =
     proposedSteps?.length && proposedDescription !== workflow.description
       ? proposedDescription
       : null;
+  const proposedChosen = newDescription !== null && acceptedProposalId === proposal?.id;
   const stepSignature = (steps: typeof workflow.steps) =>
     JSON.stringify(
       steps.map(({ id, name, goal, depends_on }) => [id, name, goal ?? null, depends_on]),
@@ -194,6 +199,17 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
     (stepSignature(proposedSteps) !== stepSignature(workflow.steps) || newDescription !== null);
   const isDraft = workflow.is_draft ?? workflow.steps.length === 0;
   const canRun = !isDraft && !hasChanges;
+  const canShare = !isViewer && workflowSharingAvailable(info);
+  const shareDisabledReason = isSharingOff(info)
+    ? SHARING_OFF_REASON
+    : workflow.shareable === false
+      ? UNSHAREABLE_WORKFLOW_MESSAGE
+      : undefined;
+  const clone = () =>
+    cloneWorkflow.mutate(workflow.id, {
+      onSuccess: (copy) => navigate(`/workflows/${copy.id}`),
+      onError: (cloneError) => showToast(`Couldn’t clone workflow. ${cloneError.message}`),
+    });
   // Expanded, the planner covers the page, which keeps its width underneath so
   // it doesn't reflow; `invisible` keeps its scroll position and tab order out.
   const plannerFillsPage = showPlanner && !isMobile && plannerExpanded;
@@ -234,29 +250,81 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
                 Draft
               </span>
             )}
+            {isViewer && (
+              <p className="mt-1 text-sm text-muted-foreground" data-testid="workflow-detail-owner">
+                Shared by {workflow.owner_display_name ?? "another user"}
+              </p>
+            )}
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <KeyboardShortcutTooltip label="Edit plan with agent">
+            {isViewer ? (
+              <DisabledActionTooltip reason={OWNER_ONLY_REASONS.edit} label="Edit plan with agent">
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label="Edit plan with agent"
+                  data-testid="workflow-detail-edit"
+                  disabled
+                >
+                  <PencilIcon className="size-4" />
+                </Button>
+              </DisabledActionTooltip>
+            ) : (
+              <KeyboardShortcutTooltip label="Edit plan with agent">
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label="Edit plan with agent"
+                  data-testid="workflow-detail-edit"
+                  onClick={openPlanner}
+                >
+                  <PencilIcon className="size-4" />
+                </Button>
+              </KeyboardShortcutTooltip>
+            )}
+            <DisabledActionTooltip
+              reason={isViewer ? OWNER_ONLY_REASONS.delete : undefined}
+              label="Delete workflow"
+            >
               <Button
                 variant="ghost"
                 size="icon-sm"
-                aria-label="Edit plan with agent"
-                data-testid="workflow-detail-edit"
-                onClick={openPlanner}
+                aria-label="Delete workflow"
+                data-testid="workflow-detail-delete"
+                disabled={isViewer}
+                onClick={() => setDeleteOpen(true)}
               >
-                <PencilIcon className="size-4" />
+                <Trash2Icon className="size-4" />
               </Button>
-            </KeyboardShortcutTooltip>
+            </DisabledActionTooltip>
+            {(isViewer || canShare) && (
+              <DisabledActionTooltip
+                reason={isViewer ? OWNER_ONLY_REASONS.share : shareDisabledReason}
+                label="Share workflow"
+              >
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label="Share workflow"
+                  data-testid="workflow-detail-share"
+                  disabled={isViewer || shareDisabledReason !== undefined}
+                  onClick={() => setShareOpen(true)}
+                >
+                  <ShareIcon className="size-4" />
+                </Button>
+              </DisabledActionTooltip>
+            )}
             <Button
-              variant="ghost"
-              size="icon-sm"
-              aria-label="Delete workflow"
-              data-testid="workflow-detail-delete"
-              onClick={() => setDeleteOpen(true)}
+              variant="outline"
+              data-testid="workflow-detail-clone"
+              disabled={cloneWorkflow.isPending}
+              loading={cloneWorkflow.isPending}
+              onClick={clone}
             >
-              <Trash2Icon className="size-4" />
+              <CopyIcon className="size-4" />
+              Clone
             </Button>
-            {automationsEnabled && (
+            {automationsEnabled && !isViewer && (
               <Button
                 variant="outline"
                 data-testid="workflow-detail-create-automation"
@@ -282,7 +350,13 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
         </div>
         <WorkflowDescription
           workflowId={workflow.id}
-          text={newDescription ?? workflow.description}
+          text={workflow.description}
+          proposed={newDescription}
+          choice={proposedChosen ? "proposed" : "current"}
+          onChoiceChange={(choice) =>
+            setAcceptedProposalId(choice === "proposed" ? (proposal?.id ?? null) : null)
+          }
+          readOnly={isViewer}
         />
 
         <section className="mt-6">
@@ -303,13 +377,14 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
                 onClick={() => {
                   if (!proposal || !proposedSteps) return;
                   setPlannerOpen(showPlanner);
-                  // Even an unchanged description records the proposal it now comes from. The
-                  // server keeps a description another client changed after this page loaded it.
+                  // Keeping the current description still records the proposal, so it isn't
+                  // offered again. The server keeps a description another client saved since.
+                  const kept = newDescription !== null && !proposedChosen;
                   const description =
                     proposedDescription === null
                       ? {}
                       : {
-                          description: proposedDescription,
+                          description: kept ? workflow.description : proposedDescription,
                           expected_description: workflow.description,
                           description_source: proposal.id,
                         };
@@ -342,12 +417,18 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
             <div className="flex flex-col items-center gap-2 rounded-xl border border-dashed border-border bg-card px-6 py-16 text-center">
               <WorkflowIcon className="size-8 text-muted-foreground/50" />
               <p className="text-ui font-medium">No plan yet</p>
-              <p className="max-w-sm text-sm text-muted-foreground">
-                Describe the workflow to an agent.
-                <br />
-                Your proposed steps will appear here.
-              </p>
-              {!showPlanner && (
+              {isViewer ? (
+                <p className="max-w-sm text-sm text-muted-foreground">
+                  Its owner hasn’t saved a plan yet.
+                </p>
+              ) : (
+                <p className="max-w-sm text-sm text-muted-foreground">
+                  Describe the workflow to an agent.
+                  <br />
+                  Your proposed steps will appear here.
+                </p>
+              )}
+              {!showPlanner && !isViewer && (
                 <Button variant="outline" size="sm" onClick={openPlanner}>
                   Create plan
                 </Button>
@@ -356,7 +437,7 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
           )}
         </section>
 
-        {automationsEnabled && !isDraft && (
+        {automationsEnabled && !isDraft && !isViewer && (
           <WorkflowAutomations workflowId={workflowId} now={now} />
         )}
 
@@ -420,6 +501,9 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
           open={sessionOpen}
           onOpenChange={setSessionOpen}
         />
+        {canShare && shareDisabledReason === undefined && (
+          <PermissionsModal workflow={workflow} open={shareOpen} onOpenChange={setShareOpen} />
+        )}
         <CreateScheduledTaskDialog
           open={automationsEnabled && automationOpen}
           onOpenChange={setAutomationOpen}
@@ -483,19 +567,43 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
   );
 }
 
+type DescriptionChoice = "current" | "proposed";
+
 /**
  * The description, in a section like an automation's prompt: three lines and
  * an ellipsis, with a chevron to show the rest when there is more. Its pencil
- * edits it in place, like a pull request's description.
+ * edits it in place, like a pull request's description. A proposal that would
+ * change it is shown beside it, to keep the current one or use the proposal's.
  */
-function WorkflowDescription({ workflowId, text }: { workflowId: string; text: string }) {
+function WorkflowDescription({
+  workflowId,
+  text,
+  proposed,
+  choice,
+  onChoiceChange,
+  readOnly = false,
+}: {
+  workflowId: string;
+  text: string;
+  /** A newer proposal's different description, or null. */
+  proposed: string | null;
+  /** The description Save plan applies while *proposed* is offered. */
+  choice: DescriptionChoice;
+  onChoiceChange: (choice: DescriptionChoice) => void;
+  /** For someone the workflow is shared with: no pencil. */
+  readOnly?: boolean;
+}) {
   const [expanded, setExpanded] = useState(false);
   const [clamped, setClamped] = useState(false);
-  // The text being edited; null while the description is shown.
+  // The text being edited, and the one the editor opened with; null while the description is shown.
   const [draft, setDraft] = useState<string | null>(null);
+  const [draftStart, setDraftStart] = useState("");
   const editing = draft !== null;
+  // Both descriptions show in full while one is chosen.
+  const reviewing = proposed !== null;
   const bodyRef = useRef<HTMLParagraphElement>(null);
   const editorRef = useRef<HTMLFormElement>(null);
+  const headingId = useId();
   const errorId = useId();
   const update = useSaveWorkflowDescription(workflowId);
 
@@ -509,7 +617,7 @@ function WorkflowDescription({ workflowId, text }: { workflowId: string; text: s
     const observer = new ResizeObserver(measure);
     observer.observe(body);
     return () => observer.disconnect();
-  }, [text, expanded, editing]);
+  }, [text, expanded, editing, reviewing]);
 
   // The editor opens ready to continue the text, with the caret after it.
   useEffect(() => {
@@ -533,23 +641,31 @@ function WorkflowDescription({ workflowId, text }: { workflowId: string; text: s
     const next = draft.trim();
     // The shortcut follows the Save button: a workflow needs a description.
     if (!next) return;
-    if (next === text) {
+    // Either offered wording, unedited, is a choice for Save plan rather than a write.
+    if (next === text || (reviewing && next === proposed)) {
+      if (reviewing) onChoiceChange(next === text ? "current" : "proposed");
       close();
       return;
     }
     update.mutate(next, { onSuccess: close });
   };
   const cancel = () => {
-    const changed = draft !== null && draft.trim() !== text;
+    const changed = draft !== null && draft.trim() !== draftStart.trim();
     if (changed && !window.confirm("Discard your description changes?")) return;
     close();
+  };
+  // The editor starts from the chosen description.
+  const edit = () => {
+    const start = choice === "proposed" && proposed !== null ? proposed : text;
+    setDraftStart(start);
+    setDraft(start);
   };
 
   return (
     <section className="mt-6">
       <div className="mb-2 flex items-center gap-1">
-        <h2 className="text-sm font-medium text-muted-foreground">
-          {!editing && (clamped || expanded) ? (
+        <h2 id={headingId} className="text-sm font-medium text-muted-foreground">
+          {!editing && !reviewing && (clamped || expanded) ? (
             <button
               type="button"
               aria-expanded={expanded}
@@ -567,14 +683,14 @@ function WorkflowDescription({ workflowId, text }: { workflowId: string; text: s
             "Description"
           )}
         </h2>
-        {!editing && (
+        {!editing && !readOnly && (
           <KeyboardShortcutTooltip label="Edit description">
             <Button
               variant="ghost"
               size="icon-xs"
               aria-label="Edit description"
               className="-my-0.5 text-muted-foreground"
-              onClick={() => setDraft(text)}
+              onClick={edit}
             >
               <PencilIcon aria-hidden="true" className="size-3" />
             </Button>
@@ -637,6 +753,38 @@ function WorkflowDescription({ workflowId, text }: { workflowId: string; text: s
             </Button>
           </div>
         </form>
+      ) : reviewing ? (
+        <CardRadioGroup<DescriptionChoice>
+          labelledBy={headingId}
+          value={choice}
+          onSelect={onChoiceChange}
+          className="grid gap-3 sm:grid-cols-2"
+          cardClassName="gap-1 p-3 text-left"
+          items={[
+            {
+              value: "current",
+              testId: "workflow-detail-keep-description",
+              body: (
+                <DescriptionOption
+                  label="Keep current"
+                  text={text}
+                  testId="workflow-detail-description"
+                />
+              ),
+            },
+            {
+              value: "proposed",
+              testId: "workflow-detail-use-proposed-description",
+              body: (
+                <DescriptionOption
+                  label="Use proposed"
+                  text={proposed}
+                  testId="workflow-detail-proposed-description"
+                />
+              ),
+            },
+          ]}
+        />
       ) : (
         <p
           ref={bodyRef}
@@ -653,6 +801,27 @@ function WorkflowDescription({ workflowId, text }: { workflowId: string; text: s
   );
 }
 
+/** One description to choose from, inside its radio card. */
+function DescriptionOption({
+  label,
+  text,
+  testId,
+}: {
+  label: string;
+  text: string;
+  testId: string;
+}) {
+  return (
+    <>
+      {/* Clear of the card's check mark. */}
+      <span className="pr-6 text-xs font-medium text-muted-foreground">{label}</span>
+      <span className="whitespace-pre-wrap text-sm text-foreground/90" data-testid={testId}>
+        {text}
+      </span>
+    </>
+  );
+}
+
 function BackLink() {
   return (
     <Link
@@ -663,127 +832,5 @@ function BackLink() {
       <ChevronLeftIcon className="size-4" />
       Workflows
     </Link>
-  );
-}
-
-// A run's glyph: the Tasks tab's, for the step state its run state matches.
-const RUN_GLYPHS: Record<WorkflowRunState["kind"], StepState> = {
-  running: "running",
-  waiting: "needs_input",
-  done: "done",
-  failed: "failed",
-  stopped: "stopped",
-};
-
-/**
- * One run: its session's title, when it started and where it stands, over the
- * Tasks tab's timeline of its tasks. The row opens the session; a segment opens
- * that task there, and the graph button shows the run on the workflow's graph.
- */
-function WorkflowRunRow({
-  run,
-  now,
-  workflowId,
-  workflowName,
-}: {
-  run: WorkflowRun;
-  now: Date;
-  workflowId: string;
-  workflowName: string;
-}) {
-  const sessionWorking = useSessionWorking(
-    run.isCurrent ? run.sessionId : null,
-    isWorkflowRunWorking(run),
-  );
-  const state = describeWorkflowRun(run, sessionWorking);
-  const progress = useMemo(() => runStepProgress(run, sessionWorking), [run, sessionWorking]);
-  // Stop while the run's session works; play once it stopped with tasks left.
-  const canAct = run.isCurrent && !run.archived;
-  const control = canAct
-    ? planRunControl(progress, run.statuses, sessionWorking, run.planGraphRevision)
-    : null;
-  const refreshKeys = [["workflow-runs", workflowId]];
-  const taskMenus = useRunTaskMenus(canAct ? run.sessionId : null, refreshKeys, run.id);
-  const [graphOpen, setGraphOpen] = useState(false);
-  const sessionPath = `/c/${encodeURIComponent(run.sessionId)}`;
-  const title = run.title || "Untitled session";
-  const started = formatRunTimestamp(run.startedAt, now) ?? "—";
-  const stateLabel = (
-    <span
-      className={cn(state.kind === "waiting" && "text-brand-accent")}
-      data-testid="workflow-run-state"
-    >
-      {state.label}
-    </span>
-  );
-  return (
-    <li
-      className="relative rounded-lg px-2 py-2.5 transition-colors hover:bg-muted/60 has-[a:focus-visible]:bg-muted/60"
-      data-testid="workflow-run"
-      data-run-state={state.kind}
-    >
-      <div className="flex items-start gap-3">
-        <span className="flex size-5 shrink-0 items-center justify-center">
-          <StepGlyph state={RUN_GLYPHS[state.kind]} />
-        </span>
-        <div className="min-w-0 flex-1">
-          {/* The link covers the row; the timeline and the graph button sit above it. */}
-          <Link
-            to={sessionPath}
-            className="block truncate text-sm leading-5 after:absolute after:inset-0 after:rounded-lg after:content-[''] focus-visible:outline-none"
-          >
-            {title}
-          </Link>
-          <p className="mt-0.5 flex flex-wrap items-baseline gap-x-2 text-xs text-muted-foreground">
-            <span>{started}</span>
-            {stateLabel}
-            {run.archived && <span>Archived</span>}
-          </p>
-          {progress.length > 0 && (
-            <RunTimeline
-              sessionId={run.sessionId}
-              progress={progress}
-              menuActionFor={taskMenus}
-              className="mt-3 pr-1"
-            />
-          )}
-        </div>
-        {control && (
-          <RunPlanButton
-            sessionId={run.sessionId}
-            runId={run.id}
-            planName={workflowName}
-            control={control}
-            refreshKeys={refreshKeys}
-            className="relative -my-1"
-          />
-        )}
-        <RunGraphButton
-          runName={title}
-          className="relative -my-1"
-          onClick={() => setGraphOpen(true)}
-        />
-      </div>
-      {graphOpen && (
-        <WorkflowGraphOverlay
-          title={workflowName}
-          subtitle={
-            <>
-              <Link to={sessionPath} className="text-foreground hover:underline">
-                {title}
-              </Link>
-              <span aria-hidden>·</span>
-              <span>{started}</span>
-              <span aria-hidden>·</span>
-              {stateLabel}
-            </>
-          }
-          steps={run.steps}
-          progress={progress}
-          menuActionFor={taskMenus}
-          onClose={() => setGraphOpen(false)}
-        />
-      )}
-    </li>
   );
 }

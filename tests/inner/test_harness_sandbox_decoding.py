@@ -18,9 +18,11 @@ from omnigent.inner.datamodel import (
     DatabricksProfileBinding,
     DatabricksProxySpec,
     GitSshBinding,
+    HostWritePathSpec,
     OSEnvSandboxSpec,
     OSEnvSpec,
     TcpEgressRoute,
+    WritePathSpec,
 )
 from omnigent.inner.os_env import _build_credential_proxy_parent_env
 from omnigent.inner.sandbox import resolve_sandbox
@@ -162,6 +164,19 @@ def test_harness_preserves_tcp_egress_route(
     )
     sandbox = OSEnvSandboxSpec(type="linux_bwrap", tcp_egress=[route])
     assert decode_sandbox(sandbox) == sandbox
+
+
+def test_harness_preserves_host_write_grant_marker(
+    decode_sandbox: Callable[[OSEnvSandboxSpec], OSEnvSandboxSpec],
+) -> None:
+    sandbox = OSEnvSandboxSpec(
+        type="linux_bwrap",
+        write_paths=[WritePathSpec(".", copy_on_write=True), "/srv/example/project"],
+        host_write_paths=["/srv/example/project"],
+    )
+    decoded = decode_sandbox(sandbox)
+    assert decoded == sandbox
+    assert isinstance(decoded.write_path_specs[1], HostWritePathSpec)
 
 
 @pytest.mark.parametrize("harness_name", _HARNESSES)

@@ -8,11 +8,11 @@
 
 import { CheckIcon, ChevronLeftIcon, ChevronRightIcon, XIcon } from "lucide-react";
 import { type ChangeEvent, useEffect, useRef, useState } from "react";
+import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { ENTER_KEY } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { CompactShortcutKeys } from "@/components/ui/kbd";
 import { isDraftingTarget } from "@/hooks/useApproveHotkey";
-import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import type { ClaudeQuestion } from "@/lib/askUserQuestion";
 import {
@@ -32,6 +32,7 @@ import {
   isTextEntry,
 } from "@/lib/hotkeys";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
+import { isComposerInput } from "@/components/composer/engine/composerInput";
 
 /**
  * Map from question id/text → either a single selected label
@@ -134,9 +135,8 @@ export function AskUserQuestionForm({
   // follows the question instead of dropping to the page.
   const focusQuestionOnMoveRef = useRef(false);
   const isMobileViewport = useIsMobileViewport();
-  const isCoarsePointer = useIsCoarsePointer();
-  // Touch and narrow viewports keep Enter as the newline key, as the composer does.
-  const preventsKeyboardSubmit = isMobileViewport || isCoarsePointer;
+  // The mobile layout keeps Enter as the newline key, as the composer does.
+  const preventsKeyboardSubmit = isMobileViewport;
   const showKeyHints = !preventsKeyboardSubmit;
   // The window listener is registered once and calls the latest handler through this ref.
   const handleKeyRef = useRef<(event: KeyboardEvent) => void>(() => {});
@@ -273,6 +273,11 @@ export function AskUserQuestionForm({
   };
   const firstUnansweredIndex = questions.findIndex((question) => !isAnswered(question));
   const allAnswered = firstUnansweredIndex === -1;
+  // Says which question keeps Submit disabled; it can be on another page.
+  const firstUnanswered = questions[firstUnansweredIndex];
+  const submitBlockedReason = firstUnanswered
+    ? `Answer question ${firstUnansweredIndex + 1}${firstUnanswered.header ? ` (${firstUnanswered.header})` : ""} to submit`
+    : undefined;
 
   const handleSubmit = () => {
     const finalAnswers: AskUserQuestionAnswers = {};
@@ -326,7 +331,7 @@ export function AskUserQuestionForm({
     };
     // The chat composer. Side-chat composers are excluded and count as other inputs.
     const composer =
-      !inside && target instanceof HTMLTextAreaElement
+      !inside && isComposerInput(target)
         ? target.closest<HTMLElement>("[data-composer-card]:not([data-side-chat])")
         : null;
     const suggestionsOpen = composer?.dataset.suggestionsOpen === "true";
@@ -612,20 +617,22 @@ export function AskUserQuestionForm({
           </Button>
         )}
         {isLast && (
-          <Button
-            size="sm"
-            onClick={handleSubmit}
-            disabled={!allAnswered}
-            className="mobile-touch-target mobile-app:h-auto mobile-app:whitespace-normal"
-            data-testid="ask-user-question-submit"
-            componentId="question.submit"
-          >
-            <CheckIcon className="mr-1 size-3.5" />
-            Submit
-            {showKeyHints && allAnswered && allSeen && (
-              <CompactShortcutKeys keys={[ENTER_KEY]} className="ml-1.5" />
-            )}
-          </Button>
+          <DisabledActionTooltip reason={submitBlockedReason} label="Submit">
+            <Button
+              size="sm"
+              onClick={handleSubmit}
+              disabled={!allAnswered}
+              className="mobile-touch-target mobile-app:h-auto mobile-app:whitespace-normal"
+              data-testid="ask-user-question-submit"
+              componentId="question.submit"
+            >
+              <CheckIcon className="mr-1 size-3.5" />
+              Submit
+              {showKeyHints && allAnswered && allSeen && (
+                <CompactShortcutKeys keys={[ENTER_KEY]} className="ml-1.5" />
+              )}
+            </Button>
+          </DisabledActionTooltip>
         )}
         <Button
           size="sm"

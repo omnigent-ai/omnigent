@@ -146,16 +146,21 @@ def _free_task_id(store: Any, user_id: str | None) -> str | ScheduledTask:
     """Return the owner's live proactive task, or the id a new one should take.
 
     Rows soft-deleted with an earlier account registration are skipped rather
-    than reactivated, so their authority never carries over.
+    than reactivated, so their authority never carries over. Every slot is
+    checked before an empty one is reused: purging an earlier registration's
+    row can empty a slot below the live task.
     """
+    free: str | None = None
     for slot in range(_MAX_TASK_SLOTS):
         task_id = proactive_task_id(user_id, slot=slot)
         existing = store.get(task_id)
         if existing is None:
-            return task_id
-        if existing.state != "deleted":
+            free = free or task_id
+        elif existing.state != "deleted":
             return existing
-    raise RuntimeError(f"no free proactive task id after {_MAX_TASK_SLOTS} deleted tasks")
+    if free is None:
+        raise RuntimeError(f"no free proactive task id after {_MAX_TASK_SLOTS} deleted tasks")
+    return free
 
 
 def find_proactive_task(store: Any, user_id: str | None) -> ScheduledTask | None:

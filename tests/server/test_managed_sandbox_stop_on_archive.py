@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 
 import click
 import pytest
 
 from omnigent.db.db_models import current_workspace_id
+from omnigent.entities import MessageData, NewConversationItem
 from omnigent.onboarding.sandboxes.base import SandboxCapabilityError
 from omnigent.server.managed_hosts import (
+    ManagedLaunchTracker,
     ManagedSandboxConfig,
     ManagedSandboxDeployment,
     launch_managed_host,
@@ -309,6 +312,238 @@ async def test_the_archive_teardown_stops_the_sandbox_last(db_uri, monkeypatch):
         sandbox_config=_deployment(fake),
     )
     assert calls == ["runner", "host-runner", "worktree", "sandbox"]
+
+
+async def _launch_for(conversations, host_store, fake, session_id, **launch):
+    tracker = ManagedLaunchTracker()
+    tracker.begin(session_id)
+    await orchestration._run_managed_launch(
+        session_id=session_id,
+        owner=_OWNER,
+        sandbox_config=_deployment(fake),
+        repos=[],
+        tracker=tracker,
+        conversation_store=conversations,
+        host_store=host_store,
+        host_registry=None,
+        tunnel_registry=None,
+        **launch,
+    )
+    assert tracker.get(session_id) is None, "the launch itself must still succeed"
+
+
+def _registering_launcher(host_store: HostStore) -> FakeSandboxLauncher:
+    def register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id, name=invocation.host_name, user_id=_OWNER
+        )
+
+    return FakeSandboxLauncher(on_host_start=register, can_resume=True)
+
+
+@pytest.fixture
+def no_undo_grace(monkeypatch):
+    from omnigent.server.routes import sessions as sessions_facade
+
+    monkeypatch.setattr(sessions_facade, "_ARCHIVE_STOP_UNDO_GRACE_S", 0.0)
+    return sessions_facade
+
+
+async def test_a_session_archived_while_provisioning_stops_once_its_host_binds(
+    db_uri, no_undo_grace
+):
+    host_store = HostStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    fake = _registering_launcher(host_store)
+    # The archive's own teardown already ran and found no host on the row.
+    conv = conversations.create_conversation()
+    conversations.update_conversation(conv.id, archived=True)
+
+    await _launch_for(conversations, host_store, fake, conv.id)
+
+    bound = conversations.get_conversation(conv.id)
+    assert bound.host_id is not None
+    await orchestration._pending_archive_stops[conv.id]
+    assert fake.stopped == [host_store.get_host(bound.host_id).sandbox_id]
+    assert fake.terminated == []
+
+
+async def test_a_session_left_active_keeps_its_new_sandbox(db_uri, no_undo_grace):
+    host_store = HostStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    fake = _registering_launcher(host_store)
+    conv = conversations.create_conversation()
+
+    await _launch_for(conversations, host_store, fake, conv.id)
+
+    assert conv.id not in orchestration._pending_archive_stops
+    assert fake.stopped == []
+
+
+async def test_an_undo_during_the_new_grace_keeps_the_sandbox(db_uri, monkeypatch):
+    from omnigent.server.routes import sessions as sessions_facade
+
+    host_store = HostStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    fake = _registering_launcher(host_store)
+    conv = conversations.create_conversation()
+    conversations.update_conversation(conv.id, archived=True)
+    # Hold the teardown inside its grace until the Undo is persisted.
+    grace = 12.5
+    monkeypatch.setattr(sessions_facade, "_ARCHIVE_STOP_UNDO_GRACE_S", grace)
+    in_grace, release = asyncio.Event(), asyncio.Event()
+    real_sleep = asyncio.sleep
+
+    async def gated_sleep(delay, *args, **kwargs):
+        if delay == grace:
+            in_grace.set()
+            await release.wait()
+            return None
+        return await real_sleep(delay, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "sleep", gated_sleep)
+
+    await _launch_for(conversations, host_store, fake, conv.id)
+    await asyncio.wait_for(in_grace.wait(), timeout=5)
+    # Undo on another replica: only the persisted flag changes.
+    conversations.update_conversation(conv.id, archived=False)
+    release.set()
+    await orchestration._pending_archive_stops[conv.id]
+
+    assert fake.stopped == []
+
+
+async def test_a_relaunch_of_an_archived_session_does_not_schedule_a_teardown(
+    db_uri, no_undo_grace
+):
+    host_store = HostStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    fake = _registering_launcher(host_store)
+    conv = conversations.create_conversation()
+    await _launch_for(conversations, host_store, fake, conv.id)
+    host = host_store.get_host(conversations.get_conversation(conv.id).host_id)
+    conversations.update_conversation(conv.id, archived=True)
+
+    # A message to the archived session kicks this relaunch and waits on it.
+    await _launch_for(conversations, host_store, fake, conv.id, relaunch_host=host)
+
+    assert conv.id not in orchestration._pending_archive_stops
+    assert fake.stopped == []
+
+
+@pytest.mark.parametrize(
+    "status_at_bind", ["running", None], ids=["running", "unknown-after-a-turn"]
+)
+async def test_a_turn_that_may_be_running_finishes_before_the_teardown(
+    db_uri, no_undo_grace, monkeypatch, status_at_bind
+):
+    host_store = HostStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    fake = _registering_launcher(host_store)
+    conv = conversations.create_conversation()
+    # The first turn archived its own session. Its status may not have reached this
+    # replica or the store, but its message has.
+    conversations.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_first_turn",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+            )
+        ],
+    )
+    conversations.update_conversation(conv.id, archived=True)
+    if status_at_bind is not None:
+        conversations.set_session_live_status(conv.id, status_at_bind)
+    monkeypatch.setattr(orchestration, "_SELF_ARCHIVE_TURN_POLL_S", 0.01)
+    reads = 0
+    polled = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    read_activity = conversations.get_session_activity
+
+    def counting_read(ids):
+        nonlocal reads
+        reads += 1
+        # The launch's own check is the first read; the rest are the teardown's turn wait.
+        if reads >= 3:
+            loop.call_soon_threadsafe(polled.set)
+        return read_activity(ids)
+
+    monkeypatch.setattr(conversations, "get_session_activity", counting_read)
+
+    await _launch_for(conversations, host_store, fake, conv.id)
+    teardown = orchestration._pending_archive_stops[conv.id]
+    await asyncio.wait_for(polled.wait(), timeout=5)
+    assert not teardown.done() and fake.stopped == []
+
+    conversations.set_session_live_status(conv.id, "idle")
+    await asyncio.wait_for(teardown, timeout=5)
+    assert len(fake.stopped) == 1
+
+
+async def test_a_failed_archive_check_keeps_the_launch_and_schedules_nothing(
+    db_uri, no_undo_grace, monkeypatch
+):
+    host_store = HostStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    fake = _registering_launcher(host_store)
+    conv = conversations.create_conversation()
+    conversations.update_conversation(conv.id, archived=True)
+
+    def unavailable(_ids):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(conversations, "get_session_activity", unavailable)
+
+    await _launch_for(conversations, host_store, fake, conv.id)
+
+    assert conversations.get_conversation(conv.id).host_id is not None
+    assert conv.id not in orchestration._pending_archive_stops
+    assert fake.stopped == []
+
+
+async def test_a_failed_item_read_makes_the_teardown_wait_for_the_turn(
+    db_uri, no_undo_grace, monkeypatch
+):
+    host_store = HostStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    fake = _registering_launcher(host_store)
+    conv = conversations.create_conversation()
+    conversations.update_conversation(conv.id, archived=True)
+    scheduled: list[bool] = []
+
+    def unavailable(*_args, **_kwargs):
+        raise RuntimeError("database unavailable")
+
+    def capture(*_args, after_turn=False, **_kwargs):
+        scheduled.append(after_turn)
+
+    monkeypatch.setattr(conversations, "list_items", unavailable)
+    monkeypatch.setattr(orchestration, "_spawn_archive_stop", capture)
+
+    await _launch_for(conversations, host_store, fake, conv.id)
+
+    # With no status and no way to see whether a turn ran, the teardown waits for one.
+    assert scheduled == [True]
+
+
+async def test_moving_an_archived_session_to_a_sandbox_does_not_schedule_a_teardown(
+    db_uri, no_undo_grace
+):
+    host_store = HostStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    fake = _registering_launcher(host_store)
+    held_runner_id = "runner_" + "b" * 32
+    # The move holds this claim on the session's runner while the sandbox provisions.
+    conv = conversations.create_conversation(runner_id=held_runner_id)
+    conversations.update_conversation(conv.id, archived=True)
+
+    await _launch_for(conversations, host_store, fake, conv.id, held_runner_id=held_runner_id)
+
+    assert conversations.get_conversation(conv.id).host_id is not None
+    assert conv.id not in orchestration._pending_archive_stops
+    assert fake.stopped == []
 
 
 class _SecondProviderLauncher(FakeSandboxLauncher):

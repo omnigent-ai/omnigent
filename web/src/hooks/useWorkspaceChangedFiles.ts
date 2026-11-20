@@ -23,6 +23,7 @@ import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { useSession } from "@/hooks/useSession";
 import { livenessRowFromSession, useSessionLiveness } from "@/hooks/useSessionLiveness";
 import { authenticatedFetch } from "@/lib/identity";
+import { listDirectoryViaWorkspaceApi, searchFilesViaWorkspaceApi } from "@/lib/workspaceApi";
 import { isTempConvId } from "@/lib/tempConversationId";
 import { useChatStore } from "@/store/chatStore";
 
@@ -401,10 +402,24 @@ function mapFilesystemEntries(
   });
 }
 
+/** A workspace directory listed through the workspace API, or null to list through REST. */
+async function listViaWorkspaceApi(
+  conversationId: string,
+  location: string,
+  maxEntries: number,
+): Promise<FilesystemListResponse | null> {
+  // The workspace API only lists inside the workspace.
+  if (browseLocationBase(location)) return null;
+  const listed = await listDirectoryViaWorkspaceApi(conversationId, location, maxEntries);
+  return listed && { object: "list", data: listed.data, has_more: listed.hasMore };
+}
+
 async function fetchWorkspaceAllFiles(
   conversationId: string,
   location = "",
 ): Promise<WorkspaceAllFilesResult> {
+  const viaApi = await listViaWorkspaceApi(conversationId, location, 1000);
+  if (viaApi) return { available: true, data: mapFilesystemEntries(viaApi, location) };
   const segment = browseLocationSegment(location);
   const params = new URLSearchParams({ limit: "1000", order: "asc" });
   const base = browseLocationBase(location);
@@ -579,6 +594,9 @@ export interface WorkspaceFileSearchResult {
   unavailable: boolean;
 }
 
+// One cap for both routes, so the API and REST return the same matches.
+const FILE_SEARCH_LIMIT = 500;
+
 async function fetchWorkspaceFileSearch(
   conversationId: string,
   query: string,
@@ -587,7 +605,29 @@ async function fetchWorkspaceFileSearch(
   location: string,
   signal?: AbortSignal,
 ): Promise<WorkspaceFileSearchResult> {
-  const params = new URLSearchParams({ limit: "500" });
+  // The workspace API only searches inside the workspace.
+  if (!browseLocationBase(location)) {
+    const viaApi = await searchFilesViaWorkspaceApi(
+      conversationId,
+      query,
+      { path: location, include, exclude, limit: FILE_SEARCH_LIMIT },
+      signal,
+    );
+    if (viaApi) {
+      return {
+        // Already relative to `location`; stripping it again would break a nested same-named folder.
+        files: mapFilesystemEntries({
+          object: "list",
+          data: viaApi.data,
+          has_more: viaApi.hasMore,
+        }),
+        truncated: viaApi.truncated,
+        hasMore: viaApi.hasMore,
+        unavailable: false,
+      };
+    }
+  }
+  const params = new URLSearchParams({ limit: String(FILE_SEARCH_LIMIT) });
   if (query) params.set("q", query);
   if (include) params.set("include", include);
   if (exclude) params.set("exclude", exclude);
@@ -676,6 +716,9 @@ async function fetchWorkspaceDirectory(
   location = "",
 ): Promise<WorkspaceFile[]> {
   const target = joinBrowseLocation(location, dirPath);
+  const viaApi = await listViaWorkspaceApi(conversationId, target, 1000);
+  // The tree addresses children relative to the location it is rooted at.
+  if (viaApi) return mapFilesystemEntries(viaApi, target, dirPath);
   const encodedPath = browseLocationSegment(target);
   const params = new URLSearchParams({ limit: "1000", order: "asc" });
   const base = browseLocationBase(target);
@@ -849,6 +892,8 @@ async function fetchDirEntriesTolerant(
   // ``base=host`` (see ``browseLocationSegment``). Entries of an absolute
   // listing echo back base-relative names, so the listed dir is re-attached
   // below and callers compare full paths uniformly.
+  const viaApi = await listViaWorkspaceApi(conversationId, dirPath, FILE_EXISTENCE_SCAN_LIMIT);
+  if (viaApi) return { files: mapFilesystemEntries(viaApi), truncated: viaApi.has_more };
   const base = `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem`;
   const params = new URLSearchParams({ order: "asc" });
   const hostBase = browseLocationBase(dirPath);

@@ -5,8 +5,8 @@ import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import type { SavedWorkflow, WorkflowPagination } from "@/hooks/useSavedWorkflows";
 
 /**
- * Searchable list of the user's saved workflows, laid out like `ProjectPicker`'s
- * "Search or create project" list. The "+" menu shows it in place of its items
+ * Searchable list of the user's saved workflows, and any shared with them, laid out
+ * like `ProjectPicker`'s "Search or create project" list. The "+" menu shows it in place of its items
  * for Run a workflow; New automation shows it in its Workflow field's menu.
  *
  * Picking one calls `onSelect(workflow)`. Below the list, "New workflow" calls
@@ -71,6 +71,11 @@ export function WorkflowPicker({
             <span className="flex min-w-0 flex-1 items-center gap-2">
               <span className="max-w-[70%] shrink-0 truncate">{workflow.name}</span>
               <span className="min-w-0 flex-1 truncate text-xs leading-4 text-muted-foreground">
+                {workflow.viewer_role === "viewer" && (
+                  <span data-testid="composer-saved-workflow-owner">
+                    Shared by {workflow.owner_display_name ?? "someone else"} ·{" "}
+                  </span>
+                )}
                 {workflow.description.split("\n")[0]}
               </span>
             </span>
