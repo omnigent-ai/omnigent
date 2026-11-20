@@ -3027,6 +3027,19 @@ describe("side-chat sent command tint", () => {
     expect(tintedTeam()).not.toBeNull();
   });
 
+  it("keeps an unsettled `!` send literal as a shell command once the side chat ends", () => {
+    conversationRegistry.acquire(childId).setState({
+      sessionHarness: "codex-native",
+      sessionStatus: "idle",
+      blocks: [],
+      pendingUserMessages: [
+        { tempId: "pend_shell", content: [{ type: "input_text", text: "!echo **hi**" }] },
+      ],
+    });
+    renderPane(<SideChatPane childId={childId} readOnly />);
+    expect(screen.getByText("!echo **hi**").tagName).toBe("CODE");
+  });
+
   it("tints a sent command in a side chat that had already ended", () => {
     seedSentCommand("/team fix it");
     renderPane(<SideChatPane childId={childId} readOnly />);
