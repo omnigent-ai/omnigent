@@ -11,6 +11,7 @@ import { CommandPalette } from "./CommandPalette";
 const navigate = vi.fn();
 vi.mock("@/lib/routing", () => ({
   useNavigate: () => navigate,
+  useLocation: () => ({ pathname: "/", search: "", hash: "", state: null, key: "default" }),
 }));
 
 const useConversations = vi.fn();

@@ -2810,6 +2810,28 @@ def _carries_any_payload(text: str, payloads: list[str]) -> bool:
     return any(item in compact or item.rstrip("=") in compact for item in payloads)
 
 
+def _blank_read_file_payload(value: object, payloads: list[str]) -> object:
+    """
+    Blank a duplicated payload in Claude Code's own Read metadata.
+
+    Image and PDF Read results store ``{"type": ..., "file": {"base64": ...}}``;
+    current Claude Code writes ``base64`` empty, the shape its renderer expects.
+
+    :param value: A record's ``toolUseResult`` object.
+    :param payloads: Base64 payloads present in the structured content.
+    :returns: *value* with ``file.base64`` emptied, or *value* unchanged.
+    """
+    if not isinstance(value, dict):
+        return value
+    file_meta = value.get("file")
+    if not isinstance(file_meta, dict):
+        return value
+    data = file_meta.get("base64")
+    if not isinstance(data, str) or not _carries_any_payload(data, payloads):
+        return value
+    return {**value, "file": {**file_meta, "base64": ""}}
+
+
 def _repair_cloned_tool_use_result(
     payload: _JsonObject,
     blocks: list[_JsonObject],
@@ -2822,7 +2844,8 @@ def _repair_cloned_tool_use_result(
     structured content. Matching is spelling-insensitive: the content blocks hold
     canonical base64 while the metadata may hold the producer's wrapped or
     unpadded original, so an exact substring test would miss the duplicate it is
-    meant to find. A redacted passthrough is preferred; when the payload survives
+    meant to find. A redacted passthrough is preferred, keeping Claude Code's Read
+    metadata shape via :func:`_blank_read_file_payload`; when the payload survives
     that (a JSON string literal wrapping mixed text-plus-image, which structured
     redaction cannot reach), the canonical redacted block list replaces it.
 
@@ -2843,7 +2866,7 @@ def _repair_cloned_tool_use_result(
     if isinstance(tool_use_result, str):
         candidate: object = _json_safe_tool_use_result(tool_use_result)
     else:
-        candidate = _redact_binary_blocks(tool_use_result)
+        candidate = _redact_binary_blocks(_blank_read_file_payload(tool_use_result, payloads))
     candidate_text = candidate if isinstance(candidate, str) else json.dumps(candidate)
     if _carries_any_payload(candidate_text, payloads):
         candidate = json.dumps(_redact_binary_blocks(blocks), separators=(",", ":"))

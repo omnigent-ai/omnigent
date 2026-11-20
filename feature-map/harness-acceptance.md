@@ -21,14 +21,14 @@ record omissions rather than treating unselected checks as passed.
 | `model-effort` | P0 | Pre-launch and in-session selections reach the intended model/request. Supported effort survives a tool round trip and a later change without losing history; rejected changes do not falsely appear applied. |
 | `interrupt-continue` | P0 | Interrupt a demonstrably active turn, then complete another turn in the same session without stale work or a stuck running state. |
 | `reload-resume` | P1 | Reload/reattach and supported resume retain history and settings; a subsequent turn works without missing or duplicated output. |
-| `auth-recovery` | P1 | The normal credential path works; renewal during tools/later turns works where supported. Authentication failure is clear and redacted; after repair the supported continuation path works. |
+| `auth-recovery` | P1 | The normal credential path works; renewal during tools/later turns works where supported. A sandboxed Claude SDK session and its terminals reach inference automatically without exposing the parent credential. Authentication failure is clear and redacted; after repair the supported continuation path works. |
 | `approvals` | P1 | Supported allow, deny and ask decisions reach the tool; denied side effects do not occur and the session can continue. |
 | `steering-queue` | P1 | Supported immediate steering and queued messages arrive once, in the intended order, including around interruption. |
 | `compaction` | P1 | Supported compaction finishes and a later turn works with retained context; pending messages are not lost. |
 | `images` | P1 | A supported image reaches the model and its reply uses the image; unsupported inputs are rejected without losing the draft. |
 | `fork` | P1 | A supported fork uses copied history on its first turn and remains separate from its parent. |
 | `mcp` | P1 | A configured, supported Omnigent MCP connection can call a harmless tool and show its result. |
-| `user-resources` | P1 | Supported user skills, extensions, prompts and packages remain available after launch/resume; relative paths, disabled resources and owner context controls retain their meaning. |
+| `user-resources` | P1 | Supported user skills, extensions, prompts and packages remain available after launch/resume; relative paths, disabled resources and owner context controls retain their meaning. In sandboxed Claude SDK, inline skill commands run under the same filesystem and network restrictions as Bash. |
 | `interactive-input` | P1 | Supported questions and editor dialogs preserve literal/empty answers, settle cancellation, and allow a later turn to complete. |
 
 ## How to get to it (user POV)
@@ -120,14 +120,14 @@ no harness-specific tests exist. No passing per-harness results are implied.
 | `model-effort` | `model_override`, `reasoning` | Native-TUI model override is currently skipped; SDK routing/reasoning observations are narrower than selection persistence. Reasoning output does not prove outgoing effort, tool continuity, High→Low or UI state. |
 | `interrupt-continue` | `interrupt` | Cancellation signal/early termination; follow-up recovery needs a separate assertion in the same session. |
 | `reload-resume` | — | No shared resume/reconnect probe. Existing native resume/disconnect tests and session/terminal recipes cover specific harnesses and boundaries only. |
-| `auth-recovery` | — | No shared auth-renewal probe. Reuse the owning harness credential tests; distinguish injected rotation from real elapsed expiry. |
+| `auth-recovery` | — | No shared auth-renewal probe. Reuse the owning harness credential tests; distinguish injected rotation from real elapsed expiry. For sandboxed Claude SDK and terminals, `tests/inner/test_claude_worker_containment.py` uses a real CLI and synthetic provider; it does not prove live-provider authentication. |
 | `approvals` | `policy_allow`, `policy_deny`, `policy_ask` | Supported policy paths through the chosen transport; Chat/Inbox presentation and post-decision continuation need their own evidence. |
 | `steering-queue` | — | No shared probe. Map the harness-specific steer/queue scenarios from Composer and Native harnesses. |
 | `compaction` | — | No shared probe. Use the Composer compaction recipe and the harness's supported entry points. |
 | `images` | — | No shared probe. Attachment UI alone does not establish delivery to a real harness/model. |
 | `fork` | `fork_replay` | Copied-history use through server/runner; fork dialog, alternate targets and parent isolation need the Sessions recipe. |
 | `mcp` | `omnigent_mcp` | Read-only relay tool for supported natives; Settings inventory alone is not a tool-execution check. |
-| `user-resources` | — | Use the Pi resource recipes below and the native skill/plugin recipes. No shared cross-harness resource-loading probe; file linking alone does not prove runtime discovery or marketplace compatibility. |
+| `user-resources` | — | Use the Pi resource recipes below and the native skill/plugin recipes. The real Claude CLI skill, hook, MCP and Bash containment cases are in `tests/inner/test_claude_worker_containment.py` (opt-in); file linking alone does not prove runtime discovery or marketplace compatibility. |
 | `interactive-input` | — | `tests/e2e/test_pi_extension_ui_round_trip.py` drives SDK/native Pi through the approval API. The [native dialog recipe](./native-harnesses.md#driving-it-with-the-repro-environment) separately covers browser answers. No shared cross-harness dialog probe. |
 
 Start the tool/history/effort continuity work by extending compatible scenarios,

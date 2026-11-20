@@ -8,15 +8,19 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Conversation } from "@/hooks/useConversations";
 import type { Session } from "@/lib/types";
-import { FALLBACK_SERVER_INFO } from "./capabilities";
+import { FALLBACK_SERVER_INFO, SHARING_OFF_REASON } from "./capabilities";
 import * as identity from "./identity";
 import {
+  LEGACY_AUTOMATION_RECREATE_REASON,
+  LEGACY_AUTOMATION_SHARE_REASON,
   LEVEL_OWNER,
+  automationShareDisabledReason,
   canShareAutomation,
   derivePermissionLevel,
   grantPermission,
   grantSharePermission,
   isOwnerLevel,
+  isPermissionLevelPending,
   listAutomationPermissions,
   listPermissions,
   listWorkflowPermissions,
@@ -480,6 +484,26 @@ describe("canShareAutomation", () => {
   });
 });
 
+describe("automationShareDisabledReason", () => {
+  const off = { ...FALLBACK_SERVER_INFO, sharing_mode: "off" as const };
+  const cloning = { ...FALLBACK_SERVER_INFO, scheduled_task_clone: true };
+  it.each([
+    ["a shareable automation", FALLBACK_SERVER_INFO, true, undefined],
+    ["an older server's automation", FALLBACK_SERVER_INFO, undefined, undefined],
+    ["a legacy automation", cloning, false, LEGACY_AUTOMATION_SHARE_REASON],
+    [
+      "a legacy automation on a server that can't clone",
+      FALLBACK_SERVER_INFO,
+      false,
+      LEGACY_AUTOMATION_RECREATE_REASON,
+    ],
+    ["sharing off", off, true, SHARING_OFF_REASON],
+    ["sharing off and a legacy automation", off, false, SHARING_OFF_REASON],
+  ])("explains %s", (_label, info, shareable, expected) => {
+    expect(automationShareDisabledReason(info, { shareable })).toBe(expected);
+  });
+});
+
 describe("sharedAutomationsListed", () => {
   const listed = {
     ...FALLBACK_SERVER_INFO,
@@ -595,6 +619,54 @@ describe("derivePermissionLevel — resolution order", () => {
     // until the sidebar has settled; that would briefly disable the
     // composer on every load.
     expect(derivePermissionLevel(null, false, null, "conv_test", false)).toBeNull();
+  });
+});
+
+describe("isPermissionLevelPending", () => {
+  const session = { permissionLevel: null } as Session;
+  const row = (permission_level: number | null) => ({ permission_level }) as Conversation;
+
+  it.each([
+    [
+      "pending while the snapshot loads and the row has no level",
+      null,
+      true,
+      null,
+      "conv_test",
+      true,
+      true,
+    ],
+    [
+      "pending when the snapshot failed before the list loaded",
+      null,
+      false,
+      null,
+      "conv_test",
+      false,
+      true,
+    ],
+    [
+      "known once the snapshot says null (owner by default)",
+      session,
+      false,
+      null,
+      "conv_test",
+      true,
+      false,
+    ],
+    ["known when the row carries a level", null, true, row(2), "conv_test", true, false],
+    [
+      "known when the list loaded without the session (read-only)",
+      null,
+      false,
+      null,
+      "conv_test",
+      true,
+      false,
+    ],
+    ["not pending without a conversation", null, false, null, undefined, false, false],
+  ] as const)("%s", (_label, snap, loading, conv, id, listLoaded, pending) => {
+    expect(isPermissionLevelPending(snap, loading, conv, id, listLoaded)).toBe(pending);
   });
 });
 

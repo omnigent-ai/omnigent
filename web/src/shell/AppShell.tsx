@@ -46,7 +46,7 @@ import { useIdleNotifications } from "@/hooks/useIdleNotifications";
 import { useSeedReadState } from "@/hooks/useUnseenConversations";
 import { useToggleUnreadHotkey } from "@/hooks/useToggleUnreadHotkey";
 import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
-import { DESKTOP_VIEWPORT_QUERY, useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { isDesktopLayout, useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useIsSideBySideSidebarViewport } from "@/hooks/useIsSideBySideSidebarViewport";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
@@ -155,6 +155,7 @@ import { SubagentPanelOpenerContext } from "./subagentPanelOpener";
 import { isMobileViewport, Sidebar } from "./Sidebar";
 import { SidebarHeaderActions } from "./SidebarHeaderActions";
 import { useSettingsRoute } from "./settingsNav";
+import { useOpenSidebarForSettingsSearch } from "./settingsSearch/settingsSearchFocus";
 import { isCachedAncestor, useRootSessionId, useSession } from "@/hooks/useSession";
 import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
 import {
@@ -456,6 +457,17 @@ function AppShellImpl() {
       sidebarOpenBeforeSettingsRef.current = null;
     }
   }, [inSettings, location.pathname, rebasePath, setSidebarOpen]);
+
+  // ⌘K's "Search settings…" opens the sidebar so its field can be seen. From outside Settings the
+  // sidebar's state is recorded first, so Back restores a collapsed sidebar, as after any other trip.
+  useOpenSidebarForSettingsSearch(() => {
+    setSidebarOpen((wasOpen) => {
+      if (!inSettings && sidebarOpenBeforeSettingsRef.current === null) {
+        sidebarOpenBeforeSettingsRef.current = wasOpen;
+      }
+      return true;
+    });
+  });
 
   // Below md an open sidebar is a full-window drawer, so narrowing closes it
   // (except the settings menu) and remembers the desktop state for widening.
@@ -3267,6 +3279,7 @@ function AppShellImpl() {
                 )}
                 <GridSessionMain
                   className="relative flex min-h-0 min-w-0 flex-1 flex-col"
+                  data-flyout-boundary=""
                   data-shell-header={extensionOwnsHeader ? "hidden" : "visible"}
                   data-session-id={conversationId}
                 >
@@ -3531,5 +3544,5 @@ function AppShellImpl() {
  */
 function initialSidebarOpen(): boolean {
   if (typeof window === "undefined") return false;
-  return window.matchMedia(DESKTOP_VIEWPORT_QUERY).matches;
+  return isDesktopLayout();
 }

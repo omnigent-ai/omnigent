@@ -53,15 +53,22 @@ vi.mock("./FileViewer", () => ({
     path,
     open,
     mediaActive,
+    onExitFullScreen,
   }: {
     path: string;
     open: boolean;
     mediaActive: boolean;
+    onExitFullScreen?: () => void;
   }) => {
     paneRenders("file");
     return (
       <div data-testid="file-viewer-stub" data-open={open} data-media-active={mediaActive}>
         {path}
+        {onExitFullScreen && (
+          <button type="button" onClick={onExitFullScreen}>
+            Viewer Escape
+          </button>
+        )}
       </div>
     );
   },
@@ -1409,6 +1416,36 @@ describe("WorkspacePanel maximize", () => {
     const panel = screen.getByRole("complementary", { name: "Workspace" });
     expect(panel).toHaveClass("md:absolute", "md:inset-0", "md:border-l");
     expect(panel).not.toHaveClass("md:shrink-0", "md:m-2", "md:rounded-lg");
+  });
+
+  it("lets Escape in a full-screen file exit full screen rather than close the tab", () => {
+    const { onToggleMaximized, onCloseFile, rerender } = renderWorkspace({
+      selectedFilePath: "docs/README.md",
+      openFiles: ["docs/README.md"],
+      maximized: true,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Viewer Escape" }));
+    expect(onToggleMaximized).toHaveBeenCalledTimes(1);
+    expect(onCloseFile).not.toHaveBeenCalled();
+
+    // Outside full screen the viewer gets no exit-full-screen handler.
+    rerender({ maximized: false });
+    expect(screen.queryByRole("button", { name: "Viewer Escape" })).toBeNull();
+  });
+
+  it.each([
+    { name: "a file", selectedFilePath: "docs/README.md", keys: ["Esc"] },
+    { name: "the Files tab", selectedFilePath: null, keys: [] },
+  ])("lists Esc on Exit full screen only for $name", async ({ selectedFilePath, keys }) => {
+    renderWorkspace({ selectedFilePath, openFiles: ["docs/README.md"], maximized: true });
+    fireEvent.pointerMove(screen.getByRole("button", { name: "Exit full screen" }).parentElement!, {
+      pointerType: "mouse",
+    });
+    const tip = await screen.findByRole("tooltip");
+    expect(tip).toHaveTextContent("Exit full screen");
+    expect(
+      Array.from(tip.querySelectorAll('[data-slot="kbd"]')).map((key) => key.textContent),
+    ).toEqual(keys);
   });
 });
 

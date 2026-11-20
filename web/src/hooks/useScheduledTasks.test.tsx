@@ -13,6 +13,7 @@ import {
   SCHEDULED_TASKS_KEY,
   scheduledTaskKey,
   scheduledTaskRunsKey,
+  useCloneScheduledTask,
   useCreateScheduledTask,
   useDeleteScheduledTask,
   useRunScheduledTaskNow,
@@ -33,6 +34,7 @@ vi.mock("@/lib/scheduledTasksApi", () => ({
   listScheduledTaskRunSteps: vi.fn(),
   listScheduledTaskRunPullRequests: vi.fn(),
   createScheduledTask: vi.fn(),
+  cloneScheduledTask: vi.fn(),
   updateScheduledTask: vi.fn(),
   deleteScheduledTask: vi.fn(),
   runScheduledTaskNow: vi.fn(),
@@ -160,6 +162,24 @@ describe("mutations invalidate the list", () => {
       agentId: "ag_1",
     });
     expect(spy).toHaveBeenCalledWith({ queryKey: SCHEDULED_TASKS_KEY });
+  });
+
+  it.each([
+    ["an ordinary automation", null, false],
+    ["an automation that runs from a session", "conv_clone_copy", true],
+  ])("clone of %s refreshes the list", async (_label, sourceSessionId, refreshesSessions) => {
+    vi.mocked(api.cloneScheduledTask).mockResolvedValue({ ...TASK, id: "st_2", sourceSessionId });
+    const { queryClient, wrapper } = makeWrapper();
+    const spy = vi.spyOn(queryClient, "invalidateQueries");
+    const { result } = renderHook(() => useCloneScheduledTask(), { wrapper });
+    await result.current.mutateAsync({ id: "st_1", hostId: "host_a" });
+    expect(api.cloneScheduledTask).toHaveBeenCalledWith({ id: "st_1", hostId: "host_a" });
+    expect(spy).toHaveBeenCalledWith({ queryKey: SCHEDULED_TASKS_KEY });
+    // The copy's source session joins the owner's session lists.
+    for (const queryKey of [["conversations"], ["session", "conv_clone_copy"]]) {
+      if (refreshesSessions) expect(spy).toHaveBeenCalledWith({ queryKey });
+      else expect(spy).not.toHaveBeenCalledWith({ queryKey });
+    }
   });
 
   it("update invalidates the list", async () => {

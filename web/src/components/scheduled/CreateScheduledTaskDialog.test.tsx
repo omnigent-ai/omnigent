@@ -1136,18 +1136,53 @@ describe("agent picker readiness (needs-setup badges)", () => {
 });
 
 describe("CreateScheduledTaskDialog validation", () => {
-  it("keeps submit disabled until name + prompt are set (agent defaults to the first)", () => {
+  it("keeps submit disabled until name + prompt are set (agent defaults to the first)", async () => {
     renderDialog();
     const submit = screen.getByTestId("create-scheduled-task-submit");
     expect(submit).toHaveTextContent("Create");
     // Agent is never blank — the picker resolves a default (first agent) — so
     // only name + prompt gate submit.
     expect(submit).toBeDisabled();
+    // Hovering the disabled button explains it before the usual 1s tooltip delay.
+    await userEvent.hover(screen.getByRole("group", { name: "Create" }));
+    await waitFor(
+      () =>
+        expect(screen.getByRole("tooltip")).toHaveTextContent(
+          "Enter a name in the field at the top.",
+        ),
+      { timeout: 800 },
+    );
 
     fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
     expect(submit).toBeDisabled();
+    expect(screen.getByRole("tooltip")).toHaveTextContent("Add instructions.");
     fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Do it" } });
     expect(submit).toBeEnabled();
+    expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
+  });
+
+  it("explains an edit's blockers in the order the dialog shows them", async () => {
+    render(
+      <CapabilitiesProvider
+        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, features: { automations_v2: false } }}
+      >
+        <CreateScheduledTaskDialog
+          open
+          onOpenChange={vi.fn()}
+          editingTask={scheduledTask({ rrule: "FREQ=DAILY;INTERVAL=2;BYHOUR=9;BYMINUTE=0" })}
+        />
+      </CapabilitiesProvider>,
+    );
+    const instructions = screen.getByTestId("task-prompt-input");
+    const savedInstructions = (instructions as HTMLTextAreaElement).value;
+    fireEvent.change(instructions, { target: { value: "" } });
+    await userEvent.hover(screen.getByRole("group", { name: "Save changes" }));
+    // An edit keeps the schedule under Advanced, below the instructions.
+    await waitFor(() => expect(screen.getByRole("tooltip")).toHaveTextContent("Add instructions."));
+    fireEvent.change(instructions, { target: { value: savedInstructions } });
+    expect(screen.getByRole("tooltip")).toHaveTextContent(
+      "Choose a frequency this server supports.",
+    );
   });
 
   it("pins a workspace on confirmation and waits for reconnection if its host disconnects", () => {
