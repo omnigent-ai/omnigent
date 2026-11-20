@@ -48,12 +48,14 @@ function Probe({
   id,
   batch = false,
   poll,
+  prUrl,
 }: {
   id: string | undefined;
   batch?: boolean;
   poll?: "linked";
+  prUrl?: string;
 }) {
-  usePullRequestInfo(id, { poll });
+  usePullRequestInfo(id, { poll, prUrl });
   usePullRequestInfos(id, batch ? ["https://github.com/org/repo/pull/1"] : []);
   return null;
 }
@@ -74,6 +76,104 @@ afterEach(() => {
 });
 
 describe("usePullRequestInfo turn-end invalidate", () => {
+  it("refreshes each PR once when the composer and linked PR rows observe the same turn end", async () => {
+    stubChatStore("conv_live", "running");
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const urls = Array.from(
+      { length: 25 },
+      (_, index) => `https://example.test/repo/pull/${index + 1}`,
+    );
+    const tree = () => (
+      <QueryClientProvider client={client}>
+        <Probe id="conv_live" />
+        {urls.map((prUrl) => (
+          <Probe key={prUrl} id="conv_live" prUrl={prUrl} />
+        ))}
+      </QueryClientProvider>
+    );
+    const view = render(tree());
+    await waitFor(() => expect(client.isFetching()).toBe(0));
+    expect(fetchMock).toHaveBeenCalledTimes(urls.length + 1);
+
+    const finish: (() => void)[] = [];
+    fetchMock.mockClear();
+    fetchMock.mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          finish.push(() => resolve(pullRequestInfoResponse()));
+        }),
+    );
+    try {
+      stubChatStore("conv_live", "idle");
+      view.rerender(tree());
+      await act(async () => {});
+      expect(fetchMock).toHaveBeenCalledTimes(urls.length + 1);
+    } finally {
+      await act(async () => {
+        for (const resolve of finish) resolve();
+      });
+      view.unmount();
+      client.clear();
+    }
+  });
+
+  it.each([false, true])("aborts superseded and unmounted PR reads (batch=%s)", async (batch) => {
+    stubChatStore("conv_live", "running");
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const tree = () => (
+      <QueryClientProvider client={client}>
+        <Probe id="conv_live" batch={batch} />
+      </QueryClientProvider>
+    );
+    const view = render(tree());
+    await waitFor(() => expect(client.isFetching()).toBe(0));
+    const requests: { signal: AbortSignal | null | undefined; finish: () => void }[] = [];
+    fetchMock.mockImplementation(
+      (_input: RequestInfo | URL, init?: RequestInit) =>
+        new Promise<Response>((resolve, reject) => {
+          const signal = init?.signal;
+          const abort = () => reject(signal?.reason);
+          signal?.addEventListener("abort", abort, { once: true });
+          requests.push({
+            signal,
+            finish: () => {
+              signal?.removeEventListener("abort", abort);
+              resolve(pullRequestInfoResponse());
+            },
+          });
+        }),
+    );
+    const perTurn = batch ? 2 : 1;
+    try {
+      stubChatStore("conv_live", "idle");
+      view.rerender(tree());
+      await act(async () => {});
+      expect(requests).toHaveLength(perTurn);
+
+      // A later turn needs a fresh snapshot, even when the last read is still slow.
+      stubChatStore("conv_live", "running");
+      view.rerender(tree());
+      stubChatStore("conv_live", "idle");
+      view.rerender(tree());
+      await act(async () => {});
+      expect(requests).toHaveLength(perTurn * 2);
+      expect(requests.slice(0, perTurn).map(({ signal }) => signal?.aborted)).toEqual(
+        Array(perTurn).fill(true),
+      );
+      expect(requests.slice(perTurn).map(({ signal }) => signal?.aborted)).toEqual(
+        Array(perTurn).fill(false),
+      );
+      view.unmount();
+      expect(requests.every(({ signal }) => signal?.aborted)).toBe(true);
+    } finally {
+      await act(async () => {
+        for (const { finish } of requests) finish();
+      });
+      view.unmount();
+      client.clear();
+    }
+  });
+
   it.each([false, true])(
     "refetches info when the focused session goes running → idle (batch=%s)",
     async (batch) => {

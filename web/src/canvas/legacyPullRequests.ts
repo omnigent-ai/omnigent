@@ -129,7 +129,7 @@ export function useLivePullRequests(
           try {
             info = await queryClient.fetchQuery({
               queryKey: ["github-info", session.id],
-              queryFn: () => fetchPullRequestInfo(session.id),
+              queryFn: ({ signal }) => fetchPullRequestInfo(session.id, undefined, signal),
               staleTime: GITHUB_INFO_STALE_MS,
             });
           } catch (error) {

@@ -15,7 +15,7 @@
 // (e.g. cloud-only agents).
 
 import { useCallback, useEffect, useRef } from "react";
-import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQueries, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
@@ -63,6 +63,24 @@ export function useWorkspaceServeable(conversationId: string | undefined): boole
   return hostOnline === true;
 }
 
+const pendingTrailingInvalidations = new WeakMap<QueryClient, Set<string>>();
+
+/** Coalesce observers of the same turn end before restarting their shared queries. */
+function scheduleTrailingInvalidate(client: QueryClient, queryKey: [string, string]): void {
+  let pending = pendingTrailingInvalidations.get(client);
+  if (!pending) {
+    pending = new Set();
+    pendingTrailingInvalidations.set(client, pending);
+  }
+  const key = JSON.stringify(queryKey);
+  if (pending.has(key)) return;
+  pending.add(key);
+  queueMicrotask(() => {
+    pending.delete(key);
+    void client.invalidateQueries({ queryKey });
+  });
+}
+
 /**
  * Fire one query invalidation when the session transitions active → idle.
  *
@@ -87,7 +105,7 @@ export function useTrailingInvalidate(
     const justWentIdle = sameSession && prev.current.active && !sessionActive;
     prev.current = { id: conversationId, active: sessionActive };
     if (justWentIdle && conversationId) {
-      queryClient.invalidateQueries({ queryKey: [queryKeyPrefix, conversationId] });
+      scheduleTrailingInvalidate(queryClient, [queryKeyPrefix, conversationId]);
     }
   }, [conversationId, sessionActive, queryClient, queryKeyPrefix]);
 }
