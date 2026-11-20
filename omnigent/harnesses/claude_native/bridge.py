@@ -5689,12 +5689,13 @@ def inject_model_command(
     owned_draft: str | None = None,
     legacy_literal_model: bool = False,
 ) -> ClaudeModelSwitchResult | ClaudeLegacyModelSwitchResult:
-    """Use session-only selection when supported, otherwise submit the legacy command.
+    """Use session-only selection, or a legacy command when its session needs a change.
 
     The session-only path clears only the exact ``owned_draft`` whose routing
     hook proved it blocked. The timeout covers lock waits and every step;
     this function never sends the dependent prompt.
-    Older or unverified CLIs retain their default-changing command behavior.
+    Older or unverified CLIs keep matching, identity-bound status unchanged;
+    actual legacy selections retain their default-changing command behavior.
     """
     deadline = ModelSwitchDeadline(timeout_s, _INJECTION_CANCEL_EVENT.get(), time.monotonic)
     transaction = SessionOnlyModelSwitch(
@@ -5730,7 +5731,10 @@ def _inject_model_command_locked(
 def _inject_legacy_model_command_locked(
     bridge_dir: Path, transaction: SessionOnlyModelSwitch, *, literal_model: bool = False
 ) -> ClaudeLegacyModelSwitchResult:
-    from omnigent.models.claude_model_vocabulary import claude_model_command_arg
+    from omnigent.models.claude_model_vocabulary import (
+        claude_model_command_arg,
+        public_claude_model_id,
+    )
 
     raw = _read_json_file(bridge_dir / CONTEXT_RAW_FILE) or {}
     version = raw.get("version")
@@ -5756,11 +5760,6 @@ def _inject_legacy_model_command_locked(
             f"This Claude terminal has no /model spelling for {transaction.model}.",
             unsupported=True,
         )
-    _logger.warning(
-        "Claude Code version %r uses legacy /model submission; "
-        "the command may also change the saved default",
-        version,
-    )
     transaction.phase = "legacy"
     _wait_for_tmux_info(bridge_dir, timeout_s=transaction.deadline.remaining_s())
     origin = _legacy_model_pane(bridge_dir)
@@ -5786,6 +5785,44 @@ def _inject_legacy_model_command_locked(
         transaction.submitted = True
         transaction.commit_attempted = True
 
+    revalidate_version()
+    current = _read_json_file(bridge_dir / CONTEXT_RAW_FILE) or {}
+    reported = current.get("model")
+    current_model = reported.get("id") if isinstance(reported, dict) else None
+    expected_public = public_claude_model_id(transaction.model)
+    same_model = isinstance(current_model, str) and (
+        current_model == transaction.model
+        or (
+            expected_public is not None
+            and public_claude_model_id(current_model) == expected_public
+            and current_model.lower().endswith("[1m]")
+            == transaction.model.lower().endswith("[1m]")
+        )
+    )
+    if (
+        origin.active_session_id is not None
+        and origin.session_id is not None
+        and current.get("session_id") == origin.session_id
+        and same_model
+    ):
+        _check_injection_cancelled()
+        state = _claude_pane_state(origin.socket_path, origin.tmux_target)
+        revalidate_version()
+        _check_injection_cancelled()
+        if state.exited:
+            raise ClaudeTerminalExited(
+                "Claude Code's terminal exited before the dependent prompt was sent.",
+                exit_status=state.exit_status,
+            )
+        return ClaudeLegacyModelSwitchResult(
+            transaction.model, model_arg, origin, already_selected=True
+        )
+
+    _logger.warning(
+        "Claude Code version %r uses legacy /model submission; "
+        "the command may also change the saved default",
+        version,
+    )
     try:
         _inject_slash_command_locked(
             bridge_dir,
@@ -5841,6 +5878,8 @@ def confirm_legacy_model_dialog(
 
     if origin is None or _legacy_model_pane(bridge_dir) != origin:
         return None
+    if receipt.already_selected:
+        return True
     if read_claude_status_model(bridge_dir) in (receipt.requested_model, receipt.picker_value):
         return True
     pane = _capture_pane(origin.socket_path, origin.tmux_target)

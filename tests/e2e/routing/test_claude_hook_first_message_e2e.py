@@ -54,6 +54,7 @@ from tests.e2e.routing._mock_router import MockRouter, decide
 from tests.e2e.routing.conftest import (
     bypass_args,
     create_routed_session,
+    require_session_only_claude,
     require_tmux,
     trusted_workspace,
     unique_trivial_prompt,
@@ -110,11 +111,12 @@ def test_claude_routes_the_first_typed_message_exactly_once(
     type_into_tui: Callable[[str, str, str], None],
     tmp_path: Path,
 ) -> None:
+    require_session_only_claude()
     require_tmux()
     routing_arms("claude-native")  # type: ignore[operator]
     workspace = trusted_workspace(tmp_path, "claude_hook_ws")
     settings_path = claude_user_settings_path(workspace, routing_claude_settings_env)
-    settings_before = claude_settings_snapshot(settings_path, include_model=True)
+    settings_before = claude_settings_snapshot(settings_path)
 
     # A BARE routed create: Smart Routing on, no prompt, so nothing is routed
     # yet and the pick is left to the in-harness hook.
@@ -193,11 +195,7 @@ def test_claude_routes_the_first_typed_message_exactly_once(
     )
 
     wait_for(
-        lambda: (
-            True
-            if claude_settings_snapshot(settings_path, include_model=True) == settings_before
-            else None
-        ),
+        lambda: True if claude_settings_snapshot(settings_path) == settings_before else None,
         timeout=10,
         what=f"{settings_path}, including the saved default, to match its initial state",
     )

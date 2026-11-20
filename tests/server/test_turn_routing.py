@@ -1009,12 +1009,10 @@ def test_settle_probe_reads_the_pane_for_claude_and_the_turn_id_for_codex(
 
 
 @pytest.mark.parametrize("version", ["2.1.323", "2.1.322"], ids=["session-only", "legacy"])
-async def test_replay_switches_the_claude_pane_before_delivering(
+async def test_replay_selects_the_claude_model_before_posting_one_message(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str
 ) -> None:
     from omnigent.harnesses.claude_native import bridge
-    from omnigent.inner import claude_native_executor
-    from omnigent.inner.executor import ExecutorConfig, TurnComplete
     from tests.harnesses.claude_native._model_switch_support import (
         _session_model_bridge,
         _SessionModelComposer,
@@ -1026,6 +1024,7 @@ async def test_replay_switches_the_claude_pane_before_delivering(
     composer = _SessionModelComposer(draft="hello")
     composer.version = version
     session_only = version == "2.1.323"
+    initial_default = composer.saved_default
     model = composer.options[-1]
     bridge_dir = _session_model_bridge(tmp_path, composer)
     composer.install(monkeypatch)
@@ -1034,50 +1033,17 @@ async def test_replay_switches_the_claude_pane_before_delivering(
         bridge_dir, session_id="web-session", prompt="hello", blocked_turn_id=None, model=model
     )
     client = _FakeServerClient()
-    executor = claude_native_executor.ClaudeNativeExecutor(bridge_dir)
-    delivered: list[str] = []
-    status_queries_at_handoff: list[int] = []
-
-    def deliver(_bridge: Path, *, content: str, timeout_s: float = 30.0) -> None:
-        assert composer.model == model
-        if session_only:
-            assert composer.status_queries > status_queries_at_handoff[0]
-        else:
-            assert composer.status_queries == 0
-        delivered.append(content)
-
-    def publish_current_status() -> None:
-        # The CLI publishes its selected model; this hint still cannot authorize delivery.
-        path = bridge_dir / bridge.CONTEXT_RAW_FILE
-        current = json.loads(path.read_text())
-        current["model"]["id"] = composer.model
-        path.write_text(json.dumps(current))
-
     original_post = client.post
 
-    async def enter_executor(url: str, *, json: dict[str, Any], timeout: float) -> _FakeResponse:
+    async def receive_message(url: str, *, json: dict[str, Any], timeout: float) -> _FakeResponse:
         assert json["type"] == "message"
         assert json["model_override"] == model
-        assert composer.model == model
-        assert composer.text == ""
-        assert sum(args[-1] == "s" for args in composer.sends) == int(session_only)
-        status_queries_at_handoff.append(composer.status_queries)
-        publish_current_status()
-        response = await original_post(url, json=json, timeout=timeout)
-        events = [
-            event
-            async for event in executor.run_turn(
-                messages=[{"role": "user", "content": json["data"]["content"][0]["text"]}],
-                tools=[],
-                system_prompt="",
-                config=ExecutorConfig(model=json["model_override"]),
-            )
-        ]
-        assert events == [TurnComplete(response=None)]
-        return response
+        assert composer.model == model and composer.text == ""
+        assert composer.status_queries == int(session_only)
+        assert composer.saved_default == (initial_default if session_only else model)
+        return await original_post(url, json=json, timeout=timeout)
 
-    monkeypatch.setattr(claude_native_executor, "inject_user_message", deliver)
-    monkeypatch.setattr(client, "post", enter_executor)
+    monkeypatch.setattr(client, "post", receive_message)
     await schedule_replay(
         "web-session",
         prompt="hello",
@@ -1089,12 +1055,11 @@ async def test_replay_switches_the_claude_pane_before_delivering(
         idle=lambda _: True,
     )
 
-    assert len(status_queries_at_handoff) == 1
     assert sum(args[-1] == "s" for args in composer.sends) == int(session_only)
     if not session_only:
-        assert [command for command in composer.submitted if command] == [f"/model {model}"] * 2
-    assert delivered == ["hello"]
+        assert [command for command in composer.submitted if command] == [f"/model {model}"]
     assert len(client.messages) == 1
+    assert client.messages[0][1]["data"]["content"][0]["text"] == "hello"
     assert turn_routing.read_pending_replay(bridge_dir) is None
 
 

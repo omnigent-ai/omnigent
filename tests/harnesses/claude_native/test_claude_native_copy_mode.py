@@ -282,6 +282,11 @@ def test_watchers_leave_scrollback_alone_when_nothing_is_on_screen(pane: _Pane) 
     pane.scroll_back()
 
     assert bridge.dismiss_btw_overlay(pane.bridge_dir) is False
+    receipt = bridge.ClaudeLegacyModelSwitchResult(
+        "private-model", "private-model", bridge._legacy_model_pane(pane.bridge_dir)
+    )
+    assert receipt.pane is not None
+    assert bridge.confirm_legacy_model_dialog(pane.bridge_dir, receipt=receipt) is False
 
     assert pane.in_mode(), "A watcher with nothing to confirm must not leave copy mode."
     assert not pane.received.exists(), "A watcher with nothing to confirm must not send keys."

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock
 
@@ -18,6 +20,7 @@ from omnigent.runner import native_controls
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from tests._helpers.providers import isolate_provider_resolution
 from tests.harnesses.claude_native._model_switch_support import (
+    _CLEAR_ONE_ROW_COMPOSER,
     _session_model_bridge,
     _SessionModelComposer,
 )
@@ -109,6 +112,133 @@ async def test_model_control_accepts_the_original_two_event_fields(
     assert composer.saved_default == (
         composer.options[0] if version == "2.1.323" else event["model"]
     )
+
+
+async def test_model_control_sends_no_keys_after_asynchronous_preparation_spends_budget(
+    model_control: tuple[native_controls.NativeControls, _SessionModelComposer, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controls, composer, _ = model_control
+    clock = [0.0]
+    monkeypatch.setattr(native_controls, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+
+    async def prepare_bridge(**_kwargs: object) -> str:
+        await asyncio.sleep(0)
+        clock[0] += native_controls._CLAUDE_CONTROL_BUDGET_S + 1
+        return "bridge"
+
+    monkeypatch.setattr(native_controls, "_claude_native_bridge_id_for_session", prepare_bridge)
+
+    response = await controls.handle_claude_native_model_change("web-session", "private-glm[1m]")
+
+    assert response.status_code == 503
+    assert composer.sends == []
+    assert composer.model == composer.saved_default == composer.options[0]
+
+
+@pytest.mark.parametrize(
+    ("phase", "replacement"),
+    [
+        ("draft", False),
+        ("picker-enter", False),
+        ("picker-down", False),
+        ("status-enter", False),
+        ("picker", True),
+        ("commit", False),
+        ("status", True),
+    ],
+)
+async def test_cancelled_model_control_drains_and_cleans_only_observed_owned_controls(
+    model_control: tuple[native_controls.NativeControls, _SessionModelComposer, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+    replacement: bool,
+) -> None:
+    _, composer, bridge_dir = model_control
+    monkeypatch.delenv(bridge.REQUEST_SESSION_ID_ENV_VAR, raising=False)
+    composer.busy = True
+    initial_model = composer.model
+    started, release, finished = threading.Event(), threading.Event(), threading.Event()
+    observed_picker = observed_status = 0
+    cancelled_at: list[tuple[str, ...]] = []
+
+    def pause() -> None:
+        if not started.is_set():
+            cancelled_at.extend(composer.sends)
+            started.set()
+            assert release.wait(5), "the test did not release its fake pane operation"
+
+    def send(socket_path: str, *args: str) -> None:
+        composer._run_tmux(socket_path, *args)
+        key = args[-1]
+        if (
+            (phase == "draft" and key == "/model")
+            or (phase == "picker-enter" and key == "Enter" and composer.overlay == "picker")
+            or (phase == "picker-down" and key == "Down")
+            or (phase == "status-enter" and key == "Enter" and composer.overlay == "status")
+            or (phase == "commit" and key == "s")
+        ):
+            pause()
+
+    def capture(socket_path: str, target: str, *, join_wrapped: bool = False) -> str:
+        nonlocal observed_picker, observed_status
+        pane = composer._capture_pane(socket_path, target, join_wrapped=join_wrapped)
+        if composer.overlay == "picker" and composer.highlight == 1:
+            observed_picker += 1
+            if phase == "picker" and observed_picker == 2:
+                pause()
+        if composer.overlay == "status":
+            observed_status += 1
+            if phase == "status" and observed_status == 2:
+                pause()
+        return pane
+
+    def select_model(directory: Path, *, model: str) -> bridge.ClaudeModelSwitchResult:
+        try:
+            return bridge.inject_model_command(directory, model=model)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(bridge, "_run_tmux", send)
+    monkeypatch.setattr(bridge, "_capture_pane", capture)
+    deadline = native_controls._ClaudeControlDeadline()
+    task = asyncio.create_task(
+        native_controls._drive_claude_pane(
+            deadline, select_model, bridge_dir, model="private-glm[1m]"
+        )
+    )
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done() and not finished.is_set()
+        assert bridge._bridge_injection_lock(bridge_dir).locked()
+        if replacement:
+            if phase == "picker":
+                composer.options[0] = "a-persons-replacement-model"
+            else:
+                composer.session = "a-persons-replacement-session"
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(task), 2)
+        assert finished.is_set() and deadline.is_set()
+        assert composer.sends[: len(cancelled_at)] == cancelled_at
+        assert [args[-1] for args in composer.sends[len(cancelled_at) :]] == (
+            [_CLEAR_ONE_ROW_COMPOSER] if phase == "draft" else []
+        )
+        assert [args[-1] for args in composer.sends].count("s") == (
+            1 if phase in {"commit", "status", "status-enter"} else 0
+        )
+        assert composer.model == (
+            "private-glm[1m]" if phase in {"commit", "status", "status-enter"} else initial_model
+        )
+        assert composer.saved_default == initial_model
+        assert not bridge._bridge_injection_lock(bridge_dir).locked()
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.parametrize("version", ["2.1.322", "2.1.323"])

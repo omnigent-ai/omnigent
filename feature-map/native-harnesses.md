@@ -818,6 +818,9 @@ Cross-harness journeys:
   servability.
   Older CLIs and CLIs with unavailable or unverified version metadata retain
   legacy `/model MODEL` submission, including its possible saved-default change.
+  A matching status bound to the same native session needs no command, preserving
+  a separately saved default. Missing or mismatched session identity still uses
+  legacy submission; the newer fresh-status guarantee does not apply.
   Existing bridge metadata works without re-registration. Upgrading Claude Code
   is optional; default preservation and fresh native receipts apply only when
   the running terminal reports a stable version of 2.1.323 or newer. A failure on

@@ -75,7 +75,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   variants keep their own labels and checked rows, including in side chats.
   Claude terminals reporting a stable CLI version of 2.1.323 or newer preserve
   the saved default through session-only picks. Older or unverified versions
-  keep legacy model switching, which may also change the saved default.
+  keep an already selected model when status matches the same native session;
+  actual legacy model changes may also change the saved default.
 - `effort-picker`: reasoning effort for harnesses that support it (Codex, Claude,
   Pi, Devin). States: available, unavailable placeholder, max/ultra levels, refused
   change (the pill keeps the applied level).

@@ -77,6 +77,52 @@ def test_model_changes_preserve_the_version_appropriate_behavior(
         assert "s" not in [args[-1] for args in composer.sends]
 
 
+@pytest.mark.parametrize("version", ["2.1.322", None, "2.1.323-preview"])
+def test_legacy_matching_session_preserves_a_distinct_saved_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str | None
+) -> None:
+    composer = _SessionModelComposer()
+    composer.version = version or "unknown"
+    composer.saved_default = "separate-user-default"
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    if version is None:
+        path = bridge_dir / bridge.CONTEXT_RAW_FILE
+        raw = json.loads(path.read_text())
+        raw.pop("version")
+        path.write_text(json.dumps(raw))
+    composer.install(monkeypatch)
+
+    result = bridge.inject_model_command(bridge_dir, model=composer.model)
+
+    assert composer.saved_default == "separate-user-default"
+    assert composer.sends == []
+    assert composer.status_queries == 0
+    assert isinstance(result, bridge.ClaudeLegacyModelSwitchResult)
+    assert result.already_selected
+    assert result.requested_model == composer.model
+
+
+@pytest.mark.parametrize("reported_session", [None, "earlier-native-session"])
+def test_legacy_matching_hint_requires_the_current_native_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reported_session: str | None
+) -> None:
+    composer = _SessionModelComposer()
+    composer.version = "2.1.322"
+    composer.saved_default = "separate-user-default"
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    path = bridge_dir / bridge.CONTEXT_RAW_FILE
+    raw = json.loads(path.read_text())
+    raw["session_id"] = reported_session
+    path.write_text(json.dumps(raw))
+    composer.install(monkeypatch)
+
+    result = bridge.inject_model_command(bridge_dir, model=composer.model)
+
+    assert not result.already_selected
+    assert composer.saved_default == composer.model
+    assert [command for command in composer.submitted if command] == [f"/model {composer.model}"]
+
+
 def test_legacy_bridge_metadata_needs_no_reregistration(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

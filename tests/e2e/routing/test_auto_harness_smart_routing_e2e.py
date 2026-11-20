@@ -50,6 +50,7 @@ from tests.e2e.routing.conftest import (
     create_routed_session,
     post_user_message,
     prompts,
+    require_session_only_claude,
     require_tmux,
     spawn_prompt,
     trusted_workspace,
@@ -95,12 +96,13 @@ def test_auto_harness_lands_an_arm_then_redirects_a_cross_family_spawn(
     mock_router: MockRouter,
     tmp_path: Path,
 ) -> None:
+    require_session_only_claude()
     require_tmux()
     # The auto route chooses between both families, so both must be backed.
     routing_arms("claude-native", "codex-native")  # type: ignore[operator]
     workspace = trusted_workspace(tmp_path, "auto_ws")
     settings_path = claude_user_settings_path(workspace, routing_claude_settings_env)
-    settings_before = claude_settings_snapshot(settings_path, include_model=True)
+    settings_before = claude_settings_snapshot(settings_path)
 
     # A contained, code-referencing task: on the ``both`` menu the recipe
     # escalates it to the Claude arm, which lands the session on claude-native
@@ -200,7 +202,7 @@ def test_auto_harness_lands_an_arm_then_redirects_a_cross_family_spawn(
             f"Claude one (model_override={child.get('model_override')!r})"
         )
 
-    assert claude_settings_snapshot(settings_path, include_model=True) == settings_before, (
+    assert claude_settings_snapshot(settings_path) == settings_before, (
         f"{settings_path} changed; routing must preserve the saved model and "
         "confine its hook wiring to the session's bridge dir"
     )

@@ -415,10 +415,10 @@ def _dated_cache_cost_bridge(
     monkeypatch.setattr(
         claude_native_bridge,
         "_capture_pane",
-        lambda socket_path, target: (
+        lambda socket_path, target, **kwargs: (
             pane
             if composer.overlay == "cache-cost"
-            else composer._capture_pane(socket_path, target)
+            else composer._capture_pane(socket_path, target, **kwargs)
         ),
     )
     return composer, bridge_dir

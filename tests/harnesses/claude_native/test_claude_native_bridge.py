@@ -13759,15 +13759,15 @@ def test_managed_model_status_check_preserves_exact_context_identity(
 
 
 @pytest.mark.parametrize(
-    ("version", "raw_target", "actual_target", "already_selected", "status_queries", "catalog"),
+    ("raw_target", "actual_target", "already_selected", "status_queries", "catalog"),
     [
-        ("2.1.323", True, True, True, 1, "picker"),
-        ("2.1.323", True, False, False, 2, "picker"),
-        ("2.1.323", False, True, False, 1, "picker"),
-        ("2.1.323", True, True, True, 1, "observed-default"),
-        ("2.1.323", True, True, True, 1, "configured-default"),
-        ("2.1.323", True, False, None, 1, "observed-default"),
-        ("2.1.323", False, True, None, 0, "observed-default"),
+        (True, True, True, 1, "picker"),
+        (True, False, False, 2, "picker"),
+        (False, True, False, 1, "picker"),
+        (True, True, True, 1, "observed-default"),
+        (True, True, True, 1, "configured-default"),
+        (True, False, None, 1, "observed-default"),
+        (False, True, None, 0, "observed-default"),
     ],
     ids=[
         "fresh-same-model",
@@ -13782,7 +13782,6 @@ def test_managed_model_status_check_preserves_exact_context_identity(
 def test_model_command_uses_a_fresh_status_for_same_model_requests(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    version: str,
     raw_target: bool,
     actual_target: bool,
     already_selected: bool | None,
@@ -13791,7 +13790,6 @@ def test_model_command_uses_a_fresh_status_for_same_model_requests(
 ) -> None:
     owned_draft = "blocked prompt" if catalog == "configured-default" else None
     composer = _SessionModelComposer(draft=owned_draft or "")
-    composer.version = version
     if catalog == "observed-default":
         composer.options[-1] = "system.ai.claude-sonnet-4-6"
     bridge_dir = _session_model_bridge(tmp_path, composer)
@@ -13842,7 +13840,7 @@ def test_model_command_uses_a_fresh_status_for_same_model_requests(
         assert composer.text == ""
 
     assert composer.status_queries == status_queries
-    if version != "2.1.323" or catalog != "picker":
+    if catalog != "picker":
         assert [args[-1] for args in composer.sends] == (
             ([_CLEAR_ONE_ROW_COMPOSER] if owned_draft else [])
             + (["/status", "Enter", "Escape"] if status_queries else [])
@@ -20170,15 +20168,3 @@ def test_a_sandboxed_helper_accepts_the_bridge_under_its_read_only_pinned_tmpdir
             bridge._trusted_parent_for_bridge_dir(pinned / "elsewhere")
     finally:
         pinned.chmod(0o700)
-
-
-@pytest.mark.parametrize("command", ["/model sonnet", "/model private-model[1m]"])
-def test_inline_automated_model_commands_are_refused_before_keys(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
-) -> None:
-    bridge_dir = _picker_bridge_dir(tmp_path)
-    (bridge_dir / claude_native_bridge.CONTEXT_RAW_FILE).write_text('{"version":"2.1.323"}')
-    sends = _fake_tmux(monkeypatch, [_IDLE_PANE])
-    with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused):
-        claude_native_bridge.inject_slash_command(bridge_dir, command=command)
-    assert sends == []

@@ -480,15 +480,14 @@ def claude_user_settings_path(cwd: Path, env: Mapping[str, str]) -> Path:
     return _claude_joined_path(cwd, config_dir, "settings.json")
 
 
-def claude_settings_snapshot(path: Path, *, include_model: bool = False) -> str:
-    """Snapshot the launched Claude settings file, optionally including its model.
+def claude_settings_snapshot(path: Path) -> str:
+    """Snapshot the launched Claude settings file, including its saved model.
 
     Hook registration lives in the per-session bridge dir. Session-only
-    selection leaves the saved default unchanged; callers include the model
-    when checking that default alongside the other settings.
+    selection leaves the saved default unchanged, which is checked alongside
+    the other settings.
 
     :param path: Settings path resolved from the launch environment and workspace.
-    :param include_model: Include the saved default in the snapshot.
 
     :returns: Canonical settings, treating a missing file as an empty object.
     """
@@ -499,8 +498,6 @@ def claude_settings_snapshot(path: Path, *, include_model: bool = False) -> str:
     except (OSError, json.JSONDecodeError):
         # Unreadable is still comparable — hash the bytes.
         return hashlib.md5(path.read_bytes(), usedforsecurity=False).hexdigest()
-    if isinstance(payload, dict) and not include_model:
-        payload = {key: value for key, value in payload.items() if key != "model"}
     return json.dumps(payload, sort_keys=True)
 
 

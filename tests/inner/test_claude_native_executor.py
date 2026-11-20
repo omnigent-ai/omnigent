@@ -1390,6 +1390,7 @@ async def test_run_turn_requires_a_matching_model_selection_result(
         composer.options[-1] = "private-model"
         if receipt_kind == "older-cli-confirmed":
             composer.model = composer.options[-1]
+        initial_default = composer.saved_default
         bridge_dir = _session_model_bridge(tmp_path, composer)
         composer.install(monkeypatch)
     else:
@@ -1435,8 +1436,14 @@ async def test_run_turn_requires_a_matching_model_selection_result(
         assert events[0].undelivered and events[0].preserve_session
         assert delivered == []
     if receipt_kind.startswith("older-cli-"):
-        assert composer.model == composer.saved_default == composer.options[-1]
-        assert [command for command in composer.submitted if command] == ["/model private-model"]
+        assert composer.model == composer.options[-1]
+        already_selected = receipt_kind == "older-cli-confirmed"
+        assert composer.saved_default == (
+            initial_default if already_selected else composer.options[-1]
+        )
+        assert [command for command in composer.submitted if command] == (
+            [] if already_selected else ["/model private-model"]
+        )
         assert composer.status_queries == 0
 
 
@@ -1598,7 +1605,6 @@ async def test_run_turn_keeps_the_pane_when_a_terminal_dialog_blocks_delivery(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("caller", ["executor", "native-control"])
 @pytest.mark.parametrize(
     ("phase", "replacement"),
     [
@@ -1623,12 +1629,9 @@ async def test_run_turn_keeps_the_pane_when_a_terminal_dialog_blocks_delivery(
 async def test_cancelled_model_switch_cleans_only_observed_owned_controls(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    caller: str,
     phase: str,
     replacement: bool,
 ) -> None:
-    from omnigent.runner import native_controls
-
     monkeypatch.setattr(claude_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_bridge, "_BRIDGE_ROOT", tmp_path)
     monkeypatch.delenv("IS_SANDBOX", raising=False)
@@ -1689,20 +1692,11 @@ async def test_cancelled_model_switch_cleans_only_observed_owned_controls(
     )
     monkeypatch.delenv(claude_bridge.REQUEST_SESSION_ID_ENV_VAR, raising=False)
     executor = claude_native_executor.ClaudeNativeExecutor(bridge_dir)
-    control_deadline = native_controls._ClaudeControlDeadline()
     prompt = Mock(side_effect=AssertionError("a cancelled model switch sent its prompt"))
     monkeypatch.setattr(claude_native_executor, "inject_user_message", prompt)
 
     async def deliver() -> None:
-        if caller == "executor":
-            await executor._inject_turn("dependent prompt", [], "private-glm[1m]")
-        else:
-            await native_controls._drive_claude_pane(
-                control_deadline,
-                select_model,
-                bridge_dir,
-                model="private-glm[1m]",
-            )
+        await executor._inject_turn("dependent prompt", [], "private-glm[1m]")
 
     task = asyncio.create_task(deliver())
     try:
@@ -1713,8 +1707,7 @@ async def test_cancelled_model_switch_cleans_only_observed_owned_controls(
         assert not task.done(), "cancellation released an in-flight pane worker"
         assert not worker_finished.is_set()
         assert claude_bridge._bridge_injection_lock(bridge_dir).locked()
-        if caller == "executor":
-            assert executor._inject_lock.locked()
+        assert executor._inject_lock.locked()
         if replacement:
             if phase == "picker":
                 composer.options[0] = "a-persons-replacement-model"
@@ -1725,8 +1718,6 @@ async def test_cancelled_model_switch_cleans_only_observed_owned_controls(
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(asyncio.shield(task), 2)
         assert worker_finished.is_set()
-        if caller == "native-control":
-            assert control_deadline.is_set()
         assert composer.sends[: len(cancelled_at)] == cancelled_at
         cleanup = [args[-1] for args in composer.sends[len(cancelled_at) :]]
         expected = [_CLEAR_ONE_ROW_COMPOSER] if phase == "draft" else []

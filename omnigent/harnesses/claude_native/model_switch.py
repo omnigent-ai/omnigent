@@ -60,11 +60,12 @@ class ClaudeLegacyModelPane:
 
 @dataclass(frozen=True)
 class ClaudeLegacyModelSwitchResult:
-    """A legacy command was submitted; it may also change Claude's saved default."""
+    """An active legacy choice, or a submitted command that may change the saved default."""
 
     requested_model: str
     picker_value: str
     pane: ClaudeLegacyModelPane | None = None
+    already_selected: bool = False
 
 
 def supports_session_only_model_switch(version: object) -> bool:

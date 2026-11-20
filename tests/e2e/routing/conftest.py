@@ -22,6 +22,7 @@ slow or failed generation must not be able to redden a routing test.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -641,6 +642,25 @@ def spawn_tool_for(harness: str) -> str:
     :returns: The tool name to name in a prompt.
     """
     return "Task" if harness == "claude-native" else "spawn_agent"
+
+
+def require_session_only_claude() -> None:
+    """Gate saved-default preservation checks on the CLI behavior they require."""
+    from omnigent.harnesses.claude_native.model_switch import supports_session_only_model_switch
+
+    reason = "saved-default preservation requires stable Claude Code 2.1.323 or newer"
+    command = shutil.which("claude")
+    if command is None:
+        pytest.skip(reason)
+    try:
+        result = subprocess.run(
+            [command, "--version"], capture_output=True, text=True, timeout=15, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pytest.skip(reason)
+    match = re.match(r"(\d+\.\d+\.\d+)(?:\s|$)", result.stdout.strip())
+    if result.returncode or match is None or not supports_session_only_model_switch(match[1]):
+        pytest.skip(reason)
 
 
 def require_tmux() -> None:

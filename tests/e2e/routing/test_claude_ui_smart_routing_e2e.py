@@ -45,6 +45,7 @@ from tests.e2e.routing.conftest import (
     create_routed_session,
     post_user_message,
     prompts,
+    require_session_only_claude,
     require_tmux,
     sequence,
     spawn_prompt,
@@ -73,11 +74,12 @@ def test_claude_session_create_routes_the_model_and_then_the_spawn(
     mock_router: MockRouter,
     tmp_path: Path,
 ) -> None:
+    require_session_only_claude()
     require_tmux()
     routing_arms("claude-native")  # type: ignore[operator]
     workspace = trusted_workspace(tmp_path, "claude_ui_ws")
     settings_path = claude_user_settings_path(workspace, routing_claude_settings_env)
-    settings_before = claude_settings_snapshot(settings_path, include_model=True)
+    settings_before = claude_settings_snapshot(settings_path)
 
     # ── 1. The routed create ────────────────────────────────────────────────
     # Unique but still rule-0 (short, no error/code markers), so the mock's
@@ -172,11 +174,7 @@ def test_claude_session_create_routes_the_model_and_then_the_spawn(
 
     # Session-only selection leaves the saved default unchanged.
     wait_for(
-        lambda: (
-            True
-            if claude_settings_snapshot(settings_path, include_model=True) == settings_before
-            else None
-        ),
+        lambda: True if claude_settings_snapshot(settings_path) == settings_before else None,
         timeout=10,
         what="Claude settings, including the saved default, to match their initial state",
     )

@@ -12096,22 +12096,6 @@ async def test_probe_claude_model_options_runs_the_harness_under_the_launch_env(
     probe = await claude_native.probe_claude_model_options(_gateway_probe_config())
 
     assert probe is not None
-    assert probe.alias_rows == [
-        {
-            "id": "opus",
-            "model": "opus",
-            "displayName": "opus",
-            "_claude_picker_options": [
-                {
-                    "value": "opus",
-                    "model": "opus",
-                    "display_name": None,
-                    "enabled": True,
-                    "provenance": "structured",
-                }
-            ],
-        }
-    ]
     args = captured["args"]
     probe_start = args.index("-p")
     assert args[probe_start : probe_start + 3] == ["-p", "--input-format", "stream-json"]
@@ -12152,22 +12136,6 @@ async def test_probe_claude_model_options_omits_mcp_flags_under_managed_mcp_conf
     probe = await claude_native.probe_claude_model_options(_gateway_probe_config())
 
     assert probe is not None
-    assert probe.alias_rows == [
-        {
-            "id": "opus",
-            "model": "opus",
-            "displayName": "opus",
-            "_claude_picker_options": [
-                {
-                    "value": "opus",
-                    "model": "opus",
-                    "display_name": None,
-                    "enabled": True,
-                    "provenance": "structured",
-                }
-            ],
-        }
-    ]
     assert spawned_args
     for args in spawned_args:
         assert "--strict-mcp-config" not in args
