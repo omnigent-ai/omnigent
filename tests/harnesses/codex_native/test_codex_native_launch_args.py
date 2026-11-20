@@ -109,6 +109,12 @@ def test_remote_resume_option_spellings(args: tuple[str, ...], expected: dict) -
         (("--dangerously-bypass-approvals-and-sandbox",), "full-access"),
         (("--approve-for-me", "--sandbox", "read-only"), None),
         (("--profile", "strict"), None),
+        # A profile or the user's config may set the sandbox the flags leave out.
+        (
+            ("--profile", "strict", "-a", "on-request", "-c", 'approvals_reviewer="auto_review"'),
+            None,
+        ),
+        (("-a", "on-request", "-c", 'approvals_reviewer="auto_review"'), None),
         ((), None),
     ],
 )
