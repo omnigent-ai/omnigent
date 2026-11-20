@@ -249,7 +249,7 @@ import { cn } from "@/lib/utils";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { isDesktopLayout, useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useOpenSessionWindow } from "@/hooks/useOpenSessionWindow";
-import { isSessionWindow } from "@/lib/sessionWindow";
+import { isOwnSessionWindow } from "@/lib/sessionWindow";
 import {
   isSideBySideSidebarViewport,
   useIsSideBySideSidebarViewport,
@@ -5191,8 +5191,7 @@ export function ConversationMenuItems({
   const isMobile = useIsMobileViewport();
   const openSessionWindow = useOpenSessionWindow();
   const { conversationId: routeSessionId } = useParams<{ conversationId: string }>();
-  // A pop-out can't pop out the session it's showing.
-  const showsOwnSessionWindow = isSessionWindow() && conversation.id === routeSessionId;
+  const showsOwnSessionWindow = isOwnSessionWindow(conversation.id, routeSessionId);
   const { trackClick } = useOmnigentAnalytics();
   const [view, setView] = useState<"main" | "move" | "projects" | "nests">("main");
 

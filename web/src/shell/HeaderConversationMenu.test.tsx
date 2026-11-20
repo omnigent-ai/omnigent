@@ -241,37 +241,52 @@ describe("HeaderConversationMenu", () => {
   it("opens the session in a sized popup from Open in new window", () => {
     const popup = { location: { pathname: "blank", href: "about:blank" }, focus: vi.fn() };
     const open = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
-    renderMenu();
-    openMenu();
-    fireEvent.click(screen.getByTestId("header-open-session-window"));
-    expect(open).toHaveBeenCalledWith("", "omnigent-session-conv-1", "popup,width=960,height=820");
-    expect(popup.location.href).toBe("/c/conv-1?window=session");
-    expect(popup.focus).toHaveBeenCalled();
-    expect(screen.getByTestId("location")).toHaveTextContent("/c/conv-1");
-    open.mockRestore();
-  });
-
-  it("hides Open in new window inside the session's own window", () => {
-    document.documentElement.dataset.sessionWindow = "true";
     try {
       renderMenu();
       openMenu();
-      expect(screen.queryByTestId("header-open-session-window")).toBeNull();
+      fireEvent.click(screen.getByTestId("header-open-session-window"));
+      expect(open).toHaveBeenCalledWith(
+        "",
+        "omnigent-session-conv-1",
+        "popup,width=960,height=820",
+      );
+      expect(popup.location.href).toBe("/c/conv-1?window=session");
+      expect(popup.focus).toHaveBeenCalled();
+      expect(screen.getByTestId("location")).toHaveTextContent("/c/conv-1");
+    } finally {
+      open.mockRestore();
+    }
+  });
+
+  it.each([
+    ["its own session", "conv-1", false],
+    ["a session it moved to", "conv-9", true],
+  ])("inside a pop-out showing %s, offers Open in new window: %s", (_name, popOutFor, offered) => {
+    document.documentElement.dataset.sessionWindow = "true";
+    document.documentElement.dataset.sessionWindowFor = popOutFor;
+    try {
+      renderMenu();
+      openMenu();
+      expect(screen.queryByTestId("header-open-session-window") !== null).toBe(offered);
       expect(screen.getByRole("menuitem", { name: "Rename" })).toBeInTheDocument();
     } finally {
       delete document.documentElement.dataset.sessionWindow;
+      delete document.documentElement.dataset.sessionWindowFor;
     }
   });
 
   it("explains a blocked popup", () => {
     const open = vi.spyOn(window, "open").mockReturnValue(null);
-    renderMenu();
-    openMenu();
-    fireEvent.click(screen.getByTestId("header-open-session-window"));
-    expect(mocks.toastError).toHaveBeenCalledWith(
-      "Your browser blocked the new window. Allow pop-ups for this site.",
-    );
-    open.mockRestore();
+    try {
+      renderMenu();
+      openMenu();
+      fireEvent.click(screen.getByTestId("header-open-session-window"));
+      expect(mocks.toastError).toHaveBeenCalledWith(
+        "Your browser blocked the new window. Allow pop-ups for this site.",
+      );
+    } finally {
+      open.mockRestore();
+    }
   });
 
   it("hides Mark as unread for a muted session", () => {

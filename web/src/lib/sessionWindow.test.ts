@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  isOwnSessionWindow,
   openBrowserSessionWindow,
   sessionWindowPath,
+  startingSessionWindowId,
   startsAsSessionWindow,
 } from "./sessionWindow";
 
@@ -10,6 +12,9 @@ afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
   delete window.__OMNIGENT_BASE_PATH__;
+  delete document.documentElement.dataset.sessionWindow;
+  delete document.documentElement.dataset.sessionWindowFor;
+  window.name = "";
   window.history.replaceState(null, "", "/");
 });
 
@@ -78,6 +83,56 @@ describe("session window", () => {
     expect(openBrowserSessionWindow("conv_1")).toBe(true);
     expect(location.href).toBe("/c/conv_1?window=session");
     expect(popup.focus).toHaveBeenCalled();
+  });
+
+  it("records the session a pop-out was opened for, under a base path too", () => {
+    vi.stubGlobal("opener", window);
+    window.history.replaceState(null, "", "/proxy/6767/c/conv%201?window=session");
+    expect(startingSessionWindowId()).toBe("conv 1");
+    window.history.replaceState(null, "", "/settings?window=session");
+    expect(startingSessionWindowId()).toBeNull();
+  });
+
+  it.each([
+    ["its own session while showing it", "conv_1", "conv_1", true],
+    ["its own session after moving to another", "conv_1", "conv_2", false],
+    ["another session", "conv_2", "conv_1", false],
+  ])("treats a pop-out opening %s as itself: %s", (_name, target, shown, expected) => {
+    document.documentElement.dataset.sessionWindow = "true";
+    document.documentElement.dataset.sessionWindowFor = "conv_1";
+    expect(isOwnSessionWindow(target, shown)).toBe(expected);
+    delete document.documentElement.dataset.sessionWindow;
+    expect(isOwnSessionWindow("conv_1", "conv_1")).toBe(false);
+  });
+
+  it("opens another window from a pop-out that moved away from the requested session", () => {
+    window.history.replaceState(null, "", "/c/conv_2?window=session");
+    window.name = "omnigent-session-conv_1";
+    const popup = { location: { pathname: "blank", href: "about:blank" }, focus: vi.fn() };
+    const open = vi
+      .spyOn(window, "open")
+      .mockImplementation((_url, name) =>
+        name === window.name ? window : (popup as unknown as Window),
+      );
+
+    expect(openBrowserSessionWindow("conv_1")).toBe(true);
+    expect(open).toHaveBeenCalledWith("", "omnigent-session-conv_1", "popup,width=960,height=820");
+    expect(popup.location.href).toBe("/c/conv_1?window=session");
+    expect(window.location.pathname).toBe("/c/conv_2");
+  });
+
+  it("keeps a pop-out's name while it still shows its session", () => {
+    window.history.replaceState(null, "", "/c/conv_1?window=session");
+    window.name = "omnigent-session-conv_1";
+    const focus = vi.spyOn(window, "focus").mockImplementation(() => {});
+    vi.spyOn(window, "open").mockImplementation((_url, name) =>
+      name === window.name ? window : null,
+    );
+
+    expect(openBrowserSessionWindow("conv_1")).toBe(true);
+    expect(window.name).toBe("omnigent-session-conv_1");
+    expect(focus).toHaveBeenCalled();
+    expect(window.location.pathname).toBe("/c/conv_1");
   });
 
   it("reports a blocked popup", () => {

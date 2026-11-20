@@ -17,16 +17,24 @@ export function sessionWindowPath(sessionId: string): string {
 }
 
 /**
- * Whether this page was opened as a session window: the query is present and the
- * page is a real pop-out (the desktop shell's, or a browser popup with an opener).
- * A copied pop-out link opened elsewhere, such as on a phone, keeps its usual layout.
+ * The session this page was popped out for, or null when it isn't a session window.
+ * It must carry the query and be a real pop-out (the desktop shell's, or a browser
+ * popup with an opener). A copied pop-out link opened elsewhere, such as on a phone,
+ * keeps its usual layout.
  */
-export function startsAsSessionWindow(): boolean {
-  if (typeof window === "undefined") return false;
+export function startingSessionWindowId(): string | null {
+  if (typeof window === "undefined") return null;
   const params = new URLSearchParams(window.location.search);
-  if (params.get(SESSION_WINDOW_PARAM) !== SESSION_WINDOW_VALUE) return false;
+  if (params.get(SESSION_WINDOW_PARAM) !== SESSION_WINDOW_VALUE) return null;
   const desktop = (window as { omnigentDesktop?: { kind?: string } }).omnigentDesktop;
-  return desktop?.kind === "electron" || Boolean(window.opener);
+  if (desktop?.kind !== "electron" && !window.opener) return null;
+  const match = /\/c\/([^/]+)\/?$/.exec(window.location.pathname);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+/** Whether this page was opened as a session window; see `startingSessionWindowId`. */
+export function startsAsSessionWindow(): boolean {
+  return startingSessionWindowId() !== null;
 }
 
 /** Set once before first paint by `applyDesktopAppAttribute`. */
@@ -34,6 +42,17 @@ export function isSessionWindow(): boolean {
   return (
     typeof document !== "undefined" && document.documentElement.dataset.sessionWindow === "true"
   );
+}
+
+/**
+ * Whether opening `sessionId` would only point this pop-out at itself: it was popped
+ * out for that session and still shows it (`shownSessionId`). After the pop-out moves
+ * to another session, its original session can be popped out again.
+ */
+export function isOwnSessionWindow(sessionId: string, shownSessionId: string | undefined): boolean {
+  if (!isSessionWindow()) return false;
+  const own = document.documentElement.dataset.sessionWindowFor;
+  return own === sessionId && shownSessionId === sessionId;
 }
 
 /** Whether `popup` already shows `target`; false while blank or if it left this origin. */
@@ -51,7 +70,10 @@ function popupShows(popup: Window, target: string): boolean {
  */
 export function openBrowserSessionWindow(sessionId: string): boolean {
   const target = withBasePath(sessionWindowPath(sessionId));
-  const popup = window.open("", `omnigent-session-${sessionId}`, SESSION_WINDOW_FEATURES);
+  const name = `omnigent-session-${sessionId}`;
+  // A pop-out that moved to another session would otherwise resolve its own stale name.
+  if (window.name === name && !popupShows(window, target)) window.name = "";
+  const popup = window.open("", name, SESSION_WINDOW_FEATURES);
   if (!popup) return false;
   if (!popupShows(popup, target)) popup.location.href = target;
   popup.focus();
