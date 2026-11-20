@@ -128,8 +128,8 @@ export function skillMenuDescription(skill: {
  * Filter `commands` to those matching `query`, then rank them for display:
  * built-in commands before skills (so the "Commands" section stays above
  * "Skills" and the flat keyboard index walks the same order that's
- * rendered), and within each group, name-prefix matches before mid-string
- * matches, then matches on only the display `labels`. The sort is stable, so
+ * rendered), and within each group, an exact name before name-prefix matches,
+ * then mid-string matches, then matches on only the display `labels`. The sort is stable, so
  * commands that tie keep their insertion order. Returns the ranked,
  * slash-prefixed names.
  *
@@ -149,12 +149,13 @@ export function rankedSlashCommandNames(
   labels: Readonly<Record<string, string>> = {},
 ): string[] {
   const q = query.toLowerCase();
-  // Built-ins rank before skills; within each, name prefix, then name
-  // substring, then label-only matches, so Tab never prefers a label hit.
+  // Built-ins rank before skills; within each, the exact name, then name
+  // prefix, then name substring, then label-only matches, so Tab never
+  // prefers a label hit.
   const rank = (name: string): number => {
-    const group = builtinNames.has(name) ? 0 : 3;
+    const group = builtinNames.has(name) ? 0 : 4;
     const body = name.slice(1).toLowerCase();
-    return group + (body.startsWith(q) ? 0 : body.includes(q) ? 1 : 2);
+    return group + (body === q ? 0 : body.startsWith(q) ? 1 : body.includes(q) ? 2 : 3);
   };
   return Object.keys(commands)
     .filter((name) => slashCommandMatches(name, query, labels[name]))
