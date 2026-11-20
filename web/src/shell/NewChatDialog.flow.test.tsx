@@ -721,6 +721,36 @@ describe("NewChatLandingScreen in the floating panel", () => {
     await waitFor(() => expect(panel.launch).toHaveBeenCalled());
   });
 
+  it("fills the panel with a borderless composer and keeps its send chord in view", async () => {
+    renderLanding([], {}, floatingPanel());
+    await waitForWorkspaceSeed();
+
+    const composer = screen.getByTestId("new-chat-landing-composer");
+    expect(composer).toHaveAttribute("data-composer-appearance", "panel");
+    expect(composer).toHaveClass("flex-1");
+    expect(composer).not.toHaveClass("composer-reference-surface");
+    expect(composer).not.toHaveClass("border");
+    expect(composer).not.toHaveClass("rounded-2xl");
+    expect(screen.getByTestId("new-chat-landing-actions")).toHaveClass("border-t");
+    expect(screen.getByTestId("new-chat-landing-send-shortcut")).toHaveTextContent("↵");
+    expect(screen.getByTestId("new-chat-landing-submit")).toHaveAttribute(
+      "aria-keyshortcuts",
+      expect.stringMatching(/^(Meta|Control)\+Enter$/),
+    );
+  });
+
+  it("keeps the main window's composer card, with no chord hint", async () => {
+    renderLanding([]);
+    await waitForWorkspaceSeed();
+
+    const composer = screen.getByTestId("new-chat-landing-composer");
+    expect(composer).not.toHaveAttribute("data-composer-appearance");
+    expect(composer).toHaveClass("composer-reference-surface", "border", "rounded-2xl");
+    expect(screen.getByTestId("new-chat-landing-actions")).not.toHaveClass("border-t");
+    expect(screen.queryByTestId("new-chat-landing-send-shortcut")).not.toBeInTheDocument();
+    expect(screen.getByTestId("new-chat-landing-submit")).not.toHaveAttribute("aria-keyshortcuts");
+  });
+
   it("tells the panel when the native file picker opens and closes", async () => {
     const panel = floatingPanel();
 

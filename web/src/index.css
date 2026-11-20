@@ -754,6 +754,15 @@
   border-color: color(srgb 0.960784 0.960784 0.956863 / 0.04);
 }
 
+/* The floating New Agent panel is itself the card, so its workspace row is a flat strip. */
+[data-presentation="floating"] .composer-context-bar {
+  width: 100%;
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  background-color: transparent;
+}
+
 .composer-context-bar.rounded-t-none {
   border-top-width: 0;
   border-top-left-radius: 0;

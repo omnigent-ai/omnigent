@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { ALT_KEY, CTRL_KEY, MOD_KEY, SHIFT_KEY } from "@/components/KeyboardShortcut";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { isMacPlatform } from "@/lib/hotkeys";
@@ -174,7 +175,16 @@ export function GlobalShortcutControl({ shortcutId = "show" }: { shortcutId?: Gl
   return (
     <SettingsItem entry={entry} className="flex flex-col gap-3">
       <div className="flex items-center justify-between gap-6">
-        <SettingsEntryLabel entry={entry} className="flex-1" descriptionClassName="text-ui" />
+        <SettingsEntryLabel
+          entry={entry}
+          className="flex-1"
+          descriptionClassName="text-ui"
+          labelBadge={
+            <Badge variant="outline" data-testid={`${ids.testIdPrefix}-system-wide`}>
+              System-wide
+            </Badge>
+          }
+        />
         <div className="flex shrink-0 items-center gap-3">
           <Button
             variant="outline"

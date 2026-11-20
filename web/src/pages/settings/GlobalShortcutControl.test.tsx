@@ -38,6 +38,25 @@ describe("GlobalShortcutControl", () => {
     expect(container).toBeEmptyDOMElement();
   });
 
+  it.each([
+    ["show", "global-shortcut", {}],
+    ["floatingComposer", "floating-composer-shortcut", { floatingComposerShortcut: true }],
+  ] as const)(
+    "marks the %s shortcut system-wide, since it works from any app",
+    async (shortcutId, prefix, features) => {
+      (window as unknown as Record<string, unknown>).omnigentDesktop = {
+        ...installBridge(),
+        getDesktopFeatures: vi.fn().mockResolvedValue(features),
+      };
+      renderControl({ shortcutId });
+
+      expect(await screen.findByTestId(`${prefix}-system-wide`)).toHaveTextContent("System-wide");
+      expect(screen.getByTestId(`${prefix}-recorder`)).toHaveAccessibleDescription(
+        /system-wide shortcut.*any app.*background/i,
+      );
+    },
+  );
+
   it("saves Alt+Space when the switch is turned on", async () => {
     const bridge = installBridge();
     renderControl();

@@ -420,6 +420,7 @@ import { SkillPills } from "@/components/SkillPills";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import type { CostControlMode } from "@/components/CostRoutingControl";
 import {
+  ARIA_MOD_KEY,
   composerSendShortcutKeys,
   CompactShortcutKeys,
   KeyboardShortcutTooltipContent,
@@ -7667,13 +7668,13 @@ function NewChatLandingContent({
               e.preventDefault();
               void handleCreate();
             }}
-            className="relative z-30"
+            className={cn("relative z-30", floating && "flex min-h-0 flex-1 flex-col")}
           >
             <ChatComposer
               engine={composerEngine}
               dictating={dictation.hasInterim}
               onActiveInputChange={bindTextarea}
-              appearance={isMobileViewport ? "glass" : "default"}
+              appearance={floating ? "panel" : isMobileViewport ? "glass" : "default"}
               hasContent={
                 files.length > 0 ||
                 mentionedItems.length > 0 ||
@@ -8310,6 +8311,12 @@ function NewChatLandingContent({
                       onTranscript={dictation.appendFinal}
                       onInterim={dictation.replaceInterim}
                     />
+                    {/* Plain ↵ adds a line in the panel, so its send chord stays in view. */}
+                    {floating && (
+                      <span className="px-1" data-testid="new-chat-landing-send-shortcut">
+                        <CompactShortcutKeys keys={composerSendShortcutKeys(true)} />
+                      </span>
+                    )}
                     <TooltipProvider>
                       <Tooltip
                         open={submitTooltipState !== "closed"}
@@ -8350,6 +8357,7 @@ function NewChatLandingContent({
                               disabled={!canSubmit}
                               label={creating ? "Starting session" : "Start session"}
                               busy={creating}
+                              aria-keyshortcuts={floating ? `${ARIA_MOD_KEY}+Enter` : undefined}
                               data-testid="new-chat-landing-submit"
                             />
                           </span>
