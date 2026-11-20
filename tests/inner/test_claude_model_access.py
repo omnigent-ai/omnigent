@@ -685,7 +685,9 @@ def test_actual_oauth_files_cannot_alias_a_worker_grant(
         access.protect_sources(policy, workspace)
 
 
-@pytest.mark.parametrize("entrypoint", ["cli_callback", "terminal", "terminal_override"])
+@pytest.mark.parametrize(
+    "entrypoint", ["cli_callback", "sdk_constructor", "terminal", "terminal_override"]
+)
 def test_relative_config_dir_provenance_uses_session_cwd(
     oauth_paths: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, entrypoint: str
 ) -> None:
@@ -693,25 +695,42 @@ def test_relative_config_dir_provenance_uses_session_cwd(
     from omnigent.runtime import workflow
 
     config, workspace = oauth_paths
+    session_root = workspace
+    if entrypoint == "sdk_constructor":
+        workspace = session_root / "project"
+        workspace.mkdir()
+        config = session_root / "auth"
+        config.mkdir()
+        _write_oauth(config / ".credentials.json", "session-only-oauth")
     parent = workspace.parent / "daemon" / "cwd"
     parent.mkdir(parents=True)
     monkeypatch.chdir(parent)
-    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(session_root))
     for name in tuple(os.environ):
         if name.startswith(("CLAUDE_", "ANTHROPIC_", "HARNESS_")):
             monkeypatch.delenv(name)
     env = {"CLAUDE_CONFIG_DIR": os.path.relpath(config, workspace)}
     # Parent settings must not replace the session's credential provenance.
     settings = {"env": {"ANTHROPIC_AUTH_TOKEN": "session-only-key"}}
+    if entrypoint == "sdk_constructor":
+        settings = {"env": {"ANTHROPIC_BASE_URL": "https://session.example.test/anthropic"}}
     (config / "settings.json").write_text(json.dumps(settings))
-    parent_config = parent / env["CLAUDE_CONFIG_DIR"]
+    # The constructor must select the named policy cwd before loading settings.
+    wrong_cwd = session_root if entrypoint == "sdk_constructor" else parent
+    parent_config = wrong_cwd / env["CLAUDE_CONFIG_DIR"]
     parent_config.mkdir(parents=True)
     (parent_config / "settings.json").write_text(
-        json.dumps({"env": {"ANTHROPIC_AUTH_TOKEN": "wrong-parent-key"}})
+        json.dumps(
+            {
+                "env": {
+                    "ANTHROPIC_AUTH_TOKEN": "wrong-parent-key",
+                    "ANTHROPIC_BASE_URL": "https://wrong.example.test/anthropic",
+                }
+            }
+        )
     )
     policy = SandboxPolicy("linux_bwrap", True, [workspace], [workspace], [], False)
-    if entrypoint == "cli_callback":
-        env["ANTHROPIC_AUTH_TOKEN"] = "session-only-key"
+    if entrypoint in ("cli_callback", "sdk_constructor"):
         monkeypatch.setattr(claude, "resolve_sandbox", lambda *_: policy)
         backend = Mock()
         backend.wrap_launcher_argv.side_effect = lambda argv, *args, **kwargs: ["bwrap", *argv]
@@ -727,17 +746,34 @@ def test_relative_config_dir_provenance_uses_session_cwd(
         launcher.touch()
         launch = Mock(return_value=str(launcher))
         monkeypatch.setattr(claude, "create_exec_launcher", launch)
-        spec = OSEnvSpec(cwd=".", sandbox=OSEnvSandboxSpec(type="linux_bwrap"))
-        prepared = claude.prepare_claude_cli_path(
-            "/bin/claude",
-            spec,
-            worker_env=dict(env),
-            response_header_timeout_seconds=75.5,
+        spec = OSEnvSpec(
+            cwd="./project" if entrypoint == "sdk_constructor" else ".",
+            sandbox=OSEnvSandboxSpec(type="linux_bwrap"),
         )
+        if entrypoint == "sdk_constructor":
+            monkeypatch.setenv("CLAUDE_CONFIG_DIR", env["CLAUDE_CONFIG_DIR"])
+            monkeypatch.setattr(claude, "_find_system_claude", lambda: "/bin/claude")
+            executor = claude.ClaudeSDKExecutor(cwd=str(session_root), os_env=spec)
+            prepared = executor._prepared_cli
+            assert prepared is not None
+            assert executor._cwd == str(workspace)
+        else:
+            env["ANTHROPIC_AUTH_TOKEN"] = "session-only-key"
+            prepared = claude.prepare_claude_cli_path(
+                "/bin/claude",
+                spec,
+                worker_env=dict(env),
+                response_header_timeout_seconds=75.5,
+            )
         try:
             access = prepared.model_access
             assert access is not None
-            assert access.response_header_timeout_seconds == 75.5
+            if entrypoint == "sdk_constructor":
+                assert access.base_url == "https://session.example.test/anthropic"
+                assert config / "settings.json" in access.source_paths
+                assert launch.call_args.kwargs["cwd"] == str(workspace)
+            else:
+                assert access.response_header_timeout_seconds == 75.5
             assert prepared.sandbox is not None
             assert config in (prepared.sandbox.credential_source_paths or [])
         finally:
@@ -768,7 +804,9 @@ def test_relative_config_dir_provenance_uses_session_cwd(
         with pytest.raises(ValueError, match="outside sandbox"):
             access.protect_sources(policy, workspace)
     assert config in access.source_paths
-    assert access.credential() == "session-only-key"
+    assert access.credential() == (
+        "session-only-oauth" if entrypoint == "sdk_constructor" else "session-only-key"
+    )
 
 
 def test_private_oauth_symlink_is_protected_and_atomic_rotation_works(

@@ -2047,7 +2047,7 @@ def _claude_internal_write_files() -> list[pathlib.Path]:
     return [path for path in candidates if path.exists()]
 
 
-def _resolve_sandbox_cwd(spec_cwd: str | None) -> pathlib.Path:
+def _resolve_sandbox_cwd(spec_cwd: str | None, *, selected_cwd: str | None = None) -> pathlib.Path:
     """Resolve the sandbox root, rooting relative paths at the session
     working folder rather than the runner daemon's process cwd.
 
@@ -2057,19 +2057,26 @@ def _resolve_sandbox_cwd(spec_cwd: str | None) -> pathlib.Path:
     home dir and disagrees with the tmux terminal, which uses
     ``OMNIGENT_RUNNER_WORKSPACE``. Prefer that workspace as the base so
     the two agree; fall back to the process cwd only when it is unset.
-    An absolute ``spec_cwd`` is honored verbatim.
+    A selected session cwd takes precedence. At the runner root, a named
+    relative ``spec_cwd`` selects its subdirectory; ``"."`` keeps the session cwd.
 
     :param spec_cwd: The spec's ``os_env.cwd``, or ``None``.
+    :param selected_cwd: The selected session working directory, if any.
     :returns: The resolved, absolute sandbox root.
     """
-    base = os.environ.get("OMNIGENT_RUNNER_WORKSPACE") or os.getcwd()
-    if spec_cwd:
-        path = pathlib.Path(spec_cwd)
-        if not path.is_absolute():
-            path = pathlib.Path(base) / path
-    else:
-        path = pathlib.Path(base)
-    return path.resolve(strict=False)
+    base = pathlib.Path(os.environ.get("OMNIGENT_RUNNER_WORKSPACE") or os.getcwd()).resolve(
+        strict=False
+    )
+    path = pathlib.Path(selected_cwd if selected_cwd is not None else spec_cwd or base)
+    resolved = (base / path).resolve(strict=False)
+    if (
+        spec_cwd
+        and pathlib.Path(spec_cwd) != pathlib.Path(".")
+        and not pathlib.Path(spec_cwd).is_absolute()
+        and resolved == base
+    ):
+        return (base / spec_cwd).resolve(strict=False)
+    return resolved
 
 
 def prepare_claude_cli_path(
@@ -2105,15 +2112,7 @@ def prepare_claude_cli_path(
     if spec is None:
         return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=False)
     with harness_sandbox_preparation():
-        resolved_cwd = _resolve_sandbox_cwd(cwd if cwd is not None else spec.cwd)
-        # Named relative roots use the runner base; "." follows the selected session cwd.
-        if (
-            spec.cwd
-            and pathlib.Path(spec.cwd) != pathlib.Path(".")
-            and not pathlib.Path(spec.cwd).is_absolute()
-            and resolved_cwd == _resolve_sandbox_cwd(None)
-        ):
-            resolved_cwd = _resolve_sandbox_cwd(spec.cwd)
+        resolved_cwd = _resolve_sandbox_cwd(spec.cwd, selected_cwd=cwd)
         validate_harness_sandbox(
             spec,
             "Claude SDK",
@@ -2759,7 +2758,7 @@ class ClaudeSDKExecutor(Executor):
         self._cli_sandbox_cwd: str | None = None
         if self._cli_path:
             if self._os_env_spec is not None:
-                effective_cwd = _resolve_sandbox_cwd(self._cwd or self._os_env_spec.cwd)
+                effective_cwd = _resolve_sandbox_cwd(self._os_env_spec.cwd, selected_cwd=self._cwd)
                 user_settings_source_paths: tuple[pathlib.Path, ...] = ()
                 user_settings_has_api_key_helper = False
                 if not self._gateway and (
@@ -2775,7 +2774,7 @@ class ClaudeSDKExecutor(Executor):
                 prepared = prepare_claude_cli_path(
                     self._cli_path,
                     self._os_env_spec,
-                    cwd=self._cwd,
+                    cwd=str(effective_cwd),
                     worker_env=self._extra_env,
                     bundle_dir=self._bundle_dir,
                     agent_name=self._agent_name,
