@@ -149,6 +149,7 @@ import {
   DELETE_WORKTREES_ON_ARCHIVE_ENTRY,
 } from "@/pages/settings/search/catalog/git";
 import {
+  CLAUDE_CONNECTION_ENTRY,
   DATABRICKS_CONNECTION_ENTRY,
   GITHUB_CONNECTION_ENTRY,
 } from "@/pages/settings/search/catalog/integrations";
@@ -1978,15 +1979,19 @@ function ClaudeIntegrationControl() {
   if (status !== "loading" && status !== null && !status.enabled) {
     return null;
   }
-  if (status === "loading") {
-    return <p className="text-sm text-muted-foreground">Checking…</p>;
-  }
-  if (status === null) {
-    return <p className="text-sm text-muted-foreground">Claude status is unavailable.</p>;
+  if (status === "loading" || status === null) {
+    return (
+      <SettingsItem entry={CLAUDE_CONNECTION_ENTRY}>
+        <SettingsEntryLabel entry={CLAUDE_CONNECTION_ENTRY} labelClassName="text-sm" />
+        <p className="text-sm text-muted-foreground">
+          {status === "loading" ? "Checking…" : "Claude status is unavailable."}
+        </p>
+      </SettingsItem>
+    );
   }
 
   return (
-    <div className="flex flex-col gap-4">
+    <SettingsItem entry={CLAUDE_CONNECTION_ENTRY} className="flex flex-col gap-4">
       {error && (
         <div
           role="alert"
@@ -1997,14 +2002,14 @@ function ClaudeIntegrationControl() {
       )}
 
       <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
-        <SettingsLabel
-          label="Claude"
+        <SettingsEntryLabel
+          entry={CLAUDE_CONNECTION_ENTRY}
           labelClassName="text-sm"
           className="flex-1"
           description={
             status.connected
               ? "Subscription connected. New sandboxes run Claude Code on your subscription."
-              : "Run `claude setup-token` and paste the token to use your Claude subscription in new sandboxes."
+              : CLAUDE_CONNECTION_ENTRY.description
           }
         />
         <div className="flex shrink-0 items-center gap-2">
@@ -2013,6 +2018,7 @@ function ClaudeIntegrationControl() {
               variant="ghost"
               size="sm"
               className="h-9"
+              {...settingsControlProps(CLAUDE_CONNECTION_ENTRY, "disconnect")}
               disabled={busy}
               data-testid="claude-disconnect"
               onClick={() => void onDisconnect()}
@@ -2022,6 +2028,7 @@ function ClaudeIntegrationControl() {
           ) : (
             <>
               <Input
+                {...settingsControlProps(CLAUDE_CONNECTION_ENTRY, "token")}
                 type="password"
                 autoComplete="off"
                 spellCheck={false}
@@ -2035,6 +2042,7 @@ function ClaudeIntegrationControl() {
               <Button
                 size="sm"
                 className="h-9"
+                {...settingsControlProps(CLAUDE_CONNECTION_ENTRY, "connect")}
                 disabled={busy || token.trim() === ""}
                 data-testid="claude-connect"
                 onClick={() => void onSave()}
@@ -2045,7 +2053,7 @@ function ClaudeIntegrationControl() {
           )}
         </div>
       </div>
-    </div>
+    </SettingsItem>
   );
 }
 

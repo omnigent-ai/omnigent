@@ -41,4 +41,28 @@ export const DATABRICKS_CONNECTION_ENTRY = settingsEntry({
   },
 });
 
-export const INTEGRATION_SETTINGS = [GITHUB_CONNECTION_ENTRY, DATABRICKS_CONNECTION_ENTRY] as const;
+export const CLAUDE_CONNECTION_ENTRY = settingsEntry({
+  id: "claude-connection",
+  available: (availability) => availability.integrationProviders.claude,
+  section: "integrations",
+  label: "Claude",
+  description:
+    "Run `claude setup-token` and paste the token to use your Claude subscription in new sandboxes.",
+  keywords: ["claude", "claude code", "subscription", "setup token", "anthropic", "connect"],
+  parts: {
+    token: "Claude setup token",
+    connect: "Connect Claude",
+    disconnect: "Disconnect",
+  },
+  presence: {
+    token: { states: ["not connected"] },
+    connect: { states: ["not connected"] },
+    disconnect: { states: ["connected"] },
+  },
+});
+
+export const INTEGRATION_SETTINGS = [
+  GITHUB_CONNECTION_ENTRY,
+  DATABRICKS_CONNECTION_ENTRY,
+  CLAUDE_CONNECTION_ENTRY,
+] as const;

@@ -400,7 +400,7 @@ const GENERAL_WEB_HIDES = {
 const TITLES_LOADED = "0 / 500 characters";
 const TITLES_SAVED = "16 / 500 characters";
 const TITLES_FAILED = "Couldn't load your title instructions.";
-const NO_CONNECTIONS = "The server lists no GitHub or Databricks connection.";
+const NO_CONNECTIONS = "The server lists no GitHub, Databricks, or Claude connection.";
 
 /** A managed MCP service as the registry lists it. */
 function service(id: string, title: string, auth: string, connected: boolean) {
@@ -447,6 +447,7 @@ function integrationScenario({
   scenario,
   github,
   databricks,
+  claude,
   ready,
   hides,
   states,
@@ -454,6 +455,7 @@ function integrationScenario({
   scenario: string;
   github: Record<string, unknown> | null;
   databricks: Record<string, unknown> | null;
+  claude: Record<string, unknown> | null;
   ready: readonly Witness[];
   hides?: Readonly<Record<string, string>>;
   states: Readonly<Record<string, readonly string[]>>;
@@ -463,10 +465,11 @@ function integrationScenario({
   return {
     section: "integrations",
     scenario: `web › ${scenario}`,
-    info: { enabled_connections: ["github", "databricks", "mcp"] },
+    info: { enabled_connections: ["github", "databricks", "claude", "mcp"] },
     routes: [
       answer("/v1/connections/github/status", github),
       answer("/v1/connections/databricks/status", databricks),
+      answer("/v1/connections/claude/status", claude),
     ],
     ready,
     hides,
@@ -673,6 +676,7 @@ const SCENARIOS: readonly SettingsAuditScenario[] = [
     hides: {
       "github-connection": NO_CONNECTIONS,
       "databricks-connection": NO_CONNECTIONS,
+      "claude-connection": NO_CONNECTIONS,
     },
   },
   integrationScenario({
@@ -685,10 +689,16 @@ const SCENARIOS: readonly SettingsAuditScenario[] = [
       install_url: INSTALL_URL,
     },
     databricks: { enabled: true, connected: false, workspace_host: null, databricks_user: null },
-    ready: ["Connect GitHub to use your gh", "Connect a Databricks workspace to access"],
+    claude: { enabled: true, connected: false, connected_at: null },
+    ready: [
+      "Connect GitHub to use your gh",
+      "Connect a Databricks workspace to access",
+      "paste the token to use your Claude subscription",
+    ],
     states: {
       "github-connection": ["not connected", "install link"],
       "databricks-connection": ["not connected"],
+      "claude-connection": ["not connected"],
     },
   }),
   integrationScenario({
@@ -700,14 +710,28 @@ const SCENARIOS: readonly SettingsAuditScenario[] = [
       workspace_host: "workspace.example.com",
       databricks_user: "alice@example.com",
     },
-    ready: ["Connected as alice.", "Connected to workspace.example.com as alice@example.com."],
-    states: { "github-connection": ["connected"], "databricks-connection": ["connected"] },
+    claude: { enabled: true, connected: true, connected_at: 1_700_000_000 },
+    ready: [
+      "Connected as alice.",
+      "Connected to workspace.example.com as alice@example.com.",
+      "Subscription connected.",
+    ],
+    states: {
+      "github-connection": ["connected"],
+      "databricks-connection": ["connected"],
+      "claude-connection": ["connected"],
+    },
   }),
   integrationScenario({
     scenario: "status unavailable",
     github: null,
     databricks: null,
-    ready: ["GitHub status is unavailable.", "Databricks status is unavailable."],
+    claude: null,
+    ready: [
+      "GitHub status is unavailable.",
+      "Databricks status is unavailable.",
+      "Claude status is unavailable.",
+    ],
     hides: {},
     states: {},
   }),

@@ -290,7 +290,7 @@ const SHOWN: SettingsAvailability = {
   accountsEnabled: true,
   archiveWorktreeCleanup: true,
   mcpServices: true,
-  integrationProviders: { github: true, databricks: true },
+  integrationProviders: { github: true, databricks: true, claude: true },
   projectKanban: true,
   sessionTitleInstructions: true,
   proactiveAgent: true,
