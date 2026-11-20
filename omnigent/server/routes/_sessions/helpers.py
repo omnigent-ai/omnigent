@@ -7304,6 +7304,82 @@ async def _provision_managed_sandbox(
         return None
 
 
+_MANAGED_RUNNER_REBIND_POLL_S = 2.0
+
+
+async def _wait_for_session_bound_runner(
+    session_id: str,
+    runner_id: str,
+    tunnel_registry: TunnelRegistry,
+    conversation_store: ConversationStore | None,
+    *,
+    timeout_s: float,
+) -> tuple[bool, str]:
+    """
+    Wait for *runner_id*, switching to a host-launched runner the session is rebound to.
+
+    Only token-bound runner ids (the form a host launch mints) are followed;
+    a move's claim is not a runner. Each followed runner gets a full
+    *timeout_s* of its own.
+
+    :param session_id: Session/conversation identifier.
+    :param runner_id: Runner id the launch started, e.g. ``"runner_token_ab12..."``.
+    :param tunnel_registry: Runner tunnel registry to wait on.
+    :param conversation_store: Store holding the session's runner binding, or
+        ``None`` to wait only for *runner_id*.
+    :param timeout_s: Connect window per runner, e.g. ``30.0``.
+    :returns: Whether the awaited runner connected before its deadline, and
+        the id of the runner awaited last.
+    """
+    from omnigent.server.managed_hosts import is_move_claim
+
+    if conversation_store is None:
+        runner = await tunnel_registry.wait_for_runner(runner_id, timeout_s=timeout_s)
+        return runner is not None, runner_id
+    deadline = time.monotonic() + timeout_s
+    lookup_failed = False
+    while True:
+        remaining = deadline - time.monotonic()
+        started = time.monotonic()
+        poll_s = max(0.0, min(remaining, _MANAGED_RUNNER_REBIND_POLL_S))
+        runner = await tunnel_registry.wait_for_runner(runner_id, timeout_s=poll_s)
+        if runner is not None:
+            return True, runner_id
+        if remaining <= 0:
+            return False, runner_id
+        # Keep the poll cadence even when a registry returns early.
+        await asyncio.sleep(max(0.0, poll_s - (time.monotonic() - started)))
+        try:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            current = conv.runner_id if conv is not None else None
+        except Exception:  # noqa: BLE001 - keep waiting on the launched runner
+            if not lookup_failed:
+                _logger.warning(
+                    "Could not read the bound runner during managed launch",
+                    exc_info=True,
+                    extra={"session_id": session_id},
+                )
+                lookup_failed = True
+            continue
+        if (
+            current is None
+            or current == runner_id
+            or is_move_claim(current)
+            or not current.startswith("runner_token_")
+        ):
+            continue
+        _logger.info(
+            "Session %s rebound from runner %s to %s during managed launch; "
+            "waiting for the new runner",
+            session_id,
+            runner_id,
+            current,
+            extra={"session_id": session_id},
+        )
+        runner_id = current
+        deadline = time.monotonic() + timeout_s
+
+
 async def _wait_for_managed_runner_tunnel(
     session_id: str,
     runner_id: str,
@@ -7311,9 +7387,16 @@ async def _wait_for_managed_runner_tunnel(
     tracker: ManagedLaunchTracker,
     *,
     settle_failure: bool = True,
+    conversation_store: ConversationStore | None = None,
 ) -> bool:
     """
     Wait for a launched managed runner to connect, failing the launch on timeout.
+
+    A slow first runner can miss the host-bound connect grace, after which a
+    message path launches a replacement and rebinds the session to it. With
+    *conversation_store*, the wait follows that rebinding: it waits for the
+    runner the session is currently bound to, giving each replacement a full
+    connect window, instead of failing the launch on the superseded runner.
 
     :param session_id: Session/conversation identifier.
     :param runner_id: Runner id returned by the host launch frame.
@@ -7321,15 +7404,20 @@ async def _wait_for_managed_runner_tunnel(
     :param tracker: Managed launch tracker to settle on failure.
     :param settle_failure: Publish and settle a timeout immediately. Callers
         with rollback work can defer settlement until cleanup finishes.
+    :param conversation_store: Store to read the session's current runner
+        from; ``None`` waits only for *runner_id*.
     :returns: ``True`` when the runner connected; ``False`` on timeout.
     """
     from omnigent.server.routes import sessions as _facade
 
-    runner = await tunnel_registry.wait_for_runner(
+    connected, runner_id = await _wait_for_session_bound_runner(
+        session_id,
         runner_id,
+        tunnel_registry,
+        conversation_store,
         timeout_s=_facade._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
     )
-    if runner is not None:
+    if connected:
         return True
     _logger.error(
         "Managed runner connection timed out",
