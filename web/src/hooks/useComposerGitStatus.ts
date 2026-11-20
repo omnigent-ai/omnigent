@@ -89,7 +89,7 @@ function githubStateOf(
   return github.isLoading ? "loading" : "unknown";
 }
 
-function linkedPullRequests(
+export function linkedPullRequests(
   info: PullRequestInfo | undefined,
   stored: StoredPullRequests | undefined,
 ): PullRequestAssociation[] {
