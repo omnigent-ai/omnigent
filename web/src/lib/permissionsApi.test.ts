@@ -13,8 +13,11 @@ import * as identity from "./identity";
 import {
   LEGACY_AUTOMATION_RECREATE_REASON,
   LEGACY_AUTOMATION_SHARE_REASON,
+  LEVEL_EDIT,
   LEVEL_OWNER,
+  LEVEL_READ,
   automationShareDisabledReason,
+  canBrowseWorkspaceFiles,
   canShareAutomation,
   derivePermissionLevel,
   grantPermission,
@@ -709,5 +712,30 @@ describe("authenticatedFetch integration", () => {
     expect(spy).toHaveBeenCalledTimes(3);
 
     spy.mockRestore();
+  });
+});
+
+describe("canBrowseWorkspaceFiles", () => {
+  const session = (permissionLevel: number | null, shareWorkspaceFiles?: boolean) => ({
+    permissionLevel,
+    shareWorkspaceFiles,
+  });
+
+  it("lets editors read the workspace's files, with or without sharing", () => {
+    expect(canBrowseWorkspaceFiles(session(LEVEL_EDIT, false))).toBe(true);
+    expect(canBrowseWorkspaceFiles(session(LEVEL_OWNER))).toBe(true);
+  });
+
+  it("lets a viewer read them only when the owner shared files", () => {
+    expect(canBrowseWorkspaceFiles(session(LEVEL_READ, true))).toBe(true);
+    expect(canBrowseWorkspaceFiles(session(LEVEL_READ, false))).toBe(false);
+    expect(canBrowseWorkspaceFiles(session(LEVEL_READ))).toBe(false);
+  });
+
+  it("reads nothing until the session is known, then follows its level", () => {
+    expect(canBrowseWorkspaceFiles(null)).toBe(false);
+    expect(canBrowseWorkspaceFiles(undefined)).toBe(false);
+    // A loaded session without a level has permissions off, as in single-user mode.
+    expect(canBrowseWorkspaceFiles(session(null, false))).toBe(true);
   });
 });

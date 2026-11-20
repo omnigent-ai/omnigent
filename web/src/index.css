@@ -2198,6 +2198,19 @@ body {
   }
 }
 
+/* A resuming sandbox breathes: its halo swells and fades once every two seconds. */
+@keyframes sandbox-resume-breathe {
+  0% {
+    transform: scale(1);
+    opacity: 0.7;
+  }
+  70%,
+  100% {
+    transform: scale(2.4);
+    opacity: 0;
+  }
+}
+
 .file-tree-row-enter,
 .file-tree-row-exit {
   overflow: hidden;
