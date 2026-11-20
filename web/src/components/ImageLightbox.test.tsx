@@ -7,9 +7,10 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-const { authenticatedFetch, isAndroidShell, toastError } = vi.hoisted(() => ({
+const { authenticatedFetch, isAndroidShell, isIOSShell, toastError } = vi.hoisted(() => ({
   authenticatedFetch: vi.fn(),
   isAndroidShell: vi.fn(() => false),
+  isIOSShell: vi.fn(() => false),
   toastError: vi.fn(),
 }));
 
@@ -19,7 +20,7 @@ vi.mock("@/lib/host", () => ({
   isDatabricksWorkspace: () => false,
 }));
 vi.mock("@/lib/nativeBridge", () => ({
-  isIOSShell: () => false,
+  isIOSShell: () => isIOSShell(),
   isAndroidShell: () => isAndroidShell(),
 }));
 vi.mock("@/lib/identity", () => ({
@@ -209,7 +210,24 @@ describe("downloading from the lightbox", () => {
     vi.unstubAllGlobals();
     authenticatedFetch.mockReset();
     isAndroidShell.mockReset().mockReturnValue(false);
+    isIOSShell.mockReset().mockReturnValue(false);
     toastError.mockReset();
+  });
+
+  it("offers no download in the iOS shell, whose web view can't save one", () => {
+    isIOSShell.mockReturnValue(true);
+    render(
+      <ImageLightboxProvider>
+        <ZoomableImage src="blob:shown-image" alt="diagram" downloadName="shot.png" />
+      </ImageLightboxProvider>,
+    );
+    expect(screen.queryByRole("button", { name: /Download/ })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: /^Zoom image/ }));
+
+    expect(
+      within(screen.getByRole("dialog")).queryByRole("button", { name: /Download/ }),
+    ).toBeNull();
   });
 
   it("saves the bytes the preview already shows under the image's file name", () => {
