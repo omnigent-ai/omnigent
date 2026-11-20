@@ -979,6 +979,26 @@ def has_pending(conversation_id: str) -> bool:
         return any(not entry.interrupted for entry in _pending.get(conversation_id, {}).values())
 
 
+def has_recent_web_prompt(conversation_id: str) -> bool:
+    """
+    Report whether a web prompt recorded within :data:`_TTL_S` is still in flight.
+
+    The native request-phase policy hook (``routes_hooks``) skips its gate on this.
+    Entries kept past the TTL for a long turn don't count, so a held message cannot
+    exempt an unrelated prompt typed in the TUI.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :returns: ``True`` iff a non-interrupted entry younger than :data:`_TTL_S` exists.
+    """
+    with _lock:
+        now = _now()
+        _evict_stale_locked(conversation_id, now)
+        return any(
+            not entry.interrupted and now - entry.created_at <= _TTL_S
+            for entry in _pending.get(conversation_id, {}).values()
+        )
+
+
 def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
     """
     Return un-consumed messages for one session, for snapshot replay.
@@ -992,9 +1012,7 @@ def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
     Returns deep copies of the stored content so a caller mutating the
     replayed entry cannot poison the index. Entries the person cancelled by
     interrupting (see :func:`mark_interrupted`) are left out, so a reload does
-    not redraw a bubble the web client already cleared. The native request-phase
-    policy hook (``routes_hooks``) also reads this as "a web prompt is in
-    flight", so a cancelled entry does not exempt a later prompt from its gate.
+    not redraw a bubble the web client already cleared.
 
     :param conversation_id: Conversation/session id to query, e.g.
         ``"conv_abc123"``.

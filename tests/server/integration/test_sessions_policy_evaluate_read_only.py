@@ -433,21 +433,25 @@ async def test_request_phase_skips_gate_when_web_prompt_pending(
     assert gate_ran["called"] is False, "dedup must skip the gate when a web prompt is pending"
 
 
-async def test_request_phase_gate_runs_when_the_only_queued_web_prompt_was_interrupted(
+@pytest.mark.parametrize("queued_prompt", ["interrupted", "held_past_ttl_mid_turn"])
+async def test_request_phase_gate_runs_when_the_only_queued_web_prompt_is_not_in_flight(
     auth_client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
     db_uri: str,
+    queued_prompt: str,
 ) -> None:
     """
-    A cancelled web prompt does not exempt a later prompt from the request-phase gate.
+    A cancelled or long-held web prompt does not exempt a later prompt from the gate.
 
     The dedup reads a queued entry as "a web prompt is in flight". After the
     person pressed Stop that entry is a cancelled message, so a prompt typed
     directly in the TUI afterwards, which has no other request-phase gate, must
     still be evaluated. If the interrupted entry counted, the ASK policy below
-    would be skipped and the prompt let through.
+    would be skipped and the prompt let through. An entry kept past the TTL for
+    a late mirror during a long turn must not exempt that prompt either.
     """
     from omnigent.runtime import pending_inputs
+    from omnigent.server.routes import sessions as sessions_module
 
     held: dict[str, Any] = {}
 
@@ -476,8 +480,15 @@ async def test_request_phase_gate_runs_when_the_only_queued_web_prompt_was_inter
     agent = await create_test_agent(auth_client, user=OWNER)
     session_id = await _create_session_as(auth_client, OWNER, agent["id"])
 
-    cancelled = pending_inputs.record(session_id, [{"type": "input_text", "text": "delete prod"}])
-    pending_inputs.mark_interrupted(session_id, [cancelled])
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock["t"])
+    queued = pending_inputs.record(session_id, [{"type": "input_text", "text": "delete prod"}])
+    if queued_prompt == "interrupted":
+        pending_inputs.mark_interrupted(session_id, [queued])
+    else:
+        sessions_module._session_status_cache[session_id] = "running"
+        clock["t"] += pending_inputs._TTL_S + 1.0
+        assert pending_inputs.pending_ids(session_id) == [queued]
     try:
         resp = await auth_client.post(
             f"/v1/sessions/{session_id}/policies/evaluate",
@@ -485,6 +496,7 @@ async def test_request_phase_gate_runs_when_the_only_queued_web_prompt_was_inter
             headers={"X-Forwarded-Email": OWNER},
         )
     finally:
+        sessions_module._session_status_cache.pop(session_id, None)
         pending_inputs.reset_for_tests()
 
     assert resp.status_code == 200, resp.text

@@ -527,6 +527,7 @@ def test_mid_turn_session_keeps_a_stale_entry_for_its_late_mirror(
     clock["t"] += pending_inputs._TTL_S + 0.1
     assert pending_inputs.pending_ids("conv_a") == [held, newer]
     assert pending_inputs.pending_ids("conv_b") == []
+    assert not pending_inputs.has_recent_web_prompt("conv_a")
 
     match = pending_inputs.resolve_matching_text("conv_a", "held steer")
     assert match.matched is not None
