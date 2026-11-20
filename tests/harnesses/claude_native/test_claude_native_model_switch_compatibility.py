@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -92,6 +94,71 @@ def test_legacy_bridge_metadata_needs_no_reregistration(
     assert result.picker_value == composer.model == composer.saved_default == target
     assert [command for command in composer.submitted if command] == [f"/model {target}"]
     assert composer.status_queries == 0
+
+
+def test_legacy_model_switch_keeps_composer_height_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    composer = _SessionModelComposer()
+    composer.version = "2.1.322"
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    composer.install(monkeypatch)
+    original_clear = bridge._clear_composer
+    clear_attempts = 0
+    recoveries = 0
+
+    def clear(*args: object, **kwargs: object) -> None:
+        nonlocal clear_attempts
+        clear_attempts += 1
+        if clear_attempts == 1:
+            raise bridge.ClaudeComposerNotCleared("The composer is clipped")
+        original_clear(*args, **kwargs)
+
+    @contextmanager
+    def recover(*_args: object) -> Iterator[bool]:
+        nonlocal recoveries
+        recoveries += 1
+        assert composer.sends == []
+        yield True
+
+    monkeypatch.setattr(bridge, "_clear_composer", clear)
+    monkeypatch.setattr(bridge, "_usable_composer_height", recover)
+
+    result = bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
+
+    assert type(result).__name__ == "ClaudeLegacyModelSwitchResult"
+    assert recoveries == 1 and clear_attempts == 2
+    assert composer.model == composer.saved_default == "private-glm[1m]"
+    assert [command for command in composer.submitted if command] == ["/model private-glm[1m]"]
+
+
+def test_legacy_model_switch_rechecks_the_version_after_lock_wait(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    composer = _SessionModelComposer()
+    composer.version = "2.1.322"
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    composer.install(monkeypatch)
+    original_read = bridge._read_json_file
+    reads = 0
+
+    def read(path: Path) -> dict[str, object] | None:
+        nonlocal reads
+        result = original_read(path)
+        if path.name == bridge.CONTEXT_RAW_FILE:
+            reads += 1
+            if reads > 1:
+                assert result is not None
+                return {**result, "version": "2.1.323"}
+        return result
+
+    monkeypatch.setattr(bridge, "_read_json_file", read)
+
+    with pytest.raises(bridge.ClaudeModelSwitchRefused, match="version changed"):
+        bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
+
+    assert composer.sends == []
+    assert composer.saved_default == composer.options[0]
 
 
 @pytest.mark.parametrize("version", ["2.1.322", "2.1.323"])

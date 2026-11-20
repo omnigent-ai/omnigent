@@ -5704,6 +5704,9 @@ def inject_model_command(
     )
     try:
         with cancellable_injection(deadline):
+            raw = _read_json_file(bridge_dir / CONTEXT_RAW_FILE) or {}
+            if not supports_session_only_model_switch(raw.get("version")):
+                return _inject_legacy_model_command_locked(bridge_dir, transaction)
             return _inject_model_command_locked(bridge_dir, transaction)
     except ClaudeInjectionCancelled as exc:
         raise transaction.refuse(
@@ -5714,52 +5717,62 @@ def inject_model_command(
 @_serialize_model_injection
 def _inject_model_command_locked(
     bridge_dir: Path, transaction: SessionOnlyModelSwitch
-) -> ClaudeModelSwitchResult | ClaudeLegacyModelSwitchResult:
+) -> ClaudeModelSwitchResult:
+    del bridge_dir
+    return transaction.run()
+
+
+@_serialize_bridge_injection
+def _inject_legacy_model_command_locked(
+    bridge_dir: Path, transaction: SessionOnlyModelSwitch
+) -> ClaudeLegacyModelSwitchResult:
+    from omnigent.models.claude_model_vocabulary import claude_model_command_arg
+
     raw = _read_json_file(bridge_dir / CONTEXT_RAW_FILE) or {}
     version = raw.get("version")
-    if not supports_session_only_model_switch(version):
-        from omnigent.models.claude_model_vocabulary import claude_model_command_arg
-
-        model_arg = claude_model_command_arg(
-            transaction.model,
-            read_model_env(bridge_dir),
-            picker_values=read_model_picker_values(bridge_dir),
+    if supports_session_only_model_switch(version):
+        raise transaction.refuse(
+            "Claude Code's version changed while waiting for model selection. Retry explicitly."
         )
-        if model_arg is None:
+    model_arg = claude_model_command_arg(
+        transaction.model,
+        read_model_env(bridge_dir),
+        picker_values=read_model_picker_values(bridge_dir),
+    )
+    if model_arg is None:
+        raise transaction.refuse(
+            f"This Claude terminal has no /model spelling for {transaction.model}.",
+            unsupported=True,
+        )
+    _logger.warning(
+        "Claude Code version %r uses legacy /model submission; "
+        "the command may also change the saved default",
+        version,
+    )
+    transaction.phase = "legacy"
+
+    def submitting() -> None:
+        transaction.submitted = True
+        transaction.commit_attempted = True
+
+    try:
+        _inject_slash_command_locked(
+            bridge_dir,
+            command=f"/model {model_arg}",
+            timeout_s=transaction.deadline.remaining_s(),
+            ready_timeout_s=transaction.ready_timeout_s,
+            auto_confirm=True,
+            confirm_hint=SWITCH_MODEL_DIALOG_HINT,
+            before_submit=submitting,
+        )
+    except (RuntimeError, ValueError, OSError) as exc:
+        if transaction.submitted:
             raise transaction.refuse(
-                f"This Claude terminal has no /model spelling for {transaction.model}.",
-                unsupported=True,
-            )
-        _logger.warning(
-            "Claude Code version %r uses legacy /model submission; "
-            "the command may also change the saved default",
-            version,
-        )
-        transaction.phase = "legacy"
-
-        def submitting() -> None:
-            transaction.submitted = True
-            transaction.commit_attempted = True
-
-        try:
-            _inject_slash_command_locked(
-                bridge_dir,
-                command=f"/model {model_arg}",
-                timeout_s=transaction.deadline.remaining_s(),
-                ready_timeout_s=transaction.ready_timeout_s,
-                auto_confirm=True,
-                confirm_hint=SWITCH_MODEL_DIALOG_HINT,
-                before_submit=submitting,
-            )
-        except (RuntimeError, ValueError, OSError) as exc:
-            if transaction.submitted:
-                raise transaction.refuse(
-                    "Claude's legacy model command may have changed the model and saved default. "
-                    "Check the terminal before retrying; the dependent prompt was not sent."
-                ) from exc
-            raise
-        return ClaudeLegacyModelSwitchResult(transaction.model, model_arg)
-    return transaction.run()
+                "Claude's legacy model command may have changed the model and saved default. "
+                "Check the terminal before retrying; the dependent prompt was not sent."
+            ) from exc
+        raise
+    return ClaudeLegacyModelSwitchResult(transaction.model, model_arg)
 
 
 @_serialize_bridge_injection
