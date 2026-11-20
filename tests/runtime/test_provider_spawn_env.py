@@ -34,7 +34,7 @@ from unittest.mock import patch
 import pytest
 import yaml as _yaml
 
-from omnigent.errors import OmnigentError
+from omnigent.errors import CodexSignerConfigurationError, ErrorCode, OmnigentError
 from omnigent.inner.codex_worker import BROKERED_CODEX_AUTH_COMMAND
 from omnigent.inner.datamodel import (
     CredentialProxyEntry,
@@ -1820,8 +1820,47 @@ def test_codex_legacy_databricks_profile_fails_without_broker_policy(
     _write_config(config_home, {})
     spec = _make_spec(harness="codex", model="some-model", profile="legacy-profile")
 
-    with pytest.raises(OmnigentError, match="ucode Codex state"):
+    with pytest.raises(OmnigentError, match="configured provider state"):
         _build_codex_spawn_env(spec, workdir=None)
+
+
+@pytest.mark.parametrize(
+    "failure_kind,repair",
+    [
+        ("auth_command", "remove that environment override"),
+        ("worker_egress", "use model_egress"),
+        ("profile", "Set the Databricks provider's 'profile'"),
+        ("state", "Codex setup"),
+    ],
+)
+def test_codex_signer_configuration_failures_keep_fixed_repair_guidance(
+    monkeypatch: pytest.MonkeyPatch, failure_kind: str, repair: str
+) -> None:
+    from omnigent.onboarding.provider_config import ProviderEntry
+    from omnigent.runtime import workflow
+
+    monkeypatch.delenv("HARNESS_CODEX_GATEWAY_AUTH_COMMAND", raising=False)
+    monkeypatch.setattr(workflow, "get_workspace_url_for_profile", lambda profile: None)
+    policy = OSEnvSandboxSpec(type="linux_bwrap")
+    spec = _make_spec(harness="codex", os_env=OSEnvSpec(sandbox=policy))
+    provider = ProviderEntry(
+        name="test-provider",
+        kind="databricks",
+        profile=None if failure_kind == "profile" else "test-profile",
+    )
+    if failure_kind == "auth_command":
+        monkeypatch.setenv("HARNESS_CODEX_GATEWAY_AUTH_COMMAND", "private-command")
+    elif failure_kind == "worker_egress":
+        policy.egress_rules = ["POST provider.example.test/**"]
+
+    with pytest.raises(CodexSignerConfigurationError) as raised:
+        _apply_codex_provider_env({}, spec, provider)
+    assert raised.value.code == ErrorCode.INVALID_INPUT
+    assert raised.value.http_status == 400
+    assert str(raised.value) == raised.value.client_message
+    assert repair in raised.value.client_message
+    assert "provider.example.test" not in raised.value.client_message
+    assert "private-command" not in raised.value.client_message
 
 
 def test_legacy_profile_still_suppresses_global_default_provider(config_home: Path) -> None:
@@ -1836,7 +1875,7 @@ def test_legacy_profile_still_suppresses_global_default_provider(config_home: Pa
     _write_config(config_home, _openai_default_config())  # global default exists
     spec = _make_spec(harness="codex", model="some-model", profile="legacy-profile")
 
-    with pytest.raises(OmnigentError, match="ucode Codex state"):
+    with pytest.raises(OmnigentError, match="configured provider state"):
         _build_codex_spawn_env(spec, workdir=None)
 
 
@@ -1885,9 +1924,23 @@ def test_codex_spec_databricks_auth_routes_via_synthesized_provider(
                     )
                 },
             ),
-        ),
+        ) as read_provider_state,
     ):
         env = _build_codex_spawn_env(spec, workdir=None)
+        read_provider_state.return_value = SimpleNamespace(
+            workspace_host="https://provider.example.test",
+            agent=lambda name: SimpleNamespace(
+                base_url="https://provider.example.test/private-route"
+            ),
+        )
+        with pytest.raises(
+            CodexSignerConfigurationError, match="supported trusted model endpoint"
+        ) as raised:
+            _build_codex_spawn_env(spec, workdir=None)
+        assert isinstance(raised.value.__cause__, ValueError)
+        assert "Codex setup" in raised.value.client_message
+        assert "provider.example.test" not in raised.value.client_message
+        assert "private-route" not in raised.value.client_message
 
     assert env["HARNESS_CODEX_DATABRICKS_PROFILE"] == "test-dbx-ws"
     assert env["HARNESS_CODEX_SIGNER_PROVIDER"] == "databricks-ucode-v1"

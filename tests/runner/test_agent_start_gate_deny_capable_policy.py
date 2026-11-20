@@ -216,27 +216,12 @@ def test_compatible_stream_spawn_env_rejects_invalid_environment(spawn_env: obje
         runner_app_module._compatible_stream_spawn_env("pi", spawn_env)
 
 
-async def test_direct_stream_rejects_invalid_compatible_environment() -> None:
-    manager = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(process_manager=manager, server_client=NullServerClient())
-    async with _runner_client(app) as client:
-        response = await client.post(
-            f"/v1/sessions/{_SESSION_ID}/events?stream=true",
-            json={
-                "type": "message",
-                "role": "user",
-                "content": [],
-                "harness": "pi",
-                "spawn_env": {"HARNESS_PI_MODEL": "bad\u0000model"},
-            },
-        )
-    assert response.status_code == 400, response.text
-    assert not manager.get_client_calls
-    assert "bad" not in response.text
-
-
-@pytest.mark.parametrize("harness", ["pi", "runner-test-default"])
-async def test_direct_stream_ignores_environment_without_selected_model(harness: str) -> None:
+@pytest.mark.parametrize(
+    "harness,invalid_model",
+    [("pi", True), ("pi", False), ("runner-test-default", False)],
+    ids=["invalid-model", "pi-no-model", "default-no-model"],
+)
+async def test_direct_stream_limits_caller_environment(harness: str, invalid_model: bool) -> None:
     manager = _FakeProcessManager(_ScriptedHarnessClient([]))
     app = create_runner_app(process_manager=manager, server_client=NullServerClient())
     async with _runner_client(app) as client:
@@ -247,14 +232,22 @@ async def test_direct_stream_ignores_environment_without_selected_model(harness:
                 "role": "user",
                 "content": [],
                 "harness": harness,
-                "spawn_env": {
-                    "HARNESS_CODEX_MODEL": None,
-                    "HARNESS_PI_OS_ENV": {"sandbox": {"type": "none"}},
-                },
+                "spawn_env": (
+                    {"HARNESS_PI_MODEL": "bad\u0000model"}
+                    if invalid_model
+                    else {
+                        "HARNESS_CODEX_MODEL": None,
+                        "HARNESS_PI_OS_ENV": {"sandbox": {"type": "none"}},
+                    }
+                ),
             },
         )
-    assert response.status_code == 200, response.text
-    assert manager.get_client_calls == [(_SESSION_ID, harness, None)]
+    assert response.status_code == (400 if invalid_model else 200), response.text
+    if invalid_model:
+        assert not manager.get_client_calls
+        assert "bad" not in response.text
+    else:
+        assert manager.get_client_calls == [(_SESSION_ID, harness, None)]
 
 
 async def test_direct_stream_legacy_model_switch_reaches_reused_worker() -> None:

@@ -2673,7 +2673,15 @@ async def test_background_setup_failure_preserves_replacement_turn(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "failure_kind", ["model-discovery", "other-setup", "public-config", "wrapped-public-config"]
+    "failure_kind",
+    [
+        "model-discovery",
+        "other-setup",
+        "public-config",
+        "wrapped-public-config",
+        "signer-profile",
+        "signer-state",
+    ],
 )
 async def test_runner_failed_status_carries_setup_error_message(
     monkeypatch: pytest.MonkeyPatch,
@@ -2699,6 +2707,7 @@ async def test_runner_failed_status_carries_setup_error_message(
 
     from omnigent.errors import ErrorCode, KimiAuthConfigurationError, OmnigentError
     from omnigent.models.model_resolver import ModelResolutionError
+    from omnigent.onboarding.provider_config import ProviderEntry
     from omnigent.runtime import workflow
 
     conv = "conv_failed_status_carries_error"
@@ -2707,6 +2716,7 @@ async def test_runner_failed_status_carries_setup_error_message(
     setup_valid = False
     catalog = Mock(side_effect=ModelResolutionError(raised_message))
     monkeypatch.setattr(workflow, "resolve_catalog_model", catalog)
+    monkeypatch.setattr(workflow, "get_workspace_url_for_profile", lambda profile: None)
 
     async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         """
@@ -2724,7 +2734,7 @@ async def test_runner_failed_status_carries_setup_error_message(
         )
 
     def _raising_build(
-        spec: object, *, cwd: object = None, workdir: object = None
+        spec: AgentSpec, *, cwd: object = None, workdir: object = None
     ) -> dict[str, str]:
         """
         Script a setup failure until the configuration is corrected.
@@ -2734,7 +2744,7 @@ async def test_runner_failed_status_carries_setup_error_message(
         :returns: Empty spawn environment after correction.
         :raises OmnigentError: While setup is invalid.
         """
-        del spec, workdir
+        del workdir
         if not setup_valid:
             if failure_kind == "model-discovery":
                 workflow._resolve_catalog_default_model(
@@ -2747,6 +2757,16 @@ async def test_runner_failed_status_carries_setup_error_message(
                     if failure_kind == "wrapped-public-config":
                         raise OmnigentError(raised_message, code=ErrorCode.INVALID_INPUT) from exc
                     raise
+            if failure_kind in ("signer-profile", "signer-state"):
+                provider = ProviderEntry(
+                    name="test-provider",
+                    kind="databricks",
+                    profile="test-profile" if failure_kind == "signer-state" else None,
+                )
+                try:
+                    workflow._apply_codex_provider_env({}, spec, provider)
+                except OmnigentError as exc:
+                    raise exc from ValueError(raised_message)
             raise OmnigentError(raised_message, code=ErrorCode.INVALID_INPUT)
         return {}
 
@@ -2847,6 +2867,16 @@ async def test_runner_failed_status_carries_setup_error_message(
         public_guidance = f"{KimiAuthConfigurationError.client_message} "
         assert "Remove ``executor.auth``" in error["message"]
         assert "~/.kimi-code/config.toml" in error["message"]
+    if failure_kind == "signer-profile":
+        public_guidance = (
+            "signer-backed Codex requires an explicit Databricks profile. "
+            "Set the Databricks provider's 'profile' and retry. "
+        )
+    elif failure_kind == "signer-state":
+        public_guidance = (
+            "signer-backed Codex requires configured provider state. "
+            "Run the provider's Codex setup and retry. "
+        )
     assert error["message"] == (
         f"turn setup failed: {public_guidance}Request failed on the runner; "
         f"see the runner log for details: {pinned_runner_log}"

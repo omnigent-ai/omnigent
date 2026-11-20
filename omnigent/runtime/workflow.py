@@ -37,6 +37,7 @@ from omnigent.entities import (
     NewConversationItem,
 )
 from omnigent.errors import (
+    CodexSignerConfigurationError,
     ErrorCode,
     KimiAuthConfigurationError,
     OmnigentError,
@@ -379,10 +380,7 @@ def _configure_brokered_codex_with_ucode(
 
     profile = provider.profile
     if os.environ.get("HARNESS_CODEX_GATEWAY_AUTH_COMMAND"):
-        raise OmnigentError(
-            "signer-backed Codex conflicts with HARNESS_CODEX_GATEWAY_AUTH_COMMAND",
-            code=ErrorCode.INVALID_INPUT,
-        )
+        raise CodexSignerConfigurationError("auth_command")
     sandbox = spec.os_env.sandbox if spec.os_env is not None else None
     if sandbox is None or sandbox.type == "none":
         platform_sandbox = _default_sandbox_for_platform()
@@ -400,25 +398,15 @@ def _configure_brokered_codex_with_ucode(
             # In place, so the session's OS tools share the worker's sandbox.
             spec.os_env.sandbox = sandbox
     if sandbox.egress_rules or sandbox.tcp_egress:
-        raise OmnigentError(
-            "signer-backed Codex does not support os_env.sandbox.egress_rules or tcp_egress; "
-            "brokered sessions are model-only",
-            code=ErrorCode.INVALID_INPUT,
-        )
+        raise CodexSignerConfigurationError("worker_egress")
     if not profile:
-        raise OmnigentError(
-            "signer-backed Codex requires an explicit Databricks profile",
-            code=ErrorCode.INVALID_INPUT,
-        )
+        raise CodexSignerConfigurationError("profile")
     workspace_url = get_workspace_url_for_profile(profile)
     state = read_ucode_state(workspace_url) if workspace_url is not None else None
     agent_state = state.agent("codex") if state is not None else None
     endpoint = agent_state.base_url if agent_state is not None else None
     if state is None or endpoint is None:
-        raise OmnigentError(
-            "signer-backed Codex requires configured ucode Codex state; run `ucode configure`",
-            code=ErrorCode.INVALID_INPUT,
-        )
+        raise CodexSignerConfigurationError("state")
     assert agent_state is not None
     try:
         binding = registered_model_provider_binding(
@@ -427,7 +415,7 @@ def _configure_brokered_codex_with_ucode(
             trusted_host=state.workspace_host,
         )
     except ValueError as exc:
-        raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+        raise CodexSignerConfigurationError("binding") from exc
     # No grant means the provider's own route, the most the signer ever signs.
     model_egress = spec.model_egress or [
         f"{route.method} {route.host}{route.path}" for route in binding.maximum_routes

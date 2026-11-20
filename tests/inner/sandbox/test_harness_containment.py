@@ -18,6 +18,7 @@ import psutil
 import pytest
 
 from omnigent.inner import claude_sdk_executor, codex_worker, sandbox
+from omnigent.inner._proc import run_isolated
 from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
 from omnigent.inner.codex_executor import CodexExecutor
 from omnigent.inner.codex_worker import prepare_codex_worker
@@ -520,7 +521,7 @@ print(json.dumps({{'contained': True}}))
         launch_env["OMNIGENT_LAUNCHER_SPAWN_PRIVATE_TMPDIR"] = str(outside)
     try:
         with _prepared_launch(harness, executable, workspace, spec) as path:
-            completed = subprocess.run(
+            completed = run_isolated(
                 [path],
                 cwd=outside if launch_state == "different_cwd" else workspace,
                 env=launch_env,
