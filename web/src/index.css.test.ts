@@ -695,6 +695,7 @@ describe("index.css native safe-area layout on the rendered WorkspacePanel", () 
           openTerminals: [],
           selectedTerminalKey: null,
           onCloseTerminal: () => {},
+          onCloseTerminals: () => {},
           maximized: false,
           onToggleMaximized: () => {},
           permissionLevel: null,
