@@ -18,6 +18,7 @@ import {
   sessionMentionToken,
   type TaggedMentions,
 } from "@/lib/composerMentions";
+import { insertComposerText } from "@/lib/composerText";
 import { composerAttachmentKey } from "@/store/chatStore";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 
@@ -230,6 +231,17 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [segmentsKey, mentionedItems, mentionedSessions]);
 
+  // Edit the input as typed text so Undo can restore what was replaced; a new value set
+  // through state would clear the undo history.
+  const replaceText = (start: number, end: number, replacement: string) => {
+    const target = textareaRef.current;
+    if (target) {
+      target.focus();
+      if (insertComposerText(target, replacement, start, end)) return;
+    }
+    setText(text.slice(0, start) + replacement + text.slice(end));
+  };
+
   const placeCaret = (caret: number) =>
     queueMicrotask(() => {
       const ta = textareaRef.current;
@@ -241,7 +253,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
   const insertToken = (active: MentionState, token: string) => {
     const after = text.slice(active.end);
     const gap = /^\s/.test(after) ? "" : " ";
-    setText(text.slice(0, active.start) + token + gap + after);
+    replaceText(active.start, active.end, token + gap);
     setMention(null);
     setMentionIndex(-1);
     placeCaret(active.start + token.length + 1);
@@ -263,7 +275,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     if (!range) return false;
     e.preventDefault();
     const next = text.slice(0, range.start) + text.slice(range.end);
-    setText(next);
+    replaceText(range.start, range.end, "");
     // The deleted token may have been the active "@" query; recompute it so a
     // following Enter can't complete a mention that no longer exists.
     setMention(detectMentionAt(next, range.start));
@@ -291,8 +303,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
   const openMentionDir = (path: string) => {
     if (!mention) return;
     const inserted = `@${path}/`;
-    const next = text.slice(0, mention.start) + inserted + text.slice(mention.end);
-    setText(next);
+    replaceText(mention.start, mention.end, inserted);
     const caret = mention.start + inserted.length;
     setMention({ query: `${path}/`, start: mention.start, end: caret });
     setMentionIndex(0);

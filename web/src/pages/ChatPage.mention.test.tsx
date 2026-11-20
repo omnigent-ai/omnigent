@@ -169,6 +169,8 @@ import * as CodeMirrorModule from "@/components/composer/engine/CodeMirrorCompos
 import { resetCodeMirrorComposerLoadForTests } from "@/components/composer/engine/codeMirrorComposerLoader";
 import { composerTargetOf } from "@/components/composer/engine/composerInput";
 import { insertComposerText } from "@/lib/composerText";
+import { undo } from "@codemirror/commands";
+import { EditorView } from "@codemirror/view";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 
@@ -1074,5 +1076,26 @@ describe("Composer @-file mentions with the CodeMirror composer", () => {
         (token) => token.textContent,
       ),
     ).toEqual(["@readme.md"]);
+  });
+
+  it("undoes a file pick back to the typed query", async () => {
+    useChatStore.setState({ conversationId: "conv_codemirror_mention_undo" });
+    renderWithTooltips(
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <Composer {...composerProps()} />
+      </CapabilitiesProvider>,
+    );
+    await waitFor(() =>
+      expect(screen.getByLabelText("Message the agent")).toHaveClass("cm-content"),
+    );
+    const editor = screen.getByLabelText("Message the agent");
+    const target = composerTargetOf(editor)!;
+
+    act(() => insertComposerText(target, "@"));
+    fireEvent.click(screen.getByTitle("Attach readme.md"));
+    expect(target.value).toBe("@readme.md ");
+
+    act(() => void undo(EditorView.findFromDOM(editor)!));
+    expect(target.value).toBe("@");
   });
 });

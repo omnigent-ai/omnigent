@@ -280,7 +280,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   the files and, after a short pause, searches session titles and the
   workspace. Picking a row puts a
   pill-styled `@name` token in the sentence; Backspace deletes a token whole, and
-  deleting it untags the item. On send each token becomes a marker in place
+  deleting it untags the item. ⌘/Ctrl+Z undoes a pick, a folder drill-down or a
+  token Backspace like typing; a token restored by undo or redo is plain text,
+  not a tag. On send each token becomes a marker in place
   (`[Attached: path]` or `[Session: "title" id=… subagent=yes|no]`), and a
   tagged session adds one tool hint at the end, so native terminals show the
   markers as typed text. The sent message shows the tokens as inline pills; a
