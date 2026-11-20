@@ -21,6 +21,7 @@ Paths given to :class:`ThingyFiles` are relative POSIX paths such as
 
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -29,6 +30,7 @@ from typing import Any
 __all__ = [
     "MAX_FILE_BYTES",
     "MAX_THINGY_NAME_CHARS",
+    "THINGY_ID_PATTERN",
     "CapacityExceeded",
     "Conflict",
     "CorruptData",
@@ -38,6 +40,7 @@ __all__ = [
     "Thingy",
     "ThingyFiles",
     "ThingyStore",
+    "is_thingy_id",
     "validate_relative_path",
 ]
 
@@ -196,6 +199,16 @@ class ThingyFiles(ABC):
         """
 
 
+# A thingy's ID is its store's: 1 to 64 lowercase letters, digits, "_" or "-", starting with a
+# letter or digit (the file store uses 32 hex digits; another store may use, say, decimal IDs).
+THINGY_ID_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+
+
+def is_thingy_id(value: object) -> bool:
+    """Whether *value* has the form of a thingy ID (any store's)."""
+    return isinstance(value, str) and THINGY_ID_PATTERN.fullmatch(value) is not None
+
+
 class ThingyStore(ABC):
     """Thingy metadata plus each thingy's and each user's :class:`ThingyFiles`.
 
@@ -212,7 +225,7 @@ class ThingyStore(ABC):
 
     @abstractmethod
     def create(self, owner_id: str, name: str) -> Thingy:
-        """Create a thingy with a new random ID, owned by *owner_id*."""
+        """Create a thingy with a new ID (see :data:`THINGY_ID_PATTERN`), owned by *owner_id*."""
 
     @abstractmethod
     def get(self, thingy_id: str) -> Thingy | None:

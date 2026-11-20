@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 import uuid
 from typing import Any
 from urllib.parse import quote
@@ -19,13 +18,13 @@ from urllib.parse import quote
 import httpx
 
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+from omnigent.stores.thingy_store import is_thingy_id
 from omnigent.tools.builtins.thingies import THINGY_RECORD_OPS, THINGY_TOOL_NAMES
 
 __all__ = ["THINGY_TOOL_NAMES", "execute_thingy_tool"]
 
 _BASE = "/v1/thingies"
 _TIMEOUT = 30.0
-_THINGY_ID = re.compile(r"[0-9a-f]{32}")
 # What a server answers for a path it has no route for: FastAPI's default body, or
 # the web UI catch-all's generic error.
 _UNROUTED_NOT_FOUND_BODIES = (
@@ -52,7 +51,7 @@ def _segment(value: Any, label: str) -> str:
 
 def _thingy_id(args: dict[str, Any]) -> str:
     value = args.get("thingy_id")
-    if not isinstance(value, str) or _THINGY_ID.fullmatch(value) is None:
+    if not isinstance(value, str) or not is_thingy_id(value):
         raise _ToolError("invalid_input: thingy_id must be a thingy's ID from sys_thingy_list")
     return value
 

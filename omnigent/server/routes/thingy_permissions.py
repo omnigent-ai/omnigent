@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import Response
@@ -37,11 +36,10 @@ from omnigent.stores.permission_store import (
     require_grantee_id_fits,
     thingy_sharing_unsupported,
 )
-from omnigent.stores.thingy_store import NotFound, Thingy, ThingyStore
+from omnigent.stores.thingy_store import NotFound, Thingy, ThingyStore, is_thingy_id
 from omnigent.thingies.access import ThingyAccess
 
 _logger = logging.getLogger(__name__)
-_THINGY_ID = re.compile(r"[0-9a-f]{32}")
 
 
 class ThingyPermissionObject(BaseModel):
@@ -162,7 +160,7 @@ def register_thingy_permissions_routes(
         :raises OmnigentError: ``FORBIDDEN`` when they can read but not manage it.
         """
         viewer = require_user(request, auth_provider) or RESERVED_USER_LOCAL
-        thingy = thingy_store.get(thingy_id) if _THINGY_ID.fullmatch(thingy_id) else None
+        thingy = thingy_store.get(thingy_id) if is_thingy_id(thingy_id) else None
         permissions = thingy_access.permissions(viewer, thingy) if thingy else None
         if thingy is None or permissions is None or not permissions.read:
             raise NotFound("Thingy not found")

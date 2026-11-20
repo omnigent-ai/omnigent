@@ -32,7 +32,13 @@ from typing import Any, cast
 
 import jsonschema
 
-from omnigent.stores.thingy_store import MAX_THINGY_NAME_CHARS, Thingy, ThingyFiles, ThingyStore
+from omnigent.stores.thingy_store import (
+    MAX_THINGY_NAME_CHARS,
+    Thingy,
+    ThingyFiles,
+    ThingyStore,
+    is_thingy_id,
+)
 from omnigent.thingies.access import NO_ACCESS, ThingyAccess, ThingyPermissions
 from omnigent.thingies.actions import (
     validate_actions,
@@ -71,7 +77,6 @@ _DATA_STORE_LIMITS = StoreLimits(
 _IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _OPERATION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _REVISION = re.compile(r"^[0-9a-f]{32}$")
-_THINGY_ID = re.compile(r"^[0-9a-f]{32}$")
 # The viewer's pins and session links, in their own files.
 SHELF_ROOT = "shelf"
 MAX_PINNED_THINGIES = 50
@@ -370,7 +375,7 @@ class ThingyService:
     # -- resolving thingies and permissions ------------------------------------
 
     def _resolve(self, app_id: Any) -> tuple[Thingy, ThingyPermissions]:
-        if not isinstance(app_id, str) or _THINGY_ID.fullmatch(app_id) is None:
+        if not is_thingy_id(app_id):
             raise NotFound("Thingy not found")
         thingy = self.store.get(app_id)
         if thingy is None:

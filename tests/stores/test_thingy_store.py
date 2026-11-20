@@ -16,6 +16,7 @@ from omnigent.stores.thingy_store import (
     CorruptData,
     InvalidInput,
     NotFound,
+    is_thingy_id,
 )
 from omnigent.stores.thingy_store.local import LocalThingyStore
 
@@ -276,3 +277,21 @@ def test_deleting_a_users_files_empties_their_scope(store: LocalThingyStore) -> 
     with pytest.raises(NotFound):
         files.list_paths("shelf")
     assert store.user_files(BOB).list_paths("shelf") == []
+
+
+@pytest.mark.parametrize(
+    ("value", "valid"),
+    [
+        ("0123456789abcdef0123456789abcdef", True),  # this store's IDs
+        ("102717306144392", True),  # another store's decimal IDs
+        ("board-1", True),
+        ("", False),
+        ("-board", False),
+        ("Board", False),
+        ("a/b", False),
+        ("a" * 65, False),
+        (123, False),
+    ],
+)
+def test_thingy_ids_follow_the_store_contract(value: object, valid: bool) -> None:
+    assert is_thingy_id(value) is valid
