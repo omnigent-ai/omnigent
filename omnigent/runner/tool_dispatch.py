@@ -7670,6 +7670,16 @@ async def _collect_global_sessions(
                 "created_by_session_id": (_string_mapping(r.get("labels")) or {}).get(
                     CREATED_BY_SESSION_LABEL_KEY
                 ),
+                # Unix seconds, as sys_session_get_info reports them, so an agent can
+                # keep only sessions active within a time window.
+                **{
+                    key: r[source]
+                    for key, source in (
+                        ("created_at", "created_at"),
+                        ("last_activity_at", "updated_at"),
+                    )
+                    if isinstance(r.get(source), (int, float))
+                },
                 # Only an archive-inclusive listing can return archived rows.
                 **({"archived": r.get("archived") is True} if include_archived else {}),
                 # Every "mine" row is the caller's; elsewhere an agent must be

@@ -36,6 +36,7 @@ vi.mock("@/lib/thingyComposerQuotes", () => ({
     queueThingyComposerQuote(sessionId, kind, text),
 }));
 vi.mock("@/lib/thingyRailTabs", () => ({
+  THINGY_FULL_SCREEN_PARAM: "thingy",
   requestThingyRailTab: (
     ...args: [string, string, { maximize?: boolean; keepSidebar?: boolean }?]
   ) => requestThingyRailTab(...args),
@@ -219,6 +220,9 @@ describe("thingy session", () => {
     const opened = parse(navigate.mock.calls[0][0]);
     expect(opened.pathname).toBe("/");
     expect(opened.searchParams.get("thingy_start")).toBe("app-1");
+    // The link itself names the thingy filling the screen, so a link with a prompt alone means
+    // the composer should show.
+    expect(opened.searchParams.get("thingy")).toBe("app-1");
     expect(opened.searchParams.get("prompt")).toContain(
       'This is my thingy session for "Team board"',
     );
@@ -318,8 +322,11 @@ describe("thingy session", () => {
     );
 
     expect(receipt).toEqual({ actionId: "act1", delivery: "starting" });
-    // New session opens again with the action, so starting it delivers the open entry.
-    const prompt = parse(navigate.mock.calls[0][0]).searchParams.get("prompt") ?? "";
+    // New session opens again with the action, so starting it delivers the open entry. The link
+    // leaves a full screen thingy docked so the composer shows.
+    const link = parse(navigate.mock.calls[0][0]);
+    expect(link.searchParams.has("thingy")).toBe(false);
+    const prompt = link.searchParams.get("prompt") ?? "";
     expect(
       prompt.endsWith(
         'Thingy action\n{"action_id":"act1","action":"run_card","params":{"cardId":"c1"}}',

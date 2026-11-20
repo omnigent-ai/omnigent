@@ -6,6 +6,8 @@
 // the router's `navigate`, which places it under the app's mount; for a new tab, rebase it first
 // (`useRebasePath`) and resolve it against `window.location.origin`.
 
+import { THINGY_FULL_SCREEN_PARAM } from "@/lib/thingyRailTabs";
+
 /**
  * The viewer's prompt followed by a note that names the thingy and points to the thingy skill,
  * so the session's `sys_thingy_*` tools reach its records.
@@ -46,10 +48,19 @@ function withQuery(path: string, params: Record<string, string | undefined>): st
 
 /**
  * New session started from the thingy, with the composer prefilled. The created session is then
- * linked to the thingy (see `useAdoptStartedThingySession`).
+ * linked to the thingy (see `useAdoptStartedThingySession`). The thingy beside it fills the screen
+ * only with `fullScreen`; a link with a prompt and without it shows the composer.
  */
-export function thingyBoardNewSessionUrl(appId: string, prompt: string): string {
-  return withQuery("/", { prompt, [THINGY_START_PARAM]: appId });
+export function thingyBoardNewSessionUrl(
+  appId: string,
+  prompt: string,
+  { fullScreen = false }: { fullScreen?: boolean } = {},
+): string {
+  return withQuery("/", {
+    prompt,
+    [THINGY_START_PARAM]: appId,
+    [THINGY_FULL_SCREEN_PARAM]: fullScreen ? appId : undefined,
+  });
 }
 
 /** New session with the composer prefilled; the viewer still chooses where it runs and starts it. */

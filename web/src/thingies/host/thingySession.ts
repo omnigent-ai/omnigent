@@ -117,6 +117,9 @@ export async function openThingyFullScreen(
     thingyBoardNewSessionUrl(
       app.id,
       app.permissions.publish ? composeThingySessionPrompt(app) : "",
+      {
+        fullScreen: true,
+      },
     ),
   );
 }
@@ -129,6 +132,7 @@ export function composeThingySessionPrompt(app: Pick<Thingy, "id" | "name">): st
   return [
     "Load the thingy skill and follow it.",
     `This is my thingy session for ${thingyPromptLabel(app)}: I'll send its actions and change requests here.`,
+    "Start with any actions already queued in its ledger.",
   ].join(" ");
 }
 
@@ -256,8 +260,7 @@ export async function openThingySession(
     }
   }
   markPending(app.id, actionId);
-  // The request waits in New session's composer, which a full screen thingy would hide.
-  exitThingyRailFullScreen(null);
+  // New session's composer holds the request; its link leaves a full screen thingy docked.
   navigate(thingyBoardNewSessionUrl(app.id, `${composeThingySessionPrompt(app)}\n\n${message}`));
   return "starting";
 }
@@ -347,7 +350,6 @@ export async function quoteInThingySession(
     .split("\n")
     .map((line) => `> ${line}`)
     .join("\n")}\n\n`;
-  exitThingyRailFullScreen(null);
   if (app.permissions.publish) {
     markPending(app.id);
     navigate(thingyBoardNewSessionUrl(app.id, `${composeThingySessionPrompt(app)}\n\n${quoted}`));

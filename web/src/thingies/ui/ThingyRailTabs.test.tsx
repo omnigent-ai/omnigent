@@ -1,5 +1,5 @@
 import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
-import { type ReactNode, useState } from "react";
+import { type ReactNode, useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -15,6 +15,7 @@ import {
   getSessionThingies,
   getThingy,
   getThingyShelf,
+  getThingyThingySession,
   linkThingyToSession,
 } from "@/thingies/api/thingyApi";
 import { openThingySession } from "@/thingies/host/thingySession";
@@ -26,6 +27,7 @@ import {
   useThingyRailTabState,
 } from "./ThingyRailTabs";
 import { renderWithThingies, thingyFixture } from "./testUtils";
+import { useNavigate } from "@/lib/routing";
 import { resetThingyDrafts } from "./thingyDrafts";
 import { resetThingyStarts } from "./useAdoptStartedThingySession";
 import type * as ThingySessionModule from "@/thingies/host/thingySession";
@@ -37,6 +39,7 @@ vi.mock("@/thingies/api/thingyApi", async (importOriginal) => ({
   linkThingyToSession: vi.fn(),
   getThingy: vi.fn(),
   getThingyShelf: vi.fn(),
+  getThingyThingySession: vi.fn(),
   createThingy: vi.fn(),
 }));
 vi.mock("@/thingies/host/thingySession", async (importOriginal) => ({
@@ -408,6 +411,45 @@ describe("the thingy beside New session", () => {
     fireEvent.click(within(panel).getByRole("button", { name: "Close Board" }));
     expect(screen.getByLabelText("location")).toHaveTextContent(/^\/$/);
     expect(screen.queryByTestId("thingy-new-session-panel")).toBeNull();
+  });
+
+  it("keeps a request that leaves full screen for New session in the URL", async () => {
+    vi.mocked(getThingy).mockResolvedValue(BOARD);
+    vi.mocked(getThingyThingySession).mockResolvedValue(null);
+    const { openThingySession: openSession } = await vi.importActual<typeof ThingySessionModule>(
+      "@/thingies/host/thingySession",
+    );
+    let navigate: ((url: string) => void) | null = null;
+    function CaptureNavigate() {
+      const go = useNavigate();
+      useEffect(() => {
+        navigate = (url: string) => go(url);
+      }, [go]);
+      return null;
+    }
+    renderWithThingies(
+      <>
+        <ThingyNewSessionPanel active />
+        <CaptureNavigate />
+      </>,
+      { path: "/?thingy_start=1&thingy=1" },
+    );
+    const panel = await screen.findByRole("complementary", { name: "Board" });
+    await waitFor(() => expect(panel).toHaveAttribute("data-maximized", "true"));
+
+    // A click in the full screen thingy before its session exists: New session opens with the
+    // request in the composer, which leaving full screen must not drop from the URL.
+    await act(async () => {
+      await openSession(BOARD, "Thingy action\n{}", navigate!, { deliver: true, actionId: "a1" });
+    });
+
+    expect(panel).not.toHaveAttribute("data-maximized");
+    const search = new URLSearchParams(
+      screen.getByLabelText("location").textContent!.replace(/^[^?]*/, ""),
+    );
+    expect(search.get("prompt")).toContain("Thingy action");
+    expect(search.get("thingy_start")).toBe("1");
+    expect(search.has("thingy")).toBe(false);
   });
 
   it("closes the sidebar for full screen and opens it again after", async () => {

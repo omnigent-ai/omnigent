@@ -54,7 +54,14 @@ function startMap({
   preview = false,
   canAct = true,
   canWrite = true,
-}: { preview?: boolean; canAct?: boolean; canWrite?: boolean } = {}) {
+  delivery = "sent",
+}: {
+  preview?: boolean;
+  canAct?: boolean;
+  canWrite?: boolean;
+  /** How the host answers a request: `starting` while the viewer has no thingy session yet. */
+  delivery?: "sent" | "starting";
+} = {}) {
   const listeners: Record<string, Listener> = {};
   let actionListener: Listener | null = null;
   const creates: { collection: string; value: unknown; options: unknown }[] = [];
@@ -86,7 +93,7 @@ function startMap({
     agent: {
       request: (action: string, params: unknown) => {
         requests.push({ action, params });
-        return Promise.resolve({ actionId: "a1", delivery: "sent" });
+        return Promise.resolve({ actionId: "a1", delivery });
       },
       watch: (listener: Listener) => {
         actionListener = listener;
@@ -192,6 +199,70 @@ describe("work map template", () => {
     ]);
     await waitFor(() => expect(byId("card-rollout").textContent).toContain("Done: At 10%."));
     expect(byId("done-section").hidden).toBe(false);
+  });
+
+  it("asks the viewer to start the thingy session when a scan waits for it", async () => {
+    const { emit, ready } = startMap({ delivery: "starting" });
+    await waitFor(() => expect(ready()).toBe(true));
+    emit("maps", []);
+
+    byId("scan-empty").click();
+
+    await waitFor(() => expect(byId("scan-empty").textContent).toBe("Start my thingy session"));
+    expect((byId("scan-empty") as HTMLButtonElement).disabled).toBe(false);
+    expect(byId("empty-run").textContent).toContain("Start your thingy session in New session");
+  });
+
+  it("follows the scan still running when a later one was merged into it", async () => {
+    const { emit, emitActions, ready } = startMap();
+    await waitFor(() => expect(ready()).toBe(true));
+    emit("maps", [{ id: "current", version: "v1", value: MAP }]);
+    emitActions([
+      { id: "a0", action: "scan", params: { window_days: 3 }, status: "running" },
+      {
+        id: "a1",
+        action: "scan",
+        params: { window_days: 3 },
+        status: "done",
+        summary: "Merged into the equivalent open scan a0",
+      },
+    ]);
+
+    await waitFor(() => expect(byId("run").textContent).toContain("Reading your recent sessions"));
+    expect(button("Scanning")?.disabled).toBe(true);
+
+    emitActions([
+      { id: "a0", action: "scan", params: { window_days: 3 }, status: "done", summary: "4 areas" },
+      { id: "a1", action: "scan", params: { window_days: 3 }, status: "done", summary: "Merged" },
+    ]);
+    await waitFor(() => expect(byId("run").textContent).toBe("Scan done"));
+  });
+
+  it("shows a finished next step as done where it was clicked, even once the map drops it", async () => {
+    const { emit, emitActions, ready } = startMap();
+    await waitFor(() => expect(ready()).toBe(true));
+    emit("maps", [{ id: "current", version: "v1", value: MAP }]);
+    const step = { next_step: "ramp-10", label: "Ramp the flag to 10%", area: "rollout" };
+    emitActions([{ id: "a1", action: "do_next_step", params: step, status: "running" }]);
+    await waitFor(() => expect(byId("card-rollout").textContent).toContain("Working on it"));
+
+    // The session reports the action and rewrites the map without the step, and writes no run.
+    const rollout = { ...MAP.areas[0], next_steps: MAP.areas[0].next_steps.slice(1) };
+    emit("maps", [
+      { id: "current", version: "v2", value: { ...MAP, areas: [rollout, MAP.areas[1]] } },
+    ]);
+    emitActions([
+      { id: "a1", action: "do_next_step", params: step, status: "done", summary: "At 10%." },
+    ]);
+
+    await waitFor(() =>
+      expect(byId("next-list").querySelector(".next-chip.finished")?.textContent).toContain(
+        "Ramp the flag to 10%",
+      ),
+    );
+    const row = byId("done-list").querySelector("li") as HTMLElement;
+    expect(row.dataset.fresh).toBe("true");
+    expect(row.textContent).toContain("Done just now: At 10%.");
   });
 
   it("leaves out next steps the viewer hid", async () => {

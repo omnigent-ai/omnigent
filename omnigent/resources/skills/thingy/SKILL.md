@@ -21,7 +21,9 @@ for one thingy to.
 
 - Read the action ledger with `sys_thingy_action_list` before anything else,
   and again after a restart or compaction. The ledger, not this conversation,
-  records what is done.
+  records what is done. Actions in it that are `pending` or `queued` are yours
+  to carry out, even when no message has brought them: one requested before
+  this session existed reaches you only through the ledger.
 - Action requests arrive as messages that start with `Thingy action`, followed
   by a JSON object with `action_id`, `action` and `params`. For each one:
   1. Set it `running` with `sys_thingy_action_update`.
@@ -39,8 +41,9 @@ for one thingy to.
 - Run actions that touch the same records one at a time.
 - A second message with an `action_id` you already have is the same request
   sent again: do not run it twice. A request with a new `action_id` that repeats
-  one still queued or running: set the new one `done` and say it was merged
-  into the open one.
+  one still queued or running: set the new one `done` with a plain summary such
+  as "Merged into the scan already running", without action IDs, since the page
+  shows it to the viewer.
 - The page shows each action's status, which Omnigent derives from the sessions
   doing the work. An action whose sessions stop without your report shows as
   `finished_unreported`, so always report how it ended.

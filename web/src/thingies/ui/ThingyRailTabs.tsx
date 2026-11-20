@@ -785,6 +785,13 @@ export function ThingyNewSessionPanel({
     handledUrlRef.current = marker;
     setThingyNewSessionTabMaximized(true);
   }, [shown, urlThingy, thingyId, location.key]);
+  // A link that fills the composer without naming the thingy, such as a request from the thingy
+  // before its session exists, shows the composer. Following the link rather than leaving full
+  // screen before it keeps the URL write below from replacing the link with the page before it.
+  const linksPrompt = params.has("prompt");
+  useEffect(() => {
+    if (shown && linksPrompt && urlThingy === null) setThingyNewSessionTabMaximized(false);
+  }, [shown, linksPrompt, urlThingy, location.key]);
   const setFullScreen = (next: boolean) => {
     setThingyNewSessionTabMaximized(next);
     if (thingyId === null || next === (urlThingy === thingyId)) return;

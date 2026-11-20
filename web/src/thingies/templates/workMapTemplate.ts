@@ -294,6 +294,15 @@ section { margin-top: 22px; }
 .done-list li { display: grid; grid-template-columns: 18px minmax(0, 1fr); gap: 8px; padding: 8px 10px; border-radius: 10px; background: var(--surface); border: 1px solid var(--line); }
 .done-list .mark { color: var(--done); font-weight: 700; }
 .done-list li[data-state='failed'] .mark { color: var(--blocked); }
+.done-list li[data-fresh='true'] { border-color: var(--done); background: var(--done-soft); animation: done-in 700ms ease-out; }
+.done-list li[data-fresh='true'][data-state='failed'] { border-color: var(--blocked); background: var(--blocked-soft); }
+.done-list li[data-fresh='true'] .mark, .next-chip.finished .mark { animation: pop 600ms cubic-bezier(0.2, 0.8, 0.2, 1.4); }
+.next-chip.finished { border-color: var(--done); background: var(--done-soft); cursor: default; opacity: 1; animation: done-in 500ms ease-out; }
+.next-chip.finished[data-state='failed'] { border-color: var(--blocked); background: var(--blocked-soft); }
+.next-chip .mark { color: var(--done); font-weight: 700; width: 16px; text-align: center; }
+.next-chip.finished[data-state='failed'] .mark { color: var(--blocked); }
+@keyframes done-in { from { transform: translateY(4px); opacity: 0.4; } to { transform: none; opacity: 1; } }
+@keyframes pop { 0% { transform: scale(0.4); } 60% { transform: scale(1.3); } 100% { transform: scale(1); } }
 .guide { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 4px 16px; }
 .guide summary { cursor: pointer; font-weight: 600; padding: 10px 0; }
 .guide-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px 28px; padding-bottom: 14px; }
@@ -326,25 +335,25 @@ const SCRIPT = `
   var STATE_LABELS = { active: 'Active', blocked: 'Blocked', waiting: 'Waiting', done: 'Done' };
   var STATE_ORDER = { blocked: 0, active: 1, waiting: 2, done: 3 };
   var SCAN_TEXT = {
-    pending: 'Start your thingy session beside this page to scan.',
-    queued: 'Waiting for your thingy session…',
+    pending: 'Start your thingy session in New session beside this page, and it scans.',
+    queued: 'Waiting for your thingy session to pick it up…',
     running: 'Reading your recent sessions…',
     needs_input: 'Your thingy session is waiting for you.',
     done: 'Scan done',
     failed: 'Scan failed',
     cancelled: 'Scan cancelled',
-    finished_unreported: 'The scan ended without a report. Click Rescan to try again.',
+    finished_unreported: 'Your thingy session stopped before it reported the scan. Click Rescan to ask again.',
     interrupted: 'The scan stopped before it finished. Click Rescan to try again.',
   };
   var STEP_TEXT = {
-    pending: 'Start your thingy session beside this page to run it.',
-    queued: 'Waiting for your thingy session…',
+    pending: 'Start your thingy session in New session beside this page, and it runs this.',
+    queued: 'Waiting for your thingy session to pick it up…',
     running: 'Working on it…',
     needs_input: 'Waiting for you in the session',
     done: 'Done',
     failed: 'Did not work',
     cancelled: 'Cancelled',
-    finished_unreported: 'Ended without a report',
+    finished_unreported: 'Stopped before it reported',
     interrupted: 'Stopped before it finished',
   };
   var LIVE_TEXT = { running: 'Running', needs_input: 'Needs your input', waiting: 'Waiting', failed: 'Failed', idle: 'Idle', done: 'Finished' };
@@ -359,6 +368,11 @@ const SCRIPT = `
   var mapDoc = null;
   var mapLoaded = false;
   var runDocs = {};
+  // Next steps that finished while this page watched, by step ID: they show as done for a moment
+  // where they were clicked, then stay under Done recently.
+  var FRESH_MS = 8000;
+  var freshDone = {};
+  var openStepActions = {};
   var dismissedDocs = {};
   var actionItems = [];
   var pendingScan = null;
@@ -450,12 +464,35 @@ const SCRIPT = `
     return found;
   }
   function isOpen(action) { return Boolean(action) && OPEN.indexOf(action.status) !== -1; }
+  // The scan to show: one a session is working on, else the latest. A later request the session
+  // merged into an open one is already done, but the open one still runs.
+  function shownScan() {
+    var working = null;
+    actionItems.forEach(function (item) {
+      if (item.action === 'scan' && isOpen(item) && item.status !== 'pending') working = item;
+    });
+    return working || latestAction('scan');
+  }
 
   function onActions(snapshot) {
     if (snapshot.status === 'loading') return;
     actionItems = snapshot.items || [];
+    actionItems.forEach(function (item) {
+      if (item.action !== 'do_next_step' || !item.params || typeof item.params.next_step !== 'string') return;
+      if (isOpen(item)) { openStepActions[item.id] = true; return; }
+      if (!openStepActions[item.id]) return;
+      delete openStepActions[item.id];
+      markFresh(item.params.next_step, item.status === 'done' ? 'done' : 'failed', item.params.label);
+    });
     schedule();
   }
+
+  function markFresh(stepId, state, label) {
+    if (freshDone[stepId]) return;
+    freshDone[stepId] = { at: Date.now(), state: state, label: label || '' };
+    setTimeout(schedule, FRESH_MS + 100);
+  }
+  function isFresh(stepId) { return Boolean(freshDone[stepId]) && Date.now() - freshDone[stepId].at < FRESH_MS; }
 
   function windowDays() { return Number($('window').value) || 3; }
 
@@ -630,18 +667,21 @@ const SCRIPT = `
   function renderScanStatus(value) {
     var box = $('run');
     box.replaceChildren();
-    var action = latestAction('scan');
+    var action = shownScan();
     if (pendingScan && (Date.now() - pendingScan.at > PENDING_MS || (action && pendingScan.actionId === action.id))) pendingScan = null;
     var open = Boolean(pendingScan && !pendingScan.starting) || (isOpen(action) && action.status !== 'pending');
     var undelivered = Boolean(pendingScan && pendingScan.starting) || (!pendingScan && action && action.status === 'pending');
     var label = value ? 'Rescan' : 'Scan my recent work';
     [$('scan'), $('scan-empty')].forEach(function (button) {
       button.disabled = !canAct || (open && !undelivered);
-      button.textContent = open ? 'Scanning…' : undelivered ? 'Open the session again' : button.id === 'scan' ? label : 'Scan my recent work';
+      button.textContent = open ? 'Scanning…' : undelivered ? 'Start my thingy session' : button.id === 'scan' ? label : 'Scan my recent work';
     });
-    if (open) box.appendChild(el('span', { class: 'spinner', 'aria-hidden': 'true' }));
-    var textValue = pendingScan ? pendingScan.text : action && SCAN_TEXT[action.status] ? SCAN_TEXT[action.status] + (action.summary && !open ? ': ' + action.summary : '') : '';
-    if (textValue) box.appendChild(el('span', { text: textValue }));
+    // Before the first map the status sits under the empty state's button instead.
+    if (open && value) box.appendChild(el('span', { class: 'spinner', 'aria-hidden': 'true' }));
+    // A finished scan's own summary repeats the meta line, so only a failure says why.
+    var why = action && action.summary && (action.status === 'failed' || action.status === 'cancelled') ? ': ' + action.summary : '';
+    var textValue = pendingScan ? pendingScan.text : action && SCAN_TEXT[action.status] ? SCAN_TEXT[action.status] + why : '';
+    if (textValue && value) box.appendChild(el('span', { text: textValue }));
     $('empty-run').textContent = !value && textValue ? textValue : '';
     if (mapSvg) mapSvg.sweep.setAttribute('data-on', open ? 'true' : 'false');
   }
@@ -974,8 +1014,16 @@ const SCRIPT = `
     });
     picks.sort(function (a, b) { return a.score - b.score; });
     picks = picks.slice(0, 4);
-    $('next-section').hidden = picks.length === 0;
-    $('next-list').replaceChildren.apply($('next-list'), picks.map(function (pick) {
+    var finished = Object.keys(freshDone).filter(isFresh).map(function (stepId) {
+      var done = freshDone[stepId];
+      return el('div', { class: 'next-chip finished', 'data-state': done.state, role: 'status' }, [
+        el('span', { class: 'mark', 'aria-hidden': 'true', text: done.state === 'done' ? '✓' : '!' }),
+        el('span', { text: done.label || 'Next step' }),
+        el('span', { class: 'where', text: done.state === 'done' ? 'Done' : 'Did not work' }),
+      ]);
+    });
+    $('next-section').hidden = picks.length === 0 && finished.length === 0;
+    $('next-list').replaceChildren.apply($('next-list'), finished.concat(picks.map(function (pick) {
       var busy = pick.state.run === 'running' || (pick.state.run === 'sending' && !pick.state.retry);
       return el('button', {
         type: 'button', class: 'next-chip', 'data-omnigent-requires': 'action', disabled: !canAct || busy,
@@ -986,29 +1034,48 @@ const SCRIPT = `
         el('span', { text: pick.step.label }),
         el('span', { class: 'where', text: pick.area.title }),
       ]);
-    }));
+    })));
   }
 
+  // Finished next steps: the session's step_runs records, and finished do_next_step actions it
+  // reported without one. Steps that finished while this page watched come first, highlighted.
   function renderDone() {
-    var rows = Object.keys(runDocs).map(function (key) { return runDocs[key]; }).filter(function (doc) {
-      return doc.value && (doc.value.state === 'done' || doc.value.state === 'failed');
-    }).sort(function (a, b) { return a.updatedAt < b.updatedAt ? 1 : -1; }).slice(0, 6);
-    $('done-section').hidden = rows.length === 0;
-    $('done-list').replaceChildren.apply($('done-list'), rows.map(function (doc) {
+    var rows = {};
+    Object.keys(runDocs).forEach(function (key) {
+      var doc = runDocs[key];
       var value = doc.value;
-      return el('li', { 'data-state': value.state, 'data-omnigent-ref': 'step_runs/' + doc.id, 'data-omnigent-label': value.label }, [
-        el('span', { class: 'mark', 'aria-hidden': 'true', text: value.state === 'done' ? '✓' : '!' }),
+      if (!value || (value.state !== 'done' && value.state !== 'failed')) return;
+      rows[key] = { key: key, label: value.label, state: value.state, outcome: value.outcome, session: value.session_id, at: value.updated || doc.updatedAt, ref: 'step_runs/' + key };
+    });
+    actionItems.forEach(function (item, index) {
+      var stepId = item.action === 'do_next_step' && item.params ? item.params.next_step : null;
+      if (typeof stepId !== 'string' || rows[stepId] || (item.status !== 'done' && item.status !== 'failed')) return;
+      rows[stepId] = { key: stepId, label: item.params.label || 'Next step', state: item.status, outcome: item.summary, session: item.sessionId, order: index };
+    });
+    var list = Object.keys(rows).map(function (key) { return rows[key]; }).sort(function (a, b) {
+      var fresh = (isFresh(b.key) ? 1 : 0) - (isFresh(a.key) ? 1 : 0);
+      if (fresh) return fresh;
+      if (a.at && b.at) return a.at < b.at ? 1 : -1;
+      if (a.at || b.at) return a.at ? -1 : 1;
+      return (b.order || 0) - (a.order || 0);
+    }).slice(0, 6);
+    $('done-section').hidden = list.length === 0;
+    $('done-list').replaceChildren.apply($('done-list'), list.map(function (row) {
+      var when = isFresh(row.key) ? 'just now' : ago(row.at);
+      return el('li', { 'data-state': row.state, 'data-fresh': isFresh(row.key) ? 'true' : null, 'data-omnigent-ref': row.ref || null, 'data-omnigent-label': row.label }, [
+        el('span', { class: 'mark', 'aria-hidden': 'true', text: row.state === 'done' ? '✓' : '!' }),
         el('div', {}, [
-          el('div', { text: value.label }),
+          el('div', { text: row.label }),
           el('div', { class: 'session-meta' }, [
-            (value.state === 'done' ? 'Done ' : 'Did not work, ') + ago(value.updated || doc.updatedAt) + (value.outcome ? ': ' + value.outcome : ''),
-            value.session_id ? ' ' : null,
-            value.session_id ? el('button', { type: 'button', class: 'link-button', text: 'Open session', on: { click: function () { openSession(value.session_id); } } }) : null,
+            (row.state === 'done' ? 'Done' : 'Did not work') + (when ? ' ' + when : '') + (row.outcome ? ': ' + row.outcome : ''),
+            row.session ? ' ' : null,
+            row.session ? el('button', { type: 'button', class: 'link-button', text: 'Open session', on: { click: function () { openSession(row.session); } } }) : null,
           ]),
         ]),
       ]);
     }));
   }
+
 
   // ---- The template preview's example map, kept in memory
 
@@ -1096,7 +1163,17 @@ const SCRIPT = `
     stepRuns = client.data.collection('step_runs');
     dismissed = client.data.collection('dismissed');
     maps.watch(onMaps, { intervalMs: 4000, limit: 5 });
-    stepRuns.watch(function (snapshot) { if (snapshot.status !== 'loading') { runDocs = byIdOf(snapshot.items); schedule(); } }, { intervalMs: 4000, limit: 100 });
+    stepRuns.watch(function (snapshot) {
+      if (snapshot.status === 'loading') return;
+      var next = byIdOf(snapshot.items);
+      Object.keys(next).forEach(function (key) {
+        var before = runDocs[key] && runDocs[key].value;
+        var now = next[key].value;
+        if (before && before.state === 'running' && now && (now.state === 'done' || now.state === 'failed')) markFresh(key, now.state, now.label);
+      });
+      runDocs = next;
+      schedule();
+    }, { intervalMs: 4000, limit: 100 });
     dismissed.watch(function (snapshot) { if (snapshot.status !== 'loading') { dismissedDocs = byIdOf(snapshot.items); schedule(); } }, { intervalMs: 8000, limit: 100 });
     if (canAct && typeof client.agent.watch === 'function') client.agent.watch(onActions, { intervalMs: 3000 });
     schedule();
@@ -1248,14 +1325,14 @@ export const WORK_MAP_GUIDE = [
   "- `areas` (up to 12): `{id, title, summary, state, kind, related, items, next_steps}`. `id` is a stable lowercase slug (`[a-z0-9][a-z0-9_-]*`, at most 64), such as `checkout-rollout`. `state` is `active`, `blocked`, `waiting` (on someone or something else) or `done`. `kind` is a word such as rollout, investigation, review, bug, incident or project. `related` lists IDs of areas that depend on or inform this one.",
   "- `items` (up to 8 per area): the threads of work in it, `{id, title, summary, state, session_ids}`.",
   "- `next_steps` (up to 5 per area): `{id, label, why, kind, session_id, evidence: {session_id, quote}}`. `kind` is `act` (something to do) or `monitor` (something to check). `id` is a stable slug, unique across the map, which also names its `step_runs` and `dismissed` records.",
-  "- `sessions` (up to 30): `{id, title, area, why, status, outcome, steps}` for each session the map refers to. Set `why` only on sessions the viewer should monitor or act in; those appear under Keep an eye on. `status` is the session's status when you scanned, `outcome` one sentence from its journal or last messages, and `steps` the latest plan step statuses from its journal.",
+  "- `sessions` (up to 30): `{id, title, area, why, status, outcome, steps}` for each session the map refers to. Set `why` only on sessions the viewer should monitor or act in; those appear under Keep an eye on. `status` is the session's status when you scanned, `outcome` one sentence from its journal or last messages, and `steps` the latest plan step statuses from its journal, only when it has one.",
   "",
   "## Scan",
   "",
   "The Scan button requests the `scan` action with `window_days`. A chat request to scan, or an automation's prompt, works the same way without the action.",
   "",
-  "1. List sessions with `sys_session_list` (visibility `mine`), and keep those updated within `window_days`, at most 25, newest first. Skip this thingy session, sessions you started for this thingy's own next steps, and trivial ones (a greeting, an empty or one-message session).",
-  "2. For each kept session read only a little: its title and status from the list, `sys_journal_read` with its `conversation_id` (plan step statuses and notes), and `sys_session_get_history` limited to its last few items when the journal is empty. Never read whole transcripts. Read in parallel where you can.",
+  "1. List sessions with `sys_session_list` (visibility `mine`). Each row has `last_activity_at` in Unix seconds: keep the sessions active within `window_days` of now, at most 25, most recently active first. Rows are ordered by creation, so page on with `cursor` until rows were created before the window. Skip this thingy session, sessions you started for this thingy's own next steps, and trivial ones (a greeting, an empty or one-message session).",
+  "2. For each kept session read only a little: its title and status from the list, then its journal with `sys_journal_read` and its `conversation_id` (plan step statuses and notes) when that tool is available, and `sys_session_get_history` limited to its last few items when there is no journal. Journal tools are optional: without them, or for a session with no journal, use the last few messages and leave `steps` out. Never ask a session to start a journal, and never read whole transcripts. Read in parallel where you can.",
   "3. Group the sessions by goal. Several sessions about one rollout are one area; one session can feed several areas. Name each area by what the viewer is trying to get done.",
   "4. Write next steps only when the sessions point to something specific: a flag to ramp after a quiet bake, a metric to check after a change, a bug to follow up on, a review someone waits for, a failed run to retry. Cite the session and a short quote in `evidence`. Write none for an area when nothing specific stands out; never pad with generic advice.",
   "5. Read `dismissed` and leave those next steps out, and read `step_runs`: drop steps that are done unless the work still needs a follow-up, which gets a new step.",
@@ -1302,8 +1379,8 @@ export const WORK_MAP_REVISION: CreateThingyRevisionRequest = {
       name: "scan",
       description:
         "Rebuild the map from the viewer's recent sessions as the guide's Scan section says: list their sessions " +
-        "updated in the last params.window_days days (default 3, at most 25 sessions), read each one's journal and " +
-        "only its last few messages, group them by goal into areas with threads and specific next steps that cite " +
+        "active in the last params.window_days days (default 3, at most 25 sessions; last_activity_at in the list), " +
+        "read each one's journal when journal tools are available and only its last few messages, group them by goal into areas with threads and specific next steps that cite " +
         "their session, and replace the maps record with ID current in one write.",
       params: {
         type: "object",
