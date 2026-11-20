@@ -199,7 +199,7 @@ def test_cold_resumed_claude_keeps_counting_the_session_cost(
             session_id,
             input_tokens=_FIRST_TURN_INPUT_TOKENS,
         )
-        spent = _settled_cost(client, session_id, above=0.0)
+        poll_until(lambda: _session_cost(client, session_id) > 0, timeout_s=60)
         # A relaunch resumes only a session whose Claude id was captured.
         claude_session_id = poll_external_session_id(
             client, conversation_id=session_id, timeout=60
@@ -212,6 +212,9 @@ def test_cold_resumed_claude_keeps_counting_the_session_cost(
         ).raise_for_status()
         _await_exit_record(claude_config, claude_session_id)
         _ensure_terminal(client, session_id)
+        # The first process and its forwarder are gone, so nothing else raises this.
+        spent = _session_cost(client, session_id)
+        assert spent > 0
         resumed_prompt = _run_priced_turn(
             client,
             isolated_mock_llm_server_url,

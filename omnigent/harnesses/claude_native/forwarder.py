@@ -3121,7 +3121,23 @@ def _cumulative_cost_from_status_state(state: dict[str, object] | None) -> float
     return float(raw)
 
 
-# Claude restores the seeded cost exactly; the slack only absorbs rounding.
+def _api_duration_from_status_state(state: dict[str, object] | None) -> float | None:
+    """
+    Extract the API time Claude has spent so far from a statusLine snapshot.
+
+    :param state: Parsed ``context.json`` payload, or ``None``.
+    :returns: ``state["total_api_duration_ms"]``, e.g. ``0.0`` before the
+        process's first API call, or ``None`` when absent / malformed.
+    """
+    if not isinstance(state, dict):
+        return None
+    raw = state.get("total_api_duration_ms")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw < 0:
+        return None
+    return float(raw)
+
+
+# Absorbs rounding when a total after the first API call is compared with the seed.
 _RESUME_COST_RESTORE_TOLERANCE_USD = 0.01
 
 
@@ -3130,6 +3146,7 @@ def _resume_adjusted_status_cost(
     bridge_dir: Path,
     transcript_path: Path,
     status_cost: float | None,
+    api_duration_ms: float | None,
     dedupe: _ForwardDedupeState,
     session_id: str,
 ) -> float | None:
@@ -3140,8 +3157,12 @@ def _resume_adjusted_status_cost(
     ``cost-state`` transcript record in Claude Code's own format. A release
     that stops reading it would restart the statusLine total at $0, and the
     server, which keeps only the highest total, would stall the session cost.
-    The resumed process's first non-zero cost tells the cases apart: at least
-    the seeded cost when restored, a fresh count when not. The decision is
+
+    The decision is made before the resumed process's first API call, when
+    its total is exactly the restored seed or $0, so it doesn't depend on
+    what that call costs. If the forwarder only sees a total after a call,
+    only a total below the seed proves a fresh count; a higher one is taken
+    as restored, which can't count the seed twice. The decision is
     persisted, so a restarted forwarder keeps it.
 
     Reads and writes the bridge dir; call via :func:`asyncio.to_thread`.
@@ -3150,6 +3171,8 @@ def _resume_adjusted_status_cost(
     :param transcript_path: Transcript being forwarded; its stem is the
         running Claude session id.
     :param status_cost: The statusLine total, or ``None`` when not captured.
+    :param api_duration_ms: The statusLine's API time, ``0.0`` before the
+        first API call, or ``None`` when not reported.
     :param dedupe: Caches the baseline and its decision; mutated in place.
     :param session_id: Omnigent session id, e.g. ``"conv_abc123"``, for logs.
     :returns: *status_cost*, plus the seeded cost when Claude counted from
@@ -3174,10 +3197,12 @@ def _resume_adjusted_status_cost(
     ):
         return status_cost
     if baseline.restored is None:
-        if status_cost <= 0:
-            # Nothing billed yet, so a restored and a fresh count look alike.
+        if api_duration_ms == 0:
+            restored = status_cost >= baseline.cost_usd / 2
+        elif status_cost > 0:
+            restored = status_cost + _RESUME_COST_RESTORE_TOLERANCE_USD >= baseline.cost_usd
+        else:
             return status_cost
-        restored = status_cost + _RESUME_COST_RESTORE_TOLERANCE_USD >= baseline.cost_usd
         baseline = replace(baseline, restored=restored)
         dedupe.resume_cost_baseline = baseline
         try:
@@ -3391,6 +3416,7 @@ async def _forward_session_cost(
             bridge_dir=bridge_dir,
             transcript_path=parent_transcript_path,
             status_cost=_cumulative_cost_from_status_state(state),
+            api_duration_ms=_api_duration_from_status_state(state),
             dedupe=dedupe,
             session_id=session_id,
         )
