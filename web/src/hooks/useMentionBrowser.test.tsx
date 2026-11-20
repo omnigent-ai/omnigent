@@ -102,7 +102,7 @@ function renderBrowser(input: ComposerTextTarget | null = null) {
       textareaRef: { current: input },
       segments: [text, quote],
     });
-    return { text, setText, setQuote, setMention, browser };
+    return { text, setText, setQuote, mention, setMention, browser };
   });
 }
 
@@ -148,7 +148,7 @@ function renderCallerOwnedBrowser() {
       textareaRef: { current: null },
       tags: { mentions, updateMentions: (update) => setMentions((previous) => update(previous)) },
     });
-    return { text, setText, setQuote: () => {}, setMention, browser };
+    return { text, setText, setQuote: () => {}, setMention, browser, mentions };
   });
 }
 
@@ -303,6 +303,26 @@ describe("useMentionBrowser with caller-owned tags", () => {
     expect(result.current.browser.mentionTokens).toEqual(["@readme.md"]);
   });
 
+  it("archives a dropped tag that's only the start of a kept one, so an undo restores both", () => {
+    const { result } = renderCallerOwnedBrowser();
+    const fix: SessionMention = { id: "sess_fix", title: "Fix", isSubagent: false };
+    const fixCi: SessionMention = { id: "sess_fix_ci", title: "Fix CI", isSubagent: false };
+    tagSession(result, fix, "Ask @Fi");
+    act(() => result.current.setText("Ask @Fix @Fi"));
+    act(() => result.current.setMention({ query: "Fi", start: 9, end: 12 }));
+    act(() => result.current.browser.attachSession(fixCi));
+    expect(result.current.text).toBe("Ask @Fix @Fix CI ");
+
+    change(result, "Ask  @Fix CI ", false);
+    expect(result.current.mentions.sessions.map((session) => session.id)).toEqual(["sess_fix_ci"]);
+
+    change(result, "Ask @Fix @Fix CI ", true);
+    expect(result.current.mentions.sessions.map((session) => session.id).sort()).toEqual([
+      "sess_fix",
+      "sess_fix_ci",
+    ]);
+  });
+
   it("forgets the tags a reset clears, so an undo in the next draft can't restore them", () => {
     const { result } = renderCallerOwnedBrowser();
     tagReadme(result);
@@ -327,6 +347,17 @@ describe("useMentionBrowser edits on a live input", () => {
       currentTarget: target,
       preventDefault: () => {},
     }) as unknown as ComposerKeyboardEvent;
+
+  it("leaves the tags and the open menu alone when a locked input refuses the pick", () => {
+    const input = createFakeComposerSurface("Read @rea", { locked: true });
+    const { result } = renderBrowser(input);
+    act(() => result.current.setMention({ query: "rea", start: 5, end: 9 }));
+    act(() => result.current.browser.attachMention("readme.md", false));
+    expect(input.value).toBe("Read @rea");
+    expect(result.current.mention).toEqual({ query: "rea", start: 5, end: 9 });
+    expect(result.current.browser.mentionTokens).toEqual([]);
+    input.unregister();
+  });
 
   it("completes a mention as its own undo step, with the caret after the token and its space", () => {
     const input = createFakeComposerSurface("Read @rea");

@@ -3381,6 +3381,30 @@ describe("grid cell @-mention picker", () => {
     );
   });
 
+  it("⌘Z brings back a file tag that was the whole draft, so the file still attaches on send", () => {
+    mountCell();
+    typeText("@read");
+    fireEvent.click(screen.getByTitle("Attach readme.md"));
+    // Drop the space after the pill, so deleting the pill empties the draft.
+    fireEvent.change(input(), { target: { value: "@readme.md" } });
+    input().setSelectionRange(10, 10);
+    fireEvent.keyDown(input(), { key: "Backspace" });
+    expect(input()).toHaveValue("");
+    expect(getSessionDraft(childId)?.mentions).toBeUndefined();
+
+    fireEvent.input(input(), { target: { value: "@readme.md" }, inputType: "historyUndo" });
+    expect(input()).toHaveValue("@readme.md");
+    expect(getSessionDraft(childId)?.mentions).toEqual({ files: [readmeTag], sessions: [] });
+
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    expect(send).toHaveBeenCalledExactlyOnceWith(
+      "[Attached file: readme.md]",
+      "agent_side",
+      undefined,
+      { pinnedConversationId: childId },
+    );
+  });
+
   it("Shift+Tab with the picker open steps the permission mode and keeps the token", () => {
     const cyclePermissionMode = vi.fn(() => true);
     mountCell({ cyclePermissionMode });

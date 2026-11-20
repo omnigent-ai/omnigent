@@ -1023,7 +1023,6 @@ function SideChatComposer({
     (!pending && files.length > 0) ||
     reviewComments.length > 0;
   // The tags and review comments a send carries. A grid cell's come from its session draft.
-  // The draft's text segments, shared by the send path and the mention hook.
   const draftSegments = [text, ...quotes.map((replyQuote) => replyQuote.before)];
   const sharedTags = presentTaggedMentions(sessionMentions, draftSegments);
   const sendContext: ComposerSendContext = {
@@ -1092,6 +1091,7 @@ function SideChatComposer({
     openMentionDir,
     attachSession,
     noteTextChange: noteMentionTextChange,
+    resetMentions,
     handleKeyDown: handleMentionKeyDown,
     handleTokenBackspace,
     dismiss: dismissMention,
@@ -1294,6 +1294,7 @@ function SideChatComposer({
       : null;
     const runSkill = (match: { command: string; args: string }) => {
       clearComposer(composerKey);
+      resetMentions();
       onSend();
       void sendSlashCommand(match.command.slice(1), match.args, agentId, {
         pinnedConversationId: childId,
@@ -1308,6 +1309,7 @@ function SideChatComposer({
     }
     if (builtin !== null) {
       setText("");
+      resetMentions();
       if (builtin.command === "/help") showHelp();
       return;
     }
@@ -1337,6 +1339,7 @@ function SideChatComposer({
       )
     ) {
       clearComposer(composerKey);
+      resetMentions();
       if (gridCell) clearLocalReviewContexts(childId);
       onSend();
       enqueueMessage(
@@ -1350,6 +1353,7 @@ function SideChatComposer({
     // A running Codex chat refuses a steered /compact; keep the draft as the main composer does.
     if (isCompactControl(harness, message, outgoing) && rejectBusyCompact(childId)) return;
     clearComposer(composerKey);
+    resetMentions();
     if (gridCell) clearLocalReviewContexts(childId);
     onSend();
     void send(message, agentId, outgoing, {
@@ -1476,9 +1480,10 @@ function SideChatComposer({
           value: text,
           onChange: (event) => {
             if (commandNotice !== null) setCommandNotice(null);
-            noteMentionTextChange(event);
             slashCompletion.onSelectionChange(event.currentTarget);
             setText(event.currentTarget.value);
+            // After the text reaches the shared draft, so a restored tag lands in a draft that exists.
+            noteMentionTextChange(event);
             if (gridCell)
               setTypedMention(
                 detectMentionAt(
@@ -1542,7 +1547,10 @@ function SideChatComposer({
                 keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
                 disabled={!ready}
                 inputFor={(replyQuote) => ({
-                  onChange: (event) => editText(replyQuote.id, event.currentTarget.value),
+                  onChange: (event) => {
+                    editText(replyQuote.id, event.currentTarget.value);
+                    noteMentionTextChange(event);
+                  },
                   onFocus: (event) => focusText(replyQuote.id, event.currentTarget),
                   onKeyDown: handleKeyDown,
                   onPaste,

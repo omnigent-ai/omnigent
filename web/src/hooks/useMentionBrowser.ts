@@ -1,4 +1,4 @@
-import { type RefObject, useEffect, useRef, useState } from "react";
+import { type RefObject, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   isHistoryInput,
   type ComposerInputEvent,
@@ -265,7 +265,9 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
   const releasedRef = useRef<TaggedMentions>(NO_TAGS);
   // The latest tags, for callers that run outside a render (the file viewer's drain).
   const activeRef = useRef<TaggedMentions>({ files: mentionedItems, sessions: mentionedSessions });
-  activeRef.current = { files: mentionedItems, sessions: mentionedSessions };
+  useLayoutEffect(() => {
+    activeRef.current = { files: mentionedItems, sessions: mentionedSessions };
+  });
 
   // Every token a tag owns, active or released; new tags take none of them.
   const ownedMentionTokens = () => [
@@ -312,7 +314,8 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     const current = { files: mentionedItems, sessions: mentionedSessions };
     callerTagsRef.current = current;
     const dropped = withoutTags(previous, current);
-    const present = tokensIn(draftSegments, tagTokens(dropped));
+    // Every token at once, so a dropped tag that's only the start of another counts as gone.
+    const present = tokensIn(draftSegments, [...tagTokens(dropped), ...ownedMentionTokens()]);
     const released = {
       files: dropped.files.filter((it) => !present.has(fileMentionToken(it))),
       sessions: dropped.sessions.filter((it) => !present.has(sessionTagToken(it))),
@@ -391,32 +394,35 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     end: number,
     insert: string,
     caret: number,
-  ) => {
+  ): boolean => {
     if (target?.isConnected) {
-      if (insertComposerText(target, insert, start, end, { separateUndo: true })) {
-        if (target.selectionStart !== caret || target.selectionEnd !== caret) {
-          target.setSelectionRange(caret, caret);
-        }
-        target.focus();
+      // A locked input refuses the edit; callers then leave the tags as they were.
+      if (!insertComposerText(target, insert, start, end, { separateUndo: true })) return false;
+      if (target.selectionStart !== caret || target.selectionEnd !== caret) {
+        target.setSelectionRange(caret, caret);
       }
-      return;
+      target.focus();
+      return true;
     }
     setText(text.slice(0, start) + insert + text.slice(end));
     placeCaret(caret);
+    return true;
   };
 
   // Swap the typed "@query" for the token plus one space, caret after it.
-  const insertToken = (active: MentionState, token: string) => {
+  const insertToken = (active: MentionState, token: string): boolean => {
     const gap = /^\s/.test(liveText(textareaRef.current).slice(active.end)) ? "" : " ";
-    editDraft(
+    const edited = editDraft(
       textareaRef.current,
       active.start,
       active.end,
       token + gap,
       active.start + token.length + 1,
     );
+    if (!edited) return false;
     setMention(null);
     setMentionIndex(-1);
+    return true;
   };
 
   const attachSession = (session: SessionMention) => {
@@ -425,9 +431,9 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     const released = releasedRef.current.sessions.find((it) => it.id === session.id);
     const token =
       existing?.token ?? released?.token ?? sessionMentionToken(session, ownedMentionTokens());
+    if (!insertToken(mention, token)) return;
     if (released) reclaim({ files: [], sessions: [{ ...released, token }] });
     else if (!existing) setMentionedSessions((prev) => [...prev, { ...session, token }]);
-    insertToken(mention, token);
   };
 
   const handleTokenBackspace = (e: ComposerKeyboardEvent): boolean => {
@@ -437,8 +443,8 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     const current = liveText(ta);
     const range = mentionTokenAtCaret(current, ta.selectionStart, mentionTokens);
     if (!range) return false;
+    if (!editDraft(ta, range.start, range.end, "", range.start)) return false;
     e.preventDefault();
-    editDraft(ta, range.start, range.end, "", range.start);
     // The deleted token may have been the active "@" query; recompute it so a
     // following Enter can't complete a mention that no longer exists.
     setMention(
@@ -466,9 +472,9 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
   const attachMention = (path: string, isDir: boolean) => {
     if (!mention) return;
     const { item, source } = claimFile({ path, isDir }, ownedMentionTokens());
+    if (!insertToken(mention, fileMentionToken(item))) return;
     if (source === "released") reclaim({ files: [item], sessions: [] });
     if (source === "new") setMentionedItems((prev) => [...prev, item]);
-    insertToken(mention, fileMentionToken(item));
   };
 
   const tagFiles = (files: readonly MentionItem[]): string[] => {
@@ -497,7 +503,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     if (!mention) return;
     const inserted = `@${path}/`;
     const caret = mention.start + inserted.length;
-    editDraft(textareaRef.current, mention.start, mention.end, inserted, caret);
+    if (!editDraft(textareaRef.current, mention.start, mention.end, inserted, caret)) return;
     setMention({ query: `${path}/`, start: mention.start, end: caret });
     setMentionIndex(0);
   };
