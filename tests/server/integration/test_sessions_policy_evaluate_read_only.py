@@ -482,21 +482,20 @@ async def test_request_phase_gate_runs_when_the_only_queued_web_prompt_is_not_in
 
     clock = {"t": 1000.0}
     monkeypatch.setattr(pending_inputs, "_now", lambda: clock["t"])
-    queued = pending_inputs.record(session_id, [{"type": "input_text", "text": "delete prod"}])
-    if queued_prompt == "interrupted":
-        pending_inputs.mark_interrupted(session_id, [queued])
-    else:
-        sessions_module._session_status_cache[session_id] = "running"
-        clock["t"] += pending_inputs._TTL_S + 1.0
-        assert pending_inputs.pending_ids(session_id) == [queued]
     try:
+        queued = pending_inputs.record(session_id, [{"type": "input_text", "text": "delete prod"}])
+        if queued_prompt == "interrupted":
+            pending_inputs.mark_interrupted(session_id, [queued])
+        else:
+            monkeypatch.setitem(sessions_module._session_status_cache, session_id, "running")
+            clock["t"] += pending_inputs._TTL_S + 1.0
+            assert pending_inputs.pending_ids(session_id) == [queued]
         resp = await auth_client.post(
             f"/v1/sessions/{session_id}/policies/evaluate",
             json=_request_request("typed in the terminal"),
             headers={"X-Forwarded-Email": OWNER},
         )
     finally:
-        sessions_module._session_status_cache.pop(session_id, None)
         pending_inputs.reset_for_tests()
 
     assert resp.status_code == 200, resp.text

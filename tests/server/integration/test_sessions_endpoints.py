@@ -3408,13 +3408,13 @@ async def test_external_user_message_drain_publishes_cleared_pending_id(
     session = await _create_session(client, agent["id"])
     pid = pending_inputs.record(session["id"], [{"type": "input_text", "text": "hi there"}])
     still_pending: list[str] = []
-    if held_past_ttl_mid_turn:
-        sessions_module._session_status_cache[session["id"]] = "running"
-        clock["t"] += pending_inputs._TTL_S + 1.0
-        still_pending.append(
-            pending_inputs.record(session["id"], [{"type": "input_text", "text": "newer"}])
-        )
     try:
+        if held_past_ttl_mid_turn:
+            monkeypatch.setitem(sessions_module._session_status_cache, session["id"], "running")
+            clock["t"] += pending_inputs._TTL_S + 1.0
+            still_pending.append(
+                pending_inputs.record(session["id"], [{"type": "input_text", "text": "newer"}])
+            )
         resp = await client.post(
             f"/v1/sessions/{session['id']}/events",
             json={
@@ -3440,7 +3440,6 @@ async def test_external_user_message_drain_publishes_cleared_pending_id(
             entry["pending_id"] for entry in pending_inputs.snapshot_for(session["id"])
         ] == still_pending
     finally:
-        sessions_module._session_status_cache.pop(session["id"], None)
         pending_inputs.reset_for_tests()
 
 
