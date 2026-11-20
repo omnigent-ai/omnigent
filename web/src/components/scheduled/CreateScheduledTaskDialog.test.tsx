@@ -1471,10 +1471,7 @@ describe("CreateScheduledTaskDialog edit mode", () => {
     fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Renamed" } });
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
-    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
-      name: "Renamed",
-      rrule: "FREQ=HOURLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9,10,11,12,13,14,15,16,17;BYMINUTE=0",
-    });
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({ name: "Renamed", rrule });
   });
 
   it.each(["Every day", "Every hour", "Custom schedule"])(

@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildRRule,
   DEFAULT_SCHEDULE_MODEL,
+  hourlyStep,
   isReachableLastHour,
   parseRRuleToScheduleModel,
   snapHourWindow,
@@ -202,6 +203,39 @@ describe("hourly schedules limited to hours and days", () => {
     });
     expect(buildRRule(parsed!)).toBe(buildRRule(businessHours));
   });
+
+  it.each([
+    ["FREQ=DAILY;BYHOUR=9,10,11,12,13,14,15,16,17;BYMINUTE=30", "hourly", 1],
+    ["FREQ=DAILY;BYHOUR=9,12,15;BYMINUTE=30", "custom", 3],
+  ] as const)("opens daily hour lists like %s in the hourly controls", (rule, preset, step) => {
+    const parsed = parseRRuleToScheduleModel(rule)!;
+    const end = step === 1 ? 17 : 15;
+    expect(parsed).toMatchObject({ preset, minute: 30, hourWindow: { start: 9, end } });
+    expect(hourlyStep(parsed)).toBe(step);
+    const rebuilt = buildRRule(parsed);
+    const hours = rule.match(/BYHOUR=([\d,]+)/)![1];
+    expect(rebuilt).toBe(`FREQ=HOURLY;BYHOUR=${hours};BYMINUTE=30`);
+    expect(buildRRule(parseRRuleToScheduleModel(rebuilt)!)).toBe(rebuilt);
+  });
+
+  it.each([0, -3, Number.NaN, 2.5])(
+    "builds a finite window when the interval is %s",
+    (interval) => {
+      const windowed = model({
+        preset: "custom",
+        customFreq: "hourly",
+        interval,
+        hourWindow: { start: 9, end: 17 },
+      });
+      const step = hourlyStep(windowed);
+      expect(step).toBeGreaterThanOrEqual(1);
+      const hours = Array.from(
+        { length: Math.floor(8 / step) + 1 },
+        (_, index) => 9 + index * step,
+      );
+      expect(buildRRule(windowed)).toBe(`FREQ=HOURLY;BYHOUR=${hours.join(",")};BYMINUTE=0`);
+    },
+  );
 
   it("round-trips days and hours with each ending", () => {
     for (const end of [

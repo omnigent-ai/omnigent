@@ -285,8 +285,7 @@ export function hasHourWindow(model: ScheduleModel): boolean {
 
 /** Hours between runs inside an hourly window; 1 while the interval is unset. */
 export function hourlyStep(model: ScheduleModel): number {
-  if (model.preset !== "custom") return 1;
-  return Number.isInteger(model.interval) && model.interval >= 1 ? model.interval : 1;
+  return model.preset === "custom" ? clampInterval(model.interval) : 1;
 }
 
 /** Whether `hour` can end a window starting at `start`: at least two runs, on the step.
@@ -347,7 +346,7 @@ function parseHourlyFilters(
   const step = sorted[1] - sorted[0];
   if (sorted.some((hour, index) => hour !== sorted[0] + index * step)) return null;
   const hourWindow = { start: sorted[0], end: sorted[sorted.length - 1] };
-  // 12 AM to 11 PM means no hour limit, so only every hour has the same schedule.
+  // A 0–23 window means no hour limit, so only a step of 1 is representable.
   if (hourWindow.start === 0 && hourWindow.end === 23)
     return step === 1 ? { hourWindow: ALL_DAY_HOURS, hourlyDays, step } : null;
   return { hourWindow, hourlyDays, step };

@@ -464,11 +464,17 @@ function hourWindowText(o: RRule["origOptions"], days: number[], interval: numbe
   if (o.freq === RRule.WEEKLY && days.length === 0) return null;
   const minute = minutes[0] ?? 0;
   const step = hours.length > 1 ? hours[1]! - hours[0]! : 1;
-  const times =
-    hours.length === 1 || hours.some((hour, index) => hour !== hours[0]! + index * step)
-      ? `at ${joinList(hours.map((hour) => formatClockTime(hour, minute)))}`
-      : `${step === 1 ? "Hourly" : `Every ${step} hours`} from ${formatClockTime(hours[0]!, minute)} to ${formatClockTime(hours[hours.length - 1]!, minute)}`;
-  return capitalize(times) + onDaysSuffix(days);
+  const suffix = onDaysSuffix(days);
+  const evenlySpaced = hours.every((hour, index) => hour === hours[0]! + index * step);
+  if (hours.length === 1 || !evenlySpaced) {
+    return (
+      capitalize(`at ${joinList(hours.map((hour) => formatClockTime(hour, minute)))}`) + suffix
+    );
+  }
+  const cadence = step === 1 ? "Hourly" : `Every ${step} hours`;
+  const first = formatClockTime(hours[0]!, minute);
+  const last = formatClockTime(hours[hours.length - 1]!, minute);
+  return `${cadence} from ${first} to ${last}${suffix}`;
 }
 
 /** " on weekdays", " on weekends" or " on <days>"; empty when every day runs. */
