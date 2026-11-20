@@ -35,6 +35,7 @@ function strip(tabLeft: number, tabWidth = 50) {
 afterEach(() => {
   document.body.innerHTML = "";
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 describe("scrollTabIntoView", () => {
@@ -158,6 +159,5 @@ describe("WorkspaceTabsScroller compact mode", () => {
       </WorkspaceTabsScroller>,
     );
     expect(screen.getByTestId("probe")).toHaveTextContent("labels");
-    vi.unstubAllGlobals();
   });
 });

@@ -20,9 +20,9 @@ seeded_session = seeded_session_fixture
 
 @pytest.mark.parametrize("width", [240, 360, 472, 900])
 def test_workspace_tab_overflow(page: Page, seeded_session: BrowserSession, width: int) -> None:
-    # Enough tabs that even icon-only tabs overflow the widest rail: labelled tabs
-    # shrink to fit first, so a handful no longer scrolls.
-    files = {f"src/long-panel-name-{index}.md": f"# Panel {index}" for index in range(24)}
+    # Enough tabs that even icon-only tabs (about 34px each) overflow the 900px rail by
+    # more than the two wheel scrolls below: labelled tabs shrink to fit first.
+    files = {f"src/long-panel-name-{index}.md": f"# Panel {index}" for index in range(48)}
     paths = list(files)
     _mock_markdown_files(page, seeded_session, files)
     state = [

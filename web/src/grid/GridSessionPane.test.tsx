@@ -64,6 +64,8 @@ const fixture = vi.hoisted(() => ({
   renderError: new Error("Grid surface render failed"),
   // Set while a cell's viewer holds unsaved edits and is asking to discard them.
   discardEdits: null as (() => void) | null,
+  // Kills the grid's shell close confirmation requested, by terminal id.
+  deleteTerminal: vi.fn((_terminalId: string) => Promise.resolve()),
   // Sessions the viewer can't edit, and each session's sandbox launch.
   readOnlySessions: [] as string[],
   launches: {} as Record<string, { stage: string; error: null }>,
@@ -166,7 +168,7 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
 vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   ...(await importOriginal<typeof TerminalsModule>()),
   useTerminals: () => ({ terminals: fixture.terminals }),
-  useDeleteTerminal: () => ({}),
+  useDeleteTerminal: () => ({ mutateAsync: fixture.deleteTerminal }),
 }));
 vi.mock("./GridSessionsContext", async (original) => ({
   ...(await original<typeof GridSessionsModule>()),
@@ -265,6 +267,12 @@ vi.mock("@/shell/WorkspacePanel", () => ({
         <button type="button" onClick={props.onToggleMaximized}>
           Maximize
         </button>
+        <button
+          type="button"
+          onClick={() => props.onCloseTerminals(props.openTerminals, { onConfirmed: vi.fn() })}
+        >
+          Close shells
+        </button>
       </aside>
     );
   },
@@ -286,6 +294,7 @@ afterEach(() => {
   fixture.failedChat = "";
   fixture.failedTerminal = "";
   fixture.discardEdits = null;
+  fixture.deleteTerminal = vi.fn((_terminalId: string) => Promise.resolve());
   fixture.readOnlySessions = [];
   fixture.launches = {};
   fixture.inferenceConfigured = undefined;
@@ -458,6 +467,24 @@ it("closes workspace tabs without asking the viewer again", () => {
   fireEvent.click(within(workspace).getByText("Close file"));
   expect(fixture.discardEdits).toBeNull();
   expect(workspace).toHaveTextContent("No file");
+});
+
+it("asks once before a bulk shell close and kills nothing when cancelled", () => {
+  fixture.terminals = [
+    { id: "terminal_a", name: "a", session: "main", running: true },
+    { id: "terminal_b", name: "b", session: "main", running: true },
+  ];
+  render(twoCellGrid());
+  const workspace = screen.getByTestId("workspace-first");
+
+  fireEvent.click(within(workspace).getByText("Close shells"));
+  expect(screen.getByRole("dialog")).toHaveTextContent("Close 2 shells?");
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  expect(fixture.deleteTerminal).not.toHaveBeenCalled();
+
+  fireEvent.click(within(workspace).getByText("Close shells"));
+  fireEvent.click(screen.getByRole("button", { name: "Close shells" }));
+  expect(fixture.deleteTerminal.mock.calls).toEqual([["terminal_a"], ["terminal_b"]]);
 });
 
 it("opens chat-linked folders and PRs in that pane's workspace", () => {

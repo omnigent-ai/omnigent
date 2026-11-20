@@ -1802,6 +1802,25 @@ describe("WorkspacePanel browser tab", () => {
 });
 
 describe("WorkspacePanel bulk close with browser tabs", () => {
+  it("closes browser tabs with Close other tabs and shows the kept file", async () => {
+    writePinnedWorkspaceTabs(["files", "subagents"]);
+    const { openFileViewer } = renderWorkspace({ showBrowserTab: true, openFiles: ["README.md"] });
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Browser" }));
+    expect(screen.getByRole("tab", { name: "Browser 1" })).toBeInTheDocument();
+
+    const browserClose = vi.fn().mockResolvedValue({ ok: true });
+    Object.assign(window, { omnigentDesktop: { browserClose } });
+    fireEvent.contextMenu(screen.getByTitle("README.md"));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Close other tabs" }));
+    await waitFor(() => expect(screen.queryByRole("tab", { name: "Browser 1" })).toBeNull());
+    expect(browserClose).toHaveBeenCalledOnce();
+    await waitFor(() => expect(openFileViewer).toHaveBeenCalledWith("README.md"));
+  });
+
   it("keeps the rail and the browser tab when its close fails during Close all tabs", async () => {
     writePinnedWorkspaceTabs(["files", "subagents"]);
     const { rerender, onCloseFile, onHide } = renderWorkspace({
@@ -2128,6 +2147,49 @@ describe("WorkspacePanel sub-agent tabs", () => {
     } as unknown as Session);
     return queryClient;
   }
+
+  it("bulk closes stop side chats, only hide sub-agent tabs, and wait on unsaved edits", async () => {
+    writeSessionWorkspaceState("conv_ws", {
+      openSubagentTabs: [SUBAGENT_TAB],
+      openSideChats: ["conv_side"],
+    });
+    const stop = vi.spyOn(sessionsApi, "stopSession").mockResolvedValue(undefined as never);
+    let allowLeave = false;
+    const fileGuard = vi.fn<FileNavigationGuard>((_path, _options, commit) => {
+      if (allowLeave) commit();
+    });
+    const { onCloseFile } = renderWorkspace({
+      queryClient: clientWithSubagent(),
+      selectedFilePath: "README.md",
+      openFiles: ["README.md"],
+      fileGuard,
+    });
+    const rail = screen.getByRole("complementary", { name: "Workspace" });
+    const closeAll = async () => {
+      fireEvent.pointerDown(within(rail).getByRole("button", { name: "Select panel" }), {
+        button: 0,
+      });
+      fireEvent.click(await screen.findByRole("menuitem", { name: "Close all tabs" }));
+    };
+
+    // Declining the unsaved-edits prompt closes and stops nothing.
+    await closeAll();
+    expect(fileGuard).toHaveBeenCalledOnce();
+    expect(stop).not.toHaveBeenCalled();
+    expect(onCloseFile).not.toHaveBeenCalled();
+    expect(within(rail).getByRole("tab", { name: "Research agent" })).toBeInTheDocument();
+
+    allowLeave = true;
+    await closeAll();
+    expect(onCloseFile).toHaveBeenCalledWith("README.md");
+    // The side chat's session stops; the sub-agent keeps running, only its tab goes.
+    await waitFor(() => expect(stop).toHaveBeenCalledWith("conv_side"));
+    expect(stop).toHaveBeenCalledTimes(1);
+    await waitFor(() =>
+      expect(within(rail).queryByRole("tab", { name: "Research agent" })).toBeNull(),
+    );
+    expect(within(rail).queryByRole("tab", { name: /^Side chat/ })).toBeNull();
+  });
 
   it("opens a requested sub-agent as a labeled tab without duplicating it", () => {
     const { onRightRailTabChange } = renderWorkspace({ queryClient: clientWithSubagent() });
