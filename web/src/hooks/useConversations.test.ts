@@ -52,7 +52,12 @@ import {
   type PinnedConversationsResult,
 } from "./useConversations";
 import { PINNED_LABEL_KEY, PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
-import { isConversationMuted, MUTED_LABEL_KEY } from "@/lib/sessionMute";
+import { isConversationMuted, MUTE_REINDEX_GRACE_MS, MUTED_LABEL_KEY } from "@/lib/sessionMute";
+import {
+  isExplicitlyUnread,
+  markConversationUnread,
+  resetReadStateForTests,
+} from "./useUnseenConversations";
 import { SidebarConfigContext, sidebarConfig } from "@/lib/sidebarConfig";
 import { PINNED_CONVERSATION_IDS_STORAGE_KEY } from "@/shell/sidebarNav";
 import { useScopeCache } from "./useScopeCache";
@@ -4722,6 +4727,11 @@ describe("mute writes", () => {
           labels: muted ? { keep: "me" } : { keep: "me", [MUTED_LABEL_KEY]: "1" },
         }),
       ]);
+      // Saving mute must leave the viewer's read state alone.
+      fetchMock.mockResolvedValue(mockResponse({}));
+      markConversationUnread("conv_m", 100);
+      onTestFinished(resetReadStateForTests);
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
       let resolvePatch!: (response: Response) => void;
       let resolveList!: (response: Response) => void;
       fetchMock.mockImplementation(
@@ -4754,12 +4764,15 @@ describe("mute writes", () => {
       let list = readStarts === "before" ? startList() : undefined;
       act(() => result.current.mutate({ id: "conv_m", muted }));
       await waitFor(() => expect(resolvePatch).toBeDefined());
+      expect(cachedRow(queryClient, "conv_m").updated_at).toBe(100);
       list ??= startList();
       await waitFor(() => expect(resolveList).toBeDefined());
       await act(async () => {
         resolvePatch(mockResponse({ labels: muted ? { [MUTED_LABEL_KEY]: "1" } : {} }));
       });
       await waitFor(() => expect(result.current.isSuccess).toBe(true));
+      expect(cachedRow(queryClient, "conv_m").updated_at).toBe(100);
+      expect(isExplicitlyUnread("conv_m")).toBe(true);
       // The read predates the save, so its labels are stale when it lands.
       await act(async () => {
         resolveList(mockResponse(stale.pages[0]));
@@ -4775,7 +4788,17 @@ describe("mute writes", () => {
       });
       expect(isConversationMuted(cachedRow(queryClient, "conv_m"))).toBe(muted);
 
-      // A read started after the save reports another device's later change.
+      // Right after the save, a lagging index still reports the old label.
+      fetchMock.mockResolvedValueOnce(mockResponse(stale.pages[0]));
+      await act(async () => {
+        await startList();
+      });
+      expect(isConversationMuted(cachedRow(queryClient, "conv_m"))).toBe(muted);
+
+      // Once the reindex window passes, a read reports another device's later change.
+      const later = performance.now() + MUTE_REINDEX_GRACE_MS;
+      const clock = vi.spyOn(performance, "now").mockReturnValue(later);
+      onTestFinished(() => clock.mockRestore());
       fetchMock.mockResolvedValueOnce(
         mockResponse(
           infinitePage([
@@ -4876,13 +4899,6 @@ describe("mute writes", () => {
         conversation({ id: "conv_other", labels: {} }),
       ]),
     );
-    // Cancellation must not roll back another session's pending preference.
-    void queryClient
-      .fetchQuery({
-        queryKey: ["conversations", "", false],
-        queryFn: () => new Promise<ConversationsInfiniteData>(() => {}),
-      })
-      .catch(() => {});
     onTestFinished(() => queryClient.clear());
     const wrapper = ({ children }: { children: ReactNode }) =>
       createElement(QueryClientProvider, { client: queryClient }, children);
