@@ -9323,6 +9323,24 @@ async def _clear_session_model_override(
         )
 
 
+def _apply_claude_launcher(command: str, args: Sequence[str]) -> tuple[str, list[str]]:
+    """
+    Route the runner's Claude terminal launch through the launcher plugin hook.
+
+    Applies :func:`omnigent.claude_launcher.resolve_claude_launch` after the
+    config / ``OMNIGENT_CLAUDE_PATH`` resolution, mirroring the local-CLI path,
+    so ``OMNIGENT_CLAUDE_LAUNCHER`` selects the same wrapper for terminals the
+    runner creates itself.
+
+    :param command: Command resolved from config, e.g. ``"claude"``.
+    :param args: Fully-augmented Claude CLI args.
+    :returns: The ``(command, args)`` to spawn; identity when no launcher is selected.
+    """
+    from omnigent.claude_launcher import resolve_claude_launch  # noqa: FlagLocalImports
+
+    return resolve_claude_launch(command, list(args))
+
+
 async def _auto_create_claude_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
@@ -10137,6 +10155,11 @@ async def _auto_create_claude_terminal(
     resolved_claude = resolve_cli_binary(launch_command)
     if resolved_claude is not None:
         validate_claude_hook_interpreter_compatibility(resolved_claude)
+    # Let a registered launcher plugin wrap the runner-spawned Claude exactly as
+    # the local-CLI launch does (omnigent.harnesses.claude_native.main), so a
+    # wrapper's process-level setup (auth, cost controls, enforcement hooks)
+    # also applies to daemon/server-created terminals. Identity by default.
+    launch_command, launch_args = _apply_claude_launcher(launch_command, launch_args)
 
     claude_terminal_env_unset = _claude_terminal_env_unset(claude_config)
     claude_auto_memory_env = await _claude_auto_memory_env(agent_spec, server_client)
