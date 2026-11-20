@@ -13556,8 +13556,11 @@ async def _create_session_from_existing_agent(
             ) from exc
     # A sub-agent nothing above configured starts in its parent's current mode.
     if needs_launch_args_from_spec and validated_launch_args is None:
-        validated_launch_args = _inherited_parent_permission_launch_args(
-            _parent_for_routing, selected_harness, own_spec
+        validated_launch_args = await asyncio.to_thread(
+            _inherited_parent_permission_launch_args,
+            _parent_for_routing,
+            selected_harness,
+            own_spec,
         )
 
     # Inherit the creator's mode only when the request, automation and readable spec
