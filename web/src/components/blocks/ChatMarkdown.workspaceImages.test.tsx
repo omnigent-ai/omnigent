@@ -6,6 +6,7 @@ import { ImageLightboxProvider } from "@/components/ImageLightbox";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import type { FileContentResponse } from "@/hooks/useFileContent";
 import type * as workspaceFiles from "@/hooks/useWorkspaceChangedFiles";
+import { captureDownloads } from "@/test/downloadTestHelpers";
 import { BlockRenderer } from "./BlockRenderer";
 import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 
@@ -64,17 +65,6 @@ afterEach(() => {
   URL.revokeObjectURL = ORIGINAL_REVOKE;
   vi.unstubAllGlobals();
 });
-
-/** Record each synthetic download link's `[href, download]` instead of navigating. */
-function captureDownloads(): [string, string][] {
-  const clicked: [string, string][] = [];
-  vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
-    this: HTMLAnchorElement,
-  ) {
-    clicked.push([this.getAttribute("href") ?? "", this.download]);
-  });
-  return clicked;
-}
 
 function renderMarkdown(
   markdown: string,

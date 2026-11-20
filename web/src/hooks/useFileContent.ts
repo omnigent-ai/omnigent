@@ -195,8 +195,16 @@ export async function downloadWorkspaceFile(conversationId: string, path: string
   await downloadApiFile(url, path.split("/").pop() ?? path);
 }
 
-/** Save an app API response's bytes as `filename`; see {@link downloadWorkspaceFile}. */
-async function downloadApiFile(url: string, filename: string): Promise<void> {
+/**
+ * Save an app API response's bytes as `filename`; see {@link downloadWorkspaceFile}.
+ * `typeImageName` adds an image extension from the fetched type; the link path
+ * gets the server's `Content-Disposition` name instead.
+ */
+async function downloadApiFile(
+  url: string,
+  filename: string,
+  typeImageName = false,
+): Promise<void> {
   if (!isDatabricksWorkspace() && !isIOSShell() && !isAndroidShell()) {
     // A direct anchor navigation, so it must carry the deployment subpath the
     // fetch paths get for free via hostFetch/authenticatedFetch. Without it a
@@ -208,7 +216,8 @@ async function downloadApiFile(url: string, filename: string): Promise<void> {
   }
   const res = await authenticatedFetch(url);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  triggerBrowserDownload(await res.blob(), filename);
+  const blob = await res.blob();
+  triggerBrowserDownload(blob, typeImageName ? withImageExtension(filename, blob.type) : filename);
 }
 
 // The page already holds these bytes, so saving them sends no request.
@@ -261,19 +270,13 @@ export function canDownloadImage(
 }
 
 /**
- * Save an image the page is showing.
- *
- * A held `blob`, or a `blob:`/`data:` source, is saved from the bytes already
- * loaded. Any other source is re-read from `apiPath` the way
- * {@link downloadWorkspaceFile} reads a file; a remote URL without one is
- * never fetched. A name without an extension gets one from the image type.
- * Callers offer the action only when {@link canDownloadImage} holds, so the
- * rejection for an unsavable image is a programming error, not a user state.
+ * Save an on-screen image from held bytes, its `blob:`/`data:` source, or its
+ * app API path; never fetches a remote URL.
  *
  * :param src: The source the `<img>` displays.
  * :param filename: The suggested filename for the save dialog.
- * :param source: Other places its bytes can be read from, e.g. an `apiPath`
- *     of ``"/v1/sessions/s/resources/files/f/content"``.
+ * :param source: The held bytes or app API path, e.g. an `apiPath` of
+ *     ``"/v1/sessions/s/resources/files/f/content"``.
  */
 export async function downloadImage(
   src: string,
@@ -289,7 +292,7 @@ export async function downloadImage(
     return;
   }
   if (!isAppApiPath(apiPath)) throw new Error("This image can't be downloaded");
-  await downloadApiFile(apiPath, filename);
+  await downloadApiFile(apiPath, filename, true);
 }
 
 /** How often an on-screen text file is re-read to show other writers' edits. */

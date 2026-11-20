@@ -367,6 +367,25 @@ describe("canDownloadImage", () => {
     expect(canDownloadImage(undefined, { blob: new Blob(["x"]) })).toBe(false);
   });
 
+  it("types an extensionless name from the bytes the Android shell fetches", async () => {
+    vi.mocked(isAndroidShell).mockReturnValueOnce(true);
+    const image = new Blob(["png"], { type: "image/png" });
+    fetchMock.mockResolvedValueOnce(blobResponse(image));
+    const clicked = captureDownloadClicks();
+    vi.stubGlobal("URL", {
+      createObjectURL: vi.fn(() => "blob:fetched"),
+      revokeObjectURL: vi.fn(),
+    });
+
+    await downloadImage("/v1/x", "file_123", {
+      apiPath: "/v1/sessions/s/resources/files/file_123/content",
+    });
+
+    expect(clicked).toEqual([["blob:fetched", "file_123.png"]]);
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
   it("refuses to fetch a source it can't save, without a request", async () => {
     await expect(downloadImage("https://example.com/a.png", "a.png")).rejects.toThrow();
     expect(fetchMock).not.toHaveBeenCalled();

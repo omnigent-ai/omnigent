@@ -40,6 +40,7 @@ vi.mock("@/components/ui/spinner", () => ({
   Spinner: () => <span data-testid="spinner" />,
 }));
 
+import { captureDownloads } from "@/test/downloadTestHelpers";
 import type {
   InlineImage as InlineImageComponent,
   SessionImage as SessionImageComponent,
@@ -71,17 +72,6 @@ afterEach(() => {
   vi.restoreAllMocks();
   isAndroidShell.mockReturnValue(false);
 });
-
-/** Record each synthetic download link's `[href, download]` instead of navigating. */
-function captureDownloads(): [string, string][] {
-  const clicked: [string, string][] = [];
-  vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
-    this: HTMLAnchorElement,
-  ) {
-    clicked.push([this.getAttribute("href") ?? "", this.download]);
-  });
-  return clicked;
-}
 
 describe("SessionImage (standalone, no host fetcher)", () => {
   beforeEach(() => {

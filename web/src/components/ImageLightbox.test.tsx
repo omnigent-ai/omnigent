@@ -27,6 +27,7 @@ vi.mock("@/lib/identity", () => ({
 }));
 vi.mock("sonner", () => ({ toast: { error: toastError } }));
 
+import { captureDownloads } from "@/test/downloadTestHelpers";
 import { ImageLightboxProvider, ZoomableImage } from "./ImageLightbox";
 
 afterEach(cleanup);
@@ -187,17 +188,6 @@ describe("dismissing the lightbox by clicking outside the image", () => {
 });
 
 describe("downloading from the lightbox", () => {
-  /** Record each synthetic download link's `[href, download]` instead of navigating. */
-  function captureDownloads(): [string, string][] {
-    const clicked: [string, string][] = [];
-    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
-      this: HTMLAnchorElement,
-    ) {
-      clicked.push([this.getAttribute("href") ?? "", this.download]);
-    });
-    return clicked;
-  }
-
   function openImage(props: {
     src: string;
     alt?: string;
@@ -216,6 +206,7 @@ describe("downloading from the lightbox", () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
     authenticatedFetch.mockReset();
     isAndroidShell.mockReset().mockReturnValue(false);
     toastError.mockReset();
@@ -260,7 +251,6 @@ describe("downloading from the lightbox", () => {
 
     expect(createObjectURL).toHaveBeenCalledWith(blob);
     expect(clicked).toEqual([["blob:lightbox-copy", "1f3a.png"]]);
-    vi.unstubAllGlobals();
   });
 
   it("sends one request when Download is clicked again while saving", async () => {

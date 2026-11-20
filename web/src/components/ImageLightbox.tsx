@@ -43,16 +43,22 @@ interface LightboxImage {
 
 function ImageDownloadButton({ image, className }: { image: LightboxImage; className?: string }) {
   const [saving, setSaving] = useState(false);
+  // A ref, not state, so two clicks in one frame can't both pass the check.
+  const savingRef = useRef(false);
   const name = image.downloadName || image.alt;
   const save = () => {
-    if (saving) return;
+    if (savingRef.current) return;
+    savingRef.current = true;
     setSaving(true);
     downloadImage(image.src, name || "image", {
       apiPath: image.downloadPath,
       blob: image.downloadBlob,
     })
       .catch(() => toast.error("Download failed"))
-      .finally(() => setSaving(false));
+      .finally(() => {
+        savingRef.current = false;
+        setSaving(false);
+      });
   };
   return (
     // Tests and stories render images without the app root's provider.
