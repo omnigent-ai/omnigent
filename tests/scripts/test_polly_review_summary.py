@@ -1756,17 +1756,15 @@ def test_review_comments_preserve_identity_with_bounded_work(
             context = _HELPERS["_markdown_context"]
             context_calls = 0
             context_bytes = 0
+            visited: set[str] = set()
 
             def checked_context(text: str, **kwargs):
                 nonlocal context_calls, context_bytes
                 context_calls += 1
                 context_bytes += len(text.encode("utf-8"))
-                assert context_calls <= _HELPERS["MAX_REVIEW_PARTS"], (
-                    "Exceeded bounded component context calls"
-                )
-                assert context_bytes <= _HELPERS["RENDER_WORK_BYTE_LIMIT"], (
-                    "Exceeded bounded component context bytes"
-                )
+                if text != composed and not text.startswith("<!--"):
+                    assert text not in visited, "Accepted review prefix was parsed again"
+                    visited.add(text)
                 return context(text, **kwargs)
 
             render_patch.setitem(
@@ -1775,6 +1773,16 @@ def test_review_comments_preserve_identity_with_bounded_work(
                 checked_context,
             )
             comments = _HELPERS["review_comments"](composed, **metadata)
+        assert context_calls <= 2 * len(comments) + 1 + 8, (
+            "Context parsing exceeded the part count plus a bounded retry allowance",
+            context_calls,
+            len(comments),
+        )
+        assert context_bytes <= 8 * len(composed.encode("utf-8")), (
+            "Context parsing exceeded eight input passes",
+            context_bytes,
+            len(composed.encode("utf-8")),
+        )
     else:
         comments = _rendered_comments(composed)
     expected = _HELPERS["split_table_row"](row.strip().strip("|"))
