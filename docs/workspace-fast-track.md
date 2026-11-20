@@ -41,9 +41,32 @@ with the host's message instead.
 
 Go to File and Content search try the workspace API first and fall back to
 their REST routes. Content search is only asked for while the server's
-`workspace_content_search` flag is on. Neither route can stop a search on the
-host once it has started: a search the user abandons runs until it ends on
-its own.
+`workspace_content_search` flag is on; with it off, the server route answers
+`SearchText` with `unimplemented` and leaves it out of `GetCapabilities`.
+Neither route can stop a search on the host once it has started: a search the
+user abandons runs until it ends on its own, at most 20 seconds.
+
+The host answers these in plain Python, listing each in `GetCapabilities` only
+when it can:
+
+| Method | Needs | Notes |
+|---|---|---|
+| `StatPath`, `ReadLinkText` | nothing | A link's own text is returned even when it points outside the workspace; a path whose parent leads outside is refused |
+| `SearchFiles` | `git` | Substring mode only (`search_files.substring`), as the REST file search answers it |
+| `SearchText` | `rg` | The REST content search's ripgrep script, streamed in batches of 100 |
+| `ResolveWorkingCopyBase`, `ListWorkingCopyChanges`, `ReadBaseFile`, `ListRepositoryRefs`, `ListBranchCommits` | `git` | With `revision_comparison` and `branch_commits`. Changes and base reads stay inside the workspace when it is a subfolder of a larger repository; refs and commits are repository-wide |
+| `ResolveRepositoryContext` | `git` | Remotes leave only as host, owner and repository |
+
+The Git it runs goes through one hardened runner
+(`omnigent/host/workspace_git/runner.py`): a clean environment, configuration
+that turns off hooks, fsmonitor, filters, external diff and transports, one
+deadline per call, at most 4 Git processes per host and 2 per repository,
+capped output, and its process group killed and reaped however the call ends.
+It never writes the repository, and never looks inside a submodule: a
+submodule shows only changes to its commit, not to its working tree. Files
+with a `filter` attribute, such as LFS pointers, are listed as filtered and
+not diffed. Directory scopes in both searches are literal workspace paths; a
+scope that is a link or a special file is refused.
 
 ## Turning it on
 
