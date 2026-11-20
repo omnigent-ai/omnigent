@@ -2983,13 +2983,20 @@ async def test_on_runner_connect_logs_deferred_init_events(
     """Reconnect defers idle, archived, and sign-in-refused sessions and logs each reason."""
     from omnigent.entities import Conversation
     from omnigent.runner.routing import RoutedRunner
+    from omnigent.runtime import pending_elicitations
     from omnigent.server.routes import sessions as sessions_routes
 
     app, captured = _build_minimal_app(db_uri, tmp_path, monkeypatch)
     runner_id = "runner_deferred_event_test"
-    idle_id, archived_id, active_id, sign_in_id, failed_id = _bind_sessions(
-        db_uri, runner_id, count=5
-    )
+    (
+        idle_id,
+        archived_id,
+        active_id,
+        sign_in_id,
+        failed_id,
+        stored_approval_id,
+        live_approval_id,
+    ) = _bind_sessions(db_uri, runner_id, count=7)
     store = SqlAlchemyConversationStore(db_uri)
     idle = store.get_conversation(idle_id)
     archived = store.get_conversation(archived_id)
@@ -3002,6 +3009,8 @@ async def test_on_runner_connect_logs_deferred_init_events(
     for session_id, code in (
         (sign_in_id, "databricks_sign_in_pending"),
         (failed_id, "codex_turn_error"),
+        (stored_approval_id, "databricks_sign_in_pending"),
+        (live_approval_id, "databricks_sign_in_pending"),
     ):
         store.set_session_live_status(session_id, "failed")
         store.set_labels(
@@ -3011,14 +3020,21 @@ async def test_on_runner_connect_logs_deferred_init_events(
                 "omnigent.last_task_error_message": "The turn failed.",
             },
         )
+    store.set_pending_elicitation_count(stored_approval_id, 1)
+    pending_elicitations.record_publish(
+        live_approval_id,
+        {"type": "response.elicitation_request", "elicitation_id": "elicit_live"},
+    )
     connection = _attach_live_connection(app, monkeypatch, runner_id)
     monkeypatch.setattr(
         app.state.tunnel_registry, "get", lambda rid: connection if rid == runner_id else None
     )
     routed = RoutedRunner(runner_id=runner_id, client=object())  # type: ignore[arg-type]
     app.state.runner_router.client_for_session_resources = lambda *_a, **_k: routed  # type: ignore[assignment]
+    initialized: list[str] = []
 
     async def _initialize(conv: Conversation, *_a: object, **_k: object) -> httpx.Response:
+        initialized.append(conv.id)
         return httpx.Response(
             201,
             json={"session_init_protocol_version": 2, "terminal_ready": True},
@@ -3034,6 +3050,7 @@ async def test_on_runner_connect_logs_deferred_init_events(
     with caplog.at_level(logging.INFO):
         await captured["callback"](runner_id, connection)  # type: ignore[operator]
 
+    assert set(initialized) == {active.id, failed_id, stored_approval_id, live_approval_id}
     deferred_events = [
         r
         for r in caplog.records
@@ -3066,6 +3083,9 @@ async def test_on_runner_connect_logs_deferred_init_events(
     assert decisions[sign_in_id]["has_last_task_error"] is True
     assert decisions[failed_id]["decision"] == "initialize_now"
     assert decisions[failed_id]["reason"] == "recovery_required"
+    assert decisions[stored_approval_id]["decision"] == "initialize_now"
+    assert decisions[live_approval_id]["decision"] == "initialize_now"
+    assert decisions[live_approval_id]["pending_elicitation_count"] == 1
     for attrs in decisions.values():
         assert attrs["runner_generation"] == 1
         assert attrs["runner_id"] == runner_id
