@@ -26,6 +26,13 @@ import { PageScroll } from "@/components/PageScroll";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { showToast } from "@/components/ui/toast";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
@@ -70,9 +77,17 @@ const FILTER_TABS: { value: FilterTab; label: string }[] = [
   { value: "paused", label: "Paused" },
 ];
 
+type SortOrder = "next_run" | "name";
+
+const SORT_OPTIONS: { value: SortOrder; label: string }[] = [
+  { value: "next_run", label: "Next run" },
+  { value: "name", label: "Name" },
+];
+
 /**
- * The tasks matching the search and Active/Paused filter: ACTIVE first by soonest
- * next run, PAUSED last by name. The server's next run is authoritative (it counts
+ * The tasks matching the search and Active/Paused filter. Sorted by `name`, every
+ * row is alphabetical regardless of state. Sorted by `next_run` (the default):
+ * ACTIVE first by soonest next run, PAUSED last by name. The server's next run is authoritative (it counts
  * COUNT from the task's creation, which the client can't); the local estimate is
  * only a fallback. Active rows with no computable next run sort after the rest.
  */
@@ -80,6 +95,7 @@ function filterAndSortTasks(
   tasks: ScheduledTask[],
   search: string,
   filter: FilterTab,
+  sort: SortOrder = "next_run",
 ): ScheduledTask[] {
   const q = search.trim().toLowerCase();
   const matches = tasks.filter((t) => {
@@ -88,6 +104,9 @@ function filterAndSortTasks(
     if (q && !t.name.toLowerCase().includes(q)) return false;
     return true;
   });
+  if (sort === "name") {
+    return matches.slice().sort((a, b) => a.name.localeCompare(b.name));
+  }
   const nextRunByTaskId = new Map(
     matches
       .filter((t) => t.state === "active")
@@ -129,6 +148,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
 
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<FilterTab>("all");
+  const [sort, setSort] = useState<SortOrder>("next_run");
   const [manualOpen, setManualOpen] = useState(false);
   const [editingTask, setEditingTask] = useState<ScheduledTask | null>(null);
   // Kept after closing so the dialog can animate out.
@@ -213,16 +233,16 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   }
 
   const filtered = useMemo(
-    () => filterAndSortTasks(tasks ?? [], search, filter),
-    [tasks, search, filter],
+    () => filterAndSortTasks(tasks ?? [], search, filter, sort),
+    [tasks, search, filter, sort],
   );
   const sharedTasks = useMemo(
     () => sharedQuery.data?.pages.flatMap((page) => page.tasks) ?? [],
     [sharedQuery.data],
   );
   const sharedFiltered = useMemo(
-    () => filterAndSortTasks(sharedTasks, search, filter),
-    [sharedTasks, search, filter],
+    () => filterAndSortTasks(sharedTasks, search, filter, sort),
+    [sharedTasks, search, filter, sort],
   );
   const {
     hasNextPage: sharedHasMore,
@@ -323,6 +343,8 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
         trackClick(`tasks.filter_${value}`, "button");
         setFilter(value);
       }}
+      sort={sort}
+      onSortChange={setSort}
       showFilters={hasAny}
     />
   );
@@ -571,18 +593,25 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   );
 }
 
-/** The search box and, once there are tasks, the All / Active / Paused filter. */
+/**
+ * The search box and, once there are tasks, the All / Active / Paused filter and
+ * the Next run / Name sort order.
+ */
 function TaskListControls({
   search,
   onSearchChange,
   filter,
   onFilterChange,
+  sort,
+  onSortChange,
   showFilters,
 }: {
   search: string;
   onSearchChange: (value: string) => void;
   filter: FilterTab;
   onFilterChange: (value: FilterTab) => void;
+  sort: SortOrder;
+  onSortChange: (value: SortOrder) => void;
   showFilters: boolean;
 }) {
   return (
@@ -599,24 +628,48 @@ function TaskListControls({
         />
       </div>
       {showFilters && (
-        <div aria-label="Filter automations" className="flex items-center gap-1">
-          {FILTER_TABS.map((tab) => (
-            <button
-              key={tab.value}
-              type="button"
-              aria-pressed={filter === tab.value}
-              data-testid={`tasks-filter-${tab.value}`}
-              onClick={() => onFilterChange(tab.value)}
-              className={cn(
-                "rounded-md px-3 py-1 text-ui font-medium transition-colors",
-                filter === tab.value
-                  ? "bg-muted text-foreground"
-                  : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
-              )}
-            >
-              {tab.label}
-            </button>
-          ))}
+        <div className="flex items-center justify-between gap-2">
+          <div aria-label="Filter automations" className="flex items-center gap-1">
+            {FILTER_TABS.map((tab) => (
+              <button
+                key={tab.value}
+                type="button"
+                aria-pressed={filter === tab.value}
+                data-testid={`tasks-filter-${tab.value}`}
+                onClick={() => onFilterChange(tab.value)}
+                className={cn(
+                  "rounded-md px-3 py-1 text-ui font-medium transition-colors",
+                  filter === tab.value
+                    ? "bg-muted text-foreground"
+                    : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
+                )}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
+          <Select
+            value={sort}
+            onValueChange={(value) => onSortChange(value as SortOrder)}
+            componentId="tasks.sort"
+            valueHasNoPii
+          >
+            <SelectTrigger size="sm" aria-label="Sort automations" data-testid="tasks-sort">
+              <span className="text-muted-foreground">Sort:</span>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent align="end" position="popper">
+              {SORT_OPTIONS.map((option) => (
+                <SelectItem
+                  key={option.value}
+                  value={option.value}
+                  data-testid={`tasks-sort-${option.value}`}
+                >
+                  {option.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
         </div>
       )}
     </div>
