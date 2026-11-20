@@ -6,6 +6,7 @@ import { createConnectTransport } from "@connectrpc/connect-web";
 import { base64Encode } from "@bufbuild/protobuf/wire";
 import type { MessageInitShape } from "@bufbuild/protobuf";
 import {
+  ComparisonKind,
   ContentEncoding,
   EntryType,
   FileSearchMode,
@@ -639,6 +640,11 @@ export function searchTextViaWorkspaceApi(
 // request the host rejects throws its ConnectError, whose message says why.
 const GIT_OPTIONS = { throwAnswers: true } as const;
 
+/** The optional features a comparison relies on: a host may serve the method without them. */
+function comparisonFeatures(comparison: ComparisonInit): string[] {
+  return comparison.kind === ComparisonKind.REVISIONS ? ["revision_comparison"] : [];
+}
+
 /** Resolve a comparison's base and head commits. */
 export function resolveWorkingCopyBaseViaWorkspaceApi(
   sessionId: string,
@@ -653,7 +659,7 @@ export function resolveWorkingCopyBaseViaWorkspaceApi(
       if (!response.base) throw new UnusableAnswerError("The workspace API sent no base");
       return response.base;
     },
-    { ...GIT_OPTIONS, signal },
+    { ...GIT_OPTIONS, signal, features: comparisonFeatures(comparison) },
   );
 }
 
@@ -667,7 +673,7 @@ export function listWorkingCopyChangesViaWorkspaceApi(
     sessionId,
     "listWorkingCopyChanges",
     (client) => client.listWorkingCopyChanges({ comparison }, { signal }),
-    { ...GIT_OPTIONS, signal },
+    { ...GIT_OPTIONS, signal, features: comparisonFeatures(comparison) },
   );
 }
 
@@ -732,7 +738,7 @@ export function listBranchCommitsViaWorkspaceApi(
     sessionId,
     "listBranchCommits",
     (client) => client.listBranchCommits({ baseRevision }, { signal }),
-    { ...GIT_OPTIONS, signal },
+    { ...GIT_OPTIONS, signal, features: ["branch_commits"] },
   );
 }
 

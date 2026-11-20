@@ -1,15 +1,21 @@
 // The workspace API methods the workspace sidebar reads through, with the signatures of
-// the workspace API client. Directory listing, file reads and searches are served today;
-// every other method answers null, meaning no route serves it yet.
+// the workspace API client. Each answers null when no route serves it for the session.
 
 import type { FileContentResponse } from "@/hooks/useFileContent";
 import type { ContentSearchResult } from "@/lib/contentSearch";
 import {
   type FileSearchOptions,
   type FoundEntries,
+  listBranchCommitsViaWorkspaceApi,
   listDirectoryViaWorkspaceApi,
   type ListedEntry,
+  listRepositoryRefsViaWorkspaceApi,
+  listWorkingCopyChangesViaWorkspaceApi,
+  readBaseFileViaWorkspaceApi,
   readFileViaWorkspaceApi,
+  readLinkTextViaWorkspaceApi,
+  resolveRepositoryContextViaWorkspaceApi,
+  resolveWorkingCopyBaseViaWorkspaceApi,
   searchFilesViaWorkspaceApi,
   searchTextViaWorkspaceApi,
   type TextSearchOptions,
@@ -297,21 +303,22 @@ export interface WorkspaceSidebarApi {
   ) => Promise<ResolveRepositoryContextResponse | null>;
 }
 
-const unserved = () => Promise.resolve(null);
-
-/** The methods served today: directory listing, file reads and searches. */
+/**
+ * Every method goes through the workspace API client, which picks the direct or server
+ * route and answers null when no route's host serves the method.
+ */
 export const DEFAULT_WORKSPACE_SIDEBAR_API: WorkspaceSidebarApi = {
   listDirectory: listDirectoryViaWorkspaceApi,
   readFile: readFileViaWorkspaceApi,
   searchFiles: searchFilesViaWorkspaceApi,
   searchText: searchTextViaWorkspaceApi,
-  resolveWorkingCopyBase: unserved,
-  listWorkingCopyChanges: unserved,
-  readBaseFile: unserved,
-  readLinkText: unserved,
-  listRepositoryRefs: unserved,
-  listBranchCommits: unserved,
-  resolveRepositoryContext: unserved,
+  resolveWorkingCopyBase: resolveWorkingCopyBaseViaWorkspaceApi,
+  listWorkingCopyChanges: listWorkingCopyChangesViaWorkspaceApi,
+  readBaseFile: readBaseFileViaWorkspaceApi,
+  readLinkText: readLinkTextViaWorkspaceApi,
+  listRepositoryRefs: listRepositoryRefsViaWorkspaceApi,
+  listBranchCommits: listBranchCommitsViaWorkspaceApi,
+  resolveRepositoryContext: resolveRepositoryContextViaWorkspaceApi,
 };
 
 let currentApi = DEFAULT_WORKSPACE_SIDEBAR_API;
