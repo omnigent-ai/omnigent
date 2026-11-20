@@ -473,7 +473,7 @@ def _check_request(
 async def test_a_runner_live_on_another_replica_skips_the_wait(
     monkeypatch: pytest.MonkeyPatch, own_stamp: bool, hostless: bool
 ) -> None:
-    """A stamp newer than this process wrote means a sibling holds the runner; its own does not."""
+    """A newer sibling stamp skips the wait, even with no host or grace; our own stamp does not."""
     from omnigent.server import session_live_state
     from omnigent.server.routes import sessions as sessions_module
 
@@ -527,12 +527,21 @@ async def test_a_runner_that_moves_during_the_wait_takes_the_answer(
 
 
 @pytest.mark.parametrize(
-    "case", ["still_bound", "runtime_support", "rebound", "row_gone", "row_error", "wrong_replica"]
+    "case",
+    [
+        "still_bound",
+        "runtime_support",
+        "rebound",
+        "row_gone",
+        "row_error",
+        "wrong_replica",
+        "runner_unavailable",
+    ],
 )
 async def test_an_admission_error_after_the_runner_connects_keeps_the_hook(
     monkeypatch: pytest.MonkeyPatch, case: str
 ) -> None:
-    """Admission fails only after the tunnel connected; other errors, or a rebound row, raise."""
+    """An admission error with the row still bound keeps the hook; anything else re-raises."""
     from omnigent.server.runtime_compatibility import RuntimeSupportError
 
     conv = _bound_conv()
@@ -542,9 +551,11 @@ async def test_an_admission_error_after_the_runner_connects_keeps_the_hook(
     elif case == "row_error":
         rows.error = RuntimeError("store down")
     mismatch = ErrorCode.RUNNER_CAPABILITY_MISMATCH
-    error: OmnigentError = OmnigentError(
-        "raised by the wait", code=ErrorCode.WRONG_REPLICA if case == "wrong_replica" else mismatch
-    )
+    other = {
+        "wrong_replica": ErrorCode.WRONG_REPLICA,
+        "runner_unavailable": ErrorCode.RUNNER_UNAVAILABLE,
+    }
+    error: OmnigentError = OmnigentError("raised by the wait", code=other.get(case, mismatch))
     if case == "runtime_support":
         error = RuntimeSupportError("Cannot load /example/agent.yaml", code=ErrorCode.CONFLICT)
 
@@ -565,7 +576,9 @@ async def test_an_admission_error_after_the_runner_connects_keeps_the_hook(
         assert raised.value is error
 
 
-async def test_a_reported_exit_skips_the_offline_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_a_reported_exit_skips_the_host_lookup_and_the_sibling_stamp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A reported runner exit skips the host lookup and the sibling stamp."""
     from omnigent.server.routes import sessions as sessions_module
 

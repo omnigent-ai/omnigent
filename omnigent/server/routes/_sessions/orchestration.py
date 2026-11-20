@@ -3190,9 +3190,9 @@ async def _session_runner_reachable(
     """
     Return whether the runner that asked can still take the answer through its hook.
 
-    True when it is reachable here, live on another replica (its hook, parked here, still waits),
-    or back within the connect grace, also when it then fails admission. The grace gates match
-    routes_events.py; other wait errors propagate.
+    True when it is reachable here, live on another replica, or back within the connect grace
+    even if admission then fails. Other wait errors propagate, as does an admission error for a
+    rebound or missing row. The grace gates match routes_events.py.
     """
     if await _get_runner_client(session_id, runner_router, conversation=conv, for_control=True):
         return True
@@ -3213,7 +3213,7 @@ async def _session_runner_reachable(
     async def fresh_row() -> Conversation | None:
         try:
             return await asyncio.to_thread(store.get_conversation, session_id)
-        except Exception:  # noqa: BLE001 - a failed re-read only means no sibling evidence
+        except Exception:  # noqa: BLE001 - a failed re-read counts as a missing row
             _logger.warning(
                 "Could not re-read session %s for runner %s",
                 session_id,
