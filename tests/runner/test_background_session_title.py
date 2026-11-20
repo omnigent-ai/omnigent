@@ -792,7 +792,7 @@ async def test_background_title_uses_native_codex_without_spawning_headless_harn
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("lookup_stage", ["launch", "server"])
+@pytest.mark.parametrize("lookup_stage", ["launch", "server", "config"])
 @pytest.mark.parametrize("cancel_during_lookup", [False, True])
 async def test_codex_native_title_keeps_loop_responsive_during_profile_resolution(
     monkeypatch: pytest.MonkeyPatch,
@@ -800,7 +800,7 @@ async def test_codex_native_title_keeps_loop_responsive_during_profile_resolutio
     cancel_during_lookup: bool,
     lookup_stage: str,
 ) -> None:
-    """Title preparation must not block unrelated runner tasks on profile lookup."""
+    """Title preparation must not block unrelated runner tasks on profile or file I/O."""
     loop = asyncio.get_running_loop()
     lookup_started = asyncio.Event()
     lookup_release = threading.Event()
@@ -811,6 +811,17 @@ async def test_codex_native_title_keeps_loop_responsive_during_profile_resolutio
         loop.call_soon_threadsafe(lookup_started.set)
         loop_progressed.append(lookup_release.wait(timeout=1.0))
         lookup_finished.set()
+
+    source_config = tmp_path / "config.toml"
+    source_config.write_text('model = "title-test-model"\n')
+    read_text = Path.read_text
+
+    def read_config(path: Path, *args: Any, **kwargs: Any) -> str:
+        if lookup_stage == "config" and path == source_config:
+            wait_for_lookup()
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_config)
 
     def resolve_launch(*, model: str | None, spec: object = None) -> NativeCodexLaunch:
         assert model is None
@@ -859,10 +870,19 @@ async def test_codex_native_title_keeps_loop_responsive_during_profile_resolutio
     try:
         await asyncio.wait_for(lookup_started.wait(), timeout=2.0)
         title_roots = list(tmp_path.glob("omnigent-codex-title-*"))
-        if lookup_stage == "server":
+        if lookup_stage in ("server", "config"):
             assert len(title_roots) == 1
         if cancel_during_lookup:
             task.cancel()
+            if lookup_stage == "config":
+                for _ in range(2):
+                    loop_tick = asyncio.Event()
+                    loop.call_soon(loop_tick.set)
+                    await loop_tick.wait()
+                    assert not task.done(), "cleanup abandoned the configuration writer"
+                    assert title_roots[0].is_dir()
+                    task.cancel()
+                lookup_release.set()
             with pytest.raises(asyncio.CancelledError):
                 await task
         else:
