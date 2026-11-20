@@ -13337,48 +13337,38 @@ def test_model_draft_reads_the_captured_empty_nbsp_composer() -> None:
 
 
 @pytest.mark.parametrize(
-    "prompt_separator", [" ", "\u00a0"], ids=["separator-space", "separator-nbsp"]
-)
-@pytest.mark.parametrize(
-    "draft",
+    ("pane", "draft"),
     [
-        "",
-        "/model",
-        "/status",
-        "\u00a0",
-        "\u00a0owned",
-        " owned",
-        "\towned",
-        "\nowned",
-        "owned\n",
-        "owned \u00a0",
-    ],
-    ids=[
-        "empty",
-        "model-command",
-        "status-command",
-        "one-nbsp",
-        "leading-nbsp",
-        "leading-space",
-        "leading-tab",
-        "leading-newline",
-        "trailing-newline",
-        "trailing-space-nbsp",
+        pytest.param(
+            _SessionModelComposer(draft=draft, prompt_separator=separator)._capture_pane("", ""),
+            draft,
+            id=f"{draft_id}-{separator_id}",
+        )
+        for draft, draft_id in [
+            ("", "empty"),
+            ("/model", "model-command"),
+            ("/status", "status-command"),
+            ("\xa0", "one-nbsp"),
+            ("\xa0owned", "leading-nbsp"),
+            (" owned", "leading-space"),
+            ("\towned", "leading-tab"),
+            ("\nowned", "leading-newline"),
+            ("owned\n", "trailing-newline"),
+            ("owned \xa0", "trailing-space-nbsp"),
+        ]
+        for separator, separator_id in [(" ", "separator-space"), ("\xa0", "separator-nbsp")]
+    ]
+    + [
+        pytest.param(
+            _composer_pane("/model").replace("❯ ", f"❯{prefix}", 1),
+            prefix + "/model",
+            id=case,
+        )
+        for prefix, case in [("\t", "tab"), ("\u2009", "thin-space")]
     ],
 )
-def test_model_draft_preserves_text_after_one_prompt_separator(
-    prompt_separator: str, draft: str
-) -> None:
-    composer = _SessionModelComposer(draft=draft, prompt_separator=prompt_separator)
-
-    assert claude_model_switch._draft(composer._capture_pane("", "")) == draft
-
-
-@pytest.mark.parametrize("prefix", ["\t", "\u2009"], ids=["tab", "thin-space"])
-def test_model_draft_does_not_consume_other_prompt_whitespace(prefix: str) -> None:
-    pane = _composer_pane("/model").replace("❯ ", f"❯{prefix}", 1)
-
-    assert claude_model_switch._draft(pane) == prefix + "/model"
+def test_model_draft_preserves_text_after_one_prompt_separator(pane: str, draft: str) -> None:
+    assert claude_model_switch._draft(pane) == draft
 
 
 def test_model_draft_joins_soft_wraps_without_losing_hard_newlines_or_whitespace() -> None:
@@ -14336,37 +14326,6 @@ def test_model_command_accepts_equivalent_picker_descriptors(
 
 
 @pytest.mark.parametrize(
-    ("requested", "descriptors"),
-    [
-        (
-            "sonnet",
-            (("sonnet", "claude-sonnet-5-5"), ("sonnet", "claude-sonnet-5-4")),
-        ),
-        (
-            "claude-sonnet-5-5",
-            (("sonnet", "system.ai.claude-sonnet-5-5"), ("other", "databricks-claude-sonnet-5-5")),
-        ),
-        ("private-model", (("first", "private-model"), ("second", "private-model"))),
-    ],
-    ids=["different-concrete-models", "different-provider-targets", "no-proven-ordinary-alias"],
-)
-def test_model_target_refuses_descriptors_without_one_proven_ordinary_choice(
-    requested: str, descriptors: tuple[tuple[str, str], ...]
-) -> None:
-    with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused) as caught:
-        claude_model_switch._target(
-            requested,
-            [
-                {"value": value, "model": concrete, "display_name": value, "enabled": True}
-                for value, concrete in descriptors
-            ],
-            [requested],
-            {},
-        )
-    assert caught.value.unsupported
-
-
-@pytest.mark.parametrize(
     ("models", "custom_slot"),
     [
         (("claude-private-A", "claude-private-a"), False),
@@ -14443,47 +14402,9 @@ def test_model_command_selects_the_exact_case_distinct_private_row(
 
 
 @pytest.mark.parametrize(
-    ("requested", "value", "concrete", "pins"),
+    ("requested", "descriptors", "picker_values", "pins"),
     [
-        ("claude-opus-5-5", "private-claude-opus-5-5", "private-claude-opus-5-5", {}),
-        ("Private/model[1M]", "Private/model[1m]", "Private/model[1m]", {}),
-        ("claude-private-A", "claude-private-a", "claude-private-a", {}),
         (
-            "system.ai.claude-private-A",
-            "system.ai.claude-private-a",
-            "system.ai.claude-private-a",
-            {},
-        ),
-        (
-            "databricks-claude-private-A",
-            "databricks-claude-private-a",
-            "databricks-claude-private-a",
-            {},
-        ),
-        ("claude-opus-4-8-Private", "claude-opus-4-8-private", "claude-opus-4-8-private", {}),
-        ("claude-sonnet-5-5", "opusplan", "claude-sonnet-5-5", {}),
-        ("opus[1m]", "opus", "claude-opus-5-5", {}),
-        ("opus", "opus", "claude-opus-4-8", {"ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-5-5"}),
-        ("Private/model", "private/model", "private/model", {}),
-    ],
-    ids=[
-        "private-prefix",
-        "private-context-case",
-        "public-prefix-private-case",
-        "gateway-prefix-private-case",
-        "catalog-prefix-private-case",
-        "public-suffix-private-case",
-        "plan-mode-is-not-an-ordinary-model",
-        "missing-context-variant",
-        "stale-pin-resolution",
-        "private-case",
-    ],
-)
-def test_model_target_refuses_unproven_model_equivalence(
-    requested: str, value: str, concrete: str, pins: dict[str, str]
-) -> None:
-    with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused) as caught:
-        claude_model_switch._target(
             requested,
             [
                 {
@@ -14497,6 +14418,80 @@ def test_model_target_refuses_unproven_model_equivalence(
             [value],
             pins,
         )
+        for requested, value, concrete, pins in [
+            ("claude-opus-5-5", "private-claude-opus-5-5", "private-claude-opus-5-5", {}),
+            ("Private/model[1M]", "Private/model[1m]", "Private/model[1m]", {}),
+            ("claude-private-A", "claude-private-a", "claude-private-a", {}),
+            (
+                "system.ai.claude-private-A",
+                "system.ai.claude-private-a",
+                "system.ai.claude-private-a",
+                {},
+            ),
+            (
+                "databricks-claude-private-A",
+                "databricks-claude-private-a",
+                "databricks-claude-private-a",
+                {},
+            ),
+            ("claude-opus-4-8-Private", "claude-opus-4-8-private", "claude-opus-4-8-private", {}),
+            ("claude-sonnet-5-5", "opusplan", "claude-sonnet-5-5", {}),
+            ("opus[1m]", "opus", "claude-opus-5-5", {}),
+            (
+                "opus",
+                "opus",
+                "claude-opus-4-8",
+                {"ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-5-5"},
+            ),
+            ("Private/model", "private/model", "private/model", {}),
+        ]
+    ]
+    + [
+        (
+            requested,
+            [
+                {"value": value, "model": concrete, "display_name": value, "enabled": True}
+                for value, concrete in descriptors
+            ],
+            [requested],
+            {},
+        )
+        for requested, descriptors in [
+            ("sonnet", [["sonnet", "claude-sonnet-5-5"], ["sonnet", "claude-sonnet-5-4"]]),
+            (
+                "claude-sonnet-5-5",
+                [
+                    ["sonnet", "system.ai.claude-sonnet-5-5"],
+                    ["other", "databricks-claude-sonnet-5-5"],
+                ],
+            ),
+            ("private-model", [["first", "private-model"], ["second", "private-model"]]),
+        ]
+    ],
+    ids=[
+        "private-prefix",
+        "private-context-case",
+        "public-prefix-private-case",
+        "gateway-prefix-private-case",
+        "catalog-prefix-private-case",
+        "public-suffix-private-case",
+        "plan-mode-is-not-an-ordinary-model",
+        "missing-context-variant",
+        "stale-pin-resolution",
+        "private-case",
+        "different-concrete-models",
+        "different-provider-targets",
+        "no-proven-ordinary-alias",
+    ],
+)
+def test_model_target_refuses_unproven_model_equivalence(
+    requested: str,
+    descriptors: list[dict[str, str | bool]],
+    picker_values: list[str],
+    pins: dict[str, str],
+) -> None:
+    with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused) as caught:
+        claude_model_switch._target(requested, descriptors, picker_values, pins)
 
     assert caught.value.unsupported
 

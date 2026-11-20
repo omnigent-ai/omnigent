@@ -193,10 +193,6 @@ def test_claude_routes_the_first_typed_message_exactly_once(
         "turn 2's prompt reached the router; the fast skip must be free"
     )
 
-    wait_for(
-        lambda: (
-            True if claude_settings_unchanged(settings_path, settings_before, session_id) else None
-        ),
-        timeout=10,
-        what=f"{settings_path} to preserve the fields promised by the running CLI version",
+    assert claude_settings_unchanged(settings_path, settings_before, session_id), (
+        f"{settings_path} changed fields promised by the running CLI version"
     )

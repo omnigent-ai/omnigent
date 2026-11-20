@@ -172,10 +172,6 @@ def test_claude_session_create_routes_the_model_and_then_the_spawn(
     )
 
     # Only newer CLIs promise to preserve the saved model default.
-    wait_for(
-        lambda: (
-            True if claude_settings_unchanged(settings_path, settings_before, session_id) else None
-        ),
-        timeout=10,
-        what="Claude settings to preserve the fields promised by the running CLI version",
+    assert claude_settings_unchanged(settings_path, settings_before, session_id), (
+        "Claude settings changed fields promised by the running CLI version"
     )

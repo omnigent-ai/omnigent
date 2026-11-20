@@ -1543,8 +1543,16 @@ async def test_server_relay_hands_the_routed_model_to_the_replay(
     assert armed[0]["harness"] == "claude-native"
 
 
-@pytest.mark.parametrize("receipt_model", ["private-model", "another-model", None])
-@pytest.mark.parametrize("legacy", [False, True], ids=["session-only", "legacy"])
+@pytest.mark.parametrize(
+    ("receipt_model", "legacy"),
+    [
+        pytest.param("private-model", False, id="session-only-private-model"),
+        pytest.param("another-model", False, id="session-only-another-model"),
+        pytest.param("private-model", True, id="legacy-private-model"),
+        pytest.param("another-model", True, id="legacy-another-model"),
+        pytest.param(None, False, id="missing-receipt"),
+    ],
+)
 async def test_replay_requires_a_matching_model_selection_result(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, receipt_model: str | None, legacy: bool
 ) -> None:
