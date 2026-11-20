@@ -3712,14 +3712,8 @@ def register_resources_routes(
         conv = await _validate_session(session_id)
         if not _tunnel_is_local(conv):
             return
-        stored = (
-            await asyncio.to_thread(pull_request_store.read, session_id)
-            if pull_request_store is not None
-            else None
-        )
-        # Outside a git checkout, a synced session without PRs has none to refresh.
-        if conv.git_branch is None and stored is not None and stored.synced and not stored.entries:
-            return
+        # Ask even when the synced list is empty: a session in a repository's main
+        # checkout has no git_branch, and its PR may be opened after the last sync.
         await _github_info(session_id, conv)
 
     if pull_request_refresher is not None and pull_request_store is not None:
