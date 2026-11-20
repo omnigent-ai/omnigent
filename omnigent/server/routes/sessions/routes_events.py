@@ -266,6 +266,7 @@ from omnigent.server.routes._sessions.helpers import (
     require_filesystem_attachment_runtime,
 )
 from omnigent.server.routes._sessions.orchestration import (
+    _await_exit_report,
     _best_effort_stop,
     _cancel_runner_relays,
     _child_session_summaries_from_conversations,
@@ -3876,6 +3877,9 @@ def register_events_routes(
             # runner is bound — item events can't, because that
             # would desync conversation store and harness state.
             if relaunched_runner_id:
+                # The wait can end on a dead status before the runner's exit report arrives.
+                if not relaunched_launch_refused:
+                    await _await_exit_report(relaunched_runner_id, runner_exit_reports)
                 # Name the failed phase to users and log a correlated ERROR.
                 exit_report = (
                     runner_exit_reports.get(relaunched_runner_id)

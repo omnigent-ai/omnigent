@@ -6,6 +6,7 @@ import {
   markConversationUnread,
   resetReadStateForTests,
 } from "./useUnseenConversations";
+import { MUTED_LABEL_KEY } from "@/lib/sessionMute";
 import { useToggleUnreadHotkey } from "./useToggleUnreadHotkey";
 
 const { showToast } = vi.hoisted(() => ({ showToast: vi.fn() }));
@@ -64,7 +65,7 @@ describe("useToggleUnreadHotkey", () => {
   });
 
   it("marks a muted session read but never unread", () => {
-    const muted = { ...SESSION, labels: { "omnigent.muted": "1" } };
+    const muted = { ...SESSION, labels: { [MUTED_LABEL_KEY]: "1" } };
     renderHook(() => useToggleUnreadHotkey(muted, false));
     expect(press().defaultPrevented).toBe(true);
     expect(isExplicitlyUnread("conv-1")).toBe(false);

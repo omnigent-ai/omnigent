@@ -375,7 +375,17 @@ function loadNavigationHarness({
         if (options?.webPreferences?.preload?.endsWith("find_preload.js")) {
           let destroyed = false;
           const bar = Object.assign(new EventEmitter(), {
-            webContents: { send: () => {} },
+            webContents: {
+              sent: [],
+              send: (channel, data) => bar.webContents.sent.push({ channel, data }),
+            },
+            focused: false,
+            isFocused: () => bar.focused,
+            focus: () => {
+              bar.focused = true;
+            },
+            show: () => {},
+            setBounds: () => {},
             isDestroyed: () => destroyed,
             close() {
               destroyed = true;
@@ -721,6 +731,7 @@ function loadNavigationHarness({
     fs.readFileSync(mainPath, "utf8") +
     "\nmodule.exports.sshHosts = sshHosts;" +
     "\nmodule.exports.panelTestApi = { activeWindow, mainWindows, enqueueDeepLink, floatingComposer, floatingComposerPanelIsCurrent, closePanelsOnSignIn, loadSetupPage, beginConnectionAttempt };" +
+    "\nmodule.exports.quitStarted = () => quitConfirmation.quitStarted();" +
     "\nmodule.exports.testApi = { handleDeepLink, buildMenu, openFindBar, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, setBlockedHintDelayMs: (ms) => { blockedHintDelayMs = ms; }, blockedHintDelayMs: () => blockedHintDelayMs, setServerResponseTimeoutMs: (ms) => { serverResponseTimeoutMs = ms; }, serverResponseTimeoutMs: () => serverResponseTimeoutMs, cancelReconnect };";
   const module = { exports: {} };
   const sandbox = {
@@ -754,6 +765,7 @@ function loadNavigationHarness({
   vm.runInNewContext(source, sandbox, { filename: mainPath });
   const api = module.exports.testApi;
   Object.assign(api, module.exports.panelTestApi);
+  api.quitStarted = module.exports.quitStarted;
   api.windows.set(win, {
     origin: new URL(serverUrl).origin,
     serverUrl,
@@ -843,6 +855,7 @@ describe("Arca extend IPC", () => {
         // Managed-feature fixtures simulate macOS on every test host.
         chromeCookieImport: true,
         floatingComposer: true,
+        floatingComposerShortcut: true,
       },
     );
     assert.deepEqual(await extend(event, "overnight"), { ok: true, shutdownAt: null });
@@ -3436,6 +3449,55 @@ describe("navigation fallback wiring (src/main.js)", () => {
   });
 });
 
+describe("a page objecting to leaving (src/main.js)", () => {
+  for (const [button, choice, left] of [
+    ["Leave", 0, true],
+    ["Stay", 1, false],
+  ]) {
+    it(`asks the user, and ${left ? "leaves" : "stays"} on ${button}`, (t) => {
+      const harness = loadNavigationHarness({ registerFallbacks: false });
+      t.after(harness.cleanup);
+      const asked = [];
+      harness.electron.dialog.showMessageBoxSync = (parent, options) => {
+        // Spread: main's arrays are from its own context.
+        asked.push({ parent, buttons: [...options.buttons], detail: options.detail });
+        return choice;
+      };
+      harness.api.createWindow("https://host.example/ml/omnigents");
+      let prevented = false;
+      harness.webContents.emitWith("will-prevent-unload", {
+        preventDefault: () => (prevented = true),
+      });
+      assert.deepEqual(asked, [
+        {
+          parent: harness.win,
+          buttons: ["Leave", "Stay"],
+          detail: "Changes you made may not be saved.",
+        },
+      ]);
+      assert.equal(prevented, left, "preventDefault lets the unload go ahead");
+    });
+  }
+
+  it("leaves without asking once the app is quitting, its cleanup already under way", (t) => {
+    const harness = loadNavigationHarness({ registerFallbacks: false });
+    t.after(harness.cleanup);
+    let asked = 0;
+    harness.electron.dialog.showMessageBoxSync = () => {
+      asked += 1;
+      return 1;
+    };
+    harness.api.createWindow("https://host.example/ml/omnigents");
+    harness.api.quitStarted();
+    let prevented = false;
+    harness.webContents.emitWith("will-prevent-unload", {
+      preventDefault: () => (prevented = true),
+    });
+    assert.equal(asked, 0);
+    assert.equal(prevented, true);
+  });
+});
+
 describe("browser view detach on main-frame navigation (src/main.js)", () => {
   it("detaches the embedded browser view when the shell commits a new document", () => {
     // Regression: the session-expiry watcher reloads the window onto the
@@ -3496,7 +3558,7 @@ describe("window-open policy wiring (src/main.js)", () => {
   it("routes setWindowOpenHandler decisions through decideWindowOpen as live code", () => {
     assert.match(
       liveCode,
-      /setWindowOpenHandler\(\s*\(\{\s*url,\s*disposition,\s*features\s*\}\)\s*=>\s*\{[\s\S]{0,500}decideWindowOpen\(/,
+      /setWindowOpenHandler\(\s*\(\{\s*url,\s*disposition,\s*features(?:,\s*frameName)?\s*\}\)\s*=>\s*\{[\s\S]{0,500}decideWindowOpen\(/,
       [
         "src/main.js no longer passes window.open through decideWindowOpen. Either every",
         "popup is denied (OAuth sign-in breaks) or popups open without the",
@@ -3784,6 +3846,7 @@ describe("floating panel wiring", () => {
     assert.equal(h.calls.globalShortcuts, undefined);
     const event = { sender: h.webContents, senderFrame: { url: h.webContents.getURL() } };
     assert.equal(h.ipc.get("omnigent:get-desktop-features")(event).floatingComposer, false);
+    assert.equal(h.ipc.get("omnigent:get-desktop-features")(event).floatingComposerShortcut, false);
   });
 
   it("Find does nothing while a panel has focus, instead of searching the window behind", (t) => {
@@ -5097,6 +5160,7 @@ describe("browser-view teardown on server change (src/main.js)", () => {
         // Managed-feature fixtures simulate macOS on every test host.
         chromeCookieImport: true,
         floatingComposer: true,
+        floatingComposerShortcut: true,
       },
     );
   });
@@ -6326,6 +6390,144 @@ describe("find bar teardown (src/main.js)", () => {
   });
 });
 
+describe("find bar selection prefill (src/main.js)", () => {
+  function harness(t, selection) {
+    const h = loadNavigationHarness();
+    t.after(h.cleanup);
+    h.webContents.isDestroyed = () => false;
+    h.webContents.stopFindInPage = () => {};
+    h.win.removeListener = () => {};
+    h.win.getContentBounds = () => ({ x: 0, y: 0, width: 1280, height: 860 });
+    const order = [];
+    h.webContents.executeJavaScriptInIsolatedWorld = async () => {
+      order.push("read-selection");
+      return selection.current;
+    };
+    const send = h.webContents.send;
+    h.webContents.send = (channel, data) => {
+      order.push(channel);
+      send(channel, data);
+    };
+    return { h, order };
+  }
+  const prefills = (bar) =>
+    bar.webContents.sent.filter(({ channel }) => channel === "omnigent:find-prefill");
+  const settle = () =>
+    new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+
+  it("fills a new bar with the page's selection once it can receive it", async (t) => {
+    const { h, order } = harness(t, { current: " migration\n" });
+    h.api.openFindBar(h.win);
+    assert.deepEqual(order, ["read-selection", "omnigent:find-opened"]);
+    const bar = h.findBars[0];
+    await settle();
+    assert.deepEqual(prefills(bar), []);
+    bar.emit("ready-to-show");
+    await settle();
+    assert.deepEqual(
+      prefills(bar).map(({ data }) => data.text),
+      ["migration"],
+    );
+  });
+
+  it("leaves a new bar empty without a usable selection", async (t) => {
+    const { h } = harness(t, { current: "" });
+    h.api.openFindBar(h.win);
+    const bar = h.findBars[0];
+    bar.emit("ready-to-show");
+    await settle();
+    assert.deepEqual(prefills(bar), []);
+  });
+
+  it("replaces an open bar's query with a new page selection", async (t) => {
+    const selection = { current: "migration" };
+    const { h } = harness(t, selection);
+    h.api.openFindBar(h.win);
+    const bar = h.findBars[0];
+    bar.emit("ready-to-show");
+    await settle();
+    selection.current = "rollback";
+    h.api.openFindBar(h.win);
+    await settle();
+    assert.equal(h.findBars.length, 1);
+    assert.deepEqual(
+      prefills(bar).map(({ data }) => data.text),
+      ["migration", "rollback"],
+    );
+  });
+
+  it("keeps the query when Cmd/Ctrl+F is pressed inside the bar", async (t) => {
+    const selection = { current: "migration" };
+    const { h, order } = harness(t, selection);
+    h.api.openFindBar(h.win);
+    const bar = h.findBars[0];
+    bar.emit("ready-to-show");
+    await settle();
+    // A slow page read from the chat is still pending when the user, now typing in
+    // the bar, presses Cmd/Ctrl+F there.
+    let finishRead;
+    selection.current = new Promise((resolve) => {
+      finishRead = resolve;
+    });
+    h.api.openFindBar(h.win);
+    bar.focused = true;
+    order.length = 0;
+    h.api.openFindBar(h.win);
+    finishRead("rollback");
+    await settle();
+    assert.deepEqual(order, ["omnigent:find-opened"]);
+    assert.ok(bar.webContents.sent.some(({ channel }) => channel === "omnigent:find-activate"));
+    assert.deepEqual(
+      prefills(bar).map(({ data }) => data.text),
+      ["migration"],
+    );
+  });
+
+  it("fills a bar that is still loading with the latest selection", async (t) => {
+    const selection = { current: "migration" };
+    const { h } = harness(t, selection);
+    h.api.openFindBar(h.win);
+    const bar = h.findBars[0];
+    selection.current = "rollback";
+    h.api.openFindBar(h.win);
+    await settle();
+    assert.deepEqual(prefills(bar), []);
+    bar.emit("ready-to-show");
+    await settle();
+    assert.deepEqual(
+      prefills(bar).map(({ data }) => data.text),
+      ["rollback"],
+    );
+  });
+
+  it("applies only the latest selection when Cmd/Ctrl+F is pressed twice", async (t) => {
+    const selection = { current: "migration" };
+    const { h } = harness(t, selection);
+    h.api.openFindBar(h.win);
+    const bar = h.findBars[0];
+    bar.emit("ready-to-show");
+    await settle();
+    let finishRead;
+    selection.current = new Promise((resolve) => {
+      finishRead = resolve;
+    });
+    h.api.openFindBar(h.win);
+    // The user clicks back into the chat to select another word.
+    bar.focused = false;
+    selection.current = "snapshot";
+    h.api.openFindBar(h.win);
+    await settle();
+    finishRead("rollback");
+    await settle();
+    assert.deepEqual(
+      prefills(bar).map(({ data }) => data.text),
+      ["migration", "snapshot"],
+    );
+  });
+});
+
 describe("server names from the manifest", () => {
   const server = "https://omni.example";
   const setupEvent = (h) => ({
@@ -6714,6 +6916,84 @@ describe("Close menu item", () => {
     clickClose();
     assert.equal(sentCloses(), 1);
     assert.equal(closes, 1);
+  });
+
+  it("names the page whose design tool's overlay holds the keys", (t) => {
+    // A fresh design tools module, whose overlays are views made here.
+    const Module = require("node:module");
+    const load = Module["_load"];
+    class WebContentsView {
+      constructor({ webContents }) {
+        this.webContents = webContents;
+      }
+      setBackgroundColor() {}
+      setBounds() {}
+      setVisible() {}
+    }
+    Module["_load"] = function (request, ...rest) {
+      if (request === "electron") return { WebContentsView };
+      return load.call(this, request, ...rest);
+    };
+    const designToolsPath = require.resolve("../src/designTools");
+    Reflect.deleteProperty(require.cache, designToolsPath);
+    t.after(() => {
+      Module["_load"] = load;
+      Reflect.deleteProperty(require.cache, designToolsPath);
+    });
+    const h = loadNavigationHarness({ serverUrl: server, savedServerUrl: server });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    h.api.createWindow();
+    h.setUrl(server);
+    h.electron.BrowserWindow.getFocusedWindow = () => h.win;
+    h.ipc.get("omnigent:set-desktop-command-state")(
+      { sender: h.webContents, senderFrame: { url: server } },
+      { commands: ["close"] },
+    );
+    h.api.buildMenu();
+    const page = Object.assign(new EventEmitter(), {
+      isFocused: () => false,
+      isDestroyed: () => false,
+      getZoomFactor: () => 1,
+    });
+    const entry = {
+      view: Object.assign(new EventEmitter(), { webContents: page, getBounds: () => null }),
+    };
+    h.api.windows.get(h.win).browserRegistry = {
+      activeConversationId: () => "view-1",
+      get: (id) => (id === "view-1" ? entry : undefined),
+      closeAll: () => {},
+    };
+    const tools = require("../src/designTools").sharedDesignTools();
+    const owner = Object.assign(new EventEmitter(), { isDestroyed: () => false });
+    const host = {
+      webContents: owner,
+      isDestroyed: () => false,
+      contentView: { children: [entry.view], addChildView: () => {}, removeChildView: () => {} },
+    };
+    const { frame, session } = tools.start("view-1", entry, {}, { send: () => {}, owner });
+    t.after(() => tools.stop(entry, session));
+    const overlay = Object.assign(new EventEmitter(), {
+      focusedNow: false,
+      isFocused: () => overlay.focusedNow,
+      isDestroyed: () => false,
+      focus: () => (overlay.focusedNow = true),
+      setWindowOpenHandler: () => {},
+      getZoomFactor: () => 1,
+      setZoomFactor: () => {},
+    });
+    tools
+      .windowOpen(host, { url: "about:blank", frameName: frame })
+      .createWindow({ webContents: overlay, webPreferences: {} });
+    const closeNames = () => {
+      h.calls.progress.length = 0;
+      h.calls.appMenu.getMenuItemById("close").click();
+      return h.calls.progress.find((message) => message.channel === "omnigent:desktop-command")
+        ?.data.browserViewId;
+    };
+    assert.equal(closeNames(), "view-1");
+    overlay.focusedNow = false;
+    assert.equal(closeNames(), null);
   });
 });
 

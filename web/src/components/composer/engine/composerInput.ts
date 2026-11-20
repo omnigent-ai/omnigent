@@ -128,6 +128,12 @@ export type ComposerInputHeightMode = "compact" | "unbounded";
 /** Which engine renders the composer's editable surface. */
 export type ComposerInputEngine = "textarea" | "codemirror";
 
+/** A token the draft holds at `start`. */
+export interface ComposerTokenAt {
+  token: string;
+  start: number;
+}
+
 /** What every input engine accepts: the subset of textarea props the composer uses. */
 export interface ComposerInputProps {
   ref?: Ref<ComposerTextTarget>;
@@ -146,8 +152,8 @@ export interface ComposerInputProps {
   inputId?: string;
   /** Tagged @-mention tokens to present as one unit, such as "@README.md". */
   mentionTokens?: readonly string[];
-  /** The slash command or skill the draft starts with, such as "/context", to tint. */
-  commandToken?: string | null;
+  /** Leading command to tint, such as "/context"; a `{token, start}` pins it to an offset. */
+  commandToken?: string | ComposerTokenAt | null;
   onChange?: (event: ComposerInputEvent) => void;
   onSelect?: (event: ComposerInputEvent) => void;
   onFocus?: (event: ComposerInputEvent) => void;
@@ -168,5 +174,6 @@ export interface ComposerInputProps {
   "aria-activedescendant"?: string;
   "data-testid"?: string;
   "data-slash-command"?: string;
+  "data-shell-command"?: string;
   "data-has-draft"?: string;
 }

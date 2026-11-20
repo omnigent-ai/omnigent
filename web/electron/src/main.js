@@ -39,6 +39,7 @@ const { createConnectionLoading } = require("./connection_loading");
 const { createAboutWindow, resolveAppIconDataUrl } = require("./about_window");
 const { registerFileReveal } = require("./fileReveal");
 const { registerFolderChooser } = require("./folderChooser");
+const { readFindSeed } = require("./findSeed");
 const fs = require("node:fs");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
@@ -81,6 +82,7 @@ const { createBrowserViewRegistry } = require("./browserViewRegistry");
 const { registerBrowserTabsIpc } = require("./browserTabs");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { goBack, goForward, registerBrowserIpc } = require("./browserIpc");
+const { isBrowserViewFocused, sharedDesignTools } = require("./designTools");
 const { arcaTarget, createArcaIdentityStore, isArcaAgentContext } = require("./arcaIdentity");
 const { createHostThisMachineChecker, SESSION_HOST_PROTOCOL } = require("./hostIdentity");
 const { isDeveloperModeEnabled } = require("./developer_mode");
@@ -1738,11 +1740,17 @@ const updater = createDesktopUpdater({
   updatesEnabled: !app.isPackaged || !isDevBuild,
 });
 
+/** What each system-wide shortcut does, as its consent dialog names it. */
+const GLOBAL_SHORTCUT_CONSENT = {
+  show: { question: "show Omnigent", effect: "brings Omnigent to the front" },
+  floatingComposer: { question: "open New Agent", effect: "opens the New Agent panel" },
+};
+
 /**
  * Native consent before a system-wide shortcut registers. The IPC gate only proves the
  * request came from the pinned server's page, not that the user asked for it.
  */
-async function confirmGlobalShortcut(win, accelerator) {
+async function confirmGlobalShortcut(win, accelerator, id = "show") {
   const origin = win ? pinnedOrigin(win) : null;
   if (!origin) return false;
   let host = origin;
@@ -1757,10 +1765,10 @@ async function confirmGlobalShortcut(win, accelerator) {
     type: "question",
     icon: icon.isEmpty() ? undefined : icon,
     title: "Omnigent",
-    message: `Use ${label} to show Omnigent from any app?`,
+    message: `Use ${label} to ${GLOBAL_SHORTCUT_CONSENT[id].question} from any app?`,
     detail:
       `${host} wants to set a system-wide shortcut. While Omnigent is running, pressing ` +
-      `${label} in any app brings Omnigent to the front.\n\nOnly allow servers you trust.`,
+      `${label} in any app ${GLOBAL_SHORTCUT_CONSENT[id].effect}.\n\nOnly allow servers you trust.`,
     buttons: ["Don't Allow", "Allow"],
     defaultId: 0,
     cancelId: 0,
@@ -1818,6 +1826,16 @@ const globalShortcuts = createGlobalShortcuts({
   },
 });
 const globalShowShortcut = globalShortcuts.show;
+
+/** The shortcut a Settings call names, `show` when it names none; null for any other name. */
+function settingsShortcut(id = "show") {
+  // The panel's shortcut exists only where the panel does.
+  if (id === "floatingComposer" && process.platform !== "darwin") return null;
+  // A shortcut the consent dialog can't describe can't be offered.
+  return Object.hasOwn(globalShortcuts, id) && Object.hasOwn(GLOBAL_SHORTCUT_CONSENT, id)
+    ? globalShortcuts[id]
+    : null;
+}
 
 /** Main windows, most recently focused first; a closed one drops out on the next focus. */
 let mainWindowFocusOrder = [];
@@ -2970,6 +2988,26 @@ function createWindow(targetUrl, opts = {}) {
     const state = windows.get(win);
     if (state) state.unresponsive = false;
   });
+  // A page's beforeunload objecting (unsaved changes) cancels a close or reload with no
+  // prompt unless main asks: ask, as a browser would.
+  win.webContents.on("will-prevent-unload", (event) => {
+    // Quitting has already stopped the server, so staying would leave a broken app.
+    if (quitConfirmation.isQuitting()) {
+      event.preventDefault();
+      return;
+    }
+    const choice = dialog.showMessageBoxSync(win, {
+      type: "question",
+      title: "Omnigent",
+      message: "Leave this page?",
+      detail: "Changes you made may not be saved.",
+      buttons: ["Leave", "Stay"],
+      defaultId: 0,
+      cancelId: 1,
+      noLink: true,
+    });
+    if (choice === 0) event.preventDefault();
+  });
   registerWorkspaceRootBounce(win.webContents, () => pinnedOrigin(win));
   // Show the return banner when the window navigates away from its server
   // (e.g. SSO) and stays away. The watch's on-away URL is the last committed
@@ -3018,7 +3056,11 @@ function createWindow(targetUrl, opts = {}) {
   // exception — an OAuth sign-in popup, whose callback needs window.opener
   // and the opener's localStorage — opens as a hardened child window.
   // Conditions in popupPolicy.js; hardening in hardenOauthPopup.
-  win.webContents.setWindowOpenHandler(({ url, disposition, features }) => {
+  win.webContents.setWindowOpenHandler(({ url, disposition, features, frameName }) => {
+    // A design tool's overlay: allowed only as about:blank, from the opening's owner, under
+    // the unclaimed frame name designTools.start issued. Null for any other open.
+    const designOverlay = sharedDesignTools().windowOpen(win, { url, frameName });
+    if (designOverlay) return designOverlay;
     const origin = pinnedOrigin(win);
     if (usesBrowserAuth(origin) && isDatabricksLoginUrl(url, origin)) {
       getDatabricksAuth().recover(win);
@@ -3195,6 +3237,10 @@ function attachContextMenu(win) {
  * @type {Map<BrowserWindow, BrowserWindow>} shell window → its find bar
  */
 const findBars = new Map();
+/** Count of find opens per shell window, so only the latest selection read applies. */
+const findOpenGenerations = new WeakMap();
+/** Per find bar, resolves once it has shown and its page can take a prefill. */
+const findBarsShown = new WeakMap();
 
 /**
  * Anchor a find bar to its parent's top-right content corner. Called at
@@ -3223,13 +3269,26 @@ function positionFindBar(target, bar) {
  * @param {BrowserWindow} target The shell window to search.
  */
 function openFindBar(target) {
+  const existing = findBars.get(target);
+  const isOpen = existing !== undefined && !existing.isDestroyed();
+  const generation = (findOpenGenerations.get(target) ?? 0) + 1;
+  findOpenGenerations.set(target, generation);
+  // Cmd/Ctrl+F from inside the bar keeps its query; from the page, a selection
+  // replaces it. Read before find-opened re-renders the transcript.
+  const seed =
+    isOpen && existing.isFocused() ? Promise.resolve(null) : readFindSeed(target.webContents);
+  // A later open, even from inside the bar, supersedes a read still in flight.
+  const prefill = (bar) =>
+    Promise.all([seed, findBarsShown.get(bar)]).then(([text]) => {
+      if (findOpenGenerations.get(target) === generation) prefillFindBar(bar, text);
+    });
   // The menu item opens the bar without a page keydown; the page must still
   // render every transcript row for find to reach off-screen messages.
   target.webContents.send("omnigent:find-opened");
-  const existing = findBars.get(target);
-  if (existing && !existing.isDestroyed()) {
+  if (isOpen) {
     existing.focus();
     existing.webContents.send("omnigent:find-activate");
+    void prefill(existing);
     return;
   }
   const bar = new BrowserWindow({
@@ -3250,6 +3309,12 @@ function openFindBar(target) {
     },
   });
   findBars.set(target, bar);
+  findBarsShown.set(
+    bar,
+    new Promise((resolve) => {
+      bar.once("ready-to-show", resolve);
+    }),
+  );
   void bar.loadFile(FIND_PAGE);
 
   const reposition = () => positionFindBar(target, bar);
@@ -3274,6 +3339,7 @@ function openFindBar(target) {
     reposition();
     bar.show();
   });
+  void prefill(bar);
   bar.on("closed", () => {
     findBars.delete(target);
     if (target.isDestroyed()) return;
@@ -3287,6 +3353,12 @@ function openFindBar(target) {
     target.webContents.stopFindInPage("clearSelection");
     target.focus();
   });
+}
+
+// Make the page's selected text the bar's query; a null seed leaves the bar as is.
+function prefillFindBar(bar, text) {
+  if (text === null || bar.isDestroyed()) return;
+  bar.webContents.send("omnigent:find-prefill", { text });
 }
 
 /** The conversation a shell URL shows, or null. Routes end in `/c/<id>` after any mount. */
@@ -4524,6 +4596,7 @@ function createBrowserRegistryForWindow(win) {
     resolveProxy: (url, partition) => session.fromPartition(partition).resolveProxy(url),
     onSuppressionChange: (suppressed) => {
       if (suppressed) browserPermissionPrompt.dismiss(win);
+      sharedDesignTools().visibilityChanged(win);
     },
     allowsLocalhost: (context) => {
       if (context?.revoked || win.isDestroyed() || !pinnedOrigin(win)) return false;
@@ -4542,8 +4615,13 @@ function createBrowserRegistryForWindow(win) {
     attachToHost: (view) => {
       win.contentView.addChildView(view);
       reconnectOverlay.raise(win);
+      // A design tool's overlay goes back just above its page (below the reconnect overlay).
+      sharedDesignTools().viewAttached(win, view);
     },
-    detachFromHost: (view) => win.contentView.removeChildView(view),
+    detachFromHost: (view) => {
+      win.contentView.removeChildView(view);
+      sharedDesignTools().viewDetached(win, view);
+    },
     sendToRenderer: (channel, payload) => {
       if (channel === "browser-host-active-changed") browserPermissionPrompt.dismiss(win);
       try {
@@ -5201,32 +5279,39 @@ function registerIpc() {
     return true;
   });
 
-  // Settings → "Show Omnigent from anywhere" (opt-in, system-wide shortcut).
-  ipcMain.handle("omnigent:get-global-shortcut", (event) => {
+  // Settings → "Show Omnigent from anywhere" and the New Agent panel's shortcut, by id.
+  const requireSettingsShortcut = (id) => {
+    const shortcut = settingsShortcut(id);
+    if (!shortcut) throw new Error(`Unknown global shortcut: ${id}`);
+    return shortcut;
+  };
+  ipcMain.handle("omnigent:get-global-shortcut", (event, id) => {
     if (!isPinnedOriginSender(event)) {
       throw new Error("get-global-shortcut is only available to a connected server page");
     }
-    return globalShowShortcut.current();
+    return requireSettingsShortcut(id).current();
   });
-  ipcMain.handle("omnigent:set-global-shortcut", (event, setting) => {
+  ipcMain.handle("omnigent:set-global-shortcut", (event, setting, id = "show") => {
     if (!isPinnedOriginSender(event)) {
       throw new Error("set-global-shortcut is only available to a connected server page");
     }
+    const shortcut = requireSettingsShortcut(id);
     const win = BrowserWindow.fromWebContents(event.sender);
-    return globalShowShortcut.set(setting, (accelerator) =>
-      confirmGlobalShortcut(win, accelerator),
-    );
+    return shortcut.set(setting, (accelerator) => confirmGlobalShortcut(win, accelerator, id));
   });
   // The Settings recorder takes the next chord here, ahead of the page's shortcuts and the menu.
-  ipcMain.handle("omnigent:record-global-shortcut", (event) => {
+  ipcMain.handle("omnigent:record-global-shortcut", (event, id) => {
     if (!isPinnedOriginSender(event)) {
       throw new Error("record-global-shortcut is only available to a connected server page");
     }
-    return globalShowShortcut.record(event.sender);
+    const shortcut = requireSettingsShortcut(id);
+    // Each shortcut ends only its own recording, so end them all before this one takes the keys.
+    for (const other of Object.values(globalShortcuts)) other.cancelRecording();
+    return shortcut.record(event.sender);
   });
   ipcMain.handle("omnigent:cancel-global-shortcut-recording", (event) => {
     if (!isPinnedOriginSender(event)) return false;
-    globalShowShortcut.cancelRecording();
+    for (const shortcut of Object.values(globalShortcuts)) shortcut.cancelRecording();
     return true;
   });
 
@@ -5708,6 +5793,8 @@ function registerIpc() {
       chromeCookieImport: process.platform === "darwin",
       // The floating New Agent panel is a macOS panel window.
       floatingComposer: process.platform === "darwin",
+      // Settings can read and change the panel's shortcut by id.
+      floatingComposerShortcut: process.platform === "darwin",
     };
   });
 
@@ -6173,7 +6260,7 @@ function sendDesktopCommand(win, command, extra = {}) {
 
 /**
  * The embedded browser view (by view ID) holding keyboard focus in `win`, or
- * null. Only the attached view can hold focus, so checking it is enough.
+ * null. Only the attached view (or its design tool's overlay) can hold focus.
  *
  * @param {BrowserWindow} win
  * @returns {string | null}
@@ -6183,7 +6270,7 @@ function focusedBrowserViewId(win) {
   const viewId = registry?.activeConversationId() ?? null;
   if (viewId === null) return null;
   try {
-    return registry.get(viewId)?.view.webContents.isFocused() ? viewId : null;
+    return isBrowserViewFocused(registry.get(viewId)) ? viewId : null;
   } catch {
     return null;
   }

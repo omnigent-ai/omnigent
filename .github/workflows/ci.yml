@@ -4,11 +4,15 @@ name: CI
 # split across directory-based matrix groups (runtime-*, server-*, inner-rest,
 # tools, repl-sdk, spec-llms, runner-app, stores, db, harnesses, misc) so slow
 # files don't bottleneck one runner; the slowest groups use `--dist=worksteal`
-# to fan tests out within a file. The `misc` group is a catch-all so new
+# to fan tests out within a file. `server-integration-core` and `stores-core`
+# take the slowest files out of `server-integration` and `stores`; new files in
+# those directories stay on the original lane. The `misc` group is a catch-all so new
 # top-level tests/<dir>/ are picked up automatically (it ignores the dirs that
 # have their own group). When Python tests run, `ci-tooling` (tests/scripts) is
 # kept only if the PR touches CI, release or dev tooling or a manifest (see
 # dependency_scope.py); push, scheduled and manual runs always include it.
+# Dialect lanes run on a PR only when dependency_scope.py marks the diff
+# as database-relevant. Push, scheduled and manual runs always run them.
 # Draft PRs are skipped (ready_for_review re-fires the workflow).
 # A `coverage-report` job combines per-shard coverage for code-coverage.yml.
 

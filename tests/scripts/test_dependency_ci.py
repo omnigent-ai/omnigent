@@ -203,10 +203,95 @@ def test_configuration_changes_keep_full_coverage(scope_module, path, before, af
     )
     assert selection["dependency"] == "false"
     assert selection["ui"] == "full"
-    assert selection["database"] == "true"
+    assert (
+        selection["database"]
+        == str(path in {"pyproject.toml", ".github/workflows/ci.yml"}).lower()
+    )
     assert json.loads(selection["python_matrix"])["include"] == json.loads(
         (CI / "python-matrix.json").read_text()
     )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "omnigent/stores/host_store.py",
+        "omnigent/connections/github/__init__.py",
+        "omnigent/server/accounts_store.py",
+        "omnigent/server/device_grant_store.py",
+        "omnigent/server/host_session_recovery.py",
+        "omnigent/server/journal_markers.py",
+        "omnigent/server/routes/_sessions/helpers.py",
+        "omnigent/server/session_families.py",
+        "omnigent/server/session_live_state.py",
+        "omnigent/util/uuid.py",
+        "omnigent/entities/comment.py",
+        "omnigent/db/db_models.py",
+        "omnigent/db/migrations/versions/new_migration.py",
+        "omnigent/db/alembic.ini",
+        "omnigent/db/utils.py",
+        "tests/stores/test_host_store.py",
+        "tests/db/test_utils.py",
+        "tests/conftest.py",
+        "deploy/cockroachdb/docker-compose.yml",
+        ".github/workflows/ci.yml",
+        ".github/scripts/ci/dependency_scope.py",
+        ".github/scripts/ci/require_results.py",
+        ".github/actions/dependency-ci-scope/action.yml",
+        ".github/actions/setup-uv/action.yml",
+        ".python-version",
+        "uv.lock",
+        "pyproject.toml",
+    ],
+)
+def test_database_paths_run_dialect_lanes(scope_module, path):
+    selection = scope_module.select_scope([{"filename": path, "status": "modified"}])
+    assert selection["database"] == "true"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "omnigent/server/app.py",
+        "omnigent/server/auth.py",
+        "omnigent/server/scheduled/schedule.py",
+        "omnigent/entities/agent.py",
+        "omnigent/runtime/policies/engine.py",
+        "omnigent/repl/app.py",
+        "web/src/App.tsx",
+        "README.md",
+        "deploy/docker/Dockerfile",
+    ],
+)
+def test_unrelated_changes_skip_dialect_lanes(scope_module, path):
+    selection = scope_module.select_scope([{"filename": path, "status": "modified"}])
+    assert selection["database"] == "false"
+    assert selection["backend"] == "true"
+
+
+def test_added_store_file_runs_dialect_lanes(scope_module):
+    selection = scope_module.select_scope(
+        [{"filename": "omnigent/stores/new_store.py", "status": "A"}]
+    )
+    assert selection["database"] == "true"
+
+
+def test_added_unrelated_file_skips_dialect_lanes(scope_module):
+    selection = scope_module.select_scope(
+        [{"filename": "omnigent/server/new_route.py", "status": "A"}]
+    )
+    assert selection["database"] == "false"
+    assert selection["backend"] == "true"
+
+
+def test_database_path_among_unrelated_changes_runs_dialect_lanes(scope_module):
+    selection = scope_module.select_scope(
+        [
+            {"filename": "omnigent/server/app.py", "status": "modified"},
+            {"filename": "omnigent/stores/host_store.py", "status": "modified"},
+        ]
+    )
+    assert selection["database"] == "true"
 
 
 @pytest.mark.parametrize(
@@ -250,6 +335,110 @@ def test_ci_tooling_tests_leave_the_catch_all_shard():
     }
     assert groups["ci-tooling"] == ["tests/scripts"]
     assert "--ignore=tests/scripts" in groups["misc"]
+
+
+def _pytest_matrix() -> list[dict[str, Any]]:
+    return json.loads((CI / "python-matrix.json").read_text())
+
+
+def _matrix_tokens(paths: str) -> tuple[list[str], list[str]]:
+    roots: list[str] = []
+    ignored: list[str] = []
+    for token in paths.split():
+        if token.startswith("--ignore="):
+            ignored.append(token.removeprefix("--ignore="))
+        else:
+            assert not token.startswith("-"), token
+            roots.append(token)
+    return roots, ignored
+
+
+def _is_test_file(path: Path) -> bool:
+    return path.is_file() and (path.name.startswith("test_") or path.name.endswith("_test.py"))
+
+
+def _covers(root: str, rel: str) -> bool:
+    return rel == root or rel.startswith(root.rstrip("/") + "/")
+
+
+def _collected_matrix_files(paths: str) -> set[str]:
+    """Test files pytest collects from a matrix `paths` string."""
+    roots, ignored = _matrix_tokens(paths)
+    collected: set[str] = set()
+    for root in roots:
+        path = ROOT / root
+        assert path.exists(), root
+        candidates = [path] if path.is_file() else list(path.rglob("*.py"))
+        for candidate in candidates:
+            if not _is_test_file(candidate):
+                continue
+            rel = candidate.relative_to(ROOT).as_posix()
+            if any(_covers(item, rel) for item in ignored):
+                continue
+            collected.add(rel)
+    return collected
+
+
+def test_each_test_path_belongs_to_one_pytest_group(scope_module):
+    """Default shards partition test files; the databricks mark is a second pass."""
+    matrix = _pytest_matrix()
+    assert len({row["group"] for row in matrix}) == len(matrix)
+    rows = [row for row in matrix if row.get("markexpr") != "databricks"]
+    owner: dict[str, str] = {}
+    for row in rows:
+        for rel in _collected_matrix_files(row["paths"]):
+            assert rel not in owner, f"{rel} is in {owner[rel]} and {row['group']}"
+            owner[rel] = row["group"]
+
+    for directory in ("tests/server/integration", "tests/stores"):
+        files = {
+            path.relative_to(ROOT).as_posix()
+            for path in (ROOT / directory).rglob("*.py")
+            if _is_test_file(path)
+        }
+        missing = sorted(files - owner.keys())
+        assert not missing, f"{directory} files missing from the matrix: {missing}"
+        assert files == {rel for rel in owner if _covers(directory, rel)}
+
+    for row in rows:
+        _roots, ignored = _matrix_tokens(row["paths"])
+        for item in ignored:
+            if not (ROOT / item).is_file():
+                continue
+            assert owner.get(item) not in {None, row["group"]}, item
+
+    databricks = next(row for row in matrix if row.get("markexpr") == "databricks")
+    assert _collected_matrix_files(databricks["paths"]) <= owner.keys()
+
+    by_name = {row["group"]: row for row in matrix}
+    core = by_name["server-integration-core"]
+    integration = by_name["server-integration"]
+    assert core["workers"] == integration["workers"]
+    assert core["dist"] == integration["dist"]
+    assert "workers" not in by_name["stores"] and "workers" not in by_name["stores-core"]
+    assert by_name["stores-core"]["dist"] == by_name["stores"]["dist"]
+
+    selection = scope_module.select_scope(
+        [{"filename": "omnigent/stores/host_store.py", "status": "modified"}]
+    )
+    selected = {row["group"] for row in json.loads(selection["python_matrix"])["include"]}
+    assert {
+        "server-integration",
+        "server-integration-core",
+        "stores",
+        "stores-core",
+    } <= selected
+
+    workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+    assert (
+        workflow["jobs"]["pytest"]["strategy"]["matrix"]
+        == "${{ fromJSON(needs.scope.outputs.python_matrix) }}"
+    )
+    assert "pytest" in workflow["jobs"]["result"]["needs"]
+    required = (ROOT / ".github/scripts/merge-ready/required.sh").read_text()
+    for name in ("stores", "server-rest"):
+        assert f'"Pytest ({name})"' in required
+        assert name in by_name
 
 
 def test_gradle_wrapper_bundle_keeps_the_android_profile(scope_module):
@@ -596,6 +785,9 @@ def test_unknown_or_non_pr_input_keeps_full_coverage(tmp_path, merged_repo, faul
     )
     assert scope["backend"] == scope["e2e"] == scope["omnidev"] == scope["sidecar"] == "true"
     assert scope["ui"] == "full"
+    assert scope["database"] == str(fault not in {"deleted", "renamed"}).lower()
+    if fault in {"push", "schedule", "workflow_dispatch"}:
+        assert scope["reason"] == "Push, scheduled and manual runs use full CI"
 
 
 def test_workflows_connect_selection_to_jobs():
@@ -639,6 +831,26 @@ def test_workflows_connect_selection_to_jobs():
     for name in ("Install other workspace dependencies", "Test and build workspace consumers"):
         step = next(step for step in web_steps if step.get("name") == name)
         assert "if" not in step
+    assert workflows["web-tests"]["jobs"]["web-test"]["name"] == "web test"
+    coverage = next(step for step in web_steps if step.get("name") == "Run tests with coverage")
+    assert coverage["if"] == "github.event_name == 'push'"
+    assert "test:coverage" in coverage["run"]
+    for name in ("Summarize coverage", "Upload UI coverage summary"):
+        step = next(step for step in web_steps if step.get("name") == name)
+        assert step["if"] == "always() && github.event_name == 'push'"
+    vitest = workflows["web-tests"]["jobs"]["web-vitest"]
+    assert vitest["needs"] == "scope"
+    assert vitest["if"] == (
+        "${{ github.event_name == 'pull_request' && !github.event.pull_request.draft "
+        "&& needs.scope.outputs.web == 'true' }}"
+    )
+    assert vitest["strategy"]["fail-fast"] is False
+    assert vitest["strategy"]["matrix"]["shard"] == [1, 2, 3, 4]
+    vitest_run = next(step["run"] for step in vitest["steps"] if step.get("name") == "Run tests")
+    # pnpm's `--` is forwarded to Vitest and disables --shard. exec must pass it.
+    assert vitest_run == (
+        "pnpm --filter web exec vitest run --shard=${{ matrix.shard }}/${{ strategy.job-total }}"
+    )
     e2e_steps = workflows["e2e"]["jobs"]["e2e"]["steps"]
     e2e_run = next(step for step in e2e_steps if step.get("uses") == "./.github/actions/e2e-run")
     action = yaml.safe_load((ROOT / ".github/actions/e2e-run/action.yml").read_text())
@@ -768,6 +980,8 @@ def test_workflows_connect_selection_to_jobs():
         validate = result["steps"][-1]
         assert validate["env"]["NEEDS"] == "${{ toJSON(needs) }}"
         assert validate["run"] == f"python3 .github/scripts/ci/require_results.py {suite}"
+        if suite == "web":
+            assert validate["env"]["EVENT_NAME"] == "${{ github.event_name }}"
 
 
 def _run_merge_gate(

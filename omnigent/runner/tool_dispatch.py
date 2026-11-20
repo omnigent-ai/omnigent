@@ -5338,7 +5338,9 @@ _SCHEDULED_TASK_GATED_FIELDS = (
 
 
 async def _scheduled_task_session_fields_refusal(
-    server_client: httpx.AsyncClient, tool_name: str, payload: _JsonObject
+    get_info: Callable[[], Awaitable[httpx.Response]],
+    tool_name: str,
+    payload: _JsonObject,
 ) -> str | None:
     """An error for optional fields this server would reject, or ``None`` to send them.
 
@@ -5353,7 +5355,7 @@ async def _scheduled_task_session_fields_refusal(
     ]
     if not gated:
         return None
-    info = await server_client.get("/v1/info", timeout=30.0)
+    info = await get_info()
     advertised = info.json() if info.status_code < 400 else {}
     for capability, reason in gated:
         if advertised.get(capability) is not True:
@@ -5626,11 +5628,22 @@ async def _execute_scheduled_task_tool(
         {ORCHESTRATION_SOURCE_HEADER: conversation_id} if conversation_id is not None else None
     )
 
+    info: httpx.Response | None = None
+
+    async def get_server_info() -> httpx.Response:
+        nonlocal info
+        if info is None:
+            info = await server_client.get("/v1/info", timeout=30.0)
+        return info
+
     try:
         if wants_project:
             # Older servers reject the field; refuse before creating a project for it.
-            info = await server_client.get("/v1/info", timeout=30.0)
-            if info.status_code >= 400 or info.json().get("scheduled_task_projects") is not True:
+            project_info = await get_server_info()
+            if (
+                project_info.status_code >= 400
+                or project_info.json().get("scheduled_task_projects") is not True
+            ):
                 return json.dumps(
                     {
                         "error": f"{tool_name}: this server does not support automation "
@@ -5646,10 +5659,24 @@ async def _execute_scheduled_task_tool(
         elif tool_name == "sys_scheduled_task_create":
             payload = {k: args[k] for k in _SCHEDULED_TASK_CREATE_FIELDS if k in args}
             refusal = await _scheduled_task_session_fields_refusal(
-                server_client, tool_name, payload
+                get_server_info, tool_name, payload
             )
             if refusal is not None:
                 return refusal
+            if payload.get("timezone") is None:
+                try:
+                    timezone_info = await get_server_info()
+                    advertised = timezone_info.json() if timezone_info.status_code < 400 else {}
+                except (httpx.HTTPError, ValueError):
+                    advertised = {}
+                if (
+                    isinstance(advertised, dict)
+                    and advertised.get("scheduled_task_default_timezone") is True
+                ):
+                    payload["timezone"] = None
+                else:
+                    # Older servers reject null; retain their omitted-field UTC default.
+                    payload.pop("timezone", None)
             if project_name is not None:
                 payload["project_id"] = await _project_id_for_name(server_client, project_name)
             resp = await server_client.post(
@@ -5675,7 +5702,7 @@ async def _execute_scheduled_task_tool(
             else:
                 payload = {k: args[k] for k in _SCHEDULED_TASK_UPDATE_FIELDS if k in args}
                 refusal = await _scheduled_task_session_fields_refusal(
-                    server_client, tool_name, payload
+                    get_server_info, tool_name, payload
                 )
                 if refusal is not None:
                     return refusal

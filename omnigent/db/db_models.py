@@ -1669,6 +1669,8 @@ class SqlScheduledTask(OmnigentBase):
         ``reminder`` (2), a one-time message an agent set for its own session.
         Clients use it to list reminders apart from automations; scheduling
         and firing do not depend on it.
+    :param smart_routing: Whether the task's runs use Smart Routing instead of
+        a fixed model: on (1) or off (2). ``None`` until the owner chooses.
     :param created_at: Unix epoch seconds at row creation.
     :param updated_at: Unix epoch seconds of the last write, or ``None`` if the
         row has never been updated.
@@ -1754,6 +1756,8 @@ class SqlScheduledTask(OmnigentBase):
     # Stable int code: automation=1, reminder=2. Defaults to automation so
     # existing tasks keep listing as automations.
     kind: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="1")
+    # Stable int code: on=1, off=2. NULL keeps "never chosen" apart from off.
+    smart_routing: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     created_at: Mapped[int] = mapped_column(BigInteger)
     updated_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
@@ -1762,6 +1766,7 @@ class SqlScheduledTask(OmnigentBase):
         CheckConstraint("execution_target IN (1, 2)", name="ck_scheduled_tasks_execution_target"),
         CheckConstraint("session_mode IN (1, 2)", name="ck_scheduled_tasks_session_mode"),
         CheckConstraint("kind IN (1, 2)", name="ck_scheduled_tasks_kind"),
+        CheckConstraint("smart_routing IN (1, 2)", name="ck_scheduled_tasks_smart_routing"),
         Index("ix_scheduled_tasks_due", "state", "next_run_at", "workspace_id", "id"),
         # Covers a user's task listing ordered by creation time.
         Index(

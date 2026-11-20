@@ -2,6 +2,7 @@ import {
   useNestedSessionDrafts,
   withNestedSessionDrafts,
   removeNestedSessionDraft,
+  discardNestedSessionDraft,
   nestedSessionSidebarKey,
 } from "@/lib/nestedSessionDrafts";
 import {
@@ -22,7 +23,7 @@ import {
   useProjectFolderPageSize,
 } from "@/lib/projectFolderPaginationPreferences";
 import { useSessionRowQuickActions } from "@/lib/sessionRowQuickActionsPreferences";
-import { useCuratedOutHarnesses } from "@/hooks/useCuratedOutHarnesses";
+import { offersAnyHarness, useCuratedOutHarnesses } from "@/hooks/useCuratedOutHarnesses";
 import { useInertRef } from "@/hooks/useInertRef";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { useMenuGuardedTooltip } from "@/hooks/useMenuGuardedTooltip";
@@ -245,7 +246,7 @@ import {
 import { collectUnreadInboxItems } from "@/lib/inbox";
 import { cn } from "@/lib/utils";
 import { useOmnigentAnalytics } from "@/lib/analytics";
-import { DESKTOP_VIEWPORT_QUERY, useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { isDesktopLayout, useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import {
   isSideBySideSidebarViewport,
   useIsSideBySideSidebarViewport,
@@ -323,7 +324,7 @@ import {
 import { SidebarServerPicker } from "./SidebarServerPicker";
 import { isRowFullyVisible } from "./sidebarRowVisibility";
 import { useHarnessLabels } from "@/lib/agentLabels";
-import { NATIVE_CODING_AGENTS, nativeCodingAgentForSession } from "@/lib/nativeCodingAgents";
+import { nativeCodingAgentForSession } from "@/lib/nativeCodingAgents";
 import { usePullRequestInfo } from "@/hooks/usePullRequests";
 import {
   getPullRequestStatus,
@@ -1365,7 +1366,7 @@ function SidebarImpl({
           <SettingsSidebar
             onNavClick={onNavClick}
             onCollapse={sideBySide ? onClose : undefined}
-            harnessesOffered={curatedOutHarnesses.size < NATIVE_CODING_AGENTS.length}
+            harnessesOffered={offersAnyHarness(curatedOutHarnesses)}
             onNavigate={onSearchNavigate}
           />
         ) : (
@@ -1561,7 +1562,12 @@ function SidebarImpl({
                         inboxCountIncomplete,
                         inboxCountCapped,
                       )}
-                      className="ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-primary-cta px-1 text-sm text-primary-cta-foreground tabular-nums"
+                      className={cn(
+                        "ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[0.75em] font-medium text-[var(--sidebar-active-foreground)] tabular-nums",
+                        // The active Inbox row already paints the --sidebar-active wash;
+                        // repainting it on the badge would double-composite to a darker fill.
+                        isInboxPage ? "bg-transparent" : "bg-[var(--sidebar-active)]",
+                      )}
                     >
                       {inboxCount > 0 ? inboxCount : ""}
                       {inboxCountIncomplete || inboxCountCapped ? "+" : ""}
@@ -4833,6 +4839,12 @@ function ConversationSection({
   /** The rows list, for a project folder's Show more slide. */
   listRef?: RefObject<HTMLUListElement | null>;
 }) {
+  const location = useLocation();
+  const rebasePath = useRebasePath();
+  const activeDraftSourceId =
+    location.pathname === rebasePath("/")
+      ? new URLSearchParams(location.search).get("sibling")
+      : null;
   // An untitled section is always open — there's no header to collapse it.
   const isCollapsed = title != null && collapsed;
   const rows = isCollapsed ? (heldConversations ?? []) : conversations;
@@ -4985,7 +4997,7 @@ function ConversationSection({
                   onToggleFamily={() => onToggleFamily(conv.family!.id)}
                   isActive={
                     conv.id === activeConversationId ||
-                    !!conv.nested_draft_source_id ||
+                    conv.nested_draft_source_id === activeDraftSourceId ||
                     conv.project_draft_name !== undefined
                   }
                   inActiveGrid={gridMembers.has(conv.id)}
@@ -5972,6 +5984,7 @@ function ConversationRowImpl({
   const sessionShortcuts = isActive ? desktopCommands : NO_DESKTOP_COMMANDS;
   const hostsById = useContext(HostsByIdContext);
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   // A client-only `temp:` row (navigate-first create window): no server session
   // yet, so per-row mutations are disabled until it's rekeyed to the real id —
   // otherwise they'd POST to `/v1/sessions/temp:*`. The row still navigates.
@@ -6518,11 +6531,9 @@ function ConversationRowImpl({
     </div>
   );
 
-  // Provisional (`temp:`) row: navigable, but no mutating affordances (kebab,
-  // context menu, pin, archive, drag) until the real session exists — those
-  // would POST to `/v1/sessions/temp:*`. Rekey to the real id (`hydrateLocal-
-  // Conversation`) drops `provisional` and the full row renders.
+  // Provisional rows only support local actions until the session exists.
   if (isProvisionalRow) {
+    const draftSourceId = conversation.nested_draft_source_id;
     return (
       <li
         ref={rowRef}
@@ -6531,7 +6542,26 @@ function ConversationRowImpl({
         className={cn("group relative", familyIndented && "ml-6")}
       >
         {familyIndented && <span aria-hidden="true" className={SIDEBAR_FAMILY_LINE} />}
-        {rowLink}
+        {draftSourceId && !selectionMode ? (
+          <ContextMenu>
+            <ContextMenuTrigger asChild>{rowLink}</ContextMenuTrigger>
+            <ContextMenuContent className="min-w-44">
+              <ContextMenuItem
+                variant="destructive"
+                onSelect={() => {
+                  if (discardNestedSessionDraft(queryClient, conversation.id) && isActive) {
+                    navigate(`/c/${draftSourceId}`);
+                  }
+                }}
+              >
+                <Trash2Icon className="size-3.5" />
+                Delete draft
+              </ContextMenuItem>
+            </ContextMenuContent>
+          </ContextMenu>
+        ) : (
+          rowLink
+        )}
         {shortcutSlot !== undefined && (
           <SessionShortcutHint slot={shortcutSlot} overlayTop={overlayTop} />
         )}
@@ -7007,8 +7037,8 @@ function SessionShortcutHint({ slot, overlayTop }: { slot: number; overlayTop: s
  * Pinning lifts a session out of its project folder into the flat "Pinned"
  * section, dropping the visual project cue the folder provided. Hovering the
  * row surfaces it again: the session title, project name, and optional branch.
- * Mirrors {@link AgentHoverCard}'s Cursor-style placement (right / top-aligned)
- * and the muted, small-icon foreground used elsewhere in the sidebar.
+ * Uses a Cursor-style placement (right / top-aligned) and the muted,
+ * small-icon foreground used elsewhere in the sidebar.
  */
 function PinnedProjectFlyoutContent({
   title,
@@ -8320,7 +8350,7 @@ function BulkActionBar({
  */
 export function isMobileViewport(): boolean {
   if (typeof window === "undefined") return false;
-  return !window.matchMedia(DESKTOP_VIEWPORT_QUERY).matches;
+  return !isDesktopLayout();
 }
 
 // Default collapse state: every section (Pinned / Projects / Chats / Shared)

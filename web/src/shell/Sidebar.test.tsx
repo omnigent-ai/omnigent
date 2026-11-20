@@ -1200,14 +1200,20 @@ describe("Sidebar session list", () => {
     expect(within(primaryNav).queryByTestId("toggle-selection-mode")).toBeNull();
   });
 
-  it("paints the Inbox count with the primary CTA fill while Inbox is inactive", () => {
+  it("paints the Inbox count with the shared active treatment while Inbox is inactive", () => {
+    // Off the /inbox route the badge is the only carrier of the count's
+    // treatment, so it wears the same --sidebar-active wash and foreground as
+    // a selected session row.
     mockConversations([conv("conv_awaiting", "Claude Code", { pending_elicitations_count: 2 })]);
     renderSidebar();
 
     const inbox = screen.getByTestId("inbox-button");
     expect(inbox).not.toHaveClass("bg-[var(--sidebar-active)]");
     const badge = within(inbox).getByLabelText("2 inbox items waiting");
-    expect(badge).toHaveClass("bg-primary-cta", "text-primary-cta-foreground");
+    expect(badge).toHaveClass(
+      "bg-[var(--sidebar-active)]",
+      "text-[var(--sidebar-active-foreground)]",
+    );
     expect(badge.className).not.toContain("brand-accent");
   });
 
@@ -1306,7 +1312,10 @@ describe("Sidebar session list", () => {
     ).toHaveTextContent("1");
   });
 
-  it("keeps the primary CTA count fill on the active Inbox row", () => {
+  it("lets the active Inbox row show through the count badge", () => {
+    // On /inbox the row itself paints the translucent --sidebar-active wash.
+    // The badge keeps the shared active foreground but stays transparent so
+    // the wash is not double-composited into a darker fill.
     mockConversations([conv("conv_awaiting", "Claude Code", { pending_elicitations_count: 2 })]);
     renderSidebar(true, "/inbox");
 
@@ -1316,7 +1325,8 @@ describe("Sidebar session list", () => {
       "text-[var(--sidebar-active-foreground)]",
     );
     const badge = within(inbox).getByLabelText("2 inbox items waiting");
-    expect(badge).toHaveClass("bg-primary-cta", "text-primary-cta-foreground");
+    expect(badge).toHaveClass("bg-transparent", "text-[var(--sidebar-active-foreground)]");
+    expect(badge).not.toHaveClass("bg-[var(--sidebar-active)]");
   });
 
   it("hides Usage navigation while the release feature is off", () => {
@@ -2202,6 +2212,34 @@ describe("Sidebar sections", () => {
     showSharedTab();
     expect(screen.getAllByText("No sessions")[0]).toBeInTheDocument();
     expect(screen.queryByText("conv_only_mine")).toBeNull();
+  });
+
+  it("highlights the open nested draft and deletes a parked draft from its context menu", async () => {
+    mockConversations([conv("conv_first", "Codex"), conv("conv_second", "Codex")]);
+    const { queryClient } = renderSidebar(true, "/?sibling=conv_first");
+    act(() => {
+      for (const id of ["conv_first", "conv_second"]) {
+        addNestedSessionDraft(queryClient, `temp:${id}`, {
+          id,
+          title: id,
+          createdAt: 1,
+          labels: {},
+          permissionLevel: null,
+        } as Session);
+      }
+    });
+    const drafts = await screen.findAllByRole("link", { name: "New nested agent" });
+    const first = drafts.find((link) => link.getAttribute("href") === "/?sibling=conv_first")!;
+    const second = drafts.find((link) => link.getAttribute("href") === "/?sibling=conv_second")!;
+    expect(first).toHaveClass("bg-[var(--sidebar-active)]");
+    expect(second).not.toHaveClass("bg-[var(--sidebar-active)]");
+    fireEvent.click(second);
+    expect(first).not.toHaveClass("bg-[var(--sidebar-active)]");
+    expect(second).toHaveClass("bg-[var(--sidebar-active)]");
+    fireEvent.contextMenu(first);
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Delete draft" }));
+    await waitFor(() => expect(first).not.toBeInTheDocument());
+    expect(second).toHaveClass("bg-[var(--sidebar-active)]");
   });
 
   it.each([
@@ -4372,6 +4410,12 @@ describe("Sidebar view options", () => {
     expect(within(groupSection("Unread")).getByText("ordinary_unread")).toBeInTheDocument();
     expect(within(groupSection("Working")).getByText("muted_running")).toBeInTheDocument();
     expect(within(groupSection("Needs attention")).getByText("muted_approval")).toBeInTheDocument();
+    // Active status outranks the muted bell.
+    for (const id of ["muted_running", "muted_approval"]) {
+      const row = screen.getByText(id).closest("li")!;
+      expect(within(row).getByTestId("session-state-badge")).toBeInTheDocument();
+      expect(within(row).queryByTestId("conversation-muted-icon")).toBeNull();
+    }
   });
 
   it("restores Status grouping from a saved selection and offers it in the menu", () => {

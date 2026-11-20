@@ -44,6 +44,12 @@ import {
   ComposerSendButton,
 } from "@/components/composer/ChatComposer";
 import {
+  nativeShellHarness,
+  ownerOnlyShellHarness,
+  useComposerHighlight,
+  usePublishComposerCommands,
+} from "@/components/composer/composerHighlight";
+import {
   COMPOSER_TAIL_INPUT_ID,
   composerTargetElement,
   isComposerTargetFocused,
@@ -53,13 +59,6 @@ import {
   type ComposerTextTarget,
 } from "@/components/composer/engine/composerInput";
 import { useRequestedComposerEngine } from "@/components/composer/engine/composerEnginePolicy";
-import {
-  ComposerMirror,
-  MIRRORED_TEXTAREA_CLASS,
-  renderMentionTokens,
-  useComposerMirrorAlignment,
-} from "@/components/composer/MentionTokenOverlay";
-import { COMMAND_TOKEN_CLASS } from "@/components/composer/commandToken";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
 import { BackgroundTaskIndicator } from "@/components/composer/BackgroundTaskIndicator";
 import { SubagentTaskIndicator } from "@/components/composer/SubagentTaskIndicator";
@@ -74,6 +73,7 @@ import { hasPendingOwnElicitation, isPendingBlockingElicitation } from "@/lib/bl
 import { cn } from "@/lib/utils";
 import { isInlineRenameFocused } from "@/lib/inlineRename";
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
+import { DesignOutboxStrip } from "@/components/BrowserPane/designTools/LazyDesignOutboxStrip";
 import {
   serverSwitcherHiddenForSurface,
   useSurfaceFrontmost,
@@ -94,6 +94,7 @@ import {
   derivePermissionLevel,
   isEditorLevel,
   isOwnerLevel,
+  isPermissionLevelPending,
   isSessionSharedWithOthers,
 } from "@/lib/permissionsApi";
 import { getCurrentAuthorId } from "@/lib/identity";
@@ -363,30 +364,11 @@ const HOST_MCP_SIGN_IN_POLL_MS = 5_000;
 /** Only an http(s) page is ever opened from a host's sign-in report. */
 const HOST_SIGN_IN_URL_RE = /^https?:\/\//i;
 
-// Leading whitespace + the command token, so the composer overlay can tint
-// just the `/command` or `$skill` and leave args in the default color.
-const SLASH_COMMAND_SPLIT_RE = /^(\s*)([/$][A-Za-z0-9][\w:-]*)(?=\s|$)/;
-
-/**
- * Split a command or skill draft for the composer highlight overlay. The token
- * is a known `commands` entry's full name (it may contain spaces or punctuation),
- * else the first `/command`-shaped word. Null for prose and paths like `/etc/hosts`.
- */
-export function splitSlashCommand(
-  value: string,
-  commands: Iterable<string> = [],
-): { before: string; token: string; after: string } | null {
-  const token =
-    matchSlashCommandInvocation(value, commands)?.command ??
-    SLASH_COMMAND_SPLIT_RE.exec(value)?.[2];
-  if (token === undefined) return null;
-  const before = /^\s*/.exec(value)?.[0] ?? "";
-  return { before, token, after: value.slice(before.length + token.length) };
+/** The draft's text as sent: a command is trimmed, anything else keeps its leading space. */
+function authoredOutgoingText(fullText: string, trimmed: string): string {
+  return isSlashCommandText(trimmed) ? trimmed : fullText.trimEnd();
 }
 
-// Iterate code points (not UTF-16 units) so emoji aren't cut mid-surrogate;
-// prefer the last word boundary within 10 chars of the limit so we don't
-// chop a word in half; trimEnd before the ellipsis so we never emit "foo  …".
 /**
  * A sent, queued or failed message as an editable composer draft: generated
  * session markers become tokens again and their tags come back with them.
@@ -435,6 +417,9 @@ function mergeRecalledDraft(
   return { text: serializeReplyDraft(replyDraft), replyDraft, mentions };
 }
 
+// Iterate code points (not UTF-16 units) so emoji aren't cut mid-surrogate;
+// prefer the last word boundary within 10 chars of the limit so we don't
+// chop a word in half; trimEnd before the ellipsis so we never emit "foo  …".
 function truncateTitle(raw: string, max = 60): string {
   const points = Array.from(raw);
   if (points.length <= max) return raw;
@@ -979,6 +964,13 @@ export function ChatPage() {
     urlConvId,
     conversationsData !== undefined,
   );
+  const permissionPending = isPermissionLevelPending(
+    activeSession,
+    sessionLoading,
+    activeConv,
+    urlConvId,
+    conversationsData !== undefined,
+  );
   const reconnectHostId = activeSession?.hostId ?? activeConv?.host_id ?? null;
   const reconnectHostOnline = useSessionHostOnline(urlConvId ?? undefined);
   const {
@@ -1253,6 +1245,7 @@ export function ChatPage() {
       hasMoreHistory={hasMoreHistory}
       loadingMoreHistory={loadingMoreHistory}
       permissionLevel={permissionLevel}
+      permissionPending={permissionPending}
       readOnlyReason={readOnlyReason}
       sendDisabledReason={sendDisabledReason}
       effortLevels={effortLevels}
@@ -1415,6 +1408,8 @@ interface MainAgentSurfaceProps {
   /** Whether a load-more fetch is currently in flight. */
   loadingMoreHistory: boolean;
   permissionLevel: number | null;
+  /** The level is still loading, so `permissionLevel`'s null doesn't mean owner yet. */
+  permissionPending?: boolean;
   /** Forces composer read-only with the given placeholder when non-null. See ``ComposerProps.readOnlyReason``. */
   readOnlyReason: string | null;
   /** Keeps drafting enabled while temporarily blocking submission. */
@@ -1590,6 +1585,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   hasMoreHistory,
   loadingMoreHistory,
   permissionLevel,
+  permissionPending,
   readOnlyReason,
   sendDisabledReason,
   effortLevels,
@@ -1926,6 +1922,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
             agents={agents}
             selectedAgentId={selectedAgentId}
             permissionLevel={permissionLevel}
+            permissionPending={permissionPending}
             readOnlyReason={readOnlyReason}
             sendDisabledReason={sendDisabledReason}
             effortLevels={effortLevels}
@@ -2056,6 +2053,8 @@ interface ComposerProps {
   agents: Agent[] | undefined;
   selectedAgentId: string | null;
   permissionLevel: number | null;
+  /** The level is still loading, so `permissionLevel`'s null doesn't mean owner yet. */
+  permissionPending?: boolean;
   /**
    * When non-null, the composer is forced read-only and the string is
    * shown as the textarea placeholder. Distinct from
@@ -2391,6 +2390,7 @@ function ComposerImpl(
     agents,
     selectedAgentId,
     permissionLevel,
+    permissionPending = false,
     readOnlyReason,
     sendDisabledReason = null,
     effortLevels,
@@ -2524,9 +2524,6 @@ function ComposerImpl(
   // Declared after textareaRef so dictation can place the caret after the
   // text it inserts (and insert at the caret rather than the draft's end).
   const dictation = useDictationInsert(value, setValue, textareaRef);
-  // Highlight overlay mirroring the textarea; scroll-synced so the tinted
-  // `/skill` token stays aligned once the draft grows past the visible rows.
-  const backdropRef = useRef<HTMLDivElement>(null);
   const isStreaming = status === "streaming";
 
   // Read-only when either the user lacks a write grant OR the session
@@ -3113,6 +3110,15 @@ function ComposerImpl(
     [offeredBuiltinCommands, commandSkills, skillPrefix],
   );
   const slashCommandNames = useMemo(() => Object.keys(slashCommands), [slashCommands]);
+  // Submission lowercases the first word before matching a built-in, so `/Goal` runs too. Not
+  // `/btw` or Codex's `/side`: they go out as typed to case-sensitive handlers.
+  const anyCaseBuiltinNames = useMemo(
+    () =>
+      Object.keys(offeredBuiltinCommands).filter(
+        (name) => name !== "/btw" && !(name === "/side" && usesNativeSideChatFork(sessionHarness)),
+      ),
+    [offeredBuiltinCommands, sessionHarness],
+  );
   // Skills always need an optional argument fill-in so the user can
   // type extra context after the name; built-in commands keep their
   // existing fill/execute split.
@@ -3129,15 +3135,10 @@ function ComposerImpl(
     [commandSkills, showEffort, showModel, showBtw, showSide, skillPrefix],
   );
 
-  // Suggest names until a space starts the arguments; exclude file paths.
-  const trimmedValue = value.trimStart();
-  const hasCommandPrefix = trimmedValue.startsWith("/") || trimmedValue.startsWith(skillPrefix);
-  // Tint only the command or skill token, leaving arguments in the default color.
-  const composerIsCommand =
-    draft.quotes.length === 0 &&
-    files.length === 0 &&
-    hasCommandPrefix &&
-    splitSlashCommand(value, slashCommandNames) !== null;
+  const nativeShell = permissionPending
+    ? null
+    : nativeShellHarness(sessionHarness, permissionLevel);
+  usePublishComposerCommands(conversationId, slashCommandNames, nativeShell);
 
   const toggleCodexPlanMode = async () => {
     if (planModeBusy) return;
@@ -3198,16 +3199,42 @@ function ComposerImpl(
 
   // Depends on mentionedItems (from the hook above), so it's computed here.
   // Tagged items whose token is still in the draft; deleting a token untags it.
-  const liveMentions = presentMentions(
-    composerInlineMentions(mentionedItems, mentionedSessions, sessionHarness),
-    [draft.text, ...draft.quotes.map((quote) => quote.before)],
+  const liveMentions = useMemo(
+    () =>
+      presentMentions(composerInlineMentions(mentionedItems, mentionedSessions, sessionHarness), [
+        draft.text,
+        ...draft.quotes.map((quote) => quote.before),
+      ]),
+    [mentionedItems, mentionedSessions, sessionHarness, draft],
   );
   const hasMentions = liveMentions.length > 0;
-  // One mirror paints both the slash-command tint and inline mention pills.
-  const mentionTokensShown =
-    draft.quotes.length === 0 && findMentionTokens(draft.text, mentionTokens).length > 0;
-  const mirrorActive = composerIsCommand || mentionTokensShown;
-  useComposerMirrorAlignment(backdropRef, tailTextareaRef, mirrorActive, tailTextareaNode);
+  const sendContext = { mentions: liveMentions, reviewComments: localReviewComments };
+  // Review comments are appended at send, which can make a bare `!` a command.
+  const outgoingClassifyText = useMemo(
+    () =>
+      buildOutgoingMessage(draft, authoredOutgoingText(fullText, fullText.trim()), {
+        mentions: liveMentions,
+        reviewComments: localReviewComments,
+      }).text,
+    [draft, fullText, liveMentions, localReviewComments],
+  );
+  const highlight = useComposerHighlight({
+    value,
+    commandNames: slashCommandNames,
+    anyCaseCommandNames: anyCaseBuiltinNames,
+    enabled: draft.quotes.length === 0 && files.length === 0,
+    // Files go out as separate blocks, so the message is no longer a lone `!` text.
+    shellEnabled: files.length === 0,
+    nativeShell,
+    refusedNativeShell: permissionPending
+      ? null
+      : ownerOnlyShellHarness(sessionHarness, permissionLevel),
+    classifyValue: outgoingClassifyText,
+    mentionTokens: draft.quotes.length === 0 ? mentionTokens : [],
+    textareaRef: tailTextareaRef,
+    textareaNode: tailTextareaNode,
+    sendContext: { ...sendContext, quotes: draft.quotes },
+  });
   const hasDraft =
     fullText.trim().length > 0 || files.length > 0 || hasMentions || localReviewComments.length > 0;
   const showInterruptButton =
@@ -3951,13 +3978,16 @@ function ComposerImpl(
       hasPendingElicitation
     )
       return;
+    if (highlight.refusal !== null) {
+      setCommandError(highlight.refusal);
+      return;
+    }
 
     const skill = onSendSlashCommand
       ? matchSlashCommandInvocation(trimmed, slashCommandNames)
       : null;
     const parts = trimmed.split(/\s+/);
     const cmd = parts[0].toLowerCase();
-    const sendContext = { mentions: liveMentions, reviewComments: localReviewComments };
     const opensGenericSideChat =
       cmd === "/side" &&
       !usesNativeSideChatFork(sessionHarness) &&
@@ -4095,7 +4125,7 @@ function ComposerImpl(
     // one tool hint at the end.
     const outgoing = buildOutgoingMessage(
       draft,
-      goalMessage ?? (isSlashCommandText(trimmed) ? trimmed : fullText.trimEnd()),
+      goalMessage ?? authoredOutgoingText(fullText, trimmed),
       sendContext,
     );
     // Sending while a prior response is streaming is fine — the
@@ -4389,6 +4419,8 @@ function ComposerImpl(
           bottom corners when the surface below is at least as wide,
           otherwise page background shows and the tray floats detached. */}
       <div className={cn("mx-auto", COMPOSER_COLUMN_WIDTH)}>
+        {/* Design tool requests still on their way to this session. */}
+        <DesignOutboxStrip conversationId={conversationId} widthClassName="mx-3 w-auto" />
         {/* Queued messages — peeks above the workspace bar like the
             sub-agent tray. Lists follow-ups held while the agent is busy;
             drains FIFO on idle. Scope to this conversation so a queue held
@@ -4475,6 +4507,7 @@ function ComposerImpl(
           "mx-auto",
           COMPOSER_COLUMN_WIDTH,
           isDragActive && "ring-2 ring-ring ring-inset",
+          highlight.cardClassName,
         )}
         data-suggestions-open={slashCompletion.open || mentionOpen ? "true" : undefined}
         engine={composerEngine}
@@ -4486,9 +4519,7 @@ function ComposerImpl(
           ref: bindTailTextarea,
           value: draft.text,
           // Same rules as the textarea mirror: quoted replies get no pills, and files stop the command tint.
-          commandToken: composerIsCommand
-            ? (splitSlashCommand(draft.text, slashCommandNames)?.token ?? null)
-            : null,
+          commandToken: highlight.input.commandToken,
           mentionTokens: draft.quotes.length === 0 ? mentionTokens : [],
           onChange: (e) => handleTextChange(null, e),
           onSelect: (e) => slashCompletion.onSelectionChange(e.currentTarget),
@@ -4503,11 +4534,9 @@ function ComposerImpl(
             dismissMention();
           },
           onPaste,
-          onScroll: (e) => {
-            // Keep the overlay's scroll position locked to the textarea's.
-            if (backdropRef.current) backdropRef.current.scrollTop = e.currentTarget.scrollTop;
-          },
+          onScroll: highlight.input.onScroll,
           "aria-label": "Message the agent",
+          "aria-describedby": highlight.input["aria-describedby"],
           "aria-keyshortcuts": nextFromSelected === null ? undefined : "Shift+Tab",
           placeholder: composerLockedByBtw
             ? "Side chat open — press Esc to close"
@@ -4527,13 +4556,12 @@ function ComposerImpl(
           rows: 1,
           heightMode: draft.quotes.length > 0 ? "unbounded" : "compact",
           disabled: inputDisabled,
-          "data-slash-command": composerIsCommand ? "true" : undefined,
+          "data-slash-command": highlight.input["data-slash-command"],
+          "data-shell-command": highlight.input["data-shell-command"],
           "data-has-draft": hasDraft ? "true" : undefined,
           className: cn(
             draft.quotes.length > 0 && "max-h-none overflow-y-hidden",
-            // Hand glyph painting to the overlay while a command is drafted;
-            // the caret stays visible via caret-foreground.
-            mirrorActive && MIRRORED_TEXTAREA_CLASS,
+            highlight.input.className,
           ),
         }}
         slots={{
@@ -4667,30 +4695,10 @@ function ComposerImpl(
                   <p className="mt-2 text-xs text-muted-foreground">Press Esc to close</p>
                 </div>
               )}
-              {/* Highlight overlay: a textarea can only paint its text one color, so
-            to tint just the command or skill token we hide the textarea's own glyphs
-            (text-transparent, caret kept visible) and render an aligned mirror
-            behind it, pinned to the textarea's box. Same typography so wrapping
-            matches the textarea exactly. Only mounted while the draft is a command. */}
             </>
           ),
-          inputBackdrop: mirrorActive && (
-            <ComposerMirror ref={backdropRef}>
-              {(() => {
-                const split = composerIsCommand
-                  ? splitSlashCommand(value, slashCommandNames)
-                  : null;
-                if (!split) return renderMentionTokens(value, mentionTokens);
-                return (
-                  <>
-                    {split.before}
-                    <span className={COMMAND_TOKEN_CLASS}>{split.token}</span>
-                    {renderMentionTokens(split.after, mentionTokens)}
-                  </>
-                );
-              })()}
-            </ComposerMirror>
-          ),
+          inputBackdrop: highlight.backdrop,
+          inputHint: highlight.hint,
           attachments: (
             <>
               {/* Pending attachments — image thumbnails (click to view) + file rows. */}
