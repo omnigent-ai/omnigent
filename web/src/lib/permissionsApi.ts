@@ -7,6 +7,7 @@
  * `omnigent/server/routes/workflow_permissions.py`.
  */
 
+import { isTempConvId } from "@/lib/tempConversationId";
 import type { Conversation } from "@/hooks/useConversations";
 import {
   isSharingOff,
@@ -148,7 +149,12 @@ export function isPermissionLevelPending(
   conversationsLoaded: boolean,
 ): boolean {
   if (session != null || activeConv?.permission_level != null) return false;
-  return sessionLoading || (Boolean(conversationId) && !conversationsLoaded);
+  // A `temp:` id has no snapshot to fetch yet, so its read-only fallback isn't a real level.
+  return (
+    sessionLoading ||
+    isTempConvId(conversationId) ||
+    (Boolean(conversationId) && !conversationsLoaded)
+  );
 }
 
 /**

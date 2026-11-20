@@ -3236,7 +3236,10 @@ function ComposerImpl(
   const highlight = useComposerHighlight({
     value,
     commandNames: slashCommandNames,
-    anyCaseCommandNames: anyCaseBuiltinNames,
+    // With context the text goes out as typed, so only exact-case commands run.
+    anyCaseCommandNames: carriesMessageContext(draft, files, sendContext)
+      ? []
+      : anyCaseBuiltinNames,
     enabled: draft.quotes.length === 0 && files.length === 0,
     // Files go out as separate blocks, so the message is no longer a lone `!` text.
     shellEnabled: files.length === 0,

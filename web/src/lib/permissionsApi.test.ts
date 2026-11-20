@@ -668,6 +668,15 @@ describe("isPermissionLevelPending", () => {
       false,
     ],
     ["not pending without a conversation", null, false, null, undefined, false, false],
+    [
+      "pending on a new chat's temp id before its session exists",
+      null,
+      false,
+      null,
+      "temp:abc",
+      true,
+      true,
+    ],
   ] as const)("%s", (_label, snap, loading, conv, id, listLoaded, pending) => {
     expect(isPermissionLevelPending(snap, loading, conv, id, listLoaded)).toBe(pending);
   });

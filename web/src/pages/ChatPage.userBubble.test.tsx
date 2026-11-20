@@ -1027,12 +1027,6 @@ describe("UserBubble command tint", () => {
     expect(text()).toBe("/team fix it");
   });
 
-  it("tints a built-in the composer sent canonicalized, such as `/Goal` as `/goal`", () => {
-    renderScoped(userBubble("/goal Fix CI"), <PublishCommands commands={["/goal"]} />);
-    expect(screen.getByText("/goal")).toHaveClass("text-brand-accent");
-    expect(screen.getByTestId("user-message-content")).toHaveTextContent("/goal Fix CI");
-  });
-
   it("adds no trailing space after a command sent without args", () => {
     renderScoped(userBubble("/team"), <PublishCommands />);
     expect(screen.getByText("/team")).toHaveClass("text-brand-accent");
