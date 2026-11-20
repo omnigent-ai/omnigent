@@ -2506,14 +2506,10 @@ async def test_cli_settings_request_ownership_survives_admission_and_terminal_li
             if mode != "declared-replacement":
                 assert baseline.read_bytes() == baseline_bytes
             await terminals.cleanup_conversation("moved")
-            if protocol == 2:
-                assert instance.private_dir.exists()
-                assert instance._private_cleanup_thread is None
-                assert baseline.read_bytes() == baseline_bytes
-                assert prune_unused_claude_settings(bridge_dir) == 0
-            else:
-                assert not instance.private_dir.exists()
-                assert not list(bridge_dir.glob(f"claude-settings-{request.generation}*"))
+            assert instance.private_dir.exists()
+            assert instance._private_cleanup_thread is None
+            assert baseline.read_bytes() == baseline_bytes
+            assert prune_unused_claude_settings(bridge_dir) == 0
     finally:
         request.close()
         await terminals.shutdown()
@@ -2522,9 +2518,8 @@ async def test_cli_settings_request_ownership_survives_admission_and_terminal_li
         ) as client:
             await client.delete(f"/v1/sessions/{session_id}")
         shutil.rmtree(bridge_dir, ignore_errors=True)
-        if protocol == 2:
-            for instance, _ in prepared:
-                shutil.rmtree(instance.private_dir, ignore_errors=True)
+        for instance, _ in prepared:
+            shutil.rmtree(instance.private_dir, ignore_errors=True)
 
 
 @pytest.mark.asyncio

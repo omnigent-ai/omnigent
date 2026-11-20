@@ -385,18 +385,21 @@ from omnigent.harnesses.claude_native.settings_generation import (
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.inner.process_lifetime import encode_process_leases
 root=Path(sys.argv[1])
+protocol=int(sys.argv[2])
 bridge._TRUSTED_PARENT=root.parent
 bridge._BRIDGE_ROOT=root
 directory=bridge.prepare_bridge_dir('conv_fenced',workspace=root.parent)
-request=ClaudeSettingsRequest.create(directory,protocol=2)
+request=ClaudeSettingsRequest.create(directory,protocol=protocol)
 bridge.augment_claude_args((),bridge_dir=directory,settings_request=request)
 private=root.parent/'terminal'
 private.mkdir()
 instance=TerminalInstance(name='claude',session_key='main',private_dir=private,socket_path=private/'tmux.sock')
-with acquire_claude_settings_request(directory,request.generation,protocol=2) as receiver:
-    receiver.attach(instance)
 request.mark_dispatched()
-print(json.dumps({'generation':request.generation,'leases':encode_process_leases(instance.process_lifetime_leases),'directory':str(directory)}),flush=True)
+with acquire_claude_settings_request(directory,request.generation,protocol=protocol) as receiver:
+    receiver.attach(instance)
+output=private/'settings.json'
+output.write_bytes(request.settings_path(directory).read_bytes())
+print(json.dumps({'generation':request.generation,'leases':encode_process_leases(instance.process_lifetime_leases),'directory':str(directory),'output':str(output)}),flush=True)
 sys.stdin.read()
 """
 
@@ -404,27 +407,35 @@ _CONSUMER = """
 import json,os,sys
 from pathlib import Path
 os.closerange(3,256)
-path=Path(sys.argv[1])
-print(json.dumps({'pid':os.getpid(),'contents':path.read_text()}),flush=True)
+paths=[Path(value) for value in sys.argv[1:]]
+def snapshot():
+    data={'contents':paths[0].read_text()}
+    if len(paths)>1:
+        data['inputs']=[path.read_text() for path in paths[1:]]
+    return data
+print(json.dumps({'pid':os.getpid(),**snapshot()}),flush=True)
 sys.stdin.readline()
-print(json.dumps({'contents':path.read_text()}),flush=True)
+print(json.dumps(snapshot()),flush=True)
 sys.stdin.read()
 """
 
 
 @pytest.mark.parametrize("existing_uncertainty", [False, True])
+@pytest.mark.parametrize("protocol", [1, 2])
 async def test_unconfirmed_consumer_completion_retains_generation_and_private_files(
-    bridge_dir: Path, tmp_path: Path, existing_uncertainty: bool
+    bridge_dir: Path, tmp_path: Path, existing_uncertainty: bool, protocol: int
 ) -> None:
     private = tmp_path / "terminal"
     private.mkdir()
     instance = TerminalInstance(
         name="claude", session_key="main", private_dir=private, socket_path=private / "tmux.sock"
     )
-    request = ClaudeSettingsRequest.create(bridge_dir, protocol=2)
+    request = ClaudeSettingsRequest.create(bridge_dir, protocol=protocol)
     baseline = _populate(request)
     contents = baseline.read_bytes()
-    with acquire_claude_settings_request(bridge_dir, request.generation, protocol=2) as receiver:
+    with acquire_claude_settings_request(
+        bridge_dir, request.generation, protocol=protocol
+    ) as receiver:
         receiver.attach(instance)
     encoded = process_lifetime.encode_process_leases(instance.process_lifetime_leases)
     assert encoded is not None
@@ -454,11 +465,12 @@ async def test_unconfirmed_consumer_completion_retains_generation_and_private_fi
 
 
 @pytest.mark.parametrize("kill_guard", [False, True], ids=["guard-alive", "guard-killed"])
+@pytest.mark.parametrize("protocol", [1, 2])
 def test_consumer_drops_inherited_leases_but_keeps_inputs_after_guard_and_controller_death(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kill_guard: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kill_guard: bool, protocol: int
 ) -> None:
     controller = subprocess.Popen(
-        [sys.executable, "-c", _CONTROLLER, str(tmp_path / "bridges")],
+        [sys.executable, "-c", _CONTROLLER, str(tmp_path / "bridges"), str(protocol)],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -474,6 +486,7 @@ def test_consumer_drops_inherited_leases_but_keeps_inputs_after_guard_and_contro
         monkeypatch.setattr(bridge, "_BRIDGE_ROOT", directory.parent)
         baseline = settings_generation_path(directory, record["generation"])
         contents = baseline.read_text()
+        assert record["leases"] is not None
         guard = subprocess.Popen(
             [
                 sys.executable,
@@ -485,6 +498,7 @@ def test_consumer_drops_inherited_leases_but_keeps_inputs_after_guard_and_contro
                 "-c",
                 _CONSUMER,
                 str(baseline),
+                record["output"],
             ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -495,6 +509,7 @@ def test_consumer_drops_inherited_leases_but_keeps_inputs_after_guard_and_contro
         ready = read_json_line(guard.stdout, timeout_s=5)
         consumer_pid = ready["pid"]
         assert ready["contents"] == contents
+        assert ready["inputs"] == [contents]
         controller.kill()
         controller.wait(timeout=5)
         if kill_guard:
@@ -509,7 +524,10 @@ def test_consumer_drops_inherited_leases_but_keeps_inputs_after_guard_and_contro
         assert baseline.read_text() == contents
         guard.stdin.write("read again\n")
         guard.stdin.flush()
-        assert read_json_line(guard.stdout, timeout_s=5) == {"contents": contents}
+        assert read_json_line(guard.stdout, timeout_s=5) == {
+            "contents": contents,
+            "inputs": [contents],
+        }
         guard.stdin.close()
         assert guard.stdout.read() == ""
         if not kill_guard:
@@ -755,8 +773,13 @@ async def test_live_controller_handoff_retains_unconfirmed_consumer_ownership(
 
 
 @pytest.mark.parametrize("cleanup", ["close", "orphan"])
+@pytest.mark.parametrize("protocol", [1, 2])
 async def test_finalized_private_settings_survive_unconfirmed_consumer_completion(
-    bridge_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleanup: str
+    bridge_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup: str,
+    protocol: int,
 ) -> None:
     from omnigent.inner import terminal
 
@@ -765,26 +788,30 @@ async def test_finalized_private_settings_survive_unconfirmed_consumer_completio
     instance = TerminalInstance(
         name="claude", session_key="main", private_dir=private, socket_path=private / "tmux.sock"
     )
-    request = ClaudeSettingsRequest.create(bridge_dir, protocol=2)
-    _populate(request)
-    with acquire_claude_settings_request(bridge_dir, request.generation, protocol=2) as receiver:
+    request = ClaudeSettingsRequest.create(bridge_dir, protocol=protocol)
+    baseline = _populate(request)
+    baseline_contents = baseline.read_text()
+    with acquire_claude_settings_request(
+        bridge_dir, request.generation, protocol=protocol
+    ) as receiver:
         receiver.attach(instance)
     encoded = process_lifetime.encode_process_leases(instance.process_lifetime_leases)
-    process_lifetime.write_process_lease_manifest(private, encoded)
+    if encoded is not None:
+        process_lifetime.write_process_lease_manifest(private, encoded)
     output = private / f"claude-finalized-settings-{request.generation}.json"
     output.write_text('{"env":{"INERT_PRIVATE":"kept"}}')
-    guard = subprocess.Popen(
-        [
+    command = [sys.executable, "-c", _CONSUMER, str(output), str(baseline)]
+    if encoded is not None:
+        command = [
             sys.executable,
             "-I",
             str(Path(process_lifetime.__file__)),
             encoded,
             "--",
-            sys.executable,
-            "-c",
-            _CONSUMER,
-            str(output),
-        ],
+            *command,
+        ]
+    guard = subprocess.Popen(
+        command,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -792,9 +819,9 @@ async def test_finalized_private_settings_survive_unconfirmed_consumer_completio
     )
     try:
         assert guard.stdout is not None and guard.stdin is not None
-        assert json.loads(read_json_line(guard.stdout, timeout_s=5)["contents"])["env"] == {
-            "INERT_PRIVATE": "kept"
-        }
+        ready = read_json_line(guard.stdout, timeout_s=5)
+        assert ready["inputs"] == [baseline_contents]
+        assert json.loads(ready["contents"])["env"] == {"INERT_PRIVATE": "kept"}
         request.close()
         if cleanup == "close":
             instance.running = True
@@ -810,11 +837,12 @@ async def test_finalized_private_settings_survive_unconfirmed_consumer_completio
             monkeypatch.setattr(terminal.owner_claim, "owner_is_gone", lambda *_a, **_kw: True)
             assert terminal.reap_orphaned_terminals() == 0
         assert output.exists()
+        assert baseline.read_text() == baseline_contents
         guard.stdin.write("last read\n")
         guard.stdin.flush()
-        assert json.loads(read_json_line(guard.stdout, timeout_s=5)["contents"])["env"] == {
-            "INERT_PRIVATE": "kept"
-        }
+        last = read_json_line(guard.stdout, timeout_s=5)
+        assert last["inputs"] == [baseline_contents]
+        assert json.loads(last["contents"])["env"] == {"INERT_PRIVATE": "kept"}
         guard.stdin.close()
         assert guard.wait(timeout=5) == 0
         if cleanup == "close":

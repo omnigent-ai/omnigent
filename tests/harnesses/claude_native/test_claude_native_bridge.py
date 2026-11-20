@@ -5571,7 +5571,7 @@ async def test_overlapping_caller_settings_finalizers_keep_immutable_baseline(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("protocol", "registration_failure"),
-    [(1, None), (1, "cleanup"), (2, None), (2, "process"), (2, "cleanup")],
+    [(1, None), (1, "process"), (1, "cleanup"), (2, None), (2, "process"), (2, "cleanup")],
 )
 async def test_async_settings_attachment_registers_on_loop_and_releases_failed_retention(
     tmp_path: Path,
@@ -5938,6 +5938,20 @@ async def test_claude_bridge_deletion_waits_for_every_settings_owner(
         await instance.close()
 
 
+def _unstarted_settings_terminal(
+    private_dir: Path, callbacks: list[Callable[[], None]]
+) -> SimpleNamespace:
+    """Register withdrawal for a terminal that never spawns a target."""
+    return SimpleNamespace(
+        private_dir=private_dir,
+        sandbox_policy=None,
+        add_resource_cleanup=lambda _callback: None,
+        add_process_lifetime_lease=lambda _lease, _close, *, withdraw_unstarted: callbacks.append(
+            withdraw_unstarted
+        ),
+    )
+
+
 @pytest.mark.parametrize("switch", ["rotation", "reactivation"])
 @pytest.mark.parametrize("last_owner", ["request", "terminal"])
 def test_final_settings_owner_retires_generation_after_admission_changes(
@@ -5957,7 +5971,7 @@ def test_final_settings_owner_retires_generation_after_admission_changes(
         callbacks = []
         with acquire_claude_settings_request(bridge_dir, request.generation) as lease:
             for _ in range(2):
-                lease.attach(SimpleNamespace(add_resource_cleanup=callbacks.append))
+                lease.attach(_unstarted_settings_terminal(tmp_path, callbacks))
         for close in callbacks:
             owners.callback(close)
         if switch == "reactivation":
@@ -6008,7 +6022,7 @@ def test_claude_bridge_deletion_fences_pending_launches(tmp_path: Path) -> None:
         pending.mark_dispatched()
         with acquire_claude_settings_request(bridge_dir, request.generation) as admitted:
             callbacks = []
-            admitted.attach(SimpleNamespace(add_resource_cleanup=callbacks.append))
+            admitted.attach(_unstarted_settings_terminal(tmp_path, callbacks))
             owners.callback(callbacks[0])
             request_claude_bridge_deletion(bridge_dir, "conv_deleted")
             with pytest.raises(ValueError, match="expired"):
@@ -6017,7 +6031,7 @@ def test_claude_bridge_deletion_fences_pending_launches(tmp_path: Path) -> None:
                 acquire_claude_settings_request(bridge_dir, pending.generation)
             assert not pending_path.with_suffix(".dispatch.owner").exists()
             with pytest.raises(ValueError, match="expired"):
-                admitted.attach(SimpleNamespace(add_resource_cleanup=callbacks.append))
+                admitted.attach(_unstarted_settings_terminal(tmp_path, callbacks))
             assert baseline.read_bytes() == baseline_bytes
             prepare_bridge_dir("conv_deleted", workspace=tmp_path)
             with ClaudeSettingsRequest.create(bridge_dir) as current:
@@ -6049,7 +6063,7 @@ def test_stale_claude_settings_release_cannot_mutate_recreated_bridge(
     reader = lease
     if owner == "terminal":
         callbacks = []
-        lease.attach(SimpleNamespace(add_resource_cleanup=callbacks.append))
+        lease.attach(_unstarted_settings_terminal(tmp_path, callbacks))
         lease = callbacks[0].__self__
         reader.close()
     old.close()
@@ -6363,7 +6377,7 @@ def test_claude_settings_receiver_rejection_retires_released_dispatch(
             )
             if owner == "terminal":
                 callbacks = []
-                admitted.attach(SimpleNamespace(add_resource_cleanup=callbacks.append))
+                admitted.attach(_unstarted_settings_terminal(tmp_path, callbacks))
                 owners.callback(callbacks[0])
                 admitted.close()
         request.mark_dispatched()
@@ -6588,7 +6602,7 @@ def test_claude_settings_session_rotation_preserves_ownership(
         augment_claude_args((), bridge_dir=bridge_dir, settings_request=request)
         callbacks = []
         with acquire_claude_settings_request(bridge_dir, request.generation) as lease:
-            lease.attach(SimpleNamespace(add_resource_cleanup=callbacks.append))
+            lease.attach(_unstarted_settings_terminal(tmp_path, callbacks))
         retained = callbacks[0].__self__
         owners.callback(retained.close)
         retained_fd = retained._fd
@@ -6633,7 +6647,7 @@ def test_claude_settings_session_rotation_preserves_ownership(
         with pytest.raises(ValueError, match="expired"):
             request.mark_dispatched()
         with pytest.raises(ValueError, match="expired"):
-            retained.attach(SimpleNamespace(add_resource_cleanup=callbacks.append))
+            retained.attach(_unstarted_settings_terminal(tmp_path, callbacks))
         assert request.acknowledge(request.generation)
         assert {
             path.name: (path.stat().st_ino, path.read_bytes())
@@ -6654,6 +6668,7 @@ def test_claude_settings_session_rotation_preserves_ownership(
         claim = retained._terminal_claim
         assert claim is not None
         del snapshot[claim.name]
+        snapshot[claim.with_suffix(".unconfirmed.owner").name] = b""
         retained.close()
         with pytest.raises(OSError) as closed:
             os.fstat(retained_fd)

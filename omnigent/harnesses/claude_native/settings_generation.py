@@ -674,7 +674,7 @@ class ClaudeSettingsLease:
                     encoded = self._fenced_binding.encode(terminal=_fd_identity(claim_fd))
                     if os.write(claim_fd, encoded) != len(encoded):
                         raise OSError("Claude terminal ownership was not fully written")
-                    fcntl.flock(claim_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                fcntl.flock(claim_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
             except BaseException:
                 with contextlib.suppress(OSError):
                     if claim_fd is not None and _file_matches_fd(claim, claim_fd):
@@ -739,18 +739,24 @@ class ClaudeSettingsLease:
             self._terminal_published = True
 
     def _attach_process_lifetime(self, instance: TerminalInstance) -> None:
-        if self._fenced_binding is None:
-            return
         from omnigent.inner.process_lifetime import ProcessLifetimeLease
         from omnigent.inner.sandbox import with_additional_read_roots
 
-        assert self._terminal_claim is not None and self._claim_fd is not None
+        assert (
+            self._terminal_claim is not None
+            and self._claim_fd is not None
+            and self._fd is not None
+        )
         baseline = settings_generation_path(self.bridge_dir, self.generation)
         path = baseline.with_suffix(".lease.lock")
         instance.add_process_lifetime_lease(
             ProcessLifetimeLease(
                 path,
-                self._fenced_binding.identities["lease"],
+                (
+                    self._fenced_binding.identities["lease"]
+                    if self._fenced_binding is not None
+                    else _fd_identity(self._fd)
+                ),
                 self._terminal_claim,
                 _fd_identity(self._claim_fd),
                 instance.private_dir / f"{self._terminal_claim.stem}.ready",
@@ -793,7 +799,7 @@ class ClaudeSettingsLease:
                         or not _file_matches_fd(self._terminal_claim, self._claim_fd)
                     ):
                         return
-                    if self._fenced_binding is not None and not unpublished:
+                    if not unpublished:
                         uncertain = self._terminal_claim.with_suffix(".unconfirmed.owner")
                         try:
                             uncertain_fd = _open_lock(uncertain, create=True)
@@ -805,6 +811,8 @@ class ClaudeSettingsLease:
                                     self._fenced_binding.encode(
                                         terminal=_fd_identity(self._claim_fd)
                                     )
+                                    if self._fenced_binding is not None
+                                    else b""
                                 )
                     self._terminal_claim.unlink(missing_ok=True)
                     self._terminal_claim = None

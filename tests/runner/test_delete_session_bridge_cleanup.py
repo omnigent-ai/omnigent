@@ -139,6 +139,7 @@ async def test_delete_session_removes_native_bridge_dir(
         acquire_claude_settings_request,
         settings_generation_path,
     )
+    from omnigent.inner import process_lifetime
     from omnigent.inner.terminal import TerminalInstance
     from omnigent.terminals import TerminalRegistry
 
@@ -219,6 +220,9 @@ async def test_delete_session_removes_native_bridge_dir(
             )
             with acquire_claude_settings_request(bridge_dir, request.generation) as lease:
                 lease.attach(instance)
+            encoded = process_lifetime.encode_process_leases(instance.process_lifetime_leases)
+            assert encoded is not None
+            process_lifetime.write_process_lease_manifest(private_dir, encoded)
             request.close()
 
             if owner != "reactivated":
@@ -263,15 +267,24 @@ async def test_delete_session_removes_native_bridge_dir(
                 assert output.exists()
                 monkeypatch.setattr(instance, "_tmux", AsyncMock())
                 await instance.close()
-                assert not output.exists()
                 if owner == "reactivated":
+                    assert not output.exists()
                     assert not list(bridge_dir.glob("claude-settings-*.terminal-*.owner"))
+                else:
+                    assert output.exists()
+                    assert baseline.read_bytes() == baseline_bytes
+                    assert list(bridge_dir.glob("claude-settings-*.terminal-*.unconfirmed.owner"))
+                    assert instance._private_cleanup_thread is None
             if reader is not None:
                 reader.close()
             request.close()
-        if owner == "unacknowledged":
+        if owner in {"unacknowledged", "failed-close", "timed-out-close"}:
             assert (await client.delete(url)).status_code == 200
-            assert baseline.with_suffix(".dispatch.owner").exists()
+            if owner == "unacknowledged":
+                assert baseline.with_suffix(".dispatch.owner").exists()
+            else:
+                assert baseline.read_bytes() == baseline_bytes
+                assert output.exists()
             assert credentials.read_bytes() == credential_bytes
         else:
             assert not bridge_dir.exists(), "released bridge dir (with token) must be deleted"
