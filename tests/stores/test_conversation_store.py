@@ -3247,10 +3247,39 @@ def _hidden_context_message(conversation_id: str) -> NewConversationItem:
         response_id=conversation_id,
         data=MessageData(
             role="user",
-            content=[{"type": "input_text", "text": "[System: timer t1 fired]"}],
             is_meta=True,
+            content=[{"type": "input_text", "text": "[System: timer timer_1 fired]"}],
         ),
     )
+
+
+@pytest.mark.parametrize(
+    ("make_item", "item_type"),
+    [
+        pytest.param(_deleted_terminal_event, "resource_event", id="resource_event"),
+        pytest.param(_hidden_context_message, "message", id="hidden_context_message"),
+    ],
+)
+def test_resource_event_only_append_preserves_updated_at(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+    make_item: Callable[[str], NewConversationItem],
+    item_type: str,
+) -> None:
+    """Appends the transcript never shows must not look like new conversation activity."""
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
+    conv = conversation_store.create_conversation()
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 2000)
+
+    appended = conversation_store.append(conv.id, [make_item(conv.id)])
+
+    assert [item.type for item in appended] == [item_type]
+    assert [item.type for item in conversation_store.list_items(conv.id).data] == [item_type]
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.updated_at == 1000
 
 
 _NON_ACTIVITY_ITEMS = pytest.mark.parametrize(
@@ -3258,29 +3287,6 @@ _NON_ACTIVITY_ITEMS = pytest.mark.parametrize(
     [_deleted_terminal_event, _hidden_context_message],
     ids=["resource_event", "hidden_context_message"],
 )
-
-
-@_NON_ACTIVITY_ITEMS
-def test_non_activity_only_append_preserves_updated_at(
-    conversation_store: SqlAlchemyConversationStore,
-    monkeypatch: pytest.MonkeyPatch,
-    non_activity_item: Callable[[str], NewConversationItem],
-) -> None:
-    """Items hidden from the transcript must not look like new conversation activity."""
-    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
-
-    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
-    conv = conversation_store.create_conversation()
-    monkeypatch.setattr(store_mod, "now_epoch", lambda: 2000)
-    item = non_activity_item(conv.id)
-
-    appended = conversation_store.append(conv.id, [item])
-
-    assert [appended_item.type for appended_item in appended] == [item.type]
-    assert [stored.data for stored in conversation_store.list_items(conv.id).data] == [item.data]
-    fetched = conversation_store.get_conversation(conv.id)
-    assert fetched is not None
-    assert fetched.updated_at == 1000
 
 
 @_NON_ACTIVITY_ITEMS
