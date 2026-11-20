@@ -7037,8 +7037,8 @@ function SessionShortcutHint({ slot, overlayTop }: { slot: number; overlayTop: s
  * Pinning lifts a session out of its project folder into the flat "Pinned"
  * section, dropping the visual project cue the folder provided. Hovering the
  * row surfaces it again: the session title, project name, and optional branch.
- * Mirrors {@link AgentHoverCard}'s Cursor-style placement (right / top-aligned)
- * and the muted, small-icon foreground used elsewhere in the sidebar.
+ * Uses a Cursor-style placement (right / top-aligned) and the muted,
+ * small-icon foreground used elsewhere in the sidebar.
  */
 function PinnedProjectFlyoutContent({
   title,
