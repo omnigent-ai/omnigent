@@ -14,6 +14,11 @@ import { isPromiseLike } from "./useQuickPickSources";
 const QUICK_PICK_DIALOG_SELECTOR = "[data-quick-pick-dialog]";
 /** Where each open picker returns focus, for a picker that opens in its place. */
 const returnFocusTargets = new WeakMap<Element, HTMLElement | null>();
+/**
+ * Where a focused picker that just unmounted would have returned focus, for one that mounts in
+ * the same commit in its place, such as ⌘K continuing as the session switcher. Gone after it.
+ */
+let unmountedReturnTarget: { target: HTMLElement | null } | null = null;
 
 /** A dedicated picker's header: its mode and the shortcut that opens it, such as "Session ⌘↵". */
 export interface QuickPickHeading {
@@ -119,12 +124,29 @@ export function QuickPickDialog<Value>({
     const active = document.activeElement;
     // Opened in another picker's place: return where that one would.
     const replaced = active?.closest(QUICK_PICK_DIALOG_SELECTOR);
+    const focusDropped = active === null || active === document.body;
     returnFocusRef.current = replaced
       ? (returnFocusTargets.get(replaced) ?? null)
-      : active instanceof HTMLElement
-        ? active
-        : null;
+      : focusDropped && unmountedReturnTarget
+        ? unmountedReturnTarget.target
+        : active instanceof HTMLElement
+          ? active
+          : null;
+    unmountedReturnTarget = null;
   }, [open, ownership]);
+  // Runs while the content is still in the document, so it can tell whether focus was inside.
+  useLayoutEffect(
+    () => () => {
+      const content = inputRef.current?.closest(QUICK_PICK_DIALOG_SELECTOR);
+      if (!content?.contains(document.activeElement)) return;
+      const handoff = { target: returnFocusRef.current };
+      unmountedReturnTarget = handoff;
+      queueMicrotask(() => {
+        if (unmountedReturnTarget === handoff) unmountedReturnTarget = null;
+      });
+    },
+    [],
+  );
   // Reopened during its exit animation, the content survived, so Radix won't autofocus it again.
   useEffect(() => {
     if (open) claimFocus();

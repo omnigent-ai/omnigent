@@ -53,10 +53,10 @@ function DialogHarness({
   );
 }
 
-async function openPicker() {
+async function openPicker(label = "Run a command") {
   const trigger = screen.getByRole("button", { name: "Open picker" });
   await userEvent.click(trigger);
-  const input = await screen.findByRole("combobox", { name: "Run a command" });
+  const input = await screen.findByRole("combobox", { name: label });
   await waitFor(() => expect(input).toHaveFocus());
   return { trigger, input };
 }
@@ -145,6 +145,66 @@ describe("QuickPickDialog over other layers", () => {
     await userEvent.keyboard("{Enter}");
     await waitFor(() => expect(screen.queryByRole("combobox")).toBeNull());
     await waitFor(() => expect(trigger).toHaveFocus());
+  });
+});
+
+describe("QuickPickDialog replaced by another as it unmounts", () => {
+  let swap: () => void = () => undefined;
+  let close: () => void = () => undefined;
+  function Swapping() {
+    const [open, setOpen] = useState(false);
+    const [mode, setMode] = useState<"first" | "second">("first");
+    swap = () => setMode("second");
+    close = () => setOpen(false);
+    return (
+      <>
+        <button type="button" onClick={() => setOpen(true)}>
+          Open picker
+        </button>
+        <QuickPickDialog
+          // A new key mounts a fresh picker in the open one's place.
+          key={mode}
+          open={open}
+          onOpenChange={setOpen}
+          label={mode}
+          segments={commands}
+          query=""
+          onQueryChange={() => undefined}
+          emptyMessage="No results found"
+          onAccept={() => "keepOpen"}
+        />
+      </>
+    );
+  }
+
+  it("returns focus where the picker it replaced would", async () => {
+    render(<Swapping />);
+    const { trigger } = await openPicker("first");
+    act(() => swap());
+    const second = await screen.findByRole("combobox", { name: "second" });
+    await waitFor(() => expect(second).toHaveFocus());
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(trigger).toHaveFocus());
+  });
+
+  it("hands nothing to a picker opened later", async () => {
+    const elsewhere = document.createElement("button");
+    document.body.append(elsewhere);
+    onTestFinished(() => elsewhere.remove());
+    render(<Swapping />);
+    await openPicker("first");
+    // Unmounted while focused, with nothing mounting in its place.
+    act(() => close());
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    elsewhere.focus();
+    act(() => swap());
+    await userEvent.click(screen.getByRole("button", { name: "Open picker" }));
+    const second = await screen.findByRole("combobox", { name: "second" });
+    await waitFor(() => expect(second).toHaveFocus());
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(screen.getByRole("button", { name: "Open picker" })).toHaveFocus());
   });
 });
 
