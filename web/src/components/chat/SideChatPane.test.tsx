@@ -23,6 +23,12 @@ import * as filesApi from "@/lib/filesApi";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { SESSION_MENTION_HINT } from "@/lib/composerMentions";
+import {
+  SHELL_MENTION_REFUSAL,
+  SHELL_OWNER_REFUSAL,
+  SHELL_QUOTE_REFUSAL,
+  SHELL_REVIEW_COMMENT_REFUSAL,
+} from "@/components/composer/composerHighlight";
 import type { Comment } from "@/hooks/useComments";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
 import { clearSessionDrafts, getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
@@ -36,6 +42,18 @@ import type * as UseWorkspaceChangedFilesModule from "@/hooks/useWorkspaceChange
 import { gridCellComposerKey, useChatStore, type ChatState } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
+import * as CodeMirrorModule from "@/components/composer/engine/codeMirrorComposerModule";
+import {
+  codeMirrorComposerLoad,
+  resetCodeMirrorComposerLoadForTests,
+} from "@/components/composer/engine/codeMirrorComposerLoader";
+import { composerTargetOf } from "@/components/composer/engine/composerInput";
+import { insertComposerText } from "@/lib/composerText";
+import { COMMAND_TOKEN_CLASS } from "@/components/composer/commandToken";
+import {
+  resetDesignOutbox,
+  useDesignOutbox,
+} from "@/components/BrowserPane/designTools/core/designOutbox";
 import { SideChatPane } from "./SideChatPane";
 
 vi.mock("@/store/chatStore", async (importOriginal) => ({
@@ -58,13 +76,15 @@ const mockSession = vi.hoisted(() => ({
 // A conversation id whose snapshot the mock should report as still loading.
 const loadingSession = vi.hoisted(() => ({ id: null as string | null }));
 const failedSession = vi.hoisted(() => ({ id: null as string | null }));
+// A conversation id whose snapshot hasn't arrived: like the real hook, it reports no session yet.
+const unfetchedSession = vi.hoisted(() => ({ id: null as string | null }));
 vi.mock("@/hooks/useSession", () => ({
   useSession: (id?: string | null) => ({
     session:
-      id && id === failedSession.id
+      id && (id === failedSession.id || id === unfetchedSession.id)
         ? null
         : { ...mockSession.snapshot, labels: mockSession.labels },
-    isLoading: id != null && id === loadingSession.id,
+    isLoading: id != null && (id === loadingSession.id || id === unfetchedSession.id),
     error: id && id === failedSession.id ? new Error("Snapshot unavailable") : null,
   }),
 }));
@@ -184,6 +204,7 @@ beforeEach(() => {
   mockSession.labels = {};
   mockSession.snapshot = {};
   loadingSession.id = null;
+  unfetchedSession.id = null;
   failedSession.id = null;
   conversationRegistry.clear();
   send.mockReset().mockResolvedValue(undefined);
@@ -241,6 +262,38 @@ describe("undelivered startup messages", () => {
       within(notice).getByRole("button", { name: "Copy message to new session" }),
     ).toBeEnabled();
   });
+});
+
+describe("design tool requests", () => {
+  it.each([false, true])(
+    "lists the chat's unsent design requests once (full session: %s)",
+    async (fullSession) => {
+      await act(async () =>
+        useDesignOutbox.setState({
+          requests: [
+            {
+              id: "design_1",
+              tabId: childId,
+              conversationId: childId,
+              label: "Draw: bigger",
+              text: "Bigger",
+              files: [],
+              status: "failed",
+              error: "Couldn't send",
+            },
+          ],
+        }),
+      );
+      renderPane(
+        <MemoryRouter>
+          <SideChatPane childId={childId} fullSession={fullSession} />
+        </MemoryRouter>,
+      );
+      expect(await screen.findByTestId("design-outbox-strip")).toHaveTextContent("Draw: bigger");
+      expect(screen.getAllByTestId("design-outbox-strip")).toHaveLength(1);
+      act(() => resetDesignOutbox());
+    },
+  );
 });
 
 describe("editing a sent side-chat message", () => {
@@ -1757,6 +1810,40 @@ describe("grid cell composer shares its session's draft", () => {
     expect(useChatStore.getState().sideChatComposers[gridCellComposerKey(childId)]).toBeUndefined();
   });
 
+  it("refuses a `!` send that carries a tag and keeps the draft", () => {
+    const text = "!cat @src/app.ts";
+    bridgedCell({ text, files: [], mentions: { files: [fileTag], sessions: [] } });
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toHaveTextContent(
+      SHELL_MENTION_REFUSAL,
+    );
+
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+
+    expect(send).not.toHaveBeenCalled();
+    expect(screen.getByTestId("side-chat-command-notice")).toHaveTextContent(SHELL_MENTION_REFUSAL);
+    expect(screen.getByTestId("side-chat-input")).toHaveValue(text);
+  });
+
+  // The review comments alone would make a bare `!` a command.
+  it.each(["!", "!git status"])(
+    "refuses a `!` send of %j that review comments would reach the shell with",
+    (text) => {
+      bridgedCell({ text, files: [], reviewComments: [reviewComment] });
+
+      expect(screen.getByTestId("composer-shell-mode-indicator")).toHaveTextContent(
+        SHELL_REVIEW_COMMENT_REFUSAL,
+      );
+      expect(screen.getByTestId("composer-highlight-overlay").textContent).toBe(text);
+      fireEvent.click(screen.getByTestId("side-chat-send"));
+
+      expect(send).not.toHaveBeenCalled();
+      expect(screen.getByTestId("side-chat-command-notice")).toHaveTextContent(
+        SHELL_REVIEW_COMMENT_REFUSAL,
+      );
+      expect(screen.getByTestId("side-chat-input")).toHaveValue(text);
+    },
+  );
+
   /** Fails a grid send of `sent` and mounts the cell, which restores it. */
   function failedGridSend(sent: string) {
     const entry = conversationRegistry.acquire(childId);
@@ -2907,6 +2994,147 @@ it.each([false, true])(
   },
 );
 
+describe("side-chat composer highlight", () => {
+  it("tints a known side-chat command but not an unknown one", () => {
+    conversationRegistry.acquire(childId).setState({ sessionHarness: "claude-sdk" });
+    skillsFixture.current = {
+      skills: [{ name: "team", description: "Run a team" }],
+      skillsStatus: "ready",
+    };
+    renderPane(<SideChatPane childId={childId} />);
+    const input = screen.getByTestId("side-chat-input");
+
+    fireEvent.change(input, { target: { value: "/team fix it" } });
+    const overlay = screen.getByTestId("composer-highlight-overlay");
+    expect(overlay).toHaveTextContent("/team fix it");
+    expect(within(overlay).getByText("/team")).toHaveClass("text-brand-accent");
+
+    fireEvent.change(input, { target: { value: "/typo fix it" } });
+    expect(screen.queryByTestId("composer-highlight-overlay")).toBeNull();
+  });
+
+  it("marks a codex-native owner's `!` draft as a shell command and sends it unchanged", () => {
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
+    renderPane(<SideChatPane childId={childId} />);
+    const input = screen.getByTestId("side-chat-input");
+    fireEvent.change(input, { target: { value: "!git status" } });
+    expect(input).toHaveAccessibleDescription("Shell command");
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(send.mock.calls[0]?.[0]).toBe("!git status");
+  });
+
+  it("classifies a `!` draft by the trimmed text it sends", () => {
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
+    renderPane(<SideChatPane childId={childId} />);
+    const input = screen.getByTestId("side-chat-input");
+    // JS trimming drops U+FEFF but Python's doesn't, so the raw draft alone reads as a command.
+    fireEvent.change(input, { target: { value: "!\ufeff" } });
+    expect(screen.queryByTestId("composer-shell-mode-indicator")).toBeNull();
+    expect(input).not.toHaveAttribute("data-shell-command");
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(send).toHaveBeenCalledExactlyOnceWith("!", "agent_side", undefined, {
+      pinnedConversationId: childId,
+    });
+  });
+
+  it("refuses a `!` send that a reply quote holds, and keeps it", () => {
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
+    useChatStore.setState({
+      sideChatComposers: {
+        [childId]: {
+          text: "",
+          files: [],
+          quotes: [{ id: "q", before: "!ls", text: "quoted line" }],
+        },
+      },
+    });
+    renderPane(<SideChatPane childId={childId} />);
+    const input = screen.getByTestId("side-chat-input");
+    expect(input).toHaveAttribute("data-shell-command", "true");
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toHaveTextContent(
+      SHELL_QUOTE_REFUSAL,
+    );
+
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    expect(send).not.toHaveBeenCalled();
+    expect(screen.getByTestId("side-chat-command-notice")).toHaveTextContent(SHELL_QUOTE_REFUSAL);
+    expect(screen.getByRole("textbox", { name: "Reply text before quote 1" })).toHaveValue("!ls");
+  });
+
+  it("waits for the session's permission level before offering shell mode", () => {
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
+    unfetchedSession.id = childId;
+    const view = renderPane(<SideChatPane childId={childId} />);
+    fireEvent.change(screen.getByTestId("side-chat-input"), { target: { value: "!git status" } });
+    expect(screen.queryByTestId("composer-shell-mode-indicator")).toBeNull();
+
+    unfetchedSession.id = null;
+    view.rerender(<SideChatPane childId={childId} />);
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
+  });
+
+  it("tells a codex-native non-owner their `!` send will be refused, and keeps it", () => {
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
+    mockSession.snapshot = { permissionLevel: 2 };
+    renderPane(<SideChatPane childId={childId} />);
+    const input = screen.getByTestId("side-chat-input");
+    fireEvent.change(input, { target: { value: "!git status" } });
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toHaveTextContent(
+      SHELL_OWNER_REFUSAL,
+    );
+
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(send).not.toHaveBeenCalled();
+    expect(screen.getByTestId("side-chat-command-notice")).toHaveTextContent(SHELL_OWNER_REFUSAL);
+    expect(input).toHaveValue("!git status");
+  });
+
+  it("does not offer shell mode on a pending Codex tab, whose text seeds a `/side` fork", () => {
+    renderPane(
+      <SideChatPane childId="pending:side" onStart={vi.fn()} pendingHarness="codex-native" />,
+    );
+    fireEvent.change(screen.getByTestId("side-chat-input"), { target: { value: "!ls" } });
+    expect(screen.queryByTestId("composer-shell-mode-indicator")).toBeNull();
+    expect(screen.queryByTestId("composer-highlight-overlay")).toBeNull();
+  });
+
+  // Elsewhere the text becomes the child's first message, which runs as native input.
+  it("offers shell mode on a pending Claude Code tab, and starts it as typed", () => {
+    const onStart = vi.fn(async () => {});
+    renderPane(
+      <SideChatPane childId="pending:side" onStart={onStart} pendingHarness="claude-native" />,
+    );
+    const input = screen.getByTestId("side-chat-input");
+    fireEvent.change(input, { target: { value: "!ls" } });
+    expect(input).toHaveAttribute("data-shell-command", "true");
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toHaveTextContent("Shell command");
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onStart).toHaveBeenCalledExactlyOnceWith("!ls");
+  });
+
+  it("refuses a pending Claude Code tab's quoted `!` start, and keeps it", () => {
+    const onStart = vi.fn(async () => {});
+    useChatStore.setState({
+      sideChatComposers: {
+        "pending:side": {
+          text: "",
+          files: [],
+          quotes: [{ id: "q", before: "!ls", text: "quoted line" }],
+        },
+      },
+    });
+    renderPane(
+      <SideChatPane childId="pending:side" onStart={onStart} pendingHarness="claude-native" />,
+    );
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toHaveTextContent(
+      SHELL_QUOTE_REFUSAL,
+    );
+    fireEvent.keyDown(screen.getByTestId("side-chat-input"), { key: "Enter" });
+    expect(onStart).not.toHaveBeenCalled();
+    expect(screen.getByTestId("side-chat-command-notice")).toHaveTextContent(SHELL_QUOTE_REFUSAL);
+  });
+});
+
 describe("grid cell @-mention picker", () => {
   const readme = {
     path: "readme.md",
@@ -3261,5 +3489,80 @@ describe("grid cell @-mention picker", () => {
     expect(screen.queryByTitle("Attach readme.md")).toBeNull();
     expect(mentionListing.workspaceQueries).toContainEqual({ owner: childId, enabled: false });
     expect(mentionListing.workspaceQueries.some((query) => query.enabled === true)).toBe(false);
+  });
+});
+
+describe("side-chat composer engine", () => {
+  const withFlag = (enabled: boolean) => (
+    <CapabilitiesProvider
+      info={{ ...FALLBACK_SERVER_INFO, features: { chat_composer_codemirror: enabled } }}
+    >
+      <SideChatPane childId={childId} />
+    </CapabilitiesProvider>
+  );
+  beforeEach(() => resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule));
+  afterEach(() => resetCodeMirrorComposerLoadForTests());
+
+  it("writes in CodeMirror and sends a typed question when the flag is on", async () => {
+    renderPane(withFlag(true));
+    await waitFor(() =>
+      expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
+    );
+    const editor = screen.getByTestId("side-chat-input");
+    act(() => insertComposerText(composerTargetOf(editor)!, "Follow up"));
+    fireEvent.keyDown(editor, { key: "Enter" });
+    expect(send).toHaveBeenCalledExactlyOnceWith("Follow up", "agent_side", undefined, {
+      pinnedConversationId: childId,
+    });
+  });
+
+  const commandMarks = () =>
+    Array.from(document.querySelectorAll('[data-testid="composer-command-token"]'), (mark) => [
+      mark.textContent,
+      mark.className,
+    ]);
+  async function typeInEditor(value: string) {
+    await waitFor(() =>
+      expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
+    );
+    const editor = screen.getByTestId("side-chat-input");
+    act(() => insertComposerText(composerTargetOf(editor)!, value));
+    return editor;
+  }
+
+  it("tints a known command in CodeMirror but not an unknown one", async () => {
+    conversationRegistry.acquire(childId).setState({ sessionHarness: "claude-sdk" });
+    skillsFixture.current = {
+      skills: [{ name: "team", description: "Run a team" }],
+      skillsStatus: "ready",
+    };
+    renderPane(withFlag(true));
+    const editor = await typeInEditor("/team fix it");
+    expect(commandMarks()).toEqual([["/team", COMMAND_TOKEN_CLASS]]);
+    expect(editor).toHaveAttribute("data-slash-command", "true");
+
+    act(() => insertComposerText(composerTargetOf(editor)!, "/typo fix it", 0, 12));
+    expect(commandMarks()).toEqual([]);
+  });
+
+  it("tints a codex-native owner's `!` in CodeMirror and sends the shell command unchanged", async () => {
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
+    renderPane(withFlag(true));
+    const editor = await typeInEditor("!git status");
+    expect(commandMarks()).toEqual([["!", COMMAND_TOKEN_CLASS]]);
+    expect(editor).toHaveAttribute("data-shell-command", "true");
+    expect(editor).toHaveAccessibleDescription("Shell command");
+
+    fireEvent.keyDown(editor, { key: "Enter" });
+    expect(send).toHaveBeenCalledExactlyOnceWith("!git status", "agent_side", undefined, {
+      pinnedConversationId: childId,
+    });
+  });
+
+  it("keeps the textarea when the flag is off", () => {
+    renderPane(withFlag(false));
+    expect(screen.getByTestId("side-chat-input").tagName).toBe("TEXTAREA");
+    expect(document.querySelector('[data-composer-engine="codemirror"]')).toBeNull();
+    expect(codeMirrorComposerLoad().status).toBe("idle");
   });
 });

@@ -18,7 +18,10 @@ the header menu), and each place is a separate entry point.
   session remains bound. The representative pins/moves the entire family; nested members have no pin
   action, and legacy individual pins keep their place inside the nest.
   Opening Add nested agent shows a draft row in the family until creation
-  replaces it; leaving the composer without submitting removes the draft. Owned active sessions can move into an existing nest by dragging onto its center
+  replaces it. Navigate away and click the draft row to resume its text, attachments,
+  and settings during the same page load. Right-click the draft row and choose
+  **Delete draft** to remove it.
+  Owned active sessions can move into an existing nest by dragging onto its center
   or choosing **Move session → Nests** in the sidebar menu. Choose a searchable
   destination, or **Remove from nest** to detach just that session. Dragging a
   nested member into the session list above or below a nest removes it; a floating
@@ -378,6 +381,24 @@ drop a nested session into the session list above or below a nest to remove it.
 Other rows retain pin/custom ordering. Removal targets appear over the sidebar
 footer, keeping session rows in place and available as drop targets.
 
+**Mute a session:** in the sidebar row menu (three-dot or right-click) or the
+project Kanban card menu, choose Mute. In the sidebar, the title dims;
+an idle row shows a muted bell in its trailing status slot, while active status
+indicators and unsent drafts take priority. A muted
+session sends no browser or desktop notifications, shows no unread dot in the
+sidebar, Kanban board, or Canvas, counts toward no app badge, and stays out of
+the Unread status group, the Kanban Unread lane, and the Inbox's Unread list.
+It can still be marked read, but not unread: the menus hide Mark as unread,
+bulk Mark as unread skips it, the unread shortcut declines, and its Kanban card
+can't be dragged into Unread. Its approvals
+and questions still appear under Awaiting response. The mute is yours alone:
+collaborators on a shared session are unaffected, and a fork starts unmuted.
+Choose Unmute to undo. The item appears only on servers that advertise
+`session_mute` in `/v1/info`.
+Failed output from a muted automation session is also hidden from Unread;
+its failure remains visible on the automation card and in run history.
+Automation failures that never created a session keep their separate Inbox cards.
+
 **Project folder:** right-click its header or open its three-dot menu, then
 choose Rename project. Start typing as soon as the dialog opens. Delete project
 archives every session in the folder; when any of them has an agent working,
@@ -531,9 +552,8 @@ the new session opens beside that board; on narrow screens, Back to canvas
 returns to it. Reloading a temporary session before creation finishes returns to
 the same board. Open sidebar appears on the board or, when the board is hidden,
 in the conversation header. On desktop, hovering previews the sidebar and clicking
-opens it. At md and wider, the macOS app uses its existing titlebar toggle, Search,
-and Settings; in a narrower window it uses the conversation header's Open sidebar
-button and the drawer's Search and Settings, all right of or below the window buttons.
+opens it. The macOS app uses its existing titlebar toggle, Search, and Settings at
+every window width: the desktop app keeps the desktop layout in a narrow window.
 On macOS desktop, the board and its controls stay below the window title bar,
 including while focusing a conversation or using a narrow window.
 Open a Canvas session outside the loaded sidebar pages to see its current host
@@ -907,6 +927,10 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/fork_session/test_fork_switch_agent.py::test_fork_switch_agent_carries_history`.
   Its SDK-to-SDK target is a built-in agent that only the test's own server
   loads; run it with plain `uv run pytest` so that target is available.
+- **`fork`, sidebar row while the session list lags:**
+  `tests/e2e_ui/fork_session/test_fork_appears_in_sidebar.py::test_fork_row_while_list_lags_and_push_misses_fork`
+  hides the fork from list reads and pushes; the row must appear after Clone and
+  stay after the user returns to the source session.
 - **`fork-sandbox-repositories`, header, message, sidebar row, right-click, and phone header:**
   `tests/browser_ui/chat/test_fork_sandbox_repositories.py::test_sandbox_fork_edits_multiple_repositories_and_branches`
   runs without a repro instance using `uv run pytest <test>
@@ -1369,8 +1393,8 @@ plain `uv run pytest`, which starts a private server for the test.
 For the desktop Close shortcut, select a side-chat tab in an ordinary
 session and press Cmd/Ctrl+W. Only that side chat should close; the parent and
 siblings stay open. If stopping the side chat fails, its tab, draft and queued
-messages must remain. Narrow the desktop window below 768 pixels and repeat:
-the hidden rail's tabs stay open and the app returns to the new-session page.
+messages must remain. A narrow desktop window keeps the rail, so the shortcut
+behaves the same there.
 Native accelerator delivery requires an Electron run; component tests cover
 selection, visibility, and stop failure.
 

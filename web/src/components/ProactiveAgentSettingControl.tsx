@@ -1,4 +1,4 @@
-import { useId, useState } from "react";
+import { useState } from "react";
 import { SettingsLabel } from "@/components/SettingsLabel";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
@@ -8,6 +8,13 @@ import {
   type ProactiveAgentSettingScope,
 } from "@/hooks/useProactiveAgentSettings";
 import { PROACTIVE_AGENT_DISPLAY_NAME } from "@/lib/proactiveInbox";
+import { PROACTIVE_AGENT_ENTRY } from "@/pages/settings/search/catalog/general";
+import { SettingsItem } from "@/pages/settings/search/SettingsItem";
+import {
+  settingsControlProps,
+  settingsLabelId,
+  settingsDescriptionId,
+} from "@/pages/settings/search/settingsControl";
 
 const COPY: Record<ProactiveAgentSettingScope, string> = {
   me: `${PROACTIVE_AGENT_DISPLAY_NAME} reads your recent sessions on a schedule and posts follow-ups, related information, and reminders to your Inbox.`,
@@ -22,7 +29,6 @@ export function ProactiveAgentSettingControl({ scope }: { scope: ProactiveAgentS
   const { available, settings, query } = useProactiveAgentSettings();
   const setSetting = useSetProactiveAgentSetting();
   const [error, setError] = useState<string | null>(null);
-  const labelId = useId();
   if (!available) return null;
   if (!settings) {
     if (query.isError) {
@@ -33,6 +39,7 @@ export function ProactiveAgentSettingControl({ scope }: { scope: ProactiveAgentS
         >
           <span>Couldn’t load {PROACTIVE_AGENT_DISPLAY_NAME} settings.</span>
           <Button
+            {...settingsControlProps(PROACTIVE_AGENT_ENTRY, "retry")}
             variant="outline"
             size="sm"
             onClick={() => void query.refetch()}
@@ -54,16 +61,17 @@ export function ProactiveAgentSettingControl({ scope }: { scope: ProactiveAgentS
     ? `An admin turned ${PROACTIVE_AGENT_DISPLAY_NAME} off for this workspace.`
     : COPY[scope];
   return (
-    <div className="flex flex-col gap-2">
+    <SettingsItem entry={PROACTIVE_AGENT_ENTRY} className="flex flex-col gap-2">
       <div className="flex items-start justify-between gap-6">
         <SettingsLabel
           label={PROACTIVE_AGENT_DISPLAY_NAME}
-          labelId={labelId}
+          labelId={settingsLabelId(PROACTIVE_AGENT_ENTRY)}
+          descriptionId={settingsDescriptionId(PROACTIVE_AGENT_ENTRY)}
           className="flex-1"
           description={description}
         />
         <Switch
-          aria-labelledby={labelId}
+          {...settingsControlProps(PROACTIVE_AGENT_ENTRY, "toggle")}
           checked={checked}
           disabled={turnedOffByAdmin || setSetting.isPending}
           onCheckedChange={(enabled) => {
@@ -80,6 +88,6 @@ export function ProactiveAgentSettingControl({ scope }: { scope: ProactiveAgentS
           {error}
         </p>
       )}
-    </div>
+    </SettingsItem>
   );
 }

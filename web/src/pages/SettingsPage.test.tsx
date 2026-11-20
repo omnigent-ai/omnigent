@@ -70,6 +70,7 @@ const mocks = vi.hoisted(() => ({
   bootFallback: false,
   sessionTitleInstructions: false,
   projectKanban: false,
+  floatingComposer: false,
   nestedAgents: false,
   advisorAvailable: false,
   authenticatedFetch: vi.fn(),
@@ -111,7 +112,10 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
           archive_worktree_cleanup: mocks.archiveWorktreeCleanup,
           session_title_instructions: mocks.sessionTitleInstructions,
           proactive_agent_available: mocks.advisorAvailable,
-          features: { project_kanban: mocks.projectKanban },
+          features: {
+            project_kanban: mocks.projectKanban,
+            floating_composer: mocks.floatingComposer,
+          },
         },
 }));
 vi.mock("@/lib/githubIntegration", () => ({
@@ -331,6 +335,7 @@ beforeEach(() => {
   mocks.bootFallback = false;
   mocks.sessionTitleInstructions = false;
   mocks.projectKanban = false;
+  mocks.floatingComposer = false;
   mocks.nestedAgents = false;
   mocks.advisorAvailable = false;
   mocks.authenticatedFetch.mockReset();
@@ -567,6 +572,57 @@ describe("SettingsPage", () => {
     expect(
       await screen.findByRole("switch", { name: "Show Omnigent from anywhere" }),
     ).toBeInTheDocument();
+  });
+
+  it("offers the New Agent shortcut only with floating_composer on and a shell that takes its id", async () => {
+    const getGlobalShortcut = vi.fn(async (id?: string) =>
+      id === "floatingComposer"
+        ? { enabled: true, accelerator: "CommandOrControl+Shift+Space" }
+        : { enabled: false, accelerator: "Alt+Space" },
+    );
+    const shell = (floatingComposerShortcut: boolean) => {
+      const getDesktopFeatures = vi.fn(async () => ({
+        floatingComposer: true,
+        floatingComposerShortcut,
+      }));
+      (window as unknown as Record<string, unknown>).omnigentDesktop = {
+        kind: "electron",
+        setBadgeCount: vi.fn(),
+        notify: vi.fn(),
+        getGlobalShortcut,
+        setGlobalShortcut: vi.fn(),
+        getDesktopFeatures,
+      };
+      return getDesktopFeatures;
+    };
+    const newAgent = { name: "Open New Agent from anywhere" };
+
+    // An older shell would read and save "show" for any id.
+    mocks.floatingComposer = true;
+    const oldShellFeatures = shell(false);
+    renderPage("/settings/general");
+    expect(
+      await screen.findByRole("switch", { name: "Show Omnigent from anywhere" }),
+    ).toBeInTheDocument();
+    // Let the New Agent row's own check answer before asserting it stayed away.
+    await waitFor(() => expect(oldShellFeatures).toHaveBeenCalled());
+    await act(async () => {});
+    expect(screen.queryByRole("switch", newAgent)).toBeNull();
+    expect(getGlobalShortcut).not.toHaveBeenCalledWith("floatingComposer");
+    cleanup();
+
+    mocks.floatingComposer = false;
+    shell(true);
+    renderPage("/settings/general");
+    await screen.findByRole("switch", { name: "Show Omnigent from anywhere" });
+    expect(screen.queryByRole("switch", newAgent)).toBeNull();
+    cleanup();
+
+    mocks.floatingComposer = true;
+    shell(true);
+    renderPage("/settings/general");
+    expect(await screen.findByRole("switch", newAgent)).toBeChecked();
+    expect(getGlobalShortcut).toHaveBeenCalledWith("floatingComposer");
   });
 
   it("offers the kanban board switch under Composer only when the server has the board", () => {
@@ -2030,6 +2086,11 @@ describe("SettingsPage", () => {
         .querySelector('[data-settings-control="always-steer:"]')
         ?.getAttribute("aria-labelledby"),
     ).toBe("settings-always-steer-label");
+  });
+
+  it("renders the General terminal clipboard row from its Settings catalog entry", () => {
+    renderPage("/settings/general");
+    expect(document.querySelector('[data-settings-item="terminal-clipboard"]')).not.toBeNull();
   });
 
   it("renders the Sandbox Integrations rows from their Settings catalog entries", async () => {

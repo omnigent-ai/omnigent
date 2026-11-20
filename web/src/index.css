@@ -15,11 +15,29 @@
  * app theme customization in this file. */
 @source "../node_modules/streamdown/dist/*.js";
 
-@custom-variant dark (&:is(.dark *));
-/* Touch UI for the mobile layout. Width alone picks the layout, whatever the
- * input device: below md is touch UI, md and up is the mouse-driven desktop UI. */
-@custom-variant mobile-app {
+/* Width picks the layout: below md the mobile touch UI, md and up the mouse-driven desktop UI.
+ * The desktop app marks its style root `data-desktop-app` and keeps the desktop UI at every width.
+ * Raw rules nest `@variant md` / `@variant max-md`; a selector list shares its highest specificity. */
+@custom-variant md {
+  @media (width >= 73.8125rem) {
+    @slot;
+  }
+  &:where([data-desktop-app], [data-desktop-app] *) {
+    @slot;
+  }
+}
+@custom-variant max-md {
   @media (width < 73.8125rem) {
+    &:where(:not([data-desktop-app], [data-desktop-app] *)) {
+      @slot;
+    }
+  }
+}
+
+@custom-variant dark (&:is(.dark *));
+/* Touch UI for the mobile layout, whatever the input device. */
+@custom-variant mobile-app {
+  @variant max-md {
     @slot;
   }
 }
@@ -27,7 +45,7 @@
 /* CSS-pixel touch floor for the mobile layout. */
 @utility mobile-touch-target {
   /* Doubled specificity so row resets like min-h-0 can't win. */
-  @media (width < 73.8125rem) {
+  @variant max-md {
     &:is(:root, :root *) {
       min-width: 44px;
       min-height: 44px;
@@ -142,8 +160,8 @@
  * bypasses the runtime typography mapping. Unitless line heights scale with
  * font size: 1.6 for interface and message text, and 1.3 for captions. */
 @theme {
-  /* The mobile layout runs up to an iPad Air in landscape (1180px). Raw
-   * `@media` rules below and MOBILE_BREAKPOINT_PX in useIsMobileViewport repeat it. */
+  /* The mobile layout runs up to an iPad Air in landscape (1180px). The layout
+   * variants above and MOBILE_BREAKPOINT_PX in useIsMobileViewport repeat it. */
   --breakpoint-md: 73.8125rem;
   /* App-default interface/body text — every control, label, and menu item. */
   --font-weight-normal: 450;
@@ -487,14 +505,16 @@
   @apply mobile-touch-target;
 }
 
-@media (width < 73.8125rem) {
-  .composer-add-menu [role="menuitem"].mobile-touch-target {
+.composer-add-menu [role="menuitem"].mobile-touch-target {
+  @variant max-md {
     @apply h-7 rounded-md px-2 py-[3px] text-ui leading-4;
     min-height: 28px;
     @apply mobile-touch-target;
   }
+}
 
-  .composer-add-menu [role="menuitem"] svg {
+.composer-add-menu [role="menuitem"] svg {
+  @variant max-md {
     width: 16px;
     height: 16px;
   }
@@ -516,8 +536,8 @@
   background-color: var(--composer-surface-bg);
 }
 
-@media (width < 73.8125rem) {
-  [data-mobile-composer] {
+[data-mobile-composer] {
+  @variant max-md {
     --composer-compact-start: 8px;
     --composer-compact-end: 8px;
     --composer-morph-duration: 280ms;
@@ -572,7 +592,8 @@
         padding var(--composer-morph-duration) var(--composer-morph-easing);
     }
 
-    > [data-composer-input-area] > textarea {
+    /* The input element of either engine: the textarea or the CodeMirror host. */
+    > [data-composer-input-area] > [data-composer-engine] {
       display: block;
       min-height: 1lh;
     }
@@ -624,7 +645,8 @@
       display: none;
     }
 
-    &[data-composer-hint-placeholder] > [data-composer-input-area] > textarea::placeholder {
+    &[data-composer-hint-placeholder] > [data-composer-input-area] > textarea::placeholder,
+    &[data-composer-hint-placeholder] > [data-composer-input-area] .cm-placeholder {
       color: transparent;
     }
 
@@ -646,7 +668,7 @@
         pointer-events: none;
       }
 
-      > [data-composer-input-area] > textarea {
+      > [data-composer-input-area] > [data-composer-engine] {
         min-height: 1lh;
         height: 1lh !important;
         overflow: hidden;
@@ -654,11 +676,12 @@
         pointer-events: auto;
       }
 
-      > [data-composer-input-area] > :not(textarea) {
+      > [data-composer-input-area] > :not([data-composer-engine]) {
         visibility: hidden;
       }
 
-      > [data-composer-input-area] > textarea::placeholder {
+      > [data-composer-input-area] > textarea::placeholder,
+      > [data-composer-input-area] .cm-placeholder {
         color: var(--muted-foreground);
       }
 
@@ -695,11 +718,15 @@
   }
 }
 
-@media (width < 73.8125rem) and (prefers-reduced-motion: reduce) {
-  [data-mobile-composer],
-  [data-mobile-composer] > [aria-hidden="true"] > .glass-surface,
-  [data-mobile-composer] > [data-composer-input-area] {
-    transition: none;
+[data-mobile-composer] {
+  @variant max-md {
+    @media (prefers-reduced-motion: reduce) {
+      &,
+      > [aria-hidden="true"] > .glass-surface,
+      > [data-composer-input-area] {
+        transition: none;
+      }
+    }
   }
 }
 
@@ -733,8 +760,8 @@
   border-top-right-radius: 0;
 }
 
-@media (width < 73.8125rem) {
-  .new-chat-workspace-controls .composer-context-bar {
+.new-chat-workspace-controls .composer-context-bar {
+  @variant max-md {
     width: auto;
     max-width: 100%;
     height: auto;
@@ -746,12 +773,16 @@
     border: 0;
     border-radius: 20px;
   }
+}
 
-  .new-chat-workspace-controls .composer-context-bar > * {
+.new-chat-workspace-controls .composer-context-bar > * {
+  @variant max-md {
     max-width: 100%;
   }
+}
 
-  .new-chat-workspace-controls .composer-context-bar button {
+.new-chat-workspace-controls .composer-context-bar button {
+  @variant max-md {
     min-height: 44px;
     height: auto;
     max-width: 100%;
@@ -762,8 +793,10 @@
     line-height: var(--text-ui--line-height);
     color: var(--muted-foreground);
   }
+}
 
-  .new-chat-workspace-controls .composer-context-bar button:hover {
+.new-chat-workspace-controls .composer-context-bar button:hover {
+  @variant max-md {
     background-color: transparent;
     color: var(--foreground);
   }
@@ -775,8 +808,8 @@
   background-image: none;
 }
 
-@media (width < 73.8125rem) {
-  .composer-queued-surface {
+.composer-queued-surface {
+  @variant max-md {
     --icon-container-default: 20px;
   }
 }
@@ -850,77 +883,80 @@
   }
 }
 
-/* Mobile icon controls change the glyph's opacity while the surface stays still. */
-@media (width < 73.8125rem) {
-  [data-slot="button"][data-size^="icon"],
-  [data-mobile-icon-button] {
-    --mobile-icon-button-background: transparent;
-    --mobile-icon-button-foreground: var(--foreground);
-    --mobile-icon-button-border: transparent;
-    background-color: var(--mobile-icon-button-background) !important;
-    color: var(--mobile-icon-button-foreground) !important;
-    border-color: var(--mobile-icon-button-border) !important;
-    outline: none !important;
-    box-shadow: none !important;
+/* Mobile icon controls change the glyph's opacity while the surface stays still.
+ * `*` adds no specificity, so each selector in the list keeps its own. */
+* {
+  @variant max-md {
+    &[data-slot="button"][data-size^="icon"],
+    &[data-mobile-icon-button] {
+      --mobile-icon-button-background: transparent;
+      --mobile-icon-button-foreground: var(--foreground);
+      --mobile-icon-button-border: transparent;
+      background-color: var(--mobile-icon-button-background) !important;
+      color: var(--mobile-icon-button-foreground) !important;
+      border-color: var(--mobile-icon-button-border) !important;
+      outline: none !important;
+      box-shadow: none !important;
 
-    &:focus-visible {
-      outline: 2px solid var(--ring) !important;
-      outline-offset: 2px;
-    }
-
-    &[data-variant="default"] {
-      --mobile-icon-button-background: var(--primary-cta);
-      --mobile-icon-button-foreground: var(--primary-cta-foreground);
-    }
-
-    &[data-variant="default"]:disabled {
-      --mobile-icon-button-background: var(--muted);
-      --mobile-icon-button-foreground: var(--muted-foreground);
-    }
-
-    &[data-variant="secondary"] {
-      --mobile-icon-button-background: var(--secondary);
-      --mobile-icon-button-foreground: var(--secondary-foreground);
-    }
-
-    &[data-variant="outline"] {
-      --mobile-icon-button-background: var(--background);
-      --mobile-icon-button-border: var(--border);
-
-      .dark & {
-        --mobile-icon-button-background: var(--input);
-        --mobile-icon-button-border: var(--input);
+      &:focus-visible {
+        outline: 2px solid var(--ring) !important;
+        outline-offset: 2px;
       }
-    }
 
-    &[data-variant="destructive"] {
-      --mobile-icon-button-background: color-mix(in srgb, var(--destructive) 10%, transparent);
-      --mobile-icon-button-foreground: var(--destructive);
-
-      .dark & {
-        --mobile-icon-button-background: color-mix(in srgb, var(--destructive) 20%, transparent);
+      &[data-variant="default"] {
+        --mobile-icon-button-background: var(--primary-cta);
+        --mobile-icon-button-foreground: var(--primary-cta-foreground);
       }
-    }
 
-    &:not(:disabled, [aria-disabled="true"]):is(:hover, :focus, :active) {
-      opacity: 1 !important;
-    }
+      &[data-variant="default"]:disabled {
+        --mobile-icon-button-background: var(--muted);
+        --mobile-icon-button-foreground: var(--muted-foreground);
+      }
 
-    :is(svg, img):not(.glass-surface *) {
-      opacity: 0.7;
-      transition: opacity 150ms ease;
-    }
+      &[data-variant="secondary"] {
+        --mobile-icon-button-background: var(--secondary);
+        --mobile-icon-button-foreground: var(--secondary-foreground);
+      }
 
-    &:not(:disabled, [aria-disabled="true"]):is(
-        :hover,
-        :focus,
-        :active,
-        [aria-expanded="true"],
-        [aria-pressed="true"],
-        [data-state="open"]
-      )
+      &[data-variant="outline"] {
+        --mobile-icon-button-background: var(--background);
+        --mobile-icon-button-border: var(--border);
+
+        .dark & {
+          --mobile-icon-button-background: var(--input);
+          --mobile-icon-button-border: var(--input);
+        }
+      }
+
+      &[data-variant="destructive"] {
+        --mobile-icon-button-background: color-mix(in srgb, var(--destructive) 10%, transparent);
+        --mobile-icon-button-foreground: var(--destructive);
+
+        .dark & {
+          --mobile-icon-button-background: color-mix(in srgb, var(--destructive) 20%, transparent);
+        }
+      }
+
+      &:not(:disabled, [aria-disabled="true"]):is(:hover, :focus, :active) {
+        opacity: 1 !important;
+      }
+
       :is(svg, img):not(.glass-surface *) {
-      opacity: 1;
+        opacity: 0.7;
+        transition: opacity 150ms ease;
+      }
+
+      &:not(:disabled, [aria-disabled="true"]):is(
+          :hover,
+          :focus,
+          :active,
+          [aria-expanded="true"],
+          [aria-pressed="true"],
+          [data-state="open"]
+        )
+        :is(svg, img):not(.glass-surface *) {
+        opacity: 1;
+      }
     }
   }
 }
@@ -958,11 +994,13 @@
 
 /* Sidebars keep their short open/close slide under reduced motion: without it
    the whole layout jumps a sidebar's width at once. */
-@media (width >= 73.8125rem) and (prefers-reduced-motion: reduce) {
-  .workspace-panel-motion[data-animate-visibility],
-  [data-workspace-panel-animate] .chat-header,
-  .conversations-sidebar[data-sidebar-motion] {
-    transition-duration: 200ms !important;
+.workspace-panel-motion[data-animate-visibility],
+[data-workspace-panel-animate] .chat-header,
+.conversations-sidebar[data-sidebar-motion] {
+  @variant md {
+    @media (prefers-reduced-motion: reduce) {
+      transition-duration: 200ms !important;
+    }
   }
 }
 
@@ -1076,13 +1114,15 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
 }
 
 /* Mobile drawers use the shared glass layer behind their content. */
-@media (width < 73.8125rem) {
-  :root:not(.dark) .sidebar-glass-surface {
+:root:not(.dark) .sidebar-glass-surface {
+  @variant max-md {
     --omni-glass-blur: 16px;
     --omni-glass-brightness: 1;
   }
+}
 
-  .conversations-sidebar {
+.conversations-sidebar {
+  @variant max-md {
     margin-top: -1px;
     margin-bottom: -1px;
     isolation: isolate;
@@ -1107,8 +1147,8 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
   -webkit-mask-image: linear-gradient(to bottom, black calc(100% - 32px), transparent 100%);
 }
 
-@media (width < 73.8125rem) {
-  .session-chat-transcript > [role="log"] {
+.session-chat-transcript > [role="log"] {
+  @variant max-md {
     --chat-edge-fade: linear-gradient(
       to bottom,
       transparent 0,
@@ -1119,12 +1159,16 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
     -webkit-mask-image: var(--chat-edge-fade);
     mask-image: var(--chat-edge-fade);
   }
+}
 
-  [data-chat-surface] .session-chat-transcript {
+[data-chat-surface] .session-chat-transcript {
+  @variant max-md {
     margin-bottom: calc(-1 * var(--session-composer-height, 0px));
   }
+}
 
-  [data-chat-surface] .chat-conversation-content {
+[data-chat-surface] .chat-conversation-content {
+  @variant max-md {
     padding-bottom: calc(var(--session-composer-height, 0px) + 1.5rem);
   }
 }
@@ -1244,19 +1288,23 @@ aside[aria-label="Workspace"][data-maximized] {
   backdrop-filter: var(--menu-surface-backdrop-filter);
 }
 
-@media (width < 73.8125rem) {
-  .mobile-menu-glass,
-  .mobile-menu-glass-layer,
-  .dark [data-radix-popper-content-wrapper] > :is(.mobile-menu-glass, .mobile-menu-glass-layer) {
-    isolation: isolate;
-    background: transparent !important;
-    border: 0 !important;
-    box-shadow: none !important;
-    -webkit-backdrop-filter: none !important;
-    backdrop-filter: none !important;
+.mobile-menu-glass,
+.mobile-menu-glass-layer {
+  @variant max-md {
+    &,
+    .dark [data-radix-popper-content-wrapper] > & {
+      isolation: isolate;
+      background: transparent !important;
+      border: 0 !important;
+      box-shadow: none !important;
+      -webkit-backdrop-filter: none !important;
+      backdrop-filter: none !important;
+    }
   }
+}
 
-  .mobile-menu-glass [data-slot="command"] {
+.mobile-menu-glass [data-slot="command"] {
+  @variant max-md {
     background: transparent;
   }
 }
@@ -1273,54 +1321,52 @@ html[data-electron-mac] {
 html[data-electron-mac][data-electron-full-screen] {
   --mac-traffic-light-width: 12px;
 }
-@media (min-width: 73.8125rem) {
-  /* Reserve the board's shared sidebar toggle only while navigation is closed. */
-  .app-shell:not([data-sidebar-open]) .canvas-page-heading {
+/* Reserve the board's shared sidebar toggle only while navigation is closed. */
+.app-shell:not([data-sidebar-open]) .canvas-page-heading {
+  @variant md {
     padding-left: 4rem;
   }
-  html[data-electron-mac] .app-shell .canvas-page-heading {
-    padding-left: 1.5rem;
-  }
-  /* md+: matches the sidebar's own desktop breakpoint.
-   *
-   * The sidebar starts at the window's top edge rather than below the lights, so
-   * no band of empty canvas sits above it. The title-bar row itself is NOT the
-   * sidebar's header row: the window furniture (lights + the persistent action
-   * cluster) is owned by AppShell and positioned over this top strip, so
-   * it stays put when the sidebar collapses or peeks. The sidebar wordmark sits
-   * with Search in its normal-height row directly below that strip. */
-  html[data-electron-mac] .conversations-sidebar {
-    margin-top: 0;
-  }
-  /* Hide the standard cluster: Search gets its own copy beside the wordmark,
-   * while the toggle and Back/Forward render in AppShell's persistent title bar. */
-  html[data-electron-mac] .conversations-sidebar [data-testid="sidebar-header-actions"] {
-    display: none;
-  }
-  /* Reserve the drag strip above the normal 3rem brand row so the wordmark and
-   * session list stay clear of the window furniture. */
-  html[data-electron-mac] .sidebar-header-row {
-    height: calc(var(--mac-titlebar-height) + 3rem);
-    padding: var(--mac-titlebar-height) 1rem 0;
-  }
-  /* The chat header's own open-sidebar button is redundant here: the title-bar
-   * cluster's toggle is always present (collapsed included) and carries the same
-   * dwell-to-peek, so this one would be a second copy of the same control,
-   * sitting lower and out of line with the lights. Hidden only on the mac shell
-   * — everywhere else it is the ONLY way to reopen a collapsed sidebar. */
-  html[data-electron-mac] .chat-header-sidebar-toggle {
-    display: none;
-  }
-  /* Float the peek card below the 48px drag strip, with the same 0.5rem
-   * breathing room as its other edges. The docked sidebar is unaffected. */
-  html[data-electron-mac] .conversations-sidebar.is-peek {
-    top: calc(var(--mac-titlebar-height) + 0.5rem);
-  }
-  /* The peek card already clears the drag strip, so it needs no reserved
-   * header row above its content. */
-  html[data-electron-mac] .conversations-sidebar.is-peek .sidebar-header-row {
-    display: none;
-  }
+}
+html[data-electron-mac] .app-shell .canvas-page-heading {
+  padding-left: 1.5rem;
+}
+/* The sidebar starts at the window's top edge rather than below the lights, so
+ * no band of empty canvas sits above it. The title-bar row itself is NOT the
+ * sidebar's header row: the window furniture (lights + the persistent action
+ * cluster) is owned by AppShell and positioned over this top strip, so
+ * it stays put when the sidebar collapses or peeks. The sidebar wordmark sits
+ * with Search in its normal-height row directly below that strip. */
+html[data-electron-mac] .conversations-sidebar {
+  margin-top: 0;
+}
+/* Hide the standard cluster: Search gets its own copy beside the wordmark,
+ * while the toggle and Back/Forward render in AppShell's persistent title bar. */
+html[data-electron-mac] .conversations-sidebar [data-testid="sidebar-header-actions"] {
+  display: none;
+}
+/* Reserve the drag strip above the normal 3rem brand row so the wordmark and
+ * session list stay clear of the window furniture. */
+html[data-electron-mac] .sidebar-header-row {
+  height: calc(var(--mac-titlebar-height) + 3rem);
+  padding: var(--mac-titlebar-height) 1rem 0;
+}
+/* The chat header's own open-sidebar button is redundant here: the title-bar
+ * cluster's toggle is always present (collapsed included) and carries the same
+ * dwell-to-peek, so this one would be a second copy of the same control,
+ * sitting lower and out of line with the lights. Hidden only on the mac shell
+ * — everywhere else it is the ONLY way to reopen a collapsed sidebar. */
+html[data-electron-mac] .chat-header-sidebar-toggle {
+  display: none;
+}
+/* Float the peek card below the 48px drag strip, with the same 0.5rem
+ * breathing room as its other edges. The docked sidebar is unaffected. */
+html[data-electron-mac] .conversations-sidebar.is-peek {
+  top: calc(var(--mac-titlebar-height) + 0.5rem);
+}
+/* The peek card already clears the drag strip, so it needs no reserved
+ * header row above its content. */
+html[data-electron-mac] .conversations-sidebar.is-peek .sidebar-header-row {
+  display: none;
 }
 /* The settings sidebar's "Back" row, docked or in the phone drawer, has no
  * cluster to align beside the lights, so it clears them vertically instead. */
@@ -1332,6 +1378,10 @@ html[data-electron-mac] .electron-drag-strip {
   position: absolute;
   inset: 0 0 auto 0;
   height: var(--mac-titlebar-height);
+  -webkit-app-region: drag;
+}
+/* The floating New Agent panel has no title bar; its header moves the window. */
+html[data-electron-mac] .floating-composer-header {
   -webkit-app-region: drag;
 }
 /* Canvas clears the native title bar, including focus
@@ -1384,23 +1434,6 @@ html[data-electron-mac]
   aside[aria-label="Workspace"][data-maximized]
   .workspace-tab-strip {
   padding-left: var(--mac-header-actions-clearance);
-}
-/* Below md the phone header and drawer carry their own controls, so drop the
- * title-bar cluster and start those headers right of the lights. */
-@media (width < 73.8125rem) {
-  html[data-electron-mac] .electron-sidebar-header-actions {
-    display: none;
-  }
-  html[data-electron-mac] .traffic-light-clearance,
-  html[data-electron-mac] .sidebar-header-row {
-    padding-left: var(--mac-traffic-light-width);
-  }
-  /* Drag regions ignore clipping and opacity, so the collapsed docked sidebar's
-   * header buttons would still block the title bar. Hide them once the fade ends. */
-  html[data-electron-mac] .conversations-sidebar[data-collapsed] .sidebar-header-row {
-    visibility: hidden;
-    transition: visibility 200ms;
-  }
 }
 /* Drag regions ignore z-order, so controls and overlays need counter-regions.
  * Scoped from <html> to cover portals outside AppShell on macOS only. */
@@ -1492,16 +1525,18 @@ html[data-electron-mac] .breadcrumb-folder {
 }
 
 /* Settings pages scroll under the mobile header's fade, like the session header. */
-@media (width < 73.8125rem) {
-  .settings-mobile-header::before {
-    position: absolute;
-    top: 0;
-    right: 0;
-    left: 0;
-    height: 80px;
-    pointer-events: none;
-    content: "";
-    background: linear-gradient(to bottom, var(--background) 0 48px, transparent 80px);
+.settings-mobile-header {
+  @variant max-md {
+    &::before {
+      position: absolute;
+      top: 0;
+      right: 0;
+      left: 0;
+      height: 80px;
+      pointer-events: none;
+      content: "";
+      background: linear-gradient(to bottom, var(--background) 0 48px, transparent 80px);
+    }
   }
 }
 
@@ -1555,11 +1590,6 @@ html[data-electron-mac] .breadcrumb-folder {
     /* header band + 1.5rem breathing room + OS safe area, sourced from the
        shared inset vars (was a hardcoded 5rem). */
     padding-top: calc(var(--omnigent-header-height) + 1.5rem + var(--omnigent-inset-top));
-  }
-
-  :is([data-ios-native], [data-android-native])
-    .chat-conversation-content.chat-content-under-arca-banner {
-    padding-top: 1rem;
   }
 
   [data-ios-native] .main-terminal-view,
@@ -1747,8 +1777,8 @@ html[data-electron-mac] .breadcrumb-folder {
  * while the fixed 16px root keeps every spacing/size utility geometrically
  * stable. Typed multiplication preserves each Tailwind text step relative to
  * the discrete Appearance value without affecting mobile. */
-@media (width >= 73.8125rem) {
-  :root {
+:root {
+  @variant md {
     /* The step factors below are Tailwind's rem ratios against a 16px base, so
      * they need the preference on that scale. The default 14px body maps to
      * the 16px title grid without resizing the fixed rem layout. */
@@ -1763,18 +1793,20 @@ html[data-electron-mac] .breadcrumb-folder {
     --text-xl: calc(var(--ui-ramp-anchor) * 1.25);
     --text-2xl: calc(var(--ui-ramp-anchor) * 1.5);
   }
+}
 
-  body {
+body {
+  @variant md {
     font-size: var(--desktop-ui-font-size);
   }
 }
 
 /* Mobile typography and sidebar geometry. The root remains at the global 16px
  * so rem-based controls and spacing keep the same scale across viewports. */
-@media (width < 73.8125rem) {
-  /* Mobile defaults to 15px when no preference is saved. An inline value from
-   * the Appearance setting overrides this directly, without rescaling. */
-  :root {
+/* Mobile defaults to 15px when no preference is saved. An inline value from
+ * the Appearance setting overrides this directly, without rescaling. */
+:root {
+  @variant max-md {
     --desktop-ui-font-size: 15px;
     --mobile-ui-font-size: var(--desktop-ui-font-size);
     --omnigent-header-height: 76px;
@@ -1786,28 +1818,38 @@ html[data-electron-mac] .breadcrumb-folder {
     --text-xl: calc(var(--ui-ramp-anchor) * 1.25);
     --text-2xl: calc(var(--ui-ramp-anchor) * 1.5);
   }
+}
 
-  body {
+body {
+  @variant max-md {
     font-size: var(--mobile-ui-font-size);
   }
+}
 
-  /* Keep mobile sidebar glyphs uniform. Desktop icon geometry is unchanged. */
-  .conversations-sidebar {
+/* Keep mobile sidebar glyphs uniform. Desktop icon geometry is unchanged. */
+.conversations-sidebar {
+  @variant max-md {
     --sidebar-icon-size-mobile: 16px;
   }
+}
 
-  /* Rows take a 40px floor at every mobile width, under the 44px touch target. */
-  .conversations-sidebar .sidebar-row {
+/* Rows take a 40px floor at every mobile width, under the 44px touch target. */
+.conversations-sidebar .sidebar-row {
+  @variant max-md {
     --radius-otto-button: 12px;
     min-height: 40px;
   }
+}
 
-  .conversations-sidebar svg,
-  .conversations-sidebar .ui-icon,
-  .conversations-sidebar .button-standard-icons svg {
-    width: var(--sidebar-icon-size-mobile);
-    height: var(--sidebar-icon-size-mobile);
-    padding: 0;
+.conversations-sidebar {
+  @variant max-md {
+    svg,
+    .ui-icon,
+    .button-standard-icons svg {
+      width: var(--sidebar-icon-size-mobile);
+      height: var(--sidebar-icon-size-mobile);
+      padding: 0;
+    }
   }
 }
 
@@ -1816,8 +1858,8 @@ html[data-electron-mac] .breadcrumb-folder {
 }
 
 /* Plain-text message fallbacks use the body tier in the mobile layout. */
-@media (width < 73.8125rem) {
-  .plain-text-fallback.text-message {
+.plain-text-fallback.text-message {
+  @variant max-md {
     font-size: var(--text-message);
   }
 }
@@ -2854,24 +2896,28 @@ html[data-electron-mac] .breadcrumb-folder {
   border-radius: 9999px;
   background: var(--primary);
 }
-@media (min-width: 73.8125rem) {
-  :root:not(.dark)[data-theme="custom"][data-custom-translucent-sidebar]
-    :is(.conversations-sidebar, aside[aria-label="Workspace"]:not([data-maximized])) {
+:root:not(.dark)[data-theme="custom"][data-custom-translucent-sidebar]
+  :is(.conversations-sidebar, aside[aria-label="Workspace"]:not([data-maximized])) {
+  @variant md {
     background-color: var(--custom-light-sidebar);
     background-image: none;
     -webkit-backdrop-filter: blur(20px) saturate(1.12);
     backdrop-filter: blur(20px) saturate(1.12);
   }
-  .dark[data-theme="custom"][data-custom-translucent-sidebar]
-    :is(.conversations-sidebar, aside[aria-label="Workspace"]:not([data-maximized])) {
+}
+.dark[data-theme="custom"][data-custom-translucent-sidebar]
+  :is(.conversations-sidebar, aside[aria-label="Workspace"]:not([data-maximized])) {
+  @variant md {
     background-color: var(--sidebar);
     background-image: var(--sidebar-surface-image);
     -webkit-backdrop-filter: blur(20px) saturate(1.12);
     backdrop-filter: blur(20px) saturate(1.12);
   }
-  :root[data-theme="custom"][data-custom-translucent-sidebar]
-    aside[aria-label="Workspace"]:not([data-maximized])
-    :is([data-workspace-panel-content] > *, [data-workspace-panel-surface]) {
+}
+:root[data-theme="custom"][data-custom-translucent-sidebar]
+  aside[aria-label="Workspace"]:not([data-maximized])
+  :is([data-workspace-panel-content] > *, [data-workspace-panel-surface]) {
+  @variant md {
     background-color: transparent;
   }
 }

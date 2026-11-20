@@ -1,7 +1,7 @@
 // Tests for /tasks: lists, filters, gallery tabs, and row actions.
 // Scheduled-task hooks are mocked; the creation dialog exposes its seed props and close action.
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { setOmnigentHostConfig } from "@/lib/host";
@@ -25,6 +25,7 @@ vi.mock("@/hooks/useScheduledTasks", () => ({
   useUpdateScheduledTask: vi.fn(),
   useDeleteScheduledTask: vi.fn(),
   useRunScheduledTaskNow: vi.fn(),
+  useCloneScheduledTask: vi.fn(),
 }));
 
 // Stub the create dialog — its internals are covered separately; here we only
@@ -118,6 +119,7 @@ function task(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
 const mutate = vi.fn();
 const deleteMutate = vi.fn();
 const runNowMutate = vi.fn();
+const cloneMutate = vi.fn();
 
 function setTasks(
   tasks: ScheduledTask[] | undefined,
@@ -159,6 +161,7 @@ beforeEach(() => {
   mutate.mockReset();
   deleteMutate.mockReset();
   runNowMutate.mockReset();
+  cloneMutate.mockReset();
   vi.mocked(showToast).mockReset();
   vi.mocked(hooks.useUpdateScheduledTask).mockReturnValue({
     mutate,
@@ -175,6 +178,11 @@ beforeEach(() => {
     isPending: false,
     variables: undefined,
   } as unknown as ReturnType<typeof hooks.useRunScheduledTaskNow>);
+  vi.mocked(hooks.useCloneScheduledTask).mockReturnValue({
+    mutate: cloneMutate,
+    isPending: false,
+    variables: undefined,
+  } as unknown as ReturnType<typeof hooks.useCloneScheduledTask>);
 });
 
 afterEach(() => {
@@ -203,6 +211,10 @@ function renderPage(
               <Route
                 path={`${basename}/tasks/templates`}
                 element={<TasksPage key="templates" templatesOnly />}
+              />
+              <Route
+                path={`${basename}/tasks/:taskId`}
+                element={<div data-testid="task-detail-route" />}
               />
             </Routes>
           </RoutingProvider>
@@ -487,6 +499,35 @@ describe("sort order", () => {
         .getAllByTestId("scheduled-task-row")
         .map((r) => r.querySelector(".font-semibold")?.textContent);
       expect(names).toEqual(expected);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("sorts every row by name when Name is picked, and back by next run", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+    try {
+      setTasks([
+        task({ id: "z", name: "Zulu", state: "active", rrule: "FREQ=DAILY;BYHOUR=6" }),
+        task({ id: "m", name: "Mike", state: "active", rrule: "FREQ=DAILY;BYHOUR=18" }),
+        task({ id: "a", name: "Alpha", state: "paused", rrule: "FREQ=DAILY;BYHOUR=1" }),
+      ]);
+      renderPage();
+      const names = () =>
+        screen
+          .getAllByTestId("scheduled-task-row")
+          .map((r) => r.querySelector(".font-semibold")?.textContent);
+      expect(screen.getByTestId("tasks-sort")).toHaveTextContent("Next run");
+      expect(names()).toEqual(["Zulu", "Mike", "Alpha"]);
+
+      fireEvent.click(screen.getByTestId("tasks-sort"));
+      fireEvent.click(screen.getByRole("option", { name: "Name" }));
+      expect(names()).toEqual(["Alpha", "Mike", "Zulu"]);
+
+      fireEvent.click(screen.getByTestId("tasks-sort"));
+      fireEvent.click(screen.getByRole("option", { name: "Next run" }));
+      expect(names()).toEqual(["Zulu", "Mike", "Alpha"]);
     } finally {
       vi.useRealTimers();
     }
@@ -780,6 +821,71 @@ describe("row actions", () => {
   });
 });
 
+describe("cloning from the row menu", () => {
+  const CLONE_INFO = {
+    ...TRIGGER_INFO,
+    scheduled_task_clone: true,
+    features: { ...TRIGGER_INFO.features, automations_v2: true },
+  };
+
+  it("offers Clone only on a server that can clone", () => {
+    setTasks([task()]);
+    renderPage();
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    expect(screen.queryByTestId("task-clone")).toBeNull();
+  });
+
+  it("opens the copy and says what's left once the clone is created", () => {
+    setTasks([task({ id: "st_1", state: "active" })]);
+    renderPage("/tasks", "", CLONE_INFO);
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Clone" }));
+
+    expect(cloneMutate).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "st_1" }),
+      expect.any(Object),
+    );
+    expect(showToast).not.toHaveBeenCalled();
+
+    act(() =>
+      cloneMutate.mock.calls[0][1].onSuccess(
+        task({ id: "st_2", nextRunAt: "2026-11-20T09:00:00+00:00" }),
+      ),
+    );
+    expect(showToast).toHaveBeenCalledExactlyOnceWith(
+      "Automation cloned. Pause or delete the original so they don't both run.",
+    );
+    expect(screen.getByTestId("task-detail-route")).toBeInTheDocument();
+  });
+
+  it("stays on the list when the server has no automation pages", () => {
+    setTasks([task({ id: "st_1" })]);
+    renderPage("/tasks", "", { ...TRIGGER_INFO, scheduled_task_clone: true });
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Clone" }));
+
+    act(() => cloneMutate.mock.calls[0][1].onSuccess(task({ id: "st_2" })));
+    expect(showToast).toHaveBeenCalledOnce();
+    expect(screen.queryByTestId("task-detail-route")).toBeNull();
+    expect(screen.getByTestId("tasks-list")).toBeInTheDocument();
+  });
+
+  it("stays on the list and shows the server's reason when the clone is refused", () => {
+    setTasks([task()]);
+    renderPage("/tasks", "", CLONE_INFO);
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Clone" }));
+
+    cloneMutate.mock.calls[0][1].onError(
+      new ScheduledTaskApiError("Only an automation can be cloned", 400, "invalid_input"),
+    );
+    expect(showToast).toHaveBeenCalledExactlyOnceWith(
+      "Couldn't clone the automation: Only an automation can be cloned",
+    );
+    expect(screen.getByTestId("tasks-list")).toBeInTheDocument();
+  });
+});
+
 describe("sharing from the row menu", () => {
   const SHARING_INFO = { ...TRIGGER_INFO, scheduled_task_sharing: true };
 
@@ -880,14 +986,15 @@ describe("automations shared with the viewer", () => {
     expect(within(list).queryByText("Mine")).toBeNull();
   });
 
-  it("shows every action disabled with why, and takes none", () => {
+  it("shows every action disabled with why, and takes none", async () => {
     setSharedPages([{ tasks: [shared()], nextCursor: null }]);
-    openSharedTab();
+    openSharedTab({ ...SHARING_INFO, scheduled_task_clone: true });
     fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
     for (const testId of [
       "task-run-now",
       "task-edit",
       "task-share",
+      "task-clone",
       "task-pause-toggle",
       "task-delete",
     ]) {
@@ -898,8 +1005,13 @@ describe("automations shared with the viewer", () => {
     expect(runNowMutate).not.toHaveBeenCalled();
     expect(mutate).not.toHaveBeenCalled();
     expect(deleteMutate).not.toHaveBeenCalled();
+    expect(cloneMutate).not.toHaveBeenCalled();
     expect(screen.queryByTestId("manual-dialog-open")).toBeNull();
     expect(screen.queryByTestId("share-dialog-open")).toBeNull();
+    fireEvent.focus(screen.getByTestId("task-clone").parentElement!);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(
+      "Only the automation's owner can clone it.",
+    );
   });
 
   it("loads more on request, and past a page that came back empty", () => {

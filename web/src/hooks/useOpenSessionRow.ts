@@ -4,6 +4,7 @@ import { type QueryClient, useQuery, useQueryClient } from "@tanstack/react-quer
 import { useCallback, useEffect, useSyncExternalStore } from "react";
 import type { Conversation } from "@/hooks/useConversations";
 import { authenticatedFetch } from "@/lib/identity";
+import { muteReadMarker, reconcileMuteLabel } from "@/lib/sessionMute";
 import { isOwnerLevel } from "@/lib/permissionsApi";
 import { sessionRoutingHostId, setSessionHost, setSessionParent } from "@/lib/sessionHost";
 import { findCachedListRow, LIST_ROW_QUERY_ROOTS } from "@/lib/sessionListCache";
@@ -21,6 +22,7 @@ export async function fetchConversationById(
   queryClient?: QueryClient,
 ): Promise<Conversation | null> {
   const params = new URLSearchParams({ include_items: "false", include_usage: "false" });
+  const readMarker = muteReadMarker();
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(id)}?${params}`);
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
@@ -29,37 +31,40 @@ export async function fetchConversationById(
   // session-scoped requests key their replica off the host map.
   setSessionHost(wire.id, sessionRoutingHostId(wire.host_id, wire.labels));
   setSessionParent(wire.id, wire.parent_session_id, wire.labels);
-  return {
-    id: wire.id,
-    object: "conversation",
-    title: wire.title ?? null,
-    created_at: wire.created_at,
-    updated_at: wire.updated_at ?? wire.created_at,
-    labels: wire.labels ?? {},
-    permission_level: wire.permission_level ?? null,
-    family: wire.family,
-    owner:
-      wire.owner ??
-      queryClient?.getQueryData<Conversation | null>(["conversation-backfill", id])?.owner ??
-      null,
-    runner_id: wire.runner_id ?? null,
-    host_id: wire.host_id ?? null,
-    workspace: wire.workspace ?? null,
-    agent_id: wire.agent_id,
-    agent_name: wire.agent_name ?? null,
-    harness: wire.harness ?? null,
-    // The detail response lists the outstanding prompts instead of counting them.
-    pending_elicitations_count: Array.isArray(wire.pending_elicitations)
-      ? wire.pending_elicitations.length
-      : 0,
-    status: wire.status ?? "idle",
-    runner_online: wire.runner_online ?? undefined,
-    host_online: wire.host_online ?? undefined,
-    git_branch: wire.git_branch ?? null,
-    archived: wire.archived ?? false,
-    parent_session_id: wire.parent_session_id ?? null,
-    project_id: wire.project_id ?? null,
-  };
+  return reconcileMuteLabel<Conversation>(
+    {
+      id: wire.id,
+      object: "conversation",
+      title: wire.title ?? null,
+      created_at: wire.created_at,
+      updated_at: wire.updated_at ?? wire.created_at,
+      labels: wire.labels ?? {},
+      permission_level: wire.permission_level ?? null,
+      family: wire.family,
+      owner:
+        wire.owner ??
+        queryClient?.getQueryData<Conversation | null>(["conversation-backfill", id])?.owner ??
+        null,
+      runner_id: wire.runner_id ?? null,
+      host_id: wire.host_id ?? null,
+      workspace: wire.workspace ?? null,
+      agent_id: wire.agent_id,
+      agent_name: wire.agent_name ?? null,
+      harness: wire.harness ?? null,
+      // The detail response lists the outstanding prompts instead of counting them.
+      pending_elicitations_count: Array.isArray(wire.pending_elicitations)
+        ? wire.pending_elicitations.length
+        : 0,
+      status: wire.status ?? "idle",
+      runner_online: wire.runner_online ?? undefined,
+      host_online: wire.host_online ?? undefined,
+      git_branch: wire.git_branch ?? null,
+      archived: wire.archived ?? false,
+      parent_session_id: wire.parent_session_id ?? null,
+      project_id: wire.project_id ?? null,
+    },
+    readMarker,
+  );
 }
 
 /**

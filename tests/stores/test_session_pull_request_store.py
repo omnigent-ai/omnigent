@@ -63,16 +63,34 @@ def _stored_document(db_uri: str, session: str = SESSION) -> bytes | None:
 
 
 @pytest.fixture()
-def conversations(db_uri: str) -> SqlAlchemyConversationStore:
-    conversations = SqlAlchemyConversationStore(db_uri)
+def conversation_db_uri(request: pytest.FixtureRequest, tmp_path) -> str | None:
+    """The conversation database; ``separate`` keeps it apart from the PR database."""
+    if getattr(request, "param", "shared") == "shared":
+        return None
+    return f"sqlite:///{tmp_path / 'conversations.db'}"
+
+
+# Run labels live in the conversation database, which deployments may keep separate.
+conversation_databases = pytest.mark.parametrize(
+    "conversation_db_uri", ["shared", "separate"], indirect=True
+)
+
+
+@pytest.fixture()
+def conversations(db_uri: str, conversation_db_uri: str | None) -> SqlAlchemyConversationStore:
+    conversations = SqlAlchemyConversationStore(
+        db_uri, conversation_storage_location=conversation_db_uri
+    )
     for session in (SESSION, OTHER):
         conversations.create_conversation(conversation_id=session)
     return conversations
 
 
 @pytest.fixture()
-def store(db_uri: str, conversations: SqlAlchemyConversationStore) -> SessionPullRequestStore:
-    return SessionPullRequestStore(db_uri)
+def store(
+    db_uri: str, conversation_db_uri: str | None, conversations: SqlAlchemyConversationStore
+) -> SessionPullRequestStore:
+    return SessionPullRequestStore(db_uri, conversation_db_uri)
 
 
 def _forbid_writes(store: SessionPullRequestStore, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -376,6 +394,7 @@ def test_read_many_reads_each_session_in_one_query(
     assert store.read_many([]) == {}
 
 
+@conversation_databases
 def test_a_pr_keeps_the_run_its_session_served_when_the_server_first_stored_it(
     store: SessionPullRequestStore, conversations: SqlAlchemyConversationStore
 ) -> None:
@@ -408,6 +427,7 @@ def test_a_pr_keeps_the_run_its_session_served_when_the_server_first_stored_it(
     assert store.read(OTHER).entries[0].run_id is None  # type: ignore[union-attr]
 
 
+@conversation_databases
 def test_a_persons_message_ends_the_runs_pr_attribution_until_another_run(
     store: SessionPullRequestStore, conversations: SqlAlchemyConversationStore
 ) -> None:
@@ -416,9 +436,11 @@ def test_a_persons_message_ends_the_runs_pr_attribution_until_another_run(
 
     C = "https://github.com/example/three/pull/3"
     run, next_run = "a" * 32, "b" * 32
-    conversations.set_labels(SESSION, {SCHEDULED_TASK_RUN_LABEL_KEY: run})
+    conversations.update_scheduled_run_label(SESSION, run, action="begin")
     store.apply_report(SESSION, [_report(A)])
-    store.end_run_turn(SESSION, run)
+    # A prompt still being dispatched keeps its run until the run finishes.
+    assert not store.end_run_turn(SESSION, run)
+    assert store.end_run_turn(SESSION, run, run_finished=True)
     store.apply_report(SESSION, [_report(B)])
     conversations.set_labels(SESSION, {SCHEDULED_TASK_RUN_LABEL_KEY: next_run})
     store.apply_report(SESSION, [_report(C)])
@@ -427,6 +449,7 @@ def test_a_persons_message_ends_the_runs_pr_attribution_until_another_run(
     assert {entry.url: entry.run_id for entry in stored.entries} == {A: run, B: None, C: next_run}
 
 
+@conversation_databases
 def test_initial_run_ids_read_only_the_sessions_a_run_created(
     store: SessionPullRequestStore, conversations: SqlAlchemyConversationStore
 ) -> None:

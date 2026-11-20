@@ -61,7 +61,8 @@ _logger = logging.getLogger(__name__)
 # Fields that decide where an automation's runs happen, and so what its grantees see.
 _TARGET_FIELDS = ("session_id", "host_id", "workspace", "execution_target")
 # Why an automation its store cannot keep grants for can't be shared; the web app says the same.
-UNSHAREABLE_AUTOMATION_MESSAGE = "This is a legacy automation. Recreate it to share it."
+# Sharing and cloning both need automations_v2, so a server that refuses this can clone.
+UNSHAREABLE_AUTOMATION_MESSAGE = "This is a legacy automation. Clone it, then share the copy."
 
 
 class ScheduledTaskPermissionObject(BaseModel):

@@ -1,6 +1,7 @@
 import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
+import { PROACTIVE_AGENT_DISPLAY_NAME } from "@/lib/proactiveInbox";
 
-import { settingsEntry } from "./types";
+import { settingsEntry, settingsEntryFamily } from "./types";
 
 export const SUBMIT_WITH_MOD_ENTER_ENTRY = settingsEntry({
   id: "submit-with-mod-enter",
@@ -62,10 +63,110 @@ export const OPEN_SUBAGENTS_IN_PANEL_ENTRY = settingsEntry({
   keywords: ["sessions", "sub-agents", "subagents", "workspace", "panel", "side by side"],
 });
 
+export const TERMINAL_CLIPBOARD_ENTRY = settingsEntry({
+  id: "terminal-clipboard",
+  section: "general",
+  label: "Copying from terminals",
+  description:
+    "Control copying from all sessions and terminals on this server, in this browser or app. Allowing it lets terminal programs silently replace your clipboard with unwanted text or commands.",
+  keywords: ["clipboard", "copy", "osc 52", "paste", "terminal programs"],
+  // As the preference select names them.
+  choices: ["Ask before copying", "Allow copying", "Block copying"],
+});
+
+export const OPEN_LINKS_IN_APP_ENTRY = settingsEntry({
+  id: "open-links-in-app",
+  available: (availability) => availability.inAppBrowser,
+  section: "general",
+  label: "Open links in the in-app browser",
+  description: `Open chat links in-app, reusing matching tabs. ${MOD_KEY}+click also opens in-app; Shift+click opens your default browser.`,
+  keywords: ["links", "browser", "in-app", "tabs", "click"],
+});
+
+export const ADMIN_VIEW_ENTRY = settingsEntry({
+  id: "admin-view",
+  available: (availability) => availability.adminView,
+  section: "general",
+  label: "Admin view",
+  description: "Turn off to use your normal session access.",
+  keywords: ["admin", "administrator", "access", "permissions", "view"],
+});
+
+export const PROJECT_KANBAN_BOARD_ENTRY = settingsEntry({
+  id: "project-kanban-board",
+  section: "general",
+  label: "Kanban board views",
+  description: "Monitor a project's agents in one view and respond the moment one needs you.",
+  keywords: ["kanban", "board", "projects", "agents", "view"],
+});
+
+export const BROWSER_AGENT_TOOLS_ENTRY = settingsEntry({
+  id: "browser-agent-tools",
+  section: "general",
+  label: "Advanced browser tools for agents",
+  description:
+    "Let agents go back and forward, reload, manage tabs, hover, right-click, double-click, drag, scroll, press keys, and use dropdowns and checkboxes in the in-app browser. New sessions use this setting. Turning it off also stops these actions in existing sessions on this device.",
+  keywords: ["browser", "agent", "tools", "tabs", "hover", "scroll", "desktop"],
+});
+
+export const PROACTIVE_AGENT_ENTRY = settingsEntry({
+  id: "proactive-agent",
+  section: "general",
+  label: PROACTIVE_AGENT_DISPLAY_NAME,
+  description:
+    "Reads your recent sessions on a schedule and posts follow-ups, related information, and reminders to your Inbox.",
+  keywords: ["proactive", "advisor", "inbox", "follow-ups", "reminders", "agent"],
+  parts: { toggle: PROACTIVE_AGENT_DISPLAY_NAME, retry: "Retry" },
+  presence: { retry: { states: ["could not load"] } },
+});
+
+/** The desktop app's shortcut that brings it forward; a row only desktop builds show. */
+export const GLOBAL_SHORTCUT_ENTRY = settingsEntry({
+  id: "global-shortcut",
+  available: (availability) => availability.globalShortcut,
+  section: "general",
+  label: "Show Omnigent from anywhere",
+  description: "Brings Omnigent to the front from any app.",
+  keywords: ["shortcut", "hotkey", "keyboard", "global", "desktop", "bring to front", "window"],
+  // Named by the chord it holds, or by the prompt while it records one.
+  parts: { recorder: "Shortcut" },
+  nameTemplates: { recorder: { before: "Shortcut: " } },
+});
+
+/** The desktop app's shortcut that opens the New Agent panel; macOS, with `floating_composer`. */
+export const FLOATING_COMPOSER_SHORTCUT_ENTRY = settingsEntry({
+  id: "floating-composer-shortcut",
+  available: (availability) => availability.floatingComposerShortcut,
+  section: "general",
+  label: "Open New Agent from anywhere",
+  description: "Opens the New Agent panel from any app to start a session.",
+  keywords: ["shortcut", "hotkey", "keyboard", "global", "desktop", "new agent", "panel"],
+  // Named by the chord it holds, or by the prompt while it records one.
+  parts: { recorder: "New Agent shortcut" },
+  nameTemplates: { recorder: { before: "New Agent shortcut: " } },
+});
+
+/** Both system-wide shortcuts' rows, by the shell's shortcut id; one control renders either. */
+export const GLOBAL_SHORTCUT_ENTRIES = settingsEntryFamily({
+  key: "global-shortcuts",
+  members: ["show", "floatingComposer"],
+  build: (shortcut) =>
+    shortcut === "show" ? GLOBAL_SHORTCUT_ENTRY : FLOATING_COMPOSER_SHORTCUT_ENTRY,
+});
+
 export const GENERAL_SETTINGS = [
   SUBMIT_WITH_MOD_ENTER_ENTRY,
   ALWAYS_STEER_ENTRY,
   BACKGROUND_SESSION_TITLES_ENTRY,
   SESSION_TITLE_INSTRUCTIONS_ENTRY,
   OPEN_SUBAGENTS_IN_PANEL_ENTRY,
+  TERMINAL_CLIPBOARD_ENTRY,
+  OPEN_LINKS_IN_APP_ENTRY,
+  ADMIN_VIEW_ENTRY,
+  PROJECT_KANBAN_BOARD_ENTRY,
+  BROWSER_AGENT_TOOLS_ENTRY,
+  PROACTIVE_AGENT_ENTRY,
+
+  GLOBAL_SHORTCUT_ENTRY,
+  FLOATING_COMPOSER_SHORTCUT_ENTRY,
 ] as const;

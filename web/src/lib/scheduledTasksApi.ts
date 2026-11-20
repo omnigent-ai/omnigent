@@ -11,6 +11,7 @@
 
 import type { GitProviderDisplay } from "./gitProviders";
 import { authenticatedFetch } from "./identity";
+import { resolvedLocalTimezone } from "./timezones";
 import type { JournalEntry, JournalPlanStep } from "./sessionJournal";
 import { startTimedInteraction } from "./analyticsEmit";
 import { browserAgentToolsRequestHeaders } from "@/components/BrowserPane/agentTools/preferences";
@@ -618,6 +619,25 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
 }
 
 /**
+ * Record the browser's IANA zone as the caller's default for tasks created
+ * with an explicit default-zone request. Skipped when the zone is unknown, so a
+ * UTC fallback never replaces another device's zone. Failures are ignored.
+ */
+export async function reportLocalTimezone(): Promise<void> {
+  const timezone = resolvedLocalTimezone();
+  if (timezone === null) return;
+  try {
+    await authenticatedFetch("/v1/scheduled-tasks/default-timezone", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ timezone }),
+    });
+  } catch {
+    // The next app load retries.
+  }
+}
+
+/**
  * Update mutable fields of a task (pause/reactivate/rename/reschedule). Only
  * the keys present in `input` are sent, matching the server's
  * `exclude_unset` semantics.
@@ -651,6 +671,43 @@ export async function updateScheduledTask(
     body: JSON.stringify(body),
   });
   return taskFromWire(await readJsonOrThrow<ScheduledTaskWire>(res));
+}
+
+/**
+ * Create a copy of an automation, under a new ID, with its settings and schedule but
+ * none of its runs. The copy is paused when the original is; otherwise both run.
+ */
+export async function cloneScheduledTask(
+  task: Pick<ScheduledTask, "id" | "hostId">,
+): Promise<ScheduledTask> {
+  const res = await authenticatedFetch(`/v1/scheduled-tasks/${encodeURIComponent(task.id)}/clone`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-omnigent-automation-source": "ui",
+      // A copied source session takes its browser tools mode from this request.
+      ...browserAgentToolsRequestHeaders(),
+    },
+    // The create checks the original's host over its tunnel, so the request
+    // routes to that host's replica by this host_id.
+    body: JSON.stringify(task.hostId ? { host_id: task.hostId } : {}),
+  });
+  return taskFromWire(await readJsonOrThrow<ScheduledTaskWire>(res));
+}
+
+/** The toast after a clone: what the copy is, and what's left to do. */
+export function cloneCreatedMessage(clone: Pick<ScheduledTask, "state" | "nextRunAt">): string {
+  if (clone.state === "paused") return "Automation cloned. The copy is paused like the original.";
+  // An active copy is always armed, so no next run means a finite schedule ran out.
+  if (clone.nextRunAt === null) return "Automation cloned. Its schedule has no runs left.";
+  return "Automation cloned. Pause or delete the original so they don't both run.";
+}
+
+/** The toast when a clone fails, with the server's reason when it gave one. */
+export function cloneFailedMessage(err: unknown): string {
+  return err instanceof ScheduledTaskApiError && err.status < 500
+    ? `Couldn't clone the automation: ${err.message}`
+    : "Couldn't clone the automation";
 }
 
 /** Delete a task so it no longer fires. */

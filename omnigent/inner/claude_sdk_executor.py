@@ -45,10 +45,11 @@ from collections.abc import (
     Collection,
     Iterator,
     Mapping,
+    MutableMapping,
     Sequence,
 )
 from contextlib import ExitStack, contextmanager, suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import ModuleType
 from typing import Any, NamedTuple, Protocol, TypeAlias, cast
 from urllib.parse import urlsplit
@@ -62,7 +63,10 @@ from omnigent.databricks_ai_gateway import (
     with_gateway_attribution_lines,
 )
 from omnigent.inner import _proc
-from omnigent.inner.bundle_skills import ensure_bundle_plugin_manifest
+from omnigent.inner.bundle_skills import (
+    ensure_bundle_plugin_manifest,
+    stage_contained_bundle_skills,
+)
 from omnigent.inner.hook_scripts import subagent_router
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.llms.adapters._content import parse_data_uri as _parse_replay_data_uri
@@ -81,11 +85,19 @@ from omnigent.util.json_serialization import json_dumps_transport_safe
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, validate_effort
 
-from ._subprocess_lifecycle import close_anyio_subprocess_transport
+from ._subprocess_lifecycle import await_cleanup_task, close_anyio_subprocess_transport
+from .agent_env import clean_agent_env, declared_passthrough
 from .async_utils import run_sync_on_thread
-from .claude_gateway_shim import DATABRICKS_CLAUDE_ADAPTIVE_THINKING_PREFIXES, ClaudeGatewayShim
+from .claude_gateway_shim import (
+    DATABRICKS_CLAUDE_ADAPTIVE_THINKING_PREFIXES,
+    ClaudeGatewayShim,
+    gateway_body_transform,
+)
+from .claude_model_access import ClaudeModelAccess, resolve_claude_model_access
 from .claude_sdk_key_file import PrivateStaticKeyFile
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec
+from .egress.controller import EgressProxyHandle, apply_egress_env, start_egress_proxy
+from .egress.proxy import RequestBodyTransform
 from .executor import (
     Executor,
     ExecutorConfig,
@@ -112,12 +124,15 @@ from .executor import (
 from .native_attachments import framework_notices, unresolved_attachment_marker
 from .sandbox import (
     SandboxPolicy,
+    cleanup_private_tmpdir,
     create_exec_launcher,
+    create_private_tmpdir,
     get_backend,
     resolve_sandbox,
     with_additional_read_roots,
     with_additional_write_files,
     with_additional_write_roots,
+    with_spawn_env_allowlist,
 )
 
 logger = logging.getLogger(__name__)
@@ -930,7 +945,7 @@ def _sandbox_disabled_by_env() -> bool:
     """
     if os.environ.get(_NO_SANDBOX_ENV):
         logger.warning(
-            "Sandbox bypass active (%s is set); skipping create_exec_launcher.",
+            "Sandbox diagnostic bypass requested (%s is set).",
             _NO_SANDBOX_ENV,
         )
         return True
@@ -1073,6 +1088,7 @@ class _ClaudeClientState:
     client: _ClaudeClient
     model: str | None
     static_key_file: PrivateStaticKeyFile | None = None
+    settings_file: pathlib.Path | None = None
     loop: asyncio.AbstractEventLoop | None = None
     task: asyncio.Task[None] | None = None
     effort: str | None = None
@@ -1115,22 +1131,32 @@ async def _close_managed_mcp_relay(state: _ClaudeClientState) -> None:
     """Release a gone CLI's auxiliary resources; relay shutdown blocks briefly."""
     relay, launcher = state.mcp_relay, state.cli_launcher
     key_file, state.static_key_file = state.static_key_file, None
+    settings_file, state.settings_file = state.settings_file, None
     state.mcp_relay = state.cli_launcher = None
     try:
         if key_file is not None:
             key_file.close()
     finally:
-        await asyncio.to_thread(_release_client_cli, relay, launcher)
+        await asyncio.to_thread(_release_client_cli, relay, launcher, settings_file)
 
 
-def _release_client_cli(relay: _ManagedMcpRelay | None, launcher: str | None) -> None:
+def _release_client_cli(
+    relay: _ManagedMcpRelay | None,
+    launcher: str | None,
+    settings_file: pathlib.Path | None = None,
+) -> None:
     try:
         if relay is not None:
             relay.close()
     finally:
-        if launcher is not None:
-            with suppress(OSError):
-                os.unlink(launcher)
+        try:
+            if launcher is not None:
+                with suppress(OSError):
+                    os.unlink(launcher)
+        finally:
+            if settings_file is not None:
+                with suppress(OSError):
+                    settings_file.unlink(missing_ok=True)
 
 
 def _claude_mcp_auth_statuses() -> dict[str, str]:
@@ -1234,7 +1260,7 @@ async def _reconnect_failed_mcp_servers(client: _ClaudeClient, names: set[str]) 
     return retry
 
 
-@dataclass(frozen=True)
+@dataclass
 class PreparedClaudeCli:
     """Result of wrapping the Claude CLI in an Omnigent sandbox.
 
@@ -1242,17 +1268,60 @@ class PreparedClaudeCli:
         original system CLI or a generated wrapper script that applies the
         sandbox before exec-ing the real binary.  ``None`` when no CLI is
         available (no system ``claude`` on PATH).
-    :param enable_native_tools: ``True`` when the sandbox is active and it is
-        safe for the SDK to enable the built-in native OS tools (Bash, Read,
-        Edit, …).  ``False`` when the sandbox cannot be applied (e.g. network
-        denied, unsupported platform) — the caller should then leave native
-        tools disabled.
+    :param enable_native_tools: Whether the OS environment permits native tools.
+        A requested sandbox must be applied successfully before returning.
     """
 
     cli_path: str | None
     enable_native_tools: bool
     # Policy the wrapper applies; a CLI needing extra grants gets its own launcher from it.
     sandbox: SandboxPolicy | None = None
+    sandboxed: bool = False
+    _owned_launcher: pathlib.Path | None = None
+    _egress_handle: EgressProxyHandle | None = None
+    _runtime_tmpdir: pathlib.Path | None = None
+    model_access: ClaudeModelAccess | None = None
+    plugin_dir: pathlib.Path | None = None
+
+    def settings_for_cli(self, settings: str | None) -> str | None:
+        """Deliver proxy access through a private file read after CLI startup."""
+        handle = self._egress_handle
+        if handle is None or handle.auth_token is None:
+            return settings
+        if self._runtime_tmpdir is None:
+            raise OSError("Authenticated Claude relay requires private runtime settings")
+        payload = json.loads(settings) if settings is not None else {}
+        proxy_env: dict[str, str] = {}
+        apply_egress_env(
+            proxy_env,
+            relay_port=handle.relay_port,
+            ca_bundle_path=handle.ca_bundle_path,
+            auth_token=handle.auth_token,
+        )
+        payload["env"] = {**payload.get("env", {}), **proxy_env}
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            prefix="cli-settings-",
+            suffix=".json",
+            dir=self._runtime_tmpdir,
+            delete=False,
+        ) as output:
+            json.dump(payload, output)
+        return output.name
+
+    def close(self) -> None:
+        """Release the launcher and its parent-owned network proxy."""
+        launcher, self._owned_launcher = self._owned_launcher, None
+        if launcher is not None:
+            with suppress(OSError):
+                launcher.unlink(missing_ok=True)
+        handle, self._egress_handle = self._egress_handle, None
+        tmpdir, self._runtime_tmpdir = self._runtime_tmpdir, None
+        try:
+            if handle is not None:
+                handle.stop()
+        finally:
+            cleanup_private_tmpdir(tmpdir)
 
 
 def _ensure_sdk() -> ModuleType:
@@ -1298,6 +1367,13 @@ class _RelayConsents:
     def record(self, tool_name: str, arguments: Mapping[str, object]) -> None:
         """Remember that the gate approved ``tool_name`` with ``arguments``."""
         self._approved.append((tool_name, self._key(arguments), time.monotonic()))
+
+    def discard(self, tool_name: str) -> None:
+        """Forget this key's approvals and prune expired entries."""
+        now = time.monotonic()
+        self._approved = [
+            item for item in self._approved if item[0] != tool_name and now - item[2] < self.TTL_S
+        ]
 
     def consume(self, tool_name: str, arguments: Mapping[str, object]) -> bool:
         """Use up one approval for this exact call; ``False`` when there is none."""
@@ -1487,6 +1563,16 @@ def _find_system_claude() -> str | None:
     path, or ``None`` if not found.
     """
     return resolve_cli_binary("claude", env_var=_CLAUDE_PATH_ENV)
+
+
+def _find_bundled_claude() -> str | None:
+    """Resolve the SDK's bundled executable before applying containment."""
+    sdk = _ensure_sdk()
+    if sdk.__file__ is None:
+        return None
+    name = "claude.exe" if os.name == "nt" else "claude"
+    path = pathlib.Path(sdk.__file__).parent / "_bundled" / name
+    return str(path) if path.is_file() else None
 
 
 # DATABRICKS-PATCH(claude-sdk-live-model-discovery)
@@ -1738,7 +1824,7 @@ def _claude_user_settings_env(cwd: str | None = None) -> dict[str, str]:
     """Read the ``env`` block of Claude Code's user ``settings.json``.
 
     The file is located by
-    :func:`omnigent.onboarding.ambient.read_claude_user_settings`.
+    :func:`omnigent.onboarding.ambient.read_claude_user_settings_with_sources`.
 
     :param cwd: The CLI's working directory, e.g. ``"/home/user/repo"``;
         ``None`` means this process's working directory.
@@ -1746,15 +1832,30 @@ def _claude_user_settings_env(cwd: str | None = None) -> dict[str, str]:
         ``{"ANTHROPIC_BEDROCK_BASE_URL": "https://gateway.example"}``; empty
         when the file is missing, unreadable, or has no ``env`` object.
     """
-    from omnigent.onboarding.ambient import read_claude_user_settings
+    env, _, _ = _claude_user_settings_env_with_sources(cwd)
+    return env
 
-    settings = read_claude_user_settings(cwd)
+
+def _claude_user_settings_env_with_sources(
+    cwd: str | None = None,
+) -> tuple[dict[str, str], tuple[pathlib.Path, ...], bool]:
+    """Keep settings provenance and helper selection with environment values."""
+    from omnigent.onboarding.ambient import read_claude_user_settings_with_sources
+
+    settings, sources = read_claude_user_settings_with_sources(cwd)
     env = settings.get("env") if settings is not None else None
+    has_api_key_helper = bool(settings.get("apiKeyHelper")) if settings is not None else False
     if not isinstance(env, dict):
-        return {}
-    return {
-        key: value for key, value in env.items() if isinstance(key, str) and isinstance(value, str)
-    }
+        return {}, sources, has_api_key_helper
+    return (
+        {
+            key: value
+            for key, value in env.items()
+            if isinstance(key, str) and isinstance(value, str)
+        },
+        sources,
+        has_api_key_helper,
+    )
 
 
 def _resolve_gateway_env(
@@ -1970,83 +2071,222 @@ def _resolve_sandbox_cwd(spec_cwd: str | None) -> pathlib.Path:
 def prepare_claude_cli_path(
     real_cli_path: str | None,
     spec: OSEnvSpec | None,
+    *,
+    worker_env: MutableMapping[str, str] | None = None,
+    bundle_dir: pathlib.Path | None = None,
+    agent_name: str | None = None,
+    request_body_transform: RequestBodyTransform | None = None,
+    model_access: ClaudeModelAccess | None = None,
+    databricks_profile: str | None = None,
+    user_settings_source_paths: tuple[pathlib.Path, ...] = (),
+    user_settings_has_api_key_helper: bool = False,
+    response_header_timeout_seconds: float | None = None,
 ) -> PreparedClaudeCli:
-    """Wrap the Claude CLI in the agent's configured sandbox when possible.
+    """Contain the whole Claude CLI when the agent requires a sandbox.
 
-    Degrades instead of crashing: when the sandbox can't be resolved or
-    the wrap can't be built (unsupported platform, un-grantable
-    interpreter layout, profile-size overflow), the CLI is returned
-    unwrapped with native tools disabled — the same confinement story
-    as ``OMNIGENT_CLAUDE_SDK_NO_SANDBOX``: file/shell access still goes
-    through the independently sandboxed ``sys_os_*`` helpers (which
-    fail closed on their own), and only the CLI supervisor process
-    runs unwrapped.
+    Skill expansion can execute commands without calling an OS tool, so
+    disabling native tools cannot replace process containment. Preparation
+    failures must prevent the CLI from starting.
 
     :param real_cli_path: Absolute path to the system-installed Claude CLI
         binary, or ``None`` when no CLI is available.
     :param spec: The agent's ``os_env`` spec.  Only ``caller_process`` specs
         with a compatible sandbox are eligible for wrapping.
+    :param user_settings_source_paths: Original user settings paths read by the parent.
     :returns: A :class:`PreparedClaudeCli` naming the effective CLI path and
         whether native tools should be enabled.
     """
 
-    if real_cli_path is None or spec is None or spec.type != "caller_process":
+    if spec is None:
         return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=False)
-
-    if _sandbox_disabled_by_env():
-        return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=False)
-
     sandbox_spec = spec.sandbox or OSEnvSandboxSpec()
     if sandbox_spec.type == "none":
         return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=True)
 
-    cwd = _resolve_sandbox_cwd(spec.cwd)
-    try:
-        sandbox = resolve_sandbox(spec, cwd)
-    except (OSError, NotImplementedError) as exc:
-        logger.warning(
-            "Cannot resolve the configured sandbox for the Claude CLI wrap; "
-            "running the CLI unwrapped with native tools disabled "
-            "(file/shell access stays confined to the sandboxed sys_os_* "
-            "tools): %s",
-            exc,
-        )
-        return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=False)
-    if not sandbox.active:
-        return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=False)
-    if not sandbox.allow_network:
-        # The Claude CLI itself must reach the provider, so we cannot run the
-        # whole native-tool process tree inside a network-denying sandbox.
-        return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=False)
+    if spec.type != "caller_process":
+        raise OSError("Sandboxed Claude requires a caller_process OS environment")
+    if real_cli_path is None:
+        raise OSError("Sandboxed Claude requires a resolved CLI executable")
+    if _sandbox_disabled_by_env():
+        raise OSError(f"{_NO_SANDBOX_ENV} conflicts with the required Claude sandbox")
+    if model_access is not None and worker_env is None:
+        raise ValueError("Brokered Claude model access requires an owned worker environment")
 
-    sandbox = with_additional_read_roots(sandbox, _claude_internal_write_roots())
-    sandbox = with_additional_write_roots(sandbox, _claude_internal_write_roots())
-    sandbox = with_additional_write_files(sandbox, _claude_internal_write_files())
-    # Dry-run the spawn-time wrap now, while degrading is still possible.
-    # The real wrap happens later inside run_launcher, where an OSError
-    # (un-grantable interpreter layout, profile-size cap, cwd-scan
-    # overflow) kills the launcher and surfaces as an opaque connect
-    # timeout. By run time native tools are already enabled, so this is
-    # the last point where "skip the wrap" is still safe.
-    try:
-        get_backend(sandbox.backend_type).wrap_launcher_argv(
-            [sys.executable, "-c", "pass"], sandbox, cwd, target=real_cli_path
+    cwd = _resolve_sandbox_cwd(spec.cwd)
+    sandbox = resolve_sandbox(spec, cwd)
+    if not sandbox.active:
+        raise OSError("The configured Claude sandbox resolved to an inactive policy")
+
+    sandbox = with_additional_read_roots(sandbox, [pathlib.Path(__file__).resolve().parents[1]])
+    if worker_env is not None:
+        parent_env = {**os.environ, **worker_env}
+        if "ANTHROPIC_API_KEY" not in worker_env:
+            parent_env.pop("ANTHROPIC_API_KEY", None)
+        credential_env_names = json.loads(
+            parent_env.get("HARNESS_CLAUDE_SDK_CREDENTIAL_ENV_NAMES", "[]")
         )
-    except OSError as exc:
-        logger.warning(
-            "The configured sandbox cannot wrap the Claude CLI at %s; "
-            "running it unwrapped with native tools disabled (file/shell "
-            "access stays confined to the sandboxed sys_os_* tools). "
-            "Remediation hints in the underlying error: %s",
-            real_cli_path,
-            exc,
-        )
-        return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=False)
-    return PreparedClaudeCli(
-        cli_path=create_exec_launcher(real_cli_path, sandbox),
-        enable_native_tools=True,
-        sandbox=sandbox,
+        if not isinstance(credential_env_names, list) or not all(
+            isinstance(name, str) for name in credential_env_names
+        ):
+            raise ValueError("invalid Claude credential environment metadata")
+        if model_access is None:
+            model_access = resolve_claude_model_access(
+                parent_env,
+                cwd=cwd,
+                databricks_profile=databricks_profile,
+                source_paths=user_settings_source_paths,
+                source_env_names=frozenset(credential_env_names),
+                user_settings_has_api_key_helper=user_settings_has_api_key_helper,
+            )
+        elif user_settings_source_paths:
+            model_access = replace(
+                model_access,
+                source_paths=(*model_access.source_paths, *user_settings_source_paths),
+            )
+        if response_header_timeout_seconds is not None:
+            model_access = replace(
+                model_access, response_header_timeout_seconds=response_header_timeout_seconds
+            )
+        model_access = model_access.with_bundle_sources(bundle_dir)
+        sandbox = model_access.protect_sources(sandbox, cwd)
+    else:
+        sandbox = with_additional_read_roots(sandbox, _claude_internal_write_roots())
+        sandbox = with_additional_write_roots(sandbox, _claude_internal_write_roots())
+        sandbox = with_additional_write_files(sandbox, _claude_internal_write_files())
+    probe_argv = [sys.executable, "-c", "pass"]
+    wrapped_argv = get_backend(sandbox.backend_type).wrap_launcher_argv(
+        probe_argv, sandbox, cwd, target=real_cli_path
     )
+    if wrapped_argv == probe_argv:
+        raise OSError(f"Sandbox backend {sandbox.backend_type!r} cannot contain the Claude CLI")
+    egress_rules = list(sandbox_spec.egress_rules or [])
+    if egress_rules and worker_env is None:
+        raise ValueError("Egress-filtered Claude requires an owned worker environment")
+    egress_handle: EgressProxyHandle | None = None
+    runtime_tmpdir: pathlib.Path | None = None
+    staged_env = dict(worker_env) if worker_env is not None else {}
+    allowed_env = clean_agent_env(
+        allow_prefixes=("ANTHROPIC_", "CLAUDE_"),
+        extra_allowed=declared_passthrough(spec),
+    )
+    source_env_names: set[str] = set()
+    plugin_dir: pathlib.Path | None = None
+    try:
+        if worker_env is not None:
+            runtime_tmpdir = create_private_tmpdir()
+            sandbox = with_additional_write_roots(sandbox, [runtime_tmpdir])
+            staged_env["CLAUDE_CODE_TMPDIR"] = str(runtime_tmpdir)
+            if bundle_dir is not None:
+                plugin_dir = stage_contained_bundle_skills(
+                    bundle_dir, runtime_tmpdir / "plugin", agent_name
+                )
+            if model_access is not None:
+                home = runtime_tmpdir / "home"
+                (home / ".claude").mkdir(parents=True)
+                credential_value = model_access.worker_environment(staged_env, home)
+                model_access.worker_environment(
+                    allowed_env, home, credential_value=credential_value
+                )
+        if egress_rules or model_access is not None:
+            assert runtime_tmpdir is not None
+            from .credential_proxy import prepare_credential_proxy_runtime
+            from .os_env import (
+                _build_credential_proxy_parent_env,
+                _write_credential_proxy_files,
+            )
+
+            credential_runtime = prepare_credential_proxy_runtime(
+                sandbox.credential_proxy,
+                parent_env=_build_credential_proxy_parent_env(
+                    helper_env={**allowed_env, **staged_env},
+                    parent_env=os.environ,
+                    spec=sandbox.credential_proxy,
+                )
+                if sandbox.credential_proxy is not None
+                else {},
+                sandbox=sandbox,
+                cwd=cwd,
+            )
+            staged_env.update(credential_runtime.helper_env_updates)
+            if sandbox.credential_proxy is not None:
+                source_env_names = {
+                    entry.source.env
+                    for entry in sandbox.credential_proxy.entries
+                    if entry.source.kind == "env" and entry.source.env
+                } - credential_runtime.helper_env_updates.keys()
+                for name in source_env_names:
+                    staged_env.pop(name, None)
+            _write_credential_proxy_files(
+                staged_env, credential_runtime.sandbox_files, runtime_tmpdir
+            )
+            for key in ("ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"):
+                staged_env.pop(key, None)
+            egress_handle = start_egress_proxy(
+                rules=egress_rules,
+                tmpdir=runtime_tmpdir,
+                allow_private_destinations=sandbox_spec.egress_allow_private_destinations,
+                require_auth=True,
+                credential_rewrites=credential_runtime.rewrites,
+                request_body_transform=request_body_transform,
+                model_access=model_access,
+            )
+            apply_egress_env(
+                staged_env,
+                relay_port=egress_handle.relay_port,
+                ca_bundle_path=egress_handle.ca_bundle_path,
+                auth_token=None,
+            )
+            sandbox = replace(
+                sandbox,
+                allow_network=False,
+                egress_relay_port=egress_handle.relay_port,
+                egress_socket_path=str(egress_handle.socket_path),
+            )
+        if worker_env is not None:
+            # The SDK adds its identity and cwd after merging options.env.
+            names = [
+                *allowed_env,
+                *staged_env,
+                "CLAUDE_CODE_ENTRYPOINT",
+                "CLAUDE_AGENT_SDK_VERSION",
+                "PWD",
+                *ALIAS_MODEL_ENV_VARS.values(),
+            ]
+            if egress_rules or model_access is not None:
+                names = [
+                    name
+                    for name in names
+                    if name not in {"ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"}
+                ]
+            names = [name for name in names if name not in source_env_names]
+            sandbox = with_spawn_env_allowlist(sandbox, names)
+        launcher = pathlib.Path(
+            create_exec_launcher(real_cli_path, sandbox, cwd=str(cwd), env_overrides=staged_env)
+            if worker_env is not None
+            else create_exec_launcher(real_cli_path, sandbox, cwd=str(cwd))
+        )
+        if worker_env is not None:
+            worker_env.clear()
+            worker_env.update(staged_env)
+        return PreparedClaudeCli(
+            cli_path=str(launcher),
+            enable_native_tools=True,
+            sandbox=sandbox,
+            sandboxed=True,
+            _owned_launcher=launcher,
+            _egress_handle=egress_handle,
+            _runtime_tmpdir=runtime_tmpdir,
+            model_access=model_access,
+            plugin_dir=plugin_dir,
+        )
+    except BaseException:
+        try:
+            if egress_handle is not None:
+                with suppress(Exception):
+                    egress_handle.stop()
+        finally:
+            cleanup_private_tmpdir(runtime_tmpdir)
+        raise
 
 
 def prepare_tight_cli_process(
@@ -2070,6 +2310,9 @@ def prepare_tight_cli_process(
     # tests that assert ``stderr_is_clean``).
     if sys.platform != "linux":
         return unwrapped
+    if shutil.which("bwrap") is None:
+        logger.warning("Could not apply default local CLI sandbox: bwrap is unavailable")
+        return unwrapped
 
     spec = OSEnvSpec(
         type="caller_process",
@@ -2080,25 +2323,31 @@ def prepare_tight_cli_process(
             allow_network=True,
         ),
     )
+    resolved_cwd = _resolve_sandbox_cwd(cwd)
+    sandbox = resolve_sandbox(spec, resolved_cwd)
+    if not sandbox.active:
+        raise OSError("Default Claude CLI sandbox resolved to an inactive policy")
+    sandbox = with_additional_write_roots(sandbox, _claude_internal_write_roots())
+    sandbox = with_additional_write_files(sandbox, _claude_internal_write_files())
     try:
-        resolved_cwd = _resolve_sandbox_cwd(cwd)
-        sandbox = resolve_sandbox(spec, resolved_cwd)
-    except (OSError, NotImplementedError) as exc:
-        logger.warning(
-            "Could not apply default local CLI sandbox; continuing without it: %s",
-            exc,
-        )
-        return unwrapped
-    else:
-        if not sandbox.active:
-            return unwrapped
-        sandbox = with_additional_write_roots(sandbox, _claude_internal_write_roots())
-        sandbox = with_additional_write_files(sandbox, _claude_internal_write_files())
+        launcher = create_exec_launcher(real_cli_path, sandbox)
         return PreparedClaudeCli(
-            cli_path=create_exec_launcher(real_cli_path, sandbox),
+            cli_path=launcher,
             enable_native_tools=False,
             sandbox=sandbox,
         )
+    except OSError as exc:
+        if "mutable hard-link alias" in str(exc):
+            raise OSError(
+                f"Default Claude CLI sandbox startup failed: {exc}. For an older uv tool "
+                "install, run 'uv tool upgrade --reinstall --link-mode copy omnigent'."
+            ) from exc
+        if "unsupported .pth" in str(exc):
+            raise OSError(
+                f"Default Claude CLI sandbox startup failed: {exc}. Remove the unsupported "
+                "Python startup hook."
+            ) from exc
+        raise
 
 
 def _claude_managed_config_dirs() -> list[pathlib.Path]:
@@ -2110,6 +2359,14 @@ def _claude_managed_config_dirs() -> list[pathlib.Path]:
     from omnigent.onboarding.ambient import claude_code_managed_mcp_paths
 
     return [path.parent for path in claude_code_managed_mcp_paths() if os.path.exists(path)]
+
+
+def _validate_claude_managed_config(
+    managed_config_dirs: Sequence[pathlib.Path], forbidden_env_names: Collection[str]
+) -> None:
+    from .claude_model_access import _validate_claude_managed_config as validate
+
+    validate(managed_config_dirs, forbidden_env_names)
 
 
 def _client_cli_sandbox(
@@ -2213,9 +2470,9 @@ class ClaudeSDKExecutor(Executor):
     """Execute agent turns using the Claude Agent SDK.
 
     The SDK runs Claude Code's full agent loop internally.  Omnigent tools
-    are registered as MCP tools so the model can call them.  Built-in OS tools
-    (Bash, Read, Edit, …) are only enabled when the agent's ``os_env`` flag
-    is set.  Even without ``os_env``, Omnigent tries to place the Claude CLI
+    are registered as MCP tools so the model can call them. Bash is enabled
+    for skill execution when the whole CLI is sandboxed. Even without
+    ``os_env``, Omnigent tries to place the Claude CLI
     itself in a tight default sandbox on supported Linux hosts.
 
     Unlike DatabricksExecutor, the SDK manages its own tool-call loop.  This
@@ -2261,10 +2518,9 @@ class ClaudeSDKExecutor(Executor):
 
         Args:
             cwd: Working directory for Claude Code.
-            os_env: If set, enable built-in OS tools (Bash, Read, Edit, …)
-                and align them with the provided OS environment. When the
-                spec's sandbox is enabled, Omnigent wraps the Claude CLI
-                in the same sandbox. If omitted, Omnigent still tries to
+            os_env: When its sandbox is enabled, contain the whole CLI and
+                enable Bash for skill execution. A containment failure stops
+                startup. If omitted, Omnigent still tries to
                 sandbox the Claude CLI process itself on supported Linux
                 hosts, but does not enable native OS tools.
             model: Override the model name.
@@ -2395,33 +2651,6 @@ class ClaudeSDKExecutor(Executor):
         # referenced so they are not GC'd mid-close.
         self._cancel_close_tasks: set[asyncio.Task[None]] = set()
 
-        # Prefer system-installed claude over the SDK's bundled CLI.
-        # The bundled CLI may be older and send beta flags that the
-        # Databricks gateway doesn't support.
-        self._cli_wrapper_path: str | None = None
-        self._cli_path: str | None = _find_system_claude()
-        # The unwrapped CLI and the sandbox its wrapper applies, for per-client launchers.
-        self._real_cli_path = self._cli_path
-        self._cli_sandbox: SandboxPolicy | None = None
-        if self._cli_path:
-            if self._os_env_spec is not None:
-                prepared = prepare_claude_cli_path(
-                    self._cli_path,
-                    self._os_env_spec,
-                )
-                self._os_env = prepared.enable_native_tools
-            else:
-                prepared = prepare_tight_cli_process(self._cli_path, cwd=self._cwd)
-            if prepared.cli_path != self._cli_path:
-                self._cli_wrapper_path = prepared.cli_path
-                self._cli_path = prepared.cli_path
-                self._cli_sandbox = prepared.sandbox
-            if self._os_env_spec is not None and self._cwd is None:
-                self._cwd = self._os_env_spec.cwd
-            logger.info("Using system claude CLI: %s", self._cli_path)
-        else:
-            logger.info("No system claude found; SDK will use bundled CLI")
-
         # True when the gateway transport was derived from a ~/.databrickscfg
         # profile (no gateway host or base URL supplied directly). Gates the
         # Databricks-specific default model in :meth:`run_turn`; the neutral
@@ -2480,8 +2709,82 @@ class ClaudeSDKExecutor(Executor):
         # ``_CLAUDE_API_KEY_HELPER_ENV_KEY`` from ``_extra_env`` only.
         if api_key_helper:
             self._extra_env[_CLAUDE_API_KEY_HELPER_ENV_KEY] = api_key_helper
+        self._model_auth_helper = self._extra_env.get(_CLAUDE_API_KEY_HELPER_ENV_KEY)
+
+        # Prefer system-installed claude over the SDK's bundled CLI.
+        # The bundled CLI may be older and send beta flags that the
+        # Databricks gateway doesn't support.
+        self._prepared_cli: PreparedClaudeCli | None = None
+        self._cli_wrapper_path: str | None = None
+        self._cli_path: str | None = _find_system_claude()
+        cli_source = "system"
+        if self._cli_path is None and self._os_env_spec is not None:
+            sandbox_spec = self._os_env_spec.sandbox or OSEnvSandboxSpec()
+            if sandbox_spec.type != "none":
+                self._cli_path = _find_bundled_claude()
+                cli_source = "SDK-bundled"
+                if self._cli_path is None:
+                    raise OSError("Sandboxed Claude requires a system or SDK-bundled CLI")
+        self._real_cli_path = self._cli_path
+        self._cli_sandbox: SandboxPolicy | None = None
+        if self._cli_path:
+            if self._os_env_spec is not None:
+                effective_cwd = _resolve_sandbox_cwd(self._cwd or self._os_env_spec.cwd)
+                user_settings_source_paths: tuple[pathlib.Path, ...] = ()
+                user_settings_has_api_key_helper = False
+                if not self._gateway and (
+                    self._os_env_spec.sandbox is None or self._os_env_spec.sandbox.type != "none"
+                ):
+                    settings_env, user_settings_source_paths, user_settings_has_api_key_helper = (
+                        _claude_user_settings_env_with_sources(str(effective_cwd))
+                    )
+                    self._extra_env = {
+                        **settings_env,
+                        **self._extra_env,
+                    }
+                prepared = prepare_claude_cli_path(
+                    self._cli_path,
+                    replace(self._os_env_spec, cwd=str(effective_cwd)),
+                    worker_env=self._extra_env,
+                    bundle_dir=self._bundle_dir,
+                    agent_name=self._agent_name,
+                    databricks_profile=self._databricks_profile if self._gateway else None,
+                    user_settings_source_paths=user_settings_source_paths,
+                    user_settings_has_api_key_helper=user_settings_has_api_key_helper,
+                    # The CLI owns its header deadline; allow the relay scheduling grace.
+                    response_header_timeout_seconds=(
+                        self._retry_policy.timeout_per_request_s + 30.0
+                        if self._retry_policy.timeout_per_request_s is not None
+                        else None
+                    ),
+                    request_body_transform=gateway_body_transform(
+                        self._extra_env["ANTHROPIC_BASE_URL"]
+                    )
+                    if self._gateway
+                    else None,
+                )
+                self._prepared_cli = prepared
+                self._cli_sandbox = prepared.sandbox
+                self._cwd = str(effective_cwd)
+                self._os_env = prepared.enable_native_tools
+                if prepared.cli_path != self._cli_path:
+                    self._cli_wrapper_path = prepared.cli_path
+                    self._cli_path = prepared.cli_path
+            else:
+                prepared = prepare_tight_cli_process(self._cli_path, cwd=self._cwd)
+                self._cli_sandbox = prepared.sandbox
+                if prepared.cli_path != self._cli_path:
+                    self._cli_wrapper_path = prepared.cli_path
+                    self._cli_path = prepared.cli_path
+            logger.info("Using %s claude CLI: %s", cli_source, self._cli_path)
+        else:
+            logger.info("No system claude found; SDK will use bundled CLI")
 
     def __del__(self) -> None:
+        prepared = getattr(self, "_prepared_cli", None)
+        if prepared is not None:
+            with suppress(Exception):
+                prepared.close()
         wrapper_path = getattr(self, "_cli_wrapper_path", None)
         if isinstance(wrapper_path, str):
             with suppress(Exception):
@@ -2507,6 +2810,9 @@ class ClaudeSDKExecutor(Executor):
         """
         if not self._gateway:
             return
+        if self._prepared_cli is not None and self._prepared_cli._egress_handle is not None:
+            # The egress relay restores thinking on the authorized request.
+            return
         env = getattr(options, "env", None)
         if not isinstance(env, dict) or "ANTHROPIC_BASE_URL" not in env:
             raise RuntimeError(
@@ -2531,6 +2837,15 @@ class ClaudeSDKExecutor(Executor):
         if state is None:
             mcp_auth = _claude_mcp_auth_statuses()
             await self._route_options_through_gateway_shim(options)
+            settings_file: pathlib.Path | None = None
+            if self._prepared_cli is not None:
+                options.settings = self._prepared_cli.settings_for_cli(
+                    getattr(options, "settings", None)
+                )
+                handle = self._prepared_cli._egress_handle
+                if handle is not None and handle.auth_token is not None:
+                    assert options.settings is not None
+                    settings_file = pathlib.Path(options.settings)
             # Tee CLI stderr so the connect timeout error carries the
             # tail; ``_on_stderr`` alone only logs at DEBUG.
             connect_stderr: list[str] = []
@@ -2561,8 +2876,11 @@ class ClaudeSDKExecutor(Executor):
                 client = sdk.ClaudeSDKClient(options)
             except BaseException:
                 options.stderr = original_stderr
-                if key_file is not None:
-                    key_file.close()
+                try:
+                    if key_file is not None:
+                        key_file.close()
+                finally:
+                    _release_client_cli(None, None, settings_file)
                 raise
             connected = False
             try:
@@ -2644,8 +2962,11 @@ class ClaudeSDKExecutor(Executor):
                     try:
                         await self._force_close_client(client)
                     finally:
-                        if key_file is not None:
-                            key_file.close()
+                        try:
+                            if key_file is not None:
+                                key_file.close()
+                        finally:
+                            _release_client_cli(None, None, settings_file)
             current_task: asyncio.Task[None] | None = cast(
                 "asyncio.Task[None] | None", asyncio.current_task()
             )
@@ -2653,6 +2974,7 @@ class ClaudeSDKExecutor(Executor):
                 client=client,
                 model=model,
                 static_key_file=key_file,
+                settings_file=settings_file,
                 loop=asyncio.get_running_loop(),
                 task=current_task,
                 effort=getattr(options, "effort", None),
@@ -2690,7 +3012,35 @@ class ClaudeSDKExecutor(Executor):
 
         return dispatch
 
-    def _prepare_managed_cli(
+    def _build_managed_cli_launcher(
+        self, options: SdkOptions, relay: _ManagedMcpRelay | None
+    ) -> str:
+        assert self._cli_sandbox is not None and self._real_cli_path is not None
+        access = self._prepared_cli.model_access if self._prepared_cli is not None else None
+        managed_dirs = _claude_managed_config_dirs()
+        if access is not None:
+            _validate_claude_managed_config(managed_dirs, access.source_env_names)
+        policy = _client_cli_sandbox(
+            self._cli_sandbox,
+            managed_config_dirs=managed_dirs,
+            bridge_dir=relay.bridge_dir if relay is not None else None,
+            socket_dir=relay.socket_dir if relay is not None else None,
+        )
+        overrides = None
+        if access is not None:
+            policy = access.protect_sources(policy, pathlib.Path(self._cwd or os.getcwd()))
+            overrides = options.env
+            policy = with_spawn_env_allowlist(
+                policy, [*(policy.spawn_env_allowlist or []), *overrides]
+            )
+        return create_exec_launcher(
+            self._real_cli_path,
+            policy,
+            cwd=self._cwd,
+            env_overrides=overrides,
+        )
+
+    async def _prepare_managed_cli(
         self, options: SdkOptions, relay_tools: list[ToolSpec] | None
     ) -> tuple[_ManagedMcpRelay | None, str | None]:
         """Point a new CLI's managed relay entry at its own relay, or at nothing.
@@ -2721,18 +3071,22 @@ class ClaudeSDKExecutor(Executor):
             options.env.update(dict.fromkeys(MANAGED_MCP_RELAY_ENV_NAMES, ""))
         if self._cli_sandbox is None or self._real_cli_path is None:
             return relay, None
+        build_task = asyncio.create_task(
+            asyncio.to_thread(self._build_managed_cli_launcher, options, relay)
+        )
         try:
-            launcher = create_exec_launcher(
-                self._real_cli_path,
-                _client_cli_sandbox(
-                    self._cli_sandbox,
-                    managed_config_dirs=_claude_managed_config_dirs(),
-                    bridge_dir=relay.bridge_dir if relay is not None else None,
-                    socket_dir=relay.socket_dir if relay is not None else None,
-                ),
-            )
+            launcher = await asyncio.shield(build_task)
         except BaseException:
-            _release_client_cli(relay, None)
+            try:
+                await await_cleanup_task(build_task)
+            except BaseException:  # noqa: BLE001 - cleanup must finish after cancellation
+                launcher = None
+            else:
+                launcher = build_task.result()
+            cleanup_task = asyncio.create_task(
+                asyncio.to_thread(_release_client_cli, relay, launcher)
+            )
+            await await_cleanup_task(cleanup_task)
             raise
         options.cli_path = launcher
         return relay, launcher
@@ -2813,12 +3167,9 @@ class ClaudeSDKExecutor(Executor):
                 "expected once the connecting turn has finished, e.g. idle reap / shutdown)",
                 session_key,
             )
+        finally:
+            # The SDK's disconnect() leaves its transport open, including on failure.
             await self._force_close_client(state.client)
-            return
-        # SDK's disconnect() doesn't close the asyncio transport;
-        # call _force_close_client to flip transport._closed before
-        # the loop tears down.
-        await self._force_close_client(state.client)
 
     def _provider_auth_hint(self) -> str:
         """Say where to fix a credential Claude Code could not authenticate with.
@@ -2878,12 +3229,40 @@ class ClaudeSDKExecutor(Executor):
         await self._close_live_client(session_key)
 
     async def close(self) -> None:
-        session_keys = list(self._clients)
-        for session_key in session_keys:
-            await self.close_session(session_key)
-        if self._gateway_shim is not None:
-            await self._gateway_shim.aclose()
-            self._gateway_shim = None
+        async def release_owned_resources() -> None:
+            first_error: BaseException | None = None
+            for session_key in list(self._clients):
+                try:
+                    await self.close_session(session_key)
+                except BaseException as exc:  # noqa: BLE001 - finish releasing other clients
+                    if first_error is None:
+                        first_error = exc
+            shim, self._gateway_shim = self._gateway_shim, None
+            if shim is not None:
+                try:
+                    await shim.aclose()
+                except BaseException as exc:  # noqa: BLE001 - relay cleanup still follows
+                    if first_error is None:
+                        first_error = exc
+            prepared, self._prepared_cli = self._prepared_cli, None
+            if prepared is not None:
+                try:
+                    await run_sync_on_thread(prepared.close)
+                except BaseException as exc:  # noqa: BLE001 - preserve the first failure
+                    if first_error is None:
+                        first_error = exc
+            if first_error is not None:
+                raise first_error
+
+        cleanup_task = asyncio.create_task(release_owned_resources())
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            try:
+                await await_cleanup_task(cleanup_task)
+            except BaseException:  # noqa: BLE001 - preserve the original cancellation
+                logger.warning("Claude SDK cleanup failed after cancellation")
+            raise
 
     async def interrupt_session(self, session_key: str) -> bool:
         state = self._clients.get(session_key)
@@ -3132,9 +3511,21 @@ class ClaudeSDKExecutor(Executor):
         if not self._gateway or not base_url:
             return {}
         if self._gateway_vocabulary is None:
-            self._gateway_vocabulary = await run_sync_on_thread(
-                _gateway_model_vocabulary, base_url, auth_command, static_api_key
-            )
+            access = self._prepared_cli.model_access if self._prepared_cli is not None else None
+            if access is not None:
+                try:
+                    token = await run_sync_on_thread(access.credential)
+                except Exception:  # noqa: BLE001 - credential errors may contain secrets.
+                    logger.warning("claude-sdk: gateway model discovery credential unavailable")
+                    return {}
+                self._gateway_vocabulary = await run_sync_on_thread(
+                    _gateway_model_vocabulary, base_url, None, api_key=token
+                )
+            else:
+                self._gateway_vocabulary = await run_sync_on_thread(
+                    _gateway_model_vocabulary, base_url, auth_command, static_api_key
+                )
+        assert self._gateway_vocabulary is not None
         for var, model_id in self._gateway_vocabulary.alias_pins.items():
             env.setdefault(var, model_id)
         return self._gateway_vocabulary.model_overrides
@@ -3345,6 +3736,79 @@ class ClaudeSDKExecutor(Executor):
         hooks["PreToolUse"] = entries
         options.hooks = hooks
 
+    def _install_bash_policy_hook(
+        self,
+        sdk: _ClaudeSDK,
+        options: Any,  # type: ignore[explicit-any]  # ClaudeAgentOptions
+    ) -> None:
+        """Enforce Bash policies even when Claude skips permission prompts."""
+        from omnigent.native.native_policy_hook import (
+            evaluation_response_to_hook_output,
+            fail_closed_hook_output,
+        )
+
+        hook_matcher = getattr(sdk, "HookMatcher", None)
+        if hook_matcher is None:
+            raise RuntimeError("Native Bash requires SDK PreToolUse hook support")
+        consents = _RelayConsents()
+        evaluated = _RelayConsents()
+
+        async def gate_bash(payload: object, tool_use_id: str | None, _context: object) -> object:
+            agent_id = payload.get("agent_id") if isinstance(payload, dict) else None
+            key = json.dumps((agent_id, tool_use_id))
+            consents.discard(key)
+            evaluated.discard(key)
+            if not isinstance(payload, dict) or not isinstance(payload.get("tool_input"), dict):
+                return fail_closed_hook_output("PreToolUse", "Invalid Bash tool input")
+            try:
+                result = await self._evaluate_tool_call_policy("Bash", payload["tool_input"])
+            except Exception:
+                logger.exception("Bash policy hook failed; denying the call")
+                return fail_closed_hook_output("PreToolUse")
+            if getattr(result, "behavior", None) == "deny":
+                return evaluation_response_to_hook_output(
+                    "PreToolUse",
+                    {"result": "POLICY_ACTION_DENY", "reason": getattr(result, "message", "")},
+                )
+            if tool_use_id:
+                evaluated.record(key, payload["tool_input"])
+                if getattr(result, "behavior", None) == "allow":
+                    consents.record(key, payload["tool_input"])
+            # Policy approval must leave Claude's own permission rules in force.
+            return {}
+
+        hooks = dict(getattr(options, "hooks", None) or {})
+        entries = list(hooks.get("PreToolUse") or [])
+        entries.append(
+            hook_matcher(
+                matcher="Bash", timeout=self._ASK_QUESTION_HOOK_TIMEOUT_S, hooks=[gate_bash]
+            )
+        )
+        hooks["PreToolUse"] = entries
+        options.hooks = hooks
+
+        permission_gate = getattr(options, "can_use_tool", None)
+        if permission_gate is not None:
+
+            async def can_use_tool(
+                tool_name: str, tool_input: ToolArgs, perm_ctx: object
+            ) -> object:
+                if tool_name == "Bash":
+                    tool_use_id = getattr(perm_ctx, "tool_use_id", None)
+                    key = json.dumps((getattr(perm_ctx, "agent_id", None), tool_use_id))
+                    # Another hook can rewrite input after our policy evaluation.
+                    if tool_use_id and evaluated.consume(key, tool_input):
+                        if consents.consume(key, tool_input):
+                            from claude_agent_sdk import PermissionResultAllow
+
+                            return PermissionResultAllow()
+                        return await self._can_use_tool_for_permission(
+                            tool_name, tool_input, perm_ctx
+                        )
+                return await permission_gate(tool_name, tool_input, perm_ctx)
+
+            options.can_use_tool = can_use_tool
+
     async def _can_use_tool_for_permission(
         self,
         tool_name: str,
@@ -3354,10 +3818,9 @@ class ClaudeSDKExecutor(Executor):
         """
         Route a Claude SDK permission request through the Omnigent elicitation system.
 
-        Installed as ``options.can_use_tool`` when ``permission_mode`` is
-        not ``"bypassPermissions"`` and an elicitation handler has been wired
-        in by :class:`omnigent.runtime.harnesses._executor_adapter.ExecutorAdapter`.
-        Called by the SDK before each tool invocation.
+        Called when Claude requests permission. Bypass mode or an absent
+        elicitation handler allows without prompting. Bash reaches this
+        method directly because its PreToolUse hook already evaluated policy.
 
         :param tool_name: Name of the tool Claude wants to call,
             e.g. ``"Bash"``.
@@ -3380,12 +3843,7 @@ class ClaudeSDKExecutor(Executor):
             tool_name,
             tool_use_id,
         )
-        if self._elicitation_handler is None:
-            # No handler installed — grant by default. This branch is
-            # unreachable in normal operation (run_turn only sets
-            # can_use_tool when _elicitation_handler is not None), but
-            # is included for safety if the SDK ever calls the callback
-            # after the handler was cleared.
+        if self._permission_mode == "bypassPermissions" or self._elicitation_handler is None:
             return PermissionResultAllow()
         allowed = await self._elicitation_handler(tool_name, tool_input)
         if allowed:
@@ -3498,13 +3956,11 @@ class ClaudeSDKExecutor(Executor):
 
         Composes two independent gates, in order:
 
-        1. **TOOL_CALL policy** (always, when a ``_policy_evaluator`` is
+        1. **TOOL_CALL policy** (when a ``_policy_evaluator`` is
            wired): a hard DENY short-circuits to
-           :class:`~claude_agent_sdk.PermissionResultDeny`. This runs in
-           EVERY permission mode — including ``bypassPermissions`` — so
-           connector-native MCP tools can't slip past policy. ALLOW /
-           no-match falls through with no human interaction, preserving
-           ``bypassPermissions`` ergonomics for un-gated tools.
+           :class:`~claude_agent_sdk.PermissionResultDeny`. Claude only calls
+           this callback for permission prompts; native Bash uses a separate
+           PreToolUse policy hook to cover calls Claude approves automatically.
         2. **Human-consent elicitation** (only when the permission mode is
            NOT ``bypassPermissions`` and an elicitation handler is wired):
            the pre-existing per-tool approval prompt. Under
@@ -3517,16 +3973,10 @@ class ClaudeSDKExecutor(Executor):
         :param perm_ctx: :class:`claude_agent_sdk.ToolPermissionContext`.
         :returns: A :class:`~claude_agent_sdk.PermissionResult`.
         """
-        from claude_agent_sdk import PermissionResultAllow
-
         policy_result = await self._evaluate_tool_call_policy(tool_name, tool_input)
         if policy_result is not None:
             # Hard DENY from policy — block before execution.
             return policy_result
-        # Policy allowed (or no policy gate). Under bypassPermissions we
-        # never prompt; otherwise defer to the elicitation gate.
-        if self._permission_mode == "bypassPermissions" or self._elicitation_handler is None:
-            return PermissionResultAllow()
         return await self._can_use_tool_for_permission(tool_name, tool_input, perm_ctx)
 
     async def run_turn(
@@ -3682,7 +4132,9 @@ class ClaudeSDKExecutor(Executor):
         # ``""`` here would still leave an empty key in the child env.
         env = dict(self._extra_env)
         env["CLAUDE_AGENT_SDK_CLIENT_APP"] = "omnigent"
-        api_key_helper = env.pop(_CLAUDE_API_KEY_HELPER_ENV_KEY, None)
+        api_key_helper = self._model_auth_helper
+        env.pop(_CLAUDE_API_KEY_HELPER_ENV_KEY, None)
+        brokered = self._prepared_cli is not None and self._prepared_cli.model_access is not None
         # Windows uses a Python helper instead of POSIX printf.
         api_key_helper, static_api_key = _platform_safe_api_key_helper(api_key_helper)
         # Teach Claude Code this gateway's spellings so no model surface routes
@@ -3707,7 +4159,9 @@ class ClaudeSDKExecutor(Executor):
 
         settings_payload = apply_claude_settings(
             _claude_settings_payload(
-                api_key_helper, model_overrides, disable_claude_ai_connectors=hermetic
+                None if brokered else api_key_helper,
+                model_overrides,
+                disable_claude_ai_connectors=hermetic,
             ),
             executor="claude-sdk",
             active_harnesses=self._mcp_active_harnesses,
@@ -3750,11 +4204,10 @@ class ClaudeSDKExecutor(Executor):
         # they explicitly opted into. ``no-session-persistence``
         # stays because omnigent owns conversation persistence
         # via its own conversation store.
-        # OS-environment tools are provided via Omnigent ``sys_os_*``
-        # MCP tools (declared via ``os_env`` in the spec), not the
-        # SDK's native Bash/Read/Edit/Write. Keep Skill and ToolSearch in
-        # the base set so MCP definitions can be discovered on demand.
+        # Skill interpolation needs Bash, contained with the entire CLI.
         base_tools: list[str] = self._base_tools(sdk)
+        if self._prepared_cli is not None and self._prepared_cli.sandboxed:
+            base_tools.append("Bash")
         # Bundle skills are exposed via the SDK's plugin mechanism.
         # The bundle's ``<bundle>/skills/<dir>/SKILL.md`` files are
         # discovered as plugin skills (no ``.claude/`` prefix needed
@@ -3763,10 +4216,14 @@ class ClaudeSDKExecutor(Executor):
         # ``name`` (and thus the skill-listing prefix) comes from
         # the manifest written at construction time.
         bundle_plugins: list[Any] = []  # type: ignore[explicit-any]  # SdkPluginConfig is a TypedDict — typed Any here to keep the import lazy
-        if self._bundle_dir is not None and (self._bundle_dir / "skills").is_dir():
-            bundle_plugins.append({"type": "local", "path": str(self._bundle_dir)})
-        if resolved.setting_sources == [] and not self._gateway:
-            # The CLI then skips the user settings env, which may hold the only provider endpoint.
+        plugin_dir = (
+            self._prepared_cli.plugin_dir
+            if self._prepared_cli is not None and self._prepared_cli.sandboxed
+            else self._bundle_dir
+        )
+        if plugin_dir is not None and (plugin_dir / "skills").is_dir():
+            bundle_plugins.append({"type": "local", "path": str(plugin_dir)})
+        if resolved.setting_sources == [] and not self._gateway and not brokered:
             env = {**_claude_user_settings_env(self._cwd), **env}
         max_output_tokens = cfg.extra.get("max_tokens")
         if max_output_tokens is not None:
@@ -3836,23 +4293,8 @@ class ClaudeSDKExecutor(Executor):
             options.model = model
         if self._cwd:
             options.cwd = self._cwd
-        # Install the unified can_use_tool gate. It runs the TOOL_CALL
-        # policy evaluation in EVERY permission mode — including
-        # ``bypassPermissions`` — so connector-native MCP tools
-        # (``mcp__github__*``, ``mcp__atlassian__*``) that execute inside
-        # the CLI subprocess are evaluated against Omnigent TOOL_CALL
-        # policy before they run, instead of bypassing policy entirely.
-        #
-        # The gate is no-friction when nothing matches: a policy ALLOW /
-        # no-match returns allow with no human prompt, so
-        # ``bypassPermissions`` ergonomics are preserved for un-gated
-        # tools. The human-consent elicitation half of the gate still only
-        # fires for non-bypass modes (see ``_can_use_tool_gate``).
-        #
-        # Install whenever EITHER a policy evaluator OR an elicitation
-        # handler is wired. Previously this only installed for non-bypass
-        # modes, which is why default ``claude-sdk`` sessions (which
-        # default to ``bypassPermissions``) had no per-tool TOOL_CALL gate.
+        # The permission callback only handles calls Claude would prompt for.
+        # Bash also needs PreToolUse policy enforcement in every mode.
         if (
             getattr(self, "_policy_evaluator", None) is not None
             or self._elicitation_handler is not None
@@ -3862,6 +4304,8 @@ class ClaudeSDKExecutor(Executor):
         self._install_subagent_router_hook(sdk, options, model)
         self._install_framework_context_hook(sdk, options, session_key)
         self._install_ask_user_question_hook(sdk, options)
+        if "Bash" in base_tools:
+            self._install_bash_policy_hook(sdk, options)
 
         # Log the full configuration for debugging
         logger.info(
@@ -4015,9 +4459,11 @@ class ClaudeSDKExecutor(Executor):
 
         mcp_relay = None
         cli_launcher = None
-        # Only a new CLI reads the relay environment; a live one keeps its relay.
-        if managed_mcp and session_key not in self._clients:
-            mcp_relay, cli_launcher = self._prepare_managed_cli(options, managed_relay_tools)
+        # Freeze the full turn environment before a new contained CLI starts.
+        if (managed_mcp or brokered) and session_key not in self._clients:
+            mcp_relay, cli_launcher = await self._prepare_managed_cli(
+                options, managed_relay_tools if managed_mcp else None
+            )
         try:
             client = await self._get_or_create_client(
                 sdk,

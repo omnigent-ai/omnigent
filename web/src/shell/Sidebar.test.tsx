@@ -12,6 +12,7 @@ import { conversationPage } from "@/test/sidebarMockHelpers";
 import * as automationInboxHook from "@/hooks/useAutomationInbox";
 import * as proactiveInboxHook from "@/hooks/useProactiveInbox";
 import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
+import { MUTED_LABEL_KEY } from "@/lib/sessionMute";
 import { sidebarConfig, type SidebarConfig } from "@/lib/sidebarConfig";
 // Integration tests for the Sidebar's session list. The search box no
 // longer carries a filter funnel (agent-type filter + "Show archived"
@@ -767,24 +768,31 @@ describe("Sidebar session list", () => {
     }
   });
 
-  it("shows a draft icon only beside sessions with unfinished composer content", () => {
-    mockConversations([
-      conv("conv_draft", "Codex", { title: "Draft session" }),
-      conv("conv_empty", "Codex", { title: "Empty session" }),
-    ]);
-    renderSidebar();
+  it.each([false, true])(
+    "shows a draft icon only beside unfinished composer content, muted=%s",
+    (muted) => {
+      mockConversations([
+        conv("conv_draft", "Codex", {
+          title: "Draft session",
+          labels: muted ? { [MUTED_LABEL_KEY]: "1" } : {},
+        }),
+        conv("conv_empty", "Codex", { title: "Empty session" }),
+      ]);
+      renderSidebar();
 
-    const draftRow = screen.getByText("Draft session").closest("li")!;
-    const emptyRow = screen.getByText("Empty session").closest("li")!;
-    expect(within(draftRow).queryByTestId("conversation-draft-indicator")).toBeNull();
+      const draftRow = screen.getByText("Draft session").closest("li")!;
+      const emptyRow = screen.getByText("Empty session").closest("li")!;
+      expect(within(draftRow).queryByTestId("conversation-draft-indicator")).toBeNull();
 
-    act(() => setSessionDraft("conv_draft", { text: "unfinished message", files: [] }));
+      act(() => setSessionDraft("conv_draft", { text: "unfinished message", files: [] }));
 
-    const indicator = within(draftRow).getByTestId("conversation-draft-indicator");
-    expect(indicator).toHaveAccessibleName("Draft");
-    expect(indicator.parentElement).toHaveClass("absolute", "right-1");
-    expect(within(emptyRow).queryByTestId("conversation-draft-indicator")).toBeNull();
-  });
+      const indicator = within(draftRow).getByTestId("conversation-draft-indicator");
+      expect(indicator).toHaveAccessibleName("Draft");
+      expect(within(draftRow).queryByTestId("conversation-muted-icon")).toBeNull();
+      expect(indicator.parentElement).toHaveClass("absolute", "right-1");
+      expect(within(emptyRow).queryByTestId("conversation-draft-indicator")).toBeNull();
+    },
+  );
 
   it("uses balanced title padding until row actions are revealed", () => {
     mockConversations([conv("conv_balanced", "Codex", { title: "Balanced row title" })]);
@@ -1192,14 +1200,20 @@ describe("Sidebar session list", () => {
     expect(within(primaryNav).queryByTestId("toggle-selection-mode")).toBeNull();
   });
 
-  it("paints the Inbox count with the primary CTA fill while Inbox is inactive", () => {
+  it("paints the Inbox count with the shared active treatment while Inbox is inactive", () => {
+    // Off the /inbox route the badge is the only carrier of the count's
+    // treatment, so it wears the same --sidebar-active wash and foreground as
+    // a selected session row.
     mockConversations([conv("conv_awaiting", "Claude Code", { pending_elicitations_count: 2 })]);
     renderSidebar();
 
     const inbox = screen.getByTestId("inbox-button");
     expect(inbox).not.toHaveClass("bg-[var(--sidebar-active)]");
     const badge = within(inbox).getByLabelText("2 inbox items waiting");
-    expect(badge).toHaveClass("bg-primary-cta", "text-primary-cta-foreground");
+    expect(badge).toHaveClass(
+      "bg-[var(--sidebar-active)]",
+      "text-[var(--sidebar-active-foreground)]",
+    );
     expect(badge.className).not.toContain("brand-accent");
   });
 
@@ -1298,7 +1312,10 @@ describe("Sidebar session list", () => {
     ).toHaveTextContent("1");
   });
 
-  it("keeps the primary CTA count fill on the active Inbox row", () => {
+  it("lets the active Inbox row show through the count badge", () => {
+    // On /inbox the row itself paints the translucent --sidebar-active wash.
+    // The badge keeps the shared active foreground but stays transparent so
+    // the wash is not double-composited into a darker fill.
     mockConversations([conv("conv_awaiting", "Claude Code", { pending_elicitations_count: 2 })]);
     renderSidebar(true, "/inbox");
 
@@ -1308,7 +1325,8 @@ describe("Sidebar session list", () => {
       "text-[var(--sidebar-active-foreground)]",
     );
     const badge = within(inbox).getByLabelText("2 inbox items waiting");
-    expect(badge).toHaveClass("bg-primary-cta", "text-primary-cta-foreground");
+    expect(badge).toHaveClass("bg-transparent", "text-[var(--sidebar-active-foreground)]");
+    expect(badge).not.toHaveClass("bg-[var(--sidebar-active)]");
   });
 
   it("hides Usage navigation while the release feature is off", () => {
@@ -2194,6 +2212,34 @@ describe("Sidebar sections", () => {
     showSharedTab();
     expect(screen.getAllByText("No sessions")[0]).toBeInTheDocument();
     expect(screen.queryByText("conv_only_mine")).toBeNull();
+  });
+
+  it("highlights the open nested draft and deletes a parked draft from its context menu", async () => {
+    mockConversations([conv("conv_first", "Codex"), conv("conv_second", "Codex")]);
+    const { queryClient } = renderSidebar(true, "/?sibling=conv_first");
+    act(() => {
+      for (const id of ["conv_first", "conv_second"]) {
+        addNestedSessionDraft(queryClient, `temp:${id}`, {
+          id,
+          title: id,
+          createdAt: 1,
+          labels: {},
+          permissionLevel: null,
+        } as Session);
+      }
+    });
+    const drafts = await screen.findAllByRole("link", { name: "New nested agent" });
+    const first = drafts.find((link) => link.getAttribute("href") === "/?sibling=conv_first")!;
+    const second = drafts.find((link) => link.getAttribute("href") === "/?sibling=conv_second")!;
+    expect(first).toHaveClass("bg-[var(--sidebar-active)]");
+    expect(second).not.toHaveClass("bg-[var(--sidebar-active)]");
+    fireEvent.click(second);
+    expect(first).not.toHaveClass("bg-[var(--sidebar-active)]");
+    expect(second).toHaveClass("bg-[var(--sidebar-active)]");
+    fireEvent.contextMenu(first);
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Delete draft" }));
+    await waitFor(() => expect(first).not.toBeInTheDocument());
+    expect(second).toHaveClass("bg-[var(--sidebar-active)]");
   });
 
   it.each([
@@ -3671,6 +3717,47 @@ describe("Sidebar project Show more", () => {
 // A collapsed project bubbles up its hidden rows' marker, using the same
 // SessionStateBadge a row shows. Only while collapsed.
 describe("Sidebar collapsed project marker", () => {
+  it.each([false, true])(
+    "ignores muted unread rows with unmuted unread sibling=%s",
+    (unreadSibling) => {
+      projectsMock.push("Example project");
+      writeProjectFolderPageSize(1);
+      seedReadState([
+        { id: "conv_read", viewer_last_seen: 300 },
+        { id: "conv_muted", viewer_last_seen: 199 },
+        { id: "conv_sibling", viewer_last_seen: unreadSibling ? 199 : 200 },
+      ]);
+      mockConversations([
+        conv("conv_read", "Codex", {
+          labels: { omni_project: "Example project" },
+          status: "idle",
+          updated_at: 300,
+        }),
+        conv("conv_muted", "Codex", {
+          labels: { omni_project: "Example project", [MUTED_LABEL_KEY]: "1" },
+          status: "idle",
+          updated_at: 200,
+        }),
+        conv("conv_sibling", "Codex", {
+          labels: { omni_project: "Example project" },
+          status: "idle",
+          updated_at: 200,
+        }),
+      ]);
+      renderSidebar();
+      const header = screen.getByRole("button", { name: /^Example project/ });
+      const marker = within(header).queryByTestId("session-state-badge");
+      if (unreadSibling) expect(marker).toHaveAttribute("data-state", "unseen");
+      else expect(marker).toBeNull();
+      fireEvent.click(header);
+      const hiddenMarker = within(screen.getByTestId("project-show-more")).queryByTestId(
+        "session-state-badge",
+      );
+      if (unreadSibling) expect(hiddenMarker).toHaveAttribute("data-state", "unseen");
+      else expect(hiddenMarker).toBeNull();
+    },
+  );
+
   it("surfaces an error ahead of unread messages and moves it to the expanded row", () => {
     projectsMock.push("Customer X");
     seedReadState([{ id: "conv_unread", viewer_last_seen: 199 }]);
@@ -4128,6 +4215,23 @@ describe("Sidebar active-row auto-scroll", () => {
     vi.restoreAllMocks();
   });
 
+  it.each([false, true])("hides the active row's Mark as unread only when muted=%s", (muted) => {
+    seedReadState([{ id: "conv_active", viewer_last_seen: 199 }]);
+    mockConversations([
+      conv("conv_active", "Codex", {
+        status: "idle",
+        updated_at: 200,
+        labels: muted ? { [MUTED_LABEL_KEY]: "1" } : {},
+      }),
+    ]);
+    renderAtRoute("/c/conv_active");
+    const row = screen.getByRole("link", { name: "conv_active" }).closest("li")!;
+    fireEvent.pointerDown(within(row).getByTestId("conversation-actions"), { button: 0 });
+    if (muted) expect(screen.queryByTestId("mark-unread-conversation")).toBeNull();
+    else expect(screen.getByTestId("mark-unread-conversation")).toBeInTheDocument();
+    expect(screen.queryByTestId("mark-read-conversation")).toBeNull();
+  });
+
   it("leaves the open session out of the Inbox badge until it is marked unread", () => {
     vi.spyOn(Element.prototype, "scrollIntoView").mockImplementation(() => {});
     seedReadState([{ id: "conv_active", viewer_last_seen: 199 }]);
@@ -4289,6 +4393,30 @@ describe("Sidebar view options", () => {
       .map((button) => button.textContent ?? "")
       .filter((title) => GROUP_TITLES.has(title));
   const groupSection = (title: string) => screen.getByText(title).closest("section")!;
+
+  it("keeps muted unread sessions out of the Unread status group", () => {
+    localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ grouping: "status" }));
+    const mutedLabels = { [MUTED_LABEL_KEY]: "1" };
+    const rows = [
+      conv("muted_idle", "Codex", { status: "idle", updated_at: 200, labels: mutedLabels }),
+      conv("ordinary_unread", "Codex", { status: "idle", updated_at: 200 }),
+      conv("muted_running", "Codex", { status: "running", labels: mutedLabels }),
+      conv("muted_approval", "Codex", { pending_elicitations_count: 1, labels: mutedLabels }),
+    ];
+    seedReadState(rows.map((row) => ({ id: row.id, viewer_last_seen: 199 })));
+    mockConversations(rows);
+    renderGroupingSidebar();
+    expect(within(groupSection("Done")).getByText("muted_idle")).toBeInTheDocument();
+    expect(within(groupSection("Unread")).getByText("ordinary_unread")).toBeInTheDocument();
+    expect(within(groupSection("Working")).getByText("muted_running")).toBeInTheDocument();
+    expect(within(groupSection("Needs attention")).getByText("muted_approval")).toBeInTheDocument();
+    // Active status outranks the muted bell.
+    for (const id of ["muted_running", "muted_approval"]) {
+      const row = screen.getByText(id).closest("li")!;
+      expect(within(row).getByTestId("session-state-badge")).toBeInTheDocument();
+      expect(within(row).queryByTestId("conversation-muted-icon")).toBeNull();
+    }
+  });
 
   it("restores Status grouping from a saved selection and offers it in the menu", () => {
     localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ grouping: "status" }));

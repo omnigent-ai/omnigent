@@ -1273,6 +1273,37 @@ def test_sandbox_launch_path_falls_back_when_backend_unavailable(monkeypatch, tm
     assert executor._sandbox_launch_path(("PATH",)) == "/usr/bin/goose"
 
 
+def test_sandbox_launch_path_propagates_launcher_integrity_failure(monkeypatch, tmp_path) -> None:
+    from omnigent.inner import sandbox as sandbox_mod
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.sandbox import SandboxPolicy
+
+    sandbox = SandboxPolicy(
+        backend_type="linux_bwrap",
+        active=True,
+        read_roots=[tmp_path],
+        write_roots=[tmp_path],
+        write_files=[],
+        allow_network=True,
+    )
+    integrity_error = OSError("Cannot validate sandbox launcher runtime")
+
+    def fail_launcher(_target: str, _sandbox: SandboxPolicy) -> str:
+        raise integrity_error
+
+    monkeypatch.setattr(sandbox_mod, "resolve_sandbox", lambda _os_env, _cwd: sandbox)
+    monkeypatch.setattr(sandbox_mod, "create_exec_launcher", fail_launcher)
+    executor = GooseExecutor(
+        cwd=str(tmp_path),
+        goose_path="/usr/bin/goose",
+        os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+    )
+
+    with pytest.raises(OSError) as raised:
+        executor._sandbox_launch_path(("PATH",))
+    assert raised.value is integrity_error
+
+
 @pytest.mark.asyncio
 async def test_start_process_resets_handshake_state(monkeypatch) -> None:
     """A (re)start clears the one-way handshake latch and spawns goose acp."""

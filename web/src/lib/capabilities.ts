@@ -60,7 +60,6 @@ export type FeatureKey =
   | "usage_page"
   | "harness_install"
   | "canvas"
-  | "arca_shutdown_warnings"
   | "import_review"
   | "sidebar_grouping_ui"
   | "workspace_content_search"
@@ -68,6 +67,7 @@ export type FeatureKey =
   | "automations_v2"
   | "splittable_terminal_view_ui"
   | "sidebar_windowed_rows"
+  | "chat_composer_codemirror"
   | "session_orchestration"
   | "workflows"
   | "session_overview"
@@ -75,7 +75,8 @@ export type FeatureKey =
   | "project_repository_creation"
   | "workspace_direct_access"
   | "workspace_api_server_access"
-  | "quick_pick_palette";
+  | "quick_pick_palette"
+  | "floating_composer";
 
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;
@@ -266,6 +267,12 @@ export interface ServerInfo {
    */
   session_search_scope?: boolean;
   /**
+   * True when the server keeps the ``omnigent.muted`` label per viewer. Older
+   * servers would store it as a label every collaborator sees, so the client
+   * offers Mute only when this is set. Fails to ``false``.
+   */
+  session_mute?: boolean;
+  /**
    * True when scheduled tasks accept ``session_mode`` and ``session_id``.
    * Older servers reject the fields, so the automation dialog hides its
    * Session control there. Fails to ``false``.
@@ -392,6 +399,11 @@ export interface ServerInfo {
    * absent on older servers (off), including ones that store session PRs.
    */
   scheduled_task_run_pull_requests?: boolean;
+  /**
+   * True when `POST /v1/scheduled-tasks/{id}/clone` copies an automation under a new ID;
+   * absent on older servers (off).
+   */
+  scheduled_task_clone?: boolean;
   /**
    * The deployment offers the proactive agent (Omni Advisor) to this caller;
    * whether it is on for them is at ``GET /v1/proactive-agent/settings``.
@@ -540,6 +552,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   archive_worktree_cleanup: false,
   automations_enabled: true,
   session_search_scope: false,
+  session_mute: false,
   scheduled_task_session_modes: false,
   session_create_permission_modes: false,
   session_create_workflow_id: false,
@@ -731,6 +744,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           archive_worktree_cleanup: data.archive_worktree_cleanup === true,
           automations_enabled: data.automations_enabled !== false,
           session_search_scope: data.session_search_scope === true,
+          session_mute: data.session_mute === true,
           scheduled_task_session_modes: data.scheduled_task_session_modes === true,
           session_create_permission_modes: data.session_create_permission_modes === true,
           session_create_workflow_id: data.session_create_workflow_id === true,
@@ -777,6 +791,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           inbox_items_available: data.inbox_items_available === true,
           scheduled_task_shared_with_me: data.scheduled_task_shared_with_me === true,
           scheduled_task_run_pull_requests: data.scheduled_task_run_pull_requests === true,
+          scheduled_task_clone: data.scheduled_task_clone === true,
           proactive_agent_available: data.proactive_agent_available === true,
           scheduled_task_harness_settings: data.scheduled_task_harness_settings === true,
           scheduled_task_approval_skipping_modes:

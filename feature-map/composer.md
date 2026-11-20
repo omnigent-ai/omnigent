@@ -14,6 +14,14 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 
 ## Sub-features
 
+- `codemirror-input`: behind the `chat_composer_codemirror` release flag (off by
+  default; enable it with `OMNIGENT_FEATURES=chat_composer_codemirror` on the
+  server), the main chat's message box is a CodeMirror editor. It takes plain
+  text, scrolls inside the box when the draft is taller than the cap, and keeps
+  the same send, history, and completion keys. Side chats and New Chat follow
+  the same choice. Mobile widths always use the plain text box. It also stays
+  while the editor loads, and stays if loading fails; a failed load retries on
+  window focus, at most once a minute.
 - `touch-targets`: native iOS/Android apps and browsers with a coarse primary
   pointer and no hover use at least 44 CSS-pixel composer controls and menu rows.
   The layout adapts at phone, tablet, and desktop widths; mouse browsers retain
@@ -151,6 +159,18 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   harness as text. A claude-sdk `/clear` continues in a new, empty session on
   the same machine and the view follows it. States: loading, error/retry,
   unavailable while disconnected, and an incomplete catalog.
+- `command-and-shell-tint`: in the main chat, side chats, Canvas grid cells
+  and the new-session composer (textarea or CodeMirror), a leading known
+  command or skill is tinted (the main chat's built-ins in any case, as they
+  run) and an unknown `/word` is not; the sent bubble keeps the tint, except
+  for a message relayed from another session. In Claude Code and Codex native
+  sessions a leading `!` is tinted with a "Shell command" hint (Codex skips
+  leading whitespace and treats `!!` as text). States: known or unknown
+  command; quotes or attachments (no tint); shell mode; refused shell send,
+  with the reason as the hint and the draft kept (an @-tag, review comments, a
+  reply quote, or a Codex non-owner, whom the server would reject); permission
+  still loading or a pending Codex side-chat tab (no shell mode). See the
+  [native shell recipes](native-harnesses.md#driving-it-with-the-repro-environment).
 - `goal-command`: in sessions with a Goal control, bare `/goal` or its slash-menu
   row opens the same dialog as **+ → Goal**. `/goal <objective>` keeps its
   existing message path. Sessions without the control keep sending the text
@@ -309,8 +329,11 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - `host-offline-hold`: a message sent to a native session whose host is offline
   waits in the queue as "Waiting for host", ahead of other queued messages, and
   sends once the host reconnects; no failed turn is recorded.
-- `browser-pointer-queue`: desktop Design-mode instructions follow the same queue
-  and always-steer preference, keeping their element screenshots.
+- `browser-pointer-queue`: desktop Design-mode instructions (older shells) follow
+  the same queue and always-steer preference, keeping their element screenshots.
+  Annotate/Draw requests skip the queue: they wait in their own outbox, saved in
+  the browser, send once the session is idle and its account is still the one
+  signed in, and show Retry/Remove above the composer (a side chat's too).
 - `pi-compact`: `/compact` follows the normal queue/Always steer preference.
   Send now interrupts the turn and compacts. During compaction, queued messages
   wait in the web queue; immediate sends are retained by the Pi integration.
@@ -370,6 +393,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - In a Codex native chat, a Claude Code native chat, or a Polly session with a
   Goal control, send `/goal`, choose `/goal` from the slash menu, or open
   **+ → Goal**.
+- In the in-session composer, a side chat, a Canvas grid cell, or the
+  new-session composer, type a known command or skill such as `/help`; in a
+  Claude Code or Codex native session (or with that agent chosen on the
+  new-session composer), type a draft that starts with `!`.
 
 **In-session composer** (open any session):
 
@@ -442,12 +469,15 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 
 **Desktop browser pointer** (open a session in the desktop app):
 
-- Choose **+ → Browser** to open a Browser soft tab, navigate to a page, enable
-  Design mode, and click an element. Type an instruction in the floating popup
-  and use Send or Enter.
+- Choose **+ → Browser** to open a Browser soft tab and navigate to a page. Use
+  Annotate to click an element and type an instruction, or Draw to mark up the
+  page and add a note, then send. Where they're unavailable (older shells),
+  enable Design mode instead, click an element, type an instruction in the
+  floating popup, and use Send or Enter.
 - Change Settings → Always steer (on by default) to choose whether
-  busy-session follow-ups queue or send immediately. Existing queued messages
-  retain FIFO ordering.
+  busy-session Design-mode follow-ups queue or send immediately. Existing queued
+  messages retain FIFO ordering. Annotate/Draw requests ignore it: they wait above
+  the composer (Send/Enter, then Retry or Remove) until the turn ends.
 
 **New-session composer** (landing page, or New session):
 
@@ -866,6 +896,18 @@ composer with its prompt`).
   incomplete catalog:
   `tests/e2e_ui/chat/test_codex_skills_menu_inventory_failure.py::test_failed_plugin_inventory_is_not_shown_as_an_empty_catalog`.
   claude-sdk `/clear` is in the `/clear` and `slash-rewind` recipe above.
+- **`command-and-shell-tint`:** component coverage, run with vitest from
+  `web/`: `web/src/components/composer/composerHighlight.test.ts`
+  (classification, including the harness-specific `!` rules),
+  `web/src/pages/ChatPage.composer.test.tsx` (`Composer native shell mode` and
+  the CodeMirror release-flag cases),
+  `web/src/components/chat/SideChatPane.test.tsx`,
+  `web/src/shell/NewChatDialog.test.tsx` and
+  `web/src/pages/ChatPage.userBubble.test.tsx` (sent-bubble tint). Manually,
+  in a Codex native session as owner, type `!echo hi`: the `!` is tinted and
+  the hint shows; add an @-tag and send to see the refusal. Repeat in a side
+  chat, a Canvas grid cell and on the new-session composer, with and without
+  `chat_composer_codemirror`.
 - **`goal-command`:**
   `tests/e2e_ui/chat/test_codex_goal_mode.py::test_codex_goal_mode_processes_first_message_with_untrusted_hooks`
   drives a real Codex native session through **+ → Goal**, bare `/goal`, and
@@ -1047,6 +1089,9 @@ node --test e2e/desktop_dictation_availability.e2e.js`): no mic against a
   Repeat in a fresh session with Always steer on: both entry points send while
   busy and the pointer popup says "Sent to agent." If older messages are already
   queued, new pointer instructions must join them even with Always steer on.
+  With Annotate or Draw instead, the request waits above the composer while the
+  turn runs and sends once it ends; after a reload it comes back for Retry or
+  Remove.
 - **`pi-compact`:** in a Pi session, start a long turn, type `/comp`, press Tab,
   then Enter. With Always steer off, confirm `/compact` queues; use Send now to
   interrupt and compact. With Always steer on and an empty queue, Enter should

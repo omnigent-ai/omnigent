@@ -1301,6 +1301,7 @@ function WorkspacePanelImpl({
           (isMobile ? mobileSideChatsOpen : open && sideChatSelected) ? conversationId : undefined
         }
         onStart={(text) => startPendingSideChat(selectedSideChat, text)}
+        pendingHarness={sideChatHarness}
       />
     );
   };
