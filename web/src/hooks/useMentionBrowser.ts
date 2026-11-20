@@ -154,6 +154,8 @@ export interface MentionBrowser {
    * token if it is already tagged or was released; returns the tokens, in order.
    */
   tagFiles: (files: readonly MentionItem[]) => string[];
+  /** Every token a tag owns, active or released, for scanning text the way the hook does. */
+  ownedMentionTokens: () => string[];
   /** Replace the draft's tags, forgetting released ones: a send, recall or new draft. */
   resetMentions: (mentions?: TaggedMentions) => void;
   /**
@@ -604,6 +606,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     attachSession,
     mentionTokens,
     tagFiles,
+    ownedMentionTokens,
     resetMentions,
     noteTextChange,
     handleTokenBackspace,

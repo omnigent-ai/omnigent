@@ -591,6 +591,31 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     );
   });
 
+  it("re-adds a file on 'Attach to agent' when a released session's longer spelling stays literal", () => {
+    const onSend = vi.fn();
+    sessions.loaded = [sessionRow("s_readme", "readme.md")];
+    renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+    type("compare @readme");
+    fireEvent.click(screen.getByTitle("Attach readme.md"));
+    append("with @readme");
+    fireEvent.click(screen.getByTitle("Tag session readme.md"));
+    const [, sessionToken] = tokens();
+    // Clear the draft, which releases both tags, then paste the session's spelling back by hand.
+    type("");
+    type(`see ${sessionToken} `);
+    expect(tokens()).toEqual([]);
+    act(() => {
+      useChatStore.setState({ pendingComposerAttachments: [{ path: "readme.md", isDir: false }] });
+    });
+    // The file is tagged again instead of lost; no session rides along.
+    expect(tokens()).toContain("@readme.md");
+    fireEvent.submit(textarea().closest("form")!);
+    const sent = onSend.mock.calls[0]![0] as string;
+    expect(sent).toContain("[Attached: readme.md]");
+    expect(sent).not.toContain("[Session:");
+    expect(sent).not.toContain(SESSION_MENTION_HINT);
+  });
+
   it("keeps the highlighted file when session results land above it", async () => {
     sessions.searchHits = [sessionRow("s_readme", "readme cleanup")];
     renderWithTooltips(<Composer {...composerProps()} />);
