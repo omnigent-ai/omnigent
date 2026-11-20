@@ -42,7 +42,6 @@ import {
   updateWarmTerminalSurfaces,
   type WarmTerminalEntry,
   isBackgroundTasksOnly,
-  splitSlashCommand,
   stripGatedSubagentRoutingChips,
   stripPendingElicitations,
   unboundSessionResumableInApp,
@@ -1915,68 +1914,6 @@ describe("isSlashCommandText", () => {
     ["empty string", ""],
   ] as const)("does not treat %s as a slash command", (_label, text) => {
     expect(isSlashCommandText(text)).toBe(false);
-  });
-});
-
-describe("splitSlashCommand", () => {
-  // The composer overlay tints only `token`; `before`/`after` stay default,
-  // so the whole draft no longer goes blue once args are typed.
-  it("splits the command token from its args", () => {
-    expect(splitSlashCommand("/cross-review fix the bug")).toEqual({
-      before: "",
-      token: "/cross-review",
-      after: " fix the bug",
-    });
-  });
-
-  it("returns an empty `after` for a bare command", () => {
-    expect(splitSlashCommand("/oncall")).toEqual({
-      before: "",
-      token: "/oncall",
-      after: "",
-    });
-  });
-
-  it("preserves leading whitespace in `before`", () => {
-    expect(splitSlashCommand("  /compact")).toEqual({
-      before: "  ",
-      token: "/compact",
-      after: "",
-    });
-  });
-
-  it("keeps a plugin-namespaced skill name whole", () => {
-    expect(splitSlashCommand("/dev-productivity:simplify now")).toEqual({
-      before: "",
-      token: "/dev-productivity:simplify",
-      after: " now",
-    });
-  });
-
-  it("treats a known skill name with spaces as one token", () => {
-    const name = "/Simplified Technical English (ASD-STE100)";
-    expect(splitSlashCommand(`${name} rewrite this`, ["/compact", name])).toEqual({
-      before: "",
-      token: name,
-      after: " rewrite this",
-    });
-    // Without a catalog match only the first word reads as the command.
-    expect(splitSlashCommand(`${name} rewrite this`, ["/compact"])?.token).toBe("/Simplified");
-  });
-
-  it("matches a known skill whose first word is not command-shaped", () => {
-    const name = "/Node.js Best Practices";
-    expect(splitSlashCommand(`${name} here`, [name])).toEqual({
-      before: "",
-      token: name,
-      after: " here",
-    });
-    // Not command-shaped and not in the catalog: nothing to tint.
-    expect(splitSlashCommand(`${name} here`)).toBeNull();
-  });
-
-  it("returns null when the text isn't a command", () => {
-    expect(splitSlashCommand("just prose")).toBeNull();
   });
 });
 

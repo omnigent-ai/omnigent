@@ -165,7 +165,9 @@ def test_drawer_stays_open_for_scroll_and_short_drag(page: Page, chat_session_co
     page.wait_for_function(f"() => document.querySelector('{_LIST}').scrollTop > 50")
     _expect_drawer_open(page)
 
-    left_before_lift = _drag(cdp, page, x=260, y=420, dx=-70, steps=10, step_ms=60)
+    # Few steps: the swipe is classified on its first move past the slop, which must
+    # land inside the 250 ms long-press window; 10 steps at 60 ms could miss it under load.
+    left_before_lift = _drag(cdp, page, x=260, y=420, dx=-70, steps=4, step_ms=60)
     assert left_before_lift < -30, f"the drawer did not follow the short drag: {left_before_lift}"
     _expect_drawer_open(page)
     assert page.url == chat.url

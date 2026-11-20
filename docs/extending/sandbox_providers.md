@@ -291,7 +291,24 @@ default. Override it to decide per owner when the session is archived, for
 example from a feature flag, so turning the behavior on or off needs no server
 restart.
 
-The reaper reuses one launcher per workspace and provider. Override
+Right after building a launcher, and before `prepare_for_launch()` or
+`provision()`, the server calls `bind_owner(owner)` once. It runs on every
+launch, wake, keepalive, relaunch, and teardown. The owner is the session
+creator, or the host's `user_id` for an existing host. Override it to remember
+the owner for authorization or attribution; the default ignores it. Launchers
+built only to read capabilities or notices are not bound, so keep those
+properties independent of the owner. An override should only record the owner
+(no I/O, never raise): the server builds launchers on teardown paths where an
+exception would abort the operation.
+
+```python
+class AcmeSandboxLauncher(ExecModelHostLauncher):
+    def bind_owner(self, owner: str) -> None:
+        self._owner = owner  # e.g. "alice@example.com"
+```
+
+The reaper reuses one launcher per workspace and provider, except that a
+launcher overriding `bind_owner` is rebuilt and bound per candidate. Override
 `reaper_identity(workspace_id)` when background termination needs a scoped
 credential context; the default context is a no-op.
 

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { MUTED_LABEL_KEY } from "./sessionMute";
 import type { Comment } from "@/hooks/useComments";
 import type { Conversation } from "@/hooks/useConversations";
 import {
@@ -63,6 +64,16 @@ describe("collectInboxItems", () => {
     // Content must survive the parse, not just the structure.
     expect(items[0].elicitation.message).toBe("approve elicit_1?");
     expect(items[0].elicitation.policyName).toBe("ask_everything");
+  });
+
+  it("keeps a muted session's approval under Awaiting response", () => {
+    const row = makeRow({ id: "conv_muted", labels: { [MUTED_LABEL_KEY]: "1" } });
+    const items = collectInboxItems([
+      { row, pendingElicitations: [makeRawElicitation("elicit_muted")] },
+    ]);
+
+    // Muting only hides unread output; a prompt still needs an answer.
+    expect(items.map((item) => item.elicitation.message)).toEqual(["approve elicit_muted?"]);
   });
 
   it("routes mirrored child prompts to the child via target_session_id", () => {
@@ -290,10 +301,18 @@ describe("collectUnreadInboxItems", () => {
     ]);
   });
 
-  it("skips archived rows and rows already listed as approvals", () => {
+  it("skips muted and archived rows and rows already listed as approvals", () => {
     // A session with a pending prompt shows as its approval card; listing it
     // again as unread would put one session in the inbox twice.
     const rows = [
+      ...(["idle", "failed"] as const).map((status) =>
+        makeRow({
+          id: `muted_${status}`,
+          status,
+          updated_at: 2_000,
+          labels: { [MUTED_LABEL_KEY]: "1" },
+        }),
+      ),
       makeRow({ id: "archived", status: "idle", updated_at: 2_000, archived: true }),
       makeRow({ id: "awaiting", status: "idle", updated_at: 2_000, pending_elicitations_count: 1 }),
       makeRow({ id: "unread", status: "idle", updated_at: 2_000 }),

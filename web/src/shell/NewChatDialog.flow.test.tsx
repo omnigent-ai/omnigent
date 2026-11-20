@@ -1049,7 +1049,9 @@ describe("NewChatLandingScreen create flow", () => {
           );
         });
         if (query.startsWith("sibling=")) {
-          expect(client.getQueryData(["nested-session-drafts"])).toEqual([]);
+          expect(client.getQueryData(["nested-session-drafts"])).toEqual([
+            expect.objectContaining({ creating: false, created: false }),
+          ]);
         }
         await waitFor(() =>
           expect(navigateMock).toHaveBeenLastCalledWith({ pathname: "/", search: `?${query}` }),
@@ -1070,7 +1072,9 @@ describe("NewChatLandingScreen create flow", () => {
         expect(hydrateLocalConversationMock).not.toHaveBeenCalled();
         if (query.startsWith("sibling=") && !sourceDeleted) {
           cleanup();
-          expect(reopenedClient.getQueryData(["nested-session-drafts"])).toEqual([]);
+          expect(reopenedClient.getQueryData(["nested-session-drafts"])).toEqual([
+            expect.objectContaining({ creating: false, created: false }),
+          ]);
         }
       } finally {
         window.history.replaceState({}, "", previousUrl);

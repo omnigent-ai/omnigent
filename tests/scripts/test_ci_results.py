@@ -14,6 +14,8 @@ ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / ".github/scripts/ci/require_results.py"
 CI_JOBS = (
     "pytest",
+    "claude-containment",
+    "seatbelt-containment",
     "stores-postgres",
     "stores-cockroachdb",
     "stores-mysql",
@@ -23,10 +25,15 @@ CI_JOBS = (
 UI_JOBS = ("build-sidecar", "e2e-ui", "browser-contract")
 
 
-def run_result(suite, needs, *, draft=False):
+def run_result(suite, needs, *, draft=False, event=None):
+    env = dict(os.environ, NEEDS=json.dumps(needs), IS_DRAFT=str(draft).lower())
+    if event is None:
+        env.pop("EVENT_NAME", None)
+    else:
+        env["EVENT_NAME"] = event
     return subprocess.run(
         [sys.executable, str(SCRIPT), suite],
-        env=dict(os.environ, NEEDS=json.dumps(needs), IS_DRAFT=str(draft).lower()),
+        env=env,
         text=True,
         capture_output=True,
         timeout=10,
@@ -99,7 +106,7 @@ def test_selected_consumer_must_succeed(suite, job, result):
         (
             "ci",
             {"database": "false", "backend": "true", "omnidev": "false", "sidecar": "false"},
-            ("pytest",),
+            ("pytest", "claude-containment", "seatbelt-containment"),
         ),
         ("ui", {"ui": "full"}, UI_JOBS),
         ("ui", {"ui": "dependency"}, UI_JOBS),
@@ -142,3 +149,32 @@ def test_selection_failure_is_not_an_intentional_skip(suite, fault):
                 job["result"] = "skipped"
     process = run_result(suite, needs, draft=fault == "draft")
     assert (process.returncode == 0) == (fault == "draft"), process.stdout + process.stderr
+
+
+@pytest.mark.parametrize(
+    "event,web,shard,draft,ok",
+    [
+        ("pull_request", "true", "success", False, True),
+        ("pull_request", "true", "failure", False, False),
+        ("pull_request", "true", "cancelled", False, False),
+        ("pull_request", "true", None, False, False),
+        ("pull_request", "true", "skipped", False, False),
+        ("pull_request", "false", "skipped", False, True),
+        ("pull_request", "true", "skipped", True, True),
+        ("push", "true", "skipped", False, True),
+        ("push", "true", "failure", False, False),
+        ("push", "true", "success", False, True),
+    ],
+)
+def test_web_vitest_shards_are_required_on_pull_requests(event, web, shard, draft, ok):
+    needs = full_needs("web")
+    needs["scope"]["outputs"] = {"web": web, "ios": "false"}
+    needs["ios"]["result"] = "skipped"
+    if web == "false":
+        needs["web-test"]["result"] = "skipped"
+    if shard is not None:
+        needs["web-vitest"] = {"result": shard}
+    process = run_result("web", needs, draft=draft, event=event)
+    assert (process.returncode == 0) == ok, process.stdout + process.stderr
+    if not ok:
+        assert "web-vitest" in process.stdout

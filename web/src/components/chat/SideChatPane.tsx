@@ -20,6 +20,7 @@ import type {
   ComposerTextTarget,
 } from "@/components/composer/engine/composerInput";
 import { cn } from "@/lib/utils";
+import { LEVEL_OWNER } from "@/lib/permissionsApi";
 import {
   type Bubble,
   type BubbleCache,
@@ -82,6 +83,7 @@ import {
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { RunnerStartingIndicator, SandboxActionBanner } from "@/pages/ChatIndicators";
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
+import { DesignOutboxStrip } from "@/components/BrowserPane/designTools/LazyDesignOutboxStrip";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { shouldQueueSend } from "@/lib/messageQueue";
 import { attachmentAccept, clipboardFiles, validateAttachments } from "@/lib/attachments";
@@ -102,6 +104,12 @@ import { useSlashCompletion } from "@/hooks/useSlashCompletion";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useFileMentionHarnesses } from "@/lib/agentLabels";
 import { skillInvocationPrefix } from "@/lib/harnessSetup";
+import {
+  nativeShellHarness,
+  ownerOnlyShellHarness,
+  useComposerHighlight,
+  usePublishComposerCommands,
+} from "@/components/composer/composerHighlight";
 import { isNativeTerminalSession } from "@/lib/nativeCodingAgents";
 import { isPermissionModeCycleKey } from "@/lib/permissionModeCycle";
 import {
@@ -301,6 +309,7 @@ export function SideChatPane({
   childId,
   selectionParentId,
   onStart,
+  pendingHarness,
   readOnly: restoredReadOnly = false,
   fullSession = false,
   evenComposerPadding = false,
@@ -310,6 +319,8 @@ export function SideChatPane({
   childId: string;
   selectionParentId?: string;
   onStart?: (text: string) => Promise<void>;
+  /** A pending tab's parent harness, which its fork runs. */
+  pendingHarness?: string | null;
   /** Show the transcript without a composer when the viewer cannot edit. */
   readOnly?: boolean;
   /** Display an existing session with its complete history and scoped composer. */
@@ -696,6 +707,7 @@ export function SideChatPane({
                 fullSession={fullSession}
                 childId={childId}
                 harness={sessionHarness}
+                pendingHarness={pendingHarness}
                 session={session}
                 settingsSession={pending ? draftSource : session}
                 agentId={boundAgentId}
@@ -727,6 +739,7 @@ function SideChatComposer({
   fullSession,
   childId,
   harness,
+  pendingHarness = null,
   session,
   settingsSession,
   agentId,
@@ -742,6 +755,7 @@ function SideChatComposer({
   fullSession: boolean;
   childId: string;
   harness: string | null | undefined;
+  pendingHarness?: string | null;
   session: Session | null | undefined;
   settingsSession: Session | null | undefined;
   agentId: string | null;
@@ -880,6 +894,12 @@ function SideChatComposer({
   const [interrupting, setInterrupting] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const tailTextareaRef = useRef<ComposerTextTarget | null>(null);
+  // Held as state too, so an engine switch that replaces the input re-binds the highlight mirror.
+  const [tailTextareaNode, setTailTextareaNode] = useState<ComposerTextTarget | null>(null);
+  const bindTailTextarea = useCallback((element: ComposerTextTarget | null) => {
+    tailTextareaRef.current = element;
+    setTailTextareaNode(element);
+  }, []);
   const textareaRef = useRef<ComposerTextTarget | null>(null);
   const voiceEditsRef = useRef(
     new Map<string | null, { before: string; after: string; quoteIds: Set<string> }>(),
@@ -1197,6 +1217,38 @@ function SideChatComposer({
     onTabComplete: completeMenuSelection,
     clearText: () => setText(""),
   });
+  const menuCommandNames = useMemo(() => Object.keys(menuCommands), [menuCommands]);
+  // Codex forks from a `/side` message, so its pending text never reaches the shell; other
+  // forks send it as the child's first message. Only the root's owner starts a side chat.
+  // A live tab's null level means owner, so wait for the snapshot before codex's owner-only `!`.
+  const nativeShell = pending
+    ? usesNativeSideChatFork(pendingHarness)
+      ? null
+      : nativeShellHarness(pendingHarness, LEVEL_OWNER)
+    : session
+      ? nativeShellHarness(harness, session.permissionLevel ?? null)
+      : null;
+  const outgoingText = isSlashCommandText(text) ? text.trim() : text.trimEnd();
+  const highlight = useComposerHighlight({
+    value: text,
+    commandNames: menuCommandNames,
+    enabled: quotes.length === 0 && files.length === 0,
+    // Files go out as separate blocks, so the message is no longer a lone `!` text.
+    shellEnabled: files.length === 0,
+    nativeShell,
+    refusedNativeShell:
+      pending || !session ? null : ownerOnlyShellHarness(harness, session.permissionLevel ?? null),
+    // Classify what is sent: trimmed, and in a grid cell with review comments appended.
+    classifyValue: gridCell
+      ? buildOutgoingMessage({ quotes, text }, outgoingText, sendContext).text
+      : serializeReplyDraft({ quotes, text: outgoingText }),
+    // Tagged mentions aren't painted as pills here.
+    mentionTokens: [],
+    textareaRef: tailTextareaRef,
+    textareaNode: tailTextareaNode,
+    sendContext: { ...sendContext, quotes },
+  });
+  usePublishComposerCommands(childId, menuCommandNames, nativeShell);
   // Like the main composer, a draft turns Interrupt into Send; a grid cell queues its draft.
   const showInterrupt = !pending && busy && ((fullSession && !gridCell) || !canSend);
 
@@ -1210,15 +1262,20 @@ function SideChatComposer({
 
   const submit = () => {
     if (settingsSavePending()) return;
-    const trimmed = isSlashCommandText(text) ? text.trim() : text.trimEnd();
+    const trimmed = outgoingText;
+    const refused = () => {
+      if (highlight.refusal === null) return false;
+      setCommandNotice(highlight.refusal);
+      return true;
+    };
     if (pending) {
-      if (!canSend || starting || !onStart) return;
+      if (!canSend || starting || !onStart || refused()) return;
       // Keep the text so a failed fork can be retried without re-typing.
       void onStart(serializeReplyDraft({ quotes, text: trimmed }));
       return;
     }
     // A grid cell queues or steers its send while the session works; other full sessions wait.
-    if ((busy && fullSession && !gridCell) || !canSend || agentId === null) return;
+    if ((busy && fullSession && !gridCell) || !canSend || agentId === null || refused()) return;
     // On in-process harnesses /help and skills resolve locally; native TUIs
     // (claude-native, codex-native) read the text themselves, and a quote, attachment,
     // tag or review comment is always an ordinary message.
@@ -1366,6 +1423,8 @@ function SideChatComposer({
           {commandNotice}
         </ComposerFeedbackRow>
       )}
+      {/* Its design tool requests still on their way (none yet for a chat not started). */}
+      {!pending && <DesignOutboxStrip conversationId={childId} widthClassName="mx-3 w-auto" />}
       {queues && (
         <TooltipProvider>
           <QueuedMessagesStrip
@@ -1409,8 +1468,9 @@ function SideChatComposer({
         hasContent={!pending && files.length > 0}
         data-side-chat="true"
         keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
+        className={highlight.cardClassName}
         input={{
-          ref: tailTextareaRef,
+          ref: bindTailTextarea,
           value: text,
           onChange: (event) => {
             if (commandNotice !== null) setCommandNotice(null);
@@ -1442,7 +1502,8 @@ function SideChatComposer({
           "data-testid": "side-chat-input",
           onKeyDown: handleKeyDown,
           onPaste,
-          className: quotes.length ? "max-h-none overflow-y-hidden" : undefined,
+          ...highlight.input,
+          className: cn(quotes.length && "max-h-none overflow-y-hidden", highlight.input.className),
         }}
         slots={{
           beforeInput: slashCompletion.open ? (
@@ -1493,6 +1554,8 @@ function SideChatComposer({
                 }}
               />
             ),
+          inputBackdrop: highlight.backdrop,
+          inputHint: highlight.hint,
           attachments:
             (!pending && files.length > 0) || reviewComments.length > 0 ? (
               <>

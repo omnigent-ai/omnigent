@@ -36,6 +36,7 @@ from omnigent.db.db_models import (
     current_workspace_id,
 )
 from omnigent.db.utils import (
+    get_or_create_conversation_engine,
     get_or_create_engine,
     make_named_managed_session_maker,
     now_epoch,
@@ -412,11 +413,15 @@ class _Watermarks:
 class SessionPullRequestStore:
     """SQLAlchemy-backed store of the pull requests linked to each session."""
 
-    def __init__(self, storage_location: str) -> None:
+    def __init__(
+        self, storage_location: str, conversation_storage_location: str | None = None
+    ) -> None:
         """Open the store.
 
         :param storage_location: SQLAlchemy URI of the database holding
             ``omnigent_conversation_metadata``, e.g. ``"sqlite:///omnigent.db"``.
+        :param conversation_storage_location: SQLAlchemy URI of the database holding
+            ``conversation_labels``, when it is not ``storage_location``.
         """
         self.storage_location = storage_location
         engine = get_or_create_engine(storage_location)
@@ -425,6 +430,14 @@ class SessionPullRequestStore:
         )
         self._session_immediate = make_named_managed_session_maker(
             engine, query_name_prefix="omnigent.session_pull_request_store", immediate=True
+        )
+        # Run labels live with the conversations, which may be a separate database.
+        label_uri = conversation_storage_location or storage_location
+        self._label_session = make_named_managed_session_maker(
+            engine
+            if label_uri == storage_location
+            else get_or_create_conversation_engine(label_uri),
+            query_name_prefix="omnigent.session_pull_request_store",
         )
         self._watermarks = _Watermarks()
 
@@ -642,7 +655,7 @@ class SessionPullRequestStore:
             SqlConversationLabel.conversation_id == conversation_id,
             SqlConversationLabel.key == SCHEDULED_TASK_RUN_LABEL_KEY,
         )
-        with self._session("get_session_current_run") as session:
+        with self._label_session("get_session_current_run") as session:
             value = session.execute(stmt.limit(1)).scalar_one_or_none()
         return value if isinstance(value, str) and value else None
 
@@ -671,7 +684,7 @@ class SessionPullRequestStore:
                 SqlConversationLabel.conversation_id == conversation_id,
                 SqlConversationLabel.key == SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX + run_id,
             )
-            with self._session("get_session_pending_run") as session:
+            with self._label_session("get_session_pending_run") as session:
                 stamped_at = session.execute(stmt.limit(1)).scalar_one_or_none()
             if stamped_at is not None and stamped_at > now_epoch() - STALE_RUN_MAX_AGE_SECONDS:
                 return False
@@ -698,7 +711,7 @@ class SessionPullRequestStore:
             SqlConversationLabel.conversation_id.in_(list(dict.fromkeys(conversation_ids))),
             SqlConversationLabel.key == SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
         )
-        with self._session("list_session_initial_runs") as session:
+        with self._label_session("list_session_initial_runs") as session:
             rows = session.execute(stmt).all()
         return {
             conversation_id: value
