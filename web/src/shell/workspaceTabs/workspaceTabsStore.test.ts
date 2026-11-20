@@ -456,6 +456,22 @@ describe("the new-tab page", () => {
     expect(store.tabs().map((tab) => tab.id)).toEqual(["F", "P"]);
     expectInvariant(store);
   });
+
+  it("leaves another tab where an agent moved it when picking an app that is already open", async () => {
+    const tab: WorkspaceTab = { id: "A", place: file("a.ts"), openedBy: "user" };
+    const { store } = makeStore({ initial: initial([tab, pulls, blank], "A") });
+    store.select("N");
+    // The agent moves the clean, unselected A without a history step.
+    await store.open({ place: file("b.ts"), tab: "A" }, { opener: "agent" });
+    expect(store.findTab("A")?.place).toEqual(file("b.ts"));
+
+    expect(store.fillNewTab("N", { kind: "pulls" })).toBe("P");
+
+    expect(store.selectedTabId()).toBe("P");
+    expect(store.findTab("A")?.place).toEqual(file("b.ts"));
+    expect(store.tabs().map((candidate) => candidate.id)).toEqual(["A", "P"]);
+    expectInvariant(store);
+  });
 });
 
 describe("saving", () => {
