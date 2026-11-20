@@ -15,6 +15,7 @@ import yaml
 
 from omnigent.errors import OmnigentError
 from omnigent.inner import terminal as terminal_module
+from omnigent.inner.claude_model_access import ClaudeCredentialConfigurationError
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.sandbox import HarnessSandboxPreparationError, SandboxPolicy
 from omnigent.inner.terminal import TerminalInstance
@@ -469,7 +470,7 @@ def test_user_settings_helper_cannot_select_saved_oauth_for_custom_gateway(
         os_env=OSEnvSpec(cwd=str(workspace), sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
     )
     if entrypoint == "terminal":
-        with pytest.raises(ValueError, match="user settings apiKeyHelper"):
+        with pytest.raises(ClaudeCredentialConfigurationError, match="user settings apiKeyHelper"):
             workflow.claude_terminal_model_access(spec, cwd=workspace)
     else:
         no_launch = Mock(side_effect=AssertionError("worker startup must not begin"))
@@ -480,9 +481,6 @@ def test_user_settings_helper_cannot_select_saved_oauth_for_custom_gateway(
             lambda *_: SandboxPolicy("linux_bwrap", True, [], [], [], False),
         )
         monkeypatch.setattr(claude, "get_backend", no_launch)
-        with pytest.raises(
-            HarnessSandboxPreparationError, match="user settings apiKeyHelper"
-        ) as failure:
+        with pytest.raises(ClaudeCredentialConfigurationError, match="user settings apiKeyHelper"):
             claude.ClaudeSDKExecutor(cwd=str(workspace), os_env=spec.os_env)
-        assert isinstance(failure.value.__cause__, ValueError)
         no_launch.assert_not_called()
