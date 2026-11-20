@@ -1,6 +1,6 @@
 import { act, renderHook } from "@testing-library/react";
 import { useRef } from "react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   clearSessionDrafts,
   getSessionDraft,
@@ -72,5 +72,29 @@ describe("useMentionBrowser with tags held by a session draft", () => {
       files: [],
       sessions: [fixSession, otherSession],
     });
+  });
+});
+
+describe("useMentionBrowser without an editable input", () => {
+  it.each<[string, () => HTMLTextAreaElement | null]>([
+    ["missing", () => null],
+    ["read-only", () => Object.assign(document.createElement("textarea"), { readOnly: true })],
+    ["disabled", () => Object.assign(document.createElement("textarea"), { disabled: true })],
+  ])("splices a pick into the draft when the input is %s", (_state, createInput) => {
+    const setText = vi.fn();
+    const { result } = renderHook(() =>
+      useMentionBrowser({
+        mention: { query: "rea", start: 6, end: 10 },
+        setMention: () => {},
+        mentionEntries: [],
+        text: "hello @rea world",
+        setText,
+        textareaRef: { current: createInput() },
+      }),
+    );
+
+    act(() => result.current.attachMention("readme.md", false));
+
+    expect(setText).toHaveBeenCalledWith("hello @readme.md world");
   });
 });

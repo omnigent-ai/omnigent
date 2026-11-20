@@ -60,6 +60,7 @@ def test_undo_reverts_a_folder_drill_down(
     environment = f"/v1/sessions/{chat.session_id}/resources/environments/default"
     chat.contract.json(f"{environment}/filesystem", _listing(("docs", "directory")))
     chat.contract.json(f"{environment}/filesystem/docs", _listing(("docs/guide.md", "file")))
+    chat.contract.json(f"{environment}/search", _listing())
     composer = _session_composer(page, chat)
     composer.press_sequentially("alpha bravo @do")
     expect(page.get_by_title("Open docs")).to_be_visible()
@@ -69,6 +70,9 @@ def test_undo_reverts_a_folder_drill_down(
 
     composer.press("ControlOrMeta+z")
     expect(composer).to_have_value("alpha bravo @do")
+    composer.press("ControlOrMeta+z")
+    expect(composer).not_to_have_value("alpha bravo @do")
+    assert "alpha bravo @do".startswith(composer.input_value())
 
 
 def test_undo_restores_a_token_deleted_with_backspace(
@@ -81,12 +85,15 @@ def test_undo_restores_a_token_deleted_with_backspace(
     expect(page.get_by_title("Attach report.md")).to_be_visible()
     composer.press("Tab")
     expect(composer).to_have_value("alpha bravo @report.md ")
+    tag = page.get_by_test_id("composer-mention-token")
+    expect(tag).to_be_visible()
     composer.press("Backspace")
     composer.press("Backspace")
     expect(composer).to_have_value("alpha bravo ")
 
     composer.press("ControlOrMeta+z")
     expect(composer).to_have_value("alpha bravo @report.md")
+    expect(tag).to_have_count(0)
 
 
 def test_undo_reverts_a_clicked_mention_pick_in_the_launcher(
