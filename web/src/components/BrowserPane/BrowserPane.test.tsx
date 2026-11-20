@@ -9,12 +9,19 @@ import {
   within,
 } from "@testing-library/react";
 import type * as NativeBridge from "@/lib/nativeBridge";
+import type * as Identity from "@/lib/identity";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resetDesktopCommandsForTests, useDesktopCommand } from "@/lib/desktopCommands";
 import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { BrowserPane } from "./BrowserPane";
 
 const getSessionSlim = vi.fn();
+const identity = vi.hoisted(() => ({ userId: "user-a" as string | null }));
+vi.mock("@/lib/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof Identity>()),
+  getCurrentUserId: () => identity.userId,
+  resolveIdentity: async () => identity.userId,
+}));
 vi.mock("@/lib/sessionsApi", () => ({
   getSessionSlim: (...args: unknown[]) => getSessionSlim(...args),
 }));
@@ -108,6 +115,7 @@ afterEach(() => {
   desktop.enabled = false;
   vi.clearAllMocks();
   localStorage.clear();
+  identity.userId = "user-a";
   (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop = undefined;
 });
 
@@ -141,12 +149,36 @@ describe("BrowserPane cold-start (no view yet)", () => {
     expect(bridge.browserSetActive).toHaveBeenLastCalledWith(null);
   });
 
-  it("reopens a tab's saved page when the shell no longer has its view", async () => {
-    getSessionSlim.mockResolvedValue({ id: "conv_a", hostId: "local-host", parentSessionId: null });
+  const savedReport = (owner = "user-a") =>
     writeSessionWorkspaceState("conv_a", {
       openBrowsers: ["two"],
-      browserPages: { two: { url: "https://example.com/report", title: "Report" } },
+      browserPages: { two: { url: "https://example.com/report", title: "Report", owner } },
     });
+  // Runs every pending promise callback; the restore path waits on no timers.
+  const flushPromises = () =>
+    Array.from({ length: 20 }).reduce<Promise<void>>(
+      (chain) => chain.then(() => undefined),
+      Promise.resolve(),
+    );
+  const settle = () => act(flushPromises);
+  const deferredHost = () => {
+    let resolveHost: (session: unknown) => void = () => {};
+    getSessionSlim.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveHost = resolve;
+        }),
+    );
+    return (hostId: string | null = null) =>
+      act(async () => {
+        resolveHost({ id: "conv_a", hostId, parentSessionId: null });
+        await flushPromises();
+      });
+  };
+
+  it("reopens a tab's saved page when the shell no longer has its view", async () => {
+    getSessionSlim.mockResolvedValue({ id: "conv_a", hostId: "local-host", parentSessionId: null });
+    savedReport();
     const bridge = installBridge();
     render(<BrowserPane conversationId="browser-tab:conv_a:two" agentBrowser={false} />);
 
@@ -163,38 +195,34 @@ describe("BrowserPane cold-start (no view yet)", () => {
     );
   });
 
+  it("does not show or reopen a page another account visited", async () => {
+    savedReport("user-b");
+    const bridge = installBridge();
+    render(<BrowserPane conversationId="browser-tab:conv_a:two" agentBrowser={false} />);
+    await waitFor(() => expect(bridge.browserHasView).toHaveBeenCalled());
+    await settle();
+
+    expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
+    expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveValue("");
+  });
+
   it("leaves a saved page that is open in another window there", async () => {
-    writeSessionWorkspaceState("conv_a", {
-      openBrowsers: ["two"],
-      browserPages: { two: { url: "https://example.com/report" } },
-    });
+    savedReport();
     const bridge = installBridge({
       browserHasView: vi.fn().mockResolvedValue({ exists: false, elsewhere: true }),
     });
     render(<BrowserPane conversationId="browser-tab:conv_a:two" agentBrowser={false} />);
     await waitFor(() => expect(bridge.browserHasView).toHaveBeenCalled());
-    await act(async () => {
-      await new Promise((resolve) => {
-        setTimeout(resolve, 20);
-      });
-    });
+    await settle();
+
     expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
     expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveValue("");
   });
 
   it("does not reopen a saved page over a view created while it looked", async () => {
-    writeSessionWorkspaceState("conv_a", {
-      openBrowsers: ["two"],
-      browserPages: { two: { url: "https://example.com/report" } },
-    });
+    savedReport();
     let fireCreated: ((p: { conversationId: string }) => void) | undefined;
-    let resolveHost: (session: unknown) => void = () => {};
-    getSessionSlim.mockImplementation(
-      () =>
-        new Promise((resolve) => {
-          resolveHost = resolve;
-        }),
-    );
+    const resolveHost = deferredHost();
     const bridge = installBridge({
       onBrowserViewCreated: vi.fn((cb: typeof fireCreated) => {
         fireCreated = cb;
@@ -205,13 +233,70 @@ describe("BrowserPane cold-start (no view yet)", () => {
     await waitFor(() => expect(getSessionSlim).toHaveBeenCalled());
     // An agent navigation opens the view before the saved page's host resolves.
     act(() => fireCreated?.({ conversationId: "browser-tab:conv_a:two" }));
-    await act(async () => {
-      resolveHost({ id: "conv_a", hostId: null, parentSessionId: null });
-      await new Promise((resolve) => {
-        setTimeout(resolve, 20);
-      });
-    });
+    await resolveHost();
+
     expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
+  });
+
+  it("lets a URL the user submits while it looked win over the saved page", async () => {
+    savedReport();
+    const resolveHost = deferredHost();
+    const bridge = installBridge();
+    render(<BrowserPane conversationId="browser-tab:conv_a:two" agentBrowser={false} />);
+    const bar = await screen.findByRole("textbox", { name: "Address bar" });
+    await waitFor(() => expect(bar).toHaveValue("https://example.com/report"));
+    fireEvent.change(bar, { target: { value: "https://example.org/chosen" } });
+    fireEvent.keyDown(bar, { key: "Enter" });
+    await resolveHost();
+
+    expect(bridge.browserOpenOrNavigate).toHaveBeenCalledOnce();
+    expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
+      "browser-tab:conv_a:two",
+      "https://example.org/chosen",
+      undefined,
+      expect.anything(),
+    );
+  });
+
+  it("does not reopen a saved page after the pane unmounts", async () => {
+    savedReport();
+    const resolveHost = deferredHost();
+    const bridge = installBridge();
+    const { unmount } = render(
+      <BrowserPane conversationId="browser-tab:conv_a:two" agentBrowser={false} />,
+    );
+    await waitFor(() => expect(getSessionSlim).toHaveBeenCalled());
+    unmount();
+    await resolveHost();
+
+    expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
+  });
+
+  it("drops a superseded reopen's failure once the user's page loads", async () => {
+    savedReport();
+    let finishReopen: (result: unknown) => void = () => {};
+    const browserOpenOrNavigate = vi
+      .fn()
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finishReopen = resolve;
+          }),
+      )
+      .mockResolvedValue({ ok: true, created: false });
+    installBridge({ browserOpenOrNavigate });
+    render(<BrowserPane conversationId="browser-tab:conv_a:two" agentBrowser={false} />);
+    await waitFor(() => expect(browserOpenOrNavigate).toHaveBeenCalledOnce());
+    const bar = screen.getByRole("textbox", { name: "Address bar" });
+    fireEvent.change(bar, { target: { value: "https://example.org/chosen" } });
+    fireEvent.keyDown(bar, { key: "Enter" });
+    await waitFor(() => expect(browserOpenOrNavigate).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      finishReopen({ ok: false, error: "navigation superseded or closed" });
+    });
+    await settle();
+
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 
   it("reattaches the retained page without navigating when its rail is reopened", async () => {

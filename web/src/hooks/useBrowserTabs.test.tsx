@@ -13,6 +13,7 @@ import {
 } from "@/lib/nativeBridge";
 import { getSessionSlim } from "@/lib/sessionsApi";
 import type * as SessionsApi from "@/lib/sessionsApi";
+import type * as Identity from "@/lib/identity";
 import type { Session } from "@/lib/types";
 import { writeBrowserAgentToolsEnabled } from "@/components/BrowserPane/agentTools/preferences";
 import { loadTabs } from "@/components/BrowserPane/agentTools/tabStore";
@@ -29,6 +30,10 @@ import {
 
 vi.mock("sonner", () => ({ toast: { error: vi.fn() } }));
 vi.mock("@/hooks/useHosts", () => ({ fetchHosts: vi.fn(async () => []) }));
+vi.mock("@/lib/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof Identity>()),
+  getCurrentUserId: () => "user-a",
+}));
 
 // Unknown hosts stay public-only unless a test gives the session one.
 vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
@@ -91,7 +96,9 @@ describe("browser tab titles", () => {
   it("labels a tab whose view is gone from its saved page", async () => {
     openBrowserTab("session-a", "restored");
     writeSessionWorkspaceState("session-a", {
-      browserPages: { restored: { url: "https://docs.example/guide", title: "Guide" } },
+      browserPages: {
+        restored: { url: "https://docs.example/guide", title: "Guide", owner: "user-a" },
+      },
     });
     Object.assign(window, {
       omnigentDesktop: { browserHasView: vi.fn().mockResolvedValue({ exists: false }) },
@@ -116,7 +123,7 @@ describe("browser tab titles", () => {
     renderHook(() => useBrowserTabs("session-a"));
     await waitFor(() =>
       expect(readSessionWorkspaceState("session-a").browserPages).toEqual({
-        opened: { url: "https://docs.example/guide" },
+        opened: { url: "https://docs.example/guide", owner: "user-a" },
       }),
     );
   });
