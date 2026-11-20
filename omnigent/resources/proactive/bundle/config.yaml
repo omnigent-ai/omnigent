@@ -26,6 +26,7 @@ tool_groups:
   projects: false
   journal: false
   memory: false
+  thingies: false
 
 async: false
 

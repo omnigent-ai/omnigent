@@ -86,6 +86,26 @@ def test_files_are_create_only_and_read_back(store: LocalThingyStore) -> None:
         files.read_json("data/missing.json")
 
 
+def test_mkdirs_reports_a_directory_deleted_mid_call_as_not_found(
+    store: LocalThingyStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    files = store.thingy_files(store.create(ALICE, "Board").id)
+    files.mkdirs("data")
+    real_mkdir = Path.mkdir
+
+    # The race: os.mkdir finds the directory, then a deletion moves it away before mkdir's
+    # own is_dir check, so mkdir(exist_ok=True) raises FileExistsError.
+    def mkdir_racing_a_deletion(self: Path, *args: object, **kwargs: object) -> None:
+        if self.name == "data":
+            self.rename(self.with_name("data.deleted"))
+            raise FileExistsError(str(self))
+        real_mkdir(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "mkdir", mkdir_racing_a_deletion)
+    with pytest.raises(NotFound):
+        files.mkdirs("data/sub")
+
+
 def test_concurrent_creates_of_one_file_have_exactly_one_winner(store: LocalThingyStore) -> None:
     files = store.thingy_files(store.create(ALICE, "Board").id)
     files.mkdirs("slots")

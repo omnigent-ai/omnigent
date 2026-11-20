@@ -906,7 +906,7 @@ class ToolGroupsConfig:
         which write to and read the owner's Inbox. The runner also drops them
         unless the server offers the Inbox to the session's owner.
     :param memory: The ``memory_*`` long-term memory tools (5).
-    :param thingies: The ``sys_thingy_*`` tools (17), which build and run thingies.
+    :param thingies: The ``sys_thingy_*`` tools (13), which build and run thingies.
         The runner also drops them unless the server enables the ``thingies`` feature.
     """
 

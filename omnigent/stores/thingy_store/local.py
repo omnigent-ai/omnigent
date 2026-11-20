@@ -181,6 +181,13 @@ class LocalThingyFiles(ThingyFiles):
             except FileNotFoundError:
                 raise self._missing_scope() from None
             except (FileExistsError, NotADirectoryError):
+                # mkdir also reports FileExistsError for a directory that a deletion moved away
+                # after os.mkdir saw it; only something still there that is no directory is in
+                # the way.
+                if current.is_dir():
+                    continue
+                if not current.exists():
+                    raise self._missing_scope() from None
                 raise InvalidInput("A thingy file is in the way of that directory") from None
 
 
