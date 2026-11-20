@@ -9,7 +9,7 @@ import { act, cleanup, render, renderHook, waitFor } from "@testing-library/reac
 import { QueryClient, QueryClientProvider, QueryObserver } from "@tanstack/react-query";
 import { MemoryRouter, useNavigate } from "react-router-dom";
 import type { ContextType, ReactNode } from "react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 import {
   clearSessionTombstones,
@@ -21,7 +21,13 @@ import {
   type ConversationsPage,
 } from "@/hooks/useConversations";
 import { clearRecentlyCreated, type ConversationsInfiniteData } from "@/lib/sessionListCache";
-import { isConversationMuted, MUTED_LABEL_KEY } from "@/lib/sessionMute";
+import {
+  beginMuteSave,
+  isConversationMuted,
+  MUTE_REINDEX_GRACE_MS,
+  MUTED_LABEL_KEY,
+  settleMuteSave,
+} from "@/lib/sessionMute";
 import { childSessionsQueryKey } from "@/hooks/useChildSessions";
 
 // Mock the socket transport so setWatched is observable and start/stop are
@@ -883,7 +889,7 @@ describe("SessionUpdatesProvider mute in flight", () => {
     { muted: true, success: false },
     { muted: false, success: false },
   ])(
-    "keeps mute=$muted through stale frames before and after it settles with success=$success",
+    "keeps mute=$muted through stale frames until the reindex window passes, success=$success",
     async ({ muted, success }) => {
       let resolvePatch!: (value: unknown) => void;
       vi.stubGlobal(
@@ -932,19 +938,61 @@ describe("SessionUpdatesProvider mute in flight", () => {
       await waitFor(() => expect(client.isMutating()).toBe(0));
       const saved = success ? muted : !muted;
       expect(row().labels).toEqual({ other: "new", ...(saved ? { [MUTED_LABEL_KEY]: "1" } : {}) });
-      // A frame read before the save can still arrive after it settles. It can't
-      // undo the saved preference; one that disagrees re-reads the list instead.
-      const invalidate = vi.spyOn(client, "invalidateQueries");
+      // A frame read before the save, or from a lagging index, can still arrive
+      // after it settles; it can't undo the saved preference.
       act(() => handler({ type: "changed", items: [original] }));
       expect(row().labels).toEqual(saved ? { [MUTED_LABEL_KEY]: "1" } : {});
       expect(isConversationMuted(row())).toBe(saved);
-      if (success) {
-        await waitFor(() =>
-          expect(invalidatedKeys(client, invalidate)).toEqual([JSON.stringify(key)]),
-        );
-      }
+      // Once the reindex window passes, a frame reports another device's change.
+      const later = performance.now() + MUTE_REINDEX_GRACE_MS;
+      const clock = vi.spyOn(performance, "now").mockReturnValue(later);
+      onTestFinished(() => clock.mockRestore());
+      const remote = !saved;
+      act(() =>
+        handler({
+          type: "changed",
+          items: [{ ...original, labels: remote ? { [MUTED_LABEL_KEY]: "1" } : {} }],
+        }),
+      );
+      expect(isConversationMuted(row())).toBe(remote);
     },
   );
+});
+
+describe("SessionUpdatesProvider mute recheck", () => {
+  it("re-reads only the lists holding a session once a frame it masked has aged out", () => {
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient();
+      const key = ["conversations", "", false];
+      seedConversations(client, ["conv_a", "conv_b"]);
+      seedProjectFolder(client, "Alpha", ["conv_x"]);
+      beginMuteSave("conv_a", true);
+      settleMuteSave("conv_a", true);
+      client.setQueryData<ConversationsInfiniteData>(key, (old) => ({
+        ...old!,
+        pages: old!.pages.map((page) => ({
+          ...page,
+          data: page.data.map((row) =>
+            row.id === "conv_a" ? { ...row, labels: { [MUTED_LABEL_KEY]: "1" } } : row,
+          ),
+        })),
+      }));
+      renderProvider(client, ["/"]);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+
+      // Another device unmutes it before this tab's save could have reindexed.
+      act(() => frameHandler()({ type: "changed", items: [conv("conv_a")] }));
+      expect(isConversationMuted({ id: "conv_a" })).toBe(true);
+      act(() => vi.advanceTimersByTime(MUTE_REINDEX_GRACE_MS - 1));
+      expect(invalidatedKeys(client, invalidate)).toEqual([]);
+
+      act(() => vi.advanceTimersByTime(1 + 300)); // the window, then the reconcile debounce
+      expect(invalidatedKeys(client, invalidate)).toEqual([JSON.stringify(key)]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("SessionUpdatesProvider open-session row", () => {

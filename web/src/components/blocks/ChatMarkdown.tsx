@@ -43,6 +43,7 @@ import {
 import { WorkspaceMarkdownImage } from "./WorkspaceMarkdownImage";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { ZoomableImage } from "@/components/ImageLightbox";
+import { COMMAND_TOKEN_CLASS } from "@/components/composer/commandToken";
 import {
   ContextMenu,
   ContextMenuContent,
@@ -749,6 +750,12 @@ const FILE_PATH_AWARE_COMPONENTS = {
   a: MarkdownLink,
 };
 
+function LeadingCommandToken({ children }: WithHastNode<React.ComponentPropsWithoutRef<"kbd">>) {
+  return <span className={COMMAND_TOKEN_CLASS}>{children}</span>;
+}
+
+const LEADING_COMMAND_COMPONENTS = { ...FILE_PATH_AWARE_COMPONENTS, kbd: LeadingCommandToken };
+
 // How often the live (growing) assistant bubble re-parses its markdown. The
 // store pump commits a new, longer text up to once per animation frame (~60/s);
 // without this the whole accumulated message is re-parsed on every commit. ~10/s
@@ -835,6 +842,26 @@ interface MarkdownNode {
   children?: MarkdownNode[];
 }
 
+interface MarkdownTextNode extends MarkdownNode {
+  value?: string;
+  data?: { hName?: string };
+}
+
+/** Tag the leading token in mdast, as sanitize strips classes from raw HTML. */
+function remarkLeadingCommand(token: string) {
+  return (tree: MarkdownTextNode) => {
+    const paragraph = tree.children?.[0];
+    if (paragraph?.type !== "paragraph" || !paragraph.children) return;
+    const first: MarkdownTextNode | undefined = paragraph.children[0];
+    if (first?.type !== "text" || !first.value?.startsWith(token)) return;
+    const rest = first.value.slice(token.length);
+    if (rest !== "" && !/^\s/.test(rest)) return;
+    const marked: MarkdownTextNode[] = [{ type: "text", value: token, data: { hName: "kbd" } }];
+    if (rest) marked.push({ type: "text", value: rest });
+    paragraph.children.splice(0, 1, ...marked);
+  };
+}
+
 /** Turns raw HTML nodes into text nodes holding the same source. */
 function remarkHtmlAsText() {
   const visit = (node: MarkdownNode) => {
@@ -863,11 +890,15 @@ function remarkHtmlAsText() {
  *
  * When `linkPullRequestRefs` is set, `#1234` and `owner/repo#12` link to the
  * PR in the session's repo. Opt-in because tool output often contains non-PR `#N`.
+ *
+ * `leadingCommand` tints that token where it opens the text, without changing
+ * how the rest parses. Only for text whose raw HTML renders as text.
  */
 export function FilePathAwareMessageResponse({
   children,
   breaks = false,
   literalHtml = false,
+  leadingCommand,
   isStreaming = false,
   linkPullRequestRefs = false,
   ...props
@@ -875,22 +906,29 @@ export function FilePathAwareMessageResponse({
   breaks?: boolean;
   literalHtml?: boolean;
   linkPullRequestRefs?: boolean;
+  leadingCommand?: string;
 }) {
-  const components = FILE_PATH_AWARE_COMPONENTS;
+  const components =
+    leadingCommand === undefined ? FILE_PATH_AWARE_COMPONENTS : LEADING_COMMAND_COMPONENTS;
 
   // Extend (don't replace) Streamdown's defaults so remark-gfm survives. With
-  // neither option set we pass `undefined` so Streamdown uses its defaults unchanged.
+  // no option set we pass `undefined` so Streamdown uses its defaults unchanged.
   const remarkPlugins = useMemo(
     () =>
-      breaks || literalHtml || linkPullRequestRefs
+      breaks || literalHtml || linkPullRequestRefs || leadingCommand !== undefined
         ? [
             ...Object.values(defaultRemarkPlugins),
+            // Before the leading command split: PR splitting rebuilds text nodes, which
+            // would drop its `kbd` tag, and its new nodes have no source position.
             ...(linkPullRequestRefs ? [remarkPullRequestRefs] : []),
             ...(literalHtml ? [remarkHtmlAsText] : []),
+            ...(leadingCommand !== undefined
+              ? [[remarkLeadingCommand, leadingCommand] as [typeof remarkLeadingCommand, string]]
+              : []),
             ...(breaks ? [remarkBreaks] : []),
           ]
         : undefined,
-    [breaks, literalHtml, linkPullRequestRefs],
+    [breaks, literalHtml, linkPullRequestRefs, leadingCommand],
   );
 
   // Throttle the markdown so the live (still-growing) bubble re-parses a few
@@ -921,6 +959,9 @@ export function FilePathAwareMessageResponse({
 
   return (
     <MessageResponse
+      // Streamdown's memo ignores plugin changes, so a command published after
+      // the first render needs a fresh tree.
+      key={leadingCommand}
       {...props}
       components={components}
       remarkPlugins={remarkPlugins}

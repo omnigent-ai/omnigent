@@ -2389,7 +2389,7 @@ export function useSetConversationMuted() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ labels: { [MUTED_LABEL_KEY]: muted ? "1" : "" } }),
       });
-      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      if (!res.ok) throw await apiErrorFromResponse(res);
       return (await res.json()) as { labels?: Record<string, string> };
     },
     onMutate: ({ id, muted }) => {
@@ -2413,7 +2413,10 @@ export function useSetConversationMuted() {
     },
     onSettled: (saved, error, { id, muted }, ctx) => {
       if (!ctx) return;
-      const value = error ? ctx.previous : saved?.labels ? !!saved.labels[MUTED_LABEL_KEY] : muted;
+      // A failure restores the previous value; otherwise the server's echo wins.
+      let value = muted;
+      if (error) value = ctx.previous;
+      else if (saved?.labels) value = !!saved.labels[MUTED_LABEL_KEY];
       settleMuteSave(id, value);
       overlayLabelIntoCaches(queryClient, id, MUTED_LABEL_KEY, value ? "1" : undefined);
     },

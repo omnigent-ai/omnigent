@@ -4400,6 +4400,12 @@ describe("Sidebar view options", () => {
     expect(within(groupSection("Unread")).getByText("ordinary_unread")).toBeInTheDocument();
     expect(within(groupSection("Working")).getByText("muted_running")).toBeInTheDocument();
     expect(within(groupSection("Needs attention")).getByText("muted_approval")).toBeInTheDocument();
+    // Active status outranks the muted bell.
+    for (const id of ["muted_running", "muted_approval"]) {
+      const row = screen.getByText(id).closest("li")!;
+      expect(within(row).getByTestId("session-state-badge")).toBeInTheDocument();
+      expect(within(row).queryByTestId("conversation-muted-icon")).toBeNull();
+    }
   });
 
   it("restores Status grouping from a saved selection and offers it in the menu", () => {
