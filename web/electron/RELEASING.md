@@ -25,7 +25,9 @@ Use a Mac with the **Databricks, Inc. (8RMX4WU6F8)** Developer ID Application ce
 From the source repository root at `SOURCE_SHA` (or a clean checkout containing that exact tree):
 
 ```bash
-pnpm install --frozen-lockfile --filter ./web --filter ./web/electron
+# --cpu installs the native Keychain binding for both architectures built below;
+# the build stops if either is missing.
+pnpm install --frozen-lockfile --filter ./web --filter ./web/electron --cpu x64 --cpu arm64
 # If the Apple variables are in an ignored web/electron/.env:
 set -a; source web/electron/.env; set +a
 pnpm --dir web/electron run build:mac:release
