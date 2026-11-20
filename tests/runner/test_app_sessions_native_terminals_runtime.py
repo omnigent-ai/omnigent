@@ -496,6 +496,7 @@ _FULL_ACCESS_ARGS = ["--sandbox", "danger-full-access", "--ask-for-approval", "n
         "use_envelope",
         "provider_profile",
         "codex_args_only",
+        "app_server_version",
     ),
     [
         pytest.param(
@@ -506,6 +507,7 @@ _FULL_ACCESS_ARGS = ["--sandbox", "danger-full-access", "--ask-for-approval", "n
             use_envelope,
             None,
             False,
+            version if version is None else (0, 153, 1),
             id=f"{version}-{'cancel' if cancel_launch else 'launch'}-"
             f"{'envelope' if use_envelope else 'legacy'}",
         )
@@ -526,9 +528,23 @@ _FULL_ACCESS_ARGS = ["--sandbox", "danger-full-access", "--ask-for-approval", "n
             True,
             "configured-workspace",
             False,
+            (0, 153, 1),
             id="configured-provider",
         ),
-        pytest.param((0, 154, 0), [], True, False, True, None, True, id="configured-codex-args"),
+        pytest.param(
+            (0, 154, 0), [], True, False, True, None, True, (0, 154, 0), id="configured-codex-args"
+        ),
+        pytest.param(
+            (0, 153, 1),
+            ["--config", "approval_policy=on-request"],
+            False,
+            False,
+            True,
+            None,
+            False,
+            (0, 154, 0),
+            id="older-wrapper-newer-app-server",
+        ),
     ],
 )
 @pytest.mark.parametrize("rotated", [False, True], ids=["session-dir", "label-dir"])
@@ -543,6 +559,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     rotated: bool,
     provider_profile: str | None,
     codex_args_only: bool,
+    app_server_version: tuple[int, int, int] | None,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
@@ -668,7 +685,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
 
         codex_path = "/opt/codex/bin/codex"
         # Known wrappers can differ; unknown versions retain the server's fallback.
-        codex_cli_version = version if codex_args_only or version is None else (0, 153, 1)
+        codex_cli_version = app_server_version
 
         def __init__(self) -> None:
             """:returns: None."""

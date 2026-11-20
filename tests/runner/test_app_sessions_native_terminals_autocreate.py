@@ -6103,18 +6103,18 @@ async def test_codex_tui_resume_omits_permission_overrides_for_configured_launch
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("wrapper_version_output", "app_server_version", "bypasses_hook_trust"),
+    ("wrapper_version", "app_server_version", "bypasses_hook_trust"),
     [
-        ("codex-cli 0.130.0", (0, 153, 4), False),
-        ("codex-cli 0.154.0", (0, 130, 0), True),
-        ("my-wrapper 1.0", (0, 130, 0), False),
+        ((0, 130, 0), (0, 153, 4), False),
+        ((0, 154, 0), (0, 130, 0), True),
+        (None, (0, 130, 0), False),
     ],
     ids=["older-wrapper", "newer-wrapper", "failed-probe-uses-app-server"],
 )
 async def test_codex_tui_resume_gates_hook_trust_on_wrapper_version(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    wrapper_version_output: str,
+    wrapper_version: tuple[int, int, int] | None,
     app_server_version: tuple[int, int, int],
     bypasses_hook_trust: bool,
 ) -> None:
@@ -6125,8 +6125,12 @@ async def test_codex_tui_resume_gates_hook_trust_on_wrapper_version(
     config_home.mkdir()
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
     wrapper = tmp_path / "codex-wrapper"
-    wrapper.write_text(f'#!/bin/sh\necho "{wrapper_version_output}"\n')
-    wrapper.chmod(0o755)
+
+    async def probe(command: str, *prefix: str) -> tuple[int, int, int] | None:
+        assert command == str(wrapper) and not prefix
+        return wrapper_version
+
+    monkeypatch.setattr("omnigent.inner.codex_executor._codex_cli_version", probe)
     (config_home / "config.yaml").write_text(
         f"harness:\n  codex-native:\n    command: {wrapper}\n"
     )
