@@ -438,9 +438,11 @@ export function pullRequestNotFoundReason(
 export async function fetchPullRequestInfo(
   conversationId: string,
   prUrl?: string,
+  signal?: AbortSignal,
 ): Promise<PullRequestInfo> {
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github${prQuery(prUrl)}`,
+    { signal },
   );
   if (res.status === 404) {
     // Preserve the server's message so an outdated host (no github route) is
@@ -545,7 +547,7 @@ function pullRequestInfoQueryOptions(
 ) {
   return queryOptions({
     queryKey: ["github-info", conversationId, ...(options?.prUrl ? [options.prUrl] : [])],
-    queryFn: () => fetchPullRequestInfo(conversationId!, options?.prUrl),
+    queryFn: ({ signal }) => fetchPullRequestInfo(conversationId!, options?.prUrl, signal),
     enabled,
     retry,
     retryDelay: runnerOfflineRetryDelay,
