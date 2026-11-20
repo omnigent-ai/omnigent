@@ -7318,6 +7318,73 @@ describe("Composer built-in tint by case", () => {
   });
 });
 
+describe("Composer built-in tint with message context", () => {
+  beforeEach(() => {
+    setComposerState({
+      conversationId: "conv_case_ctx",
+      sessionHarness: "codex-native",
+      skills: [],
+    });
+  });
+  afterEach(() => {
+    cleanup();
+    clearLocalReviewContexts("conv_case_ctx");
+  });
+  const goalTint = () => screen.queryByText("/Goal", { selector: `.${COMMAND_TOKEN_CLASS}` });
+
+  // A tag or review comment sends `/Goal` as typed, where nothing runs it.
+  it("drops a mixed-case built-in's tint once an inline tag rides along", () => {
+    render(<Composer {...composerProps({ showGoalControl: true })} />);
+    fireEvent.change(textarea(), { target: { value: "/Goal review" } });
+    expect(goalTint()).not.toBeNull();
+
+    act(() =>
+      useChatStore.setState({
+        pendingComposerAttachments: [{ path: "src/example.ts", isDir: false }],
+      }),
+    );
+    expect(textarea().value).toContain("@src/example.ts");
+    expect(goalTint()).toBeNull();
+    expect(textarea()).not.toHaveAttribute("data-slash-command");
+  });
+
+  it("drops a mixed-case built-in's tint once a review comment rides along", () => {
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Composer {...composerProps({ showGoalControl: true })} />
+      </QueryClientProvider>,
+    );
+    fireEvent.change(textarea(), { target: { value: "/Goal review" } });
+    expect(goalTint()).not.toBeNull();
+
+    act(() =>
+      requestLocalReviewContext({
+        id: "goal-review",
+        conversation_id: "conv_case_ctx",
+        path: "src/example.ts",
+        start_index: 0,
+        end_index: 0,
+        body: "Keep the API.",
+        status: "draft",
+        created_at: 1,
+        updated_at: 1,
+        anchor_content: null,
+        created_by: null,
+        anchor_metadata: {
+          pr_url: "https://github.com/acme/repo/pull/1",
+          side: "RIGHT",
+          line: 12,
+          start_line: null,
+          head_sha: "a".repeat(40),
+          base_sha: "b".repeat(40),
+        },
+      }),
+    );
+    expect(goalTint()).toBeNull();
+    expect(textarea()).not.toHaveAttribute("data-slash-command");
+  });
+});
+
 describe("Composer side-chat entry points", () => {
   beforeEach(() => {
     setComposerState({
