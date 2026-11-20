@@ -32,6 +32,13 @@ const DESIGN_MODE_GESTURE_WINDOW_MS = 1500;
 // Chrome's cookie jar is OS-encrypted through the macOS Keychain; the other
 // platforms' schemes aren't wired up yet (the shell's feature flag mirrors this).
 const CHROME_COOKIE_IMPORT_PLATFORM_ERROR = "Importing Chrome cookies is only supported on macOS.";
+// A restore's answer when the tab already has, or is getting, a page.
+const RESTORE_YIELDED = Object.freeze({
+  ok: false,
+  created: false,
+  superseded: true,
+  error: "this tab already has a page",
+});
 
 /**
  * Profile names come from Chrome's `Local State`, which is just a file on disk.
@@ -466,7 +473,7 @@ function registerBrowserIpc({
   // Open (create-if-absent) or navigate a conversation's view, and measure it
   // into place. `force` reloads even on the same URL (agent "bring me back"
   // intent). Returns the registry's structured `{ ok, created, error }`.
-  const openOrNavigate = async (event, args) => {
+  const navigateView = async (event, args) => {
     const purpose = args?.opts?.agent === true ? "agent" : "user";
     const g = viewGate(event, args?.conversationId, purpose);
     if (g.error) return { ok: false, error: g.error, ...(g.elsewhere ? { elsewhere: true } : {}) };
@@ -474,6 +481,7 @@ function registerBrowserIpc({
     if (typeof conversationId !== "string" || !conversationId) {
       return { ok: false, error: "conversationId is required" };
     }
+    if (opts?.restore === true && g.registry.get(conversationId)) return RESTORE_YIELDED;
     // Past its deadline the call changes nothing: it must not take over a
     // pending navigation's place or clear the page.
     if (pastAgentDeadline(opts)) {
@@ -565,6 +573,21 @@ function registerBrowserIpc({
       ...(r.ok ? { hostIsThisMachine: r.entry?.agentContext?.hostIsThisMachine === true } : {}),
       error: hint ? `${r.error} ${hint}` : r.error,
     };
+  };
+  // Opens still in progress per view: a tab reopening its saved page (`restore`) yields to
+  // an existing page or to any open still being checked, which a newer generation would cancel.
+  const opensInProgress = new Map();
+  const openOrNavigate = async (event, args) => {
+    const viewId = args?.conversationId;
+    if (args?.opts?.restore === true && opensInProgress.has(viewId)) return RESTORE_YIELDED;
+    opensInProgress.set(viewId, (opensInProgress.get(viewId) ?? 0) + 1);
+    try {
+      return await navigateView(event, args);
+    } finally {
+      const left = opensInProgress.get(viewId) - 1;
+      if (left > 0) opensInProgress.set(viewId, left);
+      else opensInProgress.delete(viewId);
+    }
   };
   ipcMain.handle("omnigent:browser-open-or-navigate", whileOpeningView(openOrNavigate));
 

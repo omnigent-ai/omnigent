@@ -105,8 +105,17 @@ interface BrowserPaneBridge {
     conversationId: string,
     url: string,
     bounds: Bounds | undefined,
-    opts: (BrowserHostOptions & { force?: boolean }) | undefined,
-  ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
+    // `restore`: reopen a tab's saved page only if nothing else has opened, or is opening, it.
+    opts: (BrowserHostOptions & { force?: boolean; restore?: boolean }) | undefined,
+  ) => Promise<{
+    ok: boolean;
+    created?: boolean;
+    error?: string;
+    /** A newer navigation took the view, or a restore yielded to another page. */
+    superseded?: boolean;
+    /** The session's tabs are open in another window. */
+    elsewhere?: boolean;
+  }>;
   browserGoBack?: (conversationId: string) => Promise<NavResult>;
   browserGoForward?: (conversationId: string) => Promise<NavResult>;
   browserReload?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
@@ -270,17 +279,24 @@ export function BrowserPane({
         if (!urlEditingRef.current) setCurrentUrl(saved.url);
         const hostId = await fetchSessionHostId(browserViewOwnerId(conversationId));
         if (superseded()) return;
-        const result = await openOrNavigate(
-          conversationId,
-          saved.url,
-          undefined,
-          navigationHostOptions(hostId),
-        );
-        if (!result.ok && !superseded()) {
-          setNavigationError(result.error ?? "Unable to reopen this page.");
+        // The shell refuses a restore once the tab has, or is getting, another page.
+        const result = await openOrNavigate(conversationId, saved.url, undefined, {
+          ...navigationHostOptions(hostId),
+          restore: true,
+        });
+        // This reopen's own view creation sets viewChanged, so only newer intent counts now.
+        const overtaken = cancelled || submitSequenceRef.current !== submitSequence;
+        if (result.ok || overtaken || result.superseded) return;
+        if (result.elsewhere) {
+          // The session's tabs are open in another window; the user wasn't navigating.
+          if (!urlEditingRef.current) setCurrentUrl((url) => (url === saved.url ? "" : url));
+          return;
         }
+        setNavigationError(result.error ?? "Unable to reopen this page.");
       } catch {
-        if (!superseded()) setNavigationError("Unable to reopen this page.");
+        if (!cancelled && submitSequenceRef.current === submitSequence) {
+          setNavigationError("Unable to reopen this page.");
+        }
       }
     };
 

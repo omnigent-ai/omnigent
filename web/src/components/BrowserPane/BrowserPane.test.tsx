@@ -154,7 +154,7 @@ describe("BrowserPane cold-start (no view yet)", () => {
       openBrowsers: ["two"],
       browserPages: { two: { url: "https://example.com/report", title: "Report", owner } },
     });
-  // Runs every pending promise callback; the restore path waits on no timers.
+  // Drains a fixed number of microtask hops; the restore path uses no timers.
   const flushPromises = () =>
     Array.from({ length: 20 }).reduce<Promise<void>>(
       (chain) => chain.then(() => undefined),
@@ -190,10 +190,53 @@ describe("BrowserPane cold-start (no view yet)", () => {
         "browser-tab:conv_a:two",
         "https://example.com/report",
         undefined,
-        { sourceHostId: "local-host", sessionHostProtocol: 1 },
+        { sourceHostId: "local-host", sessionHostProtocol: 1, restore: true },
       ),
     );
   });
+
+  it("shows a reopen's failure after its own view was created", async () => {
+    savedReport();
+    let fireCreated: ((p: { conversationId: string }) => void) | undefined;
+    installBridge({
+      onBrowserViewCreated: vi.fn((cb: typeof fireCreated) => {
+        fireCreated = cb;
+        return () => {};
+      }),
+      browserOpenOrNavigate: vi.fn(async (viewId: string) => {
+        fireCreated?.({ conversationId: viewId });
+        return { ok: false, created: true, error: "loadURL failed: ERR_NAME_NOT_RESOLVED" };
+      }),
+    });
+    render(<BrowserPane conversationId="browser-tab:conv_a:two" agentBrowser={false} />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("ERR_NAME_NOT_RESOLVED");
+  });
+
+  for (const [refusal, result, bar] of [
+    [
+      "gives the tab to another page",
+      { ok: false, superseded: true, error: "this tab already has a page" },
+      "https://example.com/report",
+    ],
+    [
+      "finds the session's tabs in another window",
+      { ok: false, elsewhere: true, error: "open in another Omnigent window" },
+      "",
+    ],
+  ] as const) {
+    it(`reopens quietly when the shell ${refusal}`, async () => {
+      savedReport();
+      const browserOpenOrNavigate = vi.fn().mockResolvedValue(result);
+      installBridge({ browserOpenOrNavigate });
+      render(<BrowserPane conversationId="browser-tab:conv_a:two" agentBrowser={false} />);
+      await waitFor(() => expect(browserOpenOrNavigate).toHaveBeenCalledOnce());
+      await settle();
+
+      expect(screen.queryByRole("alert")).toBeNull();
+      expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveValue(bar);
+    });
+  }
 
   it("does not show or reopen a page another account visited", async () => {
     savedReport("user-b");
