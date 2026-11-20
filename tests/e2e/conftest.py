@@ -405,15 +405,15 @@ def configure_mock_llm(
         agent spec. Defaults to ``"default"`` (matches any model
         not assigned to a more specific queue).
     :param required_tools: Advertised tools required to consume this queue,
-        isolating agent turns from background generation and review.
+        isolating agent turns from background generation and review. Serve
+        the queue only to requests advertising all of these tools, so a
+        tool-less request (a title generation) cannot consume a scripted tool
+        call meant for the agent's own turn.
     :param match: Optional content-routing token. When set, the queue is
         selected if this token appears in the request's user input,
         regardless of ``model``. Use a deliberately-unique token (the
         message the test sends). Also used as the queue *key* when *key*
         is left at its default, so each match-routed queue is distinct.
-    :param required_tools: Serve this queue only to requests advertising all of
-        these tools, so a tool-less request (a title generation) cannot consume
-        a scripted tool call meant for the agent's own turn.
     """
     if mock_llm_server_url is None:
         return

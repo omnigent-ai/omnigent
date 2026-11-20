@@ -6080,8 +6080,8 @@ async def test_create_and_bind_notifies_carry_the_servers_routing_answer(
     """Both runner notifies must stamp the server's routing answer.
 
     The runner learns whether ``sys_advise_models`` is answerable only from
-    ``smart_routing_available`` on the session-init envelope; an id-only body
-    takes its envelope-less init path and leaves routing read as off.
+    ``smart_routing_available`` on the session-init envelope. An ID-only body
+    cannot update the runner's routing capability.
     """
     from omnigent.runtime import _globals
     from omnigent.runtime.caps import RuntimeCaps

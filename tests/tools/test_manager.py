@@ -648,12 +648,10 @@ def test_advise_models_exposed_when_routing_enabled() -> None:
 
 
 def test_advise_models_exposed_when_only_the_remote_server_routes() -> None:
-    """A runner carries no routing backends, so it reads the server's answer.
+    """Expose the advisor when only the attached server can route.
 
-    Routing backends are built in the server process. A runner attached to a
-    remote server therefore has none, and gating on its own caps alone hid
-    ``sys_advise_models`` from every session — including those whose server
-    routes and whose ``sys_advise_models`` calls the server intercepts.
+    The runner has no routing backends of its own, so the server's answer
+    from the session-init envelope decides the gate.
     """
     caps = SimpleNamespace(
         routing_client=None,

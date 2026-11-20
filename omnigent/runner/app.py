@@ -2767,8 +2767,10 @@ def create_runner_app(
         global _server_accepts_input_only_failures
         _server_version = envelope.server_version
         if set_remote_routing_available(envelope.smart_routing_available):
-            # Advertised tool lists are cached per session; a flipped answer must reach them.
+            # A flipped answer must reach the advertised tool lists. Drop the MCP spec
+            # hashes with them: a kept hash skips MCP discovery on the rebuild.
             _session_tool_schemas.clear()
+            _session_mcp_spec_hash.clear()
         _server_accepts_inferred_status = envelope.accepts_inferred_status
         _server_accepts_input_only_failures = envelope.accepts_input_only_failures
         if _server_accepts_input_only_failures:

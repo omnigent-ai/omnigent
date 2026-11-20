@@ -15193,6 +15193,128 @@ async def test_shared_agent_selections_are_isolated_and_revision_recovers_missed
 
 
 @pytest.mark.asyncio
+async def test_routing_flip_rebuilds_advertised_tools_without_dropping_mcp(monkeypatch):
+    """A routing change reaches the advertised tools and keeps the MCP tools.
+
+    The routing answer arrives on the session-init envelope. Rebuilding the
+    advertised tools must also rediscover MCP, because a kept MCP spec hash
+    skips discovery and would drop the MCP tools from the rebuilt list.
+    """
+    from omnigent.entities import Conversation
+    from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
+    from omnigent.runner.session_init_protocol import (
+        SESSION_INIT_PAYLOAD_KEY,
+        build_runner_session_init_payload,
+    )
+    from omnigent.runtime import _globals
+    from omnigent.runtime.caps import RuntimeCaps
+    from omnigent.spec.types import MCPServerConfig
+
+    monkeypatch.setattr(_globals, "_caps", RuntimeCaps())
+    sid = "conv_routing_flip"
+    spec = AgentSpec(
+        spec_version=1,
+        name="flip",
+        spawn=True,
+        mcp_servers=[MCPServerConfig(name="tracker", transport="registry")],
+    )
+    discoveries: list[int] = []
+
+    async def resolver(agent_id, session_id=None):
+        return spec
+
+    async def schemas(self, _spec):
+        discoveries.append(1)
+        return SimpleNamespace(
+            schemas=[
+                {
+                    "type": "function",
+                    "name": "mcp__tracker__ping",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+            tool_names={"mcp__tracker__ping"},
+            failures={},
+        )
+
+    def tool_names(body):
+        return {t.get("name") or t.get("function", {}).get("name") for t in body["tools"]}
+
+    monkeypatch.setattr(ProxyMcpManager, "schemas_for", schemas)
+    recording = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording)),
+        spec_resolver=resolver,
+        server_client=NullServerClient(),
+    )
+    conv = Conversation(
+        id=sid,
+        agent_id="ag_flip",
+        runner_id="runner_test",
+        created_at=0,
+        updated_at=0,
+        root_conversation_id=sid,
+    )
+    message = {
+        "type": "message",
+        "role": "user",
+        "agent_id": "ag_flip",
+        "harness": "hermes",
+        "content": [],
+    }
+    async with _runner_test_client(app) as http:
+        response = await http.post(
+            "/v1/sessions", json=build_runner_session_init_payload(conv, server_version="t")
+        )
+        assert response.status_code in (200, 201), response.text
+        response = await http.post(f"/v1/sessions/{sid}/events?stream=false", json=message)
+        assert response.status_code == 202, response.text
+        await _await_bg_turn_task(sid)
+        before = tool_names(recording.posted_bodies[-1])
+        discoveries_before_flip = len(discoveries)
+
+        response = await http.post(
+            "/v1/sessions",
+            json=build_runner_session_init_payload(
+                conv, server_version="t", smart_routing_available=True
+            ),
+        )
+        assert response.status_code in (200, 201), response.text
+        response = await http.post(f"/v1/sessions/{sid}/events?stream=false", json=message)
+        assert response.status_code == 202, response.text
+        await _await_bg_turn_task(sid)
+        after = tool_names(recording.posted_bodies[-1])
+
+        # An ID-only legacy init carries no answer, so the process keeps the last one.
+        response = await http.post(
+            "/v1/sessions", json={"session_id": sid, "agent_id": "ag_flip", "sub_agent_name": None}
+        )
+        assert response.status_code in (200, 201), response.text
+        response = await http.post(f"/v1/sessions/{sid}/events?stream=false", json=message)
+        assert response.status_code == 202, response.text
+        await _await_bg_turn_task(sid)
+        after_legacy = tool_names(recording.posted_bodies[-1])
+
+        # An envelope from a server that predates the field reads as "no router".
+        old_payload = build_runner_session_init_payload(conv, server_version="t")
+        del old_payload[SESSION_INIT_PAYLOAD_KEY]["smart_routing_available"]
+        response = await http.post("/v1/sessions", json=old_payload)
+        assert response.status_code in (200, 201), response.text
+        response = await http.post(f"/v1/sessions/{sid}/events?stream=false", json=message)
+        assert response.status_code == 202, response.text
+        await _await_bg_turn_task(sid)
+        after_old_server = tool_names(recording.posted_bodies[-1])
+
+    assert "mcp__tracker__ping" in before and "mcp__tracker__ping" in after
+    assert "sys_advise_models" not in before
+    assert "sys_advise_models" in after
+    assert "sys_advise_models" in after_legacy
+    assert "mcp__tracker__ping" in after_legacy and "mcp__tracker__ping" in after_old_server
+    assert "sys_advise_models" not in after_old_server
+    assert len(discoveries) > discoveries_before_flip
+
+
+@pytest.mark.asyncio
 async def test_eager_mcp_cache_keeps_named_child_scope_after_revision_change(monkeypatch):
     from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
     from omnigent.spec.types import MCPServerConfig
