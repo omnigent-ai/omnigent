@@ -78,7 +78,15 @@ class FakePanel extends EventEmitter {
 const laptop = { id: 1, workArea: { x: 0, y: 25, width: 1512, height: 920 } };
 const external = { id: 2, workArea: { x: 1512, y: 0, width: 2560, height: 1415 } };
 
-function setup({ present, quitting = () => false, saveFrames, loadFrames, autoReady = true } = {}) {
+function setup({
+  present,
+  quitting = () => false,
+  saveFrames,
+  loadFrames,
+  autoReady = true,
+  focusedMainWindow,
+  returnToPreviousApp,
+} = {}) {
   const created = [];
   const stale = new Set();
   let frames = {};
@@ -102,6 +110,8 @@ function setup({ present, quitting = () => false, saveFrames, loadFrames, autoRe
     isCurrent: (panel) => !stale.has(panel),
     quitting,
     ...(present ? { present } : {}),
+    ...(focusedMainWindow ? { focusedMainWindow } : {}),
+    ...(returnToPreviousApp ? { returnToPreviousApp } : {}),
   });
   if (autoReady) {
     // These panels' pages have loaded: the one just opened says it's ready as soon as it exists.
@@ -635,4 +645,52 @@ test("the preloader builds for the current target once the app is quiet", (t) =>
   target = null;
   t.mock.timers.tick(FLOATING_COMPOSER_PRELOAD_DELAY_MS);
   assert.deepEqual(built, ["https://a.example"]);
+});
+
+test("putting away a panel opened over another app hands focus back to that app", () => {
+  let returned = 0;
+  let focused = null;
+  const { controller, created } = setup({
+    focusedMainWindow: () => focused,
+    returnToPreviousApp: () => (returned += 1),
+  });
+  controller.show("https://a.example");
+  // A second press while it's up keeps where it was opened from.
+  focused = { main: true };
+  controller.show("https://a.example");
+  assert.equal(controller.dismiss(created[0]), true);
+  assert.equal(created[0].visible, false);
+  assert.equal(returned, 1);
+  // ⌘W puts it away the same way.
+  focused = null;
+  controller.show("https://a.example");
+  created[0].close();
+  assert.equal(created[0].destroyed, false, "⌘W keeps the draft");
+  assert.equal(returned, 2);
+});
+
+test("a panel opened from an Omnigent window goes back to it when put away", () => {
+  let returned = 0;
+  const { controller, created } = setup({
+    focusedMainWindow: () => ({ main: true }),
+    returnToPreviousApp: () => (returned += 1),
+  });
+  controller.show("https://a.example");
+  controller.dismiss(created[0]);
+  assert.equal(returned, 0);
+});
+
+test("a launch or a click on an Omnigent window isn't putting the panel away", () => {
+  let returned = 0;
+  const { controller, created } = setup({
+    focusedMainWindow: () => null,
+    returnToPreviousApp: () => (returned += 1),
+  });
+  controller.show("https://a.example");
+  controller.hide(created[0], { resetFrame: true });
+  controller.show("https://a.example");
+  controller.mainWindowFocused();
+  // Hidden by those, so a later dismiss of the hidden panel goes nowhere either.
+  controller.dismiss(created[0]);
+  assert.equal(returned, 0);
 });

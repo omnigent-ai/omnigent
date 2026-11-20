@@ -1882,6 +1882,19 @@ function floatingComposer() {
     },
     isCurrent: floatingComposerPanelIsCurrent,
     quitting: () => appQuitting,
+    focusedMainWindow: () => {
+      const focused = BrowserWindow.getFocusedWindow();
+      return isMainWindow(focused) ? focused : null;
+    },
+    // Focusing the panel so it takes typing activates the app (macOS 14+), so putting it away makes
+    // an Omnigent window key and front. When it was opened over another app, hand focus back like
+    // ⌘H: that also hides Omnigent's other windows until the app is next used.
+    returnToPreviousApp: () => {
+      if (process.platform !== "darwin") return;
+      setTimeout(() => {
+        if (isMainWindow(BrowserWindow.getFocusedWindow())) app.hide();
+      }, 0);
+    },
     present: (panel, show) =>
       fadeInFloatingComposer(panel, show, {
         reduceMotion: systemPreferences.getAnimationSettings?.().prefersReducedMotion === true,
@@ -5398,11 +5411,11 @@ function registerIpc() {
     floatingComposerController.markReady(panel);
   });
 
-  // From the panel: hide it, keeping its draft.
+  // From the panel: put it away, keeping its draft, and go back to where the user was.
   ipcMain.on("omnigent:floating-composer:dismiss", (event) => {
     const panel = BrowserWindow.fromWebContents(event.sender);
     if (!isPinnedOriginSender(event) || !floatingComposerController?.isPanel(panel)) return;
-    floatingComposerController.hide(panel);
+    floatingComposerController.dismiss(panel);
   });
 
   // From the panel: while its native file picker is open, focusing a main window keeps it up.

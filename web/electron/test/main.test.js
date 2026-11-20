@@ -4142,6 +4142,46 @@ describe("floating panel wiring", () => {
     assert.equal(panel.visible, false);
   });
 
+  for (const [platform, from, appHidden] of [
+    ["darwin", "another app", 1],
+    ["darwin", "an Omnigent window", 0],
+    ["linux", "another app", 0],
+  ]) {
+    it(`on ${platform}, the close button opened from ${from} ${appHidden ? "goes back to that app" : "leaves the app as it is"}`, (t) => {
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      const h = loadNavigationHarness({ platform });
+      t.after(h.cleanup);
+      h.api.registerIpc();
+      const main = addMain(h);
+      let hides = 0;
+      h.electron.app.hide = () => (hides += 1);
+      if (from !== "another app") h.electron.BrowserWindow.getFocusedWindow = () => main;
+      const panel = openPanel(h);
+      // Putting the key panel away makes the app's next window key, as AppKit does.
+      h.electron.BrowserWindow.getFocusedWindow = () => main;
+      h.ipc.get("omnigent:floating-composer:dismiss")(fromPanel(h));
+      t.mock.timers.tick(0);
+      assert.equal(panel.visible, false);
+      assert.equal(hides, appHidden);
+    });
+  }
+
+  it("a launch from a panel opened over another app still brings its window forward", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const main = addMain(h);
+    let hides = 0;
+    h.electron.app.hide = () => (hides += 1);
+    openPanel(h);
+    h.electron.BrowserWindow.getFocusedWindow = () => main;
+    assert.deepEqual(await openFromPanel(h, "/settings/import"), { ok: true });
+    t.mock.timers.tick(0);
+    assert.ok(main.focused > 0);
+    assert.equal(hides, 0);
+  });
+
   it("hides the panel when its page dismisses it", (t) => {
     const h = loadNavigationHarness({ platform: "darwin" });
     t.after(h.cleanup);
