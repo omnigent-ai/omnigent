@@ -32,6 +32,20 @@ describe("composerHighlightSplit commands", () => {
   ])("leaves %s untinted", (_label, value) => {
     expect(composerHighlightSplit(value, KNOWN, "codex-native")).toBeNull();
   });
+
+  it("tints an any-case command as typed, but a skill only in its exact case", () => {
+    expect(
+      composerHighlightSplit("/Goal Fix CI", ["/goal", "/team"], null, undefined, ["/goal"]),
+    ).toEqual({
+      kind: "command",
+      before: "",
+      token: "/Goal",
+      after: " Fix CI",
+    });
+    expect(
+      composerHighlightSplit("/Team fix it", ["/goal", "/team"], null, undefined, ["/goal"]),
+    ).toBeNull();
+  });
 });
 
 describe("splitKnownSlashCommand", () => {

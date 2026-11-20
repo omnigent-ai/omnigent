@@ -25,12 +25,22 @@ export interface ComposerHighlightSplit {
   after: string;
 }
 
-/** Split a leading known command; unknown command-shaped words stay plain, as they won't run. */
+/**
+ * Split a leading known command; unknown command-shaped words stay plain, as they won't run.
+ * `anyCaseCommands` match the first word in any case, as the main chat runs its built-ins.
+ */
 export function splitKnownSlashCommand(
   value: string,
   commands: Iterable<string>,
+  anyCaseCommands: readonly string[] = [],
 ): { before: string; token: string; after: string } | null {
-  const token = matchSlashCommandInvocation(value, commands)?.command;
+  const firstWord = value.trimStart().match(/^\S+/)?.[0];
+  const token =
+    matchSlashCommandInvocation(value, commands)?.command ??
+    (firstWord !== undefined &&
+    anyCaseCommands.some((name) => name.toLowerCase() === firstWord.toLowerCase())
+      ? firstWord
+      : undefined);
   if (token === undefined) return null;
   const before = value.match(/^\s*/)?.[0] ?? "";
   return { before, token, after: value.slice(before.length + token.length) };
@@ -121,12 +131,13 @@ export function composerHighlightSplit(
   commands: Iterable<string>,
   nativeShell: string | null,
   classifyValue: string = value,
+  anyCaseCommands: readonly string[] = [],
 ): ComposerHighlightSplit | null {
   const at = value.indexOf("!");
   if (at >= 0 && nativeShell && splitNativeShellCommand(classifyValue, nativeShell)) {
     return { kind: "shell", before: value.slice(0, at), token: "!", after: value.slice(at + 1) };
   }
-  const command = splitKnownSlashCommand(value, commands);
+  const command = splitKnownSlashCommand(value, commands, anyCaseCommands);
   return command ? { kind: "command", ...command } : null;
 }
 
@@ -149,6 +160,8 @@ export function renderComposerHighlight(
 export interface UseComposerHighlightOptions {
   value: string;
   commandNames: readonly string[];
+  /** Commands that run whatever their case, such as the main chat's built-ins. */
+  anyCaseCommandNames?: readonly string[];
   /** False while quotes or attachments ride along, as the token no longer leads `value`. */
   enabled: boolean;
   /** Whether shell mode can apply, judged on `classifyValue`; `enabled` when unset. */
@@ -192,6 +205,7 @@ export interface ComposerHighlight {
 export function useComposerHighlight({
   value,
   commandNames,
+  anyCaseCommandNames,
   enabled,
   shellEnabled = enabled,
   nativeShell,
@@ -211,7 +225,13 @@ export function useComposerHighlight({
     shellHarness !== null &&
     splitNativeShellCommand(classifyValue ?? value, shellHarness) !== null;
   const painted = enabled
-    ? composerHighlightSplit(value, commandNames, shell ? shellHarness : null, classifyValue)
+    ? composerHighlightSplit(
+        value,
+        commandNames,
+        shell ? shellHarness : null,
+        classifyValue,
+        anyCaseCommandNames,
+      )
     : null;
   const split = shell && painted?.kind !== "shell" ? null : painted;
   const refusal = !shell

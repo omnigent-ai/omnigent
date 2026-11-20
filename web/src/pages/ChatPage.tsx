@@ -3110,6 +3110,11 @@ function ComposerImpl(
     [offeredBuiltinCommands, commandSkills, skillPrefix],
   );
   const slashCommandNames = useMemo(() => Object.keys(slashCommands), [slashCommands]);
+  // Submission lowercases the first word before matching a built-in, so `/Goal` runs too.
+  const offeredBuiltinNames = useMemo(
+    () => Object.keys(offeredBuiltinCommands),
+    [offeredBuiltinCommands],
+  );
   // Skills always need an optional argument fill-in so the user can
   // type extra context after the name; built-in commands keep their
   // existing fill/execute split.
@@ -3212,6 +3217,7 @@ function ComposerImpl(
   const highlight = useComposerHighlight({
     value,
     commandNames: slashCommandNames,
+    anyCaseCommandNames: offeredBuiltinNames,
     enabled: draft.quotes.length === 0 && files.length === 0,
     // Files go out as separate blocks, so the message is no longer a lone `!` text.
     shellEnabled: files.length === 0,

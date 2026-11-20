@@ -1079,6 +1079,12 @@ describe("Composer goal slash command", () => {
       fireEvent.change(textarea(), {
         target: { value: text },
       });
+      // Submission matches the built-in in any case, so the tint paints the token as typed.
+      const typed = text.split(/\s+/)[0]!;
+      expect(textarea()).toHaveAttribute("data-slash-command", "true");
+      expect(within(screen.getByTestId("composer-highlight-overlay")).getByText(typed)).toHaveClass(
+        COMMAND_TOKEN_CLASS,
+      );
       fireEvent.click(screen.getByRole("button", { name: "Send" }));
       expect(onSend.mock.calls[0]?.[0]).toBe(sent);
       expect(onSendSlashCommand).not.toHaveBeenCalled();
@@ -10155,6 +10161,16 @@ describe("Composer with the CodeMirror release flag on", () => {
     );
     return screen.getByLabelText("Message the agent");
   }
+
+  it("tints a built-in typed in another case in the editor, as it still runs", async () => {
+    const { sessionHarness } = useChatStore.getState();
+    onTestFinished(() => useChatStore.setState({ sessionHarness }));
+    setComposerState({ conversationId: "conv_codemirror_goal", sessionHarness: "codex-native" });
+    const editor = await renderEditor(composerProps({ showGoalControl: true }));
+    act(() => insertComposerText(composerTargetOf(editor)!, "/Goal Fix CI"));
+    expect(commandMarks()).toEqual([["/Goal", COMMAND_TOKEN_CLASS]]);
+    expect(editor).toHaveAttribute("data-slash-command", "true");
+  });
 
   it("tints a known command in the editor but not an unknown one", async () => {
     setComposerState({
