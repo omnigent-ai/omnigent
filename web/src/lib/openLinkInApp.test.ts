@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { showToast } from "@/components/ui/toast";
 import { AGENT_BROWSER_TAB_ID, browserViewId } from "@/lib/browserTabs";
 import { writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
-import { maybeOpenLinkInApp, onInAppLinkOpen, parseHttpUrl } from "@/lib/openLinkInApp";
+import { maybeOpenLinkInApp, onInAppLinkOpen, openLink, parseHttpUrl } from "@/lib/openLinkInApp";
 import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
@@ -288,4 +288,12 @@ it("resolves the current host for a new link after the session moves", async () 
     ),
   );
   expect(getSessionSlim).toHaveBeenCalledTimes(2);
+});
+
+it("opens a link in a new window unless the in-app browser takes it", () => {
+  openLink(CONV, URL_);
+  expect(window.open).not.toHaveBeenCalled();
+  writeOpenLinksInApp(false);
+  openLink(CONV, URL_);
+  expect(window.open).toHaveBeenCalledWith(URL_, "_blank", "noopener,noreferrer");
 });
