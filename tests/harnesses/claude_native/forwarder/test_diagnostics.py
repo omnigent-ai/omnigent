@@ -14,6 +14,7 @@ from typing import Any
 import httpx
 import pytest
 
+import omnigent.harnesses.claude_native.bridge as bridge
 import omnigent.harnesses.claude_native.forwarder as forwarder
 from omnigent.harnesses.claude_native.bridge import (
     record_hook_event,
@@ -1087,3 +1088,146 @@ async def test_diagnostic_ids_differ_across_hook_log_generations(tmp_path: Path)
     assert first_ids[0] != second_ids[0]
     # A retry of the same generation re-posts the same notice id.
     assert await diagnostic_ids(first) == first_ids
+
+
+def _priced_assistant_line(uuid: str) -> str:
+    return json.dumps(
+        {
+            "type": "assistant",
+            "uuid": uuid,
+            "message": {
+                "id": f"msg-{uuid}",
+                "role": "assistant",
+                "model": "claude-sonnet-4-5-20250929",
+                "content": [{"type": "text", "text": "priced reply"}],
+                "usage": {"input_tokens": 1000, "output_tokens": 200},
+            },
+        }
+    )
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads unreadable files")
+def test_denied_transcript_read_is_not_cached_as_zero_cost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read refused during cost pricing is not cached as an empty transcript.
+
+    The size-keyed cache is the only memory of a priced transcript, so a refused read
+    cached as ``None`` would stay wrong after permission is restored, even with the
+    file size unchanged.
+    """
+    # The test environment has no provider pricing table, so price the model explicitly.
+    monkeypatch.setattr(bridge, "_transcript_model_pricing", lambda *a, **k: object())
+    monkeypatch.setattr("omnigent.llms.context_window.compute_llm_cost", lambda *a, **k: 0.25)
+    transcript_path = tmp_path / "parent.jsonl"
+    transcript_path.write_text(_priced_assistant_line("a1") + "\n", encoding="utf-8")
+    expected = forwarder.compute_transcript_cumulative_cost(
+        transcript_path, include_sidechains=False
+    )
+    assert expected is not None
+    cache: dict[Path, Any] = {}
+
+    transcript_path.chmod(0o000)
+    try:
+        with pytest.raises(PermissionError):
+            forwarder._transcript_cost_size_cached(
+                transcript_path, include_sidechains=False, cache=cache
+            )
+    finally:
+        transcript_path.chmod(0o644)
+    assert cache == {}
+
+    assert (
+        forwarder._transcript_cost_size_cached(
+            transcript_path, include_sidechains=False, cache=cache
+        )
+        == expected
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads unreadable files")
+async def test_relocated_unreadable_transcript_keeps_the_saved_cursor(tmp_path: Path) -> None:
+    """A hook that relocates the transcript to an unreadable file keeps the saved checkpoint.
+
+    The denied-then-recovered sequence: the forwarder has forwarded the original
+    transcript; the hook then reports a same-named copy that cannot be read. The
+    saved cursor must survive that poll unchanged, and after permission is restored
+    the copy must resume from the cursor without re-forwarding earlier items.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "claude-settings.json").write_text("{}", encoding="utf-8")
+    content = _priced_assistant_line("a1") + "\n" + _priced_assistant_line("a2") + "\n"
+    old_path = tmp_path / "projects" / "old" / "claude-session.jsonl"
+    new_path = tmp_path / "projects" / "worktree" / "claude-session.jsonl"
+    old_path.parent.mkdir(parents=True)
+    new_path.parent.mkdir(parents=True)
+    old_path.write_text(content, encoding="utf-8")
+    new_path.write_text(content, encoding="utf-8")
+    _record_turn(bridge_dir, old_path)
+
+    server, thread, base_url = _start_recording_server()
+
+    async def run_loop(seconds: float) -> list[dict[str, Any]]:
+        task = asyncio.create_task(
+            forwarder.forward_claude_transcript_to_session(
+                base_url=base_url,
+                headers={},
+                session_id="conv_relocated",
+                bridge_dir=bridge_dir,
+                agent_name="claude-native-ui",
+                start_at_end=False,
+                poll_interval_s=0.01,
+            )
+        )
+        await asyncio.sleep(seconds)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        drained: list[dict[str, Any]] = []
+        while True:
+            try:
+                drained.append(server.requests.get_nowait())
+            except queue.Empty:
+                return drained
+
+    def transcript_items(posts: list[dict[str, Any]]) -> list[str]:
+        return [
+            post["body"]["data"]["source_id"]
+            for post in posts
+            if post["body"].get("type") == "external_conversation_item"
+            and post["body"]["data"].get("item_type") != "error"
+        ]
+
+    try:
+        first = transcript_items(await run_loop(1.5))
+        assert len(first) >= 2
+        state_path = bridge_dir / forwarder._FORWARDER_STATE_FILE
+        saved_cursor = state_path.read_bytes()
+
+        new_path.chmod(0o000)
+        _record_turn(bridge_dir, new_path)
+        denied = transcript_items(await run_loop(1.5))
+        assert denied == []
+        # The Stop may settle the turn, so only the checkpoint itself must hold still.
+        checkpoint = (
+            "transcript_path",
+            "line_cursor",
+            "byte_offset",
+            "cursor_fingerprint",
+            "seen_source_ids",
+        )
+        before, after = json.loads(saved_cursor), json.loads(state_path.read_bytes())
+        assert {key: after.get(key) for key in checkpoint} == {
+            key: before.get(key) for key in checkpoint
+        }
+
+        new_path.chmod(0o644)
+        recovered = transcript_items(await run_loop(1.5))
+        assert recovered == []
+    finally:
+        new_path.chmod(0o644)
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)

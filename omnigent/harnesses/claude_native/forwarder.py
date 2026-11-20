@@ -442,6 +442,22 @@ class _UnreadTranscript:
     exists: bool
 
 
+def _transcript_unreadable(transcript_path: Path) -> bool:
+    """
+    Whether a hook-reported transcript exists but this process cannot read it.
+
+    An unsearchable ancestor counts too, because it hides the file. A missing
+    file is not unreadable; the transcript cursor logic handles that case.
+
+    :param transcript_path: Transcript path carried by the latest hook record.
+    :returns: ``True`` when reads of the file would be refused.
+    """
+    try:
+        return transcript_path.exists() and not os.access(transcript_path, os.R_OK)
+    except OSError:
+        return True
+
+
 def _missing_transcript_blocker(
     bridge_dir: Path, hook_transcript_path: Path | None
 ) -> _UnreadTranscript | None:
@@ -1806,7 +1822,27 @@ async def forward_claude_transcript_to_session(
                         transcript_path=transcript_path,
                         diagnostics=transcript_diagnostics,
                     )
-                    if transcript_path is not None:
+                    if transcript_path is not None and _transcript_unreadable(transcript_path):
+                        # Reads of an unreadable transcript would raise and restart this
+                        # loop, so the poll forwards hook records only. The Stop-time
+                        # diagnostic then reports the turn, and the saved transcript
+                        # cursor is left untouched for when the file is readable again.
+                        hook_state = await _forward_available_status_events(
+                            client=client,
+                            session_id=current_session_id,
+                            bridge_dir=bridge_dir,
+                            state=hook_state,
+                            retry_tracker=status_retries,
+                            compaction_retry_tracker=compaction_retries,
+                            dedupe=dedupe,
+                            task_subjects=task_subjects,
+                            task_statuses=task_statuses,
+                            task_order=task_order,
+                            response_id=state.current_response_id if state is not None else None,
+                            diagnostic_health=diagnostic_health,
+                            hooks_cutoff_byte_offset=None,
+                        )
+                    elif transcript_path is not None:
                         state = await _ensure_state_for_transcript(
                             bridge_dir=bridge_dir,
                             state=state,
@@ -6149,8 +6185,7 @@ def _validated_transcript_state(
         return state
     current_fingerprint = _jsonl_cursor_fingerprint(state.transcript_path, state.byte_offset)
     if current_fingerprint is None:
-        # An unreadable file is reported at Stop, not as a stale cursor on every poll.
-        if not state.transcript_path.exists() or not os.access(state.transcript_path, os.R_OK):
+        if not state.transcript_path.exists():
             return state
         _logger.warning(
             "Claude transcript cursor invalid; skipping to end of transcript; "
@@ -8561,7 +8596,7 @@ def _complete_jsonl_end_offset(path: Path) -> int:
                 if newline_index >= 0:
                     return block_start + newline_index + 1
                 block_end = block_start
-    except (FileNotFoundError, PermissionError):
+    except FileNotFoundError:
         return 0
     return 0
 
@@ -8590,9 +8625,6 @@ def _jsonl_cursor_fingerprint(
             sample_start = max(0, byte_offset - _CURSOR_FINGERPRINT_BYTES)
             handle.seek(sample_start)
             sample = handle.read(byte_offset - sample_start)
-    except PermissionError:
-        # Unreadable is not a stale cursor; the Stop-time diagnostic reports the file.
-        return None
     except FileNotFoundError:
         if not missing_ok:
             raise
