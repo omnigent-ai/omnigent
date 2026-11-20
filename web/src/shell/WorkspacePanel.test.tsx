@@ -16,6 +16,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
 import * as sessionsApi from "@/lib/sessionsApi";
 import * as identity from "@/lib/identity";
+import { GOOGLE_DOCS_SELECTION_LABEL } from "@/lib/googleDocs";
 import { useChatStore } from "@/store/chatStore";
 import { workspaceTabAriaShortcut, workspaceTabShortcutKeys } from "@/components/KeyboardShortcut";
 import { isMacPlatform } from "@/lib/hotkeys";
@@ -241,6 +242,7 @@ function renderWorkspace(
     changedCount?: number;
     showGithubTab?: boolean;
     showContentSearch?: boolean;
+    googleDocs?: React.ComponentProps<typeof WorkspacePanel>["googleDocs"];
     showFilesPanel?: boolean;
     showBrowserTab?: boolean;
     openTerminals?: string[];
@@ -299,6 +301,7 @@ function renderWorkspace(
         onClosePanel={onClosePanel}
         showFilesPanel={overrides.showFilesPanel ?? true}
         showContentSearch={overrides.showContentSearch}
+        googleDocs={overrides.googleDocs}
         showGithubTab={overrides.showGithubTab ?? false}
         showBrowserTab={overrides.showBrowserTab ?? false}
         onReveal={onReveal}
@@ -414,6 +417,108 @@ describe("WorkspacePanel render failures", () => {
 });
 
 describe("WorkspacePanel surface presentation", () => {
+  it("keeps the Docs editor mounted through rail tab changes and collapse", async () => {
+    const url = "https://docs.google.com/document/d/example/edit";
+    vi.spyOn(identity, "authenticatedFetch").mockImplementation(async (request) => {
+      if (request === "/v1/sessions/conv_ws/labels") {
+        return Response.json({
+          id: "conv_ws",
+          labels: { [GOOGLE_DOCS_SELECTION_LABEL]: url },
+        });
+      }
+      return Response.json({ data: [] });
+    });
+    const { onRightRailTabChange, rerender } = renderWorkspace();
+    expect(screen.queryByRole("tab", { name: "Google Docs" })).not.toBeInTheDocument();
+
+    rerender({ googleDocs: { sessionId: "conv_ws", canEditReference: false } });
+    await userEvent.click(screen.getByRole("tab", { name: "Google Docs" }));
+    expect(onRightRailTabChange).toHaveBeenCalledWith("google-docs");
+    rerender({ rightRailTab: "google-docs" });
+    const iframe = await screen.findByTitle("Google Docs editor");
+
+    rerender({ rightRailTab: "files" });
+    expect(iframe).not.toBeVisible();
+    rerender({ rightRailTab: "google-docs", open: false, inert: true });
+    expect(iframe).not.toBeVisible();
+    rerender({ open: true, inert: false });
+    expect(screen.getByTitle("Google Docs editor")).toBe(iframe);
+    expect(iframe).toBeVisible();
+  });
+
+  it("retains each session's iframe and isolates a save that finishes after switching sessions", async () => {
+    const firstUrl = "https://docs.google.com/document/d/first/edit";
+    const secondUrl = "https://docs.google.com/document/d/second/edit";
+    const changeUrl = "https://docs.google.com/document/d/replacement/edit";
+    const first = { sessionId: "conv_ws", canEditReference: true };
+    const second = { sessionId: "conv_other", canEditReference: true };
+    let finishSave!: (response: Response) => void;
+    const saving = new Promise<Response>((finish) => {
+      finishSave = finish;
+    });
+    const fetch = vi
+      .spyOn(identity, "authenticatedFetch")
+      .mockImplementation(async (request, options) => {
+        if (options?.method === "PATCH") return saving;
+        if (request === "/v1/sessions/conv_ws/labels") {
+          return Response.json({
+            id: first.sessionId,
+            labels: { [GOOGLE_DOCS_SELECTION_LABEL]: firstUrl },
+          });
+        }
+        if (request === "/v1/sessions/conv_other/labels") {
+          return Response.json({
+            id: second.sessionId,
+            labels: { [GOOGLE_DOCS_SELECTION_LABEL]: secondUrl },
+          });
+        }
+        return Response.json({ data: [] });
+      });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const { rerender } = renderWorkspace({ googleDocs: first, rightRailTab: "google-docs" });
+    const firstFrame = await screen.findByTitle("Google Docs editor");
+    fireEvent.click(screen.getByRole("button", { name: "Change document" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Google Docs URL" }), {
+      target: { value: changeUrl },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Open document" }));
+    await waitFor(() =>
+      expect(fetch).toHaveBeenCalledWith(
+        "/v1/sessions/conv_ws",
+        expect.objectContaining({ method: "PATCH" }),
+      ),
+    );
+
+    rerender({ conversationId: second.sessionId, googleDocs: undefined });
+    expect(firstFrame).toBeInTheDocument();
+    expect(firstFrame).not.toBeVisible();
+    rerender({ googleDocs: second });
+    const visiblePane = await screen.findByRole("region", { name: "Google Docs pane" });
+    const secondFrame = within(visiblePane).getByTitle("Google Docs editor");
+    expect(secondFrame).toHaveAttribute("src", secondUrl + "?embedded=true");
+    await act(async () =>
+      finishSave(Response.json({ error: "Save unavailable" }, { status: 503 })),
+    );
+    expect(within(visiblePane).getByTitle("Google Docs editor")).toBe(secondFrame);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    rerender({ conversationId: first.sessionId, googleDocs: first });
+    const restoredPane = screen.getByRole("region", { name: "Google Docs pane" });
+    expect(within(restoredPane).getByTitle("Google Docs editor")).toBe(firstFrame);
+    expect(secondFrame).toBeInTheDocument();
+    expect(secondFrame).not.toBeVisible();
+    expect(within(restoredPane).getByRole("textbox", { name: "Google Docs URL" })).toHaveValue(
+      changeUrl,
+    );
+    expect(within(restoredPane).getByRole("alert")).toHaveTextContent(
+      "Could not save the document.",
+    );
+    expect(
+      fetch.mock.calls.filter(([, options]) => options?.method === "PATCH").map(([url]) => url),
+    ).toEqual(["/v1/sessions/conv_ws"]);
+    expect(confirm).toHaveBeenCalledOnce();
+  });
+
   it("offers unpinned pages in + without requiring shell or browser support", () => {
     writePinnedWorkspaceTabs(["files", "subagents"]);
     const { onRightRailTabChange } = renderWorkspace({ showGithubTab: true });

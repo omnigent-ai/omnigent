@@ -7,6 +7,7 @@
 import {
   BotIcon,
   FileDiffIcon,
+  FileTextIcon,
   FolderTreeIcon,
   GitPullRequestIcon,
   ListChecksIcon,
@@ -28,6 +29,7 @@ export interface WorkspacePanelTabContext {
   /** Whether the session has a Tasks tab. */
   showTasksTab: boolean;
   showContentSearch: boolean;
+  showGoogleDocs: boolean;
   changedCount: number;
   agentCount: number;
   subagentsWorking: number;
@@ -65,6 +67,11 @@ export const WORKSPACE_PANEL_TABS: Record<WorkspacePanelTab, WorkspacePanelTabDe
     tooltipShortcut: () => [MOD_KEY, SHIFT_KEY, "F"],
     ariaKeyShortcuts: ({ digitAriaShortcut }) =>
       `${ARIA_MOD_KEY}+Shift+F ${digitAriaShortcut ?? ""}`.trim(),
+  },
+  "google-docs": {
+    label: "Google Docs",
+    icon: FileTextIcon,
+    shown: ({ pending, showGoogleDocs }) => !pending && showGoogleDocs,
   },
   files: {
     label: "Files",

@@ -14,6 +14,7 @@ const READY: WorkspacePanelTabContext = {
   showGithubTab: true,
   showTasksTab: true,
   showContentSearch: true,
+  showGoogleDocs: false,
   changedCount: 0,
   agentCount: 0,
   subagentsWorking: 0,
@@ -64,6 +65,12 @@ describe("workspacePanelTabPresentation", () => {
       "tasks",
       "subagents",
     ]);
+  });
+
+  it("shows Google Docs independently of file access once enabled for a session", () => {
+    const context = { ...READY, showFilesPanel: false, showGoogleDocs: true };
+    expect(shownTabs(context)).toContain("google-docs");
+    expect(shownTabs({ ...context, pending: true })).not.toContain("google-docs");
   });
 
   it("draws Tasks only for a session with a Tasks tab", () => {

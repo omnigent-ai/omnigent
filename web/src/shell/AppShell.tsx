@@ -52,7 +52,8 @@ import { useIsSideBySideSidebarViewport } from "@/hooks/useIsSideBySideSidebarVi
 import { useReportLocalTimezone } from "@/hooks/useReportLocalTimezone";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
-import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
+import { derivePermissionLevel, isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
+import { readOnlyReasonForSessionLabels } from "@/lib/sessionCapabilities";
 import {
   closeDesktopWindow,
   confirmDesktopQuit,
@@ -1170,6 +1171,7 @@ function AppShellImpl() {
     () =>
       ({
         files: showFilesPanel,
+        "google-docs": isFeatureEnabled(serverInfo, "google_docs"),
         "content-search":
           showFilesPanel && isFeatureEnabled(serverInfo, "workspace_content_search"),
         // Changes tab shares the Files gate — same on-disk workspace, just the
@@ -1202,6 +1204,23 @@ function AppShellImpl() {
   // no-filesystem agent with no terminals/sub-agents would otherwise
   // render an empty white card with no way to dismiss it.
   const hasRailContent = Object.values(railTabsAvailable).some(Boolean);
+  const googleDocsSessionId = activeSession?.id;
+  const googleDocsCanEdit = activeSession !== null && isEditorLevel(activeSession.permissionLevel);
+  const googleDocsRevisionDisabledReason =
+    readOnlyReasonForSessionLabels(activeSession, activeConv) ?? undefined;
+  const googleDocsEnabled = railTabsAvailable["google-docs"];
+  const googleDocs = useMemo(
+    () =>
+      googleDocsEnabled && googleDocsSessionId
+        ? {
+            sessionId: googleDocsSessionId,
+            canEditReference: googleDocsCanEdit,
+            revisionDisabledReason: googleDocsRevisionDisabledReason,
+          }
+        : undefined,
+    [googleDocsEnabled, googleDocsSessionId, googleDocsCanEdit, googleDocsRevisionDisabledReason],
+  );
+
   const initialWorkspaceTab = readInitialWorkspaceTab();
   const fallbackWorkspaceTab =
     initialWorkspaceTab !== null && railTabsAvailable[initialWorkspaceTab]
@@ -3351,6 +3370,7 @@ function AppShellImpl() {
                     showGithubTab={railTabsAvailable.github}
                     showTasksTab={railTabsAvailable.tasks}
                     showContentSearch={railTabsAvailable["content-search"]}
+                    googleDocs={googleDocs}
                     showBrowserTab={railTabsAvailable.browser}
                     onReveal={revealRightPanel}
                     onHide={rightPanelOpen ? toggleRightPanel : undefined}

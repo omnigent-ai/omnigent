@@ -94,6 +94,10 @@ import { scrollTabIntoView, WorkspaceTabsScroller } from "./WorkspaceTabsScrolle
 import { FilesPanel } from "./FilesPanel";
 import { resolveWorkspaceActiveView } from "./workspaceActiveView";
 import { ContentSearchPanel } from "./ContentSearchPanel";
+import {
+  GoogleDocsWorkspacePane,
+  type GoogleDocsWorkspacePaneProps,
+} from "./GoogleDocsWorkspacePane";
 import { FileViewer } from "./FileViewer";
 import { ResponsiveViewerSlot } from "./ResponsiveViewerSlot";
 import { TasksPanel } from "./TasksPanel";
@@ -718,6 +722,7 @@ interface WorkspacePanelProps {
   /** Whether the Files/Changes tabs are available (agent spec exposes an os_env). */
   showFilesPanel: boolean;
   showContentSearch?: boolean;
+  googleDocs?: Omit<GoogleDocsWorkspacePaneProps, "active" | "visible">;
   /** Whether the Pull Requests tab is available (same on-disk-workspace gate as Files). */
   showGithubTab: boolean;
   /** Whether the session has a Tasks tab. */
@@ -900,6 +905,7 @@ function WorkspacePanelImpl({
   onClosePanel,
   showFilesPanel,
   showContentSearch = false,
+  googleDocs,
   showGithubTab,
   showTasksTab = false,
   showBrowserTab,
@@ -1357,6 +1363,7 @@ function WorkspacePanelImpl({
   const visiblePermanentTabs = [
     ...availablePanels.filter((tab) => pinnedTabs.includes(tab)),
     ...(showContentSearch && (pending || showFilesPanel) ? ["content-search" as const] : []),
+    ...(googleDocs && !isMobile && !pending ? ["google-docs" as const] : []),
   ];
   const unpinnedTabs = availablePanels.filter((tab) => !pinnedTabs.includes(tab));
   const visibleOpenPanels = openPanels.filter((tab) => unpinnedTabs.includes(tab));
@@ -1507,6 +1514,7 @@ function WorkspacePanelImpl({
       changedCount,
       agentCount,
       subagentsWorking,
+      showGoogleDocs: googleDocs !== undefined && !isMobile,
       digit: shortcutFor(tab),
       digitAriaShortcut: tabAriaShortcut(tab),
     });
@@ -1534,8 +1542,23 @@ function WorkspacePanelImpl({
   const frontTerminalKey = activeView.terminalKey;
   const frontFilePath = activeView.filePath;
   const fileViewerInFront = !pending && frontTerminalKey === null && frontFilePath !== null;
+  const googleDocsSelected = googleDocs !== undefined && rightRailTab === "google-docs";
+  const googleDocsVisible =
+    open &&
+    !inert &&
+    !pending &&
+    !isMobile &&
+    googleDocsSelected &&
+    selectedFilePath === null &&
+    selectedTerminalKey === null;
+  const [openedGoogleDocsSessions, setOpenedGoogleDocsSessions] = useState<string[]>([]);
+  // Keep retained frames in their original DOM order so switching sessions doesn't move them.
+  if (googleDocsVisible && !openedGoogleDocsSessions.includes(googleDocs.sessionId)) {
+    setOpenedGoogleDocsSessions([...openedGoogleDocsSessions, googleDocs.sessionId]);
+  }
   // Stays mounted behind a file or shell to keep tree expansion, listing and scroll.
-  const filesPanelMounted = showFilesPanel && !pending && scopeView === "files";
+  const filesPanelMounted =
+    showFilesPanel && !pending && scopeView === "files" && !googleDocsSelected;
   const filesPanelActive = filesPanelMounted && !terminalShown && selectedFilePath === null;
   // Desktop Close (⌘W / Ctrl+W) while the rail, or its embedded browser view,
   // has focus: close the tab on screen, or hide the rail on a fixed page.
@@ -2064,6 +2087,20 @@ function WorkspacePanelImpl({
           tabIndex={-1}
           className="relative flex min-h-0 flex-1 flex-col overflow-hidden focus:outline-none"
         >
+          {openedGoogleDocsSessions.map((sessionId) => {
+            const current = googleDocs?.sessionId === sessionId ? googleDocs : undefined;
+            return (
+              <RenderErrorBoundary key={sessionId} name="Google Docs" resetKey={sessionId}>
+                <GoogleDocsWorkspacePane
+                  {...current}
+                  sessionId={sessionId}
+                  active={current !== undefined}
+                  visible={current !== undefined && googleDocsVisible}
+                  canEditReference={current?.canEditReference ?? false}
+                />
+              </RenderErrorBoundary>
+            );
+          })}
           <RenderErrorBoundary
             name="this workspace pane"
             resetKey={JSON.stringify([

@@ -16,7 +16,8 @@ export type RightRailTab =
   | "subagents"
   | "browser"
   | "sidechat"
-  | "content-search";
+  | "content-search"
+  | "google-docs";
 
 /**
  * Count/status badge geometry. Fixed height with min-width == height keeps a
