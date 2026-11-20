@@ -16,9 +16,9 @@ function mockDevice(initial: Device) {
   const listeners = new Set<() => void>();
   const base = window.matchMedia;
   vi.spyOn(window, "matchMedia").mockImplementation((query: string) => {
-    const min = /\(min-width: ([\d.]+)px\)/.exec(query);
-    const max = /\(max-width: ([\d.]+)px\)/.exec(query);
-    const pointer = /\(pointer: (coarse|fine)\)/.exec(query);
+    const min = query.match(/\(min-width: ([\d.]+)px\)/);
+    const max = query.match(/\(max-width: ([\d.]+)px\)/);
+    const pointer = query.match(/\(pointer: (coarse|fine)\)/);
     const matches = pointer
       ? (pointer[1] === "coarse") === device.coarse
       : (!min || device.width >= Number(min[1])) && (!max || device.width <= Number(max[1]));
