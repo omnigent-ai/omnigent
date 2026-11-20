@@ -3,7 +3,7 @@
 // is keyboardActive, and never while a text field, composer menu, dialog, or other
 // focused control owns them.
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { type ReactNode, useState } from "react";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -87,6 +87,7 @@ function composerCard({
     >
       <textarea
         aria-label="Message the agent"
+        data-composer-input=""
         defaultValue={text}
         data-has-draft={hasDraft ? "true" : undefined}
       />
@@ -655,6 +656,40 @@ describe("AskUserQuestionForm — keyboard activity", () => {
     );
     expect(within(inboxCard!).getByLabelText("Vue")).not.toBeChecked();
     expect(within(chatCard!).getByLabelText("Vue")).toBeChecked();
+  });
+});
+
+describe("AskUserQuestionForm — disabled Submit", () => {
+  it("names the unanswered question that keeps Submit disabled", async () => {
+    renderForm([{ ...snacks, header: "Snacks" }, framework]);
+    fireEvent.click(screen.getByTestId("ask-user-question-next"));
+    expect(screen.getByRole("button", { name: "Submit" })).toBeDisabled();
+    act(() => screen.getByRole("group", { name: "Submit" }).focus());
+    await waitFor(() =>
+      expect(screen.getByRole("tooltip")).toHaveTextContent("Answer question 1 (Snacks) to submit"),
+    );
+
+    fireEvent.click(screen.getByTestId("ask-user-question-prev"));
+    fireEvent.click(screen.getByLabelText("Popcorn"));
+    fireEvent.click(screen.getByTestId("ask-user-question-next"));
+    expect(screen.getByRole("button", { name: "Submit" })).toBeEnabled();
+    expect(screen.queryByRole("group", { name: "Submit" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
+  });
+
+  it("closes the reason on Escape before Escape cancels the questions", async () => {
+    const user = userEvent.setup();
+    const { onReject } = renderForm([snacks, framework]);
+    fireEvent.click(screen.getByTestId("ask-user-question-next"));
+    act(() => screen.getByRole("group", { name: "Submit" }).focus());
+    await waitFor(() => expect(screen.getByRole("tooltip")).toBeVisible());
+
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
+    expect(onReject).not.toHaveBeenCalled();
+
+    await user.keyboard("{Escape}");
+    expect(onReject).toHaveBeenCalledTimes(1);
   });
 });
 

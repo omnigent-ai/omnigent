@@ -53,6 +53,11 @@ together in Comments.
   other subtabs, the PR list and the collapsed rail stop requesting them.
   A compact **Loading review threads** spinner beside the layout toggle indicates
   an in-flight read. Conversation navigation shares the diff toolbar.
+- `chat-references`: `#1234` and `owner/repo#12` in agent replies, user messages
+  and /btw answers link to the github.com PR. Bare references use the session's
+  own repo, including in a side chat. They stay text in tool output, code, existing
+  links, after an escaped `#`, and in Enterprise, other-forge or unrecognized-remote
+  checkouts, and while the runner hasn't reported the workspace repo.
 - `render-recovery`: A panel render failure shows **Try again** while chat,
   Workspace tabs and mobile Close remain usable.
 
@@ -72,6 +77,9 @@ With a pointer, hovering the composer's PR link previews each PR's status. The
 icon beside each title opens that PR in a new browser tab without opening the
 panel. `tests/e2e_ui/github/test_composer_pr_status.py` covers the preview,
 its links and the touch and keyboard paths.
+
+- `chat-transcript`: In a session whose checkout is on github.com, an agent reply,
+  your own message, a side chat or a /btw answer that mentions a PR reference.
 
 On each surface, **Try again** retries failed panel content. Switching sessions
 also clears a failed panel. Healthy chat drafts stay mounted; content inside a
@@ -150,7 +158,19 @@ For an existing comment with a fenced `suggestion`, compare its red removal and
 green addition rows to GitHub, including a multiline replacement. Expand an
 outdated thread and confirm the suggestion uses its labeled original context.
 
+Chat references have component coverage in
+`web/src/components/blocks/ChatMarkdown.prRefs.test.tsx`,
+`web/src/pages/ChatPage.userBubble.test.tsx` and
+`web/src/components/ai-elements/pullRequestRefs.test.ts`; the runner's workspace
+repo choice is in `tests/runner/test_pr_resource.py`. Manually, in a github.com
+checkout, send `See #4242 and acme/lib#7` and have the agent repeat it; both link
+to github.com. Repeat in a side chat and through /btw. In a checkout whose origin
+is an Enterprise host, references stay text.
+
 ## Gotchas
+
+- Chat references link only to github.com. A tracked PR's repo doesn't decide the
+  workspace: an Enterprise origin with a github.com upstream stays text.
 
 - Browser stubs prove UI behavior; runner/host tests prove provider transport.
   They do not constitute a live GitHub write test.

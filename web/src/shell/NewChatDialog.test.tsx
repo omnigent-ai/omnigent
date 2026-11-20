@@ -1,4 +1,12 @@
+import * as CodeMirrorModule from "@/components/composer/engine/codeMirrorComposerModule";
+import {
+  codeMirrorComposerLoad,
+  resetCodeMirrorComposerLoadForTests,
+} from "@/components/composer/engine/codeMirrorComposerLoader";
+import { composerTargetOf } from "@/components/composer/engine/composerInput";
+import { insertComposerText } from "@/lib/composerText";
 import { testAgent } from "@/test/agentFixtures";
+import { COMMAND_TOKEN_CLASS } from "@/components/composer/commandToken";
 import { fetchSandboxProfiles, SANDBOX_PROFILES_QUERY_KEY } from "@/lib/sandboxProfilesApi";
 import type * as SandboxProfilesModule from "@/lib/sandboxProfilesApi";
 
@@ -114,6 +122,7 @@ vi.mock("@/pages/settings/HarnessFixDialog", () => ({
   },
 }));
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
+import { SHELL_MENTION_REFUSAL } from "@/components/composer/composerHighlight";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
@@ -4335,11 +4344,11 @@ describe("NewChatLandingScreen", () => {
       "composer-reference-surface",
       "border",
       "hover:shadow-[var(--composer-shadow)]",
-      "has-[textarea:focus]:shadow-[var(--composer-shadow)]",
+      "has-[[data-composer-input]:focus]:shadow-[var(--composer-shadow)]",
     );
     expect(composer).not.toHaveClass("bg-card", "dark:bg-card-solid");
     expect(composer).not.toHaveClass("shadow-[var(--composer-shadow)]");
-    expect(composer.className).not.toContain("has-[textarea:focus]:border-");
+    expect(composer.className).not.toContain("has-[[data-composer-input]:focus]:border-");
   });
 
   it("renders the reference two-layer composer with one in-form control row", () => {
@@ -10272,7 +10281,9 @@ describe("NewChatLandingScreen attachments", () => {
     fireEvent.dragOver(composer, { dataTransfer: fileDrag() });
     expect(screen.getByText("Drop files here")).toBeTruthy();
     expect(composer).toHaveClass("ring-2", "ring-ring", "ring-inset");
-    expect(composer).toHaveClass("has-[textarea:focus]:shadow-[var(--composer-shadow)]");
+    expect(composer).toHaveClass(
+      "has-[[data-composer-input]:focus]:shadow-[var(--composer-shadow)]",
+    );
     // Dropping a file attaches it (chip proves it reached state) and clears
     // the overlay.
     const file = new File(["hello"], "dropped.txt", { type: "text/plain" });
@@ -14254,5 +14265,287 @@ describe("NewChatLandingScreen picker curation", () => {
     expect(row("a1")).toBeNull();
     expect(row("a2")).not.toBeNull();
     expect(screen.queryByText("Harnesses")).toBeNull();
+  });
+});
+
+describe("NewChatLandingScreen composer highlight", () => {
+  const ROOT = "/Users/corey/repo";
+  beforeEach(() => {
+    setupLandingMocks();
+    setPendingInitialPromptMock.mockReset();
+    authenticatedFetchMock.mockImplementation(
+      async (url) =>
+        ({
+          ok: true,
+          json: async () => (String(url) === "/v1/sessions" ? { id: "conv_new" } : {}),
+        }) as Response,
+    );
+  });
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+  });
+
+  function landingAgent(harness: string) {
+    mockAgents([
+      testAgent("a1", `${harness}-ui`, {
+        display_name: harness,
+        harness,
+        skills: [{ name: "team", description: "Run a team" }],
+      }),
+    ]);
+  }
+  const input = () => screen.getByTestId("new-chat-landing-input");
+  const type = (value: string) => fireEvent.change(input(), { target: { value } });
+
+  it("tints a known skill but not an unknown command", () => {
+    landingAgent("claude-sdk");
+    renderLanding();
+    type("/team fix the bug");
+    const overlay = screen.getByTestId("composer-highlight-overlay");
+    expect(overlay).toHaveTextContent("/team fix the bug");
+    expect(within(overlay).getByText("/team")).toHaveClass("text-brand-accent");
+    expect(input()).toHaveAttribute("data-slash-command", "true");
+
+    type("/typo fix the bug");
+    expect(screen.queryByTestId("composer-highlight-overlay")).toBeNull();
+    expect(input()).not.toHaveAttribute("data-slash-command");
+  });
+
+  it("marks a claude-native `!` draft as a shell command and sends it unchanged", async () => {
+    landingAgent("claude-native");
+    renderLanding();
+    type("!git status --short");
+    expect(input()).toHaveAttribute("data-shell-command", "true");
+    expect(input()).toHaveAccessibleDescription("Shell command");
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
+
+    const submit = screen.getByTestId("new-chat-landing-submit");
+    await waitFor(() => expect(submit).toBeEnabled());
+    fireEvent.click(submit);
+    await waitFor(() =>
+      expect(setPendingInitialPromptMock).toHaveBeenCalledWith(
+        "conv_new",
+        expect.objectContaining({ text: "!git status --short" }),
+      ),
+    );
+  });
+
+  it("decides shell mode on the sanitized text but mirrors the raw draft", () => {
+    landingAgent("claude-native");
+    renderLanding();
+    // Sanitizing drops DEL, which the claude-native check alone would keep.
+    type("\x7f!echo ok");
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
+    const overlay = screen.getByTestId("composer-highlight-overlay");
+    expect(overlay.textContent).toBe("\x7f!echo ok");
+    expect(within(overlay).getByText("!")).toHaveClass("text-brand-accent");
+  });
+
+  it("refuses a `!` send that carries a tag, keeps the draft, then sends once it is gone", async () => {
+    landingAgent("claude-native");
+    useHostFilesystemMock.mockImplementation(((_hostId: string | null, path: string | null) => ({
+      data: {
+        entries:
+          path === ROOT
+            ? [
+                {
+                  name: "README.md",
+                  path: `${ROOT}/README.md`,
+                  type: "file",
+                  bytes: 10,
+                  modified_at: 0,
+                },
+              ]
+            : [],
+        truncated: false,
+      },
+      isLoading: false,
+      error: null,
+      isPlaceholderData: false,
+    })) as unknown as typeof useHostFilesystem);
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    fireEvent.change(input(), { target: { value: "!cat @", selectionStart: 6 } });
+    fireEvent.click(screen.getByTitle("Attach README.md"));
+    expect(input()).toHaveValue("!cat @README.md ");
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toHaveTextContent(
+      SHELL_MENTION_REFUSAL,
+    );
+
+    const submit = screen.getByTestId("new-chat-landing-submit");
+    await waitFor(() => expect(submit).toBeEnabled());
+    fireEvent.click(submit);
+    expect(await screen.findByTestId("new-chat-landing-error")).toHaveTextContent(
+      SHELL_MENTION_REFUSAL,
+    );
+    expect(input()).toHaveValue("!cat @README.md ");
+    expect(setPendingInitialPromptMock).not.toHaveBeenCalled();
+    expect(authenticatedFetchMock).not.toHaveBeenCalledWith("/v1/sessions", expect.anything());
+
+    // Backspace over the token drops the tag without an edit event; the refusal goes with it.
+    (input() as HTMLTextAreaElement).setSelectionRange(15, 15);
+    fireEvent.keyDown(input(), { key: "Backspace" });
+    expect(input()).toHaveValue("!cat  ");
+    expect(screen.queryByTestId("new-chat-landing-error")).toBeNull();
+
+    type("!cat README.md");
+    expect(screen.queryByTestId("new-chat-landing-error")).toBeNull();
+    fireEvent.click(submit);
+    await waitFor(() =>
+      expect(setPendingInitialPromptMock).toHaveBeenCalledWith(
+        "conv_new",
+        expect.objectContaining({ text: "!cat README.md" }),
+      ),
+    );
+  });
+
+  it("does not offer shell mode on a harness without native `!` input", () => {
+    landingAgent("claude-sdk");
+    renderLanding();
+    type("!git status");
+    expect(screen.queryByTestId("composer-shell-mode-indicator")).toBeNull();
+    expect(screen.queryByTestId("composer-highlight-overlay")).toBeNull();
+  });
+});
+
+describe("New Chat composer engine", () => {
+  beforeEach(() => setupLandingMocks());
+  afterEach(() => {
+    cleanup();
+    resetCodeMirrorComposerLoadForTests();
+    vi.restoreAllMocks();
+  });
+
+  it("writes in CodeMirror and starts a chat from a typed prompt when the flag is on", async () => {
+    resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding({
+      features: {
+        harness_install: false,
+        codex_plan_at_launch: true,
+        chat_composer_codemirror: true,
+      },
+    });
+    await waitFor(() =>
+      expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
+    );
+    const editor = screen.getByTestId("new-chat-landing-input");
+    act(() => insertComposerText(composerTargetOf(editor)!, "ship it"));
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await readCreateBody();
+    await waitFor(() =>
+      expect(setPendingInitialPromptMock).toHaveBeenCalledWith(
+        "conv_new",
+        expect.objectContaining({ text: "ship it" }),
+      ),
+    );
+  });
+
+  it("keeps the textarea-only mirror class off the editor once a session is tagged", async () => {
+    resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+    mockAgents([
+      testAgent("sdk1", "my-sdk-agent", { display_name: "SDK Agent", harness: "claude-sdk" }),
+    ]);
+    useConversationsMock.mockReturnValue({
+      data: {
+        pages: [
+          {
+            data: [{ id: "s_alpha", object: "conversation", title: "Alpha planning", labels: {} }],
+          },
+        ],
+      },
+    });
+    renderLanding({
+      features: {
+        harness_install: false,
+        codex_plan_at_launch: true,
+        chat_composer_codemirror: true,
+      },
+    });
+    await waitFor(() =>
+      expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
+    );
+    const editor = screen.getByTestId("new-chat-landing-input");
+
+    act(() => insertComposerText(composerTargetOf(editor)!, "@"));
+    fireEvent.click(screen.getByTestId("session-mention-category-sessions"));
+    fireEvent.click(screen.getByTitle("Tag session Alpha planning"));
+
+    expect(composerTargetOf(editor)?.value).toBe("@Alpha planning ");
+    expect(editor).not.toHaveClass("text-transparent");
+  });
+
+  const commandMarks = () =>
+    Array.from(document.querySelectorAll('[data-testid="composer-command-token"]'), (mark) => [
+      mark.textContent,
+      mark.className,
+    ]);
+  async function typeInEditor(harness: string, value: string) {
+    resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+    mockAgents([
+      testAgent("a1", `${harness}-ui`, {
+        display_name: harness,
+        harness,
+        skills: [{ name: "team", description: "Run a team" }],
+      }),
+    ]);
+    renderLanding({
+      features: {
+        harness_install: false,
+        codex_plan_at_launch: true,
+        chat_composer_codemirror: true,
+      },
+    });
+    await waitFor(() =>
+      expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
+    );
+    const editor = screen.getByTestId("new-chat-landing-input");
+    act(() => insertComposerText(composerTargetOf(editor)!, value));
+    return editor;
+  }
+
+  it("tints a known skill in CodeMirror but not an unknown command", async () => {
+    const editor = await typeInEditor("claude-sdk", "/team fix the bug");
+    expect(commandMarks()).toEqual([["/team", COMMAND_TOKEN_CLASS]]);
+    expect(editor).toHaveAttribute("data-slash-command", "true");
+
+    act(() => insertComposerText(composerTargetOf(editor)!, "/typo", 0, 5));
+    expect(commandMarks()).toEqual([]);
+    expect(editor).not.toHaveAttribute("data-slash-command");
+  });
+
+  it("tints a claude-native `!` in CodeMirror, even with its command right after it, and sends it unchanged", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    const editor = await typeInEditor("claude-native", "!pwd");
+    expect(commandMarks()).toEqual([["!", COMMAND_TOKEN_CLASS]]);
+    expect(editor).toHaveAttribute("data-shell-command", "true");
+    expect(editor).toHaveAccessibleDescription("Shell command");
+
+    const submit = screen.getByTestId("new-chat-landing-submit");
+    await waitFor(() => expect(submit).toBeEnabled());
+    fireEvent.click(submit);
+    await waitFor(() =>
+      expect(setPendingInitialPromptMock).toHaveBeenCalledWith(
+        "conv_new",
+        expect.objectContaining({ text: "!pwd" }),
+      ),
+    );
+  });
+
+  it("keeps the textarea when the flag is off", () => {
+    renderLanding();
+    expect(screen.getByTestId("new-chat-landing-input").tagName).toBe("TEXTAREA");
+    expect(document.querySelector('[data-composer-engine="codemirror"]')).toBeNull();
+    expect(codeMirrorComposerLoad().status).toBe("idle");
   });
 });

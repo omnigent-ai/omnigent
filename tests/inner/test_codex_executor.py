@@ -6013,6 +6013,21 @@ async def test_codex_cli_version_parses_output(
     assert await _codex_cli_version("/usr/local/bin/codex") == expected
 
 
+async def test_codex_cli_version_runs_wrapper_prefix_before_version_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A configured wrapper is probed with its args ahead of ``--version``."""
+    calls: list[tuple[Any, ...]] = []
+
+    async def _fake_exec(*args: Any, **_kwargs: Any) -> _FakeVersionProcess:
+        calls.append(args)
+        return _FakeVersionProcess(stdout=b"codex-cli 0.154.0\n")
+
+    monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", _fake_exec)
+    assert await _codex_cli_version("user-codex-wrapper", "codex", "--") == (0, 154, 0)
+    assert calls == [("user-codex-wrapper", "codex", "--", "--version")]
+
+
 async def test_codex_cli_version_returns_none_on_oserror(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6072,6 +6087,45 @@ async def test_codex_cli_version_times_out_and_kills_proc(
     assert await _codex_cli_version("/usr/local/bin/codex") is None
     # The stuck process was killed, not leaked.
     assert proc.killed is True
+
+
+async def test_codex_cli_version_cancellation_reaps_and_closes_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = asyncio.Event()
+    pending = asyncio.Event()
+
+    class _CancelledProbe(_FakeVersionProcess):
+        killed = False
+        reaped = False
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            started.set()
+            await pending.wait()
+            return b"", b""
+
+        def kill(self) -> None:
+            self.killed = True
+
+        async def wait(self) -> int:
+            self.reaped = True
+            return -9
+
+    proc = _CancelledProbe(stdout=b"")
+    closed: list[Any] = []
+
+    async def fake_exec(*_args: Any, **_kwargs: Any) -> _CancelledProbe:
+        return proc
+
+    monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", fake_exec)
+    monkeypatch.setattr("omnigent.inner.codex_executor.close_subprocess_transport", closed.append)
+    task = asyncio.create_task(_codex_cli_version("codex-wrapper", "codex", "--"))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert proc.killed and proc.reaped
+    assert closed == [proc]
 
 
 @pytest.mark.parametrize(

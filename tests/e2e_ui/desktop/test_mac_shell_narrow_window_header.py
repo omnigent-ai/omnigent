@@ -1,7 +1,8 @@
 """Narrow-window layout beside the macOS desktop shell's window controls.
 
 Electron lets the window shrink to 720px, below the SPA's 1181px mobile-layout
-breakpoint. These tests emulate the macOS shell in Chromium, as
+breakpoint. The desktop app keeps the desktop layout there. These tests emulate
+the macOS shell in Chromium, as
 ``tests/e2e_ui/sessions/test_session_search.py`` does.
 """
 
@@ -102,40 +103,46 @@ def _open_session_in_mac_shell(
     return page
 
 
-def _shrink_window_and_open_sidebar(page: Page) -> Locator:
-    # A CSS locator: the collapsed sidebar is aria-hidden, so a role query would miss it.
-    aside = page.locator('aside[aria-label="Conversations"]')
-    page.locator(".electron-sidebar-header-actions").get_by_role(
-        "button", name="Close sidebar", exact=True
-    ).click()
-    expect(aside).to_have_attribute("data-collapsed", "true")
-    # Park the pointer over the chat: left where it is, it lands on the narrow
-    # header's "Open sidebar" toggle, and a slow run dwells long enough to peek.
-    page.mouse.move(_NARROW_VIEWPORT["width"] / 2, _NARROW_VIEWPORT["height"] / 2)
-
+def _shrink_window(page: Page) -> Locator:
+    """Narrow the window below the mobile breakpoint; the docked sidebar must stay."""
     page.set_viewport_size(_NARROW_VIEWPORT)
-    open_sidebar = page.get_by_role("button", name="Open sidebar", exact=True)
-    expect(open_sidebar).to_be_visible()
-    assert not _intersects_window_controls(open_sidebar.bounding_box()), (
-        f"Open sidebar button {open_sidebar.bounding_box()} sits under the window controls"
-    )
-    open_sidebar.click()
-    expect(aside).not_to_have_attribute("data-collapsed", "true")
-    page.wait_for_function(
-        "() => document.querySelector('aside[aria-label=\"Conversations\"]')"
-        ".getBoundingClientRect().x === 0"
-    )
+    # A CSS locator, matching how the collapsed (aria-hidden) sidebar is found elsewhere.
+    aside = page.locator('aside[aria-label="Conversations"]')
+    _expect_docked_sidebar(page, aside)
     return aside
 
 
-def test_narrow_window_sidebar_header_stays_clear_of_window_controls(
+def _expect_docked_sidebar(page: Page, aside: Locator) -> None:
+    expect(aside).not_to_have_attribute("data-collapsed", "true")
+    # Docked beside the chat, not the mobile layout's full-window drawer.
+    page.wait_for_function(
+        """(windowWidth) => {
+          const rect = document
+            .querySelector('aside[aria-label="Conversations"]')
+            .getBoundingClientRect();
+          return rect.x === 0 && rect.width > 0 && rect.width < windowWidth / 2;
+        }""",
+        arg=_NARROW_VIEWPORT["width"],
+    )
+
+
+def test_narrow_window_keeps_the_desktop_layout(
     request: pytest.FixtureRequest, seeded_session: tuple[str, str]
 ) -> None:
     base_url, session_id = seeded_session
     page = _open_session_in_mac_shell(request, base_url, session_id)
-    aside = _shrink_window_and_open_sidebar(page)
+    expect(page.locator("html")).to_have_attribute("data-desktop-app", "true")
+    aside = _shrink_window(page)
     _hold_for_recording(page)
 
+    # The title-bar cluster beside the lights stays; the phone header's toggle does not appear.
+    title_bar_actions = page.locator(".electron-sidebar-header-actions")
+    close_sidebar = title_bar_actions.get_by_role("button", name="Close sidebar", exact=True)
+    expect(close_sidebar).to_be_visible()
+    assert not _intersects_window_controls(close_sidebar.bounding_box()), (
+        f"Close sidebar button {close_sidebar.bounding_box()} sits under the window controls"
+    )
+    expect(page.locator(".chat-header-sidebar-toggle")).to_be_hidden()
     brand = aside.get_by_test_id("sidebar-brand")
     expect(brand).to_be_visible()
     assert not _intersects_window_controls(brand.bounding_box()), (
@@ -145,28 +152,47 @@ def test_narrow_window_sidebar_header_stays_clear_of_window_controls(
         page.get_by_role("button", name="Search", exact=True).filter(visible=True)
     ).to_have_count(1)
 
+    # Plain Enter sends, as in a wide window; the mobile layout makes it a newline.
+    composer = page.get_by_role("textbox", name="Message the agent")
+    composer.click(timeout=5_000)
+    composer.fill("sent from a narrow window")
+    composer.press("Enter")
+    expect(composer).to_have_value("")
+    expect(page.get_by_text("sent from a narrow window", exact=True).first).to_be_visible(
+        timeout=30_000
+    )
+
+    close_sidebar.click()
+    expect(aside).to_have_attribute("data-collapsed", "true")
+    open_sidebar = title_bar_actions.get_by_role("button", name="Open sidebar", exact=True)
+    expect(open_sidebar).to_be_visible()
+    assert not _intersects_window_controls(open_sidebar.bounding_box()), (
+        f"Open sidebar button {open_sidebar.bounding_box()} sits under the window controls"
+    )
+    open_sidebar.click()
+    _expect_docked_sidebar(page, aside)
+
 
 def test_narrow_window_command_palette_clears_window_controls(
     request: pytest.FixtureRequest, seeded_session: tuple[str, str]
 ) -> None:
     base_url, session_id = seeded_session
     page = _open_session_in_mac_shell(request, base_url, session_id)
-    _shrink_window_and_open_sidebar(page)
+    _shrink_window(page)
 
     page.get_by_role("button", name="Search", exact=True).filter(visible=True).first.click()
     palette = page.get_by_role("dialog", name="Command palette", exact=True)
     search_field = palette.get_by_role("combobox")
     expect(search_field).to_be_visible()
-    expect(palette).to_have_css("transform", "none")
     _hold_for_recording(page)
 
     assert not _intersects_window_controls(search_field.bounding_box()), (
         f"palette search field {search_field.bounding_box()} sits under the window controls"
     )
+    # The desktop palette is a centered dialog, not the mobile layout's full-window sheet.
     sheet = palette.bounding_box()
-    assert sheet is not None and abs(sheet["x"]) < 1, f"palette sheet {sheet} is not flush left"
-    assert abs(sheet["width"] - _NARROW_VIEWPORT["width"]) < 1, (
-        f"palette sheet {sheet} does not span the {_NARROW_VIEWPORT['width']}px window"
+    assert sheet is not None and sheet["width"] < _NARROW_VIEWPORT["width"], (
+        f"palette {sheet} spans the {_NARROW_VIEWPORT['width']}px window like the mobile sheet"
     )
 
 
@@ -175,7 +201,7 @@ def test_narrow_window_settings_back_row_clears_window_controls(
 ) -> None:
     base_url, session_id = seeded_session
     page = _open_session_in_mac_shell(request, base_url, session_id)
-    aside = _shrink_window_and_open_sidebar(page)
+    aside = _shrink_window(page)
 
     aside.get_by_test_id("sidebar-profile-settings").click()
     back = page.get_by_role("link", name="Back", exact=True)
@@ -185,23 +211,6 @@ def test_narrow_window_settings_back_row_clears_window_controls(
     assert not _intersects_window_controls(back.bounding_box()), (
         f"settings Back link {back.bounding_box()} sits under the window controls"
     )
-
-
-def test_narrowing_window_collapses_open_sidebar(
-    request: pytest.FixtureRequest, seeded_session: tuple[str, str]
-) -> None:
-    base_url, session_id = seeded_session
-    page = _open_session_in_mac_shell(request, base_url, session_id)
-    aside = page.locator('aside[aria-label="Conversations"]')
-    expect(aside).not_to_have_attribute("data-collapsed", "true")
-
-    page.set_viewport_size(_NARROW_VIEWPORT)
-    _hold_for_recording(page)
-
-    expect(aside).to_have_attribute("data-collapsed", "true")
-    composer = page.get_by_role("textbox", name="Message the agent")
-    composer.click(timeout=5_000)
-    expect(composer).to_be_focused()
 
 
 def test_narrow_window_title_bar_stays_draggable(
@@ -214,16 +223,7 @@ def test_narrow_window_title_bar_stays_draggable(
         f"empty title-bar points not draggable at {_WIDE_VIEWPORT['width']}px: {wide_points}"
     )
 
-    page.set_viewport_size(_NARROW_VIEWPORT)
-    expect(page.locator('aside[aria-label="Conversations"]')).to_have_attribute(
-        "data-collapsed", "true"
-    )
-    # The docked sidebar's width and fade transitions can end a frame apart; sample once
-    # both have settled.
-    page.wait_for_function(
-        "() => !document.getAnimations().some((animation) => animation instanceof CSSTransition)"
-    )
-    expect(page.get_by_role("button", name="Open sidebar", exact=True)).to_be_visible()
+    _shrink_window(page)
     _hold_for_recording(page)
 
     narrow_points = _undraggable_empty_title_bar_points(page)

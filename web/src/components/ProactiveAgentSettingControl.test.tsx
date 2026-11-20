@@ -1,7 +1,14 @@
+import type { ReactElement } from "react";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ProactiveAgentSettings } from "@/hooks/useProactiveAgentSettings";
 import { ProactiveAgentSettingControl } from "./ProactiveAgentSettingControl";
+
+/** The controls read the router's location, so each render sits inside one. */
+function renderInRouter(ui: ReactElement) {
+  return render(<MemoryRouter>{ui}</MemoryRouter>);
+}
 
 const mocks = vi.hoisted(() => ({
   available: true,
@@ -40,13 +47,13 @@ afterEach(cleanup);
 describe("ProactiveAgentSettingControl", () => {
   it("renders nothing where the server does not offer Omni Advisor", () => {
     mocks.available = false;
-    const { container } = render(<ProactiveAgentSettingControl scope="me" />);
+    const { container } = renderInRouter(<ProactiveAgentSettingControl scope="me" />);
     expect(container).toBeEmptyDOMElement();
   });
 
   it("says the settings are loading rather than hiding the switch", () => {
     mocks.settings = undefined;
-    render(<ProactiveAgentSettingControl scope="workspace" />);
+    renderInRouter(<ProactiveAgentSettingControl scope="workspace" />);
     expect(screen.getByText("Loading...")).toBeInTheDocument();
     expect(screen.queryByRole("switch")).toBeNull();
   });
@@ -56,7 +63,7 @@ describe("ProactiveAgentSettingControl", () => {
     (scope) => {
       mocks.settings = undefined;
       mocks.query.isError = true;
-      render(<ProactiveAgentSettingControl scope={scope} />);
+      renderInRouter(<ProactiveAgentSettingControl scope={scope} />);
       expect(screen.getByRole("alert")).toHaveTextContent("Couldn’t load Omni Advisor settings.");
       expect(screen.queryByRole("switch")).toBeNull();
 
@@ -66,7 +73,7 @@ describe("ProactiveAgentSettingControl", () => {
   );
 
   it("turns the viewer's own setting off", () => {
-    render(<ProactiveAgentSettingControl scope="me" />);
+    renderInRouter(<ProactiveAgentSettingControl scope="me" />);
     const toggle = screen.getByRole("switch", { name: "Omni Advisor" });
     expect(toggle).toBeChecked();
 
@@ -80,7 +87,7 @@ describe("ProactiveAgentSettingControl", () => {
 
   it("shows the viewer's switch off and locked when an admin turned it off", () => {
     mocks.settings = settings({ workspace_enabled: false, enabled: false });
-    render(<ProactiveAgentSettingControl scope="me" />);
+    renderInRouter(<ProactiveAgentSettingControl scope="me" />);
 
     const toggle = screen.getByRole("switch", { name: "Omni Advisor" });
     expect(toggle).not.toBeChecked();
@@ -91,12 +98,12 @@ describe("ProactiveAgentSettingControl", () => {
   });
 
   it("offers the workspace switch only to callers who can manage it", () => {
-    const { container } = render(<ProactiveAgentSettingControl scope="workspace" />);
+    const { container } = renderInRouter(<ProactiveAgentSettingControl scope="workspace" />);
     expect(container).toBeEmptyDOMElement();
     cleanup();
 
     mocks.settings = settings({ can_manage_workspace: true });
-    render(<ProactiveAgentSettingControl scope="workspace" />);
+    renderInRouter(<ProactiveAgentSettingControl scope="workspace" />);
     fireEvent.click(screen.getByRole("switch", { name: "Omni Advisor" }));
     expect(mocks.mutate).toHaveBeenCalledWith(
       { scope: "workspace", enabled: false },

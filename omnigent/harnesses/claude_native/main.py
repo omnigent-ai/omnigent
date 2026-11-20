@@ -756,6 +756,8 @@ def claude_config_with_launch_model_pinned(
         env set.
     """
     from omnigent.models.claude_model_vocabulary import (
+        LONG_CONTEXT_MARKER,
+        alias_pins,
         claude_model_command_arg,
         normalized_model_id,
     )
@@ -770,10 +772,27 @@ def claude_config_with_launch_model_pinned(
     model = launch_model.strip()
     if model in _UCODE_CLAUDE_TIER_TO_ENV or model == _UCODE_CLAUDE_CUSTOM_TIER:
         return claude_config
-    if claude_model_command_arg(model, claude_config.env) is not None:
-        # Already speakable: an alias pinned to exactly this id, or the
-        # custom slot already holding it.
+    custom_slot = claude_config.env.get(_ANTHROPIC_CUSTOM_MODEL_OPTION_ENV, "").strip()
+    speakable = claude_model_command_arg(model, claude_config.env)
+    resolved_speakable = (
+        alias_pins(claude_config.env).get(speakable, speakable) if speakable is not None else None
+    )
+    wants_marker = model.lower().endswith(LONG_CONTEXT_MARKER)
+    if (
+        speakable is not None
+        and speakable != custom_slot
+        and resolved_speakable is not None
+        and resolved_speakable.lower().endswith(LONG_CONTEXT_MARKER) == wants_marker
+    ):
+        # A family alias preserves the window only when its configured pin
+        # carries the same marker.
         return claude_config
+    if custom_slot == model:
+        # The slot already holds this id byte-for-byte, marker included.
+        return claude_config
+    # Otherwise (re)write the slot to the launch model. A slot that matches only
+    # once ``[1m]`` is stripped would make ``/model`` re-select the bare id and
+    # fall back to 200K, so the slot must carry the marked spelling verbatim.
     normalized = normalized_model_id(model)
     tier = next(
         (family for family in _UCODE_CLAUDE_TIER_TO_ENV if family in normalized.split("-")),
@@ -2810,6 +2829,28 @@ def _carries_any_payload(text: str, payloads: list[str]) -> bool:
     return any(item in compact or item.rstrip("=") in compact for item in payloads)
 
 
+def _blank_read_file_payload(value: object, payloads: list[str]) -> object:
+    """
+    Blank a duplicated payload in Claude Code's own Read metadata.
+
+    Image and PDF Read results store ``{"type": ..., "file": {"base64": ...}}``;
+    current Claude Code writes ``base64`` empty, the shape its renderer expects.
+
+    :param value: A record's ``toolUseResult`` object.
+    :param payloads: Base64 payloads present in the structured content.
+    :returns: *value* with ``file.base64`` emptied, or *value* unchanged.
+    """
+    if not isinstance(value, dict):
+        return value
+    file_meta = value.get("file")
+    if not isinstance(file_meta, dict):
+        return value
+    data = file_meta.get("base64")
+    if not isinstance(data, str) or not _carries_any_payload(data, payloads):
+        return value
+    return {**value, "file": {**file_meta, "base64": ""}}
+
+
 def _repair_cloned_tool_use_result(
     payload: _JsonObject,
     blocks: list[_JsonObject],
@@ -2822,7 +2863,8 @@ def _repair_cloned_tool_use_result(
     structured content. Matching is spelling-insensitive: the content blocks hold
     canonical base64 while the metadata may hold the producer's wrapped or
     unpadded original, so an exact substring test would miss the duplicate it is
-    meant to find. A redacted passthrough is preferred; when the payload survives
+    meant to find. A redacted passthrough is preferred, keeping Claude Code's Read
+    metadata shape via :func:`_blank_read_file_payload`; when the payload survives
     that (a JSON string literal wrapping mixed text-plus-image, which structured
     redaction cannot reach), the canonical redacted block list replaces it.
 
@@ -2843,7 +2885,7 @@ def _repair_cloned_tool_use_result(
     if isinstance(tool_use_result, str):
         candidate: object = _json_safe_tool_use_result(tool_use_result)
     else:
-        candidate = _redact_binary_blocks(tool_use_result)
+        candidate = _redact_binary_blocks(_blank_read_file_payload(tool_use_result, payloads))
     candidate_text = candidate if isinstance(candidate, str) else json.dumps(candidate)
     if _carries_any_payload(candidate_text, payloads):
         candidate = json.dumps(_redact_binary_blocks(blocks), separators=(",", ":"))

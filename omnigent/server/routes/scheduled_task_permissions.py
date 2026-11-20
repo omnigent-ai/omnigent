@@ -60,6 +60,9 @@ _logger = logging.getLogger(__name__)
 
 # Fields that decide where an automation's runs happen, and so what its grantees see.
 _TARGET_FIELDS = ("session_id", "host_id", "workspace", "execution_target")
+# Why an automation its store cannot keep grants for can't be shared; the web app says the same.
+# Sharing and cloning both need automations_v2, so a server that refuses this can clone.
+UNSHAREABLE_AUTOMATION_MESSAGE = "This is a legacy automation. Clone it, then share the copy."
 
 
 class ScheduledTaskPermissionObject(BaseModel):
@@ -154,6 +157,16 @@ def scheduled_task_sharing_supported(state: Any, permission_store: PermissionSto
     return stores_scheduled_task_grants(permission_store) and state.feature_flags.enabled(
         Feature.AUTOMATIONS_V2
     )
+
+
+def scheduled_task_shareable(permission_store: PermissionStore | None, task_id: str) -> bool:
+    """Whether the automation itself can be shared, apart from server-wide support.
+
+    ``/v1/info`` reports server-wide support (:func:`scheduled_task_sharing_supported`),
+    so this is only the store's answer, and ``True`` without a store. It does no I/O,
+    so a list asks for every row.
+    """
+    return permission_store is None or permission_store.scheduled_task_shareable(task_id)
 
 
 def has_scheduled_task_grants(permission_store: PermissionStore | None, task_id: str) -> bool:
@@ -457,9 +470,9 @@ def register_scheduled_task_permissions_routes(
         :param body: The grant request with ``user_id`` and ``level``.
         :returns: The resulting grant.
         :raises OmnigentError: 404 when the caller does not own the automation, 403
-            for an agent, a server that cannot share automations or the sharing
-            policy, 400 for an empty or over-long ID, the owner,
-            ``__public__`` or a level other than read.
+            for an agent, a server that cannot share automations, the sharing policy
+            or an automation its store cannot keep grants for, 400 for an empty or
+            over-long ID, the owner, ``__public__`` or a level other than read.
         """
         store = require_sharing(request, granting=True)
         task = await owned_task(request, scheduled_task_id)
@@ -487,6 +500,9 @@ def register_scheduled_task_permissions_routes(
                 task, task.host_id, getattr(request.app.state, "host_registry", None)
             ),
         )
+        # After the sharing policy, so sharing off is the reason given, as in the web app.
+        if not store.scheduled_task_shareable(task.id):
+            raise OmnigentError(UNSHAREABLE_AUTOMATION_MESSAGE, code=ErrorCode.FORBIDDEN)
         [(grantee, level)] = await asyncio.to_thread(
             store.validate_grants, [(body.user_id, body.level)]
         )

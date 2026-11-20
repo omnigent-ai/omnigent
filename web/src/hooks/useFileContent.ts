@@ -117,6 +117,16 @@ export async function fetchFileContent(
     const viaApi = await readFileViaWorkspaceApi(conversationId, path, signal, sshTarget);
     if (viaApi) return viaApi;
   }
+  return fetchFileContentViaRest(conversationId, path, signal, query);
+}
+
+/** {@link fetchFileContent} through the REST route only, for a caller that already asked the API. */
+export async function fetchFileContentViaRest(
+  conversationId: string,
+  path: string,
+  signal?: AbortSignal,
+  query: { scope?: "workspace" } = {},
+): Promise<FileContentResponse> {
   const res = await authenticatedFetch(workspaceFileUrl(conversationId, path, query), { signal });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   // Older servers ignore scope; automatic previews must fail closed there.
@@ -235,6 +245,23 @@ export function fileContentPollInterval(
 }
 
 /**
+ * The query for one file's contents, shared by the viewer and prefetch so a
+ * prefetched file opens from the cache.
+ */
+export function fileContentQuery(serverId: string, path: string, sshTarget?: string | null) {
+  return {
+    queryKey: ["file-content", serverId, path],
+    queryFn: async ({ signal }: { signal: AbortSignal }) => {
+      await fileWritesSettled(serverId, path);
+      // Cancelled while waiting (a newer write started): don't send the read.
+      signal.throwIfAborted();
+      return fetchFileContent(serverId, path, signal, { sshTarget });
+    },
+    staleTime: 5_000,
+  };
+}
+
+/**
  * Fetch the content of a workspace file for the given conversation.
  *
  * Disabled (no request made) when `conversationId` or `path` is
@@ -294,15 +321,8 @@ export function useFileContent(
   }, [serverId, path, sessionActive, visible, queryClient]);
 
   return useQuery({
-    queryKey: ["file-content", serverId, path],
-    queryFn: async ({ signal }) => {
-      await fileWritesSettled(serverId!, path!);
-      // Cancelled while waiting (a newer write started): don't send the read.
-      signal.throwIfAborted();
-      return fetchFileContent(serverId!, path!, signal, { sshTarget: options.sshTarget });
-    },
+    ...fileContentQuery(serverId ?? "", path ?? "", options.sshTarget),
     enabled: !!serverId && !!path && serveable !== false,
-    staleTime: 5_000,
     refetchInterval: visible
       ? (query) => fileContentPollInterval(query.state.data, query.state.status === "error")
       : false,
