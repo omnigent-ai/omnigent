@@ -39,6 +39,7 @@ const { createConnectionLoading } = require("./connection_loading");
 const { createAboutWindow, resolveAppIconDataUrl } = require("./about_window");
 const { registerFileReveal } = require("./fileReveal");
 const { registerFolderChooser } = require("./folderChooser");
+const { readFindSeed } = require("./findSeed");
 const fs = require("node:fs");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
@@ -3220,6 +3221,10 @@ function attachContextMenu(win) {
  * @type {Map<BrowserWindow, BrowserWindow>} shell window → its find bar
  */
 const findBars = new Map();
+/** Count of find opens per shell window, so only the latest selection read applies. */
+const findOpenGenerations = new WeakMap();
+/** Per find bar, resolves once it has shown and its page can take a prefill. */
+const findBarsShown = new WeakMap();
 
 /**
  * Anchor a find bar to its parent's top-right content corner. Called at
@@ -3248,13 +3253,26 @@ function positionFindBar(target, bar) {
  * @param {BrowserWindow} target The shell window to search.
  */
 function openFindBar(target) {
+  const existing = findBars.get(target);
+  const isOpen = existing !== undefined && !existing.isDestroyed();
+  const generation = (findOpenGenerations.get(target) ?? 0) + 1;
+  findOpenGenerations.set(target, generation);
+  // Cmd/Ctrl+F from inside the bar keeps its query; from the page, a selection
+  // replaces it. Read before find-opened re-renders the transcript.
+  const seed =
+    isOpen && existing.isFocused() ? Promise.resolve(null) : readFindSeed(target.webContents);
+  // A later open, even from inside the bar, supersedes a read still in flight.
+  const prefill = (bar) =>
+    Promise.all([seed, findBarsShown.get(bar)]).then(([text]) => {
+      if (findOpenGenerations.get(target) === generation) prefillFindBar(bar, text);
+    });
   // The menu item opens the bar without a page keydown; the page must still
   // render every transcript row for find to reach off-screen messages.
   target.webContents.send("omnigent:find-opened");
-  const existing = findBars.get(target);
-  if (existing && !existing.isDestroyed()) {
+  if (isOpen) {
     existing.focus();
     existing.webContents.send("omnigent:find-activate");
+    void prefill(existing);
     return;
   }
   const bar = new BrowserWindow({
@@ -3275,6 +3293,12 @@ function openFindBar(target) {
     },
   });
   findBars.set(target, bar);
+  findBarsShown.set(
+    bar,
+    new Promise((resolve) => {
+      bar.once("ready-to-show", resolve);
+    }),
+  );
   void bar.loadFile(FIND_PAGE);
 
   const reposition = () => positionFindBar(target, bar);
@@ -3299,6 +3323,7 @@ function openFindBar(target) {
     reposition();
     bar.show();
   });
+  void prefill(bar);
   bar.on("closed", () => {
     findBars.delete(target);
     if (target.isDestroyed()) return;
@@ -3312,6 +3337,12 @@ function openFindBar(target) {
     target.webContents.stopFindInPage("clearSelection");
     target.focus();
   });
+}
+
+// Make the page's selected text the bar's query; a null seed leaves the bar as is.
+function prefillFindBar(bar, text) {
+  if (text === null || bar.isDestroyed()) return;
+  bar.webContents.send("omnigent:find-prefill", { text });
 }
 
 /** The conversation a shell URL shows, or null. Routes end in `/c/<id>` after any mount. */
