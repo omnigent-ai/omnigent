@@ -129,6 +129,8 @@ export function QuickPickCommandPalette({
             label: action.label,
             keywords: action.keywords,
             group: "Actions",
+            // A command is a short name; a quiet underline marks the words the query hit.
+            matchHighlight: "underline",
             icon: <action.icon />,
             shortcut: action.shortcut,
             value: { kind: "action", action },
