@@ -7567,6 +7567,8 @@ function NewChatLandingContent({
     </NewChatWorkspaceControls>
   );
 
+  // The chord the panel advertises beside Send, in ARIA's spelling.
+  const sendKeyShortcuts = submitWithModEnter ? `${ARIA_MOD_KEY}+Enter` : "Enter";
   let composerAppearance: "panel" | "glass" | "default" = "default";
   if (floating) composerAppearance = "panel";
   else if (isMobileViewport) composerAppearance = "glass";
@@ -8318,7 +8320,7 @@ function NewChatLandingContent({
                     {/* Plain ↵ adds a line in the panel, so its send chord stays in view. */}
                     {floating && (
                       <span className="px-1" data-testid="new-chat-landing-send-shortcut">
-                        <CompactShortcutKeys keys={composerSendShortcutKeys(true)} />
+                        <CompactShortcutKeys keys={composerSendShortcutKeys(submitWithModEnter)} />
                       </span>
                     )}
                     <TooltipProvider>
@@ -8361,7 +8363,7 @@ function NewChatLandingContent({
                               disabled={!canSubmit}
                               label={creating ? "Starting session" : "Start session"}
                               busy={creating}
-                              aria-keyshortcuts={floating ? `${ARIA_MOD_KEY}+Enter` : undefined}
+                              aria-keyshortcuts={floating ? sendKeyShortcuts : undefined}
                               data-testid="new-chat-landing-submit"
                             />
                           </span>
