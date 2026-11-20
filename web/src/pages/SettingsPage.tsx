@@ -361,14 +361,16 @@ import {
   notifyHiddenPickerAgentsChanged,
 } from "@/lib/pickerEntryVisibility";
 import {
-  applyThemePalette,
   DEFAULT_PALETTE,
   isThemeSelection,
   PALETTES,
-  readThemePalette,
   type ThemeSelection,
-  writeThemePalette,
 } from "@/lib/themePalette";
+import {
+  commitThemePalette,
+  reloadThemePalette,
+  useThemePaletteSelection,
+} from "@/store/themePalette";
 import {
   applyCustomTheme,
   createCustomThemeFromPalette,
@@ -887,15 +889,14 @@ function ColorThemeControl() {
   // Render each chip in the currently-resolved mode so it matches the app now
   // (honoring the embed's forced theme, not just next-themes' resolvedTheme).
   const isDark = useResolvedThemeMode() === "dark";
-  const [selection, setSelection] = useState<ThemeSelection>(() => readThemePalette());
+  // Shared with the theme picker, so a palette chosen there shows here.
+  const selection = useThemePaletteSelection();
   const [customTheme, setCustomTheme] = useState<CustomTheme>(() => readCustomTheme());
 
   const choose = useCallback(
     (next: ThemeSelection) => {
       if (next === "custom") applyCustomTheme(customTheme);
-      setSelection(next);
-      writeThemePalette(next);
-      applyThemePalette(next);
+      commitThemePalette(next);
     },
     [customTheme],
   );
@@ -921,9 +922,7 @@ function ColorThemeControl() {
       setCustomTheme(next);
       writeCustomTheme(next);
       applyCustomTheme(next);
-      setSelection("custom");
-      writeThemePalette("custom");
-      applyThemePalette("custom");
+      commitThemePalette("custom");
     },
     [customTheme, selection],
   );
@@ -1235,8 +1234,7 @@ function AppearanceSection() {
 
     writeTerminalThemeMode(TERMINAL_THEME_DEFAULT);
 
-    writeThemePalette(DEFAULT_PALETTE);
-    applyThemePalette(DEFAULT_PALETTE);
+    commitThemePalette(DEFAULT_PALETTE);
     writeCustomTheme(DEFAULT_CUSTOM_THEME);
     applyCustomTheme(DEFAULT_CUSTOM_THEME);
 
@@ -1325,7 +1323,7 @@ function AppearanceSection() {
       if (themeMode && isThemeMode(themeMode)) setTheme(themeMode);
       applyStoredUiFontSize();
       applyUiFontFamily(readUiFontFamily());
-      applyThemePalette(readThemePalette());
+      reloadThemePalette();
       applyCustomTheme(readCustomTheme());
 
       setIsImportDialogOpen(false);
