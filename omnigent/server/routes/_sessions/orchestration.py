@@ -2989,10 +2989,19 @@ def _stopped_session_answer_text(
     return "\n\n".join(lines)
 
 
+def _recovery_record_changed(key: tuple[str, str], record: _StoppedSessionAnswer | None) -> bool:
+    """Return whether another request replaced, started or finished this question's recovery."""
+    current = _stopped_session_answers.get(key)
+    return current is not record or (
+        current is not None
+        and (current.delivery is not None or current.acknowledgement is not None)
+    )
+
+
 def _report_conflict_as_unavailable(
     deliver: Callable[..., Awaitable[dict[str, Any] | None]],
 ) -> Callable[..., Awaitable[dict[str, Any] | None]]:
-    """Raise a recovery 409 as 503: clients read a 409 as an already answered question."""
+    """Raise a recovery 409 as 503: clients such as Slack read a 409 as an answered question."""
 
     @functools.wraps(deliver)
     async def _wrapped(*args: Any, **kwargs: Any) -> dict[str, Any] | None:
@@ -3001,6 +3010,7 @@ def _report_conflict_as_unavailable(
         except OmnigentError as exc:
             if exc.http_status != 409:
                 raise
+            _logger.info("An answer was not delivered (%s: %s); reporting 503", exc.code, exc)
             raise OmnigentError(exc.message, code=ErrorCode.RUNNER_UNAVAILABLE) from exc
 
     return _wrapped
@@ -3022,9 +3032,8 @@ async def _deliver_answer_to_stopped_session(
     Send an AskUserQuestion answer as a user message when the session's runner stays gone.
 
     The message path relaunches the runner; the card closes only after it accepts the message.
-    A session with no host in its chain is left to its hook: nothing can relaunch its runner.
     :returns: The acknowledgement (also for a later answer), or ``None``: the caller resolves it.
-    :raises OmnigentError: 403 on a policy denial, or the message path's error (a 409 as 503).
+    :raises OmnigentError: 403 on a policy denial, or the message path's error; a 409 as 503.
     """
     elicitation_id = data.get("elicitation_id")
     if post_event is None or not isinstance(request, Request):
@@ -3072,22 +3081,38 @@ async def _deliver_answer_to_stopped_session(
         or not _is_native_terminal_session(conv)
     ):
         return None
-    if conv.host_id is None and (
-        conversation_store is None
-        or await asyncio.to_thread(routing_host_id, conv, conversation_store) is None
-    ):
-        # No host in the chain can relaunch the runner, so the hook keeps the answer.
-        return None
+    if conv.host_id is None:
+        host_id = (
+            await asyncio.to_thread(routing_host_id, conv, conversation_store)
+            if conversation_store is not None
+            else None
+        )
+        if host_id is None:
+            # No host in the chain can relaunch the runner, so the hook keeps the answer.
+            _logger.info(
+                "Session has no host to relaunch its runner; %s goes to its hook",
+                elicitation_id,
+                extra={"session_id": session_id},
+            )
+            return None
+        if _recovery_record_changed(key, record):
+            # Another request changed this question's recovery record during the read.
+            return await _deliver_answer_to_stopped_session(
+                request,
+                session_id,
+                conv,
+                data,
+                runner_router,
+                post_event,
+                conversation_store=conversation_store,
+                runner_exit_reports=runner_exit_reports,
+            )
     # Check the runner on a first answer or under the same runner id; a new runner never asked.
     if record is None or record.runner_id == conv.runner_id:
         hook_can_take = await _session_runner_reachable(
             request, session_id, conv, runner_router, conversation_store, runner_exit_reports
         )
-        current = _stopped_session_answers.get(key)
-        if current is not record or (
-            current is not None
-            and (current.delivery is not None or current.acknowledgement is not None)
-        ):
+        if _recovery_record_changed(key, record):
             # Another request changed this question's recovery record during the wait.
             return await _deliver_answer_to_stopped_session(
                 request,
@@ -3169,7 +3194,13 @@ async def _run_stopped_session_delivery(
             isinstance(current_params, dict)
             and _harness_elicitation_fingerprint_or_none(current_params) != record.fingerprint
         )
-        if not replaced:
+        if replaced:
+            _logger.info(
+                "A new question under %s keeps its card open",
+                elicitation_id,
+                extra={"session_id": session_id},
+            )
+        else:
             _close_answered_card(session_id, elicitation_id, params)
         return acknowledgement
     except Exception as exc:

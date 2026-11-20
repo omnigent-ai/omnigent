@@ -1,4 +1,4 @@
-"""Recovery records for answers on a stopped session: pruning, races and the runner check."""
+"""Answers on a stopped session: scope, records, races, error codes and the runner check."""
 
 from __future__ import annotations
 
@@ -207,7 +207,7 @@ _CURSOR_QUESTION = {
 async def test_an_answer_outside_the_question_scope_is_not_sent(
     question: _Question, monkeypatch: pytest.MonkeyPatch, case: str
 ) -> None:
-    """Only an accepted AskUserQuestion on a top-level native session can become a message."""
+    """Only an accepted Claude AskUserQuestion on a top-level native session becomes a message."""
 
     async def _post_event(*args: object, **kwargs: object) -> dict[str, bool]:
         raise AssertionError("an out-of-scope answer must not be delivered")
@@ -226,21 +226,20 @@ async def test_an_answer_outside_the_question_scope_is_not_sent(
     assert question.pending()
 
 
-@pytest.mark.parametrize("routing_host", ["host_parent", None])
+@pytest.mark.parametrize("routing_host", ["host_parent", None, "no_store"])
 async def test_a_session_with_no_host_in_its_chain_leaves_the_answer_to_its_hook(
     question: _Question, monkeypatch: pytest.MonkeyPatch, routing_host: str | None
 ) -> None:
-    """With no host in the chain the hook keeps the answer; an inherited host still relaunches."""
+    """With no host in the chain the hook keeps the answer; an inherited host still sends it."""
     question.conv.host_id = None
     monkeypatch.setattr(orchestration, "routing_host_id", lambda conv, store: routing_host)
     post_event, _reached, release = _gated_post_event(question, [{"queued": True}])
     release.set()
+    store = None if routing_host == "no_store" else _Rows(question.conv)
 
-    delivered = await asyncio.wait_for(
-        question.answer(post_event, conversation_store=_Rows(question.conv)), 5.0
-    )
+    delivered = await asyncio.wait_for(question.answer(post_event, conversation_store=store), 5.0)
 
-    if routing_host is None:
+    if routing_host != "host_parent":
         assert delivered is None
         assert question.posts == []
         return
@@ -249,7 +248,9 @@ async def test_a_session_with_no_host_in_its_chain_leaves_the_answer_to_its_hook
 
 
 @pytest.mark.parametrize(
-    "case", ["moving", "admission", "denied"], ids=["409_moving", "409_admission", "403"]
+    "case",
+    ["moving", "exists", "admission", "denied"],
+    ids=["409_moving", "409_exists", "409_admission", "403"],
 )
 async def test_a_recovery_409_is_reported_as_unavailable(
     question: _Question, monkeypatch: pytest.MonkeyPatch, case: str
@@ -272,7 +273,9 @@ async def test_a_recovery_409_is_reported_as_unavailable(
     else:
         error = OmnigentError(
             "This chat is moving to a new session; send the message there.",
-            code=ErrorCode.CONFLICT if case == "moving" else ErrorCode.FORBIDDEN,
+            code={"moving": ErrorCode.CONFLICT, "exists": ErrorCode.ALREADY_EXISTS}.get(
+                case, ErrorCode.FORBIDDEN
+            ),
         )
         post_event, reached, release = _gated_post_event(question, [error])
         answers = [question.answer(post_event)]
@@ -342,6 +345,40 @@ async def test_a_retry_after_a_failed_delivery_closes_its_card(question: _Questi
     assert await asyncio.wait_for(question.answer(post_event), 5.0) == {"queued": True}
     assert question.resolved == [question.elicitation_id]
     assert not question.pending()
+
+
+async def test_two_retries_across_the_host_lookup_deliver_one_message(
+    question: _Question, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two retries that both wait on the host lookup of a side chat still send one message."""
+    import threading
+
+    question.conv.host_id = None
+    question.conv.runner_id = "runner_new"
+    orchestration._stopped_session_answers[question.key] = orchestration._StoppedSessionAnswer(
+        started_at=time.time(),
+        fingerprint=orchestration._harness_elicitation_fingerprint_or_none(_question_params()),
+        runner_id="runner_old",
+    )
+    release, waiting = threading.Event(), [0]
+
+    def _gated_host(conv: object, store: object) -> str:
+        waiting[0] += 1
+        release.wait(5.0)
+        return "host_parent"
+
+    monkeypatch.setattr(orchestration, "routing_host_id", _gated_host)
+    post_event, _reached, post_release = _gated_post_event(question, [{"queued": True}])
+    post_release.set()
+    store = _Rows(question.conv)
+    answers = [question.answer(post_event, conversation_store=store) for _ in range(2)]
+    try:
+        await poll_until_async(lambda: waiting[0] == 2, timeout_s=5.0, interval_s=0.01)
+    finally:
+        release.set()
+
+    assert await asyncio.wait_for(asyncio.gather(*answers), 5.0) == [{"queued": True}] * 2
+    assert len(question.posts) == 1
 
 
 async def test_a_denied_answer_keeps_the_question_open(question: _Question) -> None:
@@ -605,7 +642,7 @@ async def test_a_runner_live_on_another_replica_skips_the_wait(
 
     request = _check_request(monkeypatch, _wait)
     if hostless:
-        # The sibling check does not need a host or a grace.
+        # An inherited-host side chat has no host_id; the sibling check needs no host or grace.
         monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
     rows = _Rows(_bound_conv())
     reachable = await orchestration._session_runner_reachable(

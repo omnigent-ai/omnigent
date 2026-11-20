@@ -6108,6 +6108,35 @@ async def test_a_hostless_session_in_a_tunnel_gap_answers_its_hook(
 
 
 @pytest.mark.parametrize("route", ["resolve", "approval_event"])
+async def test_a_recovery_409_reaches_the_client_as_503(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    app: FastAPI,
+    route: str,
+) -> None:
+    """A chat that is moving refuses the answer message; the route says 503, not answered."""
+    from omnigent.runtime import pending_elicitations, set_runner_client
+    from omnigent.server.routes.sessions import routes_events
+
+    comm, session_id, hook_task, elicitation_id = await _park_on_claude_session(client, app)
+    set_runner_client(None)
+    _stage_relaunched_runner(monkeypatch, None)
+    monkeypatch.setattr(routes_events, "_session_is_moving", lambda conversation_id: True)
+    try:
+        response = await _resolve_answer(client, session_id, elicitation_id, route=route)
+    finally:
+        hook_task.cancel()
+        await asyncio.gather(hook_task, return_exceptions=True)
+
+    assert response.status_code == 503, response.text
+    error = response.json()["error"]
+    assert error["code"] == "runner_unavailable"
+    assert "moving" in error["message"]
+    assert pending_elicitations.lookup(elicitation_id, conversation_id=session_id) is not None
+    assert not await _expect_no_launch(comm, budget_s=budget(0.2))
+
+
+@pytest.mark.parametrize("route", ["resolve", "approval_event"])
 async def test_an_answer_during_a_runner_tunnel_gap_reaches_the_hook(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
