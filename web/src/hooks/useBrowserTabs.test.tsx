@@ -17,6 +17,7 @@ import {
   AGENT_BROWSER_TAB_ID,
   browserViewId,
   browserViewOwnerId,
+  closeBrowserView,
   openAgentBrowserTab,
   openBrowserTab,
   useBrowserTabs,
@@ -186,6 +187,24 @@ describe("browserViewOwnerId", () => {
   it("returns malformed or undecodable view IDs unchanged", () => {
     expect(browserViewOwnerId("browser-tab:conv")).toBe("browser-tab:conv");
     expect(browserViewOwnerId("browser-tab:%E0%A4%A:tab")).toBe("browser-tab:%E0%A4%A:tab");
+  });
+});
+
+describe("closeBrowserView", () => {
+  it("closes the session's view and says whether it went", async () => {
+    const browserClose = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true })
+      .mockResolvedValueOnce({ ok: false });
+    await expect(closeBrowserView("session-a", "tab-1", { browserClose })).resolves.toBe(true);
+    expect(browserClose).toHaveBeenCalledWith(browserViewId("session-a", "tab-1"));
+    await expect(closeBrowserView("session-a", "tab-1", { browserClose })).resolves.toBe(false);
+  });
+
+  it("counts a failed close as kept, and has nothing to close without a view host", async () => {
+    const browserClose = vi.fn().mockRejectedValue(new Error("gone"));
+    await expect(closeBrowserView("session-a", "tab-1", { browserClose })).resolves.toBe(false);
+    await expect(closeBrowserView("session-a", "tab-1", undefined)).resolves.toBe(true);
   });
 });
 

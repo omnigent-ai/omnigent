@@ -84,6 +84,19 @@ export function isEditorLevel(level: number | null): boolean {
 }
 
 /**
+ * Whether the viewer may read a session's workspace files: editors, or anyone
+ * the owner shared files with. View grants alone don't include files. A
+ * session not loaded yet, or whose fetch failed, reads nothing; a loaded
+ * session's null level means permissions are off, as in single-user mode.
+ */
+export function canBrowseWorkspaceFiles(
+  session: { permissionLevel: number | null; shareWorkspaceFiles?: boolean } | null | undefined,
+): boolean {
+  if (session == null) return false;
+  return isEditorLevel(session.permissionLevel) || session.shareWorkspaceFiles === true;
+}
+
+/**
  * Derive the effective permission level for the active conversation.
  *
  * Resolution order:

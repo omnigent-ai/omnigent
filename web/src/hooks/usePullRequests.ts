@@ -539,12 +539,17 @@ function usePullRequestQueryContext(rawConversationId: string | undefined) {
   return { conversationId, enabled: !!conversationId && serveable !== false, retry };
 }
 
+/** The query key of a session's pull request info, or one of its pull requests' by URL. */
+export function pullRequestInfoQueryKey(conversationId: string | undefined, prUrl?: string) {
+  return ["github-info", conversationId, ...(prUrl ? [prUrl] : [])];
+}
+
 function pullRequestInfoQueryOptions(
   { conversationId, enabled, retry }: ReturnType<typeof usePullRequestQueryContext>,
   options?: { poll?: boolean | "list" | "linked"; prUrl?: string },
 ) {
   return queryOptions({
-    queryKey: ["github-info", conversationId, ...(options?.prUrl ? [options.prUrl] : [])],
+    queryKey: pullRequestInfoQueryKey(conversationId, options?.prUrl),
     queryFn: () => fetchPullRequestInfo(conversationId!, options?.prUrl),
     enabled,
     retry,

@@ -239,6 +239,7 @@ import {
   selectPullRequestInPanel,
   derivePullRequestPanelState,
   LARGE_DIFF_THRESHOLD,
+  type PullRequestSubtab,
 } from "./PullRequestPanel";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
 import { viewedStorageKey } from "@/lib/pullRequestViewed";
@@ -275,25 +276,36 @@ function file(
   };
 }
 
-function renderPanel(mobile = false, active?: boolean) {
+function renderPanel(
+  mobile = false,
+  active?: boolean,
+  onOpenPullRequest?: (url: string, section?: PullRequestSubtab) => void,
+) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return {
     client,
-    ...render(<PullRequestPanel conversationId="conv_1" active={active} />, {
-      wrapper: ({ children }) => (
-        <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, comment_anchor_metadata: true }}>
-          <QueryClientProvider client={client}>
-            {mobile ? (
-              <MobilePanelDrawer open title="Pull Requests" onClose={() => {}}>
-                {children}
-              </MobilePanelDrawer>
-            ) : (
-              children
-            )}
-          </QueryClientProvider>
-        </CapabilitiesProvider>
-      ),
-    }),
+    ...render(
+      <PullRequestPanel
+        conversationId="conv_1"
+        active={active}
+        onOpenPullRequest={onOpenPullRequest}
+      />,
+      {
+        wrapper: ({ children }) => (
+          <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, comment_anchor_metadata: true }}>
+            <QueryClientProvider client={client}>
+              {mobile ? (
+                <MobilePanelDrawer open title="Pull Requests" onClose={() => {}}>
+                  {children}
+                </MobilePanelDrawer>
+              ) : (
+                children
+              )}
+            </QueryClientProvider>
+          </CapabilitiesProvider>
+        ),
+      },
+    ),
   };
 }
 
@@ -3805,4 +3817,87 @@ it("saves a local comment as agent context and retains earlier revisions", async
     expect(screen.queryByRole("region", { name: "Local review comment" })).not.toBeInTheDocument(),
   );
   expect(contexts.result.current).toHaveLength(0);
+});
+
+describe("a host that shows each pull request in a place of its own", () => {
+  function listPrs(prs: PullRequestAssociation[]) {
+    state.storesPrs = false;
+    Object.assign(state.info!.data!, {
+      tracking_available: true,
+      selected_pr_url: prs[0]!.url,
+      prs,
+    });
+  }
+  const FIRST: PullRequestAssociation = {
+    ...OTHER_PR,
+    url: "https://github.com/acme/app/pull/6000",
+    number: 6000,
+  };
+
+  it("hands a chosen pull request to the host and keeps showing the list", async () => {
+    const user = userEvent.setup();
+    listPrs([FIRST, OTHER_PR]);
+    const onOpenPullRequest = vi.fn();
+    renderPanel(false, true, onOpenPullRequest);
+    const list = screen.getByRole("list", { name: "Pull requests" });
+    await user.click(within(list).getByRole("button", { name: "acme/app #6001" }));
+    expect(onOpenPullRequest).toHaveBeenCalledWith(OTHER_PR.url);
+    expect(screen.getByRole("list", { name: "Pull requests" })).toBeVisible();
+    expect(screen.queryByRole("tab", { name: "Summary" })).toBeNull();
+  });
+
+  it("lists a session's only pull request rather than opening it in the list's place", async () => {
+    const user = userEvent.setup();
+    listPrs([FIRST]);
+    const onOpenPullRequest = vi.fn();
+    renderPanel(false, true, onOpenPullRequest);
+    const list = screen.getByRole("list", { name: "Pull requests" });
+    expect(screen.queryByRole("tab", { name: "Summary" })).toBeNull();
+    await user.click(within(list).getByRole("button", { name: "acme/app #6000" }));
+    expect(onOpenPullRequest).toHaveBeenCalledWith(FIRST.url);
+  });
+  it.each([
+    {
+      shape: "an older host that sends only the branch's pull request",
+      setUp: () => {
+        state.storesPrs = false;
+      },
+    },
+    {
+      shape: "a host whose list of linked pull requests isn't synced yet",
+      setUp: () => {
+        state.storesPrs = true;
+        state.stored.conv_1 = [];
+        state.unsynced.add("conv_1");
+        Object.assign(state.info!.data!, { tracking_available: true });
+      },
+    },
+  ])("lists the branch's pull request from $shape, and hands it over too", async ({ setUp }) => {
+    const user = userEvent.setup();
+    setUp();
+    const url = state.info!.data!.pr!.url;
+    const onOpenPullRequest = vi.fn();
+    renderPanel(false, true, onOpenPullRequest);
+    expect(screen.queryByRole("tab", { name: "Summary" })).toBeNull();
+    const list = screen.getByRole("list", { name: "Pull requests" });
+    await user.click(
+      within(list).getByRole("button", { name: /^example\.com\/acme\/app #6000 \(from branch\)/ }),
+    );
+    expect(onOpenPullRequest).toHaveBeenCalledWith(url);
+  });
+
+  it("titles an older host's list and keeps its Refresh", () => {
+    state.storesPrs = false;
+    renderPanel(false, true, vi.fn());
+    expect(screen.getByRole("list", { name: "Pull requests" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Pull Requests" })).toBeVisible();
+    expect(screen.getByRole("button", { name: /Refresh/ })).toBeVisible();
+  });
+
+  it("still shows the branch's pull request itself without a host to hand it to", () => {
+    state.storesPrs = false;
+    renderPanel(false, true);
+    expect(screen.getByRole("tab", { name: "Summary" })).toBeVisible();
+    expect(screen.queryByRole("list", { name: "Pull requests" })).toBeNull();
+  });
 });

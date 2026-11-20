@@ -59,6 +59,20 @@ function browserTabsBridge(): BrowserTabsBridge | undefined {
   return (window as unknown as { omnigentDesktop?: BrowserTabsBridge }).omnigentDesktop;
 }
 
+/** Close a session's browser view; true once it's gone, or where there is none to close. */
+export function closeBrowserView(
+  conversationId: string,
+  tabId: string,
+  bridge: BrowserTabsBridge | undefined = browserTabsBridge(),
+): Promise<boolean> {
+  const closing = bridge?.browserClose?.(browserViewId(conversationId, tabId));
+  if (!closing) return Promise.resolve(true);
+  return closing.then(
+    (result) => result.ok,
+    () => false,
+  );
+}
+
 const agentNavigationEpochs = new Map<string, number>();
 // Counts each session's tab selections, across mounts of its rail, so a slow reopen
 // only selects its tab if nothing was selected after it was requested.

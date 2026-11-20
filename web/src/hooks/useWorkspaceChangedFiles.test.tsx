@@ -44,6 +44,7 @@ import {
   useWorkspaceFileExists,
   useWorkspaceFileSearch,
   useWorkspaceServeable,
+  workspaceDirectoryQuery,
 } from "./useWorkspaceChangedFiles";
 import { goToFileSearchState, goToFileStatusMessage } from "@/shell/goToFileSearchStatus";
 
@@ -751,6 +752,15 @@ describe("useWorkspaceDirectory gating", () => {
           bytes: 3,
           modified_at: 1,
         },
+        {
+          id: "src/inner/lib",
+          name: "lib",
+          path: "src/inner/lib",
+          type: "directory",
+          bytes: null,
+          modified_at: 1,
+          leaf_directory_path: "src/inner/lib/deep",
+        },
       ],
       hasMore: false,
     });
@@ -760,7 +770,15 @@ describe("useWorkspaceDirectory gating", () => {
     });
 
     await waitFor(() => expect(result.current.data).toBeDefined());
-    expect(result.current.data?.map((file) => file.path)).toEqual(["src/inner/a.ts"]);
+    expect(result.current.data?.map((file) => file.path)).toEqual([
+      "src/inner/a.ts",
+      "src/inner/lib",
+    ]);
+    // A single-child chain's end carries over; a file has none.
+    expect(result.current.data?.map((file) => file.leaf_directory_path)).toEqual([
+      undefined,
+      "src/inner/lib/deep",
+    ]);
     expect(listDirectoryViaWorkspaceApi).toHaveBeenCalledWith("conv_api", "src/inner", 1000);
     expect(fetchMock).not.toHaveBeenCalled();
   });
@@ -776,6 +794,25 @@ describe("useWorkspaceDirectory gating", () => {
     await flushMicrotasks();
 
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("workspaceDirectoryQuery", () => {
+  it("keys a listing as the directory hooks do, adding a refresh token only once set", () => {
+    expect(workspaceDirectoryQuery("conv", "src").queryKey).toEqual([
+      "workspace-dir",
+      "conv",
+      "src",
+      "",
+    ]);
+    expect(workspaceDirectoryQuery("conv", "src", "remote", 2).queryKey).toEqual([
+      "workspace-dir",
+      "conv",
+      "src",
+      "remote",
+      2,
+    ]);
+    expect(workspaceDirectoryQuery("conv", "src").staleTime).toBe(5_000);
   });
 });
 
@@ -1999,6 +2036,47 @@ describe("browse-location listings normalize to paths relative to the location",
 
     expect(onPaths).toHaveBeenLastCalledWith(["quarterly/q3.csv"]);
   });
+
+  it.each([
+    ["reports", "REST", "reports/quarterly/2026"],
+    ["/elsewhere/reports", "REST", "2026"],
+    ["reports", "the workspace API", "reports/quarterly/2026"],
+  ])(
+    "roots a lazily-expanded directory's chain end under it too (%s, through %s)",
+    async (location, route, wirePath) => {
+      const entry = {
+        id: wirePath,
+        name: "2026",
+        path: wirePath,
+        type: "directory" as const,
+        bytes: null,
+        modified_at: null,
+        leaf_directory_path: `${wirePath}/q3`,
+      };
+      if (route === "REST") {
+        fetchMock.mockResolvedValueOnce(
+          jsonResponse({ object: "list", data: [entry], has_more: false }),
+        );
+      } else {
+        vi.mocked(listDirectoryViaWorkspaceApi).mockResolvedValueOnce({
+          data: [entry],
+          hasMore: false,
+        });
+      }
+
+      const { result } = renderHook(
+        () => useWorkspaceDirectory("conv_leaf", "quarterly", location),
+        {
+          wrapper: Wrap,
+        },
+      );
+
+      await waitFor(() => expect(result.current.data).toBeDefined());
+      expect(result.current.data?.map((file) => [file.path, file.leaf_directory_path])).toEqual([
+        ["quarterly/2026", "quarterly/2026/q3"],
+      ]);
+    },
+  );
 });
 
 describe("browse-location wire form (survives a slash-merging proxy)", () => {

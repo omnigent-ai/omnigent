@@ -331,6 +331,8 @@ export interface ListedEntry {
   type: "file" | "directory";
   bytes: number | null;
   modified_at: number | null;
+  /** The deepest directory of a single-child chain, when the host reports it. */
+  leaf_directory_path?: string;
 }
 
 const LIST_PAGE_SIZE = 1000;
@@ -501,6 +503,7 @@ function listedEntry(entry: Entry): ListedEntry {
     type: entry.type === EntryType.DIRECTORY ? "directory" : "file",
     bytes: entry.size === undefined ? null : Number(entry.size),
     modified_at: entry.modifyTime ? Number(entry.modifyTime.seconds) : null,
+    ...(entry.leafDirectoryPath ? { leaf_directory_path: entry.leafDirectoryPath } : {}),
   };
 }
 
