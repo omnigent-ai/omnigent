@@ -422,6 +422,40 @@ describe("chromeCookieStore — import scopes", () => {
     assert.deepEqual(store.cookieScopeCandidates("127.0.0.1"), ["127.0.0.1"]);
   });
 
+  it("keeps an opened site on any host other than the page's", () => {
+    assert.equal(
+      store.openedSiteScope("idp.example.net", "Workspace.Example.com"),
+      "workspace.example.com",
+    );
+    assert.equal(store.openedSiteScope("example.com", "files.example.com"), "files.example.com");
+    assert.equal(store.openedSiteScope("example.com", "Example.com"), null);
+    assert.equal(store.openedSiteScope("idp.example.net", undefined), null);
+    assert.equal(store.openedSiteScope("idp.example.net", "not a host!"), null);
+  });
+
+  it("refuses an opened site that is the page's host or not a host before reading Chrome", async () => {
+    const touched = [];
+    const sentinel = (name) => () => {
+      touched.push(name);
+      throw new Error(`${name} must not run`);
+    };
+    for (const openedHost of ["example.com", "not a host!"]) {
+      // oxlint-disable-next-line no-await-in-loop -- each refusal is checked in turn
+      const result = await store.importSiteCookies({
+        host: "example.com",
+        openedHost,
+        profileId: "Default",
+        cookiesApi: { set: sentinel("cookie write") },
+        rootDir: path.join(os.tmpdir(), "omnigent-chrome-opened-unread"),
+        fsImpl: new Proxy({}, { get: (_target, name) => sentinel(`fs.${String(name)}`) }),
+        run: sentinel("sqlite3"),
+        readPassword: sentinel("Keychain"),
+      });
+      assert.deepEqual(result, { ok: false, error: "That site isn't available for this tab." });
+    }
+    assert.deepEqual(touched, []);
+  });
+
   it("counts the site's own cookies when no clock is passed", () => {
     const rows = [
       { hostKey: ".example.com", name: "shared", expiresUtc: chromeExpiresUtc(1_900_000_000) },
@@ -731,6 +765,86 @@ describe("chromeCookieStore — sqlite3 reader", { skip: !hasSqlite3 }, () => {
       assert.equal(result.ok, false);
       assert.match(result.error, /scope isn't available/);
       assert.deepEqual(written, []);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("previews the cookies Chrome sends to the site the tab opened", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-chrome-opened-preview-"));
+    try {
+      fs.mkdirSync(path.join(root, "Default"));
+      makeCookieDb(path.join(root, "Default", "Cookies"));
+      const preview = await store.previewSiteCookies({
+        host: "idp.unrelated.test",
+        openedHost: "example.com",
+        rootDir: root,
+      });
+      assert.equal(preview.openedHost, "example.com");
+      // example.com's own and domain cookies, not files.example.com's.
+      assert.deepEqual(preview.profiles[0].scopes, [
+        { host: "idp.unrelated.test", cookieCount: 1, openedCookieCount: 2 },
+        { host: "unrelated.test", cookieCount: 1, openedCookieCount: 2 },
+      ]);
+
+      // The opened site's only cookie is a parent-domain one the page's scope
+      // already imports; it adds nothing but is still where the tab goes back.
+      const shared = await store.previewSiteCookies({
+        host: "files.example.com",
+        openedHost: "workspace.example.com",
+        rootDir: root,
+      });
+      assert.equal(shared.openedHost, "workspace.example.com");
+      assert.deepEqual(shared.profiles[0].scopes, [
+        { host: "files.example.com", cookieCount: 2, openedCookieCount: 0 },
+        { host: "example.com", cookieCount: 3, openedCookieCount: 0 },
+      ]);
+
+      // A wider scope can hold all of them, and the page's tree can contain the site.
+      const wider = await store.previewSiteCookies({
+        host: "files.example.com",
+        openedHost: "example.com",
+        rootDir: root,
+      });
+      assert.deepEqual(wider.profiles[0].scopes, [
+        { host: "files.example.com", cookieCount: 2, openedCookieCount: 1 },
+        { host: "example.com", cookieCount: 3, openedCookieCount: 0 },
+      ]);
+      const covered = await store.previewSiteCookies({
+        host: "example.com",
+        openedHost: "files.example.com",
+        rootDir: root,
+      });
+      assert.equal(covered.openedHost, "files.example.com");
+      assert.deepEqual(covered.profiles[0].scopes, [
+        { host: "example.com", cookieCount: 3, openedCookieCount: 0 },
+      ]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("imports the opened site's cookies once alongside the page's scope", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-chrome-opened-import-"));
+    try {
+      fs.mkdirSync(path.join(root, "Default"));
+      makeCookieDb(path.join(root, "Default", "Cookies"));
+      const written = [];
+      const result = await store.importSiteCookies({
+        host: "login.example.com",
+        openedHost: "example.com",
+        profileId: "Default",
+        cookiesApi: { set: async (cookie) => written.push(cookie) },
+        rootDir: root,
+        readPassword: async () => "test-password",
+      });
+      assert.equal(result.ok, true);
+      assert.equal(result.openedHost, "example.com");
+      assert.equal(result.found, 2);
+      assert.equal(result.imported, 2);
+      // SID applies to both sites but is written once; files.example.com's
+      // host-only cookie is never sent to example.com.
+      assert.deepEqual(written.map((cookie) => cookie.name).sort(), ["SID", "parentonly"]);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

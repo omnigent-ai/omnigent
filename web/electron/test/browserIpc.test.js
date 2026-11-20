@@ -1223,6 +1223,209 @@ describe("browserIpc — Chrome cookie import", () => {
     assert.deepEqual(r, { ok: false, error: "No browser view" });
   });
 
+  /** A store whose preview also counts cookies for the site the tab opened. */
+  function stubOpenedSiteStore(openedCookieCount = 2) {
+    const store = stubStore();
+    const preview = store.previewSiteCookies;
+    store.previewSiteCookies = async (args) => {
+      const result = await preview(args);
+      if (!args.openedHost) return result;
+      return {
+        ...result,
+        openedHost: args.openedHost,
+        profiles: result.profiles.map((profile) => ({
+          ...profile,
+          scopes: profile.scopes.map((scope) => ({ ...scope, openedCookieCount })),
+        })),
+      };
+    };
+    return store;
+  }
+
+  /** A tab that opened workspace.example.com and was redirected to sign in. */
+  function setupSignInRedirect(options) {
+    const context = setup({
+      webContents: makeWebContents({ url: "https://idp.example.net/authorize?client=app" }),
+      ...options,
+    });
+    context.registry.get("conv_1").openedSite = { url: "https://workspace.example.com/start" };
+    return context;
+  }
+
+  it("includes the site the tab opened before a sign-in redirect", async () => {
+    const store = stubOpenedSiteStore();
+    const confirmations = [];
+    const { ipcMain, event, wc } = setupSignInRedirect({
+      chromeCookieStore: store,
+      confirmCookieImport: async (request) => {
+        confirmations.push(request);
+        return true;
+      },
+    });
+    await ipcMain.invoke("omnigent:browser-chrome-cookie-preview", event, {
+      conversationId: "conv_1",
+    });
+    assert.deepEqual(store.calls[0].args, {
+      host: "idp.example.net",
+      openedHost: "workspace.example.com",
+    });
+    const r = await ipcMain.invoke("omnigent:browser-chrome-cookie-import", event, {
+      conversationId: "conv_1",
+      profileId: "Default",
+      expectedHost: "idp.example.net",
+      openedHost: "Workspace.example.com",
+    });
+    assert.equal(r.ok, true);
+    assert.equal(r.openedUrl, "https://workspace.example.com/start");
+    assert.deepEqual(confirmations, [
+      {
+        host: "idp.example.net",
+        scope: "idp.example.net",
+        openedHost: "workspace.example.com",
+        profileName: "Work",
+        cookieCount: 5,
+        parentWindow: null,
+      },
+    ]);
+    const importCall = store.calls.find((call) => call.fn === "import");
+    assert.equal(importCall.args.openedHost, "workspace.example.com");
+    assert.equal(importCall.args.cookiesApi, wc.session.cookies);
+  });
+
+  it("goes back to the opened site when the picked scope already holds its cookies", async () => {
+    const store = stubOpenedSiteStore(0);
+    const confirmations = [];
+    const { ipcMain, event } = setupSignInRedirect({
+      chromeCookieStore: store,
+      confirmCookieImport: async (request) => {
+        confirmations.push(request);
+        return true;
+      },
+    });
+    const r = await ipcMain.invoke("omnigent:browser-chrome-cookie-import", event, {
+      conversationId: "conv_1",
+      profileId: "Default",
+      expectedHost: "idp.example.net",
+      openedHost: "workspace.example.com",
+    });
+    assert.equal(r.ok, true);
+    assert.equal(r.openedUrl, "https://workspace.example.com/start");
+    // Only sites the prompt names have cookies copied.
+    assert.equal(confirmations.length, 1);
+    assert.equal("openedHost" in confirmations[0], false);
+    assert.equal(confirmations[0].cookieCount, 3);
+    const importCall = store.calls.find((call) => call.fn === "import");
+    assert.equal("openedHost" in importCall.args, false);
+  });
+
+  it("imports only the page's site unless the opened site is requested", async () => {
+    const store = stubOpenedSiteStore();
+    const { ipcMain, event } = setupSignInRedirect({ chromeCookieStore: store });
+    const r = await ipcMain.invoke("omnigent:browser-chrome-cookie-import", event, {
+      conversationId: "conv_1",
+      profileId: "Default",
+      expectedHost: "idp.example.net",
+    });
+    assert.equal(r.ok, true);
+    assert.equal("openedUrl" in r, false);
+    assert.equal("openedHost" in store.calls.find((call) => call.fn === "import").args, false);
+  });
+
+  it("refuses an opened site this tab didn't open before confirming", async () => {
+    const confirmations = [];
+    const confirmCookieImport = async (request) => {
+      confirmations.push(request);
+      return true;
+    };
+    const store = stubOpenedSiteStore();
+    const { ipcMain, event } = setupSignInRedirect({
+      chromeCookieStore: store,
+      confirmCookieImport,
+    });
+    const r = await ipcMain.invoke("omnigent:browser-chrome-cookie-import", event, {
+      conversationId: "conv_1",
+      profileId: "Default",
+      expectedHost: "idp.example.net",
+      openedHost: "unrelated.test",
+    });
+    assert.match(r.error, /no longer on that site/);
+    assert.deepEqual(store.calls, []);
+
+    // Main's own preview doesn't offer the opened site.
+    const empty = stubStore();
+    const emptySetup = setupSignInRedirect({ chromeCookieStore: empty, confirmCookieImport });
+    const none = await emptySetup.ipcMain.invoke(
+      "omnigent:browser-chrome-cookie-import",
+      emptySetup.event,
+      {
+        conversationId: "conv_1",
+        profileId: "Default",
+        expectedHost: "idp.example.net",
+        openedHost: "workspace.example.com",
+      },
+    );
+    assert.match(none.error, /site isn't available/);
+    assert.deepEqual(confirmations, []);
+    assert.deepEqual(
+      empty.calls.filter((call) => call.fn === "import"),
+      [],
+    );
+  });
+
+  it("refuses to write when the tab opens another site during the Keychain wait", async () => {
+    const store = stubOpenedSiteStore();
+    const { ipcMain, event, registry } = setupSignInRedirect({ chromeCookieStore: store });
+    store.importSiteCookies = async (args) => {
+      assert.equal(args.beforeWrite(), true);
+      registry.get("conv_1").openedSite = { url: "https://unrelated.test/" };
+      assert.equal(args.beforeWrite(), false);
+      return {
+        ok: false,
+        error: "This tab is no longer on that site. Reopen the import dialog to retry.",
+      };
+    };
+    const r = await ipcMain.invoke("omnigent:browser-chrome-cookie-import", event, {
+      conversationId: "conv_1",
+      profileId: "Default",
+      expectedHost: "idp.example.net",
+      openedHost: "workspace.example.com",
+    });
+    assert.equal(r.ok, false);
+    assert.equal("openedUrl" in r, false);
+  });
+
+  it("goes back to the opened site's newest address, never one it has left", async () => {
+    const importWhile = async (moveOpenedSite) => {
+      const store = stubOpenedSiteStore();
+      const { ipcMain, event, registry } = setupSignInRedirect({ chromeCookieStore: store });
+      const importSiteCookies = store.importSiteCookies;
+      store.importSiteCookies = (args) =>
+        moveOpenedSite(registry.get("conv_1"), args, () => importSiteCookies(args));
+      return ipcMain.invoke("omnigent:browser-chrome-cookie-import", event, {
+        conversationId: "conv_1",
+        profileId: "Default",
+        expectedHost: "idp.example.net",
+        openedHost: "workspace.example.com",
+      });
+    };
+    // Another path on the same site, requested during the Keychain wait.
+    const samePath = await importWhile((entry, args, write) => {
+      entry.openedSite = { url: "https://workspace.example.com/project/b" };
+      assert.equal(args.beforeWrite(), true);
+      return write();
+    });
+    assert.equal(samePath.ok, true);
+    assert.equal(samePath.openedUrl, "https://workspace.example.com/project/b");
+
+    const leftSite = await importWhile(async (entry, _args, write) => {
+      const result = await write();
+      entry.openedSite = { url: "https://unrelated.test/" };
+      return result;
+    });
+    assert.equal(leftSite.ok, true);
+    assert.equal("openedUrl" in leftSite, false);
+  });
+
   it("surfaces a closed view as an error instead of throwing", async () => {
     const store = stubStore();
     store.importSiteCookies = async () => {

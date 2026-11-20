@@ -810,7 +810,8 @@ Scope is deliberately narrow:
 
 - Only cookies inside the page's own domain tree: its host, its subdomains, and
   the leading-dot parent domains that reach it (`.google.com` for
-  `mail.google.com`). Nothing else in the jar is read into the app.
+  `mail.google.com`). Nothing else in the jar is read into the app, apart from
+  the opened site after a sign-in redirect (below).
 - When the host has parent domains the dialog offers them as _Site scope_, each
   labelled with its own count (`accounts.google.com (25)` vs `google.com (64)`, the
   wider scope being a superset because it covers every subdomain's cookies).
@@ -829,6 +830,21 @@ Scope is deliberately narrow:
   site tree. On a public suffix people can host under (`github.io`,
   `blogspot.com`) that reads every tenant's cookies for the suffix; the dialog
   names the scope before anything is read, and the user has to confirm.
+- When a sign-in redirect moved the tab to another site (an IdP challenge), the
+  dialog also offers the site the tab opened, checked by default. Only a load
+  the pane asks main for (the address bar, an agent, or a link opened from the
+  app) sets that site, once the load commits and unless another load replaces
+  it first; the page can't choose it. Server and page
+  redirects keep it, and so do sign-in steps on the same host. Any
+  other way of leaving its host clears it, including a page navigation within
+  five seconds of a click or key press, a back/forward step, or a popup loaded
+  into the tab. Only the cookies Chrome sends to that host itself are read (its
+  host-only cookies and the domain cookies that reach it, not its subdomains'),
+  minus those the picked scope already copies. The site is offered even when
+  that leaves none, because afterwards the tab goes back to the opened address
+  instead of reloading the sign-in page, which would only repeat its challenge.
+  Its cookies are copied, and the native prompt names it, only when it adds
+  some; either way `beforeWrite` re-checks it before anything is written.
 - `browser-chrome-cookie-preview` reports only counts and profile names, and
   touches no Keychain, so the confirmation dialog opens without a system prompt.
   The import re-derives the host from the view's own URL main-side and refuses if

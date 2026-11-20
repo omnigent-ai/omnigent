@@ -58,6 +58,21 @@ describe("buildCookieImportPrompt", () => {
     assert.doesNotMatch(detail, /this tab is on/);
   });
 
+  it("names the site the tab opened when its cookies are included", () => {
+    const { message, detail } = buildCookieImportPrompt({
+      host: "idp.example.net",
+      scope: "idp.example.net",
+      openedHost: "workspace.example.com",
+      profileName: "Work",
+      cookieCount: 4,
+    });
+    assert.equal(message, "Import 4 cookies into Omnigent?");
+    assert.match(
+      detail,
+      /for idp\.example\.net and its subdomains, plus workspace\.example\.com \(the site this tab opened\)\./,
+    );
+  });
+
   it("keeps a crafted Chrome profile name on one line", () => {
     const { detail } = buildCookieImportPrompt({
       host: "example.com",

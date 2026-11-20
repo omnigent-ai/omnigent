@@ -32,6 +32,11 @@ const { agentInputInFlight } = require("./browserInput");
 // Each view is a separate renderer process; the cap bounds memory per window.
 const DEFAULT_CAP = 20;
 
+// Chromium's transient user-activation lifespan: a page navigation this soon after
+// input may be the user's, not a sign-in redirect.
+const PAGE_INPUT_NAVIGATION_WINDOW_MS = 5000;
+const PAGE_INPUT_TYPES = new Set(["mouseDown", "keyDown", "rawKeyDown"]);
+
 // Map WebSocket handshakes onto the HTTP URL rules.
 function httpUrlForWebSocket(url) {
   return url.replace(/^ws(s?):/, "http$1:");
@@ -190,6 +195,11 @@ function createBrowserViewRegistry({
       // Last URL we EXPLICITLY requested (not getURL(), which drifts as the page
       // navigates) — lets openOrNavigate skip reissuing loadURL on a re-mount.
       lastRequestedUrl: "",
+      // { url } of the last explicit open that committed; sign-in redirects keep it,
+      // so the Chrome cookie import can see past them. Pages can't set it.
+      openedSite: null,
+      pendingOpenedSite: null,
+      lastPageInputAt: 0,
       // Enables navigation guards; renderer IPC always sets it.
       navigationPolicyEnforced: false,
       agentContext: null,
@@ -229,6 +239,7 @@ function createBrowserViewRegistry({
     attachViewContextMenu(entry);
     attachAgentNavGuard(conversationId, entry);
     attachRecentSessionInput(entry);
+    attachOpenedSiteTracker(entry);
     return { ok: true, entry, created: true };
   }
 
@@ -338,6 +349,47 @@ function createBrowserViewRegistry({
     wc.on("will-frame-navigate", (event) => {
       // will-frame-navigate passes a single event whose `.url` is the target.
       guard(event, event && event.url);
+    });
+  }
+
+  // Only openOrNavigate's own load sets the opened site, once it commits. Leaving
+  // its host any other way clears it, except a page redirect without recent input.
+  function attachOpenedSiteTracker(entry) {
+    const wc = entry.view && entry.view.webContents;
+    if (!wc || typeof wc.on !== "function") return;
+    wc.on("input-event", (_event, input) => {
+      if (PAGE_INPUT_TYPES.has(input?.type)) entry.lastPageInputAt = Date.now();
+    });
+    wc.on("did-start-navigation", (details, positionalUrl, isInPlace, isMainFrame) => {
+      if ((details?.isMainFrame ?? isMainFrame) === false) return;
+      if (details?.isSameDocument ?? isInPlace) return;
+      const targetUrl = details?.url ?? positionalUrl;
+      const targetHost = hostnameOf(targetUrl);
+      const pending = entry.pendingOpenedSite;
+      // Only the open's own start repeats its URL; any other main-frame load replaces it.
+      if (
+        pending &&
+        !details?.initiator &&
+        canonicalUrlOf(targetUrl) === canonicalUrlOf(pending.url)
+      ) {
+        return;
+      }
+      entry.pendingOpenedSite = null;
+      const pageRedirect =
+        Boolean(details?.initiator) &&
+        Date.now() - entry.lastPageInputAt > PAGE_INPUT_NAVIGATION_WINDOW_MS;
+      if (!pageRedirect && targetHost !== hostnameOf(wc.getURL?.())) entry.openedSite = null;
+    });
+    wc.on("did-navigate", () => {
+      if (entry.pendingOpenedSite) entry.openedSite = entry.pendingOpenedSite;
+      entry.pendingOpenedSite = null;
+    });
+    // A load that ends without committing (a download, a 204, a blocked redirect) opened nothing.
+    wc.on("did-fail-load", (_event, _code, _description, _url, isMainFrame) => {
+      if (isMainFrame !== false) entry.pendingOpenedSite = null;
+    });
+    wc.on("did-stop-loading", () => {
+      entry.pendingOpenedSite = null;
     });
   }
 
@@ -494,6 +546,10 @@ function createBrowserViewRegistry({
     return URL.canParse(url) ? new URL(url).hostname : "";
   }
 
+  function canonicalUrlOf(url) {
+    return URL.canParse(url) ? new URL(url).href : url;
+  }
+
   // Resolve named hosts in the owning partition before any request is sent.
   // IP literals and exact loopback names need only the URL check; `*.localhost`
   // must also be on a direct route so a proxy never receives the request.
@@ -645,6 +701,7 @@ function createBrowserViewRegistry({
       // drifts with in-page nav — stops a re-mount from refreshing to the initial URL.
       if (created || force || entry.lastRequestedUrl !== url) {
         entry.lastRequestedUrl = url;
+        entry.pendingOpenedSite = { url };
         try {
           entry.view.webContents.loadURL(url);
         } catch (e) {

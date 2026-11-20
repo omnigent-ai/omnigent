@@ -419,6 +419,7 @@ function makeEventCapturingRegistry(extra = {}) {
   let handlers; // { [event]: fn } for the single created view
   let windowOpenHandler;
   let nextWebContentsId = 1;
+  let currentUrl = "";
   const registry = createBrowserViewRegistry({
     WebContentsViewCtor: () => {
       handlers = {};
@@ -429,6 +430,7 @@ function makeEventCapturingRegistry(extra = {}) {
           loadURL(url) {
             loaded.push(url);
           },
+          getURL: () => currentUrl,
           close() {},
           copy() {
             copyCalls += 1;
@@ -474,8 +476,155 @@ function makeEventCapturingRegistry(extra = {}) {
     },
     fireContextMenu: (params) => handlers["context-menu"]({}, params),
     windowOpen: (url, disposition) => windowOpenHandler({ url, disposition }),
+    emit: (event, ...args) => handlers[event](...args),
+    commit: (url) => {
+      currentUrl = url;
+    },
   };
 }
+
+describe("browserViewRegistry — opened site for the Chrome cookie import", () => {
+  const pageFrame = { routingId: 1 };
+  const start = (url, details = {}) => [
+    { url, isMainFrame: true, isSameDocument: false, initiator: null, ...details },
+  ];
+  const openAndCommit = (tab, url, committedUrl = url) => {
+    tab.registry.openOrNavigate("conv_1", url);
+    tab.emit("did-start-navigation", ...start(url));
+    tab.commit(committedUrl);
+    tab.emit("did-navigate", {}, committedUrl);
+  };
+  const signInRedirect = () => {
+    const tab = makeEventCapturingRegistry();
+    openAndCommit(
+      tab,
+      "https://workspace.example.com/start",
+      "https://workspace.example.com/login",
+    );
+    tab.emit(
+      "did-start-navigation",
+      ...start("https://idp.example.net/authorize", { initiator: pageFrame }),
+    );
+    tab.commit("https://idp.example.net/authorize");
+    tab.emit("did-navigate", {}, "https://idp.example.net/authorize");
+    return tab;
+  };
+  const opened = (tab) => tab.registry.get("conv_1").openedSite?.url;
+
+  it("sets the opened site from an explicit open once it commits, through its redirects", () => {
+    const tab = makeEventCapturingRegistry();
+    tab.registry.openOrNavigate("conv_1", "https://workspace.example.com/start");
+    tab.emit("did-start-navigation", ...start("https://workspace.example.com/start"));
+    assert.equal(opened(tab), undefined, "not before the load commits");
+    tab.commit("https://idp.example.net/authorize");
+    tab.emit("did-navigate", {}, "https://idp.example.net/authorize");
+    assert.equal(opened(tab), "https://workspace.example.com/start");
+  });
+
+  it("matches an explicit open to the canonical URL Chromium starts", () => {
+    const tab = makeEventCapturingRegistry();
+    tab.registry.openOrNavigate("conv_1", "https://Workspace.example.com");
+    tab.emit("did-start-navigation", ...start("https://workspace.example.com/"));
+    tab.commit("https://idp.example.net/authorize");
+    tab.emit("did-navigate", {}, "https://idp.example.net/authorize");
+    assert.equal(opened(tab), "https://Workspace.example.com");
+  });
+
+  it("keeps the opened site through page-driven redirects and sign-in steps", () => {
+    const tab = signInRedirect();
+    tab.emit(
+      "did-start-navigation",
+      ...start("https://idp.example.net/#otp", { isSameDocument: true }),
+    );
+    tab.emit("did-start-navigation", ...start("https://ads.example.org/", { isMainFrame: false }));
+    tab.emit("input-event", {}, { type: "mouseMove" });
+    tab.emit(
+      "did-start-navigation",
+      ...start("https://device.example.org/check", { initiator: pageFrame }),
+    );
+    tab.commit("https://idp.example.net/authorize");
+    tab.emit("input-event", {}, { type: "keyDown" });
+    tab.emit(
+      "did-start-navigation",
+      ...start("https://idp.example.net/verify", { initiator: pageFrame }),
+    );
+    tab.emit("did-navigate", {}, "https://idp.example.net/verify");
+    assert.equal(opened(tab), "https://workspace.example.com/start");
+  });
+
+  it("clears the opened site when the tab leaves its host any other way", () => {
+    const afterInput = (type) => (tab) => {
+      tab.emit("input-event", {}, { type });
+      tab.emit(
+        "did-start-navigation",
+        ...start("https://other.example.org/", { initiator: pageFrame }),
+      );
+    };
+    const leave = {
+      "a click in the page": afterInput("mouseDown"),
+      "a key press in the page": afterInput("keyDown"),
+      "a raw key press in the page": afterInput("rawKeyDown"),
+      "a back/forward step or a page navigation whose frame is gone": (tab) =>
+        tab.emit("did-start-navigation", ...start("https://other.example.org/")),
+      "a popup loaded into the tab": (tab) => {
+        tab.windowOpen("https://other.example.org/", "foreground-tab");
+        tab.emit("did-start-navigation", ...start("https://other.example.org/"));
+      },
+      "an event without details": (tab) =>
+        tab.emit("did-start-navigation", {}, "https://other.example.org/", false, true),
+    };
+    for (const [name, navigate] of Object.entries(leave)) {
+      const tab = signInRedirect();
+      navigate(tab);
+      tab.commit("https://other.example.org/");
+      tab.emit("did-navigate", {}, "https://other.example.org/");
+      assert.equal(opened(tab), undefined, name);
+    }
+  });
+
+  it("keeps the earlier opened site when an explicit open never commits", () => {
+    const endings = {
+      "a download or empty response": (tab) => tab.emit("did-stop-loading"),
+      "a failed load": (tab, openUrl) =>
+        tab.emit("did-fail-load", {}, -105, "ERR_NAME_NOT_RESOLVED", openUrl, true),
+      "a back step on the sign-in host": (tab) =>
+        tab.emit("did-start-navigation", ...start("https://idp.example.net/authorize")),
+      "a popup loaded into the tab on the sign-in host": (tab) => {
+        tab.windowOpen("https://idp.example.net/help", "foreground-tab");
+        tab.emit("did-start-navigation", ...start("https://idp.example.net/help"));
+      },
+      "a link click on the sign-in host": (tab) => {
+        tab.emit("input-event", {}, { type: "mouseDown" });
+        tab.emit(
+          "did-start-navigation",
+          ...start("https://idp.example.net/help", { initiator: pageFrame }),
+        );
+      },
+    };
+    const opens = ["https://files.example.org/report.zip", "https://idp.example.net/slow-download"];
+    for (const openUrl of opens) {
+      for (const [name, end] of Object.entries(endings)) {
+        const tab = signInRedirect();
+        tab.registry.openOrNavigate("conv_1", openUrl);
+        tab.emit("did-start-navigation", ...start(openUrl));
+        end(tab, openUrl);
+        tab.emit("did-navigate", {}, "https://idp.example.net/authorize");
+        assert.equal(opened(tab), "https://workspace.example.com/start", `${name}, ${openUrl}`);
+      }
+    }
+  });
+
+  it("does not count stale page input as the user's navigation", () => {
+    const tab = signInRedirect();
+    tab.emit("input-event", {}, { type: "mouseDown" });
+    tab.registry.get("conv_1").lastPageInputAt -= 5001;
+    tab.emit(
+      "did-start-navigation",
+      ...start("https://device.example.org/check", { initiator: pageFrame }),
+    );
+    assert.equal(opened(tab), "https://workspace.example.com/start");
+  });
+});
 
 describe("browserViewRegistry — redirect/nav guard (SSRF: allowlist on every hop)", () => {
   it("uses the same live Arca context for initial URL, redirect, frame and popup", () => {
