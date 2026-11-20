@@ -4,11 +4,17 @@ from __future__ import annotations
 
 import json
 import os
+import pty
+import select
 import shutil
+import signal
 import subprocess
 import sys
+import termios
+import time
 import xml.etree.ElementTree as ET
 from collections.abc import Iterator
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -128,6 +134,52 @@ def frame(name: str) -> None:
     observation["frames"].append({"name": name, "path": str(path)})
 
 
+def run_control(argv: list[str]) -> dict[str, Any]:
+    """Capture the interactive CLI on an owned PTY, including its exit status."""
+    master, slave = pty.openpty()
+    try:
+        termios.tcsetwinsize(slave, (40, 120))
+        try:
+            process = subprocess.Popen(
+                argv, stdin=slave, stdout=slave, stderr=slave, start_new_session=True
+            )
+        finally:
+            os.close(slave)
+        raw = bytearray()
+        deadline = time.monotonic() + 20
+        try:
+            while time.monotonic() < deadline:
+                ready, _, _ = select.select([master], [], [], 0.1)
+                if ready:
+                    try:
+                        chunk = os.read(master, 65536)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    raw.extend(chunk)
+                elif process.poll() is not None:
+                    break
+        finally:
+            with suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=max(0.01, deadline - time.monotonic()))
+            timed_out = process.poll() is None
+            if timed_out:
+                with suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+        return {
+            "argv": argv,
+            "exit_code": process.returncode,
+            "stdout": raw.decode(errors="replace"),
+            "stderr": "",
+            "capture": "PTY stdout/stderr combined",
+            "timed_out": timed_out,
+        }
+    finally:
+        os.close(master)
+
+
 def capture_state(*args: Any, **kwargs: Any) -> Any:
     state = read_state(*args, **kwargs)
     if state is not None and state.thread_id and "control" not in observation:
@@ -139,20 +191,7 @@ def capture_state(*args: Any, **kwargs: Any) -> Any:
             state.socket_path,
             state.thread_id,
         ]
-        control = subprocess.run(
-            control_argv,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=20,
-            check=False,
-        )
-        observation["control"] = {
-            "argv": control_argv,
-            "exit_code": control.returncode,
-            "stdout": control.stdout,
-            "stderr": control.stderr,
-        }
+        observation["control"] = run_control(control_argv)
         frame("initial-configured-terminal")
     return state
 
@@ -196,6 +235,7 @@ control = observation.get("control", {})
 control_text = (control.get("stdout", "") + control.get("stderr", "")).lower()
 control_rejected = (
     control.get("exit_code", 0) != 0
+    and not control.get("timed_out", True)
     and "remote" in control_text
     and any(word in control_text for word in ("permission", "sandbox", "approval", "override"))
 )
