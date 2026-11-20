@@ -287,9 +287,21 @@ export class FileTreeModel {
     this.#scrollRequest = {
       id: (this.#scrollRequestId += 1),
       offset: normalizeScrollOffset(options?.offset),
+      path: targetPath,
       visibleIndex: targetIndex,
     };
     this.#emit();
+  }
+
+  /** The row index that shows `path` now, or -1 when it's gone or inside a closed folder. */
+  public getVisibleIndexOfPath(path: string): number {
+    const resolvedPath = this.#store.getPathInfo(path)?.path ?? null;
+    if (resolvedPath == null) {
+      return -1;
+    }
+
+    this.#ensureFullProjection();
+    return this.#getExactCurrentVisibleIndexByPath(resolvedPath);
   }
 
   // DOM row events already know the target row is mounted, so they can focus it

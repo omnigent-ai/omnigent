@@ -30,6 +30,40 @@ export const FILE_TREE_ROOT_SELECTOR = "[data-file-tree]";
 const OVERSCAN = 10;
 const FALLBACK_VIEWPORT_HEIGHT = 420;
 
+type ScrollOffset = "top" | "center" | "nearest";
+/** A reveal to replay once the tree has a size, by path since rows can move meanwhile. */
+interface PendingReveal {
+  path: string;
+  offset: ScrollOffset;
+}
+
+/** The element's laid-out height; zero while it's hidden or not laid out yet. */
+function measuredHeight(scrollElement: HTMLElement): number {
+  return scrollElement.getBoundingClientRect().height || scrollElement.clientHeight;
+}
+
+/**
+ * Scroll `scrollElement` to show row `index`. True only once a measured viewport shows it: a
+ * hidden element ignores the write, and a guessed height can't say the row is in view.
+ */
+function scrollRowIntoView(
+  scrollElement: HTMLElement,
+  request: { index: number; offset: ScrollOffset; totalRows: number; fallbackHeight: number },
+): boolean {
+  const height = measuredHeight(scrollElement);
+  const target = computeScrollTarget({
+    currentScrollTop: scrollElement.scrollTop,
+    index: request.index,
+    itemHeight: FILE_TREE_ITEM_HEIGHT,
+    offset: request.offset,
+    totalHeight: request.totalRows * FILE_TREE_ITEM_HEIGHT,
+    viewportHeight: height || request.fallbackHeight,
+  });
+  if (target !== null) scrollElement.scrollTop = target;
+  // Browsers snap scrollTop to device pixels, so a fractional target lands within a pixel.
+  return height > 0 && (target === null || Math.abs(scrollElement.scrollTop - target) < 1);
+}
+
 /**
  * Creates the tree model once for the component's lifetime. Later changes to
  * `options` are ignored; drive the model through its methods instead.
@@ -77,6 +111,8 @@ export function FileTree({
   const ownsFocus = useRef(false);
   const lastFocusedPath = useRef<string | null | undefined>(undefined);
   const [scrollTop, setScrollTop] = useState(0);
+  // A reveal the browser couldn't apply, as while the tree is hidden; retried once it has a size.
+  const pendingScroll = useRef<PendingReveal | null>(null);
   const [viewportHeight, setViewportHeight] = useState(FALLBACK_VIEWPORT_HEIGHT);
   const [hoveredPath, setHoveredPath] = useState<string | null>(null);
   const [focusWithin, setFocusWithin] = useState(false);
@@ -117,39 +153,53 @@ export function FileTree({
     const scrollElement = scrollRef.current;
     if (!scrollElement) return;
     const measure = () => {
-      const height = scrollElement.getBoundingClientRect().height || scrollElement.clientHeight;
+      const height = measuredHeight(scrollElement);
       if (height > 0) setViewportHeight(height);
+      const pending = pendingScroll.current;
+      if (height > 0 && pending) {
+        // The tree may have changed while hidden; a removed row has nothing to reveal.
+        const index = model.getVisibleIndexOfPath(pending.path);
+        const revealed =
+          index < 0 ||
+          scrollRowIntoView(scrollElement, {
+            index,
+            offset: pending.offset,
+            totalRows: model.getVisibleCount(),
+            fallbackHeight: height,
+          });
+        if (revealed) pendingScroll.current = null;
+      }
+      // Showing a hidden tree can move its scroll offset without a scroll event.
+      setScrollTop(scrollElement.scrollTop);
     };
     measure();
     if (typeof ResizeObserver === "undefined") return;
     const observer = new ResizeObserver(measure);
     observer.observe(scrollElement);
     return () => observer.disconnect();
-  }, []);
+  }, [model]);
 
   // Applies scroll requests from `scrollToPath`, and keeps the focused row in
   // view when keyboard focus moves while the tree owns DOM focus.
   useLayoutEffect(() => {
     const scrollElement = scrollRef.current;
     if (!scrollElement) return;
-    const scrollTo = (index: number, offset: "top" | "center" | "nearest") => {
-      const target = computeScrollTarget({
-        currentScrollTop: scrollElement.scrollTop,
+    const scrollTo = (index: number, path: string | null, offset: ScrollOffset) => {
+      const revealed = scrollRowIntoView(scrollElement, {
         index,
-        itemHeight,
         offset,
-        totalHeight,
-        viewportHeight: scrollElement.clientHeight || viewportHeight,
+        totalRows: visibleCount,
+        fallbackHeight: viewportHeight,
       });
-      if (target === null) return;
-      scrollElement.scrollTop = target;
-      setScrollTop(target);
+      // Draw at the offset the browser applied: a hidden tree ignores the write.
+      setScrollTop(scrollElement.scrollTop);
+      pendingScroll.current = revealed || path === null ? null : { path, offset };
     };
 
     const request = model.getScrollRequest();
     if (request) {
       model.clearScrollRequest(request.id);
-      scrollTo(request.visibleIndex, request.offset);
+      scrollTo(request.visibleIndex, request.path, request.offset);
       lastFocusedPath.current = focusedPath;
       return;
     }
@@ -159,11 +209,11 @@ export function FileTree({
     lastFocusedPath.current = focusedPath;
     if (isFirstRun) {
       // Reveal an initially selected row without taking focus.
-      scrollTo(focusedIndex, "nearest");
+      scrollTo(focusedIndex, focusedPath, "nearest");
       return;
     }
     if (!ownsFocus.current || !focusChanged || focusedPath === null) return;
-    scrollTo(focusedIndex, "nearest");
+    scrollTo(focusedIndex, focusedPath, "nearest");
     rowRefs.current.get(focusedPath)?.focus({ preventScroll: true });
   });
 
@@ -227,7 +277,11 @@ export function FileTree({
       <div
         ref={scrollRef}
         data-file-tree-scroll=""
-        onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
+        onScroll={(event) => {
+          // Once the tree has a size, a scroll by the reader replaces any reveal still waiting.
+          if (measuredHeight(event.currentTarget) > 0) pendingScroll.current = null;
+          setScrollTop(event.currentTarget.scrollTop);
+        }}
       >
         <div data-file-tree-list="" style={{ height: totalHeight }}>
           <div
