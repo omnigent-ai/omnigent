@@ -9,6 +9,7 @@ import { updateOverlayToastOffset } from "@/lib/updateOverlayInset";
 import { CommandPalette } from "./CommandPalette";
 import { QuickPickCommandPalette } from "./QuickPickCommandPalette";
 import { RecentSessionsSwitcher } from "./RecentSessionsSwitcher";
+import { ThemePicker } from "./ThemePicker";
 
 // Dev-only preview; lazy so the sample data never ships in production bundles.
 const ImportContextPreview = import.meta.env.DEV
@@ -81,6 +82,8 @@ export function AppShellOverlays({
         rightSidebarShortcutEnabled={!gridRoute}
         onGoToSession={goToSession}
       />
+      {/* "Select theme…" from ⌘K; previews each theme as the user moves through them. */}
+      <ThemePicker />
       <RecentSessionsSwitcher
         conversations={allConversations}
         activeSessionId={serverConversationId ?? null}

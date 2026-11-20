@@ -174,6 +174,7 @@ import { AppShellWorkspacePanels } from "./AppShellWorkspacePanels";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { AppShellOverlays } from "./AppShellOverlays";
 import { AppShellRootProviders } from "./AppShellRootProviders";
+import { replaceThemePicker } from "@/store/themePicker";
 import { commandViewForPath, useCommandSession } from "./commandContext";
 import { CloseShellDialog } from "./CloseShellDialog";
 import { CloseWindowDialog } from "./CloseWindowDialog";
@@ -2190,6 +2191,10 @@ function AppShellImpl() {
   // Bound here where the palette's open-state lives.
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const [sessionSearch, setSessionSearch] = useState(false);
+  // The palette replaces the theme picker rather than stacking on it, which ends its preview.
+  useEffect(() => {
+    if (commandPaletteOpen) replaceThemePicker();
+  }, [commandPaletteOpen]);
   // Stable handlers so the memoized Sidebar doesn't re-render on AppShell's
   // frequent re-renders (chatStore status churn during a bind). Inline
   // callbacks would give it fresh props each time and defeat the memo.

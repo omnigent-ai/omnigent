@@ -3,11 +3,12 @@
 // palettes list stay in `useAppCommands`.
 
 import { useMemo } from "react";
-import { KeyboardIcon, MessagesSquareIcon, SearchIcon } from "lucide-react";
+import { KeyboardIcon, MessagesSquareIcon, PaletteIcon, SearchIcon } from "lucide-react";
 
 import { openKeyboardShortcuts } from "@/components/KeyboardShortcutsDialog";
 import { openFindFromCommand, useCanOpenFindFromCommand } from "@/lib/findRouting";
 import { AVAILABLE, HIDDEN, type PaletteCommand } from "@/store/paletteCommands";
+import { openThemePicker, SELECT_THEME_COMMAND } from "@/store/themePicker";
 
 import { useSettingsCommands } from "./settingsCommands";
 
@@ -57,6 +58,13 @@ export function useQuickPickAppCommands({
         // Opens the reference once the palette has closed, so it keeps focus.
         movesFocus: true,
         run: openKeyboardShortcuts,
+      },
+      {
+        ...SELECT_THEME_COMMAND,
+        icon: PaletteIcon,
+        // Opens the picker once the palette has closed, so it keeps focus.
+        movesFocus: true,
+        run: openThemePicker,
       },
       ...settingsCommands,
     ],

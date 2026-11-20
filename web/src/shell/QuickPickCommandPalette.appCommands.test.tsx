@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { KEYBOARD_SHORTCUTS_EVENT } from "@/components/KeyboardShortcutsDialog";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { registerFindSurface } from "@/lib/findRouting";
+import { useThemePickerStore } from "@/store/themePicker";
 import { readTerminalThemeMode } from "@/lib/terminalThemePreferences";
 
 import { QuickPickCommandPalette } from "./QuickPickCommandPalette";
@@ -156,6 +157,16 @@ describe("QuickPick ⌘K app commands", () => {
     fireEvent.keyDown(input, { key: "Enter" });
     expect(opened).not.toHaveBeenCalled();
     await waitFor(() => expect(opened).toHaveBeenCalledOnce());
+  });
+
+  it("opens the theme picker once the palette has closed", async () => {
+    onTestFinished(() => useThemePickerStore.setState({ open: false, replaced: false }));
+    const input = renderPalette();
+    fireEvent.change(input, { target: { value: "select theme" } });
+    expect(actionNames()[0]).toContain("Select theme…");
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(useThemePickerStore.getState().open).toBe(false);
+    await waitFor(() => expect(useThemePickerStore.getState().open).toBe(true));
   });
 
   it("offers Find only while something on screen can find, and opens it there", async () => {
