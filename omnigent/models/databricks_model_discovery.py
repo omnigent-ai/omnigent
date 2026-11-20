@@ -112,6 +112,17 @@ def _models_by_claude_family(model_ids: list[str], *, marker: str) -> dict[str, 
     return result
 
 
+def claude_models_by_family(model_ids: Iterable[str]) -> dict[str, str]:
+    """Map each Claude family in *model_ids* to its newest ``system.ai.`` id.
+
+    :param model_ids: Catalog ids in either spelling, e.g.
+        ``["databricks-claude-opus-5-5", "databricks-gpt-5-5"]``.
+    :returns: Family alias → newest id, e.g.
+        ``{"opus": "system.ai.claude-opus-5-5"}``.
+    """
+    return _models_by_claude_family(_prefer_system_model_spelling(model_ids), marker="claude-")
+
+
 def _all_claude_models(model_ids: list[str], *, marker: str) -> tuple[str, ...]:
     """Keep every Claude-family id in *model_ids*, newest first per family."""
     claude_ids = [
