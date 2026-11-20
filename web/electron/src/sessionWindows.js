@@ -25,23 +25,47 @@ function sessionWindowPath(sessionId) {
 }
 
 /**
- * Whether `pageUrl` still shows `sessionId` (the user may have navigated the window away).
+ * `pageUrl` without the pop-out marker, so a New Window cloned from a pop-out opens as a
+ * normal window. Other query parameters and unparsable URLs pass through unchanged.
+ *
+ * @param {string | undefined} pageUrl
+ * @returns {string | undefined}
+ */
+function withoutSessionWindowQuery(pageUrl) {
+  let url;
+  try {
+    url = new URL(pageUrl ?? "");
+  } catch {
+    return pageUrl;
+  }
+  if (url.searchParams.get("window") !== "session") return pageUrl;
+  url.searchParams.delete("window");
+  return url.toString();
+}
+
+/**
+ * Whether a pop-out has left `sessionId` for another page on its server. A window still
+ * loading (blank URL) or signing in (identity provider's URL) has not left it.
  *
  * @param {string} pageUrl
+ * @param {string} serverUrl
  * @param {string} sessionId
  * @returns {boolean}
  */
-function showsSession(pageUrl, sessionId) {
+function leftSession(pageUrl, serverUrl, sessionId) {
+  let page;
   try {
-    return new URL(pageUrl).pathname.replace(/\/+$/, "").endsWith(`/c/${sessionId}`);
+    page = new URL(pageUrl);
+    if (page.origin !== new URL(serverUrl).origin) return false;
   } catch {
     return false;
   }
+  return !page.pathname.replace(/\/+$/, "").endsWith(`/c/${sessionId}`);
 }
 
 /**
  * The open window already popped out for this server's session, so opening it again
- * focuses that window instead of stacking a duplicate.
+ * focuses that window instead of stacking a duplicate, even before its page has loaded.
  *
  * @template {{isDestroyed(): boolean, webContents: {getURL(): string}}} W
  * @param {Map<W, {serverUrl?: string | null, sessionWindowId?: string}>} windows
@@ -52,7 +76,7 @@ function findSessionWindow(windows, { serverUrl, sessionId }) {
   for (const [win, state] of windows) {
     if (win.isDestroyed()) continue;
     if (state.sessionWindowId !== sessionId || state.serverUrl !== serverUrl) continue;
-    if (showsSession(win.webContents.getURL(), sessionId)) return win;
+    if (!leftSession(win.webContents.getURL(), serverUrl, sessionId)) return win;
   }
   return null;
 }
@@ -61,4 +85,5 @@ module.exports = {
   SESSION_WINDOW_SIZE,
   findSessionWindow,
   sessionWindowPath,
+  withoutSessionWindowQuery,
 };

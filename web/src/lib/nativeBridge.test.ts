@@ -921,10 +921,14 @@ describe("desktop session windows", () => {
     expect(await openDesktopSessionWindow("conv_1")).toBe(false);
 
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    setSessionWindowBridge(() => Promise.reject(new Error("ipc down")));
-    expect(await openDesktopSessionWindow("conv_1")).toBe(false);
-    setSessionWindowBridge(() => Promise.resolve(false));
-    expect(await openDesktopSessionWindow("conv_1")).toBe(false);
-    warn.mockRestore();
+    try {
+      setSessionWindowBridge(() => Promise.reject(new Error("ipc down")));
+      expect(await openDesktopSessionWindow("conv_1")).toBe(false);
+      expect(warn).toHaveBeenCalled();
+      setSessionWindowBridge(() => Promise.resolve(false));
+      expect(await openDesktopSessionWindow("conv_1")).toBe(false);
+    } finally {
+      warn.mockRestore();
+    }
   });
 });

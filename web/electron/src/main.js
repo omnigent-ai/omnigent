@@ -149,7 +149,12 @@ const {
   registerDesktopCommandStateReset,
   sanitizeDesktopCommandState,
 } = require("./desktopCommands");
-const { SESSION_WINDOW_SIZE, findSessionWindow, sessionWindowPath } = require("./sessionWindows");
+const {
+  SESSION_WINDOW_SIZE,
+  findSessionWindow,
+  sessionWindowPath,
+  withoutSessionWindowQuery,
+} = require("./sessionWindows");
 const omnigentCli = require("./omnigent_cli");
 const { workspaceSocketRequest } = require("./workspaceSocket");
 const { createWorkspaceSshForwards } = require("./workspaceSshForwards");
@@ -3418,7 +3423,7 @@ function isFindBarSender(event) {
  */
 function newWindow() {
   const win = activeWindow();
-  const current = win?.webContents.getURL();
+  const current = withoutSessionWindowQuery(win?.webContents.getURL());
   // Cloning an ephemeral (multi-server) window keeps the clone
   // ephemeral, so Change Server… from it still won't touch saved settings.
   // The clone's server is its source's, not its /c/<id> URL (browserTabs.js keys tabs by it).

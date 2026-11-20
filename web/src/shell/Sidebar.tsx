@@ -5117,7 +5117,7 @@ export function ConversationMenuItems({
 }: {
   /** The menu family to render items from; the kebab's dropdown by default. */
   components?: MenuComponents;
-  /** On a kanban card, only actions that change the board: no nested agent, grid, pin, share or automation. */
+  /** On a kanban card, only actions that change the board: no nested agent, grid, new window, pin, share or automation. */
   kanbanCard?: boolean;
   conversation: Conversation;
   /** Session menu commands whose chords to list (the open session's row only). */
@@ -5303,7 +5303,7 @@ export function ConversationMenuItems({
           </C.SubContent>
         </C.Sub>
       )}
-      {openSessionWindow && (
+      {openSessionWindow && !kanbanCard && (
         <C.Item
           className="mobile-touch-target"
           data-testid="open-session-window"

@@ -14,7 +14,7 @@ import { useSyncExternalStore, type ReactElement } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import type * as IdentityModule from "@/lib/identity";
@@ -245,6 +245,10 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
 // Route so `useParams` populates), making that row the active one — the
 // rest of the suite renders at `/` where no row is active. `info` pins the
 // server sharing policy via CapabilitiesProvider (default "loading" → on).
+function CurrentPath() {
+  return <span data-testid="current-path">{useLocation().pathname}</span>;
+}
+
 function renderSidebar(
   activeId?: string,
   info?: ServerInfo,
@@ -1432,20 +1436,6 @@ describe("mark as unread", () => {
 });
 
 describe("right-click context menu", () => {
-  it("opens the session in its own window without leaving the current page", () => {
-    const popup = { location: { pathname: "blank", href: "about:blank" }, focus: vi.fn() };
-    const open = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
-    renderSidebar();
-
-    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
-    fireEvent.click(screen.getByRole("menuitem", { name: "Open in new window" }));
-
-    expect(open).toHaveBeenCalledWith("", "omnigent-session-conv_1", "popup,width=960,height=820");
-    expect(popup.location.href).toBe("/c/conv_1?window=session");
-    expect(popup.focus).toHaveBeenCalled();
-    open.mockRestore();
-  });
-
   it("offers no new window on a mobile viewport", () => {
     mocks.isMobile = true;
     renderSidebar();
@@ -1523,6 +1513,32 @@ describe("right-click context menu", () => {
       // inline rename input appears.
       fireEvent.click(screen.getByTestId("rename-conversation"));
       expect(screen.getByTestId("rename-conversation-input")).toBeInTheDocument();
+    },
+  );
+
+  it.each(["kebab", "context"])(
+    "opens the session in its own window from %s without leaving the current page",
+    (menu) => {
+      const popup = { location: { pathname: "blank", href: "about:blank" }, focus: vi.fn() };
+      const open = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
+      renderSidebar(undefined, undefined, { header: <CurrentPath /> });
+
+      if (menu === "kebab") {
+        fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+      } else {
+        fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+      }
+      fireEvent.click(screen.getByTestId("open-session-window"));
+
+      expect(open).toHaveBeenCalledWith(
+        "",
+        "omnigent-session-conv_1",
+        "popup,width=960,height=820",
+      );
+      expect(popup.location.href).toBe("/c/conv_1?window=session");
+      expect(popup.focus).toHaveBeenCalled();
+      expect(screen.getByTestId("current-path")).toHaveTextContent(/^\/$/);
+      open.mockRestore();
     },
   );
 

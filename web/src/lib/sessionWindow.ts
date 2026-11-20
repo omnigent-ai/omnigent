@@ -26,7 +26,7 @@ export function startsAsSessionWindow(): boolean {
   const params = new URLSearchParams(window.location.search);
   if (params.get(SESSION_WINDOW_PARAM) !== SESSION_WINDOW_VALUE) return false;
   const desktop = (window as { omnigentDesktop?: { kind?: string } }).omnigentDesktop;
-  return desktop?.kind === "electron" || window.opener != null;
+  return desktop?.kind === "electron" || Boolean(window.opener);
 }
 
 /** Set once before first paint by `applyDesktopAppAttribute`. */
