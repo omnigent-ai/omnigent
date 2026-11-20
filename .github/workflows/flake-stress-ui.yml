@@ -87,7 +87,6 @@ jobs:
         id: gen
         env:
           ATTEMPTS: ${{ github.event.inputs.attempts }}
-          OMNIGENT_E2E_RECORD_DIR: artifacts/demo-videos
           TEST_TARGET: ${{ github.event.inputs.test_target }}
           EXTRA_ARGS: ${{ github.event.inputs.extra_pytest_args }}
         run: |
@@ -282,6 +281,7 @@ jobs:
         uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@75d817057138bd2cf5cd5af1cd954fdaca12e03d
         with:
           harness: claude
+          version: "2.1.323"
 
       - name: Install Codex CLI
         uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@75d817057138bd2cf5cd5af1cd954fdaca12e03d
@@ -310,6 +310,7 @@ jobs:
         run: |
           mkdir -p artifacts "artifacts/basetemp-${{ matrix.attempt }}"
           git rev-parse HEAD > artifacts/demo-source.txt
+          export OMNIGENT_E2E_RECORD_DIR="$PWD/artifacts/demo-videos"
           # shellcheck disable=SC2086
           uv run pytest $TEST_TARGET \
             --ui-skip-build \
