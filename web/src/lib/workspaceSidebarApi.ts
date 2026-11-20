@@ -3,60 +3,24 @@
 // other method answers null, meaning no route serves it yet, until the client lands.
 
 import type { FileContentResponse } from "@/hooks/useFileContent";
+import type { ContentSearchResult } from "@/lib/contentSearch";
 import {
+  type FileSearchOptions,
+  type FoundEntries,
   listDirectoryViaWorkspaceApi,
   type ListedEntry,
   readFileViaWorkspaceApi,
+  type TextSearchOptions,
 } from "@/lib/workspaceApi";
 
-// ── Search results, in the REST routes' shapes ────────────────────────────────
+// ── Search results, in the REST routes' shapes, as the client returns them ─────
 
-/** File search matches, in the REST search's shape. */
-export interface FoundEntries {
-  /** Paths relative to the searched directory, as the REST search reports them. */
-  data: ListedEntry[];
-  /** The search returned its limit, so more entries may match. */
-  hasMore: boolean;
-  /** Some files weren't searched, so a missing file may still exist. */
-  truncated: boolean;
-}
-
-export interface FileSearchOptions {
-  /** Workspace-relative directory to search under, `""` for the root. */
-  path: string;
-  /** Comma-separated globs, e.g. `"*.{js,ts}, src/**"`. */
-  include: string;
-  exclude: string;
-  /** Maximum entries, 1 to 500. */
-  limit: number;
-}
-
-export interface TextSearchOptions {
-  caseSensitive: boolean;
-  /** Read the query as a ripgrep regular expression. */
-  regex: boolean;
-  /** Comma-separated globs; an include also searches files ignore rules skip. */
-  include: string;
-  exclude: string;
-}
-
-/** One matching line, for its first match; offsets count UTF-16 code units. */
-export interface ContentMatch {
-  path: string;
-  line: number;
-  column: number;
-  text: string;
-  match_start: number;
-  match_end: number;
-}
-
-export interface ContentSearchResult {
-  matches: ContentMatch[];
-  truncated: boolean;
-  warning: string | null;
-}
+export type { ContentMatch, ContentSearchResult } from "@/lib/contentSearch";
+export type { FileSearchOptions, FoundEntries, TextSearchOptions } from "@/lib/workspaceApi";
 
 // ── Git comparisons, as the workspace API's messages ──────────────────────────
+// Plain views of the generated messages, so callers and tests build them as literals;
+// the client's answers are assigned to them below, so a changed message fails to compile.
 
 export const ComparisonKind = {
   UNSPECIFIED: 0,
