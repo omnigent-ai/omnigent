@@ -154,7 +154,7 @@ def test_message_font_size_survives_rotation_and_reload(
         ]
     )
     viewports = (
-        [(390, 844), (844, 390), (390, 844)] if touch else [(767, 844), (768, 844), (1280, 844)]
+        [(390, 844), (844, 390), (390, 844)] if touch else [(1180, 844), (1181, 844), (1280, 844)]
     )
     page.set_viewport_size({"width": viewports[0][0], "height": viewports[0][1]})
     page.goto(chat.url)
@@ -174,11 +174,11 @@ def test_message_font_size_survives_rotation_and_reload(
             if reload:
                 page.reload()
             assert page.evaluate("matchMedia('(pointer: coarse)').matches") is touch
-            interface_px = saved_size if saved_size is not None else (15 if width < 768 else 14)
+            interface_px = saved_size if saved_size is not None else (15 if width < 1181 else 14)
             message_px = interface_px
             for element in prose:
                 expect(element).to_have_css("font-size", f"{message_px}px")
-            expect(prose[1]).to_have_css("line-height", f"{message_px * 1.8:g}px")
+            expect(prose[1]).to_have_css("line-height", f"{message_px * 1.6:g}px")
             for selector in ('[data-streamdown="inline-code"]', _CODE_BODY):
                 expect(assistant.locator(selector)).to_have_css(
                     "font-size", f"{message_px * 0.875:g}px"
@@ -214,7 +214,7 @@ def test_large_message_fallback_keeps_message_font_size(
         for scope in ('[data-role="user"]', '[data-testid="assistant-text-section"]'):
             fallback = page.locator(f"{scope} .whitespace-pre-wrap.break-all")
             expect(fallback).to_contain_text("VISIBLE_FALLBACK_TAIL")
-            expected_px = (15 if width < 768 else 14) if touch else 13
+            expected_px = 15 if width < 1181 else 13
             expect(fallback).to_have_css("font-size", f"{expected_px}px")
 
 
@@ -240,7 +240,7 @@ def test_custom_browser_font_default_matches_rendered_sizes_and_settings(
         )
         page.set_viewport_size({"width": 800, "height": 844})
         page.goto(chat.url)
-        assert not page.evaluate("matchMedia('(min-width: 48rem)').matches")
+        assert not page.evaluate("matchMedia('(min-width: 73.8125rem)').matches")
         assert not page.evaluate("matchMedia('(pointer: coarse)').matches")
         for selector in ('[data-role="user"] p', '[data-testid="assistant-text-section"] p'):
             expect(page.locator(selector)).to_have_css("font-size", "15px")
@@ -1091,7 +1091,7 @@ def test_tool_rows_read_as_actions_with_their_outcome(
         }""")
         # The path must retain a readable prefix beside its verb, not disappear atomically.
         assert geometry["visiblePathWidth"] >= 44, geometry
-        if app_kind:
+        if width < 1181:
             assert geometry["path"]["height"] >= 44, geometry
             assert geometry["path"]["width"] >= 44, geometry
             assert geometry["path"]["left"] >= geometry["verb"]["right"], geometry
@@ -1344,7 +1344,7 @@ def test_failed_edit_rows_show_their_error(
 def test_automation_context_is_hidden_from_transcript(
     page: Page, chat_session_contract: ChatSessionContract
 ) -> None:
-    from omnigent.server.scheduled.fire import UNATTENDED_RUN_NOTE
+    from omnigent.server.scheduled.fire import unattended_run_note
 
     chat = chat_session_contract
     chat.set_items(
@@ -1352,7 +1352,7 @@ def test_automation_context_is_hidden_from_transcript(
             message_item(
                 "automation-task",
                 "user",
-                f"Summarize **today's changes**.\n\n{UNATTENDED_RUN_NOTE}",
+                f"Summarize **today's changes**.\n\n{unattended_run_note(1_794_895_414)}",
                 response_id="automation-turn",
             )
         ]
@@ -1362,6 +1362,7 @@ def test_automation_context_is_hidden_from_transcript(
     expect(user).to_contain_text("Summarize today's changes.")
     expect(user).not_to_contain_text("no one is watching")
     expect(user).not_to_contain_text("omnigent-automation-context")
+    expect(user).not_to_contain_text("Run time:")
 
 
 @pytest.mark.parametrize("width", [1280, 390], ids=["desktop", "mobile"])

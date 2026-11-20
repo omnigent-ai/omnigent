@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
+import { journalEntry, journalPlan } from "@/test/journalFixtures";
+import { planSteps } from "./sessionJournal";
 
-import { describeWorkflowRun, type WorkflowRun } from "./workflowRuns";
+import { describeWorkflowRun, isWorkflowRunWorking, type WorkflowRun } from "./workflowRuns";
 
 function run(
   progress: Partial<WorkflowRun["progress"]>,
@@ -8,6 +10,7 @@ function run(
 ): WorkflowRun {
   return {
     id: "c".repeat(32),
+    planGraphRevision: "graph-0",
     sessionId: "a".repeat(32),
     title: "Fix the upload test",
     startedAt: 1_762_900_000,
@@ -30,6 +33,33 @@ describe("describeWorkflowRun", () => {
 
   it("says a run whose steps are all done is done", () => {
     expect(describeWorkflowRun(run({ done: 5 }))).toEqual({ kind: "done", label: "Done" });
+    const completed = {
+      ...run({ total: 2, done: 1, failed: 1 }),
+      steps: planSteps(journalPlan(0, ["work"], ["report", ["work"]])),
+      statuses: [
+        journalEntry(1, {
+          kind: "status",
+          step: "work",
+          content: { status: "failed", graph_revision: "graph-0" },
+        }),
+        journalEntry(2, {
+          kind: "status",
+          step: "report",
+          content: { status: "done", graph_revision: "graph-0" },
+        }),
+      ],
+    };
+    expect(describeWorkflowRun(completed)).toEqual({ kind: "done", label: "Finished, 1 failed" });
+    const legacy = {
+      ...completed,
+      planGraphRevision: 0,
+      statuses: [
+        journalEntry(1, { kind: "status", step: "work", content: { status: "failed" } }),
+        journalEntry(2, { kind: "status", step: "report", content: { status: "done" } }),
+      ],
+    };
+    expect(describeWorkflowRun(legacy)).toEqual({ kind: "done", label: "Finished, 1 failed" });
+    expect(describeWorkflowRun({ ...legacy, planGraphRevision: 3 }).kind).toBe("failed");
   });
 
   it("shows a running run's progress, even past a failed step it may retry", () => {
@@ -37,6 +67,12 @@ describe("describeWorkflowRun", () => {
       kind: "running",
       label: "2 of 5 done",
     });
+  });
+
+  it("keeps older-server activity when authoritative graph context is absent", () => {
+    expect(
+      describeWorkflowRun({ ...run({ done: 5 }, "running"), planGraphRevision: undefined }),
+    ).toEqual({ kind: "running", label: "5 of 5 done" });
   });
 
   it("counts background work while keeping completed and input states", () => {
@@ -49,6 +85,17 @@ describe("describeWorkflowRun", () => {
       describeWorkflowRun({ ...active, progress: { ...active.progress, needsInput: 1 } }).kind,
     ).toBe("waiting");
     expect(describeWorkflowRun(active, false).kind).toBe("stopped");
+  });
+
+  it("counts a run whose sandbox is still launching as running", () => {
+    const launching = { ...run({}), sandboxLaunching: true };
+    expect(isWorkflowRunWorking(launching)).toBe(true);
+    expect(describeWorkflowRun(launching)).toEqual({ kind: "running", label: "0 of 5 done" });
+    // A failed launch ends the launch and fails the session.
+    const failed = { ...launching, sandboxLaunching: false, sessionStatus: "failed" as const };
+    expect(isWorkflowRunWorking(failed)).toBe(false);
+    expect(describeWorkflowRun(failed).label).toBe("Session failed · 0 of 5 done");
+    expect(isWorkflowRunWorking({ ...launching, isCurrent: false })).toBe(false);
   });
 
   it("says a stopped run failed, or how far it got", () => {

@@ -1,4 +1,5 @@
 import {
+  isPlanComplete,
   type JournalEntry,
   type JournalPlanStep,
   type StepProgress,
@@ -9,6 +10,8 @@ import {
 export interface WorkflowRun {
   /** The ID of the plan entry that started the run. */
   id: string;
+  /** Graph ID, or earliest unchanged legacy graph position; absent on older servers. */
+  planGraphRevision?: string | number;
   sessionId: string;
   /** The session's title; empty when it has none yet. */
   title: string;
@@ -19,8 +22,10 @@ export interface WorkflowRun {
   sessionStatus: "idle" | "running" | "failed";
   /** Work that outlives the parent turn, such as background shells or an active goal. */
   backgroundWorkRunning?: boolean;
+  /** The session's sandbox is still launching, so the run is starting; absent on older servers. */
+  sandboxLaunching?: boolean;
   archived: boolean;
-  /** The run's starting steps, counted by their current status. */
+  /** The run's latest steps, counted by their current status. */
   progress: {
     total: number;
     started: number;
@@ -28,15 +33,44 @@ export interface WorkflowRun {
     needsInput: number;
     failed: number;
   };
-  /** The steps of the plan that started the run. */
+  /** The latest plan's steps within this invocation. */
   steps: JournalPlanStep[];
   /** Each of those steps' newest status entry. */
   statuses: JournalEntry[];
+  /** The saved workflow the run follows; absent on older servers. */
+  workflowId?: string;
+  /** The session that started the run, when another session did and you can read it. */
+  startedBy?: WorkflowRunStarter;
+  /** Its workflow's name when the workflow is yours; `null` for someone else's or a deleted one. */
+  workflowName?: string | null;
+  /** The first page of the workflow runs below this one, each right after the run that started it. */
+  descendantRuns?: WorkflowRun[];
+  /** How many workflow runs are below this one, on every page. */
+  descendantRunCount?: number;
+  /** Continues `descendantRuns`; `null` when they are all here. */
+  descendantRunsCursor?: string | null;
+  /** Whether any run below this one, on any page, is working or waiting for input. */
+  descendantRunsActive?: boolean;
 }
 
-/** The session's turn, delegated work, or work left running between turns. */
+/** The session that started a workflow run. */
+export interface WorkflowRunStarter {
+  sessionId: string;
+  /** Its title; empty when it has none yet. */
+  title: string;
+}
+
+/** The run is starting: its session waits on a sandbox that is still launching. */
+export function isWorkflowRunLaunching(run: WorkflowRun): boolean {
+  return run.isCurrent && run.sandboxLaunching === true;
+}
+
+/** The session's turn, delegated work, work left running between turns, or its sandbox launch. */
 export function isWorkflowRunWorking(run: WorkflowRun): boolean {
-  return run.isCurrent && (run.sessionStatus === "running" || run.backgroundWorkRunning === true);
+  return (
+    isWorkflowRunLaunching(run) ||
+    (run.isCurrent && (run.sessionStatus === "running" || run.backgroundWorkRunning === true))
+  );
 }
 
 /** Where each of the run's steps stands, as the Tasks tab works it out. */
@@ -56,8 +90,8 @@ export type WorkflowRunState =
   | { kind: "stopped"; label: string };
 
 /**
- * Where a run stands, for its row. A question for the user comes first, then
- * a finished run; a running session shows its progress; otherwise a failed
+ * Where a run stands, for its row. A finished run comes first, then a question
+ * for the user; a running session shows its progress; otherwise a failed
  * step or session says so, and a run that stopped partway shows its count.
  */
 export function describeWorkflowRun(
@@ -66,8 +100,14 @@ export function describeWorkflowRun(
 ): WorkflowRunState {
   const { total, done, needsInput, failed } = run.progress;
   const count = `${done} of ${total} done`;
+  const unknownActivePlan = run.planGraphRevision === undefined && run.isCurrent && sessionWorking;
+  if (
+    (run.planGraphRevision !== undefined &&
+      isPlanComplete(runStepProgress(run, sessionWorking), run.planGraphRevision)) ||
+    (!unknownActivePlan && total > 0 && done === total)
+  )
+    return { kind: "done", label: failed > 0 ? `Finished, ${failed} failed` : "Done" };
   if (needsInput > 0) return { kind: "waiting", label: "Waiting for you" };
-  if (total > 0 && done === total) return { kind: "done", label: "Done" };
   if (run.isCurrent && sessionWorking) return { kind: "running", label: count };
   if (failed > 0) return { kind: "failed", label: `Failed · ${count}` };
   if (run.isCurrent && run.sessionStatus === "failed")

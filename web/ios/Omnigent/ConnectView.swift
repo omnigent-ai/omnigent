@@ -12,6 +12,9 @@ struct ConnectView: View {
   @State private var message: String?
   @State private var isConnecting = false
   @State private var infoLink: InfoLink?
+  @FocusState private var isFieldFocused: Bool
+  @Environment(\.accessibilityReduceMotion) private var reduceMotion
+  @Environment(\.verticalSizeClass) private var verticalSizeClass
 
   init(prefill: String?, error: String?, onConnect: @escaping (URL) -> Void) {
     self.prefill = prefill
@@ -22,97 +25,28 @@ struct ConnectView: View {
   }
 
   var body: some View {
-    VStack {
-      Spacer(minLength: 24)
-
+    GeometryReader { proxy in
+      let topInset = proxy.safeAreaInsets.top
       VStack(spacing: 0) {
-        Image(colorScheme == .dark ? "OmnigentLogoReverse" : "OmnigentLogo")
-          .resizable()
-          .scaledToFit()
-          .frame(height: 80)
-          .padding(.bottom, 12)
+        heroBand(topInset: topInset)
+          .frame(height: topInset + (isBandCollapsed ? collapsedBandHeight : expandedBandHeight))
+          .contentShape(Rectangle())
+          .onTapGesture { isFieldFocused = false }
 
-        Text("Enter the URL of the Omnigent server.")
-          .font(.system(size: 14))
-          .lineSpacing(2)
-          .multilineTextAlignment(.center)
-          .foregroundStyle(DesignTokens.mutedForeground(colorScheme))
-          .padding(.bottom, 24)
-
-        VStack(alignment: .leading, spacing: 8) {
-          Text("Server URL")
-            .font(.system(size: 14, weight: .medium))
-            .foregroundStyle(DesignTokens.foreground(colorScheme))
-
-          TextField(defaultServerURL, text: $serverURL)
-            .textInputAutocapitalization(.never)
-            .autocorrectionDisabled()
-            .keyboardType(.URL)
-            .accessibilityIdentifier("server-url-field")
-            .font(.system(size: 14))
-            .padding(.horizontal, 12)
-            .frame(height: 38)
-            .overlay {
-              RoundedRectangle(cornerRadius: DesignTokens.radius)
-                .stroke(DesignTokens.border(colorScheme), lineWidth: 1)
-            }
-            .submitLabel(.go)
-            .onSubmit(connect)
-            .disabled(isConnecting)
+        ScrollView {
+          form
+            .frame(maxWidth: 384)
+            .padding(.horizontal, 16)
+            .padding(.bottom, 24)
+            .frame(maxWidth: .infinity)
         }
-
-        Button(action: connect) {
-          if isConnecting {
-            HStack(spacing: 8) {
-              ProgressView()
-                .tint(primaryForeground)
-              Text("Connecting…")
-            }
-          } else {
-            Text("Connect")
-          }
-        }
-        .buttonStyle(PrimaryButtonStyle(background: primary, foreground: primaryForeground))
-        .accessibilityIdentifier("connect-button")
-        .padding(.top, 16)
-        .disabled(isConnecting)
-        // Fires the moment connect() flips isConnecting, so the tap is
-        // acknowledged by touch even before the spinner appears.
-        .sensoryFeedback(.impact(weight: .light), trigger: isConnecting)
-
-        Text(message ?? "")
-          .font(.system(size: 13))
-          .lineSpacing(2)
-          .foregroundStyle(Color(red: 0.784, green: 0.196, blue: 0.298))
-          .frame(maxWidth: .infinity, minHeight: 38, alignment: .leading)
-          .padding(.top, 12)
-
-        // Preset servers sit above recents under their own heading, so an entry
-        // the organization vouches for doesn't read as something the user
-        // happened to type before.
-        if !managedConfiguration.serverURLs.isEmpty {
-          serverSection(
-            title: "Provided by your organization",
-            servers: managedConfiguration.serverURLs.map(\.absoluteString),
-            identifier: "managed-servers"
-          )
-        }
-
-        if !visibleRecentServers.isEmpty {
-          serverSection(
-            title: "Recent servers",
-            servers: visibleRecentServers,
-            identifier: "recent-servers"
-          )
-        }
+        .scrollDismissesKeyboard(.interactively)
       }
-      .frame(maxWidth: 384)
-
-      Spacer(minLength: 24)
+      .ignoresSafeArea(.container, edges: [.top, .horizontal])
+      .animation(
+        reduceMotion ? nil : .timingCurve(0.22, 1, 0.36, 1, duration: 0.5), value: isFieldFocused)
     }
-    .padding(.horizontal, 16)
-    .frame(maxWidth: .infinity, maxHeight: .infinity)
-    .background(DesignTokens.background(colorScheme))
+    .background(DesignTokens.wizardBackground(colorScheme).ignoresSafeArea())
     .overlay(alignment: .topTrailing) {
       infoMenu
         .padding(.trailing, 16)
@@ -121,6 +55,118 @@ struct ConnectView: View {
     .sheet(item: $infoLink) { link in
       SafariView(url: link.url)
         .ignoresSafeArea()
+    }
+  }
+
+  // The animated band, fading into the page at its bottom edge. The logo keeps a
+  // fixed offset from the top, so collapsing the band slides it out the top
+  // rather than re-centering it into the shrinking band.
+  private func heroBand(topInset: CGFloat) -> some View {
+    WelcomeBlobBackground()
+      .overlay(alignment: .top) {
+        Image("OmnigentStarfish")
+          .resizable()
+          .scaledToFit()
+          .frame(width: 56, height: 56)
+          .padding(.top, topInset + (expandedBandHeight - 56) / 2)
+          .opacity(isBandCollapsed ? 0 : 1)
+          .accessibilityHidden(true)
+      }
+      .clipped()
+      .mask(
+        LinearGradient(
+          stops: [.init(color: .black, location: 0.7), .init(color: .clear, location: 1)],
+          startPoint: .top, endPoint: .bottom)
+      )
+  }
+
+  // Landscape iPhones lack the height for the full band, so it stays collapsed there.
+  private var isBandCollapsed: Bool {
+    isFieldFocused || verticalSizeClass == .compact
+  }
+
+  private var form: some View {
+    VStack(spacing: 0) {
+      Text("Meet Omnigent")
+        .font(.system(size: 28))
+        .tracking(-0.84)
+        .foregroundStyle(DesignTokens.foreground(colorScheme))
+        .accessibilityAddTraits(.isHeader)
+
+      Text("One interface for all your coding agents")
+        .font(.system(size: 16))
+        .multilineTextAlignment(.center)
+        .foregroundStyle(DesignTokens.mutedForeground(colorScheme))
+        .padding(.top, 4)
+        .padding(.bottom, 28)
+
+      VStack(alignment: .leading, spacing: 8) {
+        Text("Server URL")
+          .font(.system(size: 14, weight: .medium))
+          .foregroundStyle(DesignTokens.foreground(colorScheme))
+
+        TextField(defaultServerURL, text: $serverURL)
+          .textInputAutocapitalization(.never)
+          .autocorrectionDisabled()
+          .keyboardType(.URL)
+          .accessibilityIdentifier("server-url-field")
+          .font(.system(size: 14))
+          .padding(.horizontal, 12)
+          .frame(height: 38)
+          .overlay {
+            RoundedRectangle(cornerRadius: DesignTokens.radius)
+              .stroke(DesignTokens.border(colorScheme), lineWidth: 1)
+          }
+          .focused($isFieldFocused)
+          .submitLabel(.go)
+          .onSubmit(connect)
+          .disabled(isConnecting)
+      }
+
+      Button(action: connect) {
+        if isConnecting {
+          HStack(spacing: 8) {
+            ProgressView()
+              .tint(primaryForeground)
+            Text("Connecting…")
+          }
+        } else {
+          Text("Connect")
+        }
+      }
+      .buttonStyle(PrimaryButtonStyle(background: primary, foreground: primaryForeground))
+      .accessibilityIdentifier("connect-button")
+      .padding(.top, 16)
+      .disabled(isConnecting)
+      // Fires the moment connect() flips isConnecting, so the tap is
+      // acknowledged by touch even before the spinner appears.
+      .sensoryFeedback(.impact(weight: .light), trigger: isConnecting)
+
+      Text(message ?? "")
+        .font(.system(size: 13))
+        .lineSpacing(2)
+        .foregroundStyle(Color(red: 0.784, green: 0.196, blue: 0.298))
+        .frame(maxWidth: .infinity, minHeight: 38, alignment: .leading)
+        .padding(.top, 12)
+
+      // Preset servers sit above recents under their own heading, so an entry
+      // the organization vouches for doesn't read as something the user
+      // happened to type before.
+      if !managedConfiguration.serverURLs.isEmpty {
+        serverSection(
+          title: "Provided by your organization",
+          servers: managedConfiguration.serverURLs.map(\.absoluteString),
+          identifier: "managed-servers"
+        )
+      }
+
+      if !visibleRecentServers.isEmpty {
+        serverSection(
+          title: "Recent servers",
+          servers: visibleRecentServers,
+          identifier: "recent-servers"
+        )
+      }
     }
   }
 
@@ -264,6 +310,10 @@ private struct PrimaryButtonStyle: ButtonStyle {
       .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
   }
 }
+
+// Matches the desktop onboarding's landing and server-list panel heights.
+private let expandedBandHeight: CGFloat = 308
+private let collapsedBandHeight: CGFloat = 64
 
 private let defaultServerURL: String = {
   #if DEBUG

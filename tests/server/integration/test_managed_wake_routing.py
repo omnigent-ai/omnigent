@@ -69,6 +69,8 @@ def _route(entry_point: str, session_id: str) -> tuple[str, str, dict[str, Any] 
         return "POST", f"/v1/sessions/{session_id}/events", MESSAGE
     if entry_point == "compact":
         return "POST", f"/v1/sessions/{session_id}/events", {"type": _COMPACT_TYPE}
+    if entry_point == "retry":
+        return "POST", f"/v1/sessions/{session_id}/events", {"type": "retry_session", "data": {}}
     return "POST", f"/v1/sessions/{session_id}/resources/terminals", TERMINAL
 
 
@@ -167,7 +169,7 @@ def _wrong_replica(response: Any) -> bool:
 
 
 @pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)
-@pytest.mark.parametrize("entry_point", ["message", "compact", "terminal"])
+@pytest.mark.parametrize("entry_point", ["message", "compact", "terminal", "retry"])
 async def test_keyed_host_mismatched_key_is_rerouted_before_any_wake(
     two_replica_stack: Any, managed_wake: Any, entry_point: str
 ) -> None:
@@ -186,7 +188,7 @@ async def test_keyed_host_mismatched_key_is_rerouted_before_any_wake(
 
 
 @pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)
-@pytest.mark.parametrize("entry_point", ["message", "terminal"])
+@pytest.mark.parametrize("entry_point", ["message", "terminal", "retry"])
 async def test_unkeyed_host_keyed_request_gets_plain_wrong_replica(
     two_replica_stack: Any, managed_wake: Any, entry_point: str
 ) -> None:

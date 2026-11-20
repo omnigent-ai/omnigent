@@ -98,6 +98,11 @@ function subscribe(listener: () => void): () => void {
   return () => listeners.delete(listener);
 }
 
+/** Call `listener` after any session draft is written, so it can compare the draft it holds. */
+export function subscribeSessionDrafts(listener: () => void): () => void {
+  return subscribe(listener);
+}
+
 function notifyListeners(): void {
   for (const listener of listeners) listener();
 }
@@ -117,6 +122,16 @@ export function setSessionDraft(conversationId: string, draft: SessionDraft): vo
   }
   saveDraftsToStorage();
   notifyListeners();
+}
+
+/** Replace a session draft's tags, keeping its text, attachments and review comments. */
+export function setSessionMentions(
+  conversationId: string,
+  mentions: TaggedMentions | undefined,
+): void {
+  const tagged = mentions && (mentions.files.length > 0 || mentions.sessions.length > 0);
+  const draft = sessionDrafts.get(conversationId) ?? { text: "", files: [] };
+  setSessionDraft(conversationId, { ...draft, mentions: tagged ? mentions : undefined });
 }
 
 /** Remove a draft and ignore any late cleanup write for the retired id. */
@@ -198,6 +213,15 @@ export function useSessionReviewComments(conversationId: string | null): Comment
       (conversationId ? sessionDrafts.get(conversationId)?.reviewComments : undefined) ??
       NO_REVIEW_COMMENTS,
     () => NO_REVIEW_COMMENTS,
+  );
+}
+
+/** The session draft's tags, re-rendering the caller when they change. */
+export function useSessionMentions(conversationId: string | null): TaggedMentions | undefined {
+  return useSyncExternalStore(
+    subscribe,
+    () => (conversationId ? sessionDrafts.get(conversationId)?.mentions : undefined),
+    () => undefined,
   );
 }
 

@@ -16,7 +16,10 @@ from omnigent.server.accounts_store import SqlAlchemyAccountStore
 from omnigent.server.device_grant_store import DeviceGrantStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import HostStore
+from omnigent.stores.inbox_item_store import NewInboxItem
+from omnigent.stores.inbox_item_store.sqlalchemy_store import SqlAlchemyInboxItemStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from omnigent.stores.proactive_agent_settings_store import ProactiveAgentSettingsStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 from omnigent.stores.workflow_store import WorkflowStore
 
@@ -40,7 +43,9 @@ def test_account_generation_survives_delete_and_rejects_old_writes(db_uri: str) 
         for write in (
             lambda: permissions.ensure_user("alice"),
             lambda: permissions.grant("alice", uuid.uuid4().hex, 3),
+            lambda: permissions.grant_if_absent("alice", uuid.uuid4().hex, 1),
             lambda: permissions.grant_for_scheduled_task("alice", uuid.uuid4().hex, 1),
+            lambda: permissions.grant_for_workflow("alice", uuid.uuid4().hex, 1),
             lambda: HostStore(db_uri).upsert_on_connect(uuid.uuid4().hex, "laptop", "alice"),
             lambda: DeviceGrantStore(db_uri).create_redeemed_grant(
                 "late-grant",
@@ -493,6 +498,148 @@ def test_reregistration_finishes_an_interrupted_workflow_cleanup(db_uri, monkeyp
         sa.event.remove(accounts._engine, "before_cursor_execute", interrupt_cleanup)
     assert accounts.create_user_with_password("alice", "replacement-hash").id == "alice"
     assert workflows.list_page(user_id="alice", limit=10) == ([], False)
+
+
+def _create_workflow(db_uri: str, owner: str) -> str:
+    return (
+        WorkflowStore(db_uri)
+        .create(user_id=owner, name=f"Plan {uuid.uuid4().hex[:8]}", description="Steps.", steps=[])
+        .id
+    )
+
+
+def test_deletion_removes_workflow_grants_held_and_on_owned_workflows(db_uri, monkeypatch):
+    from omnigent.db.db_models import workspace_scope
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    workflows = WorkflowStore(db_uri)
+    # One grant or workflow per batch, so each cleanup spans several transactions.
+    monkeypatch.setattr(accounts, "_cleanup_batch_size", 1)
+    with workspace_scope(202):
+        permissions.ensure_user("alice")
+        elsewhere = _create_workflow(db_uri, "dave")
+        permissions.grant_for_workflow("alice", elsewhere, 1)
+    accounts.create_user_with_password("alice", "alice-hash")
+    for grantee in ("carol", "erin"):
+        permissions.ensure_user(grantee)
+    owned, owned_too, other, another = (
+        _create_workflow(db_uri, owner) for owner in ("alice", "alice", "dave", "dave")
+    )
+    for workflow_id, grantee in (
+        (owned, "carol"),
+        (owned, "erin"),
+        (owned_too, "carol"),
+        (other, "alice"),
+        (other, "carol"),
+        (another, "alice"),
+    ):
+        permissions.grant_for_workflow(grantee, workflow_id, 1)
+
+    assert accounts.delete_user("alice") is True
+    for workflow_id in (owned, owned_too, another):
+        assert permissions.list_for_workflow(workflow_id) == ([], None)
+    assert workflows.get(owned, user_id="alice") is None
+    assert [grant.user_id for grant in permissions.list_for_workflow(other)[0]] == ["carol"]
+    with pytest.raises(OmnigentError, match="revoked"):
+        permissions.grant_for_workflow("alice", other, 1)
+    accounts.create_user_with_password("alice", "replacement-hash")
+    assert permissions.resolve_workflow_access(["alice"], other) is None
+    with workspace_scope(202):
+        assert permissions.resolve_workflow_access(["alice"], elsewhere) == 1
+
+
+def test_owned_workflows_lose_their_grants_a_bounded_batch_at_a_time(db_uri, monkeypatch):
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    monkeypatch.setattr(accounts, "_cleanup_batch_size", 2)
+    accounts.create_user_with_password("alice", "alice-hash")
+    owned = [_create_workflow(db_uri, "alice") for _ in range(3)]
+    for grantee in ("bob", "carol", "erin"):
+        permissions.ensure_user(grantee)
+        for workflow_id in owned:
+            permissions.grant_for_workflow(grantee, workflow_id, 1)
+    batches: list[int] = []
+    delete_grants = accounts_module.delete_grants_on_workflows
+
+    def recording(session, workflow_ids, *, batch_size):
+        batches.append(delete_grants(session, workflow_ids, batch_size=batch_size))
+        return batches[-1]
+
+    monkeypatch.setattr(accounts_module, "delete_grants_on_workflows", recording)
+    assert accounts.delete_user("alice") is True
+    assert sum(batches) == 9
+    assert max(batches) <= 2
+    for workflow_id in owned:
+        assert permissions.list_for_workflow(workflow_id) == ([], None)
+        assert WorkflowStore(db_uri).get(workflow_id, user_id="alice") is None
+
+
+def test_reregistration_finishes_an_interrupted_workflow_grant_cleanup(db_uri, monkeypatch):
+    from omnigent.db.db_models import SqlWorkflowShare
+    from omnigent.stores.permission_store import sqlalchemy_store as permission_module
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    monkeypatch.setattr(accounts, "_cleanup_batch_size", 1)
+    accounts.create_user_with_password("bob", "bob-hash")
+    workflow_ids = [_create_workflow(db_uri, "dave") for _ in range(3)]
+    for workflow_id in workflow_ids:
+        permissions.grant_for_workflow("bob", workflow_id, 1)
+
+    def held_grants() -> int:
+        return sum(
+            permissions.resolve_workflow_access(["bob"], workflow_id) is not None
+            for workflow_id in workflow_ids
+        )
+
+    delete_batch = permission_module._delete_grant_batch
+    batches = 0
+
+    def interrupted_after_one_batch(*args, **kwargs):
+        nonlocal batches
+        if kwargs["model"] is SqlWorkflowShare:
+            batches += 1
+            if batches > 1:
+                raise RuntimeError("test cleanup interruption")
+        return delete_batch(*args, **kwargs)
+
+    monkeypatch.setattr(permission_module, "_delete_grant_batch", interrupted_after_one_batch)
+    assert accounts.delete_user("bob") is True
+    assert held_grants() == 2
+    monkeypatch.setattr(permission_module, "_delete_grant_batch", delete_batch)
+
+    # A grant still held refuses the name; registration's own cleanup is skipped here.
+    finish_cleanup = accounts_module.delete_deleted_account_workflow_grants
+    monkeypatch.setattr(
+        accounts_module, "delete_deleted_account_workflow_grants", lambda *a, **k: 0
+    )
+    with pytest.raises(OmnigentError, match="workflow grants") as caught:
+        accounts.create_user_with_password("bob", "replacement-hash")
+    assert caught.value.code == ErrorCode.CONFLICT
+    assert accounts.get_user("bob") is None
+    monkeypatch.setattr(accounts_module, "delete_deleted_account_workflow_grants", finish_cleanup)
+
+    assert accounts.create_user_with_password("bob", "replacement-hash").id == "bob"
+    assert held_grants() == 0
+
+
+def test_deleted_accounts_names_only_tombstoned_users(db_uri):
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    accounts.create_user_with_password("alice", "alice-hash")
+    accounts.create_user_with_password("bob", "bob-hash")
+    assert accounts.delete_user("alice") is True
+    # "carol" has no account row, as an identity an SSO proxy supplies may not.
+    assert permissions.deleted_accounts(["alice", "bob", "carol", "alice"]) == {"alice"}
+    assert permissions.deleted_accounts([]) == set()
+    # MySQL's key folds case and accents, so a spelling it equates is deleted too,
+    # and comes back as given, which is how a workflow may store its owner.
+    variants = ["ALICE", "alíce"]
+    expected = set(variants) if permissions._engine.dialect.name == "mysql" else set()
+    assert permissions.deleted_accounts([*variants, "bob"]) == expected
+    accounts.create_user_with_password("alice", "replacement-hash")
+    assert permissions.deleted_accounts(["alice"]) == set()
 
 
 def test_deletion_removes_all_preferences_only_for_user_in_workspace(db_uri: str) -> None:
@@ -1176,6 +1323,7 @@ def test_target_without_registration_cannot_acquire_new_account(db_uri, existing
             for write in (
                 lambda: permissions.ensure_user("target"),
                 lambda: permissions.grant("target", uuid.uuid4().hex, 1),
+                lambda: permissions.grant_if_absent("target", uuid.uuid4().hex, 1),
                 lambda: permissions.grant_for_scheduled_task("target", uuid.uuid4().hex, 1),
             ):
                 with pytest.raises(OmnigentError, match="revoked"):
@@ -1255,3 +1403,157 @@ def test_runner_issuance_rechecks_both_owners_and_binding(db_uri, monkeypatch, c
         else:
             assert pending.result(timeout=15) is None
     assert issued == []
+
+
+def _inbox_item(user_id: str, dedupe_key: str = "v1:private") -> NewInboxItem:
+    return NewInboxItem(
+        user_id=user_id,
+        source_session_id=uuid.uuid4().hex,
+        agent_id=uuid.uuid4().hex,
+        kind="info",
+        title="A private suggestion",
+        body_md="Only the account that got it may read it.",
+        links=[],
+        actions=[],
+        media=[],
+        primary_link=None,
+        topic="private",
+        dedupe_key=dedupe_key,
+    )
+
+
+def test_deleted_account_inbox_is_not_visible_after_reregistration(db_uri: str) -> None:
+    accounts = SqlAlchemyAccountStore(db_uri)
+    inbox = SqlAlchemyInboxItemStore(db_uri)
+    old = accounts.create_user_with_password("alice", "test-password-hash")
+    with account_authority_scope("alice", old.account_generation):
+        item = inbox.create(_inbox_item("alice"))
+    assert accounts.delete_user("alice") is True
+    new = accounts.create_user_with_password("alice", "replacement-password-hash")
+
+    with account_authority_scope("alice", new.account_generation):
+        assert inbox.list_for_user("alice") == ([], None)
+        assert inbox.get(item.id, "alice") is None
+        assert inbox.get_by_dedupe_key("alice", "v1:private") is None
+    with account_authority_scope("alice", old.account_generation):
+        for write in (
+            lambda: inbox.create(_inbox_item("alice")),
+            lambda: inbox.update(item.id, "alice", status="read", now=1),
+        ):
+            with pytest.raises(OmnigentError, match="revoked"):
+                write()
+
+
+def test_inbox_cleanup_is_batched_and_finished_before_reregistration(db_uri, monkeypatch):
+    import sqlalchemy as sa
+
+    from omnigent.db.db_models import SqlInboxItem, workspace_scope
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    inbox = SqlAlchemyInboxItemStore(db_uri)
+    monkeypatch.setattr(accounts, "_cleanup_batch_size", 1)
+    old = accounts.create_user_with_password("alice", "alice-hash")
+    with account_authority_scope("alice", old.account_generation):
+        # One item from each of three sessions, as the per-session cap does not bound them.
+        for n in range(3):
+            inbox.create(_inbox_item("alice", dedupe_key=f"v1:private-{n}"))
+
+    def stored() -> int:
+        with workspace_scope(None), accounts._engine.connect() as conn:
+            return conn.execute(
+                sa.select(sa.func.count()).where(SqlInboxItem.user_id == "alice")
+            ).scalar_one()
+
+    deletes = 0
+
+    def interrupt_cleanup(_connection, _cursor, _statement, parameters, context, _executemany):
+        nonlocal deletes
+        query = getattr(context.compiled, "statement", None)
+        if isinstance(query, sa.Delete) and query.table.name == "inbox_items":
+            # Each committed batch deletes one row: the workspace and one item ID.
+            assert len(parameters) == 2
+            deletes += 1
+            if deletes > 1:
+                raise RuntimeError("test inbox cleanup interruption")
+
+    sa.event.listen(accounts._engine, "before_cursor_execute", interrupt_cleanup)
+    try:
+        # The tombstone commits first; the failed cleanup is deferred, not the deletion.
+        assert accounts.delete_user("alice") is True
+        assert stored() == 2
+        with pytest.raises(RuntimeError, match="test inbox cleanup interruption"):
+            accounts.create_user_with_password("alice", "replacement-hash")
+        assert accounts.get_user("alice") is None
+    finally:
+        sa.event.remove(accounts._engine, "before_cursor_execute", interrupt_cleanup)
+
+    new = accounts.create_user_with_password("alice", "replacement-hash")
+    assert stored() == 0
+    with account_authority_scope("alice", new.account_generation):
+        fresh = inbox.create(_inbox_item("alice", dedupe_key="v1:fresh"))
+    # Cleanup that runs late sees a live account and leaves its items alone.
+    accounts._delete_deleted_inbox_items("alice")
+    with account_authority_scope("alice", new.account_generation):
+        assert [item.id for item in inbox.list_for_user("alice")[0]] == [fresh.id]
+
+
+def test_workspace_setting_write_rechecks_the_admin_under_its_lock(db_uri: str) -> None:
+    """A deleted or demoted admin's in-flight workspace write cannot land."""
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    settings = ProactiveAgentSettingsStore(db_uri)
+    # A second admin, so deleting the first one below is allowed.
+    accounts.create_user_with_password("root", "test-password-hash")
+    permissions.set_admin("root", True)
+    admin = accounts.create_user_with_password("admin", "test-password-hash")
+    permissions.set_admin("admin", True)
+    with account_authority_scope("admin", admin.account_generation):
+        settings.set_workspace_enabled(False, actor="admin", require_admin=True)
+    assert settings.read("alice") == (False, True)
+
+    # The route authorized the request while the actor was still an admin.
+    permissions.set_admin("admin", False)
+    with account_authority_scope("admin", admin.account_generation):
+        with pytest.raises(OmnigentError) as demoted:
+            settings.set_workspace_enabled(True, actor="admin", require_admin=True)
+    assert demoted.value.code == ErrorCode.FORBIDDEN
+    assert settings.read("alice") == (False, True)
+
+    permissions.set_admin("admin", True)
+    assert accounts.delete_user("admin") is True
+    with account_authority_scope("admin", admin.account_generation):
+        with pytest.raises(OmnigentError, match="revoked"):
+            settings.set_workspace_enabled(True, actor="admin", require_admin=True)
+    assert settings.read("alice") == (False, True)
+
+
+def test_prompt_write_rechecks_the_admin_under_its_lock(db_uri: str) -> None:
+    """A deleted or demoted admin's in-flight prompt write cannot land."""
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    settings = ProactiveAgentSettingsStore(db_uri)
+    # A second admin, so deleting the first one below is allowed.
+    accounts.create_user_with_password("root", "test-password-hash")
+    permissions.set_admin("root", True)
+    admin = accounts.create_user_with_password("admin", "test-password-hash")
+    permissions.set_admin("admin", True)
+    with account_authority_scope("admin", admin.account_generation):
+        settings.set_prompt_override(
+            "Look for stale pull requests.", actor="admin", require_admin=True
+        )
+    assert settings.read_prompt_override() == "Look for stale pull requests."
+
+    # The route authorized the request while the actor was still an admin.
+    permissions.set_admin("admin", False)
+    with account_authority_scope("admin", admin.account_generation):
+        with pytest.raises(OmnigentError) as demoted:
+            settings.set_prompt_override("Post about anything.", actor="admin", require_admin=True)
+    assert demoted.value.code == ErrorCode.FORBIDDEN
+    assert settings.read_prompt_override() == "Look for stale pull requests."
+
+    permissions.set_admin("admin", True)
+    assert accounts.delete_user("admin") is True
+    with account_authority_scope("admin", admin.account_generation):
+        with pytest.raises(OmnigentError, match="revoked"):
+            settings.set_prompt_override(None, actor="admin", require_admin=True)
+    assert settings.read_prompt_override() == "Look for stale pull requests."

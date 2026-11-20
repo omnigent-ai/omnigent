@@ -11,7 +11,7 @@ function view(todos: NativeTask[], extra: Partial<SessionTasksView> = {}): Sessi
     plan: null,
     progress: nativeTaskProgress(todos, true),
     native: true,
-    journal: {} as SessionTasksView["journal"],
+    journal: { entries: extra.plan ? [extra.plan] : [] } as SessionTasksView["journal"],
     journalSupported: true,
     loading: false,
     sessionWorking: true,

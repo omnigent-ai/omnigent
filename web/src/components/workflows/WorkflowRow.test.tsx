@@ -22,6 +22,7 @@ function renderRow(workflow: SavedWorkflow = WORKFLOW, automationsEnabled = true
   const handlers = {
     onRun: vi.fn(),
     onCreateAutomation: vi.fn(),
+    onClone: vi.fn(),
     onDelete: vi.fn(),
   };
   render(
@@ -66,12 +67,12 @@ describe("WorkflowRow", () => {
   });
 
   it.each([false, true])("offers available actions in the ⋯ menu (automations=%s)", (enabled) => {
-    const { onRun, onCreateAutomation, onDelete } = renderRow(WORKFLOW, enabled);
+    const { onRun, onCreateAutomation, onClone, onDelete } = renderRow(WORKFLOW, enabled);
 
     expect(screen.getByRole("button", { name: "Actions for Fix flaky tests" })).toBeInTheDocument();
     openMenu();
     expect(itemNames()).toEqual(
-      enabled ? ["Run", "Create automation", "Delete"] : ["Run", "Delete"],
+      enabled ? ["Run", "Create automation", "Clone", "Delete"] : ["Run", "Clone", "Delete"],
     );
     fireEvent.click(screen.getByTestId("workflow-run"));
     expect(onRun).toHaveBeenCalledWith(WORKFLOW);
@@ -85,18 +86,26 @@ describe("WorkflowRow", () => {
     }
 
     openMenu();
+    fireEvent.click(screen.getByTestId("workflow-clone"));
+    expect(onClone).toHaveBeenCalledWith(WORKFLOW);
+
+    openMenu();
     fireEvent.click(screen.getByTestId("workflow-delete"));
     expect(onDelete).toHaveBeenCalledWith(WORKFLOW);
   });
 
   it.each([false, true])("offers the same actions on right-click (automations=%s)", (enabled) => {
-    const { onRun } = renderRow(WORKFLOW, enabled);
+    const { onRun, onClone } = renderRow(WORKFLOW, enabled);
 
     fireEvent.contextMenu(screen.getByTestId("workflow-row"));
     expect(itemNames()).toEqual(
-      enabled ? ["Run", "Create automation", "Delete"] : ["Run", "Delete"],
+      enabled ? ["Run", "Create automation", "Clone", "Delete"] : ["Run", "Clone", "Delete"],
     );
     fireEvent.click(screen.getByTestId("workflow-run"));
     expect(onRun).toHaveBeenCalledWith(WORKFLOW);
+
+    fireEvent.contextMenu(screen.getByTestId("workflow-row"));
+    fireEvent.click(screen.getByTestId("workflow-clone"));
+    expect(onClone).toHaveBeenCalledWith(WORKFLOW);
   });
 });

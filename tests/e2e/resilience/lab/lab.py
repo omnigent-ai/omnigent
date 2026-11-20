@@ -24,15 +24,18 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import re
 import secrets
 import shutil
 import signal
+import stat
 import sys
 import tempfile
 import time
 import uuid
+from collections import deque
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,7 +46,7 @@ import psutil
 import yaml
 
 from tests._helpers.live_server import reserve_port
-from tests.e2e.resilience.lab.events import EventLog
+from tests.e2e.resilience.lab.events import EventLog, LabEvent
 from tests.e2e.resilience.lab.model import MockModel
 from tests.e2e.resilience.lab.processes import (
     ManagedProcess,
@@ -75,6 +78,99 @@ _POLICY_MODEL = "_policy_llm_"
 _LAUNCHED_RUNNER = re.compile(r"Launched runner \S+ for workspace .*? \(pid=(\d+)\)")
 _POLL_S = 0.25
 _STARTUP_TIMEOUT_S = 120.0
+_DIAGNOSTIC_LIMIT = 4096
+_DIAGNOSTIC_SESSION_LIMIT = 8
+_DIAGNOSTIC_SNAPSHOT_BUDGET_S = 2.0
+_DIAGNOSTIC_ID = re.compile(
+    r"(?:(?:conv_)?[0-9a-f]{32}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\Z"
+)
+_DIAGNOSTIC_ENUMS = {
+    "status": {"idle", "launching", "running", "waiting", "failed"},
+    "source": {"stream", "snapshot", "startup", "resume", "clear", "compact"},
+    "harness": {"claude", "codex"},
+    "process": {"server", "host", "runner", "model"},
+    "mode": {"host", "runner"},
+    "front": {"ingress", "direct"},
+    "tag": {
+        "client.sse",
+        "client.ws",
+        "client.http",
+        "host.tunnel",
+        "runner.tunnel",
+        "host.http",
+        "model",
+    },
+    "event_name": {
+        "SessionStart",
+        "SessionEnd",
+        "UserPromptSubmit",
+        "Stop",
+        "StopFailure",
+        "PreCompact",
+    },
+}
+_DIAGNOSTIC_KINDS = {
+    "starting",
+    "ready",
+    "stopped",
+    "server_down",
+    "server_up",
+    "session_created",
+    "process_start",
+    "process_stop",
+    "kill_runner",
+    "freeze",
+    "thaw",
+    "sleep_host",
+    "wake_host",
+    "connect",
+    "disconnect",
+    "reset",
+    "fault_start",
+    "fault_end",
+    "refuse",
+    "send",
+    "approve",
+    "stop",
+}
+
+
+def _diagnostic_fields(fields: dict[str, Any]) -> dict[str, Any]:
+    """Project content-free values; redacting arbitrary logs would still retain payloads."""
+    result: dict[str, Any] = {}
+    for key, value in fields.items():
+        if key in _DIAGNOSTIC_ENUMS:
+            if isinstance(value, str) and value in _DIAGNOSTIC_ENUMS[key]:
+                result[key] = value
+        elif key in {
+            "session_id",
+            "claude_session_id",
+            "bridge_session_id",
+            "launch_session_id",
+            "terminal_instance_id",
+            "launch_id",
+            "event_id",
+        }:
+            if isinstance(value, str) and _DIAGNOSTIC_ID.fullmatch(value):
+                result[key] = value
+        elif key in {"wall", "mono", "recorded_at", "last_recorded_at", "identity_started_at"}:
+            if type(value) in (int, float) and 0 <= value <= 1e12 and math.isfinite(value):
+                result[key] = value
+        elif key in {
+            "pid",
+            "conn",
+            "pending_approvals",
+            "c2s_bytes",
+            "s2c_bytes",
+            "events_omitted",
+        }:
+            if type(value) is int and 0 <= value < 2**63:
+                result[key] = value
+        elif key in {"runner_online", "host_online", "graceful"} and type(value) is bool:
+            result[key] = value
+    return result
+
+
 # Ambient settings that would point lab processes at a developer's real
 # server, credentials or a parent Claude Code session.
 _STRIP_ENV_PREFIXES = ("OMNIGENT_", "DATABRICKS_", "ANTHROPIC_", "OPENAI_", "CLAUDE_", "CODEX_")
@@ -198,6 +294,7 @@ class Lab:
         self._runner: ManagedProcess | None = None
         self._proxies: LabProxies | None = None
         self._clients: list[httpx.Client] = []
+        self._stop_started = False
         self.model: MockModel | None = None
         self.client: httpx.Client | None = None
         self.observer: httpx.Client | None = None
@@ -239,6 +336,7 @@ class Lab:
 
     def stop(self) -> None:
         """Stop every process, proxy and client; keep :attr:`root` for inspection."""
+        self._stop_started = True
         self._port_reservations.close()
         for client in self._clients:
             client.close()
@@ -263,6 +361,165 @@ class Lab:
             if not self.root.exists():
                 return
             time.sleep(1.0)
+
+    def write_diagnostics(self, destination: Path) -> None:
+        """Retain a safe failure projection, never raw lab files.
+
+        Retention and file-read limits do not bound complete event-history
+        copying/scanning or lifecycle-path discovery and sorting.
+        """
+        events = self.events.events()
+        discovery: deque[LabEvent] = deque(maxlen=_DIAGNOSTIC_LIMIT)
+        discovery_count = 0
+        for event in events:
+            if (event.source, event.kind) in {
+                ("lab", "session_created"),
+                ("observer", "timeline"),
+            }:
+                discovery.append(event)
+                discovery_count += 1
+        retained = events[-_DIAGNOSTIC_LIMIT:]
+        payload: dict[str, Any] = {
+            "schema_version": 1,
+            "captured_at": time.time(),
+            "captured_before_stop": not self._stop_started,
+            "events_omitted": max(0, len(events) - len(retained)),
+            "discovery_events_omitted": discovery_count - len(discovery),
+            "events": [],
+            "observations": [],
+            "observations_omitted": 0,
+            "sessions": [],
+            "snapshot_budget_exhausted": False,
+            "native_lifecycle": self._diagnostic_lifecycle(),
+        }
+        session_ids: set[str] = set()
+        observations_remaining = _DIAGNOSTIC_LIMIT
+        for event in reversed(discovery):
+            if event.source == "lab" and event.kind == "session_created":
+                identity = _diagnostic_fields(event.fields).get("session_id")
+                if identity:
+                    session_ids.add(identity)
+            if event.source == "observer" and event.kind == "timeline":
+                identity = _diagnostic_fields(event.fields).get("session_id")
+                observations = event.fields.get("observations", [])
+                if not isinstance(observations, list):
+                    continue
+                count = min(len(observations), observations_remaining)
+                observations_remaining -= count
+                payload["observations_omitted"] += len(observations) - count
+                if identity:
+                    session_ids.add(identity)
+                if not count:
+                    continue
+                for observation in reversed(observations[-count:]):
+                    if isinstance(observation, dict):
+                        safe = _diagnostic_fields(observation)
+                        if identity and {"wall", "source", "status"} <= safe.keys():
+                            payload["observations"].append({**safe, "session_id": identity})
+        for event in retained:
+            if (
+                event.source in {"lab", "user", "proxy:client", "proxy:host", "proxy:model"}
+                and event.kind in _DIAGNOSTIC_KINDS
+            ):
+                payload["events"].append(
+                    {
+                        **_diagnostic_fields(event.fields),
+                        "wall": event.wall,
+                        "mono": event.mono,
+                        "source": event.source,
+                        "kind": event.kind,
+                    }
+                )
+        payload["observations"].reverse()
+        selected_sessions = sorted(session_ids)[:_DIAGNOSTIC_SESSION_LIMIT]
+        payload["sessions_omitted"] = len(session_ids) - len(selected_sessions)
+        deadline = time.monotonic() + _DIAGNOSTIC_SNAPSHOT_BUDGET_S
+        for index, session_id in enumerate(selected_sessions):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                payload["sessions_omitted"] += len(selected_sessions) - index
+                payload["snapshot_budget_exhausted"] = True
+                break
+            snapshot: dict[str, Any] = {"session_id": session_id, "read_status": "unavailable"}
+            try:
+                if self.observer is not None:
+                    response = self.observer.get(
+                        f"/v1/sessions/{session_id}",
+                        params={"include_items": "false"},
+                        timeout=remaining,
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    snapshot.update(
+                        _diagnostic_fields(
+                            {
+                                key: data.get(key)
+                                for key in ("status", "runner_online", "host_online")
+                            }
+                        ),
+                        read_status="ok",
+                    )
+            except (httpx.HTTPError, ValueError, AttributeError, RuntimeError):
+                pass
+            payload["sessions"].append(snapshot)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(json.dumps(payload, indent=2, allow_nan=False) + "\n")
+
+    def _diagnostic_lifecycle(self) -> dict[str, Any]:
+        """Limit retained file reads after complete path discovery and sorting."""
+        records: list[dict[str, Any]] = []
+        paths = sorted(self._host_tmp.glob("omnigent-*/claude-native/*/lifecycle-*.json"))
+        selected = paths[:128]
+        for path in selected:
+            try:
+                try:
+                    resolved = path.resolve()
+                except RuntimeError:
+                    continue
+                if not resolved.is_relative_to(self._host_tmp) or path.is_symlink():
+                    continue
+                flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+                fd = os.open(path, flags)
+                try:
+                    info = os.fstat(fd)
+                    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                        continue
+                    raw = os.read(fd, 32769)
+                finally:
+                    os.close(fd)
+                if len(raw) > 32768:
+                    continue
+                data = json.loads(raw)
+                if (
+                    not isinstance(data, dict)
+                    or type(data.get("schema_version")) is not int
+                    or data["schema_version"] != 1
+                ):
+                    continue
+                record = _diagnostic_fields(data)
+                if (
+                    record.get("launch_id") != path.stem.removeprefix("lifecycle-")
+                    or "terminal_instance_id" not in record
+                ):
+                    continue
+                hooks = data.get("events", [])
+                if not isinstance(hooks, list):
+                    continue
+                record["events"] = [
+                    safe
+                    for hook in hooks[-16:]
+                    if isinstance(hook, dict)
+                    and {"event_name", "recorded_at"} <= (safe := _diagnostic_fields(hook)).keys()
+                ]
+                records.append(record)
+            except (OSError, ValueError, TypeError, RecursionError):
+                continue
+        return {
+            "records": records,
+            "candidates": len(paths),
+            "rejected": len(selected) - len(records),
+            "omitted": len(paths) - len(selected),
+        }
 
     def describe(self) -> str:
         """Human-readable URLs and paths for manual poking."""

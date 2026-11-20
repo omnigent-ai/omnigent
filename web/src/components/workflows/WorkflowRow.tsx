@@ -1,5 +1,5 @@
 import type { ComponentType, ReactNode } from "react";
-import { ClockIcon, MoreHorizontalIcon, PlayIcon, Trash2Icon } from "lucide-react";
+import { ClockIcon, CopyIcon, MoreHorizontalIcon, PlayIcon, Trash2Icon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -23,17 +23,27 @@ export interface WorkflowRowProps {
   workflow: SavedWorkflow;
   onRun: (workflow: SavedWorkflow) => void;
   onCreateAutomation?: (workflow: SavedWorkflow) => void;
-  onDelete: (workflow: SavedWorkflow) => void;
+  onClone: (workflow: SavedWorkflow) => void;
+  cloning?: boolean;
+  /** Absent for a workflow shared with the user, which only its owner deletes. */
+  onDelete?: (workflow: SavedWorkflow) => void;
 }
 
 /**
  * One saved workflow: its name and description, opening its page, with Run,
- * Create automation and Delete in a ⋯ menu and on right-click, like an
- * automation's row.
+ * Create automation, Clone and Delete in a ⋯ menu and on right-click, like an
+ * automation's row. A workflow shared with the user names its owner.
  */
-export function WorkflowRow({ workflow, onRun, onCreateAutomation, onDelete }: WorkflowRowProps) {
+export function WorkflowRow({
+  workflow,
+  onRun,
+  onCreateAutomation,
+  onClone,
+  cloning,
+  onDelete,
+}: WorkflowRowProps) {
   const navigate = useNavigate();
-  const actions = { workflow, onRun, onCreateAutomation, onDelete };
+  const actions = { workflow, onRun, onCreateAutomation, onClone, cloning, onDelete };
 
   return (
     <ContextMenu>
@@ -54,6 +64,14 @@ export function WorkflowRow({ workflow, onRun, onCreateAutomation, onDelete }: W
             {workflow.is_draft && (
               <span className="text-xs font-medium text-muted-foreground">
                 Draft · No saved plan
+              </span>
+            )}
+            {workflow.viewer_role === "viewer" && (
+              <span
+                className="text-xs font-medium text-muted-foreground"
+                data-testid="workflow-row-owner"
+              >
+                Shared by {workflow.owner_display_name ?? "someone else"}
               </span>
             )}
             <span className="line-clamp-2 text-ui text-muted-foreground/80">
@@ -106,13 +124,11 @@ function WorkflowMenuItems({
   workflow,
   onRun,
   onCreateAutomation,
+  onClone,
+  cloning,
   onDelete,
-}: {
+}: WorkflowRowProps & {
   Item: ComponentType<MenuItemProps>;
-  workflow: SavedWorkflow;
-  onRun: (workflow: SavedWorkflow) => void;
-  onCreateAutomation?: (workflow: SavedWorkflow) => void;
-  onDelete: (workflow: SavedWorkflow) => void;
 }) {
   const { trackClick } = useOmnigentAnalytics();
   return (
@@ -142,16 +158,29 @@ function WorkflowMenuItems({
         </Item>
       )}
       <Item
-        variant="destructive"
+        disabled={cloning}
         onSelect={() => {
-          trackClick("workflows.row.delete", "button");
-          onDelete(workflow);
+          trackClick("workflows.row.clone", "button");
+          onClone(workflow);
         }}
-        data-testid="workflow-delete"
+        data-testid="workflow-clone"
       >
-        <Trash2Icon className="size-4" />
-        Delete
+        <CopyIcon className="size-4" />
+        Clone
       </Item>
+      {onDelete && (
+        <Item
+          variant="destructive"
+          onSelect={() => {
+            trackClick("workflows.row.delete", "button");
+            onDelete(workflow);
+          }}
+          data-testid="workflow-delete"
+        >
+          <Trash2Icon className="size-4" />
+          Delete
+        </Item>
+      )}
     </>
   );
 }

@@ -6,6 +6,7 @@ import {
   splitTriggerPrompt,
   stripTriggerHeader,
 } from "@/components/scheduled/triggerTemplates";
+import { parseSavedWorkflowRun } from "@/lib/savedWorkflowRun";
 import type { WorkflowStep } from "@/lib/workflowGraphLayout";
 
 /** The framework skill that plans and runs a workflow (`/workflow <description>`). */
@@ -13,7 +14,7 @@ export const WORKFLOW_SKILL = "workflow";
 
 /**
  * Added to the workflow message when the user reviews the plan before work starts. The
- * workflow skill says how: the review comes right after the exploration every plan starts with.
+ * workflow skill places that review before executing the proposed work.
  */
 export const REVIEW_PLAN_FIRST = "Let me review the plan before you start the work.";
 
@@ -121,10 +122,24 @@ export function continuePlanMessage(planName: string | null): string {
   return `Continue ${plan} from where you left off, and work through the tasks that are left.\n\n${RESUME_WORKFLOW_WORK}`;
 }
 
+const STOP_PLAN_INSTRUCTIONS =
+  "Stop all background tasks, subagents, and other Omnigent sessions working on this workflow run. Tell each worker to stop its own background tasks, agents, and Omnigent sessions recursively, verify their shutdown, and report back before it stops. Cancel background commands through their original task/terminal handles and wait for their exit results. A missing handle or an empty process list in another sandbox is not proof of shutdown. Cancel this run's timers and queued follow-ups that could restart the work. Keep this main session available while you coordinate and verify that the work has stopped; report anything you could not stop or verify. Preserve completed results and record the worker/session IDs and what remains so the workflow can resume. Leave unfinished steps that were started as started, not done or failed. Do not ask for confirmation or resume the workflow until I explicitly tell you to continue.";
+
 /** Keep the main agent available to stop delegated work and record how to resume it. */
 export function stopPlanMessage(planName: string | null): string {
   const plan = planName ? `the plan "${planName}"` : "the plan";
-  return `Stop ${plan} now. Stop all background tasks, subagents, and other Omnigent sessions working on this workflow run. Tell each worker to stop its own background tasks, agents, and Omnigent sessions recursively, verify their shutdown, and report back before it stops. Cancel background commands through their original task/terminal handles and wait for their exit results. A missing handle or an empty process list in another sandbox is not proof of shutdown. Cancel this run's timers and queued follow-ups that could restart the work. Keep this main session available while you coordinate and verify that the work has stopped; report anything you could not stop or verify. Preserve completed results and record the worker/session IDs and what remains so the workflow can resume. Leave unfinished steps that were started as started, not done or failed. Do not ask for confirmation or resume the workflow until I explicitly tell you to continue.`;
+  return `Stop ${plan} now. ${STOP_PLAN_INSTRUCTIONS}`;
+}
+
+const STOP_PLAN_OPENING = /^Stop the plan(?: "[\s\S]*")? now\. $/;
+
+/** Whether *text* is a {@link stopPlanMessage}, whatever plan it names. */
+export function isStopPlanMessage(text: string): boolean {
+  const trimmed = text.trim();
+  return (
+    trimmed.endsWith(STOP_PLAN_INSTRUCTIONS) &&
+    STOP_PLAN_OPENING.test(trimmed.slice(0, -STOP_PLAN_INSTRUCTIONS.length))
+  );
 }
 
 /**
@@ -149,7 +164,7 @@ export function createWorkflowPrompt(name: string, description: string): string 
   return `Use the ${SAVE_WORKFLOW_SKILL} skill to create a workflow named "${name.trim()}" from this description, without doing the work:\n\n${description.trim()}`;
 }
 
-/** The planning chat proposes a graph; Save plan in the editor applies it. */
+/** The planning chat proposes a graph and its description; Save plan in the editor applies them. */
 export function editWorkflowPlanPrompt(workflow: {
   id: string;
   name: string;
@@ -162,6 +177,8 @@ export function editWorkflowPlanPrompt(workflow: {
     `Workflow description: ${workflow.description}`,
     "This is a planning conversation. Load the existing workflow with sys_workflow_load. Explore context if useful, but do not execute the workflow or make changes to the project.",
     "Use sys_journal_write_plan to publish the proposed steps, and write a new plan whenever I ask for revisions. Keep step IDs stable. Do not set workflow_id on this journal plan: this conversation is for planning, not an execution run.",
+    "Write each step's goal for me first, in plain language and short Markdown bullets, as the save-workflow skill's Step descriptions section shows: **Inputs:** (what it reads and from where, such as a Slack channel, a PR or another MCP server), **What it does:** (a few bullets) and **Outputs:** (what it produces, such as a PR link or a report). Put the exact commands, paths and flags a run needs after them, under **Details:**. A run works from the same goal, so keep those details.",
+    "Set description on every plan you publish. Keep the current description's wording: change only what the proposed steps make inaccurate, add only what a run needs that it leaves out, and repeat it unchanged when it still fits. I review a changed description before Save plan applies it.",
     "The workflow already exists. Do not call sys_workflow_save or create another workflow. I will use Save plan on the workflow page to apply the proposal.",
     hasSavedPlan
       ? "Read the saved plan and use it as the starting point. Ask what edits I want and wait for my answer before proposing or publishing changes. Preserve steps I haven't asked to change, and iterate with me on my requested edits."
@@ -181,16 +198,15 @@ export function runSavedWorkflowPrompt(
   workflow: { id: string; name: string },
   details = "",
 ): string {
-  const request = `Use the ${WORKFLOW_SKILL} skill to run the saved workflow "${workflow.name}" (ID ${workflow.id}).`;
+  const request = `Use the ${WORKFLOW_SKILL} skill to run the saved workflow "${workflow.name}" (ID ${workflow.id}).\n\nIf the session journal already contains this workflow's plan, continue that run without writing a second starting plan.`;
   return details.trim() ? `${request}\n\n${details.trim()}` : request;
 }
 
-// A savedWorkflowMessage without the plan review, as New automation stores it.
-const SAVED_WORKFLOW_RUN =
-  /^[/$]workflow Run the saved workflow "(.+)" \(ID ([0-9a-f]{32})\)\.(?:\n\n([\s\S]*))?$/;
-
 /**
  * Read back a {@link savedWorkflowMessage}, directly or inside a trigger prompt.
+ * Keep in sync with omnigent/server/scheduled/workflow_automations.py, which reads
+ * the prompt below a trigger header the same way to keep these automations off a
+ * reused session.
  *
  * @returns The workflow's ID and name and the run's details, or `null` for any other text.
  */
@@ -200,7 +216,15 @@ export function parseSavedWorkflowMessage(
   const instructions =
     decodeTriggerPrompt(text)?.instructions ??
     splitTriggerPrompt(stripTriggerHeader(text)).userPrompt;
-  const match = SAVED_WORKFLOW_RUN.exec(instructions.trim());
-  if (!match) return null;
-  return { id: match[2], name: match[1], details: (match[3] ?? "").trim() };
+  return parseSavedWorkflowRun(instructions);
+}
+
+/** The automations whose prompt runs the saved workflow *workflowId*, in list order. */
+export function automationsUsingWorkflow<T extends { prompt: string }>(
+  automations: readonly T[],
+  workflowId: string,
+): T[] {
+  return automations.filter(
+    (automation) => parseSavedWorkflowMessage(automation.prompt)?.id === workflowId,
+  );
 }

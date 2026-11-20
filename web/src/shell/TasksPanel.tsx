@@ -1,7 +1,17 @@
 // The Tasks tab: where the session's tasks stand, one row each. Tasks are a
 // plan's steps, or the agent's own task list when the session has no plan.
 
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  Fragment,
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import {
   CheckIcon,
   ChevronRightIcon,
@@ -16,6 +26,7 @@ import {
   XIcon,
 } from "lucide-react";
 import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
+import { FullscreenIcon } from "@/components/ai-elements/MermaidBlock";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -26,12 +37,15 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { StepDescription } from "@/components/workflows/StepDescription";
 import { useConversationEntryValue } from "@/hooks/useConversationEntryState";
 import { useNow } from "@/hooks/useNow";
 import { useSavedWorkflows } from "@/hooks/useSavedWorkflows";
+import { usePlanStopping } from "@/hooks/usePlanStopping";
 import { useSessionTasks } from "@/hooks/useSessionTasks";
 import { pendingWorkflowQuestions } from "@/lib/blocks";
 import { isFeatureEnabled } from "@/lib/capabilities";
+import { markdownPreviewText } from "@/lib/markdownPreviewText";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import {
   absoluteTime,
@@ -42,7 +56,9 @@ import {
 import {
   failedUpstream,
   finishedTaskCount,
+  isPlanComplete,
   isRestart,
+  planGraphRevision,
   planName,
   planTally,
   planWorkflowId,
@@ -66,6 +82,13 @@ import { PlanRunButton } from "@/shell/PlanRunButton";
 import { useSessionTasksActions } from "@/store/sessionTasksActions";
 
 const NO_ENTRIES: JournalEntry[] = [];
+
+// React Flow loads only once a plan opens on its graph.
+const WorkflowGraphOverlay = lazy(() =>
+  import("@/components/workflows/WorkflowStepsGraph").then((module) => ({
+    default: module.WorkflowGraphOverlay,
+  })),
+);
 
 export const STATE_LABELS: Record<StepState, string> = {
   waiting: "Not started",
@@ -191,20 +214,27 @@ export function CantStart({ failedNames }: { failedNames: readonly string[] }) {
   );
 }
 
+/** A step's goal as one line of plain text, for a row or card that shows only its start. */
+function goalPreview(step: JournalPlanStep): string | null {
+  return step.goal && markdownPreviewText(step.goal);
+}
+
 /** @param failedNames - The failed tasks it waits on, by name, when that's why it can't start. */
 function stepDetail(item: StepProgress, failedNames: readonly string[] = []): ReactNode {
   const text = item.status ? textOf(item.status) : null;
   switch (item.state) {
     case "waiting":
-      if (failedNames.length === 0) return item.step.goal;
+      if (failedNames.length === 0) return goalPreview(item.step);
       return <CantStart failedNames={failedNames} />;
-    case "ready":
+    case "ready": {
+      const goal = goalPreview(item.step);
       return (
         <>
           <span className="font-medium text-session-active">Ready</span>
-          {item.step.goal && ` · ${item.step.goal}`}
+          {goal && ` · ${goal}`}
         </>
       );
+    }
     case "needs_input":
       // A running task becomes this while a prompt waits; its start has no text.
       return (
@@ -281,19 +311,17 @@ function listNames(names: readonly string[]): string {
 
 /**
  * Each status a task recorded, oldest first, after what it waits on and its
- * goal. A line marks where each later attempt begins.
+ * whole goal, which its row shows only the start of. A line marks where each
+ * later attempt begins.
  */
 function StepHistory({
   step,
   entries,
   names,
-  showGoal,
 }: {
   step: JournalPlanStep;
   entries: readonly JournalEntry[];
   names: ReadonlyMap<string, string>;
-  /** False when the step's row already shows its goal. */
-  showGoal: boolean;
 }) {
   const history = entries.flatMap((entry) => {
     const status = entry.step === step.id && entry.kind === "status" ? statusOf(entry) : null;
@@ -310,7 +338,7 @@ function StepHistory({
           </span>
         </p>
       )}
-      {showGoal && step.goal && <p className="break-words text-muted-foreground">{step.goal}</p>}
+      {step.goal && <StepDescription text={step.goal} />}
       {history.length === 0 ? (
         <p className="text-muted-foreground">Nothing recorded yet.</p>
       ) : (
@@ -592,12 +620,7 @@ function StepRow({
       </div>
       {open && (
         <div className="pr-2 pl-[38px]">
-          <StepHistory
-            step={item.step}
-            entries={entries}
-            names={names}
-            showGoal={item.state !== "waiting" && item.state !== "ready"}
-          />
+          <StepHistory step={item.step} entries={entries} names={names} />
         </div>
       )}
     </li>
@@ -650,11 +673,12 @@ function statusLine(
 
 /**
  * What a task's hover card says: which task it is, where it stands, and its
- * newest result or its goal.
+ * newest result or the start of its goal.
  *
  * @param pending - The tasks it waits on that aren't done, by name.
  * @param failedNames - The failed tasks it waits on, by name, when that's why it can't start.
- * @param full - Also show the goal beside a result, uncut, for a graph node whose box cuts both short.
+ * @param full - Show the whole goal as Markdown, below a result too, for a graph node whose box
+ *   cuts both short.
  * @param menu - Its ⋯ menu, in the top corner.
  */
 export function TaskCardDetails({
@@ -677,7 +701,10 @@ export function TaskCardDetails({
   const text = item.status ? textOf(item.status) : null;
   const detail =
     item.state === "waiting" || item.state === "ready" ? item.step.goal : (text ?? item.step.goal);
-  const goal = full && detail !== item.step.goal ? item.step.goal : null;
+  const detailIsGoal = detail === item.step.goal;
+  // A cut card shows the start of its goal as plain text, if any text remains.
+  const shownDetail = detailIsGoal && !full ? goalPreview(item.step) : detail;
+  const goal = full && !detailIsGoal ? item.step.goal : null;
   return (
     <>
       <span className="flex w-full items-center justify-between gap-3">
@@ -686,19 +713,27 @@ export function TaskCardDetails({
         </span>
         {menu}
       </span>
-      <span className="break-words font-medium">{item.step.name}</span>
+      <span className="font-medium">{item.step.name}</span>
       <span className="flex items-center gap-1.5">
         <StepGlyph state={item.state} number={number} />
         <span className={STATUS_LINE_COLORS[item.state]}>
           {statusLine(item, pending, failedNames)}
         </span>
       </span>
-      {detail && (
-        <span className={cn("break-words text-muted-foreground", !full && "line-clamp-3")}>
-          {detail}
-        </span>
+      {shownDetail &&
+        (full && detailIsGoal ? (
+          <StepDescription text={shownDetail} />
+        ) : (
+          <span className={cn("text-muted-foreground", !full && "line-clamp-3")}>
+            {shownDetail}
+          </span>
+        ))}
+      {goal && (
+        <>
+          <span className="text-muted-foreground">Goal</span>
+          <StepDescription text={goal} />
+        </>
       )}
-      {goal && <span className="break-words text-muted-foreground">Goal: {goal}</span>}
     </>
   );
 }
@@ -843,7 +878,8 @@ export function ProgressStrip({
             <HoverCardContent
               side="bottom"
               sideOffset={8}
-              className="flex w-fit max-w-72 flex-col items-start gap-1 px-3 py-2 text-sm"
+              // break-words would let a long path or command set the text's width past the card.
+              className="flex w-fit max-w-72 flex-col items-start gap-1 wrap-anywhere px-3 py-2 text-sm"
               data-testid="tasks-progress-card"
             >
               <TaskCardDetails
@@ -940,6 +976,8 @@ function TasksHeader({
   onContinuePlan,
   menuActionFor,
   onStop,
+  stopping = false,
+  onOpenGraph,
 }: {
   plan: JournalEntry | null;
   /** The saved workflow the plan came from, or null. */
@@ -956,6 +994,10 @@ function TasksHeader({
   menuActionFor: (item: StepProgress) => TaskMenuAction | undefined;
   /** Stops the agent; offered only while it works. */
   onStop?: () => void;
+  /** Whether the agent is stopping after a Stop, which shows in Stop's place. */
+  stopping?: boolean;
+  /** Opens the plan on its graph; absent without a plan, which says what waits on what. */
+  onOpenGraph?: () => void;
 }) {
   const tally = planTally(progress);
   const updatedAt = Math.max(
@@ -1002,7 +1044,9 @@ function TasksHeader({
                   Updated <Ago seconds={updatedAt} />
                 </span>
               )}
-              {onStop ? (
+              {stopping ? (
+                <PlanRunButton control="stopping" size="icon-xs" className="self-center" />
+              ) : onStop ? (
                 <PlanRunButton
                   control="stop"
                   size="icon-xs"
@@ -1019,6 +1063,19 @@ function TasksHeader({
                     onClick={onContinuePlan}
                   />
                 )
+              )}
+              {onOpenGraph && (
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label="View the plan on the graph"
+                  title="View the plan on the graph"
+                  className="shrink-0 self-center text-muted-foreground"
+                  data-testid="tasks-plan-graph"
+                  onClick={onOpenGraph}
+                >
+                  <FullscreenIcon />
+                </Button>
               )}
               {onSaveWorkflow && (
                 <DropdownMenu>
@@ -1150,12 +1207,19 @@ export function TasksPanel({
   active,
   onStartWorkflow,
   onShowInChat,
+  renderWorkflowRuns,
 }: {
   conversationId: string;
   active: boolean;
   onStartWorkflow?: () => void;
   /** Called before a task's click scrolls the chat to it, e.g. to close a phone's drawer. */
   onShowInChat?: () => void;
+  /**
+   * The workflow runs below the session's run of its plan's workflow, shown
+   * after the tasks while the panel is active. Passed in because those rows
+   * are built from this panel's parts.
+   */
+  renderWorkflowRuns?: (workflowId: string) => ReactNode;
 }) {
   const tasks = useSessionTasks(conversationId, active);
   const { journal, plan, progress } = tasks;
@@ -1163,12 +1227,16 @@ export function TasksPanel({
   const saveWorkflow = useSessionTasksActions((state) => state.saveWorkflow[conversationId]);
   const taskAction = useSessionTasksActions((state) => state.taskAction[conversationId]);
   const stopWork = useSessionTasksActions((state) => state.stopWork[conversationId]);
-  const stopActiveWork = tasks.sessionWorking ? stopWork : undefined;
+  const stopping = usePlanStopping(conversationId, tasks.sessionWorking);
+  // A run that is already stopping offers no Stop, so its stop message isn't sent twice.
+  const stopActiveWork = tasks.sessionWorking && !stopping ? stopWork : undefined;
   const continuePlan = useSessionTasksActions((state) => state.continuePlan[conversationId]);
   const entries = tasks.journalSupported ? journal.entries : NO_ENTRIES;
+  const workflowId = planWorkflowId(entries);
   const names = new Map(progress.map((item) => [item.step.id, item.step.name]));
   const empty = progress.length === 0;
   const showPlan = !tasks.loading && !journal.error && progress.length > 0;
+  const planComplete = plan !== null && isPlanComplete(progress, planGraphRevision(entries));
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const [stuck, setStuck] = useState(false);
@@ -1194,10 +1262,19 @@ export function TasksPanel({
     // The rail or drawer may still be opening; its rows mount by the next frame.
     requestAnimationFrame(() => jumpToStep(taskToShow.stepId));
   }, [active, showPlan, taskToShow, conversationId, jumpToStep]);
+  const [graphOpen, setGraphOpen] = useState(false);
+  // The panel stays mounted across sessions, so a switch closes the graph rather than hiding it.
+  const [graphConversationId, setGraphConversationId] = useState(conversationId);
+  if (graphConversationId !== conversationId) {
+    setGraphConversationId(conversationId);
+    setGraphOpen(false);
+  }
   const location = useLocation();
   const navigate = useNavigate();
   const showInChat = useCallback(
     (markerId: string) => {
+      // The graph covers the chat it scrolls.
+      setGraphOpen(false);
       onShowInChat?.();
       const pathname = `/c/${encodeURIComponent(conversationId)}`;
       const search = messageDeepLinkParams(new URLSearchParams(location.search), markerId);
@@ -1296,7 +1373,7 @@ export function TasksPanel({
           <>
             <TasksHeader
               plan={plan}
-              workflowId={planWorkflowId(entries)}
+              workflowId={workflowId}
               progress={progress}
               paused={tasks.paused}
               stuck={stuck}
@@ -1306,7 +1383,9 @@ export function TasksPanel({
               }
               onContinuePlan={continuePlan && (() => continuePlan(planName(plan)))}
               menuActionFor={menuActionFor}
-              onStop={stopActiveWork}
+              onStop={planComplete ? undefined : stopActiveWork}
+              stopping={!planComplete && stopping && stopWork !== undefined}
+              onOpenGraph={plan ? () => setGraphOpen(true) : undefined}
             />
             <TaskList
               progress={progress}
@@ -1317,6 +1396,18 @@ export function TasksPanel({
               menuActionFor={menuActionFor}
               nativeMarkerIds={nativeMarkerIds}
             />
+            {active && workflowId && renderWorkflowRuns?.(workflowId)}
+            {plan && graphOpen && (
+              <Suspense fallback={null}>
+                <WorkflowGraphOverlay
+                  title={planName(plan) ?? "Tasks"}
+                  steps={progress.map((item) => item.step)}
+                  progress={progress}
+                  menuActionFor={menuActionFor}
+                  onClose={() => setGraphOpen(false)}
+                />
+              </Suspense>
+            )}
           </>
         )}
       </div>

@@ -310,6 +310,25 @@ export function presentMentions<T extends InlineMention>(
   return mentions.filter((m) => found.has(m.token));
 }
 
+/**
+ * The tags whose token still appears in ``texts``; a tag whose token was deleted
+ * drops out, so retyping that text later stays literal.
+ */
+export function presentTaggedMentions(
+  mentions: TaggedMentions | undefined,
+  texts: readonly string[],
+): TaggedMentions | undefined {
+  if (!mentions) return undefined;
+  const inline = composerInlineMentions(mentions.files, mentions.sessions, null);
+  const present = new Set(presentMentions(inline, texts).map((mention) => mention.token));
+  const fileCount = mentions.files.length;
+  const files = mentions.files.filter((_, index) => present.has(inline[index]!.token));
+  const sessions = mentions.sessions.filter((_, index) =>
+    present.has(inline[fileCount + index]!.token),
+  );
+  return files.length > 0 || sessions.length > 0 ? { files, sessions } : undefined;
+}
+
 /** Replace each token in ``text`` with its marker, in place. */
 export function expandMentionTokens(text: string, mentions: readonly InlineMention[]): string {
   const markerFor = new Map(mentions.map((m) => [m.token, m.marker]));

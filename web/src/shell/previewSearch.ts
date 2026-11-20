@@ -81,6 +81,14 @@ interface TextSegment {
   length: number;
 }
 
+/** Where one match starts and ends, as text nodes and offsets within them. */
+export interface TextMatch {
+  startNode: Text;
+  startOffset: number;
+  endNode: Text;
+  endOffset: number;
+}
+
 /**
  * Case-insensitive plain-text matches of `query` within `container`, returned as
  * DOM Ranges ready to paint. Matches span adjacent text nodes inside one block
@@ -88,6 +96,16 @@ interface TextSegment {
  * text matches.
  */
 export function findTextRanges(container: Element, query: string): Range[] {
+  return findTextMatches(container, query).map((match) => {
+    const range = document.createRange();
+    range.setStart(match.startNode, match.startOffset);
+    range.setEnd(match.endNode, match.endOffset);
+    return range;
+  });
+}
+
+/** The matches {@link findTextRanges} returns, before they become Ranges. */
+export function findTextMatches(container: Element, query: string): TextMatch[] {
   const q = lowerPreservingLength(query);
   if (!q) return [];
 
@@ -111,7 +129,11 @@ export function findTextRanges(container: Element, query: string): Range[] {
   }
 
   const haystack = lowerPreservingLength(text);
-  const ranges: Range[] = [];
+  const matches: TextMatch[] = [];
+  // Matches come in order, so the separator and segment lookups only move
+  // forward: one pass over each, not a scan per match.
+  let separator = 0;
+  let segment = 0;
   let idx = haystack.indexOf(q);
   while (idx !== -1) {
     const start = idx;
@@ -119,20 +141,32 @@ export function findTextRanges(container: Element, query: string): Range[] {
     idx = haystack.indexOf(q, end);
 
     // A match touching a block separator spans two blocks — skip it.
-    if (separators.some((s) => s >= start && s < end)) continue;
+    while (separator < separators.length && separators[separator] < start) separator += 1;
+    if (separator < separators.length && separators[separator] < end) continue;
 
-    const startSeg = segments.find(
-      (s) => s.visibleFrom <= start && start < s.visibleFrom + s.length,
-    );
-    const endSeg = segments.find((s) => s.visibleFrom < end && end <= s.visibleFrom + s.length);
-    if (!startSeg || !endSeg) continue;
+    while (
+      segment < segments.length &&
+      segments[segment].visibleFrom + segments[segment].length <= start
+    ) {
+      segment += 1;
+    }
+    const startSeg = segments[segment];
+    if (!startSeg || startSeg.visibleFrom > start) continue;
+    let last = segment;
+    while (last < segments.length && segments[last].visibleFrom + segments[last].length < end) {
+      last += 1;
+    }
+    const endSeg = segments[last];
+    if (!endSeg || endSeg.visibleFrom >= end) continue;
 
-    const range = document.createRange();
-    range.setStart(startSeg.node, start - startSeg.visibleFrom);
-    range.setEnd(endSeg.node, end - endSeg.visibleFrom);
-    ranges.push(range);
+    matches.push({
+      startNode: startSeg.node,
+      startOffset: start - startSeg.visibleFrom,
+      endNode: endSeg.node,
+      endOffset: end - endSeg.visibleFrom,
+    });
   }
-  return ranges;
+  return matches;
 }
 
 const HIGHLIGHT_ALL = "md-preview-search";
@@ -150,8 +184,13 @@ export function highlightsSupported(): boolean {
 export function paintPreviewHighlights(ranges: Range[], current: number): void {
   if (!highlightsSupported()) return;
   const currentRange = ranges[current];
-  const rest = ranges.filter((_, i) => i !== current);
-  CSS.highlights.set(HIGHLIGHT_ALL, new Highlight(...rest));
+  // Added one by one: spreading a large table's matches into the constructor
+  // can pass more arguments than the engine allows.
+  const all = new Highlight();
+  ranges.forEach((range, index) => {
+    if (index !== current) all.add(range);
+  });
+  CSS.highlights.set(HIGHLIGHT_ALL, all);
   CSS.highlights.set(HIGHLIGHT_CURRENT, new Highlight(...(currentRange ? [currentRange] : [])));
 }
 

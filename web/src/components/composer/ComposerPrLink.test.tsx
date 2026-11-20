@@ -5,11 +5,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ComposerPrLink } from "./ComposerPrLink";
 import { COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS } from "./ChatComposer";
 import type { ComposerPullRequest } from "@/hooks/useComposerGitStatus";
-import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import type * as OpenLinkInAppModule from "@/lib/openLinkInApp";
 import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
 
-vi.mock("@/hooks/useIsCoarsePointer", () => ({ useIsCoarsePointer: vi.fn(() => false) }));
+vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: vi.fn(() => false) }));
 vi.mock("@/lib/openLinkInApp", async (importOriginal) => ({
   ...(await importOriginal<typeof OpenLinkInAppModule>()),
   followLinkWithPopupFallback: vi.fn(),
@@ -17,7 +17,7 @@ vi.mock("@/lib/openLinkInApp", async (importOriginal) => ({
 
 afterEach(() => {
   cleanup();
-  vi.mocked(useIsCoarsePointer).mockReturnValue(false);
+  vi.mocked(useIsMobileViewport).mockReturnValue(false);
 });
 
 describe("ComposerPrLink", () => {
@@ -127,8 +127,8 @@ describe("ComposerPrLink", () => {
     expect(screen.queryByText("#null")).toBeNull();
   });
 
-  it.each([false, true])("shows each PR state on keyboard focus (coarse=%s)", async (coarse) => {
-    vi.mocked(useIsCoarsePointer).mockReturnValue(coarse);
+  it.each([false, true])("shows each PR state on keyboard focus (mobile=%s)", async (mobile) => {
+    vi.mocked(useIsMobileViewport).mockReturnValue(mobile);
     const prs: ComposerPullRequest[] = [
       {
         url: "https://github.com/example/app/pull/42",

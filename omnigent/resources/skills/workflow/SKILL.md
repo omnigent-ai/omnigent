@@ -1,6 +1,6 @@
 ---
 name: workflow
-description: Plan and run a multi-step workflow from a description or one of the user's saved workflows. Keeps the plan and every step's status in the session's journal, so people can follow along in the Tasks tab and the work resumes cleanly.
+description: Run a multi-step workflow from a description or one of the user's saved workflows. Keeps the plan and every step's status in the session's journal, so people can follow along in the Tasks tab and the work resumes cleanly.
 ---
 
 # Run a workflow
@@ -10,6 +10,11 @@ workflows. Turn it into a plan, then work through the plan, recording where
 each step stands as you go. The user watches
 the plan's steps as tasks in the session's Tasks tab and can steer or stop you
 in chat at any time.
+
+For a request to design, edit or save a reusable workflow, including a workflow
+page's planning chat, use the [save-workflow skill](../save-workflow/SKILL.md).
+Research the procedure and publish a proposal without executing it. The
+execution instructions below apply when the user asks to run the work.
 
 You need the `sys_journal_*` tools, plus `sys_workflow_load` and
 `sys_workflow_list` for a saved workflow. If a required tool is missing, report
@@ -108,34 +113,69 @@ so nothing in the run may wait for a person:
    question only under "Before asking or declaring a blocker". A finished
    plan does not block a new one.
    An explicit Stop still requires an explicit Continue for the stopped work.
-2. Write the plan with `sys_journal_write_plan` before you start working. Name
+2. Use the current run's plan if one is already in the journal. Otherwise,
+   write the plan with `sys_journal_write_plan` before executing its steps. Name
    the plan for its goal in a few words ("Cut GET /orders p95 by 20%"). Give
-   each step a short, stable ID (`profile`, `opt-pool`), a name, and its
-   dependencies. A new step needs an ID the journal hasn't used yet, since a
+   each step a short, stable ID (`profile`, `opt-pool`), a name, its
+   dependencies and a `goal` written for the user first (see "Step
+   descriptions"). A new step needs an ID the journal hasn't used yet, since a
    step's status is the newest one written under its ID.
 
    List the steps in the order you'll work on them. The Tasks tab numbers
    them in that order, so the user should see the work move steadily down the
-   list. Put each step right after the steps it depends on: a step that needs
-   only the exploration, such as a check, goes right after the exploration,
-   and steps that can run at the same time go next to each other. Steps that
-   would change the same files, or measure on the same machine, can't run at
-   the same time: make the later one depend on the earlier.
-3. Make the first step exploring the work: ID `explore` (`explore-2`,
-   `explore-3` and on when an earlier workflow in this session used it), and a
-   name that starts with "Explore" ("Explore the open PRs and pick 3"), so the
-   user can tell it apart in the Tasks tab. Explore without changing anything,
-   deeply enough that the steps you add from it are reasonably specific: each
-   a concrete piece of work, such as one change or one PR, rather than a broad
-   phase like "implement the changes". A small, clear task needs only a quick
-   look.
-4. Once you've explored, replan: keep the exploration first and add the work
-   after it, depending on it. A single goal is one step after the exploration.
+   list. Put each step after the steps whose results it needs, and steps that
+   can run at the same time next to each other. Steps that would change the
+   same files in one checkout, or measure on the same machine, can't run at
+   the same time: make the later one depend on the earlier, or give each its
+   own checkout or machine (see "Running a step in a nested agent").
+3. Include a discovery step when the run needs new information, such as which
+   PRs to review or what causes today's failing tests. Name it for the result
+   it must produce, and investigate deeply enough to make dependent work
+   concrete. An already understood procedure does not need an initial
+   exploration step. Use the current instructions while doing each task;
+   rereading a known SOP is not itself a default workflow step.
+4. Replan when discovery or changed instructions affect the work. Preserve
+   completed results and add concrete steps, with dependencies only on the
+   results they need. Do not repeat research already completed while authoring
+   the saved workflow unless new evidence makes it necessary.
 5. Start once the goal is clear enough to make progress. Discover missing
-   details during exploration and record reasonable assumptions. If an
-   question meets "Before asking or declaring a blocker", ask it on a ready
-   step with `sys_workflow_request_input`; don't turn routine uncertainty into
-   a plan-review pause. In an unattended run, follow the automation rules.
+   run inputs as needed and record reasonable assumptions. If a question meets
+   "Before asking or declaring a blocker", ask it on a ready step with
+   `sys_workflow_request_input`; don't turn routine uncertainty into a
+   plan-review pause. In an unattended run, follow the automation rules.
+
+## Step descriptions
+
+A step's `goal`, in `sys_journal_write_plan`, is its description. The user
+reads it in the Tasks tab, and whoever runs the step, you or a nested agent,
+works from it. Write it for the user first, in plain language and short
+Markdown bullets, with these parts in this order:
+
+- **Inputs:** what the step reads and where it comes from, such as a Slack
+  channel, a pull request or another MCP server's tool.
+- **What it does:** a few short bullets.
+- **Outputs:** what it produces, such as a PR link or a report. This is what
+  done means for the step.
+- **Details:** the exact commands, paths, flags and checks the work needs,
+  last.
+
+Separate the parts with blank lines. A step simple enough for one sentence can
+be one sentence. For example:
+
+```markdown
+**Inputs:** the failing checks on the current branch's pull request.
+
+**What it does:**
+- Reproduces each failure locally.
+- Fixes its cause and pushes the fix.
+
+**Outputs:** the PR with passing checks.
+
+**Details:** list the checks with `gh pr checks <number>`, and run the suite with the repository's test command.
+```
+
+Saved workflows' steps use the same parts. Before you work on a step, read its
+whole goal: Details carries the commands, paths and checks it needs.
 
 ## Run a saved workflow
 
@@ -144,18 +184,27 @@ tests" (ID …)", or "run my triage workflow" in chat):
 
 - Do the plan's step 1 first: decide whether this resumes, extends or starts
   a run from the request and journal.
-- Load it with `sys_workflow_load`, by its ID when you have one, otherwise by
-  name. If they describe it without its exact name, or the load returns
+- A session started as a run of the workflow, from its Run button or by
+  another session, already has its starting plan in the journal. Continue
+  that run using its saved snapshot and step IDs; do not write another
+  starting plan with `workflow_id`. Later edits to the saved workflow do not
+  replace this run's plan. Load the workflow only if you need its
+  description. An explicit request to run it again starts a new run.
+- If there is no starting plan, load it with `sys_workflow_load`, by its ID
+  when you have one, otherwise by name. If they describe it without its exact
+  name, or the load returns
   `workflow_not_found`, list their workflows with `sys_workflow_list` and pick
   the one whose description and context clearly fit. If the intended workflow
   still cannot be identified, follow "Before asking or declaring a blocker";
   don't choose an unrelated workflow just to avoid a question.
-- Its steps are your plan: write them with `sys_journal_write_plan`, named
-  after the workflow, keeping their IDs and dependencies, and with
+- If the run has no starting plan yet, its steps are your plan: write them
+  with `sys_journal_write_plan`, named after the workflow, keeping their IDs
+  and dependencies, and with
   `workflow_id` set to its ID, so the workflow's page lists this run. Put
   them in the order you'll work on them (see Plan), even if the saved order
   differs. Rename an ID only if this session's journal already used it. Fill
-  the run's details into the step names and goals.
+  the run's details into the step names and goals, keeping each goal's parts:
+  this run's inputs go in its Inputs, and their specifics in its Details.
 - Its description says what a run needs. Resolve missing details from the
   conversation, journal, current workspace and available tools, then use
   documented or reversible defaults. Any remaining missing input must meet
@@ -168,16 +217,15 @@ tests" (ID …)", or "run my triage workflow" in chat):
 
 When the user asks to review the plan before the work starts:
 
-- Make the review the second step (`review`, numbered like the exploration
-  when an earlier workflow used it), depending on the exploration, and make
-  every step you add after it depend on the review. Keep those two steps first
-  in every version of the plan.
-- Once you've explored and added the work, ask the user to approve the plan
-  with `sys_workflow_request_input` on the review. Start none of the later
-  steps until they approve, then write `done` on the review.
-- If they ask for changes, write `started` on the review first, then restart
-  the exploration to look into what they asked, update the steps after the
-  review, and ask again.
+- Add a review step (`review`, or a new ID if that ID was used earlier) before
+  the work requiring approval. Any read-only discovery needed to form the plan
+  comes before it; when the plan is already concrete, review can be first.
+  Make the work requiring approval depend on the review.
+- Once the plan is concrete, ask the user to approve it with
+  `sys_workflow_request_input` on the review. Start none of the later steps
+  until they approve, then write `done` on the review.
+- If they ask for changes, write `started` on the review first, investigate
+  what the revision requires, update the affected steps and ask again.
 
 ## Work through it
 
@@ -191,8 +239,9 @@ When the user asks to review the plan before the work starts:
   and say which step covered it. If one turned out unnecessary, replan without
   it.
 - Run ready steps that don't depend on each other at the same time when you
-  can, such as on sub-agents if you have them, and work on other ready steps
-  while one waits on something slow, such as CI or another session.
+  can, each in a nested agent (see "Running a step in a nested agent"), and
+  work on other ready steps while one waits on something slow, such as CI or
+  another session.
 - Write `done` when the step achieved its goal. Only `done` lets later steps
   start.
 - Don't write `done` while a later step still needs something that's on its
@@ -200,7 +249,7 @@ When the user asks to review the plan before the work starts:
   you started, even if the step's own goal is met. Keep the step `started`,
   say what it waits for in its status ("Sync started; waiting for its PR"),
   and check on it with a background timer, as for a session you start (see
-  "Running another workflow as a step"). Write `done` once it arrives.
+  "Running a step in a nested agent"). Write `done` once it arrives.
 - Keep going while any step is ready or started. Don't end your turn until
   everything left is done, failed, waiting for the user, running in another
   session, or waits on one of those, unless the user or your instructions say
@@ -210,8 +259,10 @@ When the user asks to review the plan before the work starts:
   Then ask with `sys_workflow_request_input`: the step, and everything you need
   in one call, each question with your options and your recommendation. It
   marks the step `needs_input`, puts the questions in the user's Inbox, and
-  waits for the answer. Use it, not your own question tool (such as
-  AskUserQuestion or request_user_input).
+  waits a few minutes for the answer. If it returns `still_open`, end your
+  turn once nothing else is ready; the answer arrives later as a message. Use
+  it, not your own question tool (such as AskUserQuestion or
+  request_user_input).
 - When the user answers a step that waits for them, in the Inbox, in the chat
   or with **Continue** in the Tasks tab, write `started` on it before you work
   on it again, or `done` if its work is already done, for example by another
@@ -294,29 +345,108 @@ own turn is not enough: delegated work can keep running independently.
   resume, start a replacement with the recorded context or do its remaining
   work here. Restore the monitoring needed to finish the workflow.
 
-## Running another workflow as a step
+## Running a step in a nested agent
 
-When a step is a workflow of its own, such as getting one PR ready to merge,
-run it in its own session:
+Hand a step off to a nested agent: an Omnigent session of its own in the
+sidebar, where the user can follow its work and message it. Use one for each
+step you run at the same time as others, for long work, and for a step that
+is a workflow of its own, such as getting one PR ready to merge. Don't hand
+steps to your harness's own sub-agents (such as Claude Code's Agent or Task
+tool), which the user may not be able to message; keep those for quick
+lookups within work you do yourself.
 
-- Write `started` on the step, then start a session for it with
-  `sys_session_create`, using your own agent and `placement: same_host`.
-  `sys_session_get_info` with no arguments gives your session ID, and
-  `sys_agent_get` on that session gives your agent's ID. The first message
-  must:
-  - tell it to load the `workflow` skill and run the workflow
-  - give it everything it needs, since it doesn't see this conversation
-  - include the relevant decisions, existing authorization and limits, and
-    whether this is an unattended run; tell it to resolve routine choices
-    itself and report any remaining blockers to you, passing this context
-    to its own workers
-  - say that this session (give its ID) started it for the step (give the
-    step ID), and that it must report back when its plan finishes
+Use the Omnigent tools named below. In a native harness such as Claude Code
+or Codex they come from the `omnigent` MCP server: in Claude Code,
+`sys_session_create` is `mcp__omnigent__sys_session_create`.
+
+1. Call `sys_session_get_info` with no arguments. It returns your session
+   ID, `agent_id`, `agent_name`, `model`, `reasoning_effort`, `host_id` and
+   `workspace`.
+2. Choose where the nested agent runs, its `placement`, to suit the step:
+   - `"same_host"`: your host and workspace. It has your checkout, files,
+     tools and credentials, and starts quickly. It also shares them: steps
+     that edit the same files can't run there at the same time, and heavy
+     work competes for one machine. Every server that allows nested agents
+     allows it.
+   - `"host"`: a directory on a host you own, given as `host_id` and an
+     absolute `workspace`. Add `git` (`branch_name`, and `base_branch` if
+     needed) to create a worktree of that repository on a new branch, so
+     parallel edits don't collide; its changes stay on that branch, so the
+     brief must say what to do with them, such as committing there or
+     opening a PR. Use your own `host_id` to stay on this machine. It needs
+     scripted sessions on the server, and the server may allow only your own
+     host.
+   - `"managed"`: a new sandbox from the server's sandbox provider, with its
+     own files and compute, for work that must be kept apart or is too heavy
+     for this machine. It starts without your checkout, files or
+     credentials, so the brief must say how to get the code, such as which
+     repository and branch to clone, and how to hand back the result, such
+     as pushing a branch or opening a PR. It is slower to start, and the
+     server may have no provider or may not allow it.
+
+   Leaving `placement` out makes a sub-agent session, not a nested agent.
+3. Choose its harness, model and reasoning effort for the step's
+   complexity. Start from your own and adjust from there: a lighter model or
+   lower effort for routine work, such as gathering data or making a
+   mechanical edit, and a stronger model or higher effort for hard work, such
+   as debugging or design. Keep yours when unsure. The `self` entry of
+   `sys_list_models` lists the models your agent can run. To use another
+   harness, pick its agent from `sys_agent_list`: one whose
+   `available_on_host` isn't false and that can run the `workflow` skill,
+   which needs Omnigent's journal tools. An agent whose spec turns those
+   tools off can't run the step as its workflow; if you can't tell, use your
+   own agent. Leave `model` out unless you know one the other agent runs.
+4. Start it with `sys_session_create`:
+   - `agent_id`: your `agent_id`, or the other harness's agent.
+   - `placement`, with the arguments it takes.
+   - `model` and `reasoning_effort`: the ones you chose, even when they
+     match yours, since a new session otherwise starts with its agent's
+     defaults. Leave out any that `sys_session_get_info` didn't report.
+   - `title`: the step's name.
+   - `workflow_id`: only for a step that runs a saved workflow, its ID. The
+     session starts with that workflow's plan, and the workflow's page lists
+     the run.
+   - `message`: the brief, at most 8000 characters; point to files for
+     more. It must:
+     - tell it to load the `workflow` skill and run the step as its
+       workflow: the step's name, its whole goal with its Details, and its
+       inputs, or a saved workflow's name and ID
+     - give it everything it needs, since it doesn't see this conversation
+     - include the relevant decisions, existing authorization and limits,
+       and whether this is an unattended run; tell it to resolve routine
+       choices itself and report any remaining blockers to you, passing
+       this context to its own workers
+     - say that this session (give its ID) started it for the step (give
+       the step ID), and that it must report back with
+       `sys_session_message` when its plan finishes
+
+   If the server refuses a choice as unavailable, such as a placement it
+   doesn't enable or allow, a missing sandbox provider, or a model or effort
+   the harness can't use, fall back to the next best option. `"same_host"`
+   with your own agent, model and effort works wherever nested agents do.
+   Falling back to it is fine when you wanted isolation only so parallel
+   edits don't collide: run those steps one after another instead. When a
+   step must not run on this machine, such as untrusted code or work the
+   user asked to keep in a sandbox, don't fall back; treat it as a blocker
+   (see "Before asking or declaring a blocker"). If the call says the
+   creation couldn't be confirmed, look for the session with
+   `sys_session_list` before starting another.
+5. Write `started` on the step with `sys_journal_write_status`, naming the
+   nested agent in its text, and record the `conversation_id` it returned in
+   a note on the step with `sys_journal_write_note`.
+6. Check on it periodically. Start a background timer with your own tools,
+   such as a background shell that sleeps 5 minutes. Each time it fires,
+   read its journal with `sys_journal_read` (`conversation_id`: its session
+   ID), update the step, and start the timer again while it is still
+   working.
+7. Send it anything it needs with `sys_session_message` (`session_id`: its
+   session ID): answers, missing context, and Stop or Continue.
+
+- Start one nested agent per step, not one per item a step covers: a
+  session's family holds at most 100 sessions.
+- Run steps that edit the same files one after another when they share a
+  checkout, such as after a fallback to `"same_host"` (see Plan).
 - If you can't start one, do the step's work in this session instead.
-- Check on it periodically. Start a background timer with your own tools,
-  such as a background shell that sleeps 5 minutes. Each time it fires, read
-  the other session's journal with `sys_journal_read`, update the step, and
-  start the timer again while that session is still working.
 - When its plan finishes or it reports back, verify the result and write
   `done` on the step if every required task is done. For failures or an
   unexpected stop with tasks left, read its journal and result: supply missing

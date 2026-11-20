@@ -10,6 +10,7 @@ import { MobilePanelDrawer } from "./MobilePanelDrawer";
 import { PullRequestPanel } from "./PullRequestPanel";
 import { SubagentsPanel } from "./SubagentsPanel";
 import { TasksPanel } from "./TasksPanel";
+import { SessionDescendantRuns } from "@/components/workflows/WorkflowRunRow";
 import { TerminalsPanel } from "./TerminalsPanel";
 
 export interface AppShellWorkspacePanelsProps {
@@ -186,6 +187,9 @@ export function AppShellWorkspacePanels({
               onStartWorkflow={() => setTasksPanelOpen(false)}
               // And so the chat a task's click scrolls to shows.
               onShowInChat={() => setTasksPanelOpen(false)}
+              renderWorkflowRuns={(workflowId) => (
+                <SessionDescendantRuns sessionId={conversationId} workflowId={workflowId} />
+              )}
             />
           </RenderErrorBoundary>
         </MobilePanelDrawer>

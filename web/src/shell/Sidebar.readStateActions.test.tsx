@@ -1,7 +1,7 @@
 import { renderSidebar } from "@/test/sidebarTestHelpers";
-import { conversationPage } from "@/test/sidebarMockHelpers";
+import { conversationPage, setConversationMutedMock } from "@/test/sidebarMockHelpers";
 // Tests for the read-state actions in the sidebar's session menus:
-//   1. A row's kebab always offers exactly one read-state action — "Mark as
+//   1. An unmuted row's kebab offers exactly one read-state action — "Mark as
 //      unread" on a read row, "Mark as read" on a row already showing the
 //      unread dot (ConversationMenuItems in Sidebar.tsx).
 //   2. The bulk-selection bar offers the matching bulk action: "Mark selected
@@ -23,8 +23,11 @@ vi.mock("@/hooks/useConversations", async () => {
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
+import { MUTED_LABEL_KEY } from "@/lib/sessionMute";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import {
   isConversationUnseen,
+  isExplicitlyUnread,
   markConversationUnread,
   resetReadStateForTests,
   seedReadState,
@@ -112,6 +115,54 @@ describe("row kebab read-state action", () => {
   });
 });
 
+describe("row mute action", () => {
+  const MUTE_SERVER = { ...FALLBACK_SERVER_INFO, session_mute: true };
+
+  it("hides a muted row's unread dot, marks it muted, and offers Unmute", () => {
+    const muted = { ...CONV_A, labels: { [MUTED_LABEL_KEY]: "1" } };
+    mockConversations([muted, CONV_B]);
+    markConversationUnread(CONV_A.id, CONV_A.updated_at);
+    renderSidebar({ info: MUTE_SERVER });
+
+    const row = rowFor("Session Alpha");
+    expect(unreadDot(row)).toBeNull();
+    expect(within(row).getByTestId("conversation-muted-icon")).toBeInTheDocument();
+
+    openKebab(row);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Unmute" }));
+    expect(setConversationMutedMock).toHaveBeenLastCalledWith({ id: CONV_A.id, muted: false });
+  });
+
+  it.each([false, true])("hides Mark as unread for an inactive muted row, unseen=%s", (unseen) => {
+    mockConversations([{ ...CONV_A, labels: { [MUTED_LABEL_KEY]: "1" } }, CONV_B]);
+    resetReadStateForTests();
+    seedReadState([{ id: CONV_A.id, viewer_last_seen: CONV_A.updated_at - (unseen ? 1 : 0) }]);
+    renderSidebar({ info: MUTE_SERVER });
+    openKebab(rowFor("Session Alpha"));
+    expect(screen.queryByTestId("mark-unread-conversation")).toBeNull();
+    if (unseen) expect(screen.getByTestId("mark-read-conversation")).toBeInTheDocument();
+    else expect(screen.queryByTestId("mark-read-conversation")).toBeNull();
+    expect(screen.getByRole("menuitem", { name: "Unmute" })).toBeInTheDocument();
+  });
+
+  it("offers Mute on an unmuted row", () => {
+    renderSidebar({ info: MUTE_SERVER });
+    const row = rowFor("Session Beta");
+    expect(within(row).queryByTestId("conversation-muted-icon")).toBeNull();
+
+    openKebab(row);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Mute" }));
+    expect(setConversationMutedMock).toHaveBeenLastCalledWith({ id: CONV_B.id, muted: true });
+  });
+
+  it("offers no Mute on a server that would share the label with collaborators", () => {
+    renderSidebar({ info: FALLBACK_SERVER_INFO });
+    openKebab(rowFor("Session Beta"));
+    expect(screen.getByRole("menuitem", { name: "Mark as unread" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Mute" })).toBeNull();
+  });
+});
+
 describe("bulk-selection read-state action", () => {
   it("marks a selection containing unread rows as read and exits selection mode", () => {
     // Mixed selection (one unread, one read) → the bar offers Mark as read.
@@ -140,6 +191,18 @@ describe("bulk-selection read-state action", () => {
 
     expect(screen.getByRole("button", { name: "Select sessions" })).toBeInTheDocument();
     expect(unreadDot(rowFor("Session Alpha"))).not.toBeNull();
+    expect(unreadDot(rowFor("Session Beta"))).not.toBeNull();
+  });
+
+  it("leaves muted rows out of Mark as unread, disabled for an all-muted selection", () => {
+    mockConversations([{ ...CONV_A, labels: { [MUTED_LABEL_KEY]: "1" } }, CONV_B]);
+    renderSidebar();
+    enterSelectionModeAndSelect(["Session Alpha"]);
+    expect(screen.getByTestId("bulk-mark-unread")).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("link", { name: /Session Beta/ }));
+    fireEvent.click(screen.getByTestId("bulk-mark-unread"));
+    expect(isExplicitlyUnread(CONV_A.id)).toBe(false);
     expect(unreadDot(rowFor("Session Beta"))).not.toBeNull();
   });
 

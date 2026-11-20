@@ -1,5 +1,6 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { userEvent, within } from "storybook/test";
+import { writeCodeBlockWordWrap } from "@/lib/codeWrapPreferences";
 import { writeTerminalThemeMode } from "@/lib/terminalThemePreferences";
 import { StoryQueryRouter } from "@/storybook/StoryProviders";
 import { ToolCard } from "./ToolCard";
@@ -327,6 +328,11 @@ export const ShellLongLinesWrapped: Story = {
 
 export const ShellLongLinesScrolling: Story = {
   args: ShellLongLinesWrapped.args,
+  // The toggle persists for every code block, so start wrapped and restore it.
+  beforeEach: () => {
+    writeCodeBlockWordWrap(true);
+    return () => writeCodeBlockWordWrap(true);
+  },
   play: async ({ canvasElement }) => {
     await expand(canvasElement);
     const wrapToggle = within(canvasElement).getByRole("button", { name: "Disable word wrap" });

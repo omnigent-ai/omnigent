@@ -876,7 +876,11 @@ class CallerProcessFilesystem:
                 f"before = {before!r}",
                 f"order = {_json.dumps(order)}",
                 f"limit = {limit}",
-                "names = sorted(os.listdir(d), reverse=order == 'desc')",
+                # A name that isn't UTF-8 can't travel in JSON; the host's reader skips it too.
+                "def utf8(n):",
+                "    try: return n.encode('utf-8') is not None",
+                "    except UnicodeEncodeError: return False",
+                "names = sorted((n for n in os.listdir(d) if utf8(n)), reverse=order == 'desc')",
                 "def cursor_index(cursor):",
                 "    if cursor is None: return None",
                 "    if prefix:",
