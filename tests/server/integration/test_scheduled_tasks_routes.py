@@ -56,6 +56,7 @@ from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStor
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
     SqlAlchemyScheduledTaskStore,
 )
+from tests.budgets import budget
 from tests.debug_log_helpers import capture_debug_rows
 from tests.server.conftest import ControllableMockClient
 from tests.server.helpers import FakeSandboxLauncher
@@ -4550,14 +4551,15 @@ async def test_a_cancelled_create_deletes_the_copy_once_its_writes_settle(
             headers=_headers(),
         )
     )
-    await asyncio.wait_for(entered.wait(), 5)
+    # CI can stall the event loop for several seconds, so the waits scale with CI's budget.
+    await asyncio.wait_for(entered.wait(), budget(5))
     pending.cancel()
     await asyncio.sleep(0)
     # A second cancellation must not interrupt the cleanup.
     pending.cancel()
     release.set()
     with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(pending, 5)
+        await asyncio.wait_for(pending, budget(5))
 
     assert {conv.id for conv in conversations.list_conversations(limit=100).data} == before
     assert len(released) == 1
