@@ -19,6 +19,10 @@ export const IMPORT_RECENT_LIMITS = [25, 50, 100, 200, 500, 1000] as const;
 
 export const importRecentLimitLabel = (limit: number) => `Last ${limit}`;
 
+/** The recent-count field's name for one harness; with every harness, the page adds the scope. */
+export const IMPORT_RECENT_COUNT_LABEL = "How many recent sessions";
+export const IMPORT_RECENT_COUNT_ALL_LABEL = `${IMPORT_RECENT_COUNT_LABEL} (across all harnesses)`;
+
 export const IMPORT_MACHINE_ENTRY = settingsEntry({
   id: "import-machine",
   section: "import",
@@ -56,7 +60,7 @@ export const IMPORT_HARNESS_ENTRY = settingsEntry({
 export const IMPORT_RECENT_COUNT_ENTRY = settingsEntry({
   id: "import-recent-count",
   section: "import",
-  label: "How many recent sessions",
+  label: IMPORT_RECENT_COUNT_ALL_LABEL,
   description:
     "Recent sessions you opened in the harness. Sub-agent and automation runs are skipped; prior imports are counted separately and skipped.",
   keywords: ["import", "recent", "how many", "limit", "count", "last"],

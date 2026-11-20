@@ -18,6 +18,7 @@ import httpx
 from fastapi import (
     APIRouter,
     HTTPException,
+    Query,
     Request,
 )
 from fastapi.responses import StreamingResponse
@@ -42,6 +43,7 @@ from omnigent.entities.conversation import (
     parse_item_data,
 )
 from omnigent.errors import ErrorCode, OmnigentError, WrongReplicaError
+from omnigent.harness_aliases import is_native_harness
 from omnigent.harness_plugins import NativeCodingAgent
 from omnigent.harnesses.codex_native.shell_input import shell_command_from_input
 from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
@@ -1173,6 +1175,22 @@ def register_events_routes(
             )
         return user_id, conv
 
+    @event_router.post("/sessions/{session_id}/recovery/admit", include_in_schema=False)
+    async def admit_recovery_turn(
+        request: Request,
+        session_id: str,
+        recovery_id: str = Query(min_length=1, max_length=128),
+    ) -> dict[str, bool]:
+        _, conv = await _authorized_conversation(request, session_id, external_transcript=True)
+        reporting_runner = _reporting_runner_id(request)
+        if reporting_runner is not None and reporting_runner != conv.runner_id:
+            raise OmnigentError("session is not bound to this runner", code=ErrorCode.FORBIDDEN)
+        recoverer = getattr(request.app.state, "host_session_recoverer", None)
+        admitted = recoverer is not None and await asyncio.to_thread(
+            recoverer.admit_turn, session_id, recovery_id
+        )
+        return {"admitted": admitted}
+
     @event_router.post(
         "/sessions/{session_id}/events",
         # Internal event ingestion — hidden from the public API reference.
@@ -1320,6 +1338,42 @@ def register_events_routes(
         register_runner_ingest(ingest_runner_batch)
 
     pull_request_store = server_prs.open_store(conversation_store)
+
+    async def _end_run_pull_request_turn(
+        app: Any, session_id: str, labels: Mapping[str, str]
+    ) -> None:
+        """End the run's PR attribution because a person wrote to the session.
+
+        Also for a session the automation created, whose run label stays for its
+        journal. A prompt still being dispatched keeps its run unless that run
+        finished or its pending stamp went stale, as when clearing the label.
+        """
+        run_id = labels.get(SCHEDULED_TASK_RUN_LABEL_KEY)
+        if not run_id or pull_request_store is None:
+            return
+        run_finished = False
+        if SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX + run_id in labels:
+            scheduled_store = getattr(getattr(app, "state", None), "scheduled_task_store", None)
+            run = (
+                await asyncio.to_thread(scheduled_store.get_run, run_id)
+                if scheduled_store is not None
+                else None
+            )
+            run_finished = run is not None and run.status not in {
+                "scheduled",
+                "starting",
+                "running",
+            }
+        try:
+            await asyncio.to_thread(
+                pull_request_store.end_run_turn, session_id, run_id, run_finished=run_finished
+            )
+        except Exception:  # PR attribution must not block the message.
+            _logger.warning(
+                "Could not end a run's pull request attribution",
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
 
     async def _store_reported_pull_requests(session_id: str, body: SessionEventInput) -> None:
         """Merge the PRs a runner discovered; the runner retries until this succeeds."""
@@ -1487,18 +1541,21 @@ def register_events_routes(
             )
         start_fire_stage("input_validation", session_id=session_id)
         peer_message = body.type == "session_message"
-        interactive_run_id = (
-            conv.labels.get(SCHEDULED_TASK_RUN_LABEL_KEY)
-            if isinstance(request, Request)
+        # A person writing to the session, not an agent, workflow or runner.
+        human_input = (
+            isinstance(request, Request)
             and not peer_message
             and body.workflow_run_id is None
             and not request.headers.get(ORCHESTRATION_SOURCE_HEADER)
             and not request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER)
-            and not conv.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY)
             and (
                 (body.type == "message" and body.data.get("role", "user") == "user")
                 or body.type == _SLASH_COMMAND_TYPE
             )
+        )
+        interactive_run_id = (
+            conv.labels.get(SCHEDULED_TASK_RUN_LABEL_KEY)
+            if human_input and not conv.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY)
             else None
         )
         if peer_message:
@@ -1777,6 +1834,9 @@ def register_events_routes(
                 user_id=user_id,
                 permission_store=permission_store,
             )
+            recoverer = getattr(request.app.state, "host_session_recoverer", None)
+            if recoverer is not None:
+                await asyncio.to_thread(recoverer.stop_recovery, conv, only_pending=True)
             if startup is not None and await startup.retry(session_id):
                 if conv.host_id is not None:
                     startup.host_changed(request.app, conv.host_id)
@@ -2125,6 +2185,9 @@ def register_events_routes(
                 user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
             )
         if body.type in (_INTERRUPT_TYPE, _STOP_SESSION_TYPE):
+            recoverer = getattr(request.app.state, "host_session_recoverer", None)
+            if recoverer is not None:
+                await asyncio.to_thread(recoverer.stop_recovery, conv)
             startup = getattr(request.app.state, "startup_inputs", None)
             if startup is not None:
                 await startup.cancel(session_id)
@@ -2297,6 +2360,9 @@ def register_events_routes(
                     stop_conv.runner_id,
                     stop_host_registry,
                     conversation_store,
+                    host_session_recoverer=getattr(
+                        request.app.state, "host_session_recoverer", None
+                    ),
                 )
                 if not host_stopped:
                     host_conn = (
@@ -2375,6 +2441,9 @@ def register_events_routes(
                         session_id,
                         conversation_store,
                         int(time.time()) - RUNNER_LIVENESS_TTL_S,
+                        host_session_recoverer=getattr(
+                            request.app.state, "host_session_recoverer", None
+                        ),
                     )
             # Stop is non-sticky: no persistent marker is written. The
             # runner tunnel dropping above flips ``runner_online`` to false
@@ -2627,6 +2696,13 @@ def register_events_routes(
             )
             return {"queued": False, "item_id": item_id}
         if body.type == _EXTERNAL_CONVERSATION_ITEM_TYPE:
+
+            async def _direct_input() -> None:
+                # Typed in a native terminal; read the label as the item lands.
+                current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+                labels = current.labels if current is not None else conv.labels if conv else {}
+                await _end_run_pull_request_turn(getattr(request, "app", None), session_id, labels)
+
             item_id = await _persist_external_conversation_item(
                 session_id,
                 conv,
@@ -2635,6 +2711,7 @@ def register_events_routes(
                 created_by=created_by,
                 background_title_coordinator=background_title_coordinator,
                 enabled=background_session_titles_enabled(request.headers),
+                on_direct_input=_direct_input,
             )
             return {"queued": False, "item_id": item_id}
         if body.type == _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE:
@@ -2876,6 +2953,34 @@ def register_events_routes(
             # A confirmed turn completion after a failure means a later turn
             # succeeded, so the earlier failure must not outlive it.
             turn_completed = status == "idle" and data.get("turn_completed") is True
+            recoverer = getattr(request.app.state, "host_session_recoverer", None)
+            recovery_terminal = turn_completed
+            if recoverer is not None and status == "idle":
+                harness = await asyncio.to_thread(
+                    _native_pane_harness, conv, agent_store=agent_store, agent_cache=agent_cache
+                )
+                recovery_terminal = turn_completed or (
+                    is_native_harness(harness)
+                    and native_subagent_terminal_status(
+                        status,
+                        harness=harness,
+                        turn_outcome=data.get("turn_outcome"),
+                        turn_completed=data.get("turn_completed"),
+                    )
+                    is not None
+                )
+            if recoverer is not None and (
+                status in {"running", "failed", "waiting"} or recovery_terminal
+            ):
+                await asyncio.to_thread(
+                    recoverer.record_turn,
+                    session_id,
+                    conv.runner_id,
+                    response_id,
+                    finished=status in {"failed", "waiting"}
+                    or recovery_terminal
+                    or bool(blocked_on),
+                )
             recovered_from_failure = (
                 turn_completed and _session_status_cache.get(session_id) == "failed"
             )
@@ -3873,6 +3978,8 @@ def register_events_routes(
         if refreshed_conv is None:
             raise _session_not_found()
         conv = refreshed_conv
+        if human_input:
+            await _end_run_pull_request_turn(request.app, session_id, conv.labels)
         # A human's next turn ends attribution from an earlier continuation.
         # Leave a newer fire or a prompt still being dispatched untouched.
         pending_run_finished = False

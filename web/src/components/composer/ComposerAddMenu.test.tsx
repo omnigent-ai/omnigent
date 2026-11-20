@@ -45,6 +45,39 @@ describe("ComposerAddMenu's Run a workflow", () => {
     await waitFor(() => expect(onWorkflow).toHaveBeenCalledWith());
   });
 
+  it("names the owner of a workflow shared with the user, which runs like the user's own", async () => {
+    const shared = {
+      id: "d".repeat(32),
+      name: "Weekly report",
+      description: "Summarizes the week.",
+      viewer_role: "viewer" as const,
+      owner_display_name: "Alice",
+    };
+    const { onRunSavedWorkflow } = renderMenu({ savedWorkflows: [...savedWorkflows, shared] });
+    runAWorkflow();
+    const rows = screen.getAllByTestId("composer-saved-workflow");
+    expect(rows.map((row) => row.textContent)).toEqual([
+      "Triage flaky testsFinds and fixes flaky tests.",
+      "Release notesDrafts the release notes.",
+      "Weekly reportShared by Alice · Summarizes the week.",
+    ]);
+    fireEvent.click(rows[2]!);
+    await waitFor(() => expect(onRunSavedWorkflow).toHaveBeenCalledWith(shared));
+  });
+
+  it("opens the picker while more workflows can load, though none loaded yet show", async () => {
+    const loadMore = vi.fn();
+    const { onWorkflow } = renderMenu({
+      savedWorkflows: [],
+      workflowPagination: { hasMore: true, loadingMore: false, loadMore },
+    });
+    runAWorkflow();
+    expect(await screen.findByTestId("composer-workflow-picker")).toBeInTheDocument();
+    expect(onWorkflow).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByText("Load more workflows"));
+    expect(loadMore).toHaveBeenCalledOnce();
+  });
+
   it("lists the saved workflows to search and run", async () => {
     const loadMore = vi.fn();
     const { onRunSavedWorkflow, onWorkflow } = renderMenu({

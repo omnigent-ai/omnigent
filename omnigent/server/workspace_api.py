@@ -21,6 +21,9 @@ from google.protobuf.message import Message
 from starlette.responses import Response
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from omnigent.api.workspace.v1alpha1.workspace_connect import (
+    WorkspaceService as WorkspaceServiceMethods,
+)
 from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     GetCapabilitiesRequest,
     GetCapabilitiesResponse,
@@ -50,8 +53,10 @@ class HostTarget:
     workspace: str
 
 
-class HostWorkspaceService:
+class HostWorkspaceService(WorkspaceServiceMethods):
     """Implements ``WorkspaceService`` by forwarding each call to the session's host.
+
+    Methods it doesn't forward yet answer UNIMPLEMENTED.
 
     :param target: The session's host, or the error every call answers with
         when the session can't be served this way.

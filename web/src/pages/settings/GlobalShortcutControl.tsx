@@ -1,7 +1,6 @@
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { ALT_KEY, CTRL_KEY, MOD_KEY, SHIFT_KEY } from "@/components/KeyboardShortcut";
-import { SettingsLabel } from "@/components/SettingsLabel";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { isMacPlatform } from "@/lib/hotkeys";
@@ -14,6 +13,11 @@ import {
   setGlobalShortcut,
   shellRecordsGlobalShortcut,
 } from "@/lib/nativeBridge";
+import { GLOBAL_SHORTCUT_ENTRY } from "./search/catalog/general";
+import { SettingsEntryLabel, SettingsItem } from "./search/SettingsItem";
+import { settingsControlProps, settingsDescriptionId } from "./search/settingsControl";
+
+const RECORDING_PROMPT = "Press a shortcut…";
 
 const MAC_MODIFIER_GLYPHS: Partial<Record<string, string>> = {
   Control: CTRL_KEY,
@@ -66,8 +70,6 @@ export function GlobalShortcutControl() {
   const [setting, setSetting] = useState<GlobalShortcutSetting | null>(null);
   const [recording, setRecording] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const labelId = useId();
-  const descriptionId = useId();
 
   useEffect(() => {
     void getGlobalShortcut().then((saved) => {
@@ -140,30 +142,29 @@ export function GlobalShortcutControl() {
   if (setting === null) return null;
 
   return (
-    <div className="flex flex-col gap-3">
+    <SettingsItem entry={GLOBAL_SHORTCUT_ENTRY} className="flex flex-col gap-3">
       <div className="flex items-center justify-between gap-6">
-        <SettingsLabel
-          label="Show Omnigent from anywhere"
-          labelId={labelId}
-          descriptionId={descriptionId}
+        <SettingsEntryLabel
+          entry={GLOBAL_SHORTCUT_ENTRY}
           className="flex-1"
-          description="Brings Omnigent to the front from any app."
           descriptionClassName="text-ui"
         />
         <div className="flex shrink-0 items-center gap-3">
           <Button
             variant="outline"
             size="sm"
-            aria-describedby={descriptionId}
+            aria-describedby={settingsDescriptionId(GLOBAL_SHORTCUT_ENTRY)}
+            {...settingsControlProps(GLOBAL_SHORTCUT_ENTRY, "recorder", {
+              runtime: recording ? RECORDING_PROMPT : formatAccelerator(setting.accelerator),
+            })}
             data-testid="global-shortcut-recorder"
             onClick={startRecording}
             onBlur={stopRecording}
           >
-            {recording ? "Press a shortcut…" : formatAccelerator(setting.accelerator)}
+            {recording ? RECORDING_PROMPT : formatAccelerator(setting.accelerator)}
           </Button>
           <Switch
-            aria-labelledby={labelId}
-            aria-describedby={descriptionId}
+            {...settingsControlProps(GLOBAL_SHORTCUT_ENTRY)}
             checked={setting.enabled}
             onCheckedChange={(enabled) =>
               // Turning off names no chord, so a window showing an older one can't save it.
@@ -181,6 +182,6 @@ export function GlobalShortcutControl() {
           {error}
         </p>
       )}
-    </div>
+    </SettingsItem>
   );
 }

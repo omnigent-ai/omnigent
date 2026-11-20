@@ -223,6 +223,14 @@ local server (pass `--force` to stop them immediately); the next `omni` command
 brings the server back up on the new version. Source checkouts update with
 `git pull` instead. Silence the notice with `OMNIGENT_NO_UPDATE_CHECK=1`.
 
+If a `uv tool` install fails to start a sandbox with a `mutable hard-link alias`
+error, reinstall its dependencies as copies. The check depends on the installed
+runtime layout, including installations made by older releases:
+
+```bash
+uv tool upgrade --reinstall --link-mode copy omnigent
+```
+
 The check queries your configured package index — honoring `UV_INDEX_URL` /
 `PIP_INDEX_URL` and your `uv.toml` / `pip.conf` (default PyPI), so private
 mirrors work out of the box; override with `OMNIGENT_INDEX_URL` if needed.
@@ -350,12 +358,20 @@ known owner finish a pending deletion. Wrapper environment transport keeps
 validation and finalization in the terminal's selected environment without
 changing the host bootstrap environment.
 
-Request and terminal owners on the host release their own settings generations
-during normal cleanup. Legacy launches without the ownership capability create
-generations without request locks, which per-generation pruning skips. A crash
-can also leave dispatch or terminal claims that retain settings indefinitely.
-Investigating those leftovers is the host operator's responsibility; there is
-no automatic reconciliation of these claims.
+Request and terminal owners release their own settings generations during normal
+cleanup, including after session rotation or reactivation when the original
+request inode and admission binding still match. A pending session deletion
+blocks new requests, admissions and terminal attachments until explicit bridge
+preparation reactivates it. Existing owners retain their files until confirmed
+release, and the final known owner completes a matching deletion intent.
+
+Connection and connection-pool timeouts occur before delivery, so the sender
+can withdraw their dispatch claims. Read/write failures, cancellation and missing
+acknowledgements can leave delivery uncertain. Legacy launches without the
+ownership capability also create generations without request locks, which
+per-generation pruning skips. Crashes can leave dispatch or terminal claims
+that retain settings indefinitely. There is no automatic reconciliation of
+these uncertain or legacy claims.
 
 Before reclaiming a legacy generation or crash-left claim, the operator must
 identify its bridge, session, generation and peer versions, and establish that
@@ -367,10 +383,10 @@ without copying credential-bearing settings. File age, runner-PID death and free
 locks do not establish reclaimability. If consumer completion cannot be proved,
 retain the files and escalate to the host maintainer.
 
-A normal session change also starts a new ownership incarnation. When an old
-terminal later closes, it releases its exact claim but leaves the old
-generation and any current deletion intent for another pruning or deletion
-operation. This can retain files after a graceful close, without a crash.
+A normal session change starts a new ownership incarnation. A closing owner
+checks its original bridge, lease and request identities before retiring its
+generation. Replaced resources and unknown ownership remain protected, and a
+release cannot delete a reactivated session through an old deletion intent.
 
 Explicit bridge preparation and session rotation replace malformed lifecycle
 JSON or damaged supported-schema fields with a fresh admission identity. They

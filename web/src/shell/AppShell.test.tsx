@@ -142,7 +142,7 @@ vi.mock("@/hooks/useAgents", () => ({
 }));
 
 vi.mock("./Sidebar", () => ({
-  isMobileViewport: () => !window.matchMedia("(min-width: 768px)").matches,
+  isMobileViewport: () => !window.matchMedia("(min-width: 1181px)").matches,
   // Reflect the open/peek props so tests can assert sidebar collapse/expand and
   // whether it is peeking (a floating hover card rather than a docked panel).
   // Rendered as aside.conversations-sidebar like the real one, so the
@@ -2158,6 +2158,8 @@ describe("Workspace rail maximize", () => {
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
     expect(rail().className).toContain("md:shrink-0");
     expect(rail().className).not.toContain("md:absolute");
+    expect(screen.getByRole("main")).toHaveAttribute("data-flyout-boundary");
+    expect(screen.getByRole("main")).not.toContainElement(rail());
     fireEvent.click(screen.getByRole("button", { name: "files: select README.md" }));
 
     // Maximize → the rail breaks out to cover the content region, and the left
@@ -2227,7 +2229,7 @@ describe("Workspace rail maximize", () => {
     const baseMatchMedia = window.matchMedia;
     const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
       ...baseMatchMedia(query),
-      matches: query === "(min-width: 768px)" ? viewport === "desktop" : false,
+      matches: query === "(min-width: 1181px)" ? viewport === "desktop" : false,
     }));
     onTestFinished(() => matchMedia.mockRestore());
     mockConversations([]);
@@ -2409,8 +2411,8 @@ describe("Sidebar across the md breakpoint", () => {
     let width = initialWidth;
     const listeners = new Map<string, Set<EventListenerOrEventListenerObject>>();
     const matches = (query: string) => {
-      if (query === "(min-width: 768px)") return width >= 768;
-      if (query === "(max-width: 767.98px)") return width < 768;
+      if (query === "(min-width: 1181px)") return width >= 1181;
+      if (query === "(max-width: 1180.98px)") return width < 1181;
       return false;
     };
     const baseMatchMedia = window.matchMedia;
@@ -5942,7 +5944,7 @@ describe("AppShell clone/fork action", () => {
     const baseMatchMedia = window.matchMedia;
     const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
       ...baseMatchMedia(query),
-      matches: query === "(min-width: 768px)",
+      matches: query === "(min-width: 1181px)",
     }));
     onTestFinished(() => matchMedia.mockRestore());
     const parent = sessionSnapshot({ id: "conv_parent", title: "Parent title" });
@@ -6815,7 +6817,7 @@ describe("shell command drafts", () => {
       const matchMedia = window.matchMedia;
       const viewport = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
         ...matchMedia(query),
-        matches: query === "(min-width: 768px)" ? !mobile : matchMedia(query).matches,
+        matches: query === "(min-width: 1181px)" ? !mobile : matchMedia(query).matches,
       }));
       onTestFinished(() => viewport.mockRestore());
       const terminals: TerminalInfo[] = [];
@@ -6978,7 +6980,8 @@ describe("AppShell desktop Close", () => {
       renderShell("/c/conv_shell_fail");
       expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "b.ts");
       if (layout === "fullscreen") {
-        fireEvent.click(screen.getByRole("button", { name: "Open sidebar" }));
+        // The desktop app starts with the sidebar docked open at any window width.
+        expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
         fireEvent.click(screen.getByRole("button", { name: "Full screen" }));
       } else if (layout === "collapsed") {
         fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));

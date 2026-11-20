@@ -104,6 +104,42 @@ export const CodexCommand: Story = {
   },
 };
 
+// A multi-line heredoc rule prefix stays one line tall and ends in an ellipsis.
+export const CodexCommandLongPrefix: Story = {
+  args: {
+    message: "Codex wants to run a remote diagnostics script.",
+    phase: "codex_command_approval",
+    policyName: "codex_native_command_approval",
+    contentPreview: "",
+    codexCommand: {
+      command:
+        "/bin/zsh -lc \"ssh build-host python3.12 - <<'PY'\nimport json, platform\nprint(json.dumps({'python': platform.python_version()}))\nPY\"",
+      cwd: "/workspace/omnigent",
+      reason: "Check the Python version on the build host.",
+      execPolicyAmendment: [
+        "/bin/zsh",
+        "-lc",
+        "ssh build-host python3.12 - <<'PY'\nimport json, platform\nprint(json.dumps({'python': platform.python_version()}))\nPY",
+      ],
+      requestFingerprint: "example-request-fingerprint",
+    },
+  },
+};
+
+export const AntigravityLongPattern: Story = {
+  args: {
+    message: "Antigravity wants to run a command.",
+    phase: "agy_permission",
+    policyName: "agy_native_permission",
+    contentPreview: "",
+    agyPermission: {
+      actionDescription: "Running the release checks",
+      alwaysAllowPattern:
+        "python3 scripts/release_checks.py --manifest dist/manifest.json --verify-signatures --strict --report reports/release-checks.json --fail-on-warning",
+    },
+  },
+};
+
 export const SubmittedAnswers: Story = {
   args: {
     message: "Claude asked how the visual tests should run.",

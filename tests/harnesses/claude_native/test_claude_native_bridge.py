@@ -4059,6 +4059,7 @@ def test_read_transcript_items_since_drops_recently_added_cli_builtins(
         ("effort", "high"),
         ("clear", ""),
         ("compact", ""),
+        ("goal", "all tests pass"),
         ("model", "claude-opus-4-7"),
         ("ultrareview", ""),
     ],
@@ -4068,7 +4069,7 @@ def test_read_transcript_items_since_surfaces_cli_commands_with_kind_command(
 ) -> None:
     """
     Surfaced CLI built-ins (``/effort``, ``/clear``, ``/compact``,
-    ``/model``, ``/ultrareview``) emit a ``slash_command`` item with
+    ``/goal``, ``/model``, ``/ultrareview``) emit a ``slash_command`` item with
     ``kind="command"`` — the renderer uses that to switch the prefix
     label from "Skill" to "Command".
 
@@ -5854,17 +5855,11 @@ async def test_claude_bridge_deletion_waits_for_every_settings_owner(
         if last_owner == "terminal":
             second.close()
             assert baselines[0].read_bytes() == baseline_bytes[0]
-            if reactivation:
-                assert baselines[1].read_bytes() == baseline_bytes[1]
-            else:
-                assert not baselines[1].exists()
+            assert not baselines[1].exists()
         else:
             await instance.close()
             assert not claim.exists()
-            if reactivation:
-                assert baselines[0].read_bytes() == baseline_bytes[0]
-            else:
-                assert not baselines[0].exists()
+            assert not baselines[0].exists()
             assert baselines[1].read_bytes() == baseline_bytes[1]
         assert (bridge_dir / "bridge.json").read_bytes() == config_bytes
         if last_owner == "terminal":
@@ -5873,8 +5868,8 @@ async def test_claude_bridge_deletion_waits_for_every_settings_owner(
             second.close()
         assert not claim.exists()
         if reactivation and not delete_again:
-            assert [path.read_bytes() for path in baselines] == baseline_bytes
-            assert prune_unused_claude_settings(bridge_dir) == 2
+            assert not any(path.exists() for path in baselines)
+            assert prune_unused_claude_settings(bridge_dir) == 0
             request_claude_bridge_deletion(bridge_dir, current_session)
         assert not bridge_dir.exists()
         if reactivation:
@@ -5890,6 +5885,97 @@ async def test_claude_bridge_deletion_waits_for_every_settings_owner(
         second.close()
         lease.close()
         await instance.close()
+
+
+@pytest.mark.parametrize("switch", ["rotation", "reactivation"])
+@pytest.mark.parametrize("last_owner", ["request", "terminal"])
+def test_final_settings_owner_retires_generation_after_admission_changes(
+    tmp_path: Path, switch: str, last_owner: str
+) -> None:
+    from omnigent.harnesses.claude_native.settings_generation import (
+        ClaudeSettingsRequest,
+        acquire_claude_settings_request,
+        request_claude_bridge_deletion,
+    )
+
+    bridge_dir = prepare_bridge_dir("conv_old", workspace=tmp_path)
+    with ClaudeSettingsRequest.create(bridge_dir) as request, ExitStack() as owners:
+        augment_claude_args((), bridge_dir=bridge_dir, settings_request=request)
+        baseline = request.settings_path(bridge_dir)
+        baseline_bytes = baseline.read_bytes()
+        callbacks = []
+        with acquire_claude_settings_request(bridge_dir, request.generation) as lease:
+            for _ in range(2):
+                lease.attach(SimpleNamespace(add_resource_cleanup=callbacks.append))
+        for close in callbacks:
+            owners.callback(close)
+        if switch == "reactivation":
+            request_claude_bridge_deletion(bridge_dir, "conv_old")
+        prepare_bridge_dir(
+            "conv_new" if switch == "rotation" else "conv_old",
+            bridge_id="conv_old",
+            workspace=tmp_path,
+        )
+        lifecycle = (bridge_dir / ".claude-settings-lifecycle.json").read_bytes()
+        config = (bridge_dir / "bridge.json").read_bytes()
+        with ClaudeSettingsRequest.create(bridge_dir) as current:
+            augment_claude_args((), bridge_dir=bridge_dir, settings_request=current)
+            current_baseline = current.settings_path(bridge_dir)
+            current_bytes = current_baseline.read_bytes()
+            if last_owner == "terminal":
+                request.close()
+            callbacks[0]()
+            assert baseline.read_bytes() == baseline_bytes
+            callbacks[1]()
+            if last_owner == "request":
+                assert baseline.read_bytes() == baseline_bytes
+                request.close()
+            assert not list(bridge_dir.glob(f"claude-settings-{request.generation}*"))
+            assert current_baseline.read_bytes() == current_bytes
+            assert (bridge_dir / ".claude-settings-lifecycle.json").read_bytes() == lifecycle
+            assert (bridge_dir / "bridge.json").read_bytes() == config
+
+
+def test_claude_bridge_deletion_fences_pending_launches(tmp_path: Path) -> None:
+    from omnigent.harnesses.claude_native.settings_generation import (
+        ClaudeSettingsRequest,
+        acquire_claude_settings_request,
+        request_claude_bridge_deletion,
+    )
+
+    bridge_dir = prepare_bridge_dir("conv_deleted", workspace=tmp_path)
+    with (
+        ClaudeSettingsRequest.create(bridge_dir) as request,
+        ClaudeSettingsRequest.create(bridge_dir) as pending,
+        ExitStack() as owners,
+    ):
+        for owner in (request, pending):
+            augment_claude_args((), bridge_dir=bridge_dir, settings_request=owner)
+        baseline = request.settings_path(bridge_dir)
+        baseline_bytes = baseline.read_bytes()
+        pending_path = pending.settings_path(bridge_dir)
+        pending.mark_dispatched()
+        with acquire_claude_settings_request(bridge_dir, request.generation) as admitted:
+            callbacks = []
+            admitted.attach(SimpleNamespace(add_resource_cleanup=callbacks.append))
+            owners.callback(callbacks[0])
+            request_claude_bridge_deletion(bridge_dir, "conv_deleted")
+            with pytest.raises(ValueError, match="expired"):
+                ClaudeSettingsRequest.create(bridge_dir)
+            with pytest.raises(ValueError, match="expired"):
+                acquire_claude_settings_request(bridge_dir, pending.generation)
+            assert not pending_path.with_suffix(".dispatch.owner").exists()
+            with pytest.raises(ValueError, match="expired"):
+                admitted.attach(SimpleNamespace(add_resource_cleanup=callbacks.append))
+            assert baseline.read_bytes() == baseline_bytes
+            prepare_bridge_dir("conv_deleted", workspace=tmp_path)
+            with ClaudeSettingsRequest.create(bridge_dir) as current:
+                augment_claude_args((), bridge_dir=bridge_dir, settings_request=current)
+                with acquire_claude_settings_request(bridge_dir, current.generation):
+                    pass
+            with pytest.raises(ValueError, match="expired"):
+                acquire_claude_settings_request(bridge_dir, pending.generation)
+            assert baseline.read_bytes() == baseline_bytes
 
 
 @pytest.mark.parametrize("owner", ["admission", "terminal"])
@@ -6577,6 +6663,7 @@ def test_claude_settings_lifecycle_reader_rejects_invalid_fields(
         "new-session-claim-replaced",
         "new-session-claim-symlink",
         "new-session-lease-replaced",
+        "new-session-request-replaced",
     ],
 )
 async def test_claude_settings_close_preserves_uncertain_bridge_state(
@@ -6635,6 +6722,7 @@ async def test_claude_settings_close_preserves_uncertain_bridge_state(
         "new-session-claim-replaced",
         "new-session-claim-symlink",
         "new-session-lease-replaced",
+        "new-session-request-replaced",
     }:
         if state == "legacy-reactivated":
             lifecycle_path.write_text(
@@ -6686,6 +6774,13 @@ async def test_claude_settings_close_preserves_uncertain_bridge_state(
         lock_path.write_text("replacement-owned")
         if state == "new-session-lease-replaced":
             request_claude_bridge_deletion(bridge_dir, "conv_other")
+    elif state == "new-session-request-replaced":
+        request_path = settings_generation_path(bridge_dir, request.generation).with_suffix(
+            ".request.lock"
+        )
+        binding = request_path.read_bytes()
+        request_path.rename(tmp_path / "original-request")
+        request_path.write_bytes(binding)
     if state in {"new-session-claim-replaced", "new-session-claim-symlink"}:
         claim.rename(tmp_path / "original-claim")
         if state == "new-session-claim-replaced":
@@ -6705,6 +6800,16 @@ async def test_claude_settings_close_preserves_uncertain_bridge_state(
         "new-session-claim-symlink",
     }:
         del snapshot[claim.name]
+    if snapshot is not None and state in {
+        "legacy-reactivated",
+        "unknown-session-reactivated",
+        "new-session-reactivated",
+    }:
+        snapshot = {
+            name: contents
+            for name, contents in snapshot.items()
+            if not name.startswith(f"claude-settings-{request.generation}")
+        }
     try:
         if state != "claim-unlink-failure":
             with pytest.raises(ValueError):

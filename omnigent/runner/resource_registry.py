@@ -68,6 +68,7 @@ class _TerminalLaunchOptions(TypedDict, total=False):
 
 _logger = logging.getLogger(__name__)
 
+
 _DEFAULT_WORKSPACE_PARENT = os.environ.get("TMPDIR", None if IS_WINDOWS else "/tmp")
 
 CODEX_NATIVE_TERMINAL_ROLE = "codex-native"

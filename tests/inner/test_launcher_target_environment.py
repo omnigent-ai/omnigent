@@ -86,6 +86,7 @@ def inert_launcher(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     execute = Mock(side_effect=stop_exec)
     monkeypatch.setattr(sb, "os", launcher_os)
     monkeypatch.setattr(sb, "get_backend", Mock(return_value=backend))
+    monkeypatch.setattr(sb, "_validate_launcher_runtime", Mock())
     monkeypatch.setattr(sb, "activate_sandbox", Mock(side_effect=activate))
     monkeypatch.setattr(sb, "create_private_tmpdir", Mock(return_value=scratch))
     monkeypatch.setattr(sb, "cleanup_private_tmpdir", cleanup)
@@ -117,8 +118,9 @@ def _bootstrap(*, wrapped: bool = False) -> dict[str, str]:
 
 @pytest.mark.parametrize("active", [False, True])
 @pytest.mark.parametrize("inherit", [False, True])
+@pytest.mark.parametrize("launch_overrides", [False, True])
 def test_target_environment_is_read_after_activation_for_final_spawn(
-    tmp_path: Path, inert_launcher, active: bool, inherit: bool
+    tmp_path: Path, inert_launcher, active: bool, inherit: bool, launch_overrides: bool
 ) -> None:
     payload = _payload(tmp_path, inherit=inherit)
     bootstrap = _bootstrap(wrapped=active)
@@ -129,6 +131,7 @@ def test_target_environment_is_read_after_activation_for_final_spawn(
                 _TARGET,
                 ["doctor"],
                 target_environment_path=str(payload),
+                env_overrides={"KEEP": "snapshot"} if launch_overrides else None,
             )
             == 0
         )
@@ -140,7 +143,9 @@ def test_target_environment_is_read_after_activation_for_final_spawn(
     assert environment["EXAMPLE_TARGET_ONLY"] == _SENTINEL
     assert environment["HOME"] == str(tmp_path / "owned-home")
     assert "REMOVE" not in environment
-    assert (environment.get("KEEP") == "bootstrap") is inherit
+    assert (
+        environment.get("KEEP") == ("snapshot" if launch_overrides else "bootstrap")
+    ) is inherit
     assert _SENTINEL not in json.dumps(call.args)
 
 

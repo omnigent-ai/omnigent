@@ -207,9 +207,9 @@ def test_review_diagnostics_retain_raw_stdout(
     (tmp_path / "timeout").symlink_to(timeout_command)
     workflow = yaml.safe_load(_WORKFLOW.read_text())
     steps = {step["name"]: step for step in workflow["jobs"]["review"]["steps"]}
-    review = (
-        _REVIEW + scope_suffix + ("test-api-secret\n" if failure_step == "secret-scan" else "")
-    )
+    review = _REVIEW + scope_suffix
+    if failure_step == "secret-scan":
+        review += "é" * 35000 + "\ntest-api-secret\n"
     raw = f"Starting review: test-api-secret at https://gateway.test\n{_MARKER}\n{review}"
     (tmp_path / "stdout.txt").write_text(raw)
     (tmp_path / "review_prompt.txt").write_text("Synthetic review; no model calls.")
@@ -248,6 +248,10 @@ def test_review_diagnostics_retain_raw_stdout(
 
     def run_step(name: str) -> subprocess.CompletedProcess[str]:
         script = steps[name]["run"].replace("/tmp/", str(tmp_path) + "/")
+        script = script.replace(
+            ".github/scripts/polly-review-summary.py",
+            str(_WORKFLOW.parent.parent / "scripts/polly-review-summary.py"),
+        )
         script = script.replace(
             "pathlib.Path.home() / '.omnigent' / 'logs'",
             f"pathlib.Path({str(tmp_path / 'logs')!r})",

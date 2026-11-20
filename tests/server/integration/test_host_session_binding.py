@@ -56,6 +56,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from tests._helpers.polling import poll_until_async
+from tests.budgets import budget
 from tests.server.helpers import (
     FakeSandboxLauncher,
     HostStartInvocation,
@@ -4490,7 +4491,7 @@ async def test_runner_exited_before_connect_fails_idle_session(
 
     caplog.set_level("WARNING", logger="omnigent")
     _comm = await _report_runner_exited(app, "runner_never_connected", had_connected=had_connected)
-    async with asyncio.timeout(5.0):
+    async with asyncio.timeout(budget(5.0)):
         while _persisted_task_error(conv_store, conv.id) is None:
             await asyncio.sleep(0.01)
 
@@ -4535,7 +4536,7 @@ async def test_runner_exited_after_connect_fails_mid_turn_session(
     _comm = await _report_runner_exited(
         app, "runner_ran_mid_turn", had_connected=True if connection_source == "host" else None
     )
-    async with asyncio.timeout(5.0):
+    async with asyncio.timeout(budget(5.0)):
         while _persisted_task_error(conv_store, conv.id) is None:
             await asyncio.sleep(0.01)
 
@@ -4556,7 +4557,8 @@ async def _answer_host_launch(comm: ApplicationCommunicator) -> None:
     from omnigent.host.frames import HostStatFrame, HostStatResultFrame
 
     for _ in range(40):
-        output = await comm.receive_output(timeout=5.0)
+        # No receive timeout: asgiref cancels the app (the host tunnel) when a receive times out.
+        output = await comm.receive_output(timeout=None)
         if output["type"] != "websocket.send":
             continue
         frame = decode_host_frame(output["text"])
@@ -4661,7 +4663,7 @@ async def test_runner_exited_keeps_existing_failure_cause(
         collector = await start_session_stream_collector(session_id)
         caplog.set_level("WARNING", logger="omnigent")
         _comm = await _report_runner_exited(app, runner_id)
-        async with asyncio.timeout(5.0):
+        async with asyncio.timeout(budget(5.0)):
             while not _disconnect_decisions(caplog, session_id):
                 await asyncio.sleep(0.01)
         await asyncio.sleep(0.5)

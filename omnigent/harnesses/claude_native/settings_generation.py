@@ -458,6 +458,24 @@ class ClaudeSettingsLease:
     _bridge_fd: int | None = None
     _claim_fd: int | None = None
     _session_id: str | None = None
+    _request_identity: tuple[int, int] | None = None
+
+    def _request_binding_matches(self) -> bool:
+        """Verify the original generation after a newer epoch fences its admissions."""
+        if self._request_identity is None or self._admission_epoch is None:
+            return False
+        path = settings_generation_path(self.bridge_dir, self.generation).with_suffix(
+            ".request.lock"
+        )
+        fd = _open_lock(path)
+        try:
+            return (
+                _fd_identity(fd) == self._request_identity
+                and _file_matches_fd(path, fd)
+                and os.pread(fd, 33, 0) == self._admission_epoch.encode("ascii")
+            )
+        finally:
+            _release(fd)
 
     def _resource_identity_matches(self, *, lease_fd: int | None = None) -> bool:
         lease_fd = self._fd if lease_fd is None else lease_fd
@@ -495,7 +513,7 @@ class ClaudeSettingsLease:
             self._incarnation,
             admission_epoch=self._admission_epoch or self._incarnation,
         )
-        if not self._identity_matches(lifecycle):
+        if lifecycle.delete_for_session is not None or not self._identity_matches(lifecycle):
             raise ClaudeSettingsRequestExpired()
         return lifecycle
 
@@ -530,6 +548,7 @@ class ClaudeSettingsLease:
             _bridge_fd=bridge_fd,
             _claim_fd=claim_fd,
             _session_id=self._session_id,
+            _request_identity=self._request_identity,
         )
 
     def attach(self, instance: TerminalInstance) -> None:
@@ -590,8 +609,7 @@ class ClaudeSettingsLease:
                     return
                 _release(fd)
                 fd = None
-                # Expired admissions may release claims without retiring their operand generation.
-                if same_epoch:
+                if same_epoch or self._request_binding_matches():
                     _retire_unused(self.bridge_dir, self.generation)
                 _complete_bridge_deletion(
                     self.bridge_dir,
@@ -687,7 +705,9 @@ class ClaudeSettingsRequest:
             _ensure_secure_dir(bridge_dir)
             incarnation = prepare_claude_settings_lifecycle(bridge_dir)
             lifecycle = _require_incarnation(bridge_dir, incarnation)
-            if not _lifecycle_matches_bridge(bridge_dir, lifecycle):
+            if lifecycle.delete_for_session is not None or not _lifecycle_matches_bridge(
+                bridge_dir, lifecycle
+            ):
                 raise ClaudeSettingsRequestExpired()
             _prune_unused(bridge_dir)
             generation = secrets.token_hex(16)
@@ -719,6 +739,7 @@ class ClaudeSettingsRequest:
                 _admission_epoch=lifecycle.epoch,
                 _bridge_fd=bridge_fd,
                 _session_id=lifecycle.session_id,
+                _request_identity=_fd_identity(request_fd),
             ),
         )
 
@@ -763,7 +784,9 @@ def _reject_expired_dispatch(
         for name, path in paths.items():
             owner_fds[name] = _open_lock(path)
         live, request_epoch = _live_request_incarnation(paths["request"])
-        if request_epoch != admission_epoch or (live and admission_epoch == lifecycle.epoch):
+        if request_epoch != admission_epoch or (
+            live and admission_epoch == lifecycle.epoch and lifecycle.delete_for_session is None
+        ):
             return False
         observed = os.pread(owner_fds["dispatch"], 4097, 0)
         if observed != _dispatch_binding(lifecycle, admission_epoch, **owner_fds):
@@ -791,11 +814,9 @@ def acquire_claude_settings_request(bridge_dir: Path, generation: str) -> Claude
         if lifecycle is None or not _lifecycle_matches_bridge(bridge_dir, lifecycle):
             raise ClaudeSettingsRequestExpired()
         live, admission_epoch = _live_request_incarnation(baseline.with_suffix(".request.lock"))
-        if not live or not baseline.is_file():
-            rejected = (
-                not live
-                and admission_epoch is not None
-                and _reject_expired_dispatch(bridge_dir, generation, lifecycle, admission_epoch)
+        if lifecycle.delete_for_session is not None or not live or not baseline.is_file():
+            rejected = admission_epoch is not None and _reject_expired_dispatch(
+                bridge_dir, generation, lifecycle, admission_epoch
             )
             _retire_unused(bridge_dir, generation)
             if rejected:
@@ -810,7 +831,10 @@ def acquire_claude_settings_request(bridge_dir: Path, generation: str) -> Claude
             raise ClaudeSettingsRequestExpired()
         fd: int | None = None
         bridge_fd: int | None = None
+        request_fd: int | None = None
         try:
+            request_fd = _open_lock(baseline.with_suffix(".request.lock"))
+            request_identity = _fd_identity(request_fd)
             bridge_fd = _open_bridge(bridge_dir)
             fd = _open_lock(baseline.with_suffix(".lease.lock"))
             assert fcntl is not None
@@ -820,6 +844,8 @@ def acquire_claude_settings_request(bridge_dir: Path, generation: str) -> Claude
             _release(fd)
             _release(bridge_fd)
             raise
+        finally:
+            _release(request_fd)
     return ClaudeSettingsLease(
         bridge_dir,
         generation,
@@ -828,4 +854,5 @@ def acquire_claude_settings_request(bridge_dir: Path, generation: str) -> Claude
         _admission_epoch=admission_epoch,
         _bridge_fd=bridge_fd,
         _session_id=lifecycle.session_id,
+        _request_identity=request_identity,
     )

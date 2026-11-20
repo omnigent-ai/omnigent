@@ -233,6 +233,8 @@ async def test_server_client_start_failure_drains_diagnostics_before_first_poll(
         (True, "rejected"),
         (True, "reactivated-ack"),
         (True, "transport"),
+        (True, "connect-timeout"),
+        (True, "pool-timeout"),
         (True, "cleanup-failure"),
         (True, "read"),
         (True, "write"),
@@ -277,6 +279,10 @@ async def test_cli_launch_failure_drains_diagnostics_and_preserves_original_erro
         "write": httpx.WriteError,
         "timeout": httpx.ReadTimeout,
     }
+    undelivered_errors = {
+        "connect-timeout": httpx.ConnectTimeout,
+        "pool-timeout": httpx.PoolTimeout,
+    }
     if failure_mode == "cleanup-failure":
         monkeypatch.setattr(
             ClaudeSettingsRequest,
@@ -297,6 +303,11 @@ async def test_cli_launch_failure_drains_diagnostics_and_preserves_original_erro
         if failure_mode in {"transport", "cleanup-failure"}:
             original_error = httpx.ConnectError(
                 "simulated launch transport failure", request=request
+            )
+            raise original_error
+        if failure_mode in undelivered_errors:
+            original_error = undelivered_errors[failure_mode](
+                "simulated failure before dispatch", request=request
             )
             raise original_error
         if failure_mode in {"unacknowledged", "mismatched"}:
@@ -341,6 +352,8 @@ async def test_cli_launch_failure_drains_diagnostics_and_preserves_original_erro
         "rejected": (ClickException, "503"),
         "reactivated-ack": (ClickException, r"\(409\): simulated launch rejection"),
         "transport": (httpx.ConnectError, "simulated launch transport failure"),
+        "connect-timeout": (httpx.ConnectTimeout, "simulated failure before dispatch"),
+        "pool-timeout": (httpx.PoolTimeout, "simulated failure before dispatch"),
         "cleanup-failure": (httpx.ConnectError, "simulated launch transport failure"),
         "read": (httpx.ReadError, "simulated failure after admission"),
         "write": (httpx.WriteError, "simulated failure after admission"),
@@ -364,7 +377,7 @@ async def test_cli_launch_failure_drains_diagnostics_and_preserves_original_erro
         assert ("claude_settings_request" in posted[0]) is owned_request
         if owned_request:
             generation = posted[0]["claude_settings_request"]
-            if failure_mode in {"rejected", "transport"}:
+            if failure_mode in {"rejected", "transport", "reactivated-ack", *undelivered_errors}:
                 assert not list(bridge_dir.glob("claude-settings-*"))
             else:
                 settings = bridge_dir / f"claude-settings-{generation}.json"
@@ -458,7 +471,7 @@ async def test_cli_settings_request_is_released_after_acknowledgement(
             close()
     if reactivated:
         assert not list(bridge_dir.glob("*.terminal-*.owner"))
-        prune_unused_claude_settings(bridge_dir)
+        assert prune_unused_claude_settings(bridge_dir) == 0
         assert not list(bridge_dir.glob("claude-settings-*"))
 
 
