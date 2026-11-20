@@ -125,6 +125,10 @@ export function VirtualSessionRows<Item extends { id: string }>({
   const estimateMeasured = useRef(false);
   const virtualizer = useVirtualizer({
     count: items.length,
+    // The virtualizer writes its starting offset to the scroller on attach, so it starts from
+    // the scroller's offset at that point; reading it earlier would undo a scroll restore.
+    enabled: scrollElement !== null,
+    initialOffset: () => scrollElement?.scrollTop ?? 0,
     getScrollElement: () => scrollElement,
     estimateSize: () => rowEstimate,
     gap,
