@@ -538,9 +538,15 @@ describe("reportLocalTimezone", () => {
     expect(JSON.parse(init.body)).toEqual({ timezone: "America/Chicago" });
   });
 
-  it("does not report a zone the browser cannot resolve", async () => {
-    mockBrowserZone("");
-    await reportLocalTimezone();
+  it.each(["empty", "throws"])("does not report a zone when discovery %s", async (failure) => {
+    if (failure === "throws") {
+      vi.spyOn(Intl.DateTimeFormat.prototype, "resolvedOptions").mockImplementationOnce(() => {
+        throw new Error("timezone discovery unavailable");
+      });
+    } else {
+      mockBrowserZone("");
+    }
+    await expect(reportLocalTimezone()).resolves.toBeUndefined();
     expect(fetchMock).not.toHaveBeenCalled();
   });
 

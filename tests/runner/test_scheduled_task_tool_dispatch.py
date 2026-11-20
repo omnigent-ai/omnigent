@@ -14,12 +14,10 @@ Covers the runner-side half:
 from __future__ import annotations
 
 import json
-from unittest.mock import Mock
 
 import httpx
 import jsonschema
 import pytest
-from pydantic import BaseModel, ValidationError
 
 from omnigent.errors import OmnigentError
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
@@ -33,7 +31,6 @@ from omnigent.runner.tool_dispatch import (
     execute_tool,
 )
 from omnigent.server.scheduled.harness_settings import validate_scheduled_permission_mode
-from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 from omnigent.tools.base import Tool
 from omnigent.tools.builtins.scheduled_tasks import (
     SysScheduledTaskCreateTool,
@@ -216,56 +213,29 @@ async def test_create_without_session_args_sends_no_session_fields() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("current_server", [False, True], ids=["old-server", "new-server"])
 @pytest.mark.parametrize(
-    ("fields", "expected"),
+    ("current_server", "fields", "expected_zone"),
     [
-        ({}, "America/Chicago"),
-        ({"timezone": None}, "America/Chicago"),
-        ({"timezone": "UTC"}, "UTC"),
-        ({"timezone": "Asia/Tokyo"}, "Asia/Tokyo"),
+        (False, {}, {}),
+        (True, {}, {"timezone": None}),
+        (False, {"timezone": None}, {}),
+        (True, {"timezone": None}, {"timezone": None}),
+        (True, {"timezone": "UTC"}, {"timezone": "UTC"}),
+        (True, {"timezone": "Asia/Tokyo"}, {"timezone": "Asia/Tokyo"}),
     ],
-    ids=["omitted-tool-zone", "explicit-local-opt-in", "explicit-utc", "explicit-zone"],
+    ids=["old-omitted", "new-omitted", "old-null", "new-null", "explicit-utc", "explicit-zone"],
 )
 async def test_current_runner_timezone_contract_across_server_versions(
-    current_server: bool, fields: dict[str, str | None], expected: str
+    current_server: bool, fields: dict[str, str | None], expected_zone: dict[str, str | None]
 ) -> None:
-    from omnigent.server.app import ServerInfoResponse
-    from omnigent.server.routes.scheduled_tasks import (
-        CreateScheduledTaskRequest,
-        _resolve_create_timezone,
-    )
-
-    class LegacyRequest(BaseModel):
-        timezone: str = "UTC"
-
-    store = Mock(spec=ScheduledTaskStore)
-    store.get_default_timezone.return_value = "America/Chicago"
     requests: list[httpx.Request] = []
 
     def respond(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         if request.url.path == "/v1/info":
-            capability = (
-                {
-                    "scheduled_task_default_timezone": ServerInfoResponse.model_fields[
-                        "scheduled_task_default_timezone"
-                    ].default
-                }
-                if current_server
-                else {}
-            )
+            capability = {"scheduled_task_default_timezone": True} if current_server else {}
             return httpx.Response(200, json=capability)
-        payload = json.loads(request.content)
-        try:
-            if current_server:
-                body = CreateScheduledTaskRequest.model_validate(payload)
-                timezone = _resolve_create_timezone(body, store, "owner@example.com")
-            else:
-                timezone = LegacyRequest.model_validate(payload).timezone
-        except ValidationError:
-            return httpx.Response(422, json={"detail": "timezone must be a string"})
-        return httpx.Response(200, json={"id": _TASK_ID, "timezone": timezone})
+        return httpx.Response(200, json={"id": _TASK_ID})
 
     async with httpx.AsyncClient(
         base_url="https://server.example", transport=httpx.MockTransport(respond)
@@ -284,12 +254,14 @@ async def test_current_runner_timezone_contract_across_server_versions(
             server_client=client,
         )
 
-    if not current_server and fields.get("timezone") is None:
-        expected = "UTC"
-    assert json.loads(result) == {"id": _TASK_ID, "timezone": expected}
-    assert [request.method for request in requests] == (
-        ["GET", "POST"] if fields.get("timezone") is None else ["POST"]
+    assert json.loads(result) == {"id": _TASK_ID}
+    assert [(request.method, request.url.path) for request in requests] == (
+        [("GET", "/v1/info"), ("POST", "/v1/scheduled-tasks")]
+        if fields.get("timezone") is None
+        else [("POST", "/v1/scheduled-tasks")]
     )
+    payload = json.loads(requests[-1].content)
+    assert {key: value for key, value in payload.items() if key == "timezone"} == expected_zone
 
 
 @pytest.mark.asyncio

@@ -731,7 +731,7 @@ def test_default_timezone_is_per_user_and_ignores_unusable_stored_values(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The recorded zone round-trips per user; an unusable stored value reads as unset."""
-    from sqlalchemy import text, update
+    from sqlalchemy import LargeBinary, literal, update
     from sqlalchemy.orm import Session
 
     from omnigent.db.compression import encode
@@ -745,11 +745,26 @@ def test_default_timezone_is_per_user_and_ignores_unusable_stored_values(
     assert store.get_default_timezone(None) == "America/Los_Angeles"
     assert store.get_default_timezone("alice@example.com") == "Asia/Tokyo"
     assert store.get_default_timezone("bob@example.com") is None
+    with workspace_scope(7):
+        assert store.get_default_timezone(None) is None
+        assert store.get_default_timezone("alice@example.com") is None
+        store.set_default_timezone(None, "Asia/Kolkata")
+        store.set_default_timezone("alice@example.com", "Europe/Paris")
+        assert store.get_default_timezone(None) == "Asia/Kolkata"
+        assert store.get_default_timezone("alice@example.com") == "Europe/Paris"
+    assert store.get_default_timezone(None) == "America/Los_Angeles"
+    assert store.get_default_timezone("alice@example.com") == "Asia/Tokyo"
 
     for stored in ('"Not/A_Zone"', '"America"', "42", "not json"):
         with Session(store._engine) as session:
             session.execute(
-                update(SqlPreference).where(SqlPreference.user_id == "local").values(value=stored)
+                update(SqlPreference)
+                .where(
+                    SqlPreference.workspace_id == current_workspace_id(),
+                    SqlPreference.user_id == "local",
+                    SqlPreference.key == "scheduled_task_default_timezone",
+                )
+                .values(value=stored)
             )
             session.commit()
         assert store.get_default_timezone(None) is None, stored
@@ -760,21 +775,21 @@ def test_default_timezone_is_per_user_and_ignores_unusable_stored_values(
     for raw in (b"not an envelope", encode(json.dumps("x" * 1025))):
         with store._session("seed_invalid_timezone_preference") as session:
             session.execute(
-                text(
-                    "UPDATE preferences SET value = :raw WHERE workspace_id = :workspace "
-                    "AND user_id = :user AND key = :key"
-                ),
-                {
-                    "raw": raw,
-                    "workspace": current_workspace_id(),
-                    "user": "local",
-                    "key": "scheduled_task_default_timezone",
-                },
+                update(SqlPreference)
+                .where(
+                    SqlPreference.workspace_id == current_workspace_id(),
+                    SqlPreference.user_id == "local",
+                    SqlPreference.key == "scheduled_task_default_timezone",
+                )
+                .values(value=literal(raw, type_=LargeBinary)),
             )
         with monkeypatch.context() as patch:
             patch.setattr(sqlalchemy_store, "ZoneInfo", unexpected_zone_lookup)
             assert store.get_default_timezone(None) is None
     assert store.get_default_timezone("alice@example.com") == "Asia/Tokyo"
+    with workspace_scope(7):
+        assert store.get_default_timezone(None) == "Asia/Kolkata"
+        assert store.get_default_timezone("alice@example.com") == "Europe/Paris"
 
 
 # ── runs ──────────────────────────────────────────────────────────────────────
