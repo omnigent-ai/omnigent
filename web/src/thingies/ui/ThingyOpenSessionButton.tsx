@@ -25,6 +25,11 @@ const OPEN_DELAY_MS = 350;
 const CLOSE_DELAY_MS = 250;
 
 const LABEL = "Open session";
+// A control's own menu or list opens outside this menu, in a portal; interacting with it is
+// interacting with this menu.
+const NESTED_LAYER =
+  "[data-radix-popper-content-wrapper], [role='menu'], [role='listbox'], [role='dialog']";
+const NESTED_OPEN = "[aria-expanded='true'], [data-state='open']";
 const FOCUSABLE = "button:not([disabled]), [href], [tabindex]:not([tabindex='-1'])";
 
 type RowSlot = Exclude<SessionControlSlot, "icon" | "create">;
@@ -162,6 +167,62 @@ export function ThingyOpenSessionButton({
     }
   };
 
+  // Something inside the menu (or a menu one of its controls opened) has the viewer's attention:
+  // a control's open list, or the target of the event in question.
+  const nestedOpen = useCallback(() => contentRef.current?.querySelector(NESTED_OPEN) != null, []);
+  const inNestedLayer = useCallback((target: EventTarget | null) => {
+    return target instanceof Element && target.closest(NESTED_LAYER) !== null;
+  }, []);
+  const keepOpenFor = useCallback(
+    (event: Event) => {
+      if (inNestedLayer(event.target) || nestedOpen()) event.preventDefault();
+    },
+    [inNestedLayer, nestedOpen],
+  );
+
+  // The composer renders the controls here through portals, so React sends their events to the
+  // composer's tree, not this menu's: pin the menu from the DOM instead.
+  const [content, setContent] = useState<HTMLDivElement | null>(null);
+  // PopoverContent doesn't forward a ref, so an inner element finds the content it sits in.
+  const setContentRef = useCallback((element: HTMLDivElement | null) => {
+    const surface =
+      element?.closest<HTMLDivElement>("[data-testid='thingy-open-session-popover']") ?? element;
+    contentRef.current = surface;
+    setContent(surface);
+  }, []);
+  useEffect(() => {
+    if (content === null) return undefined;
+    const pin = () => {
+      pinned.current = true;
+      clearTimer();
+    };
+    // Hover by DOM, not React: moving onto a control is staying in the menu.
+    const enter = () => clearTimer();
+    content.addEventListener("pointerdown", pin, true);
+    content.addEventListener("focusin", pin);
+    content.addEventListener("keydown", pin, true);
+    content.addEventListener("pointerenter", enter);
+    content.addEventListener("pointerleave", closeSoon);
+    return () => {
+      content.removeEventListener("pointerdown", pin, true);
+      content.removeEventListener("focusin", pin);
+      content.removeEventListener("keydown", pin, true);
+      content.removeEventListener("pointerenter", enter);
+      content.removeEventListener("pointerleave", closeSoon);
+    };
+  }, [clearTimer, closeSoon, content]);
+
+  // A click in the thingy is a click elsewhere, but its frame keeps the event to itself: the
+  // page only loses focus to the frame.
+  useEffect(() => {
+    if (!open) return undefined;
+    const onBlur = () => {
+      if (document.activeElement instanceof HTMLIFrameElement) changeOpen(false);
+    };
+    window.addEventListener("blur", onBlur);
+    return () => window.removeEventListener("blur", onBlur);
+  }, [changeOpen, open]);
+
   const creating = sessionId === null;
   return (
     <Popover open={open} onOpenChange={changeOpen}>
@@ -175,7 +236,11 @@ export function ThingyOpenSessionButton({
           aria-expanded={open}
           data-testid="thingy-open-session"
           className={cn("flex size-6", className)}
-          onClick={openSession}
+          onClick={(event) => {
+            // Only a click on the button itself leaves full screen, not one React routes here
+            // from content rendered elsewhere.
+            if (event.currentTarget.contains(event.target as Node)) openSession();
+          }}
           // pointerover, not pointerenter: a pointer arriving from the thingy's frame brings no
           // pointerout to this document, so React may never report it entering the button.
           onPointerOver={() => {
@@ -210,7 +275,6 @@ export function ThingyOpenSessionButton({
         </Button>
       </PopoverAnchor>
       <PopoverContent
-        ref={contentRef}
         side="bottom"
         align="end"
         className="group w-72 p-3"
@@ -219,16 +283,14 @@ export function ThingyOpenSessionButton({
         // Focus stays on the button; ArrowDown, or a request that opens the menu, moves it in.
         onOpenAutoFocus={(event) => event.preventDefault()}
         onCloseAutoFocus={(event) => event.preventDefault()}
-        onPointerOver={clearTimer}
-        onPointerLeave={closeSoon}
-        onPointerDownCapture={() => {
-          pinned.current = true;
-        }}
-        onKeyDownCapture={() => {
-          pinned.current = true;
+        // A control's open menu is part of this one: neither focus nor a press there closes it,
+        // and Escape closes that control's menu first.
+        onInteractOutside={keepOpenFor}
+        onEscapeKeyDown={(event) => {
+          if (nestedOpen()) event.preventDefault();
         }}
       >
-        <div className="flex flex-col gap-2">
+        <div ref={setContentRef} className="flex flex-col gap-2">
           {ROWS.map((row) => (
             <ControlRow key={row.slot} sessionId={sessionId} slot={row.slot} label={row.label} />
           ))}

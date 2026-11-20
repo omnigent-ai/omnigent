@@ -8,6 +8,12 @@ import {
   useThingyRailRequest,
 } from "@/lib/thingyRailTabs";
 import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
   MobileHeaderControlPortal,
   MobileHeaderControlsProvider,
   SessionControlPortal,
@@ -289,5 +295,132 @@ describe("ThingyOpenSessionButton", () => {
     expect(screen.getByTestId("thingy-open-session-harness")).toHaveTextContent("Model: only");
     // No icon was offered, so the button shows the chat icon.
     expect(screen.getByTestId("thingy-open-session-icon")).toBeEmptyDOMElement();
+  });
+
+  describe("with a control that opens its own menu", () => {
+    // The real host picker: a dropdown whose menu the composer renders in a portal of its own,
+    // outside the Open session menu.
+    function HostPicker() {
+      const [host, setHost] = useState("laptop");
+      return (
+        <MobileHeaderControlPortal sessionId={null} popoverSlot="host">
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button type="button">Host: {host}</button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent>
+              <DropdownMenuItem onSelect={() => setHost("devbox")}>devbox</DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </MobileHeaderControlPortal>
+      );
+    }
+
+    function renderWithPicker(onOpenSession = vi.fn()) {
+      render(
+        <MobileHeaderControlsProvider>
+          <ThingyOpenSessionButton sessionId={null} onOpenSession={onOpenSession} />
+          <HostPicker />
+          <iframe title="thingy" sandbox="allow-scripts" />
+        </MobileHeaderControlsProvider>,
+      );
+      const button = screen.getByRole("button", { name: "Open session" });
+      hoverOpen(button);
+      return { button, onOpenSession };
+    }
+
+    function openHostMenu() {
+      const trigger = screen.getByRole("button", { name: "Host: laptop" });
+      act(() => {
+        trigger.focus();
+      });
+      fireEvent.keyDown(trigger, { key: "Enter" });
+      return screen.getByRole("menu");
+    }
+
+    it("stays open while the control's menu is used, and keeps the choice", () => {
+      const { onOpenSession } = renderWithPicker();
+
+      const menu = openHostMenu();
+      // Focus moved into the control's menu, outside the Open session menu.
+      expect(screen.getByTestId("thingy-open-session-popover")).toBeInTheDocument();
+      const item = within(menu).getByRole("menuitem", { name: "devbox" });
+      fireEvent.pointerDown(item);
+      fireEvent.keyDown(item, { key: "Enter" });
+      act(() => {
+        vi.advanceTimersByTime(1000);
+      });
+
+      expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+      const popover = screen.getByTestId("thingy-open-session-popover");
+      expect(within(popover).getByRole("button", { name: "Host: devbox" })).toBeInTheDocument();
+      expect(onOpenSession).not.toHaveBeenCalled();
+    });
+
+    it("stays open when the pointer moves onto a control", () => {
+      const { button } = renderWithPicker();
+      const popover = screen.getByTestId("thingy-open-session-popover");
+
+      fireEvent.pointerLeave(button);
+      // The control is the composer's, but in the menu's DOM: the pointer is still in the menu.
+      fireEvent.pointerEnter(popover);
+      act(() => {
+        vi.advanceTimersByTime(1000);
+      });
+
+      expect(screen.getByTestId("thingy-open-session-popover")).toBeInTheDocument();
+    });
+
+    it("closes a control's menu on Escape before closing itself", () => {
+      renderWithPicker();
+      const menu = openHostMenu();
+
+      fireEvent.keyDown(menu, { key: "Escape" });
+      expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+      expect(screen.getByTestId("thingy-open-session-popover")).toBeInTheDocument();
+
+      fireEvent.keyDown(screen.getByTestId("thingy-open-session-popover"), { key: "Escape" });
+      expect(screen.queryByTestId("thingy-open-session-popover")).not.toBeInTheDocument();
+    });
+
+    it("closes on a press outside it, after a control's menu was used", async () => {
+      vi.useRealTimers();
+      render(
+        <MobileHeaderControlsProvider>
+          <ThingyOpenSessionButton sessionId={null} onOpenSession={vi.fn()} />
+          <HostPicker />
+        </MobileHeaderControlsProvider>,
+      );
+      // Keyboard focus opens the menu at once.
+      act(() => {
+        screen.getByRole("button", { name: "Open session" }).focus();
+      });
+      openHostMenu();
+      fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+      expect(screen.getByTestId("thingy-open-session-popover")).toBeInTheDocument();
+      // Radix listens for presses outside a tick after it opens.
+      await act(
+        () =>
+          new Promise<void>((resolve) => {
+            setTimeout(resolve, 0);
+          }),
+      );
+
+      fireEvent.pointerDown(document.body, { button: 0 });
+      fireEvent.click(document.body);
+
+      expect(screen.queryByTestId("thingy-open-session-popover")).not.toBeInTheDocument();
+    });
+
+    it("closes when the viewer clicks into the thingy", () => {
+      renderWithPicker();
+
+      act(() => {
+        screen.getByTitle("thingy").focus();
+        window.dispatchEvent(new FocusEvent("blur"));
+      });
+
+      expect(screen.queryByTestId("thingy-open-session-popover")).not.toBeInTheDocument();
+    });
   });
 });
