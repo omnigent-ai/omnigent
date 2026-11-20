@@ -13959,9 +13959,11 @@ async def _contract_run_known_harness(
             "instructions": _CONTRACT_CALLER_INSTRUCTIONS,
         },
     )
+    events = _parse_sse(resp.content)
     return {
         "status": resp.status_code,
         "error": (resp.json().get("error") if resp.status_code >= 400 else None),
+        "terminal_event": events[-1][0] if events else None,
         "instructions": (
             recording.posted_bodies[-1].get("instructions") if recording.posted_bodies else None
         ),
@@ -14098,7 +14100,12 @@ def _contract_resolver_for(scenario: str, calls: list[str]) -> Any:
         pytest.param(
             "resolver_raises",
             "known_harness",
-            {"status": 200, "error": None, "instructions": None},
+            {
+                "status": 200,
+                "error": None,
+                "instructions": None,
+                "terminal_event": "response.failed",
+            },
             id="resolver_raises-known_harness-sse",
         ),
         pytest.param(

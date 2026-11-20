@@ -18,6 +18,7 @@ import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -32,7 +33,7 @@ from omnigent.spec.types import (
     GuardrailsSpec,
 )
 from tests._helpers.providers import isolate_provider_resolution
-from tests.runner.conftest import _drain_session_event_queue
+from tests.runner.conftest import _drain_session_event_queue, _sse
 from tests.runner.conftest import _FakeProcessManager as _TurnProcessManager
 from tests.runner.conftest import _ScriptedHarnessClient as _TurnHarnessClient
 from tests.runner.helpers import NullServerClient
@@ -927,6 +928,12 @@ async def test_cached_start_policy_tracks_harness_override_changes(
 ) -> None:
     """Target changes reapply launch policy to the declared sandbox without accumulation."""
     from omnigent.policies import FunctionPolicy
+    from omnigent.runner import app as runner_module
+
+    build_environment = Mock(wraps=runner_module._build_spawn_env_from_spec)
+    monkeypatch.setattr(runner_module, "_build_spawn_env_from_spec", build_environment)
+    dispatch_tool = AsyncMock(return_value="mocked tool result")
+    monkeypatch.setattr("omnigent.runner.tool_dispatch.dispatch_tool_locally", dispatch_tool)
 
     start_harnesses: list[str] = []
 
@@ -971,6 +978,18 @@ async def test_cached_start_policy_tracks_harness_override_changes(
     harness_client = _TurnHarnessClient(
         [
             'data: {"type":"response.created","response":{"id":"resp_target"}}\n\n',
+            _sse(
+                {
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "function_call",
+                        "status": "action_required",
+                        "name": "sys_os_read",
+                        "call_id": "call",
+                        "arguments": "{}",
+                    },
+                }
+            ),
             'data: {"type":"response.completed","response":{"id":"resp_target",'
             '"status":"completed"}}\n\n',
         ]
@@ -1017,6 +1036,10 @@ async def test_cached_start_policy_tracks_harness_override_changes(
 
             assert session_id not in app.state.active_turns
             assert len(harness_client.posted_bodies) == turn_index
+            selected = build_environment.call_args.args[0]
+            assert dispatch_tool.await_count == turn_index
+            assert dispatch_tool.call_args.kwargs["agent_spec"] is selected
+            assert dispatch_tool.call_args.kwargs["effective_harness"] == harness
             conversation_id, actual_harness, env = manager.get_client_calls[-1]
             assert conversation_id == session_id
             assert actual_harness == harness

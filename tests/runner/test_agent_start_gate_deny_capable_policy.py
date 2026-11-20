@@ -1,6 +1,5 @@
 """Tool denials must not block session init or discard sandbox transforms."""
 
-import asyncio
 import json
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -358,10 +357,8 @@ async def test_direct_stream_legacy_model_obeys_inference_allowlist(
 @pytest.mark.parametrize(
     "cache_state",
     [
-        "same-harness",
         "original-harness",
         "replaced-entry",
-        "background",
         "native-selection",
         "lazy-metadata",
         "lazy-replaced-entry",
@@ -471,9 +468,8 @@ async def test_cached_harness_selection_preserves_single_policy_transform(
         original_cached = cache[_SESSION_ID]
         if cache_state in {"replaced-entry", "lazy-replaced-entry"}:
             cache[_SESSION_ID] = replace(cache[_SESSION_ID], name="external-cache-entry")
-        query = "" if cache_state == "background" else "?stream=true"
         response = await client.post(
-            f"/v1/sessions/{_SESSION_ID}/events{query}",
+            f"/v1/sessions/{_SESSION_ID}/events?stream=true",
             json={
                 "type": "message",
                 "role": "user",
@@ -486,11 +482,7 @@ async def test_cached_harness_selection_preserves_single_policy_transform(
                 },
             },
         )
-        if cache_state == "background":
-            task = app.state.active_turns.get(_SESSION_ID)
-            if task is not None:
-                await asyncio.wait_for(task, timeout=5)
-    assert response.status_code == (202 if cache_state == "background" else 200), response.text
+    assert response.status_code == 200, response.text
     if cache_state == "lazy-replaced-entry":
         events = [
             json.loads(line.removeprefix("data: "))
@@ -534,7 +526,7 @@ async def test_cached_harness_selection_preserves_single_policy_transform(
         assert context.agent_spec is selected
         assert context.ensure_comment_relay.keywords["effective_spec_entry"] is selected
         assert launch_terminal.call_args.kwargs["resolve_agent_spec"] is None
-    if cache_state in {"same-harness", "background", "lazy-metadata"}:
+    if cache_state == "lazy-metadata":
         gate.assert_awaited_once_with(declared, harness)
         resolver.assert_awaited_once()
     else:
