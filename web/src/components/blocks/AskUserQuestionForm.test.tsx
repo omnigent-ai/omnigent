@@ -676,6 +676,21 @@ describe("AskUserQuestionForm — disabled Submit", () => {
     expect(screen.queryByRole("group", { name: "Submit" })).not.toBeInTheDocument();
     expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
   });
+
+  it("closes the reason on Escape before Escape cancels the questions", async () => {
+    const user = userEvent.setup();
+    const { onReject } = renderForm([snacks, framework]);
+    fireEvent.click(screen.getByTestId("ask-user-question-next"));
+    act(() => screen.getByRole("group", { name: "Submit" }).focus());
+    await waitFor(() => expect(screen.getByRole("tooltip")).toBeVisible());
+
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
+    expect(onReject).not.toHaveBeenCalled();
+
+    await user.keyboard("{Escape}");
+    expect(onReject).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("AskUserQuestionForm — key hints", () => {
