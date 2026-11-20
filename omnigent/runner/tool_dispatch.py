@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING, Protocol, cast
 from omnigent.stores.conversation_store import CREATED_BY_SESSION_LABEL_KEY
 from omnigent.util.json_serialization import json_dumps_transport_safe
 from omnigent.util.json_types import JsonObject as _JsonObject
+from omnigent.util.uuid import normalize_uuid
 
 if TYPE_CHECKING:
     from omnigent.inner.datamodel import OSEnvSpec
@@ -76,8 +77,10 @@ from omnigent.runner.journal_tools import (
     execute_journal_tool,
     server_workflows_enabled,
 )
+from omnigent.runner.server_capabilities import server_session_set_document_enabled
 from omnigent.runner.session_requests import remember_session_host
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
+from omnigent.session_documents import build_google_docs_label_patch, validate_google_docs_url
 from omnigent.spec.types import MEMORY_TOOL_NAMES
 from omnigent.tools import ToolManager
 from omnigent.tools.base import Tool, ToolContext
@@ -118,6 +121,7 @@ from omnigent.tools.builtins.session_projects import (
     SysSessionUpdateTool,
 )
 from omnigent.tools.builtins.session_rename import SysSessionRenameTool
+from omnigent.tools.builtins.session_set_document import SysSessionSetDocumentTool
 from omnigent.tools.builtins.spawn import (
     # Shared contract values with the in-process sys_session_* tools. Imported
     # (not duplicated) so the runner's REST-backed peek clamps to the same
@@ -355,7 +359,9 @@ _SESSION_QUERY_TOOLS = frozenset(
     }
 )
 
-_SESSION_SELF_WRITE_TOOLS = frozenset({SysSessionRenameTool.name()})
+_SESSION_SELF_WRITE_TOOLS = frozenset(
+    {SysSessionRenameTool.name(), SysSessionSetDocumentTool.name()}
+)
 # Project and session organizing proxy the sidebar's owner-gated REST endpoints.
 _PROJECT_TOOLS = frozenset(
     {
@@ -603,11 +609,20 @@ def filter_workflow_tool_schemas(
     return schemas if enabled else _strip_tool_schemas(schemas, _JOURNAL_TOOLS)
 
 
+def filter_session_document_tool_schema(
+    schemas: list[_JsonObject], *, enabled: bool
+) -> list[_JsonObject]:
+    """Hide the document setter on servers that cannot authorize its writes."""
+    return schemas if enabled else _strip_tool_schemas(schemas, {SysSessionSetDocumentTool.name()})
+
+
 def _strip_tool_schemas(
     schemas: list[_JsonObject], names: set[str] | frozenset[str]
 ) -> list[_JsonObject]:
     kept: list[_JsonObject] = []
     for schema in schemas:
+        if not isinstance(schema, dict):
+            continue
         name: object = schema.get("name")
         if not isinstance(name, str):
             function = _string_object_dict(schema.get("function"))
@@ -618,7 +633,9 @@ def _strip_tool_schemas(
     return kept
 
 
-def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]:
+def build_native_relay_tool_schemas(
+    spec: AgentSpec | None, *, session_set_document_enabled: bool = False
+) -> list[_JsonObject]:
     """Build the flat Omnigent tool surface for native harness bridges.
 
     Returns the same tool set the claude-native / codex-native relay advertises
@@ -634,6 +651,7 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
     :param spec: The session's resolved agent spec. ``None`` falls back to the
         always-on read/discovery surface (never the opt-in spawn writes, whose
         gate can't be evaluated without the spec), mirroring the relay.
+    :param session_set_document_enabled: The connected server supports the document setter.
     :returns: Flat tool schemas for native bridges.
     """
     from omnigent.tools.builtins.agents import (
@@ -671,7 +689,11 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
     if spec is not None:
         from omnigent.tools.manager import ToolManager
 
-        for schema in ToolManager(spec, os_env_schema_only=True).get_tool_schemas():
+        for schema in ToolManager(
+            spec,
+            os_env_schema_only=True,
+            session_set_document_enabled=session_set_document_enabled,
+        ).get_tool_schemas():
             function = _string_object_dict(schema.get("function"))
             if function is None:
                 continue
@@ -692,6 +714,7 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
             SysSessionGetHistoryTool,
             SysSessionGetInfoTool,
             SysSessionRenameTool,
+            SysSessionSetDocumentTool,
             SysSessionMessageTool,
             SysProjectListTool,
             SysSessionLinkPrTool,
@@ -704,6 +727,8 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
             SysAddPolicyTool,
             SysPolicyRegistryTool,
         ):
+            if _cls is SysSessionSetDocumentTool and not session_set_document_enabled:
+                continue
             if _cls is SysSessionMessageTool and not peer_session_messaging_enabled():
                 continue
             fallback_schema = _string_object_dict(_cls().get_schema())
@@ -1182,7 +1207,8 @@ def _granted_tool_names(agent_spec: AgentSpec, harness: str | None = None) -> fr
     cached = _granted_tool_names_cache.get(cache_key)
     if cached is not None and cached[0]() is agent_spec:
         return cached[1]
-    manager = ToolManager(agent_spec, os_env_schema_only=True)
+    # Deployment checks happen in the handler, including for calls outside advertisement.
+    manager = ToolManager(agent_spec, os_env_schema_only=True, session_set_document_enabled=True)
     try:
         names = set(manager.get_tool_names())
     finally:
@@ -7405,6 +7431,73 @@ async def _open_file_via_rest(
         return json.dumps({"error": f"ui_open_file failed: {exc}"})
 
 
+def _document_labels(response: httpx.Response, session_id: str) -> dict[str, str]:
+    """Read labels only from a response that identifies the calling session."""
+    payload = _string_object_dict(response.json())
+    if payload is not None:
+        returned_id = _optional_string(payload.get("id"))
+        labels = _string_object_dict(payload.get("labels"))
+        if (
+            returned_id is not None
+            and normalize_uuid(returned_id) == normalize_uuid(session_id)
+            and labels is not None
+            and all(isinstance(value, str) for value in labels.values())
+        ):
+            return cast(dict[str, str], labels)
+    raise ValueError("Server did not return labels for the calling session")
+
+
+async def _set_current_session_document(
+    args: _JsonObject,
+    conversation_id: str | None,
+    server_client: httpx.AsyncClient | None,
+) -> str:
+    """Attach a Google Doc through the calling session's label API."""
+    url = args.get("url")
+    if set(args) != {"url"} or not isinstance(url, str):
+        return json.dumps({"error": "Provide only a string 'url'"})
+    if conversation_id is None or server_client is None:
+        return json.dumps({"error": "Linking a Google Doc requires a session and server access"})
+    try:
+        reference = validate_google_docs_url(url)
+        session_url = _session_url(conversation_id)
+    except ValueError as exc:
+        return json.dumps({"error": str(exc)})
+    if not await server_session_set_document_enabled(server_client):
+        return json.dumps(
+            {"error": "This Omnigent server does not enable agent Google Doc linking"}
+        )
+
+    try:
+        before = await server_client.get(f"{session_url}/labels", timeout=30.0)
+        before.raise_for_status()
+        patch = build_google_docs_label_patch(
+            _document_labels(before, conversation_id), reference.canonical_url
+        )
+        response = await server_client.patch(
+            session_url,
+            params={"include_usage": "false"},
+            headers={ORCHESTRATION_SOURCE_HEADER: conversation_id},
+            json={"labels": patch},
+            timeout=30.0,
+        )
+        response.raise_for_status()
+        confirmed = _document_labels(response, conversation_id)
+    except httpx.HTTPStatusError as exc:
+        return json.dumps(
+            {"error": f"Google Doc link request returned HTTP {exc.response.status_code}"}
+        )
+    except httpx.RequestError:
+        return json.dumps(
+            {"error": "Could not confirm the Google Doc link due to a server connection error"}
+        )
+    except ValueError:
+        return json.dumps({"error": "Could not confirm Google Doc labels for this session"})
+    if any(confirmed.get(key) != value for key, value in patch.items()):
+        return json.dumps({"error": "The server did not confirm the Google Doc link"})
+    return json.dumps({"url": reference.canonical_url})
+
+
 async def _rename_current_session_via_rest(
     args: _JsonObject,
     conversation_id: str | None,
@@ -8341,7 +8434,9 @@ async def execute_tool(
             )
         elif tool_name in _UI_TOOLS:
             output = await _open_file_via_rest(args, conversation_id, server_client)
-        elif tool_name in _SESSION_SELF_WRITE_TOOLS:
+        elif tool_name == SysSessionSetDocumentTool.name():
+            output = await _set_current_session_document(args, conversation_id, server_client)
+        elif tool_name == SysSessionRenameTool.name():
             output = await _rename_current_session_via_rest(
                 args,
                 conversation_id,

@@ -25,8 +25,18 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 import omnigent.server.routes.sessions as sessions_routes
-from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, UnifiedAuthProvider
+from omnigent.runner.identity import (
+    ORCHESTRATION_SOURCE_HEADER,
+    RUNNER_TUNNEL_TOKEN_HEADER,
+    token_bound_runner_id,
+)
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, LEVEL_READ, UnifiedAuthProvider
+from omnigent.server.feature_flags import resolve_feature_flags
 from omnigent.server.routes.sessions import SessionLiveness, create_sessions_router
+from omnigent.session_documents import (
+    GOOGLE_DOCS_DOCUMENT_LABEL_PREFIX,
+    GOOGLE_DOCS_SELECTION_LABEL,
+)
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -1148,3 +1158,36 @@ def test_projects_changed_event_forwards_to_client(
         sessions_routes.user_session_stream.publish(ALICE, {"type": "projects_changed"})
         frame = _recv_until(ws, {"projects_changed"})
         assert frame["type"] == "projects_changed"
+
+
+def test_bound_runner_document_patch_reaches_session_updates(
+    app: FastAPI, stores, fast_rescan: None
+) -> None:
+    """A shared viewer receives the stored reference through the existing updates stream."""
+    session = _seed_session(stores, owner=ALICE, title="Linked doc")
+    conversations, _, permissions = stores
+    permissions.ensure_user(BOB)
+    permissions.grant(BOB, session, LEVEL_EDIT)
+    conversations.set_runner_id(session, token_bound_runner_id("docs-test-runner"))
+    app.state.feature_flags = resolve_feature_flags({"OMNIGENT_FEATURES": "google_docs"})
+    headers = {
+        "X-Forwarded-Email": ALICE,
+        ORCHESTRATION_SOURCE_HEADER: session,
+        RUNNER_TUNNEL_TOKEN_HEADER: "docs-test-runner",
+    }
+    url = "https://docs.google.com/document/d/attached/edit?tab=t.0"
+    labels = {
+        GOOGLE_DOCS_SELECTION_LABEL: url,
+        f"{GOOGLE_DOCS_DOCUMENT_LABEL_PREFIX}attached": url,
+    }
+    client = TestClient(app)
+    with client.websocket_connect(
+        "/v1/sessions/updates", headers={"X-Forwarded-Email": BOB}
+    ) as ws:
+        ws.send_json({"type": "watch", "session_ids": [session]})
+        assert _recv_until(ws, {"snapshot"})["items"][0]["labels"] == {}
+        saved = client.patch(f"/v1/sessions/{session}", json={"labels": labels}, headers=headers)
+        assert saved.status_code == 200, saved.text
+        changed = _recv_until(ws, {"changed"})["items"][0]
+        assert changed["id"] == session
+        assert changed["labels"] == labels

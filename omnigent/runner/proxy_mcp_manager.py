@@ -34,6 +34,7 @@ import httpx
 
 from omnigent.debug_logging import debug_event
 from omnigent.runner import pending_approvals
+from omnigent.runner.identity import MCP_SESSION_ID_HEADER
 from omnigent.runner.mcp_execution_registry import (
     MCP_OPERATION_ID_PARAM,
     RUNNER_MCP_EXECUTION_DETACHED_CODE,
@@ -42,6 +43,7 @@ from omnigent.runner.mcp_execution_registry import (
 from omnigent.runner.mcp_manager import McpSchemasResult
 from omnigent.runner.tool_dispatch import MCP_PROXY_CALL_TIMEOUT_S
 from omnigent.spec.types import AgentSpec
+from omnigent.tools.builtins.session_set_document import SysSessionSetDocumentTool
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
@@ -230,7 +232,7 @@ class ProxyMcpManager:
             resp = await self._omnigent_client.post(
                 f"/v1/mcp/{service}" if service else self._mcp_url,
                 json=payload,
-                headers={"X-Omnigent-Session-Id": self._session_id} if service else {},
+                headers={MCP_SESSION_ID_HEADER: self._session_id} if service else {},
                 timeout=30.0,
             )
             resp.raise_for_status()
@@ -420,6 +422,9 @@ class ProxyMcpManager:
                 },
             }
 
+        needs_source = managed or tool_name == SysSessionSetDocumentTool.name()
+        headers = {MCP_SESSION_ID_HEADER: self._session_id} if needs_source else {}
+
         reattaching = False
 
         async def _wait_to_reattach(
@@ -487,7 +492,7 @@ class ProxyMcpManager:
                     resp = await request_client.post(
                         url,
                         json=payload,
-                        headers={"X-Omnigent-Session-Id": self._session_id} if managed else {},
+                        headers=headers,
                         # Short connect timeout still fails fast on an unreachable
                         # server; the read timeout covers ordinary proxy request
                         # hangs. Sub-agent dispatch returns an async handle

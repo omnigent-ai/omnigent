@@ -100,6 +100,31 @@ def require_private_bound_source(
     return source
 
 
+def require_bound_session_runner(
+    request: Request,
+    session: Conversation,
+    user_id: str | None,
+    permissions: PermissionStore | None,
+    *,
+    source_id: str | None,
+) -> None:
+    """Verify runner origin for an already edit-authorized self-write."""
+    if not source_id or normalize_uuid(source_id.strip()) != session.id:
+        raise OmnigentError("The runner must call from this session", code=ErrorCode.FORBIDDEN)
+    token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
+    runner_id = session.runner_id
+    # Local single-user runners can have stable IDs unrelated to tunnel tokens.
+    requires_token = (
+        (permissions is not None and user_id != RESERVED_USER_LOCAL)
+        or (runner_id is not None and runner_id.startswith("runner_token_"))
+        or RUNNER_TUNNEL_TOKEN_HEADER in request.headers
+    )
+    if not runner_id or (
+        requires_token and (not token or token_bound_runner_id(token) != runner_id)
+    ):
+        raise OmnigentError("Only the session's bound runner may call", code=ErrorCode.FORBIDDEN)
+
+
 # How many sessions the archive guard walks up from the caller before refusing.
 _MAX_ARCHIVE_LINEAGE_DEPTH = 32
 

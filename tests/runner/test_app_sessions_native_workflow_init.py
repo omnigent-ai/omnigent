@@ -36,6 +36,7 @@ from omnigent.runner.native import NativeLaunchContext, _resolve_native_spawn_en
 from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
 )
+from omnigent.runtime.prompt import SESSION_DOCUMENT_INSTRUCTION
 from omnigent.spec.types import AgentSpec, ExecutorSpec, LocalToolInfo
 from tests._helpers.providers import isolate_provider_resolution
 from tests.budgets import budget
@@ -2219,13 +2220,24 @@ async def test_mcp_execute_dispatches_full_namespaced_mcp_tool_name() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sessions_native_path_injects_mcp_schemas() -> None:
+@pytest.mark.parametrize("docs_enabled", [False, True])
+async def test_sessions_native_path_injects_mcp_schemas(
+    docs_enabled: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """``POST /v1/sessions/{conv}/events`` with a message body injects MCP schemas.
 
     Sessions-native clients must get the same MCP injection that the
     legacy ``/v1/responses`` path provides.
     """
-    app, _mcp_manager, harness_client, _server_client = _build_app_with_mcp_tool()
+    app, _mcp_manager, harness_client, server_client = _build_app_with_mcp_tool()
+    original_get = server_client.get
+
+    async def get(url: str, **kwargs: Any) -> Any:
+        if url == "/v1/info":
+            return httpx.Response(200, json={"session_set_document": docs_enabled})
+        return await original_get(url, **kwargs)
+
+    monkeypatch.setattr(server_client, "get", get)
     async with _runner_client(app) as client:
         resp = await client.post(
             "/v1/sessions/4e92b5a0c0ee6db3f874f9c4a3f855a5/events",
@@ -2250,6 +2262,14 @@ async def test_sessions_native_path_injects_mcp_schemas() -> None:
     assert any(s.get("name") == "jira_search_issues" for s in schemas), (
         f"MCP schema must be injected on sessions-native path; got {schemas}"
     )
+    assert (
+        any(
+            schema.get("function", {}).get("name") == "sys_session_set_document"
+            for schema in schemas
+        )
+        is docs_enabled
+    )
+    assert (SESSION_DOCUMENT_INSTRUCTION in body.get("instructions", "")) is docs_enabled
 
 
 @pytest.mark.asyncio

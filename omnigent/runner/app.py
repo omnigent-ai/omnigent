@@ -114,7 +114,6 @@ from omnigent.runner.codex.goal import CodexGoalRunner
 from omnigent.runner.journal_tools import (
     answer_arrives_as_message,
     cancel_session_questions,
-    invalidate_server_workflow_flag,
     server_workflows_enabled,
 )
 from omnigent.runner.launch_failure import (
@@ -171,6 +170,10 @@ from omnigent.runner.resource_registry import (
     trim_terminal_output,
 )
 from omnigent.runner.resource_routes import register_resource_routes
+from omnigent.runner.server_capabilities import (
+    invalidate_server_info,
+    server_session_set_document_enabled,
+)
 from omnigent.runner.session_history import build_session_history, is_cancellation_marker
 from omnigent.runner.session_init_protocol import (
     RunnerSessionInitEnvelope,
@@ -222,9 +225,12 @@ from omnigent.runner.subagent_work import (
 )
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
 from omnigent.runtime.prompt import (
+    SESSION_DOCUMENT_INSTRUCTION,
+    append_framework_instructions,
     build_instructions,
     build_instructions_nullable,
     raw_author_instructions,
+    session_document_tool_exposed,
 )
 from omnigent.scheduled_context import current_scheduled_run, scheduled_run_scope
 from omnigent.server.schemas import (
@@ -5780,10 +5786,11 @@ def create_runner_app(
         explicit_bridge_dir: Path | None = None,
         await_notify: bool = False,
         session_labels: Mapping[str, str] | None = None,
-    ) -> None:
+    ) -> bool:
         import json as _json
 
         from omnigent.harnesses.claude_native.bridge import (
+            _TOOL_RELAY_FILE,
             BRIDGE_ID_LABEL_KEY,
             TOOLS_CHANGED_READY_TIMEOUT_S,
             ClaudeBridgeNotReady,
@@ -5793,6 +5800,7 @@ def create_runner_app(
         )
 
         workflows_enabled = await server_workflows_enabled(server_client)
+        session_set_document_enabled = await server_session_set_document_enabled(server_client)
 
         try:
             spec_entry = await _resolve_session_spec_entry(session_id)
@@ -5804,8 +5812,17 @@ def create_runner_app(
             # Keep it: once resolution recovers, the resolved spec differs
             # from the stored one and the relay rebuilds then.
             binding = _session_comment_relays.get(session_id)
-            if binding is not None and binding.workflows_enabled == workflows_enabled:
-                return
+            if (
+                binding is not None
+                and binding.workflows_enabled == workflows_enabled
+                and binding.session_set_document_enabled == session_set_document_enabled
+                and (explicit_bridge_dir is None or binding.bridge_dir == explicit_bridge_dir)
+                and (
+                    not session_set_document_enabled
+                    or (binding.bridge_dir / _TOOL_RELAY_FILE).is_file()
+                )
+            ):
+                return session_set_document_enabled
             spec_entry = binding.spec_entry if binding is not None else None
 
         # The bridge dir, when the caller pinned it down or handed over the
@@ -5833,9 +5850,14 @@ def create_runner_app(
             current is not None
             and current.spec_entry is spec_entry
             and current.workflows_enabled == workflows_enabled
+            and current.session_set_document_enabled == session_set_document_enabled
+            and (
+                not session_set_document_enabled
+                or (current.bridge_dir / _TOOL_RELAY_FILE).is_file()
+            )
             and known_bridge_dir is None
         ):
-            return
+            return session_set_document_enabled
 
         bridge_dir = known_bridge_dir
         if bridge_dir is None:
@@ -5855,9 +5877,14 @@ def create_runner_app(
             current is not None
             and current.spec_entry is spec_entry
             and current.workflows_enabled == workflows_enabled
+            and current.session_set_document_enabled == session_set_document_enabled
+            and (
+                not session_set_document_enabled
+                or (current.bridge_dir / _TOOL_RELAY_FILE).is_file()
+            )
             and current.bridge_dir == bridge_dir
         ):
-            return
+            return session_set_document_enabled
 
         from omnigent.runner.tool_dispatch import (
             build_native_relay_tool_schemas,
@@ -5866,7 +5893,9 @@ def create_runner_app(
 
         relay_spec = _unwrap_spec_entry(spec_entry)
         relay_schemas: list[_JsonObject] = filter_workflow_tool_schemas(
-            build_native_relay_tool_schemas(relay_spec),
+            build_native_relay_tool_schemas(
+                relay_spec, session_set_document_enabled=session_set_document_enabled
+            ),
             enabled=workflows_enabled,
         )
         from omnigent.tools.browser_agent_tools import filter_native_relay_browser_tools
@@ -5893,9 +5922,14 @@ def create_runner_app(
                 current is not None
                 and current.spec_entry is spec_entry
                 and current.workflows_enabled == workflows_enabled
+                and current.session_set_document_enabled == session_set_document_enabled
+                and (
+                    not session_set_document_enabled
+                    or (current.bridge_dir / _TOOL_RELAY_FILE).is_file()
+                )
                 and current.bridge_dir == bridge_dir
             ):
-                return
+                return session_set_document_enabled
 
         _captured_session_id = session_id
         # ponytail: one lock per relay; split by path only if recovery contention matters.
@@ -6031,13 +6065,14 @@ def create_runner_app(
                 exc_info=True,
                 extra={"session_id": session_id},
             )
-            return
+            return False
         superseded = _session_comment_relays.get(session_id)
         _session_comment_relays[session_id] = _CommentRelayBinding(
             relay=relay,
             spec_entry=spec_entry,
             bridge_dir=bridge_dir,
             workflows_enabled=workflows_enabled,
+            session_set_document_enabled=session_set_document_enabled,
         )
         # Close last: the new advertisement is already written, and
         # ClaudeNativeToolRelay.close only unlinks a tool_relay.json that
@@ -6088,6 +6123,7 @@ def create_runner_app(
                 )
             _background_tasks.add(_notify_task)
             _notify_task.add_done_callback(_background_tasks.discard)
+        return session_document_tool_exposed(relay_schemas)
 
     async def _run_turn_bg(
         msg_body: _JsonObject,
@@ -6458,6 +6494,7 @@ def create_runner_app(
                         cached_spec,
                         workdir=_resolved_workdir_for_spec(cached_spec_entry, runner_workspace),
                         os_env_schema_only=True,
+                        session_set_document_enabled=True,
                     )
                     all_tools.extend(_tmgr.get_tool_schemas())
                 except (
@@ -6511,7 +6548,10 @@ def create_runner_app(
                         extra={"session_id": conv},
                     )
 
-        from omnigent.runner.tool_dispatch import filter_workflow_tool_schemas
+        from omnigent.runner.tool_dispatch import (
+            filter_session_document_tool_schema,
+            filter_workflow_tool_schemas,
+        )
 
         _spec_tools = filter_workflow_tool_schemas(
             _session_tool_schemas.get(conv) or [],
@@ -6530,7 +6570,19 @@ def create_runner_app(
         from omnigent.tools.browser_agent_tools import filter_turn_browser_tools
 
         _spec_tools = filter_turn_browser_tools(_spec_tools, msg_body)
-        _client_tools = cast(list[_JsonObject], msg_body.get("tools") or [])
+        session_set_document_enabled = await server_session_set_document_enabled(server_client)
+        _spec_tools = filter_session_document_tool_schema(
+            _spec_tools, enabled=session_set_document_enabled
+        )
+        _client_tools = filter_session_document_tool_schema(
+            cast(list[_JsonObject], msg_body.get("tools") or []), enabled=False
+        )
+        if not is_native_harness(harness_name) and session_document_tool_exposed(_spec_tools):
+            instructions = append_framework_instructions(
+                instructions, (SESSION_DOCUMENT_INSTRUCTION,)
+            )
+            harness_body["instructions"] = instructions
+            ctx.instructions = instructions
         merged_tools = _merge_request_client_tools(_spec_tools, _client_tools)
         if merged_tools:
             harness_body["tools"] = merged_tools
@@ -9389,7 +9441,7 @@ def create_runner_app(
 
     async def _catch_up_scan() -> None:
         global _server_accepts_inferred_status, _server_accepts_input_only_failures
-        invalidate_server_workflow_flag(server_client)
+        invalidate_server_info(server_client)
         # The new connection may reach an older server; it must accept inferred status
         # and input-only failures anew.
         _server_accepts_inferred_status = False

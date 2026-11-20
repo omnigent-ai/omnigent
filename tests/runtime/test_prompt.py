@@ -1,6 +1,9 @@
 """Tests for canonical system-instruction composition."""
 
 import json
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
@@ -30,6 +33,32 @@ _DEFAULT_FRAMEWORK_INSTRUCTIONS = (
     f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
 )
 _SAMPLE_FRAMEWORK_INSTRUCTION = "Framework instruction for testing build_instructions_nullable."
+
+
+@pytest.mark.parametrize(
+    "first_module",
+    ["omnigent.runtime.workflow", "omnigent.runtime.prompt", "omnigent.tools.builtins"],
+)
+def test_runtime_startup_imports_work_in_fresh_process(first_module: str) -> None:
+    """A warm module cache must not hide startup import cycles."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import importlib, sys\n"
+            "for name in sys.argv[1:]:\n"
+            "    importlib.import_module(name)\n",
+            first_module,
+            "omnigent.runtime.workflow",
+            "omnigent.runtime.prompt",
+        ],
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def _spec(

@@ -279,8 +279,14 @@ from omnigent.server.schemas import (
 )
 from omnigent.server.session_orchestration import (
     require_archive_outside_source_lineage,
+    require_bound_session_runner,
     require_named_source_private,
     require_orchestration_source,
+)
+from omnigent.session_documents import (
+    GOOGLE_DOCS_DOCUMENT_LABEL_PREFIX,
+    GOOGLE_DOCS_SELECTION_LABEL,
+    build_google_docs_label_patch,
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
@@ -3622,6 +3628,48 @@ def register_core_routes(
                 return await _update_session(request, session_id, body, include_usage, live_change)
         return await _update_session(request, session_id, body, include_usage)
 
+    async def _authorize_agent_document_patch(
+        request: Request,
+        session_id: str,
+        body: UpdateSessionRequest,
+        user_id: str | None,
+    ) -> Conversation:
+        """Permit only the calling runner's canonical document patch on its own session."""
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        conversation = access.conversation or await asyncio.to_thread(
+            conversation_store.get_conversation, session_id
+        )
+        if conversation is None:
+            raise _session_not_found()
+        require_bound_session_runner(
+            request,
+            conversation,
+            user_id,
+            permission_store,
+            source_id=request.headers.get(ORCHESTRATION_SOURCE_HEADER),
+        )
+        if not request.app.state.feature_flags.enabled(Feature.GOOGLE_DOCS):
+            raise OmnigentError("Linking Google Docs is disabled", code=ErrorCode.FORBIDDEN)
+        labels = body.labels or {}
+        url = labels.get(GOOGLE_DOCS_SELECTION_LABEL)
+        if body.model_fields_set != {"labels"} or not url:
+            raise OmnigentError(
+                "An agent must link a Google Doc in a separate update",
+                code=ErrorCode.FORBIDDEN,
+            )
+        try:
+            expected_patch = build_google_docs_label_patch(conversation.labels, url)
+        except ValueError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+        if labels != expected_patch:
+            raise OmnigentError(
+                "The Google Doc update does not match the current document labels",
+                code=ErrorCode.CONFLICT,
+            )
+        return conversation
+
     async def _update_session(
         request: Request,
         session_id: str,
@@ -3692,19 +3740,32 @@ def register_core_routes(
             required_level = LEVEL_MANAGE
         else:
             required_level = LEVEL_EDIT
-        await _require_access(
-            user_id, session_id, required_level, permission_store, conversation_store
+        document_update = any(
+            key == GOOGLE_DOCS_SELECTION_LABEL or key.startswith(GOOGLE_DOCS_DOCUMENT_LABEL_PREFIX)
+            for key in (body.labels or {})
         )
-        # A session shared with edit access must not let collaborators refile,
-        # rename, pin or archive the owner's other sessions through agent tools.
-        # Only those tools name a calling session, so other PATCHes are unaffected.
-        await asyncio.to_thread(
-            require_named_source_private,
-            request,
-            user_id,
-            conversation_store,
-            permission_store,
+        runner_request = (
+            ORCHESTRATION_SOURCE_HEADER in request.headers
+            or RUNNER_TUNNEL_TOKEN_HEADER in request.headers
         )
+        document_session = None
+        if document_update and runner_request:
+            document_session = await _authorize_agent_document_patch(
+                request, session_id, body, user_id
+            )
+        else:
+            await _require_access(
+                user_id, session_id, required_level, permission_store, conversation_store
+            )
+            # An editor can steer a shared agent, but cannot use it to organize the
+            # owner's other sessions or projects.
+            await asyncio.to_thread(
+                require_named_source_private,
+                request,
+                user_id,
+                conversation_store,
+                permission_store,
+            )
         if body.archived is True:
             await asyncio.to_thread(
                 require_archive_outside_source_lineage, request, session_id, conversation_store
@@ -4286,7 +4347,7 @@ def register_core_routes(
                         request.app.state.runner_session_initializer,
                     )
         else:
-            conv = conv_for_collaboration_mode
+            conv = conv_for_collaboration_mode or document_session
             if conv is None:
                 conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None:

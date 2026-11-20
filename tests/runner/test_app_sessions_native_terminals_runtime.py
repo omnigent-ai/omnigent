@@ -50,7 +50,7 @@ from omnigent.runner.session_init_protocol import (
     RunnerSessionInitEnvelope,
     RunnerSessionInitSnapshot,
 )
-from omnigent.runtime.prompt import WORKSPACE_IMAGE_INSTRUCTION
+from omnigent.runtime.prompt import SESSION_DOCUMENT_INSTRUCTION, WORKSPACE_IMAGE_INSTRUCTION
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.stores.conversation_store import CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY
 from omnigent.terminals import TerminalRegistry
@@ -1640,9 +1640,11 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("docs_enabled", [False, True])
 async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    docs_enabled: bool,
 ) -> None:
     """
     Codex-native launches in the session worktree, not the bundle dir.
@@ -1719,6 +1721,8 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
             :returns: HTTP 200 response carrying the worktree workspace.
             """
             del timeout, params
+            if url == "/v1/info":
+                return httpx.Response(200, json={"session_set_document": docs_enabled})
             assert url == f"/v1/sessions/{session_id}"
             return httpx.Response(
                 200,
@@ -1883,6 +1887,10 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
         workdir=bundle_dir,
     )
 
+    async def ensure_relay(*_args: Any, **_kwargs: Any) -> bool:
+        assert bool(build_calls) is not docs_enabled
+        return docs_enabled
+
     try:
         await _auto_create_codex_terminal(
             session_id,
@@ -1890,6 +1898,7 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
             lambda _sid, event: None,
             agent_spec=agent_spec,
             server_client=_WorktreeSnapshotClient(),  # type: ignore[arg-type]
+            ensure_comment_relay=ensure_relay,
         )
         await asyncio.sleep(0)
     finally:
@@ -1917,8 +1926,12 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
         "mean the session snapshot workspace was ignored."
     )
     assert build_calls[0]["cwd"] != bundle_dir.resolve()  # never the spec-bundle dir
-    assert build_calls[0]["developer_instructions"] == (
-        f"Be a concise, careful coding assistant.\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
+    expected = f"Be a concise, careful coding assistant.\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
+    if docs_enabled:
+        expected = f"{expected}\n\n{SESSION_DOCUMENT_INSTRUCTION}"
+    assert build_calls[0]["developer_instructions"] == expected
+    assert "sys_session_set_document" not in codex_app_mod.framework_approved_tools(
+        routed_spawns=True
     )
 
     # Sandbox-override regression: the launched Codex terminal must inherit

@@ -23,6 +23,7 @@ from omnigent.mcp_selection import MCP_SELECTION_HEADER, MCP_SELECTION_PREFIX, s
 from omnigent.memory_availability import MEMORY_HEADER, MEMORY_SEARCH_HEADER
 from omnigent.native.native_coding_agents import native_coding_agent_for_agent_name
 from omnigent.policies.registry import LOCAL_SINGLE_USER_HEADER, POLICY_MODULES_HEADER
+from omnigent.runner.identity import MCP_SESSION_ID_HEADER
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
@@ -64,6 +65,7 @@ from omnigent.server.routes._auth_helpers import (
 from omnigent.server.routes._content_type import (
     require_json_content_type,
 )
+from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._sessions.common import (
     _TURN_ACTOR_LABEL,
     _logger,
@@ -91,9 +93,11 @@ from omnigent.server.schemas import (
     PolicySummary,
     SkillSummary,
 )
+from omnigent.server.session_orchestration import require_bound_session_runner
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.tools.builtins.session_set_document import SysSessionSetDocumentTool
 
 
 def register_agent_routes(
@@ -644,6 +648,21 @@ def register_agent_routes(
                 return _mcp_error_response(rpc_id, -32601, "Workflows are disabled on this server")
 
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if tool_name == SysSessionSetDocumentTool.name():
+                if not getattr(request.app.state, "feature_flags", FeatureFlags()).enabled(
+                    Feature.GOOGLE_DOCS
+                ):
+                    return _mcp_error_response(rpc_id, -32000, "Google Doc linking is disabled")
+                if conv is None:
+                    raise _session_not_found()
+                # Pi takes its source from its runner-written transport configuration.
+                require_bound_session_runner(
+                    request,
+                    conv,
+                    user_id,
+                    permission_store,
+                    source_id=request.headers.get(MCP_SESSION_ID_HEADER),
+                )
             actor = mcp_policy_actor(request, conv, user_id) if conv else _build_actor(user_id)
             return await _handle_mcp_tools_call(
                 rpc_id,

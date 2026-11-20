@@ -143,6 +143,7 @@ class _CommentRelayBinding:
     spec_entry: _SpecEntry | None
     bridge_dir: Path
     workflows_enabled: bool = False
+    session_set_document_enabled: bool = False
 
 
 def _require_full_native_lock_coverage(

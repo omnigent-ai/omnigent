@@ -107,6 +107,7 @@ from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
     redacted_terminal_output,
 )
+from omnigent.runner.server_capabilities import server_session_set_document_enabled
 from omnigent.runner.session_init_protocol import (
     RunnerSessionInitEnvelope,
 )
@@ -141,8 +142,24 @@ class _EnsureCommentRelay(Protocol):
         explicit_bridge_dir: Path | None = None,
         await_notify: bool = False,
         session_labels: Mapping[str, str] | None = None,
-    ) -> None:
-        pass
+    ) -> bool | None:
+        """Return whether the started relay advertises the document setter."""
+
+
+async def _start_native_document_relay(
+    ensure_comment_relay: _EnsureCommentRelay | None,
+    server_client: httpx.AsyncClient | None,
+    session_id: str,
+    bridge_dir: Path,
+) -> bool:
+    """Start the relay before composing startup guidance for the document setter."""
+    if ensure_comment_relay is None or not await server_session_set_document_enabled(
+        server_client
+    ):
+        return False
+    return bool(
+        await ensure_comment_relay(session_id, explicit_bridge_dir=bridge_dir, await_notify=False)
+    )
 
 
 def _publish_tmux_target_for_bridge(
@@ -2010,9 +2027,20 @@ async def _auto_create_opencode_terminal(
                 databricks_request_headers(runner_server_url, bearer_token=_policy_token)
             )
 
+    document_tool_exposed = False
+    if server_client is not None and ensure_comment_relay is not None:
+        document_tool_exposed = bool(
+            await ensure_comment_relay(
+                session_id, explicit_bridge_dir=bridge_dir, await_notify=False
+            )
+        )
+
     # opencode 2.0 ignores config ``instructions``; the per-session global AGENTS.md is read.
     instructions_path = write_opencode_instructions(
-        xdg_config_home, _opencode_session_instructions_from_spec(agent_spec)
+        xdg_config_home,
+        _opencode_session_instructions_from_spec(
+            agent_spec, session_document_tool_exposed=document_tool_exposed
+        ),
     )
     config = build_opencode_config(
         model=model_override,
@@ -2036,17 +2064,6 @@ async def _auto_create_opencode_terminal(
     # The per-session DB imports $XDG_DATA_HOME/opencode/auth.json once when it is
     # created; seed it with the user's auth.json and v2 SQLite credentials.
     seed_opencode_auth(bridge_dir)
-
-    # Start the Omnigent builtin-tool relay BEFORE opencode boots, so
-    # ``tool_relay.json`` exists when opencode launches the ``serve-mcp`` MCP
-    # server and lists its tools (the sys_*/load_skill/web_fetch surface). The
-    # relay POSTs each call back through the Omnigent server (policy enforced).
-    if server_client is not None and ensure_comment_relay is not None:
-        await ensure_comment_relay(
-            session_id,
-            explicit_bridge_dir=bridge_dir,
-            await_notify=False,
-        )
 
     # A forked clone copies the source conversation's DB before its own server
     # opens it, so the source session can be forked natively.
@@ -2932,7 +2949,12 @@ async def _auto_create_pi_terminal(
 
         spec_for_tools = _unwrap_resolved_spec(agent_spec)
         relay_tools = filter_workflow_tool_schemas(
-            build_native_relay_tool_schemas(spec_for_tools),
+            build_native_relay_tool_schemas(
+                spec_for_tools,
+                session_set_document_enabled=await server_session_set_document_enabled(
+                    server_client
+                ),
+            ),
             enabled=await server_workflows_enabled(server_client),
         )
         pi_tools = await filter_native_relay_browser_tools(
@@ -2945,6 +2967,12 @@ async def _auto_create_pi_terminal(
             session_id,
             exc_info=True,
         )
+    from omnigent.runner.identity import MCP_SESSION_ID_HEADER
+    from omnigent.runtime.prompt import session_document_tool_exposed
+
+    document_tool_exposed = session_document_tool_exposed(pi_tools)
+    if document_tool_exposed:
+        auth_headers[MCP_SESSION_ID_HEADER] = session_id
     _extension, config = write_extension_files(
         bridge_dir,
         session_id=session_id,
@@ -2986,7 +3014,11 @@ async def _auto_create_pi_terminal(
         if system_prompt_mode == "replace" and raw_author_instructions(pi_spec) is None:
             raise ValueError("system_prompt_mode='replace' requires non-empty instructions")
     startup_instructions = await _native_startup_instructions(
-        agent_spec, server_client, session_id, workspace=workspace
+        agent_spec,
+        server_client,
+        session_id,
+        workspace=workspace,
+        session_document_tool_exposed=document_tool_exposed,
     )
     instructions_path = write_agent_instructions(bridge_dir, startup_instructions)
     provider_args: list[str] = []
@@ -4306,13 +4338,21 @@ async def _auto_create_devin_terminal(
     workspace = str(workspace_path)
     bridge_dir = prepare_bridge_dir(session_id)
 
+    document_tool_exposed = await _start_native_document_relay(
+        ensure_comment_relay, server_client, session_id, bridge_dir
+    )
+
     # Reserve the workspace rule for authored roles; framework guidance belongs
     # in this session's preamble so plain sessions cannot occupy the shared slot.
     spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
     authored = raw_author_instructions(spec) if spec is not None else None
     rule_is_live = write_devin_agent_rule(workspace_path, authored, session_id=session_id)
     write_agent_instructions_preamble(
-        bridge_dir, build_native_startup_instructions(None if rule_is_live else spec)
+        bridge_dir,
+        build_native_startup_instructions(
+            None if rule_is_live else spec,
+            session_document_tool_exposed=document_tool_exposed,
+        ),
     )
     if rule_is_live:
         # Record the workspace so the SessionEnd hook can remove this rule when
@@ -4431,7 +4471,11 @@ async def _auto_create_devin_terminal(
 
     # Start the Omnigent builtin-tool relay so Devin's MCP-declared Omnigent
     # tools route back through the session's policy/elicitation gate.
-    if server_client is not None and ensure_comment_relay is not None:
+    if (
+        not document_tool_exposed
+        and server_client is not None
+        and ensure_comment_relay is not None
+    ):
         await ensure_comment_relay(
             session_id,
             explicit_bridge_dir=bridge_dir,
@@ -5830,14 +5874,7 @@ async def _auto_create_codex_terminal(
         codex_ws_port = s.getsockname()[1]
     codex_ws_url = f"ws://127.0.0.1:{codex_ws_port}"
 
-    # Write the minimal MCP bridge config so serve-mcp can boot, and
-    # start the tool relay so tool_relay.json is on disk before codex
-    # launches its MCP server. This mirrors the claude-native relay
-    # start in ``create_session_terminal``. The relay is started here
-    # (not in ``_ensure_comment_relay_started``) because that helper
-    # is scoped inside ``create_routes`` and not reachable at module
-    # level. The ``_run_turn_bg`` fallback path covers sessions whose
-    # terminal was created outside this function.
+    # Write the minimal MCP bridge config so serve-mcp can boot.
     from omnigent.harnesses.codex_native.bridge import (
         codex_mcp_config_overrides,
         write_mcp_bridge_config,
@@ -5877,8 +5914,16 @@ async def _auto_create_codex_terminal(
         from omnigent.inner.hook_scripts.subagent_router import smart_routing_spawn_note
 
         _codex_routing_note = smart_routing_spawn_note("codex-native")
+    document_tool_exposed = await _start_native_document_relay(
+        ensure_comment_relay, server_client, session_id, bridge_dir
+    )
     _codex_developer_instructions = await _native_startup_instructions(
-        agent_spec, server_client, session_id, _codex_routing_note, workspace=workspace
+        agent_spec,
+        server_client,
+        session_id,
+        _codex_routing_note,
+        workspace=workspace,
+        session_document_tool_exposed=document_tool_exposed,
     )
     # SDK initialization can block on DNS/auth before model discovery times out.
     # Keep it off the runner loop so heartbeats and other sessions can progress.
@@ -6218,7 +6263,7 @@ async def _auto_create_codex_terminal(
     # the first-turn `_ensure_comment_relay_started` then fast-paths, avoiding
     # the ~30s stall (see its docstring for the lazy-bridge / await_notify=False
     # rationale).
-    if ensure_comment_relay is not None:
+    if not document_tool_exposed and ensure_comment_relay is not None:
         await ensure_comment_relay(session_id, explicit_bridge_dir=bridge_dir, await_notify=False)
 
     _logger.info(
@@ -7821,32 +7866,43 @@ def _claude_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) 
 
 
 def _opencode_session_instructions_from_spec(
-    agent_spec: AgentSpec | ResolvedSpec | None,
+    agent_spec: AgentSpec | ResolvedSpec | None, *, session_document_tool_exposed: bool = False
 ) -> str | None:
     """Compose the session-snapshot instructions written to OpenCode's AGENTS.md.
 
     Author instructions plus the spec-level framework instructions from
     ``omnigent.runtime.prompt``. No per-request text or turn-bound framework
     text is included: AGENTS.md is written once per launch and read for every
-    later turn. Tool schemas are empty, matching the runner's own composition.
+    later turn.
 
     :param agent_spec: Agent spec object, or a resolved wrapper carrying a
         ``spec`` attribute. ``None`` means no spec was available.
-    :returns: The composed text, or stable image guidance when there is no spec.
+    :param session_document_tool_exposed: The started relay advertises the document setter.
+    :returns: The composed text, or stable framework guidance when there is no spec.
     """
     from omnigent.runtime.prompt import (
+        SESSION_DOCUMENT_INSTRUCTION,
         build_instructions_nullable,
         build_native_startup_instructions,
     )
 
     spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
     if spec is None:
-        return build_native_startup_instructions(None)
-    return build_instructions_nullable(spec, None, [])
+        return build_native_startup_instructions(
+            None, session_document_tool_exposed=session_document_tool_exposed
+        )
+    return build_instructions_nullable(
+        spec,
+        None,
+        [],
+        framework_instructions=(SESSION_DOCUMENT_INSTRUCTION,)
+        if session_document_tool_exposed
+        else (),
+    )
 
 
 def _native_startup_instructions_from_spec(
-    agent_spec: AgentSpec | ResolvedSpec | None,
+    agent_spec: AgentSpec | ResolvedSpec | None, *, session_document_tool_exposed: bool = False
 ) -> str:
     """Compose native startup instructions without turn-bound framework metadata.
 
@@ -7856,12 +7912,15 @@ def _native_startup_instructions_from_spec(
 
     :param agent_spec: Agent spec object, or a resolved wrapper carrying a
         ``spec`` attribute. ``None`` means no spec was available.
+    :param session_document_tool_exposed: The native harness advertises the document setter.
     :returns: Author instructions followed by stable framework guidance.
     """
     from omnigent.runtime.prompt import build_native_startup_instructions
 
     spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
-    return build_native_startup_instructions(spec)
+    return build_native_startup_instructions(
+        spec, session_document_tool_exposed=session_document_tool_exposed
+    )
 
 
 async def _native_startup_instructions(
@@ -7870,6 +7929,7 @@ async def _native_startup_instructions(
     session_id: str,
     *launch_notes: str | None,
     workspace: str | Path | None = None,
+    session_document_tool_exposed: bool = False,
 ) -> str:
     """
     Compose a native harness's startup instructions, including long-term memory.
@@ -7884,10 +7944,13 @@ async def _native_startup_instructions(
     :param launch_notes: Additional framework notes, in order; ``None`` skipped.
     :param workspace: The session's working directory, which names its project
         in the memory guidance.
+    :param session_document_tool_exposed: The native harness advertises the document setter.
     :returns: The joined text.
     """
     parts = [
-        _native_startup_instructions_from_spec(agent_spec),
+        _native_startup_instructions_from_spec(
+            agent_spec, session_document_tool_exposed=session_document_tool_exposed
+        ),
         *launch_notes,
         await memory_startup_guidance(server_client, session_id, agent_spec, workspace=workspace),
     ]
@@ -9268,6 +9331,7 @@ async def _auto_create_claude_terminal(
     resolve_launch_config: Callable[[], Awaitable[ClaudeNativeUcodeConfig | None]] | None = None,
     record_launch_config: Callable[[str, ClaudeNativeUcodeConfig | None], None] | None = None,
     rebind_bridge: Callable[[str, str], Awaitable[None]] | None = None,
+    ensure_comment_relay: _EnsureCommentRelay | None = None,
 ) -> SessionResourceView:
     """
     Auto-create a Claude Code terminal for a claude-native session.
@@ -10002,6 +10066,9 @@ async def _auto_create_claude_terminal(
                 and await server_workflows_enabled(server_client)
             ),
         )
+    document_tool_exposed = await _start_native_document_relay(
+        ensure_comment_relay, server_client, session_id, bridge_dir
+    )
     claude_args = augment_claude_args(
         base_claude_args,
         active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
@@ -10016,7 +10083,12 @@ async def _auto_create_claude_terminal(
         model_overrides=claude_config.model_overrides if claude_config is not None else None,
         subagent_router_dir=subagent_router_dir,
         append_system_prompt=await _native_startup_instructions(
-            agent_spec, server_client, session_id, routed_spawn_note, workspace=workspace
+            agent_spec,
+            server_client,
+            session_id,
+            routed_spawn_note,
+            workspace=workspace,
+            session_document_tool_exposed=document_tool_exposed,
         ),
         allowed_tools=routed_spawn_tools,
         # The route-turn hook is registered only when this session can
@@ -10900,6 +10972,7 @@ async def _launch_claude(ctx: NativeLaunchContext) -> SessionResourceView:
         resolve_launch_config=ctx.resolve_launch_config,
         record_launch_config=ctx.record_launch_config,
         rebind_bridge=ctx.rebind_bridge,
+        ensure_comment_relay=ctx.ensure_comment_relay,
     )
     _start_claude_relay_after_launch(ctx)
     return view

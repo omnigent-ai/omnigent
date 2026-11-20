@@ -66,7 +66,25 @@ WORKSPACE_IMAGE_INSTRUCTION = (
 )
 
 
-def _framework_instructions_for(spec: AgentSpec) -> list[str]:
+SESSION_DOCUMENT_INSTRUCTION = (
+    "After creating a Google Doc for this session with connected Google tools, "
+    "attach it with sys_session_set_document, then return its Google Docs link to the user."
+)
+
+
+def session_document_tool_exposed(tool_schemas: Sequence[dict[str, Any]]) -> bool:
+    """Check the actual advertised tool list, in either OpenAI or native relay format."""
+    # Builtin tools import prompt constants while initializing their package.
+    from omnigent.tools.builtins.session_set_document import SysSessionSetDocumentTool
+
+    for schema in tool_schemas:
+        function = schema.get("function", schema)
+        if isinstance(function, dict) and function.get("name") == SysSessionSetDocumentTool.name():
+            return True
+    return False
+
+
+def _framework_instructions_for(spec: AgentSpec, tool_schemas: list[dict[str, Any]]) -> list[str]:
     """
     Framework instructions that apply to every turn of ``spec``.
 
@@ -91,6 +109,8 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
     if spec.tool_groups.browser:
         instructions.append(EMBEDDED_BROWSER_PRIORITY_INSTRUCTION)
     instructions.append(WORKSPACE_IMAGE_INSTRUCTION)
+    if session_document_tool_exposed(tool_schemas):
+        instructions.append(SESSION_DOCUMENT_INSTRUCTION)
     return instructions
 
 
@@ -166,8 +186,7 @@ def build_instructions(
         instructions for this specific request, appended
         after the agent's base instructions.
     :param tool_schemas: OpenAI-format tool schemas (used
-        only for future skill-awareness hinting; currently
-        not included in the instructions body).
+        for instructions that refer to tools the agent actually receives).
     :param framework_instructions: Framework-owned additive instructions
         for this turn, appended after user-authored agent/request instructions
         and after the spec-level framework instructions (the sub-agent
@@ -179,7 +198,7 @@ def build_instructions(
     return (
         append_framework_instructions(
             base_instructions,
-            [*_framework_instructions_for(spec), *framework_instructions],
+            [*_framework_instructions_for(spec, tool_schemas), *framework_instructions],
         )
         or base_instructions
     )
@@ -210,7 +229,7 @@ def build_instructions_nullable(
     base_instructions = "\n\n".join(parts) if parts else None
     return append_framework_instructions(
         base_instructions,
-        [*_framework_instructions_for(spec), *framework_instructions],
+        [*_framework_instructions_for(spec, tool_schemas), *framework_instructions],
     )
 
 
@@ -228,20 +247,20 @@ def raw_author_instructions(spec: AgentSpec) -> str | None:
     return None
 
 
-def build_native_startup_instructions(spec: AgentSpec | None) -> str:
-    """Compose author text and stable image guidance for native session startup.
-
-    Startup channels persist across turns, so they must not carry per-turn
-    framework metadata or guidance for tools the native harness does not expose.
+def build_native_startup_instructions(
+    spec: AgentSpec | None, *, session_document_tool_exposed: bool = False
+) -> str:
+    """Compose author text and stable framework guidance for native session startup.
 
     :param spec: Resolved agent spec, or ``None`` when unavailable.
-    :returns: Author instructions followed by workspace-image guidance.
+    :param session_document_tool_exposed: The native harness advertises the document setter.
+    :returns: Author instructions followed by applicable framework guidance.
     """
     authored = raw_author_instructions(spec) if spec is not None else None
-    return (
-        append_framework_instructions(authored, (WORKSPACE_IMAGE_INSTRUCTION,))
-        or WORKSPACE_IMAGE_INSTRUCTION
-    )
+    guidance = [WORKSPACE_IMAGE_INSTRUCTION]
+    if session_document_tool_exposed:
+        guidance.append(SESSION_DOCUMENT_INSTRUCTION)
+    return append_framework_instructions(authored, guidance) or WORKSPACE_IMAGE_INSTRUCTION
 
 
 def _strip_output_annotations(

@@ -60,6 +60,7 @@ from omnigent.tools.builtins import (
     any_skill_has_resources,
     get_builtin_tool,
 )
+from omnigent.tools.builtins.session_set_document import SysSessionSetDocumentTool
 from omnigent.tools.client_specified import ClientSideTool, ClientSideToolSpec
 from omnigent.tools.local import load_local_python_tools
 
@@ -126,6 +127,7 @@ class ToolManager:
         os_env: OSEnvironment | None = None,
         *,
         os_env_schema_only: bool = False,
+        session_set_document_enabled: bool = False,
     ) -> None:
         """
         Initialize the tool manager and register built-in,
@@ -171,7 +173,7 @@ class ToolManager:
         self._register_skill_tools()
         self._register_builtin_tools()
         self._register_sub_agent_tools()
-        self._register_session_tools()
+        self._register_session_tools(session_set_document_enabled)
         self._register_agent_mgmt_tools()
         self._register_project_tools()
         self._register_os_env_tools(schema_only=os_env_schema_only)
@@ -570,11 +572,13 @@ class ToolManager:
         if self._spec.spawn:
             self._tools[SysSessionCreateTool.name()] = SysSessionCreateTool()
 
-    def _register_session_tools(self) -> None:
+    def _register_session_tools(self, session_set_document_enabled: bool) -> None:
         """Register framework-owned tools for the current session."""
         from omnigent.tools.builtins.ui import UiOpenFileTool
 
         self._tools[SysSessionRenameTool.name()] = SysSessionRenameTool()
+        if session_set_document_enabled:
+            self._tools[SysSessionSetDocumentTool.name()] = SysSessionSetDocumentTool()
         self._tools[UiOpenFileTool.name()] = UiOpenFileTool()
 
     def _register_agent_mgmt_tools(self) -> None:

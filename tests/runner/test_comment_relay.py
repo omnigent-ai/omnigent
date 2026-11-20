@@ -1750,6 +1750,105 @@ async def test_native_revision_refreshes_relay_before_turn_without_reset(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["stdio", "loopback", "gateway"])
+async def test_native_document_tool_transports_stay_on_the_runner_session(
+    tmp_path: Path, transport: str
+) -> None:
+    """Stdio, loopback HTTP, and Pi's gateway transport reach the same scoped setter."""
+    from omnigent.runner.identity import MCP_SESSION_ID_HEADER, ORCHESTRATION_SOURCE_HEADER
+
+    session_id = uuid.uuid4().hex
+    session_path = f"/v1/sessions/{session_id}"
+    bridge_dir = prepare_bridge_dir(session_id, workspace=tmp_path)
+    relay_file = bridge_dir / _TOOL_RELAY_FILE
+    url = "https://docs.google.com/document/d/attached/edit?tab=t.0"
+    tool = "sys_session_set_document"
+    params = {"name": tool, "arguments": {"url": url}}
+    rpc = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": params}
+    info: dict[str, object] = {"features": {"google_docs": True}}
+    writes = []
+
+    async def ap(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/v1/info":
+            return httpx.Response(200, json=info)
+        if path == f"{session_path}/mcp":
+            assert request.headers[MCP_SESSION_ID_HEADER] == session_id
+            call = json.loads(request.content)
+            assert call["method"] == "tools/call"
+            assert call["params"]["arguments"] == {"url": url}
+            response = await runner_client.post(f"{session_path}/mcp/execute", json=call)
+            return httpx.Response(
+                200,
+                json={
+                    "result": {
+                        "content": [{"type": "text", "text": response.json()["result"]["output"]}],
+                    },
+                },
+            )
+        if path == f"{session_path}/labels":
+            return httpx.Response(200, json={"id": session_id, "labels": {}})
+        if (
+            request.method == "PATCH"
+            and path == session_path
+            and "labels" in json.loads(request.content)
+        ):
+            assert request.headers[ORCHESTRATION_SOURCE_HEADER] == session_id
+            labels = json.loads(request.content)["labels"]
+            writes.append(labels)
+            return httpx.Response(200, json={"id": session_id, "labels": labels})
+        return httpx.Response(200, json={"workspace": str(tmp_path)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(ap), base_url="https://server.example"
+    ) as server_client:
+        app = create_runner_app(
+            server_client=server_client, resource_registry=_StubResourceRegistry(tmp_path)
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as runner_client:
+            try:
+                for enabled in (False, True):
+                    if enabled:
+                        info["session_set_document"] = True
+                        await app.state.catch_up_scan()
+                    await _launch_bridged(runner_client, session_id)
+                    assert (tool in _relay_tool_names(relay_file)) is enabled
+                    if transport == "stdio":
+                        listed = bridge._handle_mcp_request("tools/list", {}, bridge_dir)
+                        assert (tool in {item["name"] for item in listed["tools"]}) is enabled
+                        result = await asyncio.to_thread(
+                            bridge._handle_mcp_request, "tools/call", params, bridge_dir
+                        )
+                    elif transport == "loopback":
+                        relay = json.loads(relay_file.read_text())
+                        async with httpx.AsyncClient(trust_env=False) as local:
+                            response = await local.post(
+                                f"{relay['url']}/tool",
+                                headers={"Authorization": f"Bearer {relay['token']}"},
+                                json=params,
+                            )
+                        result = response.json()
+                    else:
+                        response = await server_client.post(
+                            f"{session_path}/mcp",
+                            headers={MCP_SESSION_ID_HEADER: session_id},
+                            json=rpc,
+                        )
+                        result = response.json()["result"]
+                    if enabled:
+                        assert json.loads(result["content"][0]["text"]) == {"url": url}
+                    else:
+                        assert not writes
+                assert writes == [
+                    {"ui.google_docs_url": url, "ui.google_docs.document.attached": url}
+                ]
+            finally:
+                await runner_client.delete(session_path)
+
+
+@pytest.mark.asyncio
 async def test_native_relay_updates_workflow_tools_after_server_reconnect(
     tmp_path: Path,
 ) -> None:

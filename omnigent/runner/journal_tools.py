@@ -31,7 +31,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
-from weakref import WeakKeyDictionary
 
 import httpx
 
@@ -53,6 +52,7 @@ from omnigent.entities.workflow_questions import (
 )
 from omnigent.runner import pending_approvals
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+from omnigent.runner.server_capabilities import get_server_info, invalidate_server_info
 from omnigent.runner.subagent_work import _deliver_subagent_wake_post
 from omnigent.tools.builtins.journal import (
     JOURNAL_READ_PAGE_MAX,
@@ -63,43 +63,13 @@ from omnigent.tools.builtins.journal import (
 JOURNAL_TOOL_NAMES: frozenset[str] = frozenset(tool.name() for tool in JOURNAL_TOOLS)
 _logger = logging.getLogger(__name__)
 
-
-@dataclass
-class _ServerWorkflowFlag:
-    enabled: bool
-    stale: bool = False
-
-
-_server_workflow_flags: WeakKeyDictionary[httpx.AsyncClient, _ServerWorkflowFlag] = (
-    WeakKeyDictionary()
-)
-
-
-def invalidate_server_workflow_flag(server_client: httpx.AsyncClient | None) -> None:
-    """Refresh lazily after reconnect, retaining the last success if the probe fails."""
-    if server_client is not None and (cached := _server_workflow_flags.get(server_client)):
-        cached.stale = True
+invalidate_server_workflow_flag = invalidate_server_info
 
 
 async def server_workflows_enabled(server_client: httpx.AsyncClient | None) -> bool:
-    """Cache the server's startup flag until reconnect without discarding known state."""
-    if server_client is None:
-        return False
-    cached = _server_workflow_flags.get(server_client)
-    if cached is not None and not cached.stale:
-        return cached.enabled
-    try:
-        # Capability discovery must not inherit a streaming client's unlimited read timeout.
-        response = await server_client.get("/v1/info", timeout=5.0)
-        if response.status_code != 200:
-            return cached.enabled if cached is not None else False
-        info = response.json()
-    except (httpx.HTTPError, ValueError):
-        return cached.enabled if cached is not None else False
-    features = info.get("features") if isinstance(info, dict) else None
-    enabled = isinstance(features, dict) and features.get("workflows") is True
-    _server_workflow_flags[server_client] = _ServerWorkflowFlag(enabled)
-    return enabled
+    """Read the server's workflow flag from the cached startup capabilities."""
+    features = (await get_server_info(server_client)).get("features")
+    return isinstance(features, dict) and features.get("workflows") is True
 
 
 # A read returns the newest entries whose lines fit this budget.

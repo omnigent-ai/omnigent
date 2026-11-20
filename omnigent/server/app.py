@@ -417,6 +417,8 @@ class ServerInfoResponse(BaseModel):
     # GET/PUT /v1/settings/session-title-instructions; absent on older servers,
     # which clients treat as unsupported.
     session_title_instructions: bool = False
+    # Session PATCH supports a bound runner updating its own document labels.
+    session_set_document: bool = False
     admin_view: bool = False
     # Session comments accept and preserve immutable PR coordinates.
     comment_anchor_metadata: bool = True
@@ -4200,6 +4202,7 @@ def create_app(
                 "workflow_sharing": workflows_available
                 and stores_workflow_grants(permission_store),
                 "session_title_instructions": user_settings_store is not None,
+                "session_set_document": frontend_features[Feature.GOOGLE_DOCS.value],
                 "admin_view": admin_view_supported,
                 "filesystem_attachments": {
                     "extensions": sorted(filesystem_attachment_policy.extensions),

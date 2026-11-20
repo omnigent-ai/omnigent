@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -78,7 +79,7 @@ from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
 )
 from omnigent.runner.session_init_protocol import RunnerSessionInitEnvelope
-from omnigent.runtime.prompt import WORKSPACE_IMAGE_INSTRUCTION
+from omnigent.runtime.prompt import SESSION_DOCUMENT_INSTRUCTION, WORKSPACE_IMAGE_INSTRUCTION
 from omnigent.spec.types import AgentSpec, ExecutorSpec, ToolGroupsConfig
 from omnigent.stores.conversation_store import FORK_CARRY_HISTORY_LABEL_KEY
 from omnigent.terminals import TerminalRegistry
@@ -219,6 +220,7 @@ def test_read_relay_policy_config_returns_none_when_session_id_absent(
         ),
         ("empty", None, [], None),
         ("raw", None, [], None),
+        ("raw-docs", None, [], None),
         ("resolved", None, [], None),
         ("resolved-replace", None, [], None),
         ("sdk-missing-replace", None, [], None),
@@ -329,6 +331,13 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
             )
 
     published: list[dict[str, Any]] = []
+    docs_enabled = instruction_spec == "raw-docs"
+
+    class _PiServerClient(NullServerClient):
+        async def get(self, url: str, **kwargs: Any) -> Any:
+            if url == "/v1/info":
+                return httpx.Response(200, json={"session_set_document": docs_enabled})
+            return await super().get(url, **kwargs)
 
     instructions = "  Follow the authored role. π\nKeep this whitespace.  "
     reject_replace = instruction_spec in ("sdk-missing-replace", "resolved-sdk-empty-replace")
@@ -369,7 +378,7 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
             _PI_SESSION_ID,
             _FakeResourceRegistry(),  # type: ignore[arg-type]
             lambda _sid, evt: published.append(evt),
-            server_client=NullServerClient(),  # type: ignore[arg-type]
+            server_client=_PiServerClient(),  # type: ignore[arg-type]
             agent_spec=agent_spec,
         )
     if reject_replace:
@@ -391,6 +400,10 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     )
     tool_names = {tool["name"] for tool in config["tools"]}
     assert {"list_comments", "sys_session_list"} <= tool_names
+    assert ("sys_session_set_document" in tool_names) is docs_enabled
+    assert config["authHeaders"].get("X-Omnigent-Session-Id") == (
+        _PI_SESSION_ID if docs_enabled else None
+    )
     # Pi uses its own shell and file tools, so the extension gets no relayed
     # sys_os_* that would be a second route to the workspace.
     assert not {name for name in tool_names if name.startswith("sys_os_")}
@@ -417,9 +430,11 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     )
     expected = (
         f"{instructions}\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
-        if instruction_spec in {"raw", "resolved", "resolved-replace"}
+        if instruction_spec in {"raw", "raw-docs", "resolved", "resolved-replace"}
         else WORKSPACE_IMAGE_INSTRUCTION
     )
+    if docs_enabled:
+        expected = f"{expected}\n\n{SESSION_DOCUMENT_INSTRUCTION}"
     if memory_guidance is not None:
         expected = f"{expected}\n\n{memory_guidance}"
     assert path.read_text() == expected
@@ -2416,9 +2431,15 @@ def test_agent_os_env_from_spec_unwraps_resolved_and_handles_none() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("server_supports_tool", "relay_exposes_tool"),
+    [(False, False), (True, False), (True, True)],
+)
 async def test_auto_create_claude_terminal_passes_startup_instructions(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    server_supports_tool: bool,
+    relay_exposes_tool: bool,
 ) -> None:
     """
     Host-spawned launch emits ``--append-system-prompt`` with the agent's
@@ -2465,7 +2486,9 @@ async def test_auto_create_claude_terminal_passes_startup_instructions(
                 metadata={"terminal_name": "claude", "session_key": "main", "running": True},
             )
 
-    def _handle_request(_request: httpx.Request) -> httpx.Response:
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json={"session_set_document": server_supports_tool})
         return httpx.Response(200, json={"labels": {}})
 
     fake_client = httpx.AsyncClient(
@@ -2481,20 +2504,24 @@ async def test_auto_create_claude_terminal_passes_startup_instructions(
         executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
     )
 
+    ensure_relay = AsyncMock(return_value=relay_exposes_tool)
     await _auto_create_claude_terminal(
         session_id,
         _FakeResourceRegistry(),
         lambda _sid, _evt: None,
         server_client=fake_client,
         agent_spec=agent_spec,
+        ensure_comment_relay=ensure_relay,
     )
 
     args = captured["spec"].args
     assert "--append-system-prompt" in args, f"missing --append-system-prompt in {args!r}"
     idx = args.index("--append-system-prompt")
-    assert args[idx + 1] == (
-        f"Be a concise, careful coding assistant.\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
-    )
+    expected = f"Be a concise, careful coding assistant.\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
+    if relay_exposes_tool:
+        expected = f"{expected}\n\n{SESSION_DOCUMENT_INSTRUCTION}"
+    assert args[idx + 1] == expected
+    assert ensure_relay.await_count == int(server_supports_tool)
 
 
 @pytest.mark.asyncio
@@ -3610,7 +3637,6 @@ async def test_auto_create_claude_fork_preserves_history_in_another_workspace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A fork rebuilds missing local history and resumes it in the chosen directory."""
-    from unittest.mock import AsyncMock
 
     from omnigent.harnesses.claude_native import main as claude_native
     from omnigent.runner.native import orchestration
@@ -4452,7 +4478,6 @@ async def test_auto_create_claude_terminal_rebinds_a_moved_bridge(
     ``rebind_bridge`` so the harness is respawned in the new dir. A session
     already on its own bridge id makes neither call.
     """
-    from unittest.mock import AsyncMock
 
     from omnigent.runner.session_init_protocol import (
         SESSION_INIT_PROTOCOL_VERSION,

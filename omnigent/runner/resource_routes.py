@@ -117,7 +117,7 @@ class _EnsureCommentRelayStartedFn(Protocol):
         explicit_bridge_dir: Path | None = None,
         await_notify: bool = False,
         session_labels: Mapping[str, str] | None = None,
-    ) -> None: ...
+    ) -> bool | None: ...
 
 
 @dataclasses.dataclass(frozen=True)
