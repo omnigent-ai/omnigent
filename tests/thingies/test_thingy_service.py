@@ -1104,3 +1104,108 @@ def test_concurrent_writes_to_a_ruled_collection_all_land(thingies: Fixture) -> 
     assert sorted(item["id"] for item in created) == sorted(f"c{n}" for n in range(12))
     listed = rpc(service, app, "list", limit=100)["items"]
     assert len(listed) == 12
+
+
+def test_a_revision_derived_by_edits_keeps_the_rest_of_its_base(thingies: Fixture) -> None:
+    service = thingies.service()
+    app = service.create("Synthetic derived page")
+    base = service.create_revision(
+        app["id"],
+        {
+            "html": "<main><!-- view:start -->plain<!-- view:end --><p>kit</p></main>",
+            "sdk_version": 1,
+            "capabilities": ["data.read"],
+            "collections": CARDS,
+            "guide": "Synthetic guide",
+            "actions": [{"name": "scan", "description": "Synthetic scan"}],
+        },
+    )
+
+    derived = service.create_revision(
+        app["id"],
+        {
+            "base_revision_id": base["id"],
+            "edits": [
+                {"start": "<!-- view:start -->", "end": "<!-- view:end -->", "new": "designed"},
+                {"old": "<p>kit</p>", "new": "<p>kit 2</p>"},
+            ],
+        },
+    )
+
+    got = service.get_revision(app["id"], derived["id"])
+    assert got["html"] == "<main><!-- view:start -->designed<!-- view:end --><p>kit 2</p></main>"
+    original = service.get_revision(app["id"], base["id"])
+    for field in ("capabilities", "collections", "guide", "actions", "constraints"):
+        assert got[field] == original[field]
+    # A field the request gives replaces the base's.
+    renamed = service.create_revision(
+        app["id"],
+        {"base_revision_id": base["id"], "edits": [{"old": "plain", "new": "x"}], "guide": "New"},
+    )
+    assert service.get_revision(app["id"], renamed["id"])["guide"] == "New"
+
+
+@pytest.mark.parametrize(
+    ("edits", "reason", "message"),
+    [
+        ([{"old": "missing", "new": "x"}], "not_found", "Edit 1: its old text is not in the HTML"),
+        ([{"old": "q", "new": "x"}], "ambiguous", "Edit 1: its old text appears 3 times"),
+        (
+            [{"old": "<p>", "new": "<p>"}, {"start": "[", "end": "]", "new": "x"}],
+            "not_found",
+            "Edit 2: its start marker appears 0 times",
+        ),
+        ([{"start": "q", "end": "z", "old": "c", "new": "x"}], "invalid", "Edit 1: needs new"),
+        ([], None, "edits must be a list of 1 to 32 edits"),
+    ],
+)
+def test_a_failed_edit_names_itself_and_creates_nothing(
+    thingies: Fixture, edits: list, reason: str | None, message: str
+) -> None:
+    service = thingies.service()
+    app = service.create("Synthetic derived page")
+    base = service.create_revision(
+        app["id"],
+        {
+            "html": "<p>q q q z</p>",
+            "sdk_version": 1,
+            "capabilities": [],
+            "collections": CARDS,
+        },
+    )
+
+    with pytest.raises(InvalidInput) as refused:
+        service.create_revision(app["id"], {"base_revision_id": base["id"], "edits": edits})
+
+    assert str(refused.value).startswith(message)
+    if reason is not None:
+        assert refused.value.details["reason"] == reason
+
+
+def test_derived_revisions_need_their_base_and_keep_the_size_limit(thingies: Fixture) -> None:
+    service = thingies.service()
+    app = service.create("Synthetic derived page")
+    base = service.create_revision(
+        app["id"],
+        {"html": "<main>x</main>", "sdk_version": 1, "capabilities": [], "collections": CARDS},
+    )
+
+    with pytest.raises(InvalidInput, match="edits need base_revision_id"):
+        service.create_revision(app["id"], {"edits": [{"old": "x", "new": "y"}]})
+    with pytest.raises(NotFound):
+        service.create_revision(
+            app["id"], {"base_revision_id": "0" * 32, "edits": [{"old": "x", "new": "y"}]}
+        )
+    with pytest.raises(InvalidInput, match="not both"):
+        service.create_revision(
+            app["id"],
+            {"base_revision_id": base["id"], "html": "<p>", "edits": [{"old": "x", "new": "y"}]},
+        )
+    with pytest.raises(InvalidInput, match="at most 1 MiB"):
+        service.create_revision(
+            app["id"],
+            {
+                "base_revision_id": base["id"],
+                "edits": [{"old": "x", "new": "y" * (service_module.MAX_HTML_BYTES + 1)}],
+            },
+        )

@@ -166,9 +166,27 @@ SysThingyRevisionGetTool = _thingy_tool(
 SysThingyRevisionCreateTool = _thingy_tool(
     "sys_thingy_revision_create",
     "Upload an immutable revision of a thingy: one self-contained HTML page using the thingy "
-    "SDK, with its collections (JSON Schemas), rules, actions and a guide for agents." + _SKILL,
+    "SDK, with its collections (JSON Schemas), rules, actions and a guide for agents. To change "
+    "a revision, give base_revision_id and edits instead of html; the rest is carried over."
+    + _SKILL,
     {
         "thingy_id": _ID,
+        "base_revision_id": _STRING,
+        "edits": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "old": _STRING,
+                    "start": _STRING,
+                    "end": _STRING,
+                    "new": _STRING,
+                },
+                "required": ["new"],
+            },
+            "description": "Exact replacements, in order: old (must appear once) with new, or "
+            "the text between the start and end markers (each once) with new.",
+        },
         "html": _STRING,
         "sdk_version": {"type": "integer", "enum": [1]},
         "capabilities": {
@@ -180,7 +198,7 @@ SysThingyRevisionCreateTool = _thingy_tool(
         "constraints": {"type": "array", "items": {"type": "object"}},
         "actions": {"type": "array", "items": {"type": "object"}},
     },
-    ["thingy_id", "html", "sdk_version", "capabilities", "collections"],
+    ["thingy_id"],
 )
 SysThingyPublishTool = _thingy_tool(
     "sys_thingy_publish",

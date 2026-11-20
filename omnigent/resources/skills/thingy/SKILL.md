@@ -85,7 +85,15 @@ Do not edit or delete records unless the person asks or an action says so.
    `sys_thingy_revision_get` and change it.
 2. Upload a revision with `sys_thingy_revision_create`: `html`, `sdk_version`
    `1`, `capabilities`, `collections`, and optionally `guide`, `constraints`
-   and `actions`.
+   and `actions`. To change part of an existing revision, send
+   `base_revision_id` and `edits` instead of `html`; every field you leave out
+   is carried over from the base. An edit is `{old, new}`, where `old` must
+   appear exactly once (add surrounding text until it does), or
+   `{start, end, new}`, which replaces the text between two markers that each
+   appear once and keeps the markers. Edits apply in order; a failed one names
+   itself (`details.edit`, `details.reason`) and nothing is created. Prefer
+   edits for a large page: they are smaller and cannot change the rest by
+   accident.
 3. Publish it with `sys_thingy_publish`, passing the thingy's current `version`
    from `sys_thingy_get` as `if_version` (`null` for its first publication). A
    stale version fails with `CONFLICT`. Publishing keeps the records.

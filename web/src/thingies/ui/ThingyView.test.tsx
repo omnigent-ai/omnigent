@@ -63,12 +63,17 @@ describe("a thingy beside a session", () => {
     await waitFor(() => expect(frameProps?.onAddComment).toBeDefined());
   });
 
-  it("offers the newer version once one is published", async () => {
+  it("loads the newer version as soon as the page learns one is published", async () => {
     const onReload = renderView();
     await screen.findByTestId("thingy-frame");
     act(() => frameProps?.onRevisionChanged());
+    expect(onReload).toHaveBeenCalledTimes(1);
+    expect(
+      screen.getByText(/A newer version of this thingy was published\. Loading it…/),
+    ).toBeVisible();
+    // The button stays for a reload that did not bring the new version.
     fireEvent.click(screen.getByRole("button", { name: "Load new version" }));
-    expect(onReload).toHaveBeenCalled();
+    expect(onReload).toHaveBeenCalledTimes(2);
   });
 
   it("opens the comments beside it, starting from a selection", async () => {

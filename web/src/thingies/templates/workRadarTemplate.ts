@@ -441,6 +441,17 @@ const KIT_SCRIPT = `
   var reported = {};
 
   function message(error) { return error && error.message ? error.message : String(error); }
+  // Text an agent wrote, without its Markdown marks: quotes come from session messages.
+  function plain(value) {
+    return String(value || '')
+      .replace(/\\[([^\\]]*)\\]\\([^)]*\\)/g, '$1')
+      .replace(/(\\*\\*|__|\\*|_|\`)(\\S(?:.*?\\S)?)\\1/g, '$2')
+      .replace(/^\\s{0,3}(?:#{1,6}\\s+|>\\s?|[-*+]\\s+)/gm, '')
+      .replace(/\\s+/g, ' ')
+      .trim();
+  }
+  // A sentence to go before more text: without its closing period.
+  function clause(value) { return String(value || '').replace(/[\\s.]+$/, ''); }
 
   // A design that throws while it loads or draws is replaced by the plain view, its styles are
   // switched off, and the page reports it in render_reports for the thingy session.
@@ -707,6 +718,8 @@ const KIT_SCRIPT = `
     if (!canAct) return;
     var pending = { at: Date.now(), text: 'Sending to your thingy session…' };
     pendingSteps[step.id] = pending;
+    // Running it again starts a new finish to show.
+    delete freshDone[step.id];
     schedule();
     client.agent.request('do_next_step', { next_step: step.id, label: step.label, area: area.id }).then(function (receipt) {
       if (pendingSteps[step.id] !== pending) return;
@@ -753,6 +766,12 @@ const KIT_SCRIPT = `
     if (isOpen(action)) {
       if (action.status === 'pending') return { run: 'sending', text: STEP_TEXT.pending, retry: true };
       return { run: 'running', text: STEP_TEXT[action.status], spin: action.status !== 'needs_input', session: action.sessionId };
+    }
+    // A step this page saw finish stays finished, even while its step_runs record still says
+    // running and the ledger no longer lists its action.
+    var finish = freshDone[step.id];
+    if (finish && !(record && (record.state === 'done' || record.state === 'failed'))) {
+      return { run: finish.state, text: finish.state === 'done' ? 'Done' : 'Did not work', session: action ? action.sessionId : record && record.session_id, again: true };
     }
     if (record && record.state === 'running' && !action) return { run: 'running', text: 'Working on it…', spin: true, session: record.session_id };
     if (record && (record.state === 'done' || record.state === 'failed')) {
@@ -883,7 +902,7 @@ const KIT_SCRIPT = `
     if (cited) {
       why.push('From ');
       why.push(el('button', { type: 'button', class: 'cite', text: sessionTitle(cited), on: { click: function () { openSession(cited); } } }));
-      if (step.evidence && step.evidence.quote) why.push(el('span', { class: 'quote', text: ': “' + step.evidence.quote + '”' }));
+      if (step.evidence && step.evidence.quote) why.push(el('span', { class: 'quote', text: ': “' + plain(step.evidence.quote) + '”' }));
     }
     var children = [main];
     if (why.length) children.push(el('div', { class: 'step-why' }, why));
@@ -921,7 +940,7 @@ const KIT_SCRIPT = `
   }
 
   var kit = {
-    el: el, svg: svg, keyed: keyed, ago: ago, hash: hash, wrap: wrap,
+    el: el, svg: svg, keyed: keyed, ago: ago, hash: hash, wrap: wrap, plain: plain,
     stateColor: stateColor, stateSoft: stateSoft, stateLabel: stateLabel, stateOrder: STATE_ORDER,
     openSteps: openSteps, ordered: ordered, stepState: stepState, requestStep: requestStep,
     stepButton: stepButton, stepCard: stepCard, sessionCard: sessionCard, sessionTitle: sessionTitle,
@@ -1035,17 +1054,25 @@ const KIT_SCRIPT = `
     var open = Boolean(pendingScan && !pendingScan.starting) || (isOpen(action) && action.status !== 'pending');
     var undelivered = Boolean(pendingScan && pendingScan.starting) || (!pendingScan && action && action.status === 'pending');
     var working = open && Boolean(action && action.status === 'running');
-    if (open && !scanOpenSince) scanOpenSince = pendingScan ? pendingScan.at : Date.now();
+    // Count from the request in the ledger, so a page reloaded mid-scan (as after the first
+    // design publishes) keeps counting instead of starting again.
+    var requested = action && action.requestedAt ? Date.parse(action.requestedAt) : NaN;
+    if (open && !isNaN(requested)) scanOpenSince = Math.min(requested, Date.now());
+    else if (open && !scanOpenSince) scanOpenSince = pendingScan ? pendingScan.at : Date.now();
     if (!open) scanOpenSince = 0;
+    // Records this scan already wrote: the radar is newer than the request.
+    var written = working && value && !value.example && !isNaN(requested) && Date.parse(value.scanned_at) >= requested;
     [$('scan'), $('scan-empty')].forEach(function (button) {
       button.disabled = !canAct || (open && !undelivered);
       button.textContent = open ? 'Scanning…' : undelivered ? 'Start my thingy session' : button.id === 'scan' ? 'Rescan' : 'Scan my recent work';
     });
-    // The first scan also designs the page: until a layout exists, a running scan is designing.
-    var designing = working && value && !value.example && !layoutValue();
+    // The first scan also designs the page: once its records are written and until a layout
+    // exists, a running scan is designing.
+    var designing = working && value && !value.example && !layoutValue() && (isNaN(requested) || written);
     var why = action && action.summary && (action.status === 'failed' || action.status === 'cancelled') ? ': ' + action.summary : '';
     var textValue = pendingScan ? pendingScan.text : action && SCAN_TEXT[action.status] ? SCAN_TEXT[action.status] + why : '';
     if (designing) textValue = 'Designing a page for your work. This is the plain view until it is ready.';
+    else if (written) textValue = 'Map updated. Finishing the scan…';
     if (open && value) box.appendChild(el('span', { class: 'spinner', 'aria-hidden': 'true' }));
     if (textValue && value) box.appendChild(el('span', { text: textValue }));
     if (working && scanOpenSince && value) box.appendChild(el('span', { class: 'elapsed', text: elapsed(scanOpenSince) + (layoutValue() ? '' : ' · usually 1 to 3 minutes') }));
@@ -1075,7 +1102,7 @@ const KIT_SCRIPT = `
       parts.push(el('b', { text: 'This look could not be drawn, so this is the plain view.' }));
       parts.push(el('span', { text: viewFailure.text }));
     } else if (layout && client && layout.revision_id === client.context.revisionId) {
-      var changed = layout.change_note ? ' · ' + layout.change_note + (layout.changed_at ? ', ' + ago(layout.changed_at) : '') : '';
+      var changed = layout.change_note ? ' · ' + clause(layout.change_note) + (layout.changed_at ? ', ' + ago(layout.changed_at) : '') : '';
       parts.push(el('span', {}, ['Look: ', el('b', { text: layout.structure }), changed]));
     }
     if (restoring) {
@@ -1095,7 +1122,8 @@ const KIT_SCRIPT = `
     list.forEach(function (area) {
       openSteps(area).forEach(function (step, position) {
         var state = stepState(step);
-        if (state.run === 'done') return;
+        // One chip per step: a step that just finished shows only as its finished chip.
+        if (state.run === 'done' || isFresh(step.id)) return;
         picks.push({ area: area, step: step, score: STATE_ORDER[stateKey(area.state)] * 10 + (step.kind === 'act' ? 0 : 5) + position });
       });
     });
@@ -1196,7 +1224,9 @@ const KIT_SCRIPT = `
   }
   function onRadar(snapshot) {
     if (snapshot.status === 'loading') return;
-    if (snapshot.status === 'stale' && snapshot.error) notice('Could not load the radar: ' + message(snapshot.error), 'error');
+    // A newer revision means the session published a look; Omnigent loads it in a moment.
+    if (snapshot.status === 'stale' && snapshot.error && snapshot.error.code === 'REVISION_CHANGED') notice('Loading the new look…');
+    else if (snapshot.status === 'stale' && snapshot.error) notice('Could not load the radar: ' + message(snapshot.error), 'error');
     var current = (snapshot.items || []).filter(function (doc) { return doc.id === 'current'; })[0] || null;
     var key = stamp(current ? [current] : []);
     if (radarLoaded && key === seen.radar) return;
@@ -1435,7 +1465,8 @@ session link with its live status and journal outcome; openSession(id); openStep
 steps the viewer has not hidden; ordered(areas) puts related areas together, blocked first;
 stateColor(state), stateSoft(state), stateLabel(state); ref(path) for data-omnigent-ref, as in
 ref('areas/' + area.id); ago(iso); wrap(text, maxChars, maxLines) splits text into lines for
-SVG; calm is true when the viewer prefers reduced motion; canAct, canWrite.
+SVG; plain(text) drops Markdown marks; calm is true when the viewer prefers reduced motion;
+canAct, canWrite.
 
 Colors: var(name) with name one of text, muted, line, faint, surface, bg, accent, active,
 blocked, waiting, done, and the -soft form of the last four; the kit switches them for dark mode.
@@ -1493,14 +1524,14 @@ export const WORK_RADAR_GUIDE = [
   "",
   "The Scan button requests the `scan` action with `window_days`. A chat request to scan, or an automation's prompt, works the same way.",
   "",
-  "1. Read `layout` and, with `sys_thingy_get`, the published revision; read its `render_reports` record. If it says `failed`, restore the previous look first (Restoring).",
+  "1. Read the `layout` record, and the `render_reports` record whose ID is the published revision from `sys_thingy_get`. If it says `failed`, restore the previous look first (Restoring). Do not read the page's HTML on a scan unless you are about to change the page.",
   "2. List sessions with `sys_session_list` (visibility `mine`). Each row has `last_activity_at` in Unix seconds: keep the sessions active within `window_days` of now, at most 25, most recently active first. Rows are ordered by creation, so page on with `cursor` until rows were created before the window. Skip this thingy session, sessions you started for this thingy's next steps, and trivial ones.",
-  "3. For each kept session read only a little: its title and status, then its journal with `sys_journal_read` and its `conversation_id` when that tool is available, else `sys_session_get_history` limited to its last few items. Journal tools are optional; never ask a session to start a journal, and never read whole transcripts.",
+  "3. For each kept session read only a little: its title and status, then its journal with `sys_journal_read` and its `conversation_id` when that tool is available, else `sys_session_get_history` limited to its last few items. Journal tools are optional; never ask a session to start a journal, and never read whole transcripts. On a rescan, read again only the sessions active since the radar's `scanned_at` and keep what the radar already says about the others.",
   "4. Group by goal: several sessions about one rollout are one area; one session can feed several areas. Name each area by what the viewer is trying to get done.",
   "5. Write next steps only when the sessions point to something specific (a flag to ramp after a quiet bake, a metric to check after a change, a review someone waits for, a failed run to retry), citing the session and a short quote in `evidence`. Write none when nothing specific stands out.",
   "6. Leave out next steps in `dismissed`; drop steps whose `step_runs` say done unless the work needs a follow-up, which gets a new step.",
   "7. On a rescan keep the IDs of areas, items and next steps that are still the same thing, so the page moves them instead of redrawing, and mark finished work `done` rather than removing it at once.",
-  "8. Replace the radar record in one write.",
+  "8. Replace the radar record in one write; there is no need to read it back.",
   "9. With no `layout` record yet, design the first page now (Designing the page). Otherwise keep the page unless the work no longer fits it (Changing the page).",
   '10. Report the action `done` with a one-line summary ("4 areas, 6 next steps from 14 sessions").',
   "",
@@ -1512,14 +1543,32 @@ export const WORK_RADAR_GUIDE = [
   "",
   "- Draw from `model` only; never write data into the HTML, so a scan updates the page without a new revision.",
   "- Make it glanceable both in the docked side panel (about 400 px wide) and full screen. Use the kit's colors so light and dark both work, respect `kit.calm` (the kit also stops CSS animation for reduced motion), and use inline SVG and CSS only: the frame blocks the network, so no external fonts, images or scripts. Keep the HTML well under 1 MiB.",
+  "- Include at least one visual element that carries meaning: an SVG of the rollout's stages with where it stands, a graph of what blocks what, lanes by state, a timeline of fixes. Cards and text alone are the plain view's job.",
   "- Animate changes in place with `kit.keyed` and stable IDs, and scope your CSS to your own classes.",
-  "- Next up, Done recently, the scan status, Rescan, the look line and the guide are the kit's. Use `kit.stepButton` or `kit.stepCard` for next steps and `kit.sessionCard` for sessions, so their actions and progress keep working.",
+  "- Next up, Done recently, the scan status, Rescan, the look line and the guide are the kit's: do not draw them again, nor a list of every next step. Show where steps sit instead (a marker on a stage), with `kit.stepButton` or `kit.stepCard`, and use `kit.sessionCard` for sessions, so their actions and progress keep working. `kit.plain(text)` drops Markdown marks from text the sessions wrote.",
+  "",
+  "A small example of a stage track that moves its marker when the radar changes:",
+  "",
+  "```js",
+  "Radar.view({ name: 'Rollout stages', render: function (root, model, kit) {",
+  "  var stages = ['1%', '5%', '10%', '50%', '100%'];",
+  "  var at = 2; // where the rollout stands, read from its area",
+  "  var track = root.querySelector('svg.stages') || root.appendChild(kit.svg('svg', { class: 'stages', viewBox: '0 0 400 40', role: 'img' }));",
+  "  track.setAttribute('aria-label', 'Rollout at ' + stages[at]);",
+  "  // keyed keeps one element per key: the 'now' ring slides to its new stage on each change.",
+  "  kit.keyed(track, stages.concat(['now']), function (key) { return key; }, function (key) {",
+  "    if (key === 'now') return kit.svg('circle', { r: 10, cy: 20, cx: 20 + at * 90, fill: 'none', stroke: 'var(--accent)', 'stroke-width': 2 });",
+  "    var index = stages.indexOf(key);",
+  "    return kit.svg('circle', { r: 6, cy: 20, cx: 20 + index * 90, fill: index <= at ? 'var(--active)' : 'var(--line)' });",
+  "  });",
+  "} });",
+  "```",
   "",
   "To publish a design:",
   "",
-  "1. `sys_thingy_revision_get` the published revision.",
-  "2. Replace only the text from `<!-- radar:view:start -->` to `<!-- radar:view:end -->` with one `<style>` and one `<script>` calling `Radar.view({name, render})`. The comment just above that region documents `model` and `kit`. Keep everything else byte for byte.",
-  "3. `sys_thingy_revision_create` with the new HTML and the same capabilities, collections, guide, constraints and actions.",
+  "1. Write one `<style>` and one `<script>` calling `Radar.view({name, render})`. The comment just above the view region in the page documents `model` and `kit`; read it once with `sys_thingy_revision_get` before your first design.",
+  '2. `sys_thingy_revision_create` with `base_revision_id` the published revision and one edit, `{start: "<!-- radar:view:start -->", end: "<!-- radar:view:end -->", new: <your style and script>}`. Do not send `html`: the edit changes only the view region, and the rest (kit, capabilities, collections, guide, rules, actions) is carried over unchanged.',
+  "3. If it is refused, the error names the edit and why; fix that and send it again.",
   "4. `sys_thingy_publish` it with `if_version` from `sys_thingy_get`.",
   "5. Write the `layout` record: `structure`, `why`, `revision_id` (the new one), `previous_revision_id` (the one it replaced), `changed_at`, `change_note`, and `history` with the replaced look added.",
   "6. Check that it drew: read `render_reports` for the new revision ID a few times over about a minute. On `failed`, restore at once (Restoring) and fix the design before you try again. No report means nobody has the page open; the next scan checks.",

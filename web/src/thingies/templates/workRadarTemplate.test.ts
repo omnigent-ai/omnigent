@@ -189,10 +189,13 @@ function startRadar({
     }
   }
   const emit = (name: string, items: Doc[]) => listeners[name]?.({ status: "live", items });
+  const emitSnapshot = (name: string, snapshot: { status: string; items: unknown[] }) =>
+    listeners[name]?.(snapshot);
   const emitActions = (items: unknown[]) => actionListener?.({ status: "live", items });
   const reports = () => writes.filter((write) => write.collection === "render_reports");
   return {
     emit,
+    emitSnapshot,
     emitActions,
     writes,
     reports,
@@ -367,6 +370,101 @@ describe("work radar template", () => {
     const row = byId("done-list").querySelector("li") as HTMLElement;
     expect(row.dataset.fresh).toBe("true");
     expect(row.textContent).toContain("Done just now: At 10%.");
+  });
+
+  it("shows one chip for a finished next step while its run record still says running", async () => {
+    const { emit, emitActions, ready } = startRadar();
+    await waitFor(() => expect(ready()).toBe(true));
+    emit("radar", [{ id: "current", version: "v1", value: RADAR }]);
+    const step = { next_step: "ramp-10", label: "Ramp the flag to 10%", area: "rollout" };
+    emit("step_runs", [
+      {
+        id: "ramp-10",
+        version: "v1",
+        value: { label: step.label, area: "rollout", state: "running" },
+      },
+    ]);
+    emitActions([{ id: "a1", action: "do_next_step", params: step, status: "running" }]);
+    await waitFor(() => expect(byId("next-list").textContent).toContain("Working on it"));
+
+    // The action ends, then drops out of the ledger page, before the run record is updated.
+    emitActions([{ id: "a1", action: "do_next_step", params: step, status: "done" }]);
+    emitActions([]);
+
+    await waitFor(() =>
+      expect(byId("next-list").querySelector(".next-chip.finished")).not.toBeNull(),
+    );
+    const chips = [...byId("next-list").children].filter((chip) =>
+      chip.textContent?.includes("Ramp the flag to 10%"),
+    );
+    expect(chips).toHaveLength(1);
+    expect(byId("next-list").textContent).not.toContain("Working on it");
+  });
+
+  it("keeps counting a scan from its request after the page reloads", async () => {
+    const { emit, emitActions, ready } = startRadar();
+    await waitFor(() => expect(ready()).toBe(true));
+    emit("radar", [{ id: "current", version: "v1", value: RADAR }]);
+    emit("layout", [{ id: "current", version: "v1", value: LAYOUT }]);
+    const requestedAt = new Date(Date.now() - 150_000).toISOString();
+    const scan = { id: "a1", action: "scan", params: { window_days: 3 }, requestedAt };
+    emitActions([{ ...scan, status: "running" }]);
+
+    await waitFor(() => expect(byId("run").textContent).toContain("Reading your recent sessions"));
+    expect(byId("run").textContent).toMatch(/2:3\d/);
+
+    // The scan wrote its records: the status says so instead of reading again.
+    const written = { ...RADAR, scanned_at: new Date().toISOString() };
+    emit("radar", [{ id: "current", version: "v2", value: written }]);
+    await waitFor(() =>
+      expect(byId("run").textContent).toContain("Map updated. Finishing the scan"),
+    );
+  });
+
+  it("shows text the sessions wrote without Markdown, and the look line's note as a clause", async () => {
+    const { emit, ready } = startRadar({ html: LANES_VIEW });
+    await waitFor(() => expect(ready()).toBe(true));
+    const quoted = {
+      ...RADAR.areas[0],
+      next_steps: [
+        {
+          ...RADAR.areas[0].next_steps[0],
+          evidence: { session_id: "s1", quote: "Choose **approve** or `request changes`" },
+        },
+      ],
+    };
+    emit("radar", [
+      { id: "current", version: "v1", value: { ...RADAR, areas: [quoted, RADAR.areas[1]] } },
+    ]);
+    emit("layout", [
+      { id: "current", version: "v1", value: { ...LAYOUT, change_note: "Grouped by goals." } },
+    ]);
+
+    await waitFor(() => expect(byId("look").textContent).toContain("Grouped by goals, "));
+    expect(byId("look").textContent).not.toContain("goals.,");
+    // The plain view's card shows the quote; the design here only lists step buttons.
+    const plainView = startRadar();
+    await waitFor(() => expect(plainView.ready()).toBe(true));
+    plainView.emit("radar", [
+      { id: "current", version: "v1", value: { ...RADAR, areas: [quoted, RADAR.areas[1]] } },
+    ]);
+    await waitFor(() =>
+      expect(byId("card-rollout").textContent).toContain("“Choose approve or request changes”"),
+    );
+  });
+
+  it("waits for a newly published look instead of showing an error", async () => {
+    const { emit, emitSnapshot, ready } = startRadar();
+    await waitFor(() => expect(ready()).toBe(true));
+    emit("radar", [{ id: "current", version: "v1", value: RADAR }]);
+    emitSnapshot("radar", {
+      status: "stale",
+      items: [{ id: "current", version: "v1", value: RADAR }],
+      error: { code: "REVISION_CHANGED", message: "A newer revision of this app was published." },
+    } as { status: string; items: unknown[] });
+
+    await waitFor(() => expect(byId("notice").textContent).toBe("Loading the new look…"));
+    expect(byId("notice").getAttribute("data-kind")).toBeNull();
   });
 
   it("leaves out next steps the viewer hid", async () => {
@@ -564,6 +662,13 @@ describe("work radar revision", () => {
       html.indexOf(WORK_RADAR_VIEW_START),
     );
     expect(html.indexOf(WORK_RADAR_VIEW_END)).toBeLessThan(html.indexOf("Radar.start()"));
+  });
+
+  it("tells the session to publish a design as one edit of the view region", () => {
+    expect(WORK_RADAR_GUIDE).toContain("`base_revision_id` the published revision and one edit");
+    expect(WORK_RADAR_GUIDE).toContain(`start: "${WORK_RADAR_VIEW_START}"`);
+    expect(WORK_RADAR_GUIDE).toContain("Do not send `html`");
+    expect(WORK_RADAR_GUIDE).toContain("at least one visual element that carries meaning");
   });
 
   it("fits the server's limits", () => {

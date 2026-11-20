@@ -348,6 +348,8 @@ export interface ThingyActionProgress {
   summary: string | null;
   sessionId: string | null;
   sessionIds: string[];
+  /** When it was requested (ISO 8601), or null from a server that does not say. */
+  requestedAt: string | null;
 }
 
 /** Queues an action in the thingy's ledger; `operationId` makes a retry return the same entry. */
@@ -402,6 +404,7 @@ function parseActionProgress(value: unknown): ThingyActionProgress {
     sessionIds: Array.isArray(value.session_ids)
       ? value.session_ids.filter((item): item is string => typeof item === "string")
       : [],
+    requestedAt: typeof value.requested_at === "string" ? value.requested_at : null,
   };
 }
 

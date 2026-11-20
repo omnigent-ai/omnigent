@@ -547,7 +547,7 @@ export const OMNIGENT_SDK_RUNTIME_SOURCE = `(function (config) {
   var ACTION_WATCH_USAGE = 'Call client.agent.watch(function (snapshot) { ... }, { actionIds: [receipt.actionId] }), ' +
     'or receipt.watch(function (snapshot) { ... }) on what agent.request resolves with; it returns { refresh, dispose }. ' +
     'Each snapshot is { status, items, action, updatedAt, error }: status is the watch state (loading, live, reconnecting or stale), ' +
-    'items holds one { id, status, reason, summary, sessionId } per action, and action is that item when one action is watched. ' +
+    'items holds one { id, status, reason, summary, sessionId, requestedAt } per action, and action is that item when one action is watched. ' +
     'An action status is pending, queued, running or needs_input while it runs, and done, failed, cancelled, finished_unreported or interrupted once it ended.';
 
   function actionIdOf(value) {

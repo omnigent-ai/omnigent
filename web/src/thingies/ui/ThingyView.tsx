@@ -50,7 +50,12 @@ function PublishedThingy({
     staleTime: Infinity,
   });
   const [revisionChanged, setRevisionChanged] = useState(false);
-  const onRevisionChanged = useCallback(() => setRevisionChanged(true), []);
+  // The page learned that a newer revision is published: load it now rather than at the next
+  // poll, so the page does not sit on errors about a revision that is gone.
+  const onRevisionChanged = useCallback(() => {
+    setRevisionChanged(true);
+    onReloadThingy();
+  }, [onReloadThingy]);
   useEffect(() => {
     if (content.data) onContentLoaded?.(content.data);
   }, [content.data, onContentLoaded]);
@@ -90,7 +95,7 @@ function PublishedThingy({
           className="flex shrink-0 items-center gap-2 border-b border-border bg-muted/40 px-3 py-2 text-ui"
         >
           <InfoIcon className="size-4 shrink-0 text-muted-foreground" />
-          <span className="flex-1">A newer version of this thingy was published.</span>
+          <span className="flex-1">A newer version of this thingy was published. Loading it…</span>
           <Button
             variant="outline"
             size="sm"

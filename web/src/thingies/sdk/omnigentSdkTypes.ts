@@ -220,6 +220,8 @@ export interface OmnigentActionProgress {
   sessionId: string | null;
   /** The sessions the status was derived from. */
   sessionIds: string[];
+  /** When it was requested (ISO 8601), or null when the host does not say. */
+  requestedAt: string | null;
 }
 
 /**

@@ -272,6 +272,71 @@ def _frontend_input(
     return html, sorted(set(capabilities)), collections, guide, constraints, actions
 
 
+# A revision derived from another carries these from it unless the request gives them.
+_REVISION_FIELDS = (
+    "sdk_version",
+    "capabilities",
+    "collections",
+    "guide",
+    "constraints",
+    "actions",
+)
+MAX_REVISION_EDITS = 32
+
+
+def _apply_edits(html: str, edits: Any) -> str:
+    """*html* with exact text *edits* applied in order.
+
+    An edit is ``{"old", "new"}``, whose ``old`` text must appear exactly once, or
+    ``{"start", "end", "new"}``, which replaces the text between two markers that each
+    appear exactly once, keeping the markers.
+    """
+    if not isinstance(edits, list) or not 1 <= len(edits) <= MAX_REVISION_EDITS:
+        raise InvalidInput(f"edits must be a list of 1 to {MAX_REVISION_EDITS} edits")
+    for number, edit in enumerate(edits, start=1):
+
+        def refuse(message: str, reason: str, number: int = number, **extra: Any) -> InvalidInput:
+            return InvalidInput(
+                f"Edit {number}: {message}", details={"edit": number, "reason": reason, **extra}
+            )
+
+        if not isinstance(edit, dict) or not isinstance(edit.get("new"), str):
+            raise refuse("needs new text, and old text or start and end markers", "invalid")
+        old, start, end = edit.get("old"), edit.get("start"), edit.get("end")
+        if isinstance(old, str) and old and start is None and end is None:
+            found = html.count(old)
+            if found != 1:
+                raise (
+                    refuse("its old text is not in the HTML", "not_found")
+                    if found == 0
+                    else refuse(
+                        f"its old text appears {found} times; add surrounding text so it "
+                        "appears once",
+                        "ambiguous",
+                        matches=found,
+                    )
+                )
+            html = html.replace(old, edit["new"], 1)
+            continue
+        if not (isinstance(start, str) and start and isinstance(end, str) and end) or old:
+            raise refuse("needs new text, and old text or start and end markers", "invalid")
+        for label, marker in (("start", start), ("end", end)):
+            found = html.count(marker)
+            if found != 1:
+                raise refuse(
+                    f"its {label} marker appears {found} times; it must appear once",
+                    "not_found" if found == 0 else "ambiguous",
+                    marker=label,
+                    matches=found,
+                )
+        begin = html.index(start) + len(start)
+        finish = html.index(end)
+        if finish < begin:
+            raise refuse("its end marker comes before its start marker", "invalid")
+        html = html[:begin] + edit["new"] + html[finish:]
+    return html
+
+
 def _epoch(timestamp: str) -> float:
     return datetime.fromisoformat(timestamp.replace("Z", "+00:00")).timestamp()
 
@@ -695,8 +760,26 @@ class ThingyService:
     # -- revisions and publication ------------------------------------------------
 
     def create_revision(self, app_id: str, body: dict) -> dict:
+        """Upload a revision: a full one, or one derived from ``base_revision_id``.
+
+        A derived revision takes the base's HTML with ``edits`` applied (or the given
+        ``html``) and the base's other fields unless the request gives them, so a small
+        change to a large page need not send the page again.
+        """
         thingy, permissions = self._resolve(app_id)
         self._require(permissions, "publish")
+        if body.get("base_revision_id") is not None:
+            base = self._frontend(thingy, body["base_revision_id"])
+            if "html" in body and "edits" in body:
+                raise InvalidInput("Give html or edits with base_revision_id, not both")
+            derived = {field: base[field] for field in _REVISION_FIELDS if field in base}
+            derived.update({field: body[field] for field in _REVISION_FIELDS if field in body})
+            derived["html"] = (
+                body["html"] if "html" in body else _apply_edits(base["html"], body.get("edits"))
+            )
+            body = derived
+        elif "edits" in body:
+            raise InvalidInput("edits need base_revision_id, the revision they change")
         html, capabilities, collections, guide, constraints, actions = _frontend_input(body)
         revision_id = uuid.uuid4().hex
         value: dict[str, Any] = {
@@ -1095,6 +1178,8 @@ class ThingyService:
                     "params": value.get("params"),
                     "summary": value.get("summary"),
                     "session_id": value.get("session_id"),
+                    # When it was requested, so a reloaded page keeps counting from there.
+                    "requested_at": document.created_at,
                     "version": document.version,
                 }
             )

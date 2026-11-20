@@ -382,3 +382,46 @@ async def test_invalid_arguments_never_reach_the_server() -> None:
         "sys_thingy_list", "{}", server_client=None, conversation_id=SESSION
     )
     assert "requires server access" in json.loads(no_server)["error"]
+
+
+@pytest.mark.asyncio
+async def test_an_agent_changes_one_region_of_a_page_without_sending_it_again(
+    server: httpx.AsyncClient,
+) -> None:
+    thingy_id = (await _call(server, "sys_thingy_create", name="Radar"))["id"]
+    page = "<main><!-- view:start -->plain<!-- view:end --><footer>kit</footer></main>"
+    base = await _call(
+        server,
+        "sys_thingy_revision_create",
+        thingy_id=thingy_id,
+        html=page,
+        sdk_version=1,
+        capabilities=["data.read"],
+        collections=_CARDS,
+        guide="# Radar",
+    )
+
+    derived = await _call(
+        server,
+        "sys_thingy_revision_create",
+        thingy_id=thingy_id,
+        base_revision_id=base["id"],
+        edits=[{"start": "<!-- view:start -->", "end": "<!-- view:end -->", "new": "<svg/>"}],
+    )
+    missed = await _call(
+        server,
+        "sys_thingy_revision_create",
+        thingy_id=thingy_id,
+        base_revision_id=base["id"],
+        edits=[{"old": "<aside>", "new": "x"}],
+    )
+
+    source = await _call(
+        server, "sys_thingy_revision_get", thingy_id=thingy_id, revision_id=derived["id"]
+    )
+    assert (
+        source["html"]
+        == "<main><!-- view:start --><svg/><!-- view:end --><footer>kit</footer></main>"
+    )
+    assert source["guide"] == "# Radar" and source["collections"] == _CARDS
+    assert missed["error"]["details"] == {"edit": 1, "reason": "not_found"}
