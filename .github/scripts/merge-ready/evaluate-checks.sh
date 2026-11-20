@@ -5,7 +5,7 @@
 # Template on an edited description), the highest check-run ID wins, including
 # queued retries without timestamps.
 # Each check counts as green when:
-#   - conclusion=success, OR
+#   - conclusion=success from a workflow created less than 24 hours ago, OR
 #   - conclusion=skipped AND name is in ALLOW_SKIP and isn't a result check, OR
 #   - the check is missing AND name is in ALLOW_SKIP AND its owning
 #     workflow either never ran for this SHA (path-ignored), or its
@@ -25,7 +25,9 @@
 # PR) from blocking the gate; trusting a *skipped* run keeps fork/draft
 # PRs — whose entire e2e workflow is gated off — from wedging it.
 #
-# Out:    failed=<markdown bullet list of failed names> on $GITHUB_OUTPUT
+# DCO never expires; reruns keep the original workflow created_at.
+# Out: failed, freshness_failed, api_failed, expires_at on $GITHUB_OUTPUT.
+# expires_at is the earliest successful CI deadline (UTC ISO8601).
 # A check can still read as running for a while after its workflow run
 # completes. When only such checks keep the gate red, re-read them a few
 # times first: nothing else re-evaluates the gate once CI is done.
@@ -42,15 +44,47 @@ source "$HERE/required.sh"
 
 LAG_ATTEMPTS=${MERGE_READY_LAG_ATTEMPTS:-6}
 LAG_DELAY_S=${MERGE_READY_LAG_DELAY_S:-20}
+MAX_AGE_SECONDS=$((24 * 60 * 60))
 
 # Check runs, plus per-workflow run state for this SHA (one row per run:
-# name<TAB>status<TAB>conclusion<TAB>created_at). The run state classifies
-# a *missing* required check via workflow_run_outcome below.
+# name<TAB>status<TAB>conclusion<TAB>created_at<TAB>suite_id<TAB>created_epoch).
+# The run state classifies a missing required check via workflow_run_outcome.
 fetch_state() {
   CHECKS=$(gh api "repos/$REPO/commits/$SHA/check-runs" --paginate \
-    --jq '.check_runs[] | "\(.name)\t\(.status)\t\(.conclusion // "null")\t\(.id)"')
+    --jq '.check_runs[] | [.name, .status, (.conclusion // "null"), .id, (.check_suite.id // "")] | @tsv') || return 1
   WORKFLOW_RUNS=$(gh api "repos/$REPO/actions/runs?head_sha=$SHA&per_page=100" --paginate \
-    --jq '.workflow_runs[] | [.name, .status, (.conclusion // "null"), (.created_at // "")] | @tsv')
+    --jq '.workflow_runs[] | .created_at as $created |
+      [.name, .status, (.conclusion // "null"), ($created // ""), (.check_suite_id // ""),
+       ((try ($created | fromdateiso8601 | select(todateiso8601 == $created)) catch null) // -1)] | @tsv') || return 1
+}
+
+# Match the selected check itself, rather than a newer unrelated run of its workflow.
+workflow_run_for_check() {
+  local suite_id="${1##*$'\t'}"
+  [[ "$suite_id" =~ ^[1-9][0-9]*$ ]] || return 0
+  printf '%s\n' "$WORKFLOW_RUNS" | awk -F'\t' -v suite_id="$suite_id" '$5 == suite_id'
+}
+
+require_fresh_workflow() {
+  local name="$1" row="$2" created_epoch deadline reason
+  created_epoch="${row##*$'\t'}"
+  if [[ ! "$created_epoch" =~ ^[0-9]+$ ]] || [[ "$created_epoch" -gt "$NOW" ]]; then
+    reason="CI age could not be verified; update the branch to run fresh CI"
+  elif [[ $((NOW - created_epoch)) -ge $MAX_AGE_SECONDS ]]; then
+    reason="CI is at least 24 hours old; update the branch to run fresh CI"
+  else
+    deadline=$((created_epoch + MAX_AGE_SECONDS))
+    if [[ -z "$EXPIRES_AT_EPOCH" || "$deadline" -lt "$EXPIRES_AT_EPOCH" ]]; then
+      EXPIRES_AT_EPOCH=$deadline
+    fi
+    return 0
+  fi
+  echo "NOT GREEN: $name  ($reason)"
+  FAILED_LINES+="- \`$name\` ($reason)"$'\n'
+  FAIL=1
+  ONLY_LAGGING=0
+  FRESHNESS_FAILED=true
+  return 1
 }
 
 # Classify the newest run of a workflow for this SHA:
@@ -76,14 +110,12 @@ newest_workflow_run() {
 }
 
 workflow_run_outcome() {
-  local wf="$1" row status concl
-  row=$(newest_workflow_run "$wf")
+  local row="$1" _workflow_name status concl _remainder
   if [[ -z "$row" ]]; then
     echo "none"
     return
   fi
-  status=$(printf '%s' "$row" | cut -f2)
-  concl=$(printf '%s' "$row" | cut -f3)
+  IFS=$'\t' read -r _workflow_name status concl _remainder <<<"$row"
   if [[ "$status" == "completed" && "$concl" == "success" ]]; then
     echo "success"
   elif [[ "$status" == "completed" && "$concl" == "skipped" ]]; then
@@ -105,6 +137,9 @@ evaluate_once() {
   FAIL=0
   FAILED_LINES=""
   ONLY_LAGGING=1
+  FRESHNESS_FAILED=false
+  EXPIRES_AT_EPOCH=""
+  NOW=$(date -u +%s)
   for n in "${REQUIRED[@]}"; do
     ROW=$(echo "$CHECKS" | awk -F'\t' -v n="$n" '$1 == n {print}' | sort -t $'\t' -k4,4n | tail -n 1)
     scope=$(scope_for_result "$n")
@@ -118,13 +153,17 @@ evaluate_once() {
       fi
       if is_allow_skip "$n"; then
         wf=$(workflow_for "$n")
-        outcome="none"
-        [[ -n "$wf" ]] && outcome=$(workflow_run_outcome "$wf")
+        workflow_row=""
+        [[ -n "$wf" ]] && workflow_row=$(newest_workflow_run "$wf")
+        outcome=$(workflow_run_outcome "$workflow_row")
         if [[ "$outcome" == "other" ]]; then
           echo "NOT GREEN: $n  (workflow '$wf' has not succeeded and the check is missing -- pending/cancelled, not a skip)"
           FAILED_LINES+="- \`$n\` (workflow ran but has not succeeded and the check is missing -- still pending or cancelled)"$'\n'
           FAIL=1
           ONLY_LAGGING=0
+          continue
+        fi
+        if [[ "$outcome" == "success" ]] && ! require_fresh_workflow "$n" "$workflow_row"; then
           continue
         fi
         # outcome is "none" (workflow path-skipped), "success" (job
@@ -158,15 +197,23 @@ evaluate_once() {
       FAILED_LINES+="- \`$n\` (conclusion=$CONCL)"$'\n'
       FAIL=1
       ONLY_LAGGING=0
-    else
+    elif [[ "$n" == "DCO" ]] || require_fresh_workflow "$n" "$(workflow_run_for_check "$ROW")"; then
       echo "OK      : $n"
     fi
   done
 }
 
+API_FAILED=false
 attempt=1
 while true; do
-  fetch_state
+  if ! fetch_state; then
+    FAIL=1
+    FRESHNESS_FAILED=true
+    API_FAILED=true
+    EXPIRES_AT_EPOCH=""
+    FAILED_LINES="- CI freshness could not be verified (GitHub API request failed; retry Merge Ready)."$'\n'
+    break
+  fi
   evaluate_once
   if [[ $FAIL -eq 0 || $ONLY_LAGGING -eq 0 || $attempt -ge $LAG_ATTEMPTS ]]; then
     break
@@ -178,6 +225,13 @@ while true; do
 done
 
 {
+  echo "freshness_failed=$FRESHNESS_FAILED"
+  echo "api_failed=$API_FAILED"
+  if [[ -n "$EXPIRES_AT_EPOCH" ]]; then
+    echo "expires_at=$(jq -nr --argjson deadline "$EXPIRES_AT_EPOCH" '$deadline | todateiso8601')"
+  else
+    echo "expires_at="
+  fi
   echo "failed<<_FAILED_EOF_"
   printf '%s' "$FAILED_LINES"
   echo "_FAILED_EOF_"

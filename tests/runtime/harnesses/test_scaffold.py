@@ -30,7 +30,7 @@ import json
 import os
 import shutil
 import uuid
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncGenerator, AsyncIterator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -44,7 +44,11 @@ from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses._scaffold import HarnessApp, TurnContext
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
-from omnigent.server.schemas import CreateResponseRequest
+from omnigent.server.schemas import (
+    CreateResponseRequest,
+    ElicitationRequestParams,
+    ElicitationResult,
+)
 
 _TEST_HARNESS_NAME = "scaffold_fixture"
 _TEST_HARNESS_MODULE = "tests.runtime.harnesses._test_scaffold_harnesses"
@@ -145,6 +149,28 @@ async def test_stale_continuation_without_model_is_rejected() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("initial_frames", [1, 2])
+async def test_disconnect_during_initial_envelope_releases_turn(initial_frames: int) -> None:
+    class App(HarnessApp):
+        async def run_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
+            pass
+
+    app = App()
+    request = CreateResponseRequest(model="test-agent", input="hello")
+    response = await app._start_or_inject_turn(request)
+    assert isinstance(response.body_iterator, AsyncGenerator)
+    async with contextlib.aclosing(response.body_iterator) as stream:
+        for _ in range(initial_frames):
+            await anext(stream)
+
+    followup = await app._start_or_inject_turn(request)
+    assert followup.status_code == 200
+    frames = [frame async for frame in followup.body_iterator]
+    assert b"event: response.completed" in frames[-1]
+    assert not app._in_flight
+
+
+@pytest.mark.asyncio
 async def test_turn_end_freezes_gc_once_only_when_armed(monkeypatch: pytest.MonkeyPatch) -> None:
     """After its first completed turn's stream ends, the subprocess collects then freezes, once."""
     from omnigent.runtime.harnesses import _scaffold
@@ -200,6 +226,11 @@ async def test_build_terminal_event_waits_for_run_task_failure() -> None:
         raise RuntimeError("terminal boom")
 
     ctx = TurnContext("resp_late_failure", asyncio.Queue(), asyncio.Event())
+    from omnigent.inner.executor import NativeTurnAcceptance
+
+    ctx.native_acceptance = NativeTurnAcceptance(
+        "conv_native", "thread_native", "codex_turn_native"
+    )
     task = asyncio.create_task(_late_failure())
 
     terminal = await HarnessApp()._build_terminal_event(
@@ -214,6 +245,7 @@ async def test_build_terminal_event_waits_for_run_task_failure() -> None:
     assert terminal.response.status == "failed"
     assert terminal.response.error is not None
     assert terminal.response.error.message == "terminal boom"
+    assert "native_acceptance" not in terminal.model_dump()
 
 
 @pytest.mark.asyncio
@@ -233,6 +265,11 @@ async def test_build_terminal_event_handles_pending_task_cancellation() -> None:
         await asyncio.sleep(60)
 
     ctx = TurnContext("resp_cancel_race", asyncio.Queue(), asyncio.Event())
+    from omnigent.inner.executor import NativeTurnAcceptance
+
+    ctx.native_acceptance = NativeTurnAcceptance(
+        "conv_native", "thread_native", "codex_turn_native"
+    )
     task = asyncio.create_task(_wait_forever())
     await task_started.wait()
     ctx.cancelled.set()
@@ -248,6 +285,34 @@ async def test_build_terminal_event_handles_pending_task_cancellation() -> None:
     assert terminal.type == "response.cancelled"
     assert terminal.sequence_number == 3
     assert terminal.response.status == "cancelled"
+    assert "native_acceptance" not in terminal.model_dump()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_elicit_emits_resolved_on_every_exit(cancel: bool) -> None:
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    ctx = TurnContext("resp_elicit", queue, asyncio.Event())
+    task = asyncio.create_task(
+        ctx.elicit("elicit_test", ElicitationRequestParams(mode="form", message="approve?"))
+    )
+    request = await queue.get()
+    assert request.type == "response.elicitation_request"
+    assert request.elicitation_id == "elicit_test"
+    if cancel:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        ctx._pending_elicitations["elicit_test"].set_result(ElicitationResult(action="accept"))
+        assert (await task).action == "accept"
+    resolved = await queue.get()
+    assert resolved.type == "response.elicitation_resolved"
+    assert resolved.elicitation_id == "elicit_test"
+    assert resolved.action == (None if cancel else "accept")
+    assert resolved.reason == ("unanswered" if cancel else None)
+    assert ctx._pending_elicitations == {}
+    assert queue.empty()
 
 
 @pytest.mark.asyncio

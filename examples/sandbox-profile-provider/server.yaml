@@ -1,0 +1,7 @@
+admins: [alice]
+sandbox:
+  provider: profile_demo
+  server_url: http://127.0.0.1:18767
+  profile_demo:
+    catalog_file: catalog.json
+    namespace: omnigent-demo

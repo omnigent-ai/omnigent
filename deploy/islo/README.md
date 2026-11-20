@@ -219,7 +219,7 @@ curl -X POST https://your-host/v1/sessions \
 ```
 
 Each managed sandbox authenticates back with a server-minted, per-launch
-token (7-day TTL — see [Lifecycle](#lifecycle-notes)); no user
+token (default 7-day validity window — see [Lifecycle](#lifecycle-notes)); no user
 credentials enter the sandbox for the server connection.
 
 Managed Islo sandboxes pause after 15 idle minutes by default. When a new
@@ -472,10 +472,10 @@ guide](../modal/README.md#git-credentials-private-repositories).
   Cross-user isolation rides on Islo's sandbox boundaries, and the shared
   org key can enumerate and delete any sandbox — the same single-tenant-org
   shape as the Modal and Daytona providers. Scope the org to this workload.
-- **The launch token's lifetime is 7 days.** Islo sandboxes have no
-  platform lifetime cap, so the per-launch host token must outlive a
-  long-running sandbox across reconnects (a longer replay window than
-  Modal's ~24 h; same as Daytona). A relaunch mints a fresh one.
+- **The host token's default validity window is 7 days.** Admins can override
+  it with [`sandbox.token_ttl_s`](../README.md#run-hosts-in-cloud-sandboxes).
+  Connected hosts renew the same token halfway through its window, extending
+  the validity of any leaked copy too. A relaunch mints a fresh token.
 
 ## Lifecycle notes
 

@@ -117,10 +117,57 @@ async def test_create_with_harness_override_persists_and_snapshot_reflects(
         "GET snapshot lost the harness override — the column did not "
         "persist or _resolve_harness stopped preferring it."
     )
+    listed = (await client.get("/v1/sessions")).json()["data"]
+    assert next(item for item in listed if item["id"] == body["id"])["harness"] == override
+
+
+@pytest.mark.parametrize(
+    "named,override,permission_mode",
+    [
+        (False, "codex-native", None),
+        (False, "claude-native", None),
+        (False, "claude-native", "plan"),
+        (True, "codex-native", None),
+        (True, "claude-native", None),
+    ],
+)
+async def test_spec_permission_args_require_matching_effective_harness(
+    client: httpx.AsyncClient, named: bool, override: str, permission_mode: str | None
+) -> None:
+    executor = {"config": {"harness": "codex-native", "permission_mode": "approve-for-me"}}
+    agent = await create_test_agent(
+        client,
+        executor=executor,
+        sub_agents=[{"name": "worker", "executor": executor}] if named else None,
+    )
+    body: dict[str, Any] = {"agent_id": agent["id"], "harness_override": override}
+    if named:
+        body.update(parent_session_id=agent["_session_id"], sub_agent_name="worker")
+    if permission_mode is not None:
+        body["permission_mode"] = permission_mode
+    created = await client.post("/v1/sessions", json=body)
+    assert created.status_code == 201, created.text
+    expected = None
+    if override == "codex-native":
+        expected = [
+            "--sandbox",
+            "workspace-write",
+            "--ask-for-approval",
+            "on-request",
+            "-c",
+            'approvals_reviewer="auto_review"',
+        ]
+    elif permission_mode is not None:
+        expected = ["--permission-mode", "plan"]
+    snapshot = await client.get(f"/v1/sessions/{created.json()['id']}")
+    assert snapshot.status_code == 200, snapshot.text
+    assert snapshot.json()["harness"] == override
+    assert snapshot.json()["terminal_launch_args"] == expected
 
 
 async def test_create_without_harness_override_reports_spec_default(
     client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """No override → the snapshot reports the spec's declared harness.
 
@@ -135,6 +182,33 @@ async def test_create_without_harness_override_reports_spec_default(
     assert resp.status_code == 201, resp.text
     # The test bundle declares claude-sdk (see build_agent_bundle).
     assert resp.json().get("harness") == "claude-sdk"
+    override = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "initial_items": [], "harness_override": "pi"},
+    )
+    assert override.status_code == 201, override.text
+    from omnigent.runtime.agent_cache import AgentCache
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+
+    def reject_single_agent_read(*args: object, **kwargs: object) -> None:
+        raise AssertionError("The session list must batch its agent metadata reads")
+
+    monkeypatch.setattr(SqlAlchemyAgentStore, "get", reject_single_agent_read)
+    listed = (await client.get("/v1/sessions")).json()["data"]
+    assert next(item for item in listed if item["id"] == resp.json()["id"])["harness"] == (
+        "claude-sdk"
+    )
+
+    def unavailable_bundle(*args: object, **kwargs: object) -> None:
+        raise httpx.ConnectError("Artifact service unavailable")
+
+    monkeypatch.setattr(AgentCache, "load", unavailable_bundle)
+    monkeypatch.setattr(AgentCache, "load_spec", unavailable_bundle)
+    response = await client.get("/v1/sessions")
+    assert response.status_code == 200
+    listed_by_id = {item["id"]: item for item in response.json()["data"]}
+    assert "harness" not in listed_by_id[resp.json()["id"]]
+    assert listed_by_id[override.json()["id"]]["harness"] == "pi"
 
 
 async def test_create_harness_override_alias_canonicalizes(

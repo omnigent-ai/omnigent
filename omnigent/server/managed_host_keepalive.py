@@ -1,12 +1,16 @@
 """Keep a managed sandbox warm while its agent is still running.
 
-The runner tunnel's ping loop already stamps ``runner_last_seen`` every
-``PING_INTERVAL_S`` for as long as a runner holds a live tunnel, and a live
-runner tunnel is the server's signal that an agent is still working on that
-sandbox: the runner exits itself once idle (``runner.idle_timeout_s``), so the
-signal disappears on its own when the session goes quiet.
+A runner reports on each tunnel pong whether it wants its sandbox kept warm
+(``PongFrame.keep_warm``, from
+:meth:`~omnigent.runner.busy_check.RunnerBusyCheck.keep_warm`: working, or
+within its idle timeout of the last work). A live tunnel alone is not enough,
+since viewing a session keeps a runner connected without any work. So while a
+runner's tunnel is up, :func:`touch` refreshes its sandbox only once the runner
+has answered a ping and its latest report does not say ``False``. A runner
+whose pongs carry no report (an older build) is refreshed for as long as its
+tunnel is up, as before.
 
-This module turns that existing signal into a provider
+This module turns that signal into a provider
 :meth:`~omnigent.onboarding.sandboxes.base.SandboxHostLauncher.keep_alive` call,
 so a sandbox whose platform reaps on inactivity, or one that expects the
 operator to push an absolute deadline forward, stays up while work is happening
@@ -26,11 +30,13 @@ window) while other providers stay on the cheap default.
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from omnigent.onboarding.sandboxes.base import (
@@ -76,6 +82,109 @@ _inflight: set[str] = set()
 _inflight_lock = threading.Lock()
 
 
+@dataclass
+class KeepWarmReport:
+    """The latest keep-warm report on one runner tunnel connection.
+
+    Owned by that connection's keepalive loop (see :func:`open_report`), and
+    only read and written on the event loop.
+    """
+
+    #: Whether the runner has answered a ping on this connection yet.
+    received: bool = False
+    #: The latest pong's ``keep_warm``; ``None`` when the runner does not report.
+    keep_warm: bool | None = None
+    #: Set when a pong makes a refresh due, so the loop need not wait a tick.
+    wake: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+# runner_id -> the report of its current tunnel connection.
+# custom-lint: disable-next=workspace-scoped-cache -- keyed by runner_id
+_reports: dict[str, KeepWarmReport] = {}
+
+
+def is_enabled() -> bool:
+    """Whether managed sandboxes are configured, so the keepalive is active."""
+    return _sandbox_config is not None and _host_store is not None
+
+
+def open_report(runner_id: str) -> KeepWarmReport:
+    """Start tracking keep-warm reports for a new tunnel connection of *runner_id*.
+
+    A reconnect replaces the previous connection's report, so nothing carries
+    over: the new connection waits for its own first pong.
+
+    :param runner_id: Runner whose tunnel just connected.
+    :returns: The connection's report, for its keepalive loop.
+    """
+    report = KeepWarmReport()
+    _reports[runner_id] = report
+    return report
+
+
+def close_report(runner_id: str, report: KeepWarmReport) -> None:
+    """Stop tracking *report* when its tunnel connection ends.
+
+    Leaves a newer connection's report for the same runner alone.
+
+    :param runner_id: Runner whose tunnel connection ended.
+    :param report: The report that connection opened.
+    """
+    if _reports.get(runner_id) is report:
+        del _reports[runner_id]
+
+
+def record_pong(runner_id: str, keep_warm: bool | None) -> None:
+    """Record *runner_id*'s keep-warm report from one of its tunnel pongs.
+
+    Wakes the connection's keepalive loop when the pong makes a refresh due:
+    the first pong, or one that turns a ``False`` report into a refresh. The
+    platform's idle timer has been running since the last refresh, so resumed
+    work must not wait for the next tick.
+
+    :param runner_id: Runner that sent the pong.
+    :param keep_warm: The pong's ``keep_warm``; ``None`` when not reported.
+    """
+    report = _reports.get(runner_id)
+    if report is None:
+        return
+    due = not report.received or (report.keep_warm is False and keep_warm is not False)
+    report.received = True
+    report.keep_warm = keep_warm
+    if due:
+        report.wake.set()
+
+
+def record_work_dispatched(runner_id: str) -> None:
+    """Treat a session event the server just sent to *runner_id* as a keep-warm report.
+
+    A user message or approval can start work at once, but the runner's next
+    pong may be up to a ping interval away, past the sandbox's deadline if its
+    last report was ``False``. So the connection counts as keep-warm until that
+    pong reports the truth, and its loop is woken to refresh now.
+
+    :param runner_id: Runner the server forwarded a session event to.
+    """
+    report = _reports.get(runner_id)
+    if report is None or (report.received and report.keep_warm is not False):
+        return  # not tracked, or already refreshing
+    report.received = True
+    report.keep_warm = True
+    report.wake.set()
+
+
+def _wants_refresh(runner_id: str) -> bool:
+    """Whether *runner_id*'s tunnel reports allow a refresh now.
+
+    A runner without a tracked connection (a caller outside the tunnel loop)
+    keeps the plain throttled behaviour.
+    """
+    report = _reports.get(runner_id)
+    if report is None:
+        return True
+    return report.received and report.keep_warm is not False
+
+
 def configure(
     conversation_store: ConversationStore,
     host_store: HostStore | None,
@@ -118,7 +227,7 @@ def keepalive_interval_s(runner_id: str) -> float:
     return _interval_for(runner_id)
 
 
-def touch(runner_id: str) -> None:
+def touch(runner_id: str) -> bool:
     """Keep the sandbox behind *runner_id* warm, at most every :func:`keepalive_interval_s`.
 
     Non-blocking and fail-safe: the provider call runs on a worker thread so a
@@ -136,26 +245,33 @@ def touch(runner_id: str) -> None:
     guard, and same reason, as :func:`omnigent.server.session_live_state._submit`
     on the other side of this ping loop.
 
+    Skipped while the runner's tunnel reports say not to (see
+    :func:`record_pong`).
+
     :param runner_id: Runner with a live tunnel, e.g. ``"runner_token_abc"``.
+    :returns: Whether a refresh was submitted.
     """
     if _sandbox_config is None or _host_store is None or _executor is None:
-        return
+        return False
+    if not _wants_refresh(runner_id):
+        return False
     now = time.monotonic()
     last = _last_kept.get(runner_id)
     if last is not None and now - last < _interval_for(runner_id):
-        return
+        return False
     with _inflight_lock:
         if runner_id in _inflight:
             # Previous attempt for this runner has not finished; skip rather than
             # queue a duplicate. Deliberately leaves _last_kept untouched so the
             # next tick retries as soon as the in-flight one clears.
-            return
+            return False
         _inflight.add(runner_id)
     _last_kept[runner_id] = now
     if len(_last_kept) > _THROTTLE_MAX_ENTRIES:
         _prune_throttle(now)
     ctx = contextvars.copy_context()
     _executor.submit(ctx.run, _keep_alive_for_runner, runner_id)
+    return True
 
 
 def _prune_throttle(now: float) -> None:

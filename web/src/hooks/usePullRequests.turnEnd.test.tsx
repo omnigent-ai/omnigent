@@ -1,11 +1,8 @@
-// The GitHub info query refetches on the focused session's turn end
-// (active → idle), so a PR the agent opened during the turn appears in the
-// status-line indicator without opening the tab. This is the harness-agnostic
-// replacement for the old per-tool git/gh signal — mirrors the trailing-edge
-// invalidate proven in useWorkspaceChangedFiles.test.tsx.
+// Turn-end refresh discovers PRs without opening the panel; composer polling
+// then tracks their status until all linked PRs are terminal.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, waitFor } from "@testing-library/react";
+import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
@@ -18,7 +15,7 @@ vi.mock("@/store/chatStore", () => ({
 
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useChatStore } from "@/store/chatStore";
-import { usePullRequestInfo } from "./usePullRequests";
+import { usePullRequestInfo, usePullRequestInfos } from "./usePullRequests";
 
 const onlineMock = vi.mocked(useSessionRunnerOnline);
 const hostOnlineMock = vi.mocked(useSessionHostOnline);
@@ -38,17 +35,26 @@ function stubChatStore(conversationId: string | null, sessionStatus: StubStatus)
   });
 }
 
-function pullRequestInfoResponse(): Response {
+function pullRequestInfoResponse(info: Record<string, unknown> = {}): Response {
   return {
     ok: true,
     status: 200,
     statusText: "OK",
-    json: async () => ({ object: "session.github.info", available: true }),
+    json: async () => ({ object: "session.github.info", available: true, ...info }),
   } as unknown as Response;
 }
 
-function Probe({ id }: { id: string | undefined }) {
-  usePullRequestInfo(id);
+function Probe({
+  id,
+  batch = false,
+  poll,
+}: {
+  id: string | undefined;
+  batch?: boolean;
+  poll?: "linked";
+}) {
+  usePullRequestInfo(id, { poll });
+  usePullRequestInfos(id, batch ? ["https://github.com/org/repo/pull/1"] : []);
   return null;
 }
 
@@ -62,31 +68,42 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  vi.useRealTimers();
   vi.unstubAllGlobals();
   vi.resetAllMocks();
 });
 
 describe("usePullRequestInfo turn-end invalidate", () => {
-  it("refetches github info when the focused session goes running → idle", async () => {
-    stubChatStore("conv_live", "running");
-    const qc = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: 0 } } });
-    const { rerender } = render(
-      <QueryClientProvider client={qc}>
-        <Probe id="conv_live" />
-      </QueryClientProvider>,
-    );
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+  it.each([false, true])(
+    "refetches info when the focused session goes running → idle (batch=%s)",
+    async (batch) => {
+      stubChatStore("conv_live", "running");
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: 0 } } });
+      const { rerender } = render(
+        <QueryClientProvider client={qc}>
+          <Probe id="conv_live" batch={batch} />
+        </QueryClientProvider>,
+      );
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(batch ? 2 : 1));
 
-    // Turn ends: the trailing invalidate fires one more github-info fetch.
-    stubChatStore("conv_live", "idle");
-    rerender(
-      <QueryClientProvider client={qc}>
-        <Probe id="conv_live" />
-      </QueryClientProvider>,
-    );
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
-    expect(fetchMock.mock.calls[1][0]).toBe("/v1/sessions/conv_live/resources/github");
-  });
+      // Turn end refetches every github-info query for the session.
+      stubChatStore("conv_live", "idle");
+      rerender(
+        <QueryClientProvider client={qc}>
+          <Probe id="conv_live" batch={batch} />
+        </QueryClientProvider>,
+      );
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(batch ? 4 : 2));
+      expect(fetchMock.mock.calls[batch ? 2 : 1][0]).toBe(
+        "/v1/sessions/conv_live/resources/github",
+      );
+      if (batch) {
+        expect(fetchMock.mock.calls[3][0]).toBe(
+          "/v1/sessions/conv_live/resources/github?pr_url=https%3A%2F%2Fgithub.com%2Forg%2Frepo%2Fpull%2F1",
+        );
+      }
+    },
+  );
 
   it("does not refetch when status stays idle across renders", async () => {
     // Guard against a spurious refetch on every render — only the
@@ -109,4 +126,50 @@ describe("usePullRequestInfo turn-end invalidate", () => {
     await Promise.resolve();
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
+
+  it.each(["selected", "linked"])(
+    "discovers a %s PR at turn end and polls until linked PRs are terminal",
+    async (source) => {
+      vi.useFakeTimers();
+      stubChatStore("conv_live", "running");
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const tree = (
+        <QueryClientProvider client={client}>
+          <Probe id="conv_live" poll="linked" />
+        </QueryClientProvider>
+      );
+      const { rerender } = render(tree);
+      await act(() => vi.advanceTimersByTimeAsync(90_000));
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      const pr = { url: "https://github.com/org/repo/pull/1", state: "OPEN" };
+      fetchMock.mockResolvedValue(
+        pullRequestInfoResponse(source === "selected" ? { pr } : { prs: [pr] }),
+      );
+      stubChatStore("conv_live", "idle");
+      rerender(
+        <QueryClientProvider client={client}>
+          <Probe id="conv_live" poll="linked" />
+        </QueryClientProvider>,
+      );
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      await act(() => vi.advanceTimersByTimeAsync(30_000));
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+
+      fetchMock.mockResolvedValue(
+        pullRequestInfoResponse({
+          pr: null,
+          prs: [
+            { ...pr, state: "MERGED" },
+            { ...pr, url: `${pr.url}2`, state: "CLOSED" },
+          ],
+        }),
+      );
+      await act(() => vi.advanceTimersByTimeAsync(30_000));
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+      await act(() => vi.advanceTimersByTimeAsync(90_000));
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+    },
+  );
 });

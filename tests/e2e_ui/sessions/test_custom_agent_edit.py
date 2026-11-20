@@ -31,14 +31,6 @@ def test_custom_agent_edit_preserves_fields_and_recovers_conflict(
         }
     )
 
-    # Only enable the release-gated UI; all agent reads and writes use the real server.
-    def enable_editor(route: Route) -> None:
-        response = route.fetch()
-        info = response.json()
-        info["features"] = {**info.get("features", {}), "custom_agents_settings_ui": True}
-        route.fulfill(response=response, json=info)
-
-    page.route("**/v1/info", enable_editor)
     page.set_viewport_size({"width": 390 if mobile else 1280, "height": 844 if mobile else 900})
     with httpx.Client(base_url=live_server, timeout=20) as api:
         installed = api.post("/v1/agents", files={"bundle": ("agent.tar.gz", bundle)})

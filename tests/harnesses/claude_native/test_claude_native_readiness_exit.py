@@ -47,6 +47,31 @@ def test_dead_pane_is_checked_before_the_startup_budget(
     assert clock.now <= bridge._CLAUDE_LIVENESS_POLL_INTERVAL_S + 0.15
 
 
+@pytest.mark.parametrize("timeout_s", [30.0, 180.0])
+def test_vanished_pane_is_reported_as_exited_not_as_unready(
+    monkeypatch: pytest.MonkeyPatch, timeout_s: float
+) -> None:
+    """A pane tmux stops reporting ends the wait as an exit, not a readiness timeout.
+
+    The terminal is gone (its tmux server or target vanished, so no exit status
+    is known). Waiting out the startup budget and then saying the prompt never
+    rendered sends the person to debug a box that never existed; the exit is
+    what they need to hear, and a relaunch is the fix.
+    """
+    clock = _Clock()
+    monkeypatch.setattr(bridge, "time", clock)
+    monkeypatch.setattr(bridge, "_capture_pane", lambda *_: "")
+    monkeypatch.setattr(bridge, "_claude_pane_state", lambda *_: bridge._ClaudePaneState(False))
+
+    with pytest.raises(bridge.ClaudeTerminalExited) as raised:
+        bridge._wait_for_claude_prompt_ready("/tmp/test.sock", "main", timeout_s=timeout_s)
+
+    assert raised.value.exit_status is None
+    assert "is no longer running (exit status unknown)" in str(raised.value)
+    assert "did not become ready" not in str(raised.value)
+    assert clock.now <= bridge._CLAUDE_LIVENESS_POLL_INTERVAL_S + 0.15
+
+
 def test_dead_pane_at_deadline_retains_exit_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
     clock = _Clock()
     monkeypatch.setattr(bridge, "time", clock)

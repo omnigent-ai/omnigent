@@ -17,6 +17,8 @@ tests drive the real routes against file-backed SQLite stores with header auth.
 
 from __future__ import annotations
 
+import uuid
+
 import pytest
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -32,6 +34,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 from omnigent.stores.permission_store.sqlalchemy_store import (
     SqlAlchemyPermissionStore,
 )
+from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 
 ALICE = "alice@example.com"
 BOB = "bob@example.com"
@@ -145,20 +148,35 @@ def test_shared_session_still_visible_in_flat_list(db_uri: str) -> None:
         ({"visibility": "mine", "project": "Bob Project"}, {"owned_active"}),
         (
             {"visibility": "archived", "include_archived": "true"},
-            {"owned_archived", "shared_archived"},
+            {"owned_archived", "owned_archived_first_class", "shared_archived"},
         ),
         (
             {"visibility": "all", "include_archived": "true", "project": "Bob Project"},
-            {"owned_active", "owned_archived"},
+            {"owned_active", "owned_archived", "owned_archived_first_class"},
+        ),
+        (
+            {"visibility": "archived", "project": "Bob Project"},
+            {"owned_archived", "owned_archived_first_class"},
         ),
         ({"visibility": "all"}, {"owned_active", "shared_active"}),
+        ({"visibility": "mine"}, {"owned_active"}),
+        # Agents list their own archived workers through sys_session_list.
+        (
+            {"visibility": "mine", "include_archived": "true"},
+            {"owned_active", "owned_archived", "owned_archived_first_class"},
+        ),
+        (
+            {"visibility": "shared", "include_archived": "true"},
+            {"shared_active", "shared_archived"},
+        ),
     ],
 )
 def test_client_scopes_preserve_owned_projects_and_shared_archives(
     db_uri: str, params: dict[str, str], expected: set[str]
 ) -> None:
-    """Archive lists retain shared rows; project lists retain the ownership boundary."""
+    """Archive lists retain shared rows; ownership scopes hold with or without archives."""
     ids = {"shared_active": _seed_shared_project_session(db_uri)}
+    project = SqlAlchemyProjectStore(db_uri).create(uuid.uuid4().hex, "Bob Project", ALICE)
     conv_store = SqlAlchemyConversationStore(db_uri)
     perms = SqlAlchemyPermissionStore(db_uri)
     shared = conv_store.get_conversation(ids["shared_active"])
@@ -176,6 +194,13 @@ def test_client_scopes_preserve_owned_projects_and_shared_archives(
         if archived:
             conv_store.update_conversation(conv.id, archived=True)
         ids[name] = conv.id
+
+    first_class = conv_store.create_conversation(
+        title="owned_archived_first_class", agent_id=shared.agent_id, project_id=project.id
+    )
+    perms.grant(ALICE, first_class.id, LEVEL_OWNER)
+    conv_store.update_conversation(first_class.id, archived=True)
+    ids["owned_archived_first_class"] = first_class.id
 
     with TestClient(_multi_user_app(db_uri)) as client:
         response = client.get("/v1/sessions", params=params, headers={"X-Forwarded-Email": ALICE})
