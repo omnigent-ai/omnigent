@@ -252,6 +252,110 @@ def test_ci_tooling_tests_leave_the_catch_all_shard():
     assert "--ignore=tests/scripts" in groups["misc"]
 
 
+def _pytest_matrix() -> list[dict[str, Any]]:
+    return json.loads((CI / "python-matrix.json").read_text())
+
+
+def _matrix_tokens(paths: str) -> tuple[list[str], list[str]]:
+    roots: list[str] = []
+    ignored: list[str] = []
+    for token in paths.split():
+        if token.startswith("--ignore="):
+            ignored.append(token.removeprefix("--ignore="))
+        else:
+            assert not token.startswith("-"), token
+            roots.append(token)
+    return roots, ignored
+
+
+def _is_test_file(path: Path) -> bool:
+    return path.is_file() and (path.name.startswith("test_") or path.name.endswith("_test.py"))
+
+
+def _covers(root: str, rel: str) -> bool:
+    return rel == root or rel.startswith(root.rstrip("/") + "/")
+
+
+def _collected_matrix_files(paths: str) -> set[str]:
+    """Test files pytest collects from a matrix `paths` string."""
+    roots, ignored = _matrix_tokens(paths)
+    collected: set[str] = set()
+    for root in roots:
+        path = ROOT / root
+        assert path.exists(), root
+        candidates = [path] if path.is_file() else list(path.rglob("*.py"))
+        for candidate in candidates:
+            if not _is_test_file(candidate):
+                continue
+            rel = candidate.relative_to(ROOT).as_posix()
+            if any(_covers(item, rel) for item in ignored):
+                continue
+            collected.add(rel)
+    return collected
+
+
+def test_each_test_path_belongs_to_one_pytest_group(scope_module):
+    """Default shards partition test files; the databricks mark is a second pass."""
+    matrix = _pytest_matrix()
+    assert len({row["group"] for row in matrix}) == len(matrix)
+    rows = [row for row in matrix if row.get("markexpr") != "databricks"]
+    owner: dict[str, str] = {}
+    for row in rows:
+        for rel in _collected_matrix_files(row["paths"]):
+            assert rel not in owner, f"{rel} is in {owner[rel]} and {row['group']}"
+            owner[rel] = row["group"]
+
+    for directory in ("tests/server/integration", "tests/stores"):
+        files = {
+            path.relative_to(ROOT).as_posix()
+            for path in (ROOT / directory).rglob("*.py")
+            if _is_test_file(path)
+        }
+        missing = sorted(files - owner.keys())
+        assert not missing, f"{directory} files missing from the matrix: {missing}"
+        assert files == {rel for rel in owner if _covers(directory, rel)}
+
+    for row in rows:
+        _roots, ignored = _matrix_tokens(row["paths"])
+        for item in ignored:
+            if not (ROOT / item).is_file():
+                continue
+            assert owner.get(item) not in {None, row["group"]}, item
+
+    databricks = next(row for row in matrix if row.get("markexpr") == "databricks")
+    assert _collected_matrix_files(databricks["paths"]) <= owner.keys()
+
+    by_name = {row["group"]: row for row in matrix}
+    core = by_name["server-integration-core"]
+    integration = by_name["server-integration"]
+    assert core["workers"] == integration["workers"]
+    assert core["dist"] == integration["dist"]
+    assert "workers" not in by_name["stores"] and "workers" not in by_name["stores-core"]
+    assert by_name["stores-core"]["dist"] == by_name["stores"]["dist"]
+
+    selection = scope_module.select_scope(
+        [{"filename": "omnigent/stores/host_store.py", "status": "modified"}]
+    )
+    selected = {row["group"] for row in json.loads(selection["python_matrix"])["include"]}
+    assert {
+        "server-integration",
+        "server-integration-core",
+        "stores",
+        "stores-core",
+    } <= selected
+
+    workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+    assert (
+        workflow["jobs"]["pytest"]["strategy"]["matrix"]
+        == "${{ fromJSON(needs.scope.outputs.python_matrix) }}"
+    )
+    assert "pytest" in workflow["jobs"]["result"]["needs"]
+    required = (ROOT / ".github/scripts/merge-ready/required.sh").read_text()
+    for name in ("stores", "server-rest"):
+        assert f'"Pytest ({name})"' in required
+        assert name in by_name
+
+
 def test_gradle_wrapper_bundle_keeps_the_android_profile(scope_module):
     paths = [
         "web/android/gradlew",
