@@ -149,9 +149,7 @@ export function rankedSlashCommandNames(
   labels: Readonly<Record<string, string>> = {},
 ): string[] {
   const q = query.toLowerCase();
-  // Built-ins rank before skills; within each, the exact name, then name
-  // prefix, then name substring, then label-only matches, so Tab never
-  // prefers a label hit.
+  // Built-ins first; within each group: exact name, prefix, substring, label-only.
   const rank = (name: string): number => {
     const group = builtinNames.has(name) ? 0 : 4;
     const body = name.slice(1).toLowerCase();
