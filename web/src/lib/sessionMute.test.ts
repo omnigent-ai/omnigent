@@ -76,9 +76,12 @@ describe("session mute store", () => {
     const rechecked: string[] = [];
     const unsubscribe = onMuteRecheck((id) => rechecked.push(id));
     beginMuteSave("session", true);
-    // Data read during the save predates it, so disagreement there isn't news.
+    // A read started during the save predates it, whether it lands before or after.
     reconcileMuteLabel(row(false), muteReadMarker());
+    const duringSave = muteReadMarker();
+    vi.advanceTimersByTime(1);
     settleMuteSave("session", true);
+    expect(reconcileMuteLabel(row(false), duringSave).labels[MUTED_LABEL_KEY]).toBe("1");
     reconcileMuteLabel(row(true), muteReadMarker());
     vi.advanceTimersByTime(MUTE_REINDEX_GRACE_MS);
     expect(rechecked).toEqual([]);

@@ -296,14 +296,6 @@ function applyItemsToCache(
   return targets;
 }
 
-/**
- * Remove ids from every cached `["conversations", ...]` variant.
- *
- * @param queryClient - The app QueryClient.
- * @param ids - Conversation ids to evict.
- * @returns Query hashes of the lists that dropped a row, which refetch to fill
- *   the gap.
- */
 /** Query hashes of the caches holding a session's row: list pages, Pinned, and its fetched row. */
 function queriesHoldingSession(queryClient: QueryClient, id: string): Set<string> {
   const cache = queryClient.getQueryCache();
@@ -324,10 +316,18 @@ function queriesHoldingSession(queryClient: QueryClient, id: string): Set<string
     hashes.add(pinned.queryHash);
   }
   const backfill = cache.find({ queryKey: ["conversation-backfill", id], exact: true });
-  if (backfill) hashes.add(backfill.queryHash);
+  if (backfill?.state.data) hashes.add(backfill.queryHash);
   return hashes;
 }
 
+/**
+ * Remove ids from every cached `["conversations", ...]` variant.
+ *
+ * @param queryClient - The app QueryClient.
+ * @param ids - Conversation ids to evict.
+ * @returns Query hashes of the lists that dropped a row, which refetch to fill
+ *   the gap.
+ */
 function removeIdsFromCache(queryClient: QueryClient, ids: string[]): Set<string> {
   const idSet = new Set(ids);
   const removedFrom = new Set<string>();

@@ -19,8 +19,8 @@ interface MuteEntry {
   muted: boolean;
   /** A save is in flight; a newer save for this session must wait. */
   saving: boolean;
-  /** Reads started before this `performance.now()` may not reflect the latest save. */
-  trustedFrom: number;
+  /** `performance.now()` when the latest save settled (infinite while saving). */
+  settledAt: number;
 }
 
 interface LabeledRow {
@@ -63,7 +63,8 @@ function scheduleRecheck(id: string, at: number): void {
       recheckTimers.delete(id);
       for (const listener of recheckListeners) listener(id);
     },
-    Math.max(0, at - performance.now()),
+    // Rounded up: a truncated delay could fire just before the window ends.
+    Math.max(0, Math.ceil(at - performance.now())),
   );
   recheckTimers.set(id, timer);
 }
@@ -92,17 +93,13 @@ export function beginMuteSave(id: string, muted: boolean): boolean {
   if (entry?.saving) return false;
   // This save supersedes whatever another device changed before it.
   cancelRecheck(id);
-  entries.set(id, { muted, saving: true, trustedFrom: Number.POSITIVE_INFINITY });
+  entries.set(id, { muted, saving: true, settledAt: Number.POSITIVE_INFINITY });
   return true;
 }
 
 /** Record the saved (or, after a failure, restored) preference. */
 export function settleMuteSave(id: string, muted: boolean): void {
-  entries.set(id, {
-    muted,
-    saving: false,
-    trustedFrom: performance.now() + MUTE_REINDEX_GRACE_MS,
-  });
+  entries.set(id, { muted, saving: false, settledAt: performance.now() });
 }
 
 /** Whether any session has a recorded preference, so fetched rows need reconciling. */
@@ -114,8 +111,8 @@ export function hasMuteEntries(): boolean {
  * Reconcile a server row's mute label with the recorded preference. Data
  * requested {@link MUTE_REINDEX_GRACE_MS} or more after the latest save replaces
  * the entry; earlier data, or data arriving while a save is in flight, takes the
- * recorded value instead. A settled preference that overrides disagreeing data
- * is reported to {@link onMuteRecheck} listeners when its window ends.
+ * recorded value instead. Disagreeing data read after the save settled is
+ * reported to {@link onMuteRecheck} listeners when the window ends.
  *
  * @param readMarker - {@link muteReadMarker} captured when the read started.
  * @returns `row` itself when it already agrees, else a copy with the label fixed.
@@ -124,13 +121,14 @@ export function reconcileMuteLabel<T extends LabeledRow>(row: T, readMarker: num
   const entry = entries.get(row.id);
   // A partial row without labels has nothing to reconcile.
   if (entry === undefined || !row.labels) return row;
-  if (readMarker >= entry.trustedFrom) {
+  const trustedFrom = entry.settledAt + MUTE_REINDEX_GRACE_MS;
+  if (readMarker >= trustedFrom) {
     entry.muted = !!row.labels[MUTED_LABEL_KEY];
     return row;
   }
   if (!!row.labels[MUTED_LABEL_KEY] === entry.muted) return row;
-  // While saving, disagreeing data predates this write; afterwards it may be news.
-  if (!entry.saving) scheduleRecheck(row.id, entry.trustedFrom);
+  // Data read before the save settled predates it; only later reads may be news.
+  if (readMarker >= entry.settledAt) scheduleRecheck(row.id, trustedFrom);
   const labels = Object.fromEntries(
     Object.entries(row.labels).filter(([key]) => key !== MUTED_LABEL_KEY),
   );
