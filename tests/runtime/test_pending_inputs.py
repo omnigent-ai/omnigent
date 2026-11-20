@@ -514,13 +514,7 @@ def test_stale_entries_evicted_after_ttl(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_mid_turn_session_keeps_a_stale_entry_for_its_late_mirror(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    A message the TUI holds past the TTL during a long turn still drains itself.
-
-    Evicting it mid-turn left the late mirror nothing to match, so the persist
-    site's FIFO fallback drained the newer message's entry instead. Once the
-    turn is over, the TTL applies again.
-    """
+    """A message the TUI holds past the TTL mid-turn drains its own entry, not a newer one."""
     clock = {"t": 1000.0}
     monkeypatch.setattr(pending_inputs, "_now", lambda: clock["t"])
     busy_sessions = {"conv_a"}
