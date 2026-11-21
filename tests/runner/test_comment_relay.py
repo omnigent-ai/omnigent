@@ -2465,6 +2465,7 @@ async def test_cli_settings_request_ownership_survives_admission_and_terminal_li
             request.close()
             if mode == "declared-replacement":
                 assert instance.args == ["-l"]
+                assert instance.process_lifetime_leases == []
                 assert not baseline.exists()
                 assert caller_reads == []
             else:
@@ -2506,10 +2507,15 @@ async def test_cli_settings_request_ownership_survives_admission_and_terminal_li
             if mode != "declared-replacement":
                 assert baseline.read_bytes() == baseline_bytes
             await terminals.cleanup_conversation("moved")
-            assert instance.private_dir.exists()
-            assert instance._private_cleanup_thread is None
-            assert baseline.read_bytes() == baseline_bytes
-            assert prune_unused_claude_settings(bridge_dir) == 0
+            if mode == "declared-replacement":
+                assert instance.process_lifetime_leases == []
+                assert not instance.private_dir.exists()
+                assert not list(bridge_dir.glob(f"claude-settings-{request.generation}*"))
+            else:
+                assert instance.private_dir.exists()
+                assert instance._private_cleanup_thread is None
+                assert baseline.read_bytes() == baseline_bytes
+                assert prune_unused_claude_settings(bridge_dir) == 0
     finally:
         request.close()
         await terminals.shutdown()
