@@ -498,6 +498,8 @@ class PersistentTaskScheduler:
         self._recovery_cutoff: int | None = None
         self._pending_cursor: TaskCursor | None = None
         self._wake = asyncio.Event()
+        # The newest due-task scan's cutoff: later runs are ones that scan did not consider.
+        self._due_scan_cutoff: int | None = None
 
     @property
     def is_started(self) -> bool:
@@ -535,6 +537,7 @@ class PersistentTaskScheduler:
         self._recovery_cursor = None
         self._recovery_cutoff = None
         self._pending_cursor = None
+        self._due_scan_cutoff = None
 
     async def _run(self) -> None:
         while True:
@@ -559,8 +562,11 @@ class PersistentTaskScheduler:
             now = self._now()
             if now >= poll_at:
                 return
+            # Read past the last scan, not past now: a run that came due since then,
+            # say while that scan ran, starts at once instead of at the next poll.
+            after = int(now) if self._due_scan_cutoff is None else self._due_scan_cutoff
             try:
-                due_at = await asyncio.to_thread(self._store.next_due_at, int(now))
+                due_at = await asyncio.to_thread(self._store.next_due_at, after)
             except Exception:
                 _logger.exception("Could not read the next due run time; waiting for the poll")
                 due_at = None
@@ -572,6 +578,8 @@ class PersistentTaskScheduler:
                 return
             async with self._poll_lock:
                 if self._stopped or not self._dispatching():
+                    # Leave runs already due to the poll, which checks dispatch too.
+                    self._due_scan_cutoff = int(self._now())
                     continue
                 try:
                     await self._claim_due()
@@ -938,6 +946,7 @@ class PersistentTaskScheduler:
 
     async def _claim_due(self) -> None:
         cutoff = int(self._now())
+        self._due_scan_cutoff = cutoff
         cursor: DispatchCursor | None = None
         while not self._stopped and len(self._startups) < self._max_startups:
             tasks = await asyncio.to_thread(

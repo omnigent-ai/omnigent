@@ -2753,21 +2753,17 @@ def _timer_task(
     first_run_at: int,
 ):
     """Save a ``sys_timer_set`` timer as its route does: first firing at *first_run_at*."""
-    task = store.create(
-        uuid.uuid5(uuid.NAMESPACE_DNS, seed).hex,
-        "Timer",
-        "[System: timer fired]",
+    return _task(
+        store,
+        seed,
         timer_rule(interval, repeat=repeat),
-        None,
-        uuid.uuid4().hex,
-        "UTC",
+        "[System: timer fired]",
         session_mode="continue",
         session_id=uuid.uuid4().hex,
         first_run_at=first_run_at,
         kind="timer",
         schedule_anchor=first_run_at - interval,
     )
-    return store.get(task.id)
 
 
 async def test_a_timer_ticks_on_its_own_interval_below_the_automation_minimum(store) -> None:
@@ -2863,3 +2859,36 @@ async def test_wake_looks_again_for_a_run_saved_after_the_last_read(store, monke
         await scheduler.stop()
     [run] = store.list_runs(task.id)[0]
     assert due <= run.fired_at <= due + 2
+
+
+async def test_a_run_that_comes_due_during_a_scan_still_starts_before_the_next_poll(
+    store, monkeypatch
+) -> None:
+    """The second can turn after a scan but before the next run time is read."""
+    clock = FakeClock(1_800_000_000.5)
+    task = _timer_task(
+        store, "due_during_scan", repeat=False, interval=1, first_run_at=1_800_000_001
+    )
+    scan = store.list_due_tasks
+
+    def scan_while_the_second_turns(now: int, **kwargs: object) -> list:
+        rows = scan(now, **kwargs)
+        clock.advance(1)
+        return rows
+
+    monkeypatch.setattr(store, "list_due_tasks", scan_while_the_second_turns)
+    fired = asyncio.Event()
+
+    async def fire(_task, _lease) -> None:
+        fired.set()
+
+    scheduler = PersistentTaskScheduler(
+        store, fire, AsyncMock(return_value=None), now=clock.now, poll_seconds=3600
+    )
+    await scheduler.start()
+    try:
+        await asyncio.wait_for(fired.wait(), 10)
+    finally:
+        await scheduler.stop()
+    [run] = store.list_runs(task.id)[0]
+    assert run.scheduled_at == task.next_run_at
