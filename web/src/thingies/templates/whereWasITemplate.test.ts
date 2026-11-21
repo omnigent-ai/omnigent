@@ -286,9 +286,11 @@ describe("where was I template", () => {
     expect(chips[0]).toContain("Review the cache fix");
     const cards = [...document.querySelectorAll("#view .area")].map((card) => card.id);
     expect(cards).toEqual(["card-reviews", "card-rollout"]);
+    // Next up owns its steps, so the area cards do not repeat them.
     expect(byId("card-rollout").textContent).toContain("Ramp checkout flag");
+    expect(byId("card-rollout").textContent).not.toContain("Ramp the flag to 10%");
 
-    const step = byId("card-rollout").querySelector(".step-main") as HTMLButtonElement;
+    const step = byId("next-ramp-10").querySelector(".next-chip") as HTMLButtonElement;
     step.click();
     expect(requests).toEqual([
       {
@@ -300,7 +302,7 @@ describe("where was I template", () => {
     emitActions([
       { id: "a1", action: "do_next_step", params: { next_step: "ramp-10" }, status: "running" },
     ]);
-    await waitFor(() => expect(byId("card-rollout").textContent).toContain("Working on it"));
+    await waitFor(() => expect(byId("next-ramp-10").textContent).toContain("Working on it"));
 
     emit("step_runs", [
       {
@@ -312,8 +314,8 @@ describe("where was I template", () => {
     emitActions([
       { id: "a1", action: "do_next_step", params: { next_step: "ramp-10" }, status: "done" },
     ]);
-    await waitFor(() => expect(byId("card-rollout").textContent).toContain("Done: At 10%."));
-    expect(byId("done-section").hidden).toBe(false);
+    await waitFor(() => expect(byId("done-list").textContent).toContain("At 10%."));
+    expect(byId("next-list").textContent).toContain("Done");
   });
 
   it("asks the viewer to start the thingy session when a scan waits for it", async () => {
@@ -360,7 +362,7 @@ describe("where was I template", () => {
     emit("radar", [{ id: "current", version: "v1", value: RADAR }]);
     const step = { next_step: "ramp-10", label: "Ramp the flag to 10%", area: "rollout" };
     emitActions([{ id: "a1", action: "do_next_step", params: step, status: "running" }]);
-    await waitFor(() => expect(byId("card-rollout").textContent).toContain("Working on it"));
+    await waitFor(() => expect(byId("next-ramp-10").textContent).toContain("Working on it"));
 
     // The session reports the action and rewrites the radar without the step, and writes no run.
     const rollout = { ...RADAR.areas[0], next_steps: RADAR.areas[0].next_steps.slice(1) };
@@ -451,14 +453,14 @@ describe("where was I template", () => {
 
     await waitFor(() => expect(byId("look").textContent).toContain("Grouped by goals, "));
     expect(byId("look").textContent).not.toContain("goals.,");
-    // The plain view's card shows the quote; the design here only lists step buttons.
+    // Next up shows the quote; the design here only lists step buttons.
     const plainView = startRadar();
     await waitFor(() => expect(plainView.ready()).toBe(true));
     plainView.emit("radar", [
       { id: "current", version: "v1", value: { ...RADAR, areas: [quoted, RADAR.areas[1]] } },
     ]);
     await waitFor(() =>
-      expect(byId("card-rollout").textContent).toContain("“Choose approve or request changes”"),
+      expect(byId("next-ramp-10").textContent).toContain("“Choose approve or request changes”"),
     );
   });
 
@@ -662,6 +664,77 @@ describe("where was I next up", () => {
       op: "replace",
       id: "cleanup",
       value: { label: "Remove the flag", pattern: "flag-rollout", reason: "already_done" },
+    });
+    // The notice asked already, so Next up does not ask again.
+    expect(byId("why-hidden").hidden).toBe(true);
+  });
+
+  it("still asks why a step was hidden after a reload", async () => {
+    const { emit, writes, ready } = startRadar();
+    await waitFor(() => expect(ready()).toBe(true));
+    emit("radar", [{ id: "current", version: "v1", value: RADAR }]);
+    emit("dismissed", [
+      {
+        id: "check-p95",
+        version: "v1",
+        value: {
+          at: new Date(Date.now() - 3600_000).toISOString(),
+          label: "Check p95 after the ramp",
+        },
+      },
+      { id: "old", version: "v1", value: { at: daysAgo(9), label: "An old step" } },
+      {
+        id: "answered",
+        version: "v1",
+        value: { at: daysAgo(1), label: "Answered", reason: "not_relevant" },
+      },
+    ]);
+
+    await waitFor(() => expect(byId("why-hidden").hidden).toBe(false));
+    expect(byId("why-hidden").textContent).toContain("You hid “Check p95 after the ramp”. Why?");
+    expect(byId("why-hidden").textContent).not.toContain("An old step");
+    expect(byId("why-hidden").textContent).not.toContain("Answered");
+
+    (byId("why-hidden").querySelector('[data-reason="not_relevant"]') as HTMLButtonElement).click();
+
+    await waitFor(() => expect(byId("why-hidden").hidden).toBe(true));
+    expect(writes.at(-1)).toMatchObject({
+      collection: "dismissed",
+      op: "replace",
+      id: "check-p95",
+      value: { label: "Check p95 after the ramp", reason: "not_relevant" },
+    });
+  });
+
+  it("shows a step that did not work as a retry, with what went wrong", async () => {
+    const { emit, requests, ready } = startRadar();
+    await waitFor(() => expect(ready()).toBe(true));
+    emit("radar", [{ id: "current", version: "v1", value: RADAR }]);
+    emit("step_runs", [
+      {
+        id: "ramp-10",
+        version: "v1",
+        value: {
+          label: "Ramp the flag to 10%",
+          state: "failed",
+          outcome: "No access to the flag.",
+        },
+      },
+    ]);
+
+    await waitFor(() =>
+      expect(byId("next-ramp-10").querySelector(".next-chip")?.textContent).toContain("Try again"),
+    );
+    const chip = byId("next-ramp-10").querySelector(".next-chip") as HTMLButtonElement;
+    expect(chip.dataset.run).toBe("failed");
+    expect(byId("next-ramp-10").querySelector(".next-run")?.textContent).toContain(
+      "Did not work: No access to the flag.",
+    );
+
+    chip.click();
+    expect(requests.at(-1)).toMatchObject({
+      action: "do_next_step",
+      params: { next_step: "ramp-10" },
     });
   });
 

@@ -162,7 +162,9 @@ export const THINGY_KIT_HELPERS = `
   function plain(value) {
     return String(value || '')
       .replace(/\\[([^\\]]*)\\]\\([^)]*\\)/g, '$1')
-      .replace(/(\\*\\*|__|\\*|_|\`)(\\S(?:.*?\\S)?)\\1/g, '$2')
+      .replace(/(\\*\\*|\\*|\`)(\\S(?:.*?\\S)?)\\1/g, '$2')
+      // Underscores mark emphasis only at word edges, so snake_case names keep theirs.
+      .replace(/(^|[^A-Za-z0-9_])(__?)(\\S(?:.*?\\S)?)\\2(?![A-Za-z0-9_])/g, '$1$3')
       .replace(/^\\s{0,3}(?:#{1,6}\\s+|>\\s?|[-*+]\\s+)/gm, '')
       .replace(/\\s+/g, ' ')
       .trim();

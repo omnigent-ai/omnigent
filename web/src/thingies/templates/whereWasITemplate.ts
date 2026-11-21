@@ -259,6 +259,9 @@ ${THINGY_KIT_STYLE}
 .next-chip:hover:not(:disabled) { border-color: var(--accent); }
 .next-chip:disabled { cursor: default; opacity: 0.7; }
 .next-chip .where { color: var(--muted); font-size: 12px; }
+.next-chip[data-run='failed'] { border-color: var(--blocked); }
+.next-chip[data-run='failed'] .where, .next-chip[data-run='failed'] .mark { color: var(--blocked); }
+.next-run { margin: 0 0 0 4px; font-size: 12px; color: var(--blocked); }
 .next-items { display: grid; gap: 10px; }
 .next-item { position: relative; display: grid; gap: 4px; padding: 10px 34px 10px 12px; border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 12px; background: var(--surface); }
 .next-item[data-nudge='forgotten'] { border-left-color: var(--waiting); }
@@ -275,6 +278,8 @@ ${THINGY_KIT_STYLE}
 .reasons button { border: 1px solid var(--line); background: var(--surface); border-radius: 999px; padding: 1px 10px; font-size: 12px; cursor: pointer; color: var(--text); }
 .reasons button:hover { border-color: var(--accent); }
 .hit { margin: 18px 0 0; font-size: 12px; color: var(--muted); }
+.why-hidden { margin: 8px 0 0; font-size: 12px; color: var(--muted); }
+.why-hidden .reasons { margin-left: 4px; }
 
 /* What it learned */
 .learned { margin-top: 18px; }
@@ -555,6 +560,9 @@ ${THINGY_KIT_HELPERS}
   function openSteps(area) {
     return (area.next_steps || []).filter(function (step) { return step && step.id && !dismissedDocs[step.id] && sure(step); });
   }
+  // The steps Next up shows now, by ID: a view draws the others, so no step shows twice.
+  var nextUpIds = {};
+  function laterSteps(area) { return openSteps(area).filter(function (step) { return !nextUpIds[step.id]; }); }
   function hiddenSteps(area) {
     return (area.next_steps || []).filter(function (step) { return step && step.id && dismissedDocs[step.id]; });
   }
@@ -748,15 +756,39 @@ ${THINGY_KIT_HELPERS}
     done.then(function () {
       delete dismissing[step.id];
       if (existing) notice('');
-      else notice('Hidden “' + step.label + '”. Why?', '', [el('span', { class: 'reasons' }, Object.keys(REASON_TEXT).map(function (reason) {
-        return el('button', { type: 'button', 'data-omnigent-requires': 'write', 'data-reason': reason, text: REASON_TEXT[reason], on: { click: function () { giveReason(step, reason); } } });
-      }))]);
+      else {
+        askedNow[step.id] = true;
+        notice('Hidden “' + step.label + '”. Why?', '', [reasonButtons(step)]);
+      }
       schedule();
     }, function (error) {
       delete dismissing[step.id];
       notice('Could not ' + (existing ? 'restore' : 'hide') + ' “' + step.label + '”: ' + message(error), 'error');
       schedule();
     });
+  }
+  function reasonButtons(step) {
+    return el('span', { class: 'reasons' }, Object.keys(REASON_TEXT).map(function (reason) {
+      return el('button', { type: 'button', 'data-omnigent-requires': 'write', 'data-reason': reason, text: REASON_TEXT[reason], on: { click: function () { giveReason(step, reason); } } });
+    }));
+  }
+  // Steps hidden in the last week without a reason, so the viewer can still say why once the
+  // notice is gone (after a reload): newest first, a few at most. A step hidden on this page asks
+  // in its notice instead.
+  var askedNow = {};
+  function renderWhyHidden() {
+    var box = $('why-hidden');
+    var unanswered = canWrite ? Object.keys(dismissedDocs).filter(function (stepId) {
+      var value = dismissedDocs[stepId].value || {};
+      var at = Date.parse(value.at);
+      return !askedNow[stepId] && !value.reason && !isNaN(at) && Date.now() - at < IGNORED_MS;
+    }).sort(function (a, b) { return Date.parse(dismissedDocs[b].value.at) - Date.parse(dismissedDocs[a].value.at); }).slice(0, 3) : [];
+    box.hidden = unanswered.length === 0;
+    box.replaceChildren.apply(box, unanswered.map(function (stepId) {
+      var label = dismissedDocs[stepId].value.label;
+      var step = { id: stepId, label: label || 'that next step' };
+      return el('div', { 'data-step': stepId }, ['You hid ' + (label ? '“' + label + '”' : 'a next step') + '. Why?', reasonButtons(step)]);
+    }));
   }
   // The one-tap answer to why a step was hidden: the session uses it to tune that pattern.
   function giveReason(step, reason) {
@@ -841,18 +873,20 @@ ${THINGY_KIT_HELPERS}
   function isBusy(state) { return state.run === 'running' || (state.run === 'sending' && !state.retry); }
 
   // A next step as a compact button that runs it and shows its progress.
+  // A step that did not work reads as a retry, not as a new step.
   function stepButton(area, step) {
     var state = stepState(step);
     var busy = isBusy(state);
+    var failed = state.run === 'failed';
     return el('button', {
       type: 'button', class: 'next-chip', 'data-omnigent-requires': 'action', 'data-run': state.run, disabled: !canAct || busy,
       title: state.run === 'idle' ? (step.kind === 'monitor' ? 'Ask your thingy session to check on this' : 'Ask your thingy session to do this') : state.text,
       'data-omnigent-ref': ref('steps/' + step.id), 'data-omnigent-label': step.label,
       on: { click: function () { requestStep(area, step); } },
     }, [
-      busy ? el('span', { class: 'spinner', 'aria-hidden': 'true' }) : kindIcon(step.kind),
+      busy ? el('span', { class: 'spinner', 'aria-hidden': 'true' }) : failed ? el('span', { class: 'mark', 'aria-hidden': 'true', text: '!' }) : kindIcon(step.kind),
       el('span', { text: step.label }),
-      el('span', { class: 'where', text: busy ? state.text : area.title }),
+      el('span', { class: 'where', text: busy ? state.text : failed ? (state.retry ? 'Send again' : 'Try again') : area.title }),
     ]);
   }
 
@@ -861,7 +895,7 @@ ${THINGY_KIT_HELPERS}
     var state = stepState(step);
     var busy = isBusy(state);
     var main = el('button', {
-      type: 'button', class: 'step-main', 'data-omnigent-requires': 'action', disabled: !canAct || busy,
+      type: 'button', class: 'step-main', 'data-omnigent-requires': 'action', disabled: !canAct || busy || state.run === 'failed',
       title: step.kind === 'monitor' ? 'Ask your thingy session to check on this' : 'Ask your thingy session to do this',
       on: { click: function () { requestStep(area, step); } },
     }, [kindIcon(step.kind), el('span', { class: 'step-label', text: step.label })]);
@@ -878,7 +912,7 @@ ${THINGY_KIT_HELPERS}
     if (state.run !== 'idle') {
       var line = [state.spin ? el('span', { class: 'spinner', 'aria-hidden': 'true' }) : null, el('span', { text: state.text })];
       if (state.session) line.push(el('button', { type: 'button', class: 'link-button', text: 'Open session', on: { click: function () { openSession(state.session); } } }));
-      if ((state.again || state.retry) && canAct) line.push(el('button', { type: 'button', class: 'link-button', 'data-omnigent-requires': 'action', text: state.retry ? 'Send again' : 'Do it again', on: { click: function () { requestStep(area, step); } } }));
+      if ((state.again || state.retry) && canAct) line.push(el('button', { type: 'button', class: 'link-button', 'data-omnigent-requires': 'action', text: state.retry ? 'Send again' : state.run === 'failed' ? 'Try again' : 'Do it again', on: { click: function () { requestStep(area, step); } } }));
       children.push(el('div', { class: 'step-run', 'aria-live': 'polite' }, line));
     }
     if (canWrite) {
@@ -903,6 +937,12 @@ ${THINGY_KIT_HELPERS}
     var pattern = patternOf(step);
     if (pattern) from.push((from.length ? ' · ' : '') + 'Your pattern: ' + pattern.name);
     var children = [stepButton(area, step)];
+    var state = stepState(step);
+    if (state.run === 'failed') {
+      var run = [el('span', { text: state.text })];
+      if (state.session) run.push(' ', el('button', { type: 'button', class: 'link-button', text: 'Open session', on: { click: function () { openSession(state.session); } } }));
+      children.push(el('p', { class: 'next-run', 'aria-live': 'polite' }, run));
+    }
     if (why.length) children.push(el('p', { class: 'next-why' }, why));
     if (from.length) children.push(el('p', { class: 'next-from' }, from));
     if (canWrite) {
@@ -935,7 +975,7 @@ ${THINGY_KIT_HELPERS}
   var kit = {
     el: el, svg: svg, keyed: keyed, ago: ago, hash: hash, wrap: wrap, plain: plain, cite: cite,
     stateColor: stateColor, stateSoft: stateSoft, stateLabel: stateLabel, stateOrder: STATE_ORDER,
-    openSteps: openSteps, sure: sure, patternOf: patternOf, hitRatio: hitRatio,
+    openSteps: openSteps, laterSteps: laterSteps, sure: sure, patternOf: patternOf, hitRatio: hitRatio,
     ordered: ordered, stepState: stepState, requestStep: requestStep,
     stepButton: stepButton, stepCard: stepCard, sessionCard: sessionCard, sessionTitle: sessionTitle,
     openSession: openSession, liveState: liveState, ref: ref, rerender: function () { schedule(); },
@@ -946,7 +986,7 @@ ${THINGY_KIT_HELPERS}
   // ---- The plain view: before the first design, and whenever a design fails to draw
 
   function areaCard(area, model) {
-    var steps = openSteps(area);
+    var steps = laterSteps(area);
     var hidden = hiddenSteps(area);
     var watched = ((model.radar && model.radar.sessions) || []).filter(function (session) { return session.area === area.id && session.why; });
     return el('article', { class: 'area', id: 'card-' + area.id, 'data-state': stateKey(area.state), 'data-omnigent-ref': ref('areas/' + area.id), 'data-omnigent-label': area.title }, [
@@ -1122,6 +1162,9 @@ ${THINGY_KIT_HELPERS}
     });
     picks.sort(function (a, b) { return a.score - b.score; });
     picks = picks.slice(0, NEXT_UP_MAX);
+    nextUpIds = {};
+    picks.forEach(function (pick) { nextUpIds[pick.step.id] = true; });
+    Object.keys(freshDone).filter(isFresh).forEach(function (stepId) { nextUpIds[stepId] = true; });
     var finished = Object.keys(freshDone).filter(isFresh).map(function (stepId) {
       var done = freshDone[stepId];
       return el('div', { class: 'next-chip finished', 'data-state': done.state, role: 'status' }, [
@@ -1137,6 +1180,7 @@ ${THINGY_KIT_HELPERS}
     $('next-list').replaceChildren.apply($('next-list'), finished);
     keyed($('next-items'), picks, function (pick) { return pick.step.id; }, function (pick) { return nextItem(pick.area, pick.step); });
     var hits = hitRatio();
+    renderWhyHidden();
     $('hit').hidden = !hits.resolved;
     $('hit').textContent = hits.resolved ? 'Next up hit ratio, last 30 days: ' + hits.clicked + ' of ' + hits.resolved + ' clicked (' + Math.round(100 * hits.clicked / hits.resolved) + '%). It shows fewer steps when you skip them.' : '';
   }
@@ -1466,6 +1510,7 @@ const KIT_BODY = `
       <h2>Next up</h2>
       <div id="next-list" class="next-list" hidden></div>
       <div id="next-items" class="next-items"></div>
+      <div id="why-hidden" class="why-hidden" hidden></div>
       <p id="next-empty" class="next-empty" hidden>Nothing needs you right now. Next up shows a step only when your past work says it is due and you will want it.</p>
     </section>
     <div id="view" class="view"></div>
@@ -1535,7 +1580,7 @@ key and animates moves; stepButton(area, step) is a next step that runs and show
 stepCard(area, step) adds its reason, evidence and a way to hide it; sessionCard(session) is a
 session link with its live status and journal outcome; openSession(id); openSteps(area) are the
 steps sure enough to show (confidence at or above their pattern's bar) that the viewer has not
-hidden: draw only these; sure(step); patternOf(step) is its pattern or null; ordered(areas) puts related areas together, blocked first;
+hidden; laterSteps(area) are those Next up does not show already: draw only these as buttons; sure(step); patternOf(step) is its pattern or null; ordered(areas) puts related areas together, blocked first;
 stateColor(state), stateSoft(state), stateLabel(state); ref(path) for data-omnigent-ref, as in
 ref('areas/' + area.id); ago(iso); wrap(text, maxChars, maxLines) splits text into lines for
 SVG; plain(text) drops Markdown marks; calm is true when the viewer prefers reduced motion;
@@ -1643,7 +1688,7 @@ export const WHERE_WAS_I_GUIDE = [
   "- Make it glanceable both in the docked side panel (about 400 px wide) and full screen. Use the kit's colors so light and dark both work, respect `kit.calm` (the kit also stops CSS animation for reduced motion), and use inline SVG and CSS only: the frame blocks the network, so no external fonts, images or scripts. Keep the HTML well under 1 MiB.",
   "- Include at least one visual element that carries meaning: an SVG of the rollout's stages with where it stands, a graph of what blocks what, lanes by state, a timeline of fixes. Cards and text alone are the plain view's job.",
   "- Animate changes in place with `kit.keyed` and stable IDs, and scope your CSS to your own classes.",
-  "- Next up, Done recently, what the session learned, the hit ratio, the scan status, Rescan, the look line and the guide are the kit's: do not draw them again. Show where steps sit instead (a marker on a stage), only steps from `kit.openSteps(area)`, with `kit.stepButton` or `kit.stepCard`, and use `kit.sessionCard` for sessions, so their actions and progress keep working. `kit.plain(text)` drops Markdown marks from text the sessions wrote.",
+  "- Next up, Done recently, what the session learned, the hit ratio, the scan status, Rescan, the look line and the guide are the kit's: do not draw them again. Next up owns its steps, so never repeat them: show where the other steps sit instead (a marker on a stage), only steps from `kit.laterSteps(area)`, with `kit.stepButton` or `kit.stepCard`, and use `kit.sessionCard` for sessions, so their actions and progress keep working. `kit.plain(text)` drops Markdown marks from text the sessions wrote.",
   "",
   "A small example of a stage track that moves its marker when the radar changes:",
   "",
