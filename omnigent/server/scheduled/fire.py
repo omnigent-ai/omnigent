@@ -180,6 +180,8 @@ from omnigent.stores.conversation_store import (
 )
 
 if TYPE_CHECKING:
+    import httpx
+
     from omnigent.server.managed_hosts import ManagedLaunch, ManagedLaunchTracker
 
 _logger = logging.getLogger(__name__)
@@ -2692,11 +2694,49 @@ def _make_reuse_dispatch(deps: FireDeps) -> LaunchDispatch:
                 conversation_store=deps.conversation_store,
                 runner_router=deps.runner_router,
             )
+            if runner_client is None and conv.kind == "sub_agent":
+                runner_client, conv = await _follow_parent_runner(deps, conv)
             if runner_client is None:
                 raise RuntimeError(f"no runner can be reached or woken for session {conv.id}")
         await _send_prompt(deps, conv, runner_client, task)
 
     return _dispatch
+
+
+async def _follow_parent_runner(
+    deps: FireDeps, conv: Conversation
+) -> tuple[httpx.AsyncClient | None, Conversation]:
+    """Move a sub-agent session to its parent's live runner, as a message to it would.
+
+    A sub-agent keeps the runner its parent had when it was created, so the binding
+    goes stale once the parent moves to another runner. Only agent timers continue
+    sub-agent sessions.
+
+    :param deps: The fire's stores and runner registries.
+    :param conv: The sub-agent session, e.g. one whose ``runner_id`` names a runner
+        that has stopped.
+    :returns: The live runner's client and the re-read session, or ``None`` and *conv*
+        when no ancestor has a live runner.
+    """
+    from omnigent.server.routes.sessions import (
+        _ensure_runner_relay_ready,
+        _heal_subagent_runner_binding_via_parent,
+    )
+
+    runner_client = await _heal_subagent_runner_binding_via_parent(
+        conv, deps.runner_router, deps.tunnel_registry, deps.conversation_store
+    )
+    if runner_client is None:
+        return None, conv
+    healed = await asyncio.to_thread(deps.conversation_store.get_conversation, conv.id)
+    if healed is None:
+        raise RuntimeError(f"session {conv.id} was deleted while its runner was found")
+    # The session's output relay still follows the stopped runner; listen to the new
+    # one before the prompt goes out, or the turn's reply is lost.
+    await _ensure_runner_relay_ready(
+        healed.id, healed.runner_id, runner_client, deps.conversation_store, conversation=healed
+    )
+    return runner_client, healed
 
 
 async def _send_prompt(

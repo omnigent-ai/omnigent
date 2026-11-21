@@ -15,9 +15,10 @@ Excluded from default ``pytest`` runs via ``--ignore=tests/e2e``. Invoke with::
 from __future__ import annotations
 
 import json
+import secrets
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -27,6 +28,7 @@ import httpx
 import pytest
 import yaml
 
+from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, token_bound_runner_id
 from tests._helpers.live_server import terminate_process
 from tests._helpers.polling import poll_until
 from tests._helpers.server_runner import ServerRunner, server_runner
@@ -47,10 +49,16 @@ _REPLY = "Noted the timer."
 
 
 @contextmanager
-def _timer_stack(tmp_path: Path) -> Iterator[tuple[ServerRunner, httpx.Client]]:
-    """A server and runner with a client that keeps background titles off the mock."""
+def _timer_stack(
+    tmp_path: Path, server_env: Mapping[str, str | None] | None = None
+) -> Iterator[tuple[ServerRunner, httpx.Client]]:
+    """A server and runner with a client that keeps background titles off the mock.
+
+    :param server_env: Server environment overrides, e.g.
+        ``{"OMNIGENT_RUNNER_TUNNEL_TOKEN": None}`` to admit any token-bound runner.
+    """
     with (
-        server_runner(tmp_path / "stack") as stack,
+        server_runner(tmp_path / "stack", server_env=server_env) as stack,
         httpx.Client(
             base_url=stack.base_url,
             trust_env=False,
@@ -301,3 +309,84 @@ def test_repeating_timer_keeps_its_id_and_stays_cancelled_across_restarts(
         time.sleep(4 * interval)
         assert len(_firings(client, session_id, timer_id)) == cancelled_count
         assert client.get(f"/v1/scheduled-tasks/{timer_id}").status_code == 404
+
+
+def _child_session(client: httpx.Client, parent_id: str) -> str:
+    """Create a sub-agent session of *parent_id*'s agent, as a parent's spawn does."""
+    agent_id = client.get(f"/v1/sessions/{parent_id}").json()["agent_id"]
+    created = client.post(
+        "/v1/sessions",
+        json={"agent_id": agent_id, "parent_session_id": parent_id},
+        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+    )
+    created.raise_for_status()
+    return str(created.json()["id"])
+
+
+def _replies(client: httpx.Client, session_id: str) -> int:
+    """How many times the agent answered with the fallback reply."""
+    return sum(
+        item["type"] == "message"
+        and item.get("role") == "assistant"
+        and _REPLY in json.dumps(item.get("content"))
+        for item in _items(client, session_id)
+    )
+
+
+def test_a_sub_agent_timer_wakes_its_child_after_the_parent_moves_runners(
+    tmp_path: Path, isolated_mock_llm_server_url: str
+) -> None:
+    """A sub-agent's timer wakes the child, and still does once its parent's runner changes."""
+    mock_url = isolated_mock_llm_server_url
+    model = f"mock-timer-child-{uuid.uuid4().hex[:6]}"
+    interval = 10
+    set_fallback_mock_llm(mock_url, model, _REPLY)
+    # Any token-bound runner may connect, so the parent can move to a new runner.
+    with _timer_stack(tmp_path, server_env={"OMNIGENT_RUNNER_TUNNEL_TOKEN": None}) as (
+        stack,
+        client,
+    ):
+        parent_id = _timer_session(client, stack, mock_url, model)
+        child_id = _child_session(client, parent_id)
+        child = client.get(f"/v1/sessions/{child_id}").json()
+        assert (child["kind"], child["runner_id"]) == ("sub_agent", stack.runner_id)
+        timer = _set_timer(
+            client,
+            mock_url,
+            child_id,
+            model,
+            {"seconds": interval, "repeat": True, "note": "check the child's work"},
+        )
+        timer_id = timer["timer_id"]
+        poll_until(lambda: _firings(client, child_id, timer_id), timeout_s=60)
+        poll_until(lambda: _replies(client, child_id) >= 1, timeout_s=60)
+
+        # The parent moves to a runner with a new identity while the child is idle, so
+        # the child still names the stopped runner, which a message to it would repair.
+        terminate_process(stack.runner)
+        stack.runner = None
+        new_token = secrets.token_urlsafe(32)
+        new_runner_id = token_bound_runner_id(new_token)
+        stack.start_runner(
+            env={
+                "OMNIGENT_RUNNER_ID": new_runner_id,
+                "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": new_token,
+            },
+            wait_ready=False,
+        )
+        poll_until(
+            lambda: client.get(f"/v1/runners/{new_runner_id}/status").json().get("online"),
+            timeout_s=120,
+        )
+        bind_session_runner(client.patch, "", parent_id, new_runner_id)
+        assert client.get(f"/v1/sessions/{child_id}").json()["runner_id"] == stack.runner_id
+        replies_before = _replies(client, child_id)
+
+        # A later tick finds the parent's new runner and wakes the child's agent there.
+        poll_until(
+            lambda: _replies(client, child_id) > replies_before,
+            timeout_s=4 * interval,
+            interval_s=0.5,
+        )
+        assert client.get(f"/v1/sessions/{child_id}").json()["runner_id"] == new_runner_id
+        assert _firings(client, parent_id, timer_id) == []

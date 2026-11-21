@@ -473,6 +473,8 @@ database scheduler (`session_timers` in `/v1/info`).
   the timer without waking anything. Otherwise `begin_timer_delivery` commits the
   firing under the task lock that deleting takes, then the prompt, a hidden
   (`is_meta`) user message, goes in through the continued-session wake and dispatch.
+  A sub-agent session whose runner has stopped first moves to its parent's live
+  runner, output relay included, as a message to it would.
   The run records `succeeded`, or `failed` (`launch_failed`) when no runner can be
   reached or woken; a firing is never retried.
 - **Cancelling.** A cancel that commits before a claimed firing does suppresses it:
