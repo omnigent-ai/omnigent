@@ -23,7 +23,7 @@ from omnigent.entities.project_ticket import (
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
-from omnigent.server.auth import LEVEL_EDIT, AuthProvider
+from omnigent.server.auth import LEVEL_EDIT, RESERVED_USER_PUBLIC, AuthProvider
 from omnigent.server.routes._auth_helpers import require_access, require_user
 from omnigent.server.routes._sessions.common import _session_status_cache
 from omnigent.server.routes._sessions.helpers import _permission_level_from_grants
@@ -150,18 +150,24 @@ def create_project_tickets_router(
         )
         session_ids = sorted({sid for link in links.values() for sid in link.session_ids})
         if permissions is not None and session_ids:
-            grants = await asyncio.to_thread(permissions.list_for_sessions, session_ids)
-            is_admin = (
-                await asyncio.to_thread(permissions.is_admin, who.user_id)
-                if who.user_id
-                else False
-            )
-            session_ids = [
-                sid
-                for sid in session_ids
-                if _permission_level_from_grants(who.user_id, grants.get(sid, []), is_admin)
-                is not None
-            ]
+            if who.user_id is None:
+                session_ids = []
+            else:
+                grants = await asyncio.to_thread(
+                    permissions.list_for_sessions, session_ids, user_id=who.user_id
+                )
+                public_grants = await asyncio.to_thread(
+                    permissions.list_for_sessions, session_ids, user_id=RESERVED_USER_PUBLIC
+                )
+                is_admin = await asyncio.to_thread(permissions.is_admin, who.user_id)
+                session_ids = [
+                    sid
+                    for sid in session_ids
+                    if _permission_level_from_grants(
+                        who.user_id, grants.get(sid, []) + public_grants.get(sid, []), is_admin
+                    )
+                    is not None
+                ]
         sessions = await asyncio.to_thread(conversations.get_session_activity, session_ids)
         for ticket in page["data"]:
             linked = links[ticket["id"]]

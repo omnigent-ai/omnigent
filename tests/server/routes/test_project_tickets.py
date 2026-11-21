@@ -512,19 +512,28 @@ async def test_ticket_running_projection_batches_links_and_respects_access(
         ticket_routes, "_session_status_cache", {project["orchestrator_session_id"]: "running"}
     )
     original = SqlAlchemyConversationStore.get_session_activity
+    original_grants = SqlAlchemyPermissionStore.list_for_sessions
     batches = []
+    grant_batches = []
 
     def capture(store, session_ids):
         batches.append(session_ids)
         return original(store, session_ids)
 
+    def capture_grants(store, session_ids, *, user_id=None):
+        assert user_id in (ALICE, RESERVED_USER_PUBLIC)
+        grant_batches.append((session_ids, user_id))
+        return original_grants(store, session_ids, user_id=user_id)
+
     monkeypatch.setattr(SqlAlchemyConversationStore, "get_session_activity", capture)
+    monkeypatch.setattr(SqlAlchemyPermissionStore, "list_for_sessions", capture_grants)
     page = (await client.get(base, headers=headers)).json()["data"]
     assert {row["id"]: row["has_running_agents"] for row in page} == {
         active["id"]: True,
         quiet["id"]: False,
     }
     assert batches == [[worker.id]]
+    assert grant_batches == [([worker.id], ALICE), ([worker.id], RESERVED_USER_PUBLIC)]
     ticket_routes._session_status_cache[worker.id] = "idle"
     page = (await client.get(base, headers=headers)).json()["data"]
     assert all(row["has_running_agents"] is False for row in page)
@@ -532,6 +541,9 @@ async def test_ticket_running_projection_batches_links_and_respects_access(
     permissions.revoke(ALICE, worker.id)
     page = (await client.get(base, headers=headers)).json()["data"]
     assert next(row for row in page if row["id"] == active["id"])["has_running_agents"] is None
+    permissions.grant(RESERVED_USER_PUBLIC, worker.id, LEVEL_EDIT)
+    page = (await client.get(base, headers=headers)).json()["data"]
+    assert next(row for row in page if row["id"] == active["id"])["has_running_agents"] is True
     assert (await client.get(base, headers=_as_user(BOB))).status_code == 404
 
 
