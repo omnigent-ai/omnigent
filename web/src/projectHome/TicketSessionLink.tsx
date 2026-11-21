@@ -1,6 +1,5 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { BotIcon, ChevronRightIcon } from "lucide-react";
-import { NeedsResponseBadge } from "@/components/NeedsResponseBadge";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { fetchConversationById } from "@/hooks/useOpenSessionRow";
@@ -95,11 +94,12 @@ export function TicketSessionLink({
         )}
         {showStatus && (
           <span className="flex flex-wrap items-center gap-x-3 gap-y-1 pt-1">
-            <span className="flex items-center gap-1.5 text-muted-foreground">
-              {!unavailable && !session?.archived && state && <SessionStateBadge state={state} />}
-              {!awaiting && <span>{status}</span>}
-            </span>
-            {responseRequested && !awaiting && <NeedsResponseBadge />}
+            {!awaiting && (
+              <span className="flex items-center gap-1.5 text-muted-foreground">
+                {!unavailable && !session?.archived && state && <SessionStateBadge state={state} />}
+                <span>{status}</span>
+              </span>
+            )}
             <span
               className={cn(
                 "inline-flex items-center gap-1 font-medium",

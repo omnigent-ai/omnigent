@@ -705,10 +705,10 @@ describe("Project ticket board", () => {
           pending_elicitations_count: 1,
         }),
       );
-      expect(await within(sessions).findByText("Needs response")).toBeInTheDocument();
       expect(
-        within(sessions).getByRole("link", { name: "Respond to: Build ticket panel" }),
+        await within(sessions).findByRole("link", { name: "Respond to: Build ticket panel" }),
       ).toHaveAttribute("href", href);
+      expect(within(sessions).queryByText("Needs response")).toBeNull();
       expect(within(sessions).queryByText("Running")).toBeNull();
     },
   );
@@ -1088,9 +1088,9 @@ describe("Project ticket board", () => {
       });
       expect(screen.queryByText("Your response is needed")).toBeNull();
       expect(screen.queryByRole("region", { name: "Response needed" })).toBeNull();
-      expect(screen.getAllByText("Needs response")).toHaveLength(2);
+      expect(screen.getAllByText("Needs response")).toHaveLength(1);
       expect(chat).toHaveClass("bg-tag-pink");
-      expect(chat).toHaveTextContent("Needs response");
+      expect(chat).not.toHaveTextContent("Needs response");
       expect(chat).toHaveTextContent("Idle");
       expect(within(chat).queryByRole("img", { name: /approval prompt/ })).toBeNull();
       expect(
@@ -1258,7 +1258,8 @@ describe("Project ticket board", () => {
     );
     const agents = await screen.findByRole("region", { name: "Agents" });
     const respond = await within(agents).findByRole("link", { name: "Respond to: Plan the work" });
-    expect(respond).toHaveTextContent("Needs response");
+    expect(respond).toHaveTextContent("Respond");
+    expect(respond).not.toHaveTextContent("Needs response");
     fireEvent.change(screen.getByLabelText("Add a comment"), { target: { value: "I approve" } });
     await user.click(screen.getByRole("button", { name: "Comment" }));
     await waitFor(() =>
@@ -1269,7 +1270,8 @@ describe("Project ticket board", () => {
     );
     expect(
       within(agents).getByRole("link", { name: "Respond to: Plan the work" }),
-    ).toHaveTextContent("Needs response");
+    ).toHaveTextContent("Respond");
+    expect(within(agents).queryByText("Needs response")).toBeNull();
     expect(api.updateTicket).not.toHaveBeenCalled();
     await user.click(respond);
     expect(screen.getByLabelText("Existing session chat")).toHaveTextContent("worker");
