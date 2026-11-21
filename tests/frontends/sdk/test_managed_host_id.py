@@ -16,11 +16,12 @@ import httpx
 import pytest
 from omnigent_client import OmnigentClient
 
-from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
+from omnigent.cli_auth import DATABRICKS_ORG_ID_HEADER, OMNIGENT_SLICE_KEY_HEADER
 from omnigent.session_host import SessionRoutingTransport, set_session_host
 from tests.frontends.sdk.test_sessions_namespace import _session_response_body
 
-BASE_URL = "https://example.databricks.com/api/2.0/omnigent"
+# The workspace API mount is what makes a deployment host-sharded.
+BASE_URL = "https://workspace.example.com/api/2.0/omnigent"
 SESSION_ID = "9e4b1c7a2d3f4e5a8b6c0d1e2f3a4b5c"
 HEX_ID = re.compile(r"[0-9a-f]{32}")
 
@@ -32,7 +33,9 @@ def _forget_session_host() -> Iterator[None]:
     set_session_host(SESSION_ID, None)
 
 
-def _client(seen: list[httpx.Request], *, accepts_host_id: bool) -> OmnigentClient:
+def _client(
+    seen: list[httpx.Request], *, accepts_host_id: bool, headers: dict[str, str] | None = None
+) -> OmnigentClient:
     """A client whose server reports *accepts_host_id* and records every request."""
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -44,7 +47,7 @@ def _client(seen: list[httpx.Request], *, accepts_host_id: bool) -> OmnigentClie
         return httpx.Response(200, json=_session_response_body(session_id=SESSION_ID))
 
     transport = SessionRoutingTransport(transport=httpx.MockTransport(handler))
-    return OmnigentClient(BASE_URL, transport=transport)
+    return OmnigentClient(BASE_URL, headers=headers, transport=transport)
 
 
 def _creates(seen: list[httpx.Request]) -> list[httpx.Request]:
@@ -110,6 +113,28 @@ async def test_external_create_does_not_probe_or_name_a_host() -> None:
 
     assert not any(r.url.path.endswith("/v1/info") for r in seen)
     assert "host_id" not in json.loads(_creates(seen)[0].content)
+
+
+@pytest.mark.asyncio
+async def test_routing_keeps_the_callers_workspace_selector_and_user_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keying a request by its host changes only the routing key."""
+    from omnigent import cli_auth
+
+    monkeypatch.setattr(cli_auth, "load_databricks_org_id", lambda _url: "100")
+    seen: list[httpx.Request] = []
+    async with _client(
+        seen, accepts_host_id=True, headers={DATABRICKS_ORG_ID_HEADER: "200"}
+    ) as client:
+        await client.sessions.create(b"bundle", host_type="managed")
+
+    info, create, snapshot = seen
+    assert info.headers[DATABRICKS_ORG_ID_HEADER] == "200"
+    for request in (create, snapshot):
+        assert request.headers[DATABRICKS_ORG_ID_HEADER] == "200"
+        assert request.headers["User-Agent"] == info.headers["User-Agent"]
+        assert HEX_ID.fullmatch(request.headers[OMNIGENT_SLICE_KEY_HEADER])
 
 
 def test_a_default_client_routes_session_requests() -> None:

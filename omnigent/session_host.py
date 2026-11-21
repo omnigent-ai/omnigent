@@ -101,10 +101,16 @@ def is_wrong_replica(response: httpx.Response) -> bool:
 
 
 def address_request(request: httpx.Request, base_url: str, host_id: str) -> None:
-    """Key one request to a host, or send it keyless when host_id is empty."""
+    """Key one request to a host, or send it keyless when host_id is empty.
+
+    Only the routing key changes: headers the caller already set, such as an
+    explicit workspace selector or the client's User-Agent, are kept.
+    """
     request.url = request.url.copy_remove_param(_SLICE_KEY_QUERY_PARAM)
     request.headers.pop(OMNIGENT_SLICE_KEY_HEADER, None)
-    request.headers.update(databricks_request_headers(base_url, host_id=host_id))
+    for name, value in databricks_request_headers(base_url, host_id=host_id).items():
+        if name.lower() == OMNIGENT_SLICE_KEY_HEADER.lower() or name not in request.headers:
+            request.headers[name] = value
     request.extensions[REQUEST_HOST_EXTENSION] = host_id
 
 
