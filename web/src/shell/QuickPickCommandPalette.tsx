@@ -44,6 +44,10 @@ import { type PaletteSession, usePaletteSessionSearch } from "./usePaletteSessio
 
 const COMMAND_HISTORY_KEY = "command-palette:commands";
 
+/** Said when a pasted `#123` or pull request link names no loaded session's pull request. */
+export const PULL_REQUEST_NOT_FOUND =
+  "No session found for that pull request. Search checks each loaded session's linked pull request.";
+
 /** The child pages' copy; their headings name what they act on. */
 const CHILD_PAGE_COPY = {
   "setting-choices": {
@@ -97,7 +101,7 @@ export function QuickPickCommandPalette({
 }: CommandPaletteProps) {
   const navigate = useNavigate();
   const isMobile = useIsMobileViewport();
-  const search = usePaletteSessionSearch({ open, sessionsOnly });
+  const search = usePaletteSessionSearch({ open, sessionsOnly, matchLoaded: true });
   const { query, debouncedQuery, titleSearch, contentSearch } = search;
   const close = (): void => onOpenChange(false);
   const actions = useAppCommands({
@@ -169,7 +173,7 @@ export function QuickPickCommandPalette({
     group,
     icon: SESSION_ICON,
     highlights: {
-      label: occurrenceRanges(highlightQuery, session.label),
+      label: session.labelRanges ?? occurrenceRanges(highlightQuery, session.label),
       description: session.snippet ? occurrenceRanges(debouncedQuery, session.snippet) : [],
     },
     accessory: (
@@ -375,6 +379,7 @@ export function QuickPickCommandPalette({
   // As in today's palette, a load error or loading message stands in for the empty one.
   const rootEmptyMessage = (): string | null => {
     if (loadStatus) return null;
+    if (search.pullRequestLookup) return PULL_REQUEST_NOT_FOUND;
     return search.searchFetching ? "Searching…" : "No results found";
   };
   // The cap stays visible with a load message, so hidden matches are never a surprise.
