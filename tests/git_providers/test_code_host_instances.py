@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import inspect
 import os
+import pickle
 import re
 import subprocess
 import sys
@@ -285,22 +287,8 @@ def test_the_host_file_loader_is_the_only_way_to_build_instances_from_outside_da
         )
 
 
-def test_instance_records_cannot_be_built_or_changed_outside_the_loader(
-    load: Load, cli: Path
-) -> None:
-    """Calling the record class, replacing a field, or wrapping a lookalike is refused."""
-    (loaded,) = load(_config(cli, env_set='{ LANG = "C.UTF-8" }')).instances
-    fields = {item.name: getattr(loaded, item.name) for item in dataclasses.fields(loaded)}
-    lookalike = type("Lookalike", (), fields)()
-
-    attempts = {
-        "keywords": lambda: CodeHostInstance(**{**fields, "command": ("/bin/sh",)}),
-        "positional": lambda: CodeHostInstance(*fields.values()),
-        "empty": lambda: CodeHostInstance(),
-        "replace": lambda: dataclasses.replace(loaded, command=("/bin/sh",)),
-        "lookalike": lambda: CodeHostInstances((lookalike,)),  # type: ignore[arg-type]
-        "list": lambda: CodeHostInstances([loaded]),  # type: ignore[arg-type]
-    }
+def _unrefused(attempts: dict[str, Callable[[], object]]) -> list[str]:
+    """Return the names of *attempts* that weren't refused as loader-only."""
     allowed = []
     for name, attempt in attempts.items():
         try:
@@ -309,13 +297,61 @@ def test_instance_records_cannot_be_built_or_changed_outside_the_loader(
             assert "built only by load_code_host_instances" in str(refused), name
         else:
             allowed.append(name)
-    assert allowed == []
+    return allowed
 
-    with pytest.raises(dataclasses.FrozenInstanceError):
-        loaded.command = ("/bin/sh",)  # type: ignore[misc]
+
+def test_ordinary_code_gets_instance_records_only_from_the_loader(load: Load, cli: Path) -> None:
+    """Calls, replace, __new__, copies, pickles and lookalikes are all refused.
+
+    This guards ordinary code, not a deliberate bypass from inside the process.
+    """
+    (loaded,) = load(_config(cli)).instances
+    fields = {item.name: getattr(loaded, item.name) for item in dataclasses.fields(loaded)}
+
+    def made_by_new() -> CodeHostInstance:
+        record = object.__new__(CodeHostInstance)
+        for name, value in fields.items():
+            object.__setattr__(record, name, value)
+        return record
+
+    unissued = {
+        "__new__": made_by_new(),
+        "copy": copy.copy(loaded),
+        "lookalike": type("Lookalike", (), fields)(),
+    }
+    attempts: dict[str, Callable[[], object]] = {
+        "keywords": lambda: CodeHostInstance(**{**fields, "command": ("/bin/sh",)}),
+        "positional": lambda: CodeHostInstance(*fields.values()),
+        "empty": lambda: CodeHostInstance(),
+        "replace": lambda: dataclasses.replace(loaded, command=("/bin/sh",)),
+        "list": lambda: CodeHostInstances([loaded]),  # type: ignore[arg-type]
+        **{
+            f"collection of {name}": lambda record=record: CodeHostInstances((record,))
+            for name, record in unissued.items()
+        },
+    }
+
+    assert _unrefused(attempts) == []
+    assert unissued["copy"].command == loaded.command  # a copy is refused, not changed
+    # A deep copy or a pickle round trip can't be made at all.
+    for duplicate in (copy.deepcopy, lambda record: pickle.loads(pickle.dumps(record))):
+        with pytest.raises(TypeError, match="cannot pickle"):
+            duplicate(loaded)
+    assert CodeHostInstances((loaded,)).instance_for("github", "code.example.test") is loaded
+
+
+def test_instance_records_cannot_change_after_loading(load: Load, cli: Path) -> None:
+    (loaded,) = load(_config(cli, env_set='{ LANG = "C.UTF-8" }')).instances
+
+    for name, value in [("command", ("/bin/sh",)), ("hosts", frozenset({"other.example.test"}))]:
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(loaded, name, value)
+    with pytest.raises((AttributeError, TypeError)):
+        loaded.extra = "x"  # type: ignore[attr-defined]
     with pytest.raises(TypeError):
         loaded.fixed_environment["LANG"] = "x"  # type: ignore[index]
-    assert CodeHostInstances((loaded,)).instance_for("github", "code.example.test") is loaded
+    assert not hasattr(loaded, "__dict__")
+    assert isinstance(loaded.hosts, frozenset) and isinstance(loaded.command, tuple)
 
 
 def test_the_instance_modules_import_only_the_standard_library() -> None:

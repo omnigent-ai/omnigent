@@ -31,6 +31,7 @@ import os
 import re
 import shutil
 import tomllib
+import weakref
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -71,11 +72,12 @@ class CodeHostInstanceError(ValueError):
 _LOADER_ONLY = "code host instances are built only by load_code_host_instances"
 
 
-@dataclass(frozen=True, init=False)
+@dataclass(frozen=True, init=False, eq=False, slots=True, weakref_slot=True)
 class CodeHostInstance:
     """One configured code host instance, built only by :func:`load_code_host_instances`.
 
-    Calling the class, or ``dataclasses.replace`` on a record, raises ``TypeError``.
+    Calling the class, or ``dataclasses.replace`` on a record, raises ``TypeError``,
+    and a record's fields can't change once it is loaded. Records compare by identity.
 
     :ivar id: Stable id, e.g. ``"internal"``; the only instance detail logs carry.
     :ivar provider: The provider whose API it serves, e.g. ``"github"``.
@@ -120,19 +122,25 @@ class CodeHostInstance:
         )
 
 
+# Every record the loader issued, held weakly; collections accept only these.
+_ISSUED: weakref.WeakSet[CodeHostInstance] = weakref.WeakSet()
+
+
 @dataclass(frozen=True)
 class CodeHostInstances:
     """The instances a host's config declares, by provider and host.
 
     It also answers the provider registry's ``hosts_for``, so the hosts it lists
-    resolve to their provider. It holds only records the loader built.
+    resolve to their provider. It holds only records the loader issued: a copy or a
+    record made some other way is refused.
     """
 
     instances: tuple[CodeHostInstance, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.instances, tuple) or not all(
-            type(instance) is CodeHostInstance for instance in self.instances
+            type(instance) is CodeHostInstance and instance in _ISSUED
+            for instance in self.instances
         ):
             raise TypeError(_LOADER_ONLY)
 
@@ -164,13 +172,14 @@ NO_INSTANCES = CodeHostInstances()
 
 
 def _built_instance(**values: Any) -> CodeHostInstance:
-    """Return a record of *values* the loader checked; the only way to build one."""
+    """Return a record of *values* the loader checked, and note it as issued."""
     names = {item.name for item in dataclasses.fields(CodeHostInstance)}
     if set(values) != names:
         raise TypeError(_LOADER_ONLY)
     instance = object.__new__(CodeHostInstance)
     for name, value in values.items():
         object.__setattr__(instance, name, value)
+    _ISSUED.add(instance)
     return instance
 
 
@@ -336,9 +345,10 @@ def load_code_host_instances(
 ) -> CodeHostInstances:
     """Read the host's instance config at *path*, once, when the host starts.
 
-    The only way to build instance records: there is no public constructor and no
-    path from a frame, a request or other text, so only a file on the host can name a
-    CLI. A missing file declares no instances.
+    The only way for ordinary code to get instance records: there is no public
+    constructor and no path from a frame, a request or other text, so only a file on
+    the host can name a CLI. Records can't change after loading. A missing file
+    declares no instances.
 
     :param path: The host-local config file.
     :param known_capabilities: The capability names an instance may list.
