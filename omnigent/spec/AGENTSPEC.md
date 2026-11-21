@@ -144,6 +144,10 @@ tools:
       search_provider: nimble
       api_key: ${NIMBLE_API_KEY}
       # optional: max_results (1-100, default 5); search_depth (lite | deep)
+    - name: web_search                     # dict — explicit Serply
+      search_provider: serply
+      api_key: ${SERPLY_API_KEY}
+      # optional: max_results (1-10, default 5); search_type (web | news | scholar)
 ```
 
 Keys can be hardcoded or use `${ENV_VAR}` references (resolved at deploy time
@@ -161,6 +165,11 @@ by the client, not at runtime by the server — the spec is self-contained).
   URLs, and snippets from Nimble's AI search API. Requires `api_key`; optional
   `max_results` (1-100, default 5) and `search_depth` (`lite` default, or
   `deep`). Works with any non-OpenAI model.
+- **Serply** (`search_provider: serply`): returns Google web results (title,
+  URL, snippet) from the [Serply](https://serply.io) API; set `search_type` to
+  `news` or `scholar` to get Google News or Google Scholar results with the same
+  key. Requires `api_key`; optional `max_results` (1-10, default 5). API
+  reference: https://serply.io/docs. Works with any non-OpenAI model.
 
 **`web_fetch` — zero-config web research:** Spawns an internal sub-agent with
 `terminal_run` to search the web and fetch pages using plain HTTP. No API keys
