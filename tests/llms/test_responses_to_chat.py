@@ -956,3 +956,93 @@ def test_trailing_function_calls_flushed() -> None:
     assert len(messages) == 1
     assert messages[0]["role"] == "assistant"
     assert len(messages[0]["tool_calls"]) == 1
+
+
+# ── Gemini thought_signature round-trip ────────────────────────────
+
+
+def test_function_call_thought_signature_round_trips_non_streaming() -> None:
+    """``thoughtSignature`` flows from Chat Completions to ``FunctionCallOutput`` and back."""
+    chat_dict = {
+        "id": "gemini-1",
+        "model": "gemini-3-pro-preview",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": '{"city": "London"}',
+                            },
+                            "thoughtSignature": "sig_abc123",
+                        }
+                    ],
+                },
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": None,
+    }
+    resp = chat_response_to_response(chat_dict)
+    assert len(resp.output) == 1
+    fc = resp.output[0]
+    assert isinstance(fc, FunctionCallOutput)
+    assert fc.thought_signature == "sig_abc123"
+
+    messages = responses_input_to_chat_messages(
+        [
+            {
+                "type": "function_call",
+                "call_id": fc.call_id,
+                "name": fc.name,
+                "arguments": fc.arguments,
+                "thought_signature": fc.thought_signature,
+            }
+        ],
+        None,
+    )
+    assert messages[0]["tool_calls"][0]["thoughtSignature"] == "sig_abc123"
+
+
+@pytest.mark.asyncio
+async def test_streaming_tool_calls_preserve_thought_signature() -> None:
+    """Streamed tool call deltas carry ``thoughtSignature`` onto ``FunctionCallOutput``."""
+    chunks = [
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "get_weather",
+                                    "arguments": '{"city": "London"}',
+                                },
+                                "thoughtSignature": "sig_stream_1",
+                            }
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ]
+        },
+        {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+    ]
+    events = [
+        e
+        async for e in chat_stream_to_response_events(_aiter(chunks), model="gemini-3-pro-preview")
+    ]
+    completed = events[-1]
+    assert isinstance(completed, ResponseCompletedEvent)
+    fc = completed.response.output[0]
+    assert isinstance(fc, FunctionCallOutput)
+    assert fc.thought_signature == "sig_stream_1"

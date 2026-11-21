@@ -200,12 +200,19 @@ def _build_vertex_url(project: str, location: str) -> str:
     Build the Vertex AI endpoint URL from project and location.
 
     :param project: GCP project ID.
-    :param location: GCP region, e.g. ``"us-central1"``.
+    :param location: GCP region, e.g. ``"us-central1"`` or ``"global"``.
     :returns: The Vertex AI base URL.
     """
+    # Vertex AI's global endpoint uses the bare host without a region prefix.
+    normalized_location = location.strip().lower()
+    host = (
+        "aiplatform.googleapis.com"
+        if normalized_location == "global"
+        else f"{normalized_location}-aiplatform.googleapis.com"
+    )
     return (
-        f"https://{location}-aiplatform.googleapis.com"
+        f"https://{host}"
         f"/v1/projects/{project}"
-        f"/locations/{location}"
+        f"/locations/{normalized_location}"
         f"/publishers/google/models"
     )

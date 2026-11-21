@@ -7,17 +7,21 @@ API. Ported from MLflow AI Gateway's GeminiAdapter.
 
 from __future__ import annotations
 
-import hashlib
 import json
+import re
 import time
+import uuid
 from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
 import httpx
 
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.llms._responses_to_chat import extract_thought_signature
 from omnigent.llms.adapters._content import parse_data_uri
 from omnigent.llms.adapters.base import BaseAdapter
+from omnigent.llms.errors import PermanentLLMError
+from omnigent.util.reasoning_effort import GEMINI_EFFORTS, validate_effort_or_llm_error
 
 _BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 _REQUEST_TIMEOUT = 120
@@ -45,6 +49,19 @@ _GENERATION_CONFIG_NAMES = {
     "frequencyPenalty",
     "presencePenalty",
 }
+
+# Gemini 2.5 token budgets per reasoning effort (within 2.5 Flash/Pro/Lite limits).
+_GEMINI_25_THINKING_BUDGETS: dict[str, int] = {
+    "low": 1024,
+    "medium": 8192,
+    "high": 24576,
+}
+
+# Matches major and optional minor version of a Gemini model id (e.g. ``gemini-2.5-pro``).
+_GEMINI_VERSION_RE = re.compile(
+    r"(?:^|/)gemini-(\d+)(?:[.\-](\d+))?(?:[.\-]|$)",
+    re.IGNORECASE,
+)
 
 
 class GeminiAdapter(BaseAdapter):
@@ -115,16 +132,17 @@ class GeminiAdapter(BaseAdapter):
             iterator.
         """
         params = connection_params or {}
-        payload = _chat_to_gemini(messages, tools, extra)
+        payload = _chat_to_gemini(messages, tools, extra, model=model)
         headers = await self._get_headers(
             api_key_override=params.get("api_key"),
         )
         override_base = params.get("base_url")
         effective_base = override_base.rstrip("/") if override_base else self._get_base_url()
+        model_path = _build_model_path(effective_base, model)
 
         if stream:
             effective_to = timeout if timeout is not None else _STREAM_TIMEOUT
-            url = f"{effective_base}/models/{model}:streamGenerateContent?alt=sse"
+            url = f"{model_path}:streamGenerateContent?alt=sse"
             return self._stream_request(
                 url,
                 headers,
@@ -133,7 +151,7 @@ class GeminiAdapter(BaseAdapter):
             )
 
         effective_to = timeout if timeout is not None else _REQUEST_TIMEOUT
-        url = f"{effective_base}/models/{model}:generateContent"
+        url = f"{model_path}:generateContent"
         return await self._send_request(
             url,
             headers,
@@ -202,23 +220,77 @@ class GeminiAdapter(BaseAdapter):
             if resp.status_code >= 400:
                 await resp.aread()
             resp.raise_for_status()
+            next_tool_call_index = 0
             async for line in resp.aiter_lines():
                 if not line.startswith("data: "):
                     continue
                 data = json.loads(line[len("data: ") :])
                 for chunk in _gemini_stream_chunk_to_chat(
                     data,
+                    tool_call_index_start=next_tool_call_index,
                 ):
+                    delta_calls = (
+                        (chunk.get("choices") or [{}])[0].get("delta", {}).get("tool_calls")
+                    )
+                    if delta_calls:
+                        next_tool_call_index += len(delta_calls)
                     yield chunk
 
 
 # ── Request translation ───────────────────────────────────
 
 
+def _build_model_path(base_url: str, model: str) -> str:
+    """Build ``<base>/models/<model>`` without duplicating a trailing ``/models`` segment."""
+    trimmed = base_url.rstrip("/")
+    normalized_model = model.lstrip("/").removeprefix("models/")
+    if trimmed.endswith("/models"):
+        return f"{trimmed}/{normalized_model}"
+    return f"{trimmed}/models/{normalized_model}"
+
+
+def _gemini_version(model: str) -> tuple[int, int] | None:
+    """Parse ``(major, minor)`` from a Gemini model id, or ``None`` if unversioned."""
+    match = _GEMINI_VERSION_RE.search(model)
+    if match is None:
+        return None
+    major = int(match.group(1))
+    minor = int(match.group(2)) if match.group(2) is not None else 0
+    return (major, minor)
+
+
+def _build_thinking_config(
+    effort: str,
+    model: str,
+    *,
+    max_output_tokens: int | None = None,
+) -> dict[str, Any]:
+    """Build Gemini ``generationConfig.thinkingConfig`` for a validated reasoning effort."""
+    version = _gemini_version(model)
+    if version is not None and version < (2, 5) and "thinking" not in model.lower():
+        raise PermanentLLMError(
+            f"Model {model!r} does not support reasoning_effort",
+            code="unsupported_reasoning_effort",
+        )
+    if version is not None and version < (3, 0):
+        budget = _GEMINI_25_THINKING_BUDGETS[effort]
+        if isinstance(max_output_tokens, int) and max_output_tokens > 0:
+            budget = min(budget, max_output_tokens)
+        return {
+            "thinkingBudget": budget,
+            "includeThoughts": True,
+        }
+    return {
+        "thinkingLevel": effort.upper(),
+        "includeThoughts": True,
+    }
+
+
 def _chat_to_gemini(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None,
     extra: dict[str, Any],
+    model: str = "",
 ) -> dict[str, Any]:
     """
     Convert Chat Completions messages to Gemini generateContent payload.
@@ -226,6 +298,9 @@ def _chat_to_gemini(
     :param messages: Chat Completions messages.
     :param tools: OpenAI-format tool schemas or ``None``.
     :param extra: Additional kwargs.
+    :param model: Bare Gemini model name, e.g. ``"gemini-3-pro-preview"``
+        or ``"gemini-2.5-pro"``. Used to select ``thinkingLevel`` vs
+        ``thinkingBudget`` when ``reasoning_effort`` is provided.
     :returns: Gemini API request payload.
     """
     payload: dict[str, Any] = {}
@@ -237,6 +312,8 @@ def _chat_to_gemini(
 
     # Convert messages
     contents: list[dict[str, Any]] = []
+    tool_names_by_id: dict[str, str] = {}
+    prev_was_tool_response = False
     for m in messages:
         role = m["role"]
         if role == "system":
@@ -245,28 +322,39 @@ def _chat_to_gemini(
         gemini_role = "model" if role == "assistant" else "user"
 
         if role == "assistant" and m.get("tool_calls"):
+            for tc in m["tool_calls"]:
+                tc_id = tc.get("id")
+                func_name = (tc.get("function") or {}).get("name")
+                if isinstance(tc_id, str) and tc_id and isinstance(func_name, str) and func_name:
+                    tool_names_by_id[tc_id] = func_name
             parts = _assistant_tool_calls_to_parts(m)
             contents.append({"role": gemini_role, "parts": parts})
+            prev_was_tool_response = False
         elif role == "tool":
-            contents.append(
-                {
-                    "role": "user",
-                    "parts": [
-                        {
-                            "functionResponse": {
-                                # Gemini requires the function name in the response;
-                                # _tool_name is injected by the caller. Falls back to
-                                # "function" for legacy tool messages that lack it.
-                                "name": m.get("_tool_name", "function"),
-                                "response": {"result": m["content"]},
-                            }
-                        }
-                    ],
-                }
+            # Resolve functionResponse.name from explicit _tool_name or the matching
+            # preceding tool_call; fall back to "function" for legacy standalone messages.
+            tool_call_id = m.get("tool_call_id")
+            resolved_name = (
+                m.get("_tool_name")
+                or (tool_names_by_id.get(tool_call_id) if isinstance(tool_call_id, str) else None)
+                or "function"
             )
+            response_part = {
+                "functionResponse": {
+                    "name": resolved_name,
+                    "response": {"result": m["content"]},
+                }
+            }
+            # Gemini requires parallel functionResponse parts to be grouped in one user turn.
+            if prev_was_tool_response and contents:
+                contents[-1]["parts"].append(response_part)
+            else:
+                contents.append({"role": "user", "parts": [response_part]})
+                prev_was_tool_response = True
         else:
             parts = _content_to_gemini_parts(m.get("content"))
             contents.append({"role": gemini_role, "parts": parts})
+            prev_was_tool_response = False
 
     payload["contents"] = contents
 
@@ -278,6 +366,16 @@ def _chat_to_gemini(
             gen_config[gemini_key] = remaining.pop(openai_key)
     if "temperature" in remaining:
         gen_config["temperature"] = remaining.pop("temperature")
+    reasoning_effort = remaining.pop("reasoning_effort", None)
+    if reasoning_effort is not None and reasoning_effort != "":
+        effort = validate_effort_or_llm_error(reasoning_effort, "Gemini", GEMINI_EFFORTS)
+        if effort is not None:
+            raw_max_output = gen_config.get("maxOutputTokens")
+            gen_config["thinkingConfig"] = _build_thinking_config(
+                effort,
+                model,
+                max_output_tokens=raw_max_output if isinstance(raw_max_output, int) else None,
+            )
 
     if gen_config:
         payload["generationConfig"] = gen_config
@@ -303,14 +401,17 @@ def _assistant_tool_calls_to_parts(
         parts.append({"text": content})
     for tc in m["tool_calls"]:
         func = tc["function"]
-        parts.append(
-            {
-                "functionCall": {
-                    "name": func["name"],
-                    "args": json.loads(func["arguments"]),
-                }
+        raw_args = func.get("arguments")
+        args = json.loads(raw_args) if raw_args else {}
+        part: dict[str, Any] = {
+            "functionCall": {
+                "name": func["name"],
+                "args": args,
             }
-        )
+        }
+        if thought_signature := extract_thought_signature(tc):
+            part["thoughtSignature"] = thought_signature
+        parts.append(part)
     return parts
 
 
@@ -417,6 +518,35 @@ def _convert_tools(
 # ── Response translation ──────────────────────────────────
 
 
+def _gemini_function_call_to_tool_call(
+    part: dict[str, Any],
+    *,
+    index: int | None = None,
+) -> dict[str, Any]:
+    """Convert a Gemini ``functionCall`` part to a Chat Completions tool call dict."""
+    fc = part["functionCall"]
+    raw_id = fc.get("id")
+    if isinstance(raw_id, str) and raw_id:
+        call_id = raw_id
+    else:
+        # Fresh UUID avoids call_id collisions for identical parallel or repeated calls.
+        call_id = f"call_{uuid.uuid4().hex[:12]}"
+
+    tool_call: dict[str, Any] = {
+        "id": call_id,
+        "type": "function",
+        "function": {
+            "name": fc["name"],
+            "arguments": json.dumps(fc.get("args") or {}),
+        },
+    }
+    if index is not None:
+        tool_call["index"] = index
+    if thought_signature := extract_thought_signature(part):
+        tool_call["thoughtSignature"] = thought_signature
+    return tool_call
+
+
 def _gemini_to_chat(
     resp: dict[str, Any],
     model: str,
@@ -436,30 +566,32 @@ def _gemini_to_chat(
     parts = candidate.get("content", {}).get("parts", [])
 
     text_parts: list[str] = []
+    thought_parts: list[str] = []
     tool_calls: list[dict[str, Any]] = []
 
     for part in parts:
         if "text" in part:
-            text_parts.append(part["text"])
-        elif "functionCall" in part:
-            fc = part["functionCall"]
-            # Gemini doesn't provide call IDs — generate deterministic ones
-            call_id = hashlib.md5(json.dumps(fc, sort_keys=True).encode()).hexdigest()[:12]
-            tool_calls.append(
-                {
-                    "id": f"call_{call_id}",
-                    "type": "function",
-                    "function": {
-                        "name": fc["name"],
-                        "arguments": json.dumps(fc.get("args", {})),
-                    },
-                }
-            )
+            text = part["text"]
+            if isinstance(text, str) and text:
+                if part.get("thought") is True:
+                    thought_parts.append(text)
+                else:
+                    text_parts.append(text)
+        if "functionCall" in part:
+            tool_calls.append(_gemini_function_call_to_tool_call(part))
 
     finish_reason = _normalize_finish_reason(candidate.get("finishReason"))
 
     content = "\n".join(text_parts) if text_parts else None
     usage = _extract_usage(resp.get("usageMetadata", {}))
+
+    message: dict[str, Any] = {
+        "role": "assistant",
+        "content": content,
+        "tool_calls": tool_calls or None,
+    }
+    if thought_parts:
+        message["reasoning_content"] = "\n".join(thought_parts)
 
     return {
         "id": f"gemini-{int(time.time())}",
@@ -469,11 +601,7 @@ def _gemini_to_chat(
         "choices": [
             {
                 "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": content,
-                    "tool_calls": tool_calls or None,
-                },
+                "message": message,
                 "finish_reason": finish_reason,
             }
         ],
@@ -483,11 +611,15 @@ def _gemini_to_chat(
 
 def _gemini_stream_chunk_to_chat(
     data: dict[str, Any],
+    *,
+    tool_call_index_start: int = 0,
 ) -> Iterator[dict[str, Any]]:
     """
     Convert a single Gemini streaming chunk to Chat Completions chunks.
 
     :param data: A parsed Gemini SSE data dict.
+    :param tool_call_index_start: Starting tool-call index for this frame so
+        multi-frame parallel calls keep distinct indices.
     :returns: Iterator of Chat Completions chunk dicts.
     """
     candidates = data.get("candidates", [])
@@ -514,25 +646,30 @@ def _gemini_stream_chunk_to_chat(
     # repeated index. Gemini returns parallel calls as multiple ``functionCall``
     # parts in one chunk, so a fixed ``0`` would collapse them into a single
     # corrupted call. Count tool calls so each gets its own index.
-    tool_call_index = 0
+    tool_call_index = tool_call_index_start
     for part in parts:
         if "text" in part:
-            yield {
-                "id": f"gemini-{int(time.time())}",
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": None,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {"content": part["text"]},
-                        "finish_reason": None,
-                    }
-                ],
-            }
-        elif "functionCall" in part:
-            fc = part["functionCall"]
-            call_id = hashlib.md5(json.dumps(fc, sort_keys=True).encode()).hexdigest()[:12]
+            text = part["text"]
+            if isinstance(text, str) and text:
+                delta: dict[str, Any] = (
+                    {"reasoning_content": text}
+                    if part.get("thought") is True
+                    else {"content": text}
+                )
+                yield {
+                    "id": f"gemini-{int(time.time())}",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": None,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": delta,
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+        if "functionCall" in part:
             yield {
                 "id": f"gemini-{int(time.time())}",
                 "object": "chat.completion.chunk",
@@ -543,15 +680,7 @@ def _gemini_stream_chunk_to_chat(
                         "index": 0,
                         "delta": {
                             "tool_calls": [
-                                {
-                                    "index": tool_call_index,
-                                    "id": f"call_{call_id}",
-                                    "type": "function",
-                                    "function": {
-                                        "name": fc["name"],
-                                        "arguments": json.dumps(fc.get("args", {})),
-                                    },
-                                }
+                                _gemini_function_call_to_tool_call(part, index=tool_call_index)
                             ]
                         },
                         "finish_reason": None,
