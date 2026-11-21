@@ -351,6 +351,12 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
         own_tool_names=_own_tool_names(root, local_tools, mcp_servers),
         agent_name=raw.get("name"),
     )
+    tool_groups = resolve_file_tool_group(
+        tool_groups,
+        raw.get("tool_groups"),
+        builtins=tools_config.builtins,
+        agent_name=raw.get("name"),
+    )
 
     return AgentSpec(
         spec_version=spec_version,
@@ -637,6 +643,54 @@ def resolve_memory_tool_group(
     if hindsight or clashes:
         return replace(tool_groups, memory=False)
     return tool_groups
+
+
+_REMOVED_FILE_TOOLS = frozenset({"upload_file", "list_files", "download_file"})
+
+
+def resolve_file_tool_group(
+    tool_groups: ToolGroupsConfig,
+    raw_tool_groups: object,
+    *,
+    builtins: Iterable[BuiltinToolConfig],
+    agent_name: str | None,
+) -> ToolGroupsConfig:
+    """
+    Keep the file tools off for an agent that still declares their removed names.
+
+    ``upload_file``, ``list_files`` and ``download_file`` became the default
+    ``sys_upload_file``, ``sys_list_files`` and ``sys_download_file``. A policy
+    written for an old name does not match the new one, so an agent that still
+    lists an old name gets no file tools until those entries are removed.
+
+    :param tool_groups: The parsed groups.
+    :param raw_tool_groups: The raw ``tool_groups:`` value, to tell an explicit
+        ``files: true`` from the default.
+    :param builtins: The spec's ``tools.builtins`` entries.
+    :param agent_name: The spec's name, for the warning.
+    :returns: *tool_groups*, with ``files`` off when a removed name is declared.
+    :raises OmnigentError: If ``files: true`` is set alongside a removed name.
+    """
+    removed = sorted({b.name for b in builtins} & _REMOVED_FILE_TOOLS)
+    if not removed:
+        return tool_groups
+    if isinstance(raw_tool_groups, dict) and raw_tool_groups.get("files") is True:
+        raise OmnigentError(
+            f"tool_groups.files: true conflicts with the removed {', '.join(removed)} "
+            "builtins: remove them from tools.builtins, and rename any policy selector "
+            "that names them to the sys_ tool.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if tool_groups.files:
+        _log.warning(
+            "Agent %r declares the removed %s builtins, so its sys_upload_file, "
+            "sys_list_files and sys_download_file tools stay off: a policy written for "
+            "the old names would not apply to them. Remove those tools.builtins entries "
+            "and rename any policy selector that names them.",
+            agent_name,
+            ", ".join(removed),
+        )
+    return replace(tool_groups, files=False)
 
 
 def _reject_orphaned_agent_id_tools(groups: ToolGroupsConfig, *, spawn: bool) -> None:
