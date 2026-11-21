@@ -2,6 +2,7 @@ import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as EditorLinksModule from "@/lib/editorLinks";
 import type * as NativeBridgeModule from "@/lib/nativeBridge";
+import type * as RevealInFileManagerModule from "../RevealInFileManager";
 import { isCommandListed, usePaletteCommandsStore } from "@/store/paletteCommands";
 import { FileActionHost, fileLink } from "./FileActionHost";
 import { requestFileAction, useFileActionStore } from "./fileActionStore";
@@ -10,11 +11,12 @@ import { FileViewerContext } from "../FileViewerContext";
 import { resolveFileCommandTarget } from "./target";
 import { useFileCommandMenu } from "./useFileCommandMenu";
 
-const { copyText, launchEditorLink, toast, shell } = vi.hoisted(() => ({
+const { copyText, launchEditorLink, revealInFileManager, toast, shell } = vi.hoisted(() => ({
   copyText: vi.fn<(text: string) => Promise<void>>(),
   launchEditorLink: vi.fn(),
   toast: { success: vi.fn(), error: vi.fn() },
-  shell: { ios: false },
+  revealInFileManager: vi.fn(),
+  shell: { ios: false, reveal: true },
 }));
 vi.mock("@/lib/clipboard", () => ({ copyText }));
 vi.mock("sonner", () => ({ toast }));
@@ -25,8 +27,14 @@ vi.mock("@/lib/editorLinks", async (importOriginal) => ({
 vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
   ...(await importOriginal<typeof NativeBridgeModule>()),
   isIOSShell: () => shell.ios,
+  supportsFileReveal: () => shell.reveal,
 }));
 vi.mock("@/lib/desktopHostId", () => ({ useDesktopHostId: () => "this-mac" }));
+vi.mock("../RevealInFileManager", async (importOriginal) => ({
+  ...(await importOriginal<typeof RevealInFileManagerModule>()),
+  fileManagerName: () => "Finder",
+  revealInFileManager,
+}));
 vi.mock("@/hooks/useHostSshTarget", () => ({
   useHostSshTarget: (hostId: string | null) => (hostId === "dev-box" ? "dev-box.ssh" : null),
 }));
@@ -45,6 +53,7 @@ function target(
 beforeEach(() => {
   copyText.mockReset().mockResolvedValue(undefined);
   shell.ios = false;
+  shell.reveal = true;
   render(<FileActionHost />);
 });
 
@@ -106,6 +115,20 @@ describe("FileActionHost", () => {
     expect(link.searchParams.get("file")).toBe("docs/a b.md");
   });
 
+  it("shows this machine's files in the file manager", () => {
+    act(() => requestFileAction(target("src/main.ts"), "reveal"));
+    expect(revealInFileManager).toHaveBeenCalledWith({
+      hostId: "this-mac",
+      path: "/repo/src/main.ts",
+    });
+  });
+
+  it("reveals nothing in a desktop shell too old to show files", () => {
+    shell.reveal = false;
+    act(() => requestFileAction(target("src/main.ts"), "reveal"));
+    expect(revealInFileManager).not.toHaveBeenCalled();
+  });
+
   it("opens this machine's files in an editor directly", () => {
     act(() => requestFileAction(target("src/main.ts"), "open-in-vscode"));
     expect(launchEditorLink).toHaveBeenCalledWith("vscode://file/repo/src/main.ts");
@@ -123,12 +146,14 @@ describe("FileActionHost", () => {
     expect(launchEditorLink).not.toHaveBeenCalled();
   });
 
-  it("opens a remote host's file in an editor over SSH", () => {
+  it("opens a remote host's file over SSH, but never reveals it", () => {
     const remote = target("src/main.ts", {
       root: "/repo",
       hostId: "dev-box",
       conversationId: "conv_1",
     });
+    act(() => requestFileAction(remote, "reveal"));
+    expect(revealInFileManager).not.toHaveBeenCalled();
     act(() => requestFileAction(remote, "open-in-cursor"));
     expect(launchEditorLink).toHaveBeenCalledWith(expect.stringContaining("dev-box.ssh"));
   });
@@ -140,10 +165,12 @@ describe("FileActionHost", () => {
       conversationId: "conv_1",
       deleted: true,
     });
+    act(() => requestFileAction(deleted, "reveal"));
     act(() => requestFileAction(deleted, "open-in-vscode"));
     act(() =>
       requestFileAction(target("a.md", { root: "/repo", hostId: "this-mac" }), "copy-link"),
     );
+    expect(revealInFileManager).not.toHaveBeenCalled();
     expect(launchEditorLink).not.toHaveBeenCalled();
     expect(copyText).not.toHaveBeenCalled();
     expect(toast.success).not.toHaveBeenCalled();
@@ -185,6 +212,7 @@ describe("the focused file in ⌘K", () => {
       "file.copy-path",
       "file.copy-relative-path",
       "file.copy-link",
+      "file.reveal",
       "file.open-in-vscode",
       "file.open-in-cursor",
     ]);

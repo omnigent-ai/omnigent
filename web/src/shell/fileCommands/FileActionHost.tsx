@@ -6,6 +6,7 @@ import { useEffect } from "react";
 import { toast } from "sonner";
 import { CODE_EDITORS, launchEditorLink } from "@/lib/editorLinks";
 import { useRebasePath } from "@/lib/routing";
+import { revealInFileManager } from "../RevealInFileManager";
 import { isCommandAvailable } from "@/store/paletteCommands";
 import { copyWithToast } from "./copyWithToast";
 import { rememberPreferredEditor } from "./preferredEditor";
@@ -74,7 +75,7 @@ function FileActionRunner({ request }: { request: FileActionRequest }) {
   }, []);
 
   function runFileAction(id: HostedFileCommandId) {
-    const { relativePath, conversationId } = target;
+    const { relativePath, absolutePath, conversationId } = target;
     switch (id) {
       case "copy-path":
       case "copy-relative-path": {
@@ -95,6 +96,11 @@ function FileActionRunner({ request }: { request: FileActionRequest }) {
             "Link copied",
             "Couldn't copy the link",
           );
+        }
+        return;
+      case "reveal":
+        if (target.hostId !== null && absolutePath !== null) {
+          revealInFileManager({ hostId: target.hostId, path: absolutePath });
         }
         return;
       default: {

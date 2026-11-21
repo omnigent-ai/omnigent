@@ -16,6 +16,8 @@ export const REPOSITORY_FILE_ENVIRONMENT: FileCommandEnvironment = {
   local: false,
   sshTarget: null,
   linkable: false,
+  revealSupported: false,
+  fileManager: "",
 };
 
 /**
