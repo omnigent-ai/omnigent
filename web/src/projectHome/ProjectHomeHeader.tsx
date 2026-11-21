@@ -34,6 +34,7 @@ import { useProjectFolderMenu } from "@/shell/Sidebar";
 import { projectHomePath } from "./projectHomeNavigation";
 import { useProjectTicketsEnabled, useTicketStagesEnabled } from "./useProjectTickets";
 import { ProjectTicketStagesDialog } from "./ProjectTicketStagesDialog";
+import { ProjectTicketSources } from "./ProjectTicketSources";
 
 interface ProjectComposerState {
   open: boolean;
@@ -58,10 +59,10 @@ export const useProjectBoardSearchStore = create<ProjectBoardSearchState>((set) 
 }));
 
 function useProjectHomeConfig(projectName: string) {
-  const { data: projects, isLoading: projectsLoading } = useProjects();
+  const { data: projects, isLoading: projectsLoading, error: projectsError } = useProjects();
   const projectId = projects?.find((project) => project.name === projectName)?.id ?? null;
   const { data: config } = useProjectConfig(projectId);
-  return { projectId, config, projectsLoading };
+  return { projectId, config, projectsLoading, projectsError };
 }
 
 /**
@@ -94,6 +95,7 @@ export function ProjectHomeTitle({ projectName }: { projectName: string }) {
 export function ProjectHomeHeaderActions({ projectName }: { projectName: string }) {
   const isMobile = useIsMobileViewport();
   const tickets = useProjectTicketsEnabled();
+  const { projectId, projectsLoading, projectsError } = useProjectHomeConfig(projectName);
   return (
     <>
       {tickets ? (
@@ -105,6 +107,9 @@ export function ProjectHomeHeaderActions({ projectName }: { projectName: string 
         </Button>
       ) : (
         <ProjectBoardSearch />
+      )}
+      {tickets && !projectsLoading && !projectsError && (
+        <ProjectTicketSources key={projectName} projectId={projectId} projectName={projectName} />
       )}
       <ProjectNewSessionButton projectName={projectName} />
       {tickets && (

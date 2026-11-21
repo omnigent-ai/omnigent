@@ -18,6 +18,8 @@ import {
 
 const mocks = vi.hoisted(() => ({
   isMobile: false,
+  projectsLoading: false,
+  projectsError: null as Error | null,
   menuArgs: [] as unknown[],
   actions: {
     openRename: vi.fn(),
@@ -37,12 +39,35 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => {
   const actual = await importOriginal<typeof ConversationsModule>();
   return {
     ...actual,
-    useProjects: () => ({ data: [{ id: "project-1", name: "Payments" }], isLoading: false }),
+    useProjects: () => ({
+      data: [
+        { id: "project-1", name: "Payments" },
+        { id: "project-2", name: "Billing & Payments" },
+      ],
+      isLoading: mocks.projectsLoading,
+      error: mocks.projectsError,
+    }),
     useProjectConfig: () => ({ data: { icon: "💸" } }),
   };
 });
 
 vi.mock("@/components/ProjectIconPicker", () => ({ ProjectLandingIcon: () => null }));
+
+vi.mock("./ProjectTicketSources", () => ({
+  ProjectTicketSources: ({
+    projectId,
+    projectName,
+  }: {
+    projectId: string | null;
+    projectName: string;
+  }) => (
+    <section aria-label="Project sources">
+      <button type="button" data-project-id={projectId} data-project-name={projectName}>
+        Connect source
+      </button>
+    </section>
+  ),
+}));
 
 vi.mock("./ProjectTicketStagesDialog", () => ({
   ProjectTicketStagesDialog: ({
@@ -86,6 +111,8 @@ function renderButton() {
 
 beforeEach(() => {
   mocks.isMobile = false;
+  mocks.projectsLoading = false;
+  mocks.projectsError = null;
   useProjectComposerStore.setState({ open: false });
   useProjectBoardSearchStore.setState({ query: "" });
   vi.clearAllMocks();
@@ -215,12 +242,30 @@ describe("ProjectNewSessionButton", () => {
     expect(screen.queryByRole("searchbox")).toBeNull();
     expect(screen.queryByRole("combobox")).toBeNull();
     const button = screen.getByRole("button", { name: "New session" });
+    const source = screen.getByRole("button", { name: "Connect source" });
+    expect(source).toHaveAttribute("data-project-id", "project-2");
+    expect(source).toHaveAttribute("data-project-name", "Billing & Payments");
+    expect(source.closest("section")?.nextElementSibling).toBe(button);
     expect(button).not.toHaveAttribute("aria-expanded");
     fireEvent.click(button);
     expect(screen.getByTestId("location")).toHaveTextContent(
       /^\/\?project=Billing%20%26%20Payments$/,
     );
     expect(useProjectComposerStore.getState().open).toBe(false);
+  });
+
+  it.each(["loading", "failed"])("hides sources while project lookup is %s", (state) => {
+    mocks.projectsLoading = state === "loading";
+    mocks.projectsError = state === "failed" ? new Error("Projects unavailable") : null;
+    render(
+      <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, project_tickets: true }}>
+        <MemoryRouter>
+          <ProjectHomeHeaderActions projectName="Payments" />
+        </MemoryRouter>
+      </CapabilitiesProvider>,
+    );
+    expect(screen.queryByRole("button", { name: "Connect source" })).toBeNull();
+    expect(screen.getByRole("button", { name: "New session" })).toBeInTheDocument();
   });
 
   it("shows and hides the floating composer", () => {

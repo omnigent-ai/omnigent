@@ -24,7 +24,6 @@ import {
   TicketError,
   TicketTags,
 } from "./TicketControls";
-import { ProjectTicketSources } from "./ProjectTicketSources";
 import { TicketStageBadge } from "./TicketStageAppearance";
 import {
   useRelatedTickets,
@@ -99,7 +98,6 @@ function TicketBoard({
   );
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-      <ProjectTicketSources key={projectName} projectId={projectId} projectName={projectName} />
       <TicketError error={completing || reviewing ? null : update.error} />
       {configuration.isPending && <Spinner className="m-6" aria-label="Loading stages" />}
       <TicketError error={configuration.error} />

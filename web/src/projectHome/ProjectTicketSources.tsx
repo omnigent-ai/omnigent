@@ -138,7 +138,7 @@ function ProjectSourcesControl({ projectId, projectName }: ProjectTicketSourcesP
   }, [open, showPicker]);
 
   return (
-    <section aria-label="Project sources" className="flex shrink-0 justify-end px-4 pt-1 pb-3">
+    <section aria-label="Project sources" className="flex shrink-0">
       <Popover
         open={open}
         onOpenChange={(nextOpen) => {
