@@ -260,7 +260,7 @@ def test_model_turn_shares_and_reads_session_files_with_the_default_tools(
     ("spec_overrides", "expected"),
     [
         ({"tool_groups": {"files": False}}, set()),
-        ({"tools": {"builtins": sorted(_OLD_NAMES)}}, _FILE_TOOLS),
+        ({"tools": {"builtins": sorted(_OLD_NAMES)}}, set()),
     ],
     ids=["files-group-off", "old-builtin-names"],
 )
@@ -273,8 +273,9 @@ def test_spec_controls_which_file_tools_a_turn_is_offered(
 ) -> None:
     """
     ``tool_groups.files: false`` removes the three tools from what the model is
-    offered, and the removed names in ``tools.builtins`` enable nothing: the
-    model still sees only the ``sys_`` tools.
+    offered. An agent that still lists the removed names in ``tools.builtins``
+    is offered none of them either, so a policy written for the old names is
+    never bypassed by the new ones.
     """
     model = f"mock-files-spec-{uuid.uuid4().hex[:8]}"
     configure_mock_llm(

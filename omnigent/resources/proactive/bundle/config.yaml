@@ -15,7 +15,9 @@ executor:
 # Only the Inbox tools are opted in; every other framework tool group the agent
 # does not need is off. The session discovery tools (sys_session_list,
 # sys_session_get_history, sys_session_get_info) are always registered and are
-# limited server-side to sessions the user can see.
+# limited server-side to sessions the user can see. The session file tools are
+# denied by the no_session_files policy below rather than `files: false`,
+# because runners released before that group reject the key.
 tool_groups:
   user_inbox: true
   browser: false
@@ -26,7 +28,6 @@ tool_groups:
   projects: false
   journal: false
   memory: false
-  files: false
 
 async: false
 
@@ -55,6 +56,16 @@ guardrails:
         arguments:
           gate_pushes: true
           risky_action: DENY
+    no_session_files:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.policies.function.make_fixed_action_callable
+        arguments:
+          action: deny
+          reason: The proactive agent does not share or read session files.
+          on_phases: [tool_call]
+          on_tools: [sys_upload_file, sys_list_files, sys_download_file]
 
 prompt: |
   You are the user's proactive assistant. You run on a schedule, without the

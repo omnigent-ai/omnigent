@@ -518,6 +518,10 @@ def _render_status_tool(
         if parsed.raw.startswith("Error:"):
             return _status_panel(ex.name, parsed.raw, theme, border_style=theme.error)
         return None
+    # A runner download returns the file's own content, even a JSON document;
+    # only the in-process tool returns saved-file metadata with a path.
+    if ex.name == "sys_download_file" and "path" not in obj:
+        return None
 
     try:
         fields = StatusToolFields.model_validate(obj)

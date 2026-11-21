@@ -633,6 +633,7 @@ def test_render_status_tool_raw_error_prefix() -> None:
             ["downloaded file", "notes.txt", "2.0 KB"],
         ),
     ],
+    ids=["upload", "in-process-download-metadata"],
 )
 def test_render_session_file_tools(
     tool_name: str, output: dict[str, object], expected: list[str]
@@ -644,6 +645,21 @@ def test_render_session_file_tools(
     rendered = _render_to_text(result)
     for text in expected:
         assert text in rendered, rendered
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["brief from the user\nsecond line", json.dumps({"name": "metrics", "rows": [1, 2]})],
+    ids=["text", "json-document"],
+)
+def test_runner_download_content_falls_through_to_the_generic_panel(content: str) -> None:
+    """
+    The runner's ``sys_download_file`` returns the file's own content, so even a
+    JSON document is shown as content rather than as a download status panel.
+    """
+    ex = _tool_ex("sys_download_file", output=content, arguments={"file_id": "file_abc123"})
+    result = DEFAULT_TOOL_RENDERERS.render_tool(ex, parse_tool_output(content), _theme())
+    assert result is None, _render_to_text(result)
 
 
 def test_render_terminal_launch_success() -> None:
