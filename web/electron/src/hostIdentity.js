@@ -4,10 +4,15 @@ const { performance } = require("node:perf_hooks");
 
 const SESSION_HOST_PROTOCOL = 1;
 const SSH_PREVIEW_PROTOCOL = 1;
+const TRUSTED_REMOTE_PREVIEW_PROTOCOL = 1;
 
 /** Local previews remain bound to the session host that received the permission. */
 function hasHostLocalAccess(context) {
-  return context?.hostIsThisMachine === true || context?.hostIsSshPreview === true;
+  return (
+    context?.hostIsThisMachine === true ||
+    context?.hostIsSshPreview === true ||
+    context?.hostIsTrustedRemotePreview === true
+  );
 }
 
 /** Return whether the host is this machine and its live daemon serves the server.
@@ -43,5 +48,6 @@ module.exports = {
   isHostThisMachine,
   SESSION_HOST_PROTOCOL,
   SSH_PREVIEW_PROTOCOL,
+  TRUSTED_REMOTE_PREVIEW_PROTOCOL,
   hasHostLocalAccess,
 };

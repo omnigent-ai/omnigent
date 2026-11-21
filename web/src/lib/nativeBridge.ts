@@ -30,11 +30,13 @@ export type SidebarDragPhase = "begin" | "move" | "open" | "close";
 // Mirrors the protocol versions in electron/src/hostIdentity.js.
 export const SESSION_HOST_PROTOCOL = 1;
 export const SSH_PREVIEW_PROTOCOL = 1;
+export const TRUSTED_REMOTE_PREVIEW_PROTOCOL = 1;
 
 export interface BrowserHostOptions {
   sourceHostId?: string | null;
   sessionHostProtocol?: number;
   sshPreviewProtocol?: number;
+  trustedRemotePreviewProtocol?: number;
   navigationRetryToken?: string;
   sourceSshTarget?: string;
 }
@@ -44,6 +46,7 @@ export interface BrowserNavigationResult {
   created?: boolean;
   hostIsThisMachine?: boolean;
   sshPreviewHost?: boolean;
+  trustedRemotePreviewHost?: boolean;
   retryWithFreshHost?: boolean;
   navigationRetryToken?: string;
   error?: string;
@@ -605,6 +608,7 @@ export interface DesktopFeatures {
   chromeCookieImport?: boolean;
   /** Shell can ask to verify a remote host over SSH before allowing localhost previews. */
   sshLocalhostPreview?: boolean;
+  trustedRemoteLocalhostPreview?: boolean;
   /** This shell can show the floating New Agent panel (macOS). */
   floatingComposer?: boolean;
   /** This shell's shortcut calls take the "floatingComposer" id (macOS). */

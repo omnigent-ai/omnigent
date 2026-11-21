@@ -600,6 +600,7 @@ function registerBrowserIpc({
             opts?.sourceHostId,
             opts?.rememberedArcaHostId,
             opts?.sourceIsArcaHost,
+            r.localhostBlocked === true,
           )
         : null;
     return {
@@ -607,6 +608,9 @@ function registerBrowserIpc({
       created: r.created ?? false,
       ...(r.ok ? { hostIsThisMachine: r.entry?.agentContext?.hostIsThisMachine === true } : {}),
       ...(r.ok && r.entry?.agentContext?.hostIsSshPreview ? { sshPreviewHost: true } : {}),
+      ...(r.ok && r.entry?.agentContext?.hostIsTrustedRemotePreview
+        ? { trustedRemotePreviewHost: true }
+        : {}),
       error: hint ? `${r.error} ${hint}` : r.error,
     };
   };
@@ -768,6 +772,7 @@ function registerBrowserIpc({
       exists: true,
       hostIsThisMachine: entry.agentContext?.hostIsThisMachine === true,
       ...(entry.agentContext?.hostIsSshPreview ? { sshPreviewHost: true } : {}),
+      ...(entry.agentContext?.hostIsTrustedRemotePreview ? { trustedRemotePreviewHost: true } : {}),
       url,
       title: viewTitle(webContents), // "" once the page is gone
       ...(pendingUrl ? { pendingUrl } : {}),

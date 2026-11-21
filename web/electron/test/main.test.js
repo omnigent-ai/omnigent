@@ -7972,3 +7972,66 @@ describe("session windows (src/main.js)", () => {
     assert.equal(h.calls.windowOptions, undefined);
   });
 });
+
+describe("settings-based remote previews", () => {
+  it("requires the matching server, host and renderer protocol, and rereads settings", (t) => {
+    const server = "https://server.example.com/preview";
+    const host = "sandbox-host";
+    const h = loadNavigationHarness({ serverUrl: server });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    h.api.createBrowserRegistryForWindow(h.win);
+    const deps = h.browserIpcDeps();
+    const event = { sender: h.webContents, senderFrame: { url: server } };
+    const opts = { sourceHostId: host, sessionHostProtocol: 1, trustedRemotePreviewProtocol: 1 };
+    const context = (options = opts) => deps.getAgentContextForEvent(event, options);
+    const allowed = h.browserRegistryDeps().allowsLocalhost;
+    const save = (serverUrl, hostId) =>
+      fs.writeFileSync(
+        h.settingsPath,
+        JSON.stringify({
+          trusted_remote_hosts: [{ server_url: serverUrl, host_id: hostId }],
+        }),
+      );
+    assert.equal(allowed(context()), false);
+    save(server, host);
+    assert.equal(context().hostIsTrustedRemotePreview, true);
+    assert.equal(context().hostIsThisMachine, false);
+    assert.equal(allowed(context()), true);
+    for (const trustedRemotePreviewProtocol of [undefined, 0, 2]) {
+      assert.equal(allowed(context({ ...opts, trustedRemotePreviewProtocol })), false);
+    }
+    assert.equal(allowed(context({ ...opts, sourceHostId: "another-host" })), false);
+    const loaded = context();
+    save("https://other.example.com", host);
+    assert.equal(allowed(loaded), false);
+    save(server, "another-host");
+    assert.equal(allowed(loaded), false);
+    fs.writeFileSync(h.settingsPath, "{}");
+    assert.equal(allowed(loaded), false);
+    assert.equal(context().hostIsTrustedRemotePreview, undefined);
+  });
+
+  it("offers an exact settings entry only for a denied localhost permission", (t) => {
+    const server = "https://server.example.com";
+    const h = loadNavigationHarness({ serverUrl: server });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const event = { sender: h.webContents, senderFrame: { url: server } };
+    const hint = (url, blocked) =>
+      h
+        .browserIpcDeps()
+        .getAgentNavigationHintForEvent(event, url, 'host"quoted', undefined, false, blocked);
+    assert.match(hint("http://localhost:5173", true), /trusted_remote_hosts/);
+    assert.ok(
+      hint("http://localhost:5173", true).includes(
+        JSON.stringify({
+          server_url: `${server}/`,
+          host_id: 'host"quoted',
+        }),
+      ),
+    );
+    assert.equal(hint("http://localhost:5173", false), null);
+    assert.equal(hint("https://example.com", true), null);
+  });
+});
