@@ -1,4 +1,5 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as api from "@/lib/projectTicketsApi";
@@ -185,12 +186,18 @@ describe("Project stage editor", () => {
   });
 
   it("requires a surviving destination for populated removals and supports undo", async () => {
+    const user = userEvent.setup();
     renderEditor();
     fireEvent.click(await screen.findByRole("button", { name: "Remove Planning" }));
     expect(screen.getByRole("button", { name: "Save stages" })).toBeDisabled();
-    fireEvent.change(screen.getByLabelText("Move tickets from Planning to"), {
-      target: { value: "in_progress" },
-    });
+    await user.click(screen.getByRole("combobox", { name: "Move tickets from Planning to" }));
+    await user.click(screen.getByRole("option", { name: "Working" }));
+    expect(screen.getByRole("button", { name: "Save stages" })).toBeEnabled();
+    await user.click(screen.getByRole("combobox", { name: "Move tickets from Planning to" }));
+    await user.click(screen.getByRole("option", { name: "Choose a stage…" }));
+    expect(screen.getByRole("button", { name: "Save stages" })).toBeDisabled();
+    await user.click(screen.getByRole("combobox", { name: "Move tickets from Planning to" }));
+    await user.click(screen.getByRole("option", { name: "Working" }));
     expect(screen.getByRole("button", { name: "Save stages" })).toBeEnabled();
     fireEvent.click(screen.getByRole("button", { name: "Remove Working" }));
     expect(screen.getByRole("button", { name: "Save stages" })).toBeDisabled();
@@ -220,6 +227,7 @@ describe("Project stage editor", () => {
   });
 
   it("keeps dirty fields after a failed save and a usage refresh, then retries", async () => {
+    const user = userEvent.setup();
     vi.mocked(api.getTicketStages).mockResolvedValueOnce({
       ...structuredClone(api.DEFAULT_TICKET_STAGES),
       occupied_stage_ids: [],
@@ -236,9 +244,8 @@ describe("Project stage editor", () => {
     expect(screen.getByLabelText("Stage name 1")).toHaveValue("New");
     expect(onClose).not.toHaveBeenCalled();
     await waitFor(() => expect(screen.getByRole("button", { name: "Save stages" })).toBeDisabled());
-    fireEvent.change(screen.getByLabelText("Move tickets from Planning to"), {
-      target: { value: "in_progress" },
-    });
+    await user.click(screen.getByRole("combobox", { name: "Move tickets from Planning to" }));
+    await user.click(screen.getByRole("option", { name: "Working" }));
     fireEvent.click(screen.getByRole("button", { name: "Save stages" }));
     await waitFor(() => expect(onClose).toHaveBeenCalledOnce());
     expect(vi.mocked(api.updateTicketStages).mock.calls[1][1].stages[0]).toMatchObject({

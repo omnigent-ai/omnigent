@@ -27,6 +27,13 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
 import {
   updateTicketStages,
@@ -38,6 +45,7 @@ import { TicketError } from "./TicketControls";
 import { useTicketProject, useTicketStages } from "./useProjectTickets";
 
 const stageToken = customAlphabet("abcdefghijklmnopqrstuvwxyz0123456789", 12);
+const NO_MOVE_DESTINATION = "__none__";
 
 export function ProjectTicketStagesDialog({
   projectName,
@@ -235,24 +243,33 @@ function StageEditor({
           </div>
           <label className="grid gap-1.5">
             Move tickets from {stage.name} to
-            <select
-              aria-label={`Move tickets from ${stage.name} to`}
+            <Select
               value={stages.some((target) => target.id === moves[stage.id]) ? moves[stage.id] : ""}
               disabled={pending}
-              className="h-9 rounded-md border bg-background px-2"
-              onChange={(event) => setMoves({ ...moves, [stage.id]: event.target.value })}
+              onValueChange={(value) =>
+                setMoves({ ...moves, [stage.id]: value === NO_MOVE_DESTINATION ? "" : value })
+              }
             >
-              <option value="">
-                {occupied.has(stage.id)
-                  ? "Choose a stage…"
-                  : "No tickets currently — choose a fallback (optional)"}
-              </option>
-              {stages.map((target) => (
-                <option key={target.id} value={target.id}>
-                  {target.name || "Unnamed stage"}
-                </option>
-              ))}
-            </select>
+              <SelectTrigger aria-label={`Move tickets from ${stage.name} to`} className="w-full">
+                <SelectValue
+                  placeholder={
+                    occupied.has(stage.id)
+                      ? "Choose a stage…"
+                      : "No tickets currently — choose a fallback (optional)"
+                  }
+                />
+              </SelectTrigger>
+              <SelectContent position="popper">
+                <SelectItem value={NO_MOVE_DESTINATION}>
+                  {occupied.has(stage.id) ? "Choose a stage…" : "No fallback"}
+                </SelectItem>
+                {stages.map((target) => (
+                  <SelectItem key={target.id} value={target.id}>
+                    {target.name || "Unnamed stage"}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </label>
         </div>
       ))}
