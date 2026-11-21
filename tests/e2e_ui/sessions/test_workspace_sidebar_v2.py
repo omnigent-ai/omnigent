@@ -2,6 +2,7 @@
 
 With the flag on, a desktop client's sidebar is the tabs panel: a New Tab page, Files with
 the tree and editor, each pull request as its own page, and Back and Forward through them.
+A Files row's menu copies its path and a link to it.
 A narrow desktop window shows the tabs in its Workspace drawer. A touch client, such as a
 phone, keeps the classic drawers with the flag on, as every client does with the flag off;
 there the tabs code never loads.
@@ -233,6 +234,34 @@ def test_tabs_sidebar_files_history_and_pull_request(
     bodies = _script_bodies(page, scripts).values()
     for marker in _TABS_CODE_MARKERS:
         assert any(marker in body for body in bodies), marker
+
+
+def test_files_menu_copies_the_path_and_a_link_to_the_file(
+    page: Page, workspace_session: tuple[str, str]
+) -> None:
+    """A Files row's menu puts the file's path, then a link into the session, on the clipboard."""
+    base_url, session_id = workspace_session
+    page.context.grant_permissions(["clipboard-read", "clipboard-write"])
+    _set_flag(page, True)
+    _open_session(page, base_url, session_id, "desktop")
+    open_right_rail(page)
+    sidebar = page.get_by_role("complementary", name="Workspace")
+    expect(sidebar.get_by_role("group", name="Workspace history")).to_be_visible(timeout=60_000)
+    _open_app(page, sidebar, "Files")
+    file_row = sidebar.get_by_role("treeitem", name=re.compile(re.escape(_FILE)))
+    expect(file_row).to_be_visible(timeout=30_000)
+
+    file_row.click(button="right")
+    page.get_by_role("menuitem", name="Copy path", exact=True).click()
+    expect(page.get_by_text("Copied path", exact=True)).to_be_visible(timeout=10_000)
+    copied = page.evaluate("() => navigator.clipboard.readText()")
+    assert copied.startswith("/") and copied.endswith(f"/{_FILE}"), copied
+
+    file_row.click(button="right")
+    page.get_by_role("menuitem", name="Copy link to file", exact=True).click()
+    expect(page.get_by_text("Link copied", exact=True)).to_be_visible(timeout=10_000)
+    link = page.evaluate("() => navigator.clipboard.readText()")
+    assert re.search(rf"/c/{re.escape(session_id)}\?(?:.*&)?file={re.escape(_FILE)}", link), link
 
 
 def test_file_link_opens_its_comment_in_a_full_screen_sidebar(
