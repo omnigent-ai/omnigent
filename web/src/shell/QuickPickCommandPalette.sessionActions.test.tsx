@@ -165,6 +165,15 @@ describe("QuickPick ⌘K session actions", () => {
     expect(heading()).toBe("Actions for “Review notes”");
   });
 
+  it("lists no actions for a session still being created", async () => {
+    listSessions({ ...MINE, id: "temp:example", provisional: true }, SHARED);
+    const { input } = renderPalette();
+    openActions(input);
+    await waitFor(() => expect(heading()).toBe("Actions for “Fix the parser”"));
+    expect(screen.queryAllByRole("option")).toEqual([]);
+    expect(screen.getByText("No actions for this session.")).toBeTruthy();
+  });
+
   it("opens the session as before on a plain Enter", () => {
     const { input } = renderPalette();
     fireEvent.keyDown(input, { key: "Enter" });
