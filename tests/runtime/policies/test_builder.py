@@ -32,7 +32,7 @@ from pathlib import Path
 import pytest
 
 from omnigent.entities import Conversation
-from omnigent.runtime.policies.builder import build_policy_engine
+from omnigent.runtime.policies.builder import build_policy_engine, load_verified_session_tree
 from omnigent.spec.parser import parse
 from omnigent.spec.types import (
     AgentSpec,
@@ -1210,6 +1210,31 @@ def test_build_issues_one_read_and_one_tree_scan(
     # A conversation read is a triplet (row + metadata + labels), and so is the
     # tree scan; the preload removes one whole triplet.
     assert len(executed) == (3 if preloaded else 6), [q[:80] for q in executed]
+
+
+def test_tree_load_reads_a_wide_tree_in_one_unpaged_scan(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    A tree wider than a 100-row page still loads in one scan, unpaged.
+
+    Every policy check loads its session's spawn tree, so each further page
+    is paid on every tool call, and a paged tree costs the builder one more
+    confirming read.
+    """
+    root = conversation_store.create_conversation(title="wide-root")
+    for index in range(150):
+        conversation_store.create_conversation(
+            kind="sub_agent", parent_conversation_id=root.id, sub_agent_name=f"worker-{index}"
+        )
+
+    with _count_sql(conversation_store) as statements:
+        verified = load_verified_session_tree(root.id, conversation_store, root.id)
+
+    tree_scans = [q for q in statements if "root_conversation_id = " in " ".join(q.split())]
+    assert len(verified.rows) == 151
+    assert len(tree_scans) == 1, tree_scans
+    assert verified.paged is False
 
 
 def test_build_counts_archived_spend_and_inherits_approval(

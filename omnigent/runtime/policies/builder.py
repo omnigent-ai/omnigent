@@ -52,7 +52,11 @@ from omnigent.spec.types import (
     Phase,
     PolicySpec,
 )
-from omnigent.stores.conversation_store import ConversationStore, DailyCostState
+from omnigent.stores.conversation_store import (
+    SPAWN_TREE_READ_CAP,
+    ConversationStore,
+    DailyCostState,
+)
 from omnigent.stores.policy_store import PolicyStore
 
 _logger = logging.getLogger(__name__)
@@ -1215,10 +1219,12 @@ def _load_session_state(
     return dict(conv.session_state)
 
 
-# Page size for walking a spawn tree when summing sub-agent usage.
-# Sub-agent trees are small in practice, but we still paginate so a
-# large tree is not silently truncated (see load_session_usage).
-_SUBTREE_USAGE_PAGE_SIZE = 100
+# Page size for walking a spawn tree when summing sub-agent usage: the root
+# row plus the sub-agents one bounded tree read covers, so nearly every tree
+# loads in one read. Every policy check of a session loads its tree, and a
+# store that cannot page a tree natively rebuilds the whole tree for each page.
+# Bigger trees still page, so none is silently truncated.
+_SUBTREE_USAGE_PAGE_SIZE = SPAWN_TREE_READ_CAP + 1
 
 # Usage counters summed across a conversation subtree. Restricted to the
 # known numeric keys the PolicyEngine reads so an unexpected key in one
