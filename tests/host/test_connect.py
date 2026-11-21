@@ -42,10 +42,12 @@ from omnigent.host.connect import (
     run_host_process,
 )
 from omnigent.host.frames import (
+    CAP_CODE_HOST_INSTANCES,
     CAP_WORKTREE_CREATE_BUDGET,
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HOST_CAPABILITIES,
     LAUNCH_HANDLER_FAILED_ERROR_CODE,
+    SERVER_CAP_CODE_HOST_INSTANCES,
     SERVER_CAP_TMUX_READINESS,
     SERVER_CAPABILITIES_HEADER,
     WORKSPACE_MISSING_ERROR_CODE,
@@ -5694,6 +5696,134 @@ def test_build_runner_env_session_env_bypasses_allowlist_and_overrides_daemon_va
     assert env["ARCATERM_CAPABILITY"] == "capability-for-pane-1"
     assert env["RUNNER_SERVER_URL"] == "http://server"
     assert env["OMNIGENT_RUNNER_SESSION_ENV_NAMES"] == "ARCATERM_CAPABILITY,SSH_AUTH_SOCK"
+
+
+def test_build_runner_env_names_the_code_host_instance_file_only_from_the_host(
+    tmp_path: Path,
+) -> None:
+    """An inherited or forwarded copy never survives: only the host's own value does."""
+    from omnigent.runner.code_host_instances import (
+        CODE_HOST_INSTANCE_HOSTS_ENV_VAR,
+        CODE_HOST_INSTANCES_FILE_ENV_VAR,
+    )
+
+    planted = {
+        CODE_HOST_INSTANCES_FILE_ENV_VAR: "/tmp/planted-instances.toml",
+        CODE_HOST_INSTANCE_HOSTS_ENV_VAR: "planted.example.test",
+    }
+    common = {
+        "server_url": "http://server",
+        "runner_id": "runner_abc",
+        "binding_token": "tok",
+        "workspace": "/ws",
+        "parent_pid": 42,
+    }
+    host_file = tmp_path / "code_host_instances.toml"
+
+    served = _build_runner_env(
+        {"PATH": "/usr/bin", **planted},
+        session_env=planted,
+        code_host_instances_file=host_file,
+        code_host_instance_hosts=["code.example.test", "mirror.example.test"],
+        **common,
+    )
+    unserved = _build_runner_env({"PATH": "/usr/bin", **planted}, session_env=planted, **common)
+
+    assert served[CODE_HOST_INSTANCES_FILE_ENV_VAR] == str(host_file)
+    assert served[CODE_HOST_INSTANCE_HOSTS_ENV_VAR] == "code.example.test,mirror.example.test"
+    assert CODE_HOST_INSTANCES_FILE_ENV_VAR not in unserved
+    assert CODE_HOST_INSTANCE_HOSTS_ENV_VAR not in unserved
+
+
+@pytest.mark.parametrize(
+    ("advertise", "served"),
+    [(False, False), (True, True)],
+    ids=["server-without-instances", "server-with-instances"],
+)
+async def test_hello_advertises_code_host_instances_only_to_a_server_that_takes_them(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, advertise: bool, served: bool
+) -> None:
+    """The host reads its file once at start and serves it only after the server's header."""
+    from websockets.asyncio.server import serve
+
+    cli = tmp_path / "bin" / "example-cli"
+    cli.parent.mkdir()
+    cli.write_text("#!/bin/sh\nexit 0\n")
+    cli.chmod(0o755)
+    config_home = tmp_path / "config"
+    config_home.mkdir()
+    (config_home / "code_host_instances.toml").write_text(
+        "[[instance]]\n"
+        'id = "internal"\nprovider = "github"\ndisplay_name = "Internal code host"\n'
+        'hosts = ["code.example.test"]\n'
+        f'cli = ["{cli}", "--fixed"]\n'
+        'auth = "cli"\ncapabilities = ["line_counts"]\n'
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    received: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+
+    def _process_response(_connection: object, _request: object, response: Response) -> Response:
+        if advertise:
+            response.headers[SERVER_CAPABILITIES_HEADER] = SERVER_CAP_CODE_HOST_INSTANCES
+        return response
+
+    async def _handler(ws: object) -> None:
+        received.set_result(await ws.recv())  # type: ignore[attr-defined]
+        await ws.wait_closed()  # type: ignore[attr-defined]
+
+    async with serve(_handler, "127.0.0.1", 0, process_response=_process_response) as server:
+        port = next(iter(server.sockets)).getsockname()[1]
+        host = HostProcess(
+            identity=HostIdentity(host_id="host_test_connect", name="test-laptop"),
+            server_url=f"http://127.0.0.1:{port}",
+        )
+        host._configured_harnesses = {}
+        monkeypatch.setattr(host, "_build_connect_headers", dict)
+        monkeypatch.setattr(host, "_initialize_capabilities", AsyncMock())
+        monkeypatch.setattr(host, "_ensure_owner_user_id", AsyncMock())
+        connect_task = asyncio.create_task(host._connect_and_serve())
+        try:
+            hello = json.loads(await asyncio.wait_for(received, timeout=5.0))
+        finally:
+            connect_task.cancel()
+            with contextlib.suppress(BaseException):
+                await connect_task
+            _cleanup_host(host)
+
+    assert (CAP_CODE_HOST_INSTANCES in hello["capabilities"]) is served
+    assert host._serves_code_host_instances() is served
+    if served:
+        assert hello["code_host_instances"] == [
+            {
+                "id": "internal",
+                "display_name": "Internal code host",
+                "hosts": ["code.example.test"],
+            }
+        ]
+    else:
+        assert "code_host_instances" not in hello
+    # Summaries only: the command and its arguments never leave the host.
+    assert str(cli) not in json.dumps(hello) and "--fixed" not in json.dumps(hello)
+
+
+def test_a_refused_instance_file_serves_no_instances_and_logs_no_values(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    (tmp_path / "code_host_instances.toml").write_text(
+        '[[instance]]\nid = "internal"\nprovider = "github"\ndisplay_name = "X"\n'
+        'hosts = ["code.example.test"]\ncli = ["/bin/sh"]\nauth = "cli"\n'
+        'env_set = { PROJECT_KEY = "value-that-must-not-be-logged" }\n'
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        host = _make_host_process()
+
+    assert host._code_host_instances.instances == ()
+    assert "secret-name rule" in caplog.text
+    assert "value-that-must-not-be-logged" not in caplog.text
+    assert "PROJECT_KEY" not in caplog.text
+    _cleanup_host(host)
 
 
 def test_dispatch_trace_context_reaches_runner_but_not_daemon(

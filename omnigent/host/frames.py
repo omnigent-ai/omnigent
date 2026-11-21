@@ -101,6 +101,9 @@ CAP_WORKTREE_CREATE_BUDGET = "worktree_create_budget"
 CAP_CLONE_REPOSITORY = "clone_repository"
 # The host answers ``host.workspace_call`` (the workspace API through the server).
 CAP_WORKSPACE_API = "workspace_api"
+# The host serves code host instances its own config declares, listed in
+# ``HostHelloFrame.code_host_instances``. Sent only to a server that turned them on:
+CAP_CODE_HOST_INSTANCES = "code_host_instances"
 # The host's runners accept session messages up to ``SESSION_MESSAGE_MAX_CHARS``
 # (32,000) instead of 8,000, so automations can send long instructions:
 CAP_LONG_SESSION_MESSAGES = "long_session_messages"
@@ -139,6 +142,9 @@ SERVER_CAPABILITIES_HEADER = "X-Omnigent-Server-Capabilities"
 # readiness decoder rejects the whole frame for it, so hosts down-map it to True.
 SERVER_CAP_TMUX_READINESS = "tmux_readiness"
 SERVER_CAPABILITIES: list[str] = [SERVER_CAP_TMUX_READINESS]
+# Sent only while the server's code host instances flag is on; a host serves its
+# configured instances only to such a server.
+SERVER_CAP_CODE_HOST_INSTANCES = "code_host_instances"
 
 
 def parse_server_capabilities(header_value: str | None) -> frozenset[str]:
@@ -351,6 +357,10 @@ class HostHelloFrame:
     :param workspace_token_key: Key the server signs direct-access tokens with
         (see :mod:`omnigent.host.workspace_tokens`). Sent with
         ``workspace_socket``; never logged.
+    :param code_host_instances: The code host instances the host serves, each
+        ``{"id", "display_name", "hosts"}``, e.g. ``{"id": "internal", "display_name":
+        "Internal code host", "hosts": ["code.example.test"]}``. Never a command or
+        environment. ``None`` when the host serves none, or from an older host.
     """
 
     version: str
@@ -368,6 +378,7 @@ class HostHelloFrame:
     workspace_socket: str | None = None
     workspace_token_key: str | None = field(default=None, repr=False)
     recover_interrupted_sessions: bool = False
+    code_host_instances: list[dict[str, Any]] | None = None
 
 
 @dataclass
@@ -1835,6 +1846,11 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "workspace_socket": frame.workspace_socket,
                 "workspace_token_key": frame.workspace_token_key,
                 "recover_interrupted_sessions": frame.recover_interrupted_sessions,
+                **(
+                    {"code_host_instances": frame.code_host_instances}
+                    if frame.code_host_instances is not None
+                    else {}
+                ),
             }
         )
     if isinstance(frame, HostConnectionErrorFrame):
@@ -3034,7 +3050,37 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         workspace_socket=_optional_nullable_str(msg, "workspace_socket"),
         workspace_token_key=_optional_nullable_str(msg, "workspace_token_key"),
         recover_interrupted_sessions=_optional_bool(msg, "recover_interrupted_sessions"),
+        code_host_instances=_decode_code_host_instances(msg.get("code_host_instances")),
     )
+
+
+def _decode_code_host_instances(raw: object) -> list[dict[str, Any]] | None:
+    """Return a hello's code host instance summaries, or ``None`` for any other shape.
+
+    A summary is exactly ``id``, ``display_name`` and ``hosts``; anything else, such
+    as a command or environment, makes the whole list unknown rather than accepted.
+    """
+    if not isinstance(raw, list):
+        return None
+    summaries: list[dict[str, Any]] = []
+    for entry in raw:
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"id", "display_name", "hosts"}
+            or not isinstance(entry["id"], str)
+            or not isinstance(entry["display_name"], str)
+            or not isinstance(entry["hosts"], list)
+            or not all(isinstance(host, str) for host in entry["hosts"])
+        ):
+            return None
+        summaries.append(
+            {
+                "id": entry["id"],
+                "display_name": entry["display_name"],
+                "hosts": list(entry["hosts"]),
+            }
+        )
+    return summaries
 
 
 def _decode_harness_readiness(msg: _JsonObject) -> HostHarnessReadinessFrame:

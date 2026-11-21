@@ -37,6 +37,7 @@ from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
 from omnigent.host.frames import (
     CAP_HARNESS_ACCOUNTS,
     IMPORT_SESSION_MAX_CONNECTION_REASSEMBLED_CHARS,
+    SERVER_CAP_CODE_HOST_INSTANCES,
     SERVER_CAPABILITIES,
     SERVER_CAPABILITIES_HEADER,
     HostCloneRepositoryResultFrame,
@@ -173,6 +174,7 @@ def create_host_tunnel_router(
     runner_exit_reports: RunnerExitReports | None = None,
     harness_install: HarnessInstallGate = False,
     sandbox_config: ManagedSandboxDeployment | None = None,
+    code_host_instances: bool = False,
 ) -> APIRouter:
     """Build the router hosting the ``/hosts/{id}/tunnel`` WS endpoint.
 
@@ -220,6 +222,8 @@ def create_host_tunnel_router(
         host is asked for accounts after connect only when this resolves true.
     :param sandbox_config: Provider TTLs for renewing authenticated managed
         hosts. Missing providers keep their existing token expiry.
+    :param code_host_instances: Whether hosts may serve the code host instances
+        their own config declares; advertised on the upgrade response.
     :returns: A FastAPI router with the host tunnel endpoint.
     """
     from omnigent.server.auth import local_single_user_enabled
@@ -227,6 +231,10 @@ def create_host_tunnel_router(
     allow_host_id_reown = (
         local_single_user if local_single_user is not None else local_single_user_enabled()
     )
+    server_capabilities = [
+        *SERVER_CAPABILITIES,
+        *([SERVER_CAP_CODE_HOST_INSTANCES] if code_host_instances else []),
+    ]
     router = APIRouter()
 
     @router.websocket("/hosts/{host_id}/tunnel")
@@ -369,7 +377,7 @@ def create_host_tunnel_router(
             headers=[
                 (
                     SERVER_CAPABILITIES_HEADER.lower().encode("ascii"),
-                    ",".join(SERVER_CAPABILITIES).encode("ascii"),
+                    ",".join(server_capabilities).encode("ascii"),
                 )
             ]
         )

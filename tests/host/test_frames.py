@@ -903,6 +903,60 @@ def test_hello_frame_without_interactive_shells_is_backward_compatible() -> None
     assert decoded.workspace_token_key is None
 
 
+def test_hello_frame_code_host_instances_round_trip_and_stay_absent_by_default() -> None:
+    summaries = [
+        {"id": "internal", "display_name": "Internal code host", "hosts": ["code.example.test"]}
+    ]
+    plain = HostHelloFrame(version="0.1.0", frame_protocol_version=1, name="host")
+    serving = HostHelloFrame(
+        version="0.1.0", frame_protocol_version=1, name="host", code_host_instances=summaries
+    )
+
+    assert "code_host_instances" not in json.loads(encode_host_frame(plain))
+    decoded = decode_host_frame(encode_host_frame(serving))
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.code_host_instances == summaries
+
+
+@pytest.mark.parametrize(
+    "summaries",
+    [
+        "internal",
+        [{"id": "internal", "display_name": "X", "hosts": ["code.example.test"], "cli": ["sh"]}],
+        [{"id": "internal", "display_name": "X"}],
+        [{"id": "internal", "display_name": "X", "hosts": "code.example.test"}],
+    ],
+    ids=["not-a-list", "with-a-command", "missing-hosts", "hosts-not-a-list"],
+)
+def test_hello_frame_with_malformed_code_host_instances_serves_none(summaries: object) -> None:
+    """A summary carrying anything but id, display name and hosts is never accepted."""
+    raw = json.loads(
+        encode_host_frame(HostHelloFrame(version="0.1.0", frame_protocol_version=1, name="host"))
+    )
+    raw["code_host_instances"] = summaries
+
+    decoded = decode_host_frame(json.dumps(raw))
+
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.code_host_instances is None
+
+
+def test_a_launch_frame_cannot_carry_a_code_host_command_or_file() -> None:
+    """The server's launch frame has no field that could name an instance's CLI or file."""
+    raw = json.loads(
+        encode_host_frame(
+            HostLaunchRunnerFrame(request_id="r1", binding_token="tok", workspace="/ws")
+        )
+    )
+    raw["code_host_instances_file"] = "/tmp/planted-instances.toml"
+    raw["cli"] = ["/bin/sh", "-c", "touch /tmp/example"]
+
+    decoded = decode_host_frame(json.dumps(raw))
+
+    assert isinstance(decoded, HostLaunchRunnerFrame)
+    assert "planted" not in repr(decoded) and "/bin/sh" not in repr(decoded)
+
+
 def test_hello_frame_capabilities_round_trip() -> None:
     """Advertised capability tokens survive encode → decode."""
     from omnigent.host.frames import (

@@ -43,6 +43,7 @@ from omnigent._platform import (
     normalize_interactive_shells,
 )
 from omnigent.cli_invocation import cli_invocation
+from omnigent.config import global_config_path
 from omnigent.debug_logging import (
     ORIGIN_WORKSPACE_ID_ENV_VAR,
     PRIMARY_SESSION_ID_ENV_VAR,
@@ -60,6 +61,17 @@ from omnigent.errors import (
     phase_for_code,
 )
 from omnigent.gateway_inference import gateway_inference_map
+from omnigent.git_providers.code_host_instances import (
+    CONFIG_FILE_NAME as CODE_HOST_INSTANCES_CONFIG_FILE_NAME,
+)
+from omnigent.git_providers.code_host_instances import (
+    NO_INSTANCES as NO_CODE_HOST_INSTANCES,
+)
+from omnigent.git_providers.code_host_instances import (
+    CodeHostInstanceError,
+    CodeHostInstances,
+    load_code_host_instances,
+)
 from omnigent.harness_accounts import HarnessAccount, HarnessAccounts
 from omnigent.harness_aliases import (
     canonicalize_harness,
@@ -70,10 +82,12 @@ from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailab
 from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
 from omnigent.host.frames import (
+    CAP_CODE_HOST_INSTANCES,
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HOST_CAPABILITIES,
     LAUNCH_HANDLER_FAILED_ERROR_CODE,
     RUNNER_LOG_TAIL_HEADING,
+    SERVER_CAP_CODE_HOST_INSTANCES,
     SERVER_CAPABILITIES_HEADER,
     WORKSPACE_MISSING_ERROR_CODE,
     HostCloneRepositoryFrame,
@@ -204,6 +218,16 @@ from omnigent.process_logging import (
     should_log_to_stderr,
 )
 from omnigent.runner._zygote import ZYGOTE_ENABLED_ENV_VAR
+from omnigent.runner.code_host_instances import (
+    CAPABILITY_NAMES as CODE_HOST_CAPABILITY_NAMES,
+)
+from omnigent.runner.code_host_instances import (
+    CODE_HOST_INSTANCE_HOSTS_ENV_VAR,
+    CODE_HOST_INSTANCES_FILE_ENV_VAR,
+)
+from omnigent.runner.code_host_instances import (
+    serve_in_this_process as serve_code_host_instances_in_process,
+)
 from omnigent.runner.identity import (
     RUNNER_AUTH_REJECTED_EXIT_CODE,
     RUNNER_CONNECT_MARKER_ENV_VAR,
@@ -979,6 +1003,22 @@ class HostConnectError(Exception):
     """
 
 
+def _load_host_code_host_instances() -> tuple[Path, CodeHostInstances]:
+    """Read the host's code host instance file once, from its config directory.
+
+    A refused file serves no instances; the refusal names rules and ids, not values.
+    """
+    path = global_config_path().parent / CODE_HOST_INSTANCES_CONFIG_FILE_NAME
+    try:
+        instances = load_code_host_instances(
+            path, known_capabilities=CODE_HOST_CAPABILITY_NAMES, host_environment=os.environ
+        )
+    except CodeHostInstanceError as refusal:
+        _logger.warning("Code host instances are off on this host: %s", refusal)
+        return path, NO_CODE_HOST_INSTANCES
+    return path, instances
+
+
 def _build_runner_env(
     base_env: Mapping[str, str],
     *,
@@ -996,6 +1036,8 @@ def _build_runner_env(
     harness_tmp_parent: Path | None = None,
     inference_config: dict[str, object] | None = None,
     session_env: Mapping[str, str] | None = None,
+    code_host_instances_file: Path | None = None,
+    code_host_instance_hosts: Iterable[str] = (),
 ) -> dict[str, str]:
     """
     Build the environment for a spawned runner subprocess.
@@ -1031,6 +1073,11 @@ def _build_runner_env(
         host janitor. ``None`` preserves the standalone runner default.
     :param session_env: Variables the launching CLI forwarded for this
         session only. They bypass the allowlist but not the runner wiring.
+    :param code_host_instances_file: The host's code host instance file, when the
+        host serves its instances to this server; ``None`` serves none. Only the
+        host names it: an inherited or forwarded value is always replaced.
+    :param code_host_instance_hosts: The hosts those instances serve, so a runner
+        that can't load one refuses its host instead of running plain ``gh``.
     :returns: The runner subprocess environment.
     """
     extra_names = {
@@ -1072,6 +1119,11 @@ def _build_runner_env(
     if session_env:
         env.update(session_env)
         env[RUNNER_SESSION_ENV_NAMES_ENV_VAR] = ",".join(sorted(session_env))
+    env.pop(CODE_HOST_INSTANCES_FILE_ENV_VAR, None)
+    env.pop(CODE_HOST_INSTANCE_HOSTS_ENV_VAR, None)
+    if code_host_instances_file is not None:
+        env[CODE_HOST_INSTANCES_FILE_ENV_VAR] = str(code_host_instances_file.absolute())
+        env[CODE_HOST_INSTANCE_HOSTS_ENV_VAR] = ",".join(sorted(code_host_instance_hosts))
     env["RUNNER_SERVER_URL"] = server_url
     env[RUNNER_ID_ENV_VAR] = runner_id
     env[RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR] = binding_token
@@ -1404,6 +1456,10 @@ class HostProcess:
         self._configured_harnesses: dict[str, HarnessAvailability] | None = None
         # Capabilities the connected server advertised on its upgrade response.
         self._server_capabilities: frozenset[str] = frozenset()
+        # Read once at start; served only to a server that turned instances on.
+        self._code_host_instances_file, self._code_host_instances = (
+            _load_host_code_host_instances()
+        )
         self._harness_accounts: HarnessAccounts | None = None
         self._gateway_inference: dict[str, bool] | None = None
         self._capabilities_initialized = False
@@ -1673,6 +1729,15 @@ class HostProcess:
 
         task.add_done_callback(_release)
         return await asyncio.shield(task)
+
+    def _serves_code_host_instances(self) -> bool:
+        """Whether this connection serves the host's code host instances.
+
+        Only to a server that advertised them, and only when the file declared one.
+        """
+        return SERVER_CAP_CODE_HOST_INSTANCES in self._server_capabilities and bool(
+            self._code_host_instances.instances
+        )
 
     def _alive_runner_ids(self) -> list[str]:
         """Return runner IDs without waiting for forkserver control replies.
@@ -2238,6 +2303,10 @@ class HostProcess:
             harness_tmp_parent=self._harness_tmp_parent,
             inference_config=frame.inference_config,
             session_env=session_env,
+            code_host_instances_file=(
+                self._code_host_instances_file if self._serves_code_host_instances() else None
+            ),
+            code_host_instance_hosts=self._code_host_instances.hosts_for("github"),
         )
         if frame.inference_config is not None:
             try:
@@ -5620,6 +5689,10 @@ class HostProcess:
             if upgrade_response is not None
             else None
         )
+        # Reads this host answers for a parked runner follow the same instances.
+        serve_code_host_instances_in_process(
+            self._code_host_instances if self._serves_code_host_instances() else None
+        )
         # An accepted upgrade proves the credentials work: login redirects
         # from here on are server restarts, not an unauthenticated host.
         reconnect = self._ever_connected
@@ -5912,11 +5985,26 @@ class HostProcess:
             interactive_shells=self._interactive_shells,
             telemetry_opt_out=_tel_opt_out,
             installation_id=_tel_install_id,
-            capabilities=list(HOST_CAPABILITIES),
+            capabilities=[
+                *HOST_CAPABILITIES,
+                *([CAP_CODE_HOST_INSTANCES] if self._serves_code_host_instances() else []),
+            ],
             connection_id=connection_id,
             workspace_socket=str(listener.path) if (listener := self._workspace_socket) else None,
             workspace_token_key=listener.token_key if listener else None,
             recover_interrupted_sessions=self._recover_interrupted_sessions,
+            code_host_instances=(
+                [
+                    {
+                        "id": instance.id,
+                        "display_name": instance.display_name,
+                        "hosts": sorted(instance.hosts),
+                    }
+                    for instance in self._code_host_instances.instances
+                ]
+                if self._serves_code_host_instances()
+                else None
+            ),
         )
         try:
             encoded_hello = self._encode_frame(hello)

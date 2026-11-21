@@ -41,6 +41,7 @@ class Feature(StrEnum):
     SIDEBAR_GROUPING_UI = "sidebar_grouping_ui"
     CLAUDE_OSC_STATUS = "claude_osc_status"
     WORKSPACE_CONTENT_SEARCH = "workspace_content_search"
+    CODE_HOST_INSTANCES = "code_host_instances"
     GRID_SESSIONS_DISPLAY_UI = "grid_sessions_display_ui"
     AUTOMATIONS = "automations"
     AUTOMATIONS_V2 = "automations_v2"
@@ -234,6 +235,13 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         review_by_release="0.20.0",
         frontend_visible=False,
         default_enabled=True,
+    ),
+    FeatureDefinition(
+        feature=Feature.CODE_HOST_INSTANCES,
+        description="Read pull requests on code host instances a host's own config declares",
+        owner="server",
+        review_by_release="0.26.0",
+        frontend_visible=False,
     ),
     FeatureDefinition(
         feature=Feature.WORKSPACE_CONTENT_SEARCH,
