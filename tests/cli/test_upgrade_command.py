@@ -24,7 +24,7 @@ _UV_PY = _uv_python_pin()
 
 
 def _uv_registry_info() -> _InstalledWheelInfo:
-    """A registry uv-tool install → ``uv tool upgrade omnigent`` (runnable)."""
+    """A registry uv-tool install has a runnable, copy-mode upgrade command."""
     return _InstalledWheelInfo(
         install_time_epoch=0.0,
         installer="uv",
@@ -37,7 +37,7 @@ def _uv_registry_info() -> _InstalledWheelInfo:
 
 
 def _git_install_info() -> _InstalledWheelInfo:
-    """A git/VCS uv-tool install → ``uv tool install --reinstall git+…``."""
+    """A git/VCS uv-tool install → ``uv tool install --reinstall --link-mode copy git+…``."""
     return _InstalledWheelInfo(
         install_time_epoch=0.0,
         installer="uv",
@@ -142,7 +142,7 @@ def test_upgrade_runs_installer_and_drains_first(
     assert result.exit_code == 0, result.output
     # Drain happened before the stop, before the install ran.
     assert events == ["drained", "stop(force=False)"]
-    assert ran == ["uv tool upgrade omnigent"]
+    assert ran == ["uv tool upgrade --reinstall --link-mode copy omnigent"]
     assert "Upgraded to v0.2.0" in result.output
 
 
@@ -329,7 +329,7 @@ def test_upgrade_pre_passes_prerelease_flag_to_installer(
     result = CliRunner().invoke(cli, ["upgrade", "--pre"])
 
     assert result.exit_code == 0, result.output
-    assert ran == ["uv tool upgrade omnigent --prerelease allow"]
+    assert ran == ["uv tool upgrade --reinstall --link-mode copy omnigent --prerelease allow"]
 
 
 # ── ``omni update`` alias ────────────────────────────────────────────
@@ -498,7 +498,8 @@ def test_upgrade_git_install_repulls_and_verifies_commit(
 
     assert result.exit_code == 0, result.output
     assert ran == [
-        f"uv tool install --reinstall{_UV_PY} git+https://github.com/omnigent-ai/omnigent.git"
+        f"uv tool install --reinstall --link-mode copy{_UV_PY} "
+        "git+https://github.com/omnigent-ai/omnigent.git"
     ]
     assert "Updated to git bbbbbbbbb" in result.output
 
@@ -591,7 +592,7 @@ def test_nightly_suggestion_shapes_per_installer() -> None:
     # install before the replacement is built, and nightlies build from source,
     # so a failed build would leave nothing behind.
     assert (uv.command, uv.runnable) == (
-        f"uv tool install --reinstall{_UV_PY} {spec}",
+        f"uv tool install --reinstall --link-mode copy{_UV_PY} {spec}",
         True,
     )
     pipx = _build_nightly_upgrade_suggestion(info_for("pipx"), version)
@@ -641,7 +642,7 @@ def test_upgrade_nightly_installs_pinned_tag(
 
     assert result.exit_code == 0, result.output
     assert ran == [
-        f"uv tool install --reinstall{_UV_PY} "
+        f"uv tool install --reinstall --link-mode copy{_UV_PY} "
         "git+https://github.com/omnigent-ai/omnigent@v0.2.0.dev20260804"
     ]
     assert "Upgraded to nightly v0.2.0.dev20260804" in result.output
@@ -697,7 +698,7 @@ def test_nightly_suggestion_preserves_and_unions_extras() -> None:
 
     assert suggestion.runnable
     assert suggestion.command == (
-        f"uv tool install --reinstall{_UV_PY} "
+        f"uv tool install --reinstall --link-mode copy{_UV_PY} "
         "git+https://github.com/omnigent-ai/omnigent@v0.9.0.dev20260804#egg=omnigent[all,server]"
     )
 
@@ -749,7 +750,7 @@ def test_upgrade_nightly_dry_run_prints_without_running(
 
     assert result.exit_code == 0, result.output
     assert (
-        f"Would run: uv tool install --reinstall{_UV_PY} "
+        f"Would run: uv tool install --reinstall --link-mode copy{_UV_PY} "
         "git+https://github.com/omnigent-ai/omnigent@v0.2.0.dev20260804" in result.output
     )
 
@@ -788,7 +789,7 @@ def test_nightly_uv_never_uses_destructive_force() -> None:
             )
             command = _build_nightly_upgrade_suggestion(info, version).command
             assert "--force" not in command, command
-            assert command.startswith(f"uv tool install --reinstall{_UV_PY} ")
+            assert command.startswith(f"uv tool install --reinstall --link-mode copy{_UV_PY} ")
             # Always the nightly tag, never the fork's recorded URL.
             assert f"git+https://github.com/omnigent-ai/omnigent@v{version}" in command
 

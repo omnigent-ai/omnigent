@@ -230,6 +230,7 @@ from omnigent.stores.host_store import Host, HostStore, host_is_live
 
 if TYPE_CHECKING:
     from omnigent.onboarding.sandboxes import SandboxHostLauncher
+    from omnigent.server.session_mcp_selection import SessionMcpSelection
     from omnigent.stores.agent_store import AgentStore
     from omnigent.stores.conversation_store import Conversation, ConversationStore
 
@@ -809,6 +810,11 @@ class ManagedSandboxConfig:
         provider's launcher makes the final call through
         :meth:`~omnigent.onboarding.sandboxes.base.SandboxLifecycle.stop_when_archived`
         (see :func:`stop_archived_session_sandbox`).
+    :param mcp_selection: How sessions the server creates in this provider's
+        sandboxes record their owner's MCP services, for a provider that
+        configures MCP servers inside the sandbox rather than through the
+        server's registry. ``None`` uses the registry, as on a connected host.
+        See :mod:`omnigent.server.session_mcp_selection`.
     """
 
     server_url: str
@@ -829,6 +835,7 @@ class ManagedSandboxConfig:
     manages_profiles: bool = False
     default_profile_id: str | None = None
     stop_on_archive: bool = False
+    mcp_selection: SessionMcpSelection | None = None
 
 
 class NoReachableModels(Exception):
@@ -4032,14 +4039,16 @@ def build_owner_launcher(
     owner: str,
 ) -> SandboxHostLauncher:
     """
-    Build *entry*'s launcher, bound to *owner*'s credential when it needs one.
+    Build *entry*'s launcher, bound to *owner* and, when it needs one, to
+    *owner*'s credential.
 
     The single place a managed-host path turns a provider config into a
-    launcher. A launcher that acts as the host's owner (its
-    ``owner_credential_provider`` names a connection provider, e.g.
-    ``"databricks"``) is bound to the deployment's resolver for that provider,
-    curried with *owner*. With no resolver (the server has no connect flow for
-    that provider) the launcher stays unbound and refuses at first use with
+    launcher. The launcher is told its owner first (``bind_owner``). A launcher
+    that acts as the host's owner (its ``owner_credential_provider`` names a
+    connection provider, e.g. ``"databricks"``) is bound to the deployment's
+    resolver for that provider, curried with *owner*. With no resolver (the
+    server has no connect flow for that provider) the launcher stays unbound
+    and refuses at first use with
     :class:`~omnigent.onboarding.sandboxes.base.OwnerCredentialMissingError` —
     there is never a fallback to a shared server identity.
 
@@ -4052,6 +4061,9 @@ def build_owner_launcher(
     """
     launcher = entry.launcher_factory()
     # getattr: embedding deployments may inject duck-typed launchers.
+    bind_owner = getattr(launcher, "bind_owner", None)
+    if bind_owner is not None:
+        bind_owner(owner)
     needed = getattr(launcher, "owner_credential_provider", None)
     if needed is not None and deployment is not None:
         resolver = deployment.owner_credentials.get(needed)

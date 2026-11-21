@@ -84,7 +84,6 @@ import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/h
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { showToast } from "@/components/ui/toast";
-import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useSidebarData } from "@/hooks/useSidebarData";
 import {
@@ -301,8 +300,7 @@ export function InboxPage() {
   const [replyStatuses, setReplyStatuses] = useState<Record<string, ReplyStatus>>({});
   const [submitWithModEnter] = useState(readSubmitWithModEnter);
   const isMobileViewport = useIsMobileViewport();
-  const isCoarsePointer = useIsCoarsePointer();
-  const preventsKeyboardSubmit = isMobileViewport || isCoarsePointer;
+  const preventsKeyboardSubmit = isMobileViewport;
 
   const { hasNextPage, isFetchingNextPage, fetchNextPage } = conversationsQuery;
   const rows = allRows.filter((c) => (c.pending_elicitations_count ?? 0) > 0);
@@ -1308,9 +1306,7 @@ function InboxCard({
       data-expanded={expanded}
       className={cn(
         "overflow-hidden border border-border transition-[border-radius]",
-        expanded
-          ? "rounded-2xl bg-card shadow-[0_12px_20px_-20px_rgba(0,0,0,0.14),0_20px_28px_-28px_rgba(0,0,0,0.1)]"
-          : "rounded-xl bg-transparent",
+        expanded ? "rounded-2xl bg-card shadow-lg" : "rounded-xl bg-transparent",
       )}
     >
       <button
@@ -1477,7 +1473,8 @@ function LatestOutputPreview({ preview, fullText }: { preview: string; fullText?
       <HoverCardContent
         side="bottom"
         align="start"
-        className="max-h-[min(60vh,32rem)] w-[min(40rem,calc(100vw-2rem))] overflow-y-auto p-3"
+        collisionPadding={8}
+        className="max-h-[min(60vh,32rem,var(--radix-hover-card-content-available-height))] w-[min(40rem,calc(100vw-2rem))] overflow-y-auto p-3"
       >
         {/* No session is open here, so file paths stay plain text instead of
             resolving against whichever session the file viewer last showed. */}

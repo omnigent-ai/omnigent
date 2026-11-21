@@ -29,6 +29,7 @@ from typing import Any
 from filelock import Timeout as FileLockTimeout
 
 from omnigent.git_providers import (
+    ParsedRemote,
     host_of,
     load_facet,
     provider,
@@ -45,6 +46,8 @@ from omnigent.runner.git_providers import (
     PinnedRevisionFacet,
     ProviderCapabilities,
     PullRequestFacet,
+    PullRequestStatus,
+    PullRequestStatusFacet,
     ReviewerRef,
     ReviewThreadsFacet,
     local_git,
@@ -175,6 +178,59 @@ def _workspace_providers(root: str) -> list[ProviderResolution]:
             unclaimed=first_host is not None,
         )
     ]
+
+
+def _keeps_provider_workspace_repo(workspace_repo: Any, preferred: ParsedRemote | None) -> bool:
+    """Whether a provider-named workspace repo is on the preferred remote's host."""
+    # An unrecognized preferred remote (ssh alias, IP, unknown host) can't vouch for
+    # it; the same host can name another repo, e.g. a fork's upstream.
+    return (
+        isinstance(workspace_repo, dict)
+        and preferred is not None
+        and str(workspace_repo.get("host") or "").lower() == preferred.host
+    )
+
+
+# gh's base-repo order among remotes when none is resolved; others follow in config order.
+_GH_REMOTE_RANK = {"upstream": 0, "github": 1, "origin": 2}
+
+
+def _add_workspace_repo(root: str, info: dict[str, Any]) -> None:
+    """Name the checkout's own repo from local config, or vet the provider's.
+
+    Precedence: gh's resolved base, then the remote gh would pick on origin's host.
+    Tracked PRs don't count toward the local pick. An unrecognized preferred remote
+    names no workspace repo.
+    """
+
+    def run(argv: list[str]) -> tuple[int | None, str]:
+        return _git_output(argv, cwd=root)
+
+    urls = local_git.remote_urls(run)
+    if not urls:
+        return
+    resolved = local_git.remote_settings(run, "gh-resolved")
+    base_url = next((url for name, url in urls if resolved.get(name) == "base"), None)
+    # Origin comes first; if unrecognized, a recognized upstream must not stand in for it.
+    preferred = resolve_remote(base_url or urls[0][1])
+    if "workspace_repo" in info:
+        # gh falls back to a github.com remote when it doesn't know origin's host.
+        if not _keeps_provider_workspace_repo(info["workspace_repo"], preferred):
+            del info["workspace_repo"]
+        return
+    if preferred is None:
+        return
+    parsed = preferred
+    if base_url is None:
+        # A remote on another host must not move the workspace off origin's host,
+        # e.g. a github.com upstream or mirror of an Enterprise checkout.
+        same_host = [
+            (name, remote)
+            for name, url in urls
+            if (remote := resolve_remote(url)) is not None and remote.host == preferred.host
+        ]
+        parsed = min(same_host, key=lambda item: _GH_REMOTE_RANK.get(item[0].lower(), 3))[1]
+    info["workspace_repo"] = {"name_with_owner": parsed.repository, "host": parsed.host}
 
 
 def _workspace_provider(root: str) -> ProviderResolution:
@@ -362,6 +418,8 @@ def _session_prs_with_titles(
     facets = _title_facets(root, entries)
     now = time.time()
     titles: dict[str, str | None] = {}
+    # States looked up during this request, which the server stores as of its request.
+    statuses: dict[str, PullRequestStatus] = {}
     timed_out_urls: set[str] = set()
     pending: list[SessionPullRequest] = []
     for entry in entries:
@@ -384,25 +442,35 @@ def _session_prs_with_titles(
     pending.sort(key=lambda entry: entry.title_checked_at)
     deadline = min(request_deadline, time.monotonic() + _PR_TITLE_LOOKUP_SECONDS)
 
-    def fetch_title(entry: SessionPullRequest) -> tuple[str, str | None, bool] | None:
+    def fetch_title(
+        entry: SessionPullRequest,
+    ) -> tuple[str, str | None, bool, PullRequestStatus | None] | None:
         if time.monotonic() >= deadline:
             return None
+        facet = facets[entry.provider]
         try:
-            title, timed_out = facets[entry.provider].pr_title(root, entry, deadline)
+            # The same request a title lookup makes also carries the state, when the
+            # provider can return both.
+            if isinstance(facet, PullRequestStatusFacet):
+                status, timed_out = facet.pr_status(root, entry, deadline)
+                return entry.url, status.title if status else None, timed_out, status
+            title, timed_out = facet.pr_title(root, entry, deadline)
         except Exception:  # keep the existing cache when an optional lookup fails
             _logger.warning("Git provider %s failed in pr_title", entry.provider, exc_info=True)
             return None
-        return entry.url, title, timed_out
+        return entry.url, title, timed_out, None
 
     may_cache = time.monotonic() < request_deadline
     if pending and time.monotonic() < deadline:
         with ThreadPoolExecutor(max_workers=min(4, len(pending))) as executor:
             for result in executor.map(fetch_title, pending):
                 if result is not None:
-                    url, title, timed_out = result
+                    url, title, timed_out, status = result
                     titles[url] = title
                     if timed_out:
                         timed_out_urls.add(url)
+                    if status is not None and status.state is not None:
+                        statuses[url] = status
     if titles and may_cache:
         try:
             registry.update_titles(titles, timestamp=now, timed_out_urls=timed_out_urls)
@@ -414,6 +482,11 @@ def _session_prs_with_titles(
             **entry.model_dump(),
             "title": titles.get(entry.url) or entry.title,
             "provider_display": provider_display(entry.provider),
+            **(
+                {"state": status.state, "is_draft": status.is_draft}
+                if (status := statuses.get(entry.url)) is not None
+                else {}
+            ),
         }
         for entry in entries
     ]
@@ -542,6 +615,7 @@ def pr_info(
         info["provider_display"] = (
             provider_display(provider_id) if isinstance(provider_id, str) else None
         )
+        _add_workspace_repo(root, info)
         return info
     request_deadline = time.monotonic() + _PR_TITLE_REQUEST_SECONDS
     registry = SessionPrRegistry(session_id)
@@ -600,6 +674,9 @@ def pr_info(
             info.setdefault("discovery_warnings", []).extend(candidate.get("warnings", []))
     info["prs"] = _session_prs_with_titles(root, info, registry, entries, request_deadline)
     info["tracking_available"] = True
+    if not pr_url:
+        # Explicit PR reads must not touch local git; chat reads the base query.
+        _add_workspace_repo(root, info)
     provider_id = info.get("provider")
     info["provider_display"] = (
         provider_display(provider_id) if isinstance(provider_id, str) else None

@@ -2062,3 +2062,38 @@ describe("BlockStream — naming a turn already in flight", () => {
     expect(blocks.filter((b) => b.type === "reasoning_start")).toHaveLength(1);
   });
 });
+
+describe("BlockStream — Claude sub-agent handback", () => {
+  it("streams the handed-back report as the answer and drops the delivery receipt", () => {
+    const handback = {
+      type: "tool_call",
+      name: "SubagentHandback",
+      arguments: { message: "**Audit** done." },
+      callId: "c1",
+      status: "completed",
+      agentName: "agent",
+      itemId: "fc_1",
+      responseId: "resp_1",
+    } satisfies StreamEvent;
+    const blocks = reduce([
+      { type: "response_created", response: makeResponse() },
+      handback,
+      // The runner can deliver the same call twice; it must render once.
+      handback,
+      {
+        type: "tool_result",
+        callId: "c1",
+        output: "delivered",
+        itemId: "fco_1",
+        responseId: "resp_1",
+      },
+      { type: "response_completed", response: makeResponse() },
+    ]);
+    expect(
+      blockTypes(blocks).filter((t) => t !== "response_start" && t !== "response_end"),
+    ).toEqual(["text_done"]);
+    const answer = blocks.find((b): b is TextDone => b.type === "text_done");
+    expect(answer?.fullText).toBe("**Audit** done.");
+    expect(answer?.ctx.itemId).toBe("fc_1");
+  });
+});

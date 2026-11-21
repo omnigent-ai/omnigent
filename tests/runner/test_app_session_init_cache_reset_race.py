@@ -22,7 +22,9 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -144,50 +146,156 @@ async def test_session_init_memoizes_spec_when_no_reset_intervenes() -> None:
 
 
 @pytest.mark.asyncio
-async def test_session_init_does_not_reinstate_spec_superseded_by_reset() -> None:
-    """A reset acknowledged during init wins over init's spec-cache write.
+@pytest.mark.parametrize("metadata", ["skills", "mcp"])
+async def test_lazy_metadata_policy_failure_is_structured_and_recovers(
+    metadata: str, monkeypatch: pytest.MonkeyPatch, pinned_runner_log: Path
+) -> None:
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.mcp_manager import McpSchemasResult
+    from omnigent.runner.policy import AgentStartPolicyError
 
-    Steps (all over the runner's HTTP API):
+    broken = False
 
-    1. ``POST /v1/sessions`` — init starts; agent-spec resolution is slow
-       (the resolver blocks, holding init open).
-    2. ``POST /v1/sessions/{id}/agent-cache/reset`` — the invalidation the
-       server issues when the user edits the session's agent mid-init.
-       Returns 200 with the entry dropped and the generation bumped.
-    3. Resolution completes with the pre-reset ("v1") spec; init finishes.
-    4. ``GET /v1/sessions/{id}/skills`` — a spec-derived read. The reset
-       retired the v1 entry, so the read must re-resolve and serve the
-       post-reset ("v2") spec, not the superseded entry init memoized.
+    async def gate(spec: AgentSpec, harness: str) -> AgentSpec:
+        if broken:
+            raise AgentStartPolicyError("private_policy_name", "private failure detail")
+        return spec
+
+    monkeypatch.setattr(runner_app, "_apply_agent_start_gate", gate)
+    resolver = AsyncMock(return_value=_spec("v1"))
+    manager = _FakeProcessManager(_ScriptedHarnessClient([]))
+    mcp = AsyncMock()
+    mcp.schemas_for.return_value = McpSchemasResult(schemas=[], tool_names=set(), failures={})
+    app = create_runner_app(
+        process_manager=manager,  # type: ignore[arg-type]
+        spec_resolver=resolver,
+        server_client=_SessionSnapshotServerClient(),  # type: ignore[arg-type]
+        resource_registry=SessionResourceRegistry(terminal_registry=None),
+        mcp_manager=mcp,
+    )
+    path, body = (
+        ("skills/resolve", {"name": "marker-v1"})
+        if metadata == "skills"
+        else ("mcp/execute", {"method": "tools/list"})
+    )
+    async with _runner_client(app) as client:
+        initialized = await client.post(
+            "/v1/sessions", json={"session_id": _SESSION_ID, "agent_id": _AGENT_ID}
+        )
+        assert initialized.status_code == 201, initialized.text
+        assert (
+            await client.post(f"/v1/sessions/{_SESSION_ID}/{path}", json=body)
+        ).status_code == 200
+        calls_before_failure = mcp.schemas_for.await_count
+        broken = True
+        reset = await client.post(f"/v1/sessions/{_SESSION_ID}/agent-cache/reset")
+        assert reset.status_code == 200, reset.text
+        rejected = await client.post(f"/v1/sessions/{_SESSION_ID}/{path}", json=body)
+        assert rejected.status_code == 403, rejected.text
+        assert rejected.json() == {
+            "error": "agent_start_policy_unevaluable",
+            "detail": (
+                "Request failed on the runner; "
+                f"see the runner log for details: {pinned_runner_log}"
+            ),
+        }
+        assert mcp.schemas_for.await_count == calls_before_failure
+        broken = False
+        reset = await client.post(f"/v1/sessions/{_SESSION_ID}/agent-cache/reset")
+        assert reset.status_code == 200, reset.text
+        recovered = await client.post(f"/v1/sessions/{_SESSION_ID}/{path}", json=body)
+        assert recovered.status_code == 200, recovered.text
+        assert len(manager.get_client_calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("setup_path", "pause_at"),
+    [
+        ("session-init", "resolver"),
+        ("direct-stream", "resolver"),
+        ("direct-stream", "snapshot"),
+        ("background", "gate"),
+    ],
+    ids=["session-init", "direct-stream", "direct-stream-snapshot", "background-gate"],
+)
+async def test_session_init_does_not_reinstate_spec_superseded_by_reset(
+    setup_path: str, pause_at: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reset during session or turn setup wins over its cache write.
+
+    Pause resolution, snapshot lookup, or background gating, reset, then release
+    setup. Both versions declare the same harness so provenance checks cannot
+    hide a stale cache write.
     """
-    resolver_entered = asyncio.Event()
-    release_resolver = asyncio.Event()
+    from omnigent.runner import app as runner_app
+
+    lookup_entered = asyncio.Event()
+    release_lookup = asyncio.Event()
     resolver_calls = 0
+    background_task: asyncio.Task[Any] | None = None
+    original_gate = runner_app._apply_agent_start_gate
+
+    async def gate(spec: AgentSpec, harness: str) -> AgentSpec:
+        nonlocal background_task
+        gated_spec = await original_gate(spec, harness)
+        if pause_at == "gate" and not lookup_entered.is_set():
+            background_task = asyncio.current_task()
+            lookup_entered.set()
+            await release_lookup.wait()
+        return gated_spec
+
+    monkeypatch.setattr(runner_app, "_apply_agent_start_gate", gate)
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         nonlocal resolver_calls
         del agent_id, session_id
         resolver_calls += 1
-        if resolver_calls == 1:
-            resolver_entered.set()
-            await release_resolver.wait()
-            return _spec("v1")
-        return _spec("v2")
+        if resolver_calls == 1 and pause_at == "resolver":
+            lookup_entered.set()
+            await release_lookup.wait()
+        spec = _spec("v1" if resolver_calls == 1 else "v2")
+        spec.executor.config["harness"] = "claude-sdk"
+        return spec
 
+    class SnapshotClient(_SessionSnapshotServerClient):
+        async def get(self, url: str, **kwargs: Any) -> NullServerClient._Response:
+            if pause_at == "snapshot" and url == f"/v1/sessions/{_SESSION_ID}":
+                lookup_entered.set()
+                await release_lookup.wait()
+            return await super().get(url, **kwargs)
+
+    manager = _FakeProcessManager(_ScriptedHarnessClient([]))
     app = create_runner_app(
-        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        process_manager=manager,  # type: ignore[arg-type]
         spec_resolver=_resolver,
-        server_client=_SessionSnapshotServerClient(),  # type: ignore[arg-type]
+        server_client=SnapshotClient(),  # type: ignore[arg-type]
         resource_registry=SessionResourceRegistry(terminal_registry=None),
     )
 
+    is_turn = setup_path != "session-init"
+    stream = setup_path == "direct-stream"
     async with _runner_client(app) as client:
-        init_task = asyncio.create_task(
+        setup_task = asyncio.create_task(
             client.post(
-                "/v1/sessions",
-                json={"session_id": _SESSION_ID, "agent_id": _AGENT_ID},
+                (
+                    f"/v1/sessions/{_SESSION_ID}/events" + ("?stream=true" if stream else "")
+                    if is_turn
+                    else "/v1/sessions"
+                ),
+                json=(
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "agent_id": _AGENT_ID,
+                        "harness_override": "claude-sdk",
+                    }
+                    if is_turn
+                    else {"session_id": _SESSION_ID, "agent_id": _AGENT_ID}
+                ),
             )
         )
-        await asyncio.wait_for(resolver_entered.wait(), timeout=10)
+        await asyncio.wait_for(lookup_entered.wait(), timeout=10)
 
         reset_resp = await client.post(
             f"/v1/sessions/{_SESSION_ID}/agent-cache/reset",
@@ -196,9 +304,18 @@ async def test_session_init_does_not_reinstate_spec_superseded_by_reset() -> Non
         assert reset_resp.status_code == 200
         assert reset_resp.json()["reset"] is True
 
-        release_resolver.set()
-        init_resp = await asyncio.wait_for(init_task, timeout=30)
-        assert init_resp.status_code == 201, init_resp.text
+        release_lookup.set()
+        setup_resp = await asyncio.wait_for(setup_task, timeout=30)
+        assert setup_resp.status_code == (
+            202 if setup_path == "background" else 200 if stream else 201
+        ), setup_resp.text
+        if setup_path == "background":
+            assert background_task is not None
+            await asyncio.wait_for(background_task, timeout=10)
+        if stream:
+            assert "response.failed" not in setup_resp.text, setup_resp.text
+        if is_turn:
+            assert manager.get_client_calls
 
         skills_resp = await client.post(
             f"/v1/sessions/{_SESSION_ID}/skills/resolve", json={"name": "missing-skill"}
@@ -211,7 +328,7 @@ async def test_session_init_does_not_reinstate_spec_superseded_by_reset() -> Non
     # consult the resolver again rather than be served init's stale write.
     assert resolver_calls == 2, (
         "spec read after an acknowledged agent-cache reset was served from the "
-        "session spec cache: session init reinstated the superseded entry "
+        "session spec cache: session setup reinstated the superseded entry "
         f"(resolver consulted {resolver_calls} time(s), expected 2)"
     )
     assert "marker-v2" in names, f"post-reset spec not served; skills = {sorted(names)}"

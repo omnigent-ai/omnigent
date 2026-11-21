@@ -19,6 +19,8 @@ from urllib.parse import urlparse
 import yaml
 
 if TYPE_CHECKING:
+    from omnigent.inner.claude_model_access import ClaudeModelAccess
+
     # Lazy: PolicyEngine + PolicyResult are pulled in at runtime via
     # the function-local imports inside ``_handle_policy_ask`` and
     # ``_enforce_policy``-using helpers (see uses below). The
@@ -35,7 +37,10 @@ from omnigent.entities import (
     NewConversationItem,
 )
 from omnigent.errors import (
+    CodexSignerConfigurationError,
     ErrorCode,
+    HarnessConfigurationError,
+    KimiAuthConfigurationError,
     OmnigentError,
     StaleCursorError,
     restart_on_stale_cursor,
@@ -94,7 +99,7 @@ from omnigent.runtime.compaction import (
 from omnigent.runtime.content_resolver import resolve_content_references
 from omnigent.runtime.prompt import build_instructions, history_to_input_items
 from omnigent.spec import AgentSpec
-from omnigent.spec.parser import check_unresolved_env_vars
+from omnigent.spec.parser import _api_key_source_env_names, check_unresolved_env_vars
 from omnigent.spec.types import (
     ApiKeyAuth,
     DatabricksAuth,
@@ -376,10 +381,7 @@ def _configure_brokered_codex_with_ucode(
 
     profile = provider.profile
     if os.environ.get("HARNESS_CODEX_GATEWAY_AUTH_COMMAND"):
-        raise OmnigentError(
-            "signer-backed Codex conflicts with HARNESS_CODEX_GATEWAY_AUTH_COMMAND",
-            code=ErrorCode.INVALID_INPUT,
-        )
+        raise CodexSignerConfigurationError("auth_command")
     sandbox = spec.os_env.sandbox if spec.os_env is not None else None
     if sandbox is None or sandbox.type == "none":
         platform_sandbox = _default_sandbox_for_platform()
@@ -397,25 +399,15 @@ def _configure_brokered_codex_with_ucode(
             # In place, so the session's OS tools share the worker's sandbox.
             spec.os_env.sandbox = sandbox
     if sandbox.egress_rules or sandbox.tcp_egress:
-        raise OmnigentError(
-            "signer-backed Codex does not support os_env.sandbox.egress_rules or tcp_egress; "
-            "brokered sessions are model-only",
-            code=ErrorCode.INVALID_INPUT,
-        )
+        raise CodexSignerConfigurationError("worker_egress")
     if not profile:
-        raise OmnigentError(
-            "signer-backed Codex requires an explicit Databricks profile",
-            code=ErrorCode.INVALID_INPUT,
-        )
+        raise CodexSignerConfigurationError("profile")
     workspace_url = get_workspace_url_for_profile(profile)
     state = read_ucode_state(workspace_url) if workspace_url is not None else None
     agent_state = state.agent("codex") if state is not None else None
     endpoint = agent_state.base_url if agent_state is not None else None
     if state is None or endpoint is None:
-        raise OmnigentError(
-            "signer-backed Codex requires configured ucode Codex state; run `ucode configure`",
-            code=ErrorCode.INVALID_INPUT,
-        )
+        raise CodexSignerConfigurationError("state")
     assert agent_state is not None
     try:
         binding = registered_model_provider_binding(
@@ -424,7 +416,7 @@ def _configure_brokered_codex_with_ucode(
             trusted_host=state.workspace_host,
         )
     except ValueError as exc:
-        raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+        raise CodexSignerConfigurationError("binding") from exc
     # No grant means the provider's own route, the most the signer ever signs.
     model_egress = spec.model_egress or [
         f"{route.method} {route.host}{route.path}" for route in binding.maximum_routes
@@ -582,10 +574,13 @@ def _provider_auth_command(family: FamilyConfig) -> str:
         return f"printf %s {shlex.quote(family.api_key)}"
     if family.auth_command is not None:
         return family.auth_command
-    raise OmnigentError(
-        "provider family has no credential (neither 'api_key' nor 'auth_command') "
-        "to build a bearer-token command from.",
-        code=ErrorCode.INVALID_INPUT,
+    raise HarnessConfigurationError(
+        "The provider family has no credential. Configure its 'api_key' or 'auth_command' "
+        "and retry.",
+        diagnostic=(
+            "provider family has no credential (neither 'api_key' nor 'auth_command') "
+            "to build a bearer-token command from."
+        ),
     )
 
 
@@ -655,12 +650,11 @@ def configure_agent_harness_with_provider(
         # threads HARNESS_ANTIGRAVITY_API_KEY / _VERTEX directly instead, so
         # this path must never run for it — fail loud rather than emit inert
         # gateway env vars the executor no longer reads.
-        raise OmnigentError(
+        raise HarnessConfigurationError(
             "The 'antigravity' harness authenticates Gemini-natively (API key "
             "or Vertex AI) and does not support generic providers or gateway "
             "routing. Set executor.auth to an api_key, or executor.config "
             "vertex/project/location, instead of a 'providers:' entry.",
-            code=ErrorCode.INVALID_INPUT,
         )
     if entry.kind == BEDROCK_KIND:
         # Bedrock mode is wired only into the native ``omnigent claude`` launch
@@ -670,13 +664,16 @@ def configure_agent_harness_with_provider(
         # the generic ``HARNESS_*_GATEWAY_*`` vars would silently point the
         # harness at the Bedrock endpoint as if it spoke the Anthropic Messages
         # API and fail at request time. Fail loud instead.
-        raise OmnigentError(
-            f"provider {entry.name!r} (kind 'bedrock') is only supported by the "
-            f"native 'omnigent claude' terminal, not the {harness_type!r} harness. "
-            "For agents / 'omnigent run', use a 'gateway' provider "
-            "(OpenAI/Anthropic-compatible endpoint), or a 'databricks' / 'key' "
-            "provider.",
-            code=ErrorCode.INVALID_INPUT,
+        raise HarnessConfigurationError(
+            "Bedrock providers require the native 'omnigent claude' terminal. "
+            "For agents, select a compatible gateway, databricks or key provider.",
+            diagnostic=(
+                f"provider {entry.name!r} (kind 'bedrock') is only supported by the "
+                f"native 'omnigent claude' terminal, not the {harness_type!r} harness. "
+                "For agents / 'omnigent run', use a 'gateway' provider "
+                "(OpenAI/Anthropic-compatible endpoint), or a 'databricks' / 'key' "
+                "provider."
+            ),
         )
     if entry.kind == SUBSCRIPTION_KIND:
         # A logged-in CLI (claude / codex) carries its own auth; the
@@ -714,12 +711,15 @@ def configure_agent_harness_with_provider(
         # cannot consume a codex provider table, so fail loud rather than
         # launch them credential-less.
         if harness_type != "codex":
-            raise OmnigentError(
-                f"provider {entry.name!r} (kind 'cli-config') pins a provider in "
-                f"~/.codex/config.toml and can only drive the 'codex' harness, "
-                f"not {harness_type!r}. Configure a key/gateway provider for this "
-                "harness in ~/.omnigent/config.yaml.",
-                code=ErrorCode.INVALID_INPUT,
+            raise HarnessConfigurationError(
+                "This CLI-config provider requires the Codex harness. Select Codex or "
+                "configure a key/gateway provider for the selected harness.",
+                diagnostic=(
+                    f"provider {entry.name!r} (kind 'cli-config') pins a provider in "
+                    f"~/.codex/config.toml and can only drive the 'codex' harness, "
+                    f"not {harness_type!r}. Configure a key/gateway provider for this "
+                    "harness in ~/.omnigent/config.yaml."
+                ),
             )
         # entry.model_provider is required by the cli-config parse branch.
         env["HARNESS_CODEX_MODEL_PROVIDER"] = str(entry.model_provider)
@@ -750,11 +750,17 @@ def configure_agent_harness_with_provider(
     family_name = _PROVIDER_HARNESS_FAMILY[harness_type]
     family = entry.family(family_name)
     if family is None:
-        raise OmnigentError(
-            f"provider {entry.name!r} has no {family_name!r} family, required by the "
-            f"{harness_type!r} harness. Add a '{family_name}:' block to that provider in "
-            f"~/.omnigent/config.yaml.",
-            code=ErrorCode.INVALID_INPUT,
+        raise HarnessConfigurationError(
+            "This harness requires an 'anthropic' provider family. Add that family to "
+            "the provider in ~/.omnigent/config.yaml and retry."
+            if family_name == ANTHROPIC_FAMILY
+            else "This harness requires an 'openai' provider family. Add that family to "
+            "the provider in ~/.omnigent/config.yaml and retry.",
+            diagnostic=(
+                f"provider {entry.name!r} has no {family_name!r} family, required by the "
+                f"{harness_type!r} harness. Add a '{family_name}:' block to that provider in "
+                f"~/.omnigent/config.yaml."
+            ),
         )
     if harness_type == "openai-agents-sdk":
         _apply_provider_to_openai_agents(env, family)
@@ -814,9 +820,10 @@ def _catalog_default_model(family_name: str) -> str:
     """
     target = _FAMILY_CATALOG_TARGET.get(family_name)
     if target is None:
-        raise OmnigentError(
-            f"No model catalog is configured for provider family {family_name!r}.",
-            code=ErrorCode.INVALID_INPUT,
+        raise HarnessConfigurationError(
+            "The provider family has no supported model catalog. Set 'executor.model' "
+            "explicitly or configure an anthropic/openai provider family and retry.",
+            diagnostic=f"No model catalog is configured for provider family {family_name!r}.",
         )
     provider_name, catalog_family = target
     return _resolve_catalog_default_model(
@@ -846,12 +853,16 @@ def _apply_provider_family(
         the unsupported Chat Completions wire API.
     """
     if harness_type == "codex" and family.wire_api == CHAT_WIRE_API:
-        raise OmnigentError(
-            "The 'codex' harness requires an OpenAI Responses API endpoint, but "
-            f"provider endpoint {family.base_url!r} is configured with "
-            "'wire_api: chat'. Choose a Responses-capable endpoint and set "
-            "'wire_api: responses', or use a harness that supports Chat Completions.",
-            code=ErrorCode.INVALID_INPUT,
+        raise HarnessConfigurationError(
+            "The 'codex' harness requires an OpenAI Responses API endpoint. "
+            "Choose a Responses-capable endpoint and set 'wire_api: responses', "
+            "or use a harness that supports Chat Completions.",
+            diagnostic=(
+                "The 'codex' harness requires an OpenAI Responses API endpoint, but "
+                f"provider endpoint {family.base_url!r} is configured with "
+                "'wire_api: chat'. Choose a Responses-capable endpoint and set "
+                "'wire_api: responses', or use a harness that supports Chat Completions."
+            ),
         )
 
     cfg = _UCODE_HARNESS_CONFIGS[harness_type]
@@ -976,10 +987,13 @@ def _apply_provider_to_pi(env: dict[str, str], entry: ProviderEntry) -> None:
             if cred_errors
             else " — set the api_key env var for its 'anthropic' or 'openai' family in your shell"
         )
-        raise OmnigentError(
-            f"pi harness: provider {entry.name!r} configures no family whose "
-            f"credentials resolve{detail}, then retry.",
-            code=ErrorCode.INVALID_INPUT,
+        raise HarnessConfigurationError(
+            "The Pi provider has no usable credential. Configure the 'api_key' or "
+            "'auth_command' for its anthropic/openai family and retry.",
+            diagnostic=(
+                f"pi harness: provider {entry.name!r} configures no family whose "
+                f"credentials resolve{detail}, then retry."
+            ),
         )
     # pi carries a single credential: anthropic's when present, else openai's.
     # The model fallback must match the family that supplied that credential.
@@ -1038,13 +1052,17 @@ def _apply_cli_config_databricks_to_pi(env: dict[str, str], entry: ProviderEntry
     model_override = env.get("HARNESS_PI_MODEL")
     provider = _cli_config_pi_provider(entry, model=model_override)
     if provider is None:
-        raise OmnigentError(
-            f"provider {entry.name!r} (kind 'cli-config') was selected for the 'pi' "
-            "harness but its codex [model_providers] table could not be resolved as a "
-            "Databricks Unity Gateway. Check the [model_providers] base_url + auth in "
-            "~/.codex/config.toml, or configure a key/gateway provider for pi in "
-            "~/.omnigent/config.yaml.",
-            code=ErrorCode.INVALID_INPUT,
+        raise HarnessConfigurationError(
+            "Pi cannot resolve this CLI-config provider as a Databricks Unity Gateway. "
+            "Check the [model_providers] base_url and auth in ~/.codex/config.toml, "
+            "or configure a key/gateway provider for Pi in ~/.omnigent/config.yaml.",
+            diagnostic=(
+                f"provider {entry.name!r} (kind 'cli-config') was selected for the 'pi' "
+                "harness but its codex [model_providers] table could not be resolved as a "
+                "Databricks Unity Gateway. Check the [model_providers] base_url + auth in "
+                "~/.codex/config.toml, or configure a key/gateway provider for pi in "
+                "~/.omnigent/config.yaml."
+            ),
         )
     # Pi speaks the gateway's Anthropic Messages surface — register it under
     # pi's "claude" family key (mirrors _apply_provider_to_pi's anthropic path).
@@ -1196,11 +1214,15 @@ def _resolve_provider_for_build(
             local_providers = load_providers(effective_config_with_detected(_load_config()))
             entry = local_providers.get(auth.name)
         if entry is None:
-            raise OmnigentError(
-                f"executor.auth references provider {auth.name!r}, but no such provider is "
-                "configured under 'providers:' in ~/.omnigent/config.yaml. "
-                f"Run `{cli_invocation()} setup --no-internal-beta` to configure one.",
-                code=ErrorCode.INVALID_INPUT,
+            raise HarnessConfigurationError(
+                "The provider named by executor.auth is not configured. "
+                "Configure it under 'providers:' in ~/.omnigent/config.yaml "
+                "or update executor.auth.name, then retry.",
+                diagnostic=(
+                    f"executor.auth references provider {auth.name!r}, but no such provider is "
+                    "configured under 'providers:' in ~/.omnigent/config.yaml. "
+                    f"Run `{cli_invocation()} setup` to configure one."
+                ),
             )
         return entry
     if isinstance(auth, DatabricksAuth):
@@ -1445,7 +1467,81 @@ def _build_claude_sdk_spawn_env(
     # Explicitly clear inherited presets for agents that have not opted in.
     preset = spec.executor.config.get("system_prompt_preset")
     env["HARNESS_CLAUDE_SDK_SYSTEM_PROMPT_PRESET"] = str(preset) if preset is not None else ""
+    from omnigent.onboarding.provider_config import _load_config, provider_credential_env_vars
+
+    # Retain env-ref provenance after provider resolution turns keys into helpers.
+    # Local providers can still supply named auth under a managed config overlay.
+    source_env_names = frozenset(
+        spec.executor.auth.source_env_names if isinstance(spec.executor.auth, ApiKeyAuth) else ()
+    )
+    for config in (effective_config_with_detected(load_config()), _load_config()):
+        source_env_names |= provider_credential_env_vars(config, include_dollar_key_refs=True)
+        raw_auth = config.get("auth")
+        if isinstance(raw_auth, dict) and raw_auth.get("type") == "api_key":
+            raw_key = raw_auth.get("api_key")
+            if isinstance(raw_key, str):
+                source_env_names |= frozenset(_api_key_source_env_names(raw_key))
+    env["HARNESS_CLAUDE_SDK_CREDENTIAL_ENV_NAMES"] = json.dumps(sorted(source_env_names))
     return env
+
+
+def claude_terminal_model_access(
+    spec: AgentSpec,
+    *,
+    bundle_dir: Path | None = None,
+    effective_harness: str | None = None,
+    cwd: str | Path | None = None,
+) -> ClaudeModelAccess | None:
+    """Derive automatic terminal model access from the owning Claude SDK session."""
+    from omnigent.inner.claude_model_access import HELPER_ENV, resolve_claude_model_access
+    from omnigent.inner.claude_sdk_executor import (
+        _claude_user_settings_env_with_sources,
+        _resolve_gateway_env,
+        _resolve_sandbox_cwd,
+    )
+
+    harness = effective_harness or spec.executor.harness_kind
+    if not is_claude_sdk_harness_name(harness):
+        return None
+    spec = replace(
+        spec,
+        executor=replace(spec.executor, config={**spec.executor.config, "harness": "claude-sdk"}),
+    )
+    launch_env = _build_claude_sdk_spawn_env(spec)
+    effective_cwd = _resolve_sandbox_cwd(
+        str(cwd) if cwd is not None else spec.os_env.cwd if spec.os_env else None
+    )
+    profile = launch_env.get("HARNESS_CLAUDE_SDK_DATABRICKS_PROFILE")
+    model_env = dict(os.environ)
+    model_env.pop("ANTHROPIC_API_KEY", None)
+    user_settings_source_paths: tuple[Path, ...] = ()
+    user_settings_has_api_key_helper = False
+    if launch_env.get("HARNESS_CLAUDE_SDK_GATEWAY") in ("1", "true"):
+        model_env.update(
+            _resolve_gateway_env(
+                profile,
+                base_url_override=launch_env.get("HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL"),
+                host_override=launch_env.get("HARNESS_CLAUDE_SDK_GATEWAY_HOST"),
+                auth_command_override=launch_env.get("HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND"),
+            )
+        )
+    else:
+        settings_env, user_settings_source_paths, user_settings_has_api_key_helper = (
+            _claude_user_settings_env_with_sources(str(effective_cwd))
+        )
+        model_env.update(settings_env)
+    if helper := launch_env.get("HARNESS_CLAUDE_SDK_API_KEY_HELPER"):
+        model_env[HELPER_ENV] = helper
+    return resolve_claude_model_access(
+        model_env,
+        cwd=effective_cwd,
+        databricks_profile=profile,
+        source_paths=user_settings_source_paths,
+        user_settings_has_api_key_helper=user_settings_has_api_key_helper,
+        source_env_names=frozenset(
+            json.loads(launch_env.get("HARNESS_CLAUDE_SDK_CREDENTIAL_ENV_NAMES", "[]"))
+        ),
+    ).with_bundle_sources(bundle_dir)
 
 
 def _apply_harness_path_override(
@@ -1503,13 +1599,19 @@ def _apply_codex_provider_env(
     _bind_codex_gateway_credential(env, spec)
 
 
-def _bind_codex_gateway_credential(env: dict[str, str], spec: AgentSpec) -> None:
-    """Use a host-bound placeholder for an explicitly brokered Codex gateway."""
+def _codex_broker_gateway_enabled(spec: AgentSpec) -> bool:
     locked = spec.executor.config.get("broker_gateway", False)
     if not isinstance(locked, bool):
-        raise OmnigentError(
-            "executor.config.broker_gateway must be a boolean", code=ErrorCode.INVALID_INPUT
+        raise HarnessConfigurationError(
+            "executor.config.broker_gateway must be a boolean. "
+            "Use true or false (without quotes) and retry."
         )
+    return locked
+
+
+def _bind_codex_gateway_credential(env: dict[str, str], spec: AgentSpec) -> None:
+    """Use a host-bound placeholder for an explicitly brokered Codex gateway."""
+    locked = _codex_broker_gateway_enabled(spec)
     base_url = env.get("HARNESS_CODEX_GATEWAY_BASE_URL")
     sandbox = spec.os_env.sandbox if spec.os_env is not None else None
     proxy = sandbox.credential_proxy if sandbox is not None else None
@@ -1521,36 +1623,40 @@ def _bind_codex_gateway_credential(env: dict[str, str], spec: AgentSpec) -> None
     if not locked and not reserved_bindings:
         return
     if not base_url:
-        raise OmnigentError(
+        raise HarnessConfigurationError(
             "Codex gateway credential_proxy requires a gateway HTTPS provider",
-            code=ErrorCode.INVALID_INPUT,
         )
     try:
         parsed = urlparse(base_url)
         host = parsed.hostname
         port = parsed.port
     except ValueError:
-        raise OmnigentError("invalid Codex gateway URL", code=ErrorCode.INVALID_INPUT) from None
+        raise HarnessConfigurationError(
+            "Invalid Codex gateway URL. Configure an exact HTTPS gateway endpoint and retry.",
+            diagnostic="invalid Codex gateway URL",
+        ) from None
     if not locked:
-        raise OmnigentError(
+        raise HarnessConfigurationError(
             "Codex gateway reserved binding requires executor.config.broker_gateway: true",
-            code=ErrorCode.INVALID_INPUT,
         )
     if (
         spec.executor.config.get("web_search") is not False
         or spec.executor.config.get("disable_native_tools") is not True
     ):
-        raise OmnigentError(
+        raise HarnessConfigurationError(
             "brokered Codex gateway requires executor.config.web_search: false "
             "and executor.config.disable_native_tools: true",
-            code=ErrorCode.INVALID_INPUT,
         )
     binding = reserved_bindings[0] if len(reserved_bindings) == 1 else None
     model_path = parsed.path.rstrip("/") + "/responses"
     try:
         rules = parse_rules(sandbox.egress_rules or []) if sandbox is not None else []
     except ValueError as exc:
-        raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+        raise HarnessConfigurationError(
+            "Invalid Codex egress rules. Configure an exact POST Responses route in "
+            "os_env.sandbox.egress_rules and retry.",
+            diagnostic=str(exc),
+        ) from exc
     model_rules = [rule for rule in rules if host and rule._host_matches(host)]
     if (
         len(reserved_bindings) != 1
@@ -1576,16 +1682,37 @@ def _bind_codex_gateway_credential(env: dict[str, str], spec: AgentSpec) -> None
             for rule in model_rules
         )
     ):
-        raise OmnigentError(
+        raise HarnessConfigurationError(
             "Codex gateway credential_proxy requires one matching HTTPS bearer "
             "renewable file/socket binding with env OMNIGENT_CODEX_GATEWAY_TOKEN "
             "and the exact POST Responses egress rule",
-            code=ErrorCode.INVALID_INPUT,
         )
     env["HARNESS_CODEX_GATEWAY_AUTH_COMMAND"] = BROKERED_CODEX_AUTH_COMMAND
     env["HARNESS_CODEX_BROKERED_GATEWAY"] = "true"
     env["HARNESS_CODEX_ENABLE_WEB_SEARCH"] = "false"
     env["HARNESS_CODEX_DISABLE_NATIVE_TOOLS"] = "true"
+
+
+def _apply_codex_tool_switches(env: dict[str, str], spec: AgentSpec) -> None:
+    """Apply the spec's Codex tool switches on every route.
+
+    The switches only restrict: ``web_search: true`` or
+    ``disable_native_tools: false`` never re-enables tools the operator disabled.
+    """
+    config = spec.executor.config
+    for key in ("web_search", "disable_native_tools"):
+        if config.get(key) is not None and not isinstance(config[key], bool):
+            raise HarnessConfigurationError(
+                "executor.config.web_search must be a boolean. Use true or false and retry."
+                if key == "web_search"
+                else "executor.config.disable_native_tools must be a boolean. "
+                "Use true or false and retry.",
+                diagnostic=f"executor.config.{key} must be a boolean",
+            )
+    if config.get("web_search") is False:
+        env["HARNESS_CODEX_ENABLE_WEB_SEARCH"] = "false"
+    if config.get("disable_native_tools") is True:
+        env["HARNESS_CODEX_DISABLE_NATIVE_TOOLS"] = "true"
 
 
 def _build_codex_spawn_env(
@@ -1611,6 +1738,21 @@ def _build_codex_spawn_env(
     :returns: A dict of env-var overrides for
         :meth:`HarnessProcessManager.get_client(env=...)`.
     """
+    brokered_gateway = _codex_broker_gateway_enabled(spec)
+    if spec.os_env is not None:
+        from omnigent.inner.sandbox import validate_harness_sandbox
+
+        try:
+            validate_harness_sandbox(
+                spec.os_env,
+                "Codex",
+                cwd=cwd,
+                supports_egress_rules=True,
+                supports_credential_proxy=brokered_gateway,
+            )
+        except ValueError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+
     env: dict[str, str] = {}
     model = _resolve_bound_launch_model(spec, "codex")
     if model is not None:
@@ -1623,6 +1765,7 @@ def _build_codex_spawn_env(
     # unchanged.
     provider = _resolve_provider_for_build(spec, harness_type="codex", for_launch=True)
     _apply_codex_provider_env(env, spec, provider)
+    _apply_codex_tool_switches(env, spec)
     # Skills bridge — same shape as the claude-sdk variant. Always
     # set so the harness wrap doesn't fall back to its ``"all"``
     # default and override an explicit ``skills: none`` spec.
@@ -2034,10 +2177,13 @@ def _build_acp_spawn_env(
     else:
         agent = resolve_acp_agent(slug) if slug else None
         if raw_harness.startswith("acp:") and agent is None:
-            raise OmnigentError(
-                f"ACP agent {slug!r} is not configured on this runner. "
-                "Check the selected host's ACP configuration.",
-                code=ErrorCode.INVALID_INPUT,
+            raise HarnessConfigurationError(
+                "The selected ACP agent is not configured on this runner. "
+                "Check the selected host's ACP configuration and select a configured agent.",
+                diagnostic=(
+                    f"ACP agent {slug!r} is not configured on this runner. "
+                    "Check the selected host's ACP configuration."
+                ),
             )
         if agent is None:
             agents = acp_agents()
@@ -2134,6 +2280,7 @@ def _load_global_auth() -> ApiKeyAuth | DatabricksAuth | None:
         api_key = str(raw_auth.get("api_key") or "")
         if not api_key:
             return None
+        source_env_names = _api_key_source_env_names(api_key)
         # Expand $VAR references (the config file may store the literal
         # env-var reference; expand at use-time so the secret never
         # needs to live in the YAML file itself).
@@ -2144,7 +2291,7 @@ def _load_global_auth() -> ApiKeyAuth | DatabricksAuth | None:
         if raw_base_url:
             base_url = expand_envvars_with_omnigent_prefix(str(raw_base_url))
             check_unresolved_env_vars("auth.base_url", base_url)
-        return ApiKeyAuth(api_key=api_key, base_url=base_url)
+        return ApiKeyAuth(api_key=api_key, base_url=base_url, source_env_names=source_env_names)
     if auth_type == "databricks":
         profile_val = str(raw_auth.get("profile") or "")
         return DatabricksAuth(profile=profile_val) if profile_val else None
@@ -2431,17 +2578,7 @@ def _build_kimi_spawn_env(
         launch against an unrelated ambient provider.
     """
     if spec.executor.auth is not None:
-        raise OmnigentError(
-            "The 'kimi' harness does not support per-invocation provider / "
-            "auth injection: upstream kimi has no per-spawn config override "
-            "(no ``--config-file`` / ``--mcp-config-file``). Remove "
-            "``executor.auth`` from the spec and configure the provider once "
-            "via `kimi provider add` in $KIMI_CODE_HOME/config.toml (default "
-            "~/.kimi-code/config.toml), then pin the "
-            "resulting model id in the agent spec. Omnigent-side provider "
-            "injection is a deferred follow-up.",
-            code=ErrorCode.INVALID_INPUT,
-        )
+        raise KimiAuthConfigurationError()
     env: dict[str, str] = {}
     model = _resolve_spec_model(spec)
     if model is not None:
@@ -2528,7 +2665,13 @@ def _build_antigravity_spawn_env(spec: AgentSpec) -> dict[str, str]:
     :returns: Env-var overrides; may be empty (the wrap then uses the SDK's
         ambient creds and default model).
     """
+    from omnigent.inner.sandbox import reject_unsupported_harness_sandbox
+
+    reject_unsupported_harness_sandbox(spec.os_env, "Antigravity")
     env: dict[str, str] = {}
+    os_env_payload = _serialize_os_env(spec.os_env)
+    if os_env_payload is not None:
+        env["HARNESS_ANTIGRAVITY_OS_ENV"] = os_env_payload
     model = _resolve_spec_model(spec)
     if model is None:
         # Brain-picker sessions often omit executor.model; honor antigravity.model

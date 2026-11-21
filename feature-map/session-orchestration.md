@@ -26,7 +26,9 @@ MCP independent creation.
   another session". `sys_session_list` and `sys_session_get_info` expose
   `created_by_session_id` so managers can identify their workers across restarts;
   `sys_session_list` with `include_archived` also lists archived workers, each
-  marked `archived`.
+  marked `archived`. With `created_by_this_session`, the runner pages the global
+  `sessions` view itself and returns only the caller's workers in one call, up to
+  a scan limit; the `sub_agents` view is then empty.
 - `list-scope`: `sys_session_list`'s global `sessions` view lists only the
   caller's own sessions by default, like the sidebar's My view. Sessions other
   users shared with the caller appear only with `visibility: "shared"` (or
@@ -53,10 +55,6 @@ MCP independent creation.
   of the owner's saved workflows, with that workflow's plan already in its
   journal. With workflows disabled, or on a server that doesn't advertise
   `session_create_workflow_id`, the tool refuses it before creating anything.
-  An optional `session_id_placeholder` names text in `message` that the runner
-  replaces with the new session's ID for `same_host` and `host` placements, where it
-  sends the first message itself; the message is sent unchanged when the argument is
-  absent, for `managed` placement, or when filling it in would exceed the message limit.
   With `sibling_sessions` enabled they share one sidebar family and do not appear
   as child agents; with it disabled they remain standalone.
   Managed creation uses the server's configured default sandbox provider. A
@@ -205,7 +203,8 @@ MCP independent creation.
 
 ### Scripted review sessions
 
-With the server release flag `scripted_sessions` enabled (default off),
+With the server release flag `scripted_sessions` enabled (default on;
+`OMNIGENT_FEATURES=-scripted_sessions` turns it off),
 `sys_session_create` also accepts `placement="host"`, an owned connected
 `host_id`, an absolute `workspace`, and optional
 `git: {branch_name, base_branch}`. The workspace is the source repository;
@@ -230,7 +229,7 @@ requires checking the session before retrying.
 creating a project; `project=""` lists unfiled sessions. Keep the same filter
 when continuing a cursor. The sub-agent view is unchanged.
 
-For a manual check, enable `scripted_sessions` on a test server and obtain an
+For a manual check, use a test server with `scripted_sessions` left on and obtain an
 owned host ID from a session's `sys_session_get_info` response. Create a review
 session with `placement="host"`, that host ID, the repository path,
 `git={"branch_name":"review-example","base_branch":"main"}` and a project ID.

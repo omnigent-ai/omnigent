@@ -7,7 +7,9 @@ SQLite database.
 
 from __future__ import annotations
 
+import json
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -15,6 +17,7 @@ import pytest
 from omnigent.db.db_models import current_workspace_id, workspace_scope
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.scheduled.schedule import next_scheduled_time
+from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 
 pytestmark = pytest.mark.usefixtures("frozen_recurrence_clock")
@@ -701,6 +704,92 @@ def test_delete_removes_task(store: SqlAlchemyScheduledTaskStore) -> None:
 def test_delete_missing_returns_false(store: SqlAlchemyScheduledTaskStore) -> None:
     """``delete`` is idempotent — returns ``False`` when nothing was removed."""
     assert store.delete(_uid("st_missing")) is False
+
+
+# ── default timezone ─────────────────────────────────────────────────────────
+
+
+def test_legacy_store_can_keep_implementing_only_its_existing_methods() -> None:
+    def unsupported(*args: object, **kwargs: object) -> None:
+        raise NotImplementedError
+
+    legacy_methods = {
+        name: unsupported
+        for name in ScheduledTaskStore.__abstractmethods__
+        if name not in {"get_default_timezone", "set_default_timezone"}
+    }
+    legacy_type = type("LegacyScheduledTaskStore", (ScheduledTaskStore,), legacy_methods)
+    legacy = legacy_type("memory")
+
+    assert legacy.get_default_timezone(None) is None
+    with pytest.raises(NotImplementedError):
+        legacy.set_default_timezone(None, "America/Chicago")
+
+
+def test_default_timezone_is_per_user_and_ignores_unusable_stored_values(
+    store: SqlAlchemyScheduledTaskStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The recorded zone round-trips per user; an unusable stored value reads as unset."""
+    from sqlalchemy import LargeBinary, literal, update
+    from sqlalchemy.orm import Session
+
+    from omnigent.db.compression import encode
+    from omnigent.db.db_models import SqlPreference
+    from omnigent.stores.scheduled_task_store import sqlalchemy_store
+
+    assert store.get_default_timezone(None) is None
+    store.set_default_timezone(None, "America/Chicago")
+    store.set_default_timezone("alice@example.com", "Asia/Tokyo")
+    store.set_default_timezone(None, "America/Los_Angeles")
+    assert store.get_default_timezone(None) == "America/Los_Angeles"
+    assert store.get_default_timezone("alice@example.com") == "Asia/Tokyo"
+    assert store.get_default_timezone("bob@example.com") is None
+    with workspace_scope(7):
+        assert store.get_default_timezone(None) is None
+        assert store.get_default_timezone("alice@example.com") is None
+        store.set_default_timezone(None, "Asia/Kolkata")
+        store.set_default_timezone("alice@example.com", "Europe/Paris")
+        assert store.get_default_timezone(None) == "Asia/Kolkata"
+        assert store.get_default_timezone("alice@example.com") == "Europe/Paris"
+    assert store.get_default_timezone(None) == "America/Los_Angeles"
+    assert store.get_default_timezone("alice@example.com") == "Asia/Tokyo"
+
+    for stored in ('"Not/A_Zone"', '"America"', "42", "not json"):
+        with Session(store._engine) as session:
+            session.execute(
+                update(SqlPreference)
+                .where(
+                    SqlPreference.workspace_id == current_workspace_id(),
+                    SqlPreference.user_id == "local",
+                    SqlPreference.key == "scheduled_task_default_timezone",
+                )
+                .values(value=stored)
+            )
+            session.commit()
+        assert store.get_default_timezone(None) is None, stored
+
+    def unexpected_zone_lookup(key: str) -> None:
+        pytest.fail(f"Invalid or oversized storage reached timezone lookup: {key[:40]}")
+
+    for raw in (b"not an envelope", b"\x00\x01bad", encode(json.dumps("x" * 1025))):
+        with store._session("seed_invalid_timezone_preference") as session:
+            session.execute(
+                update(SqlPreference)
+                .where(
+                    SqlPreference.workspace_id == current_workspace_id(),
+                    SqlPreference.user_id == "local",
+                    SqlPreference.key == "scheduled_task_default_timezone",
+                )
+                .values(value=literal(raw, type_=LargeBinary)),
+            )
+        with monkeypatch.context() as patch:
+            patch.setattr(sqlalchemy_store, "ZoneInfo", unexpected_zone_lookup)
+            assert store.get_default_timezone(None) is None
+    assert store.get_default_timezone("alice@example.com") == "Asia/Tokyo"
+    with workspace_scope(7):
+        assert store.get_default_timezone(None) == "Asia/Kolkata"
+        assert store.get_default_timezone("alice@example.com") == "Europe/Paris"
 
 
 # ── runs ──────────────────────────────────────────────────────────────────────
@@ -2994,3 +3083,37 @@ def test_inbox_mysql_deep_page_seeks_to_cursor(store):
         float(value) for value in re.findall(r"actual time=[^)]*? rows=([\d.]+)", plans[0])
     ]
     assert examined and max(examined) <= 51, plans[0]
+
+
+@pytest.mark.parametrize(
+    ("days_later", "expected"),
+    [
+        (2, (int(datetime(2026, 11, 21, 9, tzinfo=UTC).timestamp()), "active")),
+        (3, (None, "completed")),
+    ],
+)
+def test_a_schedule_anchor_keeps_count_from_the_anchor(
+    store: SqlAlchemyScheduledTaskStore,
+    monkeypatch: pytest.MonkeyPatch,
+    days_later: int,
+    expected: tuple[int | None, str],
+) -> None:
+    from omnigent.stores.scheduled_task_store import sqlalchemy_store
+
+    store.configure_dispatch(True)
+    anchor = int(datetime(2026, 11, 18, 12, tzinfo=UTC).timestamp())
+    # Runs on the 19th, 20th and 21st when anchored on the 18th.
+    monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: anchor + days_later * 86400)
+    task = store.create(
+        scheduled_task_id=_uid(f"st_anchor_{days_later}"),
+        name="copy",
+        prompt="p",
+        rrule="FREQ=DAILY;BYHOUR=9;BYMINUTE=0;COUNT=3",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+        schedule_anchor=anchor,
+    )
+    assert task.created_at == anchor
+    # Only the occurrences left after now remain; none, once COUNT is used up.
+    assert (task.next_run_at, task.state) == expected

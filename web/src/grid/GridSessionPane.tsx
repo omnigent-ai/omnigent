@@ -1,3 +1,4 @@
+import { DEFAULT_FILES_PANEL_PREFERENCES } from "@/lib/filesPanelPreferences";
 import {
   useCallback,
   useContext,
@@ -6,19 +7,20 @@ import {
   useRef,
   useState,
   type ComponentProps,
+  Suspense,
 } from "react";
 import { createPortal } from "react-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { useDraggable, useDroppable } from "@dnd-kit/core";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
-import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { Maximize2Icon, XIcon } from "lucide-react";
 import { SideChatPane } from "@/components/chat/SideChatPane";
-import { COMPOSER_COLLAPSED_LABEL_CLASS } from "@/components/composer/ChatComposer";
+import { SessionHarnessPicker } from "@/components/composer/SessionHarnessPicker";
+import { useSessionPickerInputs } from "@/components/composer/sessionPickerInputs";
+import { useSessionHarnessPickerProps } from "@/components/composer/useSessionHarnessPickerProps";
 import { ComposerPermissionPicker } from "@/components/composer/ComposerControls";
-import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
 import { HostBadge } from "@/components/HostBadge";
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import { Button } from "@/components/ui/button";
@@ -38,16 +40,11 @@ import {
 import { terminalTabKey, useDeleteTerminal } from "@/hooks/useTerminals";
 import { useWorkspaceResources } from "@/shell/useWorkspaceResources";
 import { supportsBrowser } from "@/lib/nativeBridge";
-import {
-  isNativeWrapper,
-  nativeCodingAgentForHarness,
-  nativeCodingAgentForSubagentWrapper,
-} from "@/lib/nativeCodingAgents";
-import { permissionChip, permissionChipKind } from "@/lib/permissionModeCycle";
+import { isNativeWrapper, nativeCodingAgentForSubagentWrapper } from "@/lib/nativeCodingAgents";
 import { isOwnerLevel } from "@/lib/permissionsApi";
 import type { Session } from "@/lib/types";
-import { useChatStore } from "@/store/chatStore";
 import { retrySession } from "@/lib/sessionsApi";
+import { readOnlyReasonForSessionLabels } from "@/lib/sessionCapabilities";
 import { readTranscriptViewDefault } from "@/lib/transcriptViewPreferences";
 import { MainTerminalView } from "@/shell/MainTerminalView";
 import { TerminalFirstContextProvider, type TerminalFirstView } from "@/shell/TerminalFirstContext";
@@ -65,6 +62,11 @@ import {
 } from "@/lib/workspaceTabPreferences";
 import { CloseShellDialog } from "@/shell/CloseShellDialog";
 import {
+  LazyWorkspaceTabsHost,
+  routeToWorkspaceTabs,
+  useTabsSidebar,
+} from "@/shell/workspaceTabsRouting";
+import {
   FileViewerContext,
   type FileNavigationGuard,
   type FilePosition,
@@ -77,6 +79,9 @@ import { revealFolderInFilesPanel } from "@/shell/FilesPanel";
 import { selectPullRequestInPanel } from "@/shell/PullRequestPanel";
 import { citedFilePosition } from "@/shell/filePositionState";
 import { useGridSessions } from "./GridSessionsContext";
+import { ENABLED_COMPOSER_INPUT_SELECTOR } from "@/components/composer/engine/composerInput";
+import { useGridPermissionControl, type GridPermissionControl } from "./useGridPermissionControl";
+import { useSharedSessionDraft } from "./sharedSessionDraft";
 
 export type GridWorkspacePanelProps = Pick<
   ComponentProps<typeof WorkspacePanel>,
@@ -110,6 +115,7 @@ export function GridSessionPane({
   const serverInfo = useServerInfo();
   const permissionLevel = session?.permissionLevel ?? (canEdit ? null : 1);
   const grids = useGridSessions()!;
+  useSharedSessionDraft(sessionId);
   const title = session?.title || "Session";
   const {
     attributes,
@@ -141,6 +147,8 @@ export function GridSessionPane({
     turnActive: state.status === "streaming",
     launchedAt: state.runnerLaunchedAt,
   });
+  const unreachable = liveness.kind === "host_offline" || liveness.kind === "local_stranded";
+  const permission = useGridPermissionControl(session, permissionLevel, unreachable);
   const wrapper = session?.labels?.["omnigent.wrapper"];
   const terminalFirst = session?.labels?.["omnigent.ui"] === "terminal";
   const rootSessionId = useRootSessionId(sessionId, session?.parentSessionId);
@@ -150,6 +158,7 @@ export function GridSessionPane({
     environmentQuery: environment,
     showFilesPanel: showFiles,
     changedCount,
+    changedFiles,
     isChangedPath,
     terminals,
     agentTerminal,
@@ -202,7 +211,7 @@ export function GridSessionPane({
     const composer = showTerminal
       ? undefined
       : Array.from(
-          chatRef.current?.querySelectorAll<HTMLTextAreaElement>("textarea:not(:disabled)") ?? [],
+          chatRef.current?.querySelectorAll<HTMLElement>(ENABLED_COMPOSER_INPUT_SELECTOR) ?? [],
         ).at(-1);
     (composer ?? pane).focus({ preventScroll: true });
   }, [focusRequest, showTerminal]);
@@ -249,7 +258,7 @@ export function GridSessionPane({
   const updateWorkspace = useCallback((patch: SessionWorkspaceState) => {
     setWorkspace((previous) => ({ ...previous, ...patch }));
   }, []);
-  const [sort, setSort] = useState<ChangedSort>("recent");
+  const [sort, setSort] = useState<ChangedSort>(DEFAULT_FILES_PANEL_PREFERENCES.sort);
   const [showHidden, setShowHidden] = useState(false);
   const [position, setPosition] = useState<FilePosition>();
   const navigationGuard = useRef<FileNavigationGuard | null>(null);
@@ -259,6 +268,9 @@ export function GridSessionPane({
       if (navigationGuard.current === guard) navigationGuard.current = null;
     };
   }, []);
+  // With the workspace_sidebar_v2 flag, the cell's sidebar shows as tabs, where its files,
+  // pages and shells open.
+  const tabsSidebar = useTabsSidebar();
   const navigateWorkspace = useCallback(
     (path: string | null, options: OpenFileOptions | undefined, apply: () => void) => {
       if (navigationGuard.current) navigationGuard.current(path, options, apply);
@@ -278,6 +290,13 @@ export function GridSessionPane({
   );
   const openFile = useCallback(
     (path: string, options?: OpenFileOptions) => {
+      if (tabsSidebar) {
+        onOpenWorkspace();
+        void routeToWorkspaceTabs((tabs) =>
+          tabs.openWorkspaceFileLink(sessionId, path, options, "user"),
+        );
+        return;
+      }
       navigateWorkspace(path, options, () => {
         onOpenWorkspace();
         setPosition(citedFilePosition(options));
@@ -291,21 +310,32 @@ export function GridSessionPane({
         }));
       });
     },
-    [navigateWorkspace, onOpenWorkspace],
+    [tabsSidebar, sessionId, navigateWorkspace, onOpenWorkspace],
   );
   useUiOpenFile(sessionId, selected && canBrowse, openFile);
-  const showTab = useCallback((rightRailTab: RightRailTab | null) => {
-    setWorkspace((previous) => ({
-      ...previous,
-      rightRailTab,
-      selectedFilePath: null,
-      selectedTerminalKey: null,
-      openPanels:
-        isDefaultWorkspaceTab(rightRailTab) && !readPinnedWorkspaceTabs().includes(rightRailTab)
-          ? [...new Set([...(previous.openPanels ?? []), rightRailTab])]
-          : previous.openPanels,
-    }));
-  }, []);
+  const showTab = useCallback(
+    (rightRailTab: RightRailTab | null) => {
+      if (tabsSidebar) {
+        void routeToWorkspaceTabs(async (tabs) =>
+          tabs.isWorkspacePage(rightRailTab)
+            ? tabs.openWorkspacePage(sessionId, rightRailTab)
+            : { ok: true },
+        );
+        return;
+      }
+      setWorkspace((previous) => ({
+        ...previous,
+        rightRailTab,
+        selectedFilePath: null,
+        selectedTerminalKey: null,
+        openPanels:
+          isDefaultWorkspaceTab(rightRailTab) && !readPinnedWorkspaceTabs().includes(rightRailTab)
+            ? [...new Set([...(previous.openPanels ?? []), rightRailTab])]
+            : previous.openPanels,
+      }));
+    },
+    [tabsSidebar, sessionId],
+  );
   const selectTab = useCallback(
     (rightRailTab: RightRailTab | null) => {
       navigateWorkspace("", undefined, () => showTab(rightRailTab));
@@ -326,12 +356,17 @@ export function GridSessionPane({
   );
   const openTerminal = useCallback(
     (key: string) => {
+      if (tabsSidebar) {
+        onOpenWorkspace();
+        void routeToWorkspaceTabs((tabs) => tabs.openWorkspaceTerminal(sessionId, key));
+        return;
+      }
       navigateWorkspace("", undefined, () => {
         onOpenWorkspace();
         updateWorkspace({ selectedFilePath: null, selectedTerminalKey: key });
       });
     },
-    [navigateWorkspace, updateWorkspace, onOpenWorkspace],
+    [tabsSidebar, sessionId, navigateWorkspace, updateWorkspace, onOpenWorkspace],
   );
   const fileContext = useMemo(
     () => ({
@@ -339,6 +374,16 @@ export function GridSessionPane({
       registerNavigationGuard,
       guardFileNavigation: navigateWorkspace,
       openGithubTab: (prUrl?: string) => {
+        if (tabsSidebar) {
+          onOpenWorkspace();
+          void routeToWorkspaceTabs((tabs) =>
+            tabs.showWorkspacePullRequests(
+              sessionId,
+              prUrl ? { kind: "pull", url: prUrl, overview: true } : { kind: "overview" },
+            ),
+          );
+          return;
+        }
         navigateWorkspace("", undefined, () => {
           if (prUrl) selectPullRequestInPanel(queryClient, sessionId, prUrl);
           showTab("github");
@@ -360,6 +405,7 @@ export function GridSessionPane({
       isChangedPath,
     }),
     [
+      tabsSidebar,
       openFile,
       registerNavigationGuard,
       queryClient,
@@ -456,18 +502,25 @@ export function GridSessionPane({
                   gridComposer={{
                     leading: session && (
                       <>
-                        {/* Status only; switching hosts stays in the full-screen view. */}
-                        <HostBadge sessionId={sessionId} appearance="composer" readOnly />
-                        <GridPermissionPicker
-                          session={session}
-                          permissionLevel={permissionLevel}
-                          unreachable={
-                            liveness.kind === "host_offline" || liveness.kind === "local_stranded"
-                          }
+                        <HostBadge
+                          sessionId={sessionId}
+                          appearance="composer"
+                          readOnly={!canEdit}
+                          launch={state.sandboxStatus}
                         />
+                        <GridPermissionPicker permission={permission} />
                       </>
                     ),
-                    trailing: session && <GridHarnessStatus session={session} />,
+                    trailing: session && (
+                      <GridSessionHarnessPicker
+                        sessionId={sessionId}
+                        session={session}
+                        canEdit={canEdit}
+                        unreachable={unreachable}
+                        runnerOnline={runnerOnline}
+                      />
+                    ),
+                    cyclePermissionMode: permission.cycle,
                   }}
                 />
               </RenderErrorBoundary>
@@ -526,75 +579,116 @@ export function GridSessionPane({
         {workspaceTarget &&
           createPortal(
             <div className={selected && workspacePanel.open ? "contents" : "hidden"}>
-              <WorkspacePanel
-                contained
-                keyboardTarget={selected}
-                conversationId={sessionId}
-                sessionHarness={state.sessionHarness}
-                agentId={state.boundAgentId ?? session?.agentId ?? null}
-                {...workspacePanel}
-                open={selected && workspacePanel.open}
-                inert={!selected || !workspacePanel.open}
-                rightRailTab={rightRailTab}
-                onRightRailTabChange={selectTab}
-                openPanels={workspace.openPanels ?? []}
-                onClosePanel={(tab) => {
-                  navigateWorkspace("", undefined, () =>
-                    setWorkspace((previous) => {
-                      const remaining = previous.openPanels?.filter((panel) => panel !== tab) ?? [];
-                      return {
-                        ...previous,
-                        openPanels: remaining,
-                        rightRailTab:
-                          previous.rightRailTab === tab
-                            ? (remaining.at(-1) ?? readInitialWorkspaceTab())
-                            : previous.rightRailTab,
-                      };
-                    }),
-                  );
-                }}
-                showFilesPanel={showFiles}
-                showGithubTab={showFiles}
-                showTasksTab={
-                  (isFeatureEnabled(serverInfo, "workflows") &&
-                    serverInfo !== "loading" &&
-                    serverInfo.session_journal === true) ||
-                  (state.todos?.length ?? 0) > 0
-                }
-                showBrowserTab={supportsBrowser()}
-                onReveal={onOpenWorkspace}
-                changedCount={changedCount}
-                subagentsWorking={childSessions.filter((child) => child.busy).length}
-                agentCount={childSessions.length + 1}
-                rootSessionId={rootSessionId}
-                selectedFilePath={canBrowse ? (workspace.selectedFilePath ?? null) : null}
-                filePosition={position}
-                openFiles={canBrowse ? (workspace.openFiles ?? []) : []}
-                openFileViewer={openFile}
-                onCloseFile={closeFile}
-                onShowScopeView={() => selectTab(rightRailTab)}
-                onCommentsOpenChange={() => {}}
-                openTerminalTab={openTerminal}
-                openTerminals={openTerminals}
-                selectedTerminalKey={
-                  openTerminals.includes(workspace.selectedTerminalKey ?? "")
-                    ? (workspace.selectedTerminalKey ?? null)
-                    : null
-                }
-                closingTerminalKey={
-                  deleteTerminal.isPending && closingTerminal
-                    ? terminalTabKey(closingTerminal)
-                    : null
-                }
-                onCloseTerminal={setPendingClose}
-                maximized={selected && workspacePanel.maximized}
-                permissionLevel={permissionLevel}
-                filesPanelSort={sort}
-                onSortChange={setSort}
-                filesPanelShowHidden={showHidden}
-                onShowHiddenChange={setShowHidden}
-                liveness={liveness}
-              />
+              {tabsSidebar ? (
+                <Suspense fallback={null}>
+                  <LazyWorkspaceTabsHost
+                    contained
+                    keyboardTarget={selected}
+                    bindsHistory={selected}
+                    conversationId={sessionId}
+                    sessionHarness={state.sessionHarness}
+                    agentId={state.boundAgentId ?? session?.agentId ?? null}
+                    {...workspacePanel}
+                    open={selected && workspacePanel.open}
+                    inert={!selected || !workspacePanel.open}
+                    showFilesPanel={showFiles}
+                    showGithubTab={showFiles}
+                    showTasksTab={
+                      (isFeatureEnabled(serverInfo, "workflows") &&
+                        serverInfo !== "loading" &&
+                        serverInfo.session_journal === true) ||
+                      (state.todos?.length ?? 0) > 0
+                    }
+                    showBrowserTab={supportsBrowser()}
+                    onReveal={onOpenWorkspace}
+                    changedCount={changedCount}
+                    changedFiles={changedFiles}
+                    subagentsWorking={childSessions.filter((child) => child.busy).length}
+                    agentCount={childSessions.length + 1}
+                    rootSessionId={rootSessionId}
+                    terminals={terminals}
+                    terminalKeys={session ? openTerminals : null}
+                    openTerminalTab={openTerminal}
+                    permissionLevel={permissionLevel}
+                    filesPanelSort={sort}
+                    onSortChange={setSort}
+                    filesPanelShowHidden={showHidden}
+                    onShowHiddenChange={setShowHidden}
+                    liveness={liveness}
+                  />
+                </Suspense>
+              ) : (
+                <WorkspacePanel
+                  contained
+                  keyboardTarget={selected}
+                  conversationId={sessionId}
+                  sessionHarness={state.sessionHarness}
+                  agentId={state.boundAgentId ?? session?.agentId ?? null}
+                  {...workspacePanel}
+                  open={selected && workspacePanel.open}
+                  inert={!selected || !workspacePanel.open}
+                  rightRailTab={rightRailTab}
+                  onRightRailTabChange={selectTab}
+                  openPanels={workspace.openPanels ?? []}
+                  onClosePanel={(tab) => {
+                    navigateWorkspace("", undefined, () =>
+                      setWorkspace((previous) => {
+                        const remaining =
+                          previous.openPanels?.filter((panel) => panel !== tab) ?? [];
+                        return {
+                          ...previous,
+                          openPanels: remaining,
+                          rightRailTab:
+                            previous.rightRailTab === tab
+                              ? (remaining.at(-1) ?? readInitialWorkspaceTab())
+                              : previous.rightRailTab,
+                        };
+                      }),
+                    );
+                  }}
+                  showFilesPanel={showFiles}
+                  showGithubTab={showFiles}
+                  showTasksTab={
+                    (isFeatureEnabled(serverInfo, "workflows") &&
+                      serverInfo !== "loading" &&
+                      serverInfo.session_journal === true) ||
+                    (state.todos?.length ?? 0) > 0
+                  }
+                  showBrowserTab={supportsBrowser()}
+                  onReveal={onOpenWorkspace}
+                  changedCount={changedCount}
+                  subagentsWorking={childSessions.filter((child) => child.busy).length}
+                  agentCount={childSessions.length + 1}
+                  rootSessionId={rootSessionId}
+                  selectedFilePath={canBrowse ? (workspace.selectedFilePath ?? null) : null}
+                  filePosition={position}
+                  openFiles={canBrowse ? (workspace.openFiles ?? []) : []}
+                  openFileViewer={openFile}
+                  onCloseFile={closeFile}
+                  onShowScopeView={() => selectTab(rightRailTab)}
+                  onCommentsOpenChange={() => {}}
+                  openTerminalTab={openTerminal}
+                  openTerminals={openTerminals}
+                  selectedTerminalKey={
+                    openTerminals.includes(workspace.selectedTerminalKey ?? "")
+                      ? (workspace.selectedTerminalKey ?? null)
+                      : null
+                  }
+                  closingTerminalKey={
+                    deleteTerminal.isPending && closingTerminal
+                      ? terminalTabKey(closingTerminal)
+                      : null
+                  }
+                  onCloseTerminal={setPendingClose}
+                  maximized={selected && workspacePanel.maximized}
+                  permissionLevel={permissionLevel}
+                  filesPanelSort={sort}
+                  onSortChange={setSort}
+                  filesPanelShowHidden={showHidden}
+                  onShowHiddenChange={setShowHidden}
+                  liveness={liveness}
+                />
+              )}
             </div>,
             workspaceTarget,
           )}
@@ -604,67 +698,71 @@ export function GridSessionPane({
 }
 
 /** The cell session's permission mode; its owner can switch it as in the main composer. */
-function GridPermissionPicker({
-  session,
-  permissionLevel,
-  unreachable,
-}: {
-  session: Session;
-  permissionLevel: number | null;
-  /** Its host is offline and a message can't wake it, as in the main composer. */
-  unreachable: boolean;
-}) {
-  const state = useConversationEntryState(session.id);
-  const [busy, setBusy] = useState(false);
-  const kind = permissionChipKind(session);
-  if (kind === null) return null;
-  const chip = permissionChip(kind, state.claudePermissionMode, state.codexApprovalMode);
-  const owner = isOwnerLevel(permissionLevel);
+function GridPermissionPicker({ permission }: { permission: GridPermissionControl }) {
+  const { chip } = permission;
+  if (chip === null) return null;
   return (
     <ComposerPermissionPicker
       label="Permission mode"
       value={chip.label || "Permission mode"}
-      harness={state.sessionHarness}
+      harness={permission.harness}
       selectedValue={chip.value}
       options={chip.options}
-      disabled={!owner || unreachable || busy}
-      disabledReason={owner ? undefined : "Only the session owner can change the permission mode"}
-      onSelect={(mode) => {
-        const store = useChatStore.getState();
-        setBusy(true);
-        (kind === "codex"
-          ? store.setCodexApprovalMode(mode, session.id)
-          : store.setClaudePermissionMode(mode, session.id)
-        )
-          .catch((error: unknown) =>
-            toast.error(error instanceof Error ? error.message : "Unable to change permissions"),
-          )
-          .finally(() => setBusy(false));
-      }}
+      disabled={!permission.owner || permission.unreachable || permission.busy}
+      disabledReason={
+        permission.owner ? undefined : "Only the session owner can change the permission mode"
+      }
+      onSelect={permission.select}
     />
   );
 }
 
-/** The cell session's harness, read-only; the model is shown and switched full screen. */
-function GridHarnessStatus({ session }: { session: Session }) {
-  const agent = nativeCodingAgentForHarness(session.harness);
-  const label = agent?.displayName ?? session.agentName ?? "Session";
+/**
+ * The cell session's model, effort and Smart Routing picker, from the same props
+ * hook as the full-screen composer. It reads and writes this session only; the
+ * busy state is this cell's.
+ */
+function GridSessionHarnessPicker({
+  sessionId,
+  session,
+  canEdit,
+  unreachable,
+  runnerOnline,
+}: {
+  sessionId: string;
+  session: Session;
+  canEdit: boolean;
+  unreachable: boolean;
+  runnerOnline: boolean | undefined;
+}) {
+  const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
+  // A launching sandbox lists no models until its host is bound; ChatPage previews them.
+  const inputs = useSessionPickerInputs(sessionId, session);
+  const wrapper = session.labels?.["omnigent.wrapper"] ?? null;
+  const picker = useSessionHarnessPickerProps({
+    sessionId,
+    hostId: session.hostId,
+    inputs,
+    agentName: session.agentName,
+    wrapperLabel: wrapper,
+    isNativeWrapper: isNativeWrapper(wrapper),
+    runnerOnline,
+    gates: {
+      // A cell the viewer can't edit is read-only, as the full-screen composer treats it.
+      permissionLevel: canEdit ? (session.permissionLevel ?? null) : 1,
+      readOnlyReason: readOnlyReasonForSessionLabels(session, null),
+      sendDisabledReason: null,
+      unreachable,
+    },
+  });
   return (
-    <span
-      title={label}
-      aria-label={label}
-      data-testid="grid-harness-status"
-      className="flex h-8 min-w-0 items-center gap-1 px-2 text-muted-foreground md:h-7"
-    >
-      <ComposerAgentIcon
-        agent={{
-          name: agent?.agentName ?? session.agentName ?? "",
-          harness: agent?.harness ?? session.harness ?? null,
-        }}
-      />
-      <span className={cn("min-w-0 truncate text-ui", COMPOSER_COLLAPSED_LABEL_CLASS)}>
-        {label}
-      </span>
-    </span>
+    <SessionHarnessPicker
+      appearance="composer"
+      busy={busy}
+      busyRef={busyRef}
+      setBusy={setBusy}
+      {...picker}
+    />
   );
 }

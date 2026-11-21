@@ -1184,6 +1184,185 @@ describe("browserIpc — Chrome cookie import", () => {
     assert.deepEqual(store.calls, []);
   });
 
+  /** {@link stubStore} for a shell that also offers every website's cookies. */
+  function stubAllSitesStore() {
+    const store = stubStore();
+    store.previewAllSitesCookies = async () => {
+      store.calls.push({ fn: "previewAll" });
+      return {
+        ok: true,
+        profiles: [
+          { id: "Default", name: "Work", cookieCount: 40 },
+          { id: "Profile 2", name: "Personal", cookieCount: 7 },
+        ],
+      };
+    };
+    store.importAllSitesCookies = async (args) => {
+      store.calls.push({ fn: "importAll", args });
+      return {
+        ok: true,
+        scope: "*",
+        profileId: args.profileId,
+        imported: 38,
+        skipped: 2,
+        failed: 0,
+      };
+    };
+    return store;
+  }
+
+  it("previews every website's profiles beside the site's own", async () => {
+    const { ipcMain, event } = setup({ chromeCookieStore: stubAllSitesStore() });
+    const r = await ipcMain.invoke("omnigent:browser-chrome-cookie-preview", event, {
+      conversationId: "conv_1",
+    });
+    assert.equal(r.host, "example.com");
+    assert.deepEqual(
+      r.profiles.map((profile) => profile.id),
+      ["Default"],
+    );
+    assert.deepEqual(r.allSitesProfiles, [
+      { id: "Default", name: "Work", cookieCount: 40 },
+      { id: "Profile 2", name: "Personal", cookieCount: 7 },
+    ]);
+  });
+
+  it("leaves every website out of the preview when the store can't read it", async () => {
+    const { ipcMain, event } = setup({ chromeCookieStore: stubStore() });
+    const r = await ipcMain.invoke("omnigent:browser-chrome-cookie-preview", event, {
+      conversationId: "conv_1",
+    });
+    assert.equal(r.ok, true);
+    assert.equal("allSitesProfiles" in r, false);
+  });
+
+  for (const [outcome, previewAll] of [
+    [
+      "rejects",
+      async () => {
+        throw new Error("boom");
+      },
+    ],
+    ["reports failure", async () => ({ ok: false, error: "unreadable" })],
+  ]) {
+    for (const siteProfiles of ["found", "empty"]) {
+      it(`keeps the site's ${siteProfiles} preview when the every-website preview ${outcome}`, async () => {
+        const store = stubAllSitesStore();
+        store.previewAllSitesCookies = previewAll;
+        if (siteProfiles === "empty") {
+          store.previewSiteCookies = async (args) => ({
+            ok: true,
+            host: args.host,
+            scopes: [args.host],
+            profiles: [],
+          });
+        }
+        const { ipcMain, event } = setup({ chromeCookieStore: store });
+        const r = await ipcMain.invoke("omnigent:browser-chrome-cookie-preview", event, {
+          conversationId: "conv_1",
+        });
+        assert.equal(r.ok, true);
+        assert.equal(r.host, "example.com");
+        assert.deepEqual(
+          r.profiles.map((profile) => profile.id),
+          siteProfiles === "empty" ? [] : ["Default"],
+        );
+        // Not an empty list: only this site's result is known.
+        assert.equal("allSitesProfiles" in r, false);
+      });
+    }
+  }
+
+  it("imports every website's cookies after confirming main's own count", async () => {
+    const store = stubAllSitesStore();
+    const confirmations = [];
+    // The tab's site is irrelevant here, so even a page with no site imports.
+    const wc = makeWebContents({ url: "about:blank" });
+    const { ipcMain, event } = setup({
+      chromeCookieStore: store,
+      webContents: wc,
+      confirmCookieImport: async (request) => {
+        confirmations.push(request);
+        return true;
+      },
+    });
+    const r = await ipcMain.invoke("omnigent:browser-chrome-cookie-import", event, {
+      conversationId: "conv_1",
+      profileId: "Profile 2",
+      expectedHost: "example.com",
+      scope: "*",
+      // Ignored: the count the user approves is main's own.
+      cookieCount: 1,
+    });
+    assert.equal(r.ok, true);
+    assert.equal(r.imported, 38);
+    assert.deepEqual(confirmations, [
+      { host: "", scope: "*", profileName: "Personal", cookieCount: 7, parentWindow: null },
+    ]);
+    assert.deepEqual(
+      store.calls.map((call) => call.fn),
+      ["previewAll", "importAll"],
+    );
+    const importCall = store.calls.find((call) => call.fn === "importAll");
+    assert.deepEqual(Object.keys(importCall.args).sort(), ["cookiesApi", "profileId"]);
+    assert.equal(importCall.args.profileId, "Profile 2");
+    assert.equal(importCall.args.cookiesApi, wc.session.cookies);
+  });
+
+  it("imports nothing for every website when the native prompt is declined", async () => {
+    const store = stubAllSitesStore();
+    const { ipcMain, event } = setup({
+      chromeCookieStore: store,
+      confirmCookieImport: async () => false,
+    });
+    const r = await ipcMain.invoke("omnigent:browser-chrome-cookie-import", event, {
+      conversationId: "conv_1",
+      profileId: "Default",
+      expectedHost: "example.com",
+      scope: "*",
+    });
+    assert.deepEqual(r, { ok: false, cancelled: true });
+    assert.equal(
+      store.calls.some((call) => call.fn === "importAll"),
+      false,
+    );
+  });
+
+  it("refuses every website for a profile main can't find, without prompting", async () => {
+    const store = stubAllSitesStore();
+    let prompted = false;
+    const { ipcMain, event } = setup({
+      chromeCookieStore: store,
+      confirmCookieImport: async () => {
+        prompted = true;
+        return true;
+      },
+    });
+    const r = await ipcMain.invoke("omnigent:browser-chrome-cookie-import", event, {
+      conversationId: "conv_1",
+      profileId: "Profile 9",
+      expectedHost: "example.com",
+      scope: "*",
+    });
+    assert.equal(r.ok, false);
+    assert.match(r.error, /no cookies to import/);
+    assert.equal(prompted, false);
+  });
+
+  it("refuses every website when the store only reads one site", async () => {
+    const store = stubStore();
+    const { ipcMain, event } = setup({ chromeCookieStore: store });
+    const r = await ipcMain.invoke("omnigent:browser-chrome-cookie-import", event, {
+      conversationId: "conv_1",
+      profileId: "Default",
+      expectedHost: "example.com",
+      scope: "*",
+    });
+    assert.equal(r.ok, false);
+    assert.match(r.error, /scope isn't available/);
+    assert.deepEqual(store.calls, []);
+  });
+
   it("refuses a page with no site (non-http) instead of importing", async () => {
     const store = stubStore();
     const wc = makeWebContents({ url: "about:blank" });

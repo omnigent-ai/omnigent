@@ -645,7 +645,7 @@ def test_branding_logo_rejects_symlinked_assets_directory(
     assert branding_logo_asset() is None
 
 
-_DEFAULT_EXTENSIONS = {".zip", ".docx", ".xlsx", ".pptx", ".db", ".sqlite", ".sqlite3"}
+_DEFAULT_EXTENSIONS = {".zip", ".docx", ".xlsx", ".pptx", ".db", ".sqlite", ".sqlite3", ".mp4"}
 
 
 @pytest.mark.parametrize(

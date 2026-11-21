@@ -6,6 +6,7 @@ import random
 import string
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import httpx
@@ -16,8 +17,13 @@ from fastapi import FastAPI
 from omnigent.db.db_models import MAX_STORED_VALUE_BYTES
 from omnigent.entities.session_journal import JournalEntryTooLargeError
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
-from omnigent.server.auth import LEVEL_READ
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.feature_flags import resolve_feature_flags
+from omnigent.server.routes._sessions.common import _session_sandbox_status_cache
+from omnigent.server.routes.workflow_permissions import UNSHAREABLE_WORKFLOW_MESSAGE
+from omnigent.server.schemas import SandboxStatus
+from omnigent.server.sharing_settings import SharingMode
+from omnigent.server.startup_inputs import STARTUP_LABEL
 from omnigent.stores.conversation_store import (
     CREATED_BY_SESSION_LABEL_KEY,
     SCHEDULED_TASK_RUN_LABEL_KEY,
@@ -25,6 +31,7 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.session_journal_store import SessionJournalStore
+from omnigent.stores.workflow_store import WorkflowStore
 from omnigent.tools.builtins.journal import JOURNAL_TOOLS
 from tests.debug_log_helpers import capture_debug_rows
 from tests.server.conftest import ControllableMockClient
@@ -253,9 +260,14 @@ async def test_disabling_workflows_blocks_api_and_tools_without_changing_saved_d
     info = (await client.get("/v1/info")).json()
     assert info["features"]["workflows"] is False
     assert info["workflows"] is False and info["session_journal"] is False
+    assert info["workflow_sharing"] is False
     for method, url, body in (
         ("GET", "/v1/workflows", None),
         ("POST", "/v1/workflows", {"name": "Hidden", "description": "", "steps": STEPS}),
+        ("GET", "/v1/workflows/shared", None),
+        ("GET", path + "/permissions", None),
+        ("PUT", path + "/permissions", {"user_id": BOB, "level": LEVEL_READ}),
+        ("DELETE", path + f"/permissions/{BOB}", None),
         ("GET", path, None),
         ("PATCH", path, {"name": "Changed"}),
         ("DELETE", path, None),
@@ -291,6 +303,7 @@ async def test_disabling_workflows_blocks_api_and_tools_without_changing_saved_d
     info = (await client.get("/v1/info")).json()
     assert info["features"]["workflows"] is True
     assert info["workflows"] is True and info["session_journal"] is True
+    assert info["workflow_sharing"] is True
     assert (await client.get(path, headers=_headers(ALICE))).json() == workflow
     assert (await client.get(journal, headers=_headers(ALICE))).json()["data"] == []
     assert len((await client.get("/v1/workflows", headers=_headers(ALICE))).json()["data"]) == 1
@@ -739,7 +752,7 @@ async def test_a_runs_descendants_continue_page_by_page_in_order(
 
 
 async def test_a_session_filter_lists_its_current_run_for_anyone_who_can_read_it(
-    client: httpx.AsyncClient, db_uri: str
+    client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     stack = await _save_workflow(client, "Land a stack")
     other = await _save_workflow(client, "Ready a PR")
@@ -767,9 +780,19 @@ async def test_a_session_filter_lists_its_current_run_for_anyone_who_can_read_it
     assert run_ids(moved) == []
     # Bob doesn't own the workflow, so only the session he can read lists its run.
     assert (await client.get(url, headers=_headers(BOB))).status_code == 404
-    assert (
-        run_ids(await client.get(url, params={"session_id": shared}, headers=_headers(BOB))) == own
-    )
+    read: list[str] = []
+    get_many = WorkflowStore.get_many
+
+    def recording_get_many(self: WorkflowStore, workflow_ids: list[str]) -> object:
+        read.extend(workflow_ids)
+        return get_many(self, workflow_ids)
+
+    monkeypatch.setattr(WorkflowStore, "get_many", recording_get_many)
+    bobs = await client.get(url, params={"session_id": shared}, headers=_headers(BOB))
+    assert run_ids(bobs) == own
+    # Nor is it shared with him, so naming the run never reads the workflow.
+    assert bobs.json()["data"][0]["workflow_name"] is None
+    assert stack["id"] not in read
     for session_id in (private, uuid4().hex, "not-a-session"):
         refused = await client.get(url, params={"session_id": session_id}, headers=_headers(BOB))
         assert refused.status_code == 404, session_id
@@ -804,3 +827,314 @@ async def test_each_family_lists_the_runs_below_it_up_to_its_own_cap(
     assert {
         run["session_id"]: run["descendant_run_count"] for run in listed["data"]
     } == dict.fromkeys(roots, 2)
+
+
+async def test_a_run_whose_session_waits_on_its_sandbox_is_launching(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    stack = await _save_workflow(client, "Land a stack")
+    ready = await _save_workflow(client, "Ready a PR")
+    conversations = SqlAlchemyConversationStore(db_uri)
+    root = _session(db_uri, title="Land stack")
+    await _run(client, root, stack, "land")
+    worker = _session(db_uri, title="Ready #1", labels={CREATED_BY_SESSION_LABEL_KEY: root})
+    conversations.add_new_sibling(root, worker, user_id=ALICE)
+    await _run(client, worker, ready, "ready-1")
+
+    async def runs(workflow: dict[str, str]) -> list[dict[str, Any]]:
+        listed = await client.get(f"/v1/workflows/{workflow['id']}/runs", headers=_headers())
+        assert listed.status_code == 200, listed.text
+        return listed.json()["data"]
+
+    async def worker_run() -> dict[str, Any]:
+        (run,) = await runs(ready)
+        return run
+
+    assert (await worker_run())["sandbox_launching"] is False
+    # Every replica reads the startup label a sandbox launch keeps on its session.
+    conversations.set_labels(worker, {STARTUP_LABEL: "pending"})
+    launching = await worker_run()
+    assert launching["sandbox_launching"] is True and launching["session_status"] == "idle"
+    (root_run,) = await runs(stack)
+    assert root_run["descendant_runs_active"] is True
+    try:
+        # The launching replica's stage comes first, so its failure ends the launch.
+        _session_sandbox_status_cache[worker] = SandboxStatus(stage="failed", error="no capacity")
+        assert (await worker_run())["sandbox_launching"] is False
+        _session_sandbox_status_cache[worker] = SandboxStatus(stage="provisioning")
+        conversations.set_labels(worker, {STARTUP_LABEL: "failed"})
+        assert (await worker_run())["sandbox_launching"] is True
+    finally:
+        _session_sandbox_status_cache.pop(worker, None)
+    # A launch that failed elsewhere, or a session whose sandbox is up, isn't launching.
+    assert (await worker_run())["sandbox_launching"] is False
+    conversations.delete_label(worker, STARTUP_LABEL)
+    assert (await worker_run())["sandbox_launching"] is False
+    (root_run,) = await runs(stack)
+    assert root_run["descendant_runs_active"] is False
+
+    # Only the session's current run reads its launch.
+    conversations.set_labels(worker, {STARTUP_LABEL: "pending"})
+    await _run(client, worker, ready, "ready-2")
+    current, earlier = await runs(ready)
+    assert current["is_current"] and current["sandbox_launching"] is True
+    assert earlier["sandbox_launching"] is False
+
+
+# ── Sharing ─────────────────────────────────────────────────────────────────
+
+
+async def _share(client: httpx.AsyncClient, workflow_id: str, user_id: str = BOB) -> None:
+    granted = await client.put(
+        f"/v1/workflows/{workflow_id}/permissions",
+        json={"user_id": user_id, "level": LEVEL_READ},
+        headers=_headers(ALICE),
+    )
+    assert granted.status_code == 200, granted.text
+
+
+async def test_a_shared_workflow_is_read_only_for_the_people_it_is_shared_with(
+    client: httpx.AsyncClient,
+) -> None:
+    workflow = await _save_workflow(client, "Release")
+    path = f"/v1/workflows/{workflow['id']}"
+    assert (workflow["viewer_role"], workflow["shareable"]) == ("owner", True)
+    assert (await client.get(path, headers=_headers(BOB))).status_code == 404
+
+    granted = await client.put(
+        path + "/permissions", json={"user_id": BOB, "level": LEVEL_READ}, headers=_headers(ALICE)
+    )
+    assert granted.status_code == 200, granted.text
+    assert granted.json() == {
+        "user_id": BOB,
+        "workflow_id": workflow["id"],
+        "level": LEVEL_READ,
+        "display_name": BOB,
+    }
+    listed = (await client.get(path + "/permissions", headers=_headers(ALICE))).json()
+    assert listed == {"permissions": [granted.json()], "next_cursor": None}
+
+    seen = (await client.get(path, headers=_headers(BOB))).json()
+    assert (seen["viewer_role"], seen["owner_display_name"]) == ("viewer", ALICE)
+    assert seen["steps"] == workflow["steps"]
+    shared = (await client.get("/v1/workflows/shared", headers=_headers(BOB))).json()
+    assert [
+        (item["id"], item["viewer_role"], item["owner_display_name"]) for item in shared["data"]
+    ] == [(workflow["id"], "viewer", ALICE)]
+    assert shared["next_cursor"] is None
+    # Bob's own list and alice's shared list are unchanged.
+    assert (await client.get("/v1/workflows", headers=_headers(BOB))).json()["data"] == []
+    assert (await client.get("/v1/workflows/shared", headers=_headers(ALICE))).json()["data"] == []
+
+    # Every change, and who it is shared with, stays with its owner.
+    for method, url, body in (
+        ("PATCH", path, {"name": "Changed"}),
+        ("DELETE", path, None),
+        ("GET", path + "/permissions", None),
+        ("PUT", path + "/permissions", {"user_id": "carol@example.com", "level": LEVEL_READ}),
+        ("DELETE", path + f"/permissions/{BOB}", None),
+    ):
+        response = await client.request(method, url, json=body, headers=_headers(BOB))
+        assert response.status_code == 404, (method, url, response.text)
+    assert (await client.get(path, headers=_headers(ALICE))).json()["name"] == "Release"
+
+    for _ in range(2):
+        revoked = await client.delete(path + f"/permissions/{BOB}", headers=_headers(ALICE))
+        assert revoked.status_code == 204, revoked.text
+    assert (await client.get(path, headers=_headers(BOB))).status_code == 404
+    assert (await client.get("/v1/workflows/shared", headers=_headers(BOB))).json()["data"] == []
+
+
+@pytest.mark.parametrize(
+    ("user_id", "level"),
+    [
+        (ALICE, LEVEL_READ),
+        (RESERVED_USER_PUBLIC, LEVEL_READ),
+        (RESERVED_USER_LOCAL, LEVEL_READ),
+        (BOB, LEVEL_EDIT),
+        ("  ", LEVEL_READ),
+        ("x" * 129, LEVEL_READ),
+    ],
+    ids=["owner", "public", "local", "edit", "blank", "over-wide"],
+)
+async def test_a_workflow_is_shared_only_read_only_with_someone_else(
+    client: httpx.AsyncClient, user_id: str, level: int
+) -> None:
+    workflow = await _save_workflow(client, "Release")
+    path = f"/v1/workflows/{workflow['id']}/permissions"
+    refused = await client.put(
+        path, json={"user_id": user_id, "level": level}, headers=_headers(ALICE)
+    )
+    assert refused.status_code == 400, refused.text
+    assert (await client.get(path, headers=_headers(ALICE))).json()["permissions"] == []
+
+
+async def test_agents_read_a_shared_workflow_by_id_but_not_who_it_is_shared_with(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    workflow = await _save_workflow(client, "Release")
+    path = f"/v1/workflows/{workflow['id']}"
+    await _share(client, workflow["id"])
+    bobs_agent = _runner(_session(db_uri, owner=BOB), BOB)
+
+    # A run of the shared workflow loads its description.
+    read = await client.get(path, headers=bobs_agent)
+    assert read.status_code == 200, read.text
+    assert read.json()["viewer_role"] == "viewer"
+    # Lookups by name and lists keep to the caller's own workflows.
+    by_name = await client.get("/v1/workflows", params={"name": "Release"}, headers=bobs_agent)
+    assert by_name.json()["data"] == []
+    assert (await client.get("/v1/workflows/shared", headers=bobs_agent)).status_code == 403
+    alices_agent = _runner(_session(db_uri))
+    for method, url, body in (
+        ("GET", path + "/permissions", None),
+        ("PUT", path + "/permissions", {"user_id": "carol@example.com", "level": LEVEL_READ}),
+        ("DELETE", path + f"/permissions/{BOB}", None),
+    ):
+        response = await client.request(method, url, json=body, headers=alices_agent)
+        assert response.status_code == 403, (method, url, response.text)
+    assert (
+        len(
+            (await client.get(path + "/permissions", headers=_headers(ALICE))).json()[
+                "permissions"
+            ]
+        )
+        == 1
+    )
+
+
+async def test_people_a_workflow_is_shared_with_run_it_and_keep_their_runs_private(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    workflow = await _save_workflow(client, "Release")
+    path = f"/v1/workflows/{workflow['id']}"
+    await _share(client, workflow["id"])
+    agent = await create_test_agent(client, user=BOB)
+    run = {"agent_id": agent["id"], "workflow_id": workflow["id"]}
+
+    created = await client.post("/v1/sessions", json=run, headers=_headers(BOB))
+    assert created.status_code == 201, created.text
+    started = created.json()["id"]
+    entries = (await client.get(f"/v1/sessions/{started}/journal", headers=_headers(BOB))).json()
+    assert entries["data"][-1]["workflow_id"] == workflow["id"]
+    # An agent's plan in another of bob's sessions can name it too.
+    chat = _session(db_uri, owner=BOB)
+    written = await client.post(
+        f"/v1/sessions/{chat}/journal",
+        json=_write(
+            "plan", {"name": "Release", "steps": STEPS}, "run", workflow_id=workflow["id"]
+        ),
+        headers=_runner(chat, BOB),
+    )
+    assert written.status_code == 200, written.text
+
+    bobs = (await client.get(path + "/runs", headers=_headers(BOB))).json()["data"]
+    assert {item["session_id"] for item in bobs} == {started, chat}
+    assert {item["workflow_name"] for item in bobs} == {"Release"}
+    assert (await client.get(path + "/runs", headers=_headers(ALICE))).json()["data"] == []
+
+    # Unshared, it can't start another run; the runs bob made stay his.
+    assert (
+        await client.delete(path + f"/permissions/{BOB}", headers=_headers(ALICE))
+    ).status_code == 204
+    again = await client.post("/v1/sessions", json=run, headers=_headers(BOB))
+    assert again.status_code == 400, again.text
+    assert "workflow_not_found" in again.json()["error"]["message"]
+    assert (
+        await client.get(f"/v1/sessions/{started}/journal", headers=_headers(BOB))
+    ).status_code == 200
+
+
+async def test_a_deleted_owners_workflow_stops_being_shared_before_its_cleanup_ends(
+    client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server import accounts_store as accounts_module
+    from omnigent.server.accounts_store import SqlAlchemyAccountStore
+
+    workflow = await _save_workflow(client, "Release")
+    await _share(client, workflow["id"])
+    agent = await create_test_agent(client, user=BOB)
+    run = {"agent_id": agent["id"], "workflow_id": workflow["id"]}
+    started = await client.post("/v1/sessions", json=run, headers=_headers(BOB))
+    assert started.status_code == 201, started.text
+    # Renamed after Bob's run started, so its name comes from storage, not the run.
+    renamed = await client.patch(
+        f"/v1/workflows/{workflow['id']}", json={"name": "Release v2"}, headers=_headers(ALICE)
+    )
+    assert renamed.status_code == 200, renamed.text
+    session_runs = f"/v1/workflows/{workflow['id']}/runs?session_id={started.json()['id']}"
+    (before,) = (await client.get(session_runs, headers=_headers(BOB))).json()["data"]
+    assert before["workflow_name"] == "Release v2"
+
+    def interrupted(*args: object, **kwargs: object) -> int:
+        raise RuntimeError("cleanup interrupted")
+
+    # The account is deleted, but removing its workflows fails at the first batch.
+    monkeypatch.setattr(accounts_module, "delete_grants_on_workflows", interrupted)
+    assert SqlAlchemyAccountStore(db_uri).delete_user(ALICE) is True
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    assert permissions.resolve_workflow_access([BOB], workflow["id"]) == LEVEL_READ
+
+    path = f"/v1/workflows/{workflow['id']}"
+    assert (await client.get(path, headers=_headers(BOB))).status_code == 404
+    assert (await client.get("/v1/workflows/shared", headers=_headers(BOB))).json()["data"] == []
+    again = await client.post("/v1/sessions", json=run, headers=_headers(BOB))
+    assert again.status_code == 400, again.text
+    assert "workflow_not_found" in again.json()["error"]["message"]
+    # The run Bob already made stays his, but no longer names the workflow.
+    journal = f"/v1/sessions/{started.json()['id']}/journal"
+    assert (await client.get(journal, headers=_headers(BOB))).status_code == 200
+    (after,) = (await client.get(session_runs, headers=_headers(BOB))).json()["data"]
+    assert after["workflow_name"] is None
+
+
+async def test_deleting_a_workflow_deletes_who_it_was_shared_with(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    workflow = await _save_workflow(client, "Release")
+    await _share(client, workflow["id"])
+    deleted = await client.delete(f"/v1/workflows/{workflow['id']}", headers=_headers(ALICE))
+    assert deleted.status_code == 200, deleted.text
+    assert SqlAlchemyPermissionStore(db_uri).list_for_workflow(workflow["id"]) == ([], None)
+    assert (await client.get("/v1/workflows/shared", headers=_headers(BOB))).json()["data"] == []
+
+
+async def test_sharing_follows_the_store_and_the_servers_sharing_mode(
+    client: httpx.AsyncClient, app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workflow = await _save_workflow(client, "Release")
+    path = f"/v1/workflows/{workflow['id']}"
+    grant = {"user_id": BOB, "level": LEVEL_READ}
+    store = app.state.permission_store
+
+    app.state.sharing_mode = lambda: SharingMode.OFF
+    off = await client.put(path + "/permissions", json=grant, headers=_headers(ALICE))
+    assert off.status_code == 403, off.text
+    app.state.sharing_mode = lambda: SharingMode.RESTRICTED_READ_ONLY
+    await _share(client, workflow["id"])
+
+    # A workflow whose grants the store can't keep shows as such, and can't be shared.
+    monkeypatch.setattr(store, "workflow_shareable", lambda workflow_id: False)
+    assert (await client.get(path, headers=_headers(ALICE))).json()["shareable"] is False
+    listed = (await client.get("/v1/workflows", headers=_headers(ALICE))).json()["data"]
+    assert [item["shareable"] for item in listed] == [False]
+    refused = await client.put(
+        path + "/permissions",
+        json={"user_id": "carol@example.com", "level": 1},
+        headers=_headers(ALICE),
+    )
+    assert refused.status_code == 403, refused.text
+    assert refused.json()["error"]["message"] == UNSHAREABLE_WORKFLOW_MESSAGE
+
+    # A store without workflow grants turns sharing off.
+    monkeypatch.setattr(type(store), "supports_workflow_grants", property(lambda self: False))
+    assert (await client.get("/v1/info")).json()["workflow_sharing"] is False
+    for method, url, body in (
+        ("GET", path + "/permissions", None),
+        ("PUT", path + "/permissions", grant),
+        ("DELETE", path + f"/permissions/{BOB}", None),
+    ):
+        response = await client.request(method, url, json=body, headers=_headers(ALICE))
+        assert response.status_code == 403, (method, url, response.text)
+    assert (await client.get("/v1/workflows/shared", headers=_headers(BOB))).json()["data"] == []
+    assert (await client.get(path, headers=_headers(BOB))).status_code == 404
