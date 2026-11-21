@@ -61,8 +61,8 @@ final class WatchBridge: NSObject, WCSessionDelegate {
 
   private func push(_ credentials: WatchCredentials?) {
     let data = credentials.flatMap { try? JSONEncoder().encode($0) } ?? Data()
-    // Keep invalidation durable until WatchConnectivity accepts a replacement context.
-    // A new sign-in's credentials are memory-only until that handoff.
+    // Keep sign-out durable until a new sign-in replaces it; accepted contexts can time out.
+    // A new sign-in's credentials remain memory-only until that handoff.
     if data.isEmpty { defaults.set(true, forKey: Self.pendingSignOutKey) }
     latest = [WatchCredentials.contextKey: data]
     flush()
@@ -79,7 +79,9 @@ final class WatchBridge: NSObject, WCSessionDelegate {
     defaults.set(sentAt, forKey: Self.lastSentAtKey)
     do {
       try transport.updateApplicationContext(latest.merging(["sentAt": sentAt]) { $1 })
-      defaults.removeObject(forKey: Self.pendingSignOutKey)
+      if let data = latest[WatchCredentials.contextKey] as? Data, !data.isEmpty {
+        defaults.removeObject(forKey: Self.pendingSignOutKey)
+      }
     } catch {
       Self.logger.error(
         "Watch credential handoff failed (code \((error as NSError).code, privacy: .public))")
@@ -94,6 +96,11 @@ final class WatchBridge: NSObject, WCSessionDelegate {
 
   /// The watch app can be installed after the page loaded; hand it the latest credentials then.
   nonisolated func sessionWatchStateDidChange(_ session: WCSession) {
+    Task { @MainActor in flush() }
+  }
+
+  /// Retry contexts that timed out while the watch was unreachable.
+  nonisolated func sessionReachabilityDidChange(_ session: WCSession) {
     Task { @MainActor in flush() }
   }
 

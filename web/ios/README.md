@@ -37,8 +37,10 @@ Only form-mode yes/no prompts have watch buttons. URL-mode prompts, including in
 server policy ASK approval URLs, and terminal-only prompts require the phone.
 After each page load or sign-in renewal the phone sends the server's API root and the cookies
 scoped to it (`WatchBridge`); the watch keeps them in its Keychain and calls the API directly.
-Signing out queues a credential-clearing context. Delivery is best-effort: an offline watch
-may retain a usable cookie until delivery, expiry, or server-side revocation.
+Signing out queues a credential-clearing context and preserves sign-out intent across phone
+restarts, retrying when the watch reconnects. Accepting a context is not delivery confirmation;
+sign-out intent remains until a new sign-in replaces it. Delivery is best-effort: an offline
+watch may retain a usable cookie until delivery, expiry, or server-side revocation.
 Run the `OmnigentWatch` scheme on a paired simulator.
 
 The watch has the same server permissions as the phone's bearer session, not a watch-scoped

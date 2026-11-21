@@ -180,13 +180,24 @@ final class WatchCompanionTests: XCTestCase {
     XCTAssertGreaterThan(
       try XCTUnwrap(signedOut["sentAt"] as? Date),
       try XCTUnwrap(failedSignOut["sentAt"] as? Date))
-    XCTAssertNil(WatchBridge(defaults: defaults, transport: transport).latest)
+    let acceptedCount = transport.contexts.count
+    let afterAcceptance = WatchBridge(defaults: defaults, transport: transport)
+    afterAcceptance.start()
+    XCTAssertEqual(
+      afterAcceptance.latest?[WatchCredentials.contextKey] as? Data, Data(),
+      "The system can accept a sign-out context and time out before delivering it")
+    XCTAssertEqual(transport.contexts.count, acceptedCount + 1)
+    XCTAssertGreaterThan(
+      try XCTUnwrap(transport.contexts.last?["sentAt"] as? Date),
+      try XCTUnwrap(signedOut["sentAt"] as? Date))
     let freshSignIn = try XCTUnwrap(
-      retried.sync(serverURL: URL(string: "https://new.example.com"), cookieStore: newerCookies))
+      afterAcceptance.sync(
+        serverURL: URL(string: "https://new.example.com"), cookieStore: newerCookies))
     newerCookies.cookies.continuation.yield([cookie("new", domain: "new.example.com", path: "/")])
     await freshSignIn.value
     XCTAssertFalse(
       try XCTUnwrap(transport.contexts.last?[WatchCredentials.contextKey] as? Data).isEmpty)
+    XCTAssertNil(WatchBridge(defaults: defaults, transport: transport).latest)
     let sentCount = transport.contexts.count
     bridge.flush()
     XCTAssertEqual(transport.contexts.count, sentCount, "Only the active delegate may send")
