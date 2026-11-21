@@ -124,6 +124,7 @@ export function ProjectHomeHeaderActions({ projectName }: { projectName: string 
 function ProjectHomeActions({ projectName }: { projectName: string }) {
   const stagesEnabled = useTicketStagesEnabled();
   const [editingStagesFor, setEditingStagesFor] = useState<string | null>(null);
+  const menuOpenedStagesRef = useRef(false);
   const isMobile = useIsMobileViewport();
   const navigate = useNavigate();
   const { projectId, config } = useProjectHomeConfig(projectName);
@@ -158,7 +159,12 @@ function ProjectHomeActions({ projectName }: { projectName: string }) {
       {/* Non-modal on phones, as in the session header: a modal menu leaves itself the only touch target. */}
       <DropdownMenu
         modal={!isMobile}
-        onOpenChange={(open) => (open ? actions.onMenuOpen() : actions.onMenuClose())}
+        onOpenChange={(open) => {
+          if (open) {
+            menuOpenedStagesRef.current = false;
+            actions.onMenuOpen();
+          } else actions.onMenuClose();
+        }}
       >
         <DropdownMenuTrigger asChild>
           <MobileHeaderButton
@@ -180,13 +186,19 @@ function ProjectHomeActions({ projectName }: { projectName: string }) {
             MOBILE_GLASS_SURFACE,
             isMobile && "w-[calc(100vw-2rem)] max-w-[calc(100vw-2rem)]",
           )}
-          onCloseAutoFocus={actions.onCloseAutoFocus}
+          onCloseAutoFocus={(event) => {
+            if (menuOpenedStagesRef.current) event.preventDefault();
+            else actions.onCloseAutoFocus(event);
+          }}
         >
           {isMobile && <SessionMenuHeader title={projectName} />}
           {stagesEnabled && (
             <DropdownMenuItem
               className={itemClass}
-              onSelect={() => setEditingStagesFor(projectName)}
+              onSelect={() => {
+                menuOpenedStagesRef.current = true;
+                setEditingStagesFor(projectName);
+              }}
             >
               <Columns3Icon className="size-3.5" />
               Edit stages

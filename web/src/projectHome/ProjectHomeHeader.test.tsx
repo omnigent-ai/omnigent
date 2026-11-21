@@ -1,7 +1,9 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import type * as ConversationsModule from "@/hooks/useConversations";
@@ -50,11 +52,15 @@ vi.mock("./ProjectTicketStagesDialog", () => ({
     projectName: string;
     onClose: () => void;
   }) => (
-    <div role="dialog" aria-label={`Edit ${projectName} stages`}>
-      <button type="button" onClick={onClose}>
-        Close editor
-      </button>
-    </div>
+    <Dialog open>
+      <DialogContent>
+        <DialogTitle>Edit {projectName} stages</DialogTitle>
+        <DialogDescription>Configure ticket stages.</DialogDescription>
+        <button type="button" onClick={onClose}>
+          Close editor
+        </button>
+      </DialogContent>
+    </Dialog>
   ),
 }));
 
@@ -136,14 +142,14 @@ describe("ProjectHomeTitle", () => {
     expect(screen.getByTestId("location")).toHaveTextContent(/^\/$/);
   });
 
-  it("opens the project stage editor from the menu when supported", () => {
+  it("opens the project stage editor from the menu and hands it focus", async () => {
+    const user = userEvent.setup();
     renderTitle(true);
-    fireEvent.pointerDown(screen.getByRole("button", { name: "Project actions for Payments" }), {
-      button: 0,
-    });
-    fireEvent.click(screen.getByRole("menuitem", { name: "Edit stages" }));
+    await user.click(screen.getByRole("button", { name: "Project actions for Payments" }));
+    await user.click(screen.getByRole("menuitem", { name: "Edit stages" }));
     expect(screen.getByRole("dialog", { name: "Edit Payments stages" })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Close editor" }));
+    expect(screen.getByRole("button", { name: "Close editor" })).toHaveFocus();
+    await user.click(screen.getByRole("button", { name: "Close editor" }));
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
