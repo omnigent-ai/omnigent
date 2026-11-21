@@ -64,6 +64,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "workspace_direct_access": False,
         "workspace_api_server_access": False,
         "floating_composer": False,
+        "host_stats": False,
     }
 
 
@@ -232,6 +233,13 @@ def test_workspace_sidebar_v2_is_an_opt_in_frontend_feature() -> None:
 
     assert flags.enabled(Feature.WORKSPACE_SIDEBAR_V2)
     assert flags.frontend_dict()["workspace_sidebar_v2"] is True
+
+
+def test_host_stats_is_a_frontend_visible_feature() -> None:
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "host_stats"})
+
+    assert flags.enabled(Feature.HOST_STATS)
+    assert flags.frontend_dict()["host_stats"] is True
 
 
 def test_sibling_sessions_explicit_enable_preserves_default_features() -> None:

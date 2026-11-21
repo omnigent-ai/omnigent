@@ -981,6 +981,22 @@ def create_hosts_router(
             update_harness_accounts(conn, result_accounts)
         return conn.hello.configured_harnesses, conn.hello.harness_accounts
 
+    def _stats_field(host: Host) -> dict[str, Any]:
+        """``stats`` while ``host_stats`` is on, in the shapes ``list_hosts`` documents."""
+        if not flags.enabled(Feature.HOST_STATS):
+            return {}
+        stats = host_registry.host_stats(host.host_id)
+        if stats is not None and stats.keys() == {"reported_at"}:
+            # This replica's placeholder only proves the host reported stats; the
+            # hosts row's updated_at is its last-seen across every replica.
+            last_seen = host.updated_at
+            if host.sandbox_provider:
+                # Relaunch and token bookkeeping also bump a sandbox's row, so use the
+                # earlier time. It can lag on a replica the sandbox reported to earlier.
+                last_seen = min(last_seen, stats["reported_at"])
+            stats = {"reported_at": last_seen}
+        return {"stats": stats}
+
     @router.get("/hosts")
     async def list_hosts(request: Request) -> dict[str, list[dict[str, Any]]]:
         """List all hosts owned by the authenticated user.
@@ -991,8 +1007,15 @@ def create_hosts_router(
         :param request: The incoming request (for auth).
         :returns: ``{"hosts": [...]}`` with host details — ``host_id``,
             ``name``, ``owner``, ``status``, ``sandbox_provider``,
-            ``configured_harnesses``, and ``gateway_inference`` (``None`` when
-            no connected host has reported it to this replica).
+            ``configured_harnesses``, ``gateway_inference`` (``None`` when
+            no connected host has reported it to this replica), and — only
+            with the ``host_stats`` release feature on — ``stats``: the latest
+            keepalive readings plus ``reported_at`` (epoch seconds) while at
+            most 150 s old by this server's clock; only ``{"reported_at": ...}``
+            (the hosts row's last-seen, or for a sandbox host no later than its
+            last report) for a host that went offline after reporting stats to
+            this replica; otherwise ``None``, e.g. for a host that never
+            reported stats or one this replica never heard from.
         """
         # require_user: unauthenticated callers 401. user_id is None
         # only when auth is disabled entirely — there the single-user
@@ -1041,6 +1064,7 @@ def create_hosts_router(
                 "long_session_messages_supported": bool(
                     conn is not None and CAP_LONG_SESSION_MESSAGES in conn.hello.capabilities
                 ),
+                **_stats_field(host),
             }
             if (
                 harness_setup_enabled
@@ -1069,7 +1093,8 @@ def create_hosts_router(
         :param host_id: Host identifier, e.g.
             ``"host_a1b2c3d4..."``.
         :returns: Host details dict — the ``list_hosts`` fields (including
-            ``gateway_inference``, ``None`` when unreported) plus ``runners``.
+            ``gateway_inference``, ``None`` when unreported, and ``stats`` in
+            the shapes ``list_hosts`` documents) plus ``runners``.
         :raises HTTPException: 404 if the host does not exist.
         """
         # require_user: with an auth provider configured, an
@@ -1106,6 +1131,7 @@ def create_hosts_router(
                 conn is not None and CAP_LONG_SESSION_MESSAGES in conn.hello.capabilities
             ),
             "runners": [],
+            **_stats_field(host),
         }
         if (
             harness_setup_enabled
