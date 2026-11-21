@@ -719,15 +719,21 @@ def offered_capabilities(facet: PullRequestFacet, host: str | None) -> ProviderC
     """Return the capabilities *facet* offers for a pull request or workspace on *host*.
 
     Every panel step that checks a capability, and every info payload, asks here, so
-    one place decides what a code host offers. Today that is the facet's own
-    :attr:`PullRequestFacet.capabilities` on every host.
+    one place decides what a code host offers: the facet's own
+    :attr:`PullRequestFacet.capabilities`, narrowed on a code host instance's host to
+    what that instance may offer.
 
     :param facet: The provider's pull request facet.
     :param host: The pull request's host, else the workspace remote's host; ``None``
         when neither is known.
     """
-    del host  # Every host gets the facet's own capabilities.
-    return facet.capabilities
+    from omnigent.git_providers import load_facet
+    from omnigent.runner.code_host_instances import instance_capabilities, instance_for_host
+
+    instance = instance_for_host(host)
+    if instance is None or facet is not load_facet(instance.provider, "pull_requests"):
+        return facet.capabilities
+    return instance_capabilities(instance, facet.capabilities)
 
 
 def with_offered_capabilities(

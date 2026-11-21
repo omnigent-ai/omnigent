@@ -72,8 +72,9 @@ from urllib.parse import quote
 
 from omnigent import config as _config
 from omnigent.git_providers import host_of
+from omnigent.git_providers.code_host_instances import CodeHostInstanceError
 from omnigent.host.identity_env import in_managed_sandbox
-from omnigent.runner import pr_resource
+from omnigent.runner import code_host_instances, pr_resource
 from omnigent.runner.git_providers import (
     COMMIT_OBJECT,
     MERGE_OPTIONS_OBJECT,
@@ -201,6 +202,17 @@ class GhInvocation:
     host: str | None = None
 
 
+def _argv_host(argv: Sequence[str]) -> str | None:
+    """Return the host a ``gh`` argv names with ``--hostname``, ``-h`` or ``-R host/o/r``."""
+    for index, argument in enumerate(argv[:-1]):
+        value = argv[index + 1]
+        if argument in ("--hostname", "-h"):
+            return value.lower() or None
+        if argument in ("-R", "--repo") and value.count("/") == 2:
+            return value.split("/", 1)[0].lower() or None
+    return None
+
+
 @contextmanager
 def gh_target_host_scope(host: str | None) -> Iterator[None]:
     """Mark every ``gh`` call in the block as being for *host*.
@@ -221,8 +233,21 @@ def _gh_invocation(argv: list[str], *, token: str | None, host: str | None) -> G
 
     :param argv: Arguments after ``gh``.
     :param token: A GitHub token to run this one call as a chosen account, or ``None``.
-    :param host: The code host the call is for, or ``None``; every host runs ``gh``.
+    :param host: The code host the call is for, from the step or the argv; or ``None``.
+        A configured code host
+        instance's host runs that instance's CLI in its pinned environment instead.
+    :raises CodeHostInstanceError: When the instance's CLI is no longer where it was.
     """
+    if code_host_instances.unavailable_instance_host(host):
+        raise CodeHostInstanceError("this runner couldn't load the instance serving the host")
+    instance = code_host_instances.instance_for_host(host) if host else None
+    if instance is not None and host is not None:
+        # The instance's CLI signs in by itself: no token, no inherited environment.
+        return GhInvocation(
+            argv=[*instance.runnable_command(), *argv],
+            env={**instance.environment(os.environ), "GH_HOST": host},
+            host=host,
+        )
     # In a managed sandbox the panel must authenticate as the connected owner via
     # the per-user hosts.yml that configure_host_gh writes — never an ambient
     # GH_TOKEN/GITHUB_TOKEN, which gh ranks ABOVE hosts.yml. Scrub them so a stray
@@ -261,7 +286,16 @@ def _gh(
         if timeout <= 0:
             _gh_timed_out.set(True)
             return None, "", "gh deadline exceeded"
-    invocation = _gh_invocation(argv, token=token, host=_gh_target_host.get())
+    host = _gh_target_host.get() or _argv_host(argv)
+    try:
+        invocation = _gh_invocation(argv, token=token, host=host)
+    except CodeHostInstanceError:
+        instance = code_host_instances.instance_for_host(host)
+        _logger.warning(
+            "github_resource: code host instance %s can't run its CLI",
+            instance.id if instance else "unknown",
+        )
+        return None, "", "code host instance CLI unavailable"
     result = _run(invocation.argv, cwd=cwd, timeout=timeout, env=invocation.env)
     if (
         deadline is not None
@@ -369,8 +403,12 @@ def _gh_signed_in_to_host(root: str, host: str) -> bool:
     """Whether ``gh`` reports a login on ``host``.
 
     Some setups sign ``gh`` in to an enterprise host only when a command names that host,
-    so a host missing from the global listing is asked about directly.
+    so a host missing from the global listing is asked about directly. A code host
+    instance's CLI signs in by itself, so it is asked who it reads as instead.
     """
+    if code_host_instances.instance_for_host(host) is not None:
+        rc, _, _ = _gh(["api", "user", "--hostname", host], cwd=root)
+        return rc == 0
     _, accounts = _list_accounts(root)
     if host in {account.get("host") for account in accounts}:
         return True
