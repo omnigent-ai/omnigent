@@ -488,7 +488,7 @@ export function ChangesReview({
   // Where typed comparisons work, a linked base and head is the visit's comparison instead.
   const comparesTyped = ["available", "checking"].includes(changes.revisionSupport.kind);
   const requestedRange = comparesTyped ? undefined : linkedRange;
-  const unavailableVisit = useVisitComparison({
+  const pendingVisit = useVisitComparison({
     // A linked range the host can't compare keeps its visit until it can.
     active: active && onComparisonShown !== undefined && requestedRange === undefined,
     visit: visitComparison,
@@ -502,7 +502,7 @@ export function ChangesReview({
   const comparisonBase = changes.comparison.base;
   const changedList = changes.data;
   const listFailed = changes.isError;
-  const comparesRequestedRange = requestedRange !== undefined || unavailableVisit !== null;
+  const comparesRequestedRange = requestedRange !== undefined || pendingVisit !== null;
   const reviewFiles = useMemo(
     (): ShownReviewFiles =>
       comparesRequestedRange
@@ -932,9 +932,20 @@ export function ChangesReview({
       setPickerOpen(true);
     },
   };
-  if (unavailableVisit) {
+  if (pendingVisit && "waiting" in pendingVisit) {
+    // Not the session's files: they aren't the comparison the visit asked for.
+    return frame(
+      <ToolbarSkeleton fileCount={null} />,
+      <ReviewMessage
+        busy
+        title="Comparing"
+        message={`Comparing ${comparisonChoiceName(pendingVisit.waiting)}…`}
+      />,
+    );
+  }
+  if (pendingVisit) {
     // The visit's own comparison stays asked for; the session's is a step away.
-    const { choice: asked, reason } = unavailableVisit.unavailable;
+    const { choice: asked, reason } = pendingVisit.unavailable;
     return frame(
       <ToolbarSkeleton fileCount={null} />,
       <ReviewMessage

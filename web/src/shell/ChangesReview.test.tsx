@@ -457,6 +457,20 @@ describe("ChangesReview", () => {
     );
   });
 
+  it("shows a linked comparison as on its way while the host checks, with none of the session's files", () => {
+    const data = source(changes({ workspace: { hostId: "host", root: "/repo" } }));
+    data.choice.availability = () => "later";
+    mocks.source.mockReturnValue(data);
+    renderReview({
+      comparison: { kind: "typed", base: "v1.2", head: "feature" },
+      landing: { settled: false },
+      onComparisonShown: vi.fn(),
+    });
+    expect(screen.getByText("Comparing “v1.2” with “feature”…")).toBeInTheDocument();
+    expect(screen.queryByTestId("review-body")).toBeNull();
+    expect(shownReview("s1")).toEqual({ state: "unavailable" });
+  });
+
   it("records the comparison it shows on its visit, and keeps none without a visit to record on", () => {
     const settledChanges = changes({ workspace: { hostId: "host", root: "/repo" } });
     mocks.source.mockReturnValue(source(settledChanges));

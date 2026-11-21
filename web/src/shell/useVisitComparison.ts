@@ -9,10 +9,12 @@ import { type ComparisonChoice, sameComparisonChoice } from "@/lib/comparisonCho
 /** Whether the session can show a comparison: now, once it knows more, or not here and why. */
 export type ComparisonAvailability = "now" | "later" | { unavailable: string };
 
-/** A landing's comparison the session can't show, kept on the visit, and why. */
-export interface UnavailableVisitComparison {
-  unavailable: { choice: ComparisonChoice; reason: string };
-}
+/**
+ * A landing's comparison the session doesn't show yet: `waiting` until the session can tell
+ * whether it can, or `unavailable` here, and why.
+ */
+export type PendingVisitComparison =
+  { waiting: ComparisonChoice } | { unavailable: { choice: ComparisonChoice; reason: string } };
 
 export interface VisitComparisonOptions {
   /** The review is on screen; only then does it apply or record a comparison. */
@@ -51,7 +53,7 @@ export function useVisitComparison({
   session,
   choices,
   onShown,
-}: VisitComparisonOptions): UnavailableVisitComparison | null {
+}: VisitComparisonOptions): PendingVisitComparison | null {
   const visitKey = choiceKey(visit);
   const shownKey = choiceKey(session.shown);
   const availability = visit === undefined ? "now" : session.availability(visit);
@@ -104,8 +106,16 @@ export function useVisitComparison({
     latest.current.onShown(current.shown, { step: picked && recorded !== undefined });
   }, [active, session.settled, landing, visitKey, shownKey, choices, availabilityKey]);
 
-  const waiting = active && session.settled && landing !== undefined && !landing.settled;
-  return waiting && visit !== undefined && typeof availability !== "string"
-    ? { unavailable: { choice: visit, reason: availability.unavailable } }
-    : null;
+  // Effects settle a landing without rendering, so one the session already shows isn't pending.
+  const pending =
+    active &&
+    session.settled &&
+    landing !== undefined &&
+    !landing.settled &&
+    visit !== undefined &&
+    !sameComparisonChoice(visit, session.shown);
+  if (!pending || availability === "now") return null;
+  return availability === "later"
+    ? { waiting: visit }
+    : { unavailable: { choice: visit, reason: availability.unavailable } };
 }

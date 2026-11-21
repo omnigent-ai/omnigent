@@ -121,15 +121,28 @@ describe("useVisitComparison", () => {
 
   it("waits until the session can show a landing's comparison, and keeps the visit meanwhile", () => {
     const link = landed();
-    const { choose, onShown, rerender } = setup({
+    const { choose, onShown, rerender, result } = setup({
       visit: TYPED,
       landing: link,
       availability: "later",
     });
     expect(choose).not.toHaveBeenCalled();
     expect(onShown).not.toHaveBeenCalled();
+    expect(result.current).toEqual({ waiting: TYPED });
     rerender({ visit: TYPED, landing: link, availability: "now" });
     expect(choose).toHaveBeenCalledWith(TYPED);
+    rerender({ visit: TYPED, landing: link, shown: TYPED, choices: 1 });
+    expect(result.current).toBeNull();
+  });
+
+  it("doesn't call a landing's comparison unavailable when the session already shows it", () => {
+    const { choose, result } = setup({
+      visit: AUTOMATIC,
+      landing: landed(),
+      availability: { unavailable: "Not known yet." },
+    });
+    expect(choose).not.toHaveBeenCalled();
+    expect(result.current).toBeNull();
   });
 
   it("keeps a landing's comparison the session can't show, and says why, as the menu would", () => {
