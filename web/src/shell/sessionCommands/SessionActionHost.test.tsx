@@ -56,9 +56,9 @@ const SESSION: Conversation = {
   owner: "viewer",
 };
 
-function renderHost() {
+function renderHost(queryClient = new QueryClient()) {
   render(
-    <QueryClientProvider client={new QueryClient()}>
+    <QueryClientProvider client={queryClient}>
       <MemoryRouter>
         <SessionActionHost />
       </MemoryRouter>
@@ -129,5 +129,44 @@ describe("SessionActionHost", () => {
     await waitFor(() =>
       expect(screen.queryByRole("dialog", { name: "Delete session?" })).toBeNull(),
     );
+  });
+
+  describe("looks the session up as the action starts", () => {
+    const cachedSessions = (...rows: Conversation[]) => {
+      const queryClient = new QueryClient();
+      queryClient.setQueryData(["conversations", "sidebar"], {
+        pages: [{ data: rows }],
+        pageParams: [undefined],
+      });
+      return queryClient;
+    };
+
+    it("does nothing once the cache marks a listed session archived", () => {
+      renderHost(cachedSessions({ ...SESSION, archived: true }));
+      // The palette asked with the row it showed before the archive.
+      act(() => requestSessionAction(SESSION, "pin", { listed: true }));
+      expect(writes.pin).not.toHaveBeenCalled();
+    });
+
+    it("does nothing once a listed session has left every list", () => {
+      renderHost(cachedSessions());
+      act(() => requestSessionAction(SESSION, "pin", { listed: true }));
+      expect(writes.pin).not.toHaveBeenCalled();
+    });
+
+    it("checks the current owner, not the one the row showed", () => {
+      renderHost(cachedSessions({ ...SESSION, owner: "someone-else" }));
+      act(() => requestSessionAction(SESSION, "rename", { listed: true }));
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
+
+    it("acts on the current row, and on a search result no list holds", () => {
+      renderHost(cachedSessions({ ...SESSION, updated_at: 200 }));
+      act(() => requestSessionAction(SESSION, "mark-unread", { listed: true }));
+      expect(readMarks.unread).toHaveBeenCalledWith("c1", 200);
+      const found: Conversation = { ...SESSION, id: "c9" };
+      act(() => requestSessionAction(found, "pin"));
+      expect(writes.pin).toHaveBeenCalledWith({ id: "c9", pinned: true });
+    });
   });
 });

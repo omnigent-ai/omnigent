@@ -1,9 +1,10 @@
 // ⌘↵ on a session row in the QuickPick palette: that session's actions on a page of their own.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import type * as ConversationsModule from "@/hooks/useConversations";
 import type { Conversation } from "@/hooks/useConversations";
 
 import { QuickPickCommandPalette } from "./QuickPickCommandPalette";
@@ -24,11 +25,17 @@ vi.mock("@/hooks/useSessionActionRestrictions", () => ({
   useSessionActionRestrictions: () => ({ forkDisabledReason: undefined }),
 }));
 const useConversations = vi.fn();
-vi.mock("@/hooks/useConversations", () => ({
-  useConversations: (...args: unknown[]) => useConversations(...args),
-  useSessionSearch: () => ({ isFetching: false }),
-  useProjects: () => ({ data: [] }),
-}));
+vi.mock("@/hooks/useConversations", async (importOriginal) => {
+  const { findCachedConversationRow, isSessionDeleting } =
+    await importOriginal<typeof ConversationsModule>();
+  return {
+    useConversations: (...args: unknown[]) => useConversations(...args),
+    useSessionSearch: () => ({ isFetching: false }),
+    useProjects: () => ({ data: [] }),
+    findCachedConversationRow,
+    isSessionDeleting,
+  };
+});
 
 const MINE: Conversation = {
   id: "c1",
@@ -46,10 +53,10 @@ function listSessions(...rows: Conversation[]) {
   useConversations.mockReturnValue({ data: { pages: [{ data: rows }] }, isFetching: false });
 }
 
-function renderPalette() {
+function renderPalette(queryClient = new QueryClient()) {
   const onOpenChange = vi.fn();
   render(
-    <QueryClientProvider client={new QueryClient()}>
+    <QueryClientProvider client={queryClient}>
       <QuickPickCommandPalette
         open
         onOpenChange={onOpenChange}
@@ -162,5 +169,27 @@ describe("QuickPick ⌘K session actions", () => {
     const { input } = renderPalette();
     fireEvent.keyDown(input, { key: "Enter" });
     expect(navigate).toHaveBeenCalledWith("/c/c1");
+  });
+
+  it("follows the session's current state once its actions are open, as when it's archived", async () => {
+    const queryClient = new QueryClient();
+    const cacheSessions = (...rows: Conversation[]) =>
+      queryClient.setQueryData(["conversations", "sidebar"], {
+        pages: [{ data: rows }],
+        pageParams: [undefined],
+      });
+    cacheSessions(MINE, SHARED);
+    const { input } = renderPalette(queryClient);
+    openActions(input);
+    await waitFor(() => expect(optionNames()).toContain("Pin"));
+    act(() => cacheSessions({ ...MINE, archived: true }, SHARED));
+    await waitFor(() => expect(optionNames()).toContain("Unarchive"));
+    expect(optionNames()).not.toContain("Pin");
+    // Gone from every list since: nothing is offered, and nothing runs.
+    act(() => cacheSessions(SHARED));
+    await waitFor(() => expect(screen.queryAllByRole("option")).toEqual([]));
+    fireEvent.change(input, { target: { value: "unarchive" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(useSessionActionStore.getState().request).toBeNull();
   });
 });
