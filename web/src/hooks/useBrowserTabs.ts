@@ -4,7 +4,8 @@ import { browserPageLabel } from "@/lib/browserPageLabel";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
 import { AGENT_BROWSER_TAB_ID, browserViewId, browserViewOwnerId } from "@/lib/browserTabs";
 import { fetchSessionHostId } from "@/lib/fetchSessionHostId";
-import { type BrowserHostOptions, navigationHostOptions } from "@/lib/nativeBridge";
+import type { BrowserHostOptions } from "@/lib/nativeBridge";
+import { previewHostOptions, withPreviewHostRetry } from "@/lib/previewHostOptions";
 import { onInAppLinkOpen } from "@/lib/openLinkInApp";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import {
@@ -196,12 +197,19 @@ async function openBrowserTabAt(
   reopenRequests.set(conversationId, request);
   // The session's host lets the shell open its localhost pages, as the address bar does.
   const hostId = await fetchSessionHostId(conversationId);
-  const result = await browserTabsBridge()
-    ?.browserOpenOrNavigate?.(browserViewId(conversationId, tabId), url, undefined, {
-      force: true,
-      ...navigationHostOptions(hostId),
-    })
-    .catch((error: unknown) => ({ ok: false, error: String(error) }));
+  const options = await previewHostOptions(hostId, url);
+  const result = await withPreviewHostRetry(conversationId, hostId, async (retryOptions) =>
+    browserTabsBridge()?.browserOpenOrNavigate?.(
+      browserViewId(conversationId, tabId),
+      url,
+      undefined,
+      {
+        force: true,
+        ...options,
+        ...retryOptions,
+      },
+    ),
+  ).catch((error: unknown) => ({ ok: false, error: String(error) }));
   if (result && !result.ok) return result;
   // The tab comes back either way. It's selected only if nothing was picked since and
   // no later reopen's tab is already shown; a later one that failed doesn't count.

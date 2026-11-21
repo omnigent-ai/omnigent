@@ -160,6 +160,40 @@ While the credential-check spinner is visible, click Skip to continue without
 verification. Confirm this starts one session without sign-in; later launches
 must check credentials again. Skipping does not guarantee sandbox authentication.
 
+## SSH localhost previews
+
+`desktop_ssh_preview.e2e.js` covers the address bar, `dev.localhost`, agent
+navigation/read/input, host isolation, and decline after a fresh app launch.
+The SPA, Python server, runner, native preload/main, and browser policy are
+real. Host-list/session provenance responses and the external SSH executable
+are fixtures; no permission records or URL-policy decisions are seeded.
+CI substitutes only the native dialog's answer, asserting that the preview
+receives no request before consent. This is not a real remote-machine test.
+Preview identity proofs are stored separately from SSH file-access approvals;
+localhost permission lasts only until the desktop app restarts.
+
+```sh
+# From the repository root, after installing Python and desktop dependencies:
+pnpm --filter web run build
+pnpm --filter omnigent-desktop-electron run build:overlay
+OMNIGENT_PYTHON="$PWD/.venv/bin/python" \
+  node --test web/electron/e2e/desktop_ssh_preview.e2e.js
+```
+
+The full UI CI lane runs this on shard 0 under Xvfb and uploads recordings.
+On macOS, set `OMNIGENT_DESKTOP_NATIVE_DIALOGS=1` for real dialogs and
+`OMNIGENT_DESKTOP_COMPOSITED_VIDEO=1` for native window recordings. Grant
+Accessibility and Screen Recording permissions to the test terminal. Keep
+`OMNIGENT_DESKTOP_RECORD_DIR` outside tracked files. To compare revisions,
+copy the test and its two `fixtures/preview*.cjs` files unchanged to each
+checkout and build each checkout's own SPA and overlays.
+
+Human check with a real remote host: run a dev server bound to its loopback,
+forward that port with SSH, then open the forwarded URL in the session's
+Browser tab. Allow the named destination and verify the remote page and its
+interactions. Restart the desktop and choose **Not now**: the page and agent
+browser tools must remain blocked without repeated prompts.
+
 ## Authoring a desktop reproduction
 
 For macOS titlebar clearance, build the SPA and run
