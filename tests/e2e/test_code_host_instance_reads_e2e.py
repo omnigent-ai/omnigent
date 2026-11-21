@@ -2,8 +2,9 @@
 
 The server turns instances on, the host loads its own instance file and advertises
 it, and a pull request on the instance's host is read through the instance's CLI by
-the host's runner and, once that runner is gone, by the host itself. Only the CLI's
-answers are fixtures, and no plain ``gh`` is on ``PATH``.
+the host's runner. Once that runner is parked, the host itself runs nothing for that
+code host and says so. Only the CLI's answers are fixtures, and no plain ``gh`` is
+on ``PATH``.
 """
 
 from __future__ import annotations
@@ -146,25 +147,33 @@ def test_a_pull_request_on_an_instance_host_is_read_through_the_instance_cli(
             attached = client.post(f"{resource}/prs", json={"url": _URL, "action": "attach"})
             assert attached.status_code == 200, attached.text
 
-            for transport in ("runner", "host"):
-                if transport == "host":
-                    pid = _runner_pid_from_daemon_log(host_log)
-                    assert pid is not None
-                    os.kill(pid, signal.SIGTERM)
-                    deadline = time.monotonic() + 30
-                    while client.get(f"/v1/runners/{runner}/status").json().get("online"):
-                        assert time.monotonic() < deadline, "runner did not go offline"
-                        time.sleep(0.2)
-                info = client.get(resource, params={"pr_url": _URL})
-                assert info.status_code == 200, info.text
-                payload = info.json()
-                assert payload["pr"]["title"] == "Instance read proof", (transport, payload)
-                (listed,) = [pr for pr in payload["prs"] if pr["url"] == _URL]
-                assert listed["provider_display"]["display_name"] == "Internal code host"
-                offered = {name for name, on in payload["capabilities"].items() if on}
-                assert "comment_posting" not in offered, (transport, offered)
-                diff = client.get(f"{resource}/diff", params={"pr_url": _URL})
-                assert diff.status_code == 200 and diff.json()["patch"] == _PATCH, diff.text
+            info = client.get(resource, params={"pr_url": _URL})
+            assert info.status_code == 200, info.text
+            payload = info.json()
+            assert payload["pr"]["title"] == "Instance read proof", payload
+            (listed,) = [pr for pr in payload["prs"] if pr["url"] == _URL]
+            assert listed["provider_display"]["display_name"] == "Internal code host"
+            offered = {name for name, on in payload["capabilities"].items() if on}
+            assert "comment_posting" not in offered, offered
+            diff = client.get(f"{resource}/diff", params={"pr_url": _URL})
+            assert diff.status_code == 200 and diff.json()["patch"] == _PATCH, diff.text
+            runner_calls = len(_calls(instance_bin / "instance-calls.jsonl"))
+
+            # Parked: the host answers, runs nothing for the instance host, and says why.
+            pid = _runner_pid_from_daemon_log(host_log)
+            assert pid is not None
+            os.kill(pid, signal.SIGTERM)
+            deadline = time.monotonic() + 30
+            while client.get(f"/v1/runners/{runner}/status").json().get("online"):
+                assert time.monotonic() < deadline, "runner did not go offline"
+                time.sleep(0.2)
+            parked = client.get(resource, params={"pr_url": _URL})
+            assert parked.status_code == 200, parked.text
+            assert parked.json()["available"] is False, parked.text
+            assert parked.json()["reason"] == "code_host_instance_needs_runner", parked.text
+            parked_diff = client.get(f"{resource}/diff", params={"pr_url": _URL})
+            assert parked_diff.status_code != 200, parked_diff.text
+            assert len(_calls(instance_bin / "instance-calls.jsonl")) == runner_calls
 
     instance_calls = _calls(instance_bin / "instance-calls.jsonl")
     assert instance_calls, "the instance's CLI was never run"

@@ -115,10 +115,7 @@ from omnigent.host.session_env import session_env_handoff
 from omnigent.onboarding import harness_install
 from omnigent.onboarding.harness_install import READINESS_CLI_PROBE_TIMEOUT_S
 from omnigent.onboarding.harness_login import CodexDeviceLogin
-from omnigent.runner.code_host_instances import active_code_host_instances
-from omnigent.runner.code_host_instances import (
-    serve_in_this_process as serve_code_host_instances_in_process,
-)
+from omnigent.runner.code_host_instances import CodeHostRoute, code_host_routing
 from omnigent.runner.identity import (
     RUNNER_CONNECT_MARKER_ENV_VAR,
     RUNNER_DELEGATED_AUTH_ENV_VAR,
@@ -5791,7 +5788,7 @@ async def test_hello_advertises_code_host_instances_only_to_a_server_that_takes_
         connect_task = asyncio.create_task(host._connect_and_serve())
         try:
             hello = json.loads(await asyncio.wait_for(received, timeout=5.0))
-            serving_during = active_code_host_instances().instances
+            route_during = code_host_routing().route_for("code.example.test")
         finally:
             connect_task.cancel()
             with contextlib.suppress(BaseException):
@@ -5801,9 +5798,9 @@ async def test_hello_advertises_code_host_instances_only_to_a_server_that_takes_
     assert (CAP_CODE_HOST_INSTANCES in hello["capabilities"]) is served
     assert host._serves_code_host_instances() is served
     assert len(loads) == (1 if served else 0)
-    assert bool(serving_during) is served
-    # Once the connection ends, this process's own reads serve no host's instances.
-    assert code_host_instances_module._served_in_this_process is None
+    # The host never runs the instance itself: its own reads leave it to a runner.
+    assert route_during == (CodeHostRoute(None, "needs_runner") if served else None)
+    assert code_host_routing().instances.instances == ()
     if served:
         assert hello["code_host_instances"] == [
             {
@@ -5834,11 +5831,10 @@ def _record_instance_file_loads(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
 
 
 @pytest.fixture(autouse=True)
-def _no_process_wide_code_host_instances() -> Iterator[None]:
-    """Keep one test's served instances from reaching another, in any order."""
-    serve_code_host_instances_in_process(None)
-    yield
-    serve_code_host_instances_in_process(None)
+def _no_process_wide_code_host_instances(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep one test's code host routing from reaching another, in any order."""
+    monkeypatch.setattr(code_host_instances_module, "_host_routing", None)
+    monkeypatch.setattr(code_host_instances_module, "_taken", None)
 
 
 def test_a_host_never_served_instances_never_opens_its_file(
@@ -5881,13 +5877,29 @@ def test_an_enabled_server_has_the_file_read_once_across_reconnects(
     _cleanup_host(host)
 
 
-def test_a_refused_instance_file_serves_no_instances_and_logs_no_values(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+@pytest.mark.parametrize(
+    ("instance_fields", "rule"),
+    [
+        (
+            'cli = ["/bin/sh"]\nenv_set = { PROJECT_KEY = "value-that-must-not-be-logged" }\n',
+            "secret-name rule",
+        ),
+        ('cli = ["/nonexistent/example-cli"]\n', "isn't an executable file"),
+    ],
+    ids=["secret-name", "missing-cli"],
+)
+def test_a_refused_instance_file_serves_no_instances_and_keeps_its_hosts_from_plain_gh(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    instance_fields: str,
+    rule: str,
 ) -> None:
+    from omnigent.runner.code_host_instances import CODE_HOST_INSTANCE_HOSTS_ENV_VAR
+
     (tmp_path / "code_host_instances.toml").write_text(
         '[[instance]]\nid = "internal"\nprovider = "github"\ndisplay_name = "X"\n'
-        'hosts = ["code.example.test"]\ncli = ["/bin/sh"]\nauth = "cli"\n'
-        'env_set = { PROJECT_KEY = "value-that-must-not-be-logged" }\n'
+        'hosts = ["code.example.test"]\nauth = "cli"\n' + instance_fields
     )
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     host = _make_host_process()
@@ -5897,9 +5909,23 @@ def test_a_refused_instance_file_serves_no_instances_and_logs_no_values(
         host._serve_code_host_instances_for_server()
 
     assert host._code_host_instances.instances == ()
-    assert "secret-name rule" in caplog.text
+    assert rule in caplog.text
     assert "value-that-must-not-be-logged" not in caplog.text
     assert "PROJECT_KEY" not in caplog.text
+    # The declared host still runs nothing here, and a runner is told it's declared.
+    assert code_host_routing().route_for("code.example.test") == CodeHostRoute(
+        None, "needs_runner"
+    )
+    runner_env = _build_runner_env(
+        {"PATH": "/usr/bin"},
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+        code_host_instance_hosts=host._code_host_declared_hosts,
+    )
+    assert runner_env[CODE_HOST_INSTANCE_HOSTS_ENV_VAR] == "code.example.test"
     _cleanup_host(host)
 
 

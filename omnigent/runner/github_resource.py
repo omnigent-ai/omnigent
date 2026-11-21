@@ -251,14 +251,16 @@ def _gh_invocation(argv: list[str], *, token: str | None, host: str | None) -> G
         instance's host runs that instance's CLI in its pinned environment instead.
     :raises CodeHostInstanceError: When the instance's CLI is no longer where it was.
     """
-    if code_host_instances.unavailable_instance_host(host):
-        raise CodeHostInstanceError("this runner couldn't load the instance serving the host")
-    instance = code_host_instances.instance_for_host(host) if host else None
-    if instance is not None and host is not None:
-        # The instance's CLI signs in by itself: no token, no inherited environment.
+    # One fixed route per host: an instance's CLI, nothing, or (undeclared) plain gh.
+    route = code_host_instances.code_host_routing().route_for(host)
+    if route is not None and route.instance is None:
+        raise CodeHostInstanceError("this process doesn't run the instance serving the host")
+    if route is not None and route.instance is not None and host is not None:
+        instance = route.instance
+        # The instance's CLI signs in by itself: no token, and only its pinned values.
         return GhInvocation(
             argv=[*instance.runnable_command(), *argv],
-            env={**instance.environment(os.environ), "GH_HOST": host},
+            env={**route.environment, "GH_HOST": host},
             log_as=f"{instance.provider} code host instance {instance.id} {_operation(argv)}",
             host=host,
         )
@@ -441,7 +443,7 @@ def _gh_signed_in_to_host(root: str, host: str) -> bool:
     so a host missing from the global listing is asked about directly. A code host
     instance's CLI signs in by itself, so it is asked who it reads as instead.
     """
-    if code_host_instances.instance_for_host(host) is not None:
+    if code_host_instances.is_instance_host(host):
         rc, _, _ = _gh(["api", "user", "--hostname", host], cwd=root)
         return rc == 0
     _, accounts = _list_accounts(root)
@@ -491,7 +493,7 @@ def _gh_auth_token(root: str, login: str, host: str = "github.com") -> str | Non
 
     Never for a code host instance's host: its CLI's token stays inside it.
     """
-    if code_host_instances.instance_for_host(host) is not None:
+    if code_host_instances.is_instance_host(host):
         return None
     rc, out, _ = _gh(["auth", "token", "--user", login, "-h", host], cwd=root)
     if rc != 0:
@@ -1127,6 +1129,24 @@ def _repo_payload(name_with_owner: str | None, url: object) -> dict[str, Any]:
     return repo
 
 
+def _workspace_instance_host(root: str) -> str | None:
+    """A declared code host instance host among the workspace's remotes, if any.
+
+    ``gh`` picks the workspace's repository from these remotes, so a checkout with one
+    on such a host reads through that host's route, never plain ``gh``.
+    """
+
+    def run(argv: list[str]) -> tuple[int | None, str]:
+        rc, out, _ = _git(argv, cwd=root)
+        return rc, out
+
+    for _name, url in local_git.remote_urls(run):
+        host = host_of(url)
+        if host and code_host_instances.is_instance_host(host):
+            return host
+    return None
+
+
 def _workspace_github_info(root: str) -> dict[str, Any]:
     """Resolve GitHub context for the workspace: repo, branch, base, and PR.
 
@@ -1166,16 +1186,34 @@ def _workspace_github_info(root: str) -> dict[str, Any]:
         pr=None,
     )
 
+    instance_host = _workspace_instance_host(root)
+    if instance_host is None:
+        return _workspace_cli_info(root, payload, None)
+    route = code_host_instances.code_host_routing().route_for(instance_host)
+    if route is not None and route.denied is not None:
+        return _instance_unavailable_info(route.denied)
+    with gh_target_host_scope(instance_host):
+        return _workspace_cli_info(root, payload, instance_host)
+
+
+def _workspace_cli_info(
+    root: str, payload: dict[str, Any], instance_host: str | None
+) -> dict[str, Any]:
+    """Add the CLI's repo and PR to a git workspace's *payload*.
+
+    :param instance_host: The instance host the workspace's remotes name, if any. Its
+        CLI signs in by itself, so no stored account or token is consulted for it.
+    """
     # gh is an enhancement layer: without it (or its auth) the git diff still
     # renders; the UI notes the missing CLI / sign-in from these flags.
-    if shutil.which("gh") is None:
+    if not _cli_available_for(instance_host):
         payload.update(gh_available=False, authenticated=False)
         return payload
     payload["gh_available"] = True
 
     # Run the API-touching calls as the workspace's preferred account (local dev);
     # resolving the token is local (config read + keyring), so it's always cheap.
-    token = _account_token_for(root)
+    token = None if instance_host else _account_token_for(root)
 
     # Resolve the PR first. A hit tells us the repo (from the PR URL) and that
     # we're authenticated, so we skip the separate `gh repo view` and the account
@@ -1226,7 +1264,7 @@ def _workspace_github_info(root: str) -> dict[str, Any]:
 
     # Repo unreachable / not signed in — enumerate accounts so the panel can offer
     # the account selector (the only state where it's shown).
-    authenticated, accounts = _list_accounts(root)
+    authenticated, accounts = (False, []) if instance_host else _list_accounts(root)
     payload["authenticated"] = authenticated
     payload["accounts"] = accounts
     workspace_key = _workspace_key(root)
@@ -1248,7 +1286,7 @@ def _repo_argument(ref: PullRequestRef) -> str:
 
 def _pr_token(root: str, reference: PullRequestRef) -> str | None:
     # An instance's CLI signs in by itself; its token is never asked for.
-    if _in_sandbox() or code_host_instances.instance_for_host(reference.host) is not None:
+    if _in_sandbox() or code_host_instances.is_instance_host(reference.host):
         return None
     login = _config.github_account_preference(_repo_argument(reference))
     if login:
@@ -1277,7 +1315,19 @@ def _head_repository_url(reference: PullRequestRef, head: object, owner: object)
     return None
 
 
+def _instance_unavailable_info(denied: str) -> dict[str, Any]:
+    """The info for a PR on a declared host whose instance this process doesn't run."""
+    return {
+        "object": "session.github.info",
+        "available": False,
+        "reason": f"code_host_instance_{denied}",
+    }
+
+
 def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
+    route = code_host_instances.code_host_routing().route_for(reference.host)
+    if route is not None and route.denied is not None:
+        return _instance_unavailable_info(route.denied)
     info: dict[str, Any] = {
         "object": "session.github.info",
         "available": True,
@@ -1290,8 +1340,7 @@ def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
     if not info["gh_available"]:
         return info
     # An instance's CLI signs in by itself: there are no stored accounts to list.
-    serving = code_host_instances.instance_for_host(reference.host) is not None
-    _, accounts = (False, []) if serving else _list_accounts(root)
+    _, accounts = (False, []) if route is not None else _list_accounts(root)
     info["accounts"] = [a for a in accounts if a.get("host") == reference.host]
     preferred = _config.github_account_preference(_repo_argument(reference))
     info["selected_account"] = preferred or next(
@@ -1350,8 +1399,9 @@ def _gh_installed() -> bool:
 
 def _cli_available_for(host: str | None) -> bool:
     """Whether a CLI can read PRs on *host*: its instance's, or ``gh`` on ``PATH``."""
-    if code_host_instances.instance_for_host(host) is not None:
-        return True
+    route = code_host_instances.code_host_routing().route_for(host)
+    if route is not None:
+        return route.instance is not None
     return shutil.which("gh") is not None
 
 

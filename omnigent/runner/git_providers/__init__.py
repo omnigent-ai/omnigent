@@ -93,7 +93,7 @@ deprecated and will be removed in 0.19.0. Other providers omit them.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields, replace
 from typing import Any, Literal, Protocol, TypedDict, runtime_checkable
 
 from omnigent.runner.session_prs import PullRequestRef
@@ -728,10 +728,23 @@ def offered_capabilities(facet: PullRequestFacet, host: str | None) -> ProviderC
         when neither is known.
     """
     from omnigent.git_providers import load_facet
-    from omnigent.runner.code_host_instances import instance_capabilities, instance_for_host
+    from omnigent.runner.code_host_instances import code_host_routing, instance_capabilities
 
-    instance = instance_for_host(host)
-    if instance is None or facet is not load_facet(instance.provider, "pull_requests"):
+    route = code_host_routing().route_for(host)
+    if route is None:
+        return facet.capabilities
+    if route.instance is None:
+        # A declared host whose instance this process doesn't run offers nothing.
+        return replace(
+            facet.capabilities,
+            **{
+                capability.name: False
+                for capability in fields(facet.capabilities)
+                if isinstance(getattr(facet.capabilities, capability.name), bool)
+            },
+        )
+    instance = route.instance
+    if facet is not load_facet(instance.provider, "pull_requests"):
         return facet.capabilities
     return instance_capabilities(instance, facet.capabilities)
 

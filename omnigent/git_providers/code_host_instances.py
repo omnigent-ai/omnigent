@@ -22,6 +22,12 @@ The file is TOML, read once when the host starts::
 The first ``cli`` entry is an absolute path, or a bare name looked up once in the
 absolute directories on the host's ``PATH`` at load and never again. Any broken rule
 refuses the whole file, so a host never runs with part of an operator's config.
+
+Each name in ``env`` is copied once, when a runner starts, from the values its host
+set; a value a session forwarded is never used. A runner starts with an allowlisted
+environment, so a variable outside it, such as ``HTTPS_PROXY``, reaches the CLI only
+when the host forwards it with ``OMNIGENT_RUNNER_ENV_PASSTHROUGH``. ``env_set``
+values come from the file itself.
 """
 
 from __future__ import annotations
@@ -382,4 +388,26 @@ def load_code_host_instances(
         known_capabilities=known_capabilities,
         host_path=host_environment.get("PATH", ""),
         which=which,
+    )
+
+
+def declared_hosts(path: Path) -> frozenset[str]:
+    """The hosts *path* declares for instances, read even when the file is refused.
+
+    A host keeps these from plain ``gh`` when it can't serve them. Anything that
+    can't be read declares nothing.
+    """
+    try:
+        document = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return frozenset()
+    instances = document.get("instance")
+    if not isinstance(instances, list):
+        return frozenset()
+    return frozenset(
+        host.strip().lower()
+        for instance in instances
+        if isinstance(instance, dict) and isinstance(instance.get("hosts"), list)
+        for host in instance["hosts"]
+        if isinstance(host, str) and host.strip()
     )

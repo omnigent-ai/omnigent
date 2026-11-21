@@ -297,7 +297,8 @@ def test_the_host_file_loader_is_the_only_way_to_build_instances_from_outside_da
     }
     parameters = inspect.signature(load_code_host_instances).parameters
 
-    assert module_functions == {"load_code_host_instances"}
+    # declared_hosts reads host names only; it never builds a record.
+    assert module_functions == {"declared_hosts", "load_code_host_instances"}
     assert alternate_builders == set()
     assert next(iter(parameters)) == "path"
     assert [name for name, p in parameters.items() if p.kind is p.POSITIONAL_OR_KEYWORD] == [

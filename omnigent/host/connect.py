@@ -70,6 +70,7 @@ from omnigent.git_providers.code_host_instances import (
 from omnigent.git_providers.code_host_instances import (
     CodeHostInstanceError,
     CodeHostInstances,
+    declared_hosts,
     load_code_host_instances,
 )
 from omnigent.harness_accounts import HarnessAccount, HarnessAccounts
@@ -226,7 +227,10 @@ from omnigent.runner.code_host_instances import (
     CODE_HOST_INSTANCES_FILE_ENV_VAR,
 )
 from omnigent.runner.code_host_instances import (
-    serve_in_this_process as serve_code_host_instances_in_process,
+    deny_in_this_process as deny_code_host_instances_in_process,
+)
+from omnigent.runner.code_host_instances import (
+    discard_runner_settings as discard_runner_code_host_settings,
 )
 from omnigent.runner.identity import (
     RUNNER_AUTH_REJECTED_EXIT_CODE,
@@ -1003,10 +1007,12 @@ class HostConnectError(Exception):
     """
 
 
-def _load_host_code_host_instances() -> tuple[Path, CodeHostInstances]:
+def _load_host_code_host_instances() -> tuple[Path, CodeHostInstances, frozenset[str]]:
     """Read the host's code host instance file once, from its config directory.
 
-    A refused file serves no instances; the refusal names rules and ids, not values.
+    :returns: The file, its instances, and every host it declares. A refused file
+        serves no instances but still declares its hosts, so they never run plain
+        ``gh``; the refusal names rules and ids, not values.
     """
     path = global_config_path().parent / CODE_HOST_INSTANCES_CONFIG_FILE_NAME
     try:
@@ -1015,8 +1021,8 @@ def _load_host_code_host_instances() -> tuple[Path, CodeHostInstances]:
         )
     except CodeHostInstanceError as refusal:
         _logger.warning("Code host instances are off on this host: %s", refusal)
-        return path, NO_CODE_HOST_INSTANCES
-    return path, instances
+        return path, NO_CODE_HOST_INSTANCES, declared_hosts(path)
+    return path, instances, instances.hosts_for("github")
 
 
 def _build_runner_env(
@@ -1076,8 +1082,9 @@ def _build_runner_env(
     :param code_host_instances_file: The host's code host instance file, when the
         host serves its instances to this server; ``None`` serves none. Only the
         host names it: an inherited or forwarded value is always replaced.
-    :param code_host_instance_hosts: The hosts those instances serve, so a runner
-        that can't load one refuses its host instead of running plain ``gh``.
+    :param code_host_instance_hosts: Every host the host's file declares, so a runner
+        that can't load one runs nothing for it instead of plain ``gh``. Passed even
+        without a file.
     :returns: The runner subprocess environment.
     """
     extra_names = {
@@ -1123,7 +1130,8 @@ def _build_runner_env(
     env.pop(CODE_HOST_INSTANCE_HOSTS_ENV_VAR, None)
     if code_host_instances_file is not None:
         env[CODE_HOST_INSTANCES_FILE_ENV_VAR] = str(code_host_instances_file.absolute())
-        env[CODE_HOST_INSTANCE_HOSTS_ENV_VAR] = ",".join(sorted(code_host_instance_hosts))
+    if hosts := sorted(code_host_instance_hosts):
+        env[CODE_HOST_INSTANCE_HOSTS_ENV_VAR] = ",".join(hosts)
     env["RUNNER_SERVER_URL"] = server_url
     env[RUNNER_ID_ENV_VAR] = runner_id
     env[RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR] = binding_token
@@ -1460,6 +1468,9 @@ class HostProcess:
         # host never served them never opens the file.
         self._code_host_instances_file: Path | None = None
         self._code_host_instances: CodeHostInstances = NO_CODE_HOST_INSTANCES
+        self._code_host_declared_hosts: frozenset[str] = frozenset()
+        # A host started from a runner's shell never serves that runner's settings.
+        discard_runner_code_host_settings()
         self._harness_accounts: HarnessAccounts | None = None
         self._gateway_inference: dict[str, bool] | None = None
         self._capabilities_initialized = False
@@ -1733,19 +1744,20 @@ class HostProcess:
     def _serve_code_host_instances_for_server(self) -> None:
         """Load the instance file at the first upgrade that turns instances on, then serve.
 
-        A server that didn't advertise them leaves the file unopened. Reads this host
-        answers for a parked runner follow the same instances as its runners.
+        A server that didn't advertise them leaves the file unopened. This host never
+        runs an instance's CLI itself: its own reads for a parked runner run nothing
+        for any host the file declares.
         """
         if (
             SERVER_CAP_CODE_HOST_INSTANCES in self._server_capabilities
             and self._code_host_instances_file is None
         ):
-            self._code_host_instances_file, self._code_host_instances = (
-                _load_host_code_host_instances()
-            )
-        serve_code_host_instances_in_process(
-            self._code_host_instances if self._serves_code_host_instances() else None
-        )
+            (
+                self._code_host_instances_file,
+                self._code_host_instances,
+                self._code_host_declared_hosts,
+            ) = _load_host_code_host_instances()
+            deny_code_host_instances_in_process(self._code_host_declared_hosts)
 
     def _serves_code_host_instances(self) -> bool:
         """Whether this connection serves the host's code host instances.
@@ -2323,11 +2335,7 @@ class HostProcess:
             code_host_instances_file=(
                 self._code_host_instances_file if self._serves_code_host_instances() else None
             ),
-            code_host_instance_hosts=(
-                self._code_host_instances.hosts_for("github")
-                if self._serves_code_host_instances()
-                else frozenset()
-            ),
+            code_host_instance_hosts=self._code_host_declared_hosts,
         )
         if frame.inference_config is not None:
             try:
@@ -5636,18 +5644,9 @@ class HostProcess:
     async def _connect_and_serve(self) -> None:
         """Single connection attempt: connect, hello, serve.
 
-        The host's own reads stop serving code host instances once the connection ends.
-
         :returns: None.
         :raises Exception: On WebSocket disconnect or error.
         """
-        try:
-            await self._connect_and_serve_once()
-        finally:
-            serve_code_host_instances_in_process(None)
-
-    async def _connect_and_serve_once(self) -> None:
-        """Connect, send the hello and serve frames until the connection ends."""
         # Fresh per-connection markers for the silent-connect streak.
         self._conn_upgrade_accepted = False
         self._conn_frame_received = False

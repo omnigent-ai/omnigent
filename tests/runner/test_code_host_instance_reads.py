@@ -12,7 +12,6 @@ from typing import Any
 import pytest
 
 from omnigent.git_providers import load_facet
-from omnigent.git_providers.code_host_instances import load_code_host_instances
 from omnigent.runner import code_host_instances, github_resource, pr_resource
 from omnigent.runner.code_host_instances import (
     CODE_HOST_INSTANCE_HOSTS_ENV_VAR,
@@ -35,13 +34,20 @@ SYNTHETIC_ENVIRONMENT = {
 
 
 @pytest.fixture(autouse=True)
-def _no_process_wide_instances() -> Iterator[None]:
-    """Start and end each test with no host-served or cached runner instances."""
-    code_host_instances.serve_in_this_process(None)
-    code_host_instances._runner_instances.cache_clear()
+def _no_process_wide_routing(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Start and end each test as a process with no routing decided yet."""
+    monkeypatch.setattr(code_host_instances, "_taken", None)
+    monkeypatch.setattr(code_host_instances, "_host_routing", None)
+    code_host_instances._runner_routing.cache_clear()
     yield
-    code_host_instances.serve_in_this_process(None)
-    code_host_instances._runner_instances.cache_clear()
+    code_host_instances._runner_routing.cache_clear()
+
+
+def _start_runner(environment: dict[str, str]) -> None:
+    """Start as a runner whose host set *environment*: it takes its settings first."""
+    os.environ.clear()
+    os.environ.update(environment)
+    code_host_instances.take_runner_settings(os.environ)
 
 
 @pytest.fixture
@@ -66,10 +72,14 @@ def serve_instance(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cli: Path) -
         # Writes listed here are still never offered.
         'capabilities = ["line_counts", "review_threads", "comment_posting", "merging"]\n'
     )
-    monkeypatch.setattr(os, "environ", {**SYNTHETIC_ENVIRONMENT})
-    os.environ[CODE_HOST_INSTANCES_FILE_ENV_VAR] = str(config)
-    os.environ[CODE_HOST_INSTANCE_HOSTS_ENV_VAR] = INSTANCE_HOST
-    code_host_instances._runner_instances.cache_clear()
+    monkeypatch.setattr(os, "environ", {})
+    _start_runner(
+        {
+            **SYNTHETIC_ENVIRONMENT,
+            CODE_HOST_INSTANCES_FILE_ENV_VAR: str(config),
+            CODE_HOST_INSTANCE_HOSTS_ENV_VAR: INSTANCE_HOST,
+        }
+    )
     return cli
 
 
@@ -112,6 +122,43 @@ def test_an_instance_host_runs_the_instances_cli_in_its_pinned_environment(
             },
         }
     ]
+
+
+def test_the_cli_gets_only_values_the_host_set_when_the_runner_started(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    cli: Path,
+    gh_starts: list[dict[str, Any]],
+) -> None:
+    """A session-forwarded or later value for a name the file lists never reaches the CLI."""
+    config = tmp_path / "host.toml"
+    config.write_text(
+        '[[instance]]\nid = "internal"\nprovider = "github"\ndisplay_name = "Internal"\n'
+        f'hosts = ["{INSTANCE_HOST}"]\ncli = ["{cli}"]\nauth = "cli"\n'
+        'env = ["HOME", "HTTPS_PROXY"]\n'
+    )
+    monkeypatch.setattr(os, "environ", {})
+    _start_runner(
+        {
+            **SYNTHETIC_ENVIRONMENT,
+            # The host forwarded HTTPS_PROXY; a session forwarded HOME.
+            "HTTPS_PROXY": "http://proxy.example.test:3128",
+            "HOME": "/session/home",
+            "OMNIGENT_RUNNER_SESSION_ENV_NAMES": "HOME",
+            "RUNNER_INITIAL_AUTH_TOKEN": "synthetic-runner-token",
+            CODE_HOST_INSTANCES_FILE_ENV_VAR: str(config),
+            CODE_HOST_INSTANCE_HOSTS_ENV_VAR: INSTANCE_HOST,
+        }
+    )
+    os.environ["HTTPS_PROXY"] = "http://later.example.test:3128"
+
+    with github_resource.gh_target_host_scope(INSTANCE_HOST):
+        github_resource._gh(["api", "user"], cwd="/workspace")
+
+    [start] = gh_starts
+    assert start["env"]["HTTPS_PROXY"] == "http://proxy.example.test:3128"
+    assert "HOME" not in start["env"]
+    assert "synthetic-runner-token" not in json.dumps(start["env"])
 
 
 def test_a_host_named_in_the_argv_routes_the_same_way(
@@ -212,22 +259,18 @@ def test_a_runner_its_host_named_no_file_serves_no_instances(
     environment = dict(SYNTHETIC_ENVIRONMENT)
     if value is not None:
         environment[CODE_HOST_INSTANCES_FILE_ENV_VAR] = value
-    monkeypatch.setattr(os, "environ", environment)
-    code_host_instances._runner_instances.cache_clear()
-    try:
-        assert active_code_host_instances().instances == ()
-        assert code_host_instances.instance_for_host(INSTANCE_HOST) is None
-    finally:
-        code_host_instances._runner_instances.cache_clear()
+    monkeypatch.setattr(os, "environ", {})
+    _start_runner(environment)
+
+    assert active_code_host_instances().instances == ()
+    assert code_host_instances.instance_for_host(INSTANCE_HOST) is None
 
 
-def test_the_runner_reads_its_file_once(
-    serve_instance: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    first = active_code_host_instances()
-    Path(os.environ[CODE_HOST_INSTANCES_FILE_ENV_VAR]).write_text("not toml [[")
+def test_the_runner_decides_its_routing_once(serve_instance: Path, tmp_path: Path) -> None:
+    first = code_host_instances.code_host_routing()
+    (tmp_path / "code_host_instances.toml").write_text("not toml [[")
 
-    assert active_code_host_instances() is first
+    assert code_host_instances.code_host_routing() is first
     assert code_host_instances.instance_for_host(INSTANCE_HOST) is not None
 
 
@@ -319,12 +362,11 @@ def test_an_instance_gone_between_building_and_running_its_call_still_logs_redac
     failure: BaseException,
     outcome: str,
 ) -> None:
-    """A disconnect after the command is built can't bring it back into the logs."""
+    """A lookup that changed after the command was built can't bring it into the logs."""
     build = github_resource._gh_invocation
 
     def build_then_disconnect(*args: Any, **kwargs: Any) -> github_resource.GhInvocation:
         invocation = build(*args, **kwargs)
-        code_host_instances.serve_in_this_process(None)
         monkeypatch.setattr(code_host_instances, "instance_for_host", lambda _host: None)
         return invocation
 
@@ -380,25 +422,143 @@ def test_a_plain_gh_failure_still_logs_as_before(
     assert "['gh', 'api', 'user'] in /workspace timed out" in caplog.text
 
 
-def test_a_host_that_served_instances_leaves_none_behind_for_a_runner(
-    serve_instance: Path, gh_starts: list[dict[str, Any]], tmp_path: Path
+def _instance_file(path: Path, cli: str) -> Path:
+    path.write_text(
+        '[[instance]]\nid = "internal"\nprovider = "github"\ndisplay_name = "Internal"\n'
+        f'hosts = ["{INSTANCE_HOST}"]\ncli = ["{cli}"]\nauth = "cli"\n'
+        'capabilities = ["line_counts"]\n'
+    )
+    return path
+
+
+@pytest.fixture(params=["host-process", "cli-gone", "session-path"])
+def denied_host(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cli: Path
+) -> str:
+    """A process where the declared instance host runs nothing, and why."""
+    monkeypatch.setattr(os, "environ", {})
+    if request.param == "host-process":
+        os.environ.update(SYNTHETIC_ENVIRONMENT)
+        code_host_instances.deny_in_this_process([INSTANCE_HOST])
+        return "code_host_instance_needs_runner"
+    environment = {**SYNTHETIC_ENVIRONMENT, CODE_HOST_INSTANCE_HOSTS_ENV_VAR: INSTANCE_HOST}
+    if request.param == "cli-gone":
+        config = _instance_file(tmp_path / "host.toml", str(tmp_path / "missing-cli"))
+    else:
+        # A bare name never resolves on a PATH a session forwarded.
+        config = _instance_file(tmp_path / "host.toml", cli.name)
+        environment["PATH"] = str(cli.parent)
+        environment["OMNIGENT_RUNNER_SESSION_ENV_NAMES"] = "PATH"
+    environment[CODE_HOST_INSTANCES_FILE_ENV_VAR] = str(config)
+    _start_runner(environment)
+    return "code_host_instance_cli_unavailable"
+
+
+def test_a_declared_host_that_runs_nothing_never_reaches_plain_gh(
+    denied_host: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """After a host stops serving in process, a runner reads with its own instances."""
-    other_cli = tmp_path / "other-cli"
-    other_cli.write_text("#!/bin/sh\nexit 0\n")
-    other_cli.chmod(0o755)
-    other_file = tmp_path / "other.toml"
-    other_file.write_text(
-        '[[instance]]\nid = "other"\nprovider = "github"\ndisplay_name = "Other"\n'
-        f'hosts = ["{INSTANCE_HOST}"]\ncli = ["{other_cli}"]\nauth = "cli"\n'
+    """No read, sign-in, token, account listing or capability falls back to ``gh``."""
+    starts: list[list[str]] = []
+
+    def run(argv: list[str], **_kwargs: Any) -> tuple[int | None, str, str]:
+        if argv[0] == "git":
+            if "--get-regexp" in argv:
+                return 0, f"remote.origin.url\nhttps://{INSTANCE_HOST}/owner/repo.git\0", ""
+            return 0, "feature\n", ""
+        starts.append(argv)
+        return 0, "{}", ""
+
+    monkeypatch.setattr(github_resource, "_run", run)
+    monkeypatch.setattr(github_resource, "_in_sandbox", lambda: False)
+    monkeypatch.setattr(github_resource.shutil, "which", lambda _name, *_a, **_k: "/usr/bin/gh")
+    monkeypatch.setattr(
+        github_resource, "_list_accounts", lambda *_a: pytest.fail("listed accounts")
     )
-    host_set = load_code_host_instances(
-        other_file, known_capabilities=code_host_instances.CAPABILITY_NAMES, host_environment={}
+    monkeypatch.setattr(
+        github_resource, "_account_token_for", lambda *_a: pytest.fail("asked for a token")
     )
-    code_host_instances.serve_in_this_process(host_set)
-    code_host_instances.serve_in_this_process(None)
+    reference = PullRequestRef.from_url(f"https://{INSTANCE_HOST}/acme/repo/pull/7")
+    facet = load_facet("github", "pull_requests")
+    assert facet is not None
+    unavailable = {"object": "session.github.info", "available": False, "reason": denied_host}
 
     with github_resource.gh_target_host_scope(INSTANCE_HOST):
-        github_resource._gh(["api", "user"], cwd="/workspace")
+        assert github_resource._gh(["api", "user"], cwd="/workspace")[0] is None
+    github_resource._gh(["pr", "view", "7", "-R", f"{INSTANCE_HOST}/acme/repo"], cwd="/w")
+    assert github_resource._pr_json("/workspace", reference, "title") is None
 
-    assert gh_starts[0]["argv"][0] == str(serve_instance)
+    assert github_resource._reference_info("/workspace", reference) == unavailable
+    assert github_resource._workspace_github_info("/workspace") == unavailable
+    assert github_resource._pr_token("/workspace", reference) is None
+    assert github_resource._cli_available_for(INSTANCE_HOST) is False
+    assert not any(offered_capabilities(facet, INSTANCE_HOST).to_json().values())
+    assert starts == []
+
+
+def test_the_host_process_decides_its_denial_once(cli: Path) -> None:
+    code_host_instances.deny_in_this_process([INSTANCE_HOST.upper()])
+    code_host_instances.deny_in_this_process([])
+
+    routing = code_host_instances.code_host_routing()
+    assert routing.route_for(INSTANCE_HOST) == code_host_instances.CodeHostRoute(
+        None, "needs_runner"
+    )
+    assert routing.instances.instances == ()
+    assert routing.route_for("github.com") is None
+
+
+def test_a_runners_children_never_see_its_instance_settings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cli: Path
+) -> None:
+    """Every process a runner starts, whatever env it passes, inherits neither setting."""
+    config = _instance_file(tmp_path / "host.toml", str(cli))
+    monkeypatch.setenv(CODE_HOST_INSTANCES_FILE_ENV_VAR, str(config))
+    monkeypatch.setenv(CODE_HOST_INSTANCE_HOSTS_ENV_VAR, INSTANCE_HOST)
+
+    code_host_instances.take_runner_settings()
+
+    child = subprocess.run(["env"], capture_output=True, text=True, check=True).stdout
+    assert CODE_HOST_INSTANCES_FILE_ENV_VAR not in child
+    assert CODE_HOST_INSTANCE_HOSTS_ENV_VAR not in child
+    assert str(config) not in child
+    assert code_host_instances.instance_for_host(INSTANCE_HOST) is not None
+
+
+def test_a_host_process_drops_the_runner_settings_it_inherited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(CODE_HOST_INSTANCES_FILE_ENV_VAR, "/elsewhere/code_host_instances.toml")
+    monkeypatch.setenv(CODE_HOST_INSTANCE_HOSTS_ENV_VAR, INSTANCE_HOST)
+
+    code_host_instances.discard_runner_settings()
+
+    assert CODE_HOST_INSTANCES_FILE_ENV_VAR not in os.environ
+    assert CODE_HOST_INSTANCE_HOSTS_ENV_VAR not in os.environ
+    assert code_host_instances.code_host_routing() is code_host_instances.NO_ROUTING
+
+
+def test_a_workspace_whose_remote_is_on_an_instance_host_reads_through_its_cli(
+    serve_instance: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no tracked PR, the remote's host routes the workspace's reads."""
+    starts: list[dict[str, Any]] = []
+
+    def run(argv: list[str], **kwargs: Any) -> tuple[int | None, str, str]:
+        if argv[0] == "git":
+            if "--get-regexp" in argv:
+                return 0, f"remote.origin.url\nhttps://{INSTANCE_HOST}/owner/repo.git\0", ""
+            return 0, "feature\n", ""
+        starts.append({"argv": argv, "env": kwargs.get("env")})
+        return 0, json.dumps({"number": 7, "title": "Instance PR", "state": "OPEN"}), ""
+
+    monkeypatch.setattr(github_resource, "_run", run)
+    monkeypatch.setattr(github_resource, "_in_sandbox", lambda: False)
+    monkeypatch.setattr(
+        github_resource, "_account_token_for", lambda *_a: pytest.fail("asked for a token")
+    )
+
+    info = github_resource._workspace_github_info("/workspace")
+
+    assert starts and all(start["argv"][0] == str(serve_instance) for start in starts)
+    assert all(start["env"]["GH_HOST"] == INSTANCE_HOST for start in starts)
+    assert info["pr"]["title"] == "Instance PR"

@@ -2617,6 +2617,10 @@ def main() -> None:
     # Set the boot-time disposition before the slow imports below, so an early
     # hangup cannot kill the runner while they run.
     _ignore_finish_work_signal_until_handled()
+    # Before anything can start a process: no child inherits the host's instance settings.
+    from omnigent.runner.code_host_instances import take_runner_settings
+
+    take_runner_settings()
     from omnigent.process_logging import configure_process_logging
     from omnigent.telemetry.request_headers import set_client_component
 
