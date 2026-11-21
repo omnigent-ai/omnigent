@@ -46,6 +46,10 @@ pytestmark = pytest.mark.timeout(600, method="signal")
 # waiting out its 30 s poll, then wakes the runner and persists the message.
 _FIRING_SLACK_S = 6.0
 _REPLY = "Noted the timer."
+# A runner stopped mid-turn leaves its session looking busy, which holds a repeating
+# timer's ticks for up to ten minutes, so these tests stop runners between turns, with
+# at least this long before the next tick.
+_STOP_MARGIN_S = 4.0
 
 
 @contextmanager
@@ -171,6 +175,18 @@ def _set_timer(
     return _tool_output(client, session_id, call_id)
 
 
+def _wait_until_idle_before(client: httpx.Client, session_id: str, next_tick_at: float) -> None:
+    """Wait for the session's turn to end, with time left to stop its runner before a tick.
+
+    :param next_tick_at: When the timer next fires, as a Unix time, e.g. its first ``fire_at``.
+    """
+    poll_until(
+        lambda: client.get(f"/v1/sessions/{session_id}").json()["status"] == "idle",
+        timeout_s=60,
+    )
+    assert time.time() < next_tick_at - _STOP_MARGIN_S, "the turn ran too long; lengthen the timer"
+
+
 def _model_saw(mock_url: str, model: str, text: str) -> bool:
     """Whether a captured model request carried *text* in its input."""
     return any(text in json.dumps(request) for request in get_mock_requests(mock_url, key=model))
@@ -250,7 +266,7 @@ def test_repeating_timer_keeps_its_id_and_stays_cancelled_across_restarts(
     """Repeated ticks reuse one task, survive a runner restart, and stop for good on cancel."""
     mock_url = isolated_mock_llm_server_url
     model = f"mock-timer-repeat-{uuid.uuid4().hex[:6]}"
-    interval = 6
+    interval = 10
     set_fallback_mock_llm(mock_url, model, _REPLY)
     with _timer_stack(tmp_path) as (stack, client):
         session_id = _timer_session(client, stack, mock_url, model)
@@ -264,18 +280,16 @@ def test_repeating_timer_keeps_its_id_and_stays_cancelled_across_restarts(
         assert timer["status"] == "scheduled", timer
         assert timer["interval_seconds"] == interval
         timer_id = timer["timer_id"]
+        first_tick_at = datetime.fromisoformat(timer["fire_at"]).timestamp()
 
+        # The timer outlives a runner restart that begins before its first tick.
+        _wait_until_idle_before(client, session_id, first_tick_at)
+        _restart_runner(stack, client)
         poll_until(lambda: len(_firings(client, session_id, timer_id)) >= 2, timeout_s=60)
         # Every tick is the same task: the task stays active with its next tick saved.
         task = client.get(f"/v1/scheduled-tasks/{timer_id}").json()
         assert (task["kind"], task["state"]) == ("timer", "active")
         assert task["rrule"] == f"FREQ=SECONDLY;INTERVAL={interval}"
-
-        _restart_runner(stack, client)
-        before_restart = len(_firings(client, session_id, timer_id))
-        poll_until(
-            lambda: len(_firings(client, session_id, timer_id)) > before_restart, timeout_s=60
-        )
 
         # The agent cancels the timer from the turn its next tick starts.
         cancel_call = f"call_cancel_{uuid.uuid4().hex[:8]}"
@@ -306,7 +320,7 @@ def test_repeating_timer_keeps_its_id_and_stays_cancelled_across_restarts(
         _restart_runner(stack, client)
         stack.restart_server()
         # Several intervals across both restarts: a cancelled timer never ticks again.
-        time.sleep(4 * interval)
+        time.sleep(3 * interval)
         assert len(_firings(client, session_id, timer_id)) == cancelled_count
         assert client.get(f"/v1/scheduled-tasks/{timer_id}").status_code == 404
 
@@ -358,8 +372,10 @@ def test_a_sub_agent_timer_wakes_its_child_after_the_parent_moves_runners(
             {"seconds": interval, "repeat": True, "note": "check the child's work"},
         )
         timer_id = timer["timer_id"]
+        first_tick_at = datetime.fromisoformat(timer["fire_at"]).timestamp()
         poll_until(lambda: _firings(client, child_id, timer_id), timeout_s=60)
         poll_until(lambda: _replies(client, child_id) >= 1, timeout_s=60)
+        _wait_until_idle_before(client, child_id, first_tick_at + interval)
 
         # The parent moves to a runner with a new identity while the child is idle, so
         # the child still names the stopped runner, which a message to it would repair.
