@@ -52,15 +52,16 @@ _GEOMETRY_JS = """() => {
 }"""
 
 
-def _set_features(page: Page, floating: bool) -> None:
-    """Answer ``/v1/info`` with the tabs sidebar on and floating panes set to ``floating``."""
+def _set_features(page: Page, floating: bool, *, tabs_sidebar: bool = True) -> None:
+    """Answer ``/v1/info`` with floating panes set to ``floating``, and the tabs sidebar on
+    unless ``tabs_sidebar`` turns it off for the classic one."""
 
     def answer(route: Route) -> None:
         response = route.fetch()
         info = response.json()
         info["features"] = {
             **(info.get("features") or {}),
-            "workspace_sidebar_v2": True,
+            "workspace_sidebar_v2": tabs_sidebar,
             "floating_panes": floating,
         }
         route.fulfill(response=response, json=info)
@@ -76,10 +77,11 @@ def _open(
     scheme: str,
     floating: bool,
     viewport: dict[str, int] = _VIEWPORT,
+    tabs_sidebar: bool = True,
 ) -> None:
     page.set_viewport_size(viewport)
     page.emulate_media(color_scheme=scheme)
-    _set_features(page, floating)
+    _set_features(page, floating, tabs_sidebar=tabs_sidebar)
     page.goto(f"{base_url}/c/{session_id}")
     expect(message_composer(page)).to_be_visible(timeout=30_000)
     expect(page.locator(".app-shell[data-floating-panes]")).to_have_count(1 if floating else 0)
@@ -332,3 +334,67 @@ def test_a_grid_workspace_is_unchanged_by_floating_panes(
     expect(page.locator(".app-shell[data-floating-panes]")).to_have_count(1)
     flat = _grid_workspace_style(page, base_url, (first, second), floating=False)
     assert floating == flat
+
+
+_WORKSPACE = 'aside[aria-label="Workspace"]'
+_CHAT_PANE = '[data-main-view="chat"] > main[data-session-id]'
+# Narrowing the sidebar: widening it far would hit the chat's minimum width.
+_DRAG_PX = 80
+
+
+def _workspace_width(page: Page) -> float:
+    """The workspace sidebar's width once its slide open, or a resize, has finished."""
+    page.wait_for_timeout(600)  # custom-lint: disable=sleep-then-assert -- the slide's length
+    return page.locator(_WORKSPACE).evaluate("(el) => el.getBoundingClientRect().width")
+
+
+def _gutter(page: Page) -> dict[str, float]:
+    """Where the chat pane ends, where the workspace sidebar starts, and the pane's middle."""
+    return page.evaluate(
+        """([sidebar, pane]) => {
+      const rail = document.querySelector(sidebar).getBoundingClientRect();
+      const chat = document.querySelector(pane).getBoundingClientRect();
+      return { paneRight: chat.right, railLeft: rail.left, middleY: chat.top + chat.height / 2 };
+    }""",
+        [_WORKSPACE, _CHAT_PANE],
+    )
+
+
+def _cursor_at(page: Page, x: float, y: float) -> str:
+    return page.evaluate(
+        "([x, y]) => getComputedStyle(document.elementFromPoint(x, y)).cursor", [x, y]
+    )
+
+
+def _drag(page: Page, x: float, y: float, dx: float) -> None:
+    page.mouse.move(x, y)
+    page.mouse.down()
+    page.mouse.move(x + dx / 2, y, steps=4)
+    page.mouse.move(x + dx, y, steps=4)
+    page.mouse.up()
+
+
+@pytest.mark.parametrize("tabs_sidebar", [True, False], ids=["tabs", "classic"])
+def test_the_workspace_sidebar_resizes_from_the_gutter_beside_the_chat(
+    page: Page, seeded_session: tuple[str, str], tabs_sidebar: bool
+) -> None:
+    """The whole gap beside the chat's card is the sidebar's edge; a press in the card is not."""
+    base_url, session_id = seeded_session
+    _open(page, base_url, session_id, scheme="light", floating=True, tabs_sidebar=tabs_sidebar)
+    open_right_rail(page)
+    before = _workspace_width(page)
+    gutter = _gutter(page)
+    assert gutter["railLeft"] - gutter["paneRight"] >= 3, gutter
+    middle_x = (gutter["paneRight"] + gutter["railLeft"]) / 2
+    y = gutter["middleY"]
+    for x in (gutter["paneRight"] + 0.5, middle_x, gutter["railLeft"] - 0.5):
+        assert _cursor_at(page, x, y) == "col-resize", (x, gutter)
+
+    _drag(page, middle_x, y, _DRAG_PX)
+    narrowed = _workspace_width(page)
+    assert abs(narrowed - (before - _DRAG_PX)) <= 4, (before, narrowed)
+
+    inside = _gutter(page)["paneRight"] - 4
+    assert _cursor_at(page, inside, y) != "col-resize"
+    _drag(page, inside, y, -_DRAG_PX)
+    assert abs(_workspace_width(page) - narrowed) <= 1

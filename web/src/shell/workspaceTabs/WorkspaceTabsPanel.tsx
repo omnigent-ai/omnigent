@@ -106,6 +106,7 @@ import { UNSUPPORTED_TAB_TITLE, UnsupportedTabContent } from "../workspaceSideba
 import { useWorkspaceSidebarTabActions } from "../workspaceSidebar/useWorkspaceSidebarTabActions";
 import { useCanStartSideChat } from "@/hooks/usePermissions";
 import { useFloatingPanes } from "../useFloatingPanes";
+import { WorkspaceRailEdgeHandle, WorkspaceRailGutterHandle } from "../WorkspaceRailResizeHandle";
 import { RailTerminalView, WorkspaceTabTooltip } from "../WorkspacePanel";
 import { NewTabPage, type NewTabRecent } from "./NewTabPage";
 import { recentPullRequestRows, recentPullRequestUrl } from "./recentPullRequestRow";
@@ -1035,17 +1036,10 @@ function WorkspaceTabsPanelImpl({
   );
 
   const selectedUnknown = tabs.find((tab) => tab.id === selectedTabId && isUnknownTab(tab));
-  const effectiveHandleProps = pending
-    ? {
-        ...handleProps,
-        onMouseDown: undefined,
-        onKeyDown: undefined,
-        "aria-disabled": true,
-        tabIndex: -1,
-      }
-    : handleProps;
+  // Floating panes leave a gutter beside the rail; dragging it resizes the rail too.
+  const gutterHandle = floatingPanes && !contained && !maximized;
 
-  return (
+  const rail = (
     <aside
       aria-label="Workspace"
       {...commandRegionProps("workspace")}
@@ -1084,12 +1078,10 @@ function WorkspaceTabsPanelImpl({
         style={{ width: maximized || inDrawer ? "100%" : `calc(${width}px - 1px)` }}
       >
         {!maximized && !inDrawer && (
-          <div
-            {...effectiveHandleProps}
-            className={cn(
-              "absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors",
-              pending && "cursor-default hover:bg-transparent active:bg-transparent",
-            )}
+          <WorkspaceRailEdgeHandle
+            handleProps={handleProps}
+            pending={pending}
+            bare={gutterHandle}
           />
         )}
         <WorkspaceSidebarFrame
@@ -1266,6 +1258,19 @@ function WorkspaceTabsPanelImpl({
         </WorkspaceSidebarFrame>
       </div>
     </aside>
+  );
+  return (
+    <>
+      {rail}
+      {gutterHandle && (
+        <WorkspaceRailGutterHandle
+          onMouseDown={handleProps.onMouseDown}
+          pending={pending}
+          railWidth={width}
+          shown={open}
+        />
+      )}
+    </>
   );
 }
 

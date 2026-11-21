@@ -71,6 +71,8 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useQuery } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
+import { useFloatingPanes } from "./useFloatingPanes";
+import { WorkspaceRailEdgeHandle, WorkspaceRailGutterHandle } from "./WorkspaceRailResizeHandle";
 import { SUBAGENT_TAB_FALLBACK_LABEL, SubagentTabPane, useSubagentTabLabels } from "./SubagentTab";
 import { type SubagentPanelOpener, SubagentPanelOpenerContext } from "./subagentPanelOpener";
 import { SideChatPane } from "@/components/chat/SideChatPane";
@@ -949,6 +951,7 @@ function WorkspacePanelImpl({
   const sideChats = useSideChats(conversationId);
   const mobileViewport = useIsMobileViewport();
   const isMobile = mobileViewport && !contained;
+  const floatingPanes = useFloatingPanes();
   const activeView = resolveWorkspaceActiveView(
     {
       rightRailTab,
@@ -1386,15 +1389,8 @@ function WorkspacePanelImpl({
       menuAlign={menuAlign}
     />
   );
-  const effectiveHandleProps = pending
-    ? {
-        ...handleProps,
-        onMouseDown: undefined,
-        onKeyDown: undefined,
-        "aria-disabled": true,
-        tabIndex: -1,
-      }
-    : handleProps;
+  // Floating panes leave a gutter beside the rail; dragging it resizes the rail too.
+  const gutterHandle = floatingPanes && !contained && !maximized;
   const shortcutFor = (tab: RightRailTab) => {
     const index = visiblePermanentTabs.findIndex((candidate) => candidate === tab);
     return index === -1 ? undefined : String(index + 1);
@@ -1769,12 +1765,10 @@ function WorkspacePanelImpl({
       >
         {/* Left-edge horizontal resize handle — suppressed while maximized. */}
         {!maximized && (
-          <div
-            {...effectiveHandleProps}
-            className={cn(
-              "absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors",
-              pending && "cursor-default hover:bg-transparent active:bg-transparent",
-            )}
+          <WorkspaceRailEdgeHandle
+            handleProps={handleProps}
+            pending={pending}
+            bare={gutterHandle}
           />
         )}
         {/* The default nav tab comes first; the remaining tabs keep their relative order. */}
@@ -2212,6 +2206,14 @@ function WorkspacePanelImpl({
   return (
     <>
       {rail}
+      {gutterHandle && (
+        <WorkspaceRailGutterHandle
+          onMouseDown={handleProps.onMouseDown}
+          pending={pending}
+          railWidth={width}
+          shown={open}
+        />
+      )}
       {/* The rail is `hidden` on phones, so the drawer renders beside it. A
         portal to the body would escape the embed's scoped styles. */}
       {isMobile && (

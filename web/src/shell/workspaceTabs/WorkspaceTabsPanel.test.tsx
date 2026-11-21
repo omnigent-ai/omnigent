@@ -317,6 +317,33 @@ describe("the panel's placement", () => {
   });
 });
 
+describe("the gutter beside floating panes", () => {
+  const gutter = () => document.querySelector<HTMLElement>("[data-workspace-rail-gutter-handle]");
+  const rail = () => document.querySelector<HTMLElement>('aside[aria-label="Workspace"]')!;
+
+  it("drags the docked rail from a band beside it, placed by the rail's width", () => {
+    floatingPanes.on = true;
+    const onMouseDown = vi.fn();
+    renderPanels([
+      { conversationId: "conv_a", open: true, handleProps: { tabIndex: 0, onMouseDown } },
+    ]);
+    expect(rail().nextElementSibling).toBe(gutter());
+    expect(gutter()!.style.right).toBe("355px");
+    fireEvent.mouseDown(gutter()!);
+    expect(onMouseDown).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["without floating panes", { floating: false }],
+    ["full screen", { floating: true, maximized: true }],
+    ["in a grid cell", { floating: true, contained: true }],
+  ])("has no band %s", (_case, { floating, ...overrides }) => {
+    floatingPanes.on = floating;
+    renderPanels([{ conversationId: "conv_a", open: true, ...overrides }]);
+    expect(gutter()).toBeNull();
+  });
+});
+
 describe("All tabs' place in the strip", () => {
   const button = (name: string) => screen.getByRole("button", { name, hidden: true });
   const precedes = (first: Element, second: Element) =>
