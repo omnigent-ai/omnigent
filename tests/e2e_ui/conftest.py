@@ -652,7 +652,9 @@ def configure_mock_llm(
         ``error``, ``status_code``, ``delay``, ``truncate_after``
         (emit only N SSE events then end the stream, dropping the
         completion event — a mid-stream fault for exercising the SPA's
-        stream error/recovery UI).
+        stream error/recovery UI), ``stop_reason`` (override the terminal
+        Anthropic ``stop_reason`` on ``/v1/messages``, e.g. ``"max_tokens"``
+        for a reply cut off by the model's output-token limit).
     :param key: Queue key — typically the model name baked into the
         agent spec. Omitting it allocates an independent content queue when
         ``match`` is supplied, otherwise uses ``"default"``. Explicit keys replace
@@ -1115,6 +1117,12 @@ def live_server(
     # Pre-0.22 compatibility servers already default to the timers.
     features = env.get("OMNIGENT_FEATURES", "")
     compat_version = env.get(COMPAT_SERVER_VERSION_ENV) or "0"
+    # Workflow scenarios opt in only on servers that recognize the flag.
+    if "workflows" not in features and (
+        compat_server_python() is None or meets_min_server_version(compat_version, "0.23.0")
+    ):
+        features = ",".join(filter(None, (features, "workflows")))
+    env["OMNIGENT_FEATURES"] = features
     if "automations_v2" not in features and (
         compat_server_python() is None or meets_min_server_version(compat_version, "0.22.0")
     ):

@@ -5,9 +5,10 @@ import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
 
 import { useDesktopCommand } from "@/lib/desktopCommands";
 import { useIsEmbedded } from "@/lib/embedded";
-import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
+import { isMacPlatform } from "@/lib/hotkeys";
 import { isElectronShell } from "@/lib/nativeBridge";
 import { useLocation, useNavigate, useNavigationType } from "@/lib/routing";
+import { matchesShortcut } from "@/lib/shortcuts/registry";
 
 /** Surfaces that keep bracket chords (Monaco outdent/indent, the PTY, the palette). */
 const BRACKET_OWNING_SURFACES = ".xterm, .monaco-editor, [cmdk-input]";
@@ -96,10 +97,11 @@ export function useHistoryNavigation(isMac = isMacPlatform()): void {
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.repeat || event.defaultPrevented || event.altKey || event.shiftKey) return;
-      if (!hasCommandModifier(event, isMac)) return;
-      const delta = event.code === "BracketLeft" ? -1 : event.code === "BracketRight" ? 1 : 0;
-      if (delta === 0) return;
+      if (event.repeat || event.defaultPrevented) return;
+      let delta: -1 | 1;
+      if (matchesShortcut(event, "history.back", { mac: isMac })) delta = -1;
+      else if (matchesShortcut(event, "history.forward", { mac: isMac })) delta = 1;
+      else return;
       const focused = document.activeElement;
       if (focused instanceof Element && focused.closest(BRACKET_OWNING_SURFACES)) return;
       event.preventDefault();

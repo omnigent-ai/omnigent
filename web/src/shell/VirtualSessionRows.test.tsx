@@ -1,7 +1,7 @@
 // Exercises the real virtualizer, which the shared test setup replaces with a
 // pass-through that renders every row and would hide windowing bugs.
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
-import { useRef, type RefObject } from "react";
+import { useLayoutEffect, useRef, type RefObject } from "react";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { VirtualSessionRows, virtualRowStyle } from "./VirtualSessionRows";
@@ -106,33 +106,45 @@ function Harness({
   revealId = null,
   revealReady,
   scrollerRef,
+  listMounted = true,
+  restoreTop,
 }: {
   rows?: readonly { id: string }[];
   revealId?: string | null;
   revealReady?: boolean;
   scrollerRef?: (scroller: RefObject<HTMLElement | null>) => void;
+  listMounted?: boolean;
+  /** Offset the parent writes as the list mounts, the way a scroll restore does. */
+  restoreTop?: number;
 }) {
   const scroller = useRef<HTMLElement | null>(null);
   scrollerRef?.(scroller);
+  useLayoutEffect(() => {
+    if (listMounted && restoreTop !== undefined && scroller.current) {
+      scroller.current.scrollTop = restoreTop;
+    }
+  }, [listMounted, restoreTop]);
   return (
     <nav ref={scroller} data-testid="scroller" style={{ overflowY: "auto" }}>
-      <VirtualSessionRows
-        items={rows}
-        scrollElementRef={scroller}
-        revealId={revealId}
-        revealReady={revealReady}
-        renderRow={(item, placement) => (
-          <li
-            key={item.id}
-            ref={placement.measureRef}
-            data-index={placement.index}
-            data-session={item.id}
-            style={virtualRowStyle(placement.top)}
-          >
-            <button type="button">{item.id}</button>
-          </li>
-        )}
-      />
+      {listMounted && (
+        <VirtualSessionRows
+          items={rows}
+          scrollElementRef={scroller}
+          revealId={revealId}
+          revealReady={revealReady}
+          renderRow={(item, placement) => (
+            <li
+              key={item.id}
+              ref={placement.measureRef}
+              data-index={placement.index}
+              data-session={item.id}
+              style={virtualRowStyle(placement.top)}
+            >
+              <button type="button">{item.id}</button>
+            </li>
+          )}
+        />
+      )}
     </nav>
   );
 }
@@ -157,6 +169,23 @@ describe("VirtualSessionRows", () => {
     scrollTo(1_500 * (ROW_HEIGHT + 1));
     expect(row("session-1500")).not.toBeNull();
     expect(row("session-0")).toBeNull();
+  });
+
+  it("keeps the offset of an already scrolled scroller it mounts into", () => {
+    const { rerender } = render(<Harness listMounted={false} />);
+    scroller().scrollTop = 1_000 * (ROW_HEIGHT + 1);
+    rerender(<Harness />);
+    expect(scroller().scrollTop).toBe(1_000 * (ROW_HEIGHT + 1));
+    expect(row("session-1000")).not.toBeNull();
+    expect(row("session-0")).toBeNull();
+  });
+
+  it("keeps an offset the parent restores in the commit that mounts it", () => {
+    const { rerender } = render(<Harness listMounted={false} />);
+    scroller().scrollTop = 1_000 * (ROW_HEIGHT + 1);
+    rerender(<Harness restoreTop={0} />);
+    expect(scroller().scrollTop).toBe(0);
+    expect(row("session-0")).not.toBeNull();
   });
 
   it("keeps the row last pointed at mounted after scrolling it away", () => {

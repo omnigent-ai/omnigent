@@ -12,7 +12,7 @@ import type { SkillsStatus } from "@/lib/types";
 import { Link } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { MobileMenuGlassSurface } from "./MobileMenuGlassSurface";
 
 /**
@@ -611,12 +611,12 @@ function MenuRowButton({
   const { name, isBuiltin } = row;
   const descriptionRef = useRef<HTMLSpanElement>(null);
   const hoverTimerRef = useRef<number | undefined>(undefined);
-  const coarsePointer = useIsCoarsePointer();
-  // A highlight resting on a cut-off row opens its tooltip, except on touch screens where most
+  const mobileViewport = useIsMobileViewport();
+  // A highlight resting on a cut-off row opens its tooltip, except in the mobile layout where most
   // rows are cut off; a highlight move or new description closes it and drops a pending hover.
   useEffect(() => {
     const timer =
-      active && !coarsePointer
+      active && !mobileViewport
         ? window.setTimeout(
             () => onTooltipOpenChange(name, isCutOff(descriptionRef.current)),
             DESCRIPTION_TOOLTIP_DELAY_MS,
@@ -628,7 +628,7 @@ function MenuRowButton({
       hoverTimerRef.current = undefined;
       onTooltipOpenChange(name, false);
     };
-  }, [active, activeIndex, coarsePointer, name, onTooltipOpenChange, row.description]);
+  }, [active, activeIndex, mobileViewport, name, onTooltipOpenChange, row.description]);
   const tooltipRef = useRef<HTMLDivElement>(null);
   // The composer keeps focus, so PageUp/PageDown page through a description taller than the cap.
   useEffect(() => {

@@ -2885,6 +2885,56 @@ def test_server_with_explicit_port_does_not_check_canonical_server(
     assert bind_probes == [("127.0.0.1", 44770)]
 
 
+@pytest.mark.parametrize("host", ["127.0.0.1", "::1", "[::1]"])
+def test_server_accounts_url_matches_bind_host(
+    host: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Accounts callbacks keep IPv6 brackets while the listener receives a bare host."""
+    import uvicorn.server
+
+    observed = {}
+
+    def capture_server(self: Any, **kwargs: Any) -> None:
+        observed["host"] = self.config.host
+        observed["url"] = os.environ["OMNIGENT_ACCOUNTS_BASE_URL"]
+
+    monkeypatch.setattr(uvicorn.server.Server, "run", capture_server)
+    listener = Mock(return_value=contextlib.nullcontext(Mock()))
+    monkeypatch.setattr("omnigent.cli._bind_server_listener", listener)
+    monkeypatch.setenv("OMNIGENT_AUTH_PROVIDER", "accounts")
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    accounts_env = {
+        "OMNIGENT_ACCOUNTS_BASE_URL": None,
+        "OMNIGENT_ACCOUNTS_COOKIE_SECRET": None,
+    }
+    original_accounts_env = {name: os.environ.get(name) for name in accounts_env}
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "server",
+            "--host",
+            host,
+            "--port",
+            "44770",
+            "--no-open",
+            "--database-uri",
+            f"sqlite:///{tmp_path / 'chat.db'}",
+            "--artifact-location",
+            str(tmp_path / "artifacts"),
+        ],
+        env=accounts_env,
+    )
+
+    assert {name: os.environ.get(name) for name in accounts_env} == original_accounts_env
+    assert result.exit_code == 0, result.exception or result.output
+    expected_host = host.strip("[]")
+    authority = f"[{expected_host}]" if ":" in expected_host else expected_host
+    assert observed == {"host": expected_host, "url": f"http://{authority}:44770"}
+    listener.assert_called_once_with(expected_host, 44770)
+
+
 def test_server_command_explicit_occupied_port_fails() -> None:
     """
     An explicit ``--port`` must fail instead of choosing a replacement.

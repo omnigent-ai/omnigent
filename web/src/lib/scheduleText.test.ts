@@ -199,6 +199,39 @@ describe("validateSchedule — 1-hour floor + required selections", () => {
 });
 
 describe("describeSchedule", () => {
+  it("describes a one-time rule as once", () => {
+    expect(
+      describeSchedule(
+        "FREQ=YEARLY;BYMONTH=11;BYMONTHDAY=12;BYHOUR=23;BYMINUTE=0;BYSECOND=0;COUNT=1",
+      ),
+    ).toBe("Once on November 12 at 11:00 PM");
+    const reminder = "FREQ=YEARLY;BYMONTH=11;BYMONTHDAY=12;BYHOUR=23;BYMINUTE=0;BYSECOND=0;COUNT=1";
+    // With its task's zone the time can't be mistaken for the viewer's local time.
+    expect(describeSchedule(reminder, "UTC")).toBe("Once on November 12 at 11:00 PM UTC");
+    expect(describeSchedule(reminder, "Asia/Tokyo")).toBe(
+      "Once on November 12 at 11:00 PM (Asia/Tokyo)",
+    );
+    // Recurring schedules read as before.
+    expect(describeSchedule("FREQ=DAILY;BYHOUR=9;BYMINUTE=0", "UTC")).toBe("Every day at 9:00 AM");
+    for (const rule of [
+      "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;COUNT=1",
+      "COUNT=1;FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+      "RRULE:COUNT=1;FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+    ]) {
+      expect(describeSchedule(rule)).toBe("Once: Every day at 9:00 AM");
+    }
+    // These name no single literal moment, so they keep the recurrence wording.
+    for (const rule of [
+      "FREQ=YEARLY;BYMONTH=11;BYMONTHDAY=-1;BYHOUR=9;BYMINUTE=0;COUNT=1",
+      "FREQ=YEARLY;BYMONTH=11;BYMONTHDAY=12;BYHOUR=9,17;BYMINUTE=0;COUNT=1",
+    ]) {
+      const text = describeSchedule(rule);
+      expect(text.startsWith("Once: ")).toBe(true);
+      expect(text).not.toMatch(/^Once on /);
+      expect(text).not.toContain("November -1");
+    }
+  });
+
   it.each([
     [1, "Every minute"],
     [10, "Every 10 minutes"],
@@ -213,6 +246,25 @@ describe("describeSchedule", () => {
     "FREQ=MINUTELY;INTERVAL=60;BYMONTH=3",
     "FREQ=MINUTELY;INTERVAL=10;BYSECOND=30",
   ])("preserves filters the library omits from minute summaries: %s", (rule) => {
+    expect(describeSchedule(rule)).toBe(rule);
+  });
+
+  it.each([
+    "FREQ=HOURLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9,10,11,12,13,14,15,16,17;BYMINUTE=0",
+    "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9,10,11,12,13,14,15,16,17;BYMINUTE=0",
+    "FREQ=DAILY;BYHOUR=9;BYMINUTE=0,30",
+    "FREQ=DAILY;BYDAY=MO;BYHOUR=9;BYMINUTE=0",
+    "FREQ=MONTHLY;BYDAY=1MO;BYHOUR=9;BYMINUTE=0",
+    "FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1;BYHOUR=9;BYMINUTE=0",
+    "FREQ=MONTHLY;BYMONTHDAY=-1;BYHOUR=9;BYMINUTE=0",
+    "FREQ=MONTHLY;BYMONTH=1,4,7,10;BYMONTHDAY=1;BYHOUR=9;BYMINUTE=0",
+    "FREQ=YEARLY;BYMONTHDAY=1;BYHOUR=9;BYMINUTE=0",
+    "FREQ=YEARLY;BYMONTH=1,13;BYMONTHDAY=1;BYHOUR=9;BYMINUTE=0",
+    "FREQ=YEARLY;BYWEEKNO=1;BYDAY=MO;BYHOUR=9;BYMINUTE=0",
+    "FREQ=YEARLY;BYEASTER=0;BYHOUR=9;BYMINUTE=0",
+    "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;BYSECOND=30",
+    "FREQ=WEEKLY;INTERVAL=2;WKST=SU;BYDAY=SU,MO;BYHOUR=9;BYMINUTE=0",
+  ])("shows a rule its phrases can't state exactly as written: %s", (rule) => {
     expect(describeSchedule(rule)).toBe(rule);
   });
 

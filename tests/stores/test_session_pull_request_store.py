@@ -63,16 +63,34 @@ def _stored_document(db_uri: str, session: str = SESSION) -> bytes | None:
 
 
 @pytest.fixture()
-def conversations(db_uri: str) -> SqlAlchemyConversationStore:
-    conversations = SqlAlchemyConversationStore(db_uri)
+def conversation_db_uri(request: pytest.FixtureRequest, tmp_path) -> str | None:
+    """The conversation database; ``separate`` keeps it apart from the PR database."""
+    if getattr(request, "param", "shared") == "shared":
+        return None
+    return f"sqlite:///{tmp_path / 'conversations.db'}"
+
+
+# Run labels live in the conversation database, which deployments may keep separate.
+conversation_databases = pytest.mark.parametrize(
+    "conversation_db_uri", ["shared", "separate"], indirect=True
+)
+
+
+@pytest.fixture()
+def conversations(db_uri: str, conversation_db_uri: str | None) -> SqlAlchemyConversationStore:
+    conversations = SqlAlchemyConversationStore(
+        db_uri, conversation_storage_location=conversation_db_uri
+    )
     for session in (SESSION, OTHER):
         conversations.create_conversation(conversation_id=session)
     return conversations
 
 
 @pytest.fixture()
-def store(db_uri: str, conversations: SqlAlchemyConversationStore) -> SessionPullRequestStore:
-    return SessionPullRequestStore(db_uri)
+def store(
+    db_uri: str, conversation_db_uri: str | None, conversations: SqlAlchemyConversationStore
+) -> SessionPullRequestStore:
+    return SessionPullRequestStore(db_uri, conversation_db_uri)
 
 
 def _forbid_writes(store: SessionPullRequestStore, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -329,3 +347,121 @@ async def test_deleting_the_session_drops_its_pull_requests(
     assert await conversations.delete_conversation(SESSION)
     assert store.read(SESSION) is None
     assert _urls(store, OTHER) == [A]
+
+
+def test_one_report_stores_every_fetched_state_each_ordered_on_its_own(
+    store: SessionPullRequestStore,
+) -> None:
+    """A title refresh's states land together, each ordered against its own PR's fetches."""
+    store.apply_report(SESSION, [_report(A), _report(B)])
+    store.apply_report(SESSION, [], fetched=[_fetch(A, "MERGED")], requested_at=2_000.0)
+    store.apply_report(
+        SESSION,
+        [],
+        fetched=[_fetch(A, "OPEN"), _fetch(B, "CLOSED", title="Abandoned")],
+        requested_at=1_000.0,
+    )
+    stored = store.read(SESSION)
+    assert stored is not None
+    states = {entry.url: (entry.state, entry.state_checked_at) for entry in stored.entries}
+    assert states == {A: ("MERGED", 2_000.0), B: ("CLOSED", 1_000.0)}
+    assert stored.get(B).title == "Abandoned"  # type: ignore[union-attr]
+
+
+def test_read_many_reads_each_session_in_one_query(
+    store: SessionPullRequestStore, db_uri: str
+) -> None:
+    from omnigent.db.utils import get_or_create_engine
+
+    store.apply_report(SESSION, [_report(A)], fetched=_fetch(A), requested_at=1_000.0)
+    store.apply_report(OTHER, [_report(B)], complete=True)
+    statements: list[str] = []
+
+    def record(_conn: object, _cursor: object, statement: str, *_args: object) -> None:
+        statements.append(statement)
+
+    engine = get_or_create_engine(db_uri)
+    sa.event.listen(engine, "before_cursor_execute", record)
+    try:
+        read = store.read_many([SESSION, OTHER, MISSING, SESSION])
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", record)
+    assert len([s for s in statements if s.lstrip().upper().startswith("SELECT")]) == 1
+    assert set(read) == {SESSION, OTHER}
+    assert [entry.url for entry in read[SESSION].entries] == [A]
+    assert read[SESSION].entries[0].state == "OPEN"
+    assert (read[OTHER].synced, read[SESSION].synced) == (True, False)
+    assert store.read_many([]) == {}
+
+
+@conversation_databases
+def test_a_pr_keeps_the_run_its_session_served_when_the_server_first_stored_it(
+    store: SessionPullRequestStore, conversations: SqlAlchemyConversationStore
+) -> None:
+    """The run label at first sight sticks; later runs, chat and user links add none."""
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
+
+    C = "https://github.com/example/three/pull/3"
+    D = "https://github.com/example/four/pull/4"
+    first_run, second_run = "a" * 32, "b" * 32
+    conversations.set_labels(SESSION, {SCHEDULED_TASK_RUN_LABEL_KEY: first_run})
+    store.apply_report(SESSION, [_report(A)])
+    conversations.set_labels(SESSION, {SCHEDULED_TASK_RUN_LABEL_KEY: second_run})
+    store.apply_report(SESSION, [_report(A, relationship="created"), _report(B)])
+    # The user writing to the session ends the run's turn.
+    assert conversations.clear_scheduled_run_label(SESSION, second_run)
+    store.apply_report(SESSION, [_report(C)])
+    conversations.set_labels(SESSION, {SCHEDULED_TASK_RUN_LABEL_KEY: first_run})
+    store.attach(SESSION, _report(D))
+    stored = store.read(SESSION)
+    assert stored is not None
+    assert {entry.url: (entry.run_id, entry.run_recorded) for entry in stored.entries} == {
+        A: (first_run, True),
+        B: (second_run, True),
+        # First seen outside any run, unlike a PR the user linked.
+        C: (None, True),
+        D: (None, False),
+    }
+    # Another session's run doesn't leak in.
+    store.apply_report(OTHER, [_report(A)])
+    assert store.read(OTHER).entries[0].run_id is None  # type: ignore[union-attr]
+
+
+@conversation_databases
+def test_a_persons_message_ends_the_runs_pr_attribution_until_another_run(
+    store: SessionPullRequestStore, conversations: SqlAlchemyConversationStore
+) -> None:
+    """For a session the automation created, whose run label stays for its journal."""
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
+
+    C = "https://github.com/example/three/pull/3"
+    run, next_run = "a" * 32, "b" * 32
+    conversations.update_scheduled_run_label(SESSION, run, action="begin")
+    store.apply_report(SESSION, [_report(A)])
+    # A prompt still being dispatched keeps its run until the run finishes.
+    assert not store.end_run_turn(SESSION, run)
+    assert store.end_run_turn(SESSION, run, run_finished=True)
+    store.apply_report(SESSION, [_report(B)])
+    conversations.set_labels(SESSION, {SCHEDULED_TASK_RUN_LABEL_KEY: next_run})
+    store.apply_report(SESSION, [_report(C)])
+    stored = store.read(SESSION)
+    assert stored is not None
+    assert {entry.url: entry.run_id for entry in stored.entries} == {A: run, B: None, C: next_run}
+
+
+@conversation_databases
+def test_initial_run_ids_read_only_the_sessions_a_run_created(
+    store: SessionPullRequestStore, conversations: SqlAlchemyConversationStore
+) -> None:
+    from omnigent.stores.conversation_store import (
+        SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
+        SCHEDULED_TASK_RUN_LABEL_KEY,
+    )
+
+    conversations.set_labels(
+        SESSION,
+        {SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY: "a" * 32, SCHEDULED_TASK_RUN_LABEL_KEY: "b" * 32},
+    )
+    conversations.set_labels(OTHER, {SCHEDULED_TASK_RUN_LABEL_KEY: "c" * 32})
+    assert store.initial_run_ids([SESSION, OTHER, MISSING]) == {SESSION: "a" * 32}
+    assert store.initial_run_ids([]) == {}

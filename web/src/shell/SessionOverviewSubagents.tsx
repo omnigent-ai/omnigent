@@ -1,9 +1,8 @@
 // WIP(session_overview): Codex and SDK sub-agents carry their own priced usage;
-// Claude sub-agents have no cost here yet.
+// Claude sub-agents show their Claude session's transcript estimate.
 
-import { useAgentCosts } from "@/hooks/useAgentCosts";
+import { agentCostLabel, useAgentCosts } from "@/hooks/useAgentCosts";
 import { useChildSessions } from "@/hooks/useChildSessions";
-import { formatSessionCostUsd } from "@/lib/formatCost";
 import { useChatStore } from "@/store/chatStore";
 import { childPrimaryLabel } from "./subagentLabel";
 
@@ -33,9 +32,7 @@ export function SessionOverviewSubagents() {
                   {childPrimaryLabel(child)}
                 </span>
                 {/* An unknown cost, including after a failed read, shows nothing. */}
-                <span className="shrink-0 font-mono tabular-nums">
-                  {typeof cost === "number" && formatSessionCostUsd(cost)}
-                </span>
+                <span className="shrink-0 font-mono tabular-nums">{agentCostLabel(cost)}</span>
               </li>
             );
           })}

@@ -29,7 +29,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from starlette.types import Receive, Scope, Send
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from omnigent.debug_logging import StageTimings, debug_event
 from omnigent.entities import (
@@ -175,7 +175,7 @@ class _RunnerStreamResponse(StreamingResponse):
     """
 
     def __init__(self, upstream: httpx.Response, *, headers: Mapping[str, str]) -> None:
-        super().__init__(upstream.aiter_raw(), headers=headers)
+        super().__init__(upstream.aiter_raw(), status_code=upstream.status_code, headers=headers)
         self._upstream = upstream
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -244,11 +244,12 @@ def _unsupported_attachment_detail(content_type: str, policy: FilesystemAttachme
     )
     if policy == DEFAULT_FILESYSTEM_ATTACHMENT_POLICY:
         return (
-            f"{detail}, or use Claude Code or Codex for archives, Office documents, and databases."
+            f"{detail}, or use a supported native coding agent for archives, "
+            "Office documents, databases, and MP4 videos."
         )
     if policy.extensions:
         extensions = ", ".join(sorted(policy.extensions))
-        return f"{detail}, or use Claude Code or Codex for {extensions} files."
+        return f"{detail}, or use a supported native coding agent for {extensions} files."
     return f"{detail}."
 
 
@@ -470,7 +471,7 @@ def register_resources_routes(
         file is. There is no host fallback: the host tunnel's filesystem
         op answers in a single message, so it cannot stream a file.
 
-        :param request: The incoming request, for the gzip opt-out.
+        :param request: The incoming request, including any media byte range.
         :param session_id: Session/conversation identifier.
         :param conversation: Conversation loaded during authorization.
         :param runner_path: Runner-relative URL carrying ``download=true``.
@@ -512,7 +513,16 @@ def register_resources_routes(
             )
         try:
             resp = await runner_client.send(
-                runner_client.build_request("GET", runner_path, timeout=_download_timeout),
+                runner_client.build_request(
+                    "GET",
+                    runner_path,
+                    headers={
+                        name: request.headers[name]
+                        for name in ("range", "if-range")
+                        if name in request.headers
+                    },
+                    timeout=_download_timeout,
+                ),
                 stream=True,
             )
         except (httpx.HTTPError, ConnectionError) as exc:
@@ -520,7 +530,9 @@ def register_resources_routes(
                 status_code=502,
                 detail="runner download endpoint unavailable",
             ) from exc
-        if resp.status_code == 200 and "content-disposition" in resp.headers:
+        if (resp.status_code in (200, 206) and "content-disposition" in resp.headers) or (
+            resp.status_code == 416 and "content-range" in resp.headers
+        ):
             skip_gzip(request)
             forwarded = {
                 name: resp.headers[name]
@@ -529,6 +541,8 @@ def register_resources_routes(
                     "content-length",
                     "content-encoding",
                     "content-disposition",
+                    "accept-ranges",
+                    "content-range",
                     "cache-control",
                     "x-content-type-options",
                 )
@@ -2811,6 +2825,61 @@ def register_resources_routes(
             "expires_at": expires_at,
         }
 
+    @router.post("/sessions/{session_id}/workspace/{service}/{method}", response_model=None)
+    async def call_workspace_api(
+        request: Request, session_id: str, service: str, method: str
+    ) -> Response:
+        """Serve the workspace API to any client, answered by the session's host.
+
+        Same read gate as the file routes; the API never takes absolute paths.
+        Side chats and sub-agents use the host and workspace of the session that
+        owns them. Unconfined sessions only, because the host applies no sandbox's
+        hidden paths. A host on another replica gets the REST wrong-replica error,
+        so the client's fetch re-addresses it; other refusals are Connect errors.
+        """
+        flags = getattr(request.app.state, "feature_flags", FeatureFlags())
+        if not flags.enabled(Feature.WORKSPACE_API_SERVER_ACCESS):
+            raise HTTPException(status_code=404, detail="The workspace API is disabled")
+        try:
+            from connectrpc.code import Code
+        except ImportError:
+            raise HTTPException(
+                status_code=501, detail="The workspace API needs `omnigent[workspace-api]`"
+            ) from None
+        from connectrpc.errors import ConnectError
+
+        from omnigent.api.workspace.v1alpha1.workspace_connect import (
+            WorkspaceServiceASGIApplication,
+        )
+        from omnigent.host.frames import CAP_WORKSPACE_API
+        from omnigent.server.workspace_api import (
+            ConnectCallResponse,
+            HostTarget,
+            HostWorkspaceService,
+        )
+
+        conv = await _authorize_browse_read(session_id, request)
+        _host_id, host, workspace = await _session_host(conv, request)
+        # The session's own spec decides confinement, even on an inherited host.
+        reach = await _environment_reach_for_session(conv, workspace) if host is not None else None
+        target: HostTarget | ConnectError
+        if host is None or host_registry is None:
+            target = ConnectError(Code.UNAVAILABLE, "The session's host is not connected")
+        elif CAP_WORKSPACE_API not in host.hello.capabilities:
+            target = ConnectError(Code.UNIMPLEMENTED, "The session's host needs an update")
+        elif reach is None or not reach[1]:
+            target = ConnectError(
+                Code.FAILED_PRECONDITION, "The workspace API serves unconfined sessions only"
+            )
+        else:
+            target = HostTarget(host_registry, host, reach[2])
+        forwarder = HostWorkspaceService(
+            target, content_search=flags.enabled(Feature.WORKSPACE_CONTENT_SEARCH)
+        )
+        app = WorkspaceServiceASGIApplication(forwarder)
+        # connectrpc types ASGI with asgiref's TypedDicts; Starlette's are plain mappings.
+        return ConnectCallResponse(cast("ASGIApp", app), f"/{service}/{method}")
+
     @router.get(
         "/sessions/{session_id}/resources/environments/{environment_id}/search",
         response_model=None,
@@ -3276,7 +3345,7 @@ def register_resources_routes(
                 f"/{_runner_environment_segment(environment_id)}/filesystem/{runner_rel}?"
                 + urllib.parse.urlencode({"download": "true", **scope_params}),
             )
-            if scope == "workspace" and download_response.status_code == 200:
+            if scope == "workspace" and download_response.status_code in (200, 206):
                 download_response.headers.update(_WORKSPACE_FILE_SCOPE_HEADERS)
             return download_response
         path = (

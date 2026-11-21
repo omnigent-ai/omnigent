@@ -198,6 +198,48 @@ describe("useIdleNotifications turn-end transitions", () => {
     });
   });
 
+  it.each([false, true])(
+    "stays silent when the session is muted while its preview loads, then removed=%s",
+    async (removed) => {
+      let resolvePreview: (text: string) => void = () => {};
+      fetchPreviewMock.mockReturnValue(
+        new Promise<string>((resolve) => {
+          resolvePreview = resolve;
+        }),
+      );
+      setConversations([conv("a", "running")]);
+      const { rerender } = renderHook(() => useIdleNotifications());
+      setConversations([conv("a", "idle")]);
+      rerender();
+      await settle();
+      expect(fetchPreviewMock).toHaveBeenCalledWith("a");
+
+      setConversations([{ ...conv("a", "idle"), labels: { "omnigent.muted": "1" } }]);
+      rerender();
+      // Archiving (or any other removal) must not lose the observed mute.
+      if (removed) {
+        setConversations([]);
+        rerender();
+      }
+      await act(async () => {
+        resolvePreview("Fixed the badge bug and shipped it.");
+        await Promise.resolve();
+      });
+
+      expect(showMock).not.toHaveBeenCalled();
+
+      // Unmuting permits the next completion without opening the session.
+      fetchPreviewMock.mockResolvedValue("Another turn finished.");
+      setConversations([conv("a", "running")]);
+      rerender();
+      setConversations([conv("a", "idle")]);
+      rerender();
+      await settle();
+      expect(showMock).toHaveBeenCalledOnce();
+      expect(showMock.mock.calls[0][0].body).toBe("Another turn finished.");
+    },
+  );
+
   it("navigates to the conversation when the notification is clicked", async () => {
     setConversations([conv("a", "running")]);
     const { rerender } = renderHook(() => useIdleNotifications());

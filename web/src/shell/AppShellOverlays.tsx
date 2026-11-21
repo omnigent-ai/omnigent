@@ -1,5 +1,4 @@
 import { lazy, Suspense } from "react";
-import { ArcaShutdownToast } from "@/components/ArcaShutdownToast";
 import { KeyboardShortcutsDialog } from "@/components/KeyboardShortcutsDialog";
 import { ImportReviewGate } from "@/components/onboarding/HostImportReview";
 import { Toaster } from "@/components/ui/sonner";
@@ -8,6 +7,7 @@ import { isFeatureEnabled, type ServerInfo } from "@/lib/capabilities";
 import { isElectronShell } from "@/lib/nativeBridge";
 import { updateOverlayToastOffset } from "@/lib/updateOverlayInset";
 import { CommandPalette } from "./CommandPalette";
+import { QuickPickCommandPalette } from "./QuickPickCommandPalette";
 import { RecentSessionsSwitcher } from "./RecentSessionsSwitcher";
 
 // Dev-only preview; lazy so the sample data never ships in production bundles.
@@ -47,6 +47,10 @@ export function AppShellOverlays({
   serverConversationId,
   updateOverlayHeight,
 }: AppShellOverlaysProps) {
+  // Both palettes take the same props; the flag picks one for ⌘K and the session switcher.
+  const Palette = isFeatureEnabled(serverInfo, "quick_pick_palette")
+    ? QuickPickCommandPalette
+    : CommandPalette;
   return (
     <>
       {/* Keyboard-shortcuts reference. Self-contained (owns its open state +
@@ -54,8 +58,6 @@ export function AppShellOverlays({
       <KeyboardShortcutsDialog />
       {/* Opens the import modal once per newly connected host. */}
       {!isEmbedded && <ImportReviewGate />}
-      {/* Keep this after Outlet so a visible chat banner wins before the toast effect runs. */}
-      {isFeatureEnabled(serverInfo, "arca_shutdown_warnings") && <ArcaShutdownToast />}
       {/* Dev-only `?import-preview` for the post-setup import modal. */}
       {ImportContextPreview && (
         <Suspense fallback={null}>
@@ -66,7 +68,7 @@ export function AppShellOverlays({
           and in embedded mode — the sidebar's "Search" button opens it
           there even though the ⌘K hotkey is disabled (it belongs to the
           host page). */}
-      <CommandPalette
+      <Palette
         key={sessionSearch ? "sessions" : "commands"}
         sessionsOnly={sessionSearch}
         open={commandPaletteOpen}

@@ -1511,6 +1511,59 @@ def _apply_bind_auth_defaults(host: str) -> None:
             click.echo(f"  ⚠ {_exposure}", err=True)
 
 
+def _create_memory_store(backend: str | None, db_uri: str, memory_config: object) -> Any:  # type: ignore[explicit-any]  # returns MemoryStore (optional deps)
+    """
+    Create the long-term memory backend.
+
+    The ``--memory-backend`` flag wins over ``memory.backend`` in the config file;
+    the default is :class:`SqlAlchemyMemoryStore` on *db_uri*. The Hindsight
+    credential is a secret *reference* (``env:`` or ``keychain:``) resolved here on
+    the server, never read from agent specs or sent to a sandbox::
+
+        memory:
+          backend: hindsight
+          hindsight:
+            api_url: https://api.hindsight.vectorize.io   # optional
+            api_key: env:HINDSIGHT_API_KEY
+
+    :param backend: ``"sqlalchemy"``, ``"hindsight"`` or ``None`` for the config file's choice.
+    :param db_uri: The server database, used by the SQLAlchemy backend.
+    :param memory_config: The config file's ``memory`` block, or ``None``.
+    :returns: A :class:`omnigent.stores.memory_store.MemoryStore`.
+    :raises click.ClickException: On an unknown backend or an incomplete Hindsight config.
+    """
+    config = memory_config if isinstance(memory_config, dict) else {}
+    chosen = backend or config.get("backend") or "sqlalchemy"
+    if chosen == "sqlalchemy":
+        from omnigent.stores.memory_store.sqlalchemy_store import SqlAlchemyMemoryStore
+
+        return SqlAlchemyMemoryStore(db_uri)
+    if chosen != "hindsight":
+        raise click.ClickException(
+            f"Unknown memory backend {chosen!r}; expected 'sqlalchemy' or 'hindsight'."
+        )
+    hindsight_config = config.get("hindsight")
+    hindsight_config = hindsight_config if isinstance(hindsight_config, dict) else {}
+    key_ref = hindsight_config.get("api_key")
+    if not isinstance(key_ref, str) or not key_ref:
+        raise click.ClickException(
+            "The hindsight memory backend needs memory.hindsight.api_key in the config "
+            "file, as a secret reference such as 'env:HINDSIGHT_API_KEY'."
+        )
+    from omnigent.errors import OmnigentError
+    from omnigent.onboarding.provider_config import resolve_secret
+    from omnigent.stores.memory_store.hindsight_store import (
+        HindsightMemoryStore,
+        create_hindsight_client,
+    )
+
+    try:
+        client = create_hindsight_client(hindsight_config.get("api_url"), resolve_secret(key_ref))
+    except OmnigentError as exc:
+        raise click.ClickException(str(exc)) from exc
+    return HindsightMemoryStore(client)
+
+
 def _create_artifact_store(location: str) -> Any:  # type: ignore[explicit-any]  # returns ArtifactStore protocol (optional deps)
     """
     Create an artifact store based on the location URI scheme.
@@ -4631,6 +4684,14 @@ def _bind_server_listener(host: str, port: int) -> Iterator[socket.socket]:
     help="Path for artifact storage.  [default: <data-dir>/artifacts]",
 )
 @click.option(
+    "--memory-backend",
+    type=click.Choice(["sqlalchemy", "hindsight"]),
+    default=None,
+    help="Long-term memory backend.  sqlalchemy stores memory in --database-uri; "
+    "hindsight needs `omnigent[hindsight]` and a `memory.hindsight` config block.  "
+    "[default: sqlalchemy]",
+)
+@click.option(
     "--config",
     "-c",
     "config_path",
@@ -4707,6 +4768,7 @@ def server(
     database_uri: str | None,
     conversation_database_uri: str | None,
     artifact_location: str | None,
+    memory_backend: str | None,
     config_path: str | None,
     execution_timeout: int | None,
     agent_dirs: tuple[str, ...],
@@ -4759,6 +4821,10 @@ def server(
         # below is the server path for the bare ``server`` group.
         return
 
+    # Socket binds use bare IPv6 addresses; URLs use brackets.
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+
     # --base-path is sugar for OMNIGENT_WEB_BASE_PATH, which create_app reads.
     # An env var (not a create_app kwarg) so the same toggle reaches every
     # startup path (Docker entrypoint, canonical local server, e2e harness)
@@ -4770,6 +4836,13 @@ def server(
         os.environ["OMNIGENT_WEB_BASE_PATH"] = base_path
 
     if background:
+        if memory_backend is not None:
+            # The detached server is spawned without this command's options; it
+            # reads memory.backend from the global config instead.
+            raise click.UsageError(
+                "--memory-backend can't be combined with --background: set memory.backend "
+                f"in {_display_path(_effective_global_config_path())} instead."
+            )
         # `omnigent server --background` is the canonical spelling for the
         # detached server; the deprecated ``server start`` alias routes to the
         # same helper so both spellings can never drift.
@@ -4868,7 +4941,9 @@ def server(
         SqlAlchemyConversationStore,
     )
     from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.inbox_item_store.sqlalchemy_store import SqlAlchemyInboxItemStore
     from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
+    from omnigent.stores.proactive_agent_settings_store import ProactiveAgentSettingsStore
     from omnigent.util.tunnel_limits import uvicorn_tunnel_kwargs
 
     cfg = _load_config(config_path)
@@ -4927,10 +5002,13 @@ def server(
     file_store = SqlAlchemyFileStore(db_uri)
     conversation_store = SqlAlchemyConversationStore(db_uri, conv_db_uri)
     comment_store = SqlAlchemyCommentStore(db_uri)
+    inbox_item_store = SqlAlchemyInboxItemStore(db_uri)
+    proactive_agent_settings_store = ProactiveAgentSettingsStore(db_uri)
     policy_store = SqlAlchemyPolicyStore(db_uri)
     permission_store = SqlAlchemyPermissionStore(db_uri)
     scheduled_task_store = SqlAlchemyScheduledTaskStore(db_uri)
     project_store = SqlAlchemyProjectStore(db_uri)
+    memory_store = _create_memory_store(memory_backend, db_uri, cfg.get("memory"))
     preference_store = None
     if authority_id is not None:
         from omnigent.stores.preference_store.sqlalchemy_store import SqlAlchemyPreferenceStore
@@ -5073,19 +5151,9 @@ def server(
 
             databricks_store = DatabricksConnectionStore(db_uri, dbx_cipher)
 
-    from omnigent.server.mcp_registry import McpRegistry, McpRegistryConfig
+    from omnigent.server.mcp_registry import build_mcp_registry_from_env
 
-    mcp_registry = None
-    registry_config = McpRegistryConfig.from_env()
-    if registry_config is not None:
-        from omnigent.stores.credential_store import build_secret_cipher
-        from omnigent.stores.credential_store.sqlalchemy_store import CredentialStore
-
-        registry_cipher = build_secret_cipher()
-        mcp_registry = McpRegistry(
-            registry_config,
-            CredentialStore(db_uri, registry_cipher) if registry_cipher else None,
-        )
+    mcp_registry = build_mcp_registry_from_env(db_uri)
 
     # Accounts mode ergonomics: when accounts mode is selected
     # (OMNIGENT_AUTH_ENABLED=1 without OIDC config, or an explicit
@@ -5111,7 +5179,11 @@ def server(
             "OMNIGENT_ACCOUNTS_COOKIE_SECRET",
             load_or_generate_cookie_secret(art_loc),
         )
-        os.environ.setdefault("OMNIGENT_ACCOUNTS_BASE_URL", f"http://{host}:{port}")
+        from omnigent.util.server_url import format_host_port
+
+        os.environ.setdefault(
+            "OMNIGENT_ACCOUNTS_BASE_URL", f"http://{format_host_port(host, port)}"
+        )
 
     auth_provider = create_auth_provider()
 
@@ -5135,10 +5207,13 @@ def server(
     )
 
     app = create_app(
+        host_session_recovery=True,
         agent_store=agent_store,
         file_store=file_store,
         conversation_store=conversation_store,
         comment_store=comment_store,
+        inbox_item_store=inbox_item_store,
+        proactive_agent_settings_store=proactive_agent_settings_store,
         policy_store=policy_store,
         artifact_store=artifact_store,
         agent_cache=agent_cache,
@@ -5149,6 +5224,7 @@ def server(
         scheduled_task_store=scheduled_task_store,
         project_store=project_store,
         preference_store=preference_store,
+        memory_store=memory_store,
         auth_provider=auth_provider,
         host_store=host_store,
         account_store=account_store,
@@ -6827,6 +6903,24 @@ def _expand_config_env_vars(  # type: ignore[explicit-any]  # raw is parsed YAML
         and cfg.executor.auth is not None
         and cfg.executor.auth.get("type") == "api_key"
     ):
+        from omnigent.errors import ErrorCode, OmnigentError
+        from omnigent.spec.parser import _api_key_source_env_names
+
+        raw_key = cfg.executor.auth.get("api_key")
+        if isinstance(raw_key, str):
+            source_names = _api_key_source_env_names(raw_key)
+            if source_names:
+                auth = raw["executor"]["auth"]
+                existing_names = auth.get("source_env_names", [])
+                if not isinstance(existing_names, list) or any(
+                    not isinstance(name, str) for name in existing_names
+                ):
+                    raise OmnigentError(
+                        "executor.auth.source_env_names must be a list of "
+                        "environment variable names",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                auth["source_env_names"] = sorted(set(existing_names).union(source_names))
         auth_secrets = {
             k: str(cfg.executor.auth[k])
             for k in ("api_key", "base_url")
@@ -9565,11 +9659,17 @@ def _registration_target_display(record: _HostDaemonRecord) -> str:
     return urlunsplit((parts.scheme, netloc, parts.path, parts.query, ""))
 
 
+class _HostRegistrationPending(click.ClickException):
+    """The server answered but the daemon has not registered yet; it may still
+    come online (e.g. a slow tunnel handshake), so callers leave it running."""
+
+
 def _background_registration_timeout(
     record: _HostDaemonRecord,
     *,
     server_responded: bool,
     transport_error: str | None,
+    stop_command: str,
 ) -> click.ClickException:
     """Build the error for a registration wait that exhausted its grace.
 
@@ -9577,11 +9677,13 @@ def _background_registration_timeout(
     :param server_responded: Whether any status probe got an HTTP answer.
     :param transport_error: Last probe transport failure, e.g.
         ``"ConnectError: [Errno 111] Connection refused"``.
+    :param stop_command: Command that stops the daemon, e.g.
+        ``"omnigent stop"``.
     :returns: The exception to raise — an unreachable server is named
-        together with its transport failure instead of the generic
-        registration-timeout wording.
+        together with its transport failure; a server that answered gets a
+        :class:`_HostRegistrationPending` naming the still-running daemon.
     """
-    from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR
+    from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR, redact_secrets
 
     target = _registration_target_display(record)
     log_detail = _background_host_log_detail(record.log_path)
@@ -9596,22 +9698,41 @@ def _background_registration_timeout(
         # tunnel rejection, so the recovery hint would mislead here.
         setattr(exc, SUPPRESS_RECOVERY_HINT_ATTR, True)
         return exc
-    return click.ClickException(
+    timeout_message = (
         "The host daemon started but did not register with the server at "
         f"{target} within {_BACKGROUND_HOST_REGISTRATION_GRACE_S:.0f}s."
-        f"{log_detail}"
+    )
+    if not server_responded:
+        return click.ClickException(f"{timeout_message}{log_detail}")
+    redacted_stop_command = redact_secrets(stop_command)
+    redaction_hint = (
+        " Replace [REDACTED] with your configured server credentials before running "
+        "the stop command."
+        if redacted_stop_command != stop_command
+        else ""
+    )
+    return _HostRegistrationPending(
+        f"{timeout_message} It is still running (pid {record.pid}) and may "
+        f"still register. Check it with `{cli_invocation()} host status`, or "
+        f"stop it with `{redacted_stop_command}`.{redaction_hint}{log_detail}"
     )
 
 
 def _confirm_background_host_registered(
-    record: _HostDaemonRecord, *, also_via: _HostDaemonRecord | None = None
+    record: _HostDaemonRecord,
+    *,
+    stop_command: str,
+    also_via: _HostDaemonRecord | None = None,
 ) -> None:
     """Wait until the detached daemon completes server registration.
 
     :param record: Daemon record whose registration to wait for.
+    :param stop_command: Stop command named in the timeout error.
     :param also_via: The same daemon probed through another URL for its
         workspace, e.g. from :func:`_record_probed_through`; either URL
         reporting it online confirms registration.
+    :raises click.ClickException: If the daemon exits or the grace expires
+        (:class:`_HostRegistrationPending` when it may still register).
     """
     deadline = time.monotonic() + _BACKGROUND_HOST_REGISTRATION_GRACE_S
     announced = False
@@ -9623,6 +9744,15 @@ def _confirm_background_host_registered(
             raise click.ClickException(
                 "The host daemon exited before registering with the server."
                 f"{_background_host_log_detail(record.log_path)}"
+            )
+        # Checked after the liveness check so a daemon that died during the
+        # last probe is reported as exited, not as still retrying.
+        if announced and time.monotonic() >= deadline:
+            raise _background_registration_timeout(
+                record,
+                server_responded=server_responded,
+                transport_error=last_transport_error,
+                stop_command=stop_command,
             )
         results = [_daemon_host_status_probe(probe, timeout_s=1.0) for probe in probes]
         for result in results:
@@ -9644,12 +9774,6 @@ def _confirm_background_host_registered(
                 err=True,
             )
             announced = True
-        if time.monotonic() >= deadline:
-            raise _background_registration_timeout(
-                record,
-                server_responded=server_responded,
-                transport_error=last_transport_error,
-            )
         time.sleep(0.2)
 
 
@@ -9725,7 +9849,8 @@ def _run_background_host(
         app instead of a browser.
     :raises click.ClickException: If the daemon cannot be spawned, exits
         immediately, fails to register, or (local mode) never serves its local
-        Omnigent server.
+        Omnigent server. A daemon that is still retrying registration when the
+        wait expires is left running.
     """
     if server:
         _ensure_databricks_server_auth(server, non_interactive=non_interactive)
@@ -9744,7 +9869,7 @@ def _run_background_host(
             if local_record is not None:
                 from omnigent.util.server_url import display_server_url
 
-                _confirm_background_host_registered(local_record)
+                _confirm_background_host_registered(local_record, stop_command=stop_command)
                 click.echo(f"The local host daemon already serves {display_server_url(target)}.")
                 return
         raise click.ClickException(
@@ -9767,9 +9892,9 @@ def _run_background_host(
         also_via = None
         if same_workspace is not None and _normalize_daemon_target(record.target) != target:
             also_via = _record_probed_through(record, target)
-        _confirm_background_host_registered(record, also_via=also_via)
-    except click.ClickException:
-        if not reused:
+        _confirm_background_host_registered(record, stop_command=stop_command, also_via=also_via)
+    except click.ClickException as exc:
+        if not reused and not isinstance(exc, _HostRegistrationPending):
             with contextlib.suppress(click.ClickException):
                 _record_daemon_stop_requested(record, reason="background_start_failed", force=True)
                 _terminate_daemon(record, force=True)

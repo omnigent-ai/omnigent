@@ -15,6 +15,7 @@ from typing import Any, ClassVar
 import click
 import httpx
 import yaml
+from asgiref.testing import ApplicationCommunicator
 from fastapi import FastAPI
 
 from omnigent.host.frames import HostFrame, decode_host_frame
@@ -25,9 +26,11 @@ from omnigent.onboarding.sandboxes import (
 )
 from omnigent.onboarding.sandboxes.types import SandboxCapabilities
 from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
+from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.runtime import session_stream
-from omnigent.server.host_registry import HostConnection
+from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.smart_routing import RoutingResult, RoutingSettings
+from tests._helpers.polling import poll_until_async
 from tests.budgets import budget
 
 # Sentinel ready event so a stream collector's registration is a
@@ -35,6 +38,30 @@ from tests.budgets import budget
 # sleep-and-hope. Never validated at the SSE wire (the collector
 # subscribes to the in-process pub/sub directly).
 _COLLECTOR_READY = {"type": "_collector_ready"}
+
+
+async def wait_for_tunnel_registration(
+    communicator: ApplicationCommunicator,
+    registry: HostRegistry | TunnelRegistry,
+    peer_id: str,
+) -> None:
+    """Wait for durable registration, surfacing a failed or closed ASGI task."""
+    try:
+        # Registration includes off-thread database work; use the shared setup polling budget.
+        await poll_until_async(
+            lambda: communicator.future.done() or registry.get(peer_id) is not None,
+            timeout_s=budget(15.0),
+            interval_s=0.01,
+        )
+    except AssertionError as exc:
+        stack = io.StringIO()
+        communicator.future.print_stack(file=stack)
+        raise AssertionError(
+            f"Tunnel {peer_id} did not register; ASGI task:\n{stack.getvalue()}"
+        ) from exc
+    if communicator.future.done():
+        communicator.future.result()
+        raise AssertionError(f"Tunnel {peer_id} closed before registration")
 
 
 @dataclass
@@ -822,6 +849,7 @@ def build_agent_bundle(
     guardrails: dict[str, Any] | None = None,
     terminals: dict[str, Any] | None = None,
     include_llm: bool = True,
+    tool_groups: dict[str, bool] | None = None,
     os_env: dict[str, Any] | None = None,
 ) -> bytes:
     """
@@ -862,6 +890,8 @@ def build_agent_bundle(
     :param os_env: Optional explicit OS environment for the root agent.
     :param include_llm: Whether to include the default ``llm:`` block.
         Set ``False`` for model-less harness tests.
+    :param tool_groups: Optional ``tool_groups:`` block written verbatim,
+        e.g. ``{"user_inbox": True}``. ``None`` omits it.
     :returns: A gzipped tar archive containing the generated
         ``config.yaml`` plus optional sub-agent and skill files.
     """
@@ -887,6 +917,8 @@ def build_agent_bundle(
         config["os_env"] = os_env
     if terminals is not None:
         config["terminals"] = terminals
+    if tool_groups is not None:
+        config["tool_groups"] = tool_groups
     if executor is not None:
         config["executor"] = dict(executor)
         config["executor"].setdefault("config", {}).setdefault("harness", "claude-sdk")

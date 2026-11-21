@@ -300,6 +300,8 @@ describe("chromeCookieStore — system binaries", () => {
         return true;
       },
     );
+    // Only a missing column may fall back to an older column set.
+    assert.deepEqual(calls, ["/usr/bin/sqlite3"]);
     calls.length = 0;
     const password = await store.readSafeStoragePassword({
       run: async (command) => {
@@ -543,9 +545,9 @@ describe("chromeCookieStore — sqlite3 reader", { skip: !hasSqlite3 }, () => {
         is_persistent INTEGER NOT NULL DEFAULT 1, top_frame_site_key TEXT NOT NULL DEFAULT ''
       );`,
       ...entries.map(
-        ([hostKey, name, partitionKey]) =>
-          `INSERT INTO cookies (host_key, name, path, top_frame_site_key)
-            VALUES ('${hostKey}', '${name}', '/', '${partitionKey ?? ""}');`,
+        ([hostKey, name, partitionKey, expiresUtc, value]) =>
+          `INSERT INTO cookies (host_key, name, path, top_frame_site_key, expires_utc, value)
+            VALUES ('${hostKey}', '${name}', '/', '${partitionKey ?? ""}', ${expiresUtc ?? 0}, '${value ?? ""}');`,
       ),
     ];
     execFileSync("sqlite3", [databasePath], { input: statements.join("\n") });
@@ -844,6 +846,165 @@ describe("chromeCookieStore — sqlite3 reader", { skip: !hasSqlite3 }, () => {
       });
       assert.equal(result.ok, false);
       assert.match(result.error, /wasn't found/);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("counts every website's importable cookies per profile for the preview", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-chrome-all-preview-"));
+    try {
+      for (const dir of ["Default", "Profile 2", "Profile 3", "Profile 4"]) {
+        fs.mkdirSync(path.join(root, dir));
+      }
+      makeScopeDb(path.join(root, "Default", "Cookies"), [
+        [".example.com", "shared"],
+        ["other.test", "session"],
+        // Left out, as in a site import: partitioned, and already expired.
+        ["other.test", "partitioned", "https://top.example"],
+        ["old.test", "expired", "", chromeExpiresUtc(1_600_000_000)],
+      ]);
+      // A legacy schema has no partition column; its cookies still count.
+      makeCookieDb(path.join(root, "Profile 2", "Cookies"), { legacyColumns: true });
+      // No cookies at all, and an unreadable database: neither is offered.
+      makeScopeDb(path.join(root, "Profile 3", "Cookies"), []);
+      fs.writeFileSync(path.join(root, "Profile 4", "Cookies"), "not a database");
+      fs.writeFileSync(
+        path.join(root, "Local State"),
+        JSON.stringify({
+          profile: {
+            last_used: "Profile 2",
+            info_cache: {
+              Default: { name: "Work" },
+              "Profile 2": { name: "Personal" },
+              "Profile 3": { name: "Empty" },
+              "Profile 4": { name: "Broken" },
+            },
+          },
+        }),
+      );
+      const preview = await store.previewAllSitesCookies({
+        rootDir: root,
+        nowMs: 1_700_000_000_000,
+      });
+      assert.deepEqual(preview, {
+        ok: true,
+        profiles: [
+          { id: "Profile 2", name: "Personal", cookieCount: 4 },
+          { id: "Default", name: "Work", cookieCount: 2 },
+        ],
+      });
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("imports every website's cookies and reports the same count as the preview", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-chrome-all-import-"));
+    try {
+      fs.mkdirSync(path.join(root, "Default"));
+      makeCookieDb(path.join(root, "Default", "Cookies"));
+      const preview = await store.previewAllSitesCookies({ rootDir: root });
+      const written = [];
+      const result = await store.importAllSitesCookies({
+        profileId: "Default",
+        cookiesApi: { set: async (cookie) => written.push(cookie) },
+        rootDir: root,
+        readPassword: async () => "test-password",
+      });
+      assert.deepEqual(result, {
+        ok: true,
+        scope: store.ALL_SITES_SCOPE,
+        profileId: "Default",
+        profileName: "Default",
+        found: 4,
+        imported: 4,
+        skipped: 0,
+        failed: 0,
+      });
+      assert.equal(preview.profiles[0].cookieCount, result.found);
+      // Unlike a site import, the unrelated site's cookie comes along.
+      assert.deepEqual(written.map((cookie) => [cookie.name, cookie.value, cookie.domain]).sort(), [
+        ["SID", "sid-value", ".example.com"],
+        ["hostonly", "host-value", undefined],
+        ["nope", "other", ".unrelated.test"],
+        ["parentonly", "parent-value", undefined],
+      ]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("imports a profile too large for one sqlite3 run, still without partitioned cookies", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-chrome-all-large-"));
+    try {
+      fs.mkdirSync(path.join(root, "Default"));
+      // Over 4 MB of values: several batches, each past execFile's default 1 MiB output cap.
+      const value = "v".repeat(3000);
+      const expires = chromeExpiresUtc(1_900_000_000);
+      const row = (index, partitionKey) => [
+        `site${index}.test`,
+        `c${index}`,
+        partitionKey,
+        expires,
+        value,
+      ];
+      makeScopeDb(path.join(root, "Default", "Cookies"), [
+        ...Array.from({ length: 1200 }, (_, index) => row(index, "")),
+        ...Array.from({ length: 300 }, (_, index) => row(1200 + index, "https://top.example")),
+      ]);
+      const preview = await store.previewAllSitesCookies({ rootDir: root });
+      assert.equal(preview.profiles[0].cookieCount, 1200);
+      const written = [];
+      const result = await store.importAllSitesCookies({
+        profileId: "Default",
+        cookiesApi: { set: async (cookie) => written.push(cookie) },
+        rootDir: root,
+        readPassword: async () => "test-password",
+      });
+      assert.equal(result.found, 1200);
+      assert.equal(result.imported, 1200);
+      assert.equal(written.length, 1200);
+      assert.equal(new Set(written.map((cookie) => cookie.name)).size, 1200);
+      assert.ok(written.every((cookie) => Number(cookie.name.slice(1)) < 1200));
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("writes nothing for every website when the profile, key or database fails", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-chrome-all-fail-"));
+    try {
+      fs.mkdirSync(path.join(root, "Default"));
+      makeCookieDb(path.join(root, "Default", "Cookies"));
+      fs.mkdirSync(path.join(root, "Profile 2"));
+      fs.writeFileSync(path.join(root, "Profile 2", "Cookies"), "not a database");
+      const written = [];
+      const importAll = (overrides) =>
+        store.importAllSitesCookies({
+          profileId: "Default",
+          cookiesApi: { set: async (cookie) => written.push(cookie) },
+          rootDir: root,
+          readPassword: async () => "test-password",
+          ...overrides,
+        });
+
+      const unknown = await importAll({ profileId: "Profile 9" });
+      assert.equal(unknown.ok, false);
+      assert.match(unknown.error, /wasn't found/);
+
+      const locked = await importAll({
+        readPassword: async () => {
+          throw new Error("Timed out waiting for Keychain access.");
+        },
+      });
+      assert.deepEqual(locked, { ok: false, error: "Timed out waiting for Keychain access." });
+
+      await assert.rejects(importAll({ profileId: "Profile 2" }), (err) => {
+        assert.equal(err.message, "Could not read Chrome's cookie database.");
+        return true;
+      });
+      assert.deepEqual(written, []);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

@@ -43,6 +43,12 @@ import {
 import { Shimmer } from "@/components/ai-elements/shimmer";
 import { renderLocalReviewComment } from "./LocalReviewCommentPreview";
 import { omitIncompleteLocalReviewComment } from "@/lib/localReviewComments";
+import { DesignRequestBody } from "@/components/BrowserPane/designTools/DesignRequestMessage";
+import {
+  clipDesignRequest,
+  parseDesignRequest,
+  type DesignRequest,
+} from "@/components/BrowserPane/designTools/parseDesignRequest";
 import { SessionMentionPill } from "@/components/blocks/ChatMarkdown";
 import {
   BlockRenderer,
@@ -56,7 +62,7 @@ import {
   RoutingDecisionCard,
 } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
-import { SubagentActivityMessage } from "@/components/blocks/SubagentActivityMessage";
+import { ActivityNotice } from "@/components/blocks/TaskActivityMessage";
 import {
   isSystemUserContent,
   parseSystemMessage,
@@ -65,7 +71,13 @@ import {
 import { Button } from "@/components/ui/button";
 import { BrandLogo } from "@/components/BrandLogo";
 import { RunningDot } from "@/components/RunningDot";
+import { formatMessageTimestamp } from "@/lib/relativeTime";
 import { cn } from "@/lib/utils";
+import {
+  splitKnownSlashCommand,
+  splitNativeShellCommand,
+  usePublishedComposerCommands,
+} from "@/components/composer/composerHighlight";
 import { readableSentText, replaceSentMentions } from "@/lib/composerMentions";
 import { mentionPillMarkdown } from "@/lib/mentionPills";
 import { splitSessionMessageOrigin, type SessionMessageOrigin } from "@/lib/sessionMessageOrigin";
@@ -87,6 +99,7 @@ import { QueryClientContext } from "@tanstack/react-query";
 import { ApiError, continueFailedTurn, retrySession } from "@/lib/sessionsApi";
 import { useChatStore, withoutFailedInputs, type PendingUserMessage } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
+import { supersedePlanStop } from "@/store/planStops";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import {
   ConversationScopeContext,
@@ -574,13 +587,14 @@ export function backgroundAgentsLabel(agents: readonly BackgroundTaskInfo[]): st
 
 /**
  * Whether the agent's own turn is in progress — server `running`/`waiting`, or
- * a local send in flight.
+ * a local send in flight. Shared by the transcript's working shimmer and the
+ * composer's background-task tally, so the two surfaces never disagree.
  */
 export function computeIsTurnActive(sessionStatus: SessionStatus, localSending: boolean): boolean {
   return computeIsWorking(sessionStatus) || localSending;
 }
 
-function useAgentTurnActive(): boolean {
+export function useAgentTurnActive(): boolean {
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const localSending = useChatStore((s) => s.status === "streaming");
   return computeIsTurnActive(sessionStatus, localSending);
@@ -837,21 +851,7 @@ function CompactionLoadingIndicator({ createdAtS }: { createdAtS?: number }) {
 
 function formatBubbleTimestamp(epochSeconds: number | undefined): string | null {
   if (epochSeconds === undefined || epochSeconds === 0) return null;
-  const d = new Date(epochSeconds * 1000);
-  const now = new Date();
-  const time = d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
-  if (
-    d.getFullYear() === now.getFullYear() &&
-    d.getMonth() === now.getMonth() &&
-    d.getDate() === now.getDate()
-  ) {
-    return time;
-  }
-  const date = d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
-  if (d.getFullYear() !== now.getFullYear()) {
-    return `${d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}, ${time}`;
-  }
-  return `${date}, ${time}`;
+  return formatMessageTimestamp(epochSeconds);
 }
 
 // Memoized so a streaming delta (which rebuilds the whole bubble array) only
@@ -878,7 +878,7 @@ export const BubbleView = memo(
     }
     if (bubble.kind === "compaction") return <CompactionMarker />;
     if (bubble.kind === "subagent_activity") {
-      return <SubagentActivityMessage data={bubble.data} />;
+      return <ActivityNotice data={bubble.data} />;
     }
     if (bubble.kind === "routing_decision") {
       return (
@@ -978,6 +978,30 @@ const USER_MESSAGE_REMARK_REHYPE_OPTIONS: MessageResponseProps["remarkRehypeOpti
   },
 };
 
+/** A user message's text as Markdown, as the bubble renders it. */
+function UserMessageMarkdown({ text, leadingCommand }: { text: string; leadingCommand?: string }) {
+  return (
+    <FilePathAwareMessageResponse
+      className="text-message"
+      breaks
+      mode="static"
+      linkPullRequestRefs
+      remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
+      renderLocalReviewComment={renderLocalReviewComment}
+      leadingCommand={leadingCommand}
+    >
+      {text}
+    </FilePathAwareMessageResponse>
+  );
+}
+
+/** A design-tool message's card, its words rendered like any user message's. */
+function DesignRequestCard({ request }: { request: DesignRequest }) {
+  return (
+    <DesignRequestBody request={request} words={<UserMessageMarkdown text={request.request} />} />
+  );
+}
+
 /**
  * Copy a deep link to this message (``?message=<id>`` on the session URL).
  * Same confirmation UX as {@link useCopyMessage}.
@@ -1048,9 +1072,12 @@ function useMessageActionVisibility(persistentOnMobile = false, persistentOnDesk
       ? "opacity-100"
       : isMobile
         ? "invisible opacity-0"
-        : "opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 mobile-app:[@media(hover:none)]:opacity-40 mobile-app:[@media(pointer:coarse)]:opacity-40",
+        : "opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100",
   };
 }
+
+// How a composer reply quote is serialized into the sent text (see serializeReplyDraft).
+const REPLY_QUOTE_PARAGRAPH = /(^|\n\n)> /;
 
 function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   // Scoped so a side-chat bubble builds attachment URLs against the CHILD, not
@@ -1064,8 +1091,22 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   //   for a block carrying neither.
   // - input_file: always render as a chip (non-image files can't be
   //   previewed inline).
-  const isShellCommand = bubble.shellCommand !== undefined;
-  const text = isShellCommand ? `!${bubble.shellCommand}` : extractUserText(bubble.content);
+  const published = usePublishedComposerCommands(sessionId);
+  const text =
+    bubble.shellCommand !== undefined ? `!${bubble.shellCommand}` : extractUserText(bubble.content);
+  // The backend classifies the raw block, before sender and context wrappers
+  // are stripped for display.
+  const rawText =
+    bubble.content.length === 1 && bubble.content[0]?.type === "input_text"
+      ? bubble.content[0].text
+      : null;
+  // An optimistic `!cmd` has no shellCommand until the terminal mirror lands.
+  const isShellCommand =
+    bubble.shellCommand !== undefined ||
+    (bubble.pending === true &&
+      published?.nativeShell != null &&
+      rawText !== null &&
+      splitNativeShellCommand(rawText, published.nativeShell) !== null);
   const origin = isShellCommand ? null : userMessageOrigin(bubble.content);
   const collapsesOrigin = usePeerSessionMessageDisplay() === "collapse" && origin !== null;
   const [originExpanded, setOriginExpanded] = useState(false);
@@ -1093,6 +1134,17 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const visibleText = isCollapsed
     ? omitIncompleteLocalReviewComment(sliceByCodePoint(renderedText, COLLAPSE_THRESHOLD))
     : renderedText;
+  // Another session's message reaches the agent as plain input, and attachments or a reply
+  // quote make a send an ordinary message, so none of these is a command.
+  const command =
+    !isShellCommand &&
+    origin === null &&
+    published &&
+    images.length === 0 &&
+    fileChips.length === 0 &&
+    !REPLY_QUOTE_PARAGRAPH.test(renderedText)
+      ? splitKnownSlashCommand(visibleText, published.commandNames)
+      : null;
   // Runtime-injected `[System: ...]` notifications ride in on role=user. When
   // the content is a pure system marker, swap in a muted centered indicator.
   // Another session's message is never one: it keeps its sender attribution.
@@ -1100,6 +1152,8 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
     const parsed = parseSystemMessage(text);
     if (parsed) return <SystemMessageView message={parsed} />;
   }
+  // Parsed from the rendered text, so its words keep their mention pills.
+  const designRequest = isShellCommand || origin ? null : parseDesignRequest(renderedText);
   if (origin && collapsesOrigin && !originExpanded) {
     return (
       <CollapsedSessionMessage
@@ -1259,16 +1313,16 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                         <pre className="whitespace-pre-wrap break-words font-mono text-sm">
                           <code>{visibleText}</code>
                         </pre>
+                      ) : designRequest ? (
+                        <DesignRequestCard
+                          request={
+                            isCollapsed
+                              ? clipDesignRequest(designRequest, COLLAPSE_THRESHOLD)
+                              : designRequest
+                          }
+                        />
                       ) : (
-                        <FilePathAwareMessageResponse
-                          className="text-message"
-                          breaks
-                          mode="static"
-                          remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
-                          renderLocalReviewComment={renderLocalReviewComment}
-                        >
-                          {visibleText}
-                        </FilePathAwareMessageResponse>
+                        <UserMessageMarkdown text={visibleText} leadingCommand={command?.token} />
                       )}
                       {/* Gradient fade at the bottom of collapsed prompts to signal
                       there is more content below. */}
@@ -1306,13 +1360,9 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
           </div>
         )}
         {visibilityToggle}
-        <div
-          id={actionsId}
-          className={cn(
-            "flex max-w-full items-center justify-end gap-3 pt-1 mobile-app:py-0",
-            visibilityClassName,
-          )}
-        >
+        <div className="flex max-w-full items-center justify-end gap-3 pt-1 mobile-app:py-0">
+          {/* Outside the hover-revealed actions: a mid-turn message can wait
+              minutes behind a long tool call and must not look delivered. */}
           {awaitingAgent && (
             <span
               className="min-w-0 truncate text-sm leading-4 text-muted-foreground"
@@ -1322,52 +1372,57 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
               The agent will read this after its current step
             </span>
           )}
-          {ts && (
-            <span
-              className="shrink-0 select-none whitespace-nowrap text-sm leading-4 text-foreground/56"
-              data-testid="message-timestamp"
-            >
-              {ts}
-            </span>
-          )}
-          <MessageActions className="shrink-0">
-            {text && (
-              <MessageAction
-                tooltip="Copy"
-                size="icon-xxs"
-                className="[@media(pointer:coarse)]:size-8"
-                onClick={handleCopy}
-                componentId="chat.message.copy_user"
+          <div
+            id={actionsId}
+            className={cn("flex shrink-0 items-center gap-3", visibilityClassName)}
+          >
+            {ts && (
+              <span
+                className="shrink-0 select-none whitespace-nowrap text-sm leading-4 text-foreground/56"
+                data-testid="message-timestamp"
               >
-                {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
-              </MessageAction>
+                {ts}
+              </span>
             )}
-            {canEdit && (
+            <MessageActions className="shrink-0">
+              {text && (
+                <MessageAction
+                  tooltip="Copy"
+                  size="icon-xxs"
+                  className="max-md:size-8"
+                  onClick={handleCopy}
+                  componentId="chat.message.copy_user"
+                >
+                  {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
+                </MessageAction>
+              )}
+              {canEdit && (
+                <MessageAction
+                  tooltip="Edit and resend"
+                  size="icon-xxs"
+                  className="max-md:size-8"
+                  onClick={() =>
+                    editSentMessage({
+                      text: isShellCommand ? text : userMessageBody(bubble.content),
+                    })
+                  }
+                  componentId="chat.message.edit_user"
+                >
+                  <PencilIcon size={14} />
+                </MessageAction>
+              )}
               <MessageAction
-                tooltip="Edit and resend"
+                tooltip={isLinkCopied ? "Copied!" : "Copy link"}
                 size="icon-xxs"
-                className="[@media(pointer:coarse)]:size-8"
-                onClick={() =>
-                  editSentMessage({
-                    text: isShellCommand ? text : userMessageBody(bubble.content),
-                  })
-                }
-                componentId="chat.message.edit_user"
+                className="max-md:size-8"
+                data-testid="copy-message-link"
+                disabled={bubble.pending}
+                onClick={handleCopyLink}
               >
-                <PencilIcon size={14} />
+                {isLinkCopied ? <CheckIcon size={14} /> : <Link2Icon size={14} />}
               </MessageAction>
-            )}
-            <MessageAction
-              tooltip={isLinkCopied ? "Copied!" : "Copy link"}
-              size="icon-xxs"
-              className="[@media(pointer:coarse)]:size-8"
-              data-testid="copy-message-link"
-              disabled={bubble.pending}
-              onClick={handleCopyLink}
-            >
-              {isLinkCopied ? <CheckIcon size={14} /> : <Link2Icon size={14} />}
-            </MessageAction>
-          </MessageActions>
+            </MessageActions>
+          </div>
         </div>
       </div>
     </Message>
@@ -1446,7 +1501,9 @@ function AssistantBubble({
         ) {
           throw new Error("Wait for the current turn to finish before retrying");
         }
+        const endPlanStop = supersedePlanStop(conversationId);
         await continueFailedTurn(conversationId);
+        endPlanStop();
         return;
       }
       try {
@@ -1583,7 +1640,7 @@ function AssistantBubble({
                   <MessageAction
                     tooltip="Copy"
                     size="icon-xxs"
-                    className="[@media(pointer:coarse)]:size-8"
+                    className="max-md:size-8"
                     onClick={handleCopy}
                     componentId="chat.message.copy_assistant"
                   >
@@ -1635,7 +1692,7 @@ function AssistantBubble({
         )}
         {trailingNotices.map((notice, index) =>
           notice.kind === "subagent_activity" ? (
-            <SubagentActivityMessage
+            <ActivityNotice
               key={notice.itemId ?? `subagent-activity-${index}`}
               data={notice.data}
             />

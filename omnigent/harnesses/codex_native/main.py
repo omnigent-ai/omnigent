@@ -816,7 +816,7 @@ def _run_with_remote_server(
     # headers, so it rides the header (emitted only on a host-sharded deployment).
     host_id = load_or_create_host_identity().host_id
     headers = _remote_headers(server_url=base_url, host_id=host_id)
-    attach_auth = _server_auth(server_url=base_url, session_id=None)
+    attach_auth = _server_auth(server_url=base_url)
     try:
         resolved_session_id = _resolve_session_id_for_resume(
             base_url=base_url,

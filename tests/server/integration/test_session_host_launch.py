@@ -40,6 +40,7 @@ from omnigent.host.connect import HostProcess
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
+    HostHarnessReadinessFrame,
     HostHelloFrame,
     HostLaunchRunnerFrame,
     HostLaunchRunnerResultFrame,
@@ -145,6 +146,11 @@ def app(runtime_init: None, db_uri: str, tmp_path) -> FastAPI:
     :param tmp_path: Pytest temp dir for artifacts and cache.
     :returns: A configured FastAPI app with host routes mounted.
     """
+    return _host_app(db_uri, tmp_path)
+
+
+def _host_app(db_uri: str, tmp_path: Path, **options: Any) -> FastAPI:
+    """Build one server replica with independent host tunnels and shared stores."""
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
     return create_app(
         agent_store=SqlAlchemyAgentStore(db_uri),
@@ -157,10 +163,76 @@ def app(runtime_init: None, db_uri: str, tmp_path) -> FastAPI:
         ),
         comment_store=SqlAlchemyCommentStore(db_uri),
         host_store=HostStore(db_uri),
+        **options,
     )
 
 
-async def _connect_host(app: FastAPI) -> ApplicationCommunicator:
+@pytest.mark.parametrize("retirement", ["blocked", "failed"])
+async def test_host_notifications_survive_recovery_retirement(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    retirement: str,
+) -> None:
+    from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
+    from omnigent.server.startup_inputs import ManagedStartupInputs
+    from tests._helpers.polling import poll_until_async
+
+    app = _host_app(
+        db_uri,
+        tmp_path,
+        host_session_recovery=True,
+        sandbox_config=ManagedSandboxDeployment.single(
+            ManagedSandboxConfig(
+                server_url="https://server.example.test",
+                launcher_factory=Mock(),
+                token_ttl_s=3600,
+                provider="test",
+            )
+        ),
+    )
+    entered = asyncio.Event()
+
+    async def retire(_connection: HostConnection) -> None:
+        entered.set()
+        if retirement == "failed":
+            raise RuntimeError("store unavailable")
+        await asyncio.Future()
+
+    service = app.state.host_session_recoverer
+    monkeypatch.setattr(service, "retire_disabled", retire)
+    announced, startup = Mock(), Mock()
+    monkeypatch.setattr("omnigent.server.app.announce_hosts_changed", announced)
+    monkeypatch.setattr(ManagedStartupInputs, "host_changed", startup)
+    comm = await _connect_host(app)
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=budget(5.0))
+        connection = app.state.host_registry.get(_HOST_ID)
+        assert not connection.hello.recover_interrupted_sessions
+        announced.assert_called_once_with(connection.owner)
+        startup.assert_called_once_with(app, _HOST_ID)
+        # A second host frame must be processed even while retirement is blocked.
+        await comm.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_host_frame(
+                    HostHarnessReadinessFrame(configured_harnesses={"codex-native": True})
+                ),
+            }
+        )
+        await poll_until_async(lambda: announced.call_count == 2, timeout_s=budget(5.0))
+        assert startup.call_count == 2
+    finally:
+        await service.shutdown()
+        assert not service._retirement_tasks
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        await comm.wait(timeout=budget(5.0))
+
+
+async def _connect_host(
+    app: FastAPI, host_id: str = _HOST_ID, *, name: str = "laptop"
+) -> ApplicationCommunicator:
     """Connect a mock host over the WebSocket tunnel and wait for it
     to register in the app's host registry.
 
@@ -168,18 +240,18 @@ async def _connect_host(app: FastAPI) -> ApplicationCommunicator:
         is the same instance the session-create launch path reads).
     :returns: The connected ASGI communicator, ready to exchange frames.
     """
-    path = f"/v1/hosts/{_HOST_ID}/tunnel"
+    path = f"/v1/hosts/{host_id}/tunnel"
     comm = ApplicationCommunicator(app, _websocket_scope(path))
     await comm.send_input({"type": "websocket.connect"})
     accepted = await comm.receive_output(timeout=budget(1.0))
     assert accepted["type"] == "websocket.accept"
 
     hello = encode_host_frame(
-        HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="laptop")
+        HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name=name)
     )
     await comm.send_input({"type": "websocket.receive", "text": hello})
     registry = app.state.host_registry
-    while registry.get(_HOST_ID) is None:
+    while registry.get(host_id) is None:
         await asyncio.sleep(0.01)
     return comm
 
@@ -2054,6 +2126,79 @@ async def test_message_relaunch_never_connected_names_phase_and_logs_error(
     assert any(session_id in r.getMessage() for r in correlated_errors), (
         "the never-connected ERROR must also carry the session id"
     )
+
+
+@pytest.mark.parametrize("status", ["dead", "unknown"])
+async def test_message_relaunch_reports_exit_cause_when_status_beats_exit_report(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+) -> None:
+    """A runner the host already forgot still reports why it exited.
+
+    The host drops a dead runner before it sends its exit report, so the
+    status verdict can arrive first. The 503 must carry the reported cause,
+    not the generic never-connected message.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(routes_events, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2)
+    daemon_report = "The server rejected this host's credentials, so the runner could not connect."
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    await _stop_host_session(client, comm, session_id)
+
+    set_runner_client(None)
+
+    async def _launch_then_verdict_then_report() -> None:
+        launch = await _serve_one_launch(comm, launch_status="launched")
+        deadline = Deadline(30.0)
+        for _ in range(40):
+            output = await comm.receive_output(timeout=deadline.next_wait(30.0))
+            if output["type"] != "websocket.send":
+                continue
+            frame = decode_host_frame(output["text"])
+            if isinstance(frame, HostRunnerStatusFrame):
+                await comm.send_input(
+                    {
+                        "type": "websocket.receive",
+                        "text": encode_host_frame(
+                            HostRunnerStatusResultFrame(request_id=frame.request_id, status=status)
+                        ),
+                    }
+                )
+                break
+        await asyncio.sleep(0.05)
+        report = HostRunnerExitedFrame(
+            runner_id=token_bound_runner_id(launch.binding_token),
+            error=daemon_report,
+        )
+        await comm.send_input({"type": "websocket.receive", "text": encode_host_frame(report)})
+
+    responder = asyncio.create_task(_launch_then_verdict_then_report())
+    try:
+        msg_resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hi?"}]},
+            },
+        )
+    finally:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            _ = await responder
+
+    assert msg_resp.status_code == 503, msg_resp.text
+    error = msg_resp.json()["error"]
+    assert error["code"] == "runner_unavailable"
+    assert daemon_report in error["message"], error["message"]
+    assert "never connected" not in error["message"], error["message"]
 
 
 async def _relaunch_then_report_exit(
@@ -4380,6 +4525,80 @@ async def test_relaunch_stops_the_superseded_runner(
 
 
 @pytest.mark.parametrize(
+    "cancel_after_rotation,snapshot_after_rotation",
+    [(False, False), (True, False), (True, True)],
+    ids=["before-binding", "after-binding-old-snapshot", "after-binding-new-snapshot"],
+)
+async def test_ordinary_launch_retries_cancelled_recovery(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    cancel_after_rotation: bool,
+    snapshot_after_rotation: bool,
+) -> None:
+    from omnigent.db.utils import now_epoch
+    from omnigent.server.routes._sessions.helpers import _launch_runner_on_host_impl
+    from omnigent.session_recovery import SessionRecovery
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    store = SqlAlchemyConversationStore(db_uri)
+    original = store.get_conversation(session["id"])
+    intent = SessionRecovery(_HOST_ID, original.runner_id, now_epoch(), phase="launching")
+    assert store.replace_session_recovery(original.id, None, intent)
+    entered, ordinary_entered = asyncio.Event(), asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    checks = 0
+
+    def allowed() -> bool:
+        nonlocal checks
+        checks += 1
+        if checks == (2 if cancel_after_rotation else 1):
+            loop.call_soon_threadsafe(entered.set)
+            assert release.wait(timeout=budget(10.0))
+            return False
+        return True
+
+    registry = app.state.host_registry
+    connection = registry.get(_HOST_ID)
+    recovery = asyncio.create_task(
+        _launch_runner_on_host_impl(
+            original, store, registry, connection, recovery=intent, recovery_allowed=allowed
+        )
+    )
+    ordinary = responder = None
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=budget(5.0))
+        snapshot = store.get_conversation(original.id) if snapshot_after_rotation else original
+
+        async def launch_ordinary() -> Any:
+            ordinary_entered.set()
+            return await _launch_runner_on_host_impl(snapshot, store, registry, connection)
+
+        ordinary = asyncio.create_task(launch_ordinary())
+        await asyncio.wait_for(ordinary_entered.wait(), timeout=budget(5.0))
+        responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+        release.set()
+        cancelled, result, frame = await asyncio.wait_for(
+            asyncio.gather(recovery, ordinary, responder), timeout=budget(10.0)
+        )
+        assert cancelled.error_code == "recovery_cancelled"
+        assert result.acknowledged and result.error_code is None
+        assert not frame.recovery
+        assert result.runner_id == token_bound_runner_id(frame.binding_token)
+        assert store.get_conversation(original.id).runner_id == result.runner_id
+    finally:
+        release.set()
+        tasks = [task for task in (recovery, ordinary, responder) if task is not None]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        await comm.wait(timeout=budget(5.0))
+
+
+@pytest.mark.parametrize(
     "snapshot_after_rotation", [False, True], ids=["old-binding", "new-binding"]
 )
 async def test_concurrent_relaunches_are_single_flight(
@@ -4522,27 +4741,50 @@ async def test_concurrent_relaunches_are_single_flight(
 
 
 @pytest.mark.parametrize(
-    "scenario", ["replaced", "gone", "denied", "replaced_again", "ack_timeout", "cancelled"]
+    "scenario",
+    [
+        "replaced",
+        "gone",
+        "denied",
+        "replaced_again",
+        "ack_timeout",
+        "cancelled",
+        "recovery_replaced",
+    ],
 )
 async def test_relaunch_recovers_only_a_rejected_enqueue(
     db_uri: str, monkeypatch: pytest.MonkeyPatch, scenario: str
 ) -> None:
-    """A replacement gets one identical launch, only before enqueue succeeds."""
+    """Ordinary launches retry once; recovery waits for the replacement's own request."""
+    from dataclasses import replace
+
     from omnigent.errors import ErrorCode, OmnigentError
     from omnigent.server.host_registry import HostRegistry
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes._sessions import helpers as sessions_helpers
+    from omnigent.session_recovery import SessionRecovery
 
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation()
     store.set_host_id(conv.id, _HOST_ID, workspace=_WORKSPACE)
     conv = store.get_conversation(conv.id)
     assert conv is not None
+    recovery = None
+    if scenario == "recovery_replaced":
+        recovery = SessionRecovery(
+            _HOST_ID, conv.runner_id or "", 100, phase="launching", attempts=1
+        )
+        assert store.replace_session_recovery(conv.id, None, recovery)
     registry = HostRegistry()
     host_store = HostStore(db_uri)
     host_store.upsert_on_connect(host_id=_HOST_ID, name="laptop", user_id="local")
     registry.launch_authorizer = host_store.admit_launch
-    hello = HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="laptop")
+    hello = HostHelloFrame(
+        version="0.1.0-test",
+        frame_protocol_version=1,
+        name="laptop",
+        recover_interrupted_sessions=recovery is not None,
+    )
     original = registry.register(_HOST_ID, _NoopRunnerWS(), hello, owner=None)
     connections = [original]
     admissions: list[HostConnection] = []
@@ -4569,7 +4811,7 @@ async def test_relaunch_recovers_only_a_rejected_enqueue(
                     registry.register(
                         _HOST_ID,
                         _NoopRunnerWS(),
-                        hello,
+                        replace(hello, recover_interrupted_sessions=False),
                         owner="different-owner@example.test" if scenario == "denied" else None,
                     )
                 )
@@ -4598,7 +4840,9 @@ async def test_relaunch_recovers_only_a_rejected_enqueue(
     monkeypatch.setattr(sessions_helpers, "_HOST_LAUNCH_RESULT_TIMEOUT_S", 0.01)
 
     async def launch() -> Any:
-        return await sessions_module._launch_runner_on_host(conv, store, registry, original)
+        return await sessions_module._launch_runner_on_host(
+            conv, store, registry, original, recovery=recovery, recovery_allowed=lambda: True
+        )
 
     if scenario == "denied":
         with pytest.raises(OmnigentError) as rejected:
@@ -4614,10 +4858,10 @@ async def test_relaunch_recovers_only_a_rejected_enqueue(
 
     assert len(bound_runner_ids) == 1
     assert store.get_conversation(conv.id).runner_id == bound_runner_ids[0]
-    expected_attempts = 1 if scenario in ("gone", "denied") else 2
+    expected_attempts = 1 if scenario in ("gone", "denied", "recovery_replaced") else 2
     assert len(attempted_frames) == expected_attempts
     assert len(set(attempted_frames)) == 1
-    assert len(admissions) == (1 if scenario == "gone" else 2)
+    assert len(admissions) == (1 if scenario in ("gone", "recovery_replaced") else 2)
     assert admissions == connections[: len(admissions)]
     assert len(accepted_frames) == (scenario in ("replaced", "ack_timeout", "cancelled"))
     if accepted_frames:
@@ -4626,6 +4870,12 @@ async def test_relaunch_recovers_only_a_rejected_enqueue(
         assert accepted_frames[0].session_id == conv.id
     assert all(not conn.pending_launches for conn in connections)
     assert all(future.done() for future in pending_futures)
+    if recovery is not None:
+        assert original.hello.recover_interrupted_sessions
+        assert not connections[-1].hello.recover_interrupted_sessions
+        frame = decode_host_frame(attempted_frames[0])
+        assert isinstance(frame, HostLaunchRunnerFrame) and frame.recovery
+        assert connections[-1].outbound_queue.empty()
 
 
 async def test_rider_of_a_refused_relaunch_surfaces_the_refusal(
@@ -4959,37 +5209,85 @@ async def test_unbinding_child_before_archive_does_not_stop_parents_shared_runne
     )
 
 
+@pytest.mark.parametrize(
+    ("host_placement", "cleanup_status"),
+    [("local", 204), ("remote", 204), ("hostless", 204), ("local", 503)],
+    ids=["local", "remote", "hostless", "cleanup-rejected"],
+)
 async def test_stopping_child_does_not_stop_parents_shared_runner(
     client: httpx.AsyncClient,
     app: FastAPI,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     _shared_runner_family: dict[str, str],
+    host_placement: str,
+    cleanup_status: int,
 ) -> None:
-    """``stop_session`` on a child ends the child's work, not the parent's runner."""
-    from omnigent.runtime import set_runner_client
+    """Child control follows its runner even when the host reconnects elsewhere."""
+    from omnigent.runner.routing import RunnerRouter
 
     comm = await _connect_host(app)
     parent = await _inline_launch_session(client, comm)
-    async with _HostFrameResponder(comm) as host:
+    async with _HostFrameResponder(comm):
         child = await _inline_child_session(client, parent["id"])
-        _shared_runner_family.update(parent=parent["id"], child=child["id"])
-        fake_runner = httpx.AsyncClient(
-            transport=httpx.MockTransport(lambda _request: httpx.Response(204)),
-            base_url="http://runner",
-        )
-        set_runner_client(fake_runner)
-        try:
-            stop = await client.post(
+    _shared_runner_family.update(parent=parent["id"], child=child["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    app.state.tunnel_registry.register(parent["runner_id"], _NoopRunnerWS(), _runner_hello())
+    host_app = app
+    if host_placement == "remote":
+        await comm.send_input({"type": "websocket.disconnect", "code": 1001})
+        await comm.wait(timeout=budget(5.0))
+        host_app = _host_app(db_uri, tmp_path)
+        comm = await _connect_host(host_app)
+        assert app.state.host_registry.get(_HOST_ID) is None
+        assert host_app.state.tunnel_registry.get(parent["runner_id"]) is None
+    elif host_placement == "hostless":
+        for session_id in (child["id"], parent["id"]):
+            store.clear_host_binding(session_id, keep_runner=True)
+
+    requests: list[tuple[str, str]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        return httpx.Response(cleanup_status if request.method == "DELETE" else 204)
+
+    async with (
+        _HostFrameResponder(comm) as host,
+        httpx.AsyncClient(
+            transport=httpx.MockTransport(respond), base_url="http://runner"
+        ) as runner,
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=host_app), base_url="http://host-replica"
+        ) as host_client,
+    ):
+        # Keep the real replica-local routing; only replace its HTTP transport.
+        monkeypatch.setattr(RunnerRouter, "_client_for_runner", lambda self, runner_id: runner)
+        if host_placement == "remote":
+            store.touch_runner_liveness([parent["runner_id"]], int(time.time()))
+            misplaced = await host_client.post(
                 f"/v1/sessions/{child['id']}/events", json={"type": "stop_session"}
             )
-        finally:
-            set_runner_client(None)
-            await fake_runner.aclose()
-        assert stop.status_code in (200, 202), stop.text
-
-    assert parent["runner_id"] not in host.stopped_runner_ids, (
-        f"stopping child {child['id']} asked the host to stop the parent's runner "
-        f"{parent['runner_id']} (stops: {host.stopped_runner_ids})"
-    )
+            assert misplaced.status_code == 503, misplaced.text
+            assert misplaced.json()["error"]["code"] == "runner_unavailable"
+            assert requests == []
+            assert host.stopped_runner_ids == []
+            assert store.get_conversation(child["id"]).runner_id == parent["runner_id"]
+        stop = await client.post(
+            f"/v1/sessions/{child['id']}/events", json={"type": "stop_session"}
+        )
+        if cleanup_status >= 400:
+            assert stop.status_code == 503, stop.text
+            assert stop.json()["error"]["code"] == "runner_unavailable"
+            assert store.get_conversation(child["id"]).runner_id == parent["runner_id"]
+        else:
+            assert stop.status_code in (200, 202), stop.text
+        expected_requests = [("POST", f"/v1/sessions/{child['id']}/events")]
+        if host_placement != "hostless":
+            expected_requests.append(("DELETE", f"/v1/sessions/{child['id']}"))
+        assert requests == expected_requests
+        assert host.stopped_runner_ids == []
+        assert store.get_conversation(parent["id"]).runner_id == parent["runner_id"]
 
 
 async def test_child_relaunch_does_not_stop_parents_shared_runner(
@@ -5374,3 +5672,144 @@ async def test_side_chat_message_rebinds_to_already_relaunched_source_runner(
     side_chat_after = store.get_conversation(side_chat_id)
     assert side_chat_after is not None and side_chat_after.runner_id == replacement
     assert f"/v1/sessions/{side_chat_id}/events" in [path for path, _ in runners.posts]
+
+
+@pytest.mark.parametrize(
+    "runner_on_target", [False, True], ids=["runner-absent", "runner-on-target"]
+)
+async def test_switch_host_stops_before_releasing_the_old_binding(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _shared_runner_family: dict[str, str],
+    runner_on_target: bool,
+) -> None:
+    """A routed Stop reaches the old replica before the move forgets its runner."""
+    from omnigent.runner.routing import RunnerRouter
+
+    first_comm = await _connect_host(app)
+    session = await _inline_launch_session(client, first_comm)
+    _shared_runner_family["moving"] = session["id"]
+    target_app = _host_app(db_uri, tmp_path)
+    target_host_id = "b2345678901234567890123456789012"
+    second_comm = await _connect_host(target_app, target_host_id, name="workstation")
+    if runner_on_target:
+        target_app.state.tunnel_registry.register(
+            session["runner_id"], _NoopRunnerWS(), _runner_hello()
+        )
+        SqlAlchemyConversationStore(db_uri).touch_runner_liveness(
+            [session["runner_id"]], int(time.time())
+        )
+    assert target_app.state.host_registry.get(_HOST_ID) is None
+    assert app.state.tunnel_registry.get(session["runner_id"]) is None
+    requests: list[tuple[str, str]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        return httpx.Response(204)
+
+    async with (
+        _HostFrameResponder(first_comm) as first_host,
+        _HostFrameResponder(second_comm) as second_host,
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=target_app), base_url="http://target"
+        ) as target_client,
+        httpx.AsyncClient(
+            transport=httpx.MockTransport(respond), base_url="http://runner"
+        ) as runner,
+    ):
+        monkeypatch.setattr(RunnerRouter, "_client_for_runner", lambda self, runner_id: runner)
+        misplaced = await target_client.post(
+            f"/v1/sessions/{session['id']}/events", json={"type": "stop_session"}
+        )
+        assert misplaced.status_code == 400, misplaced.text
+        assert misplaced.json()["error"]["code"] == "wrong_replica"
+        assert requests == []
+        assert first_host.stopped_runner_ids == []
+        assert second_host.stopped_runner_ids == []
+        bound = (await client.get(f"/v1/sessions/{session['id']}")).json()
+        assert bound["runner_id"] == session["runner_id"]
+        stopped = await client.post(
+            f"/v1/sessions/{session['id']}/events", json={"type": "stop_session"}
+        )
+        assert stopped.status_code in (200, 202), stopped.text
+        assert first_host.stopped_runner_ids == [session["runner_id"]]
+        released = await client.patch(f"/v1/sessions/{session['id']}", json={"runner_id": ""})
+        assert released.status_code == 200, released.text
+        launched = await target_client.post(
+            f"/v1/hosts/{target_host_id}/runners",
+            json={"session_id": session["id"], "workspace": _WORKSPACE},
+        )
+        assert launched.status_code == 200, launched.text
+    assert len(second_host.launch_frames) == 1
+    moved = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert moved["host_id"] == target_host_id
+    assert moved["runner_id"] == launched.json()["runner_id"]
+
+
+async def test_recovery_binding_is_durable_before_host_receives_launch(
+    app: FastAPI, client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dataclasses import replace
+
+    from omnigent.runner.identity import token_bound_runner_id
+    from omnigent.server.routes.sessions import _launch_runner_on_host
+    from omnigent.session_recovery import SessionRecovery
+
+    comm = await _connect_host(app)
+    agent = await create_test_agent(client)
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    response = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+    )
+    await responder
+    assert response.status_code == 201
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.get_conversation(response.json()["id"])
+    assert conv is not None and conv.runner_id is not None
+    intent = SessionRecovery(
+        _HOST_ID, conv.runner_id, 100, phase="launching", attempts=1, attempt_id="interruption"
+    )
+    assert store.replace_session_recovery(conv.id, None, intent)
+    replace_runner_id = store.replace_runner_id
+
+    def bind_runner(session_id: str, runner_id: str, **kwargs: Any) -> Conversation:
+        assert store.get_session_recovery(session_id) == replace(
+            intent, launch_runner_id=runner_id
+        )
+        return replace_runner_id(session_id, runner_id, **kwargs)
+
+    monkeypatch.setattr(store, "replace_runner_id", bind_runner)
+    registry = app.state.host_registry
+    task = asyncio.create_task(
+        _launch_runner_on_host(
+            conv,
+            store,
+            registry,
+            registry.get(_HOST_ID),
+            recovery=intent,
+            recovery_allowed=lambda: True,
+        )
+    )
+    frame = await _wait_for_launch(comm, budget_s=5)
+    assert frame is not None and frame.recovery
+    bound_id = token_bound_runner_id(frame.binding_token)
+    assert store.get_session_recovery(conv.id) == replace(
+        intent, runner_id=bound_id, launch_runner_id=bound_id
+    )
+    assert store.get_conversation(conv.id).runner_id == bound_id
+    await comm.send_input(
+        {
+            "type": "websocket.receive",
+            "text": encode_host_frame(
+                HostLaunchRunnerResultFrame(
+                    request_id=frame.request_id, status="launched", runner_id=bound_id
+                )
+            ),
+        }
+    )
+    assert (await task).runner_id == bound_id
+    await comm.send_input({"type": "websocket.disconnect", "code": 1000})

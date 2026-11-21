@@ -45,6 +45,7 @@ from omnigent.host.frames import (
     CAP_CLONE_REPOSITORY,
     CAP_HARNESS_ACCOUNTS,
     CAP_HARNESS_LOGIN,
+    CAP_LONG_SESSION_MESSAGES,
     CAP_REFRESH_HARNESSES,
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
@@ -871,7 +872,9 @@ async def _resolve_agent_spec_cwd(
     agent = await asyncio.to_thread(agent_store.get, conv.agent_id)
     if agent is None or agent.bundle_location is None:
         return None
-    loaded = await asyncio.to_thread(agent_cache.load, agent.id, agent.bundle_location)
+    loaded = await asyncio.to_thread(
+        agent_cache.load, agent.id, agent.bundle_location, expand_env=agent.operator_authored
+    )
     os_env = getattr(loaded.spec, "os_env", None)
     return getattr(os_env, "cwd", None) if os_env is not None else None
 
@@ -901,7 +904,9 @@ async def _resolve_agent_harness(
     agent = await asyncio.to_thread(agent_store.get, conv.agent_id)
     if agent is None or agent.bundle_location is None:
         return None
-    loaded = await asyncio.to_thread(agent_cache.load, agent.id, agent.bundle_location)
+    loaded = await asyncio.to_thread(
+        agent_cache.load, agent.id, agent.bundle_location, expand_env=agent.operator_authored
+    )
     return canonicalize_harness(loaded.spec.executor.harness_kind)
 
 
@@ -1032,6 +1037,10 @@ def create_hosts_router(
                 # gateway-backed".
                 "gateway_inference": host_registry.gateway_inference(host.host_id),
                 "interactive_shells": host_registry.interactive_shells(host.host_id),
+                # False also when another replica holds the tunnel: unverified.
+                "long_session_messages_supported": bool(
+                    conn is not None and CAP_LONG_SESSION_MESSAGES in conn.hello.capabilities
+                ),
             }
             if (
                 harness_setup_enabled
@@ -1093,6 +1102,9 @@ def create_hosts_router(
             # memory, so ``None`` is "no report on this replica yet".
             "gateway_inference": host_registry.gateway_inference(host.host_id),
             "interactive_shells": host_registry.interactive_shells(host.host_id),
+            "long_session_messages_supported": bool(
+                conn is not None and CAP_LONG_SESSION_MESSAGES in conn.hello.capabilities
+            ),
             "runners": [],
         }
         if (

@@ -130,14 +130,31 @@ def test_codex_goal_mode_processes_first_message_with_untrusted_hooks(
     )
     expect(page.get_by_test_id("goal-pause")).to_be_visible()
 
-    runner_online["value"] = False
-    expect(page.get_by_test_id("composer-goal-mode")).to_have_count(0, timeout=30_000)
-    with page.expect_response(_goal_response(session.session_id, "GET"), timeout=30_000):
-        runner_online["value"] = True
-        page.wait_for_timeout(12_000)
+    page.keyboard.press("Escape")
+    with page.expect_response(
+        lambda response: (
+            urlparse(response.url).path == "/health"
+            and response.status == 200
+            and response.json()
+            .get("sessions", {})
+            .get(session.session_id, {})
+            .get("runner_online")
+            is False
+        ),
+        timeout=30_000,
+    ):
+        runner_online["value"] = False
+    page.get_by_test_id("composer-attach").click()
+    expect(goal_toggle).to_be_enabled()
+    with page.expect_response(_goal_response(session.session_id, "GET")):
+        goal_toggle.click()
+    expect(current_goal).to_contain_text(objective, timeout=30_000)
     expect(page.get_by_test_id("composer-goal-mode")).to_have_attribute(
         "aria-label", f"Goal active: {objective}", timeout=30_000
     )
+    expect(page.get_by_test_id("goal-save")).to_be_enabled()
+    with page.expect_response(_goal_response(session.session_id, "GET"), timeout=30_000):
+        runner_online["value"] = True
 
     with page.expect_response(_goal_response(session.session_id, "DELETE")):
         page.get_by_test_id("goal-clear").click()

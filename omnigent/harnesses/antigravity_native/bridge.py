@@ -1229,6 +1229,7 @@ _AGY_ACTIVE_MARKER = "esc to cancel"
 # so both the render gate and the submit verification key off the placeholder
 # appearing and then leaving the composer.
 _AGY_PASTE_PLACEHOLDER_RE = re.compile(r"\[Pasted text #\d+[^\]]*\]")
+_AGY_SCROLL_INDICATOR_RE = re.compile(r"^[> ]*[↑↓]\s*\d+\s+more\s+lines", re.IGNORECASE)
 # agy's notice when a turn is submitted before its startup account-eligibility
 # check settles. The composer footer mounts ~3s after launch but eligibility is
 # not settled for ~7-9s, and a turn landing in that window is CONSUMED (the draft
@@ -1460,6 +1461,21 @@ def _paste_payload_bytes(text: str) -> bytes:
     return bytes(body)
 
 
+def _submit_needles(content: str) -> list[str]:
+    """Sample both ends of the draft so a scrolled composer can confirm a paste."""
+    lines = [line.strip() for line in content.splitlines() if len(line.strip()) >= 4]
+    if not lines:
+        stripped = content.strip()
+        return [stripped[:24]] if len(stripped) >= 4 else []
+    needles: list[str] = []
+    for line in (lines[0], lines[-1]):
+        for sample in (line[:24], line[-24:]):
+            sample = sample.strip()
+            if len(sample) >= 4 and sample not in needles:
+                needles.append(sample)
+    return needles
+
+
 def _submit_needle(content: str) -> str:
     """
     A stable single-line substring used to confirm the paste rendered in the pane.
@@ -1469,12 +1485,8 @@ def _submit_needle(content: str) -> str:
         or ``""`` when no such line exists (the caller then skips the
         paste-commit poll and submits after the settle pause).
     """
-    for line in content.splitlines():
-        stripped = line.strip()
-        if len(stripped) >= 4:
-            return stripped[:24]
-    stripped = content.strip()
-    return stripped[:24] if len(stripped) >= 4 else ""
+    needles = _submit_needles(content)
+    return needles[0] if needles else ""
 
 
 def _redact_pane_secrets(text: str) -> str:
@@ -1511,12 +1523,22 @@ def _agy_input_region(pane: str) -> str:
     agy renders the editable composer between horizontal separator lines. After
     a successful submit, the submitted prompt remains in transcript history
     above a fresh empty composer, so checking the full pane would falsely think
-    the draft is still present. The last separator pair scopes matching to the
-    currently editable input box, mirroring Kiro's input-region guard.
+    the draft is still present. Scans candidate separator sections from the bottom
+    up looking for the active prompt box (> ...), properly skipping any background
+    task or subagent status widgets below it.
     """
     lines = pane.splitlines()
     separator_indexes = [index for index, line in enumerate(lines) if _agy_separator_line(line)]
     if len(separator_indexes) >= 2:
+        for index in range(len(separator_indexes) - 2, -1, -1):
+            start = separator_indexes[index] + 1
+            end = separator_indexes[index + 1]
+            candidate = lines[start:end]
+            if any(
+                line.strip().startswith(">") or _AGY_PASTE_PLACEHOLDER_RE.search(line)
+                for line in candidate
+            ):
+                return "\n".join(candidate)
         start = separator_indexes[-2] + 1
         end = separator_indexes[-1]
         return "\n".join(lines[start:end])
@@ -1537,36 +1559,52 @@ def _agy_separator_line(line: str) -> bool:
     return all(char in _AGY_BOX_GLYPHS for char in stripped if not char.isspace())
 
 
-def _draft_in_input_region(pane: str, needle: str, baseline_region: str) -> bool:
+def _collapse_ws(text: str) -> str:
+    """Collapse all whitespace runs to single spaces for wrap-tolerant compares."""
+    return " ".join(text.split())
+
+
+def _needle_matches_candidates(needle: str, candidates: list[str]) -> bool:
+    """Match one needle against composer lines, tolerating terminal word-wrap."""
+    collapsed = _collapse_ws(needle)
+    if not collapsed:
+        return False
+    for line in candidates:
+        if needle in line or collapsed in _collapse_ws(line):
+            return True
+    joined_space = _collapse_ws(" ".join(candidates))
+    joined_bare = _collapse_ws("".join(candidates))
+    return bool(joined_space and collapsed in joined_space) or bool(
+        joined_bare and collapsed in joined_bare
+    )
+
+
+def _draft_in_input_region(
+    pane: str,
+    needle: str,
+    baseline_region: str,
+    extra_needles: tuple[str, ...] = (),
+) -> bool:
     """
     Return whether the pasted draft is still visible in agy's composer.
 
     The baseline region prevents matching the empty prompt or stale text that was
     already present before this paste. Candidate lines are normalized by removing
     agy's leading ``>`` prompt glyph.
-
-    When *needle* is empty (a message too short for a stable needle, e.g.
-    ``"ok"``), any draft-like content in a composer that differs from the
-    pre-paste baseline counts as present — so short messages are still render- and
-    submit-verified by composer state instead of being submitted blind.
     """
     region = _agy_input_region(pane)
     if region == baseline_region:
         return False
     candidates = _agy_draft_candidate_lines(region)
-    # A collapsed paste hides the text behind a placeholder, so no needle can
-    # match; the placeholder itself IS the draft (see _AGY_PASTE_PLACEHOLDER_RE).
     if any(_AGY_PASTE_PLACEHOLDER_RE.search(line) for line in candidates):
         return True
-    normalized_needle = needle.strip() if needle else ""
-    if not normalized_needle:
+    if any(_AGY_SCROLL_INDICATOR_RE.search(line) for line in candidates):
+        return True
+    needles = [needle.strip() if needle else "", *(n.strip() for n in extra_needles)]
+    needles = [n for n in needles if n]
+    if not needles:
         return bool(candidates)
-    return any(
-        line == normalized_needle
-        or line.startswith(normalized_needle)
-        or normalized_needle in line
-        for line in candidates
-    )
+    return any(_needle_matches_candidates(n, candidates) for n in needles)
 
 
 def _agy_draft_candidate_lines(region: str) -> list[str]:
@@ -1630,6 +1668,7 @@ def _submit_and_verify(
     needle: str = "",
     baseline_region: str = "",
     draft_seen: bool = False,
+    extra_needles: tuple[str, ...] = (),
 ) -> None:
     """
     Press Enter to submit the pasted draft, verifying by composer state.
@@ -1691,10 +1730,14 @@ def _submit_and_verify(
                 )
             pane = _capture_pane(socket_path, tmux_target)
             last_pane = pane or last_pane
-            if pane and not _draft_in_input_region(pane, needle, baseline_region):
+            if pane and not _draft_in_input_region(
+                pane, needle, baseline_region, extra_needles=extra_needles
+            ):
                 return
             time.sleep(_TMUX_POLL_INTERVAL_S)
-    draft_visible = _draft_in_input_region(last_pane, needle, baseline_region)
+    draft_visible = _draft_in_input_region(
+        last_pane, needle, baseline_region, extra_needles=extra_needles
+    )
     raise RuntimeError(
         "agy did not accept the submitted message; the draft is still visible "
         "in the input box; "
@@ -1788,7 +1831,9 @@ def _paste_and_submit(
     # runs for EVERY message — including short ones with no stable needle — so a
     # paste that never lands in the composer is caught rather than submitted blind
     # (``_draft_in_input_region`` keys off composer change when the needle is "").
-    needle = _submit_needle(content)
+    needles = _submit_needles(content)
+    needle = needles[0] if needles else ""
+    extra_needles = tuple(needles[1:]) if len(needles) > 1 else ()
     # A mid-turn steer (agy already running a turn) is delivered best-effort: agy
     # queues it as the next turn and may not surface the draft in the composer the
     # same way an idle turn does, so a non-render is NOT a swallowed message here.
@@ -1802,7 +1847,7 @@ def _paste_and_submit(
     while time.monotonic() < commit_deadline:
         pane = _capture_pane(socket_path, tmux_target)
         last_commit_pane = pane or last_commit_pane
-        if _draft_in_input_region(pane, needle, baseline_region):
+        if _draft_in_input_region(pane, needle, baseline_region, extra_needles=extra_needles):
             draft_seen = True
             break
         time.sleep(_TMUX_POLL_INTERVAL_S)
@@ -1818,6 +1863,7 @@ def _paste_and_submit(
         needle=needle,
         baseline_region=baseline_region,
         draft_seen=draft_seen,
+        extra_needles=extra_needles,
     )
 
 

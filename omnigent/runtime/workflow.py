@@ -19,6 +19,8 @@ from urllib.parse import urlparse
 import yaml
 
 if TYPE_CHECKING:
+    from omnigent.inner.claude_model_access import ClaudeModelAccess
+
     # Lazy: PolicyEngine + PolicyResult are pulled in at runtime via
     # the function-local imports inside ``_handle_policy_ask`` and
     # ``_enforce_policy``-using helpers (see uses below). The
@@ -94,7 +96,7 @@ from omnigent.runtime.compaction import (
 from omnigent.runtime.content_resolver import resolve_content_references
 from omnigent.runtime.prompt import build_instructions, history_to_input_items
 from omnigent.spec import AgentSpec
-from omnigent.spec.parser import check_unresolved_env_vars
+from omnigent.spec.parser import _api_key_source_env_names, check_unresolved_env_vars
 from omnigent.spec.types import (
     ApiKeyAuth,
     DatabricksAuth,
@@ -1445,7 +1447,81 @@ def _build_claude_sdk_spawn_env(
     # Explicitly clear inherited presets for agents that have not opted in.
     preset = spec.executor.config.get("system_prompt_preset")
     env["HARNESS_CLAUDE_SDK_SYSTEM_PROMPT_PRESET"] = str(preset) if preset is not None else ""
+    from omnigent.onboarding.provider_config import _load_config, provider_credential_env_vars
+
+    # Retain env-ref provenance after provider resolution turns keys into helpers.
+    # Local providers can still supply named auth under a managed config overlay.
+    source_env_names = frozenset(
+        spec.executor.auth.source_env_names if isinstance(spec.executor.auth, ApiKeyAuth) else ()
+    )
+    for config in (effective_config_with_detected(load_config()), _load_config()):
+        source_env_names |= provider_credential_env_vars(config, include_dollar_key_refs=True)
+        raw_auth = config.get("auth")
+        if isinstance(raw_auth, dict) and raw_auth.get("type") == "api_key":
+            raw_key = raw_auth.get("api_key")
+            if isinstance(raw_key, str):
+                source_env_names |= frozenset(_api_key_source_env_names(raw_key))
+    env["HARNESS_CLAUDE_SDK_CREDENTIAL_ENV_NAMES"] = json.dumps(sorted(source_env_names))
     return env
+
+
+def claude_terminal_model_access(
+    spec: AgentSpec,
+    *,
+    bundle_dir: Path | None = None,
+    effective_harness: str | None = None,
+    cwd: str | Path | None = None,
+) -> ClaudeModelAccess | None:
+    """Derive automatic terminal model access from the owning Claude SDK session."""
+    from omnigent.inner.claude_model_access import HELPER_ENV, resolve_claude_model_access
+    from omnigent.inner.claude_sdk_executor import (
+        _claude_user_settings_env_with_sources,
+        _resolve_gateway_env,
+        _resolve_sandbox_cwd,
+    )
+
+    harness = effective_harness or spec.executor.harness_kind
+    if not is_claude_sdk_harness_name(harness):
+        return None
+    spec = replace(
+        spec,
+        executor=replace(spec.executor, config={**spec.executor.config, "harness": "claude-sdk"}),
+    )
+    launch_env = _build_claude_sdk_spawn_env(spec)
+    effective_cwd = _resolve_sandbox_cwd(
+        str(cwd) if cwd is not None else spec.os_env.cwd if spec.os_env else None
+    )
+    profile = launch_env.get("HARNESS_CLAUDE_SDK_DATABRICKS_PROFILE")
+    model_env = dict(os.environ)
+    model_env.pop("ANTHROPIC_API_KEY", None)
+    user_settings_source_paths: tuple[Path, ...] = ()
+    user_settings_has_api_key_helper = False
+    if launch_env.get("HARNESS_CLAUDE_SDK_GATEWAY") in ("1", "true"):
+        model_env.update(
+            _resolve_gateway_env(
+                profile,
+                base_url_override=launch_env.get("HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL"),
+                host_override=launch_env.get("HARNESS_CLAUDE_SDK_GATEWAY_HOST"),
+                auth_command_override=launch_env.get("HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND"),
+            )
+        )
+    else:
+        settings_env, user_settings_source_paths, user_settings_has_api_key_helper = (
+            _claude_user_settings_env_with_sources(str(effective_cwd))
+        )
+        model_env.update(settings_env)
+    if helper := launch_env.get("HARNESS_CLAUDE_SDK_API_KEY_HELPER"):
+        model_env[HELPER_ENV] = helper
+    return resolve_claude_model_access(
+        model_env,
+        cwd=effective_cwd,
+        databricks_profile=profile,
+        source_paths=user_settings_source_paths,
+        user_settings_has_api_key_helper=user_settings_has_api_key_helper,
+        source_env_names=frozenset(
+            json.loads(launch_env.get("HARNESS_CLAUDE_SDK_CREDENTIAL_ENV_NAMES", "[]"))
+        ),
+    ).with_bundle_sources(bundle_dir)
 
 
 def _apply_harness_path_override(
@@ -1588,6 +1664,24 @@ def _bind_codex_gateway_credential(env: dict[str, str], spec: AgentSpec) -> None
     env["HARNESS_CODEX_DISABLE_NATIVE_TOOLS"] = "true"
 
 
+def _apply_codex_tool_switches(env: dict[str, str], spec: AgentSpec) -> None:
+    """Apply the spec's Codex tool switches on every route.
+
+    The switches only restrict: ``web_search: true`` or
+    ``disable_native_tools: false`` never re-enables tools the operator disabled.
+    """
+    config = spec.executor.config
+    for key in ("web_search", "disable_native_tools"):
+        if config.get(key) is not None and not isinstance(config[key], bool):
+            raise OmnigentError(
+                f"executor.config.{key} must be a boolean", code=ErrorCode.INVALID_INPUT
+            )
+    if config.get("web_search") is False:
+        env["HARNESS_CODEX_ENABLE_WEB_SEARCH"] = "false"
+    if config.get("disable_native_tools") is True:
+        env["HARNESS_CODEX_DISABLE_NATIVE_TOOLS"] = "true"
+
+
 def _build_codex_spawn_env(
     spec: AgentSpec,
     *,
@@ -1623,6 +1717,7 @@ def _build_codex_spawn_env(
     # unchanged.
     provider = _resolve_provider_for_build(spec, harness_type="codex", for_launch=True)
     _apply_codex_provider_env(env, spec, provider)
+    _apply_codex_tool_switches(env, spec)
     # Skills bridge — same shape as the claude-sdk variant. Always
     # set so the harness wrap doesn't fall back to its ``"all"``
     # default and override an explicit ``skills: none`` spec.
@@ -2134,6 +2229,7 @@ def _load_global_auth() -> ApiKeyAuth | DatabricksAuth | None:
         api_key = str(raw_auth.get("api_key") or "")
         if not api_key:
             return None
+        source_env_names = _api_key_source_env_names(api_key)
         # Expand $VAR references (the config file may store the literal
         # env-var reference; expand at use-time so the secret never
         # needs to live in the YAML file itself).
@@ -2144,7 +2240,7 @@ def _load_global_auth() -> ApiKeyAuth | DatabricksAuth | None:
         if raw_base_url:
             base_url = expand_envvars_with_omnigent_prefix(str(raw_base_url))
             check_unresolved_env_vars("auth.base_url", base_url)
-        return ApiKeyAuth(api_key=api_key, base_url=base_url)
+        return ApiKeyAuth(api_key=api_key, base_url=base_url, source_env_names=source_env_names)
     if auth_type == "databricks":
         profile_val = str(raw_auth.get("profile") or "")
         return DatabricksAuth(profile=profile_val) if profile_val else None

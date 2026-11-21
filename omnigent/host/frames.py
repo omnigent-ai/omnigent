@@ -19,6 +19,8 @@ see.
 
 from __future__ import annotations
 
+import base64
+import importlib.util
 import json
 import math
 from collections.abc import Iterator
@@ -76,6 +78,7 @@ RUNNER_LOG_TAIL_HEADING = "--- runner log tail ---"
 # feature simply omits the token (older hosts send no ``capabilities`` at all).
 # The runner intercepts codex ``/side`` and forks an ephemeral side-chat thread:
 CAP_CODEX_SIDE_CHAT = "codex_side_chat"
+CAP_CODEX_SIDE_CHAT_RESUME = "codex_side_chat_resume"
 # The runner starts a codex-native session whose collaboration-mode label is
 # ``plan`` (armed on the New Session screen) in Codex Plan mode:
 CAP_CODEX_PLAN_AT_LAUNCH = "codex_plan_at_launch"
@@ -84,6 +87,7 @@ CAP_MCP_INVENTORY = "mcp_inventory"
 CAP_HARNESS_STARTUP = "harness_startup"
 CAP_PLUGINS = "plugins"
 CAP_SKILL_CONTENT = "skill_content"
+CAP_WORKFLOWS = "workflows"
 CAP_MCP_TOOLS = "mcp_tools"
 CAP_MCP_SERVER_ENABLED = "mcp_server_enabled"
 CAP_REFRESH_HARNESSES = "refresh_harnesses"
@@ -95,15 +99,22 @@ CAP_TCP_EGRESS = "tcp_egress"
 CAP_WORKTREE_CREATE_BUDGET = "worktree_create_budget"
 # The host clones a git repository into a new directory (``host.clone_repository``):
 CAP_CLONE_REPOSITORY = "clone_repository"
+# The host answers ``host.workspace_call`` (the workspace API through the server).
+CAP_WORKSPACE_API = "workspace_api"
+# The host's runners accept session messages up to ``SESSION_MESSAGE_MAX_CHARS``
+# (32,000) instead of 8,000, so automations can send long instructions:
+CAP_LONG_SESSION_MESSAGES = "long_session_messages"
 
 # Every capability THIS build supports; reported verbatim in the hello frame.
 HOST_CAPABILITIES: list[str] = [
     CAP_CODEX_SIDE_CHAT,
+    CAP_CODEX_SIDE_CHAT_RESUME,
     CAP_CODEX_PLAN_AT_LAUNCH,
     CAP_FILESYSTEM_ATTACHMENTS,
     CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
     CAP_PLUGINS,
     CAP_SKILL_CONTENT,
+    CAP_WORKFLOWS,
     CAP_MCP_TOOLS,
     CAP_MCP_SERVER_ENABLED,
     CAP_MCP_REGISTRY,
@@ -115,7 +126,11 @@ HOST_CAPABILITIES: list[str] = [
     CAP_HARNESS_ACCOUNTS,
     CAP_HARNESS_LOGIN,
     CAP_CLONE_REPOSITORY,
+    CAP_LONG_SESSION_MESSAGES,
 ]
+# The workspace API needs the optional `omnigent[workspace-api]` extra.
+if importlib.util.find_spec("connectrpc") is not None:
+    HOST_CAPABILITIES.append(CAP_WORKSPACE_API)
 
 # Server capabilities, advertised on the tunnel's WebSocket upgrade response (the
 # server sends no frame before the host's hello). Older servers send no header.
@@ -222,6 +237,7 @@ def classify_launch_refusal(
 class HostFrameKind(str, Enum):
     """All host frame kinds; the value is the JSON wire string."""
 
+    RECOVER_SESSIONS = "host.recover_sessions"
     HELLO = "host.hello"
     CONNECTION_ERROR = "host.connection_error"
     HARNESS_READINESS = "host.harness_readiness"
@@ -265,6 +281,8 @@ class HostFrameKind(str, Enum):
     DETECT_CREDENTIALS_RESULT = "host.detect_credentials_result"
     FS_REQUEST = "host.fs_request"
     FS_RESULT = "host.fs_result"
+    WORKSPACE_CALL = "host.workspace_call"
+    WORKSPACE_REPLY = "host.workspace_reply"
     FS_WRITE_REQUEST = "host.fs_write_request"
     MODEL_OPTIONS = "host.model_options"
     MODEL_OPTIONS_RESULT = "host.model_options_result"
@@ -349,6 +367,14 @@ class HostHelloFrame:
     connection_id: str | None = None
     workspace_socket: str | None = None
     workspace_token_key: str | None = field(default=None, repr=False)
+    recover_interrupted_sessions: bool = False
+
+
+@dataclass
+class HostRecoverSessionsFrame:
+    """Host requests reconciliation after its provider has restored local state."""
+
+    runners: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -427,6 +453,7 @@ class HostLaunchRunnerFrame:
     scheduled_run: ScheduledRunLogContext | None = None
     mcp_disabled_servers_active_harnesses: list[str] | None = None
     session_env_handoff_id: str | None = None
+    recovery: bool = False
 
 
 @dataclass
@@ -1284,6 +1311,40 @@ class HostFsWriteFrame:
 
 
 @dataclass
+class HostWorkspaceCallFrame:
+    """Server → host: one workspace API call (``omnigent.api.workspace.v1alpha1``).
+
+    :param request_id: Correlates the call's replies.
+    :param workspace: The session's workspace on the host, chosen by the server.
+    :param method: Method name, e.g. ``"ReadFile"``.
+    :param request: The serialized request message.
+    """
+
+    request_id: str
+    workspace: str
+    method: str
+    request: bytes = b""
+
+
+@dataclass
+class HostWorkspaceReplyFrame:
+    """Host → server: one response message of a workspace call, or its end.
+
+    :param request_id: The call this answers.
+    :param message: A serialized response message, or ``None``.
+    :param done: Whether this is the call's last frame.
+    :param error_code: On a failed call's last frame, its Connect code, e.g. ``"not_found"``.
+    :param error_message: The failure's message.
+    """
+
+    request_id: str
+    message: bytes | None = None
+    done: bool = False
+    error_code: str | None = None
+    error_message: str | None = None
+
+
+@dataclass
 class HostFsResultFrame:
     """Host → server: outcome of a workspace filesystem request (read or write).
 
@@ -1347,6 +1408,7 @@ class HostSkillsFrame:
     agent_version: str | None = None
     sub_agent_name: str | None = None
     skills_filter: str | list[str] = "all"
+    workflows_enabled: bool = False
 
 
 @dataclass
@@ -1608,7 +1670,8 @@ class HostImportLocalDoneFrame:
 
 
 HostFrame = (
-    HostHelloFrame
+    HostRecoverSessionsFrame
+    | HostHelloFrame
     | HostConnectionErrorFrame
     | HostHarnessReadinessFrame
     | HostLaunchRunnerFrame
@@ -1651,6 +1714,8 @@ HostFrame = (
     | HostDetectCredentialsResultFrame
     | HostFsRequestFrame
     | HostFsResultFrame
+    | HostWorkspaceCallFrame
+    | HostWorkspaceReplyFrame
     | HostFsWriteFrame
     | HostModelOptionsFrame
     | HostModelOptionsResultFrame
@@ -1744,6 +1809,13 @@ def encode_host_frame(frame: HostFrame) -> str:
     :returns: JSON string for the WebSocket text message.
     :raises TypeError: If ``frame`` is not a known host frame type.
     """
+    if isinstance(frame, HostRecoverSessionsFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.RECOVER_SESSIONS.value,
+                "runners": list(frame.runners),
+            }
+        )
     if isinstance(frame, HostHelloFrame):
         return _encode_payload(
             {
@@ -1762,6 +1834,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "connection_id": frame.connection_id,
                 "workspace_socket": frame.workspace_socket,
                 "workspace_token_key": frame.workspace_token_key,
+                "recover_interrupted_sessions": frame.recover_interrupted_sessions,
             }
         )
     if isinstance(frame, HostConnectionErrorFrame):
@@ -1799,6 +1872,8 @@ def encode_host_frame(frame: HostFrame) -> str:
             )
         if frame.scheduled_run is not None:
             payload["scheduled_run"] = frame.scheduled_run.model_dump()
+        if frame.recovery:
+            payload["recovery"] = True
         if frame.superseded_runner_ids is not None:
             payload["superseded_runner_ids"] = list(frame.superseded_runner_ids)
         return _encode_payload(payload)
@@ -2199,6 +2274,29 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "params": frame.params,
             }
         )
+    if isinstance(frame, HostWorkspaceCallFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.WORKSPACE_CALL.value,
+                "request_id": frame.request_id,
+                "workspace": frame.workspace,
+                "method": frame.method,
+                "request": base64.b64encode(frame.request).decode(),
+            }
+        )
+    if isinstance(frame, HostWorkspaceReplyFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.WORKSPACE_REPLY.value,
+                "request_id": frame.request_id,
+                "message": None
+                if frame.message is None
+                else base64.b64encode(frame.message).decode(),
+                "done": frame.done,
+                "error_code": frame.error_code,
+                "error_message": frame.error_message,
+            }
+        )
     if isinstance(frame, HostFsResultFrame):
         return _encode_payload(
             {
@@ -2242,6 +2340,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "agent_version": frame.agent_version,
                 "sub_agent_name": frame.sub_agent_name,
                 "skills_filter": frame.skills_filter,
+                "workflows_enabled": frame.workflows_enabled,
             }
         )
     if isinstance(frame, HostSkillsResultFrame):
@@ -2650,6 +2749,10 @@ def _decode_known_host_frame(
     :raises ValueError: If the kind is unexpectedly unhandled.
     """
     match kind:
+        case HostFrameKind.RECOVER_SESSIONS:
+            return HostRecoverSessionsFrame(
+                runners=_optional_str_list(msg, "runners"),
+            )
         case HostFrameKind.HELLO:
             return _decode_host_hello(msg)
         case HostFrameKind.CONNECTION_ERROR:
@@ -2785,6 +2888,22 @@ def _decode_known_host_frame(
             return _decode_fs_request(msg)
         case HostFrameKind.FS_RESULT:
             return _decode_fs_result(msg)
+        case HostFrameKind.WORKSPACE_CALL:
+            return HostWorkspaceCallFrame(
+                request_id=_required_str(msg, "request_id"),
+                workspace=_required_str(msg, "workspace"),
+                method=_required_str(msg, "method"),
+                request=base64.b64decode(_optional_nullable_str(msg, "request") or ""),
+            )
+        case HostFrameKind.WORKSPACE_REPLY:
+            message = _optional_nullable_str(msg, "message")
+            return HostWorkspaceReplyFrame(
+                request_id=_required_str(msg, "request_id"),
+                message=None if message is None else base64.b64decode(message),
+                done=_optional_bool(msg, "done"),
+                error_code=_optional_nullable_str(msg, "error_code"),
+                error_message=_optional_nullable_str(msg, "error_message"),
+            )
         case HostFrameKind.FS_WRITE_REQUEST:
             return _decode_fs_write_request(msg)
         case HostFrameKind.MODEL_OPTIONS:
@@ -2809,6 +2928,7 @@ def _decode_known_host_frame(
                 agent_version=_optional_nullable_str(msg, "agent_version"),
                 sub_agent_name=_optional_nullable_str(msg, "sub_agent_name"),
                 skills_filter=skills_filter,
+                workflows_enabled=msg.get("workflows_enabled") is True,
             )
         case HostFrameKind.SKILLS_RESULT:
             return _decode_skills_result(msg)
@@ -2913,6 +3033,7 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         connection_id=_optional_nullable_str(msg, "connection_id"),
         workspace_socket=_optional_nullable_str(msg, "workspace_socket"),
         workspace_token_key=_optional_nullable_str(msg, "workspace_token_key"),
+        recover_interrupted_sessions=_optional_bool(msg, "recover_interrupted_sessions"),
     )
 
 
@@ -2946,6 +3067,7 @@ def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
         raise ValueError("inference_config must be an object or null")
     return HostLaunchRunnerFrame(
         request_id=_required_str(msg, "request_id"),
+        recovery=_optional_bool(msg, "recovery"),
         binding_token=_required_str(msg, "binding_token"),
         workspace=_required_str(msg, "workspace"),
         session_id=_optional_nullable_str(msg, "session_id"),

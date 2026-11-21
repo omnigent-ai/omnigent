@@ -44,6 +44,11 @@ if (process.platform === "darwin") {
   });
 }
 
+/** A shortcut id for the shell to check; anything else names the default "show". */
+function shortcutId(id) {
+  return typeof id === "string" ? id : undefined;
+}
+
 // Collapse the update states the in-page UpdateBanner renders on
 // (available / downloading / downloaded / error-security) to `idle` so the server page can
 // never show a banner — that UI is shell-owned (the corner overlay). Kept here
@@ -65,6 +70,21 @@ function bannerSafe(status) {
 // Native integrations for the SPA: a dock/taskbar badge and OS notifications.
 // Numbers/strings only so the values survive contextBridge's structured-clone
 // boundary.
+// Annotate and Draw (designTools.js): open and stop a tool's overlay on a view, and its page
+// operations and captures. A test run can leave them out, to stand in for an older shell.
+const designTools =
+  process.env?.OMNIGENT_DESKTOP_LEGACY_DESIGN_MODE === "1"
+    ? {}
+    : {
+        browserDesignTools: (args) => ipcRenderer.invoke("omnigent:browser-design-tools", args),
+        /** Main ended a view's opening (its page went): `{ viewId, type: "ended", session, reason }`. */
+        onBrowserDesignToolsEvent: (callback) => {
+          const listener = (_event, payload) => callback(payload);
+          ipcRenderer.on("browser-design-tools-event", listener);
+          return () => ipcRenderer.removeListener("browser-design-tools-event", listener);
+        },
+      };
+
 contextBridge.exposeInMainWorld("omnigentDesktop", {
   kind: "electron",
   /** Paint the dock/taskbar badge; 0 clears it. Fire-and-forget. */
@@ -173,25 +193,30 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
         startSystemDictation: () => ipcRenderer.invoke("omnigent:start-system-dictation"),
       }
     : {}),
-  /** The "Show Omnigent from anywhere" shortcut (off by default). */
-  getGlobalShortcut: () => ipcRenderer.invoke("omnigent:get-global-shortcut"),
+  /**
+   * A system-wide shortcut by id: "show" (Show Omnigent from anywhere, off by default, and
+   * the default id) or "floatingComposer" (the New Agent panel, macOS).
+   */
+  getGlobalShortcut: (id) => ipcRenderer.invoke("omnigent:get-global-shortcut", shortcutId(id)),
   /**
    * Saves `{ enabled, accelerator }`, or turns the shortcut off for `{ enabled: false }`,
    * keeping the saved chord. Resolves `{ ok, setting?, error? }`; `ok: false` means the
    * saved setting is unchanged.
    */
-  setGlobalShortcut: ({ enabled, accelerator } = {}) =>
+  setGlobalShortcut: ({ enabled, accelerator } = {}, id) =>
     ipcRenderer.invoke(
       "omnigent:set-global-shortcut",
       enabled !== true && accelerator === undefined
         ? { enabled: false }
         : { enabled: enabled === true, accelerator: String(accelerator ?? "") },
+      shortcutId(id),
     ),
   /**
    * Takes the next chord in the shell, before the page's shortcuts and the menu see it.
    * Resolves its accelerator, or null when Escape or the cancel call ends recording.
    */
-  recordGlobalShortcut: () => ipcRenderer.invoke("omnigent:record-global-shortcut"),
+  recordGlobalShortcut: (id) =>
+    ipcRenderer.invoke("omnigent:record-global-shortcut", shortcutId(id)),
   cancelGlobalShortcutRecording: () =>
     ipcRenderer.invoke("omnigent:cancel-global-shortcut-recording"),
   /** The runner picked during onboarding for this server ("local" |
@@ -243,6 +268,30 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    */
   getDesktopFeatures: () => ipcRenderer.invoke("omnigent:get-desktop-features"),
   /**
+   * The floating New Agent panel, usable when getDesktopFeatures() reports
+   * `floatingComposer` (macOS). A main window's page announces it can render the panel;
+   * the panel's own page dismisses itself and opens what it launched in a main window.
+   */
+  floatingComposer: {
+    /** From a main window: this document can render the panel (version 1) for its server. */
+    announceSupport: (version) => ipcRenderer.send("omnigent:floating-composer:announce", version),
+    /** From the panel: hide it, keeping its draft. */
+    dismiss: () => ipcRenderer.send("omnigent:floating-composer:dismiss"),
+    /**
+     * From the panel: open `/c/<id>` or a page it links to in a main window of its server,
+     * then hide. Resolves `{ ok: true }` or
+     * `{ ok: false, error: "not-composer" | "bad-path" | "window-loading" }`.
+     */
+    openInMainWindow: (path) =>
+      ipcRenderer.invoke("omnigent:floating-composer:open-in-main-window", path),
+    /** From the panel: its native file picker opened or closed. */
+    filePicker: (state) =>
+      ipcRenderer.send(
+        "omnigent:floating-composer:file-picker",
+        state === "open" ? "open" : "closed",
+      ),
+  },
+  /**
    * Connect the user's Arca instance to the window's
    * server as a host, via `arca ssh`. Native consent is asked in the main
    * process. Resolves a `{ ok, error?, authError? }` result.
@@ -258,6 +307,21 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
          * Resolves `{ ok, error?, canceled?, identity? }`.
          */
         connectSshHost: (destination) => ipcRenderer.invoke("omnigent:ssh-connect", destination),
+      }),
+  // Main checks a socket's owner before using it, which Windows can't report.
+  ...(process.platform === "win32"
+    ? {}
+    : {
+        /**
+         * Send one workspace API call to a session host's socket, named by the
+         * server with a token: on this machine, or over SSH. `sshTarget` is an
+         * alias main may ask the user to allow, then try and record, if the
+         * host has none yet.
+         * Resolves `{ status, headers, body }`.
+         * @param {{hostId: string, sshTarget?: string, socketPath: string, path: string, headers: Record<string, string>, body: Uint8Array}} request
+         */
+        workspaceSocketRequest: (request) =>
+          ipcRenderer.invoke("omnigent:workspace-socket-request", request),
       }),
   /** Extend the local Arca instance with one of the main process's approved modes. */
   extendArca: (mode) => ipcRenderer.invoke("omnigent:arca-extend", mode),
@@ -385,10 +449,21 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * @returns {Promise<{ ok: boolean, dataUrl?: string, error?: string }>}
    */
   browserScreenshot: (conversationId, opts) =>
-    ipcRenderer.invoke("omnigent:browser-screenshot", { conversationId, opts }),
+    ipcRenderer.invoke("omnigent:browser-screenshot", {
+      deadlineAt: opts?.deadlineAt,
+      conversationId,
+      opts,
+    }),
   /** Perform a fixed snapshot, click or type action in the conversation's view. */
   browserPerformAction: (conversationId, action, params, opts) =>
     ipcRenderer.invoke("omnigent:browser-perform-action", { conversationId, action, params, opts }),
+  // The agent browser tools' per-session tab records, kept in main (browserTabs.js).
+  browserTabs: (args) => ipcRenderer.invoke("omnigent:browser-tabs", args),
+  onBrowserTabsChanged: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on("omnigent:browser-tabs-changed", listener);
+    return () => ipcRenderer.removeListener("omnigent:browser-tabs-changed", listener);
+  },
   /** @deprecated Until v0.21: main translates only recognized v0.18 action templates. */
   browserExecute: (conversationId, js, opts) =>
     ipcRenderer.invoke("omnigent:browser-execute", { conversationId, js, opts }),
@@ -397,8 +472,13 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * @param {string} conversationId
    * @param {string} [reason]
    */
-  browserClose: (conversationId, reason) =>
-    ipcRenderer.invoke("omnigent:browser-close", { conversationId, reason }),
+  browserClose: (conversationId, reason, opts) =>
+    ipcRenderer.invoke("omnigent:browser-close", {
+      conversationId,
+      reason,
+      deadlineAt: opts?.deadlineAt,
+      expectedNavs: opts?.expectedNavs,
+    }), // deadlineAt, expectedNavs
   /**
    * Subscribe to which conversation's browser view is currently attached to the
    * host window (`{conversationId}` or `{conversationId: null}` when detached).
@@ -508,22 +588,23 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   openBrowserDevTools: (conversationId) =>
     ipcRenderer.invoke("omnigent:open-browser-devtools", { conversationId }),
   /**
-   * Inspect the user's local Google Chrome profiles for cookies in the site
-   * tree the conversation's view is currently on. Metadata only (profile name +
-   * per-scope counts): no Keychain access and no cookie values. macOS only.
+   * Inspect the user's local Google Chrome profiles for cookies: in the site
+   * tree the conversation's view is currently on (`profiles`), and across every
+   * website (`allSitesProfiles`). Metadata only (profile name + counts): no
+   * Keychain access and no cookie values. macOS only.
    * @param {string} conversationId
-   * @returns {Promise<{ ok: boolean, host?: string, scopes?: string[], profiles?: Array<{ id: string, name: string, cookieCount: number, scopes?: Array<{ host: string, cookieCount: number }> }>, error?: string }>}
+   * @returns {Promise<{ ok: boolean, host?: string, scopes?: string[], profiles?: Array<{ id: string, name: string, cookieCount: number, scopes?: Array<{ host: string, cookieCount: number }> }>, allSitesProfiles?: Array<{ id: string, name: string, cookieCount: number }>, error?: string }>}
    */
   browserChromeCookiePreview: (conversationId) =>
     ipcRenderer.invoke("omnigent:browser-chrome-cookie-preview", { conversationId }),
   /**
-   * Copy ONLY that site's cookies out of one Chrome profile into the
-   * conversation's own (in-memory) session. Decrypts via the Keychain, so the
-   * first import shows a system approval prompt. `expectedHost` must still match
-   * the view's site.
+   * Copy one Chrome profile's cookies into the conversation's own (in-memory)
+   * session. Decrypts via the Keychain, so the first import shows a system
+   * approval prompt.
    * @param {string} conversationId
-   * `scope` is the site tree to copy (the page's host or a parent domain); main
-   * rejects anything that isn't an ancestor of the page.
+   * `scope` is `"*"` for every website, or the site tree to copy (the page's
+   * host or a parent domain); main rejects a site that isn't an ancestor of the
+   * page, and `expectedHost` must then still match the view's site.
    * @param {{ profileId: string, expectedHost: string, scope?: string }} args
    * @returns {Promise<{ ok: boolean, imported?: number, skipped?: number, failed?: number, error?: string }>}
    */
@@ -556,6 +637,8 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     ipcRenderer.on("browser-nav-state", listener);
     return () => ipcRenderer.removeListener("browser-nav-state", listener);
   },
+
+  ...designTools,
 
   // ── Design mode (point-and-prompt) ─────────────────────────────────────
   // Toggle the in-page picker + popup. On Send, the SPA gets the submit via
@@ -661,6 +744,8 @@ contextBridge.exposeInMainWorld("omnigentSetup", {
    *  `{ok, error?}`; output streams via onRunnerConnectLog.
    *  @param {string} url @param {"local"|"remote"} runner */
   connectRunner: (url, runner) => ipcRenderer.invoke("omnigent:connect-runner", url, runner),
+  /** Stop the in-flight connectRunner sign-in. Resolves whether one was running. */
+  cancelRunnerConnect: () => ipcRenderer.invoke("omnigent:cancel-runner-connect"),
   /** Subscribe to connectRunner output. Returns an unsubscribe function.
    *  @param {(line: string) => void} callback */
   onRunnerConnectLog: (callback) => {
