@@ -40,10 +40,11 @@ final class WatchConversation {
     let snapshotQuery = [
       "include_items": "false", "include_liveness": "false", "include_usage": "false",
     ]
+    // Committed items live in the store, independently of runner availability or affinity.
+    async let items = recentItems(path + "/items")
     do {
       let host = try await client.routingHost(for: session.id)
       async let snapshot: WatchSnapshot = client.get(path, snapshotQuery, host: host)
-      async let items = recentItems(path + "/items", host: host)
       let (state, transcript) = try await (snapshot, items)
       guard generation == loadGeneration else { return }
       pollDelay = .seconds(5)
@@ -63,19 +64,23 @@ final class WatchConversation {
     } catch is CancellationError {
     } catch let failure as URLError where failure.code == .cancelled {
     } catch {
+      let transcript = try? await items
       guard generation == loadGeneration else { return }
+      if let transcript { messages = Array(transcript.reversed().bubbles.suffix(12)) }
+      approvals = []
+      session.pendingElicitationsCount = 0
       loadError = error.localizedDescription
       pollDelay = min(pollDelay * 2, .seconds(120))
     }
   }
 
-  private func recentItems(_ path: String, host: String?) async throws -> [WatchItem] {
+  private func recentItems(_ path: String) async throws -> [WatchItem] {
     var query = ["order": "desc", "limit": "30"]
     var items: [WatchItem] = []
     var cursors: Set<String> = []
     // Bound polling work even when hundreds of tool/reasoning items precede visible messages.
     for _ in 0..<10 {
-      let page: WatchPage<WatchItem> = try await client.get(path, query, host: host)
+      let page: WatchPage<WatchItem> = try await client.get(path, query)
       items += page.data
       guard items.reversed().bubbles.count < 12, page.hasMore == true, !page.data.isEmpty,
         let cursor = page.lastId, cursors.insert(cursor).inserted

@@ -183,7 +183,7 @@ struct WatchMessage: Hashable, Identifiable, Sendable {
 struct WatchElicitation: Decodable, Identifiable, Sendable {
   struct Params: Decodable, Sendable {
     let mode: String?
-    let message: String
+    let message: String?
     let contentPreview: String?
     let targetSessionId: String?
     let requestedSchema: Schema?
@@ -196,6 +196,7 @@ struct WatchElicitation: Decodable, Identifiable, Sendable {
   let elicitationId: String
   let params: Params
   var id: String { elicitationId }
+  var message: String { params.message ?? "Approval required" }
   /// Plain yes/no prompts only; forms, URL flows, and receipt-based native delivery need the phone.
   var isBinary: Bool {
     (params.mode ?? "form") == "form" && params.askUserQuestion == nil
@@ -260,8 +261,7 @@ struct WatchClient: Sendable {
           // A bounded, read-only runner inventory verifies affinity first.
           if let probeSessionID {
             _ = try await send(
-              request("sessions/\(probeSessionID)/resources/terminals", ["limit": "1"], host: host),
-              allowingOfflineRunner: true)
+              request("sessions/\(probeSessionID)/resources/terminals", ["limit": "1"], host: host))
           }
           return host
         }
@@ -300,8 +300,7 @@ struct WatchClient: Sendable {
     return request
   }
 
-  private func send(_ request: URLRequest, allowingOfflineRunner: Bool = false) async throws -> Data
-  {
+  private func send(_ request: URLRequest) async throws -> Data {
     var request = request
     let host = request.value(forHTTPHeaderField: Self.sliceKey)
     if let host {
@@ -325,10 +324,6 @@ struct WatchClient: Sendable {
           host, keyless: request.value(forHTTPHeaderField: Self.sliceKey) == nil)
       }
       return data
-    case 503
-    where allowingOfflineRunner && !retried && serverErrorCode(data) == "runner_unavailable":
-      // An offline runner still has a readable durable transcript; no new affinity is learned.
-      return Data()
     case 401: throw WatchError.signedOut
     case 403: throw WatchError.forbidden
     case let code: throw WatchError.status(code)

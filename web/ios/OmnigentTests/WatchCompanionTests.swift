@@ -642,7 +642,6 @@ final class WatchCompanionTests: XCTestCase {
     }
 
     var bound = false
-    var itemReads = 0
     let server = try MockHTTPServer(requestHandler: { request in
       let url = URLComponents(string: request.path)
       let host = request.headers["x-databricks-omnigent-slice-key"]
@@ -660,8 +659,7 @@ final class WatchCompanionTests: XCTestCase {
           200, [:], Data("{\"host_id\":\"late-host\",\"pending_elicitations\":\(pending)}".utf8)
         )
       case "/v1/sessions/s1/items":
-        itemReads += 1
-        if itemReads > 1 { XCTAssertEqual(host, "late-host") }
+        XCTAssertNil(host, "Durable items do not depend on the runner's route")
         return (200, [:], Data(#"{"data":[]}"#.utf8))
       default:
         XCTFail("Unexpected watch request: \(request.path)")
@@ -682,7 +680,8 @@ final class WatchCompanionTests: XCTestCase {
     XCTAssertEqual(conversation.approvals.map(\.id), ["late"])
 
     var actualKey: String?
-    var probeFails = false
+    var probeStatus = 502
+    var storedText = "Stored before opening"
     var pendingID: String? = "keyless"
     var probeKeys: [String?] = []
     var snapshotKeys: [String?] = []
@@ -708,14 +707,25 @@ final class WatchCompanionTests: XCTestCase {
         if key != actualKey {
           return (400, [:], Data(#"{"error":{"code":"wrong_replica"}}"#.utf8))
         }
-        if probeFails {
-          return (503, [:], Data(#"{"error":{"code":"runner_unavailable"}}"#.utf8))
+        if probeStatus != 200 {
+          let failure =
+            probeStatus == 503
+            ? #"{"error":{"code":"runner_unavailable"}}"#
+            : #"{"detail":"runner resource endpoint unavailable"}"#
+          return (probeStatus, [:], Data(failure.utf8))
         }
         return (200, [:], Data(#"{"data":[]}"#.utf8))
       case ("GET", "/v1/sessions/s1/items"):
-        return (200, [:], Data(#"{"data":[]}"#.utf8))
-      case ("POST", "/v1/sessions/s1/elicitations/keyless/resolve"):
+        XCTAssertNil(key, "Stored messages must remain readable without verified affinity")
+        return (
+          200, [:],
+          Data(
+            #"{"data":[{"id":"stored","type":"message","role":"assistant","content":[{"text":"\#(storedText)"}]}]}"#
+              .utf8)
+        )
+      case ("POST", let path) where path?.hasPrefix("/v1/sessions/s1/elicitations/") == true:
         responseKeys.append(key)
+        XCTAssertEqual(probeStatus, 200, "A failed routing probe must never permit an approval")
         XCTAssertNil(key, "Approvals must use the proven keyless route")
         pendingID = nil
         return (200, [:], Data())
@@ -730,6 +740,13 @@ final class WatchCompanionTests: XCTestCase {
         credentials: WatchCredentials(
           apiURL: URL(string: "http://127.0.0.1:\(keylessServer.port)/v1")!,
           cookie: "session=test")))
+    await routed.load()
+    XCTAssertEqual(routed.messages.map(\.text), [storedText])
+    XCTAssertEqual(routed.error, WatchError.status(502).localizedDescription)
+    XCTAssertTrue(routed.approvals.isEmpty)
+    XCTAssertTrue(snapshotKeys.isEmpty, "Unverified routing must not fetch live approvals")
+    probeStatus = 200
+    probeKeys.removeAll()
     await routed.load()
     XCTAssertNil(routed.error)
     XCTAssertEqual(routed.approvals.map(\.id), ["keyless"])
@@ -754,27 +771,41 @@ final class WatchCompanionTests: XCTestCase {
     await routed.load()
     XCTAssertEqual(probeKeys.last!, "moving-host")
 
-    // A failed retry cannot prove new affinity or replace the last good snapshot.
+    // Failed routing still refreshes stored messages but withholds live approvals.
     actualKey = nil
-    probeFails = true
+    probeStatus = 503
+    storedText = "Committed during outage"
     let priorSnapshotCount = snapshotKeys.count
     await routed.load()
     XCTAssertNotNil(routed.error)
     XCTAssertEqual(snapshotKeys.count, priorSnapshotCount)
-    XCTAssertEqual(routed.approvals.map(\.id), ["later"])
-    probeFails = false
+    XCTAssertTrue(routed.approvals.isEmpty)
+    XCTAssertEqual(routed.messages.map(\.text), [storedText])
+    probeStatus = 200
     await routed.load()
     XCTAssertNil(routed.error)
     XCTAssertEqual(Array(probeKeys.suffix(2)), ["moving-host", nil])
     XCTAssertNil(snapshotKeys.last!)
 
-    // A genuinely offline runner must not prevent reading the stored transcript.
-    probeFails = true
-    pendingID = nil
+    let laterApproval = try XCTUnwrap(routed.approvals.first)
+    for status in [502, 503] {
+      probeStatus = status
+      storedText = "Committed during HTTP \(status)"
+      await routed.load()
+      XCTAssertNotNil(routed.error)
+      XCTAssertTrue(routed.approvals.isEmpty)
+      XCTAssertEqual(routed.messages.map(\.text), [storedText])
+      XCTAssertEqual(snapshotKeys.count, priorSnapshotCount + 1)
+      await routed.resolve(laterApproval, accept: true)
+      XCTAssertEqual(responseKeys.count, 1, "Even a previously displayed approval must fail closed")
+    }
+    probeStatus = 200
     await routed.load()
+    XCTAssertEqual(routed.approvals.map(\.id), ["later"])
+    await routed.resolve(laterApproval, accept: false)
     XCTAssertNil(routed.error)
     XCTAssertTrue(routed.approvals.isEmpty)
-    XCTAssertEqual(snapshotKeys.count, priorSnapshotCount + 2)
+    XCTAssertEqual(responseKeys.count, 2, "Approval resumes only after routing recovers")
   }
 
   @MainActor func testToolHeavyTranscriptBackfillsVisibleMessages() async throws {
@@ -939,7 +970,9 @@ final class WatchCompanionTests: XCTestCase {
           "requestedSchema": {"properties": {"choice": {"type": "string"}}}}},
          {"elicitation_id": "e3", "params": {"mode": "url", "message": "Sign in"}},
          {"elicitation_id": "e4", "params": {"mode": "form", "message": "Which?",
-          "requestedSchema": null, "ask_user_question": {"questions": []}}}
+          "requestedSchema": null, "ask_user_question": {"questions": []}}},
+         {"elicitation_id": "e5", "params": {}},
+         {"elicitation_id": "e6", "params": {"message": null}}
        ]}
       """
     let snapshot = try WatchClient.decoder.decode(WatchSnapshot.self, from: Data(json.utf8))
@@ -952,7 +985,11 @@ final class WatchCompanionTests: XCTestCase {
         WatchMessage(
           id: "pending:p4", isUser: true, text: "<system-reminder>queued</system-reminder>"),
       ])
-    XCTAssertEqual(snapshot.pendingElicitations?.map(\.isBinary), [true, false, false, false])
+    XCTAssertEqual(
+      snapshot.pendingElicitations?.map(\.isBinary), [true, false, false, false, true, true])
+    XCTAssertEqual(
+      snapshot.pendingElicitations?.map(\.message),
+      ["Run it?", "Pick", "Sign in", "Which?", "Approval required", "Approval required"])
 
     let items = """
       {"data": [

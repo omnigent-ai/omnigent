@@ -42,7 +42,7 @@ private struct ApprovalCard: View {
   var body: some View {
     VStack(alignment: .leading, spacing: 8) {
       Text("Needs response").font(.caption2.weight(.semibold)).foregroundStyle(Color.brand)
-      Text(approval.params.message).font(.subheadline.weight(.medium))
+      Text(approval.message).font(.subheadline.weight(.medium))
       if let preview = approval.params.contentPreview, !preview.isEmpty {
         Text(preview)
           .font(.caption2.monospaced())
