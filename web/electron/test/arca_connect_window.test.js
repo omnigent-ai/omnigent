@@ -130,6 +130,13 @@ it("lets copy shortcuts copy a terminal selection instead of sending ^C", (t) =>
   assert.equal(passesToTerminal({ key: "c" }), true);
 });
 
+it("keeps the status line selectable although the page disables selection", (t) => {
+  const { document } = renderConsole(t, { scrollHeight: 360 });
+  const userSelect = (element) => document.defaultView.getComputedStyle(element).userSelect;
+  assert.equal(userSelect(document.body), "none");
+  assert.equal(userSelect(document.getElementById("status")), "text");
+});
+
 /** A fake Electron world: BrowserWindow + ipcMain + a controllable connect. */
 function flowHarness() {
   const world = {
