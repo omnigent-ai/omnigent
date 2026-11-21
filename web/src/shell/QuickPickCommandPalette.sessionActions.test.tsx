@@ -184,6 +184,21 @@ describe("QuickPick ⌘K session actions", () => {
     expect(rename).toHaveAttribute("aria-disabled", "true");
   });
 
+  it("names the page as the session reads now, after a rename elsewhere", async () => {
+    const queryClient = new QueryClient();
+    const cacheSessions = (...rows: Conversation[]) =>
+      queryClient.setQueryData(["conversations", "sidebar"], {
+        pages: [{ data: rows }],
+        pageParams: [undefined],
+      });
+    cacheSessions(MINE, SHARED);
+    const { input } = renderPalette(queryClient);
+    openActions(input);
+    await waitFor(() => expect(heading()).toBe("Actions for “Fix the parser”"));
+    act(() => cacheSessions({ ...MINE, title: "Parser rewrite" }, SHARED));
+    await waitFor(() => expect(heading()).toBe("Actions for “Parser rewrite”"));
+  });
+
   it("lists no actions for a session still being created", async () => {
     listSessions({ ...MINE, id: "temp:example", provisional: true }, SHARED);
     const { input } = renderPalette();
