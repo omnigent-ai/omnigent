@@ -86,6 +86,38 @@ describe("useHostWorktrees", () => {
     });
     expect(result.current.data?.[0].branch).toBe("selected");
   });
+
+  it("aborts worktree discovery after the selected path changes", async () => {
+    let abandonedSignal: AbortSignal | undefined;
+    authenticatedFetchMock
+      .mockImplementationOnce((_url, init) => {
+        abandonedSignal = init?.signal as AbortSignal;
+        return new Promise<Response>((_resolve, reject) => {
+          abandonedSignal?.addEventListener("abort", () => reject(abandonedSignal?.reason));
+        });
+      })
+      .mockResolvedValueOnce(
+        response([
+          {
+            path: "/next",
+            branch: "main",
+            is_main: true,
+            detached: false,
+          },
+        ]),
+      );
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { result, rerender } = renderHook(
+      ({ path }: { path: string }) => useHostWorktrees("host_1", path),
+      { initialProps: { path: "/slow" }, wrapper: wrapper(client) },
+    );
+
+    await waitFor(() => expect(abandonedSignal).toBeDefined());
+    rerender({ path: "/next" });
+
+    expect(abandonedSignal?.aborted).toBe(true);
+    await waitFor(() => expect(result.current.data?.[0].path).toBe("/next"));
+  });
 });
 
 describe("useVerifiedGitWorktrees", () => {
