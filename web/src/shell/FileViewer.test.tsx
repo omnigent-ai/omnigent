@@ -21,6 +21,8 @@ import { MemoryRouter, useSearchParams } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
 import { copyText } from "@/lib/clipboard";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { Comment } from "@/hooks/useComments";
 import { isFilePositionPending } from "./filePositionState";
 
@@ -2042,6 +2044,26 @@ describe("FileViewer markdown preview/edit/source modes", () => {
     view.rerender(viewerTree({ open: true, path: "other.py", initialSearch: "comment=c1" }));
     view.rerender(viewerTree({ open: true, path: "notes.md", initialSearch: "comment=c1" }));
     expect(viewModeOf()).toBe("editor");
+  });
+
+  it("previews a Vega-Lite file as a chart with a source toggle only when charts are on", () => {
+    const chartViewer = (enabled: boolean) => (
+      <CapabilitiesProvider
+        info={{ ...FALLBACK_SERVER_INFO, features: { vega_lite_charts: enabled } }}
+      >
+        {viewerTree({ open: true, path: "charts/sales.vl.json" })}
+      </CapabilitiesProvider>
+    );
+    const { rerender } = render(chartViewer(false));
+    expect(viewModeOf()).toBe("source");
+    expect(screen.queryByRole("button", { name: "View preview" })).toBeNull();
+
+    rerender(chartViewer(true));
+    expect(viewModeOf()).toBe("preview");
+    fireEvent.click(screen.getByRole("button", { name: "View source" }));
+    expect(viewModeOf()).toBe("source");
+    fireEvent.click(screen.getByRole("button", { name: "View preview" }));
+    expect(viewModeOf()).toBe("preview");
   });
 
   it("guards unsaved edits when leaving the markdown editor, switching only after Discard", () => {

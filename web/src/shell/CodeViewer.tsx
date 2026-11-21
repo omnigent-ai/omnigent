@@ -52,6 +52,8 @@ import rehypeSlug from "rehype-slug";
 import { createMathPlugin } from "@streamdown/math";
 import { ExternalPreviewLink } from "./ExternalPreviewLink";
 import { MermaidPreview } from "./MermaidPreview";
+import { VegaLiteChart } from "@/components/charts/VegaLiteChart";
+import { isVegaLitePath } from "@/components/charts/vegaLiteSpec";
 import type { Comment } from "@/hooks/useComments";
 import {
   type FileContentResponse,
@@ -604,6 +606,12 @@ export interface CodeViewerProps {
   attachToAgent?: boolean;
 }
 
+/** Download name for a chart file, e.g. ``"sales"`` for ``"charts/sales.vl.json"``. */
+function chartDownloadName(path: string): string {
+  const name = path.split("/").pop() ?? path;
+  return name.replace(/\.(vl|vega-lite)\.json$/i, "") || "chart";
+}
+
 export function CodeViewer({
   position,
   conversationId,
@@ -689,8 +697,14 @@ export function CodeViewer({
   const isDataTablePreview = viewMode === "preview" && isDataTablePath(path);
   // Excel and Parquet have no text to show, so they open on the table in every mode but diff.
   const isSpreadsheetPreview = viewMode !== "diff" && isSpreadsheetPath(path);
+  // FileViewer offers preview for chart files only while the chart feature is on.
+  const isChartPreview = viewMode === "preview" && isVegaLitePath(path);
   const isRenderedPreview =
-    isHtmlPreview || isMarkdownOrNotebookPreview || isDataTablePreview || isSpreadsheetPreview;
+    isHtmlPreview ||
+    isMarkdownOrNotebookPreview ||
+    isDataTablePreview ||
+    isSpreadsheetPreview ||
+    isChartPreview;
   // Only the Shiki DOM path needs the per-line split; skip it for Monaco and
   // rendered previews, which never render these lines.
   const rawLines = useMemo(
@@ -806,8 +820,8 @@ export function CodeViewer({
   // Open search on Cmd+F / Ctrl+F in the Shiki source view.
   useEffect(() => {
     // Skip in Monaco mode (Monaco owns Cmd+F) and markdown editor mode (handled
-    // above with its own find bar).
-    if (!panelOpen || isMarkdownEditor || showMonaco) return;
+    // above with its own find bar). A chart has no text to find.
+    if (!panelOpen || isMarkdownEditor || showMonaco || isChartPreview) return;
     const handler = (e: KeyboardEvent) => {
       if (hasCommandModifier(e) && e.key === "f") {
         // Beside the chat, Cmd+F belongs to whichever surface the user is in.
@@ -841,6 +855,7 @@ export function CodeViewer({
     panelOpen,
     isMarkdownEditor,
     showMonaco,
+    isChartPreview,
     searchOpen,
     setSearchOpen,
     searchInputRef,
@@ -1114,6 +1129,20 @@ export function CodeViewer({
         activeSelection={activeSelection}
         onSetActiveSelection={onSetActiveSelection}
       />
+    );
+  }
+
+  if (isChartPreview) {
+    return (
+      <div data-preview-scroll className="h-full overflow-auto px-6 py-4">
+        {truncated ? (
+          <p className="text-muted-foreground text-ui">
+            This file is too large to draw as a chart. View its source instead.
+          </p>
+        ) : (
+          <VegaLiteChart spec={content} filename={chartDownloadName(path)} />
+        )}
+      </div>
     );
   }
 

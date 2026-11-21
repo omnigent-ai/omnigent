@@ -51,6 +51,7 @@ class Feature(StrEnum):
     WORKFLOWS = "workflows"
     SESSION_OVERVIEW = "session_overview"
     PROJECT_KANBAN = "project_kanban"
+    VEGA_LITE_CHARTS = "vega_lite_charts"
     PROJECT_REPOSITORY_CREATION = "project_repository_creation"
     WORKSPACE_DIRECT_ACCESS = "workspace_direct_access"
     WORKSPACE_API_SERVER_ACCESS = "workspace_api_server_access"
@@ -273,6 +274,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         owner="web",
         review_by_release="0.27.0",
         default_enabled=True,
+    ),
+    FeatureDefinition(
+        feature=Feature.VEGA_LITE_CHARTS,
+        description="Draw Vega-Lite specs from agents as interactive charts in chat and files",
+        owner="web",
+        review_by_release="0.27.0",
     ),
     FeatureDefinition(
         feature=Feature.PROJECT_REPOSITORY_CREATION,
