@@ -29,13 +29,13 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     ListWorkingCopyChangesResponse,
     ReadBaseFileRequest,
 )
+from omnigent.host.workspace_git import comparison
 from omnigent.host.workspace_git.comparison import (
     EMPTY_TREES,
     MAXIMUM_COMMIT_BODY_BYTES,
     list_branch_commits,
     list_repository_refs,
 )
-from omnigent.host.workspace_git.runner import LISTING_OUTPUT_BYTES
 from omnigent.host.workspace_git.working_copy import list_working_copy_changes, read_base_file
 from tests.host.test_workspace_git_runner import _git, _repository
 from tests.host.test_workspace_git_working_copy import (
@@ -468,24 +468,13 @@ async def test_a_long_commit_body_is_cut_at_a_character_within_the_limit(
 
 
 async def test_branch_commits_too_long_to_list_with_their_bodies_still_list_their_subjects(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = _branches(tmp_path)
-    # Past the listing's output limit only with the body; too long for one argument.
-    message = tmp_path / "message.txt"
-    message.write_text(f"Vendor the log\n\n{'x' * (LISTING_OUTPUT_BYTES + 1024)}\n")
-    _git(
-        root,
-        "-c",
-        "user.name=Dev",
-        "-c",
-        "user.email=dev@example.com",
-        "commit",
-        "-q",
-        "--allow-empty",
-        "--file",
-        str(message),
-    )
+    # A small listing limit, so a modest body is past it and the subjects alone fit.
+    listing_limit = 16 * 1024
+    monkeypatch.setattr(comparison, "LISTING_OUTPUT_BYTES", listing_limit)
+    _commit(root, f"Vendor the log\n\n{'x' * (listing_limit + 1024)}\n")
 
     listed = await _branch_commits(root, "main")
     assert [commit.subject for commit in listed.commits] == ["Vendor the log", "feature work"]
