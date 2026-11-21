@@ -20,10 +20,14 @@ TOKEN_VARIABLES = frozenset(
 )
 # A name containing one of these is treated as holding a secret.
 SECRET_NAME_PARTS = ("TOKEN", "SECRET", "PASSWORD", "KEY")
-# A name containing one of these, or starting with one of the prefixes, turns on
-# diagnostic output, such as HTTP_DEBUG, GIT_TRACE_CURL or GIT_CURL_VERBOSE.
-DIAGNOSTIC_NAME_PARTS = ("DEBUG", "TRACE", "VERBOSE")
-DIAGNOSTIC_NAME_PREFIXES = ("GIT_CURL_",)
+# Variables that make the CLI, git or curl print requests, which can carry credentials.
+DIAGNOSTIC_VARIABLES = frozenset(
+    {"GH_DEBUG", "DEBUG", "DEBUG_HTTP", "HTTP_DEBUG", "GIT_CURL_VERBOSE"}
+)
+# Every git trace setting, e.g. GIT_TRACE, GIT_TRACE_CURL or GIT_TRACE2_EVENT.
+GIT_TRACE_PREFIX = "GIT_TRACE"
+# GODEBUG is diagnostic only when it turns on Go's HTTP/2 request logging.
+GO_HTTP2_DEBUG = "http2debug"
 _NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -31,11 +35,26 @@ class EnvironmentRuleError(ValueError):
     """An instance's environment config breaks a rule; the message names the rule."""
 
 
-def _diagnostic_rule(name: str) -> str | None:
-    """Return the part or prefix that makes *name* a diagnostic variable, if any."""
+def _diagnostic_rule(name: str, value: str | None) -> str | None:
+    """Return what makes *name*, set to *value*, a diagnostic variable, if anything.
+
+    A ``None`` value means it isn't known yet, as for a name passed from the host.
+    """
     upper = name.upper()
-    part = next((part for part in DIAGNOSTIC_NAME_PARTS if part in upper), None)
-    return part or next((p for p in DIAGNOSTIC_NAME_PREFIXES if upper.startswith(p)), None)
+    if upper in DIAGNOSTIC_VARIABLES:
+        return upper
+    if upper.startswith(GIT_TRACE_PREFIX):
+        return f"a {GIT_TRACE_PREFIX} setting"
+    if upper == "GODEBUG" and value is not None and GO_HTTP2_DEBUG in value.lower():
+        return f"GODEBUG with {GO_HTTP2_DEBUG}"
+    return None
+
+
+def _refuse_diagnostic(where: str, rule: str) -> EnvironmentRuleError:
+    return EnvironmentRuleError(
+        f"{where} is refused by the diagnostic-variable rule: {rule} turns on diagnostic "
+        "output, which can print credentials"
+    )
 
 
 def _check_name(name: object, where: str) -> str:
@@ -54,11 +73,8 @@ def _check_name(name: object, where: str) -> str:
                 f"{where} is refused by the secret-name rule: names containing {part} are "
                 "treated as secrets. Rename the variable if it doesn't hold one"
             )
-    if (diagnostic := _diagnostic_rule(name)) is not None:
-        raise EnvironmentRuleError(
-            f"{where} is refused by the diagnostic-variable rule: names containing or "
-            f"starting with {diagnostic} turn on diagnostic output, which can print credentials"
-        )
+    if (diagnostic := _diagnostic_rule(name, None)) is not None:
+        raise _refuse_diagnostic(where, diagnostic)
     if upper.startswith(("GH_", "GITHUB_")):
         raise EnvironmentRuleError(
             f"{where} is refused by the CLI-settings rule: GH_ and GITHUB_ settings come "
@@ -104,6 +120,8 @@ def check_environment(
             raise EnvironmentRuleError(f"{where} is refused: it is also passed through in env")
         if not isinstance(value, str) or "\0" in value:
             raise EnvironmentRuleError(f"{where} is refused: its value must be a string")
+        if (diagnostic := _diagnostic_rule(name, value)) is not None:
+            raise _refuse_diagnostic(where, diagnostic)
         values[name] = value
     return tuple(names), values
 
@@ -117,6 +135,9 @@ def pinned_environment(
     :param fixed: Fixed values from :func:`check_environment`; ``PATH`` here replaces
         :data:`DEFAULT_PATH`.
     :param host_environment: The host process's environment.
+
+    Token and diagnostic variables are dropped whatever is passed in, including a
+    ``GODEBUG`` the host sets with ``http2debug``.
     """
     environment = {"PATH": DEFAULT_PATH}
     for name in passed:
@@ -124,6 +145,6 @@ def pinned_environment(
             environment[name] = host_environment[name]
     environment.update(fixed)
     for name in [*environment]:
-        if name in TOKEN_VARIABLES or _diagnostic_rule(name) is not None:
+        if name in TOKEN_VARIABLES or _diagnostic_rule(name, environment[name]) is not None:
             del environment[name]
     return environment

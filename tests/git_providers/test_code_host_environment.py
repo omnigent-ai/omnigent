@@ -48,11 +48,26 @@ def test_token_variables_never_reach_a_run_whatever_is_passed_in() -> None:
 
 
 def test_diagnostic_variables_never_reach_a_run_whatever_is_passed_in() -> None:
-    names = ["HTTP_DEBUG", "GIT_TRACE_CURL", "GIT_CURL_VERBOSE", "GIT_CURL_FTP_NO_EPSV"]
+    names = ["GH_DEBUG", "HTTP_DEBUG", "GIT_TRACE_CURL", "GIT_CURL_VERBOSE", "GODEBUG"]
+    host = {"HTTP_DEBUG": "1", "GODEBUG": "netdns=go,http2debug=2"}
 
-    environment = pinned_environment(names, dict.fromkeys(names, "1"), {"HTTP_DEBUG": "1"})
+    environment = pinned_environment(names, dict.fromkeys(names[:-1], "1"), host)
 
     assert environment == {"PATH": DEFAULT_PATH}
+
+
+def test_settings_that_print_nothing_still_reach_a_run() -> None:
+    passed, fixed = check_environment(
+        ["GODEBUG", "GIT_CURL_FTP_NO_EPSV"], {"BUILD_VERBOSE": "1"}, instance_id="internal"
+    )
+    host = {"GODEBUG": "netdns=cgo", "GIT_CURL_FTP_NO_EPSV": "1"}
+
+    assert pinned_environment(passed, fixed, host) == {
+        "PATH": DEFAULT_PATH,
+        "GODEBUG": "netdns=cgo",
+        "GIT_CURL_FTP_NO_EPSV": "1",
+        "BUILD_VERBOSE": "1",
+    }
 
 
 def test_no_config_passes_nothing_but_the_pinned_path() -> None:
@@ -105,21 +120,23 @@ def test_a_fixed_value_with_a_secret_shaped_name_is_refused_without_its_value() 
 
 
 @pytest.mark.parametrize(
-    ("name", "part"),
+    ("name", "rule"),
     [
-        ("DEBUG_HTTP", "DEBUG"),
-        ("HTTP_DEBUG", "DEBUG"),
-        ("GODEBUG", "DEBUG"),
-        ("GIT_TRACE_CURL", "TRACE"),
-        ("GIT_TRACE", "TRACE"),
-        ("GIT_CURL_VERBOSE", "VERBOSE"),
-        ("curl_verbose", "VERBOSE"),
-        ("GIT_CURL_FTP_NO_EPSV", "GIT_CURL_"),
+        ("GH_DEBUG", "GH_DEBUG"),
+        ("DEBUG", "DEBUG"),
+        ("debug", "DEBUG"),
+        ("DEBUG_HTTP", "DEBUG_HTTP"),
+        ("HTTP_DEBUG", "HTTP_DEBUG"),
+        ("GIT_CURL_VERBOSE", "GIT_CURL_VERBOSE"),
+        ("GIT_TRACE", "a GIT_TRACE setting"),
+        ("GIT_TRACE_CURL", "a GIT_TRACE setting"),
+        ("GIT_TRACE2_EVENT", "a GIT_TRACE setting"),
+        ("git_tracer", "a GIT_TRACE setting"),
     ],
 )
 @pytest.mark.parametrize("field", ["env", "env_set"])
 def test_a_diagnostic_variable_is_refused_naming_the_rule(
-    name: str, part: str, field: str
+    name: str, rule: str, field: str
 ) -> None:
     passed, fixed = ([name], {}) if field == "env" else ([], {name: "1"})
     where = "env[0]" if field == "env" else "env_set entry 1"
@@ -128,10 +145,28 @@ def test_a_diagnostic_variable_is_refused_naming_the_rule(
         check_environment(passed, fixed, instance_id="internal")
 
     assert str(refused.value) == (
-        f"instance internal {where} is refused by the diagnostic-variable rule: names "
-        f"containing or starting with {part} turn on diagnostic output, which can print "
-        "credentials"
+        f"instance internal {where} is refused by the diagnostic-variable rule: {rule} turns "
+        "on diagnostic output, which can print credentials"
     )
+
+
+@pytest.mark.parametrize("value", ["http2debug=1", "netdns=go,HTTP2DEBUG=2"])
+def test_a_fixed_godebug_that_logs_http2_is_refused_without_its_value(value: str) -> None:
+    with pytest.raises(EnvironmentRuleError) as refused:
+        check_environment([], {"GODEBUG": value}, instance_id="internal")
+
+    assert "diagnostic-variable rule: GODEBUG with http2debug turns on" in str(refused.value)
+    assert value not in str(refused.value)
+
+
+@pytest.mark.parametrize(
+    "name", ["GIT_CURL_FTP_NO_EPSV", "BUILD_VERBOSE", "GODEBUG", "TRACE_ID", "GIT_TERMINAL_PROMPT"]
+)
+@pytest.mark.parametrize("field", ["env", "env_set"])
+def test_a_variable_outside_the_diagnostic_list_is_accepted(name: str, field: str) -> None:
+    passed, fixed = ([name], {}) if field == "env" else ([], {name: "netdns=cgo"})
+
+    assert check_environment(passed, fixed, instance_id="internal") == (tuple(passed), fixed)
 
 
 @pytest.mark.parametrize(
