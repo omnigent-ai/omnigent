@@ -43,6 +43,8 @@ export interface SessionWorkspaceState {
   selectedTerminalKey?: string | null;
   openBrowsers?: string[];
   selectedBrowserId?: string | null;
+  /** Last page of each open browser tab, keyed by tab ID, so a tab whose view is gone reopens it. */
+  browserPages?: Record<string, SavedBrowserPage>;
   /** Ordered list of open side-chat tabs (child conversation ids). */
   openSideChats?: string[];
   /** Side chats closed on this device; discovery must not reopen them. */
@@ -55,6 +57,14 @@ export interface SessionWorkspaceState {
   terminalSplit?: TerminalSplitState;
 }
 
+/** A browser tab's last http(s) page. */
+export interface SavedBrowserPage {
+  url: string;
+  title?: string;
+  /** The signed-in user who visited it; only they may see or reopen it. */
+  owner: string;
+}
+
 export const SESSION_WORKSPACE_STATE_KEY = "omnigent:session-workspace-state";
 // Cap stored sessions so the store can't grow without bound. The
 // least-recently-touched entries (front of the array) are pruned first once the
@@ -64,6 +74,20 @@ const MAX_SESSIONS = 100;
 // through many files can't bloat the store. Tabs are appended in open order, so
 // the most-recent (tail) entries are kept.
 export const MAX_OPEN_TABS = 20;
+const MAX_BROWSER_URL_LENGTH = 8192;
+const MAX_BROWSER_TITLE_LENGTH = 512;
+// Query and fragment parameters that can carry a credential (OAuth codes and tokens,
+// signed links, API keys), by part of their name (authkey, passcode) or by its last
+// word (auth_code, apiKey). An address carrying one is never saved or replayed.
+const CREDENTIAL_PARAM_PART = new RegExp(
+  [
+    "token|secret|passw|signature|credential|verifier|api[-_]?key|session[-_]?id",
+    "saml(request|response)",
+    "(access|auth|login|pass|private|secure|signing)[-_.]?(code|key|pwd|sig|ticket)",
+  ].join("|"),
+  "i",
+);
+const CREDENTIAL_PARAM_WORD = /(^|[-_.])(auth|authorization|code|jwt|key|otp|pass|pwd|sig|ticket)$/;
 
 function isValidWidth(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value > 0;
@@ -94,6 +118,55 @@ function uniqueIds(values: unknown[]): string[] {
       values.filter((value): value is string => typeof value === "string" && value !== ""),
     ),
   ];
+}
+
+function isCredentialParam(name: string): boolean {
+  const words = name.replace(/([a-z\d])([A-Z])/g, "$1_$2").toLowerCase();
+  return CREDENTIAL_PARAM_PART.test(name) || CREDENTIAL_PARAM_WORD.test(words);
+}
+
+function carriesCredential({ username, password, search, hash }: URL): boolean {
+  if (username !== "" || password !== "") return true;
+  // A hash-routed app's fragment holds its own query (`#/callback?code=…`).
+  const fragmentQueries = hash
+    .slice(1)
+    .split("?")
+    .filter((part) => part.includes("="));
+  const params = [search, ...fragmentQueries].flatMap((query) => [
+    ...new URLSearchParams(query).keys(),
+  ]);
+  return params.some(isCredentialParam);
+}
+
+/** A page a tab can reopen, or null without an owner or for a non-http(s), oversized, or credential-bearing URL. */
+export function sanitizeSavedBrowserPage(value: unknown): SavedBrowserPage | null {
+  if (typeof value !== "object" || value === null) return null;
+  const { url, title, owner } = value as Record<string, unknown>;
+  if (typeof owner !== "string" || owner === "") return null;
+  if (typeof url !== "string" || url.length > MAX_BROWSER_URL_LENGTH) return null;
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    if (carriesCredential(parsed)) return null;
+  } catch {
+    return null;
+  }
+  const page: SavedBrowserPage = { url, owner };
+  if (typeof title === "string" && title.trim() !== "") {
+    page.title = title.slice(0, MAX_BROWSER_TITLE_LENGTH);
+  }
+  return page;
+}
+
+function sanitizeSavedBrowserPages(value: unknown): Record<string, SavedBrowserPage> | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  // Tab IDs come from storage, so a `__proto__` key must stay an ordinary entry.
+  const pages: Record<string, SavedBrowserPage> = Object.create(null);
+  for (const [tabId, raw] of Object.entries(value)) {
+    const page = sanitizeSavedBrowserPage(raw);
+    if (tabId !== "" && page) pages[tabId] = page;
+  }
+  return pages;
 }
 
 function sanitize(entry: unknown): SessionWorkspaceState {
@@ -133,6 +206,8 @@ function sanitize(entry: unknown): SessionWorkspaceState {
   if (record.selectedBrowserId === null || typeof record.selectedBrowserId === "string") {
     state.selectedBrowserId = record.selectedBrowserId;
   }
+  const browserPages = sanitizeSavedBrowserPages(record.browserPages);
+  if (browserPages) state.browserPages = browserPages;
   if (Array.isArray(record.openSideChats)) state.openSideChats = uniqueIds(record.openSideChats);
   if (Array.isArray(record.closedSideChats))
     state.closedSideChats = uniqueIds(record.closedSideChats);
@@ -205,6 +280,14 @@ export function saveSessionWorkspaceState(
   // runtime cap; this keeps the persisted rail from growing without bound.
   if (next.openBrowsers && next.openBrowsers.length > MAX_OPEN_TABS) {
     next.openBrowsers = next.openBrowsers.slice(-MAX_OPEN_TABS);
+  }
+  // A closed tab forgets its page. Only a tab-list write prunes: with the agent browser
+  // tools on, a newly opened tab's page can be saved before main's tab list reaches here.
+  if (patch.openBrowsers && next.browserPages) {
+    const open = new Set(next.openBrowsers ?? []);
+    next.browserPages = Object.fromEntries(
+      Object.entries(next.browserPages).filter(([tabId]) => open.has(tabId)),
+    );
   }
   // Same bound for side-chat tabs (also appended in open order).
   if (next.openSideChats && next.openSideChats.length > MAX_OPEN_TABS) {

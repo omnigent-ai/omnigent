@@ -59,8 +59,10 @@ import {
   type ChromeCookieImportResult,
   type ChromeCookiePreviewResult,
 } from "@/lib/nativeBridge";
+import { readSavedBrowserPage } from "@/lib/browserTabPages";
 import { browserViewOwnerId } from "@/lib/browserTabs";
 import { fetchSessionHostId } from "@/lib/fetchSessionHostId";
+import { resolveIdentity } from "@/lib/identity";
 import { normalizeTypedUrl } from "@/lib/normalizeTypedUrl";
 import { cn } from "@/lib/utils";
 // Say when the tab's page is open in another desktop window.
@@ -104,8 +106,17 @@ interface BrowserPaneBridge {
     conversationId: string,
     url: string,
     bounds: Bounds | undefined,
-    opts: (BrowserHostOptions & { force?: boolean }) | undefined,
-  ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
+    // `restore`: reopen a tab's saved page only if nothing else has opened, or is opening, it.
+    opts: (BrowserHostOptions & { force?: boolean; restore?: boolean }) | undefined,
+  ) => Promise<{
+    ok: boolean;
+    created?: boolean;
+    error?: string;
+    /** A newer navigation took the view, or a restore yielded to another page. */
+    superseded?: boolean;
+    /** The session's tabs are open in another window. */
+    elsewhere?: boolean;
+  }>;
   browserGoBack?: (conversationId: string) => Promise<NavResult>;
   browserGoForward?: (conversationId: string) => Promise<NavResult>;
   browserReload?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
@@ -135,6 +146,8 @@ interface BrowserPaneBridge {
   ) => () => void;
   browserHasView?: (conversationId: string) => Promise<{
     exists: boolean;
+    /** The page is open in another desktop window, not this one. */
+    elsewhere?: boolean;
     url?: string;
     canGoBack?: boolean;
     canGoForward?: boolean;
@@ -308,19 +321,59 @@ export function BrowserPane({
     let viewChanged = false;
     const urlEvents = urlEventsRef.current;
 
+    const submitSequence = submitSequenceRef.current;
+    // A later navigation (the user's or an agent's) owns the view.
+    const superseded = () =>
+      cancelled || viewChanged || submitSequenceRef.current !== submitSequence;
+    // The shell destroyed this tab's view (sign-out, a session-expiry reconnect, quit):
+    // reopen the page the signed-in user last had in it.
+    const reopenSavedPage = async () => {
+      const openOrNavigate = bridge.browserOpenOrNavigate;
+      if (!openOrNavigate) return;
+      try {
+        const saved = readSavedBrowserPage(conversationId, await resolveIdentity());
+        if (!saved || superseded()) return;
+        if (!urlEditingRef.current) setCurrentUrl(saved.url);
+        const hostId = await fetchSessionHostId(browserViewOwnerId(conversationId));
+        if (superseded()) return;
+        // The shell refuses a restore once the tab has, or is getting, another page.
+        const result = await openOrNavigate(conversationId, saved.url, undefined, {
+          ...navigationHostOptions(hostId),
+          restore: true,
+        });
+        // This reopen's own view creation sets viewChanged, so only newer intent counts now.
+        const overtaken = cancelled || submitSequenceRef.current !== submitSequence;
+        if (result.ok || overtaken || result.superseded) return;
+        if (result.elsewhere) {
+          // The session's tabs are open in another window; the user wasn't navigating.
+          if (!urlEditingRef.current) setCurrentUrl((url) => (url === saved.url ? "" : url));
+          return;
+        }
+        setNavigationError(result.error ?? "Unable to reopen this page.");
+      } catch {
+        if (!cancelled && submitSequenceRef.current === submitSequence) {
+          setNavigationError("Unable to reopen this page.");
+        }
+      }
+    };
+
     // A newer lifecycle event takes precedence over this asynchronous snapshot.
     void bridge.browserHasView?.(conversationId).then((r) => {
-      if (!cancelled && !viewChanged && r?.exists) {
-        setHasView(true);
-        // A navigation since it asked brought its own URL and back/forward state.
-        const fresh = urlEventsRef.current === urlEvents;
-        const url = fresh ? r.url : undefined;
-        if (url) setPageUrl(url);
-        if (!urlEditingRef.current && url) setCurrentUrl(url);
-        if (fresh) {
-          setCanGoBack(!!r.canGoBack);
-          setCanGoForward(!!r.canGoForward);
-        }
+      if (cancelled || viewChanged || !r) return;
+      if (!r.exists) {
+        // A page open in another window stays there.
+        if (!r.elsewhere) void reopenSavedPage();
+        return;
+      }
+      setHasView(true);
+      // A navigation since it asked brought its own URL and back/forward state.
+      const fresh = urlEventsRef.current === urlEvents;
+      const url = fresh ? r.url : undefined;
+      if (url) setPageUrl(url);
+      if (!urlEditingRef.current && url) setCurrentUrl(url);
+      if (fresh) {
+        setCanGoBack(!!r.canGoBack);
+        setCanGoForward(!!r.canGoForward);
       }
     });
 

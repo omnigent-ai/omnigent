@@ -9,6 +9,7 @@ import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/ses
 import { SESSION_HOST_PROTOCOL } from "@/lib/nativeBridge";
 import { getSessionSlim } from "@/lib/sessionsApi";
 import type * as SessionsApi from "@/lib/sessionsApi";
+import type * as Identity from "@/lib/identity";
 import type { Session } from "@/lib/types";
 import { writeBrowserAgentToolsEnabled } from "@/components/BrowserPane/agentTools/preferences";
 import { loadTabs } from "@/components/BrowserPane/agentTools/tabStore";
@@ -24,6 +25,10 @@ import {
 } from "./useBrowserTabs";
 
 vi.mock("sonner", () => ({ toast: { error: vi.fn() } }));
+vi.mock("@/lib/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof Identity>()),
+  getCurrentUserId: () => "user-a",
+}));
 
 // Unknown hosts stay public-only unless a test gives the session one.
 vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
@@ -81,6 +86,41 @@ describe("browser tab titles", () => {
     });
     const { result } = renderHook(() => useBrowserTabs("session-a"));
     await waitFor(() => expect(result.current.labelFor("known", 1)).toBe(label));
+  });
+
+  it("labels a tab whose view is gone from its saved page", async () => {
+    openBrowserTab("session-a", "restored");
+    writeSessionWorkspaceState("session-a", {
+      browserPages: {
+        restored: { url: "https://docs.example/guide", title: "Guide", owner: "user-a" },
+      },
+    });
+    Object.assign(window, {
+      omnigentDesktop: { browserHasView: vi.fn().mockResolvedValue({ exists: false }) },
+    });
+    const { result } = renderHook(() => useBrowserTabs("session-a"));
+    await waitFor(() => expect(result.current.labelFor("restored", 0)).toBe("Guide"));
+    expect(await result.current.pageUrl("restored")).toBe("https://docs.example/guide");
+  });
+
+  it("saves the page a live view already shows when its tab is added", async () => {
+    openBrowserTab("session-a", "opened");
+    Object.assign(window, {
+      omnigentDesktop: {
+        browserHasView: vi.fn().mockResolvedValue({
+          exists: true,
+          url: "about:blank",
+          pendingUrl: "https://docs.example/guide",
+          title: "",
+        }),
+      },
+    });
+    renderHook(() => useBrowserTabs("session-a"));
+    await waitFor(() =>
+      expect(readSessionWorkspaceState("session-a").browserPages).toEqual({
+        opened: { url: "https://docs.example/guide", owner: "user-a" },
+      }),
+    );
   });
 
   it("updates a background title without changing selection or accepting an older probe", async () => {
