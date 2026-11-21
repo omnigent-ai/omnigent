@@ -106,6 +106,7 @@ function makeAbout({
     desktopDownloadParents: [],
     desktopInstalls: 0,
     closedParents: [],
+    externalUrls: [],
   };
   const updater = {
     getStatus: () => desktopStatus ?? { state: "none" },
@@ -127,6 +128,7 @@ function makeAbout({
       on: (channel, handler) => onHandlers.set(channel, handler),
     },
     nativeTheme: { shouldUseDarkColors: false },
+    shell: { openExternal: async (url) => calls.externalUrls.push(url) },
     updater,
     getDesktopVersion: () => "0.13.0-dev.0",
     getAppIconDataUrl: async () => appIconDataUrl,
@@ -271,7 +273,9 @@ describe("About window", () => {
     assert.equal(first.options.webPreferences.sandbox, true);
     assert.equal(first.loadedFile, ABOUT_PAGE);
     assert.equal(first.excludedFromShownWindowsMenu, true);
-    assert.deepEqual(first.webContents.windowOpenHandler(), { action: "deny" });
+    assert.deepEqual(first.webContents.windowOpenHandler({ url: "https://example.com" }), {
+      action: "deny",
+    });
 
     first.emit("ready-to-show");
     assert.equal(first.visible, true);
@@ -295,6 +299,43 @@ describe("About window", () => {
     assert.notEqual(second, first);
     assert.equal(second.options.parent, secondParent);
     assert.deepEqual(h.calls.closedParents, [firstParent]);
+  });
+
+  it("opens the official release notes in the browser without creating an app window", () => {
+    const h = makeAbout();
+    const about = h.controller.open(new FakeWindow());
+    const url = "https://omnigent.ai/releases";
+
+    assert.deepEqual(about.webContents.windowOpenHandler({ url }), { action: "deny" });
+    assert.deepEqual(h.calls.externalUrls, [url]);
+    assert.equal(h.windows.length, 1);
+    assert.equal(about.webContents.getURL(), pathToFileURL(ABOUT_PAGE).href);
+  });
+
+  it("keeps other URLs blocked and prevents navigation away from About", () => {
+    const h = makeAbout();
+    const about = h.controller.open(new FakeWindow());
+    for (const url of [
+      "https://example.com",
+      "https://omnigent.ai/releases/untrusted",
+      "file:///tmp/untrusted.html",
+      "omnigent://untrusted",
+    ]) {
+      assert.deepEqual(about.webContents.windowOpenHandler({ url }), { action: "deny" });
+    }
+    assert.deepEqual(h.calls.externalUrls, []);
+
+    let prevented = false;
+    about.webContents.emit(
+      "will-navigate",
+      {
+        preventDefault: () => {
+          prevented = true;
+        },
+      },
+      "https://omnigent.ai/releases",
+    );
+    assert.equal(prevented, true);
   });
 
   it("opens without a parent when macOS has no main windows", () => {
