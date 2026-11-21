@@ -369,6 +369,26 @@ describe("planOpen", () => {
         });
       });
 
+      it("reuses a Diffs file tab whatever comparison its visit recorded, and drops a stale one", () => {
+        const diffFile: WorkspacePlace = { kind: "changes", path: "a.go", fileTab: true };
+        const shown: PlanTab = {
+          id: "D",
+          place: { ...diffFile, comparison: { kind: "saved", intent: "branch-point" } },
+          dirty: false,
+        };
+        const reuse: OpenOptions = { ...focus, reuse: "same-place" };
+        // Bringing it forward keeps the session's comparison, unless the open asks for one.
+        expect(plan(state([changes, shown], "C"), diffFile, reuse)).toEqual({
+          ok: true,
+          plan: expect.objectContaining({ action: "navigate", tabId: "D", place: diffFile }),
+        });
+        const head = { ...diffFile, comparison: { kind: "saved", intent: "head" } } as const;
+        expect(plan(state([changes, shown], "C"), head, reuse)).toEqual({
+          ok: true,
+          plan: expect.objectContaining({ action: "navigate", tabId: "D", place: head }),
+        });
+      });
+
       it("refuses at the tab cap", () => {
         expect(plan(state([files], "F", { maxTabs: 1 }), { kind: "pulls" }, focus)).toEqual({
           ok: false,

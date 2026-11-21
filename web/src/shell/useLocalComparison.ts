@@ -10,14 +10,24 @@ import {
   useWorkingCopyChanges,
   workingCopyComparisonActions,
 } from "@/hooks/useWorkingCopyChanges";
+import { type ComparisonChoice, comparisonChoiceOf } from "@/lib/comparisonChoice";
 import { localComparisonView, type LocalComparisonView } from "@/lib/localComparison";
 import { useWorkingCopyBaseIntent } from "@/lib/workingCopyBasePreference";
+import type { ComparisonAvailability } from "./useVisitComparison";
 import { useWorkingCopyBase } from "./workingCopyBase";
 
 export interface LocalComparisonSource {
   /** The changed files, generation and gates the review's reads are checked against. */
   changes: WorkingCopyChanges;
   view: LocalComparisonView;
+  /** What the session compares with; settled once its workspace, and so its typed comparison, is known. */
+  choice: {
+    shown: ComparisonChoice;
+    settled: boolean;
+    /** Whether `choice` can be applied: the menu's own checks, and typed revisions' support. */
+    availability: (choice: ComparisonChoice) => ComparisonAvailability;
+    choose: (choice: ComparisonChoice) => void;
+  };
 }
 
 /** A session's changes and their comparison. Only a review on screen (`active`) keeps it current. */
@@ -61,5 +71,30 @@ export function useLocalComparison(
     readable,
     refetch,
   ]);
-  return { changes, view };
+  const settled = changes.workspace !== null;
+  const choice = useMemo(() => {
+    const recoveries = workingCopyComparisonActions(sessionId);
+    const commandFor = (next: ComparisonChoice & { kind: "saved" }) =>
+      commands.find((command) => command.id === `compare-${next.intent}`);
+    return {
+      shown: comparisonChoiceOf(intent, custom),
+      settled,
+      availability: (next: ComparisonChoice): ComparisonAvailability => {
+        if (next.kind === "saved") {
+          const reason = commandFor(next)?.unavailableReason;
+          return reason ? { unavailable: reason } : "now";
+        }
+        if (revisionSupport.kind === "available") return "now";
+        if (revisionSupport.kind === "checking") return "later";
+        return { unavailable: revisionSupport.message };
+      },
+      // Runs the same command as the menu, so the choice is saved as a person's would be.
+      choose: (next: ComparisonChoice) => {
+        if (next.kind === "typed")
+          recoveries.compareRevisions({ base: next.base, head: next.head });
+        else commandFor(next)?.run();
+      },
+    };
+  }, [sessionId, intent, custom, settled, commands, revisionSupport]);
+  return { changes, view, choice };
 }

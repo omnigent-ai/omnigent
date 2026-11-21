@@ -416,7 +416,7 @@ def git_session(built_spa: None, tmp_path: Path) -> Iterator[tuple[str, str]]:
 def test_changes_compare_branches_and_tags_through_the_workspace_api(
     page: Page, git_session: tuple[str, str]
 ) -> None:
-    """The picker suggests branches and tags; All branch changes and Last commit list files."""
+    """The picker suggests branches and tags; each comparison lists its files and is a step."""
     base_url, session_id = git_session
     _set_flag(page, True)
     _open_session(page, base_url, session_id, "desktop")
@@ -462,3 +462,20 @@ def test_changes_compare_branches_and_tags_through_the_workspace_api(
         timeout=30_000
     )
     expect(sidebar.get_by_text("Not available on this host yet.")).to_have_count(0)
+
+    # Each pick is a step: Back shows All branch changes again, and Forward the last commit.
+    history = sidebar.get_by_role("group", name="Workspace history")
+    trigger = sidebar.get_by_role("button", name="Change compared revisions")
+    history.get_by_role("button", name="Back").click()
+    expect(trigger).to_contain_text("All branch changes", timeout=30_000)
+    expect(changed("feature_first.txt")).to_be_visible(timeout=30_000)
+    history.get_by_role("button", name="Forward").click()
+    expect(trigger).to_contain_text("Last commit", timeout=30_000)
+    expect(changed("feature_first.txt")).to_have_count(0, timeout=30_000)
+
+    # A reload keeps the visit and what it compares.
+    page.reload()
+    open_right_rail(page)
+    expect(trigger).to_contain_text("Last commit", timeout=60_000)
+    history.get_by_role("button", name="Back").click()
+    expect(trigger).to_contain_text("All branch changes", timeout=30_000)

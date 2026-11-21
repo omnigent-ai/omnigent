@@ -317,12 +317,14 @@ describe("openWorkspaceFileLink", () => {
   it("keeps a file the review on screen shows in it, at the cited line, each time", async () => {
     const session = workspaceTabsSession("s1");
     const changes = await selectChanges();
+    const comparison = { kind: "saved", intent: "branch-point" } as const;
+    await session.store.navigate(changes.id, { kind: "changes", comparison });
     publishShownReview("s1", {}, { state: "listed", paths: ["src/a.py"] });
 
     await openWorkspaceFileLink("s1", "src/a.py", { line: 100 }, "user");
     expect(session.store.selectedTab()).toMatchObject({
       id: changes.id,
-      place: { kind: "changes", path: "src/a.py", line: { start: 100 } },
+      place: { kind: "changes", path: "src/a.py", line: { start: 100 }, comparison },
     });
     const first = session.fileRequest(changes.id)?.position;
     expect(first).toEqual({ line: 100 });
