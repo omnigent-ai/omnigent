@@ -41,6 +41,8 @@ export interface WorkflowRun {
   workflowId?: string;
   /** The session that started the run, when another session did and you can read it. */
   startedBy?: WorkflowRunStarter;
+  /** The automation whose scheduled run started the run's session, when you can see it. */
+  automation?: WorkflowRunAutomation;
   /** Its workflow's name when the workflow is yours; `null` for someone else's or a deleted one. */
   workflowName?: string | null;
   /** The first page of the workflow runs below this one, each right after the run that started it. */
@@ -51,6 +53,12 @@ export interface WorkflowRun {
   descendantRunsCursor?: string | null;
   /** Whether any run below this one, on any page, is working or waiting for input. */
   descendantRunsActive?: boolean;
+}
+
+/** The automation whose scheduled run started a workflow run. */
+export interface WorkflowRunAutomation {
+  id: string;
+  name: string;
 }
 
 /** The session that started a workflow run. */
