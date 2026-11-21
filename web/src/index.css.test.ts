@@ -921,6 +921,113 @@ describe("index.css sidebar canvas", () => {
   });
 });
 
+/** Each top-level rule in `source`: its selector and its whole body, nested `@variant`s included. */
+function topLevelRules(source: string): { selector: string; body: string }[] {
+  const rules: { selector: string; body: string }[] = [];
+  let depth = 0;
+  let start = 0;
+  let open = 0;
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === "{") {
+      if (depth === 0) open = index;
+      depth += 1;
+    } else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        const selector = source
+          .slice(start, open)
+          .replace(/\/\*[\s\S]*?\*\//g, "")
+          .replace(/\s+/g, " ")
+          .trim();
+        rules.push({ selector, body: source.slice(open + 1, index) });
+        start = index + 1;
+      }
+    } else if (char === ";" && depth === 0) {
+      start = index + 1;
+    }
+  }
+  return rules;
+}
+
+describe("index.css floating panes", () => {
+  const rules = topLevelRules(indexCssSource);
+  // Every rule for exactly this selector, as one body.
+  const ruleFor = (selector: string) =>
+    rules
+      .filter((rule) => rule.selector === selector)
+      .map((rule) => rule.body.replace(/\s+/g, " "))
+      .join(" ");
+
+  it("styles only a shell marked for floating panes", () => {
+    const tokens =
+      /var\(--(pane-gap|pane-cell-gap|pane-card-border|floating-[a-z-]+|shell-top-row)\b/;
+    const users = rules.filter((rule) => tokens.test(rule.body) && rule.selector !== ":root");
+    expect(users.length).toBeGreaterThan(5);
+    for (const rule of users) expect(rule.selector).toContain(".app-shell[data-floating-panes]");
+    // Layout that isn't a card's or the top row's stays to md and wider.
+    for (const rule of users) expect(rule.body).toMatch(/@variant md \{/);
+  });
+
+  it("keeps every control the edge-to-edge layout shows", () => {
+    const floating = rules.filter((each) => each.selector.includes("[data-floating-panes]"));
+    for (const rule of floating) {
+      // Only decoration goes: the header's glass layer, never a control.
+      if (!rule.selector.endsWith("::before")) expect(rule.body).not.toMatch(/display:\s*none/);
+      expect(rule.selector).not.toMatch(/data-workspace-history|data-right-panel-toggle/);
+    }
+  });
+
+  it("makes the dark backdrop the one surface the sidebar and panes sit on", () => {
+    const backdrop = ruleFor(".dark .app-shell[data-floating-panes]");
+    expect(backdrop).toContain("background: var(--floating-backdrop-image) !important");
+    expect(backdrop).toContain("background-color: var(--sidebar) !important");
+    const overBackdrop = ruleFor(
+      ".dark .app-shell[data-floating-panes] .omnigent-sidebar-panel:not(.is-peek), .dark .app-shell[data-floating-panes] .main-terminal-view",
+    );
+    expect(overBackdrop).toContain("background: none");
+  });
+
+  it("measures the dark backdrop from the window corner in the sidebar's own colors", () => {
+    const token = (name: string) =>
+      indexCssSource
+        .match(new RegExp(`${name}:([^;]*);`))?.[1]
+        .replace(/\s+/g, " ")
+        .trim();
+    // The same layers and colors; only the diagonal's fade is an absolute length: 60% along the
+    // sidebar's own diagonal, which a sidebar-sized box puts at 60%.
+    expect(token("--sidebar-surface-image")).toBe(
+      "linear-gradient(transparent 35%, rgb(255 255 255 / 6%)), linear-gradient(135deg, rgb(255 255 255 / 4%), transparent 60%)",
+    );
+    expect(token("--floating-backdrop-image")).toBe(
+      "linear-gradient(transparent 35%, rgb(255 255 255 / 6%)), linear-gradient( 135deg, rgb(255 255 255 / 4%), transparent calc(0.6 * (var(--app-sidebar-width, 0px) + 100dvh) * 0.7071) )",
+    );
+  });
+
+  it("sits a full-screen workspace on the backdrop, opaque over the chat it covers", () => {
+    const maximized =
+      '.app-shell[data-floating-panes] aside[aria-label="Workspace"][data-maximized]';
+    expect(ruleFor(maximized)).toContain("border-left-width: 0");
+    expect(ruleFor(`:root:not(.dark) ${maximized}`)).toContain(
+      "background: var(--sidebar-background, var(--sidebar)) !important",
+    );
+    const dark = ruleFor(`.dark ${maximized}`);
+    expect(dark).toMatch(
+      /background-image: var\(--floating-backdrop-image\), linear-gradient\(var\(--sidebar\), var\(--sidebar\)\) !important/,
+    );
+    expect(dark).toContain("background-attachment: fixed !important");
+    expect(dark).toContain("background-color: var(--background) !important");
+  });
+
+  it("cards a session's chat, which a grid of sessions shows in its own panes", () => {
+    const card = ruleFor(
+      '.app-shell[data-floating-panes] [data-main-view="chat"] > main[data-session-id]',
+    );
+    expect(card).toContain("border-radius: var(--radius-lg, 0.5rem)");
+    expect(card).toContain("border: 1px solid var(--pane-card-border)");
+  });
+});
+
 describe("index.css composer and menu surfaces", () => {
   const darkTokens = cssSource.match(/\.dark \{\s*--app-shell-bg:[\s\S]*?\n\}/)?.[0];
   const queuedSurface = cssSource.match(/\.composer-queued-surface \{[^}]*\}/)?.[0];
