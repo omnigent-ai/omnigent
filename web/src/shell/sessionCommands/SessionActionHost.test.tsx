@@ -1,0 +1,133 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import type * as ConversationsModule from "@/hooks/useConversations";
+import type { Conversation } from "@/hooks/useConversations";
+import type * as UnseenModule from "@/hooks/useUnseenConversations";
+
+import { SessionActionHost } from "./SessionActionHost";
+import { requestSessionAction, useSessionActionStore } from "./sessionActionStore";
+
+const writes = vi.hoisted(() => ({
+  pin: vi.fn(),
+  mute: vi.fn(),
+  move: vi.fn(),
+  rename: vi.fn(),
+}));
+vi.mock("@/hooks/useConversations", async (importOriginal) => {
+  const actual = await importOriginal<typeof ConversationsModule>();
+  const mutation = (mutate: (...args: unknown[]) => void) => () => ({
+    mutate,
+    mutateAsync: vi.fn(async () => undefined),
+    isPending: false,
+  });
+  return {
+    ...actual,
+    useProjects: () => ({ data: [{ id: "p1", name: "Payments", icon: null }] }),
+    useTogglePinnedConversation: mutation(writes.pin),
+    useSetConversationMuted: mutation(writes.mute),
+    useMoveToProject: mutation(writes.move),
+    useRenameConversation: mutation(writes.rename),
+  };
+});
+vi.mock("@/hooks/useViewerId", () => ({ useViewerId: () => "viewer" }));
+const readMarks = vi.hoisted(() => ({ unread: vi.fn(), read: vi.fn() }));
+vi.mock("@/hooks/useUnseenConversations", async (importOriginal) => ({
+  ...(await importOriginal<typeof UnseenModule>()),
+  // Seen, so its row offers Mark as unread.
+  useConversationReadState: () => ({ unseen: false, explicitlyUnread: false }),
+  markConversationUnread: readMarks.unread,
+  markConversationRead: readMarks.read,
+}));
+vi.mock("@/hooks/useSessionActionRestrictions", () => ({
+  useSessionActionRestrictions: () => ({ forkDisabledReason: undefined }),
+}));
+
+const SESSION: Conversation = {
+  id: "c1",
+  object: "conversation",
+  title: "Fix the parser",
+  created_at: 0,
+  updated_at: 100,
+  labels: {},
+  permission_level: null,
+  owner: "viewer",
+};
+
+function renderHost() {
+  render(
+    <QueryClientProvider client={new QueryClient()}>
+      <MemoryRouter>
+        <SessionActionHost />
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+}
+
+afterEach(() => {
+  cleanup();
+  vi.clearAllMocks();
+  useSessionActionStore.setState({ request: null });
+});
+
+describe("SessionActionHost", () => {
+  it("pins through the row menu's write", () => {
+    renderHost();
+    act(() => requestSessionAction(SESSION, "pin"));
+    expect(writes.pin).toHaveBeenCalledWith({ id: "c1", pinned: true });
+  });
+
+  it("marks the session unread as its row does", () => {
+    renderHost();
+    act(() => requestSessionAction(SESSION, "mark-unread"));
+    expect(readMarks.unread).toHaveBeenCalledWith("c1", 100);
+    // Already read, so Mark as read doesn't apply.
+    act(() => requestSessionAction(SESSION, "mark-read"));
+    expect(readMarks.read).not.toHaveBeenCalled();
+  });
+
+  it("does nothing for an action that stopped applying, such as pinning it once archived", () => {
+    renderHost();
+    act(() => requestSessionAction({ ...SESSION, archived: true }, "pin"));
+    act(() => requestSessionAction({ ...SESSION, owner: "someone-else" }, "rename"));
+    expect(writes.pin).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("renames from its dialog", async () => {
+    renderHost();
+    act(() => requestSessionAction(SESSION, "rename"));
+    const field = await screen.findByTestId("rename-session-input");
+    fireEvent.change(field, { target: { value: "Parser rewrite" } });
+    fireEvent.submit(field.closest("form")!);
+    expect(writes.rename).toHaveBeenCalledWith({ id: "c1", title: "Parser rewrite" });
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  });
+
+  it("files the session from the project picker", async () => {
+    renderHost();
+    act(() => requestSessionAction(SESSION, "move-to-project"));
+    const input = await screen.findByRole("combobox", { name: "Add session to a project" });
+    fireEvent.change(input, { target: { value: "payments" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(writes.move).toHaveBeenCalledWith({ id: "c1", project: "Payments" });
+  });
+
+  it("asks before deleting, with the row menu's dialog", async () => {
+    renderHost();
+    act(() => requestSessionAction(SESSION, "delete"));
+    expect(await screen.findByRole("dialog", { name: "Delete session?" })).toBeTruthy();
+  });
+
+  it("starts a second request in place of the first", async () => {
+    renderHost();
+    act(() => requestSessionAction(SESSION, "delete"));
+    await screen.findByRole("dialog", { name: "Delete session?" });
+    act(() => requestSessionAction(SESSION, "stop"));
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "Delete session?" })).toBeNull(),
+    );
+  });
+});
