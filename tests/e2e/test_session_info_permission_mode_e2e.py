@@ -202,8 +202,10 @@ def test_session_info_reports_the_mode_each_session_is_in(tmp_path, isolated_moc
                     "claude": claude,
                 }
 
-                # The web picker switches each session while it runs.
-                switch(codex, {"approval_mode": "read-only"})
+                # The web picker switches each session while it runs. Codex offers
+                # Read Only on Linux only with a permission profile, so use a preset
+                # every platform lists.
+                switch(codex, {"approval_mode": "ask-for-approval"})
                 switch(claude, {"permission_mode": "acceptEdits"})
                 after = read_modes(
                     _REREAD_TASK,
@@ -221,6 +223,6 @@ def test_session_info_reports_the_mode_each_session_is_in(tmp_path, isolated_moc
                     "own before": None,
                     "codex before": "approve-for-me",
                     "claude before": "default",
-                    "codex after": "read-only",
+                    "codex after": "ask-for-approval",
                     "claude after": "acceptEdits",
                 }

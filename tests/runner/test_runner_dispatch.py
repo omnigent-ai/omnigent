@@ -10055,6 +10055,8 @@ async def test_sys_session_get_info_defaults_to_caller_session() -> None:
     assert info["last_activity_at"] == 42
     assert info["pending_elicitations"] == []
     assert info["pending_elicitation_count"] == 0
+    # A server that predates the field reports no mode.
+    assert info["permission_mode"] is None
     assert not any(p.startswith("/v1/runners") for p in requested_paths)
 
 
