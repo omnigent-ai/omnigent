@@ -1224,10 +1224,8 @@ def _load_session_state(
 # large tree is not silently truncated (see load_session_usage).
 _SUBTREE_USAGE_PAGE_SIZE = 100
 
-# Usage counters summed across a conversation subtree. Restricted to the
-# known numeric keys the PolicyEngine reads so an unexpected key in one
-# conversation's persisted usage can't leak into the aggregate. Shared with
-# the stored spawn-tree and project totals so both sum the same counters.
+# Usage counters summed across a conversation subtree; the stored spawn-tree
+# and project totals sum the same ones (see SUMMABLE_USAGE_KEYS).
 _SUMMABLE_USAGE_KEYS = SUMMABLE_USAGE_KEYS
 
 

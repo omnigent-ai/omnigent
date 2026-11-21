@@ -11,7 +11,6 @@ import json
 import math
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -72,7 +71,9 @@ def _turn(tokens: int, cost: float | None, model: str = "model-a") -> dict[str, 
 
 
 def _assert_usage_equal(actual: dict[str, Any] | None, expected: dict[str, Any]) -> None:
+    """Compare a stored total with a session-view sum, which has no priced-session count."""
     assert actual is not None
+    actual = {key: value for key, value in actual.items() if key != "priced_sessions"}
     assert actual.keys() == expected.keys()
     for key, value in expected.items():
         if key == "by_model":
@@ -111,7 +112,7 @@ def test_change_covers_summed_counters_only() -> None:
         "input_tokens": 50,
         "by_model": {
             "model-a": {"input_tokens": 20},
-            "model-b": {"input_tokens": 30, "total_cost_usd": 0.0},
+            "model-b": {"input_tokens": 30, "total_cost_usd": 0.0, "priced_sessions": 1},
         },
     }
     assert usage_totals_change(new, new) == {}
@@ -125,18 +126,33 @@ def test_added_change_reaches_the_new_usage_and_never_goes_negative() -> None:
     add_usage_totals(totals, usage_totals_change(old, new))
 
     assert totals["input_tokens"] == 40
-    assert totals["total_cost_usd"] == 0
+    # The only priced session became unpriced, so the total no longer has a cost.
+    assert "total_cost_usd" not in totals
     assert totals["by_model"]["model-a"] == {
         "input_tokens": 0,
         "output_tokens": 0,
         "total_tokens": 0,
-        "total_cost_usd": 0,
     }
     assert totals["by_model"]["model-b"]["input_tokens"] == 40
 
-    rounding = {"total_cost_usd": 0.1 + 0.2}
+    rounding = {"total_cost_usd": 0.1 + 0.2, "priced_sessions": 1}
     add_usage_totals(rounding, {"total_cost_usd": -0.30000000000000004 - 1e-12})
-    assert rounding == {"total_cost_usd": 0}
+    assert rounding == {"total_cost_usd": 0, "priced_sessions": 1}
+
+
+def test_a_dropped_breakdown_spreads_to_totals_it_moves_into() -> None:
+    dropped = {"input_tokens": 5, "by_model_dropped": True}
+    project = {"input_tokens": 7, "by_model": {"model-a": {"input_tokens": 7}}}
+
+    add_usage_totals(project, usage_totals_change({}, dropped))
+    add_usage_totals(project, usage_totals_change({}, _turn(1, None)))
+
+    assert project == {
+        "input_tokens": 13,
+        "output_tokens": 0,
+        "total_tokens": 1,
+        "by_model_dropped": True,
+    }
 
 
 def test_relay_and_native_writes_keep_tree_and_project_totals_current(
@@ -248,7 +264,7 @@ async def test_a_kept_host_reservation_stops_counting_toward_its_project(
     assert await conversation_store.delete_conversation(session.id, preserve_host_binding=host_id)
 
     assert _tree_totals(conversation_store, session.id) is None
-    assert projects.get_usage(project_id, user_id=_OWNER)["total_cost_usd"] == 0
+    assert "total_cost_usd" not in projects.get_usage(project_id, user_id=_OWNER)
     replacement = conversation_store.create_conversation(
         conversation_id=session.id, host_id=host_id, workspace="/work", project_id=project_id
     )
@@ -275,7 +291,7 @@ def test_refiling_moves_totals_between_projects(
     assert conversation_store.set_conversation_project(session.id, second)
     assert conversation_store.set_conversation_project(representative.id, second)
 
-    assert projects.get_usage(first, user_id=_OWNER)["total_cost_usd"] == 0
+    assert "total_cost_usd" not in projects.get_usage(first, user_id=_OWNER)
     assert projects.get_usage(second, user_id=_OWNER)["input_tokens"] == 113
     assert projects.get_usage(second, user_id=_OWNER)["total_cost_usd"] == pytest.approx(7.5)
 
@@ -296,7 +312,7 @@ def test_nesting_a_session_moves_its_total_to_the_family_project(
     conversation_store.set_session_nest(moved.id, source.id, user_id=_OWNER)
 
     assert conversation_store.get_conversation(moved.id).project_id == family_project
-    assert projects.get_usage(other_project, user_id=_OWNER)["total_cost_usd"] == 0
+    assert "total_cost_usd" not in projects.get_usage(other_project, user_id=_OWNER)
     assert projects.get_usage(family_project, user_id=_OWNER)["total_cost_usd"] == pytest.approx(
         1.5
     )
@@ -346,10 +362,12 @@ def test_concurrent_writers_in_one_tree_lose_no_usage(
 
 
 @pytest.mark.asyncio
-async def test_totals_span_split_databases(tmp_path: Path) -> None:
-    omnigent_uri = f"sqlite:///{tmp_path}/omnigent.db"
-    store = SqlAlchemyConversationStore(omnigent_uri, f"sqlite:///{tmp_path}/conversations.db")
-    projects = SqlAlchemyProjectStore(omnigent_uri)
+async def test_totals_span_split_databases(
+    split_db_conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    store = split_db_conversation_store
+    # Projects live with the session metadata, not the conversation rows.
+    projects = SqlAlchemyProjectStore(store.storage_location)
     project_id = _project(projects, "Factory")
     root = store.create_conversation(project_id=project_id)
     child = store.create_conversation(kind="sub_agent", parent_conversation_id=root.id)
@@ -364,9 +382,10 @@ async def test_totals_span_split_databases(tmp_path: Path) -> None:
 
 
 def test_an_oversized_per_model_breakdown_is_dropped_but_counters_stay_exact(
-    conversation_store: SqlAlchemyConversationStore,
+    conversation_store: SqlAlchemyConversationStore, projects: SqlAlchemyProjectStore
 ) -> None:
-    root = conversation_store.create_conversation()
+    project_id = _project(projects, "Factory")
+    root = conversation_store.create_conversation(project_id=project_id)
     models = {
         f"model-{uuid.uuid4().hex}": {"input_tokens": index, "total_cost_usd": index / 7}
         for index in range(400)
@@ -376,8 +395,77 @@ def test_an_oversized_per_model_breakdown_is_dropped_but_counters_stay_exact(
     conversation_store.increment_session_usage(
         root.id, {"input_tokens": 79_800, "total_cost_usd": 1.0, "by_model": models}
     )
+    # A later small change must not rebuild a breakdown that misses the earlier usage.
+    conversation_store.increment_session_usage(root.id, _turn(10, 0.5))
 
-    assert _tree_totals(conversation_store, root.id) == {
-        "input_tokens": 79_800,
-        "total_cost_usd": 1.0,
+    expected = {
+        "input_tokens": 79_810,
+        "output_tokens": 5,
+        "total_tokens": 15,
+        "total_cost_usd": 1.5,
+        "priced_sessions": 1,
+        "by_model_dropped": True,
     }
+    assert _tree_totals(conversation_store, root.id) == expected
+    assert projects.get_usage(project_id, user_id=_OWNER) == expected
+
+
+@pytest.mark.asyncio
+async def test_removing_the_last_priced_session_leaves_the_project_unpriced(
+    conversation_store: SqlAlchemyConversationStore, projects: SqlAlchemyProjectStore
+) -> None:
+    project_id = _project(projects, "Factory")
+    priced = conversation_store.create_conversation(project_id=project_id)
+    unpriced = conversation_store.create_conversation(project_id=project_id)
+    conversation_store.increment_session_usage(priced.id, _turn(10, 1.0))
+    conversation_store.increment_session_usage(unpriced.id, _turn(20, None))
+    assert projects.get_usage(project_id, user_id=_OWNER)["total_cost_usd"] == 1.0
+
+    assert conversation_store.set_conversation_project(priced.id, None)
+
+    totals = projects.get_usage(project_id, user_id=_OWNER)
+    assert totals["input_tokens"] == 20
+    assert "total_cost_usd" not in totals
+    assert "total_cost_usd" not in totals["by_model"]["model-a"]
+
+    # A genuinely priced $0.00 still shows, until that session leaves too.
+    free = conversation_store.create_conversation(project_id=project_id)
+    conversation_store.increment_session_usage(free.id, _turn(5, 0.0))
+    assert projects.get_usage(project_id, user_id=_OWNER)["total_cost_usd"] == 0
+    assert await conversation_store.delete_conversation(free.id)
+    assert "total_cost_usd" not in projects.get_usage(project_id, user_id=_OWNER)
+
+
+@pytest.mark.asyncio
+async def test_usage_landing_mid_deletion_never_skews_the_totals(
+    conversation_store: SqlAlchemyConversationStore,
+    projects: SqlAlchemyProjectStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A report between a deletion's conversation and metadata deletes counts nowhere."""
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_module
+
+    project_id = _project(projects, "Factory")
+    root = conversation_store.create_conversation(project_id=project_id)
+    child = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=root.id
+    )
+    conversation_store.increment_session_usage(root.id, _turn(100, 1.0))
+    conversation_store.increment_session_usage(child.id, _turn(10, 0.5))
+    real_write = store_module.run_write_transaction
+    raced: list[str] = []
+
+    def racing_write(session_maker: Any, operation_name: str, callback: Any, **kwargs: Any) -> Any:
+        if operation_name == "delete_conversation_metadata" and not raced:
+            raced.append(operation_name)
+            conversation_store.increment_session_usage(child.id, _turn(1000, 9.0))
+            conversation_store.set_session_usage(child.id, _turn(2000, 9.0))
+        return real_write(session_maker, operation_name, callback, **kwargs)
+
+    monkeypatch.setattr(store_module, "run_write_transaction", racing_write)
+
+    assert await conversation_store.delete_conversation(child.id)
+
+    assert raced
+    _assert_usage_equal(_tree_totals(conversation_store, root.id), _turn(100, 1.0))
+    _assert_usage_equal(projects.get_usage(project_id, user_id=_OWNER), _turn(100, 1.0))

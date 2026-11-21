@@ -131,6 +131,7 @@ from omnigent.stores.conversation_store import (
     SCHEDULED_TASK_RUN_LABEL_KEY,
     SIDE_CHAT_COPY_ID_PREFIX_LEN,
     SIDE_CHAT_LABEL_KEY,
+    USAGE_TOTALS_BY_MODEL_DROPPED_KEY,
     ConversationAlreadyExistsError,
     ConversationNotFoundError,
     ConversationStore,
@@ -511,13 +512,14 @@ def _decode_usage_totals(raw: str | None) -> dict[str, Any] | None:
 
 
 def _encode_usage_totals(totals: dict[str, Any]) -> str:
-    """Serialize a usage total, dropping its per-model map if it would not fit."""
+    """Serialize a usage total, dropping its per-model map for good if it would not fit."""
     encoded = json.dumps(totals, separators=(",", ":"))
     framed = compress_text(encoded)
     if framed is not None and len(framed) > USAGE_TOTALS_MAX_STORED_BYTES:
         # The flat counters stay exact; only an outsized per-model map is lost.
         _logger.warning("Dropping the per-model breakdown from an oversized usage total")
         flat = {key: value for key, value in totals.items() if key != "by_model"}
+        flat[USAGE_TOTALS_BY_MODEL_DROPPED_KEY] = True
         encoded = json.dumps(flat, separators=(",", ":"))
     return encoded
 
@@ -1974,15 +1976,67 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         run_write_transaction(self._session_immediate, "set_session_state", write)
 
-    def _usage_root_id(self, conversation_id: str) -> str | None:
-        """The top-level session whose total counts this session's usage; ``None`` once gone."""
-        with self._conv_session("read_usage_root") as session:
-            return session.scalar(
+    def _lock_usage_member(self, session: Session, conversation_id: str) -> Any:
+        """
+        Lock a session's usage row for a usage write in this transaction.
+
+        Writers lock rows in one order: the written sessions' own rows, then
+        their tree's top-level row, then its project. Concurrent writers in a
+        tree therefore wait for each other instead of deadlocking.
+
+        :returns: The row's ``kind``, ``session_usage``, ``subtree_usage`` and
+            ``project_id``, or ``None`` when the session has no row.
+        """
+        stmt = select(
+            SqlConversationMetadata.kind,
+            SqlConversationMetadata.session_usage,
+            SqlConversationMetadata.subtree_usage,
+            SqlConversationMetadata.project_id,
+        ).where(
+            SqlConversationMetadata.workspace_id == current_workspace_id(),
+            SqlConversationMetadata.id == conversation_id,
+        )
+        if self._meta_supports_for_update:
+            stmt = stmt.with_for_update()
+        return session.execute(stmt).one_or_none()
+
+    def _lock_member_tree_usage_totals(
+        self, session: Session, conversation_id: str, member: Any
+    ) -> tuple[bool, _TreeUsageTotals | None]:
+        """
+        Lock the stored total that counts a locked session's usage.
+
+        A top-level session's own row holds its tree's total. A sub-agent's
+        tree root comes from its conversation row; when that row is gone, the
+        session is being deleted and its pending metadata delete subtracts
+        whatever usage it holds, so the caller must not write more.
+
+        :param member: The session's row from :meth:`_lock_usage_member`.
+        :returns: Whether to write the session's usage, and the total to add
+            its change to (``None`` when no total is tracked).
+        """
+        if member.kind != encode_conversation_kind("sub_agent"):
+            totals = _decode_usage_totals(member.subtree_usage)
+            tree = (
+                _TreeUsageTotals(
+                    root_id=conversation_id, totals=totals, project_id=member.project_id
+                )
+                if totals is not None
+                else None
+            )
+            return True, tree
+        with self._profile_label_session(
+            session, read_only=True, operation="read_usage_root"
+        ) as conv_session:
+            root_id = conv_session.scalar(
                 select(SqlConversation.root_conversation_id).where(
                     SqlConversation.workspace_id == current_workspace_id(),
                     SqlConversation.id == conversation_id,
                 )
             )
+        if root_id is None:
+            return False, None
+        return True, self._lock_tree_usage_totals(session, root_id)
 
     def _lock_tree_usage_totals(
         self, session: Session, root_id: str | None
@@ -1990,9 +2044,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         Lock a top-level session's stored total for an update in this transaction.
 
-        Every writer locks the tree's top-level row before its other usage
-        rows, then the project, so concurrent writers in one tree serialize in
-        a single order instead of deadlocking.
+        Called after locking the written sessions' own rows; see
+        :meth:`_lock_usage_member` for the lock order.
 
         :returns: The total and its project, or ``None`` when the session is
             gone or its total is not tracked.
@@ -2131,9 +2184,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .values(subtree_usage=None)
             )
             return
-        tree = self._lock_tree_usage_totals(session, root_id)
-        if tree is None:
-            return
+        # The batch's own rows lock before their tree's top-level row.
         stmt = select(SqlConversationMetadata.session_usage).where(
             SqlConversationMetadata.workspace_id == current_workspace_id(),
             SqlConversationMetadata.id.in_(batch_ids),
@@ -2145,14 +2196,13 @@ class SqlAlchemyConversationStore(ConversationStore):
             add_usage_totals(
                 removed, usage_totals_change({}, _decode_usage_totals(raw_usage) or {})
             )
+        tree = self._lock_tree_usage_totals(session, root_id)
         self._add_to_tree_usage_totals(session, tree, usage_totals_change(removed, {}))
 
     def set_session_usage(
         self,
         conversation_id: str,
         usage: dict[str, Any],
-        *,
-        root_conversation_id: str | None = None,
     ) -> None:
         """
         Persist the cumulative LLM token usage for a conversation.
@@ -2168,24 +2218,17 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``{"input_tokens": 1500, "output_tokens": 350,
             "total_tokens": 1850}``. May carry a nested ``"by_model"``
             sub-dict (per-model token/cost buckets), hence ``Any``.
-        :param root_conversation_id: The conversation's tree root from a row
-            the caller already read; ``None`` looks it up.
         """
         import json
 
         encoded_usage = json.dumps(usage)
-        root_id = root_conversation_id or self._usage_root_id(conversation_id)
 
         def write(session: Session) -> None:
-            totals = self._lock_tree_usage_totals(session, root_id)
-            stmt = select(SqlConversationMetadata.session_usage).where(
-                SqlConversationMetadata.workspace_id == current_workspace_id(),
-                SqlConversationMetadata.id == conversation_id,
-            )
-            if self._meta_supports_for_update:
-                stmt = stmt.with_for_update()
-            stored = session.execute(stmt).one_or_none()
+            stored = self._lock_usage_member(session, conversation_id)
             if stored is None:
+                return
+            counted, totals = self._lock_member_tree_usage_totals(session, conversation_id, stored)
+            if not counted:
                 return
             session.execute(
                 update(SqlConversationMetadata)
@@ -2717,8 +2760,6 @@ class SqlAlchemyConversationStore(ConversationStore):
         self,
         conversation_id: str,
         delta: dict[str, Any],
-        *,
-        root_conversation_id: str | None = None,
     ) -> dict[str, Any]:
         """
         Atomically increment the session usage for one conversation.
@@ -2743,28 +2784,22 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param conversation_id: The conversation to update.
         :param delta: Usage increments (see
             :meth:`ConversationStore.increment_session_usage`).
-        :param root_conversation_id: The conversation's tree root from a row
-            the caller already read; ``None`` looks it up.
         :returns: The updated ``session_usage`` dict.
         """
         import json
 
         from omnigent.stores.conversation_store import apply_session_usage_delta
 
-        root_id = root_conversation_id or self._usage_root_id(conversation_id)
-
         def write(session: Session) -> dict[str, Any]:
-            totals = self._lock_tree_usage_totals(session, root_id)
-            q = select(SqlConversationMetadata).where(
-                SqlConversationMetadata.workspace_id == current_workspace_id(),
-                SqlConversationMetadata.id == conversation_id,
-            )
-            if self._meta_supports_for_update:
-                q = q.with_for_update()
-            meta = session.scalars(q).first()
-            previous = _decode_usage_document(meta.session_usage if meta else None)
+            stored = self._lock_usage_member(session, conversation_id)
+            previous = _decode_usage_document(stored.session_usage if stored else None)
             current = copy.deepcopy(previous)
             apply_session_usage_delta(current, delta)
+            if stored is None:
+                return current
+            counted, totals = self._lock_member_tree_usage_totals(session, conversation_id, stored)
+            if not counted:
+                return current
             session.execute(
                 update(SqlConversationMetadata)
                 .where(
@@ -2773,10 +2808,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
                 .values(session_usage=json.dumps(current))
             )
-            if meta is not None:
-                self._add_to_tree_usage_totals(
-                    session, totals, usage_totals_change(previous, current)
-                )
+            self._add_to_tree_usage_totals(session, totals, usage_totals_change(previous, current))
             return current
 
         return run_write_transaction(

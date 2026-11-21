@@ -537,6 +537,15 @@ def apply_session_usage_delta(current: dict[str, Any], delta: dict[str, Any]) ->
             current[key] = current.get(key, 0) + value
 
 
+# Set on a stored total whose per-model map was dropped for size; the map is
+# then never rebuilt, so a partial breakdown can't pass for a complete one.
+USAGE_TOTALS_BY_MODEL_DROPPED_KEY = "by_model_dropped"
+
+# How many counted sessions a stored total (or a per-model bucket) has priced. The
+# total keeps ``total_cost_usd`` only while this is positive, so removing the last
+# priced session leaves it unpriced rather than at $0.00.
+USAGE_TOTALS_PRICED_SESSIONS_KEY = "priced_sessions"
+
 # The flat ``session_usage`` counters a displayed subtree total sums.
 SUMMABLE_USAGE_KEYS = (
     "input_tokens",
@@ -572,6 +581,27 @@ def _usage_counter_changes(
     return changes
 
 
+def _priced_sessions(usage: Mapping[str, Any]) -> int:
+    """Priced sessions a document stands for: a total's count, else whether it has a cost."""
+    count = usage.get(USAGE_TOTALS_PRICED_SESSIONS_KEY)
+    if isinstance(count, int) and not isinstance(count, bool):
+        return count
+    return 0 if _usage_number(usage.get("total_cost_usd")) is None else 1
+
+
+def _usage_changes(
+    old: Mapping[str, Any], new: Mapping[str, Any], keys: Iterable[str]
+) -> dict[str, int | float]:
+    """Counter changes plus the change in how many priced sessions are counted."""
+    changes = _usage_counter_changes(
+        old, new, (key for key in keys if key != USAGE_TOTALS_PRICED_SESSIONS_KEY)
+    )
+    priced_change = _priced_sessions(new) - _priced_sessions(old)
+    if priced_change:
+        changes[USAGE_TOTALS_PRICED_SESSIONS_KEY] = priced_change
+    return changes
+
+
 def _usage_models(usage: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
     """The well-formed per-model buckets of a ``session_usage`` document."""
     by_model = usage.get("by_model")
@@ -590,20 +620,29 @@ def usage_totals_change(old: Mapping[str, Any], new: Mapping[str, Any]) -> dict[
     and the enforcement-only ``policy_cost_usd`` are excluded, so a parent's
     total never counts a nested worker twice.
 
+    The change also carries how many priced sessions it adds or removes
+    (:data:`USAGE_TOTALS_PRICED_SESSIONS_KEY`), overall and per model. A stored
+    total whose per-model map was dropped marks the change, so the total
+    receiving it drops its map too.
+
     :param old: The usage before the change, e.g. ``{"input_tokens": 100}``.
     :param new: The usage after it, e.g. ``{"input_tokens": 150,
         "total_cost_usd": 0.0}``.
     :returns: Signed changes in the same layout, e.g. ``{"input_tokens": 50,
-        "total_cost_usd": 0.0}``. Empty when nothing summed changed.
+        "total_cost_usd": 0.0, "priced_sessions": 1}``. Empty when nothing
+        summed changed.
     """
-    change: dict[str, Any] = dict(_usage_counter_changes(old, new, SUMMABLE_USAGE_KEYS))
+    change: dict[str, Any] = dict(_usage_changes(old, new, SUMMABLE_USAGE_KEYS))
+    if old.get(USAGE_TOTALS_BY_MODEL_DROPPED_KEY) or new.get(USAGE_TOTALS_BY_MODEL_DROPPED_KEY):
+        change[USAGE_TOTALS_BY_MODEL_DROPPED_KEY] = True
+        return change
     old_models = _usage_models(old)
     new_models = _usage_models(new)
     model_changes: dict[str, dict[str, int | float]] = {}
     for model in sorted(old_models.keys() | new_models.keys()):
         old_bucket = old_models.get(model, {})
         new_bucket = new_models.get(model, {})
-        bucket_change = _usage_counter_changes(
+        bucket_change = _usage_changes(
             old_bucket, new_bucket, sorted(old_bucket.keys() | new_bucket.keys())
         )
         if bucket_change:
@@ -620,6 +659,12 @@ def _add_usage_counters(totals: dict[str, Any], changes: Mapping[str, Any]) -> N
             continue
         # Totals sum non-negative counters; clamp float rounding below zero.
         totals[key] = max(0, (_usage_number(totals.get(key)) or 0) + change)
+    if _usage_number(totals.get(USAGE_TOTALS_PRICED_SESSIONS_KEY)) is None or (
+        totals[USAGE_TOTALS_PRICED_SESSIONS_KEY] <= 0
+    ):
+        # Nothing counted is priced any more: report unpriced, not $0.00.
+        totals.pop(USAGE_TOTALS_PRICED_SESSIONS_KEY, None)
+        totals.pop("total_cost_usd", None)
 
 
 def add_usage_totals(totals: dict[str, Any], change: Mapping[str, Any]) -> None:
@@ -629,9 +674,19 @@ def add_usage_totals(totals: dict[str, Any], change: Mapping[str, Any]) -> None:
     :param totals: A ``subtree_usage`` or ``project_usage`` document.
     :param change: Signed changes from :func:`usage_totals_change`.
     """
-    _add_usage_counters(totals, {key: value for key, value in change.items() if key != "by_model"})
+    _add_usage_counters(
+        totals,
+        {
+            key: value
+            for key, value in change.items()
+            if key not in ("by_model", USAGE_TOTALS_BY_MODEL_DROPPED_KEY)
+        },
+    )
+    if change.get(USAGE_TOTALS_BY_MODEL_DROPPED_KEY):
+        totals.pop("by_model", None)
+        totals[USAGE_TOTALS_BY_MODEL_DROPPED_KEY] = True
     model_changes = change.get("by_model")
-    if not isinstance(model_changes, dict) or not model_changes:
+    if totals.get(USAGE_TOTALS_BY_MODEL_DROPPED_KEY) or not isinstance(model_changes, dict):
         return
     by_model = totals.get("by_model")
     if not isinstance(by_model, dict):
@@ -1708,8 +1763,6 @@ class ConversationStore(ABC):
         self,
         conversation_id: str,
         usage: dict[str, Any],
-        *,
-        root_conversation_id: str | None = None,
     ) -> None:
         """
         Persist the cumulative LLM token usage for a conversation.
@@ -1726,8 +1779,6 @@ class ConversationStore(ABC):
             ``{"input_tokens": 1500, "output_tokens": 350,
             "total_tokens": 1850}``. May carry a nested ``"by_model"``
             sub-dict (per-model token/cost buckets), hence ``Any``.
-        :param root_conversation_id: The conversation's tree root from a row
-            the caller already read; ``None`` makes the store look it up.
         """
         ...
 
@@ -1787,8 +1838,6 @@ class ConversationStore(ABC):
         self,
         conversation_id: str,
         delta: dict[str, Any],
-        *,
-        root_conversation_id: str | None = None,
     ) -> dict[str, Any]:
         """
         Atomically apply a usage delta to a conversation's ``session_usage``.
@@ -1820,8 +1869,6 @@ class ConversationStore(ABC):
             ``{"input_tokens": 1000, "total_cost_usd": 0.05,
             "by_model": {"claude-sonnet-4-6": {"input_tokens": 1000,
             "total_cost_usd": 0.05}}}``.
-        :param root_conversation_id: The conversation's tree root from a row
-            the caller already read; ``None`` makes the store look it up.
         :returns: The updated ``session_usage`` dict after the increment.
         """
         ...
