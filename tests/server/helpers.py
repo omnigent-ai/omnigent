@@ -1344,3 +1344,37 @@ async def sent_to_host(
             f"the route answered {response.status_code} without asking the host: {response.text}"
         )
     raise AssertionError(f"the route didn't ask the host within {timeout:g}s")
+
+
+def claude_ask_user_question_payload(
+    *,
+    cwd: str = "/tmp/cwd",
+    question: str = "Which database should the worker target?",
+) -> dict[str, Any]:
+    """
+    Build a realistic Claude ``PermissionRequest`` body for one AskUserQuestion.
+
+    ``tool_input`` carries the full ``questions`` list (each with ``options``), which the
+    server projects into the structured ``params.ask_user_question`` extra.
+    """
+    return {
+        "session_id": "claude_sess_ask",
+        "transcript_path": "/tmp/transcript.jsonl",
+        "cwd": cwd,
+        "permission_mode": "default",
+        "hook_event_name": "PermissionRequest",
+        "tool_name": "AskUserQuestion",
+        "tool_input": {
+            "questions": [
+                {
+                    "question": question,
+                    "header": "Database",
+                    "multiSelect": False,
+                    "options": [
+                        {"label": "postgres", "description": "Primary store"},
+                        {"label": "sqlite", "description": "Local dev"},
+                    ],
+                },
+            ],
+        },
+    }

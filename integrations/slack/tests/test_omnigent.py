@@ -1183,6 +1183,22 @@ async def test_resolve_elicitation_decline_and_benign_statuses() -> None:
 
 
 @respx.mock
+async def test_resolve_elicitation_raises_when_the_answer_was_not_delivered() -> None:
+    # 503: the server could not deliver the answer, so the card must not read as answered.
+    respx.post("http://omnigent.test/v1/sessions/conv_1/elicitations/elicit_1/resolve").mock(
+        return_value=httpx.Response(
+            503, json={"error": {"code": "runner_unavailable", "message": "not sent"}}
+        )
+    )
+    client = OmnigentClient("http://omnigent.test")
+    try:
+        with pytest.raises(RunnerUnavailableError):
+            await client.resolve_elicitation("conv_1", "elicit_1", accepted=True)
+    finally:
+        await client.aclose()
+
+
+@respx.mock
 async def test_get_session_activity_maps_server_state() -> None:
     # The server snapshot is the authoritative "is this session busy?" signal.
     def snap(status: str, pending: list[dict[str, object]]) -> httpx.Response:

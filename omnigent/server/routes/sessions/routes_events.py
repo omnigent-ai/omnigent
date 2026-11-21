@@ -272,6 +272,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _cancel_runner_relays,
     _child_session_summaries_from_conversations,
     _codex_side_chat_thread_id,
+    _deliver_answer_to_stopped_session,
     _dispatch_session_event_to_runner,
     _enrich_terminal_status_with_subagent_output,
     _ensure_native_terminal_ready,
@@ -298,6 +299,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _resolve_elicitation,
     _runner_live_on_another_replica_from_conversations,
     _session_is_moving,
+    _session_offline_host_id,
     _side_chat_source_id,
     _stop_host_runner_intentionally,
     _wait_for_host_bound_runner_client,
@@ -587,48 +589,6 @@ async def _raise_if_runner_re_tunnelled_to_another_replica(
             "session runner re-tunnelled to another replica; retry",
             code=ErrorCode.WRONG_REPLICA,
         )
-
-
-async def _session_offline_host_id(
-    conv: Conversation,
-    app_state: Any,
-    conversation_store: ConversationStore,
-) -> str | None:
-    """
-    Return the session's user-run routing host when it has no live tunnel.
-
-    Called after a send found no runner to use and the host never took a
-    launch. A host that is not connected cannot start a runner, so the failure
-    is an offline host rather than a runner that failed to start. Managed
-    sandboxes are excluded (the server wakes those itself and the user cannot
-    start them), as is a host whose row still reads live, which can only be
-    connected to another replica.
-
-    Side chats and sub-agents can inherit their host from an ancestor, so the
-    routing host is authoritative rather than only ``conv.host_id``.
-
-    :param conv: The session row whose send failed.
-    :param app_state: ``request.app.state`` — supplies the host registry and
-        the host store.
-    :param conversation_store: Store used to resolve an inherited routing host.
-    :returns: The offline user-run host id, or ``None`` when the session has no
-        such host.
-    """
-    host_id = conv.host_id
-    if host_id is None:
-        host_id = await asyncio.to_thread(routing_host_id, conv, conversation_store)
-    if host_id is None:
-        return None
-    host_registry = getattr(app_state, "host_registry", None)
-    if host_registry is None or host_registry.get(host_id) is not None:
-        return None
-    host_store = getattr(app_state, "host_store", None)
-    if host_store is None:
-        return host_id
-    host = await asyncio.to_thread(host_store.get_host, host_id)
-    if host is None or host.sandbox_provider is not None or host_is_live(host):
-        return None
-    return host_id
 
 
 def _host_offline_message() -> str:
@@ -1092,6 +1052,7 @@ def register_events_routes(
     register_runner_ingest: Callable[[Callable[..., Awaitable[EventAckFrame]]], None]
     | None = None,
     register_startup_dispatch: Callable[[StartupDispatch], None] | None = None,
+    register_message_dispatch: Callable[[Callable[..., Awaitable[Any]]], None] | None = None,
     clear_session_into_fresh_session: Callable[
         [Request, Conversation, Callable[[], Awaitable[None]]], Awaitable[str]
     ]
@@ -2470,6 +2431,19 @@ def register_events_routes(
                 pass
             return {"queued": False}
         if body.type == _APPROVAL_TYPE:
+            # An answer whose runner stays gone goes as a message; the resolver handles the rest.
+            delivered = await _deliver_answer_to_stopped_session(
+                request,
+                session_id,
+                conv,
+                body.data,
+                runner_router,
+                _post_event_impl,
+                conversation_store=conversation_store,
+                runner_exit_reports=runner_exit_reports,
+            )
+            if delivered is not None:
+                return delivered
             # Deliver the verdict through the shared resolver: it
             # sets any server-side harness Future (owner-checked),
             # clears the sidebar badge, and forwards
@@ -4209,6 +4183,8 @@ def register_events_routes(
 
     if register_startup_dispatch is not None:
         register_startup_dispatch(_post_event_impl)
+    if register_message_dispatch is not None:
+        register_message_dispatch(_post_event_impl)
 
     # ── GET /sessions/{session_id}/stream ────────────────────────
 
