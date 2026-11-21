@@ -2,6 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Conversation } from "@/hooks/useConversations";
+import type * as SidebarDataModule from "@/hooks/useSidebarData";
 import { type ComponentProps, type ReactNode, useState } from "react";
 
 import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
@@ -31,7 +32,7 @@ vi.mock("@/hooks/useConversations", () => ({
 
 let sidebarSessions: { pages: { data: unknown[] }[] } | undefined;
 vi.mock("@/hooks/useSidebarData", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/hooks/useSidebarData")>()),
+  ...(await importOriginal<typeof SidebarDataModule>()),
   useOptionalLoadedConversations: () => sidebarSessions,
 }));
 
