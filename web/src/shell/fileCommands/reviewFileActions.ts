@@ -13,6 +13,7 @@ import { type FileCommandEnvironment, fileCommandFacts } from "./useFileCommandF
 
 /** Where a pull request's files live: in a repository, not on any host the app reaches. */
 export const REPOSITORY_FILE_ENVIRONMENT: FileCommandEnvironment = {
+  local: false,
   sshTarget: null,
   linkable: false,
 };

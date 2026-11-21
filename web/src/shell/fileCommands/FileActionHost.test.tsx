@@ -1,6 +1,7 @@
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as EditorLinksModule from "@/lib/editorLinks";
+import type * as NativeBridgeModule from "@/lib/nativeBridge";
 import { isCommandListed, usePaletteCommandsStore } from "@/store/paletteCommands";
 import { FileActionHost, fileLink } from "./FileActionHost";
 import { requestFileAction, useFileActionStore } from "./fileActionStore";
@@ -9,10 +10,11 @@ import { FileViewerContext } from "../FileViewerContext";
 import { resolveFileCommandTarget } from "./target";
 import { useFileCommandMenu } from "./useFileCommandMenu";
 
-const { copyText, launchEditorLink, toast } = vi.hoisted(() => ({
+const { copyText, launchEditorLink, toast, shell } = vi.hoisted(() => ({
   copyText: vi.fn<(text: string) => Promise<void>>(),
   launchEditorLink: vi.fn(),
   toast: { success: vi.fn(), error: vi.fn() },
+  shell: { ios: false },
 }));
 vi.mock("@/lib/clipboard", () => ({ copyText }));
 vi.mock("sonner", () => ({ toast }));
@@ -20,6 +22,11 @@ vi.mock("@/lib/editorLinks", async (importOriginal) => ({
   ...(await importOriginal<typeof EditorLinksModule>()),
   launchEditorLink,
 }));
+vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
+  ...(await importOriginal<typeof NativeBridgeModule>()),
+  isIOSShell: () => shell.ios,
+}));
+vi.mock("@/lib/desktopHostId", () => ({ useDesktopHostId: () => "this-mac" }));
 vi.mock("@/hooks/useHostSshTarget", () => ({
   useHostSshTarget: (hostId: string | null) => (hostId === "dev-box" ? "dev-box.ssh" : null),
 }));
@@ -37,6 +44,7 @@ function target(
 
 beforeEach(() => {
   copyText.mockReset().mockResolvedValue(undefined);
+  shell.ios = false;
   render(<FileActionHost />);
 });
 
@@ -98,6 +106,23 @@ describe("FileActionHost", () => {
     expect(link.searchParams.get("file")).toBe("docs/a b.md");
   });
 
+  it("opens this machine's files in an editor directly", () => {
+    act(() => requestFileAction(target("src/main.ts"), "open-in-vscode"));
+    expect(launchEditorLink).toHaveBeenCalledWith("vscode://file/repo/src/main.ts");
+  });
+
+  it("opens no editor from a phone, where neither local nor SSH links work", () => {
+    shell.ios = true;
+    act(() => requestFileAction(target("src/main.ts"), "open-in-vscode"));
+    act(() =>
+      requestFileAction(
+        target("src/main.ts", { root: "/repo", hostId: "dev-box", conversationId: "conv_1" }),
+        "open-in-cursor",
+      ),
+    );
+    expect(launchEditorLink).not.toHaveBeenCalled();
+  });
+
   it("opens a remote host's file in an editor over SSH", () => {
     const remote = target("src/main.ts", {
       root: "/repo",
@@ -111,7 +136,7 @@ describe("FileActionHost", () => {
   it("does nothing for an action that no longer applies", () => {
     const deleted = resolveFileCommandTarget("gone.ts", {
       root: "/repo",
-      hostId: "dev-box",
+      hostId: "this-mac",
       conversationId: "conv_1",
       deleted: true,
     });
@@ -160,6 +185,8 @@ describe("the focused file in ⌘K", () => {
       "file.copy-path",
       "file.copy-relative-path",
       "file.copy-link",
+      "file.open-in-vscode",
+      "file.open-in-cursor",
     ]);
 
     act(() => group!.commands.find((command) => command.id === "file.copy-path")!.run());

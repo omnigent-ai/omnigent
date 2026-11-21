@@ -6,11 +6,15 @@
 import { useMemo } from "react";
 import { useHostSshTarget } from "@/hooks/useHostSshTarget";
 import { CODE_EDITORS, editorLink, type CodeEditor } from "@/lib/editorLinks";
+import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
+import { useDesktopHostId } from "@/lib/desktopHostId";
 import type { FileCommandFacts } from "./model";
 import type { FileCommandTarget } from "./target";
 
 /** What the facts read from the app and the session's host, shared by its files. */
 export interface FileCommandEnvironment {
+  /** The session's host is this machine. */
+  local: boolean;
   /** The SSH alias that reaches the session's remote host, if any. */
   sshTarget: string | null;
   /** The files belong to a session, so a link can point into it. */
@@ -21,10 +25,15 @@ export interface FileCommandEnvironment {
 export function fileEditorLink(
   editor: CodeEditor,
   target: FileCommandTarget,
-  environment: Pick<FileCommandEnvironment, "sshTarget">,
+  environment: Pick<FileCommandEnvironment, "local" | "sshTarget">,
 ): string | null {
-  if (!target.absolutePath || !environment.sshTarget) return null;
-  return editorLink(editor, target.absolutePath, environment.sshTarget, target.directory);
+  if (!target.absolutePath || (!environment.local && !environment.sshTarget)) return null;
+  return editorLink(
+    editor,
+    target.absolutePath,
+    environment.local ? null : environment.sshTarget,
+    target.directory,
+  );
 }
 
 /** How the asking surface can open files, which only it knows. */
@@ -56,17 +65,23 @@ export function fileCommandFacts(
 }
 
 /**
- * The environment for session `conversationId`'s files on `hostId`; SSH
- * aliases resolve only for remote hosts.
+ * The environment for session `conversationId`'s files on `hostId`. Editors open this
+ * machine's files directly and a remote host's over SSH; a phone opens neither.
  */
 export function useFileCommandEnvironment(
   hostId: string | null,
   conversationId: string | null,
 ): FileCommandEnvironment {
-  const sshTarget = useHostSshTarget(hostId, conversationId ?? undefined);
+  const desktopHostId = useDesktopHostId();
+  const mobile = isAndroidShell() || isIOSShell();
+  const local = !mobile && hostId !== null && hostId === desktopHostId;
+  const sshTarget = useHostSshTarget(
+    !mobile && !local ? hostId : null,
+    conversationId ?? undefined,
+  );
   return useMemo(
-    () => ({ sshTarget, linkable: conversationId !== null }),
-    [sshTarget, conversationId],
+    () => ({ local, sshTarget: mobile ? null : sshTarget, linkable: conversationId !== null }),
+    [local, mobile, sshTarget, conversationId],
   );
 }
 
