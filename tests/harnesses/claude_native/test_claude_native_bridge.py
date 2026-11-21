@@ -11684,7 +11684,7 @@ def test_wait_for_claude_prompt_ready_surfaces_terminal_output_on_timeout(
     )
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge._capture_pane",
-        lambda socket_path, tmux_target: crash_pane,
+        lambda socket_path, tmux_target, *, join_wrapped=False: crash_pane,
     )
     # The pane is alive, so the wait runs out its budget rather than seeing it gone.
     monkeypatch.setattr(
@@ -11721,7 +11721,7 @@ def test_wait_for_claude_prompt_ready_reports_empty_capture_count(
     """
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge._capture_pane",
-        lambda socket_path, tmux_target: "",
+        lambda socket_path, tmux_target, *, join_wrapped=False: "",
     )
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge._claude_pane_state",
@@ -11767,7 +11767,9 @@ def test_wait_for_claude_prompt_ready_tail_is_observed_not_recaptured(
     late_ready = "────────────────\n❯ \n────────────────\n  Opus 4.8\n"
     calls = {"n": 0}
 
-    def fake_capture(socket_path: str, tmux_target: str) -> str:
+    def fake_capture(socket_path: str, tmux_target: str, *, join_wrapped: bool = False) -> str:
+        if join_wrapped:
+            return observed
         calls["n"] += 1
         # First (and only, at timeout_s=0) in-loop capture: no box.
         # Any later capture would be the box-present frame — which the
@@ -11814,7 +11816,7 @@ def test_wait_for_claude_prompt_ready_outlasts_base_budget_while_pane_alive(
     frames = iter([_BOOTING_PANE, _BOOTING_PANE, _READY_PANE])
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge._capture_pane",
-        lambda socket_path, tmux_target: next(frames, _READY_PANE),
+        lambda socket_path, tmux_target, *, join_wrapped=False: next(frames, _READY_PANE),
     )
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge._claude_pane_state",
@@ -11928,10 +11930,10 @@ def test_wait_for_claude_prompt_ready_reports_a_launcher_input_prompt(
     answer and the delivery holds the message for it.
     """
     monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
-    captures: list[int] = []
+    captures: list[bool] = []
 
     def _capture(socket_path: str, tmux_target: str, *, join_wrapped: bool = False) -> str:
-        captures.append(1)
+        captures.append(join_wrapped)
         return f"Installing launcher...\n{prompt}\n"
 
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._capture_pane", _capture)
@@ -11950,7 +11952,52 @@ def test_wait_for_claude_prompt_ready_reports_a_launcher_input_prompt(
     )
     assert prompt in str(raised.value)
     assert raised.value.awaits_answer is awaits_answer
-    assert len(captures) == 2
+    assert captures.count(False) == 2
+
+
+@pytest.mark.parametrize(
+    ("banner", "joined_banner"),
+    [
+        ("Updating Claude Code from 2.1.314 to 2.1.316\n", None),
+        ("No Claude Code installation found; installing it now.\n", None),
+        (
+            "Updating Clau\nde Code from 2.1.314 to 2.1.316\n",
+            "Updating Claude Code from 2.1.314 to 2.1.316\n",
+        ),
+        (
+            "No Claude Code installation found; insta\nlling it now.\n",
+            "No Claude Code installation found; installing it now.\n",
+        ),
+    ],
+    ids=["update", "install", "wrapped-update", "wrapped-install"],
+)
+def test_wait_for_claude_prompt_ready_holds_for_a_launcher_install(
+    monkeypatch: pytest.MonkeyPatch, banner: str, joined_banner: str | None
+) -> None:
+    """A launcher still installing Claude Code is reported as awaiting; the pane is not reaped."""
+    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
+    captures: list[bool] = []
+
+    def _capture(socket_path: str, tmux_target: str, *, join_wrapped: bool = False) -> str:
+        captures.append(join_wrapped)
+        return joined_banner if join_wrapped and joined_banner is not None else banner
+
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._capture_pane", _capture)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._claude_pane_state",
+        lambda socket_path, tmux_target: claude_native_bridge._ClaudePaneState(True),
+    )
+    with pytest.raises(claude_native_bridge.ClaudeTerminalDialog) as raised:
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/example/tmux.sock",
+            "claude:0.0",
+            timeout_s=30.0,
+        )
+    assert str(raised.value).startswith(
+        "Claude Code's launch command is still installing Claude Code in its terminal"
+    )
+    assert raised.value.awaits_answer is True
+    assert captures.count(False) == 2
 
 
 def test_wait_for_claude_prompt_ready_prefers_a_rendered_prompt_over_a_link(
@@ -11987,7 +12034,7 @@ def test_wait_for_claude_prompt_ready_reports_the_exit_when_pane_dead(
     """
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge._capture_pane",
-        lambda socket_path, tmux_target: _BOOTING_PANE,
+        lambda socket_path, tmux_target, *, join_wrapped=False: _BOOTING_PANE,
     )
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge._claude_pane_state",
@@ -12024,7 +12071,7 @@ def test_wait_for_claude_prompt_ready_slow_boot_wait_is_bounded(
     """
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge._capture_pane",
-        lambda socket_path, tmux_target: _BOOTING_PANE,
+        lambda socket_path, tmux_target, *, join_wrapped=False: _BOOTING_PANE,
     )
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge._claude_pane_state",
@@ -12052,8 +12099,9 @@ def test_readiness_throttles_liveness_without_delaying_ready_composer(
     captures: list[float] = []
     probes: list[tuple[float, float]] = []
 
-    def capture(socket_path: str, tmux_target: str) -> str:
-        captures.append(clock.monotonic())
+    def capture(socket_path: str, tmux_target: str, *, join_wrapped: bool = False) -> str:
+        if not join_wrapped:
+            captures.append(clock.monotonic())
         return _READY_PANE if clock.monotonic() >= 6.5 else _BOOTING_PANE
 
     def probe(socket_path: str, tmux_target: str) -> claude_native_bridge._ClaudePaneState:
@@ -12086,7 +12134,7 @@ def test_readiness_stops_at_deadline_between_liveness_probes(
     monkeypatch.setattr(claude_native_bridge, "time", clock)
     monkeypatch.setattr(claude_native_bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0.25)
     monkeypatch.setattr(claude_native_bridge, "_TMUX_READY_SLOW_BOOT_TIMEOUT_S", 0.75)
-    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda *_: _BOOTING_PANE)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda *_, **_kw: _BOOTING_PANE)
     monkeypatch.setattr(claude_native_bridge, "_claude_pane_state", probe)
 
     with pytest.raises(claude_native_bridge.ClaudePromptTimeout):
@@ -12109,7 +12157,7 @@ def test_readiness_detects_dead_pane_on_next_liveness_probe(
     )
     monkeypatch.setattr(claude_native_bridge, "time", clock)
     monkeypatch.setattr(claude_native_bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0.25)
-    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda *_: _BOOTING_PANE)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda *_, **_kw: _BOOTING_PANE)
     monkeypatch.setattr(claude_native_bridge, "_claude_pane_state", probe)
 
     with pytest.raises(claude_native_bridge.ClaudePromptTimeout):
@@ -12196,7 +12244,7 @@ def test_wait_for_claude_prompt_ready_survives_unanswered_liveness_probe(
     frames = iter([_BOOTING_PANE, _BOOTING_PANE, _READY_PANE])
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge._capture_pane",
-        lambda socket_path, tmux_target: next(frames, _READY_PANE),
+        lambda socket_path, tmux_target, *, join_wrapped=False: next(frames, _READY_PANE),
     )
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge._claude_pane_state",
@@ -12739,14 +12787,18 @@ def _fake_tmux(
     """
     sends: list[list[str]] = []
     frames = list(panes)
+    current_frame = frames[0]
 
     def _fake_run_tmux(socket_path: str, *args: str) -> None:
         del socket_path
         sends.append(list(args))
 
-    def _fake_capture(socket_path: str, tmux_target: str) -> str:
+    def _fake_capture(socket_path: str, tmux_target: str, *, join_wrapped: bool = False) -> str:
+        nonlocal current_frame
         del socket_path, tmux_target
-        return frames.pop(0) if len(frames) > 1 else frames[0]
+        if not join_wrapped:
+            current_frame = frames.pop(0) if len(frames) > 1 else frames[0]
+        return current_frame
 
     monkeypatch.setattr(claude_native_bridge, "_run_tmux", _fake_run_tmux)
     monkeypatch.setattr(claude_native_bridge, "_capture_pane", _fake_capture)
@@ -12832,7 +12884,9 @@ class _EditableComposer:
             self.submitted.append(self.text)
             self.text, self.cursor = "", 0
 
-    def _capture_pane(self, socket_path: str, tmux_target: str) -> str:
+    def _capture_pane(
+        self, socket_path: str, tmux_target: str, *, join_wrapped: bool = False
+    ) -> str:
         del socket_path, tmux_target
         if self._clearing_started and self._unavailable_clear_captures:
             self._unavailable_clear_captures -= 1
@@ -13098,7 +13152,9 @@ def test_delivery_expands_a_clipped_composer_until_submit_is_verified(
     if stale_frame:
         capture = composer._capture_pane
 
-        def capture_after_old_frame(socket_path: str, tmux_target: str) -> str:
+        def capture_after_old_frame(
+            socket_path: str, tmux_target: str, *, join_wrapped: bool = False
+        ) -> str:
             pane = capture(socket_path, tmux_target).removeprefix("⏺ done\n")
             return f"{composer._RULE}\n❯ previous message\n{pane}"
 
@@ -13189,7 +13245,9 @@ def test_idle_compact_notice_redraw_preserves_delivery_checks(
     monkeypatch.setattr(
         claude_native_bridge,
         "_capture_pane",
-        lambda *args: overlay if notice_visible else composer._capture_pane(*args),
+        lambda *args, **kwargs: (
+            overlay if notice_visible else composer._capture_pane(*args, **kwargs)
+        ),
     )
     bridge_dir = _picker_bridge_dir(tmp_path)
 
@@ -13268,8 +13326,10 @@ def test_output_printed_over_the_input_box_is_repainted_before_refusing(
     monkeypatch.setattr(
         claude_native_bridge,
         "_capture_pane",
-        lambda *args: (
-            _PRINTED_OVER_BOX_PANES[printed] if covered else composer._capture_pane(*args)
+        lambda *args, **kwargs: (
+            _PRINTED_OVER_BOX_PANES[printed]
+            if covered
+            else composer._capture_pane(*args, **kwargs)
         ),
     )
 
@@ -13345,12 +13405,12 @@ def test_composer_recovery_rechecks_the_surface_before_typing(
     monkeypatch.setattr(
         claude_native_bridge,
         "_capture_pane",
-        lambda *args: (
+        lambda *args, **kwargs: (
             pane
             if resized or redrawn
             else _IDLE_COMPACT_NOTICE_PANE
             if recovery == "notice-redraw"
-            else composer._capture_pane(*args)
+            else composer._capture_pane(*args, **kwargs)
         ),
     )
     monkeypatch.setattr(
@@ -13940,7 +14000,7 @@ def test_an_effort_switch_with_a_swallowed_confirm_leaves_the_pane_usable(
                 tui["pane"] = _EFFORT_DIALOG_PANE  # the submit ran /effort
 
     monkeypatch.setattr(claude_native_bridge, "_run_tmux", _fake_run_tmux)
-    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda _s, _t: tui["pane"])
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda _s, _t, **_kw: tui["pane"])
     monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
 
     claude_native_bridge.inject_slash_command(
@@ -14332,7 +14392,7 @@ def test_wait_for_claude_prompt_ready_fails_fast_on_a_terminal_dialog(
     """
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge._capture_pane",
-        lambda socket_path, tmux_target: _MCP_APPROVAL_DIALOG_PANE,
+        lambda socket_path, tmux_target, *, join_wrapped=False: _MCP_APPROVAL_DIALOG_PANE,
     )
     sends = []
     monkeypatch.setattr(claude_native_bridge, "_run_tmux", lambda *args: sends.append(args))
@@ -14397,7 +14457,7 @@ def test_wait_for_claude_prompt_ready_ignores_a_single_dialog_frame(
     frames = iter([_MCP_APPROVAL_DIALOG_PANE, _READY_PANE])
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge._capture_pane",
-        lambda socket_path, tmux_target: next(frames, _READY_PANE),
+        lambda socket_path, tmux_target, *, join_wrapped=False: next(frames, _READY_PANE),
     )
     claude_native_bridge._wait_for_claude_prompt_ready(
         "/tmp/example/tmux.sock",
@@ -14774,7 +14834,9 @@ class _BootingClaudePane:
         elif args[-1] == "Enter":
             self._draft = ""
 
-    def _capture_pane(self, socket_path: str, tmux_target: str) -> str:
+    def _capture_pane(
+        self, socket_path: str, tmux_target: str, *, join_wrapped: bool = False
+    ) -> str:
         del socket_path, tmux_target
         if self.clock.monotonic() < self.boot_s:
             return self.boot_pane
@@ -14944,7 +15006,7 @@ def test_capped_readiness_probes_liveness_until_its_cap(
     probe = Mock(return_value=claude_native_bridge._ClaudePaneState(alive))
     monkeypatch.setattr(claude_native_bridge, "time", clock)
     monkeypatch.setattr(claude_native_bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0.25)
-    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda *_: _BOOTING_PANE)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda *_, **_kw: _BOOTING_PANE)
     monkeypatch.setattr(claude_native_bridge, "_claude_pane_state", probe)
 
     with pytest.raises(claude_native_bridge.ClaudePromptTimeout):

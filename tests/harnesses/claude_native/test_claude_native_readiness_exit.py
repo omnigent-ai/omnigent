@@ -34,7 +34,9 @@ def test_dead_pane_is_checked_before_the_startup_budget(
 ) -> None:
     clock = _Clock()
     monkeypatch.setattr(bridge, "time", clock)
-    monkeypatch.setattr(bridge, "_capture_pane", lambda *_: "Synthetic startup failure")
+    monkeypatch.setattr(
+        bridge, "_capture_pane", lambda *_args, **_kwargs: "Synthetic startup failure"
+    )
     monkeypatch.setattr(
         bridge,
         "_claude_pane_state",
@@ -60,7 +62,7 @@ def test_vanished_pane_is_reported_as_exited_not_as_unready(
     """
     clock = _Clock()
     monkeypatch.setattr(bridge, "time", clock)
-    monkeypatch.setattr(bridge, "_capture_pane", lambda *_: "")
+    monkeypatch.setattr(bridge, "_capture_pane", lambda *_args, **_kwargs: "")
     monkeypatch.setattr(bridge, "_claude_pane_state", lambda *_: bridge._ClaudePaneState(False))
 
     with pytest.raises(bridge.ClaudeTerminalExited) as raised:
@@ -76,7 +78,9 @@ def test_dead_pane_at_deadline_retains_exit_evidence(monkeypatch: pytest.MonkeyP
     clock = _Clock()
     monkeypatch.setattr(bridge, "time", clock)
     monkeypatch.setattr(bridge, "_TMUX_READY_SLOW_BOOT_TIMEOUT_S", 0.3)
-    monkeypatch.setattr(bridge, "_capture_pane", lambda *_: "Synthetic startup failure")
+    monkeypatch.setattr(
+        bridge, "_capture_pane", lambda *_args, **_kwargs: "Synthetic startup failure"
+    )
     monkeypatch.setattr(
         bridge,
         "_claude_pane_state",
