@@ -156,13 +156,20 @@ export function followCorner(
   return { ...corner, dividers: held, left: linePosition(column), top: linePosition(row) };
 }
 
-/** `layout` with each resize applied in turn. */
+/**
+ * `layout` with each resize applied in turn. A resize naming the ratio its divider already has
+ * leaves it exactly there: a refused move keeps a proportional split's ratio past the resize
+ * limits, which clamping would change.
+ */
 export function applyDividerResizes(
   layout: TerminalLayout,
   resizes: readonly DividerResize[],
 ): TerminalLayout {
   return resizes.reduce(
-    (current, { path, ratio }) => resizeTerminalSplit(current, path, ratio),
+    (current, { path, ratio }) =>
+      dividerAt(current, path)?.ratio === ratio
+        ? current
+        : resizeTerminalSplit(current, path, ratio),
     layout,
   );
 }

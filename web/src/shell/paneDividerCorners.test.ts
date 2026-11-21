@@ -208,6 +208,25 @@ describe("cornerDragResizes", () => {
     ]);
   });
 
+  it("keeps a proportional split's ratio past the resize limits when its move is refused", () => {
+    // Splitting along a row keeps proportions, so nine columns beside a stack sit at 0.9.
+    const layout = columns("a", rows("b", "c"), 0.9);
+    const [corner] = dividerCorners(terminalLayoutGeometry(layout).dividers);
+    const resizes = cornerDragResizes(layout, corner, { left: 50, top: 70 }, () => false);
+    expect(resizes).toEqual([
+      { path: [], ratio: 0.9 },
+      { path: [1], ratio: 0.5 },
+    ]);
+    expect(applyDividerResizes(layout, resizes)).toBe(layout);
+  });
+
+  it("still holds an accepted move to the resize limits", () => {
+    const layout = columns("a", rows("b", "c"), 0.9);
+    expect(applyDividerResizes(layout, [{ path: [], ratio: 0.95 }])).toEqual(
+      columns("a", rows("b", "c"), 0.85),
+    );
+  });
+
   it("applies resizes in turn", () => {
     const layout = columns("a", rows("b", "c"), 0.4);
     expect(
