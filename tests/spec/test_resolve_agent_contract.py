@@ -303,6 +303,54 @@ def test_recording_blockers_are_explicit_and_do_not_block_delivery() -> None:
     assert "Do not block the fix or PR because footage is missing or rejected" in normalized
 
 
+def test_api_facet_with_a_found_ui_caller_is_filmed_on_that_surface() -> None:
+    normalized = _normalized_resolve_instructions()
+
+    assert (
+        "search for UI and CLI callers (including SDK wrappers) that submit the same "
+        "request and display its outcome, and retain the search" in normalized
+    )
+    assert (
+        "makes the facet that caller's surface: film it on that lane against your fix"
+        in normalized
+    )
+    assert (
+        "Naming the caller without running the recorder is not footage and not a blocker"
+        in normalized
+    )
+    assert "An API facet whose request a UI caller submits and whose error it shows" in normalized
+    assert "is a `web` facet" in normalized
+    assert (
+        "An `api` trigger does not exempt the facet when a UI or CLI caller submits the "
+        "same request and shows the outcome" in normalized
+    )
+    assert (
+        "`api`-surface facet with nothing to film and no UI/CLI caller that exposes it"
+        in normalized
+    )
+
+
+def test_recording_unavailable_reason_is_a_finished_attempt_not_a_plan() -> None:
+    normalized = _normalized_resolve_instructions()
+
+    assert (
+        "explain each missing clip as the outcome of a finished attempt, never as a plan"
+        in normalized
+    )
+    assert (
+        'A reason phrased as pending work ("is being attempted during the review wait"'
+        in normalized
+    )
+    assert (
+        "If you postpone the clip to the Step 4 review wait, record it there before the "
+        "final handoff" in normalized
+    )
+    assert (
+        'A `recording_unavailable_reason` that describes pending work ("is being attempted '
+        'during the review wait") does not pass this gate' in normalized
+    )
+
+
 def test_resolve_drives_both_reviews_and_preserves_incomplete_outcomes() -> None:
     instructions = _normalized_resolve_instructions()
     drive_pr = (_RESOLVE_AGENT / "skills" / "resolve-drive-pr" / "SKILL.md").read_text()

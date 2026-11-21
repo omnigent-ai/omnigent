@@ -39,6 +39,23 @@ def test_lane_recording_blockers_are_explicit_and_do_not_block_delivery() -> Non
     assert "Do not block the verdict, fix, or PR" in lanes
 
 
+def test_lane_rules_judge_the_surface_by_its_callers_and_finished_attempts() -> None:
+    lanes = _normalized(_DEV / "recording-lanes.md")
+
+    assert "Judge the surface by what a user would see, not by the reporter's trigger" in lanes
+    assert (
+        "search for UI and CLI callers (including SDK wrappers) that submit the same request"
+        in lanes
+    )
+    assert "makes the facet that caller's surface" in lanes
+    assert "finding the caller is neither footage nor a blocker" in lanes
+    assert "`recording_unavailable_reason` describes a finished attempt" in lanes
+    assert (
+        'A reason phrased as pending work ("is being attempted", "will be recorded during '
+        'the review wait") is not an outcome' in lanes
+    )
+
+
 def test_repro_recording_rules_match_the_shared_guide() -> None:
     instructions = _normalized(_REPRO_AGENT / "AGENTS.md")
     lanes = _normalized(_DEV / "recording-lanes.md")

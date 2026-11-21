@@ -37,6 +37,15 @@ Record the user action and the product's response:
   interface shows the result. Set `recordings: []`, describe what you observed,
   and explain how you checked it.
 
+Judge the surface by what a user would see, not by the reporter's trigger. Before
+calling a result internal/API-only, search for UI and CLI callers (including SDK
+wrappers) that submit the same request and display its outcome, and retain the
+search. A caller that exposes the failure — for example a web dialog that uploads
+the affected bundle and shows the server's error — makes the facet that caller's
+surface (`web`, `cli`, …): film it on that lane. If the attempt fails, name the
+recorder command and its observed result; finding the caller is neither footage
+nor a blocker.
+
 For example, if `omnigent host` prints the wrong error after login expires,
 record running that command with an expired login and showing its output. See
 the `cli` section below for setup steps.
@@ -70,6 +79,11 @@ Recording is **best-effort**:
   is insufficient.
 - Text-only CLI output is not a reason to skip recording. A missing recording
   from an earlier run is not a reason either.
+- `recording_unavailable_reason` describes a finished attempt — the lane you
+  probed, the recorder command you ran, and what it did — never a plan. A reason
+  phrased as pending work ("is being attempted", "will be recorded during the
+  review wait") is not an outcome; finish the attempt or record its blocker
+  before the final handoff.
 - Do not block the verdict, fix, or PR because footage is missing or rejected.
   Explain the gap and continue with the available evidence.
 
