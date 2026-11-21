@@ -16,6 +16,8 @@ import { rememberOpenSessionRow } from "@/hooks/useOpenSessionRow";
 import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import { BOOT_PROBE_TIMEOUT_MS } from "@/lib/bootCapabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import type { MatchRange } from "@/components/ui/quick-pick";
+import { isPullRequestLookup, matchSessions } from "./sessionMatching";
 import { conversationDisplayLabel, getConversationAgentType } from "./sidebarNav";
 
 /** Debounce matches the sidebar search (300ms) so keystrokes don't each fetch. */
@@ -39,6 +41,8 @@ export interface PaletteSession {
   project: string | null;
   /** The session's list row, which its actions read their facts from. */
   conversation: Conversation;
+  /** Where a match on loaded sessions hit the label; absent for the server's matches. */
+  labelRanges?: readonly MatchRange[];
 }
 
 /** Flatten list pages into palette rows, dropping repeated ids and, unless
@@ -46,6 +50,17 @@ export interface PaletteSession {
     `updated_at`, because pushed updates reorder sessions without a refetch. */
 function paletteSessions(
   pages: readonly ConversationsPage[],
+  options: Parameters<typeof paletteRows>[1] = {},
+): PaletteSession[] {
+  return paletteRows(
+    pages.flatMap((page) => page.data),
+    options,
+  );
+}
+
+/** Palette rows for `rows`, in order unless `newestFirst`; see `paletteSessions`. */
+function paletteRows(
+  rows: Conversation[],
   {
     includeArchived = false,
     excludeIds = new Set(),
@@ -62,7 +77,6 @@ function paletteSessions(
 ): PaletteSession[] {
   const seen = new Set(excludeIds);
   const out: PaletteSession[] = [];
-  const rows = pages.flatMap((page) => page.data);
   // Stable, so rows with the same timestamp keep the server's order.
   if (newestFirst) rows.sort((a, b) => (b.updated_at ?? 0) - (a.updated_at ?? 0));
   for (const c of rows) {
@@ -95,9 +109,15 @@ function paletteSessions(
 export function usePaletteSessionSearch({
   open,
   sessionsOnly,
+  matchLoaded = false,
 }: {
   open: boolean;
   sessionsOnly: boolean;
+  /**
+   * Match the loaded sessions as the user types, ahead of the server's title matches, and
+   * look up a pasted `#123` or pull request link among them instead of searching.
+   */
+  matchLoaded?: boolean;
 }) {
   const { data: projects = EMPTY_PROJECTS } = useProjects({ enabled: open });
   const [query, setQuery] = useState("");
@@ -123,7 +143,11 @@ export function usePaletteSessionSearch({
   const serverInfo = useServerInfo();
   // Older servers ignore `search_scope`, so they get one mixed group instead.
   const groupedSearch = serverInfo !== "loading" && serverInfo.session_search_scope === true;
-  const searching = !sessionsOnly && debouncedQuery !== "";
+  // A pull request reference is looked up among the loaded sessions only.
+  const pullRequestLookup = matchLoaded && isPullRequestLookup(query);
+  const searching = !sessionsOnly && debouncedQuery !== "" && !pullRequestLookup;
+  // Loaded sessions match at once, without waiting for the debounce or the server.
+  const matchingLoaded = matchLoaded && query.trim() !== "";
   // Wait briefly for server info so a supporting server never gets the mixed
   // request; if it stalls, fall back to that request rather than never searching.
   const serverInfoLoading = serverInfo === "loading";
@@ -183,12 +207,28 @@ export function usePaletteSessionSearch({
     [data, titleSearch.data, contentSearch.data],
   );
   const sessions = useMemo(() => {
-    if (searching)
-      return paletteSessions(titleSearch.data?.pages ?? [], {
-        includeArchived: true,
-        projects,
-        parentTitles,
-      });
+    const serverMatches = searching
+      ? paletteSessions(titleSearch.data?.pages ?? [], {
+          includeArchived: true,
+          projects,
+          parentTitles,
+        })
+      : [];
+    if (matchingLoaded) {
+      // Rows archived after they loaded are still cached here, so leave them out.
+      const loaded = (data?.pages ?? [])
+        .flatMap((page) => page.data)
+        .filter((row) => !row.archived);
+      const matches = matchSessions(loaded, query);
+      const rangesById = new Map(matches.map((match) => [match.session.id, match.labelRanges]));
+      const local = paletteRows(
+        matches.map((match) => match.session),
+        { projects, parentTitles },
+      ).map((session) => ({ ...session, labelRanges: rangesById.get(session.id) }));
+      const listed = new Set(local.map((session) => session.id));
+      return [...local, ...serverMatches.filter((session) => !listed.has(session.id))];
+    }
+    if (searching) return serverMatches;
     // Rows archived after they loaded are still cached here, so drop them.
     const out = paletteSessions(data?.pages ?? [], { newestFirst: true, projects, parentTitles });
     if (sessionsOnly) {
@@ -200,7 +240,16 @@ export function usePaletteSessionSearch({
     }
     // The full first page would push Actions below the fold.
     return out.slice(0, IDLE_SESSION_LIMIT);
-  }, [data, titleSearch.data, query, searching, sessionsOnly, projects, parentTitles]);
+  }, [
+    data,
+    titleSearch.data,
+    query,
+    searching,
+    matchingLoaded,
+    sessionsOnly,
+    projects,
+    parentTitles,
+  ]);
   // Excludes title matches again in case a rename moved a session between the
   // two groups' requests: list rows need unique ids.
   const contentSessions = useMemo(
@@ -270,5 +319,7 @@ export function usePaletteSessionSearch({
     olderSessionsAvailable: hasNextPage === true && loadedPages >= pageLimit,
     searchOlderSessions: (): void => setPageLimit(loadedPages + SESSION_SEARCH_PAGE_BATCH),
     rememberSearchRow,
+    /** The query is a `#123` or pull request link, looked up among the loaded sessions. */
+    pullRequestLookup,
   };
 }
