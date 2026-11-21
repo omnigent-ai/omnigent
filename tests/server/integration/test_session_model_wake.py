@@ -1,4 +1,4 @@
-"""Explicit native model changes recover sleeping host-bound runners."""
+"""Explicit native model and approval changes recover sleeping host-bound runners."""
 
 from __future__ import annotations
 
@@ -118,6 +118,58 @@ async def test_model_switch_wakes_and_initializes_before_forwarding(
         assert terminal.call_args.kwargs["persist_resource_event"] is False
     items = await client.get(f"/v1/sessions/{session_id}/items")
     assert not any(item["type"] == "message" for item in items.json()["data"])
+
+
+async def test_approval_switch_wakes_before_forwarding(
+    client: httpx.AsyncClient,
+    model_session: tuple[str, SqlAlchemyConversationStore],
+    controls: dict[str, AsyncMock],
+) -> None:
+    session_id, store = model_session
+    order: list[str] = []
+
+    async def wake(**kwargs: Any) -> tuple[object, Conversation]:
+        order.append("wake")
+        return object(), store.replace_runner_id(session_id, "runner_new")
+
+    async def forward(*args: Any, **kwargs: Any) -> _RunnerForwardResult | None:
+        assert args[2] == {"type": "codex_approval_mode_change", "approval_mode": "full-access"}
+        order.append("forward")
+        # Like the real forward, nothing is delivered while no runner is bound.
+        if "wake" not in order:
+            return None
+        return _RunnerForwardResult(status_code=200, body='{"approval_mode": "full-access"}')
+
+    controls["ensure_runner_connected"].side_effect = wake
+    controls["_forward_session_change_to_runner"].side_effect = forward
+
+    response = await client.patch(
+        f"/v1/sessions/{session_id}", json={"approval_mode": "full-access"}
+    )
+
+    assert response.status_code == 200, response.text
+    assert order == ["wake", "forward"]
+    assert response.json()["labels"]["omnigent.codex_native.approval_mode"] == "full-access"
+    controls["_ensure_runner_session_initialized"].assert_awaited_once()
+    controls["_ensure_runner_relay_ready"].assert_awaited_once()
+
+
+async def test_approval_switch_on_offline_host_keeps_label_unset(
+    client: httpx.AsyncClient,
+    model_session: tuple[str, SqlAlchemyConversationStore],
+    controls: dict[str, AsyncMock],
+) -> None:
+    session_id, store = model_session
+    controls["ensure_runner_connected"].return_value = (None, store.get_conversation(session_id))
+
+    response = await client.patch(
+        f"/v1/sessions/{session_id}", json={"approval_mode": "full-access"}
+    )
+
+    assert response.status_code == 503, response.text
+    assert "Cannot switch approval modes while the session host is offline" in response.text
+    assert "omnigent.codex_native.approval_mode" not in store.get_conversation(session_id).labels
+    controls["_forward_session_change_to_runner"].assert_not_awaited()
 
 
 @pytest.mark.parametrize(
