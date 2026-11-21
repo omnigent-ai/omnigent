@@ -48,6 +48,18 @@ function newestEntry(data: JournalData | undefined): JournalEntry | undefined {
   return newest;
 }
 
+/**
+ * Whether entries in position order hold every entry from the journal's start
+ * through a position. Positions run 0, 1, 2, … without gaps.
+ */
+function holdsJournalThrough(entries: readonly JournalEntry[], position: number): boolean {
+  if (entries.length <= position) return false;
+  for (let index = 0; index <= position; index += 1) {
+    if (entries[index].position !== index) return false;
+  }
+  return true;
+}
+
 function withEntries(data: JournalData, entries: JournalEntry[]): JournalData {
   const known = new Set(data.pages.flatMap((page) => page.data.map((entry) => entry.id)));
   const fresh = entries.filter((entry) => !known.has(entry.id));
@@ -248,9 +260,17 @@ export function useSessionJournal(
       ),
     [pages, extraPages],
   );
-  const planId = currentPlan(journalEntries)?.id;
+  const plan = currentPlan(journalEntries);
+  const planId = plan?.id;
   // Run boundaries are not sent with the live plan event and can predate the
-  // newest page. Read the current one whenever the plan changes.
+  // newest page. Read the current one whenever the plan changes, unless the
+  // loaded entries already reach back to the journal's start: the boundary and
+  // the run's original plan both come before the current plan.
+  const boundaryLoaded = useMemo(
+    () => plan !== null && holdsJournalThrough(journalEntries, plan.position),
+    [journalEntries, plan],
+  );
+  const readBoundary = planId !== undefined && !boundaryLoaded;
   const runBoundary = useQuery({
     queryKey: [...sessionJournalKey(conversationId), "run-boundary", planId],
     queryFn: async () => {
@@ -270,7 +290,7 @@ export function useSessionJournal(
       });
       return mergeJournalEntries(boundary.data, origin.data);
     },
-    enabled: active && planId !== undefined,
+    enabled: active && readBoundary,
     staleTime: Number.POSITIVE_INFINITY,
     refetchOnWindowFocus: false,
   });
@@ -281,14 +301,14 @@ export function useSessionJournal(
   const error =
     query.error ??
     (olderExist ? planAndStatuses.error : null) ??
-    (planId ? runBoundary.error : null);
+    (readBoundary ? runBoundary.error : null);
   return {
     entries: error ? [] : entries,
     isLoading:
       active &&
       (query.isPending ||
         (olderExist && planAndStatuses.isPending) ||
-        (planId !== undefined && runBoundary.isPending)),
+        (readBoundary && runBoundary.isPending)),
     error: error ?? catchUpError,
     hasOlder: query.hasNextPage,
     loadingOlder: query.isFetchingNextPage,
