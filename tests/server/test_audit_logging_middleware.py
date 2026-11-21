@@ -352,6 +352,27 @@ def test_reserved_attr_keys_never_crash_and_session_id_binds(
         sink.close()
 
 
+@pytest.mark.asyncio
+async def test_middleware_hands_resolved_user_to_telemetry(
+    auth_app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The user the auth provider resolves is what the HTTP middleware stamps on
+    # the already-started server span; the telemetry side is covered by
+    # tests/runtime/test_telemetry.py.
+    from omnigent.runtime import telemetry
+
+    stamped: list[str | None] = []
+    monkeypatch.setattr(telemetry, "set_request_user", stamped.append)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=auth_app), base_url="http://test"
+    ) as client:
+        response = await client.get("/health", headers={"X-Forwarded-Email": "alice@example.com"})
+
+    assert response.status_code == 200
+    assert stamped == ["alice@example.com"]
+
+
 @pytest.mark.parametrize("requested_runner", ["", "new_runner"], ids=["clear", "bind"])
 @pytest.mark.asyncio
 async def test_attachment_requests_correlate_with_binding_change(
