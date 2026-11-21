@@ -184,15 +184,31 @@ async def test_rename_missing_project_404(project_client: httpx.AsyncClient) -> 
     assert resp.status_code == 404
 
 
-async def test_create_defaults_to_empty_config(project_client: httpx.AsyncClient) -> None:
-    """A project created without a config field reports an empty config."""
-    body = (await project_client.post("/v1/projects", json={"name": "P"})).json()
-    assert body["config"] == {}
+async def test_create_assigns_the_least_used_color_unless_marked(
+    project_client: httpx.AsyncClient,
+) -> None:
+    """Unmarked projects get the least-used color; an emoji is kept, and a
+    lucide icon gets a color to tint it."""
+    first = (await project_client.post("/v1/projects", json={"name": "A"})).json()
+    second = (await project_client.post("/v1/projects", json={"name": "B"})).json()
+    emoji = await project_client.post("/v1/projects", json={"name": "E", "config": {"icon": "🔥"}})
+    lucide = await project_client.post(
+        "/v1/projects", json={"name": "L", "config": {"lucide_icon": "FlaskConical"}}
+    )
+    assert first["config"] == {"color": "omni"}
+    assert second["config"] == {"color": "dracula"}
+    assert emoji.json()["config"] == {"icon": "🔥"}
+    assert lucide.json()["config"] == {"lucide_icon": "FlaskConical", "color": "github"}
 
 
 async def test_create_and_get_roundtrips_config(project_client: httpx.AsyncClient) -> None:
     """A config passed on create round-trips through the create + get responses."""
-    cfg = {"host_id": "host_abc", "workspace": "/work/repo", "model": "claude-opus-4-8"}
+    cfg = {
+        "host_id": "host_abc",
+        "workspace": "/work/repo",
+        "model": "claude-opus-4-8",
+        "color": "nord",
+    }
     created = (
         await project_client.post("/v1/projects", json={"name": "Configured", "config": cfg})
     ).json()
@@ -216,14 +232,16 @@ async def test_repository_config_is_stored_opaquely(
 ) -> None:
     """The saved repository round-trips through create, get and rename untouched."""
     config = {"agent_id": "187b7cb7ac30abf4debfaa578d052ec6", "repository": repository}
+    # An unmarked new project gets the least-used color alongside its config.
+    stored = {**config, "color": "omni"}
     created = (
         await project_client.post("/v1/projects", json={"name": "Repo", "config": config})
     ).json()
-    assert created["config"] == config
+    assert created["config"] == stored
     fetched = (await project_client.get(f"/v1/projects/{created['id']}")).json()
-    assert fetched["config"] == config
+    assert fetched["config"] == stored
     renamed = await project_client.patch(f"/v1/projects/{created['id']}", json={"name": "Renamed"})
-    assert renamed.json()["config"] == config
+    assert renamed.json()["config"] == stored
 
 
 async def test_patch_replaces_config(project_client: httpx.AsyncClient) -> None:
@@ -248,7 +266,7 @@ async def test_patch_without_config_preserves_it(project_client: httpx.AsyncClie
         )
     ).json()
     renamed = await project_client.patch(f"/v1/projects/{created['id']}", json={"name": "P2"})
-    assert renamed.json()["config"] == {"host_id": "keep"}
+    assert renamed.json()["config"] == {"host_id": "keep", "color": "omni"}
 
 
 async def test_patch_empty_config_clears_it(project_client: httpx.AsyncClient) -> None:
@@ -294,32 +312,60 @@ async def test_session_projects_unions_first_class_and_labels(
     resp = await project_client.get("/v1/sessions/projects")
     assert resp.status_code == 200
     assert resp.json() == [
-        {"id": both["id"], "name": "Both", "icon": None},
-        {"id": empty["id"], "name": "Empty FC", "icon": None},
-        {"id": None, "name": "Label Only", "icon": None},
+        {
+            "id": both["id"],
+            "name": "Both",
+            "icon": None,
+            "lucide_icon": None,
+            "color": both["config"]["color"],
+        },
+        {
+            "id": empty["id"],
+            "name": "Empty FC",
+            "icon": None,
+            "lucide_icon": None,
+            "color": "omni",
+        },
+        {"id": None, "name": "Label Only", "icon": None, "lucide_icon": None, "color": None},
     ]
 
 
-async def test_session_projects_surfaces_config_icon(
+async def test_session_projects_surfaces_config_icon_and_color(
     project_client: httpx.AsyncClient,
 ) -> None:
-    """A first-class project's ``config.icon`` surfaces in the sidebar listing
-    so the folder can render the emoji; a non-string/absent icon stays None."""
+    """A first-class project's ``config.icon``, ``config.lucide_icon`` and
+    ``config.color`` surface in the sidebar listing; non-string/absent values
+    stay None."""
     fire = (
-        await project_client.post("/v1/projects", json={"name": "Fire", "config": {"icon": "🔥"}})
-    ).json()
-    # A config without an icon key surfaces None (default folder glyph).
-    plain = (
         await project_client.post(
-            "/v1/projects", json={"name": "Plain", "config": {"host_id": "h"}}
+            "/v1/projects", json={"name": "Fire", "config": {"icon": "🔥", "color": "nord"}}
         )
     ).json()
+    lab = (
+        await project_client.post(
+            "/v1/projects",
+            json={"name": "Lab", "config": {"lucide_icon": "FlaskConical", "color": "nord"}},
+        )
+    ).json()
+    # Absent icon and non-string values surface None (default folder glyph).
+    plain = (await project_client.post("/v1/projects", json={"name": "Plain"})).json()
+    await project_client.patch(
+        f"/v1/projects/{plain['id']}",
+        json={"config": {"host_id": "h", "lucide_icon": 7, "color": 3}},
+    )
 
     resp = await project_client.get("/v1/sessions/projects")
     assert resp.status_code == 200
     assert resp.json() == [
-        {"id": fire["id"], "name": "Fire", "icon": "🔥"},
-        {"id": plain["id"], "name": "Plain", "icon": None},
+        {"id": fire["id"], "name": "Fire", "icon": "🔥", "lucide_icon": None, "color": "nord"},
+        {
+            "id": lab["id"],
+            "name": "Lab",
+            "icon": None,
+            "lucide_icon": "FlaskConical",
+            "color": "nord",
+        },
+        {"id": plain["id"], "name": "Plain", "icon": None, "lucide_icon": None, "color": None},
     ]
 
 

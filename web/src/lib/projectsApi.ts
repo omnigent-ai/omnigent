@@ -33,8 +33,12 @@ export interface ProjectConfig {
   sandbox_provider?: string;
   /** Default agent id for new sessions. */
   agent_id?: string;
-  /** Chosen emoji icon (a unicode grapheme, e.g. "🔥"). Unset → default folder. */
+  /** Chosen emoji icon (a unicode grapheme, e.g. "🔥"). Wins over `lucide_icon` and `color`. */
   icon?: string;
+  /** Chosen lucide-react icon name (e.g. "FlaskConical"), tinted by `color`. Unset → folder. */
+  lucide_icon?: string;
+  /** Chosen color: a theme palette id (see lib/projectColors). Unset → muted folder. */
+  color?: string;
   /**
    * Per-project worktree default. When `true`, a new session in a git workspace
    * starts in a fresh randomly-named worktree; when `false`, it starts directly
@@ -108,8 +112,10 @@ export async function getProject(id: string): Promise<Project> {
 }
 
 /**
- * Create a project, optionally with initial `config` defaults. Rejects with the
- * server's message on a duplicate name (409) so callers can surface it inline.
+ * Create a project, optionally with initial `config` defaults. The server
+ * assigns a color when the config carries neither an emoji nor a color.
+ * Rejects with the server's message on a duplicate name (409) so callers can
+ * surface it inline.
  */
 export async function createProject(name: string, config?: ProjectConfig): Promise<Project> {
   const res = await authenticatedFetch("/v1/projects", {
