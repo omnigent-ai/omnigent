@@ -32,8 +32,6 @@ const DEFAULT_TIMEOUT_MS = 10000;
 /** Ceiling for `login`, just past the CLI's own 300s OIDC ticket deadline. */
 const LOGIN_TIMEOUT_MS = 305000;
 
-const WORKSPACE_API_PATH = "/api/2.0/omnigent";
-
 /**
  * One-liner shown on the setup page when the CLI is missing. Mirrors the
  * install instructions in the repo root README.
@@ -876,7 +874,7 @@ function workspaceUiServerUrl(value) {
   const normalized = normalizeServerUrl(value);
   try {
     const parsed = new URL(normalized);
-    if (parsed.pathname.replace(/\/+$/, "") !== WORKSPACE_API_PATH) return normalized;
+    if (!url.WORKSPACE_API_PATHS.has(parsed.pathname.replace(/\/+$/, ""))) return normalized;
     parsed.pathname = url.WORKSPACE_UI_PATH;
     return normalizeServerUrl(parsed.href);
   } catch {
@@ -1035,6 +1033,7 @@ function bearerTokenFor(serverUrl) {
 }
 
 const OMNIGENT_SLICE_KEY_HEADER = "X-Databricks-Omnigent-Slice-Key";
+const WORKSPACE_API_PATH = "/api/2.0/omnigent";
 
 /**
  * Whether requests to `serverUrl` should carry a host's routing key, by the same

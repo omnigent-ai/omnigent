@@ -389,6 +389,7 @@ describe("matchesServer", () => {
     [{ server_url: workspaceApi }, workspaceUi, true],
     [{ target: `${workspaceApi}?o=1` }, `${workspaceUi}?o=1`, true],
     [{ target: `${workspaceApi}/` }, `${workspaceUi}/`, true],
+    [{ server_url: `${workspaceApi}s` }, workspaceUi, true],
     [{ target: `${workspaceApi}?o=1` }, `${workspaceUi}?o=2`, false],
     [{ server_url: workspaceApi }, "https://other.example.com/omnigent", false],
     [{ server_url: workspaceApi }, "http://ws.example.com/omnigent", false],
@@ -710,7 +711,11 @@ describe("liveDaemonRecordFor", () => {
     mock.method(fs, "readFileSync", () => JSON.stringify(record));
     const windowServerUrl = "https://ws.example.com/omnigent?o=123";
     assert.equal(liveDaemonRecordFor(windowServerUrl)?.pid, process.pid);
-    assert.equal((await getHostConnectionFast(windowServerUrl, { probe: false })).connected, true);
+    // No bearer token is stored for the window's URL, so the probe must not send a request.
+    const fetch = mock.method(globalThis, "fetch", async () => ({ ok: true }));
+    const { connected, verified } = await getHostConnectionFast(windowServerUrl);
+    assert.deepEqual({ connected, verified }, { connected: true, verified: false });
+    assert.equal(fetch.mock.callCount(), 0);
     assert.equal(
       isHostThisMachine(
         { hostId: "local", serverUrl: windowServerUrl },
