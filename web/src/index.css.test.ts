@@ -1045,6 +1045,13 @@ describe("index.css floating panes", () => {
     expect(dark).toContain("background-color: var(--background) !important");
   });
 
+  it("rises the chat's card to the gap when an extension owns the header", () => {
+    const hidden = ruleFor(
+      '.app-shell[data-floating-panes] [data-main-view="chat"] > main[data-session-id][data-shell-header="hidden"]',
+    );
+    expect(hidden).toContain("margin-top: var(--pane-gap)");
+  });
+
   it("cards a session's chat, which a grid of sessions shows in its own panes", () => {
     const card = ruleFor(
       '.app-shell[data-floating-panes] [data-main-view="chat"] > main[data-session-id]',

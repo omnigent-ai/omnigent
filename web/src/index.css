@@ -1353,6 +1353,12 @@ aside[aria-label="Workspace"][data-maximized] {
     background: var(--background);
     overflow: clip;
   }
+  /* An extension that owns the header leaves no top row, so the card keeps the gap it has below. */
+  .app-shell[data-floating-panes]
+    [data-main-view="chat"]
+    > main[data-session-id][data-shell-header="hidden"] {
+    margin-top: var(--pane-gap);
+  }
   .dark .app-shell[data-floating-panes] [data-main-view="chat"] > main[data-session-id] {
     background: var(--floating-card-canvas);
   }
