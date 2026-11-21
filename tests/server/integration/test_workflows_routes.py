@@ -188,6 +188,10 @@ async def test_a_run_is_titled_for_its_workflow_until_someone_renames_it(
     # The composer's workflow picker sends only the workflow skill's message.
     picked_run = await create(f"/workflow Run the saved workflow {opening}\n\nThe upload tests")
     named_run = await create(workflow_id=workflow["id"], title="Hotfix release")
+    # A first message that reads like the workflow's name doesn't make the title a seed.
+    echoed_run = await create(workflow["name"], workflow_id=workflow["id"])
+    # A child's title is its sub-agent name, unique under its parent, so children keep theirs.
+    children = [await create(workflow_id=workflow["id"], parent_session_id=page_run) for _ in "ab"]
     conversations = SqlAlchemyConversationStore(db_uri)
 
     def title(session_id: str) -> str | None:
@@ -195,15 +199,17 @@ async def test_a_run_is_titled_for_its_workflow_until_someone_renames_it(
         assert conversation is not None
         return conversation.title
 
-    assert [title(run) for run in (page_run, agent_run, picked_run, named_run)] == [
+    assert [title(run) for run in (page_run, agent_run, picked_run, named_run, echoed_run)] == [
         "Blah borgus",
         "Blah borgus",
         "Blah borgus",
         "Hotfix release",
+        "Blah borgus",
     ]
+    assert [title(child) for child in children] == [f"untitled:{child}" for child in children]
 
     # A harness's automatic title replaces only a seed taken from the message itself.
-    for run in (page_run, picked_run):
+    for run in (page_run, picked_run, echoed_run):
         declined = await client.post(
             f"/v1/sessions/{run}/auto-title",
             json={"title": "Run Saved Workflow"},
