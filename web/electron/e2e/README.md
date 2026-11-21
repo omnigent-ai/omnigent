@@ -112,7 +112,9 @@ OMNIGENT_PYTHON="$PWD/.venv/bin/python" \
 ```
 
 Run on an interactive desktop and keep the test app foregrounded for its native
-focus assertions. `OMNIGENT_DESKTOP_EXECUTABLE` may point to a packaged binary.
+focus assertions. `OMNIGENT_DESKTOP_EXECUTABLE` may point to a packaged
+**Omnigent Dev** binary (`pnpm run build`); a release build accepts no debugger,
+so Playwright can't attach to it.
 `OMNIGENT_DESKTOP_COMPOSITED_VIDEO=1` records the native window on macOS (requires
 Screen Recording permission). Set `OMNIGENT_DESKTOP_RECORD_DIR` outside the
 checkout; each fixture's subdirectory receives `design-prompt-native.mov`.
