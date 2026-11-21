@@ -123,7 +123,7 @@ def _codex_permission_settings(launch_args: Sequence[str]) -> dict[str, Any] | N
 
     :param launch_args: Codex launch args, e.g. ``["-a", "never", "-s", "danger-full-access"]``.
     :returns: The settings, e.g. ``{"approvalPolicy": "never", "sandbox": "danger-full-access"}``,
-        or ``None`` when a custom profile or config value takes part.
+        or ``None`` when a custom permission profile or config value takes part.
     """
     from omnigent.harnesses.codex_native.app_server import _codex_resume_permission_params
 
@@ -163,8 +163,16 @@ def _launch_permission_mode(session: Conversation, harness: str) -> str | None:
         mode = _claude_launch_permission_mode(options)
         return mode if mode in modes else None
     if harness == "codex-native":
+        from omnigent.harnesses.codex_native.launch_args import codex_config_profile
+
         if session.labels.get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == "1":
             return "bypass"
+        # A file profile can set more than any preset, so none stands in for it.
+        try:
+            if codex_config_profile(options) is not None:
+                return None
+        except ValueError:
+            return None
         effective = _codex_permission_settings(options)
         if effective is None:
             return None
