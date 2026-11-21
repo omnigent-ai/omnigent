@@ -26,13 +26,16 @@ a host never runs with part of an operator's config.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import re
 import shutil
 import tomllib
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
+from typing import Any, NoReturn
 
 from omnigent.git_providers.code_host_environment import (
     EnvironmentRuleError,
@@ -65,9 +68,14 @@ class CodeHostInstanceError(ValueError):
     """
 
 
-@dataclass(frozen=True)
+_LOADER_ONLY = "code host instances are built only by load_code_host_instances"
+
+
+@dataclass(frozen=True, init=False)
 class CodeHostInstance:
-    """One configured code host instance.
+    """One configured code host instance, built only by :func:`load_code_host_instances`.
+
+    Calling the class, or ``dataclasses.replace`` on a record, raises ``TypeError``.
 
     :ivar id: Stable id, e.g. ``"internal"``; the only instance detail logs carry.
     :ivar provider: The provider whose API it serves, e.g. ``"github"``.
@@ -84,9 +92,12 @@ class CodeHostInstance:
     display_name: str
     hosts: frozenset[str]
     command: tuple[str, ...]
-    passed_environment: tuple[str, ...] = ()
-    fixed_environment: Mapping[str, str] = field(default_factory=dict)
-    capabilities: frozenset[str] = frozenset()
+    passed_environment: tuple[str, ...]
+    fixed_environment: Mapping[str, str]
+    capabilities: frozenset[str]
+
+    def __init__(self, *_args: object, **_fields: object) -> NoReturn:
+        raise TypeError(_LOADER_ONLY)
 
     def runnable_command(self) -> list[str]:
         """Return the command to start, refusing it if its CLI has disappeared.
@@ -114,10 +125,16 @@ class CodeHostInstances:
     """The instances a host's config declares, by provider and host.
 
     It also answers the provider registry's ``hosts_for``, so the hosts it lists
-    resolve to their provider.
+    resolve to their provider. It holds only records the loader built.
     """
 
     instances: tuple[CodeHostInstance, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.instances, tuple) or not all(
+            type(instance) is CodeHostInstance for instance in self.instances
+        ):
+            raise TypeError(_LOADER_ONLY)
 
     def hosts_for(self, provider_id: str) -> frozenset[str]:
         """Return the hosts the instances of *provider_id* declare."""
@@ -144,6 +161,17 @@ class CodeHostInstances:
 
 
 NO_INSTANCES = CodeHostInstances()
+
+
+def _built_instance(**values: Any) -> CodeHostInstance:
+    """Return a record of *values* the loader checked; the only way to build one."""
+    names = {item.name for item in dataclasses.fields(CodeHostInstance)}
+    if set(values) != names:
+        raise TypeError(_LOADER_ONLY)
+    instance = object.__new__(CodeHostInstance)
+    for name, value in values.items():
+        object.__setattr__(instance, name, value)
+    return instance
 
 
 def _refuse(message: str) -> CodeHostInstanceError:
@@ -249,14 +277,14 @@ def _instance(
         if name in capabilities:
             raise _refuse(f"{where} capabilities[{index}] is refused: it is listed twice")
         capabilities.add(name)
-    return CodeHostInstance(
+    return _built_instance(
         id=instance_id,
         provider=provider,
         display_name=display_name.strip(),
         hosts=frozenset(hosts),
         command=command,
         passed_environment=passed,
-        fixed_environment=fixed,
+        fixed_environment=MappingProxyType(dict(fixed)),
         capabilities=frozenset(capabilities),
     )
 
@@ -308,9 +336,9 @@ def load_code_host_instances(
 ) -> CodeHostInstances:
     """Read the host's instance config at *path*, once, when the host starts.
 
-    The only way to build instances from outside data: there is no path from a frame,
-    a request or other text, so only a file on the host can name a CLI. A missing
-    file declares no instances.
+    The only way to build instance records: there is no public constructor and no
+    path from a frame, a request or other text, so only a file on the host can name a
+    CLI. A missing file declares no instances.
 
     :param path: The host-local config file.
     :param known_capabilities: The capability names an instance may list.

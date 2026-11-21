@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import os
 import re
@@ -9,6 +10,7 @@ import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -58,7 +60,7 @@ Load = Callable[..., CodeHostInstances]
 def load(tmp_path: Path) -> Load:
     """Load TOML text the only way instances load: from a file on the host."""
 
-    def load_text(text: str, **options: object) -> CodeHostInstances:
+    def load_text(text: str, **options: Any) -> CodeHostInstances:
         path = tmp_path / "code_host_instances.toml"
         path.write_text(text, encoding="utf-8")
         return load_code_host_instances(
@@ -277,10 +279,43 @@ def test_the_host_file_loader_is_the_only_way_to_build_instances_from_outside_da
     ]
     with pytest.raises(TypeError, match="only from a host file path"):
         load_code_host_instances(
-            _config(cli),  # TOML text, as a frame might carry it
+            _config(cli),  # type: ignore[arg-type]  # TOML text, as a frame might carry it
             known_capabilities=KNOWN,
             host_environment={"PATH": "/usr/bin"},
         )
+
+
+def test_instance_records_cannot_be_built_or_changed_outside_the_loader(
+    load: Load, cli: Path
+) -> None:
+    """Calling the record class, replacing a field, or wrapping a lookalike is refused."""
+    (loaded,) = load(_config(cli, env_set='{ LANG = "C.UTF-8" }')).instances
+    fields = {item.name: getattr(loaded, item.name) for item in dataclasses.fields(loaded)}
+    lookalike = type("Lookalike", (), fields)()
+
+    attempts = {
+        "keywords": lambda: CodeHostInstance(**{**fields, "command": ("/bin/sh",)}),
+        "positional": lambda: CodeHostInstance(*fields.values()),
+        "empty": lambda: CodeHostInstance(),
+        "replace": lambda: dataclasses.replace(loaded, command=("/bin/sh",)),
+        "lookalike": lambda: CodeHostInstances((lookalike,)),  # type: ignore[arg-type]
+        "list": lambda: CodeHostInstances([loaded]),  # type: ignore[arg-type]
+    }
+    allowed = []
+    for name, attempt in attempts.items():
+        try:
+            attempt()
+        except TypeError as refused:
+            assert "built only by load_code_host_instances" in str(refused), name
+        else:
+            allowed.append(name)
+    assert allowed == []
+
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        loaded.command = ("/bin/sh",)  # type: ignore[misc]
+    with pytest.raises(TypeError):
+        loaded.fixed_environment["LANG"] = "x"  # type: ignore[index]
+    assert CodeHostInstances((loaded,)).instance_for("github", "code.example.test") is loaded
 
 
 def test_the_instance_modules_import_only_the_standard_library() -> None:
