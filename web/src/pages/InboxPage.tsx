@@ -35,7 +35,9 @@
  * today", …). Only the newest approval starts expanded; manual toggles are
  * keyed by item, so they stick as new items arrive. Tabs narrow the list
  * to "Unread" (comments + unread sessions) or "Awaiting response"
- * (approvals); the pick persists per device.
+ * (approvals); the pick persists per device. A menu beside the tabs holds
+ * bulk actions: mark the current tab's loaded items read (Done sessions only,
+ * or all, with Undo) or decline its awaiting prompts after a confirmation.
  *
  * Deliberately NOT here: dismissing approvals and mentions — neither
  * exists as a server concept. Resolving (or the prompt timing out) is
@@ -48,31 +50,27 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import type { Query } from "@tanstack/react-query";
 import type { Session } from "@/lib/types";
-import { useEffect, useId, useRef, useState, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type ComponentProps, type ReactNode } from "react";
 import { useQueries, useQueryClient } from "@tanstack/react-query";
+import { toast } from "sonner";
 import {
   AlertTriangleIcon,
   ArrowRightIcon,
   ArrowUpIcon,
   CheckIcon,
+  ChevronDownIcon,
   CircleAlertIcon,
   CircleCheckIcon,
+  EllipsisVerticalIcon,
   HandIcon,
   InboxIcon,
   LightbulbIcon,
   Loader2Icon,
   SquarePenIcon,
-  ChevronDownIcon,
   type LucideIcon,
 } from "lucide-react";
 import { ApprovalCard, type SubmitApprovalFn } from "@/components/blocks/ApprovalCard";
 import { SuggestionMedia } from "@/components/inbox/SuggestionMedia";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
 import { useProactiveInbox } from "@/hooks/useProactiveInbox";
 import { useProactiveAgentSettings } from "@/hooks/useProactiveAgentSettings";
 import { FilePathAwareMessageResponse } from "@/components/blocks/ChatMarkdown";
@@ -80,16 +78,35 @@ import { ElicitationMessage } from "@/components/blocks/ElicitationMessage";
 import { PageScroll } from "@/components/PageScroll";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { showToast } from "@/components/ui/toast";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { forgetSeenComments, markCommentsSeen } from "@/hooks/useSeenComments";
 import { useSidebarData } from "@/hooks/useSidebarData";
 import {
   clearUnreadOverride,
   isConversationUnseen,
   markConversationRead,
+  markConversationsRead,
+  restoreReadState,
   useUnseenTick,
 } from "@/hooks/useUnseenConversations";
 import {
@@ -107,7 +124,7 @@ import {
   writeInboxFilter,
   type InboxFilter,
 } from "@/lib/inboxFilterPreferences";
-import { clearAskUserQuestionDraft } from "@/lib/askUserQuestionDrafts";
+import { clearAskUserQuestionDraft, useAskUserQuestionDraftIds } from "@/lib/askUserQuestionDrafts";
 import {
   isComposerAltNewlineKey,
   isComposerSendKey,
@@ -209,6 +226,11 @@ const EMPTY_STATES: Record<InboxFilter, { title: string; body: string }> = {
   },
 };
 
+// Long enough to read a bulk count and reach Undo.
+const MARK_READ_UNDO_DURATION_MS = 6000;
+// The decline confirmation names this many prompts, then counts the rest.
+const DECLINE_PREVIEW_ITEMS = 5;
+
 // Enough trailing items to step past a tool call or two after the final reply.
 const PREVIEW_SCAN_ITEMS = 12;
 const UNREAD_ONLY = ["unread"] as const;
@@ -288,6 +310,8 @@ export function InboxPage() {
     if (!proactiveInbox.enabled) setPinnedSuggestions({});
   }, [proactiveInbox.enabled]);
   const [responded, setResponded] = useState<RespondedMap>({});
+  // Prompts frozen when the decline confirmation opened; null while it's closed.
+  const [declineTargets, setDeclineTargets] = useState<InboxItem[] | null>(null);
   const pendingSubmissions = useRef(new Map<string, RespondedMap[string]>());
   // Manual expand/collapse toggles keyed by entry key. Anything not in
   // the map falls back to the default: expanded only for the newest
@@ -297,6 +321,7 @@ export function InboxPage() {
   // Keyed by session id at page level: a collapsed card unmounts its body,
   // and the draft must survive the toggle.
   const [replyDrafts, setReplyDrafts] = useState<Record<string, string>>({});
+  const questionDraftIds = useAskUserQuestionDraftIds();
   const [replyStatuses, setReplyStatuses] = useState<Record<string, ReplyStatus>>({});
   const [submitWithModEnter] = useState(readSubmitWithModEnter);
   const isMobileViewport = useIsMobileViewport();
@@ -525,63 +550,163 @@ export function InboxPage() {
       commentInbox.failedCount +
       Number(Boolean(conversationsQuery.isError));
 
+  // The optimistic verdict for the prompt's current delivery attempt, if any.
+  const liveVerdict = ({ elicitation }: InboxItem) => {
+    const optimistic = responded[elicitation.elicitationId];
+    return optimistic?.attempt === elicitation.nativeDelivery?.attempt ? optimistic : undefined;
+  };
+
   // Mirrors `chatStore.submitApproval`: optimistic flip → resolve POST →
   // rollback on error. Success invalidates the session list so the row's
   // count (and the sidebar badge) drop without waiting for the socket.
-  const makeSubmit = (item: InboxItem): SubmitApprovalFn => {
-    return (elicitationId, action, content, meta) => {
-      const attempt = item.elicitation.nativeDelivery?.attempt;
-      const previous = pendingSubmissions.current.get(elicitationId);
-      if (previous && previous.attempt === attempt) return;
-      const verdict = {
-        action,
-        attempt,
-        ...(content === undefined ? {} : { content }),
-        ...(meta === undefined ? {} : { _meta: meta }),
-      };
-      pendingSubmissions.current.set(elicitationId, verdict);
-      setResponded((prev) => ({ ...prev, [elicitationId]: verdict }));
-      const holdToken = beginLocalElicitationResolution(
-        elicitationId,
-        affectedSessionIds(
-          [item.row.id, item.resolveSessionId],
-          (knownSessionId) =>
-            queryClient.getQueryData<Session>(["session", knownSessionId])?.parentSessionId,
-        ),
-        { nativeDelivery: Boolean(item.elicitation.nativeDelivery) },
-      );
-      void approve(item.resolveSessionId, elicitationId, {
-        action,
-        ...(content === undefined ? {} : { content }),
-        ...(meta === undefined ? {} : { _meta: meta }),
-      }).then(
-        () => {
-          if (pendingSubmissions.current.get(elicitationId) !== verdict) return;
-          pendingSubmissions.current.delete(elicitationId);
-          acknowledgeLocalElicitationResolution(elicitationId, holdToken);
-          clearAskUserQuestionDraft(elicitationId);
-          void queryClient.invalidateQueries({ queryKey: ["conversations"] });
-          if (item.elicitation.nativeDelivery) {
-            const queryKey = ["inbox-elicitations", item.row.id];
-            void queryClient
-              .cancelQueries({ queryKey })
-              .then(() => queryClient.invalidateQueries({ queryKey }));
-          }
-        },
-        () => {
-          if (pendingSubmissions.current.get(elicitationId) !== verdict) return;
-          pendingSubmissions.current.delete(elicitationId);
-          cancelLocalElicitationResolution(elicitationId, holdToken);
-          // Roll back to pending so the buttons reappear and the user
-          // can retry — same recovery the chat store uses.
-          setResponded((prev) => {
-            if (prev[elicitationId] !== verdict) return prev;
-            const { [elicitationId]: _respondedVerdict, ...pendingVerdicts } = prev;
-            return pendingVerdicts;
-          });
-        },
-      );
+  // Resolves to whether the POST succeeded; undefined when already in flight.
+  const submitVerdict = (
+    item: InboxItem,
+    ...[elicitationId, action, content, meta]: Parameters<SubmitApprovalFn>
+  ): Promise<boolean> | undefined => {
+    const attempt = item.elicitation.nativeDelivery?.attempt;
+    const previous = pendingSubmissions.current.get(elicitationId);
+    if (previous && previous.attempt === attempt) return undefined;
+    const verdict = {
+      action,
+      attempt,
+      ...(content === undefined ? {} : { content }),
+      ...(meta === undefined ? {} : { _meta: meta }),
     };
+    pendingSubmissions.current.set(elicitationId, verdict);
+    setResponded((prev) => ({ ...prev, [elicitationId]: verdict }));
+    const holdToken = beginLocalElicitationResolution(
+      elicitationId,
+      affectedSessionIds(
+        [item.row.id, item.resolveSessionId],
+        (knownSessionId) =>
+          queryClient.getQueryData<Session>(["session", knownSessionId])?.parentSessionId,
+      ),
+      { nativeDelivery: Boolean(item.elicitation.nativeDelivery) },
+    );
+    return approve(item.resolveSessionId, elicitationId, {
+      action,
+      ...(content === undefined ? {} : { content }),
+      ...(meta === undefined ? {} : { _meta: meta }),
+    }).then(
+      () => {
+        if (pendingSubmissions.current.get(elicitationId) !== verdict) return true;
+        pendingSubmissions.current.delete(elicitationId);
+        acknowledgeLocalElicitationResolution(elicitationId, holdToken);
+        clearAskUserQuestionDraft(elicitationId);
+        void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+        if (item.elicitation.nativeDelivery) {
+          const queryKey = ["inbox-elicitations", item.row.id];
+          void queryClient
+            .cancelQueries({ queryKey })
+            .then(() => queryClient.invalidateQueries({ queryKey }));
+        }
+        return true;
+      },
+      () => {
+        if (pendingSubmissions.current.get(elicitationId) !== verdict) return false;
+        pendingSubmissions.current.delete(elicitationId);
+        cancelLocalElicitationResolution(elicitationId, holdToken);
+        // Roll back to pending so the buttons reappear and the user
+        // can retry — same recovery the chat store uses.
+        setResponded((prev) => {
+          if (prev[elicitationId] !== verdict) return prev;
+          const { [elicitationId]: _respondedVerdict, ...pendingVerdicts } = prev;
+          return pendingVerdicts;
+        });
+        return false;
+      },
+    );
+  };
+
+  const makeSubmit =
+    (item: InboxItem): SubmitApprovalFn =>
+    (...args) => {
+      void submitVerdict(item, ...args);
+    };
+
+  // Bulk actions leave a row with a reply sending or a typed draft alone, so no text is lost.
+  const bulkUnread = visibleUnread.filter(
+    ({ row }) => replyStatuses[row.id]?.state !== "sending" && !replyDrafts[row.id]?.trim(),
+  );
+  const doneTargets = bulkUnread.filter((item) => item.kind === "done");
+  const errorTargetCount = bulkUnread.length - doneTargets.length + visibleAutomations.length;
+  const allReadCount = bulkUnread.length + visibleComments.length + visibleAutomations.length;
+  const allReadIncludes = [
+    errorTargetCount > 0 && countOf(errorTargetCount, "error", "errors"),
+    visibleComments.length > 0 && countOf(visibleComments.length, "comment", "comments"),
+  ]
+    .filter(Boolean)
+    .join(" and ");
+  const bulkLoadedOnly = hasNextPage || (showUnread && automationInbox.hasNextPage);
+  // A native prompt mid-delivery already carries a decision; its card only offers a retry.
+  // A question with unsent answers stays for the user to finish.
+  const declinable = visibleApprovals.filter(
+    (item) =>
+      liveVerdict(item) === undefined &&
+      (item.elicitation.nativeDelivery?.state ?? "ready") === "ready" &&
+      !questionDraftIds.has(item.elicitation.elicitationId),
+  );
+
+  // Clears exactly these items; Undo restores them and nothing that arrived since.
+  const markEntriesRead = (
+    sessions: UnreadInboxItem[],
+    comments: CommentInboxItem[],
+    automations: AutomationFailure[],
+  ) => {
+    const readState = markConversationsRead(
+      sessions.map(({ row }) => ({ id: row.id, updatedAt: row.updated_at })),
+    );
+    const commentIds = markCommentsSeen(comments.map(({ comment }) => comment.id));
+    const runIds = automationInbox.markManyRead(automations.map(({ runId }) => runId));
+    // Like the per-row Mark as read: a later reply re-surfaces the row collapsed.
+    const clearedKeys = new Set([
+      ...sessions.map(({ row }) => `unread:${row.id}`),
+      ...comments.map(({ comment }) => `comment:${comment.id}`),
+      ...automations.map(({ runId }) => `automation:${runId}`),
+    ]);
+    setExpandedOverrides((prev) =>
+      Object.fromEntries(Object.entries(prev).filter(([key]) => !clearedKeys.has(key))),
+    );
+    const sessionIds = new Set(sessions.map(({ row }) => row.id));
+    setReplyStatuses((prev) =>
+      Object.fromEntries(Object.entries(prev).filter(([sessionId]) => !sessionIds.has(sessionId))),
+    );
+    const count = readState.length + commentIds.length + runIds.length;
+    if (count === 0) return;
+    toast(`Marked ${count} as read`, {
+      duration: MARK_READ_UNDO_DURATION_MS,
+      action: {
+        label: "Undo",
+        onClick: () => {
+          restoreReadState(readState);
+          forgetSeenComments(commentIds);
+          automationInbox.unmarkRead(runIds);
+        },
+      },
+      testId: "inbox-mark-read-toast",
+    });
+  };
+
+  // Declines the confirmed prompts still open, using their current delivery attempt;
+  // one answered meanwhile is skipped.
+  const declineAll = (targets: InboxItem[]) => {
+    const targetIds = new Set(targets.map(({ elicitation }) => elicitation.elicitationId));
+    const submissions = declinable
+      .filter(({ elicitation }) => targetIds.has(elicitation.elicitationId))
+      .map((item) => {
+        const { elicitationId, nativeDelivery } = item.elicitation;
+        // Same attempt stamp the card adds to a native verdict.
+        const meta = nativeDelivery
+          ? { native_delivery_attempt: nativeDelivery.attempt }
+          : undefined;
+        return submitVerdict(item, elicitationId, "decline", undefined, meta);
+      })
+      .filter((submission) => submission !== undefined);
+    if (submissions.length === 0) return;
+    void Promise.all(submissions).then((results) => {
+      showToast(describeDeclineResult(results.filter(Boolean).length, results.length));
+    });
   };
 
   const rowsById = new Map(allRows.map((row) => [row.id, row]));
@@ -738,9 +863,7 @@ export function InboxPage() {
     if (entry.kind === "approval") {
       const { item } = entry;
       const elicitationId = item.elicitation.elicitationId;
-      const optimistic = responded[elicitationId];
-      const verdict =
-        optimistic?.attempt === item.elicitation.nativeDelivery?.attempt ? optimistic : undefined;
+      const verdict = liveVerdict(item);
       // Same display mapping the sidebar uses: native-wrapper sessions read
       // "Claude Code" / "Codex", never the internal agent name. Hidden when
       // it would just repeat the title (untitled native sessions).
@@ -750,7 +873,7 @@ export function InboxPage() {
           key={entry.key}
           testId="inbox-item"
           tile={<KindTile icon={HandIcon} tone="yellow" />}
-          kindLabel={item.elicitation.askUserQuestion ? "Question" : "Approval needed"}
+          kindLabel={approvalKindLabel(item)}
           title={title}
           preview={
             item.elicitation.message ? (
@@ -1095,34 +1218,47 @@ export function InboxPage() {
         )}
       </div>
 
-      <Tabs
-        value={filter}
-        onValueChange={(value) => {
-          if (!isInboxFilter(value)) return;
-          setFilter(value);
-          writeInboxFilter(value);
-        }}
-        componentId="inbox.filter"
-        className="mb-4"
-      >
-        <TabsList
-          variant="pill"
-          aria-label="Inbox filter"
-          className="gap-1 mobile-app:max-w-full mobile-app:flex-wrap mobile-app:justify-start"
+      <div className="mb-4 flex flex-wrap items-center gap-2">
+        <Tabs
+          value={filter}
+          onValueChange={(value) => {
+            if (!isInboxFilter(value)) return;
+            setFilter(value);
+            writeInboxFilter(value);
+          }}
+          componentId="inbox.filter"
         >
-          {INBOX_TABS.filter(({ value }) => value !== "advisor" || advisorTab).map(
-            ({ value, label }) => (
-              <TabsTrigger
-                key={value}
-                value={value}
-                className="h-7 mobile-touch-target mobile-app:h-auto flex-none mobile-app:whitespace-normal px-3"
-              >
-                {label}
-              </TabsTrigger>
-            ),
-          )}
-        </TabsList>
-      </Tabs>
+          <TabsList
+            variant="pill"
+            aria-label="Inbox filter"
+            className="gap-1 mobile-app:max-w-full mobile-app:flex-wrap mobile-app:justify-start"
+          >
+            {INBOX_TABS.filter(({ value }) => value !== "advisor" || advisorTab).map(
+              ({ value, label }) => (
+                <TabsTrigger
+                  key={value}
+                  value={value}
+                  className="h-7 mobile-touch-target mobile-app:h-auto flex-none mobile-app:whitespace-normal px-3"
+                >
+                  {label}
+                </TabsTrigger>
+              ),
+            )}
+          </TabsList>
+        </Tabs>
+        <InboxBulkActions
+          showRead={showUnread}
+          doneCount={doneTargets.length}
+          allCount={allReadCount}
+          allIncludes={allReadIncludes}
+          showDecline={showApprovals}
+          declineCount={declinable.length}
+          loadedOnly={bulkLoadedOnly}
+          onMarkDoneRead={() => markEntriesRead(doneTargets, [], [])}
+          onMarkAllRead={() => markEntriesRead(bulkUnread, visibleComments, visibleAutomations)}
+          onDecline={() => setDeclineTargets(declinable)}
+        />
+      </div>
 
       {failedSessionCount > 0 && (
         <div
@@ -1264,7 +1400,190 @@ export function InboxPage() {
           {automationInbox.isFetchingNextPage ? "Loading…" : "Check more automations"}
         </Button>
       )}
+      <Dialog
+        open={declineTargets !== null}
+        onOpenChange={(open) => {
+          if (!open) setDeclineTargets(null);
+        }}
+      >
+        {declineTargets && (
+          <DialogContent className="sm:max-w-md">
+            <DialogHeader>
+              <DialogTitle>
+                Decline {declineTargets.length} {awaitingNoun(declineTargets.length)}?
+              </DialogTitle>
+              <DialogDescription>
+                Each agent is told you declined. This can’t be undone.
+                {hasNextPage && " Only loaded items are included."}
+              </DialogDescription>
+            </DialogHeader>
+            <ul className="flex flex-col gap-1 text-ui">
+              {declineTargets.slice(0, DECLINE_PREVIEW_ITEMS).map((item) => (
+                <li key={item.elicitation.elicitationId} className="truncate">
+                  <span className="font-medium">{conversationDisplayLabel(item.row)}</span>
+                  <span className="text-muted-foreground"> · {approvalKindLabel(item)}</span>
+                </li>
+              ))}
+              {declineTargets.length > DECLINE_PREVIEW_ITEMS && (
+                <li className="text-muted-foreground">
+                  and {declineTargets.length - DECLINE_PREVIEW_ITEMS} more
+                </li>
+              )}
+            </ul>
+            <DialogFooter className="border-t-0 bg-transparent">
+              <Button type="button" variant="ghost" onClick={() => setDeclineTargets(null)}>
+                Cancel
+              </Button>
+              <Button
+                type="button"
+                variant="destructive"
+                onClick={() => {
+                  setDeclineTargets(null);
+                  declineAll(declineTargets);
+                }}
+                componentId="inbox.bulk.decline_confirm"
+              >
+                Decline {declineTargets.length}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        )}
+      </Dialog>
     </PageScroll>
+  );
+}
+
+function approvalKindLabel(item: InboxItem): string {
+  return item.elicitation.askUserQuestion ? "Question" : "Approval needed";
+}
+
+function awaitingNoun(count: number): string {
+  return count === 1 ? "awaiting response" : "awaiting responses";
+}
+
+/** `1 completed session` / `5 completed sessions`. */
+function countOf(count: number, one: string, many: string): string {
+  return `${count} ${count === 1 ? one : many}`;
+}
+
+/** The toast after a bulk decline; failed prompts roll back to their cards. */
+export function describeDeclineResult(declined: number, total: number): string {
+  if (declined === total) return `Declined ${total} ${awaitingNoun(total)}`;
+  if (declined === 0) {
+    return total === 1
+      ? "Couldn’t decline the awaiting response. It’s still listed."
+      : "Couldn’t decline the awaiting responses. They’re still listed.";
+  }
+  const failed = total - declined;
+  return `Declined ${declined} of ${total} awaiting responses. ${failed} couldn’t be declined and ${failed === 1 ? "is" : "are"} still listed.`;
+}
+
+/**
+ * The tab row's bulk actions in one overflow menu, each counting the loaded
+ * items it acts on. Mark-read items keep their places, disabled when empty, so
+ * a repeated click never lands on the wider action.
+ */
+function InboxBulkActions({
+  showRead,
+  doneCount,
+  allCount,
+  allIncludes,
+  showDecline,
+  declineCount,
+  loadedOnly,
+  onMarkDoneRead,
+  onMarkAllRead,
+  onDecline,
+}: {
+  /** The tab lists sessions, comments and automation failures. */
+  showRead: boolean;
+  doneCount: number;
+  allCount: number;
+  /** What the wider read action adds beyond Done, e.g. "1 error and 2 comments". */
+  allIncludes: string;
+  /** The tab lists awaiting responses. */
+  showDecline: boolean;
+  /** Prompts bulk decline would answer; one session can have several. */
+  declineCount: number;
+  /** More items exist than are loaded, so the counts cover only part of the tab. */
+  loadedOnly: boolean;
+  onMarkDoneRead: () => void;
+  onMarkAllRead: () => void;
+  onDecline: () => void;
+}) {
+  const { trackClick } = useOmnigentAnalytics();
+  const showReadItems = showRead && allCount > 0;
+  const showDeclineItem = showDecline && declineCount > 0;
+  if (!showReadItems && !showDeclineItem) return null;
+  const extraCount = allCount - doneCount;
+  const select = (componentId: string, action: () => void) => () => {
+    trackClick(componentId, "button");
+    action();
+  };
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          aria-label="Inbox bulk actions"
+          title="Inbox bulk actions"
+          className="ml-auto shrink-0 mobile-touch-target"
+          componentId="inbox.bulk.menu"
+        >
+          <EllipsisVerticalIcon />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="max-w-72">
+        {loadedOnly && <DropdownMenuLabel>Loaded items only</DropdownMenuLabel>}
+        {showReadItems && (
+          <BulkMenuItem
+            label="Mark done as read"
+            detail={
+              doneCount > 0
+                ? countOf(doneCount, "completed session", "completed sessions")
+                : "No completed sessions"
+            }
+            disabled={doneCount === 0}
+            onSelect={select("inbox.bulk.mark_done_read", onMarkDoneRead)}
+          />
+        )}
+        {showReadItems && extraCount > 0 && (
+          <BulkMenuItem
+            label="Mark all as read"
+            detail={
+              doneCount > 0
+                ? `${countOf(allCount, "unread item", "unread items")}, including ${allIncludes}`
+                : allIncludes
+            }
+            onSelect={select("inbox.bulk.mark_all_read", onMarkAllRead)}
+          />
+        )}
+        {showReadItems && showDeclineItem && <DropdownMenuSeparator />}
+        {showDeclineItem && (
+          <BulkMenuItem
+            variant="destructive"
+            label="Decline awaiting responses"
+            detail={countOf(declineCount, "request waiting on you", "requests waiting on you")}
+            onSelect={select("inbox.bulk.decline", onDecline)}
+          />
+        )}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+/** A bulk menu item: what it does, then what it covers. */
+function BulkMenuItem({
+  label,
+  detail,
+  ...props
+}: { label: string; detail: string } & ComponentProps<typeof DropdownMenuItem>) {
+  return (
+    <DropdownMenuItem className="mobile-touch-target flex-col items-start gap-0" {...props}>
+      <span>{label}</span>
+      <span className="text-sm text-muted-foreground">{detail}</span>
+    </DropdownMenuItem>
   );
 }
 

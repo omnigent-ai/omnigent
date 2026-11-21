@@ -96,19 +96,20 @@ function subscribe(listener: () => void): () => void {
 /**
  * Record the given comment ids as seen (idempotent). Notifies
  * `useSeenCommentIds` subscribers so inbox surfaces update in place.
+ * Returns the ids that weren't already seen.
  */
-export function markCommentsSeen(commentIds: string[]): void {
-  if (commentIds.length === 0) return;
+export function markCommentsSeen(commentIds: string[]): string[] {
+  if (commentIds.length === 0) return [];
   const map = readSeenMap();
   const now = Math.floor(Date.now() / 1000);
-  let changed = false;
+  const added: string[] = [];
   for (const id of commentIds) {
     if (map[id] === undefined) {
       map[id] = now;
-      changed = true;
+      added.push(id);
     }
   }
-  if (!changed) return;
+  if (added.length === 0) return added;
   const entries = Object.entries(map);
   if (entries.length > MAX_ENTRIES) {
     entries.sort((a, b) => b[1] - a[1]);
@@ -117,6 +118,17 @@ export function markCommentsSeen(commentIds: string[]): void {
   } else {
     writeSeenMap(map);
   }
+  listeners.forEach((listener) => listener());
+  return added;
+}
+
+/** Forget comment ids (undoing {@link markCommentsSeen}) so they surface again. */
+export function forgetSeenComments(commentIds: readonly string[]): void {
+  const forgotten = new Set(commentIds);
+  const entries = Object.entries(readSeenMap());
+  const kept = entries.filter(([id]) => !forgotten.has(id));
+  if (kept.length === entries.length) return;
+  writeSeenMap(Object.fromEntries(kept));
   listeners.forEach((listener) => listener());
 }
 
