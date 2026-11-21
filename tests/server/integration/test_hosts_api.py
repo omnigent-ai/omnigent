@@ -413,6 +413,40 @@ async def test_code_host_instances_are_listed_only_while_served(
         assert "code_host_instances" not in detail
 
 
+@pytest.mark.parametrize(
+    "field",
+    [
+        "cli",
+        "command",
+        "env",
+        "env_set",
+        "code_host_instances",
+        "code_host_instances_file",
+        "code_host_instance_hosts",
+    ],
+)
+async def test_a_launch_request_naming_a_code_host_command_is_refused(
+    db_uri: str, field: str
+) -> None:
+    """Only the host's own config names an instance's CLI; a request that tries is refused."""
+    app, registry, _hs, conv_store = _build_host_api_app(db_uri)
+    _comm = await _connect_host(app, registry, capabilities=[CAP_CODE_HOST_INSTANCES])
+    conv = conv_store.create_conversation(agent_id=None)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            f"/v1/hosts/{_HOST_ID}/runners",
+            json={"session_id": conv.id, "workspace": "/tmp", field: ["/bin/sh", "planted"]},
+        )
+
+    assert resp.status_code == 422, resp.text
+    (error,) = resp.json()["detail"]
+    assert f"field {field} can't be sent" in error["msg"]
+    assert "planted" not in error["msg"]
+    still = conv_store.get_conversation(conv.id)
+    assert still is not None and still.runner_id is None
+
+
 async def test_harness_accounts_are_live_only_and_login_support_is_explicit(
     db_uri: str,
 ) -> None:

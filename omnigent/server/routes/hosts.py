@@ -29,7 +29,7 @@ from urllib.parse import urlparse
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from packaging.version import InvalidVersion, Version
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from omnigent.db.utils import now_epoch
 from omnigent.debug_logging import (
@@ -64,6 +64,7 @@ from omnigent.host.frames import (
     classify_launch_refusal,
     encode_host_frame,
     optional_str_bool_map,
+    refuse_code_host_command_fields,
     workspace_missing_message,
 )
 from omnigent.onboarding.harness_install import (
@@ -851,6 +852,14 @@ class LaunchRunnerRequest(BaseModel):
     session_env_handoff_id: str | None = Field(
         default=None, max_length=64, pattern=r"^[A-Za-z0-9_-]+$"
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _refuse_code_host_commands(cls, data: object) -> object:
+        """Refuse a body naming a code host instance's command, environment or file."""
+        if isinstance(data, dict):
+            refuse_code_host_command_fields(data, where="the runner launch request")
+        return data
 
 
 async def _resolve_agent_spec_cwd(

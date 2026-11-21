@@ -23,7 +23,7 @@ import base64
 import importlib.util
 import json
 import math
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from os import PathLike
@@ -3102,12 +3102,42 @@ def _decode_harness_readiness(msg: _JsonObject) -> HostHarnessReadinessFrame:
     )
 
 
+# Fields that would name a code host instance's command or environment; only the
+# host's own config file may, so a launch that carries one is refused.
+CODE_HOST_COMMAND_FIELDS = frozenset(
+    {
+        "cli",
+        "command",
+        "env",
+        "env_set",
+        "code_host_instances",
+        "code_host_instances_file",
+        "code_host_instance_hosts",
+    }
+)
+
+
+def refuse_code_host_command_fields(fields: Iterable[str], *, where: str) -> None:
+    """Refuse a launch whose *fields* name a code host instance's command or environment.
+
+    :raises ValueError: Naming the first such field, never its value.
+    """
+    named = sorted(CODE_HOST_COMMAND_FIELDS.intersection(fields))
+    if named:
+        raise ValueError(
+            f"{where} is refused: field {named[0]} can't be sent; only the host's own "
+            "config names a code host instance's command or environment"
+        )
+
+
 def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
     """Decode a launch-runner frame.
 
     :param msg: Decoded frame object.
     :returns: Typed launch-runner frame.
+    :raises ValueError: When the frame names a code host instance's command or file.
     """
+    refuse_code_host_command_fields(msg, where="the launch-runner frame")
     inference_config = msg.get("inference_config")
     if inference_config is not None and not isinstance(inference_config, dict):
         raise ValueError("inference_config must be an object or null")
