@@ -1,0 +1,237 @@
+// The session row's actions as ⌘K offers them on any session: the same set, labels and gates
+// as the sidebar row's menu, decided from plain facts about one session. No React here; the
+// icons and the code that runs each action live beside the palette.
+
+import { SHARING_OFF_REASON } from "@/lib/capabilities";
+import {
+  AVAILABLE,
+  type CommandAvailability,
+  HIDDEN,
+  unavailableBecause,
+} from "@/store/paletteCommands";
+
+/** Every action, in the row menu's order. Toggles are two ids, so a stale row can't flip back. */
+export const SESSION_COMMAND_IDS = [
+  "add-sibling",
+  "pin",
+  "unpin",
+  "share",
+  "fork",
+  "rename",
+  "mute",
+  "unmute",
+  "mark-unread",
+  "mark-read",
+  "create-automation",
+  "move-to-project",
+  "stop",
+  "archive",
+  "unarchive",
+  "delete",
+  "leave",
+] as const;
+
+export type SessionCommandId = (typeof SESSION_COMMAND_IDS)[number];
+
+/** What the actions need to know about one session and the server it's on. */
+export interface SessionCommandFacts {
+  /** The viewer owns it; see `isOwnedByViewer`. */
+  owner: boolean;
+  archived: boolean;
+  pinned: boolean;
+  /** A family member shown under its leader, which pins and files with the family. */
+  indentedSibling: boolean;
+  /** No pin slot is left, so pinning another session needs an unpin first. */
+  atPinCapacity: boolean;
+  /** A pin write is saving; pin writes don't overlap. */
+  pinSaving: boolean;
+  /** It shows the unread dot. */
+  unread: boolean;
+  /** The viewer muted it, which silences its unread dot. */
+  muted: boolean;
+  /** The viewer may start an automation from it; see `canCreateAutomationFromSession`. */
+  canCreateAutomation: boolean;
+  /** The project it's filed under, if any. */
+  currentProject: string | null;
+  /** Its runner may still be running. */
+  stoppable: boolean;
+  /** Why Fork can't run here, if it can't. */
+  forkDisabledReason?: string;
+  server: {
+    /** One user, so there's nobody to share with or leave a session to. */
+    singleUser: boolean;
+    /** The admin turned sharing off for this server. */
+    sharingOff: boolean;
+    /** The server creates nested agents. */
+    siblingSessions: boolean;
+    /** The server can mute a session for the viewer alone. */
+    sessionMute: boolean;
+  };
+}
+
+export interface SessionCommand {
+  id: SessionCommandId;
+  label: string;
+  /** Extra words ⌘K matches. */
+  keywords: readonly string[];
+  /** Ends or removes something, styled as the menu's destructive items are. */
+  destructive: boolean;
+  /** Opens a dialog or picker, which should take focus once the palette has closed. */
+  opensDialog: boolean;
+  availability: CommandAvailability;
+}
+
+/** Actions that ask or show something first; Archive can ask about worktrees. */
+const OPENS_DIALOG: ReadonlySet<SessionCommandId> = new Set<SessionCommandId>([
+  "share",
+  "fork",
+  "rename",
+  "create-automation",
+  "move-to-project",
+  "stop",
+  "archive",
+  "delete",
+  "leave",
+]);
+
+const DESTRUCTIVE: ReadonlySet<SessionCommandId> = new Set<SessionCommandId>([
+  "stop",
+  "delete",
+  "leave",
+]);
+
+/** Why an action only the owner may take is greyed for everyone else, as the row menu says. */
+export const OWNER_ONLY_REASONS = {
+  share: "Only the session owner can share this session",
+  rename: "Only the session owner can rename this session",
+  stop: "Only the session owner can stop this session",
+  archive: "Only the session owner can archive this session",
+  unarchive: "Only the session owner can unarchive this session",
+} as const;
+
+export const PIN_SAVING_REASON = "A pin change is still saving.";
+export const PIN_CAPACITY_REASON = "Unpin a session to pin another.";
+
+const KEYWORDS: Record<SessionCommandId, readonly string[]> = {
+  "add-sibling": ["nested", "sibling", "new agent", "family"],
+  pin: ["favorite", "keep", "top"],
+  unpin: ["favorite", "remove pin"],
+  share: ["permissions", "invite", "access"],
+  fork: ["branch", "clone", "copy", "duplicate"],
+  rename: ["title", "name"],
+  mute: ["notifications", "silence", "quiet"],
+  unmute: ["notifications", "unsilence"],
+  "mark-unread": ["unread", "dot", "revisit", "flag"],
+  "mark-read": ["read", "seen", "clear"],
+  "create-automation": ["automation", "schedule", "recurring"],
+  "move-to-project": ["project", "folder", "file", "move"],
+  stop: ["terminate", "kill", "runner", "halt"],
+  archive: ["hide", "done"],
+  unarchive: ["restore", "unhide"],
+  delete: ["remove", "trash"],
+  leave: ["remove", "unshare"],
+};
+
+function ownerOnly(owner: boolean, reason: string): CommandAvailability {
+  return owner ? AVAILABLE : unavailableBecause(reason);
+}
+
+function when(condition: boolean, availability: CommandAvailability): CommandAvailability {
+  return condition ? availability : HIDDEN;
+}
+
+function shareAvailability({ owner, server }: SessionCommandFacts): CommandAvailability {
+  // One user has nobody to share with, so the row menu leaves Share out.
+  if (server.singleUser) return HIDDEN;
+  // Sharing turned off server-wide outranks the viewer's own reason.
+  if (server.sharingOff) return unavailableBecause(SHARING_OFF_REASON);
+  return ownerOnly(owner, OWNER_ONLY_REASONS.share);
+}
+
+function pinAvailability(facts: SessionCommandFacts, pinning: boolean): CommandAvailability {
+  // Archiving outranks pinning, and a nested family member pins with its family.
+  if (facts.archived || facts.indentedSibling || facts.pinned === pinning) return HIDDEN;
+  if (facts.pinSaving) return unavailableBecause(PIN_SAVING_REASON);
+  if (pinning && facts.atPinCapacity) return unavailableBecause(PIN_CAPACITY_REASON);
+  return AVAILABLE;
+}
+
+const LABELS: Record<SessionCommandId, string> = {
+  "add-sibling": "Add nested agent",
+  pin: "Pin",
+  unpin: "Unpin",
+  share: "Share",
+  fork: "Fork",
+  rename: "Rename",
+  mute: "Mute",
+  unmute: "Unmute",
+  "mark-unread": "Mark as unread",
+  "mark-read": "Mark as read",
+  "create-automation": "Create automation",
+  "move-to-project": "Add to project",
+  stop: "Stop session",
+  archive: "Archive",
+  unarchive: "Unarchive",
+  delete: "Delete",
+  leave: "Leave session",
+};
+
+function availabilityOf(id: SessionCommandId, facts: SessionCommandFacts): CommandAvailability {
+  const { owner, server } = facts;
+  switch (id) {
+    case "add-sibling":
+      return when(owner && !facts.archived && server.siblingSessions, AVAILABLE);
+    case "pin":
+      return pinAvailability(facts, true);
+    case "unpin":
+      return pinAvailability(facts, false);
+    case "share":
+      return shareAvailability(facts);
+    case "fork":
+      return facts.forkDisabledReason ? unavailableBecause(facts.forkDisabledReason) : AVAILABLE;
+    case "rename":
+      return ownerOnly(owner, OWNER_ONLY_REASONS.rename);
+    case "mute":
+      return when(server.sessionMute && !facts.muted, AVAILABLE);
+    case "unmute":
+      return when(server.sessionMute && facts.muted, AVAILABLE);
+    // A muted session's dot is silenced, so it can be marked read but not flagged unread.
+    case "mark-unread":
+      return when(!facts.unread && !facts.muted, AVAILABLE);
+    case "mark-read":
+      return when(facts.unread, AVAILABLE);
+    case "create-automation":
+      return when(facts.canCreateAutomation, AVAILABLE);
+    // Filing is the owner's own tool, and a nested family member files with its family.
+    case "move-to-project":
+      return when(owner && !facts.indentedSibling, AVAILABLE);
+    case "stop":
+      return when(facts.stoppable, ownerOnly(owner, OWNER_ONLY_REASONS.stop));
+    case "archive":
+      return when(!facts.archived, ownerOnly(owner, OWNER_ONLY_REASONS.archive));
+    case "unarchive":
+      return when(facts.archived, ownerOnly(owner, OWNER_ONLY_REASONS.unarchive));
+    // The owner deletes; anyone it's shared with leaves. One user only deletes.
+    case "delete":
+      return when(owner || server.singleUser, AVAILABLE);
+    case "leave":
+      return when(!owner && !server.singleUser, AVAILABLE);
+  }
+}
+
+/** Every action for `facts`, in the row menu's order; hidden ones have no reason. */
+export function sessionCommands(facts: SessionCommandFacts): SessionCommand[] {
+  return SESSION_COMMAND_IDS.map((id) => ({
+    id,
+    label: id === "move-to-project" && facts.currentProject !== null ? "Move session" : LABELS[id],
+    keywords: KEYWORDS[id],
+    destructive: DESTRUCTIVE.has(id),
+    opensDialog: OPENS_DIALOG.has(id),
+    availability: availabilityOf(id, facts),
+  }));
+}
+
+/** The action `id` for `facts`. */
+export function sessionCommand(facts: SessionCommandFacts, id: SessionCommandId): SessionCommand {
+  return sessionCommands(facts).find((command) => command.id === id)!;
+}
