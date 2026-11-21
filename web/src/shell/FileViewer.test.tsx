@@ -1036,6 +1036,7 @@ describe("FileViewer URL sync — comment param", () => {
     expect(screen.getByTestId("code-viewer")).toBeInTheDocument();
     expect(screen.queryByTestId("diff-viewer")).toBeNull();
     expect(readFileViewPreferences().diffActive).toBe(true);
+    expect(screen.getByTestId("url-params").textContent).not.toContain("diff=1");
     fireEvent.click(screen.getByRole("button", { name: "Show diff" }));
     expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
   });
