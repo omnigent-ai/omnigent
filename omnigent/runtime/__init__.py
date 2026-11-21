@@ -391,6 +391,20 @@ def get_runner_id() -> str | None:
     return _globals._runner_id
 
 
+def set_remote_routing_available(available: bool) -> bool:
+    """Record the attached server's routing availability, creating caps lazily.
+
+    Runners never call :func:`init`, which would replace the caps object.
+
+    :param available: The server's answer from the session-init envelope.
+    :returns: ``True`` when the answer changed, so callers can drop state built from it.
+    """
+    caps = get_caps()
+    changed = caps.remote_routing_available != available
+    caps.remote_routing_available = available
+    return changed
+
+
 def set_harness_process_manager(manager: HarnessProcessManager | None) -> None:
     """
     Set the AP-wide :class:`HarnessProcessManager` singleton.

@@ -160,6 +160,20 @@ def test_lazy_caps_constructor_failure_can_retry(
     assert factory.call_count == 2
 
 
+def test_set_remote_routing_available_before_first_caps_read(
+    isolated_runtime: _ObservedLock,
+) -> None:
+    """A runner records the server's routing answer before anything has read its caps."""
+    assert _globals._caps is None
+
+    assert runtime.set_remote_routing_available(True) is True
+    assert runtime.get_caps().remote_routing_available is True
+    # Repeating an answer reports no change, so the runner keeps its caches.
+    assert runtime.set_remote_routing_available(True) is False
+    assert runtime.set_remote_routing_available(False) is True
+    assert runtime.get_caps().remote_routing_available is False
+
+
 def test_runtime_caps_default_value() -> None:
     """RuntimeCaps with no args uses the 7200s default."""
     caps = RuntimeCaps()
