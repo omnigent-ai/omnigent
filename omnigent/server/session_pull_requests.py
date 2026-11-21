@@ -261,7 +261,12 @@ def entry_payload(entry: StoredPullRequest) -> dict[str, Any]:
     }
 
 
-def answer(info: dict[str, Any], stored: SessionPullRequests | None) -> dict[str, Any]:
+def answer(
+    info: dict[str, Any],
+    stored: SessionPullRequests | None,
+    *,
+    instance_hosts: frozenset[str] = frozenset(),
+) -> dict[str, Any]:
     """Replace a host payload's PR list with the server's.
 
     Once the session is synced, a selection the server doesn't link (an unlinked
@@ -269,6 +274,8 @@ def answer(info: dict[str, Any], stored: SessionPullRequests | None) -> dict[str
 
     :param info: A ``session.github.info`` payload already passed to :func:`ingest_info`.
     :param stored: The session's PRs afterwards.
+    :param instance_hosts: The hosts the session's host serves as code host
+        instances; only a PR on one of them keeps the name its host reported.
     :returns: ``info`` with ``prs`` from the server, or unchanged for a host that
         does not track session PRs.
     """
@@ -283,7 +290,7 @@ def answer(info: dict[str, Any], stored: SessionPullRequests | None) -> dict[str
     prs = []
     for entry in stored.entries:
         payload = entry_payload(entry)
-        if entry.url in reported:
+        if entry.url in reported and entry.host.lower() in instance_hosts:
             payload["provider_display"] = _reported_display(reported[entry.url], entry.provider)
         prs.append(payload)
     updated = {**info, "prs": prs}

@@ -3658,6 +3658,47 @@ async def test_session_pull_requests_stay_listed_and_unlinkable_offline(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("flag_on", [True, False], ids=["flag-on", "flag-off"])
+async def test_a_hosts_instance_name_for_a_pr_needs_this_servers_flag(
+    runner_globals_reset: None, db_uri: str, flag_on: bool
+) -> None:
+    """A host that claims the capability can't rename a provider while the flag is off."""
+    from omnigent.host.frames import CAP_CODE_HOST_INSTANCES
+
+    del runner_globals_reset
+    flags = FeatureFlags(frozenset({Feature.CODE_HOST_INSTANCES}) if flag_on else frozenset())
+    app = _pr_app(db_uri, feature_flags=flags)
+    conv = app.state.test_conversation_store._conversations[_PR_SESSION]
+    conv.host_id = "host_instances"
+    app.state.test_host_registry.register(
+        conv.host_id,
+        object(),  # type: ignore[arg-type]
+        HostHelloFrame(
+            version="0.1.0-test",
+            frame_protocol_version=1,
+            name="instances",
+            capabilities=[CAP_CODE_HOST_INSTANCES],
+            code_host_instances=[
+                {"id": "internal", "display_name": "Internal code host", "hosts": ["github.com"]}
+            ],
+        ),
+        owner=None,
+    )
+    info = _pr_info()
+    for entry in info["prs"]:  # type: ignore[union-attr]
+        entry["provider_display"] = {"id": "github", "display_name": "Internal code host"}  # type: ignore[index]
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=info)))  # type: ignore[arg-type]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://server"
+    ) as client:
+        answer = await client.get(f"/v1/sessions/{_PR_SESSION}/resources/github")
+
+    assert answer.status_code == 200, answer.text
+    names = {pr["provider_display"]["display_name"] for pr in answer.json()["prs"]}
+    assert names == ({"Internal code host"} if flag_on else {"GitHub"})
+
+
+@pytest.mark.asyncio
 async def test_the_server_vouches_for_its_prs_and_owns_unlinks(
     pr_client: httpx.AsyncClient,
 ) -> None:

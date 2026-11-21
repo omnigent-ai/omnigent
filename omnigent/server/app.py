@@ -4343,6 +4343,7 @@ def create_app(
             project_store=project_store,
             background_title_coordinator=background_title_coordinator,
             pull_request_refresher=pull_request_refresher,
+            feature_flags=resolved_feature_flags,
             register_startup_dispatch=lambda handler: (
                 setattr(startup_inputs, "dispatch", handler)
                 if startup_inputs is not None

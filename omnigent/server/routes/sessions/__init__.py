@@ -129,6 +129,7 @@ from omnigent.server.background_session_titles import (
     prepare_background_session_title,
 )
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
+from omnigent.server.feature_flags import FeatureFlags
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 from omnigent.server.mcp_pool import ServerMcpPool
 from omnigent.server.permissions import check_session_access
@@ -830,6 +831,7 @@ def create_sessions_router(
     register_runner_ingest: Callable[..., None] | None = None,
     register_startup_dispatch: Callable[..., None] | None = None,
     register_initial_file_upload: Callable[..., None] | None = None,
+    feature_flags: FeatureFlags | None = None,
 ) -> APIRouter:
     """
     Factory that builds the sessions router.
@@ -968,6 +970,7 @@ def create_sessions_router(
         host_registry=host_registry,
         register_initial_file_upload=register_initial_file_upload,
         pull_request_refresher=pull_request_refresher,
+        feature_flags=feature_flags,
     )
 
     register_ui_routes(

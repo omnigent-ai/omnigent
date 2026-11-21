@@ -38,6 +38,7 @@ from omnigent.entities import (
 )
 from omnigent.entities.session_resources import session_resource_view_to_dict
 from omnigent.errors import ErrorCode, OmnigentError, WrongReplicaError
+from omnigent.host.frames import CAP_CODE_HOST_INSTANCES
 from omnigent.host.workspace_tokens import mint_token
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_agent_name,
@@ -60,7 +61,7 @@ from omnigent.server.auth import (
     LEVEL_READ,
     AuthProvider,
 )
-from omnigent.server.feature_flags import Feature, FeatureFlags
+from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
@@ -266,9 +267,16 @@ def register_resources_routes(
     host_registry: HostRegistry | None = None,
     register_initial_file_upload: Callable[..., None] | None = None,
     pull_request_refresher: server_prs.PullRequestRefresher | None = None,
+    feature_flags: FeatureFlags | None = None,
 ) -> None:
-    """Register the resources routes on router."""
+    """Register the resources routes on router.
+
+    :param feature_flags: This server's flags; resolved from the environment when omitted.
+    """
     pull_request_store = server_prs.open_store(conversation_store)
+    code_host_instances_enabled = (feature_flags or resolve_feature_flags()).enabled(
+        Feature.CODE_HOST_INSTANCES
+    )
 
     async def _require_filesystem_attachment_support(
         request: Request, conv: Conversation, filename: str, capability: str
@@ -3551,8 +3559,25 @@ def register_resources_routes(
         except server_prs.NotAssociatedError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    def _served_instance_hosts(conv: Conversation) -> frozenset[str]:
+        """The hosts the session's host serves as code host instances, with the flag on.
+
+        None while this server's flag is off, whatever the host claims.
+        """
+        if not code_host_instances_enabled or host_registry is None or not conv.host_id:
+            return frozenset()
+        connection = host_registry.get(conv.host_id)
+        if connection is None or CAP_CODE_HOST_INSTANCES not in connection.hello.capabilities:
+            return frozenset()
+        return frozenset(
+            host.lower()
+            for instance in connection.hello.code_host_instances or []
+            for host in instance.get("hosts", [])
+            if isinstance(host, str)
+        )
+
     async def _with_server_pull_requests(
-        session_id: str, info: dict[str, Any], requested_at: float
+        session_id: str, conv: Conversation, info: dict[str, Any], requested_at: float
     ) -> dict[str, Any]:
         """Store a runner or host payload's PRs, then answer with the server's list.
 
@@ -3577,7 +3602,7 @@ def register_resources_routes(
             return info
         if pull_request_refresher is not None:
             pull_request_refresher.note_read(session_id, requested_at)
-        return server_prs.answer(info, stored)
+        return server_prs.answer(info, stored, instance_hosts=_served_instance_hosts(conv))
 
     async def _record_attached(session_id: str, info: dict[str, Any]) -> None:
         """Link the PR a successful attach selected, clearing an earlier unlink.
@@ -3633,7 +3658,7 @@ def register_resources_routes(
             runner_params=params or None,
             runner_path=f"/v1/sessions/{session_id}/resources/github",
         )
-        return await _with_server_pull_requests(session_id, info, requested_at)
+        return await _with_server_pull_requests(session_id, conv, info, requested_at)
 
     async def _update_host_pull_requests(
         session_id: str,
@@ -3692,7 +3717,7 @@ def register_resources_routes(
             await _record_attached(session_id, result)
         elif store_unlink:
             await _store_unlink(session_id, url)
-        return await _with_server_pull_requests(session_id, result, requested_at)
+        return await _with_server_pull_requests(session_id, conv, result, requested_at)
 
     def _tunnel_is_local(conv: Conversation) -> bool:
         """Whether this replica holds the session's runner or host tunnel."""
@@ -4046,14 +4071,14 @@ def register_resources_routes(
             )
             if payload is None:
                 raise
-            return await _with_server_pull_requests(session_id, payload, requested_at)
+            return await _with_server_pull_requests(session_id, conv, payload, requested_at)
         if status >= 400:
             error = result.get("error", {})
             raise OmnigentError(
                 error.get("message", f"GitHub preference update failed (HTTP {status})"),
                 code=error.get("code", ErrorCode.INTERNAL_ERROR),
             )
-        return await _with_server_pull_requests(session_id, result, requested_at)
+        return await _with_server_pull_requests(session_id, conv, result, requested_at)
 
     @router.get(
         "/sessions/{session_id}/resources/github/labels",

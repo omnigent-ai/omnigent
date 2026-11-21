@@ -421,8 +421,20 @@ def test_the_answer_keeps_the_instance_name_a_host_reported_for_a_pr(
     )
     stored = server_prs.ingest_info(store, SESSION, info, requested_at=50.0)
 
-    answered = server_prs.answer(info, stored)
+    answered = server_prs.answer(info, stored, instance_hosts=frozenset({"github.com"}))
+    # A host that serves no instance there, e.g. with the flag off, can't rename one.
+    unserved = server_prs.answer(info, stored)
 
-    names = {entry["url"]: entry["provider_display"]["display_name"] for entry in answered["prs"]}
-    assert names == {A: "Internal code host", B: "GitHub", third: "GitHub", fourth: "GitHub"}
+    def names(payload: dict[str, Any]) -> dict[str, str]:
+        return {
+            entry["url"]: entry["provider_display"]["display_name"] for entry in payload["prs"]
+        }
+
+    assert names(answered) == {
+        A: "Internal code host",
+        B: "GitHub",
+        third: "GitHub",
+        fourth: "GitHub",
+    }
+    assert set(names(unserved).values()) == {"GitHub"}
     assert answered["prs"][0]["provider_display"]["request_name"] == "pull request"
