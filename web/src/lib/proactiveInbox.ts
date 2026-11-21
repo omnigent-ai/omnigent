@@ -314,7 +314,9 @@ export function suggestionKindLabel(kind: SuggestionKind): string {
 export function suggestionPreview(bodyMd: string, maxChars = 200): string {
   const line = bodyMd
     .split("\n")
-    .map((part) => part.replace(/^\s*(?:[#>*-]+|\d+\.)\s*/, "").trim())
+    // Only strip a leading markdown marker when it's a real prefix (followed by
+    // whitespace or end of line), so content like "-5°C" / "3.5 h" stays intact.
+    .map((part) => part.replace(/^\s*(?:[#>*-]+|\d+\.)(?=\s|$)\s*/, "").trim())
     .find(Boolean);
   if (!line) return "";
   return line.length > maxChars ? `${line.slice(0, maxChars - 1)}…` : line;
