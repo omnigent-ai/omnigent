@@ -2,7 +2,12 @@
 // rail's host doesn't provide, which are the shell close question, ending a shell, and Back
 // and Forward. Loaded on demand, so the classic sidebar never downloads it.
 
-import { useCallback, useMemo } from "react";
+import { useCallback, useMemo, useSyncExternalStore } from "react";
+
+import {
+  tabsSidebarForwardedShortcuts,
+  useBrowserForwardedChords,
+} from "@/hooks/useBrowserForwardedChords";
 
 import { useDeleteTerminal } from "@/hooks/useTerminals";
 import { useValueAfterDeferredRender } from "@/hooks/useValueAfterDeferredRender";
@@ -14,6 +19,15 @@ import { useWorkspaceHistoryCommands } from "../workspaceCommands/useWorkspaceHi
 import { useTabsShellClose } from "./useTabsShellClose";
 import { useWorkspaceHistory } from "./useWorkspaceHistory";
 import { WorkspaceTabsPanel, type WorkspaceTabsPanelProps } from "./WorkspaceTabsPanel";
+import { workspaceTabsSession } from "./workspaceTabsSessions";
+
+const NO_FORWARDED_SHORTCUTS: readonly [] = [];
+
+/** Whether the session has a closed tab to reopen. */
+function useCanReopenTab(conversationId: string): boolean {
+  const { store } = useMemo(() => workspaceTabsSession(conversationId), [conversationId]);
+  return useSyncExternalStore(store.subscribe, () => store.snapshot().canReopen);
+}
 
 export type WorkspaceTabsHostProps = Omit<
   WorkspaceTabsPanelProps,
@@ -58,6 +72,11 @@ export function WorkspaceTabsHost({
     facts: history.facts,
     go,
   });
+  // A focused browser page hands its app chords to the sidebar that binds history, one per window.
+  const canReopen = useCanReopenTab(conversationId);
+  useBrowserForwardedChords(
+    bindsHistory ? tabsSidebarForwardedShortcuts(canReopen) : NO_FORWARDED_SHORTCUTS,
+  );
   const historyProps = useMemo(
     () => (bindsHistory ? { historyCommands, onHistoryGo: go } : {}),
     [bindsHistory, historyCommands, go],

@@ -4,6 +4,7 @@ import type { ComponentProps } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
+import type * as HotkeysModule from "@/lib/hotkeys";
 import type { TerminalInfo } from "@/lib/terminals";
 import { registeredPaletteCommands } from "@/test/paletteCommands";
 
@@ -20,6 +21,11 @@ vi.mock("./WorkspaceTabsPanel", () => ({
     captured.panel = props;
     return <div data-testid="tabs-panel" />;
   },
+}));
+// The Mac app's tab chords are the ones a page can hand over.
+vi.mock("@/lib/hotkeys", async (importOriginal) => ({
+  ...(await importOriginal<typeof HotkeysModule>()),
+  isMacPlatform: () => true,
 }));
 vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   ...(await importOriginal<typeof UseTerminalsModule>()),
@@ -69,6 +75,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   cleanup();
+  delete (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop;
   resetWorkspaceTabsSessionsForTests();
   window.localStorage.clear();
 });
@@ -143,6 +150,42 @@ describe("WorkspaceTabsHost", () => {
     expect(
       registeredPaletteCommands().some((row) => row.id === "workspace:conv_host:history:back"),
     ).toBe(true);
+  });
+
+  describe("a focused browser page's app chords", () => {
+    function desktopBridge() {
+      const browserSetForwardedChords = vi.fn().mockResolvedValue({ ok: true });
+      (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop = {
+        kind: "electron",
+        browserSetForwardedChords,
+        onBrowserForwardedInput: () => () => {},
+      };
+      const listedCodes = () =>
+        ((browserSetForwardedChords.mock.lastCall?.[0] ?? []) as { code?: string }[]).flatMap(
+          (chord) => chord.code ?? [],
+        );
+      return { browserSetForwardedChords, listedCodes };
+    }
+
+    it("are asked for by the sidebar that binds history, Reopen once a tab can reopen", async () => {
+      const bridge = desktopBridge();
+      const { store } = workspaceTabsSession("conv_host");
+      await act(() => store.open({ place: { kind: "files" } }, { opener: "user" }));
+      await act(() =>
+        store.open({ place: { kind: "changes" } }, { opener: "user", disposition: "new" }),
+      );
+      host();
+      expect(bridge.listedCodes()).toEqual(["KeyN", "KeyW"]);
+
+      await act(() => store.close(store.selectedTab()!.id, {}));
+      await vi.waitFor(() => expect(bridge.listedCodes()).toEqual(["KeyN", "KeyW", "KeyT"]));
+    });
+
+    it("are left with the page by a cell that doesn't bind history", () => {
+      const bridge = desktopBridge();
+      host({ bindsHistory: false });
+      expect(bridge.browserSetForwardedChords).not.toHaveBeenCalled();
+    });
   });
 
   it("leaves Back and Forward to the cell that binds them", () => {
