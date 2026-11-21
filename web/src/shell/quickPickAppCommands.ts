@@ -12,6 +12,9 @@ import { openThemePicker, SELECT_THEME_COMMAND } from "@/store/themePicker";
 
 import { useSettingsCommands } from "./settingsCommands";
 
+/** The picker ⌘K continues as for Go to Session…, which takes the palette's return target. */
+export const SESSION_SWITCHER = "session-switcher";
+
 export interface QuickPickAppCommandOptions {
   /** Switches the palette to searching sessions only; absent where it can't. */
   onGoToSession?: () => void;
@@ -34,6 +37,7 @@ export function useQuickPickAppCommands({
               shortcut: "palette.sessions" as const,
               // The palette stays open, now searching sessions.
               keepsPaletteOpen: true,
+              continuesAs: SESSION_SWITCHER,
               run: onGoToSession,
             },
           ]

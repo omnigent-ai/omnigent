@@ -6,7 +6,11 @@ import { isBehindOpenLayer } from "@/lib/automaticFocus";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { cn } from "@/lib/utils";
 
-import { type AcceptanceToken, createAcceptanceOwnership } from "./acceptanceOwnership";
+import {
+  type AcceptanceOwnership,
+  type AcceptanceToken,
+  createAcceptanceOwnership,
+} from "./acceptanceOwnership";
 import type { QuickPickAcceptDetails, QuickPickAcceptResult, QuickPickItem } from "./model";
 import { QuickPick, type QuickPickProps } from "./QuickPick";
 import { isPromiseLike } from "./useQuickPickSources";
@@ -15,10 +19,23 @@ const QUICK_PICK_DIALOG_SELECTOR = "[data-quick-pick-dialog]";
 /** Where each open picker returns focus, for a picker that opens in its place. */
 const returnFocusTargets = new WeakMap<Element, HTMLElement | null>();
 /**
- * Where a focused picker that just unmounted would have returned focus, for one that mounts in
- * the same commit in its place, such as ⌘K continuing as the session switcher. Gone after it.
+ * A return target an accept handed to the picker it named, such as ⌘K continuing as the
+ * session switcher. Only the next picker to open sees it: the named one takes it, and any
+ * other discards it. Its picker withdraws it on a cancel, close, Back or newer accept.
  */
-let unmountedReturnTarget: { target: HTMLElement | null } | null = null;
+let successorHandoff: {
+  successor: string;
+  target: HTMLElement | null;
+  from: AcceptanceOwnership;
+} | null = null;
+
+function withdrawHandoff(from: AcceptanceOwnership) {
+  if (successorHandoff?.from === from) successorHandoff = null;
+}
+
+function isHandOff(result: QuickPickDialogSettledResult): result is QuickPickHandOff {
+  return typeof result === "object" && result !== null && "handOffTo" in result;
+}
 
 /** A dedicated picker's header: its mode and the shortcut that opens it, such as "Session ⌘↵". */
 export interface QuickPickHeading {
@@ -29,12 +46,23 @@ export interface QuickPickHeading {
 }
 
 /**
+ * An accept that opens another picker in this one's place, the one whose `successorName` is
+ * `handOffTo`: this one stays open until its owner swaps it, and that one returns focus where
+ * this one would.
+ */
+export interface QuickPickHandOff {
+  handOffTo: string;
+}
+
+type QuickPickDialogSettledResult = QuickPickAcceptResult | QuickPickHandOff;
+
+/**
  * What an accept does in a dialog, now or once a promise settles, such as after the row's
  * details load. The dialog stays open while it waits; a cancel, a reopen or a newer accept
  * meanwhile drops the result.
  */
 export type QuickPickDialogAcceptResult =
-  QuickPickAcceptResult | PromiseLike<QuickPickAcceptResult>;
+  QuickPickDialogSettledResult | PromiseLike<QuickPickDialogSettledResult>;
 
 export interface QuickPickDialogProps<Value> extends Omit<
   QuickPickProps<Value>,
@@ -59,6 +87,8 @@ export interface QuickPickDialogProps<Value> extends Omit<
   heading?: QuickPickHeading;
   /** Called when the dialog closes without an accept, such as Escape or a click outside. */
   onCancel?: () => void;
+  /** The name an accept hands off to, for a picker that opens in another's place. */
+  successorName?: string;
 }
 
 /** The standard modal QuickPick; an accepted close restores focus before running its `afterClose`. */
@@ -73,6 +103,7 @@ export function QuickPickDialog<Value>({
   onAccept,
   onAlternate,
   onCancel,
+  successorName,
   ...quickPickProps
 }: QuickPickDialogProps<Value>) {
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -110,51 +141,53 @@ export function QuickPickDialog<Value>({
     if (!open) {
       // Closed from outside, such as by the shortcut that opened it: nothing pending applies.
       if (!ownership.closing()) ownership.revoke();
+      withdrawHandoff(ownership);
       return;
     }
     // A new opening, even one during the last one's exit, owns nothing from before: an earlier
     // accept's result or close action would act on a picker the user came back to.
     ownership.revoke();
+    // Only the next picker to open sees a handoff: the one it names takes it, any other drops it.
+    const handoff = successorHandoff;
+    successorHandoff = null;
     const active = document.activeElement;
-    // Opened in another picker's place: return where that one would.
+    // Opened in another still-mounted picker's place: return where that one would.
     const replaced = active?.closest(QUICK_PICK_DIALOG_SELECTOR);
-    const focusDropped = active === null || active === document.body;
-    returnFocusRef.current = replaced
-      ? (returnFocusTargets.get(replaced) ?? null)
-      : focusDropped && unmountedReturnTarget
-        ? unmountedReturnTarget.target
-        : active instanceof HTMLElement
-          ? active
-          : null;
-    unmountedReturnTarget = null;
+    returnFocusRef.current =
+      handoff && successorName !== undefined && handoff.successor === successorName
+        ? handoff.target
+        : replaced
+          ? (returnFocusTargets.get(replaced) ?? null)
+          : active instanceof HTMLElement
+            ? active
+            : null;
+    // oxlint-disable-next-line react-hooks/exhaustive-deps -- the name is read as it opens.
   }, [open, ownership]);
-  // Runs while the content is still in the document, so it can tell whether focus was inside.
-  useLayoutEffect(
-    () => () => {
-      const content = inputRef.current?.closest(QUICK_PICK_DIALOG_SELECTOR);
-      if (!content?.contains(document.activeElement)) return;
-      const handoff = { target: returnFocusRef.current };
-      unmountedReturnTarget = handoff;
-      queueMicrotask(() => {
-        if (unmountedReturnTarget === handoff) unmountedReturnTarget = null;
-      });
-    },
-    [],
-  );
   // Reopened during its exit animation, the content survived, so Radix won't autofocus it again.
   useEffect(() => {
     if (open) claimFocus();
   }, [open]);
   /** Close for `token`'s result, unless another acceptance, a cancel or a reopen took over. */
-  const settle = (token: AcceptanceToken, result: QuickPickAcceptResult) => {
+  const settle = (token: AcceptanceToken, result: QuickPickDialogSettledResult) => {
     if (!ownership.isCurrent(token) || result === "keepOpen") return;
+    if (isHandOff(result)) {
+      // Stays open; the owner swaps in the successor, which takes this picker's return target.
+      successorHandoff = {
+        successor: result.handOffTo,
+        target: returnFocusRef.current,
+        from: ownership,
+      };
+      return;
+    }
     ownership.requestClose(token, result?.afterClose ?? null);
     setClosesAsked((count) => count + 1);
     latestOnOpenChange.current(false);
   };
   const begin = (result: QuickPickDialogAcceptResult): QuickPickAcceptResult => {
+    // A newer accept supersedes an earlier one's handoff.
+    withdrawHandoff(ownership);
     const token = ownership.begin();
-    if (isPromiseLike<QuickPickAcceptResult>(result)) {
+    if (isPromiseLike<QuickPickDialogSettledResult>(result)) {
       // A failed result leaves the picker open for the caller to say why; it's logged too.
       result.then(
         (settled) => settle(token, settled),
@@ -165,12 +198,13 @@ export function QuickPickDialog<Value>({
       return "keepOpen";
     }
     settle(token, result);
-    return result === "keepOpen" ? result : undefined;
+    return result === "keepOpen" || isHandOff(result) ? "keepOpen" : undefined;
   };
   const handleOpenChange = (nextOpen: boolean) => {
     if (!nextOpen) {
       // A cancel closes with no choice: whatever an accept left pending is dropped.
       ownership.revoke();
+      withdrawHandoff(ownership);
       onCancel?.();
     }
     onOpenChange(nextOpen);
@@ -181,6 +215,7 @@ export function QuickPickDialog<Value>({
     onBack &&
     (() => {
       ownership.revoke();
+      withdrawHandoff(ownership);
       onBack();
     });
   const picker = (

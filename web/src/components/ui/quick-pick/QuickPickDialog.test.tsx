@@ -148,14 +148,25 @@ describe("QuickPickDialog over other layers", () => {
   });
 });
 
-describe("QuickPickDialog replaced by another as it unmounts", () => {
+describe("QuickPickDialog handing off to a successor", () => {
+  const SUCCESSOR = "second";
   let swap: () => void = () => undefined;
-  let close: () => void = () => undefined;
-  function Swapping() {
+  let swapClosed: () => void = () => undefined;
+  let reopen: () => void = () => undefined;
+  let openOther: () => void = () => undefined;
+  /** Accepting "first" hands off to the successor named SUCCESSOR, as Go to Session… does. */
+  function Swapping({ handsOff = true }: { handsOff?: boolean }) {
     const [open, setOpen] = useState(false);
+    const [otherOpen, setOtherOpen] = useState(false);
     const [mode, setMode] = useState<"first" | "second">("first");
     swap = () => setMode("second");
-    close = () => setOpen(false);
+    // The successor mounts closed and opens in a later commit.
+    swapClosed = () => {
+      setMode("second");
+      setOpen(false);
+    };
+    reopen = () => setOpen(true);
+    openOther = () => setOtherOpen(true);
     return (
       <>
         <button type="button" onClick={() => setOpen(true)}>
@@ -167,6 +178,17 @@ describe("QuickPickDialog replaced by another as it unmounts", () => {
           open={open}
           onOpenChange={setOpen}
           label={mode}
+          successorName={mode === "second" ? SUCCESSOR : undefined}
+          segments={commands}
+          query=""
+          onQueryChange={() => undefined}
+          emptyMessage="No results found"
+          onAccept={() => (mode === "first" && handsOff ? { handOffTo: SUCCESSOR } : "keepOpen")}
+        />
+        <QuickPickDialog
+          open={otherOpen}
+          onOpenChange={setOtherOpen}
+          label="other"
           segments={commands}
           query=""
           onQueryChange={() => undefined}
@@ -176,35 +198,77 @@ describe("QuickPickDialog replaced by another as it unmounts", () => {
       </>
     );
   }
+  const dropFocus = () => act(() => (document.activeElement as HTMLElement | null)?.blur());
+  const escapeFrom = async (label: string) => {
+    const input = await screen.findByRole("combobox", { name: label });
+    await waitFor(() => expect(input).toHaveFocus());
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("combobox", { name: label })).toBeNull());
+  };
 
-  it("returns focus where the picker it replaced would", async () => {
+  it("returns focus where its predecessor would when it opens in the same commit", async () => {
     render(<Swapping />);
     const { trigger } = await openPicker("first");
+    await userEvent.keyboard("{Enter}");
     act(() => swap());
-    const second = await screen.findByRole("combobox", { name: "second" });
-    await waitFor(() => expect(second).toHaveFocus());
-    await userEvent.keyboard("{Escape}");
-    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await escapeFrom("second");
     await waitFor(() => expect(trigger).toHaveFocus());
   });
 
-  it("hands nothing to a picker opened later", async () => {
-    const elsewhere = document.createElement("button");
-    document.body.append(elsewhere);
-    onTestFinished(() => elsewhere.remove());
+  it("still returns there when the successor opens well after its predecessor unmounted", async () => {
     render(<Swapping />);
-    await openPicker("first");
-    // Unmounted while focused, with nothing mounting in its place.
-    act(() => close());
-    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-    elsewhere.focus();
-    act(() => swap());
-    await userEvent.click(screen.getByRole("button", { name: "Open picker" }));
-    const second = await screen.findByRole("combobox", { name: "second" });
-    await waitFor(() => expect(second).toHaveFocus());
+    const { trigger } = await openPicker("first");
+    await userEvent.keyboard("{Enter}");
+    act(() => swapClosed());
+    await act(async () => {
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 300);
+      });
+    });
+    dropFocus();
+    act(() => reopen());
+    await escapeFrom("second");
+    await waitFor(() => expect(trigger).toHaveFocus());
+  });
+
+  it("hands nothing to a picker that opens after its predecessor unmounted without an accept", async () => {
+    render(<Swapping handsOff={false} />);
+    const { trigger } = await openPicker("first");
+    act(() => swapClosed());
+    dropFocus();
+    act(() => reopen());
+    await escapeFrom("second");
+    expect(trigger).not.toHaveFocus();
+  });
+
+  it("hands nothing to an unrelated picker that opens right after the handing-off accept", async () => {
+    render(<Swapping />);
+    const { trigger } = await openPicker("first");
+    await userEvent.keyboard("{Enter}");
+    act(() => swapClosed());
+    dropFocus();
+    act(() => openOther());
+    await escapeFrom("other");
+    expect(trigger).not.toHaveFocus();
+    // The unrelated picker opening first discarded the handoff, so the successor gets none.
+    dropFocus();
+    act(() => reopen());
+    await escapeFrom("second");
+    expect(trigger).not.toHaveFocus();
+  });
+
+  it("withdraws the handoff when the user cancels before the successor opens", async () => {
+    render(<Swapping />);
+    const { trigger } = await openPicker("first");
+    await userEvent.keyboard("{Enter}");
     await userEvent.keyboard("{Escape}");
-    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-    await waitFor(() => expect(screen.getByRole("button", { name: "Open picker" })).toHaveFocus());
+    await waitFor(() => expect(screen.queryByRole("combobox", { name: "first" })).toBeNull());
+    await waitFor(() => expect(trigger).toHaveFocus());
+    act(() => swap());
+    dropFocus();
+    act(() => reopen());
+    await escapeFrom("second");
+    expect(trigger).not.toHaveFocus();
   });
 });
 

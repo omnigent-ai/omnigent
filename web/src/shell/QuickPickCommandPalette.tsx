@@ -12,13 +12,14 @@ import { Button } from "@/components/ui/button";
 import {
   type QuickPickAcceptResult,
   QuickPickDialog,
+  type QuickPickHandOff,
   type QuickPickItem,
   type QuickPickSegment,
 } from "@/components/ui/quick-pick";
 import { occurrenceRanges } from "@/components/ui/quick-pick/match";
 import { usePaletteCommandsStore } from "@/store/paletteCommands";
 import { useAppCommands } from "./appCommands";
-import { useQuickPickAppCommands } from "./quickPickAppCommands";
+import { SESSION_SWITCHER, useQuickPickAppCommands } from "./quickPickAppCommands";
 import type { CommandPaletteProps } from "./CommandPalette";
 import {
   type CommandRegion,
@@ -259,7 +260,7 @@ export function QuickPickCommandPalette({
     ? [{ sourceId: "page", ranking: "client", fuzzyMatching: "words", items: pageItems }]
     : rootSegments;
 
-  const accept = (item: QuickPickItem<PaletteRow>): QuickPickAcceptResult => {
+  const accept = (item: QuickPickItem<PaletteRow>): QuickPickAcceptResult | QuickPickHandOff => {
     const row = item.value;
     if (row.kind === "more") {
       setParkedId(row.lastRowId ?? null);
@@ -294,7 +295,7 @@ export function QuickPickCommandPalette({
       }
       if (command.keepsPaletteOpen) {
         command.run();
-        return "keepOpen";
+        return command.continuesAs ? { handOffTo: command.continuesAs } : "keepOpen";
       }
       // A command that moves focus runs once the palette has closed and restored it; it's read
       // again then, in case the close changed what applies.
@@ -378,6 +379,8 @@ export function QuickPickCommandPalette({
     <QuickPickDialog
       open={open}
       onOpenChange={onOpenChange}
+      // Go to Session… hands the palette's return target to the switcher opening in its place.
+      successorName={sessionsOnly ? SESSION_SWITCHER : undefined}
       // ⌘K steps with Ctrl-N/Ctrl-P, trading the query's readline caret keys for row steps.
       stepsWithCtrlNP
       // The full-screen sheet fills the visible viewport, clear of the title bar and home bar.

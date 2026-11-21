@@ -8,6 +8,7 @@ export {
   QuickPickDialog,
   type QuickPickDialogAcceptResult,
   type QuickPickDialogProps,
+  type QuickPickHandOff,
   type QuickPickHeading,
 } from "./QuickPickDialog";
 export { HighlightedText, type MatchHighlight } from "./HighlightedText";

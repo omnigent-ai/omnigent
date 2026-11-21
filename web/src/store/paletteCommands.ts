@@ -47,6 +47,11 @@ export interface PaletteCommand {
   movesFocus?: boolean;
   /** Run with the palette left open, for a command that switches its scope. */
   keepsPaletteOpen?: boolean;
+  /**
+   * With `keepsPaletteOpen`, the picker of this `successorName` that opens in the palette's
+   * place, such as the session switcher; it returns focus where the palette would.
+   */
+  continuesAs?: string;
   /** The shortcut that runs it outside the palette; its active chord shows at the row's end. */
   shortcut?: ShortcutId;
   /**
