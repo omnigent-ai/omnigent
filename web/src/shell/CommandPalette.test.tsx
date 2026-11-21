@@ -1,6 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { Conversation } from "@/hooks/useConversations";
 import { type ComponentProps, type ReactNode, useState } from "react";
 
@@ -646,6 +646,21 @@ describe("CommandPalette — mobile full-screen sheet", () => {
     expect(content?.className).not.toContain("top-1/4");
     // …and offers an explicit close affordance (no ⌘K/Esc hint on touch).
     expect(screen.getByLabelText("Close search")).toBeTruthy();
+  });
+
+  it("pins the mobile sheet to the top of the visible viewport in the iOS app", () => {
+    // The iOS app's dialogs center on the keyboard-aware viewport inline; the sheet must not.
+    vi.stubGlobal("omnigentNative", { kind: "ios" });
+    onTestFinished(() => {
+      vi.unstubAllGlobals();
+    });
+    setMobile(true);
+    renderPalette();
+
+    const style = (dialogContent() as HTMLElement | null)?.style;
+    expect(style?.top).toBe("0px");
+    expect(style?.height).toBe("var(--omnigent-viewport-height, 100dvh)");
+    expect(style?.maxHeight).toBe("var(--omnigent-viewport-height, 100dvh)");
   });
 
   it("keeps the centered dialog and shows no close button on desktop", () => {

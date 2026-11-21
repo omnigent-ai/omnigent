@@ -2,7 +2,7 @@
 // with fuzzy-ranked actions and keyboard navigation from the QuickPick list, and the
 // commands features on screen offer through `usePaletteCommands`, under their headings.
 
-import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { type CSSProperties, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { useStore } from "zustand";
 import { XIcon } from "lucide-react";
 import { useNavigate } from "@/lib/routing";
@@ -66,6 +66,15 @@ function pageStatusSummary(text: string): () => ReactNode {
     );
   };
 }
+
+/** The phone sheet fills the keyboard-aware viewport, clear of the title bar and home bar. */
+const MOBILE_SHEET_STYLE: CSSProperties = {
+  top: 0,
+  height: "var(--omnigent-viewport-height, 100dvh)",
+  maxHeight: "var(--omnigent-viewport-height, 100dvh)",
+  paddingTop: "var(--mac-titlebar-height, var(--omnigent-safe-top, 0px))",
+  paddingBottom: "var(--omnigent-safe-bottom, 0px)",
+};
 
 /** A blank icon slot, so session labels line up with the icon-prefixed actions. */
 const SESSION_ICON = <span aria-hidden className="size-4" />;
@@ -383,12 +392,13 @@ export function QuickPickCommandPalette({
       successorName={sessionsOnly ? SESSION_SWITCHER : undefined}
       // ⌘K steps with Ctrl-N/Ctrl-P, trading the query's readline caret keys for row steps.
       stepsWithCtrlNP
-      // The full-screen sheet fills the visible viewport, clear of the title bar and home bar.
       contentClassName={
         isMobile
-          ? "inset-x-0 top-0 flex h-(--omnigent-viewport-height,100dvh) max-h-(--omnigent-viewport-height,100dvh) w-full max-w-full translate-x-0 flex-col rounded-none border-0 pt-(--mac-titlebar-height,var(--omnigent-safe-top,0px)) pb-(--omnigent-safe-bottom,0px) shadow-none sm:max-w-full"
+          ? "inset-x-0 flex w-full max-w-full translate-x-0 flex-col rounded-none border-0 shadow-none sm:max-w-full"
           : "top-1/4 sm:max-w-2xl"
       }
+      // Inline, so it also wins over the iOS app's centering of dialogs on the visible viewport.
+      contentStyle={isMobile ? MOBILE_SHEET_STYLE : undefined}
       label={pageCopy?.label ?? label}
       heading={childPage && pageHeading ? { label: pageHeading } : undefined}
       onBack={childPage ? back : undefined}

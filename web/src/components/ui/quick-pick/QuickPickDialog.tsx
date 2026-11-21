@@ -1,9 +1,17 @@
-import { type ReactNode, useEffect, useLayoutEffect, useRef, useState } from "react";
+import {
+  type CSSProperties,
+  type ReactNode,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
 import { CompactShortcutKeys } from "@/components/ui/kbd";
 import { isBehindOpenLayer } from "@/lib/automaticFocus";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
+import { isIOSShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 
 import {
@@ -81,6 +89,8 @@ export interface QuickPickDialogProps<Value> extends Omit<
   /** Visually hidden dialog description. */
   description?: string;
   contentClassName?: string;
+  /** Inline geometry for the content, such as a full-screen phone sheet; it wins over the anchor. */
+  contentStyle?: CSSProperties;
   /** Classes for the backdrop, such as a clear one so a live preview shows through. */
   overlayClassName?: string;
   /** A header naming the picker's mode, such as a child page's subject. */
@@ -91,6 +101,15 @@ export interface QuickPickDialogProps<Value> extends Omit<
   successorName?: string;
 }
 
+// The iOS app's dialogs center on the keyboard-aware viewport inline; a picker hangs from near its
+// top instead, below the safe area, and stops short of the keyboard.
+const IOS_PICKER_TOP =
+  "max(calc(var(--omnigent-viewport-height, 100lvh) * 0.12), calc(var(--omnigent-safe-top, 0px) + 0.5rem))";
+const IOS_PICKER_ANCHOR: CSSProperties = {
+  top: IOS_PICKER_TOP,
+  maxHeight: `calc(var(--omnigent-viewport-height, 100lvh) - ${IOS_PICKER_TOP} - var(--omnigent-safe-bottom, 0px) - 0.5rem)`,
+};
+
 /** The standard modal QuickPick; an accepted close restores focus before running its `afterClose`. */
 export function QuickPickDialog<Value>({
   open,
@@ -98,6 +117,7 @@ export function QuickPickDialog<Value>({
   title,
   description,
   contentClassName,
+  contentStyle,
   overlayClassName,
   heading,
   onAccept,
@@ -278,6 +298,7 @@ export function QuickPickDialog<Value>({
           "top-[12vh] translate-y-0 gap-0 overflow-hidden rounded-xl p-0 sm:max-w-xl",
           contentClassName,
         )}
+        style={isIOSShell() ? { ...IOS_PICKER_ANCHOR, ...contentStyle } : contentStyle}
       >
         <DialogTitle className="sr-only">{title ?? quickPickProps.label}</DialogTitle>
         <DialogDescription className="sr-only">

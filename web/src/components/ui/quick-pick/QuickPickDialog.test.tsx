@@ -1,6 +1,6 @@
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { useState } from "react";
+import { type CSSProperties, useState } from "react";
 import { createPortal } from "react-dom";
 import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
@@ -145,6 +145,52 @@ describe("QuickPickDialog over other layers", () => {
     await userEvent.keyboard("{Enter}");
     await waitFor(() => expect(screen.queryByRole("combobox")).toBeNull());
     await waitFor(() => expect(trigger).toHaveFocus());
+  });
+});
+
+describe("QuickPickDialog in the iOS app", () => {
+  function Picker({ contentStyle }: { contentStyle?: CSSProperties }) {
+    return (
+      <QuickPickDialog
+        open
+        onOpenChange={() => undefined}
+        label="Pick"
+        contentStyle={contentStyle}
+        segments={commands}
+        query=""
+        onQueryChange={() => undefined}
+        emptyMessage="No results found"
+        onAccept={() => "keepOpen"}
+      />
+    );
+  }
+  const contentStyle = () =>
+    (document.querySelector("[data-quick-pick-dialog]") as HTMLElement | null)?.style;
+
+  it("hangs from near the top of the visible viewport, not its middle", () => {
+    vi.stubGlobal("omnigentNative", { kind: "ios" });
+    onTestFinished(() => {
+      vi.unstubAllGlobals();
+    });
+    render(<Picker />);
+    expect(contentStyle()?.top).toContain("var(--omnigent-viewport-height, 100lvh) * 0.12");
+    expect(contentStyle()?.top).not.toContain("/ 2");
+    expect(contentStyle()?.maxHeight).toContain("var(--omnigent-safe-bottom, 0px)");
+  });
+
+  it("lets the caller's geometry win, as a full-screen sheet needs", () => {
+    vi.stubGlobal("omnigentNative", { kind: "ios" });
+    onTestFinished(() => {
+      vi.unstubAllGlobals();
+    });
+    render(<Picker contentStyle={{ top: 0, maxHeight: "100dvh" }} />);
+    expect(contentStyle()?.top).toBe("0px");
+    expect(contentStyle()?.maxHeight).toBe("100dvh");
+  });
+
+  it("leaves other platforms on its classes", () => {
+    render(<Picker />);
+    expect(contentStyle()?.top).toBe("");
   });
 });
 
