@@ -385,6 +385,29 @@ class TestBuildAgyLaunch:
         )
         assert argv.count(_SKIP_FLAG) == 1
 
+    def test_user_skip_flag_is_the_only_bypass_on_the_runner_path(self, fake_agy: str) -> None:
+        """The runner passes no permission mode: a user-passed flag is the sole bypass source."""
+        argv, _ = build_agy_launch(
+            conversation_id=None,
+            model=None,
+            resume=False,
+            permission_mode=None,
+            headless=False,
+            extra_args=(_SKIP_FLAG,),
+        )
+        assert argv.count(_SKIP_FLAG) == 1
+
+    def test_user_skip_flag_is_not_duplicated_by_bypass_mode(self, fake_agy: str) -> None:
+        """bypassPermissions plus an explicit user flag still yields one flag."""
+        argv, _ = build_agy_launch(
+            conversation_id=None,
+            model=None,
+            resume=False,
+            permission_mode="bypassPermissions",
+            extra_args=(_SKIP_FLAG,),
+        )
+        assert argv.count(_SKIP_FLAG) == 1
+
 
 # ---------------------------------------------------------------------------
 # should_skip_permissions
