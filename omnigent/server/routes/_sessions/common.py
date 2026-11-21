@@ -633,6 +633,9 @@ _WATCHER_TASKS: set[asyncio.Task[None]] = set()
 
 _session_status_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 
+# Only in-flight recoveries retain a token; a newer status or cause invalidates it.
+_session_recovery_tokens: WorkspaceScopedCache[str, object] = WorkspaceScopedCache()
+
 
 @dataclass
 class _RunnerStatusProbeBackoff:
