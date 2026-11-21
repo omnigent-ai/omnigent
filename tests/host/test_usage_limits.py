@@ -126,7 +126,8 @@ def probe_host(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
     log = tmp_path / "calls.log"
     claude = tmp_path / "claude"
-    claude.write_text(f"""#!{sys.executable}
+    claude.write_text(f"""#!/bin/sh
+"exec" "{sys.executable}" "$0" "$@"
 import json, os, subprocess, sys, time
 assert tuple(sys.argv[1:]) == {usage_limits.CLAUDE_PROBE_ARGS!r}, sys.argv
 assert os.environ["ENABLE_CLAUDEAI_MCP_SERVERS"] == "false"
@@ -178,7 +179,8 @@ for line in sys.stdin:
         time.sleep(60)
 """)
     codex = tmp_path / "codex"
-    codex.write_text(f"""#!{sys.executable}
+    codex.write_text(f"""#!/bin/sh
+"exec" "{sys.executable}" "$0" "$@"
 import json, os, sys
 assert tuple(sys.argv[1:]) == {usage_limits.CODEX_PROBE_ARGS!r}, sys.argv
 with open({str(log)!r}, "a") as log:

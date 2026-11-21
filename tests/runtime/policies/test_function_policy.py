@@ -144,6 +144,47 @@ async def test_sync_callable_allow() -> None:
 
 
 @pytest.mark.asyncio
+async def test_function_policy_new_and_bind_agent_spec_safe_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Instances created via ``__new__`` (e.g. ``make_fixed_policy``) or with
+    ``needs_sub_agent_providers`` safely handle ``bind_agent_spec`` and evaluation."""
+    from omnigent.host import usage_limits
+
+    fixed = make_fixed_policy("fixed_allow", action=PolicyAction.ALLOW)
+    fixed.bind_agent_spec(object())
+    fixed_result = await fixed.evaluate(
+        EvaluationContext(phase=Phase.REQUEST, content="hi"),
+        {"labels": {}, "conversation_id": "c"},
+    )
+    assert fixed_result.action == PolicyAction.ALLOW
+
+    monkeypatch.setattr(
+        usage_limits,
+        "subscription_providers_for_spec",
+        lambda _spec: {"claude_code": "claude", "pi": None},
+    )
+    captured: dict[str, Any] = {}
+
+    def capture_fn(event: dict[str, Any]) -> dict[str, Any]:
+        captured.update(event.get("context") or {})
+        return {"result": "allow"}
+
+    bound_policy = FunctionPolicy(
+        _spec(name="sub_guard"),
+        capture_fn,
+        needs_sub_agent_providers=True,
+    )
+    bound_policy.bind_agent_spec(object())
+    bound_result = await bound_policy.evaluate(
+        EvaluationContext(phase=Phase.TOOL_CALL, content={"name": "sys_session_send"}),
+        {"labels": {}, "conversation_id": "c"},
+    )
+    assert bound_result.action == PolicyAction.ALLOW
+    assert captured.get("sub_agent_providers") == {"claude_code": "claude", "pi": None}
+
+
+@pytest.mark.asyncio
 async def test_sync_callable_block() -> None:
     """Ports omnigent ``test_sync_callable_block``. A sync
     function that returns DENY blocks."""

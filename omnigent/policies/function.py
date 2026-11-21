@@ -90,6 +90,10 @@ class FunctionPolicy(Policy):
         (dict-form spec).
     """
 
+    runtime_state_keys: frozenset[str] = frozenset()
+    _needs_sub_agent_providers: bool = False
+    _sub_agent_providers: dict[str, str | None] | None = None
+
     def __init__(
         self,
         spec: FunctionPolicySpec,
@@ -116,7 +120,7 @@ class FunctionPolicy(Policy):
 
     def bind_agent_spec(self, agent_spec: object | None) -> None:
         """Attach sub-agent provider metadata from *agent_spec* when needed by this policy."""
-        if not self._needs_sub_agent_providers or agent_spec is None:
+        if not getattr(self, "_needs_sub_agent_providers", False) or agent_spec is None:
             return
         from omnigent.host.usage_limits import subscription_providers_for_spec
 
@@ -192,10 +196,11 @@ class FunctionPolicy(Policy):
             ``{"result": ..., "reason": ...}`` dict).
         """
         event = _build_event(ctx)
-        if self._sub_agent_providers is not None:
+        sub_agent_providers = getattr(self, "_sub_agent_providers", None)
+        if sub_agent_providers is not None:
             raw_ctx = event.get("context")
             if isinstance(raw_ctx, dict) and "sub_agent_providers" not in raw_ctx:
-                raw_ctx["sub_agent_providers"] = dict(self._sub_agent_providers)
+                raw_ctx["sub_agent_providers"] = dict(sub_agent_providers)
         args: tuple[object, ...]
         if self._arity >= 2:
             args = (event, self._config)
