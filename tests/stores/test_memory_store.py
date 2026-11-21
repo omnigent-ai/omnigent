@@ -29,33 +29,32 @@ def store(db_uri: str) -> MemoryStore:
 class TestSqlAlchemyMemoryStore(MemoryStoreConformance):
     """The shared backend contract against SQLAlchemy."""
 
-    def test_lists_in_path_order_across_pages(self, store: MemoryStore) -> None:
+    async def test_lists_in_path_order_across_pages(self, store: MemoryStore) -> None:
         for path in ("/b", "/a/z", "/a", "/c", "/a/b"):
-            store.write(ALICE, path, "x")
+            await store.write(ALICE, path, "x")
 
-        first = store.list(ALICE, page_size=3)
-        second = store.list(ALICE, page_size=3, page_token=first.next_page_token)
+        first = await store.list(ALICE, page_size=3)
+        second = await store.list(ALICE, page_size=3, page_token=first.next_page_token)
 
         assert [e.path for e in first.entries] == ["/a", "/a/b", "/a/z"]
         assert [e.path for e in second.entries] == ["/b", "/c"]
         assert second.next_page_token is None
 
-    def test_paths_compare_byte_for_byte(self, store: MemoryStore) -> None:
-        store.write(ALICE, "/Projects/api", "upper")
-        store.write(ALICE, "/projects/api", "lower")
+    async def test_paths_compare_byte_for_byte(self, store: MemoryStore) -> None:
+        await store.write(ALICE, "/Projects/api", "upper")
+        await store.write(ALICE, "/projects/api", "lower")
 
-        assert [e.path for e in store.list(ALICE, path_prefix="/projects").entries] == [
-            "/projects/api"
-        ]
-        loaded = store.get(ALICE, "/Projects/api")
+        listed = await store.list(ALICE, path_prefix="/projects")
+        assert [e.path for e in listed.entries] == ["/projects/api"]
+        loaded = await store.get(ALICE, "/Projects/api")
         assert loaded is not None
         assert loaded.content == "upper"
 
-    def test_a_concurrent_first_write_becomes_a_replacement(
+    async def test_a_concurrent_first_write_becomes_a_replacement(
         self, store: MemoryStore, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Another writer inserts the path between this write's read and its insert."""
-        first = store.write(ALICE, "/race", "theirs")
+        first = await store.write(ALICE, "/race", "theirs")
         real_get = Session.get
         misses = []
 
@@ -68,27 +67,27 @@ class TestSqlAlchemyMemoryStore(MemoryStoreConformance):
 
         monkeypatch.setattr(Session, "get", stale_get)
 
-        written = store.write(ALICE, "/race", "ours")
+        written = await store.write(ALICE, "/race", "ours")
 
         assert misses
         assert written.content == "ours"
         assert written.created_at == first.created_at
-        loaded = store.get(ALICE, "/race")
+        loaded = await store.get(ALICE, "/race")
         assert loaded is not None
         assert loaded.content == "ours"
 
-    def test_search_is_not_offered(self, store: MemoryStore) -> None:
-        store.write(ALICE, "/a", "hello")
+    async def test_search_is_not_offered(self, store: MemoryStore) -> None:
+        await store.write(ALICE, "/a", "hello")
 
         assert store.supports_search is False
         with pytest.raises(OmnigentError) as excinfo:
-            store.search(ALICE, "hello")
+            await store.search(ALICE, "hello")
         assert excinfo.value.code == ErrorCode.NOT_FOUND
 
-    def test_content_is_stored_compressed_within_the_column_bound(
+    async def test_content_is_stored_compressed_within_the_column_bound(
         self, store: MemoryStore, db_uri: str
     ) -> None:
-        store.write(ALICE, "/big", largest_hard_to_compress_content())
+        await store.write(ALICE, "/big", largest_hard_to_compress_content())
 
         with get_or_create_engine(db_uri).connect() as connection:
             stored = connection.execute(
@@ -98,14 +97,14 @@ class TestSqlAlchemyMemoryStore(MemoryStoreConformance):
             ).scalar_one()
         assert len(stored) <= MEMORY_CONTENT_MAX_STORED_BYTES
 
-    def test_every_listing_query_reads_one_primary_key_range(
+    async def test_every_listing_query_reads_one_primary_key_range(
         self, store: MemoryStore, db_uri: str
     ) -> None:
         engine = get_or_create_engine(db_uri)
         if engine.dialect.name != "sqlite":
             pytest.skip("reads SQLite's query plans")
         for path in ("/p", "/p/a", "/p/b", "/p/c", "/q"):
-            store.write(ALICE, path, "x")
+            await store.write(ALICE, path, "x")
         statements: list[tuple[str, object]] = []
 
         def record(_conn, _cursor, statement, parameters, _context, _executemany) -> None:
@@ -114,9 +113,11 @@ class TestSqlAlchemyMemoryStore(MemoryStoreConformance):
 
         sa.event.listen(engine, "before_cursor_execute", record)
         try:
-            first = store.list(ALICE, path_prefix="/p", page_size=2)
-            store.list(ALICE, path_prefix="/p", page_size=2, page_token=first.next_page_token)
-            store.list(ALICE, page_size=2, page_token="/p/a")
+            first = await store.list(ALICE, path_prefix="/p", page_size=2)
+            await store.list(
+                ALICE, path_prefix="/p", page_size=2, page_token=first.next_page_token
+            )
+            await store.list(ALICE, page_size=2, page_token="/p/a")
         finally:
             sa.event.remove(engine, "before_cursor_execute", record)
         with engine.connect() as connection:
