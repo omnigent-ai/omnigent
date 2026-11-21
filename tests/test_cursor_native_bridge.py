@@ -330,6 +330,9 @@ class TestHooksConfig:
             Path("/tmp/bridge"), python_executable="/usr/bin/python3"
         )
         assert cfg["version"] == 1
+        start_command = cfg["hooks"]["beforeSubmitPrompt"][0]["command"]
+        assert "record-turn-start" in start_command
+        assert "/tmp/bridge" in start_command
         hooks = cfg["hooks"]["stop"]
         assert len(hooks) == 1
         command = hooks[0]["command"]
@@ -348,6 +351,7 @@ class TestHooksConfig:
         command = cfg["hooks"]["stop"][0]["command"]
         # A shell-quoted path keeps the spaced bridge dir a single argv token.
         assert "'/tmp/dir with space'" in command
+        assert "'/tmp/dir with space'" in cfg["hooks"]["beforeSubmitPrompt"][0]["command"]
 
     def test_write_hooks_config_writes_project_scoped_file(self, tmp_path: Path) -> None:
         import json
