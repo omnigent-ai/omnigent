@@ -570,6 +570,25 @@ def read_claude_managed_settings(
     return None
 
 
+def claude_sideload_flags_disabled(
+    paths: tuple[Path, ...] | None = None,
+) -> bool:
+    """Return whether Claude Code's managed policy forbids sideload flags.
+
+    Claude Code rejects ``--plugin-dir`` and ``--plugin-url`` at startup when
+    ``disableSideloadFlags`` is enabled. Omnigent must therefore avoid adding
+    its agent-bundle plugin flag under that policy; otherwise an otherwise
+    usable Claude SDK or native session fails before its first turn.
+
+    :param paths: Managed settings files to read, highest precedence first.
+        Defaults to :data:`CLAUDE_CODE_MANAGED_SETTINGS_PATHS`.
+    :returns: ``True`` only when the effective managed settings explicitly set
+        ``disableSideloadFlags`` to boolean ``true``.
+    """
+    payload = read_claude_managed_settings(paths)
+    return payload is not None and payload.get("disableSideloadFlags") is True
+
+
 def read_claude_user_settings(cwd: str | None = None) -> dict[str, object] | None:
     """Return Claude Code's user ``settings.json``, parsed.
 

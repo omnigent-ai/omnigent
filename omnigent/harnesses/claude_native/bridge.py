@@ -3217,13 +3217,24 @@ def augment_claude_args(
     args = _merge_allowed_tools(args, allowed_tools)
     settings_path = bridge_dir / _INVOCATION_SETTINGS_FILE
     _write_json_file(settings_path, hook_settings)
-    from omnigent.onboarding.ambient import claude_code_managed_mcp_present
+    from omnigent.onboarding.ambient import (
+        claude_code_managed_mcp_present,
+        claude_sideload_flags_disabled,
+    )
 
-    if claude_code_managed_mcp_present():
+    managed_mcp_present = claude_code_managed_mcp_present()
+    sideload_flags_disabled = claude_sideload_flags_disabled()
+    if managed_mcp_present:
         # Claude Code exits at startup on --mcp-config while an enterprise MCP config
         # exists; its relay entry reads the bridge from claude_terminal_relay_env.
         if not managed_mcp_relay_configured():
             _logger.warning(MANAGED_MCP_RELAY_MISSING_WARNING)
+    elif sideload_flags_disabled:
+        # Claude Code rejects an inline MCP config under the sideload policy.
+        _logger.warning(
+            "Claude Code has disableSideloadFlags managed policy; launching "
+            "without Omnigent's MCP tools."
+        )
     else:
         mcp_config = build_mcp_config(bridge_dir, python_executable=python_executable)
         args.extend(["--mcp-config", json.dumps(mcp_config, separators=(",", ":"))])

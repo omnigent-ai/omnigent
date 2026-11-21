@@ -2654,7 +2654,13 @@ class ClaudeSDKExecutor(Executor):
         # ``--plugin-dir <bundle>`` produces clean
         # ``<agent-name>:<skill-name>`` labels in Claude's skill
         # listing instead of the auto-derived tmpdir basename.
-        if self._bundle_dir is not None and (self._bundle_dir / "skills").is_dir():
+        from omnigent.onboarding.ambient import claude_sideload_flags_disabled
+
+        if (
+            self._bundle_dir is not None
+            and (self._bundle_dir / "skills").is_dir()
+            and not claude_sideload_flags_disabled()
+        ):
             try:
                 ensure_bundle_plugin_manifest(self._bundle_dir, self._agent_name)
             except OSError as exc:
@@ -4271,13 +4277,21 @@ class ClaudeSDKExecutor(Executor):
         # ``name`` (and thus the skill-listing prefix) comes from
         # the manifest written at construction time.
         bundle_plugins: list[Any] = []  # type: ignore[explicit-any]  # SdkPluginConfig is a TypedDict — typed Any here to keep the import lazy
+        from omnigent.onboarding.ambient import claude_sideload_flags_disabled
+
         plugin_dir = (
             self._prepared_cli.plugin_dir
             if self._prepared_cli is not None and self._prepared_cli.sandboxed
             else self._bundle_dir
         )
         if plugin_dir is not None and (plugin_dir / "skills").is_dir():
-            bundle_plugins.append({"type": "local", "path": str(plugin_dir)})
+            if claude_sideload_flags_disabled():
+                logger.warning(
+                    "Claude Code has disableSideloadFlags managed policy; launching "
+                    "without bundled skills."
+                )
+            else:
+                bundle_plugins.append({"type": "local", "path": str(plugin_dir)})
         if resolved.setting_sources == [] and not self._gateway and not brokered:
             env = {**_claude_user_settings_env(self._cwd), **env}
         max_output_tokens = cfg.extra.get("max_tokens")
