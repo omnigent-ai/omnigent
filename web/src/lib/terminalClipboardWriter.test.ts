@@ -1,7 +1,9 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import type * as ClipboardModule from "./clipboard";
 import {
   isTerminalClipboardWritePending,
   queueTerminalClipboardWrite,
+  writeExplicitTerminalClipboardText,
 } from "./terminalClipboardWriter";
 
 const clipboardMock = vi.hoisted(() => ({
@@ -13,6 +15,8 @@ beforeEach(() => {
   expect(isTerminalClipboardWritePending()).toBe(false);
   clipboardMock.copyText.mockReset().mockResolvedValue(undefined);
 });
+
+const alwaysAllowed = () => true;
 
 function request(text: string, isCurrent = () => true) {
   return { text, isCurrent, onResult: vi.fn<(copied: boolean) => void>() };
@@ -43,6 +47,111 @@ describe("terminal clipboard writer", () => {
     expect(isTerminalClipboardWritePending()).toBe(true);
     await expectIdle();
     expect(write.onResult).toHaveBeenCalledWith(true);
+  });
+
+  it("starts an explicit copy at once and drops the program copies it replaces", async () => {
+    const first = deferredCopy();
+    const inFlight = request("first");
+    const queued = request("queued program text");
+    queueTerminalClipboardWrite(inFlight);
+    queueTerminalClipboardWrite(queued);
+    const explicit = writeExplicitTerminalClipboardText("chosen text", alwaysAllowed);
+    expect(clipboardMock.copyText.mock.calls).toEqual([["first"], ["chosen text"]]);
+    await expect(explicit).resolves.toBe(true);
+    // The superseded copy finishes last, so the chosen text is written again.
+    first.resolve();
+    await expectIdle();
+    expect(clipboardMock.copyText.mock.calls).toEqual([
+      ["first"],
+      ["chosen text"],
+      ["chosen text"],
+    ]);
+    expect(inFlight.onResult).not.toHaveBeenCalled();
+    expect(queued.onResult).not.toHaveBeenCalled();
+  });
+
+  it("does not restore a copy the user has since blocked", async () => {
+    const first = deferredCopy();
+    let copyAllowed = true;
+    queueTerminalClipboardWrite(request("first"));
+    await expect(
+      writeExplicitTerminalClipboardText("chosen text", () => copyAllowed),
+    ).resolves.toBe(true);
+    copyAllowed = false;
+    first.resolve();
+    await expectIdle();
+    expect(clipboardMock.copyText.mock.calls).toEqual([["first"], ["chosen text"]]);
+  });
+
+  it("drops the result of a superseded program copy that fails", async () => {
+    const first = deferredCopy();
+    const inFlight = request("first");
+    queueTerminalClipboardWrite(inFlight);
+    await expect(writeExplicitTerminalClipboardText("chosen text", alwaysAllowed)).resolves.toBe(
+      true,
+    );
+    first.reject();
+    await expectIdle();
+    expect(inFlight.onResult).not.toHaveBeenCalled();
+    expect(clipboardMock.copyText.mock.calls).toEqual([["first"], ["chosen text"]]);
+  });
+
+  it("starts an explicit copy synchronously when nothing is in flight", async () => {
+    const explicit = writeExplicitTerminalClipboardText("chosen text", alwaysAllowed);
+    expect(clipboardMock.copyText).toHaveBeenCalledWith("chosen text");
+    clipboardMock.copyText.mockRejectedValueOnce(new Error("browser denied"));
+    await expect(explicit).resolves.toBe(true);
+    await expect(writeExplicitTerminalClipboardText("denied", alwaysAllowed)).resolves.toBe(false);
+    await expectIdle();
+  });
+
+  it("lets a program copy that arrives during an explicit copy follow it", async () => {
+    const explicitCopy = deferredCopy();
+    const explicit = writeExplicitTerminalClipboardText("chosen text", alwaysAllowed);
+    const later = request("later program text");
+    queueTerminalClipboardWrite(later);
+    expect(clipboardMock.copyText.mock.calls).toEqual([["chosen text"], ["later program text"]]);
+    explicitCopy.resolve();
+    await expect(explicit).resolves.toBe(true);
+    await expectIdle();
+    expect(later.onResult).toHaveBeenCalledWith(true);
+  });
+
+  it("is not overwritten by an older program copy whose late fallback succeeds", async () => {
+    const { copyText } = await vi.importActual<typeof ClipboardModule>("./clipboard");
+    clipboardMock.copyText.mockImplementation(copyText);
+    let clipboard = "";
+    let rejectProgramWrite!: () => void;
+    const writeText = vi
+      .fn<(text: string) => Promise<void>>()
+      .mockImplementationOnce(
+        () =>
+          new Promise<void>((_resolve, reject) => {
+            rejectProgramWrite = () => reject(new Error("browser denied"));
+          }),
+      )
+      .mockImplementation(async (text) => {
+        clipboard = text;
+      });
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    const execCommand = vi.fn(() => {
+      clipboard = (document.activeElement as HTMLTextAreaElement).value;
+      return true;
+    });
+    Object.defineProperty(document, "execCommand", { configurable: true, value: execCommand });
+    onTestFinished(() => {
+      Reflect.deleteProperty(navigator, "clipboard");
+      Reflect.deleteProperty(document, "execCommand");
+    });
+
+    queueTerminalClipboardWrite(request("program text"));
+    const explicit = writeExplicitTerminalClipboardText("chosen text", alwaysAllowed);
+    rejectProgramWrite();
+
+    await expect(explicit).resolves.toBe(true);
+    await expectIdle();
+    expect(execCommand).toHaveBeenCalledOnce();
+    expect(clipboard).toBe("chosen text");
   });
 
   it("serializes writers and keeps only the latest pending text", async () => {
