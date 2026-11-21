@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: omnigent
+spec:
+  strategy:
+    type: Recreate
+    rollingUpdate: null
+  template:
+    spec:
+      serviceAccountName: omnigent-substrate
+      automountServiceAccountToken: false
+      containers:
+        - name: omnigent
+          env:
+            - name: OMNIGENT_CONFIG
+              value: /etc/omnigent/config.yaml
+          volumeMounts:
+            - name: sandbox-config
+              mountPath: /etc/omnigent
+              readOnly: true
+            - name: substrate-identity
+              mountPath: /var/run/substrate
+              readOnly: true
+      volumes:
+        - name: sandbox-config
+          configMap:
+            name: omnigent-substrate-config
+        - name: substrate-identity
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: api.ate-system.svc
+                  path: api-token
+              - clusterTrustBundle:
+                  signerName: servicedns.podcert.ate.dev/identity
+                  labelSelector:
+                    matchLabels:
+                      podcert.ate.dev/canarying: live
+                  path: serving-ca.pem
+              - podCertificate:
+                  signerName: podidentity.podcert.ate.dev/identity
+                  keyType: ECDSAP256
+                  credentialBundlePath: router-identity.pem

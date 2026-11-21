@@ -55,6 +55,7 @@ import yaml
 
 from omnigent.host.identity import HOST_TOKEN_ENV_VAR as _HOST_TOKEN_ENV_VAR
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
+from omnigent.host.identity_env import HOST_TOKEN_FILE_ENV_VAR as HOST_TOKEN_FILE_ENV
 from omnigent.host.identity_env import in_managed_sandbox
 from omnigent.telemetry.request_headers import client_identity_headers
 
@@ -151,15 +152,24 @@ def _install_broker_helper(server_url: str, host_id: str, token: str) -> None:
     would vend first and silently bypass the per-user broker. An empty value
     clears the inherited chain for github.com, so only the broker remains.
 
+    When HOST_TOKEN_FILE_ENV names a bootstrap-owned private file, persist only
+    its path instead. This keeps snapshot-backed HOME free of the launch token.
+
     Idempotent by ``--replace-all``: the workspace-prep init container and the
     host both wire the broker into the same shared ~/.gitconfig (and the host
     re-runs on every resume). A plain set can't overwrite the 2+ values that
     leaves, so without ``--replace-all`` broker entries would pile up.
     """
+    token_file = os.environ.get(HOST_TOKEN_FILE_ENV)
+    credential = (
+        f"--host-token-file {shlex.quote(token_file)}"
+        if token_file
+        else f"--host-token {shlex.quote(token)}"
+    )
     helper = (
         "!python3 -m omnigent.git_credential_github "
         f"--server {shlex.quote(server_url)} --host-id {shlex.quote(host_id)} "
-        f"--host-token {shlex.quote(token)}"
+        f"{credential}"
     )
     _git_config("--replace-all", "credential.https://github.com.helper", "")
     _git_config("--add", "credential.https://github.com.helper", helper)
@@ -399,7 +409,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--server", required=True)
     parser.add_argument("--host-id", required=True)
-    parser.add_argument("--host-token", required=True)
+    credential = parser.add_mutually_exclusive_group(required=True)
+    credential.add_argument("--host-token")
+    credential.add_argument("--host-token-file", type=Path)
     # git passes the operation (get/store/erase) as the first positional arg.
     parser.add_argument("operation", nargs="?", default="get")
     args, _ = parser.parse_known_args(argv)
@@ -417,7 +429,15 @@ def main(argv: list[str] | None = None) -> int:
     if request.get("host") != "github.com" or request.get("protocol") != "https":
         return 0
 
-    cred = _fetch_credential(args.server, args.host_id, args.host_token)
+    host_token = args.host_token
+    if args.host_token_file is not None:
+        try:
+            host_token = args.host_token_file.read_text().strip()
+        except OSError:
+            return 0
+        if not host_token:
+            return 0
+    cred = _fetch_credential(args.server, args.host_id, host_token)
     if cred is None:
         return 0  # decline; git tries the next helper / prompts
     username, token = cred

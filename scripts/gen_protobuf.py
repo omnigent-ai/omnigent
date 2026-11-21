@@ -3,7 +3,7 @@
 Each API ships a protobuf schema (e.g. ``omnigent/api/routing/v1/routing.proto``)
 and the runtime imports its generated modules: ``*_pb2`` for messages, plus
 ``*_connect`` (Connect RPC server and client stubs) for schemas that declare a
-service. Schemas that declare a service also get TypeScript bindings
+service. Owned schemas that declare a service also get TypeScript bindings
 (``*_pb.js`` and ``*_pb.d.ts``, from ``protoc-gen-es``) under ``web/src/gen/``,
 which the web client imports. Generated code is checked in (so a plain
 ``pip install`` / editor / type checker sees it without a build step), and this
@@ -14,7 +14,8 @@ It shells out to ``grpc_tools.protoc`` (the ``grpcio-tools`` dev dependency),
 which bundles both the compiler and the well-known-type protos, so imports such
 as ``google/protobuf/struct.proto`` resolve with no system ``protoc`` install.
 Service stubs come from the ``protoc-gen-connectrpc`` plugin (also a dev
-dependency), which emits nothing for schemas without a service.
+dependency), which emits nothing for schemas without a service. The vendored
+Substrate schema uses gRPC descriptors directly and needs only message bindings.
 
 Pass ``--check`` to verify the committed bindings are up to date without
 writing: it regenerates into a temp dir, compares, and exits non-zero (printing
@@ -32,6 +33,7 @@ from __future__ import annotations
 import argparse
 import filecmp
 import importlib.util
+import re
 import shutil
 import subprocess
 import sys
@@ -56,8 +58,18 @@ def _protos() -> list[Path]:
 
 
 def _services() -> list[Path]:
-    """The API schemas that declare a service: the ones clients call."""
-    return [p for p in _protos() if "\nservice " in (_REPO_ROOT / p).read_text()]
+    """Owned API schemas that declare a service for web clients."""
+    return [
+        proto
+        for proto in _protos()
+        if not proto.is_relative_to(_API_ROOT / "substrate")
+        and "\nservice " in (_REPO_ROOT / proto).read_text()
+    ]
+
+
+def normalize_stub(text: str) -> str:
+    """Protoc marks extension-number globals ClassVar, which is class-only."""
+    return re.sub(r"(?m)^(\w+: )_ClassVar\[([^\n]+)\]$", r"\1\2", text)
 
 
 def _run_protoc(out_dir: Path) -> None:
@@ -74,17 +86,28 @@ def _run_protoc(out_dir: Path) -> None:
         )
     protoc = [sys.executable, "-m", "grpc_tools.protoc", f"--proto_path={_REPO_ROOT}"]
     (out_dir / _TS_OUT).mkdir(parents=True)
-    cmd = [
-        *protoc,
-        f"--python_out={out_dir}",
-        f"--pyi_out={out_dir}",
-        f"--plugin=protoc-gen-connectrpc={_CONNECT_PLUGIN}",
-        f"--connectrpc_out={out_dir}",
-        # Stubs use the google protobuf messages that ``--python_out`` emits.
-        "--connectrpc_opt=protobuf=google",
-        *(str(p) for p in _protos()),
-    ]
-    subprocess.run(cmd, check=True, cwd=_REPO_ROOT)
+    for proto in _protos():
+        cmd = [
+            *protoc,
+            f"--python_out={out_dir}",
+            f"--pyi_out={out_dir}",
+        ]
+        # Substrate uses gRPC descriptors, not Connect client/server stubs.
+        if not proto.is_relative_to(_API_ROOT / "substrate"):
+            cmd.extend(
+                [
+                    f"--plugin=protoc-gen-connectrpc={_CONNECT_PLUGIN}",
+                    f"--connectrpc_out={out_dir}",
+                    "--connectrpc_opt=protobuf=google",
+                ]
+            )
+        cmd.append(str(proto))
+        subprocess.run(cmd, check=True, cwd=_REPO_ROOT)
+        stub = out_dir / proto.with_name(f"{proto.stem}_pb2.pyi")
+        original = stub.read_text()
+        normalized = normalize_stub(original)
+        if normalized != original:
+            stub.write_text(normalized)
     ts_cmd = [
         *protoc,
         f"--plugin=protoc-gen-es={_ES_PLUGIN}",

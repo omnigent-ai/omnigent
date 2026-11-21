@@ -47,7 +47,7 @@ from typing import TYPE_CHECKING
 import httpx
 
 from omnigent.host.identity import HOST_TOKEN_ENV_VAR, MANAGED_HOST_TOKEN_HEADER
-from omnigent.host.identity_env import in_managed_sandbox
+from omnigent.host.identity_env import HOST_TOKEN_FILE_ENV_VAR, in_managed_sandbox
 from omnigent.telemetry.request_headers import client_identity_headers
 
 if TYPE_CHECKING:
@@ -186,6 +186,10 @@ def _write_sidecar(
         "host_token": host_token,
         "workspace_host": workspace_host,
     }
+    token_file = os.environ.get(HOST_TOKEN_FILE_ENV_VAR)
+    if token_file:
+        payload.pop("host_token")
+        payload["host_token_file"] = token_file
     temporary_path: Path | None = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -217,6 +221,14 @@ def _read_sidecar(path: Path) -> dict[str, str] | None:
         return None
     if not isinstance(data, dict):
         return None
+    token_file = data.get("host_token_file")
+    if token_file is not None:
+        if not isinstance(token_file, str) or not token_file:
+            return None
+        try:
+            data["host_token"] = Path(token_file).read_text().strip()
+        except OSError:
+            return None
     coords = {key: data.get(key) for key in _SIDECAR_KEYS}
     if not all(isinstance(value, str) and value for value in coords.values()):
         return None

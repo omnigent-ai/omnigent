@@ -561,6 +561,9 @@ class SandboxLifecycle(ABC):
     # Provider ID learned during start; managed launch persists it over the reserved ID.
     started_sandbox_id: str | None = None
 
+    # Optional credential digest reported by a private, generation-bound bootstrap.
+    preserved_host_token_hash: str | None = None
+
     @abstractmethod
     def prepare(self) -> None:
         """
@@ -590,6 +593,14 @@ class SandboxLifecycle(ABC):
             ``"lovable-wattlebird-1530"``.
         :raises click.ClickException: If provisioning fails.
         """
+
+    def materialize(self, sandbox_id: str) -> str:
+        """Allocate a reserved sandbox after host registration, before activation.
+
+        Return its concrete identity so the managed host stores ownership before
+        any workload can connect. Providers allocating elsewhere keep the default.
+        """
+        return sandbox_id
 
     def attach(self, sandbox_id: str) -> None:
         """
@@ -697,6 +708,10 @@ class SandboxLifecycle(ABC):
             "own tooling."
         )
 
+    def wait_for_idle(self, sandbox_id: str, generation: str) -> None:
+        """Confirm an acknowledged host quiescence has finished all process cleanup."""
+        raise self._capability_error("confirm idle quiescence")
+
     def stop(self, sandbox_id: str) -> None:
         """
         Stop a sandbox's compute without deleting it, so :meth:`resume` can
@@ -758,6 +773,15 @@ class SandboxLifecycle(ABC):
         :raises click.ClickException: If the resume fails.
         """
         raise self._capability_error("resume a stopped sandbox")
+
+    def resume_keeps_host(self, sandbox_id: str) -> bool:
+        """Whether this wake must keep the existing host process and credential.
+
+        Providers may restore compute to inspect the surviving bootstrap before
+        credential rotation, but must not start a new host here. The default
+        describes snapshot-preserving providers.
+        """
+        return self.capabilities.resume_preserves_host
 
     def is_running(self, sandbox_id: str) -> bool | None:
         """
