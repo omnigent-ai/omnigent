@@ -471,7 +471,7 @@ function TicketDetails({
                     ))}
                   </SelectContent>
                 </Select>
-                <TicketTags tags={ticket.tags} />
+                {ticket.tags.length > 0 && <TicketTags tags={ticket.tags} />}
                 <TagEditor
                   tags={ticket.tags}
                   disabled={update.isPending}
