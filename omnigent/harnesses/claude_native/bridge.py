@@ -5860,10 +5860,10 @@ def inject_slash_command(
             dialog_hint=dialog_hint,
             guard=guard,
         )
+        _await_draft_restored(socket_path, tmux_target, guard=guard)
     except BaseException:
         _put_draft_back(socket_path, tmux_target, guard=guard, needle=_submit_needle(command))
         raise
-    _await_draft_restored(socket_path, tmux_target, guard=guard)
 
 
 def _deliver_slash_command(

@@ -330,6 +330,25 @@ async def test_a_message_the_persons_draft_refused_says_why_then_waits_for_it(
 
 
 @pytest.mark.asyncio
+async def test_a_draft_that_refuses_the_message_again_is_announced_once(
+    pane: _Pane, tmp_path: Path
+) -> None:
+    """Each refused attempt holds the message again; the sender is told once, and it goes once."""
+    pane.refusals = [
+        ClaudeComposerHoldsDraft("nothing was sent", stash_in_use=False) for _ in range(3)
+    ]
+
+    events = await _run(tmp_path)
+
+    assert events == [
+        TextChunk(text=claude_native_executor._DRAFT_HOLD_MESSAGE),
+        TurnComplete(response=None),
+    ]
+    assert pane.delivered == ["hello from the web"]
+    assert pane.deliveries == 4
+
+
+@pytest.mark.asyncio
 async def test_a_held_message_asks_for_a_repaint_each_interval(
     pane: _Pane, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

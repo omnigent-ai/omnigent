@@ -13809,6 +13809,52 @@ class _ComposerKeepingItsStash(_EditableComposer):
         super()._run_tmux(socket_path, *args)
 
 
+def _web_control_deadline(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """
+    Return the runner's settings-control deadline, on the bridge's virtual clock.
+
+    The real tmux calls stop at a cancelled deadline, and so do the installed fakes.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: A started ``_ClaudeControlDeadline``.
+    """
+    from omnigent.runner import native_controls
+
+    monkeypatch.setattr(native_controls, "time", claude_native_bridge.time)
+    for name in ("_run_tmux", "_capture_pane"):
+        fake = getattr(claude_native_bridge, name)
+
+        def checked(*args: Any, _fake: Callable[..., Any] = fake, **kwargs: Any) -> Any:
+            claude_native_bridge._check_injection_cancelled()
+            return _fake(*args, **kwargs)
+
+        monkeypatch.setattr(claude_native_bridge, name, checked)
+    return native_controls._ClaudeControlDeadline()
+
+
+def _change_effort_as_the_web_control_does(bridge_dir: Path, deadline: Any) -> None:
+    """
+    Send ``/effort high`` with the arguments and deadline of the runner's effort control.
+
+    :param bridge_dir: Bridge directory of the session.
+    :param deadline: The control's deadline from :func:`_web_control_deadline`.
+    :returns: None.
+    """
+    from omnigent.runner import native_controls
+
+    with claude_native_bridge.cancellable_injection(deadline):
+        claude_native_bridge.inject_slash_command(
+            bridge_dir,
+            command="/effort high",
+            timeout_s=1.0,
+            ready_timeout_s=min(
+                native_controls._CLAUDE_CONTROL_PROMPT_WAIT_S, deadline.remaining_s()
+            ),
+            auto_confirm=True,
+            confirm_hint=claude_native_bridge.EFFORT_DIALOG_HINT,
+        )
+
+
 @pytest.mark.parametrize(
     "typed_after_submit", ["", "a new thought"], ids=["box-empty", "box-occupied"]
 )
@@ -13830,6 +13876,45 @@ def test_a_stash_claude_code_keeps_is_returned_only_to_an_empty_box(
     inject_user_message(bridge_dir, content="hello from the web")
 
     assert [text.strip() for text in composer.submitted] == ["hello from the web"]
+    if typed_after_submit:
+        assert composer.text == typed_after_submit
+        assert composer.stash == (_STALE_MULTILINE_DRAFT, 4)
+    else:
+        assert (composer.text, composer.cursor, composer.stash) == (
+            _STALE_MULTILINE_DRAFT,
+            4,
+            None,
+        )
+
+
+@pytest.mark.parametrize(
+    "typed_after_submit", ["", "a new thought"], ids=["box-empty", "box-occupied"]
+)
+def test_a_kept_stash_is_returned_when_a_settings_deadline_cuts_its_wait(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, typed_after_submit: str
+) -> None:
+    """
+    A settings change whose deadline lapses while Claude Code keeps the stash still returns it.
+
+    The person paused typing late, so the wait for the draft after ``/effort``
+    and its dialog watch runs into the web control's deadline. The stash
+    still goes back to an empty box, and never over new text.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    composer = _ComposerKeepingItsStash(
+        _STALE_MULTILINE_DRAFT, cursor=4, typed_after_submit=typed_after_submit
+    )
+    composer.install(monkeypatch)
+    clock = claude_native_bridge.time
+    monkeypatch.setattr(
+        claude_native_bridge, "last_human_input_at", lambda *_args: min(clock.now, 6.0)
+    )
+    deadline = _web_control_deadline(monkeypatch)
+
+    with pytest.raises(claude_native_bridge.ClaudeInjectionCancelled):
+        _change_effort_as_the_web_control_does(bridge_dir, deadline)
+
+    assert [text.strip() for text in composer.submitted if text.strip()] == ["/effort high"]
     if typed_after_submit:
         assert composer.text == typed_after_submit
         assert composer.stash == (_STALE_MULTILINE_DRAFT, 4)
@@ -14886,49 +14971,24 @@ def test_an_effort_change_while_someone_types_keeps_to_its_deadline(
     wait for the input box refuses the change with nothing typed; a change
     applied in the terminal after the deadline would be reported as failed.
     """
-    from omnigent.runner import native_controls
-
     bridge_dir = _picker_bridge_dir(tmp_path)
     draft = "my half-typed question"
     composer = _EditableComposer(draft, cursor=len(draft))
     composer.install(monkeypatch)
     clock = claude_native_bridge.time
-    monkeypatch.setattr(native_controls, "time", clock)
     monkeypatch.setattr(
         claude_native_bridge,
         "last_human_input_at",
         lambda *_args: clock.now if typing_until is None else min(clock.now, typing_until),
     )
-    # The real tmux calls stop at a cancelled deadline, and so do these.
-    for name in ("_run_tmux", "_capture_pane"):
-        fake = getattr(claude_native_bridge, name)
-
-        def checked(*args: Any, _fake: Callable[..., Any] = fake, **kwargs: Any) -> Any:
-            claude_native_bridge._check_injection_cancelled()
-            return _fake(*args, **kwargs)
-
-        monkeypatch.setattr(claude_native_bridge, name, checked)
-    deadline = native_controls._ClaudeControlDeadline()
-
-    def change_effort() -> None:
-        with claude_native_bridge.cancellable_injection(deadline):
-            claude_native_bridge.inject_slash_command(
-                bridge_dir,
-                command="/effort high",
-                timeout_s=1.0,
-                ready_timeout_s=min(
-                    native_controls._CLAUDE_CONTROL_PROMPT_WAIT_S, deadline.remaining_s()
-                ),
-                auto_confirm=True,
-                confirm_hint=claude_native_bridge.EFFORT_DIALOG_HINT,
-            )
+    deadline = _web_control_deadline(monkeypatch)
 
     if applied:
-        change_effort()
+        _change_effort_as_the_web_control_does(bridge_dir, deadline)
         assert [text.strip() for text in composer.submitted] == ["/effort high"]
     else:
         with pytest.raises(claude_native_bridge.ClaudeComposerHoldsDraft, match="typing"):
-            change_effort()
+            _change_effort_as_the_web_control_does(bridge_dir, deadline)
         assert composer.submitted == []
     assert not deadline.is_set()
     assert (composer.text, composer.cursor, composer.stash) == (draft, len(draft), None)
