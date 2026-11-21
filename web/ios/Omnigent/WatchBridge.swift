@@ -42,7 +42,8 @@ final class WatchBridge: NSObject, WCSessionDelegate {
   }
 
   private func flush() {
-    guard WCSession.isSupported(), WCSession.default.activationState == .activated,
+    guard WCSession.isSupported(), WCSession.default.delegate === self,
+      WCSession.default.activationState == .activated,
       WCSession.default.isWatchAppInstalled, let latest
     else { return }
     // The system drops a context equal to the last one sent, even to a reinstalled watch app.
