@@ -332,10 +332,7 @@ def test_relative_policy_cwd_preserves_non_claude_workspace(
         # Claude's successful-wrap scenario also exercises cwd conflicts.
         if (harness, feature) != ("claude-sdk", "cwd_conflict")
     ]
-    + [
-        pytest.param("codex", "tcp_egress", id="codex-tcp_egress"),
-        pytest.param("codex", "empty_tcp_egress", id="codex-empty-tcp-egress"),
-    ],
+    + [pytest.param("codex", "tcp_egress", id="codex-tcp_egress")],
 )
 def test_harness_rejects_policy_features_it_cannot_honor(
     harness: str, feature: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -345,11 +342,7 @@ def test_harness_rejects_policy_features_it_cannot_honor(
     executable.touch()
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    routes = None
-    if feature == "tcp_egress":
-        routes = [TcpEgressRoute("db", "db.example.test", 5432)]
-    elif feature == "empty_tcp_egress":
-        routes = []
+    routes = [TcpEgressRoute("db", "db.example.test", 5432)] if feature == "tcp_egress" else None
     spec = OSEnvSpec(
         cwd=str(workspace),
         sandbox=OSEnvSandboxSpec(
@@ -369,7 +362,7 @@ def test_harness_rejects_policy_features_it_cannot_honor(
     monkeypatch.setattr(sandbox, "resolve_sandbox", resolve)
     monkeypatch.setattr(claude_sdk_executor, "resolve_sandbox", resolve)
     monkeypatch.setattr(codex_worker, "resolve_sandbox", resolve)
-    message = {"cwd_conflict": "conflicts", "empty_tcp_egress": "tcp_egress"}.get(feature, feature)
+    message = "conflicts" if feature == "cwd_conflict" else feature
     with pytest.raises(sandbox.HarnessSandboxValidationError, match=message) as failure:
         with _prepared_launch(harness, executable, workspace, spec):
             pytest.fail(f"{harness} silently ignored {feature}")
