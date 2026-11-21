@@ -95,7 +95,7 @@ def test_fullscreen_file_link_survives_reload_and_can_be_exited(
     page: Page,
     seeded_shareable_session: tuple[str, str],
 ) -> None:
-    """A fullscreen file URL rehydrates, and exiting keeps the file docked."""
+    """A fullscreen file URL rehydrates, and the button or Escape exits it with the file docked."""
     base_url, session_id = seeded_shareable_session
     query = urlencode({"file": _FILE_PATH, "fullscreen": "1"})
     page.goto(f"{base_url}/c/{session_id}?{query}")
@@ -121,6 +121,22 @@ def test_fullscreen_file_link_survives_reload_and_can_be_exited(
     page.reload()
     expect(page.get_by_role("button", name="Full screen", exact=True)).to_be_visible()
     expect(file_viewer.get_by_text(_FILE_BODY).first).to_be_visible(timeout=20_000)
+
+    # Escape exits full screen and keeps the tab; a second Escape closes it.
+    close_tab = page.get_by_role("button", name=f"Close {_FILE_PATH}", exact=True)
+    page.get_by_role("button", name="Full screen", exact=True).click()
+    expect(exit_fullscreen).to_have_attribute("aria-pressed", "true")
+    page.keyboard.press("Escape")
+    expect(page.get_by_role("button", name="Full screen", exact=True)).to_be_visible()
+    expect(page.get_by_role("textbox", name="Message the agent", exact=True)).to_be_visible()
+    expect(close_tab.first).to_be_visible()
+    expect(file_viewer.get_by_text(_FILE_BODY).first).to_be_visible()
+    params = parse_qs(urlsplit(page.url).query)
+    assert params.get("file") == [_FILE_PATH]
+    assert "fullscreen" not in params
+
+    page.keyboard.press("Escape")
+    expect(close_tab).to_have_count(0)
 
 
 def test_share_file_grants_read_access_and_opens_fullscreen(

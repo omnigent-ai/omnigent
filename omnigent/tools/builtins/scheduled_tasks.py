@@ -99,10 +99,14 @@ class SysScheduledTaskCreateTool(Tool):
                             ),
                         },
                         "timezone": {
-                            "type": "string",
+                            "type": ["string", "null"],
                             "description": (
                                 "IANA timezone the rule is evaluated in, e.g. "
-                                "'America/Los_Angeles'. Defaults to 'UTC'."
+                                "'America/Los_Angeles'. Use the zone the user names; "
+                                "otherwise omit it or send JSON null. Current runners "
+                                "request their recorded browser timezone, falling back "
+                                "to UTC when unavailable or unsupported. "
+                                "Do not infer a zone from the host or environment."
                             ),
                         },
                         "model_override": {
@@ -146,9 +150,11 @@ class SysScheduledTaskCreateTool(Tool):
                         "max_cost_usd": {
                             "type": "number",
                             "description": (
-                                "Optional per-firing cost budget in USD. When set, each "
-                                "fired session is capped at this spend — all models are "
-                                "blocked once the limit is reached. Omit for no cap."
+                                "Optional per-firing cost budget in USD. Omit unless the "
+                                "user explicitly requests a cost limit; do not invent a "
+                                "budget. Reaching the limit blocks further model requests "
+                                "and tool calls and may leave the task incomplete. "
+                                "Omit for no automation-specific cap."
                             ),
                         },
                         "session_mode": {
@@ -337,9 +343,14 @@ class SysScheduledTaskUpdateTool(Tool):
                             ),
                         },
                         "max_cost_usd": {
-                            "type": "number",
+                            "type": ["number", "null"],
                             "description": (
-                                "New per-firing cost budget in USD. Null clears the cap."
+                                "New per-firing cost budget in USD. Omit to preserve the "
+                                "current setting. Set or change a limit only when the user "
+                                "explicitly requests it; do not invent a budget. Send JSON "
+                                "null only when the user requests removing the cap. "
+                                "Reaching the limit blocks further model requests and tool "
+                                "calls and may leave the task incomplete."
                             ),
                         },
                         "session_mode": {

@@ -440,28 +440,36 @@ describe("CommentsPanel show more / less", () => {
 // vs mobile is decided from the canonical md media query.
 
 describe("CommentsPanel resize affordance", () => {
-  it("renders a resize handle and applies an inline width on desktop", () => {
-    renderPanel([makeComment("c1")], []);
+  function withInnerWidth(width: number, run: () => void) {
+    const orig = window.innerWidth;
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: width });
+    try {
+      run();
+    } finally {
+      Object.defineProperty(window, "innerWidth", { configurable: true, value: orig });
+    }
+  }
 
-    // The separator is the divider gutter preceding the panel root, which
-    // gets an explicit pixel width (default 240px) so it can be dragged wider.
-    const handle = screen.getByRole("separator", { name: "Resize comments panel" });
-    expect((handle.nextElementSibling as HTMLElement).style.width).toBe("240px");
+  it("renders a resize handle and applies an inline width on desktop", () => {
+    withInnerWidth(1280, () => {
+      renderPanel([makeComment("c1")], []);
+
+      // The separator is the divider gutter preceding the panel root, which
+      // gets an explicit pixel width (default 240px) so it can be dragged wider.
+      const handle = screen.getByRole("separator", { name: "Resize comments panel" });
+      expect((handle.nextElementSibling as HTMLElement).style.width).toBe("240px");
+    });
   });
 
   it("omits the handle and inline width on a narrow (mobile) viewport", () => {
-    const orig = window.innerWidth;
-    Object.defineProperty(window, "innerWidth", { configurable: true, value: 500 });
     setDesktopViewport(false);
-    try {
+    withInnerWidth(500, () => {
       renderPanel([makeComment("c1")], []);
       // No drag handle, and the panel falls back to the w-full class (no inline width).
       expect(screen.queryByRole("separator", { name: "Resize comments panel" })).toBeNull();
       const panel = screen.getByText("Comments").closest("div")?.parentElement as HTMLElement;
       expect(panel.style.width).toBe("");
-    } finally {
-      Object.defineProperty(window, "innerWidth", { configurable: true, value: orig });
-    }
+    });
   });
 });
 

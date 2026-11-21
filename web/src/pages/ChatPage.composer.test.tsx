@@ -1,6 +1,19 @@
+import type { Comment } from "@/hooks/useComments";
+import { LEVEL_OWNER } from "@/lib/permissionsApi";
+import { COMMAND_TOKEN_CLASS } from "@/components/composer/commandToken";
 import { formatLocalReviewComments } from "@/lib/localReviewComments";
-import { requestLocalReviewContext, updateLocalReviewContext } from "@/lib/localReviewContext";
+import {
+  clearLocalReviewContexts,
+  requestLocalReviewContext,
+  updateLocalReviewContext,
+} from "@/lib/localReviewContext";
 import { create } from "zustand";
+import {
+  SHELL_MENTION_REFUSAL,
+  SHELL_OWNER_REFUSAL,
+  SHELL_QUOTE_REFUSAL,
+  SHELL_REVIEW_COMMENT_REFUSAL,
+} from "@/components/composer/composerHighlight";
 import { SHIFT_KEY } from "@/components/KeyboardShortcut";
 import type { SkillSummary, SkillsStatus } from "@/lib/types";
 
@@ -17,6 +30,10 @@ import type * as GoalApiModule from "@/lib/goalApi";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type { ChildSessionInfo } from "@/hooks/useChildSessions";
 import type * as FileViewerContextModule from "@/shell/FileViewerContext";
+import * as CodeMirrorModule from "@/components/composer/engine/CodeMirrorComposerInput";
+import { resetCodeMirrorComposerLoadForTests } from "@/components/composer/engine/codeMirrorComposerLoader";
+import { composerTargetOf } from "@/components/composer/engine/composerInput";
+import { insertComposerText } from "@/lib/composerText";
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -28,6 +45,7 @@ import { SideChatPane } from "@/components/chat/SideChatPane";
 import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { handleSessionEvent, useChatStore, type ChatState } from "@/store/chatStore";
+import { usePlanStops } from "@/store/planStops";
 import { useSessionTasksActions } from "@/store/sessionTasksActions";
 import {
   continuePlanMessage,
@@ -119,6 +137,8 @@ const { composerGitStatusArgsSpy, composerGitStatusSnapshot } = vi.hoisted(() =>
   },
 }));
 const { openGithubTabMock } = vi.hoisted(() => ({ openGithubTabMock: vi.fn() }));
+const tabsSidebar = vi.hoisted(() => ({ shows: false }));
+vi.mock("@/shell/useTabsSidebar", () => ({ useTabsSidebar: () => tabsSidebar.shows }));
 vi.mock("@/hooks/useComposerGitStatus", () => ({
   useComposerGitStatus: (args: unknown) => {
     composerGitStatusArgsSpy(args);
@@ -144,13 +164,17 @@ function setComposerGitStatus(overrides: Record<string, unknown> = {}) {
       prCount: 0,
       prNumber: null,
       prNumberPrefix: "#",
+      prs: [],
       refreshing: false,
     },
     overrides,
   );
 }
 
-afterEach(() => setComposerGitStatus());
+afterEach(() => {
+  setComposerGitStatus();
+  tabsSidebar.shows = false;
+});
 // SubagentTaskIndicator's child-session query also needs a QueryClient; stub it
 // so the indicator self-hides (no active children) in isolated composer renders.
 const { childSessionsArgsSpy, composerChildSessions } = vi.hoisted(() => ({
@@ -257,7 +281,6 @@ import {
   SlashCommandMenu,
   slashCommandMatches,
 } from "@/components/SlashCommandMenu";
-import { stubMatchMedia } from "@/test-helpers/matchMedia";
 
 // These tests pin the slash-command suggestions menu UX in the composer:
 // (1) the first match is highlighted as soon as the menu opens, so Tab/Enter
@@ -267,6 +290,34 @@ import { stubMatchMedia } from "@/test-helpers/matchMedia";
 // through to the browser's default focus move and Enter sent the message.
 
 /** Minimal ComposerProps for an interactive (writable, idle) composer. */
+const LOCAL_REVIEW_ANCHOR = {
+  pr_url: "https://github.com/acme/repo/pull/1",
+  side: "RIGHT" as const,
+  line: 12,
+  start_line: null,
+  head_sha: "a".repeat(40),
+  base_sha: "b".repeat(40),
+};
+
+/** A draft local review comment on `src/example.ts`, as the review panel queues it. */
+function localReviewComment(overrides: Partial<Comment> = {}): Comment {
+  return {
+    id: "123",
+    conversation_id: "conv_test",
+    path: "src/example.ts",
+    start_index: 0,
+    end_index: 0,
+    body: "Preserve the public API.",
+    status: "draft",
+    created_at: 1,
+    updated_at: 1,
+    anchor_content: null,
+    created_by: null,
+    anchor_metadata: LOCAL_REVIEW_ANCHOR,
+    ...overrides,
+  };
+}
+
 function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) {
   return {
     status: "idle" as const,
@@ -319,10 +370,21 @@ function textarea() {
   return screen.getByLabelText("Message the agent") as HTMLTextAreaElement;
 }
 
-// A coarse pointer at a desktop width, so `useIsMobileViewport` stays false
-// and the test exercises the coarse-pointer branch alone.
-function forceDesktopCoarsePointer(): () => void {
-  return stubMatchMedia({ width: 1280, anyCoarse: true });
+function forceMobileViewport(): () => void {
+  const original = window.matchMedia;
+  window.matchMedia = ((query: string) => ({
+    matches: query.includes("max-width"),
+    media: query,
+    onchange: null,
+    addListener: () => {},
+    removeListener: () => {},
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    dispatchEvent: () => false,
+  })) as typeof window.matchMedia;
+  return () => {
+    window.matchMedia = original;
+  };
 }
 
 /** The currently highlighted menu row, or null when none is highlighted. */
@@ -419,6 +481,35 @@ describe("Composer Escape interrupt", () => {
     expect(activeRow()).toBeNull();
     fireEvent.keyDown(textarea(), { key: "Escape" });
     expect(props.onStop).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes slash-command output before interrupting", () => {
+    const props = composerProps({ isWorking: true });
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "/help " } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(screen.getByText(/\/help — Show available slash commands/)).toBeVisible();
+
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+    expect(screen.queryByText(/\/help — Show available slash commands./)).toBeNull();
+    expect(props.onStop).not.toHaveBeenCalled();
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+    expect(props.onStop).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes slash-command output on Escape with focus outside the composer", () => {
+    const props = composerProps({ isWorking: true });
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "/help " } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    // Page-wide Escape shortcuts (approval decline, question reject) defer to escape owners.
+    const help = screen.getByText(/\/help — Show available slash commands/);
+    expect(help.closest("[data-escape-owner]")).not.toBeNull();
+
+    textarea().blur();
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(screen.queryByText(/\/help — Show available slash commands./)).toBeNull();
+    expect(props.onStop).not.toHaveBeenCalled();
   });
 
   it("leaves Escape to active IME composition", () => {
@@ -643,11 +734,11 @@ describe("Composer growth layout", () => {
   });
 
   it("publishes mobile overlay height only when it changes and clears it on unmount", () => {
-    const mediaQuery = window.matchMedia("(max-width: 767.98px)");
+    const mediaQuery = window.matchMedia("(max-width: 1180.98px)");
     vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
       ...mediaQuery,
       media: query,
-      matches: query === "(max-width: 767.98px)",
+      matches: query === "(max-width: 1180.98px)",
     }));
     let height = 48;
     const getRect = HTMLElement.prototype.getBoundingClientRect;
@@ -699,13 +790,6 @@ describe("Composer growth layout", () => {
     expect(disconnect).toHaveBeenCalledOnce();
     expect(surface.style.getPropertyValue("--session-composer-height")).toBe("");
   });
-});
-
-// These suites assert desktop composer behavior (mount autofocus,
-// Enter-sends, hover affordances); tests that need a mobile width re-pin it
-// themselves.
-beforeEach(() => {
-  stubMatchMedia({ width: 1280 });
 });
 
 describe("Composer send shortcut", () => {
@@ -864,8 +948,8 @@ describe("Composer send shortcut", () => {
     expect(tooltipKeys(tooltip)).toEqual(["Ctrl", "↵"]);
   });
 
-  it("keeps Enter native and hides its hint on a desktop-width coarse pointer", () => {
-    const restorePointer = forceDesktopCoarsePointer();
+  it("keeps Enter native and hides its hint in the mobile layout", () => {
+    const restoreViewport = forceMobileViewport();
     const onSend = vi.fn();
     try {
       render(<Composer {...composerProps({ onSend })} />);
@@ -877,15 +961,14 @@ describe("Composer send shortcut", () => {
       fireEvent.focus(screen.getByRole("button", { name: "Send" }));
       expect(screen.queryByRole("tooltip")).toBeNull();
     } finally {
-      restorePointer();
+      restoreViewport();
     }
   });
 
-  it("leaves plain Enter as a newline on a coarse pointer, even with no menu open", async () => {
-    // Touch keyboards own the send action (the on-screen button), so Enter on
-    // a coarse pointer must stay a plain newline — same rule the landing
-    // composer follows on a phone viewport.
-    const restorePointer = forceDesktopCoarsePointer();
+  it("leaves plain Enter as a newline in the mobile layout, even with no menu open", async () => {
+    // Touch keyboards own the send action (the on-screen button), so Enter in
+    // the mobile layout must stay a plain newline, as in the landing composer.
+    const restoreViewport = forceMobileViewport();
     const onSend = vi.fn();
     try {
       const user = userEvent.setup();
@@ -894,7 +977,23 @@ describe("Composer send shortcut", () => {
       expect(textarea().value).toBe("first\nsecond");
       expect(onSend).not.toHaveBeenCalled();
     } finally {
-      restorePointer();
+      restoreViewport();
+    }
+  });
+
+  it("sends on plain Enter in a desktop app window narrower than the mobile breakpoint", () => {
+    // The desktop app keeps the desktop layout when narrow, so Enter stays the send key.
+    const restoreViewport = forceMobileViewport();
+    vi.stubGlobal("omnigentDesktop", { kind: "electron" });
+    const onSend = vi.fn();
+    try {
+      render(<Composer {...composerProps({ onSend })} />);
+      fireEvent.change(textarea(), { target: { value: "narrow window" } });
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(onSend).toHaveBeenCalledWith("narrow window", undefined);
+    } finally {
+      vi.unstubAllGlobals();
+      restoreViewport();
     }
   });
 
@@ -1031,6 +1130,12 @@ describe("Composer goal slash command", () => {
       fireEvent.change(textarea(), {
         target: { value: text },
       });
+      // Submission matches the built-in in any case, so the tint paints the token as typed.
+      const typed = text.split(/\s+/)[0]!;
+      expect(textarea()).toHaveAttribute("data-slash-command", "true");
+      expect(within(screen.getByTestId("composer-highlight-overlay")).getByText(typed)).toHaveClass(
+        COMMAND_TOKEN_CLASS,
+      );
       fireEvent.click(screen.getByRole("button", { name: "Send" }));
       expect(onSend.mock.calls[0]?.[0]).toBe(sent);
       expect(onSendSlashCommand).not.toHaveBeenCalled();
@@ -3352,6 +3457,37 @@ describe("Composer shared visible controls", () => {
     expect(screen.queryByTestId("composer-config-modal")).toBeNull();
   });
 
+  it.each([
+    ["the classic sidebar, which keeps the section it shows", false, []],
+    [
+      "the tabs sidebar, which shows the PR in its own tab",
+      true,
+      ["https://github.com/omnigent-ai/omnigent/pull/42"],
+    ],
+  ])("opens a lone PR's link in %s", (_, shows, args) => {
+    tabsSidebar.shows = shows;
+    setComposerGitStatus({
+      githubState: "ready",
+      prCount: 1,
+      prNumber: 42,
+      prs: [
+        {
+          url: "https://github.com/omnigent-ai/omnigent/pull/42",
+          host: "github.com",
+          repository: "omnigent-ai/omnigent",
+          number: 42,
+          relationship: "created",
+          title: "Add the tabs sidebar",
+          state: "OPEN",
+        },
+      ],
+    });
+    openGithubTabMock.mockClear();
+    renderWithTooltips(<Composer {...composerProps()} />);
+    fireEvent.click(screen.getByTestId("composer-pr-link"));
+    expect(openGithubTabMock.mock.calls).toEqual([args]);
+  });
+
   it("transitions PR and worktree visibility across ready, empty, loading, and unknown GitHub states", () => {
     setComposerGitStatus({
       branch: "feature/shared-composer",
@@ -4095,7 +4231,13 @@ describe("Composer background tasks", () => {
   it.each([false, true])(
     "keeps a running monitor reachable after foreground work ends (mobile=%s)",
     (mobile) => {
-      onTestFinished(stubMatchMedia({ width: mobile ? 390 : 1280 }));
+      const mediaQuery = window.matchMedia("(max-width: 1180.98px)");
+      const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+        ...mediaQuery,
+        media: query,
+        matches: mobile && query === "(max-width: 1180.98px)",
+      }));
+      onTestFinished(() => matchMedia.mockRestore());
       useChatStore.setState({
         backgroundTaskCount: 1,
         backgroundTasks: [
@@ -5658,6 +5800,10 @@ describe("Composer slash-command highlight overlay", () => {
     "/cross-review have Claude Code implement GH issue #<number>, then have Codex review";
 
   it("tints only the token for a command with args (args stay default)", () => {
+    setComposerState({
+      conversationId: "conv_test",
+      skills: [{ name: "cross-review", description: "Cross-review a change." }],
+    });
     render(<Composer {...composerProps()} />);
     fireEvent.change(textarea(), { target: { value: COMMAND_PROMPT } });
     expect(textarea().value).toBe(COMMAND_PROMPT);
@@ -5695,6 +5841,295 @@ describe("Composer slash-command highlight overlay", () => {
     fireEvent.change(textarea(), { target: { value: "just a normal message" } });
     expect(screen.queryByTestId("composer-highlight-overlay")).toBeNull();
   });
+
+  it("leaves an unknown command-shaped token untinted", () => {
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: COMMAND_PROMPT } });
+    expect(screen.queryByTestId("composer-highlight-overlay")).toBeNull();
+    expect(textarea()).not.toHaveAttribute("data-slash-command");
+    expect(textarea()).not.toHaveClass("text-transparent");
+  });
+});
+
+describe("Composer native shell mode", () => {
+  beforeEach(() => {
+    clearSessionDrafts();
+    const { sessionHarness } = useChatStore.getState();
+    onTestFinished(() => useChatStore.setState({ sessionHarness }));
+    setComposerState({ conversationId: "conv_shell", skills: [], blocks: [] });
+  });
+  afterEach(() => cleanup());
+
+  it.each([
+    { harness: "claude-native", permissionLevel: 2 },
+    { harness: "codex-native", permissionLevel: null },
+    { harness: "codex-native", permissionLevel: LEVEL_OWNER },
+  ])(
+    "marks a `!` draft as a shell command on $harness (level $permissionLevel) and sends it unchanged",
+    (row) => {
+      useChatStore.setState({ sessionHarness: row.harness });
+      const props = composerProps({ isNativeWrapper: true, permissionLevel: row.permissionLevel });
+      render(<Composer {...props} />);
+      fireEvent.change(textarea(), { target: { value: "!git log -1 --oneline" } });
+
+      const overlay = screen.getByTestId("composer-highlight-overlay");
+      expect(overlay).toHaveTextContent("!git log -1 --oneline");
+      expect(within(overlay).getByText("!")).toHaveClass("text-brand-accent");
+      expect(textarea()).toHaveAttribute("data-shell-command", "true");
+      expect(textarea()).toHaveAccessibleDescription("Shell command");
+      expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
+
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(props.onSend).toHaveBeenCalledExactlyOnceWith("!git log -1 --oneline", undefined);
+    },
+  );
+
+  // The quote would follow the `!` into the shell, where `> quoted line` truncates a file.
+  it("refuses a `!` send that a reply quote moved out of the tail, and keeps it", () => {
+    useChatStore.setState({ sessionHarness: "codex-native" });
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const props = composerProps({ isNativeWrapper: true, permissionLevel: null });
+    render(<Composer {...props} ref={ref} />);
+    fireEvent.change(textarea(), { target: { value: "!ls" } });
+    act(() => ref.current?.appendReplyQuote("quoted line"));
+
+    expect(textarea()).toHaveValue("");
+    expect(textarea()).toHaveAttribute("data-shell-command", "true");
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toHaveTextContent(
+      SHELL_QUOTE_REFUSAL,
+    );
+    expect(screen.getByTestId("composer-shell-mode-status")).toHaveTextContent(SHELL_QUOTE_REFUSAL);
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(props.onSend).not.toHaveBeenCalled();
+    expect(
+      screen.getByText(SHELL_QUOTE_REFUSAL, { selector: "[data-escape-owner]" }),
+    ).toBeVisible();
+    expect(screen.getByLabelText("Reply text before quote 1")).toHaveValue("!ls");
+  });
+
+  it("leaves shell mode off when a file rides along, as it goes out as its own block", () => {
+    useChatStore.setState({ sessionHarness: "codex-native" });
+    const props = composerProps({ isNativeWrapper: true, permissionLevel: null });
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "!ls" } });
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
+
+    fireEvent.change(document.querySelector('input[type="file"]') as HTMLInputElement, {
+      target: { files: [new File(["hello"], "notes.txt", { type: "text/plain" })] },
+    });
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+    expect(screen.queryByTestId("composer-shell-mode-indicator")).toBeNull();
+    expect(textarea()).not.toHaveAttribute("data-shell-command");
+  });
+
+  it("refuses a quoted `!` send the session won't run, and keeps it", () => {
+    useChatStore.setState({ sessionHarness: "codex-native" });
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const props = composerProps({ isNativeWrapper: true, permissionLevel: 2 });
+    render(<Composer {...props} ref={ref} />);
+    fireEvent.change(textarea(), { target: { value: "!ls" } });
+    act(() => ref.current?.appendReplyQuote("quoted line"));
+
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toHaveTextContent(
+      SHELL_OWNER_REFUSAL,
+    );
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(props.onSend).not.toHaveBeenCalled();
+    expect(screen.getByLabelText("Reply text before quote 1")).toHaveValue("!ls");
+  });
+
+  it("offers no shell mode until the permission level has loaded", () => {
+    useChatStore.setState({ sessionHarness: "codex-native" });
+    const props = composerProps({ isNativeWrapper: true, permissionLevel: null });
+    const view = render(<Composer {...props} permissionPending />);
+    fireEvent.change(textarea(), { target: { value: "!git status" } });
+    expect(screen.queryByTestId("composer-shell-mode-indicator")).toBeNull();
+
+    view.rerender(<Composer {...props} permissionPending={false} />);
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
+  });
+
+  // Only codex refuses a non-owner's shell input; the claude-native level-2 row above runs it.
+  it.each([
+    { label: "an owner on pi", harness: "pi", permissionLevel: null, draft: "!git status" },
+    { label: "a non-owner on pi", harness: "pi", permissionLevel: 2, draft: "!git status" },
+    {
+      label: "a codex non-owner",
+      harness: "codex-native",
+      permissionLevel: 2,
+      draft: "git status",
+    },
+  ])(
+    "sends $draft from $label as typed, with no shell mode",
+    ({ harness, permissionLevel, draft }) => {
+      useChatStore.setState({ sessionHarness: harness });
+      const props = composerProps({ isNativeWrapper: true, permissionLevel });
+      render(<Composer {...props} />);
+      fireEvent.change(textarea(), { target: { value: draft } });
+      expect(screen.queryByTestId("composer-shell-mode-indicator")).toBeNull();
+      expect(screen.queryByTestId("composer-highlight-overlay")).toBeNull();
+
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(props.onSend).toHaveBeenCalledExactlyOnceWith(draft, undefined);
+    },
+  );
+
+  it("tells a codex-native non-owner their `!` send will be refused, and keeps it", () => {
+    useChatStore.setState({ sessionHarness: "codex-native" });
+    const props = composerProps({ isNativeWrapper: true, permissionLevel: 2 });
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "!git status" } });
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toHaveTextContent(
+      SHELL_OWNER_REFUSAL,
+    );
+
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(props.onSend).not.toHaveBeenCalled();
+    expect(
+      screen.getByText(SHELL_OWNER_REFUSAL, { selector: "[data-escape-owner]" }),
+    ).toBeVisible();
+    expect(textarea()).toHaveValue("!git status");
+  });
+
+  it.each([
+    {
+      label: "the `!`",
+      draft: "!ls",
+      token: "!",
+      mode: "data-shell-command",
+      props: () => {
+        useChatStore.setState({ sessionHarness: "codex-native" });
+        return composerProps({ isNativeWrapper: true, permissionLevel: null });
+      },
+    },
+    {
+      label: "a known command",
+      draft: "/team fix",
+      token: "/team",
+      mode: "data-slash-command",
+      props: () => {
+        setComposerState({
+          conversationId: "conv_shell",
+          skills: [{ name: "team", description: "Run a team" }],
+          blocks: [],
+        });
+        return composerProps();
+      },
+    },
+  ])(
+    "paints $label and an inline mention pill in the one mirror",
+    ({ draft, token, mode, props }) => {
+      render(<Composer {...props()} />);
+      fireEvent.change(textarea(), { target: { value: draft } });
+      expect(textarea()).toHaveAttribute(mode, "true");
+
+      // The attachment lands as an inline token after the text, so the token still leads.
+      act(() =>
+        useChatStore.setState({
+          pendingComposerAttachments: [{ path: "src/example.ts", isDir: false }],
+        }),
+      );
+      expect(textarea()).toHaveAttribute(mode, "true");
+      expect(screen.getAllByTestId("composer-highlight-overlay")).toHaveLength(1);
+      const overlay = screen.getByTestId("composer-highlight-overlay");
+      expect(overlay.textContent).toBe(textarea().value);
+      expect(within(overlay).getByText(token)).toHaveClass("text-brand-accent");
+      expect(within(overlay).getByTestId("composer-mention-token")).toBeInTheDocument();
+      if (mode === "data-shell-command") {
+        expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
+      }
+    },
+  );
+
+  it.each([
+    {
+      label: "a codex-native draft",
+      harness: "codex-native",
+      permissionLevel: null,
+      draft: "!cat",
+      untagged: "!cat src/example.ts",
+    },
+    {
+      // Classified by the text the terminal receives: claude-native drops the \x05.
+      label: "a claude-native draft behind a control character",
+      harness: "claude-native",
+      permissionLevel: 2,
+      draft: "\x05!echo ok",
+      untagged: "\x05!echo ok",
+    },
+  ])(
+    "refuses a `!` send of $label that carries a tag, keeps the draft, then sends once it is gone",
+    ({ harness, permissionLevel, draft, untagged }) => {
+      useChatStore.setState({ sessionHarness: harness });
+      const props = composerProps({ isNativeWrapper: true, permissionLevel });
+      render(<Composer {...props} />);
+      fireEvent.change(textarea(), { target: { value: draft } });
+      expect(textarea()).toHaveAttribute("data-shell-command", "true");
+      expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
+
+      act(() =>
+        useChatStore.setState({
+          pendingComposerAttachments: [{ path: "src/example.ts", isDir: false }],
+        }),
+      );
+      const tagged = textarea().value;
+      // The hint says why before the send is tried.
+      expect(screen.getByTestId("composer-shell-mode-indicator")).toHaveTextContent(
+        SHELL_MENTION_REFUSAL,
+      );
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(props.onSend).not.toHaveBeenCalled();
+      // The composer's inline feedback row repeats it after the refused send.
+      expect(
+        screen.getByText(SHELL_MENTION_REFUSAL, { selector: "[data-escape-owner]" }),
+      ).toBeVisible();
+      expect(textarea()).toHaveValue(tagged);
+
+      fireEvent.change(textarea(), { target: { value: untagged } });
+      expect(screen.getByTestId("composer-shell-mode-indicator")).toHaveTextContent(
+        "Shell command",
+      );
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(props.onSend).toHaveBeenCalledExactlyOnceWith(untagged, undefined);
+    },
+  );
+
+  it.each([
+    // The review context alone would make a bare `!` a command.
+    { draft: "!", shellBeforeReview: false },
+    { draft: "!git status", shellBeforeReview: true },
+  ])(
+    "refuses a `!` send of $draft that review context would reach the shell with",
+    ({ draft, shellBeforeReview }) => {
+      useChatStore.setState({ sessionHarness: "codex-native" });
+      const props = composerProps({ isNativeWrapper: true, permissionLevel: null });
+      render(
+        <QueryClientProvider client={new QueryClient()}>
+          <Composer {...props} />
+        </QueryClientProvider>,
+      );
+      fireEvent.change(textarea(), { target: { value: draft } });
+      expect(screen.queryByTestId("composer-shell-mode-indicator") !== null).toBe(
+        shellBeforeReview,
+      );
+
+      const comment = localReviewComment({ id: "shell-review", conversation_id: "conv_shell" });
+      // A refused send keeps the context; drop it so later tests don't render its chips.
+      onTestFinished(() => clearLocalReviewContexts("conv_shell"));
+      act(() => requestLocalReviewContext(comment));
+      expect(screen.getByTestId("composer-shell-mode-indicator")).toHaveTextContent(
+        SHELL_REVIEW_COMMENT_REFUSAL,
+      );
+      expect(screen.getByTestId("composer-highlight-overlay").textContent).toBe(draft);
+
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(props.onSend).not.toHaveBeenCalled();
+      expect(
+        screen.getByText(SHELL_REVIEW_COMMENT_REFUSAL, { selector: "[data-escape-owner]" }),
+      ).toBeVisible();
+      expect(textarea()).toHaveValue(draft);
+    },
+  );
 });
 
 describe("Composer placeholder", () => {
@@ -5737,6 +6172,34 @@ describe("Composer placeholder", () => {
     render(<Composer {...composerProps({ status: "streaming" })} />);
     expect(textarea().placeholder).toMatch(/send a follow-up/i);
   });
+
+  it.each([
+    {
+      viewport: "desktop",
+      hostId: "host-a",
+      copy: "Session offline — reconnect below to continue",
+    },
+    {
+      viewport: "mobile",
+      hostId: "host-a",
+      copy: "Session offline — reconnect from the host menu",
+    },
+    { viewport: "mobile", hostId: null, copy: "Session offline — reconnect below to continue" },
+  ])(
+    "points an offline $viewport session with host $hostId at its reconnect control",
+    ({ viewport, hostId, copy }) => {
+      // Mobile moves a bound host's button into the header; a session with no
+      // host reconnects from the banner below the composer instead.
+      if (viewport === "mobile") onTestFinished(forceMobileViewport());
+      composerSessionSnapshot.hostId = hostId;
+      onTestFinished(() => {
+        composerSessionSnapshot.hostId = null;
+      });
+      render(<Composer {...composerProps({ unreachable: true })} />);
+      expect(textarea()).toBeDisabled();
+      expect(textarea().placeholder).toBe(copy);
+    },
+  );
 
   it("resets the native text input when the Send button moves focus first", () => {
     const props = composerProps({ status: "streaming", isWorking: true });
@@ -6016,15 +6479,6 @@ describe("Composer reply quotes", () => {
     expect(document.activeElement).toBe(ta);
     expect(ta.selectionStart).toBe(ta.value.length);
     expect(ta.selectionEnd).toBe(ta.value.length);
-  });
-
-  // The mobile boundary is the canonical layout predicate (not provably at
-  // md+), not the historical bespoke 767px — 767.5px sits between the two,
-  // so this test pins the migrated boundary: suppression must apply there.
-  it("suppresses mount autofocus at 767.5px (below the canonical md boundary)", () => {
-    stubMatchMedia({ width: 767.5 });
-    render(<Composer {...composerProps()} />);
-    expect(document.activeElement).not.toBe(textarea());
   });
 
   it("appends on mobile without opening the software keyboard", () => {
@@ -6750,27 +7204,7 @@ describe("Composer reply quotes", () => {
     );
     act(() => ref.current?.appendReplyQuote("Existing quote"));
     fireEvent.change(textarea(), { target: { value: "My instructions" } });
-    const comment = {
-      id: "123",
-      conversation_id: "conv_test",
-      path: "src/example.ts",
-      start_index: 0,
-      end_index: 0,
-      body: "Preserve the public API.",
-      status: "draft" as const,
-      created_at: 1,
-      updated_at: 1,
-      anchor_content: null,
-      created_by: null,
-      anchor_metadata: {
-        pr_url: "https://github.com/acme/repo/pull/1",
-        side: "RIGHT" as const,
-        line: 12,
-        start_line: null,
-        head_sha: "a".repeat(40),
-        base_sha: "b".repeat(40),
-      },
-    };
+    const comment = localReviewComment();
     act(() => requestLocalReviewContext({ ...comment, conversation_id: "other-session" }));
     expect(screen.queryByLabelText(/Open local review comment/)).not.toBeInTheDocument();
     act(() => requestLocalReviewContext(comment));
@@ -6852,7 +7286,7 @@ describe("Composer reply quotes", () => {
         ...comment,
         id: "1011",
         body: "Keep the old behavior for this range.",
-        anchor_metadata: { ...comment.anchor_metadata, side: "LEFT" as const, start_line: 7 },
+        anchor_metadata: { ...LOCAL_REVIEW_ANCHOR, side: "LEFT" as const, start_line: 7 },
       },
     ];
     expect(textarea()).toHaveValue("");
@@ -6928,6 +7362,80 @@ describe("Composer reply quotes", () => {
   });
 });
 
+describe("Composer built-in tint by case", () => {
+  afterEach(() => {
+    cleanup();
+    composerSessionSnapshot.sideChatAllowed = null;
+  });
+
+  // Only built-ins the composer runs case-insensitively may tint in another case.
+  it.each([
+    { harness: "claude-native", text: "/Btw x", token: "/Btw", tinted: false },
+    { harness: "claude-native", text: "/btw x", token: "/btw", tinted: true },
+    { harness: "codex-native", text: "/Side x", token: "/Side", tinted: false },
+    { harness: "codex-native", text: "/side x", token: "/side", tinted: true },
+    { harness: "openai-agents", text: "/Side x", token: "/Side", tinted: true },
+    { harness: "codex-native", text: "/Goal x", token: "/Goal", tinted: true },
+  ])("tints $text on $harness: $tinted", ({ harness, text, token, tinted }) => {
+    composerSessionSnapshot.sideChatAllowed = true;
+    setComposerState({ conversationId: "conv_case", sessionHarness: harness, skills: [] });
+    render(<Composer {...composerProps({ permissionLevel: 4, showGoalControl: true })} />);
+    fireEvent.change(textarea(), { target: { value: text } });
+    expect(textarea().hasAttribute("data-slash-command")).toBe(tinted);
+    expect(screen.queryByText(token, { selector: `.${COMMAND_TOKEN_CLASS}` }) !== null).toBe(
+      tinted,
+    );
+  });
+});
+
+describe("Composer built-in tint with message context", () => {
+  beforeEach(() => {
+    setComposerState({
+      conversationId: "conv_case_ctx",
+      sessionHarness: "codex-native",
+      skills: [],
+    });
+  });
+  afterEach(() => {
+    cleanup();
+    clearLocalReviewContexts("conv_case_ctx");
+  });
+  const goalTint = () => screen.queryByText("/Goal", { selector: `.${COMMAND_TOKEN_CLASS}` });
+
+  // A tag or review comment sends `/Goal` as typed, where nothing runs it.
+  it.each([
+    {
+      label: "an inline tag",
+      draft: "@src/example.ts",
+      add: () =>
+        useChatStore.setState({
+          pendingComposerAttachments: [{ path: "src/example.ts", isDir: false }],
+        }),
+    },
+    {
+      label: "a review comment",
+      draft: "/Goal review",
+      add: () =>
+        requestLocalReviewContext(
+          localReviewComment({ id: "goal-review", conversation_id: "conv_case_ctx" }),
+        ),
+    },
+  ])("drops a mixed-case built-in's tint once $label rides along", ({ draft, add }) => {
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Composer {...composerProps({ showGoalControl: true })} />
+      </QueryClientProvider>,
+    );
+    fireEvent.change(textarea(), { target: { value: "/Goal review" } });
+    expect(goalTint()).not.toBeNull();
+
+    act(add);
+    expect(textarea().value).toContain(draft);
+    expect(goalTint()).toBeNull();
+    expect(textarea()).not.toHaveAttribute("data-slash-command");
+  });
+});
+
 describe("Composer side-chat entry points", () => {
   beforeEach(() => {
     setComposerState({
@@ -6942,7 +7450,106 @@ describe("Composer side-chat entry points", () => {
   afterEach(() => {
     cleanup();
     composerSessionSnapshot.sideChatAllowed = null;
+    setOmnigentHostConfig({});
     vi.restoreAllMocks();
+  });
+
+  it.each(["success", "failure"])(
+    "ignores repeated /side submissions until creation settles (%s)",
+    async (outcome) => {
+      const analytics = vi.fn();
+      setOmnigentHostConfig({ analytics });
+      let finishCreation!: () => void;
+      const creation = new Promise<{ childSessionId: string }>((resolve, reject) => {
+        finishCreation = () => {
+          if (outcome === "success") resolve({ childSessionId: "conv_side" });
+          else reject(new Error("offline"));
+        };
+      });
+      const createSideChat = vi
+        .spyOn(sessionsApi, "createSideChat")
+        .mockReturnValueOnce(creation)
+        .mockResolvedValue({ childSessionId: "conv_next" });
+      const error = vi.spyOn(toast, "error");
+      renderWithTooltips(<Composer {...composerProps()} />);
+      fireEvent.change(textarea(), { target: { value: "/side question" } });
+
+      act(() => {
+        fireEvent.keyDown(textarea(), { key: "Enter" });
+        fireEvent.keyDown(textarea(), { key: "Enter" });
+        fireEvent.click(screen.getByRole("button", { name: "Send" }));
+      });
+
+      expect(createSideChat).toHaveBeenCalledExactlyOnceWith("conv_test");
+      expect(
+        analytics.mock.calls.filter(([event]) => event.componentId === "chat.composer.send"),
+      ).toHaveLength(1);
+      expect(textarea()).toHaveValue("/side question");
+      expect(useChatStore.getState().sideChatToOpen).toBeNull();
+      await act(async () => finishCreation());
+
+      if (outcome === "success") {
+        expect(textarea()).toHaveValue("");
+        expect(useChatStore.getState().sideChatToOpen).toEqual({
+          childId: "conv_side",
+          parentId: "conv_test",
+        });
+        fireEvent.change(textarea(), { target: { value: "/side another question" } });
+      } else {
+        expect(textarea()).toHaveValue("/side question");
+        expect(useChatStore.getState().sideChatToOpen).toBeNull();
+        expect(error).toHaveBeenCalledWith("Couldn't start a side chat for this session.");
+      }
+
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      await waitFor(() =>
+        expect(useChatStore.getState().sideChatToOpen).toEqual({
+          childId: "conv_next",
+          parentId: "conv_test",
+        }),
+      );
+      expect(createSideChat).toHaveBeenCalledTimes(2);
+      expect(textarea()).toHaveValue("");
+    },
+  );
+
+  it("keeps pending /side creations independent across conversation switches", async () => {
+    clearSessionDrafts();
+    const finishCreation = new Map<string, () => void>();
+    const createSideChat = vi.spyOn(sessionsApi, "createSideChat").mockImplementation(
+      (sourceId) =>
+        new Promise((resolve) => {
+          finishCreation.set(sourceId, () => resolve({ childSessionId: `side_${sourceId}` }));
+        }),
+    );
+    renderWithTooltips(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: "/side first question" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+
+    act(() => useChatStore.setState({ conversationId: "conv_other" }));
+    fireEvent.change(textarea(), { target: { value: "/side second question" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(createSideChat.mock.calls.map(([sourceId]) => sourceId)).toEqual([
+      "conv_test",
+      "conv_other",
+    ]);
+
+    act(() => useChatStore.setState({ conversationId: "conv_test" }));
+    expect(textarea()).toHaveValue("/side first question");
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(createSideChat).toHaveBeenCalledTimes(2);
+    await act(async () => finishCreation.get("conv_test")!());
+
+    act(() => useChatStore.setState({ conversationId: "conv_other" }));
+    expect(textarea()).toHaveValue("/side second question");
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(createSideChat).toHaveBeenCalledTimes(2);
+    await act(async () => finishCreation.get("conv_other")!());
+    expect(textarea()).toHaveValue("");
+    expect(useChatStore.getState().sideChatToOpen).toEqual({
+      childId: "side_conv_other",
+      parentId: "conv_other",
+    });
   });
 
   // An admin has owner level, but only the root session's owner starts side chats.
@@ -7198,6 +7805,7 @@ describe("Composer workflow entry point", () => {
           status: original.status,
           sessionStatus: original.sessionStatus,
         });
+        usePlanStops.setState({ requests: {}, settledStops: {} });
       });
       const onStop = vi.fn();
       const onSend = vi.fn(useChatStore.getState().enqueueMessage);
@@ -7207,11 +7815,16 @@ describe("Composer workflow entry point", () => {
       );
       fireEvent.change(textarea(), { target: { value: "An unsent note" } });
       act(() => useSessionTasksActions.getState().stopWork.conv_test?.());
+      // The run shows as stopping from the click, and still once the session takes the message.
+      expect(usePlanStops.getState().requests.conv_test).toMatchObject({ sent: false });
       await waitFor(() =>
         expect(fetchMessage).toHaveBeenCalledWith(
           "/v1/sessions/conv_test/events",
           expect.objectContaining({ method: "POST" }),
         ),
+      );
+      await waitFor(() =>
+        expect(usePlanStops.getState().requests.conv_test).toMatchObject({ sent: true }),
       );
       expect(JSON.parse(fetchMessage.mock.calls[0]![1]!.body as string)).toMatchObject({
         type: "message",
@@ -7236,6 +7849,45 @@ describe("Composer workflow entry point", () => {
       error.mockRestore();
     },
   );
+
+  it.each([
+    {
+      reply: { error: { message: "The session is offline." } },
+      status: 503,
+      message: "The session is offline.",
+    },
+    {
+      reply: { queued: false, denied: true },
+      status: 200,
+      message: "A policy blocked the message.",
+    },
+  ])("restores Stop when the stop message fails, with the error: $message", async (failure) => {
+    setComposerState({
+      conversationId: "conv_test",
+      sessionHarness: "openai-agents",
+      skills: [],
+      sessionStatus: "running",
+    });
+    const fetchMessage = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify(failure.reply), {
+        status: failure.status,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    const error = vi.spyOn(toast, "error");
+    onTestFinished(() => {
+      fetchMessage.mockRestore();
+      error.mockRestore();
+      usePlanStops.setState({ requests: {}, settledStops: {} });
+    });
+    renderWithWorkflows(<Composer {...composerProps()} />);
+
+    act(() => useSessionTasksActions.getState().stopWork.conv_test?.());
+    expect(usePlanStops.getState().requests.conv_test).toMatchObject({ sent: false });
+    await waitFor(() => expect(error).toHaveBeenCalledWith(failure.message));
+    expect(error).toHaveBeenCalledOnce();
+    expect(usePlanStops.getState().requests.conv_test).toBeUndefined();
+  });
 
   it("opens the dialog for the Tasks tab's empty state", async () => {
     setComposerState({
@@ -7503,7 +8155,7 @@ describe("Composer file-attachment focus", () => {
     ta.blur();
     expect(document.activeElement).not.toBe(ta);
 
-    const bad = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
+    const bad = new File([new Uint8Array(10)], "clip.webm", { type: "video/webm" });
     fireEvent.change(fileInput(), { target: { files: [bad] } });
 
     expect(document.activeElement).not.toBe(ta);
@@ -7558,7 +8210,7 @@ describe("Composer file-attachment focus", () => {
     // nothing else clears the notice. Left sticky it reads as a blocker on a
     // composer that can actually be submitted.
     render(<Composer {...composerProps()} />);
-    const bad = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
+    const bad = new File([new Uint8Array(10)], "clip.webm", { type: "video/webm" });
     fireEvent.change(fileInput(), { target: { files: [bad] } });
     expect(screen.getByText(/can't be attached/)).toBeTruthy();
 
@@ -7573,7 +8225,7 @@ describe("Composer file-attachment focus", () => {
     // composer's mixed-drop behavior).
     render(<Composer {...composerProps()} />);
     const ok = new File(["hello"], "notes.txt", { type: "text/plain" });
-    const bad = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
+    const bad = new File([new Uint8Array(10)], "clip.webm", { type: "video/webm" });
     fireEvent.change(fileInput(), { target: { files: [ok, bad] } });
     expect(screen.getByText("notes.txt")).toBeTruthy();
     expect(screen.getByText(/can't be attached/)).toBeTruthy();
@@ -7686,7 +8338,7 @@ describe("Composer failed-send attachment restore", () => {
   it("restores the retriable files and flags the ones current limits reject", () => {
     render(<Composer {...composerProps()} />);
     const ok = new File(["hello"], "notes.txt", { type: "text/plain" });
-    const bad = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
+    const bad = new File([new Uint8Array(10)], "clip.webm", { type: "video/webm" });
     act(() =>
       useChatStore.setState({
         failedSendDraft: { conversationId: "conv_test", text: "", files: [ok, bad] },
@@ -7694,7 +8346,7 @@ describe("Composer failed-send attachment restore", () => {
     );
 
     expect(screen.getByText("notes.txt")).toBeTruthy();
-    expect(screen.queryByText("clip.mp4")).toBeNull();
+    expect(screen.queryByText("clip.webm")).toBeNull();
     expect(screen.getByText(/can't be attached/)).toBeTruthy();
     // The store entry drained on restore, so the draft can't come back twice.
     expect(useChatStore.getState().failedSendDraft).toBeNull();
@@ -7732,7 +8384,7 @@ describe("Composer failed-send attachment restore", () => {
         failedSendDraft: {
           conversationId: "conv_test",
           text: "",
-          files: [new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" })],
+          files: [new File([new Uint8Array(10)], "clip.webm", { type: "video/webm" })],
         },
       }),
     );
@@ -9611,4 +10263,87 @@ describe("saved sandbox inference policy", () => {
       expect(useChatStore.getState().setModel).not.toHaveBeenCalled();
     },
   );
+});
+
+describe("Composer with the CodeMirror release flag on", () => {
+  const codeMirrorInfo = { ...FALLBACK_SERVER_INFO, features: { chat_composer_codemirror: true } };
+  beforeEach(() => resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule));
+  afterEach(() => resetCodeMirrorComposerLoadForTests());
+
+  it("renders the main composer on CodeMirror and sends a typed message", async () => {
+    const props = composerProps();
+    render(
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <Composer {...props} />
+      </CapabilitiesProvider>,
+    );
+    await waitFor(() =>
+      expect(screen.getByLabelText("Message the agent")).toHaveClass("cm-content"),
+    );
+    const editor = screen.getByLabelText("Message the agent");
+
+    act(() => insertComposerText(composerTargetOf(editor)!, "ship the fix"));
+    fireEvent.keyDown(editor, { key: "Enter" });
+
+    expect(props.onSend).toHaveBeenCalledExactlyOnceWith("ship the fix", undefined);
+    await waitFor(() => expect(composerTargetOf(editor)?.value).toBe(""));
+  });
+
+  const commandMarks = () =>
+    Array.from(document.querySelectorAll('[data-testid="composer-command-token"]'), (mark) => [
+      mark.textContent,
+      mark.className,
+    ]);
+  async function renderEditor(props: ReturnType<typeof composerProps>) {
+    render(
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <Composer {...props} />
+      </CapabilitiesProvider>,
+    );
+    await waitFor(() =>
+      expect(screen.getByLabelText("Message the agent")).toHaveClass("cm-content"),
+    );
+    return screen.getByLabelText("Message the agent");
+  }
+
+  it("tints a built-in typed in another case in the editor, as it still runs", async () => {
+    const { sessionHarness } = useChatStore.getState();
+    onTestFinished(() => useChatStore.setState({ sessionHarness }));
+    setComposerState({ conversationId: "conv_codemirror_goal", sessionHarness: "codex-native" });
+    const editor = await renderEditor(composerProps({ showGoalControl: true }));
+    act(() => insertComposerText(composerTargetOf(editor)!, "/Goal Fix CI"));
+    expect(commandMarks()).toEqual([["/Goal", COMMAND_TOKEN_CLASS]]);
+    expect(editor).toHaveAttribute("data-slash-command", "true");
+  });
+
+  it("tints a known command in the editor but not an unknown one", async () => {
+    setComposerState({
+      conversationId: "conv_codemirror_tint",
+      skills: [{ name: "team", description: "Run a team" }],
+    });
+    const editor = await renderEditor(composerProps());
+    act(() => insertComposerText(composerTargetOf(editor)!, "/team fix it"));
+    expect(commandMarks()).toEqual([["/team", COMMAND_TOKEN_CLASS]]);
+    expect(editor).toHaveAttribute("data-slash-command", "true");
+
+    act(() => insertComposerText(composerTargetOf(editor)!, "/typo", 0, 5));
+    expect(commandMarks()).toEqual([]);
+    expect(editor).not.toHaveAttribute("data-slash-command");
+  });
+
+  it("tints a codex-native owner's `!` in the editor and sends the shell command unchanged", async () => {
+    const { sessionHarness } = useChatStore.getState();
+    onTestFinished(() => useChatStore.setState({ sessionHarness }));
+    setComposerState({ conversationId: "conv_codemirror_shell", skills: [], blocks: [] });
+    useChatStore.setState({ sessionHarness: "codex-native" });
+    const props = composerProps({ isNativeWrapper: true, permissionLevel: null });
+    const editor = await renderEditor(props);
+    act(() => insertComposerText(composerTargetOf(editor)!, "!git status"));
+    expect(commandMarks()).toEqual([["!", COMMAND_TOKEN_CLASS]]);
+    expect(editor).toHaveAttribute("data-shell-command", "true");
+    expect(editor).toHaveAccessibleDescription("Shell command");
+
+    fireEvent.keyDown(editor, { key: "Enter" });
+    expect(props.onSend).toHaveBeenCalledExactlyOnceWith("!git status", undefined);
+  });
 });

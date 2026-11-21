@@ -49,6 +49,7 @@ import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictio
 import { SESSION_ACTIONS_LOADING } from "@/lib/sessionCapabilities";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { fetchSessionRepositoryBranches, forkSession, launchRunner } from "@/lib/sessionsApi";
+import { conversationRowFromSession, insertCreatedRowIntoCaches } from "@/lib/sessionListCache";
 import { useAvailableAgents, prefetchAvailableAgentDetails } from "@/hooks/useAvailableAgents";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { partitionAgentsByKind } from "@/lib/agentGrouping";
@@ -1687,6 +1688,8 @@ function SupportedForkSessionForm({
           console.warn(`Clone ${fork.id}: background runner launch failed`, e);
         });
       }
+      // Show the fork now and keep it listed while the list refetch lags.
+      insertCreatedRowIntoCaches(queryClient, conversationRowFromSession(fork));
       // Fire-and-forget: the sidebar refresh must not gate navigation.
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       // The fork inherits the source's project, and each folder renders its

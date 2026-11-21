@@ -6,6 +6,10 @@ interface Props {
   children: ReactNode;
   name: string;
   resetKey?: string;
+  /** Shown instead of the alert; `null` hides a part whose absence is fine. */
+  fallback?: ReactNode;
+  /** Told of a render failure it contained. */
+  onError?: (error: Error) => void;
 }
 
 interface State {
@@ -29,10 +33,12 @@ export class RenderErrorBoundary extends Component<Props, State> {
 
   override componentDidCatch(error: Error, info: ErrorInfo) {
     console.error(`Rendering ${this.props.name} failed`, error, info.componentStack);
+    this.props.onError?.(error);
   }
 
   override render() {
     if (!this.state.failed) return this.props.children;
+    if (this.props.fallback !== undefined) return this.props.fallback;
     return (
       <div
         role="alert"

@@ -7,8 +7,6 @@ import { vi } from "vitest";
 // to observe them without racing Testing Library's matching default timeout.
 configure({ asyncUtilTimeout: 2000 });
 
-import { MD_MIN_WIDTH_QUERY } from "@/lib/breakpoints";
-
 // The @lobehub icon packages have broken nested-module resolution
 // under vitest; stub presentational glyphs so component modules that
 // import them can still load in tests. (The Antigravity glyph additionally
@@ -53,6 +51,12 @@ if (!Element.prototype.scrollIntoView) {
   Element.prototype.scrollIntoView = () => {};
 }
 
+// jsdom has no layout. CodeMirror measures its text through Range.getClientRects, so an
+// empty list lets it measure without a rect. Tests that need a rect stub it themselves.
+if (typeof Range.prototype.getClientRects !== "function") {
+  Range.prototype.getClientRects = () => [] as unknown as DOMRectList;
+}
+
 // jsdom doesn't implement IntersectionObserver (used by the sidebar's
 // infinite-scroll sentinel). A no-op stub is enough — tests that need to drive
 // auto-loading can override the global with their own controllable mock.
@@ -86,16 +90,9 @@ if (typeof globalThis.ResizeObserver === "undefined") {
   };
 }
 
-// @tanstack/react-virtual windows rows off the scroll element's measured
-// height, but jsdom does no layout — every element is 0×0, so the real
-// virtualizer renders nothing and component tests can't see any rows. Replace
-// it with a pass-through that renders every item; the windowing itself is
-// browser behaviour verified manually, and the components' logic (flatten /
-// expand / lazy-load for FolderTree; bubble building / history load /
-// indicators for the transcript) is what the unit tests assert. Shared by both
-// consumers, so the shape is the superset they read — honouring `getItemKey`
-// and exposing the offset/range/scroll handles the transcript's
-// VirtualBubbleList touches, so its real path doesn't throw under jsdom.
+// jsdom does no layout, so the real virtualizer renders no rows. This pass-through
+// renders every item and exposes the superset of handles its consumers read.
+// Tests of the windowing itself `vi.unmock` it and stub element sizes.
 const ROW = 200;
 vi.mock("@tanstack/react-virtual", async (importOriginal) => ({
   measureElement: (await importOriginal<typeof ReactVirtualModule>()).measureElement,
@@ -112,6 +109,7 @@ vi.mock("@tanstack/react-virtual", async (importOriginal) => ({
       return {
         getVirtualItems: () => items,
         getTotalSize: () => count * ROW,
+        measure: () => {},
         measureElement: () => {},
         scrollToIndex: () => {},
         getVirtualItemForOffset: (offset: number) =>
@@ -135,9 +133,7 @@ vi.mock("@tanstack/react-virtual", async (importOriginal) => ({
 Object.defineProperty(window, "matchMedia", {
   writable: true,
   value: (query: string) => ({
-    // Preserve the pre-min-width desktop default without changing capability,
-    // color-scheme, or reduced-motion queries.
-    matches: query === MD_MIN_WIDTH_QUERY,
+    matches: false,
     media: query,
     onchange: null,
     addListener: () => {},

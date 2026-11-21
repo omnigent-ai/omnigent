@@ -19,7 +19,8 @@ shell terminal panel:
   - the long output line must FIT the panel (``scrollWidth`` no wider
     than ``clientWidth``), i.e. wrap instead of forcing a horizontal
     scrollbar;
-  - turning word wrap off switches the line to horizontal scrolling;
+  - turning word wrap off switches the line to horizontal scrolling, and the
+    choice survives a reload;
   - with Settings > Terminal theme pinned to dark under a light app, the
     reloaded panel renders in the dark terminal palette, selection included.
 
@@ -254,6 +255,9 @@ def test_tool_output_long_line_wraps_instead_of_clipping(
     page.reload()
     _expand_tool_output(page)
     terminal = page.get_by_test_id("shell-tool-terminal")
+    # Word wrap is a persisted preference: the reloaded panel stays unwrapped.
+    expect(terminal.get_by_role("button", name="Enable word wrap")).to_be_visible()
+    page.wait_for_function(_SCROLLS, timeout=8_000)
     expect(terminal).to_have_attribute("data-terminal-theme", "dark")
     expect(terminal).to_have_css("background-color", "rgb(10, 10, 10)")
     # Selected text stays light on the dark panel instead of taking the light

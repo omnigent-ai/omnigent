@@ -47,10 +47,10 @@ to customize.
   Instructions for the task session, and Advanced's summary shows One task session.
   The choice is saved in the prompt, survives switching integrations, and isn't
   offered on edit. Archiving the task session makes the next match start a new one.
-  With a workflow chosen, One task session is disabled and a note says each match
-  runs the workflow in a new session. Saving a workflow trigger that used one task
-  session from the trigger form switches it to a session for each match; one that
-  opens as its prompt text can't be saved until the workflow is removed.
+  With a workflow chosen, One task session is disabled, since each match runs the
+  workflow in a new session. Saving a workflow trigger that used one task session
+  from the trigger form switches it to a session for each match; one that opens as
+  its prompt text can't be saved until the workflow is removed.
 - `prompt-editing`: the rendered template prompt is never shown or editable; there is
   no System prompt, Preview prompt, or Edit as prompt. A trigger saves its form state
   as a one-line `<!-- omnigent-trigger v1 {...} -->` header above the rendered prompt.
@@ -154,6 +154,13 @@ to customize.
   Custom schedule remains available for other recurrence patterns.
   The shared modal supports ten-minute connected-host schedules in
   either session mode and continued-sandbox schedules; new sandbox sessions stay hourly.
+- `rrule-editor`: the schedule picker opens with a Visual | RRULE toggle (RRULE needs
+  `automations_v2`). RRULE takes one rule line, seeded from the current schedule, with
+  the timezone below it and the end under Ends; the form checks only its shape, and the
+  server reports why a rule can't run on save. A saved rule the visual controls can't show,
+  such as hourly 9 AM to 5 PM on weekdays, opens on RRULE, and an edit that leaves it alone
+  saves it unchanged. Summaries show such rules as written. Rules with `COUNT=1` stay
+  unsupported in the form.
 - `capabilities`: Jira, Slack, GitHub, Linear, and PagerDuty templates require session continuity
   and orchestration. Unsupported servers still allow creation from scratch.
 - `tools-note`: the form says which tools the agent needs where the task runs,

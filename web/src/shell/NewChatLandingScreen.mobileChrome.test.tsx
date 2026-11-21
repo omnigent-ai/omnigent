@@ -104,9 +104,7 @@ function setViewport(mobile: boolean): void {
   Object.defineProperty(window, "matchMedia", {
     writable: true,
     value: (query: string) => ({
-      // Answer both query poles like a real viewport would: phones match
-      // max-width queries, desktops match min-width queries.
-      matches: mobile ? query.includes("max-width") : query.includes("min-width"),
+      matches: mobile && query.includes("max-width"),
       media: query,
       onchange: null,
       addListener: () => {},

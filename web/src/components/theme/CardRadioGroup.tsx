@@ -2,6 +2,7 @@ import { useRef, type ReactNode } from "react";
 import { CheckIcon } from "lucide-react";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { cn } from "@/lib/utils";
+import { useSettingsOwnership } from "@/pages/settings/search/settingsOwnership";
 
 export interface CardRadioOption<T extends string> {
   value: T;
@@ -37,9 +38,15 @@ export function CardRadioGroup<T extends string>({
       }
     : onSelect;
   const refs = useRef(new Map<T, HTMLButtonElement | null>());
+  // Under a Settings owner the group is that row's control, and each card one of its choices.
+  const owned = useSettingsOwnership();
 
   return (
-    <div role="radiogroup" aria-labelledby={labelledBy} className={className}>
+    <div
+      role="radiogroup"
+      {...owned.control({ outside: { "aria-labelledby": labelledBy } })}
+      className={className}
+    >
       {items.map((item, index) => {
         const selected = item.value === value;
         return (

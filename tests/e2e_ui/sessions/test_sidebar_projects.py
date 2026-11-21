@@ -77,6 +77,7 @@ def _move_to_new_project(page: Page, row: Locator, name: str) -> None:
     row.get_by_test_id("conversation-actions").click()
     # Open the submenu flyout, then pick the just-created project by name.
     page.get_by_test_id("move-to-project").click()
+    page.get_by_role("menuitem", name="Projects", exact=True).hover()
     page.get_by_role("menuitem", name=name, exact=True).click()
 
 
@@ -258,6 +259,7 @@ def test_remove_session_from_project(
     project_row.hover()
     project_row.get_by_test_id("conversation-actions").click()
     page.get_by_test_id("move-to-project").click()
+    page.get_by_role("menuitem", name="Projects", exact=True).hover()
     # The kebab item names the project it removes from ("Remove from <name>").
     # It unfiles immediately — no confirmation, since a first-class project
     # persists when emptied (nothing is deleted).
@@ -270,7 +272,8 @@ def test_remove_session_from_project(
     expect(_section(page, project).locator(f'a[href="/c/{session_id}"]')).to_have_count(0)
 
 
-# Below the 768px breakpoint the sidebar is a mobile overlay.
+# Below the 1181px breakpoint the shell uses the mobile layout. The phone
+# sidebar is an overlay; the 3:4 tablet docks it beside the page.
 _MOBILE_VIEWPORT = {"width": 390, "height": 780}
 _TABLET_VIEWPORT = {"width": 834, "height": 1112}
 
@@ -294,12 +297,12 @@ def test_project_header_action_is_clickable_on_touch_tablet(
     browser: Browser,
     seeded_session: tuple[str, str],
 ) -> None:
-    """The Projects header action stays visible above ``md`` without hover."""
+    """The Projects header action stays visible on a tablet in the mobile layout."""
     base_url, session_id = seeded_session
     context = browser.new_context(viewport=_TABLET_VIEWPORT, has_touch=True)
     page = context.new_page()
     try:
-        page.goto(f"{base_url}/c/{session_id}")
+        page.goto(f"{base_url}/c/{session_id}?sidebar=open")
         assert page.evaluate("matchMedia('(hover: none)').matches")
         new_project = page.get_by_test_id("new-project")
         expect(new_project).to_be_visible()
@@ -357,10 +360,9 @@ def test_project_actions_are_keyboard_accessible_on_desktop(
     [
         ({"width": 390, "height": 780}, True),
         ({"width": 834, "height": 1194}, True),
-        ({"width": 1194, "height": 834}, True),
         ({"width": 500, "height": 780}, False),
     ],
-    ids=["phone", "ipad-portrait", "ipad-landscape", "narrow-mouse"],
+    ids=["phone", "ipad-portrait", "narrow-mouse"],
 )
 def test_project_actions_follow_the_input_type(
     browser: Browser,
@@ -402,7 +404,7 @@ def test_project_actions_follow_the_input_type(
         expect(shortcut).to_be_visible()
         for expanded in [True, False]:
             if header.get_attribute("aria-expanded") != str(expanded).lower():
-                header.click()
+                header.locator("[data-section-toggle]").first.click()
                 touch.mouse.move(viewport["width"] - 1, 0)
             expect(kebab).to_be_visible()
             assert kebab.evaluate("""element => {

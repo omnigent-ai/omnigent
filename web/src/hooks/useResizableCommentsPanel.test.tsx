@@ -8,6 +8,10 @@ import {
 } from "./useResizableCommentsPanel";
 
 const originalInnerWidth = window.innerWidth;
+// useIsMobileViewport's queries: `md` is 1181px, and the hook subscribes to the
+// mobile side of it.
+const DESKTOP_QUERY = "(min-width: 1181px)";
+const MOBILE_QUERY = "(max-width: 1180.98px)";
 
 // jsdom has no pointer capture, so tests drive the returned handlers directly
 // with a stub handle element that tracks capture state.
@@ -73,7 +77,7 @@ function attachContainer(
 
 beforeEach(() => {
   setInnerWidth(2000);
-  mockMatchMedia({ "(min-width: 768px)": true });
+  mockMatchMedia({ [DESKTOP_QUERY]: true });
 });
 
 afterEach(() => {
@@ -81,6 +85,23 @@ afterEach(() => {
   resetCommentsWidthStoreForTesting();
   setInnerWidth(originalInnerWidth);
   window.matchMedia = originalMatchMedia;
+  vi.unstubAllGlobals();
+});
+
+describe("useResizableCommentsPanel layout", () => {
+  it.each([
+    ["a browser", false, false],
+    ["the desktop app", true, true],
+  ])("sizes the panel inline below md only in %s", (_name, desktopApp, inline) => {
+    setInnerWidth(900);
+    mockMatchMedia({ [MOBILE_QUERY]: true });
+    if (desktopApp) vi.stubGlobal("omnigentDesktop", { kind: "electron" });
+
+    const { result } = renderHook(() => useResizableCommentsPanel());
+
+    expect(result.current.isDesktop).toBe(inline);
+    expect(result.current.width).toBe(inline ? 240 : undefined);
+  });
 });
 
 describe("useResizableCommentsPanel persistence", () => {
@@ -233,7 +254,7 @@ describe("useResizableCommentsPanel pointer drag", () => {
   it("aborts the drag when the layout flips below the md breakpoint", () => {
     // Flipping to mobile unmounts the handle, so its up/cancel can never
     // arrive; the drag must end (unpersisted) or the overlay would wedge.
-    const mm = mockMatchMedia({ "(min-width: 768px)": true });
+    const mm = mockMatchMedia({ [DESKTOP_QUERY]: true });
     const { result, unmount } = renderHook(() => useResizableCommentsPanel());
     attachContainer(result.current.containerRef);
     const target = makeHandleTarget();
@@ -241,7 +262,10 @@ describe("useResizableCommentsPanel pointer drag", () => {
     act(() => result.current.handleProps.onPointerDown(pointerEvent(target, { pointerId: 4 })));
     expect(overlaySelector()).not.toBeNull();
 
-    act(() => mm.fire("(min-width: 768px)", false));
+    act(() => {
+      mm.fire(DESKTOP_QUERY, false);
+      mm.fire(MOBILE_QUERY, true);
+    });
     expect(result.current.isDesktop).toBe(false);
     expect(overlaySelector()).toBeNull();
     expect(document.body.style.cursor).toBe("");
@@ -468,7 +492,7 @@ describe("useResizableCommentsPanel touch affordances", () => {
 
   it("seeds desktop state from the canonical media query, not innerWidth", () => {
     setInnerWidth(2000);
-    mockMatchMedia({ "(min-width: 768px)": false });
+    mockMatchMedia({ [DESKTOP_QUERY]: false, [MOBILE_QUERY]: true });
     const { result, unmount } = renderHook(() => useResizableCommentsPanel());
 
     expect(result.current.isDesktop).toBe(false);

@@ -17,7 +17,7 @@ import {
 } from "@/hooks/resizableWidthStore";
 import { useInputCapabilities } from "@/hooks/useInputCapabilities";
 import { useResizeDrag } from "@/hooks/useResizeDrag";
-import { isMobileViewport, subscribeMdBreakpoint } from "@/lib/breakpoints";
+import { isDesktopLayout, subscribeMobileViewport } from "@/hooks/useIsMobileViewport";
 
 // The default gives conversation titles room before truncating. The floor keeps
 // controls usable; the viewport-relative ceiling preserves the main content.
@@ -128,8 +128,8 @@ export function useResizableSidebar() {
   const cancelResizeDrag = resizeDrag.cancelDrag;
   useEffect(
     () =>
-      subscribeMdBreakpoint(() => {
-        if (isMobileViewport()) cancelResizeDrag();
+      subscribeMobileViewport(() => {
+        if (!isDesktopLayout()) cancelResizeDrag();
       }),
     [cancelResizeDrag],
   );

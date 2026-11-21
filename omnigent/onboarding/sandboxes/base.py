@@ -1091,6 +1091,19 @@ class SandboxHostLauncher(SandboxLifecycle):
         del sandbox_id
         return None
 
+    def bind_owner(self, owner: str) -> None:
+        """
+        Bind the session owner this launcher instance acts for.
+
+        Called by the server right after it builds a launcher for a host's
+        owner, before any other method. Providers that act on the owner's
+        behalf (for example, passing it to an external API for authorization
+        or attribution) override it; the default ignores the owner.
+
+        :param owner: The host's user id, e.g. ``alice@example.com``.
+        """
+        del owner
+
     @abstractmethod
     def start_host(
         self,

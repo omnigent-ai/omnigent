@@ -379,7 +379,9 @@ describe("useResizableSidebar", () => {
     // A touch/pen drag started at desktop width must not survive the layout
     // flip to mobile: the handle hides but capture would persist, and release
     // would write an unintended width.
-    const mm = mockMatchMedia({ "(min-width: 768px)": true });
+    // md (desktop layout) is `(min-width: 1181px)`; crossings arrive on the
+    // mobile `(max-width: 1180.98px)` query useIsMobileViewport subscribes to.
+    const mm = mockMatchMedia({ "(min-width: 1181px)": true });
     const { result, unmount } = renderHook(() => useResizableSidebar());
     const handle = createHandle();
 
@@ -392,7 +394,10 @@ describe("useResizableSidebar", () => {
     expect(result.current.width).toBe(600);
     expect(document.body.style.cursor).toBe("col-resize");
 
-    act(() => mm.fire("(min-width: 768px)", false));
+    act(() => {
+      mm.fire("(min-width: 1181px)", false);
+      mm.fire("(max-width: 1180.98px)", true);
+    });
 
     expect(result.current.width).toBe(320);
     expect(readPanelSizePreference("sidebarWidthPx")).toBeNull();

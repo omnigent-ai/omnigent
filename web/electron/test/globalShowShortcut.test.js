@@ -2,7 +2,13 @@ const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
 
-const { acceleratorLabel, createGlobalShowShortcut } = require("../src/globalShowShortcut");
+const {
+  GLOBAL_SHORTCUTS,
+  acceleratorLabel,
+  chordKey,
+  createGlobalShortcuts,
+  createGlobalShowShortcut,
+} = require("../src/globalShowShortcut");
 
 /**
  * A settings store and a fake GlobalShortcut. `refused` chords make register
@@ -385,6 +391,357 @@ describe("recording a chord", () => {
     contents.emit("destroyed");
     assert.equal(await closed, null);
     assert.equal(contents.listenerCount("before-input-event"), 0);
+  });
+});
+
+describe("createGlobalShortcuts", () => {
+  /**
+   * How macOS Electron tells chords apart, written independently of chordKey so a bug there
+   * can't hide behind the fake: one name per modifier and key alias, in any order and case.
+   */
+  const MAC_NAMES = {
+    commandorcontrol: "cmd",
+    cmdorctrl: "cmd",
+    command: "cmd",
+    cmd: "cmd",
+    super: "cmd",
+    meta: "cmd",
+    control: "ctrl",
+    ctrl: "ctrl",
+    alt: "alt",
+    option: "alt",
+    return: "enter",
+    esc: "escape",
+  };
+  /** Off macOS, CommandOrControl is Ctrl, and Command is the Win/Super key. */
+  const OTHER_NAMES = {
+    ...MAC_NAMES,
+    commandorcontrol: "ctrl",
+    cmdorctrl: "ctrl",
+    command: "super",
+    cmd: "super",
+    super: "super",
+    meta: "super",
+  };
+  const electronChord = (accelerator, isMac) =>
+    accelerator
+      .toLowerCase()
+      .split("+")
+      .map((part) => (isMac ? MAC_NAMES : OTHER_NAMES)[part] ?? part)
+      .sort()
+      .join("+");
+
+  /**
+   * Both shortcuts over one settings store and a fake GlobalShortcut that, like Electron,
+   * refuses a chord already registered in any spelling. `pressed` counts each action; `ids`
+   * picks which shortcuts the app builds.
+   */
+  function shortcuts(
+    settings = {},
+    { isMac = true, ids = ["show", "floatingComposer"], active } = {},
+  ) {
+    let stored = structuredClone(settings);
+    const live = new Map();
+    const pressed = { show: 0, floatingComposer: 0 };
+    const built = createGlobalShortcuts({
+      globalShortcut: {
+        register: (accelerator, press) => {
+          if (live.has(electronChord(accelerator, isMac))) return false;
+          live.set(electronChord(accelerator, isMac), { accelerator, press });
+          return true;
+        },
+        unregister: (accelerator) => live.delete(electronChord(accelerator, isMac)),
+      },
+      loadSettings: () => structuredClone(stored),
+      saveSettings: (next) => {
+        stored = structuredClone(next);
+      },
+      isMac,
+      presses: Object.fromEntries(ids.map((id) => [id, () => (pressed[id] += 1)])),
+      active,
+    });
+    return {
+      ...built,
+      saved: () => stored,
+      rewrite: (next) => {
+        stored = structuredClone(next);
+      },
+      registered: () => [...live.values()].map(({ accelerator }) => accelerator),
+      press: (accelerator) => {
+        const entry = live.get(electronChord(accelerator, isMac));
+        assert.ok(
+          entry,
+          `${accelerator} isn't registered; registered: ${[...live.values()].map((e) => e.accelerator)}`,
+        );
+        entry.press();
+      },
+      pressed,
+    };
+  }
+
+  it("runs each shortcut's own action when its chord is pressed", async () => {
+    const s = shortcuts();
+    assert.equal(
+      (await s.show.set({ enabled: true, accelerator: "Alt+Space" }, async () => true)).ok,
+      true,
+    );
+    s.floatingComposer.apply();
+    s.press("Alt+Space");
+    assert.deepEqual(s.pressed, { show: 1, floatingComposer: 0 });
+    s.press("CommandOrControl+Shift+Space");
+    assert.deepEqual(s.pressed, { show: 1, floatingComposer: 1 });
+  });
+
+  it("holds its chord only while active, and lets go when it isn't", () => {
+    let on = false;
+    const s = shortcuts({}, { active: { floatingComposer: () => on } });
+    s.floatingComposer.apply();
+    assert.deepEqual(s.registered(), []);
+    assert.equal(s.floatingComposer.current().error, undefined);
+    on = true;
+    s.floatingComposer.apply();
+    s.press("CommandOrControl+Shift+Space");
+    assert.deepEqual(s.pressed, { show: 0, floatingComposer: 1 });
+    on = false;
+    s.floatingComposer.apply();
+    assert.deepEqual(s.registered(), []);
+  });
+
+  it("keeps no chord from another shortcut while inactive, and loses it once active", async () => {
+    let on = false;
+    const s = shortcuts({}, { active: { floatingComposer: () => on } });
+    const taken = await s.show.set(
+      { enabled: true, accelerator: "CommandOrControl+Shift+Space" },
+      async () => true,
+    );
+    assert.equal(taken.ok, true);
+    on = true;
+    s.floatingComposer.apply();
+    assert.deepEqual(s.registered(), ["CommandOrControl+Shift+Space"]);
+    assert.match(s.floatingComposer.current().error, /Another Omnigent shortcut/);
+    s.press("CommandOrControl+Shift+Space");
+    assert.deepEqual(s.pressed, { show: 1, floatingComposer: 0 });
+  });
+
+  it("saves a chord while inactive without holding it, and holds it once active", async () => {
+    let on = false;
+    const s = shortcuts({}, { active: { floatingComposer: () => on } });
+    const result = await s.floatingComposer.set(
+      { enabled: true, accelerator: "Alt+Shift+K" },
+      async () => true,
+    );
+    assert.equal(result.ok, true);
+    assert.deepEqual(s.registered(), []);
+    assert.deepEqual(s.saved().floating_composer_shortcut, {
+      enabled: true,
+      accelerator: "Alt+Shift+K",
+    });
+    on = true;
+    s.floatingComposer.apply();
+    assert.deepEqual(s.registered(), ["Alt+Shift+K"]);
+    s.press("Alt+Shift+K");
+    assert.deepEqual(s.pressed, { show: 0, floatingComposer: 1 });
+  });
+
+  it("lets a shortcut the app doesn't build leave its default chord free", async () => {
+    const s = shortcuts({}, { ids: ["show"] });
+    assert.equal(s.floatingComposer, undefined);
+    const result = await s.show.set(
+      { enabled: true, accelerator: "CommandOrControl+Shift+Space" },
+      async () => true,
+    );
+    assert.equal(result.ok, true);
+    s.press("CommandOrControl+Shift+Space");
+    assert.deepEqual(s.pressed, { show: 1, floatingComposer: 0 });
+  });
+
+  it("off macOS, refuses Control for another shortcut's CommandOrControl but not Super", async () => {
+    const s = shortcuts({}, { isMac: false });
+    s.floatingComposer.apply();
+    let asked = 0;
+    const approve = async () => {
+      asked += 1;
+      return true;
+    };
+    const taken = await s.show.set({ enabled: true, accelerator: "Control+Shift+Space" }, approve);
+    assert.equal(taken.ok, false);
+    assert.match(taken.error, /Another Omnigent shortcut/);
+    assert.equal(asked, 0);
+    const free = await s.show.set({ enabled: true, accelerator: "Super+Shift+Space" }, approve);
+    assert.equal(free.ok, true);
+    assert.deepEqual(s.registered(), ["CommandOrControl+Shift+Space", "Super+Shift+Space"]);
+  });
+
+  it("keeps each shortcut under its own settings key", () => {
+    const keys = Object.values(GLOBAL_SHORTCUTS).map((definition) => definition.settingKey);
+    assert.equal(new Set(keys).size, keys.length);
+    assert.equal(GLOBAL_SHORTCUTS.show.settingKey, "global_shortcut");
+    for (const id of ["unknown", "toString", "constructor"]) {
+      assert.throws(
+        () => createGlobalShowShortcut({ id, show: () => {} }),
+        /Unknown global shortcut/,
+      );
+    }
+  });
+
+  it("saving one shortcut leaves the other's setting as it was", async () => {
+    const show = { enabled: true, accelerator: "Command+Shift+K" };
+    const s = shortcuts({ global_shortcut: show });
+    assert.deepEqual(s.floatingComposer.current(), {
+      enabled: true,
+      accelerator: "CommandOrControl+Shift+Space",
+    });
+    assert.equal((await s.floatingComposer.set({ enabled: false })).ok, true);
+    assert.deepEqual(s.saved().global_shortcut, show);
+    assert.deepEqual(s.saved().floating_composer_shortcut, {
+      enabled: false,
+      accelerator: "CommandOrControl+Shift+Space",
+    });
+    assert.deepEqual(s.show.current(), show);
+  });
+
+  // The recorder writes the default's chord as `Shift+Command+Space` on macOS.
+  for (const accelerator of ["CommandOrControl+Shift+Space", "Shift+Command+Space"]) {
+    for (const held of ["registered", "on by default"]) {
+      it(`refuses ${accelerator} while another shortcut has it ${held}, before asking`, async () => {
+        const s = shortcuts();
+        if (held === "registered") s.floatingComposer.apply();
+        let asked = false;
+        const result = await s.show.set({ enabled: true, accelerator }, async () => (asked = true));
+        assert.match(result.error, /Another Omnigent shortcut/);
+        assert.equal(asked, false);
+        assert.equal(s.saved().global_shortcut, undefined);
+      });
+    }
+  }
+
+  it("refuses a chord another shortcut has registered even after its setting changed", async () => {
+    const s = shortcuts();
+    s.floatingComposer.apply();
+    s.rewrite({ floating_composer_shortcut: { enabled: false, accelerator: "Alt+K" } });
+    let asked = false;
+    const result = await s.show.set(
+      { enabled: true, accelerator: "Shift+Command+Space" },
+      async () => (asked = true),
+    );
+    assert.match(result.error, /Another Omnigent shortcut/);
+    assert.equal(asked, false);
+  });
+
+  it("lets the shortcut that won a chord save it again, in another spelling or off", async () => {
+    const s = shortcuts({ global_shortcut: { enabled: true, accelerator: "Shift+Command+Space" } });
+    s.show.apply();
+    s.floatingComposer.apply();
+    const respelled = await s.show.set(
+      { enabled: true, accelerator: "CommandOrControl+Shift+Space" },
+      async () => true,
+    );
+    assert.equal(respelled.ok, true);
+    // The respelled save keeps the one registration, still pressing `show`.
+    assert.equal(s.registered().length, 1);
+    s.press("CommandOrControl+Shift+Space");
+    assert.deepEqual(s.pressed, { show: 1, floatingComposer: 0 });
+    const off = await s.show.set(
+      { enabled: false, accelerator: "CommandOrControl+Shift+Space" },
+      async () => true,
+    );
+    assert.equal(off.ok, true);
+    assert.deepEqual(s.saved().global_shortcut, {
+      enabled: false,
+      accelerator: "CommandOrControl+Shift+Space",
+    });
+    // Turning off frees the chord for the shortcut that lost it.
+    assert.equal(s.floatingComposer.current().error, undefined);
+    s.press("CommandOrControl+Shift+Space");
+    assert.deepEqual(s.pressed, { show: 1, floatingComposer: 1 });
+  });
+
+  for (const [how, change] of [
+    ["turns off", { enabled: false }],
+    ["moves to another chord", { enabled: true, accelerator: "Alt+K" }],
+  ]) {
+    it(`gives a freed chord to the shortcut that lost it when the winner ${how}`, async () => {
+      const s = shortcuts({
+        global_shortcut: { enabled: true, accelerator: "Shift+Command+Space" },
+      });
+      s.show.apply();
+      s.floatingComposer.apply();
+      assert.match(s.floatingComposer.current().error, /Another Omnigent shortcut/);
+      assert.equal((await s.show.set(change, async () => true)).ok, true);
+      assert.equal(s.floatingComposer.current().error, undefined);
+      assert.ok(s.registered().includes("CommandOrControl+Shift+Space"));
+    });
+  }
+
+  it("refuses a chord another shortcut took while the user was deciding", async () => {
+    const s = shortcuts({ floating_composer_shortcut: { enabled: false, accelerator: "Alt+K" } });
+    const result = await s.show.set({ enabled: true, accelerator: "Alt+K" }, async () => {
+      await s.floatingComposer.set({ enabled: true, accelerator: "Alt+K" }, async () => true);
+      return true;
+    });
+    assert.match(result.error, /Another Omnigent shortcut/);
+    assert.deepEqual(s.registered(), ["Alt+K"]);
+    assert.equal(s.saved().global_shortcut, undefined);
+  });
+
+  it("saves another spelling of its own chord without asking or registering it twice", async () => {
+    const s = shortcuts();
+    s.floatingComposer.apply();
+    let asked = false;
+    const result = await s.floatingComposer.set(
+      { enabled: true, accelerator: "Shift+Command+Space" },
+      async () => (asked = true),
+    );
+    assert.equal(result.ok, true);
+    assert.equal(asked, false);
+    assert.deepEqual(s.registered(), ["CommandOrControl+Shift+Space"]);
+  });
+
+  for (const order of [
+    ["show", "floatingComposer"],
+    ["floatingComposer", "show"],
+  ]) {
+    it(`lets a chord the user saved win over another shortcut's default (${order.join(" first, ")} last)`, () => {
+      const s = shortcuts({
+        global_shortcut: { enabled: true, accelerator: "Shift+Command+Space" },
+      });
+      for (const id of order) s[id].apply();
+      assert.deepEqual(s.registered(), ["Shift+Command+Space"]);
+      assert.match(s.floatingComposer.current().error, /Another Omnigent shortcut/);
+      assert.equal(s.show.current().error, undefined);
+    });
+  }
+
+  for (const order of [
+    ["show", "floatingComposer"],
+    ["floatingComposer", "show"],
+  ]) {
+    it(`gives a chord both saved on to the first shortcut in the table (${order.join(" first, ")} last)`, () => {
+      const s = shortcuts({
+        global_shortcut: { enabled: true, accelerator: "Alt+K" },
+        floating_composer_shortcut: { enabled: true, accelerator: "Alt+k" },
+      });
+      for (const id of order) s[id].apply();
+      assert.deepEqual(s.registered(), ["Alt+K"]);
+      assert.equal(s.show.current().error, undefined);
+      assert.match(s.floatingComposer.current().error, /Another Omnigent shortcut/);
+    });
+  }
+});
+
+describe("chordKey", () => {
+  it("spells a chord one way for its platform", () => {
+    assert.equal(chordKey("CommandOrControl+Shift+Space", true), "shift+command+space");
+    assert.equal(chordKey("Shift+Cmd+space", true), "shift+command+space");
+    assert.equal(chordKey("Super+Shift+Space", true), "shift+command+space");
+    assert.equal(chordKey("CmdOrCtrl+Option+K", false), "control+alt+k");
+    assert.equal(chordKey("Ctrl+Alt+K", false), "control+alt+k");
+    assert.equal(chordKey("Alt+Return", true), chordKey("Option+Enter", true));
+    assert.equal(chordKey("Shift+Esc", true), chordKey("Shift+Escape", true));
+    // Off macOS too, Electron reads Command and Super as the same (Win/Super) modifier.
+    assert.equal(chordKey("Command+Shift+Space", false), chordKey("Super+Shift+Space", false));
+    assert.equal(chordKey("Cmd+K", false), chordKey("Meta+K", false));
+    assert.notEqual(chordKey("Super+K", false), chordKey("Control+K", false));
   });
 });
 

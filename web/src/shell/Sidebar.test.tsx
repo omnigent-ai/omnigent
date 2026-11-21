@@ -12,6 +12,7 @@ import { conversationPage } from "@/test/sidebarMockHelpers";
 import * as automationInboxHook from "@/hooks/useAutomationInbox";
 import * as proactiveInboxHook from "@/hooks/useProactiveInbox";
 import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
+import { MUTED_LABEL_KEY } from "@/lib/sessionMute";
 import { sidebarConfig, type SidebarConfig } from "@/lib/sidebarConfig";
 // Integration tests for the Sidebar's session list. The search box no
 // longer carries a filter funnel (agent-type filter + "Show archived"
@@ -215,7 +216,6 @@ import { Sidebar } from "./Sidebar";
 import { EXPANDED_PROJECT_SECTIONS_STORAGE_KEY } from "./sidebarNav";
 import { useSessionImportStore } from "@/store/sessionImport";
 import * as identity from "@/lib/identity";
-import { stubMatchMedia } from "@/test-helpers/matchMedia";
 
 const useConvMock = vi.mocked(useConversations);
 
@@ -364,24 +364,7 @@ function stubIntersectionObserver() {
   return observer;
 }
 
-// Evaluate min-/max-width media queries against a simulated viewport width,
-// so each test runs at an explicit real-browser width instead of inheriting
-// the global test-setup mock (which answers false to every query).
-function stubViewportWidth(
-  width: number,
-  anyCoarse = false,
-  coarsePrimary = anyCoarse,
-  canHover = false,
-  anyHover = canHover,
-) {
-  stubMatchMedia({ width, anyCoarse, coarsePrimary, canHover, anyHover });
-}
-
 beforeEach(() => {
-  // Default to a desktop width: these suites assert hover affordances
-  // (session tooltips, project flyouts) that are gated off on mobile. Tests
-  // that need a mobile width re-pin it themselves.
-  stubViewportWidth(1280);
   useConvMock.mockReset();
   useHostsMock.mockReset();
   useHostsMock.mockReturnValue({ data: [] });
@@ -871,24 +854,31 @@ describe("Sidebar session list", () => {
     }
   });
 
-  it("shows a draft icon only beside sessions with unfinished composer content", () => {
-    mockConversations([
-      conv("conv_draft", "Codex", { title: "Draft session" }),
-      conv("conv_empty", "Codex", { title: "Empty session" }),
-    ]);
-    renderSidebar();
+  it.each([false, true])(
+    "shows a draft icon only beside unfinished composer content, muted=%s",
+    (muted) => {
+      mockConversations([
+        conv("conv_draft", "Codex", {
+          title: "Draft session",
+          labels: muted ? { [MUTED_LABEL_KEY]: "1" } : {},
+        }),
+        conv("conv_empty", "Codex", { title: "Empty session" }),
+      ]);
+      renderSidebar();
 
-    const draftRow = screen.getByText("Draft session").closest("li")!;
-    const emptyRow = screen.getByText("Empty session").closest("li")!;
-    expect(within(draftRow).queryByTestId("conversation-draft-indicator")).toBeNull();
+      const draftRow = screen.getByText("Draft session").closest("li")!;
+      const emptyRow = screen.getByText("Empty session").closest("li")!;
+      expect(within(draftRow).queryByTestId("conversation-draft-indicator")).toBeNull();
 
-    act(() => setSessionDraft("conv_draft", { text: "unfinished message", files: [] }));
+      act(() => setSessionDraft("conv_draft", { text: "unfinished message", files: [] }));
 
-    const indicator = within(draftRow).getByTestId("conversation-draft-indicator");
-    expect(indicator).toHaveAccessibleName("Draft");
-    expect(indicator.parentElement).toHaveClass("absolute", "right-1");
-    expect(within(emptyRow).queryByTestId("conversation-draft-indicator")).toBeNull();
-  });
+      const indicator = within(draftRow).getByTestId("conversation-draft-indicator");
+      expect(indicator).toHaveAccessibleName("Draft");
+      expect(within(draftRow).queryByTestId("conversation-muted-icon")).toBeNull();
+      expect(indicator.parentElement).toHaveClass("absolute", "right-1");
+      expect(within(emptyRow).queryByTestId("conversation-draft-indicator")).toBeNull();
+    },
+  );
 
   it("uses balanced title padding until row actions are revealed", () => {
     mockConversations([conv("conv_balanced", "Codex", { title: "Balanced row title" })]);
@@ -1235,6 +1225,30 @@ describe("Sidebar session list", () => {
       "href",
       "/settings/archived",
     );
+  });
+
+  it("docks the settings menu beside the page on a wide phone, collapsing from its header", () => {
+    const mediaQuery = window.matchMedia("(max-width: 1180.98px)");
+    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+      ...mediaQuery,
+      media: query,
+      matches: query.includes("min-width: 600px") || query === "(max-width: 1180.98px)",
+    }));
+    try {
+      mockConversations(THREE_TYPE_CONVERSATIONS);
+      const onClose = vi.fn();
+      renderSidebar(true, "/settings", undefined, undefined, [], onClose);
+
+      expect(screen.getByRole("complementary", { name: "Conversations" })).toHaveClass(
+        "max-md:w-80",
+      );
+      fireEvent.click(screen.getByTestId("settings-nav-appearance"));
+      expect(onClose).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByRole("button", { name: "Close sidebar" }));
+      expect(onClose).toHaveBeenCalledOnce();
+    } finally {
+      matchMedia.mockRestore();
+    }
   });
 
   it("keeps navigation controls in the header and moves Settings to the footer", async () => {
@@ -1601,7 +1615,7 @@ describe("Sidebar session list", () => {
       "-translate-y-1/2",
       "opacity-0",
       "group-focus-visible/new-session:opacity-100",
-      "[@media((hover:hover)_and_(pointer:fine))]:group-hover/new-session:opacity-100",
+      "md:group-hover/new-session:opacity-100",
     );
   });
 
@@ -1639,7 +1653,6 @@ describe("Sidebar session list", () => {
   });
 
   it("closes the mobile sidebar when an extension nav row is selected", () => {
-    stubViewportWidth(375);
     mockConversations(THREE_TYPE_CONVERSATIONS);
     const onClose = vi.fn();
     renderSidebar(true, "/", undefined, undefined, [TEST_EXTENSION], onClose);
@@ -1668,6 +1681,14 @@ describe("Sidebar session list", () => {
 
     expect(screen.getByTestId("workflows-nav")).toHaveClass("bg-[var(--sidebar-active)]");
     expect(screen.getByTestId("new-chat-button")).not.toHaveClass("bg-[var(--sidebar-active)]");
+  });
+
+  it("leaves New session inactive on a nested-agent composer", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/?sibling=conv_one");
+
+    expect(screen.getByTestId("new-chat-button")).not.toHaveClass("bg-[var(--sidebar-active)]");
+    expect(screen.getByTestId("new-chat-button")).not.toHaveAttribute("aria-current");
   });
 
   it("marks Automations active (not New session) on /tasks/:taskId (detail route)", () => {
@@ -2311,6 +2332,34 @@ describe("Sidebar sections", () => {
     expect(screen.queryByText("conv_only_mine")).toBeNull();
   });
 
+  it("highlights the open nested draft and deletes a parked draft from its context menu", async () => {
+    mockConversations([conv("conv_first", "Codex"), conv("conv_second", "Codex")]);
+    const { queryClient } = renderSidebar(true, "/?sibling=conv_first");
+    act(() => {
+      for (const id of ["conv_first", "conv_second"]) {
+        addNestedSessionDraft(queryClient, `temp:${id}`, {
+          id,
+          title: id,
+          createdAt: 1,
+          labels: {},
+          permissionLevel: null,
+        } as Session);
+      }
+    });
+    const drafts = await screen.findAllByRole("link", { name: "New nested agent" });
+    const first = drafts.find((link) => link.getAttribute("href") === "/?sibling=conv_first")!;
+    const second = drafts.find((link) => link.getAttribute("href") === "/?sibling=conv_second")!;
+    expect(first).toHaveClass("bg-[var(--sidebar-active)]");
+    expect(second).not.toHaveClass("bg-[var(--sidebar-active)]");
+    fireEvent.click(second);
+    expect(first).not.toHaveClass("bg-[var(--sidebar-active)]");
+    expect(second).toHaveClass("bg-[var(--sidebar-active)]");
+    fireEvent.contextMenu(first);
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Delete draft" }));
+    await waitFor(() => expect(first).not.toBeInTheDocument());
+    expect(second).toHaveClass("bg-[var(--sidebar-active)]");
+  });
+
   it.each([
     "sessions",
     "project",
@@ -2610,20 +2659,68 @@ describe("Sidebar sections", () => {
       if (inProject) fireEvent.click(screen.getByRole("button", { name: /^Customer X/ }));
       expect(screen.getByText("conv_0")).toBeInTheDocument();
       expect(screen.getByRole("button", { name: "Collapse session family" })).toBeInTheDocument();
-      for (let index = 1; index < 5; index++) {
+      // Nested sessions list newest first, so the oldest one is past the first page.
+      for (let index = 2; index <= 5; index++) {
         expect(screen.getByText(`conv_${index}`).closest("li")).toHaveAttribute(
           "data-sibling-session",
           "true",
         );
       }
-      expect(screen.queryByText("conv_5")).toBeNull();
+      expect(screen.queryByText("conv_1")).toBeNull();
       fireEvent.click(screen.getByRole("button", { name: inProject ? /Show more/ : "Load more" }));
-      expect(screen.getByText("conv_5").closest("li")).toHaveAttribute(
+      expect(screen.getByText("conv_1").closest("li")).toHaveAttribute(
         "data-sibling-session",
         "true",
       );
     },
   );
+
+  it("names each row's family role in its tooltip", async () => {
+    const family = { id: "family", representative_id: "conv_parent", pinned: false };
+    mockConversations([
+      conv("conv_parent", "Claude Code", { updated_at: 3, created_at: 1, family }),
+      conv("conv_nested_a", "Claude Code", { updated_at: 2, created_at: 2, family }),
+      conv("conv_nested_b", "Claude Code", { updated_at: 1, created_at: 3, family }),
+    ]);
+    renderSidebar();
+
+    fireEvent.pointerMove(screen.getByRole("link", { name: /conv_parent/ }), {
+      pointerType: "mouse",
+    });
+    expect(await screen.findByTestId("session-tooltip-family")).toHaveTextContent(
+      /^Nested sessions\s*2$/,
+    );
+    cleanup();
+
+    renderSidebar();
+    fireEvent.pointerMove(screen.getByRole("link", { name: /conv_nested_a/ }), {
+      pointerType: "mouse",
+    });
+    expect(await screen.findByTestId("session-tooltip-family")).toHaveTextContent(
+      /^Nested in\s*conv_parent$/,
+    );
+  });
+
+  it("opens a family parent without toggling it; only its icon button toggles", () => {
+    const family = { id: "family", representative_id: "conv_parent", pinned: false };
+    mockConversations([
+      conv("conv_parent", "Claude Code", { updated_at: 2, family }),
+      conv("conv_nested", "Claude Code", { updated_at: 1, family }),
+    ]);
+    renderSidebar();
+    const parent = screen.getByRole("link", { name: /conv_parent/ });
+
+    fireEvent.click(parent);
+    expect(screen.getByText("conv_nested")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Collapse session family" }));
+    expect(screen.queryByText("conv_nested")).toBeNull();
+    fireEvent.click(parent);
+    expect(screen.queryByText("conv_nested")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Expand session family" }));
+    expect(screen.getByText("conv_nested")).toBeInTheDocument();
+  });
 });
 
 // The sidebar splits sessions across two tabs: "My sessions" (owned, with the
@@ -3025,9 +3122,6 @@ describe("Sidebar project sections", () => {
   });
 
   it("closes the mobile overlay when New session is selected from the project menu", async () => {
-    // At a phone width isMobileViewport() is true: picking New session must close
-    // the full-screen sidebar overlay so the pre-filed page is not hidden behind it.
-    stubViewportWidth(375);
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
@@ -3343,11 +3437,11 @@ describe("Sidebar project sections", () => {
     });
     const menuItem = await screen.findByTestId("project-new-session-menu");
     expect(menuItem).not.toHaveClass("hidden");
-    expect(menuItem).toHaveClass("[@media((hover:hover)_and_(pointer:fine))]:hidden");
+    expect(menuItem).toHaveClass("md:hidden");
     expect(menuItem.closest("a")).toHaveAttribute("href", "/?project=Customer%20X");
   });
 
-  it("reveals project actions on hover only on wide fine-pointer layouts", () => {
+  it("reveals project actions on hover only in the desktop layout", () => {
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_running", "Claude Code", {
@@ -3748,6 +3842,47 @@ describe("Sidebar project Show more", () => {
 // A collapsed project bubbles up its hidden rows' marker, using the same
 // SessionStateBadge a row shows. Only while collapsed.
 describe("Sidebar collapsed project marker", () => {
+  it.each([false, true])(
+    "ignores muted unread rows with unmuted unread sibling=%s",
+    (unreadSibling) => {
+      projectsMock.push("Example project");
+      writeProjectFolderPageSize(1);
+      seedReadState([
+        { id: "conv_read", viewer_last_seen: 300 },
+        { id: "conv_muted", viewer_last_seen: 199 },
+        { id: "conv_sibling", viewer_last_seen: unreadSibling ? 199 : 200 },
+      ]);
+      mockConversations([
+        conv("conv_read", "Codex", {
+          labels: { omni_project: "Example project" },
+          status: "idle",
+          updated_at: 300,
+        }),
+        conv("conv_muted", "Codex", {
+          labels: { omni_project: "Example project", [MUTED_LABEL_KEY]: "1" },
+          status: "idle",
+          updated_at: 200,
+        }),
+        conv("conv_sibling", "Codex", {
+          labels: { omni_project: "Example project" },
+          status: "idle",
+          updated_at: 200,
+        }),
+      ]);
+      renderSidebar();
+      const header = screen.getByRole("button", { name: /^Example project/ });
+      const marker = within(header).queryByTestId("session-state-badge");
+      if (unreadSibling) expect(marker).toHaveAttribute("data-state", "unseen");
+      else expect(marker).toBeNull();
+      fireEvent.click(header);
+      const hiddenMarker = within(screen.getByTestId("project-show-more")).queryByTestId(
+        "session-state-badge",
+      );
+      if (unreadSibling) expect(hiddenMarker).toHaveAttribute("data-state", "unseen");
+      else expect(hiddenMarker).toBeNull();
+    },
+  );
+
   it("surfaces an error ahead of unread messages and moves it to the expanded row", () => {
     projectsMock.push("Customer X");
     seedReadState([{ id: "conv_unread", viewer_last_seen: 199 }]);
@@ -4148,11 +4283,11 @@ describe("Sidebar move-to-project action", () => {
 
 describe("Sidebar mobile overlay background", () => {
   it("uses shared glass with an overridable background for the mobile overlay", () => {
-    const mediaQuery = window.matchMedia("(max-width: 767.98px)");
+    const mediaQuery = window.matchMedia("(max-width: 1180.98px)");
     const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
       ...mediaQuery,
       media: query,
-      matches: query === "(max-width: 767.98px)",
+      matches: query === "(max-width: 1180.98px)",
     }));
     try {
       mockConversations(THREE_TYPE_CONVERSATIONS);
@@ -4235,6 +4370,23 @@ describe("Sidebar active-row auto-scroll", () => {
     const row = screen.getByText("Active draft").closest("li")!;
     expect(within(row).queryByTestId("conversation-draft-indicator")).toBeNull();
     vi.restoreAllMocks();
+  });
+
+  it.each([false, true])("hides the active row's Mark as unread only when muted=%s", (muted) => {
+    seedReadState([{ id: "conv_active", viewer_last_seen: 199 }]);
+    mockConversations([
+      conv("conv_active", "Codex", {
+        status: "idle",
+        updated_at: 200,
+        labels: muted ? { [MUTED_LABEL_KEY]: "1" } : {},
+      }),
+    ]);
+    renderAtRoute("/c/conv_active");
+    const row = screen.getByRole("link", { name: "conv_active" }).closest("li")!;
+    fireEvent.pointerDown(within(row).getByTestId("conversation-actions"), { button: 0 });
+    if (muted) expect(screen.queryByTestId("mark-unread-conversation")).toBeNull();
+    else expect(screen.getByTestId("mark-unread-conversation")).toBeInTheDocument();
+    expect(screen.queryByTestId("mark-read-conversation")).toBeNull();
   });
 
   it("leaves the open session out of the Inbox badge until it is marked unread", () => {
@@ -4398,6 +4550,30 @@ describe("Sidebar view options", () => {
       .map((button) => button.textContent ?? "")
       .filter((title) => GROUP_TITLES.has(title));
   const groupSection = (title: string) => screen.getByText(title).closest("section")!;
+
+  it("keeps muted unread sessions out of the Unread status group", () => {
+    localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ grouping: "status" }));
+    const mutedLabels = { [MUTED_LABEL_KEY]: "1" };
+    const rows = [
+      conv("muted_idle", "Codex", { status: "idle", updated_at: 200, labels: mutedLabels }),
+      conv("ordinary_unread", "Codex", { status: "idle", updated_at: 200 }),
+      conv("muted_running", "Codex", { status: "running", labels: mutedLabels }),
+      conv("muted_approval", "Codex", { pending_elicitations_count: 1, labels: mutedLabels }),
+    ];
+    seedReadState(rows.map((row) => ({ id: row.id, viewer_last_seen: 199 })));
+    mockConversations(rows);
+    renderGroupingSidebar();
+    expect(within(groupSection("Done")).getByText("muted_idle")).toBeInTheDocument();
+    expect(within(groupSection("Unread")).getByText("ordinary_unread")).toBeInTheDocument();
+    expect(within(groupSection("Working")).getByText("muted_running")).toBeInTheDocument();
+    expect(within(groupSection("Needs attention")).getByText("muted_approval")).toBeInTheDocument();
+    // Active status outranks the muted bell.
+    for (const id of ["muted_running", "muted_approval"]) {
+      const row = screen.getByText(id).closest("li")!;
+      expect(within(row).getByTestId("session-state-badge")).toBeInTheDocument();
+      expect(within(row).queryByTestId("conversation-muted-icon")).toBeNull();
+    }
+  });
 
   it("restores Status grouping from a saved selection and offers it in the menu", () => {
     localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ grouping: "status" }));
@@ -4773,11 +4949,11 @@ describe("Sidebar view options", () => {
   });
 
   it("opens view submenus in place of the main menu on a mobile viewport", () => {
-    const mediaQuery = window.matchMedia("(max-width: 767.98px)");
+    const mediaQuery = window.matchMedia("(max-width: 1180.98px)");
     const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
       ...mediaQuery,
       media: query,
-      matches: query === "(max-width: 767.98px)",
+      matches: query === "(max-width: 1180.98px)",
     }));
     try {
       mockConversations([conv("conv_idle", "Codex", { status: "idle" })]);

@@ -362,7 +362,9 @@ defaults delete ai.omnigent.desktop DeveloperMode
 
 Development (`pnpm --dir web/electron dev`) builds keep Developer Tools enabled
 without this preference. The override is intentionally macOS-only and does not
-relax production update security checks.
+relax production update security checks. It covers the windows only: the
+production app's main process accepts no debugger (see
+[What a packaged app refuses to run](#what-a-packaged-app-refuses-to-run)).
 
 The native enhancements live on the web side in
 [`../src/lib/nativeBridge.ts`](../src/lib/nativeBridge.ts). It detects the
@@ -385,7 +387,7 @@ electron/
   src/browserViewRegistry.js  # per-conversation WebContentsView registry (browser pane)
   src/browserViewBounds.js    # CSS-px → window-DIP bounds conversion (browser pane)
   src/browserIpc.js           # omnigent:browser-* IPC handlers (extracted from main.js)
-  src/chromeCookieStore.js    # per-site Chrome cookie import for the browser pane
+  src/chromeCookieStore.js    # Chrome cookie import for the browser pane
   src/loopback-oauth.js       # RFC 8252 loopback listener shared by browser sign-ins
   src/oidc-credentials.js     # OIDC loopback sign-in, refresh, and revoke
   src/oidc-auth.js            # OIDC window session lifecycle (cookie, renewal, sign-out)
@@ -728,8 +730,9 @@ including the address bar, chat links, and agent actions, enforces this policy.
   listeners that push `browser-url-changed` + `browser-nav-state` to the renderer
   so the toolbar's URL bar live-tracks the real URL (redirects, in-page link
   clicks, agent navigation) instead of going stale.
-- `src/chromeCookieStore.js` — reads the current site's cookies out of a local
-  Chrome profile for the toolbar's **Import cookies from Chrome** action (below).
+- `src/chromeCookieStore.js` — reads cookies out of a local Chrome profile, for
+  every website or the current site, for the toolbar's **Import cookies from
+  Chrome** action (below).
   Electron-free, so it is unit-tested with a stub session and a synthetic
   `Cookies` DB.
 - `src/preload.js` — adds `browserOpenOrNavigate/SetActive/Resize/Screenshot/`
@@ -804,13 +807,24 @@ under the same policy.
 
 **Importing cookies from Chrome (macOS).** Sites that reject embedded browsers
 (Google sign-in is the common one) can't be signed in from this pane, so the
-toolbar's cookie button copies the **current site's** cookies out of a local
-Chrome profile into this conversation's in-memory session and reloads the page.
-Scope is deliberately narrow:
+toolbar's cookie button copies cookies out of a local Chrome profile into this
+conversation's in-memory session and reloads the page. The dialog's _Site scope_
+picks how much:
 
-- Only cookies inside the page's own domain tree: its host, its subdomains, and
-  the leading-dot parent domains that reach it (`.google.com` for
-  `mail.google.com`). Nothing else in the jar is read into the app.
+- **All websites** (the default) copies every unexpired, unpartitioned cookie in
+  the chosen profile, so sign-ins that span several sites work without picking
+  each one. Any profile holding cookies can be chosen. The scope is the literal
+  `"*"`, which is not a hostname, and has its own store functions
+  (`previewAllSitesCookies` / `importAllSitesCookies`), so a site import can
+  never be widened into it. It is not tied to the tab's current site: main
+  validates only the profile, against its own preview. The agent can then act
+  as the user on every site that profile is signed in to; both prompts say so.
+  The preview reports these profiles as `allSitesProfiles`, a field a pane or
+  shell that predates it ignores, leaving the site scopes below.
+- A site scope copies only cookies inside the page's own domain tree: its host,
+  its subdomains, and the leading-dot parent domains that reach it
+  (`.google.com` for `mail.google.com`). Nothing else in the jar is read into
+  the app.
 - When the host has parent domains the dialog offers them as _Site scope_, each
   labelled with its own count (`accounts.google.com (25)` vs `google.com (64)`, the
   wider scope being a superset because it covers every subdomain's cookies).
@@ -840,9 +854,9 @@ Scope is deliberately narrow:
 - The secret-copying step itself needs consent from the main process, not just
   the pane's dialog: the connected page holds the bridge and could call it
   directly, so `browser-chrome-cookie-import` runs a native
-  `dialog.showMessageBox` naming the scope, the tab's host (when an ancestor
-  scope was picked), the Chrome profile and the count (that count comes from
-  main's own preview, never from the renderer). Like the shell's other consent
+  `dialog.showMessageBox` naming the scope (or that it covers all websites), the
+  tab's host (when an ancestor scope was picked), the Chrome profile and the
+  count (that count comes from main's own preview, never from the renderer). Like the shell's other consent
   dialogs it is parented to the sender's window, so it can't be approved while
   the tab it describes is hidden behind another app, and Chrome's profile name —
   a plain file on disk — is flattened to one short line so it can't add its own
@@ -851,24 +865,32 @@ Scope is deliberately narrow:
 - Values are decrypted with `v10`/`v11` (AES-128-CBC, key from the login
   Keychain's "Chrome Safe Storage" item) and never shown, logged, or persisted.
   App-bound `v20` values and non-macOS platforms are refused with a message, not
-  guessed at. The Keychain prompt is attributed to `security`; choose **Allow**
-  rather than **Always Allow**, because Always Allow adds `/usr/bin/security` to
-  the item's ACL, and any local process can then read Chrome's key without a
-  prompt. Partitioned (CHIPS) cookies are skipped rather than replayed
+  guessed at. Partitioned (CHIPS) cookies are skipped rather than replayed
   unpartitioned, which would widen the site they were scoped to.
+- The app reads that Keychain item in its own process, through the native
+  `@napi-rs/keyring` binding, so the macOS prompt names the app and **Always
+  Allow** is recorded against the app's signature. It never asks a helper such
+  as `/usr/bin/security` for the key, and does not fall back to one when the
+  binding can't load: a grant to a shared tool lets any local process run that
+  tool and read the key without a prompt. That grant is only as narrow as the
+  signed binary, so the packaged app restricts its main process to the app's
+  own sealed code (see [What a packaged app refuses to run](#what-a-packaged-app-refuses-to-run)).
+  Builds before this change did read the key through `security`; if
+  you chose Always Allow in one, remove `security` from the "Chrome Safe
+  Storage" item's Access Control list in Keychain Access.
 - Reading never touches Chrome's live database: `Cookies` (plus any
   `Cookies-wal` / `Cookies-journal`) is copied into a private temp directory and
   `sqlite3` only opens that copy, so Chrome's file is never locked or rewritten.
-  `sqlite3` and `security` are spawned by absolute path (`/usr/bin/...`, the
-  macOS system copies) instead of being resolved through `PATH`, so nothing on
-  the user's path can intercept Chrome's key or jar. Failures surface as a fixed
-  message, never the command line.
+  `sqlite3` is spawned by absolute path (`/usr/bin/sqlite3`, the macOS system
+  copy) instead of being resolved through `PATH`, so nothing on the user's path
+  can intercept Chrome's jar. Failures surface as a fixed message, never the
+  command line.
 - Cookies land in the conversation's existing in-memory partition, so they
   disappear when the app quits; nothing is written back to Chrome, and there is
   no background sync.
 - Cookies alone don't always reproduce a sign-in (localStorage, device checks,
   `HttpOnly` site state), and an agent-controlled tab means the agent can act as
-  you on that site while they're loaded — the dialog says so. For real SSO use
+  you on the imported sites while they're loaded — the dialog says so. For real SSO use
   system-browser sign-in above.
 
 **JS trust boundary:** `omnigent:browser-perform-action` accepts only snapshot,
@@ -971,6 +993,36 @@ install production desktop updates. `build:mac:release` retains
 `ai.omnigent.desktop`, **Omnigent**, and `electron/dist/`. For the full
 cross-platform publishing and update-feed checklist, see [the desktop release
 runbook](RELEASING.md).
+
+### What a packaged app refuses to run
+
+macOS records a Keychain **Always Allow** against the app's signature, not
+against the code that asked. A packaged app therefore turns off, through
+Electron fuses (`build.electronFuses` in `package.json`), the ways to run other
+JavaScript in the signed binary:
+
+| Fuse                                          | Effect in a packaged app                                                                                       |
+| --------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `runAsNode: false`                            | `ELECTRON_RUN_AS_NODE` is ignored, so the binary can't be used as a plain Node.js to run someone's script.     |
+| `enableNodeCliInspectArguments: false`        | `--inspect` and `SIGUSR1` don't open a debugger on the main process.                                           |
+| `enableNodeOptionsEnvironmentVariable: false` | `NODE_OPTIONS` and `NODE_EXTRA_CA_CERTS` are ignored.                                                          |
+| `enableEmbeddedAsarIntegrityValidation: true` | On macOS and Windows the app checks `app.asar` against the hash sealed at build time, and exits if it differs. |
+| `onlyLoadAppFromAsar: true`                   | The app loads its code from `app.asar` only, never from an `app/` folder placed beside it.                     |
+
+Two consequences to know about:
+
+- `NODE_EXTRA_CA_CERTS` no longer adds a certificate authority to the main
+  process's own requests (sign-in, server checks). Pages in the app's windows
+  never used that variable.
+- Local **Omnigent Dev** packages (`pnpm run build`, `build:mac`, `build:linux`,
+  `build:win`) keep `--inspect`, which Playwright needs to drive a packaged
+  binary. They are a different app (`ai.omnigent.desktop-dev`), so a grant made
+  to the release app never covers them. A grant made to Omnigent Dev itself is
+  open to anyone who can attach that debugger, so choose **Allow**, not
+  **Always Allow**, in Omnigent Dev. Every other fuse is the same.
+
+Unpackaged development (`pnpm start`) runs the stock Electron binary and is not
+affected.
 
 macOS apps, including unpackaged development, default to V2 onboarding for both
 new and existing profiles. Windows/Linux keep the legacy default. The setup-page

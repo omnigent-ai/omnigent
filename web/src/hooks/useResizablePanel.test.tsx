@@ -27,7 +27,10 @@ function installMatchMedia(): void {
           ? false
           : query.includes("min-width")
             ? desktopMatches
-            : false;
+            : // useIsMobileViewport reads the mobile side of md.
+              query.includes("max-width")
+              ? !desktopMatches
+              : false;
     },
     media: query,
     onchange: null,
@@ -35,7 +38,9 @@ function installMatchMedia(): void {
     removeListener: () => {},
     addEventListener: (_type: string, listener: (event: MediaQueryListEvent) => void) => {
       if (query === "(any-pointer: coarse)") coarseChangeListeners.add(listener);
-      else if (query.includes("min-width")) desktopChangeListeners.add(listener);
+      else if (query.includes("min-width") || query.includes("max-width")) {
+        desktopChangeListeners.add(listener);
+      }
     },
     removeEventListener: (_type: string, listener: (event: MediaQueryListEvent) => void) => {
       if (query === "(any-pointer: coarse)") coarseChangeListeners.delete(listener);
@@ -109,6 +114,24 @@ afterEach(() => {
   window.matchMedia = originalMatchMedia;
   desktopChangeListeners.clear();
   coarseChangeListeners.clear();
+  vi.unstubAllGlobals();
+});
+
+describe("useResizablePanel layout", () => {
+  it.each([
+    ["a browser", false, false],
+    ["the desktop app", true, true],
+  ])("sizes the panel inline below md only in %s", (_name, desktopApp, inline) => {
+    setInnerWidth(900);
+    setDesktopMatch(false);
+    if (desktopApp) vi.stubGlobal("omnigentDesktop", { kind: "electron" });
+
+    const { result } = renderHook(() => useResizablePanel(true));
+
+    expect(result.current.isDesktop).toBe(inline);
+    // 50vw of 900px; the mobile layout leaves the width to its drawer classes.
+    expect(result.current.panelWidth).toBe(inline ? 450 : undefined);
+  });
 });
 
 describe("useResizablePanel persistence", () => {
@@ -445,5 +468,27 @@ describe("useResizablePanel persistence", () => {
 
     first.unmount();
     second.unmount();
+  });
+
+  it("keeps a panel with its own storage key apart from the push panels", () => {
+    const push = renderHook(() => useResizablePanel(true));
+    const project = renderHook(() =>
+      useResizablePanel(true, 40, 320, "projectSessionPanelWidthPx"),
+    );
+
+    act(() => {
+      project.result.current.handleProps.onKeyDown({
+        key: "ArrowRight",
+        preventDefault: () => {},
+      } as React.KeyboardEvent);
+    });
+
+    expect(project.result.current.panelWidth).toBe(780);
+    expect(readPanelSizePreference("projectSessionPanelWidthPx")).toBe(780);
+    expect(push.result.current.panelWidth).toBe(1000);
+    expect(readPanelSizePreference("pushPanelWidthPx")).toBeNull();
+
+    push.unmount();
+    project.unmount();
   });
 });

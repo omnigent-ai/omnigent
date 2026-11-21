@@ -7,6 +7,7 @@ import {
 import { useInputCapabilities } from "@/hooks/useInputCapabilities";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useResizeDrag } from "@/hooks/useResizeDrag";
+import type { PanelSizePreferenceKey } from "@/lib/panelSizePreferences";
 
 const MIN_WIDTH_PX = 320;
 const MAX_WIDTH_RATIO = 0.8; // 80% of viewport
@@ -39,20 +40,33 @@ function clampWidth(w: number, minPx = MIN_WIDTH_PX): number {
 }
 
 // ---------------------------------------------------------------------------
-// Shared width store
+// Shared width stores
 // ---------------------------------------------------------------------------
 // Every right-side push panel (FileViewer, TerminalsPanel,
 // ExecutionLogsPanel, FilesPanelDrawer) reads and writes the same
-// width via this module-level store. Without sharing, switching
+// width via the `pushPanelWidthPx` store. Without sharing, switching
 // between panels would snap the layout back to each panel's
 // independent default, which feels like the chat is jumping width
-// for no reason. ``null`` means "not yet set — fall back to the
-// caller's default (vw-based)". The first drag persists a px value.
-const widthStore = createPersistedWidthStore("pushPanelWidthPx");
+// for no reason. A panel outside that group passes its own storage key.
+// `null` means "not yet set — fall back to the caller's default (vw-based)".
+// The first drag persists a px value.
+type PersistedWidthStore = ReturnType<typeof createPersistedWidthStore>;
+
+const widthStores = new Map<PanelSizePreferenceKey, PersistedWidthStore>();
+
+function widthStoreFor(key: PanelSizePreferenceKey): PersistedWidthStore {
+  const existing = widthStores.get(key);
+  if (existing) return existing;
+  const store = createPersistedWidthStore(key);
+  widthStores.set(key, store);
+  return store;
+}
 
 /** Reset module-level width state from localStorage. Only for tests. */
 export function resetSharedWidthStoreForTesting(): void {
-  widthStore.resetForTesting();
+  for (const key of new Set<PanelSizePreferenceKey>(["pushPanelWidthPx", ...widthStores.keys()])) {
+    widthStoreFor(key).resetForTesting();
+  }
 }
 
 /**
@@ -62,18 +76,28 @@ export function resetSharedWidthStoreForTesting(): void {
  * driven by drag state. On mobile (`< md`) the panel is a full-screen
  * overlay — the hook returns `undefined` so no inline width is set.
  *
- * The width is stored at module scope and shared across every caller,
- * so all right-side push panels resize together — the layout stays
- * stable as the user switches between FileViewer / Terminals / Logs /
- * Files.
+ * The width is stored at module scope and shared across every caller with
+ * the same `storageKey`, so all right-side push panels resize together — the
+ * layout stays stable as the user switches between FileViewer / Terminals /
+ * Logs / Files.
  *
  * Returns the current pixel width (or undefined on mobile) and a set of
  * props to spread onto the resize handle element.
  */
-export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx = MIN_WIDTH_PX) {
+export function useResizablePanel(
+  open: boolean,
+  defaultWidthVw = 50,
+  minWidthPx = MIN_WIDTH_PX,
+  storageKey: PanelSizePreferenceKey = "pushPanelWidthPx",
+) {
   const { anyCoarse } = useInputCapabilities();
+  // Desktop layout (`md`+, or any width in the desktop app): only there does
+  // the panel take an inline width and a drag handle.
   const mobileViewport = useIsMobileViewport();
   const isDesktop = typeof window !== "undefined" && !mobileViewport;
+  const widthStore = widthStoreFor(storageKey);
+  const widthStoreRef = useRef(widthStore);
+  widthStoreRef.current = widthStore;
   const width = useResizableWidthSnapshot(widthStore);
   const minWidthRef = useRef(minWidthPx);
   minWidthRef.current = minWidthPx;
@@ -87,8 +111,9 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
       // Re-derive the effective width from the persisted preference (not the
       // possibly-already-clamped live value) so widening the viewport restores
       // the user's larger choice instead of sticking at the prior clamp.
-      widthStore.set((prev) => {
-        const base = widthStore.getPreferred() ?? prev;
+      const store = widthStoreRef.current;
+      store.set((prev) => {
+        const base = store.getPreferred() ?? prev;
         return base !== null ? clampWidth(base, minWidthRef.current) : prev;
       });
       bumpViewport();
@@ -104,7 +129,7 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
       if (prev !== null && prev < minWidthPx) return clampWidth(prev, minWidthPx);
       return prev;
     });
-  }, [minWidthPx]);
+  }, [minWidthPx, widthStore]);
 
   // Initialise from viewport on first open (or if never set), respecting the minimum.
   const resolvedWidth = clampWidth(
@@ -118,9 +143,12 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
     onStart: widthStore.beginDrag,
     onCancel: () => widthStore.rollbackDrag((w) => clampWidth(w, minWidthRef.current)),
     onCommit: widthStore.persist,
-    onMove: useCallback((e: React.PointerEvent<HTMLElement>) => {
-      widthStore.set(clampWidth(window.innerWidth - e.clientX, minWidthRef.current));
-    }, []),
+    onMove: useCallback(
+      (e: React.PointerEvent<HTMLElement>) => {
+        widthStore.set(clampWidth(window.innerWidth - e.clientX, minWidthRef.current));
+      },
+      [widthStore],
+    ),
   });
 
   // Keyboard resize: left/right arrow keys adjust width by 20px.
@@ -134,7 +162,7 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
         true,
       );
     },
-    [open, isDesktop, resolvedWidth],
+    [open, isDesktop, resolvedWidth, widthStore],
   );
 
   // On mobile the panel is a fixed full-screen overlay — no inline width.

@@ -128,7 +128,7 @@ class OmnigentWebViewClientTest {
 
     @Test
     fun `back handler consumes the web layer's breakpoint signal`() {
-        // The web layer owns the md breakpoint (web/src/lib/breakpoints.ts) and
+        // The web layer owns the md breakpoint (web/src/hooks/useIsMobileViewport.ts) and
         // publishes __omnigentIsMobileViewport; the back handler must consult it
         // rather than re-derive the drawer/rail boundary from its own literal.
         val backHandler =
@@ -137,7 +137,7 @@ class OmnigentWebViewClientTest {
         assertTrue(backHandler.contains("window.__omnigentIsMobileViewport === \"function\""))
         assertTrue(backHandler.contains("window.__omnigentIsMobileViewport()"))
         // The inline width check survives only as the older-web-build fallback.
-        assertTrue(backHandler.contains(": window.innerWidth < 768"))
+        assertTrue(backHandler.contains(": window.innerWidth < 1181"))
     }
 
     @Test

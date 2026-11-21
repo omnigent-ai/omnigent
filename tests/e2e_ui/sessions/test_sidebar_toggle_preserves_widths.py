@@ -19,7 +19,6 @@ _CONVERSATIONS = 'aside[aria-label="Conversations"]'
 _LEFT_CHORD = "Control+Alt+BracketLeft"
 _CHAT_MIN_PX = 480
 _PANEL_MOTION_SETTLE_MS = 400
-_CHAT_HARD_MIN_PX = 240
 
 
 def _rail_width(page: Page) -> float:
@@ -85,11 +84,14 @@ def test_shrinking_viewport_keeps_chat_minimum_with_sidebar_open(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Shrinking the window keeps the chat above its tablet hard floor.
+    """Shrinking the window with both sidebars open never squeezes the chat < 480.
 
-    The rail must recompute as the viewport shrinks. Once the row reaches tablet
-    width, the chat may cede below its 480px comfort minimum so the rail retains
-    drag travel, but it must never cross the hard minimum.
+    The reported regression: at a wide viewport the rail is wide; opening the
+    left sidebar and then dragging the window smaller let the chat fall under
+    480px, because the rail's width didn't recompute against the smaller
+    viewport (a resize that didn't move the stored width never re-rendered) and
+    the rail's own comfort minimum overrode the chat-preserving ceiling. 1181px
+    is the narrowest desktop layout; below it the rail is a drawer.
     """
     base_url, session_id = seeded_session
     # Start wide so the rail's default is well above the shrunk ceiling.
@@ -103,11 +105,9 @@ def test_shrinking_viewport_keeps_chat_minimum_with_sidebar_open(
     expect(conversations).not_to_have_attribute("data-collapsed", "true")
     assert _chat_width(page) >= _CHAT_MIN_PX - 1, _chat_width(page)
 
-    # At this tablet width the rail clamp may cede below the chat's comfort
-    # minimum, but it must preserve the hard floor.
-    page.set_viewport_size({"width": 928, "height": 800})
+    # Shrink the window hard, sidebar still open. The rail must yield (below its
+    # own comfort minimum if needed) so the chat holds its 480px floor.
+    page.set_viewport_size({"width": 1181, "height": 800})
     page.wait_for_timeout(_PANEL_MOTION_SETTLE_MS)
     expect(conversations).not_to_have_attribute("data-collapsed", "true")
-    chat_width = _chat_width(page)
-    assert chat_width >= _CHAT_HARD_MIN_PX - 1, chat_width
-    assert chat_width < _CHAT_MIN_PX, chat_width
+    assert _chat_width(page) >= _CHAT_MIN_PX - 1, _chat_width(page)

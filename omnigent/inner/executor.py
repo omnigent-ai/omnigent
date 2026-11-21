@@ -176,6 +176,19 @@ class ToolCallRequest(ExecutorEvent):
     metadata: ToolCallMetadata = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class NativeTurnAcceptance:
+    """Native RPC acceptance, scoped to the real session and thread.
+
+    ``response_id`` uses the native status identity, independently of the
+    generic harness request's response ID.
+    """
+
+    session_id: str
+    thread_id: str
+    response_id: str
+
+
 @dataclass
 class TurnComplete(ExecutorEvent):
     """The LLM has finished its turn with a final text response.
@@ -203,6 +216,7 @@ class TurnComplete(ExecutorEvent):
     modified_by_policy: bool = False
     continue_turn: bool = False
     usage: ExecutorUsage | None = None
+    native_acceptance: NativeTurnAcceptance | None = None
 
 
 class ToolCallStatus(str, enum.Enum):
