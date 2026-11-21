@@ -6816,15 +6816,24 @@ def _user_prompt_visible(pane: str) -> bool:
     # A short pane can clip the plan decision's footer entirely.
     plan_region = "\n".join(lines[rules[-1] + 1 :]) if rules else ""
     plan_exit = re.search(
-        r"(?m)^[ \t]*Exit plan mode\?[ \t]*\n"
-        r"[ \t]*Claude wants to exit plan mode[ \t]*\n"
+        r"(?m)^[ \t]*Exit\s+plan\s+mode\?[ \t]*\n"
+        r"[ \t]*Claude\s+wants\s+to\s+exit\s+plan\s+mode[ \t]*\n"
         r"[ \t]*(?:❯[ \t]*)?1\.[ \t]+Yes\b[\s\S]*?"
         r"^[ \t]*(?:❯[ \t]*)?2\.[ \t]+No[ \t]*$",
+        plan_region,
+    )
+    ready_plan = re.match(
+        r"[ \t]*Claude\s+has\s+written\s+up\s+a\s+plan\s+and\s+is\s+ready\s+to\s+execute\."
+        r"\s+Would\s+you\s+like\s+to\s+proceed\?[ \t]*\n"
+        r"[ \t]*(?:❯[ \t]*)?1\.[ \t]+Yes,\s+and\s+use\s+auto\s+mode[ \t]*\n"
+        r"[ \t]*(?:❯[ \t]*)?2\.[ \t]+Yes,\s+manually\s+approve\s+edits[ \t]*\n"
+        r"[ \t]*(?:❯[ \t]*)?3\.[ \t]+Tell\s+Claude\s+what\s+to\s+change[ \t]*(?:\n|$)",
         plan_region,
     )
     return (
         _auto_mode_billing_prompt_matches(pane, _AUTO_MODE_BILLING_CONSENT)
         or (plan_exit is not None and "❯" in plan_exit.group())
+        or (ready_plan is not None and ready_plan.group().count("❯") == 1)
         or "Do you want to " in region
         or "Yes, and don't ask again" in region
         or (
