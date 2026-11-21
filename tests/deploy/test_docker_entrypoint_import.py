@@ -21,6 +21,7 @@ import pytest
 from fastapi import FastAPI
 from pydantic import ValidationError
 
+from omnigent.stores.artifact_store.databricks_volumes import DatabricksVolumesArtifactStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.artifact_store.s3 import S3ArtifactStore
 from tests._helpers.providers import isolate_provider_resolution
@@ -162,13 +163,23 @@ def test_resolve_config_defaults_to_no_remote_store(_entrypoint_env: None) -> No
     assert _resolve_config().artifact_store_uri is None
 
 
-def test_resolve_config_rejects_non_s3_artifact_uri(
+def test_resolve_config_captures_volumes_artifact_uri(
     _entrypoint_env: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from deploy.docker.entrypoint import _resolve_config
 
-    monkeypatch.setenv("OMNIGENT_ARTIFACT_URI", "gs://my-bucket")
-    with pytest.raises(RuntimeError, match="s3://"):
+    monkeypatch.setenv("OMNIGENT_ARTIFACT_URI", "dbfs:/Volumes/main/omnigent/artifacts")
+    assert _resolve_config().artifact_store_uri == "dbfs:/Volumes/main/omnigent/artifacts"
+
+
+@pytest.mark.parametrize("artifact_store_uri", ["gs://my-bucket", "dbfs:/tmp/artifacts"])
+def test_resolve_config_rejects_unsupported_artifact_uri(
+    _entrypoint_env: None, monkeypatch: pytest.MonkeyPatch, artifact_store_uri: str
+) -> None:
+    from deploy.docker.entrypoint import _resolve_config
+
+    monkeypatch.setenv("OMNIGENT_ARTIFACT_URI", artifact_store_uri)
+    with pytest.raises(RuntimeError, match=r"s3://.*dbfs:/Volumes/"):
         _resolve_config()
 
 
@@ -176,14 +187,21 @@ def test_resolve_config_rejects_non_s3_artifact_uri(
     ("artifact_store_uri", "expected_type"),
     [
         ("s3://my-bucket/artifacts", S3ArtifactStore),
+        ("dbfs:/Volumes/main/omnigent/artifacts", DatabricksVolumesArtifactStore),
         (None, LocalArtifactStore),
     ],
 )
 def test_select_artifact_store(
-    tmp_path: Path, artifact_store_uri: str | None, expected_type: type
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact_store_uri: str | None,
+    expected_type: type,
 ) -> None:
     from deploy.docker.entrypoint import _ResolvedConfig, _select_artifact_store
 
+    # The Volumes store builds a WorkspaceClient from ambient credentials;
+    # stub it so selection is tested without a Databricks workspace.
+    monkeypatch.setattr("databricks.sdk.WorkspaceClient", MagicMock())
     resolved = _ResolvedConfig(
         cfg={},
         database_url="postgresql://u:p@localhost/omnigent",
