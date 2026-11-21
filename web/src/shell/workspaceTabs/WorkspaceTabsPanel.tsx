@@ -938,7 +938,10 @@ function WorkspaceTabsPanelImpl({
               onResumeSession={isEditorLevel(permissionLevel) ? resumeSession : undefined}
               resumingSession={tabConnections.resumingSession}
               onTryAgain={retryTerminals}
-              localReconnectCommand={tabConnections.localReconnectCommand}
+              // Only the owner can attach a runner, so only the owner gets the command.
+              localReconnectCommand={
+                isOwnerLevel(permissionLevel) ? tabConnections.localReconnectCommand : undefined
+              }
             />
           );
         }

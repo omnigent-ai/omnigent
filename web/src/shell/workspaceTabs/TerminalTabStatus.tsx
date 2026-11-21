@@ -16,6 +16,7 @@ import { LOCAL_RECONNECT_DESCRIPTION, LOCAL_RECONNECT_TITLE } from "@/shell/Reco
 import type { TerminalTabConnection } from "./terminalTabConnection";
 
 export const VIEWER_RESUME_HINT = "Ask someone who can edit this session to resume it.";
+export const OWNER_RECONNECT_HINT = "Ask the session's owner to reconnect it.";
 
 export function TerminalTabStatus({
   connection,
@@ -32,8 +33,11 @@ export function TerminalTabStatus({
   /** A session Resume is on its way. */
   resumingSession?: boolean;
   onTryAgain: () => void;
-  /** The command that relaunches a session that isn't host-bound, as Reconnect shows it. */
-  localReconnectCommand: string;
+  /**
+   * The command that relaunches a session that isn't host-bound, as Reconnect shows it; absent
+   * for anyone but the owner, since only the owner can attach a runner.
+   */
+  localReconnectCommand?: string;
 }) {
   const stalled = stalledReason(connection);
   useEffect(() => {
@@ -68,14 +72,16 @@ export function TerminalTabStatus({
         <TerminalTabMessage
           icon={<WifiOffIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden />}
           title={LOCAL_RECONNECT_TITLE}
-          detail={LOCAL_RECONNECT_DESCRIPTION}
+          detail={localReconnectCommand ? LOCAL_RECONNECT_DESCRIPTION : OWNER_RECONNECT_HINT}
           action={
-            <div className="w-full max-w-sm text-left">
-              <CliCommandBlock
-                command={localReconnectCommand}
-                testIdPrefix="terminal-tab-reconnect"
-              />
-            </div>
+            localReconnectCommand ? (
+              <div className="w-full max-w-sm text-left">
+                <CliCommandBlock
+                  command={localReconnectCommand}
+                  testIdPrefix="terminal-tab-reconnect"
+                />
+              </div>
+            ) : null
           }
         />
       );

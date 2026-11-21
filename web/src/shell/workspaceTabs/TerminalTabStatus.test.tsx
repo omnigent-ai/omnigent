@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { LOCAL_RECONNECT_DESCRIPTION } from "@/shell/ReconnectSessionDialog";
 
 import { START_TIMED_OUT } from "./terminalTabConnection";
-import { TerminalTabStatus, VIEWER_RESUME_HINT } from "./TerminalTabStatus";
+import { OWNER_RECONNECT_HINT, TerminalTabStatus, VIEWER_RESUME_HINT } from "./TerminalTabStatus";
 
 afterEach(cleanup);
 
@@ -84,6 +84,18 @@ describe("TerminalTabStatus", () => {
     expect(status).toHaveTextContent(RECONNECT_COMMAND);
     // There's no host to reconnect, so the tab doesn't point there.
     expect(status).not.toHaveTextContent("Reconnect host");
+
+    // Only the owner can attach a runner; anyone else is told who can.
+    view.rerender(
+      <TerminalTabStatus
+        connection={{ kind: "local_stranded" }}
+        sandboxNotice={null}
+        onTryAgain={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("status")).toHaveTextContent(OWNER_RECONNECT_HINT);
+    expect(screen.getByRole("status")).not.toHaveTextContent(LOCAL_RECONNECT_DESCRIPTION);
+    expect(screen.getByRole("status")).not.toHaveTextContent(RECONNECT_COMMAND);
 
     view.rerender(
       <TerminalTabStatus

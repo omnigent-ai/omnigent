@@ -7,13 +7,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
+import { LEVEL_EDIT, LEVEL_OWNER, LEVEL_READ } from "@/lib/permissionsApi";
 import { terminalsQueryKey } from "@/lib/terminals";
+import { LOCAL_RECONNECT_DESCRIPTION, LOCAL_RECONNECT_TITLE } from "@/shell/ReconnectSessionDialog";
 import { isCommandListed, usePaletteCommandsStore } from "@/store/paletteCommands";
 import { usePullRequestListCounts } from "@/store/pullRequestListCounts";
 import { registeredPaletteCommands } from "@/test/paletteCommands";
 
 import type { WorkspacePlaceViewProps } from "./placeViews/WorkspacePlaceView";
 import { SHELL_LIST_LIMIT_MS } from "./terminalTabConnection";
+import { OWNER_RECONNECT_HINT } from "./TerminalTabStatus";
 import { resetSessionResumes } from "./useTerminalTabConnection";
 import { WorkspaceTabsPanel, type WorkspaceTabsPanelProps } from "./WorkspaceTabsPanel";
 import {
@@ -738,6 +741,38 @@ describe("a shell's tab", () => {
     expect(await screen.findByTestId("terminal-tab-status")).toHaveTextContent(title);
     expect(screen.queryByTestId("terminal-tab-connecting")).toBeNull();
   });
+
+  it.each([
+    [LEVEL_READ, "a viewer"],
+    [LEVEL_EDIT, "an editor"],
+    [LEVEL_OWNER, "the owner"],
+  ])(
+    "gives the relaunch command for a stopped session with no host only to its owner (%i, %s)",
+    async (permissionLevel) => {
+      await listShells({});
+      const conversationId = `s-shell-stranded-${permissionLevel}`;
+      renderPanels([
+        {
+          conversationId,
+          terminalKeys: ["terminal:term_1"],
+          liveness: { kind: "local_stranded" },
+          permissionLevel,
+        },
+      ]);
+      const { store } = workspaceTabsSession(conversationId);
+      await act(async () => {
+        await store.open(
+          { place: { kind: "terminal", key: "terminal:term_1" } },
+          { opener: "user" },
+        );
+      });
+      const status = await screen.findByTestId("terminal-tab-status");
+      expect(status).toHaveTextContent(LOCAL_RECONNECT_TITLE);
+      const owner = permissionLevel === LEVEL_OWNER;
+      expect(status).toHaveTextContent(owner ? LOCAL_RECONNECT_DESCRIPTION : OWNER_RECONNECT_HINT);
+      expect(status.textContent?.includes(`--resume ${conversationId}`)).toBe(owner);
+    },
+  );
 
   it("resumes a session that isn't running from its shell tab, once while it's on its way", async () => {
     const { useTerminals } = await import("@/hooks/useTerminals");
