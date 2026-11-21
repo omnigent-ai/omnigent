@@ -1814,6 +1814,8 @@ def _pending_descendant_session_ids(
     session on the path below ``conv`` must be a readable, unarchived
     ``sub_agent``. All candidates move up one level per batch read, so
     the cost follows the deepest candidate's depth, not the tree size.
+    A session's root never changes, so candidates from another tree stop
+    after the first read.
 
     :param conv_store: Store used to batch-read conversations.
     :param conv: Session whose descendants are wanted.
@@ -1821,6 +1823,14 @@ def _pending_descendant_session_ids(
         prompt. Returned in this order.
     :returns: The ``candidate_ids`` below ``conv``.
     """
+
+    def on_visible_path(node: Conversation) -> bool:
+        return (
+            node.kind == "sub_agent"
+            and not node.archived
+            and node.root_conversation_id == conv.root_conversation_id
+        )
+
     known: dict[str, Conversation | None] = {}
     frontier = list(dict.fromkeys(candidate_ids))
     while frontier:
@@ -1829,7 +1839,7 @@ def _pending_descendant_session_ids(
         next_ids: list[str] = []
         for session_id in frontier:
             node = known[session_id]
-            if node is None or node.kind != "sub_agent" or node.archived:
+            if node is None or not on_visible_path(node):
                 continue
             parent_id = node.parent_conversation_id
             if parent_id is not None and parent_id != conv.id and parent_id not in known:
@@ -1842,7 +1852,7 @@ def _pending_descendant_session_ids(
         while current is not None and current not in visited:
             visited.add(current)
             node = known.get(current)
-            if node is None or node.kind != "sub_agent" or node.archived:
+            if node is None or not on_visible_path(node):
                 return False
             if node.parent_conversation_id == conv.id:
                 return True
