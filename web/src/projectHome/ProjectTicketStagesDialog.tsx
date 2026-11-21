@@ -22,7 +22,6 @@ import { Button } from "@/components/ui/button";
 import {
   Dialog,
   DialogContent,
-  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -76,13 +75,12 @@ export function ProjectTicketStagesDialog({
         if (!open && !save.isPending) onClose();
       }}
     >
-      <DialogContent className="max-h-[85dvh] overflow-y-auto sm:max-w-2xl">
+      <DialogContent
+        className="max-h-[85dvh] overflow-y-auto sm:max-w-2xl"
+        aria-describedby={undefined}
+      >
         <DialogHeader>
           <DialogTitle>Edit stages</DialogTitle>
-          <DialogDescription>
-            {projectName} · Drag to reorder, choose where tickets start, and mark completed stages.
-            Instructions guide agents; they do not run work or grant approvals.
-          </DialogDescription>
         </DialogHeader>
         {loaded ? (
           <StageEditor
@@ -264,10 +262,6 @@ function StageEditor({
           </label>
         </div>
       ))}
-      <p className="text-xs text-muted-foreground">
-        Tickets entering completed stages need completion summaries. Plan, Review and Needs response
-        stay independent of stages.
-      </p>
       {validation && <p className="text-sm text-muted-foreground">{validation}</p>}
       <TicketError error={error} />
       <DialogFooter>
