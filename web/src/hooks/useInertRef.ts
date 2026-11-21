@@ -34,14 +34,15 @@ export function useInertRef<T extends HTMLElement>(
   const inertRef = useRef(inert);
   // Apply during DOM mutation, as React would for a native prop, so layout
   // effects (e.g. ResponsiveViewerSlot restoring focus) see the final state.
-  useInsertionEffect(() => {
-    inertRef.current = inert;
-    elementRef.current?.toggleAttribute("inert", inert);
-  }, [inert]);
   const keepFocusOut = pending && !inert;
   const keepFocusOutRef = useRef(keepFocusOut);
-  useLayoutEffect(() => {
+  useInsertionEffect(() => {
+    inertRef.current = inert;
+    // Before refs attach, so an element mounting as the guard lifts keeps what it focuses.
     keepFocusOutRef.current = keepFocusOut;
+    elementRef.current?.toggleAttribute("inert", inert);
+  }, [inert, keepFocusOut]);
+  useLayoutEffect(() => {
     if (!keepFocusOut) return;
     blurInside(elementRef.current);
     // Reads the element on each event, so one that mounts while pending is guarded too.

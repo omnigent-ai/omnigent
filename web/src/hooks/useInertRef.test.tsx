@@ -25,10 +25,12 @@ function ClosingPanel({
   inert,
   pending,
   mounted = true,
+  autoFocus = false,
 }: {
   inert: boolean;
   pending: boolean;
   mounted?: boolean;
+  autoFocus?: boolean;
 }) {
   const ref = useInertRef<HTMLElement>(inert, undefined, { pending });
   return (
@@ -36,7 +38,9 @@ function ClosingPanel({
       <button type="button">Outside</button>
       {mounted ? (
         <aside ref={ref} aria-label="Panel">
-          <button type="button">Inside</button>
+          <button type="button" autoFocus={autoFocus}>
+            Inside
+          </button>
         </aside>
       ) : null}
     </>
@@ -135,6 +139,12 @@ describe("useInertRef", () => {
       act(() => outside().focus());
       act(() => inside().focus());
       expect(outside()).toHaveFocus();
+    });
+
+    it("lets an element that mounts as the guard lifts keep what it focuses", () => {
+      const { rerender } = render(<ClosingPanel inert={false} pending mounted={false} />);
+      rerender(<ClosingPanel inert={false} pending={false} autoFocus />);
+      expect(inside()).toHaveFocus();
     });
   });
 
