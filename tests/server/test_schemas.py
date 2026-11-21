@@ -1159,8 +1159,8 @@ def test_session_metadata_managed_accepts_sandbox_provider() -> None:
     """
     from omnigent.server.schemas import SessionCreateMetadata
 
-    meta = SessionCreateMetadata(host_type="managed", sandbox_provider="lakebox")
-    assert meta.sandbox_provider == "lakebox"
+    meta = SessionCreateMetadata(host_type="managed", sandbox_provider="custom-sandbox")
+    assert meta.sandbox_provider == "custom-sandbox"
 
 
 def test_session_metadata_external_rejects_sandbox_provider() -> None:
@@ -1171,7 +1171,7 @@ def test_session_metadata_external_rejects_sandbox_provider() -> None:
     from omnigent.server.schemas import SessionCreateMetadata
 
     with pytest.raises(ValidationError, match="sandbox_provider only applies"):
-        SessionCreateMetadata(sandbox_provider="lakebox")
+        SessionCreateMetadata(sandbox_provider="custom-sandbox")
 
 
 def test_session_metadata_external_rejects_repo_url_workspace() -> None:

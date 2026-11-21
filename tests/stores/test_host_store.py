@@ -267,7 +267,9 @@ def test_automatic_cleanup_cannot_delete_replacement_generation(
     assert host_store.get_host(host_id).sandbox_id == "replacement"
 
 
-@pytest.mark.parametrize("provider", [None, "kubernetes", "agent_sandbox", "modal", "lakebox"])
+@pytest.mark.parametrize(
+    "provider", [None, "kubernetes", "agent_sandbox", "modal", "custom-sandbox"]
+)
 @pytest.mark.parametrize("saved_profile", [False, True])
 @pytest.mark.parametrize("binding", ["unbound", "same-host", "transfer"])
 def test_launch_admission_keeps_saved_profiles_on_managed_hosts(
