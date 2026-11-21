@@ -46,6 +46,29 @@ afterEach(() => {
 });
 
 describe("useResizeDrag cancellation", () => {
+  it("keeps a touch or pen drag through the OS long-press context menu", () => {
+    for (const pointerType of ["touch", "pen"]) {
+      const onMove = vi.fn();
+      const view = render(<DragHandle name={`Resize ${pointerType}`} onMove={onMove} />);
+      const handle = screen.getByLabelText(`Resize ${pointerType}`);
+      const capture = installPointerCapture(handle);
+
+      fireEvent.pointerDown(handle, { button: 0, pointerId: 21, pointerType });
+      const menu = new Event("contextmenu", { cancelable: true });
+      document.dispatchEvent(menu);
+
+      expect(menu.defaultPrevented).toBe(true);
+      expect(capture.releasePointerCapture).not.toHaveBeenCalled();
+      expect(overlaySelector()).not.toBeNull();
+      fireEvent.pointerMove(handle, { pointerId: 21, pointerType, clientX: 40 });
+      expect(onMove).toHaveBeenCalledTimes(1);
+
+      fireEvent.pointerUp(handle, { pointerId: 21, pointerType });
+      expect(overlaySelector()).toBeNull();
+      view.unmount();
+    }
+  });
+
   it.each([
     ["Escape", () => fireEvent.keyDown(document, { key: "Escape" })],
     ["context menu", () => document.dispatchEvent(new Event("contextmenu"))],

@@ -6248,8 +6248,22 @@ function ConversationRowImpl({
 
   // Owners' live rows reorder; any row in the same list is a target.
   const canReorder = reorderGroup !== undefined && isOwner && !isArchived;
+  const nestMoves = useContext(NestMoveContext);
+  const canMoveNest = !!nestMoves && isOwner && !isArchived && !conversation.parent_session_id;
+  const { setNodeRef: setNestNodeRef, isOver: isNestTarget } = useDroppable({
+    id: `nest:${conversation.id}`,
+    data: { type: "session-nest", destination: conversation },
+    disabled: !canMoveNest || !conversation.family,
+  });
   const gestureEnabled = !selectionMode && !isEditing && !isProvisionalRow;
-  const dragEnabled = gestureEnabled && !isArchived && (isOwner || gridsEnabled);
+  // Every condition that disables the draggable below, so a touch hold never
+  // enters a drag phase dnd-kit won't start (which would also block scrolling).
+  const dragEnabled =
+    gestureEnabled &&
+    !isArchived &&
+    (isOwner || gridsEnabled) &&
+    !((familyIndented || isIndentedSibling(conversation)) && !gridsEnabled && !canMoveNest) &&
+    !nestMoves?.saving;
   const swipeActions = useSwipeActions();
   const hasSwipeLeft = swipeActions.left !== "none";
   const hasSwipeRight = swipeActions.right !== "none";
@@ -6332,13 +6346,6 @@ function ConversationRowImpl({
     onCancel: closeContextMenu,
   });
 
-  const nestMoves = useContext(NestMoveContext);
-  const canMoveNest = !!nestMoves && isOwner && !isArchived && !conversation.parent_session_id;
-  const { setNodeRef: setNestNodeRef, isOver: isNestTarget } = useDroppable({
-    id: `nest:${conversation.id}`,
-    data: { type: "session-nest", destination: conversation },
-    disabled: !canMoveNest || !conversation.family,
-  });
   // Drag-and-drop: a row is grabbable when the viewer owns it (re-filing is
   // owner-only, like the Move-to-project kebab item), outside selection /
   // archive / rename modes. Dragging it onto a project folder files it there;
@@ -6365,10 +6372,7 @@ function ConversationRowImpl({
       reorderIndex,
       rowGesture: gesture.dndData,
     },
-    disabled:
-      !dragEnabled ||
-      ((familyIndented || isIndentedSibling(conversation)) && !gridsEnabled && !canMoveNest) ||
-      nestMoves?.saving,
+    disabled: !dragEnabled,
   });
   const {
     setNodeRef: setSessionOrderNodeRef,

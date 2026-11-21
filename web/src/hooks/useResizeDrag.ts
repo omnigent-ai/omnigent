@@ -124,7 +124,16 @@ export function useResizeDrag<T extends Element = Element>({
       const onDocumentKeyDown = (documentEvent: KeyboardEvent) => {
         if (documentEvent.key === "Escape") cancelDrag();
       };
-      const onContextMenu = cancelDrag;
+      // A touch or pen held still past the OS long-press timeout raises a context
+      // menu mid-drag; keep the drag and swallow the menu. A mouse right-click aborts.
+      const heldPointer = event.pointerType === "touch" || event.pointerType === "pen";
+      const onContextMenu = (contextEvent: Event) => {
+        if (heldPointer) {
+          contextEvent.preventDefault();
+          return;
+        }
+        cancelDrag();
+      };
       const onWindowBlur = cancelDrag;
       const onVisibilityChange = () => {
         if (document.visibilityState === "hidden") cancelDrag();
