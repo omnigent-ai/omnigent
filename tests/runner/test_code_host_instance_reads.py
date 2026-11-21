@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -512,15 +513,33 @@ def test_a_runners_children_never_see_its_instance_settings(
 ) -> None:
     """Every process a runner starts, whatever env it passes, inherits neither setting."""
     config = _instance_file(tmp_path / "host.toml", str(cli))
-    monkeypatch.setenv(CODE_HOST_INSTANCES_FILE_ENV_VAR, str(config))
-    monkeypatch.setenv(CODE_HOST_INSTANCE_HOSTS_ENV_VAR, INSTANCE_HOST)
+    # A fully synthetic process environment, so nothing real can reach the child.
+    for name in list(os.environ):
+        monkeypatch.delenv(name)
+    for name, value in {
+        **SYNTHETIC_ENVIRONMENT,
+        CODE_HOST_INSTANCES_FILE_ENV_VAR: str(config),
+        CODE_HOST_INSTANCE_HOSTS_ENV_VAR: INSTANCE_HOST,
+    }.items():
+        monkeypatch.setenv(name, value)
 
     code_host_instances.take_runner_settings()
 
-    child = subprocess.run(["env"], capture_output=True, text=True, check=True).stdout
-    assert CODE_HOST_INSTANCES_FILE_ENV_VAR not in child
-    assert CODE_HOST_INSTANCE_HOSTS_ENV_VAR not in child
-    assert str(config) not in child
+    # The child reports presence only, never a value.
+    probe = (
+        "import json, os, sys\n"
+        "names, path = sys.argv[1:3], sys.argv[3]\n"
+        "print(json.dumps({'names': [n in os.environ for n in names],"
+        " 'path': path in os.environ.values()}))"
+    )
+    names = [CODE_HOST_INSTANCES_FILE_ENV_VAR, CODE_HOST_INSTANCE_HOSTS_ENV_VAR]
+    child = subprocess.run(
+        [sys.executable, "-I", "-c", probe, *names, str(config)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert json.loads(child.stdout) == {"names": [False, False], "path": False}
     assert code_host_instances.instance_for_host(INSTANCE_HOST) is not None
 
 
