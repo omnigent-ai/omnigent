@@ -597,6 +597,24 @@ def test_reset_for_tests_clears_observer_registration() -> None:
     assert received == []
 
 
+def test_reset_for_tests_clears_count_persist_hook_registration() -> None:
+    """
+    ``reset_for_tests`` clears the count-persist hook like the observer.
+
+    A hook that outlived the reset would keep firing in every later test
+    of the process and poison ``session_live_state``'s dedupe cache.
+    """
+    fired: list[tuple[str, int]] = []
+
+    def _hook(conv_id: str, count: int) -> None:
+        fired.append((conv_id, count))
+
+    pending_elicitations.set_count_persist_hook(_hook)
+    pending_elicitations.reset_for_tests()
+    pending_elicitations.record_publish("conv_a", _elicit_event("elicit_1"))
+    assert fired == []
+
+
 def test_lookup_returns_matching_elicitation() -> None:
     """
     :func:`lookup` returns ``(conversation_id, event)`` when the
