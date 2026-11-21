@@ -427,6 +427,44 @@ WORKDIR /root
 # sandbox create` runs so a bare `docker run` behaves the same way.
 CMD ["sleep", "infinity"]
 
+# ── OpenShell host runtime (`--target host-openshell`) ──
+FROM host AS host-openshell
+
+# Build the venv under /sandbox rather than relocating /opt/venv: the k8s
+# driver seeds the image's /sandbox into the workspace PVC, which then mounts
+# over /sandbox at runtime, and the sandbox policy leaves only /sandbox and
+# /tmp writable. Copying does not work — console scripts' shebangs embed the
+# creating venv's absolute path (#!/opt/venv/bin/python), so every entry point
+# (omnigent, pip) fails with ENOENT once /opt/venv is removed — so rebuild
+# the venv in place from the source tree, like the UBI host-openshell stage.
+RUN python -m venv /sandbox/.venv \
+ && /sandbox/.venv/bin/pip install --no-cache-dir \
+      /build /build/sdks/python-client /build/sdks/ui "python-socks[asyncio]" \
+ && /sandbox/.venv/bin/pip install --no-cache-dir --no-deps "websockets>=15" \
+ && rm -rf /opt/venv /build
+
+ENV PATH="/sandbox/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin" \
+    VIRTUAL_ENV="/sandbox/.venv" \
+    HOME="/sandbox"
+
+RUN printf 'export PATH="/sandbox/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin"\nexport VIRTUAL_ENV="/sandbox/.venv"\n' \
+      > /sandbox/.bashrc \
+ && printf '[ -f ~/.bashrc ] && . ~/.bashrc\n' > /sandbox/.bash_profile \
+ && echo 'export PATH="/sandbox/.venv/bin:${PATH}"' > /etc/profile.d/omnigent-venv.sh
+
+# OpenShell helper: the deny-by-default egress policy.
+COPY deploy/docker/openshell/policy.yaml /etc/openshell/policy.yaml
+
+# workspace-init's seed-workspace runs as UID 10001 with no supplemental
+# groups — /sandbox must be readable by other UIDs (useradd -m left it 700).
+RUN chown -R sandbox:0 /sandbox \
+ && chmod -R a+rX /sandbox \
+ && chmod -R g+w /sandbox
+
+USER sandbox
+WORKDIR /sandbox
+
+
 # ── Server runtime (default target) ─────────────────────
 FROM python:${PYTHON_VERSION}-slim AS runtime
 
