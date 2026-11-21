@@ -386,11 +386,11 @@ import {
 } from "@/components/KeyboardShortcut";
 
 // Positioning for a row's trailing session-state badge. Anchored at the row's
-// right-1 edge: on fine-hover desktop it fades on hover/focus so the pin +
-// archive + kebab take its place; elsewhere the controls are gone and the badge
-// holds the edge, fading only under a held shortcut hint.
+// trailing icon edge in every viewport: on desktop it fades on hover so the pin
+// + kebab take its place; on mobile those controls are gone, so the badge holds
+// that edge. A held pinned-row shortcut hint fades it the same way.
 const SESSION_STATE_SLOT_CLASS =
-  "-translate-y-1/2 pointer-events-none absolute flex h-5 items-center transition-opacity fine-hover:md:group-hover:opacity-0 fine-hover:md:group-has-[:focus-visible]:opacity-0 fine-hover:md:group-has-[[data-testid=conversation-actions][aria-expanded=true]]:opacity-0 group-has-[[data-session-shortcut-hint]]:opacity-0";
+  "-translate-y-1/2 pointer-events-none absolute flex h-5 items-center transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[data-testid=conversation-actions][aria-expanded=true]]:opacity-0 group-has-[[data-session-shortcut-hint]]:opacity-0";
 
 // Small markers (running/starting/unseen dot, or the draft pencil when there's
 // no session state) get a fixed size-6 centered box so their glyph lands 16px
@@ -423,12 +423,13 @@ function trailingSlotKind(
   return "none";
 }
 
-// fine-hover display from `md` up, fading until the row is hovered, a control
-// is keyboard-focused or the kebab menu is open. Touch devices of any width
-// act on rows through swipes and the long-press menu instead.
+// A session row's quick controls (pin, archive, kebab) exist only in the
+// desktop layout (`md` up), fading until the row is hovered, a control is
+// keyboard-focused or the kebab menu is open. The mobile layout acts on rows
+// through swipes and the long-press menu instead.
 // `inline-flex` (not `block`) keeps the Button base's flex centering.
 const ROW_CONTROL_CLASS =
-  "hidden text-muted-foreground transition-opacity focus-visible:ring-inset fine-hover:md:inline-flex fine-hover:md:opacity-0 fine-hover:md:group-hover:opacity-100 fine-hover:md:group-has-[:focus-visible]:opacity-100 fine-hover:md:group-has-[[data-testid=conversation-actions][aria-expanded=true]]:opacity-100";
+  "hidden text-muted-foreground transition-opacity focus-visible:ring-inset md:inline-flex md:opacity-0 md:group-hover:opacity-100 md:group-has-[:focus-visible]:opacity-100 md:group-has-[[data-testid=conversation-actions][aria-expanded=true]]:opacity-100";
 const DROP_TARGET_HIGHLIGHT = SIDEBAR_ACTIVE_HIGHLIGHT;
 
 const SCROLLBAR_HIDE_DELAY_MS = 700;
@@ -4192,17 +4193,17 @@ function SectionHeader({
   // desktops the marker returns to the right edge until the controls appear.
   const clusterRestMargin = showsMarker ? (icon ? "-mr-1" : "mr-1") : "mr-2";
   const clusterHoverDesktopMargin = hasPersistentAction
-    ? "fine-hover:md:mr-7"
+    ? "md:mr-7"
     : showsMarker
       ? icon
-        ? "fine-hover:md:-mr-1"
-        : "fine-hover:md:mr-1"
-      : "fine-hover:md:mr-2";
+        ? "md:-mr-1"
+        : "md:mr-1"
+      : "md:mr-2";
   const markerFade =
-    "fine-hover:md:group-hover/section:opacity-0 fine-hover:md:group-has-[[data-state=open]]/header:opacity-0";
+    "md:group-hover/section:opacity-0 md:group-has-[[data-state=open]]/header:opacity-0";
   const actionFocusFade = actionFocusVisible
-    ? "fine-hover:md:group-has-[[data-header-controls]_:focus-visible]/header:opacity-0"
-    : "fine-hover:md:group-has-[[data-header-controls]:focus-within]/header:opacity-0";
+    ? "md:group-has-[[data-header-controls]_:focus-visible]/header:opacity-0"
+    : "md:group-has-[[data-header-controls]:focus-within]/header:opacity-0";
   const button = (
     <button
       ref={
@@ -4255,7 +4256,7 @@ function SectionHeader({
               active && SIDEBAR_ACTIVE_HIGHLIGHT,
               hasAction &&
                 !showsMarker &&
-                "fine-hover:pr-14 fine-hover:md:pr-2 fine-hover:md:group-hover/header:pr-14 fine-hover:md:group-has-[[data-header-controls]:focus-within]/header:pr-14 fine-hover:md:group-has-[[data-state=open]]/header:pr-14",
+                "pr-8 md:pr-2 md:group-hover/header:pr-14 md:group-has-[[data-header-controls]:focus-within]/header:pr-14 md:group-has-[[data-state=open]]/header:pr-14",
             )
           : cn(
               "group flex h-7 w-full items-center gap-1 border-0 pr-0 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground max-md:pl-4",
@@ -4267,21 +4268,21 @@ function SectionHeader({
     >
       {icon ? (
         // Headers with a leading icon (project folders) swap the folder for a
-        // chevron on fine-hover desktop, so the caret takes the icon's place
-        // rather than trailing the name. Without fine hover (mobile, touch
-        // tablets) the folder icon and the trailing chevron below stay visible.
+        // chevron on desktop hover/focus, so the caret takes the icon's place
+        // rather than trailing the name. Mobile (no hover) keeps the folder
+        // icon and shows the trailing chevron below.
         <span
           data-section-toggle
           className="relative flex size-4 shrink-0 cursor-default items-center justify-center"
         >
-          <span className="flex md:transition-opacity fine-hover:md:group-hover:opacity-0 fine-hover:md:group-focus-visible:opacity-0">
+          <span className="flex md:transition-opacity md:group-hover:opacity-0 md:group-focus-visible:opacity-0">
             {icon}
           </span>
           <ChevronRightIcon
             className={cn(
               "absolute size-3.5 opacity-0 transition-[transform,opacity]",
               !collapsed && "rotate-90",
-              "hidden md:flex fine-hover:md:group-hover:opacity-100 fine-hover:md:group-focus-visible:opacity-100",
+              "hidden md:flex md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
             )}
           />
         </span>
@@ -4289,16 +4290,16 @@ function SectionHeader({
       {/* Project folder names sit heavier than their session rows. */}
       <span className={cn("min-w-0 truncate", icon && "font-medium")}>{title}</span>
       {/* Trailing chevron, rotating on expand. Headers without a leading icon
-            reveal it on fine-hover desktop; icon headers show it only without
-            fine hover, since desktop swaps the folder for the chevron above. */}
+            reveal it on desktop hover/focus; icon headers show it only on mobile
+            (no hover) since desktop swaps the folder for the chevron above. */}
       <ChevronRightIcon
         data-section-toggle
         className={cn(
           "size-3.5 shrink-0 cursor-default transition-[transform,opacity]",
           !collapsed && "rotate-90",
           icon
-            ? "fine-hover:md:hidden"
-            : "fine-hover:md:opacity-0 fine-hover:md:group-hover:opacity-100 fine-hover:md:group-focus-visible:opacity-100",
+            ? "md:hidden"
+            : "md:opacity-0 md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
         )}
       />
       {/* A hidden row inside this collapsed section carries a marker — surface
@@ -4307,13 +4308,9 @@ function SectionHeader({
         <span
           className={cn(
             "ml-auto flex shrink-0 items-center justify-center transition-opacity mobile-app:mr-0 mobile-app:opacity-100",
-            // Project actions exist only with fine hover (touch uses the
-            // long-press menu); section headers keep their select/filter slots.
+            // Mobile project rows have one menu; desktop also gets a shortcut.
             hasAction
-              ? cn(
-                  icon ? cn(clusterRestMargin, "fine-hover:mr-14") : "mr-14",
-                  clusterHoverDesktopMargin,
-                )
+              ? cn(icon ? "mr-7" : "mr-14", clusterHoverDesktopMargin)
               : hasPersistentAction
                 ? "mr-7"
                 : clusterRestMargin,
@@ -4773,7 +4770,7 @@ function SectionGroup({
             // clicked button keeps focus afterward.
             <div
               data-header-controls
-              className="mobile-app:static mobile-app:translate-y-0 mobile-app:pr-1 mobile-app:pointer-events-auto -translate-y-1/2 absolute top-1/2 right-1 flex items-center transition-opacity fine-hover:md:opacity-0 fine-hover:md:has-[:focus-visible]:opacity-100 fine-hover:md:group-has-[[data-state=open]]/header:opacity-100 fine-hover:md:group-hover/header:opacity-100"
+              className="mobile-app:static mobile-app:translate-y-0 mobile-app:pr-1 mobile-app:pointer-events-auto -translate-y-1/2 absolute top-1/2 right-1 flex items-center transition-opacity md:opacity-0 md:has-[:focus-visible]:opacity-100 md:group-has-[[data-state=open]]/header:opacity-100 md:group-hover/header:opacity-100"
             >
               {headerAction}
             </div>
@@ -4965,7 +4962,7 @@ function ConversationSection({
                   ? "ml-auto flex shrink-0 items-center gap-0.5 pr-1"
                   : "mobile-app:static mobile-app:translate-y-0 mobile-app:pr-1 mobile-app:pointer-events-auto -translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5",
                 protectsCollapsedBadge &&
-                  "fine-hover:md:pointer-events-none fine-hover:md:group-has-[[data-header-controls]:focus-within]/header:pointer-events-auto fine-hover:md:group-hover/header:pointer-events-auto fine-hover:md:group-has-[[data-state=open]]/header:pointer-events-auto fine-hover:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:pointer-events-auto fine-hover:md:has-[[aria-expanded=true]]:pointer-events-auto",
+                  "md:pointer-events-none md:group-has-[[data-header-controls]:focus-within]/header:pointer-events-auto md:group-hover/header:pointer-events-auto md:group-has-[[data-state=open]]/header:pointer-events-auto md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:pointer-events-auto md:has-[[aria-expanded=true]]:pointer-events-auto",
               )}
             >
               {headerAction && (
@@ -4977,7 +4974,7 @@ function ConversationSection({
                 <div
                   className={cn(
                     "flex items-center rounded transition-opacity",
-                    "fine-hover:md:opacity-0 fine-hover:md:group-has-[[data-header-controls]:focus-within]/header:opacity-100 fine-hover:md:group-hover/header:opacity-100 fine-hover:md:group-has-[[data-state=open]]/header:opacity-100 fine-hover:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100 fine-hover:md:has-[[aria-expanded=true]]:opacity-100",
+                    "md:opacity-0 md:group-has-[[data-header-controls]:focus-within]/header:opacity-100 md:group-hover/header:opacity-100 md:group-has-[[data-state=open]]/header:opacity-100 md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100 md:has-[[aria-expanded=true]]:opacity-100",
                   )}
                 >
                   {headerAction}
@@ -5341,13 +5338,13 @@ export function ConversationMenuItems({
           </C.SubContent>
         </C.Sub>
       )}
-      {/* Pin/Unpin — wherever the quick-pin button is absent: off fine-hover desktop,
-          or on every device when Settings hides the quick buttons. Archived rows omit it. */}
+      {/* Desktop pins from the hover button unless Settings hides it; archived
+          rows omit Pin (archive outranks pin). */}
       {onTogglePinned && !kanbanCard && !isArchived && !isIndentedSibling(conversation) && (
         <C.Item
           data-testid="pin-conversation"
           disabled={pinSaving || (!isPinned && atPinCap)}
-          className={cn("mobile-touch-target", showQuickActions && "fine-hover:md:hidden")}
+          className={cn("mobile-touch-target", showQuickActions && "md:hidden")}
           onSelect={() => onTogglePinned(conversation.id)}
         >
           {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
@@ -6591,9 +6588,9 @@ function ConversationRowImpl({
           "mobile-touch-target",
           // Aligns the parent title with its nested rows' titles (ml-6 + px-2).
           familyExpanded !== undefined && "pl-8",
-          // Rest reserve: without fine hover the controls are gone, so the row
-          // reserves only what the badge needs — the same width a fine-hover
-          // desktop uses before hover reveals the controls.
+          // Mobile drops the pin + kebab (see the trailing controls below), so it
+          // reserves only what the badge needs — the same width desktop uses at
+          // rest, before hover reveals the controls.
           !selectionMode &&
             (showSharedIndicator ? trailingLayout.sharedReserve : trailingLayout.reserve),
           // The narrowed reserve must track exactly when the trailing controls
@@ -6601,11 +6598,8 @@ function ConversationRowImpl({
           // `focus-within` also fires for a plain click, which shrank the reserve
           // on the selected row while the marker stayed put, sliding the title
           // under it.
-          // Gated on fine hover like the reveals themselves: without it the
-          // persistent touch-tablet reserve above stays put.
-          !selectionMode &&
-            `fine-hover:md:group-hover:pr-20 fine-hover:md:group-has-[:focus-visible]:pr-20`,
-          !selectionMode && menuOpen && "fine-hover:md:pr-20",
+          !selectionMode && "md:group-hover:pr-20 md:group-has-[:focus-visible]:pr-20",
+          !selectionMode && menuOpen && "md:pr-20",
           // Same room as the hover controls, so a held hint never covers the title.
           shortcutSlot !== undefined && "group-has-[[data-session-shortcut-hint]]:pr-20",
           selectionMode && "pr-2 pl-8",
@@ -6979,13 +6973,12 @@ function ConversationRowImpl({
                   className={cn(
                     "-translate-y-1/2 absolute right-1 flex items-center gap-0.5",
                     overlayTop,
-                    // While hover-faded on a fine-pointer display the controls must
-                    // not hit-test either (opacity alone leaves them tappable on a
-                    // touchscreen laptop, ahead of the row's tap/swipe), so they go
-                    // inert until the same hover/focus/open state that reveals them —
-                    // the section headers' controls use the identical gate.
-                    "fine-hover:md:pointer-events-none",
-                    "fine-hover:md:group-hover:pointer-events-auto fine-hover:md:group-has-[:focus-visible]:pointer-events-auto fine-hover:md:group-has-[[data-testid=conversation-actions][aria-expanded=true]]:pointer-events-auto",
+                    // While hover-faded on desktop the controls must not hit-test
+                    // either (opacity alone leaves them tappable on a touchscreen
+                    // laptop, ahead of the row's tap/swipe), so they go inert until
+                    // the same hover/focus/open state that reveals them.
+                    "md:pointer-events-none",
+                    "md:group-hover:pointer-events-auto md:group-has-[:focus-visible]:pointer-events-auto md:group-has-[[data-testid=conversation-actions][aria-expanded=true]]:pointer-events-auto",
                     "group-has-[[data-session-shortcut-hint]]:hidden",
                   )}
                 >
@@ -7299,9 +7292,8 @@ function ProjectFolderActions({
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
   actions: ProjectFolderMenuActions;
 }) {
-  // Touch devices of any width reach these through the header's long-press menu.
   return (
-    <div className="hidden items-center gap-0.5 fine-hover:flex">
+    <div className="flex items-center gap-0.5">
       <Tooltip>
         <TooltipTrigger asChild>
           <Button
@@ -7310,7 +7302,7 @@ function ProjectFolderActions({
             size="icon-xs"
             aria-label={`New session in ${projectName}`}
             data-testid="project-new-session"
-            className="text-muted-foreground"
+            className="hidden text-muted-foreground md:flex"
           >
             <Link
               to={`/?project=${encodeURIComponent(projectName)}`}

@@ -453,11 +453,11 @@ describe("quick pin/unpin hover button", () => {
     renderSidebar();
 
     const rowLink = screen.getByRole("link", { name: "My Session" });
-    expect(rowLink).not.toHaveClass("fine-hover:md:pr-20");
+    expect(rowLink).not.toHaveClass("md:pr-20");
 
     fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
 
-    expect(rowLink).toHaveClass("fine-hover:md:pr-20");
+    expect(rowLink).toHaveClass("md:pr-20");
   });
 
   it("sizes the project-folder header controls to match the session-row kebab", () => {
@@ -500,9 +500,7 @@ describe("quick pin/unpin hover button", () => {
     expect(iconSelector.querySelector("svg")).toHaveClass("text-primary");
   });
 
-  // These are class-contract tests: jsdom does not evaluate @media (hover:hover).
-  // The recorded sidebar-project-row-fixes.gif demo is the behavioral guardrail.
-  it("keeps the Projects group-header actions visible without hover, hover-revealed on desktop", () => {
+  it("keeps the Projects group-header actions visible on mobile, hover-revealed on desktop", () => {
     // The "New project" (+) button is the only way to create a project, so its
     // group-header wrapper must stay visible in the mobile layout. jsdom doesn't
     // evaluate media queries, so assert the responsive classes: base `flex`
@@ -516,73 +514,28 @@ describe("quick pin/unpin hover button", () => {
     expect(wrapper).not.toHaveClass("hidden");
     // Desktop: fades out until the header is hovered / focused / a menu opens.
     expect(wrapper).toHaveClass(
-      "fine-hover:md:opacity-0",
-      "fine-hover:md:group-hover/header:opacity-100",
-      "fine-hover:md:has-[:focus-visible]:opacity-100",
+      "md:opacity-0",
+      "md:group-hover/header:opacity-100",
+      "md:has-[:focus-visible]:opacity-100",
     );
   });
 
-  it("keeps the hover-faded row controls inert on a fine-pointer display", () => {
+  it("keeps the hover-faded row controls inert on desktop", () => {
     // Opacity alone leaves a faded control tappable (a touchscreen laptop's
     // finger lands on the invisible kebab ahead of the row), so the control
-    // cluster is pointer-events-none under the same fine-hover gate that fades
-    // it, and comes back with the same hover / focus / open-menu reveals.
+    // cluster is pointer-events-none under the same `md` gate that fades it,
+    // and comes back with the same hover / focus / open-menu reveals.
     renderSidebar();
 
     const cluster = screen.getByTestId("conversation-row-controls");
     expect(cluster).toHaveClass(
-      "fine-hover:md:pointer-events-none",
-      "fine-hover:md:group-hover:pointer-events-auto",
-      "fine-hover:md:group-has-[:focus-visible]:pointer-events-auto",
-      "fine-hover:md:group-has-[[data-testid=conversation-actions][aria-expanded=true]]:pointer-events-auto",
+      "md:pointer-events-none",
+      "md:group-hover:pointer-events-auto",
+      "md:group-has-[:focus-visible]:pointer-events-auto",
+      "md:group-has-[[data-testid=conversation-actions][aria-expanded=true]]:pointer-events-auto",
     );
-    expect(cluster).not.toHaveClass("pointer-events-none", "md:pointer-events-none");
-  });
-
-  it("keeps the session-row pin and kebab visible without hover on a touch tablet", () => {
-    // The row's quick-pin and actions kebab must match the header actions'
-    // capability gating: fade-until-hover only where hover exists. On a
-    // hover-incapable md+ device (touch tablet) a bare `md:opacity-0` leaves
-    // the controls permanently invisible — there is no hover to reveal them —
-    // so the fade and its hover/focus reveals must all be gated on
-    // `fine-hover`, never on viewport width alone.
-    renderSidebar();
-
-    const pin = screen.getByTestId("quick-pin-conversation");
-    expect(pin).toHaveClass("fine-hover:md:opacity-0", "fine-hover:md:group-hover:opacity-100");
-    expect(pin).not.toHaveClass("md:opacity-0");
-
-    const kebab = screen.getByTestId("conversation-actions");
-    expect(kebab).toHaveClass(
-      "fine-hover:md:opacity-0",
-      "fine-hover:md:group-hover:opacity-100",
-      "fine-hover:md:group-has-[[data-testid=conversation-actions][aria-expanded=true]]:opacity-100",
-    );
-    expect(kebab).not.toHaveClass("md:opacity-0");
-  });
-
-  it("keeps Pinned and Sessions carets visible on a wide coarse-pointer device", () => {
-    vi.stubGlobal("innerWidth", 810);
-    mocks.anyCoarse = true;
-    mocks.pinnedStore.set([CONV.id]);
-    mockConversations([
-      CONV,
-      { ...CONV, id: "conv_2", title: "Another session", updated_at: CONV.updated_at - 1 },
-    ]);
-    renderSidebar();
-
-    expect(window.innerWidth).toBe(810);
-    expect(mocks.anyCoarse).toBe(true);
-    for (const name of ["Pinned", "Sessions"]) {
-      const header = screen.getByRole("button", { name });
-      const chevron = header.querySelector(".lucide-chevron-right");
-      expect(chevron).toHaveClass(
-        "fine-hover:md:opacity-0",
-        "fine-hover:md:group-hover:opacity-100",
-        "fine-hover:md:group-focus-visible:opacity-100",
-      );
-      expect(chevron).not.toHaveClass("md:opacity-0");
-    }
+    // Below md the controls are hidden outright, so nothing there is inert.
+    expect(cluster).not.toHaveClass("pointer-events-none");
   });
 
   it("hides the Projects list-actions kebab when there are no projects", () => {
@@ -667,24 +620,23 @@ describe("quick pin/unpin hover button", () => {
 
   it("splits the two pin affordances by viewport via Tailwind responsive classes", () => {
     // jsdom doesn't evaluate CSS media queries, so both affordances live in the
-    // DOM regardless of viewport — the split is purely the responsive and
-    // input-capability classes. Assert those classes directly: the menu Pin
-    // item is hidden on fine-hover `md`+ (desktop), and the quick button is
-    // shown only there. Together they guarantee exactly one pin affordance on
-    // every device, including touch devices at desktop widths.
+    // DOM regardless of viewport — the mobile/desktop split is purely the
+    // responsive classes. Assert those classes directly: the kebab Pin item is
+    // hidden from `md` up (desktop), and the quick button is hidden below `md`
+    // (mobile) but shown from `md` up. Together they guarantee exactly one pin
+    // affordance is visible at any breakpoint.
     renderSidebar();
 
-    // Desktop quick button: revealed only on fine-hover `md`+. The reveal uses
-    // `inline-flex` (not `block`) so the button stays a flex container — see
-    // the centering regression test below.
+    // Desktop quick button: hidden on mobile, revealed from `md` up. The reveal
+    // uses `md:inline-flex` (not `md:block`) so the button stays a flex
+    // container — see the centering regression test below.
     const quickButton = screen.getByTestId("quick-pin-conversation");
-    expect(quickButton).toHaveClass("hidden", "fine-hover:md:inline-flex");
+    expect(quickButton).toHaveClass("hidden", "md:inline-flex");
 
-    // Menu Pin item: present in the menu but hidden on fine-hover `md`+, so it
-    // surfaces on phones and touch devices at any width.
+    // Kebab Pin item: present in the menu but hidden from `md` up, so it only
+    // surfaces on mobile.
     fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
-    expect(screen.getByTestId("pin-conversation")).toHaveClass("fine-hover:md:hidden");
-    expect(screen.getByTestId("pin-conversation")).not.toHaveClass("md:hidden");
+    expect(screen.getByTestId("pin-conversation")).toHaveClass("md:hidden");
   });
 
   it("reveals the quick-pin button without breaking icon centering", () => {
@@ -701,21 +653,21 @@ describe("quick pin/unpin hover button", () => {
     expect(quickButton).toHaveClass("items-center", "justify-center");
     // ...and the desktop reveal makes the button a flex container (so those
     // classes actually take effect), rather than a block (which would not).
-    expect(quickButton).toHaveClass("fine-hover:md:inline-flex");
+    expect(quickButton).toHaveClass("md:inline-flex");
     expect(quickButton).not.toHaveClass("md:block");
   });
 
-  it("drops the row kebab without fine hover, revealing it only on fine-hover md+", () => {
-    // The per-row "..." menu is fine-hover-desktop-only: touch devices of any
-    // width (phones, unfolded foldables, tablets) reach these actions through
-    // the long-press menu, so the kebab is hidden (`hidden`) and only surfaces
-    // on a fine-hover display from `md` up. It reveals like the quick-pin
-    // button — flex, not block — so its glyph stays centered.
+  it("drops the row kebab on mobile, revealing it only from md up", () => {
+    // The per-row "..." menu is desktop-only: on mobile the chat page's own
+    // header menu covers these per-session actions, so the row kebab is hidden
+    // (`hidden`) and only surfaces from `md` up (`md:inline-flex`). It reveals
+    // like the quick-pin button — flex, not block — so its glyph stays
+    // centered.
     renderSidebar();
 
     const kebab = screen.getByTestId("conversation-actions");
-    expect(kebab).toHaveClass("hidden", "fine-hover:md:inline-flex");
-    expect(kebab).not.toHaveClass("md:inline-flex", "md:block");
+    expect(kebab).toHaveClass("hidden", "md:inline-flex");
+    expect(kebab).not.toHaveClass("md:block");
   });
 });
 

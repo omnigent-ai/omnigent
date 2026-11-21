@@ -610,7 +610,7 @@ describe("Sidebar session list", () => {
       // Fades with the state slot, including while the ⌘-number hint holds its edge.
       expect(within(sharedRow).getByRole("img", { name: "Shared with others" })).toHaveClass(
         "right-1",
-        "fine-hover:md:group-hover:opacity-0",
+        "md:group-hover:opacity-0",
         "group-has-[[data-session-shortcut-hint]]:opacity-0",
       );
       // The icon sits left of the session state, which keeps the rightmost slot.
@@ -889,14 +889,13 @@ describe("Sidebar session list", () => {
     // as desktop; only desktop hover widens it for the revealed controls.
     expect(row).toHaveClass("pr-2");
     expect(row.className).not.toMatch(/(?:^|\s)pr-28(?:\s|$)/);
-    expect(row.className).toContain("fine-hover:md:group-hover:pr-20");
+    expect(row.className).toContain("md:group-hover:pr-20");
     // Keyed on `:focus-visible`, matching when the trailing controls appear and
     // the state marker fades. `focus-within` would also fire for a plain click,
     // narrowing the reserve on the selected row while the marker stayed put.
-    expect(row.className).toContain("fine-hover:md:group-has-[:focus-visible]:pr-20");
+    expect(row.className).toContain("md:group-has-[:focus-visible]:pr-20");
     expect(row.className).not.toContain("md:group-focus-within:pr-20");
     expect(row.className).not.toMatch(/(?:^|\s)md:pr-20(?:\s|$)/);
-    expect(row.className).not.toMatch(/(?:^|\s)fine-hover:md:pr-20(?:\s|$)/);
   });
 
   it("narrows the awaiting row's reserve on the same trigger that fades its tag", () => {
@@ -938,37 +937,6 @@ describe("Sidebar session list", () => {
 
     const slot = screen.getByTestId("session-state-badge").parentElement!;
     expect(slot).toHaveClass("right-1", "w-6", "justify-center");
-  });
-
-  it("keeps a row's dot marker at the right edge without fine hover", () => {
-    // Touch devices of any width (including unfolded foldables at md+) have no
-    // row controls, so the badge keeps its right-1 anchor and the row reserves
-    // only the badge's own width, never a control column.
-    mockConversations([
-      conv("conv_running", "Claude Code", { title: "Running row", status: "running" }),
-    ]);
-    renderSidebar();
-
-    const slot = screen.getByTestId("session-state-badge").parentElement!;
-    expect(slot).toHaveClass("right-1");
-    expect(slot.className).not.toContain("no-fine-hover:");
-    const row = screen.getByRole("link", { name: /Running row/ });
-    expect(row).toHaveClass("pr-8");
-    expect(row.className).not.toContain("no-fine-hover:");
-    // The fades and the hover reserve are gated to fine hover, so a tap's
-    // sticky :hover or a keyboard focus neither hides the badge nor collapses
-    // the reserve under it.
-    expect(slot).toHaveClass(
-      "fine-hover:md:group-hover:opacity-0",
-      "fine-hover:md:group-has-[:focus-visible]:opacity-0",
-    );
-    expect(slot).not.toHaveClass(
-      "md:group-hover:opacity-0",
-      "md:group-has-[:focus-visible]:opacity-0",
-    );
-    expect(row.className).not.toMatch(
-      /(?:^|\s)md:group-(?:hover|has-\[:focus-visible\]):pr-20(?:\s|$)/,
-    );
   });
 
   it("does not constrain a row's awaiting pill to the dot slot", () => {
@@ -1548,10 +1516,10 @@ describe("Sidebar session list", () => {
     ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
     expect(selectSessions.parentElement).toHaveClass("flex", "gap-0.5");
     expect(selectSessions.parentElement?.parentElement).toHaveClass(
-      "fine-hover:md:opacity-0",
-      "fine-hover:md:group-hover/header:opacity-100",
-      "fine-hover:md:group-has-[[data-header-controls]:focus-within]/header:opacity-100",
-      "fine-hover:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100",
+      "md:opacity-0",
+      "md:group-hover/header:opacity-100",
+      "md:group-has-[[data-header-controls]:focus-within]/header:opacity-100",
+      "md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100",
     );
 
     const filterSessions = within(sessionsSection!).getByRole("button", {
@@ -3414,7 +3382,7 @@ describe("Sidebar project sections", () => {
     );
   });
 
-  it("keeps project header actions to fine hover so touch uses the long-press menu", async () => {
+  it("offers a desktop New session shortcut while keeping the mobile menu accessible", async () => {
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
@@ -3423,14 +3391,10 @@ describe("Sidebar project sections", () => {
 
     const shortcut = screen.getByRole("link", { name: "New session in Customer X" });
     expect(shortcut).toHaveAttribute("href", "/?project=Customer%20X");
+    expect(shortcut).toHaveClass("hidden", "md:flex");
     const menuButton = screen.getByTestId("project-actions");
-    const cluster = menuButton.parentElement!;
-    expect(cluster).toContainElement(shortcut);
-    expect(cluster).toHaveClass("hidden", "fine-hover:flex");
-    // Without the painted cluster, the title keeps the row's own padding.
-    const header = document.querySelector<HTMLElement>('[data-project-order-name="Customer X"]')!;
-    expect(header).not.toHaveClass("pr-8");
-    expect(header).toHaveClass("fine-hover:pr-14", "fine-hover:md:pr-2");
+    expect(menuButton).not.toHaveClass("hidden");
+    expect(menuButton).not.toHaveClass("sr-only");
     fireEvent.pointerDown(screen.getByRole("button", { name: "Project actions for Customer X" }), {
       button: 0,
       ctrlKey: false,
@@ -3453,14 +3417,11 @@ describe("Sidebar project sections", () => {
 
     const kebab = screen.getByTestId("project-actions");
     const revealWrapper = kebab.closest("div[class*=transition-opacity]")!;
-    expect(revealWrapper).toHaveClass(
-      "fine-hover:md:opacity-0",
-      "fine-hover:md:group-hover/header:opacity-100",
-    );
+    expect(revealWrapper).toHaveClass("md:opacity-0", "md:group-hover/header:opacity-100");
     const outerBox = kebab.closest("div[class*=absolute]")!;
     expect(outerBox).toHaveClass(
-      "fine-hover:md:pointer-events-none",
-      "fine-hover:md:group-hover/header:pointer-events-auto",
+      "md:pointer-events-none",
+      "md:group-hover/header:pointer-events-auto",
     );
   });
 });
@@ -4066,14 +4027,12 @@ describe("Sidebar collapsed project marker", () => {
     // Fixed centered box so the dot centers on the same vertical line as the
     // rows' dots.
     expect(slot).toHaveClass("w-6", "justify-center");
-    // Touch has no header controls, so the marker holds the badge slot; narrow
-    // fine-hover layouts paint the shortcut + kebab column beside it.
-    expect(slot).toHaveClass("-mr-1", "fine-hover:mr-14", "fine-hover:md:-mr-1");
-    expect(slot).not.toHaveClass("mr-7");
+    // Visible touch controls get their own column beside the marker.
+    expect(slot).toHaveClass("mr-7", "md:-mr-1");
     expect(slot).toHaveClass(
-      "fine-hover:md:group-hover/section:opacity-0",
-      "fine-hover:md:group-has-[[data-state=open]]/header:opacity-0",
-      "fine-hover:md:group-has-[[data-header-controls]:focus-within]/header:opacity-0",
+      "md:group-hover/section:opacity-0",
+      "md:group-has-[[data-state=open]]/header:opacity-0",
+      "md:group-has-[[data-header-controls]:focus-within]/header:opacity-0",
     );
   });
 
@@ -4103,7 +4062,7 @@ describe("Sidebar collapsed project marker", () => {
     expect(markerGroup).toHaveClass("group/header");
     expect(markerGroup).toContainElement(trigger);
     expect(markerGroup).toContainElement(slot);
-    expect(slot).toHaveClass("fine-hover:md:group-has-[[data-state=open]]/header:opacity-0");
+    expect(slot).toHaveClass("md:group-has-[[data-state=open]]/header:opacity-0");
   });
 
   // The "awaiting" pill is wider than the dot markers; constraining it to the
@@ -4213,9 +4172,9 @@ describe("Sidebar pin marker visibility", () => {
 
     const pinned = screen.getByText("Pinned").closest("section")!;
     const pinButton = within(pinned).getByTestId("quick-pin-conversation");
-    // Hover-gated like every other row (no persistent opacity-100 marker) —
-    // only where hover exists — and the control unpins.
-    expect(pinButton.className).toContain("fine-hover:md:opacity-0");
+    // Hover-gated like every other row (no persistent opacity-100 marker), and
+    // the control unpins.
+    expect(pinButton.className).toContain("md:opacity-0");
     expect(pinButton).toHaveAttribute("aria-label", "Unpin conversation");
   });
 
@@ -4224,9 +4183,8 @@ describe("Sidebar pin marker visibility", () => {
     renderSidebar();
 
     const pinButton = screen.getByTestId("quick-pin-conversation");
-    // Unpinned: hover-gated reveal (opacity-0 until group-hover), gated on
-    // hover capability so touch tablets keep the control visible.
-    expect(pinButton.className).toContain("fine-hover:md:opacity-0");
+    // Unpinned: hover-gated reveal (opacity-0 until group-hover).
+    expect(pinButton.className).toContain("md:opacity-0");
   });
 });
 

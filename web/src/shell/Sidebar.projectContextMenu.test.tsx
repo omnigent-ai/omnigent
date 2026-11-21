@@ -317,7 +317,7 @@ describe("project folder header context menu", () => {
     const item = screen.getByTestId("project-new-session-menu");
 
     expect(item).toHaveAttribute("href", `/?project=${encodeURIComponent(PROJECT_NAME)}`);
-    for (const hiddenClass of ["hidden", "md:hidden", "fine-hover:md:hidden"]) {
+    for (const hiddenClass of ["hidden", "md:hidden", "md:hidden"]) {
       expect(item).not.toHaveClass(hiddenClass);
     }
   });
