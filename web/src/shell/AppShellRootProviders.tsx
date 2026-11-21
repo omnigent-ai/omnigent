@@ -5,10 +5,7 @@ import { FileViewerContext } from "./FileViewerContext";
 
 type CommandContextInputs = Omit<ComponentProps<typeof CommandContextProvider>, "children">;
 
-/**
- * The shell's root providers: the ⌘K command context around the file viewer context. One
- * element keeps AppShell's render tree at the shell layout's own indentation.
- */
+/** The shell's root providers: the ⌘K command context around the file viewer context. */
 export function AppShellRootProviders({
   command,
   fileViewer,

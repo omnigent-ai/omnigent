@@ -2,8 +2,7 @@ import { create } from "zustand";
 
 import type { PaletteCommand } from "./paletteCommands";
 
-// One "Select theme" picker serves every entry point (⌘K and Settings), so they
-// share its label and behavior.
+// The "Select theme" picker that ⌘K opens, and the command that opens it.
 
 export const SELECT_THEME_COMMAND: Pick<PaletteCommand, "id" | "label" | "keywords"> = {
   id: "select-theme",

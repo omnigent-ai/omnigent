@@ -1,4 +1,4 @@
-// The "Select theme" picker, opened from ⌘K and Settings > Appearance. The
+// The "Select theme" picker, opened from ⌘K. The
 // highlighted palette, or appearance on its page, previews across the app;
 // Escape, Back or a click outside restores the committed one, and Enter keeps it.
 
