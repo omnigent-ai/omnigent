@@ -85,6 +85,7 @@ function renderView(
     registerLeaveGuard,
     permissionLevel,
     keyboardTarget,
+    files = {},
   }: Partial<
     Pick<
       WorkspacePlaceViewProps,
@@ -94,9 +95,20 @@ function renderView(
       | "position"
       | "registerLeaveGuard"
       | "keyboardTarget"
-    > & { permissionLevel: number | null }
+    > & {
+      permissionLevel: number | null;
+      files: Partial<WorkspacePlaceViewProps["files"]>;
+    }
   > = {},
 ) {
+  const fileSettings = {
+    sort: "recent" as const,
+    onSortChange: vi.fn(),
+    showHidden: false,
+    onShowHiddenChange: vi.fn(),
+    permissionLevel,
+    ...files,
+  };
   const onNavigate = vi.fn();
   const onOpen = vi.fn();
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -111,13 +123,7 @@ function renderView(
           onNavigate={onNavigate}
           onOpen={onOpen}
           onCommentOnFile={onCommentOnFile}
-          files={{
-            sort: "recent",
-            onSortChange: vi.fn(),
-            showHidden: false,
-            onShowHiddenChange: vi.fn(),
-            permissionLevel,
-          }}
+          files={fileSettings}
           position={position}
           registerLeaveGuard={registerLeaveGuard}
           keyboardTarget={keyboardTarget}
@@ -125,7 +131,7 @@ function renderView(
       </TooltipProvider>
     </QueryClientProvider>,
   );
-  return { onNavigate, onOpen };
+  return { onNavigate, onOpen, fileSettings };
 }
 
 const toggleCommands = () =>
@@ -305,6 +311,52 @@ describe("Files tab", () => {
     pressToggleChord();
     expect(screen.getAllByRole("button", { name: "Show Files Tree" })).toHaveLength(1);
     expect(screen.getAllByRole("button", { name: "Hide Files Tree" })).toHaveLength(1);
+  });
+
+  it("sorts the tree and shows hidden files from the toolbar's options", async () => {
+    const { fileSettings } = renderView({ kind: "files", path: "a.ts" });
+    const options = () =>
+      within(screen.getByTestId("file-viewer")).getByRole("button", { name: "Files tree options" });
+    await userEvent.click(options());
+    expect(screen.getByRole("menuitemradio", { name: "Last edited" })).toBeChecked();
+    await userEvent.click(screen.getByRole("menuitemradio", { name: "Size" }));
+    expect(fileSettings.onSortChange).toHaveBeenCalledWith("size");
+
+    await userEvent.click(options());
+    await userEvent.click(screen.getByRole("menuitemcheckbox", { name: "Show hidden files" }));
+    expect(fileSettings.onShowHiddenChange).toHaveBeenCalledWith(true);
+    // An all-hidden workspace's tree offers the same.
+    captured.tree!.onShowHidden!();
+    expect(fileSettings.onShowHiddenChange).toHaveBeenLastCalledWith(true);
+  });
+
+  it("leaves the options to ⌘K while the tree is hidden", async () => {
+    renderView({ kind: "files", path: "a.ts" });
+    await userEvent.click(screen.getByRole("button", { name: "Hide Files Tree" }));
+    expect(screen.queryByRole("button", { name: "Files tree options" })).toBeNull();
+    expect(registeredPaletteCommands().some((row) => row.id === "files-tree-hidden")).toBe(true);
+  });
+
+  it("sorts the tree and shows hidden files from ⌘K, for the keyboard target only", () => {
+    renderView({ kind: "files", path: "a.ts" }, { keyboardTarget: false });
+    const { fileSettings } = renderView(
+      { kind: "files", path: "b.ts" },
+      { files: { showHidden: true } },
+    );
+    const listed = registeredPaletteCommands().filter(
+      (row) => row.id.startsWith("files-tree-") && row.availability?.available !== false,
+    );
+    // The current order isn't offered again.
+    expect(listed.map((row) => row.label)).toEqual([
+      "Sort Files Tree by Filename",
+      "Sort Files Tree by Size",
+      "Sort Files Tree by Type",
+      "Hide Hidden Files",
+    ]);
+    act(() => listed.find((row) => row.label === "Sort Files Tree by Type")!.run());
+    expect(fileSettings.onSortChange).toHaveBeenCalledWith("type");
+    act(() => listed.find((row) => row.label === "Hide Hidden Files")!.run());
+    expect(fileSettings.onShowHiddenChange).toHaveBeenCalledWith(false);
   });
 
   it("leaves ⌘K and ⇧⌘E to the keyboard target when two Files places are on screen", () => {

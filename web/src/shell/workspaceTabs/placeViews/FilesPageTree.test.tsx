@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -38,16 +38,18 @@ const listed = (entries: WorkspaceFile[]) =>
 function renderTree(files: Partial<FilesResult>, showHidden = false) {
   vi.mocked(useWorkspaceAllFiles).mockReturnValue(files as FilesResult);
   const onFileSelect = vi.fn();
+  const onShowHidden = vi.fn();
   render(
     <FilesPageTree
       conversationId="conv_1"
       activePath="src/a.ts"
       sort="alpha"
       showHidden={showHidden}
+      onShowHidden={onShowHidden}
       onFileSelect={onFileSelect}
     />,
   );
-  return { onFileSelect };
+  return { onFileSelect, onShowHidden };
 }
 
 beforeEach(() => {
@@ -83,10 +85,10 @@ describe("FilesPageTree", () => {
     renderTree(listed([]));
     expect(screen.getByRole("status")).toHaveTextContent("No files in the workspace.");
     cleanup();
-    renderTree(listed([entry(".env")]));
-    expect(screen.getByRole("status")).toHaveTextContent(
-      "Every file here is hidden. Show hidden files to see them.",
-    );
+    const { onShowHidden } = renderTree(listed([entry(".env")]));
+    expect(screen.getByRole("status")).toHaveTextContent("Every file here is hidden.");
+    fireEvent.click(screen.getByRole("button", { name: "Show hidden files" }));
+    expect(onShowHidden).toHaveBeenCalledTimes(1);
     cleanup();
     renderTree(listed([entry(".env")]), true);
     expect(screen.getByTestId("files-tree")).toBeInTheDocument();
