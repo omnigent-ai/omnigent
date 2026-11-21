@@ -71,15 +71,19 @@ After starting, you can also add or remove policies at runtime through the REST 
 
 The upload, copy, and fork routes apply additional server settings to files
 delivered through the harness's filesystem tools: by default `.zip`, `.docx`,
-`.xlsx`, `.pptx`, `.db`, `.sqlite`, and `.sqlite3` files. These files require
-Claude Code or Codex and an updated execution host/runner that supports their
-delivery and restoration. They are stored without extraction; the harness
+`.xlsx`, `.pptx`, `.db`, `.sqlite`, `.sqlite3`, and `.mp4` files. These files require
+an updated execution host/runner and a supported native coding agent for their
+delivery. They are stored without extraction; the harness
 reads a local copy outside the working checkout. See
 [attached files and sandbox access](DATA_DIR_LAYOUT.md#attached-files).
 
+Supported agents are Claude Code, Codex, Pi, Cursor, Kiro, Goose, Antigravity,
+Qwen Code, Kimi, Hermes, and Devin. OpenCode and API/SDK harnesses do not support
+filesystem attachments. Forking sent file history requires Claude Code or Codex.
+
 | Server config key | Default | Scope |
 |-------------------|---------|-------|
-| `filesystem_attachment_allowed_extensions` | the seven extensions above | Which files are delivered as files (see below) |
+| `filesystem_attachment_allowed_extensions` | the eight extensions above | Which files are delivered as files (see below) |
 | `filesystem_attachment_max_bytes` | `52428800` (50 MiB) | Bytes per file |
 | `filesystem_attachment_max_files` | `20` | Stored files of these types per session |
 | `filesystem_attachment_max_total_bytes` | `209715200` (200 MiB) | Combined bytes of these types per session |
@@ -91,23 +95,29 @@ reads a local copy outside the working checkout. See
   Files match on their last extension, so list `.gz` for `.tar.gz` files; a
   compound entry such as `.tar.gz` is skipped with a warning.
   A listed text or image type, such as `.log` or `.png`, is delivered as a file,
-  with its original bytes, instead of inline. It then needs a Claude Code or
-  Codex session, like any other file delivered as a file.
+  with its original bytes, instead of inline. It then needs a supported native
+  coding-agent session, like any other file delivered as a file.
   A default extension left off the list is refused, even when the browser
   labels it as text.
 - `[]`, which turns filesystem attachments off.
 - `"*"` (or a list containing `"*"`), which keeps the defaults and also delivers
-  every other file that can't be inlined, such as `.gz`, `.tar`, `.har`, or video.
+  every other file that can't be inlined, such as `.gz`, `.tar`, `.har`, or
+  other video formats.
   Images, PDFs, and text/code files stay inline, except for extensions listed
   beside `"*"`: `["*", ".log"]` also delivers `.log` files as files.
 
 The server reads this key at startup. Each upload records how it is delivered,
-so changing the setting does not change files a session already holds. Types
-outside the default extensions need a host and runner that advertise
+so changing the setting does not change files a session already holds. MP4
+videos and formats beyond the original archive, Office, and database extensions
+need a host and runner that advertise
 `filesystem_attachment_delivery`; older builds refuse them with an update
 message. `GET /v1/info` reports the effective setting as
 `filesystem_attachments`, which the web composer uses to accept files before
 uploading them.
+
+MP4 videos are delivered as files, without decoding or frame extraction. The
+agent can inspect them with local tools such as `ffmpeg`; Claude Code's `Read`
+tool cannot read the video directly.
 
 These are filename-based admission and storage limits, not content inspection.
 Classification uses the stored filename's extension, even when the browser

@@ -44,6 +44,7 @@ import {
   useWorkspaceFileExists,
   useWorkspaceFileSearch,
   useWorkspaceServeable,
+  workspaceDirectoryQuery,
 } from "./useWorkspaceChangedFiles";
 import { goToFileSearchState, goToFileStatusMessage } from "@/shell/goToFileSearchStatus";
 
@@ -223,24 +224,6 @@ function AllFilesPathsProbe({
   const query = useWorkspaceAllFiles(id, {}, location);
   useEffect(() => {
     if (query.isSuccess) onPaths(query.data.data.map((f) => f.path));
-  }, [query.isSuccess, query.data, onPaths]);
-  return null;
-}
-
-function DirectoryPathsProbe({
-  id,
-  path,
-  location,
-  onPaths,
-}: {
-  id: string;
-  path: string;
-  location: string;
-  onPaths: (paths: string[]) => void;
-}) {
-  const query = useWorkspaceDirectory(id, path, location);
-  useEffect(() => {
-    if (query.isSuccess) onPaths(query.data.map((f) => f.path));
   }, [query.isSuccess, query.data, onPaths]);
   return null;
 }
@@ -751,6 +734,15 @@ describe("useWorkspaceDirectory gating", () => {
           bytes: 3,
           modified_at: 1,
         },
+        {
+          id: "src/inner/lib",
+          name: "lib",
+          path: "src/inner/lib",
+          type: "directory",
+          bytes: null,
+          modified_at: 1,
+          leaf_directory_path: "src/inner/lib/deep",
+        },
       ],
       hasMore: false,
     });
@@ -760,7 +752,15 @@ describe("useWorkspaceDirectory gating", () => {
     });
 
     await waitFor(() => expect(result.current.data).toBeDefined());
-    expect(result.current.data?.map((file) => file.path)).toEqual(["src/inner/a.ts"]);
+    expect(result.current.data?.map((file) => file.path)).toEqual([
+      "src/inner/a.ts",
+      "src/inner/lib",
+    ]);
+    // A single-child chain's end carries over; a file has none.
+    expect(result.current.data?.map((file) => file.leaf_directory_path)).toEqual([
+      undefined,
+      "src/inner/lib/deep",
+    ]);
     expect(listDirectoryViaWorkspaceApi).toHaveBeenCalledWith("conv_api", "src/inner", 1000);
     expect(fetchMock).not.toHaveBeenCalled();
   });
@@ -776,6 +776,25 @@ describe("useWorkspaceDirectory gating", () => {
     await flushMicrotasks();
 
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("workspaceDirectoryQuery", () => {
+  it("keys a listing as the directory hooks do, adding a refresh token only once set", () => {
+    expect(workspaceDirectoryQuery("conv", "src").queryKey).toEqual([
+      "workspace-dir",
+      "conv",
+      "src",
+      "",
+    ]);
+    expect(workspaceDirectoryQuery("conv", "src", "remote", 2).queryKey).toEqual([
+      "workspace-dir",
+      "conv",
+      "src",
+      "remote",
+      2,
+    ]);
+    expect(workspaceDirectoryQuery("conv", "src").staleTime).toBe(5_000);
   });
 });
 
@@ -1981,24 +2000,47 @@ describe("browse-location listings normalize to paths relative to the location",
   });
 
   it.each([
-    ["reports", "reports/quarterly/q3.csv", "a relative location echoes the whole target"],
-    ["/elsewhere/reports", "q3.csv", "an absolute one lists bare"],
-  ])("roots a lazily-expanded directory's children under it (%s)", async (location, wirePath) => {
-    // Children address themselves relative to the tree's root, not to the
-    // directory that was listed -- otherwise expanding one level deeper
-    // would request the wrong path.
-    fetchMock.mockResolvedValueOnce(entries(wirePath));
-    const onPaths = vi.fn();
+    ["reports", "REST", "reports/quarterly/"],
+    ["/elsewhere/reports", "REST", ""],
+    ["reports", "the workspace API", "reports/quarterly/"],
+  ])(
+    "roots a lazily-expanded directory's children and chain ends under it (%s, through %s)",
+    async (location, route, wirePrefix) => {
+      // Children address themselves relative to the tree's root, not to the directory that
+      // was listed; a relative location echoes the whole target, an absolute one lists bare.
+      const listing = [
+        { id: "q3.csv", name: "q3.csv", type: "file" as const, bytes: 1, leaf: undefined },
+        { id: "2026", name: "2026", type: "directory" as const, bytes: null, leaf: "2026/q3" },
+      ].map(({ id, leaf, ...entry }) => ({
+        ...entry,
+        id: `${wirePrefix}${id}`,
+        path: `${wirePrefix}${id}`,
+        modified_at: null,
+        ...(leaf ? { leaf_directory_path: `${wirePrefix}${leaf}` } : {}),
+      }));
+      if (route === "REST") {
+        fetchMock.mockResolvedValueOnce(
+          jsonResponse({ object: "list", data: listing, has_more: false }),
+        );
+      } else {
+        vi.mocked(listDirectoryViaWorkspaceApi).mockResolvedValueOnce({
+          data: listing,
+          hasMore: false,
+        });
+      }
 
-    render(
-      <Wrap>
-        <DirectoryPathsProbe id="conv_dir" path="quarterly" location={location} onPaths={onPaths} />
-      </Wrap>,
-    );
-    await waitFor(() => expect(onPaths).toHaveBeenCalled());
+      const { result } = renderHook(
+        () => useWorkspaceDirectory("conv_dir", "quarterly", location),
+        { wrapper: Wrap },
+      );
 
-    expect(onPaths).toHaveBeenLastCalledWith(["quarterly/q3.csv"]);
-  });
+      await waitFor(() => expect(result.current.data).toBeDefined());
+      expect(result.current.data?.map((file) => [file.path, file.leaf_directory_path])).toEqual([
+        ["quarterly/q3.csv", undefined],
+        ["quarterly/2026", "quarterly/2026/q3"],
+      ]);
+    },
+  );
 });
 
 describe("browse-location wire form (survives a slash-merging proxy)", () => {

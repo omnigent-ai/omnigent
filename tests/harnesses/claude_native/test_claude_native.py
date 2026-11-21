@@ -1124,46 +1124,92 @@ def test_unpinned_family_alias_passes_through_on_the_anthropic_api() -> None:
     assert claude_native.resolve_claude_native_model_selection("opus", config) == "opus"
 
 
-def test_launch_model_takes_the_custom_slot_when_no_alias_names_it() -> None:
-    """A routed older generation gets its own spelling for later ``/model``."""
+@pytest.mark.parametrize(
+    ("launch_model", "alias_env", "alias_model", "custom_slot", "display_name"),
+    [
+        (
+            "databricks-claude-opus-4-8",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "databricks-claude-opus-5",
+            None,
+            "Opus 4.8",
+        ),
+        (
+            "databricks-claude-sonnet-5[1m]",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "databricks-claude-sonnet-6",
+            "databricks-claude-sonnet-5",
+            "Sonnet 5",
+        ),
+        (
+            "databricks-claude-opus-5[1m]",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "databricks-claude-opus-5",
+            None,
+            "Opus 5",
+        ),
+        (
+            "databricks-claude-sonnet-5[1m]",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "databricks-claude-sonnet-5",
+            None,
+            "Sonnet 5",
+        ),
+    ],
+    ids=["older-generation", "bare-custom-slot", "bare-opus-alias", "bare-sonnet-alias"],
+)
+def test_launch_model_takes_the_custom_slot_when_no_alias_names_it(
+    launch_model: str, alias_env: str, alias_model: str, custom_slot: str | None, display_name: str
+) -> None:
+    """A launch model gets a slot preserving its exact generation and context."""
     from omnigent.models.claude_model_vocabulary import claude_model_command_arg
 
     config = claude_native.ClaudeNativeUcodeConfig(
         env={
-            "ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic",
-            "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-5",
+            "ANTHROPIC_BASE_URL": "https://gateway.example/anthropic",
+            alias_env: alias_model,
         },
-        model="databricks-claude-opus-5",
+        model=alias_model,
     )
+    if custom_slot is not None:
+        config.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] = custom_slot
+    initial_env = dict(config.env)
 
-    pinned = claude_native.claude_config_with_launch_model_pinned(
-        config, "databricks-claude-opus-4-8"
-    )
+    pinned = claude_native.claude_config_with_launch_model_pinned(config, launch_model)
 
     assert pinned is not None
-    assert pinned.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-8"
-    assert pinned.env["ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"] == "Opus 4.8"
-    assert config.env.get("ANTHROPIC_CUSTOM_MODEL_OPTION") is None
-    assert (
-        claude_model_command_arg("databricks-claude-opus-4-8", pinned.env)
-        == "databricks-claude-opus-4-8"
-    )
+    assert pinned.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == launch_model
+    assert pinned.env["ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"] == display_name
+    assert config.env == initial_env
+    assert claude_model_command_arg(launch_model, pinned.env) == launch_model
 
 
 @pytest.mark.parametrize(
-    "launch_model",
-    ["opus", "databricks-claude-opus-5", None, ""],
+    ("launch_model", "opus_pin"),
+    [
+        ("opus", "databricks-claude-opus-5"),
+        ("databricks-claude-opus-5", "databricks-claude-opus-5"),
+        ("databricks-claude-opus-5[1m]", "databricks-claude-opus-5[1m]"),
+        (None, "databricks-claude-opus-5"),
+        ("", "databricks-claude-opus-5"),
+    ],
 )
 def test_launch_model_needs_no_custom_slot_when_already_speakable(
     launch_model: str | None,
+    opus_pin: str,
 ) -> None:
     """Aliases and the pinned id resolve without the extra slot."""
     config = claude_native.ClaudeNativeUcodeConfig(
-        env={"ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-5"},
-        model="databricks-claude-opus-5",
+        env={
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": opus_pin,
+            "ANTHROPIC_CUSTOM_MODEL_OPTION": "other-picker-model",
+        },
+        model=opus_pin,
     )
+    initial_env = dict(config.env)
 
     assert claude_native.claude_config_with_launch_model_pinned(config, launch_model) is config
+    assert config.env == initial_env
     assert claude_native.claude_config_with_launch_model_pinned(None, "x") is None
 
 

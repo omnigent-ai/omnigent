@@ -359,6 +359,7 @@ const IDENTITY_RETRY_MAX_MS = 30_000;
 const identityListeners = new Set<() => void>();
 let identityRetryPending = false;
 let identityRetryDelayMs = IDENTITY_RETRY_INITIAL_MS;
+let identityRetryAfter = 0;
 let identityRetryTimer: ReturnType<typeof setTimeout> | null = null;
 // Cache the server-provided login URL on the first /v1/me probe so
 // later session-expiry redirects in authenticatedFetch hit the right
@@ -423,12 +424,13 @@ function isOnLoginPath(): boolean {
 }
 
 /**
- * Whether a non-2xx `/v1/me` status may change on retry. A 401 or another
- * 4xx is the server's answer (signed out, route missing); 5xx, 408, and 429
- * come from an overloaded server or the gateway in front of it.
+ * Whether a non-2xx `/v1/me` status may change on retry. 5xx, 408, and 429
+ * come from an overloaded server or the gateway in front of it. The built-in
+ * handlers never return 403, so a 403 comes from the gateway and may be lifted.
+ * A 401 or any other 4xx is the server's answer (signed out, route missing).
  */
 function isTransientIdentityStatus(status: number): boolean {
-  return status >= 500 || status === 408 || status === 429;
+  return status >= 500 || status === 403 || status === 408 || status === 429;
 }
 
 /**
@@ -452,7 +454,7 @@ async function probeIdentity(): Promise<boolean> {
         };
         if (data.login_url) {
           serverLoginUrl = data.login_url;
-          if (!isOnLoginPath()) {
+          if (!getOmnigentHostConfig().fetcher && !isOnLoginPath()) {
             redirectToLogin(data.login_url);
           }
         }
@@ -487,20 +489,20 @@ function scheduleIdentityRetry(): void {
   if (!identityRetryPending || identityRetryTimer !== null || identityListeners.size === 0) {
     return;
   }
-  identityRetryTimer = setTimeout(() => {
-    identityRetryTimer = null;
-    // Grow the delay only when a retry runs; a cancelled timer made no request.
-    identityRetryDelayMs = Math.min(identityRetryDelayMs * 2, IDENTITY_RETRY_MAX_MS);
-    void resolveIdentity();
-  }, identityRetryDelayMs);
+  identityRetryTimer = setTimeout(
+    () => {
+      identityRetryTimer = null;
+      void resolveIdentity();
+    },
+    identityRetryAfter ? Math.max(0, identityRetryAfter - Date.now()) : identityRetryDelayMs,
+  );
 }
 
 /**
  * Fetch the current user identity from the server.
  * Called once on app load; subsequent calls return the cached value.
- * A transient failure resolves to null without being cached: the next
- * call probes again, and while {@link subscribeIdentity} has listeners
- * the probe is retried with backoff.
+ * A transient failure permits an immediate retry; repeated failures back off
+ * for direct callers and while {@link subscribeIdentity} has listeners.
  *
  * When the server returns 401 with a ``login_url`` (OIDC mode),
  * redirects the browser to the login page.
@@ -508,13 +510,23 @@ function scheduleIdentityRetry(): void {
 export async function resolveIdentity(): Promise<string | null> {
   if (identityResolved) return currentUserId;
   if (identityPromise) return identityPromise;
+  if (Date.now() < identityRetryAfter) {
+    scheduleIdentityRetry();
+    return currentUserId;
+  }
+  cancelIdentityRetry();
   const attempt = probeIdentity().then((final) => {
     identityPromise = null;
     if (final) {
       identityResolved = true;
       identityRetryPending = false;
+      identityRetryAfter = 0;
       cancelIdentityRetry();
     } else {
+      if (identityRetryPending) {
+        identityRetryDelayMs = Math.min(identityRetryDelayMs * 2, IDENTITY_RETRY_MAX_MS);
+        identityRetryAfter = Date.now() + identityRetryDelayMs;
+      }
       identityRetryPending = true;
       scheduleIdentityRetry();
     }

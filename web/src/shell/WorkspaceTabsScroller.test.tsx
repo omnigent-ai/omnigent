@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { scrollTabIntoView } from "./WorkspaceTabsScroller";
+import { scrollTabIntoView, scrollViewportToShow } from "./WorkspaceTabsScroller";
 
 function rect(left: number, width: number): DOMRect {
   return { left, right: left + width, width, top: 0, bottom: 20, height: 20 } as DOMRect;
@@ -32,10 +32,18 @@ afterEach(() => {
 });
 
 describe("scrollTabIntoView", () => {
-  it("scrolls only the strip to show a tab past its right edge", () => {
+  // Without a visible width, showing a box uses the strip's whole width, as a tab does.
+  it.each([
+    ["a tab", (_viewport: HTMLElement, tab: HTMLElement) => scrollTabIntoView(tab)],
+    [
+      "a box",
+      (viewport: HTMLElement, tab: HTMLElement) =>
+        scrollViewportToShow(viewport, tab.getBoundingClientRect()),
+    ],
+  ])("scrolls only the strip to show %s past its right edge", (_shape, show) => {
     const { viewport, tab } = strip(280);
     const scrollIntoView = vi.spyOn(Element.prototype, "scrollIntoView");
-    scrollTabIntoView(tab);
+    show(viewport, tab);
     expect(viewport.scrollLeft).toBe(70);
     expect(scrollIntoView).not.toHaveBeenCalled();
   });
@@ -66,5 +74,16 @@ describe("scrollTabIntoView", () => {
     page.append(loose);
     expect(() => scrollTabIntoView(loose)).not.toThrow();
     scrollTabIntoView(null);
+  });
+});
+
+describe("scrollViewportToShow", () => {
+  it("shows a box within the strip's visible width, when part of the strip is covered", () => {
+    const { viewport } = strip(0);
+    // The box ends at x=280: inside the strip's 200px, but past its first 150px.
+    scrollViewportToShow(viewport, rect(230, 50));
+    expect(viewport.scrollLeft).toBe(40);
+    scrollViewportToShow(viewport, rect(230, 50), 150);
+    expect(viewport.scrollLeft).toBe(70);
   });
 });

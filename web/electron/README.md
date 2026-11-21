@@ -385,7 +385,7 @@ electron/
   src/browserViewRegistry.js  # per-conversation WebContentsView registry (browser pane)
   src/browserViewBounds.js    # CSS-px → window-DIP bounds conversion (browser pane)
   src/browserIpc.js           # omnigent:browser-* IPC handlers (extracted from main.js)
-  src/chromeCookieStore.js    # per-site Chrome cookie import for the browser pane
+  src/chromeCookieStore.js    # Chrome cookie import for the browser pane
   src/loopback-oauth.js       # RFC 8252 loopback listener shared by browser sign-ins
   src/oidc-credentials.js     # OIDC loopback sign-in, refresh, and revoke
   src/oidc-auth.js            # OIDC window session lifecycle (cookie, renewal, sign-out)
@@ -728,8 +728,9 @@ including the address bar, chat links, and agent actions, enforces this policy.
   listeners that push `browser-url-changed` + `browser-nav-state` to the renderer
   so the toolbar's URL bar live-tracks the real URL (redirects, in-page link
   clicks, agent navigation) instead of going stale.
-- `src/chromeCookieStore.js` — reads the current site's cookies out of a local
-  Chrome profile for the toolbar's **Import cookies from Chrome** action (below).
+- `src/chromeCookieStore.js` — reads cookies out of a local Chrome profile, for
+  every website or the current site, for the toolbar's **Import cookies from
+  Chrome** action (below).
   Electron-free, so it is unit-tested with a stub session and a synthetic
   `Cookies` DB.
 - `src/preload.js` — adds `browserOpenOrNavigate/SetActive/Resize/Screenshot/`
@@ -804,13 +805,24 @@ under the same policy.
 
 **Importing cookies from Chrome (macOS).** Sites that reject embedded browsers
 (Google sign-in is the common one) can't be signed in from this pane, so the
-toolbar's cookie button copies the **current site's** cookies out of a local
-Chrome profile into this conversation's in-memory session and reloads the page.
-Scope is deliberately narrow:
+toolbar's cookie button copies cookies out of a local Chrome profile into this
+conversation's in-memory session and reloads the page. The dialog's _Site scope_
+picks how much:
 
-- Only cookies inside the page's own domain tree: its host, its subdomains, and
-  the leading-dot parent domains that reach it (`.google.com` for
-  `mail.google.com`). Nothing else in the jar is read into the app.
+- **All websites** (the default) copies every unexpired, unpartitioned cookie in
+  the chosen profile, so sign-ins that span several sites work without picking
+  each one. Any profile holding cookies can be chosen. The scope is the literal
+  `"*"`, which is not a hostname, and has its own store functions
+  (`previewAllSitesCookies` / `importAllSitesCookies`), so a site import can
+  never be widened into it. It is not tied to the tab's current site: main
+  validates only the profile, against its own preview. The agent can then act
+  as the user on every site that profile is signed in to; both prompts say so.
+  The preview reports these profiles as `allSitesProfiles`, a field a pane or
+  shell that predates it ignores, leaving the site scopes below.
+- A site scope copies only cookies inside the page's own domain tree: its host,
+  its subdomains, and the leading-dot parent domains that reach it
+  (`.google.com` for `mail.google.com`). Nothing else in the jar is read into
+  the app.
 - When the host has parent domains the dialog offers them as _Site scope_, each
   labelled with its own count (`accounts.google.com (25)` vs `google.com (64)`, the
   wider scope being a superset because it covers every subdomain's cookies).
@@ -840,9 +852,9 @@ Scope is deliberately narrow:
 - The secret-copying step itself needs consent from the main process, not just
   the pane's dialog: the connected page holds the bridge and could call it
   directly, so `browser-chrome-cookie-import` runs a native
-  `dialog.showMessageBox` naming the scope, the tab's host (when an ancestor
-  scope was picked), the Chrome profile and the count (that count comes from
-  main's own preview, never from the renderer). Like the shell's other consent
+  `dialog.showMessageBox` naming the scope (or that it covers all websites), the
+  tab's host (when an ancestor scope was picked), the Chrome profile and the
+  count (that count comes from main's own preview, never from the renderer). Like the shell's other consent
   dialogs it is parented to the sender's window, so it can't be approved while
   the tab it describes is hidden behind another app, and Chrome's profile name —
   a plain file on disk — is flattened to one short line so it can't add its own
@@ -868,7 +880,7 @@ Scope is deliberately narrow:
   no background sync.
 - Cookies alone don't always reproduce a sign-in (localStorage, device checks,
   `HttpOnly` site state), and an agent-controlled tab means the agent can act as
-  you on that site while they're loaded — the dialog says so. For real SSO use
+  you on the imported sites while they're loaded — the dialog says so. For real SSO use
   system-browser sign-in above.
 
 **JS trust boundary:** `omnigent:browser-perform-action` accepts only snapshot,

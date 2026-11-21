@@ -7,6 +7,7 @@
 // state into each other through the cached `currentUserId`.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type * as HostApi from "./host";
 
 function mockJsonResponse(body: unknown, init?: { ok?: boolean; status?: number }): Response {
   return {
@@ -158,6 +159,7 @@ describe("resolveIdentity transient failures", () => {
   it.each<[string, () => void]>([
     ["a network error", () => fetchMock.mockRejectedValueOnce(new Error("network"))],
     ["a gateway 503", failWithStatus(503)],
+    ["a gateway 403", failWithStatus(403)],
     ["a 408", failWithStatus(408)],
     ["a 429", failWithStatus(429)],
     [
@@ -184,8 +186,8 @@ describe("resolveIdentity transient failures", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it("caches a 4xx answer without probing again", async () => {
-    fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status: 403 }));
+  it("caches a non-transient 4xx answer without probing again", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status: 404 }));
     const { resolveIdentity } = await import("./identity");
 
     expect(await resolveIdentity()).toBeNull();
@@ -268,6 +270,29 @@ describe("resolveIdentity transient failures", () => {
 
     resubscribe();
   });
+
+  it.each([false, true])(
+    "honors backoff for direct callers with subscribed=%s",
+    async (subscribed) => {
+      vi.useFakeTimers();
+      fetchMock.mockResolvedValue(mockJsonResponse({}, { ok: false, status: 503 }));
+      const { resolveIdentity, subscribeIdentity } = await import("./identity");
+      const unsubscribe = subscribed ? subscribeIdentity(() => {}) : () => {};
+
+      await resolveIdentity();
+      await resolveIdentity();
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      await Promise.all(Array.from({ length: 8 }, () => resolveIdentity()));
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(1_999);
+      await resolveIdentity();
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(1);
+      await resolveIdentity();
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      unsubscribe();
+    },
+  );
 
   it("does not retry without a listener", async () => {
     vi.useFakeTimers();
@@ -1099,6 +1124,26 @@ describe("login redirect", () => {
     expect(hrefWrites).toEqual([]);
     expect(isLoginRedirectPending()).toBe(false);
     expect(res.status).toBe(401);
+  });
+
+  it("leaves an embedded host in control when a recovered probe requires login", async () => {
+    vi.doMock("./host", async (importOriginal) => ({
+      ...(await importOriginal<typeof HostApi>()),
+      getOmnigentHostConfig: () => ({ fetcher: fetchMock }),
+      hostFetch: fetchMock,
+    }));
+    fetchMock.mockRejectedValueOnce(new Error("offline"));
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({ user_id: null, login_url: "/auth/login" }, { ok: false, status: 401 }),
+    );
+    const { resolveIdentity, isLoginRedirectPending } = await import("./identity");
+
+    await resolveIdentity();
+    await resolveIdentity();
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(hrefWrites).toEqual([]);
+    expect(isLoginRedirectPending()).toBe(false);
   });
 
   it("reports no pending redirect for an authenticated load", async () => {

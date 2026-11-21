@@ -271,14 +271,16 @@ interface ElectronDesktopApi extends NativeShellApi {
   browserCancelRecentSessionSwitch?: () => Promise<{ ok: boolean; error?: string }>;
   /**
    * Inspect the local Google Chrome profiles for cookies in the site tree the
-   * conversation's view is on. Metadata only (profile + per-scope counts): no
-   * Keychain access and no cookie values. Absent on shells predating the feature.
+   * conversation's view is on, and across every website. Metadata only (profile
+   * + counts): no Keychain access and no cookie values. Absent on shells
+   * predating the feature.
    */
   browserChromeCookiePreview?: (conversationId: string) => Promise<ChromeCookiePreviewResult>;
   /**
-   * Copy that site's cookies out of one Chrome profile into the conversation's
-   * own in-memory browser session. Decrypts via the Keychain (system prompt on
-   * the first import); `expectedHost` must still match the view's current site.
+   * Copy one Chrome profile's cookies into the conversation's own in-memory
+   * browser session: every website's for {@link CHROME_COOKIE_ALL_SITES_SCOPE},
+   * else one site tree, for which `expectedHost` must still match the view's
+   * current site. Decrypts via the Keychain (system prompt on the first import).
    */
   browserChromeCookieImport?: (
     conversationId: string,
@@ -412,6 +414,16 @@ export interface ChromeCookieProfile {
   scopes?: ChromeCookieScopeCount[];
 }
 
+/** The import scope for every website in a Chrome profile, not one site tree. */
+export const CHROME_COOKIE_ALL_SITES_SCOPE = "*";
+
+/** One local Chrome profile and how many cookies it holds across every website. */
+export interface ChromeCookieAllSitesProfile {
+  id: string;
+  name: string;
+  cookieCount: number;
+}
+
 export interface ChromeCookiePreviewResult {
   ok: boolean;
   /** Host whose page asked for the import (main-derived from the real URL). */
@@ -421,6 +433,9 @@ export interface ChromeCookiePreviewResult {
   scopes?: string[];
   /** Profiles with at least one cookie for any scope; empty when none match. */
   profiles?: ChromeCookieProfile[];
+  /** Profiles with at least one cookie for any website. Absent on shells that
+   *  can only import one site. */
+  allSitesProfiles?: ChromeCookieAllSitesProfile[];
   error?: string;
 }
 
@@ -429,7 +444,7 @@ export interface ChromeCookieImportResult {
   /** The user declined the shell's own confirmation; nothing was read. */
   cancelled?: boolean;
   host?: string;
-  /** The site tree actually copied (the page's host unless the user widened it). */
+  /** The site tree actually copied, or {@link CHROME_COOKIE_ALL_SITES_SCOPE}. */
   scope?: string;
   profileId?: string;
   profileName?: string;
