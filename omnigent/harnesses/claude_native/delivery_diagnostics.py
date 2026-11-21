@@ -111,7 +111,7 @@ def record_restore_observation(*, pane: str, surface: str | None) -> None:
 
 @_best_effort
 def record_restore_action(
-    action: Literal["escape", "shell_stash", "scrolled_draft_stash", "transcript_toggle"],
+    action: Literal["escape", "shell_stash", "transcript_toggle"],
 ) -> None:
     trace = _prompt_delivery_trace.get()
     if trace is not None:

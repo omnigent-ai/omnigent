@@ -12895,6 +12895,7 @@ class _EditableComposer:
 
 
 _STALE_MULTILINE_DRAFT = "STALE ONE\nSTALE TWO\nSTALE THREE"
+_TALL_DRAFT = "\n".join(f"STALE {idx}" for idx in range(30))
 
 # The guarantee holds for any cursor position: before the draft's first
 # character, inside its middle line, and after its last character.
@@ -12986,19 +12987,34 @@ def test_inject_slash_command_sends_none_of_a_leftover_draft_and_returns_it(
     ],
     ids=["web-message", "slash-command"],
 )
+@pytest.mark.parametrize(
+    ("draft", "geometry", "stash_seen"),
+    [
+        ("newer draft", {}, True),
+        # The box is cut off below, but the marker above it is still on screen.
+        (_STALE_MULTILINE_DRAFT, {"visible_rows": 2}, True),
+        # The draft scrolls the marker off the top, so the stash cannot be checked.
+        (_TALL_DRAFT, {"pane_rows": 10}, False),
+    ],
+    ids=["whole-box", "sliver-pane", "scrolled-draft"],
+)
 def test_a_draft_beside_a_stashed_one_refuses_delivery_and_keeps_both(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     inject: Callable[[Path], None],
+    draft: str,
+    geometry: dict[str, int],
+    stash_seen: bool,
 ) -> None:
     """
     Claude Code's one stash slot is never overwritten.
 
     Stashing the box's draft would replace the person's stashed one, so the
-    delivery is refused before anything is typed, as one the executor holds.
+    delivery is refused before anything is typed, as one the executor holds,
+    also when the box is cut off or the marker is scrolled out of view.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
-    composer = _EditableComposer("newer draft", cursor=5)
+    composer = _EditableComposer(draft, cursor=5, **geometry)
     composer.stash = ("older draft", 2)
     composer.install(monkeypatch)
 
@@ -13007,10 +13023,68 @@ def test_a_draft_beside_a_stashed_one_refuses_delivery_and_keeps_both(
     ) as refused:
         inject(bridge_dir)
 
-    assert refused.value.stash_in_use is True
+    assert refused.value.stash_in_use is stash_seen
     assert composer.submitted == []
-    assert (composer.text, composer.cursor) == ("newer draft", 5)
+    assert (composer.text, composer.cursor) == (draft, 5)
     assert composer.stash == ("older draft", 2)
+
+
+def test_a_delivery_cancelled_right_after_the_stash_returns_the_draft(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The draft the delivery stashed comes back although the delivery itself stopped."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    cancelled = threading.Event()
+
+    class _CancelledAfterTheStash(_EditableComposer):
+        def _run_tmux(self, socket_path: str, *args: str) -> None:
+            super()._run_tmux(socket_path, *args)
+            if args[-1] == claude_native_bridge._COMPOSER_STASH_KEY and self.stash is not None:
+                cancelled.set()
+
+        def _capture_pane(self, socket_path: str, tmux_target: str) -> str:
+            # As the real capture does, before reading the pane.
+            claude_native_bridge._check_injection_cancelled()
+            return super()._capture_pane(socket_path, tmux_target)
+
+    composer = _CancelledAfterTheStash("half-written thought", cursor=4)
+    composer.install(monkeypatch)
+
+    with (
+        claude_native_bridge.cancellable_injection(cancelled),
+        pytest.raises(claude_native_bridge.ClaudeInjectionCancelled),
+    ):
+        inject_user_message(bridge_dir, content="hello from the web")
+
+    assert composer.submitted == []
+    assert (composer.text, composer.cursor, composer.stash) == ("half-written thought", 4, None)
+
+
+def test_a_delivery_refused_after_its_paste_returns_the_draft(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A delivery that stops after its paste takes its text back out and returns the draft.
+
+    Claude Code returns a stashed draft only after a submit, so here the
+    delivery pops it itself, once its own text is out of the box.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    composer = _EditableComposer(_STALE_MULTILINE_DRAFT, cursor=4)
+    composer.install(monkeypatch)
+    # A permission prompt opens once the message is in the box.
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "has_pending_user_prompt",
+        lambda _bridge_dir: "hello from the web" in composer.text,
+    )
+
+    with pytest.raises(claude_native_bridge.ClaudeUserPromptPending) as refused:
+        inject_user_message(bridge_dir, content="hello from the web")
+
+    assert refused.value.nothing_typed is False
+    assert composer.submitted == []
+    assert (composer.text, composer.cursor, composer.stash) == (_STALE_MULTILINE_DRAFT, 4, None)
 
 
 @pytest.mark.parametrize(
@@ -13075,6 +13149,60 @@ def test_faint_hints_in_the_box_are_not_a_draft(styled_row: str, typed: bool) ->
     assert box is not None
 
     assert claude_native_bridge._styled_box_has_typed_text(styled, box.rows) is typed
+
+
+@pytest.mark.parametrize(
+    ("styled_row", "draft"),
+    [
+        (_STYLED_QUEUED_HINT, False),
+        ("\x1b[39m❯\xa0Press up to edit queued messages\x1b[7m \x1b[0m", True),
+    ],
+    ids=["faint-hint", "typed-like-the-hint"],
+)
+def test_text_reading_like_the_queued_hint_is_a_draft_only_when_typed(
+    monkeypatch: pytest.MonkeyPatch, styled_row: str, draft: bool
+) -> None:
+    """The hint is told from typed text by its styling, so typing its words is kept."""
+    rule = "─" * 30
+    styled = f"{rule}\n{styled_row}\n{rule}\n"
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane_styled", lambda *_args: styled)
+    plain = claude_native_bridge._SGR_RE.sub("", styled)
+
+    assert claude_native_bridge._composer_holds_draft("/tmp/sock", "main", plain) is draft
+
+
+@pytest.mark.parametrize(
+    ("inject", "expected"),
+    [
+        (
+            lambda bridge_dir: inject_user_message(bridge_dir, content="hello from the web"),
+            "hello from the web",
+        ),
+        (
+            lambda bridge_dir: claude_native_bridge.inject_slash_command(
+                bridge_dir, command="/effort high"
+            ),
+            "/effort high",
+        ),
+    ],
+    ids=["web-message", "slash-command"],
+)
+def test_a_typed_draft_that_reads_like_the_queued_hint_is_returned(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    inject: Callable[[Path], None],
+    expected: str,
+) -> None:
+    """Typed at full intensity, the hint's words are the person's draft and come back."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    draft = claude_native_bridge._QUEUED_MESSAGE_HINT
+    composer = _EditableComposer(draft, cursor=5)
+    composer.install(monkeypatch)
+
+    inject(bridge_dir)
+
+    assert [text.strip() for text in composer.submitted] == [expected]
+    assert (composer.text, composer.cursor, composer.stash) == (draft, 5, None)
 
 
 def test_the_stash_marker_is_read_only_above_the_input_box() -> None:
@@ -13240,50 +13368,44 @@ def test_unavailable_composer_capture_never_submits_the_leftover_draft(
         assert [text.strip() for text in composer.submitted] == [expected]
 
 
-_TALL_DRAFT = "\n".join(f"STALE {idx}" for idx in range(30))
-
-
 @pytest.mark.parametrize("cursor", [0, len(_TALL_DRAFT)], ids=["cursor-at-start", "cursor-at-end"])
 @pytest.mark.parametrize(
-    ("inject", "expected"),
+    "inject",
     [
-        (
-            lambda bridge_dir: inject_user_message(bridge_dir, content="hello from the web"),
-            "hello from the web",
-        ),
-        (
-            lambda bridge_dir: claude_native_bridge.inject_slash_command(
-                bridge_dir, command="/effort high"
-            ),
-            "/effort high",
+        lambda bridge_dir: inject_user_message(bridge_dir, content="hello from the web"),
+        lambda bridge_dir: claude_native_bridge.inject_slash_command(
+            bridge_dir, command="/effort high"
         ),
     ],
     ids=["web-message", "slash-command"],
 )
-def test_a_draft_taller_than_the_pane_is_stashed_before_delivery(
+def test_a_draft_taller_than_the_pane_refuses_delivery_and_is_left_alone(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     cursor: int,
     inject: Callable[[Path], None],
-    expected: str,
 ) -> None:
     """
-    A draft too tall for the pane is set aside, not waited on as an overlay.
+    A draft too tall for the pane refuses the delivery, not waited on as an overlay.
 
     Claude Code keeps the bottom of its screen in view, so the draft scrolls
-    the box's opening rule and ``❯`` row off the top. Read as "no input box",
-    the readiness gate waited out its budget and the turn failed as a
-    terminal that never became ready. The stash keeps every line, including
-    those off screen, and returns them after the delivery.
+    the box's opening rule, ``❯`` row and stash marker off the top. A draft
+    stashed earlier cannot be ruled out, and stashing could replace it, so
+    nothing is typed and the executor holds the message. Read as "no input
+    box", the readiness gate used to wait out its budget instead.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
     composer = _EditableComposer(_TALL_DRAFT, cursor=cursor, pane_rows=10)
     composer.install(monkeypatch)
 
-    inject(bridge_dir)
+    with pytest.raises(
+        claude_native_bridge.ClaudeComposerHoldsDraft, match="nothing was sent"
+    ) as refused:
+        inject(bridge_dir)
 
-    assert [text.strip() for text in composer.submitted] == [expected]
-    assert (composer.text, composer.cursor) == (_TALL_DRAFT, cursor)
+    assert refused.value.stash_in_use is False
+    assert composer.submitted == []
+    assert (composer.text, composer.cursor, composer.stash) == (_TALL_DRAFT, cursor, None)
 
 
 @pytest.mark.parametrize("slash", [False, True], ids=["web-message", "slash-command"])

@@ -5704,13 +5704,19 @@ def wait_for_input_ready(
         the terminal.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    _reclaim_and_wait_for_prompt(
-        bridge_dir,
-        info["socket_path"],
-        info["tmux_target"],
-        timeout_s=_TMUX_READY_TIMEOUT_S,
-        ready_timeout_s=ready_timeout_s,
-    )
+    guard = _DraftGuard()
+    try:
+        _reclaim_and_wait_for_prompt(
+            bridge_dir,
+            info["socket_path"],
+            info["tmux_target"],
+            timeout_s=_TMUX_READY_TIMEOUT_S,
+            ready_timeout_s=ready_timeout_s,
+            guard=guard,
+        )
+    finally:
+        # A draft the reclaim stashed goes back; the command that follows stashes its own.
+        _put_draft_back(info["socket_path"], info["tmux_target"], guard=guard, needle="")
 
 
 @_serialize_bridge_injection
@@ -5837,10 +5843,8 @@ def _deliver_slash_command(
             "Answer the pending Claude question or permission request before changing settings.",
             nothing_typed=True,
         )
-    # Stash any draft the person is mid-typing; otherwise the command below
-    # concatenates with their text and Enter submits
-    # ``<their-draft>/effort high`` as a turn. Unlike Escape it does
-    # not interrupt an in-flight generation.
+    # Stash the person's draft so the command is not appended to it; unlike
+    # Escape, this does not interrupt an in-flight generation.
     _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir, guard=guard)
     # ``-l`` pastes ``/`` and spaces literally; trailing Enter submits.
     _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, command)
@@ -7265,8 +7269,9 @@ def _restore_occupied_input(
     holding a typed command, which Escape leaves in shell mode: that command
     is stashed instead (see :func:`_shell_mode_draft` and
     :func:`_set_draft_aside`), mode included, the way an unsent chat draft is
-    before a paste. So is a draft taller than the pane, which scrolls the
-    box's glyph row out of view (:func:`_scrolled_draft_rows`).
+    before a paste. A draft taller than the pane, which scrolls the box's glyph
+    row and the stash marker out of view (:func:`_scrolled_draft_rows`),
+    refuses the delivery instead, since a stash could replace one it hides.
 
     The detailed transcript view uses Ctrl+O instead of Escape. Toggle it
     once after two matching captures; repeating it could reopen the view.
@@ -7384,12 +7389,14 @@ def _restore_occupied_input(
             if unclearable_seen:
                 return surface
         elif surface == _SCROLLED_DRAFT_SURFACE:
-            # Stashing empties the box, so its glyph row is back on screen. The
-            # stash marker is off screen above such a box, so a draft stashed
-            # earlier cannot be seen here, and the stash would replace it.
-            _logger.info("claude-native: stashing a draft taller than the terminal")
-            delivery_diagnostics.record_restore_action("scrolled_draft_stash")
-            _set_draft_aside(socket_path, tmux_target, bridge_dir=bridge_dir, guard=guard)
+            # The stash marker is off screen above such a box, so a draft stashed
+            # earlier cannot be ruled out, and stashing this one could replace it.
+            _record_held_draft(pane)
+            raise ClaudeComposerHoldsDraft(
+                "Claude Code's input box holds a draft taller than the terminal, so its "
+                "stash cannot be checked and nothing was sent.",
+                stash_in_use=False,
+            )
         elif last_escape is None or now - last_escape >= _OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S:
             if surface == _SHELL_MODE_SURFACE and _shell_mode_draft(pane):
                 # Escape keeps a typed shell command in shell mode. The stash
@@ -7806,8 +7813,8 @@ def _composer_holds_draft(socket_path: str, tmux_target: str, pane: str) -> bool
 
     An empty box can show a faint hint, such as the queued-message hint or a
     prompt suggestion. A hint is not a draft: the stash key ignores it and a
-    paste replaces it. A styled capture tells the two apart; when there is
-    none, any text counts as a draft.
+    paste replaces it. A styled capture tells the two apart, even for typed
+    text that reads like a hint; when there is none, any text counts as a draft.
 
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
@@ -7818,8 +7825,7 @@ def _composer_holds_draft(socket_path: str, tmux_target: str, pane: str) -> bool
     if box is None:
         return False
     rows = [box.rows[0].strip()[1:], *box.rows[1:]]
-    text = [row.strip() for row in rows if row.strip()]
-    if not text or text == [_QUEUED_MESSAGE_HINT]:
+    if not any(row.strip() for row in rows):
         return False
     styled = _capture_pane_styled(socket_path, tmux_target)
     return _styled_box_has_typed_text(styled, box.rows) if styled else True
@@ -7861,6 +7867,8 @@ def _set_draft_aside(
             stash_in_use=True,
         )
     _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, _COMPOSER_STASH_KEY)
+    # Owned from the key on: a delivery cancelled while waiting still returns the draft.
+    guard.stashed = True
     stashed = _await_draft_stashed(socket_path, tmux_target)
     if stashed is None and _request_claude_repaint(socket_path, tmux_target, bridge_dir):
         delivery_diagnostics.record_details(composer_repaint_requested=True)
@@ -7871,8 +7879,8 @@ def _set_draft_aside(
             "Claude Code's input box holds text it did not stash, so nothing was sent.",
             stash_in_use=False,
         )
+    guard.stashed = stashed
     if stashed:
-        guard.stashed = True
         delivery_diagnostics.record_details(draft_stashed=True)
         _logger.info("claude-native: stashed the person's unsent draft for a delivery")
 

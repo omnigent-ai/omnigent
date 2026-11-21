@@ -21,6 +21,7 @@ from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.harnesses.claude_native.bridge import (
     inject_slash_command,
     inject_user_message,
+    wait_for_input_ready,
     write_tmux_target,
 )
 
@@ -218,6 +219,19 @@ def test_a_settings_command_stashes_a_shell_mode_draft_too(
 
     assert box.submitted == [("prompt", "/effort high")]
     assert (box.mode, box.draft) == ("bash", "ls -la")
+
+
+def test_waiting_for_the_input_box_leaves_a_shell_draft_as_it_was(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A readiness check before a model switch returns the shell draft it stashed."""
+    box = _InputBox("bash", "ls -la")
+    bridge_dir, _calls = _patch_tmux(monkeypatch, tmp_path, box, content="")
+
+    wait_for_input_ready(bridge_dir, ready_timeout_s=5.0)
+
+    assert box.submitted == []
+    assert (box.mode, box.draft, box.stash) == ("bash", "ls -la", None)
 
 
 @pytest.mark.parametrize(

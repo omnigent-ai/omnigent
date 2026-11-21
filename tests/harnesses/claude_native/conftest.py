@@ -40,19 +40,23 @@ def _no_one_typing_in_the_pane(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
-def _styled_capture_is_the_plain_capture(monkeypatch: pytest.MonkeyPatch) -> None:
+def _styled_capture_follows_a_fake_pane(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     A fake pane has no text attributes, so its styled capture is its plain one.
 
-    Resolved at call time, so it follows whatever capture a test installs.
+    Resolved at call time: a test that installs a fake capture gets it styled
+    that way, and a test on real tmux keeps the real styled capture.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    monkeypatch.setattr(
-        claude_native_bridge,
-        "_capture_pane_styled",
-        lambda socket_path, tmux_target: claude_native_bridge._capture_pane(
-            socket_path, tmux_target
-        ),
-    )
+    real_capture = claude_native_bridge._capture_pane
+    real_styled_capture = claude_native_bridge._capture_pane_styled
+
+    def styled_capture(socket_path: str, tmux_target: str) -> str:
+        capture = claude_native_bridge._capture_pane
+        if capture is real_capture:
+            return real_styled_capture(socket_path, tmux_target)
+        return capture(socket_path, tmux_target)
+
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane_styled", styled_capture)
