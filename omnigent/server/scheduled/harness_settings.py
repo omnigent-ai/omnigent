@@ -26,8 +26,9 @@ from omnigent.stores.conversation_store import CODEX_NATIVE_BYPASS_SANDBOX_LABEL
 _logger = logging.getLogger(__name__)
 
 # Labels where a running session reports the mode it is in, including a switch made
-# inside the CLI, in its harness's vocabulary.
-_LIVE_PERMISSION_MODE_LABEL_KEYS: dict[str, str] = {
+# inside the CLI, in its harness's vocabulary. Anyone who may edit the session can
+# write them too, so they never grant a mode that skips approval.
+_REPORTED_PERMISSION_MODE_LABEL_KEYS: dict[str, str] = {
     "claude-native": _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY,
     "codex-native": _CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY,
 }
@@ -119,31 +120,66 @@ def launch_args_contain(args: Sequence[str], needle: Sequence[str]) -> bool:
     return any(tuple(args[i : i + width]) == tuple(needle) for i in range(len(args) - width + 1))
 
 
+def _launch_permission_mode(session: Conversation, harness: str) -> str | None:
+    """The mode *session*'s launch settings select, which only its owner or runner set.
+
+    :param session: A session running *harness*.
+    :param harness: Its canonical harness, e.g. ``"codex-native"``.
+    :returns: A mode of :data:`PERMISSION_LAUNCH_ARGS` for *harness*, or ``None``
+        when the settings select none of them exactly.
+    """
+    launch_args = session.terminal_launch_args or []
+    modes = PERMISSION_LAUNCH_ARGS.get(harness, {})
+    if harness == "claude-native":
+        from omnigent.runner.native.orchestration import _claude_launch_permission_mode
+
+        mode = _claude_launch_permission_mode(launch_args)
+        return mode if mode in modes else None
+    if harness == "codex-native":
+        if session.labels.get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == "1":
+            return "bypass"
+        from omnigent.harnesses.codex_native.app_server import (
+            _codex_resume_permission_params,
+        )
+
+        # Compare the settings Codex resumes with, not how the args spell them.
+        try:
+            effective = _codex_resume_permission_params(launch_args)
+        except ValueError:
+            return None
+        return next(
+            (
+                mode
+                for mode, args in modes.items()
+                if args and _codex_resume_permission_params(args).items() <= effective.items()
+            ),
+            None,
+        )
+    return next(
+        (mode for mode, args in modes.items() if args and launch_args_contain(launch_args, args)),
+        None,
+    )
+
+
 def session_permission_mode(session: Conversation, harness: str) -> str | None:
     """The permission mode *session* runs in, in *harness*'s vocabulary, or ``None``.
 
-    The mode the session reports wins: its launch args can lag a switch made while
-    it runs.
+    A reported mode that keeps approval wins, since launch args can lag a switch made
+    while the session runs; any session can already ask for such a mode for a session
+    it starts. A mode that skips approval comes only from the launch settings.
 
     :param session: A session running *harness*.
     :param harness: Its canonical harness, e.g. ``"codex-native"``.
     :returns: A mode of :data:`PERMISSION_LAUNCH_ARGS` for *harness*, e.g.
         ``"full-access"``, or ``None`` when it cannot be told.
     """
-    modes = PERMISSION_LAUNCH_ARGS.get(harness, {})
+    reported = session.labels.get(_REPORTED_PERMISSION_MODE_LABEL_KEYS.get(harness, ""))
     if (
-        harness == "codex-native"
-        and session.labels.get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == "1"
+        reported in PERMISSION_LAUNCH_ARGS.get(harness, {})
+        and reported not in APPROVAL_SKIPPING_PERMISSION_MODES
     ):
-        return "bypass"
-    reported = session.labels.get(_LIVE_PERMISSION_MODE_LABEL_KEYS.get(harness, ""))
-    if reported in modes:
         return reported
-    launch_args = session.terminal_launch_args or []
-    return next(
-        (mode for mode, args in modes.items() if args and launch_args_contain(launch_args, args)),
-        None,
-    )
+    return _launch_permission_mode(session, harness)
 
 
 def creator_session_launch_options(

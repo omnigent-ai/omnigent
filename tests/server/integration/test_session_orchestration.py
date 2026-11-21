@@ -1571,33 +1571,45 @@ async def _codex_creator(auth_client, auth_app, db_uri, monkeypatch, permission_
 
 
 @pytest.mark.parametrize(
-    ("creator_mode", "placement", "requested_mode", "expected"),
+    ("creator_mode", "placement", "requested_mode", "worker_config", "expected"),
     [
         # A workflow run in Full Access hands a step to a nested agent on its host.
         pytest.param(
             "full-access",
             "same_host",
             None,
+            None,
             PERMISSION_LAUNCH_ARGS["codex-native"]["full-access"],
             id="same-host",
         ),
         # Full Access was chosen for the run's host, not for a new sandbox.
-        pytest.param("full-access", "managed", None, None, id="approval-skipping-off-host"),
+        pytest.param("full-access", "managed", None, None, None, id="approval-skipping-off-host"),
         pytest.param(
             "approve-for-me",
             "managed",
+            None,
             None,
             PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
             id="managed",
         ),
         # The call's own choice wins, even the harness default.
-        pytest.param("full-access", "same_host", "default", None, id="requested-default"),
+        pytest.param("full-access", "same_host", "default", None, None, id="requested-default"),
         pytest.param(
             "full-access",
             "same_host",
             "approve-for-me",
+            None,
             PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
             id="requested-mode",
+        ),
+        # So does a mode the worker's own agent sets.
+        pytest.param(
+            "full-access",
+            "same_host",
+            None,
+            {"permission_mode": "read-only"},
+            PERMISSION_LAUNCH_ARGS["codex-native"]["read-only"],
+            id="worker-spec-mode",
         ),
     ],
 )
@@ -1610,17 +1622,21 @@ async def test_nested_agent_starts_in_its_creators_permission_mode(
     creator_mode,
     placement,
     requested_mode,
+    worker_config,
     expected,
 ):
     from omnigent.server.routes.sessions import routes_core
 
     creator = await _codex_creator(auth_client, auth_app, db_uri, monkeypatch, creator_mode)
+    agent_id = creator["agent_id"]
+    if worker_config is not None:
+        agent_id = await _upload_codex_worker(auth_client, **worker_config)
 
     async def launch(**kwargs):
         pass
 
     monkeypatch.setattr(routes_core, "_run_managed_launch", launch)
-    arguments = {"agent_id": creator["agent_id"], "placement": placement}
+    arguments = {"agent_id": agent_id, "placement": placement}
     if requested_mode is not None:
         arguments["permission_mode"] = requested_mode
     result = json.loads(
@@ -1634,6 +1650,36 @@ async def test_nested_agent_starts_in_its_creators_permission_mode(
     assert result.get("conversation_id"), result
     worker = SqlAlchemyConversationStore(db_uri).get_conversation(result["conversation_id"])
     assert worker.terminal_launch_args == expected
+
+
+async def test_a_planted_reported_mode_does_not_skip_approval_for_nested_agents(
+    auth_client, auth_app, peers, db_uri, monkeypatch
+):
+    """An editor can write a session's reported-mode label but not its launch mode."""
+    creator = await _codex_creator(auth_client, auth_app, db_uri, monkeypatch, "approve-for-me")
+    session_id = creator["session_id"]
+    SqlAlchemyPermissionStore(db_uri).grant("bob", session_id, LEVEL_EDIT)
+    planted = await auth_client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"labels": {"omnigent.codex_native.approval_mode": "full-access"}},
+        headers={"X-Forwarded-Email": "bob"},
+    )
+    assert planted.status_code == 200, planted.text
+    # A shared source can't start sessions, so the owner removes the editor first.
+    revoked = await auth_client.delete(f"/v1/sessions/{session_id}/permissions/bob")
+    assert revoked.status_code == 204, revoked.text
+    result = json.loads(
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": creator["agent_id"], "placement": "same_host"}),
+            server_client=auth_client,
+            conversation_id=session_id,
+        )
+    )
+    assert result.get("conversation_id"), result
+    worker = SqlAlchemyConversationStore(db_uri).get_conversation(result["conversation_id"])
+    assert worker.terminal_launch_args == PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"]
+    assert CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY not in worker.labels
 
 
 @pytest.mark.parametrize(

@@ -317,18 +317,54 @@ async def test_session_keeps_its_agent_default_without_an_applicable_mode(
 _CODEX_APPROVAL_MODE = "omnigent.codex_native.approval_mode"
 _CLAUDE_PERMISSION_MODE = "omnigent.claude_native.permission_mode"
 _CODEX_ARGS = PERMISSION_LAUNCH_ARGS["codex-native"]
+_CODEX_FULL_ACCESS = (_CODEX_ARGS["full-access"], {})
 
 
 @pytest.mark.parametrize(
     ("harness", "labels", "launch_args", "on_creator_host", "expected"),
     [
+        pytest.param("codex-native", {}, _CODEX_ARGS["full-access"], True, _CODEX_FULL_ACCESS),
+        # Codex resumes with the same settings however the args spell them.
         pytest.param(
             "codex-native",
             {},
-            _CODEX_ARGS["full-access"],
+            ["-s", "danger-full-access", "-a", "never", "-c", 'approvals_reviewer="user"'],
             True,
-            (_CODEX_ARGS["full-access"], {}),
-            id="launch-mode",
+            _CODEX_FULL_ACCESS,
+            id="codex-spelling",
+        ),
+        pytest.param(
+            "codex-native",
+            {},
+            ["--dangerously-bypass-approvals-and-sandbox"],
+            True,
+            _CODEX_FULL_ACCESS,
+            id="codex-bypass-flag",
+        ),
+        # No preset matches, so none is widened to fit.
+        pytest.param(
+            "codex-native",
+            {},
+            ["--ask-for-approval", "never", "--sandbox", "workspace-write"],
+            True,
+            None,
+            id="codex-no-preset",
+        ),
+        pytest.param(
+            "claude-native",
+            {},
+            ["--permission-mode", "plan", "--permission-mode=acceptEdits"],
+            False,
+            (["--permission-mode", "acceptEdits"], {}),
+            id="claude-last-flag",
+        ),
+        pytest.param(
+            "claude-native",
+            {},
+            ["--dangerously-skip-permissions"],
+            True,
+            (["--permission-mode", "bypassPermissions"], {}),
+            id="claude-skip-flag",
         ),
         # A switch through the web picker updates only the reported mode.
         pytest.param(
@@ -337,7 +373,7 @@ _CODEX_ARGS = PERMISSION_LAUNCH_ARGS["codex-native"]
             _CODEX_ARGS["full-access"],
             True,
             (_CODEX_ARGS["approve-for-me"], {}),
-            id="reported-mode-wins",
+            id="reported-mode",
         ),
         pytest.param(
             "codex-native",
@@ -346,6 +382,32 @@ _CODEX_ARGS = PERMISSION_LAUNCH_ARGS["codex-native"]
             True,
             (None, {CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "1"}),
             id="bypass",
+        ),
+        # A bypass launch switched to a mode that asks keeps asking.
+        pytest.param(
+            "codex-native",
+            {CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "1", _CODEX_APPROVAL_MODE: "ask-for-approval"},
+            None,
+            True,
+            (_CODEX_ARGS["ask-for-approval"], {}),
+            id="bypass-switched",
+        ),
+        # Editors can write the reported mode, so it never skips approval.
+        pytest.param(
+            "codex-native",
+            {_CODEX_APPROVAL_MODE: "full-access"},
+            _CODEX_ARGS["approve-for-me"],
+            True,
+            (_CODEX_ARGS["approve-for-me"], {}),
+            id="reported-approval-skipping-mode",
+        ),
+        pytest.param(
+            "claude-native",
+            {_CLAUDE_PERMISSION_MODE: "bypassPermissions"},
+            None,
+            True,
+            None,
+            id="reported-claude-bypass",
         ),
         pytest.param(
             "claude-native",
@@ -363,14 +425,6 @@ _CODEX_ARGS = PERMISSION_LAUNCH_ARGS["codex-native"]
             False,
             None,
             id="approval-skipping-off-host",
-        ),
-        pytest.param(
-            "claude-native",
-            {_CLAUDE_PERMISSION_MODE: "bypassPermissions"},
-            None,
-            False,
-            None,
-            id="claude-bypass-off-host",
         ),
         pytest.param(
             "codex-native",

@@ -53,9 +53,10 @@ MCP independent creation.
   `session_create_permission_modes` the tool refuses the call before creating anything.
   Without one, an independent session that runs its creator's harness starts in
   the mode the creator is in, so a workflow run's nested agents work as
-  unattended as the run; a mode that skips approval carries over only onto the
-  creator's own host. An automation that sets a mode gives it to its run's
-  workers first (see `scheduled`). Coverage:
+  unattended as the run; a mode that skips approval comes only from the
+  creator's launch settings and carries over only onto its own host. An
+  automation that sets a mode gives it to its run's workers first (see
+  `scheduled`), and a worker whose agent sets a mode keeps it. Coverage:
   `tests/e2e/test_nested_agent_permission_mode_e2e.py`.
   An optional `workflow_id` (agent_id only) starts the session as a run of one
   of the owner's saved workflows, with that workflow's plan already in its
