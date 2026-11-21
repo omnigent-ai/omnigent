@@ -7698,9 +7698,6 @@ def create_runner_app(
                                             _spec_for_dispatch_entry
                                         )
                                         _dispatch_workspace = await _session_runtime_cwd(conv_id)
-                                        _dispatch_session_workspace = (
-                                            await _session_explicit_workspace(conv_id)
-                                        )
                                         event[_RUNNER_DISPATCHED_FIELD] = True
                                         raw_sse_bytes = _encode_sse_event(event)
                                         _agent_id_for_dispatch = cast(
@@ -7748,7 +7745,6 @@ def create_runner_app(
                                                         if isinstance(_caller_user_id, str)
                                                         else None
                                                     ),
-                                                    session_workspace=_dispatch_session_workspace,
                                                 )
                                             )
                                         )

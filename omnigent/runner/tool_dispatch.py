@@ -8624,16 +8624,12 @@ async def dispatch_tool_locally(
     effective_harness: str | None = None,
     wake_on_async_result: AsyncResultWake | None = None,
     caller_user_id: str | None = None,
-    session_workspace: Path | None = None,
 ) -> str:
     """Execute a tool once and POST its result to the harness.
 
     :param runner_workspace: Optional CLI launch workspace used to
         resolve placeholder cwd values for runner-owned filesystem
         tools.
-    :param session_workspace: The session's own server-stored workspace, e.g.
-        ``Path("/repo")``; ``None`` when it has none. Forwarded to
-        ``execute_tool``, where it bounds ``sys_upload_file`` reads.
     :param mcp_manager: When set, dispatch via
         :meth:`RunnerMcpManager.call_tool`. Caller (proxy_stream)
         passes this only for MCP-owned tools.
@@ -8683,7 +8679,6 @@ async def dispatch_tool_locally(
         wake_on_async_result=wake_on_async_result,
         call_id=call_id,
         caller_user_id=caller_user_id,
-        session_workspace=session_workspace,
     )
 
     # A file-mutating tool just ran — nudge the web to refetch the

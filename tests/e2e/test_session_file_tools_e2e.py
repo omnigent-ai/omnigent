@@ -637,6 +637,8 @@ def test_cli_style_model_turn_uploads_the_file_it_wrote_to_its_workspace(
                 else None
             )
 
+    advertised = advertised_tool_names(get_mock_requests(mock_llm_server_url, key=model))
+    assert "sys_upload_file" in advertised, sorted(advertised)
     assert body["status"] == "completed", (body.get("status"), body.get("error"))
     assert (stack.workspace / "report.md").read_text() == "cli report"
     upload = _outputs_by_call_id(body)["upload"]
