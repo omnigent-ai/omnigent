@@ -2,15 +2,18 @@ import SwiftUI
 
 struct SessionListView: View {
   let client: WatchClient
-  @State private var sessions: [WatchSession]?
-  @State private var groups: [WatchSessionGroup] = []
-  @State private var error: String?
+  @State private var model: WatchSessionList
+
+  init(client: WatchClient) {
+    self.client = client
+    _model = State(initialValue: WatchSessionList(client: client))
+  }
 
   var body: some View {
     NavigationStack {
       List {
-        if let error { ErrorLabel(error) }
-        ForEach(groups) { group in
+        if let error = model.error { ErrorLabel(error) }
+        ForEach(model.groups) { group in
           Section {
             ForEach(group.sessions) { session in
               NavigationLink(value: session) { SessionRow(session: session) }
@@ -31,38 +34,24 @@ struct SessionListView: View {
         }
       }
       .overlay {
-        if sessions?.isEmpty == true {
+        if model.sessions?.isEmpty == true {
           ContentUnavailableView("No sessions", systemImage: "bubble.left.and.bubble.right")
         }
       }
-      .toolbar { LoadingIndicator(isLoading: sessions == nil && error == nil) }
+      .toolbar { LoadingIndicator(isLoading: model.sessions == nil && model.error == nil) }
       .navigationTitle("Omnigent")
       .navigationDestination(for: WatchSession.self) { SessionView(session: $0, client: client) }
       .containerBackground(for: .navigation) { BrandBackground() }
-      .refreshable { await load() }
+      .refreshable { await model.load() }
       .task {
         while !Task.isCancelled {
-          await load()
+          await model.load()
           try? await Task.sleep(for: .seconds(30))
         }
       }
     }
   }
 
-  private func load() async {
-    do {
-      let query = ["order": "desc", "sort_by": "updated_at", "limit": "25", "visibility": "all"]
-      async let page: WatchPage<WatchSession> = client.get("sessions", query)
-      let projects: [WatchProject] = (try? await client.get("sessions/projects")) ?? []
-      let loaded = try await page.data
-      (sessions, groups) = (loaded, loaded.grouped(projects: projects))
-      error = nil
-    } catch is CancellationError {
-    } catch let failure as URLError where failure.code == .cancelled {
-    } catch {
-      self.error = error.localizedDescription
-    }
-  }
 }
 
 /// A small spinner in the top-left corner while the list loads.

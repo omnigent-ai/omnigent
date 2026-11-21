@@ -368,6 +368,62 @@ final class WatchCompanionTests: XCTestCase {
     }
   }
 
+  @MainActor func testOnlyNewestSessionListLoadCanPublishResults() async throws {
+    for olderFails in [false, true] {
+      let olderRequests = expectation(description: "older sessions and projects are waiting")
+      olderRequests.expectedFulfillmentCount = 2
+      let releaseOlder = DispatchSemaphore(value: 0)
+      defer {
+        releaseOlder.signal()
+        releaseOlder.signal()
+      }
+      let lock = NSLock()
+      var reads: [String: Int] = [:]
+      let server = try MockHTTPServer(
+        concurrentConnections: true,
+        requestHandler: { request in
+          let path = URLComponents(string: request.path)?.path ?? ""
+          let projects = path == "/v1/sessions/projects"
+          XCTAssertTrue(projects || path == "/v1/sessions")
+          let older = lock.withLock {
+            reads[path, default: 0] += 1
+            return reads[path] == 1
+          }
+          if older {
+            olderRequests.fulfill()
+            XCTAssertEqual(releaseOlder.wait(timeout: .now() + 10), .success)
+          }
+          let id = older ? "older" : "newer"
+          if projects {
+            return (200, [:], Data("[{\"id\":\"\(id)\",\"name\":\"\(id)\"}]".utf8))
+          }
+          if older && olderFails { return (500, [:], Data()) }
+          return (
+            200, [:],
+            Data(
+              "{\"data\":[{\"id\":\"\(id)\",\"status\":\"idle\",\"project_id\":\"\(id)\",\"pending_elicitations_count\":\(older ? 0 : 1)}]}"
+                .utf8)
+          )
+        })
+      let list = WatchSessionList(
+        client: WatchClient(
+          credentials: WatchCredentials(
+            apiURL: URL(string: "http://127.0.0.1:\(server.port)/v1")!, cookie: "session=test")))
+      let older = Task { await list.load() }
+      let waiting = await XCTWaiter().fulfillment(of: [olderRequests], timeout: 3)
+      XCTAssertEqual(waiting, .completed)
+      await list.load()
+      XCTAssertEqual(list.sessions?.map(\.id), ["newer"])
+      releaseOlder.signal()
+      releaseOlder.signal()
+      await older.value
+      XCTAssertEqual(list.sessions?.map(\.id), ["newer"])
+      XCTAssertEqual(list.groups.map(\.id), ["project:newer"])
+      XCTAssertEqual(list.sessions?.first?.approvals, 1)
+      XCTAssertNil(list.error)
+    }
+  }
+
   @MainActor func testCredentialsSendOnlyCookiesTheAPIWouldReceive() throws {
     let cookies = [
       cookie("session", domain: "omnigent.example.com", path: "/"),
