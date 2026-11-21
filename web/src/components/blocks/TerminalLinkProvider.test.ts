@@ -30,7 +30,7 @@ async function terminalShowing(output: string): Promise<Terminal> {
 /** Links the provider reports for the 1-based buffer row. */
 function linksOnRow(term: Terminal, row: number): ILink[] {
   let result: ILink[] | undefined;
-  new TerminalLinkProvider(term, vi.fn()).provideLinks(row, (links) => {
+  new TerminalLinkProvider(term, { activate: vi.fn() }).provideLinks(row, (links) => {
     result = links;
   });
   return result ?? [];
@@ -179,17 +179,21 @@ describe("TerminalLinkProvider", () => {
     expect(linksOnRow(term, 1)).toEqual([]);
   });
 
-  it("activates with the detected URL", async () => {
-    const activate = vi.fn();
+  it("activates, hovers, and leaves through the shared handler with the detected URL", async () => {
+    const handler = { activate: vi.fn(), hover: vi.fn(), leave: vi.fn() };
     const term = await terminalShowing(brokenAtPaneWidth(URL));
     let links: ILink[] | undefined;
-    new TerminalLinkProvider(term, activate).provideLinks(1, (result) => {
+    new TerminalLinkProvider(term, handler).provideLinks(1, (result) => {
       links = result;
     });
     const event = new MouseEvent("click");
 
+    links?.[0].hover?.(event, links[0].text);
     links?.[0].activate(event, links[0].text);
+    links?.[0].leave?.(event, links[0].text);
 
-    expect(activate).toHaveBeenCalledWith(event, URL);
+    expect(handler.hover).toHaveBeenCalledWith(event, URL);
+    expect(handler.activate).toHaveBeenCalledWith(event, URL);
+    expect(handler.leave).toHaveBeenCalledWith(event, URL);
   });
 });
