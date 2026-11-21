@@ -15571,6 +15571,7 @@ async def test_shared_agent_selections_are_isolated_and_revision_recovers_missed
     monkeypatch, stream
 ):
     from omnigent.mcp_selection import mcp_selection_revision
+    from omnigent.runner.mcp_manager import McpSchemasResult
     from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
     from omnigent.spec.types import MCPServerConfig
 
@@ -15591,7 +15592,7 @@ async def test_shared_agent_selections_are_isolated_and_revision_recovers_missed
 
     async def schemas(self, spec):
         schemas_seen.append([s.name for s in spec.mcp_servers])
-        return SimpleNamespace(schemas=[], tool_names=set(), failures={})
+        return McpSchemasResult(schemas=[], tool_names=set(), failures={})
 
     class SnapshotClient(NullServerClient):
         async def get(self, url, **kwargs):
@@ -15644,6 +15645,7 @@ async def test_shared_agent_selections_are_isolated_and_revision_recovers_missed
 
 @pytest.mark.asyncio
 async def test_eager_mcp_cache_keeps_named_child_scope_after_revision_change(monkeypatch):
+    from omnigent.runner.mcp_manager import McpSchemasResult
     from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
     from omnigent.spec.types import MCPServerConfig
 
@@ -15653,7 +15655,7 @@ async def test_eager_mcp_cache_keeps_named_child_scope_after_revision_change(mon
         return spec
 
     async def schemas(self, spec):
-        return SimpleNamespace(schemas=[], tool_names=set(), failures={})
+        return McpSchemasResult(schemas=[], tool_names=set(), failures={})
 
     monkeypatch.setattr(ProxyMcpManager, "schemas_for", schemas)
     recording = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
