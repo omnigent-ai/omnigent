@@ -7341,23 +7341,46 @@ async def test_timer_routes_keep_to_the_callers_own_session(
         f"/v1/sessions/{session_id}/timers", json={"seconds": 60}, headers=_headers()
     )
     timer_id = created.json()["timer_id"]
+    automation_id = await _create_task(
+        auth_client, session_mode="continue", session_id=session_id, host_id=None, workspace=None
+    )
     for url, email in (
         # Another session of the same owner can't cancel it, nor can someone else.
         (f"/v1/sessions/{other_session}/timers/{timer_id}", "alice@example.com"),
         (f"/v1/sessions/{session_id}/timers/{timer_id}", "bob@example.com"),
-        # An automation's ID is not a timer this session can cancel.
+        # The session's own automation is not a timer it can cancel, nor is an unknown ID.
+        (f"/v1/sessions/{session_id}/timers/{automation_id}", "alice@example.com"),
         (f"/v1/sessions/{session_id}/timers/{uuid.uuid4().hex}", "alice@example.com"),
         (f"/v1/sessions/{session_id}/timers/not-an-id", "alice@example.com"),
     ):
         refused = await auth_client.delete(url, headers=_headers(email))
         assert refused.status_code == 404, refused.text
-    assert SqlAlchemyScheduledTaskStore(db_uri).get(timer_id).state == "active"
+    tasks = SqlAlchemyScheduledTaskStore(db_uri)
+    assert (tasks.get(timer_id).state, tasks.get(automation_id).state) == ("active", "active")
     archived = _owned_session(db_uri, archived=True)
     late = await auth_client.post(
         f"/v1/sessions/{archived}/timers", json={"seconds": 60}, headers=_headers()
     )
     assert late.status_code == 400, late.text
     assert "archived" in late.text
+
+
+@pytest.mark.parametrize("auth_app", [True], indirect=True)
+async def test_a_sub_agent_timer_routes_to_the_host_its_parent_runs_on(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    parent_id = _owned_session(db_uri)
+    # A sub-agent shares its parent's runner without a host binding of its own.
+    child_id = _owned_session(
+        db_uri, host_id=None, kind="sub_agent", parent_conversation_id=parent_id
+    )
+    created = await auth_client.post(
+        f"/v1/sessions/{child_id}/timers", json={"seconds": 60}, headers=_headers()
+    )
+    assert created.status_code == 201, created.text
+    task = SqlAlchemyScheduledTaskStore(db_uri).get(created.json()["timer_id"])
+    # Its runs go to the replica holding the parent's host, and so the shared runner.
+    assert (task.session_id, task.host_id) == (child_id, _HOST_ID)
 
 
 @pytest.mark.parametrize("auth_app", [True], indirect=True)

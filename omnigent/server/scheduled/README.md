@@ -458,7 +458,10 @@ deployment:
 `DELETE /v1/sessions/{id}/timers/{timer_id}`. Both authorize the caller as posting a
 message would; cancelling also needs the same session and owner. The task ID is the
 `timer_id`. The automations gate does not hide these routes, but they need the
-database scheduler (`session_timers` in `/v1/info`).
+database scheduler (`session_timers` in `/v1/info`). The task's host is the one
+serving the session's runner tunnel (`routing_host_id`): a sub-agent or side chat
+with no host of its own takes its parent's or source's, so the replica holding that
+tunnel claims its firings.
 
 - **Schedule.** The rule is `FREQ=SECONDLY;INTERVAL=<n>`, plus `COUNT=1` for a
   one-shot timer, with `n` the delay rounded up to whole seconds. Firings fall at
@@ -473,8 +476,9 @@ database scheduler (`session_timers` in `/v1/info`).
   the timer without waking anything. Otherwise `begin_timer_delivery` commits the
   firing under the task lock that deleting takes, then the prompt, a hidden
   (`is_meta`) user message, goes in through the continued-session wake and dispatch.
-  A sub-agent session whose runner has stopped first moves to its parent's live
-  runner, output relay included, as a message to it would.
+  A sub-agent session whose runner is gone first moves to its parent's live runner,
+  output relay included, before anything launches a runner of its own, as a message
+  to it would.
   The run records `succeeded`, or `failed` (`launch_failed`) when no runner can be
   reached or woken; a firing is never retried.
 - **Cancelling.** A cancel that commits before a claimed firing does suppresses it:

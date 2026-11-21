@@ -36,6 +36,7 @@ from omnigent.db.account_authority import account_generation, current_account_us
 from omnigent.entities import Agent, Conversation, ScheduledTask, ScheduledTaskRun
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner._subprocess_lifecycle import await_cleanup_task
+from omnigent.runner.routing import routing_host_id
 from omnigent.runtime import pending_elicitations
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.bundles import agent_for_user
@@ -2292,6 +2293,7 @@ def create_scheduled_tasks_router(
                 "This session has no agent for a timer to wake", code=ErrorCode.INVALID_INPUT
             )
         agent_id = conv.agent_id
+        routing_host = await asyncio.to_thread(routing_host_id, conv, conversation_store)
         interval = max(1, math.ceil(seconds))
         fire_at = math.ceil(time.time() + seconds)
         async with _allocated_task_id(user_id, "Timer") as task_id:
@@ -2307,8 +2309,9 @@ def create_scheduled_tasks_router(
                 timezone="UTC",
                 session_mode="continue",
                 session_id=conv.id,
-                # Runs route to the replica that holds the session's host.
-                host_id=conv.host_id,
+                # Runs route to the replica holding the session's runner tunnel, which a
+                # sub-agent or side chat shares through its parent's or source's host.
+                host_id=routing_host,
                 first_run_at=fire_at,
                 kind="timer",
                 # Firings fall at the anchor plus whole intervals, the first at fire_at.

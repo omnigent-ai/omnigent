@@ -2666,6 +2666,7 @@ def _make_reuse_dispatch(deps: FireDeps) -> LaunchDispatch:
     async def _dispatch(conv: Conversation, task: ScheduledTask) -> None:
         from omnigent.server.routes.sessions import (
             _await_settled_managed_launch,
+            _get_runner_client,
             ensure_runner_connected,
         )
 
@@ -2687,15 +2688,23 @@ def _make_reuse_dispatch(deps: FireDeps) -> LaunchDispatch:
                 # A sandbox automation's prompt never goes to a runner outside its
                 # sandbox, such as a local one a hostless session may have.
                 raise RuntimeError(f"session {conv.id} is not bound to the automation's sandbox")
-            runner_client, conv = await ensure_runner_connected(
-                session_id=conv.id,
-                conv=conv,
-                app_state=deps.app_state,
-                conversation_store=deps.conversation_store,
-                runner_router=deps.runner_router,
-            )
-            if runner_client is None and conv.kind == "sub_agent":
-                runner_client, conv = await _follow_parent_runner(deps, conv)
+            runner_client = None
+            if conv.kind == "sub_agent":
+                # As for a message, a sub-agent follows its parent to a new runner before
+                # anything launches a runner of its own.
+                runner_client = await _get_runner_client(
+                    conv.id, deps.runner_router, conversation=conv
+                )
+                if runner_client is None:
+                    runner_client, conv = await _follow_parent_runner(deps, conv)
+            if runner_client is None:
+                runner_client, conv = await ensure_runner_connected(
+                    session_id=conv.id,
+                    conv=conv,
+                    app_state=deps.app_state,
+                    conversation_store=deps.conversation_store,
+                    runner_router=deps.runner_router,
+                )
             if runner_client is None:
                 raise RuntimeError(f"no runner can be reached or woken for session {conv.id}")
         await _send_prompt(deps, conv, runner_client, task)

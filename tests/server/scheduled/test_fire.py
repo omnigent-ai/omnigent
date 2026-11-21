@@ -100,6 +100,7 @@ class _FakeConversation:
     parent_conversation_id: str | None = None
     root_conversation_id: str = ""
     terminal_launch_args: list[str] | None = None
+    kind: str = "default"
 
     def __post_init__(self) -> None:
         self.root_conversation_id = self.root_conversation_id or self.id
@@ -4309,6 +4310,50 @@ async def test_a_sandbox_continue_never_reaches_a_runner_outside_its_sandbox(
     with pytest.raises(RuntimeError, match="not bound to the automation's sandbox"):
         await dispatch(conv_store.existing["conv_prev"], task)
     connect.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_sub_agent_follows_its_parents_new_runner_before_its_host_launches_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A timer wakes a sub-agent on its parent's live runner, as a message to it would.
+
+    The sub-agent's own runner is gone, and its online host could launch it a new one.
+    """
+    from omnigent.server.routes import sessions
+
+    child = _continued_session(
+        kind="sub_agent", parent_conversation_id="conv_parent", runner_id="runner_gone"
+    )
+    healed = _continued_session(
+        kind="sub_agent", parent_conversation_id="conv_parent", runner_id="runner_parent"
+    )
+    parent_runner, relaunched_runner = object(), object()
+    monkeypatch.setattr(sessions, "_get_runner_client", AsyncMock(return_value=None))
+    heal = AsyncMock(return_value=parent_runner)
+    monkeypatch.setattr(sessions, "_heal_subagent_runner_binding_via_parent", heal)
+    relay = AsyncMock()
+    monkeypatch.setattr(sessions, "_ensure_runner_relay_ready", relay)
+    relaunch = AsyncMock(return_value=(relaunched_runner, child))
+    monkeypatch.setattr(sessions, "ensure_runner_connected", relaunch)
+    send = AsyncMock()
+    monkeypatch.setattr(fire_mod, "_send_prompt", send)
+    task = _continuing_task()
+    conv_store = _ExistingConversationStore(healed)
+    dispatch = fire_mod._make_reuse_dispatch(
+        _deps(FakeScheduledTaskStore(rows={"task_1": task}), conversation_store=conv_store)
+    )
+
+    await dispatch(child, task)
+
+    relaunch.assert_not_awaited()
+    heal.assert_awaited_once()
+    assert heal.await_args.args[0] is child
+    # The session's output relay moves with it before the prompt goes out.
+    relay.assert_awaited_once()
+    assert relay.await_args.args[:3] == ("conv_prev", "runner_parent", parent_runner)
+    send.assert_awaited_once()
+    assert send.await_args.args[1:] == (healed, parent_runner, task)
 
 
 @pytest.mark.asyncio

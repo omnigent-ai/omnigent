@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterator
+from importlib import import_module
 from io import StringIO
 from pathlib import Path
 from uuid import uuid4
@@ -55,6 +56,7 @@ _SHARES_REVISION = "a8be64286ffc"
 _SMART_ROUTING_PREVIOUS = "d3bda6dbade3"
 _SMART_ROUTING_REVISION = "5ab01aaca219"
 _TIMER_KIND_REVISION = "bf30d7cbda61"
+_TIMER_KIND_MIGRATION = "omnigent.db.migrations.versions.bf30d7cbda61_allow_scheduled_task_timers"
 _SCHEMA_PATHS = [
     "migration",
     "metadata",
@@ -1328,3 +1330,30 @@ def test_timer_kind_migration_round_trips_once_timers_are_gone(
         conn.execute(tasks.insert().values(id=b"t" * 16, kind=3, **values))
     with engine.begin() as conn:
         assert conn.execute(sa.select(tasks.c.kind)).scalars().all() == [1]
+
+
+@pytest.mark.parametrize("dispatch_migration_engine", [_SMART_ROUTING_REVISION], indirect=True)
+def test_timer_kind_downgrade_finds_a_timer_past_its_first_batch(
+    dispatch_migration_engine: Engine,
+) -> None:
+    engine = dispatch_migration_engine
+    batch_size = import_module(_TIMER_KIND_MIGRATION)._CHECK_BATCH
+    _migrate_on_one_connection(engine, _TIMER_KIND_REVISION)
+    tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
+    values = {
+        "name": "Task",
+        "prompt": b"p",
+        "rrule": "FREQ=SECONDLY;INTERVAL=120",
+        "agent_id": b"g" * 16,
+        "timezone": "UTC",
+        "created_at": 1,
+    }
+    with engine.begin() as conn:
+        conn.execute(
+            tasks.insert(),
+            [{"id": n.to_bytes(16, "big"), "kind": 1, **values} for n in range(batch_size)],
+        )
+        # The timer sorts after a whole batch of automations.
+        conn.execute(tasks.insert().values(id=b"\xff" * 16, kind=3, **values))
+    with pytest.raises(RuntimeError, match="Cancel or delete"):
+        _migrate_on_one_connection(engine, _SMART_ROUTING_REVISION, downgrade=True)
