@@ -46,6 +46,8 @@ change their layout and type syntax, plus one renamed local variable.
   `orderTreePaths`, which lists paths in the tree's order.
 - Lookups that pass through a file find nothing instead of throwing, and the
   folders a tree starts open are found under any `sort`, not just name order.
+- `compareTreeEntries`, the default order as a comparator, for custom sorts'
+  ties.
 - `FileTree`'s `renderRowDecoration` and `onRowMenu` props. The menu opens from
   a right-click, Shift+F10, the context menu key, or one actions button that
   follows the hovered or focused row, using upstream's ellipsis icon.

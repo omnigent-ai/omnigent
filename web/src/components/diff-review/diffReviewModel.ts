@@ -3,9 +3,14 @@
 // pull request) produce `DiffReviewFile`s; the renderer only reads this model.
 
 import { getFiletypeFromFileName, type SupportedLanguages } from "@pierre/diffs";
-// The module itself, not the tree's index: the index brings the tree's CSS, which the diff
-// worker would inject into a document it doesn't have.
+// Leaf modules only: the diff worker loads this file, and the tree's index brings in its CSS
+// and React, which a worker can't load.
 import { orderTreePaths } from "@/components/file-tree/vendored/order";
+import { compareTreeEntries } from "@/components/file-tree/vendored/path-store/sort";
+import type {
+  FileTreeCompareEntry,
+  FileTreeSortComparator,
+} from "@/components/file-tree/vendored/types";
 import { isGeneratedPath, isTestPath } from "./fileClassification";
 
 /** How a file changed in the review. */
@@ -166,13 +171,68 @@ export function effectiveReviewFilters(
   return { ...filters, ownedFilesOnly: false };
 }
 
+/** How a review orders its files: by path, or by how many lines each changed. */
+export type DiffFileOrder = "path" | "size";
+
+/** What a file needs for its place in the order: its path and, where counted, its lines. */
+export interface OrderedFile {
+  path: string;
+  additions?: number | null;
+  deletions?: number | null;
+}
+
+/** The lines `file` changed, or null where its source counted neither side. */
+function changedLines(file: OrderedFile): number | null {
+  if (file.additions == null && file.deletions == null) return null;
+  return (file.additions ?? 0) + (file.deletions ?? 0);
+}
+
+/** A row's key at `depth` of `entry`: a folder ends with "/", a file is its path. */
+function rowKey(entry: FileTreeCompareEntry, depth: number): string {
+  const key = entry.segments.slice(0, depth + 1).join("/");
+  const file = depth === entry.segments.length - 1 && !entry.isDirectory;
+  return file ? key : `${key}/`;
+}
+
 /**
- * `files` in the order the changed-files tree lists them, which the diff follows too: folders
- * before files at each level, then by name. The tree's own ordering decides, so they can't drift.
+ * The tree's order by size, largest first, at every level: a folder weighs what its files
+ * changed, a file without counts goes after every counted one, and ties keep the path order.
  */
-export function treeOrderedFiles<File extends { path: string }>(files: readonly File[]): File[] {
+export function sizeOrderComparator(files: readonly OrderedFile[]): FileTreeSortComparator {
+  const weights = new Map<string, number>();
+  for (const file of files) {
+    const lines = changedLines(file);
+    const segments = file.path.split("/");
+    for (let depth = 0; depth < segments.length - 1; depth++) {
+      const folder = `${segments.slice(0, depth + 1).join("/")}/`;
+      weights.set(folder, (weights.get(folder) ?? 0) + (lines ?? 0));
+    }
+    weights.set(segments.join("/"), lines ?? -1);
+  }
+  return (left, right) => {
+    const shared = Math.min(left.segments.length, right.segments.length);
+    for (let depth = 0; depth < shared; depth++) {
+      if (left.segments[depth] === right.segments[depth]) continue;
+      const leftWeight = weights.get(rowKey(left, depth)) ?? -1;
+      const rightWeight = weights.get(rowKey(right, depth)) ?? -1;
+      if (leftWeight !== rightWeight) return rightWeight - leftWeight;
+      break;
+    }
+    return compareTreeEntries(left, right);
+  };
+}
+
+/**
+ * `files` in the order the changed-files tree lists them, which the diff follows too: by path,
+ * folders before files at each level, or by `order`'s size. The tree takes this order as given.
+ */
+export function treeOrderedFiles<File extends OrderedFile>(
+  files: readonly File[],
+  order: DiffFileOrder = "path",
+): File[] {
   const byPath = new Map(files.map((file) => [file.path, file]));
-  const ordered = orderTreePaths([...byPath.keys()], { flattenEmptyDirectories: true })
+  const sort = order === "size" ? sizeOrderComparator(files) : undefined;
+  const ordered = orderTreePaths([...byPath.keys()], { flattenEmptyDirectories: true, sort })
     .map((path) => byPath.get(path))
     .filter((file): file is File => file !== undefined);
   // A path the tree couldn't place, such as one ending in "/", still shows, last.

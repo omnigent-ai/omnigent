@@ -85,6 +85,7 @@ import {
   type DiffReviewCommand,
   FIND_IN_CHANGES_LABEL,
 } from "./diffReviewCommands";
+import { useDiffFileOrder } from "./diffFileOrderPreference";
 import { useOwnedFilesOnly, writeOwnedFilesOnly } from "./ownedFilesPreference";
 import { useDiffWorkers } from "./sharedDiffWorkers";
 import {
@@ -419,7 +420,8 @@ export function DiffReview<A = undefined>({
   presentation,
 }: DiffReviewProps<A>) {
   // The diff lists its files in the tree's order, so the two read the same top to bottom.
-  const files = useMemo(() => treeOrderedFiles(givenFiles), [givenFiles]);
+  const [fileOrder, setFileOrder] = useDiffFileOrder();
+  const files = useMemo(() => treeOrderedFiles(givenFiles, fileOrder), [givenFiles, fileOrder]);
   const viewer = useRef<CodeViewHandle<A>>(null);
   const [shell, setShell] = useState<HTMLDivElement | null>(null);
   const width = useElementWidth(shell);
@@ -2250,6 +2252,8 @@ export function DiffReview<A = undefined>({
         setIgnoreWhitespace: onIgnoreWhitespaceChange,
         wrapLines,
         setWrapLines: onWrapLinesChange,
+        fileOrder,
+        setFileOrder,
         allCollapsed,
         canCollapse: expandablePaths.length > 0,
         toggleAllFiles,
@@ -2284,6 +2288,8 @@ export function DiffReview<A = undefined>({
       wide,
       filters,
       dispatchFilter,
+      fileOrder,
+      setFileOrder,
       layout,
       onLayoutChange,
       canSplit,

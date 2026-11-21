@@ -77,6 +77,55 @@ describe("treeOrderedFiles", () => {
   });
 });
 
+describe("treeOrderedFiles by size", () => {
+  const sized = (path: string, additions: number | null, deletions: number | null = 0) =>
+    reviewFile(path, "modified", { additions, deletions });
+  const bySize = (list: ReturnType<typeof sized>[]) => paths(treeOrderedFiles(list, "size"));
+
+  it("puts the most changed lines first at each level, a folder weighing all its files", () => {
+    expect(
+      bySize([
+        sized("README.md", 3),
+        sized("src/app/main.py", 1),
+        sized("src/app/session_list.py", 14, 6),
+        sized("src/uploads.py", 5, 2),
+        sized("docs/guide.md", 30),
+      ]),
+    ).toEqual([
+      // docs/ weighs 30, src/ 28 (its app/ 21 before uploads.py's 7), then the 3-line README.
+      "docs/guide.md",
+      "src/app/session_list.py",
+      "src/app/main.py",
+      "src/uploads.py",
+      "README.md",
+    ]);
+  });
+
+  it("keeps the path order between rows of the same size", () => {
+    const tied = [sized("c.ts", 2), sized("a.ts", 1, 1), sized("lib/d.ts", 2), sized("b.ts", 2)];
+    // All weigh 2, so the tree's own order decides: folders first, then by name.
+    expect(bySize(tied)).toEqual(["lib/d.ts", "a.ts", "b.ts", "c.ts"]);
+    expect(bySize(tied)).toEqual(paths(treeOrderedFiles(tied, "path")));
+  });
+
+  it("puts a file without counts after every counted one, even an empty change", () => {
+    expect(
+      bySize([sized("image.png", null, null), sized("empty.txt", 0), sized("big.ts", 9)]),
+    ).toEqual(["big.ts", "empty.txt", "image.png"]);
+    // A folder of uncounted files weighs nothing, so counted rows still come first.
+    expect(bySize([sized("assets/logo.png", null, null), sized("a.ts", 1)])).toEqual([
+      "a.ts",
+      "assets/logo.png",
+    ]);
+  });
+
+  it("keeps the path order unless asked for size", () => {
+    const list = [sized("z.ts", 50), sized("a/b.ts", 1)];
+    expect(paths(treeOrderedFiles(list))).toEqual(["a/b.ts", "z.ts"]);
+    expect(paths(treeOrderedFiles(list, "path"))).toEqual(["a/b.ts", "z.ts"]);
+  });
+});
+
 describe("reviewFile", () => {
   it("classifies language, tests, and generated files from the path", () => {
     expect(files.map((file) => [file.language, file.isTest, file.isGenerated])).toEqual([

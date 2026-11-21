@@ -176,6 +176,14 @@ function comparePreparedEntries(
   return left.isDirectory ? -1 : 1;
 }
 
+/** The tree's default order for two paths, for comparators that break their ties with it. */
+export function compareTreeEntries(
+  left: PathStoreCompareEntry,
+  right: PathStoreCompareEntry,
+): number {
+  return comparePreparedEntries(left, right);
+}
+
 export function comparePreparedPaths(left: PreparedPath, right: PreparedPath): number {
   return comparePreparedEntries(left, right);
 }

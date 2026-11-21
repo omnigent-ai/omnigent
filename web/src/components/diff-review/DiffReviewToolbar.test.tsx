@@ -88,6 +88,8 @@ describe("DiffReviewToolbar's owned files filter", () => {
       wrapLines: false,
       allCollapsed: false,
       canCollapse: false,
+      fileOrder: "path",
+      setFileOrder: () => {},
       toggleAllFiles: () => {},
     }).filter((command) => command.id === "filter-files" || command.id === "toggle-owned-files");
     render(
@@ -155,6 +157,8 @@ describe("DiffReviewToolbar's line counts in a narrow review", () => {
       wrapLines: false,
       allCollapsed: false,
       canCollapse: false,
+      fileOrder: "path",
+      setFileOrder: () => {},
       toggleAllFiles: () => {},
       // The tree toggle opens its own popover; this toolbar shows the rest.
     }).filter((command) => command.id !== "toggle-tree");

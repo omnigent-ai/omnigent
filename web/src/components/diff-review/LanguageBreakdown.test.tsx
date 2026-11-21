@@ -38,6 +38,8 @@ function command(listedFileCount: number) {
     wrapLines: false,
     allCollapsed: false,
     canCollapse: false,
+    fileOrder: "path",
+    setFileOrder: () => {},
     toggleAllFiles: () => {},
   }).find((candidate) => candidate.id === "show-language-breakdown");
 }
