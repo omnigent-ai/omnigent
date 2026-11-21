@@ -12,7 +12,13 @@ const {
 const PAGE = "https://login.example.com/signin/verify";
 const flush = () => new Promise(setImmediate);
 
-function harness({ url = PAGE, canPrompt = () => true, launch, beforeShow } = {}) {
+function harness({
+  url = PAGE,
+  canPrompt = () => true,
+  launch,
+  beforeShow,
+  browserHandoff = true,
+} = {}) {
   const contents = new EventEmitter();
   let currentUrl = url;
   Object.assign(contents, {
@@ -36,11 +42,13 @@ function harness({ url = PAGE, canPrompt = () => true, launch, beforeShow } = {}
         prompts.push(prompt);
       });
     },
-    openExternal: (target) => {
-      opened.push(target);
-      return launch?.();
-    },
-    cookieImport: true,
+    openExternal: browserHandoff
+      ? (target) => {
+          opened.push(target);
+          return launch?.();
+        }
+      : undefined,
+    cookieImport: browserHandoff,
   });
   const report = (pending, frame = contents.mainFrame) =>
     contents.ipc.emit(PENDING_CHANNEL, { senderFrame: frame }, pending);
@@ -77,9 +85,22 @@ describe("security-key notice for embedded browser pages", () => {
     assert.equal(options.kind, "security-key");
     assert.equal(options.origin, "https://login.example.com");
     assert.equal(options.cookieImport, true);
+    assert.equal(options.openInBrowser, true);
     h.report(false);
     assert.equal(options.signal.aborted, true);
     assert.deepEqual(h.opened, []);
+  });
+
+  it("offers no browser handoff when the caller cannot open one", async () => {
+    const warning = mock.method(console, "warn", () => {});
+    const h = harness({ browserHandoff: false });
+    h.report(true);
+    await h.wait();
+    assert.equal(h.prompts[0].options.openInBrowser, false);
+    h.prompts[0].choose("open-in-browser");
+    await h.wait();
+    assert.equal(h.prompts.length, 1);
+    assert.equal(warning.mock.callCount(), 0);
   });
 
   it("opens no window for a request that settles before the delay", async () => {

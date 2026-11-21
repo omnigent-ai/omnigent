@@ -24,6 +24,8 @@ const moduleLoader = require("node:module");
 const path = require("node:path");
 const vm = require("node:vm");
 const { EventEmitter } = require("node:events");
+const { promptBounds } = require("../src/browserPermissionPrompt");
+const { BANNER_HEIGHT, BANNER_INSET } = require("../src/return_banner");
 
 const { createRequire } = moduleLoader;
 const electronStub = {
@@ -279,6 +281,7 @@ function loadNavigationHarness({
   const connectivity = { online: true };
   const webContents = {
     id: 1,
+    ipc: new EventEmitter(),
     send: (channel, data) => calls.progress.push({ channel, data }),
     stop() {},
     reload() {
@@ -301,6 +304,9 @@ function loadNavigationHarness({
     },
     prependListener(eventName, listener) {
       listeners.set(eventName, [listener, ...(listeners.get(eventName) ?? [])]);
+    },
+    once(eventName, listener) {
+      webContents.on(eventName, listener);
     },
     emit(eventName, ...args) {
       for (const listener of listeners.get(eventName) ?? []) listener({}, ...args);
@@ -649,6 +655,7 @@ function loadNavigationHarness({
     // createWindow is what the behavior test below exercises.
     "./workspace-root-bounce": { registerWorkspaceRootBounce: () => {} },
     "./return_banner": {
+      ...require("../src/return_banner"),
       createReturnBanner: () => ({
         ensureBanner: () => {},
         show: (bannerWin, returnUrl) => bannerCalls.show.push({ win: bannerWin, returnUrl }),
@@ -2695,6 +2702,47 @@ describe("browser permission wiring", () => {
     }
   });
 
+  for (const platform of ["linux", "darwin"]) {
+    it(`asks for the security key while a sign-in page in the window waits on ${platform}`, async () => {
+      const h = loadNavigationHarness({ platform });
+      try {
+        const content = { x: 0, y: 0, width: 1280, height: 860 };
+        Object.assign(h.win, { isVisible: () => true, getContentBounds: () => content });
+        Object.assign(h.webContents, { isDestroyed: () => false, mainFrame: {} });
+        h.api.createWindow();
+        await until(() => h.calls.loadFile.length + h.calls.loadURL.length > 0, "the first page");
+        h.setUrl("https://login.example/signin/verify");
+        h.webContents.ipc.emit(
+          "omnigent:browser-webauthn-pending",
+          { senderFrame: h.webContents.mainFrame },
+          true,
+        );
+        const prompts = h.permissionPromptCalls.show;
+        await until(() => prompts.length === 1, "the window's security-key notice");
+        assert.equal(prompts[0].kind, "security-key");
+        assert.equal(prompts[0].parent, h.win);
+        assert.equal(prompts[0].origin, "https://login.example");
+        assert.equal(prompts[0].openInBrowser, false);
+        assert.ok(!prompts[0].cookieImport);
+        const bounds = promptBounds(content, prompts[0].getAnchorBounds());
+        assert.equal(bounds.x + bounds.width, content.width);
+        assert.ok(bounds.y >= BANNER_INSET + BANNER_HEIGHT, "clear of the return banner");
+      } finally {
+        h.cleanup();
+      }
+    });
+  }
+
+  it("leaves WebAuthn in Windows shell windows to the system dialog", () => {
+    const h = loadNavigationHarness({ platform: "win32" });
+    try {
+      h.api.createWindow();
+      assert.equal(h.webContents.ipc.listenerCount("omnigent:browser-webauthn-pending"), 0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it("guards each agent partition's network requests through its own Chromium session", async () => {
     const h = loadNavigationHarness({ registerFallbacks: false, realBrowserRegistry: true });
     try {
@@ -3602,6 +3650,15 @@ describe("window-open policy wiring (src/main.js)", () => {
         "window can inherit the SHELL preload's IPC bridges while showing third-party",
         "sign-in pages. Restore both overrides (see popup_preload.js).",
       ].join(" "),
+    );
+  });
+
+  it("keeps the popup preload empty, so sign-in popups get no bridge or security-key observer", () => {
+    const popupPreload = readFileSync(path.join(__dirname, "../src/popup_preload.js"), "utf8");
+    assert.equal(
+      popupPreload.replace(/\/\/.*$/gm, "").trim(),
+      '"use strict";',
+      "popup_preload.js now runs code in third-party sign-in popups; review its trust boundary.",
     );
   });
 

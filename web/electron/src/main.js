@@ -76,7 +76,7 @@ const {
 const { registerWorkspaceChromeHide } = require("./workspace-chrome");
 const { registerWorkspaceRootBounce } = require("./workspace-root-bounce");
 const { registerServerAwayWatch, AWAY_BANNER_DELAY_MS } = require("./away_banner");
-const { createReturnBanner } = require("./return_banner");
+const { createReturnBanner, BANNER_HEIGHT, BANNER_INSET } = require("./return_banner");
 const { createReconnectOverlay } = require("./reconnect_overlay");
 const { createBrowserViewRegistry } = require("./browserViewRegistry");
 const { registerBrowserTabsIpc } = require("./browserTabs");
@@ -324,9 +324,12 @@ const ERR_BLOCKED_BY_CLIENT = -20;
  */
 const POPUP_PRELOAD = path.join(__dirname, "popup_preload.js");
 
-/** Reports embedded-browser WebAuthn requests; Windows draws its own WebAuthn dialog. */
-const BROWSER_VIEW_PRELOAD =
-  process.platform === "win32" ? undefined : path.join(__dirname, "browser_view_preload.js");
+/** Windows draws its own WebAuthn dialog; elsewhere the shell shows a security-key notice. */
+const SHOWS_SECURITY_KEY_NOTICE = process.platform !== "win32";
+/** Reports embedded-browser WebAuthn requests for that notice. */
+const BROWSER_VIEW_PRELOAD = SHOWS_SECURITY_KEY_NOTICE
+  ? path.join(__dirname, "browser_view_preload.js")
+  : undefined;
 
 /** Absolute path to the app icon (PNG works for the macOS dock at runtime). */
 const ICON_PNG = path.join(__dirname, "..", "icons", "icon.png");
@@ -3039,6 +3042,22 @@ function createWindow(targetUrl, opts = {}) {
       onReturn: () => returnBanner.hide(win),
     }),
   );
+  if (SHOWS_SECURITY_KEY_NOTICE) {
+    // No browser handoff: a sign-in finished in another browser can't sign this window in.
+    attachSecurityKeyNotice(win.webContents, {
+      canPrompt: () => !win.isDestroyed() && win.isVisible() && !win.isMinimized(),
+      showPrompt: (options) =>
+        browserPermissionPrompt.show({
+          parent: win,
+          // Top right, below the centered return banner.
+          getAnchorBounds: () => ({
+            x: win.getContentBounds().width,
+            y: BANNER_INSET + BANNER_HEIGHT + BANNER_INSET,
+          }),
+          ...options,
+        }),
+    });
+  }
   if (destination) {
     // All server entry points share auth preparation and resolved-origin manifest lookup.
     void loadServerUrl(win, serverUrl, undefined, { loadUrl: destination })

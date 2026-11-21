@@ -623,17 +623,23 @@ policy must be configured to allow it; the pane does not rewrite those headers.
 
 Electron draws no WebAuthn UI, so a sign-in page waiting on a security key
 would otherwise sit with nothing on screen. On macOS and Linux, a preload in
-each pane page reports its WebAuthn requests, and the same popover window then
-tells the user to insert and touch their security key. It also says built-in
-biometrics and saved passkeys are unavailable (see
-[Passkeys](#passkeys-webauthn)). **Open in browser** hands the current page to
-the default browser; on macOS the popover also points to the cookie button.
+each pane page and in the app window reports its WebAuthn requests, and the same
+popover window then tells the user to insert and touch their security key. It
+also says built-in biometrics and saved passkeys are unavailable (see
+[Passkeys](#passkeys-webauthn)). In a pane, **Open in browser** hands the
+current page to the default browser; on macOS the popover also points to the
+cookie button. A sign-in page in the app window itself, such as a Databricks
+App's identity provider, gets the notice at the top right below the return
+banner. It suggests another verification method instead of a browser handoff,
+because finishing sign-in in another browser does not sign the app in.
 The popover closes when the request finishes or fails, or when the page navigates.
-It waits until the pane is visible and returns if the pane is hidden or covered
+It waits until the pane or window is visible and returns if it is hidden or covered
 while the request still waits. Clicking elsewhere leaves it open. Once the user
 closes it or presses Escape, it stays closed until the page makes a new request.
 Only requests from the top-level page are observed; requests inside iframes
 do not open the notice. Conditional (autofill) requests do not open it.
+[OAuth sign-in popups](#architecture) run the empty popup preload, so they
+do not open it either.
 Options with accessor-backed `publicKey` or `mediation` properties also bypass
 observation so the preload does not evaluate page getters a second time. Those
 requests still run through Chromium, but they do not open the notice.
@@ -1219,7 +1225,7 @@ reconnect this machine explicitly from the host menu when you want it.
 External security keys (e.g. a YubiKey) work out of the box: Chromium's
 content layer speaks CTAP to the key directly. Electron doesn't ship the passkey
 sheet you see in Chrome/Safari, so touching the key completes the ceremony with
-no Chromium UI. The embedded browser pane shows its own
+no Chromium UI. The app window and the embedded browser pane show their own
 [security-key notice](#security-keys) while the request waits.
 
 The shell intentionally does **not** enable Electron's Touch ID platform
