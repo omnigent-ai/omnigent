@@ -308,6 +308,12 @@ describe("global show shortcut bridge", () => {
     assert.equal(h.invokes.at(-1).channel, "omnigent:cancel-global-shortcut-recording");
   });
 
+  it("forwards the floating panel's ready signal on its own channel", () => {
+    const h = loadPreload({ platform: "darwin" });
+    h.desktop.floatingComposer.ready();
+    assert.equal(h.sends.at(-1).channel, "omnigent:floating-composer:ready");
+  });
+
   it("names the shortcut by id for the shell to check, and drops ids that aren't strings", async () => {
     const h = loadPreload();
     const sent = () => JSON.parse(JSON.stringify(h.invokes.at(-1)));
