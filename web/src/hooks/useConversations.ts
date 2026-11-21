@@ -1987,10 +1987,7 @@ export async function setConversationPinned(
  * window lives only in its folder's cache). Used by the pin and move overlays
  * to read the row's current fields before patching them optimistically.
  */
-export function findCachedConversationRow(
-  queryClient: QueryClient,
-  id: string,
-): Conversation | undefined {
+function findCachedConversationRow(queryClient: QueryClient, id: string): Conversation | undefined {
   return (
     queryClient
       .getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)

@@ -26,14 +26,14 @@ vi.mock("@/hooks/useSessionActionRestrictions", () => ({
 }));
 const useConversations = vi.fn();
 vi.mock("@/hooks/useConversations", async (importOriginal) => {
-  const { findCachedConversationRow, isSessionDeleting } =
+  const { isSessionDeleting, PINNED_CONVERSATIONS_KEY } =
     await importOriginal<typeof ConversationsModule>();
   return {
     useConversations: (...args: unknown[]) => useConversations(...args),
     useSessionSearch: () => ({ isFetching: false }),
     useProjects: () => ({ data: [] }),
-    findCachedConversationRow,
     isSessionDeleting,
+    PINNED_CONVERSATIONS_KEY,
   };
 });
 
@@ -163,6 +163,25 @@ describe("QuickPick ⌘K session actions", () => {
     expect(useSessionActionStore.getState().request).toBeNull();
     expect(onOpenChange).not.toHaveBeenCalled();
     expect(heading()).toBe("Actions for “Review notes”");
+  });
+
+  it("keeps a search result's owner when only its detail is cached, and stays steady", async () => {
+    const queryClient = new QueryClient();
+    // The session's own fetch, which carries no owner, and no list holds it.
+    queryClient.setQueryData(["session", "c2"], {
+      id: "c2",
+      title: "Review notes",
+      createdAt: 0,
+      permissionLevel: 1,
+      labels: {},
+      archived: false,
+    });
+    listSessions(SHARED, MINE);
+    const { input } = renderPalette(queryClient);
+    openActions(input);
+    await waitFor(() => expect(heading()).toBe("Actions for “Review notes”"));
+    const rename = screen.getByRole("option", { name: /Rename/ });
+    expect(rename).toHaveAttribute("aria-disabled", "true");
   });
 
   it("lists no actions for a session still being created", async () => {
