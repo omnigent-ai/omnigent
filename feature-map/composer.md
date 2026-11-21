@@ -480,7 +480,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - Change Settings → Always steer (on by default) to choose whether
   busy-session Design-mode follow-ups queue or send immediately. Existing queued
   messages retain FIFO ordering. Annotate/Draw requests ignore it: they wait above
-  the composer (Send/Enter, then Retry or Remove) until the turn ends.
+  the composer (Send/Enter, then Retry or Remove) until the turn ends. With
+  `quick_pick_palette` on, ⌘K also lists Always steer as a setting row: type
+  "always steer", press Enter, and pick On or Off
+  (`web/src/shell/QuickPickCommandPalette.appCommands.test.tsx`).
 
 **New-session composer** (landing page, or New session):
 

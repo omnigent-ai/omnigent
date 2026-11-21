@@ -153,12 +153,7 @@ import { ProjectHomeHeaderActions, ProjectHomeTitle } from "@/projectHome/Projec
 import { projectNameFromHomePath } from "@/projectHome/projectHomeNavigation";
 import { MobileHeaderControlsProvider } from "./MobileHeaderControlsSlot";
 import { CREATED_BY_SESSION_LABEL_KEY } from "./CreatedBySession";
-import {
-  FileViewerContext,
-  type FilePosition,
-  type OpenFileOptions,
-  type FileNavigationGuard,
-} from "./FileViewerContext";
+import type { FilePosition, OpenFileOptions, FileNavigationGuard } from "./FileViewerContext";
 import { revealFolderInFilesPanel } from "./FilesPanel";
 import { selectPullRequestInPanel } from "./PullRequestPanel";
 import type { ChangedSort } from "./FlatFileList";
@@ -178,6 +173,9 @@ import {
 import { AppShellWorkspacePanels } from "./AppShellWorkspacePanels";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { AppShellOverlays } from "./AppShellOverlays";
+import { AppShellRootProviders } from "./AppShellRootProviders";
+import { replaceThemePicker } from "@/store/themePicker";
+import { commandViewForPath, useCommandSession } from "./commandContext";
 import { CloseShellDialog } from "./CloseShellDialog";
 import { CloseWindowDialog } from "./CloseWindowDialog";
 import { QuitDialog } from "./QuitDialog";
@@ -777,6 +775,9 @@ function AppShellImpl() {
     if (!serverConversationId) return null;
     return allConversations?.find((c) => c.id === serverConversationId) ?? null;
   }, [serverConversationId, allConversations]);
+  // What ⌘K commands act on. The level is only authoritative once this route's snapshot loads.
+  const commandSession = useCommandSession(serverConversationId, activeConv);
+  const commandView = commandViewForPath(location.pathname, rebasePath);
   // A temporary row is display-only: it can supply optimistic breadcrumb
   // text, but must not participate in permissions, actions, or server hooks.
   const provisionalConv = useMemo(() => {
@@ -2190,6 +2191,10 @@ function AppShellImpl() {
   // Bound here where the palette's open-state lives.
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const [sessionSearch, setSessionSearch] = useState(false);
+  // The palette replaces the theme picker rather than stacking on it, which ends its preview.
+  useEffect(() => {
+    if (commandPaletteOpen) replaceThemePicker();
+  }, [commandPaletteOpen]);
   // Stable handlers so the memoized Sidebar doesn't re-render on AppShell's
   // frequent re-renders (chatStore status churn during a bind). Inline
   // callbacks would give it fresh props each time and defeat the memo.
@@ -2208,6 +2213,8 @@ function AppShellImpl() {
     setSessionSearch(false);
     setCommandPaletteOpen(true);
   }, []);
+  // ⌘K's Go to Session…: the open palette continues as the session switcher.
+  const handleGoToSession = useCallback(() => setSessionSearch(true), []);
   const isEmbedded = useIsEmbedded();
   useCommandPaletteHotkey(
     () => {
@@ -3206,7 +3213,15 @@ function AppShellImpl() {
   }, [workspacePanelVisible, focusWorkspaceTabs]);
 
   return (
-    <FileViewerContext.Provider value={fileViewerContextValue}>
+    <AppShellRootProviders
+      command={{
+        session: commandSession,
+        view: commandView,
+        workspaceTab: workspacePanelVisible ? rightRailTab : null,
+        filePath: selectedFilePath,
+      }}
+      fileViewer={fileViewerContextValue}
+    >
       <TerminalFirstContextProvider value={terminalFirstContextValue}>
         <ForkDialogContextProvider value={forkDialogContextValue}>
           {/* `app-shell` paints the shared canvas behind the sidebar and
@@ -3768,6 +3783,7 @@ function AppShellImpl() {
             setCommandPaletteOpen={setCommandPaletteOpen}
             toggleLeftSidebar={toggleLeftSidebar}
             toggleRightPanel={toggleRightPanel}
+            goToSession={handleGoToSession}
             gridRoute={gridRoute}
             allConversations={allConversations}
             serverConversationId={serverConversationId}
@@ -3775,7 +3791,7 @@ function AppShellImpl() {
           />
         </ForkDialogContextProvider>
       </TerminalFirstContextProvider>
-    </FileViewerContext.Provider>
+    </AppShellRootProviders>
   );
 }
 

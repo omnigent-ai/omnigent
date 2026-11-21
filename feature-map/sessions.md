@@ -59,6 +59,15 @@ the header menu), and each place is a separate entry point.
   sessions shown before typing leave them out. Results show project and parent
   session breadcrumbs when available, including when the parent did not match
   the search. Desktop and mobile search use the same context.
+- `palette-session-commands`: ⌘K lists the open session's header-menu actions
+  under **Session**: Add nested agent, Pin or Unpin, Share, Fork, Export,
+  Rename, Mark as unread, Create automation, Archive or Unarchive, and Delete.
+  The QuickPick palette (`quick_pick_palette`) always lists them; the default
+  palette lists them where `workspace_sidebar_v2` shows feature commands. They're
+  offered to the session's owner, as the header menu is; one that can't run
+  stays listed with the reason, and a dialog such as Rename opens with focus in
+  it. With `quick_pick_palette`, **Go to Session…** turns the open palette into
+  the session switcher; Escape returns focus to where ⌘K was opened.
 - `archive`: archived sessions leave the main list and appear in the archived
   view, which can be filtered by project and paged. On a server with worktree
   cleanup, archiving a session that has a git worktree first asks whether to
@@ -294,6 +303,10 @@ the header menu), and each place is a separate entry point.
 
 ## How to get to it (user POV)
 
+- For ⌘K session actions, open a session you own and press Cmd/Ctrl+K, then
+  type an action such as "rename session" and press Enter. With
+  `quick_pick_palette` on, type "go to session" and press Enter to switch
+  sessions, or Escape to return to where you were.
 - For siblings, open an owned active session's sidebar kebab, right-click menu,
   or header menu and choose **Add nested agent**. Mobile row/header menus offer
   the same action. On desktop, Cmd/Ctrl+Alt+A opens **Add nested agent** for the active
@@ -871,6 +884,13 @@ plain `uv run pytest`, which starts a private server for the test.
   worktree session from the row menu, bulk selection, and header menu, and
   expect the dialog each time; an idle session without a worktree archives
   silently.
+- **`palette-session-commands`:**
+  `tests/e2e_ui/sessions/test_quick_pick_palette.py::test_quick_pick_on_an_open_session`
+  runs with `quick_pick_palette` on: Rename session from ⌘K opens its dialog
+  with focus in the name field, and Go to Session… moves focus to the switcher
+  and back on Escape. Each action's gates and handlers have unit coverage in
+  `web/src/shell/HeaderConversationMenu.test.tsx` and
+  `web/src/shell/openSessionCommands.test.ts`.
 - **`unarchive`, header menu:**
   `tests/e2e_ui/sessions/test_archived_session_header_menu.py::test_archived_session_header_menu_offers_unarchive`.
 - **`unarchive`, open archived session's sidebar row:**
