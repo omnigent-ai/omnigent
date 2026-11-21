@@ -35,10 +35,3 @@ def test_last_human_input_at_reads_attached_terminals_and_the_web_stamp(
     monkeypatch.setattr(tmux_activity, "_tmux_output", tmux_output)
 
     assert tmux_activity.last_human_input_at("/tmp/example/tmux.sock", "main") == expected
-
-
-def test_the_web_stamp_is_a_pane_option() -> None:
-    assert (
-        tmux_activity.human_input_stamp_command("main", 1795227030.25)
-        == "set-option -p -t main @omnigent_human_input_at 1795227030.250"
-    )

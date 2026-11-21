@@ -5009,7 +5009,8 @@ def inject_user_message(
     delivery_diagnostics.set_stage("waiting_for_tmux")
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     delivery_diagnostics.set_stage("waiting_for_typing_pause")
-    _wait_for_typing_pause(info["socket_path"], info["tmux_target"])
+    if not _wait_for_typing_pause(info["socket_path"], info["tmux_target"]):
+        _logger.info("claude-native: the person kept typing; delivering anyway")
     guard = _DraftGuard()
     try:
         _deliver_user_message(bridge_dir, info, content=content, timeout_s=timeout_s, guard=guard)
@@ -5798,15 +5799,19 @@ def inject_slash_command(
         dialog is polled for by its own title so a late render (~1.9s on a
         session with cached history) still gets its Enter, and so the Enter
         cannot answer a dialog that is not ours.
-    :param ready_timeout_s: Hard cap, in seconds, on waiting for the input box
-        to render, e.g. ``9.0``. For a caller answering a request with its own
-        deadline: a slow boot then fails the command in time instead of
-        outliving the request. ``None`` waits like :func:`inject_user_message`
-        — *timeout_s* as the base budget, extended while a live pane is still
-        booting.
+    :param ready_timeout_s: Hard cap, in seconds, on waiting for the person to
+        pause typing and then for the input box to render, e.g. ``9.0``. For a
+        caller answering a request with its own deadline: a slow boot, or
+        typing that goes on throughout, then fails the command in time with
+        nothing typed instead of outliving the request. ``None`` waits like
+        :func:`inject_user_message` — *timeout_s* as the base budget, extended
+        while a live pane is still booting.
     :raises ValueError: If *command* is empty, does not start with
         ``/``, contains a newline, or *auto_confirm* is set without a
         *confirm_hint*.
+    :raises ClaudeComposerHoldsDraft: If someone types in the terminal
+        throughout *ready_timeout_s*, or the person's draft cannot be set
+        aside; nothing was typed.
     :raises ClaudeTerminalDialog: If shell mode, the prompt-history search or a
         footer-less dialog still covers the input box after the restore, or
         the readiness gate finds a dialog holding it; no keystroke was sent.
@@ -5828,7 +5833,21 @@ def inject_slash_command(
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
-    _wait_for_typing_pause(socket_path, tmux_target)
+    prompt_timeout_s = ready_timeout_s
+    if ready_timeout_s is None:
+        if not _wait_for_typing_pause(socket_path, tmux_target):
+            _logger.info("claude-native: the person kept typing; delivering anyway")
+    else:
+        # The caller's deadline must still cover the submit and the dialog watch.
+        pause_started = time.monotonic()
+        if not _wait_for_typing_pause(
+            socket_path, tmux_target, max_wait_s=min(_TYPING_PAUSE_MAX_WAIT_S, ready_timeout_s)
+        ):
+            raise ClaudeComposerHoldsDraft(
+                "Someone is typing in Claude Code's terminal, so the command was not sent.",
+                stash_in_use=False,
+            )
+        prompt_timeout_s = max(0.0, ready_timeout_s - (time.monotonic() - pause_started))
     guard = _DraftGuard()
     try:
         _deliver_slash_command(
@@ -5837,7 +5856,7 @@ def inject_slash_command(
             tmux_target,
             command=command,
             timeout_s=timeout_s,
-            ready_timeout_s=ready_timeout_s,
+            ready_timeout_s=prompt_timeout_s,
             dialog_hint=dialog_hint,
             guard=guard,
         )
@@ -7778,27 +7797,31 @@ class _DraftGuard:
     stashed: bool = False
 
 
-def _wait_for_typing_pause(socket_path: str, tmux_target: str) -> None:
+def _wait_for_typing_pause(
+    socket_path: str, tmux_target: str, *, max_wait_s: float = _TYPING_PAUSE_MAX_WAIT_S
+) -> bool:
     """
     Wait for the person to pause typing in the pane before a delivery takes the box.
 
     A key typed while a delivery holds the input box lands in the delivered
     text, so delivery waits for a :data:`_TYPING_PAUSE_S` pause, at most
-    :data:`_TYPING_PAUSE_MAX_WAIT_S`, then goes ahead.
+    *max_wait_s*.
 
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param max_wait_s: Longest wait, in seconds, e.g. ``15.0``.
+    :returns: ``True`` once the person paused, ``False`` when they typed throughout.
     """
-    deadline = time.monotonic() + _TYPING_PAUSE_MAX_WAIT_S
+    deadline = time.monotonic() + max_wait_s
     while (typed_at := last_human_input_at(socket_path, tmux_target)) is not None:
         paused_s = time.time() - typed_at
         if paused_s >= _TYPING_PAUSE_S:
-            return
+            return True
         if time.monotonic() >= deadline:
-            _logger.info("claude-native: the person kept typing; delivering anyway")
-            return
+            return False
         _check_injection_cancelled()
         time.sleep(min(_TYPING_PAUSE_S - paused_s, _CLAUDE_READY_POLL_INTERVAL_S))
+    return True
 
 
 def _typed_in_pane_since(socket_path: str, tmux_target: str, since: float) -> bool:
@@ -7992,24 +8015,10 @@ def _set_draft_aside(
     """
     Stash the person's unsent draft before a delivery types into the input box.
 
-    Clearing the box would erase what the person is writing. Claude Code's own
-    stash keeps the draft whole (every line, collapsed pastes, shell mode) and
-    returns it after the next submit. It has one slot, which is never
-    overwritten: a draft beside an already-stashed one stays in the box, and
-    the delivery is refused.
-
-    Text the stash key leaves in place can be another process's output
-    printed over the box rather than a draft, so the box is repainted once
-    before such text refuses the delivery as a draft that could not be
-    stashed. A capture that does not show the box, such as a torn read during
-    a repaint, says nothing about a draft: it is retried, and the delivery is
-    refused before any key if no capture shows the box. The stash key is sent
-    only while the person's keybindings leave Ctrl+S to the stash
-    (:func:`_ctrl_s_stashes`), since bound to submit it would send the draft. So
-    is a box the pane
-    cuts off whose visible rows are blank, since the rest of a draft can sit
-    below a blank first line; the refused delivery gives the pane room and
-    retries (:func:`_serialize_bridge_injection`).
+    Claude Code's own stash keeps the draft whole (every line, collapsed
+    pastes, shell mode) and returns it after the next submit. The draft is
+    stashed only when the pane and the person's keybindings show the stash can
+    take it; otherwise the delivery is refused with nothing typed.
 
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.

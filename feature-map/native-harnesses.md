@@ -675,7 +675,8 @@ Cross-harness journeys:
   left, including shell mode, collapsed pastes and drafts longer than the box
   shows. Omnigent waits for a pause in the typing, for at most 15 seconds,
   then sets the draft aside with Claude Code's own stash, which returns it
-  after the submit. When the
+  after the submit. A settings change waits only as long as its request
+  allows, and is refused with nothing typed if the typing goes on. When the
   stash already holds another draft, the message waits, with a notice in Chat,
   until the person sends or clears the draft. The tests need Claude Code and
   tmux. Manually, type a sentence in the terminal without sending it, send a

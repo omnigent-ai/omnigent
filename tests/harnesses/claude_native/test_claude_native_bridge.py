@@ -12961,6 +12961,20 @@ def test_inject_user_message_sends_none_of_a_leftover_draft_and_returns_it(
     assert (composer.text, composer.cursor, composer.stash) == (draft, cursor, None)
 
 
+def test_a_draft_that_is_the_message_word_for_word_is_returned_once_it_is_sent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The delivery's own text in the box after the submit is the person's draft coming back."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    composer = _EditableComposer("hello from the web", cursor=5)
+    composer.install(monkeypatch)
+
+    inject_user_message(bridge_dir, content="hello from the web")
+
+    assert [text.strip() for text in composer.submitted] == ["hello from the web"]
+    assert (composer.text, composer.cursor, composer.stash) == ("hello from the web", 5, None)
+
+
 @_BOX_GEOMETRIES
 @_STALE_DRAFT_CURSORS
 @pytest.mark.parametrize(
@@ -14850,6 +14864,74 @@ def test_an_effort_injection_with_no_dialog_completes_without_hanging(
         "Enter",
         "Enter",
     ]
+
+
+@pytest.mark.parametrize(
+    ("typing_until", "applied"),
+    [(5.0, True), (12.0, False), (None, False)],
+    ids=["pauses-in-time", "pauses-too-late", "never-pauses"],
+)
+def test_an_effort_change_while_someone_types_keeps_to_its_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    typing_until: float | None,
+    applied: bool,
+) -> None:
+    """
+    A settings change lands in the terminal only within the request that asked for it.
+
+    The web control's deadline covers the wait for a pause in the person's
+    typing as well as the submit and the watch for a dialog after it, which
+    ``/effort`` without one spends in full. Typing that goes on through the
+    wait for the input box refuses the change with nothing typed; a change
+    applied in the terminal after the deadline would be reported as failed.
+    """
+    from omnigent.runner import native_controls
+
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    draft = "my half-typed question"
+    composer = _EditableComposer(draft, cursor=len(draft))
+    composer.install(monkeypatch)
+    clock = claude_native_bridge.time
+    monkeypatch.setattr(native_controls, "time", clock)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "last_human_input_at",
+        lambda *_args: clock.now if typing_until is None else min(clock.now, typing_until),
+    )
+    # The real tmux calls stop at a cancelled deadline, and so do these.
+    for name in ("_run_tmux", "_capture_pane"):
+        fake = getattr(claude_native_bridge, name)
+
+        def checked(*args: Any, _fake: Callable[..., Any] = fake, **kwargs: Any) -> Any:
+            claude_native_bridge._check_injection_cancelled()
+            return _fake(*args, **kwargs)
+
+        monkeypatch.setattr(claude_native_bridge, name, checked)
+    deadline = native_controls._ClaudeControlDeadline()
+
+    def change_effort() -> None:
+        with claude_native_bridge.cancellable_injection(deadline):
+            claude_native_bridge.inject_slash_command(
+                bridge_dir,
+                command="/effort high",
+                timeout_s=1.0,
+                ready_timeout_s=min(
+                    native_controls._CLAUDE_CONTROL_PROMPT_WAIT_S, deadline.remaining_s()
+                ),
+                auto_confirm=True,
+                confirm_hint=claude_native_bridge.EFFORT_DIALOG_HINT,
+            )
+
+    if applied:
+        change_effort()
+        assert [text.strip() for text in composer.submitted] == ["/effort high"]
+    else:
+        with pytest.raises(claude_native_bridge.ClaudeComposerHoldsDraft, match="typing"):
+            change_effort()
+        assert composer.submitted == []
+    assert not deadline.is_set()
+    assert (composer.text, composer.cursor, composer.stash) == (draft, len(draft), None)
 
 
 _WRAPPED_BTW_PANE = "\n".join(
