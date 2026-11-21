@@ -78,6 +78,27 @@ export const GIT_PROVIDERS: Readonly<Record<string, GitProviderCopy>> = {
 };
 
 /**
+ * A known provider's copy for a code host instance the host's config names, e.g. a
+ * GitHub-compatible host whose CLI signs in by itself: its own name, any host shown,
+ * and sign-in hints that don't assume the provider's own CLI.
+ */
+function instanceCopy(
+  known: GitProviderCopy,
+  label: string,
+  authHint?: string | null,
+): GitProviderCopy {
+  return {
+    ...known,
+    label,
+    defaultHost: null,
+    authHint: authHint || `Check that ${label} can sign in on the host.`,
+    cliLabel: `${label} CLI`,
+    repoUnresolvedHint: undefined,
+    checksUnavailableHint: undefined,
+  };
+}
+
+/**
  * The copy for a provider id. No id (a host that predates `provider`) is GitHub;
  * `null` (no provider is known) is neutral copy that names none; an unknown id
  * gets generic copy that uses the host's `auth.hint` when given.
@@ -89,8 +110,13 @@ export function gitProviderCopy(
 ): GitProviderCopy {
   if (id === null) return NEUTRAL;
   if (!id) return GITHUB;
-  if (Object.hasOwn(GIT_PROVIDERS, id)) return GIT_PROVIDERS[id];
   const metadata = display?.id === id ? display : undefined;
+  if (Object.hasOwn(GIT_PROVIDERS, id)) {
+    const known = GIT_PROVIDERS[id];
+    return metadata?.display_name && metadata.display_name !== known.label
+      ? instanceCopy(known, metadata.display_name, authHint)
+      : known;
+  }
   const label = metadata?.display_name || id;
   const requestName = metadata?.request_name || "pull request";
   return {

@@ -22,6 +22,7 @@ from omnigent.db.utils import get_or_create_engine, now_epoch
 from omnigent.host.frames import (
     CAP_MCP_TOOLS,
     CAP_SKILL_CONTENT,
+    SERVER_CAP_CODE_HOST_INSTANCES,
     SERVER_CAP_TMUX_READINESS,
     SERVER_CAPABILITIES_HEADER,
     HostConnectionErrorFrame,
@@ -852,6 +853,29 @@ async def test_host_tunnel_upgrade_advertises_server_capabilities(
     headers = dict(accepted.get("headers") or [])
     advertised = headers[SERVER_CAPABILITIES_HEADER.lower().encode("ascii")].decode("ascii")
     assert SERVER_CAP_TMUX_READINESS in parse_server_capabilities(advertised)
+    assert SERVER_CAP_CODE_HOST_INSTANCES not in parse_server_capabilities(advertised)
+    await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+
+
+async def test_host_tunnel_upgrade_advertises_code_host_instances_only_when_turned_on(
+    db_uri: str,
+) -> None:
+    """A host serves its configured instances only to a server that advertises them."""
+    app = FastAPI()
+    app.include_router(
+        create_host_tunnel_router(HostRegistry(), HostStore(db_uri), code_host_instances=True),
+        prefix="/v1",
+    )
+    communicator = ApplicationCommunicator(app, _websocket_scope(_TUNNEL_PATH))
+    await communicator.send_input({"type": "websocket.connect"})
+    accepted = await communicator.receive_output(timeout=budget(1.0))
+
+    headers = dict(accepted.get("headers") or [])
+    advertised = headers[SERVER_CAPABILITIES_HEADER.lower().encode("ascii")].decode("ascii")
+    assert parse_server_capabilities(advertised) == {
+        SERVER_CAP_TMUX_READINESS,
+        SERVER_CAP_CODE_HOST_INSTANCES,
+    }
     await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
 
 

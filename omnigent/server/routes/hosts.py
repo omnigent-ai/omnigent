@@ -29,7 +29,7 @@ from urllib.parse import urlparse
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from packaging.version import InvalidVersion, Version
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from omnigent.db.utils import now_epoch
 from omnigent.debug_logging import (
@@ -43,6 +43,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness, harness_account_key
 from omnigent.host.frames import (
     CAP_CLONE_REPOSITORY,
+    CAP_CODE_HOST_INSTANCES,
     CAP_HARNESS_ACCOUNTS,
     CAP_HARNESS_LOGIN,
     CAP_LONG_SESSION_MESSAGES,
@@ -63,6 +64,7 @@ from omnigent.host.frames import (
     classify_launch_refusal,
     encode_host_frame,
     optional_str_bool_map,
+    refuse_code_host_command_fields,
     workspace_missing_message,
 )
 from omnigent.onboarding.harness_install import (
@@ -851,6 +853,14 @@ class LaunchRunnerRequest(BaseModel):
         default=None, max_length=64, pattern=r"^[A-Za-z0-9_-]+$"
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def _refuse_code_host_commands(cls, data: object) -> object:
+        """Refuse a body naming a code host instance's command, environment or file."""
+        if isinstance(data, dict):
+            refuse_code_host_command_fields(data, where="the runner launch request")
+        return data
+
 
 async def _resolve_agent_spec_cwd(
     conv: Conversation,
@@ -951,7 +961,18 @@ def create_hosts_router(
     harness_install_gate: HarnessInstallGate = (
         flags.enabled(Feature.HARNESS_INSTALL) if harness_install is None else harness_install
     )
+    code_host_instances_enabled = flags.enabled(Feature.CODE_HOST_INSTANCES)
     router = APIRouter()
+
+    def _served_code_host_instances(conn: HostConnection | None) -> list[dict[str, Any]] | None:
+        """The code host instances a live host serves, while the flag is on; else unserved."""
+        if (
+            not code_host_instances_enabled
+            or conn is None
+            or CAP_CODE_HOST_INSTANCES not in conn.hello.capabilities
+        ):
+            return None
+        return conn.hello.code_host_instances or None
 
     def require_harness_install() -> None:
         if not harness_install_enabled(harness_install_gate):
@@ -1049,6 +1070,8 @@ def create_hosts_router(
                 and conn.hello.harness_accounts is not None
             ):
                 item["harness_accounts"] = conn.hello.harness_accounts
+            if served_instances := _served_code_host_instances(conn):
+                item["code_host_instances"] = served_instances
             if harness_setup_enabled:
                 item["harness_accounts_supported"] = bool(
                     conn is not None and CAP_HARNESS_ACCOUNTS in conn.hello.capabilities
@@ -1114,6 +1137,8 @@ def create_hosts_router(
             and conn.hello.harness_accounts is not None
         ):
             result["harness_accounts"] = conn.hello.harness_accounts
+        if served_instances := _served_code_host_instances(conn):
+            result["code_host_instances"] = served_instances
         if harness_setup_enabled:
             result["harness_accounts_supported"] = bool(
                 conn is not None and CAP_HARNESS_ACCOUNTS in conn.hello.capabilities

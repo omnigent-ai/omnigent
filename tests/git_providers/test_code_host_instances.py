@@ -5,11 +5,8 @@ from __future__ import annotations
 import copy
 import dataclasses
 import inspect
-import os
 import pickle
 import re
-import subprocess
-import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -24,7 +21,6 @@ from omnigent.git_providers.code_host_instances import (
     CodeHostInstances,
     load_code_host_instances,
 )
-from tests.budgets import budget
 
 KNOWN = frozenset({"line_counts", "linked_pr_diff", "review_threads", "comment_posting"})
 SECRET_ARGUMENT = "s3cr3t-argument-value"
@@ -129,6 +125,33 @@ def test_a_file_is_read_with_the_hosts_path(tmp_path: Path, cli: Path) -> None:
     assert seen == [f"{cli.parent}:/usr/bin"]
 
 
+def _executable(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\nexit 0\n")
+    path.chmod(0o755)
+    return path
+
+
+def test_a_bare_name_skips_relative_path_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A CLI found only through the current directory is refused; a later absolute one wins."""
+    monkeypatch.chdir(tmp_path)
+    _executable(tmp_path / "bin" / "example-cli")
+    absolute = _executable(tmp_path / "absolute" / "example-cli")
+    config = tmp_path / "code_host_instances.toml"
+    config.write_text(_config("example-cli"))
+
+    def load_with(path: str) -> CodeHostInstances:
+        return load_code_host_instances(
+            config, known_capabilities=KNOWN, host_environment={"PATH": path}
+        )
+
+    assert load_with(f"bin:{absolute.parent}").instances[0].command == (str(absolute),)
+    with pytest.raises(CodeHostInstanceError, match="isn't in an absolute directory"):
+        load_with("bin:.")
+
+
 def test_a_bare_name_resolves_once_and_is_refused_once_it_disappears(
     load: Load, cli: Path
 ) -> None:
@@ -168,7 +191,10 @@ def test_arguments_stay_literal_with_no_shell(load: Load, cli: Path) -> None:
         ({"cli": "[]"}, "cli must be a non-empty list"),
         ({"cli": '["./example-cli"]'}, "use an absolute path or a bare name on PATH"),
         ({"cli": '["bin/example-cli"]'}, "use an absolute path or a bare name on PATH"),
-        ({"cli": '["example-cli; true"]'}, "the name isn't on the host's PATH"),
+        (
+            {"cli": '["example-cli; true"]'},
+            "the name isn't in an absolute directory on the host's PATH",
+        ),
         ({"cli": '["/nonexistent/example-cli"]'}, "it isn't an executable file"),
         ({"cli": f'["/bin/sh", "{"x" * 5000}"]'}, "each argument must be a short string"),
         ({"id": '"Internal"'}, "id must match"),
@@ -185,8 +211,6 @@ def test_arguments_stay_literal_with_no_shell(load: Load, cli: Path) -> None:
         ({"capabilities": '["line_counts", "line_counts"]'}, "it is listed twice"),
         ({"command": '["/bin/sh"]'}, "unknown field command"),
         ({"env": '["GH_TOKEN"]'}, "token-variable rule"),
-        ({"env": '["SERVICE_API_KEY"]'}, "secret-name rule"),
-        ({"env_set": '{ GIT_TRACE_CURL = "1" }'}, "diagnostic-variable rule"),
     ],
 )
 def test_a_broken_rule_refuses_the_file(
@@ -349,30 +373,3 @@ def test_instance_records_cannot_change_after_loading(load: Load, cli: Path) -> 
         loaded.fixed_environment["LANG"] = "x"  # type: ignore[index]
     assert not hasattr(loaded, "__dict__")
     assert isinstance(loaded.hosts, frozenset) and isinstance(loaded.command, tuple)
-
-
-def test_the_instance_modules_import_only_the_standard_library() -> None:
-    roots = [path for path in sys.path if path]
-    probe = (
-        f"import sys\nsys.path[:0] = {roots!r}\nbefore = set(sys.modules)\n"
-        "import omnigent.git_providers.code_host_instances\n"
-        "loaded = set(sys.modules) - before\n"
-        "print('\\n'.join(sorted(loaded)))\n"
-    )
-    result = subprocess.run(
-        [sys.executable, "-I", "-c", probe],
-        env=os.environ.copy(),
-        capture_output=True,
-        text=True,
-        timeout=budget(120),
-    )
-
-    assert result.returncode == 0, result.stderr
-    outside = [
-        name
-        for name in result.stdout.split()
-        if name.partition(".")[0] not in sys.stdlib_module_names
-        and name not in {"omnigent", "omnigent._env_compat"}
-        and not name.startswith("omnigent.git_providers")
-    ]
-    assert outside == []

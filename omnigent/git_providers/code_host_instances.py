@@ -19,9 +19,9 @@ The file is TOML, read once when the host starts::
     auth = "cli"
     capabilities = ["line_counts", "linked_pr_diff", "review_threads"]
 
-The first ``cli`` entry is an absolute path, or a bare name looked up once on the
-host's ``PATH`` at load and never again. Any broken rule refuses the whole file, so
-a host never runs with part of an operator's config.
+The first ``cli`` entry is an absolute path, or a bare name looked up once in the
+absolute directories on the host's ``PATH`` at load and never again. Any broken rule
+refuses the whole file, so a host never runs with part of an operator's config.
 """
 
 from __future__ import annotations
@@ -225,9 +225,16 @@ def _command(
     elif os.sep in program or (os.altsep and os.altsep in program):
         raise _refuse(f"{where}[0] is refused: use an absolute path or a bare name on PATH")
     else:
-        found = which(program, path=host_path)
+        # Relative PATH entries depend on the current directory, so they are skipped.
+        search = os.pathsep.join(
+            entry for entry in host_path.split(os.pathsep) if os.path.isabs(entry)
+        )
+        found = which(program, path=search)
         if not found or not os.path.isabs(found):
-            raise _refuse(f"{where}[0] is refused: the name isn't on the host's PATH")
+            raise _refuse(
+                f"{where}[0] is refused: the name isn't in an absolute directory on the "
+                "host's PATH"
+            )
         resolved = found
     if not (os.path.isfile(resolved) and os.access(resolved, os.X_OK)):
         raise _refuse(f"{where}[0] is refused: it isn't an executable file")

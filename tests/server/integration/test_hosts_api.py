@@ -16,6 +16,7 @@ from httpx import ASGITransport, AsyncClient
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
+    CAP_CODE_HOST_INSTANCES,
     CAP_HARNESS_ACCOUNTS,
     CAP_HARNESS_LOGIN,
     CAP_LONG_SESSION_MESSAGES,
@@ -28,6 +29,7 @@ from omnigent.host.frames import (
     encode_host_frame,
 )
 from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
+from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes._host_launch import HostLaunchTarget, resolve_host_launch
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
@@ -57,6 +59,7 @@ def _make_hello(
     gateway_inference: dict[str, bool] | None = None,
     harness_accounts: dict[str, dict[str, object]] | None = None,
     capabilities: list[str] | None = None,
+    code_host_instances: list[dict[str, object]] | None = None,
 ) -> str:
     """Encode a HostHelloFrame for tests.
 
@@ -78,6 +81,7 @@ def _make_hello(
             gateway_inference=gateway_inference,
             harness_accounts=harness_accounts,
             capabilities=capabilities or [],
+            code_host_instances=code_host_instances,
         )
     )
 
@@ -98,6 +102,7 @@ def _build_host_api_app(
     db_uri: str,
     *,
     harness_install: bool | Callable[[], bool] | None = None,
+    feature_flags: FeatureFlags | None = None,
 ) -> tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore]:
     """Build one replica's app over *db_uri*.
 
@@ -128,6 +133,7 @@ def _build_host_api_app(
             host_store,
             conv_store,
             harness_install=harness_install,
+            feature_flags=feature_flags,
         ),
         prefix="/v1",
     )
@@ -155,6 +161,7 @@ async def _connect_host(
     gateway_inference: dict[str, bool] | None = None,
     harness_accounts: dict[str, dict[str, object]] | None = None,
     capabilities: list[str] | None = None,
+    code_host_instances: list[dict[str, object]] | None = None,
 ) -> ApplicationCommunicator:
     """Connect a mock host via WebSocket tunnel.
 
@@ -183,6 +190,7 @@ async def _connect_host(
                 gateway_inference,
                 harness_accounts,
                 capabilities,
+                code_host_instances,
             ),
         },
     )
@@ -356,6 +364,87 @@ async def test_hosts_api_configured_harnesses_null_for_older_host(
 
     assert resp.status_code == 200
     assert resp.json()["hosts"][0]["configured_harnesses"] is None
+
+
+CODE_HOST_INSTANCE_SUMMARY = {
+    "id": "internal",
+    "display_name": "Internal code host",
+    "hosts": ["code.example.test"],
+}
+
+
+@pytest.mark.parametrize(
+    ("flag_on", "capabilities", "summaries", "served"),
+    [
+        pytest.param(
+            True, [CAP_CODE_HOST_INSTANCES], [CODE_HOST_INSTANCE_SUMMARY], True, id="served"
+        ),
+        pytest.param(
+            False, [CAP_CODE_HOST_INSTANCES], [CODE_HOST_INSTANCE_SUMMARY], False, id="flag-off"
+        ),
+        pytest.param(True, [], [CODE_HOST_INSTANCE_SUMMARY], False, id="no-capability"),
+        pytest.param(True, [], None, False, id="older-host"),
+        pytest.param(True, [CAP_CODE_HOST_INSTANCES], None, False, id="malformed-summaries"),
+    ],
+)
+async def test_code_host_instances_are_listed_only_while_served(
+    db_uri: str,
+    flag_on: bool,
+    capabilities: list[str],
+    summaries: list[dict[str, object]] | None,
+    served: bool,
+) -> None:
+    """A host's instances reach clients only with the flag on and the host's capability."""
+    flags = FeatureFlags(frozenset({Feature.CODE_HOST_INSTANCES}) if flag_on else frozenset())
+    app, registry, _hs, _cs = _build_host_api_app(db_uri, feature_flags=flags)
+    _comm = await _connect_host(
+        app, registry, capabilities=capabilities, code_host_instances=summaries
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        listed = (await client.get("/v1/hosts")).json()["hosts"][0]
+        detail = (await client.get(f"/v1/hosts/{_HOST_ID}")).json()
+
+    if served:
+        assert listed["code_host_instances"] == [CODE_HOST_INSTANCE_SUMMARY]
+        assert detail["code_host_instances"] == [CODE_HOST_INSTANCE_SUMMARY]
+    else:
+        assert "code_host_instances" not in listed
+        assert "code_host_instances" not in detail
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "cli",
+        "command",
+        "env",
+        "env_set",
+        "code_host_instances",
+        "code_host_instances_file",
+        "code_host_instance_hosts",
+    ],
+)
+async def test_a_launch_request_naming_a_code_host_command_is_refused(
+    db_uri: str, field: str
+) -> None:
+    """Only the host's own config names an instance's CLI; a request that tries is refused."""
+    app, registry, _hs, conv_store = _build_host_api_app(db_uri)
+    _comm = await _connect_host(app, registry, capabilities=[CAP_CODE_HOST_INSTANCES])
+    conv = conv_store.create_conversation(agent_id=None)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            f"/v1/hosts/{_HOST_ID}/runners",
+            json={"session_id": conv.id, "workspace": "/tmp", field: ["/bin/sh", "planted"]},
+        )
+
+    assert resp.status_code == 422, resp.text
+    (error,) = resp.json()["detail"]
+    assert f"field {field} can't be sent" in error["msg"]
+    assert "planted" not in error["msg"]
+    still = conv_store.get_conversation(conv.id)
+    assert still is not None and still.runner_id is None
 
 
 async def test_harness_accounts_are_live_only_and_login_support_is_explicit(

@@ -33,11 +33,11 @@ from omnigent.git_providers import (
     host_of,
     load_facet,
     provider,
-    provider_display,
     providers,
     resolve_remote,
 )
 from omnigent.runner import pr_reports
+from omnigent.runner.code_host_instances import provider_display_for
 from omnigent.runner.git_providers import (
     PR_DIFF_OBJECT,
     AccountMergeFacet,
@@ -327,6 +327,13 @@ def _default_pr(session_id: str | None, pr_url: str | None) -> SessionPullReques
     return entries[0] if entries else None
 
 
+def _info_host(info: dict[str, Any]) -> str | None:
+    """Return the host of the repository an info payload describes, when it names one."""
+    repo = info.get("repo")
+    host = repo.get("host") if isinstance(repo, dict) else None
+    return host if isinstance(host, str) else None
+
+
 def _cannot_serve(info: dict[str, Any], capabilities: ProviderCapabilities) -> bool:
     """Whether a provider's workspace info shows that it cannot serve the workspace.
 
@@ -487,7 +494,7 @@ def _session_prs_with_titles(
         {
             **entry.model_dump(),
             "title": titles.get(entry.url) or entry.title,
-            "provider_display": provider_display(entry.provider),
+            "provider_display": provider_display_for(entry.provider, entry.host),
             **(
                 {"state": status.state, "is_draft": status.is_draft}
                 if (status := statuses.get(entry.url)) is not None
@@ -619,7 +626,9 @@ def pr_info(
         info = _workspace_info(root)
         provider_id = info.get("provider")
         info["provider_display"] = (
-            provider_display(provider_id) if isinstance(provider_id, str) else None
+            provider_display_for(provider_id, _info_host(info))
+            if isinstance(provider_id, str)
+            else None
         )
         _add_workspace_repo(root, info)
         return info
@@ -685,7 +694,9 @@ def pr_info(
         _add_workspace_repo(root, info)
     provider_id = info.get("provider")
     info["provider_display"] = (
-        provider_display(provider_id) if isinstance(provider_id, str) else None
+        provider_display_for(provider_id, _info_host(info))
+        if isinstance(provider_id, str)
+        else None
     )
     return info
 
@@ -767,7 +778,7 @@ def _capable_target(
     reference = _selected_pr(session_id, pr_url)
     facet = _facet(reference.provider)
     if facet is None or not capable(offered_capabilities(facet, reference.host)):
-        display = provider_display(reference.provider)
+        display = provider_display_for(reference.provider, reference.host)
         kind = (
             f"{display['display_name']} {display['request_name']}"
             if display

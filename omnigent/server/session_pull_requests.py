@@ -223,6 +223,22 @@ def vouch(stored: SessionPullRequests | None, pr_url: object) -> dict[str, Any]:
     return {}
 
 
+def _reported_display(entry: dict[str, Any], provider_id: str) -> dict[str, str] | None:
+    """Return the labels a host reported for a PR, when they fit its provider's shape.
+
+    A host names a code host instance it serves this way; the server's registry
+    knows only the provider.
+    """
+    display = provider_display(provider_id)
+    reported = entry.get("provider_display")
+    if display is None or not isinstance(reported, dict) or reported.get("id") != provider_id:
+        return display
+    name = reported.get("display_name")
+    if not isinstance(name, str) or not name.strip() or len(name) > 64 or not name.isprintable():
+        return display
+    return {**display, "display_name": name.strip()}
+
+
 def entry_payload(entry: StoredPullRequest) -> dict[str, Any]:
     """Serialize a stored PR in the shape of a ``session.github.info`` ``prs`` entry.
 
@@ -258,7 +274,19 @@ def answer(info: dict[str, Any], stored: SessionPullRequests | None) -> dict[str
     """
     if "prs" not in info or stored is None:
         return info
-    updated = {**info, "prs": [entry_payload(entry) for entry in stored.entries]}
+    listed = info["prs"] if isinstance(info["prs"], list) else []
+    reported = {
+        item["url"]: item
+        for item in listed
+        if isinstance(item, dict) and isinstance(item.get("url"), str)
+    }
+    prs = []
+    for entry in stored.entries:
+        payload = entry_payload(entry)
+        if entry.url in reported:
+            payload["provider_display"] = _reported_display(reported[entry.url], entry.provider)
+        prs.append(payload)
+    updated = {**info, "prs": prs}
     selected = updated.get("selected_pr_url")
     if stored.synced and isinstance(selected, str) and stored.get(selected) is None:
         updated.pop("selected_pr_url")

@@ -26,7 +26,8 @@ DIAGNOSTIC_VARIABLES = frozenset(
 )
 # Every git trace setting, e.g. GIT_TRACE, GIT_TRACE_CURL or GIT_TRACE2_EVENT.
 GIT_TRACE_PREFIX = "GIT_TRACE"
-# GODEBUG is diagnostic only when it turns on Go's HTTP/2 request logging.
+# GODEBUG is diagnostic only when it turns on Go's HTTP/2 request logging;
+# ``http2debug=0`` turns it off and passes.
 GO_HTTP2_DEBUG = "http2debug"
 _NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -45,9 +46,18 @@ def _diagnostic_rule(name: str, value: str | None) -> str | None:
         return upper
     if upper.startswith(GIT_TRACE_PREFIX):
         return f"a {GIT_TRACE_PREFIX} setting"
-    if upper == "GODEBUG" and value is not None and GO_HTTP2_DEBUG in value.lower():
+    if upper == "GODEBUG" and value is not None and _turns_on_http2_debug(value):
         return f"GODEBUG with {GO_HTTP2_DEBUG}"
     return None
+
+
+def _turns_on_http2_debug(value: str) -> bool:
+    """Whether a ``GODEBUG`` value sets ``http2debug`` to anything but ``0``."""
+    for setting in value.split(","):
+        key, _, level = setting.partition("=")
+        if key.strip().lower() == GO_HTTP2_DEBUG and level.strip() != "0":
+            return True
+    return False
 
 
 def _refuse_diagnostic(where: str, rule: str) -> EnvironmentRuleError:

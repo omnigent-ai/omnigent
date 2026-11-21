@@ -72,8 +72,9 @@ from urllib.parse import quote
 
 from omnigent import config as _config
 from omnigent.git_providers import host_of
+from omnigent.git_providers.code_host_instances import CodeHostInstanceError
 from omnigent.host.identity_env import in_managed_sandbox
-from omnigent.runner import pr_resource
+from omnigent.runner import code_host_instances, pr_resource
 from omnigent.runner.git_providers import (
     COMMIT_OBJECT,
     MERGE_OPTIONS_OBJECT,
@@ -138,6 +139,7 @@ def _run(
     cwd: str,
     timeout: float,
     env: dict[str, str] | None = None,
+    log_as: str | None = None,
 ) -> tuple[int | None, str, str]:
     """Run a subprocess and capture its output, never raising.
 
@@ -146,6 +148,8 @@ def _run(
     :param timeout: Wall-clock cap in seconds.
     :param env: Full child environment, or ``None`` to inherit this process's
         (the default).
+    :param log_as: Names the run in failure logs instead of its command, cwd and
+        error text, for a CLI whose configured arguments mustn't reach logs.
     :returns: ``(returncode, stdout, stderr)``. ``returncode`` is ``None`` when
         the command could not run at all (spawn error / timeout), so callers can
         distinguish "ran and failed" from "never ran".
@@ -160,14 +164,20 @@ def _run(
             env=env,
         )
     except subprocess.TimeoutExpired:
-        _logger.warning(
-            "github_resource: %r in %s timed out after %.2fs",
-            argv,
-            cwd,
-            time.monotonic() - started,
-        )
+        if log_as is not None:
+            _logger.warning("github_resource: %s: timed out", log_as)
+        else:
+            _logger.warning(
+                "github_resource: %r in %s timed out after %.2fs",
+                argv,
+                cwd,
+                time.monotonic() - started,
+            )
         return None, "", "timed out"
     except OSError as exc:
+        if log_as is not None:
+            _logger.warning("github_resource: %s: could not start", log_as)
+            return None, "", "code host instance CLI could not start"
         _logger.warning("github_resource: %r in %s could not run: %s", argv, cwd, exc)
         return None, "", str(exc)
     return (
@@ -194,11 +204,26 @@ class GhInvocation:
     :ivar env: The child's whole environment, or ``None`` to inherit this process's.
     :ivar host: The code host the call is for, from :func:`gh_target_host_scope`;
         ``None`` when the step didn't name one.
+    :ivar log_as: For a code host instance, the provider, instance id and operation
+        that name the call in failure logs instead of its command; fixed when the
+        invocation is built, so a later change can't bring the command back.
     """
 
     argv: list[str]
     env: dict[str, str] | None
     host: str | None = None
+    log_as: str | None = None
+
+
+def _argv_host(argv: Sequence[str]) -> str | None:
+    """Return the host a ``gh`` argv names with ``--hostname``, ``-h`` or ``-R host/o/r``."""
+    for index, argument in enumerate(argv[:-1]):
+        value = argv[index + 1]
+        if argument in ("--hostname", "-h"):
+            return value.lower() or None
+        if argument in ("-R", "--repo") and value.count("/") == 2:
+            return value.split("/", 1)[0].lower() or None
+    return None
 
 
 @contextmanager
@@ -221,8 +246,22 @@ def _gh_invocation(argv: list[str], *, token: str | None, host: str | None) -> G
 
     :param argv: Arguments after ``gh``.
     :param token: A GitHub token to run this one call as a chosen account, or ``None``.
-    :param host: The code host the call is for, or ``None``; every host runs ``gh``.
+    :param host: The code host the call is for, from the step or the argv; or ``None``.
+        A configured code host
+        instance's host runs that instance's CLI in its pinned environment instead.
+    :raises CodeHostInstanceError: When the instance's CLI is no longer where it was.
     """
+    if code_host_instances.unavailable_instance_host(host):
+        raise CodeHostInstanceError("this runner couldn't load the instance serving the host")
+    instance = code_host_instances.instance_for_host(host) if host else None
+    if instance is not None and host is not None:
+        # The instance's CLI signs in by itself: no token, no inherited environment.
+        return GhInvocation(
+            argv=[*instance.runnable_command(), *argv],
+            env={**instance.environment(os.environ), "GH_HOST": host},
+            log_as=f"{instance.provider} code host instance {instance.id} {_operation(argv)}",
+            host=host,
+        )
     # In a managed sandbox the panel must authenticate as the connected owner via
     # the per-user hosts.yml that configure_host_gh writes — never an ambient
     # GH_TOKEN/GITHUB_TOKEN, which gh ranks ABOVE hosts.yml. Scrub them so a stray
@@ -261,8 +300,32 @@ def _gh(
         if timeout <= 0:
             _gh_timed_out.set(True)
             return None, "", "gh deadline exceeded"
-    invocation = _gh_invocation(argv, token=token, host=_gh_target_host.get())
-    result = _run(invocation.argv, cwd=cwd, timeout=timeout, env=invocation.env)
+    host = _gh_target_host.get() or _argv_host(argv)
+    try:
+        invocation = _gh_invocation(argv, token=token, host=host)
+    except CodeHostInstanceError:
+        instance = code_host_instances.instance_for_host(host)
+        _logger.warning(
+            "github_resource: %s code host instance %s %s: CLI unavailable",
+            instance.provider if instance else "github",
+            instance.id if instance else "unknown",
+            _operation(argv),
+        )
+        return None, "", "code host instance CLI unavailable"
+    log_as = invocation.log_as
+    if log_as is None and invocation.argv[:1] != ["gh"]:
+        # Only plain gh may be logged by its command; anything else stays unnamed.
+        log_as = f"github code host instance unknown {_operation(argv)}"
+    if log_as is None:
+        result = _run(invocation.argv, cwd=cwd, timeout=timeout, env=invocation.env)
+    else:
+        result = _run(
+            invocation.argv,
+            cwd=cwd,
+            timeout=timeout,
+            env=invocation.env,
+            log_as=log_as,
+        )
     if (
         deadline is not None
         and result[0] is None
@@ -271,6 +334,12 @@ def _gh(
     ):
         _gh_timed_out.set(True)
     return result
+
+
+def _operation(argv: list[str]) -> str:
+    """Name a ``gh`` call by its command words only, e.g. ``"pr view"`` or ``"api"``."""
+    words = [word for word in argv[:2] if re.fullmatch(r"[a-z][a-z-]*", word)]
+    return " ".join(words[:1] if words[:1] == ["api"] else words) or "command"
 
 
 @contextmanager
@@ -369,8 +438,12 @@ def _gh_signed_in_to_host(root: str, host: str) -> bool:
     """Whether ``gh`` reports a login on ``host``.
 
     Some setups sign ``gh`` in to an enterprise host only when a command names that host,
-    so a host missing from the global listing is asked about directly.
+    so a host missing from the global listing is asked about directly. A code host
+    instance's CLI signs in by itself, so it is asked who it reads as instead.
     """
+    if code_host_instances.instance_for_host(host) is not None:
+        rc, _, _ = _gh(["api", "user", "--hostname", host], cwd=root)
+        return rc == 0
     _, accounts = _list_accounts(root)
     if host in {account.get("host") for account in accounts}:
         return True
@@ -414,7 +487,12 @@ def _workspace_key(root: str) -> str | None:
 
 
 def _gh_auth_token(root: str, login: str, host: str = "github.com") -> str | None:
-    """Return *login*'s GitHub token via ``gh auth token --user`` (never logged)."""
+    """Return *login*'s GitHub token via ``gh auth token --user`` (never logged).
+
+    Never for a code host instance's host: its CLI's token stays inside it.
+    """
+    if code_host_instances.instance_for_host(host) is not None:
+        return None
     rc, out, _ = _gh(["auth", "token", "--user", login, "-h", host], cwd=root)
     if rc != 0:
         return None
@@ -1169,7 +1247,8 @@ def _repo_argument(ref: PullRequestRef) -> str:
 
 
 def _pr_token(root: str, reference: PullRequestRef) -> str | None:
-    if _in_sandbox():
+    # An instance's CLI signs in by itself; its token is never asked for.
+    if _in_sandbox() or code_host_instances.instance_for_host(reference.host) is not None:
         return None
     login = _config.github_account_preference(_repo_argument(reference))
     if login:
@@ -1202,7 +1281,7 @@ def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
     info: dict[str, Any] = {
         "object": "session.github.info",
         "available": True,
-        "gh_available": shutil.which("gh") is not None,
+        "gh_available": _cli_available_for(reference.host),
         "authenticated": False,
         "pr": None,
         "repo": {"name_with_owner": reference.repository, "host": reference.host},
@@ -1210,7 +1289,9 @@ def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
     }
     if not info["gh_available"]:
         return info
-    _, accounts = _list_accounts(root)
+    # An instance's CLI signs in by itself: there are no stored accounts to list.
+    serving = code_host_instances.instance_for_host(reference.host) is not None
+    _, accounts = (False, []) if serving else _list_accounts(root)
     info["accounts"] = [a for a in accounts if a.get("host") == reference.host]
     preferred = _config.github_account_preference(_repo_argument(reference))
     info["selected_account"] = preferred or next(
@@ -1261,7 +1342,16 @@ def _pr_title(data: dict[str, Any] | None) -> str | None:
 
 
 def _gh_installed() -> bool:
-    """Whether the ``gh`` CLI is on ``PATH``."""
+    """Whether some PR's titles can be read: ``gh`` is on ``PATH``, or an instance is served."""
+    return shutil.which("gh") is not None or bool(
+        code_host_instances.active_code_host_instances().instances
+    )
+
+
+def _cli_available_for(host: str | None) -> bool:
+    """Whether a CLI can read PRs on *host*: its instance's, or ``gh`` on ``PATH``."""
+    if code_host_instances.instance_for_host(host) is not None:
+        return True
     return shutil.which("gh") is not None
 
 

@@ -56,25 +56,36 @@ def test_diagnostic_variables_never_reach_a_run_whatever_is_passed_in() -> None:
     assert environment == {"PATH": DEFAULT_PATH}
 
 
-def test_settings_that_print_nothing_still_reach_a_run() -> None:
+@pytest.mark.parametrize("godebug", ["netdns=cgo", "netdns=cgo,http2debug=0", "http2debug=0"])
+def test_settings_that_print_nothing_still_reach_a_run(godebug: str) -> None:
     passed, fixed = check_environment(
         ["GODEBUG", "GIT_CURL_FTP_NO_EPSV"], {"BUILD_VERBOSE": "1"}, instance_id="internal"
     )
-    host = {"GODEBUG": "netdns=cgo", "GIT_CURL_FTP_NO_EPSV": "1"}
+    host = {"GODEBUG": godebug, "GIT_CURL_FTP_NO_EPSV": "1"}
 
     assert pinned_environment(passed, fixed, host) == {
-        "PATH": DEFAULT_PATH,
-        "GODEBUG": "netdns=cgo",
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "GODEBUG": godebug,
         "GIT_CURL_FTP_NO_EPSV": "1",
         "BUILD_VERBOSE": "1",
     }
+
+
+def test_a_fixed_godebug_that_turns_http2_logging_off_is_kept() -> None:
+    passed, fixed = check_environment(
+        [], {"GODEBUG": "netdns=cgo,http2debug=0"}, instance_id="internal"
+    )
+
+    assert pinned_environment(passed, fixed, {})["GODEBUG"] == "netdns=cgo,http2debug=0"
 
 
 def test_no_config_passes_nothing_but_the_pinned_path() -> None:
     passed, fixed = check_environment(None, None, instance_id="internal")
 
     assert (passed, fixed) == ((), {})
-    assert pinned_environment(passed, fixed, HOST_ENVIRONMENT) == {"PATH": DEFAULT_PATH}
+    assert pinned_environment(passed, fixed, HOST_ENVIRONMENT) == {
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"
+    }
 
 
 @pytest.mark.parametrize("name", sorted(TOKEN_VARIABLES))
@@ -150,7 +161,9 @@ def test_a_diagnostic_variable_is_refused_naming_the_rule(
     )
 
 
-@pytest.mark.parametrize("value", ["http2debug=1", "netdns=go,HTTP2DEBUG=2"])
+@pytest.mark.parametrize(
+    "value", ["http2debug=1", "netdns=go,HTTP2DEBUG=2", "http2debug=", "http2debug=0,http2debug=2"]
+)
 def test_a_fixed_godebug_that_logs_http2_is_refused_without_its_value(value: str) -> None:
     with pytest.raises(EnvironmentRuleError) as refused:
         check_environment([], {"GODEBUG": value}, instance_id="internal")
