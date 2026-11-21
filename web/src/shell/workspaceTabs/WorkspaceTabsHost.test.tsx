@@ -90,6 +90,22 @@ describe("WorkspaceTabsHost", () => {
     expect(captured.panel?.inert).toBe(false);
   });
 
+  it("keeps focus out while any change to inert is deferred, also with the rail still open", async () => {
+    // A rail dragged to no width goes inert while it stays open.
+    const { rerender } = host({ open: true, inert: false });
+    expect(captured.panel?.inertPending).toBe(false);
+    rerender({ open: true, inert: true });
+    expect(captured.panel?.inert).toBe(false);
+    expect(captured.panel?.inertPending).toBe(true);
+    await act(async () => {
+      await new Promise((resolve) => {
+        requestAnimationFrame(() => resolve(undefined));
+      });
+    });
+    await vi.waitFor(() => expect(captured.panel?.inert).toBe(true));
+    expect(captured.panel?.inertPending).toBe(false);
+  });
+
   it("asks in the Close shell dialog before a shell's tab closes, then ends it", async () => {
     const user = userEvent.setup();
     host();

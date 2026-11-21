@@ -69,6 +69,7 @@ export function WorkspaceTabsHost({
         {...panelProps}
         {...historyProps}
         inert={inertNow && inertLater}
+        inertPending={inertNow && !inertLater}
         confirmCloseShell={shellClose.confirmCloseShell}
         endShell={shellClose.endShell}
       />
