@@ -169,7 +169,8 @@ struct WatchClient: Sendable {
   private static let session: URLSession = {
     let configuration = URLSessionConfiguration.ephemeral
     configuration.httpShouldSetCookies = false
-    return URLSession(configuration: configuration)
+    return URLSession(
+      configuration: configuration, delegate: WatchRedirectBlocker(), delegateQueue: nil)
   }()
 
   let credentials: WatchCredentials
@@ -214,5 +215,16 @@ struct WatchClient: Sendable {
     case 401, 403: throw WatchError.signedOut
     case let code: throw WatchError.status(code)
     }
+  }
+}
+
+/// API redirects must not carry scoped cookies to another host or path.
+private final class WatchRedirectBlocker: NSObject, URLSessionTaskDelegate {
+  func urlSession(
+    _ session: URLSession, task: URLSessionTask,
+    willPerformHTTPRedirection response: HTTPURLResponse,
+    newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void
+  ) {
+    completionHandler(nil)
   }
 }

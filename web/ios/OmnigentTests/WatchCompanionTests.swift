@@ -55,6 +55,63 @@ final class WatchCompanionTests: XCTestCase {
         forHTTPHeaderField: "X-Databricks-Omnigent-Slice-Key"))
   }
 
+  func testClientRejectsRedirectsWithoutForwardingCredentials() async throws {
+    let destination = try MockHTTPServer(requestHandler: { _ in
+      XCTFail("API redirects must not forward requests or session cookies")
+      return (200, [:], Data(#"{"data":[]}"#.utf8))
+    })
+    for status in [301, 302, 303, 307, 308] {
+      let source = try MockHTTPServer(requestHandler: { request in
+        XCTAssertEqual(request.headers["cookie"], "session=test")
+        return (status, ["location": "http://localhost:\(destination.port)/sessions"], Data())
+      })
+      let client = WatchClient(
+        credentials: WatchCredentials(
+          apiURL: URL(string: "http://127.0.0.1:\(source.port)/v1")!, cookie: "session=test"))
+      for method in ["GET", "POST"] {
+        do {
+          if method == "GET" {
+            let _: WatchPage<WatchSession> = try await client.get("sessions")
+          } else {
+            try await client.post(
+              "sessions/session/elicitations/prompt/resolve", ["action": "accept"], host: nil)
+          }
+          XCTFail("Expected \(method) to reject HTTP \(status)")
+        } catch {
+          XCTAssertEqual(error as? WatchError, .status(status))
+        }
+      }
+    }
+  }
+
+  func testClientRejectsRedirectsAfterWrongReplicaRetry() async throws {
+    let originalRequest = expectation(description: "request with the stale host key")
+    let retriedRequest = expectation(description: "retry without the host key")
+    let server = try MockHTTPServer(requestHandler: { request in
+      guard URLComponents(string: request.path)?.path == "/v1/sessions" else {
+        XCTFail("The retry must not follow a redirect outside the cookie's path")
+        return (200, [:], Data(#"{"data":[]}"#.utf8))
+      }
+      XCTAssertEqual(request.headers["cookie"], "session=test")
+      if request.headers["x-databricks-omnigent-slice-key"] != nil {
+        originalRequest.fulfill()
+        return (400, [:], Data(#"{"error":"wrong_replica"}"#.utf8))
+      }
+      retriedRequest.fulfill()
+      return (307, ["location": "/outside-cookie-path"], Data())
+    })
+    let client = WatchClient(
+      credentials: WatchCredentials(
+        apiURL: URL(string: "http://127.0.0.1:\(server.port)/v1")!, cookie: "session=test"))
+    do {
+      let _: WatchPage<WatchSession> = try await client.get("sessions", host: "stale-host")
+      XCTFail("Expected the retry to reject the redirect outside the cookie's path")
+    } catch {
+      XCTAssertEqual(error as? WatchError, .status(307))
+    }
+    await fulfillment(of: [originalRequest, retriedRequest], timeout: 2)
+  }
+
   func testSessionsGroupByProjectThenTheRest() throws {
     let json = """
       {"data": [
