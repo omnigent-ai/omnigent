@@ -1,0 +1,259 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { cleanup, render, screen } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
+import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
+
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import type { Conversation, useMoveToProject } from "@/hooks/useConversations";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO, SHARING_OFF_REASON } from "@/lib/capabilities";
+import { clearSessionMuteState, MUTED_LABEL_KEY } from "@/lib/sessionMute";
+import { PinCapacityContext } from "@/lib/sidebarConfig";
+import { isCommandListed } from "@/store/paletteCommands";
+
+import { ConversationMenuItems } from "../Sidebar";
+import {
+  OWNER_ONLY_REASONS,
+  PIN_CAPACITY_REASON,
+  PIN_SAVING_REASON,
+  type SessionCommandFacts,
+  sessionCommand,
+  sessionCommands,
+} from "./model";
+
+const FACTS: SessionCommandFacts = {
+  owner: true,
+  archived: false,
+  pinned: false,
+  indentedSibling: false,
+  atPinCapacity: false,
+  pinSaving: false,
+  unread: false,
+  muted: false,
+  canCreateAutomation: true,
+  currentProject: null,
+  stoppable: true,
+  server: { singleUser: false, sharingOff: false, siblingSessions: true, sessionMute: true },
+};
+
+const listed = (facts: SessionCommandFacts) =>
+  sessionCommands(facts)
+    .filter((command) => isCommandListed(command.availability))
+    .map((command) => command.label);
+
+const reasonOf = (facts: SessionCommandFacts, id: Parameters<typeof sessionCommand>[1]) => {
+  const { availability } = sessionCommand(facts, id);
+  return availability.available ? undefined : availability.reason;
+};
+
+describe("sessionCommands", () => {
+  it("lists the owner's actions in the row menu's order", () => {
+    expect(listed(FACTS)).toEqual([
+      "Add nested agent",
+      "Pin",
+      "Share",
+      "Fork",
+      "Rename",
+      "Mute",
+      "Mark as unread",
+      "Create automation",
+      "Add to project",
+      "Stop session",
+      "Archive",
+      "Delete",
+    ]);
+  });
+
+  it("greys the owner's actions for someone it's shared with, who leaves instead of deleting", () => {
+    const shared = { ...FACTS, owner: false, canCreateAutomation: false };
+    expect(listed(shared)).toEqual([
+      "Pin",
+      "Share",
+      "Fork",
+      "Rename",
+      "Mute",
+      "Mark as unread",
+      "Stop session",
+      "Archive",
+      "Leave session",
+    ]);
+    expect(reasonOf(shared, "share")).toBe(OWNER_ONLY_REASONS.share);
+    expect(reasonOf(shared, "rename")).toBe(OWNER_ONLY_REASONS.rename);
+    expect(reasonOf(shared, "stop")).toBe(OWNER_ONLY_REASONS.stop);
+    expect(reasonOf(shared, "archive")).toBe(OWNER_ONLY_REASONS.archive);
+  });
+
+  it("offers Unarchive on an archived session, and nothing to pin or nest", () => {
+    const archived = { ...FACTS, archived: true };
+    const labels = listed(archived);
+    expect(labels).toContain("Unarchive");
+    expect(labels).not.toContain("Archive");
+    expect(labels).not.toContain("Pin");
+    expect(labels).not.toContain("Add nested agent");
+  });
+
+  it("says why Pin can't run while a pin saves or no slot is left", () => {
+    expect(reasonOf({ ...FACTS, pinSaving: true }, "pin")).toBe(PIN_SAVING_REASON);
+    expect(reasonOf({ ...FACTS, atPinCapacity: true }, "pin")).toBe(PIN_CAPACITY_REASON);
+    // Unpinning frees a slot, so a full set of pins still allows it.
+    expect(sessionCommand({ ...FACTS, pinned: true, atPinCapacity: true }, "unpin")).toMatchObject({
+      availability: { available: true },
+    });
+  });
+
+  it("lets a muted session be marked read but not flagged unread", () => {
+    expect(listed({ ...FACTS, muted: true })).toEqual(expect.arrayContaining(["Unmute"]));
+    expect(listed({ ...FACTS, muted: true })).not.toContain("Mark as unread");
+    expect(listed({ ...FACTS, muted: true, unread: true })).toContain("Mark as read");
+  });
+
+  it("names the move after the project the session is filed in", () => {
+    expect(sessionCommand({ ...FACTS, currentProject: "Payments" }, "move-to-project").label).toBe(
+      "Move session",
+    );
+  });
+
+  it("puts sharing turned off ahead of the viewer's own reason", () => {
+    expect(
+      reasonOf({ ...FACTS, owner: false, server: { ...FACTS.server, sharingOff: true } }, "share"),
+    ).toBe(SHARING_OFF_REASON);
+  });
+
+  it("leaves Share and Leave out with one user, who only deletes", () => {
+    const solo = { ...FACTS, owner: false, server: { ...FACTS.server, singleUser: true } };
+    expect(listed(solo)).not.toContain("Share");
+    expect(listed(solo)).not.toContain("Leave session");
+    expect(listed(solo)).toContain("Delete");
+  });
+
+  it("marks only Stop, Delete and Leave as destructive, and the dialogs as moving focus", () => {
+    const commands = sessionCommands(FACTS);
+    expect(commands.filter((command) => command.destructive).map((command) => command.id)).toEqual([
+      "stop",
+      "delete",
+      "leave",
+    ]);
+    expect(sessionCommand(FACTS, "pin").opensDialog).toBe(false);
+    expect(sessionCommand(FACTS, "archive").opensDialog).toBe(true);
+  });
+});
+
+const conversation: Conversation = {
+  id: "conv_row",
+  object: "conversation",
+  title: "Row session",
+  created_at: 0,
+  updated_at: 0,
+  labels: {},
+  permission_level: null,
+};
+
+/** The row menu's items for `facts`: their names, and which of them are greyed. */
+function rowMenu(facts: SessionCommandFacts) {
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  onTestFinished(() => queryClient.clear());
+  const labels: Record<string, string> = facts.muted ? { [MUTED_LABEL_KEY]: "1" } : {};
+  const row: Conversation = { ...conversation, labels };
+  queryClient.setQueryData(["conversation-backfill", row.id], row);
+  const noop = vi.fn();
+  render(
+    <QueryClientProvider client={queryClient}>
+      <CapabilitiesProvider
+        info={{
+          ...FALLBACK_SERVER_INFO,
+          session_mute: facts.server.sessionMute,
+          sibling_sessions: facts.server.siblingSessions,
+        }}
+      >
+        <PinCapacityContext.Provider value={facts.atPinCapacity}>
+          <MemoryRouter>
+            <TooltipProvider>
+              <DropdownMenu open>
+                <DropdownMenuTrigger>Actions</DropdownMenuTrigger>
+                <DropdownMenuContent>
+                  <ConversationMenuItems
+                    conversation={row}
+                    isPinned={facts.pinned}
+                    isArchived={facts.archived}
+                    isOwner={facts.owner}
+                    sharingOff={facts.server.sharingOff}
+                    isSingleUser={facts.server.singleUser}
+                    canStop={facts.stoppable}
+                    canMarkUnread={!facts.unread}
+                    currentProject={facts.currentProject}
+                    onTogglePinned={noop}
+                    onMarkUnread={noop}
+                    onMarkRead={noop}
+                    moveToProject={{} as ReturnType<typeof useMoveToProject>}
+                    setShareOpen={noop}
+                    setForkOpen={noop}
+                    canCreateAutomation={facts.canCreateAutomation}
+                    setAutomationOpen={noop}
+                    setIsEditing={noop}
+                    setStopOpen={noop}
+                    setDeleteOpen={noop}
+                    setLeaveOpen={noop}
+                    setMenuOpen={noop}
+                    runArchive={noop}
+                  />
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </TooltipProvider>
+          </MemoryRouter>
+        </PinCapacityContext.Provider>
+      </CapabilitiesProvider>
+    </QueryClientProvider>,
+  );
+  const items = screen.getAllByRole("menuitem");
+  const name = (item: HTMLElement) => item.textContent?.trim() ?? "";
+  return {
+    names: items.map(name),
+    greyed: items.filter((item) => item.hasAttribute("data-disabled")).map(name),
+  };
+}
+
+describe("sessionCommands against the sidebar row's menu", () => {
+  afterEach(() => {
+    cleanup();
+    clearSessionMuteState();
+  });
+
+  it.each([
+    ["the owner's session", FACTS],
+    ["a session shared with the viewer", { ...FACTS, owner: false, canCreateAutomation: false }],
+    ["an archived session", { ...FACTS, archived: true }],
+    ["a pinned, unread session", { ...FACTS, pinned: true, unread: true }],
+    ["a full set of pins", { ...FACTS, atPinCapacity: true }],
+    ["a muted session", { ...FACTS, muted: true }],
+    ["a muted, unread session", { ...FACTS, muted: true, unread: true }],
+    [
+      "a filed session that isn't running",
+      { ...FACTS, currentProject: "Payments", stoppable: false },
+    ],
+    [
+      "a single-user server without nested agents or mute",
+      {
+        ...FACTS,
+        server: { singleUser: true, sharingOff: false, siblingSessions: false, sessionMute: false },
+      },
+    ],
+    [
+      "a server with sharing turned off",
+      { ...FACTS, owner: false, server: { ...FACTS.server, sharingOff: true } },
+    ],
+  ] as const)("lists and greys what the row menu does for %s", (_name, facts) => {
+    const commands = sessionCommands(facts).filter((command) =>
+      isCommandListed(command.availability),
+    );
+    const menu = rowMenu(facts);
+    expect(commands.map((command) => command.label)).toEqual(menu.names);
+    expect(
+      commands.filter((command) => !command.availability.available).map((command) => command.label),
+    ).toEqual(menu.greyed);
+  });
+});
