@@ -7,13 +7,17 @@ import { useSyncExternalStore } from "react";
 import {
   closeTerminalPane,
   replaceTerminalLayoutKey,
+  splitTerminalLayout,
+  terminalLayoutGeometry,
   terminalLayoutKeys,
+  type TerminalLayout,
+  type TerminalPanePlacement,
   type TerminalPaneSide,
   type TerminalRect,
   type TerminalSplitAxis,
 } from "@/lib/paneSplitLayout";
 
-import { type PaneDragOutside, paneDropArea, paneDropSpot, splitPanesRoot } from "./paneMove";
+import { type PaneDragOutside, paneDropSpot, splitPanesRoot } from "./paneMove";
 import { NO_ROOM_MESSAGE } from "./paneSizing";
 import { requestTerminalFocus } from "./terminalFocusRequest";
 import {
@@ -236,7 +240,7 @@ export function openPaneInSplit(
 export interface AppPaneDrop {
   targetKey: string;
   side: TerminalPaneSide;
-  /** The half of the target the tab would take, in percent of the panes' view. */
+  /** Where the tab's pane would sit once dropped, in percent of the panes' view. */
   area: TerminalRect;
 }
 
@@ -265,8 +269,27 @@ export function appPaneDropAt(
   if (!spot) return null;
   const { axis, placement } = splitOfSide(spot.side);
   if (!roomToSplit(target, spot.targetKey, axis, placement, agentKey)) return null;
-  const area = paneDropArea(layout, spot.targetKey, spot.side);
+  const area = insertedPaneArea(layout, spot.targetKey, axis, placement);
   return area ? { ...spot, area } : null;
+}
+
+// Stands for the dropped tab's pane while working out where it would land.
+const DROPPED_PANE = "\u0000dropped";
+
+/**
+ * Where a pane inserted beside `targetKey` would sit, in percent of the view. A drop inserts as a
+ * split does, keeping the other panes' proportions, so the preview is that layout's new pane, not
+ * half of the target.
+ */
+function insertedPaneArea(
+  layout: TerminalLayout,
+  targetKey: string,
+  axis: TerminalSplitAxis,
+  placement: TerminalPanePlacement,
+): TerminalRect | null {
+  const inserted = splitTerminalLayout(layout, targetKey, DROPPED_PANE, axis, placement);
+  const pane = terminalLayoutGeometry(inserted).panes.find((each) => each.key === DROPPED_PANE);
+  return pane ? { left: pane.left, top: pane.top, width: pane.width, height: pane.height } : null;
 }
 
 /** Show workspace tab `tabId` as a pane on `drop`'s side of its target, taking focus. */

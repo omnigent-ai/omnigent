@@ -22,6 +22,8 @@ import {
 } from "./appPanes";
 import { toggleZoomedPane } from "./terminalPaneZoom";
 import { mainSplitTarget } from "./terminalSplitTarget";
+import { terminalLayoutGeometry } from "@/lib/paneSplitLayout";
+
 import { readPaneSplit, updatePaneSplit } from "./paneSplitStore";
 
 const AGENT = "terminal:terminal_claude_main";
@@ -190,6 +192,29 @@ describe("dropping a sidebar tab on the panes", () => {
     setPendingAppPaneDrop(conversationId, bottom);
     expect(appPaneDropAt(conversationId, { x: 850, y: 544 }, AGENT)?.side).toBe("bottom");
     setPendingAppPaneDrop(conversationId, null);
+  });
+
+  it("previews where a tab dropped beside a split's pane lands, as the split keeps proportions", () => {
+    const conversationId = nextConversation();
+    placePanes(conversationId);
+    updatePaneSplit(conversationId, () => ({
+      layout: { axis: "columns", ratio: 0.5, children: [AGENT, SHELL] },
+      focusedKey: AGENT,
+    }));
+    // Right of the right pane: the row grows to thirds, so the tab takes the last third.
+    const drop = appPaneDropAt(conversationId, { x: 980, y: 250 }, AGENT);
+    expect(drop?.targetKey).toBe(SHELL);
+    expect(drop?.side).toBe("right");
+    expect(drop?.area.left).toBeCloseTo(200 / 3);
+    expect(drop?.area.width).toBeCloseTo(100 / 3);
+    expect(dropTabAsPane(conversationId, "files", drop!, AGENT)).toBe(true);
+    const landed = terminalLayoutGeometry(readPaneSplit(conversationId)!.layout).panes.find(
+      (pane) => pane.key === "app:files",
+    );
+    expect(landed?.left).toBeCloseTo(drop!.area.left);
+    expect(landed?.width).toBeCloseTo(drop!.area.width);
+    expect(landed?.top).toBe(drop!.area.top);
+    expect(landed?.height).toBe(drop!.area.height);
   });
 
   it("offers no spot while a pane is maximized", () => {
