@@ -16,7 +16,7 @@ import {
   useSortable,
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
-import { GripVerticalIcon, PlusIcon, Trash2Icon } from "lucide-react";
+import { GripVerticalIcon, PlusIcon, Trash2Icon, Undo2Icon } from "lucide-react";
 import { customAlphabet } from "nanoid";
 import { Button } from "@/components/ui/button";
 import {
@@ -147,12 +147,11 @@ function StageEditor({
     ? "Give every stage a name."
     : new Set(names).size !== names.length
       ? "Stage names must be unique."
-      : removed.some(
-            (stage) =>
-              occupied.has(stage.id) && !stages.some((target) => target.id === moves[stage.id]),
-          )
-        ? "Choose where tickets from each removed stage should move."
-        : null;
+      : null;
+  const missingMoveDestination = removed.some(
+    (stage) => occupied.has(stage.id) && !stages.some((target) => target.id === moves[stage.id]),
+  );
+  const canSave = !validation && !missingMoveDestination;
   const change = (id: string, fields: Partial<TicketStage>) =>
     setStages((current) =>
       current.map((stage) => (stage.id === id ? { ...stage, ...fields } : stage)),
@@ -162,7 +161,7 @@ function StageEditor({
       className="space-y-4"
       onSubmit={(event) => {
         event.preventDefault();
-        if (pending || validation) return;
+        if (pending || !canSave) return;
         onSave({
           stages: stages.map((stage, index) => ({
             ...stage,
@@ -233,12 +232,13 @@ function StageEditor({
             </p>
             <Button
               type="button"
-              variant="ghost"
+              variant="outline"
               size="sm"
               aria-label={`Undo removal of ${stage.name}`}
               disabled={pending || stages.length >= 20}
               onClick={() => setStages([...stages, stage])}
             >
+              <Undo2Icon aria-hidden />
               Undo
             </Button>
           </div>
@@ -280,7 +280,7 @@ function StageEditor({
         <Button type="button" variant="ghost" disabled={pending} onClick={onClose}>
           Cancel
         </Button>
-        <Button type="submit" loading={pending} disabled={!!validation}>
+        <Button type="submit" loading={pending} disabled={!canSave}>
           Save stages
         </Button>
       </DialogFooter>
