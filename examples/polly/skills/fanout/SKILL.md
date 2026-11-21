@@ -57,6 +57,15 @@ dependency).
 - A sub-agent that returns a dark or failing result: don't re-prompt it in a
   loop — re-dispatch a fresh implementation sub-agent in a clean worktree, or
   escalate to the user.
+- Subscription usage preemption: if `subscription_usage_guard` denies a
+  `claude_code` or `codex` dispatch (5-hour `session` or `weekly` window at or
+  above threshold) or an in-flight worker returns a `[System: Subscription usage
+  limit reached ...]` checkpoint, record any checkpointed branch, worktree path,
+  and commit SHA in `.polly/registry.json` and leave that `.worktrees/<task_id>`
+  intact. Reroute remaining independent subtasks or cross-reviews to another
+  available unthrottled vendor when possible; otherwise pause immediately
+  (never schedule a `sys_timer_set` auto-resume) and report completed PRs,
+  checkpointed worktrees, and exact window `resets_at` timestamps to the human.
 - Because polly never merges, cross-PR conflicts surface when the human merges,
   not here. Keeping each parallel task's file scope disjoint is what keeps that
   rare — honor it.

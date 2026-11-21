@@ -42,7 +42,7 @@ from collections.abc import Awaitable, Callable
 from typing import Protocol, cast
 
 from omnigent.policies.base import Policy
-from omnigent.policies.builtins.orchestration import spawn_bounds
+from omnigent.policies.builtins.orchestration import spawn_bounds, subscription_usage_guard
 from omnigent.policies.builtins.safety import detect_loop, max_tool_calls_per_session
 from omnigent.policies.schema import PolicyEvent
 from omnigent.policies.types import EvaluationContext, PolicyResult
@@ -90,12 +90,17 @@ class FunctionPolicy(Policy):
         (dict-form spec).
     """
 
+    runtime_state_keys: frozenset[str] = frozenset()
+    _needs_sub_agent_providers: bool = False
+    _sub_agent_providers: dict[str, str | None] | None = None
+
     def __init__(
         self,
         spec: FunctionPolicySpec,
         callable_obj: object,
         *,
         runtime_state_keys: frozenset[str] = frozenset(),
+        needs_sub_agent_providers: bool = False,
     ) -> None:
         """
         Wrap a resolved callable in the Policy contract.
@@ -110,6 +115,18 @@ class FunctionPolicy(Policy):
         self._is_async = inspect.iscoroutinefunction(self._callable)
         self._arity = _callable_arity(callable_obj)
         self._config: dict[str, str] = dict(spec.config) if spec.config else {}
+        self._needs_sub_agent_providers = needs_sub_agent_providers
+        self._sub_agent_providers: dict[str, str | None] | None = None
+
+    def bind_agent_spec(self, agent_spec: object | None) -> None:
+        """Attach sub-agent provider metadata from *agent_spec* when needed by this policy."""
+        if not getattr(self, "_needs_sub_agent_providers", False) or agent_spec is None:
+            return
+        from omnigent.host.usage_limits import subscription_providers_for_spec
+
+        resolved = subscription_providers_for_spec(agent_spec)
+        if resolved is not None:
+            self._sub_agent_providers = dict(resolved)
 
     async def evaluate(
         self,
@@ -179,6 +196,11 @@ class FunctionPolicy(Policy):
             ``{"result": ..., "reason": ...}`` dict).
         """
         event = _build_event(ctx)
+        sub_agent_providers = getattr(self, "_sub_agent_providers", None)
+        if sub_agent_providers is not None:
+            raw_ctx = event.get("context")
+            if isinstance(raw_ctx, dict) and "sub_agent_providers" not in raw_ctx:
+                raw_ctx["sub_agent_providers"] = dict(sub_agent_providers)
         args: tuple[object, ...]
         if self._arity >= 2:
             args = (event, self._config)
@@ -339,7 +361,12 @@ def resolve_function_policy(spec: FunctionPolicySpec) -> FunctionPolicy:
         )
         if target is factory
     )
-    return FunctionPolicy(spec, callable_obj, runtime_state_keys=runtime_state_keys)
+    return FunctionPolicy(
+        spec,
+        callable_obj,
+        runtime_state_keys=runtime_state_keys,
+        needs_sub_agent_providers=(target is subscription_usage_guard),
+    )
 
 
 def _resolve_dotted_path(path: str) -> object:

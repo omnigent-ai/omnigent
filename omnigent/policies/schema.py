@@ -236,6 +236,9 @@ class EventContext(TypedDict, total=False):
     # RESPONSE policies skip only explicit False for completion actions;
     # None preserves callers that do not distinguish segments.
     turn_final: bool | None
+    # Sub-agent name -> subscription provider ("claude" | "codex") or None
+    # when the sub-agent uses a non-subscription / API-key / mock harness.
+    sub_agent_providers: dict[str, str | None]
 
 
 class PolicyEvent(TypedDict, total=False):
