@@ -275,6 +275,23 @@ describe("neighborTerminalPane", () => {
     expect(neighborTerminalPane(twoByOne, "agent", "right")).toBe("a");
   });
 
+  it("treats edges flush within rounding as touching, so the overlap still decides", () => {
+    // p | q over s on the left, f on the right: q's right edge lands at 0.6 only to rounding.
+    const layout: TerminalLayout = {
+      axis: "columns",
+      ratio: 0.6,
+      children: [
+        {
+          axis: "rows",
+          ratio: 0.7,
+          children: [{ axis: "columns", ratio: 5 / 12, children: ["p", "q"] }, "s"],
+        },
+        "f",
+      ],
+    };
+    expect(neighborTerminalPane(layout, "f", "left")).toBe("q");
+  });
+
   it("measures distance in the view's real proportions", () => {
     // a | b over a wide c: from c upward, a and b overlap equally; layout order decides.
     const layout: TerminalLayout = {
@@ -283,7 +300,7 @@ describe("neighborTerminalPane", () => {
       children: [{ axis: "columns", ratio: 0.5, children: ["a", "b"] }, "c"],
     };
     expect(neighborTerminalPane(layout, "c", "up", 3)).toBe("a");
-    // With nothing beside, the nearest pane wins once widths are scaled by the aspect.
+    // A wide view scales every candidate alike, so the pane directly above still wins.
     const diagonal: TerminalLayout = {
       axis: "columns",
       ratio: 0.5,

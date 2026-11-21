@@ -355,6 +355,30 @@ function intervalRelation(start: number, end: number, otherStart: number, otherE
   return { overlap: Math.max(0, overlap), separation: Math.max(0, -overlap) };
 }
 
+interface PaneEdges {
+  left: number;
+  right: number;
+  top: number;
+  bottom: number;
+}
+
+/** How far ``pane`` lies past ``from``'s edge in ``direction``; negative where they overlap. */
+function gapToward(direction: TerminalPaneDirection, from: PaneEdges, pane: PaneEdges): number {
+  switch (direction) {
+    case "right":
+      return pane.left - from.right;
+    case "left":
+      return from.left - pane.right;
+    case "down":
+      return pane.top - from.bottom;
+    case "up":
+      return from.top - pane.bottom;
+  }
+}
+
+const compareLengths = (a: number, b: number): number =>
+  Math.abs(a - b) <= GEOMETRY_EPSILON ? 0 : a - b;
+
 /**
  * The pane next to ``fromKey`` in ``direction``, or null at that edge (focus
  * doesn't wrap). Panes beside it along the other axis come first, then the
@@ -381,14 +405,7 @@ export function neighborTerminalPane(
   const horizontal = directionAxis(direction) === "columns";
   const candidates = panes.flatMap((pane) => {
     if (pane.key === fromKey) return [];
-    const gap =
-      direction === "right"
-        ? pane.left - from.right
-        : direction === "left"
-          ? from.left - pane.right
-          : direction === "down"
-            ? pane.top - from.bottom
-            : from.top - pane.bottom;
+    const gap = gapToward(direction, from, pane);
     if (gap < -GEOMETRY_EPSILON) return [];
     const across = horizontal
       ? intervalRelation(from.top, from.bottom, pane.top, pane.bottom)
@@ -401,12 +418,13 @@ export function neighborTerminalPane(
       { ...pane, beside: across.overlap > GEOMETRY_EPSILON, distance, ...across, centerOffset },
     ];
   });
+  // Lengths within rounding of each other are equal, so flush edges fall through to the overlap.
   candidates.sort(
     (a, b) =>
       Number(b.beside) - Number(a.beside) ||
-      a.distance - b.distance ||
-      b.overlap - a.overlap ||
-      a.centerOffset - b.centerOffset ||
+      compareLengths(a.distance, b.distance) ||
+      compareLengths(b.overlap, a.overlap) ||
+      compareLengths(a.centerOffset, b.centerOffset) ||
       a.order - b.order,
   );
   return candidates[0]?.key ?? null;
