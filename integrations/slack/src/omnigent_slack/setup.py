@@ -43,6 +43,8 @@ AGENT_BLOCK = "agent_block"
 AGENT_ACTION = "agent_select"
 HOST_BLOCK = "host_block"
 HOST_ACTION = "host_select"
+MCP_BLOCK = "mcp_block"
+MCP_ACTION = "mcp_select"
 WORKSPACE_BLOCK = "workspace_block"
 WORKSPACE_ACTION = "workspace_input"
 
@@ -366,7 +368,9 @@ class SetupFlow:
             )
             return
 
-        await self._advance_to_select(ack, omnigent, server_url, validated)
+        await self._advance_to_select(
+            ack, omnigent, server_url, validated, team_id=team_id, user_id=user_id
+        )
 
     async def _advance_to_select(
         self,
@@ -374,12 +378,19 @@ class SetupFlow:
         omnigent: OmnigentClient,
         server_url: str,
         validated: ValidatedServer,
+        *,
+        team_id: str | None = None,
+        user_id: str | None = None,
     ) -> None:
         """Advance the modal to agent/host/workspace selection.
 
         ``ack`` is always an :class:`_ViewUpdateAck` (setup is driven via
         ``views_update`` now that there's no URL-submit event), taking
         ``response_action='update'`` / ``'errors'``.
+
+        With a team/user, the user's previously pinned MCP services are
+        pre-selected in the MCP menu, so re-running setup edits the pin
+        instead of silently clearing it.
         """
         if not validated.agents:
             # Not a form-validation error (there's no live submission here —
@@ -407,6 +418,11 @@ class SetupFlow:
         # Resolved here, against the listing fetched as this authenticated user,
         # so an operator default is only pre-selected when it is genuinely on
         # offer. The submit handler stays network-free.
+        pinned_mcp_services: tuple[str, ...] = ()
+        if team_id and user_id:
+            existing = await self._store.get_user_config(team_id, user_id)
+            if existing is not None:
+                pinned_mcp_services = existing.mcp_registry_services
         await ack(
             response_action="update",
             view=select_modal(
@@ -415,6 +431,7 @@ class SetupFlow:
                 workspace_default=workspace_default,
                 default_agent_id=self._default_agent_id,
                 default_host_type=self._default_host_type,
+                default_mcp_service_ids=pinned_mcp_services,
             ),
         )
 
@@ -443,7 +460,12 @@ class SetupFlow:
         try:
             validated = await omnigent.validate()
             await self._advance_to_select(
-                _ViewUpdateAck(client, view_id), omnigent, server_url, validated
+                _ViewUpdateAck(client, view_id),
+                omnigent,
+                server_url,
+                validated,
+                team_id=team_id,
+                user_id=user_id,
             )
         except Exception as exc:
             # The token was stored (the callback/login succeeded), but validating
@@ -751,6 +773,14 @@ class SetupFlow:
             host_id=host_id,
             host_name=host_name,
             host_type="managed" if managed else "external",
+            # The MCP menu is optional and absent when the user has nothing
+            # connected, so a missing block reads as "pin nothing" — clearing
+            # a previous pin is just submitting with nothing selected.
+            mcp_registry_services=tuple(
+                option.get("value")
+                for option in _selected_options(view, MCP_BLOCK, MCP_ACTION)
+                if isinstance(option.get("value"), str)
+            ),
         )
 
         await self._store.upsert_user_config(team_id, user_id, config)
@@ -770,12 +800,17 @@ class SetupFlow:
             host_line = " in a sandbox this server runs for you"
         else:
             host_line = f" on host *{host_name}*" if host_name else ""
+        mcp_line = (
+            f" with MCP services {', '.join(config.mcp_registry_services)}"
+            if config.mcp_registry_services
+            else ""
+        )
         await self._dm_user(
             client,
             user_id,
             text=(
                 f":white_check_mark: You're set up! I'll use *{config.agent_name}*"
-                f"{host_line} on {server_url}. Mention me in a channel or message me "
+                f"{host_line}{mcp_line} on {server_url}. Mention me in a channel or message me "
                 "here to start."
             ),
             purpose="setup confirmation",
@@ -1036,6 +1071,7 @@ def select_modal(
     *,
     default_agent_id: str | None = None,
     default_host_type: str | None = None,
+    default_mcp_service_ids: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Build the agent/host/workspace picker.
 
@@ -1044,6 +1080,9 @@ def select_modal(
     actually being offered; an unavailable one leaves its menu blank and adds a
     note saying so, rather than quietly selecting something else. Unset (the
     normal case) renders exactly the picker this always rendered.
+
+    ``default_mcp_service_ids`` is the user's previously pinned MCP selection,
+    pre-selected only for services still offered (connected) in this menu.
     """
     blocks: list[dict[str, Any]] = [
         {
@@ -1126,6 +1165,54 @@ def select_modal(
                 + " — pick a host above."
             )
         )
+    mcp_options = _mcp_options(validated.mcp_services)
+    if mcp_options:
+        mcp_element: dict[str, Any] = {
+            "type": "multi_static_select",
+            "action_id": MCP_ACTION,
+            "placeholder": {"type": "plain_text", "text": "Choose MCP services (optional)"},
+            "options": mcp_options,
+        }
+        mcp_initial = [
+            option
+            for service_id in default_mcp_service_ids
+            if (option := _option_with_value(mcp_options, service_id)) is not None
+        ]
+        if mcp_initial:
+            mcp_element["initial_options"] = mcp_initial
+        blocks.append(
+            {
+                "type": "input",
+                "block_id": MCP_BLOCK,
+                "optional": True,
+                "label": {"type": "plain_text", "text": "MCP services"},
+                "element": mcp_element,
+                "hint": {
+                    "type": "plain_text",
+                    "text": (
+                        "Pinned to every new Slack session. Only services you've "
+                        "connected in Omnigent Settings → MCP Services appear here."
+                    ),
+                },
+            }
+        )
+    elif validated.mcp_services:
+        # The catalog has services, but none of them is connected for this
+        # user — say where to connect one instead of showing an empty menu.
+        blocks.append(
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": (
+                            "No MCP services connected yet — connect one in Omnigent "
+                            "Settings → MCP Services, then re-run `/omnigent` to pin it here."
+                        ),
+                    }
+                ],
+            }
+        )
     workspace_element: dict[str, Any] = {
         "type": "plain_text_input",
         "action_id": WORKSPACE_ACTION,
@@ -1166,6 +1253,23 @@ def select_modal(
         "close": {"type": "plain_text", "text": "Cancel"},
         "blocks": blocks,
     }
+
+
+def _mcp_options(services: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Menu entries for the MCP services the user has connected.
+
+    Only ``connected`` services are offered: the server rejects a selection
+    the owner hasn't connected, so offering one would only fail at session
+    creation. ``connected`` also covers services whose auth is unnecessary.
+    """
+    options: list[dict[str, Any]] = []
+    for service in services[:_MAX_SELECT_OPTIONS]:
+        service_id = service.get("id")
+        if not isinstance(service_id, str) or service.get("connected") is not True:
+            continue
+        title = service.get("title") or service_id
+        options.append(_option(truncate_option(str(title)), service_id))
+    return options
 
 
 def _agent_options(agents: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1241,6 +1345,15 @@ def _selected_option(view: dict[str, Any], block_id: str, action_id: str) -> dic
     state = _state_action(view, block_id, action_id)
     selected = state.get("selected_option") if state else None
     return selected if isinstance(selected, dict) else None
+
+
+def _selected_options(view: dict[str, Any], block_id: str, action_id: str) -> list[dict[str, Any]]:
+    """Selected options of a ``multi_static_select`` (empty when unpicked)."""
+    state = _state_action(view, block_id, action_id)
+    selected = state.get("selected_options") if state else None
+    if not isinstance(selected, list):
+        return []
+    return [option for option in selected if isinstance(option, dict)]
 
 
 def _state_action(view: dict[str, Any], block_id: str, action_id: str) -> dict[str, Any] | None:

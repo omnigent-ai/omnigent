@@ -9,6 +9,7 @@ from omnigent_slack.omnigent import (
     AuthRequiredError,
     HarnessNotConfiguredError,
     HostUnavailableError,
+    McpSelectionError,
     OmnigentClient,
     OmnigentClientPool,
     OmnigentError,
@@ -185,6 +186,116 @@ async def test_create_session_managed_asks_the_server_to_provision_a_host() -> N
 
 
 @respx.mock
+async def test_create_session_sends_pinned_mcp_services() -> None:
+    create = respx.post("http://omnigent.test/v1/sessions").mock(
+        return_value=httpx.Response(201, json={"id": "conv_1"})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        session_id = await client.create_session(
+            "ag_1", "Slack C/1", mcp_registry_services=("tracker", "notes")
+        )
+    finally:
+        await client.aclose()
+
+    assert session_id == "conv_1"
+    assert create.calls.last.request.read() == (
+        b'{"agent_id":"ag_1","title":"Slack C/1","mcp_registry_services":["tracker","notes"]}'
+    )
+
+
+@respx.mock
+async def test_create_session_rejects_a_stale_pinned_selection() -> None:
+    # A pinned service the owner can no longer use (disconnected since setup,
+    # or colliding with the agent) comes back 403/409 — that is a selection
+    # failure, not a generic startup failure, so the caller can tell the user
+    # to re-pick instead of retrying.
+    for status in (403, 409, 422):
+        respx.post("http://omnigent.test/v1/sessions").mock(
+            return_value=httpx.Response(status, json={"error": {"code": "forbidden"}})
+        )
+        client = OmnigentClient("http://omnigent.test")
+        try:
+            with pytest.raises(McpSelectionError):
+                await client.create_session(
+                    "ag_1", "Slack C/1", mcp_registry_services=("tracker",)
+                )
+        finally:
+            await client.aclose()
+
+
+@respx.mock
+async def test_create_session_rejection_without_a_pin_stays_generic() -> None:
+    # The same 403 with no pinned selection is not an MCP failure — it must
+    # keep its generic shape so other callers' handling doesn't change.
+    respx.post("http://omnigent.test/v1/sessions").mock(
+        return_value=httpx.Response(403, json={"error": {"code": "forbidden"}})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        with pytest.raises(OmnigentError):
+            await client.create_session("ag_1", "Slack C/1")
+    finally:
+        await client.aclose()
+
+
+@respx.mock
+async def test_list_mcp_registry_services_returns_the_catalog() -> None:
+    respx.get("http://omnigent.test/v1/mcp-registry/services").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"id": "tracker", "title": "Work tracker", "connected": True},
+                    {"id": "crm", "title": "CRM", "connected": False},
+                ]
+            },
+        )
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        services = await client.list_mcp_registry_services()
+    finally:
+        await client.aclose()
+
+    assert [service["id"] for service in services] == ["tracker", "crm"]
+    assert services[0]["connected"] is True
+
+
+@respx.mock
+async def test_validate_degrades_when_the_registry_is_unavailable() -> None:
+    # An older server without the registry endpoint must not break setup:
+    # validation still succeeds, with no MCP services to offer.
+    respx.get("http://omnigent.test/health").mock(
+        return_value=httpx.Response(200, json={"status": "ok"})
+    )
+    respx.get("http://omnigent.test/v1/agents").mock(
+        return_value=httpx.Response(200, json={"data": [{"id": "ag_1"}]})
+    )
+    respx.get("http://omnigent.test/v1/hosts").mock(
+        return_value=httpx.Response(200, json={"hosts": [{"host_id": "h1", "status": "online"}]})
+    )
+    respx.get("http://omnigent.test/v1/info").mock(
+        return_value=httpx.Response(200, json={"managed_sandboxes_enabled": False})
+    )
+    respx.get("http://omnigent.test/v1/mcp-registry/services").mock(
+        return_value=httpx.Response(404, json={"error": {"code": "not_found"}})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        validated = await client.validate()
+    finally:
+        await client.aclose()
+
+    assert validated.mcp_services == []
+    assert [a["id"] for a in validated.agents] == ["ag_1"]
+
+
+@respx.mock
 async def test_delete_session_issues_delete_and_tolerates_absent() -> None:
     # Cleanup of a session stranded by a failed launch: DELETE the session, and
     # treat 404 (already gone) as success — that IS the desired end state.
@@ -267,6 +378,9 @@ async def test_validate_withholds_managed_but_records_an_unread_probe() -> None:
         return_value=httpx.Response(200, json={"hosts": [{"host_id": "h1", "status": "online"}]})
     )
     respx.get("http://omnigent.test/v1/info").mock(return_value=httpx.Response(500))
+    respx.get("http://omnigent.test/v1/mcp-registry/services").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
     client = OmnigentClient("http://omnigent.test")
 
     try:
@@ -293,6 +407,9 @@ async def test_validate_records_a_readable_probe_as_known() -> None:
     )
     respx.get("http://omnigent.test/v1/info").mock(
         return_value=httpx.Response(200, json={"managed_sandboxes_enabled": False})
+    )
+    respx.get("http://omnigent.test/v1/mcp-registry/services").mock(
+        return_value=httpx.Response(200, json={"data": []})
     )
     client = OmnigentClient("http://omnigent.test")
 
@@ -344,6 +461,9 @@ async def test_validate_returns_agents_and_online_hosts() -> None:
         return_value=httpx.Response(
             200, json={"managed_sandboxes_enabled": False, "sandbox_provider": None}
         )
+    )
+    respx.get("http://omnigent.test/v1/mcp-registry/services").mock(
+        return_value=httpx.Response(200, json={"data": []})
     )
     client = OmnigentClient("http://omnigent.test")
 
