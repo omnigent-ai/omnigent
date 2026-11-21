@@ -21,7 +21,7 @@ import secrets
 import threading
 from collections import Counter
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any
 
@@ -75,23 +75,44 @@ def _parked_permission_request(base_url: str, session_id: str) -> Iterator[dict[
     Hold a Claude Code ``PermissionRequest`` hook call open on ``session_id``.
 
     The hook long-polls until the prompt is answered, so it runs on its own
-    thread and client. The yielded dict receives the hook's HTTP response.
+    thread and client. The yielded dict receives the hook's HTTP response, or
+    the error its call raised. A prompt still parked on exit, because the test
+    failed before answering it, is cancelled so the call returns promptly.
     """
     outcome: dict[str, Any] = {}
 
     def call_hook() -> None:
-        with httpx.Client(base_url=base_url, trust_env=False, timeout=300) as hook_client:
-            outcome["response"] = hook_client.post(
-                f"/v1/sessions/{session_id}/hooks/permission-request",
-                json={"tool_name": "Bash", "tool_input": {"command": "make deploy"}},
-            )
+        try:
+            with httpx.Client(base_url=base_url, trust_env=False, timeout=300) as hook_client:
+                outcome["response"] = hook_client.post(
+                    f"/v1/sessions/{session_id}/hooks/permission-request",
+                    json={"tool_name": "Bash", "tool_input": {"command": "make deploy"}},
+                )
+        except httpx.HTTPError as error:
+            outcome["error"] = error
 
     thread = threading.Thread(target=call_hook, daemon=True)
     thread.start()
     try:
         yield outcome
     finally:
+        if thread.is_alive():
+            _cancel_pending_prompts(base_url, session_id)
         thread.join(timeout=30)
+
+
+def _cancel_pending_prompts(base_url: str, session_id: str) -> None:
+    """Best-effort cleanup: cancel ``session_id``'s own pending prompts."""
+    with (
+        suppress(httpx.HTTPError, ValueError),
+        httpx.Client(base_url=base_url, trust_env=False, timeout=10) as client,
+    ):
+        snapshot = client.get(f"/v1/sessions/{session_id}").json()
+        for prompt in snapshot.get("pending_elicitations") or []:
+            client.post(
+                f"/v1/sessions/{session_id}/elicitations/{prompt['elicitation_id']}/resolve",
+                json={"action": "cancel"},
+            )
 
 
 def _replayed_prompts(snapshot: dict[str, Any], session_id: str) -> list[dict[str, Any]]:
@@ -185,6 +206,7 @@ def test_open_cost_with_a_pending_sub_agent_prompt_does_not_grow_with_the_tree(
             )
             assert resolve.status_code == 202, resolve.text
 
+        assert "error" not in hook, f"the parked hook call failed: {hook.get('error')!r}"
         assert "response" in hook, (
             "the parked hook call did not return after its prompt was answered"
         )
