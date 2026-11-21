@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { KEYBOARD_SHORTCUTS_EVENT } from "@/components/KeyboardShortcutsDialog";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { registerFindSurface } from "@/lib/findRouting";
+import { readFoldAssistantNarration } from "@/lib/foldNarrationPreferences";
 import { useThemePickerStore } from "@/store/themePicker";
 import { readTerminalThemeMode } from "@/lib/terminalThemePreferences";
 
@@ -134,6 +135,23 @@ describe("QuickPick ⌘K setting rows", () => {
     expect(readAlwaysSteer()).toBe(false);
     await waitFor(() => expect(heading()).toBeNull());
     expect(screen.getByRole("option", { name: /Always steer/ })).toHaveTextContent("Off");
+  });
+
+  it("turns on Show only the final answer from its row, back on the row showing On", async () => {
+    const input = renderPalette();
+    fireEvent.change(input, { target: { value: "show only the final answer" } });
+    expect(screen.getByRole("option", { name: /Show only the final answer/ })).toHaveTextContent(
+      "Off",
+    );
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(heading()).toBe("Show only the final answer"));
+    fireEvent.change(input, { target: { value: "on" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(readFoldAssistantNarration()).toBe(true);
+    await waitFor(() => expect(heading()).toBeNull());
+    expect(screen.getByRole("option", { name: /Show only the final answer/ })).toHaveTextContent(
+      "On",
+    );
   });
 
   it("finds the terminal theme by a value's name and opens on it", async () => {

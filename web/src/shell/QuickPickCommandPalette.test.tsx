@@ -235,7 +235,7 @@ describe("QuickPickCommandPalette feature commands", () => {
     );
   });
 
-  it("runs a command that moves focus only once the palette has closed", async () => {
+  it("doesn't run a command that moves focus when it's withdrawn while the palette closes", async () => {
     const focusFilter = command("Filter files", { movesFocus: true });
     offer([focusFilter]);
     function Palette() {
@@ -255,9 +255,15 @@ describe("QuickPickCommandPalette feature commands", () => {
       </QueryClientProvider>,
     );
     accept(screen.getByTestId("command-palette-input"), "filter files");
+    // The feature unmounts after the accept, before the palette has finished closing.
+    usePaletteCommandsStore.setState({ groups: {} });
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await act(async () => {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 20);
+      });
+    });
     expect(focusFilter.run).not.toHaveBeenCalled();
-    await waitFor(() => expect(focusFilter.run).toHaveBeenCalledOnce());
-    expect(screen.queryByRole("dialog")).toBeNull();
   });
 
   it.each(["withdrawn", "greyed out"] as const)(

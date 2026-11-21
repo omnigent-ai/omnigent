@@ -2,12 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { currentChoiceLabel, listedChoices } from "@/store/paletteSettings";
 
-import {
-  ALWAYS_STEER_SETTING,
-  appearanceModeSetting,
-  settingSwitchSetting,
-  terminalThemeSetting,
-} from "./settingsCommands";
+import { appearanceModeSetting, terminalThemeSetting } from "./settingsCommands";
 
 describe("settings rows", () => {
   it("names the appearance mode as Settings does, following a Databricks host", () => {
@@ -32,13 +27,5 @@ describe("settings rows", () => {
     setting.choose("light");
     setting.choose("sepia");
     expect(write).toHaveBeenCalledExactlyOnceWith("light");
-  });
-
-  it("turns a switch on and off through its write", () => {
-    const write = vi.fn();
-    const setting = settingSwitchSetting(ALWAYS_STEER_SETTING, true, write);
-    expect(currentChoiceLabel(setting)).toBe("On");
-    setting.choose("off");
-    expect(write).toHaveBeenCalledWith(false);
   });
 });

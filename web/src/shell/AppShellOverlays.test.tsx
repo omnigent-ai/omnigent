@@ -1,9 +1,9 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ServerInfo } from "@/lib/capabilities";
-import { AppShellOverlays, type AppShellOverlaysProps } from "./AppShellOverlays";
+import type { AppShellOverlaysProps } from "./AppShellOverlays";
 
 // The flag only chooses the palette; each palette's behavior has its own suites.
 vi.mock("./CommandPalette", () => ({
@@ -11,27 +11,35 @@ vi.mock("./CommandPalette", () => ({
     <div data-testid="cmdk-palette" data-sessions-only={String(Boolean(sessionsOnly))} />
   ),
 }));
-// Which flagged modules have been imported; the flag-off cases run first and need none.
-const loaded = vi.hoisted(() => new Set<string>());
-vi.mock("./QuickPickCommandPalette", () => {
-  loaded.add("QuickPickCommandPalette");
-  return {
-    QuickPickCommandPalette: ({ sessionsOnly }: { sessionsOnly?: boolean }) => (
-      <div data-testid="quick-pick-palette" data-sessions-only={String(Boolean(sessionsOnly))} />
-    ),
-  };
-});
-vi.mock("./ThemePicker", () => {
-  loaded.add("ThemePicker");
-  return { ThemePicker: () => <div data-testid="theme-picker" /> };
-});
 vi.mock("@/components/KeyboardShortcutsDialog", () => ({ KeyboardShortcutsDialog: () => null }));
 vi.mock("@/components/onboarding/HostImportReview", () => ({ ImportReviewGate: () => null }));
 vi.mock("./RecentSessionsSwitcher", () => ({ RecentSessionsSwitcher: () => null }));
 
 afterEach(cleanup);
+// Which flagged modules this case imported. Each case loads the shell and these mocks afresh,
+// so a flag-on case can't hide or cause a load in a later one.
+const loaded = new Set<string>();
+beforeEach(() => {
+  vi.resetModules();
+  loaded.clear();
+  vi.doMock("./QuickPickCommandPalette", () => {
+    loaded.add("QuickPickCommandPalette");
+    return {
+      QuickPickCommandPalette: ({ sessionsOnly }: { sessionsOnly?: boolean }) => (
+        <div data-testid="quick-pick-palette" data-sessions-only={String(Boolean(sessionsOnly))} />
+      ),
+    };
+  });
+  vi.doMock("./ThemePicker", () => {
+    loaded.add("ThemePicker");
+    return { ThemePicker: () => <div data-testid="theme-picker" /> };
+  });
+});
 
-function renderOverlays(features: Record<string, boolean> | "loading", sessionSearch = false) {
+async function renderOverlays(
+  features: Record<string, boolean> | "loading",
+  sessionSearch = false,
+) {
   const serverInfo =
     features === "loading" ? ("loading" as const) : ({ features } as unknown as ServerInfo);
   const props: AppShellOverlaysProps = {
@@ -48,6 +56,7 @@ function renderOverlays(features: Record<string, boolean> | "loading", sessionSe
     serverConversationId: undefined,
     updateOverlayHeight: 0,
   };
+  const { AppShellOverlays } = await import("./AppShellOverlays");
   return render(
     <QueryClientProvider client={new QueryClient()}>
       <AppShellOverlays {...props} />
@@ -67,8 +76,8 @@ describe("AppShellOverlays palette flag", () => {
     ),
   )(
     "keeps the current palette when the flag is %s (sessions only: %s)",
-    (_state, features, sessionSearch) => {
-      const { getByTestId, queryByTestId } = renderOverlays(features, sessionSearch);
+    async (_state, features, sessionSearch) => {
+      const { getByTestId, queryByTestId } = await renderOverlays(features, sessionSearch);
       expect(getByTestId("cmdk-palette").dataset.sessionsOnly).toBe(String(sessionSearch));
       expect(queryByTestId("quick-pick-palette")).toBeNull();
       expect(queryByTestId("theme-picker")).toBeNull();
@@ -80,7 +89,7 @@ describe("AppShellOverlays palette flag", () => {
   it.each([false, true])(
     "shows the QuickPick palette when the flag is on (sessions only: %s)",
     async (sessionSearch) => {
-      const { findByTestId, queryByTestId } = renderOverlays(
+      const { findByTestId, queryByTestId } = await renderOverlays(
         { quick_pick_palette: true },
         sessionSearch,
       );
@@ -89,6 +98,7 @@ describe("AppShellOverlays palette flag", () => {
       );
       expect(await findByTestId("theme-picker")).toBeTruthy();
       expect(queryByTestId("cmdk-palette")).toBeNull();
+      expect([...loaded].sort()).toEqual(["QuickPickCommandPalette", "ThemePicker"]);
     },
   );
 });
