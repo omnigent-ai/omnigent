@@ -214,7 +214,8 @@ def _assert_sender_rows(page: Page, tasks: _Tasks) -> None:
     label = "Not sent toanother session"
     expect(refused.get_by_test_id("message-destination")).to_have_text(label)
     note = "· Session message refused"
-    expect(refused.get_by_test_id("toggle-unsent-message")).to_have_text(note)
+    # The note sits beside the call's runtime, as on a tool row.
+    expect(refused.get_by_test_id("toggle-unsent-message")).to_contain_text(note)
 
 
 def _assert_recipient(

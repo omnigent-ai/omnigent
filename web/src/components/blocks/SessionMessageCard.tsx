@@ -1,7 +1,5 @@
-// Rows for agent-to-agent messages. `SessionMessageLabel` names the other session:
-// "From @…" on a message another session sent here, "To @…" on one this session
-// sent. An accepted send gets a collapsible outlined row in place of its tool call;
-// one still sending, refused or unconfirmed gets a plain status row instead.
+// Rows for agent-to-agent messages: "From @…" on received ones, "To @…" on sent ones.
+// An accepted send gets an outlined row in place of its tool call; others keep a tool row.
 
 import { useState, type ReactNode } from "react";
 import {
@@ -22,6 +20,7 @@ import type {
 import { firstLine } from "@/lib/toolValue";
 import { cn } from "@/lib/utils";
 import { FilePathAwareMessageResponse, SessionMentionPill } from "./ChatMarkdown";
+import { formatToolDuration, useElapsedDuration } from "./ToolCard";
 
 interface SessionMessageLabelProps {
   /** The other session, e.g. ``"9b8b26c8edfd40d781c0d13a04fa5c0b"``. */
@@ -53,7 +52,6 @@ export function SessionMessageLabel({
   className,
   testId,
 }: SessionMessageLabelProps) {
-  const label = useSessionLabel(sessionId, currentSessionId);
   return (
     <div
       data-testid={testId}
@@ -61,14 +59,37 @@ export function SessionMessageLabel({
     >
       <Icon className={cn("size-3 shrink-0", iconClassName)} />
       <span className="shrink-0 whitespace-nowrap">{verb}</span>
-      {label ? (
-        <SessionMentionPill id={sessionId} isSubagent={label.isSubagent} className={pillClassName}>
-          @{label.title}
-        </SessionMentionPill>
-      ) : (
-        <span>another session</span>
-      )}
+      <SessionReference
+        sessionId={sessionId}
+        currentSessionId={currentSessionId}
+        pillClassName={pillClassName}
+      />
     </div>
+  );
+}
+
+/**
+ * The other session's pill, or "another session" while its title is unknown or unreadable.
+ *
+ * :param sessionId: The session to name, e.g. ``"9b8b26c8edfd40d781c0d13a04fa5c0b"``.
+ * :param currentSessionId: Session being viewed; its subagents name the pill first.
+ * :param pillClassName: Extra pill classes, e.g. ``"min-w-0"`` so a long title truncates.
+ */
+function SessionReference({
+  sessionId,
+  currentSessionId,
+  pillClassName,
+}: {
+  sessionId: string;
+  currentSessionId: string | null;
+  pillClassName?: string;
+}) {
+  const label = useSessionLabel(sessionId, currentSessionId);
+  if (!label) return <span>another session</span>;
+  return (
+    <SessionMentionPill id={sessionId} isSubagent={label.isSubagent} className={pillClassName}>
+      @{label.title}
+    </SessionMentionPill>
   );
 }
 
@@ -118,15 +139,27 @@ interface MessageRowProps {
   onToggle: () => void;
 }
 
+interface OutboundSessionMessageCardProps {
+  /** The classified send, from ``outboundSessionMessage``. */
+  message: OutboundSessionMessage;
+  /** Page-clock seconds the call started, e.g. ``12.5``; times a send still in flight. */
+  startedAt?: number | null;
+  /** Completed runtime in seconds, when known. */
+  duration?: number;
+}
+
 /**
  * The row a message this session sent gets in place of its tool call: "To @recipient"
  * and its first line once the server accepted it, expandable to the whole text.
- *
- * :param message: The classified send, from ``outboundSessionMessage``.
  */
-export function OutboundSessionMessageCard({ message }: { message: OutboundSessionMessage }) {
+export function OutboundSessionMessageCard({
+  message,
+  startedAt,
+  duration,
+}: OutboundSessionMessageCardProps) {
   const currentSessionId = useScopedConversationId();
   const [expanded, setExpanded] = useState(false);
+  const elapsed = useElapsedDuration(message.status === "sending" ? startedAt : null);
   const rowProps = {
     message,
     currentSessionId,
@@ -134,7 +167,7 @@ export function OutboundSessionMessageCard({ message }: { message: OutboundSessi
     onToggle: () => setExpanded((open) => !open),
   };
   if (message.status === "sent") return <SentMessage {...rowProps} />;
-  return <UnsentMessage {...rowProps} status={message.status} />;
+  return <UnsentMessage {...rowProps} status={message.status} duration={duration ?? elapsed} />;
 }
 
 /** An accepted send: a one-line ``rounded-lg`` row, or ``rounded-2xl`` with the full text. */
@@ -223,44 +256,47 @@ function ExpandedSentMessage({
   );
 }
 
-/** A send the server has not accepted: a plain row, expandable to its error and text. */
+/**
+ * A send the server has not accepted, as a tool row: status icon, medium verb, the
+ * recipient, a note, the runtime and a chevron, expanding to its error and text.
+ */
 function UnsentMessage({
   message,
   status,
   currentSessionId,
   expanded,
   onToggle,
-}: MessageRowProps & { status: UnsentStatus }) {
+  duration,
+}: MessageRowProps & { status: UnsentStatus; duration: number | undefined }) {
   const row = UNSENT_ROWS[status];
+  const Icon = row.icon;
   const note = status === "not_sent" ? message.error : row.note;
   return (
-    <div
-      data-testid="outbound-session-message"
-      data-status={status}
-      className="flex flex-col gap-1"
-    >
-      <div className="flex min-w-0 items-center gap-1 px-3 py-1.5">
-        <SessionMessageLabel
-          sessionId={message.recipientId}
-          currentSessionId={currentSessionId}
-          verb={row.verb}
-          icon={row.icon}
-          iconClassName={row.iconClassName}
-          className="min-w-0 shrink"
-          pillClassName="min-w-0"
-          testId="message-destination"
-        />
+    <div data-testid="outbound-session-message" data-status={status} className="w-full">
+      <div className="flex w-full items-center gap-1.5 py-0.5 text-muted-foreground text-ui">
+        <Icon className={cn("size-3.5 shrink-0", row.iconClassName)} />
+        <span data-testid="message-destination" className="flex min-w-0 items-center gap-1.5">
+          <span className="shrink-0 whitespace-nowrap font-medium text-foreground">{row.verb}</span>
+          <SessionReference
+            sessionId={message.recipientId}
+            currentSessionId={currentSessionId}
+            pillClassName="min-w-0"
+          />
+        </span>
         <button
           type="button"
           onClick={onToggle}
           aria-expanded={expanded}
           aria-label={expanded ? "Hide message" : "Show message"}
           data-testid="toggle-unsent-message"
-          className={cn("flex min-w-0 items-center gap-1 text-xs", TOGGLE_CLASS)}
+          className={cn("flex min-w-0 flex-1 items-center gap-1.5 text-left", TOGGLE_CLASS)}
         >
-          {note !== null && <span className="min-w-0 truncate">· {note}</span>}
+          <span className="min-w-0 flex-1 truncate">{note === null ? null : `· ${note}`}</span>
+          {duration !== undefined && (
+            <span className="shrink-0 tabular-nums opacity-70">{formatToolDuration(duration)}</span>
+          )}
           <ChevronRightIcon
-            className={cn("size-3 shrink-0 transition-transform", expanded && "rotate-90")}
+            className={cn("size-3.5 shrink-0 transition-transform", expanded && "rotate-90")}
           />
         </button>
       </div>
@@ -272,8 +308,8 @@ function UnsentMessage({
 /** What an unsent message would have said, under the error its send reported. */
 function UnsentDetail({ error, body }: { error: string | null; body: string }) {
   return (
-    <div className="ml-5 flex flex-col gap-1.5 border-l pl-3">
-      {error !== null && <p className="text-sm text-muted-foreground">{error}</p>}
+    <div className="mt-1 ml-2 flex flex-col gap-2 border-l py-1 pl-3 text-sm">
+      {error !== null && <p className="text-muted-foreground">{error}</p>}
       <SentText text={body} />
     </div>
   );

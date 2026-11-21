@@ -938,7 +938,16 @@ function renderItem(
       }
       // A message to another session reads "To @recipient", once, in place of its call.
       const outbound = outboundSessionMessage(item);
-      if (outbound !== null) return <OutboundSessionMessageCard key={key} message={outbound} />;
+      if (outbound !== null) {
+        return (
+          <OutboundSessionMessageCard
+            key={key}
+            message={outbound}
+            startedAt={item.startedAt}
+            duration={item.duration}
+          />
+        );
+      }
       return (
         <ToolCard
           key={key}
