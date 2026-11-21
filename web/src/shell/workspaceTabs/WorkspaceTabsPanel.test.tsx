@@ -73,6 +73,9 @@ vi.mock("@/components/blocks/TerminalView", () => ({
   ),
 }));
 
+const floatingPanes = vi.hoisted(() => ({ on: false }));
+vi.mock("../useFloatingPanes", () => ({ useFloatingPanes: () => floatingPanes.on }));
+
 const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 
 type PanelOverrides = Partial<WorkspaceTabsPanelProps> & { conversationId: string };
@@ -151,6 +154,7 @@ beforeEach(() => {
   vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
   placeViews.latest.clear();
   placeViews.bySession.clear();
+  floatingPanes.on = false;
 });
 
 afterEach(() => {
@@ -310,6 +314,47 @@ describe("the panel's placement", () => {
     expect(
       screen.queryByRole("button", { name: "Full screen", hidden: true }),
     ).not.toBeInTheDocument();
+  });
+});
+
+describe("All tabs' place in the strip", () => {
+  const button = (name: string) => screen.getByRole("button", { name, hidden: true });
+  const precedes = (first: Element, second: Element) =>
+    Boolean(first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING);
+  const firstTab = () => screen.getAllByRole("tab", { hidden: true })[0]!;
+  const stripDividers = () =>
+    document.querySelectorAll('aside[aria-label="Workspace"] [data-slot="separator"]');
+
+  it("leads the strip as layers before the tabs, with the divider after New tab", () => {
+    renderPanels([{ conversationId: "conv_a", open: true }]);
+    const allTabs = button("All tabs");
+    expect(precedes(allTabs, firstTab())).toBe(true);
+    expect(allTabs.querySelector(".lucide-layers")).not.toBeNull();
+    expect(stripDividers()).toHaveLength(1);
+    expect(precedes(button("New tab"), stripDividers()[0]!)).toBe(true);
+    expect(precedes(stripDividers()[0]!, button("Full screen"))).toBe(true);
+  });
+
+  it("with floating panes, opens from a chevron beside Full screen, after the divider", () => {
+    floatingPanes.on = true;
+    renderPanels([{ conversationId: "conv_a", open: true }]);
+    const allTabs = button("All tabs");
+    expect(precedes(firstTab(), allTabs)).toBe(true);
+    expect(precedes(button("New tab"), allTabs)).toBe(true);
+    expect(precedes(allTabs, button("Full screen"))).toBe(true);
+    expect(allTabs.querySelector(".lucide-chevron-down")).not.toBeNull();
+    // One divider, between New tab and All tabs.
+    expect(stripDividers()).toHaveLength(1);
+    expect(precedes(button("New tab"), stripDividers()[0]!)).toBe(true);
+    expect(precedes(stripDividers()[0]!, allTabs)).toBe(true);
+  });
+
+  it("with floating panes, lines its list up with the button's end", async () => {
+    floatingPanes.on = true;
+    renderPanels([{ conversationId: "conv_a", open: true }]);
+    await userEvent.click(button("All tabs"));
+    const list = await screen.findByRole("dialog", { hidden: true });
+    expect(list).toHaveAttribute("data-align", "end");
   });
 });
 

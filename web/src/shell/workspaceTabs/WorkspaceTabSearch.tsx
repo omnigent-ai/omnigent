@@ -1,7 +1,7 @@
 // The strip's tab list: a fuzzy search over the open workspace tabs, opened from the layers button
 // after ‹ › or from ⌘K's "Search tabs…", which share one command.
 
-import { LayersIcon, type LucideIcon, RotateCcwIcon } from "lucide-react";
+import { ChevronDownIcon, LayersIcon, type LucideIcon, RotateCcwIcon } from "lucide-react";
 import { useState } from "react";
 
 import { Button } from "@/components/ui/button";
@@ -12,6 +12,7 @@ import { FileTypeIcon } from "@/shell/FileTypeIcon";
 
 import { SuppressBrowserView } from "@/hooks/useSuppressBrowserView";
 import { WorkspaceTabTooltip } from "@/shell/WorkspacePanel";
+import { useFloatingPanes } from "@/shell/useFloatingPanes";
 
 export interface TabSearchEntry {
   tabId: string;
@@ -69,13 +70,17 @@ export function WorkspaceTabSearch({
   entries,
   reopen,
   onChoose,
+  menuAlign = "start",
 }: {
+  /** Which edge of the button the list lines up with. */
+  menuAlign?: "start" | "end";
   open: boolean;
   onOpenChange: (open: boolean) => void;
   entries: readonly TabSearchEntry[];
   reopen: TabSearchReopen;
   onChoose: (choice: TabSearchChoice) => void;
 }) {
+  const floatingPanes = useFloatingPanes();
   return (
     <Popover open={open} onOpenChange={onOpenChange}>
       <WorkspaceTabTooltip label="All tabs">
@@ -87,11 +92,16 @@ export function WorkspaceTabSearch({
             className="size-6 shrink-0 text-muted-foreground hover:text-foreground"
             aria-label="All tabs"
           >
-            <LayersIcon className="size-4" />
+            {/* Floating panes open the list from a chevron, as a menu of the tabs. */}
+            {floatingPanes ? (
+              <ChevronDownIcon className="size-4" />
+            ) : (
+              <LayersIcon className="size-4" />
+            )}
           </Button>
         </PopoverTrigger>
       </WorkspaceTabTooltip>
-      <PopoverContent align="start" className="w-[min(26rem,calc(100vw-2rem))] p-0">
+      <PopoverContent align={menuAlign} className="w-[min(26rem,calc(100vw-2rem))] p-0">
         <SuppressBrowserView />
         <TabSearchPicker
           entries={entries}

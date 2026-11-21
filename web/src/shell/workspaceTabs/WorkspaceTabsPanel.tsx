@@ -13,6 +13,7 @@ import {
   NEW_TAB_DIVIDER_ROOM,
   NewTabButton,
   PINNED_TAB_WIDTH,
+  StripDivider,
   StripTab,
   StripTabMenu,
   type TabTitle,
@@ -104,6 +105,7 @@ import {
 import { UNSUPPORTED_TAB_TITLE, UnsupportedTabContent } from "../workspaceSidebar/unsupportedTab";
 import { useWorkspaceSidebarTabActions } from "../workspaceSidebar/useWorkspaceSidebarTabActions";
 import { useCanStartSideChat } from "@/hooks/usePermissions";
+import { useFloatingPanes } from "../useFloatingPanes";
 import { RailTerminalView, WorkspaceTabTooltip } from "../WorkspacePanel";
 import { NewTabPage, type NewTabRecent } from "./NewTabPage";
 import { recentPullRequestRows, recentPullRequestUrl } from "./recentPullRequestRow";
@@ -529,6 +531,7 @@ function WorkspaceTabsPanelImpl({
     onReveal?.();
   };
   const inDrawer = placement === "drawer";
+  const floatingPanes = useFloatingPanes();
   // Hotkeys and ⌘K rows act only while this panel is the keyboard target.
   const commandsActive = !pending && keyboardTarget;
   useNewBrowserHotkey(() => addBrowser(), showBrowserTab && commandsActive);
@@ -1005,6 +1008,32 @@ function WorkspaceTabsPanelImpl({
     }
   };
 
+  // All tabs: before the tabs in the classic strip; with floating panes the strip starts with the
+  // tabs, and the list opens from beside Full screen.
+  const tabSearch = !pending && tabs.length > 0 && (
+    <WorkspaceTabSearch
+      menuAlign={floatingPanes ? "end" : "start"}
+      open={tabSearchOpen}
+      onOpenChange={setTabSearchOpen}
+      entries={tabSearchEntries}
+      reopen={
+        reopenCommand.availability.available
+          ? {
+              label: reopenCommand.menuLabel,
+              ...(reopenCommand.shortcut ? { shortcut: shortcutKeys(reopenCommand.shortcut) } : {}),
+            }
+          : null
+      }
+      onChoose={(choice) => {
+        const command =
+          choice.kind === "reopen"
+            ? reopenCommand
+            : showCommands.find((candidate) => candidate.panelKey === choice.tabId);
+        if (command) runCommand(command);
+      }}
+    />
+  );
+
   const selectedUnknown = tabs.find((tab) => tab.id === selectedTabId && isUnknownTab(tab));
   const effectiveHandleProps = pending
     ? {
@@ -1072,30 +1101,7 @@ function WorkspaceTabsPanelImpl({
               {!pending && onHistoryGo && (
                 <WorkspaceHistoryChevrons commands={historyCommands} onGo={onHistoryGo} />
               )}
-              {!pending && tabs.length > 0 && (
-                <WorkspaceTabSearch
-                  open={tabSearchOpen}
-                  onOpenChange={setTabSearchOpen}
-                  entries={tabSearchEntries}
-                  reopen={
-                    reopenCommand.availability.available
-                      ? {
-                          label: reopenCommand.menuLabel,
-                          ...(reopenCommand.shortcut
-                            ? { shortcut: shortcutKeys(reopenCommand.shortcut) }
-                            : {}),
-                        }
-                      : null
-                  }
-                  onChoose={(choice) => {
-                    const command =
-                      choice.kind === "reopen"
-                        ? reopenCommand
-                        : showCommands.find((candidate) => candidate.panelKey === choice.tabId);
-                    if (command) runCommand(command);
-                  }}
-                />
-              )}
+              {!floatingPanes && tabSearch}
             </div>
           }
           tabs={
@@ -1170,12 +1176,18 @@ function WorkspaceTabsPanelImpl({
             // Below 160px "+" would run under Full screen, so it gives way; ⌘K and its chord still open a tab.
             !pending && (
               <div className="contents @max-[160px]/rail:hidden">
-                <NewTabButton onClick={newTab} />
+                <NewTabButton onClick={newTab} divider={!floatingPanes} />
               </div>
             )
           }
           trailing={
             <>
+              {floatingPanes && tabSearch ? (
+                <>
+                  <StripDivider />
+                  {tabSearch}
+                </>
+              ) : null}
               {!inDrawer && (
                 <WorkspaceTabTooltip
                   label={fullScreenCommand?.menuLabel ?? "Full screen"}
