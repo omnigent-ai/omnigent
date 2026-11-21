@@ -1918,11 +1918,23 @@ function AppShellImpl() {
     if (isMobileViewport()) setTabsDrawerOpen(true);
     else {
       setRightPanelOpenImmediately(true);
-      // ?fullscreen=1 fills the window with the sidebar, as its Full screen button does.
-      if (urlFileFullscreen && !rightPanelMaximized) toggleRightPanelMaximized();
+      // ?fullscreen=1 fills the window with the sidebar, as its Full screen button does. Arriving
+      // from another session's full screen, the left sidebar it closed is the one to restore.
+      if (urlFileFullscreen && !rightPanelMaximized) {
+        const leftFullScreen =
+          tabsLinkRestoreRef.current !== restoredWorkspace && !!restoredWorkspace?.exitedMaximized;
+        if (!leftFullScreen) sidebarOpenBeforeMaximizeRef.current = sidebarOpen;
+        setSidebarOpen(false);
+        setRightPanelMaximized(true);
+      }
     }
     clearFileViewerUrl();
   }, [tabsSidebar, conversationId, citationPath, urlNavigation, clearFileViewerUrl]); // eslint-disable-line react-hooks/exhaustive-deps
+  // The session restore the link effect above saw, so it knows the commit that restored one.
+  const tabsLinkRestoreRef = useRef(restoredWorkspace);
+  useEffect(() => {
+    tabsLinkRestoreRef.current = restoredWorkspace;
+  });
   const restoreSelectedFileUrl = useCallback(() => {
     // The tabs sidebar keeps its own files; the classic selection would open as a tab.
     if (!selectedFilePath || tabsModeRef.current) return;

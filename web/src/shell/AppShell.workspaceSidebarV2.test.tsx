@@ -270,6 +270,9 @@ function ChatProbe() {
       <button type="button" onClick={() => navigate("/c/conv_ws?file=README.md&line=4")}>
         Follow README link
       </button>
+      <button type="button" onClick={() => navigate("/c/conv_other?file=README.md&fullscreen=1")}>
+        Follow another session's full screen link
+      </button>
       <button type="button" onClick={() => openFile?.("src/app.ts", { line: 3 })}>
         Open cited file
       </button>
@@ -662,6 +665,28 @@ describe("workspace_sidebar_v2", () => {
     renderShell(withFlag(true), "/c/conv_ws?file=README.md&fullscreen=1");
     await waitFor(() => expect(tabs.host).toMatchObject({ maximized: true }));
     await waitFor(() => expect(screen.getByTestId("search")).not.toHaveTextContent("fullscreen="));
+  });
+
+  it("reopens the left sidebar on leaving full screen after another session's full screen link", async () => {
+    setViewport(DESKTOP);
+    renderShell(withFlag(true));
+    await screen.findByTestId("tabs-host");
+    const shell = document.querySelector(".app-shell");
+    // A wide window shows the left sidebar.
+    expect(shell).toHaveAttribute("data-sidebar-open", "true");
+    act(() => tabs.host!.onToggleMaximized());
+    expect(shell).not.toHaveAttribute("data-sidebar-open");
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Follow another session's full screen link" }),
+    );
+    await waitFor(() => expect(tabs.host).toMatchObject({ maximized: true }));
+    await waitFor(() => expect(screen.getByTestId("search")).not.toHaveTextContent("fullscreen="));
+    expect(shell).not.toHaveAttribute("data-sidebar-open");
+
+    act(() => tabs.host!.onToggleMaximized());
+    expect(tabs.host).toMatchObject({ maximized: false });
+    expect(shell).toHaveAttribute("data-sidebar-open", "true");
   });
 
   it("shows the browser tab an agent selects in its tab", async () => {

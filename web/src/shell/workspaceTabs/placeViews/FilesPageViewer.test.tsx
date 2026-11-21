@@ -133,16 +133,12 @@ describe("FilesPageViewer", () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
-  it("shows a text file in the app's viewer at a linked comment's thread, since the editor has none", () => {
-    renderViewer("src/app.ts", { data: file("src/app.ts", "const a = 1;\n") }, { commentId: "c1" });
-    expect(screen.queryByTestId("editor")).toBeNull();
-    expect(screen.getByTestId("file-viewer")).toBeInTheDocument();
-    expect(captured.viewer!.linkedCommentId).toBe("c1");
-  });
-
-  it("starts the app's viewer afresh for another linked comment, so its thread opens too", () => {
+  it("shows a text file at a linked comment's thread in the app's viewer, afresh for each comment", () => {
     const text = { data: file("src/app.ts", "const a = 1;\n") };
     const { rerender, onClose } = renderViewer("src/app.ts", text, { commentId: "c1" });
+    // The editor has no threads, so the app's viewer shows the file at the comment.
+    expect(screen.queryByTestId("editor")).toBeNull();
+    expect(captured.viewer!.linkedCommentId).toBe("c1");
     const viewerFor = (commentId: string) => (
       <FilesPageViewer
         conversationId="conv_1"
