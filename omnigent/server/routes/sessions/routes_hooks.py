@@ -517,6 +517,12 @@ def register_hooks_routes(
             # (or None when absent).
             tool_name=tool_name,
             tool_input=tool_input if isinstance(tool_input, dict) else None,
+            # Only a hook-supplied id can re-park, so only it earns the question grace.
+            repark_grace_s=(
+                _sf._HARNESS_QUESTION_REPARK_GRACE_S
+                if is_claude and tool_name == "AskUserQuestion" and elicitation_id is not None
+                else None
+            ),
         )
         if result is None:
             # Disconnect or timeout. Either way Claude is no
