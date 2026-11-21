@@ -1,10 +1,12 @@
-// Moving a split's pane to another pane's side, as a drag of its strip row or ⌘K's Move Pane…
-// does. Both offer exactly the spots listed here.
+// Placing a pane on another pane's side: moving a split's pane there, as a drag of its strip row
+// or ⌘K's Move Pane… does, or inserting a new one, as a dropped sidebar tab does. Every preview
+// and every commit reads the same placed layout.
 
 import { MoveIcon } from "lucide-react";
 
 import {
   moveTerminalPane,
+  splitTerminalLayout,
   terminalLayoutGeometry,
   terminalLayoutKeys,
   type TerminalLayout,
@@ -34,6 +36,51 @@ export interface PaneMoveDestination {
 }
 
 /**
+ * A pane placed on `side` of `targetKey`'s: one already in the split moving there, or a new one
+ * inserted there, as a sidebar tab dropped on the panes is.
+ */
+export interface PanePlacement {
+  kind: "move" | "insert";
+  key: string;
+  targetKey: string;
+  side: TerminalPaneSide;
+}
+
+/** Placing a pane on `side` of another: the split it makes and which half it takes. */
+export const splitOfSide = (side: TerminalPaneSide) => ({
+  axis: side === "left" || side === "right" ? ("columns" as const) : ("rows" as const),
+  placement: side === "left" || side === "top" ? ("before" as const) : ("after" as const),
+});
+
+/**
+ * The layout `placement` makes of `layout`: what its drop, ⌘K or menu commits. A move leaves its
+ * place as a close would; an insert keeps the other panes' proportions, as a split does. Returns
+ * `layout` itself when nothing would change.
+ */
+export function placedLayout(layout: TerminalLayout, placement: PanePlacement): TerminalLayout {
+  const { kind, key, targetKey, side } = placement;
+  if (kind === "move") return moveTerminalPane(layout, key, targetKey, side);
+  const keys = terminalLayoutKeys(layout);
+  if (keys.includes(key) || !keys.includes(targetKey)) return layout;
+  const { axis, placement: where } = splitOfSide(side);
+  return splitTerminalLayout(layout, targetKey, key, axis, where);
+}
+
+/**
+ * Where `placement`'s pane would sit, in percent of the view, read from the layout it makes, so
+ * a preview always shows where the pane lands. Null when nothing would change.
+ */
+export function placedPaneArea(
+  layout: TerminalLayout,
+  placement: PanePlacement,
+): TerminalRect | null {
+  const placed = placedLayout(layout, placement);
+  if (placed === layout) return null;
+  const pane = terminalLayoutGeometry(placed).panes.find(({ key }) => key === placement.key);
+  return pane ? { left: pane.left, top: pane.top, width: pane.width, height: pane.height } : null;
+}
+
+/**
  * Where `key`'s pane can go in `layout`: each side of every other pane that moves it, in layout
  * order, and that keeps every pane to `sizing`'s minimum, when there's a rule to ask.
  */
@@ -46,7 +93,7 @@ export function paneMoveDestinations(
   for (const targetKey of terminalLayoutKeys(layout)) {
     if (targetKey === key) continue;
     for (const side of PANE_SIDES) {
-      const moved = moveTerminalPane(layout, key, targetKey, side);
+      const moved = placedLayout(layout, { kind: "move", key, targetKey, side });
       if (moved === layout) continue;
       if (sizing && !sizing.keeps(layout, moved)) continue;
       destinations.push({ targetKey, side, layout: moved });
@@ -155,21 +202,6 @@ export function paneDropSpot(
       ? shown.side
       : nearest;
   return { targetKey: pane.key, side };
-}
-
-/** The half of `targetKey`'s pane a pane dropped on its `side` takes, in percent of the view. */
-export function paneDropArea(
-  layout: TerminalLayout,
-  targetKey: string,
-  side: TerminalPaneSide,
-): TerminalRect | null {
-  const pane = terminalLayoutGeometry(layout).panes.find(({ key }) => key === targetKey);
-  if (!pane) return null;
-  const { left, top, width, height } = pane;
-  if (side === "left") return { left, top, width: width / 2, height };
-  if (side === "right") return { left: left + width / 2, top, width: width / 2, height };
-  if (side === "top") return { left, top, width, height: height / 2 };
-  return { left, top: top + height / 2, width, height: height / 2 };
 }
 
 /** A spot's name on Move Pane…'s page, such as "Below zsh". */

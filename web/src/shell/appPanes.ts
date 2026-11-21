@@ -7,17 +7,20 @@ import { useSyncExternalStore } from "react";
 import {
   closeTerminalPane,
   replaceTerminalLayoutKey,
-  splitTerminalLayout,
-  terminalLayoutGeometry,
   terminalLayoutKeys,
-  type TerminalLayout,
-  type TerminalPanePlacement,
   type TerminalPaneSide,
   type TerminalRect,
   type TerminalSplitAxis,
 } from "@/lib/paneSplitLayout";
 
-import { type PaneDragOutside, paneDropSpot, splitPanesRoot } from "./paneMove";
+import {
+  type PaneDragOutside,
+  paneDropSpot,
+  placedLayout,
+  placedPaneArea,
+  splitOfSide,
+  splitPanesRoot,
+} from "./paneMove";
 import { NO_ROOM_MESSAGE } from "./paneSizing";
 import { requestTerminalFocus } from "./terminalFocusRequest";
 import {
@@ -149,12 +152,6 @@ export function appPaneTabIds(layoutKeys: readonly string[]): TabId[] {
   });
 }
 
-/** Placing a pane on `side` of another: the split it makes and which half it takes. */
-const splitOfSide = (side: TerminalPaneSide) => ({
-  axis: side === "left" || side === "right" ? ("columns" as const) : ("rows" as const),
-  placement: side === "left" || side === "top" ? ("before" as const) : ("after" as const),
-});
-
 /** Where a tab opens as a pane: beside `besideKey`, else the split's focused pane. */
 export interface AppPanePlacement {
   /** The agent's terminal, which the split starts from while unsplit. */
@@ -236,6 +233,9 @@ export function openPaneInSplit(
   return inserted;
 }
 
+// Stands for the dropped tab's pane while working out where it would land.
+const DROPPED_PANE = "\u0000dropped";
+
 /** Where a sidebar tab dragged over the session's panes would land: beside `targetKey`. */
 export interface AppPaneDrop {
   targetKey: string;
@@ -269,27 +269,13 @@ export function appPaneDropAt(
   if (!spot) return null;
   const { axis, placement } = splitOfSide(spot.side);
   if (!roomToSplit(target, spot.targetKey, axis, placement, agentKey)) return null;
-  const area = insertedPaneArea(layout, spot.targetKey, axis, placement);
+  const area = placedPaneArea(layout, {
+    kind: "insert",
+    key: DROPPED_PANE,
+    targetKey: spot.targetKey,
+    side: spot.side,
+  });
   return area ? { ...spot, area } : null;
-}
-
-// Stands for the dropped tab's pane while working out where it would land.
-const DROPPED_PANE = "\u0000dropped";
-
-/**
- * Where a pane inserted beside `targetKey` would sit, in percent of the view. A drop inserts as a
- * split does, keeping the other panes' proportions, so the preview is that layout's new pane, not
- * half of the target.
- */
-function insertedPaneArea(
-  layout: TerminalLayout,
-  targetKey: string,
-  axis: TerminalSplitAxis,
-  placement: TerminalPanePlacement,
-): TerminalRect | null {
-  const inserted = splitTerminalLayout(layout, targetKey, DROPPED_PANE, axis, placement);
-  const pane = terminalLayoutGeometry(inserted).panes.find((each) => each.key === DROPPED_PANE);
-  return pane ? { left: pane.left, top: pane.top, width: pane.width, height: pane.height } : null;
 }
 
 /** Show workspace tab `tabId` as a pane on `drop`'s side of its target, taking focus. */
@@ -312,15 +298,22 @@ export function dropPaneInSplit(
   const { axis, placement } = splitOfSide(drop.side);
   // The panes may have changed since the preview: the drop checks the room again.
   if (!roomToSplit(target, drop.targetKey, axis, placement, agentKey)) return false;
-  const inserted = insertSplitPane(target, {
-    sourceKey: drop.targetKey,
-    newKey,
-    axis,
-    placement,
-    unsplitKey: agentKey,
-    takeFocus: false,
+  let inserted = false;
+  target.update((current) => {
+    const state =
+      current ?? (agentKey === null ? null : { layout: agentKey, focusedKey: agentKey });
+    if (state === null) return current;
+    // The same placement the preview read, so the pane lands where it showed.
+    const layout = placedLayout(state.layout, {
+      kind: "insert",
+      key: newKey,
+      targetKey: drop.targetKey,
+      side: drop.side,
+    });
+    if (layout === state.layout) return current;
+    inserted = true;
+    return { layout, focusedKey: newKey };
   });
-  if (inserted) target.update((state) => state && { ...state, focusedKey: newKey });
   return inserted;
 }
 

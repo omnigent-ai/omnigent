@@ -12,7 +12,7 @@ import {
   movePaneCommand,
   moveSplitPane,
   NO_ROOM_TO_MOVE_REASON,
-  paneDropArea,
+  placedPaneArea,
   paneDropSpot,
   paneMoveDestinations,
 } from "./paneMove";
@@ -243,12 +243,30 @@ describe("paneDropSpot", () => {
   });
 });
 
-describe("paneDropArea", () => {
-  it("is the half of the target the pane would take", () => {
-    expect(paneDropArea(AB, "b", "right")).toEqual({ left: 75, top: 0, width: 25, height: 100 });
-    expect(paneDropArea(AB, "b", "left")).toEqual({ left: 50, top: 0, width: 25, height: 100 });
-    expect(paneDropArea(ABC, "c", "top")).toEqual({ left: 50, top: 50, width: 50, height: 25 });
-    expect(paneDropArea(ABC, "b", "bottom")).toEqual({ left: 50, top: 25, width: 50, height: 25 });
-    expect(paneDropArea(AB, "x", "left")).toBeNull();
+describe("placedPaneArea", () => {
+  it("is where a moved pane lands once it has left its place", () => {
+    // Moving a above b: a leaves, so b fills the row before the two stack.
+    expect(placedPaneArea(AB, { kind: "move", key: "a", targetKey: "b", side: "top" })).toEqual({
+      left: 0,
+      top: 0,
+      width: 100,
+      height: 50,
+    });
+  });
+
+  it("is where an inserted pane lands, the others keeping their proportions", () => {
+    const area = placedPaneArea(AB, { kind: "insert", key: "new", targetKey: "b", side: "right" });
+    expect(area?.left).toBeCloseTo(200 / 3);
+    expect(area?.width).toBeCloseTo(100 / 3);
+  });
+
+  it("is null for a placement that changes nothing", () => {
+    expect(placedPaneArea(AB, { kind: "move", key: "a", targetKey: "b", side: "left" })).toBeNull();
+    expect(
+      placedPaneArea(AB, { kind: "insert", key: "a", targetKey: "b", side: "left" }),
+    ).toBeNull();
+    expect(
+      placedPaneArea(AB, { kind: "insert", key: "new", targetKey: "x", side: "left" }),
+    ).toBeNull();
   });
 });
