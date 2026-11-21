@@ -1302,10 +1302,8 @@ aside[aria-label="Workspace"][data-maximized] {
     box-shadow: none;
   }
 
-  /* The dark sidebar's surface image measured from the window's corner, for a backdrop that spans
-   * past the sidebar. A 135deg gradient's position is (x + y) / sqrt(2) from that corner whatever
-   * its box, so a stop at 60% of the sidebar's own diagonal paints the sidebar as its own surface
-   * does and runs on past its edge with no step. Same colors as --sidebar-surface-image. */
+  /* --sidebar-surface-image measured from the window's corner: the 135deg stop sits at 60% of
+   * the sidebar's own diagonal, so the backdrop runs on past the sidebar's edge with no step. */
   .dark .app-shell[data-floating-panes] {
     --floating-backdrop-image:
       linear-gradient(transparent 35%, rgb(255 255 255 / 6%)),

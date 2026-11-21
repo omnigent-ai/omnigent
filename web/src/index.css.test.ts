@@ -921,7 +921,7 @@ describe("index.css sidebar canvas", () => {
   });
 });
 
-/** Each top-level rule in `source`: its selector and its whole body, nested `@variant`s included. */
+/** Each top-level rule in `css`: its selector and its whole body, nested rules included. */
 function topLevelRules(css: string): { selector: string; body: string }[] {
   // A comment's ";" or braces aren't the stylesheet's.
   const source = css.replace(/\/\*[\s\S]*?\*\//g, "");
@@ -937,11 +937,7 @@ function topLevelRules(css: string): { selector: string; body: string }[] {
     } else if (char === "}") {
       depth -= 1;
       if (depth === 0) {
-        const selector = source
-          .slice(start, open)
-          .replace(/\/\*[\s\S]*?\*\//g, "")
-          .replace(/\s+/g, " ")
-          .trim();
+        const selector = source.slice(start, open).replace(/\s+/g, " ").trim();
         rules.push({ selector, body: source.slice(open + 1, index) });
         start = index + 1;
       }
