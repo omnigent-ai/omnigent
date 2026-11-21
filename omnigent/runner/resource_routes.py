@@ -1505,6 +1505,7 @@ def register_resource_routes(
         pr_url: str | None = None,
         server_tracked: bool = False,
         default_pr_url: str | None = None,
+        summary: bool = False,
     ) -> JSONResponse:
         return await _github_call(
             session_id,
@@ -1512,6 +1513,8 @@ def register_resource_routes(
             pr_url=pr_url,
             server_tracked=server_tracked,
             default_pr_url=default_pr_url,
+            # The server's listed-session refresh asks for a summary.
+            summary=summary,
         )
 
     @app.get("/v1/sessions/{session_id}/resources/github/changes")
