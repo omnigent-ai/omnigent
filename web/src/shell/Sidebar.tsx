@@ -231,7 +231,7 @@ import { SidebarEditRow } from "./SidebarEditRow";
 import { isInClosedSidebar, registerSidebarRename } from "./sidebarRename";
 import { hasSessionDraft, useHasSessionDraft, useSessionDraftIds } from "@/lib/sessionDrafts";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
-import type { SessionState } from "@/hooks/useSessionState";
+import { withUnreadState, type SessionState } from "@/hooks/useSessionState";
 import { useSessionBadgeStates } from "@/hooks/useSessionBadgeStates";
 import { useChatStore } from "@/store/chatStore";
 import {
@@ -4091,7 +4091,10 @@ function projectMarkerState(
   let disconnected = false;
   let unseen = false;
   for (const [i, c] of conversations.entries()) {
-    const state = states[i];
+    const state = withUnreadState(
+      states[i],
+      showsUnreadFor(c, isConversationUnseen(c.id, c.updated_at, c.status)),
+    );
     if (state?.kind === "awaiting") {
       awaiting += state.count;
       terminalReason ??= state.terminalReason;
@@ -4103,7 +4106,7 @@ function projectMarkerState(
       error = true;
     } else if (state?.kind === "disconnected") {
       disconnected = true;
-    } else if (showsUnreadFor(c, isConversationUnseen(c.id, c.updated_at, c.status))) {
+    } else if (state?.kind === "unseen") {
       unseen = true;
     }
   }
@@ -6149,9 +6152,11 @@ function ConversationRowImpl({
   const unread = readState.unseen && (!isActive || readState.explicitlyUnread);
   const hasUnseenMessages = showsUnreadFor(conversation, unread);
   const canMarkUnread = !unread;
-  // Approvals and failures outrank the unread dot without clearing read state.
+  // Approvals, turns and failures outrank the unread dot without clearing read
+  // state; background work alone yields to it.
   const badgeConversations = useMemo(() => [conversation], [conversation]);
   const [derivedState] = useSessionBadgeStates(badgeConversations);
+  const badgeState = withUnreadState(derivedState, hasUnseenMessages);
   // The bound session's launch/relaunch window: a send is in flight (local
   // status "streaming") or the runner is auto-creating the PTY
   // (`terminalPending`), but the server hasn't confirmed `running` yet — a
@@ -6163,11 +6168,11 @@ function ConversationRowImpl({
     (s) => s.conversationId === conversation.id && (s.status === "streaming" || s.terminalPending),
   );
   const sessionState =
-    derivedState?.kind === "awaiting" || derivedState?.kind === "running"
-      ? derivedState
+    badgeState?.kind === "awaiting" || badgeState?.kind === "running"
+      ? badgeState
       : isStartingUp
         ? { kind: "starting" as const }
-        : (derivedState ?? (hasUnseenMessages ? { kind: "unseen" as const } : null));
+        : badgeState;
   // Drafts share the row's trailing indicator slot, but the active session's
   // composer already makes its draft visible. Live session state wins while
   // present; otherwise only an inactive row needs the draft marker.
