@@ -845,18 +845,18 @@ async def test_events_compact_on_codex_native_returns_503_on_tmux_failure(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("active_turn_id", ["turn_running", None], ids=["busy", "idle"])
-async def test_events_codex_native_approval_mode_change_types_only_when_idle(
+async def test_events_codex_native_approval_mode_change_queues_while_busy(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     active_turn_id: str | None,
 ) -> None:
     """
-    An approval-mode switch while Codex runs a turn is refused, not keyed in.
+    An approval-mode switch while Codex runs a turn waits for idle, not Escape.
 
     Codex disables /permissions during a turn, and the Escape that opens it
-    interrupts the turn and drops the message it carries. The 409 detail tells
-    the person why the mode did not change. Once the session is idle the same
-    request drives the /permissions popup and reports the confirmed mode.
+    interrupts the turn and drops the message it carries. A busy request returns
+    immediately and only the latest queued pick drives the popup after the turn.
+    An idle request keeps its synchronous confirmed response.
     """
     from tests.runner.helpers import make_test_terminal_instance
 
@@ -867,6 +867,18 @@ async def test_events_codex_native_approval_mode_change_types_only_when_idle(
         "  enter select · esc back\n"
     )
     tmux_calls: list[tuple[str, ...]] = []
+    confirmations: list[str] = []
+    approval_readbacks: list[dict[str, Any]] = []
+
+    original_server_post = NullServerClient.post
+
+    async def _record_approval_readback(
+        self: NullServerClient, url: str, **kwargs: Any
+    ) -> NullServerClient._Response:
+        body = kwargs.get("json")
+        if isinstance(body, dict) and body.get("type") == "external_codex_approval_mode_change":
+            approval_readbacks.append(body["data"])
+        return await original_server_post(self, url, **kwargs)
 
     def _recording_run_tmux(socket_path: str, *args: str) -> None:
         del socket_path
@@ -874,10 +886,13 @@ async def test_events_codex_native_approval_mode_change_types_only_when_idle(
 
     def _fake_capture_pane(socket_path: str, target: str, **kwargs: Any) -> str:
         del socket_path, target, kwargs
-        # The popup stays up until its Full Access row is picked; Codex then
-        # prints the confirmation line.
+        # The popup stays up until a row is picked; Codex then prints its echo.
         if any(call[-1] == "2" for call in tmux_calls):
+            confirmations.append("Full Access")
             return "• Permissions updated to Full Access\n"
+        if active_turn_id is not None and any(call[-1] == "1" for call in tmux_calls):
+            confirmations.append("Ask for approval")
+            return "• Permissions updated to Ask for approval\n"
         return popup
 
     async def _no_op_auto_create(*args: Any, **kwargs: Any) -> None:
@@ -886,7 +901,9 @@ async def test_events_codex_native_approval_mode_change_types_only_when_idle(
 
     monkeypatch.setattr(claude_native_bridge, "_run_tmux", _recording_run_tmux)
     monkeypatch.setattr(claude_native_bridge, "_capture_pane", _fake_capture_pane)
+    monkeypatch.setattr(NullServerClient, "post", _record_approval_readback)
     monkeypatch.setattr(native_controls, "_CODEX_POPUP_RENDER_S", 0)
+    monkeypatch.setattr(native_controls, "_CODEX_APPROVAL_QUEUE_POLL_S", 0.001)
     monkeypatch.setattr(
         "omnigent.runner.native.orchestration._auto_create_codex_terminal", _no_op_auto_create
     )
@@ -921,6 +938,133 @@ async def test_events_codex_native_approval_mode_change_types_only_when_idle(
             f"/v1/sessions/{conv_id}/events",
             json={"type": "codex_approval_mode_change", "approval_mode": "full-access"},
         )
+        if active_turn_id is not None:
+            assert resp.status_code == 202, resp.text
+            assert resp.json() == {"approval_mode": "full-access", "queued": True}
+            assert tmux_calls == []
+
+            # A later pick replaces the queued one instead of driving two popups.
+            resp = await client.post(
+                f"/v1/sessions/{conv_id}/events",
+                json={"type": "codex_approval_mode_change", "approval_mode": "ask-for-approval"},
+            )
+            assert resp.status_code == 202, resp.text
+            assert resp.json() == {"approval_mode": "ask-for-approval", "queued": True}
+            assert tmux_calls == []
+            workers = {
+                task
+                for task in asyncio.all_tasks()
+                if task.get_name() == f"codex-approval-mode-{conv_id}"
+            }
+            assert len(workers) == 1
+
+            bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
+            codex_native_bridge.update_active_turn_id(bridge_dir, None)
+            for _ in range(200):
+                if confirmations:
+                    break
+                await asyncio.sleep(0.01)
+            assert confirmations == ["Ask for approval"]
+            await asyncio.wait_for(asyncio.gather(*workers), timeout=1)
+
+            class _ApprovalReadbackClient:
+                async def connect(self) -> None:
+                    return None
+
+                async def close(self) -> None:
+                    return None
+
+                async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+                    assert method == "thread/read"
+                    assert params == {"threadId": "thread_codex", "includeTurns": False}
+                    return {
+                        "result": {
+                            "thread": {
+                                "approvalPolicy": "never",
+                                "sandboxPolicy": {"type": "dangerFullAccess"},
+                            }
+                        }
+                    }
+
+            monkeypatch.setattr(
+                "omnigent.harnesses.codex_native.app_server.client_for_transport",
+                lambda *args, **kwargs: _ApprovalReadbackClient(),
+            )
+            codex_native_bridge.update_active_turn_id(bridge_dir, "turn_without_read_only")
+            tmux_calls.clear()
+            resp = await client.post(
+                f"/v1/sessions/{conv_id}/events",
+                json={"type": "codex_approval_mode_change", "approval_mode": "read-only"},
+            )
+            assert resp.status_code == 202, resp.text
+            workers = {
+                task
+                for task in asyncio.all_tasks()
+                if task.get_name() == f"codex-approval-mode-{conv_id}"
+            }
+            assert len(workers) == 1
+            codex_native_bridge.update_active_turn_id(bridge_dir, None)
+            await asyncio.wait_for(asyncio.gather(*workers), timeout=1)
+            assert approval_readbacks == [{"approval_mode": "full-access"}]
+
+            # An older request suspended during bridge resolution must not
+            # bypass a newer queued pick when it resumes.
+            original_server_get = NullServerClient.get
+            older_resolution_started = asyncio.Event()
+            release_older_resolution = asyncio.Event()
+            older_resolution_held = False
+
+            async def _hold_older_resolution(
+                self: NullServerClient, url: str, **kwargs: Any
+            ) -> NullServerClient._Response:
+                nonlocal older_resolution_held
+                if not older_resolution_held and url.endswith(f"/v1/sessions/{conv_id}/labels"):
+                    older_resolution_held = True
+                    older_resolution_started.set()
+                    await release_older_resolution.wait()
+                return await original_server_get(self, url, **kwargs)
+
+            codex_native_bridge.update_active_turn_id(bridge_dir, "turn_overlapping_requests")
+            monkeypatch.setattr(NullServerClient, "get", _hold_older_resolution)
+            tmux_calls.clear()
+            confirmations.clear()
+            older_request = asyncio.create_task(
+                client.post(
+                    f"/v1/sessions/{conv_id}/events",
+                    json={"type": "codex_approval_mode_change", "approval_mode": "full-access"},
+                )
+            )
+            await asyncio.wait_for(older_resolution_started.wait(), timeout=1)
+            newer_request = asyncio.create_task(
+                client.post(
+                    f"/v1/sessions/{conv_id}/events",
+                    json={
+                        "type": "codex_approval_mode_change",
+                        "approval_mode": "ask-for-approval",
+                    },
+                )
+            )
+            await asyncio.sleep(0)
+            release_older_resolution.set()
+            older_response, resp = await asyncio.wait_for(
+                asyncio.gather(older_request, newer_request), timeout=1
+            )
+            assert older_response.status_code == 202, older_response.text
+            assert resp.status_code == 202, resp.text
+            assert tmux_calls == []
+            workers = {
+                task
+                for task in asyncio.all_tasks()
+                if task.get_name() == f"codex-approval-mode-{conv_id}"
+            }
+            assert len(workers) == 1
+            codex_native_bridge.update_active_turn_id(bridge_dir, None)
+            for _ in range(200):
+                if confirmations:
+                    break
+                await asyncio.sleep(0.01)
+            assert confirmations == ["Ask for approval"]
+            await asyncio.wait_for(asyncio.gather(*workers), timeout=1)
 
     if active_turn_id is None:
         assert resp.status_code == 200, resp.text
@@ -935,14 +1079,16 @@ async def test_events_codex_native_approval_mode_change_types_only_when_idle(
             ("send-keys", "-l", "-t", target, "1"),
         ]
         return
-    assert resp.status_code == 409, resp.text
-    body = resp.json()
-    assert body["error"] == "codex_native_approval_mode_busy"
-    assert body["detail"] == (
-        "Codex is working on a turn. Change the approval mode after it finishes, "
-        "or stop the turn first."
-    )
-    assert tmux_calls == []
+    assert resp.status_code == 202, resp.text
+    assert resp.json() == {"approval_mode": "ask-for-approval", "queued": True}
+    target = instance.tmux_target
+    assert tmux_calls == [
+        ("send-keys", "-t", target, "Escape"),
+        ("send-keys", "-t", target, "C-u"),
+        ("send-keys", "-l", "-t", target, "/permissions"),
+        ("send-keys", "-t", target, "Enter"),
+        ("send-keys", "-l", "-t", target, "1"),
+    ]
 
 
 @pytest.mark.asyncio

@@ -210,6 +210,8 @@ _CODEX_PERMISSION_CONFIRM_BUDGET_S = 4.0
 # (Read Only appears only with a read-only permission profile), so the digit is
 # read from the live popup when possible rather than hardcoded.
 _CODEX_PERMISSION_MENU_BUDGET_S = 5.0
+_CODEX_APPROVAL_QUEUE_POLL_S = 0.1
+_CODEX_APPROVAL_READBACK_TIMEOUT_S = 5.0
 _CODEX_SETTINGS_READY_POLL_S = 0.1
 _CODEX_SETTINGS_CLOSE_TIMEOUT_S = 1.0
 # Older servers read any reply as a confirmed result, so outlast their
@@ -388,6 +390,11 @@ def build_native_controls(
     """
     # Weak values drop idle sessions, so a holder must keep its lock in a local.
     _codex_settings_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+        weakref.WeakValueDictionary()
+    )
+    _codex_approval_mode_pending: dict[str, str] = {}
+    _codex_approval_mode_workers: dict[str, asyncio.Task[None]] = {}
+    _codex_approval_mode_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
         weakref.WeakValueDictionary()
     )
 
@@ -869,7 +876,7 @@ def build_native_controls(
             },
         )
 
-    async def _handle_codex_native_approval_mode_change(
+    async def _apply_codex_native_approval_mode_change(
         conv_id: str,
         mode: str,
     ) -> Response:
@@ -906,6 +913,7 @@ def build_native_controls(
         if state is not None and state.active_turn_id is not None:
             # Codex disables /permissions while a turn runs, and the Escape that
             # opens it would interrupt that turn and drop the message it carries.
+            # The public handler queues this refusal and retries after the turn.
             return JSONResponse(
                 status_code=409,
                 content={
@@ -977,6 +985,146 @@ def build_native_controls(
                 },
             )
         return JSONResponse(status_code=200, content={"approval_mode": preset.value})
+
+    async def _reconcile_codex_approval_mode_after_failure(conv_id: str) -> None:
+        """Publish Codex's actual preset when a queued switch does not apply."""
+        from omnigent.codex_approval_modes import codex_permission_preset_from_thread_settings
+        from omnigent.harnesses.codex_native.app_server import client_for_transport
+
+        state = await _codex_native_bridge_state_for_session(
+            conv_id, action="approval mode read-back", missing_state_log_level=logging.DEBUG
+        )
+        if state is None:
+            return
+        codex_client = client_for_transport(
+            state.socket_path,
+            client_name="omnigent-codex-native-approval-readback",
+        )
+        try:
+            async with asyncio.timeout(_CODEX_APPROVAL_READBACK_TIMEOUT_S):
+                await codex_client.connect()
+                response = await codex_client.request(
+                    "thread/read", {"threadId": state.thread_id, "includeTurns": False}
+                )
+        finally:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(
+                    codex_client.close(), timeout=_CODEX_SETTINGS_CLOSE_TIMEOUT_S
+                )
+        result = response.get("result")
+        thread = result.get("thread") if isinstance(result, dict) else None
+        settings = thread.get("settings") if isinstance(thread, dict) else None
+        if not isinstance(settings, dict):
+            settings = thread
+        actual_mode = codex_permission_preset_from_thread_settings(settings)
+        if actual_mode is None:
+            _logger.warning(
+                "Could not read back Codex approval mode after queued failure for session=%s",
+                conv_id,
+                extra={"session_id": conv_id},
+            )
+            return
+        posted = await server_client.post(
+            f"/v1/sessions/{urllib.parse.quote(conv_id, safe='')}/events",
+            json={
+                "type": "external_codex_approval_mode_change",
+                "data": {"approval_mode": actual_mode},
+            },
+            timeout=5.0,
+        )
+        if posted.status_code >= 400:
+            _logger.warning(
+                "Could not reconcile Codex approval mode for session=%s: HTTP %s",
+                conv_id,
+                posted.status_code,
+                extra={"session_id": conv_id},
+            )
+
+    def _codex_approval_mode_lock(conv_id: str) -> asyncio.Lock:
+        lock = _codex_approval_mode_locks.get(conv_id)
+        if lock is None:
+            lock = _codex_approval_mode_locks[conv_id] = asyncio.Lock()
+        return lock
+
+    def _start_codex_approval_mode_worker(conv_id: str) -> None:
+        worker = asyncio.create_task(
+            _drain_codex_approval_mode_queue(conv_id),
+            name=f"codex-approval-mode-{conv_id}",
+        )
+        _codex_approval_mode_workers[conv_id] = worker
+        _background_tasks.add(worker)
+        worker.add_done_callback(_background_tasks.discard)
+
+    async def _drain_codex_approval_mode_queue(conv_id: str) -> None:
+        lock = _codex_approval_mode_lock(conv_id)
+        try:
+            while True:
+                async with lock:
+                    mode = _codex_approval_mode_pending.get(conv_id)
+                    if mode is None:
+                        return
+                    response = await _apply_codex_native_approval_mode_change(conv_id, mode)
+                    if response.status_code != 409:
+                        is_latest = _codex_approval_mode_pending.get(conv_id) == mode
+                        if response.status_code >= 400 and is_latest:
+                            await _reconcile_codex_approval_mode_after_failure(conv_id)
+                        if is_latest:
+                            _codex_approval_mode_pending.pop(conv_id, None)
+                if response.status_code == 409:
+                    await asyncio.sleep(_CODEX_APPROVAL_QUEUE_POLL_S)
+                    continue
+                if response.status_code >= 400:
+                    _logger.warning(
+                        "Queued Codex approval mode change failed for session=%s mode=%s: HTTP %s",
+                        conv_id,
+                        mode,
+                        response.status_code,
+                        extra={"session_id": conv_id},
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _logger.warning(
+                "Queued Codex approval mode worker failed for session=%s",
+                conv_id,
+                exc_info=True,
+                extra={"session_id": conv_id},
+            )
+            _codex_approval_mode_pending.pop(conv_id, None)
+        finally:
+            async with lock:
+                _codex_approval_mode_workers.pop(conv_id, None)
+                current_worker = asyncio.current_task()
+                if conv_id in _codex_approval_mode_pending and (
+                    current_worker is None or not current_worker.cancelling()
+                ):
+                    _start_codex_approval_mode_worker(conv_id)
+
+    async def _handle_codex_native_approval_mode_change(
+        conv_id: str,
+        mode: str,
+    ) -> Response:
+        lock = _codex_approval_mode_lock(conv_id)
+        async with lock:
+            if conv_id not in _codex_approval_mode_workers:
+                response = await _apply_codex_native_approval_mode_change(conv_id, mode)
+                if response.status_code != 409:
+                    return response
+            # Queue behind the worker even if the turn just settled, so the
+            # request and worker cannot drive the popup concurrently.
+            _codex_approval_mode_pending[conv_id] = mode
+            if conv_id not in _codex_approval_mode_workers:
+                _start_codex_approval_mode_worker(conv_id)
+        _logger.info(
+            "Codex approval mode change queued behind active turn for session=%s mode=%s",
+            conv_id,
+            mode,
+            extra={"session_id": conv_id},
+        )
+        return JSONResponse(
+            status_code=202,
+            content={"approval_mode": mode, "queued": True},
+        )
 
     async def _codex_native_model_options(
         conv_id: str, *, retry_unreachable: bool = True
