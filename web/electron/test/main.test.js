@@ -274,7 +274,12 @@ function loadNavigationHarness({
   const bannerCalls = { show: [], hide: 0 };
   // The reconnect overlay's behavior is unit-tested in reconnect_overlay.test.js.
   const overlay = { hint: null, shows: [], hides: 0, raises: 0, cancel: null };
-  const browserRegistryCalls = { setActive: [], closeAll: [], setOpenTabSupported: [] };
+  const browserRegistryCalls = {
+    setActive: [],
+    closeAll: [],
+    setOpenTabSupported: [],
+    setForwardedChords: [],
+  };
   let browserRegistryDeps;
   let browserIpcDeps;
   const permissionPromptCalls = { show: [], dismiss: [] };
@@ -691,6 +696,7 @@ function loadNavigationHarness({
               setRecentSessionSwitchSupported: () => {},
               setOpenTabSupported: (supported) =>
                 browserRegistryCalls.setOpenTabSupported.push(supported),
+              setForwardedChords: (chords) => browserRegistryCalls.setForwardedChords.push(chords),
               activeConversationId: () => null,
             };
           },
@@ -3598,6 +3604,77 @@ describe("browser view detach on main-frame navigation (src/main.js)", () => {
     assert.deepEqual(harness.browserRegistryCalls.setOpenTabSupported, [false]);
     harness.cleanup();
   });
+
+  it("hands page keys back when the shell starts a new document or its renderer goes away", () => {
+    const harness = loadNavigationHarness({ registerFallbacks: false });
+    harness.api.createWindow("https://host.example/ml/omnigents");
+
+    harness.emit("did-start-navigation", "https://host.example/ml/omnigents#c/1", true, true);
+    harness.emit("did-start-navigation", "https://frame.example/", false, false);
+    assert.deepEqual(harness.browserRegistryCalls.setForwardedChords, []);
+
+    // main runs in its own context, so compare each cleared list's length.
+    const cleared = () =>
+      harness.browserRegistryCalls.setForwardedChords.map((list) => list.length);
+    harness.emit("did-start-navigation", "https://host.example/ml/omnigents", false, true);
+    assert.deepEqual(cleared(), [0]);
+    harness.emit("render-process-gone", {}, { reason: "crashed" });
+    assert.deepEqual(cleared(), [0, 0]);
+    harness.cleanup();
+  });
+
+  for (const [replacement, replace] of [
+    [
+      "a reload into a bundle that never asks",
+      (h) => h.emit("did-start-navigation", "https://host.example/ml/omnigents", false, true),
+    ],
+    ["a crashed renderer", (h) => h.emit("render-process-gone", {}, { reason: "crashed" })],
+  ]) {
+    it(`leaves a page its keys after ${replacement}`, () => {
+      const h = loadNavigationHarness({ registerFallbacks: false, realBrowserRegistry: true });
+      try {
+        Object.assign(h.webContents, { focus() {} });
+        h.electron.session.fromPartition = () => ({
+          setPermissionRequestHandler() {},
+          setPermissionCheckHandler() {},
+          webRequest: { onBeforeRequest() {}, onBeforeSendHeaders() {}, onHeadersReceived() {} },
+        });
+        h.electron.createWebContentsView = () => {
+          const wc = Object.assign(new EventEmitter(), {
+            ipc: new EventEmitter(),
+            setWindowOpenHandler() {},
+            loadURL() {},
+          });
+          return { webContents: wc, setVisible() {}, setBounds() {}, getBounds: () => ({}) };
+        };
+        const registry = h.api.createBrowserRegistryForWindow(h.win);
+        const page = registry.openOrNavigate("browser-tab:conv:t1", "https://page.example/").entry
+          .view.webContents;
+        const pressCommandK = () => {
+          let prevented = false;
+          const before = h.calls.progress.length;
+          page.emit(
+            "before-input-event",
+            { preventDefault: () => (prevented = true) },
+            { type: "keyDown", key: "k", code: "KeyK", meta: true },
+          );
+          const forwarded = h.calls.progress
+            .slice(before)
+            .filter(({ channel }) => channel === "browser-forwarded-input");
+          return { prevented, forwarded: forwarded.length };
+        };
+
+        registry.setForwardedChords([
+          { key: "k", metaKey: true, ctrlKey: false, altKey: false, shiftKey: false },
+        ]);
+        assert.deepEqual(pressCommandK(), { prevented: true, forwarded: 1 });
+        replace(h);
+        assert.deepEqual(pressCommandK(), { prevented: false, forwarded: 0 });
+      } finally {
+        h.cleanup();
+      }
+    });
+  }
 });
 
 // Wiring guards for the window-open policy (src/popupPolicy.js decides,

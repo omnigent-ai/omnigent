@@ -187,6 +187,7 @@ describe("browserViewRegistry — first-navigate activation signal", () => {
 function makeRecentSessionInputRegistry({
   isHostFocused = () => true,
   supportsRecentSessionSwitch = true,
+  focusHost = () => {},
 } = {}) {
   const listeners = new Map();
   const sent = [];
@@ -206,12 +207,71 @@ function makeRecentSessionInputRegistry({
     detachFromHost() {},
     sendToRenderer: (channel, payload) => sent.push({ channel, payload }),
     isHostFocused,
+    focusHost,
+    platform: "darwin",
   });
   registry.openOrNavigate("conv_1", "https://example.com");
   registry.setActive("conv_1");
   registry.setRecentSessionSwitchSupported(supportsRecentSessionSwitch);
   return { registry, listeners, sent };
 }
+
+describe("browserViewRegistry — app chords a page hands to the shell", () => {
+  const COMMAND_K = { key: "k", metaKey: true, ctrlKey: false, altKey: false, shiftKey: false };
+
+  function press(listeners, input) {
+    let prevented = false;
+    listeners.get("before-input-event")(
+      { preventDefault: () => (prevented = true) },
+      { type: "keyDown", ...input },
+    );
+    return prevented;
+  }
+
+  it("takes no key from a page until the renderer lists its chords", () => {
+    const { listeners, sent } = makeRecentSessionInputRegistry({
+      supportsRecentSessionSwitch: false,
+    });
+    assert.equal(press(listeners, { key: "k", code: "KeyK", meta: true }), false);
+    assert.deepEqual(
+      sent.filter((item) => item.channel === "browser-forwarded-input"),
+      [],
+    );
+  });
+
+  it("hands a listed chord to the focused shell, and other keys to the page", () => {
+    let focused = 0;
+    const { registry, listeners, sent } = makeRecentSessionInputRegistry({
+      supportsRecentSessionSwitch: false,
+      focusHost: () => (focused += 1),
+    });
+    assert.deepEqual(registry.setForwardedChords([COMMAND_K]), { ok: true, count: 1 });
+    const forwarded = () => sent.filter((item) => item.channel === "browser-forwarded-input");
+
+    assert.equal(press(listeners, { key: "k", code: "KeyK", meta: true }), true);
+    assert.equal(focused, 1);
+    assert.deepEqual(forwarded()[0].payload, {
+      type: "keydown",
+      key: "k",
+      code: "KeyK",
+      ctrlKey: false,
+      shiftKey: false,
+      altKey: false,
+      metaKey: true,
+      repeat: false,
+    });
+    assert.equal(press(listeners, { key: "j", code: "KeyJ", meta: true }), false);
+    assert.equal(
+      press(listeners, { key: "k", code: "KeyK", meta: true, isComposing: true }),
+      false,
+    );
+
+    // An empty list, which main sets when the renderer is replaced, hands every key back.
+    registry.setForwardedChords([]);
+    assert.equal(press(listeners, { key: "k", code: "KeyK", meta: true }), false);
+    assert.equal(forwarded().length, 1);
+  });
+});
 
 describe("browserViewRegistry — recent-session input forwarding", () => {
   it("leaves page shortcuts untouched until the renderer advertises support", () => {

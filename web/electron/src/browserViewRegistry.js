@@ -31,6 +31,11 @@ const { isDesktopOpenRequest } = require("./desktopOpenServer");
 const { createAgentNavigation } = require("./agentNavigation");
 const { hasHostLocalAccess } = require("./hostIdentity");
 const { agentInputInFlight } = require("./browserInput");
+const {
+  forwardedKeydown,
+  matchesForwardedChord,
+  normalizeForwardedChords,
+} = require("./browserForwardedChords");
 
 // Each view is a separate renderer process; the cap bounds memory per window.
 const DEFAULT_CAP = 20;
@@ -88,6 +93,10 @@ function createBrowserViewRegistry({
   getHostZoomFactor = () => 1,
   getHostDisplayScaleFactor = () => null,
   isHostFocused = () => true,
+  // Give the shell window keyboard focus, for a chord forwarded from a page.
+  focusHost = () => {},
+  // Which keys write text depends on the OS (AltGr arrives as Ctrl+Alt off the Mac).
+  platform = process.platform,
   // Desktop affordances for the pane's context menu; injected so the registry
   // stays Electron-free. No-op defaults keep tests and non-menu hosts simple.
   openUrlExternal = () => {}, // (url) => shell.openExternal(url)
@@ -155,6 +164,8 @@ function createBrowserViewRegistry({
   // across attaches: a view that becomes active while suppressed stays hidden.
   let overlaySuppressed = false;
   let recentSessionSwitchSupported = false;
+  // The app chords the renderer handles itself; none until a renderer that handles them asks.
+  let forwardedChords = [];
   // Set by an SPA that opens `browser-open-tab` requests as new tabs; an older
   // SPA would drop them, so modifier-clicks navigate in place until declared.
   let openTabSupported = false;
@@ -394,6 +405,20 @@ function createBrowserViewRegistry({
     return { ok: true };
   }
 
+  function setForwardedChords(chords) {
+    forwardedChords = normalizeForwardedChords(chords);
+    return { ok: true, count: forwardedChords.length };
+  }
+
+  // Hand the renderer's app chords to it, focused, so ⌘K acts as if the page weren't there.
+  function forwardAppChord(event, input) {
+    if (!matchesForwardedChord(forwardedChords, input, platform)) return false;
+    event.preventDefault();
+    focusHost();
+    sendToRenderer("browser-forwarded-input", forwardedKeydown(input));
+    return true;
+  }
+
   function attachRecentSessionInput(entry) {
     // Another view taking keys for the page (the design tools' overlay) forwards them too.
     entry.forwardRecentSessionInput = (wc) => forwardRecentSessionInputFrom(entry, wc);
@@ -403,9 +428,10 @@ function createBrowserViewRegistry({
   function forwardRecentSessionInputFrom(entry, wc) {
     if (!wc || typeof wc.on !== "function") return;
     wc.on("before-input-event", (event, input) => {
-      if (!recentSessionSwitchSupported) return;
       // An agent's key presses are for the page, never the shell.
       if (agentInputInFlight(wc)) return;
+      if (forwardAppChord(event, input)) return;
+      if (!recentSessionSwitchSupported) return;
       const type =
         input && input.type === "keyDown"
           ? "keydown"
@@ -806,6 +832,7 @@ function createBrowserViewRegistry({
     setSuppressed,
     cancelRecentSessionSwitch,
     setRecentSessionSwitchSupported,
+    setForwardedChords,
     setOpenTabSupported,
     close,
     closeAll,

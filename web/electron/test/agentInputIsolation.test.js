@@ -2,7 +2,8 @@
 
 // An agent's protocol input stays in the page. Electron 42
 // doesn't raise before-input-event for it, but the shell's Ctrl+Tab session
-// switcher also ignores it explicitly in case a later Electron does.
+// switcher and the app chords a page hands to the shell also ignore it explicitly
+// in case a later Electron does.
 
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
@@ -65,12 +66,13 @@ function makeRegistry() {
     detachFromHost() {},
     sendToRenderer: (channel, payload) => sent.push({ channel, payload }),
     isHostFocused: () => true,
+    platform: "linux",
   });
   registry.openOrNavigate("conv_1", "https://example.com");
   registry.setActive("conv_1");
   registry.setRecentSessionSwitchSupported(true);
   const forwarded = () => sent.filter((item) => item.channel === "browser-recent-session-input");
-  return { registry, listeners, forwarded, keys, entry: registry.get("conv_1") };
+  return { registry, listeners, forwarded, sent, keys, entry: registry.get("conv_1") };
 }
 
 describe("agent key presses and the recent-session switcher", () => {
@@ -93,4 +95,24 @@ describe("agent key presses and the recent-session switcher", () => {
       assert.equal(forwarded().length, 1, "the user's Ctrl+Tab still opens the switcher");
     });
   }
+});
+
+describe("agent key presses and the app chords a page hands to the shell", () => {
+  it("keeps an agent's Ctrl+K in the page, and still forwards the user's", async () => {
+    const { registry, listeners, sent, entry } = makeRegistry();
+    registry.setForwardedChords([
+      { key: "k", metaKey: false, ctrlKey: true, altKey: false, shiftKey: false },
+    ]);
+    const chords = () => sent.filter((item) => item.channel === "browser-forwarded-input");
+    await performBrowserInput(entry, "press_key", { key: "Control+k" });
+    assert.deepEqual(chords(), [], "the agent's chord reached the page only");
+    await new Promise((resolve) => {
+      setTimeout(resolve, AGENT_INPUT_GRACE_MS + 50);
+    });
+    listeners.get("before-input-event")(
+      { preventDefault() {} },
+      { type: "keyDown", key: "k", code: "KeyK", control: true },
+    );
+    assert.equal(chords().length, 1, "the user's Ctrl+K reaches the app");
+  });
 });
