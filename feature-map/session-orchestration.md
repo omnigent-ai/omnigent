@@ -18,6 +18,13 @@ MCP independent creation.
   the prefix. The title comes from sessions the sidebar, the viewed session's
   subagents or the session cache already hold, else one lookup; an unreadable
   sender reads "From another session". The prefix is a label, not proof of origin.
+- `recipient-attribution`: the sender's Chat shows each `sys_session_message`, and the first
+  task of a same-host, host or managed `sys_session_create`, as a collapsed "To @<destination>"
+  row in place of its tool row. The row never folds into the turn's steps; it expands to the
+  sent text, and the pill opens the destination. It appears once the server accepts the send
+  (a boolean `queued`), which is not proof of delivery or reading. "Not sent" needs a proven
+  refusal: a policy denial or the runner's `delivery: "refused"`. Any other error, or a turn
+  that ends mid-send, reads "Could not confirm send".
 - `read-results`: the manager reads history/status; replies are not forwarded.
   Existing owner-authorized reads remain allowed when a session is shared.
   `sys_session_get_info` reports the session's `permission_mode` in its
@@ -167,7 +174,8 @@ MCP independent creation.
   messaging, or `/settings/sharing`, and toggle **Message other sessions**.
 - In an SDK session's Chat, ask the agent to send a task using
   `sys_session_message`, then inspect the destination's history. Its new user
-  bubble shows "From @<sender>"; click the pill to open the sender.
+  bubble shows "From @<sender>"; click the pill to open the sender. The sender's
+  Chat shows the send as "To @<destination>"; click the row to read the text.
 - In a native session's Chat or agent terminal, ask for the same operation;
   the native MCP relay supplies the tools.
 - In a session with creation tools enabled, ask for a worker with

@@ -49,7 +49,7 @@ import {
   parseDesignRequest,
   type DesignRequest,
 } from "@/components/BrowserPane/designTools/parseDesignRequest";
-import { SessionMentionPill } from "@/components/blocks/ChatMarkdown";
+import { SessionMessageLabel } from "@/components/blocks/SessionMessageCard";
 import {
   BlockRenderer,
   FilePathAwareMessageResponse,
@@ -81,7 +81,6 @@ import {
 import { readableSentText, replaceSentMentions } from "@/lib/composerMentions";
 import { mentionPillMarkdown } from "@/lib/mentionPills";
 import { splitSessionMessageOrigin, type SessionMessageOrigin } from "@/lib/sessionMessageOrigin";
-import { useSessionLabel } from "@/hooks/useSessionLabel";
 import type { AnyBlock, ImageContentBlock, MessageContentBlock } from "@/lib/blocks";
 import {
   attachmentLabel,
@@ -164,28 +163,18 @@ function userMarkdownText(content: MessageContentBlock[]): string {
 function SessionMessageOriginLine({
   sourceId,
   currentSessionId,
-  className,
 }: {
   sourceId: string;
   currentSessionId: string | null;
-  className?: string;
 }) {
-  const label = useSessionLabel(sourceId, currentSessionId);
   return (
-    <div
-      data-testid="message-origin"
-      className={cn("flex shrink-0 items-center gap-1 text-xs text-muted-foreground", className)}
-    >
-      <CornerDownRightIcon className="size-3 shrink-0" />
-      <span>From</span>
-      {label ? (
-        <SessionMentionPill id={sourceId} isSubagent={label.isSubagent}>
-          @{label.title}
-        </SessionMentionPill>
-      ) : (
-        <span>another session</span>
-      )}
-    </div>
+    <SessionMessageLabel
+      sessionId={sourceId}
+      currentSessionId={currentSessionId}
+      verb="From"
+      icon={CornerDownRightIcon}
+      testId="message-origin"
+    />
   );
 }
 

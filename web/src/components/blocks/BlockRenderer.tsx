@@ -9,14 +9,14 @@
 //    hidden ("Read 2 files", rendered by `ToolGroupSummary`). While
 //    the run is the live activity, the trailing `STREAMING_TAIL`
 //    tools stay visible as individual rows so the user can watch
-//    recent steps. Still-in-progress spinners and durable
-//    routing/fan-out cards never fold regardless of position.
+//    recent steps. Still-in-progress spinners, durable routing/fan-out
+//    cards and messages to other sessions never fold regardless of position.
 //
 // 2. Turn folding: once settled, each work run collapses behind a
 //    "Worked" row, sub-agent notices included. Pending elicitations,
-//    routing cards, the newest notices and assistant messages stay
-//    visible; opt-in `foldNarration` folds narration too (Codex
-//    commentary, else all but the last message).
+//    routing cards, messages to other sessions, the newest notices and
+//    assistant messages stay visible; opt-in `foldNarration` folds
+//    narration too (Codex commentary, else all but the last message).
 
 import type { ReactNode } from "react";
 import { useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
@@ -26,12 +26,14 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { ConversationScrollLockContext } from "@/components/ai-elements/conversation";
 import { formatDuration } from "@/lib/relativeTime";
 import type { RenderItem } from "@/lib/renderItems";
+import { outboundSessionMessage } from "@/lib/sessionMessageOrigin";
 import type { SessionStatus } from "@/lib/types";
 import type { ActiveResponse } from "@/store/types";
 import { cn } from "@/lib/utils";
 import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 import { ElicitationCard } from "./ApprovalCard";
 import { ReasoningView } from "./ReasoningView";
+import { OutboundSessionMessageCard } from "./SessionMessageCard";
 import { SlashCommandCard } from "./SlashCommandCard";
 import { SmartRoutingCard } from "./SmartRoutingCard";
 import { readTaskActivity } from "@/lib/taskActivity";
@@ -834,7 +836,9 @@ const SESSION_SEND_NAMES = new Set(["sys_session_send", "mcp__omnigent__sys_sess
 function isPersistentToolCard(item: RenderItem): boolean {
   return (
     item.kind === "tool" &&
-    (ADVISE_MODELS_NAMES.has(item.execution.name) || SESSION_SEND_NAMES.has(item.execution.name))
+    (ADVISE_MODELS_NAMES.has(item.execution.name) ||
+      SESSION_SEND_NAMES.has(item.execution.name) ||
+      outboundSessionMessage(item) !== null)
   );
 }
 
@@ -919,7 +923,7 @@ function renderItem(
           duration={suppressReasoningDuration ? undefined : item.duration}
         />
       );
-    case "tool":
+    case "tool": {
       // Intelligent routing's fan-out sizing gets a structured plan card
       // instead of the generic tool row.
       if (ADVISE_MODELS_NAMES.has(item.execution.name)) {
@@ -929,6 +933,18 @@ function renderItem(
             arguments={item.execution.arguments}
             output={item.output}
             state={item.state}
+          />
+        );
+      }
+      // A message to another session reads "To @recipient", once, in place of its call.
+      const outbound = outboundSessionMessage(item);
+      if (outbound !== null) {
+        return (
+          <OutboundSessionMessageCard
+            key={key}
+            message={outbound}
+            startedAt={item.startedAt}
+            duration={item.duration}
           />
         );
       }
@@ -943,6 +959,7 @@ function renderItem(
           duration={item.duration}
         />
       );
+    }
     case "native_tool":
       // Reuse the same tool card. Native tools are server-side
       // (provider-managed) so they're always "completed" by the
