@@ -50,6 +50,32 @@ it("proves the exact host and selected server using only a bounded read-only SSH
   assert.deepEqual(call[2], { timeout: 15000, maxBuffer: 65536, encoding: "utf8" });
 });
 
+it("accepts CLI-resolved selectors and equivalent workspace targets for the selected server", async () => {
+  await Promise.all(
+    [
+      { server: daemon.server_url, status: daemon },
+      { server: SERVER, status: { ...daemon, target: daemon.server_url } },
+      {
+        server: SERVER,
+        status: {
+          ...daemon,
+          target: "https://workspace.example/team",
+          server_url: "https://workspace.example/team",
+          same_workspace_as: daemon.server_url,
+        },
+      },
+    ].map(async ({ server, status }) => {
+      assert.equal(
+        await verifySshPreviewIdentity(server, HOST, "devbox", async () => ({
+          stdout: JSON.stringify({ daemons: [status] }),
+        })),
+        true,
+        JSON.stringify({ server, status }),
+      );
+    }),
+  );
+});
+
 it(
   "finds the CLI in an isolated user install with a restricted shell PATH",
   {
@@ -111,7 +137,16 @@ it("refuses missing, ambiguous, offline, mismatched and malformed identity", asy
         { host_id: "b".repeat(32) },
         { target: "https://other.example/team?o=7" },
         { target: "https://server.example/team?o=8" },
-        { target: "https://server.example/team" },
+        {
+          target: "https://workspace.example/team",
+          server_url: "https://workspace.example/team",
+          same_workspace_as: "https://server.example/other",
+        },
+        {
+          target: "https://workspace.example/team",
+          server_url: "https://workspace.example/team",
+          same_workspace_as: "https://server.example/team?o=8",
+        },
         { server_url: "https://server.example/other" },
         { error: "offline" },
         { process: "offline" },

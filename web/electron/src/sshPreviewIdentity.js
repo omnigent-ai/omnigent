@@ -4,25 +4,14 @@ const { execFile } = require("node:child_process");
 const { promisify } = require("node:util");
 const { canonicalHostId } = require("./sshHosts");
 const { REMOTE_PATH, remoteCommand, safeServerUrl, validateDestination } = require("./ssh_connect");
-const { normalizeSavedServerUrl } = require("./url");
-
-function targetUrl(raw) {
-  const url = new URL(normalizeSavedServerUrl(raw));
-  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) {
-    throw new Error("invalid server target");
-  }
-  url.hash = "";
-  url.pathname = url.pathname.replace(/\/+$/, "") || "/";
-  url.searchParams.sort();
-  return url;
-}
+const { normalizedServerTarget, daemonServesTarget } = require("./hostStatusIdentity");
 
 /** Read an existing daemon's identity over the user's SSH, without starting or signing in. */
 async function verifySshPreviewIdentity(serverUrl, hostId, destination, run = promisify(execFile)) {
   try {
     const server = safeServerUrl(serverUrl);
     const target = validateDestination(destination);
-    const expected = targetUrl(server);
+    if (!normalizedServerTarget(server)) return false;
     const { stdout } = await run(
       "ssh",
       [
@@ -58,10 +47,7 @@ async function verifySshPreviewIdentity(serverUrl, hostId, destination, run = pr
       canonicalHostId(daemon.host_id) !== canonicalHostId(hostId)
     )
       return false;
-    // The selected workspace must match; the CLI's server_url omits its query.
-    if (targetUrl(daemon.target).href !== expected.href) return false;
-    expected.search = "";
-    return targetUrl(daemon.server_url).href === expected.href;
+    return daemonServesTarget(daemon, server);
   } catch {
     return false;
   }

@@ -50,11 +50,12 @@ it.each([null, {}, { sshLocalhostPreview: false }])(
 );
 
 it.each(["https://example.com", "http://127.0.0.2:8787", "file:///tmp/test", "bad URL"])(
-  "does not discover SSH for %s",
+  "advertises preview support without discovering SSH for %s",
   async (url) => {
     expect(await previewHostOptions("remote", url)).toEqual({
       sourceHostId: "remote",
       sessionHostProtocol: 1,
+      sshPreviewProtocol: 1,
     });
     expect(fetchHosts).not.toHaveBeenCalled();
   },

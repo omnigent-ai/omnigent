@@ -2235,10 +2235,18 @@ describe("browser IPC sessions on this machine", () => {
           sshPreview &&
           liveEnrollment &&
           opts?.sessionHostProtocol === 1 &&
+          opts?.sshPreviewProtocol === 1 &&
           opts?.sourceHostId === "local",
       }),
     });
-    const navigate = (url, opts = { sourceHostId: hostId, sessionHostProtocol: protocol }) =>
+    const navigate = (
+      url,
+      opts = {
+        sourceHostId: hostId,
+        sessionHostProtocol: protocol,
+        ...(sshPreview ? { sshPreviewProtocol: 1 } : {}),
+      },
+    ) =>
       ipcMain.invoke(
         "omnigent:browser-open-or-navigate",
         {},
@@ -2310,7 +2318,7 @@ describe("browser IPC sessions on this machine", () => {
             {},
             {
               conversationId: "conv",
-              opts: scenario.opts,
+              opts: sshPreview ? { ...scenario.opts, sshPreviewProtocol: 1 } : scenario.opts,
               action: transport === "screenshot" || transport === "legacy" ? undefined : transport,
               params:
                 transport === "click"
@@ -2356,6 +2364,44 @@ describe("browser IPC sessions on this machine", () => {
     assert.equal(view.hostIsThisMachine, false);
     assert.equal(view.sshPreviewHost, true);
   });
+
+  for (const protocol of [1, undefined]) {
+    it(`preserves an approved SSH host across public navigation only with preview protocol ${protocol}`, async () => {
+      const { navigate, registry, webContents } = localNavigation({ sshPreview: true });
+      assert.equal((await navigate("http://localhost:5173")).ok, true);
+      const entry = registry.get("conv");
+      const loads = [];
+      webContents.loadURL = async (url) => loads.push(url);
+      assert.equal(
+        (
+          await navigate("https://example.com/login", {
+            sourceHostId: "local",
+            sessionHostProtocol: 1,
+            sshPreviewProtocol: protocol,
+          })
+        ).ok,
+        true,
+      );
+      const redirect = {
+        prevented: false,
+        preventDefault() {
+          this.prevented = true;
+        },
+      };
+      for (const listener of webContents.listeners.get("will-redirect")) {
+        listener(redirect, "http://localhost:5173/callback");
+      }
+      assert.equal(redirect.prevented, protocol !== 1);
+      assert.equal(registry.get("conv"), entry);
+      assert.equal(entry.agentContext.hostIsSshPreview, protocol === 1);
+      assert.deepEqual(
+        loads,
+        protocol === 1
+          ? ["https://example.com/login"]
+          : ["about:blank", "https://example.com/login"],
+      );
+    });
+  }
 
   it("revokes an SSH preview before a different host navigates the same tab", async () => {
     const { navigate, ipcMain, registry, webContents } = localNavigation({ sshPreview: true });

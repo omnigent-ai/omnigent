@@ -31,9 +31,10 @@ export async function previewHostOptions(
 ): Promise<BrowserHostOptions> {
   const options = navigationHostOptions(hostId);
   try {
-    if (!hostId || !isLoopbackPreviewUrl(url)) return options;
+    if (!hostId) return options;
     if (!(await getDesktopFeatures())?.sshLocalhostPreview) return options;
     options.sshPreviewProtocol = SSH_PREVIEW_PROTOCOL;
+    if (!isLoopbackPreviewUrl(url)) return options;
     // Discovery only adds a hint; a stalled lookup must not hold up navigation.
     const hosts = await fetchHosts(true, undefined, AbortSignal.timeout(1_000));
     const host = hosts.find((candidate) => candidate.host_id === hostId);
