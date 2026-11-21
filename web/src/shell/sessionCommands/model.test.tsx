@@ -27,6 +27,7 @@ import {
 } from "./model";
 
 const FACTS: SessionCommandFacts = {
+  provisional: false,
   owner: true,
   archived: false,
   pinned: false,
@@ -52,6 +53,10 @@ const reasonOf = (facts: SessionCommandFacts, id: Parameters<typeof sessionComma
 };
 
 describe("sessionCommands", () => {
+  it("offers nothing while the session is still being created, as its row offers no menu", () => {
+    expect(listed({ ...FACTS, provisional: true })).toEqual([]);
+  });
+
   it("lists the owner's actions in the row menu's order", () => {
     expect(listed(FACTS)).toEqual([
       "Add nested agent",

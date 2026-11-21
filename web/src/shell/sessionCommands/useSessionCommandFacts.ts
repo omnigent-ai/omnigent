@@ -60,6 +60,7 @@ export function useSessionCommandFacts(
     // The open session's dot shows only once it's explicitly marked unread, as on its row.
     const active = routedRoot === conversation.id;
     return {
+      provisional: conversation.provisional === true,
       owner,
       archived: conversation.archived === true,
       pinned:

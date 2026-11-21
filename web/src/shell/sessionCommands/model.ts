@@ -35,6 +35,8 @@ export type SessionCommandId = (typeof SESSION_COMMAND_IDS)[number];
 
 /** What the actions need to know about one session and the server it's on. */
 export interface SessionCommandFacts {
+  /** Still being created, so the server doesn't know it yet; its row offers no actions. */
+  provisional: boolean;
   /** The viewer owns it; see `isOwnedByViewer`. */
   owner: boolean;
   archived: boolean;
@@ -178,6 +180,8 @@ const LABELS: Record<SessionCommandId, string> = {
 
 function availabilityOf(id: SessionCommandId, facts: SessionCommandFacts): CommandAvailability {
   const { owner, server } = facts;
+  // Each action writes to the server, which can't act on the session before it exists.
+  if (facts.provisional) return HIDDEN;
   switch (id) {
     case "add-sibling":
       return when(owner && !facts.archived && server.siblingSessions, AVAILABLE);
