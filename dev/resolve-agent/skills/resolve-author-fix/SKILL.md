@@ -206,8 +206,13 @@ fallback if rendering is blocked; keep any usable footage.
   Render to `recordings/<slug>/after-<facet>.mp4`, inspect it, then declare
   that final path with `kind: "after"` in the PR Demo and handoff. If captioning
   fails, use the shared guide's explicit fallback path instead.
-- Keep any recovered before-clip unchanged. A missing before-clip is not a
-  reason to skip the after-clip; note the missing before-clip in your evidence.
+- Keep any recovered before-clip unchanged. Its caption is Repro's claim, not
+  your observation: do not restate it as the observed symptom in `root_cause`,
+  the PR or the ticket unless you inspected the frames that show it. Otherwise
+  attribute the description to Repro and say you did not check the frames.
+  Report frames that contradict the caption in `evidence` and beside the clip in
+  the PR Demo. A missing before-clip is not a reason to skip the after-clip;
+  note the missing before-clip in your evidence.
 - For internal/API-only results with no visible user interaction, written
   evidence is enough. Set `recordings: []` and describe the before/after result
   in your evidence and the PR Demo section.
