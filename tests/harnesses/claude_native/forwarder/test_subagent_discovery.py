@@ -102,6 +102,230 @@ async def test_subagent_watcher_registers_a_task_named_spawn(
     assert state.subagents["a-worker"].parent_subagent_id is None
 
 
+@pytest.mark.parametrize(
+    "name,description,label",
+    [
+        ("differ", "Version-diff pass on findings", "differ: Version-diff pass on findings"),
+        ("", "Version-diff pass on findings", "Version-diff pass on findings"),
+        ("differ", "", "differ"),
+    ],
+)
+async def test_subagent_watcher_registers_an_in_process_teammate_under_the_lead(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    description: str,
+    label: str,
+) -> None:
+    """An agent-team teammate has no spawn tool call, so it attaches to the lead.
+
+    Its meta carries ``taskKind: "in_process_teammate"`` and no ``toolUseId``.
+    Registration must not wait on spawn correlation, the label leads with the
+    teammate's name when both parts exist, and a meta missing ``toolUseId``
+    for any other reason stays unregistered.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    subagents_dir = transcript_path.parent / transcript_path.stem / "subagents"
+    subagents_dir.mkdir(parents=True)
+    metas = {
+        "teammate": {
+            "agentType": "differ",
+            "description": description,
+            "name": name,
+            "taskKind": "in_process_teammate",
+            "teamName": "session-c13bb742",
+            "spawnDepth": 0,
+        },
+        "malformed": {"agentType": "Explore", "description": "no spawn id"},
+    }
+    for subagent_id, meta in metas.items():
+        (subagents_dir / f"agent-{subagent_id}.meta.json").write_text(
+            json.dumps(meta), encoding="utf-8"
+        )
+        (subagents_dir / f"agent-{subagent_id}.jsonl").write_text("", encoding="utf-8")
+
+    def fail_correlation(*_args: Any) -> dict[str, str | None]:
+        raise AssertionError("a teammate alone must not trigger a transcript scan")
+
+    monkeypatch.setattr(forwarder, "_subagent_parents_by_tool_use", fail_correlation)
+    starts: list[tuple[str, dict[str, Any]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body.get("type") != "external_subagent_start":
+            return httpx.Response(202, json={})
+        starts.append((request.url.path, body["data"]))
+        return httpx.Response(
+            202,
+            json={"queued": False, "child_session_id": f"conv_{body['data']['subagent_id']}"},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        state = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_root",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=forwarder.SubagentForwardState(subagents={}),
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    assert starts == [
+        (
+            "/v1/sessions/conv_root/events",
+            {
+                "subagent_id": "teammate",
+                "agent_type": "differ",
+                "description": label,
+                "tool_use_id": "teammate:teammate",
+            },
+        )
+    ]
+    assert state.subagents["teammate"].child_conversation_id == "conv_teammate"
+    assert state.subagents["teammate"].parent_subagent_id is None
+    assert "malformed" not in state.subagents
+
+
+async def test_subagent_watcher_registers_a_teammate_spawned_subagent_under_the_teammate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Task sub-agent a teammate spawns registers under the teammate's child session.
+
+    The teammate's meta has no spawn id, so its transcript contributes every
+    spawn it owns to correlation, which runs once for the Task meta; the
+    teammate registers first so its child can be parented to it.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    subagents_dir = transcript_path.parent / transcript_path.stem / "subagents"
+    subagents_dir.mkdir(parents=True)
+    (subagents_dir / "agent-t-mate.meta.json").write_text(
+        json.dumps(
+            {
+                "agentType": "differ",
+                "description": "Version-diff pass on findings",
+                "name": "differ",
+                "taskKind": "in_process_teammate",
+            }
+        ),
+        encoding="utf-8",
+    )
+    teammate_transcript = subagents_dir / "agent-t-mate.jsonl"
+    teammate_transcript.write_text("", encoding="utf-8")
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="a-helper",
+        agent_type="Explore",
+        description="helper spawned by the teammate",
+        tool_use_id="toolu_helper",
+        spawn_transcript_path=teammate_transcript,
+        spawn_tool_name="Task",
+    )
+    correlations: list[Path] = []
+    real_correlation = forwarder._subagent_parents_by_tool_use
+
+    def counting_correlation(*args: Any) -> dict[str, str | None]:
+        correlations.append(args[0])
+        return real_correlation(*args)
+
+    monkeypatch.setattr(forwarder, "_subagent_parents_by_tool_use", counting_correlation)
+    start_paths: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body.get("type") != "external_subagent_start":
+            return httpx.Response(202, json={})
+        subagent_id = body["data"]["subagent_id"]
+        start_paths[subagent_id] = request.url.path
+        return httpx.Response(
+            202,
+            json={"queued": False, "child_session_id": f"conv_{subagent_id}"},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        state = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_root",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=forwarder.SubagentForwardState(subagents={}),
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    assert start_paths == {
+        "t-mate": "/v1/sessions/conv_root/events",
+        "a-helper": "/v1/sessions/conv_t-mate/events",
+    }
+    assert state.subagents["t-mate"].parent_subagent_id is None
+    assert state.subagents["a-helper"].parent_subagent_id == "t-mate"
+    assert correlations == [transcript_path]
+
+
+_TEAMMATE_META = {
+    "agentType": "differ",
+    "description": "Version-diff pass on findings",
+    "name": "differ",
+    "taskKind": "in_process_teammate",
+    "teamName": "session-c13bb742",
+    "spawnDepth": 0,
+}
+_TEAMMATE_FIELDS = {
+    "agentType": "differ",
+    "description": "Version-diff pass on findings",
+    "name": "differ",
+    "taskKind": "in_process_teammate",
+    "spawnDepth": 0,
+}
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        (_TEAMMATE_META, _TEAMMATE_FIELDS),
+        ({**_TEAMMATE_META, "name": "  "}, {**_TEAMMATE_FIELDS, "name": ""}),
+        ({**_TEAMMATE_META, "description": ""}, {**_TEAMMATE_FIELDS, "description": ""}),
+        # Teammate metas written without a spawnDepth are accepted too.
+        (
+            {k: v for k, v in _TEAMMATE_META.items() if k != "spawnDepth"},
+            {k: v for k, v in _TEAMMATE_FIELDS.items() if k != "spawnDepth"},
+        ),
+        # A teammate that also carries a spawn id correlates like a Task sub-agent.
+        (
+            {**_TEAMMATE_META, "toolUseId": "toolu_spawn"},
+            {**_TEAMMATE_FIELDS, "toolUseId": "toolu_spawn"},
+        ),
+        (
+            {"agentType": "Explore", "description": "task", "toolUseId": "toolu_task"},
+            {"agentType": "Explore", "description": "task", "toolUseId": "toolu_task", "name": ""},
+        ),
+        ({"agentType": "Explore", "description": "no spawn id"}, None),
+        ({**_TEAMMATE_META, "taskKind": "background"}, None),
+    ],
+)
+def test_read_subagent_meta_returns_fields_as_written(
+    tmp_path: Path, raw: dict[str, Any], expected: dict[str, Any] | None
+) -> None:
+    meta_path = tmp_path / "agent-x.meta.json"
+    meta_path.write_text(json.dumps(raw), encoding="utf-8")
+    assert forwarder._read_subagent_meta(meta_path) == expected
+
+
 async def test_subagent_watcher_posts_external_subagent_start_for_new_meta(
     tmp_path: Path,
 ) -> None:
@@ -358,6 +582,7 @@ async def test_subagent_watcher_preserves_nested_parent_graph_across_restart(
         ({"parentAgentId": "parent"}, True),
         ({"toolUseId": "toolu_spawn"}, True),
         ({}, False),
+        ({"spawnDepth": 0}, False),
         ({"spawnDepth": 2}, False),
         ({"spawnDepth": True}, False),
         ({"spawnDepth": 1, "toolUseId": None}, False),
@@ -644,8 +869,8 @@ async def test_subagent_watcher_skips_subagents_already_in_state(
     """
     On forwarder restart, sub-agents already in
     ``subagent_forwarder.json`` are NOT re-registered (no second
-    ``external_subagent_start`` POST). This is the idempotency
-    contract the cursor file is for — without it, a forwarder
+    ``external_subagent_start`` POST), teammates included. This is the
+    idempotency contract the cursor file is for — without it, a forwarder
     crash-loop would mint a new child Conversation per restart.
     """
     bridge_dir = tmp_path / "bridge"
@@ -658,6 +883,11 @@ async def test_subagent_watcher_skips_subagents_already_in_state(
         description="post-restart sub-agent",
         tool_use_id="toolu_qqq",
     )
+    subagents_dir = transcript_path.parent / transcript_path.stem / "subagents"
+    (subagents_dir / "agent-t-mate.meta.json").write_text(
+        json.dumps(_TEAMMATE_META), encoding="utf-8"
+    )
+    (subagents_dir / "agent-t-mate.jsonl").write_text("", encoding="utf-8")
     record_hook_event(
         bridge_dir,
         {
@@ -677,7 +907,13 @@ async def test_subagent_watcher_skips_subagents_already_in_state(
                         "byte_offset": 0,
                         "last_activity_ts": None,
                         "last_status": None,
-                    }
+                    },
+                    "t-mate": {
+                        "child_conversation_id": "conv_teammate_existing",
+                        "byte_offset": 0,
+                        "last_activity_ts": None,
+                        "last_status": None,
+                    },
                 },
                 "updated_at": 0,
             }
