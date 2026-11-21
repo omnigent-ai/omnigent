@@ -8648,6 +8648,57 @@ def test_run_host_process_logs_crash_during_setup(
     assert _host_exit_reasons(caplog) == ["uncaught"]
 
 
+def test_run_host_process_warns_when_managed_gateway_command_is_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Managed boot logs why gateway setup was skipped when uvx is not on PATH."""
+    from omnigent.host import databricks_credential
+    from omnigent.host.identity import HOST_TOKEN_ENV_VAR
+
+    monkeypatch.setenv("IS_SANDBOX", "1")
+    monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-token")
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / ".databrickscfg"))
+    # Registers a restore: configure_host_databricks sets this outside monkeypatch.
+    monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "")
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE")
+    empty_bin = tmp_path / "bin"
+    empty_bin.mkdir()
+    monkeypatch.setenv("PATH", str(empty_bin))
+    (Path(os.environ["OMNIGENT_CONFIG_HOME"]) / "config.yaml").write_text(
+        "providers:\n"
+        "  databricks: {kind: databricks, connection: databricks}\n"
+        "inference:\n"
+        "  harnesses:\n"
+        "    claude-native: {provider: databricks}\n"
+    )
+    monkeypatch.setattr(
+        databricks_credential,
+        "fetch_broker_bearer",
+        lambda server, host_id, token: ("https://workspace.example.com", "broker-bearer"),
+    )
+    for name in ("configure_host_git", "configure_host_gh", "start_host_gh_refresh"):
+        monkeypatch.setattr(f"omnigent.git_credential_github.{name}", lambda *_args: None)
+    host_run = AsyncMock()
+    monkeypatch.setattr(HostProcess, "run", host_run)
+
+    with caplog.at_level(logging.INFO):
+        run_host_process(
+            server_url="https://omnigent.example.com",
+            config_path=tmp_path / "host.yaml",
+        )
+
+    warnings = [
+        record.getMessage() for record in caplog.records if record.levelno >= logging.WARNING
+    ]
+    assert any(
+        "Sandbox configure skipped (profile=omnigent)" in message
+        and "uvx is not on PATH" in message
+        and "Install uv" in message
+        for message in warnings
+    ), caplog.text
+    host_run.assert_awaited_once()
+
+
 async def test_run_host_process_invalid_host_id_exits_actionably(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
