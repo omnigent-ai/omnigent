@@ -156,8 +156,16 @@ describe("Project ticket board", () => {
     renderBoard(<ProjectTicketBoard projectName="Shipping" selectedTicketId={null} />);
     await screen.findByRole("region", { name: "Open" });
     const board = screen.getByRole("region", { name: "Shipping ticket board" });
-    for (const label of ["Open", "Planning", "Working", "Review", "Done"])
-      expect(within(board).getByRole("region", { name: label })).toBeInTheDocument();
+    for (const [label, icon, color] of [
+      ["Open", "circle-dashed", "text-muted-foreground"],
+      ["Planning", "clipboard-list", "text-session-active"],
+      ["Working", "circle-dot", "text-session-active"],
+      ["Review", "eye", "text-warning"],
+      ["Done", "circle-check", "text-success"],
+    ]) {
+      const lane = within(board).getByRole("region", { name: label });
+      expect(lane.querySelector(`.lucide-${icon}`)).toHaveClass(color);
+    }
     expect(
       await screen.findByRole("link", { name: "Open ticket: Ship the board" }),
     ).toHaveAttribute("href", "/?ticket=ticket");
@@ -176,8 +184,17 @@ describe("Project ticket board", () => {
           name: "Investigating",
           instructions: "Gather evidence before resolving.",
           is_complete: false,
+          color: "purple",
+          icon: "search",
         },
-        { id: "resolved", name: "Resolved", instructions: "", is_complete: true },
+        {
+          id: "resolved",
+          name: "Resolved",
+          instructions: "",
+          is_complete: true,
+          color: "blue",
+          icon: "rocket",
+        },
       ],
       initial_stage_id: "new",
     });
@@ -185,6 +202,13 @@ describe("Project ticket board", () => {
     const investigating = await screen.findByRole("region", { name: "Investigating" });
     const initial = screen.getByRole("region", { name: "New" });
     const board = screen.getByRole("region", { name: "Shipping ticket board" });
+    expect(investigating.querySelector(".lucide-search")).toHaveClass("text-purple-600");
+    expect(
+      within(investigating).getByText("Investigating").closest('[data-slot="badge"]'),
+    ).toHaveClass("bg-purple-500/10");
+    expect(
+      screen.getByRole("region", { name: "Resolved" }).querySelector(".lucide-rocket"),
+    ).toHaveClass("text-session-active");
     expect(
       within(board)
         .getAllByRole("region")
@@ -227,6 +251,8 @@ describe("Project ticket board", () => {
           name: "Verifying",
           instructions: "Confirm recovery before resolving.",
           is_complete: false,
+          color: "orange",
+          icon: "wrench",
         },
         { id: "done", name: "Done", instructions: "", is_complete: false },
         { id: "resolved", name: "Resolved", instructions: "", is_complete: false },
@@ -244,6 +270,9 @@ describe("Project ticket board", () => {
       />,
     );
     expect(await screen.findByText("Confirm recovery before resolving.")).toBeInTheDocument();
+    expect(
+      screen.getByRole("combobox", { name: "Ticket stage" }).querySelector(".lucide-wrench"),
+    ).toHaveClass("text-orange-600");
     await user.click(screen.getByRole("button", { name: "Add plan" }));
     fireEvent.change(screen.getByLabelText("Plan"), {
       target: { value: "Verify recovery evidence." },
@@ -308,7 +337,13 @@ describe("Project ticket board", () => {
               created_at: 1000,
               payload: {
                 changes: { stage_id: "removed" },
-                stage: { id: "removed", name: "Investigating", is_complete: false },
+                stage: {
+                  id: "removed",
+                  name: "Investigating",
+                  is_complete: false,
+                  color: "purple",
+                  icon: "search",
+                },
               },
             },
             {
@@ -336,6 +371,8 @@ describe("Project ticket board", () => {
     );
     const activity = await screen.findByRole("region", { name: "Ticket activity" });
     expect(await within(activity).findByText("Investigating")).toBeInTheDocument();
+    expect(activity.querySelector(".lucide-search")).toHaveClass("text-purple-600");
+    expect(activity.querySelector(".lucide-circle-check")).toHaveClass("text-success");
     expect(within(activity).getByText("Done")).toBeInTheDocument();
     expect(within(activity).queryByText("Closed")).toBeNull();
     expect(await screen.findByRole("combobox", { name: "Ticket stage" })).toHaveTextContent("New");

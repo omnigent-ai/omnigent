@@ -75,7 +75,7 @@ def _stage(configuration: TicketStages, stage_id: str) -> TicketStage:
 
 
 def _stage_snapshot(stage: TicketStage) -> dict[str, Any]:
-    return stage.model_dump(exclude={"instructions"})
+    return stage.model_dump(exclude={"instructions"}, exclude_none=True)
 
 
 def _ticket(row: SqlProjectTicket) -> dict[str, Any]:

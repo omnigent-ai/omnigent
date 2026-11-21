@@ -423,9 +423,15 @@ def test_stage_edit_reorder_start_and_removal_preserve_ticket_content_and_histor
     history = tickets.events(project.id, ticket["id"], user_id="alice")["data"]
     configuration = {
         "stages": [
-            {"id": "investigating", "name": "Investigating", "instructions": "Gather evidence"},
-            {"id": "open", "name": "New"},
-            {"id": "resolved", "name": "Resolved"},
+            {
+                "id": "investigating",
+                "name": "Investigating",
+                "instructions": "Gather evidence",
+                "color": "purple",
+                "icon": "search",
+            },
+            {"id": "open", "name": "New", "color": "orange", "icon": "flag"},
+            {"id": "resolved", "name": "Resolved", "color": "blue", "icon": "rocket"},
         ],
     }
     saved = tickets.update_stages(project.id, UpdateTicketStages(**configuration), actor)
@@ -433,16 +439,24 @@ def test_stage_edit_reorder_start_and_removal_preserve_ticket_content_and_histor
     assert saved["initial_stage_id"] == "investigating"
     assert [stage["id"] for stage in saved["stages"] if stage["is_complete"]] == ["resolved"]
     assert tickets.get(project.id, ticket["id"], user_id="alice") == original
-    assert (
-        tickets.create(project.id, CreateTicket(title="New work"), actor)["stage_id"]
-        == "investigating"
-    )
+    created = tickets.create(project.id, CreateTicket(title="New work"), actor)
+    assert created["stage_id"] == "investigating"
+    assert tickets.events(project.id, created["id"], user_id="alice")["data"][0]["payload"][
+        "stage"
+    ] == {
+        "id": "investigating",
+        "name": "Investigating",
+        "is_complete": False,
+        "color": "purple",
+        "icon": "search",
+    }
     assert tickets.stages(project.id, user_id="alice", include_usage=True)[
         "occupied_stage_ids"
     ] == ["investigating", "open"]
     # Saving unrelated project session defaults cannot overwrite the board configuration.
     projects.update(project.id, user_id="alice", config={"workspace": "/work/project"})
     assert tickets.stages(project.id, user_id="alice") == saved
+    assert saved["stages"][0]["color"] == "purple" and saved["stages"][0]["icon"] == "search"
     configuration["stages"].pop(1)
     with pytest.raises(OmnigentError, match="contains tickets"):
         tickets.update_stages(project.id, UpdateTicketStages(**configuration), actor)
@@ -467,12 +481,22 @@ def test_stage_edit_reorder_start_and_removal_preserve_ticket_content_and_histor
     events = tickets.events(project.id, ticket["id"], user_id="alice")["data"]
     assert events[:-1] == history
     assert events[-1]["payload"]["previous_stage"]["name"] == "New"
+    assert events[-1]["payload"]["previous_stage"]["color"] == "orange"
+    assert events[-1]["payload"]["previous_stage"]["icon"] == "flag"
     assert events[-1]["payload"]["stage"]["name"] == "Resolved"
+    assert events[-1]["payload"]["stage"]["color"] == "blue"
+    assert events[-1]["payload"]["stage"]["icon"] == "rocket"
     assert events[-1]["payload"]["reason"] == "stage_removed"
     assert events[-1]["notification_pending"] is True
     renamed = tickets.stages(project.id, user_id="alice")
     renamed["stages"][0]["name"] = "Research"
+    for stage in renamed["stages"]:
+        stage.update(color=None, icon=None)
     tickets.update_stages(project.id, UpdateTicketStages(**renamed), actor)
+    assert all(
+        stage["color"] is None and stage["icon"] is None
+        for stage in tickets.stages(project.id, user_id="alice")["stages"]
+    )
     assert tickets.events(project.id, ticket["id"], user_id="alice")["data"] == events
     assert tickets.get(project.id, ticket["id"], user_id="alice")["stage_id"] == "resolved"
 

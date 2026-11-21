@@ -47,7 +47,15 @@ it.each(["Planning the approach", ""])(
 );
 
 it("reads real stage definitions and saves configuration with removal destinations", async () => {
-  const configuration = { ...DEFAULT_TICKET_STAGES, occupied_stage_ids: ["planning"] };
+  const configuration = {
+    ...DEFAULT_TICKET_STAGES,
+    stages: DEFAULT_TICKET_STAGES.stages.map((stage) => ({
+      ...stage,
+      color: "purple" as const,
+      icon: "search" as const,
+    })),
+    occupied_stage_ids: ["planning"],
+  };
   const fetchMock = vi
     .fn()
     .mockImplementation(async () => new Response(JSON.stringify(configuration)));

@@ -117,6 +117,59 @@ describe("Project stage editor", () => {
     expect(await screen.findByLabelText("Stage name 1")).toHaveValue("Open");
   });
 
+  it("previews, saves and resets appearance with keyboard-accessible choices", async () => {
+    const user = userEvent.setup();
+    const { onClose, unmount } = renderEditor();
+    await user.click(await screen.findByRole("button", { name: "Appearance for Open" }));
+    const picker = screen.getByRole("dialog", { name: "Appearance for Open" });
+    expect(within(picker).getByRole("radio", { name: "Gray" })).toBeChecked();
+    expect(within(picker).getByRole("radio", { name: "Gray" })).toHaveFocus();
+    expect(within(picker).getByRole("radio", { name: "Dashed circle" })).toBeChecked();
+    await user.click(within(picker).getByRole("radio", { name: "Purple" }));
+    expect(within(picker).getByRole("radio", { name: "Purple" })).toHaveFocus();
+    // Radix moves focus asynchronously while an arrow key is held.
+    await user.keyboard("{ArrowRight>}");
+    await waitFor(() => expect(within(picker).getByRole("radio", { name: "Pink" })).toBeChecked());
+    await user.keyboard("{/ArrowRight}");
+    await user.click(within(picker).getByRole("radio", { name: "Purple" }));
+    await user.click(within(picker).getByRole("radio", { name: "Search" }));
+    expect(within(picker).getByRole("radio", { name: "Search" })).toBeChecked();
+    expect(within(picker).getByText("Open").closest('[data-slot="badge"]')).toHaveClass(
+      "text-purple-600",
+    );
+    expect(api.updateTicketStages).not.toHaveBeenCalled();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog", { name: "Appearance for Open" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Appearance for Open" })).toHaveFocus();
+    expect(onClose).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "Save stages" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalledOnce());
+    const saved = vi.mocked(api.updateTicketStages).mock.calls[0][1];
+    expect(saved.stages[0]).toMatchObject({
+      id: "open",
+      color: "purple",
+      icon: "search",
+      is_complete: false,
+    });
+    unmount();
+
+    vi.mocked(api.getTicketStages).mockResolvedValue(saved);
+    renderEditor();
+    await user.click(await screen.findByRole("button", { name: "Appearance for Open" }));
+    expect(screen.getByRole("radio", { name: "Purple" })).toBeChecked();
+    expect(screen.getByRole("radio", { name: "Search" })).toBeChecked();
+    await user.click(screen.getByRole("button", { name: "Reset appearance" }));
+    expect(screen.getByRole("radio", { name: "Gray" })).toBeChecked();
+    expect(screen.getByRole("radio", { name: "Dashed circle" })).toBeChecked();
+    await user.click(screen.getByRole("button", { name: "Save stages" }));
+    await waitFor(() => expect(api.updateTicketStages).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(api.updateTicketStages).mock.calls[1][1].stages[0]).toMatchObject({
+      id: "open",
+      color: null,
+      icon: null,
+    });
+  });
+
   it("renames stable IDs and derives completion from the added last stage", async () => {
     const { onClose } = renderEditor();
     fireEvent.change(await screen.findByLabelText("Stage name 1"), { target: { value: " New " } });
@@ -150,6 +203,10 @@ describe("Project stage editor", () => {
     { index: 0, key: "ArrowDown", order: ["planning", "open", "in_progress", "review", "done"] },
     { index: 4, key: "ArrowUp", order: ["open", "planning", "in_progress", "done", "review"] },
   ])("derives start and completion after dragging stage $index", async ({ index, key, order }) => {
+    const configuration = structuredClone(api.DEFAULT_TICKET_STAGES);
+    configuration.stages[index].color = "pink";
+    configuration.stages[index].icon = "flag";
+    vi.mocked(api.getTicketStages).mockResolvedValue(configuration);
     renderEditor();
     const list = await screen.findByRole("list", { name: "Project stages" });
     const rows = within(list).getAllByRole("listitem");
@@ -183,6 +240,12 @@ describe("Project stage editor", () => {
     expect(saved.stages.filter((stage) => stage.is_complete).map((stage) => stage.id)).toEqual([
       order.at(-1),
     ]);
+    expect(saved.stages.find((stage) => stage.id === configuration.stages[index].id)).toMatchObject(
+      {
+        color: "pink",
+        icon: "flag",
+      },
+    );
   });
 
   it("requires a surviving destination for populated removals and supports undo", async () => {
@@ -215,8 +278,12 @@ describe("Project stage editor", () => {
   });
 
   it("rejects blank or duplicate names and cancels without persisting drafts", async () => {
+    const user = userEvent.setup();
     const { onClose } = renderEditor();
     const name = await screen.findByLabelText("Stage name 1");
+    await user.click(screen.getByRole("button", { name: "Appearance for Open" }));
+    await user.click(screen.getByRole("radio", { name: "Purple" }));
+    await user.keyboard("{Escape}");
     fireEvent.change(name, { target: { value: " working " } });
     expect(screen.getByRole("button", { name: "Save stages" })).toBeDisabled();
     fireEvent.change(name, { target: { value: " " } });
@@ -236,7 +303,11 @@ describe("Project stage editor", () => {
       new Error("Choose where occupied stages move"),
     );
     const { onClose } = renderEditor();
-    fireEvent.change(await screen.findByLabelText("Stage name 1"), { target: { value: "New" } });
+    await user.click(await screen.findByRole("button", { name: "Appearance for Open" }));
+    await user.click(screen.getByRole("radio", { name: "Purple" }));
+    await user.click(screen.getByRole("radio", { name: "Search" }));
+    await user.keyboard("{Escape}");
+    fireEvent.change(screen.getByLabelText("Stage name 1"), { target: { value: "New" } });
     fireEvent.click(screen.getByRole("button", { name: "Remove Planning" }));
     fireEvent.click(screen.getByRole("button", { name: "Save stages" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("Choose where occupied stages move");
@@ -251,6 +322,8 @@ describe("Project stage editor", () => {
     expect(vi.mocked(api.updateTicketStages).mock.calls[1][1].stages[0]).toMatchObject({
       id: "open",
       name: "New",
+      color: "purple",
+      icon: "search",
     });
   });
 
@@ -275,6 +348,7 @@ describe("Project stage editor", () => {
     await waitFor(() => expect(api.getTicketStages).toHaveBeenCalledWith("created", true));
     expect(screen.getByLabelText("Stage name 1")).toHaveValue("New");
     expect(screen.getByRole("button", { name: "Cancel" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Appearance for New" })).toBeDisabled();
     await act(async () => rejectSave(new Error("Save failed")));
     expect(await screen.findByRole("alert")).toHaveTextContent("Save failed");
     expect(screen.getByLabelText("Stage name 1")).toHaveValue("New");

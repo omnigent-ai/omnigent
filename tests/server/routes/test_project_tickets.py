@@ -278,7 +278,13 @@ async def test_custom_stage_api_and_ticket_tools_share_real_project_definitions(
     configuration = {
         "stages": [
             {"id": "triage", "name": "New"},
-            {"id": "verifying", "name": "Verifying", "instructions": "Attach recovery evidence"},
+            {
+                "id": "verifying",
+                "name": "Verifying",
+                "instructions": "Attach recovery evidence",
+                "color": "purple",
+                "icon": "search",
+            },
             {"id": "resolved", "name": "Resolved"},
         ],
         "moves": {"open": "triage"},
@@ -301,6 +307,8 @@ async def test_custom_stage_api_and_ticket_tools_share_real_project_definitions(
         )
     )
     assert detail["stages"][1]["instructions"] == "Attach recovery evidence"
+    assert detail["stages"][1]["color"] == "purple"
+    assert detail["stages"][1]["icon"] == "search"
     moved = json.loads(
         await execute_ticket_tool(
             "sys_ticket_update",
@@ -341,6 +349,8 @@ async def test_custom_stage_api_and_ticket_tools_share_real_project_definitions(
     for invalid in (
         {**configuration, "stages": [configuration["stages"][0]] * 2},
         {**configuration, "stages": []},
+        {"stages": [{"id": "triage", "name": "New", "color": "#ff0000"}]},
+        {"stages": [{"id": "triage", "name": "New", "icon": "<svg />"}]},
     ):
         assert (await project_client.put(base + "/stages", json=invalid)).status_code == 422
     assert (

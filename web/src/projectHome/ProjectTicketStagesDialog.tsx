@@ -42,6 +42,7 @@ import {
   type TicketStages,
 } from "@/lib/projectTicketsApi";
 import { TicketError } from "./TicketControls";
+import { TicketStageAppearancePicker, TicketStageIcon } from "./TicketStageAppearance";
 import { useTicketProject, useTicketStages } from "./useProjectTickets";
 
 const stageToken = customAlphabet("abcdefghijklmnopqrstuvwxyz0123456789", 12);
@@ -196,7 +197,7 @@ function StageEditor({
             {stages.map((stage, index) => (
               <StageRow
                 key={stage.id}
-                stage={stage}
+                stage={{ ...stage, is_complete: index === stages.length - 1 }}
                 index={index}
                 pending={pending}
                 onlyStage={stages.length === 1}
@@ -263,8 +264,11 @@ function StageEditor({
                 <SelectItem value={NO_MOVE_DESTINATION}>
                   {occupied.has(stage.id) ? "Choose a stage…" : "No fallback"}
                 </SelectItem>
-                {stages.map((target) => (
+                {stages.map((target, index) => (
                   <SelectItem key={target.id} value={target.id}>
+                    <TicketStageIcon
+                      stage={{ ...target, is_complete: index === stages.length - 1 }}
+                    />
                     {target.name || "Unnamed stage"}
                   </SelectItem>
                 ))}
@@ -334,6 +338,7 @@ function StageRow({
       >
         <GripVerticalIcon aria-hidden />
       </Button>
+      <TicketStageAppearancePicker stage={stage} disabled={pending} onChange={onChange} />
       <div className="grid min-w-0 flex-1 gap-2">
         <Input
           aria-label={`Stage name ${index + 1}`}

@@ -1,11 +1,29 @@
 import { authenticatedFetch } from "./identity";
 import { apiErrorFromResponse } from "./sessionsApi";
 
+export type TicketStageColor =
+  "gray" | "blue" | "purple" | "pink" | "red" | "orange" | "amber" | "green";
+export type TicketStageIconName =
+  | "circle-dashed"
+  | "circle"
+  | "circle-dot"
+  | "circle-check"
+  | "clipboard-list"
+  | "eye"
+  | "clock"
+  | "pause"
+  | "search"
+  | "flag"
+  | "wrench"
+  | "rocket";
+
 export interface TicketStage {
   id: string;
   name: string;
   instructions: string;
   is_complete: boolean;
+  color?: TicketStageColor | null;
+  icon?: TicketStageIconName | null;
 }
 export interface TicketStages {
   stages: TicketStage[];
@@ -235,7 +253,7 @@ export function ticketOutputs(events: TicketEvent[]): TicketOutput[] {
   return [...outputs.values()];
 }
 
-/** Event snapshots retain the name/completion meaning at the time, even after stage removal. */
+/** Snapshots retain the stage's name, meaning and appearance even after removal. */
 export function ticketEventStage(event: TicketEvent): TicketStage | null {
   const snapshot = event.payload.stage as Partial<TicketStage> | undefined;
   if (snapshot && typeof snapshot.id === "string" && typeof snapshot.name === "string")
@@ -244,6 +262,8 @@ export function ticketEventStage(event: TicketEvent): TicketStage | null {
       name: snapshot.name,
       instructions: "",
       is_complete: snapshot.is_complete === true,
+      color: snapshot.color,
+      icon: snapshot.icon,
     };
   const changes = event.payload.changes as { stage_id?: unknown; status?: unknown } | undefined;
   if (typeof changes?.stage_id === "string")

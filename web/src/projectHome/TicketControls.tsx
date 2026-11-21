@@ -1,11 +1,4 @@
 import { useState, type ReactNode } from "react";
-import {
-  CircleCheckIcon,
-  CircleDashedIcon,
-  CircleDotIcon,
-  ClipboardListIcon,
-  EyeIcon,
-} from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { NeedsResponseBadge } from "@/components/NeedsResponseBadge";
 import { Button } from "@/components/ui/button";
@@ -19,32 +12,8 @@ import {
 } from "@/components/ui/dialog";
 import { Textarea } from "@/components/ui/textarea";
 import type { TicketStage, TicketTag } from "@/lib/projectTicketsApi";
-import { cn } from "@/lib/utils";
 
-export function TicketStageIcon({ stage }: { stage?: TicketStage | null }) {
-  const icons: Record<string, typeof CircleDashedIcon> = {
-    open: CircleDashedIcon,
-    planning: ClipboardListIcon,
-    in_progress: CircleDotIcon,
-    review: EyeIcon,
-  };
-  const Icon = stage?.is_complete ? CircleCheckIcon : (icons[stage?.id ?? ""] ?? CircleDotIcon);
-  return (
-    <Icon
-      aria-hidden
-      className={cn(
-        "size-3.5 shrink-0",
-        stage?.is_complete
-          ? "text-success"
-          : stage?.id === "review"
-            ? "text-warning"
-            : stage?.id !== "open"
-              ? "text-session-active"
-              : "text-muted-foreground",
-      )}
-    />
-  );
-}
+export { TicketStageIcon } from "./TicketStageAppearance";
 
 export function TicketTags({ tags }: { tags: TicketTag[] }) {
   return (

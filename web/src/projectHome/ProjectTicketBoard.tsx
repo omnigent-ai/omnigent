@@ -10,7 +10,6 @@ import {
   useSensors,
 } from "@dnd-kit/core";
 import { MessageSquareIcon, PlusIcon } from "lucide-react";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { useNow } from "@/hooks/useNow";
@@ -22,10 +21,10 @@ import {
   CompleteTicketDialog,
   ReviewTicketDialog,
   TicketError,
-  TicketStageIcon,
   TicketTags,
 } from "./TicketControls";
 import { ProjectTicketSources } from "./ProjectTicketSources";
+import { TicketStageBadge } from "./TicketStageAppearance";
 import {
   useRelatedTickets,
   useTicketActions,
@@ -34,13 +33,6 @@ import {
   useTickets,
   useTicketStages,
 } from "./useProjectTickets";
-
-const STAGE_CLASS: Record<string, string> = {
-  open: "bg-muted text-muted-foreground",
-  planning: "bg-session-active/10 text-session-active",
-  in_progress: "bg-session-active/15 text-session-active",
-  review: "bg-warning/15 text-warning",
-};
 
 export function ProjectTicketBoard({
   projectName,
@@ -261,17 +253,7 @@ function TicketColumn({
       )}
     >
       <h2 className="flex shrink-0 items-center justify-between px-1.5 pt-1.5 pb-3 text-sm font-medium text-muted-foreground">
-        <Badge
-          className={cn(
-            "border-transparent",
-            stage.is_complete
-              ? "bg-success/15 text-success"
-              : (STAGE_CLASS[stage.id] ?? "bg-session-active/10 text-session-active"),
-          )}
-        >
-          <TicketStageIcon stage={stage} />
-          {stage.name}
-        </Badge>
+        <TicketStageBadge stage={stage} />
         <span className="tabular-nums">
           {tickets.length}
           {query.hasNextPage ? "+" : ""}

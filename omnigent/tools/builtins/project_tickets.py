@@ -83,7 +83,8 @@ class SysTicketListTool(_TicketTool):
     tool_name = "sys_ticket_list"
     help_text = (
         "List tickets, oldest first, and this project's ordered stage definitions "
-        "(IDs, names, instructions, and derived start/completion metadata). "
+        "(IDs, names, instructions, appearance, and derived start/completion metadata). "
+        "Colors and icons are visual only. "
         "The first stage starts new tickets; the last means complete. Read these before choosing "
         "a stage; do not assume fixed names. Use last_id as after while has_more is true."
     )

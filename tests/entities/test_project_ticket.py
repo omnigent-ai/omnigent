@@ -73,6 +73,7 @@ def test_stage_definitions_have_stable_defaults_and_trimmed_content():
     ]
     assert defaults.initial_stage_id == "open"
     assert [stage.id for stage in defaults.stages if stage.is_complete] == ["done"]
+    assert all(stage.color is None and stage.icon is None for stage in defaults.stages)
     renamed = TicketStage(id="open", name=" New ", instructions=" Investigate first ")
     assert renamed.name == "New" and renamed.instructions == "Investigate first"
     assert renamed.id == "open"
@@ -83,7 +84,13 @@ def test_stage_definitions_have_stable_defaults_and_trimmed_content():
 @pytest.mark.parametrize("count", [1, 3])
 def test_start_and_completion_are_derived_from_order(count):
     stages = [
-        TicketStage(id=f"stage-{index}", name=str(index), is_complete=index == 0)
+        TicketStage(
+            id=f"stage-{index}",
+            name=str(index),
+            is_complete=index == 0,
+            color="red",
+            icon="circle-check",
+        )
         for index in range(count)
     ]
     configuration = TicketStages(stages=stages, initial_stage_id="missing")
@@ -93,6 +100,17 @@ def test_start_and_completion_are_derived_from_order(count):
     assert reordered.initial_stage_id == stages[-1].id
     assert [stage.id for stage in reordered.stages if stage.is_complete] == [stages[0].id]
     assert configuration.stages[-1].is_complete
+    assert all(stage.color == "red" and stage.icon == "circle-check" for stage in reordered.stages)
+    assert TicketStages.model_validate_json(reordered.model_dump_json()) == reordered
+
+
+@pytest.mark.parametrize(
+    "appearance",
+    [{"color": "#ff0000"}, {"color": "unknown"}, {"icon": "unknown"}, {"icon": "<svg />"}],
+)
+def test_stage_appearance_is_limited_to_supported_choices(appearance):
+    with pytest.raises(ValidationError):
+        TicketStage(id="custom", name="Custom", **appearance)
 
 
 @pytest.mark.parametrize(

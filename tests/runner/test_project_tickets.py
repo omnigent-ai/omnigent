@@ -121,11 +121,15 @@ async def test_tools_use_only_the_callers_project(name, args, method, suffix, ex
 
 
 async def test_get_returns_paged_activity_outputs_and_sessions():
+    stages = default_ticket_stages()
+    stages.stages[0].color = "purple"
+    stages.stages[0].icon = "search"
+
     def handler(request):
         if request.url.path == f"/v1/sessions/{SOURCE}":
             return httpx.Response(200, json={"project_id": PROJECT})
         if request.url.path.endswith("/stages"):
-            return httpx.Response(200, json=default_ticket_stages().model_dump())
+            return httpx.Response(200, json=stages.model_dump())
         if request.url.path.endswith("/events"):
             assert request.url.params["after"] == "6" and request.url.params["kind"] == "output"
             return httpx.Response(200, json={"data": [], "has_more": False, "last_position": 6})
@@ -153,7 +157,7 @@ async def test_get_returns_paged_activity_outputs_and_sessions():
     assert result["events"]["last_position"] == 6
     assert result["sessions"]["data"] == [{"session_id": SOURCE, "involvement": "Plan the work"}]
     assert result["related"] == {"data": [], "has_more": False}
-    assert result["stages"] == default_ticket_stages().model_dump()["stages"]
+    assert result["stages"] == stages.model_dump()["stages"]
     assert result["initial_stage_id"] == "open"
 
 

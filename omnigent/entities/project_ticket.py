@@ -10,6 +10,21 @@ from urllib.parse import urlsplit, urlunsplit
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 TicketStageId = Annotated[str, Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_-]*$")]
+TicketStageColor = Literal["gray", "blue", "purple", "pink", "red", "orange", "amber", "green"]
+TicketStageIcon = Literal[
+    "circle-dashed",
+    "circle",
+    "circle-dot",
+    "circle-check",
+    "clipboard-list",
+    "eye",
+    "clock",
+    "pause",
+    "search",
+    "flag",
+    "wrench",
+    "rocket",
+]
 TicketEventKind = Literal["created", "updated", "comment", "execution", "output"]
 LEGACY_STATUS_CODES = {"open": 0, "in_progress": 1, "done": 2, "planning": 3, "review": 4}
 LEGACY_STATUS_LABELS = {
@@ -35,6 +50,12 @@ class TicketStage(BaseModel):
     instructions: str = Field(default="", max_length=500)
     is_complete: bool = Field(
         default=False, description="Derived from the final stage's position."
+    )
+    color: TicketStageColor | None = Field(
+        default=None, description="Visual color only; null uses the default appearance."
+    )
+    icon: TicketStageIcon | None = Field(
+        default=None, description="Visual icon only; null uses the default appearance."
     )
 
     @field_validator("name", "instructions")
