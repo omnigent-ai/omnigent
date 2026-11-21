@@ -869,12 +869,15 @@ async function stopHost(cliPath, serverUrl) {
   return { ok: res.code === 0, output: (res.stdout || res.stderr).trim() };
 }
 
-/** Map a workspace API mount to the web-UI mount on the same origin, which windows pin. */
+/** Canonicalize a workspace UI or API mount to the same-origin UI mount that windows pin. */
 function workspaceUiServerUrl(value) {
   const normalized = normalizeServerUrl(value);
   try {
     const parsed = new URL(normalized);
-    if (!url.WORKSPACE_API_PATHS.has(parsed.pathname.replace(/\/+$/, ""))) return normalized;
+    const pathname = parsed.pathname.replace(/\/+$/, "");
+    const isWorkspaceMount =
+      pathname === url.WORKSPACE_UI_PATH || url.WORKSPACE_API_PATHS.has(pathname);
+    if (!isWorkspaceMount) return normalized;
     parsed.pathname = url.WORKSPACE_UI_PATH;
     return normalizeServerUrl(parsed.href);
   } catch {
@@ -888,9 +891,10 @@ function matchesServer(daemon, serverUrl) {
   if (!daemon || typeof daemon !== "object") return false;
   const want = workspaceUiServerUrl(serverUrl);
   if (want === "") return false;
-  return [daemon.server_url, daemon.target, daemon.resolved_server_url].some(
-    (field) => workspaceUiServerUrl(field) === want || sameLoopbackServer(field, serverUrl),
-  );
+  return [daemon.server_url, daemon.target, daemon.resolved_server_url].some((field) => {
+    const candidate = workspaceUiServerUrl(field);
+    return candidate === want || sameLoopbackServer(candidate, want);
+  });
 }
 
 /**

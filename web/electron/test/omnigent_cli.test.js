@@ -394,6 +394,12 @@ describe("matchesServer", () => {
     [{ server_url: workspaceApi }, "https://other.example.com/omnigent", false],
     [{ server_url: workspaceApi }, "http://ws.example.com/omnigent", false],
     [{ server_url: "https://ws.example.com/api/2.0/other" }, workspaceUi, false],
+    [{ target: `${workspaceApi}?o=1` }, `${workspaceUi}/?o=1`, true],
+    [
+      { server_url: "http://localhost:6767/api/2.0/omnigent" },
+      "http://127.0.0.1:6767/omnigent",
+      true,
+    ],
   ]) {
     it(`${JSON.stringify(record)} ${expected ? "matches" : "does not match"} ${serverUrl}`, () => {
       assert.equal(matchesServer(record, serverUrl), expected);
