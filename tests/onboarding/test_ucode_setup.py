@@ -5,11 +5,13 @@ from __future__ import annotations
 import subprocess
 import sys
 import types
-from unittest.mock import patch
+from pathlib import Path
+from unittest.mock import ANY, patch
 
 import pytest
 from click import ClickException
 
+from omnigent.onboarding import persistent_tool
 from omnigent.onboarding.setup import ProfileSpec
 from omnigent.onboarding.ucode_setup import (
     build_ucode_configure_command,
@@ -31,8 +33,10 @@ def test_find_ucode_command_prefers_uvx_pinned_commit() -> None:
     """
     with patch("shutil.which", return_value="/usr/bin/uvx"):
         assert find_ucode_command() == [
-            "/usr/bin/uvx",
-            "--from",
+            sys.executable,
+            "-I",
+            str(Path(persistent_tool.__file__).resolve()),
+            ANY,
             "git+https://github.com/databricks/ucode@304e4a29c5ca73b3bfaaf1911e38d0080833fda4",
             "ucode",
         ]
