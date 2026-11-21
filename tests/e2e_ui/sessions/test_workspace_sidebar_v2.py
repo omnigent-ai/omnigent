@@ -10,7 +10,8 @@ The flag is turned on by answering ``/v1/info`` with it added to the server's ow
 the server side of the flag is covered by ``tests/server/test_feature_flags.py``. Pull
 requests come from the same stubs as ``test_github_tab.py``, so no ``gh`` runs. The Changes
 journey runs on its own server and host, with ``workspace_api_server_access`` on, so its Git
-reads go through the workspace API.
+reads go through the workspace API. A reopened shell tab says it's connecting until the session
+lists its shell, then shows its terminal.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from __future__ import annotations
 import re
 import subprocess
 from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -262,6 +264,55 @@ def test_file_link_opens_its_comment_in_a_full_screen_sidebar(
     expect(page.locator("[data-maximized]")).to_have_count(1)
     # The link is handed to the tab, so a reload doesn't open it again.
     expect(page).not_to_have_url(re.compile(r"[?&](?:file|comment|fullscreen)="))
+
+
+def test_tabs_sidebar_shell_tab_connects_then_shows_its_terminal(
+    page: Page, terminal_session: tuple[str, str]
+) -> None:
+    """A reopened shell tab spins and says Connecting… until its shell is listed, then shows it."""
+    base_url, session_id = terminal_session
+    _set_flag(page, True)
+    _open_session(page, base_url, session_id, "desktop")
+    open_right_rail(page)
+    sidebar = page.get_by_role("complementary", name="Workspace")
+    expect(sidebar.get_by_role("group", name="Workspace history")).to_be_visible(timeout=60_000)
+    _open_app(page, sidebar, "Terminal")
+    terminal = sidebar.get_by_test_id("terminal-view").last
+    expect(terminal).to_have_attribute("data-state", "connected", timeout=60_000)
+
+    # Reopen the session while its shell list is held: the restored tab can't know its shell yet.
+    # The page's clock stands still meanwhile, so the list read's deadline can't fire however
+    # long the hold takes.
+    held: list[Route] = []
+    holding = True
+
+    def hold_list(route: Route) -> None:
+        if holding and route.request.method == "GET":
+            held.append(route)
+        else:
+            route.continue_()
+
+    page.route(re.compile(r"/v1/sessions/[^/]+/resources/terminals(?:\?.*)?$"), hold_list)
+    page.clock.install()
+    page.clock.pause_at(datetime.now(UTC) + timedelta(seconds=1))
+    try:
+        page.reload()
+        open_right_rail(page)
+        connecting = sidebar.get_by_test_id("terminal-tab-connecting")
+        expect(connecting).to_contain_text("Connecting…", timeout=60_000)
+        selected = sidebar.get_by_role("tab", selected=True)
+        expect(selected.get_by_role("status", name="Loading")).to_be_visible()
+        expect(sidebar.get_by_test_id("terminal-view")).to_have_count(0)
+        assert held, "the shell list was never requested"
+    finally:
+        page.clock.resume()
+        holding = False
+        for route in held:
+            route.continue_()
+
+    expect(terminal).to_have_attribute("data-state", "connected", timeout=30_000)
+    expect(connecting).to_have_count(0)
+    expect(selected.get_by_role("status", name="Loading")).to_have_count(0)
 
 
 def _press_palette(page: Page) -> Locator:

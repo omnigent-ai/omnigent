@@ -1,15 +1,20 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
+import type * as SessionsApiModule from "@/lib/sessionsApi";
+import { terminalsQueryKey } from "@/lib/terminals";
 import { isCommandListed, usePaletteCommandsStore } from "@/store/paletteCommands";
 import { usePullRequestListCounts } from "@/store/pullRequestListCounts";
 import { registeredPaletteCommands } from "@/test/paletteCommands";
 
 import type { WorkspacePlaceViewProps } from "./placeViews/WorkspacePlaceView";
+import { SHELL_LIST_LIMIT_MS } from "./terminalTabConnection";
+import { resetSessionResumes } from "./useTerminalTabConnection";
 import { WorkspaceTabsPanel, type WorkspaceTabsPanelProps } from "./WorkspaceTabsPanel";
 import {
   openWorkspaceFile,
@@ -53,6 +58,11 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   useTerminals: vi.fn(() => ({ terminals: [], isLoading: false, error: null })),
 }));
 
+// Resume session asks the server to start the runner; the tests answer for it.
+vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionsApiModule>()),
+  retrySession: vi.fn(async () => ({})),
+}));
 // A shell tab shows upstream's terminal view, whose connection has its own suite.
 vi.mock("@/components/blocks/TerminalView", () => ({
   TerminalView: ({ terminalId }: { terminalId: string }) => (
@@ -147,6 +157,7 @@ afterEach(() => {
   usePaletteCommandsStore.setState({ groups: {} });
   usePullRequestListCounts.setState({ counts: {} });
   queryClient.clear();
+  resetSessionResumes();
 });
 
 describe("WorkspaceTabsPanel keyboard target", () => {
@@ -564,8 +575,11 @@ describe("a shell's tab", () => {
     await act(async () => {
       await store.open({ place: { kind: "terminal", key: "terminal:term_1" } }, { opener: "user" });
     });
-    expect(await screen.findByText("Connecting to the shell…")).toBeInTheDocument();
-    expect(screen.queryByText("This shell has ended.")).toBeNull();
+    expect(await screen.findByTestId("terminal-tab-connecting")).toHaveTextContent("Connecting…");
+    // Its strip tab spins while it connects.
+    const stripTab = screen.getByRole("tab", { name: /term_1/ });
+    expect(within(stripTab).getByRole("status", { name: "Loading" })).toBeInTheDocument();
+    expect(screen.queryByText("This shell has ended")).toBeNull();
 
     listing(1);
     view.rerender(panels);
@@ -580,24 +594,184 @@ describe("a shell's tab", () => {
     view.rerender(panels);
     await waitFor(() => expect(store.resourceState(store.selectedTabId()!)).toBe("unknown"));
     expect(screen.getByTestId("terminal-view-stub")).toBe(attached);
-    expect(screen.queryByText("This shell has ended.")).toBeNull();
+    expect(screen.queryByText("This shell has ended")).toBeNull();
+
+    // While a cleared list reloads, the attached shell's strip tab doesn't spin over its terminal.
+    vi.mocked(useTerminals).mockReturnValue({
+      terminals: [terminal],
+      isLoading: true,
+      error: null,
+      listCompleteAt: 0,
+    } as unknown as ReturnType<typeof useTerminals>);
+    view.rerender(panels);
+    await waitFor(() => expect(store.resourceState(store.selectedTabId()!)).toBe("unknown"));
+    expect(screen.getByTestId("terminal-view-stub")).toBe(attached);
+    expect(
+      within(screen.getByRole("tab", { name: /term_1/ })).queryByRole("status", {
+        name: "Loading",
+      }),
+    ).toBeNull();
   });
 
-  it("says the session's shells can't be listed when that fails before the tab attaches", async () => {
+  /** The session's shell list as the panel reads it. */
+  async function listShells(state: {
+    error?: Error;
+    isFetching?: boolean;
+    listCompleteAt?: number;
+  }) {
     const { useTerminals } = await import("@/hooks/useTerminals");
     vi.mocked(useTerminals).mockReturnValue({
       terminals: [],
       isLoading: false,
-      error: new Error("offline"),
+      isFetching: false,
+      error: null,
       listCompleteAt: 0,
+      ...state,
     } as unknown as ReturnType<typeof useTerminals>);
-    renderPanels([{ conversationId: "s-shell-down", terminalKeys: ["terminal:term_1"] }]);
+  }
+
+  it("offers Try Again when the session's shells can't be listed, which asks for them again", async () => {
+    await listShells({ error: new Error("offline") });
+    const cancel = vi.spyOn(queryClient, "cancelQueries");
+    const refetch = vi.spyOn(queryClient, "refetchQueries");
+    const panels = [{ conversationId: "s-shell-down", terminalKeys: ["terminal:term_1"] }];
+    const view = renderPanels(panels);
     const { store } = workspaceTabsSession("s-shell-down");
     await act(async () => {
       await store.open({ place: { kind: "terminal", key: "terminal:term_1" } }, { opener: "user" });
     });
-    expect(await screen.findByText("Couldn’t reach this session’s shells.")).toBeInTheDocument();
-    expect(screen.queryByText("This shell has ended.")).toBeNull();
+    expect(await screen.findByRole("alert")).toHaveTextContent("Couldn't connect to this terminal");
     expect(screen.queryByTestId("terminal-view-stub")).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "Try Again" }));
+    expect(refetch).toHaveBeenCalledWith(
+      { queryKey: terminalsQueryKey("s-shell-down") },
+      { cancelRefetch: false },
+    );
+    expect(cancel).not.toHaveBeenCalled();
+
+    // While the list is asked for again, the tab connects; a failed answer shows the failure again.
+    await listShells({ error: new Error("offline"), isFetching: true });
+    view.rerender(panels);
+    expect(await screen.findByTestId("terminal-tab-connecting")).toBeInTheDocument();
+    await listShells({ error: new Error("offline") });
+    view.rerender(panels);
+    expect(await screen.findByRole("alert")).toHaveTextContent("Couldn't connect to this terminal");
+  });
+
+  describe("a shell the loaded list doesn't show", () => {
+    beforeEach(async () => {
+      await listShells({ listCompleteAt: 1 });
+      vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    });
+    afterEach(() => vi.useRealTimers());
+    const openUnlisted = async (conversationId: string) => {
+      const { store } = workspaceTabsSession(conversationId);
+      await act(async () => {
+        await store.open(
+          { place: { kind: "terminal", key: "terminal:term_9" } },
+          { opener: "user" },
+        );
+      });
+      expect(store.resourceState(store.selectedTabId()!)).toBe("unknown");
+    };
+    const advance = async (ms: number) => {
+      await act(async () => {
+        vi.advanceTimersByTime(ms);
+      });
+    };
+    const connecting = () => screen.queryByTestId("terminal-tab-connecting") !== null;
+
+    it("stops connecting after the limit", async () => {
+      renderPanels([{ conversationId: "s-shell-unlisted", terminalKeys: [] }]);
+      await openUnlisted("s-shell-unlisted");
+      expect(connecting()).toBe(true);
+      await advance(SHELL_LIST_LIMIT_MS + 1_000);
+      expect(screen.getByRole("alert")).toHaveTextContent("Couldn't connect to this terminal");
+    });
+
+    it("still stops after the limit when another panel replaces the one it opened in", async () => {
+      const panels = [{ conversationId: "s-shell-replaced", terminalKeys: [] }];
+      const view = renderPanels(panels);
+      await openUnlisted("s-shell-replaced");
+      await advance(SHELL_LIST_LIMIT_MS - 5_000);
+      view.rerender([]);
+      view.rerender(panels);
+      expect(connecting()).toBe(true);
+      await advance(6_000);
+      expect(screen.getByRole("alert")).toHaveTextContent("Couldn't connect to this terminal");
+    });
+
+    it("asks again on each Try Again, with the limit starting over each time", async () => {
+      const refetch = vi.spyOn(queryClient, "refetchQueries");
+      renderPanels([{ conversationId: "s-shell-retry", terminalKeys: [] }]);
+      await openUnlisted("s-shell-retry");
+      const timeOutThenTryAgain = async (attempt: number) => {
+        await advance(SHELL_LIST_LIMIT_MS + 1_000);
+        fireEvent.click(screen.getByRole("button", { name: "Try Again" }));
+        expect(refetch).toHaveBeenCalledTimes(attempt);
+        expect(connecting()).toBe(true);
+        await advance(SHELL_LIST_LIMIT_MS - 1_000);
+        expect(connecting()).toBe(true);
+      };
+      await timeOutThenTryAgain(1);
+      await timeOutThenTryAgain(2);
+    });
+  });
+
+  it.each([
+    [{ kind: "host_offline", isOwner: true } as const, "Host is offline"],
+    [{ kind: "runner_asleep" } as const, "Session isn't running"],
+  ])("says why a shell can't connect while the session reads %o", async (liveness, title) => {
+    const { useTerminals } = await import("@/hooks/useTerminals");
+    vi.mocked(useTerminals).mockReturnValue({
+      terminals: [],
+      isLoading: true,
+      error: null,
+      listCompleteAt: 0,
+    } as unknown as ReturnType<typeof useTerminals>);
+    const conversationId = `s-shell-${liveness.kind}`;
+    renderPanels([{ conversationId, terminalKeys: ["terminal:term_1"], liveness }]);
+    const { store } = workspaceTabsSession(conversationId);
+    await act(async () => {
+      await store.open({ place: { kind: "terminal", key: "terminal:term_1" } }, { opener: "user" });
+    });
+    expect(await screen.findByTestId("terminal-tab-status")).toHaveTextContent(title);
+    expect(screen.queryByTestId("terminal-tab-connecting")).toBeNull();
+  });
+
+  it("resumes a session that isn't running from its shell tab, once while it's on its way", async () => {
+    const { useTerminals } = await import("@/hooks/useTerminals");
+    const { retrySession } = await import("@/lib/sessionsApi");
+    vi.mocked(useTerminals).mockReturnValue({
+      terminals: [],
+      isLoading: true,
+      error: null,
+      listCompleteAt: 0,
+    } as unknown as ReturnType<typeof useTerminals>);
+    let answer: () => void = () => {};
+    vi.mocked(retrySession).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          answer = () => resolve({} as never);
+        }),
+    );
+    renderPanels([
+      {
+        conversationId: "s-shell-asleep",
+        terminalKeys: ["terminal:term_1"],
+        liveness: { kind: "runner_asleep" },
+      },
+    ]);
+    const { store } = workspaceTabsSession("s-shell-asleep");
+    await act(async () => {
+      await store.open({ place: { kind: "terminal", key: "terminal:term_1" } }, { opener: "user" });
+    });
+    const resume = await screen.findByRole("button", { name: "Resume session" });
+    await userEvent.click(resume);
+    await userEvent.click(resume);
+    expect(retrySession).toHaveBeenCalledTimes(1);
+    expect(retrySession).toHaveBeenCalledWith("s-shell-asleep");
+    await act(async () => answer());
+    await waitFor(() => expect(resume).not.toBeDisabled());
   });
 });

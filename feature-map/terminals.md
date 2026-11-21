@@ -88,7 +88,10 @@ with their own terminal retain the switcher.
 - Tabs sidebar: with `workspace_sidebar_v2` on, in a desktop app or desktop browser (not a
   touch client), shells open as tabs in the workspace sidebar. The
   session-actions menu's **Shells** shows the session's selected or last shell tab,
-  or a New tab to start one.
+  or a New tab to start one. A shell tab that can't show its terminal yet says why:
+  **Resume session** appears when the session isn't running, for anyone who can edit it
+  (a viewer is told to ask an editor), and **Try Again** appears when the shell list
+  can't be read or doesn't show the shell within 20 seconds.
 
 **After the session moves:** open the host badge, choose "Switch host…", pick
 another host or a new sandbox, then look at both the terminal strip and the
