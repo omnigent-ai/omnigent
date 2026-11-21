@@ -6,15 +6,13 @@ import {
   paneStripMinWidth,
   paneStripShownWidth,
   STRIP_BUTTON_WIDTH,
-  STRIP_FIND_MAX_WIDTH,
-  STRIP_FIND_MIN_WIDTH,
   STRIP_GAP,
   STRIP_PADDING,
   type PaneStripParts,
 } from "./paneStripLayout";
 
-// Every row a pane kind draws: a session or local pane, maximized or not, find open or not, and
-// the lone shell with its status and Show Chat.
+// Every row a pane kind draws: maximized or not, with or without Close, and the lone shell with
+// its status and Show Chat.
 const ROWS: readonly [string, PaneStripParts][] = [
   ["split pane", { actions: 4, restore: false }],
   ["maximized pane", { actions: 3, restore: true }],
@@ -22,8 +20,6 @@ const ROWS: readonly [string, PaneStripParts][] = [
   ["lone splittable pane", { actions: 2, restore: false }],
   ["identity-only pane", { actions: 0, restore: false }],
   ["lone shell", { actions: 0, restore: false, fixed: [72, STRIP_BUTTON_WIDTH] }],
-  ["split pane, find open", { actions: 4, restore: false, findOpen: true }],
-  ["maximized pane, find open", { actions: 3, restore: true, findOpen: true }],
 ];
 
 describe("paneStripLayout", () => {
@@ -37,7 +33,7 @@ describe("paneStripLayout", () => {
       const layout = paneStripLayout(width, parts);
       expect(layout.compact, `at ${width}`).toBe(false);
       expect(paneStripShownWidth(layout, parts), `at ${width}`).toBeLessThanOrEqual(width);
-      // Identity stays: find floats over the terminal before it takes the title's room.
+      // Identity stays at or above the floor.
       expect(layout.title, `at ${width}`).toBe(true);
     }
   });
@@ -46,13 +42,9 @@ describe("paneStripLayout", () => {
     "below the floor keeps only the controls, still inside the row: %s",
     (_name, parts) => {
       const floor = paneStripMinWidth(parts);
-      const controls = paneStripShownWidth(
-        { compact: true, title: false, actions: 0, find: null },
-        parts,
-      );
+      const controls = paneStripShownWidth({ compact: true, title: false, actions: 0 }, parts);
       for (let width = 0; width < floor; width += 1) {
         const layout = paneStripLayout(width, parts);
-        if (layout.find?.placement === "row") continue;
         expect(layout.compact, `at ${width}`).toBe(true);
         expect(layout.actions, `at ${width}`).toBe(0);
         // Narrower than its controls, the row shows just them and overflows.
@@ -81,33 +73,5 @@ describe("paneStripLayout", () => {
     const step = STRIP_BUTTON_WIDTH + STRIP_GAP;
     expect(paneStripLayout(floor + step - 1, parts).actions).toBe(0);
     expect(paneStripLayout(floor + step, parts).actions).toBe(1);
-  });
-
-  it("gives find a usable width, or floats it", () => {
-    const parts = { actions: 4, restore: true, findOpen: true };
-    for (let width = 0; width <= 900; width += 1) {
-      const { find } = paneStripLayout(width, parts);
-      expect(find).not.toBeNull();
-      if (find?.placement === "row") {
-        expect(find.width).toBeGreaterThanOrEqual(STRIP_FIND_MIN_WIDTH);
-        expect(find.width).toBeLessThanOrEqual(STRIP_FIND_MAX_WIDTH);
-      }
-    }
-    // The title stays; find floats over the terminal when it can't dock beside it.
-    expect(paneStripLayout(300, parts)).toMatchObject({ title: true, find: { placement: "row" } });
-    const narrow = paneStripLayout(paneStripMinWidth(parts) + 70, parts);
-    expect(narrow).toMatchObject({ title: true, find: { placement: "float" } });
-    // A 204 px split pane with find open: with no ⋯ to keep, find docks beside the title.
-    const split = { actions: 4, restore: false, findOpen: true };
-    expect(paneStripLayout(204, split)).toMatchObject({
-      title: true,
-      find: { placement: "row", width: 204 - (STRIP_PADDING + 22 + 48 + 2 * STRIP_GAP), fold: 2 },
-    });
-    expect(paneStripLayout(PANE_STRIP_MIN_WIDTH, parts).find).toEqual({ placement: "float" });
-    expect(paneStripLayout(1200, parts).find).toEqual({
-      placement: "row",
-      width: STRIP_FIND_MAX_WIDTH,
-      fold: 0,
-    });
   });
 });

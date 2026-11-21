@@ -97,3 +97,12 @@ export function paneMenuEntries(
   }
   return entries;
 }
+
+const ZOOM = PANE_COMMANDS.find((entry) => entry.id === "terminal.toggleZoom")!;
+
+/** Maximize and Restore, as every entry point names them, and the maximized pane's own mark. */
+export const PANE_ZOOM_LABELS = Object.freeze({
+  maximize: ZOOM.label,
+  restore: ZOOM.checkedLabel ?? ZOOM.label,
+  maximized: "Maximized",
+});
