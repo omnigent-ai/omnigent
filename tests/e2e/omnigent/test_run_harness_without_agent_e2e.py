@@ -261,6 +261,15 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     this matrix to drive. Its coverage is the dedicated devin-native
     bridge/forwarder/executor unit tests plus the Devin picker e2e_ui suite.
 
+    ``commandcode-native`` is excluded for the union of both reasons, like
+    ``devin-native``: it is a terminal-first TUI launched via
+    ``omnigent commandcode`` (tmux pane + bridge dir + generated policy mod),
+    not ``omnigent run --harness commandcode-native``, AND it wraps the
+    own-auth ``cmd`` CLI (``cmd login`` / ``COMMAND_CODE_API_KEY``), so its
+    spawn env carries no gateway/profile probe vars for this matrix to drive.
+    Its coverage is the dedicated commandcode-native bridge/forwarder unit
+    tests.
+
     Builtin ACP CLI harnesses (every row of ``ACP_CLI_HARNESSES``) are excluded
     for the same reason as ``goose``: each wraps an own-auth vendor CLI, so its
     spawn env carries no gateway/profile probe vars for this matrix to drive.
@@ -288,6 +297,7 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
         "hermes",
         "hermes-native",
         "devin-native",
+        "commandcode-native",
         *ACP_CLI_HARNESSES,
     }
     assert {probe.harness for probe in HARNESS_PROBES} == expected_live_harnesses

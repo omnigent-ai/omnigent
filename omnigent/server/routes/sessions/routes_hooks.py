@@ -375,11 +375,12 @@ def register_hooks_routes(
                 if elicitation_id.startswith(f"elicit_{vendor}_"):
                     hook_vendor = vendor
                     break
-        elif native_agent is not None and native_agent.key == "devin":
-            # Older Devin hooks send no id; retain their session-derived identity.
-            hook_vendor = "devin"
+        elif native_agent is not None and native_agent.key in ("devin", "commandcode"):
+            # Older Devin hooks and Command Code's generated mod send no
+            # elicitation id; derive the vendor from the session's native agent.
+            hook_vendor = native_agent.key
         hook_harness = f"{hook_vendor}-native"
-        hook_label = hook_vendor.capitalize()
+        hook_label = {"commandcode": "Command Code"}.get(hook_vendor, hook_vendor.capitalize())
         is_claude = hook_vendor == "claude"
         # Legacy sessions may lack native metadata; a known native session must match.
         if native_agent is not None and native_agent.harness != hook_harness:
