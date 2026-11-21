@@ -6589,7 +6589,7 @@ function ConversationRowImpl({
           // outset ring.
           "w-full focus-visible:outline-offset-[-2px]",
           // Touch reaches the row menu by long press.
-          "mobile-touch-target",
+          "mobile-touch-target max-md:select-none max-md:[-webkit-touch-callout:none]",
           // Aligns the parent title with its nested rows' titles (ml-6 + px-2).
           familyExpanded !== undefined && "pl-8",
           // Mobile drops the pin + kebab (see the trailing controls below), so it
