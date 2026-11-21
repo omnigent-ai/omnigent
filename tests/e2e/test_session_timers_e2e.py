@@ -208,7 +208,7 @@ def test_one_shot_timer_fires_once_after_runner_and_server_restarts(
             f"the firing came {delivered_at - fire_at:.1f}s late\n{stack.log_tail()}"
         )
         (firing,) = _firings(client, session_id, timer_id)
-        # The same hidden, note-carrying wake the runner's timers sent.
+        # The firing is a hidden user message that carries the timer's note.
         assert firing["is_meta"] is True
         assert firing["content"] == [
             {

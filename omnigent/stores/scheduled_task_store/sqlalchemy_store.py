@@ -1894,12 +1894,14 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             row = session.get(
                 SqlScheduledTaskRun, (run.workspace_id, run.id), with_for_update=True
             )
+            # Read once the locks are held, so a lease that lapsed meanwhile is refused.
+            timestamp = int(now())
             if (
                 row is None
                 or row.status != encode_scheduled_task_run_status("starting")
                 or row.lease_expires_at is None
                 or row.lease_expires_at != run.lease_expires_at
-                or row.lease_expires_at <= int(now())
+                or row.lease_expires_at <= timestamp
             ):
                 return None
             if task is None or task.state == encode_scheduled_task_state("deleted"):
@@ -1909,7 +1911,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 # removes it, so a later cancel finds nothing left to stop.
                 task.state = encode_scheduled_task_state("deleted")
                 task.next_run_at = None
-                task.updated_at = now_epoch()
+                task.updated_at = timestamp
             row.conversation_id = conversation_id
             return TimerDelivery(run=_run_to_entity(row), deliver=True)
 

@@ -4843,9 +4843,29 @@ def _has_subagent(
 
 
 # ── Timer dispatch ─────────────────────────────────────────────
-# The server saves each timer as a scheduled task and fires it, so a timer
-# survives runner exits and restarts. Argument validation and the delay ceiling
-# live in the timer builtin (``validate_timer_set_args``), shared with the server.
+# The server saves and fires timers, so they survive runner restarts; the
+# server checks arguments with the same ``validate_timer_set_args``.
+
+
+async def _timer_support_error(server_client: httpx.AsyncClient) -> str | None:
+    """
+    Check that the server runs timers before asking it to save one.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: Why no timer can be set, or ``None`` when the server runs timers.
+    """
+    try:
+        info = await server_client.get("/v1/info", timeout=30.0)
+        info.raise_for_status()
+        supported = info.json().get("session_timers") is True
+    except (httpx.HTTPError, ValueError) as exc:
+        # Nothing was sent to save yet, so trying again is safe.
+        return f"sys_timer_set could not check server support, so no timer was set: {exc}"
+    if supported:
+        return None
+    return (
+        "sys_timer_set: this Omnigent server does not run timers; it needs the database scheduler"
+    )
 
 
 async def _execute_timer_set(
@@ -4869,15 +4889,10 @@ async def _execute_timer_set(
     seconds, repeat, note = validated
     if server_client is None or conversation_id is None:
         return json.dumps({"error": "timer requires server_client and conversation_id"})
+    unsupported = await _timer_support_error(server_client)
+    if unsupported is not None:
+        return json.dumps({"error": unsupported})
     try:
-        info = await server_client.get("/v1/info", timeout=30.0)
-        if info.status_code >= 400 or info.json().get("session_timers") is not True:
-            return json.dumps(
-                {
-                    "error": "sys_timer_set: this Omnigent server does not run timers; "
-                    "it needs the database scheduler"
-                }
-            )
         resp = await server_client.post(
             f"{_session_url(conversation_id)}/timers",
             json={"seconds": seconds, "repeat": repeat, "note": note},

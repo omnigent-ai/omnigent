@@ -2299,7 +2299,7 @@ def create_scheduled_tasks_router(
             task = store.create(
                 scheduled_task_id=task_id,
                 name=f"Timer: {note}"[:256] if note else "Timer",
-                # The hidden message each firing sends, as the runner's timers did.
+                # The hidden message each firing sends into the session.
                 prompt=f"[System: timer {task_id} fired]" + (f"\nnote: {note!r}" if note else ""),
                 rrule=timer_rule(interval, repeat=repeat),
                 user_id=user_id,
