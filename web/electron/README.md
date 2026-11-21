@@ -863,18 +863,26 @@ picks how much:
 - Values are decrypted with `v10`/`v11` (AES-128-CBC, key from the login
   Keychain's "Chrome Safe Storage" item) and never shown, logged, or persisted.
   App-bound `v20` values and non-macOS platforms are refused with a message, not
-  guessed at. The Keychain prompt is attributed to `security`; choose **Allow**
-  rather than **Always Allow**, because Always Allow adds `/usr/bin/security` to
-  the item's ACL, and any local process can then read Chrome's key without a
-  prompt. Partitioned (CHIPS) cookies are skipped rather than replayed
+  guessed at. Partitioned (CHIPS) cookies are skipped rather than replayed
   unpartitioned, which would widen the site they were scoped to.
+- The app reads that Keychain item in its own process, through the native
+  `@napi-rs/keyring` binding, so the macOS prompt names the app and **Always
+  Allow** is recorded against the app's signature. It never asks a helper such
+  as `/usr/bin/security` for the key, and does not fall back to one when the
+  binding can't load: a grant to a shared tool lets any local process run that
+  tool and read the key without a prompt. Still choose **Allow** rather than
+  **Always Allow** for now: the packaged app can be started in Electron's
+  plain-Node mode, which runs another program's script under the app's
+  signature. Builds before this change did read the key through `security`; if
+  you chose Always Allow in one, remove `security` from the "Chrome Safe
+  Storage" item's Access Control list in Keychain Access.
 - Reading never touches Chrome's live database: `Cookies` (plus any
   `Cookies-wal` / `Cookies-journal`) is copied into a private temp directory and
   `sqlite3` only opens that copy, so Chrome's file is never locked or rewritten.
-  `sqlite3` and `security` are spawned by absolute path (`/usr/bin/...`, the
-  macOS system copies) instead of being resolved through `PATH`, so nothing on
-  the user's path can intercept Chrome's key or jar. Failures surface as a fixed
-  message, never the command line.
+  `sqlite3` is spawned by absolute path (`/usr/bin/sqlite3`, the macOS system
+  copy) instead of being resolved through `PATH`, so nothing on the user's path
+  can intercept Chrome's jar. Failures surface as a fixed message, never the
+  command line.
 - Cookies land in the conversation's existing in-memory partition, so they
   disappear when the app quits; nothing is written back to Chrome, and there is
   no background sync.

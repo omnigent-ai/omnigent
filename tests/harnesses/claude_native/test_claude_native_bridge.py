@@ -18122,3 +18122,35 @@ def test_a_sandboxed_helper_accepts_the_bridge_under_its_read_only_pinned_tmpdir
             bridge._trusted_parent_for_bridge_dir(pinned / "elsewhere")
     finally:
         pinned.chmod(0o700)
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        {"claude_session_id": "", "cost_usd": 1.0, "restored": None},
+        {"claude_session_id": "sid", "cost_usd": 0, "restored": None},
+        {"claude_session_id": "sid", "cost_usd": float("nan"), "restored": None},
+        {"claude_session_id": "sid", "cost_usd": 10**400, "restored": None},
+        {"claude_session_id": "sid", "cost_usd": True, "restored": None},
+        {"claude_session_id": "sid", "cost_usd": "1.0", "restored": None},
+        {"claude_session_id": "sid", "cost_usd": 1.0, "restored": "yes"},
+        ["sid", 1.0],
+    ],
+    ids=[
+        "no-session",
+        "zero",
+        "nan",
+        "overflow",
+        "bool",
+        "string",
+        "bad-decision",
+        "not-an-object",
+    ],
+)
+def test_read_resume_cost_baseline_ignores_a_malformed_record(
+    tmp_path: Path, record: object
+) -> None:
+    """A malformed record seeds nothing rather than a wrong cost."""
+    (tmp_path / "resume_cost_baseline.json").write_text(json.dumps(record), encoding="utf-8")
+
+    assert claude_native_bridge.read_resume_cost_baseline(tmp_path) is None

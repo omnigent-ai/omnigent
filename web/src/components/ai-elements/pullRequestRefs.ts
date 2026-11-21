@@ -15,10 +15,18 @@ export interface PullRequestRef {
   number: string;
 }
 
-// `#` must start a token; bare numbers need 4+ digits. A captured prefix replaces
-// lookbehind for Safari < 16.4.
-export const PULL_REQUEST_REF =
-  /(^|[^\w&/#.-])(?:([A-Za-z0-9][A-Za-z0-9-]{0,38})\/([A-Za-z0-9._-]{1,100}))?#(\d+)(?!\w)/g;
+// Unicode letters, digits and marks on either side block a reference, as does an
+// extension (`#4242.md`); Han, kana and Hangul may border one outside a path segment.
+// Bare numbers need 4+ digits. A captured prefix replaces lookbehind for Safari < 16.4.
+const UNSPACED_SCRIPT = "\\p{scx=Han}\\p{scx=Hiragana}\\p{scx=Katakana}\\p{scx=Hangul}";
+export const PULL_REQUEST_REF = new RegExp(
+  `(^|[^\\p{L}\\p{N}\\p{M}_&/#.-]|[${UNSPACED_SCRIPT}])` +
+    "(?:([A-Za-z0-9][A-Za-z0-9-]{0,38})\\/([A-Za-z0-9._-]{1,100}))?#(\\d+)" +
+    `(?!(?![${UNSPACED_SCRIPT}])[\\p{L}\\p{N}\\p{M}_]|\\.[\\p{L}\\p{N}])`,
+  "gu",
+);
+const UNSPACED_CHAR = new RegExp(`^[${UNSPACED_SCRIPT}]$`, "u");
+const PATH_SEPARATOR = /[/\\]/;
 const BARE_NUMBER = /^[1-9]\d{3,9}$/;
 const EXPLICIT_NUMBER = /^[1-9]\d{0,9}$/;
 // GitHub owners can't end in `-`.
@@ -131,7 +139,7 @@ export function splitPullRequestRefs(
         !FILE_EXTENSION.test(repo) &&
         !NON_OWNER.test(owner)
       : BARE_NUMBER.test(number);
-    if (!valid) continue;
+    if (!valid || followsPathSegment(text, match.index, prefix)) continue;
     if (escaped) {
       const hash = start + token.indexOf("#");
       for (
@@ -157,6 +165,22 @@ export function splitPullRequestRefs(
     nodes.push({ type: "text", value: text.slice(last) });
   }
   return nodes;
+}
+
+/** Whether an unspaced-script `prefix` at `index` ends a run that follows a path separator. */
+function followsPathSegment(text: string, index: number, prefix: string): boolean {
+  if (!UNSPACED_CHAR.test(prefix)) return false;
+  let start = index;
+  for (;;) {
+    // Step back a whole code point, so a supplementary character (`𠀀`) continues the run.
+    const low = text.charCodeAt(start - 1);
+    const width = low >= 0xdc00 && low <= 0xdfff && start >= 2 ? 2 : 1;
+    const previous = text.slice(start - width, start);
+    if (start === 0 || !UNSPACED_CHAR.test(previous)) {
+      return PATH_SEPARATOR.test(previous);
+    }
+    start -= width;
+  }
 }
 
 /** The reference a parked href names, or null for any other href. */
