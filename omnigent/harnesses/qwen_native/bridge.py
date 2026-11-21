@@ -65,6 +65,9 @@ _EVENTS_FILE = "qwen_out.ndjson"
 _TMUX_READY_TIMEOUT_S = 30.0
 _TMUX_SEND_TIMEOUT_S = 10.0
 _POLL_INTERVAL_S = 0.2
+#: Max seconds :func:`wait_for_ready` waits for qwen's boot signal. On expiry the
+#: caller fails the turn rather than append a line qwen's watcher would skip.
+READY_TIMEOUT_S = 30.0
 
 #: Token config the shared Omnigent MCP relay (``serve-mcp``) reads from the
 #: bridge dir. Mirrors cursor-/claude-native (``cursor_native_bridge.py``).
@@ -597,7 +600,7 @@ def _append_command(bridge_dir: Path, command: _JsonObject) -> None:
 def wait_for_ready(
     bridge_dir: Path,
     *,
-    timeout_s: float = 30.0,
+    timeout_s: float = READY_TIMEOUT_S,
     poll_interval_s: float = _POLL_INTERVAL_S,
 ) -> bool:
     """Block until the qwen TUI has booted its dual-output stream.
@@ -620,7 +623,7 @@ def wait_for_ready(
     :param timeout_s: Max seconds to wait for the boot signal.
     :param poll_interval_s: Seconds between polls of the events file.
     :returns: ``True`` once the boot signal is seen; ``False`` on timeout (the
-        caller submits anyway — best effort beats hanging the turn).
+        caller must not append — qwen would skip the line it never reads).
     """
     events_file = events_file_path(bridge_dir)
     deadline = time.monotonic() + timeout_s

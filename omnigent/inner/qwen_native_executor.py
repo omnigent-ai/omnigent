@@ -24,6 +24,7 @@ from pathlib import Path
 
 from omnigent.harnesses.qwen_native.bridge import (
     BRIDGE_DIR_ENV_VAR,
+    READY_TIMEOUT_S,
     submit_user_message,
     wait_for_ready,
 )
@@ -74,23 +75,28 @@ class QwenNativeExecutor(Executor):
         watcher is up — so the offset is taken on the still-empty input file.
 
         Only latches ``_ready`` on a confirmed-ready result, so a warm session
-        never re-blocks but a *timeout* re-checks on the next turn (qwen is
-        almost certainly up by then). On timeout we log and let the caller submit
-        anyway — best-effort beats hanging the turn — but the warning makes the
-        rare dropped-first-message failure diagnosable rather than silent.
+        never re-blocks; on timeout the turn fails instead of appending a line
+        qwen's watcher would skip, and the next turn re-checks readiness.
+
+        :raises RuntimeError: If qwen's boot signal is not seen within
+            :data:`READY_TIMEOUT_S`.
         """
         if self._ready:
             return
-        ready = await asyncio.to_thread(wait_for_ready, self._bridge_dir)
+        ready = await asyncio.to_thread(
+            wait_for_ready, self._bridge_dir, timeout_s=READY_TIMEOUT_S
+        )
         if ready:
             self._ready = True
-        else:
-            logger.warning(
-                "qwen-native readiness gate timed out for %s; submitting anyway — "
-                "the first message may be dropped if qwen's input watcher is not up "
-                "yet (will re-check next turn)",
-                self._bridge_dir,
-            )
+            return
+        logger.warning(
+            "qwen-native readiness gate timed out for %s; failing the turn instead of "
+            "appending a line qwen's input watcher would skip (will re-check next turn)",
+            self._bridge_dir,
+        )
+        raise RuntimeError(
+            f"qwen did not become ready within {READY_TIMEOUT_S:.0f}s; the message was not sent"
+        )
 
     def supports_streaming(self) -> bool:
         """:returns: ``False`` — output is shown by the embedded terminal, not this executor."""
