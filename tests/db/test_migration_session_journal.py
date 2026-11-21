@@ -133,8 +133,12 @@ def test_upgrade_matches_models_and_downgrade_drops_tables(tmp_path: Path) -> No
     assert {"inbox_items", "scheduled_task_shares"} <= tables
     assert "kind" in {column["name"] for column in rolled_back.get_columns("scheduled_tasks")}
     with engine.connect() as connection:
-        assert connection.execute(
-            sa.text("SELECT version_num FROM alembic_version")
-        ).scalars().all() == ["27d16059fab9"]
+        # Downgrading only the session-journal branch (5d872cd6632a) back to the
+        # fork point a7d4c2e9f610 leaves the other heads descending from that
+        # fork intact: the scheduled-tasks head (27d16059fab9) and the
+        # usage-tracking/cost-alerts head (dc0b5e0d2288).
+        assert set(
+            connection.execute(sa.text("SELECT version_num FROM alembic_version")).scalars().all()
+        ) == {"dc0b5e0d2288", "27d16059fab9"}
     engine.dispose()
     clear_engine_cache()

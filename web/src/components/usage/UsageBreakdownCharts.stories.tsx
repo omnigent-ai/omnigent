@@ -1,6 +1,6 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { UsageBreakdownCharts } from "./UsageBreakdownCharts";
-import { usageStorySessions } from "./storyFixtures";
+import { usageStoryProjects, usageStorySessions } from "./storyFixtures";
 
 const meta = {
   title: "Components/Usage/UsageBreakdownCharts",
@@ -20,7 +20,7 @@ export default meta;
 type Story = StoryObj<typeof meta>;
 
 export const Populated: Story = {
-  args: { sessions: usageStorySessions },
+  args: { sessions: usageStorySessions, projects: usageStoryProjects },
 };
 
 export const Empty: Story = {
