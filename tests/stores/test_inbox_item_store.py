@@ -250,6 +250,32 @@ def test_unread_count_is_bounded(store: SqlAlchemyInboxItemStore) -> None:
     assert store.count_unread("alice", limit=2) == 2
 
 
+def _status(store: SqlAlchemyInboxItemStore, item_id: str, user_id: str = "alice") -> str:
+    item = store.get(item_id, user_id)
+    assert item is not None
+    return item.status
+
+
+def test_mark_all_read_changes_only_the_owners_unread_items(
+    store: SqlAlchemyInboxItemStore,
+) -> None:
+    first = store.create(_new(dedupe_key="v1:first"))
+    other_agent = store.create(_new(dedupe_key="v1:other", agent_id="b" * 32))
+    dismissed = store.create(_new(dedupe_key="v1:dismissed"))
+    store.update(dismissed.id, "alice", status="dismissed", resolution="not_now", now=100)
+    bobs = store.create(_new(dedupe_key="v1:bob", user_id="bob"))
+
+    assert store.mark_all_read("alice", agent_id="a" * 32) == 1
+    assert (_status(store, first.id), _status(store, other_agent.id)) == ("read", "unread")
+
+    assert store.mark_all_read("alice") == 1
+    assert store.count_unread("alice", limit=100) == 0
+    # A resolved item stays closed, and another owner's item is untouched.
+    assert _status(store, dismissed.id) == "dismissed"
+    assert _status(store, bobs.id, "bob") == "unread"
+    assert store.mark_all_read("alice") == 0
+
+
 def test_update_records_the_answer_and_when_it_was_given(
     store: SqlAlchemyInboxItemStore,
 ) -> None:

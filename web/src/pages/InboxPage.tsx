@@ -468,6 +468,16 @@ export function InboxPage() {
     unreadSuggestions.length +
     unloadedUnreadSuggestions;
   const markSuggestionsRead = async () => {
+    // One call covers every page; on the advisor tab, only that agent's items.
+    if (proactiveInbox.canMarkAllRead) {
+      if (advisorOnly && advisorSettings === undefined) return;
+      const accepted = await proactiveInbox.markAllRead(
+        advisorOnly && advisorSettings ? advisorSettings.agent_id : null,
+      );
+      if (!accepted) showToast("Couldn’t mark your suggestions as read. Try again.");
+      return;
+    }
+    // Older servers mark one suggestion at a time, so list those past the loaded pages.
     const targets = new Set(unreadSuggestions.map((item) => item.id));
     let listingFailed = false;
     if (showSuggestions && proactiveInbox.hasNextPage) {

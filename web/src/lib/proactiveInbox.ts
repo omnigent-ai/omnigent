@@ -180,6 +180,57 @@ export async function updateSuggestion(
   };
 }
 
+/** The server's reply to marking every unread suggestion read. */
+export interface MarkAllReadResult {
+  marked: number;
+  unreadCount: number;
+  unreadCountCapped: boolean;
+}
+
+/**
+ * Mark all of the viewer's unread suggestions read in one call, or only those
+ * *agentId* posted. Needs `inbox_mark_all_read` in the server info.
+ */
+export async function markAllSuggestionsRead(agentId: string | null): Promise<MarkAllReadResult> {
+  const res = await authenticatedFetch("/v1/inbox/items/mark-read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(agentId === null ? {} : { agent_id: agentId }),
+  });
+  if (!res.ok) throw await apiErrorFromResponse(res);
+  const reply = (await res.json()) as {
+    marked: number;
+    unread_count: number;
+    unread_count_capped?: boolean;
+  };
+  return {
+    marked: reply.marked,
+    unreadCount: reply.unread_count,
+    unreadCountCapped: reply.unread_count_capped === true,
+  };
+}
+
+/**
+ * Write a mark-all-read reply into cached pages: unread items (only *agentId*'s
+ * when set) read, and every page's total set to the server's count after it.
+ */
+export function reconcileMarkAllRead(
+  pages: SuggestionPage[],
+  agentId: string | null,
+  saved: MarkAllReadResult,
+): SuggestionPage[] {
+  return pages.map((page) => ({
+    ...page,
+    unreadCount: saved.unreadCount,
+    unreadCountCapped: saved.unreadCountCapped,
+    data: page.data.map((item) =>
+      item.status === "unread" && (agentId === null || item.agentId === agentId)
+        ? { ...item, status: "read" }
+        : item,
+    ),
+  }));
+}
+
 /** The status an update moves an item to, matching the server's rules. */
 export function statusAfterUpdate(update: SuggestionUpdate): SuggestionStatus {
   if ("status" in update) return update.status;

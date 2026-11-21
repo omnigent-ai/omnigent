@@ -2329,6 +2329,55 @@ describe("InboxPage mark all as read", () => {
     expect(update).toHaveBeenCalledWith("sug_unread", { status: "read" }, expect.anything());
   });
 
+  it("uses one call for every suggestion when the server offers it", async () => {
+    const markAllRead = vi.fn().mockResolvedValue(true);
+    const update = vi.fn().mockResolvedValue(true);
+    vi.mocked(proactiveInboxHook.useProactiveInbox).mockReturnValue(
+      proactiveInboxStub({
+        items: [suggestionItem({})],
+        unreadCount: 40,
+        hasNextPage: true,
+        canMarkAllRead: true,
+        markAllRead,
+        update,
+      }),
+    );
+    renderPage();
+
+    fireEvent.click(screen.getByRole("button", { name: "Mark all as read" }));
+    await waitFor(() => expect(markAllRead).toHaveBeenCalledWith(null));
+    expect(update).not.toHaveBeenCalled();
+    expect(proactiveInboxApi.listSuggestions).not.toHaveBeenCalled();
+    cleanup();
+
+    renderPage();
+    selectTab("Omni Advisor");
+    fireEvent.click(screen.getByRole("button", { name: "Mark all as read" }));
+    await waitFor(() => expect(markAllRead).toHaveBeenLastCalledWith("agent_advisor"));
+  });
+
+  it("reports a failed one-call mark in one toast", async () => {
+    const toasts: unknown[] = [];
+    const onToast = (e: Event) => toasts.push((e as CustomEvent).detail.content);
+    window.addEventListener("omnigent:toast", onToast);
+    onTestFinished(() => window.removeEventListener("omnigent:toast", onToast));
+    vi.mocked(proactiveInboxHook.useProactiveInbox).mockReturnValue(
+      proactiveInboxStub({
+        items: [suggestionItem({}), suggestionItem({ id: "sug_2" })],
+        unreadCount: 2,
+        canMarkAllRead: true,
+        markAllRead: vi.fn().mockResolvedValue(false),
+      }),
+    );
+    renderPage();
+
+    fireEvent.click(screen.getByRole("button", { name: "Mark all as read" }));
+
+    await waitFor(() =>
+      expect(toasts).toEqual(["Couldn’t mark your suggestions as read. Try again."]),
+    );
+  });
+
   it("is offered only while the tab lists something unread", async () => {
     renderPage();
     expect(screen.queryByRole("button", { name: "Mark all as read" })).toBeNull();

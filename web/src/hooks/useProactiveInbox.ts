@@ -13,8 +13,11 @@ import {
   applySuggestionUpdate,
   listSuggestions,
   locateSuggestion,
+  markAllSuggestionsRead,
+  reconcileMarkAllRead,
   reconcileSuggestion,
   updateSuggestion,
+  type MarkAllReadResult,
   type SuggestionPage,
   type SuggestionStatus,
   type SuggestionUpdate,
@@ -100,6 +103,26 @@ function dataVersions(queryClient: QueryClient, key: readonly unknown[]): Map<st
     versions.set(JSON.stringify(query.queryKey), query.state.dataUpdatedAt);
   }
   return versions;
+}
+
+/**
+ * After a reply rewrites cached lists, keep each other queued item's lists
+ * marked as predating its change: requests run one at a time, so the reply's
+ * total does not include changes still waiting behind it.
+ */
+function carryStartedVersions(
+  scope: ScopeState,
+  before: Map<string, number>,
+  after: Map<string, number>,
+  exceptId?: string,
+): void {
+  for (const [other, versions] of scope.started) {
+    if (other === exceptId) continue;
+    for (const [list, version] of versions) {
+      const rewritten = after.get(list);
+      if (version === before.get(list) && rewritten !== undefined) versions.set(list, rewritten);
+    }
+  }
 }
 
 /** The item's status in whichever cached list holds it, if any. */
@@ -216,18 +239,7 @@ export function useProactiveInbox(
               data ? { ...data, pages: reconcileSuggestion(data.pages, reply) } : data,
             );
             scope.confirmed.set(id, reply.item.status);
-            // The reply's total covers only this item, since PATCHes run one at a
-            // time; other queued items are still missing from the lists it rewrote.
-            const after = dataVersions(queryClient, key);
-            for (const [other, versions] of scope.started) {
-              if (other === id) continue;
-              for (const [list, version] of versions) {
-                const rewritten = after.get(list);
-                if (version === before.get(list) && rewritten !== undefined) {
-                  versions.set(list, rewritten);
-                }
-              }
-            }
+            carryStartedVersions(scope, before, dataVersions(queryClient, key), id);
           }
           return saved !== null;
         })
@@ -240,6 +252,47 @@ export function useProactiveInbox(
           }
           scope.inFlight -= 1;
           notify();
+          if (scope.inFlight === 0) void queryClient.invalidateQueries({ queryKey: key });
+        });
+      scope.chain = request;
+      return request;
+    },
+    [queryClient, scopeKeyText],
+  );
+
+  /**
+   * Mark all unread suggestions read in one call, or only *agentId*'s. It waits
+   * behind any update in flight, like they wait for each other. Resolves to
+   * whether the server accepted it; the caller reports a failure.
+   */
+  const markAllRead = useCallback(
+    (agentId: string | null): Promise<boolean> => {
+      const scope = scopeState(queryClient, scopeKeyText);
+      const key = JSON.parse(scopeKeyText) as unknown[];
+      scope.inFlight += 1;
+      void queryClient.cancelQueries({ queryKey: key });
+      const request: Promise<boolean> = scope.chain
+        .then(async () => {
+          let saved: MarkAllReadResult | null = null;
+          try {
+            saved = await markAllSuggestionsRead(agentId);
+          } catch {
+            // The caller reports the failure; the refetch below restores the list.
+          }
+          await queryClient.cancelQueries({ queryKey: key });
+          if (saved) {
+            const reply = saved;
+            const before = dataVersions(queryClient, key);
+            queryClient.setQueriesData<Pages>({ queryKey: key }, (data) =>
+              data ? { ...data, pages: reconcileMarkAllRead(data.pages, agentId, reply) } : data,
+            );
+            carryStartedVersions(scope, before, dataVersions(queryClient, key));
+          }
+          return saved !== null;
+        })
+        .finally(() => {
+          scope.inFlight -= 1;
+          scope.listeners.forEach((listener) => listener());
           if (scope.inFlight === 0) void queryClient.invalidateQueries({ queryKey: key });
         });
       scope.chain = request;
@@ -272,5 +325,8 @@ export function useProactiveInbox(
     fetchNextPage: query.fetchNextPage,
     refetch: query.refetch,
     update,
+    /** Whether {@link markAllRead} is available; older servers mark one item at a time. */
+    canMarkAllRead: enabled && info.inbox_mark_all_read === true,
+    markAllRead,
   };
 }

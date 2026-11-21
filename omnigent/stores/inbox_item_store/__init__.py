@@ -133,6 +133,18 @@ class InboxItemStore(ABC):
         """
 
     @abstractmethod
+    def mark_all_read(self, user_id: str, *, agent_id: str | None = None) -> int:
+        """Mark every one of the owner's unread items read.
+
+        Only unread items change, so a resolved item stays closed.
+
+        :param user_id: The owner.
+        :param agent_id: Hex UUID of the posting agent to limit it to, or
+            ``None`` for every agent.
+        :returns: How many items it marked read.
+        """
+
+    @abstractmethod
     def update(
         self,
         item_id: str,

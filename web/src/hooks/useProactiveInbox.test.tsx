@@ -8,6 +8,7 @@ import { showToast } from "@/components/ui/toast";
 import { setOmnigentHostConfig } from "@/lib/host";
 import {
   listSuggestions,
+  markAllSuggestionsRead,
   updateSuggestion,
   type Suggestion,
   type SuggestionPage,
@@ -20,6 +21,7 @@ import { useProactiveInbox } from "./useProactiveInbox";
 vi.mock("@/lib/proactiveInbox", async (importActual) => ({
   ...(await importActual<typeof ProactiveInboxModule>()),
   listSuggestions: vi.fn(),
+  markAllSuggestionsRead: vi.fn(),
   updateSuggestion: vi.fn(),
 }));
 vi.mock("./useViewerId", () => ({ useViewerId: () => "alice" }));
@@ -27,9 +29,16 @@ vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
 
 let client: QueryClient;
 let enabled = true;
+let markAllAvailable = false;
 const wrapper = ({ children }: { children: ReactNode }) => (
   <QueryClientProvider client={client}>
-    <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, inbox_items_available: enabled }}>
+    <CapabilitiesProvider
+      info={{
+        ...FALLBACK_SERVER_INFO,
+        inbox_items_available: enabled,
+        inbox_mark_all_read: markAllAvailable,
+      }}
+    >
       <RoutingProvider value={basenamedRouting("/")}>{children}</RoutingProvider>
     </CapabilitiesProvider>
   </QueryClientProvider>
@@ -72,11 +81,13 @@ function deferred<T>() {
 beforeEach(() => {
   client = new QueryClient({ defaultOptions: { queries: { gcTime: Infinity, retry: false } } });
   enabled = true;
+  markAllAvailable = false;
   setOmnigentHostConfig({ serverIdentity: "server-a" });
   vi.mocked(listSuggestions)
     .mockReset()
     .mockResolvedValue(page([item], 1));
   vi.mocked(updateSuggestion).mockReset();
+  vi.mocked(markAllSuggestionsRead).mockReset();
   vi.mocked(showToast).mockReset();
 });
 
@@ -215,6 +226,52 @@ it("hands a failed update to the caller's onError instead of the toast", async (
   await expect(accepted).resolves.toBe(false);
   expect(onError).toHaveBeenCalledOnce();
   expect(showToast).not.toHaveBeenCalled();
+});
+
+it("marks every unread suggestion read in one call when the server offers it", async () => {
+  markAllAvailable = true;
+  const { result } = renderHook(() => useProactiveInbox(true), { wrapper });
+  await waitFor(() => expect(result.current.unreadCount).toBe(1));
+  expect(result.current.canMarkAllRead).toBe(true);
+  vi.mocked(markAllSuggestionsRead).mockResolvedValueOnce({
+    marked: 1,
+    unreadCount: 0,
+    unreadCountCapped: false,
+  });
+  vi.mocked(listSuggestions).mockResolvedValue(page([{ ...item, status: "read" }], 0));
+
+  let accepted: Promise<boolean> = Promise.resolve(false);
+  act(() => {
+    accepted = result.current.markAllRead(null);
+  });
+
+  await expect(accepted).resolves.toBe(true);
+  expect(markAllSuggestionsRead).toHaveBeenCalledWith(null);
+  await waitFor(() => expect(result.current.unreadCount).toBe(0));
+  expect(result.current.items).toEqual([{ ...item, status: "read" }]);
+  expect(showToast).not.toHaveBeenCalled();
+});
+
+it("leaves a failed mark-all to the caller and reloads the list", async () => {
+  markAllAvailable = true;
+  const { result } = renderHook(() => useProactiveInbox(true), { wrapper });
+  await waitFor(() => expect(result.current.unreadCount).toBe(1));
+  vi.mocked(markAllSuggestionsRead).mockRejectedValueOnce(new Error("offline"));
+
+  let accepted: Promise<boolean> = Promise.resolve(true);
+  act(() => {
+    accepted = result.current.markAllRead("agent");
+  });
+
+  await expect(accepted).resolves.toBe(false);
+  expect(showToast).not.toHaveBeenCalled();
+  await waitFor(() => expect(listSuggestions).toHaveBeenCalledTimes(2));
+  expect(result.current.items).toEqual([item]);
+});
+
+it("offers mark-all only on servers that advertise it", () => {
+  const { result } = renderHook(() => useProactiveInbox(true), { wrapper });
+  expect(result.current.canMarkAllRead).toBe(false);
 });
 
 it("keeps the item when the update and the recovery fetch both fail", async () => {

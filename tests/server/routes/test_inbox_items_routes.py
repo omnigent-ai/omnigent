@@ -450,6 +450,34 @@ async def test_list_and_resolve(client: httpx.AsyncClient, stores: SimpleNamespa
     assert (late_read["status"], late_read["resolution"]) == ("dismissed", "not_now")
 
 
+async def test_mark_read_marks_every_unread_item_and_reports_the_total(
+    client: httpx.AsyncClient, stores: SimpleNamespace
+) -> None:
+    headers = _from(_session(stores))
+    ids = [
+        (await client.post("/v1/inbox/items", json=_body(topic=f"t{n}"), headers=headers)).json()[
+            "item"
+        ]["id"]
+        for n in range(3)
+    ]
+    await client.patch(f"/v1/inbox/items/{ids[0]}", json={"resolution": "not_now"})
+
+    other = await client.post("/v1/inbox/items/mark-read", json={"agent_id": _PLAIN_AGENT})
+    assert other.json() == {"marked": 0, "unread_count": 2, "unread_count_capped": False}
+    marked = await client.post("/v1/inbox/items/mark-read", json={"agent_id": _INBOX_AGENT})
+    assert marked.json() == {"marked": 2, "unread_count": 0, "unread_count_capped": False}
+    listed = (await client.get("/v1/inbox/items", params={"status": "read"})).json()
+    assert sorted(entry["id"] for entry in listed["data"]) == sorted(ids[1:])
+    # The dismissed item stays dismissed.
+    dismissed = (await client.get("/v1/inbox/items", params={"status": "dismissed"})).json()
+    assert [entry["id"] for entry in dismissed["data"]] == [ids[0]]
+    assert (await client.post("/v1/inbox/items/mark-read", json={})).json()["marked"] == 0
+    assert (
+        await client.post("/v1/inbox/items/mark-read", json={"agent_id": "not-an-id"})
+    ).status_code == 422
+    assert (await client.get("/v1/info")).json()["inbox_mark_all_read"] is True
+
+
 async def test_authenticated_owners_see_only_their_items(
     stores: SimpleNamespace, tmp_path: Path
 ) -> None:
@@ -473,7 +501,11 @@ async def test_authenticated_owners_see_only_their_items(
         assert (
             await c.patch(f"/v1/inbox/items/{item_id}", json={"status": "read"}, headers=bob)
         ).status_code == 404
+        assert (await c.post("/v1/inbox/items/mark-read", json={}, headers=bob)).json()[
+            "marked"
+        ] == 0
         assert len((await c.get("/v1/inbox/items", headers=alice)).json()["data"]) == 1
+        assert (await c.get("/v1/inbox/items", headers=alice)).json()["unread_count"] == 1
 
 
 async def test_routes_serve_every_agent_while_the_proactive_agent_is_off(
@@ -490,8 +522,10 @@ async def test_routes_are_off_without_the_feature(stores: SimpleNamespace, tmp_p
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
         assert (await c.get("/v1/inbox/items")).status_code == 404
+        assert (await c.post("/v1/inbox/items/mark-read", json={})).status_code == 404
         info = (await c.get("/v1/info")).json()
         assert info["inbox_items_available"] is False
+        assert info["inbox_mark_all_read"] is False
         # The proactive agent posts to the Inbox, so it is off with it.
         assert info["proactive_agent_available"] is False
 
