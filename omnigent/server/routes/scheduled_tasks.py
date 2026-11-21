@@ -84,7 +84,7 @@ from omnigent.server.scheduled.rrule import (
 )
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.server.scheduled.run_sharing import delete_task_grants
-from omnigent.server.scheduled.schedule import continued_sandbox_host_id
+from omnigent.server.scheduled.schedule import continued_sandbox_host_id, is_trigger_automation
 from omnigent.server.scheduled.telemetry import log_task_created
 from omnigent.server.scheduled.workflow_automations import workflow_session_reuse_error
 from omnigent.server.session_mcp_selection import (
@@ -110,6 +110,7 @@ from omnigent.tools.browser_agent_tools import (
     BROWSER_AGENT_TOOLS_CREATION_LABEL_KEYS,
     browser_agent_tools_creation_labels,
 )
+from omnigent.tools.builtins.scheduled_tasks import TRIGGER_RRULE_HEADER, TRIGGER_RRULE_OMIT
 from omnigent.util.uuid import normalize_uuid
 
 _logger = logging.getLogger(__name__)
@@ -283,10 +284,16 @@ def _next_run_at(task: ScheduledTask, request: Request) -> str | None:
     return scheduler.next_run_at(task.id) if scheduler is not None else None
 
 
+def _omits_trigger_rrule(request: Request) -> bool:
+    """Whether the caller reads a trigger automation's ``rrule`` as null."""
+    return request.headers.get(TRIGGER_RRULE_HEADER) == TRIGGER_RRULE_OMIT
+
+
 def _to_response(
     task: ScheduledTask,
     *,
     shareable: bool,
+    omit_trigger_rrule: bool,
     last_run_status: str | None = None,
     next_run_at: str | None = None,
     viewer_role: ScheduledTaskViewerRole = "owner",
@@ -296,6 +303,9 @@ def _to_response(
 
     :param shareable: Whether the automation itself can be shared, from
         :func:`scheduled_task_shareable`.
+    :param omit_trigger_rrule: Send a trigger automation's ``rrule`` as ``None``, from
+        :func:`_omits_trigger_rrule`. The server picks when a trigger polls, so its
+        saved rule isn't its schedule.
     :param last_run_status: The status of the task's most recent run
         (``succeeded`` / ``failed`` / ``skipped`` / ``running`` / ``scheduled``),
         or ``None`` when the task has never run. Surfaced so the Tasks list can
@@ -313,7 +323,7 @@ def _to_response(
         "id": task.id,
         "name": task.name,
         "prompt": task.prompt,
-        "rrule": task.rrule,
+        "rrule": None if omit_trigger_rrule and is_trigger_automation(task) else task.rrule,
         # JSON key preserved for API/UI stability; the DB column + entity
         # attribute are now ``user_id``.
         "owner_user_id": task.user_id,
@@ -1371,6 +1381,7 @@ def create_scheduled_tasks_router(
         return _to_response(
             task,
             shareable=scheduled_task_shareable(permission_store, task.id),
+            omit_trigger_rrule=_omits_trigger_rrule(request),
             next_run_at=_next_run_at(task, request),
         )
 
@@ -1428,11 +1439,13 @@ def create_scheduled_tasks_router(
         # dead run as ``failed`` rather than a stuck ``running``.
         force_fail_stale_runs(store, running)
         latest_status = store.list_latest_run_status_for_tasks(task_ids)
+        omit_trigger_rrule = _omits_trigger_rrule(request)
         return {
             "scheduled_tasks": [
                 _to_response(
                     t,
                     shareable=scheduled_task_shareable(permission_store, t.id),
+                    omit_trigger_rrule=omit_trigger_rrule,
                     last_run_status=latest_status.get(t.id),
                     next_run_at=_next_run_at(t, request),
                 )
@@ -1535,11 +1548,13 @@ def create_scheduled_tasks_router(
         # Reads one run per automation; a stale running run fails when its history is read.
         latest_status = await asyncio.to_thread(store.list_latest_run_status_for_tasks, ids)
         names = await _owner_display_names(tasks)
+        omit_trigger_rrule = _omits_trigger_rrule(request)
         return {
             "scheduled_tasks": [
                 _to_response(
                     task,
                     shareable=scheduled_task_shareable(permission_store, task.id),
+                    omit_trigger_rrule=omit_trigger_rrule,
                     last_run_status=latest_status.get(task.id),
                     next_run_at=_next_run_at(task, request),
                     viewer_role="viewer",
@@ -1570,6 +1585,7 @@ def create_scheduled_tasks_router(
         return _to_response(
             task,
             shareable=scheduled_task_shareable(permission_store, task.id),
+            omit_trigger_rrule=_omits_trigger_rrule(request),
             last_run_status=latest_status.get(task.id),
             next_run_at=_next_run_at(task, request),
             viewer_role=role,
@@ -2142,6 +2158,7 @@ def create_scheduled_tasks_router(
         return _to_response(
             updated,
             shareable=scheduled_task_shareable(permission_store, updated.id),
+            omit_trigger_rrule=_omits_trigger_rrule(request),
             last_run_status=latest_status.get(updated.id),
             next_run_at=_next_run_at(updated, request),
         )

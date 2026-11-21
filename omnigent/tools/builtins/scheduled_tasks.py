@@ -35,6 +35,10 @@ REMINDER_NAME_CHARS = 60
 _TOO_SOON = (
     f"A reminder must be at least {MIN_REMINDER_DELAY.seconds // 60} minutes in the future."
 )
+# Sent with TRIGGER_RRULE_OMIT to read a trigger automation's rrule as null, since the
+# server picks when a trigger polls. Older clients expect every task to have a rule.
+TRIGGER_RRULE_HEADER = "X-Omnigent-Trigger-Rrule"
+TRIGGER_RRULE_OMIT = "omit"
 
 _RRULE_DESC = (
     "RFC 5545 recurrence rule, e.g. 'FREQ=DAILY;BYHOUR=9;BYMINUTE=0' (daily at "
@@ -248,7 +252,11 @@ class SysScheduledTaskListTool(Tool):
     @classmethod
     def description(cls) -> str:
         """:returns: Human-readable description of the tool."""
-        return "List your scheduled tasks (recurring agent runs) with their schedules and state."
+        return (
+            "List your scheduled tasks (recurring agent runs) with their schedules and state. "
+            "A trigger automation, which watches a service such as Jira or Slack for new "
+            "items, has no schedule: the server decides when it polls, so its rrule is null."
+        )
 
     def get_schema(self) -> dict[str, Any]:
         """:returns: The OpenAI-format tool schema."""

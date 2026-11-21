@@ -101,6 +101,8 @@ from omnigent.tools.builtins.os_env import (
     SysOsWriteTool,
 )
 from omnigent.tools.builtins.scheduled_tasks import (
+    TRIGGER_RRULE_HEADER,
+    TRIGGER_RRULE_OMIT,
     reminder_name,
     reminder_prompt,
     reminder_rrule,
@@ -5632,8 +5634,12 @@ async def _execute_scheduled_task_tool(
     wants_project = tool_name in ("sys_scheduled_task_create", "sys_scheduled_task_update") and (
         "project_name" in args or "project_id" in args
     )
+    # A trigger automation's saved rule isn't when it polls, so agents read its rrule as null.
+    trigger_rrule_headers = {TRIGGER_RRULE_HEADER: TRIGGER_RRULE_OMIT}
     mutation_headers = (
-        {ORCHESTRATION_SOURCE_HEADER: conversation_id} if conversation_id is not None else None
+        {**trigger_rrule_headers, ORCHESTRATION_SOURCE_HEADER: conversation_id}
+        if conversation_id is not None
+        else trigger_rrule_headers
     )
 
     info: httpx.Response | None = None
@@ -5662,7 +5668,10 @@ async def _execute_scheduled_task_tool(
             # Includes reminders, which the list leaves out by default, so an agent
             # can find one to cancel.
             resp = await server_client.get(
-                "/v1/scheduled-tasks", params={"kind": "all"}, timeout=30.0
+                "/v1/scheduled-tasks",
+                params={"kind": "all"},
+                headers=trigger_rrule_headers,
+                timeout=30.0,
             )
         elif tool_name == "sys_scheduled_task_create":
             payload = {k: args[k] for k in _SCHEDULED_TASK_CREATE_FIELDS if k in args}
@@ -5691,7 +5700,7 @@ async def _execute_scheduled_task_tool(
                 "/v1/scheduled-tasks",
                 json=payload,
                 timeout=30.0,
-                headers={**(mutation_headers or {}), "x-omnigent-automation-source": "agent"},
+                headers={**mutation_headers, "x-omnigent-automation-source": "agent"},
             )
         elif tool_name in ("sys_scheduled_task_update", "sys_scheduled_task_delete"):
             task_id = args.get("scheduled_task_id")
