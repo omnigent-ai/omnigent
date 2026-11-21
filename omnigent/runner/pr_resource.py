@@ -17,7 +17,7 @@ import re
 import subprocess
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 from contextlib import contextmanager, suppress
@@ -46,6 +46,7 @@ from omnigent.runner.git_providers import (
     PinnedRevisionFacet,
     ProviderCapabilities,
     PullRequestFacet,
+    PullRequestHeadFacet,
     PullRequestStatus,
     PullRequestStatusFacet,
     ReviewerRef,
@@ -567,6 +568,53 @@ def infer_checkout_pr(session_id: str, checkout: str) -> None:
             _associate_discovered_pr(checkout, registry, candidate, time.time())
     except Exception:  # optional inference must never affect the tool call
         _logger.warning("Could not infer the PR of %s", checkout, exc_info=True)
+
+
+# One command's printed PRs share the time budget a push's PR lookup gets.
+_PRINTED_PR_LOOKUP_SECONDS = 5.0
+# (session, checkout, HEAD, PR URL) already checked, so repeated output isn't asked again.
+_CHECKED_PRINTED_PRS: OrderedDict[tuple[str, str, str, str], None] = OrderedDict()
+
+
+def infer_printed_pr(session_id: str, checkout: str, printed: Sequence[PullRequestRef]) -> None:
+    """Associate a PR a command printed when its head is *checkout*'s ``HEAD``.
+
+    Branch inference asks the host a remote names, so a branch pushed through a git
+    remote helper, whose URL names none, has no PR to find. The PR its publishing
+    command printed is the branch's when that PR is open at the same commit.
+    """
+    try:
+        code, out = _git_output(["rev-parse", "--verify", "HEAD"], cwd=checkout)
+        head = out.strip()
+        if code != 0 or not _COMMIT_SHA.fullmatch(head):
+            return
+        registry = SessionPrRegistry(session_id)
+        tracked = {entry.url for entry in registry.list()}
+        deadline = time.monotonic() + _PRINTED_PR_LOOKUP_SECONDS
+        for reference in printed:
+            key = (session_id, checkout, head, reference.url)
+            with _CHECKED_CHECKOUTS_LOCK:
+                if reference.url in tracked or key in _CHECKED_PRINTED_PRS:
+                    continue
+                _CHECKED_PRINTED_PRS[key] = None
+                while len(_CHECKED_PRINTED_PRS) > 1024:
+                    _CHECKED_PRINTED_PRS.popitem(last=False)
+            try:
+                facet = _facet(reference.provider)
+                if not isinstance(facet, PullRequestHeadFacet):
+                    continue
+                if facet.open_pr_head(checkout, reference, deadline) != head:
+                    continue
+            except Exception:  # one unreadable PR must not hide another printed one
+                _logger.warning("Could not read printed PR %s", reference.url, exc_info=True)
+                continue
+            registry.record([reference], relationship="inferred", source="branch")
+            pr_reports.notify(session_id)
+            if any(entry.url == reference.url for entry in registry.list()):
+                facet.on_inferred_pr(checkout, reference)
+            return
+    except Exception:  # optional inference must never affect the tool call
+        _logger.warning("Could not infer the printed PR of %s", checkout, exc_info=True)
 
 
 def _background_discovery(

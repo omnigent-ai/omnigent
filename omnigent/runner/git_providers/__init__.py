@@ -326,6 +326,26 @@ class PullRequestStatusFacet(Protocol):
 
 
 @runtime_checkable
+class PullRequestHeadFacet(Protocol):
+    """Optional lookup of an open PR's head commit.
+
+    A command can print the PR it opened on a host that none of the checkout's
+    remotes name, such as one pushed through a git remote helper. The orchestrator
+    treats that PR as the branch's when its head is the checkout's ``HEAD``.
+    """
+
+    def open_pr_head(self, root: str, reference: PullRequestRef, deadline: float) -> str | None:
+        """Return the PR's head commit SHA while it is open, giving up at ``deadline``.
+
+        Ask only a host the provider's credentials are signed in to, so a printed URL
+        can't send a request or token elsewhere. Never raises.
+
+        :returns: The SHA, or ``None`` when the PR is not open or cannot be read.
+        """
+        ...
+
+
+@runtime_checkable
 class CommitCompareFacet(Protocol):
     """Optional changes after one PR commit, up to the head, beside :class:`CommitsFacet`.
 

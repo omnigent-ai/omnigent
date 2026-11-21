@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import subprocess
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
 from types import SimpleNamespace
@@ -16,7 +18,7 @@ import pytest
 from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 
-from omnigent.runner import create_runner_app, pr_resource
+from omnigent.runner import create_runner_app, pr_observer, pr_resource
 from omnigent.runner import github_resource as github
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
 from omnigent.runner.slow_io import run_slow_io
@@ -1081,3 +1083,85 @@ def test_enterprise_host_signed_in_only_when_named_can_attach_and_read(
     assert info["pr"]["title"] == "Enterprise PR"
     files = github.github_changed_files(str(tmp_path), session_id="session", pr_url=url)
     assert [entry["path"] for entry in files["data"]] == ["enterprise.py"]
+
+
+PRINTED = "https://ghe.example.com/acme/widgets/pull/7"
+
+
+@pytest.mark.parametrize(
+    "command", ["git publish", "forge-pr create --head topic"], ids=["git-subcommand", "pr-cli"]
+)
+@pytest.mark.parametrize(
+    ("state", "at_head", "signed_in", "exit_code", "expected"),
+    [
+        pytest.param("OPEN", True, True, 0, [PRINTED], id="open-at-head"),
+        pytest.param("OPEN", False, True, 0, [], id="head-elsewhere"),
+        pytest.param("MERGED", True, True, 0, [], id="not-open"),
+        pytest.param("OPEN", True, False, 0, [], id="host-signed-out"),
+        pytest.param("OPEN", True, True, 1, [], id="command-failed"),
+    ],
+)
+def test_a_printed_pr_on_a_host_no_remote_names_is_the_checkouts_when_its_head_is_head(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    state: str,
+    at_head: bool,
+    signed_in: bool,
+    exit_code: int,
+    expected: list[str],
+) -> None:
+    """A publishing command's printed PR stands in for branch lookups no remote can serve."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setattr(github.shutil, "which", lambda _: "/bin/gh")
+    monkeypatch.setattr(github._config, "github_account_preference", lambda _: None)
+    checkout = tmp_path / "checkout"
+    for argv in (
+        ["init", "-q", "-b", "topic", str(checkout)],
+        ["-C", str(checkout), "commit", "-q", "--allow-empty", "-m", "change"],
+        # A push through a remote helper leaves only a tracking ref; its URL names no host.
+        ["-C", str(checkout), "remote", "add", "forge", "ext::git %s /forge.git"],
+        ["-C", str(checkout), "update-ref", "refs/remotes/forge/topic", "HEAD"],
+    ):
+        subprocess.run(
+            ["git", "-c", "user.name=T", "-c", "user.email=t@example.com", *argv], check=True
+        )
+    head = subprocess.run(
+        ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    listed = {"hosts": {"github.com": [{"login": "octocat", "active": True, "state": "success"}]}}
+    calls: list[list[str]] = []
+
+    def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        calls.append(args)
+        if args[:4] == ["auth", "status", "--json", "hosts"]:
+            return 0, json.dumps(listed), ""
+        if args == ["auth", "status", "-h", "ghe.example.com"]:
+            return (0, "Logged in", "") if signed_in else (1, "", "not logged in")
+        if args[:3] == ["pr", "view", "7"]:
+            assert args[args.index("-R") + 1] == "ghe.example.com/acme/widgets"
+            pr_head = head if at_head else "f" * 40
+            return 0, json.dumps({"state": state, "headRefOid": pr_head}), ""
+        # Lookups by branch or commit run against github.com and find nothing.
+        return 1, "", "no pull requests found"
+
+    monkeypatch.setattr(github, "_gh", gh)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        monkeypatch.setattr(pr_observer, "_lookup_pool", pool)
+        pr_observer.observe_tool_completion(
+            "session",
+            tool_name="Bash",
+            arguments={"command": command},
+            result={"stdout": f"\nDraft PR created: {PRINTED}\n", "exit_code": exit_code},
+            cwd=str(checkout),
+        )
+    assert [entry.url for entry in SessionPrRegistry("session").list()] == expected
+    if expected:
+        [entry] = SessionPrRegistry("session").list()
+        assert entry.relationship == "inferred"
+    if not signed_in or exit_code:
+        # A host gh is signed out of, or a failed command's output, is never queried.
+        assert not [call for call in calls if call[:3] == ["pr", "view", "7"]]
