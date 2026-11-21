@@ -76,6 +76,11 @@ class ElicitationTurnState:
 
     pending: dict[str, PendingElicitation] = field(default_factory=dict)
 
+    @property
+    def has_open_card(self) -> bool:
+        """Whether a card posted this turn still waits for its answer."""
+        return any(not pending.finalized for pending in self.pending.values())
+
 
 class ElicitationController:
     """Orchestrates elicitation cards for a turn, pure-push style.
