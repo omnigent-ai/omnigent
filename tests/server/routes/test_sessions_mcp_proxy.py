@@ -79,3 +79,61 @@ async def test_mcp_tools_list_runner_failure_is_genericized(
     # ...but IS logged server-side for operators (the other half of the
     # contract — if missing, the failure has no diagnostic record).
     assert _RaisingRunnerClient.raw_error in caplog.text
+
+
+class _OkRunnerClient:
+    """Runner HTTP client stub that returns a tools/list payload with instructions."""
+
+    async def post(self, *_args: object, **_kwargs: object) -> httpx.Response:
+        """Return a 200 JSON body using the runner's snake_case extension keys."""
+        return httpx.Response(
+            200,
+            json={
+                "result": {
+                    "schemas": [
+                        {
+                            "type": "function",
+                            "name": "pipeshub__chat",
+                            "description": "Chat",
+                            "parameters": {"type": "object", "properties": {}},
+                        }
+                    ],
+                    "failures": {},
+                    "server_instructions": {"pipeshub": "Prefer pipeshub_chat."},
+                    "server_labels": {"pipeshub": "PipesHub MCP"},
+                }
+            },
+            request=httpx.Request("POST", "http://runner.test/mcp/execute"),
+        )
+
+
+class _OkRunnerRouter:
+    """RunnerRouter stub that hands back a successful tools/list client."""
+
+    def client_for_session_resources(self, conversation_id: str) -> RoutedRunner:
+        """Return a routed runner whose client succeeds.
+
+        :param conversation_id: Ignored session id.
+        :returns: A :class:`RoutedRunner` wrapping the ok client.
+        """
+        del conversation_id
+        return RoutedRunner(
+            runner_id="runner_test",
+            client=_OkRunnerClient(),  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.asyncio
+async def test_mcp_tools_list_forwards_server_instructions() -> None:
+    """Runner snake_case instructions must survive as camelCase on the proxy hop."""
+    response = await _handle_mcp_tools_list(
+        rpc_id=3,
+        session_id="conv_test",
+        runner_router=_OkRunnerRouter(),  # type: ignore[arg-type]
+    )
+
+    payload = json.loads(bytes(response.body))
+    assert payload["id"] == 3
+    assert payload["result"]["serverInstructions"] == {"pipeshub": "Prefer pipeshub_chat."}
+    assert payload["result"]["serverLabels"] == {"pipeshub": "PipesHub MCP"}
+    assert payload["result"]["tools"][0]["name"] == "pipeshub__chat"
