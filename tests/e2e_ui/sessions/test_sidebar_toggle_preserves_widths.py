@@ -28,13 +28,10 @@ def _rail_width(page: Page) -> float:
 
 
 def _chat_width(page: Page) -> float:
-    """Horizontal space left for the chat: from the sidebar's right edge to the
-    rail's left edge."""
-    conversations = page.locator(_CONVERSATIONS).bounding_box()
-    rail = page.get_by_role("complementary", name="Workspace").bounding_box()
-    assert conversations is not None and rail is not None
-    sidebar_right = conversations["x"] + conversations["width"]
-    return rail["x"] - sidebar_right
+    """Width of the center chat surface, excluding the resize gutter."""
+    chat = page.locator("main").bounding_box()
+    assert chat is not None
+    return chat["width"]
 
 
 def test_sidebar_toggle_preserves_widths(
@@ -93,7 +90,8 @@ def test_shrinking_viewport_keeps_chat_minimum_with_sidebar_open(
     left sidebar and then dragging the window smaller let the chat fall under
     480px, because the rail's width didn't recompute against the smaller
     viewport (a resize that didn't move the stored width never re-rendered) and
-    the rail's own comfort minimum overrode the chat-preserving ceiling.
+    the rail's own comfort minimum overrode the chat-preserving ceiling. 1181px
+    is the narrowest desktop layout; below it the rail is a drawer.
     """
     base_url, session_id = seeded_session
     # Start wide so the rail's default is well above the shrunk ceiling.

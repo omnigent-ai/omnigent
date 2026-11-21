@@ -1010,6 +1010,11 @@ function WorkspaceTabsPanelImpl({
     ? {
         ...handleProps,
         onMouseDown: undefined,
+        onPointerDown: undefined,
+        onPointerMove: undefined,
+        onPointerUp: undefined,
+        onPointerCancel: undefined,
+        onLostPointerCapture: undefined,
         onKeyDown: undefined,
         "aria-disabled": true,
         tabIndex: -1,
@@ -1017,243 +1022,248 @@ function WorkspaceTabsPanelImpl({
     : handleProps;
 
   return (
-    <aside
-      aria-label="Workspace"
-      {...commandRegionProps("workspace")}
-      ref={railInertRef}
-      aria-hidden={!open}
-      data-workspace-design="tabs"
-      data-collapsed={width === 0 || undefined}
-      data-maximized={maximized || undefined}
-      // Its own name, not data-state: a data-state change restyles everything inside the rail.
-      data-rail-state={open ? "open" : "closed"}
-      data-animate-visibility={animateVisibility || undefined}
-      data-resizing={resizing || undefined}
-      className={
-        inDrawer
-          ? "workspace-panel-motion @container/rail relative flex h-full min-h-0 flex-col overflow-hidden bg-card"
-          : cn(
-              "workspace-panel-motion @container/rail relative z-40 hidden md:flex md:min-h-0 md:flex-col md:overflow-hidden md:border-l md:border-border md:bg-card",
-              maximized ? "md:absolute md:inset-0" : "md:shrink-0",
-              contained &&
-                "flex min-h-0 flex-col overflow-hidden border-l border-border bg-card shrink-0",
-              contained && maximized && "absolute inset-0",
-            )
-      }
-      style={
-        maximized || inDrawer
-          ? undefined
-          : ({
-              width: open ? width : 0,
-              "--omnigent-reserved-width": `${width}px`,
-            } as CSSProperties)
-      }
-    >
-      <div
-        data-workspace-panel-inner
-        className="relative flex h-full min-h-0 shrink-0 flex-col"
-        style={{ width: maximized || inDrawer ? "100%" : `calc(${width}px - 1px)` }}
+    <>
+      {/* The resize target is a real flex gutter beside the rail, as in WorkspacePanel: its
+          bounded slivers stay outside both scroll containers. */}
+      {!maximized && !inDrawer && handleProps.hidden !== true && (
+        <div
+          {...effectiveHandleProps}
+          data-workspace-panel-resize-gutter
+          className={cn(
+            "relative z-50 hidden w-1 shrink-0 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 data-dragging:bg-primary/50 md:block",
+            pending && "cursor-default hover:bg-transparent active:bg-transparent",
+          )}
+        />
+      )}
+      <aside
+        aria-label="Workspace"
+        {...commandRegionProps("workspace")}
+        ref={railInertRef}
+        aria-hidden={!open}
+        data-workspace-design="tabs"
+        data-collapsed={width === 0 || undefined}
+        data-maximized={maximized || undefined}
+        // Its own name, not data-state: a data-state change restyles everything inside the rail.
+        data-rail-state={open ? "open" : "closed"}
+        data-animate-visibility={animateVisibility || undefined}
+        data-resizing={resizing || undefined}
+        className={
+          inDrawer
+            ? "workspace-panel-motion @container/rail relative flex h-full min-h-0 flex-col overflow-hidden bg-card"
+            : cn(
+                "workspace-panel-motion @container/rail relative z-40 hidden md:flex md:min-h-0 md:flex-col md:overflow-hidden md:border-l md:border-border md:bg-card",
+                maximized ? "md:absolute md:inset-0" : "md:shrink-0",
+                contained &&
+                  "flex min-h-0 flex-col overflow-hidden border-l border-border bg-card shrink-0",
+                contained && maximized && "absolute inset-0",
+              )
+        }
+        style={
+          maximized || inDrawer
+            ? undefined
+            : ({
+                width: open ? width : 0,
+                "--omnigent-reserved-width": `${width}px`,
+              } as CSSProperties)
+        }
       >
-        {!maximized && !inDrawer && (
-          <div
-            {...effectiveHandleProps}
-            className={cn(
-              "absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors",
-              pending && "cursor-default hover:bg-transparent active:bg-transparent",
-            )}
-          />
-        )}
-        <WorkspaceSidebarFrame
-          stripWidth={stripWidth}
-          tabListRef={tabListRef}
-          leading={
-            // ‹ › and the tab list sit together, without the strip's gap.
-            <div className="flex shrink-0 items-center">
-              {!pending && onHistoryGo && (
-                <WorkspaceHistoryChevrons commands={historyCommands} onGo={onHistoryGo} />
-              )}
-              {!pending && tabs.length > 0 && (
-                <WorkspaceTabSearch
-                  open={tabSearchOpen}
-                  onOpenChange={setTabSearchOpen}
-                  entries={tabSearchEntries}
-                  reopen={
-                    reopenCommand.availability.available
-                      ? {
-                          label: reopenCommand.menuLabel,
-                          ...(reopenCommand.shortcut
-                            ? { shortcut: shortcutKeys(reopenCommand.shortcut) }
-                            : {}),
+        <div
+          data-workspace-panel-inner
+          className="relative flex h-full min-h-0 shrink-0 flex-col"
+          style={{ width: maximized || inDrawer ? "100%" : `calc(${width}px - 1px)` }}
+        >
+          <WorkspaceSidebarFrame
+            stripWidth={stripWidth}
+            tabListRef={tabListRef}
+            leading={
+              // ‹ › and the tab list sit together, without the strip's gap.
+              <div className="flex shrink-0 items-center">
+                {!pending && onHistoryGo && (
+                  <WorkspaceHistoryChevrons commands={historyCommands} onGo={onHistoryGo} />
+                )}
+                {!pending && tabs.length > 0 && (
+                  <WorkspaceTabSearch
+                    open={tabSearchOpen}
+                    onOpenChange={setTabSearchOpen}
+                    entries={tabSearchEntries}
+                    reopen={
+                      reopenCommand.availability.available
+                        ? {
+                            label: reopenCommand.menuLabel,
+                            ...(reopenCommand.shortcut
+                              ? { shortcut: shortcutKeys(reopenCommand.shortcut) }
+                              : {}),
+                          }
+                        : null
+                    }
+                    onChoose={(choice) => {
+                      const command =
+                        choice.kind === "reopen"
+                          ? reopenCommand
+                          : showCommands.find((candidate) => candidate.panelKey === choice.tabId);
+                      if (command) runCommand(command);
+                    }}
+                  />
+                )}
+              </div>
+            }
+            tabs={
+              pending
+                ? null
+                : {
+                    value: stripValue,
+                    onValueChange: (tabId) => {
+                      store.select(tabId);
+                    },
+                    componentId: "chat.right_rail.workspace_tabs",
+                    scope: conversationId,
+                    onReorder: (activeKey, overKey) => {
+                      const order = reorderStripEntries(reorderEntries, activeKey, overKey);
+                      if (order) store.reorder(order);
+                    },
+                    pinsStayPut: pinsStayPutIn(stripWidth.areaWidth),
+                    entries: tabs
+                      .map((tab, index): WorkspaceSidebarStripEntry | null => {
+                        const selected = tab.id === selectedTabId;
+                        if (isUnknownTab(tab)) {
+                          return {
+                            key: tab.id,
+                            tab: (
+                              <StripTab
+                                tabId={tab.id}
+                                index={index}
+                                title={UNSUPPORTED_TAB_TITLE}
+                                selected={selected}
+                                closable
+                                onClose={(source) => closeTab(tab.id, source)}
+                                width={stripWidth.width}
+                                onKeyDown={(event) => actions.handleTabKeyDown(event, tab.id)}
+                                menu={null}
+                              />
+                            ),
+                          };
                         }
-                      : null
-                  }
-                  onChoose={(choice) => {
-                    const command =
-                      choice.kind === "reopen"
-                        ? reopenCommand
-                        : showCommands.find((candidate) => candidate.panelKey === choice.tabId);
-                    if (command) runCommand(command);
-                  }}
-                />
-              )}
-            </div>
-          }
-          tabs={
-            pending
-              ? null
-              : {
-                  value: stripValue,
-                  onValueChange: (tabId) => {
-                    store.select(tabId);
-                  },
-                  componentId: "chat.right_rail.workspace_tabs",
-                  scope: conversationId,
-                  onReorder: (activeKey, overKey) => {
-                    const order = reorderStripEntries(reorderEntries, activeKey, overKey);
-                    if (order) store.reorder(order);
-                  },
-                  pinsStayPut: pinsStayPutIn(stripWidth.areaWidth),
-                  entries: tabs
-                    .map((tab, index): WorkspaceSidebarStripEntry | null => {
-                      const selected = tab.id === selectedTabId;
-                      if (isUnknownTab(tab)) {
+                        const title = titleOf(tab);
+                        // The × is hidden where the tab can't close, not left as a dead control.
+                        const closable = closeRefusalFor(tab) === undefined;
+                        const pinned = isPinnedTab(tab);
                         return {
                           key: tab.id,
+                          pinned,
                           tab: (
                             <StripTab
                               tabId={tab.id}
                               index={index}
-                              title={UNSUPPORTED_TAB_TITLE}
+                              title={title}
+                              pinned={pinned}
+                              unseen={tab.unseen === true || tab.attention !== undefined}
                               selected={selected}
-                              closable
+                              closable={closable}
                               onClose={(source) => closeTab(tab.id, source)}
                               width={stripWidth.width}
                               onKeyDown={(event) => actions.handleTabKeyDown(event, tab.id)}
-                              menu={null}
+                              menu={
+                                <StripTabMenu
+                                  items={actions.menuItemsFor(tab.id, index, title.label, closable)}
+                                />
+                              }
                             />
                           ),
                         };
-                      }
-                      const title = titleOf(tab);
-                      // The × is hidden where the tab can't close, not left as a dead control.
-                      const closable = closeRefusalFor(tab) === undefined;
-                      const pinned = isPinnedTab(tab);
-                      return {
-                        key: tab.id,
-                        pinned,
-                        tab: (
-                          <StripTab
-                            tabId={tab.id}
-                            index={index}
-                            title={title}
-                            pinned={pinned}
-                            unseen={tab.unseen === true || tab.attention !== undefined}
-                            selected={selected}
-                            closable={closable}
-                            onClose={(source) => closeTab(tab.id, source)}
-                            width={stripWidth.width}
-                            onKeyDown={(event) => actions.handleTabKeyDown(event, tab.id)}
-                            menu={
-                              <StripTabMenu
-                                items={actions.menuItemsFor(tab.id, index, title.label, closable)}
-                              />
-                            }
-                          />
-                        ),
-                      };
-                    })
-                    .filter((entry) => entry !== null),
-                }
-          }
-          placeholder={<span className="px-1 text-ui text-muted-foreground">Workspace</span>}
-          afterTabs={
-            // Below 160px "+" would run under Full screen, so it gives way; ⌘K and its chord still open a tab.
-            !pending && (
-              <div className="contents @max-[160px]/rail:hidden">
-                <NewTabButton onClick={newTab} />
+                      })
+                      .filter((entry) => entry !== null),
+                  }
+            }
+            placeholder={<span className="px-1 text-ui text-muted-foreground">Workspace</span>}
+            afterTabs={
+              // Below 160px "+" would run under Full screen, so it gives way; ⌘K and its chord still open a tab.
+              !pending && (
+                <div className="contents @max-[160px]/rail:hidden">
+                  <NewTabButton onClick={newTab} />
+                </div>
+              )
+            }
+            trailing={
+              <>
+                {!inDrawer && (
+                  <WorkspaceTabTooltip
+                    label={fullScreenCommand?.menuLabel ?? "Full screen"}
+                    shortcut={shortcutKeys("workspace.toggleFullScreen")}
+                  >
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      aria-label={fullScreenCommand?.menuLabel ?? "Full screen"}
+                      aria-pressed={maximized}
+                      onClick={onToggleMaximized}
+                      disabled={pending}
+                      size="icon-xs"
+                      className="flex size-6 text-muted-foreground hover:text-foreground"
+                    >
+                      {maximized ? (
+                        <MinimizeIcon className="size-4" />
+                      ) : (
+                        <MaximizeIcon className="size-4" />
+                      )}
+                    </Button>
+                  </WorkspaceTabTooltip>
+                )}
+                {onHide && (
+                  <WorkspaceTabTooltip
+                    label="Collapse right panel"
+                    shortcut={shortcutKeys("sidebar.right")}
+                  >
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      aria-label="Collapse right panel"
+                      aria-keyshortcuts={shortcutAriaKeys("sidebar.right")}
+                      onClick={onHide}
+                      size="icon-xs"
+                      // A narrow strip leaves room to "+", as the header's toggle beside it does the same.
+                      className="flex size-6 text-muted-foreground hover:text-foreground @max-[240px]/rail:hidden"
+                    >
+                      <XIcon className="size-4" />
+                    </Button>
+                  </WorkspaceTabTooltip>
+                )}
+              </>
+            }
+            banner={
+              selectedTab?.attention && (
+                <AttentionBar
+                  label={titleOf({ ...selectedTab, place: selectedTab.attention.place }).label}
+                  onShow={() => void store.showAttention(selectedTab.id)}
+                  onDismiss={() => store.dismissAttention(selectedTab.id)}
+                />
+              )
+            }
+            contentRef={contentRef}
+          >
+            {pending ? (
+              <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 text-muted-foreground">
+                <Spinner />
+                <span className="text-ui">Starting workspace…</span>
               </div>
-            )
-          }
-          trailing={
-            <>
-              {!inDrawer && (
-                <WorkspaceTabTooltip
-                  label={fullScreenCommand?.menuLabel ?? "Full screen"}
-                  shortcut={shortcutKeys("workspace.toggleFullScreen")}
-                >
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    aria-label={fullScreenCommand?.menuLabel ?? "Full screen"}
-                    aria-pressed={maximized}
-                    onClick={onToggleMaximized}
-                    disabled={pending}
-                    size="icon-xs"
-                    className="flex size-6 text-muted-foreground hover:text-foreground"
-                  >
-                    {maximized ? (
-                      <MinimizeIcon className="size-4" />
-                    ) : (
-                      <MaximizeIcon className="size-4" />
-                    )}
-                  </Button>
-                </WorkspaceTabTooltip>
-              )}
-              {onHide && (
-                <WorkspaceTabTooltip
-                  label="Collapse right panel"
-                  shortcut={shortcutKeys("sidebar.right")}
-                >
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    aria-label="Collapse right panel"
-                    aria-keyshortcuts={shortcutAriaKeys("sidebar.right")}
-                    onClick={onHide}
-                    size="icon-xs"
-                    // A narrow strip leaves room to "+", as the header's toggle beside it does the same.
-                    className="flex size-6 text-muted-foreground hover:text-foreground @max-[240px]/rail:hidden"
-                  >
-                    <XIcon className="size-4" />
-                  </Button>
-                </WorkspaceTabTooltip>
-              )}
-            </>
-          }
-          banner={
-            selectedTab?.attention && (
-              <AttentionBar
-                label={titleOf({ ...selectedTab, place: selectedTab.attention.place }).label}
-                onShow={() => void store.showAttention(selectedTab.id)}
-                onDismiss={() => store.dismissAttention(selectedTab.id)}
-              />
-            )
-          }
-          contentRef={contentRef}
-        >
-          {pending ? (
-            <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 text-muted-foreground">
-              <Spinner />
-              <span className="text-ui">Starting workspace…</span>
-            </div>
-          ) : (
-            <>
-              {mountedTabs.map((tab) => {
-                const selected = tab.id === selectedTabId;
-                return (
-                  <WorkspaceSidebarTabPanel key={tab.id} tabId={tab.id} selected={selected}>
-                    {renderTabContent(tab, selected)}
-                  </WorkspaceSidebarTabPanel>
-                );
-              })}
-              {selectedUnknown && (
-                <UnsupportedTabContent onClose={() => closeTab(selectedUnknown.id)} />
-              )}
-            </>
-          )}
-        </WorkspaceSidebarFrame>
-      </div>
-    </aside>
+            ) : (
+              <>
+                {mountedTabs.map((tab) => {
+                  const selected = tab.id === selectedTabId;
+                  return (
+                    <WorkspaceSidebarTabPanel key={tab.id} tabId={tab.id} selected={selected}>
+                      {renderTabContent(tab, selected)}
+                    </WorkspaceSidebarTabPanel>
+                  );
+                })}
+                {selectedUnknown && (
+                  <UnsupportedTabContent onClose={() => closeTab(selectedUnknown.id)} />
+                )}
+              </>
+            )}
+          </WorkspaceSidebarFrame>
+        </div>
+      </aside>
+    </>
   );
 }
 

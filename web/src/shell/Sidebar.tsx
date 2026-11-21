@@ -118,11 +118,13 @@ import {
   MeasuringStrategy,
   MouseSensor,
   pointerWithin,
-  TouchSensor,
   useDraggable,
   useDroppable,
   useSensor,
   useSensors,
+  type KeyboardSensorOptions,
+  type MeasuringConfiguration,
+  type MouseSensorOptions,
 } from "@dnd-kit/core";
 import {
   arrayMove,
@@ -246,13 +248,22 @@ import {
 import { collectUnreadInboxItems } from "@/lib/inbox";
 import { cn } from "@/lib/utils";
 import { useOmnigentAnalytics } from "@/lib/analytics";
+import { type SwipeAction, useSwipeActions } from "@/lib/swipeActionPreferences";
+import {
+  finishActiveRowGesture,
+  ROW_GESTURE_HOLD_MS,
+  ROW_MENU_SYNTHETIC,
+  ROW_SWIPE_COMMIT_PX,
+  RowGesturePointerSensor,
+  useRowGesture,
+} from "@/hooks/useRowGesture";
 import { isDesktopLayout, useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import {
   isSideBySideSidebarViewport,
   useIsSideBySideSidebarViewport,
 } from "@/hooks/useIsSideBySideSidebarViewport";
 import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
-import { useSidebarSwipeToClose } from "@/hooks/useSidebarSwipeToClose";
+import { OWNS_LEFT_SWIPE_ATTRIBUTE, useSidebarSwipeToClose } from "@/hooks/useSidebarSwipeToClose";
 import { useSidebarSwipeToOpen } from "@/hooks/useSidebarSwipeToOpen";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { SESSION_HOTKEY_DIGITS, useSessionNumberHotkeys } from "@/hooks/useSessionNumberHotkeys";
@@ -412,15 +423,14 @@ function trailingSlotKind(
   return "none";
 }
 
+// A session row's quick controls (pin, archive, kebab) exist only in the
+// desktop layout (`md` up), fading until the row is hovered, a control is
+// keyboard-focused or the kebab menu is open. The mobile layout acts on rows
+// through swipes and the long-press menu instead.
+// `inline-flex` (not `block`) keeps the Button base's flex centering.
+const ROW_CONTROL_CLASS =
+  "hidden text-muted-foreground transition-opacity focus-visible:ring-inset md:inline-flex md:opacity-0 md:group-hover:opacity-100 md:group-has-[:focus-visible]:opacity-100 md:group-has-[[data-testid=conversation-actions][aria-expanded=true]]:opacity-100";
 const DROP_TARGET_HIGHLIGHT = SIDEBAR_ACTIVE_HIGHLIGHT;
-
-// Stable sensor options keep dnd-kit from rerendering every row on list updates.
-const KEYBOARD_SENSOR_OPTIONS = {
-  coordinateGetter: sortableKeyboardCoordinates,
-  keyboardCodes: { start: ["Space"], cancel: ["Escape"], end: ["Space"] },
-};
-const MOUSE_SENSOR_OPTIONS = { activationConstraint: { distance: 5 } };
-const TOUCH_SENSOR_OPTIONS = { activationConstraint: { delay: 250, tolerance: 8 } };
 
 const SCROLLBAR_HIDE_DELAY_MS = 700;
 
@@ -1088,11 +1098,12 @@ function SidebarImpl({
   const sideBySide = useIsSideBySideSidebarViewport();
   const closeSwipeEnabled = open && mobileLayout && dragProgress == null;
   const openSwipeEnabled = !open && !peek && mobileLayout && dragProgress == null;
+  // A touch held past this before moving is a long-press, not an open swipe.
   useSidebarSwipeToOpen({
     enabled: openSwipeEnabled,
     drawerRef,
     surfaceSelector: ".app-shell",
-    holdMs: TOUCH_SENSOR_OPTIONS.activationConstraint.delay,
+    holdMs: 250,
     onDragProgress: setOpenSwipeProgress,
     onSettle: (shouldOpen) => {
       if (shouldOpen) onOpen?.();
@@ -1102,7 +1113,7 @@ function SidebarImpl({
     enabled: closeSwipeEnabled,
     drawerRef,
     scrimRef,
-    holdMs: TOUCH_SENSOR_OPTIONS.activationConstraint.delay,
+    holdMs: ROW_GESTURE_HOLD_MS,
     onDragProgress: setCloseSwipeProgress,
     onSettle: (close) => {
       if (close) onClose();
@@ -1303,7 +1314,7 @@ function SidebarImpl({
           // divider — no outer margin or rounding. Width (the user-resizable
           // variable) animates →0 to push main; when closed the border
           // collapses too so nothing lingers.
-          "md:translate-x-0 md:overflow-hidden",
+          "md:translate-x-0",
           // Opening or collapsing slides the width and fades the content in
           // 200 ms, matching the workspace rail (index.css keeps it under
           // reduced motion, where an instant jump of the layout reads worse).
@@ -1319,7 +1330,7 @@ function SidebarImpl({
           // ringed and shadowed, sliding+fading in from the left so it reads as an
           // overlay rather than a push.
           peek &&
-            "is-peek md:absolute md:inset-2 p-0 md:max-w-[400px] ring-1 ring-border rounded-xl md:shadow-xl animate-in fade-in slide-in-from-left-4 duration-200 ease-out",
+            "is-peek md:absolute md:inset-2 p-0 md:max-w-[400px] md:overflow-hidden ring-1 ring-border rounded-xl md:shadow-xl animate-in fade-in slide-in-from-left-4 duration-200 ease-out",
           // Click-through while fading in (see peekInteractive above): the
           // click falls through to the header toggle underneath, which pins
           // the sidebar open — what the user aimed for.
@@ -1356,12 +1367,20 @@ function SidebarImpl({
           when closed also keeps it from being draggable while collapsed.
           Hidden while peeking too — the peek card is a fixed-width flyout, not
           a resizable panel. */}
-        {!peek && (
+        {open && !peek && (
           <div
             {...resizeHandleProps}
-            className="absolute inset-y-0 right-0 z-10 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:block"
+            data-testid="sidebar-resize-handle"
+            // Horizontal anchoring comes from the hook's inline
+            // `insetInlineEnd` (seam + outward sliver) — no `md:right-0`
+            // here, or the class would fight the inline offset.
+            className="z-10 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 data-dragging:bg-primary/50 md:absolute md:inset-y-0 md:block"
           />
         )}
+        {/* The content wrapper owns clipping while the absolutely positioned
+          handle enlarges the seam without consuming sidebar layout width. */}
+        {/* prettier-ignore */}
+        <div data-testid="sidebar-clipped-content" className="flex min-h-0 flex-1 flex-col md:overflow-hidden">
         {inSettings ? (
           <SettingsSidebar
             onNavClick={onNavClick}
@@ -1678,6 +1697,7 @@ function SidebarImpl({
             </div>
           </>
         )}
+        </div>
         {/* Profile and Settings stay pinned below either sidebar body. Native
             shells add their existing server-switching actions to its menu. */}
         <SidebarServerPicker />
@@ -2245,6 +2265,19 @@ function useStartingConversationId(enabled: boolean): string | null {
     return s.status === "streaming" || s.terminalPending ? s.conversationId : null;
   });
 }
+
+// Module-level so dnd-kit's useSensor/DndContext memoization holds: fresh
+// option objects rebuild the activators and re-render every draggable row.
+const KEYBOARD_SENSOR_OPTIONS: KeyboardSensorOptions = {
+  coordinateGetter: sortableKeyboardCoordinates,
+  keyboardCodes: { start: ["Space"], cancel: ["Escape"], end: ["Space"] },
+};
+const MOUSE_SENSOR_OPTIONS: MouseSensorOptions = { activationConstraint: { distance: 5 } };
+// Always-measure so the transient "remove from project" zone (mounted at drag
+// start) is registered as a drop target without a stale layout cache.
+const DND_MEASURING: MeasuringConfiguration = {
+  droppable: { strategy: MeasuringStrategy.Always },
+};
 
 function ConversationList({
   conversationsQuery,
@@ -3018,7 +3051,7 @@ function ConversationList({
   const sensors = useSensors(
     useSensor(KeyboardSensor, KEYBOARD_SENSOR_OPTIONS),
     useSensor(MouseSensor, MOUSE_SENSOR_OPTIONS),
-    useSensor(TouchSensor, TOUCH_SENSOR_OPTIONS),
+    useSensor(RowGesturePointerSensor),
   );
   // dnd-kit stops the click that ends a drag before React's <Link> sees it, so
   // a row released over itself would follow its href natively; cancel that one.
@@ -3084,6 +3117,7 @@ function ConversationList({
         if (from >= 0 && to >= 0 && from !== to) saveOrder.mutate(arrayMove(projects, from, to));
         return;
       }
+      finishActiveRowGesture();
       const dragged = activeDrag;
       setActiveDrag(null);
       setOverPin(null);
@@ -3623,9 +3657,7 @@ function ConversationList({
           }
           return closestCenter({ ...args, droppableContainers });
         }}
-        // Always-measure so the transient "remove from project" zone (mounted at
-        // drag start) is registered as a drop target without a stale layout cache.
-        measuring={{ droppable: { strategy: MeasuringStrategy.Always } }}
+        measuring={DND_MEASURING}
         onDragStart={handleDragStart}
         onDragEnd={handleDragEnd}
         onDragOver={(event) => {
@@ -3635,6 +3667,7 @@ function ConversationList({
         }}
         onDragMove={(event) => setPinBelow(event.collisions?.[0]?.data?.below === true)}
         onDragCancel={() => {
+          finishActiveRowGesture(true);
           setActiveDrag(null);
           setOverPin(null);
           setDraggedProject(null);
@@ -6222,6 +6255,97 @@ function ConversationRowImpl({
     data: { type: "session-nest", destination: conversation },
     disabled: !canMoveNest || !conversation.family,
   });
+  const gestureEnabled = !selectionMode && !isEditing && !isProvisionalRow;
+  // Every condition that disables the draggable below, so a touch hold never
+  // enters a drag phase dnd-kit won't start (which would also block scrolling).
+  const dragEnabled =
+    gestureEnabled &&
+    !isArchived &&
+    (isOwner || gridsEnabled) &&
+    !((familyIndented || isIndentedSibling(conversation)) && !gridsEnabled && !canMoveNest) &&
+    !nestMoves?.saving;
+  const swipeActions = useSwipeActions();
+  const hasSwipeLeft = swipeActions.left !== "none";
+  const hasSwipeRight = swipeActions.right !== "none";
+  // The sequence's pointerType owns recognition, so hardware capability
+  // queries cannot disable the first touch from a newly attached digitizer.
+  const swipeEnabled = gestureEnabled && isOwner && (hasSwipeLeft || hasSwipeRight);
+  const [contextMenuOpen, setContextMenuOpen] = useState(false);
+  const rowLinkRef = useRef<HTMLAnchorElement>(null);
+  const touchContextMenuRef = useRef(false);
+  const primingContextMenuRef = useRef(false);
+  const pendingMenuOpenFrame = useRef<number | null>(null);
+  const cancelPendingMenuOpen = useCallback(() => {
+    if (pendingMenuOpenFrame.current === null) return;
+    cancelAnimationFrame(pendingMenuOpenFrame.current);
+    pendingMenuOpenFrame.current = null;
+  }, []);
+  useEffect(() => cancelPendingMenuOpen, [cancelPendingMenuOpen]);
+  const handleContextMenuOpenChange = useCallback((open: boolean) => {
+    // A priming dispatch only moves Radix's anchor to the finger.
+    if (open && primingContextMenuRef.current) return;
+    setContextMenuOpen(open);
+    if (!open) {
+      if (!touchContextMenuRef.current) rowLinkRef.current?.focus({ preventScroll: true });
+      touchContextMenuRef.current = false;
+    }
+  }, []);
+  const openContextMenuAt = useCallback(
+    (point: { clientX: number; clientY: number }) => {
+      touchContextMenuRef.current = true;
+      const dispatchContextMenu = () => {
+        const event = new MouseEvent("contextmenu", {
+          bubbles: true,
+          cancelable: true,
+          button: 2,
+          clientX: point.clientX,
+          clientY: point.clientY,
+        });
+        Object.assign(event, { [ROW_MENU_SYNTHETIC]: true });
+        rowLinkRef.current?.dispatchEvent(event);
+      };
+      // Radix publishes a new anchor point in a passive effect, so opening in
+      // the same render paints the menu at (0,0) first. Move it, then open.
+      primingContextMenuRef.current = true;
+      try {
+        dispatchContextMenu();
+      } finally {
+        primingContextMenuRef.current = false;
+      }
+      cancelPendingMenuOpen();
+      pendingMenuOpenFrame.current = requestAnimationFrame(() => {
+        pendingMenuOpenFrame.current = null;
+        dispatchContextMenu();
+      });
+    },
+    [cancelPendingMenuOpen],
+  );
+  const runArchiveRef = useRef(runArchive);
+  useEffect(() => {
+    runArchiveRef.current = runArchive;
+  });
+  const handleGestureAction = useCallback(
+    (action: Exclude<SwipeAction, "none">) => {
+      if (action === "archive") runArchiveRef.current();
+      else setDeleteOpen(true);
+    },
+    [setDeleteOpen],
+  );
+  const closeContextMenu = useCallback(() => {
+    cancelPendingMenuOpen();
+    setContextMenuOpen(false);
+  }, [cancelPendingMenuOpen]);
+  const gesture = useRowGesture({
+    enabled: gestureEnabled,
+    swipeEnabled,
+    dragEnabled,
+    actions: swipeActions,
+    onAction: handleGestureAction,
+    onLongPress: openContextMenuAt,
+    onDragStart: closeContextMenu,
+    onCancel: closeContextMenu,
+  });
+
   // Drag-and-drop: a row is grabbable when the viewer owns it (re-filing is
   // owner-only, like the Move-to-project kebab item), outside selection /
   // archive / rename modes. Dragging it onto a project folder files it there;
@@ -6246,15 +6370,9 @@ function ConversationRowImpl({
       familyId: conversation.family?.id,
       reorderGroup: canReorder ? reorderGroup : undefined,
       reorderIndex,
+      rowGesture: gesture.dndData,
     },
-    disabled:
-      ((familyIndented || isIndentedSibling(conversation)) && !gridsEnabled && !canMoveNest) ||
-      nestMoves?.saving ||
-      (!isOwner && !gridsEnabled) ||
-      selectionMode ||
-      isArchived ||
-      isEditing ||
-      isProvisionalRow,
+    disabled: !dragEnabled,
   });
   const {
     setNodeRef: setSessionOrderNodeRef,
@@ -6271,6 +6389,13 @@ function ConversationRowImpl({
     const from = reorderDrag?.data.current?.reorderIndex as number;
     reorderInsertion = from < reorderIndex ? "after" : "before";
   }
+  // `gesture.listeners` is stable across renders; memoize the composed object
+  // so a row render doesn't rebuild the handler set.
+  const bindRowGestureListeners = gesture.listeners;
+  const rowGestureListeners = useMemo(
+    () => bindRowGestureListeners(dragListeners),
+    [bindRowGestureListeners, dragListeners],
+  );
   // In the Pinned section each row is also a reorder target for other pins.
   const pinOrder = useContext(PinOrderContext);
   const { setNodeRef: setPinOrderNodeRef } = useDroppable({
@@ -6429,6 +6554,7 @@ function ConversationRowImpl({
         </button>
       )}
       <Link
+        ref={rowLinkRef}
         to={
           selectionMode
             ? "#"
@@ -6444,8 +6570,12 @@ function ConversationRowImpl({
             ? sessionNumberAriaShortcut(SESSION_HOTKEY_DIGITS[shortcutSlot])
             : undefined
         }
-        draggable={gridsEnabled ? false : undefined}
+        draggable={false}
         onDragStart={gridsEnabled ? (event) => event.preventDefault() : undefined}
+        onContextMenu={(e) => {
+          if (isDragging) e.preventDefault();
+        }}
+        onKeyDown={gesture.clearClickSuppression}
         className={cn(
           SIDEBAR_ROW,
           "relative flex text-left text-foreground transition-colors",
@@ -6455,9 +6585,11 @@ function ConversationRowImpl({
           SIDEBAR_HOVER_HIGHLIGHT,
           // Full width (not 100%+1rem) so the highlight stays inset from the
           // right edge, aligning with the project/folder rows above.
-          "w-full",
+          // The focus outline sits inside the row: the swipe clip would cut an
+          // outset ring.
+          "w-full focus-visible:outline-offset-[-2px]",
           // Touch reaches the row menu by long press.
-          "mobile-touch-target",
+          "mobile-touch-target pointer-coarse:select-none [-webkit-touch-callout:none]",
           // Aligns the parent title with its nested rows' titles (ml-6 + px-2).
           familyExpanded !== undefined && "pl-8",
           // Mobile drops the pin + kebab (see the trailing controls below), so it
@@ -6485,6 +6617,11 @@ function ConversationRowImpl({
             ...recentClickTimesRef.current.slice(-1),
             performance.now(),
           ];
+          // Swallow the click that trails a resolved touch gesture.
+          if (gesture.consumeClick()) {
+            e.preventDefault();
+            return;
+          }
           if (selectionMode) {
             e.preventDefault();
             e.stopPropagation();
@@ -6569,361 +6706,422 @@ function ConversationRowImpl({
     );
   }
 
+  const renderContextMenu = (trigger: ReactNode) => (
+    <ContextMenu modal={false} open={contextMenuOpen} onOpenChange={handleContextMenuOpenChange}>
+      <ContextMenuTrigger asChild>{trigger}</ContextMenuTrigger>
+      <ContextMenuContent className="min-w-44 touch-pan-y select-none">
+        <ConversationMenuItems
+          components={contextBundle}
+          setMenuOpen={() => {}}
+          {...menuItemProps}
+        />
+      </ContextMenuContent>
+    </ContextMenu>
+  );
+
+  const swipingAction: SwipeAction =
+    gesture.dx < 0
+      ? (gesture.actions?.left ?? swipeActions.left)
+      : gesture.dx > 0
+        ? (gesture.actions?.right ?? swipeActions.right)
+        : "none";
+  const isSwiping = gesture.dx !== 0 && swipingAction !== "none";
+  const swipeCommitted = Math.abs(gesture.dx) >= ROW_SWIPE_COMMIT_PX;
+  const ownsPointer = gesture.phase === "armed" || gesture.phase === "drag";
+  // Chrome samples touch-action at pointerdown, so a direction granted to the
+  // browser is lost to the recognizer for the whole stream — cede only the
+  // inert horizontal direction, never one with a configured action. CSS pan
+  // directions name the SCROLL direction, the reverse of finger travel
+  // (Chromium requires kPanLeft for deltaX>0, i.e. a rightward finger), so a
+  // left action — fired by a leftward finger = a rightward pan — must
+  // withhold pan-right and may cede pan-left, and vice versa.
+  //
+  // This must be a single composed `touch-action` VALUE, applied inline:
+  // Tailwind's `touch-pan-y` + `touch-pan-left` are same-property utilities
+  // that don't compose — stylesheet order picks one, so the one-sided grant
+  // never reached the browser as `pan-y pan-left`.
+  const swipeTouchAction = !swipeEnabled
+    ? undefined
+    : hasSwipeLeft && hasSwipeRight
+      ? "pan-y"
+      : hasSwipeLeft
+        ? "pan-y pan-left"
+        : "pan-y pan-right";
+
   return (
     // Drag props on the <li> so the whole row is grabbable; `isDragging` dims
     // it. `setRowRef` merges the drag node ref with the scroll-into-view ref.
     <li
       ref={setRowRef}
       data-sidebar-session-id={conversation.id}
-      onMouseDown={(event) => {
-        // Portaled dialogs bubble through this row but must not start a drag.
-        if (event.currentTarget.contains(event.target as Node)) {
-          dragListeners?.onMouseDown?.(event);
-        }
+      data-testid="conversation-swipe-frame"
+      // A leftward swipe here runs the row's action, not the drawer's swipe-to-close.
+      {...{ [OWNS_LEFT_SWIPE_ATTRIBUTE]: swipeEnabled && hasSwipeLeft ? "" : undefined }}
+      {...rowGestureListeners}
+      onContextMenuCapture={(e) => {
+        if (!(ROW_MENU_SYNTHETIC in e.nativeEvent)) touchContextMenuRef.current = false;
       }}
-      onTouchStart={(event) => {
-        if (event.currentTarget.contains(event.target as Node)) {
-          dragListeners?.onTouchStart?.(event);
-        }
+      onContextMenu={(e) => {
+        if (ROW_MENU_SYNTHETIC in e.nativeEvent) return;
+        if (ownsPointer || isDragging) e.preventDefault();
       }}
       className={cn(
         "group relative",
         familyIndented && "ml-6",
         isDragging && "opacity-40",
         isNestTarget && DROP_TARGET_HIGHLIGHT,
+        gesture.phase === "armed" && "z-10 motion-safe:scale-[1.01] shadow-sm",
+        ownsPointer && "touch-none",
       )}
       data-sibling-session={familyIndented || undefined}
+      // Keep vertical scrolling native while claiming the horizontal axis for
+      // the swipe: without this the browser can take the horizontal pan (or
+      // back-navigation gesture) and cancel the gesture mid-drag. Only where
+      // a swipe can actually fire, so rows without one keep default behavior.
+      // Inline style, not utility classes — see the swipeTouchAction comment.
+      style={!ownsPointer && swipeTouchAction ? { touchAction: swipeTouchAction } : undefined}
     >
       {familyIndented && <span aria-hidden="true" className={SIDEBAR_FAMILY_LINE} />}
-      {insertion && (
-        <span
-          data-testid={pinInsertion ? "pin-order-insertion" : "session-order-insertion"}
-          className="pointer-events-none absolute inset-x-0 z-10 h-0.5 bg-primary"
-          style={insertion === "before" ? { top: 0 } : { bottom: 0 }}
-        />
-      )}
-      {/* Right-click anywhere on the row opens the same actions as the kebab.
+      {/* Clip the hint to the vacated strip so it cannot overlap the moving
+          surface. The threshold also scales the glyph, avoiding a color-only cue.
+          Action colors switch immediately so reversals cannot inherit the old color. */}
+      <div className="relative overflow-hidden">
+        {isSwiping && (
+          <div
+            aria-hidden
+            data-testid="conversation-swipe-reveal"
+            className={cn(
+              "pointer-events-none absolute inset-y-0 flex items-center justify-center overflow-hidden rounded-[var(--radius-otto-sm)]",
+              swipingAction === "delete"
+                ? swipeCommitted
+                  ? "bg-destructive/20 text-destructive"
+                  : "bg-destructive/10 text-destructive/70"
+                : swipeCommitted
+                  ? "bg-accent text-accent-foreground"
+                  : "bg-accent/50 text-accent-foreground/70",
+            )}
+            style={
+              gesture.dx > 0 ? { left: 0, width: gesture.dx } : { right: 0, width: -gesture.dx }
+            }
+          >
+            <span
+              className={cn(
+                "flex items-center transition-transform",
+                swipeCommitted ? "motion-safe:scale-110" : "motion-safe:scale-100",
+              )}
+            >
+              {swipingAction === "delete" ? (
+                <Trash2Icon className="size-4" />
+              ) : isArchived ? (
+                // Archiving toggles, so on an archived row the gesture restores —
+                // mirror the kebab's Unarchive glyph rather than promising a re-archive.
+                <ArchiveRestoreIcon className="size-4" />
+              ) : (
+                <ArchiveIcon className="size-4" />
+              )}
+            </span>
+          </div>
+        )}
+        <div
+          data-testid="conversation-swipe-surface"
+          className={cn(
+            "relative w-full",
+            isSwiping && "rounded-[var(--radius-otto-sm)] bg-sidebar",
+            // Transition only at rest, so the row eases back when the gesture
+            // ends but tracks the finger 1:1 while swiping.
+            gesture.dx === 0 && "transition-transform duration-200",
+          )}
+          style={{ transform: `translateX(${gesture.dx}px)` }}
+        >
+          {insertion && (
+            <span
+              data-testid={pinInsertion ? "pin-order-insertion" : "session-order-insertion"}
+              className="pointer-events-none absolute inset-x-0 z-10 h-0.5 bg-primary"
+              style={insertion === "before" ? { top: 0 } : { bottom: 0 }}
+            />
+          )}
+          {/* Right-click anywhere on the row opens the same actions as the kebab.
           Suppressed in selection mode (bulk-select owns the row), where the
           bare link is rendered instead. ContextMenuTrigger preventDefaults the
           native contextmenu event, so right-click never navigates; asChild
           merges its handler onto the row surface, preserving left-click /
           double-click. Pinned, project-owned rows nest a HoverCardTrigger around
           that same surface so hovering still opens the project flyout. */}
-      {selectionMode ? (
-        projectFlyoutName ? (
-          <HoverCard openDelay={150} closeDelay={0}>
-            <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
-            <PinnedProjectFlyoutContent
-              title={conversation.title ?? conversation.id}
-              projectName={projectFlyoutName}
-              projectIcon={projectFlyoutIcon}
-              gitBranch={gitBranch}
-              hasError={sessionState?.kind === "error"}
-              shared={sharing}
-              familyDetail={familyDetail}
-            />
-          </HoverCard>
-        ) : isMobile ? (
-          rowLink
-        ) : (
-          <Tooltip>
-            <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
-            <SessionTooltipContent
-              conversation={conversation}
-              hostsById={hostsById}
-              hasError={sessionState?.kind === "error"}
-              shared={sharing}
-              familyDetail={familyDetail}
-            />
-          </Tooltip>
-        )
-      ) : projectFlyoutName ? (
-        <HoverCard openDelay={150} closeDelay={0}>
-          <ContextMenu>
-            <ContextMenuTrigger asChild>
-              <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
-            </ContextMenuTrigger>
-            <ContextMenuContent className="min-w-44">
-              <ConversationMenuItems
-                components={contextBundle}
-                setMenuOpen={() => {}}
-                {...menuItemProps}
-              />
-            </ContextMenuContent>
-          </ContextMenu>
-          <PinnedProjectFlyoutContent
-            title={conversation.title ?? conversation.id}
-            projectName={projectFlyoutName}
-            projectIcon={projectFlyoutIcon}
-            gitBranch={gitBranch}
-            hasError={sessionState?.kind === "error"}
-            shared={sharing}
-            familyDetail={familyDetail}
-          />
-        </HoverCard>
-      ) : isMobile ? (
-        <ContextMenu>
-          <ContextMenuTrigger asChild>{rowLink}</ContextMenuTrigger>
-          <ContextMenuContent className="min-w-44">
-            <ConversationMenuItems
-              components={contextBundle}
-              setMenuOpen={() => {}}
-              {...menuItemProps}
-            />
-          </ContextMenuContent>
-        </ContextMenu>
-      ) : (
-        <Tooltip>
-          <ContextMenu>
-            <ContextMenuTrigger asChild>
-              <div className="w-full">
+          {selectionMode ? (
+            projectFlyoutName ? (
+              <HoverCard openDelay={150} closeDelay={0}>
+                <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
+                <PinnedProjectFlyoutContent
+                  title={conversation.title ?? conversation.id}
+                  projectName={projectFlyoutName}
+                  projectIcon={projectFlyoutIcon}
+                  gitBranch={gitBranch}
+                  hasError={sessionState?.kind === "error"}
+                  shared={sharing}
+                  familyDetail={familyDetail}
+                />
+              </HoverCard>
+            ) : isMobile ? (
+              rowLink
+            ) : (
+              <Tooltip>
                 <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
-              </div>
-            </ContextMenuTrigger>
-            <ContextMenuContent className="min-w-44">
-              <ConversationMenuItems
-                components={contextBundle}
-                setMenuOpen={() => {}}
-                {...menuItemProps}
+                <SessionTooltipContent
+                  conversation={conversation}
+                  hostsById={hostsById}
+                  hasError={sessionState?.kind === "error"}
+                  shared={sharing}
+                  familyDetail={familyDetail}
+                />
+              </Tooltip>
+            )
+          ) : projectFlyoutName ? (
+            <HoverCard openDelay={150} closeDelay={0}>
+              {renderContextMenu(<HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>)}
+              <PinnedProjectFlyoutContent
+                title={conversation.title ?? conversation.id}
+                projectName={projectFlyoutName}
+                projectIcon={projectFlyoutIcon}
+                gitBranch={gitBranch}
+                hasError={sessionState?.kind === "error"}
+                shared={sharing}
+                familyDetail={familyDetail}
               />
-            </ContextMenuContent>
-          </ContextMenu>
-          <SessionTooltipContent
-            conversation={conversation}
-            hostsById={hostsById}
-            hasError={sessionState?.kind === "error"}
-            shared={sharing}
-            familyDetail={familyDetail}
-          />
-        </Tooltip>
-      )}
-      {selectionMode ? (
-        <span
-          className={cn(
-            "-translate-y-1/2 pointer-events-none absolute left-2 flex items-center",
-            overlayTop,
-          )}
-        >
-          {isSelected ? (
-            <SquareCheckIcon className="size-4 text-primary" />
+            </HoverCard>
+          ) : isMobile ? (
+            renderContextMenu(rowLink)
           ) : (
-            <SquareIcon className="size-4 text-muted-foreground" />
+            <Tooltip>
+              {renderContextMenu(
+                <div className="w-full">
+                  <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
+                </div>,
+              )}
+              <SessionTooltipContent
+                conversation={conversation}
+                hostsById={hostsById}
+                hasError={sessionState?.kind === "error"}
+                shared={sharing}
+                familyDetail={familyDetail}
+              />
+            </Tooltip>
           )}
-        </span>
-      ) : hasSessionIndicator ? (
-        <span
-          className={cn(
-            SESSION_STATE_SLOT_CLASS,
-            overlayTop,
-            "right-1",
-            // The wide "awaiting" pill keeps its natural width; every other
-            // marker (running/starting/unseen dot, or the draft pencil) sits in
-            // the fixed centered box so it lines up under the kebab.
-            isDotMarker(sessionState) && SESSION_STATE_DOT_SLOT_CLASS,
+          {selectionMode ? (
+            <span
+              className={cn(
+                "-translate-y-1/2 pointer-events-none absolute left-2 flex items-center",
+                overlayTop,
+              )}
+            >
+              {isSelected ? (
+                <SquareCheckIcon className="size-4 text-primary" />
+              ) : (
+                <SquareIcon className="size-4 text-muted-foreground" />
+              )}
+            </span>
+          ) : hasSessionIndicator ? (
+            <span
+              className={cn(
+                SESSION_STATE_SLOT_CLASS,
+                overlayTop,
+                "right-1",
+                // The wide "awaiting" pill keeps its natural width; every other
+                // marker (running/starting/unseen dot, or the draft pencil) sits in
+                // the fixed centered box so it lines up under the kebab.
+                isDotMarker(sessionState) && SESSION_STATE_DOT_SLOT_CLASS,
+              )}
+            >
+              {renderSessionIndicator()}
+            </span>
+          ) : showUpdated ? (
+            <span
+              data-testid="session-row-updated"
+              className={cn(
+                SESSION_STATE_SLOT_CLASS,
+                overlayTop,
+                "right-2 text-sm text-muted-foreground",
+              )}
+            >
+              <SessionUpdatedLabel updatedAt={conversation.updated_at} />
+            </span>
+          ) : null}
+          {!selectionMode && sharing !== null && (
+            <span
+              role="img"
+              // The row's hover surface carries the visible explanation.
+              aria-label={SESSION_SHARING_LABEL[sharing]}
+              // Shares the state slot's classes so it fades on every trigger the
+              // badge does (hover, focus, open menu, shortcut hint).
+              className={cn(
+                SESSION_STATE_SLOT_CLASS,
+                SESSION_STATE_DOT_SLOT_CLASS,
+                "shrink-0 text-muted-foreground",
+                overlayTop,
+                trailingLayout.sharedIcon,
+              )}
+            >
+              <UsersIcon className="size-3.5" aria-hidden="true" />
+            </span>
           )}
-        >
-          {renderSessionIndicator()}
-        </span>
-      ) : showUpdated ? (
-        <span
-          data-testid="session-row-updated"
-          className={cn(
-            SESSION_STATE_SLOT_CLASS,
-            overlayTop,
-            "right-2 text-sm text-muted-foreground",
-          )}
-        >
-          <SessionUpdatedLabel updatedAt={conversation.updated_at} />
-        </span>
-      ) : null}
-      {!selectionMode && sharing !== null && (
-        <span
-          role="img"
-          // The row's hover surface carries the visible explanation.
-          aria-label={SESSION_SHARING_LABEL[sharing]}
-          // Shares the state slot's classes so it fades on every trigger the
-          // badge does (hover, focus, open menu, shortcut hint).
-          className={cn(
-            SESSION_STATE_SLOT_CLASS,
-            SESSION_STATE_DOT_SLOT_CLASS,
-            "shrink-0 text-muted-foreground",
-            overlayTop,
-            trailingLayout.sharedIcon,
-          )}
-        >
-          <UsersIcon className="size-3.5" aria-hidden="true" />
-        </span>
-      )}
-      {/* Trailing controls (pin + kebab) share one absolutely-positioned flex
+          {/* Trailing controls (pin + kebab) share one absolutely-positioned flex
           row, so their spacing is defined once (gap-0.5) and stays aligned
           with the project-folder header actions, which use the same pattern.
           The kebab is the rightmost child (pinned to right-1); the pin sits a
           gap to its left. Hidden entirely while selecting (bulk mode owns the
           row controls). */}
-      {!selectionMode && (
-        <ContextMenu>
-          <ContextMenuTrigger asChild>
-            <div
-              className={cn(
-                "-translate-y-1/2 absolute right-1 flex items-center gap-0.5",
-                overlayTop,
-                "group-has-[[data-session-shortcut-hint]]:hidden",
-              )}
-            >
-              {/* Archived rows omit the pin entirely: pinning is meaningless there
+          {!selectionMode && (
+            <ContextMenu>
+              <ContextMenuTrigger asChild>
+                <div
+                  data-testid="conversation-row-controls"
+                  className={cn(
+                    "-translate-y-1/2 absolute right-1 flex items-center gap-0.5",
+                    overlayTop,
+                    // While hover-faded on desktop the controls must not hit-test
+                    // either (opacity alone leaves them tappable on a touchscreen
+                    // laptop, ahead of the row's tap/swipe), so they go inert until
+                    // the same hover/focus/open state that reveals them.
+                    "md:pointer-events-none",
+                    "md:group-hover:pointer-events-auto md:group-has-[:focus-visible]:pointer-events-auto md:group-has-[[data-testid=conversation-actions][aria-expanded=true]]:pointer-events-auto",
+                    "group-has-[[data-session-shortcut-hint]]:hidden",
+                  )}
+                >
+                  {/* Archived rows omit the pin entirely: pinning is meaningless there
               (archive outranks pin), so there's no pin action even on hover. */}
-              {showQuickActions &&
-                !isArchived &&
-                !familyIndented &&
-                !isIndentedSibling(conversation) && (
-                  <Tooltip disableHoverableContent>
-                    <TooltipContent
-                      shortcut={
-                        sessionShortcuts.has("toggle-pin-session") ? PIN_SESSION_KEYS : undefined
-                      }
-                    >
-                      {pinTooltip}
-                    </TooltipContent>
-                    <TooltipTrigger asChild>
+                  {showQuickActions &&
+                    !isArchived &&
+                    !familyIndented &&
+                    !isIndentedSibling(conversation) && (
+                      <Tooltip disableHoverableContent>
+                        <TooltipContent
+                          shortcut={
+                            sessionShortcuts.has("toggle-pin-session")
+                              ? PIN_SESSION_KEYS
+                              : undefined
+                          }
+                        >
+                          {pinTooltip}
+                        </TooltipContent>
+                        <TooltipTrigger asChild>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="icon-xs"
+                            aria-label={isPinned ? "Unpin conversation" : "Pin conversation"}
+                            data-testid="quick-pin-conversation"
+                            aria-disabled={pinSaving || (!isPinned && atPinCap)}
+                            // Desktop-only quick affordance: hidden on mobile (the kebab's
+                            // Pin item below covers that). Pinned rows keep no persistent
+                            // marker: the "Pinned" section header already conveys the
+                            // state, so the glyph is unpin when pinned, pin otherwise.
+                            className={ROW_CONTROL_CLASS}
+                            onClick={(e) => {
+                              // Keep the toggle click off the surrounding Link (no navigation).
+                              e.preventDefault();
+                              e.stopPropagation();
+                              if (pinSaving) return;
+                              onTogglePinned(conversation.id);
+                            }}
+                          >
+                            {isPinned ? (
+                              <PinOffIcon className="size-3.5" data-icon-size="14" />
+                            ) : (
+                              <PinIcon className="size-3.5" data-icon-size="14" />
+                            )}
+                          </Button>
+                        </TooltipTrigger>
+                      </Tooltip>
+                    )}
+                  {/* Archive is owner-only, same as the kebab's Archive item; non-owners
+              don't get the quick affordance and instead see that item disabled
+              with an explanation. */}
+                  {showQuickActions && isOwner && (
+                    <Tooltip disableHoverableContent>
+                      <TooltipContent
+                        shortcut={
+                          sessionShortcuts.has("archive-session") ? ARCHIVE_SESSION_KEYS : undefined
+                        }
+                      >
+                        {isArchived ? "Unarchive" : "Archive"}
+                      </TooltipContent>
+                      <TooltipTrigger asChild>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon-xs"
+                          aria-label={
+                            isArchived ? "Unarchive conversation" : "Archive conversation"
+                          }
+                          data-testid="quick-archive-conversation"
+                          className={ROW_CONTROL_CLASS}
+                          onClick={(e) => {
+                            // Keep the toggle click off the surrounding Link (no navigation).
+                            e.preventDefault();
+                            e.stopPropagation();
+                            if (!isArchived) {
+                              runArchive();
+                            } else {
+                              runUnarchive();
+                            }
+                          }}
+                        >
+                          {isArchived ? (
+                            <ArchiveRestoreIcon className="size-3.5" data-icon-size="14" />
+                          ) : (
+                            <ArchiveIcon className="size-3.5" data-icon-size="14" />
+                          )}
+                        </Button>
+                      </TooltipTrigger>
+                    </Tooltip>
+                  )}
+
+                  <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
+                    <DropdownMenuTrigger asChild>
                       <Button
                         type="button"
                         variant="ghost"
                         size="icon-xs"
-                        aria-label={isPinned ? "Unpin conversation" : "Pin conversation"}
-                        data-testid="quick-pin-conversation"
-                        aria-disabled={pinSaving || (!isPinned && atPinCap)}
-                        className={cn(
-                          // Desktop-only quick affordance: hidden on mobile (the kebab's
-                          // Pin item below covers that), hover/focus-revealed from `md`
-                          // up. Pinned rows no longer keep a persistent pin marker, since
-                          // the "Pinned" section header (and pinned-first ordering inside
-                          // a project) already conveys the pinned state. Revealed glyph:
-                          // unpin if pinned, pin otherwise.
-                          //
-                          // `md:inline-flex` (not `md:block`): the Button base is
-                          // `inline-flex` and relies on it for `items-center
-                          // justify-center` to center the icon. `md:block` would override
-                          // that display and collapse the centering, leaving the glyph
-                          // pinned to the top-left of the button — so keep the flex
-                          // display when revealing it.
-                          "text-muted-foreground transition-opacity",
-                          "hidden md:inline-flex",
-                          "md:opacity-0 md:group-hover:opacity-100",
-                          "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[data-testid=conversation-actions][aria-expanded=true]]:opacity-100",
-                        )}
+                        aria-label="Conversation actions"
+                        data-testid="conversation-actions"
+                        // Desktop-only: the chat page's own header menu covers these
+                        // per-session actions on mobile, so the row kebab is dropped
+                        // there. From `md` up it stays hidden until hover / keyboard
+                        // focus, with `aria-expanded` keeping it surfaced while the menu
+                        // is open so the trigger doesn't vanish under the cursor.
+                        className={ROW_CONTROL_CLASS}
                         onClick={(e) => {
-                          // Keep the toggle click off the surrounding Link (no navigation).
+                          // Keep the trigger click from bubbling into the Link.
                           e.preventDefault();
                           e.stopPropagation();
-                          if (pinSaving) return;
-                          onTogglePinned(conversation.id);
                         }}
                       >
-                        {isPinned ? (
-                          <PinOffIcon className="size-3.5" data-icon-size="14" />
-                        ) : (
-                          <PinIcon className="size-3.5" data-icon-size="14" />
-                        )}
+                        <MoreHorizontalIcon className="size-3.5" data-icon-size="14" />
                       </Button>
-                    </TooltipTrigger>
-                  </Tooltip>
-                )}
-              {/* Archive is owner-only, same as the kebab's Archive item; non-owners
-              don't get the quick affordance and instead see that item disabled
-              with an explanation. */}
-              {showQuickActions && isOwner && (
-                <Tooltip disableHoverableContent>
-                  <TooltipContent
-                    shortcut={
-                      sessionShortcuts.has("archive-session") ? ARCHIVE_SESSION_KEYS : undefined
-                    }
-                  >
-                    {isArchived ? "Unarchive" : "Archive"}
-                  </TooltipContent>
-                  <TooltipTrigger asChild>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-xs"
-                      aria-label={isArchived ? "Unarchive conversation" : "Archive conversation"}
-                      data-testid="quick-archive-conversation"
-                      className={cn(
-                        "text-muted-foreground transition-opacity",
-                        "hidden md:inline-flex",
-                        "md:opacity-0 md:group-hover:opacity-100",
-                        "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[data-testid=conversation-actions][aria-expanded=true]]:opacity-100",
-                      )}
-                      onClick={(e) => {
-                        // Keep the toggle click off the surrounding Link (no navigation).
-                        e.preventDefault();
-                        e.stopPropagation();
-                        if (!isArchived) {
-                          runArchive();
-                        } else {
-                          runUnarchive();
-                        }
-                      }}
-                    >
-                      {isArchived ? (
-                        <ArchiveRestoreIcon className="size-3.5" data-icon-size="14" />
-                      ) : (
-                        <ArchiveIcon className="size-3.5" data-icon-size="14" />
-                      )}
-                    </Button>
-                  </TooltipTrigger>
-                </Tooltip>
-              )}
-
-              <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
-                <DropdownMenuTrigger asChild>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon-xs"
-                    aria-label="Conversation actions"
-                    data-testid="conversation-actions"
-                    // Desktop-only: the chat page's own header menu covers these
-                    // per-session actions on mobile, so the row kebab is dropped
-                    // there. From `md` up it stays hidden until hover / keyboard
-                    // focus, with `aria-expanded` keeping it surfaced while the menu
-                    // is open so the trigger doesn't vanish under the cursor.
-                    className={cn(
-                      "text-muted-foreground transition-opacity",
-                      "hidden md:inline-flex",
-                      "md:opacity-0 md:group-hover:opacity-100 md:group-has-[:focus-visible]:opacity-100",
-                      "md:aria-expanded:opacity-100",
-                    )}
-                    onClick={(e) => {
-                      // Keep the trigger click from bubbling into the Link.
-                      e.preventDefault();
-                      e.stopPropagation();
-                    }}
-                  >
-                    <MoreHorizontalIcon className="size-3.5" data-icon-size="14" />
-                  </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end" className="min-w-44">
-                  <ConversationMenuItems
-                    components={dropdownBundle}
-                    setMenuOpen={setMenuOpen}
-                    {...menuItemProps}
-                  />
-                </DropdownMenuContent>
-              </DropdownMenu>
-            </div>
-          </ContextMenuTrigger>
-          <ContextMenuContent className="min-w-44">
-            <ConversationMenuItems
-              components={contextBundle}
-              setMenuOpen={() => {}}
-              {...menuItemProps}
-            />
-          </ContextMenuContent>
-        </ContextMenu>
-      )}
-      {shortcutSlot !== undefined && (
-        <SessionShortcutHint slot={shortcutSlot} overlayTop={overlayTop} />
-      )}
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end" className="min-w-44">
+                      <ConversationMenuItems
+                        components={dropdownBundle}
+                        setMenuOpen={setMenuOpen}
+                        {...menuItemProps}
+                      />
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                </div>
+              </ContextMenuTrigger>
+              <ContextMenuContent className="min-w-44">
+                <ConversationMenuItems
+                  components={contextBundle}
+                  setMenuOpen={() => {}}
+                  {...menuItemProps}
+                />
+              </ContextMenuContent>
+            </ContextMenu>
+          )}
+          {shortcutSlot !== undefined && (
+            <SessionShortcutHint slot={shortcutSlot} overlayTop={overlayTop} />
+          )}
+        </div>
+      </div>
       {actionDialogs}
     </li>
   );

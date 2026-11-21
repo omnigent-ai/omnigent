@@ -43,3 +43,22 @@ describe("layout by viewport width", () => {
     expect(renderHook(() => useIsSideBySideSidebarViewport()).result.current).toBe(mobile);
   });
 });
+
+describe("native shell layout signal", () => {
+  // Native shells (the Android back handler) read the published signal, so it
+  // must agree with the hook at every width, including the fractional sliver
+  // just under md that Tailwind's max-md variant still treats as mobile.
+  it.each([
+    [1180, false, true],
+    [1180.5, false, true],
+    [1180.98, false, true],
+    [1181, false, false],
+    [740, true, false],
+  ])("agrees with the hook at %spx (desktop app: %s)", (width, desktopApp, mobile) => {
+    mockViewportWidth(width);
+    if (desktopApp) vi.stubGlobal("omnigentDesktop", { kind: "electron" });
+
+    expect(window["__omnigentIsMobileViewport"]?.()).toBe(mobile);
+    expect(renderHook(() => useIsMobileViewport()).result.current).toBe(mobile);
+  });
+});

@@ -100,8 +100,11 @@ export function ProjectHomePage() {
             className="relative flex shrink-0 flex-col pt-1 pr-4 pb-4"
             style={{ width: panelWidth }}
           >
+            {/* The hook's gutter padding is laid out for the push panels' seam handle; this
+                handle overhangs the panel's edge instead, so keep its own box and claim touch. */}
             <div
               {...handleProps}
+              style={{ touchAction: "none" }}
               aria-label="Resize session panel"
               className="group/resize absolute inset-y-0 -left-2 z-10 flex w-2 cursor-col-resize items-center justify-center outline-none"
             >

@@ -391,12 +391,10 @@ function ChangesToolbar({
 /** The resizable file-list column; `filter` is a slot above the tree. */
 function ChangesSidebar({
   width,
-  handleProps,
   filter,
   children,
 }: {
   width: number;
-  handleProps: ReturnType<typeof useResizableColumn>["handleProps"];
   filter?: React.ReactNode;
   children: React.ReactNode;
 }) {
@@ -405,12 +403,6 @@ function ChangesSidebar({
       style={{ width: `${width}px` }}
       className="relative shrink-0 overflow-y-auto border-r border-border pb-1"
     >
-      {/* Drag the right edge to resize the file list. */}
-      <div
-        {...handleProps}
-        aria-label="Resize file list"
-        className="absolute inset-y-0 right-0 z-10 w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50"
-      />
       {filter}
       {children}
     </div>
@@ -1519,11 +1511,24 @@ export function PullRequestChangesTab({
           onOpen={view.openCommit}
         />
       )}
-      <div ref={bodyRef as React.RefObject<HTMLDivElement>} className="flex min-h-0 flex-1">
+      <div
+        ref={bodyRef as React.RefObject<HTMLDivElement>}
+        className="relative flex min-h-0 flex-1"
+      >
+        {/* Drag the list's right edge to resize it. The handle sits outside the scrolling
+            list, as in TerminalsPanel, so its touch-sized hit pad straddles the border
+            instead of being clipped onto the rows. */}
+        {!sidebarCollapsed && !commitsView && (
+          <div
+            {...sidebarHandleProps}
+            aria-label="Resize file list"
+            style={{ ...sidebarHandleProps.style, left: sidebarWidth }}
+            className="absolute inset-y-0 z-10 w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 data-dragging:bg-primary/50"
+          />
+        )}
         {!sidebarCollapsed && !commitsView && (
           <ChangesSidebar
             width={sidebarWidth}
-            handleProps={sidebarHandleProps}
             filter={
               files.length > 0 && (
                 <div className="p-2 pr-3">
