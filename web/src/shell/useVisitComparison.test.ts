@@ -16,7 +16,7 @@ const TYPED: ComparisonChoice = { kind: "typed", base: "main", head: "" };
 interface Step {
   active?: boolean;
   visit?: ComparisonChoice;
-  landing?: { settled: boolean };
+  landing?: { settled: boolean; choices: number };
   shown?: ComparisonChoice;
   settled?: boolean;
   availability?: ComparisonAvailability;
@@ -50,7 +50,8 @@ function setup(initial: Step = {}) {
   };
 }
 
-const landed = () => ({ settled: false });
+/** A landing stamped with the session's choice count as it lands. */
+const landed = (choices = 0) => ({ settled: false, choices });
 
 describe("useVisitComparison", () => {
   it("records what a visit first shows on it, in place", () => {
@@ -104,7 +105,7 @@ describe("useVisitComparison", () => {
   });
 
   it("keeps what the session shows when a tab shows again without landing, as after a reload", () => {
-    const settled = { settled: true };
+    const settled = { settled: true, choices: 0 };
     const { choose, onShown } = setup({ visit: AUTOMATIC, landing: settled, shown: TYPED });
     expect(choose).not.toHaveBeenCalled();
     expect(onShown).toHaveBeenCalledWith(TYPED, { step: false });
@@ -158,37 +159,58 @@ describe("useVisitComparison", () => {
     });
   });
 
-  it("lets a pick made while a landing waits win, as a step, over the landing's comparison", () => {
-    const link = landed();
-    const { choose, onShown, rerender } = setup({
-      visit: TYPED,
-      landing: link,
-      availability: "later",
-    });
-    rerender({ visit: TYPED, landing: link, availability: "later", shown: BRANCH, choices: 1 });
-    expect(onShown).toHaveBeenCalledWith(BRANCH, { step: true });
-    rerender({ visit: TYPED, landing: link, availability: "now", shown: BRANCH, choices: 1 });
+  // However it lands, a comparison the person picked since a landing wins over the landing's.
+  it.each<{
+    when: string;
+    steps: (link: { settled: boolean; choices: number }) => Step[];
+    step: boolean;
+  }>([
+    {
+      when: "picked here while the landing waits",
+      steps: (link) => [
+        { visit: TYPED, landing: link, availability: "later" },
+        { visit: TYPED, landing: link, availability: "later", shown: BRANCH, choices: 1 },
+        { visit: TYPED, landing: link, shown: BRANCH, choices: 1 },
+      ],
+      step: true,
+    },
+    {
+      when: "picked here before the session is known",
+      steps: (link) => [
+        { visit: TYPED, landing: link, settled: false },
+        { visit: TYPED, landing: link, settled: false, shown: BRANCH, choices: 1 },
+        { visit: TYPED, landing: link, shown: BRANCH, choices: 1 },
+      ],
+      step: true,
+    },
+    {
+      when: "picked here as the session becomes ready",
+      steps: (link) => [
+        { visit: TYPED, landing: link, availability: "later" },
+        { visit: TYPED, landing: link, shown: BRANCH, choices: 1 },
+      ],
+      step: true,
+    },
+    {
+      when: "picked in another tab while this one is hidden",
+      steps: (link) => [
+        { visit: TYPED, landing: link, availability: "later" },
+        { active: false, visit: TYPED, landing: link, availability: "later" },
+        { active: false, visit: TYPED, landing: link, shown: BRANCH, choices: 1 },
+        { visit: TYPED, landing: link, shown: BRANCH, choices: 1 },
+      ],
+      step: false,
+    },
+    {
+      when: "picked before a tab opened in the background first shows",
+      steps: (link) => [{ visit: TYPED, landing: link, shown: BRANCH, choices: 1 }],
+      step: false,
+    },
+  ])("keeps a comparison $when over the landing's", ({ steps, step }) => {
+    const [first, ...rest] = steps(landed(0));
+    const { choose, onShown, rerender } = setup(first);
+    for (const next of rest) rerender(next);
     expect(choose).not.toHaveBeenCalled();
-  });
-
-  it("keeps a pick made before the session is known over a waiting landing's comparison", () => {
-    const link = landed();
-    const { choose, onShown, rerender } = setup({ visit: TYPED, landing: link, settled: false });
-    rerender({ visit: TYPED, landing: link, settled: false, shown: BRANCH, choices: 1 });
-    rerender({ visit: TYPED, landing: link, shown: BRANCH, choices: 1 });
-    expect(choose).not.toHaveBeenCalled();
-    expect(onShown).toHaveBeenCalledWith(BRANCH, { step: true });
-  });
-
-  it("keeps a pick that arrives with the session's readiness over a waiting landing's comparison", () => {
-    const link = landed();
-    const { choose, onShown, rerender } = setup({
-      visit: TYPED,
-      landing: link,
-      availability: "later",
-    });
-    rerender({ visit: TYPED, landing: link, availability: "now", shown: BRANCH, choices: 1 });
-    expect(choose).not.toHaveBeenCalled();
-    expect(onShown).toHaveBeenCalledWith(BRANCH, { step: true });
+    expect(onShown).toHaveBeenCalledWith(BRANCH, { step });
   });
 });

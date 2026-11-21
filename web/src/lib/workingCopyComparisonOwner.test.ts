@@ -783,6 +783,7 @@ describe("a typed base and head", () => {
 
   it("counts each comparison the person chooses, but not one another window types or a reload reads back", async () => {
     const test = harness({ route: REVISIONS });
+    expect(test.owner.choiceCount(SESSION)).toBe(0);
     test.typed.set(typedKey(SESSION), V1);
     test.owner.register(SESSION, consumer("surface"));
     await settle();
@@ -790,6 +791,7 @@ describe("a typed base and head", () => {
     test.owner.compareRevisions(SESSION, { base: "v2", head: "" });
     test.owner.chose(SESSION);
     expect(test.snapshot().choices).toBe(2);
+    expect(test.owner.choiceCount(SESSION)).toBe(2);
     test.typedElsewhere(SESSION, V1);
     await settle();
     expect([test.snapshot().custom, test.snapshot().choices]).toEqual([V1, 2]);

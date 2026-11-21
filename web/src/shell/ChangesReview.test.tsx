@@ -426,7 +426,7 @@ describe("ChangesReview", () => {
       requestedRange: { base: "v1.2", head: "Working Copy" },
       comparison: { kind: "typed", base: "v1.2", head: "" },
       onComparisonShown,
-      landing: { settled: false },
+      landing: { settled: false, choices: 0 },
     });
     expect(screen.queryByText(/Comparing “v1.2” with “Working Copy”/)).toBeNull();
     expect(data.choice.choose).toHaveBeenCalledWith({ kind: "typed", base: "v1.2", head: "" });
@@ -440,7 +440,7 @@ describe("ChangesReview", () => {
     const onComparisonShown = vi.fn();
     renderReview({
       comparison: { kind: "saved", intent: "branch-point" },
-      landing: { settled: false },
+      landing: { settled: false, choices: 0 },
       onComparisonShown,
     });
     expect(
@@ -463,7 +463,7 @@ describe("ChangesReview", () => {
     mocks.source.mockReturnValue(data);
     renderReview({
       comparison: { kind: "typed", base: "v1.2", head: "feature" },
-      landing: { settled: false },
+      landing: { settled: false, choices: 0 },
       onComparisonShown: vi.fn(),
     });
     expect(screen.getByText("Comparing “v1.2” with “feature”…")).toBeInTheDocument();

@@ -91,17 +91,20 @@ describe("opening", () => {
   });
 
   it("marks a fresh landing for each open and history step, and none for a click on a tab", async () => {
-    const { store } = makeStore();
+    let choices = 0;
+    const { store } = makeStore({ choiceCount: () => choices });
     expect(store.landing("P")).toBeUndefined();
     await store.open({ place: { kind: "pulls" } }, { opener: "user" });
     const opened = store.landing("P");
-    expect(opened).toEqual({ settled: false });
+    expect(opened).toEqual({ settled: false, choices: 0 });
     store.select("F");
     expect(store.landing("F")).toBeUndefined();
+    // Each landing keeps the session's choice count as it lands.
+    choices = 3;
     await store.go("back");
     expect(store.selectedTabId()).toBe("P");
     expect(store.landing("P")).not.toBe(opened);
-    expect(store.landing("P")).toEqual({ settled: false });
+    expect(store.landing("P")).toEqual({ settled: false, choices: 3 });
   });
 
   it("brings a Diffs tab forward without the comparison it showed before, for the session's own", async () => {
@@ -119,7 +122,7 @@ describe("opening", () => {
     );
     expect(store.selectedTab()).toMatchObject({ id: opened.ok && opened.tabId });
     expect(store.selectedTab()?.place).toEqual(diffFile);
-    expect(store.landing(store.selectedTabId()!)).toEqual({ settled: false });
+    expect(store.landing(store.selectedTabId()!)).toEqual({ settled: false, choices: 0 });
     expectInvariant(store);
   });
 

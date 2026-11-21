@@ -146,6 +146,8 @@ export interface WorkspaceTabsStoreOptions {
   newTabId?: () => TabId;
   newViewKey?: () => string;
   newDraftKey?: () => string;
+  /** How many comparisons the person has chosen for the session, stamped on each landing. */
+  choiceCount?: () => number;
 }
 
 /** A line, column or comment move inside the same file, which history records in place. */
@@ -184,6 +186,8 @@ export type WorkspaceTabsStore = ReturnType<typeof createWorkspaceTabsStore>;
 /** A tab's landing on a visit; its view marks it `settled` once it showed what the visit asks. */
 export interface TabLanding {
   settled: boolean;
+  /** The session's choice count as it landed; a pick since is newer than the visit. */
+  choices: number;
 }
 
 export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
@@ -199,12 +203,13 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
     newTabId = () => randomUUID(),
     newViewKey = () => randomUUID(),
     newDraftKey = newPendingSideChatId,
+    choiceCount = () => 0,
   } = options;
 
   let tabs: WorkspaceTabRecord[] = withPinnedFirst([...options.initial.tabs]);
   // Each tab's latest landing on a visit by a step, a link or an open, which its view settles once.
   const landings = new Map<TabId, TabLanding>();
-  const land = (tabId: TabId) => landings.set(tabId, { settled: false });
+  const land = (tabId: TabId) => landings.set(tabId, { settled: false, choices: choiceCount() });
   let selectedTabId: TabId | null = options.initial.selectedTabId;
   let closed: ClosedTab[] = [...options.initial.closed];
   let revision = 0;

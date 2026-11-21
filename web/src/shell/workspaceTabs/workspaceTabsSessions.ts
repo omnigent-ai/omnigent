@@ -10,6 +10,7 @@ import { toast } from "sonner";
 import type { FilePosition } from "@/shell/FileViewerContext";
 import { citedFilePosition } from "@/shell/filePositionState";
 import { reviewMembership, settledShownReview } from "@/lib/reviewFileLinks";
+import { workingCopyComparisons } from "@/lib/workingCopyComparisons";
 
 import { type OpenOptions, samePlace } from "./planOpen";
 import { pullRequestTabPlace } from "./pullRequestSubpage";
@@ -109,6 +110,7 @@ function createSession(sessionId: string): WorkspaceTabsSession {
     isTabDirty: (tabId) => guards.has(tabId),
     onSaveFailed: () => toast.error(SAVE_FAILED_MESSAGE),
     newTabId,
+    choiceCount: () => workingCopyComparisons().choiceCount(sessionId),
   });
   const currentPlace = (tabId: TabId) => {
     const tab = store.findTab(tabId);

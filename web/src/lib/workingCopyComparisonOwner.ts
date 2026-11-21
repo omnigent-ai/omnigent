@@ -230,6 +230,11 @@ export class WorkingCopyComparisonOwner {
     return this.session(sessionId).snapshot;
   }
 
+  /** How many comparisons the person has chosen for the session, read without tracking it. */
+  choiceCount(sessionId: string): number {
+    return this.sessions.get(sessionId)?.snapshot.choices ?? 0;
+  }
+
   // ── Actions ───────────────────────────────────────────────────────────────
 
   /** The session's files may have changed: list again once the current list ends. */
