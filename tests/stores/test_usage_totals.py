@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -469,3 +470,68 @@ async def test_usage_landing_mid_deletion_never_skews_the_totals(
     assert raced
     _assert_usage_equal(_tree_totals(conversation_store, root.id), _turn(100, 1.0))
     _assert_usage_equal(projects.get_usage(project_id, user_id=_OWNER), _turn(100, 1.0))
+
+
+def test_whole_tree_deletion_waits_for_a_child_usage_write(
+    conversation_store: SqlAlchemyConversationStore, projects: SqlAlchemyProjectStore
+) -> None:
+    """A child's usage write and its tree's deletion lock rows in one order, so neither fails.
+
+    The writer pauses holding the child's row until the deletion's metadata
+    cleanup has started; on engines with row locks the cleanup then waits for it.
+    """
+    import asyncio
+    import threading
+
+    project_id = _project(projects, "Factory")
+    root = conversation_store.create_conversation(project_id=project_id)
+    child = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=root.id
+    )
+    conversation_store.increment_session_usage(root.id, _turn(100, 1.0))
+    conversation_store.increment_session_usage(child.id, _turn(10, 0.5))
+    writer_holds_child = threading.Event()
+    cleanup_started = threading.Event()
+    errors: list[BaseException] = []
+    lock_tree = conversation_store._lock_tree_usage_totals
+    remove_deleted = conversation_store._remove_deleted_usage
+
+    def paused_lock_tree(session: Any, root_id: Any) -> Any:
+        if threading.current_thread().name == "usage-writer":
+            writer_holds_child.set()
+            # SQLite serializes the two transactions, so the cleanup never starts here.
+            if cleanup_started.wait(timeout=2):
+                time.sleep(0.5)
+        return lock_tree(session, root_id)
+
+    def signalling_remove_deleted(*args: Any, **kwargs: Any) -> Any:
+        cleanup_started.set()
+        return remove_deleted(*args, **kwargs)
+
+    def run(target: Any) -> None:
+        try:
+            target()
+        except BaseException as error:  # Surfaced by the assertion below.
+            errors.append(error)
+
+    conversation_store._lock_tree_usage_totals = paused_lock_tree  # type: ignore[method-assign]
+    conversation_store._remove_deleted_usage = signalling_remove_deleted  # type: ignore[method-assign]
+    writer = threading.Thread(
+        name="usage-writer",
+        target=run,
+        args=(lambda: conversation_store.increment_session_usage(child.id, _turn(1, 2.0)),),
+    )
+    writer.start()
+    assert writer_holds_child.wait(timeout=10)
+    deleter = threading.Thread(
+        target=run, args=(lambda: asyncio.run(conversation_store.delete_conversation(root.id)),)
+    )
+    deleter.start()
+    writer.join(timeout=60)
+    deleter.join(timeout=60)
+
+    assert not writer.is_alive() and not deleter.is_alive()
+    assert errors == []
+    totals = projects.get_usage(project_id, user_id=_OWNER)
+    assert "total_cost_usd" not in totals
+    assert totals.get("input_tokens", 0) == 0

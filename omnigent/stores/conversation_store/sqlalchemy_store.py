@@ -2167,6 +2167,20 @@ class SqlAlchemyConversationStore(ConversationStore):
         if whole_tree:
             if root_id not in batch_ids:
                 return
+            others = [member_id for member_id in batch_ids if member_id != root_id]
+            if others and self._meta_supports_for_update:
+                # The batch's other rows lock before their top-level row, as
+                # usage writers lock them; the batch's DELETE would otherwise
+                # take them while this transaction holds the top-level row.
+                session.execute(
+                    select(SqlConversationMetadata.id)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.id.in_(others),
+                    )
+                    .order_by(SqlConversationMetadata.id)
+                    .with_for_update()
+                ).all()
             tree = self._lock_tree_usage_totals(session, root_id)
             if tree is None:
                 return
@@ -2185,9 +2199,13 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             return
         # The batch's own rows lock before their tree's top-level row.
-        stmt = select(SqlConversationMetadata.session_usage).where(
-            SqlConversationMetadata.workspace_id == current_workspace_id(),
-            SqlConversationMetadata.id.in_(batch_ids),
+        stmt = (
+            select(SqlConversationMetadata.session_usage)
+            .where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.id.in_(batch_ids),
+            )
+            .order_by(SqlConversationMetadata.id)
         )
         if self._meta_supports_for_update:
             stmt = stmt.with_for_update()

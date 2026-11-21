@@ -161,6 +161,8 @@ describe("ProjectHomeTitle", () => {
       </MemoryRouter>,
     );
     expect(screen.getByRole("heading", { name: "Payments" })).toHaveClass("sr-only");
+    // Phones show no project cost, so they never poll for it.
+    expect(mocks.usageProjectIds).toEqual([]);
     expect(screen.getByRole("banner").querySelectorAll("button")).toHaveLength(0);
     const actions = screen.getByRole("navigation", { name: "Header actions" });
     expect(

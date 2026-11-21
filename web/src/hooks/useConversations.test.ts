@@ -31,6 +31,8 @@ import {
   useProjects,
   useProjectConfig,
   useProjectSessions,
+  useProjectUsage,
+  PROJECT_USAGE_REFETCH_INTERVAL_MS,
   useRenameProject,
   useUpdateProjectConfig,
   useMoveToProject,
@@ -2899,6 +2901,59 @@ describe("useProjectConfig", () => {
       createElement(QueryClientProvider, { client: queryClient }, children);
     const { result } = renderHook(() => useProjectConfig("p_1"), { wrapper });
     await waitFor(() => expect(result.current.isError).toBe(true));
+  });
+});
+
+describe("useProjectUsage", () => {
+  function usageWrapper() {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    return ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+  }
+
+  it("does not fetch for a label-only folder (null id)", () => {
+    renderHook(() => useProjectUsage(null), { wrapper: usageWrapper() });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("re-reads the project's usage each refresh interval", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      fetchMock.mockResolvedValue(mockResponse({ project_id: "p_1", total_cost_usd: 1.5 }));
+      const { result } = renderHook(() => useProjectUsage("p_1"), { wrapper: usageWrapper() });
+      await waitFor(() => expect(result.current.data?.total_cost_usd).toBe(1.5));
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(String(fetchMock.mock.calls[0]?.[0])).toContain("/v1/projects/p_1/usage");
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(PROJECT_USAGE_REFETCH_INTERVAL_MS + 50);
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops asking a server that has no usage endpoint", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      fetchMock.mockResolvedValue(
+        mockResponse(
+          { error: { code: "not_found", message: "Not found." } },
+          { ok: false, status: 404 },
+        ),
+      );
+      const { result } = renderHook(() => useProjectUsage("p_1"), { wrapper: usageWrapper() });
+      await waitFor(() => expect(result.current.isError).toBe(true));
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(PROJECT_USAGE_REFETCH_INTERVAL_MS * 3);
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
