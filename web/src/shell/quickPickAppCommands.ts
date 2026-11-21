@@ -10,6 +10,7 @@ import { openFindFromCommand, useCanOpenFindFromCommand } from "@/lib/findRoutin
 import { AVAILABLE, HIDDEN, type PaletteCommand } from "@/store/paletteCommands";
 import { openThemePicker, SELECT_THEME_COMMAND } from "@/store/themePicker";
 
+import { useSessionNavigationCommands } from "./sessionNavigationCommands";
 import { useSettingsCommands } from "./settingsCommands";
 
 /** The picker ⌘K continues as for Go to Session…, which takes the palette's return target. */
@@ -25,6 +26,7 @@ export function useQuickPickAppCommands({
 }: QuickPickAppCommandOptions = {}): PaletteCommand[] {
   const canOpenFind = useCanOpenFindFromCommand();
   const settingsCommands = useSettingsCommands();
+  const sessionNavigationCommands = useSessionNavigationCommands();
   return useMemo<PaletteCommand[]>(
     () => [
       ...(onGoToSession
@@ -70,8 +72,9 @@ export function useQuickPickAppCommands({
         movesFocus: true,
         run: openThemePicker,
       },
+      ...sessionNavigationCommands,
       ...settingsCommands,
     ],
-    [canOpenFind, onGoToSession, settingsCommands],
+    [canOpenFind, onGoToSession, sessionNavigationCommands, settingsCommands],
   );
 }
