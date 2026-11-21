@@ -180,11 +180,10 @@ async def test_a_run_is_titled_for_its_workflow_until_someone_renames_it(
             assert sent.status_code == 202, sent.text
         return session_id
 
-    # The Workflows page names the workflow; an agent's run may ask in its own words.
+    # The Workflows page passes workflow_id, as does an agent's sys_session_create.
     page_run = await create(
         f"Use the workflow skill to run the saved workflow {opening}", workflow_id=workflow["id"]
     )
-    agent_run = await create("Run it with the workflow skill.", workflow_id=workflow["id"])
     # The composer's workflow picker sends only the workflow skill's message.
     picked_run = await create(f"/workflow Run the saved workflow {opening}\n\nThe upload tests")
     named_run = await create(workflow_id=workflow["id"], title="Hotfix release")
@@ -199,8 +198,7 @@ async def test_a_run_is_titled_for_its_workflow_until_someone_renames_it(
         assert conversation is not None
         return conversation.title
 
-    assert [title(run) for run in (page_run, agent_run, picked_run, named_run, echoed_run)] == [
-        "Blah borgus",
+    assert [title(run) for run in (page_run, picked_run, named_run, echoed_run)] == [
         "Blah borgus",
         "Blah borgus",
         "Hotfix release",

@@ -204,6 +204,16 @@ async def test_saved_workflow_runs_keep_the_workflow_name_title(
     [
         (f"/workflow {_WORKFLOW_RUN}", "Blah borgus"),
         (f'/workflow Run the saved workflow "{"n" * 80}" (ID {"0" * 32}).', "n" * 80),
+        (f'/workflow Run the saved workflow "{"n" * 81}" (ID {"0" * 32}).', None),
+        # Names are literal, not message markup.
+        (
+            f'/workflow Run the saved workflow "[Attached: report.txt]" (ID {"0" * 32}).',
+            "[Attached: report.txt]",
+        ),
+        (
+            f'/workflow Run the saved workflow "[Attached: /tmp/r.txt]" (ID {"0" * 32}).',
+            "[Attached: /tmp/r.txt]",
+        ),
         (f"Please /workflow {_WORKFLOW_RUN}", None),
         (f"/workflow {_WORKFLOW_RUN} Then stop.", None),
     ],

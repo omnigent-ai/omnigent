@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING, Any
 from omnigent.entities.conversation import (
     DEFAULT_GENERATED_TITLE_MAX_CHARS,
     USER_SESSION_TITLE_MAX_CHARS,
-    synthesize_conversation_title,
 )
 from omnigent.entities.workflow import WORKFLOW_NAME_MAX_CHARS
 from omnigent.harness_aliases import canonicalize_harness
@@ -595,7 +594,8 @@ def saved_workflow_run_title(content: list[dict[str, Any]]) -> str | None:
 
     :param content: The message's content blocks, e.g.
         ``[{"type": "input_text", "text": '/workflow Run the saved workflow "Release" (ID …).'}]``.
-    :returns: The workflow's name, e.g. ``"Release"``, or ``None`` for any other message.
+    :returns: The workflow's name, e.g. ``"Release"``, or ``None`` for any other message
+        or a name no saved workflow could have.
     """
     text = next(
         (
@@ -605,12 +605,9 @@ def saved_workflow_run_title(content: list[dict[str, Any]]) -> str | None:
         ),
         "",
     )
-    name = saved_workflow_run_name(text)
-    if name is None:
-        return None
-    return synthesize_conversation_title(
-        [{"type": "input_text", "text": name}], limit=WORKFLOW_NAME_MAX_CHARS
-    )
+    # Saved names are one whitespace-collapsed line, kept literally, so read it the same way.
+    name = " ".join((saved_workflow_run_name(text) or "").split())
+    return name if 0 < len(name) <= WORKFLOW_NAME_MAX_CHARS else None
 
 
 def _title_content_from_event(event: SessionEventInput, prompt: str) -> list[dict[str, Any]]:
