@@ -123,7 +123,12 @@ def test_open_cost_with_a_pending_sub_agent_prompt_does_not_grow_with_the_tree(
 ) -> None:
     with (
         OtlpTraceCollector() as collector,
-        isolated_local_server(tmp_path / "server", env=collector.exporter_env()) as base_url,
+        isolated_local_server(
+            tmp_path / "server",
+            # Read the session's grants on every request: the 5 s access cache
+            # could expire inside one measured open and not the other.
+            env={**collector.exporter_env(), "OMNIGENT_ACL_RESOLVE_CACHE_TTL_S": "0"},
+        ) as base_url,
         httpx.Client(base_url=base_url, trust_env=False, timeout=60) as client,
     ):
         root = create_native_session(
