@@ -340,6 +340,9 @@ def git_session(built_spa: None, tmp_path: Path) -> Iterator[tuple[str, str]]:
     origin = tmp_path / "origin.git"
     subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
     subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repository, check=True)
+    # Otherwise the host's untracked-cache probe briefly writes mtime-test-*/ files into the
+    # repository, and a listing that lands then shows a file that's gone when its diff loads.
+    subprocess.run(["git", "config", "core.untrackedCache", "true"], cwd=repository, check=True)
     _commit(repository, "base.txt", "Add the base")
     subprocess.run(["git", "tag", "v1.0"], cwd=repository, check=True)
     # All branch changes compares with the merge base of origin's default branch.
