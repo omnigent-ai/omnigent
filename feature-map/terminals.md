@@ -91,7 +91,10 @@ with their own terminal retain the switcher.
   or a New tab to start one. A shell tab that can't show its terminal yet says why:
   **Resume session** appears when the session isn't running, for anyone who can edit it
   (a viewer is told to ask an editor), and **Try Again** appears when the shell list
-  can't be read or doesn't show the shell within 20 seconds.
+  can't be read or doesn't show the shell within 20 seconds. While the session's sandbox
+  is asleep or failed to wake, the tab shows the same sandbox notice as the other
+  workspace panes, with **Resume sandbox**, or **Retry** after a failed wake, for those
+  who may resume it.
 
 **After the session moves:** open the host badge, choose "Switch host…", pick
 another host or a new sandbox, then look at both the terminal strip and the

@@ -16,7 +16,7 @@ import { registeredPaletteCommands } from "@/test/paletteCommands";
 
 import type { WorkspacePlaceViewProps } from "./placeViews/WorkspacePlaceView";
 import { SHELL_LIST_LIMIT_MS } from "./terminalTabConnection";
-import { OWNER_RECONNECT_HINT } from "./TerminalTabStatus";
+import { OWNER_RECONNECT_HINT, VIEWER_RESUME_HINT } from "./TerminalTabStatus";
 import { resetSessionResumes } from "./useTerminalTabConnection";
 import { WorkspaceTabsPanel, type WorkspaceTabsPanelProps } from "./WorkspaceTabsPanel";
 import {
@@ -774,39 +774,59 @@ describe("a shell's tab", () => {
     },
   );
 
-  it("resumes a session that isn't running from its shell tab, once while it's on its way", async () => {
-    const { useTerminals } = await import("@/hooks/useTerminals");
-    const { retrySession } = await import("@/lib/sessionsApi");
-    vi.mocked(useTerminals).mockReturnValue({
-      terminals: [],
-      isLoading: true,
-      error: null,
-      listCompleteAt: 0,
-    } as unknown as ReturnType<typeof useTerminals>);
-    let answer: () => void = () => {};
-    vi.mocked(retrySession).mockImplementationOnce(
-      () =>
-        new Promise((resolve) => {
-          answer = () => resolve({} as never);
-        }),
-    );
-    renderPanels([
-      {
-        conversationId: "s-shell-asleep",
-        terminalKeys: ["terminal:term_1"],
-        liveness: { kind: "runner_asleep" },
-      },
-    ]);
-    const { store } = workspaceTabsSession("s-shell-asleep");
-    await act(async () => {
-      await store.open({ place: { kind: "terminal", key: "terminal:term_1" } }, { opener: "user" });
-    });
-    const resume = await screen.findByRole("button", { name: "Resume session" });
-    await userEvent.click(resume);
-    await userEvent.click(resume);
-    expect(retrySession).toHaveBeenCalledTimes(1);
-    expect(retrySession).toHaveBeenCalledWith("s-shell-asleep");
-    await act(async () => answer());
-    await waitFor(() => expect(resume).not.toBeDisabled());
-  });
+  it.each([
+    [LEVEL_READ, "a viewer"],
+    [LEVEL_EDIT, "an editor"],
+    [LEVEL_OWNER, "the owner"],
+  ])(
+    "lets someone who can edit resume a session that isn't running from its shell tab, once while it's on its way (%i, %s)",
+    async (permissionLevel) => {
+      const { useTerminals } = await import("@/hooks/useTerminals");
+      const { retrySession } = await import("@/lib/sessionsApi");
+      vi.mocked(retrySession).mockReset();
+      vi.mocked(useTerminals).mockReturnValue({
+        terminals: [],
+        isLoading: true,
+        error: null,
+        listCompleteAt: 0,
+      } as unknown as ReturnType<typeof useTerminals>);
+      let answer: () => void = () => {};
+      vi.mocked(retrySession).mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            answer = () => resolve({} as never);
+          }),
+      );
+      const conversationId = `s-shell-asleep-${permissionLevel}`;
+      renderPanels([
+        {
+          conversationId,
+          terminalKeys: ["terminal:term_1"],
+          liveness: { kind: "runner_asleep" },
+          permissionLevel,
+        },
+      ]);
+      const { store } = workspaceTabsSession(conversationId);
+      await act(async () => {
+        await store.open(
+          { place: { kind: "terminal", key: "terminal:term_1" } },
+          { opener: "user" },
+        );
+      });
+      const status = await screen.findByTestId("terminal-tab-status");
+      if (permissionLevel === LEVEL_READ) {
+        expect(status).toHaveTextContent(VIEWER_RESUME_HINT);
+        expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
+        expect(retrySession).not.toHaveBeenCalled();
+        return;
+      }
+      const resume = screen.getByRole("button", { name: "Resume session" });
+      await userEvent.click(resume);
+      await userEvent.click(resume);
+      expect(retrySession).toHaveBeenCalledTimes(1);
+      expect(retrySession).toHaveBeenCalledWith(conversationId);
+      await act(async () => answer());
+      await waitFor(() => expect(resume).not.toBeDisabled());
+    },
+  );
 });

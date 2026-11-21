@@ -6,6 +6,7 @@ import { useCallback, useEffect, useLayoutEffect, useState, useSyncExternalStore
 import { toast } from "sonner";
 
 import type { SandboxResumeNoticeState } from "@/components/SandboxResumeNotice";
+import { refreshRunnerHealth } from "@/hooks/useRunnerHealth";
 import { useSandboxResume } from "@/hooks/useSandboxResume";
 import { useSession } from "@/hooks/useSession";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
@@ -18,6 +19,7 @@ import { resumeSandboxAvailability } from "@/shell/resumeSandboxAvailability";
 
 import type { ShellWaits } from "./shellWaits";
 import {
+  TERMINAL_TAB_WAIT_LIMIT_MS,
   type TerminalTabConnection,
   type TerminalTabInputs,
   terminalTabConnection,
@@ -146,8 +148,10 @@ export function useTerminalTabConnections(
     }
     if (!endResume(sessionId, attempt)) return;
     if (outcome.ok) {
-      // The runner may take a while to start: its wait counts from when it was asked.
+      // The runner may take a while to start: its wait counts from when it was asked, and its
+      // health is read again now rather than at the next poll.
       restart();
+      refreshRunnerHealth();
     } else {
       const { error } = outcome;
       toast.error(error instanceof Error ? error.message : "Couldn't resume the session.");
@@ -160,7 +164,11 @@ export function useTerminalTabConnections(
     setNow(Date.now());
   }, [shellWaits, waitingSignature]);
 
-  const anyWaiting = waiting.length > 0;
+  // The clock ticks only until the last wait runs out; Try Again or Resume starts it again.
+  const anyWaiting = waiting.some(([key, wait]) => {
+    const since = shellWaits.since(key);
+    return since === undefined || now - since < TERMINAL_TAB_WAIT_LIMIT_MS[wait];
+  });
   useEffect(() => {
     if (!anyWaiting) return;
     const timer = window.setInterval(() => setNow(Date.now()), TICK_MS);

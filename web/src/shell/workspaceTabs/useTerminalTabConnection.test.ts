@@ -4,6 +4,8 @@ import { createElement, type ReactNode } from "react";
 import { toast } from "sonner";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import type * as UseRunnerHealthModule from "@/hooks/useRunnerHealth";
+import { refreshRunnerHealth } from "@/hooks/useRunnerHealth";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
 import { fetchTerminals, TERMINAL_LIST_TIMEOUT_MS } from "@/hooks/useTerminals";
 import { retrySession } from "@/lib/sessionsApi";
@@ -34,6 +36,10 @@ vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
   retrySession: vi.fn(),
 }));
 vi.mock("sonner", () => ({ toast: { error: vi.fn() } }));
+vi.mock("@/hooks/useRunnerHealth", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseRunnerHealthModule>()),
+  refreshRunnerHealth: vi.fn(),
+}));
 
 describe("Resume session from a shell tab", () => {
   const client = new QueryClient();
@@ -65,6 +71,7 @@ describe("Resume session from a shell tab", () => {
     vi.useRealTimers();
     vi.mocked(retrySession).mockReset();
     vi.mocked(toast.error).mockReset();
+    vi.mocked(refreshRunnerHealth).mockReset();
     resetSessionResumes();
   });
 
@@ -138,9 +145,49 @@ describe("Resume session from a shell tab", () => {
     act(() => void second.result.current.resumeSession());
     expect(retrySession).toHaveBeenCalledTimes(1);
 
+    // Once the server has started the runner, its health is read again now, not at the next poll.
+    expect(refreshRunnerHealth).not.toHaveBeenCalled();
     await act(async () => held.resolve());
     expect(second.result.current.resumingSession).toBe(false);
     expect(toast.error).not.toHaveBeenCalled();
+    expect(refreshRunnerHealth).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("a shell tab's clock", () => {
+  it("stops ticking once the last wait has run out, and starts again on Try Again", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    try {
+      const client = new QueryClient();
+      const shellWaits = createShellWaits();
+      let renders = 0;
+      const { result } = renderHook(
+        () => {
+          renders += 1;
+          return useTerminalTabConnections("s-tick", shellWaits, {
+            liveness: "online",
+            listFailed: false,
+            shells: [{ key: "terminal:t1", inventory: "unknown" }],
+          });
+        },
+        { wrapper: ({ children }) => createElement(QueryClientProvider, { client }, children) },
+      );
+      const shell = { key: "terminal:t1", inventory: "unknown" } as const;
+      await act(async () => vi.advanceTimersByTime(SHELL_LIST_LIMIT_MS + 1_000));
+      expect(result.current.connectionOf(shell).kind).toBe("unreachable");
+      const settled = renders;
+      await act(async () => vi.advanceTimersByTime(10_000));
+      expect(renders).toBe(settled);
+
+      act(() => result.current.tryAgain());
+      expect(result.current.connectionOf(shell).kind).toBe("connecting");
+      const restarted = renders;
+      await act(async () => vi.advanceTimersByTime(3_000));
+      expect(renders).toBeGreaterThan(restarted);
+      client.clear();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
