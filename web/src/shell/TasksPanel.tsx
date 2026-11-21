@@ -245,7 +245,7 @@ function stepDetail(item: StepProgress, failedNames: readonly string[] = []): Re
       );
     case "stopped":
       if (!item.status) return item.activeForm;
-      return [stepStatusLabel("started", item.status.created_at, false), text]
+      return [stepStatusLabel("started", item.startedAt ?? item.status.created_at, false), text]
         .filter(Boolean)
         .join(" · ");
     default:
@@ -660,7 +660,7 @@ function statusLine(
       );
     case "stopped":
       return status
-        ? `Stopped · ${stepStatusLabel("started", status.created_at, false).toLowerCase()}`
+        ? `Stopped · ${stepStatusLabel("started", startedAt ?? status.created_at, false).toLowerCase()}`
         : "Stopped";
     case "done":
       return ended ? `Done · ${ended}` : "Done";

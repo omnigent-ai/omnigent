@@ -14,7 +14,7 @@ import { useSavedWorkflows } from "@/hooks/useSavedWorkflows";
 import { type SessionJournalView, useSessionJournal } from "@/hooks/useSessionJournal";
 import { useOptionalLoadedConversations } from "@/hooks/useSidebarData";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { formatMessageTimestamp } from "@/lib/relativeTime";
+import { absoluteTime, formatMessageTimestamp } from "@/lib/relativeTime";
 import type { JournalEntry, StepProgress } from "@/lib/sessionJournal";
 import type { ConversationState } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
@@ -1012,6 +1012,63 @@ describe("TasksPanel", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  describe("a task whose start the agent restates with each push", () => {
+    // The newest start is 32m 6s old; the first, 4h 7m.
+    const at = (seconds: number) => 1_762_534_860 + seconds;
+    const now = at(14_840);
+    const starts = [0, 4_534, 4_982, 6_440, 7_924, 11_124, 12_914].map((seconds, index) =>
+      journalEntry(index + 1, {
+        kind: "status",
+        step: "ci",
+        created_at: at(seconds),
+        content: { status: "started", text: `Pushed fix ${index + 1}` },
+      }),
+    );
+    beforeEach(() => {
+      vi.useFakeTimers();
+      vi.setSystemTime(now * 1000);
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("counts its time from the first start while it runs", () => {
+      showJournal([journalPlan(0, ["ci"]), ...starts]);
+      setSession({ sessionStatus: "running" });
+      renderPanel();
+      const elapsed = within(screen.getByTestId("tasks-row")).getByTitle(/^Started/);
+      expect([elapsed.textContent, elapsed.title]).toEqual([
+        "4h 7m",
+        `Started ${absoluteTime(at(0) * 1000)}`,
+      ]);
+    });
+
+    it("says it started at the first start once it stops", () => {
+      showJournal([journalPlan(0, ["ci"]), ...starts]);
+      renderPanel();
+      const row = screen.getByTestId("tasks-row");
+      expect(row).toHaveAttribute("data-state", "stopped");
+      expect(row).toHaveTextContent("Started 4h ago · Pushed fix 7");
+    });
+
+    it("spans its finished time from the first start", () => {
+      const done = journalEntry(starts.length + 1, {
+        kind: "status",
+        step: "ci",
+        created_at: now,
+        content: { status: "done", text: "CI is green" },
+      });
+      showJournal([journalPlan(0, ["ci"]), ...starts, done]);
+      renderPanel();
+      const clock = (seconds: number) =>
+        new Date(seconds * 1000).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+      const ended = within(screen.getByTestId("tasks-row")).getByText(
+        formatMessageTimestamp(done.created_at),
+      );
+      expect(ended).toHaveAttribute("title", `${clock(at(0))} – ${clock(now)}`);
+    });
   });
 
   it("keeps Stop available while background work runs after the main turn ends", () => {
