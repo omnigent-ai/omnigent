@@ -23,18 +23,27 @@ final class MockHTTPServer {
   private var listenFD: Int32 = -1
   private var source: DispatchSourceRead?
   private let queue = DispatchQueue(label: "omnigent.mock-http-server")
+  private let connectionQueue: DispatchQueue?
 
   /// - Parameter handler: Receives `(HTTPMethod, path)` and returns
   ///   `(statusCode, headerField -> value, body)`. Header names are lowercased
   ///   on the way out.
   init(handler: @escaping (String, String) -> (Int, [String: String], Data)) throws {
     self.handler = { handler($0.method, $0.path) }
+    connectionQueue = nil
     try start()
   }
 
   /// - Parameter requestHandler: Like `handler`, but also receives headers and the body.
-  init(requestHandler: @escaping (Request) -> (Int, [String: String], Data)) throws {
+  /// - Parameter concurrentConnections: Allows responses to finish out of order; synchronize handler state.
+  init(
+    concurrentConnections: Bool = false,
+    requestHandler: @escaping (Request) -> (Int, [String: String], Data)
+  ) throws {
     self.handler = requestHandler
+    connectionQueue =
+      concurrentConnections
+      ? DispatchQueue(label: "omnigent.mock-http-connections", attributes: .concurrent) : nil
     try start()
   }
 
@@ -86,7 +95,11 @@ final class MockHTTPServer {
     while true {
       let conn = accept(listenFD, nil, nil)
       if conn < 0 { break }
-      handleConnection(conn)
+      if let connectionQueue {
+        connectionQueue.async { self.handleConnection(conn) }
+      } else {
+        handleConnection(conn)
+      }
     }
   }
 

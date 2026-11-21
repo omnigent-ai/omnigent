@@ -117,7 +117,9 @@ final class WatchCompanionTests: XCTestCase {
         cookieStore: olderCookies))
     let newer = try XCTUnwrap(
       bridge.sync(
-        serverURL: URL(string: "https://new.example.com"), workspaceID: "2", cookieName: "new",
+        serverURL: URL(string: "https://entered.example.com/omnigent"),
+        workspacePageURL: URL(string: "https://new.example.com/omnigent/c/ignored"),
+        workspaceID: "2", cookieName: "new",
         cookieStore: newerCookies))
     newerCookies.cookies.continuation.yield([
       cookie("new", domain: "new.example.com", path: "/"),
@@ -128,7 +130,7 @@ final class WatchCompanionTests: XCTestCase {
     await older.value
     let data = try XCTUnwrap(bridge.latest?[WatchCredentials.contextKey] as? Data)
     let latest = try JSONDecoder().decode(WatchCredentials.self, from: data)
-    XCTAssertEqual(latest.apiURL.absoluteString, "https://new.example.com/v1?o=2")
+    XCTAssertEqual(latest.apiURL.absoluteString, "https://new.example.com/omnigent/v1?o=2")
     XCTAssertEqual(latest.cookie, "new=1")
     transport.activationState = .activated
     bridge.flush(now: now)
@@ -225,6 +227,145 @@ final class WatchCompanionTests: XCTestCase {
       XCTAssertNil(conversation.error, "resolvedElsewhere: \(resolvedElsewhere)")
       XCTAssertTrue(conversation.approvals.isEmpty)
     }
+
+    for nativeFromStart in [false, true] {
+      var submitted = false
+      var confirmed = false
+      var readsAfterSubmit = 0
+      let server = try MockHTTPServer(requestHandler: { request in
+        let url = URLComponents(string: request.path)
+        switch (request.method, url?.path) {
+        case ("GET", "/v1/sessions/s1"):
+          var params: [String: Any] = ["message": "Run it?"]
+          if submitted || nativeFromStart {
+            let state = submitted ? (readsAfterSubmit == 0 ? "sending" : "unconfirmed") : "ready"
+            params["native_delivery"] = ["state": state, "attempt": "a1"]
+          }
+          if submitted
+            && url?.queryItems?.contains(where: { $0.name == "include_live_status" }) != true
+          {
+            readsAfterSubmit += 1
+          }
+          let pending: [[String: Any]] =
+            confirmed ? [] : [["elicitation_id": "e1", "params": params]]
+          return (
+            200, [:], try! JSONSerialization.data(withJSONObject: ["pending_elicitations": pending])
+          )
+        case ("GET", "/v1/sessions/s1/items"):
+          return (200, [:], Data(#"{"data":[]}"#.utf8))
+        case ("POST", "/v1/sessions/s1/elicitations/e1/resolve"):
+          XCTAssertFalse(submitted, "Native-delivery retries must be handled on the phone")
+          submitted = true
+          return (202, [:], Data())
+        case ("POST", "/v1/sessions/s1/events"):
+          confirmed = true
+          return (202, [:], Data())
+        default:
+          XCTFail("Unexpected watch request: \(request.method) \(request.path)")
+          return (404, [:], Data())
+        }
+      })
+      let client = WatchClient(
+        credentials: WatchCredentials(
+          apiURL: URL(string: "http://127.0.0.1:\(server.port)/v1")!, cookie: "session=test"))
+      let session = try WatchClient.decoder.decode(
+        WatchSession.self, from: Data(#"{"id":"s1","status":"running"}"#.utf8))
+      let conversation = WatchConversation(session: session, client: client)
+      await conversation.load()
+      let approval = try XCTUnwrap(conversation.approvals.first)
+      XCTAssertEqual(approval.isBinary, !nativeFromStart)
+      await conversation.resolve(approval, accept: true)
+      if nativeFromStart {
+        XCTAssertEqual(conversation.approvals.map(\.id), ["e1"])
+        try await client.post(
+          "sessions/s1/elicitations/e1/resolve", ["action": "accept"], host: nil)
+        await conversation.load()
+      }
+      for _ in 0..<2 {
+        let waiting = try XCTUnwrap(conversation.approvals.first)
+        XCTAssertEqual(waiting.id, "e1")
+        XCTAssertFalse(
+          waiting.isBinary, "Unconfirmed delivery must remain visible with phone-only handling")
+        await conversation.resolve(waiting, accept: false)
+        await conversation.load()
+      }
+      try await client.post(
+        "sessions/s1/events",
+        ["type": "external_elicitation_resolved", "data": ["elicitation_id": "e1"]], host: nil)
+      await conversation.load()
+      XCTAssertNil(conversation.error)
+      XCTAssertTrue(conversation.approvals.isEmpty)
+    }
+  }
+
+  @MainActor func testOnlyNewestConversationLoadCanPublishResults() async throws {
+    for olderFails in [false, true] {
+      let olderRequests = expectation(description: "older snapshot and items are waiting")
+      olderRequests.expectedFulfillmentCount = 2
+      let releaseOlder = DispatchSemaphore(value: 0)
+      defer {
+        releaseOlder.signal()
+        releaseOlder.signal()
+      }
+      let lock = NSLock()
+      var reads: [String: Int] = [:]
+      let server = try MockHTTPServer(
+        concurrentConnections: true,
+        requestHandler: { request in
+          let url = URLComponents(string: request.path)
+          if url?.queryItems?.contains(where: { $0.name == "include_live_status" }) == true {
+            return (200, [:], Data("{}".utf8))
+          }
+          let path = url?.path ?? ""
+          let isItems = path == "/v1/sessions/s1/items"
+          XCTAssertTrue(isItems || path == "/v1/sessions/s1")
+          let older = lock.withLock {
+            reads[path, default: 0] += 1
+            return reads[path] == 1
+          }
+          if older {
+            olderRequests.fulfill()
+            XCTAssertEqual(releaseOlder.wait(timeout: .now() + 10), .success)
+          }
+          let id = older ? "older" : "newer"
+          if isItems {
+            return (
+              200, [:],
+              Data(
+                "{\"data\":[{\"id\":\"\(id)\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"text\":\"\(id)\"}]}]}"
+                  .utf8)
+            )
+          }
+          if older && olderFails { return (500, [:], Data()) }
+          let status = older ? "failed" : "idle"
+          return (
+            200, [:],
+            Data(
+              "{\"status\":\"\(status)\",\"last_task_error\":{\"message\":\"old failure\"},\"pending_elicitations\":[{\"elicitation_id\":\"\(id)\",\"params\":{\"message\":\"Run it?\"}}]}"
+                .utf8)
+          )
+        })
+      let session = try WatchClient.decoder.decode(
+        WatchSession.self, from: Data(#"{"id":"s1","status":"running"}"#.utf8))
+      let conversation = WatchConversation(
+        session: session,
+        client: WatchClient(
+          credentials: WatchCredentials(
+            apiURL: URL(string: "http://127.0.0.1:\(server.port)/v1")!, cookie: "session=test")))
+      let older = Task { await conversation.load() }
+      let waiting = await XCTWaiter().fulfillment(of: [olderRequests], timeout: 3)
+      XCTAssertEqual(waiting, .completed)
+      await conversation.load()
+      XCTAssertEqual(conversation.messages.map(\.id), ["newer"])
+      XCTAssertFalse(conversation.isLoading)
+      releaseOlder.signal()
+      releaseOlder.signal()
+      await older.value
+      XCTAssertEqual(conversation.messages.map(\.id), ["newer"])
+      XCTAssertEqual(conversation.approvals.map(\.id), ["newer"])
+      XCTAssertEqual(conversation.session.status, "idle")
+      XCTAssertNil(conversation.error)
+    }
   }
 
   @MainActor func testCredentialsSendOnlyCookiesTheAPIWouldReceive() throws {
@@ -271,6 +412,28 @@ final class WatchCompanionTests: XCTestCase {
           serverURL: URL(string: "https://omnigent.example.com/omnigent")!, cookieName: name,
           cookies: nativeCookies))
       XCTAssertEqual(credentials.cookie, name == "absent" ? "" : "\(name)=1")
+    }
+
+    for enteredPath in ["/omnigent", "/omnigent/c/original"] {
+      let landed = try XCTUnwrap(
+        WatchCredentials(
+          serverURL: URL(string: "https://entered.example.com\(enteredPath)")!,
+          workspacePageURL: URL(
+            string: "https://landed.example.com:8443/omnigent/c/session?o=42&next=ignored#message")!,
+          cookieName: "DBAUTH",
+          cookies: [
+            cookie("DBAUTH", domain: "entered.example.com", path: "/"),
+            cookie("DBAUTH", domain: "landed.example.com", path: "/omnigent", secure: true),
+          ]))
+      XCTAssertEqual(
+        landed.apiURL.absoluteString, "https://landed.example.com:8443/omnigent/v1?o=42")
+      XCTAssertEqual(landed.cookie, "DBAUTH=1")
+    }
+    for unsafeLanding in ["http://landed.example.com", "https://user@landed.example.com"] {
+      XCTAssertNil(
+        WatchCredentials(
+          serverURL: URL(string: "https://entered.example.com")!,
+          workspacePageURL: URL(string: unsafeLanding), cookies: []))
     }
   }
 
@@ -346,6 +509,46 @@ final class WatchCompanionTests: XCTestCase {
       XCTAssertEqual(conversation.error == nil, testCase.succeeds, testCase.metadata)
       XCTAssertEqual(conversation.approvals.isEmpty, testCase.succeeds, testCase.metadata)
     }
+
+    var bound = false
+    var itemReads = 0
+    let server = try MockHTTPServer(requestHandler: { request in
+      let url = URLComponents(string: request.path)
+      let host = request.headers["x-databricks-omnigent-slice-key"]
+      switch url?.path {
+      case "/v1/sessions/s1":
+        if url?.queryItems?.contains(where: { $0.name == "include_live_status" }) == true {
+          return (200, [:], Data((bound ? #"{"host_id":"late-host"}"# : "{}").utf8))
+        }
+        if bound { XCTAssertEqual(host, "late-host", "Later polls must use the assigned host") }
+        bound = true
+        let pending =
+          host == "late-host"
+          ? #"[{"elicitation_id":"late","params":{"message":"Run it?"}}]"# : "[]"
+        return (
+          200, [:], Data("{\"host_id\":\"late-host\",\"pending_elicitations\":\(pending)}".utf8)
+        )
+      case "/v1/sessions/s1/items":
+        itemReads += 1
+        if itemReads > 1 { XCTAssertEqual(host, "late-host") }
+        return (200, [:], Data(#"{"data":[]}"#.utf8))
+      default:
+        XCTFail("Unexpected watch request: \(request.path)")
+        return (404, [:], Data())
+      }
+    })
+    let initiallyHostless = try WatchClient.decoder.decode(
+      WatchSession.self, from: Data(#"{"id":"s1","status":"running"}"#.utf8))
+    let conversation = WatchConversation(
+      session: initiallyHostless,
+      client: WatchClient(
+        credentials: WatchCredentials(
+          apiURL: URL(string: "http://127.0.0.1:\(server.port)/v1")!, cookie: "session=test")))
+    await conversation.load()
+    XCTAssertTrue(conversation.approvals.isEmpty)
+    await conversation.load()
+    XCTAssertNil(conversation.error)
+    XCTAssertEqual(conversation.approvals.map(\.id), ["late"])
   }
 
   @MainActor func testToolHeavyTranscriptBackfillsVisibleMessages() async throws {

@@ -173,6 +173,7 @@ struct WatchElicitation: Decodable, Identifiable, Sendable {
     let targetSessionId: String?
     let requestedSchema: Schema?
     let askUserQuestion: AnyField?
+    let nativeDelivery: AnyField?
   }
   struct Schema: Decodable, Sendable { let properties: [String: AnyField]? }
   struct AnyField: Decodable, Sendable { init(from decoder: Decoder) {} }
@@ -180,9 +181,10 @@ struct WatchElicitation: Decodable, Identifiable, Sendable {
   let elicitationId: String
   let params: Params
   var id: String { elicitationId }
-  /// Plain yes/no prompts only; questions, forms, and URL flows need the phone.
+  /// Plain yes/no prompts only; forms, URL flows, and receipt-based native delivery need the phone.
   var isBinary: Bool {
     (params.mode ?? "form") == "form" && params.askUserQuestion == nil
+      && params.nativeDelivery == nil
       && params.requestedSchema?.properties?.isEmpty != false
   }
 }

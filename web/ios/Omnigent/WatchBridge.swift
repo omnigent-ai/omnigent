@@ -37,7 +37,8 @@ final class WatchBridge: NSObject, WCSessionDelegate {
 
   @discardableResult
   func sync(
-    serverURL: URL?, workspaceID: String? = nil, cookieName: String? = nil,
+    serverURL: URL?, workspacePageURL: URL? = nil, workspaceID: String? = nil,
+    cookieName: String? = nil,
     cookieStore: some WatchCookieStore
   ) -> Task<Void, Never>? {
     guard transport != nil, let serverURL else { return nil }
@@ -48,7 +49,8 @@ final class WatchBridge: NSObject, WCSessionDelegate {
       guard generation == started else { return }
       push(
         WatchCredentials(
-          serverURL: serverURL, workspaceID: workspaceID, cookieName: cookieName, cookies: cookies))
+          serverURL: serverURL, workspacePageURL: workspacePageURL, workspaceID: workspaceID,
+          cookieName: cookieName, cookies: cookies))
     }
   }
 
@@ -119,15 +121,29 @@ extension WKHTTPCookieStore: WatchCookieStore {}
 extension WatchCredentials {
   /// The API root under the server's mount and the cookies a browser would send it.
   @MainActor init?(
-    serverURL: URL, workspaceID: String? = nil, cookieName: String? = nil, cookies: [HTTPCookie]
+    serverURL: URL, workspacePageURL: URL? = nil, workspaceID: String? = nil,
+    cookieName: String? = nil,
+    cookies: [HTTPCookie]
   ) {
-    let mount = WorkspaceURLExpander.workspaceUIURL(forBareRoot: serverURL) ?? serverURL
+    var mount = WorkspaceURLExpander.workspaceUIURL(forBareRoot: serverURL) ?? serverURL
+    // Use only the validated workspace bootstrap URL, never an arbitrary web-view navigation.
+    if let workspacePageURL {
+      guard var landing = URLComponents(url: workspacePageURL, resolvingAgainstBaseURL: false),
+        landing.scheme?.lowercased() == "https", landing.host != nil,
+        landing.user == nil, landing.password == nil
+      else { return nil }
+      landing.percentEncodedPath = WorkspaceURLExpander.workspaceUIPath
+      guard let landed = landing.url else { return nil }
+      mount = landed
+    }
     guard let endpoint = mount.omnigentEndpoint("/v1"),
       var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false)
     else { return nil }
     // Shared hosts route by the `o` workspace selector, which sign-in may have learned.
-    let selector = URLComponents(url: serverURL, resolvingAgainstBaseURL: false)?
-      .queryItems?.first { $0.name == "o" }?.value
+    let selector = [mount, serverURL].compactMap {
+      URLComponents(url: $0, resolvingAgainstBaseURL: false)?
+        .queryItems?.first { $0.name == "o" }?.value
+    }.first
     components.queryItems = (workspaceID ?? selector).map { [URLQueryItem(name: "o", value: $0)] }
     guard let apiURL = components.url else { return nil }
     let sent = cookies.filter {

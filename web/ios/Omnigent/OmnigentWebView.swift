@@ -1461,7 +1461,8 @@ struct OmnigentWebView: UIViewRepresentable {
         (webView as? AccessoryFreeWebView)?.emitKeyboardViewport(force: true)
         webView.evaluateJavaScript(WorkspaceChromeScript.source)
         WatchBridge.shared.sync(
-          serverURL: parent.serverURL ?? pinnedURL, workspaceID: workspaceSession?.workspaceID,
+          serverURL: parent.serverURL ?? pinnedURL, workspacePageURL: workspaceSession?.pageURL,
+          workspaceID: workspaceSession?.workspaceID,
           cookieName: workspaceSession == nil ? oidcConnection?.cookieName : "DBAUTH",
           cookieStore: webView.configuration.websiteDataStore.httpCookieStore)
         parent.loadSucceeded()
