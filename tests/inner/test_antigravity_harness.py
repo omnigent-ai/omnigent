@@ -116,6 +116,7 @@ def test_executor_factory_defaults_when_unset(
 @pytest.mark.parametrize(
     "os_env_payload,message",
     [
+        ("{}", "Antigravity cannot enforce"),
         ('{"sandbox": {"type": "linux_bwrap"}}', "Antigravity cannot enforce"),
         ('{"sandbox":', "HARNESS_ANTIGRAVITY_OS_ENV must contain a valid OS environment policy"),
     ],

@@ -16,7 +16,7 @@ import functools
 import inspect
 from collections.abc import Callable
 from enum import Enum
-from typing import Any, Literal, ParamSpec, TypeVar, cast
+from typing import Any, Literal, LiteralString, ParamSpec, TypeVar, cast
 
 from omnigent.util.uuid import normalize_uuid
 
@@ -547,25 +547,15 @@ class OmnigentError(Exception):
 
 
 class HarnessConfigurationError(OmnigentError):
-    """Fixed public repairs for recognized harness configuration failures."""
+    """Keep a framework-authored repair separate from private configuration details."""
 
     def __init__(
         self,
-        reason: Literal["codex_broker_gateway_type", "missing_provider"],
+        client_message: LiteralString,
         *,
         diagnostic: str | None = None,
     ) -> None:
-        self.client_message = {
-            "codex_broker_gateway_type": (
-                "executor.config.broker_gateway must be a boolean. "
-                "Use true or false (without quotes) and retry."
-            ),
-            "missing_provider": (
-                "The provider named by executor.auth is not configured. "
-                "Configure it under 'providers:' in ~/.omnigent/config.yaml "
-                "or update executor.auth.name, then retry."
-            ),
-        }[reason]
+        self.client_message = client_message
         super().__init__(diagnostic or self.client_message, code=ErrorCode.INVALID_INPUT)
 
 

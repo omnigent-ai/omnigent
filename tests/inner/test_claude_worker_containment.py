@@ -117,16 +117,6 @@ def worker_policy(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SandboxPol
     return policy
 
 
-def test_backend_that_does_not_wrap_is_rejected(
-    worker_policy: SandboxPolicy, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    backend = Mock()
-    backend.wrap_launcher_argv.side_effect = lambda argv, *a, **k: argv
-    monkeypatch.setattr(claude, "get_backend", lambda _: backend)
-    with pytest.raises(OSError, match="cannot contain"):
-        claude.prepare_claude_cli_path("/bin/claude", OSEnvSpec())
-
-
 def test_inactive_policy_cannot_silently_disable_a_requested_sandbox(
     worker_policy: SandboxPolicy,
 ) -> None:

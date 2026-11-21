@@ -574,10 +574,13 @@ def _provider_auth_command(family: FamilyConfig) -> str:
         return f"printf %s {shlex.quote(family.api_key)}"
     if family.auth_command is not None:
         return family.auth_command
-    raise OmnigentError(
-        "provider family has no credential (neither 'api_key' nor 'auth_command') "
-        "to build a bearer-token command from.",
-        code=ErrorCode.INVALID_INPUT,
+    raise HarnessConfigurationError(
+        "The provider family has no credential. Configure its 'api_key' or 'auth_command' "
+        "and retry.",
+        diagnostic=(
+            "provider family has no credential (neither 'api_key' nor 'auth_command') "
+            "to build a bearer-token command from."
+        ),
     )
 
 
@@ -647,12 +650,11 @@ def configure_agent_harness_with_provider(
         # threads HARNESS_ANTIGRAVITY_API_KEY / _VERTEX directly instead, so
         # this path must never run for it — fail loud rather than emit inert
         # gateway env vars the executor no longer reads.
-        raise OmnigentError(
+        raise HarnessConfigurationError(
             "The 'antigravity' harness authenticates Gemini-natively (API key "
             "or Vertex AI) and does not support generic providers or gateway "
             "routing. Set executor.auth to an api_key, or executor.config "
             "vertex/project/location, instead of a 'providers:' entry.",
-            code=ErrorCode.INVALID_INPUT,
         )
     if entry.kind == BEDROCK_KIND:
         # Bedrock mode is wired only into the native ``omnigent claude`` launch
@@ -662,13 +664,16 @@ def configure_agent_harness_with_provider(
         # the generic ``HARNESS_*_GATEWAY_*`` vars would silently point the
         # harness at the Bedrock endpoint as if it spoke the Anthropic Messages
         # API and fail at request time. Fail loud instead.
-        raise OmnigentError(
-            f"provider {entry.name!r} (kind 'bedrock') is only supported by the "
-            f"native 'omnigent claude' terminal, not the {harness_type!r} harness. "
-            "For agents / 'omnigent run', use a 'gateway' provider "
-            "(OpenAI/Anthropic-compatible endpoint), or a 'databricks' / 'key' "
-            "provider.",
-            code=ErrorCode.INVALID_INPUT,
+        raise HarnessConfigurationError(
+            "Bedrock providers require the native 'omnigent claude' terminal. "
+            "For agents, select a compatible gateway, databricks or key provider.",
+            diagnostic=(
+                f"provider {entry.name!r} (kind 'bedrock') is only supported by the "
+                f"native 'omnigent claude' terminal, not the {harness_type!r} harness. "
+                "For agents / 'omnigent run', use a 'gateway' provider "
+                "(OpenAI/Anthropic-compatible endpoint), or a 'databricks' / 'key' "
+                "provider."
+            ),
         )
     if entry.kind == SUBSCRIPTION_KIND:
         # A logged-in CLI (claude / codex) carries its own auth; the
@@ -706,12 +711,15 @@ def configure_agent_harness_with_provider(
         # cannot consume a codex provider table, so fail loud rather than
         # launch them credential-less.
         if harness_type != "codex":
-            raise OmnigentError(
-                f"provider {entry.name!r} (kind 'cli-config') pins a provider in "
-                f"~/.codex/config.toml and can only drive the 'codex' harness, "
-                f"not {harness_type!r}. Configure a key/gateway provider for this "
-                "harness in ~/.omnigent/config.yaml.",
-                code=ErrorCode.INVALID_INPUT,
+            raise HarnessConfigurationError(
+                "This CLI-config provider requires the Codex harness. Select Codex or "
+                "configure a key/gateway provider for the selected harness.",
+                diagnostic=(
+                    f"provider {entry.name!r} (kind 'cli-config') pins a provider in "
+                    f"~/.codex/config.toml and can only drive the 'codex' harness, "
+                    f"not {harness_type!r}. Configure a key/gateway provider for this "
+                    "harness in ~/.omnigent/config.yaml."
+                ),
             )
         # entry.model_provider is required by the cli-config parse branch.
         env["HARNESS_CODEX_MODEL_PROVIDER"] = str(entry.model_provider)
@@ -742,11 +750,17 @@ def configure_agent_harness_with_provider(
     family_name = _PROVIDER_HARNESS_FAMILY[harness_type]
     family = entry.family(family_name)
     if family is None:
-        raise OmnigentError(
-            f"provider {entry.name!r} has no {family_name!r} family, required by the "
-            f"{harness_type!r} harness. Add a '{family_name}:' block to that provider in "
-            f"~/.omnigent/config.yaml.",
-            code=ErrorCode.INVALID_INPUT,
+        raise HarnessConfigurationError(
+            "This harness requires an 'anthropic' provider family. Add that family to "
+            "the provider in ~/.omnigent/config.yaml and retry."
+            if family_name == ANTHROPIC_FAMILY
+            else "This harness requires an 'openai' provider family. Add that family to "
+            "the provider in ~/.omnigent/config.yaml and retry.",
+            diagnostic=(
+                f"provider {entry.name!r} has no {family_name!r} family, required by the "
+                f"{harness_type!r} harness. Add a '{family_name}:' block to that provider in "
+                f"~/.omnigent/config.yaml."
+            ),
         )
     if harness_type == "openai-agents-sdk":
         _apply_provider_to_openai_agents(env, family)
@@ -806,9 +820,10 @@ def _catalog_default_model(family_name: str) -> str:
     """
     target = _FAMILY_CATALOG_TARGET.get(family_name)
     if target is None:
-        raise OmnigentError(
-            f"No model catalog is configured for provider family {family_name!r}.",
-            code=ErrorCode.INVALID_INPUT,
+        raise HarnessConfigurationError(
+            "The provider family has no supported model catalog. Set 'executor.model' "
+            "explicitly or configure an anthropic/openai provider family and retry.",
+            diagnostic=f"No model catalog is configured for provider family {family_name!r}.",
         )
     provider_name, catalog_family = target
     return _resolve_catalog_default_model(
@@ -838,12 +853,16 @@ def _apply_provider_family(
         the unsupported Chat Completions wire API.
     """
     if harness_type == "codex" and family.wire_api == CHAT_WIRE_API:
-        raise OmnigentError(
-            "The 'codex' harness requires an OpenAI Responses API endpoint, but "
-            f"provider endpoint {family.base_url!r} is configured with "
-            "'wire_api: chat'. Choose a Responses-capable endpoint and set "
-            "'wire_api: responses', or use a harness that supports Chat Completions.",
-            code=ErrorCode.INVALID_INPUT,
+        raise HarnessConfigurationError(
+            "The 'codex' harness requires an OpenAI Responses API endpoint. "
+            "Choose a Responses-capable endpoint and set 'wire_api: responses', "
+            "or use a harness that supports Chat Completions.",
+            diagnostic=(
+                "The 'codex' harness requires an OpenAI Responses API endpoint, but "
+                f"provider endpoint {family.base_url!r} is configured with "
+                "'wire_api: chat'. Choose a Responses-capable endpoint and set "
+                "'wire_api: responses', or use a harness that supports Chat Completions."
+            ),
         )
 
     cfg = _UCODE_HARNESS_CONFIGS[harness_type]
@@ -968,10 +987,13 @@ def _apply_provider_to_pi(env: dict[str, str], entry: ProviderEntry) -> None:
             if cred_errors
             else " — set the api_key env var for its 'anthropic' or 'openai' family in your shell"
         )
-        raise OmnigentError(
-            f"pi harness: provider {entry.name!r} configures no family whose "
-            f"credentials resolve{detail}, then retry.",
-            code=ErrorCode.INVALID_INPUT,
+        raise HarnessConfigurationError(
+            "The Pi provider has no usable credential. Configure the 'api_key' or "
+            "'auth_command' for its anthropic/openai family and retry.",
+            diagnostic=(
+                f"pi harness: provider {entry.name!r} configures no family whose "
+                f"credentials resolve{detail}, then retry."
+            ),
         )
     # pi carries a single credential: anthropic's when present, else openai's.
     # The model fallback must match the family that supplied that credential.
@@ -1030,13 +1052,17 @@ def _apply_cli_config_databricks_to_pi(env: dict[str, str], entry: ProviderEntry
     model_override = env.get("HARNESS_PI_MODEL")
     provider = _cli_config_pi_provider(entry, model=model_override)
     if provider is None:
-        raise OmnigentError(
-            f"provider {entry.name!r} (kind 'cli-config') was selected for the 'pi' "
-            "harness but its codex [model_providers] table could not be resolved as a "
-            "Databricks Unity Gateway. Check the [model_providers] base_url + auth in "
-            "~/.codex/config.toml, or configure a key/gateway provider for pi in "
-            "~/.omnigent/config.yaml.",
-            code=ErrorCode.INVALID_INPUT,
+        raise HarnessConfigurationError(
+            "Pi cannot resolve this CLI-config provider as a Databricks Unity Gateway. "
+            "Check the [model_providers] base_url and auth in ~/.codex/config.toml, "
+            "or configure a key/gateway provider for Pi in ~/.omnigent/config.yaml.",
+            diagnostic=(
+                f"provider {entry.name!r} (kind 'cli-config') was selected for the 'pi' "
+                "harness but its codex [model_providers] table could not be resolved as a "
+                "Databricks Unity Gateway. Check the [model_providers] base_url + auth in "
+                "~/.codex/config.toml, or configure a key/gateway provider for pi in "
+                "~/.omnigent/config.yaml."
+            ),
         )
     # Pi speaks the gateway's Anthropic Messages surface — register it under
     # pi's "claude" family key (mirrors _apply_provider_to_pi's anthropic path).
@@ -1189,7 +1215,9 @@ def _resolve_provider_for_build(
             entry = local_providers.get(auth.name)
         if entry is None:
             raise HarnessConfigurationError(
-                "missing_provider",
+                "The provider named by executor.auth is not configured. "
+                "Configure it under 'providers:' in ~/.omnigent/config.yaml "
+                "or update executor.auth.name, then retry.",
                 diagnostic=(
                     f"executor.auth references provider {auth.name!r}, but no such provider is "
                     "configured under 'providers:' in ~/.omnigent/config.yaml. "
@@ -1574,7 +1602,10 @@ def _apply_codex_provider_env(
 def _codex_broker_gateway_enabled(spec: AgentSpec) -> bool:
     locked = spec.executor.config.get("broker_gateway", False)
     if not isinstance(locked, bool):
-        raise HarnessConfigurationError("codex_broker_gateway_type")
+        raise HarnessConfigurationError(
+            "executor.config.broker_gateway must be a boolean. "
+            "Use true or false (without quotes) and retry."
+        )
     return locked
 
 
@@ -1592,36 +1623,40 @@ def _bind_codex_gateway_credential(env: dict[str, str], spec: AgentSpec) -> None
     if not locked and not reserved_bindings:
         return
     if not base_url:
-        raise OmnigentError(
+        raise HarnessConfigurationError(
             "Codex gateway credential_proxy requires a gateway HTTPS provider",
-            code=ErrorCode.INVALID_INPUT,
         )
     try:
         parsed = urlparse(base_url)
         host = parsed.hostname
         port = parsed.port
     except ValueError:
-        raise OmnigentError("invalid Codex gateway URL", code=ErrorCode.INVALID_INPUT) from None
+        raise HarnessConfigurationError(
+            "Invalid Codex gateway URL. Configure an exact HTTPS gateway endpoint and retry.",
+            diagnostic="invalid Codex gateway URL",
+        ) from None
     if not locked:
-        raise OmnigentError(
+        raise HarnessConfigurationError(
             "Codex gateway reserved binding requires executor.config.broker_gateway: true",
-            code=ErrorCode.INVALID_INPUT,
         )
     if (
         spec.executor.config.get("web_search") is not False
         or spec.executor.config.get("disable_native_tools") is not True
     ):
-        raise OmnigentError(
+        raise HarnessConfigurationError(
             "brokered Codex gateway requires executor.config.web_search: false "
             "and executor.config.disable_native_tools: true",
-            code=ErrorCode.INVALID_INPUT,
         )
     binding = reserved_bindings[0] if len(reserved_bindings) == 1 else None
     model_path = parsed.path.rstrip("/") + "/responses"
     try:
         rules = parse_rules(sandbox.egress_rules or []) if sandbox is not None else []
     except ValueError as exc:
-        raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+        raise HarnessConfigurationError(
+            "Invalid Codex egress rules. Configure an exact POST Responses route in "
+            "os_env.sandbox.egress_rules and retry.",
+            diagnostic=str(exc),
+        ) from exc
     model_rules = [rule for rule in rules if host and rule._host_matches(host)]
     if (
         len(reserved_bindings) != 1
@@ -1647,11 +1682,10 @@ def _bind_codex_gateway_credential(env: dict[str, str], spec: AgentSpec) -> None
             for rule in model_rules
         )
     ):
-        raise OmnigentError(
+        raise HarnessConfigurationError(
             "Codex gateway credential_proxy requires one matching HTTPS bearer "
             "renewable file/socket binding with env OMNIGENT_CODEX_GATEWAY_TOKEN "
             "and the exact POST Responses egress rule",
-            code=ErrorCode.INVALID_INPUT,
         )
     env["HARNESS_CODEX_GATEWAY_AUTH_COMMAND"] = BROKERED_CODEX_AUTH_COMMAND
     env["HARNESS_CODEX_BROKERED_GATEWAY"] = "true"
@@ -1668,8 +1702,12 @@ def _apply_codex_tool_switches(env: dict[str, str], spec: AgentSpec) -> None:
     config = spec.executor.config
     for key in ("web_search", "disable_native_tools"):
         if config.get(key) is not None and not isinstance(config[key], bool):
-            raise OmnigentError(
-                f"executor.config.{key} must be a boolean", code=ErrorCode.INVALID_INPUT
+            raise HarnessConfigurationError(
+                "executor.config.web_search must be a boolean. Use true or false and retry."
+                if key == "web_search"
+                else "executor.config.disable_native_tools must be a boolean. "
+                "Use true or false and retry.",
+                diagnostic=f"executor.config.{key} must be a boolean",
             )
     if config.get("web_search") is False:
         env["HARNESS_CODEX_ENABLE_WEB_SEARCH"] = "false"
@@ -2139,10 +2177,13 @@ def _build_acp_spawn_env(
     else:
         agent = resolve_acp_agent(slug) if slug else None
         if raw_harness.startswith("acp:") and agent is None:
-            raise OmnigentError(
-                f"ACP agent {slug!r} is not configured on this runner. "
-                "Check the selected host's ACP configuration.",
-                code=ErrorCode.INVALID_INPUT,
+            raise HarnessConfigurationError(
+                "The selected ACP agent is not configured on this runner. "
+                "Check the selected host's ACP configuration and select a configured agent.",
+                diagnostic=(
+                    f"ACP agent {slug!r} is not configured on this runner. "
+                    "Check the selected host's ACP configuration."
+                ),
             )
         if agent is None:
             agents = acp_agents()
