@@ -160,6 +160,8 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 - [Composer](./composer.md) covers the session and new-session composers,
   the model/effort pill, the configuration gear, slash commands, and the
   native `!` shell mode.
+- [Files](./files.md) covers workspace browsing, viewers, uploads in the rail
+  and mobile drawer, tree destinations, progress and capability gates.
 - [Terminals](./terminals.md) covers the Chat/Terminal switcher, the agent
   terminal, shell terminals, and terminal reattachment.
 - [Native harnesses](./native-harnesses.md) is the matrix of every native
@@ -217,7 +219,6 @@ map an area, remove it here in the same change.
   native edit-tool approvals are mapped)
 - Sub-agents and the agent info popover: `tests/e2e_ui/agents/` (only Claude-native
   discovery and idle-runner performance are mapped in Native harnesses)
-- Files and the workspace browser: `tests/e2e_ui/files/`, `tests/browser_ui/files/`
 - Comments: `tests/e2e_ui/comments/`
 - Sharing and session permissions: `tests/e2e_ui/collaboration/` (only automation
   sharing and its managed-session warning are mapped)
