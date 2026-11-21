@@ -41,6 +41,10 @@ from omnigent.llms.routing import RoutedModel, infer_harness_from_model, parse_m
             RoutedModel(provider="ollama", model="llama3"),
         ),
         (
+            "magnitude/hf:ornith-ai/Ornith/model.gguf",
+            RoutedModel(provider="magnitude", model="hf:ornith-ai/Ornith/model.gguf"),
+        ),
+        (
             "gemini/gemini-2.5-pro",
             RoutedModel(provider="gemini", model="gemini-2.5-pro"),
         ),
