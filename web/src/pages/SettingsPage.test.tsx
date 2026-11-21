@@ -18,7 +18,7 @@ import {
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import type * as IdentityApi from "@/lib/identity";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { toast } from "sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -26,6 +26,7 @@ import type { Conversation } from "@/hooks/useConversations";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
 import { OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY } from "@/lib/subagentPanelPreferences";
 import { PROJECT_KANBAN_BOARD_STORAGE_KEY } from "@/lib/projectKanbanPreferences";
+import { reloadThemePalette } from "@/store/themePalette";
 import { fetchDatabricksStatus } from "@/lib/databricksIntegration";
 import { fetchGithubStatus } from "@/lib/githubIntegration";
 import {
@@ -997,6 +998,12 @@ describe("SettingsPage", () => {
     "colours Delete red and Archive blue in the %s palette; None stays neutral",
     async (palette) => {
       localStorage.setItem("omnigent:ui-theme-palette", JSON.stringify(palette));
+      // The palette store reads storage once at load; re-read it for this render.
+      reloadThemePalette();
+      onTestFinished(() => {
+        localStorage.removeItem("omnigent:ui-theme-palette");
+        reloadThemePalette();
+      });
       localStorage.setItem(
         "omnigent:swipe-actions",
         JSON.stringify({ left: "none", right: "delete" }),
