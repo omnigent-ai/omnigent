@@ -21,9 +21,9 @@ Enumeration is deterministic per provider kind:
   ``"openai-compatible"``).
 - ``subscription`` → live CLI discovery for Cursor; curated static aliases for
   CLIs without a listing API (source ``"static"``, ``verified: false``).
-- ``cli-config`` → native Claude/Codex shared probe catalogs (source ``"cli"``)
-  when available, otherwise an empty static listing. Credentials are
-  resolved by the CLI at launch.
+- ``cli-config`` → native Claude/Codex shared probe catalogs or Kiro CLI
+  discovery (source ``"cli"``) when available, otherwise an empty static
+  listing. Credentials are resolved by the CLI at launch.
 - anything unresolvable → source ``"none"`` with an explanatory note,
   which doubles as a dead-worker preflight signal.
 """
@@ -127,7 +127,7 @@ _ProviderHarness: TypeAlias = Literal[
 ]
 
 # Harness spellings -> the workflow harness whose provider resolution they
-# share; natives resolve via their SDK sibling (the resolve_native_* rule).
+# share; SDK-backed natives resolve via their sibling (the resolve_native_* rule).
 _PROVIDER_RESOLUTION_HARNESS: dict[str, _ProviderHarness] = {
     "claude-sdk": "claude-sdk",
     "claude_sdk": "claude-sdk",
@@ -179,6 +179,14 @@ _CURSOR_HARNESSES: frozenset[str] = frozenset({"cursor", "cursor-native", "nativ
 # provider-config lookup.
 _DEVIN_HARNESSES: frozenset[str] = frozenset({"devin-native", "native-devin"})
 
+# These native launches own their provider selection rather than sharing an SDK
+# resolver. OpenCode alone also consumes an explicit inference binding.
+_NATIVE_CLI_CATALOGS: dict[str, str] = {
+    "opencode-native": "opencode",
+    "hermes-native": "hermes",
+    "kiro-native": "kiro-cli",
+}
+
 # SDK harnesses whose CLI-login launch shares a native model-probe catalog.
 _SDK_PROBE_CLI: dict[str, str] = {"claude-sdk": "claude", "claude_sdk": "claude", "codex": "codex"}
 
@@ -189,6 +197,7 @@ _KEY_AUTH_FAMILY: dict[str, str] = {
     "openai-agents-sdk": OPENAI_FAMILY,
     "antigravity": OPENAI_FAMILY,
     "qwen": OPENAI_FAMILY,
+    "opencode-native": OPENAI_FAMILY,
 }
 
 # Multi-family providers (pi): anthropic first, matching _apply_provider_to_pi.
@@ -255,9 +264,8 @@ class ResolvedModelProvider:
         Never serialized into tool output.
     :param auth_command: Shell command printing a bearer token, for
         providers configured with a dynamic credential.
-    :param cli: ``"claude"`` / ``"codex"`` / ``"cursor-agent"`` for
-        ``kind="subscription"``; ``"claude"`` / ``"codex"`` for
-        ``kind="cli-config"``.
+    :param cli: CLI whose login or configuration owns provider routing for
+        ``kind="subscription"`` or ``kind="cli-config"``.
     :param model_provider: Codex config.toml provider id for ``kind="cli-config"``.
     :param detail: Non-secret descriptor of how the provider resolved,
         e.g. ``"provider 'openrouter'"`` — used in listing notes.
@@ -624,6 +632,9 @@ def _resolve_model_provider_unsafe(spec: object, harness: str | None) -> Resolve
     from omnigent.runtime.workflow import _resolve_provider_for_build
 
     canonical_harness = canonicalize_harness(harness) or harness
+    cli = _NATIVE_CLI_CATALOGS.get(canonical_harness or "")
+    if cli is not None:
+        return _native_cli_provider(cast("AgentSpec", spec), canonical_harness or "", cli)
     if (canonical_harness or "") in _CURSOR_HARNESSES:
         return ResolvedModelProvider(
             kind=SUBSCRIPTION_KIND, cli="cursor-agent", detail="cursor-agent CLI login"
@@ -673,6 +684,37 @@ def _resolve_model_provider_unsafe(spec: object, harness: str | None) -> Resolve
                 detail="Claude Code managed settings",
             )
     return provider
+
+
+def _native_cli_provider(spec: AgentSpec, harness: str, cli: str) -> ResolvedModelProvider:
+    """Describe CLI-owned routing, preserving OpenCode's authoritative binding."""
+    if harness == "opencode-native":
+        from omnigent.inference_config import (
+            load_runtime_inference_config,
+            resolve_bound_model,
+            resolve_bound_provider,
+        )
+
+        config = load_runtime_inference_config()
+        entry = resolve_bound_provider(config, harness, spec.executor.auth)
+        if entry is not None:
+            family = entry.family(OPENAI_FAMILY)
+            if family is None or not resolve_bound_model(config, harness, spec.executor.model):
+                return ResolvedModelProvider(
+                    kind=NONE_KIND,
+                    detail="OpenCode requires an OpenAI-compatible provider and a default model",
+                )
+            if family.wire_api == "responses":
+                return ResolvedModelProvider(
+                    kind=NONE_KIND,
+                    detail="OpenCode's configured gateway must support the chat wire API",
+                )
+            return _provider_from_entry(entry, harness)
+    # OpenCode's optional profile/managed gateway and the other CLIs' providers
+    # resolve at launch. Unrelated global SDK defaults are not launch evidence.
+    return ResolvedModelProvider(
+        kind=CLI_CONFIG_KIND, cli=cli, detail=f"{cli} native CLI configuration"
+    )
 
 
 def _provider_from_legacy_auth(
@@ -1471,12 +1513,35 @@ def _static_subscription_listing(provider: ResolvedModelProvider) -> ModelListin
 def _static_cli_config_listing(provider: ResolvedModelProvider) -> ModelListing:
     """Read a CLI-owned catalog, or report that it has not been probed yet.
 
-    Claude managed gateways and Codex config.toml providers share their
-    native launch catalogs. Credentials remain the CLI's responsibility.
+    Claude and Codex share native launch catalogs; Kiro exposes a listing
+    command. Other native configurations remain unknown until launch.
+    Credentials remain the CLI's responsibility.
 
     :param provider: A ``kind="cli-config"`` provider descriptor.
     :returns: A probe-backed listing when cached, else an empty static listing.
     """
+    if provider.cli == "kiro-cli":
+        from omnigent.harnesses.kiro_native.main import list_kiro_cli_model_options
+
+        try:
+            options = list_kiro_cli_model_options()
+            if options:
+                return ModelListing(
+                    source="cli",
+                    verified=True,
+                    models=tuple(
+                        ModelEntry(
+                            id=str(option["id"]), family=model_family_token(str(option["id"]))
+                        )
+                        for option in options
+                    ),
+                    note=(
+                        "Models advertised by the Kiro CLI; authentication and execution "
+                        "have not been verified."
+                    ),
+                )
+        except (click.ClickException, OSError, ValueError, subprocess.SubprocessError):
+            _logger.debug("Kiro CLI model listing unavailable", exc_info=True)
     probe: tuple[str, str, str] | None = None
     if provider.cli == "claude":
         from omnigent.harnesses.claude_native.main import claude_catalog_fingerprint
@@ -1505,7 +1570,8 @@ def _static_cli_config_listing(provider: ResolvedModelProvider) -> ModelListing:
         models=(),
         note=(
             f"{provider.detail} enumerates its models only from the CLI's own "
-            "config at launch; the live listing comes from probing the harness"
+            "configuration or discovery; model availability, authentication, and "
+            "execution have not been verified."
         ),
     )
 
