@@ -1,7 +1,10 @@
-// The command palette's child pages: a setting's values and a command's options. They live
-// outside the palette component so work that settles late can tell whether its page still shows.
+// The command palette's child pages: a setting's values, a command's options and a session's
+// actions. They live outside the palette component so work that settles late can tell whether
+// its page still shows.
 
 import { create } from "zustand";
+
+import type { Conversation } from "@/hooks/useConversations";
 
 /** Where Back returns to: the parent page's query and active row. */
 export interface PaletteParentPlace {
@@ -10,6 +13,8 @@ export interface PaletteParentPlace {
 }
 
 export type PaletteChildPage =
+  /** A session's actions, from ⌘↵ on its row; `conversation` is that row as listed. */
+  | { kind: "session-actions"; sessionId: string; title: string; conversation: Conversation }
   /** A command's options, bound to its row and the command target then. */
   | { kind: "command-options"; itemId: string; targetKey: string; label: string }
   /**
