@@ -17,7 +17,6 @@ import threading
 import time
 import urllib.parse
 import weakref
-from collections import deque
 from collections.abc import (
     AsyncIterator,
     Awaitable,
@@ -1756,44 +1755,6 @@ def _publish_elicitation_resolved_to_ancestors(
             )
 
 
-@restart_on_stale_cursor
-def _descendant_sessions(
-    conv_store: ConversationStore,
-    session_id: str,
-) -> list[Conversation]:
-    """
-    Return descendant sub-agent conversations for a session.
-
-    :param conv_store: Store used to list conversations.
-    :param session_id: Ancestor session id, e.g. ``"conv_root123"``.
-    :returns: Sub-agent conversations below ``session_id``. Empty
-        for sessions with no descendants.
-    """
-    descendants: list[Conversation] = []
-    queue: deque[str] = deque([session_id])
-    seen = {session_id}
-    while queue:
-        parent_id = queue.popleft()
-        after: str | None = None
-        while True:
-            page = conv_store.list_conversations(
-                kind="sub_agent",
-                parent_conversation_id=parent_id,
-                limit=100,
-                after=after,
-            )
-            for child in page.data:
-                if child.id in seen:
-                    continue
-                seen.add(child.id)
-                descendants.append(child)
-                queue.append(child.id)
-            if not page.has_more or page.last_id is None:
-                break
-            after = page.last_id
-    return descendants
-
-
 def _pending_elicitation_snapshot_for_session(
     conv_store: ConversationStore,
     conv: Conversation,
@@ -1808,33 +1769,97 @@ def _pending_elicitation_snapshot_for_session(
     Duplicate ids are skipped because live mirroring also records the
     ancestor copy in the in-memory index.
 
-    The descendant walk costs one ``list_conversations`` query per
-    session in the tree, so it is skipped entirely unless some session
-    other than ``conv`` has an outstanding prompt in the in-memory
-    index (the common case is none anywhere).
+    Descendants are found by walking up from the sessions that have a
+    prompt, so the database work follows their depth rather than the
+    size of the snapshotted session's tree.
 
-    :param conv_store: Store used to list descendant sub-agents.
+    :param conv_store: Store used to read the pending sessions' ancestors.
     :param conv: Session conversation being snapshotted.
     :returns: Pending elicitation event dicts suitable for
         :class:`SessionResponse.pending_elicitations`.
     """
     events = pending_elicitations.snapshot_for(conv.id)
-    if not (set(pending_elicitations.pending_session_ids()) - {conv.id}):
+    other_pending = [
+        session_id
+        for session_id in pending_elicitations.pending_session_ids()
+        if session_id != conv.id
+    ]
+    if not other_pending:
         return events
     seen = {
         event.get("elicitation_id")
         for event in events
         if isinstance(event.get("elicitation_id"), str)
     }
-    for child in _descendant_sessions(conv_store, conv.id):
-        for event in pending_elicitations.snapshot_for(child.id):
+    for child_id in _pending_descendant_session_ids(conv_store, conv, other_pending):
+        for event in pending_elicitations.snapshot_for(child_id):
             elicitation_id = event.get("elicitation_id")
             if isinstance(elicitation_id, str) and elicitation_id in seen:
                 continue
             if isinstance(elicitation_id, str):
                 seen.add(elicitation_id)
-            events.append(_targeted_elicitation_event(event, target_session_id=child.id))
+            events.append(_targeted_elicitation_event(event, target_session_id=child_id))
     return events
+
+
+def _pending_descendant_session_ids(
+    conv_store: ConversationStore,
+    conv: Conversation,
+    candidate_ids: list[str],
+) -> list[str]:
+    """
+    Return the candidates that are visible sub-agent descendants of ``conv``.
+
+    Matches what listing ``conv``'s sub-agent tree would reach: every
+    session on the path below ``conv`` must be a readable, unarchived
+    ``sub_agent``. All candidates move up one level per batch read, so
+    the cost follows the deepest candidate's depth, not the tree size.
+    A session's root never changes, so candidates from another tree stop
+    after the first read.
+
+    :param conv_store: Store used to batch-read conversations.
+    :param conv: Session whose descendants are wanted.
+    :param candidate_ids: Sessions to test, e.g. those with a pending
+        prompt. Returned in this order.
+    :returns: The ``candidate_ids`` below ``conv``.
+    """
+
+    def on_visible_path(node: Conversation) -> bool:
+        return (
+            node.kind == "sub_agent"
+            and not node.archived
+            and node.root_conversation_id == conv.root_conversation_id
+        )
+
+    known: dict[str, Conversation | None] = {}
+    frontier = list(dict.fromkeys(candidate_ids))
+    while frontier:
+        fetched = conv_store.get_conversations(frontier)
+        known.update({session_id: fetched.get(session_id) for session_id in frontier})
+        next_ids: list[str] = []
+        for session_id in frontier:
+            node = known[session_id]
+            if node is None or not on_visible_path(node):
+                continue
+            parent_id = node.parent_conversation_id
+            if parent_id is not None and parent_id != conv.id and parent_id not in known:
+                next_ids.append(parent_id)
+        frontier = list(dict.fromkeys(next_ids))
+
+    def below_conv(session_id: str) -> bool:
+        visited: set[str] = set()
+        current: str | None = session_id
+        while current is not None and current not in visited:
+            visited.add(current)
+            node = known.get(current)
+            if node is None or not on_visible_path(node):
+                return False
+            if node.parent_conversation_id == conv.id:
+                return True
+            current = node.parent_conversation_id
+        return False
+
+    return [session_id for session_id in dict.fromkeys(candidate_ids) if below_conv(session_id)]
 
 
 def _publish_input_consumed(
@@ -13111,7 +13136,6 @@ __all__ = [
     "_create_session_worktree",
     "_delete_stored_session_bundle_after_failure",
     "_derive_terminal_launch_args_from_spec",
-    "_descendant_sessions",
     "_devin_subagent_display_tool",
     "_devin_subagent_labels_from_body",
     "_discovery_key",
