@@ -93,6 +93,9 @@ describe("sidebar Stop session item", () => {
     expect(screen.getByRole("dialog")).toHaveTextContent(
       "stops its runner, including side chats running on it",
     );
+    expect(screen.getByRole("dialog")).toHaveTextContent(
+      "Conversation histories are kept. Any open side shells are closed.",
+    );
     // The confirm dialog gates the mutation — nothing fires on item click.
     expect(mocks.stop.mutate).not.toHaveBeenCalled();
 
@@ -140,6 +143,9 @@ describe("sidebar Stop session item", () => {
       "This terminates the running session for My Session. Conversation histories are kept.",
     );
     expect(screen.getByRole("dialog")).not.toHaveTextContent("stops its runner");
+    expect(screen.getByRole("dialog")).toHaveTextContent(
+      "Conversation histories are kept. Any open side shells are closed.",
+    );
   });
 
   it("is hidden for a local in-process runner (runner_id, no host_id)", () => {
