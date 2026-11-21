@@ -93,6 +93,7 @@ def configure_ucode_for_workspace(
     workspace_url: str,
     *,
     agents: Sequence[str] = _UCODE_AGENT_NAMES,
+    profile: str | None = None,
 ) -> None:
     """Run ``ucode configure`` against a single model-serving workspace.
 
@@ -110,17 +111,27 @@ def configure_ucode_for_workspace(
         is stripped by :func:`build_ucode_configure_command`.
     :param agents: ucode agent names to configure non-interactively,
         e.g. ``("claude", "codex", "pi")``. Defaults to all three.
+    :param profile: The ``~/.databrickscfg`` profile the caller just signed
+        in to, e.g. ``"oss"``. Its token is handed to ucode as
+        ``DATABRICKS_BEARER`` so ``configure`` skips its own second
+        ``databricks auth login``; ``None``, or a profile that yields no
+        token, leaves ucode to sign in itself.
     :returns: None.
     :raises click.ClickException: If ucode cannot be resolved (see
         :func:`find_ucode_command`) or ``ucode configure`` exits non-zero.
     """
     ucode_command = find_ucode_command()
+    env = dict(os.environ)
+    bearer = _profile_bearer(profile) if profile else None
+    if bearer:
+        env["DATABRICKS_BEARER"] = bearer
     click.echo(f"Running `ucode configure --workspaces {workspace_url}`...")
     result = subprocess.run(
         build_ucode_configure_command(
             ucode_command, workspace_urls=[workspace_url], agents=agents
         ),
         check=False,
+        env=env,
     )
     if result.returncode != 0:
         raise click.ClickException(
@@ -128,6 +139,27 @@ def configure_ucode_for_workspace(
             "see the command output above for details."
         )
     click.echo("ucode configuration complete. Omnigent will use state.json for harness setup.")
+
+
+def _profile_bearer(profile: str) -> str | None:
+    """
+    Mint the current access token for a ``~/.databrickscfg`` profile.
+
+    ucode reads ``DATABRICKS_BEARER`` only while ``configure`` runs: the
+    harness token helpers it writes still mint from the profile, so token
+    renewal later is unaffected.
+
+    :param profile: Profile name, e.g. ``"oss"``.
+    :returns: The token, or ``None`` when the profile yields none.
+    """
+    # Deferred: the executor loads ~300 modules the harness launch path never needs.
+    from omnigent.inner.databricks_executor import DatabricksAuthError, _resolve_databricks_auth
+
+    try:
+        auth, _host = _resolve_databricks_auth(profile)
+        return auth.current_token() or None
+    except (DatabricksAuthError, ImportError, ValueError):
+        return None
 
 
 def ucode_workspace_exists(workspace_url: str) -> bool:

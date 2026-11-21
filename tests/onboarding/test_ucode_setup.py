@@ -172,7 +172,9 @@ def test_configure_ucode_for_workspace_targets_single_workspace() -> None:
     """
     recorded: list[list[str]] = []
 
-    def _run(argv: list[str], *, check: bool = False) -> subprocess.CompletedProcess[str]:
+    def _run(
+        argv: list[str], *, check: bool = False, env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
         recorded.append(argv)
         return subprocess.CompletedProcess(args=argv, returncode=0)
 
@@ -203,7 +205,9 @@ def test_configure_ucode_for_workspace_raises_on_nonzero_exit() -> None:
     whose gateway was never actually wired up.
     """
 
-    def _run(argv: list[str], *, check: bool = False) -> subprocess.CompletedProcess[str]:
+    def _run(
+        argv: list[str], *, check: bool = False, env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(args=argv, returncode=3)
 
     with (
@@ -212,6 +216,44 @@ def test_configure_ucode_for_workspace_raises_on_nonzero_exit() -> None:
         pytest.raises(ClickException, match="exited with code 3"),
     ):
         configure_ucode_for_workspace("https://example.cloud.databricks.com")
+
+
+@pytest.mark.parametrize("minted", ["tok-123", None], ids=["token", "no-token"])
+def test_configure_ucode_for_workspace_hands_profile_token_to_ucode(
+    monkeypatch: pytest.MonkeyPatch, minted: str | None
+) -> None:
+    """The just-signed-in profile's token reaches ucode as ``DATABRICKS_BEARER``.
+
+    ucode skips its own second ``databricks auth login`` when it is set. A
+    profile that yields no token leaves it unset, so ucode signs in as before.
+    """
+    from omnigent.inner import databricks_executor
+
+    def _resolve(profile: str) -> tuple[object, str]:
+        assert profile == "my-ws"
+        if minted is None:
+            raise databricks_executor.DatabricksAuthError("no cached login")
+        token_source = types.SimpleNamespace(current_token=lambda: minted)
+        return token_source, "https://example.cloud.databricks.com"
+
+    monkeypatch.setattr(databricks_executor, "_resolve_databricks_auth", _resolve)
+    monkeypatch.delenv("DATABRICKS_BEARER", raising=False)
+    envs: list[dict[str, str] | None] = []
+
+    def _run(
+        argv: list[str], *, check: bool = False, env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        envs.append(env)
+        return subprocess.CompletedProcess(args=argv, returncode=0)
+
+    with (
+        patch("omnigent.onboarding.ucode_setup.find_ucode_command", return_value=["ucode"]),
+        patch("omnigent.onboarding.ucode_setup.subprocess.run", _run),
+    ):
+        configure_ucode_for_workspace("https://example.cloud.databricks.com", profile="my-ws")
+
+    assert len(envs) == 1 and envs[0] is not None
+    assert envs[0].get("DATABRICKS_BEARER") == minted
 
 
 def test_build_ucode_configure_command_normalizes_pasted_url() -> None:

@@ -314,18 +314,19 @@ def _login_profile(cli: str, spec: ProfileSpec, console: Console) -> bool:
     :param console: Rich console for surrounding messages.
     :returns: ``True`` on success.
     """
+    from omnigent.onboarding.databricks_login import run_databricks_auth_login
+
     console.print(f"\n  [bold]→ {spec.name}[/bold]  [dim]{spec.purpose}[/dim]")
     console.print(f"    [dim]host: {spec.host}[/dim]")
     try:
-        result = subprocess.run(
-            [cli, "auth", "login", "--host", spec.host, "--profile", spec.name],
-            check=False,
+        returncode = run_databricks_auth_login(
+            [cli, "auth", "login", "--host", spec.host, "--profile", spec.name]
         )
     except KeyboardInterrupt:
         console.print(f"  [yellow]cancelled {spec.name}[/yellow]")
         return False
-    if result.returncode != 0:
-        console.print(f"  [red]failed (exit {result.returncode})[/red]")
+    if returncode != 0:
+        console.print(f"  [red]failed (exit {returncode})[/red]")
         return False
     console.print(f"  [green]✓ {spec.name}[/green]")
     time.sleep(_OAUTH_BETWEEN_LOGIN_SLEEP_SECONDS)
