@@ -5,6 +5,7 @@ import { defaultFilter } from "cmdk";
 import { useEffect, useMemo, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
+  type Conversation,
   type ConversationsPage,
   type ProjectSummary,
   useProjects,
@@ -36,6 +37,8 @@ export interface PaletteSession {
   snippet: string | null;
   parent: string | null;
   project: string | null;
+  /** The session's list row, which its actions read their facts from. */
+  conversation: Conversation;
 }
 
 /** Flatten list pages into palette rows, dropping repeated ids and, unless
@@ -83,6 +86,7 @@ function paletteSessions(
         projects.find((project) => project.id !== null && project.id === c.project_id)?.name ??
         c.labels?.[PROJECT_LABEL_KEY] ??
         null,
+      conversation: c,
     });
   }
   return out;
