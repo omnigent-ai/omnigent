@@ -1278,9 +1278,9 @@ aside[aria-label="Workspace"][data-maximized] {
   background: var(--card-solid) !important;
 }
 
-/* Floating panes (the shell's data-floating-panes, 48rem and wider): the session's chat and the
- * workspace sidebar are rounded cards on the left sidebar's color, below one top row that
- * carries the session header and the sidebar's tabs. */
+/* Floating panes (the shell's data-floating-panes, 48rem and wider): a standalone session's chat
+ * and workspace sidebar are rounded cards on the left sidebar's color, below one top row that
+ * carries the session header and the sidebar's tabs. A grid keeps its own layout. */
 :root {
   --pane-gap: 5px;
   /* The extra room a card keeps inside its slot. */
@@ -1327,7 +1327,7 @@ aside[aria-label="Workspace"][data-maximized] {
   /* That backdrop is the one surface: the docked sidebar and the terminal view paint none of their
    * own over it, since a gradient sized to their own boxes steps at their edges. */
   .dark .app-shell[data-floating-panes] .omnigent-sidebar-panel:not(.is-peek),
-  .dark .app-shell[data-floating-panes] .main-terminal-view {
+  .dark .app-shell[data-floating-panes] [data-main-view] .main-terminal-view {
     background: none;
   }
 
@@ -1368,7 +1368,7 @@ aside[aria-label="Workspace"][data-maximized] {
   }
   /* Nothing scrolls under the header any more, so the transcript and the terminal need no room
    * for it. */
-  .app-shell[data-floating-panes] .chat-conversation-content.pt-20 {
+  .app-shell[data-floating-panes] [data-main-view] .chat-conversation-content.pt-20 {
     padding-top: 1.5rem;
   }
   .app-shell[data-floating-panes] [data-main-view="chat"] .main-terminal-view {
@@ -1377,16 +1377,22 @@ aside[aria-label="Workspace"][data-maximized] {
 
   /* The workspace sidebar's tabs are its part of the top row; its body is a card that kisses the
    * window's right edge, rounded only where it faces the panes. */
-  .app-shell[data-floating-panes] aside[aria-label="Workspace"]:not([data-maximized]) {
+  .app-shell[data-floating-panes]
+    [data-main-view]
+    aside[aria-label="Workspace"]:not([data-maximized]) {
     border-left-width: 0;
     background: transparent !important;
   }
-  .app-shell[data-floating-panes] aside[aria-label="Workspace"] .workspace-tab-strip {
+  .app-shell[data-floating-panes]
+    [data-main-view]
+    aside[aria-label="Workspace"]
+    .workspace-tab-strip {
     height: var(--shell-top-row);
     padding-block: 0;
     border-bottom-width: 0;
   }
   .app-shell[data-floating-panes]
+    [data-main-view]
     aside[aria-label="Workspace"]:not([data-maximized])
     [data-workspace-panel-content] {
     margin-top: var(--pane-cell-gap);
@@ -1399,6 +1405,7 @@ aside[aria-label="Workspace"][data-maximized] {
   /* Full screen, the body fills the window below the top row: only the corner facing the
    * sidebar is rounded, and it runs flush to the window's right and bottom edges. */
   .app-shell[data-floating-panes]
+    [data-main-view]
     aside[aria-label="Workspace"][data-maximized]
     [data-workspace-panel-content] {
     margin-top: var(--pane-cell-gap);
@@ -1410,25 +1417,33 @@ aside[aria-label="Workspace"][data-maximized] {
   }
   /* Beside the conversations sidebar, the same gap a pane card keeps there. */
   .app-shell[data-floating-panes][data-sidebar-open]
+    [data-main-view]
     aside[aria-label="Workspace"][data-maximized]
     [data-workspace-panel-content] {
     margin-left: var(--pane-cell-gap);
   }
   .dark
     .app-shell[data-floating-panes]
+    [data-main-view]
     aside[aria-label="Workspace"]
     [data-workspace-panel-content] {
     background: var(--floating-card-canvas);
   }
   /* Full screen sits on the backdrop, edge to edge with the sidebar, and paints it opaquely: it
    * covers the chat. */
-  .app-shell[data-floating-panes] aside[aria-label="Workspace"][data-maximized] {
+  .app-shell[data-floating-panes] [data-main-view] aside[aria-label="Workspace"][data-maximized] {
     border-left-width: 0;
   }
-  :root:not(.dark) .app-shell[data-floating-panes] aside[aria-label="Workspace"][data-maximized] {
+  :root:not(.dark)
+    .app-shell[data-floating-panes]
+    [data-main-view]
+    aside[aria-label="Workspace"][data-maximized] {
     background: var(--sidebar-background, var(--sidebar)) !important;
   }
-  .dark .app-shell[data-floating-panes] aside[aria-label="Workspace"][data-maximized] {
+  .dark
+    .app-shell[data-floating-panes]
+    [data-main-view]
+    aside[aria-label="Workspace"][data-maximized] {
     background-image:
       var(--floating-backdrop-image), linear-gradient(var(--sidebar), var(--sidebar)) !important;
     background-attachment: fixed !important;
@@ -1437,13 +1452,20 @@ aside[aria-label="Workspace"][data-maximized] {
 
   /* The sidebar's tabs sit on the backdrop: the selected tab takes the card's color and a soft
    * lift, the others a faint fill of their own. The fills set the tabs apart, so the dividers go. */
-  .app-shell[data-floating-panes] aside[aria-label="Workspace"] [data-tab-strip-entry] {
+  .app-shell[data-floating-panes]
+    [data-main-view]
+    aside[aria-label="Workspace"]
+    [data-tab-strip-entry] {
     background: color-mix(in srgb, var(--foreground) 5%, transparent);
   }
-  .app-shell[data-floating-panes] aside[aria-label="Workspace"] [data-tab-strip-entry]:hover {
+  .app-shell[data-floating-panes]
+    [data-main-view]
+    aside[aria-label="Workspace"]
+    [data-tab-strip-entry]:hover {
     background: color-mix(in srgb, var(--foreground) 8%, transparent);
   }
   .app-shell[data-floating-panes]
+    [data-main-view]
     aside[aria-label="Workspace"]
     [data-tab-strip-entry][data-selected] {
     background: var(--background);
@@ -1451,14 +1473,23 @@ aside[aria-label="Workspace"][data-maximized] {
       0 1px 2px rgb(0 0 0 / 8%),
       0 0 0 0.5px color-mix(in srgb, var(--foreground) 6%, transparent);
   }
-  .dark .app-shell[data-floating-panes] aside[aria-label="Workspace"] [data-tab-strip-entry] {
+  .dark
+    .app-shell[data-floating-panes]
+    [data-main-view]
+    aside[aria-label="Workspace"]
+    [data-tab-strip-entry] {
     background: color-mix(in srgb, var(--foreground) 4%, transparent);
   }
-  .dark .app-shell[data-floating-panes] aside[aria-label="Workspace"] [data-tab-strip-entry]:hover {
+  .dark
+    .app-shell[data-floating-panes]
+    [data-main-view]
+    aside[aria-label="Workspace"]
+    [data-tab-strip-entry]:hover {
     background: color-mix(in srgb, var(--foreground) 7%, transparent);
   }
   .dark
     .app-shell[data-floating-panes]
+    [data-main-view]
     aside[aria-label="Workspace"]
     [data-tab-strip-entry][data-selected] {
     background: color-mix(in srgb, var(--foreground) 11%, transparent);
@@ -1466,7 +1497,10 @@ aside[aria-label="Workspace"][data-maximized] {
       0 1px 2px rgb(0 0 0 / 45%),
       inset 0 0.5px 0 color-mix(in srgb, var(--foreground) 10%, transparent);
   }
-  .app-shell[data-floating-panes] aside[aria-label="Workspace"] [data-tab-strip-entry]::before {
+  .app-shell[data-floating-panes]
+    [data-main-view]
+    aside[aria-label="Workspace"]
+    [data-tab-strip-entry]::before {
     opacity: 0;
   }
 }

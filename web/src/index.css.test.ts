@@ -979,6 +979,22 @@ describe("index.css floating panes", () => {
     expect(outside).toEqual([]);
   });
 
+  it("styles a standalone session's panes, not a grid's", () => {
+    // A grid portals its workspace sidebar and renders its cells outside the session column.
+    const paneRules = rules.filter((rule) =>
+      /aside\[aria-label="Workspace"\]|main-terminal-view|chat-conversation-content|> main\[/.test(
+        rule.selector,
+      ),
+    );
+    expect(paneRules.length).toBeGreaterThan(10);
+    for (const rule of paneRules) {
+      for (const selector of rule.selector.split(/,\s*/)) {
+        if (selector.includes(".omnigent-sidebar-panel")) continue;
+        expect(selector).toContain("[data-main-view");
+      }
+    }
+  });
+
   it("keeps every control the edge-to-edge layout shows", () => {
     const floating = rules.filter((each) => each.selector.includes("[data-floating-panes]"));
     for (const rule of floating) {
@@ -993,7 +1009,7 @@ describe("index.css floating panes", () => {
     expect(backdrop).toContain("background: var(--floating-backdrop-image) !important");
     expect(backdrop).toContain("background-color: var(--sidebar) !important");
     const overBackdrop = ruleFor(
-      ".dark .app-shell[data-floating-panes] .omnigent-sidebar-panel:not(.is-peek), .dark .app-shell[data-floating-panes] .main-terminal-view",
+      ".dark .app-shell[data-floating-panes] .omnigent-sidebar-panel:not(.is-peek), .dark .app-shell[data-floating-panes] [data-main-view] .main-terminal-view",
     );
     expect(overBackdrop).toContain("background: none");
   });
@@ -1016,7 +1032,7 @@ describe("index.css floating panes", () => {
 
   it("sits a full-screen workspace on the backdrop, opaque over the chat it covers", () => {
     const maximized =
-      '.app-shell[data-floating-panes] aside[aria-label="Workspace"][data-maximized]';
+      '.app-shell[data-floating-panes] [data-main-view] aside[aria-label="Workspace"][data-maximized]';
     expect(ruleFor(maximized)).toContain("border-left-width: 0");
     expect(ruleFor(`:root:not(.dark) ${maximized}`)).toContain(
       "background: var(--sidebar-background, var(--sidebar)) !important",

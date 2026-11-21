@@ -252,3 +252,64 @@ def test_the_desktop_app_floats_the_panes_from_48rem_too(
     )
     expect(page.locator("html")).to_have_attribute("data-desktop-app", "true")
     assert (page.evaluate(_CHAT_RADIUS_JS) != "0px") is floats
+
+
+_GRID_WORKSPACE_STYLE_JS = """() => {
+  const aside = document.querySelector(
+    '[data-testid="grid-workspace-panel"] aside[aria-label="Workspace"]'
+  );
+  const read = (element, properties) => {
+    const style = getComputedStyle(element);
+    return Object.fromEntries(properties.map((name) => [name, style.getPropertyValue(name)]));
+  };
+  const box = ["margin-top", "margin-bottom", "border-top-width", "border-top-left-radius"];
+  return {
+    aside: read(aside, ["background-color", "background-image", "border-left-width"]),
+    strip: read(aside.querySelector(".workspace-tab-strip"), ["height", "border-bottom-width"]),
+    content: read(aside.querySelector("[data-workspace-panel-content]"), [
+      ...box,
+      "background-color",
+    ]),
+    tab: read(aside.querySelector("[data-tab-strip-entry]"), ["background-color", "box-shadow"]),
+  };
+}"""
+
+
+def _grid_workspace_style(
+    page: Page, base_url: str, sessions: tuple[str, str], *, floating: bool
+) -> dict[str, Any]:
+    _open(page, base_url, sessions[0], scheme="dark", floating=floating)
+    # A saved grid of both sessions, under this viewer's key, as dragging one onto the other saves.
+    page.evaluate(
+        """async (layout) => {
+          const me = await (await fetch("/v1/me")).json();
+          const key = `omnigent:session-grids:${location.origin}:${me.user_id}`;
+          localStorage.setItem(key, JSON.stringify([{ id: "grid-a", layout }]));
+        }""",
+        {"axis": "columns", "children": list(sessions)},
+    )
+    page.goto(f"{base_url}/grid/grid-a")
+    expect(page.get_by_test_id("session-grid")).to_be_visible(timeout=30_000)
+    # A grid has no standalone session column, which the floating rules are scoped to.
+    expect(page.locator("[data-main-view]")).to_have_count(0)
+    page.locator(f'[data-grid-session="{sessions[0]}"]').click()
+    expand = page.get_by_role("button", name="Expand grid workspace")
+    if expand.is_visible():
+        expand.click()
+    aside = page.get_by_test_id("grid-workspace-panel").get_by_role(
+        "complementary", name="Workspace"
+    )
+    expect(aside).to_be_visible()
+    page.wait_for_timeout(500)
+    return page.evaluate(_GRID_WORKSPACE_STYLE_JS)
+
+
+def test_a_grid_workspace_is_unchanged_by_floating_panes(
+    page: Page, seeded_session_pair: tuple[str, str, str]
+) -> None:
+    """A grid's workspace sidebar keeps its own strip, edges and tab fills with the flag on."""
+    base_url, first, second = seeded_session_pair
+    floating = _grid_workspace_style(page, base_url, (first, second), floating=True)
+    expect(page.locator(".app-shell[data-floating-panes]")).to_have_count(1)
+    flat = _grid_workspace_style(page, base_url, (first, second), floating=False)
+    assert floating == flat

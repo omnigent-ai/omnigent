@@ -122,8 +122,8 @@ turns it on. With it off, the sidebar is unchanged.
 too. `-floating_panes` turns floating panes off and `floating_panes` turns them
 on, whatever sidebar v2 does. With floating panes, a session's chat and the
 workspace sidebar are rounded cards on the left sidebar's color, below one top
-row, from 48rem wide in a browser and the desktop app alike. Touch clients
-and narrower windows keep the edge-to-edge layout.
+row, from 48rem wide in a browser and the desktop app alike. Grids, touch
+clients and narrower windows keep the edge-to-edge layout.
 
 ## Data
 
