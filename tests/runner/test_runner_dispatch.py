@@ -13567,15 +13567,19 @@ def _contract_root_spec(*, with_child: bool) -> AgentSpec:
 class _ContractSnapshotClient(NullServerClient):
     """Session snapshot naming the requested sub-agent."""
 
-    def __init__(self, conv: str, *, project_orchestrator: bool = False) -> None:
+    def __init__(
+        self, conv: str, *, project_orchestrator: bool = False, project_id: str | None = None
+    ) -> None:
         super().__init__()
         self._conv = conv
         self._project_orchestrator = project_orchestrator
+        self._project_id = project_id
 
     async def get(self, url: str, **kwargs: object) -> NullServerClient._Response:
         del kwargs
         _conv = self._conv
         project_orchestrator = self._project_orchestrator
+        project_id = self._project_id
 
         class _Resp(NullServerClient._Response):
             status_code = 200
@@ -13585,6 +13589,7 @@ class _ContractSnapshotClient(NullServerClient):
                     "agent_id": "ag_contract_root",
                     "sub_agent_name": "worker",
                     "project_orchestrator": project_orchestrator,
+                    "project_id": project_id,
                 }
 
         if url.endswith(f"/v1/sessions/{_conv}"):
@@ -13683,20 +13688,28 @@ _CONTRACT_ADAPTERS = {
 
 
 @pytest.mark.parametrize("path", ["no_harness", "known_harness", "background"])
-@pytest.mark.parametrize("orchestrator", [True, False])
-async def test_project_role_is_session_scoped_across_dispatch_paths(path, orchestrator):
+@pytest.mark.parametrize(
+    "orchestrator,project_id", [(True, "project"), (False, "project"), (False, None)]
+)
+async def test_project_role_is_session_scoped_across_dispatch_paths(
+    path, orchestrator, project_id
+):
     from omnigent.runner.project_orchestrator import PROJECT_ORCHESTRATOR_INSTRUCTION
+    from omnigent.runtime.project_ticket_instructions import PROJECT_TICKET_WORK_INSTRUCTION
 
     conv = f"conv_project_{path}_{orchestrator}"
     recording = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
     app = create_runner_app(
         process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording)),
         spec_resolver=_contract_resolver_for("child_present", []),
-        server_client=_ContractSnapshotClient(conv, project_orchestrator=orchestrator),
+        server_client=_ContractSnapshotClient(
+            conv, project_orchestrator=orchestrator, project_id=project_id
+        ),
     )
     async with _runner_test_client(app) as http:
         result = await _CONTRACT_ADAPTERS[path](http, conv, recording)
     assert "Worker instructions." in result["instructions"]
+    assert (PROJECT_TICKET_WORK_INSTRUCTION in result["instructions"]) is (project_id is not None)
     assert (PROJECT_ORCHESTRATOR_INSTRUCTION in result["instructions"]) is orchestrator
 
 

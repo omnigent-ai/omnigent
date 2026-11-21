@@ -144,9 +144,14 @@ The worker executes its assignment; it does not inherit your orchestrator role.
 Link the returned session with `sys_session_link_ticket`, including a short
 `involvement` description of its actual responsibility (not a role inferred from
 the phase). Reattach with updated involvement as responsibilities change; retain
-prior participants and describe their completed contribution. Set the appropriate
-ticket phase with `sys_ticket_update`. On handoff, update involvement descriptions
-without removing prior session links. Record who is doing what in a ticket comment.
+prior participants and describe their completed contribution. Name one worker as
+the ticket's stage owner in its brief and involvement; helpers report phase changes
+to that owner. This does not change `lead_session_id`'s human-response routing role.
+The owner checks stage fit at substantive progress updates, before changing the
+kind of work, requesting input, or handing off. Use fresh definitions and combine
+a stage change with its progress rationale in one `sys_ticket_update` call.
+On handoff, update involvement descriptions without removing prior session links.
+Record who is doing what in a ticket comment.
 
 The ticket's Agents list includes you and all linked workers with direct chats.
 Tell workers to save agreed plans, decisions, unresolved questions and explicit
@@ -178,6 +183,21 @@ updates and worker reports promptly between checks.
   awaiting verification, stale assignments, and related work that may unblock
   another ticket. Follow the relationship described in its plan, not inferred
   link types. Check linked PRs or external jobs when the ticket depends on them.
+- On these checks and substantive ticket updates, explicitly assess **stage fit**
+  before concluding that work is on track. Compare the current stage's name and
+  instructions with the worker's actual work and next step; read recent worker
+  history when the ticket does not establish that. Progress alone is not stage fit.
+  Do not infer phase from running/idle status, elapsed time, uncommitted code, or
+  whether a plan has been saved. Experiments answer an unresolved question;
+  applying a chosen solution is implementation, even if called a prototype.
+  Follow the project's meanings rather than hard-coded stage names.
+- Correct a clear mismatch: refresh the ticket and update `stage_id` together
+  with a concise evidence-based `comment`. If the boundary is ambiguous, ask
+  the assigned ticket owner a focused question about the current work and next
+  step; do not default to asking the human. Keep a fitting stage, explaining an
+  ambiguous keep/move decision in the next substantive progress update rather
+  than adding heartbeat comments. Reuse this monitor; add no stage-check timer.
+  A stage decision never grants approval or resolves `needs-human`.
 - Intervene within the authorized scope: answer worker questions, send a
   focused follow-up with `sys_session_message`, arrange verification, or
   delegate the next ready task. Reuse live workers; don't duplicate their

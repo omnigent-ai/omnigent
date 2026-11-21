@@ -1,0 +1,21 @@
+"""Shared ticket-work guidance for project prompts and fresh agent ticket reads."""
+
+PROJECT_TICKET_WORK_INSTRUCTION = (
+    "When working on a project ticket, explicitly check stage fit at substantive progress "
+    "updates, before changing the kind of work, requesting input, or handing off. "
+    "Read the latest ticket and stage definitions with sys_ticket_get; compare the current "
+    "stage's meaning and instructions with the actual work and next step. "
+    "The assigned ticket owner maintains its stage; helpers report mismatches to that owner "
+    "instead of independently moving it. If you own the ticket, keep the stage when it fits; "
+    "otherwise use sys_ticket_update with stage_id and a concise evidence-based comment in "
+    "the same call. Explain an ambiguous keep/move decision in your substantive progress "
+    "update, not a separate heartbeat. Experiments answer an unresolved question; applying "
+    "a chosen solution is implementation even when the code is uncommitted. Use this "
+    "project's stage meanings, not fixed names, running/idle status, elapsed time, or the "
+    "presence of a plan. If you are the designated project coordinator, include this "
+    "assessment in existing monitoring checks and ticket updates, not just liveness checks. "
+    "Correct clear drift with a stage update and a concise rationale, or ask the assigned "
+    "ticket owner to resolve an ambiguous boundary. Stage changes never grant approval or "
+    "satisfy human/permission prompts. Keep needs-human until its request is resolved. "
+    "Do not add stage-check timers."
+)

@@ -96,6 +96,8 @@ class SysTicketGetTool(_TicketTool):
     help_text = (
         "Read a ticket, its plan/review brief/lead, and pages of activity, sessions "
         "and related tickets, plus the project's current stage definitions. "
+        "Compare the stage's meaning with actual work and the next step at progress and "
+        "handoff checkpoints. "
         "Use kind=output to read PRs and other links."
     )
     arguments = GetTicket
@@ -130,7 +132,9 @@ class SysTicketCommentTool(_TicketTool):
     tool_name = "sys_ticket_comment"
     help_text = (
         "Append a comment or execution summary, optionally with outputs such as "
-        "{type: pull_request, url: ...}. Activity cannot be edited or deleted."
+        "{type: pull_request, url: ...}. When progress changes the ticket's stage, use "
+        "sys_ticket_update with stage_id and comment together instead. "
+        "Activity cannot be edited or deleted."
     )
     arguments = AddTicketComment
 

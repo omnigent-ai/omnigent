@@ -8,11 +8,13 @@ from omnigent.runner.project_orchestrator import (
     PROJECT_ORCHESTRATOR_INSTRUCTION,
     append_project_orchestrator_instructions,
 )
+from omnigent.runtime.project_ticket_instructions import PROJECT_TICKET_WORK_INSTRUCTION
 from omnigent.spec.types import AgentSpec, ToolGroupsConfig
 
 
 @pytest.mark.parametrize("role", [True, False, None, "true"])
-async def test_only_designated_orchestrator_gets_the_role_in_native_and_sdk_prompts(role):
+@pytest.mark.parametrize("project_id", [None, "project"])
+async def test_project_guidance_and_designated_role_in_native_and_sdk_prompts(role, project_id):
     spec = AgentSpec(
         spec_version=1,
         instructions="Shared agent instructions",
@@ -29,7 +31,7 @@ async def test_only_designated_orchestrator_gets_the_role_in_native_and_sdk_prom
             "include_live_status": "false",
             "include_usage": "false",
         }
-        return httpx.Response(200, json={"project_orchestrator": role})
+        return httpx.Response(200, json={"project_orchestrator": role, "project_id": project_id})
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(respond), base_url="http://server.test"
@@ -42,8 +44,25 @@ async def test_only_designated_orchestrator_gets_the_role_in_native_and_sdk_prom
     assert native.startswith(spec.instructions)
     assert sdk.startswith("Shared agent instructions\n\nRequest instructions")
     for prompt in (native, sdk):
+        assert (PROJECT_TICKET_WORK_INSTRUCTION in prompt) is (project_id is not None)
         assert (PROJECT_ORCHESTRATOR_INSTRUCTION in prompt) is (role is True)
     assert spec.instructions == "Shared agent instructions"
+
+
+def test_stage_fit_contract_requires_a_decision_without_phase_or_approval_shortcuts():
+    assert "stage fit" in PROJECT_TICKET_WORK_INSTRUCTION
+    assert "actual work and next step" in PROJECT_TICKET_WORK_INSTRUCTION
+    assert "ticket owner" in PROJECT_TICKET_WORK_INSTRUCTION
+    assert "never grant approval" in PROJECT_TICKET_WORK_INSTRUCTION
+    assert "substantive progress" in PROJECT_TICKET_WORK_INSTRUCTION
+    assert "stage_id and a concise evidence-based comment in the same call" in (
+        PROJECT_TICKET_WORK_INSTRUCTION
+    )
+    assert "helpers report mismatches" in PROJECT_TICKET_WORK_INSTRUCTION
+    assert "implementation even when the code is uncommitted" in PROJECT_TICKET_WORK_INSTRUCTION
+    assert "Keep needs-human until its request is resolved" in PROJECT_TICKET_WORK_INSTRUCTION
+    assert "existing monitoring checks" in PROJECT_TICKET_WORK_INSTRUCTION
+    assert "resolve an ambiguous boundary" in PROJECT_TICKET_WORK_INSTRUCTION
 
 
 async def test_agent_without_project_tools_has_no_role_or_server_lookup():

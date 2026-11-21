@@ -13,6 +13,7 @@ from omnigent.host.frames import (
     decode_host_frame,
 )
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+from omnigent.runtime.project_ticket_instructions import PROJECT_TICKET_WORK_INSTRUCTION
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, RESERVED_USER_PUBLIC
 from omnigent.server.project_ticket_notifications import ProjectTicketNotifications
 from omnigent.server.routes import project_tickets as ticket_routes
@@ -274,6 +275,11 @@ async def test_custom_stage_api_and_ticket_tools_share_real_project_definitions(
 
     project = (await project_client.post("/v1/projects", json={"name": "Response"})).json()
     base = f"/v1/projects/{project['id']}/tickets"
+    source = project["orchestrator_session_id"]
+    empty = json.loads(await execute_ticket_tool("sys_ticket_list", {}, project_client, source))
+    assert empty["data"] == []
+    assert empty["agent_guidance"] == PROJECT_TICKET_WORK_INSTRUCTION
+    assert "agent_guidance" not in (await project_client.get(base)).json()
     stages = await project_client.get(base + "/stages")
     assert stages.status_code == 200 and stages.json()["initial_stage_id"] == "open"
     ticket = (await project_client.post(base, json={"title": "Investigate"})).json()
@@ -298,11 +304,13 @@ async def test_custom_stage_api_and_ticket_tools_share_real_project_definitions(
     assert (await project_client.get(base + "/stages", params={"include_usage": True})).json()[
         "occupied_stage_ids"
     ] == ["triage"]
-    assert (await project_client.get(f"{base}/{ticket['id']}")).json()["stage_id"] == "triage"
+    human_ticket = (await project_client.get(f"{base}/{ticket['id']}")).json()
+    assert human_ticket["stage_id"] == "triage"
+    assert "agent_guidance" not in human_ticket
     assert (await project_client.post(base, json={"title": "Next"})).json()["stage_id"] == "triage"
-    source = project["orchestrator_session_id"]
     listed = json.loads(await execute_ticket_tool("sys_ticket_list", {}, project_client, source))
     assert listed["stages"] == response.json()["stages"]
+    assert listed["agent_guidance"] == PROJECT_TICKET_WORK_INSTRUCTION
     detail = json.loads(
         await execute_ticket_tool(
             "sys_ticket_get", {"ticket_id": ticket["id"]}, project_client, source
@@ -311,6 +319,7 @@ async def test_custom_stage_api_and_ticket_tools_share_real_project_definitions(
     assert detail["stages"][1]["instructions"] == "Attach recovery evidence"
     assert detail["stages"][1]["color"] == "purple"
     assert detail["stages"][1]["icon"] == "search"
+    assert detail["ticket"]["agent_guidance"] == PROJECT_TICKET_WORK_INSTRUCTION
     moved = json.loads(
         await execute_ticket_tool(
             "sys_ticket_update",
@@ -379,6 +388,12 @@ async def test_agent_source_is_project_scoped_owned_bound_and_private(multi_user
     response = await client.post(path, json={"title": "Agent ticket"}, headers=headers)
     assert response.status_code == 201, response.text
     ticket_id = response.json()["id"]
+    assert (await client.get(path, headers=headers)).json()["agent_guidance"] == (
+        PROJECT_TICKET_WORK_INSTRUCTION
+    )
+    assert (await client.get(f"{path}/{ticket_id}", headers=headers)).json()["agent_guidance"] == (
+        PROJECT_TICKET_WORK_INSTRUCTION
+    )
     events = (await client.get(f"{path}/{ticket_id}/events", headers=headers)).json()["data"]
     assert events[0]["session_id"] == source.id and events[0]["user_id"] == ALICE
     stages = (await client.get(path + "/stages", headers=headers)).json()

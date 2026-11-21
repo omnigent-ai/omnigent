@@ -1,9 +1,10 @@
-"""Deliver the project role without changing an agent's authored instructions."""
+"""Deliver project ticket guidance without changing an agent's authored instructions."""
 
 from __future__ import annotations
 
 import httpx
 
+from omnigent.runtime.project_ticket_instructions import PROJECT_TICKET_WORK_INSTRUCTION
 from omnigent.runtime.prompt import append_framework_instructions
 from omnigent.spec import AgentSpec
 
@@ -27,7 +28,7 @@ async def project_orchestrator_instructions(
     session_id: str,
     spec: AgentSpec | None,
 ) -> str | None:
-    """Resolve the role from the server's project reference, never from an agent or title."""
+    """Resolve ticket guidance and the role from the session, never its agent or title."""
     if server_client is None or spec is None or not spec.tool_groups.projects:
         return None
     response = await server_client.get(
@@ -45,9 +46,14 @@ async def project_orchestrator_instructions(
     if response.status_code >= 400:
         response.raise_for_status()
     snapshot = response.json()
-    if isinstance(snapshot, dict) and snapshot.get("project_orchestrator") is True:
-        return PROJECT_ORCHESTRATOR_INSTRUCTION
-    return None
+    if not isinstance(snapshot, dict):
+        return None
+    instructions = []
+    if snapshot.get("project_id"):
+        instructions.append(PROJECT_TICKET_WORK_INSTRUCTION)
+    if snapshot.get("project_orchestrator") is True:
+        instructions.append(PROJECT_ORCHESTRATOR_INSTRUCTION)
+    return "\n\n".join(instructions) or None
 
 
 async def append_project_orchestrator_instructions(

@@ -113,7 +113,10 @@ def test_orchestrator_skill_is_available_without_workflows_and_respects_project_
     from omnigent.spec.types import AgentSpec, ToolGroupsConfig
 
     _ensure_orchestrator_skills_in_bundle(tmp_path, AgentSpec(spec_version=1))
-    assert (tmp_path / "skills" / "orchestrator" / "SKILL.md").is_file()
+    skill = (tmp_path / "skills" / "orchestrator" / "SKILL.md").read_text()
+    assert "explicitly assess **stage fit**" in skill
+    assert "Progress alone is not stage fit" in skill
+    assert "A stage decision never grants approval or resolves `needs-human`" in skill
     assert not (tmp_path / "skills" / "workflow").exists()
     sources = codex_skill_sources(tmp_path, tmp_path / "fake-home").linked
     assert "orchestrator" in select_codex_skill_dirs("all", sources)

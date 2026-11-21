@@ -23,6 +23,7 @@ from omnigent.entities.project_ticket import (
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+from omnigent.runtime.project_ticket_instructions import PROJECT_TICKET_WORK_INSTRUCTION
 from omnigent.server.auth import LEVEL_EDIT, RESERVED_USER_PUBLIC, AuthProvider
 from omnigent.server.routes._auth_helpers import require_access, require_user
 from omnigent.server.routes._sessions.common import _session_status_cache
@@ -140,6 +141,8 @@ def create_project_tickets_router(
             after=after,
             limit=limit,
         )
+        if who.session_id is not None:
+            page["agent_guidance"] = PROJECT_TICKET_WORK_INSTRUCTION
         if not page["data"]:
             return page
         links = await asyncio.to_thread(
@@ -208,7 +211,10 @@ def create_project_tickets_router(
     @router.get("/{ticket_id}")
     async def get_ticket(request: Request, project_id: str, ticket_id: str) -> dict[str, Any]:
         who = await actor(request, project_id)
-        return await asyncio.to_thread(store.get, project_id, ticket_id, user_id=who.user_id)
+        ticket = await asyncio.to_thread(store.get, project_id, ticket_id, user_id=who.user_id)
+        if who.session_id is not None:
+            ticket["agent_guidance"] = PROJECT_TICKET_WORK_INSTRUCTION
+        return ticket
 
     @router.patch("/{ticket_id}")
     async def update_ticket(
