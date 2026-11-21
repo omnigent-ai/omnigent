@@ -214,13 +214,14 @@ describe("lineBreakdown", () => {
       reviewFile("assets/empty.bin", "added", { isBinary: true }),
     ];
     const { totals, languages } = lineBreakdown(listed, sourceCounts);
-    expect(totals).toEqual({ additions: 20, deletions: 36 });
+    expect(totals).toEqual({ files: 5, additions: 20, deletions: 36 });
     const sum = languages.reduce(
       (acc, entry) => ({
+        files: acc.files + entry.files,
         additions: acc.additions + entry.additions,
         deletions: acc.deletions + entry.deletions,
       }),
-      { additions: 0, deletions: 0 },
+      { files: 0, additions: 0, deletions: 0 },
     );
     expect(sum).toEqual(totals);
     expect(languages.reduce((count, entry) => count + entry.files, 0)).toBe(listed.length);
@@ -253,10 +254,36 @@ describe("lineBreakdown", () => {
     ]);
   });
 
+  it("totals the files not viewed apart, while languages count every file", () => {
+    const listed = [
+      reviewFile("a.ts", "modified", { additions: 10, deletions: 2 }),
+      reviewFile("b.ts", "modified", { additions: 5, deletions: 1 }),
+      reviewFile("c.py", "added", { additions: 3, deletions: 0 }),
+    ];
+    const breakdown = lineBreakdown(listed, sourceCounts, (file) => file.path === "a.ts");
+    expect(breakdown.totals).toEqual({ files: 3, additions: 18, deletions: 3 });
+    expect(breakdown.notViewed).toEqual({ files: 2, additions: 8, deletions: 1 });
+    expect(breakdown.languages[0]).toEqual({
+      language: "TypeScript",
+      files: 2,
+      additions: 15,
+      deletions: 3,
+    });
+    // Nothing viewed: both totals agree; everything viewed: none left.
+    expect(lineBreakdown(listed, sourceCounts).notViewed).toEqual(
+      lineBreakdown(listed, sourceCounts).totals,
+    );
+    expect(lineBreakdown(listed, sourceCounts, () => true).notViewed).toEqual({
+      files: 0,
+      additions: 0,
+      deletions: 0,
+    });
+  });
+
   it("takes every file's counts from the one source the totals use, such as a loaded diff", () => {
     const listed = [reviewFile("a.ts", "modified", { additions: 100, deletions: 100 })];
     const loaded = lineBreakdown(listed, () => ({ additions: 7, deletions: 1 }));
-    expect(loaded.totals).toEqual({ additions: 7, deletions: 1 });
+    expect(loaded.totals).toEqual({ files: 1, additions: 7, deletions: 1 });
     expect(loaded.languages[0]).toMatchObject({ additions: 7, deletions: 1 });
   });
 });

@@ -15,7 +15,8 @@ import { DiffReviewToolbar, DiffReviewToolbarProgress } from "./DiffReviewToolba
 /** One TypeScript file's worth of line counts. */
 function breakdownOf(additions: number, deletions: number): LineBreakdown {
   return {
-    totals: { additions, deletions },
+    totals: { files: 1, additions, deletions },
+    notViewed: { files: 1, additions, deletions },
     languages: [{ language: "TypeScript", files: 1, additions, deletions }],
   };
 }

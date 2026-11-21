@@ -1534,6 +1534,18 @@ describe("file headers", () => {
     expect(itemFor(SECOND).collapsed).toBe(false);
   });
 
+  it("leaves a viewed file out of the toolbar's line counts, and counts it again once cleared", () => {
+    render(<DiffReview {...review()} />);
+    const lineCounts = () => screen.getByTestId("diff-review-line-counts");
+    const allCounts = lineCounts().textContent;
+    clickViewed(SECOND);
+    expect(lineCounts()).toHaveAccessibleName(/ in files not viewed\. /);
+    expect(lineCounts().textContent).not.toBe(allCounts);
+    clickViewed(SECOND);
+    expect(lineCounts().textContent).toBe(allCounts);
+    expect(lineCounts()).not.toHaveAccessibleName(/not viewed/);
+  });
+
   it("opens a viewed file again once its changes are edited", () => {
     const view = render(<DiffReview {...review()} />);
     clickViewed(SECOND);
@@ -1733,7 +1745,7 @@ describe("an opt-in presentation", () => {
     render(<DiffReview {...props(ready, { presentation: { toolbar } })} />);
     expect(screen.getByTestId("reference-toolbar")).toHaveTextContent("1 file");
     const given = toolbar.mock.calls.at(-1)![0];
-    expect(given.breakdown.totals).toEqual({ additions: 1, deletions: 1 });
+    expect(given.breakdown.totals).toEqual({ files: 1, additions: 1, deletions: 1 });
     expect(given.commands.length).toBeGreaterThan(0);
     expect(given.dispatchFilter).toBeTypeOf("function");
     expect(given.setFiltersOpen).toBeTypeOf("function");

@@ -192,49 +192,63 @@ export function languageCounts(
 }
 
 /** One language's share of a review's changed lines. */
-export interface LanguageLineCounts {
+export interface LanguageLineCounts extends FileLineTotals {
   language: string;
+}
+
+/** Some files' changed lines, and how many files they are. */
+export interface FileLineTotals {
   files: number;
   additions: number;
   deletions: number;
 }
 
-/** A review's line counts: in all, and per language, most changed lines first. */
+/**
+ * A review's line counts: in all, in the files not marked viewed, and per language, most
+ * changed lines first. The languages count every file, viewed or not.
+ */
 export interface LineBreakdown {
-  totals: { additions: number; deletions: number };
+  totals: FileLineTotals;
+  notViewed: FileLineTotals;
   languages: LanguageLineCounts[];
 }
 
 /**
  * Totals and per-language counts of `files` in one pass, from `countsFor`, the
  * same counts for every file, so the languages always add up to the totals.
+ * `isViewed` sets apart the files the user marked viewed.
  */
 export function lineBreakdown(
   files: readonly DiffReviewFile[],
   countsFor: (file: DiffReviewFile) => { additions: number; deletions: number },
+  isViewed: (file: DiffReviewFile) => boolean = () => false,
 ): LineBreakdown {
-  const totals = { additions: 0, deletions: 0 };
+  const totals: FileLineTotals = { files: 0, additions: 0, deletions: 0 };
+  const notViewed: FileLineTotals = { files: 0, additions: 0, deletions: 0 };
   const byLanguage = new Map<string, LanguageLineCounts>();
+  const add = (into: FileLineTotals, counts: { additions: number; deletions: number }) => {
+    into.files += 1;
+    into.additions += counts.additions;
+    into.deletions += counts.deletions;
+  };
   for (const file of files) {
     const counts = countsFor(file);
-    totals.additions += counts.additions;
-    totals.deletions += counts.deletions;
+    add(totals, counts);
+    if (!isViewed(file)) add(notViewed, counts);
     const entry = byLanguage.get(file.language) ?? {
       language: file.language,
       files: 0,
       additions: 0,
       deletions: 0,
     };
-    entry.files += 1;
-    entry.additions += counts.additions;
-    entry.deletions += counts.deletions;
+    add(entry, counts);
     byLanguage.set(file.language, entry);
   }
   const changed = (entry: LanguageLineCounts) => entry.additions + entry.deletions;
   const languages = [...byLanguage.values()].sort(
     (left, right) => changed(right) - changed(left) || left.language.localeCompare(right.language),
   );
-  return { totals, languages };
+  return { totals, notViewed, languages };
 }
 
 /** The language the filter shows alone, chosen as such; null for no filter or several. */

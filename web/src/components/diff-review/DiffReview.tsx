@@ -636,10 +636,16 @@ export function DiffReview<A = undefined>({
       if (content?.status === "ready") requestPreview(path, content.fileDiff);
     }
   }, [findOpen, shownRich, contents, requestPreview]);
-  // The toolbar's totals and its by-language breakdown come from one pass over the same counts.
+  // The toolbar's totals and its by-language breakdown come from one pass over the same counts;
+  // the toolbar counts only files not yet viewed, so marking one brings its number down.
   const breakdown = useMemo(
-    () => lineBreakdown(listedFiles, (file) => fileLineCounts(file, contents.get(file.path))),
-    [listedFiles, contents],
+    () =>
+      lineBreakdown(
+        listedFiles,
+        (file) => fileLineCounts(file, contents.get(file.path)),
+        (file) => viewedPaths.has(file.path),
+      ),
+    [listedFiles, contents, viewedPaths],
   );
   const expandablePaths = useMemo(
     () =>
