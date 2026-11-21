@@ -18,6 +18,7 @@ except ImportError:  # pragma: no cover - non-POSIX platforms have no flock
 
 import click
 
+from omnigent.onboarding.credential_tool import persistent_tool_configuration
 from omnigent.onboarding.databricks_config import normalize_workspace_url
 from omnigent.onboarding.ucode_state import read_ucode_state
 
@@ -58,6 +59,7 @@ def model_gateway_workspace_urls() -> list[str]:
     ]
 
 
+@persistent_tool_configuration
 def build_ucode_configure_command(
     ucode_command: Sequence[str],
     *,
@@ -210,6 +212,7 @@ def ucode_configure_lock() -> Iterator[None]:
         os.close(fd)
 
 
+@persistent_tool_configuration
 def build_ucode_configure_command_for_profile(
     ucode_command: Sequence[str],
     *,
