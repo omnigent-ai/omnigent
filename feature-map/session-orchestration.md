@@ -22,8 +22,10 @@ MCP independent creation.
   Existing owner-authorized reads remain allowed when a session is shared.
   `sys_session_get_info` reports the session's `permission_mode` in its
   harness's vocabulary, as `sys_session_create` takes it, including a switch
-  made while it runs; `null` when the harness has no permission modes or the
-  mode is unknown. Coverage: `tests/e2e/test_session_info_permission_mode_e2e.py`.
+  made while it runs to a mode that keeps approval. A mode that skips approval
+  shows only when the session launched in it, since anyone who can edit the
+  session can write the reported mode; `null` when the harness has no
+  permission modes or the mode is unknown. Coverage: `tests/e2e/test_session_info_permission_mode_e2e.py`.
 - `created-by`: independent workers record their creating session. The worker's
   Chat/Terminal header rechecks access when opened, hides attribution during the
   lookup, and links to the creator when accessible; otherwise it says "Created by

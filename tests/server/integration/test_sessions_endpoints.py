@@ -12260,12 +12260,18 @@ async def test_patch_approval_mode_forwards_and_persists_label(
 
 
 @pytest.mark.parametrize(
-    ("harness", "expected"),
-    [("codex-native", "read-only"), (None, None)],
-    ids=["reported-mode", "harness-without-modes"],
+    ("harness", "reported", "expected"),
+    [
+        ("codex-native", "read-only", "read-only"),
+        # Anyone who can edit the session can write the label, so it can't claim
+        # a mode that skips approval.
+        ("codex-native", "full-access", "approve-for-me"),
+        (None, "read-only", None),
+    ],
+    ids=["reported-mode", "reported-approval-skipping-mode", "harness-without-modes"],
 )
 async def test_session_snapshot_reports_its_permission_mode(
-    client: httpx.AsyncClient, harness: str | None, expected: str | None
+    client: httpx.AsyncClient, harness: str | None, reported: str, expected: str | None
 ) -> None:
     """The snapshot names the mode a session reports, over the one it launched in."""
     executor = {"type": "omnigent", "config": {"harness": harness}} if harness else None
@@ -12273,7 +12279,7 @@ async def test_session_snapshot_reports_its_permission_mode(
     session = await _create_session(
         client,
         agent["id"],
-        labels={"omnigent.codex_native.approval_mode": "read-only"},
+        labels={"omnigent.codex_native.approval_mode": reported},
         terminal_launch_args=PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
     )
 
