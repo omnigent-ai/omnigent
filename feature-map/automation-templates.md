@@ -67,7 +67,8 @@ to customize.
   update future worker instructions without rebinding the polling session.
   Permissions offers only modes that keep approval, and only on servers that advertise
   `session_create_permission_modes`. New templates give workers the automation's mode when
-  it keeps approval and the server supports it; otherwise workers use their agent's default.
+  it keeps approval and the server supports it; otherwise the server chooses their mode, as
+  `session-orchestration`'s `create` describes.
   Existing worker sessions retain their settings. Customized creation calls in a single
   Instructions field keep **Edit worker instructions**, which focuses that field. Edits
   that remove the template signature or add ambiguous section headings show a notice

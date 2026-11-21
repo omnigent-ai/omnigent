@@ -1530,6 +1530,112 @@ async def test_created_session_launches_in_the_requested_permission_mode(
     assert worker.terminal_launch_args == expected
 
 
+async def _codex_creator(auth_client, auth_app, db_uri, monkeypatch, permission_mode):
+    """Alice's runner-bound Codex session on her online host, running in *permission_mode*."""
+    from omnigent.host.frames import HostLaunchRunnerFrame, HostStatFrame, decode_host_frame
+    from tests._helpers.session import post_session_bundle
+    from tests.server.helpers import build_agent_bundle
+    from tests.server.integration.test_sessions_permissions import _register_online_host
+
+    bundle = build_agent_bundle("codex-run", executor={"config": {"harness": "codex-native"}})
+    created = await post_session_bundle(auth_client.post, "/v1/sessions", bundle)
+    assert created.status_code == 201, created.text
+    creator = created.json()
+    host_id = uuid4().hex
+    _register_online_host(auth_app, host_id, "alice")
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_host_id(creator["session_id"], host_id, workspace="/tmp")
+    store.update_conversation(
+        creator["session_id"],
+        terminal_launch_args=PERMISSION_LAUNCH_ARGS["codex-native"][permission_mode],
+    )
+    # Codex reports its live mode on this label.
+    store.set_labels(
+        creator["session_id"], {"omnigent.codex_native.approval_mode": permission_mode}
+    )
+    auth_client.headers.update(_bind_runner(db_uri, creator["session_id"]))
+
+    def answer_host(connection, payload):
+        frame = decode_host_frame(payload)
+        if isinstance(frame, HostStatFrame):
+            connection.pending_stats[frame.request_id].set_result(
+                {"status": "ok", "exists": True, "type": "directory", "canonical_path": frame.path}
+            )
+        elif isinstance(frame, HostLaunchRunnerFrame):
+            connection.pending_launches[frame.request_id].set_result({"status": "launched"})
+        else:
+            pytest.fail(f"Unexpected host frame: {frame}")
+
+    monkeypatch.setattr(auth_app.state.host_registry, "send_text", answer_host)
+    return creator
+
+
+@pytest.mark.parametrize(
+    ("creator_mode", "placement", "requested_mode", "expected"),
+    [
+        # A workflow run in Full Access hands a step to a nested agent on its host.
+        pytest.param(
+            "full-access",
+            "same_host",
+            None,
+            PERMISSION_LAUNCH_ARGS["codex-native"]["full-access"],
+            id="same-host",
+        ),
+        # Full Access was chosen for the run's host, not for a new sandbox.
+        pytest.param("full-access", "managed", None, None, id="approval-skipping-off-host"),
+        pytest.param(
+            "approve-for-me",
+            "managed",
+            None,
+            PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
+            id="managed",
+        ),
+        # The call's own choice wins, even the harness default.
+        pytest.param("full-access", "same_host", "default", None, id="requested-default"),
+        pytest.param(
+            "full-access",
+            "same_host",
+            "approve-for-me",
+            PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
+            id="requested-mode",
+        ),
+    ],
+)
+async def test_nested_agent_starts_in_its_creators_permission_mode(
+    auth_client,
+    auth_app,
+    peers,
+    db_uri,
+    monkeypatch,
+    creator_mode,
+    placement,
+    requested_mode,
+    expected,
+):
+    from omnigent.server.routes.sessions import routes_core
+
+    creator = await _codex_creator(auth_client, auth_app, db_uri, monkeypatch, creator_mode)
+
+    async def launch(**kwargs):
+        pass
+
+    monkeypatch.setattr(routes_core, "_run_managed_launch", launch)
+    arguments = {"agent_id": creator["agent_id"], "placement": placement}
+    if requested_mode is not None:
+        arguments["permission_mode"] = requested_mode
+    result = json.loads(
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(arguments),
+            server_client=auth_client,
+            conversation_id=creator["session_id"],
+        )
+    )
+    assert result.get("conversation_id"), result
+    worker = SqlAlchemyConversationStore(db_uri).get_conversation(result["conversation_id"])
+    assert worker.terminal_launch_args == expected
+
+
 @pytest.mark.parametrize(
     ("fields", "error"),
     [

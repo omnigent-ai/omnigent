@@ -1152,7 +1152,9 @@ class SysSessionCreateTool(Tool):
                                 "harness's vocabulary, e.g. Claude Code 'auto' or Codex "
                                 "'approve-for-me' (agent_id only). Modes that skip "
                                 "approval, such as 'bypassPermissions' or 'full-access', "
-                                "are refused. Omit to use the agent's default."
+                                "are refused. Omit to start it in your current mode when it "
+                                "runs your harness (a mode that skips approval only on your "
+                                "own host), else in the agent's default."
                             ),
                         },
                         "workflow_id": {
