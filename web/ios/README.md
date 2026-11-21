@@ -30,6 +30,8 @@ The transcript shows up to 12 committed messages, scanning at most 300 recent it
 activity, plus queued inputs.
 Receipt-based native approvals stay visible but require the phone for confirmation/retry;
 the watch does not expose approval buttons for that delivery protocol.
+Only form-mode yes/no prompts have watch buttons. URL-mode prompts, including internal
+server policy ASK approval URLs, and terminal-only prompts require the phone.
 After each page load or sign-in renewal the phone sends the server's API root and the cookies
 scoped to it (`WatchBridge`); the watch keeps them in its Keychain and calls the API directly.
 Signing out on the phone signs the watch out. Run the `OmnigentWatch` scheme on a paired

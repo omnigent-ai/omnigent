@@ -42,11 +42,11 @@ final class ConnectionErrorTests: XCTestCase {
     }
   }
 
-  func testNavigationFailureCallbacksUseCurrentFlag() async {
+  func testNavigationFailureCallbacksUseCurrentFlag() async throws {
     let defaultsName = "ConnectionErrorTests.\(UUID().uuidString)"
     let defaults = UserDefaults(suiteName: defaultsName)!
     defer { defaults.removePersistentDomain(forName: defaultsName) }
-    let url = URL(string: "https://server.invalid")!
+    let url = URL(string: "https://server.invalid/mounted")!
     let error = URLError(.cannotFindHost, userInfo: [NSURLErrorFailingURLErrorKey: url])
     // Nil is reserved for silent workspace cancellation; page-load failures always carry a message.
     var failures: [(URL, String?)] = []
@@ -55,7 +55,11 @@ final class ConnectionErrorTests: XCTestCase {
       databricksInternalFeaturesEnabled: false,
       loadFailed: { failures.append(($0, $1)) }, loadSucceeded: {}, pushServerPicker: {},
       requestSwitchServer: { _ in }, openServerSetup: {})
-    let coordinator = view.makeCoordinator()
+    let transport = PendingWatchTransport()
+    transport.activationState = .activated
+    let bridge = WatchBridge(defaults: defaults, transport: transport)
+    bridge.start()
+    let coordinator = OmnigentWebView.Coordinator(view, watchBridge: bridge)
     let webView = NoNetworkWebView()
     // Mirror makeUIView: failure callbacks act only for the attached, model-held view.
     view.model.webView = webView
@@ -66,6 +70,36 @@ final class ConnectionErrorTests: XCTestCase {
     coordinator.load(url, in: webView)
     defer { coordinator.detach() }
     await fulfillment(of: [loaded], timeout: 10)
+
+    let cookies = PendingWatchCookies()
+    cookies.cookies.continuation.yield([
+      HTTPCookie(properties: [
+        .name: "session", .value: "test", .domain: "server.invalid", .path: "/",
+      ])!
+    ])
+    await bridge.sync(serverURL: url, cookieStore: cookies)?.value
+    let signedIn = try XCTUnwrap(transport.contexts.last?[WatchCredentials.contextKey] as? Data)
+    XCTAssertFalse(signedIn.isEmpty)
+    for (destination, isMainFrame) in [
+      ("https://server.invalid/mounted/auth/logout", false),
+      ("https://other.invalid/mounted/auth/logout", true),
+      ("https://server.invalid/other/auth/logout", true),
+    ] {
+      XCTAssertNil(
+        coordinator.authNavigationRoute(for: URL(string: destination)!, isMainFrame: isMainFrame))
+      XCTAssertEqual(transport.contexts.last?[WatchCredentials.contextKey] as? Data, signedIn)
+    }
+    XCTAssertEqual(
+      coordinator.authNavigationRoute(
+        for: URL(string: "https://server.invalid/mounted/auth/logout?next=ignored")!,
+        isMainFrame: true),
+      .logout)
+    // No page completes and no native OIDC session exists; abandoned re-login must stay signed out.
+    XCTAssertEqual(transport.contexts.last?[WatchCredentials.contextKey] as? Data, Data())
+    XCTAssertNil(
+      coordinator.authNavigationRoute(
+        for: URL(string: "https://identity.invalid/logout")!, isMainFrame: true))
+    XCTAssertEqual(transport.contexts.last?[WatchCredentials.contextKey] as? Data, Data())
 
     for enabled in [true, false] {
       coordinator.parent = OmnigentWebView(

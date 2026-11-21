@@ -85,9 +85,9 @@ private struct SessionRow: View {
       HStack {
         Text(session.name).lineLimit(1)
         Spacer(minLength: 4)
-        if session.approvals == 0 { SessionMarker(session: session) }
+        if !session.needsResponse { SessionMarker(session: session) }
       }
-      if session.approvals > 0 {
+      if session.needsResponse {
         Text("Needs response")
           .font(.caption2.weight(.medium))
           .foregroundStyle(Color.brand)

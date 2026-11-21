@@ -658,21 +658,43 @@ final class WatchCompanionTests: XCTestCase {
         {"id": "b", "status": "running", "title": "  "},
         {"id": "c", "status": "idle", "project_id": "p1"},
         {"id": "d", "status": "failed", "project_id": "gone"},
-        {"id": "e", "status": "waiting"}
+        {"id": "e", "status": "waiting"},
+        {"id": "f", "status": "idle", "project_id": "p2"}
       ]}
       """
     let sessions = try WatchClient.decoder.decode(
       WatchPage<WatchSession>.self, from: Data(json.utf8)
     ).data
     let groups = sessions.grouped(projects: [
-      WatchProject(id: "p1", name: "Docs"), WatchProject(id: nil, name: "Legacy"),
+      WatchProject(id: "p1", name: "Docs"), WatchProject(id: "p2", name: "Docs"),
+      WatchProject(id: nil, name: "Legacy"),
     ])
-    XCTAssertEqual(groups.map(\.title), ["Docs", "Sessions"])
-    XCTAssertEqual(groups.map { $0.sessions.map(\.id) }, [["c"], ["a", "b", "d", "e"]])
+    XCTAssertEqual(groups.map(\.title), ["Docs", "Docs", "Sessions"])
+    XCTAssertEqual(groups.map(\.id), ["project:p1", "project:p2", "sessions"])
+    XCTAssertEqual(groups.map { $0.sessions.map(\.id) }, [["c"], ["f"], ["a", "b", "d", "e"]])
     XCTAssertEqual(
-      sessions.map(\.statusLabel), ["1 approval", "Running", "Ready", "Failed", "Waiting"])
+      sessions.map(\.statusLabel), ["1 approval", "Running", "Ready", "Failed", "Waiting", "Ready"])
     XCTAssertEqual(sessions[1].name, "Untitled session")
     XCTAssertEqual(sessions[2].name, "Untitled session")
+
+    let cases: [(fields: String, needsResponse: Bool, active: Bool, label: String)] = [
+      (#""status":"running","blocked_on":"permission_prompt""#, true, false, "Needs response"),
+      (#""status":"idle","background_work_running":true"#, false, true, "Background work"),
+      (#""status":"failed","background_work_running":true"#, false, false, "Failed"),
+      (
+        #""status":"running","blocked_on":"permission_prompt","pending_elicitations_count":1"#,
+        true, false, "1 approval"
+      ),
+      (#""status":"idle","blocked_on":"permission_prompt""#, false, false, "Ready"),
+      (#""status":"running","blocked_on":"""#, false, true, "Running"),
+    ]
+    for testCase in cases {
+      let session = try WatchClient.decoder.decode(
+        WatchSession.self, from: Data("{\"id\":\"state\",\(testCase.fields)}".utf8))
+      XCTAssertEqual(session.needsResponse, testCase.needsResponse, testCase.fields)
+      XCTAssertEqual(session.isActive, testCase.active, testCase.fields)
+      XCTAssertEqual(session.statusLabel, testCase.label, testCase.fields)
+    }
   }
 
   func testSnapshotDecodesMessagesQueuedInputsAndApprovals() throws {
@@ -763,7 +785,7 @@ final class WatchCompanionTests: XCTestCase {
 }
 
 @MainActor
-private final class PendingWatchTransport: WatchSessionTransport {
+final class PendingWatchTransport: WatchSessionTransport {
   weak var delegate: (any WCSessionDelegate)?
   var activationState = WCSessionActivationState.notActivated
   var isWatchAppInstalled = true
@@ -779,7 +801,7 @@ private final class PendingWatchTransport: WatchSessionTransport {
 }
 
 @MainActor
-private final class PendingWatchCookies: WatchCookieStore {
+final class PendingWatchCookies: WatchCookieStore {
   let cookies = AsyncStream<[HTTPCookie]>.makeStream()
 
   func allCookies() async -> [HTTPCookie] {

@@ -44,6 +44,8 @@ struct WatchSession: Decodable, Hashable, Identifiable, Sendable {
   let projectId: String?
   var status: String
   var pendingElicitationsCount: Int?
+  let blockedOn: String?
+  let backgroundWorkRunning: Bool?
   let updatedAt: TimeInterval?
   let viewerUnread: Bool?
 
@@ -52,19 +54,27 @@ struct WatchSession: Decodable, Hashable, Identifiable, Sendable {
     return title.isEmpty ? "Untitled session" : title
   }
   var approvals: Int { pendingElicitationsCount ?? 0 }
+  var needsResponse: Bool {
+    approvals > 0 || (status == "running" && !(blockedOn ?? "").isEmpty)
+  }
   var updated: Date? { updatedAt.map(Date.init(timeIntervalSince1970:)) }
-  var isActive: Bool { status == "running" || status == "waiting" }
+  var isActive: Bool {
+    !needsResponse
+      && (status == "running" || (status != "failed" && backgroundWorkRunning == true))
+  }
   var statusLabel: String {
     if approvals > 0 { return approvals == 1 ? "1 approval" : "\(approvals) approvals" }
+    if needsResponse { return "Needs response" }
+    if isActive && status != "running" { return "Background work" }
     return status == "idle" ? "Ready" : status.capitalized
   }
 }
 
 struct WatchSessionGroup: Identifiable, Sendable {
+  let id: String
   let title: String
   let symbol: String
   let sessions: [WatchSession]
-  var id: String { symbol + title }
 }
 
 extension [WatchSession] {
@@ -74,11 +84,15 @@ extension [WatchSession] {
     let byProject = projects.compactMap { project in
       project.id.map { id in
         WatchSessionGroup(
-          title: project.name, symbol: "folder", sessions: filter { $0.projectId == id })
+          id: "project:" + id, title: project.name, symbol: "folder",
+          sessions: filter { $0.projectId == id })
       }
     }
     let others = filter { !projectIDs.contains($0.projectId ?? "") }
-    return (byProject + [WatchSessionGroup(title: "Sessions", symbol: "", sessions: others)])
+    return
+      (byProject + [
+        WatchSessionGroup(id: "sessions", title: "Sessions", symbol: "", sessions: others)
+      ])
       .filter { !$0.sessions.isEmpty }
   }
 }
