@@ -63,13 +63,10 @@ import {
   FoldVerticalIcon,
   MessagesSquareIcon,
   MinusIcon,
-  MonitorIcon,
-  MoonIcon,
   PanelRightCloseIcon,
   PanelRightIcon,
   PinIcon,
   PlusIcon,
-  SunIcon,
   SquareCheckIcon,
   SquareIcon,
   TerminalIcon,
@@ -276,7 +273,6 @@ import {
   writeCodeBlockWordWrap,
 } from "@/lib/codeWrapPreferences";
 import {
-  readTerminalThemeMode,
   TERMINAL_THEME_DEFAULT,
   writeTerminalThemeMode,
   type TerminalThemeMode,
@@ -342,7 +338,13 @@ import {
   type DefaultWorkspaceTab,
 } from "@/lib/workspaceTabPreferences";
 import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
-import { readAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
+import { useAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
+import {
+  THEME_MODE_OPTIONS,
+  TERMINAL_THEME_OPTIONS,
+  themeModeLabel,
+} from "@/components/theme/themeModeOptions";
+import { useTerminalThemeMode } from "@/components/theme/useTerminalIsDark";
 import {
   readOpenSubagentsInPanel,
   writeOpenSubagentsInPanel,
@@ -384,15 +386,17 @@ import {
   writeSwipeActions,
 } from "@/lib/swipeActionPreferences";
 import {
-  applyThemePalette,
   DEFAULT_PALETTE,
   isThemeSelection,
   PALETTES,
   type PaletteSwatch,
-  readThemePalette,
   type ThemeSelection,
-  writeThemePalette,
 } from "@/lib/themePalette";
+import {
+  commitThemePalette,
+  reloadThemePalette,
+  useThemePaletteSelection,
+} from "@/store/themePalette";
 import {
   applyCustomTheme,
   createCustomThemeFromPalette,
@@ -556,18 +560,6 @@ function Section({
   );
 }
 
-const themeCards: { mode: ThemeMode; label: string; icon: typeof SunIcon }[] = [
-  { mode: "system", label: "System", icon: MonitorIcon },
-  { mode: "light", label: "Light", icon: SunIcon },
-  { mode: "dark", label: "Dark", icon: MoonIcon },
-];
-
-const terminalThemeCards: { mode: TerminalThemeMode; label: string; icon: typeof SunIcon }[] = [
-  { mode: "auto", label: "Match app", icon: MonitorIcon },
-  { mode: "light", label: "Light", icon: SunIcon },
-  { mode: "dark", label: "Dark", icon: MoonIcon },
-];
-
 const transcriptViewCards: {
   value: TranscriptViewDefault;
   label: string;
@@ -702,11 +694,11 @@ function ModeControl() {
           value={mode}
           onSelect={(next) => setTheme(next)}
           componentId="settings.appearance.theme_mode"
-          items={themeCards.map((card) => ({
-            value: card.mode,
-            testId: `theme-${card.mode}`,
-            label: card.mode === "system" && followsHost ? "Use Databricks setting" : card.label,
-            icon: card.icon,
+          items={THEME_MODE_OPTIONS.map((option) => ({
+            value: option.mode,
+            testId: `theme-${option.mode}`,
+            label: themeModeLabel(option.mode, followsHost),
+            icon: option.icon,
           }))}
         />
       </SettingsOwner>
@@ -716,11 +708,7 @@ function ModeControl() {
 
 /** Terminal light/dark/match-app theme — its own section. */
 function TerminalThemeControl() {
-  const [mode, setMode] = useState(() => readTerminalThemeMode());
-  const choose = useCallback((next: TerminalThemeMode) => {
-    setMode(next);
-    writeTerminalThemeMode(next);
-  }, []);
+  const mode = useTerminalThemeMode();
   return (
     <SettingsItem entry={TERMINAL_THEME_ENTRY} className="flex items-center justify-between gap-4">
       <SettingsEntryLabel entry={TERMINAL_THEME_ENTRY} className="flex-1" />
@@ -728,13 +716,13 @@ function TerminalThemeControl() {
         <IconSegmentedControl<TerminalThemeMode>
           labelledBy={settingsLabelId(TERMINAL_THEME_ENTRY)}
           value={mode}
-          onSelect={choose}
+          onSelect={writeTerminalThemeMode}
           componentId="settings.appearance.terminal_theme"
-          items={terminalThemeCards.map((card) => ({
-            value: card.mode,
-            testId: `terminal-theme-${card.mode}`,
-            label: card.label,
-            icon: card.icon,
+          items={TERMINAL_THEME_OPTIONS.map((option) => ({
+            value: option.mode,
+            testId: `terminal-theme-${option.mode}`,
+            label: option.label,
+            icon: option.icon,
           }))}
         />
       </SettingsOwner>
@@ -941,15 +929,14 @@ function ColorThemeControl() {
   // Render each chip in the currently-resolved mode so it matches the app now
   // (honoring the embed's forced theme, not just next-themes' resolvedTheme).
   const isDark = useResolvedThemeMode() === "dark";
-  const [selection, setSelection] = useState<ThemeSelection>(() => readThemePalette());
+  // Shared with the theme picker, so a palette chosen there shows here.
+  const selection = useThemePaletteSelection();
   const [customTheme, setCustomTheme] = useState<CustomTheme>(() => readCustomTheme());
 
   const choose = useCallback(
     (next: ThemeSelection) => {
       if (next === "custom") applyCustomTheme(customTheme);
-      setSelection(next);
-      writeThemePalette(next);
-      applyThemePalette(next);
+      commitThemePalette(next);
     },
     [customTheme],
   );
@@ -975,9 +962,7 @@ function ColorThemeControl() {
       setCustomTheme(next);
       writeCustomTheme(next);
       applyCustomTheme(next);
-      setSelection("custom");
-      writeThemePalette("custom");
-      applyThemePalette("custom");
+      commitThemePalette("custom");
     },
     [customTheme, selection],
   );
@@ -1476,8 +1461,7 @@ function AppearanceSection() {
 
     writeTerminalThemeMode(TERMINAL_THEME_DEFAULT);
 
-    writeThemePalette(DEFAULT_PALETTE);
-    applyThemePalette(DEFAULT_PALETTE);
+    commitThemePalette(DEFAULT_PALETTE);
     writeCustomTheme(DEFAULT_CUSTOM_THEME);
     applyCustomTheme(DEFAULT_CUSTOM_THEME);
 
@@ -1569,7 +1553,7 @@ function AppearanceSection() {
       if (themeMode && isThemeMode(themeMode)) setTheme(themeMode);
       applyStoredUiFontSize();
       applyUiFontFamily(readUiFontFamily());
-      applyThemePalette(readThemePalette());
+      reloadThemePalette();
       applyCustomTheme(readCustomTheme());
 
       setIsImportDialogOpen(false);
@@ -2163,18 +2147,14 @@ function DatabricksIntegrationControl() {
  * Dispatch for messages sent while the agent is working (on by default).
  */
 function AlwaysSteerControl() {
-  const [value, setValue] = useState(() => readAlwaysSteer());
-  const toggle = useCallback((next: boolean) => {
-    setValue(next);
-    writeAlwaysSteer(next);
-  }, []);
+  const value = useAlwaysSteer();
   return (
     <SettingsItem entry={ALWAYS_STEER_ENTRY} className="flex items-start justify-between gap-6">
       <SettingsEntryLabel entry={ALWAYS_STEER_ENTRY} className="flex-1" />
       <Switch
         {...settingsControlProps(ALWAYS_STEER_ENTRY)}
         checked={value}
-        onCheckedChange={toggle}
+        onCheckedChange={writeAlwaysSteer}
         data-testid="always-steer-toggle"
         className="mt-0.5 shrink-0"
         componentId="settings.general.always_steer"

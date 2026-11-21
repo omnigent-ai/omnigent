@@ -233,6 +233,37 @@ def test_tabs_sidebar_files_history_and_pull_request(
         assert any(marker in body for body in bodies), marker
 
 
+def test_file_link_opens_its_comment_in_a_full_screen_sidebar(
+    page: Page, workspace_session: tuple[str, str]
+) -> None:
+    """A ``?file=`` link with ``comment`` and ``fullscreen=1`` shows that thread, full screen."""
+    base_url, session_id = workspace_session
+    anchor = "hello"
+    response = httpx.post(
+        f"{base_url}/v1/sessions/{session_id}/comments",
+        json={
+            "path": _FILE,
+            "body": "Say goodbye too",
+            "start_index": "print('hello')".index(anchor),
+            "end_index": "print('hello')".index(anchor) + len(anchor),
+            "anchor_content": anchor,
+        },
+        timeout=10.0,
+    )
+    response.raise_for_status()
+    comment_id = response.json()["id"]
+    _set_flag(page, True)
+    page.set_viewport_size(_VIEWPORTS["desktop"])
+    page.goto(f"{base_url}/c/{session_id}?file={_FILE}&comment={comment_id}&fullscreen=1")
+
+    sidebar = page.get_by_role("complementary", name="Workspace")
+    viewer = sidebar.get_by_test_id("file-viewer")
+    expect(viewer).to_contain_text("Say goodbye too", timeout=60_000)
+    expect(page.locator("[data-maximized]")).to_have_count(1)
+    # The link is handed to the tab, so a reload doesn't open it again.
+    expect(page).not_to_have_url(re.compile(r"[?&](?:file|comment|fullscreen)="))
+
+
 def _press_palette(page: Page) -> Locator:
     """Open ⌘K once the session's page is up, and search it for the tabs' Back row."""
     actions = page.get_by_role("button", name=re.compile(r"^(?:Conversation|Session) actions$"))
@@ -385,7 +416,7 @@ def git_session(built_spa: None, tmp_path: Path) -> Iterator[tuple[str, str]]:
 def test_changes_compare_branches_and_tags_through_the_workspace_api(
     page: Page, git_session: tuple[str, str]
 ) -> None:
-    """The picker suggests branches and tags; All branch changes and Last commit list files."""
+    """The picker suggests branches and tags; each comparison lists its files and is a step."""
     base_url, session_id = git_session
     _set_flag(page, True)
     _open_session(page, base_url, session_id, "desktop")
@@ -431,3 +462,20 @@ def test_changes_compare_branches_and_tags_through_the_workspace_api(
         timeout=30_000
     )
     expect(sidebar.get_by_text("Not available on this host yet.")).to_have_count(0)
+
+    # Each pick is a step: Back shows All branch changes again, and Forward the last commit.
+    history = sidebar.get_by_role("group", name="Workspace history")
+    trigger = sidebar.get_by_role("button", name="Change compared revisions")
+    history.get_by_role("button", name="Back").click()
+    expect(trigger).to_contain_text("All branch changes", timeout=30_000)
+    expect(changed("feature_first.txt")).to_be_visible(timeout=30_000)
+    history.get_by_role("button", name="Forward").click()
+    expect(trigger).to_contain_text("Last commit", timeout=30_000)
+    expect(changed("feature_first.txt")).to_have_count(0, timeout=30_000)
+
+    # A reload keeps the visit and what it compares.
+    page.reload()
+    open_right_rail(page)
+    expect(trigger).to_contain_text("Last commit", timeout=60_000)
+    history.get_by_role("button", name="Back").click()
+    expect(trigger).to_contain_text("All branch changes", timeout=30_000)

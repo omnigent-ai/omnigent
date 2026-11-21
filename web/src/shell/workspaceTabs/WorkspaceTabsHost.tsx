@@ -5,6 +5,7 @@
 import { useCallback, useMemo } from "react";
 
 import { useDeleteTerminal } from "@/hooks/useTerminals";
+import { useValueAfterDeferredRender } from "@/hooks/useValueAfterDeferredRender";
 import type { TerminalInfo } from "@/lib/terminals";
 
 import { CloseShellDialog } from "../CloseShellDialog";
@@ -33,6 +34,10 @@ export function WorkspaceTabsHost({
   ...panelProps
 }: WorkspaceTabsHostProps) {
   const { conversationId, onReveal } = panelProps;
+  // Going inert restyles everything in the rail, so a collapse takes it in a frame of its own,
+  // after the toggle's. Leaving inert stays immediate, so what an expand focuses can take focus.
+  const inertNow = panelProps.inert ?? false;
+  const inertLater = useValueAfterDeferredRender(inertNow);
   const deleteTerminal = useDeleteTerminal(conversationId);
   const { mutateAsync: deleteTerminalAsync } = deleteTerminal;
   const shellClose = useTabsShellClose({ terminals, deleteTerminal: deleteTerminalAsync });
@@ -63,6 +68,8 @@ export function WorkspaceTabsHost({
       <WorkspaceTabsPanel
         {...panelProps}
         {...historyProps}
+        inert={inertNow && inertLater}
+        inertPending={inertNow && !inertLater}
         confirmCloseShell={shellClose.confirmCloseShell}
         endShell={shellClose.endShell}
       />

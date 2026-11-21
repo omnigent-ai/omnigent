@@ -205,15 +205,16 @@ describe("Files tab", () => {
     );
   });
 
-  it("prefers the tab's own citation and passes its leave guard to the viewer", () => {
+  it("prefers the tab's own citation and passes its leave guard and linked comment to the viewer", () => {
     const citation = { line: 9 };
     const registerLeaveGuard = vi.fn(() => () => {});
     renderView(
-      { kind: "files", path: "a.ts", line: { start: 3 } },
+      { kind: "files", path: "a.ts", line: { start: 3 }, comment: "c1" },
       { position: citation, registerLeaveGuard },
     );
     expect(captured.viewer!.position).toBe(citation);
     expect(captured.viewer!.registerLeaveGuard).toBe(registerLeaveGuard);
+    expect(captured.viewer!.commentId).toBe("c1");
   });
 
   it("gives the file's viewer the session's permission level, so a viewer can't edit", () => {
@@ -405,6 +406,25 @@ describe("Changes tab", () => {
       { kind: "changes", path: "src/app.ts" },
       { replace: false },
     );
+  });
+
+  it("hands the review the visit's comparison, a linked range's too, and records what it shows", async () => {
+    const { onNavigate } = renderView({ kind: "changes", range: { base: "v1.2" } });
+    await screen.findByTestId("changes-review");
+    expect(captured.review?.comparison).toEqual({ kind: "typed", base: "v1.2", head: "" });
+    cleanup();
+
+    const saved = { kind: "saved", intent: "branch-point" } as const;
+    const view = renderView({ kind: "changes", path: "a.go", comparison: saved });
+    await screen.findByTestId("changes-review");
+    expect(captured.review?.comparison).toEqual(saved);
+    const typed = { kind: "typed", base: "main", head: "" } as const;
+    captured.review!.onComparisonShown!(typed, { step: true });
+    expect(view.onNavigate).toHaveBeenCalledWith(
+      { kind: "changes", path: "a.go", comparison: typed },
+      { replace: false },
+    );
+    expect(onNavigate).not.toHaveBeenCalled();
   });
 
   it("opens a file from the review's tree in a Diffs tab of its own, keeping the range", async () => {

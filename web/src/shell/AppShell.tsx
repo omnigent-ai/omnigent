@@ -10,6 +10,7 @@ import {
   showWorkspaceTabOrChooser,
   useTabsSidebar,
 } from "@/shell/workspaceTabsRouting";
+import type { WorkspaceFileOpenOptions } from "@/shell/workspaceTabs/workspacePlaceNavigation";
 import {
   type ComponentProps,
   type CSSProperties,
@@ -153,12 +154,7 @@ import { ProjectHomeHeaderActions, ProjectHomeTitle } from "@/projectHome/Projec
 import { projectNameFromHomePath } from "@/projectHome/projectHomeNavigation";
 import { MobileHeaderControlsProvider } from "./MobileHeaderControlsSlot";
 import { CREATED_BY_SESSION_LABEL_KEY } from "./CreatedBySession";
-import {
-  FileViewerContext,
-  type FilePosition,
-  type OpenFileOptions,
-  type FileNavigationGuard,
-} from "./FileViewerContext";
+import type { FilePosition, OpenFileOptions, FileNavigationGuard } from "./FileViewerContext";
 import { revealFolderInFilesPanel } from "./FilesPanel";
 import { selectPullRequestInPanel } from "./PullRequestPanel";
 import type { ChangedSort } from "./FlatFileList";
@@ -178,6 +174,9 @@ import {
 import { AppShellWorkspacePanels } from "./AppShellWorkspacePanels";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { AppShellOverlays } from "./AppShellOverlays";
+import { AppShellRootProviders } from "./AppShellRootProviders";
+import { replaceThemePicker } from "@/store/themePicker";
+import { commandViewForPath, useCommandSession } from "./commandContext";
 import { CloseShellDialog } from "./CloseShellDialog";
 import { CloseWindowDialog } from "./CloseWindowDialog";
 import { QuitDialog } from "./QuitDialog";
@@ -777,6 +776,9 @@ function AppShellImpl() {
     if (!serverConversationId) return null;
     return allConversations?.find((c) => c.id === serverConversationId) ?? null;
   }, [serverConversationId, allConversations]);
+  // What ⌘K commands act on. The level is only authoritative once this route's snapshot loads.
+  const commandSession = useCommandSession(serverConversationId, activeConv);
+  const commandView = commandViewForPath(location.pathname, rebasePath);
   // A temporary row is display-only: it can supply optimistic breadcrumb
   // text, but must not participate in permissions, actions, or server hooks.
   const provisionalConv = useMemo(() => {
@@ -1888,34 +1890,58 @@ function AppShellImpl() {
       { replace: true },
     );
   }, [setSearchParams]);
-  // In the tabs sidebar, a ?file= link opens the file's tab at its cited line, and the
-  // request leaves the URL once it's handed over.
+  // In the tabs sidebar, a ?file= link opens the file's tab at its cited line, its diff in
+  // Changes, or its comment's thread, and the request leaves the URL once it's handed over.
   useEffect(() => {
     const tabsSession = tabsSessionRef.current;
     if (tabsSession === null || !citationPath) return;
-    const position = urlNavigation?.position;
+    const commentId = searchParams.get("comment") || undefined;
+    const options: WorkspaceFileOpenOptions = {
+      ...urlNavigation?.position,
+      ...(searchParams.get("diff") === "1" ? { view: "diff" } : {}),
+      ...(commentId !== undefined ? { commentId } : {}),
+    };
     void routeToWorkspaceTabs((tabs) =>
-      tabs.openWorkspaceFileLink(tabsSession, citationPath, position, "link"),
+      tabs.openWorkspaceFileLink(tabsSession, citationPath, options, "link"),
     );
     if (isMobileViewport()) setTabsDrawerOpen(true);
-    else setRightPanelOpenImmediately(true);
+    else {
+      setRightPanelOpenImmediately(true);
+      // ?fullscreen=1 fills the window with the sidebar, as its Full screen button does. Arriving
+      // from another session's full screen, the left sidebar it closed is the one to restore.
+      if (urlFileFullscreen && !rightPanelMaximized) {
+        const leftFullScreen =
+          tabsLinkRestoreRef.current !== restoredWorkspace && !!restoredWorkspace?.exitedMaximized;
+        if (!leftFullScreen) sidebarOpenBeforeMaximizeRef.current = sidebarOpen;
+        setSidebarOpen(false);
+        setRightPanelMaximized(true);
+      }
+    }
     clearFileViewerUrl();
   }, [tabsSidebar, conversationId, citationPath, urlNavigation, clearFileViewerUrl]); // eslint-disable-line react-hooks/exhaustive-deps
-  const restoreSelectedFileUrl = useCallback(() => {
-    // The tabs sidebar keeps its own files; the classic selection would open as a tab.
-    if (!selectedFilePath || tabsModeRef.current) return;
-    setSearchParams(
-      (prev) => {
-        const params = new URLSearchParams(prev);
-        params.set("file", selectedFilePath);
-        if (rightPanelMaximized) params.set("fullscreen", "1");
-        else params.delete("fullscreen");
-        localFileUrlRef.current = params;
-        return params;
-      },
-      { replace: true },
-    );
-  }, [selectedFilePath, rightPanelMaximized, setSearchParams]);
+  // The session restore the link effect above saw, so it knows the commit that restored one.
+  const tabsLinkRestoreRef = useRef(restoredWorkspace);
+  useEffect(() => {
+    tabsLinkRestoreRef.current = restoredWorkspace;
+  });
+  const restoreSelectedFileUrl = useCallback(
+    (fullscreen: boolean = rightPanelMaximized) => {
+      // The tabs sidebar keeps its own files; the classic selection would open as a tab.
+      if (!selectedFilePath || tabsModeRef.current) return;
+      setSearchParams(
+        (prev) => {
+          const params = new URLSearchParams(prev);
+          params.set("file", selectedFilePath);
+          if (fullscreen) params.set("fullscreen", "1");
+          else params.delete("fullscreen");
+          localFileUrlRef.current = params;
+          return params;
+        },
+        { replace: true },
+      );
+    },
+    [selectedFilePath, rightPanelMaximized, setSearchParams],
+  );
 
   // Toggle the right (Workspace) sidebar — shared by the header's collapse
   // button and the ⌘⌥]/Ctrl+Alt+] hotkey so they can't drift. Beyond flipping the
@@ -2141,26 +2167,13 @@ function AppShellImpl() {
       restoreSidebarAfterMaximize();
     }
     setRightPanelMaximized((prev) => !prev);
-    if (selectedFilePath) {
-      setSearchParams(
-        (prev) => {
-          const next = new URLSearchParams(prev);
-          next.set("file", selectedFilePath);
-          if (rightPanelMaximized) next.delete("fullscreen");
-          else next.set("fullscreen", "1");
-          localFileUrlRef.current = next;
-          return next;
-        },
-        { replace: true },
-      );
-    }
+    restoreSelectedFileUrl(!rightPanelMaximized);
   }, [
     rightPanelMaximized,
     sidebarOpen,
     restoreSidebarAfterMaximize,
     setSidebarOpen,
-    selectedFilePath,
-    setSearchParams,
+    restoreSelectedFileUrl,
   ]);
 
   // ⌘B / ⇧⌘B in the desktop app (⌘⌥[ / ⌘⌥] in a browser) toggle the left and
@@ -2178,6 +2191,10 @@ function AppShellImpl() {
   // Bound here where the palette's open-state lives.
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const [sessionSearch, setSessionSearch] = useState(false);
+  // The palette replaces the theme picker rather than stacking on it, which ends its preview.
+  useEffect(() => {
+    if (commandPaletteOpen) replaceThemePicker();
+  }, [commandPaletteOpen]);
   // Stable handlers so the memoized Sidebar doesn't re-render on AppShell's
   // frequent re-renders (chatStore status churn during a bind). Inline
   // callbacks would give it fresh props each time and defeat the memo.
@@ -2196,6 +2213,8 @@ function AppShellImpl() {
     setSessionSearch(false);
     setCommandPaletteOpen(true);
   }, []);
+  // ⌘K's Go to Session…: the open palette continues as the session switcher.
+  const handleGoToSession = useCallback(() => setSessionSearch(true), []);
   const isEmbedded = useIsEmbedded();
   useCommandPaletteHotkey(
     () => {
@@ -3207,7 +3226,15 @@ function AppShellImpl() {
   );
 
   return (
-    <FileViewerContext.Provider value={fileViewerContextValue}>
+    <AppShellRootProviders
+      command={{
+        session: commandSession,
+        view: commandView,
+        workspaceTab: workspacePanelVisible ? rightRailTab : null,
+        filePath: selectedFilePath,
+      }}
+      fileViewer={fileViewerContextValue}
+    >
       <TerminalFirstContextProvider value={terminalFirstContextValue}>
         <ForkDialogContextProvider value={forkDialogContextValue}>
           {/* `app-shell` paints the shared canvas behind the sidebar and
@@ -3769,6 +3796,7 @@ function AppShellImpl() {
             setCommandPaletteOpen={setCommandPaletteOpen}
             toggleLeftSidebar={toggleLeftSidebar}
             toggleRightPanel={toggleRightPanel}
+            goToSession={handleGoToSession}
             gridRoute={gridRoute}
             allConversations={allConversations}
             serverConversationId={serverConversationId}
@@ -3776,7 +3804,7 @@ function AppShellImpl() {
           />
         </ForkDialogContextProvider>
       </TerminalFirstContextProvider>
-    </FileViewerContext.Provider>
+    </AppShellRootProviders>
   );
 }
 

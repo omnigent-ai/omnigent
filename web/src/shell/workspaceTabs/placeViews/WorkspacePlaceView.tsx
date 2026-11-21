@@ -21,6 +21,7 @@ import { PullRequestPanel } from "@/shell/PullRequestPanel";
 import { PullRequestPageBody } from "@/pullRequestPage/PullRequestPageBody";
 
 import type { OpenOptions } from "../planOpen";
+import type { TabLanding } from "../workspaceTabsStore";
 import {
   WORKSPACE_SIDEBAR_LAYOUT,
   WORKSPACE_TOOLBAR_CLASS,
@@ -32,6 +33,7 @@ import {
 import type { LineRange, WorkspaceLink, WorkspacePlace } from "../workspacePlace";
 import {
   changedFileViewed,
+  changesComparisonShown,
   changesDefaultComparison,
   changesFileInNewTab,
   changesOverview,
@@ -73,6 +75,8 @@ export interface PlaceViewFileSettings {
 export interface WorkspacePlaceViewProps {
   conversationId: string;
   place: FilesPlace | ChangesPlace | PullRequestPlace;
+  /** How the tab last landed on `place`, by a step, a link or an open. */
+  landing?: TabLanding;
   /**
    * This is the session's Files tab, which browses with its tree. Other file tabs
    * show just their file, so a tree click can't land in a different tab.
@@ -254,6 +258,7 @@ function FilesPlaceView({
           toolbarLeading={treeToggle}
           registerLeaveGuard={registerLeaveGuard}
           permissionLevel={files.permissionLevel}
+          commentId={place.comment}
           // The Files tab closes its file back to the tree; another file tab goes to the Files tab.
           onClose={() =>
             filesTab
@@ -286,6 +291,7 @@ function ChangesPlaceView({
   onCommentOnFile,
   files,
   position,
+  landing,
 }: WorkspacePlaceViewProps & { place: ChangesPlace }) {
   const run = useRunAction(onNavigate, onOpen);
   const range = place.range;
@@ -302,6 +308,12 @@ function ChangesPlaceView({
           requestedRange={
             range ? { base: range.base, head: range.head ?? "Working Copy" } : undefined
           }
+          comparison={
+            place.comparison ??
+            (range ? { kind: "typed", base: range.base, head: range.head ?? "" } : undefined)
+          }
+          onComparisonShown={(shown, { step }) => run(changesComparisonShown(place, shown, step))}
+          landing={landing}
           active={active}
           sort={files.sort}
           onViewFile={(path) => run(changedFileViewed(path))}

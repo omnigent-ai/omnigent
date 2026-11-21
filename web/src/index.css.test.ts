@@ -374,6 +374,42 @@ describe("workspace panel content border", () => {
   });
 });
 
+describe("workspace rail open motion", () => {
+  // The rule that shows an open rail; the classic rail names its state data-state, the tabs
+  // rail data-rail-state, so a toggle there doesn't restyle everything Radix styles by data-state.
+  const openRule = indexCssSource.match(/([^{}]*\[data-rail-state="open"\][^{}]*)\{/)?.[1] ?? "";
+
+  it.each([
+    ["data-state", "the classic rail"],
+    ["data-rail-state", "the tabs rail"],
+  ])("shows an open rail that names its state %s (%s)", (attribute) => {
+    const rail = document.createElement("aside");
+    rail.className = "workspace-panel-motion";
+    rail.setAttribute(attribute, "open");
+    expect(rail.matches(openRule.trim())).toBe(true);
+    rail.setAttribute(attribute, "closed");
+    expect(rail.matches(openRule.trim())).toBe(false);
+  });
+
+  // Where an animated open starts from; the selector list inside @starting-style.
+  const startingRule =
+    indexCssSource.match(/@starting-style\s*\{([^{}]*\.workspace-panel-motion[^{}]*)\{/)?.[1] ?? "";
+
+  it.each([
+    ["data-state", "the classic rail"],
+    ["data-rail-state", "the tabs rail"],
+  ])("animates an open rail that names its state %s (%s) from its start", (attribute) => {
+    const rail = document.createElement("aside");
+    rail.className = "workspace-panel-motion";
+    rail.setAttribute(attribute, "open");
+    expect(rail.matches(startingRule.trim())).toBe(false);
+    rail.setAttribute("data-animate-visibility", "");
+    expect(rail.matches(startingRule.trim())).toBe(true);
+    rail.setAttribute(attribute, "closed");
+    expect(rail.matches(startingRule.trim())).toBe(false);
+  });
+});
+
 describe("index.css app-shell viewport lock", () => {
   const rule = cssBlocks
     .map(([block]) => block)

@@ -49,6 +49,8 @@ export interface FilesPageViewerProps {
   registerLeaveGuard?: (guard: FilesPageLeaveGuard) => () => void;
   /** The session's permission level, which limits the app's viewer as it does elsewhere. */
   permissionLevel?: number | null;
+  /** A comment whose thread a link opens; the app's viewer shows it, since the editor has no threads. */
+  commentId?: string;
 }
 
 /** Whether the app's own viewer shows `path` rather than the text editor. */
@@ -72,13 +74,18 @@ export function FilesPageViewer({
   onShowChanges,
   registerLeaveGuard,
   permissionLevel,
+  commentId,
 }: FilesPageViewerProps) {
   const file = useFileContent(conversationId, path, { visible: active });
   const contentType = file.data?.content_type;
   // Markdown, media and binaries show in the app's viewer, under the same toolbar as text.
-  const rich = file.data != null && showsInFileViewer(path, contentType);
+  const rich =
+    file.data != null && (commentId !== undefined || showsInFileViewer(path, contentType));
   const appViewer = (
     <FileViewer
+      // Another linked comment opens its thread afresh.
+      key={commentId}
+      linkedCommentId={commentId}
       conversationId={conversationId}
       path={path}
       position={position}

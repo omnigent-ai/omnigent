@@ -241,6 +241,45 @@ describe("the panel's placement", () => {
     expect(screen.getByRole("button", { name: "Full screen", hidden: true })).toBeInTheDocument();
   });
 
+  // A closed rail is aria-hidden, which leaves its landmark out of the accessibility tree.
+  const rail = () => document.querySelector<HTMLElement>('aside[aria-label="Workspace"]')!;
+
+  it("names its open state data-rail-state, so a toggle doesn't restyle what's inside", () => {
+    const view = renderPanels([{ conversationId: "conv_a", open: true }]);
+    expect(rail()).toHaveAttribute("data-rail-state", "open");
+    expect(rail()).not.toHaveAttribute("data-state");
+    view.rerender([{ conversationId: "conv_a", open: false }]);
+    expect(rail()).toHaveAttribute("data-rail-state", "closed");
+  });
+
+  it("moves focus out of a collapsing rail before it goes inert, and keeps it out", () => {
+    const outside = document.createElement("button");
+    document.body.append(outside);
+    const view = renderPanels([{ conversationId: "conv_a", open: true, inert: false }]);
+    const inside = screen.getByRole("button", { name: "Full screen", hidden: true });
+    inside.focus();
+    expect(inside).toHaveFocus();
+    view.rerender([{ conversationId: "conv_a", open: false, inert: false }]);
+    expect(rail()).not.toHaveAttribute("inert");
+    expect(inside).not.toHaveFocus();
+    // Focus that enters from outside goes back where it came from.
+    outside.focus();
+    inside.focus();
+    expect(outside).toHaveFocus();
+    outside.blur();
+    outside.remove();
+  });
+
+  it("keeps focus out of an open rail while its host says it's about to go inert", () => {
+    const view = renderPanels([{ conversationId: "conv_a", open: true, inertPending: true }]);
+    const inside = screen.getByRole("button", { name: "Full screen", hidden: true });
+    inside.focus();
+    expect(inside).not.toHaveFocus();
+    view.rerender([{ conversationId: "conv_a", open: true, inertPending: false }]);
+    inside.focus();
+    expect(inside).toHaveFocus();
+  });
+
   it("fills a drawer at any width, with no resize handle or full screen", () => {
     renderPanels([
       {

@@ -487,6 +487,7 @@ from omnigent.util.session_lifecycle import (
 from omnigent.util.tmux_compat import MIN_TMUX_VERSION_HINT
 
 if TYPE_CHECKING:
+    from omnigent.entities.workflow import Workflow
     from omnigent.server.host_session_recovery import HostSessionRecoverer
 
 
@@ -12764,6 +12765,17 @@ async def _inherited_mcp_labels(
     return inherited
 
 
+def _created_session_title(body: SessionCreateInput, workflow: Workflow | None) -> str | None:
+    """The new session's title: the caller's, else a top-level run's workflow name.
+
+    A child's title is its sub-agent name, unique under its parent, so a child the
+    caller doesn't name keeps the store's placeholder.
+    """
+    if body.title is not None or workflow is None or body.parent_session_id is not None:
+        return body.title
+    return workflow.name
+
+
 async def _create_session_from_existing_agent(
     conversation_store: ConversationStore,
     agent_store: AgentStore,
@@ -13577,7 +13589,7 @@ async def _create_session_from_existing_agent(
         with creation_stage("create_persistence_ms"):
             conv = conversation_store.create_conversation(
                 agent_id=agent.id,
-                title=body.title,
+                title=_created_session_title(body, workflow),
                 parent_conversation_id=body.parent_session_id,
                 runner_id=inherited_runner_id,
                 kind="sub_agent" if body.parent_session_id else "default",
