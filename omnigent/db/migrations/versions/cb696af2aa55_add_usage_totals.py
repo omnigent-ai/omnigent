@@ -10,8 +10,10 @@ compressed and capped at 4,096 stored bytes (``VARBINARY`` on MySQL). They are
 read whole by primary key, never filtered in SQL, so no index is added.
 
 Additive, nullable and without a default: ``NULL`` marks a row whose total is
-not tracked, so no backfill runs. Ship before the server that maintains them;
-older servers ignore both columns. Downgrade drops them and the stored totals.
+not tracked, so no backfill runs. Ship before the server that maintains them,
+which can roll back to this release. Builds older than this revision refuse to
+start on a database at it, so rolling back further needs a database downgrade
+first. Downgrade drops both columns and the stored totals.
 """
 
 from __future__ import annotations
