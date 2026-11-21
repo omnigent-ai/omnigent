@@ -9,6 +9,7 @@ the input box.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -177,37 +178,52 @@ def test_terminal_dialog_pending_without_a_pane_is_false(tmp_path: Path) -> None
     assert claude_native_bridge.terminal_dialog_pending(tmp_path / "missing") is False
 
 
-_MODEL_ACK = "  ⎿  Set model to Opus 5.5 and saved as your default for new sessions"
+_MODEL_ECHO = "<command-name>/model</command-name><command-args>opus[1m]</command-args>"
+_MODEL_ACK = "<local-command-stdout>Set model to Opus 5.5</local-command-stdout>"
 
 
 @pytest.mark.parametrize(
-    ("pane", "expected"),
+    ("records", "expected"),
     [
-        (f"❯ /model opus[1m]\n{_MODEL_ACK}\n{_RULE}\n❯ \n{_RULE}\n", True),
-        (f"❯ /model opus[1m]\n{_RULE}\n❯ \n{_RULE}\n", False),
-        (f"{_MODEL_ACK}\n❯ /model opus[1m]\n{_RULE}\n❯ \n{_RULE}\n", False),
-        (f"{_MODEL_ACK}\n{_RULE}\n❯ \n{_RULE}\n", False),
-        ("", False),
+        ([_MODEL_ECHO, _MODEL_ACK], True),
+        ([_MODEL_ECHO], False),
+        ([_MODEL_ACK, _MODEL_ECHO], False),
+        ([_MODEL_ACK], False),
+        ([], False),
     ],
-    ids=["acknowledged", "no-acknowledgement", "older-acknowledgement", "no-echo", "torn"],
+    ids=["acknowledged", "no-acknowledgement", "older-acknowledgement", "no-echo", "empty"],
 )
-def test_model_switch_acknowledged_reads_the_pane(
-    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch, pane: str, expected: bool
+def test_model_switch_acknowledged_reads_fresh_transcript_records(
+    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch, records: list[str], expected: bool
 ) -> None:
-    """Only an acknowledgement printed under the command's last echo confirms it."""
-    _show(monkeypatch, pane)
+    """A stale identical echo on the pane cannot confirm the current command."""
+    _show(monkeypatch, "❯ /model opus[1m]\n  ⎿  Set model to Opus 5.5\n")
+    transcript_path = bridge_dir / "session.jsonl"
+    transcript_path.touch()
+    monkeypatch.setattr(claude_native_bridge, "read_transcript_path", lambda _: transcript_path)
+    monkeypatch.setattr(claude_native_bridge, "read_claude_session_id", lambda _: "native-1")
+    boundary = claude_native_bridge.capture_model_switch_boundary(bridge_dir)
+    assert boundary is not None
+    with transcript_path.open("a", encoding="utf-8") as handle:
+        for index, content in enumerate(records):
+            handle.write(
+                json.dumps(
+                    {
+                        "type": "system",
+                        "subtype": "local_command",
+                        "sessionId": "native-1",
+                        "uuid": f"model-command-{index}",
+                        "content": content,
+                    }
+                )
+                + "\n"
+            )
 
-    assert (
-        claude_native_bridge.model_switch_acknowledged(bridge_dir, command="/model opus[1m]")
-        is expected
-    )
+    assert claude_native_bridge.model_switch_acknowledged(boundary, "opus[1m]") is expected
 
 
-def test_model_switch_acknowledged_without_a_pane_is_false(tmp_path: Path) -> None:
-    assert (
-        claude_native_bridge.model_switch_acknowledged(tmp_path / "missing", command="/model x")
-        is False
-    )
+def test_model_switch_boundary_without_a_transcript_is_unavailable(tmp_path: Path) -> None:
+    assert claude_native_bridge.capture_model_switch_boundary(tmp_path / "missing") is None
 
 
 def test_the_settings_pre_check_refuses_before_typing(
