@@ -249,9 +249,19 @@ export interface PullRequestCapabilities {
  *  - `unsupported_remote` — no supported provider serves the workspace's
  *    remote (see `remote_host`).
  *  - `host_outdated` — the host predates the `/resources/github` route and
- *    404s "Resource 'github' not found"; synthesized in {@link fetchPullRequestInfo}. */
+ *    404s "Resource 'github' not found"; synthesized in {@link fetchPullRequestInfo}.
+ *  - `code_host_instance_needs_runner` — the PR's code host is read only by the
+ *    session's runner, which is parked.
+ *  - `code_host_instance_cli_unavailable` — the runner couldn't load the host's
+ *    instance for that code host, so nothing reads it. */
 export type PullRequestUnavailableReason =
-  "not_a_git_repo" | "no_os_env" | "unsupported_remote" | "provider_unavailable" | "host_outdated";
+  | "not_a_git_repo"
+  | "no_os_env"
+  | "unsupported_remote"
+  | "provider_unavailable"
+  | "host_outdated"
+  | "code_host_instance_needs_runner"
+  | "code_host_instance_cli_unavailable";
 
 export interface PullRequestAssociation {
   url: string;

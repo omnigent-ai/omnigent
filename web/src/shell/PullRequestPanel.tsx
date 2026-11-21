@@ -250,6 +250,8 @@ export type PullRequestPanelState =
   | { kind: "sandbox-offline" }
   | { kind: "error"; message: string }
   | { kind: "host-outdated" }
+  | { kind: "instance-needs-runner" }
+  | { kind: "instance-cli-unavailable" }
   | { kind: "unavailable" }
   | { kind: "not-a-git-repo" }
   | { kind: "unsupported-remote"; remoteHost: string | undefined }
@@ -283,6 +285,12 @@ export function derivePullRequestPanelState(info: {
   if (!data || !data.available) {
     if (data?.reason === "not_a_git_repo") return { kind: "not-a-git-repo" };
     if (data?.reason === "host_outdated") return { kind: "host-outdated" };
+    if (data?.reason === "code_host_instance_needs_runner") {
+      return { kind: "instance-needs-runner" };
+    }
+    if (data?.reason === "code_host_instance_cli_unavailable") {
+      return { kind: "instance-cli-unavailable" };
+    }
     if (data?.reason === "unsupported_remote") {
       return { kind: "unsupported-remote", remoteHost: data.remote_host };
     }
@@ -1712,6 +1720,26 @@ export function PullRequestPanelDetails({
           icon={DownloadIcon}
           title="Update your host to use the Pull Requests tab"
           hint="The Pull Requests tab needs the host running Omnigent 0.13.0 or later. Update the host, then reconnect the session."
+        >
+          {emptyStateAction}
+        </PullRequestEmptyState>
+      );
+    case "instance-needs-runner":
+      return (
+        <PullRequestEmptyState
+          icon={ServerOffIcon}
+          title="Pull requests load when the session resumes"
+          hint="Only the agent’s runner reads this code host, and it’s paused. Send a message to resume the session."
+        >
+          {emptyStateAction}
+        </PullRequestEmptyState>
+      );
+    case "instance-cli-unavailable":
+      return (
+        <PullRequestEmptyState
+          icon={ServerOffIcon}
+          title="Can’t read this code host"
+          hint="The host’s code host instance file or its CLI couldn’t be loaded for this session. Check the host’s logs, fix the file, then start a new session."
         >
           {emptyStateAction}
         </PullRequestEmptyState>

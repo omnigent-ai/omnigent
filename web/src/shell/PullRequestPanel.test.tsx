@@ -35,6 +35,7 @@ import type {
   PullRequestInfo,
   PullRequestRepoLabels,
   PullRequestReviewCandidates,
+  PullRequestUnavailableReason,
 } from "@/hooks/usePullRequests";
 
 const state = vi.hoisted(() => ({
@@ -2749,6 +2750,12 @@ describe("derivePullRequestPanelState", () => {
         q({ data: { object: "session.github.info", available: false, reason: "host_outdated" } }),
       ).kind,
     ).toBe("host-outdated");
+    const instanceReason = (reason: PullRequestUnavailableReason) =>
+      derivePullRequestPanelState(
+        q({ data: { object: "session.github.info", available: false, reason } }),
+      ).kind;
+    expect(instanceReason("code_host_instance_needs_runner")).toBe("instance-needs-runner");
+    expect(instanceReason("code_host_instance_cli_unavailable")).toBe("instance-cli-unavailable");
   });
 
   it("walks the gh layer: cli → auth → repo → pr → ready", () => {
