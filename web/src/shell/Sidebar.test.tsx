@@ -4407,6 +4407,21 @@ describe("Sidebar open/close motion", () => {
   });
 });
 
+describe("Sidebar resize edge", () => {
+  it("draws a bar on its edge, and with floating panes only a cursor band across the gap", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    const view = renderSidebar(true);
+    const edge = () => screen.getByRole("separator", { name: "Resize sidebar" });
+    expect(edge()).toHaveClass("w-1", "hover:bg-primary/30");
+    view.unmount();
+
+    const floating = { ...FALLBACK_SERVER_INFO.features, floating_panes: true };
+    renderSidebar(true, "/", undefined, { ...FALLBACK_SERVER_INFO, features: floating });
+    expect(edge()).toHaveClass("cursor-col-resize", "w-[calc(var(--pane-gap)+5px)]");
+    expect(edge()).not.toHaveClass("hover:bg-primary/30");
+  });
+});
+
 describe("Sidebar collapsed marker", () => {
   // The dark-mode glass rule in index.css keys its border/blur on
   // :not([data-collapsed]) — NOT on aria-hidden, which Radix also toggles

@@ -245,6 +245,7 @@ import {
 } from "@/hooks/useUnseenConversations";
 import { collectUnreadInboxItems } from "@/lib/inbox";
 import { cn } from "@/lib/utils";
+import { useFloatingPanes } from "@/shell/useFloatingPanes";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { isDesktopLayout, useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import {
@@ -1076,6 +1077,7 @@ function SidebarImpl({
   // class so it only applies on desktop — on mobile the sidebar is a
   // full-screen overlay (``fixed inset-0``) and the variable is ignored.
   const { width: sidebarWidth, resizing, handleProps: resizeHandleProps } = useResizableSidebar();
+  const floatingPanes = useFloatingPanes();
 
   // On the mobile layout, a leftward swipe on the open drawer slides it shut and
   // a rightward swipe across the chat slides the closed one open, both under
@@ -1361,7 +1363,13 @@ function SidebarImpl({
         {!peek && (
           <div
             {...resizeHandleProps}
-            className="absolute inset-y-0 right-0 z-10 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:block"
+            className={cn(
+              "absolute inset-y-0 right-0 z-10 hidden cursor-col-resize md:block",
+              // Floating panes show no bar: the cursor changes where the panes meet the sidebar.
+              floatingPanes
+                ? "w-[calc(var(--pane-gap)+5px)]"
+                : "w-1 transition-colors hover:bg-primary/30 active:bg-primary/50",
+            )}
           />
         )}
         {inSettings ? (
