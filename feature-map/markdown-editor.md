@@ -5,6 +5,9 @@ switch between Edit, Source, and Preview, and attach comments to selections.
 This map defines the repeatable critical user journey (CUJ) for editor changes
 and the recording protocol for comparing revisions.
 
+The [October 2026 performance results](../docs/markdown-editor-performance.md)
+record the cumulative work, per-stage measurements, and remaining limitations.
+
 ## Sub-features
 
 - `read`: headings, lists, tasks, tables, links, quotes, and fenced code render.
