@@ -8,8 +8,10 @@ import type { Conversation } from "@/hooks/useConversations";
 import type { SessionCommandId } from "./model";
 
 export interface SessionActionRequest {
-  /** The session as the palette listed it. */
+  /** The session as the palette listed it; the host looks up its current state by ID. */
   conversation: Conversation;
+  /** Whether the sidebar's lists held the session when its actions opened. */
+  listed: boolean;
   command: SessionCommandId;
   /** New per request, so asking again for the same action starts it again. */
   key: number;
@@ -24,7 +26,11 @@ export const useSessionActionStore = create<SessionActionState>(() => ({ request
 let nextKey = 0;
 
 /** Carry out `command` on `conversation`, unless it no longer applies when the host reads it. */
-export function requestSessionAction(conversation: Conversation, command: SessionCommandId): void {
+export function requestSessionAction(
+  conversation: Conversation,
+  command: SessionCommandId,
+  { listed = false }: { listed?: boolean } = {},
+): void {
   nextKey += 1;
-  useSessionActionStore.setState({ request: { conversation, command, key: nextKey } });
+  useSessionActionStore.setState({ request: { conversation, command, listed, key: nextKey } });
 }

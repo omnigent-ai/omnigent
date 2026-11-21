@@ -6,6 +6,7 @@ import { useEffect, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 
 import {
+  type Conversation,
   useMoveToProject,
   useSetConversationMuted,
   useTogglePinnedConversation,
@@ -21,6 +22,7 @@ import { RenameSessionDialog } from "../RenameSessionDialog";
 import { conversationDisplayLabel } from "../sidebarNav";
 import { unpinWithUndo } from "../unpinUndoToast";
 import { useSessionActions } from "../useSessionActions";
+import { currentSessionRow } from "./currentSession";
 import { sessionCommand } from "./model";
 import { MoveToProjectPicker } from "./MoveToProjectPicker";
 import { type SessionActionRequest, useSessionActionStore } from "./sessionActionStore";
@@ -29,11 +31,27 @@ import { useSessionCommandFacts } from "./useSessionCommandFacts";
 /** Mount once, beside the palette. */
 export function SessionActionHost() {
   const request = useSessionActionStore((state) => state.request);
-  return request ? <SessionActionRunner key={request.key} request={request} /> : null;
+  return request ? <SessionActionResolver key={request.key} request={request} /> : null;
 }
 
-function SessionActionRunner({ request }: { request: SessionActionRequest }) {
-  const { conversation, command } = request;
+/** Looks the session up as the action starts; one gone since does nothing. */
+function SessionActionResolver({ request }: { request: SessionActionRequest }) {
+  const queryClient = useQueryClient();
+  const [conversation] = useState(() =>
+    currentSessionRow(queryClient, request.conversation, request.listed),
+  );
+  return conversation ? (
+    <SessionActionRunner conversation={conversation} command={request.command} />
+  ) : null;
+}
+
+function SessionActionRunner({
+  conversation,
+  command,
+}: {
+  conversation: Conversation;
+  command: SessionActionRequest["command"];
+}) {
   const facts = useSessionCommandFacts(conversation);
   const viewerId = useViewerId();
   const serverInfo = useServerInfo();
@@ -62,7 +80,7 @@ function SessionActionRunner({ request }: { request: SessionActionRequest }) {
     const current = latest.current.facts;
     if (started.current || !current) return;
     started.current = true;
-    // Asked for from a row built a moment ago; the session may have changed since.
+    // Checked against the session's current state, which may have changed since its row showed.
     if (!sessionCommand(current, command).availability.available) return;
     const { id, updated_at: updatedAt } = conversation;
     const run = latest.current.actions;
