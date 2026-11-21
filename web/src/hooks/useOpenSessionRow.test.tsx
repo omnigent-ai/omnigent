@@ -2,9 +2,10 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { Conversation } from "@/hooks/useConversations";
+import { type Conversation, useSetConversationMuted } from "@/hooks/useConversations";
 import { getSessionHost, getSessionParent } from "@/lib/sessionHost";
 import { findCachedListRow } from "@/lib/sessionListCache";
+import { clearSessionMuteState, MUTED_LABEL_KEY } from "@/lib/sessionMute";
 import { conversation } from "@/test/sidebarMockHelpers";
 import {
   fetchConversationById,
@@ -41,6 +42,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  clearSessionMuteState();
   vi.unstubAllGlobals();
 });
 
@@ -184,28 +186,80 @@ describe("useOpenSessionRow", () => {
     expect(result.current).toBeNull();
   });
 
-  it("lists a remembered shared row after its search cache is gone, and keeps its owner on refetch", async () => {
-    const queryClient = newQueryClient();
-    const sharedRow = conversation("conv_shared", {
-      owner: "teammate",
-      permission_level: 1,
-      archived: true,
-    });
-    rememberOpenSessionRow(queryClient, sharedRow);
+  it.each([
+    { muted: true, success: true },
+    { muted: false, success: true },
+    { muted: true, success: false },
+    { muted: false, success: false },
+  ])(
+    "keeps a shared row through a backfill refresh with mute=$muted, success=$success",
+    async ({ muted, success }) => {
+      const queryClient = newQueryClient();
+      const sharedRow = conversation("conv_shared", {
+        owner: "teammate",
+        permission_level: 1,
+        archived: true,
+        labels: muted ? {} : { [MUTED_LABEL_KEY]: "1" },
+      });
+      rememberOpenSessionRow(queryClient, sharedRow);
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children);
+      const { result, unmount } = renderHook(
+        () => ({
+          row: useOpenSessionRow("conv_shared"),
+          mute: useSetConversationMuted(),
+        }),
+        { wrapper },
+      );
 
-    const { result } = renderOpenSessionRow(queryClient, "conv_shared");
-
-    expect(result.current).toEqual(sharedRow);
-    expect(fetchMock).not.toHaveBeenCalled();
-
-    fetchMock.mockResolvedValue(
-      mockResponse({ id: "conv_shared", created_at: 1, permission_level: 1, archived: false }),
-    );
-    await act(() => queryClient.invalidateQueries({ queryKey: ["conversation-backfill"] }));
-
-    await waitFor(() => expect(result.current?.archived).toBe(false));
-    expect(result.current?.owner).toBe("teammate");
-  });
+      expect(result.current.row).toEqual(sharedRow);
+      expect(fetchMock).not.toHaveBeenCalled();
+      let resolveBackfill!: (response: Response) => void;
+      let resolvePatch!: (response: Response) => void;
+      fetchMock.mockImplementation(
+        (_url: string, init?: RequestInit) =>
+          new Promise<Response>((resolve) => {
+            if (init?.method === "PATCH") resolvePatch = resolve;
+            else resolveBackfill = resolve;
+          }),
+      );
+      let refresh!: Promise<void>;
+      act(() => {
+        refresh = queryClient.invalidateQueries({ queryKey: ["conversation-backfill"] });
+      });
+      act(() => result.current.mute.mutate({ id: "conv_shared", muted }));
+      await waitFor(() => expect(resolvePatch).toBeDefined());
+      await waitFor(() => expect(resolveBackfill).toBeDefined());
+      await act(async () => {
+        resolveBackfill(
+          mockResponse({
+            id: "conv_shared",
+            created_at: 1,
+            permission_level: 1,
+            archived: false,
+            labels: { ...sharedRow.labels, "example.label": "updated" },
+          }),
+        );
+        await refresh;
+      });
+      await waitFor(() => expect(result.current.row?.archived).toBe(false));
+      expect(result.current.row?.owner).toBe("teammate");
+      expect(result.current.row?.labels[MUTED_LABEL_KEY]).toBe(muted ? "1" : undefined);
+      expect(result.current.row?.labels["example.label"]).toBe("updated");
+      await act(async () => {
+        resolvePatch(
+          mockResponse({ labels: muted ? { [MUTED_LABEL_KEY]: "1" } : {} }, success ? 200 : 500),
+        );
+      });
+      await waitFor(() => expect(result.current.mute.status).toBe(success ? "success" : "error"));
+      expect(result.current.row?.labels[MUTED_LABEL_KEY]).toBe(
+        (success ? muted : !muted) ? "1" : undefined,
+      );
+      expect(result.current.row?.labels["example.label"]).toBe("updated");
+      unmount();
+      queryClient.clear();
+    },
+  );
 
   it("keeps a shared row's owner when its list drops the row and it is fetched", async () => {
     const queryClient = newQueryClient();

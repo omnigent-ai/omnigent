@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -23,6 +24,7 @@ from fastapi import FastAPI
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
 from omnigent.entities.environment_filesystem import (
     DirectoryNotEmpty,
+    FilesystemEntry,
     FilesystemPathNotFound,
     InvalidPath,
     PathUnreachable,
@@ -34,6 +36,7 @@ from omnigent.runner import create_runner_app
 from omnigent.runner.environment_filesystem import CallerProcessFilesystem, search_indexed_paths
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.runtime.filesystem_registry import GitFilesystemRegistry
+from omnigent.workspace_file_search import walk_search
 from tests.runner.helpers import NullServerClient
 
 
@@ -1030,6 +1033,82 @@ async def test_download_returns_complete_file_past_read_cap(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("range_header", "start", "end"),
+    [
+        ("bytes=0-1", 0, 2),
+        ("bytes=65530-65545", 65530, 65546),
+        ("bytes=131072-", 131072, 153600),
+        ("bytes=-16", 153584, 153600),
+        ("bytes=153590-999999", 153590, 153600),
+        ("bytes=-999999", 0, 153600),
+    ],
+)
+async def test_download_serves_byte_range(
+    client: httpx.AsyncClient, workspace: Path, range_header: str, start: int, end: int
+) -> None:
+    payload = bytes(range(256)) * 600
+    (workspace / "recording.mp4").write_bytes(payload)
+    response = await client.get(
+        "/v1/sessions/conv_test/resources/environments/default/filesystem/recording.mp4",
+        params={"download": "true"},
+        headers={"Range": range_header},
+    )
+    assert response.status_code == 206
+    assert response.content == payload[start:end]
+    assert response.headers["content-length"] == str(end - start)
+    assert response.headers["content-range"] == f"bytes {start}-{end - 1}/{len(payload)}"
+    assert response.headers["accept-ranges"] == "bytes"
+    assert response.headers["content-type"] == "video/mp4"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "range_header"),
+    [(b"hello", "bytes=5-"), (b"hello", "bytes=10-20"), (b"", "bytes=0-"), (b"hello", "bytes=-0")],
+)
+async def test_download_rejects_unsatisfiable_byte_range(
+    client: httpx.AsyncClient, workspace: Path, payload: bytes, range_header: str
+) -> None:
+    (workspace / "recording.mp4").write_bytes(payload)
+    response = await client.get(
+        "/v1/sessions/conv_test/resources/environments/default/filesystem/recording.mp4",
+        params={"download": "true"},
+        headers={"Range": range_header},
+    )
+    assert response.status_code == 416
+    assert response.headers["content-range"] == f"bytes */{len(payload)}"
+    assert response.headers["accept-ranges"] == "bytes"
+    assert response.content == b""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {},
+        {"Range": "items=0-1"},
+        {"Range": "bytes=garbage"},
+        {"Range": "bytes=3-1"},
+        {"Range": "bytes=0-1,3-4"},
+        {"Range": "bytes=0-1", "If-Range": '"different-version"'},
+    ],
+)
+async def test_download_falls_back_to_complete_file(
+    client: httpx.AsyncClient, workspace: Path, headers: dict[str, str]
+) -> None:
+    response = await client.get(
+        "/v1/sessions/conv_test/resources/environments/default/filesystem/hello.txt",
+        params={"download": "true"},
+        headers=headers,
+    )
+    assert response.status_code == 200
+    assert response.content == (workspace / "hello.txt").read_bytes()
+    assert response.headers["accept-ranges"] == "bytes"
+    assert "content-range" not in response.headers
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("path", "status", "code"),
     [("src", 400, "invalid_path"), ("nope.bin", 404, "path_not_found")],
 )
@@ -1588,7 +1667,7 @@ async def test_filesystem_changes_modified(
     resp = await client_with_registry.get(
         f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/changes"
     )
-    assert resp.status_code == 200
+    assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["object"] == "list"
     entries_by_path = {e["path"]: e for e in body["data"]}
@@ -1656,6 +1735,7 @@ async def test_multi_repo_routes_bind_session_git_and_preserve_repository_metada
                 ["git", *argv], cwd=repo, env=_git_env(), check=True, capture_output=True
             )
         (repo / "same.txt").write_text(f"{name} changed\n")
+    (workspace / "alpha" / "new.txt").write_text("one\ntwo\n")
     environment = registry._primary_envs["conv_test"]
     request.addfinalizer(environment.close)
     run_git = environment.run_git
@@ -1675,12 +1755,15 @@ async def test_multi_repo_routes_bind_session_git_and_preserve_repository_metada
     response = await client.get(f"{base}/changes")
     assert response.status_code == 200, response.text
     entries = {entry["path"]: entry for entry in response.json()["data"]}
-    assert set(entries) == {"alpha/same.txt", "beta/same.txt", "hello.txt"}
+    assert set(entries) == {"alpha/new.txt", "alpha/same.txt", "beta/same.txt", "hello.txt"}
     assert "repository_root" not in entries["hello.txt"]
     for name in ("alpha", "beta"):
         assert entries[f"{name}/same.txt"]["repository_root"] == name
         assert entries[f"{name}/same.txt"]["lines_added"] == 1
         assert entries[f"{name}/same.txt"]["lines_removed"] == 1
+        assert entries[f"{name}/same.txt"]["untracked_lines"] is None
+    assert entries["alpha/new.txt"]["lines_added"] is None
+    assert entries["alpha/new.txt"]["untracked_lines"] == 2
     assert calls == [
         (command, workspace / name) for name in ("alpha", "beta") for command in ("status", "diff")
     ]
@@ -2152,6 +2235,22 @@ async def test_content_search_live_workspace(
     assert not (workspace / "injected").exists()
 
 
+@pytest.mark.parametrize(
+    "case",
+    json.loads(
+        (
+            Path(__file__).resolve().parents[2] / "web/src/lib/__fixtures__/globLists.json"
+        ).read_text(encoding="utf-8")
+    )["cases"],
+    ids=lambda case: repr(case["raw"]),
+)
+def test_split_glob_list_matches_the_web_client(case: dict[str, Any]) -> None:
+    """The web client splits globs for the workspace API as REST does here."""
+    from omnigent.runner.environment_filesystem import split_glob_list
+
+    assert split_glob_list(case["raw"]) == case["patterns"]
+
+
 # The web panel's Whole word cases, shared with its unit test, run through real ripgrep.
 _WHOLE_WORD_FIXTURE = json.loads(
     (
@@ -2238,10 +2337,28 @@ async def test_content_search_limits_errors_and_hidden_files(
     assert len(match["text"]) <= 402
 
 
+@pytest.mark.asyncio
+async def test_content_search_keeps_matches_with_unicode_line_separators(
+    client: httpx.AsyncClient, workspace: Path
+) -> None:
+    """Minified bundles hold U+2028, U+2029 and U+0085, which Python also reads as line breaks."""
+    text = 'var s = "a\u2028b\u2029c\u0085d";'
+    (workspace / "bundle.js").write_text(text + "\n", encoding="utf-8")
+
+    response = await client.get(
+        "/v1/sessions/conv_test/resources/environments/default/content-search",
+        params={"q": "var s"},
+    )
+
+    result = response.json()
+    assert "error" not in result, result
+    assert [match["text"] for match in result["matches"]] == [text]
+
+
 @pytest.mark.parametrize("mode", ["missing", "timeout", "long-line"])
 def test_content_search_process_boundaries(tmp_path: Path, mode: str) -> None:
-    """Exercise the sandbox script with controlled executables and a short deadline."""
-    from omnigent.runner.content_search import _SEARCH_SCRIPT
+    """Exercise the sandbox script with controlled executables and a bounded timeout."""
+    from omnigent.workspace_content_search import _SEARCH_SCRIPT, collect_records
 
     if mode != "missing":
         executable = tmp_path / "rg"
@@ -2254,16 +2371,19 @@ def test_content_search_process_boundaries(tmp_path: Path, mode: str) -> None:
         executable.chmod(0o755)
     parameters = (
         "query = 'needle'\ncase_sensitive = False\nregex = False\nlimit = 2\nglob_args = []\n"
+        "extra_args = []\nsearch_paths = ['.']\n"
     )
-    # Record the owned child's PID before the shortened timer can kill it.
-    timer = (
-        "import threading\noriginal_timer = threading.Timer\n"
-        "def shortened_timer(seconds, callback):\n"
-        f"    with open({str(tmp_path / 'pid')!r}, 'w') as marker:\n"
-        "        marker.write(str(process.pid))\n"
-        "    return original_timer(0.2, callback)\n"
-        "threading.Timer = shortened_timer\n"
-    )
+    timer = ""
+    if mode == "timeout":
+        # Record the owned child's PID before the shortened timer can kill it.
+        timer = (
+            "import threading\noriginal_timer = threading.Timer\n"
+            "def shortened_timer(seconds, callback):\n"
+            f"    with open({str(tmp_path / 'pid')!r}, 'w') as marker:\n"
+            "        marker.write(str(process.pid))\n"
+            "    return original_timer(0.2, callback)\n"
+            "threading.Timer = shortened_timer\n"
+        )
     completed = subprocess.run(
         [sys.executable, "-I", "-c", parameters + timer + _SEARCH_SCRIPT],
         env={**os.environ, "PATH": str(tmp_path)},
@@ -2272,7 +2392,7 @@ def test_content_search_process_boundaries(tmp_path: Path, mode: str) -> None:
         timeout=5,
         check=True,
     )
-    result = json.loads(completed.stdout)
+    result = collect_records(completed.stdout.splitlines())
     if mode == "missing":
         assert "Install ripgrep" in result["error"]
     elif mode == "timeout":
@@ -3316,6 +3436,51 @@ def test_search_indexed_paths_never_describes_a_symlink(tmp_path: Path) -> None:
     assert [(e.path, e.type, e.bytes) for e in entries] == [("real/b.md", "file", 2)]
 
 
+def test_search_indexed_paths_hands_leaf_symlinks_to_describe_link(tmp_path: Path) -> None:
+    """A leaf link goes to the caller's describer with its own lstat; a path
+    beneath a symlinked parent is still never described."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "b.txt").write_text("12345")
+    root = tmp_path / "ws"
+    root.mkdir()
+    (root / "b-link").symlink_to(outside / "b.txt")
+    (root / "a").symlink_to(outside)
+    seen: list[tuple[str, bool]] = []
+
+    def describe(path: str, own: os.stat_result) -> FilesystemEntry:
+        seen.append((path, stat.S_ISLNK(own.st_mode)))
+        return FilesystemEntry(id=path, name=path, path=path, type="file")
+
+    entries = search_indexed_paths(root, ["b-link", "a/b.txt"], "b", describe_link=describe)
+
+    assert seen == [("b-link", True)]
+    assert [e.path for e in entries] == ["b-link"]
+
+
+def test_walk_search_hands_symlinks_to_describe_link(tmp_path: Path) -> None:
+    """Links to files and to directories go to the describer; real entries don't."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "b.txt").write_text("12345")
+    root = tmp_path / "ws"
+    root.mkdir()
+    (root / "b-file").symlink_to(outside / "b.txt")
+    (root / "b-dir").symlink_to(outside)
+    (root / "b.md").write_text("md")
+    seen: list[str] = []
+
+    def describe(path: str, own: os.stat_result) -> FilesystemEntry:
+        assert stat.S_ISLNK(own.st_mode)
+        seen.append(path)
+        return FilesystemEntry(id=path, name=path, path=path, type="file")
+
+    entries, _ = walk_search(root, "b", [], [], 10, budget=100, describe_link=describe)
+
+    assert sorted(seen) == ["b-dir", "b-file"]
+    assert {e.path: e.bytes for e in entries} == {"b-dir": None, "b-file": None, "b.md": 2}
+
+
 @pytest.mark.asyncio
 async def test_search_follows_a_repository_created_inside_an_outer_one(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -3600,3 +3765,31 @@ def test_download_over_the_wire_fails_instead_of_truncating(
     message = str(excinfo.value)
     assert str(_DOWNLOAD_CHUNK) in message
     assert str(_SHRINK_SIZE) in message
+
+
+@pytest.mark.parametrize("directory", ["", "tree"])
+async def test_runner_listing_matches_the_host_reader(
+    client: httpx.AsyncClient, workspace: Path, directory: str
+) -> None:
+    """The workspace API lists through the host's reader, so it must answer like the runner."""
+    from omnigent.workspace_fs import WorkspaceReader
+
+    tree = workspace / "tree"
+    (tree / "sub").mkdir(parents=True)
+    (tree / "empty").mkdir()
+    (tree / ".hidden").write_text("x")
+    (tree / "file.txt").write_text("12345")
+    (tree / "dir-link").symlink_to(tree / "sub")
+    (tree / "broken-link").symlink_to(tree / "missing")
+    if sys.platform.startswith("linux"):
+        # Skipped by both: a non-UTF-8 name can't travel in JSON.
+        with open(os.path.join(os.fsencode(tree), b"bad-\xff"), "wb") as handle:
+            handle.write(b"x")
+    url = _FS_URL + (f"/{directory}" if directory else "")
+
+    runner = await client.get(url, params={"limit": 1000, "order": "asc"})
+    host = WorkspaceReader(workspace).list_directory(directory, limit=1000, after=None)
+
+    assert runner.status_code == 200, runner.text
+    assert runner.json()["data"] == host.data
+    assert runner.json()["has_more"] is host.has_more

@@ -20,8 +20,9 @@ export interface FilesPanelPreferences {
 
 const STORAGE_KEY = "omnigent:files-panel-preferences";
 
+// Alphabetical, with folders first in the tree; the other sorts stay a choice away.
 export const DEFAULT_FILES_PANEL_PREFERENCES: FilesPanelPreferences = {
-  sort: "recent",
+  sort: "alpha",
 };
 
 /**

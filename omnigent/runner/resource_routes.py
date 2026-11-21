@@ -8,6 +8,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import urllib.parse
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Mapping
 from pathlib import Path
@@ -22,6 +23,7 @@ if TYPE_CHECKING:
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.responses import RangeNotSatisfiable
 
 from omnigent._platform import normalize_interactive_shells
 from omnigent.entities.session_resources import (
@@ -83,6 +85,27 @@ if TYPE_CHECKING:
     from omnigent.runtime.filesystem_registry import FilesystemRegistry
 
 _logger = logging.getLogger("omnigent.runner.app")
+
+
+def _download_byte_range(header: str, size: int) -> tuple[int, int] | None:
+    """Resolve one byte range; ignore malformed and multipart ranges."""
+    match = re.fullmatch(r"bytes=([0-9]*)-([0-9]*)", header.strip(), re.IGNORECASE)
+    if match is None or not any(match.groups()):
+        return None
+    first, last = match.groups()
+    try:
+        start = int(first) if first else 0
+        end = int(last) if last else size - 1
+    except ValueError:
+        return None
+    if first:
+        if last and end < start:
+            return None
+    else:
+        start, end = max(0, size - end), size - 1
+    if start >= size or start > end:
+        raise RangeNotSatisfiable(size)
+    return start, min(end + 1, size)
 
 
 class _EnsureCommentRelayStartedFn(Protocol):
@@ -1307,6 +1330,7 @@ def register_resource_routes(
                 "modified_at": rec.get("modified_at"),
                 "lines_added": rec.get("lines_added"),
                 "lines_removed": rec.get("lines_removed"),
+                "untracked_lines": rec.get("untracked_lines"),
                 **(
                     {"repository_root": rec["repository_root"]} if "repository_root" in rec else {}
                 ),
@@ -1851,6 +1875,7 @@ def register_resource_routes(
         session_id: str,
         environment_id: str,
         relative_path: str,
+        request: Request,
         limit: int = Query(default=20, ge=1, le=1000),
         after: str | None = Query(default=None),
         before: str | None = Query(default=None),
@@ -1868,6 +1893,9 @@ def register_resource_routes(
                 session_id,
                 environment_id,
                 relative_path,
+                range_header=request.headers.get("range")
+                if "if-range" not in request.headers
+                else None,
                 follow_outward_links=follow_outward_links,
             )
         return await _fs_list_or_read(
@@ -2045,9 +2073,10 @@ def register_resource_routes(
         environment_id: str,
         path: str,
         *,
+        range_header: str | None = None,
         follow_outward_links: bool = False,
-    ) -> StreamingResponse:
-        """Serve a file's complete bytes as an attachment.
+    ) -> Response:
+        """Serve complete or ranged file bytes from the authorized descriptor.
 
         The read path inlines content in a JSON envelope, so it caps at
         ``_MAX_READ_BYTES``. A download streams from a descriptor and needs
@@ -2057,6 +2086,7 @@ def register_resource_routes(
         :param session_id: Session identifier.
         :param environment_id: Environment resource id.
         :param path: Path within the environment, or an absolute path.
+        :param range_header: An optional HTTP byte range for media seeking.
         :param follow_outward_links: Admit a workspace symlink whose target
             lies outside the workspace but within the environment's reach.
         :returns: The file streamed with ``Content-Disposition: attachment``.
@@ -2071,12 +2101,25 @@ def register_resource_routes(
         env = resource_registry.resolve_environment(session_id, environment_id, agent_spec)
         fs = CallerProcessFilesystem(env, follow_outward_links=follow_outward_links)
         fobj, resolved, size = await fs.open_download(path)
+        headers = {"Accept-Ranges": "bytes"}
+        try:
+            byte_range = _download_byte_range(range_header, size) if range_header else None
+        except RangeNotSatisfiable:
+            fobj.close()
+            headers["Content-Range"] = f"bytes */{size}"
+            return Response(status_code=416, headers=headers)
+        start, end = byte_range if byte_range is not None else (0, size)
+        length = end - start
+        if byte_range is not None:
+            headers["Content-Range"] = f"bytes {start}-{end - 1}/{size}"
 
         async def _chunks() -> AsyncIterator[bytes]:
             # Stop at the size announced in Content-Length so a file growing
             # underneath the download cannot overrun the response.
-            remaining = size
+            remaining = length
             try:
+                if start:
+                    await asyncio.to_thread(fobj.seek, start)
                 while remaining > 0:
                     chunk = await asyncio.to_thread(fobj.read, min(64 * 1024, remaining))
                     if not chunk:
@@ -2087,8 +2130,8 @@ def register_resource_routes(
                             "Download of %s aborted: file shrank while streaming "
                             "(sent %d of %d announced bytes)",
                             resolved.name,
-                            size - remaining,
-                            size,
+                            length - remaining,
+                            length,
                         )
                         raise RuntimeError(f"{resolved.name} shrank during download")
                     remaining -= len(chunk)
@@ -2106,9 +2149,11 @@ def register_resource_routes(
         )
         return StreamingResponse(
             _chunks(),
+            status_code=206 if byte_range is not None else 200,
             media_type=mimetypes.guess_type(resolved.name)[0] or "application/octet-stream",
             headers={
-                "Content-Length": str(size),
+                **headers,
+                "Content-Length": str(length),
                 "Content-Disposition": disposition,
                 "Cache-Control": "no-store",
                 "X-Content-Type-Options": "nosniff",

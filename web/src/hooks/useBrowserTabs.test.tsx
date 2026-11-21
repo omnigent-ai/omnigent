@@ -10,10 +10,14 @@ import { SESSION_HOST_PROTOCOL } from "@/lib/nativeBridge";
 import { getSessionSlim } from "@/lib/sessionsApi";
 import type * as SessionsApi from "@/lib/sessionsApi";
 import type { Session } from "@/lib/types";
+import { writeBrowserAgentToolsEnabled } from "@/components/BrowserPane/agentTools/preferences";
+import { loadTabs } from "@/components/BrowserPane/agentTools/tabStore";
+import { fakeMainTabs } from "@/components/BrowserPane/agentTools/fakeMainTabs";
 import {
   AGENT_BROWSER_TAB_ID,
   browserViewId,
   browserViewOwnerId,
+  closeBrowserView,
   openAgentBrowserTab,
   openBrowserTab,
   useBrowserTabs,
@@ -186,6 +190,24 @@ describe("browserViewOwnerId", () => {
   });
 });
 
+describe("closeBrowserView", () => {
+  it("closes the session's view and says whether it went", async () => {
+    const browserClose = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true })
+      .mockResolvedValueOnce({ ok: false });
+    await expect(closeBrowserView("session-a", "tab-1", { browserClose })).resolves.toBe(true);
+    expect(browserClose).toHaveBeenCalledWith(browserViewId("session-a", "tab-1"));
+    await expect(closeBrowserView("session-a", "tab-1", { browserClose })).resolves.toBe(false);
+  });
+
+  it("counts a failed close as kept, and has nothing to close without a view host", async () => {
+    const browserClose = vi.fn().mockRejectedValue(new Error("gone"));
+    await expect(closeBrowserView("session-a", "tab-1", { browserClose })).resolves.toBe(false);
+    await expect(closeBrowserView("session-a", "tab-1", undefined)).resolves.toBe(true);
+  });
+});
+
 describe("browser soft tabs", () => {
   it("persists a pending close even if the workspace unmounts", async () => {
     let finishClose!: (value: { ok: boolean }) => void;
@@ -281,6 +303,32 @@ describe("browser soft tabs", () => {
     });
     expect(outcome).toEqual({ ok: false, error });
     expect(result.current.tabs).toEqual([]);
+  });
+
+  it("reports a failure when the reopened tab can't be recorded, and closes its view", async () => {
+    const main = fakeMainTabs();
+    main.otherWindow("session-a", (r) => ({ ...r, tabs: ["kept"], selected: "kept" }));
+    const browserClose = vi.fn().mockResolvedValue({ ok: true });
+    Object.assign(window, {
+      omnigentDesktop: {
+        browserOpenOrNavigate: vi.fn().mockResolvedValue({ ok: true }),
+        browserClose,
+        onBrowserTabsChanged: main.onBrowserTabsChanged,
+        browserTabs: async (args: Record<string, unknown>) =>
+          args.op === "update" ? { ok: false, error: "disk full" } : main.browserTabs(args),
+      },
+    });
+    writeBrowserAgentToolsEnabled(true);
+    await loadTabs("session-a");
+    const { result } = renderHook(() => useBrowserTabs("session-a"));
+    await waitFor(() => expect(result.current.tabs).toEqual(["kept"]));
+    let outcome: { ok: boolean; error?: string } | undefined;
+    await act(async () => {
+      outcome = await result.current.reopen("https://example.com/");
+    });
+    expect(outcome).toEqual({ ok: false, error: "disk full" });
+    expect(browserClose).toHaveBeenCalledTimes(1);
+    expect(result.current.tabs).toEqual(["kept"]);
   });
 
   it("commits the incoming session's selection in its first render after a switch", () => {

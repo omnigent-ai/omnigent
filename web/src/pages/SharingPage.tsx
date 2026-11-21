@@ -25,69 +25,75 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { type SharingMode, isSingleUserMode } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isBootFallbackInfo } from "@/lib/bootCapabilities";
-import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
+import {
+  getCurrentIsAdmin,
+  getCurrentUserId,
+  resolveIdentity,
+  subscribeIdentity,
+} from "@/lib/identity";
 import { cn } from "@/lib/utils";
 import { type DefaultPublicSessions, useSetSharing, useSharing } from "@/hooks/useSharing";
-
-/** The four tiers, most-permissive first, with human-readable copy. */
-const TIERS: { id: SharingMode; label: string; description: string }[] = [
-  {
-    id: "on",
-    label: "On",
-    description:
-      "Users with manage access can share at read, edit, or manage level and enable public or workspace read access.",
-  },
-  {
-    id: "read_only",
-    label: "Read only",
-    description: "New shares allow Read access only; Edit and Manage grants are rejected.",
-  },
-  {
-    id: "restricted_read_only",
-    label: "Read only (restricted)",
-    description: "Read-only. Sessions in a home directory or the filesystem root cannot be shared.",
-  },
-  {
-    id: "off",
-    label: "Off",
-    description: "Block new shares and hide the Share control.",
-  },
-];
-
-/** Scope of automatic sharing, most-private first. */
-const DEFAULT_PUBLIC_OPTIONS: {
-  id: Exclude<DefaultPublicSessions, "off">;
-  label: string;
-  description: string;
-}[] = [
-  {
-    id: "sandbox",
-    label: "Managed hosts only",
-    description: "Share sessions on managed sandboxes. Local sessions start private.",
-  },
-  {
-    id: "all",
-    label: "All sessions",
-    description: "Share sessions on both managed and local hosts.",
-  },
-];
+import {
+  DEFAULT_PUBLIC_SCOPES,
+  DEFAULT_PUBLIC_SESSIONS_ENTRY,
+  PEER_SESSION_MESSAGING_ENTRY,
+  PUBLIC_ACCESS_ENTRY,
+  PUBLIC_MAX_PERMISSION_ENTRY,
+  SHARING_MODE_ENTRY,
+  SHARING_TIERS as TIERS,
+} from "@/pages/settings/search/catalog/sharing";
+import { SettingsEntryLabel, SettingsItem } from "@/pages/settings/search/SettingsItem";
+import { settingsControlProps } from "@/pages/settings/search/settingsControl";
+import {
+  SettingsOwner,
+  settingsOverlayProps,
+  useSettingsOwnership,
+} from "@/pages/settings/search/settingsOwnership";
 
 /**
  * Greys out a control another setting overrides and explains why on hover.
  * Renders children untouched when ``reason`` is null.
  */
+/** Greys out a control another setting overrides; under its owner, the focusable reason is that part. */
 function BlockedBy({ reason, children }: { reason: string | null; children: ReactNode }) {
+  const owned = useSettingsOwnership();
   if (reason === null) return children;
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <div tabIndex={0} className="cursor-not-allowed opacity-50" data-blocked="true">
+        <div
+          {...owned.control({ title: "" })}
+          tabIndex={0}
+          className="cursor-not-allowed opacity-50"
+          data-blocked="true"
+        >
           <span className="sr-only">{reason}</span>
           {children}
         </div>
       </TooltipTrigger>
       <TooltipContent side="top">{reason}</TooltipContent>
     </Tooltip>
+  );
+}
+
+/** The default-visibility row, greyed out behind whichever setting overrides it. */
+function DefaultPublicBlocked({
+  sharingOff,
+  reason,
+  children,
+}: {
+  sharingOff: boolean;
+  reason: string | null;
+  children: ReactNode;
+}) {
+  return sharingOff ? (
+    <SettingsOwner entry={DEFAULT_PUBLIC_SESSIONS_ENTRY} part="blockedBySharing">
+      <BlockedBy reason={reason}>{children}</BlockedBy>
+    </SettingsOwner>
+  ) : (
+    <SettingsOwner entry={DEFAULT_PUBLIC_SESSIONS_ENTRY} part="blockedByPublicAccess">
+      <BlockedBy reason={reason}>{children}</BlockedBy>
+    </SettingsOwner>
   );
 }
 
@@ -109,11 +115,17 @@ export function SharingPage() {
   // too). Skipped in single-user mode where no auth endpoints exist.
   useEffect(() => {
     if (isSingleUser || capabilitiesLoading) return;
-    void (async () => {
-      const userId = await resolveIdentity();
-      if (userId === null) return;
+    let active = true;
+    const update = (userId: string | null) => {
+      if (!active || userId === null) return;
       setMeIsAdmin(getCurrentIsAdmin());
-    })();
+    };
+    const unsubscribe = subscribeIdentity(() => update(getCurrentUserId()));
+    void resolveIdentity().then(update);
+    return () => {
+      active = false;
+      unsubscribe();
+    };
   }, [isSingleUser, capabilitiesLoading]);
 
   if (!isSingleUser && meIsAdmin === null) {
@@ -131,7 +143,7 @@ export function SharingPage() {
         contentClassName="px-4 md:px-8"
         extraBottom="2.5rem"
       >
-        <h1 className="settings-page-title mb-2 text-2xl font-medium">Session sharing</h1>
+        <h1 className="mb-2 text-2xl font-medium">Session sharing</h1>
         <p className="text-ui text-muted-foreground">
           You don't have permission to manage session sharing.
         </p>
@@ -151,12 +163,15 @@ export function SharingPage() {
   // Settings a higher-level one overrides are greyed out and show their
   // effective value; the saved value returns once the blocker is lifted.
   const sharingOff = current === "off";
-  const publicBlockedReason = sharingOff ? "Turn sharing on to use public access." : null;
-  const defaultPublicBlockedReason = sharingOff
-    ? "Turn sharing on to change the default visibility."
+  const publicBlockedReason = sharingOff ? PUBLIC_ACCESS_ENTRY.parts.blocked : null;
+  const defaultPublicBlockedByPart = sharingOff
+    ? "blockedBySharing"
     : !publicEnabled
-      ? "Turn on public access to change the default visibility."
+      ? "blockedByPublicAccess"
       : null;
+  const defaultPublicBlockedReason = defaultPublicBlockedByPart
+    ? DEFAULT_PUBLIC_SESSIONS_ENTRY.parts[defaultPublicBlockedByPart]
+    : null;
   const effectivePublic = publicEnabled && !sharingOff;
   const effectiveDefaultPublic = defaultPublicBlockedReason ? "off" : defaultPublic;
   const publicDisabled = !publicEditable || setMode.isPending || publicBlockedReason !== null;
@@ -185,7 +200,7 @@ export function SharingPage() {
     <PageScroll maxWidthClassName="max-w-4xl" contentClassName="px-4 md:px-8" extraBottom="2.5rem">
       <div>
         <div className="mb-6">
-          <h1 className="settings-page-title text-2xl font-medium">Session sharing</h1>
+          <h1 className="text-2xl font-medium">Session sharing</h1>
           <p className="mt-1 text-sm text-muted-foreground max-md:hidden">
             Control sharing server-wide. Mode and visibility defaults affect new shares; public
             permission limits also affect existing public grants. Changes apply immediately.
@@ -203,7 +218,10 @@ export function SharingPage() {
             )}
             <div className="flex flex-col gap-6">
               <SettingsGroup title="Sharing mode" testId="settings-group-sharing-mode">
-                <div className="flex flex-col gap-3 md:flex-row-reverse md:items-start md:gap-6">
+                <SettingsItem
+                  entry={SHARING_MODE_ENTRY}
+                  className="flex flex-col gap-3 md:flex-row-reverse md:items-start md:gap-6"
+                >
                   <Select
                     value={current}
                     onValueChange={(value) => choose(value as SharingMode)}
@@ -212,13 +230,14 @@ export function SharingPage() {
                     valueHasNoPii
                   >
                     <SelectTrigger
+                      {...settingsControlProps(SHARING_MODE_ENTRY, "mode")}
                       className="w-full shrink-0 md:w-52"
-                      aria-label="Session sharing mode"
                       aria-describedby="sharing-mode-description"
                     >
                       <SelectValue>{currentTier?.label}</SelectValue>
                     </SelectTrigger>
                     <SelectContent
+                      {...settingsOverlayProps(SHARING_MODE_ENTRY, "mode")}
                       position="popper"
                       align="end"
                       className="w-[28rem] max-w-[calc(100vw-2rem)]"
@@ -253,45 +272,50 @@ export function SharingPage() {
                   >
                     {currentTier?.description}
                   </p>
-                </div>
+                </SettingsItem>
               </SettingsGroup>
 
               <SettingsGroup title="Public sharing" testId="settings-group-public-sharing">
-                <BlockedBy reason={publicBlockedReason}>
-                  <div className="flex items-center justify-between gap-4">
-                    <SettingsLabel
-                      label="Public access"
-                      className="flex-1"
-                      description={
-                        <>
-                          Anyone with the link can access after signing in. Turning this off blocks
-                          new public grants; existing grants stay accessible and revocable.
-                          {!publicEditable && (
-                            <span className="mt-1 block">
-                              Managed by this deployment and can&apos;t be changed here.
-                            </span>
-                          )}
-                        </>
-                      }
-                    />
-                    <Switch
-                      checked={effectivePublic}
-                      onCheckedChange={togglePublic}
-                      disabled={publicDisabled}
-                      aria-label="Public access"
-                      componentId="settings.sharing.public_access"
-                    />
-                  </div>
-                </BlockedBy>
+                <SettingsItem entry={PUBLIC_ACCESS_ENTRY}>
+                  <SettingsOwner entry={PUBLIC_ACCESS_ENTRY} part="blocked">
+                    <BlockedBy reason={publicBlockedReason}>
+                      <div className="flex items-center justify-between gap-4">
+                        <SettingsEntryLabel
+                          entry={PUBLIC_ACCESS_ENTRY}
+                          className="flex-1"
+                          description={
+                            <>
+                              {PUBLIC_ACCESS_ENTRY.description}
+                              {!publicEditable && (
+                                <span className="mt-1 block">
+                                  Managed by this deployment and can&apos;t be changed here.
+                                </span>
+                              )}
+                            </>
+                          }
+                        />
+                        <Switch
+                          {...settingsControlProps(PUBLIC_ACCESS_ENTRY)}
+                          checked={effectivePublic}
+                          onCheckedChange={togglePublic}
+                          disabled={publicDisabled}
+                          componentId="settings.sharing.public_access"
+                        />
+                      </div>
+                    </BlockedBy>
+                  </SettingsOwner>
+                </SettingsItem>
 
-                <div className="mt-4 flex items-center justify-between gap-4 border-t border-border pt-4">
-                  <SettingsLabel
-                    label="Maximum public permission"
+                <SettingsItem
+                  entry={PUBLIC_MAX_PERMISSION_ENTRY}
+                  className="mt-4 flex items-center justify-between gap-4 border-t border-border pt-4"
+                >
+                  <SettingsEntryLabel
+                    entry={PUBLIC_MAX_PERMISSION_ENTRY}
                     className="min-w-0 flex-1"
                     description={
                       <>
-                        Limit access through public links. Lowering to Read limits existing Edit
-                        grants; raising it does not upgrade Read grants.
+                        {PUBLIC_MAX_PERMISSION_ENTRY.description}
                         {!publicMaxEditable && (
                           <span className="mt-1 block">Managed by this deployment.</span>
                         )}
@@ -312,33 +336,33 @@ export function SharingPage() {
                     valueHasNoPii
                   >
                     <SelectTrigger
+                      {...settingsControlProps(PUBLIC_MAX_PERMISSION_ENTRY)}
                       className="h-8 w-28 shrink-0"
-                      aria-label="Maximum public permission"
                     >
                       <SelectValue />
                     </SelectTrigger>
-                    <SelectContent>
+                    <SelectContent {...settingsOverlayProps(PUBLIC_MAX_PERMISSION_ENTRY)}>
                       <SelectItem value="read">Read</SelectItem>
                       {state?.public_sharing_max_level_options?.includes("edit") && (
                         <SelectItem value="edit">Edit</SelectItem>
                       )}
                     </SelectContent>
                   </Select>
-                </div>
+                </SettingsItem>
 
-                <div className="mt-4 border-t border-border pt-4">
-                  <BlockedBy reason={defaultPublicBlockedReason}>
+                <SettingsItem
+                  entry={DEFAULT_PUBLIC_SESSIONS_ENTRY}
+                  className="mt-4 border-t border-border pt-4"
+                >
+                  <DefaultPublicBlocked sharingOff={sharingOff} reason={defaultPublicBlockedReason}>
                     <div className="flex items-center justify-between gap-4">
-                      <SettingsLabel
-                        label="Share new sessions by default"
-                        labelId="default-public-label"
-                        descriptionId="default-public-description"
+                      <SettingsEntryLabel
+                        entry={DEFAULT_PUBLIC_SESSIONS_ENTRY}
                         descriptionClassName="max-md:block"
                         className="flex-1"
                         description={
                           <>
-                            New sessions allow public read access with a link and sign-in. Owners
-                            can revoke it in Share. Existing sessions stay unchanged.
+                            {DEFAULT_PUBLIC_SESSIONS_ENTRY.description}
                             {!defaultPublicEditable && (
                               <span className="mt-1 block">
                                 Managed by this deployment and can&apos;t be changed here.
@@ -348,13 +372,12 @@ export function SharingPage() {
                         }
                       />
                       <Switch
+                        {...settingsControlProps(DEFAULT_PUBLIC_SESSIONS_ENTRY)}
                         checked={effectiveDefaultPublic !== "off"}
                         onCheckedChange={(enabled) =>
                           chooseDefaultPublic(enabled ? "sandbox" : "off")
                         }
                         disabled={defaultPublicDisabled}
-                        aria-labelledby="default-public-label"
-                        aria-describedby="default-public-description"
                         componentId="settings.sharing.default_public"
                       />
                     </div>
@@ -364,8 +387,12 @@ export function SharingPage() {
                         disabled={defaultPublicDisabled}
                       >
                         <legend className="mb-3 text-ui font-medium">Automatically share</legend>
-                        <div className="flex flex-col gap-4">
-                          {DEFAULT_PUBLIC_OPTIONS.map((option) => (
+                        <div
+                          role="radiogroup"
+                          {...settingsControlProps(DEFAULT_PUBLIC_SESSIONS_ENTRY, "scope")}
+                          className="flex flex-col gap-4"
+                        >
+                          {DEFAULT_PUBLIC_SCOPES.map((option) => (
                             <label
                               key={option.id}
                               className={cn(
@@ -397,16 +424,17 @@ export function SharingPage() {
                         </div>
                       </fieldset>
                     )}
-                  </BlockedBy>
-                </div>
+                  </DefaultPublicBlocked>
+                </SettingsItem>
               </SettingsGroup>
               {state?.peer_session_messaging_enabled !== undefined && (
                 <SettingsGroup title="Agent messaging" testId="settings-group-agent-messaging">
-                  <div className="flex items-center justify-between gap-4">
-                    <SettingsLabel
-                      label="Message other sessions"
-                      labelId="peer-messaging-label"
-                      descriptionId="peer-messaging-description"
+                  <SettingsItem
+                    entry={PEER_SESSION_MESSAGING_ENTRY}
+                    className="flex items-center justify-between gap-4"
+                  >
+                    <SettingsEntryLabel
+                      entry={PEER_SESSION_MESSAGING_ENTRY}
                       descriptionClassName="max-md:block"
                       className="flex-1"
                       description={
@@ -422,6 +450,7 @@ export function SharingPage() {
                       }
                     />
                     <Switch
+                      {...settingsControlProps(PEER_SESSION_MESSAGING_ENTRY)}
                       checked={state.peer_session_messaging_enabled}
                       onCheckedChange={(enabled) => {
                         setError(null);
@@ -431,11 +460,9 @@ export function SharingPage() {
                         );
                       }}
                       disabled={!state.peer_session_messaging_editable || setMode.isPending}
-                      aria-labelledby="peer-messaging-label"
-                      aria-describedby="peer-messaging-description"
                       componentId="settings.sharing.peer_session_messaging"
                     />
-                  </div>
+                  </SettingsItem>
                 </SettingsGroup>
               )}
             </div>

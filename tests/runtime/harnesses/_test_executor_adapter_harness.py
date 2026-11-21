@@ -36,6 +36,7 @@ from omnigent.inner.executor import (
     ExecutorEvent,
     Message,
     MockExecutor,
+    NativeTurnAcceptance,
     ToolCallComplete,
     ToolCallRequest,
     ToolCallStatus,
@@ -115,7 +116,17 @@ def _build_text_only() -> Executor:
     :returns: A configured :class:`MockExecutor` instance.
     """
     executor = MockExecutor()
-    executor.enqueue_response("hello from mock")
+    raw_acceptance = os.environ.get("MOCK_EXECUTOR_NATIVE_ACCEPTANCE")
+    executor.enqueue_events(
+        [
+            TurnComplete(
+                response="hello from mock",
+                native_acceptance=NativeTurnAcceptance(**json.loads(raw_acceptance))
+                if raw_acceptance
+                else None,
+            )
+        ]
+    )
     return executor
 
 
@@ -208,12 +219,20 @@ def _build_cancelled() -> Executor:
     MockExecutor scripted with a provider-side :class:`TurnCancelled`.
 
     The adapter should map this cleanly to ``response.cancelled`` rather than
-    falling through to ``response.completed``.
+    falling through to ``response.completed``, with the usage of the model
+    calls the turn made before it was cancelled.
 
     :returns: A configured :class:`MockExecutor` instance.
     """
     executor = MockExecutor()
-    executor._turns.append([TurnCancelled(reason="provider_cancelled")])
+    executor._turns.append(
+        [
+            TurnCancelled(
+                reason="provider_cancelled",
+                usage={"input_tokens": 300, "output_tokens": 40, "total_tokens": 340},
+            )
+        ]
+    )
     return executor
 
 

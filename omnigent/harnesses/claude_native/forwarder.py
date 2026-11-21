@@ -30,6 +30,7 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeMessageDelta,
     ClaudeTranscriptItem,
     HookReadResult,
+    ResumeCostBaseline,
     TranscriptReadResult,
     _display_text,
     _transcript_items_from_entry,
@@ -43,6 +44,7 @@ from omnigent.harnesses.claude_native.bridge import (
     read_hook_events_since_with_position,
     read_message_deltas_from_offset,
     read_pane_signals,
+    read_resume_cost_baseline,
     read_seen_claude_session_ids,
     read_transcript_items_from_offset,
     read_transcript_items_since_with_position,
@@ -51,6 +53,7 @@ from omnigent.harnesses.claude_native.bridge import (
     transcript_has_recent_local_command,
     url_component,
     write_active_session_id,
+    write_resume_cost_baseline,
 )
 from omnigent.harnesses.claude_native.diagnostics import ClaudeDebugLogFollower
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
@@ -133,6 +136,13 @@ _MAX_SEEN_DELTA_KEYS = 5000
 # Seconds without transcript activity before reporting an idle observation.
 # This heuristic does not establish that the sub-agent has completed.
 _SUBAGENT_IDLE_THRESHOLD_S = 5.0
+# The gap allowed while the child's turn is still open (a tool runs or the model
+# is responding), so a long step doesn't flip it idle and back. Matches Claude's
+# longest Bash timeout, so a child that stops mid-tool still settles.
+_SUBAGENT_MID_TURN_IDLE_THRESHOLD_S = 600.0
+# Claude's tool that hands a sub-agent's report back and ends its turn.
+_SUBAGENT_HANDBACK_TOOL = "SubagentHandback"
+_SUBAGENT_INTERRUPT_PREFIX = "[Request interrupted by user"
 
 # Meta-file glob inside ``~/.claude/projects/<encoded>/<session>/subagents/``.
 # One per Claude Task-tool subagent; appears alongside the matching
@@ -653,6 +663,9 @@ class SubagentEntry:
         means no observation has been handled yet.
     :param delivery_error: Durable reason the mirrored transcript is
         incomplete. After inactivity it reports ``failed`` instead of idle.
+    :param mid_turn: Whether the forwarded items leave the child's turn open
+        (see :func:`_leaves_turn_open`), so inactivity waits for
+        ``_SUBAGENT_MID_TURN_IDLE_THRESHOLD_S``.
     """
 
     subagent_id: str
@@ -663,6 +676,7 @@ class SubagentEntry:
     last_activity_ts: float | None = None
     last_status: str | None = None
     delivery_error: str | None = None
+    mid_turn: bool = False
 
 
 @dataclass(frozen=True)
@@ -902,6 +916,8 @@ class _ForwardDedupeState:
     # sub-agent spend so the gate can block mid-turn. Separate baseline
     # because it can advance while ``posted_cost`` (S) is frozen.
     posted_policy_cost: float | None = None
+    # Last per-child transcript cost estimates POSTed as ``subagent_costs_usd``.
+    posted_subagent_costs: dict[str, float] | None = None
     # Last permission mode POSTed as ``external_permission_mode_change`` —
     # mirrors the launch mode and any in-pane shift+tab switch, neither of
     # which the web UI can observe on its own.
@@ -960,6 +976,10 @@ class _ForwardDedupeState:
     # Session already logged as moved off this runner, so the notice is not
     # repeated for every item dropped afterwards.
     session_not_bound_logged_for: str | None = None
+    # The cost a cold resume seeded into this Claude process, read from the
+    # bridge dir once (see ``_resume_adjusted_status_cost``).
+    resume_cost_baseline: ResumeCostBaseline | None = None
+    resume_cost_baseline_read: bool = False
 
 
 @dataclass(frozen=True)
@@ -1822,6 +1842,7 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
             delivery_error=(
                 row.get("delivery_error") if isinstance(row.get("delivery_error"), str) else None
             ),
+            mid_turn=row.get("mid_turn") is True,
         )
     return SubagentForwardState(subagents=entries)
 
@@ -1845,6 +1866,7 @@ def _write_subagent_forward_state(bridge_dir: Path, state: SubagentForwardState)
                 "last_activity_ts": entry.last_activity_ts,
                 "last_status": entry.last_status,
                 "delivery_error": entry.delivery_error,
+                "mid_turn": entry.mid_turn,
             }
             for entry in state.subagents.values()
         },
@@ -2197,6 +2219,31 @@ def _partition_subagent_batches(
     return batches
 
 
+def _leaves_turn_open(item: ClaudeTranscriptItem, *, open_before: bool) -> bool:
+    """Whether a child's turn is still open after this item.
+
+    Assistant text, a handback, and an interrupt end it; a tool result keeps
+    the state its call set.
+    """
+    if item.item_type == "function_call_output":
+        return open_before
+    if item.item_type == "function_call":
+        return item.data.get("name") != _SUBAGENT_HANDBACK_TOOL
+    if item.item_type != "message":
+        return True
+    if item.data.get("role") == "assistant":
+        return False
+    content = item.data.get("content")
+    return not (
+        isinstance(content, list)
+        and any(
+            isinstance(block, dict)
+            and str(block.get("text", "")).startswith(_SUBAGENT_INTERRUPT_PREFIX)
+            for block in content
+        )
+    )
+
+
 def _pending_items_from_records(
     result: TranscriptReadResult,
     seen: set[str],
@@ -2526,6 +2573,9 @@ async def _forward_one_subagent(
             source_id = pending_item.item.source_id
             seen.add(source_id)
             seen_source_ids.append(source_id)
+        mid_turn = new_entry.mid_turn
+        for pending_item in completed_items:
+            mid_turn = _leaves_turn_open(pending_item.item, open_before=mid_turn)
         completed_offsets = [
             pending_item.checkpoint_after
             for pending_item in completed_items
@@ -2536,22 +2586,26 @@ async def _forward_one_subagent(
             byte_offset=max(completed_offsets, default=new_entry.byte_offset),
             seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
             last_activity_ts=now if delivered else new_entry.last_activity_ts,
+            mid_turn=mid_turn,
         )
         await checkpoint.put(new_entry)
         if stop_after_batch:
             break
 
     delivery_pending = any(item.item.source_id not in seen for item in pending)
+    idle_threshold_s = (
+        _SUBAGENT_MID_TURN_IDLE_THRESHOLD_S if new_entry.mid_turn else _SUBAGENT_IDLE_THRESHOLD_S
+    )
     desired_status: str | None = None
     if had_item:
         desired_status = "running"
     elif (
         not delivery_pending
         and new_entry.last_activity_ts is not None
-        and now - new_entry.last_activity_ts > _SUBAGENT_IDLE_THRESHOLD_S
+        and now - new_entry.last_activity_ts > idle_threshold_s
     ):
         # A transcript lull is an idle observation, not an authoritative
-        # completion: the child may still be in a long-running tool call.
+        # completion: the child may still be working on its reply.
         desired_status = "failed" if new_entry.delivery_error else "idle"
     if desired_status is None or desired_status == new_entry.last_status:
         return
@@ -2583,6 +2637,9 @@ async def _forward_one_subagent(
             exc_info=True,
             extra={"session_id": parent_session_id},
         )
+        # The server already published this status; only the hand-off to the parent failed.
+        if decision.exhausted and _is_subagent_delivery_not_confirmed(exc):
+            await checkpoint.put(replace(new_entry, last_status=desired_status))
         return
     status_retry_tracker.clear(retry_key)
     await checkpoint.put(replace(new_entry, last_status=desired_status))
@@ -3067,6 +3124,108 @@ def _cumulative_cost_from_status_state(state: dict[str, object] | None) -> float
     return float(raw)
 
 
+def _api_duration_from_status_state(state: dict[str, object] | None) -> float | None:
+    """
+    Extract the API time Claude has spent so far from a statusLine snapshot.
+
+    :param state: Parsed ``context.json`` payload, or ``None``.
+    :returns: ``state["total_api_duration_ms"]``, e.g. ``0.0`` before the
+        process's first API call, or ``None`` when absent / malformed.
+    """
+    if not isinstance(state, dict):
+        return None
+    raw = state.get("total_api_duration_ms")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw < 0:
+        return None
+    return float(raw)
+
+
+def _resume_adjusted_status_cost(
+    *,
+    bridge_dir: Path,
+    transcript_path: Path,
+    status_cost: float | None,
+    api_duration_ms: float | None,
+    dedupe: _ForwardDedupeState,
+    session_id: str,
+) -> float | None:
+    """
+    Add back the cost a cold resume seeded when Claude didn't restore it.
+
+    A cold resume seeds the session's recorded cost into Claude through a
+    ``cost-state`` transcript record in Claude Code's own format. A release
+    that stops reading it would restart the statusLine total at $0, and the
+    server, which keeps only the highest total, would stall the session cost.
+
+    Claude restores the seed exactly and only adds to it, so a total below
+    the seed proves a fresh count. The decision is made before the resumed
+    process's first API call, when its total is the seed or $0, so it
+    doesn't depend on what that call costs. If the forwarder only sees a
+    total after a call, one at or above the seed is taken as restored,
+    which can't count the seed twice. The decision is persisted, so a
+    restarted forwarder keeps it.
+
+    Reads and writes the bridge dir; call via :func:`asyncio.to_thread`.
+
+    :param bridge_dir: Native Claude bridge directory holding the baseline.
+    :param transcript_path: Transcript being forwarded; its stem is the
+        running Claude session id.
+    :param status_cost: The statusLine total, or ``None`` when not captured.
+    :param api_duration_ms: The statusLine's API time, ``0.0`` before the
+        first API call, or ``None`` when not reported.
+    :param dedupe: Caches the baseline and its decision; mutated in place.
+    :param session_id: Omnigent session id, e.g. ``"conv_abc123"``, for logs.
+    :returns: *status_cost*, plus the seeded cost when Claude counted from
+        zero.
+    """
+    if not dedupe.resume_cost_baseline_read:
+        dedupe.resume_cost_baseline_read = True
+        try:
+            dedupe.resume_cost_baseline = read_resume_cost_baseline(bridge_dir)
+        except (OSError, ValueError):
+            _logger.warning(
+                "Could not read the cost seeded on cold resume; session=%s",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+    baseline = dedupe.resume_cost_baseline
+    if (
+        baseline is None
+        or status_cost is None
+        or transcript_path.stem != baseline.claude_session_id
+    ):
+        return status_cost
+    if baseline.restored is None:
+        if status_cost <= 0 and api_duration_ms != 0:
+            # No total from before the first API call, and none billed yet.
+            return status_cost
+        restored = status_cost >= baseline.cost_usd
+        baseline = replace(baseline, restored=restored)
+        dedupe.resume_cost_baseline = baseline
+        try:
+            write_resume_cost_baseline(bridge_dir, baseline)
+        except (OSError, RuntimeError):
+            _logger.warning(
+                "Could not persist the cold-resume cost decision; session=%s",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+        if not restored:
+            _logger.warning(
+                "Claude Code did not restore the cost seeded on cold resume; adding "
+                "$%.4f to its total; session=%s claude_session=%s",
+                baseline.cost_usd,
+                session_id,
+                baseline.claude_session_id,
+                extra={"session_id": session_id},
+            )
+    if baseline.restored:
+        return status_cost
+    return baseline.cost_usd + status_cost
+
+
 def _transcript_cost_size_cached(
     transcript_path: Path,
     *,
@@ -3107,10 +3266,40 @@ def _transcript_cost_size_cached(
     return cost
 
 
+def _subagent_cost_estimates(
+    parent_transcript_path: Path,
+    active_subagents: list[SubagentEntry],
+    cost_cache: dict[Path, _TranscriptCostCacheEntry],
+) -> dict[str, float]:
+    """
+    Price each tracked sub-agent's own transcript, keyed by child conversation.
+
+    Synchronous transcript I/O; call via :func:`asyncio.to_thread`.
+
+    :param parent_transcript_path: Parent transcript JSONL path; its sibling
+        ``subagents/`` directory holds ``agent-<id>.jsonl`` files.
+    :param active_subagents: Sub-agents with a minted child conversation.
+    :param cost_cache: Size-keyed transcript cost cache, mutated in place.
+    :returns: ``{child_conversation_id: usd}`` for priceable transcripts, e.g.
+        ``{"conv_child": 0.55}``.
+    """
+    subagents_dir = _subagents_dir_for_transcript(parent_transcript_path)
+    costs: dict[str, float] = {}
+    for entry in active_subagents:
+        cost = _transcript_cost_size_cached(
+            subagents_dir / f"agent-{entry.subagent_id}.jsonl",
+            include_sidechains=True,
+            cache=cost_cache,
+        )
+        if cost is not None and entry.child_conversation_id:
+            costs[entry.child_conversation_id] = cost
+    return costs
+
+
 def _session_cost_estimate(
     *,
     parent_transcript_path: Path,
-    active_subagents: list[SubagentEntry],
+    subagent_costs: Mapping[str, float],
     status_cost: float | None,
     cost_cache: dict[Path, _TranscriptCostCacheEntry],
 ) -> float | None:
@@ -3130,8 +3319,8 @@ def _session_cost_estimate(
 
     :param parent_transcript_path: Parent transcript JSONL path; its
         sibling ``subagents/`` directory holds the sub-agent transcripts.
-    :param active_subagents: Sub-agents with a minted child conversation
-        (only these have an ``agent-<id>.jsonl`` on disk to price).
+    :param subagent_costs: Each tracked sub-agent's own transcript cost, from
+        :func:`_subagent_cost_estimates`.
     :param status_cost: ``S`` — the statusLine total, or ``None`` when
         not captured yet.
     :param cost_cache: Per-session size-keyed transcript cost cache,
@@ -3139,19 +3328,13 @@ def _session_cost_estimate(
     :returns: ``max(S, C)`` in USD, or ``None`` when neither source
         yields a priceable cost.
     """
-    subagents_dir = _subagents_dir_for_transcript(parent_transcript_path)
     estimate: float | None = _transcript_cost_size_cached(
         parent_transcript_path, include_sidechains=False, cache=cost_cache
     )
-    for entry in active_subagents:
-        jsonl_path = subagents_dir / f"agent-{entry.subagent_id}.jsonl"
-        sub_cost = _transcript_cost_size_cached(
-            jsonl_path, include_sidechains=True, cache=cost_cache
-        )
-        if sub_cost is not None:
-            # Seed the accumulator from the parent cost, or 0.0 when the parent
-            # had nothing priceable — so sub-agent cost still contributes to C.
-            estimate = (estimate or 0.0) + sub_cost
+    if subagent_costs:
+        # Seed the accumulator from the parent cost, or 0.0 when the parent
+        # had nothing priceable — so sub-agent cost still contributes to C.
+        estimate = (estimate or 0.0) + sum(subagent_costs.values())
     candidates = [cost for cost in (status_cost, estimate) if cost is not None]
     if not candidates:
         return None
@@ -3200,6 +3383,9 @@ async def _forward_session_cost(
     gate uses the higher live ``C``) is intentional and reconciles at the
     turn boundary when ``S`` jumps; ``max`` keeps both monotonic.
 
+    After a cold resume that Claude counted from $0, ``S`` includes the
+    seeded cost (see :func:`_resume_adjusted_status_cost`).
+
     Best-effort, like the other forwarder posts: a failed POST is retried
     on the next poll (the ``dedupe`` baselines advance only on success).
 
@@ -3221,8 +3407,20 @@ async def _forward_session_cost(
     """
     if time.monotonic() < dedupe.cost_retry_not_before:
         return
-    status_state = await asyncio.to_thread(read_claude_context_state, bridge_dir)
-    status_cost = _cumulative_cost_from_status_state(status_state)
+
+    def read_status_cost() -> tuple[dict[str, object] | None, float | None]:
+        state = read_claude_context_state(bridge_dir)
+        cost = _resume_adjusted_status_cost(
+            bridge_dir=bridge_dir,
+            transcript_path=parent_transcript_path,
+            status_cost=_cumulative_cost_from_status_state(state),
+            api_duration_ms=_api_duration_from_status_state(state),
+            dedupe=dedupe,
+            session_id=session_id,
+        )
+        return state, cost
+
+    status_state, status_cost = await asyncio.to_thread(read_status_cost)
     active_subagents = [
         entry for entry in subagent_state.subagents.values() if entry.child_conversation_id
     ]
@@ -3231,22 +3429,28 @@ async def _forward_session_cost(
     # Policy/budget cost: with no sub-agent it equals S; with a sub-agent
     # running it is max(S, real-time transcript estimate) so the gate sees
     # in-flight spend while S is frozen.
+    subagent_costs: dict[str, float] = {}
     if not active_subagents:
         policy_cost = status_cost
     else:
-        policy_cost = await asyncio.to_thread(
-            _session_cost_estimate,
-            parent_transcript_path=parent_transcript_path,
-            active_subagents=active_subagents,
-            status_cost=status_cost,
-            cost_cache=cost_cache,
-        )
+
+        def estimate() -> tuple[dict[str, float], float | None]:
+            # One pricing pass feeds both the policy estimate and the display estimates.
+            costs = _subagent_cost_estimates(parent_transcript_path, active_subagents, cost_cache)
+            return costs, _session_cost_estimate(
+                parent_transcript_path=parent_transcript_path,
+                subagent_costs=costs,
+                status_cost=status_cost,
+                cost_cache=cost_cache,
+            )
+
+        subagent_costs, policy_cost = await asyncio.to_thread(estimate)
     # Build the payload from whichever values are present AND have advanced.
     # Monotonic per field: never walk a total backwards — guards a transient
     # lower transcript read (e.g. just after a rotation) and suppresses
     # steady-state churn. The two fields advance independently (policy_cost
     # moves mid-turn while display_cost/S is frozen).
-    payload: dict[str, float | str] = {}
+    payload: dict[str, object] = {}
     if display_cost is not None and (
         dedupe.posted_cost is None or display_cost > dedupe.posted_cost
     ):
@@ -3268,6 +3472,10 @@ async def _forward_session_cost(
         model = status_state.get("model")
         if isinstance(model, str) and model:
             payload["model"] = model
+    # Display-only estimates ride a cost post (never alone) so an older server ignores
+    # them; one that moves while neither cost advances waits for the next post.
+    if subagent_costs and subagent_costs != dedupe.posted_subagent_costs:
+        payload["subagent_costs_usd"] = subagent_costs
     try:
         await _post_external_session_usage(
             client,
@@ -3297,6 +3505,8 @@ async def _forward_session_cost(
         dedupe.posted_cost = display_cost
     if "policy_cost_usd" in payload:
         dedupe.posted_policy_cost = policy_cost
+    if "subagent_costs_usd" in payload:
+        dedupe.posted_subagent_costs = subagent_costs
 
 
 async def _supervisor_sleep(seconds: float) -> None:
@@ -4631,6 +4841,8 @@ async def _forward_available_status_events(
             elif native_todos_changed and task_order:
                 todos_to_post = [
                     {
+                        # Claude's task ID keeps a renamed task the same task.
+                        "id": tid,
                         "content": task_subjects.get(tid, tid),
                         "status": task_statuses.get(tid, "pending"),
                         # activeForm is the gerund form used by Claude's TodoWrite tool.
@@ -4766,7 +4978,8 @@ async def _forward_available_status_events(
                     _http_status_for_log(exc),
                     extra={"session_id": session_id},
                 )
-                if status != "failed":
+                # Only the hand-off to the parent failed; this session's own turn did not.
+                if status != "failed" and not _is_subagent_delivery_not_confirmed(exc):
                     await _post_forwarder_failed_status(
                         client,
                         session_id=session_id,
@@ -6072,7 +6285,7 @@ async def _post_external_session_usage(
     client: httpx.AsyncClient,
     *,
     session_id: str,
-    usage: Mapping[str, float | str] | None,
+    usage: Mapping[str, object] | None,
     context_window: int | None = None,
     token_usage: dict[str, int] | None = None,
 ) -> None:
@@ -7284,11 +7497,13 @@ def _is_subagent_delivery_not_confirmed(exc: httpx.HTTPError) -> bool:
 
     The runner returns this application-level 503 when a terminal sub-agent
     payload could not be delivered to the parent inbox (no work entry / inbox).
-    It is a bounded-retry class, distinct from a generic transient 5xx.
+    It is a bounded-retry class, distinct from a generic transient 5xx. The
+    server relays it as a ``runner_unavailable`` 503 quoting the runner body.
 
     :param exc: HTTP exception raised while posting an Omnigent event.
     :returns: ``True`` only for a 503 whose JSON body carries
-        ``error == "subagent_delivery_not_confirmed"``.
+        ``error == "subagent_delivery_not_confirmed"``, or whose
+        ``runner_unavailable`` error message quotes that runner body.
     """
     if not isinstance(exc, httpx.HTTPStatusError):
         return False
@@ -7298,7 +7513,14 @@ def _is_subagent_delivery_not_confirmed(exc: httpx.HTTPError) -> bool:
         body = exc.response.json()
     except Exception:  # noqa: BLE001 — best-effort body parse
         return False
-    return isinstance(body, dict) and body.get("error") == "subagent_delivery_not_confirmed"
+    error = body.get("error") if isinstance(body, dict) else None
+    if error == "subagent_delivery_not_confirmed":
+        return True
+    return (
+        isinstance(error, dict)
+        and error.get("code") == ErrorCode.RUNNER_UNAVAILABLE
+        and "subagent_delivery_not_confirmed" in str(error.get("message", ""))
+    )
 
 
 def _http_status_for_log(exc: httpx.HTTPError) -> int | None:

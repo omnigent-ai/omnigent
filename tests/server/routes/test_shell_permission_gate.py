@@ -301,7 +301,15 @@ def app(runner_globals_reset: None, runner_client: _RecordingRunnerClient) -> Fa
     set_runner_router(_FakeRunnerRouter(runner_client))  # type: ignore[arg-type]
 
     application = FastAPI()
-    application.state.feature_flags = FeatureFlags(frozenset({Feature.WORKSPACE_CONTENT_SEARCH}))
+    application.state.feature_flags = FeatureFlags(
+        frozenset(
+            {
+                Feature.WORKSPACE_CONTENT_SEARCH,
+                Feature.WORKSPACE_DIRECT_ACCESS,
+                Feature.WORKSPACE_API_SERVER_ACCESS,
+            }
+        )
+    )
 
     @application.exception_handler(OmnigentError)
     async def _handle_omnigent_error(
@@ -1192,3 +1200,71 @@ async def test_pr_edit_requires_a_json_body(
 
     assert resp.status_code == 415, resp.text
     assert runner_client.posts == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("user", "status"),
+    [
+        ("viewer@example.com", 403),
+        ("owner@example.com", 403),  # an edit collaborator, despite the name
+        ("manager@example.com", 403),
+        # The owner passes the gate; this harness has no connected host to offer.
+        ("real-owner@example.com", 404),
+    ],
+)
+async def test_workspace_direct_access_is_owner_only(
+    client: httpx.AsyncClient, user: str, status: int
+) -> None:
+    """A direct-access token reads the workspace with no per-read server check,
+    so only the session owner may get one."""
+    resp = await client.post(
+        "/v1/sessions/conv_share/workspace/direct-access", headers={"X-Forwarded-Email": user}
+    )
+
+    assert resp.status_code == status, resp.text
+    if status == 404:
+        assert "host is not connected" in resp.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("session", "passes"), [("conv_share", False), ("conv_open", True)])
+@pytest.mark.parametrize(
+    "method",
+    [
+        "ReadFile",
+        "StatPath",
+        "ReadLinkText",
+        "SearchFiles",
+        "SearchText",
+        "ResolveWorkingCopyBase",
+        "ListWorkingCopyChanges",
+        "ReadBaseFile",
+        "ListRepositoryRefs",
+        "ListBranchCommits",
+        "ResolveRepositoryContext",
+    ],
+)
+async def test_workspace_api_follows_the_file_read_gate(
+    client: httpx.AsyncClient, session: str, passes: bool, method: str
+) -> None:
+    """A view-only collaborator reads the workspace API only where files are shared."""
+    streaming = method in ("ReadFile", "SearchText", "ReadBaseFile")
+    resp = await client.post(
+        f"/v1/sessions/{session}/workspace"
+        f"/omnigent.api.workspace.v1alpha1.WorkspaceService/{method}",
+        headers={
+            "X-Forwarded-Email": "viewer@example.com",
+            "Content-Type": "application/connect+json" if streaming else "application/json",
+        },
+        # A stream takes one enveloped Connect message; a unary call, the bare message.
+        content=b"\x00\x00\x00\x00\x02{}" if streaming else b"{}",
+    )
+
+    if not passes:
+        assert resp.status_code == 403, resp.text
+        return
+    # Past the gate; this harness has no host, so the call ends with that error. A
+    # stream reports it in its body, a unary call as its status.
+    assert resp.status_code == (200 if streaming else 503), resp.text
+    assert b"unavailable" in resp.content

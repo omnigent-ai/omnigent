@@ -17,6 +17,12 @@ type StoredDraft =
 const SESSION_DRAFTS_KEY = "omnigent.sessionDrafts";
 const listeners = new Set<() => void>();
 const retiredDraftIds = new Set<string>();
+// How many times this tab has written each id's draft, emptied ones included.
+const draftRevisions = new Map<string, number>();
+
+function noteDraftWrite(conversationId: string): void {
+  draftRevisions.set(conversationId, (draftRevisions.get(conversationId) ?? 0) + 1);
+}
 
 function loadDraftsFromStorage(): Map<string, SessionDraft> {
   if (typeof window === "undefined") return new Map();
@@ -92,6 +98,11 @@ function subscribe(listener: () => void): () => void {
   return () => listeners.delete(listener);
 }
 
+/** Call `listener` after any session draft is written, so it can compare the draft it holds. */
+export function subscribeSessionDrafts(listener: () => void): () => void {
+  return subscribe(listener);
+}
+
 function notifyListeners(): void {
   for (const listener of listeners) listener();
 }
@@ -102,6 +113,7 @@ export function getSessionDraft(conversationId: string): SessionDraft | undefine
 
 export function setSessionDraft(conversationId: string, draft: SessionDraft): void {
   if (retiredDraftIds.has(conversationId)) return;
+  noteDraftWrite(conversationId);
   const reviewComments = draft.reviewComments ?? sessionDrafts.get(conversationId)?.reviewComments;
   if (draft.text === "" && draft.files.length === 0 && !reviewComments?.length) {
     sessionDrafts.delete(conversationId);
@@ -110,6 +122,16 @@ export function setSessionDraft(conversationId: string, draft: SessionDraft): vo
   }
   saveDraftsToStorage();
   notifyListeners();
+}
+
+/** Replace a session draft's tags, keeping its text, attachments and review comments. */
+export function setSessionMentions(
+  conversationId: string,
+  mentions: TaggedMentions | undefined,
+): void {
+  const tagged = mentions && (mentions.files.length > 0 || mentions.sessions.length > 0);
+  const draft = sessionDrafts.get(conversationId) ?? { text: "", files: [] };
+  setSessionDraft(conversationId, { ...draft, mentions: tagged ? mentions : undefined });
 }
 
 /** Remove a draft and ignore any late cleanup write for the retired id. */
@@ -151,10 +173,27 @@ export function promoteSessionDraft(
 ): SessionDraft | undefined {
   const draft = retireSessionDraft(temporaryConversationId);
   if (draft === undefined) return undefined;
+  noteDraftWrite(conversationId);
   sessionDrafts.set(conversationId, draft);
   saveDraftsToStorage();
   notifyListeners();
   return draft;
+}
+
+/**
+ * Whether this tab has written *conversationId*'s draft, even one the user
+ * then emptied, as opposed to never having touched it.
+ */
+export function sessionDraftWasWritten(conversationId: string): boolean {
+  return draftRevisions.has(conversationId);
+}
+
+/**
+ * How many times this tab has written *conversationId*'s draft; an unchanged
+ * count means nothing has written it since.
+ */
+export function sessionDraftRevision(conversationId: string): number {
+  return draftRevisions.get(conversationId) ?? 0;
 }
 
 export function hasSessionDraft(conversationId: string): boolean {
@@ -174,6 +213,15 @@ export function useSessionReviewComments(conversationId: string | null): Comment
       (conversationId ? sessionDrafts.get(conversationId)?.reviewComments : undefined) ??
       NO_REVIEW_COMMENTS,
     () => NO_REVIEW_COMMENTS,
+  );
+}
+
+/** The session draft's tags, re-rendering the caller when they change. */
+export function useSessionMentions(conversationId: string | null): TaggedMentions | undefined {
+  return useSyncExternalStore(
+    subscribe,
+    () => (conversationId ? sessionDrafts.get(conversationId)?.mentions : undefined),
+    () => undefined,
   );
 }
 
@@ -208,6 +256,7 @@ export function useSessionDraftIds(enabled = true): string {
 export function clearSessionDrafts(): void {
   sessionDrafts.clear();
   retiredDraftIds.clear();
+  draftRevisions.clear();
   saveDraftsToStorage();
   notifyListeners();
 }

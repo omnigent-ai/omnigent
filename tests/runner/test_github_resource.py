@@ -160,10 +160,12 @@ def test_github_info_pr_via_pr_view(repo: Path, monkeypatch: pytest.MonkeyPatch)
     assert not any(c[:2] == ("pr", "list") for c in calls)
 
 
-def test_github_info_no_pr(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("host", ["github.com", "ghe.example.com"])
+def test_github_info_no_pr(repo: Path, monkeypatch: pytest.MonkeyPatch, host: str) -> None:
     """A branch with no PR yields ``pr``/``base_ref`` null (bare ``gh pr view`` empty).
 
-    gh's "no pull requests" failure names no refused field, so it is not retried.
+    gh's "no pull requests" failure names no refused field, so it is not retried. The
+    reachable repo is the workspace's and names its host.
     """
     calls: list[tuple[str, ...]] = []
 
@@ -175,7 +177,9 @@ def test_github_info_no_pr(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         if head == ("auth", "status"):
             return (0, "", "")
         if head == ("repo", "view"):
-            return (0, json.dumps({"nameWithOwner": "o/r"}), "")
+            fields = argv[argv.index("--json") + 1].split(",")
+            view = {"nameWithOwner": "corp/app", "url": f"https://{host}/corp/app"}
+            return (0, json.dumps({k: v for k, v in view.items() if k in fields}), "")
         if head == ("pr", "view"):
             return (1, "", "no pull requests found for branch")
         return (1, "", "no stub")
@@ -187,6 +191,24 @@ def test_github_info_no_pr(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     assert info["pr"] is None
     assert info["base_ref"] is None
     assert sum(c[:2] == ("pr", "view") for c in calls) == 1
+    assert info["repo"] == info["workspace_repo"] == {"name_with_owner": "corp/app", "host": host}
+
+
+def test_reference_info_without_gh_reports_repo_host(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tracked PR names its host even when gh is missing and no PR loads."""
+    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: None)
+    reference = PullRequestRef(
+        host="ghe.example.com",
+        repository="corp/app",
+        number=7,
+        url="https://ghe.example.com/corp/app/pull/7",
+    )
+
+    info = github_resource._reference_info(str(repo), reference)
+    assert info["pr"] is None
+    assert info["repo"] == {"name_with_owner": "corp/app", "host": "ghe.example.com"}
 
 
 def test_github_info_pr_via_commit_fork_fallback(
@@ -552,12 +574,37 @@ def test_github_info_skips_account_enumeration_on_happy_path(
 
     info = github_info(str(repo))
     assert info["pr"]["number"] == 42
-    assert info["repo"] == {"name_with_owner": "acme/repo"}  # derived from pr.url
+    assert info["repo"] == {"name_with_owner": "acme/repo", "host": "github.com"}  # from pr.url
+    assert info["workspace_repo"] == info["repo"]
     assert info["authenticated"] is True
     # The two per-poll network calls are gone on the happy path.
     assert not any(c[:4] == ("auth", "status", "--json", "hosts") for c in calls)
     assert not any(c[:2] == ("repo", "view") for c in calls)
     assert "accounts" not in info
+
+
+def test_github_info_pr_without_url_names_the_workspace_repo_from_its_remote(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A PR reply without a URL can't name the repo, so the remote still does."""
+    _run(["git", "remote", "add", "origin", "https://github.com/acme/repo.git"], repo)
+    monkeypatch.setattr(github_resource, "_workspace_key", lambda _root: "/ws/x")
+    monkeypatch.setattr(github_resource._config, "github_account_preference", lambda _key: None)
+    pr = {"number": 42, "title": "t", "state": "OPEN", "statusCheckRollup": []}
+
+    def fake_gh(
+        argv: Sequence[str], *, cwd: str, token: str | None = None
+    ) -> tuple[int, str, str]:
+        if tuple(argv[:2]) == ("pr", "view"):
+            return (0, json.dumps(pr), "")
+        return (1, "", "no stub")
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: "/usr/bin/gh")
+
+    info = github_info(str(repo))
+    assert info["pr"]["number"] == 42
+    assert info["workspace_repo"] == {"name_with_owner": "acme/repo", "host": "github.com"}
 
 
 def test_github_info_runs_gh_as_preferred_account(
@@ -1973,8 +2020,9 @@ def test_busy_pr_reads_latest_comments_without_losing_feed_on_failure(monkeypatc
     payload = github_resource._comments_payload(data)
     assert payload["timeline_events"] == []
     assert payload["timeline_partial"] is True
-    assert len(calls) == (1 if failure == "enterprise_auth" else 2)
+    assert len(calls) == 2
     if failure == "enterprise_auth":
+        assert calls[1][0] == ["auth", "status", "-h", "ghe.example.com"]
         return
     assert calls[1][0][:4] == ["api", "--hostname", "github.com", "graphql"]
     assert "--cache" not in calls[1][0]

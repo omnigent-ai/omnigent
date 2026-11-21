@@ -198,6 +198,176 @@ def test_tracked_github_pr_info_carries_the_provider_fields(
     assert [pr["provider"] for pr in info["prs"]] == ["github"]
 
 
+def test_attaching_a_pr_keeps_the_workspace_repo(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bare references keep resolving against the same repo as PRs come and go."""
+    _git(repo, "remote", "add", "origin", GITHUB_FORK)
+    _git(repo, "remote", "add", "upstream", "https://github.com/owner/app.git")
+    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(github_resource, "_verify_pr_access", lambda _root, _ref: None)
+    upstream = {"name_with_owner": "owner/app", "host": "github.com"}
+    url = "https://github.com/me/app/pull/7"
+
+    assert pr_resource.pr_info(str(repo), session_id="session")["workspace_repo"] == upstream
+    pr_resource.update_session_pr(str(repo), "session", url, "attach")
+    assert pr_resource.pr_info(str(repo), session_id="session")["workspace_repo"] == upstream
+    removed = pr_resource.update_session_pr(str(repo), "session", url, "remove")
+    assert removed["workspace_repo"] == upstream
+
+
+def test_without_remotes_the_provider_names_the_workspace_repo(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No remote can vet gh's answer, which then comes from the user's ``GH_REPO``."""
+    view = {"nameWithOwner": "owner/app", "url": "https://github.com/owner/app"}
+    _stub_gh(monkeypatch, {("repo", "view"): (0, json.dumps(view), "")})
+
+    info = pr_resource.pr_info(str(repo), session_id="session")
+
+    assert info["workspace_repo"] == {"name_with_owner": "owner/app", "host": "github.com"}
+
+
+def test_a_session_base_read_names_the_workspace_repo(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A session with a tracked PR still names the checkout's repo on the base read."""
+    _git(repo, "remote", "add", "origin", "https://github.com/owner/app.git")
+    SessionPrRegistry("session").record(
+        [PullRequestRef.from_url("https://github.com/owner/app/pull/7")],
+        relationship="created",
+        source="test",
+    )
+    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: None)
+
+    base = pr_resource.pr_info(str(repo), session_id="session")
+    assert base["workspace_repo"] == {"name_with_owner": "owner/app", "host": "github.com"}
+
+
+GITHUB_FORK = "https://github.com/me/app.git"
+ENTERPRISE_ORIGIN = "https://ghe.example.com/owner/app.git"
+
+
+@pytest.mark.parametrize(
+    ("origin", "second_remote", "gh_resolved", "tracked_repo", "workspace_repo"),
+    [
+        # A fork checkout: gh resolves bare refs against upstream, not the fork.
+        (GITHUB_FORK, "upstream", "upstream", "owner/app", ("owner/app", "github.com")),
+        (GITHUB_FORK, "upstream", "upstream", "owner/other", ("owner/app", "github.com")),
+        # gh's resolved base wins over a remote of the tracked repo.
+        (GITHUB_FORK, "upstream", "origin", "owner/app", ("me/app", "github.com")),
+        # Without one, gh ranks remotes upstream > github > origin on origin's host,
+        # whichever repo the tracked PR is in.
+        (GITHUB_FORK, "upstream", None, "owner/app", ("owner/app", "github.com")),
+        (GITHUB_FORK, "upstream", None, "owner/other", ("owner/app", "github.com")),
+        (GITHUB_FORK, "upstream", None, "me/app", ("owner/app", "github.com")),
+        # A public mirror of the tracked repo must not move bare refs off Enterprise.
+        (ENTERPRISE_ORIGIN, "upstream", None, "owner/app", ("owner/app", "ghe.example.com")),
+        # ``repo`` stays the tracked PR's; ``workspace_repo`` names the checkout's own.
+        (ENTERPRISE_ORIGIN, "upstream", None, "owner/other", ("owner/app", "ghe.example.com")),
+        # An origin-only checkout names origin; a `github` remote outranks origin.
+        (GITHUB_FORK, None, None, "owner/other", ("me/app", "github.com")),
+        (GITHUB_FORK, "github", None, "owner/other", ("owner/app", "github.com")),
+        # gh's own choice still wins on any host.
+        (ENTERPRISE_ORIGIN, "upstream", "upstream", "owner/app", ("owner/app", "github.com")),
+    ],
+)
+def test_tracked_pr_info_picks_the_workspace_remote_like_gh(
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    origin: str,
+    second_remote: str | None,
+    gh_resolved: str | None,
+    tracked_repo: str,
+    workspace_repo: tuple[str, str],
+) -> None:
+    monkeypatch.setenv("GH_HOST", "ghe.example.com")
+    _git(repo, "remote", "add", "origin", origin)
+    if second_remote is not None:
+        _git(repo, "remote", "add", second_remote, "https://github.com/owner/app.git")
+    if gh_resolved is not None:
+        _git(repo, "config", f"remote.{gh_resolved}.gh-resolved", "base")
+    url = f"https://github.com/{tracked_repo}/pull/7"
+    SessionPrRegistry("session").record(
+        [PullRequestRef.from_url(url)], relationship="created", source="test"
+    )
+    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: None)
+
+    info = pr_resource.pr_info(str(repo), session_id="session")
+
+    assert info["repo"] == {"name_with_owner": tracked_repo, "host": "github.com"}
+    name_with_owner, host = workspace_repo
+    assert info["workspace_repo"] == {"name_with_owner": name_with_owner, "host": host}
+
+
+@pytest.mark.parametrize(
+    ("gh_resolved", "workspace_repo"),
+    [
+        (None, None),
+        ("origin", None),
+        # gh's resolved base is a deliberate choice, so a recognized one still wins.
+        ("upstream", {"name_with_owner": "owner/app", "host": "github.com"}),
+    ],
+)
+@pytest.mark.parametrize("tracked", [True, False])
+def test_an_unrecognized_origin_names_no_workspace_repo(
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tracked: bool,
+    gh_resolved: str | None,
+    workspace_repo: dict[str, str] | None,
+) -> None:
+    """A recognized public upstream must not stand in for an Enterprise origin's host."""
+    _git(repo, "remote", "add", "origin", ENTERPRISE_ORIGIN)
+    _git(repo, "remote", "add", "upstream", "https://github.com/owner/app.git")
+    if gh_resolved is not None:
+        _git(repo, "config", f"remote.{gh_resolved}.gh-resolved", "base")
+    if tracked:
+        SessionPrRegistry("session").record(
+            [PullRequestRef.from_url("https://github.com/owner/app/pull/7")],
+            relationship="created",
+            source="test",
+        )
+    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: None)
+
+    info = pr_resource.pr_info(str(repo), session_id="session")
+
+    assert info.get("workspace_repo") == workspace_repo
+
+
+@pytest.mark.parametrize(
+    ("origin", "workspace_repo"),
+    [
+        ("https://github.com/owner/app.git", ("owner/app", "github.com")),
+        # A fork checkout: gh resolves the upstream on origin's own host.
+        (GITHUB_FORK, ("owner/app", "github.com")),
+        # gh may not resolve an ssh alias or IP either and fall back to the upstream.
+        ("git@corp-ghe:owner/app.git", None),
+        (ENTERPRISE_ORIGIN, None),
+        ("https://gitserver/owner/app.git", None),
+    ],
+)
+def test_gh_names_the_workspace_repo_only_for_the_preferred_remote(
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    origin: str,
+    workspace_repo: tuple[str, str] | None,
+) -> None:
+    """gh resolves a github.com upstream when it doesn't know origin's host."""
+    _git(repo, "remote", "add", "origin", origin)
+    _git(repo, "remote", "add", "upstream", "https://github.com/owner/app.git")
+    view = {"nameWithOwner": "owner/app", "url": "https://github.com/owner/app"}
+    _stub_gh(monkeypatch, {("repo", "view"): (0, json.dumps(view), "")})
+
+    info = pr_resource.pr_info(str(repo), session_id="session")
+
+    if workspace_repo is None:
+        assert "workspace_repo" not in info
+    else:
+        name_with_owner, host = workspace_repo
+        assert info["workspace_repo"] == {"name_with_owner": name_with_owner, "host": host}
+
+
 def test_a_directory_outside_git_reports_not_a_git_repo_from_github(tmp_path: Path) -> None:
     info = pr_resource.pr_info(str(tmp_path))
 

@@ -67,6 +67,13 @@ the latest uploaded TestFlight build and uploads `fastlane/metadata` plus
 `fastlane/screenshots`. Set
 `OMNIGENT_PROD_BUILD_NUMBER=4` to pin a specific processed build.
 
+## Server compatibility
+
+Before deploying a server release that changes the sign-in contract (see
+"OIDC login client upgrades" in `deploy/README.md`), confirm the build with the
+required client is live on the App Store, not only uploaded or bumped in
+`MARKETING_VERSION`. Otherwise iOS users cannot sign in to that server.
+
 ## Other commands
 
 - `bundle exec fastlane tests` — run the `OmnigentTests` unit suite.

@@ -308,6 +308,34 @@ def test_pi_readiness_uses_selected_executable(
         assert (hi.missing_harness_cli(harness) is None) is (expected is True)
 
 
+@pytest.mark.parametrize(
+    "skip_env,binary,expected",
+    [
+        (None, "/usr/bin/opencode", HARNESS_VERSION_TOO_LOW),
+        ("1", "/usr/bin/opencode", True),
+        ("1", None, HARNESS_BINARY_MISSING),
+    ],
+)
+def test_opencode_skip_version_check_admits_newer_cli(
+    monkeypatch: pytest.MonkeyPatch,
+    skip_env: str | None,
+    binary: str | None,
+    expected: bool | str,
+) -> None:
+    """The skip env var only waives the range; a missing CLI is still missing."""
+    if skip_env is None:
+        monkeypatch.delenv("OMNIGENT_OPENCODE_SKIP_VERSION_CHECK", raising=False)
+    else:
+        monkeypatch.setenv("OMNIGENT_OPENCODE_SKIP_VERSION_CHECK", skip_env)
+    monkeypatch.setattr(hi.shutil, "which", lambda name: binary)
+
+    def version_probe(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(argv, 0, stdout="opencode v2.3.0\n", stderr="")
+
+    monkeypatch.setattr(hi, "run_isolated", version_probe)
+    assert _binary_availability_reason(hi.OPENCODE_KEY) == expected
+
+
 def test_unanswered_pi_version_probe_is_not_reported_as_outdated(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -104,6 +104,8 @@ _DELEGATED_ALLOWED_PREFIXES = (
     "/v1/mcp",
     "/v1/skills",
     "/v1/runners",
+    # Agents save and load their owner's workflows through these routes.
+    "/v1/workflows",
     "/oauth/token",
     "/oauth/revoke",
 )

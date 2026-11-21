@@ -36,6 +36,15 @@ export function isFocusInDialogOrMenu(): boolean {
   return !!document.activeElement?.closest('[role="dialog"], [role="alertdialog"], [role="menu"]');
 }
 
+/**
+ * Marks a dialog that shows a workspace sidebar over a narrow page: its tabs keep their
+ * Close, Reopen and Previous/Next keys, which other dialogs keep from the page behind.
+ */
+export const WORKSPACE_SHEET_ATTRIBUTE = "data-workspace-sheet";
+
+/** A dialog or menu that keeps the workspace tabs' keys: any but a workspace sheet. */
+export const TAB_KEY_OWNING_DIALOG_OR_MENU = `[role="dialog"]:not([${WORKSPACE_SHEET_ATTRIBUTE}]), [role="alertdialog"], [role="menu"]`;
+
 // Open surfaces that keep the keys even while focus stays outside them: a fullscreen
 // table or diagram, and the composer's model/effort preview.
 const KEY_OWNING_OVERLAYS = "[aria-modal='true'], [data-fullscreen-overlay], [data-cycle-preview]";
