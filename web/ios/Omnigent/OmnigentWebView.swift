@@ -846,7 +846,7 @@ struct OmnigentWebView: UIViewRepresentable {
       afterLoading pageURL: URL?, cookieStore: some WatchCookieStore
     ) -> Task<Void, Never>? {
       guard let pageURL, let pinnedOrigin, pageURL.omnigentOrigin == pinnedOrigin,
-        let serverURL = parent.serverURL ?? pinnedURL
+        let serverURL = oidcConnection?.serverURL ?? parent.serverURL ?? pinnedURL
       else { return nil }
       if workspaceSession == nil {
         guard OidcWebSession.isPage(pageURL, of: serverURL),

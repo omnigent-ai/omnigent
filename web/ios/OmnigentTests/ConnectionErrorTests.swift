@@ -60,7 +60,9 @@ final class ConnectionErrorTests: XCTestCase {
     let bridge = WatchBridge(defaults: defaults, transport: transport)
     bridge.start()
     let coordinator = OmnigentWebView.Coordinator(view, watchBridge: bridge)
-    let webView = NoNetworkWebView()
+    let configuration = WKWebViewConfiguration()
+    configuration.websiteDataStore = .nonPersistent()
+    let webView = NoNetworkWebView(frame: .zero, configuration: configuration)
     // Mirror makeUIView: failure callbacks act only for the attached, model-held view.
     view.model.webView = webView
     coordinator.attach(webView)
@@ -169,6 +171,53 @@ final class ConnectionErrorTests: XCTestCase {
       userInfo: [NSURLErrorFailingURLErrorKey: URL(string: "https://unrelated.invalid")!])
     coordinator.webView(webView, didFailProvisionalNavigation: nil, withError: unrelatedError)
     XCTAssertEqual(failures.count, 4, "Canceled and off-origin failures must still be ignored")
+
+    let server = try MockHTTPServer(requestHandler: { request in
+      XCTAssertEqual(request.method, "GET")
+      switch request.path {
+      case "/.well-known/omnigent.json":
+        return (
+          200, ["content-type": "application/json"],
+          Data(
+            #"{"manifest_version":1,"auth":{"mode":"oidc","session_cookie":"ap_session","native_redirect_uris":["ai.omnigent.ios:/oauth/callback"]}}"#
+              .utf8)
+        )
+      case "/mounted/v1/me":
+        XCTAssertEqual(request.headers["cookie"], "ap_session=connected")
+        return (200, ["content-type": "application/json"], Data("{}".utf8))
+      default:
+        XCTFail("Unexpected OIDC request: \(request.path)")
+        return (404, [:], Data())
+      }
+    })
+    let connectedURL = URL(string: "http://127.0.0.1:\(server.port)/mounted")!
+    let connectedCookie = HTTPCookie(properties: [
+      .name: "ap_session", .value: "connected", .domain: "127.0.0.1", .path: "/mounted",
+      .expires: Date().addingTimeInterval(3600),
+    ])!
+    await webView.configuration.websiteDataStore.httpCookieStore.setCookie(connectedCookie)
+    coordinator.parent.serverURL = url
+    let nativeLoaded = expectation(description: "native OIDC connection reuses its accepted cookie")
+    webView.onLoad = { nativeLoaded.fulfill() }
+    coordinator.load(connectedURL, in: webView)
+    await fulfillment(of: [nativeLoaded], timeout: 10)
+
+    let connectedCookies = PendingWatchCookies()
+    for staleServer in [url, connectedURL.appending(path: "other-mount")] {
+      coordinator.parent.serverURL = staleServer
+      connectedCookies.cookies.continuation.yield([connectedCookie])
+      await coordinator.syncWatchCredentials(
+        afterLoading: connectedURL.appending(path: "c/session"), cookieStore: connectedCookies)?
+        .value
+      let data = try XCTUnwrap(transport.contexts.last?[WatchCredentials.contextKey] as? Data)
+      let credential = try? JSONDecoder().decode(WatchCredentials.self, from: data)
+      XCTAssertEqual(credential?.apiURL, connectedURL.appending(path: "v1"))
+      XCTAssertEqual(credential?.cookie, "ap_session=connected")
+    }
+    await coordinator.syncWatchCredentials(
+      afterLoading: connectedURL.appending(path: "auth/login"), cookieStore: connectedCookies)?
+      .value
+    XCTAssertEqual(transport.contexts.last?[WatchCredentials.contextKey] as? Data, Data())
   }
 
   private func message(for error: Error, enabled: Bool) -> String {

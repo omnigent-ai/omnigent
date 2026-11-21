@@ -151,6 +151,12 @@ final class WatchCompanionTests: XCTestCase {
     XCTAssertEqual(bridge.latest?[WatchCredentials.contextKey] as? Data, Data())
     XCTAssertEqual(transport.contexts.count, 1, "Inactive handoffs must remain pending")
 
+    let pendingSignIn = try XCTUnwrap(
+      bridge.sync(serverURL: URL(string: "https://new.example.com"), cookieStore: newerCookies))
+    newerCookies.cookies.continuation.yield([cookie("new", domain: "new.example.com", path: "/")])
+    await pendingSignIn.value
+    XCTAssertFalse(try XCTUnwrap(bridge.latest?[WatchCredentials.contextKey] as? Data).isEmpty)
+    // Undelivered sign-in exists only in memory; restart must still invalidate the old account.
     let restored = WatchBridge(defaults: defaults, transport: transport)
     restored.start()
     XCTAssertEqual(restored.latest?[WatchCredentials.contextKey] as? Data, Data())
@@ -175,6 +181,12 @@ final class WatchCompanionTests: XCTestCase {
       try XCTUnwrap(signedOut["sentAt"] as? Date),
       try XCTUnwrap(failedSignOut["sentAt"] as? Date))
     XCTAssertNil(WatchBridge(defaults: defaults, transport: transport).latest)
+    let freshSignIn = try XCTUnwrap(
+      retried.sync(serverURL: URL(string: "https://new.example.com"), cookieStore: newerCookies))
+    newerCookies.cookies.continuation.yield([cookie("new", domain: "new.example.com", path: "/")])
+    await freshSignIn.value
+    XCTAssertFalse(
+      try XCTUnwrap(transport.contexts.last?[WatchCredentials.contextKey] as? Data).isEmpty)
     let sentCount = transport.contexts.count
     bridge.flush()
     XCTAssertEqual(transport.contexts.count, sentCount, "Only the active delegate may send")

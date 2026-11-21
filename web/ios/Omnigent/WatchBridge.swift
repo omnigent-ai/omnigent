@@ -61,7 +61,8 @@ final class WatchBridge: NSObject, WCSessionDelegate {
 
   private func push(_ credentials: WatchCredentials?) {
     let data = credentials.flatMap { try? JSONEncoder().encode($0) } ?? Data()
-    // Defaults persist only intent; WatchConnectivity retains the credential delivery context.
+    // Keep invalidation durable until WatchConnectivity accepts a replacement context.
+    // A new sign-in's credentials are memory-only until that handoff.
     if data.isEmpty { defaults.set(true, forKey: Self.pendingSignOutKey) }
     latest = [WatchCredentials.contextKey: data]
     flush()
