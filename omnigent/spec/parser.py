@@ -3059,6 +3059,13 @@ def _parse_inline_mcp_servers(
                     code=ErrorCode.INVALID_INPUT,
                 )
             databricks_profile = str(raw_profile)
+        auth_command = _parse_mcp_auth_command(name, val, "inline MCP server")
+        if transport == "stdio" and auth_command is not None:
+            raise OmnigentError(
+                f"Inline MCP server {name!r} (transport='stdio') has "
+                f"wrong-transport field 'auth_command'",
+                code=ErrorCode.INVALID_INPUT,
+            )
         servers.append(
             MCPServerConfig(
                 name=name,
@@ -3074,9 +3081,27 @@ def _parse_inline_mcp_servers(
                 env=env,
                 databricks_profile=databricks_profile,
                 tools=_parse_mcp_tool_allowlist(name, val, "inline MCP server"),
+                auth_command=auth_command,
             )
         )
     return servers
+
+
+def _parse_mcp_auth_command(
+    name: object,
+    raw: dict[str, object],
+    source: object,
+) -> str | None:
+    """Parse an optional ``auth_command`` string for HTTP MCP servers."""
+    if "auth_command" not in raw or raw["auth_command"] is None:
+        return None
+    value = raw["auth_command"]
+    if not isinstance(value, str) or not value.strip():
+        raise OmnigentError(
+            f"MCP server {name!r} 'auth_command' must be a non-empty string: {source}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return value
 
 
 def _parse_mcp_tool_allowlist(
@@ -3187,6 +3212,7 @@ def _parse_registry_mcp_server(name: str, raw: dict, source: str) -> MCPServerCo
             "args",
             "env",
             "auth",
+            "auth_command",
             "profile",
             "databricks_server",
         )
@@ -3268,6 +3294,7 @@ def _parse_http_mcp_server(
             else None
         ),
         retry=_parse_retry(raw["retry"]) if "retry" in raw else None,
+        auth_command=_parse_mcp_auth_command(name, raw, yaml_file),
     )
 
 
@@ -3310,7 +3337,7 @@ def _parse_stdio_mcp_server(
         name,
         raw,
         yaml_file,
-        disallowed=("url", "headers"),
+        disallowed=("url", "headers", "auth_command"),
         transport_name="stdio",
     )
     command = raw.get("command")
