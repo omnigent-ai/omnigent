@@ -3219,21 +3219,21 @@ async def test_harness_compaction_after_tool_call_keeps_turn_text_once(
     ] == [*expected_history, ("user", "next")]
 
 
-def test_kimi_auto_create_clears_forwarder_state_before_supervising() -> None:
-    """Every kimi forwarder start must be preceded by a bridge-state clear.
+def test_kimi_auto_create_prepares_forwarder_state_before_supervising() -> None:
+    """Every kimi forwarder start must be preceded by bridge-state preparation.
 
     This is the invariant that lets the forwarder discard a state file it
     cannot parse (e.g. one written by an older build): the only path that
     starts ``supervise_kimi_forwarder`` is ``_auto_create_kimi_terminal``,
-    which always unlinks the state file (and stamps a fresh launch epoch)
-    first, so a stale state file is never read by a new forwarder.
+    which first either clears the state file or keeps it only for a validated
+    resumed session, so a stale state file is never read by a new forwarder.
     """
     import inspect
 
     from omnigent.runner.native import orchestration as orch
 
     src = inspect.getsource(orch._auto_create_kimi_terminal)
-    assert "clear_kimi_bridge_state(bridge_dir)" in src
-    assert src.index("clear_kimi_bridge_state(bridge_dir)") < src.rindex(
-        "supervise_kimi_forwarder("
-    )
+    supervise_at = src.rindex("supervise_kimi_forwarder(")
+    for preparation in ("clear_kimi_bridge_state(bridge_dir)", "prepare_kimi_bridge_state("):
+        assert preparation in src
+        assert src.index(preparation) < supervise_at
