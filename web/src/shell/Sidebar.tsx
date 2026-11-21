@@ -256,6 +256,7 @@ import { useSidebarSwipeToClose } from "@/hooks/useSidebarSwipeToClose";
 import { useSidebarSwipeToOpen } from "@/hooks/useSidebarSwipeToOpen";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { SESSION_HOTKEY_DIGITS, useSessionNumberHotkeys } from "@/hooks/useSessionNumberHotkeys";
+import { usePublishSidebarSessionOrder } from "@/hooks/useSidebarSessionOrder";
 import { useCommandHoldStore, useCommandHoldTracking } from "@/hooks/useCommandHold";
 import { type DesktopCommand, useAvailableDesktopCommands } from "@/lib/desktopCommands";
 import {
@@ -3362,6 +3363,12 @@ function ConversationList({
     [orderedConversationIds],
   );
   useSessionNumberHotkeys(numberedSessionIds, activeId);
+  // ⌘K's Next and Previous session step through the same rows.
+  const listedSessionIds = useMemo(
+    () => [...new Set(orderedConversationIds)],
+    [orderedConversationIds],
+  );
+  usePublishSidebarSessionOrder(listedSessionIds, resolvedActiveId);
   // Holding the command modifier shows each numbered row's jump number. The slots
   // come from the hotkey's own list, so a badge exists only where the key works.
   useCommandHoldTracking();
