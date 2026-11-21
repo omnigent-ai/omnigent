@@ -3,13 +3,14 @@
 The server turns instances on, the host loads its own instance file and advertises
 it, and a pull request on the instance's host is read through the instance's CLI by
 the host's runner and, once that runner is gone, by the host itself. Only the CLI's
-answers are fixtures.
+answers are fixtures, and no plain ``gh`` is on ``PATH``.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -57,13 +58,6 @@ elif args[:1] == ['api'] and any('/files' in arg for arg in args):
 else:
     raise SystemExit(1)
 """
-# Plain ``gh`` on the host's PATH; nothing for the instance's host may reach it.
-_PLAIN_GH = r"""
-import json, pathlib, sys
-with (pathlib.Path(__file__).parent / 'plain-gh-calls.jsonl').open('a') as log:
-    log.write(json.dumps(sys.argv[1:]) + '\n')
-raise SystemExit(1)
-"""
 
 
 def _script(path: Path, body: str) -> Path:
@@ -83,13 +77,17 @@ def test_a_pull_request_on_an_instance_host_is_read_through_the_instance_cli(
     instance_bin = tmp_path / "instance-bin"
     instance_cli = _script(instance_bin / "example-cli", _INSTANCE_CLI)
     (instance_bin / "fixture.json").write_text(json.dumps({"url": _URL, "patch": _PATCH}))
-    plain_bin = tmp_path / "plain-bin"
-    _script(plain_bin / "gh", _PLAIN_GH)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     subprocess.run(["git", "init", "-q", "-b", "main", str(workspace)], check=True)
     base_env = {name: os.environ[name] for name in ("LANG", "TMPDIR") if name in os.environ}
-    base_env["PATH"] = f"{plain_bin}{os.pathsep}{os.environ['PATH']}"
+    # No plain gh anywhere on PATH: the instance's CLI must be enough on its own.
+    base_env["PATH"] = os.pathsep.join(
+        directory
+        for directory in os.environ["PATH"].split(os.pathsep)
+        if directory and not (Path(directory) / "gh").exists()
+    )
+    assert shutil.which("gh", path=base_env["PATH"]) is None
 
     with server_runner(
         tmp_path / "stack",
@@ -179,5 +177,3 @@ def test_a_pull_request_on_an_instance_host_is_read_through_the_instance_cli(
             "LC_CTYPE",
             "__CF_USER_TEXT_ENCODING",
         }
-    plain_calls = _calls(plain_bin / "plain-gh-calls.jsonl")
-    assert not [argv for argv in plain_calls if _HOST in json.dumps(argv)], plain_calls
