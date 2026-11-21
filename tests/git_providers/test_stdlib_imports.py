@@ -1,4 +1,7 @@
-"""Git provider descriptors import only the standard library, and PR modules import cleanly."""
+"""Git provider descriptors and code host instance config import only the standard library.
+
+PR modules also import cleanly in any order.
+"""
 
 from __future__ import annotations
 
@@ -50,6 +53,7 @@ def test_descriptors_import_only_the_standard_library() -> None:
         "import omnigent.git_providers.github\n"
         "import omnigent.git_providers.gitlab\n"
         "import omnigent.git_providers.azure_devops\n"
+        "import omnigent.git_providers.code_host_instances\n"
         "omnigent.git_providers.providers()\n"
         "print('\\n'.join(sorted(set(sys.modules) - before)))\n"
     )
@@ -59,6 +63,8 @@ def test_descriptors_import_only_the_standard_library() -> None:
     assert "omnigent.git_providers.github" in loaded
     assert "omnigent.git_providers.gitlab" in loaded
     assert "omnigent.git_providers.azure_devops" in loaded
+    assert "omnigent.git_providers.code_host_instances" in loaded
+    assert "omnigent.git_providers.code_host_environment" in loaded
     assert [name for name in loaded if not _allowed(name)] == []
 
 
