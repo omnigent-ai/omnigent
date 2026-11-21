@@ -204,11 +204,15 @@ class GhInvocation:
     :ivar env: The child's whole environment, or ``None`` to inherit this process's.
     :ivar host: The code host the call is for, from :func:`gh_target_host_scope`;
         ``None`` when the step didn't name one.
+    :ivar log_as: For a code host instance, the provider, instance id and operation
+        that name the call in failure logs instead of its command; fixed when the
+        invocation is built, so a later change can't bring the command back.
     """
 
     argv: list[str]
     env: dict[str, str] | None
     host: str | None = None
+    log_as: str | None = None
 
 
 def _argv_host(argv: Sequence[str]) -> str | None:
@@ -255,6 +259,7 @@ def _gh_invocation(argv: list[str], *, token: str | None, host: str | None) -> G
         return GhInvocation(
             argv=[*instance.runnable_command(), *argv],
             env={**instance.environment(os.environ), "GH_HOST": host},
+            log_as=f"{instance.provider} code host instance {instance.id} {_operation(argv)}",
             host=host,
         )
     # In a managed sandbox the panel must authenticate as the connected owner via
@@ -307,12 +312,20 @@ def _gh(
             _operation(argv),
         )
         return None, "", "code host instance CLI unavailable"
-    instance = code_host_instances.instance_for_host(invocation.host)
-    if instance is None:
+    log_as = invocation.log_as
+    if log_as is None and invocation.argv[:1] != ["gh"]:
+        # Only plain gh may be logged by its command; anything else stays unnamed.
+        log_as = f"github code host instance unknown {_operation(argv)}"
+    if log_as is None:
         result = _run(invocation.argv, cwd=cwd, timeout=timeout, env=invocation.env)
     else:
-        log_as = f"{instance.provider} code host instance {instance.id} {_operation(argv)}"
-        result = _run(invocation.argv, cwd=cwd, timeout=timeout, env=invocation.env, log_as=log_as)
+        result = _run(
+            invocation.argv,
+            cwd=cwd,
+            timeout=timeout,
+            env=invocation.env,
+            log_as=log_as,
+        )
     if (
         deadline is not None
         and result[0] is None

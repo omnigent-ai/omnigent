@@ -304,6 +304,69 @@ def test_an_instance_cli_failure_logs_only_the_instance_and_operation(
         assert detail not in result[2]
 
 
+@pytest.mark.parametrize(
+    ("failure", "outcome"),
+    [
+        (subprocess.TimeoutExpired(["x"], 1.0), "timed out"),
+        (OSError("could not start --fixed private-detail"), "could not start"),
+    ],
+    ids=["timeout", "spawn-error"],
+)
+def test_an_instance_gone_between_building_and_running_its_call_still_logs_redacted(
+    serve_instance: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure: BaseException,
+    outcome: str,
+) -> None:
+    """A disconnect after the command is built can't bring it back into the logs."""
+    build = github_resource._gh_invocation
+
+    def build_then_disconnect(*args: Any, **kwargs: Any) -> github_resource.GhInvocation:
+        invocation = build(*args, **kwargs)
+        code_host_instances.serve_in_this_process(None)
+        monkeypatch.setattr(code_host_instances, "instance_for_host", lambda _host: None)
+        return invocation
+
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise failure
+
+    monkeypatch.setattr(github_resource, "_gh_invocation", build_then_disconnect)
+    monkeypatch.setattr(github_resource.subprocess, "run", fail)
+
+    with github_resource.gh_target_host_scope(INSTANCE_HOST):
+        result = github_resource._gh(["api", "user"], cwd="/private/workspace")
+
+    assert result[0] is None
+    assert f"github code host instance internal api: {outcome}" in caplog.text
+    for detail in (str(serve_instance), "--fixed", "/private/workspace", "private-detail"):
+        assert detail not in caplog.text
+        assert detail not in result[2]
+
+
+def test_a_built_command_that_isnt_plain_gh_is_never_logged_by_its_command(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Backstop: an invocation missing its log name still logs no command."""
+    monkeypatch.setattr(
+        github_resource,
+        "_gh_invocation",
+        lambda argv, **_: github_resource.GhInvocation(
+            argv=["/opt/example/cli", "--fixed", *argv], env={"PATH": "/usr/bin"}
+        ),
+    )
+
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise subprocess.TimeoutExpired(["x"], 1.0)
+
+    monkeypatch.setattr(github_resource.subprocess, "run", fail)
+
+    github_resource._gh(["api", "user"], cwd="/private/workspace")
+
+    assert "github code host instance unknown api: timed out" in caplog.text
+    assert "/opt/example/cli" not in caplog.text and "--fixed" not in caplog.text
+
+
 def test_a_plain_gh_failure_still_logs_as_before(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
