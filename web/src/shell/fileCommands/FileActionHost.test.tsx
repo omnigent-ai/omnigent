@@ -1,4 +1,4 @@
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, renderHook, screen, waitFor } from "@testing-library/react";
 import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as EditorLinksModule from "@/lib/editorLinks";
@@ -8,6 +8,7 @@ import { isCommandListed, usePaletteCommandsStore } from "@/store/paletteCommand
 import { FileActionHost, fileLink } from "./FileActionHost";
 import { requestFileAction, useFileActionStore } from "./fileActionStore";
 import { publishFocusedFile, useFocusedFileStore } from "./focusedFile";
+import { usePreferredEditor } from "./preferredEditor";
 import { FileViewerContext } from "../FileViewerContext";
 import { resolveFileCommandTarget } from "./target";
 import { useFileCommandMenu } from "./useFileCommandMenu";
@@ -130,9 +131,15 @@ describe("FileActionHost", () => {
     expect(revealInFileManager).not.toHaveBeenCalled();
   });
 
-  it("opens this machine's files in an editor directly", () => {
+  it("opens this machine's files in an editor directly, and remembers the editor", () => {
+    // The Open in menu reads the same preference, so its default follows this choice.
+    const preferred = renderHook(() => usePreferredEditor());
     act(() => requestFileAction(target("src/main.ts"), "open-in-vscode"));
-    expect(launchEditorLink).toHaveBeenCalledWith("vscode://file/repo/src/main.ts");
+    expect(launchEditorLink).toHaveBeenLastCalledWith("vscode://file/repo/src/main.ts");
+    expect(preferred.result.current).toBe("vscode");
+    act(() => requestFileAction(target("src/main.ts"), "open-in-cursor"));
+    expect(launchEditorLink).toHaveBeenLastCalledWith("cursor://file/repo/src/main.ts");
+    expect(preferred.result.current).toBe("cursor");
   });
 
   it("opens no editor from a phone, where neither local nor SSH links work", () => {

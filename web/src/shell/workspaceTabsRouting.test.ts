@@ -1,3 +1,5 @@
+import { render } from "@testing-library/react";
+import { createElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const SESSIONS = "./workspaceTabs/workspaceTabsSessions";
@@ -163,5 +165,20 @@ describe("showAgentBrowserTab", () => {
     await vi.waitFor(() =>
       expect(toastError).toHaveBeenCalledWith("Close some workspace tabs to open more."),
     );
+  });
+});
+
+describe("loadFileActionHost", () => {
+  it("loads the host, or one that does nothing when its code can't load", async () => {
+    const { loadFileActionHost } = await routing();
+    const FileActionHost = () => null;
+    expect((await loadFileActionHost(async () => ({ FileActionHost }))).default).toBe(
+      FileActionHost,
+    );
+    const failed = await loadFileActionHost(async () => {
+      throw new Error("Failed to fetch dynamically imported module");
+    });
+    expect(render(createElement(failed.default)).container).toBeEmptyDOMElement();
+    expect(console.error).toHaveBeenCalled();
   });
 });

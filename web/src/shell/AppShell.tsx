@@ -3236,10 +3236,13 @@ function AppShellImpl() {
       fileViewer={fileViewerContextValue}
     >
       {/* One for the whole window, so a grid of sidebars runs each request once. */}
+      {/* A host that breaks only disables the file actions. */}
       {tabsSidebar && (
-        <Suspense fallback={null}>
-          <LazyFileActionHost />
-        </Suspense>
+        <RenderErrorBoundary name="file actions" fallback={null}>
+          <Suspense fallback={null}>
+            <LazyFileActionHost />
+          </Suspense>
+        </RenderErrorBoundary>
       )}
       <TerminalFirstContextProvider value={terminalFirstContextValue}>
         <ForkDialogContextProvider value={forkDialogContextValue}>
