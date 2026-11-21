@@ -484,6 +484,15 @@ describe("HeaderConversationMenu", () => {
       expect(mocks.togglePinned).not.toHaveBeenCalled();
     });
 
+    it("doesn't run a held row once its action can't run, as when sharing turns off", () => {
+      const onShare = vi.fn();
+      const view = renderMenu({ onShare });
+      const share = sessionCommands()[0].commands.find((row) => row.label === "Share session");
+      view.rerender(menuTree({ onShare, shareDisabled: true, shareDisabledReason: "Off." }));
+      act(() => share?.run());
+      expect(onShare).not.toHaveBeenCalled();
+    });
+
     it("keeps Share listed with its reason when sharing is off", () => {
       renderMenu({ shareDisabled: true, shareDisabledReason: "Sharing is turned off." });
       const share = sessionCommands()[0].commands.find((row) => row.label === "Share session");

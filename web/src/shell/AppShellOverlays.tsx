@@ -11,7 +11,7 @@ import { RecentSessionsSwitcher } from "./RecentSessionsSwitcher";
 
 // The QuickPick palette and its theme picker load only with quick_pick_palette, so the
 // default bundle keeps the flagged code, and what it imports, out of the first load. The
-// palette renders closed as soon as the flag is known, so it has loaded before the first ⌘K.
+// palette mounts closed when the flag resolves, to start loading before use.
 const QuickPickCommandPalette = lazy(() =>
   import("./QuickPickCommandPalette").then((module) => ({
     default: module.QuickPickCommandPalette,

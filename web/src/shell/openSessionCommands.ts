@@ -23,6 +23,7 @@ import {
   AVAILABLE,
   type CommandAvailability,
   HIDDEN,
+  isCommandAvailable,
   isCommandListed,
   type PaletteCommand,
   unavailableBecause,
@@ -198,10 +199,13 @@ export function useOpenSessionPaletteCommands({
         nativeShortcut: command.nativeShortcut,
         // Dialogs such as Rename take focus once the palette has closed.
         movesFocus: true,
+        // Read again at run time: a caller may hold this row past a change in the session.
         run: () => {
+          const current = commandsRef.current.find((each) => each.id === command.id);
           if (
             shownSessionRef.current === conversationId &&
-            commandsRef.current.some((current) => current.id === command.id)
+            current &&
+            isCommandAvailable(current.availability)
           ) {
             runRef.current(command.id);
           }

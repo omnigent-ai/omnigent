@@ -123,36 +123,31 @@ describe("QuickPick ⌘K setting rows", () => {
   const heading = () =>
     document.querySelector('[data-slot="quick-pick-heading"]')?.textContent ?? null;
 
-  it("changes Always steer from its row, back on the row showing the new value", async () => {
-    const input = renderPalette();
-    fireEvent.change(input, { target: { value: "always steer" } });
-    const row = screen.getByRole("option", { name: /Always steer/ });
-    expect(row).toHaveTextContent("On");
-    fireEvent.keyDown(input, { key: "Enter" });
-    await waitFor(() => expect(heading()).toBe("Always steer"));
-    fireEvent.change(input, { target: { value: "off" } });
-    fireEvent.keyDown(input, { key: "Enter" });
-    expect(readAlwaysSteer()).toBe(false);
-    await waitFor(() => expect(heading()).toBeNull());
-    expect(screen.getByRole("option", { name: /Always steer/ })).toHaveTextContent("Off");
-  });
-
-  it("turns on Show only the final answer from its row, back on the row showing On", async () => {
-    const input = renderPalette();
-    fireEvent.change(input, { target: { value: "show only the final answer" } });
-    expect(screen.getByRole("option", { name: /Show only the final answer/ })).toHaveTextContent(
-      "Off",
-    );
-    fireEvent.keyDown(input, { key: "Enter" });
-    await waitFor(() => expect(heading()).toBe("Show only the final answer"));
-    fireEvent.change(input, { target: { value: "on" } });
-    fireEvent.keyDown(input, { key: "Enter" });
-    expect(readFoldAssistantNarration()).toBe(true);
-    await waitFor(() => expect(heading()).toBeNull());
-    expect(screen.getByRole("option", { name: /Show only the final answer/ })).toHaveTextContent(
-      "On",
-    );
-  });
+  it.each([
+    { label: "Always steer", from: "On", to: "Off", read: readAlwaysSteer, saved: false },
+    {
+      label: "Show only the final answer",
+      from: "Off",
+      to: "On",
+      read: readFoldAssistantNarration,
+      saved: true,
+    },
+  ])(
+    "changes $label from its row, back on the row showing $to",
+    async ({ label, from, to, read, saved }) => {
+      const input = renderPalette();
+      const row = () => screen.getByRole("option", { name: new RegExp(label) });
+      fireEvent.change(input, { target: { value: label.toLowerCase() } });
+      expect(row()).toHaveTextContent(from);
+      fireEvent.keyDown(input, { key: "Enter" });
+      await waitFor(() => expect(heading()).toBe(label));
+      fireEvent.change(input, { target: { value: to.toLowerCase() } });
+      fireEvent.keyDown(input, { key: "Enter" });
+      expect(read()).toBe(saved);
+      await waitFor(() => expect(heading()).toBeNull());
+      expect(row()).toHaveTextContent(to);
+    },
+  );
 
   it("finds the terminal theme by a value's name and opens on it", async () => {
     const input = renderPalette();

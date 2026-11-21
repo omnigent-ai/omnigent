@@ -697,30 +697,18 @@ describe("QuickPickDialog deferred accepts", () => {
     expect(abandoned).not.toHaveBeenCalled();
   });
 
-  it("drops a result that settles after Escape, before the next opening", async () => {
-    const abandoned = vi.fn();
-    const load = deferred();
-    render(<Deferring accept={() => load.promise} />);
-    await screen.findByRole("combobox", { name: "Pick" });
-    await userEvent.keyboard("{Enter}");
-    await userEvent.keyboard("{Escape}");
-    await waitFor(() => expect(dialog()).toBeNull());
-    await settleWith(() => load.resolve({ afterClose: abandoned }));
-    act(() => setOpen(true));
-    await screen.findByRole("combobox", { name: "Pick" });
-    await settleWith(() => undefined);
-    expect(screen.getByRole("dialog")).toBeInTheDocument();
-    expect(abandoned).not.toHaveBeenCalled();
-  });
-
-  it("drops a result that settles after the picker was closed from outside", async () => {
-    const abandoned = vi.fn();
-    const load = deferred();
-    render(<Deferring accept={() => load.promise} />);
-    await screen.findByRole("combobox", { name: "Pick" });
-    await userEvent.keyboard("{Enter}");
+  it.each([
+    // Cancelled by the reader.
+    ["Escape, before the next opening", () => userEvent.keyboard("{Escape}")],
     // Closed by its owner, such as by the shortcut that opened it, not by an accept.
-    act(() => setOpen(false));
+    ["the picker was closed from outside", async () => act(() => setOpen(false))],
+  ])("drops a result that settles after %s", async (_close, close) => {
+    const abandoned = vi.fn();
+    const load = deferred();
+    render(<Deferring accept={() => load.promise} />);
+    await screen.findByRole("combobox", { name: "Pick" });
+    await userEvent.keyboard("{Enter}");
+    await close();
     await waitFor(() => expect(dialog()).toBeNull());
     await settleWith(() => load.resolve({ afterClose: abandoned }));
     act(() => setOpen(true));

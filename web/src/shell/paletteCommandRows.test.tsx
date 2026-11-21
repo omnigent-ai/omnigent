@@ -1,6 +1,7 @@
 import { FlagIcon } from "lucide-react";
 import { describe, expect, it, vi } from "vitest";
 
+import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import {
   HIDDEN,
   type PaletteCommand,
@@ -78,7 +79,8 @@ describe("paletteCommandItems", () => {
 
   it("shows a registered shortcut's key caps and a native one's chord", () => {
     const item = paletteCommandItem(command("settings", { shortcut: "settings.open" }), "t");
-    expect(item.shortcut?.length).toBeGreaterThan(0);
+    // Open Settings is ⌘⌥, in a browser, where the desktop menu doesn't own it.
+    expect(item.shortcut).toEqual([MOD_KEY, ALT_KEY, ","]);
     const native = paletteCommandItem(
       command("close", { nativeShortcut: { key: "w", mod: true } }),
       "t",

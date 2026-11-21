@@ -208,7 +208,7 @@ describe("a setting's row", () => {
     expect(input()).toHaveValue("Renderer");
     expect(activeOption()).toHaveTextContent("Renderer");
     expect(activeOption()).toHaveTextContent("Vulkan (experimental)");
-    // The picker remounts between the root and the page's heading; focus stays.
+    // Focus stays in the query when returning.
     expect(input()).toHaveFocus();
   });
 
