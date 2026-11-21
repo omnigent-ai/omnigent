@@ -12800,8 +12800,15 @@ class _EditableComposer:
         self.stash: tuple[str, int] | None = None
         # Enters that land in a paste burst and become a line break instead.
         self.swallowed_enters = 0
+        # Captures after a swallowed Enter that catch the status row redrawn without its marker.
+        self.swallowed_enter_redraws = 0
+        self._unmarked_captures = 0
         # Captures that show the box cut off below its first row.
         self.clipped_captures = 0
+        # Clipped captures right after each paste or typed text.
+        self.clips_after_typing = 0
+        # Text the person types right after an Enter is swallowed.
+        self.typed_after_swallowed_enter = ""
         self.after_submit: Callable[[_EditableComposer], None] | None = None
         self.paste_fails = False
         self._paste_buffer = ""
@@ -12828,12 +12835,14 @@ class _EditableComposer:
             if self.paste_fails:
                 raise RuntimeError("tmux paste-buffer failed")
             self._insert(self._paste_buffer)
+            self.clipped_captures = self.clips_after_typing
         elif args[0] == "send-keys" and "-l" in args:
             keys = args[-1]
             while keys:
                 sequence = next((seq for seq in self._actions if keys.startswith(seq)), None)
                 if sequence is None:
                     self._insert(keys)
+                    self.clipped_captures = self.clips_after_typing
                     break
                 self._actions[sequence]()
                 keys = keys[len(sequence) :]
@@ -12842,7 +12851,8 @@ class _EditableComposer:
             self._insert(" ")
         elif args[0] == "send-keys" and args[-1] == "Enter" and self.swallowed_enters:
             self.swallowed_enters -= 1
-            self._insert("\n")
+            self._unmarked_captures = self.swallowed_enter_redraws
+            self._insert("\n" + self.typed_after_swallowed_enter)
         elif args[0] == "send-keys" and args[-1] == "Enter":
             self.submitted.append(self.text)
             restored = self.stash if self.text.strip() else None
@@ -12859,6 +12869,9 @@ class _EditableComposer:
         first, *rest = self.text.split("\n")
         rows = [f"❯ {first}", *(f"  {row}" for row in rest)]
         status = ["          ◐ medium · /effort · › stashed"] if self.stash else []
+        if status and self._unmarked_captures:
+            self._unmarked_captures -= 1
+            status = ["          ◐ medium · /effort"]
         visible_rows = self._visible_rows
         if self.clipped_captures:
             self.clipped_captures -= 1
@@ -12972,7 +12985,7 @@ def test_message_from_another_session_keeps_the_typed_draft_in_the_box(
     assert composer.text == draft
 
 
-# Drafts a restored copy of could pass for "hello from the web" still waiting in the box.
+# Drafts whose restored copy could be mistaken for the unsent "hello from the web".
 _DRAFTS_LIKE_THE_MESSAGE = pytest.mark.parametrize(
     "draft",
     [
@@ -13017,15 +13030,29 @@ def test_a_restored_draft_is_not_mistaken_for_the_unsent_message(
     assert composer.text == draft + typed
 
 
+@pytest.mark.parametrize(
+    ("redraws", "clips"),
+    [(0, 0), (3, 0), (0, 2)],
+    ids=["marker-shown", "status-row-mid-redraw", "box-cut-off-until-enter"],
+)
 def test_an_enter_swallowed_while_the_draft_is_stashed_is_retried(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    redraws: int,
+    clips: int,
 ) -> None:
-    """An Enter folded into the paste as a line break is re-sent while the draft is stashed."""
+    """
+    An Enter folded into the paste as a line break is re-sent while the draft is stashed.
+
+    A status row caught without its marker does not count the unsent message as accepted,
+    and a box first shown whole after the Enter still shows the unsent message.
+    """
     draft = "also rerun the flaky lock-wait test"
     bridge_dir = _picker_bridge_dir(tmp_path)
     composer = _EditableComposer(draft, cursor=len(draft))
     composer.swallowed_enters = 1
+    composer.swallowed_enter_redraws = redraws
+    composer.clips_after_typing = clips
     composer.install(monkeypatch)
 
     inject_user_message(bridge_dir, content="hello from the web")
@@ -13034,38 +13061,131 @@ def test_an_enter_swallowed_while_the_draft_is_stashed_is_retried(
     assert composer.text == draft
 
 
-def test_a_delivery_that_fails_before_enter_puts_the_draft_back(
+@pytest.mark.parametrize(
+    ("held_stash", "clips"),
+    [("hello from the web", 0), ("[Pasted text #1 +11 lines] explain this log", 2)],
+    ids=["identical-to-the-message", "box-never-shown-whole-before-enter"],
+)
+def test_a_restored_stash_that_cannot_be_told_from_the_message_is_not_submitted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    held_stash: str,
+    clips: int,
+) -> None:
+    """The message is reported as not accepted rather than re-sent with the restored stash."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    composer = _EditableComposer("new draft", cursor=len("new draft"))
+    composer.stash = (held_stash, 0)
+    composer.clips_after_typing = clips
+    composer.install(monkeypatch)
+
+    with pytest.raises(claude_native_bridge.ClaudeMessageNotAccepted):
+        inject_user_message(bridge_dir, content="hello from the web")
+
+    assert [text.strip() for text in composer.submitted] == ["hello from the web"]
+    assert (composer.text, composer.stash) == (held_stash, None)
+
+
+def test_a_message_edited_while_the_draft_is_stashed_is_not_submitted(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A failed paste pops the stashed draft back into the box instead of leaving it stashed."""
+    """After a swallowed Enter, text typed into the unsent message is not submitted by a retry."""
+    draft = "also rerun the flaky lock-wait test"
     bridge_dir = _picker_bridge_dir(tmp_path)
-    composer = _EditableComposer(_STALE_MULTILINE_DRAFT, cursor=len(_STALE_MULTILINE_DRAFT))
-    composer.paste_fails = True
+    composer = _EditableComposer(draft, cursor=len(draft))
+    composer.swallowed_enters = 1
+    composer.typed_after_swallowed_enter = "and my reply"
     composer.install(monkeypatch)
 
-    with pytest.raises(RuntimeError, match="paste-buffer failed"):
+    with pytest.raises(claude_native_bridge.ClaudeMessageNotAccepted):
         inject_user_message(bridge_dir, content="hello from the web")
 
     assert composer.submitted == []
-    assert (composer.text, composer.stash) == (_STALE_MULTILINE_DRAFT, None)
+    assert (composer.text, composer.stash) == (
+        "hello from the web\nand my reply",
+        (draft, len(draft)),
+    )
+
+
+def _unreadable_transcript_path(bridge_dir: Path) -> Path:
+    raise RuntimeError(f"transcript path unreadable in {bridge_dir}")
+
+
+@pytest.mark.parametrize(
+    ("held_stash", "after_paste", "box", "stash"),
+    [
+        (None, False, _STALE_MULTILINE_DRAFT, None),
+        (None, True, "hello from the web", (_STALE_MULTILINE_DRAFT, len(_STALE_MULTILINE_DRAFT))),
+        (("stashed earlier", 3), False, "", ("stashed earlier", 3)),
+    ],
+    ids=["paste-fails", "fails-after-pasting", "stash-held-before"],
+)
+def test_a_delivery_that_fails_before_enter_keeps_the_draft(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    held_stash: tuple[str, int] | None,
+    after_paste: bool,
+    box: str,
+    stash: tuple[str, int] | None,
+) -> None:
+    """
+    A failed paste pops the draft this delivery stashed back into the box.
+
+    With the message already in the box, Ctrl+S would stash the message over the draft,
+    so the draft stays stashed and comes back after the next submit. A stash held before
+    the delivery stays held.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    composer = _EditableComposer(_STALE_MULTILINE_DRAFT, cursor=len(_STALE_MULTILINE_DRAFT))
+    composer.stash = held_stash
+    composer.paste_fails = not after_paste
+    composer.install(monkeypatch)
+    if after_paste:
+        monkeypatch.setattr(
+            claude_native_bridge, "read_transcript_path", _unreadable_transcript_path
+        )
+
+    with pytest.raises(RuntimeError, match=r"paste-buffer failed|transcript path unreadable"):
+        inject_user_message(bridge_dir, content="hello from the web")
+
+    assert composer.submitted == []
+    assert (composer.text, composer.stash) == (box, stash)
+
+
+def _deliver_second_message(bridge_dir: Path) -> None:
+    inject_user_message(bridge_dir, content="second message")
+
+
+def _change_effort(bridge_dir: Path) -> None:
+    claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
 
 @pytest.mark.parametrize(
     "draft",
-    ["[Pasted text #1 +11 lines] explain this log", "second message, then the docs"],
-    ids=["paste-placeholder", "contains-the-message"],
+    ["[Pasted text #1 +11 lines] explain this log", "second message, then the docs /effort high"],
+    ids=["paste-placeholder", "contains-the-next-input"],
 )
+@pytest.mark.parametrize(
+    ("deliver_next", "next_input"),
+    [(_deliver_second_message, "second message"), (_change_effort, "/effort high")],
+    ids=["message", "settings-command"],
+)
+@pytest.mark.parametrize("clips", [0, 1], ids=["box-shown", "first-capture-cut-off"])
 def test_a_draft_stashed_by_a_delivery_a_question_stopped_survives_the_next_one(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     draft: str,
+    deliver_next: Callable[[Path], None],
+    next_input: str,
+    clips: int,
 ) -> None:
     """
-    No key reaches a question that stops a delivery; the next one still keeps the draft.
+    No key reaches a question that stops a delivery; the next input still keeps the draft.
 
-    The first message stays in the box and the draft stays stashed. The next delivery
-    replaces that message and submits its own, and Claude Code puts the draft back.
+    The first message stays in the box and the draft stays stashed. The next message or
+    settings command replaces that message and is submitted alone, even when the capture
+    right after it cuts the box off, and Claude Code puts the draft back.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
     composer = _EditableComposer(draft, cursor=len(draft))
@@ -13081,9 +13201,10 @@ def test_a_draft_stashed_by_a_delivery_a_question_stopped_survives_the_next_one(
         inject_user_message(bridge_dir, content="first message")
     assert (composer.text, composer.stash) == ("first message", (draft, len(draft)))
     answered = True
-    inject_user_message(bridge_dir, content="second message")
+    composer.clips_after_typing = clips
+    deliver_next(bridge_dir)
 
-    assert [text.strip() for text in composer.submitted] == ["second message"]
+    assert [text.strip() for text in composer.submitted] == [next_input]
     assert (composer.text, composer.stash) == (draft, None)
 
 
@@ -13144,14 +13265,22 @@ def test_only_the_status_row_above_the_box_shows_a_held_stash(pane: str, held: b
     assert claude_native_bridge._composer_stash_held(pane) is held
 
 
+@pytest.mark.parametrize("cut_off_and_swallowed", [0, 1], ids=["enter-taken", "enter-swallowed"])
 def test_a_claude_code_without_the_stash_still_gets_the_message_alone(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    cut_off_and_swallowed: int,
 ) -> None:
-    """When Ctrl+S does nothing, the draft is cleared rather than submitted with the message."""
+    """
+    When Ctrl+S does nothing, the draft is cleared rather than submitted with the message.
+
+    No stash was held, so an Enter swallowed after a cut-off capture is still retried.
+    """
     bridge_dir = _picker_bridge_dir(tmp_path)
     composer = _EditableComposer(_STALE_MULTILINE_DRAFT, cursor=0)
     composer._actions["\x1b[115;5u"] = lambda: None
+    composer.clips_after_typing = cut_off_and_swallowed
+    composer.swallowed_enters = cut_off_and_swallowed
     composer.install(monkeypatch)
 
     inject_user_message(bridge_dir, content="hello from the web")

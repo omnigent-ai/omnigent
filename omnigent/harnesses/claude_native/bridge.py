@@ -5101,7 +5101,7 @@ def _paste_and_submit(
     delivery_diagnostics.set_stage("pasting")
     # Clear stale text first, or the paste lands inside the person's draft and
     # Enter submits both together. A stashed draft returns after the submit.
-    stashed = _stash_composer_draft(socket_path, tmux_target, text=text)
+    stash = _stash_composer_draft(socket_path, tmux_target, text=text)
     try:
         _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
         transcript_before_paste = _capture_pane(socket_path, tmux_target)
@@ -5155,6 +5155,10 @@ def _paste_and_submit(
             pane=pane, box_reader=_composer_box, baseline=True
         )
         time.sleep(_PASTE_SETTLE_S)
+        if draft_seen:
+            _note_unsent_draft(
+                stash, socket_path, tmux_target, pane, needle=needle, tail_needle=tail_needle
+            )
         delivery_diagnostics.set_stage("checking_pending_prompt")
         if has_pending_user_prompt(bridge_dir):
             raise ClaudeUserPromptPending(
@@ -5169,7 +5173,7 @@ def _paste_and_submit(
             else None
         )
     except Exception:
-        if stashed:
+        if stash.sent:
             _restore_stashed_draft(bridge_dir, socket_path, tmux_target)
         raise
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
@@ -5196,7 +5200,7 @@ def _paste_and_submit(
             bridge_dir=bridge_dir,
             submit_boundary=submit_boundary,
             submitted_text=text,
-            unsent_box_text=_unsent_box_text_while_stash_held(pane, stashed=stashed),
+            stash=stash,
         )
     except ClaudeUserPromptPending as exc:
         # The Enter already went out, so the prompt may belong to this message's own turn.
@@ -5291,7 +5295,7 @@ def _verify_submit_accepted(
     bridge_dir: Path | None = None,
     submit_boundary: SubmitBoundary | None = None,
     submitted_text: str | None = None,
-    unsent_box_text: str | None = None,
+    stash: _ComposerStash | None = None,
 ) -> bool:
     """
     Wait for a submitted draft to leave the input box, re-sending Enter.
@@ -5314,9 +5318,10 @@ def _verify_submit_accepted(
     :param bridge_dir: Bridge whose pending questions protect submit retries.
     :param submit_boundary: Native transcript boundary captured before Enter.
     :param submitted_text: Full submitted text; a marker alone cannot identify a refusal.
-    :param unsent_box_text: Set while a stash is held
-        (:func:`_unsent_box_text_while_stash_held`): Enter is retried only while the
-        box shows exactly this, and a box whose stash marker went away was accepted.
+    :param stash: What is known of a held stash (:class:`_ComposerStash`), also
+        learned from the marker here. While one is held, Enter is retried only while
+        the box shows the unsent text beside the marker, and a box showing other text
+        without the marker was accepted.
     :returns: ``True`` when the draft left the input box (accepted),
         ``False`` when it is still there after the full window.
     :raises ClaudeSubmitBlockedUnconfirmed: A fresh matching refusal appeared;
@@ -5324,6 +5329,7 @@ def _verify_submit_accepted(
     :raises RuntimeError: Pane capture remains unavailable after submitting;
         delivery cannot be confirmed safely.
     """
+    stash = stash or _ComposerStash()
     start = time.monotonic()
     last_enter = start
     retry_interval = _SUBMIT_RETRY_INTERVAL_S
@@ -5360,11 +5366,15 @@ def _verify_submit_accepted(
         # neither that the draft cleared nor that another Enter is safe.
         if not pane.strip():
             continue
+        draft_present = _draft_in_input_box(pane, needle, tail_needle=tail_needle)
+        marker = _composer_stash_held(pane)
+        if draft_present and marker:
+            stash.note_unsent(pane)
+        box = _framed_chat_box(pane)
+        shows_unsent = box is not None and _composer_draft_text(box) == stash.unsent_box_text
         # Claude Code restores a held stash right after it accepts the submit.
-        box = _framed_chat_box(pane) if unsent_box_text is not None else None
-        if not _draft_in_input_box(pane, needle, tail_needle=tail_needle) or (
-            box is not None and not _composer_stash_held(pane)
-        ):
+        restored = stash.unsent_box_text is not None and box is not None and not marker
+        if not draft_present or (restored and not shows_unsent):
             delivery_diagnostics.record_verification(
                 draft_still_present=False,
                 pane=pane,
@@ -5391,9 +5401,8 @@ def _verify_submit_accepted(
                 _SUBMIT_SLOW_ACCEPT_WARN_S,
                 _SUBMIT_VERIFY_TIMEOUT_S,
             )
-        unsent = unsent_box_text is None or (
-            box is not None and _composer_draft_text(box) == unsent_box_text
-        )
+        # Without the marker, the box may show a restored stash that looks like the draft.
+        unsent = not stash.held or (marker and shows_unsent)
         if unsent and now - last_enter >= retry_interval:
             _raise_if_user_prompt_pending(bridge_dir, pane)
             _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
@@ -5737,7 +5746,8 @@ def inject_slash_command(
     # Clear any draft the user is mid-typing; otherwise the command below
     # concatenates with their text and Enter submits
     # ``<their-draft>/effort high`` as a turn. Unlike Escape it does
-    # not interrupt an in-flight generation.
+    # not interrupt an in-flight generation. A held stash returns once the command runs.
+    stash = _ComposerStash(held=_composer_stash_held(_capture_pane(socket_path, tmux_target)))
     _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
     # ``-l`` pastes ``/`` and spaces literally; trailing Enter submits.
     _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, command)
@@ -5747,6 +5757,7 @@ def inject_slash_command(
     # left the box; an unidentifiable draft falls through to a blind submit.
     needle = _submit_needle(command)
     draft_seen = False
+    pane = ""
     deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
     while time.monotonic() < deadline:
         pane = _capture_pane(socket_path, tmux_target)
@@ -5756,6 +5767,8 @@ def inject_slash_command(
             break
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
     time.sleep(_PASTE_SETTLE_S)
+    if draft_seen:
+        _note_unsent_draft(stash, socket_path, tmux_target, pane, needle=needle)
     if has_pending_user_prompt(bridge_dir):
         raise ClaudeUserPromptPending(
             "Claude is waiting for an explicit answer; settings command not sent."
@@ -5770,6 +5783,7 @@ def inject_slash_command(
             needle=needle,
             what="slash command",
             bridge_dir=bridge_dir,
+            stash=stash,
         ):
             raise RuntimeError(
                 f"Claude Code did not accept the slash command within "
@@ -7476,7 +7490,36 @@ def _composer_draft_text(box: _ComposerBox) -> str:
     return _comparable_draft_text("\n".join(rows).replace(_QUEUED_MESSAGE_HINT, ""))
 
 
-def _stash_composer_draft(socket_path: str, tmux_target: str, *, text: str) -> bool:
+@dataclass
+class _ComposerStash:
+    """
+    What a delivery knows of Claude Code's prompt stash.
+
+    Claude Code puts a held stash back into the box right after it accepts the next
+    submit, so a draft like the message can show there once the message was sent.
+
+    :param held: Whether a stash is known to be held: its marker showed, or Ctrl+S
+        emptied the box.
+    :param sent: Whether this delivery pressed Ctrl+S, so stopping before Enter pops it.
+    :param unsent_box_text: The box shown beside the marker before the submit was
+        accepted, i.e. the unsent message; ``None`` until a capture showed both.
+    """
+
+    held: bool = False
+    sent: bool = False
+    unsent_box_text: str | None = None
+
+    def note_unsent(self, pane: str) -> None:
+        """Record *pane*, a capture of the box still holding the unsent draft."""
+        if not _composer_stash_held(pane):
+            return
+        self.held = True
+        box = _framed_chat_box(pane)
+        if box is not None and self.unsent_box_text is None:
+            self.unsent_box_text = _composer_draft_text(box)
+
+
+def _stash_composer_draft(socket_path: str, tmux_target: str, *, text: str) -> _ComposerStash:
     """
     Stash the person's draft with Ctrl+S so Claude Code restores it after the next submit.
 
@@ -7487,15 +7530,16 @@ def _stash_composer_draft(socket_path: str, tmux_target: str, *, text: str) -> b
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :param text: The message about to be pasted.
-    :returns: Whether Ctrl+S was sent.
+    :returns: Whether a stash is held and whether Ctrl+S was sent.
     """
     pane = _capture_pane(socket_path, tmux_target)
     box = _framed_chat_box(pane)
-    if box is None or _composer_stash_held(pane):
-        return False
+    held = _composer_stash_held(pane)
+    if box is None or held:
+        return _ComposerStash(held=held)
     draft = _composer_draft_text(box)
     if not draft or draft == _comparable_draft_text(text):
-        return False
+        return _ComposerStash()
     _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, _COMPOSER_STASH)
     # The clear runs after the stash either way; waiting only records whether it took.
     deadline = time.monotonic() + _COMPOSER_STASH_TIMEOUT_S
@@ -7505,21 +7549,34 @@ def _stash_composer_draft(socket_path: str, tmux_target: str, *, text: str) -> b
         box = _composer_box(_capture_pane(socket_path, tmux_target))
         stashed = box is not None and not _composer_draft_text(box)
     delivery_diagnostics.record_details(composer_draft_stashed=stashed)
-    return True
+    return _ComposerStash(held=stashed, sent=True)
 
 
-def _unsent_box_text_while_stash_held(pane: str, *, stashed: bool) -> str | None:
+def _note_unsent_draft(
+    stash: _ComposerStash,
+    socket_path: str,
+    tmux_target: str,
+    pane: str,
+    *,
+    needle: str,
+    tail_needle: str = "",
+) -> None:
     """
-    Return the box text an Enter may be retried on while a stash is held, else ``None``.
+    Record the unsent draft *pane* shows, capturing once more if a held stash has no text yet.
 
-    Claude Code restores a held stash right after accepting a submit, so once the paste is
-    on screen (*pane*) a box showing anything else no longer holds the unsent message.
-    ``""`` (this delivery stashed, but the box was not shown whole) allows no retry.
+    :param stash: The delivery's stash state, updated in place.
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param pane: The capture that showed the draft in the box, before Enter.
+    :param needle: Draft marker from :func:`_submit_needle`.
+    :param tail_needle: End-of-draft marker from :func:`_submit_tail_needle`.
     """
-    box = _framed_chat_box(pane)
-    if box is not None and _composer_stash_held(pane):
-        return _composer_draft_text(box)
-    return "" if stashed and box is None else None
+    stash.note_unsent(pane)
+    if stash.held and stash.unsent_box_text is None:
+        # A box cut off in that capture gives nothing to tell a restored draft from.
+        pane = _capture_pane(socket_path, tmux_target)
+        if _draft_in_input_box(pane, needle, tail_needle=tail_needle):
+            stash.note_unsent(pane)
 
 
 def _restore_stashed_draft(bridge_dir: Path, socket_path: str, tmux_target: str) -> None:
