@@ -197,7 +197,7 @@ def test_oauth_profile_auth_command_mints_token_at_request_time(
     gateway_env = _resolve_gateway_env_from_spawn_env(env)
     assert gateway_env, "gateway credentials must resolve for an OAuth profile"
     helper = gateway_env.get("OMNIGENT_CLAUDE_API_KEY_HELPER", "")
-    assert 'databricks auth token --profile "my-profile"' in helper, (
+    assert "databricks auth token --profile my-profile" in helper, (
         "The bearer must be minted per-request via the profile-pinned "
         "Databricks CLI command; a static token cannot exist for OAuth U2M "
         f"profiles. Helper was: {helper!r}"
