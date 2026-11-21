@@ -23,6 +23,7 @@ import type { Comment } from "@/hooks/useComments";
 import { useCanEdit } from "@/hooks/usePermissions";
 import { Button } from "@/components/ui/button";
 import { getEmbedRoot } from "@/lib/host";
+import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
 import { cn } from "@/lib/utils";
 import type { ActiveSelection } from "./codeViewerHelpers";
 import {
@@ -352,7 +353,16 @@ export function PdfViewer({
         </div>
       </div>
 
-      <div ref={containerRef} className="pdf-viewer min-h-0 flex-1 overflow-auto bg-muted/30 p-4">
+      <div
+        ref={containerRef}
+        className="pdf-viewer min-h-0 flex-1 overflow-auto bg-muted/30 p-4"
+        onClick={(event) => {
+          const href = (event.target as Element)
+            .closest(".annotationLayer a[href]")
+            ?.getAttribute("href");
+          if (href) followLinkWithPopupFallback(event, href, conversationId);
+        }}
+      >
         {pdfFile && (
           <Document
             file={pdfFile}
@@ -360,6 +370,8 @@ export function PdfViewer({
             onLoadError={() => setErrored(true)}
             loading={centered("Loading PDF…")}
             error={centered("Unable to render PDF.", "error")}
+            // Web links must not navigate the app window away from the session.
+            externalLinkTarget="_blank"
             className="flex flex-col items-center gap-4"
           >
             {Array.from({ length: numPages }, (_, i) => {
