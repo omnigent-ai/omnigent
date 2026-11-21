@@ -384,6 +384,9 @@ _CODEX_FULL_ACCESS = (_CODEX_ARGS["full-access"], {})
             id="codex-prompt-text",
         ),
         pytest.param(
+            "codex-native", {}, ["--", "--approve-for-me"], True, None, id="codex-prompt-text-mode"
+        ),
+        pytest.param(
             "claude-native",
             {},
             ["--", "--permission-mode", "bypassPermissions"],
@@ -393,6 +396,7 @@ _CODEX_FULL_ACCESS = (_CODEX_ARGS["full-access"], {})
         ),
         # Only Claude Code's and Codex's launch settings are read.
         pytest.param("cursor-native", {}, ["--yolo"], True, None, id="other-harness"),
+        pytest.param("pi", {}, None, True, None, id="no-permission-modes"),
         pytest.param(
             "claude-native",
             {},

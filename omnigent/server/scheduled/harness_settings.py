@@ -154,18 +154,18 @@ def _launch_permission_mode(session: Conversation, harness: str) -> str | None:
         Claude Code or Codex.
     """
     launch_args = list(session.terminal_launch_args or [])
+    # Everything after ``--`` is prompt text, not an option.
+    options = launch_args[: launch_args.index("--")] if "--" in launch_args else launch_args
     modes = PERMISSION_LAUNCH_ARGS.get(harness, {})
     if harness == "claude-native":
         from omnigent.runner.native.orchestration import _claude_launch_permission_mode
 
-        # Everything after ``--`` is prompt text, not an option.
-        options = launch_args[: launch_args.index("--")] if "--" in launch_args else launch_args
         mode = _claude_launch_permission_mode(options)
         return mode if mode in modes else None
     if harness == "codex-native":
         if session.labels.get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == "1":
             return "bypass"
-        effective = _codex_permission_settings(launch_args)
+        effective = _codex_permission_settings(options)
         if effective is None:
             return None
         return next(

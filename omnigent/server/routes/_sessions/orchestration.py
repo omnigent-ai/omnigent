@@ -12780,18 +12780,18 @@ def _created_session_title(body: SessionCreateInput, workflow: Workflow | None) 
 _SPEC_PERMISSION_MODE_KEYS = ("permission_mode", "yolo", "exec_mode")
 
 
-def _spec_sets_permission_mode(spec: AgentSpec | None, harness: str | None) -> bool:
+def _spec_leaves_permission_mode_open(spec: AgentSpec | None) -> bool:
     """
-    Whether *spec* chooses its own permission mode for *harness*, even its default.
+    Whether *spec* was read and chooses no permission mode of its own, even its default.
+
+    A spec the server couldn't read might choose one, so it never counts as open.
 
     :param spec: The new session's agent spec, or ``None`` when it couldn't be loaded.
-    :param harness: The new session's harness, e.g. ``"codex-native"``.
-    :returns: ``True`` when the spec runs *harness* and sets one of
-        :data:`_SPEC_PERMISSION_MODE_KEYS`.
+    :returns: ``True`` when the spec sets none of :data:`_SPEC_PERMISSION_MODE_KEYS`.
     """
-    if spec is None or _spec_harness(spec) != harness:
+    if spec is None:
         return False
-    return any(key in spec.executor.config for key in _SPEC_PERMISSION_MODE_KEYS)
+    return not any(key in spec.executor.config for key in _SPEC_PERMISSION_MODE_KEYS)
 
 
 def _creator_permission_launch_options(
@@ -13547,14 +13547,14 @@ async def _create_session_from_existing_agent(
             ) from exc
 
     # A worker can do without asking what the session that started it can, so one
-    # that its request, automation and own spec leave without a mode runs in its
-    # creator's.
+    # that its request, automation and own spec, once read, leave without a mode runs
+    # in its creator's.
     creator_permission_labels: dict[str, str] = {}
     if (
         needs_launch_args_from_spec
         and validated_launch_args is None
         and created_by is not None
-        and not _spec_sets_permission_mode(own_spec, selected_harness)
+        and _spec_leaves_permission_mode_open(own_spec)
     ):
         creator_launch_options = await asyncio.to_thread(
             _creator_permission_launch_options,

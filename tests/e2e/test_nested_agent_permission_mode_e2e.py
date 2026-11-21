@@ -26,7 +26,7 @@ from tests._helpers.native_session import create_native_session
 from tests._helpers.polling import poll_until
 from tests._helpers.server_runner import server_runner
 from tests._helpers.session import bundle_files, post_session_bundle, send_user_text
-from tests.e2e._harness_probes import skip_if_harness_cli_missing
+from tests.e2e._harness_probes import cli_unavailable_reason
 from tests.e2e.conftest import configure_mock_llm, get_mock_requests, set_fallback_mock_llm
 
 _REPO = Path(__file__).resolve().parents[2]
@@ -108,7 +108,10 @@ def _tool_call(harness: str, name: str, arguments: dict, call_id: str) -> dict:
 def test_nested_agent_runs_unattended_like_its_creator(
     tmp_path, isolated_mock_llm_server_url, harness
 ):
-    skip_if_harness_cli_missing(harness)
+    # Each parameter is named for its CLI's binary.
+    missing = cli_unavailable_reason(harness)
+    if missing is not None:
+        pytest.skip(missing)
     if shutil.which("tmux") is None:
         pytest.skip("native CLIs require tmux")
     spec = _HARNESSES[harness]
