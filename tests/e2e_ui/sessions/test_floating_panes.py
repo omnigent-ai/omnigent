@@ -113,6 +113,22 @@ def _largest_step(image: Image.Image, y: int, x_from: int, x_to: int) -> tuple[i
     return max(steps)
 
 
+def test_the_step_reading_passes_a_gradient_and_finds_an_edge() -> None:
+    """The pixel check the journeys rest on: a dithered gradient is one surface, a 3-step edge
+    is not, and the edge is found where it is."""
+    gradient = Image.new("RGB", (60, 1))
+    for x in range(60):
+        gradient.putpixel((x, 0), (100 + x // 6 + x % 2, 100, 100))
+    assert _largest_step(gradient, 0, 0, 59)[0] <= _MAX_STEP
+
+    edge = Image.new("RGB", (60, 1), (100, 100, 100))
+    for x in range(30, 60):
+        edge.putpixel((x, 0), (103, 100, 100))
+    step, at = _largest_step(edge, 0, 0, 59)
+    assert step > _MAX_STEP
+    assert at == 30
+
+
 @pytest.mark.parametrize("scheme", ["light", "dark"])
 def test_the_sidebar_and_the_backdrop_beside_the_chat_are_one_surface(
     page: Page, seeded_session: tuple[str, str], scheme: str
@@ -173,13 +189,17 @@ def test_the_sidebar_paints_as_it_does_without_floating_panes(
 def test_the_chat_card_stays_rounded_after_switching_sessions(
     page: Page, seeded_session_pair: tuple[str, str, str], scheme: str
 ) -> None:
-    """Moving to another session and back keeps the chat's card."""
+    """Picking another session in the sidebar and back, in place, keeps the chat's card."""
     base_url, first, second = seeded_session_pair
+    page.add_init_script("window.__documentLoadMarker = crypto.randomUUID();")
     _open(page, base_url, first, scheme=scheme, floating=True)
-    page.goto(f"{base_url}/c/{second}")
-    expect(message_composer(page)).to_be_visible(timeout=30_000)
-    page.go_back()
-    expect(message_composer(page)).to_be_visible(timeout=30_000)
+    load_marker = page.evaluate("window.__documentLoadMarker")
+    for session_id in (second, first):
+        page.locator(f'a[href="/c/{session_id}"]').click()
+        expect(page).to_have_url(f"{base_url}/c/{session_id}", timeout=30_000)
+        expect(message_composer(page)).to_be_visible(timeout=30_000)
+    # The same document throughout: the shell and its session column were reused.
+    assert page.evaluate("window.__documentLoadMarker") == load_marker
     geometry = _geometry(page)
     assert geometry["chatRadius"] != "0px"
     assert geometry["chatBorder"] == "1px"
@@ -252,6 +272,11 @@ def test_the_desktop_app_floats_the_panes_from_48rem_too(
     )
     expect(page.locator("html")).to_have_attribute("data-desktop-app", "true")
     assert (page.evaluate(_CHAT_RADIUS_JS) != "0px") is floats
+    # The left sidebar's resize edge: its 4px bar edge to edge, a band across the gap where
+    # the panes float.
+    edge = page.get_by_role("separator", name="Resize sidebar").bounding_box()
+    assert edge is not None
+    assert edge["width"] == (10 if floats else 4), edge
 
 
 _GRID_WORKSPACE_STYLE_JS = """() => {
