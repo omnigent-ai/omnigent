@@ -77,7 +77,9 @@ export function changesComparisonShown(
   comparison: ComparisonChoice,
   step: boolean,
 ): PlaceViewAction {
-  return { type: "navigate", place: { ...current, comparison }, replace: !step };
+  // The recorded comparison replaces a link's range, which would otherwise outlive it.
+  const { range: _range, ...rest } = current;
+  return { type: "navigate", place: { ...rest, comparison }, replace: !step };
 }
 
 /** Leaves a comparison a link asked for, for the session's own, keeping the file. */
@@ -100,6 +102,7 @@ export function changesFileInNewTab(
 ): PlaceViewAction {
   const place: ChangesPlace = { kind: "changes", path, fileTab: true };
   if (current.range) place.range = current.range;
+  if (current.comparison) place.comparison = current.comparison;
   return {
     type: "open",
     link: { place },

@@ -85,16 +85,13 @@ describe("Files tab", () => {
 });
 
 describe("Changes tab", () => {
-  it("goes back to the overview from a file", () => {
+  it("goes back to the overview from a file, keeping the visit's comparison", () => {
     expect(changesOverview({ kind: "changes", path: "a.go" })).toEqual({
       type: "navigate",
       place: { kind: "changes" },
       replace: false,
     });
     expect(changesOverview({ kind: "changes" })).toEqual({ type: "none" });
-  });
-
-  it("keeps the visit's comparison on the overview it goes back to", () => {
     const comparison = { kind: "saved", intent: "branch-point" } as const;
     expect(changesOverview({ kind: "changes", path: "a.go", comparison })).toMatchObject({
       place: { kind: "changes", comparison },
@@ -201,6 +198,24 @@ describe("changesFileInNewTab", () => {
       type: "open",
       link: { place: { kind: "changes", path: "b.go", fileTab: true } },
       options: { opener: "user", disposition: "focus", reuse: "same-place", keepSelection: false },
+    });
+  });
+
+  it("gives the file the comparison picked over a linked range, not the range", () => {
+    const lastCommit = { kind: "saved", intent: "head" } as const;
+    const picked = changesComparisonShown(
+      { kind: "changes", range: { base: "v1.2" } },
+      lastCommit,
+      true,
+    );
+    expect(picked).toEqual({
+      type: "navigate",
+      place: { kind: "changes", comparison: lastCommit },
+      replace: false,
+    });
+    const place = { kind: "changes", comparison: lastCommit } as const;
+    expect(changesFileInNewTab(place, "b.go", { background: true })).toMatchObject({
+      link: { place: { kind: "changes", path: "b.go", fileTab: true, comparison: lastCommit } },
     });
   });
 });
