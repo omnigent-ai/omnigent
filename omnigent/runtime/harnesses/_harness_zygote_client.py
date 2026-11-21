@@ -44,6 +44,9 @@ logger = logging.getLogger(__name__)
 # 0.1s keeps wait() responsive without loading the control channel.
 _POLL_INTERVAL_S = 0.1
 
+# A stalled forkserver must not hold the control lock and its worker forever.
+_CONTROL_TIMEOUT_S = 30.0
+
 # Reported when a harness's real exit code can't be recovered because the
 # zygote (its OS parent) died AND the harness pid is itself gone. Non-zero so a
 # harness that crashed on boot reads as a failure — never as a clean exit that
@@ -137,8 +140,9 @@ class HarnessZygoteClient:
         self._sock: socket.socket | None = socket.socket(
             socket.AF_UNIX, socket.SOCK_STREAM, fileno=control_fd
         )
-        self._sock.setblocking(True)
+        self._sock.settimeout(_CONTROL_TIMEOUT_S)
         self._lock = asyncio.Lock()
+        self._control_failed = False
 
     @classmethod
     def from_env(cls) -> HarnessZygoteClient | None:
@@ -196,12 +200,21 @@ class HarnessZygoteClient:
         :raises ZygoteHarnessUnavailable: On any socket error / EOF.
         """
         async with self._lock:
+            if self._control_failed:
+                raise ZygoteHarnessUnavailable("harness zygote control channel is unusable")
             sock = self._sock
             if sock is None:
                 raise ZygoteHarnessUnavailable("harness zygote channel is closed")
             try:
                 return await asyncio.to_thread(self._exchange_blocking, sock, request)
-            except (OSError, ValueError) as exc:
+            except asyncio.CancelledError:
+                # Cancelling to_thread leaves its reader running. Keep the
+                # socket open: EOF would terminate existing harness children.
+                self._control_failed = True
+                raise
+            except (OSError, ValueError, ZygoteHarnessUnavailable) as exc:
+                # Partial or late replies cannot be assigned to another request.
+                self._control_failed = True
                 raise ZygoteHarnessUnavailable(f"harness zygote control error: {exc}") from exc
 
     @staticmethod
