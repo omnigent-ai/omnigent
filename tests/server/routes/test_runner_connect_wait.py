@@ -264,12 +264,41 @@ async def test_wait_for_runner_client_first_lookup_hit_needs_no_retry(
     assert (event.attributes["outcome"], event.attributes["attempts"]) == ("resolved", 1)
 
 
-async def test_wait_for_runner_client_gives_up_after_bounded_lookups(
+async def test_wait_for_runner_client_outlasts_a_stale_binding(
     virtual_time: _VirtualTime,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A connected runner that never resolves is retried a fixed number of times."""
+    """A binding that settles 20s after the connect still resolves inside the budget.
+
+    A store that caches conversations can serve the previous runner id for
+    that long after a rebind. Giving up after a few lookups failed the
+    session's first message although its runner was up.
+    """
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.sessions")
+    retry_s = sessions_facade._RUNNER_CLIENT_RESOLVE_RETRY_S
+    lookup = _ScriptedLookup(misses=int(20.0 / retry_s))
+    monkeypatch.setattr(sessions_facade, "_get_runner_client", lookup)
+
+    result = await _wait_for_runner_client(
+        "conv_x", None, _ConnectsRegistry(virtual_time), runner_id="runner_ok", timeout_s=30.0
+    )
+
+    assert result is lookup.client
+    assert virtual_time.now == 20.0
+    [event] = _wait_events(caplog)
+    assert (event.attributes["outcome"], event.attributes["attempts"]) == (
+        "resolved",
+        lookup.misses + 1,
+    )
+
+
+async def test_wait_for_runner_client_keeps_looking_up_until_the_deadline(
+    virtual_time: _VirtualTime,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A connected runner that never resolves is retried until the budget runs out."""
     caplog.set_level(logging.INFO, logger="omnigent.server.routes.sessions")
     lookup = _ScriptedLookup(misses=10**6)
     monkeypatch.setattr(sessions_facade, "_get_runner_client", lookup)
@@ -278,10 +307,12 @@ async def test_wait_for_runner_client_gives_up_after_bounded_lookups(
         "conv_x", None, _ConnectsRegistry(virtual_time), runner_id="runner_x", timeout_s=30.0
     )
 
-    attempts = sessions_facade._RUNNER_CLIENT_RESOLVE_ATTEMPTS
+    retry_s = sessions_facade._RUNNER_CLIENT_RESOLVE_RETRY_S
+    attempts = int(30.0 / retry_s)
     assert result is None
     assert lookup.calls == attempts
-    assert virtual_time.sleeps == [sessions_facade._RUNNER_CLIENT_RESOLVE_RETRY_S] * (attempts - 1)
+    assert virtual_time.sleeps == [retry_s] * attempts
+    assert virtual_time.now == 30.0
     [event] = _wait_events(caplog)
     assert event.attributes["outcome"] == "connected_but_unresolved"
     assert event.attributes["attempts"] == attempts
@@ -291,8 +322,8 @@ async def test_wait_for_runner_client_gives_up_after_bounded_lookups(
 @pytest.mark.parametrize(
     ("timeout_s", "connect_after_s", "expected_sleeps", "expected_lookups"),
     [
-        # Whole budget left: every retry gets the full gap.
-        (30.0, 0.0, [2.0, 2.0], 3),
+        # Whole budget left: every retry gets the full gap until the deadline.
+        (30.0, 0.0, [2.0] * 15, 15),
         # Connect used the whole budget: no lookup or pause remains.
         (5.0, 5.0, [], 0),
         # 1s left: one pause clamped to the budget, then the deadline ends it.
