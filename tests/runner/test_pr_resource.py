@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import types
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 
@@ -19,9 +20,15 @@ from omnigent.git_providers import (
     ParsedPullRequest,
     ParsedRemote,
     host_of,
+    load_facet,
     reset_for_tests,
 )
 from omnigent.runner import github_resource, pr_resource
+from omnigent.runner.git_providers import (
+    ProviderCapabilities,
+    offered_capabilities,
+    with_offered_capabilities,
+)
 from omnigent.runner.pr_resource import ProviderResolution
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
 from tests.budgets import budget
@@ -196,6 +203,57 @@ def test_tracked_github_pr_info_carries_the_provider_fields(
     assert info["auth"]["cli"] == {"name": "gh", "available": False}
     assert info["gh_available"] is False
     assert [pr["provider"] for pr in info["prs"]] == ["github"]
+
+
+def test_a_tracked_enterprise_pr_reports_the_same_github_capabilities(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GH_HOST", "ghe.example.test")
+    url = "https://ghe.example.test/acme/repo/pull/7"
+    SessionPrRegistry("session").record(
+        [PullRequestRef.from_url(url)], relationship="created", source="test"
+    )
+    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: None)
+
+    info = pr_resource.pr_info(str(repo), session_id="session")
+
+    assert info["selected_pr_url"] == url
+    assert (info["provider"], info["capabilities"]) == ("github", GITHUB_CAPABILITIES)
+
+
+@pytest.mark.parametrize("host", ["github.com", "ghe.example.test", "gitlab.example.test", None])
+@pytest.mark.parametrize("provider_id", ["github", "gitlab", "azure_devops"])
+def test_every_host_is_offered_its_providers_own_capabilities(
+    provider_id: str, host: str | None
+) -> None:
+    facet = load_facet(provider_id, "pull_requests")
+
+    assert facet is not None
+    assert offered_capabilities(facet, host) is facet.capabilities
+
+
+def test_offered_capabilities_only_narrow_what_a_payload_reports() -> None:
+    nothing = types.SimpleNamespace(capabilities=ProviderCapabilities(False, False, False, False))
+    everything = types.SimpleNamespace(
+        capabilities=ProviderCapabilities(**dict.fromkeys(GITHUB_CAPABILITIES, True))
+    )
+    reported = {**dict.fromkeys(GITHUB_CAPABILITIES, True), "newer_capability": True}
+
+    narrowed = with_offered_capabilities({"capabilities": dict(reported)}, nothing, None)
+    kept = with_offered_capabilities({"capabilities": dict(reported)}, everything, None)
+    nothing_on = with_offered_capabilities(
+        {"capabilities": dict.fromkeys(GITHUB_CAPABILITIES, False)}, everything, None
+    )
+    unavailable = {"capabilities": None}
+
+    assert narrowed["capabilities"] == {
+        **dict.fromkeys(GITHUB_CAPABILITIES, False),
+        "newer_capability": True,
+    }
+    assert kept["capabilities"] == reported
+    assert nothing_on["capabilities"] == dict.fromkeys(GITHUB_CAPABILITIES, False)
+    assert with_offered_capabilities(unavailable, everything, None) is unavailable
+    assert unavailable == {"capabilities": None}
 
 
 def test_attaching_a_pr_keeps_the_workspace_repo(
