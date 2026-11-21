@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 import httpx
@@ -229,12 +230,15 @@ class _FakeMeter:
         name: str,
         unit: str = "",
         description: str = "",
+        *,
+        explicit_bucket_boundaries_advisory: Sequence[float] | None = None,
     ) -> _FakeHistogram:
         """
         Create and record a fake histogram.
 
         :param name: Metric name.
         :param unit: Metric unit.
+        :param explicit_bucket_boundaries_advisory: Preferred bounds in the instrument unit.
         :param description: Metric description.
         :returns: Fake histogram instrument.
         """
@@ -966,3 +970,56 @@ async def test_create_app_websocket_metrics_count_accepted_connections(
 
     after = app.state.server_metrics.snapshot()
     assert after.active_websockets == before.active_websockets
+
+
+def test_request_duration_sdk_bucket_boundaries_and_counts() -> None:
+    """The SDK aggregates seconds into sub-second buckets and retains failures."""
+    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=[reader])
+    try:
+        publisher = ServerMetricsOtelPublisher(meter=provider.get_meter("test"))
+        for failed in (False, True):
+            for duration in (0.001, 0.005, 0.02, 0.125, 0.5, 11.0):
+                publisher.record_request_duration(
+                    duration_seconds=duration,
+                    failed=failed,
+                    method="GET",
+                    route="/test",
+                    status_code=500 if failed else 200,
+                )
+        data = reader.get_metrics_data()
+        assert data is not None
+        histogram = next(
+            metric
+            for resource in data.resource_metrics
+            for scope in resource.scope_metrics
+            for metric in scope.metrics
+            if metric.name == "omnigent.server.http.request.duration"
+        )
+        assert histogram.unit == "s"
+        points = histogram.data.data_points
+        assert {point.attributes["failed"] for point in points} == {False, True}
+        for point in points:
+            assert point.explicit_bounds == (
+                0.005,
+                0.01,
+                0.025,
+                0.05,
+                0.075,
+                0.1,
+                0.25,
+                0.5,
+                0.75,
+                1,
+                2.5,
+                5,
+                7.5,
+                10,
+            )
+            assert point.bucket_counts == (2, 0, 1, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 1)
+            assert point.count == 6
+    finally:
+        provider.shutdown()
