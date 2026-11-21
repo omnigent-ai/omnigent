@@ -13125,7 +13125,7 @@
                 "type": "null"
               }
             ],
-            "description": "Own cumulative token baseline for Pi and Codex side chats, excluding descendants. Available even when display usage aggregation is skipped; `None` for other harnesses or older servers."
+            "description": "Own cumulative usage baseline for Pi, Claude native and Codex side chats, excluding descendants. Available even when display usage aggregation is skipped; `None` for other harnesses or older servers."
           },
           "parent_session_id": {
             "anyOf": [

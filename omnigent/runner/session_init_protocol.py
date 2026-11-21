@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Literal, TypeAlias
 from uuid import uuid4
 
@@ -32,6 +33,27 @@ class RunnerSessionInitSnapshot(BaseModel):  # type: ignore[explicit-any]  # Pyd
     parent_session_id: str | None = None
     root_session_id: str | None = None
     inference_config: dict[str, object] | None = None
+    # Recorded cost of this session alone, excluding sessions it spawned; a
+    # native harness resumes its running cost total from it.
+    own_cost_usd: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+
+
+def _own_cost_usd(conversation: Conversation) -> float | None:
+    """
+    Return the session's own recorded cost for the init snapshot.
+
+    :param conversation: Session whose ``session_usage`` holds its own spend,
+        e.g. ``{"total_cost_usd": 1.25}``.
+    :returns: The positive cost in USD, or ``None`` when none is recorded.
+    """
+    cost = (conversation.session_usage or {}).get("total_cost_usd")
+    if isinstance(cost, bool) or not isinstance(cost, (int, float)):
+        return None
+    try:
+        value = float(cost)
+    except OverflowError:  # an integer too large for a float
+        return None
+    return value if math.isfinite(value) and value > 0 else None
 
 
 class RunnerSessionInitEnvelope(BaseModel):  # type: ignore[explicit-any]  # Pydantic uses Any
@@ -107,6 +129,7 @@ def build_runner_session_init_payload(
             parent_session_id=conversation.parent_conversation_id,
             root_session_id=conversation.root_conversation_id,
             inference_config=snapshot_runtime_config(conversation.inference_snapshot),
+            own_cost_usd=_own_cost_usd(conversation),
         ),
     )
     return {
