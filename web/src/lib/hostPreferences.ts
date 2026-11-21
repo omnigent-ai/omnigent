@@ -22,6 +22,14 @@
 const STORAGE_KEY = "omnigent:last-host-choice";
 const SANDBOX_PROVIDER_KEY = "omnigent:last-sandbox-provider";
 
+// Only the legacy host_<32-hex> spelling can be normalized safely.
+const LEGACY_HOST_ID = /^host_([0-9a-f]{32})$/;
+
+function normalizeHostChoice(choice: string): string {
+  const match = LEGACY_HOST_ID.exec(choice);
+  return match ? match[1] : choice;
+}
+
 // Stored in place of a host id when the user picked the managed-sandbox option,
 // which has no host id of its own (the server provisions the host at create
 // time). A reserved sentinel so it can never collide with a real host id.
@@ -69,7 +77,8 @@ export function sandboxHostChoiceProvider(choice: string): string | null | undef
 export function readLastHostChoice(): string | null {
   if (typeof window === "undefined") return null;
   try {
-    return window.localStorage.getItem(STORAGE_KEY);
+    const stored = window.localStorage.getItem(STORAGE_KEY);
+    return stored === null ? null : normalizeHostChoice(stored);
   } catch {
     return null;
   }
