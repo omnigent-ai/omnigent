@@ -58,6 +58,7 @@ async def test_project_creation_has_one_normal_orchestrator(project_client, db_u
     assert info["project_tickets"] is True
     assert info["project_ticket_lifecycle"] is True
     assert info["project_ticket_agent_involvement"] is True
+    assert info["project_ticket_stages"] is True
     assert info["durable_initial_input"] is False
 
     worker = (
@@ -224,16 +225,16 @@ async def test_board_api_lifecycle_and_no_deletion(project_client):
     created = await project_client.post(base, json={"title": "Ship"})
     assert created.status_code == 201
     ticket = created.json()
-    assert ticket["status"] == "open" and ticket["description"] == ""
+    assert ticket["stage_id"] == "open" and ticket["description"] == ""
     path = base + f"/{ticket['id']}"
     response = await project_client.patch(
-        path, json={"tags": [{"key": "needs-human", "value": "review"}], "status": "in_progress"}
+        path, json={"tags": [{"key": "needs-human", "value": "review"}], "stage_id": "in_progress"}
     )
     assert response.status_code == 200
-    assert (await project_client.get(base, params={"status": "in_progress", "limit": 1})).json()[
+    assert (await project_client.get(base, params={"stage_id": "in_progress", "limit": 1})).json()[
         "data"
     ][0]["id"] == ticket["id"]
-    assert (await project_client.patch(path, json={"status": "done"})).status_code == 422
+    assert (await project_client.patch(path, json={"stage_id": "done"})).status_code == 400
     comment = await project_client.post(
         path + "/comments",
         json={
@@ -252,7 +253,7 @@ async def test_board_api_lifecycle_and_no_deletion(project_client):
         "url": "https://git.example.com/org/repo/pull/42",
     }
     completed = await project_client.patch(
-        path, json={"status": "done", "completion_summary": "Tests passed"}
+        path, json={"stage_id": "done", "completion_summary": "Tests passed"}
     )
     assert completed.json()["completion_summary"] == "Tests passed"
     assert (await project_client.delete(path)).status_code in (404, 405)
@@ -264,6 +265,86 @@ async def test_board_api_lifecycle_and_no_deletion(project_client):
             path + "/comments", json={"text": "Hi", "notify_orchestrator": False}
         )
     ).status_code == 422
+
+
+async def test_custom_stage_api_and_ticket_tools_share_real_project_definitions(project_client):
+    from omnigent.runner.project_tickets import execute_ticket_tool
+
+    project = (await project_client.post("/v1/projects", json={"name": "Response"})).json()
+    base = f"/v1/projects/{project['id']}/tickets"
+    stages = await project_client.get(base + "/stages")
+    assert stages.status_code == 200 and stages.json()["initial_stage_id"] == "open"
+    ticket = (await project_client.post(base, json={"title": "Investigate"})).json()
+    configuration = {
+        "stages": [
+            {"id": "triage", "name": "New"},
+            {"id": "verifying", "name": "Verifying", "instructions": "Attach recovery evidence"},
+            {"id": "resolved", "name": "Resolved", "is_complete": True},
+        ],
+        "initial_stage_id": "triage",
+        "moves": {"open": "triage"},
+    }
+    response = await project_client.put(base + "/stages", json=configuration)
+    assert response.status_code == 200, response.text
+    assert (await project_client.get(base + "/stages", params={"include_usage": True})).json()[
+        "occupied_stage_ids"
+    ] == ["triage"]
+    assert (await project_client.get(f"{base}/{ticket['id']}")).json()["stage_id"] == "triage"
+    assert (await project_client.post(base, json={"title": "Next"})).json()["stage_id"] == "triage"
+    source = project["orchestrator_session_id"]
+    listed = json.loads(await execute_ticket_tool("sys_ticket_list", {}, project_client, source))
+    assert listed["stages"] == response.json()["stages"]
+    detail = json.loads(
+        await execute_ticket_tool(
+            "sys_ticket_get", {"ticket_id": ticket["id"]}, project_client, source
+        )
+    )
+    assert detail["stages"][1]["instructions"] == "Attach recovery evidence"
+    moved = json.loads(
+        await execute_ticket_tool(
+            "sys_ticket_update",
+            {
+                "ticket_id": ticket["id"],
+                "stage_id": "verifying",
+                "review_summary": "Recovery looks good",
+            },
+            project_client,
+            source,
+        )
+    )
+    assert moved["stage_id"] == "verifying"
+    rejected = json.loads(
+        await execute_ticket_tool(
+            "sys_ticket_update",
+            {"ticket_id": ticket["id"], "stage_id": "resolved"},
+            project_client,
+            source,
+        )
+    )
+    assert "completion summary" in rejected["detail"]
+    completed = json.loads(
+        await execute_ticket_tool(
+            "sys_ticket_update",
+            {
+                "ticket_id": ticket["id"],
+                "stage_id": "resolved",
+                "completion_summary": "Evidence attached",
+            },
+            project_client,
+            source,
+        )
+    )
+    assert completed["stage_id"] == "resolved"
+    assert completed["review_summary"] == "Recovery looks good"
+    for invalid in (
+        {**configuration, "initial_stage_id": "resolved"},
+        {**configuration, "stages": []},
+    ):
+        assert (await project_client.put(base + "/stages", json=invalid)).status_code == 422
+    assert (
+        await project_client.patch(f"{base}/{ticket['id']}", json={"stage_id": "foreign"})
+    ).status_code == 400
+    assert (await project_client.get(base, params={"stage_id": "foreign"})).status_code == 400
 
 
 async def test_agent_source_is_project_scoped_owned_bound_and_private(multi_user_client, db_uri):
@@ -286,9 +367,22 @@ async def test_agent_source_is_project_scoped_owned_bound_and_private(multi_user
     ticket_id = response.json()["id"]
     events = (await client.get(f"{path}/{ticket_id}/events", headers=headers)).json()["data"]
     assert events[0]["session_id"] == source.id and events[0]["user_id"] == ALICE
+    stages = (await client.get(path + "/stages", headers=headers)).json()
+    assert (await client.put(path + "/stages", json=stages, headers=headers)).status_code == 200
     assert (await client.get(path, headers=_as_user(BOB))).status_code == 404
+    assert (await client.get(path + "/stages", headers=_as_user(BOB))).status_code == 404
+    assert (
+        await client.put(path + "/stages", json=stages, headers=_as_user(BOB))
+    ).status_code == 404
     assert (
         await client.get(path, headers={**_as_user(ALICE), ORCHESTRATION_SOURCE_HEADER: source.id})
+    ).status_code == 403
+    assert (
+        await client.put(
+            path + "/stages",
+            json=stages,
+            headers={**_as_user(ALICE), ORCHESTRATION_SOURCE_HEADER: source.id},
+        )
     ).status_code == 403
     other = (
         await client.post("/v1/projects", json={"name": "Other"}, headers=_as_user(ALICE))
@@ -296,12 +390,19 @@ async def test_agent_source_is_project_scoped_owned_bound_and_private(multi_user
     assert (
         await client.get(f"/v1/projects/{other['id']}/tickets", headers=headers)
     ).status_code == 403
+    assert (
+        await client.put(
+            f"/v1/projects/{other['id']}/tickets/stages", json=stages, headers=headers
+        )
+    ).status_code == 403
     permissions.ensure_user(BOB)
     permissions.grant(BOB, source.id, LEVEL_EDIT)
     assert (await client.get(path, headers=headers)).status_code == 403
     assert (
         await client.post(path, json={"title": "Shared writer"}, headers=headers)
     ).status_code == 403
+    assert (await client.get(path + "/stages", headers=headers)).status_code == 403
+    assert (await client.put(path + "/stages", json=stages, headers=headers)).status_code == 403
 
 
 async def test_links_require_same_project_and_preserve_history(project_client, db_uri):
@@ -337,7 +438,7 @@ async def test_links_require_same_project_and_preserve_history(project_client, d
         "involvement"
     ] == "Build the plan"
     await store.delete_conversation(source.id)
-    assert (await project_client.get(path)).json()["status"] == "open"
+    assert (await project_client.get(path)).json()["stage_id"] == "open"
     assert len((await project_client.get(path + "/events")).json()["data"]) == 3
 
 
@@ -348,18 +449,21 @@ async def test_lifecycle_related_links_and_lead_api(project_client, db_uri):
     related = (await project_client.post(base, json={"title": "Related work"})).json()
     path, other_path = f"{base}/{ticket['id']}", f"{base}/{related['id']}"
     planned = await project_client.patch(
-        path, json={"status": "planning", "plan": "## Plan\n\n- Acceptance"}
+        path, json={"stage_id": "planning", "plan": "## Plan\n\n- Acceptance"}
     )
     assert planned.status_code == 200 and planned.json()["plan"].startswith("## Plan")
-    assert (await project_client.patch(path, json={"status": "review"})).status_code == 422
+    assert (await project_client.patch(path, json={"stage_id": "review"})).status_code == 200
     review = await project_client.patch(
-        path, json={"status": "review", "review_summary": "Verify the demo"}
+        path, json={"stage_id": "review", "review_summary": "Verify the demo"}
     )
     assert review.status_code == 200
     changed = await project_client.patch(
-        path, json={"status": "in_progress", "comment": "Adjust the layout"}
+        path, json={"stage_id": "in_progress", "comment": "Adjust the layout"}
     )
-    assert changed.json()["review_summary"] == "" and changed.json()["comment_count"] == 1
+    assert (
+        changed.json()["review_summary"] == "Verify the demo"
+        and changed.json()["comment_count"] == 1
+    )
     for source, target in ((path, related["id"]), (other_path, ticket["id"])):
         assert (
             await project_client.post(source + "/related", json={"related_ticket_id": target})

@@ -43,40 +43,47 @@ Do not enter a native planning mode that requires blocking this session for appr
 
 ## Ticket lifecycle
 
-Use one status: **Open → Planning → Working → Review → Done**. The API values
-are `open`, `planning`, `in_progress`, `review`, `done`; existing `in_progress`
-means Working. Phases describe the work, not whether a session is currently
-running. `needs-human` is an independent tag, not another phase.
+Read the project's current ordered `stages` and `initial_stage_id` from
+`sys_ticket_list` or `sys_ticket_get`, including on an empty board. Select
+`stage_id` from those definitions; IDs stay stable when names change. Follow
+the selected stage's optional instructions within the user's authorized scope.
+Use `is_complete`, never a name such as "Done", to recognize completed work.
+Refresh the definitions after a rejected move: stages can change while you work.
+
+The defaults are **Open → Planning → Working → Review → Done**, but projects
+can rename, reorder, add or remove them. A project might instead use
+New → Investigating → Mitigating → Verifying → Resolved. Stages describe work,
+not whether a session is running. `needs-human` is an independent tag, meaningful
+in any stage, including a completed one. A stage change never clears it.
 If the advertised tools/schema do not yet support a field below, explain the
 upgrade limitation; don't invent tool arguments or claim unpersisted transitions.
 Record unavailable metadata in comments while using supported fields.
 
-- **Open:** captured but not started; a title is enough.
-- **Planning:** investigate the approach and acceptance criteria. Save the
-  current agreement in `plan`, not only in agent chat. Resolve routine choices
-  independently; ask only for information, preferences or authority genuinely
-  needed after investigation. Skip this phase for an obvious task, recording
-  the approach and what counts as done without a ceremonial planning turn.
-- **Working:** implement and perform objective verification. Move here when
-  execution starts, not merely because a discovery session was created.
-- **Review:** ready for human acceptance. Add `needs-human` and save `review_summary`
-  describing delivered scope, checks performed, limitations and exact human
-  review steps. Append permitted screenshots, demos, reports and PRs as output
-  links. Choose useful evidence during planning so workers prepare it as they
-  work. Missing tools or capture permission must remain explicit limitations;
-  review does not authorize browser use, uploads or other external actions.
-- **Done:** the agreed outcome is delivered and verified, including requested
-  human acceptance. Supply `completion_summary`; a PR or ended session alone
-  is insufficient. Merge/deployment is required only if part of the outcome.
+- A title is enough to capture work in the project's starting stage.
+- Planning is optional content, not a column requirement. Save the approach
+  and acceptance criteria in `plan` when useful. Resolve routine choices
+  independently; workers ask only for information or authority genuinely needed.
+- Human review is optional content, independent of a stage named Review.
+  Save `review_summary` with delivered scope, checks, limitations and exact
+  human review steps, then add `needs-human` if a response is needed. Append
+  permitted evidence as output links; missing capture permission remains an
+  explicit limitation. Preserve earlier briefs when moving stages.
+- Enter an `is_complete` stage only when the agreed outcome is delivered and
+  verified, including any requested human acceptance. Supply `completion_summary`;
+  a PR or ended session alone is insufficient. Merge/deployment is required only
+  if part of the outcome. Existing completion text is retained when reopening,
+  but a new completion move requires a fresh explicit summary.
 
-Default to human Review for subjective results, substantial UX changes, or
+Default to human review for subjective results, substantial UX changes, or
 completeness requiring human judgment. Skip only when the outcome is unambiguous
 and objectively verified; record why in an execution update or completion
 summary. Passing tests alone does not establish look and feel. Explicit approval
 gates always apply. Once review is requested, silence is not acceptance: wait for
 the human's action or explicit acceptance in chat and record that decision.
-Feedback returns the ticket to Working with a comment (or Planning for a changed
-approach). `sys_ticket_update` can append `comment` atomically with the change.
+Choose an appropriate unfinished stage for feedback or a changed approach;
+do not assume that Working or Planning exists. `sys_ticket_update` can append
+`comment` atomically with the change. Stage instructions describe work; they
+never authorize execution on entry, satisfy approval gates, or bypass prompts.
 Clear `needs-human` only when its request is resolved.
 
 ## Capture the work
@@ -125,10 +132,11 @@ different defaults. One worker can own a whole ticket; split only independent
 work with clear ownership. If creation is uncertain, check `sys_session_list`
 before launching another copy.
 
-Give the worker the ticket ID, current phase, goal, relevant context,
+Give the worker the ticket ID, current stage ID and definitions, goal, relevant context,
 repository/workspace, acceptance criteria and authorized scope. Include the
 lifecycle rules above, review evidence expected, and any approval-before-work
-gate. It does not see this conversation. Tell it to read/update the ticket,
+gate. It does not see this conversation. Tell it to read the current definitions
+with `sys_ticket_get`, follow the stage's instructions within scope, update the ticket,
 append progress and outputs, and report results or blockers to your session ID
 with `sys_session_message`.
 The worker executes its assignment; it does not inherit your orchestrator role.
@@ -183,8 +191,8 @@ updates and worker reports promptly between checks.
 ## Follow through
 
 - Verify the result against the ticket's outcome. A worker ending is not
-  completion. Mark `done` only when the work is finished, with a
-  `completion_summary`; otherwise keep it open or in progress and arrange the
+  completion. Select a stage with `is_complete=true` only when the work is finished,
+  with a `completion_summary`; otherwise keep it in an unfinished stage and arrange the
   next action. Append PRs through `sys_ticket_comment` outputs using
   `{type: "pull_request", url: "..."}`.
 - Resolve worker questions from available context and authorization. When a

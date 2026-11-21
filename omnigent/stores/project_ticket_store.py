@@ -27,16 +27,20 @@ from omnigent.db.utils import (
 )
 from omnigent.entities.project_ticket import (
     EVENT_CODES,
+    LEGACY_STATUS_CODES,
     NOTIFICATION_PENDING,
     NOTIFICATION_QUEUED,
     NOTIFICATION_SKIPPED,
-    STATUS_CODES,
-    STATUS_LABELS,
+    STAGE_EDIT_TICKET_MAX,
     TICKET_PAGE_MAX,
     CommentOnTicket,
     CreateTicket,
     TicketActor,
+    TicketStage,
+    TicketStages,
     UpdateTicket,
+    UpdateTicketStages,
+    default_ticket_stages,
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
@@ -49,13 +53,38 @@ def _identifier(value: str) -> str:
         raise OmnigentError("Ticket or project not found", code=ErrorCode.NOT_FOUND) from exc
 
 
+def _stage_id(row: SqlProjectTicket) -> str:
+    return row.stage_id or next(
+        key for key, value in LEGACY_STATUS_CODES.items() if value == row.status
+    )
+
+
+def _stages(project: SqlProject) -> TicketStages:
+    return (
+        TicketStages.model_validate(project.ticket_stages)
+        if project.ticket_stages is not None
+        else default_ticket_stages()
+    )
+
+
+def _stage(configuration: TicketStages, stage_id: str) -> TicketStage:
+    for stage in configuration.stages:
+        if stage.id == stage_id:
+            return stage
+    raise OmnigentError("Stage does not belong to this project", code=ErrorCode.INVALID_INPUT)
+
+
+def _stage_snapshot(stage: TicketStage) -> dict[str, Any]:
+    return stage.model_dump(exclude={"instructions"})
+
+
 def _ticket(row: SqlProjectTicket) -> dict[str, Any]:
     return {
         "id": row.id,
         "project_id": row.project_id,
         "title": row.title,
         "description": row.description,
-        "status": next(key for key, value in STATUS_CODES.items() if value == row.status),
+        "stage_id": _stage_id(row),
         "tags": row.tags,
         "completion_summary": row.completion_summary,
         "plan": row.plan or "",
@@ -158,6 +187,8 @@ class ProjectTicketStore:
     def create(self, project_id: str, body: CreateTicket, actor: TicketActor) -> dict[str, Any]:
         def write(session: Session) -> dict[str, Any]:
             project = self._project(session, project_id, actor.user_id, write=True)
+            configuration = _stages(project)
+            stage = _stage(configuration, configuration.initial_stage_id)
             now = now_epoch()
             row = SqlProjectTicket(
                 workspace_id=current_workspace_id(),
@@ -165,7 +196,8 @@ class ProjectTicketStore:
                 id=uuid.uuid4().hex,
                 title=body.title,
                 description=body.description,
-                status=STATUS_CODES["open"],
+                status=LEGACY_STATUS_CODES.get(stage.id, 0),
+                stage_id=stage.id,
                 tags=[tag.model_dump(exclude_none=True) for tag in body.tags],
                 completion_summary=None,
                 latest_update="Created the ticket",
@@ -176,7 +208,12 @@ class ProjectTicketStore:
             )
             session.add(row)
             self._append(
-                session, project, row, actor, "created", body.model_dump(exclude_none=True)
+                session,
+                project,
+                row,
+                actor,
+                "created",
+                {**body.model_dump(exclude_none=True), "stage": _stage_snapshot(stage)},
             )
             return _ticket(row)
 
@@ -192,41 +229,173 @@ class ProjectTicketStore:
         project_id: str,
         *,
         user_id: str | None,
-        status: str | None = None,
+        stage_id: str | None = None,
         after: str | None = None,
         limit: int = 50,
     ) -> dict[str, Any]:
         limit = max(1, min(limit, TICKET_PAGE_MAX))
         with self._session("list_tickets") as session:
-            self._project(session, project_id, user_id)
-            stmt = select(SqlProjectTicket).where(
-                SqlProjectTicket.workspace_id == current_workspace_id(),
-                SqlProjectTicket.project_id == _identifier(project_id),
+            project = self._project(session, project_id, user_id)
+            configuration = _stages(project)
+            if stage_id is not None:
+                _stage(configuration, stage_id)
+            rows = self._stage_rows(
+                session,
+                project,
+                stage_id,
+                after=self._row(session, project_id, after) if after is not None else None,
+                limit=limit + 1,
             )
-            if status is not None:
-                stmt = stmt.where(SqlProjectTicket.status == STATUS_CODES[status])
-            if after is not None:
-                cursor = self._row(session, project_id, after)
-                stmt = stmt.where(
-                    keyset_after(
-                        self._dialect_name,
-                        (SqlProjectTicket.created_at, SqlProjectTicket.id),
-                        (cursor.created_at, cursor.id),
-                    )
-                )
-            index = (
-                "ix_project_tickets_status" if status is not None else "ix_project_tickets_created"
-            )
-            rows = session.scalars(
-                stmt.with_hint(SqlProjectTicket, f"FORCE INDEX ({index})", "mysql")
-                .order_by(SqlProjectTicket.created_at, SqlProjectTicket.id)
-                .limit(limit + 1)
-            ).all()
             return {
+                **configuration.model_dump(),
                 "data": [_ticket(row) for row in rows[:limit]],
                 "has_more": len(rows) > limit,
                 "last_id": rows[min(limit, len(rows)) - 1].id if rows else None,
             }
+
+    def _stage_rows(
+        self,
+        session: Session,
+        project: SqlProject,
+        stage_id: str | None,
+        *,
+        limit: int,
+        after: SqlProjectTicket | None = None,
+        write: bool = False,
+    ) -> builtins.list[SqlProjectTicket]:
+        stmt = select(SqlProjectTicket).where(
+            SqlProjectTicket.workspace_id == project.workspace_id,
+            SqlProjectTicket.project_id == project.id,
+        )
+        if after is not None:
+            stmt = stmt.where(
+                keyset_after(
+                    self._dialect_name,
+                    (SqlProjectTicket.created_at, SqlProjectTicket.id),
+                    (after.created_at, after.id),
+                )
+            )
+        stmt = stmt.order_by(SqlProjectTicket.created_at, SqlProjectTicket.id).limit(limit)
+        if write:
+            stmt = stmt.with_for_update()
+        queries = [(stmt, "ix_project_tickets_created")]
+        if stage_id is not None:
+            queries = [
+                (stmt.where(SqlProjectTicket.stage_id == stage_id), "ix_project_tickets_stage")
+            ]
+            if stage_id in LEGACY_STATUS_CODES:
+                queries.append(
+                    (
+                        stmt.where(
+                            SqlProjectTicket.stage_id.is_(None),
+                            SqlProjectTicket.status == LEGACY_STATUS_CODES[stage_id],
+                        ),
+                        "ix_project_tickets_legacy_stage",
+                    )
+                )
+        # Merge disjoint indexed streams, avoiding COALESCE or a project scan.
+        rows = [
+            row
+            for query, index in queries
+            for row in session.scalars(
+                query.with_hint(SqlProjectTicket, f"FORCE INDEX ({index})", "mysql")
+            )
+        ]
+        return sorted(rows, key=lambda row: (row.created_at, row.id))[:limit]
+
+    def stages(
+        self, project_id: str, *, user_id: str | None, include_usage: bool = False
+    ) -> dict[str, Any]:
+        with self._session("get_ticket_stages") as session:
+            project = self._project(session, project_id, user_id)
+            configuration = _stages(project)
+            result = configuration.model_dump()
+            if include_usage:
+                result["occupied_stage_ids"] = [
+                    stage.id
+                    for stage in configuration.stages
+                    if self._stage_rows(session, project, stage.id, limit=1)
+                ]
+            return result
+
+    def update_stages(
+        self, project_id: str, body: UpdateTicketStages, actor: TicketActor
+    ) -> dict[str, Any]:
+        configuration = TicketStages(stages=body.stages, initial_stage_id=body.initial_stage_id)
+
+        def write(session: Session) -> dict[str, Any]:
+            project = self._project(session, project_id, actor.user_id, write=True)
+            before = {stage.id: stage for stage in _stages(project).stages}
+            after = {stage.id: stage for stage in configuration.stages}
+            removed = before.keys() - after.keys()
+            if body.moves.keys() - removed:
+                raise OmnigentError(
+                    "Move sources must be existing removed stages", code=ErrorCode.INVALID_INPUT
+                )
+            newly_complete = {
+                stage_id
+                for stage_id in before.keys() & after.keys()
+                if after[stage_id].is_complete and not before[stage_id].is_complete
+            }
+            affected: list[SqlProjectTicket] = []
+            for stage_id in sorted(removed | newly_complete):
+                rows = self._stage_rows(
+                    session,
+                    project,
+                    stage_id,
+                    limit=STAGE_EDIT_TICKET_MAX - len(affected) + 1,
+                    write=True,
+                )
+                affected.extend(rows)
+                if len(affected) > STAGE_EDIT_TICKET_MAX:
+                    raise OmnigentError(
+                        f"This edit affects more than {STAGE_EDIT_TICKET_MAX} tickets. "
+                        "Move tickets in smaller groups before changing these stages.",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                if rows and stage_id in removed and stage_id not in body.moves:
+                    raise OmnigentError(
+                        f"{before[stage_id].name} contains tickets. "
+                        "Choose a surviving stage for them.",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                target_id = body.moves.get(stage_id, stage_id)
+                if (
+                    rows
+                    and after[target_id].is_complete
+                    and any(not (row.completion_summary or "").strip() for row in rows)
+                ):
+                    raise OmnigentError(
+                        "Tickets entering a completed stage need completion summaries. "
+                        "Complete them individually or choose an unfinished stage.",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+            project.ticket_stages = configuration.model_dump()
+            project.updated_at = now_epoch()
+            for row in affected:
+                previous = before[_stage_id(row)]
+                if previous.id not in removed:
+                    continue
+                target = after[body.moves[previous.id]]
+                row.stage_id = target.id
+                row.status = LEGACY_STATUS_CODES.get(target.id, 2 if target.is_complete else 0)
+                row.latest_update = f"Moved to {target.name} (stage removed)"
+                self._append(
+                    session,
+                    project,
+                    row,
+                    actor,
+                    "updated",
+                    {
+                        "changes": {"stage_id": target.id},
+                        "stage": _stage_snapshot(target),
+                        "previous_stage": _stage_snapshot(previous),
+                        "reason": "stage_removed",
+                    },
+                )
+            return configuration.model_dump()
+
+        return run_write_transaction(self._write, "update_ticket_stages", write)
 
     def update(
         self, project_id: str, ticket_id: str, body: UpdateTicket, actor: TicketActor
@@ -240,6 +409,12 @@ class ProjectTicketStore:
         def write(session: Session) -> dict[str, Any]:
             project = self._project(session, project_id, actor.user_id, write=True)
             row = self._row(session, project_id, ticket_id, write=True)
+            target = _stage(_stages(project), body.stage_id) if body.stage_id is not None else None
+            if target is not None and target.is_complete and not body.completion_summary:
+                raise OmnigentError(
+                    "Entering a completed stage requires a completion summary",
+                    code=ErrorCode.INVALID_INPUT,
+                )
             lead = changes.get("lead_session_id")
             if (
                 lead is not None
@@ -253,22 +428,23 @@ class ProjectTicketStore:
                     code=ErrorCode.INVALID_INPUT,
                 )
             for key, value in changes.items():
-                setattr(row, key, STATUS_CODES[value] if key == "status" else value)
-            if body.status is not None and body.status != "done":
-                row.completion_summary = None
-            if body.status not in (None, "review", "done"):
-                row.review_summary = None
+                setattr(row, key, value)
+            if target is not None:
+                row.status = LEGACY_STATUS_CODES.get(target.id, 2 if target.is_complete else 0)
             if changes:
                 row.latest_update = (
                     body.completion_summary
                     or body.review_summary
-                    or (
-                        f"Moved to {STATUS_LABELS[body.status]}"
-                        if body.status
-                        else "Updated the ticket"
-                    )
+                    or (f"Moved to {target.name}" if target is not None else "Updated the ticket")
                 )[:300]
-                self._append(session, project, row, actor, "updated", {"changes": changes})
+                self._append(
+                    session,
+                    project,
+                    row,
+                    actor,
+                    "updated",
+                    {"changes": changes, **({"stage": _stage_snapshot(target)} if target else {})},
+                )
             if body.comment:
                 self._append(session, project, row, actor, "comment", {"text": body.comment})
                 row.comment_count += 1

@@ -42,6 +42,22 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => {
 
 vi.mock("@/components/ProjectIconPicker", () => ({ ProjectLandingIcon: () => null }));
 
+vi.mock("./ProjectTicketStagesDialog", () => ({
+  ProjectTicketStagesDialog: ({
+    projectName,
+    onClose,
+  }: {
+    projectName: string;
+    onClose: () => void;
+  }) => (
+    <div role="dialog" aria-label={`Edit ${projectName} stages`}>
+      <button type="button" onClick={onClose}>
+        Close editor
+      </button>
+    </div>
+  ),
+}));
+
 vi.mock("@/shell/Sidebar", () => ({
   useProjectFolderMenu: (...args: unknown[]) => {
     mocks.menuArgs = args;
@@ -72,14 +88,18 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("ProjectHomeTitle", () => {
-  function renderTitle() {
+  function renderTitle(stagesEnabled = false) {
     render(
-      <MemoryRouter initialEntries={["/projects/Payments"]}>
-        <TooltipProvider>
-          <ProjectHomeTitle projectName="Payments" />
-        </TooltipProvider>
-        <LocationProbe />
-      </MemoryRouter>,
+      <CapabilitiesProvider
+        info={{ ...FALLBACK_SERVER_INFO, project_ticket_stages: stagesEnabled }}
+      >
+        <MemoryRouter initialEntries={["/projects/Payments"]}>
+          <TooltipProvider>
+            <ProjectHomeTitle projectName="Payments" />
+          </TooltipProvider>
+          <LocationProbe />
+        </MemoryRouter>
+      </CapabilitiesProvider>,
     );
   }
 
@@ -114,6 +134,17 @@ describe("ProjectHomeTitle", () => {
 
     act(() => onDeleted());
     expect(screen.getByTestId("location")).toHaveTextContent(/^\/$/);
+  });
+
+  it("opens the project stage editor from the menu when supported", () => {
+    renderTitle(true);
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Project actions for Payments" }), {
+      button: 0,
+    });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Edit stages" }));
+    expect(screen.getByRole("dialog", { name: "Edit Payments stages" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Close editor" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
   });
 
   it("hides the title and moves the project actions beside New session on phones", () => {

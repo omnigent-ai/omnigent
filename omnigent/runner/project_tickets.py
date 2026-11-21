@@ -68,13 +68,20 @@ async def execute_ticket_tool(
             related_params = {"limit": body["limit"]}
             if related_after is not None:
                 related_params["after"] = related_after
-            ticket, events, sessions, related = await asyncio.gather(
+            ticket, events, sessions, related, stages = await asyncio.gather(
                 request("GET", path),
                 request("GET", path + "/events", params=body),
                 request("GET", path + "/sessions", params=session_params),
                 request("GET", path + "/related", params=related_params),
+                request("GET", f"/v1/projects/{project_id}/tickets/stages"),
             )
-            result = {"ticket": ticket, "events": events, "sessions": sessions, "related": related}
+            result = {
+                "ticket": ticket,
+                "events": events,
+                "sessions": sessions,
+                "related": related,
+                **stages,
+            }
         else:
             method, suffix = {
                 "sys_ticket_create": ("POST", ""),

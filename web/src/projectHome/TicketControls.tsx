@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import {
   CircleCheckIcon,
   CircleDashedIcon,
@@ -18,27 +18,27 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Textarea } from "@/components/ui/textarea";
-import type { TicketStatus, TicketTag } from "@/lib/projectTicketsApi";
+import type { TicketStage, TicketTag } from "@/lib/projectTicketsApi";
 import { cn } from "@/lib/utils";
 
-export function TicketStatusIcon({ status }: { status: TicketStatus }) {
-  const Icon = {
+export function TicketStageIcon({ stage }: { stage?: TicketStage | null }) {
+  const icons: Record<string, typeof CircleDashedIcon> = {
     open: CircleDashedIcon,
     planning: ClipboardListIcon,
     in_progress: CircleDotIcon,
     review: EyeIcon,
-    done: CircleCheckIcon,
-  }[status];
+  };
+  const Icon = stage?.is_complete ? CircleCheckIcon : (icons[stage?.id ?? ""] ?? CircleDotIcon);
   return (
     <Icon
       aria-hidden
       className={cn(
         "size-3.5 shrink-0",
-        status === "done"
+        stage?.is_complete
           ? "text-success"
-          : status === "review"
+          : stage?.id === "review"
             ? "text-warning"
-            : status === "in_progress" || status === "planning"
+            : stage?.id !== "open"
               ? "text-session-active"
               : "text-muted-foreground",
       )}
@@ -83,20 +83,60 @@ export function CompleteTicketDialog({
   error,
   approving = false,
   initialSummary = "",
-}: TicketDialogProps & { approving?: boolean }) {
+  stages,
+  initialStageId,
+}: Omit<TicketDialogProps, "onComplete"> & {
+  approving?: boolean;
+  stages: TicketStage[];
+  initialStageId?: string;
+  onComplete: (summary: string, stageId: string) => void;
+}) {
+  const [stageId, setStageId] = useState(
+    initialStageId ?? stages.find((candidate) => candidate.is_complete)?.id ?? "",
+  );
+  const stage = stages.find((candidate) => candidate.id === stageId && candidate.is_complete);
   return (
     <TicketTextDialog
       title={title}
       onClose={onClose}
-      onComplete={onComplete}
+      onComplete={(summary) => {
+        if (stage) onComplete(summary, stage.id);
+      }}
       pending={pending}
       error={error}
       initialSummary={initialSummary}
-      heading={approving ? "Approve & mark done" : "Mark ticket done"}
+      heading={approving ? "Approve & complete" : "Complete ticket"}
       label="Completion summary"
-      submitLabel={approving ? "Approve & mark done" : "Mark done"}
+      submitLabel={approving ? "Approve & complete" : "Complete ticket"}
       placeholder="What was delivered and verified?"
-    />
+      disabled={!stage}
+    >
+      <label className="grid gap-2 text-sm">
+        Completed stage
+        <select
+          aria-label="Completed stage"
+          value={stage ? stageId : ""}
+          disabled={pending}
+          className="h-9 rounded-md border bg-background px-2"
+          onChange={(event) => setStageId(event.target.value)}
+        >
+          <option value="" disabled>
+            Choose a completed stage…
+          </option>
+          {stages
+            .filter((candidate) => candidate.is_complete)
+            .map((candidate) => (
+              <option key={candidate.id} value={candidate.id}>
+                {candidate.name}
+              </option>
+            ))}
+        </select>
+      </label>
+      <p className="text-xs text-muted-foreground">
+        This updates the ticket only. Needs response stays unchanged; answer open agent prompts in
+        their own chat.
+      </p>
+    </TicketTextDialog>
   );
 }
 
@@ -146,12 +186,16 @@ function TicketTextDialog({
   submitLabel,
   placeholder,
   maxLength = 1500,
+  children,
+  disabled = false,
 }: TicketDialogProps & {
   heading: string;
   label: string;
   submitLabel: string;
   placeholder: string;
   maxLength?: number;
+  children?: ReactNode;
+  disabled?: boolean;
 }) {
   const [summary, setSummary] = useState(initialSummary);
   return (
@@ -165,7 +209,7 @@ function TicketTextDialog({
         <form
           onSubmit={(event) => {
             event.preventDefault();
-            if (pending || !summary.trim()) return;
+            if (pending || disabled || !summary.trim()) return;
             onComplete(summary.trim());
           }}
           className="space-y-4"
@@ -174,6 +218,7 @@ function TicketTextDialog({
             <DialogTitle>{heading}</DialogTitle>
             <DialogDescription>{title}</DialogDescription>
           </DialogHeader>
+          {children}
           <label className="grid gap-2 text-sm">
             {label}
             <Textarea
@@ -192,7 +237,7 @@ function TicketTextDialog({
             <Button type="button" variant="ghost" disabled={pending} onClick={onClose}>
               Cancel
             </Button>
-            <Button type="submit" loading={pending} disabled={!summary.trim()}>
+            <Button type="submit" loading={pending} disabled={disabled || !summary.trim()}>
               {submitLabel}
             </Button>
           </DialogFooter>

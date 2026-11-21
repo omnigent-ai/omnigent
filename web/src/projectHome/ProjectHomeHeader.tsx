@@ -6,10 +6,11 @@ import {
   PencilIcon,
   SearchIcon,
   Settings2Icon,
+  Columns3Icon,
   Trash2Icon,
   XIcon,
 } from "lucide-react";
-import { useRef } from "react";
+import { useRef, useState } from "react";
 import { create } from "zustand";
 import { ProjectLandingIcon } from "@/components/ProjectIconPicker";
 import { Button } from "@/components/ui/button";
@@ -31,7 +32,8 @@ import { MOBILE_GLASS_SURFACE } from "@/shell/mobileGlass";
 import { SessionMenuHeader } from "@/shell/SessionMenuHeader";
 import { useProjectFolderMenu } from "@/shell/Sidebar";
 import { projectHomePath } from "./projectHomeNavigation";
-import { useProjectTicketsEnabled } from "./useProjectTickets";
+import { useProjectTicketsEnabled, useTicketStagesEnabled } from "./useProjectTickets";
+import { ProjectTicketStagesDialog } from "./ProjectTicketStagesDialog";
 
 interface ProjectComposerState {
   open: boolean;
@@ -120,6 +122,8 @@ export function ProjectHomeHeaderActions({ projectName }: { projectName: string 
 
 /** Project settings, plus an overflow menu to rename or delete the project. */
 function ProjectHomeActions({ projectName }: { projectName: string }) {
+  const stagesEnabled = useTicketStagesEnabled();
+  const [editingStagesFor, setEditingStagesFor] = useState<string | null>(null);
   const isMobile = useIsMobileViewport();
   const navigate = useNavigate();
   const { projectId, config } = useProjectHomeConfig(projectName);
@@ -179,6 +183,15 @@ function ProjectHomeActions({ projectName }: { projectName: string }) {
           onCloseAutoFocus={actions.onCloseAutoFocus}
         >
           {isMobile && <SessionMenuHeader title={projectName} />}
+          {stagesEnabled && (
+            <DropdownMenuItem
+              className={itemClass}
+              onSelect={() => setEditingStagesFor(projectName)}
+            >
+              <Columns3Icon className="size-3.5" />
+              Edit stages
+            </DropdownMenuItem>
+          )}
           <DropdownMenuItem className={itemClass} onSelect={actions.openRename}>
             <PencilIcon className="size-3.5" />
             Rename project
@@ -195,6 +208,13 @@ function ProjectHomeActions({ projectName }: { projectName: string }) {
         </DropdownMenuContent>
       </DropdownMenu>
       {dialogs}
+      {editingStagesFor === projectName && (
+        <ProjectTicketStagesDialog
+          key={projectName}
+          projectName={projectName}
+          onClose={() => setEditingStagesFor(null)}
+        />
+      )}
     </div>
   );
 }

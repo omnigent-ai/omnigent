@@ -16,18 +16,13 @@ import { Spinner } from "@/components/ui/spinner";
 import { useNow } from "@/hooks/useNow";
 import { Link } from "@/lib/routing";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
-import {
-  TICKET_STATUSES,
-  TICKET_STATUS_LABELS,
-  type ProjectTicket,
-  type TicketStatus,
-} from "@/lib/projectTicketsApi";
+import type { ProjectTicket, TicketStage } from "@/lib/projectTicketsApi";
 import { cn } from "@/lib/utils";
 import {
   CompleteTicketDialog,
   ReviewTicketDialog,
   TicketError,
-  TicketStatusIcon,
+  TicketStageIcon,
   TicketTags,
 } from "./TicketControls";
 import { ProjectTicketSources } from "./ProjectTicketSources";
@@ -37,15 +32,14 @@ import {
   useTicketLifecycleEnabled,
   useTicketProject,
   useTickets,
-  useTicketStatuses,
+  useTicketStages,
 } from "./useProjectTickets";
 
-const STATUS_CLASS: Record<TicketStatus, string> = {
+const STAGE_CLASS: Record<string, string> = {
   open: "bg-muted text-muted-foreground",
   planning: "bg-session-active/10 text-session-active",
   in_progress: "bg-session-active/15 text-session-active",
   review: "bg-warning/15 text-warning",
-  done: "bg-success/15 text-success",
 };
 
 export function ProjectTicketBoard({
@@ -87,12 +81,15 @@ function TicketBoard({
   overlayClearance?: string;
 }) {
   const [dragged, setDragged] = useState<ProjectTicket | null>(null);
-  const [completing, setCompleting] = useState<ProjectTicket | null>(null);
+  const [completing, setCompleting] = useState<{ ticket: ProjectTicket; stageId: string } | null>(
+    null,
+  );
   const [reviewing, setReviewing] = useState<ProjectTicket | null>(null);
   const [hoveredId, setHoveredId] = useState<string | null>(null);
   const [focusedId, setFocusedId] = useState<string | null>(null);
   const lifecycle = useTicketLifecycleEnabled();
-  const statuses = useTicketStatuses();
+  const configuration = useTicketStages(projectId);
+  const stages = configuration.data?.stages ?? [];
   const related = useRelatedTickets(projectId, lifecycle ? (hoveredId ?? focusedId) : null);
   const { hasNextPage, isFetching, isError, fetchNextPage } = related;
   const relatedIds = new Set(
@@ -111,6 +108,13 @@ function TicketBoard({
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       <ProjectTicketSources key={projectName} projectId={projectId} projectName={projectName} />
       <TicketError error={completing || reviewing ? null : update.error} />
+      {configuration.isPending && <Spinner className="m-6" aria-label="Loading stages" />}
+      <TicketError error={configuration.error} />
+      {configuration.isError && (
+        <Button variant="ghost" onClick={() => void configuration.refetch()}>
+          Try again
+        </Button>
+      )}
       <DndContext
         sensors={sensors}
         onDragStart={({ active }) => setDragged(active.data.current?.ticket ?? null)}
@@ -122,13 +126,12 @@ function TicketBoard({
           const ticket = dragged;
           setDragged(null);
           dragEnded.current = Date.now();
-          const status = over?.id as TicketStatus | undefined;
-          if (!ticket || !status || !TICKET_STATUSES.includes(status) || ticket.status === status)
-            return;
+          const stage = stages.find((candidate) => candidate.id === over?.id);
+          if (!ticket || !stage || ticket.stage_id === stage.id) return;
           update.reset();
-          if (status === "done") setCompleting(ticket);
-          else if (status === "review") setReviewing(ticket);
-          else update.mutate({ id: ticket.id, changes: { status } });
+          if (stage.is_complete) setCompleting({ ticket, stageId: stage.id });
+          else if (!configuration.supported && stage.id === "review") setReviewing(ticket);
+          else update.mutate({ id: ticket.id, changes: { stage_id: stage.id } });
         }}
       >
         <div
@@ -137,10 +140,11 @@ function TicketBoard({
           data-testid="project-ticket-board"
           className="flex min-h-0 flex-1 gap-4 overflow-x-auto px-4 pt-1 pb-4"
         >
-          {statuses.map((status) => (
+          {stages.map((stage) => (
             <TicketColumn
-              key={status}
-              status={status}
+              key={stage.id}
+              stage={stage}
+              initial={stage.id === configuration.data?.initial_stage_id}
               projectId={projectId}
               selectedTicketId={selectedTicketId}
               dragging={dragged !== null}
@@ -163,22 +167,22 @@ function TicketBoard({
       </DndContext>
       {completing && (
         <CompleteTicketDialog
-          title={completing.title}
-          approving={completing.status === "review"}
+          title={completing.ticket.title}
+          stages={stages}
+          initialStageId={completing.stageId}
           onClose={() => {
             setCompleting(null);
             update.reset();
           }}
           pending={update.isPending}
           error={update.error}
-          onComplete={(summary) =>
+          onComplete={(summary, stageId) =>
             update.mutate(
               {
-                id: completing.id,
+                id: completing.ticket.id,
                 changes: {
-                  status: "done",
+                  stage_id: stageId,
                   completion_summary: summary,
-                  tags: completing.tags.filter((tag) => tag.key !== "needs-human"),
                 },
               },
               { onSuccess: () => setCompleting(null) },
@@ -201,7 +205,7 @@ function TicketBoard({
               {
                 id: reviewing.id,
                 changes: {
-                  status: "review",
+                  stage_id: "review",
                   review_summary: summary,
                   tags: reviewing.tags.some((tag) => tag.key === "needs-human")
                     ? reviewing.tags
@@ -219,7 +223,8 @@ function TicketBoard({
 
 function TicketColumn({
   projectId,
-  status,
+  stage,
+  initial,
   selectedTicketId,
   dragging,
   disabled,
@@ -230,7 +235,8 @@ function TicketColumn({
   onFocus,
 }: {
   projectId: string | null;
-  status: TicketStatus;
+  stage: TicketStage;
+  initial: boolean;
   selectedTicketId: string | null;
   dragging: boolean;
   disabled: boolean;
@@ -240,13 +246,13 @@ function TicketColumn({
   onHover: (id: string | null) => void;
   onFocus: (id: string | null) => void;
 }) {
-  const query = useTickets(projectId, status);
+  const query = useTickets(projectId, stage.id);
   const tickets = query.data?.pages.flatMap((page) => page.data) ?? [];
-  const { setNodeRef, isOver } = useDroppable({ id: status, disabled });
+  const { setNodeRef, isOver } = useDroppable({ id: stage.id, disabled });
   return (
     <section
       ref={setNodeRef}
-      aria-label={TICKET_STATUS_LABELS[status]}
+      aria-label={stage.name}
       className={cn(
         "flex min-w-60 flex-1 basis-0 flex-col rounded-xl border border-transparent bg-muted/30 px-2 pt-2 transition-colors",
         dragging && "border-dashed border-muted-foreground/50",
@@ -254,15 +260,30 @@ function TicketColumn({
       )}
     >
       <h2 className="flex shrink-0 items-center justify-between px-1.5 pt-1.5 pb-3 text-sm font-medium text-muted-foreground">
-        <Badge className={cn("border-transparent", STATUS_CLASS[status])}>
-          <TicketStatusIcon status={status} />
-          {TICKET_STATUS_LABELS[status]}
+        <Badge
+          className={cn(
+            "border-transparent",
+            stage.is_complete
+              ? "bg-success/15 text-success"
+              : (STAGE_CLASS[stage.id] ?? "bg-session-active/10 text-session-active"),
+          )}
+        >
+          <TicketStageIcon stage={stage} />
+          {stage.name}
         </Badge>
         <span className="tabular-nums">
           {tickets.length}
           {query.hasNextPage ? "+" : ""}
         </span>
       </h2>
+      {stage.instructions && (
+        <p
+          className="mb-2 line-clamp-2 px-1.5 text-xs text-muted-foreground"
+          title={stage.instructions}
+        >
+          {stage.instructions}
+        </p>
+      )}
       <div
         className="-mx-2 flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-2 pt-0.5 pb-2"
         style={{ paddingBottom: overlayClearance }}
@@ -300,7 +321,7 @@ function TicketColumn({
             Load more
           </Button>
         )}
-        {status === "open" && (
+        {initial && (
           <Button variant="ghost" asChild className="justify-start text-muted-foreground">
             <Link to="?ticket=new">
               <PlusIcon />

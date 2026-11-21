@@ -10,7 +10,7 @@ from omnigent.entities.project_ticket import (
     LinkRelatedTicket,
     TicketEventKind,
     TicketSessionLinkOptions,
-    TicketStatus,
+    TicketStageId,
     UpdateTicket,
 )
 from omnigent.tools.base import Tool
@@ -18,7 +18,9 @@ from omnigent.tools.base import Tool
 
 class ListTickets(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    status: TicketStatus | None = None
+    stage_id: TicketStageId | None = Field(
+        default=None, description="Filter by a stage ID from this project's definitions."
+    )
     after: str | None = Field(default=None, description="Previous page's last_id.")
     limit: int = Field(default=50, ge=1, le=100)
 
@@ -79,7 +81,11 @@ class _TicketTool(Tool):
 
 class SysTicketListTool(_TicketTool):
     tool_name = "sys_ticket_list"
-    help_text = "List tickets, oldest first. Use last_id as after while has_more is true."
+    help_text = (
+        "List tickets, oldest first, and this project's ordered stage definitions "
+        "(IDs, names, instructions, completion flags and initial_stage_id). Read these before "
+        "choosing a stage; do not assume fixed names. Use last_id as after while has_more is true."
+    )
     arguments = ListTickets
 
 
@@ -87,7 +93,8 @@ class SysTicketGetTool(_TicketTool):
     tool_name = "sys_ticket_get"
     help_text = (
         "Read a ticket, its plan/review brief/lead, and pages of activity, sessions "
-        "and related tickets. Use kind=output to read PRs and other links."
+        "and related tickets, plus the project's current stage definitions. "
+        "Use kind=output to read PRs and other links."
     )
     arguments = GetTicket
 
@@ -95,7 +102,7 @@ class SysTicketGetTool(_TicketTool):
 class SysTicketCreateTool(_TicketTool):
     tool_name = "sys_ticket_create"
     help_text = (
-        "Create an Open ticket; only title is required. "
+        "Create a ticket in the project's starting stage; only title is required. "
         "Tickets persist independently of sessions and cannot be deleted."
     )
     arguments = CreateTicket
@@ -104,12 +111,15 @@ class SysTicketCreateTool(_TicketTool):
 class SysTicketUpdateTool(_TicketTool):
     tool_name = "sys_ticket_update"
     help_text = (
-        "Edit a ticket; omit unchanged fields. Phases: open, planning, in_progress (Working), "
-        "review, done. Review requires review_summary; Done requires completion_summary. "
-        "Save the approach and acceptance criteria in plan. Set lead_session_id to an already "
+        "Edit a ticket; omit unchanged fields. Select stage_id from the current definitions in "
+        "sys_ticket_list or sys_ticket_get and follow its instructions within authorized scope. "
+        "A stage with is_complete=true requires completion_summary. Moving stages or following "
+        "stage instructions never grants approval or bypasses human/permission prompts. "
+        "Plan and review_summary are optional content independent of stages. "
+        "Set lead_session_id to an already "
         "linked session (null clears it). Optional comment is appended atomically. "
         "Tags replace the whole list: use needs-human plus a comment when a person must act, "
-        "and remove that tag when resolved."
+        "in any stage, and remove that tag only when its request is resolved."
     )
     arguments = EditTicket
 

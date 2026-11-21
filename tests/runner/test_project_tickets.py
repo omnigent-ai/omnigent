@@ -3,6 +3,7 @@ import json
 import httpx
 import pytest
 
+from omnigent.entities.project_ticket import default_ticket_stages
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runner.project_tickets import execute_ticket_tool
 from omnigent.tools.builtins.project_tickets import TICKET_TOOLS
@@ -15,7 +16,7 @@ TICKET = "c" * 32
 @pytest.mark.parametrize(
     "name,args,method,suffix,expected",
     [
-        ("sys_ticket_list", {"status": "open", "limit": 2}, "GET", "", None),
+        ("sys_ticket_list", {"stage_id": "open", "limit": 2}, "GET", "", None),
         (
             "sys_ticket_create",
             {"title": "Do it"},
@@ -76,20 +77,20 @@ TICKET = "c" * 32
             "sys_ticket_update",
             {
                 "ticket_id": TICKET,
-                "status": "planning",
+                "stage_id": "planning",
                 "plan": "Agreed scope",
                 "lead_session_id": SOURCE,
             },
             "PATCH",
             f"/{TICKET}",
-            {"status": "planning", "plan": "Agreed scope", "lead_session_id": SOURCE},
+            {"stage_id": "planning", "plan": "Agreed scope", "lead_session_id": SOURCE},
         ),
         (
             "sys_ticket_update",
-            {"ticket_id": TICKET, "status": "review", "review_summary": "Check the demo"},
+            {"ticket_id": TICKET, "stage_id": "review", "review_summary": "Check the demo"},
             "PATCH",
             f"/{TICKET}",
-            {"status": "review", "review_summary": "Check the demo"},
+            {"stage_id": "review", "review_summary": "Check the demo"},
         ),
     ],
 )
@@ -109,7 +110,7 @@ async def test_tools_use_only_the_callers_project(name, args, method, suffix, ex
         if expected is not None:
             assert json.loads(request.content) == expected
         else:
-            assert request.url.params["status"] == "open" and request.url.params["limit"] == "2"
+            assert request.url.params["stage_id"] == "open" and request.url.params["limit"] == "2"
         return httpx.Response(200, json={"ok": True})
 
     async with httpx.AsyncClient(
@@ -123,6 +124,8 @@ async def test_get_returns_paged_activity_outputs_and_sessions():
     def handler(request):
         if request.url.path == f"/v1/sessions/{SOURCE}":
             return httpx.Response(200, json={"project_id": PROJECT})
+        if request.url.path.endswith("/stages"):
+            return httpx.Response(200, json=default_ticket_stages().model_dump())
         if request.url.path.endswith("/events"):
             assert request.url.params["after"] == "6" and request.url.params["kind"] == "output"
             return httpx.Response(200, json={"data": [], "has_more": False, "last_position": 6})
@@ -150,14 +153,16 @@ async def test_get_returns_paged_activity_outputs_and_sessions():
     assert result["events"]["last_position"] == 6
     assert result["sessions"]["data"] == [{"session_id": SOURCE, "involvement": "Plan the work"}]
     assert result["related"] == {"data": [], "has_more": False}
+    assert result["stages"] == default_ticket_stages().model_dump()["stages"]
+    assert result["initial_stage_id"] == "open"
 
 
 @pytest.mark.parametrize(
     "name,args",
     [
         ("sys_ticket_create", {"title": " ", "project_id": PROJECT}),
-        ("sys_ticket_update", {"ticket_id": TICKET, "status": "done"}),
-        ("sys_ticket_update", {"ticket_id": TICKET, "status": "review"}),
+        ("sys_ticket_update", {"ticket_id": TICKET, "stage_id": "../other"}),
+        ("sys_ticket_update", {"ticket_id": TICKET, "stage_id": "x" * 65}),
         ("sys_ticket_link", {"ticket_id": TICKET, "related_ticket_id": "../../other"}),
         ("sys_ticket_get", {"ticket_id": TICKET, "related_after": "../other"}),
         ("sys_ticket_get", {"ticket_id": "../../other"}),

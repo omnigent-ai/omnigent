@@ -228,7 +228,7 @@ def test_lifecycle_migration_preserves_existing_ticket_statuses_and_history(tmp_
                 project.id,
                 ticket["id"],
                 UpdateTicket(
-                    status=status,
+                    stage_id=status,
                     completion_summary="Verified" if status == "done" else None,
                 ),
                 actor,
@@ -236,6 +236,11 @@ def test_lifecycle_migration_preserves_existing_ticket_statuses_and_history(tmp_
         records.append((ticket, tickets.events(project.id, ticket["id"], user_id=actor.user_id)))
     try:
         with engine.begin() as connection:
+            connection.execute(
+                sa.update(SqlProjectTicket)
+                .where(SqlProjectTicket.project_id == project.id)
+                .values(stage_id=None)
+            )
             config.attributes["connection"] = connection
             command.downgrade(config, "e8a9b0c1d2e3")
         assert "lead_session_id" not in {

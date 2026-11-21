@@ -2,14 +2,18 @@ import random
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import update
 from sqlalchemy.exc import StatementError
 
-from omnigent.db.db_models import workspace_scope
+from omnigent.db.db_models import SqlProjectTicket, workspace_scope
+from omnigent.db.utils import get_or_create_engine
 from omnigent.entities.project_ticket import (
     CommentOnTicket,
     CreateTicket,
     TicketActor,
     UpdateTicket,
+    UpdateTicketStages,
+    default_ticket_stages,
 )
 from omnigent.errors import OmnigentError
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -28,7 +32,7 @@ def test_atomic_edits_and_append_only_outputs(board):
     tickets, _, project = board
     actor = TicketActor("alice", uuid4().hex, uuid4().hex)
     ticket = tickets.create(project.id, CreateTicket(title=" Deliver "), actor)
-    assert ticket["title"] == "Deliver" and ticket["status"] == "open"
+    assert ticket["title"] == "Deliver" and ticket["stage_id"] == "open"
     assert ticket["created_at"] == ticket["updated_at"]
     tickets.update(project.id, ticket["id"], UpdateTicket(title="First"), actor)
     tickets.update(
@@ -70,14 +74,14 @@ def test_atomic_edits_and_append_only_outputs(board):
     done = tickets.update(
         project.id,
         ticket["id"],
-        UpdateTicket(status="done", completion_summary="Delivered and tested"),
+        UpdateTicket(stage_id="done", completion_summary="Delivered and tested"),
         actor,
     )
     assert done["completion_summary"] == "Delivered and tested"
     reopened = tickets.update(
-        project.id, ticket["id"], UpdateTicket(status="open", tags=[]), actor
+        project.id, ticket["id"], UpdateTicket(stage_id="open", tags=[]), actor
     )
-    assert reopened["completion_summary"] is None and reopened["tags"] == []
+    assert reopened["completion_summary"] == done["completion_summary"] and reopened["tags"] == []
     assert len(tickets.events(project.id, ticket["id"], user_id="alice")["data"]) == 8
 
 
@@ -146,8 +150,10 @@ def test_pagination_and_outbox_order(board):
     tickets, projects, project = board
     actor = TicketActor("alice")
     created = [tickets.create(project.id, CreateTicket(title=str(i)), actor) for i in range(4)]
-    page = tickets.list(project.id, user_id="alice", status="open", limit=2)
-    rest = tickets.list(project.id, user_id="alice", status="open", after=page["last_id"], limit=2)
+    page = tickets.list(project.id, user_id="alice", stage_id="open", limit=2)
+    rest = tickets.list(
+        project.id, user_id="alice", stage_id="open", after=page["last_id"], limit=2
+    )
     assert page["has_more"] and not rest["has_more"]
     assert {row["id"] for row in page["data"] + rest["data"]} == {row["id"] for row in created}
     ticket_id = created[0]["id"]
@@ -232,7 +238,7 @@ async def test_linked_session_deletion_preserves_ticket_and_history(board, db_ur
         event["session_id"] == session.id and event["user_id"] == "alice" for event in history
     )
     await conversations.delete_conversation(session.id)
-    assert tickets.get(project.id, ticket["id"], user_id="alice")["status"] == "open"
+    assert tickets.get(project.id, ticket["id"], user_id="alice")["stage_id"] == "open"
     assert (
         tickets.events(project.id, ticket["id"], user_id="alice")["data"][0]["session_id"]
         == session.id
@@ -255,7 +261,7 @@ def test_plan_review_and_feedback_change_atomically(board, monkeypatch):
         project.id,
         ticket_id,
         UpdateTicket(
-            status="planning",
+            stage_id="planning",
             plan="## Approach\n\n- [ ] Verified outcome",
             comment="Agreed in chat",
         ),
@@ -267,13 +273,13 @@ def test_plan_review_and_feedback_change_atomically(board, monkeypatch):
         project.id,
         ticket_id,
         UpdateTicket(
-            status="review",
+            stage_id="review",
             review_summary="Tests passed; please check the layout",
             tags=[{"key": "needs-human"}],
         ),
         actor,
     )
-    assert review["review_summary"] and review["status"] == "review"
+    assert review["review_summary"] and review["stage_id"] == "review"
     append = tickets._append
 
     def fail_comment(session, project_row, ticket_row, who, kind, payload):
@@ -288,7 +294,7 @@ def test_plan_review_and_feedback_change_atomically(board, monkeypatch):
                 project.id,
                 ticket_id,
                 UpdateTicket(
-                    status="in_progress",
+                    stage_id="in_progress",
                     comment="Adjust spacing",
                     tags=[],
                 ),
@@ -299,13 +305,16 @@ def test_plan_review_and_feedback_change_atomically(board, monkeypatch):
         project.id,
         ticket_id,
         UpdateTicket(
-            status="in_progress",
+            stage_id="in_progress",
             comment="Adjust spacing",
             tags=[],
         ),
         actor,
     )
-    assert working["review_summary"] == "" and working["plan"] == planning["plan"]
+    assert (
+        working["review_summary"] == review["review_summary"]
+        and working["plan"] == planning["plan"]
+    )
     assert working["comment_count"] == 2 and working["tags"] == []
     events = tickets.events(project.id, ticket_id, user_id="alice")["data"]
     assert [event["kind"] for event in events[-2:]] == ["updated", "comment"]
@@ -336,7 +345,7 @@ def test_related_links_are_symmetric_idempotent_and_paginated(board):
     tickets.link_ticket(project.id, center["id"], others[0]["id"], "remove", actor)
     assert tickets.related(project.id, others[0]["id"], user_id="alice")["data"] == []
     assert len(tickets.events(project.id, others[0]["id"], user_id="alice")["data"]) == 3
-    assert tickets.get(project.id, center["id"], user_id="alice")["status"] == "open"
+    assert tickets.get(project.id, center["id"], user_id="alice")["stage_id"] == "open"
     assert len(tickets.pending_notifications()) == 12
 
 
@@ -394,3 +403,222 @@ def test_lead_handoff_requires_links_and_unlink_clears_only_the_lead(board, db_u
     assert tickets.events(project.id, ticket["id"], user_id="alice")["data"][-1]["payload"][
         "changes"
     ] == {"lead_session_id": None}
+
+
+def test_stage_edit_reorder_start_and_removal_preserve_ticket_content_and_history(board):
+    tickets, projects, project = board
+    actor = TicketActor("alice")
+    ticket = tickets.create(project.id, CreateTicket(title="Original"), actor)
+    tickets.update(
+        project.id,
+        ticket["id"],
+        UpdateTicket(plan="Plan", review_summary="Review", tags=[{"key": "needs-human"}]),
+        actor,
+    )
+    tickets.comment(project.id, ticket["id"], CommentOnTicket(text="Keep me"), actor)
+    worker = uuid4().hex
+    tickets.link_session(project.id, ticket["id"], worker, "attach", actor)
+    sibling = tickets.create(project.id, CreateTicket(title="Related"), actor)
+    tickets.link_ticket(project.id, ticket["id"], sibling["id"], "attach", actor)
+    original = tickets.get(project.id, ticket["id"], user_id="alice")
+    history = tickets.events(project.id, ticket["id"], user_id="alice")["data"]
+    configuration = {
+        "stages": [
+            {"id": "investigating", "name": "Investigating", "instructions": "Gather evidence"},
+            {"id": "open", "name": "New"},
+            {"id": "resolved", "name": "Resolved", "is_complete": True},
+        ],
+        "initial_stage_id": "investigating",
+    }
+    saved = tickets.update_stages(project.id, UpdateTicketStages(**configuration), actor)
+    assert [stage["id"] for stage in saved["stages"]] == ["investigating", "open", "resolved"]
+    assert tickets.get(project.id, ticket["id"], user_id="alice") == original
+    assert (
+        tickets.create(project.id, CreateTicket(title="New work"), actor)["stage_id"]
+        == "investigating"
+    )
+    assert tickets.stages(project.id, user_id="alice", include_usage=True)[
+        "occupied_stage_ids"
+    ] == ["investigating", "open"]
+    # Saving unrelated project session defaults cannot overwrite the board configuration.
+    projects.update(project.id, user_id="alice", config={"workspace": "/work/project"})
+    assert tickets.stages(project.id, user_id="alice") == saved
+    configuration["stages"].pop(1)
+    with pytest.raises(OmnigentError, match="contains tickets"):
+        tickets.update_stages(project.id, UpdateTicketStages(**configuration), actor)
+    assert tickets.stages(project.id, user_id="alice") == saved
+    tickets.update_stages(
+        project.id, UpdateTicketStages(**configuration, moves={"open": "investigating"}), actor
+    )
+    moved = tickets.get(project.id, ticket["id"], user_id="alice")
+    assert moved["stage_id"] == "investigating"
+    for field in ("id", "title", "description", "plan", "review_summary", "tags", "comment_count"):
+        assert moved[field] == original[field]
+    assert (
+        tickets.sessions(project.id, ticket["id"], user_id="alice")["data"][0]["session_id"]
+        == worker
+    )
+    assert (
+        tickets.related(project.id, ticket["id"], user_id="alice")["data"][0]["id"]
+        == sibling["id"]
+    )
+    events = tickets.events(project.id, ticket["id"], user_id="alice")["data"]
+    assert events[:-1] == history
+    assert events[-1]["payload"]["previous_stage"]["name"] == "New"
+    assert events[-1]["payload"]["stage"]["name"] == "Investigating"
+    assert events[-1]["payload"]["reason"] == "stage_removed"
+    assert events[-1]["notification_pending"] is True
+    renamed = tickets.stages(project.id, user_id="alice")
+    renamed["stages"][0]["name"] = "Research"
+    tickets.update_stages(project.id, UpdateTicketStages(**renamed), actor)
+    assert tickets.events(project.id, ticket["id"], user_id="alice")["data"] == events
+    assert tickets.get(project.id, ticket["id"], user_id="alice")["stage_id"] == "investigating"
+
+
+def test_completion_uses_stage_metadata_and_never_implicitly_changes_human_tags(board):
+    tickets, _, project = board
+    actor = TicketActor("alice")
+    configuration = UpdateTicketStages(
+        stages=[
+            {"id": "done", "name": "Done", "is_complete": False},
+            {"id": "verified", "name": "Verified", "is_complete": True},
+        ],
+        initial_stage_id="done",
+    )
+    tickets.update_stages(project.id, configuration, actor)
+    ticket = tickets.create(
+        project.id, CreateTicket(title="Investigate", tags=[{"key": "needs-human"}]), actor
+    )
+    assert ticket["stage_id"] == "done"
+    tickets.update(project.id, ticket["id"], UpdateTicket(stage_id="done"), actor)
+    for stage_id in ("verified", "not-in-this-project"):
+        with pytest.raises(OmnigentError):
+            tickets.update(project.id, ticket["id"], UpdateTicket(stage_id=stage_id), actor)
+    completed = tickets.update(
+        project.id,
+        ticket["id"],
+        UpdateTicket(
+            stage_id="verified", completion_summary="Recovery confirmed", review_summary="Evidence"
+        ),
+        actor,
+    )
+    assert completed["tags"] == ticket["tags"]
+    reopened = tickets.update(project.id, ticket["id"], UpdateTicket(stage_id="done"), actor)
+    assert reopened["review_summary"] == "Evidence"
+    assert reopened["completion_summary"] == "Recovery confirmed"
+    with pytest.raises(OmnigentError, match="completion summary"):
+        tickets.update(project.id, ticket["id"], UpdateTicket(stage_id="verified"), actor)
+
+
+def test_configuration_cannot_complete_tickets_without_evidence_or_cross_project_boundaries(board):
+    tickets, projects, project = board
+    actor = TicketActor("alice")
+    ticket = tickets.create(project.id, CreateTicket(title="Not verified"), actor)
+    original = tickets.stages(project.id, user_id="alice")
+    configuration = {**original, "stages": original["stages"][1:], "initial_stage_id": "planning"}
+    with pytest.raises(OmnigentError, match="completion summaries"):
+        tickets.update_stages(
+            project.id, UpdateTicketStages(**configuration, moves={"open": "done"}), actor
+        )
+    completed_stage = default_ticket_stages().model_dump()
+    completed_stage["initial_stage_id"] = "planning"
+    completed_stage["stages"][0]["is_complete"] = True
+    with pytest.raises(OmnigentError, match="completion summaries"):
+        tickets.update_stages(project.id, UpdateTicketStages(**completed_stage), actor)
+    other = projects.create(uuid4().hex, "Other", "alice")
+    tickets.update_stages(
+        other.id,
+        UpdateTicketStages(
+            stages=[{"id": "elsewhere", "name": "Elsewhere"}], initial_stage_id="elsewhere"
+        ),
+        actor,
+    )
+    with pytest.raises(OmnigentError, match="Stage does not belong"):
+        tickets.update(project.id, ticket["id"], UpdateTicket(stage_id="elsewhere"), actor)
+    for operation in (
+        lambda: tickets.stages(project.id, user_id="bob"),
+        lambda: tickets.update_stages(
+            project.id, UpdateTicketStages(**original), TicketActor("bob")
+        ),
+        lambda: tickets.list(project.id, user_id="alice", stage_id="elsewhere"),
+        lambda: tickets.update_stages(
+            project.id, UpdateTicketStages(**original, moves={"unknown": "open"}), actor
+        ),
+    ):
+        with pytest.raises(OmnigentError):
+            operation()
+    with workspace_scope(9), pytest.raises(OmnigentError):
+        tickets.update_stages(project.id, UpdateTicketStages(**original), actor)
+    assert tickets.stages(project.id, user_id="alice") == original
+    assert tickets.get(project.id, ticket["id"], user_id="alice") == ticket
+
+
+def test_failed_stage_move_and_bounded_edit_roll_back_the_entire_configuration(board, monkeypatch):
+    tickets, _, project = board
+    actor = TicketActor("alice")
+    records = [
+        tickets.create(project.id, CreateTicket(title=str(index)), actor) for index in range(3)
+    ]
+    original = tickets.stages(project.id, user_id="alice")
+    change = UpdateTicketStages(
+        stages=[{"id": "new", "name": "New"}], initial_stage_id="new", moves={"open": "new"}
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr("omnigent.stores.project_ticket_store.STAGE_EDIT_TICKET_MAX", 2)
+        with pytest.raises(OmnigentError, match="smaller groups"):
+            tickets.update_stages(project.id, change, actor)
+    append = tickets._append
+    calls = 0
+
+    def fail_second(*args):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("event write failed")
+        append(*args)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(tickets, "_append", fail_second)
+        with pytest.raises(RuntimeError, match="event write"):
+            tickets.update_stages(project.id, change, actor)
+    assert tickets.stages(project.id, user_id="alice") == original
+    for ticket in records:
+        assert tickets.get(project.id, ticket["id"], user_id="alice") == ticket
+        assert len(tickets.events(project.id, ticket["id"], user_id="alice")["data"]) == 1
+
+
+def test_mixed_legacy_and_stage_id_tickets_paginate_once_and_move_together(board, db_uri):
+    tickets, _, project = board
+    actor = TicketActor("alice")
+    records = [
+        tickets.create(project.id, CreateTicket(title=str(index)), actor) for index in range(6)
+    ]
+    with get_or_create_engine(db_uri).begin() as connection:
+        connection.execute(
+            update(SqlProjectTicket)
+            .where(
+                SqlProjectTicket.project_id == project.id,
+                SqlProjectTicket.id.in_([ticket["id"] for ticket in records[::2]]),
+            )
+            .values(stage_id=None)
+        )
+    found = []
+    after = None
+    for _ in range(3):
+        page = tickets.list(project.id, user_id="alice", stage_id="open", after=after, limit=2)
+        found.extend(page["data"])
+        after = page["last_id"]
+    assert not page["has_more"]
+    assert [ticket["id"] for ticket in found] == sorted(ticket["id"] for ticket in records)
+    tickets.update_stages(
+        project.id,
+        UpdateTicketStages(
+            stages=[{"id": "queued", "name": "Queued"}],
+            initial_stage_id="queued",
+            moves={"open": "queued"},
+        ),
+        actor,
+    )
+    assert len(tickets.list(project.id, user_id="alice", stage_id="queued")["data"]) == 6
+    for ticket in records:
+        assert tickets.get(project.id, ticket["id"], user_id="alice")["stage_id"] == "queued"

@@ -3,11 +3,15 @@ import { LinkIcon, PlusIcon, XIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Spinner } from "@/components/ui/spinner";
-import { TICKET_STATUS_LABELS } from "@/lib/projectTicketsApi";
 import { Link } from "@/lib/routing";
 import { ticketPanelSearch } from "./projectHomeNavigation";
-import { TicketError, TicketStatusIcon } from "./TicketControls";
-import { useRelatedTickets, useTicketActions, useTickets } from "./useProjectTickets";
+import { TicketError, TicketStageIcon } from "./TicketControls";
+import {
+  useRelatedTickets,
+  useTicketActions,
+  useTickets,
+  useTicketStages,
+} from "./useProjectTickets";
 
 export function TicketRelatedTickets({
   projectId,
@@ -17,6 +21,8 @@ export function TicketRelatedTickets({
   ticketId: string;
 }) {
   const [open, setOpen] = useState(false);
+  const configuration = useTicketStages(projectId);
+  const stageFor = (id: string) => configuration.data?.stages.find((stage) => stage.id === id);
   const related = useRelatedTickets(projectId, ticketId);
   const candidates = useTickets(open ? projectId : null);
   const { link } = useTicketActions(projectId);
@@ -61,7 +67,7 @@ export function TicketRelatedTickets({
                     )
                   }
                 >
-                  <TicketStatusIcon status={ticket.status} />
+                  <TicketStageIcon stage={stageFor(ticket.stage_id)} />
                   <span className="min-w-0 wrap-anywhere">{ticket.title}</span>
                 </Button>
               ))}
@@ -95,7 +101,7 @@ export function TicketRelatedTickets({
             <li key={ticket.id} className="flex min-w-0 items-center gap-1 pr-1">
               <Link
                 to={ticketPanelSearch(ticket.id)}
-                aria-label={`${ticket.title} — ${TICKET_STATUS_LABELS[ticket.status]}`}
+                aria-label={`${ticket.title} — ${stageFor(ticket.stage_id)?.name ?? ticket.stage_id}`}
                 className="flex min-w-0 flex-1 items-center gap-3 rounded-sm p-3 transition-colors hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
               >
                 <LinkIcon aria-hidden className="size-4 shrink-0 text-muted-foreground" />
@@ -103,8 +109,8 @@ export function TicketRelatedTickets({
                   {ticket.title}
                 </span>
                 <span className="flex shrink-0 items-center gap-1.5 text-sm text-muted-foreground">
-                  <TicketStatusIcon status={ticket.status} />
-                  {TICKET_STATUS_LABELS[ticket.status]}
+                  <TicketStageIcon stage={stageFor(ticket.stage_id)} />
+                  {stageFor(ticket.stage_id)?.name ?? ticket.stage_id}
                 </span>
               </Link>
               <Button

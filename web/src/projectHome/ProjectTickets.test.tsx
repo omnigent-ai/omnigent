@@ -15,12 +15,13 @@ import * as api from "@/lib/projectTicketsApi";
 import * as projectsApi from "@/lib/projectsApi";
 import { Link } from "@/lib/routing";
 
-const capabilities = vi.hoisted(() => ({ lifecycle: true, involvement: true }));
+const capabilities = vi.hoisted(() => ({ lifecycle: true, involvement: true, stages: true }));
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({
     project_tickets: true,
     project_ticket_lifecycle: capabilities.lifecycle,
     project_ticket_agent_involvement: capabilities.involvement,
+    project_ticket_stages: capabilities.stages,
   }),
 }));
 
@@ -65,6 +66,7 @@ vi.mock("@/lib/projectTicketsApi", async (importOriginal) => ({
   listRelatedTickets: vi.fn(),
   linkRelatedTicket: vi.fn(),
   setTicketSessionInvolvement: vi.fn(),
+  getTicketStages: vi.fn(),
 }));
 vi.mock("@/lib/projectsApi", () => ({
   getProject: vi.fn(),
@@ -95,6 +97,8 @@ beforeEach(() => {
   vi.clearAllMocks();
   capabilities.lifecycle = true;
   capabilities.involvement = true;
+  capabilities.stages = true;
+  vi.mocked(api.getTicketStages).mockResolvedValue(structuredClone(api.DEFAULT_TICKET_STAGES));
   vi.mocked(useIsMobileViewport).mockReturnValue(false);
   vi.mocked(fetchConversationById).mockImplementation(async (id) =>
     id === "orchestrator" ? conversation(id, { title: "Shipping orchestrator" }) : null,
@@ -109,7 +113,7 @@ beforeEach(() => {
     project_id: "project",
     title: "Ship the board",
     description: "",
-    status: "open",
+    stage_id: "open",
     tags: [{ key: "needs-human", value: "approval" }],
     completion_summary: null,
     latest_update: "Created the ticket",
@@ -118,7 +122,7 @@ beforeEach(() => {
     updated_at: 1000,
   };
   vi.mocked(api.listTickets).mockImplementation(async (_projectId, options) => ({
-    data: options?.status === ticket.status ? [ticket] : [],
+    data: options?.stage_id === ticket.stage_id ? [ticket] : [],
     has_more: false,
     last_id: ticket.id,
   }));
@@ -128,8 +132,6 @@ beforeEach(() => {
     async (_projectId, _id, changes: TicketChanges) => {
       const { comment: _comment, ...fields } = changes;
       ticket = { ...ticket, ...fields };
-      if (changes.status && !["review", "done"].includes(changes.status))
-        ticket.review_summary = "";
       return ticket;
     },
   );
@@ -152,6 +154,7 @@ afterEach(() => {
 describe("Project ticket board", () => {
   it("shows five phases and human-input tags, without filter controls", async () => {
     renderBoard(<ProjectTicketBoard projectName="Shipping" selectedTicketId={null} />);
+    await screen.findByRole("region", { name: "Open" });
     const board = screen.getByRole("region", { name: "Shipping ticket board" });
     for (const label of ["Open", "Planning", "Working", "Review", "Done"])
       expect(within(board).getByRole("region", { name: label })).toBeInTheDocument();
@@ -161,6 +164,177 @@ describe("Project ticket board", () => {
     expect(screen.getByText("Needs response")).toBeInTheDocument();
     expect(screen.queryByRole("searchbox")).toBeNull();
     expect(screen.queryByRole("combobox")).toBeNull();
+  });
+
+  it("renders configured lane order, instructions and the chosen starting lane", async () => {
+    ticket.stage_id = "investigating";
+    vi.mocked(api.getTicketStages).mockResolvedValue({
+      stages: [
+        { id: "new", name: "New", instructions: "", is_complete: false },
+        {
+          id: "investigating",
+          name: "Investigating",
+          instructions: "Gather evidence before resolving.",
+          is_complete: false,
+        },
+        { id: "resolved", name: "Resolved", instructions: "", is_complete: true },
+      ],
+      initial_stage_id: "investigating",
+    });
+    renderBoard(<ProjectTicketBoard projectName="Shipping" selectedTicketId={null} />);
+    const initial = await screen.findByRole("region", { name: "Investigating" });
+    const board = screen.getByRole("region", { name: "Shipping ticket board" });
+    expect(
+      within(board)
+        .getAllByRole("region")
+        .map((lane) => lane.getAttribute("aria-label")),
+    ).toEqual(["New", "Investigating", "Resolved"]);
+    expect(within(initial).getByText("Gather evidence before resolving.")).toBeInTheDocument();
+    expect(within(initial).getByRole("link", { name: "New ticket" })).toHaveAttribute(
+      "href",
+      "/?ticket=new",
+    );
+    expect(within(board).getAllByRole("link", { name: "New ticket" })).toHaveLength(1);
+    expect(
+      await within(initial).findByRole("link", { name: "Open ticket: Ship the board" }),
+    ).toBeInTheDocument();
+    expect(within(initial).getByText("Needs response")).toBeInTheDocument();
+    expect(api.listTickets).toHaveBeenCalledWith("project", {
+      stage_id: "investigating",
+      after: undefined,
+    });
+  });
+
+  it("does not show default lanes when a capable server cannot load its stages", async () => {
+    vi.mocked(api.getTicketStages).mockRejectedValue(new Error("Stages unavailable"));
+    renderBoard(<ProjectTicketBoard projectName="Shipping" selectedTicketId={null} />);
+    expect(await screen.findByRole("alert")).toHaveTextContent("Stages unavailable");
+    expect(screen.queryByRole("region", { name: "Open" })).toBeNull();
+    expect(api.listTickets).not.toHaveBeenCalled();
+  });
+
+  it("uses completion metadata, keeping optional content and Needs response in any stage", async () => {
+    ticket.stage_id = "verifying";
+    ticket.review_summary = "Inspect the evidence in any stage.";
+    ticket.completion_summary = "Earlier result";
+    vi.mocked(api.getTicketStages).mockResolvedValue({
+      stages: [
+        {
+          id: "verifying",
+          name: "Verifying",
+          instructions: "Confirm recovery before resolving.",
+          is_complete: false,
+        },
+        { id: "done", name: "Done", instructions: "", is_complete: false },
+        { id: "resolved", name: "Resolved", instructions: "", is_complete: true },
+        { id: "archived", name: "Archived", instructions: "", is_complete: true },
+      ],
+      initial_stage_id: "verifying",
+    });
+    const user = userEvent.setup();
+    renderBoard(
+      <ProjectTicketPanel
+        projectName="Shipping"
+        ticketId="ticket"
+        onClose={vi.fn()}
+        onCreated={vi.fn()}
+      />,
+    );
+    expect(await screen.findByText("Confirm recovery before resolving.")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Add plan" }));
+    fireEvent.change(screen.getByLabelText("Plan"), {
+      target: { value: "Verify recovery evidence." },
+    });
+    await user.click(screen.getByRole("button", { name: "Save plan" }));
+    await screen.findByRole("button", { name: "Edit plan" });
+    await user.click(screen.getByRole("combobox", { name: "Ticket stage" }));
+    await user.click(screen.getByRole("option", { name: "Done" }));
+    await waitFor(() =>
+      expect(api.updateTicket).toHaveBeenLastCalledWith("project", "ticket", { stage_id: "done" }),
+    );
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.getByRole("button", { name: "Completion summary" })).toHaveTextContent(
+      "Earlier result",
+    );
+    await user.click(screen.getByRole("combobox", { name: "Ticket stage" }));
+    await user.click(screen.getByRole("option", { name: "Resolved" }));
+    expect(screen.getByLabelText("Completed stage")).toHaveValue("resolved");
+    await user.selectOptions(screen.getByLabelText("Completed stage"), "archived");
+    fireEvent.change(within(screen.getByRole("dialog")).getByLabelText("Completion summary"), {
+      target: { value: "Recovery verified." },
+    });
+    await user.click(screen.getByRole("button", { name: "Complete ticket" }));
+    await waitFor(() =>
+      expect(api.updateTicket).toHaveBeenLastCalledWith("project", "ticket", {
+        stage_id: "archived",
+        completion_summary: "Recovery verified.",
+      }),
+    );
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(ticket.tags).toEqual([{ key: "needs-human", value: "approval" }]);
+    expect(ticket.plan).toBe("Verify recovery evidence.");
+    expect(ticket.review_summary).toBe("Inspect the evidence in any stage.");
+    expect(screen.getByRole("button", { name: "Review brief" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(screen.getByText("Needs response")).toBeInTheDocument();
+  });
+
+  it("keeps snapshot and legacy history readable after stage rename or removal", async () => {
+    vi.mocked(api.getTicketStages).mockResolvedValue({
+      stages: [
+        { id: "open", name: "New", instructions: "", is_complete: false },
+        { id: "done", name: "Closed", instructions: "", is_complete: true },
+      ],
+      initial_stage_id: "open",
+    });
+    vi.mocked(api.listTicketEvents).mockImplementation(async (_project, _ticket, _after, kind) => ({
+      data: kind
+        ? []
+        : [
+            {
+              id: "custom",
+              ticket_id: "ticket",
+              position: 0,
+              kind: "updated",
+              user_id: "local",
+              session_id: null,
+              agent_id: null,
+              created_at: 1000,
+              payload: {
+                changes: { stage_id: "removed" },
+                stage: { id: "removed", name: "Investigating", is_complete: false },
+              },
+            },
+            {
+              id: "legacy",
+              ticket_id: "ticket",
+              position: 1,
+              kind: "updated",
+              user_id: "local",
+              session_id: null,
+              agent_id: null,
+              created_at: 1000,
+              payload: { changes: { status: "done" } },
+            },
+          ],
+      has_more: false,
+      last_position: 1,
+    }));
+    renderBoard(
+      <ProjectTicketPanel
+        projectName="Shipping"
+        ticketId="ticket"
+        onClose={vi.fn()}
+        onCreated={vi.fn()}
+      />,
+    );
+    const activity = await screen.findByRole("region", { name: "Ticket activity" });
+    expect(await within(activity).findByText("Investigating")).toBeInTheDocument();
+    expect(within(activity).getByText("Done")).toBeInTheDocument();
+    expect(within(activity).queryByText("Closed")).toBeNull();
+    expect(await screen.findByRole("combobox", { name: "Ticket stage" })).toHaveTextContent("New");
   });
 
   it("creates a title-only ticket without creating a session", async () => {
@@ -197,18 +371,19 @@ describe("Project ticket board", () => {
     renderBoard(
       <CompleteTicketDialog
         title="Ship"
+        stages={api.DEFAULT_TICKET_STAGES.stages}
         onClose={vi.fn()}
         onComplete={complete}
         pending={false}
         error={null}
       />,
     );
-    expect(screen.getByRole("button", { name: "Mark done" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Complete ticket" })).toBeDisabled();
     fireEvent.change(screen.getByLabelText("Completion summary"), {
       target: { value: " Delivered and tested " },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Mark done" }));
-    expect(complete).toHaveBeenCalledWith("Delivered and tested");
+    fireEvent.click(screen.getByRole("button", { name: "Complete ticket" }));
+    expect(complete).toHaveBeenCalledWith("Delivered and tested", "done");
   });
 
   it("deduplicates PR outputs while retaining both events, and appends comments", async () => {
@@ -284,7 +459,7 @@ describe("Project ticket board", () => {
         tags: [{ key: "area", value: "board" }],
       }),
     );
-    expect(ticket.status).toBe("open");
+    expect(ticket.stage_id).toBe("open");
   });
 
   it("renders ticket prose as Markdown and hides empty optional sections", async () => {
@@ -500,18 +675,17 @@ describe("Project ticket board", () => {
     expect(
       await screen.findByRole("heading", { name: "Ship a polished board", level: 2 }),
     ).toBeInTheDocument();
-    await user.click(screen.getByRole("combobox", { name: "Ticket status" }));
+    await user.click(screen.getByRole("combobox", { name: "Ticket stage" }));
     await user.click(screen.getByRole("option", { name: "Done" }));
-    expect(screen.getByRole("button", { name: "Mark done" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Complete ticket" })).toBeDisabled();
     fireEvent.change(screen.getByLabelText("Completion summary"), {
       target: { value: "Built and tested" },
     });
-    await user.click(screen.getByRole("button", { name: "Mark done" }));
+    await user.click(screen.getByRole("button", { name: "Complete ticket" }));
     await waitFor(() =>
       expect(api.updateTicket).toHaveBeenLastCalledWith("project", "ticket", {
-        status: "done",
+        stage_id: "done",
         completion_summary: "Built and tested",
-        tags: [],
       }),
     );
     expect(await screen.findByText("Built and tested")).toBeInTheDocument();
@@ -561,16 +735,19 @@ describe("Project ticket board", () => {
 
   it("does not call new lifecycle endpoints against an older backend", async () => {
     capabilities.lifecycle = false;
+    capabilities.stages = false;
     renderBoard(<ProjectTicketBoard projectName="Shipping" selectedTicketId={null} />);
     const card = await screen.findByRole("link", { name: "Open ticket: Ship the board" });
     expect(screen.queryByRole("region", { name: "Planning" })).toBeNull();
     expect(screen.queryByRole("region", { name: "Review" })).toBeNull();
     fireEvent.mouseEnter(card);
     expect(api.listRelatedTickets).not.toHaveBeenCalled();
+    expect(api.getTicketStages).not.toHaveBeenCalled();
   });
 
   it("saves the current plan and renders its acceptance criteria as Markdown", async () => {
-    ticket.status = "planning";
+    ticket.stage_id = "planning";
+    ticket.plan = "Approach and acceptance criteria";
     const user = userEvent.setup();
     renderBoard(
       <ProjectTicketPanel
@@ -585,7 +762,7 @@ describe("Project ticket board", () => {
     disclosure.focus();
     await user.keyboard("{Enter}");
     expect(disclosure).toHaveAttribute("aria-expanded", "true");
-    expect(screen.getByText(/Align on the approach/)).toBeInTheDocument();
+    expect(screen.getAllByText("Approach and acceptance criteria").length).toBeGreaterThan(0);
     await user.keyboard(" ");
     expect(disclosure).toHaveAttribute("aria-expanded", "false");
     fireEvent.click(screen.getByRole("button", { name: "Edit plan" }));
@@ -605,7 +782,7 @@ describe("Project ticket board", () => {
     });
   });
 
-  it("requires a review brief and returns feedback to Working atomically", async () => {
+  it("requests review and records feedback independently of the ticket stage", async () => {
     const user = userEvent.setup();
     renderBoard(
       <ProjectTicketPanel
@@ -615,15 +792,14 @@ describe("Project ticket board", () => {
         onCreated={vi.fn()}
       />,
     );
-    await user.click(await screen.findByRole("combobox", { name: "Ticket status" }));
-    await user.click(screen.getByRole("option", { name: "Review" }));
+    await user.click(await screen.findByRole("button", { name: "Request review" }));
     expect(screen.getByRole("button", { name: "Send for review" })).toBeDisabled();
     fireEvent.change(screen.getByLabelText("Review brief"), {
       target: { value: "**Verified** tests. Please inspect the demo." },
     });
     await user.click(screen.getByRole("button", { name: "Send for review" }));
     const review = await screen.findByRole("region", { name: "Human review" });
-    const disclosure = within(review).getByRole("button", { name: "Ready for review" });
+    const disclosure = within(review).getByRole("button", { name: "Review brief" });
     expect(disclosure).toHaveAttribute("aria-expanded", "false");
     expect(disclosure).toHaveTextContent("Verified tests. Please inspect the demo.");
     expect(screen.queryByText("Verified")).toBeNull();
@@ -640,16 +816,17 @@ describe("Project ticket board", () => {
     await user.click(within(dialog).getByRole("button", { name: "Request changes" }));
     await waitFor(() =>
       expect(api.updateTicket).toHaveBeenLastCalledWith("project", "ticket", {
-        status: "in_progress",
         comment: "Increase the contrast",
-        tags: [],
       }),
     );
-    await waitFor(() => expect(screen.queryByRole("region", { name: "Human review" })).toBeNull());
+    expect(screen.getByRole("region", { name: "Human review" })).toBeInTheDocument();
+    expect(ticket.stage_id).toBe("open");
+    expect(ticket.tags).toEqual([{ key: "needs-human", value: "approval" }]);
   });
 
   it("reopens a collapsed plan on save failure without losing its draft", async () => {
-    ticket.status = "planning";
+    ticket.stage_id = "planning";
+    ticket.plan = "Original plan";
     let rejectSave!: (error: Error) => void;
     vi.mocked(api.updateTicket).mockImplementationOnce(
       () =>
@@ -678,7 +855,7 @@ describe("Project ticket board", () => {
   });
 
   it("records human acceptance with a completion summary", async () => {
-    ticket.status = "review";
+    ticket.stage_id = "review";
     ticket.review_summary = "Tested and ready; check the demo.";
     renderBoard(
       <ProjectTicketPanel
@@ -688,21 +865,21 @@ describe("Project ticket board", () => {
         onCreated={vi.fn()}
       />,
     );
-    expect(await screen.findByRole("button", { name: "Ready for review" })).toHaveAttribute(
+    expect(await screen.findByRole("button", { name: "Review brief" })).toHaveAttribute(
       "aria-expanded",
       "false",
     );
-    fireEvent.click(await screen.findByRole("button", { name: "Approve & mark done" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Approve & complete" }));
     const dialog = screen.getByRole("dialog");
     fireEvent.change(within(dialog).getByLabelText("Completion summary"), {
       target: { value: "Reviewed the demo and accepted" },
     });
-    fireEvent.click(within(dialog).getByRole("button", { name: "Approve & mark done" }));
+    fireEvent.click(within(dialog).getByRole("button", { name: "Approve & complete" }));
     await waitFor(() =>
       expect(api.updateTicket).toHaveBeenLastCalledWith("project", "ticket", {
-        status: "done",
+        stage_id: "done",
         completion_summary: "Reviewed the demo and accepted",
-        tags: [],
+        comment: "Accepted the ticket review.",
       }),
     );
   });
@@ -712,7 +889,7 @@ describe("Project ticket board", () => {
       ...ticket,
       id: "peer",
       title: "Related work",
-      status: "planning",
+      stage_id: "planning",
     };
     let related: ProjectTicket[] = [];
     vi.mocked(api.listTickets).mockResolvedValue({
@@ -755,7 +932,7 @@ describe("Project ticket board", () => {
     "opens a linked planning chat and keeps ticket drafts (mobile=%s)",
     async (mobile) => {
       vi.mocked(useIsMobileViewport).mockReturnValue(mobile);
-      ticket.status = "planning";
+      ticket.stage_id = "planning";
       ticket.lead_session_id = "planner";
       ticket.plan = "Original plan";
       vi.mocked(fetchConversationById).mockImplementation(async (id) =>
@@ -824,7 +1001,7 @@ describe("Project ticket board", () => {
   );
 
   it("lists paginated agents with involvement and keeps the orchestrator visible once", async () => {
-    ticket.status = "planning";
+    ticket.stage_id = "planning";
     ticket.lead_session_id = "reviewer";
     vi.mocked(api.listTicketSessions).mockImplementation(async (_project, _ticket, after) => ({
       data: after
@@ -1025,17 +1202,24 @@ describe("Project ticket board", () => {
         ...ticket,
         id: "first",
         title: "Plan part",
-        status: "planning",
+        stage_id: "planning",
       };
-      const second: ProjectTicket = { ...ticket, id: "second", title: "Done part", status: "done" };
+      const second: ProjectTicket = {
+        ...ticket,
+        id: "second",
+        title: "Done part",
+        stage_id: "done",
+      };
       const unrelated: ProjectTicket = {
         ...ticket,
         id: "unrelated",
         title: "Other work",
-        status: "in_progress",
+        stage_id: "in_progress",
       };
       vi.mocked(api.listTickets).mockImplementation(async (_project, options) => ({
-        data: [ticket, first, second, unrelated].filter((item) => item.status === options?.status),
+        data: [ticket, first, second, unrelated].filter(
+          (item) => item.stage_id === options?.stage_id,
+        ),
         has_more: false,
         last_id: null,
       }));

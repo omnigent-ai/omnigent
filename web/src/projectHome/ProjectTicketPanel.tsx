@@ -42,12 +42,10 @@ import { getProject, initializeProjectOrchestrator } from "@/lib/projectsApi";
 import {
   createTicket,
   ticketOutputs,
-  TICKET_STATUSES,
-  TICKET_STATUS_LABELS,
+  ticketEventStage,
   type ProjectTicket,
   type TicketEvent,
   type TicketOutput,
-  type TicketStatus,
   type TicketTag,
 } from "@/lib/projectTicketsApi";
 import { ProjectSessionPanel } from "./ProjectSessionPanel";
@@ -59,7 +57,7 @@ import {
   ReviewTicketDialog,
   RequestTicketChangesDialog,
   TicketError,
-  TicketStatusIcon,
+  TicketStageIcon,
   TicketTags,
 } from "./TicketControls";
 import { TicketRelatedTickets } from "./TicketRelatedTickets";
@@ -69,7 +67,7 @@ import {
   useTicketEvents,
   useTicketProject,
   useTicketLifecycleEnabled,
-  useTicketStatuses,
+  useTicketStages,
 } from "./useProjectTickets";
 
 interface TicketExpansionProps {
@@ -363,11 +361,14 @@ function TicketDetails({
   const query = useTicket(projectId, ticketId);
   const { update, comment } = useTicketActions(projectId);
   const [editing, setEditing] = useState(false);
-  const [completing, setCompleting] = useState(false);
+  const [completing, setCompleting] = useState<{ stageId?: string; approving: boolean } | null>(
+    null,
+  );
   const [reviewing, setReviewing] = useState(false);
   const [requestingChanges, setRequestingChanges] = useState(false);
   const lifecycle = useTicketLifecycleEnabled();
-  const statuses = useTicketStatuses();
+  const configuration = useTicketStages(projectId);
+  const stages = configuration.data?.stages ?? [];
   const [searchParams] = useSearchParams();
   const replaceSearchParams = useReplaceSearchParams();
   const chatSessionId = searchParams.get("session");
@@ -392,6 +393,7 @@ function TicketDetails({
         )}
       </Panel>
     );
+  const currentStage = stages.find((stage) => stage.id === ticket.stage_id);
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       <div
@@ -441,28 +443,29 @@ function TicketDetails({
               </div>
               <div className="flex flex-wrap items-center gap-2">
                 <Select
-                  value={ticket.status}
-                  disabled={update.isPending}
+                  value={ticket.stage_id}
+                  disabled={update.isPending || configuration.isPending || configuration.isError}
                   onValueChange={(value) => {
                     update.reset();
-                    if (value === "done") setCompleting(true);
-                    else if (value === "review") setReviewing(true);
-                    else
-                      update.mutate({ id: ticketId, changes: { status: value as TicketStatus } });
+                    const stage = stages.find((candidate) => candidate.id === value);
+                    if (!stage) return;
+                    if (stage.is_complete) setCompleting({ stageId: stage.id, approving: false });
+                    else if (!configuration.supported && value === "review") setReviewing(true);
+                    else update.mutate({ id: ticketId, changes: { stage_id: value } });
                   }}
                 >
                   <SelectTrigger
                     size="sm"
-                    aria-label="Ticket status"
+                    aria-label="Ticket stage"
                     className="shrink-0 border-border/60 bg-muted/30"
                   >
-                    <SelectValue />
+                    <SelectValue placeholder={ticket.stage_id} />
                   </SelectTrigger>
                   <SelectContent>
-                    {statuses.map((status) => (
-                      <SelectItem key={status} value={status}>
-                        <TicketStatusIcon status={status} />
-                        {TICKET_STATUS_LABELS[status]}
+                    {stages.map((stage) => (
+                      <SelectItem key={stage.id} value={stage.id}>
+                        <TicketStageIcon stage={stage} />
+                        {stage.name}
                       </SelectItem>
                     ))}
                   </SelectContent>
@@ -475,6 +478,10 @@ function TicketDetails({
                   onChange={(tags) => update.mutate({ id: ticketId, changes: { tags } })}
                 />
               </div>
+              <TicketError error={configuration.error} />
+              {currentStage?.instructions && (
+                <p className="text-sm text-muted-foreground">{currentStage.instructions}</p>
+              )}
               <TicketAgents projectId={projectId} ticket={ticket} />
               {ticket.description ? (
                 <ProseMarkdown className="text-ui leading-relaxed">
@@ -499,27 +506,43 @@ function TicketDetails({
           {!editing && !completing && !reviewing && !requestingChanges && (
             <TicketError error={update.error} />
           )}
-          {(lifecycle || ticket.status === "review" || ticket.completion_summary) && (
+          {(lifecycle || ticket.review_summary || ticket.completion_summary) && (
             <div className="space-y-2">
               {lifecycle && <TicketPlan projectId={projectId} ticket={ticket} />}
-              {ticket.status === "review" && (
+              {ticket.review_summary && (
                 <TicketDisclosure
                   label="Human review"
-                  title="Ready for review"
-                  icon={<TicketStatusIcon status="review" />}
+                  title="Review brief"
                   preview={markdownPreviewText(ticket.review_summary ?? "")}
+                  action={
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label="Edit review brief"
+                      onClick={() => {
+                        update.reset();
+                        setReviewing(true);
+                      }}
+                    >
+                      <PencilIcon aria-hidden />
+                    </Button>
+                  }
                   footer={
                     <div className="flex flex-wrap gap-2">
                       <Button
                         size="sm"
-                        disabled={update.isPending}
+                        disabled={
+                          update.isPending ||
+                          currentStage?.is_complete ||
+                          !stages.some((stage) => stage.is_complete)
+                        }
                         onClick={() => {
                           update.reset();
-                          setCompleting(true);
+                          setCompleting({ approving: true });
                         }}
                       >
                         <CheckIcon aria-hidden />
-                        Approve &amp; mark done
+                        Approve &amp; complete
                       </Button>
                       <Button
                         size="sm"
@@ -539,10 +562,23 @@ function TicketDetails({
                     {ticket.review_summary ?? ""}
                   </ProseMarkdown>
                   <p className="mt-3 text-sm text-muted-foreground">
-                    These actions update the ticket. Answer any open agent prompt in that agent’s
-                    chat.
+                    These actions update the ticket, not agent prompts. Needs response stays
+                    unchanged; resolve it separately when its request is answered.
                   </p>
                 </TicketDisclosure>
+              )}
+              {lifecycle && !ticket.review_summary && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="-ml-2 text-muted-foreground"
+                  onClick={() => {
+                    update.reset();
+                    setReviewing(true);
+                  }}
+                >
+                  <PlusIcon aria-hidden /> Request review
+                </Button>
               )}
               {ticket.completion_summary && (
                 <TicketDisclosure
@@ -561,24 +597,26 @@ function TicketDetails({
           {completing && (
             <CompleteTicketDialog
               title={ticket.title}
-              approving={ticket.status === "review"}
+              approving={completing.approving}
+              stages={stages}
+              initialStageId={completing.stageId}
               pending={update.isPending}
               error={update.error}
               onClose={() => {
-                setCompleting(false);
+                setCompleting(null);
                 update.reset();
               }}
-              onComplete={(summary) =>
+              onComplete={(summary, stageId) =>
                 update.mutate(
                   {
                     id: ticketId,
                     changes: {
-                      status: "done",
+                      stage_id: stageId,
                       completion_summary: summary,
-                      tags: ticket.tags.filter((tag) => tag.key !== "needs-human"),
+                      ...(completing.approving ? { comment: "Accepted the ticket review." } : {}),
                     },
                   },
-                  { onSuccess: () => setCompleting(false) },
+                  { onSuccess: () => setCompleting(null) },
                 )
               }
             />
@@ -598,7 +636,7 @@ function TicketDetails({
                   {
                     id: ticketId,
                     changes: {
-                      status: "review",
+                      ...(!configuration.supported ? { stage_id: "review" } : {}),
                       review_summary: summary,
                       tags: ticket.tags.some((tag) => tag.key === "needs-human")
                         ? ticket.tags
@@ -624,9 +662,8 @@ function TicketDetails({
                   {
                     id: ticketId,
                     changes: {
-                      status: "in_progress",
+                      ...(!configuration.supported ? { stage_id: "in_progress" } : {}),
                       comment: feedback,
-                      tags: ticket.tags.filter((tag) => tag.key !== "needs-human"),
                     },
                   },
                   { onSuccess: () => setRequestingChanges(false) },
@@ -714,7 +751,7 @@ function TicketPlan({ projectId, ticket }: { projectId: string; ticket: ProjectT
     setEditing(true);
     setOpen(true);
   };
-  if (!editing && !ticket.plan && ticket.status !== "planning")
+  if (!editing && !ticket.plan)
     return (
       <Button variant="ghost" size="sm" className="-ml-2 text-muted-foreground" onClick={edit}>
         <PlusIcon aria-hidden />
@@ -1124,11 +1161,11 @@ function ActivityChange({ event }: { event: TicketEvent }) {
       </>
     );
   const changes = event.payload.changes as Partial<ProjectTicket> | undefined;
-  if (changes?.status && TICKET_STATUSES.includes(changes.status))
+  const stage = ticketEventStage(event);
+  if (stage)
     return (
       <>
-        moved to{" "}
-        <span className="font-medium text-foreground">{TICKET_STATUS_LABELS[changes.status]}</span>
+        moved to <span className="font-medium text-foreground">{stage.name}</span>
       </>
     );
   const fields = Object.keys(changes ?? {}).map((field) => field.replaceAll("_", " "));
@@ -1195,8 +1232,7 @@ function TicketActivityItem({
   ) : (
     <span className="text-foreground">{author}</span>
   );
-  const status =
-    changes?.status && TICKET_STATUSES.includes(changes.status) ? changes.status : null;
+  const stage = ticketEventStage(event);
   const age = relativeTime(event.created_at * 1000, nowMs);
   return (
     <li className="relative flex min-w-0 gap-3 pb-4 last:pb-0 before:absolute before:top-6 before:bottom-0 before:left-3 before:w-px before:bg-border/60 last:before:hidden">
@@ -1212,8 +1248,8 @@ function TicketActivityItem({
           ) : (
             <UserRoundIcon aria-hidden className="size-3.5" />
           )
-        ) : status ? (
-          <TicketStatusIcon status={status} />
+        ) : stage ? (
+          <TicketStageIcon stage={stage} />
         ) : event.kind === "output" ? (
           event.payload.type === "pull_request" ? (
             <GitPullRequestIcon aria-hidden className="size-3.5" />

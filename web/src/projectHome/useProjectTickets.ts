@@ -1,22 +1,23 @@
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMemo } from "react";
 import { useProjects } from "@/hooks/useConversations";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { createProject } from "@/lib/projectsApi";
 import {
   commentOnTicket,
   getTicket,
+  getTicketStages,
   listTicketEvents,
   listTickets,
   listTicketSessions,
   listRelatedTickets,
   linkRelatedTicket,
   setTicketSessionInvolvement,
-  TICKET_STATUSES,
+  DEFAULT_TICKET_STAGES,
   updateTicket,
   type TicketChanges,
   type TicketComment,
   type TicketEvent,
-  type TicketStatus,
 } from "@/lib/projectTicketsApi";
 
 export function useProjectTicketsEnabled() {
@@ -34,9 +35,35 @@ export function useTicketInvolvementEnabled() {
   return info !== "loading" && info.project_ticket_agent_involvement === true;
 }
 
-export function useTicketStatuses() {
+export function useTicketStagesEnabled() {
+  const info = useServerInfo();
+  return info !== "loading" && info.project_ticket_stages === true;
+}
+
+export function useTicketStages(projectId: string | null, includeUsage = false) {
+  const supported = useTicketStagesEnabled();
   const lifecycle = useTicketLifecycleEnabled();
-  return TICKET_STATUSES.filter((status) => lifecycle || !["planning", "review"].includes(status));
+  const defaults = useMemo(
+    () => ({
+      ...DEFAULT_TICKET_STAGES,
+      stages: DEFAULT_TICKET_STAGES.stages.filter(
+        (stage) => lifecycle || !["planning", "review"].includes(stage.id),
+      ),
+    }),
+    [lifecycle],
+  );
+  const query = useQuery({
+    queryKey: ["project-tickets", projectId, "stages", includeUsage],
+    queryFn: () => getTicketStages(projectId!, includeUsage),
+    enabled: projectId !== null && supported,
+    refetchInterval: 5000,
+  });
+  return {
+    ...query,
+    supported,
+    isPending: supported && projectId !== null && query.isPending,
+    data: supported && projectId !== null ? query.data : defaults,
+  };
 }
 
 export function useTicketProject(projectName: string) {
@@ -50,10 +77,16 @@ export function useTicketProject(projectName: string) {
   return { projectId, projects, ensure };
 }
 
-export function useTickets(projectId: string | null, status?: TicketStatus) {
+export function useTickets(projectId: string | null, stageId?: string) {
+  const supported = useTicketStagesEnabled();
   return useInfiniteQuery({
-    queryKey: ["project-tickets", projectId, "board", status],
-    queryFn: ({ pageParam }) => listTickets(projectId!, { status, after: pageParam }),
+    queryKey: ["project-tickets", projectId, "board", stageId, supported],
+    queryFn: ({ pageParam }) =>
+      listTickets(projectId!, {
+        stage_id: stageId,
+        after: pageParam,
+        ...(!supported ? { legacy: true } : {}),
+      }),
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (page) => (page.has_more ? (page.last_id ?? undefined) : undefined),
     enabled: projectId !== null,
@@ -102,11 +135,12 @@ export function useRelatedTickets(projectId: string | null, ticketId: string | n
 }
 
 export function useTicketActions(projectId: string) {
+  const supported = useTicketStagesEnabled();
   const client = useQueryClient();
   const refresh = () => client.invalidateQueries({ queryKey: ["project-tickets", projectId] });
   const update = useMutation({
     mutationFn: ({ id, changes }: { id: string; changes: TicketChanges }) =>
-      updateTicket(projectId, id, changes),
+      supported ? updateTicket(projectId, id, changes) : updateTicket(projectId, id, changes, true),
     onSuccess: refresh,
   });
   const comment = useMutation({

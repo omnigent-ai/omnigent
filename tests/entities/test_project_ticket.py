@@ -2,12 +2,16 @@ import pytest
 from pydantic import ValidationError
 
 from omnigent.entities.project_ticket import (
-    STATUS_CODES,
+    LEGACY_STATUS_CODES,
     CommentOnTicket,
     CreateTicket,
     LinkTicketSession,
     TicketOutput,
+    TicketStage,
+    TicketStages,
     UpdateTicket,
+    UpdateTicketStages,
+    default_ticket_stages,
 )
 
 
@@ -25,36 +29,82 @@ def test_title_only_and_key_value_tags():
         CreateTicket(title="Review", tags=[{"key": "team"}, {"key": " team "}])
 
 
-def test_done_requires_summary_and_comments_have_no_notification_option():
+def test_stage_ids_are_dynamic_and_comments_have_no_notification_option():
+    assert UpdateTicket(stage_id="investigating").stage_id == "investigating"
+    assert UpdateTicket(stage_id="done").completion_summary is None
     with pytest.raises(ValidationError):
-        UpdateTicket(status="done")
-    with pytest.raises(ValidationError):
-        UpdateTicket(status="done", completion_summary="  ")
+        UpdateTicket(stage_id="resolved", completion_summary="  ")
     assert (
-        UpdateTicket(status="done", completion_summary=" Tested ").completion_summary == "Tested"
+        UpdateTicket(stage_id="resolved", completion_summary=" Tested ").completion_summary
+        == "Tested"
     )
     with pytest.raises(ValidationError):
         CommentOnTicket(text="Progress", notify_orchestrator=False)
 
 
-def test_lifecycle_preserves_status_codes_and_requires_review_evidence():
-    assert {name: STATUS_CODES[name] for name in ("open", "in_progress", "done")} == {
+def test_legacy_codes_and_optional_plan_review_content_are_preserved():
+    assert {name: LEGACY_STATUS_CODES[name] for name in ("open", "in_progress", "done")} == {
         "open": 0,
         "in_progress": 1,
         "done": 2,
     }
-    assert len(set(STATUS_CODES.values())) == 5
-    assert UpdateTicket(status="planning", plan="Approach and done when").plan
+    assert len(set(LEGACY_STATUS_CODES.values())) == 5
+    assert UpdateTicket(stage_id="investigating", plan="Approach and done when").plan
     for summary in (None, "", "  "):
-        with pytest.raises(ValidationError, match="Review"):
-            UpdateTicket(status="review", review_summary=summary)
+        assert UpdateTicket(stage_id="review", review_summary=summary).stage_id == "review"
     assert (
-        UpdateTicket(status="review", review_summary="Verify the attached demo").status == "review"
+        UpdateTicket(stage_id="verifying", review_summary="Verify the attached demo").stage_id
+        == "verifying"
     )
     assert "lead_session_id" not in UpdateTicket(title="Keep lead").model_fields_set
     assert "lead_session_id" in UpdateTicket(lead_session_id=None).model_fields_set
     with pytest.raises(ValidationError):
         UpdateTicket(comment=" ")
+
+
+def test_stage_definitions_have_stable_defaults_and_trimmed_content():
+    defaults = default_ticket_stages()
+    assert [stage.id for stage in defaults.stages] == [
+        "open",
+        "planning",
+        "in_progress",
+        "review",
+        "done",
+    ]
+    assert defaults.initial_stage_id == "open"
+    assert [stage.id for stage in defaults.stages if stage.is_complete] == ["done"]
+    renamed = TicketStage(id="open", name=" New ", instructions=" Investigate first ")
+    assert renamed.name == "New" and renamed.instructions == "Investigate first"
+    assert renamed.id == "open"
+    defaults.stages[0].name = "Changed"
+    assert default_ticket_stages().stages[0].name == "Open"
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"stages": []},
+        {"stages": [{"id": "open", "name": "A"}, {"id": "open", "name": "B"}]},
+        {"stages": [{"id": "open", "name": " New "}, {"id": "other", "name": "new"}]},
+        {"stages": [{"id": "open", "name": " "}]},
+        {"stages": [{"id": "open", "name": "x" * 61}]},
+        {"stages": [{"id": "open", "name": "New", "instructions": "x" * 501}]},
+        {"stages": [{"id": "../other", "name": "New"}]},
+        {"stages": [{"id": "x" * 65, "name": "New"}]},
+        {"stages": [{"id": "open", "name": "New", "is_complete": True}]},
+        {"initial_stage_id": "missing"},
+        {"stages": [{"id": f"stage-{index}", "name": str(index)} for index in range(21)]},
+    ],
+)
+def test_stage_configuration_validation(changes):
+    with pytest.raises(ValidationError):
+        TicketStages.model_validate({**default_ticket_stages().model_dump(), **changes})
+
+
+@pytest.mark.parametrize("moves", [{"open": "done"}, {"removed": "missing"}])
+def test_stage_removal_targets_must_survive(moves):
+    with pytest.raises(ValidationError):
+        UpdateTicketStages(**default_ticket_stages().model_dump(), moves=moves)
 
 
 def test_session_involvement_is_optional_bounded_and_only_changes_on_attach():

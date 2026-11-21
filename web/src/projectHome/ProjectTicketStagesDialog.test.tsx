@@ -1,0 +1,266 @@
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as api from "@/lib/projectTicketsApi";
+import { createProject } from "@/lib/projectsApi";
+import { ProjectTicketStagesDialog } from "./ProjectTicketStagesDialog";
+
+const projects = vi.hoisted(() => ({
+  data: [] as { id: string | null; name: string }[],
+  isLoading: false,
+  error: null as Error | null,
+  refetch: vi.fn(),
+}));
+vi.mock("@/hooks/useConversations", () => ({ useProjects: () => projects }));
+vi.mock("@/lib/CapabilitiesContext", () => ({
+  useServerInfo: () => ({ project_ticket_stages: true, project_ticket_lifecycle: true }),
+}));
+vi.mock("@/lib/projectTicketsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof api>()),
+  getTicketStages: vi.fn(),
+  updateTicketStages: vi.fn(),
+}));
+vi.mock("@/lib/projectsApi", () => ({ createProject: vi.fn() }));
+
+const clients: QueryClient[] = [];
+function renderEditor() {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  clients.push(client);
+  const onClose = vi.fn();
+  const element = <ProjectTicketStagesDialog projectName="Shipping" onClose={onClose} />;
+  const rendered = render(element, {
+    wrapper: ({ children }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    ),
+  });
+  return {
+    ...rendered,
+    client,
+    onClose,
+    refresh: () =>
+      rendered.rerender(<ProjectTicketStagesDialog projectName="Shipping" onClose={onClose} />),
+  };
+}
+
+beforeEach(() => {
+  vi.resetAllMocks();
+  projects.data = [{ id: "project", name: "Shipping" }];
+  projects.isLoading = false;
+  projects.error = null;
+  vi.mocked(api.getTicketStages).mockResolvedValue({
+    ...structuredClone(api.DEFAULT_TICKET_STAGES),
+    occupied_stage_ids: ["planning"],
+  });
+  vi.mocked(api.updateTicketStages).mockImplementation(
+    async (_project, { stages, initial_stage_id }) => ({ stages, initial_stage_id }),
+  );
+});
+afterEach(() => {
+  cleanup();
+  clients.splice(0).forEach((client) => client.clear());
+  vi.restoreAllMocks();
+});
+
+describe("Project stage editor", () => {
+  it("waits for project lookup and real stage definitions before editing", async () => {
+    projects.isLoading = true;
+    projects.data = [];
+    let resolveStages!: (stages: api.TicketStages) => void;
+    vi.mocked(api.getTicketStages).mockReturnValue(
+      new Promise((resolve) => {
+        resolveStages = resolve;
+      }),
+    );
+    const { refresh } = renderEditor();
+    expect(screen.queryByLabelText("Stage name 1")).toBeNull();
+    expect(api.getTicketStages).not.toHaveBeenCalled();
+    projects.data = [{ id: "project", name: "Shipping" }];
+    projects.isLoading = false;
+    refresh();
+    await waitFor(() => expect(api.getTicketStages).toHaveBeenCalledWith("project", true));
+    expect(screen.queryByLabelText("Stage name 1")).toBeNull();
+    await act(async () =>
+      resolveStages({
+        stages: [
+          {
+            id: "investigating",
+            name: "Investigating",
+            instructions: "Gather evidence",
+            is_complete: false,
+          },
+        ],
+        initial_stage_id: "investigating",
+      }),
+    );
+    expect(await screen.findByLabelText("Stage name 1")).toHaveValue("Investigating");
+    expect(screen.getByLabelText("Instructions for Investigating")).toHaveValue("Gather evidence");
+    expect(screen.getByRole("button", { name: "Remove Investigating" })).toBeDisabled();
+  });
+
+  it("shows a stage-load error and retries instead of inventing defaults", async () => {
+    vi.mocked(api.getTicketStages).mockRejectedValueOnce(new Error("Stages unavailable"));
+    renderEditor();
+    expect(await screen.findByRole("alert")).toHaveTextContent("Stages unavailable");
+    expect(screen.queryByLabelText("Stage name 1")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    expect(await screen.findByLabelText("Stage name 1")).toHaveValue("Open");
+  });
+
+  it("renames stable IDs and adds a completed stage with instructions and a new start", async () => {
+    const { onClose } = renderEditor();
+    fireEvent.change(await screen.findByLabelText("Stage name 1"), { target: { value: " New " } });
+    fireEvent.click(screen.getByLabelText("Start in Planning"));
+    expect(screen.getByLabelText("Planning means work is complete")).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Add stage" }));
+    expect(screen.getByRole("button", { name: "Save stages" })).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("Stage name 6"), { target: { value: "Resolved" } });
+    fireEvent.click(screen.getByLabelText("Resolved means work is complete"));
+    expect(screen.getByLabelText("Start in Resolved")).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("Instructions for Resolved"), {
+      target: { value: " Attach recovery evidence. " },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save stages" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalledOnce());
+    expect(api.updateTicketStages).toHaveBeenCalledWith("project", {
+      stages: [
+        { ...api.DEFAULT_TICKET_STAGES.stages[0], name: "New" },
+        ...api.DEFAULT_TICKET_STAGES.stages.slice(1),
+        {
+          id: expect.stringMatching(/^stage-[a-z0-9]{12}$/),
+          name: "Resolved",
+          instructions: "Attach recovery evidence.",
+          is_complete: true,
+        },
+      ],
+      initial_stage_id: "planning",
+      moves: {},
+    });
+  });
+
+  it("persists keyboard drag order without replacing stage IDs", async () => {
+    renderEditor();
+    const list = await screen.findByRole("list", { name: "Project stages" });
+    const rows = within(list).getAllByRole("listitem");
+    const handles = within(list).getAllByRole("button", { name: /^Reorder / });
+    rows.forEach((row, index) =>
+      vi.spyOn(row, "getBoundingClientRect").mockReturnValue(new DOMRect(0, index * 100, 500, 90)),
+    );
+    handles.forEach((handle, index) =>
+      vi
+        .spyOn(handle, "getBoundingClientRect")
+        .mockReturnValue(new DOMRect(0, index * 100, 24, 24)),
+    );
+    vi.spyOn(list, "getBoundingClientRect").mockReturnValue(new DOMRect(0, 0, 500, 500));
+    handles[0].focus();
+    fireEvent.keyDown(handles[0], { key: " ", code: "Space" });
+    await waitFor(() => expect(handles[0]).toHaveAttribute("aria-pressed", "true"));
+    fireEvent.keyDown(handles[0], { key: "ArrowDown", code: "ArrowDown" });
+    fireEvent.keyDown(handles[0], { key: " ", code: "Space" });
+    await waitFor(() => expect(screen.getByLabelText("Stage name 1")).toHaveValue("Planning"));
+    fireEvent.click(screen.getByRole("button", { name: "Save stages" }));
+    await waitFor(() => expect(api.updateTicketStages).toHaveBeenCalledOnce());
+    const saved = vi.mocked(api.updateTicketStages).mock.calls[0][1];
+    expect(saved.stages.map((stage) => stage.id)).toEqual([
+      "planning",
+      "open",
+      "in_progress",
+      "review",
+      "done",
+    ]);
+    expect(saved.initial_stage_id).toBe("open");
+  });
+
+  it("requires a surviving destination for populated removals and supports undo", async () => {
+    renderEditor();
+    fireEvent.click(await screen.findByRole("button", { name: "Remove Planning" }));
+    expect(screen.getByRole("button", { name: "Save stages" })).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("Move tickets from Planning to"), {
+      target: { value: "in_progress" },
+    });
+    expect(screen.getByRole("button", { name: "Save stages" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "Remove Working" }));
+    expect(screen.getByRole("button", { name: "Save stages" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Undo removal of Working" }));
+    fireEvent.click(screen.getByRole("button", { name: "Remove Review" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save stages" }));
+    await waitFor(() => expect(api.updateTicketStages).toHaveBeenCalledOnce());
+    expect(vi.mocked(api.updateTicketStages).mock.calls[0][1]).toMatchObject({
+      initial_stage_id: "open",
+      moves: { planning: "in_progress" },
+    });
+    expect(
+      vi.mocked(api.updateTicketStages).mock.calls[0][1].stages.map((stage) => stage.id),
+    ).toEqual(["open", "done", "in_progress"]);
+  });
+
+  it("rejects blank or duplicate names and cancels without persisting drafts", async () => {
+    const { onClose } = renderEditor();
+    const name = await screen.findByLabelText("Stage name 1");
+    fireEvent.change(name, { target: { value: " working " } });
+    expect(screen.getByRole("button", { name: "Save stages" })).toBeDisabled();
+    fireEvent.change(name, { target: { value: " " } });
+    expect(screen.getByRole("button", { name: "Save stages" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(onClose).toHaveBeenCalledOnce();
+    expect(api.updateTicketStages).not.toHaveBeenCalled();
+  });
+
+  it("keeps dirty fields after a failed save and a usage refresh, then retries", async () => {
+    vi.mocked(api.getTicketStages).mockResolvedValueOnce({
+      ...structuredClone(api.DEFAULT_TICKET_STAGES),
+      occupied_stage_ids: [],
+    });
+    vi.mocked(api.updateTicketStages).mockRejectedValueOnce(
+      new Error("Choose where occupied stages move"),
+    );
+    const { onClose } = renderEditor();
+    fireEvent.change(await screen.findByLabelText("Stage name 1"), { target: { value: "New" } });
+    fireEvent.click(screen.getByRole("button", { name: "Remove Planning" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save stages" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Choose where occupied stages move");
+    await waitFor(() => expect(api.getTicketStages).toHaveBeenCalledTimes(2));
+    expect(screen.getByLabelText("Stage name 1")).toHaveValue("New");
+    expect(onClose).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Save stages" })).toBeDisabled());
+    fireEvent.change(screen.getByLabelText("Move tickets from Planning to"), {
+      target: { value: "in_progress" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save stages" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalledOnce());
+    expect(vi.mocked(api.updateTicketStages).mock.calls[1][1].stages[0]).toMatchObject({
+      id: "open",
+      name: "New",
+    });
+  });
+
+  it("creates a label-only project on save and keeps the draft through its ID assignment", async () => {
+    projects.data = [{ id: null, name: "Shipping" }];
+    vi.mocked(createProject).mockResolvedValue({ id: "created", name: "Shipping" });
+    let rejectSave!: (error: Error) => void;
+    vi.mocked(api.updateTicketStages).mockReturnValueOnce(
+      new Promise((_resolve, reject) => {
+        rejectSave = reject;
+      }),
+    );
+    const { refresh, onClose } = renderEditor();
+    fireEvent.change(await screen.findByLabelText("Stage name 1"), { target: { value: "New" } });
+    expect(createProject).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Save stages" }));
+    await waitFor(() =>
+      expect(api.updateTicketStages).toHaveBeenCalledWith("created", expect.anything()),
+    );
+    projects.data = [{ id: "created", name: "Shipping" }];
+    refresh();
+    await waitFor(() => expect(api.getTicketStages).toHaveBeenCalledWith("created", true));
+    expect(screen.getByLabelText("Stage name 1")).toHaveValue("New");
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeDisabled();
+    await act(async () => rejectSave(new Error("Save failed")));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Save failed");
+    expect(screen.getByLabelText("Stage name 1")).toHaveValue("New");
+    fireEvent.click(screen.getByRole("button", { name: "Save stages" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalledOnce());
+    expect(createProject).toHaveBeenCalledExactlyOnceWith("Shipping");
+  });
+});

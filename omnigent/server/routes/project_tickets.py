@@ -17,8 +17,9 @@ from omnigent.entities.project_ticket import (
     LinkTicketSession,
     TicketActor,
     TicketEventKind,
-    TicketStatus,
+    TicketStageId,
     UpdateTicket,
+    UpdateTicketStages,
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
@@ -103,13 +104,18 @@ def create_project_tickets_router(
     async def list_tickets(
         request: Request,
         project_id: str,
-        status: TicketStatus | None = None,
+        stage_id: TicketStageId | None = None,
         after: str | None = None,
         limit: int = Query(50, ge=1, le=100),
     ) -> dict[str, Any]:
         who = await actor(request, project_id)
         return await asyncio.to_thread(
-            store.list, project_id, user_id=who.user_id, status=status, after=after, limit=limit
+            store.list,
+            project_id,
+            user_id=who.user_id,
+            stage_id=stage_id,
+            after=after,
+            limit=limit,
         )
 
     @router.post("", status_code=201)
@@ -121,6 +127,25 @@ def create_project_tickets_router(
             ticket = await asyncio.to_thread(store.create, project_id, body, who)
         wake(request)
         return ticket
+
+    @router.get("/stages")
+    async def ticket_stages(
+        request: Request, project_id: str, include_usage: bool = False
+    ) -> dict[str, Any]:
+        who = await actor(request, project_id)
+        return await asyncio.to_thread(
+            store.stages, project_id, user_id=who.user_id, include_usage=include_usage
+        )
+
+    @router.put("/stages")
+    async def update_ticket_stages(
+        request: Request, project_id: str, body: UpdateTicketStages
+    ) -> dict[str, Any]:
+        who = await actor(request, project_id)
+        with _storage_errors():
+            configuration = await asyncio.to_thread(store.update_stages, project_id, body, who)
+        wake(request)
+        return configuration
 
     @router.get("/{ticket_id}")
     async def get_ticket(request: Request, project_id: str, ticket_id: str) -> dict[str, Any]:

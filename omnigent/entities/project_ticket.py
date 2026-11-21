@@ -4,15 +4,15 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Literal
+from typing import Annotated, Literal
 from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-TicketStatus = Literal["open", "planning", "in_progress", "review", "done"]
+TicketStageId = Annotated[str, Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_-]*$")]
 TicketEventKind = Literal["created", "updated", "comment", "execution", "output"]
-STATUS_CODES = {"open": 0, "in_progress": 1, "done": 2, "planning": 3, "review": 4}
-STATUS_LABELS = {
+LEGACY_STATUS_CODES = {"open": 0, "in_progress": 1, "done": 2, "planning": 3, "review": 4}
+LEGACY_STATUS_LABELS = {
     "open": "Open",
     "planning": "Planning",
     "in_progress": "Working",
@@ -24,6 +24,72 @@ NOTIFICATION_PENDING = 0
 NOTIFICATION_QUEUED = 1
 NOTIFICATION_SKIPPED = 2
 TICKET_PAGE_MAX = 100
+STAGE_EDIT_TICKET_MAX = 500
+
+
+class TicketStage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: TicketStageId
+    name: str = Field(min_length=1, max_length=60)
+    instructions: str = Field(default="", max_length=500)
+    is_complete: bool = False
+
+    @field_validator("name", "instructions")
+    @classmethod
+    def trim_text(cls, value: str) -> str:
+        return value.strip()
+
+    @model_validator(mode="after")
+    def require_name(self) -> TicketStage:
+        if not self.name:
+            raise ValueError("stage name must not be empty")
+        return self
+
+
+class TicketStages(BaseModel):
+    """One project-owned configuration document, not a transition engine."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    stages: list[TicketStage] = Field(min_length=1, max_length=20)
+    initial_stage_id: TicketStageId
+
+    @model_validator(mode="after")
+    def validate_stages(self) -> TicketStages:
+        if len({stage.id for stage in self.stages}) != len(self.stages):
+            raise ValueError("stage IDs must be unique")
+        if len({stage.name.casefold() for stage in self.stages}) != len(self.stages):
+            raise ValueError("stage names must be unique")
+        initial = next((stage for stage in self.stages if stage.id == self.initial_stage_id), None)
+        if initial is None:
+            raise ValueError("starting stage must be one of the project's stages")
+        if initial.is_complete:
+            raise ValueError("starting stage cannot mean work is complete")
+        return self
+
+
+class UpdateTicketStages(TicketStages):
+    moves: dict[TicketStageId, TicketStageId] = Field(default_factory=dict, max_length=20)
+
+    @model_validator(mode="after")
+    def validate_moves(self) -> UpdateTicketStages:
+        surviving = {stage.id for stage in self.stages}
+        if any(
+            source in surviving or target not in surviving for source, target in self.moves.items()
+        ):
+            raise ValueError("move targets must survive and move sources must be removed stages")
+        return self
+
+
+def default_ticket_stages() -> TicketStages:
+    return TicketStages(
+        stages=[
+            TicketStage(id=stage_id, name=name, is_complete=stage_id == "done")
+            for stage_id, name in LEGACY_STATUS_LABELS.items()
+        ],
+        initial_stage_id="open",
+    )
 
 
 class TicketTag(BaseModel):
@@ -91,7 +157,10 @@ class UpdateTicket(BaseModel):
 
     title: str | None = Field(default=None, min_length=1, max_length=160)
     description: str | None = Field(default=None, max_length=3000)
-    status: TicketStatus | None = None
+    stage_id: TicketStageId | None = Field(
+        default=None,
+        description="A stage ID from this project's ticket list or stage definitions.",
+    )
     tags: list[TicketTag] | None = Field(default=None, max_length=20)
     completion_summary: str | None = Field(default=None, min_length=1, max_length=1500)
     plan: str | None = Field(default=None, max_length=3000)
@@ -112,14 +181,6 @@ class UpdateTicket(BaseModel):
     @classmethod
     def unique_keys(cls, tags: list[TicketTag] | None) -> list[TicketTag] | None:
         return None if tags is None else CreateTicket.unique_keys(tags)
-
-    @model_validator(mode="after")
-    def require_completion(self) -> UpdateTicket:
-        if self.status == "done" and not self.completion_summary:
-            raise ValueError("marking Done requires a completion summary")
-        if self.status == "review" and not (self.review_summary or "").strip():
-            raise ValueError("entering Review requires a review summary")
-        return self
 
 
 class CommentOnTicket(BaseModel):
