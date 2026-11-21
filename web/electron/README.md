@@ -536,6 +536,26 @@ Hide/reopen the Workspace or switch tabs to retain a page without reloading.
 Closing the tab destroys it. User-created Browser tabs are separate from the
 session's agent browser view and are not targeted by the agent relay.
 
+### Previews from hosts reached over SSH
+
+A session whose host runs on another machine can also open localhost pages
+once this desktop reaches that host over the user's own SSH: through
+**Connect over SSH**, or by reading one of the session's files over the SSH
+alias the web app suggests. Main records the destination only after a
+token-checked call over it reaches that host (`src/sshHosts.js`,
+`src/sshTargets.js`); the page and server name only the session's host.
+
+When such a session first opens a localhost page (address bar, link, or
+agent), a shell-owned dialog names the destination and asks whether its
+sessions may open localhost pages. **Allow** opens the page; **Not now** keeps
+that host's localhost pages blocked until Omnigent restarts. The answer lasts
+for this app run and only while the host's recorded destination is unchanged
+(`src/sshPreviewHosts.js`).
+
+`localhost` still names this computer, so forward the app's port first, for
+example with `ssh -L 5173:localhost:5173 <destination>`. The loopback rules
+above still apply.
+
 ### Agent previews on Arca
 
 The verified Arca exception also applies to the address bar and chat/file links.

@@ -154,6 +154,7 @@ const { workspaceSocketRequest } = require("./workspaceSocket");
 const { createWorkspaceSshForwards } = require("./workspaceSshForwards");
 const { createSshHostStore } = require("./sshHosts");
 const { createSshTargetChecks } = require("./sshTargets");
+const { createSshPreviewHosts } = require("./sshPreviewHosts");
 
 const serverManager = require("./server_manager");
 const { diagnostics } = require("./diagnostics");
@@ -374,6 +375,27 @@ const arcaIdentities = createArcaIdentityStore();
 const sshHosts = createSshHostStore(() => path.join(app.getPath("userData"), "ssh-hosts.json"));
 const workspaceSshForwards = createWorkspaceSshForwards();
 const sshTargetChecks = createSshTargetChecks({ record: sshHosts.record });
+const sshPreviewHosts = createSshPreviewHosts({ destination: sshHosts.destination });
+
+/**
+ * Ask, in a dialog the page can't draw over, before sessions on a host reached
+ * over SSH may open this computer's localhost pages. Null when there is no window to ask in.
+ */
+async function approveSshPreviewHost(win, serverUrl, destination) {
+  if (!win || win.isDestroyed()) return null;
+  const { response } = await dialog.showMessageBox(win, {
+    type: "question",
+    buttons: ["Not now", "Allow"],
+    defaultId: 0,
+    cancelId: 0,
+    message: `Let sessions on "${destination}" open localhost pages?`,
+    detail:
+      `${new URL(serverUrl).host} says this session runs on the host you reach over SSH as "${destination}", which Omnigent has already checked. ` +
+      "Sessions there, and their agents, could then open localhost, 127.0.0.1 and *.localhost pages in the Browser pane. Those are this computer's own ports, including any you forward from that host.\n\n" +
+      `Allow only if you recognize "${destination}".`,
+  });
+  return response === 1;
+}
 
 /**
  * Ask, in a dialog the page can't draw over, before SSH runs with a destination
@@ -4625,7 +4647,9 @@ function createBrowserRegistryForWindow(win) {
             isDatabricksManagedServerUrl(windows.get(win)?.serverUrl) &&
             isDatabricksManagedServerUrl(target),
           serverTarget: target,
-        }) || context?.hostIsThisMachine === true
+        }) ||
+        context?.hostIsThisMachine === true ||
+        sshPreviewHosts.allows(windows.get(win)?.serverUrl, context?.sourceHostId)
       );
     },
     createBoundsController: createBrowserViewBoundsController,
@@ -6106,6 +6130,22 @@ function registerIpc() {
         return false;
       }
     },
+    requestPreviewHostForEvent: async (event, url, sourceHostId) => {
+      const win = BrowserWindow.fromWebContents(event.sender);
+      const serverUrl = senderServerUrl(event);
+      if (
+        !win ||
+        win.isDestroyed() ||
+        !isPinnedOriginSender(event) ||
+        !isLoopbackPreviewUrl(url) ||
+        sshPreviewHosts.allows(serverUrl, sourceHostId)
+      ) {
+        return false;
+      }
+      return sshPreviewHosts.request(serverUrl, sourceHostId, (destination) =>
+        approveSshPreviewHost(win, serverUrl, destination),
+      );
+    },
     getAgentNavigationHintForEvent: (
       event,
       url,
@@ -6113,6 +6153,10 @@ function registerIpc() {
       rememberedArcaHostId,
       sourceIsArcaHost,
     ) => {
+      const previewHint = isLoopbackPreviewUrl(url)
+        ? sshPreviewHosts.hint(senderServerUrl(event), sourceHostId)
+        : null;
+      if (previewHint) return previewHint;
       const targetContext = arcaPreviewRecoveryTargetForEvent(event, url);
       if (!targetContext) return null;
       if (typeof rememberedArcaHostId !== "string") {

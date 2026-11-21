@@ -673,6 +673,111 @@ it("does not mistake subframe loading for an initial main-frame navigation", () 
   assert.equal("pendingUrl" in result, false);
 });
 
+describe("browser IPC localhost previews from hosts reached over SSH", () => {
+  /** A registry that blocks localhost until `state.allowed`, recording each step. */
+  function previewSetup({ request, recover } = {}) {
+    const ipcMain = makeIpcMain();
+    const state = { allowed: false, calls: [] };
+    const registry = {
+      beginAgentNavigation: () => () => true,
+      checkAgentNavigation: async () => {
+        state.calls.push(state.allowed ? "allowed" : "denied");
+        return state.allowed ? { ok: true } : { ok: false, error: "blocked" };
+      },
+      openOrNavigate: () => {
+        state.calls.push("navigate");
+        return { ok: true, created: false };
+      },
+    };
+    registerBrowserIpc({
+      ipcMain,
+      isPinnedOriginSender: () => true,
+      getRegistryForEvent: () => registry,
+      getAgentContextForEvent: (_event, opts) => ({ sourceHostId: opts?.sourceHostId ?? null }),
+      ...(recover ? { recoverAgentNavigationForEvent: recover } : {}),
+      requestPreviewHostForEvent: async (...args) => {
+        state.calls.push("request");
+        return request(state, ...args);
+      },
+    });
+    const navigate = (opts) =>
+      ipcMain.invoke(
+        "omnigent:browser-open-or-navigate",
+        {},
+        { conversationId: "source", url: "http://127.0.0.1:8787/", opts },
+      );
+    return { state, navigate };
+  }
+
+  it("asks about the source host after a typed localhost URL is blocked, then retries", async () => {
+    const seen = [];
+    const { state, navigate } = previewSetup({
+      request: (current, _event, url, sourceHostId) => {
+        seen.push([url, sourceHostId]);
+        current.allowed = true;
+        return true;
+      },
+    });
+    const result = await navigate({ force: true, sourceHostId: "host-1" });
+    assert.equal(result.ok, true);
+    assert.deepEqual(seen, [["http://127.0.0.1:8787/", "host-1"]]);
+    assert.deepEqual(state.calls, ["denied", "request", "allowed", "navigate"]);
+  });
+
+  it("asks after identity recovery declines an agent navigation", async () => {
+    const { state, navigate } = previewSetup({
+      recover: async () => {
+        state.calls.push("recover");
+        return false;
+      },
+      request: (current) => {
+        current.allowed = true;
+        return true;
+      },
+    });
+    const result = await navigate({ agent: true, sourceHostId: "host-1" });
+    assert.equal(result.ok, true);
+    assert.deepEqual(state.calls, ["denied", "recover", "request", "allowed", "navigate"]);
+  });
+
+  it("doesn't ask when identity recovery already allowed the page", async () => {
+    const { state, navigate } = previewSetup({
+      recover: async () => {
+        state.calls.push("recover");
+        state.allowed = true;
+        return true;
+      },
+      request: () => assert.fail("must not ask"),
+    });
+    assert.equal((await navigate({ agent: true, sourceHostId: "host-1" })).ok, true);
+    assert.deepEqual(state.calls, ["denied", "recover", "allowed", "navigate"]);
+  });
+
+  it("keeps the denial when the host isn't allowed or the question fails", async () => {
+    const requests = [
+      () => false,
+      () => {
+        throw new Error("no window");
+      },
+    ];
+    await Promise.all(
+      requests.map(async (request) => {
+        const { state, navigate } = previewSetup({ request });
+        const result = await navigate({ sourceHostId: "host-1" });
+        assert.deepEqual(result, { ok: false, created: false, error: "blocked" });
+        assert.deepEqual(state.calls, ["denied", "request"]);
+      }),
+    );
+  });
+
+  it("doesn't ask about a page the policy allowed", async () => {
+    const { state, navigate } = previewSetup({ request: () => assert.fail("must not ask") });
+    state.allowed = true;
+    assert.equal((await navigate({ sourceHostId: "host-1" })).ok, true);
+    assert.deepEqual(state.calls, ["allowed", "navigate"]);
+  });
+});
+
 describe("browserIpc — set active", () => {
   it("focuses the attached page only when asked", () => {
     const { ipcMain, event, wc } = setup();

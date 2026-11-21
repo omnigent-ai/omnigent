@@ -385,6 +385,10 @@ function makeDesignModeInputHandler(gestureState, isAgentInput = () => false) {
  * @param {(event: Electron.IpcMainInvokeEvent) => boolean} [deps.showsServerForEvent]
  *        Whether the sender's window still shows its server's page. Pushes to a
  *        window that navigated to a foreign page are dropped at send time.
+ * @param {(event: Electron.IpcMainInvokeEvent, url: string, sourceHostId: unknown) =>
+ *          Promise<boolean>} [deps.requestPreviewHostForEvent]
+ *        After a blocked navigation, asks whether the session's host may open
+ *        localhost pages; true retries the navigation once.
  */
 function registerBrowserIpc({
   ipcMain,
@@ -393,6 +397,7 @@ function registerBrowserIpc({
   getAgentContextForEvent = () => null,
   recoverAgentNavigationForEvent = async () => false,
   getAgentNavigationHintForEvent = () => null,
+  requestPreviewHostForEvent = async () => false,
   // The window with a tab's one page (browserTabs.js).
   routeViewForEvent = () => null,
   whileOpeningView = (handler) => handler, // the page's window while it opens
@@ -537,6 +542,14 @@ function registerBrowserIpc({
           opts?.rememberedArcaHostId,
           opts?.sourceIsArcaHost,
         );
+      } catch {
+        recovered = false;
+      }
+    }
+    // Typed URLs and links reach here too; the question names the session's host, not the page.
+    if (!r.ok && !recovered && isCurrent()) {
+      try {
+        recovered = (await requestPreviewHostForEvent(event, url, opts?.sourceHostId)) === true;
       } catch {
         recovered = false;
       }

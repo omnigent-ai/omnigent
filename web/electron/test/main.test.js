@@ -6889,6 +6889,78 @@ describe("SSH connect IPC", () => {
   });
 });
 
+describe("localhost previews for hosts reached over SSH", () => {
+  const server = "https://host.example/ml/omnigents";
+  const hostId = "0123456789abcdef0123456789abcdef";
+  const preview = "http://127.0.0.1:8787/";
+
+  /** A window on `server` whose SSH connect reaches `hostId`, answering previews with `answer()`. */
+  function previewHarness(t, answer) {
+    const h = loadNavigationHarness({
+      serverUrl: server,
+      sshConnectResult: { ok: true, shownInConsole: true, identity: { hostId } },
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    h.api.createBrowserRegistryForWindow(h.win);
+    const questions = [];
+    h.electron.dialog.showMessageBox = async (win, options) => {
+      assert.equal(win, h.win);
+      questions.push(options.message);
+      return { response: answer() };
+    };
+    const event = { sender: h.webContents, senderFrame: { url: server } };
+    const deps = h.browserIpcDeps();
+    return {
+      h,
+      event,
+      deps,
+      questions,
+      context: deps.getAgentContextForEvent(event, { sourceHostId: hostId }),
+      eligible: h.browserRegistryDeps().allowsLocalhost,
+      connect: () => h.ipc.get("omnigent:ssh-connect")(event, "devbox"),
+    };
+  }
+
+  it("asks once about a host connected over SSH, then lets its sessions open localhost pages", async (t) => {
+    const { h, event, deps, questions, context, eligible, connect } = previewHarness(t, () => 1);
+    const request = (url, source = hostId, from = event) =>
+      deps.requestPreviewHostForEvent(from, url, source);
+    const elsewhere = { sender: h.webContents, senderFrame: { url: "https://elsewhere.example/" } };
+
+    assert.equal(await request(preview), false, "nothing is recorded for the host yet");
+    assert.equal((await connect()).ok, true);
+    assert.equal(eligible(context), false);
+    assert.equal(await request("https://example.com/"), false);
+    assert.equal(await request(preview, "b".repeat(32)), false);
+    assert.equal(await request(preview, hostId, elsewhere), false);
+    assert.deepEqual(questions, []);
+
+    assert.equal(await request(preview), true);
+    assert.deepEqual(questions, ['Let sessions on "devbox" open localhost pages?']);
+    assert.equal(eligible(context), true);
+    assert.equal(eligible({ ...context, sourceHostId: "b".repeat(32) }), false);
+    assert.equal(await request(preview), false, "an allowed host needs no retry");
+    assert.equal(questions.length, 1);
+  });
+
+  it("keeps a declined host blocked until restart and tells the agent why", async (t) => {
+    const { event, deps, questions, context, eligible, connect } = previewHarness(t, () => 0);
+    assert.equal((await connect()).ok, true);
+    assert.equal(deps.getAgentNavigationHintForEvent(event, preview, hostId), null);
+
+    assert.equal(await deps.requestPreviewHostForEvent(event, preview, hostId), false);
+    assert.equal(await deps.requestPreviewHostForEvent(event, preview, hostId), false);
+    assert.equal(questions.length, 1);
+    assert.equal(eligible(context), false);
+    assert.match(
+      deps.getAgentNavigationHintForEvent(event, preview, hostId),
+      /"devbox" were declined/,
+    );
+    assert.equal(deps.getAgentNavigationHintForEvent(event, "https://example.com/", hostId), null);
+  });
+});
+
 describe("main-owned local host eligibility", () => {
   it("denies local eligibility when the window loses its pinned origin or is destroyed", (t) => {
     const h = loadNavigationHarness({ serverUrl: "https://server.example" });
