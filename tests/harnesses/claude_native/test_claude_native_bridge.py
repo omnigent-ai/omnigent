@@ -12802,6 +12802,8 @@ class _EditableComposer:
         self.submitted: list[str] = []
         # Claude Code's one stash slot: the (draft, cursor) Ctrl+S set aside.
         self.stash: tuple[str, int] | None = None
+        # Captures that fail next, as a torn read during a repaint does.
+        self.failing_captures = 0
         self._paste_buffer = ""
         self._actions = {
             "\x1b[107;5u": self._kill_to_line_end,
@@ -12817,6 +12819,12 @@ class _EditableComposer:
         monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
         # No Claude Code process runs behind this box for a repaint signal to reach.
         monkeypatch.setattr(claude_native_bridge, "_request_claude_repaint", lambda *_: 0)
+        # Nor for tmux to probe: the box stands for a running terminal.
+        monkeypatch.setattr(
+            claude_native_bridge,
+            "_claude_pane_state",
+            lambda *_args: claude_native_bridge._ClaudePaneState(alive=True),
+        )
 
     def _run_tmux(self, socket_path: str, *args: str) -> None:
         del socket_path
@@ -12846,6 +12854,9 @@ class _EditableComposer:
 
     def _capture_pane(self, socket_path: str, tmux_target: str) -> str:
         del socket_path, tmux_target
+        if self.failing_captures:
+            self.failing_captures -= 1
+            return ""
         if self._clearing_started and self._unavailable_clear_captures:
             self._unavailable_clear_captures -= 1
             return ""
@@ -13366,6 +13377,177 @@ def test_unavailable_composer_capture_never_submits_the_leftover_draft(
     else:
         inject(bridge_dir)
         assert [text.strip() for text in composer.submitted] == [expected]
+
+
+@pytest.mark.parametrize(
+    "inject",
+    [
+        lambda bridge_dir: inject_user_message(bridge_dir, content="hello from the web"),
+        lambda bridge_dir: claude_native_bridge.inject_slash_command(
+            bridge_dir, command="/effort high"
+        ),
+    ],
+    ids=["web-message", "slash-command"],
+)
+@pytest.mark.parametrize(
+    "failed_captures",
+    [1, claude_native_bridge._COMPOSER_CLEAR_MAX_ROUNDS],
+    ids=["one-failed-capture", "persistent-failed-captures"],
+)
+def test_an_unreadable_box_before_the_stash_leaves_the_draft_as_typed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    inject: Callable[[Path], None],
+    failed_captures: int,
+) -> None:
+    """
+    A capture that cannot read the box is not an empty box.
+
+    The Space that returns focus to the box would land inside a draft the
+    capture could not see. A transient failure delivers with the draft
+    returned exactly; a lasting one refuses with the draft untouched.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    composer = _EditableComposer(_STALE_MULTILINE_DRAFT, cursor=4)
+    composer.install(monkeypatch)
+    clear_composer = claude_native_bridge._clear_composer
+
+    def clear_after_torn_reads(*args: Any, **kwargs: Any) -> None:
+        # The captures fail from the very first one the clearing takes.
+        composer.failing_captures = failed_captures
+        clear_composer(*args, **kwargs)
+
+    monkeypatch.setattr(claude_native_bridge, "_clear_composer", clear_after_torn_reads)
+
+    if failed_captures == 1:
+        inject(bridge_dir)
+        assert len(composer.submitted) == 1
+    else:
+        with pytest.raises(
+            claude_native_bridge.ClaudeComposerNotCleared, match="nothing was sent"
+        ):
+            inject(bridge_dir)
+        assert composer.submitted == []
+    assert (composer.text, composer.cursor, composer.stash) == (_STALE_MULTILINE_DRAFT, 4, None)
+
+
+class _ResumingComposer(_EditableComposer):
+    """
+    The input box of a Claude Code still replaying a resumed transcript.
+
+    The first paste does not show while the replay redraws the screen, and
+    lands in the box when the replay ends, as a paste the TUI held back does.
+    """
+
+    _REPLAY = "Resuming the conversation from the transcript...\n"
+
+    def __init__(self, draft: str, *, cursor: int, replay_captures: int) -> None:
+        super().__init__(draft, cursor=cursor)
+        self._replay_captures = replay_captures
+        self._replay_left = 0
+        self._held_paste: str | None = None
+        self.pastes = 0
+
+    def _run_tmux(self, socket_path: str, *args: str) -> None:
+        if args[0] == "paste-buffer":
+            self.pastes += 1
+            if self.pastes == 1:
+                self._held_paste, self._replay_left = self._paste_buffer, self._replay_captures
+                return
+        super()._run_tmux(socket_path, *args)
+
+    def _capture_pane(self, socket_path: str, tmux_target: str) -> str:
+        if self._replay_left:
+            self._replay_left -= 1
+            if not self._replay_left and self._held_paste is not None:
+                self._insert(self._held_paste)
+                self._held_paste = None
+            return self._REPLAY
+        return super()._capture_pane(socket_path, tmux_target)
+
+
+@pytest.mark.parametrize(
+    ("draft", "cursor"),
+    [("", 0), (_STALE_MULTILINE_DRAFT, 4)],
+    ids=["empty-box", "draft-stashed-first"],
+)
+def test_a_first_paste_that_lands_during_recovery_is_submitted_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, draft: str, cursor: int
+) -> None:
+    """
+    A paste that shows only after the recovery wait is this delivery's, not a draft.
+
+    As in ``test_paste_into_a_resuming_tui_waits_for_the_composer_before_any_enter``,
+    the first paste is not seen before the paste wait ends; here it then lands
+    while recovery waits for the box. Stashing it as the person's draft and
+    pasting again would deliver the message and then hand it back as a
+    duplicate draft, with the delivery reported as not accepted.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    # Past the paste wait's polls, into the recovery's wait for the box.
+    replay_captures = (
+        int(
+            claude_native_bridge._PASTE_COMMIT_TIMEOUT_S
+            / claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S
+        )
+        + 10
+    )
+    composer = _ResumingComposer(draft, cursor=cursor, replay_captures=replay_captures)
+    composer.install(monkeypatch)
+
+    inject_user_message(bridge_dir, content="hello from the web")
+
+    assert composer.pastes == 1
+    assert [text.strip() for text in composer.submitted] == ["hello from the web"]
+    assert (composer.text, composer.cursor, composer.stash) == (draft, cursor, None)
+
+
+class _ComposerKeepingItsStash(_EditableComposer):
+    """Claude Code that does not return the stash after a submit within the wait."""
+
+    def __init__(self, draft: str, *, cursor: int, typed_after_submit: str) -> None:
+        super().__init__(draft, cursor=cursor)
+        self._typed_after_submit = typed_after_submit
+
+    def _run_tmux(self, socket_path: str, *args: str) -> None:
+        if args[0] == "send-keys" and args[-1] == "Enter":
+            self.submitted.append(self.text)
+            self.text = self._typed_after_submit
+            self.cursor = len(self.text)
+            return
+        super()._run_tmux(socket_path, *args)
+
+
+@pytest.mark.parametrize(
+    "typed_after_submit", ["", "a new thought"], ids=["box-empty", "box-occupied"]
+)
+def test_a_stash_claude_code_keeps_is_returned_only_to_an_empty_box(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, typed_after_submit: str
+) -> None:
+    """
+    The delivery returns a stash Claude Code kept, but never over new text.
+
+    Ctrl+S on a box that holds text would stash that text in place of the
+    person's draft, so the stash is then left for the person to return.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    composer = _ComposerKeepingItsStash(
+        _STALE_MULTILINE_DRAFT, cursor=4, typed_after_submit=typed_after_submit
+    )
+    composer.install(monkeypatch)
+
+    inject_user_message(bridge_dir, content="hello from the web")
+
+    assert [text.strip() for text in composer.submitted] == ["hello from the web"]
+    if typed_after_submit:
+        assert composer.text == typed_after_submit
+        assert composer.stash == (_STALE_MULTILINE_DRAFT, 4)
+    else:
+        assert (composer.text, composer.cursor, composer.stash) == (
+            _STALE_MULTILINE_DRAFT,
+            4,
+            None,
+        )
 
 
 @pytest.mark.parametrize("cursor", [0, len(_TALL_DRAFT)], ids=["cursor-at-start", "cursor-at-end"])

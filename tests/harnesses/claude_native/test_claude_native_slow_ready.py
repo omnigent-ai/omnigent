@@ -224,7 +224,8 @@ def test_first_message_survives_slow_terminal_startup(
                 assert geometry.stdout.strip() == "6"
             elif startup == "exit-after-ready":
                 caplog.set_level(logging.WARNING)
-                with pytest.raises(RuntimeError, match="tmux command failed"):
+                # No key goes into a pane whose input box cannot be read.
+                with pytest.raises(bridge.ClaudeTerminalExited, match="no longer running"):
                     bridge.inject_user_message(
                         bridge_dir, content="MUST_NOT_DELIVER", timeout_s=0.3
                     )
@@ -234,8 +235,8 @@ def test_first_message_survives_slow_terminal_startup(
                     if getattr(r, "event_name", None) == "claude_native_delivery_finished"
                 )
                 row = record_to_row(record, source="runner")
-                assert row["attributes"]["tmux_operation"] == "send-keys"
-                assert row["attributes"]["tmux_returncode"] == "1"
+                assert row["attributes"]["error_type"] == "ClaudeTerminalExited"
+                assert "tmux_operation" not in row["attributes"]
                 assert "MUST_NOT_DELIVER" not in json.dumps(row)
                 assert str(socket_path) not in json.dumps(row)
                 assert not delivered.exists()

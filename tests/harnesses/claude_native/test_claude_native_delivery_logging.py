@@ -47,7 +47,9 @@ def test_delivery_diagnostics(
         secret = "/private-customer-command"
     content = "\n" + secret if scenario == "blank_line" else secret
     elapsed = 0.0
-    pane = "❯ "
+    # The empty input box: no key is sent before a capture shows it.
+    empty_box = "──────\n❯ \n──────\n"
+    pane = empty_box
     enters = 0
     pending_checks = 0
 
@@ -77,7 +79,7 @@ def test_delivery_diagnostics(
             for record in caplog.records
         )
         if args[-1] == "Space":
-            pane = "──────\n❯ \n──────\n"
+            pane = empty_box
         elif args[0] == "send-keys" and "-l" in args:
             pane = "❯ "
         if args[0] == "paste-buffer":
@@ -88,7 +90,12 @@ def test_delivery_diagnostics(
             enters += 1
             if scenario in {"blank_line", "timeout"} or (scenario == "retry" and enters == 1):
                 return
-            pane = {"empty_capture": "", "missing_glyph": "terminal output"}.get(scenario, "❯ ")
+            # The plain-text re-delivery after an unknown command types into a shown box.
+            pane = {
+                "empty_capture": "",
+                "missing_glyph": "terminal output",
+                "unknown_command": empty_box,
+            }.get(scenario, "❯ ")
 
     monkeypatch.setattr(
         bridge,

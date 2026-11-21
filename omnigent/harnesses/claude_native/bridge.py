@@ -5174,6 +5174,7 @@ def _paste_and_submit(
     # Enter submits both together. The draft itself is stashed, not erased.
     _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir, guard=guard)
     transcript_before_paste = _capture_pane(socket_path, tmux_target)
+    paste_sent_at = time.time()
     draft_seen, pane, polls, empty_captures, paste_wait_started = _paste_and_await_draft(
         bridge_dir,
         socket_path,
@@ -5202,15 +5203,25 @@ def _paste_and_submit(
             bridge_dir=bridge_dir,
             extend_for_slow_boot=False,
         )
-        _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir, guard=guard)
-        draft_seen, pane, polls, empty_captures, paste_wait_started = _paste_and_await_draft(
-            bridge_dir,
-            socket_path,
-            tmux_target,
-            payload=payload,
-            needle=needle,
-            tail_needle=tail_needle,
-        )
+        pane = _capture_pane(socket_path, tmux_target)
+        if _draft_in_input_box(pane, needle, tail_needle=tail_needle) and not _typed_in_pane_since(
+            socket_path, tmux_target, paste_sent_at
+        ):
+            # The first paste landed during the wait. No one has typed since it
+            # was sent, so the box holds this delivery's own text: it is
+            # submitted, not stashed as the person's draft and pasted again.
+            draft_seen = True
+            delivery_diagnostics.record_details(late_paste_seen=True)
+        else:
+            _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir, guard=guard)
+            draft_seen, pane, polls, empty_captures, paste_wait_started = _paste_and_await_draft(
+                bridge_dir,
+                socket_path,
+                tmux_target,
+                payload=payload,
+                needle=needle,
+                tail_needle=tail_needle,
+            )
     delivery_diagnostics.record_draft(
         pane=pane,
         needle=needle,
@@ -6734,6 +6745,26 @@ class _ClaudePaneState(NamedTuple):
     exit_status: str | None = None
 
 
+def _terminal_exited_error(exit_status: str | None, *, tail: str = "") -> ClaudeTerminalExited:
+    """
+    Build the refusal for a Claude Code terminal that tmux no longer reports.
+
+    :param exit_status: The pane's wait-status, e.g. ``"1"``, when tmux gave one.
+    :param tail: The terminal's last output, from :func:`_format_terminal_failure_tail`.
+    :returns: The exception to raise.
+    """
+    gone = (
+        "is no longer running (exit status unknown)"
+        if exit_status is None
+        else f"has exited (status {exit_status})"
+    )
+    return ClaudeTerminalExited(
+        f"The Claude Code terminal {gone}, so the message was not delivered. "
+        "Relaunch the terminal to continue this conversation." + tail,
+        exit_status=exit_status,
+    )
+
+
 def _claude_pane_state(socket_path: str, tmux_target: str) -> _ClaudePaneState:
     """
     Report whether the Claude pane's process is still running.
@@ -7690,6 +7721,20 @@ def _wait_for_typing_pause(socket_path: str, tmux_target: str) -> None:
         time.sleep(min(_TYPING_PAUSE_S - paused_s, _CLAUDE_READY_POLL_INTERVAL_S))
 
 
+def _typed_in_pane_since(socket_path: str, tmux_target: str, since: float) -> bool:
+    """
+    Return whether the person typed in the pane after *since*.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param since: Wall-clock seconds, as :func:`time.time` returns.
+    :returns: ``True`` when an attached terminal or the web terminal sent keys
+        after *since*.
+    """
+    typed_at = last_human_input_at(socket_path, tmux_target)
+    return typed_at is not None and typed_at > since
+
+
 def _stash_marker_shown(pane: str) -> bool:
     """
     Return whether Claude Code shows that a stashed draft is waiting.
@@ -7846,7 +7891,9 @@ def _set_draft_aside(
     Text the stash key leaves in place can be another process's output
     printed over the box rather than a draft, so the box is repainted once
     before such text refuses the delivery as a draft that could not be
-    stashed.
+    stashed. A capture that does not show the box, such as a torn read during
+    a repaint, says nothing about a draft: it is retried, and the delivery is
+    refused before any key if no capture shows the box.
 
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
@@ -7855,8 +7902,21 @@ def _set_draft_aside(
     :param guard: The delivery's record of the draft it stashed.
     :raises ClaudeComposerHoldsDraft: If the draft could not be stashed;
         nothing was typed.
+    :raises ClaudeComposerNotCleared: If no capture showed the input box;
+        nothing was typed.
+    :raises ClaudeTerminalExited: If no capture showed the box because the
+        terminal is gone; nothing was typed.
     """
-    pane = _capture_pane(socket_path, tmux_target)
+    pane = _readable_composer_pane(socket_path, tmux_target)
+    if _composer_box(pane) is None:
+        _record_held_draft(pane)
+        state = _claude_pane_state(socket_path, tmux_target)
+        if state.alive is False:
+            raise _terminal_exited_error(state.exit_status)
+        raise ClaudeComposerNotCleared(
+            "Claude Code's input box could not be read, so nothing was sent. "
+            "Open the terminal and retry."
+        )
     if not _composer_holds_draft(socket_path, tmux_target, pane):
         return
     if guard.stashed or _stash_marker_shown(pane):
@@ -7883,6 +7943,25 @@ def _set_draft_aside(
     if stashed:
         delivery_diagnostics.record_details(draft_stashed=True)
         _logger.info("claude-native: stashed the person's unsent draft for a delivery")
+
+
+def _readable_composer_pane(socket_path: str, tmux_target: str) -> str:
+    """
+    Capture the pane until it shows the input box, within the clearing budget.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :returns: The first capture that shows the box, or the last capture when
+        none of :data:`_COMPOSER_CLEAR_MAX_ROUNDS` did.
+    """
+    pane = ""
+    for attempt in range(_COMPOSER_CLEAR_MAX_ROUNDS):
+        if attempt:
+            time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+        pane = _capture_pane(socket_path, tmux_target)
+        if _composer_box(pane) is not None:
+            break
+    return pane
 
 
 def _record_held_draft(pane: str) -> None:
@@ -8049,7 +8128,8 @@ def _clear_composer(
         capture showed the box whole and down to one row; nothing was pasted.
     :raises RuntimeError: If a ``tmux`` invocation fails.
     """
-    # Before any key: the Space and the clearing keys would edit the draft.
+    # Before any key, from a capture that shows the box: the Space and the
+    # clearing keys would edit a draft.
     _set_draft_aside(socket_path, tmux_target, bridge_dir=bridge_dir, guard=guard)
     # Space returns focus from the footer to the input box. The clear also
     # removes the space when the input box already held focus.
@@ -8710,16 +8790,8 @@ def _wait_for_claude_prompt_ready(
         # which reads as a rendering bug. A pane tmux no longer reports is a
         # different failure: the terminal is gone, so a relaunch is the fix.
         # Its wait-status, when tmux gave one, tells a quit from a crash.
-        gone = (
-            "is no longer running (exit status unknown)"
-            if exited_status is None
-            else f"has exited (status {exited_status})"
-        )
-        raise ClaudeTerminalExited(
-            f"The Claude Code terminal {gone}, so the message was not delivered. "
-            "Relaunch the terminal to continue this conversation."
-            + _format_terminal_failure_tail(last_nonempty),
-            exit_status=exited_status,
+        raise _terminal_exited_error(
+            exited_status, tail=_format_terminal_failure_tail(last_nonempty)
         )
     raise ClaudePromptTimeout(
         f"Claude Code terminal did not become ready within {waited_s:.1f}s "
