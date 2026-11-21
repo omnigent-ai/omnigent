@@ -10,6 +10,7 @@ final class WatchConversation {
   private(set) var approvals: [WatchElicitation] = []
   private(set) var isLoading = true
   private(set) var isBusy = false
+  private(set) var pollDelay: Duration = .seconds(5)
   /// Suppress stale ordinary prompts; native delivery confirmation remains server-owned.
   private var answered: Set<String> = []
   private var loadGeneration = 0
@@ -45,6 +46,7 @@ final class WatchConversation {
       async let items = recentItems(path + "/items", host: host)
       let (state, transcript) = try await (snapshot, items)
       guard generation == loadGeneration else { return }
+      pollDelay = .seconds(5)
       messages = state.messages(items: transcript)
       approvals = (state.pendingElicitations ?? []).filter {
         $0.params.nativeDelivery != nil || !answered.contains($0.id)
@@ -63,6 +65,7 @@ final class WatchConversation {
     } catch {
       guard generation == loadGeneration else { return }
       loadError = error.localizedDescription
+      pollDelay = min(pollDelay * 2, .seconds(120))
     }
   }
 

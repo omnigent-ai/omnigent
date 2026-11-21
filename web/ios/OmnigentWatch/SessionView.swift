@@ -29,7 +29,7 @@ struct SessionView: View {
     .task {
       while !Task.isCancelled {
         await conversation.load()
-        try? await Task.sleep(for: .seconds(5))
+        try? await Task.sleep(for: conversation.pollDelay)
       }
     }
   }

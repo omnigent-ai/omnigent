@@ -64,7 +64,8 @@ final class WatchCompanionTests: XCTestCase {
   }
 
   func testWatchKeychainWriteFailurePreservesSavedCredentials() {
-    let store = WatchKeychain(service: "ai.omnigent.ios.tests.watch.\(UUID().uuidString)")
+    let service = "ai.omnigent.ios.tests.watch.\(UUID().uuidString)"
+    let store = WatchKeychain(service: service)
     defer { _ = store.save(nil) }
     let saved = WatchCredentials(
       apiURL: URL(string: "https://omnigent.example.com/v1")!, cookie: "session=saved")
@@ -87,7 +88,11 @@ final class WatchCompanionTests: XCTestCase {
     }
     XCTAssertEqual(
       store.save(nil, delete: { _ in errSecInteractionNotAllowed }), errSecInteractionNotAllowed)
-    XCTAssertEqual(store.load(), saved)
+    XCTAssertNil(store.load(), "Failed deletion must not restore a signed-out account")
+    XCTAssertNil(
+      WatchKeychain(service: service).load(), "Sign-out intent survives store recreation")
+    XCTAssertEqual(store.save(renewed, update: { _, _ in errSecAuthFailed }), errSecAuthFailed)
+    XCTAssertNil(store.load(), "A failed replacement must not undo pending sign-out")
 
     var updates = 0
     XCTAssertEqual(
@@ -222,6 +227,8 @@ final class WatchCompanionTests: XCTestCase {
       XCTAssertEqual(conversation.error, expectedError)
       await conversation.load()
       XCTAssertEqual(conversation.error, expectedError)
+      XCTAssertEqual(
+        conversation.pollDelay, .seconds(5), "Approval failures do not slow healthy reads")
       XCTAssertEqual(conversation.approvals.map(\.id), ["e1"])
       if resolvedElsewhere {
         try await client.post(
@@ -304,6 +311,40 @@ final class WatchCompanionTests: XCTestCase {
     }
   }
 
+  @MainActor func testConversationPollingBacksOffFailedReads() async throws {
+    let lock = NSLock()
+    var failureStatus = 0
+    let server = try MockHTTPServer(requestHandler: { request in
+      let failure = lock.withLock { failureStatus }
+      if failure != 0 { return (failure, [:], Data()) }
+      let path = URLComponents(string: request.path)?.path
+      XCTAssertTrue(path == "/v1/sessions/s1" || path == "/v1/sessions/s1/items")
+      return (
+        200, [:],
+        Data((path == "/v1/sessions/s1/items" ? #"{"data":[]}"# : #"{"status":"idle"}"#).utf8)
+      )
+    })
+    let session = try WatchClient.decoder.decode(
+      WatchSession.self, from: Data(#"{"id":"s1","status":"idle"}"#.utf8))
+    let conversation = WatchConversation(
+      session: session,
+      client: WatchClient(
+        credentials: WatchCredentials(
+          apiURL: URL(string: "http://127.0.0.1:\(server.port)/v1")!, cookie: "session=test")))
+    for status in [401, 403, 503] {
+      lock.withLock { failureStatus = status }
+      for seconds in [10, 20, 40, 80, 120, 120] {
+        await conversation.load()
+        XCTAssertNotNil(conversation.error)
+        XCTAssertEqual(conversation.pollDelay, .seconds(seconds))
+      }
+      lock.withLock { failureStatus = 0 }
+      await conversation.load()
+      XCTAssertNil(conversation.error)
+      XCTAssertEqual(conversation.pollDelay, .seconds(5))
+    }
+  }
+
   @MainActor func testOnlyNewestConversationLoadCanPublishResults() async throws {
     for olderFails in [false, true] {
       let olderRequests = expectation(description: "older snapshot and items are waiting")
@@ -371,6 +412,7 @@ final class WatchCompanionTests: XCTestCase {
       XCTAssertEqual(conversation.approvals.map(\.id), ["newer"])
       XCTAssertEqual(conversation.session.status, "idle")
       XCTAssertNil(conversation.error)
+      XCTAssertEqual(conversation.pollDelay, .seconds(5))
     }
   }
 

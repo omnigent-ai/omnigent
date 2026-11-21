@@ -9,6 +9,8 @@ struct WatchKeychain: Sendable {
     self.service = service
   }
 
+  private var pendingSignOutKey: String { service + ".pendingSignOut" }
+
   private var query: [String: Any] {
     [
       kSecClass as String: kSecClassGenericPassword,
@@ -19,6 +21,7 @@ struct WatchKeychain: Sendable {
   }
 
   func load() -> WatchCredentials? {
+    guard !UserDefaults.standard.bool(forKey: pendingSignOutKey) else { return nil }
     var result: CFTypeRef?
     let search = query.merging([kSecReturnData as String: true]) { $1 }
     guard SecItemCopyMatching(search as CFDictionary, &result) == errSecSuccess,
@@ -34,8 +37,14 @@ struct WatchKeychain: Sendable {
     delete: (CFDictionary) -> OSStatus = SecItemDelete
   ) -> OSStatus {
     guard let credentials else {
+      // Remember sign-out even when the Keychain cannot delete its saved record yet.
+      UserDefaults.standard.set(true, forKey: pendingSignOutKey)
       let status = delete(query as CFDictionary)
-      return status == errSecItemNotFound ? errSecSuccess : status
+      if status == errSecSuccess || status == errSecItemNotFound {
+        UserDefaults.standard.removeObject(forKey: pendingSignOutKey)
+        return errSecSuccess
+      }
+      return status
     }
     guard let data = try? JSONEncoder().encode(credentials) else { return errSecParam }
     let attributes: [String: Any] = [
@@ -49,6 +58,7 @@ struct WatchKeychain: Sendable {
         status = update(query as CFDictionary, attributes as CFDictionary)
       }
     }
+    if status == errSecSuccess { UserDefaults.standard.removeObject(forKey: pendingSignOutKey) }
     return status
   }
 }
