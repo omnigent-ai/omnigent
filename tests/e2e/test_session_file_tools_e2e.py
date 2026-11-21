@@ -15,9 +15,7 @@ import json
 import os
 import shlex
 import shutil
-import time
 import uuid
-from collections.abc import Callable
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
@@ -40,6 +38,7 @@ from tests.e2e.conftest import (
     send_user_message_to_session,
     set_fallback_mock_llm,
 )
+from tests.e2e.routing._helpers import wait_for
 
 _REPO = Path(__file__).resolve().parents[2]
 _FILE_TOOLS = {"sys_upload_file", "sys_list_files", "sys_download_file"}
@@ -47,17 +46,6 @@ _OLD_NAMES = {"upload_file", "list_files", "download_file"}
 _OS_ENV = {"type": "caller_process", "cwd": ".", "sandbox": {"type": "none"}}
 _NATIVE_MODELS = {"claude": "claude-sonnet-4-20250514", "codex": "gpt-4o"}
 _SYSTEM_CODEX_CONFIG = Path("/etc/codex/managed_config.toml")
-
-
-def _wait(check: Callable[[], Any], description: str, timeout: float = 90) -> Any:
-    """Poll *check* until it returns a truthy value, failing after *timeout* seconds."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        value = check()
-        if value:
-            return value
-        time.sleep(0.2)
-    raise AssertionError(f"Timed out waiting for {description}")
 
 
 def _stack_base_env() -> dict[str, str]:
@@ -426,7 +414,7 @@ def test_native_cli_uploads_a_workspace_file_through_the_omnigent_relay(
             response.raise_for_status()
             return next((h for h in response.json()["hosts"] if h["status"] == "online"), None)
 
-        host = _wait(online_host, "real host registration")
+        host = wait_for(online_host, timeout=90, what="real host registration", interval=0.2)
         spec = {
             "name": f"native-files-{harness}",
             "prompt": "Share files with the user when asked.",
@@ -473,7 +461,7 @@ def test_native_cli_uploads_a_workspace_file_through_the_omnigent_relay(
         # A native CLI can take input before its MCP discovery finishes.
         sent_probes = 0
 
-        def relay_tools_offered() -> set[str]:
+        def relay_tools_offered() -> set[str] | None:
             nonlocal sent_probes
             snapshot = client.get(f"/v1/sessions/{session_id}").json()
             assert not snapshot.get("last_task_error"), snapshot["last_task_error"]
@@ -484,9 +472,14 @@ def test_native_cli_uploads_a_workspace_file_through_the_omnigent_relay(
             if snapshot["status"] == "idle" and len(requests) >= sent_probes:
                 sent_probes += 1
                 send(probe)
-            return set()
+            return None
 
-        offered = _wait(relay_tools_offered, "the native CLI to offer the relay's tools", 180)
+        offered = wait_for(
+            relay_tools_offered,
+            timeout=180,
+            what="the native CLI to offer the relay's tools",
+            interval=0.2,
+        )
         assert offered >= _FILE_TOOLS, sorted(offered)
         assert not offered & _OLD_NAMES, sorted(offered)
 
@@ -522,7 +515,12 @@ def test_native_cli_uploads_a_workspace_file_through_the_omnigent_relay(
                 ).raise_for_status()
             return _session_files(client, session_id).get("report.md")
 
-        file_id = _wait(uploaded_report, "the native CLI's upload to reach the session", 180)
+        file_id = wait_for(
+            uploaded_report,
+            timeout=180,
+            what="the native CLI's upload to reach the session",
+            interval=0.2,
+        )
         assert _file_bytes(client, session_id, file_id) == b"native report"
 
 
@@ -589,28 +587,38 @@ def test_isolating_runner_keeps_uploads_inside_each_session(tmp_path: Path) -> N
     assert set(stored) == {"own.txt"}, stored
 
 
-def test_cli_style_model_turn_uploads_the_file_it_wrote_to_its_workspace(
-    tmp_path: Path, mock_llm_server_url: str
+@pytest.mark.parametrize("isolating", [True, False], ids=["cli-isolating-runner", "shared-runner"])
+def test_model_turn_uploads_only_from_the_session_workspace(
+    tmp_path: Path, mock_llm_server_url: str, isolating: bool
 ) -> None:
     """
-    ``omnigent chat`` and ``omnigent run`` start a runner that isolates sessions
-    and give each session the launch directory as its workspace. A model turn's
-    ``sys_os_write`` writes there, and its ``sys_upload_file`` shares that file.
+    A model turn's ``sys_upload_file`` reads the session's own workspace: it shares
+    the report ``sys_os_write`` just wrote there and refuses a file outside it.
+    ``omnigent chat`` and ``omnigent run`` isolate sessions and use the launch
+    directory as both workspaces; a shared runner may serve a session elsewhere.
     """
+    runner_workspace = tmp_path / "runner-workspace"
+    session_workspace = runner_workspace if isolating else tmp_path / "session-workspace"
+    session_workspace.mkdir(parents=True, exist_ok=True)
+    outside = (tmp_path if isolating else runner_workspace) / "outside.txt"
+    outside.parent.mkdir(parents=True, exist_ok=True)
+    outside.write_text("NOT THIS SESSION'S FILE")
     model = f"mock-files-cli-{uuid.uuid4().hex[:8]}"
     configure_mock_llm(
         mock_llm_server_url,
         [
             _tool_call("write", "sys_os_write", {"path": "report.md", "content": "cli report"}),
             _tool_call("upload", "sys_upload_file", {"path": "report.md"}),
+            _tool_call("outside", "sys_upload_file", {"path": str(outside)}),
             {"text": "Shared report.md."},
         ],
         key=model,
         required_tools=["sys_upload_file"],
     )
-    with server_runner(tmp_path, base_env=_stack_base_env(), poll_interval=0.2) as stack:
-        # The CLI's runner: its workspace is the launch directory, sessions isolated.
-        stack.start_runner(env={"OMNIGENT_RUNNER_ISOLATE_SESSION": "1"})
+    with server_runner(
+        tmp_path, base_env=_stack_base_env(), workspace=runner_workspace, poll_interval=0.2
+    ) as stack:
+        stack.start_runner(env={"OMNIGENT_RUNNER_ISOLATE_SESSION": "1" if isolating else "0"})
         with httpx.Client(
             base_url=stack.base_url,
             trust_env=False,
@@ -623,7 +631,7 @@ def test_cli_style_model_turn_uploads_the_file_it_wrote_to_its_workspace(
                 mock_llm_server_url=mock_llm_server_url,
                 model=model,
                 spec_overrides={"os_env": _OS_ENV},
-                metadata={"workspace": str(stack.workspace)},
+                metadata={"workspace": str(session_workspace)},
             )
             response_id = send_user_message_to_session(
                 client, session_id=session_id, content="Write the report and share it."
@@ -641,8 +649,10 @@ def test_cli_style_model_turn_uploads_the_file_it_wrote_to_its_workspace(
     advertised = advertised_tool_names(get_mock_requests(mock_llm_server_url, key=model))
     assert "sys_upload_file" in advertised, sorted(advertised)
     assert body["status"] == "completed", (body.get("status"), body.get("error"))
-    assert (stack.workspace / "report.md").read_text() == "cli report"
-    upload = _outputs_by_call_id(body)["upload"]
-    assert not upload.startswith("Error:"), upload
-    assert json.loads(upload)["filename"] == "report.md", upload
-    assert shared == b"cli report", stored
+    assert (session_workspace / "report.md").read_text() == "cli report"
+    outputs = _outputs_by_call_id(body)
+    assert not outputs["upload"].startswith("Error:"), outputs["upload"]
+    assert json.loads(outputs["upload"])["filename"] == "report.md", outputs["upload"]
+    assert outputs["outside"].startswith("Error: sys_upload_file failed:"), outputs["outside"]
+    assert set(stored) == {"report.md"}, stored
+    assert shared == b"cli report"
