@@ -155,8 +155,14 @@ async function dispatch(
           ...(rememberedArcaHostId ? { rememberedArcaHostId } : {}),
           ...(sourceIsArcaHost ? { sourceIsArcaHost: true } : {}),
         };
-        const r = await withPreviewHostRetry(browserViewOwnerId(conversationId), sourceHostId, () =>
-          desktop.browserOpenOrNavigate!(conversationId, url, undefined, options),
+        const r = await withPreviewHostRetry(
+          browserViewOwnerId(conversationId),
+          sourceHostId,
+          (retryOptions) =>
+            desktop.browserOpenOrNavigate!(conversationId, url, undefined, {
+              ...options,
+              ...retryOptions,
+            }),
         );
         if (!r?.ok) return { ok: false, error: r?.error ?? "navigate failed" };
         if (

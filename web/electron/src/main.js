@@ -47,6 +47,7 @@ const { omnigentBuild } = require("../package.json");
 const { execFile } = require("node:child_process");
 const { registerLocalhostCors } = require("./localhost_cors");
 const { isLoopbackPreviewUrl } = require("./browserUrlPolicy");
+const { normalizedServerTarget } = require("./hostStatusIdentity");
 const {
   registerBrowserPermissions,
   createBrowserPermissionStore,
@@ -564,7 +565,7 @@ const arcaAutoConnect = createArcaAutoConnect({
 });
 /** Agent retry bursts after a deliberate decline should not reopen the prompt immediately. */
 const ARCA_PREVIEW_DECLINE_COOLDOWN_MS = 10 * 1000;
-const arcaPreviewRecoveries = new Set();
+const pendingPreviewReconnects = new Set();
 const arcaPreviewDeclinedUntil = new Map();
 
 /**
@@ -4582,8 +4583,8 @@ function arcaPreviewRecoveryContextForEvent(
 
 /** Open one shared consent flow and let the requesting agent retry afterward. */
 function startArcaPreviewConsentRecovery({ win, target, sourceHostId }) {
-  if (arcaPreviewRecoveries.has(target)) return;
-  arcaPreviewRecoveries.add(target);
+  if (pendingPreviewReconnects.has(target)) return;
+  pendingPreviewReconnects.add(target);
   void arcaConnectFlow
     .run(win, target, { reason: "preview-reconnect" })
     .then((result) => {
@@ -4601,7 +4602,7 @@ function startArcaPreviewConsentRecovery({ win, target, sourceHostId }) {
       return { ok: false, error: String(error) };
     })
     .finally(() => {
-      arcaPreviewRecoveries.delete(target);
+      pendingPreviewReconnects.delete(target);
     });
 }
 
@@ -6133,7 +6134,7 @@ function registerIpc() {
       );
       if (!context) return false;
       const { target } = context;
-      if (arcaPreviewRecoveries.has(target)) return false;
+      if (pendingPreviewReconnects.has(target)) return false;
       const declinedUntil = arcaPreviewDeclinedUntil.get(target) ?? 0;
       if (declinedUntil > Date.now()) return false;
       arcaPreviewDeclinedUntil.delete(target);
@@ -6167,6 +6168,7 @@ function registerIpc() {
         win.isDestroyed() ||
         !isPinnedOriginSender(event) ||
         !isLoopbackPreviewUrl(url) ||
+        pendingPreviewReconnects.has(normalizedServerTarget(serverUrl)) ||
         sshPreviewHosts.allows(serverUrl, sourceHostId)
       ) {
         return false;
@@ -6209,7 +6211,7 @@ function registerIpc() {
       if ((arcaPreviewDeclinedUntil.get(target) ?? 0) > Date.now()) {
         return "Reconnect was declined. Wait a moment, then retry the preview to show the prompt again.";
       }
-      if (arcaPreviewRecoveries.has(target)) {
+      if (pendingPreviewReconnects.has(target)) {
         return "Finish the Arca reconnect in Omnigent, then retry the preview.";
       }
       return "Omnigent couldn't restore the Arca connection details. Retry the preview to reconnect.";

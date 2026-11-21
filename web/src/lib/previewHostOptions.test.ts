@@ -113,11 +113,13 @@ it("refreshes provenance after consent and retries only once for the same host",
   });
   const navigate = vi.fn(async () => {
     steps.push("navigate");
-    return { ok: false, retryWithFreshHost: true };
+    return { ok: false, retryWithFreshHost: true, navigationRetryToken: "continuation" };
   });
   await withPreviewHostRetry("session", "host-a", navigate);
   expect(steps).toEqual(["navigate", "refresh", "navigate"]);
   expect(navigate).toHaveBeenCalledTimes(2);
+  expect(navigate).toHaveBeenNthCalledWith(1);
+  expect(navigate).toHaveBeenNthCalledWith(2, { navigationRetryToken: "continuation" });
 });
 
 it.each([false, true])(
@@ -140,7 +142,7 @@ it.each([false, true])(
     const pending = withPreviewHostRetry("session", "host-a", navigate);
     expect(getSessionSlim).not.toHaveBeenCalled();
     currentHost = "host-b";
-    resolveConsent({ ok: false, retryWithFreshHost: true });
+    resolveConsent({ ok: false, retryWithFreshHost: true, navigationRetryToken: "continuation" });
     expect(await pending).toMatchObject({
       ok: false,
       retryWithFreshHost: false,
@@ -155,7 +157,11 @@ it.each([false, true])(
 
 it("does not retry if current provenance is unavailable", async () => {
   vi.mocked(getSessionSlim).mockRejectedValue(new Error("offline"));
-  const navigate = vi.fn().mockResolvedValue({ ok: false, retryWithFreshHost: true });
+  const navigate = vi.fn().mockResolvedValue({
+    ok: false,
+    retryWithFreshHost: true,
+    navigationRetryToken: "continuation",
+  });
   expect(await withPreviewHostRetry("session", "host-a", navigate)).toMatchObject({
     ok: false,
     retryWithFreshHost: false,
@@ -173,7 +179,11 @@ it("does not reuse a host lookup that started before consent", async () => {
     .mockReturnValueOnce(oldResponse)
     .mockResolvedValue({ id: "session", hostId: "host-b", parentSessionId: null } as Session);
   const earlier = fetchSessionHostId("session");
-  const consent = Promise.resolve({ ok: false, retryWithFreshHost: true });
+  const consent = Promise.resolve({
+    ok: false,
+    retryWithFreshHost: true,
+    navigationRetryToken: "continuation",
+  });
   const navigate = vi.fn(() => consent);
   const pending = withPreviewHostRetry("session", "host-a", navigate);
   await consent;
@@ -183,6 +193,23 @@ it("does not reuse a host lookup that started before consent", async () => {
   expect(navigate).toHaveBeenCalledTimes(1);
   expect(getSessionSlim).toHaveBeenCalledTimes(2);
 });
+
+it.each([undefined, ""])(
+  "does not resume without a native continuation token: %j",
+  async (token) => {
+    const navigate = vi.fn().mockResolvedValue({
+      ok: false,
+      retryWithFreshHost: true,
+      navigationRetryToken: token,
+    });
+    expect(await withPreviewHostRetry("session", "host-a", navigate)).toMatchObject({
+      ok: false,
+      retryWithFreshHost: false,
+    });
+    expect(navigate).toHaveBeenCalledTimes(1);
+    expect(getSessionSlim).not.toHaveBeenCalled();
+  },
+);
 
 it.each([{ ok: true }, { ok: false, error: "blocked" }, null, undefined])(
   "does not refresh or retry unrelated results: %j",

@@ -198,7 +198,7 @@ async function openBrowserTabAt(
   // The session's host lets the shell open its localhost pages, as the address bar does.
   const hostId = await fetchSessionHostId(conversationId);
   const options = await previewHostOptions(hostId, url);
-  const result = await withPreviewHostRetry(conversationId, hostId, async () =>
+  const result = await withPreviewHostRetry(conversationId, hostId, async (retryOptions) =>
     browserTabsBridge()?.browserOpenOrNavigate?.(
       browserViewId(conversationId, tabId),
       url,
@@ -206,6 +206,7 @@ async function openBrowserTabAt(
       {
         force: true,
         ...options,
+        ...retryOptions,
       },
     ),
   ).catch((error: unknown) => ({ ok: false, error: String(error) }));

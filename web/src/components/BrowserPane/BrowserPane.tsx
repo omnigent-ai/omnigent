@@ -385,13 +385,18 @@ export function BrowserPane({
     void fetchSessionHostId(browserViewOwnerId(conversationId))
       .then(async (hostId) => {
         const options = await previewHostOptions(hostId, navUrl);
-        return withPreviewHostRetry(browserViewOwnerId(conversationId), hostId, async () => {
-          if (sequence !== submitSequenceRef.current) return null;
-          return bridge.browserOpenOrNavigate!(conversationId, navUrl, undefined, {
-            force: true,
-            ...options,
-          });
-        });
+        return withPreviewHostRetry(
+          browserViewOwnerId(conversationId),
+          hostId,
+          async (retryOptions) => {
+            if (sequence !== submitSequenceRef.current) return null;
+            return bridge.browserOpenOrNavigate!(conversationId, navUrl, undefined, {
+              force: true,
+              ...options,
+              ...retryOptions,
+            });
+          },
+        );
       })
       .then((result) => {
         if (!result || sequence !== submitSequenceRef.current) return;

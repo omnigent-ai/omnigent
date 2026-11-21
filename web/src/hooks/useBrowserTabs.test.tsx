@@ -625,7 +625,7 @@ describe("browser soft tabs", () => {
       if (capable) {
         browserOpenOrNavigate.mockImplementationOnce(async () => {
           if (moved) parentHost = "ungranted-host";
-          return { ok: false, retryWithFreshHost: true };
+          return { ok: false, retryWithFreshHost: true, navigationRetryToken: "reopen" };
         });
       }
       Object.assign(window, {
@@ -663,6 +663,14 @@ describe("browser soft tabs", () => {
         },
       );
       expect(browserOpenOrNavigate).toHaveBeenCalledTimes(capable && !moved ? 2 : 1);
+      if (capable && !moved) {
+        expect(browserOpenOrNavigate).toHaveBeenLastCalledWith(
+          viewId,
+          "http://localhost:3000/",
+          undefined,
+          expect.objectContaining({ navigationRetryToken: "reopen" }),
+        );
+      }
       expect(getSessionSlim).toHaveBeenCalledTimes(capable ? 4 : 2);
       expect(reopened?.ok).toBe(!moved);
       if (moved) {

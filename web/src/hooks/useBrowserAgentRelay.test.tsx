@@ -197,6 +197,53 @@ describe("useBrowserAgentRelay — claim-first protocol", () => {
     expect(settled).toHaveBeenCalledWith(event, CONV, postedResult().result);
   });
 
+  it("keeps the consent continuation token when a newer navigation finishes during host refresh", async () => {
+    let resolveFresh!: (session: unknown) => void;
+    const fresh = new Promise((resolve) => {
+      resolveFresh = resolve;
+    });
+    const session = { id: CONV, hostId: "host-a", parentSessionId: null };
+    getSessionSlim.mockResolvedValueOnce(session).mockReturnValue(fresh);
+    authenticatedFetch.mockResolvedValueOnce(WON).mockResolvedValue(jsonResponse({}));
+    let first = true;
+    let currentToken = "consent-a";
+    let loaded = "";
+    const bridge = installBridge({
+      browserOpenOrNavigate: vi.fn(
+        async (
+          _viewId: string,
+          url: string,
+          _bounds?: unknown,
+          opts?: NativeBridge.BrowserHostOptions,
+        ) => {
+          if (first) {
+            first = false;
+            return { ok: false, retryWithFreshHost: true, navigationRetryToken: currentToken };
+          }
+          if (opts?.navigationRetryToken && opts.navigationRetryToken !== currentToken) {
+            return { ok: false, error: "navigation superseded or closed" };
+          }
+          currentToken = "newer";
+          loaded = url;
+          return { ok: true };
+        },
+      ),
+    });
+    const pending = runAction(actionEvent("navigate", { url: "http://localhost:5173" }));
+    await vi.waitFor(() => expect(getSessionSlim).toHaveBeenCalledTimes(2));
+    await bridge.browserOpenOrNavigate(CONV, "https://example.com/newer", undefined, {});
+    resolveFresh(session);
+    await pending;
+    expect(bridge.browserOpenOrNavigate).toHaveBeenLastCalledWith(
+      CONV,
+      "http://localhost:5173",
+      undefined,
+      expect.objectContaining({ navigationRetryToken: "consent-a" }),
+    );
+    expect(postedResult().result).toEqual({ ok: false, error: "navigation superseded or closed" });
+    expect(loaded).toBe("https://example.com/newer");
+  });
+
   it("tells this window when an action it ran failed, with the error it posts", async () => {
     installBridge({
       browserOpenOrNavigate: vi.fn().mockResolvedValue({ ok: false, error: "blocked host" }),

@@ -72,8 +72,12 @@ async function openInApp(conversationId: string, url: string): Promise<void> {
     // Chat and file content can come from an agent, so their links use the
     // agent policy even when a user clicks them.
     const viewId = newViewId;
-    const result = await withPreviewHostRetry(conversationId, hostId, () =>
-      bridge.browserOpenOrNavigate(viewId, url, undefined, { agent: true, ...options }),
+    const result = await withPreviewHostRetry(conversationId, hostId, (retryOptions) =>
+      bridge.browserOpenOrNavigate(viewId, url, undefined, {
+        agent: true,
+        ...options,
+        ...retryOptions,
+      }),
     );
     if (result?.ok) {
       newViewId = undefined;

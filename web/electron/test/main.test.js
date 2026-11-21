@@ -5446,8 +5446,23 @@ describe("browser-view teardown on server change (src/main.js)", () => {
     const recover = deps.recoverAgentNavigationForEvent;
     const hint = deps.getAgentNavigationHintForEvent;
     const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
+    let previewPrompts = 0;
+    h.electron.dialog.showMessageBox = async () => {
+      previewPrompts++;
+      return { response: 0 };
+    };
 
     assert.equal(await recover(event, "http://localhost:5173", hostId, hostId), false);
+    assert.equal(
+      await deps.requestPreviewHostForEvent(event, "http://localhost:5173", {
+        sourceHostId: hostId,
+        sourceSshTarget: "devbox",
+        sessionHostProtocol: 1,
+        sshPreviewProtocol: 1,
+      }),
+      false,
+    );
+    assert.equal(previewPrompts, 0, "pending reconnect consent must not start another prompt");
     assert.equal(h.calls.arcaConsentRuns.length, 1);
     assert.equal(h.calls.arcaConsentRuns[0].serverUrl, serverUrl);
     assert.equal(h.calls.arcaConsentRuns[0].options.reason, "preview-reconnect");

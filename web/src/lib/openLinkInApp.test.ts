@@ -318,7 +318,7 @@ it.each([false, true])(
     if (movesDuringConsent) {
       expect(surfaced).toHaveLength(1);
       hostId = "ungranted-host";
-      answerConsent({ ok: false, retryWithFreshHost: true });
+      answerConsent({ ok: false, retryWithFreshHost: true, navigationRetryToken: "link" });
       await vi.waitFor(() => expect(closeView).toHaveBeenCalledOnce());
       expect(showToast).toHaveBeenCalledWith(expect.stringContaining("session host changed"));
     } else {

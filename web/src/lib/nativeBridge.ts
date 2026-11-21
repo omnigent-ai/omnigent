@@ -35,6 +35,7 @@ export interface BrowserHostOptions {
   sourceHostId?: string | null;
   sessionHostProtocol?: number;
   sshPreviewProtocol?: number;
+  navigationRetryToken?: string;
   sourceSshTarget?: string;
 }
 
@@ -44,6 +45,7 @@ export interface BrowserNavigationResult {
   hostIsThisMachine?: boolean;
   sshPreviewHost?: boolean;
   retryWithFreshHost?: boolean;
+  navigationRetryToken?: string;
   error?: string;
 }
 

@@ -17,6 +17,7 @@
  *    detached on hide and destroyed only on explicit close.
  */
 
+const { randomUUID } = require("node:crypto");
 const {
   checkAgentNavigation,
   isAgentConnectionAllowed,
@@ -106,10 +107,16 @@ function createBrowserViewRegistry({
   const entries = new Map(); // conversationId -> BrowserViewEntry
   const pendingNavigations = new Map();
 
-  function beginAgentNavigation(conversationId) {
-    const generation = Symbol();
+  // A continuation consumes its original generation without superseding a newer navigation.
+  function beginAgentNavigation(conversationId, retryToken) {
+    if (retryToken !== undefined && pendingNavigations.get(conversationId) !== retryToken) {
+      return null;
+    }
+    const generation = randomUUID();
     pendingNavigations.set(conversationId, generation);
-    return () => pendingNavigations.get(conversationId) === generation;
+    return Object.assign(() => pendingNavigations.get(conversationId) === generation, {
+      retryToken: generation,
+    });
   }
   const allowsLocalhost = (context) => !context?.revoked && contextAllowsLocalhost(context);
 
@@ -332,7 +339,10 @@ function createBrowserViewRegistry({
         if (event?.isMainFrame !== false) entry.agentNavBlockedError = verdict.error;
       }
     };
-    wc.on("will-navigate", guard);
+    wc.on("will-navigate", (event, targetUrl) => {
+      beginAgentNavigation(conversationId);
+      guard(event, targetUrl);
+    });
     wc.on("will-redirect", guard);
     // Subframe navigations (iframes) can also reach an internal host; guard them
     // too. Older Electron may not emit this event — harmless if it never fires.

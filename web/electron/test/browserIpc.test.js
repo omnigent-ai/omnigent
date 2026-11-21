@@ -677,16 +677,18 @@ describe("browser IPC localhost previews from hosts reached over SSH", () => {
   /** A registry that grants one host only, recording each step. */
   function previewSetup({ request, recover } = {}) {
     const ipcMain = makeIpcMain();
-    const state = { allowed: false, allowedHost: "host-1", calls: [] };
+    const { createBrowserViewRegistry } = require("../src/browserViewRegistry");
+    const state = { allowed: false, allowedHost: "host-1", calls: [], loaded: [] };
     const registry = {
-      beginAgentNavigation: () => () => true,
+      ...createBrowserViewRegistry(),
       checkAgentNavigation: async (_id, _url, context) => {
         const allowed = state.allowed && context.sourceHostId === state.allowedHost;
         state.calls.push(allowed ? "allowed" : "denied");
         return allowed ? { ok: true } : { ok: false, error: "blocked", localhostBlocked: true };
       },
-      openOrNavigate: () => {
+      openOrNavigate: (_id, url) => {
         state.calls.push("navigate");
+        state.loaded.push(url);
         return { ok: true, created: false };
       },
     };
@@ -701,17 +703,17 @@ describe("browser IPC localhost previews from hosts reached over SSH", () => {
         return request(state, ...args);
       },
     });
-    const navigate = (opts) =>
+    const navigate = (opts, url = "http://127.0.0.1:8787/") =>
       ipcMain.invoke(
         "omnigent:browser-open-or-navigate",
         {},
         {
           conversationId: "source",
-          url: "http://127.0.0.1:8787/",
+          url,
           opts: { sessionHostProtocol: 1, sshPreviewProtocol: 1, ...opts },
         },
       );
-    return { state, navigate, registry };
+    return { state, navigate, registry, ipcMain };
   }
 
   it("asks about the source host, then requires fresh provenance before retrying", async () => {
@@ -726,11 +728,62 @@ describe("browser IPC localhost previews from hosts reached over SSH", () => {
     const result = await navigate({ force: true, sourceHostId: "host-1" });
     assert.equal(result.ok, false);
     assert.equal(result.retryWithFreshHost, true);
+    assert.equal(typeof result.navigationRetryToken, "string");
     assert.deepEqual(seen, [["http://127.0.0.1:8787/", "host-1"]]);
     assert.deepEqual(state.calls, ["denied", "request"]);
-    assert.equal((await navigate({ sourceHostId: "host-1" })).ok, true);
+    const retry = { sourceHostId: "host-1", navigationRetryToken: result.navigationRetryToken };
+    assert.equal((await navigate(retry)).ok, true);
+    assert.equal((await navigate(retry)).superseded, true, "a retry token is single-use");
     assert.deepEqual(state.calls, ["denied", "request", "allowed", "navigate"]);
   });
+
+  for (const action of [
+    "newer navigation",
+    "close",
+    "closeAll",
+    "go-back",
+    "go-forward",
+    "reload",
+  ]) {
+    it(`refuses a post-consent continuation after ${action}`, async () => {
+      const { state, navigate, registry, ipcMain } = previewSetup({
+        request: (current) => {
+          current.allowed = true;
+          return true;
+        },
+      });
+      const source = { agent: true, sourceHostId: "host-1" };
+      const first = await navigate(source);
+      assert.equal(first.retryWithFreshHost, true);
+      const newer = "https://example.com/newer";
+      if (action === "newer navigation") {
+        assert.equal((await navigate({ sourceHostId: "host-1" }, newer)).ok, true);
+      } else if (["go-back", "go-forward", "reload"].includes(action)) {
+        const webContents = makeWebContents({ canBack: true, canForward: true });
+        registry.get = () => ({ view: { webContents } });
+        const result = await ipcMain.invoke(
+          `omnigent:browser-${action}`,
+          {},
+          {
+            conversationId: "source",
+          },
+        );
+        assert.equal(result.ok, true);
+        assert.equal(webContents.calls.length, 1, "the toolbar operation must run");
+      } else {
+        registry[action]("source");
+      }
+      const calls = [...state.calls];
+      const obsolete = await navigate({
+        ...source,
+        navigationRetryToken: first.navigationRetryToken,
+      });
+      assert.equal(obsolete.ok, false);
+      assert.equal(obsolete.superseded, true);
+      assert.deepEqual(state.calls, calls, "an obsolete retry must not start a navigation");
+      assert.deepEqual(state.loaded, action === "newer navigation" ? [newer] : []);
+    });
+  }
 
   it("asks after identity recovery declines an agent navigation", async () => {
     const { state, navigate } = previewSetup({

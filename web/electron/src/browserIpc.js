@@ -494,7 +494,8 @@ function registerBrowserIpc({
     if (pastAgentDeadline(opts)) {
       return { ok: false, created: false, superseded: false, error: PAGE_TIMEOUT_ERROR };
     }
-    const isCurrentNavigation = g.registry.beginAgentNavigation(conversationId);
+    const isCurrentNavigation =
+      g.registry.beginAgentNavigation(conversationId, opts?.navigationRetryToken) ?? (() => false);
     const cancelled = {
       ok: false,
       created: false,
@@ -507,6 +508,7 @@ function registerBrowserIpc({
     // A forwarded agent navigation also ends at its caller's deadline.
     const isCurrent = () =>
       isCurrentNavigation() && isPinnedOriginSender(event) && !pastAgentDeadline(opts);
+    if (!isCurrent()) return cancelled;
     const navigate = async (registry) => {
       // Main validates the renderer-supplied host; opts only route.
       const agentContext = getAgentContextForEvent(event, opts);
@@ -568,6 +570,7 @@ function registerBrowserIpc({
         ok: false,
         created: false,
         retryWithFreshHost: true,
+        navigationRetryToken: isCurrentNavigation.retryToken,
         error: "Localhost access allowed; refresh the session host before retrying.",
       };
     }
@@ -792,7 +795,7 @@ function registerBrowserIpc({
     if (g.error) return { ok: false, error: g.error };
     const entry = g.registry.get(args?.conversationId);
     if (!entry) return { ok: false, error: "No browser view" };
-    goBack(entry.view.webContents);
+    if (goBack(entry.view.webContents)) g.registry.beginAgentNavigation?.(args.conversationId);
     return { ok: true, ...readNavState(entry.view.webContents) };
   });
 
@@ -801,7 +804,7 @@ function registerBrowserIpc({
     if (g.error) return { ok: false, error: g.error };
     const entry = g.registry.get(args?.conversationId);
     if (!entry) return { ok: false, error: "No browser view" };
-    goForward(entry.view.webContents);
+    if (goForward(entry.view.webContents)) g.registry.beginAgentNavigation?.(args.conversationId);
     return { ok: true, ...readNavState(entry.view.webContents) };
   });
 
@@ -811,6 +814,7 @@ function registerBrowserIpc({
     const entry = g.registry.get(args?.conversationId);
     if (!entry) return { ok: false, error: "No browser view" };
     try {
+      g.registry.beginAgentNavigation?.(args.conversationId);
       entry.view.webContents.reload();
     } catch {
       /* destroyed */

@@ -21,6 +21,8 @@ describe("localhost previews for hosts reached over SSH", () => {
   it("verifies an unrecorded suggestion after consent, then records its preview proof", async () => {
     let destination = null;
     const steps = [];
+    const consent = Promise.withResolvers();
+    const asked = Promise.withResolvers();
     const previews = createSshPreviewHosts({
       destination: () => destination,
       verify: async (server, host, target) => {
@@ -32,18 +34,21 @@ describe("localhost previews for hosts reached over SSH", () => {
         destination = target;
       },
     });
-    assert.equal(
-      await previews.request(
-        SERVER,
-        HOST,
-        async (target, needsVerification) => {
-          steps.push(["approve", target, needsVerification]);
-          return true;
-        },
-        "devbox",
-      ),
-      true,
+    const pending = previews.request(
+      SERVER,
+      HOST,
+      async (target, needsVerification) => {
+        steps.push(["approve", target, needsVerification]);
+        asked.resolve();
+        return consent.promise;
+      },
+      "devbox",
     );
+    await asked.promise;
+    assert.deepEqual(steps, [["approve", "devbox", true]], "SSH must wait for the answer");
+    assert.equal(previews.allows(SERVER, HOST), false);
+    consent.resolve(true);
+    assert.equal(await pending, true);
     assert.deepEqual(steps, [
       ["approve", "devbox", true],
       ["verify", SERVER, HOST, "devbox"],

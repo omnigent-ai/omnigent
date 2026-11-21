@@ -51,10 +51,20 @@ export async function previewHostOptions(
 export async function withPreviewHostRetry(
   sessionId: string,
   sourceHostId: string | null,
-  navigate: () => Promise<BrowserNavigationResult | null | undefined>,
+  navigate: (
+    retryOptions?: Pick<BrowserHostOptions, "navigationRetryToken">,
+  ) => Promise<BrowserNavigationResult | null | undefined>,
 ): Promise<BrowserNavigationResult | null | undefined> {
   const result = await navigate();
   if (result?.retryWithFreshHost !== true) return result;
+  if (typeof result.navigationRetryToken !== "string" || !result.navigationRetryToken) {
+    return {
+      ...result,
+      ok: false,
+      retryWithFreshHost: false,
+      error: "The desktop could not preserve this navigation. Retry the preview.",
+    };
+  }
   if (!sourceHostId || (await fetchSessionHostId(sessionId, { fresh: true })) !== sourceHostId) {
     return {
       ...result,
@@ -63,5 +73,5 @@ export async function withPreviewHostRetry(
       error: "The session host changed while allowing localhost access. Retry the preview.",
     };
   }
-  return navigate();
+  return navigate({ navigationRetryToken: result.navigationRetryToken });
 }
