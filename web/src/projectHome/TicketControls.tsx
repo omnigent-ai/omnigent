@@ -85,16 +85,17 @@ export function CompleteTicketDialog({
   initialSummary = "",
   stages,
   initialStageId,
+  required = true,
 }: Omit<TicketDialogProps, "onComplete"> & {
   approving?: boolean;
   stages: TicketStage[];
   initialStageId?: string;
   onComplete: (summary: string, stageId: string) => void;
 }) {
-  const [stageId, setStageId] = useState(
-    initialStageId ?? stages.find((candidate) => candidate.is_complete)?.id ?? "",
+  const stage = stages.find(
+    (candidate) =>
+      candidate.is_complete && (initialStageId === undefined || candidate.id === initialStageId),
   );
-  const stage = stages.find((candidate) => candidate.id === stageId && candidate.is_complete);
   return (
     <TicketTextDialog
       title={title}
@@ -105,33 +106,13 @@ export function CompleteTicketDialog({
       pending={pending}
       error={error}
       initialSummary={initialSummary}
+      required={required}
       heading={approving ? "Approve & complete" : "Complete ticket"}
       label="Completion summary"
       submitLabel={approving ? "Approve & complete" : "Complete ticket"}
-      placeholder="What was delivered and verified?"
+      placeholder={required ? "What was delivered and verified?" : "Optional completion summary…"}
       disabled={!stage}
     >
-      <label className="grid gap-2 text-sm">
-        Completed stage
-        <select
-          aria-label="Completed stage"
-          value={stage ? stageId : ""}
-          disabled={pending}
-          className="h-9 rounded-md border bg-background px-2"
-          onChange={(event) => setStageId(event.target.value)}
-        >
-          <option value="" disabled>
-            Choose a completed stage…
-          </option>
-          {stages
-            .filter((candidate) => candidate.is_complete)
-            .map((candidate) => (
-              <option key={candidate.id} value={candidate.id}>
-                {candidate.name}
-              </option>
-            ))}
-        </select>
-      </label>
       <p className="text-xs text-muted-foreground">
         This updates the ticket only. Needs response stays unchanged; answer open agent prompts in
         their own chat.
@@ -147,6 +128,7 @@ interface TicketDialogProps {
   pending: boolean;
   error: Error | null;
   initialSummary?: string;
+  required?: boolean;
 }
 
 export function ReviewTicketDialog(props: TicketDialogProps) {
@@ -188,6 +170,7 @@ function TicketTextDialog({
   maxLength = 1500,
   children,
   disabled = false,
+  required = true,
 }: TicketDialogProps & {
   heading: string;
   label: string;
@@ -209,7 +192,7 @@ function TicketTextDialog({
         <form
           onSubmit={(event) => {
             event.preventDefault();
-            if (pending || disabled || !summary.trim()) return;
+            if (pending || disabled || (required && !summary.trim())) return;
             onComplete(summary.trim());
           }}
           className="space-y-4"
@@ -223,7 +206,7 @@ function TicketTextDialog({
             {label}
             <Textarea
               autoFocus
-              required
+              required={required}
               maxLength={maxLength}
               value={summary}
               disabled={pending}
@@ -237,7 +220,11 @@ function TicketTextDialog({
             <Button type="button" variant="ghost" disabled={pending} onClick={onClose}>
               Cancel
             </Button>
-            <Button type="submit" loading={pending} disabled={disabled || !summary.trim()}>
+            <Button
+              type="submit"
+              loading={pending}
+              disabled={disabled || (required && !summary.trim())}
+            >
               {submitLabel}
             </Button>
           </DialogFooter>

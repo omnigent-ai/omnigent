@@ -18,9 +18,10 @@ header, new-session composer, session quick view and side chat, and UI primitive
 ## Requirements
 
 - R1: Tickets belong to a project and exist independently of sessions.
-- R3: Open → Planning → Working → Review → Done. Planning and human review may
-  be skipped when justified; phases can move backward. Keep `in_progress` as
-  Working's API value. Title-only creation starts in Open.
+- R3: Projects own ordered stages, defaulting to Open → Planning → Working → Review → Done.
+  The first stage starts new tickets; the last means complete. Rename, reorder,
+  add and remove stages without changing their stable IDs. Occupied removals
+  require a surviving destination; moves and configuration commit together.
 - R6: Append attributed comments, changes, execution summaries and output events.
   PRs are `{type: "pull_request", url}` outputs, deduplicated for display.
 - R7: No ticket, comment or history deletion, including through project deletion.
@@ -32,12 +33,12 @@ header, new-session composer, session quick view and side chat, and UI primitive
 - R19: Tags have a key and optional value. The presence of `needs-human` shows
   the pink Needs response pill. A comment explains the request; removing the
   tag resolves it. This is independent of a session's pending approval prompt.
-- R20: Done requires a completion summary. A finished session does not finish a ticket.
+- R20: Completion summaries are optional. A finished session does not finish a ticket.
 - R21: Keep New ticket and New session. No search or tag-filter UI.
 - R22: Persist a concise plan containing the approach and acceptance criteria.
   Agents investigate routine choices; ask humans only for necessary decisions
   or authority. Explicit approval gates cannot be skipped.
-- R23: Before Review, verify the work and save a review brief: delivered scope,
+- R23: When requesting human review, verify the work and save a review brief: delivered scope,
   evidence, limitations and exact human checks. Default to human review for
   subjective results; skipping requires an unambiguous, objectively verified
   outcome and recorded reason. Silence is not approval.
@@ -78,7 +79,7 @@ header, new-session composer, session quick view and side chat, and UI primitive
 
 ## Acceptance Criteria
 
-- AC1: GIVEN a project WHEN a title-only ticket is saved THEN it appears in Open.
+- AC1: GIVEN a project WHEN a title-only ticket is saved THEN it appears in its first stage.
 - AC12: GIVEN recorded work WHEN a session is removed THEN ticket history remains.
 - AC17: GIVEN an unfinished ticket WHEN its worker ends THEN it remains unfinished.
 - AC21: GIVEN a ticket update by someone else WHEN it commits THEN its orchestrator
@@ -99,8 +100,8 @@ header, new-session composer, session quick view and side chat, and UI primitive
   codes, content and history survive; the board exposes all five phases.
 - AC29: GIVEN a ticket WHEN its plan or review brief is saved THEN it is readable
   as Markdown on the ticket and the attributed change notifies the orchestrator.
-- AC30: GIVEN a ticket WHEN entering Review THEN a review brief is required;
-  requesting changes saves feedback and phase together; Done still needs a summary.
+- AC30: Plan, Review and completion summaries are optional content independent
+  of stage position. Moving stages preserves that content and Needs response.
 - AC31: GIVEN two same-project tickets WHEN linked from either side THEN each
   lists the other once; unlinking retains both histories and changes neither phase.
 - AC32: GIVEN unrelated ownership, projects or tenants WHEN linking tickets or
@@ -134,7 +135,7 @@ Keep schema changes separately reviewable from the application changes.
 
 ## Out of Scope
 
-Priorities, additional phases, filters, custom workflows, typed dependencies,
+Priorities, filters, configurable transition rules, typed dependencies,
 automatic dependency scheduling/rollups, issue-tracker sync, PR unlinking,
 project sharing, file uploads and specialized agent builders.
 Typed agent roles, automatic interpretation of comment approvals, and automatic

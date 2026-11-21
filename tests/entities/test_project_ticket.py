@@ -80,6 +80,21 @@ def test_stage_definitions_have_stable_defaults_and_trimmed_content():
     assert default_ticket_stages().stages[0].name == "Open"
 
 
+@pytest.mark.parametrize("count", [1, 3])
+def test_start_and_completion_are_derived_from_order(count):
+    stages = [
+        TicketStage(id=f"stage-{index}", name=str(index), is_complete=index == 0)
+        for index in range(count)
+    ]
+    configuration = TicketStages(stages=stages, initial_stage_id="missing")
+    assert configuration.initial_stage_id == stages[0].id
+    assert [stage.id for stage in configuration.stages if stage.is_complete] == [stages[-1].id]
+    reordered = TicketStages(stages=list(reversed(configuration.stages)))
+    assert reordered.initial_stage_id == stages[-1].id
+    assert [stage.id for stage in reordered.stages if stage.is_complete] == [stages[0].id]
+    assert configuration.stages[-1].is_complete
+
+
 @pytest.mark.parametrize(
     "changes",
     [
@@ -91,8 +106,6 @@ def test_stage_definitions_have_stable_defaults_and_trimmed_content():
         {"stages": [{"id": "open", "name": "New", "instructions": "x" * 501}]},
         {"stages": [{"id": "../other", "name": "New"}]},
         {"stages": [{"id": "x" * 65, "name": "New"}]},
-        {"stages": [{"id": "open", "name": "New", "is_complete": True}]},
-        {"initial_stage_id": "missing"},
         {"stages": [{"id": f"stage-{index}", "name": str(index)} for index in range(21)]},
     ],
 )

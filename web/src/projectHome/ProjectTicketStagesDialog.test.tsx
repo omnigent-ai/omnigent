@@ -97,6 +97,14 @@ describe("Project stage editor", () => {
     expect(await screen.findByLabelText("Stage name 1")).toHaveValue("Investigating");
     expect(screen.getByLabelText("Instructions for Investigating")).toHaveValue("Gather evidence");
     expect(screen.getByRole("button", { name: "Remove Investigating" })).toBeDisabled();
+    expect(screen.queryByRole("radio")).toBeNull();
+    expect(screen.queryByRole("checkbox")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Save stages" }));
+    await waitFor(() => expect(api.updateTicketStages).toHaveBeenCalledOnce());
+    expect(vi.mocked(api.updateTicketStages).mock.calls[0][1]).toMatchObject({
+      initial_stage_id: "investigating",
+      stages: [{ id: "investigating", is_complete: true }],
+    });
   });
 
   it("shows a stage-load error and retries instead of inventing defaults", async () => {
@@ -108,16 +116,12 @@ describe("Project stage editor", () => {
     expect(await screen.findByLabelText("Stage name 1")).toHaveValue("Open");
   });
 
-  it("renames stable IDs and adds a completed stage with instructions and a new start", async () => {
+  it("renames stable IDs and derives completion from the added last stage", async () => {
     const { onClose } = renderEditor();
     fireEvent.change(await screen.findByLabelText("Stage name 1"), { target: { value: " New " } });
-    fireEvent.click(screen.getByLabelText("Start in Planning"));
-    expect(screen.getByLabelText("Planning means work is complete")).toBeDisabled();
     fireEvent.click(screen.getByRole("button", { name: "Add stage" }));
     expect(screen.getByRole("button", { name: "Save stages" })).toBeDisabled();
     fireEvent.change(screen.getByLabelText("Stage name 6"), { target: { value: "Resolved" } });
-    fireEvent.click(screen.getByLabelText("Resolved means work is complete"));
-    expect(screen.getByLabelText("Start in Resolved")).toBeDisabled();
     fireEvent.change(screen.getByLabelText("Instructions for Resolved"), {
       target: { value: " Attach recovery evidence. " },
     });
@@ -126,7 +130,9 @@ describe("Project stage editor", () => {
     expect(api.updateTicketStages).toHaveBeenCalledWith("project", {
       stages: [
         { ...api.DEFAULT_TICKET_STAGES.stages[0], name: "New" },
-        ...api.DEFAULT_TICKET_STAGES.stages.slice(1),
+        ...api.DEFAULT_TICKET_STAGES.stages
+          .slice(1)
+          .map((stage) => ({ ...stage, is_complete: false })),
         {
           id: expect.stringMatching(/^stage-[a-z0-9]{12}$/),
           name: "Resolved",
@@ -134,42 +140,48 @@ describe("Project stage editor", () => {
           is_complete: true,
         },
       ],
-      initial_stage_id: "planning",
+      initial_stage_id: "open",
       moves: {},
     });
   });
 
-  it("persists keyboard drag order without replacing stage IDs", async () => {
+  it.each([
+    { index: 0, key: "ArrowDown", order: ["planning", "open", "in_progress", "review", "done"] },
+    { index: 4, key: "ArrowUp", order: ["open", "planning", "in_progress", "done", "review"] },
+  ])("derives start and completion after dragging stage $index", async ({ index, key, order }) => {
     renderEditor();
     const list = await screen.findByRole("list", { name: "Project stages" });
     const rows = within(list).getAllByRole("listitem");
     const handles = within(list).getAllByRole("button", { name: /^Reorder / });
-    rows.forEach((row, index) =>
-      vi.spyOn(row, "getBoundingClientRect").mockReturnValue(new DOMRect(0, index * 100, 500, 90)),
+    rows.forEach((row, rowIndex) =>
+      vi
+        .spyOn(row, "getBoundingClientRect")
+        .mockReturnValue(new DOMRect(0, rowIndex * 100, 500, 90)),
     );
-    handles.forEach((handle, index) =>
+    handles.forEach((handle, handleIndex) =>
       vi
         .spyOn(handle, "getBoundingClientRect")
-        .mockReturnValue(new DOMRect(0, index * 100, 24, 24)),
+        .mockReturnValue(new DOMRect(0, handleIndex * 100, 24, 24)),
     );
     vi.spyOn(list, "getBoundingClientRect").mockReturnValue(new DOMRect(0, 0, 500, 500));
-    handles[0].focus();
-    fireEvent.keyDown(handles[0], { key: " ", code: "Space" });
-    await waitFor(() => expect(handles[0]).toHaveAttribute("aria-pressed", "true"));
-    fireEvent.keyDown(handles[0], { key: "ArrowDown", code: "ArrowDown" });
-    fireEvent.keyDown(handles[0], { key: " ", code: "Space" });
-    await waitFor(() => expect(screen.getByLabelText("Stage name 1")).toHaveValue("Planning"));
+    handles[index].focus();
+    fireEvent.keyDown(handles[index], { key: " ", code: "Space" });
+    await waitFor(() => expect(handles[index]).toHaveAttribute("aria-pressed", "true"));
+    fireEvent.keyDown(handles[index], { key, code: key });
+    fireEvent.keyDown(handles[index], { key: " ", code: "Space" });
+    await waitFor(() => {
+      expect(screen.getByLabelText(`Stage name ${index + 1}`)).toHaveValue(
+        api.DEFAULT_TICKET_STAGES.stages.find((stage) => stage.id === order[index])?.name,
+      );
+    });
     fireEvent.click(screen.getByRole("button", { name: "Save stages" }));
     await waitFor(() => expect(api.updateTicketStages).toHaveBeenCalledOnce());
     const saved = vi.mocked(api.updateTicketStages).mock.calls[0][1];
-    expect(saved.stages.map((stage) => stage.id)).toEqual([
-      "planning",
-      "open",
-      "in_progress",
-      "review",
-      "done",
+    expect(saved.stages.map((stage) => stage.id)).toEqual(order);
+    expect(saved.initial_stage_id).toBe(order[0]);
+    expect(saved.stages.filter((stage) => stage.is_complete).map((stage) => stage.id)).toEqual([
+      order.at(-1),
     ]);
-    expect(saved.initial_stage_id).toBe("open");
   });
 
   it("requires a surviving destination for populated removals and supports undo", async () => {

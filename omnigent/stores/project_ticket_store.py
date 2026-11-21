@@ -188,7 +188,7 @@ class ProjectTicketStore:
         def write(session: Session) -> dict[str, Any]:
             project = self._project(session, project_id, actor.user_id, write=True)
             configuration = _stages(project)
-            stage = _stage(configuration, configuration.initial_stage_id)
+            stage = configuration.stages[0]
             now = now_epoch()
             row = SqlProjectTicket(
                 workspace_id=current_workspace_id(),
@@ -321,7 +321,7 @@ class ProjectTicketStore:
     def update_stages(
         self, project_id: str, body: UpdateTicketStages, actor: TicketActor
     ) -> dict[str, Any]:
-        configuration = TicketStages(stages=body.stages, initial_stage_id=body.initial_stage_id)
+        configuration = TicketStages(stages=body.stages)
 
         def write(session: Session) -> dict[str, Any]:
             project = self._project(session, project_id, actor.user_id, write=True)
@@ -332,13 +332,8 @@ class ProjectTicketStore:
                 raise OmnigentError(
                     "Move sources must be existing removed stages", code=ErrorCode.INVALID_INPUT
                 )
-            newly_complete = {
-                stage_id
-                for stage_id in before.keys() & after.keys()
-                if after[stage_id].is_complete and not before[stage_id].is_complete
-            }
             affected: list[SqlProjectTicket] = []
-            for stage_id in sorted(removed | newly_complete):
+            for stage_id in sorted(removed):
                 rows = self._stage_rows(
                     session,
                     project,
@@ -353,29 +348,16 @@ class ProjectTicketStore:
                         "Move tickets in smaller groups before changing these stages.",
                         code=ErrorCode.INVALID_INPUT,
                     )
-                if rows and stage_id in removed and stage_id not in body.moves:
+                if rows and stage_id not in body.moves:
                     raise OmnigentError(
                         f"{before[stage_id].name} contains tickets. "
                         "Choose a surviving stage for them.",
-                        code=ErrorCode.INVALID_INPUT,
-                    )
-                target_id = body.moves.get(stage_id, stage_id)
-                if (
-                    rows
-                    and after[target_id].is_complete
-                    and any(not (row.completion_summary or "").strip() for row in rows)
-                ):
-                    raise OmnigentError(
-                        "Tickets entering a completed stage need completion summaries. "
-                        "Complete them individually or choose an unfinished stage.",
                         code=ErrorCode.INVALID_INPUT,
                     )
             project.ticket_stages = configuration.model_dump()
             project.updated_at = now_epoch()
             for row in affected:
                 previous = before[_stage_id(row)]
-                if previous.id not in removed:
-                    continue
                 target = after[body.moves[previous.id]]
                 row.stage_id = target.id
                 row.status = LEGACY_STATUS_CODES.get(target.id, 2 if target.is_complete else 0)
@@ -410,11 +392,6 @@ class ProjectTicketStore:
             project = self._project(session, project_id, actor.user_id, write=True)
             row = self._row(session, project_id, ticket_id, write=True)
             target = _stage(_stages(project), body.stage_id) if body.stage_id is not None else None
-            if target is not None and target.is_complete and not body.completion_summary:
-                raise OmnigentError(
-                    "Entering a completed stage requires a completion summary",
-                    code=ErrorCode.INVALID_INPUT,
-                )
             lead = changes.get("lead_session_id")
             if (
                 lead is not None

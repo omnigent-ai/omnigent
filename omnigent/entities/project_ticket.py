@@ -33,7 +33,9 @@ class TicketStage(BaseModel):
     id: TicketStageId
     name: str = Field(min_length=1, max_length=60)
     instructions: str = Field(default="", max_length=500)
-    is_complete: bool = False
+    is_complete: bool = Field(
+        default=False, description="Derived from the final stage's position."
+    )
 
     @field_validator("name", "instructions")
     @classmethod
@@ -53,7 +55,9 @@ class TicketStages(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     stages: list[TicketStage] = Field(min_length=1, max_length=20)
-    initial_stage_id: TicketStageId
+    initial_stage_id: TicketStageId | None = Field(
+        default=None, description="Derived from the first stage; supplied values are ignored."
+    )
 
     @model_validator(mode="after")
     def validate_stages(self) -> TicketStages:
@@ -61,11 +65,11 @@ class TicketStages(BaseModel):
             raise ValueError("stage IDs must be unique")
         if len({stage.name.casefold() for stage in self.stages}) != len(self.stages):
             raise ValueError("stage names must be unique")
-        initial = next((stage for stage in self.stages if stage.id == self.initial_stage_id), None)
-        if initial is None:
-            raise ValueError("starting stage must be one of the project's stages")
-        if initial.is_complete:
-            raise ValueError("starting stage cannot mean work is complete")
+        self.initial_stage_id = self.stages[0].id
+        self.stages = [
+            stage.model_copy(update={"is_complete": index == len(self.stages) - 1})
+            for index, stage in enumerate(self.stages)
+        ]
         return self
 
 
@@ -85,10 +89,8 @@ class UpdateTicketStages(TicketStages):
 def default_ticket_stages() -> TicketStages:
     return TicketStages(
         stages=[
-            TicketStage(id=stage_id, name=name, is_complete=stage_id == "done")
-            for stage_id, name in LEGACY_STATUS_LABELS.items()
+            TicketStage(id=stage_id, name=name) for stage_id, name in LEGACY_STATUS_LABELS.items()
         ],
-        initial_stage_id="open",
     )
 
 

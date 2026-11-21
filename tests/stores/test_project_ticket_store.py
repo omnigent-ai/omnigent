@@ -13,7 +13,6 @@ from omnigent.entities.project_ticket import (
     TicketActor,
     UpdateTicket,
     UpdateTicketStages,
-    default_ticket_stages,
 )
 from omnigent.errors import OmnigentError
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -426,12 +425,13 @@ def test_stage_edit_reorder_start_and_removal_preserve_ticket_content_and_histor
         "stages": [
             {"id": "investigating", "name": "Investigating", "instructions": "Gather evidence"},
             {"id": "open", "name": "New"},
-            {"id": "resolved", "name": "Resolved", "is_complete": True},
+            {"id": "resolved", "name": "Resolved"},
         ],
-        "initial_stage_id": "investigating",
     }
     saved = tickets.update_stages(project.id, UpdateTicketStages(**configuration), actor)
     assert [stage["id"] for stage in saved["stages"]] == ["investigating", "open", "resolved"]
+    assert saved["initial_stage_id"] == "investigating"
+    assert [stage["id"] for stage in saved["stages"] if stage["is_complete"]] == ["resolved"]
     assert tickets.get(project.id, ticket["id"], user_id="alice") == original
     assert (
         tickets.create(project.id, CreateTicket(title="New work"), actor)["stage_id"]
@@ -448,10 +448,12 @@ def test_stage_edit_reorder_start_and_removal_preserve_ticket_content_and_histor
         tickets.update_stages(project.id, UpdateTicketStages(**configuration), actor)
     assert tickets.stages(project.id, user_id="alice") == saved
     tickets.update_stages(
-        project.id, UpdateTicketStages(**configuration, moves={"open": "investigating"}), actor
+        project.id, UpdateTicketStages(**configuration, moves={"open": "resolved"}), actor
     )
     moved = tickets.get(project.id, ticket["id"], user_id="alice")
-    assert moved["stage_id"] == "investigating"
+    assert moved["stage_id"] == "resolved"
+    assert moved["completion_summary"] is None
+    assert tickets.get(project.id, sibling["id"], user_id="alice")["stage_id"] == "resolved"
     for field in ("id", "title", "description", "plan", "review_summary", "tags", "comment_count"):
         assert moved[field] == original[field]
     assert (
@@ -465,17 +467,17 @@ def test_stage_edit_reorder_start_and_removal_preserve_ticket_content_and_histor
     events = tickets.events(project.id, ticket["id"], user_id="alice")["data"]
     assert events[:-1] == history
     assert events[-1]["payload"]["previous_stage"]["name"] == "New"
-    assert events[-1]["payload"]["stage"]["name"] == "Investigating"
+    assert events[-1]["payload"]["stage"]["name"] == "Resolved"
     assert events[-1]["payload"]["reason"] == "stage_removed"
     assert events[-1]["notification_pending"] is True
     renamed = tickets.stages(project.id, user_id="alice")
     renamed["stages"][0]["name"] = "Research"
     tickets.update_stages(project.id, UpdateTicketStages(**renamed), actor)
     assert tickets.events(project.id, ticket["id"], user_id="alice")["data"] == events
-    assert tickets.get(project.id, ticket["id"], user_id="alice")["stage_id"] == "investigating"
+    assert tickets.get(project.id, ticket["id"], user_id="alice")["stage_id"] == "resolved"
 
 
-def test_completion_uses_stage_metadata_and_never_implicitly_changes_human_tags(board):
+def test_completion_summary_is_optional_and_stage_moves_preserve_content_and_human_tags(board):
     tickets, _, project = board
     actor = TicketActor("alice")
     configuration = UpdateTicketStages(
@@ -491,9 +493,14 @@ def test_completion_uses_stage_metadata_and_never_implicitly_changes_human_tags(
     )
     assert ticket["stage_id"] == "done"
     tickets.update(project.id, ticket["id"], UpdateTicket(stage_id="done"), actor)
-    for stage_id in ("verified", "not-in-this-project"):
-        with pytest.raises(OmnigentError):
-            tickets.update(project.id, ticket["id"], UpdateTicket(stage_id=stage_id), actor)
+    with pytest.raises(OmnigentError):
+        tickets.update(
+            project.id, ticket["id"], UpdateTicket(stage_id="not-in-this-project"), actor
+        )
+    completed = tickets.update(project.id, ticket["id"], UpdateTicket(stage_id="verified"), actor)
+    assert completed["stage_id"] == "verified"
+    assert completed["completion_summary"] is None
+    assert completed["tags"] == ticket["tags"]
     completed = tickets.update(
         project.id,
         ticket["id"],
@@ -506,25 +513,20 @@ def test_completion_uses_stage_metadata_and_never_implicitly_changes_human_tags(
     reopened = tickets.update(project.id, ticket["id"], UpdateTicket(stage_id="done"), actor)
     assert reopened["review_summary"] == "Evidence"
     assert reopened["completion_summary"] == "Recovery confirmed"
-    with pytest.raises(OmnigentError, match="completion summary"):
-        tickets.update(project.id, ticket["id"], UpdateTicket(stage_id="verified"), actor)
+    completed = tickets.update(project.id, ticket["id"], UpdateTicket(stage_id="verified"), actor)
+    assert completed["completion_summary"] == "Recovery confirmed"
+    assert completed["tags"] == ticket["tags"]
 
 
-def test_configuration_cannot_complete_tickets_without_evidence_or_cross_project_boundaries(board):
+def test_reordering_occupied_stages_needs_no_summary_and_preserves_project_boundaries(board):
     tickets, projects, project = board
     actor = TicketActor("alice")
     ticket = tickets.create(project.id, CreateTicket(title="Not verified"), actor)
     original = tickets.stages(project.id, user_id="alice")
-    configuration = {**original, "stages": original["stages"][1:], "initial_stage_id": "planning"}
-    with pytest.raises(OmnigentError, match="completion summaries"):
-        tickets.update_stages(
-            project.id, UpdateTicketStages(**configuration, moves={"open": "done"}), actor
-        )
-    completed_stage = default_ticket_stages().model_dump()
-    completed_stage["initial_stage_id"] = "planning"
-    completed_stage["stages"][0]["is_complete"] = True
-    with pytest.raises(OmnigentError, match="completion summaries"):
-        tickets.update_stages(project.id, UpdateTicketStages(**completed_stage), actor)
+    configuration = {**original, "stages": original["stages"][1:] + original["stages"][:1]}
+    saved = tickets.update_stages(project.id, UpdateTicketStages(**configuration), actor)
+    assert saved["initial_stage_id"] == "planning"
+    assert [stage["id"] for stage in saved["stages"] if stage["is_complete"]] == ["open"]
     other = projects.create(uuid4().hex, "Other", "alice")
     tickets.update_stages(
         other.id,
@@ -549,7 +551,7 @@ def test_configuration_cannot_complete_tickets_without_evidence_or_cross_project
             operation()
     with workspace_scope(9), pytest.raises(OmnigentError):
         tickets.update_stages(project.id, UpdateTicketStages(**original), actor)
-    assert tickets.stages(project.id, user_id="alice") == original
+    assert tickets.stages(project.id, user_id="alice") == saved
     assert tickets.get(project.id, ticket["id"], user_id="alice") == ticket
 
 

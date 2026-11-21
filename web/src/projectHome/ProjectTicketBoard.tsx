@@ -129,7 +129,8 @@ function TicketBoard({
           const stage = stages.find((candidate) => candidate.id === over?.id);
           if (!ticket || !stage || ticket.stage_id === stage.id) return;
           update.reset();
-          if (stage.is_complete) setCompleting({ ticket, stageId: stage.id });
+          if (!configuration.supported && stage.is_complete)
+            setCompleting({ ticket, stageId: stage.id });
           else if (!configuration.supported && stage.id === "review") setReviewing(ticket);
           else update.mutate({ id: ticket.id, changes: { stage_id: stage.id } });
         }}

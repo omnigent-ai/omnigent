@@ -166,7 +166,7 @@ describe("Project ticket board", () => {
     expect(screen.queryByRole("combobox")).toBeNull();
   });
 
-  it("renders configured lane order, instructions and the chosen starting lane", async () => {
+  it("renders configured lane order, instructions and the first starting lane", async () => {
     ticket.stage_id = "investigating";
     vi.mocked(api.getTicketStages).mockResolvedValue({
       stages: [
@@ -179,26 +179,29 @@ describe("Project ticket board", () => {
         },
         { id: "resolved", name: "Resolved", instructions: "", is_complete: true },
       ],
-      initial_stage_id: "investigating",
+      initial_stage_id: "new",
     });
     renderBoard(<ProjectTicketBoard projectName="Shipping" selectedTicketId={null} />);
-    const initial = await screen.findByRole("region", { name: "Investigating" });
+    const investigating = await screen.findByRole("region", { name: "Investigating" });
+    const initial = screen.getByRole("region", { name: "New" });
     const board = screen.getByRole("region", { name: "Shipping ticket board" });
     expect(
       within(board)
         .getAllByRole("region")
         .map((lane) => lane.getAttribute("aria-label")),
     ).toEqual(["New", "Investigating", "Resolved"]);
-    expect(within(initial).getByText("Gather evidence before resolving.")).toBeInTheDocument();
+    expect(
+      within(investigating).getByText("Gather evidence before resolving."),
+    ).toBeInTheDocument();
     expect(within(initial).getByRole("link", { name: "New ticket" })).toHaveAttribute(
       "href",
       "/?ticket=new",
     );
     expect(within(board).getAllByRole("link", { name: "New ticket" })).toHaveLength(1);
     expect(
-      await within(initial).findByRole("link", { name: "Open ticket: Ship the board" }),
+      await within(investigating).findByRole("link", { name: "Open ticket: Ship the board" }),
     ).toBeInTheDocument();
-    expect(within(initial).getByText("Needs response")).toBeInTheDocument();
+    expect(within(investigating).getByText("Needs response")).toBeInTheDocument();
     expect(api.listTickets).toHaveBeenCalledWith("project", {
       stage_id: "investigating",
       after: undefined,
@@ -213,7 +216,7 @@ describe("Project ticket board", () => {
     expect(api.listTickets).not.toHaveBeenCalled();
   });
 
-  it("uses completion metadata, keeping optional content and Needs response in any stage", async () => {
+  it("moves to the last stage without requiring a summary and preserves optional content", async () => {
     ticket.stage_id = "verifying";
     ticket.review_summary = "Inspect the evidence in any stage.";
     ticket.completion_summary = "Earlier result";
@@ -226,7 +229,7 @@ describe("Project ticket board", () => {
           is_complete: false,
         },
         { id: "done", name: "Done", instructions: "", is_complete: false },
-        { id: "resolved", name: "Resolved", instructions: "", is_complete: true },
+        { id: "resolved", name: "Resolved", instructions: "", is_complete: false },
         { id: "archived", name: "Archived", instructions: "", is_complete: true },
       ],
       initial_stage_id: "verifying",
@@ -258,19 +261,20 @@ describe("Project ticket board", () => {
     );
     await user.click(screen.getByRole("combobox", { name: "Ticket stage" }));
     await user.click(screen.getByRole("option", { name: "Resolved" }));
-    expect(screen.getByLabelText("Completed stage")).toHaveValue("resolved");
-    await user.selectOptions(screen.getByLabelText("Completed stage"), "archived");
-    fireEvent.change(within(screen.getByRole("dialog")).getByLabelText("Completion summary"), {
-      target: { value: "Recovery verified." },
-    });
-    await user.click(screen.getByRole("button", { name: "Complete ticket" }));
+    await waitFor(() =>
+      expect(api.updateTicket).toHaveBeenLastCalledWith("project", "ticket", {
+        stage_id: "resolved",
+      }),
+    );
+    await user.click(screen.getByRole("combobox", { name: "Ticket stage" }));
+    await user.click(screen.getByRole("option", { name: "Archived" }));
     await waitFor(() =>
       expect(api.updateTicket).toHaveBeenLastCalledWith("project", "ticket", {
         stage_id: "archived",
-        completion_summary: "Recovery verified.",
       }),
     );
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(ticket.completion_summary).toBe("Earlier result");
     expect(ticket.tags).toEqual([{ key: "needs-human", value: "approval" }]);
     expect(ticket.plan).toBe("Verify recovery evidence.");
     expect(ticket.review_summary).toBe("Inspect the evidence in any stage.");
@@ -366,7 +370,7 @@ describe("Project ticket board", () => {
     expect(projectsApi.initializeProjectOrchestrator).not.toHaveBeenCalled();
   });
 
-  it("requires a summary before completing", () => {
+  it("retains required completion summaries for legacy servers", () => {
     const complete = vi.fn();
     renderBoard(
       <CompleteTicketDialog
@@ -657,7 +661,8 @@ describe("Project ticket board", () => {
     await waitFor(() => expect(input).toHaveValue(""));
   });
 
-  it("retains title editing and completion through the compact status control", async () => {
+  it("retains title editing and legacy completion through the compact status control", async () => {
+    capabilities.stages = false;
     const user = userEvent.setup();
     renderBoard(
       <ProjectTicketPanel
@@ -683,10 +688,12 @@ describe("Project ticket board", () => {
     });
     await user.click(screen.getByRole("button", { name: "Complete ticket" }));
     await waitFor(() =>
-      expect(api.updateTicket).toHaveBeenLastCalledWith("project", "ticket", {
-        stage_id: "done",
-        completion_summary: "Built and tested",
-      }),
+      expect(api.updateTicket).toHaveBeenLastCalledWith(
+        "project",
+        "ticket",
+        { stage_id: "done", completion_summary: "Built and tested" },
+        true,
+      ),
     );
     expect(await screen.findByText("Built and tested")).toBeInTheDocument();
   });
@@ -854,35 +861,40 @@ describe("Project ticket board", () => {
     expect(screen.getByLabelText("Plan")).toHaveValue("Keep the draft");
   });
 
-  it("records human acceptance with a completion summary", async () => {
-    ticket.stage_id = "review";
-    ticket.review_summary = "Tested and ready; check the demo.";
-    renderBoard(
-      <ProjectTicketPanel
-        projectName="Shipping"
-        ticketId="ticket"
-        onClose={vi.fn()}
-        onCreated={vi.fn()}
-      />,
-    );
-    expect(await screen.findByRole("button", { name: "Review brief" })).toHaveAttribute(
-      "aria-expanded",
-      "false",
-    );
-    fireEvent.click(await screen.findByRole("button", { name: "Approve & complete" }));
-    const dialog = screen.getByRole("dialog");
-    fireEvent.change(within(dialog).getByLabelText("Completion summary"), {
-      target: { value: "Reviewed the demo and accepted" },
-    });
-    fireEvent.click(within(dialog).getByRole("button", { name: "Approve & complete" }));
-    await waitFor(() =>
-      expect(api.updateTicket).toHaveBeenLastCalledWith("project", "ticket", {
-        stage_id: "done",
-        completion_summary: "Reviewed the demo and accepted",
-        comment: "Accepted the ticket review.",
-      }),
-    );
-  });
+  it.each(["", "Reviewed the demo and accepted"])(
+    "records human acceptance with optional summary '%s'",
+    async (summary) => {
+      ticket.stage_id = "review";
+      ticket.review_summary = "Tested and ready; check the demo.";
+      renderBoard(
+        <ProjectTicketPanel
+          projectName="Shipping"
+          ticketId="ticket"
+          onClose={vi.fn()}
+          onCreated={vi.fn()}
+        />,
+      );
+      expect(await screen.findByRole("button", { name: "Review brief" })).toHaveAttribute(
+        "aria-expanded",
+        "false",
+      );
+      fireEvent.click(await screen.findByRole("button", { name: "Approve & complete" }));
+      const dialog = screen.getByRole("dialog");
+      expect(within(dialog).getByLabelText("Completion summary")).not.toBeRequired();
+      expect(within(dialog).getByRole("button", { name: "Approve & complete" })).toBeEnabled();
+      fireEvent.change(within(dialog).getByLabelText("Completion summary"), {
+        target: { value: summary },
+      });
+      fireEvent.click(within(dialog).getByRole("button", { name: "Approve & complete" }));
+      await waitFor(() =>
+        expect(api.updateTicket).toHaveBeenLastCalledWith("project", "ticket", {
+          stage_id: "done",
+          ...(summary ? { completion_summary: summary } : {}),
+          comment: "Accepted the ticket review.",
+        }),
+      );
+    },
+  );
 
   it("links and unlinks related tickets by title without changing phase", async () => {
     const peer: ProjectTicket = {

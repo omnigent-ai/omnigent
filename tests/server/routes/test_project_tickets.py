@@ -279,13 +279,14 @@ async def test_custom_stage_api_and_ticket_tools_share_real_project_definitions(
         "stages": [
             {"id": "triage", "name": "New"},
             {"id": "verifying", "name": "Verifying", "instructions": "Attach recovery evidence"},
-            {"id": "resolved", "name": "Resolved", "is_complete": True},
+            {"id": "resolved", "name": "Resolved"},
         ],
-        "initial_stage_id": "triage",
         "moves": {"open": "triage"},
     }
     response = await project_client.put(base + "/stages", json=configuration)
     assert response.status_code == 200, response.text
+    assert response.json()["initial_stage_id"] == "triage"
+    assert [stage["is_complete"] for stage in response.json()["stages"]] == [False, False, True]
     assert (await project_client.get(base + "/stages", params={"include_usage": True})).json()[
         "occupied_stage_ids"
     ] == ["triage"]
@@ -313,7 +314,7 @@ async def test_custom_stage_api_and_ticket_tools_share_real_project_definitions(
         )
     )
     assert moved["stage_id"] == "verifying"
-    rejected = json.loads(
+    completed_without_summary = json.loads(
         await execute_ticket_tool(
             "sys_ticket_update",
             {"ticket_id": ticket["id"], "stage_id": "resolved"},
@@ -321,7 +322,8 @@ async def test_custom_stage_api_and_ticket_tools_share_real_project_definitions(
             source,
         )
     )
-    assert "completion summary" in rejected["detail"]
+    assert completed_without_summary["stage_id"] == "resolved"
+    assert completed_without_summary["completion_summary"] is None
     completed = json.loads(
         await execute_ticket_tool(
             "sys_ticket_update",
@@ -337,7 +339,7 @@ async def test_custom_stage_api_and_ticket_tools_share_real_project_definitions(
     assert completed["stage_id"] == "resolved"
     assert completed["review_summary"] == "Recovery looks good"
     for invalid in (
-        {**configuration, "initial_stage_id": "resolved"},
+        {**configuration, "stages": [configuration["stages"][0]] * 2},
         {**configuration, "stages": []},
     ):
         assert (await project_client.put(base + "/stages", json=invalid)).status_code == 422

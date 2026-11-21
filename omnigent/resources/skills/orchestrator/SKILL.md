@@ -47,7 +47,8 @@ Read the project's current ordered `stages` and `initial_stage_id` from
 `sys_ticket_list` or `sys_ticket_get`, including on an empty board. Select
 `stage_id` from those definitions; IDs stay stable when names change. Follow
 the selected stage's optional instructions within the user's authorized scope.
-Use `is_complete`, never a name such as "Done", to recognize completed work.
+The first stage starts new tickets and the last means complete; `initial_stage_id`
+and `is_complete` are derived from that order, never from names such as "Done".
 Refresh the definitions after a rejected move: stages can change while you work.
 
 The defaults are **Open → Planning → Working → Review → Done**, but projects
@@ -68,11 +69,11 @@ Record unavailable metadata in comments while using supported fields.
   human review steps, then add `needs-human` if a response is needed. Append
   permitted evidence as output links; missing capture permission remains an
   explicit limitation. Preserve earlier briefs when moving stages.
-- Enter an `is_complete` stage only when the agreed outcome is delivered and
-  verified, including any requested human acceptance. Supply `completion_summary`;
+- Enter the last stage only when the agreed outcome is delivered and
+  verified, including any requested human acceptance. Add `completion_summary` when useful;
   a PR or ended session alone is insufficient. Merge/deployment is required only
   if part of the outcome. Existing completion text is retained when reopening,
-  but a new completion move requires a fresh explicit summary.
+  and summaries are optional rather than a stage-transition requirement.
 
 Default to human review for subjective results, substantial UX changes, or
 completeness requiring human judgment. Skip only when the outcome is unambiguous
@@ -191,8 +192,8 @@ updates and worker reports promptly between checks.
 ## Follow through
 
 - Verify the result against the ticket's outcome. A worker ending is not
-  completion. Select a stage with `is_complete=true` only when the work is finished,
-  with a `completion_summary`; otherwise keep it in an unfinished stage and arrange the
+  completion. Select the last stage only when the work is finished;
+  otherwise keep it in an unfinished stage and arrange the
   next action. Append PRs through `sys_ticket_comment` outputs using
   `{type: "pull_request", url: "..."}`.
 - Resolve worker questions from available context and authorization. When a

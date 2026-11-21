@@ -449,7 +449,8 @@ function TicketDetails({
                     update.reset();
                     const stage = stages.find((candidate) => candidate.id === value);
                     if (!stage) return;
-                    if (stage.is_complete) setCompleting({ stageId: stage.id, approving: false });
+                    if (!configuration.supported && stage.is_complete)
+                      setCompleting({ stageId: stage.id, approving: false });
                     else if (!configuration.supported && value === "review") setReviewing(true);
                     else update.mutate({ id: ticketId, changes: { stage_id: value } });
                   }}
@@ -600,6 +601,7 @@ function TicketDetails({
               approving={completing.approving}
               stages={stages}
               initialStageId={completing.stageId}
+              required={!configuration.supported}
               pending={update.isPending}
               error={update.error}
               onClose={() => {
@@ -612,7 +614,7 @@ function TicketDetails({
                     id: ticketId,
                     changes: {
                       stage_id: stageId,
-                      completion_summary: summary,
+                      ...(summary ? { completion_summary: summary } : {}),
                       ...(completing.approving ? { comment: "Accepted the ticket review." } : {}),
                     },
                   },

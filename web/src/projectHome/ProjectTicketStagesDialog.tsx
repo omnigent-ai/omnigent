@@ -123,7 +123,6 @@ function StageEditor({
   onClose: () => void;
 }) {
   const [stages, setStages] = useState(() => configuration.stages.map((stage) => ({ ...stage })));
-  const [initialStageId, setInitialStageId] = useState(configuration.initial_stage_id);
   const [moves, setMoves] = useState<Record<string, string>>({});
   const removed = configuration.stages.filter(
     (stage) => !stages.some((current) => current.id === stage.id),
@@ -139,14 +138,12 @@ function StageEditor({
     ? "Give every stage a name."
     : new Set(names).size !== names.length
       ? "Stage names must be unique."
-      : !stages.some((stage) => stage.id === initialStageId && !stage.is_complete)
-        ? "Choose an unfinished starting stage."
-        : removed.some(
-              (stage) =>
-                occupied.has(stage.id) && !stages.some((target) => target.id === moves[stage.id]),
-            )
-          ? "Choose where tickets from each removed stage should move."
-          : null;
+      : removed.some(
+            (stage) =>
+              occupied.has(stage.id) && !stages.some((target) => target.id === moves[stage.id]),
+          )
+        ? "Choose where tickets from each removed stage should move."
+        : null;
   const change = (id: string, fields: Partial<TicketStage>) =>
     setStages((current) =>
       current.map((stage) => (stage.id === id ? { ...stage, ...fields } : stage)),
@@ -158,12 +155,13 @@ function StageEditor({
         event.preventDefault();
         if (pending || validation) return;
         onSave({
-          stages: stages.map((stage) => ({
+          stages: stages.map((stage, index) => ({
             ...stage,
             name: stage.name.trim(),
             instructions: stage.instructions.trim(),
+            is_complete: index === stages.length - 1,
           })),
-          initial_stage_id: initialStageId,
+          initial_stage_id: stages[0].id,
           moves: Object.fromEntries(
             removed
               .filter((stage) => stages.some((target) => target.id === moves[stage.id]))
@@ -193,15 +191,11 @@ function StageEditor({
                 stage={stage}
                 index={index}
                 pending={pending}
-                initial={stage.id === initialStageId}
                 onlyStage={stages.length === 1}
                 onChange={(fields) => change(stage.id, fields)}
-                onStart={() => setInitialStageId(stage.id)}
                 onRemove={() => {
                   const remaining = stages.filter((current) => current.id !== stage.id);
                   setStages(remaining);
-                  if (stage.id === initialStageId)
-                    setInitialStageId(remaining.find((current) => !current.is_complete)?.id ?? "");
                 }}
               />
             ))}
@@ -279,20 +273,16 @@ function StageEditor({
 function StageRow({
   stage,
   index,
-  initial,
   onlyStage,
   pending,
   onChange,
-  onStart,
   onRemove,
 }: {
   stage: TicketStage;
   index: number;
-  initial: boolean;
   onlyStage: boolean;
   pending: boolean;
   onChange: (fields: Partial<TicketStage>) => void;
-  onStart: () => void;
   onRemove: () => void;
 }) {
   const {
@@ -307,27 +297,27 @@ function StageRow({
   return (
     <li
       ref={setNodeRef}
-      className="space-y-2 rounded-lg border border-border/60 bg-background p-3"
+      className="flex items-center gap-2 rounded-lg border border-border/60 bg-background p-3"
       style={{
         transform: transform ? `translate3d(${transform.x}px, ${transform.y}px, 0)` : undefined,
         transition,
         opacity: isDragging ? 0.5 : 1,
       }}
     >
-      <div className="flex items-center gap-2">
-        <Button
-          ref={setActivatorNodeRef}
-          {...attributes}
-          {...listeners}
-          type="button"
-          variant="ghost"
-          size="icon-sm"
-          className="touch-none text-muted-foreground"
-          disabled={pending}
-          aria-label={`Reorder ${stage.name || `stage ${index + 1}`}`}
-        >
-          <GripVerticalIcon aria-hidden />
-        </Button>
+      <Button
+        ref={setActivatorNodeRef}
+        {...attributes}
+        {...listeners}
+        type="button"
+        variant="ghost"
+        size="icon-sm"
+        className="touch-none text-muted-foreground"
+        disabled={pending}
+        aria-label={`Reorder ${stage.name || `stage ${index + 1}`}`}
+      >
+        <GripVerticalIcon aria-hidden />
+      </Button>
+      <div className="grid min-w-0 flex-1 gap-2">
         <Input
           aria-label={`Stage name ${index + 1}`}
           required
@@ -337,51 +327,25 @@ function StageRow({
           placeholder="Stage name"
           onChange={(event) => onChange({ name: event.target.value })}
         />
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon-sm"
-          disabled={pending || onlyStage}
-          aria-label={`Remove ${stage.name || `stage ${index + 1}`}`}
-          onClick={onRemove}
-        >
-          <Trash2Icon aria-hidden />
-        </Button>
+        <Input
+          aria-label={`Instructions for ${stage.name || `stage ${index + 1}`}`}
+          value={stage.instructions}
+          maxLength={500}
+          disabled={pending}
+          placeholder="Optional instruction for this stage…"
+          onChange={(event) => onChange({ instructions: event.target.value })}
+        />
       </div>
-      <div className="flex flex-wrap items-center gap-x-5 gap-y-2 pl-1 text-sm">
-        <label className="flex items-center gap-2">
-          <input
-            type="radio"
-            name="initial-ticket-stage"
-            checked={initial}
-            disabled={pending || stage.is_complete}
-            onChange={onStart}
-            aria-label={`Start in ${stage.name || `stage ${index + 1}`}`}
-          />
-          Starting stage
-        </label>
-        <label
-          className="flex items-center gap-2"
-          title={initial ? "Choose another starting stage first" : undefined}
-        >
-          <input
-            type="checkbox"
-            checked={stage.is_complete}
-            disabled={pending || initial}
-            aria-label={`${stage.name || `Stage ${index + 1}`} means work is complete`}
-            onChange={(event) => onChange({ is_complete: event.target.checked })}
-          />
-          Work is complete
-        </label>
-      </div>
-      <Input
-        aria-label={`Instructions for ${stage.name || `stage ${index + 1}`}`}
-        value={stage.instructions}
-        maxLength={500}
-        disabled={pending}
-        placeholder="Optional instruction for this stage…"
-        onChange={(event) => onChange({ instructions: event.target.value })}
-      />
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon-sm"
+        disabled={pending || onlyStage}
+        aria-label={`Remove ${stage.name || `stage ${index + 1}`}`}
+        onClick={onRemove}
+      >
+        <Trash2Icon aria-hidden />
+      </Button>
     </li>
   );
 }
