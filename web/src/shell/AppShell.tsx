@@ -10,6 +10,7 @@ import {
   showWorkspaceTabOrChooser,
   useTabsSidebar,
 } from "@/shell/workspaceTabsRouting";
+import type { WorkspaceFileOpenOptions } from "@/shell/workspaceTabs/workspacePlaceNavigation";
 import {
   type ComponentProps,
   type CSSProperties,
@@ -1901,34 +1902,58 @@ function AppShellImpl() {
       { replace: true },
     );
   }, [setSearchParams]);
-  // In the tabs sidebar, a ?file= link opens the file's tab at its cited line, and the
-  // request leaves the URL once it's handed over.
+  // In the tabs sidebar, a ?file= link opens the file's tab at its cited line, its diff in
+  // Changes, or its comment's thread, and the request leaves the URL once it's handed over.
   useEffect(() => {
     const tabsSession = tabsSessionRef.current;
     if (tabsSession === null || !citationPath) return;
-    const position = urlNavigation?.position;
+    const commentId = searchParams.get("comment") || undefined;
+    const options: WorkspaceFileOpenOptions = {
+      ...urlNavigation?.position,
+      ...(searchParams.get("diff") === "1" ? { view: "diff" } : {}),
+      ...(commentId !== undefined ? { commentId } : {}),
+    };
     void routeToWorkspaceTabs((tabs) =>
-      tabs.openWorkspaceFileLink(tabsSession, citationPath, position, "link"),
+      tabs.openWorkspaceFileLink(tabsSession, citationPath, options, "link"),
     );
     if (isMobileViewport()) setTabsDrawerOpen(true);
-    else setRightPanelOpenImmediately(true);
+    else {
+      setRightPanelOpenImmediately(true);
+      // ?fullscreen=1 fills the window with the sidebar, as its Full screen button does. Arriving
+      // from another session's full screen, the left sidebar it closed is the one to restore.
+      if (urlFileFullscreen && !rightPanelMaximized) {
+        const leftFullScreen =
+          tabsLinkRestoreRef.current !== restoredWorkspace && !!restoredWorkspace?.exitedMaximized;
+        if (!leftFullScreen) sidebarOpenBeforeMaximizeRef.current = sidebarOpen;
+        setSidebarOpen(false);
+        setRightPanelMaximized(true);
+      }
+    }
     clearFileViewerUrl();
   }, [tabsSidebar, conversationId, citationPath, urlNavigation, clearFileViewerUrl]); // eslint-disable-line react-hooks/exhaustive-deps
-  const restoreSelectedFileUrl = useCallback(() => {
-    // The tabs sidebar keeps its own files; the classic selection would open as a tab.
-    if (!selectedFilePath || tabsModeRef.current) return;
-    setSearchParams(
-      (prev) => {
-        const params = new URLSearchParams(prev);
-        params.set("file", selectedFilePath);
-        if (rightPanelMaximized) params.set("fullscreen", "1");
-        else params.delete("fullscreen");
-        localFileUrlRef.current = params;
-        return params;
-      },
-      { replace: true },
-    );
-  }, [selectedFilePath, rightPanelMaximized, setSearchParams]);
+  // The session restore the link effect above saw, so it knows the commit that restored one.
+  const tabsLinkRestoreRef = useRef(restoredWorkspace);
+  useEffect(() => {
+    tabsLinkRestoreRef.current = restoredWorkspace;
+  });
+  const restoreSelectedFileUrl = useCallback(
+    (fullscreen: boolean = rightPanelMaximized) => {
+      // The tabs sidebar keeps its own files; the classic selection would open as a tab.
+      if (!selectedFilePath || tabsModeRef.current) return;
+      setSearchParams(
+        (prev) => {
+          const params = new URLSearchParams(prev);
+          params.set("file", selectedFilePath);
+          if (fullscreen) params.set("fullscreen", "1");
+          else params.delete("fullscreen");
+          localFileUrlRef.current = params;
+          return params;
+        },
+        { replace: true },
+      );
+    },
+    [selectedFilePath, rightPanelMaximized, setSearchParams],
+  );
 
   // Toggle the right (Workspace) sidebar — shared by the header's collapse
   // button and the ⌘⌥]/Ctrl+Alt+] hotkey so they can't drift. Beyond flipping the
@@ -2154,26 +2179,13 @@ function AppShellImpl() {
       restoreSidebarAfterMaximize();
     }
     setRightPanelMaximized((prev) => !prev);
-    if (selectedFilePath) {
-      setSearchParams(
-        (prev) => {
-          const next = new URLSearchParams(prev);
-          next.set("file", selectedFilePath);
-          if (rightPanelMaximized) next.delete("fullscreen");
-          else next.set("fullscreen", "1");
-          localFileUrlRef.current = next;
-          return next;
-        },
-        { replace: true },
-      );
-    }
+    restoreSelectedFileUrl(!rightPanelMaximized);
   }, [
     rightPanelMaximized,
     sidebarOpen,
     restoreSidebarAfterMaximize,
     setSidebarOpen,
-    selectedFilePath,
-    setSearchParams,
+    restoreSelectedFileUrl,
   ]);
 
   // ⌘B / ⇧⌘B in the desktop app (⌘⌥[ / ⌘⌥] in a browser) toggle the left and

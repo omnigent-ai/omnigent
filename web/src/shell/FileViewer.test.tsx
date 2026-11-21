@@ -279,6 +279,7 @@ interface RenderProps {
   escapeCloses?: boolean;
   onShare?: () => void;
   shareDisabledReason?: string;
+  linkedCommentId?: string;
 }
 
 /**
@@ -308,6 +309,7 @@ function viewerTree({
   onShare,
   shareDisabledReason,
   registerLeaveGuard,
+  linkedCommentId,
 }: RenderProps = {}) {
   const url = initialSearch ? `/?${initialSearch}` : "/";
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -333,6 +335,7 @@ function viewerTree({
           onShare={onShare}
           shareDisabledReason={shareDisabledReason}
           registerLeaveGuard={registerLeaveGuard}
+          linkedCommentId={linkedCommentId}
         />
       </MemoryRouter>
     </QueryClientProvider>
@@ -1019,6 +1022,23 @@ describe("FileViewer URL sync — comment param", () => {
     // Failure: linkedCommentAppliedRef logic did not run, or commentsQuery.data
     // was not available when the effect fired.
     expect(screen.getByTestId("comments-panel")).toBeInTheDocument();
+  });
+
+  it("opens the comments panel for a linked comment it's given, with no ?comment= in the URL", async () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1"), makeComment("c2")]));
+    // A saved Show diff doesn't hide the file the comment is on, and stays saved.
+    writeFileViewPreferences({ ...DEFAULT_FILE_VIEW_PREFERENCES, diffActive: true });
+
+    renderViewer({ open: true, path: "file1.py", linkedCommentId: "c2" });
+    await act(async () => {});
+
+    expect(screen.getByTestId("comments-panel")).toHaveAttribute("data-active-comment-id", "c2");
+    expect(screen.getByTestId("code-viewer")).toBeInTheDocument();
+    expect(screen.queryByTestId("diff-viewer")).toBeNull();
+    expect(readFileViewPreferences().diffActive).toBe(true);
+    expect(screen.getByTestId("url-params").textContent).not.toContain("diff=1");
+    fireEvent.click(screen.getByRole("button", { name: "Show diff" }));
+    expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
   });
 
   it("applies the linked comment only once per component lifecycle", () => {

@@ -270,6 +270,9 @@ function ChatProbe() {
       <button type="button" onClick={() => navigate("/c/conv_ws?file=README.md&line=4")}>
         Follow README link
       </button>
+      <button type="button" onClick={() => navigate("/c/conv_other?file=README.md&fullscreen=1")}>
+        Follow another session's full screen link
+      </button>
       <button type="button" onClick={() => openFile?.("src/app.ts", { line: 3 })}>
         Open cited file
       </button>
@@ -629,6 +632,81 @@ describe("workspace_sidebar_v2", () => {
     await waitFor(() =>
       expect(workspaceTabsSessions.openWorkspaceFileLink).toHaveBeenCalledTimes(2),
     );
+  });
+
+  it("opens a ?diff= link's file in the Changes review, and a ?comment= link's thread on the file", async () => {
+    setViewport(DESKTOP);
+    renderShell(withFlag(true), "/c/conv_ws?file=README.md&line=4&diff=1");
+    await waitFor(() =>
+      expect(workspaceTabsSessions.openWorkspaceFileLink).toHaveBeenCalledWith(
+        "conv_ws",
+        "README.md",
+        { line: 4, view: "diff" },
+        "link",
+      ),
+    );
+    await waitFor(() => expect(screen.getByTestId("search")).not.toHaveTextContent("diff="));
+    cleanup();
+
+    renderShell(withFlag(true), "/c/conv_ws?file=README.md&comment=c1");
+    await waitFor(() =>
+      expect(workspaceTabsSessions.openWorkspaceFileLink).toHaveBeenLastCalledWith(
+        "conv_ws",
+        "README.md",
+        { commentId: "c1" },
+        "link",
+      ),
+    );
+    await waitFor(() => expect(screen.getByTestId("search")).not.toHaveTextContent("comment="));
+
+    // Full screen and back only change the layout; neither opens the linked file again.
+    const linkOpens = vi.mocked(workspaceTabsSessions.openWorkspaceFileLink).mock.calls.length;
+    act(() => tabs.host!.onToggleMaximized());
+    await waitFor(() => expect(tabs.host).toMatchObject({ maximized: true }));
+    act(() => tabs.host!.onToggleMaximized());
+    await waitFor(() => expect(tabs.host).toMatchObject({ maximized: false }));
+    expect(screen.getByTestId("search")).not.toHaveTextContent("file=");
+    expect(workspaceTabsSessions.openWorkspaceFileLink).toHaveBeenCalledTimes(linkOpens);
+  });
+
+  it("fills the window with the sidebar for a ?fullscreen=1 link, and leaves the URL", async () => {
+    setViewport(DESKTOP);
+    renderShell(withFlag(true), "/c/conv_ws?file=README.md&fullscreen=1");
+    await waitFor(() => expect(tabs.host).toMatchObject({ maximized: true }));
+    await waitFor(() => expect(screen.getByTestId("search")).not.toHaveTextContent("fullscreen="));
+    cleanup();
+
+    // In a narrow window the link opens the drawer instead, with nothing to fill.
+    setViewport(NARROW_DESKTOP);
+    renderShell(withFlag(true), "/c/conv_ws?file=README.md&fullscreen=1");
+    await waitFor(() =>
+      expect(screen.getByTestId("workspace-tabs-drawer")).toHaveAttribute("data-state", "open"),
+    );
+    expect(tabs.host).toMatchObject({ placement: "drawer", maximized: false });
+    await waitFor(() => expect(screen.getByTestId("search")).not.toHaveTextContent("file="));
+    expect(screen.getByTestId("search")).not.toHaveTextContent("fullscreen=");
+  });
+
+  it("reopens the left sidebar on leaving full screen after another session's full screen link", async () => {
+    setViewport(DESKTOP);
+    renderShell(withFlag(true));
+    await screen.findByTestId("tabs-host");
+    const shell = document.querySelector(".app-shell");
+    // A wide window shows the left sidebar.
+    expect(shell).toHaveAttribute("data-sidebar-open", "true");
+    act(() => tabs.host!.onToggleMaximized());
+    expect(shell).not.toHaveAttribute("data-sidebar-open");
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Follow another session's full screen link" }),
+    );
+    await waitFor(() => expect(tabs.host).toMatchObject({ maximized: true }));
+    await waitFor(() => expect(screen.getByTestId("search")).not.toHaveTextContent("fullscreen="));
+    expect(shell).not.toHaveAttribute("data-sidebar-open");
+
+    act(() => tabs.host!.onToggleMaximized());
+    expect(tabs.host).toMatchObject({ maximized: false });
+    expect(shell).toHaveAttribute("data-sidebar-open", "true");
   });
 
   it("shows the browser tab an agent selects in its tab", async () => {

@@ -205,15 +205,16 @@ describe("Files tab", () => {
     );
   });
 
-  it("prefers the tab's own citation and passes its leave guard to the viewer", () => {
+  it("prefers the tab's own citation and passes its leave guard and linked comment to the viewer", () => {
     const citation = { line: 9 };
     const registerLeaveGuard = vi.fn(() => () => {});
     renderView(
-      { kind: "files", path: "a.ts", line: { start: 3 } },
+      { kind: "files", path: "a.ts", line: { start: 3 }, comment: "c1" },
       { position: citation, registerLeaveGuard },
     );
     expect(captured.viewer!.position).toBe(citation);
     expect(captured.viewer!.registerLeaveGuard).toBe(registerLeaveGuard);
+    expect(captured.viewer!.commentId).toBe("c1");
   });
 
   it("gives the file's viewer the session's permission level, so a viewer can't edit", () => {

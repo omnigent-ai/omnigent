@@ -233,6 +233,37 @@ def test_tabs_sidebar_files_history_and_pull_request(
         assert any(marker in body for body in bodies), marker
 
 
+def test_file_link_opens_its_comment_in_a_full_screen_sidebar(
+    page: Page, workspace_session: tuple[str, str]
+) -> None:
+    """A ``?file=`` link with ``comment`` and ``fullscreen=1`` shows that thread, full screen."""
+    base_url, session_id = workspace_session
+    anchor = "hello"
+    response = httpx.post(
+        f"{base_url}/v1/sessions/{session_id}/comments",
+        json={
+            "path": _FILE,
+            "body": "Say goodbye too",
+            "start_index": "print('hello')".index(anchor),
+            "end_index": "print('hello')".index(anchor) + len(anchor),
+            "anchor_content": anchor,
+        },
+        timeout=10.0,
+    )
+    response.raise_for_status()
+    comment_id = response.json()["id"]
+    _set_flag(page, True)
+    page.set_viewport_size(_VIEWPORTS["desktop"])
+    page.goto(f"{base_url}/c/{session_id}?file={_FILE}&comment={comment_id}&fullscreen=1")
+
+    sidebar = page.get_by_role("complementary", name="Workspace")
+    viewer = sidebar.get_by_test_id("file-viewer")
+    expect(viewer).to_contain_text("Say goodbye too", timeout=60_000)
+    expect(page.locator("[data-maximized]")).to_have_count(1)
+    # The link is handed to the tab, so a reload doesn't open it again.
+    expect(page).not_to_have_url(re.compile(r"[?&](?:file|comment|fullscreen)="))
+
+
 def _press_palette(page: Page) -> Locator:
     """Open ⌘K once the session's page is up, and search it for the tabs' Back row."""
     actions = page.get_by_role("button", name=re.compile(r"^(?:Conversation|Session) actions$"))
