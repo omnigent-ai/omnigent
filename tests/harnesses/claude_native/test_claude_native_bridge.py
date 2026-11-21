@@ -12760,7 +12760,9 @@ class _EditableComposer:
     Measured on Claude Code 2.1.287: Ctrl+K deletes to the end of the line,
     or the line break when the cursor is already there; Ctrl+U does the same
     towards the start; Ctrl+A moves to the start of the line. Each line of
-    the draft renders as its own row of the box.
+    the draft renders as its own row of the box. Measured on 2.1.283: Ctrl+S
+    stashes a draft, replacing any held stash, or puts the stash back into a
+    blank box; a submit restores it; ``› stashed`` shows above the box meanwhile.
     """
 
     _RULE = "──────────────────────────────"
@@ -12795,11 +12797,13 @@ class _EditableComposer:
         self._unavailable_clear_captures = unavailable_clear_captures
         self._clearing_started = False
         self.submitted: list[str] = []
+        self.stash: tuple[str, int] | None = None
         self._paste_buffer = ""
         self._actions = {
             "\x1b[107;5u": self._kill_to_line_end,
             "\x1b[117;5u": self._kill_to_line_start,
             "\x1b[97;5u": self._move_to_line_start,
+            "\x1b[115;5u": self._toggle_stash,
         }
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -12830,7 +12834,9 @@ class _EditableComposer:
             self._insert(" ")
         elif args[0] == "send-keys" and args[-1] == "Enter":
             self.submitted.append(self.text)
-            self.text, self.cursor = "", 0
+            restored = self.stash if self.text.strip() else None
+            self.text, self.cursor = restored or ("", 0)
+            self.stash = None if restored else self.stash
 
     def _capture_pane(self, socket_path: str, tmux_target: str) -> str:
         del socket_path, tmux_target
@@ -12839,11 +12845,12 @@ class _EditableComposer:
             return ""
         first, *rest = self.text.split("\n")
         rows = [f"❯ {first}", *(f"  {row}" for row in rest)]
+        status = ["          ◐ medium · /effort · › stashed"] if self.stash else []
         if self._visible_rows is not None and len(rows) >= self._visible_rows:
             # The rows take every line the pane has: no closing rule.
             clipped = "\n".join(rows[: self._visible_rows])
-            return f"⏺ done\n{self._RULE}\n{clipped}\n"
-        screen = ["⏺ done", self._RULE, *rows, self._RULE, "  ? for shortcuts"]
+            return "\n".join(["⏺ done", *status, self._RULE, clipped]) + "\n"
+        screen = ["⏺ done", *status, self._RULE, *rows, self._RULE, "  ? for shortcuts"]
         if self._pane_rows is not None:
             screen = screen[-self._pane_rows :]
         return "\n".join(screen[1:] if self._pane_rows is None else screen) + "\n"
@@ -12870,6 +12877,12 @@ class _EditableComposer:
 
     def _move_to_line_start(self) -> None:
         self.cursor = self.text.rfind("\n", 0, self.cursor) + 1
+
+    def _toggle_stash(self) -> None:
+        if self.text.strip():
+            self.stash, (self.text, self.cursor) = (self.text, self.cursor), ("", 0)
+        elif self.stash is not None:
+            (self.text, self.cursor), self.stash = self.stash, None
 
 
 _STALE_MULTILINE_DRAFT = "STALE ONE\nSTALE TWO\nSTALE THREE"
@@ -12912,6 +12925,7 @@ def test_inject_user_message_clears_every_line_of_a_leftover_draft(
     person's half-written draft as part of the web message. In a sliver
     pane the capture shows one row of the draft, so stopping after one
     clearing burst would likewise leave the hidden lines to be submitted.
+    A draft shown whole is stashed first and comes back after the submit.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
     composer = _EditableComposer(draft, cursor=cursor, visible_rows=visible_rows)
@@ -12920,6 +12934,91 @@ def test_inject_user_message_clears_every_line_of_a_leftover_draft(
     inject_user_message(bridge_dir, content="hello from the web")
 
     assert [text.strip() for text in composer.submitted] == ["hello from the web"]
+    if visible_rows is None:
+        assert (composer.text, composer.cursor) == (draft, cursor)
+
+
+def test_message_from_another_session_keeps_the_typed_draft_in_the_box(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A delivered message is submitted alone and the person's unsent draft stays in the box."""
+    draft = "also rerun the flaky lock-wait test"
+    message = "[Message from session 0123abcd]\nbg-sync worker heartbeat: alive. Nothing new."
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    composer = _EditableComposer(draft, cursor=len(draft))
+    composer.install(monkeypatch)
+
+    inject_user_message(bridge_dir, content=message)
+
+    assert [text.strip() for text in composer.submitted] == [message]
+    assert composer.text == draft
+
+
+@pytest.mark.parametrize(
+    "draft",
+    ["[Pasted text #1 +11 lines] explain this log", "hello from the web, then the docs"],
+    ids=["paste-placeholder", "contains-the-message"],
+)
+def test_a_restored_draft_is_not_mistaken_for_the_unsent_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    draft: str,
+) -> None:
+    """The draft Claude Code restores after the submit is never submitted by a retried Enter."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    composer = _EditableComposer(draft, cursor=len(draft))
+    composer.install(monkeypatch)
+
+    inject_user_message(bridge_dir, content="hello from the web")
+
+    assert [text.strip() for text in composer.submitted] == ["hello from the web"]
+    assert composer.text == draft
+
+
+@pytest.mark.parametrize(
+    ("draft", "held_stash"),
+    [("hello from the web", None), ("new draft", ("stashed earlier", 3))],
+    ids=["draft-matches-the-message", "stash-already-held"],
+)
+def test_a_draft_that_cannot_be_stashed_safely_is_cleared(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    draft: str,
+    held_stash: tuple[str, int] | None,
+) -> None:
+    """
+    Keep the earlier behavior when Ctrl+S could lose text or confuse verification.
+
+    Ctrl+S would overwrite a held stash, and a restored copy of the message could
+    not be told apart from a message that was never submitted.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    composer = _EditableComposer(draft, cursor=len(draft))
+    composer.stash = held_stash
+    composer.install(monkeypatch)
+
+    inject_user_message(bridge_dir, content="hello from the web")
+
+    assert [text.strip() for text in composer.submitted] == ["hello from the web"]
+    assert composer.text == ("" if held_stash is None else held_stash[0])
+    assert composer.stash is None
+
+
+def test_a_claude_code_without_the_stash_still_gets_the_message_alone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When Ctrl+S does nothing, the draft is cleared rather than submitted with the message."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    composer = _EditableComposer(_STALE_MULTILINE_DRAFT, cursor=0)
+    composer._actions["\x1b[115;5u"] = lambda: None
+    composer.install(monkeypatch)
+
+    inject_user_message(bridge_dir, content="hello from the web")
+
+    assert [text.strip() for text in composer.submitted] == ["hello from the web"]
+    assert composer.text == ""
 
 
 @_BOX_GEOMETRIES
@@ -13030,7 +13129,9 @@ def test_unavailable_composer_capture_never_submits_the_leftover_draft(
         ):
             inject(bridge_dir)
         assert composer.submitted == []
-        assert "STALE TWO\nSTALE THREE" in composer.text
+        # A web message stashes the draft before clearing; the stash keeps it.
+        held = composer.text if composer.stash is None else composer.stash[0]
+        assert "STALE TWO\nSTALE THREE" in held
     else:
         inject(bridge_dir)
         assert [text.strip() for text in composer.submitted] == [expected]

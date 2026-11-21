@@ -394,6 +394,11 @@ _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit E
 # rather than as text when they arrive in one burst.
 _COMPOSER_KILL_TO_LINE_END = "\x1b[107;5u"
 _COMPOSER_KILL_TO_LINE_START = "\x1b[117;5u"
+# Ctrl+S stashes the draft; Claude Code puts it back in the box after the next submit.
+_COMPOSER_STASH = "\x1b[115;5u"
+# Shown on the status row while a stash is held; another Ctrl+S would overwrite it.
+_COMPOSER_STASH_MARKER = "› stashed"
+_COMPOSER_STASH_TIMEOUT_S = 0.5
 # Retry rounds when the capture cannot show the whole box.
 _COMPOSER_CLEAR_MAX_ROUNDS = 3
 # Footer rows Claude Code draws under the input box (mode hints, status line).
@@ -5052,8 +5057,8 @@ def _paste_and_submit(
     Deliver *text* into Claude's input box as one paste plus a verified Enter.
 
     The delivery core of :func:`inject_user_message` (see its docstring for
-    the full hazard notes): clear any leftover draft, bracketed-paste the
-    payload via ``load-buffer`` + ``paste-buffer -p``, wait for the draft to
+    the full hazard notes): stash and clear any leftover draft, bracketed-paste
+    the payload via ``load-buffer`` + ``paste-buffer -p``, wait for the draft to
     visibly commit, submit, and verify the draft left the box — re-sending
     Enter while it verifiably hasn't.
 
@@ -5094,7 +5099,8 @@ def _paste_and_submit(
     tail_needle = _submit_tail_needle(text) if needle else ""
     delivery_diagnostics.set_stage("pasting")
     # Clear stale text first, or the paste lands inside the person's draft and
-    # Enter submits both together.
+    # Enter submits both together. A stashed draft returns after the submit.
+    stashed_draft = _stash_composer_draft(socket_path, tmux_target, text=text)
     _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
     transcript_before_paste = _capture_pane(socket_path, tmux_target)
     draft_seen, pane, polls, empty_captures, paste_wait_started = _paste_and_await_draft(
@@ -5182,6 +5188,7 @@ def _paste_and_submit(
             bridge_dir=bridge_dir,
             submit_boundary=submit_boundary,
             submitted_text=text,
+            stashed_draft=stashed_draft,
         )
     except ClaudeUserPromptPending as exc:
         # The Enter already went out, so the prompt may belong to this message's own turn.
@@ -5276,6 +5283,7 @@ def _verify_submit_accepted(
     bridge_dir: Path | None = None,
     submit_boundary: SubmitBoundary | None = None,
     submitted_text: str | None = None,
+    stashed_draft: str = "",
 ) -> bool:
     """
     Wait for a submitted draft to leave the input box, re-sending Enter.
@@ -5298,6 +5306,8 @@ def _verify_submit_accepted(
     :param bridge_dir: Bridge whose pending questions protect submit retries.
     :param submit_boundary: Native transcript boundary captured before Enter.
     :param submitted_text: Full submitted text; a marker alone cannot identify a refusal.
+    :param stashed_draft: Draft from :func:`_stash_composer_draft`. The box showing
+        only this draft means Claude Code restored it after accepting the submit.
     :returns: ``True`` when the draft left the input box (accepted),
         ``False`` when it is still there after the full window.
     :raises ClaudeSubmitBlockedUnconfirmed: A fresh matching refusal appeared;
@@ -5341,7 +5351,10 @@ def _verify_submit_accepted(
         # neither that the draft cleared nor that another Enter is safe.
         if not pane.strip():
             continue
-        if not _draft_in_input_box(pane, needle, tail_needle=tail_needle):
+        restored_box = _composer_box(pane) if stashed_draft else None
+        if not _draft_in_input_box(pane, needle, tail_needle=tail_needle) or (
+            restored_box is not None and _composer_draft_text(restored_box) == stashed_draft
+        ):
             delivery_diagnostics.record_verification(
                 draft_still_present=False,
                 pane=pane,
@@ -7442,6 +7455,50 @@ def _composer_reads_clear(box: _ComposerBox | None) -> bool:
     :returns: ``True`` when the box reads clear.
     """
     return box is not None and box.framed and not any(row.strip() for row in box.rows[1:])
+
+
+def _composer_draft_text(box: _ComposerBox) -> str:
+    """Return the comparable text (:func:`_comparable_draft_text`) after *box*'s prompt glyph."""
+    rows = [box.rows[0].replace(_CLAUDE_PROMPT_GLYPH, "", 1), *box.rows[1:]]
+    return _comparable_draft_text("\n".join(rows).replace(_QUEUED_MESSAGE_HINT, ""))
+
+
+def _stash_composer_draft(socket_path: str, tmux_target: str, *, text: str) -> str:
+    """
+    Stash the person's draft with Ctrl+S so Claude Code restores it after the next submit.
+
+    Only a draft shown whole that differs from *text* is stashed, and only while no
+    stash is held: Ctrl+S would overwrite that stash, and a restored copy of *text*
+    could not be told apart from an unsent message. Otherwise the clear deletes it.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param text: The message about to be pasted.
+    :returns: The draft's comparable text (:func:`_composer_draft_text`) when Ctrl+S
+        was sent, else ``""``.
+    """
+    pane = _capture_pane(socket_path, tmux_target)
+    box = _composer_box(pane)
+    if (
+        box is None
+        or not box.framed
+        or not box.rows[0].lstrip().startswith(_CLAUDE_PROMPT_GLYPH)
+        or _COMPOSER_STASH_MARKER in pane
+    ):
+        return ""
+    draft = _composer_draft_text(box)
+    if not draft or draft == _comparable_draft_text(text):
+        return ""
+    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, _COMPOSER_STASH)
+    # The clear runs after the stash either way; waiting only records whether it took.
+    deadline = time.monotonic() + _COMPOSER_STASH_TIMEOUT_S
+    stashed = False
+    while not stashed and time.monotonic() < deadline:
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+        box = _composer_box(_capture_pane(socket_path, tmux_target))
+        stashed = box is not None and not _composer_draft_text(box)
+    delivery_diagnostics.record_details(composer_draft_stashed=stashed)
+    return draft
 
 
 def _first_non_blank(lines: list[str], start: int, end: int) -> int:
