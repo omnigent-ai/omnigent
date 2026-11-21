@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { useConversations } from "@/hooks/useConversations";
 import { COMMAND_HOLD_REVEAL_DELAY_MS, useCommandHoldStore } from "@/hooks/useCommandHold";
+import { useSidebarSessionOrderStore } from "@/hooks/useSidebarSessionOrder";
 import { isMacPlatform } from "@/lib/hotkeys";
 import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
 import { conversation as conv, conversationPage } from "@/test/sidebarMockHelpers";
@@ -101,6 +102,16 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+});
+
+describe("Sidebar session order", () => {
+  it("publishes its rows top to bottom for ⌘K's Next and Previous session", async () => {
+    const view = renderSidebar();
+    await waitFor(() => expect(renderedRowIds()).toHaveLength(5));
+    expect(useSidebarSessionOrderStore.getState().orderedSessionIds).toEqual(renderedRowIds());
+    view.unmount();
+    expect(useSidebarSessionOrderStore.getState().orderedSessionIds).toEqual([]);
+  });
 });
 
 describe("Sidebar numbered-row shortcut hints", () => {
