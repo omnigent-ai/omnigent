@@ -76,8 +76,9 @@ _LOADER_ONLY = "code host instances are built only by load_code_host_instances"
 class CodeHostInstance:
     """One configured code host instance, built only by :func:`load_code_host_instances`.
 
-    Calling the class, or ``dataclasses.replace`` on a record, raises ``TypeError``,
-    and a record's fields can't change once it is loaded. Records compare by identity.
+    Calling the class, ``dataclasses.replace``, copying or pickling a record raises
+    ``TypeError``, and a record's fields can't change once it is loaded. Records
+    compare by identity.
 
     :ivar id: Stable id, e.g. ``"internal"``; the only instance detail logs carry.
     :ivar provider: The provider whose API it serves, e.g. ``"github"``.
@@ -99,6 +100,10 @@ class CodeHostInstance:
     capabilities: frozenset[str]
 
     def __init__(self, *_args: object, **_fields: object) -> NoReturn:
+        raise TypeError(_LOADER_ONLY)
+
+    def __reduce_ex__(self, _protocol: object) -> NoReturn:
+        # Copies and pickles would be records the loader never issued.
         raise TypeError(_LOADER_ONLY)
 
     def runnable_command(self) -> list[str]:

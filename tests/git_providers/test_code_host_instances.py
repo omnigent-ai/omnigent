@@ -316,7 +316,6 @@ def test_ordinary_code_gets_instance_records_only_from_the_loader(load: Load, cl
 
     unissued = {
         "__new__": made_by_new(),
-        "copy": copy.copy(loaded),
         "lookalike": type("Lookalike", (), fields)(),
     }
     attempts: dict[str, Callable[[], object]] = {
@@ -324,6 +323,9 @@ def test_ordinary_code_gets_instance_records_only_from_the_loader(load: Load, cl
         "positional": lambda: CodeHostInstance(*fields.values()),
         "empty": lambda: CodeHostInstance(),
         "replace": lambda: dataclasses.replace(loaded, command=("/bin/sh",)),
+        "copy": lambda: copy.copy(loaded),
+        "deepcopy": lambda: copy.deepcopy(loaded),
+        "pickle": lambda: pickle.dumps(loaded),
         "list": lambda: CodeHostInstances([loaded]),  # type: ignore[arg-type]
         **{
             f"collection of {name}": lambda record=record: CodeHostInstances((record,))
@@ -332,11 +334,6 @@ def test_ordinary_code_gets_instance_records_only_from_the_loader(load: Load, cl
     }
 
     assert _unrefused(attempts) == []
-    assert unissued["copy"].command == loaded.command  # a copy is refused, not changed
-    # A deep copy or a pickle round trip can't be made at all.
-    for duplicate in (copy.deepcopy, lambda record: pickle.loads(pickle.dumps(record))):
-        with pytest.raises(TypeError, match="cannot pickle"):
-            duplicate(loaded)
     assert CodeHostInstances((loaded,)).instance_for("github", "code.example.test") is loaded
 
 
