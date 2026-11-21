@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -25,7 +26,7 @@ import httpx
 import pytest
 
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-from omnigent.runner import subagent_work
+from omnigent.runner import resource_registry, subagent_work
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.runner.tool_dispatch import (
     _execute_file_tool,
@@ -293,18 +294,39 @@ async def _upload(
 
 
 @pytest.mark.asyncio
-async def test_upload_without_any_workspace_reads_the_session_filesystem(
+def _default_temp_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """
+    Point the runner's default temp roots at a fresh directory, with no override.
+
+    The agent's tools default under ``tempfile.gettempdir()`` and the session's
+    filesystem routes under the registry's workspace parent; both move here.
+
+    :param monkeypatch: Patches the two defaults and unsets the root override.
+    :param tmp_path: Pytest-provided parent for the controlled root.
+    :returns: The controlled temp root.
+    """
+    temp_root = tmp_path / "tmp"
+    temp_root.mkdir()
+    monkeypatch.delenv("OMNIGENT_RUNNER_OS_ENV_ROOT", raising=False)
+    monkeypatch.setattr(tempfile, "tempdir", str(temp_root))
+    monkeypatch.setattr(resource_registry, "_DEFAULT_WORKSPACE_PARENT", str(temp_root))
+    return temp_root
+
+
+@pytest.mark.asyncio
+async def test_upload_without_any_workspace_reads_both_default_directories(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """
-    With no session or runner workspace, the agent's own writes and the session's
-    filesystem routes share one per-session workspace, and uploads read from it.
+    With no session or runner workspace, uploads read what the agent's tools
+    wrote in their directory and what the session's filesystem routes hold in
+    theirs: two separate per-session directories under the default temp roots.
 
-    :param monkeypatch: Points the per-session workspace root at *tmp_path*.
-    :param tmp_path: Pytest-provided root for per-session workspaces.
+    :param monkeypatch: Controls the default temp roots.
+    :param tmp_path: Pytest-provided parent for the controlled roots.
     """
-    monkeypatch.setenv("OMNIGENT_RUNNER_OS_ENV_ROOT", str(tmp_path / "sessions"))
+    temp_root = _default_temp_root(monkeypatch, tmp_path)
     registry = SessionResourceRegistry()
     spec = _placeholder_cwd_spec()
     written = await execute_tool(
@@ -313,10 +335,11 @@ async def test_upload_without_any_workspace_reads_the_session_filesystem(
         agent_spec=spec,
         conversation_id=_CONVERSATION_ID,
     )
-    # The default environment root the session's filesystem routes serve.
-    session_root = registry.compute_default_env_root(_CONVERSATION_ID, spec)
-    assert session_root is not None
-    Path(session_root, "notes.txt").write_text("user notes")
+    tools_dir = temp_root / "omnigent-runner-os-envs" / _CONVERSATION_ID / "workspace"
+    session_dir = temp_root / "omnigent-sessions" / _CONVERSATION_ID / "workspace"
+    assert registry.compute_default_env_root(_CONVERSATION_ID, spec) == str(session_dir.resolve())
+    session_dir.mkdir(parents=True)
+    (session_dir / "notes.txt").write_text("user notes")
 
     captured: list[httpx.Request] = []
     client = _recording_client(captured)
@@ -329,11 +352,71 @@ async def test_upload_without_any_workspace_reads_the_session_filesystem(
         await client.aclose()
 
     assert json.loads(written)["created"] is True
+    assert (tools_dir / "out" / "report.md").read_text() == "agent report"
     assert json.loads(agent_file)["filename"] == "report.md", agent_file
     assert json.loads(user_file)["filename"] == "notes.txt", user_file
     assert len(captured) == 2
     assert b"agent report" in captured[0].content
     assert b"user notes" in captured[1].content
+
+
+@pytest.mark.asyncio
+async def test_upload_leaves_existing_no_workspace_directories_in_place(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A session from before this runner, with files in both default directories,
+    keeps them all: its tools still read their directory, uploads reach both,
+    the tools' copy of a name in both wins, and nothing is moved or rewritten.
+
+    :param monkeypatch: Controls the default temp roots.
+    :param tmp_path: Pytest-provided parent for the controlled roots.
+    """
+    temp_root = _default_temp_root(monkeypatch, tmp_path)
+    tools_dir = temp_root / "omnigent-runner-os-envs" / _CONVERSATION_ID / "workspace"
+    session_dir = temp_root / "omnigent-sessions" / _CONVERSATION_ID / "workspace"
+    before = {
+        tools_dir / "old.txt": "written before the upgrade",
+        tools_dir / "shared.txt": "tools copy",
+        session_dir / "notes.txt": "panel note",
+        session_dir / "shared.txt": "panel copy",
+    }
+    for file, content in before.items():
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text(content)
+    registry = SessionResourceRegistry()
+    spec = _placeholder_cwd_spec()
+
+    read = await execute_tool(
+        tool_name="sys_os_read",
+        arguments=json.dumps({"path": "old.txt"}),
+        agent_spec=spec,
+        conversation_id=_CONVERSATION_ID,
+    )
+    captured: list[httpx.Request] = []
+    client = _recording_client(captured)
+    try:
+        uploads = [
+            await _upload(client, name, agent_spec=spec, resource_registry=registry)
+            for name in ("old.txt", "notes.txt", "shared.txt")
+        ]
+    finally:
+        await client.aclose()
+
+    assert "written before the upgrade" in read, read
+    assert [json.loads(result)["filename"] for result in uploads] == [
+        "old.txt",
+        "notes.txt",
+        "shared.txt",
+    ]
+    assert len(captured) == 3
+    assert b"written before the upgrade" in captured[0].content
+    assert b"panel note" in captured[1].content
+    assert b"tools copy" in captured[2].content and b"panel copy" not in captured[2].content
+    assert {file: file.read_text() for file in before} == before
+    assert sorted(p.name for p in tools_dir.iterdir()) == ["old.txt", "shared.txt"]
+    assert sorted(p.name for p in session_dir.iterdir()) == ["notes.txt", "shared.txt"]
 
 
 @pytest.mark.parametrize("path_form", ["inside-runner-root", "parent-traversal", "absolute"])

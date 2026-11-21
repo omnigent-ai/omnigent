@@ -8265,6 +8265,7 @@ async def execute_tool(
                 server_client,
                 conversation_id=conversation_id,
                 agent_spec=agent_spec,
+                runner_workspace=runner_workspace,
                 session_workspace=session_workspace,
                 resource_registry=resource_registry,
             )
@@ -8763,14 +8764,21 @@ def _clone_os_env_spec(spec: OSEnvSpec) -> OSEnvSpec:
 
 
 def _runner_default_os_env_cwd(conversation_id: str | None) -> str:
-    """Return the cwd for a default runner-owned primary OSEnv.
-
-    It is the session's default workspace, so the agent's tools and the session's
-    filesystem routes agree when neither the session nor the runner has a workspace.
-    """
-    from omnigent.runner.resource_registry import ensure_session_workspace
-
-    return ensure_session_workspace(conversation_id or "default")
+    """Return the cwd for a default runner-owned primary OSEnv."""
+    safe_conv = "default"
+    if conversation_id:
+        safe_conv = "".join(
+            ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in conversation_id
+        )
+    root = Path(
+        os.environ.get(
+            "OMNIGENT_RUNNER_OS_ENV_ROOT",
+            str(Path(tempfile.gettempdir()) / "omnigent-runner-os-envs"),
+        )
+    )
+    cwd = root / safe_conv / "workspace"
+    cwd.mkdir(parents=True, exist_ok=True)
+    return str(cwd)
 
 
 def _effective_runner_os_env_spec(
@@ -9234,36 +9242,73 @@ async def _execute_rest_tool(
 # ── File tools (Phase 1) ──────────────────────────────────
 
 
-def _session_upload_root(
+def _session_upload_roots(
     agent_spec: AgentSpec | None,
     conversation_id: str,
     *,
+    runner_workspace: Path | None,
     session_workspace: Path | None,
     resource_registry: SessionResourceRegistry | None,
-) -> Path | None:
+) -> list[Path]:
     """
-    Return the directory ``sys_upload_file`` may read from, or ``None`` if unknown.
+    Return the directories ``sys_upload_file`` may read from, searched in order.
 
     The session's own workspace wins: its native terminal and tools run there.
-    Otherwise this is the session's default environment root, the one its
-    filesystem routes serve. A runner that isolates sessions gives that root a
-    per-session subdirectory, never the shared runner workspace.
+    Otherwise use the session's default environment root, the one its filesystem
+    routes serve; a runner that isolates sessions gives each session its own
+    subdirectory there, never the shared runner workspace. When neither the
+    session nor the runner has a workspace, the agent's tools use a separate
+    per-session directory, so it is searched first.
 
     :param agent_spec: The session's agent spec, or ``None`` when unresolved.
     :param conversation_id: The session id, e.g. ``"conv_abc123"``.
+    :param runner_workspace: The runtime cwd: the session's workspace, else the
+        runner's, e.g. ``Path("/repo")``; ``None`` when neither has one.
     :param session_workspace: The session's server-stored workspace, e.g.
         ``Path("/repo")``; ``None`` when it has none or the caller can't tell.
     :param resource_registry: The runner's session resource registry.
-    :returns: The upload root, or ``None`` when no boundary can be established.
+    :returns: The upload roots; empty when no boundary can be established.
     """
     if session_workspace is not None:
-        return session_workspace
-    if resource_registry is None:
-        return None
-    # Without an os_env the registry reports no filesystem; use its spec-less default.
-    spec = agent_spec if getattr(agent_spec, "os_env", None) is not None else None
-    root = resource_registry.compute_default_env_root(conversation_id, spec)
-    return Path(root) if root is not None else None
+        return [session_workspace]
+    roots: list[Path] = []
+    if runner_workspace is None:
+        tools_cwd = _effective_runner_os_env_spec(agent_spec, conversation_id).cwd
+        assert tools_cwd is not None
+        roots.append(Path(tools_cwd))
+    if resource_registry is not None:
+        # Without an os_env the registry reports no filesystem; use its spec-less default.
+        spec = agent_spec if getattr(agent_spec, "os_env", None) is not None else None
+        default_root = resource_registry.compute_default_env_root(conversation_id, spec)
+        if default_root is not None and Path(default_root) not in roots:
+            roots.append(Path(default_root))
+    return roots
+
+
+def _resolve_upload_path(path: str, roots: list[Path]) -> Path:
+    """
+    Resolve *path* within the first upload root that holds it as a file.
+
+    :param path: The agent-supplied path, e.g. ``"out/report.md"``.
+    :param roots: Upload roots from :func:`_session_upload_roots`, non-empty.
+    :returns: The file to read; when no root holds it, the first in-bounds
+        candidate, so reading it reports the missing file.
+    :raises ValueError: If *path* escapes every root.
+    """
+    candidates: list[Path] = []
+    first_escape: ValueError | None = None
+    for root in roots:
+        try:
+            candidates.append(safe_resolve(path, root))
+        except ValueError as exc:
+            first_escape = first_escape or exc
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    if candidates:
+        return candidates[0]
+    assert first_escape is not None
+    raise first_escape
 
 
 async def _execute_file_tool(
@@ -9273,6 +9318,7 @@ async def _execute_file_tool(
     *,
     conversation_id: str | None,
     agent_spec: AgentSpec | None = None,
+    runner_workspace: Path | None = None,
     session_workspace: Path | None = None,
     resource_registry: SessionResourceRegistry | None = None,
 ) -> str:
@@ -9285,8 +9331,9 @@ async def _execute_file_tool(
     :param conversation_id: Owning session/conversation id,
         e.g. ``"conv_abc123"``.
     :param agent_spec: Agent spec resolved for the current turn.
+    :param runner_workspace: The runtime cwd, e.g. ``Path("/repo")``, or ``None``.
     :param session_workspace: The session's server-stored workspace, e.g.
-        ``Path("/repo")``, or ``None``. See :func:`_session_upload_root`.
+        ``Path("/repo")``, or ``None``. See :func:`_session_upload_roots`.
     :param resource_registry: The runner's session resource registry, which
         knows the session's default environment root.
     :returns: Tool result string.
@@ -9303,16 +9350,17 @@ async def _execute_file_tool(
             return "Error: sys_upload_file failed: empty path"
         # The read runs in the un-sandboxed runner, so the path must stay inside this
         # session's workspace, or an agent could upload host or sibling-session files.
-        workspace = _session_upload_root(
+        roots = _session_upload_roots(
             agent_spec,
             conversation_id,
+            runner_workspace=runner_workspace,
             session_workspace=session_workspace,
             resource_registry=resource_registry,
         )
-        if workspace is None:
+        if not roots:
             return "Error: sys_upload_file failed: the session workspace is unknown"
         try:
-            resolved = safe_resolve(path, workspace)
+            resolved = _resolve_upload_path(path, roots)
         except ValueError as exc:
             return f"Error: sys_upload_file failed: {exc}"
         filename = resolved.name

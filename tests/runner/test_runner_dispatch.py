@@ -4266,8 +4266,7 @@ def test_effective_runner_os_env_defaults_when_spec_has_no_os_env(monkeypatch) -
         os_env = _effective_runner_os_env_spec(spec, "conv/no os env")
 
         assert os_env.type == "caller_process"
-        # The session's default workspace, as its filesystem routes resolve it.
-        assert Path(os_env.cwd) == Path(td, "conv_no_os_env", "workspace").resolve()
+        assert Path(os_env.cwd) == Path(td, "conv_no_os_env", "workspace")
         assert Path(os_env.cwd).is_dir()
 
 

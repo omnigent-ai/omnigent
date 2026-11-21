@@ -572,23 +572,6 @@ def _session_workspace(session_id: str) -> str:
     return os.path.join(_contained_session_dir(root, session_id), "workspace")
 
 
-def ensure_session_workspace(session_id: str) -> str:
-    """Create a session's default workspace, readable only by its owner.
-
-    This is the workspace a session uses when neither it nor the runner has one.
-
-    :param session_id: Session/conversation identifier,
-        e.g. ``"conv_abc123"``.
-    :returns: Absolute path to the session workspace directory.
-    :raises ValueError: If the session id escapes the workspace root.
-    """
-    workspace = _session_workspace(session_id)
-    # Restrict workspace visibility on shared hosts.
-    os.makedirs(workspace, mode=0o700, exist_ok=True)
-    os.chmod(workspace, 0o700)  # ensure mode even if pre-existing
-    return workspace
-
-
 def _retire_closed_terminal_poller(
     poller: SessionStatusPoller | ClaudeProgramStatusPoller | None,
 ) -> None:
@@ -1514,7 +1497,10 @@ class SessionResourceRegistry:
             else:
                 default_cwd = str(self._runner_workspace)
         else:
-            default_cwd = ensure_session_workspace(session_id)
+            default_cwd = _session_workspace(session_id)
+            # Restrict workspace visibility on shared hosts.
+            os.makedirs(default_cwd, mode=0o700, exist_ok=True)
+            os.chmod(default_cwd, 0o700)  # ensure mode even if pre-existing
 
         if agent_spec is not None or os_env_spec is not None:
             spec_os_env = (
