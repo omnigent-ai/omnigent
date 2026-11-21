@@ -19,7 +19,7 @@ import {
   isStartedSessionId,
   thingyRailKey,
 } from "@/thingies/host/thingySession";
-import { invalidateThingies } from "./thingyQueries";
+import { invalidateThingies, useThingiesEnabled } from "./thingyQueries";
 
 // The thingy whose New session this tab is on, until it starts a session or goes elsewhere.
 let starting: string | null = null;
@@ -76,7 +76,10 @@ export function useAdoptStartedThingySession(): void {
   const queryClient = useQueryClient();
   const replaceSearchParams = useReplaceSearchParams();
   const sessionPrefix = rebasePath("/c/");
+  const enabled = useThingiesEnabled();
   useEffect(() => {
+    // With the feature off, a `thingy_start` URL is left alone and nothing asks for thingies.
+    if (!enabled) return;
     const params = new URLSearchParams(search);
     const marked = params.get(THINGY_START_PARAM);
     const sessionId = pathname.startsWith(sessionPrefix)
@@ -116,5 +119,5 @@ export function useAdoptStartedThingySession(): void {
       .catch(() => {
         if (fullScreen) noteThingyStartFailed(thingyId);
       });
-  }, [pathname, queryClient, search, sessionPrefix, replaceSearchParams]);
+  }, [enabled, pathname, queryClient, search, sessionPrefix, replaceSearchParams]);
 }

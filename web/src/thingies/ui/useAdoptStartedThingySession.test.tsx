@@ -3,6 +3,9 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
+import type { ServerInfo } from "@/lib/capabilities";
 import { resetThingyRailRequests, useThingyRailRequest } from "@/lib/thingyRailTabs";
 import { deleteThingy, getThingy, getThingyThingySession } from "@/thingies/api/thingyApi";
 import { adoptStartedThingySession } from "@/thingies/host/thingySession";
@@ -12,7 +15,7 @@ import {
   resetThingyStarts,
   useAdoptStartedThingySession,
 } from "./useAdoptStartedThingySession";
-import { thingyFixture } from "./testUtils";
+import { THINGIES_INFO, thingyFixture } from "./testUtils";
 import type * as ThingyApiModule from "@/thingies/api/thingyApi";
 import type * as ThingySessionModule from "@/thingies/host/thingySession";
 
@@ -50,12 +53,14 @@ function Shell() {
   );
 }
 
-function renderShell() {
+function renderShell(info: ServerInfo = THINGIES_INFO) {
   render(
     <QueryClientProvider client={new QueryClient()}>
-      <MemoryRouter initialEntries={["/?prompt=Build&thingy_start=board"]}>
-        <Shell />
-      </MemoryRouter>
+      <CapabilitiesProvider info={info}>
+        <MemoryRouter initialEntries={["/?prompt=Build&thingy_start=board"]}>
+          <Shell />
+        </MemoryRouter>
+      </CapabilitiesProvider>
     </QueryClientProvider>,
   );
 }
@@ -157,6 +162,19 @@ describe("a session started beside a thingy", () => {
     renderShell();
     fireEvent.click(screen.getAllByRole("button", { name: "Created" }).at(-1)!);
     await waitFor(() => expect(adoptStartedThingySession).toHaveBeenCalled());
+    expect(deleteThingy).not.toHaveBeenCalled();
+  });
+});
+
+describe("with thingies off", () => {
+  it("leaves a thingy_start URL alone and asks for no thingy", () => {
+    renderShell({ ...SERVER_INFO_OFFLINE_FALLBACK, features: { thingies: false } });
+    fireEvent.click(screen.getByRole("button", { name: "Created, query kept" }));
+    expect(screen.getByLabelText("location")).toHaveTextContent("/c/conv_9?o=1&thingy_start=board");
+    fireEvent.click(screen.getByRole("button", { name: "Elsewhere" }));
+    expect(adoptStartedThingySession).not.toHaveBeenCalled();
+    expect(getThingy).not.toHaveBeenCalled();
+    expect(getThingyThingySession).not.toHaveBeenCalled();
     expect(deleteThingy).not.toHaveBeenCalled();
   });
 });
