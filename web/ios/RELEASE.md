@@ -50,7 +50,7 @@ Apple finishes processing.
   number with no version churn in git. Don't bump it by hand.
 - **Marketing version** (`CFBundleShortVersionString`, currently `0.3.2`) is set
   manually. Bump `MARKETING_VERSION` for both the Debug and Release
-  configurations of the **Omnigent** target in Xcode (or via `fastlane
+  configurations of the **Omnigent** and **OmnigentWatch** targets in Xcode (or via `fastlane
 increment_version_number`) when shipping a new user-facing version.
 - **App icon** is the shared Icon Composer source at
   `platform-assets/AppIcon.icon`, which the iOS target includes directly for
