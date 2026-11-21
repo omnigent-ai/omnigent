@@ -43,6 +43,14 @@ file **uploads** (`<input type=file>` via `WebChromeClient.onShowFileChooser`),
 and **microphone** capture for voice input (`onPermissionRequest`, granted to
 the pinned origin only, with a runtime `RECORD_AUDIO` request).
 
+Conversation links from the web Share dialog's mobile QR code
+(`omnigent://<host[:port]>/c/<id>`) open through `DeepLinkActivity`, matching the
+iOS and desktop shells: the http(s) scheme is inferred from the host, a link to
+a recent server opens directly, and any other server (including an organization
+preset the user hasn't picked) asks for consent first because connecting grants
+its origin the native bridge. A consented server joins the recent servers only
+once its page loads.
+
 ### Deliberately deferred to the web in-page fallbacks
 
 These are iOS-only native chrome; the SPA already renders its own equivalents

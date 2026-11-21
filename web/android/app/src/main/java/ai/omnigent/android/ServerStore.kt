@@ -52,6 +52,10 @@ class ServerStore(
             ?.filter { it.isNotBlank() }
             .orEmpty()
 
+    /** The most recent server the user connected to on [origin]; presets count once picked. */
+    fun recentServer(origin: String): String? =
+        recentServers().firstOrNull { originOf(it) == origin }
+
     /** Forget the automatic default while retaining recents for an explicit reconnect. */
     fun clearCurrent() {
         prefs.edit().remove(KEY_CURRENT).apply()
@@ -59,12 +63,22 @@ class ServerStore(
 
     /** Set the current server and push it to the front of the recents list. */
     fun connect(url: String) {
-        val recents = (listOf(url) + recentServers()).distinct().take(MAX_RECENTS)
-        prefs
-            .edit()
-            .putString(KEY_CURRENT, url)
-            .putString(KEY_RECENTS, recents.joinToString("\n"))
-            .apply()
+        select(url)
+        rememberCurrent()
+    }
+
+    /** Set the current server without adding it to recents until [rememberCurrent]. */
+    fun select(url: String) {
+        prefs.edit().putString(KEY_CURRENT, url).apply()
+    }
+
+    /** Push the current server to the front of the recents list. */
+    fun rememberCurrent() {
+        val url = storedServerUrl() ?: return
+        val recents = recentServers()
+        if (recents.firstOrNull() == url) return
+        val updated = (listOf(url) + recents).distinct().take(MAX_RECENTS)
+        prefs.edit().putString(KEY_RECENTS, updated.joinToString("\n")).apply()
     }
 
     private fun storedServerUrl(): String? = prefs.getString(KEY_CURRENT, null)
