@@ -682,7 +682,9 @@ describe("browser IPC localhost previews from hosts reached over SSH", () => {
       beginAgentNavigation: () => () => true,
       checkAgentNavigation: async () => {
         state.calls.push(state.allowed ? "allowed" : "denied");
-        return state.allowed ? { ok: true } : { ok: false, error: "blocked" };
+        return state.allowed
+          ? { ok: true }
+          : { ok: false, error: "blocked", localhostBlocked: true };
       },
       openOrNavigate: () => {
         state.calls.push("navigate");
@@ -704,9 +706,13 @@ describe("browser IPC localhost previews from hosts reached over SSH", () => {
       ipcMain.invoke(
         "omnigent:browser-open-or-navigate",
         {},
-        { conversationId: "source", url: "http://127.0.0.1:8787/", opts },
+        {
+          conversationId: "source",
+          url: "http://127.0.0.1:8787/",
+          opts: { sessionHostProtocol: 1, ...opts },
+        },
       );
-    return { state, navigate };
+    return { state, navigate, registry };
   }
 
   it("asks about the source host after a typed localhost URL is blocked, then retries", async () => {
@@ -776,6 +782,38 @@ describe("browser IPC localhost previews from hosts reached over SSH", () => {
     assert.equal((await navigate({ sourceHostId: "host-1" })).ok, true);
     assert.deepEqual(state.calls, ["allowed", "navigate"]);
   });
+
+  for (const protocol of [undefined, 0, 2]) {
+    it(`doesn't ask when the renderer's host protocol is ${protocol}`, async () => {
+      const { state, navigate } = previewSetup({ request: () => true });
+      assert.equal(
+        (await navigate({ sourceHostId: "host-1", sessionHostProtocol: protocol })).ok,
+        false,
+      );
+      assert.deepEqual(state.calls, ["denied"]);
+    });
+  }
+
+  for (const failure of ["policy", "open", "revocation"]) {
+    it(`doesn't ask after an unrelated ${failure} error`, async () => {
+      const { state, navigate, registry } = previewSetup({ request: () => true });
+      const denied = async () => ({ ok: false, error: "unrelated failure" });
+      if (failure === "policy") registry.checkAgentNavigation = denied;
+      if (failure === "open") {
+        state.allowed = true;
+        registry.openOrNavigate = denied;
+      }
+      if (failure === "revocation") {
+        registry.get = () => ({});
+        registry.needsAgentViewRevocation = () => true;
+        registry.revokeAgentView = denied;
+      }
+      const result = await navigate({ sourceHostId: "host-1" });
+      assert.equal(result.ok, false);
+      assert.equal(result.error, "unrelated failure");
+      assert.equal(state.calls.includes("request"), false);
+    });
+  }
 });
 
 describe("browserIpc — set active", () => {

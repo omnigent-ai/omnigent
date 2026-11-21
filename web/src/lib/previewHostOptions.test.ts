@@ -1,5 +1,5 @@
 import { beforeEach, expect, it, vi } from "vitest";
-import { previewHostOptions } from "./previewHostOptions";
+import { isLoopbackPreviewUrl, previewHostOptions } from "./previewHostOptions";
 import { fetchHosts } from "@/hooks/useHosts";
 import { getDesktopFeatures } from "./nativeBridge";
 import type * as NativeBridge from "./nativeBridge";
@@ -58,4 +58,47 @@ it("keeps unknown provenance and discovery failures public-only", async () => {
     sourceHostId: "remote",
     sessionHostProtocol: 1,
   });
+});
+
+it.each([
+  { host_id: "remote", name: "devbox", status: "offline" },
+  { host_id: "another", name: "devbox", status: "online" },
+  { host_id: "remote", name: "not an ssh destination", status: "online" },
+  { host_id: "remote", name: "devbox", status: "online", sandbox_provider: "container" },
+])("does not suggest a destination for %j", async (host) => {
+  vi.mocked(fetchHosts).mockResolvedValue([host as Awaited<ReturnType<typeof fetchHosts>>[number]]);
+  expect(await previewHostOptions("remote", "http://localhost:8787")).toEqual({
+    sourceHostId: "remote",
+    sessionHostProtocol: 1,
+  });
+});
+
+it("aborts stalled discovery and keeps navigation on the existing policy path", async () => {
+  let signal: AbortSignal | undefined;
+  vi.mocked(fetchHosts).mockImplementation(
+    async (_includeSandbox, _sourceHostId, requestSignal) => {
+      signal = requestSignal;
+      return new Promise((_resolve, reject) => {
+        signal!.addEventListener("abort", () => reject(signal!.reason), { once: true });
+      });
+    },
+  );
+  expect(await previewHostOptions("remote", "http://localhost:8787")).toEqual({
+    sourceHostId: "remote",
+    sessionHostProtocol: 1,
+  });
+  expect(signal?.aborted).toBe(true);
+});
+
+it.each([
+  ["http://localhost:8787", true],
+  ["https://dev.localhost:8787", true],
+  ["http://127.0.0.1", true],
+  ["http://[::1]:8787", true],
+  ["https://localhost.example", false],
+  ["http://127.0.0.2", false],
+  ["file://localhost/tmp/page", false],
+  ["bad URL", false],
+])("recognizes preview URL %s: %s", (url, expected) => {
+  expect(isLoopbackPreviewUrl(url)).toBe(expected);
 });

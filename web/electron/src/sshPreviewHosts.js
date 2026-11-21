@@ -18,7 +18,7 @@ function createSshPreviewHosts({ destination, verify, record }) {
   // "Not now" holds until restart, so a retrying agent can't keep asking.
   const declined = new Set();
   const pending = new Map();
-  const failed = new Set();
+  const failed = new Map();
 
   const keyFor = (serverUrl, hostId) => JSON.stringify([serverUrl, canonicalHostId(hostId)]);
 
@@ -73,13 +73,25 @@ function createSshPreviewHosts({ destination, verify, record }) {
           if (answer !== true) return false;
           if (existing === null) {
             if (!(await verify(serverUrl, hostId, asked).catch(() => false))) {
-              failed.add(key);
+              failed.set(
+                key,
+                "The SSH destination could not be verified as this session's host. Check its connection and restart Omnigent to retry.",
+              );
               return false;
             }
             // Another connection may have recorded a different destination during verification.
             const current = recorded(serverUrl, hostId);
             if (current !== null && current !== asked) return false;
-            record(serverUrl, hostId, asked);
+            try {
+              record(serverUrl, hostId, asked);
+            } catch (error) {
+              console.warn("[omnigent] couldn't save the SSH preview destination:", error);
+              failed.set(
+                key,
+                "The verified SSH destination could not be saved. Check desktop storage and restart Omnigent to retry.",
+              );
+              return false;
+            }
           }
           // The record can change while the question is open; the answer covers only what was shown.
           if (recorded(serverUrl, hostId) !== asked) return false;
@@ -99,9 +111,8 @@ function createSshPreviewHosts({ destination, verify, record }) {
      * @returns {string | null}
      */
     hint(serverUrl, hostId) {
-      if (failed.has(keyFor(serverUrl, hostId))) {
-        return "The SSH destination could not be verified as this session's host. Check its connection and restart Omnigent to retry.";
-      }
+      const failure = failed.get(keyFor(serverUrl, hostId));
+      if (failure) return failure;
       const current = recorded(serverUrl, hostId);
       if (!declined.has(keyFor(serverUrl, hostId))) return null;
       return `Localhost previews${current ? ` from "${current}"` : " for this host"} were declined; restart Omnigent to be asked again.`;

@@ -17,7 +17,7 @@ import {
   type BrowserHostOptions,
 } from "@/lib/nativeBridge";
 import { fetchSessionHostId } from "@/lib/fetchSessionHostId";
-import { previewHostOptions } from "@/lib/previewHostOptions";
+import { isLoopbackPreviewUrl, previewHostOptions } from "@/lib/previewHostOptions";
 import { authenticatedFetch } from "@/lib/identity";
 import { useQueryClient } from "@tanstack/react-query";
 import { loadOnce } from "@/lib/loadOnce";
@@ -66,20 +66,6 @@ interface BrowserDesktopBridge {
     args?: Record<string, unknown>,
     opts?: BrowserHostOptions,
   ) => Promise<{ ok: boolean; result?: string; error?: string }>;
-}
-
-function isLoopbackPreview(url: string): boolean {
-  try {
-    const { hostname } = new URL(url);
-    return (
-      hostname === "localhost" ||
-      hostname.endsWith(".localhost") ||
-      hostname === "127.0.0.1" ||
-      hostname === "[::1]"
-    );
-  } catch {
-    return false;
-  }
 }
 
 function getBrowserDesktop(): BrowserDesktopBridge | null {
@@ -165,7 +151,7 @@ async function dispatch(
         });
         if (!r?.ok) return { ok: false, error: r?.error ?? "navigate failed" };
         if (
-          isLoopbackPreview(url) &&
+          isLoopbackPreviewUrl(url) &&
           r.sshPreviewHost !== true &&
           sourceHostId &&
           rememberedArcaHostId &&

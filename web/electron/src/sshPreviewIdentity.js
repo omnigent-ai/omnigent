@@ -3,7 +3,7 @@
 const { execFile } = require("node:child_process");
 const { promisify } = require("node:util");
 const { canonicalHostId } = require("./sshHosts");
-const { safeServerUrl, validateDestination } = require("./ssh_connect");
+const { REMOTE_PATH, remoteCommand, safeServerUrl, validateDestination } = require("./ssh_connect");
 const { normalizeSavedServerUrl } = require("./url");
 
 function targetUrl(raw) {
@@ -33,7 +33,9 @@ async function verifySshPreviewIdentity(serverUrl, hostId, destination, run = pr
         "-o",
         "ClearAllForwardings=yes",
         target,
-        `OMNIGENT_WRAPPER_BYPASS=1 omnigent host status --server '${server}' --json`,
+        remoteCommand(
+          `${REMOTE_PATH}; OMNIGENT_WRAPPER_BYPASS=1 omnigent host status --server "${server}" --json`,
+        ),
       ],
       { timeout: 15_000, maxBuffer: 64 * 1024, encoding: "utf8" },
     );

@@ -54,13 +54,15 @@ describe("localhost previews for hosts reached over SSH", () => {
 
   it("never probes a declined suggestion or grants a failed proof", async () => {
     let attempts = 0;
+    let questions = 0;
+    let records = 0;
     const previews = createSshPreviewHosts({
       destination: () => null,
       verify: async () => {
         attempts++;
         return false;
       },
-      record: () => assert.fail("must not record an unverified host"),
+      record: () => records++,
     });
     assert.equal(await previews.request(SERVER, HOST, async () => false, "devbox"), false);
     assert.equal(await previews.request(SERVER, HOST, async () => true, "devbox"), false);
@@ -73,11 +75,67 @@ describe("localhost previews for hosts reached over SSH", () => {
       await previews.request(
         SERVER,
         "b".repeat(32),
-        () => assert.fail("must not repeatedly ask"),
+        async () => {
+          questions++;
+          return true;
+        },
         "devbox",
       ),
       false,
     );
+    assert.equal(questions, 0);
+    assert.equal(records, 0);
+    assert.equal(attempts, 1);
+  });
+
+  for (const failure of ["verification", "storage"]) {
+    it(`fails closed without repeating consent when ${failure} throws`, async (t) => {
+      let questions = 0;
+      let proofs = 0;
+      let records = 0;
+      const warnings = t.mock.method(console, "warn", () => {});
+      const previews = createSshPreviewHosts({
+        destination: () => null,
+        verify: async () => {
+          proofs++;
+          if (failure === "verification") throw new Error("offline");
+          return true;
+        },
+        record: () => {
+          records++;
+          throw new Error("disk full");
+        },
+      });
+      const approve = async () => {
+        questions++;
+        return true;
+      };
+      assert.equal(await previews.request(SERVER, HOST, approve, "devbox"), false);
+      assert.equal(await previews.request(SERVER, HOST, approve, "another-alias"), false);
+      assert.equal(previews.allows(SERVER, HOST), false);
+      assert.equal(questions, 1);
+      assert.equal(proofs, 1);
+      assert.equal(records, failure === "storage" ? 1 : 0);
+      assert.equal(warnings.mock.callCount(), failure === "storage" ? 1 : 0);
+      assert.match(previews.hint(SERVER, HOST), /restart Omnigent/);
+    });
+  }
+
+  it("doesn't overwrite a destination recorded during verification", async () => {
+    let destination = null;
+    let records = 0;
+    const previews = createSshPreviewHosts({
+      destination: () => destination,
+      verify: async () => {
+        destination = "replacement";
+        return true;
+      },
+      record: () => records++,
+    });
+    assert.equal(await previews.request(SERVER, HOST, async () => true, "devbox"), false);
+    assert.equal(records, 0);
+    assert.equal(destination, "replacement");
+    assert.equal(previews.allows(SERVER, HOST), false);
   });
 
   it("allows a recorded host only after the user allows it", async () => {
@@ -103,29 +161,39 @@ describe("localhost previews for hosts reached over SSH", () => {
 
   it("never asks about a host without a recorded destination, or for another server", async () => {
     const { previews } = setup();
-    const ask = () => assert.fail("must not ask");
+    let questions = 0;
+    const ask = async () => {
+      questions++;
+      return true;
+    };
     assert.equal(await previews.request(SERVER, "b".repeat(32), ask), false);
     assert.equal(await previews.request("https://other.example/", HOST, ask), false);
     assert.equal(await previews.request(SERVER, null, ask), false);
     assert.equal(await previews.request(null, HOST, ask), false);
     assert.equal(previews.allows(SERVER, undefined), false);
+    assert.equal(questions, 0);
   });
 
   it("treats a lookup without a destination string as unrecorded", async () => {
     await Promise.all(
       [undefined, "", 0].map(async (missing) => {
+        let questions = 0;
         const previews = createSshPreviewHosts({ destination: () => missing });
         assert.equal(previews.allows(SERVER, HOST), false);
         assert.equal(
-          await previews.request(SERVER, HOST, () => assert.fail("must not ask")),
+          await previews.request(SERVER, HOST, async () => {
+            questions++;
+            return true;
+          }),
           false,
         );
+        assert.equal(questions, 0);
       }),
     );
   });
 
   it("keeps a declined host blocked until restart and explains why", async () => {
-    const { previews } = setup();
+    const { destinations, previews } = setup();
     let questions = 0;
     const decline = async () => {
       questions++;
@@ -137,6 +205,9 @@ describe("localhost previews for hosts reached over SSH", () => {
     assert.equal(questions, 1);
     assert.equal(previews.allows(SERVER, HOST), false);
     assert.match(previews.hint(SERVER, HOST), /"devbox" were declined/);
+    destinations[SERVER][HOST] = "replacement";
+    assert.equal(await previews.request(SERVER, HOST, decline), false);
+    assert.equal(questions, 1);
   });
 
   it("asks again after a question that couldn't be shown or failed", async () => {

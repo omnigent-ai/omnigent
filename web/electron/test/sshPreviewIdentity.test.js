@@ -35,7 +35,7 @@ it("proves the exact host and selected server using only a bounded read-only SSH
   ]);
   assert.equal(
     call[1].at(-1),
-    `OMNIGENT_WRAPPER_BYPASS=1 omnigent host status --server '${SERVER}' --json`,
+    `sh -c 'PATH="$HOME/.local/bin:$PATH"; export PATH; OMNIGENT_WRAPPER_BYPASS=1 omnigent host status --server "${SERVER}" --json'`,
   );
   assert.deepEqual(call[2], { timeout: 15000, maxBuffer: 65536, encoding: "utf8" });
 });
@@ -80,11 +80,16 @@ it("refuses missing, ambiguous, offline, mismatched and malformed identity", asy
 });
 
 it("does not run SSH for unsafe commands or destinations", async () => {
-  const never = () => assert.fail("must not spawn SSH");
+  let spawned = 0;
+  const never = async () => {
+    spawned++;
+    return { stdout: JSON.stringify({ daemons: [daemon] }) };
+  };
   assert.equal(await verifySshPreviewIdentity(SERVER, HOST, "-oProxyCommand=bad", never), false);
   assert.equal(
     await verifySshPreviewIdentity("https://server.example/'bad", HOST, "devbox", never),
     false,
   );
   assert.equal(await verifySshPreviewIdentity("file:///tmp/test", HOST, "devbox", never), false);
+  assert.equal(spawned, 0);
 });

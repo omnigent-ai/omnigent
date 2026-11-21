@@ -546,7 +546,13 @@ function registerBrowserIpc({
       }
     }
     // Typed URLs and links reach here too; the question names the session's host, not the page.
-    if (!r.ok && !recovered && isCurrent()) {
+    if (
+      !r.ok &&
+      r.localhostBlocked === true &&
+      opts?.sessionHostProtocol === SESSION_HOST_PROTOCOL &&
+      !recovered &&
+      isCurrent()
+    ) {
       try {
         recovered =
           (await requestPreviewHostForEvent(

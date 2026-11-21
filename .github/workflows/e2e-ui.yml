@@ -367,6 +367,7 @@ jobs:
           pnpm install --frozen-lockfile --filter ./web/electron
           pnpm --filter omnigent-desktop-electron run build:overlay
           OMNIGENT_PYTHON="$PWD/.venv/bin/python" xvfb-run -a node --test web/electron/e2e/desktop_ssh_preview.e2e.js
+          node -e 'const fs = require("node:fs"); const path = require("node:path"); const evidence = JSON.parse(fs.readFileSync(path.join(process.env.OMNIGENT_DESKTOP_RECORD_DIR, "evidence.json"))); require("node:assert/strict").equal(evidence.result, "passed", "Desktop preview must execute, not skip");'
 
       - name: Upload desktop SSH preview evidence
         if: always() && matrix.shard_id == 0 && needs.setup.outputs.ui == 'full'
