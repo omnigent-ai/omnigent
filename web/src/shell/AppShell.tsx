@@ -57,6 +57,7 @@ import { useSeedReadState } from "@/hooks/useUnseenConversations";
 import { useToggleUnreadHotkey } from "@/hooks/useToggleUnreadHotkey";
 import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
 import { isDesktopLayout, useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { isSessionWindow } from "@/lib/sessionWindow";
 import { useIsSideBySideSidebarViewport } from "@/hooks/useIsSideBySideSidebarViewport";
 import { useReportLocalTimezone } from "@/hooks/useReportLocalTimezone";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
@@ -3780,11 +3781,12 @@ function AppShellImpl() {
 }
 
 /**
- * Initial sidebar open state — open on desktop, closed on mobile. SSR-
- * safe (returns false when window is undefined). The threshold is
- * Tailwind's `md` breakpoint, used in the Sidebar's responsive classes.
+ * Initial sidebar open state — open on desktop, closed on mobile and in a
+ * popped-out session window, which shows just its session. SSR-safe (returns
+ * false when window is undefined). The threshold is Tailwind's `md` breakpoint,
+ * used in the Sidebar's responsive classes.
  */
 function initialSidebarOpen(): boolean {
   if (typeof window === "undefined") return false;
-  return isDesktopLayout();
+  return isDesktopLayout() && !isSessionWindow();
 }

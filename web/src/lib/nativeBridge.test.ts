@@ -6,9 +6,11 @@ import {
   closeDesktopWindow,
   confirmDesktopQuit,
   onDesktopCommand,
+  openDesktopSessionWindow,
   setDesktopCommandState,
   startSystemDictation,
   supportsDesktopCommands,
+  supportsDesktopSessionWindows,
   supportsSystemDictation,
   getServerPicker,
   hasDbcertPreflightBridge,
@@ -889,5 +891,44 @@ describe("system dictation bridge", () => {
     // A rejected IPC call reads as not started, so the mic can report it.
     start.mockRejectedValueOnce(new Error("ipc down"));
     await expect(startSystemDictation()).resolves.toBe(false);
+  });
+});
+
+describe("desktop session windows", () => {
+  function setSessionWindowBridge(openSessionWindow?: (id: string) => Promise<boolean>): void {
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      ...(openSessionWindow ? { openSessionWindow } : {}),
+    };
+  }
+
+  it("asks a capable shell to open the session and reports its answer", async () => {
+    const openSessionWindow = vi.fn().mockResolvedValue(true);
+    setSessionWindowBridge(openSessionWindow);
+
+    expect(supportsDesktopSessionWindows()).toBe(true);
+    expect(await openDesktopSessionWindow("conv_1")).toBe(true);
+    expect(openSessionWindow).toHaveBeenCalledWith("conv_1");
+  });
+
+  it("reports no window for an older shell, a browser, or a failed request", async () => {
+    setSessionWindowBridge();
+    expect(supportsDesktopSessionWindows()).toBe(false);
+    expect(await openDesktopSessionWindow("conv_1")).toBe(false);
+
+    setElectron(false);
+    expect(supportsDesktopSessionWindows()).toBe(false);
+    expect(await openDesktopSessionWindow("conv_1")).toBe(false);
+
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      setSessionWindowBridge(() => Promise.reject(new Error("ipc down")));
+      expect(await openDesktopSessionWindow("conv_1")).toBe(false);
+      expect(warn).toHaveBeenCalled();
+      setSessionWindowBridge(() => Promise.resolve(false));
+      expect(await openDesktopSessionWindow("conv_1")).toBe(false);
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
