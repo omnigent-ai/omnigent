@@ -252,15 +252,14 @@ def _rig_python(work: Path, gate_started: Path, *, ready_timeout_s: float | None
         "from omnigent.harnesses.claude_native import bridge\n"
         f"gate_started = Path({str(gate_started)!r})\n"
         "wait_for_prompt = bridge._wait_for_claude_prompt_ready\n"
-        "def observe_wait(socket_path, tmux_target, *, timeout_s, bridge_dir=None, "
-        "extend_for_slow_boot=True):\n"
+        # Keyword arguments pass through, so the gate keeps the delivery's own.
+        "def observe_wait(socket_path, tmux_target, *, timeout_s, **kwargs):\n"
         f"    if {ready_timeout_s!r} is not None:\n"
         f"        timeout_s = {ready_timeout_s!r}\n"
         "    if not gate_started.exists():\n"
         "        gate_started.write_text(json.dumps({'started_at': time.monotonic(), "
         "'timeout_s': timeout_s}))\n"
-        "    wait_for_prompt(socket_path, tmux_target, timeout_s=timeout_s, "
-        "bridge_dir=bridge_dir, extend_for_slow_boot=extend_for_slow_boot)\n"
+        "    wait_for_prompt(socket_path, tmux_target, timeout_s=timeout_s, **kwargs)\n"
         "bridge._wait_for_claude_prompt_ready = observe_wait\n"
     )
     (site_packages / "omnigent_rig.pth").write_text(

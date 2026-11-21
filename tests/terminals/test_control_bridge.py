@@ -183,6 +183,8 @@ class _FakeWebSocket:
         self.close_code: int | None = None
         self.close_reason: str | None = None
         self._recv_gate = asyncio.Event()
+        # Calls to receive(): one past the script means every scripted frame was handled.
+        self.receives = 0
         # Per-send delay simulates a real network so a burst backlogs behind the
         # send — the condition under which the forwarder coalesces.
         self._send_delay_s = send_delay_s
@@ -207,6 +209,7 @@ class _FakeWebSocket:
         ]
 
     async def receive(self) -> dict[str, object]:
+        self.receives += 1
         if self._inbound:
             return self._inbound.pop(0)
         # Block forever once scripted input is exhausted so the bridge's other
@@ -636,7 +639,9 @@ async def test_browser_keystrokes_mark_when_the_person_last_typed(read_only: boo
     )
     try:
         if read_only:
-            await asyncio.sleep(1.0)
+            # The bridge asks for a third frame only once it has handled the keystrokes.
+            await poll_until_async(lambda: ws.receives >= 3, timeout_s=10)
+            assert not task.done()
             assert last_human_input_at(str(sock), target) is None
         else:
             await poll_until_async(

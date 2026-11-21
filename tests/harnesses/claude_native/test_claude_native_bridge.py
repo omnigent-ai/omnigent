@@ -13157,8 +13157,17 @@ _STYLED_DRAFT = "\x1b[39m❯\xa0typed draft text\x1b[7m \x1b[0m"
         # Extended colours carry a 2 that is not the faint attribute.
         ("❯\xa0\x1b[38;2;200;200;200mtyped\x1b[0m", True),
         ("❯\xa0\x1b[2mfaint suggestion\x1b[22m", False),
+        ("\x1b[39m❯\xa0[Pasted text #1 +4 lines]\x1b[7m \x1b[0m", True),
     ],
-    ids=["empty", "queued-hint", "draft", "cursor-on-draft", "truecolour", "suggestion"],
+    ids=[
+        "empty",
+        "queued-hint",
+        "draft",
+        "cursor-on-draft",
+        "truecolour",
+        "suggestion",
+        "paste-only",
+    ],
 )
 def test_faint_hints_in_the_box_are_not_a_draft(styled_row: str, typed: bool) -> None:
     """The stash key ignores a faint hint and a paste replaces it, so only typed text counts."""
@@ -13171,24 +13180,17 @@ def test_faint_hints_in_the_box_are_not_a_draft(styled_row: str, typed: bool) ->
     assert claude_native_bridge._styled_box_has_typed_text(styled, box.rows) is typed
 
 
-@pytest.mark.parametrize(
-    ("styled_row", "draft"),
-    [
-        (_STYLED_QUEUED_HINT, False),
-        ("\x1b[39m❯\xa0Press up to edit queued messages\x1b[7m \x1b[0m", True),
-    ],
-    ids=["faint-hint", "typed-like-the-hint"],
-)
-def test_text_reading_like_the_queued_hint_is_a_draft_only_when_typed(
-    monkeypatch: pytest.MonkeyPatch, styled_row: str, draft: bool
+def test_typed_text_reading_like_the_queued_hint_is_a_draft(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The hint is told from typed text by its styling, so typing its words is kept."""
     rule = "─" * 30
+    styled_row = "\x1b[39m❯\xa0Press up to edit queued messages\x1b[7m \x1b[0m"
     styled = f"{rule}\n{styled_row}\n{rule}\n"
     monkeypatch.setattr(claude_native_bridge, "_capture_pane_styled", lambda *_args: styled)
     plain = claude_native_bridge._SGR_RE.sub("", styled)
 
-    assert claude_native_bridge._composer_holds_draft("/tmp/sock", "main", plain) is draft
+    assert claude_native_bridge._composer_holds_draft("/tmp/sock", "main", plain) is True
 
 
 @pytest.mark.parametrize(
@@ -13740,6 +13742,61 @@ def test_delivery_expands_a_clipped_composer_until_submit_is_verified(
     assert [text.strip() for text in composer.submitted] == [
         "/effort high" if slash else "hello from the web"
     ]
+    assert sizes == ["24", "6"]
+
+
+@pytest.mark.parametrize(
+    ("inject", "expected"),
+    [
+        (
+            lambda bridge_dir: inject_user_message(bridge_dir, content="hello from the web"),
+            "hello from the web",
+        ),
+        (
+            lambda bridge_dir: claude_native_bridge.inject_slash_command(
+                bridge_dir, command="/effort high"
+            ),
+            "/effort high",
+        ),
+    ],
+    ids=["web-message", "slash-command"],
+)
+def test_a_cut_off_box_hiding_a_draft_below_a_blank_line_is_stashed_whole(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    inject: Callable[[Path], None],
+    expected: str,
+) -> None:
+    """
+    A box the pane cuts off may hide a draft below a blank first line.
+
+    Nothing is typed while only its blank first row shows: the delivery is
+    refused, the pane given room, and the retry stashes the whole draft.
+    """
+    draft = "\nKEEP ONE\nKEEP TWO"
+    composer = _EditableComposer(draft, cursor=0, visible_rows=1)
+    composer.install(monkeypatch)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="120 6 latest\n", stderr=""),
+    )
+    sizes: list[str] = []
+
+    def run_tmux(socket_path: str, *args: str, **kwargs: object) -> None:
+        if args[0] == "resize-window":
+            height = args[args.index("-y") + 1]
+            sizes.append(height)
+            composer._visible_rows = None if int(height) >= 24 else 1
+        else:
+            composer._run_tmux(socket_path, *args)
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", run_tmux)
+
+    inject(_picker_bridge_dir(tmp_path))
+
+    assert [text.strip() for text in composer.submitted] == [expected]
+    assert (composer.text, composer.cursor, composer.stash) == (draft, 0, None)
     assert sizes == ["24", "6"]
 
 

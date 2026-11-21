@@ -7953,7 +7953,10 @@ def _set_draft_aside(
     before such text refuses the delivery as a draft that could not be
     stashed. A capture that does not show the box, such as a torn read during
     a repaint, says nothing about a draft: it is retried, and the delivery is
-    refused before any key if no capture shows the box.
+    refused before any key if no capture shows the box. So is a box the pane
+    cuts off whose visible rows are blank, since the rest of a draft can sit
+    below a blank first line; the refused delivery gives the pane room and
+    retries (:func:`_serialize_bridge_injection`).
 
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
@@ -7962,8 +7965,8 @@ def _set_draft_aside(
     :param guard: The delivery's record of the draft it stashed.
     :raises ClaudeComposerHoldsDraft: If the draft could not be stashed;
         nothing was typed.
-    :raises ClaudeComposerNotCleared: If no capture showed the input box;
-        nothing was typed.
+    :raises ClaudeComposerNotCleared: If no capture showed the input box, or a
+        cut-off box showed only blank rows; nothing was typed.
     :raises ClaudeTerminalExited: If no capture showed the box because the
         terminal is gone; nothing was typed.
     """
@@ -7976,6 +7979,18 @@ def _set_draft_aside(
         raise ClaudeComposerNotCleared(
             "Claude Code's input box could not be read, so nothing was sent. "
             "Open the terminal and retry."
+        )
+    box = _composer_box(pane)
+    if (
+        not guard.stashed
+        and box is not None
+        and not box.framed
+        and not any(row.strip() for row in [box.rows[0].strip()[1:], *box.rows[1:]])
+    ):
+        _record_held_draft(pane)
+        raise ClaudeComposerNotCleared(
+            "Claude Code's input box is cut off by the terminal's height, so a draft below "
+            "its first row could not be ruled out and nothing was sent."
         )
     if not _composer_holds_draft(socket_path, tmux_target, pane):
         return
