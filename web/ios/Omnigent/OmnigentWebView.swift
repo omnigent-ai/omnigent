@@ -827,9 +827,34 @@ struct OmnigentWebView: UIViewRepresentable {
         let serverURL = oidcConnection?.serverURL ?? parent.serverURL ?? pinnedURL
       else { return nil }
       let route = OidcAuthRoute(url: url, serverURL: serverURL)
-      // Browser-only logout can redirect externally without another app page completing.
-      if route == .logout { watchBridge.signOut() }
+      // Auth transitions can redirect externally without another app page completing.
+      if route != nil { watchBridge.signOut() }
       return route
+    }
+
+    @discardableResult
+    func syncWatchCredentials(
+      afterLoading pageURL: URL?, cookieStore: some WatchCookieStore
+    ) -> Task<Void, Never>? {
+      guard let pageURL, let pinnedOrigin, pageURL.omnigentOrigin == pinnedOrigin,
+        let serverURL = parent.serverURL ?? pinnedURL
+      else { return nil }
+      if workspaceSession == nil {
+        let mount = OidcWebSession.mountPath(of: serverURL)
+        let path = OidcWebSession.mountPath(of: pageURL)
+        guard OidcWebSession.isPage(pageURL, of: serverURL),
+          path != mount + "/login", path != mount + "/auth",
+          !path.hasPrefix(mount + "/auth/")
+        else {
+          watchBridge.signOut()
+          return nil
+        }
+      }
+      return watchBridge.sync(
+        serverURL: serverURL, workspacePageURL: workspaceSession?.pageURL,
+        workspaceID: workspaceSession?.workspaceID,
+        cookieName: workspaceSession == nil ? oidcConnection?.cookieName : "DBAUTH",
+        cookieStore: cookieStore)
     }
 
     /// Reads the manifest, then either signs in natively before loading or loads as before.
@@ -1472,10 +1497,8 @@ struct OmnigentWebView: UIViewRepresentable {
       if pinnedOrigin != nil, webView.url?.omnigentOrigin == pinnedOrigin {
         (webView as? AccessoryFreeWebView)?.emitKeyboardViewport(force: true)
         webView.evaluateJavaScript(WorkspaceChromeScript.source)
-        watchBridge.sync(
-          serverURL: parent.serverURL ?? pinnedURL, workspacePageURL: workspaceSession?.pageURL,
-          workspaceID: workspaceSession?.workspaceID,
-          cookieName: workspaceSession == nil ? oidcConnection?.cookieName : "DBAUTH",
+        syncWatchCredentials(
+          afterLoading: webView.url,
           cookieStore: webView.configuration.websiteDataStore.httpCookieStore)
         parent.loadSucceeded()
       }

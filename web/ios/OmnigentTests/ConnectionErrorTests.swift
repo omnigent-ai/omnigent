@@ -101,6 +101,31 @@ final class ConnectionErrorTests: XCTestCase {
         for: URL(string: "https://identity.invalid/logout")!, isMainFrame: true))
     XCTAssertEqual(transport.contexts.last?[WatchCredentials.contextKey] as? Data, Data())
 
+    let oldCookie = HTTPCookie(properties: [
+      .name: "session", .value: "test", .domain: "server.invalid", .path: "/",
+    ])!
+    for path in ["auth/login", "auth/login/", "login", "auth", "auth/callback"] {
+      bridge.signOut()
+      cookies.cookies.continuation.yield([oldCookie])
+      await coordinator.syncWatchCredentials(
+        afterLoading: url.appending(path: path), cookieStore: cookies)?.value
+      XCTAssertEqual(transport.contexts.last?[WatchCredentials.contextKey] as? Data, Data(), path)
+    }
+    cookies.cookies.continuation.yield([oldCookie])
+    await bridge.sync(serverURL: url, cookieStore: cookies)?.value
+    XCTAssertEqual(
+      coordinator.authNavigationRoute(for: url.appending(path: "auth/login"), isMainFrame: true),
+      .login)
+    XCTAssertEqual(transport.contexts.last?[WatchCredentials.contextKey] as? Data, Data())
+
+    let anonymousCookies = PendingWatchCookies()
+    anonymousCookies.cookies.continuation.yield([])
+    await coordinator.syncWatchCredentials(afterLoading: url, cookieStore: anonymousCookies)?.value
+    let anonymous = try JSONDecoder().decode(
+      WatchCredentials.self,
+      from: XCTUnwrap(transport.contexts.last?[WatchCredentials.contextKey] as? Data))
+    XCTAssertEqual(anonymous.cookie, "", "Cookie-free app deployments must still work")
+
     for enabled in [true, false] {
       coordinator.parent = OmnigentWebView(
         initialURL: url, model: view.model, settings: view.settings,

@@ -400,6 +400,7 @@ final class WatchCompanionTests: XCTestCase {
       serverURL: URL(string: "https://omnigent.example.com/omnigent")!, workspaceID: "7",
       cookies: [])
     XCTAssertEqual(learned?.apiURL.absoluteString, "https://omnigent.example.com/omnigent/v1?o=7")
+    XCTAssertEqual(learned?.cookie, "")
 
     let sessionNames = ["DBAUTH", "__Host-ap_session", "ap_session"]
     let nativeCookies =
@@ -407,11 +408,25 @@ final class WatchCompanionTests: XCTestCase {
         cookie($0, domain: "omnigent.example.com", path: "/", secure: true)
       } + [cookie("unrelated", domain: "omnigent.example.com", path: "/")]
     for name in sessionNames + ["absent"] {
-      let credentials = try XCTUnwrap(
+      let credentials = WatchCredentials(
+        serverURL: URL(string: "https://omnigent.example.com/omnigent")!, cookieName: name,
+        cookies: nativeCookies)
+      if name == "absent" {
+        XCTAssertNil(credentials, "A missing known session cookie must clear authentication")
+      } else {
+        XCTAssertEqual(try XCTUnwrap(credentials).cookie, "\(name)=1")
+      }
+    }
+    for invalid in [
+      cookie("session", domain: "omnigent.example.com", path: "/", value: ""),
+      cookie("session", domain: "omnigent.example.com", path: "/", expires: now),
+      cookie("session", domain: "other.example.com", path: "/"),
+      cookie("session", domain: "omnigent.example.com", path: "/admin"),
+    ] {
+      XCTAssertNil(
         WatchCredentials(
-          serverURL: URL(string: "https://omnigent.example.com/omnigent")!, cookieName: name,
-          cookies: nativeCookies))
-      XCTAssertEqual(credentials.cookie, name == "absent" ? "" : "\(name)=1")
+          serverURL: URL(string: "https://omnigent.example.com/omnigent")!, cookieName: "session",
+          cookies: [invalid]))
     }
 
     for enteredPath in ["/omnigent", "/omnigent/c/original"] {
@@ -773,10 +788,11 @@ final class WatchCompanionTests: XCTestCase {
   }
 
   private func cookie(
-    _ name: String, domain: String, path: String, secure: Bool = false, expires: Date? = nil
+    _ name: String, domain: String, path: String, secure: Bool = false, expires: Date? = nil,
+    value: String = "1"
   ) -> HTTPCookie {
     var properties: [HTTPCookiePropertyKey: Any] = [
-      .name: name, .value: "1", .domain: domain, .path: path,
+      .name: name, .value: value, .domain: domain, .path: path,
     ]
     if secure { properties[.secure] = "TRUE" }
     if let expires { properties[.expires] = expires }

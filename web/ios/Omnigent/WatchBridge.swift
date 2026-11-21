@@ -147,9 +147,10 @@ extension WatchCredentials {
     components.queryItems = (workspaceID ?? selector).map { [URLQueryItem(name: "o", value: $0)] }
     guard let apiURL = components.url else { return nil }
     let sent = cookies.filter {
-      (cookieName == nil || $0.name == cookieName)
+      (cookieName == nil || ($0.name == cookieName && !$0.value.isEmpty))
         && DatabricksSessionClient.cookie($0, appliesTo: apiURL)
     }
+    guard cookieName == nil || !sent.isEmpty else { return nil }
     self.init(apiURL: apiURL, cookie: HTTPCookie.requestHeaderFields(with: sent)["Cookie"] ?? "")
   }
 }
