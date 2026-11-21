@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -40,6 +41,7 @@ from omnigent.terminals.control_bridge import (
     unescape_control_output,
 )
 from omnigent.terminals.query_replies import tmux_answered_queries
+from omnigent.util.tmux_activity import last_human_input_at
 from tests._helpers.polling import poll_until_async
 
 _HAS_TMUX = shutil.which("tmux") is not None
@@ -612,6 +614,37 @@ async def test_control_bridge_seeds_streams_and_detaches() -> None:
 
     # Kill the server → the control client's stdout closes → bridge exits.
     await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+@pytest.mark.parametrize("read_only", [False, True], ids=["typing", "read-only"])
+async def test_browser_keystrokes_mark_when_the_person_last_typed(read_only: bool) -> None:
+    """Deliveries into the pane wait for the person to pause typing in the web terminal."""
+    sock, target = await _new_private_tmux("cat")
+    typed_from = time.time()
+    ws = _FakeWebSocket(
+        inbound=[
+            {"type": "websocket.receive", "text": '{"type":"resize","cols":80,"rows":24}'},
+            {"type": "websocket.receive", "bytes": b"typed"},
+        ]
+    )
+    task = asyncio.create_task(
+        bridge_tmux_control_to_websocket(
+            ws, socket_path=str(sock), tmux_target=target, read_only=read_only
+        )
+    )
+    try:
+        if read_only:
+            await asyncio.sleep(1.0)
+            assert last_human_input_at(str(sock), target) is None
+        else:
+            await poll_until_async(
+                lambda: (last_human_input_at(str(sock), target) or 0) >= typed_from,
+                timeout_s=10,
+            )
+    finally:
+        await _kill_and_join(sock, task)
 
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")

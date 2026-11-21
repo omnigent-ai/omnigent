@@ -51,6 +51,7 @@ import logging
 import os
 import re
 import shutil
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Final
@@ -69,8 +70,12 @@ from omnigent.terminals.ws_common import (
     _monotonic,
     _tmux_session_alive,
 )
+from omnigent.util.tmux_activity import human_input_stamp_command
 
 _logger = logging.getLogger(__name__)
+
+# How often browser keystrokes stamp the pane's last-typed time.
+_HUMAN_INPUT_STAMP_INTERVAL_S = 0.25
 
 __all__ = [
     "bridge_tmux_control_to_websocket",
@@ -738,6 +743,7 @@ async def bridge_tmux_control_to_websocket(
     # xterm's synchronous paint path) and clipboard
     # forwarding uses it to identify which attached client initiated a copy.
     last_client_input_at: float | None = None
+    last_input_stamp_at: float | None = None
 
     def _current_ws_coalesce_limit() -> int:
         """Per-frame cap: small right after input, larger for output floods."""
@@ -882,7 +888,7 @@ async def bridge_tmux_control_to_websocket(
 
     async def _ws_to_control() -> None:
         """Read browser frames; resize via refresh-client -C, input via -H hex."""
-        nonlocal last_client_input_at
+        nonlocal last_client_input_at, last_input_stamp_at
         try:
             while True:
                 msg = await websocket.receive()
@@ -908,6 +914,15 @@ async def bridge_tmux_control_to_websocket(
                     # Stamp before sending so the next %output (the echo) takes
                     # the small interactive frame cap.
                     last_client_input_at = _monotonic()
+                    if (
+                        last_input_stamp_at is None
+                        or last_client_input_at - last_input_stamp_at
+                        >= _HUMAN_INPUT_STAMP_INTERVAL_S
+                    ):
+                        # Deliveries into the pane wait for the person to pause typing.
+                        last_input_stamp_at = last_client_input_at
+                        stamp = human_input_stamp_command(tmux_target, time.time())
+                        await _send_command(f"{stamp}\n".encode())
                     for cmd in _hex_send_keys_commands(tmux_target, data):
                         await _send_command(cmd)
         except WebSocketDisconnect:

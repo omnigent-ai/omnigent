@@ -105,7 +105,12 @@ def test_the_pre_paste_check_refuses_before_typing(
 
     with pytest.raises(ClaudeUserPromptPending) as raised:
         claude_native_bridge._paste_and_submit(
-            bridge_dir, "/tmp/example/tmux.sock", "main", text="hi\n", needle="hi"
+            bridge_dir,
+            "/tmp/example/tmux.sock",
+            "main",
+            text="hi\n",
+            needle="hi",
+            guard=claude_native_bridge._DraftGuard(),
         )
 
     assert raised.value.nothing_typed is True
@@ -115,13 +120,25 @@ def test_a_prompt_after_the_paste_is_not_retryable(
     bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The draft is in the box by then; a retry could append to it."""
-    _show(monkeypatch, f"{_RULE}\n❯ hi\n{_RULE}\n  ? for shortcuts\n")
+    panes = {"box": f"{_RULE}\n❯ \n{_RULE}\n  ? for shortcuts\n"}
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda *_a, **_k: panes["box"])
+
+    def paste(_socket: str, *args: str) -> None:
+        if args[0] == "paste-buffer":
+            panes["box"] = f"{_RULE}\n❯ hi\n{_RULE}\n  ? for shortcuts\n"
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", paste)
     checks = iter([False, True])
     monkeypatch.setattr(claude_native_bridge, "has_pending_user_prompt", lambda _dir: next(checks))
 
     with pytest.raises(ClaudeUserPromptPending) as raised:
         claude_native_bridge._paste_and_submit(
-            bridge_dir, "/tmp/example/tmux.sock", "main", text="hi\n", needle="hi"
+            bridge_dir,
+            "/tmp/example/tmux.sock",
+            "main",
+            text="hi\n",
+            needle="hi",
+            guard=claude_native_bridge._DraftGuard(),
         )
 
     assert raised.value.nothing_typed is False
@@ -145,7 +162,7 @@ def test_an_occupied_input_box_refusal_awaits_no_answer(
     bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Shell mode is no dialog; nothing the person answers would free the box."""
-    _show(monkeypatch, f"{_RULE}\n! git status --short\n{_RULE}\n  ! for shell mode\n")
+    _show(monkeypatch, f"{_RULE}\n!\n{_RULE}\n  ! for shell mode\n")
 
     with pytest.raises(ClaudeTerminalDialog, match="occupied by shell mode") as raised:
         claude_native_bridge.inject_user_message(bridge_dir, content="hi")

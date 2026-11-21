@@ -5466,7 +5466,12 @@ def test_paste_file_is_removed_when_payload_write_fails(
 
     with pytest.raises(OSError) as caught:
         claude_native_bridge._paste_and_submit(
-            tmp_path, "synthetic.sock", "claude:0.0", text="synthetic prompt", needle="synthetic"
+            tmp_path,
+            "synthetic.sock",
+            "claude:0.0",
+            text="synthetic prompt",
+            needle="synthetic",
+            guard=claude_native_bridge._DraftGuard(),
         )
 
     assert caught.value is failure
@@ -12795,11 +12800,14 @@ class _EditableComposer:
         self._unavailable_clear_captures = unavailable_clear_captures
         self._clearing_started = False
         self.submitted: list[str] = []
+        # Claude Code's one stash slot: the (draft, cursor) Ctrl+S set aside.
+        self.stash: tuple[str, int] | None = None
         self._paste_buffer = ""
         self._actions = {
             "\x1b[107;5u": self._kill_to_line_end,
             "\x1b[117;5u": self._kill_to_line_start,
             "\x1b[97;5u": self._move_to_line_start,
+            "\x1b[115;5u": self._toggle_stash,
         }
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -12831,6 +12839,10 @@ class _EditableComposer:
         elif args[0] == "send-keys" and args[-1] == "Enter":
             self.submitted.append(self.text)
             self.text, self.cursor = "", 0
+            if self.stash is not None:
+                # Claude Code returns a stashed draft after the submit.
+                self.text, self.cursor = self.stash
+                self.stash = None
 
     def _capture_pane(self, socket_path: str, tmux_target: str) -> str:
         del socket_path, tmux_target
@@ -12839,11 +12851,12 @@ class _EditableComposer:
             return ""
         first, *rest = self.text.split("\n")
         rows = [f"❯ {first}", *(f"  {row}" for row in rest)]
+        marker = ["                    \u203a stashed"] if self.stash else []
         if self._visible_rows is not None and len(rows) >= self._visible_rows:
             # The rows take every line the pane has: no closing rule.
             clipped = "\n".join(rows[: self._visible_rows])
-            return f"⏺ done\n{self._RULE}\n{clipped}\n"
-        screen = ["⏺ done", self._RULE, *rows, self._RULE, "  ? for shortcuts"]
+            return "\n".join(["⏺ done", *marker, self._RULE, clipped]) + "\n"
+        screen = ["⏺ done", *marker, self._RULE, *rows, self._RULE, "  ? for shortcuts"]
         if self._pane_rows is not None:
             screen = screen[-self._pane_rows :]
         return "\n".join(screen[1:] if self._pane_rows is None else screen) + "\n"
@@ -12871,6 +12884,15 @@ class _EditableComposer:
     def _move_to_line_start(self) -> None:
         self.cursor = self.text.rfind("\n", 0, self.cursor) + 1
 
+    def _toggle_stash(self) -> None:
+        # Stashes a draft; on an empty box it returns the stash instead.
+        if self.text.strip():
+            self.stash = (self.text, self.cursor)
+            self.text, self.cursor = "", 0
+        elif self.stash is not None:
+            self.text, self.cursor = self.stash
+            self.stash = None
+
 
 _STALE_MULTILINE_DRAFT = "STALE ONE\nSTALE TWO\nSTALE THREE"
 
@@ -12897,7 +12919,7 @@ _BOX_GEOMETRIES = pytest.mark.parametrize(
     [_STALE_MULTILINE_DRAFT, _STALE_MULTILINE_DRAFT.replace("STALE TWO", "─────────")],
     ids=["plain-draft", "draft-with-rule"],
 )
-def test_inject_user_message_clears_every_line_of_a_leftover_draft(
+def test_inject_user_message_sends_none_of_a_leftover_draft_and_returns_it(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     cursor: int,
@@ -12905,13 +12927,12 @@ def test_inject_user_message_clears_every_line_of_a_leftover_draft(
     draft: str,
 ) -> None:
     """
-    A multi-line draft left in the box is not submitted with the message.
+    A multi-line draft left in the box is not submitted with the message, nor lost.
 
-    Clearing only the cursor's line leaves the draft's other lines in the
-    box, and the paste then lands among them, so Enter would send the
-    person's half-written draft as part of the web message. In a sliver
-    pane the capture shows one row of the draft, so stopping after one
-    clearing burst would likewise leave the hidden lines to be submitted.
+    A paste into the draft would send the person's half-written text as part
+    of the web message, and clearing it would erase it. Claude Code's stash
+    holds every line, even the ones a sliver pane hides, and returns the
+    draft with its cursor after the submit.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
     composer = _EditableComposer(draft, cursor=cursor, visible_rows=visible_rows)
@@ -12920,6 +12941,7 @@ def test_inject_user_message_clears_every_line_of_a_leftover_draft(
     inject_user_message(bridge_dir, content="hello from the web")
 
     assert [text.strip() for text in composer.submitted] == ["hello from the web"]
+    assert (composer.text, composer.cursor, composer.stash) == (draft, cursor, None)
 
 
 @_BOX_GEOMETRIES
@@ -12929,7 +12951,7 @@ def test_inject_user_message_clears_every_line_of_a_leftover_draft(
     [_STALE_MULTILINE_DRAFT, _STALE_MULTILINE_DRAFT.replace("STALE TWO", "─────────")],
     ids=["plain-draft", "draft-with-rule"],
 )
-def test_inject_slash_command_clears_every_line_of_a_leftover_draft(
+def test_inject_slash_command_sends_none_of_a_leftover_draft_and_returns_it(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     cursor: int,
@@ -12937,7 +12959,7 @@ def test_inject_slash_command_clears_every_line_of_a_leftover_draft(
     draft: str,
 ) -> None:
     """
-    A multi-line draft left in the box is not submitted with a slash command.
+    A multi-line draft left in the box is not submitted with a slash command, nor lost.
 
     Otherwise the command becomes a line of the draft and Enter sends the
     draft plus ``/effort high`` to the model as a prompt instead of
@@ -12951,6 +12973,188 @@ def test_inject_slash_command_clears_every_line_of_a_leftover_draft(
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
     assert composer.submitted == ["/effort high"]
+    assert (composer.text, composer.cursor, composer.stash) == (draft, cursor, None)
+
+
+@pytest.mark.parametrize(
+    "inject",
+    [
+        lambda bridge_dir: inject_user_message(bridge_dir, content="hello from the web"),
+        lambda bridge_dir: claude_native_bridge.inject_slash_command(
+            bridge_dir, command="/effort high"
+        ),
+    ],
+    ids=["web-message", "slash-command"],
+)
+def test_a_draft_beside_a_stashed_one_refuses_delivery_and_keeps_both(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    inject: Callable[[Path], None],
+) -> None:
+    """
+    Claude Code's one stash slot is never overwritten.
+
+    Stashing the box's draft would replace the person's stashed one, so the
+    delivery is refused before anything is typed, as one the executor holds.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    composer = _EditableComposer("newer draft", cursor=5)
+    composer.stash = ("older draft", 2)
+    composer.install(monkeypatch)
+
+    with pytest.raises(
+        claude_native_bridge.ClaudeComposerHoldsDraft, match="nothing was sent"
+    ) as refused:
+        inject(bridge_dir)
+
+    assert refused.value.stash_in_use is True
+    assert composer.submitted == []
+    assert (composer.text, composer.cursor) == ("newer draft", 5)
+    assert composer.stash == ("older draft", 2)
+
+
+@pytest.mark.parametrize(
+    ("pane", "stash_in_use", "expected"),
+    [
+        ("⏺ done\n" + "─" * 30 + "\n❯ \n" + "─" * 30 + "\n", False, True),
+        ("⏺ done\n" + "─" * 30 + "\n❯ draft\n" + "─" * 30 + "\n", True, True),
+        (
+            "⏺ done\n  \u203a stashed\n" + "─" * 30 + "\n❯ draft\n" + "─" * 30 + "\n",
+            True,
+            False,
+        ),
+        ("⏺ done\n" + "─" * 30 + "\n❯ draft\n" + "─" * 30 + "\n", False, False),
+        ("Loading…\n", False, False),
+    ],
+    ids=["empty-box", "stash-free", "stash-in-use", "draft-not-stashed", "no-box"],
+)
+def test_a_held_draft_frees_delivery_once_the_box_or_the_stash_does(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pane: str,
+    stash_in_use: bool,
+    expected: bool,
+) -> None:
+    """A draft-held message can go once the box holds no draft, or its stash frees."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda *_args, **_kw: pane)
+
+    taken = claude_native_bridge.input_box_takes_delivery(bridge_dir, stash_in_use=stash_in_use)
+
+    assert taken is expected
+
+
+# Styled captures of Claude Code 2.1.325's input box (``capture-pane -e``).
+_STYLED_EMPTY_BOX = "\x1b[39m❯\xa0\x1b[7m \x1b[0m"
+_STYLED_QUEUED_HINT = (
+    "\x1b[38;5;246m❯\xa0\x1b[7m\x1b[39mP\x1b[0;2mress up to edit queued messages\x1b[0m"
+)
+_STYLED_DRAFT = "\x1b[39m❯\xa0typed draft text\x1b[7m \x1b[0m"
+
+
+@pytest.mark.parametrize(
+    ("styled_row", "typed"),
+    [
+        (_STYLED_EMPTY_BOX, False),
+        (_STYLED_QUEUED_HINT, False),
+        (_STYLED_DRAFT, True),
+        # A one-character draft with the cursor on it is still typed text.
+        ("❯\xa0\x1b[7mx\x1b[0m", True),
+        # Extended colours carry a 2 that is not the faint attribute.
+        ("❯\xa0\x1b[38;2;200;200;200mtyped\x1b[0m", True),
+        ("❯\xa0\x1b[2mfaint suggestion\x1b[22m", False),
+    ],
+    ids=["empty", "queued-hint", "draft", "cursor-on-draft", "truecolour", "suggestion"],
+)
+def test_faint_hints_in_the_box_are_not_a_draft(styled_row: str, typed: bool) -> None:
+    """The stash key ignores a faint hint and a paste replaces it, so only typed text counts."""
+    rule = "\x1b[38;5;244m" + "─" * 30 + "\x1b[39m"
+    styled = f"{rule}\n{styled_row}\n{rule}\n"
+    plain = claude_native_bridge._SGR_RE.sub("", styled)
+    box = claude_native_bridge._composer_box(plain)
+    assert box is not None
+
+    assert claude_native_bridge._styled_box_has_typed_text(styled, box.rows) is typed
+
+
+def test_the_stash_marker_is_read_only_above_the_input_box() -> None:
+    """Transcript text that quotes the marker does not count as a stashed draft."""
+    rule = "─" * 30
+    shown = f"⏺ done\n   ◐ medium · /effort · \u203a stashed\n{rule}\n❯ \n{rule}\n"
+    quoted = f"● The footer says \u203a stashed\n\n⏺ done\n{rule}\n❯ \n{rule}\n"
+
+    assert claude_native_bridge._stash_marker_shown(shown)
+    assert not claude_native_bridge._stash_marker_shown(quoted)
+
+
+def test_a_confirm_enter_never_reaches_a_returned_draft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A settings dialog that never renders gets no Enter over the person's draft.
+
+    Claude Code returns the stashed draft as soon as the command runs; an
+    Enter sent for a dialog that never appeared would submit it.
+    """
+    sends = _fake_tmux(monkeypatch, [_composer_pane("my returned draft")])
+
+    confirmed = claude_native_bridge._confirm_tui_dialog(
+        "/tmp/example/tmux.sock", "claude:0.0", hint="Change effort level?", timeout_s=1.0
+    )
+
+    assert confirmed is False
+    assert not any(args[-1] == "Enter" for args in sends)
+
+
+def test_submit_retries_stop_once_the_stashed_draft_is_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the draft returned, the box may hold it, so no retry Enter is sent."""
+    sends = _fake_tmux(monkeypatch, [_composer_pane("hello from the web and more")])
+    monkeypatch.setattr(claude_native_bridge, "_SUBMIT_VERIFY_TIMEOUT_S", 5.0)
+
+    accepted = claude_native_bridge._verify_submit_accepted(
+        "/tmp/example/tmux.sock",
+        "claude:0.0",
+        needle="hello from the web",
+        what="submitted message",
+        stash_pending=True,
+    )
+
+    assert accepted is False
+    assert not any(args[-1] == "Enter" for args in sends)
+
+
+def test_delivery_waits_for_the_person_to_pause_typing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keys typed while a delivery holds the box would join it, so it waits for a pause."""
+    clock = _VirtualClock()
+    clock.now = 1000.0
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+    # The person types until 1003.0, then stops.
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "last_human_input_at",
+        lambda *_args: min(clock.now, 1003.0),
+    )
+
+    claude_native_bridge._wait_for_typing_pause("/tmp/example/tmux.sock", "claude:0.0")
+
+    assert 1003.0 + claude_native_bridge._TYPING_PAUSE_S <= clock.now < 1005.0
+
+
+def test_delivery_stops_waiting_for_a_person_who_keeps_typing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _VirtualClock()
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+    monkeypatch.setattr(claude_native_bridge, "last_human_input_at", lambda *_args: clock.now)
+
+    claude_native_bridge._wait_for_typing_pause("/tmp/example/tmux.sock", "claude:0.0")
+
+    cap = claude_native_bridge._TYPING_PAUSE_MAX_WAIT_S
+    assert cap <= clock.now < cap + 1.0
 
 
 @pytest.mark.parametrize(
@@ -13056,7 +13260,7 @@ _TALL_DRAFT = "\n".join(f"STALE {idx}" for idx in range(30))
     ],
     ids=["web-message", "slash-command"],
 )
-def test_a_draft_taller_than_the_pane_is_cleared_before_delivery(
+def test_a_draft_taller_than_the_pane_is_stashed_before_delivery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     cursor: int,
@@ -13064,12 +13268,13 @@ def test_a_draft_taller_than_the_pane_is_cleared_before_delivery(
     expected: str,
 ) -> None:
     """
-    A draft too tall for the pane is cleared, not waited on as an overlay.
+    A draft too tall for the pane is set aside, not waited on as an overlay.
 
     Claude Code keeps the bottom of its screen in view, so the draft scrolls
     the box's opening rule and ``❯`` row off the top. Read as "no input box",
     the readiness gate waited out its budget and the turn failed as a
-    terminal that never became ready.
+    terminal that never became ready. The stash keeps every line, including
+    those off screen, and returns them after the delivery.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
     composer = _EditableComposer(_TALL_DRAFT, cursor=cursor, pane_rows=10)
@@ -13078,6 +13283,7 @@ def test_a_draft_taller_than_the_pane_is_cleared_before_delivery(
     inject(bridge_dir)
 
     assert [text.strip() for text in composer.submitted] == [expected]
+    assert (composer.text, composer.cursor) == (_TALL_DRAFT, cursor)
 
 
 @pytest.mark.parametrize("slash", [False, True], ids=["web-message", "slash-command"])
@@ -13383,7 +13589,10 @@ def test_blank_rows_after_an_empty_glyph_row_count_as_a_cleared_box(
     sends = _fake_tmux(monkeypatch, ["──────\n❯\n\n──────\n  ? for shortcuts\n"])
 
     claude_native_bridge._clear_composer(
-        "/tmp/example/tmux.sock", "claude:0.0", bridge_dir=Path("/tmp/example/bridge")
+        "/tmp/example/tmux.sock",
+        "claude:0.0",
+        bridge_dir=Path("/tmp/example/bridge"),
+        guard=claude_native_bridge._DraftGuard(),
     )
 
     assert sum(1 for send in sends if "-l" in send) == 1
@@ -13880,7 +14089,15 @@ def test_a_slash_command_stuck_in_the_composer_fails_loud(
     the authoritative fallback — an honest failure, not a silent divergence.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
-    _fake_tmux(monkeypatch, [_composer_pane("/effort high")])
+    sends = _fake_tmux(monkeypatch, [_composer_pane("")])
+
+    def stuck_after_typing(socket_path: str, tmux_target: str) -> str:
+        typed = any(
+            args[:2] == ["send-keys", "-l"] and args[-1] == "/effort high" for args in sends
+        )
+        return _composer_pane("/effort high" if typed else "")
+
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", stuck_after_typing)
 
     with pytest.raises(RuntimeError, match="was not delivered"):
         claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
@@ -14169,17 +14386,16 @@ def test_detailed_transcript_view_requires_its_live_footer(pane: str, expected: 
         assert not claude_native_bridge.claude_pane_input_box_shown(pane)
 
 
-def test_inject_user_message_refuses_a_shell_mode_draft_it_cannot_clear(
+def test_inject_user_message_refuses_a_shell_mode_draft_it_cannot_stash(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    A shell-mode draft that outlives the reclaim is refused, not waited out.
+    A shell-mode draft the stash key leaves in place is refused, not waited out.
 
-    When clearing does not take the typed shell command out of the box, the
-    readiness gate would poll its whole slow-boot budget for a ``❯`` that
-    cannot appear, and the delivery timeout then kills the healthy pane.
-    Only the clearing keys may reach the pane: nothing that submits.
+    The readiness gate would otherwise poll its whole slow-boot budget for a
+    ``❯`` that cannot appear, and the delivery timeout then kills the healthy
+    pane. Only the stash key may reach the pane: nothing that edits or submits.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
     shell_draft_pane = (
@@ -14196,17 +14412,17 @@ def test_inject_user_message_refuses_a_shell_mode_draft_it_cannot_clear(
         lambda *_args: claude_native_bridge._ClaudePaneState(alive=True),
     )
 
+    monkeypatch.setattr(claude_native_bridge, "_request_claude_repaint", lambda *_: 0)
+
     with pytest.raises(
-        claude_native_bridge.ClaudeInputBoxOccupied, match="occupied by shell mode"
+        claude_native_bridge.ClaudeComposerHoldsDraft, match="nothing was sent"
     ) as refused:
         inject_user_message(bridge_dir, content="hello from the web")
 
     # Nothing was typed, so the executor can hold the message until the box frees.
-    assert refused.value.surface == "shell mode"
+    assert refused.value.stash_in_use is False
     tails = [args[-1] for args in sends]
-    assert tails and all(
-        not tail.replace("\x1b[107;5u", "").replace("\x1b[117;5u", "") for tail in tails
-    ), f"Only the clearing keys may be sent; got {tails}."
+    assert tails == [claude_native_bridge._COMPOSER_STASH_KEY], tails
 
 
 _MCP_APPROVAL_DIALOG_PANE = """\

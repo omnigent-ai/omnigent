@@ -99,6 +99,7 @@ from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native.failure_telemetry import FailureContext
 from omnigent.runtime.tool_call_deadline import ToolCallDeadline, bind_tool_call_deadline
 from omnigent.util.json_types import JsonObject as _JsonObject
+from omnigent.util.tmux_activity import last_human_input_at
 
 if TYPE_CHECKING:
     import httpx
@@ -396,6 +397,21 @@ _COMPOSER_KILL_TO_LINE_END = "\x1b[107;5u"
 _COMPOSER_KILL_TO_LINE_START = "\x1b[117;5u"
 # Retry rounds when the capture cannot show the whole box.
 _COMPOSER_CLEAR_MAX_ROUNDS = 3
+# Claude Code's chat:stash key (Ctrl+S) as a CSI-u event, like the clearing keys.
+# It sets the person's unsent draft aside; Claude Code returns it after the next submit.
+_COMPOSER_STASH_KEY = "\x1b[115;5u"
+# Claude Code's marker above the input box while a stashed draft waits. It has one
+# stash, so stashing again would replace the draft already there.
+_STASH_MARKER_RE = re.compile(r"[›»] ?stashed\b")
+_STASH_MARKER_ROWS = 2
+# How long Claude Code may take to stash a draft, and to return it after a submit.
+_STASH_SETTLE_S = 3.0
+_STASH_RESTORE_TIMEOUT_S = 10.0
+# A delivery first waits for the person to pause typing this long, at most the cap.
+_TYPING_PAUSE_S = 1.5
+_TYPING_PAUSE_MAX_WAIT_S = 15.0
+_SGR_RE = re.compile(r"\x1b\[([0-9;:]*)m")
+_NON_SGR_ESCAPE_RE = re.compile(r"\x1b(?:\][^\x07\x1b]*(?:\x07|\x1b\\)|\[[0-9;:?]*[A-Za-ln-z])")
 # Footer rows Claude Code draws under the input box (mode hints, status line).
 _SCROLLED_DRAFT_MAX_FOOTER_ROWS = 4
 # How long to wait for the pasted draft to visibly land in Claude's
@@ -787,6 +803,22 @@ class ClaudeMessageNotAccepted(RuntimeError):
 
 class ClaudeComposerNotCleared(ClaudeMessageNotAccepted):
     """A draft left in Claude's input box could not be cleared, so nothing was sent."""
+
+
+class ClaudeComposerHoldsDraft(ClaudeComposerNotCleared):
+    """
+    The input box holds the person's unsent draft, which could not be set aside.
+
+    Nothing was typed. The delivery can go once the person sends or clears the
+    draft or, when :attr:`stash_in_use`, once Claude Code's stash is free.
+
+    :param message: Why the draft stayed in the box.
+    :param stash_in_use: Whether Claude Code's one stash already holds a draft.
+    """
+
+    def __init__(self, message: str, *, stash_in_use: bool) -> None:
+        super().__init__(message)
+        self.stash_in_use = stash_in_use
 
 
 class ClaudeSubmitBlockedUnconfirmed(RuntimeError):
@@ -4909,9 +4941,15 @@ def inject_user_message(
     Between the two, anything the person left occupying the composer
     from the embedded terminal — a ctrl+r history search, a rewind
     dialog, a ``/config`` panel, ``!`` shell mode — is dismissed with
-    Escape, or cleared when it is a typed shell command (see
+    Escape, or stashed when it is a typed shell command (see
     :func:`_restore_occupied_input`), so the message reclaims the input box
     instead of being typed into that surface.
+
+    The person's own unsent draft is never erased. Delivery waits for them to
+    pause typing (:func:`_wait_for_typing_pause`), then stashes the draft with
+    Claude Code's stash, which returns it after the submit
+    (:func:`_set_draft_aside`). A draft that cannot be stashed refuses the
+    delivery before anything is typed (:class:`ClaudeComposerHoldsDraft`).
 
     Delivered as one bracketed paste via ``tmux load-buffer`` (from a
     temp file) + ``paste-buffer -p`` so interior newlines ride as raw CR
@@ -4963,12 +5001,44 @@ def inject_user_message(
     """
     delivery_diagnostics.set_stage("waiting_for_tmux")
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    delivery_diagnostics.set_stage("waiting_for_typing_pause")
+    _wait_for_typing_pause(info["socket_path"], info["tmux_target"])
+    guard = _DraftGuard()
+    try:
+        _deliver_user_message(bridge_dir, info, content=content, timeout_s=timeout_s, guard=guard)
+    except BaseException:
+        _put_draft_back(
+            info["socket_path"],
+            info["tmux_target"],
+            guard=guard,
+            needle=_submit_needle(content),
+        )
+        raise
+
+
+def _deliver_user_message(
+    bridge_dir: Path,
+    info: dict[str, str],
+    *,
+    content: str,
+    timeout_s: float,
+    guard: _DraftGuard,
+) -> None:
+    """
+    Reclaim the input box and deliver *content*, as :func:`inject_user_message` describes.
+
+    :param bridge_dir: Bridge directory path.
+    :param info: The advertised tmux target, with ``socket_path`` and ``tmux_target``.
+    :param content: User text to deliver.
+    :param timeout_s: Seconds to wait for the prompt to render.
+    :param guard: This delivery's record of the draft it set aside.
+    """
     delivery_diagnostics.set_stage("restoring_input")
     # A surface left occupying the composer swallows everything typed
     # below — and hides the input box, wedging the readiness gate — so
     # reclaim the input box before waiting on it.
     surface = _restore_occupied_input(
-        info["socket_path"], info["tmux_target"], bridge_dir=bridge_dir
+        info["socket_path"], info["tmux_target"], bridge_dir=bridge_dir, guard=guard
     )
     if surface is not None and surface != _OVERLAY_SURFACE:
         # An overlay may be launcher output the readiness gate waits through; a
@@ -5012,7 +5082,9 @@ def inject_user_message(
         rejection_baseline = _count_unknown_command_rejections(
             _capture_pane(socket_path, tmux_target), rejection_needle
         )
-    _paste_and_submit(bridge_dir, socket_path, tmux_target, text=injected_text, needle=needle)
+    _paste_and_submit(
+        bridge_dir, socket_path, tmux_target, text=injected_text, needle=needle, guard=guard
+    )
     if rejection_needle is None:
         return
     if not _unknown_command_rejection_appeared(
@@ -5037,6 +5109,7 @@ def inject_user_message(
         tmux_target,
         text=_escape_slash_command_text(content),
         needle=needle,
+        guard=guard,
     )
 
 
@@ -5047,15 +5120,17 @@ def _paste_and_submit(
     *,
     text: str,
     needle: str,
+    guard: _DraftGuard,
 ) -> None:
     r"""
     Deliver *text* into Claude's input box as one paste plus a verified Enter.
 
     The delivery core of :func:`inject_user_message` (see its docstring for
-    the full hazard notes): clear any leftover draft, bracketed-paste the
-    payload via ``load-buffer`` + ``paste-buffer -p``, wait for the draft to
-    visibly commit, submit, and verify the draft left the box — re-sending
-    Enter while it verifiably hasn't.
+    the full hazard notes): stash the person's unsent draft, bracketed-paste
+    the payload via ``load-buffer`` + ``paste-buffer -p``, wait for it to
+    visibly commit, submit, verify it left the box — re-sending Enter while
+    it verifiably hasn't — and wait for Claude Code to return the stashed
+    draft.
 
     :param bridge_dir: Bridge directory path (hosts the paste temp file).
     :param socket_path: Absolute path to the tmux socket.
@@ -5063,11 +5138,13 @@ def _paste_and_submit(
     :param text: Exact text to paste (already escaped as needed).
     :param needle: Draft marker from :func:`_submit_needle`; empty skips
         draft-visibility verification (blind submit).
+    :param guard: This delivery's record of the person's draft it stashed.
     :returns: None.
     :raises ClaudeUserPromptPending: If a question or permission prompt is
         pending before the submit Enter; the message was not sent.
-    :raises ClaudeComposerNotCleared: If a draft left in the input box could
-        not be cleared first; the message was not sent.
+    :raises ClaudeComposerNotCleared: If the input box could not be emptied
+        first (:class:`ClaudeComposerHoldsDraft` for a draft that could not be
+        stashed); the message was not sent.
     :raises RuntimeError: If a ``tmux`` invocation fails, if the draft
         never leaves the input box after repeated submit Enters, or if a
         prompt appears after the submit Enter.
@@ -5093,9 +5170,9 @@ def _paste_and_submit(
         payload += b"\r"
     tail_needle = _submit_tail_needle(text) if needle else ""
     delivery_diagnostics.set_stage("pasting")
-    # Clear stale text first, or the paste lands inside the person's draft and
-    # Enter submits both together.
-    _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
+    # Empty the box first, or the paste lands inside the person's draft and
+    # Enter submits both together. The draft itself is stashed, not erased.
+    _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir, guard=guard)
     transcript_before_paste = _capture_pane(socket_path, tmux_target)
     draft_seen, pane, polls, empty_captures, paste_wait_started = _paste_and_await_draft(
         bridge_dir,
@@ -5125,7 +5202,7 @@ def _paste_and_submit(
             bridge_dir=bridge_dir,
             extend_for_slow_boot=False,
         )
-        _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
+        _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir, guard=guard)
         draft_seen, pane, polls, empty_captures, paste_wait_started = _paste_and_await_draft(
             bridge_dir,
             socket_path,
@@ -5164,6 +5241,7 @@ def _paste_and_submit(
         delivery_diagnostics.record_details(verification="unverified")
         # The draft was never observed, so its absence proves nothing —
         # verification would trivially "pass". Submit blind as before.
+        _await_draft_restored(socket_path, tmux_target, guard=guard)
         return
     # Verify the submit took: a successful Enter clears the input box.
     # If the draft is still sitting there the Enter was swallowed into
@@ -5182,6 +5260,7 @@ def _paste_and_submit(
             bridge_dir=bridge_dir,
             submit_boundary=submit_boundary,
             submitted_text=text,
+            stash_pending=guard.stashed,
         )
     except ClaudeUserPromptPending as exc:
         # The Enter already went out, so the prompt may belong to this message's own turn.
@@ -5190,6 +5269,7 @@ def _paste_and_submit(
             "it may already have been delivered."
         ) from exc
     if accepted:
+        _await_draft_restored(socket_path, tmux_target, guard=guard)
         return
     raise ClaudeMessageNotAccepted(
         f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
@@ -5276,6 +5356,7 @@ def _verify_submit_accepted(
     bridge_dir: Path | None = None,
     submit_boundary: SubmitBoundary | None = None,
     submitted_text: str | None = None,
+    stash_pending: bool = False,
 ) -> bool:
     """
     Wait for a submitted draft to leave the input box, re-sending Enter.
@@ -5298,6 +5379,8 @@ def _verify_submit_accepted(
     :param bridge_dir: Bridge whose pending questions protect submit retries.
     :param submit_boundary: Native transcript boundary captured before Enter.
     :param submitted_text: Full submitted text; a marker alone cannot identify a refusal.
+    :param stash_pending: Whether the person's draft was stashed for this submit.
+        Once Claude Code returns it, the box may hold it, so no Enter follows.
     :returns: ``True`` when the draft left the input box (accepted),
         ``False`` when it is still there after the full window.
     :raises ClaudeSubmitBlockedUnconfirmed: A fresh matching refusal appeared;
@@ -5369,6 +5452,9 @@ def _verify_submit_accepted(
                 _SUBMIT_VERIFY_TIMEOUT_S,
             )
         if now - last_enter >= retry_interval:
+            if stash_pending and not _stash_marker_shown(pane):
+                # The returned draft may be what the box holds; Enter would send it.
+                continue
             _raise_if_user_prompt_pending(bridge_dir, pane)
             _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
             retries += 1
@@ -5693,6 +5779,48 @@ def inject_slash_command(
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
+    _wait_for_typing_pause(socket_path, tmux_target)
+    guard = _DraftGuard()
+    try:
+        _deliver_slash_command(
+            bridge_dir,
+            socket_path,
+            tmux_target,
+            command=command,
+            timeout_s=timeout_s,
+            ready_timeout_s=ready_timeout_s,
+            dialog_hint=dialog_hint,
+            guard=guard,
+        )
+    except BaseException:
+        _put_draft_back(socket_path, tmux_target, guard=guard, needle=_submit_needle(command))
+        raise
+    _await_draft_restored(socket_path, tmux_target, guard=guard)
+
+
+def _deliver_slash_command(
+    bridge_dir: Path,
+    socket_path: str,
+    tmux_target: str,
+    *,
+    command: str,
+    timeout_s: float,
+    ready_timeout_s: float | None,
+    dialog_hint: str | None,
+    guard: _DraftGuard,
+) -> None:
+    """
+    Type and submit *command*, as :func:`inject_slash_command` describes.
+
+    :param bridge_dir: Bridge directory path.
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param command: The validated slash command, e.g. ``"/effort high"``.
+    :param timeout_s: Base budget for the input box to render.
+    :param ready_timeout_s: Hard cap on that wait, or ``None``.
+    :param dialog_hint: Title of the confirmation dialog to accept, or ``None``.
+    :param guard: This delivery's record of the person's draft it stashed.
+    """
     # Same reclaim-then-wait as inject_user_message: a surface left occupying
     # the composer would swallow the clearing keys and command, and a TUI that
     # has not mounted its input box yet would drop them.
@@ -5702,17 +5830,18 @@ def inject_slash_command(
         tmux_target,
         timeout_s=timeout_s,
         ready_timeout_s=ready_timeout_s,
+        guard=guard,
     )
     if has_pending_user_prompt(bridge_dir):
         raise ClaudeUserPromptPending(
             "Answer the pending Claude question or permission request before changing settings.",
             nothing_typed=True,
         )
-    # Clear any draft the user is mid-typing; otherwise the command below
+    # Stash any draft the person is mid-typing; otherwise the command below
     # concatenates with their text and Enter submits
     # ``<their-draft>/effort high`` as a turn. Unlike Escape it does
     # not interrupt an in-flight generation.
-    _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
+    _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir, guard=guard)
     # ``-l`` pastes ``/`` and spaces literally; trailing Enter submits.
     _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, command)
     # Same delivery hazards as inject_user_message: a coalesced or dropped
@@ -5744,6 +5873,7 @@ def inject_slash_command(
             needle=needle,
             what="slash command",
             bridge_dir=bridge_dir,
+            stash_pending=guard.stashed,
         ):
             raise RuntimeError(
                 f"Claude Code did not accept the slash command within "
@@ -5774,9 +5904,10 @@ def _confirm_tui_dialog(
 
     On timeout the Enter is still sent, so a dialog whose title drifted in a
     Claude Code release does not sit open forever wedging the pane. It is
-    withheld when a question or permission request is pending, or the pane
+    withheld when a question or permission request is pending, when the pane
     shows a :data:`_FOREIGN_DIALOG_HINTS` surface, whose default answer would
-    commit something unasked-for.
+    commit something unasked-for, or when the input box holds a draft the
+    Enter would send.
 
     The same load that renders the dialog late can also swallow the confirm
     Enter outright (the TUI drops keystrokes mid-repaint), so a matched-hint
@@ -5819,6 +5950,14 @@ def _confirm_tui_dialog(
         raise ClaudeUserPromptPending(
             "Claude is waiting for an explicit answer; settings dialog not confirmed."
         )
+    if _composer_holds_draft(socket_path, tmux_target, pane):
+        # Claude Code returned the person's stashed draft; an Enter would send it.
+        _logger.warning(
+            "claude-native: %r never rendered and the input box holds a draft; "
+            "withholding the confirm Enter",
+            hint,
+        )
+        return False
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     return False
 
@@ -6918,6 +7057,40 @@ def input_box_reads_clear(bridge_dir: Path, *, repaint: bool = False) -> bool:
     return False
 
 
+def input_box_takes_delivery(
+    bridge_dir: Path, *, stash_in_use: bool, repaint: bool = False
+) -> bool:
+    """
+    Report whether a delivery held for the person's unsent draft can go, without input.
+
+    It can once the box holds no draft or, when the hold was only for a stash
+    already in use, once that stash is free. Output another process printed
+    over the box reads as a draft until Claude Code repaints, so *repaint*
+    asks for one when the delivery cannot go yet.
+
+    :param bridge_dir: The session's native bridge directory.
+    :param stash_in_use: Whether the hold was for Claude Code's stash being in use.
+    :param repaint: Whether to ask Claude Code to repaint the box.
+    :returns: ``True`` when the delivery can go; ``False`` otherwise or when
+        the pane is not advertised.
+    """
+    info = _read_json_file(bridge_dir / _TMUX_FILE)
+    if not isinstance(info, dict):
+        return False
+    socket_path, target = info.get("socket_path"), info.get("tmux_target")
+    if not isinstance(socket_path, str) or not isinstance(target, str):
+        return False
+    pane = _capture_pane(socket_path, target)
+    if _composer_box(pane) is not None:
+        if not _composer_holds_draft(socket_path, target, pane):
+            return True
+        if stash_in_use and not _stash_marker_shown(pane):
+            return True
+    if repaint:
+        _request_claude_repaint(socket_path, target, bridge_dir)
+    return False
+
+
 def terminal_dialog_pending(bridge_dir: Path) -> bool:
     """
     Check whether a dialog only the terminal shows still holds Claude Code.
@@ -7071,6 +7244,7 @@ def _restore_occupied_input(
     *,
     bridge_dir: Path | None = None,
     timeout_s: float | None = None,
+    guard: _DraftGuard | None = None,
 ) -> str | None:
     """
     Dismiss a terminal-opened surface occupying Claude's input box.
@@ -7089,10 +7263,10 @@ def _restore_occupied_input(
     cancel"), which commits nothing and hands the empty input box back, so
     the web-UI message wins the pane. The exception is a shell-mode box
     holding a typed command, which Escape leaves in shell mode: that command
-    is cleared from the box instead (see :func:`_shell_mode_draft`), the way
-    an unsent chat draft is cleared before a paste. So is a draft taller than
-    the pane, which scrolls the box's glyph row out of view
-    (:func:`_scrolled_draft_rows`).
+    is stashed instead (see :func:`_shell_mode_draft` and
+    :func:`_set_draft_aside`), mode included, the way an unsent chat draft is
+    before a paste. So is a draft taller than the pane, which scrolls the
+    box's glyph row out of view (:func:`_scrolled_draft_rows`).
 
     The detailed transcript view uses Ctrl+O instead of Escape. Toggle it
     once after two matching captures; repeating it could reopen the view.
@@ -7130,11 +7304,13 @@ def _restore_occupied_input(
     :param bridge_dir: Bridge whose live permission hooks protect the native prompt.
     :param timeout_s: Seconds to keep dismissing, e.g. ``1.5``. ``None`` uses
         :data:`_OCCUPIED_INPUT_DISMISS_TIMEOUT_S`.
+    :param guard: The delivery's record of the person's draft it stashed.
     :returns: ``None`` once the input box is free (or the capture is torn);
         otherwise the :func:`_occupying_surface` description of what is
         still on screen, for the caller to refuse to type into.
     """
     dismiss_timeout_s = _OCCUPIED_INPUT_DISMISS_TIMEOUT_S if timeout_s is None else timeout_s
+    guard = _DraftGuard() if guard is None else guard
     deadline = time.monotonic() + dismiss_timeout_s
     last_escape: float | None = None
     confirmed = False
@@ -7208,18 +7384,19 @@ def _restore_occupied_input(
             if unclearable_seen:
                 return surface
         elif surface == _SCROLLED_DRAFT_SURFACE:
-            # Deleting lines shrinks the box until its glyph row is back on
-            # screen; the keys only edit the draft, so they need no spacing.
-            _logger.info("claude-native: clearing a draft taller than the terminal")
-            delivery_diagnostics.record_restore_action("scrolled_draft_clear")
-            _send_composer_clear_keys(socket_path, tmux_target, rows=len(pane.splitlines()))
+            # Stashing empties the box, so its glyph row is back on screen. The
+            # stash marker is off screen above such a box, so a draft stashed
+            # earlier cannot be seen here, and the stash would replace it.
+            _logger.info("claude-native: stashing a draft taller than the terminal")
+            delivery_diagnostics.record_restore_action("scrolled_draft_stash")
+            _set_draft_aside(socket_path, tmux_target, bridge_dir=bridge_dir, guard=guard)
         elif last_escape is None or now - last_escape >= _OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S:
             if surface == _SHELL_MODE_SURFACE and _shell_mode_draft(pane):
-                # Escape keeps a typed shell command in shell mode, so the
-                # command is cleared instead, as a chat draft is before a paste.
-                _logger.info("claude-native: clearing a shell-mode draft from the input box")
-                delivery_diagnostics.record_restore_action("shell_clear")
-                _send_composer_clear_keys(socket_path, tmux_target, rows=len(pane.splitlines()))
+                # Escape keeps a typed shell command in shell mode. The stash
+                # keeps the command and its mode and returns the box to chat.
+                _logger.info("claude-native: stashing a shell-mode draft in the input box")
+                delivery_diagnostics.record_restore_action("shell_stash")
+                _set_draft_aside(socket_path, tmux_target, bridge_dir=bridge_dir, guard=guard)
             else:
                 _logger.info("claude-native: dismissing %s covering the input box", surface)
                 delivery_diagnostics.record_restore_action("escape")
@@ -7476,9 +7653,356 @@ def _scrolled_draft_rows(lines: list[str], rules: list[int]) -> list[str] | None
     return rows
 
 
-def _clear_composer(socket_path: str, tmux_target: str, *, bridge_dir: Path) -> None:
+@dataclass
+class _DraftGuard:
+    """Whether one delivery has stashed the person's draft, so it must come back."""
+
+    stashed: bool = False
+
+
+def _wait_for_typing_pause(socket_path: str, tmux_target: str) -> None:
     """
-    Delete the whole draft in Claude Code's input box.
+    Wait for the person to pause typing in the pane before a delivery takes the box.
+
+    A key typed while a delivery holds the input box lands in the delivered
+    text, so delivery waits for a :data:`_TYPING_PAUSE_S` pause, at most
+    :data:`_TYPING_PAUSE_MAX_WAIT_S`, then goes ahead.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    """
+    deadline = time.monotonic() + _TYPING_PAUSE_MAX_WAIT_S
+    while (typed_at := last_human_input_at(socket_path, tmux_target)) is not None:
+        paused_s = time.time() - typed_at
+        if paused_s >= _TYPING_PAUSE_S:
+            return
+        if time.monotonic() >= deadline:
+            _logger.info("claude-native: the person kept typing; delivering anyway")
+            return
+        _check_injection_cancelled()
+        time.sleep(min(_TYPING_PAUSE_S - paused_s, _CLAUDE_READY_POLL_INTERVAL_S))
+
+
+def _stash_marker_shown(pane: str) -> bool:
+    """
+    Return whether Claude Code shows that a stashed draft is waiting.
+
+    Only the indicator rows above the input box's opening rule are read, so
+    transcript text that quotes the marker does not count.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: ``True`` while the marker is shown.
+    """
+    lines = pane.replace("\xa0", " ").splitlines()
+    rules = _composer_frame_rule_indices(lines)
+    if not rules:
+        return False
+    opening = rules[-2] if len(rules) >= 2 else rules[-1]
+    indicator_rows = lines[max(0, opening - _STASH_MARKER_ROWS) : opening]
+    return any(_STASH_MARKER_RE.search(line) for line in indicator_rows)
+
+
+def _capture_pane_styled(socket_path: str, tmux_target: str) -> str:
+    """
+    Capture the pane with its text attributes (``capture-pane -e``).
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :returns: The styled capture, or ``""`` if capture failed.
+    """
+    import subprocess
+
+    _check_injection_cancelled()
+    try:
+        proc = subprocess.run(
+            ["tmux", "-S", socket_path, "capture-pane", "-e", "-p", "-t", tmux_target],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_TMUX_SEND_TIMEOUT_S,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return ""
+    return proc.stdout if proc.returncode == 0 else ""
+
+
+def _styled_cells(line: str) -> list[tuple[str, bool, bool]]:
+    """
+    Split a styled capture line into ``(character, faint, inverse)`` cells.
+
+    :param line: One line of a ``capture-pane -e`` capture.
+    :returns: The line's characters with the SGR faint and inverse state each had.
+    """
+    line = _NON_SGR_ESCAPE_RE.sub("", line)
+    cells: list[tuple[str, bool, bool]] = []
+    faint = inverse = False
+    position = 0
+    for match in _SGR_RE.finditer(line):
+        cells.extend((character, faint, inverse) for character in line[position : match.start()])
+        codes = match.group(1).replace(":", ";").split(";")
+        index = 0
+        while index < len(codes):
+            code = codes[index]
+            if code in ("", "0"):
+                faint = inverse = False
+            elif code == "2":
+                faint = True
+            elif code == "22":
+                faint = False
+            elif code == "7":
+                inverse = True
+            elif code == "27":
+                inverse = False
+            elif code in ("38", "48", "58"):
+                # Extended colours carry their own numbers: 5;n or 2;r;g;b.
+                index += 2 if index + 1 < len(codes) and codes[index + 1] == "5" else 4
+            index += 1
+        position = match.end()
+    cells.extend((character, faint, inverse) for character in line[position:])
+    return cells
+
+
+def _styled_box_has_typed_text(styled: str, rows: Sequence[str]) -> bool:
+    """
+    Return whether a styled capture draws any input-box text at full intensity.
+
+    Claude Code draws hints in an empty box faint, behind its inverse cursor
+    cell, so that cell does not count when faint text follows it.
+
+    :param styled: A ``capture-pane -e`` capture.
+    :param rows: The box rows :func:`_composer_box` read from the plain capture.
+    :returns: ``True`` when the box shows typed text, and when the rows cannot
+        be found in *styled*.
+    """
+    lines = styled.splitlines()
+    plain = [_SGR_RE.sub("", _NON_SGR_ESCAPE_RE.sub("", line)).rstrip() for line in lines]
+    first_row = rows[0].rstrip()
+    first = next(
+        (index for index in range(len(plain) - 1, -1, -1) if plain[index] == first_row), None
+    )
+    if first is None:
+        return True
+    for offset, line in enumerate(lines[first : first + len(rows)]):
+        cells = _styled_cells(line)
+        if offset == 0:
+            glyph = next(
+                (index for index, cell in enumerate(cells) if cell[0] in _COMPOSER_MODE_GLYPHS),
+                None,
+            )
+            cells = cells[glyph + 1 :] if glyph is not None else cells
+        for index, (character, faint, inverse) in enumerate(cells):
+            if not character.strip() or faint:
+                continue
+            hint_follows = index + 1 < len(cells) and cells[index + 1][1]
+            if inverse and hint_follows:
+                continue
+            return True
+    return False
+
+
+def _composer_holds_draft(socket_path: str, tmux_target: str, pane: str) -> bool:
+    """
+    Return whether Claude Code's input box shows text the person typed.
+
+    An empty box can show a faint hint, such as the queued-message hint or a
+    prompt suggestion. A hint is not a draft: the stash key ignores it and a
+    paste replaces it. A styled capture tells the two apart; when there is
+    none, any text counts as a draft.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: ``True`` when the box holds a draft.
+    """
+    box = _composer_box(pane)
+    if box is None:
+        return False
+    rows = [box.rows[0].strip()[1:], *box.rows[1:]]
+    text = [row.strip() for row in rows if row.strip()]
+    if not text or text == [_QUEUED_MESSAGE_HINT]:
+        return False
+    styled = _capture_pane_styled(socket_path, tmux_target)
+    return _styled_box_has_typed_text(styled, box.rows) if styled else True
+
+
+def _set_draft_aside(
+    socket_path: str, tmux_target: str, *, bridge_dir: Path | None, guard: _DraftGuard
+) -> None:
+    """
+    Stash the person's unsent draft before a delivery types into the input box.
+
+    Clearing the box would erase what the person is writing. Claude Code's own
+    stash keeps the draft whole (every line, collapsed pastes, shell mode) and
+    returns it after the next submit. It has one slot, which is never
+    overwritten: a draft beside an already-stashed one stays in the box, and
+    the delivery is refused.
+
+    Text the stash key leaves in place can be another process's output
+    printed over the box rather than a draft, so the box is repainted once
+    before such text refuses the delivery as a draft that could not be
+    stashed.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param bridge_dir: Bridge directory of the Claude session in the pane, for
+        the repaint request, or ``None``.
+    :param guard: The delivery's record of the draft it stashed.
+    :raises ClaudeComposerHoldsDraft: If the draft could not be stashed;
+        nothing was typed.
+    """
+    pane = _capture_pane(socket_path, tmux_target)
+    if not _composer_holds_draft(socket_path, tmux_target, pane):
+        return
+    if guard.stashed or _stash_marker_shown(pane):
+        _record_held_draft(pane)
+        raise ClaudeComposerHoldsDraft(
+            "Claude Code's input box holds an unsent draft and its stash already holds "
+            "another one, so nothing was sent.",
+            stash_in_use=True,
+        )
+    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, _COMPOSER_STASH_KEY)
+    stashed = _await_draft_stashed(socket_path, tmux_target)
+    if stashed is None and _request_claude_repaint(socket_path, tmux_target, bridge_dir):
+        delivery_diagnostics.record_details(composer_repaint_requested=True)
+        stashed = _await_draft_stashed(socket_path, tmux_target)
+    if stashed is None:
+        _record_held_draft(_capture_pane(socket_path, tmux_target))
+        raise ClaudeComposerHoldsDraft(
+            "Claude Code's input box holds text it did not stash, so nothing was sent.",
+            stash_in_use=False,
+        )
+    if stashed:
+        guard.stashed = True
+        delivery_diagnostics.record_details(draft_stashed=True)
+        _logger.info("claude-native: stashed the person's unsent draft for a delivery")
+
+
+def _record_held_draft(pane: str) -> None:
+    """Record the shape of a box whose draft refused a delivery, without its text."""
+    box = _composer_box(pane)
+    delivery_diagnostics.record_composer_not_cleared(
+        pane=pane,
+        rows=None if box is None else box.rows,
+        framed=box is not None and box.framed,
+        rule_count=sum(1 for line in pane.splitlines() if _is_box_rule(line)),
+    )
+
+
+def _await_draft_stashed(socket_path: str, tmux_target: str) -> bool | None:
+    """
+    Wait for the input box to stop showing a draft after the stash key.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :returns: ``True`` once the box is empty and the stash marker shows,
+        ``False`` when the box ends empty without the marker (nothing was left
+        to stash), or ``None`` when the box still shows a draft.
+    """
+    deadline = time.monotonic() + _STASH_SETTLE_S
+    emptied = False
+    while time.monotonic() < deadline:
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+        pane = _capture_pane(socket_path, tmux_target)
+        if _composer_box(pane) is None or _composer_holds_draft(socket_path, tmux_target, pane):
+            emptied = False
+            continue
+        if _stash_marker_shown(pane):
+            return True
+        emptied = True
+    return False if emptied else None
+
+
+@contextlib.contextmanager
+def _ignoring_injection_cancellation() -> Iterator[None]:
+    """Let the person's draft be returned after the delivery itself was cancelled."""
+    token = _INJECTION_CANCEL_EVENT.set(None)
+    try:
+        yield
+    finally:
+        _INJECTION_CANCEL_EVENT.reset(token)
+
+
+def _put_draft_back(
+    socket_path: str, tmux_target: str, *, guard: _DraftGuard, needle: str
+) -> None:
+    """
+    Return a draft the delivery stashed to the input box when the delivery stops short.
+
+    Text in the box is deleted first only while the stash still holds the
+    person's draft and the box shows the delivered text, so nothing of theirs
+    is deleted. Best effort: Ctrl+S in the terminal also returns a stashed draft.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param guard: The delivery's record of the draft it stashed.
+    :param needle: Marker of the delivered text from :func:`_submit_needle`.
+    """
+    if not guard.stashed:
+        return
+    try:
+        with _ignoring_injection_cancellation():
+            pane = _capture_pane(socket_path, tmux_target)
+            if not _stash_marker_shown(pane):
+                guard.stashed = False
+                return
+            box = _composer_box(pane)
+            if box is not None and needle and _draft_in_input_box(pane, needle):
+                _send_composer_clear_keys(socket_path, tmux_target, rows=len(box.rows))
+                time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+                pane = _capture_pane(socket_path, tmux_target)
+            if _stash_marker_shown(pane) and not _composer_holds_draft(
+                socket_path, tmux_target, pane
+            ):
+                _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, _COMPOSER_STASH_KEY)
+                guard.stashed = False
+    except RuntimeError:
+        _logger.warning(
+            "claude-native: could not return the person's stashed draft to the input box",
+            exc_info=True,
+        )
+
+
+def _await_draft_restored(socket_path: str, tmux_target: str, *, guard: _DraftGuard) -> None:
+    """
+    Wait for Claude Code to return a draft the delivery stashed, after its submit.
+
+    Claude Code returns the draft itself once the submitted input leaves the
+    box. A draft it leaves stashed beside an empty box is returned with the
+    stash key.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param guard: The delivery's record of the draft it stashed.
+    """
+    if not guard.stashed:
+        return
+    deadline = time.monotonic() + _STASH_RESTORE_TIMEOUT_S
+    pane = ""
+    while time.monotonic() < deadline:
+        pane = _capture_pane(socket_path, tmux_target)
+        if _composer_box(pane) is not None and not _stash_marker_shown(pane):
+            guard.stashed = False
+            return
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+    if _stash_marker_shown(pane) and not _composer_holds_draft(socket_path, tmux_target, pane):
+        _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, _COMPOSER_STASH_KEY)
+        guard.stashed = False
+        return
+    _logger.warning(
+        "claude-native: the person's draft is still stashed; Ctrl+S in the terminal returns it"
+    )
+
+
+def _clear_composer(
+    socket_path: str, tmux_target: str, *, bridge_dir: Path, guard: _DraftGuard
+) -> None:
+    """
+    Empty Claude Code's input box for a delivery, stashing the person's draft first.
+
+    A draft the person left in the box is set aside with Claude Code's stash
+    (:func:`_set_draft_aside`), which returns it after the next submit. The
+    clearing keys below then delete only what is not the person's: a dim hint,
+    a stray space, or text this delivery typed.
 
     Ctrl+K deletes to the end of the line and, at the end of a line, the
     line break after it; Ctrl+U does the same towards the start. Two of each
@@ -7510,10 +8034,15 @@ def _clear_composer(socket_path: str, tmux_target: str, *, bridge_dir: Path) -> 
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :param bridge_dir: Bridge directory of the Claude session in the pane.
+    :param guard: The delivery's record of the person's draft it stashed.
+    :raises ClaudeComposerHoldsDraft: If the person's draft could not be
+        stashed; nothing was typed.
     :raises ClaudeComposerNotCleared: If the rounds ran out before a readable
         capture showed the box whole and down to one row; nothing was pasted.
     :raises RuntimeError: If a ``tmux`` invocation fails.
     """
+    # Before any key: the Space and the clearing keys would edit the draft.
+    _set_draft_aside(socket_path, tmux_target, bridge_dir=bridge_dir, guard=guard)
     # Space returns focus from the footer to the input box. The clear also
     # removes the space when the input box already held focus.
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Space")
@@ -7541,6 +8070,10 @@ def _clear_composer(socket_path: str, tmux_target: str, *, bridge_dir: Path) -> 
                 "Open the terminal, expand it and clear the input box, then retry."
             )
         if box is not None:
+            if _composer_holds_draft(socket_path, tmux_target, pane):
+                # A draft the first capture could not read, such as under a repaint.
+                _set_draft_aside(socket_path, tmux_target, bridge_dir=bridge_dir, guard=guard)
+                continue
             _send_composer_clear_keys(socket_path, tmux_target, rows=len(box.rows))
             if settled:
                 return
@@ -8195,6 +8728,7 @@ def _reclaim_and_wait_for_prompt(
     *,
     timeout_s: float,
     ready_timeout_s: float | None,
+    guard: _DraftGuard | None = None,
 ) -> None:
     """
     Clear anything occupying Claude's input box, then wait for its prompt.
@@ -8223,6 +8757,8 @@ def _reclaim_and_wait_for_prompt(
         the caller's cancellation flag is the strict deadline. ``None`` waits
         like a message delivery: *timeout_s* as the base budget, extended
         while a live pane is still booting.
+    :param guard: The delivery's record of the person's draft it stashed, or
+        ``None`` when no delivery follows in the same call.
     :returns: None.
     :raises ClaudeInputBoxOccupied: If shell mode or the prompt-history search
         still holds the input box after the restore; no keystroke was sent.
@@ -8236,6 +8772,7 @@ def _reclaim_and_wait_for_prompt(
         socket_path,
         tmux_target,
         bridge_dir=bridge_dir,
+        guard=guard,
         # At least two polls, so a surface is confirmed before it is refused.
         timeout_s=(
             None

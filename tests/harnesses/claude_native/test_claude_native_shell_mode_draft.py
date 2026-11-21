@@ -3,9 +3,10 @@ A shell-mode draft left in Claude Code's input box no longer blocks web input.
 
 Claude Code takes its input box back from ``!`` shell mode on Escape only while
 the shell draft is empty; a typed command keeps the box in shell mode. The
-bridge clears such a command with Ctrl+U, which Claude Code applies to the line
-and then, at the start of the line, to the mode. The fake input box below
-reproduces that behaviour, including multi-line edits, of Claude Code 2.1.310.
+bridge stashes such a command with Claude Code's own stash (Ctrl+S), which sets
+it aside with its mode, empties the box in chat mode, and returns the command
+after the next submit. The fake input box below reproduces that behaviour,
+including multi-line edits, of Claude Code 2.1.310 and the stash of 2.1.325.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from omnigent.harnesses.claude_native.bridge import (
 _RULE = "──────────────────────────────"
 _CTRL_U = "\x1b[117;5u"
 _CTRL_K = "\x1b[107;5u"
+_CTRL_S = "\x1b[115;5u"
 
 
 class _InputBox:
@@ -45,6 +47,8 @@ class _InputBox:
         self.cursor = len(draft) if cursor is None else cursor
         self.swallowed_enters = swallowed_enters
         self.submitted: list[tuple[str, str]] = []
+        # Claude Code's one stash slot: (mode, draft, cursor) set aside by Ctrl+S.
+        self.stash: tuple[str, str, int] | None = None
 
     def paste(self, content: str) -> None:
         # A leading "!" in an empty chat box switches it to shell mode instead of being typed.
@@ -58,7 +62,8 @@ class _InputBox:
         footer = "  ! for shell mode" if self.mode == "bash" else "  ? for shortcuts"
         first, *rest = self.draft.split("\n")
         rows = [f"{glyph} {first}", *(f"  {row}" for row in rest)]
-        return "\n".join([_RULE, *rows, _RULE, footer]) + "\n"
+        marker = ["                    \u203a stashed"] if self.stash else []
+        return "\n".join([*marker, _RULE, *rows, _RULE, footer]) + "\n"
 
     def key(self, key: str) -> None:
         if key in (_CTRL_U, "C-u"):
@@ -77,6 +82,14 @@ class _InputBox:
             if end == self.cursor and end < len(self.draft):
                 end += 1
             self.draft = self.draft[: self.cursor] + self.draft[end:]
+        elif key == _CTRL_S:
+            # Stashes a draft, mode included; on an empty box it returns the stash.
+            if self.draft.strip():
+                self.stash = (self.mode, self.draft, self.cursor)
+                self.mode, self.draft, self.cursor = "prompt", "", 0
+            elif self.stash is not None:
+                self.mode, self.draft, self.cursor = self.stash
+                self.stash = None
         elif key == "Escape":
             # Shell mode ends only with the cursor at the start of an empty draft.
             if self.mode == "bash" and not self.draft:
@@ -94,6 +107,10 @@ class _InputBox:
             self.submitted.append((self.mode, self.draft.strip()))
             self.draft = ""
             self.cursor = 0
+            if self.stash is not None:
+                # Claude Code returns a stashed draft after the submit.
+                self.mode, self.draft, self.cursor = self.stash
+                self.stash = None
 
 
 def _patch_tmux(
@@ -139,14 +156,14 @@ def _keys(calls: list[list[str]]) -> list[str]:
     return [cmd[-1] for cmd in calls if "send-keys" in cmd]
 
 
-def test_a_shell_mode_draft_is_cleared_and_the_message_delivered(
+def test_a_shell_mode_draft_is_stashed_and_the_message_delivered(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    A typed shell command is cleared, never run, and the message is sent.
+    A typed shell command is set aside, never run, and returned after the message.
 
-    On main the message was refused ("occupied by shell mode") after two
-    Escapes the shell draft ignores.
+    Escape cannot take the box back from such a command, and clearing it would
+    erase what the person typed.
     """
     box = _InputBox("bash", "git status --short")
     bridge_dir, calls = _patch_tmux(monkeypatch, tmp_path, box, content="hello from the web")
@@ -156,6 +173,7 @@ def test_a_shell_mode_draft_is_cleared_and_the_message_delivered(
     keys = _keys(calls)
     assert "Escape" not in keys, f"Escape cannot clear a shell draft; sent {keys}."
     assert box.submitted == [("prompt", "hello from the web")]
+    assert (box.mode, box.draft) == ("bash", "git status --short")
 
 
 def test_an_empty_shell_mode_box_is_still_escaped(
@@ -175,19 +193,21 @@ def test_an_empty_shell_mode_box_is_still_escaped(
 
 @pytest.mark.parametrize("draft", ["one\ntwo\nthree", "\none\ntwo"])
 @pytest.mark.parametrize("cursor", [0, 6, None], ids=["start", "middle", "end"])
-def test_a_multiline_shell_draft_is_cleared_before_web_input(
+def test_a_multiline_shell_draft_is_stashed_around_web_input(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, draft: str, cursor: int | None
 ) -> None:
-    """Line edits reclaim shell drafts without executing any leftover command."""
+    """A multi-line shell draft is never executed, and comes back with its cursor."""
     box = _InputBox("bash", draft, cursor=cursor)
     bridge_dir, _calls = _patch_tmux(monkeypatch, tmp_path, box, content="hello from the web")
 
     inject_user_message(bridge_dir, content="hello from the web")
 
     assert box.submitted == [("prompt", "hello from the web")]
+    expected_cursor = len(draft) if cursor is None else cursor
+    assert (box.mode, box.draft, box.cursor) == ("bash", draft, expected_cursor)
 
 
-def test_a_settings_command_clears_a_shell_mode_draft_too(
+def test_a_settings_command_stashes_a_shell_mode_draft_too(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The ``/model`` and ``/effort`` path shares the reclaim, so it is not refused either."""
@@ -197,6 +217,7 @@ def test_a_settings_command_clears_a_shell_mode_draft_too(
     inject_slash_command(bridge_dir, command="/effort high")
 
     assert box.submitted == [("prompt", "/effort high")]
+    assert (box.mode, box.draft) == ("bash", "ls -la")
 
 
 @pytest.mark.parametrize(
