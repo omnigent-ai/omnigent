@@ -1,10 +1,17 @@
 import { QueryClient, QueryClientProvider, focusManager } from "@tanstack/react-query";
-import { act, cleanup, renderHook } from "@testing-library/react";
+import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, expect, it, vi } from "vitest";
 import { useArchivedSessions } from "./useScopeCache";
 
 const archivedKey = ["conversations", "", false, null, "archived"];
+const response = (title: string) =>
+  new Response(
+    JSON.stringify({
+      data: [{ id: "archived-session", title, created_at: 1, updated_at: 1, archived: true }],
+      has_more: false,
+    }),
+  );
 
 afterEach(() => {
   cleanup();
@@ -16,13 +23,6 @@ afterEach(() => {
 it("fetches on each entry while retaining cached rows and never polling", async () => {
   vi.useFakeTimers();
   const client = new QueryClient({ defaultOptions: { queries: { gcTime: Infinity } } });
-  const response = (title: string) =>
-    new Response(
-      JSON.stringify({
-        data: [{ id: "archived-session", title, created_at: 1, updated_at: 1, archived: true }],
-        has_more: false,
-      }),
-    );
   const fetch = vi.fn().mockImplementation(async () => response("Original title"));
   vi.stubGlobal("fetch", fetch);
   const { result, rerender } = renderHook(({ enabled }) => ({ ...useArchivedSessions(enabled) }), {
@@ -73,3 +73,29 @@ it("fetches on each entry while retaining cached rows and never polling", async 
   expect(fetch).toHaveBeenCalledTimes(2);
   client.clear();
 });
+
+it.each(["updated_at", "created_at"] as const)(
+  "replaces a pending %s first load when retried",
+  async (sortBy) => {
+    const client = new QueryClient({ defaultOptions: { queries: { gcTime: Infinity } } });
+    const fetch = vi
+      .fn()
+      .mockImplementationOnce(() => new Promise<Response>(() => {}))
+      .mockImplementation(async () => response("Recovered"));
+    vi.stubGlobal("fetch", fetch);
+    const { result } = renderHook(() => ({ ...useArchivedSessions(true, sortBy) }), {
+      wrapper: ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      ),
+    });
+    await waitFor(() => expect(fetch).toHaveBeenCalledOnce());
+    expect(result.current.isLoading).toBe(true);
+    act(() => {
+      void result.current.refetch();
+    });
+    await waitFor(() => expect(result.current.data?.pages[0].data[0].title).toBe("Recovered"));
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect((fetch.mock.calls[0][1] as RequestInit).signal?.aborted).toBe(true);
+    client.clear();
+  },
+);

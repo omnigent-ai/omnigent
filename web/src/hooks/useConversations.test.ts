@@ -432,6 +432,58 @@ describe("useConversations search timeout", () => {
   });
 });
 
+describe("list_sessions timing", () => {
+  it("hands a cancelled first load's timing to the load that replaces it", async () => {
+    vi.resetModules();
+    const [{ timeInitialConversationLoad }, { setOmnigentHostConfig }] = await Promise.all([
+      import("./useConversations"),
+      import("@/lib/host"),
+    ]);
+    const analytics = vi.fn();
+    setOmnigentHostConfig({ analytics });
+    try {
+      const abortError = () => new DOMException("aborted", "AbortError");
+      const fetchUntilAborted = (signal: AbortSignal) => () =>
+        new Promise<never>((_, reject) => {
+          if (signal.aborted) reject(abortError());
+          signal.addEventListener("abort", () => reject(abortError()), { once: true });
+        });
+      const alreadyAborted = AbortSignal.abort();
+      await expect(
+        timeInitialConversationLoad(
+          undefined,
+          "mine",
+          fetchUntilAborted(alreadyAborted),
+          alreadyAborted,
+        ),
+      ).rejects.toThrow("aborted");
+      const stalled = new AbortController();
+      const stalledLoad = timeInitialConversationLoad(
+        undefined,
+        "mine",
+        fetchUntilAborted(stalled.signal),
+        stalled.signal,
+      );
+      stalled.abort();
+      await expect(stalledLoad).rejects.toThrow("aborted");
+      const page = { data: [], first_id: null, last_id: null, has_more: false };
+      await timeInitialConversationLoad(undefined, "mine", async () => page);
+      await timeInitialConversationLoad(undefined, "mine", async () => page);
+
+      const outcomes = analytics.mock.calls
+        .map(([event]) => event as { interactionKind: string; phase: string; status?: string })
+        .filter((event) => event.phase === "complete")
+        .map((event) => [event.interactionKind, event.status]);
+      expect(outcomes).toEqual([
+        ["list_sessions", "cancelled"],
+        ["list_sessions", "success"],
+      ]);
+    } finally {
+      setOmnigentHostConfig({});
+    }
+  });
+});
+
 describe("useConversations stale cursor", () => {
   function page(body: unknown) {
     return mockResponse(body);
