@@ -1219,10 +1219,8 @@ def _load_session_state(
     return dict(conv.session_state)
 
 
-# Page size for walking a spawn tree when summing sub-agent usage: the root
-# row plus the sub-agents one bounded tree read covers, so nearly every tree
-# loads in one read. Every policy check of a session loads its tree, and a
-# store that cannot page a tree natively rebuilds the whole tree for each page.
+# Page size for summing a spawn tree's usage: the root plus the sub-agents one
+# bounded tree read covers, so nearly every policy check reads its tree once.
 # Bigger trees still page, so none is silently truncated.
 _SUBTREE_USAGE_PAGE_SIZE = SPAWN_TREE_READ_CAP + 1
 
