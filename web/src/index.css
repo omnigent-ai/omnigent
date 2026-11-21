@@ -1408,9 +1408,11 @@ html[data-electron-mac] .canvas-workspace {
   margin-top: var(--mac-titlebar-height);
 }
 /* Full-window views portal outside AppShell, so they clear the window's top
- * inset themselves: the macOS title bar, or a phone's status bar. */
+ * inset themselves: the macOS title bar, or a phone's status bar. Absolutely
+ * positioned controls offset by the variable, since padding doesn't move them. */
 [data-fullscreen-overlay] {
-  padding-top: var(--mac-titlebar-height, var(--omnigent-safe-top, 0px));
+  --fullscreen-overlay-inset-top: var(--mac-titlebar-height, var(--omnigent-safe-top, 0px));
+  padding-top: var(--fullscreen-overlay-inset-top);
 }
 /* The title-bar cluster below sits above the z-50 layer to clear the sidebar,
  * so it steps aside while a full-window view covers the app. */

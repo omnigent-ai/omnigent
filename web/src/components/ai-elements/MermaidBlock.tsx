@@ -64,7 +64,8 @@ function MermaidFullscreen({ blockRef }: { blockRef: RefObject<HTMLDivElement | 
           >
             <Button
               aria-label="Exit fullscreen"
-              className="absolute top-4 right-4"
+              className="absolute right-4"
+              style={{ top: "calc(var(--fullscreen-overlay-inset-top, 0px) + 1rem)" }}
               onClick={close}
               size="icon-sm"
               title="Exit fullscreen"
