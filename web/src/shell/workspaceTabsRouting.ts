@@ -2,7 +2,7 @@
 // tabs (`useTabsSidebar`). The tabs code loads on first use, so a deployment with the
 // flag off never downloads it.
 
-import { lazy } from "react";
+import { type ComponentType, lazy } from "react";
 import { toast } from "sonner";
 
 import type { AgentBrowserTabRequest } from "@/components/BrowserPane/agentTools/useRevealBrowserOnAgentTabs";
@@ -20,6 +20,29 @@ let workspaceTabsModule: Promise<WorkspaceTabsModule> | null = null;
 
 /** The tabs sidebar's host, loaded when it first shows. */
 export const LazyWorkspaceTabsHost = lazy(() => import("./workspaceTabs/WorkspaceTabsHost"));
+
+interface FileActionHostModule {
+  FileActionHost: ComponentType;
+}
+
+/**
+ * The file action host's module, or a host that does nothing when it can't load, such as after
+ * an update replaced it: only the file actions stop working, not the shell around them.
+ */
+export function loadFileActionHost(
+  load: () => Promise<FileActionHostModule> = () => import("./fileCommands/FileActionHost"),
+): Promise<{ default: ComponentType }> {
+  return load().then(
+    (module) => ({ default: module.FileActionHost }),
+    (error: unknown) => {
+      console.error("[file-actions] couldn't load the file action host:", error);
+      return { default: () => null };
+    },
+  );
+}
+
+/** Carries out the file actions the tabs sidebar's menus and ⌘K ask for; loaded with the sidebar. */
+export const LazyFileActionHost = lazy(() => loadFileActionHost());
 
 export { useTabsSidebar } from "./useTabsSidebar";
 

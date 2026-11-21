@@ -70,6 +70,14 @@ vi.mock("@/components/BrowserPane/agentTools/tabStore", async (importOriginal) =
 }));
 
 // A draft typed into the host stands for its editors' unsaved text, which a remount loses.
+// The file action host has its own suite; these tests check that it mounts only with the flag.
+const fileActionHost = vi.hoisted(() => ({ throws: false }));
+vi.mock("./fileCommands/FileActionHost", () => ({
+  FileActionHost: () => {
+    if (fileActionHost.throws) throw new Error("file action host broke");
+    return <div data-testid="file-action-host" />;
+  },
+}));
 vi.mock("./workspaceTabs/WorkspaceTabsHost", () => ({
   default: (props: WorkspaceTabsHostProps) => {
     tabs.host = props;
@@ -375,6 +383,22 @@ describe("workspace_sidebar_v2", () => {
     expect(await screen.findByTestId("tabs-host")).toBeInTheDocument();
     expect(screen.queryByRole("tab", { name: /^Files$/ })).toBeNull();
     expect(tabs.host).toMatchObject({ conversationId: "conv_ws", terminals: [] });
+    // One file action host carries out what the sidebar's file menus and ⌘K ask for.
+    expect(await screen.findAllByTestId("file-action-host")).toHaveLength(1);
+  });
+
+  it("keeps the shell when the file action host throws", async () => {
+    fileActionHost.throws = true;
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      setViewport(DESKTOP);
+      renderShell(withFlag(true));
+      expect(await screen.findByTestId("tabs-host")).toBeInTheDocument();
+      expect(screen.queryByTestId("file-action-host")).toBeNull();
+      expect(screen.queryByText("Unable to display file actions.")).toBeNull();
+    } finally {
+      fileActionHost.throws = false;
+    }
   });
 
   it.each([
@@ -387,6 +411,7 @@ describe("workspace_sidebar_v2", () => {
 
     expect(screen.getByRole("tab", { name: /^Files$/ })).toBeInTheDocument();
     expect(screen.queryByTestId("tabs-host")).toBeNull();
+    expect(screen.queryByTestId("file-action-host")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Open linked PR" }));
     fireEvent.click(screen.getByRole("button", { name: "Open cited file" }));
     expectTabsUntouched();
