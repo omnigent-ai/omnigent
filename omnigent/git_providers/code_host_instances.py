@@ -261,20 +261,14 @@ def _instance(
     )
 
 
-def parse_code_host_instances(
+def _parse(
     text: str,
     *,
     known_capabilities: Iterable[str],
     host_path: str,
-    which: Callable[..., str | None] = shutil.which,
+    which: Callable[..., str | None],
 ) -> CodeHostInstances:
-    """Return the instances a config file's *text* declares.
-
-    :param known_capabilities: The capability names an instance may list.
-    :param host_path: The host's ``PATH``, where bare CLI names are looked up once.
-    :param which: Resolves a bare name on a ``PATH``; ``shutil.which`` by default.
-    :raises CodeHostInstanceError: When any rule is broken; no instance is returned.
-    """
+    """Return the instances the host file's *text* declares; private to the loader."""
     try:
         document = tomllib.loads(text)
     except tomllib.TOMLDecodeError:
@@ -314,18 +308,26 @@ def load_code_host_instances(
 ) -> CodeHostInstances:
     """Read the host's instance config at *path*, once, when the host starts.
 
-    A missing file declares no instances.
+    The only way to build instances from outside data: there is no path from a frame,
+    a request or other text, so only a file on the host can name a CLI. A missing
+    file declares no instances.
 
+    :param path: The host-local config file.
+    :param known_capabilities: The capability names an instance may list.
     :param host_environment: The host's environment; its ``PATH`` resolves bare names.
+    :param which: Resolves a bare name on a ``PATH``; ``shutil.which`` by default.
     :raises CodeHostInstanceError: When the file can't be read or breaks a rule.
+    :raises TypeError: When *path* isn't a :class:`~pathlib.Path`.
     """
+    if not isinstance(path, Path):
+        raise TypeError("code host instances load only from a host file path")
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return NO_INSTANCES
     except (OSError, UnicodeDecodeError):
         raise _refuse("the code host instance config is refused: it can't be read") from None
-    return parse_code_host_instances(
+    return _parse(
         text,
         known_capabilities=known_capabilities,
         host_path=host_environment.get("PATH", ""),

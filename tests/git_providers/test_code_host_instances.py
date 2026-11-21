@@ -2,20 +2,23 @@
 
 from __future__ import annotations
 
+import inspect
 import os
 import re
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
+import omnigent.git_providers.code_host_instances as code_host_instances
 from omnigent.git_providers.code_host_instances import (
     NO_INSTANCES,
+    CodeHostInstance,
     CodeHostInstanceError,
     CodeHostInstances,
     load_code_host_instances,
-    parse_code_host_instances,
 )
 from tests.budgets import budget
 
@@ -48,14 +51,25 @@ def _config(program: Path | str, **fields: str) -> str:
     return "[[instance]]\n" + "".join(f"{name} = {value}\n" for name, value in values.items())
 
 
-def _parse(text: str, **options: object) -> CodeHostInstances:
-    return parse_code_host_instances(
-        text, known_capabilities=KNOWN, host_path=options.pop("host_path", "/usr/bin"), **options
-    )
+Load = Callable[..., CodeHostInstances]
 
 
-def test_an_instance_loads_with_its_resolved_command_and_ceiling(cli: Path) -> None:
-    instances = _parse(_config(cli, env='["HOME"]', env_set='{ LANG = "C.UTF-8" }'))
+@pytest.fixture
+def load(tmp_path: Path) -> Load:
+    """Load TOML text the only way instances load: from a file on the host."""
+
+    def load_text(text: str, **options: object) -> CodeHostInstances:
+        path = tmp_path / "code_host_instances.toml"
+        path.write_text(text, encoding="utf-8")
+        return load_code_host_instances(
+            path, known_capabilities=KNOWN, host_environment={"PATH": "/usr/bin"}, **options
+        )
+
+    return load_text
+
+
+def test_an_instance_loads_with_its_resolved_command_and_ceiling(load: Load, cli: Path) -> None:
+    instances = load(_config(cli, env='["HOME"]', env_set='{ LANG = "C.UTF-8" }'))
 
     (instance,) = instances.instances
     assert instance.id == "internal"
@@ -68,8 +82,8 @@ def test_an_instance_loads_with_its_resolved_command_and_ceiling(cli: Path) -> N
     assert instance.capabilities == frozenset({"line_counts", "review_threads"})
 
 
-def test_instances_are_found_by_provider_and_host(cli: Path) -> None:
-    instances = _parse(_config(cli, hosts='["code.example.test", "mirror.example.test"]'))
+def test_instances_are_found_by_provider_and_host(load: Load, cli: Path) -> None:
+    instances = load(_config(cli, hosts='["code.example.test", "mirror.example.test"]'))
 
     assert instances.hosts_for("github") == {"code.example.test", "mirror.example.test"}
     assert instances.hosts_for("gitlab") == frozenset()
@@ -111,14 +125,16 @@ def test_a_file_is_read_with_the_hosts_path(tmp_path: Path, cli: Path) -> None:
     assert seen == [f"{cli.parent}:/usr/bin"]
 
 
-def test_a_bare_name_resolves_once_and_is_refused_once_it_disappears(cli: Path) -> None:
+def test_a_bare_name_resolves_once_and_is_refused_once_it_disappears(
+    load: Load, cli: Path
+) -> None:
     lookups: list[str] = []
 
     def which(name: str, *, path: str) -> str | None:
         lookups.append(name)
         return str(cli)
 
-    (instance,) = _parse(_config("example-cli"), which=which).instances
+    (instance,) = load(_config("example-cli"), which=which).instances
     assert instance.runnable_command() == [str(cli)]
     cli.unlink()
     replacement = cli.parent.parent / "example-cli"
@@ -135,8 +151,8 @@ def test_a_bare_name_resolves_once_and_is_refused_once_it_disappears(cli: Path) 
     assert lookups == ["example-cli"]
 
 
-def test_arguments_stay_literal_with_no_shell(cli: Path) -> None:
-    (instance,) = _parse(_config(cli, cli=f'["{cli}", "pr; touch /tmp/example"]')).instances
+def test_arguments_stay_literal_with_no_shell(load: Load, cli: Path) -> None:
+    (instance,) = load(_config(cli, cli=f'["{cli}", "pr; touch /tmp/example"]')).instances
 
     assert instance.runnable_command() == [str(cli), "pr; touch /tmp/example"]
 
@@ -168,17 +184,19 @@ def test_arguments_stay_literal_with_no_shell(cli: Path) -> None:
         ({"env": '["SERVICE_API_KEY"]'}, "secret-name rule"),
     ],
 )
-def test_a_broken_rule_refuses_the_file(cli: Path, fields: dict[str, str], rule: str) -> None:
+def test_a_broken_rule_refuses_the_file(
+    load: Load, cli: Path, fields: dict[str, str], rule: str
+) -> None:
     with pytest.raises(CodeHostInstanceError, match=re.escape(rule)):
-        _parse(_config(cli, **fields), which=lambda _name, path: None)
+        load(_config(cli, **fields), which=lambda _name, path: None)
 
 
-def test_one_broken_instance_refuses_every_instance(cli: Path) -> None:
+def test_one_broken_instance_refuses_every_instance(load: Load, cli: Path) -> None:
     good = _config(cli)
     broken = _config(cli, id='"second"', hosts='["other.example.test"]', auth='"token"')
 
     with pytest.raises(CodeHostInstanceError, match="instance second auth is refused"):
-        _parse(good + broken)
+        load(good + broken)
 
 
 @pytest.mark.parametrize(
@@ -189,10 +207,10 @@ def test_one_broken_instance_refuses_every_instance(cli: Path) -> None:
     ],
 )
 def test_instances_cannot_share_an_id_or_a_host(
-    cli: Path, second: dict[str, str], rule: str
+    load: Load, cli: Path, second: dict[str, str], rule: str
 ) -> None:
     with pytest.raises(CodeHostInstanceError, match=re.escape(rule)):
-        _parse(_config(cli) + _config(cli, **second))
+        load(_config(cli) + _config(cli, **second))
 
 
 @pytest.mark.parametrize(
@@ -203,9 +221,9 @@ def test_instances_cannot_share_an_id_or_a_host(
         ('instance = "x"\n', "use [[instance]] tables"),
     ],
 )
-def test_a_malformed_file_is_refused(text: str, rule: str) -> None:
+def test_a_malformed_file_is_refused(load: Load, text: str, rule: str) -> None:
     with pytest.raises(CodeHostInstanceError, match=re.escape(rule)):
-        _parse(text)
+        load(text)
 
 
 def test_an_unreadable_file_is_refused(tmp_path: Path) -> None:
@@ -218,7 +236,7 @@ def test_an_unreadable_file_is_refused(tmp_path: Path) -> None:
         )
 
 
-def test_refusals_never_repeat_a_configured_value(cli: Path) -> None:
+def test_refusals_never_repeat_a_configured_value(load: Load, cli: Path) -> None:
     secret_cli = f'["{cli}", "{SECRET_ARGUMENT}{"x" * 5000}"]'
     cases = [
         _config(cli, cli=secret_cli),
@@ -227,8 +245,41 @@ def test_refusals_never_repeat_a_configured_value(cli: Path) -> None:
     ]
     for text in cases:
         with pytest.raises(CodeHostInstanceError) as refused:
-            _parse(text)
+            load(text)
         assert SECRET_ARGUMENT not in str(refused.value)
+
+
+def test_the_host_file_loader_is_the_only_way_to_build_instances_from_outside_data(
+    cli: Path,
+) -> None:
+    """No ``from_dict``, JSON or text path exists that a frame or request could reach."""
+    module_functions = {
+        name
+        for name, value in vars(code_host_instances).items()
+        if not name.startswith("_")
+        and inspect.isfunction(value)
+        and value.__module__ == code_host_instances.__name__
+    }
+    alternate_builders = {
+        f"{record.__name__}.{name}"
+        for record in (CodeHostInstance, CodeHostInstances)
+        for name, value in vars(record).items()
+        if isinstance(value, (classmethod, staticmethod))
+    }
+    parameters = inspect.signature(load_code_host_instances).parameters
+
+    assert module_functions == {"load_code_host_instances"}
+    assert alternate_builders == set()
+    assert next(iter(parameters)) == "path"
+    assert [name for name, p in parameters.items() if p.kind is p.POSITIONAL_OR_KEYWORD] == [
+        "path"
+    ]
+    with pytest.raises(TypeError, match="only from a host file path"):
+        load_code_host_instances(
+            _config(cli),  # TOML text, as a frame might carry it
+            known_capabilities=KNOWN,
+            host_environment={"PATH": "/usr/bin"},
+        )
 
 
 def test_the_instance_modules_import_only_the_standard_library() -> None:
