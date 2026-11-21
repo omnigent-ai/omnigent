@@ -334,7 +334,7 @@ import {
 } from "@/components/composer/useSessionHarnessPickerProps";
 import { nextTranscriptBottomPin, type TranscriptBottomPin } from "./transcriptBottomPin";
 import { Transcript } from "@/components/chat/Transcript";
-import { canStopResponse } from "@/components/chat/stopResponse";
+import { canStopResponse, useStopResponsePaletteCommand } from "@/components/chat/stopResponse";
 
 /**
  * Whether the deployment has smart routing at all. `"loading"` (the `/v1/info`
@@ -2594,6 +2594,12 @@ function ComposerImpl(
   // No server session behind a temp id — gate goal/workspace fetches on it so
   // the create window issues no `/v1/sessions/temp:*` requests.
   const composerSessionId = isTempConvId(conversationId) ? null : conversationId;
+  useStopResponsePaletteCommand({
+    conversationId: composerSessionId,
+    working: isWorking,
+    readOnly: isReadOnly,
+    stop: onStop,
+  });
   // A send held while the host was offline goes out once the host is back.
   useReleaseHostHeldSends(composerSessionId);
   const { session: composerSession } = useSession(composerSessionId);
