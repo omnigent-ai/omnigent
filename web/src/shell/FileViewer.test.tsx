@@ -1024,12 +1024,20 @@ describe("FileViewer URL sync — comment param", () => {
     expect(screen.getByTestId("comments-panel")).toBeInTheDocument();
   });
 
-  it("opens the comments panel for a linked comment it's given, with no ?comment= in the URL", () => {
+  it("opens the comments panel for a linked comment it's given, with no ?comment= in the URL", async () => {
     useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1"), makeComment("c2")]));
+    // A saved Show diff doesn't hide the file the comment is on, and stays saved.
+    writeFileViewPreferences({ ...DEFAULT_FILE_VIEW_PREFERENCES, diffActive: true });
 
     renderViewer({ open: true, path: "file1.py", linkedCommentId: "c2" });
+    await act(async () => {});
 
     expect(screen.getByTestId("comments-panel")).toHaveAttribute("data-active-comment-id", "c2");
+    expect(screen.getByTestId("code-viewer")).toBeInTheDocument();
+    expect(screen.queryByTestId("diff-viewer")).toBeNull();
+    expect(readFileViewPreferences().diffActive).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Show diff" }));
+    expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
   });
 
   it("applies the linked comment only once per component lifecycle", () => {

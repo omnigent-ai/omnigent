@@ -976,7 +976,9 @@ function FileViewerBody({
   const [diffActive, setDiffActive] = useState(
     () => initialDiffRef.current || persistedPrefsRef.current.diffActive,
   );
-  const effectiveDiffActive = diffActive || isDeletedFile;
+  // A comment link shows the file its thread is on, this visit only; the saved preference stays.
+  const [commentLinkFileView, setCommentLinkFileView] = useState(linkedCommentId !== undefined);
+  const effectiveDiffActive = (diffActive && !commentLinkFileView) || isDeletedFile;
   const requestedDiff =
     open && isActiveViewport && effectiveDiffActive && !isImage && !isPdf && !isVideo && !isModel;
   // A saved preference also applies to unchanged files; only explicit links skip discovery.
@@ -1276,7 +1278,7 @@ function FileViewerBody({
   // so stale searchParams seen here could emit a navigate("?") that strips it).
   useEffect(() => {
     if (!syncUrl || !open || !isActiveViewport) return;
-    const wantDiff = diffActive && isDiffAvailable;
+    const wantDiff = diffActive && !commentLinkFileView && isDiffAvailable;
     const hasDiff = searchParams.has("diff");
     if (wantDiff === hasDiff) return; // already in sync — no navigate needed
     setSearchParams(
@@ -1291,7 +1293,16 @@ function FileViewerBody({
       },
       { replace: true },
     );
-  }, [syncUrl, diffActive, isDiffAvailable, open, isActiveViewport, searchParams, setSearchParams]);
+  }, [
+    syncUrl,
+    diffActive,
+    commentLinkFileView,
+    isDiffAvailable,
+    open,
+    isActiveViewport,
+    searchParams,
+    setSearchParams,
+  ]);
 
   // Toolbar actions, declared once and rendered two ways: inline icon buttons
   // when there's room, or rows in an overflow ("⋯") menu when there isn't.
@@ -1495,6 +1506,7 @@ function FileViewerBody({
         guardDirty(() => {
           dismissFilePosition(position);
           setDismissedPosition(position);
+          setCommentLinkFileView(false);
           setDiffActive(viewMode !== "diff");
         }),
     });

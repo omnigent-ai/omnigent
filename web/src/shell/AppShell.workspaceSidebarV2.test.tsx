@@ -674,6 +674,17 @@ describe("workspace_sidebar_v2", () => {
     renderShell(withFlag(true), "/c/conv_ws?file=README.md&fullscreen=1");
     await waitFor(() => expect(tabs.host).toMatchObject({ maximized: true }));
     await waitFor(() => expect(screen.getByTestId("search")).not.toHaveTextContent("fullscreen="));
+    cleanup();
+
+    // In a narrow window the link opens the drawer instead, with nothing to fill.
+    setViewport(NARROW_DESKTOP);
+    renderShell(withFlag(true), "/c/conv_ws?file=README.md&fullscreen=1");
+    await waitFor(() =>
+      expect(screen.getByTestId("workspace-tabs-drawer")).toHaveAttribute("data-state", "open"),
+    );
+    expect(tabs.host).toMatchObject({ placement: "drawer", maximized: false });
+    await waitFor(() => expect(screen.getByTestId("search")).not.toHaveTextContent("file="));
+    expect(screen.getByTestId("search")).not.toHaveTextContent("fullscreen=");
   });
 
   it("reopens the left sidebar on leaving full screen after another session's full screen link", async () => {
