@@ -910,6 +910,24 @@ def test_resolve_cli_binary_falls_back_to_global_dir(monkeypatch, tmp_path):
     assert _platform.resolve_cli_binary("tool", env_var="OMNIGENT_TESTCLI_PATH") == str(tool)
 
 
+@pytest.mark.parametrize("custom_install", [False, True], ids=["default-bun", "custom-bun"])
+def test_resolve_cli_binary_finds_bun_global_install(monkeypatch, tmp_path, custom_install):
+    monkeypatch.setattr(_platform.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.delenv("OMNIGENT_TESTCLI_PATH", raising=False)
+    install = tmp_path / ("custom-bun" if custom_install else ".bun")
+    if custom_install:
+        monkeypatch.setenv("BUN_INSTALL", str(install))
+    else:
+        monkeypatch.delenv("BUN_INSTALL", raising=False)
+    tool = install / "bin" / "bun-installed-test-tool"
+    tool.parent.mkdir(parents=True)
+    tool.write_text("#!/bin/sh\n")
+    tool.chmod(0o755)
+    assert _platform.resolve_cli_binary(
+        tool.name, env_var="OMNIGENT_TESTCLI_PATH", which=lambda name: None
+    ) == str(tool)
+
+
 def test_resolve_cli_binary_returns_none_when_absent(monkeypatch, tmp_path):
     monkeypatch.delenv("OMNIGENT_TESTCLI_PATH", raising=False)
     monkeypatch.setattr(_platform.shutil, "which", lambda name: None)
