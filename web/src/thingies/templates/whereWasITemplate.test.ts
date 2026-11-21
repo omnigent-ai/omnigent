@@ -39,17 +39,20 @@ const RADAR = {
           id: "ramp-10",
           label: "Ramp the flag to 10%",
           kind: "act",
+          confidence: 0.8,
           why: "Errors stayed flat.",
           evidence: { session_id: "s1", quote: "no change in 5xx" },
         },
-        { id: "check-p95", label: "Check p95 after the ramp", kind: "monitor" },
+        { id: "check-p95", label: "Check p95 after the ramp", kind: "monitor", confidence: 0.75 },
       ],
     },
     {
       id: "reviews",
       title: "Reviews",
       state: "blocked",
-      next_steps: [{ id: "review-fix", label: "Review the cache fix", kind: "act" }],
+      next_steps: [
+        { id: "review-fix", label: "Review the cache fix", kind: "act", confidence: 0.9 },
+      ],
     },
   ],
   sessions: [
@@ -251,7 +254,7 @@ describe("where was I template", () => {
     await waitFor(() => expect(ready()).toBe(true));
     emit("radar", []);
 
-    expect(writes).toHaveLength(1);
+    expect(writes.map((write) => write.collection)).toEqual(["radar", "patterns"]);
     expect(writes[0]).toMatchObject({
       collection: "radar",
       id: "current",
@@ -262,6 +265,12 @@ describe("where was I template", () => {
     expect(byId("meta").textContent).toContain("Example");
     expect(byId("look").textContent).toContain("designs this page around your work");
     expect(byId("empty").hidden).toBe(true);
+    // The example shows its sure steps with why now, what it learned, and a hit ratio.
+    await waitFor(() => expect(byId("hit").hidden).toBe(false));
+    const shown = [...byId("next-items").children].map((item) => item.id);
+    expect(shown).toEqual(["next-ramp-10", "next-checkout-telemetry", "next-review-cache"]);
+    expect(byId("next-checkout-telemetry").textContent).toContain("Easy to forget.");
+    expect(byId("learned-list").textContent).toContain("Remove the flag (often forgotten)");
   });
 
   it("draws the plain view, ranks blocked work first and runs a next step", async () => {
@@ -271,7 +280,7 @@ describe("where was I template", () => {
 
     await waitFor(() => expect(byId("content").hidden).toBe(false));
     expect(byId("headline").textContent).toBe(RADAR.headline);
-    const chips = [...document.querySelectorAll("#next-list .next-chip")].map(
+    const chips = [...document.querySelectorAll("#next-items .next-chip")].map(
       (chip) => chip.textContent,
     );
     expect(chips[0]).toContain("Review the cache fix");
@@ -385,7 +394,7 @@ describe("where was I template", () => {
       },
     ]);
     emitActions([{ id: "a1", action: "do_next_step", params: step, status: "running" }]);
-    await waitFor(() => expect(byId("next-list").textContent).toContain("Working on it"));
+    await waitFor(() => expect(byId("next-section").textContent).toContain("Working on it"));
 
     // The action ends, then drops out of the ledger page, before the run record is updated.
     emitActions([{ id: "a1", action: "do_next_step", params: step, status: "done" }]);
@@ -398,7 +407,7 @@ describe("where was I template", () => {
       chip.textContent?.includes("Ramp the flag to 10%"),
     );
     expect(chips).toHaveLength(1);
-    expect(byId("next-list").textContent).not.toContain("Working on it");
+    expect(byId("next-section").textContent).not.toContain("Working on it");
   });
 
   it("keeps counting a scan from its request after the page reloads", async () => {
@@ -473,8 +482,11 @@ describe("where was I template", () => {
     emit("radar", [{ id: "current", version: "v1", value: RADAR }]);
     emit("dismissed", [{ id: "check-p95", version: "v1", value: { at: "2026-11-19T11:00:00Z" } }]);
 
-    await waitFor(() => expect(byId("card-rollout").textContent).toContain("1 next step hidden"));
+    await waitFor(() =>
+      expect(byId("card-rollout").textContent).toContain("You hid a next step here."),
+    );
     expect(byId("card-rollout").textContent).not.toContain("Check p95 after the ramp");
+    expect(byId("next-section").textContent).not.toContain("Check p95 after the ramp");
   });
 
   it("tells a viewer without edit access that scanning is the owner's", async () => {
@@ -505,6 +517,207 @@ describe("where was I template", () => {
   });
 });
 
+const daysAgo = (days: number) => new Date(Date.now() - days * 86_400_000).toISOString();
+
+const PATTERNS = {
+  updated_at: "2026-11-19T10:00:00Z",
+  history_days: 30,
+  patterns: [
+    {
+      id: "flag-rollout",
+      name: "Flag rollout",
+      bar: 0.8,
+      steps: [
+        { id: "ramp", label: "Ramp" },
+        { id: "cleanup", label: "Remove the flag", forgotten: true },
+      ],
+    },
+  ],
+};
+
+/** A radar whose one area has these next steps. */
+function radarWith(nextSteps: Record<string, unknown>[]) {
+  return {
+    ...RADAR,
+    areas: [
+      { id: "rollout", title: "Checkout flag rollout", state: "active", next_steps: nextSteps },
+    ],
+  };
+}
+
+describe("where was I next up", () => {
+  it("shows only the steps it is sure the viewer wants, with why now and their pattern", async () => {
+    const { emit, ready } = startRadar();
+    await waitFor(() => expect(ready()).toBe(true));
+    emit("patterns", [{ id: "current", version: "v1", value: PATTERNS }]);
+    emit("radar", [
+      {
+        id: "current",
+        version: "v1",
+        value: radarWith([
+          {
+            id: "cleanup",
+            label: "Remove the checkout flag",
+            kind: "act",
+            confidence: 0.85,
+            pattern: "flag-rollout",
+            nudge: "forgotten",
+            why_now: "It has been at 100% for two weeks; you usually forget this one.",
+            evidence: { session_id: "s1", quote: "100% everywhere" },
+          },
+          // Below its pattern's bar of 0.8, though above the default.
+          {
+            id: "metric",
+            label: "Check p95",
+            kind: "monitor",
+            confidence: 0.75,
+            pattern: "flag-rollout",
+          },
+          // Sure enough with the default bar.
+          { id: "review", label: "Review the fix", kind: "act", confidence: 0.72 },
+          // No estimate: never shown.
+          { id: "guess", label: "Write a blog post", kind: "act" },
+        ]),
+      },
+    ]);
+
+    await waitFor(() => expect(byId("next-items").children).toHaveLength(2));
+    expect([...byId("next-items").children].map((item) => item.id)).toEqual([
+      "next-cleanup",
+      "next-review",
+    ]);
+    const item = byId("next-cleanup");
+    expect(item.textContent).toContain("Easy to forget.");
+    expect(item.textContent).toContain("you usually forget this one");
+    expect(item.textContent).toContain("Your pattern: Flag rollout");
+    expect(item.textContent).toContain("“100% everywhere”");
+    expect(byId("card-rollout").textContent).not.toContain("Check p95");
+    expect(byId("card-rollout").textContent).not.toContain("Write a blog post");
+    // Next up never counts its steps.
+    expect(byId("next-section").querySelector("h2")?.textContent).toBe("Next up");
+    expect(document.body.textContent).not.toMatch(/\d+ (next )?steps?\b/);
+    expect(byId("next-empty").hidden).toBe(true);
+    expect(byId("learned-list").textContent).toContain("Remove the flag (often forgotten)");
+  });
+
+  it("says plainly that nothing needs the viewer when no step is sure enough", async () => {
+    const { emit, ready } = startRadar();
+    await waitFor(() => expect(ready()).toBe(true));
+    emit("radar", [
+      {
+        id: "current",
+        version: "v1",
+        value: radarWith([{ id: "maybe", label: "Maybe ramp", kind: "act", confidence: 0.4 }]),
+      },
+    ]);
+
+    await waitFor(() => expect(byId("next-section").hidden).toBe(false));
+    expect(byId("next-empty").hidden).toBe(false);
+    expect(byId("next-empty").textContent).toContain("Nothing needs you right now.");
+    expect(byId("next-items").children).toHaveLength(0);
+    expect(document.body.textContent).not.toContain("Maybe ramp");
+  });
+
+  it("hides a step with ×, then records the reason the viewer taps", async () => {
+    const { emit, writes, ready } = startRadar();
+    await waitFor(() => expect(ready()).toBe(true));
+    emit("patterns", [{ id: "current", version: "v1", value: PATTERNS }]);
+    emit("radar", [
+      {
+        id: "current",
+        version: "v1",
+        value: radarWith([
+          {
+            id: "cleanup",
+            label: "Remove the flag",
+            kind: "act",
+            confidence: 0.9,
+            pattern: "flag-rollout",
+          },
+        ]),
+      },
+    ]);
+    await waitFor(() => expect(byId("next-cleanup")).toBeTruthy());
+
+    (byId("next-cleanup").querySelector(".step-x") as HTMLButtonElement).click();
+
+    await waitFor(() =>
+      expect(byId("notice").textContent).toContain("Hidden “Remove the flag”. Why?"),
+    );
+    expect(writes.at(-1)).toMatchObject({
+      collection: "dismissed",
+      op: "create",
+      id: "cleanup",
+      value: { label: "Remove the flag", pattern: "flag-rollout" },
+    });
+    await waitFor(() => expect(document.getElementById("next-cleanup")).toBeNull());
+
+    (byId("notice").querySelector('[data-reason="already_done"]') as HTMLButtonElement).click();
+
+    await waitFor(() =>
+      expect(byId("notice").textContent).toBe("Thanks. Next up learns from that."),
+    );
+    expect(writes.at(-1)).toMatchObject({
+      collection: "dismissed",
+      op: "replace",
+      id: "cleanup",
+      value: { label: "Remove the flag", pattern: "flag-rollout", reason: "already_done" },
+    });
+  });
+
+  it("shows the hit ratio quietly, counting a click as soon as the viewer makes it", async () => {
+    const { emit, requests, ready } = startRadar();
+    await waitFor(() => expect(ready()).toBe(true));
+    const ledger = [
+      { step: "cleanup", pattern: "flag-rollout", shown_at: daysAgo(1), outcome: "open" },
+      { step: "a", pattern: "flag-rollout", shown_at: daysAgo(1), outcome: "clicked" },
+      { step: "b", pattern: "flag-rollout", shown_at: daysAgo(2), outcome: "clicked" },
+      { step: "c", shown_at: daysAgo(3), outcome: "dismissed", reason: "not_relevant" },
+      // Open for over a week: ignored.
+      { step: "d", shown_at: daysAgo(10), outcome: "open" },
+      // Older than the window.
+      { step: "e", shown_at: daysAgo(40), outcome: "clicked" },
+    ];
+    emit("patterns", [{ id: "current", version: "v1", value: { ...PATTERNS, ledger } }]);
+    emit("radar", [
+      {
+        id: "current",
+        version: "v1",
+        value: radarWith([
+          {
+            id: "cleanup",
+            label: "Remove the flag",
+            kind: "act",
+            confidence: 0.9,
+            pattern: "flag-rollout",
+          },
+        ]),
+      },
+    ]);
+
+    await waitFor(() => expect(byId("hit").hidden).toBe(false));
+    expect(byId("hit").textContent).toContain(
+      "Next up hit ratio, last 30 days: 2 of 4 clicked (50%)",
+    );
+    // The page's headline area carries no ratio; it sits under the page.
+    expect(byId("headline").textContent).not.toContain("hit ratio");
+    expect(byId("learned-list").textContent).toContain("Next up hits: 2 of 2");
+
+    (byId("next-cleanup").querySelector(".next-chip") as HTMLButtonElement).click();
+
+    expect(requests.at(-1)).toEqual({
+      action: "do_next_step",
+      params: {
+        next_step: "cleanup",
+        label: "Remove the flag",
+        area: "rollout",
+        pattern: "flag-rollout",
+      },
+    });
+    await waitFor(() => expect(byId("hit").textContent).toContain("3 of 5 clicked (60%)"));
+  });
+});
+
 describe("where was I designs", () => {
   it("draws a design with the kit's pieces and reports that it drew", async () => {
     const { emit, emitActions, reports, requests, ready } = startRadar({ html: LANES_VIEW });
@@ -515,7 +728,7 @@ describe("where was I designs", () => {
     await waitFor(() => expect(byId("lane-rollout")).toBeTruthy());
     expect(document.querySelector("#view .area")).toBeNull();
     // Next up stays the kit's.
-    expect(byId("next-list").querySelectorAll(".next-chip").length).toBeGreaterThan(0);
+    expect(byId("next-items").querySelectorAll(".next-chip").length).toBeGreaterThan(0);
     await waitFor(() =>
       expect(reports()).toEqual([
         expect.objectContaining({
@@ -682,5 +895,18 @@ describe("where was I revision", () => {
       "do_next_step",
       "restore_look",
     ]);
+    const doStep = WHERE_WAS_I_REVISION.actions?.find((action) => action.name === "do_next_step");
+    expect(Object.keys(doStep?.params?.properties ?? {})).toContain("pattern");
+  });
+
+  it("keeps the learned patterns in one record and tells the session to aim for clicks", () => {
+    expect(Object.keys(WHERE_WAS_I_REVISION.collections)).toContain("patterns");
+    expect(WHERE_WAS_I_REVISION.constraints).toContainEqual(
+      expect.objectContaining({ name: "one_patterns", collection: "patterns", max: 1 }),
+    );
+    expect(WHERE_WAS_I_GUIDE).toContain("Next up is judged by its hit ratio");
+    expect(WHERE_WAS_I_GUIDE).toContain("Never add a pattern from general knowledge alone");
+    expect(WHERE_WAS_I_GUIDE).toContain("never fill the list");
+    expect(WHERE_WAS_I_GUIDE).toContain("without counts");
   });
 });

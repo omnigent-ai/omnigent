@@ -31,7 +31,7 @@ const messages = {
   radarShowsDesign:
     "A page your thingy session designs for your work, such as a rollout as stages or reviews as lanes",
   radarShowsSteps:
-    "Next steps such as ramping a flag or checking a metric, each a click away, with their progress",
+    "Only the step that is due in the workflows you repeat, such as a metric check after a ramp or the telemetry you meant to add; it learns from what you click",
   radarShowsBack: "Back to the previous look whenever a new design misses",
   radarSuggestScan: "Scan my sessions from the last 3 days",
   radarSuggestLanes: "Show my pull request reviews as lanes",
