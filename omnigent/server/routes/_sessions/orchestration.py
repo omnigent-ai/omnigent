@@ -1784,6 +1784,7 @@ def _build_session_response(
             conv, agent_store=agent_store, agent_cache=agent_cache, agent=agent
         )
     from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
+    from omnigent.server.scheduled.harness_settings import session_permission_mode
 
     native_usage_baseline = None
     if harness in ("pi-native", "claude-native") or (
@@ -1836,6 +1837,7 @@ def _build_session_response(
         root_conversation_id=conv.root_conversation_id,
         llm_model=llm_model,
         harness=harness,
+        permission_mode=session_permission_mode(conv, harness) if harness else None,
         model_override=conv.model_override,
         cost_control_mode_override=conv.cost_control_mode_override,
         subagent_routing_override=conv.subagent_routing_override,
@@ -12776,6 +12778,39 @@ def _created_session_title(body: SessionCreateInput, workflow: Workflow | None) 
     return workflow.name
 
 
+def _creator_permission_launch_options(
+    creator: Conversation,
+    body: SessionCreateInput,
+    *,
+    harness: str | None,
+    conversation_store: ConversationStore,
+    agent_store: AgentStore,
+    agent_cache: AgentCache | None,
+) -> tuple[list[str] | None, dict[str, str]] | None:
+    """
+    Launch options that start a session *creator* asks for in *creator*'s permission mode.
+
+    :param creator: The server-authorized session that requested the create.
+    :param body: The create request, after its placement was resolved.
+    :param harness: The new session's harness, e.g. ``"codex-native"``.
+    :param conversation_store: Store used to find the creator's host.
+    :param agent_store: Store used to resolve the creator's harness.
+    :param agent_cache: Cache used to load the creator's spec.
+    :returns: Launch args and labels, or ``None`` for the new session's agent default.
+    """
+    from omnigent.server.scheduled.harness_settings import creator_session_launch_options
+
+    creator_host_id = routing_host_id(creator, conversation_store)
+    return creator_session_launch_options(
+        creator,
+        harness=harness,
+        creator_harness=_resolve_harness(
+            creator, agent_store=agent_store, agent_cache=agent_cache
+        ),
+        on_creator_host=creator_host_id is not None and body.host_id == creator_host_id,
+    )
+
+
 async def _create_session_from_existing_agent(
     conversation_store: ConversationStore,
     agent_store: AgentStore,
@@ -12829,8 +12864,8 @@ async def _create_session_from_existing_agent(
         no project is filed there, so it sits beside the session that started it.
     :param created_by_scheduled_task_id: The automation whose run is that source, if
         any. A worker whose request carries no launch args runs in its permission mode.
-    :param created_by: That source session. A worker that picks no MCP services of
-        its own starts with the source's.
+    :param created_by: That source session. A worker that picks no MCP services or
+        permission mode of its own starts with the source's.
     :param launched_by_scheduled_task_id: The automation whose run's tree that source
         is in, if any, stamped as the worker's ``SCHEDULED_TASK_LAUNCH_LABEL_KEY``.
     :returns: The newly created session snapshot, its conversation row, and
@@ -13428,23 +13463,33 @@ async def _create_session_from_existing_agent(
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
 
-    # Workers an automation's run starts are unattended like the run itself, so they
-    # use the automation's permission mode instead of their agent's default. A mode
-    # the request names wins.
-    automation_launch_options: tuple[list[str] | None, dict[str, str]] | None = None
+    # A worker can do without asking what the session that started it can: it runs
+    # in the automation's permission mode when an automation's run starts it, else
+    # in its creator's, instead of its agent's default. A mode the request names wins.
+    inherited_launch_options: tuple[list[str] | None, dict[str, str]] | None = None
     if not body.sub_agent_name and validated_launch_args is None and body.permission_mode is None:
         from omnigent.server.scheduled.harness_settings import automation_session_launch_options
 
-        automation_launch_options = await automation_session_launch_options(
+        inherited_launch_options = await automation_session_launch_options(
             getattr(request.app.state, "scheduled_task_store", None),
             created_by_scheduled_task_id,
             source_session_id=created_by_session_id,
             user_id=user_id,
             harness=selected_harness,
         )
-    automation_permission_labels: dict[str, str] = {}
-    if automation_launch_options is not None:
-        validated_launch_args, automation_permission_labels = automation_launch_options
+        if inherited_launch_options is None and created_by is not None:
+            inherited_launch_options = await asyncio.to_thread(
+                _creator_permission_launch_options,
+                created_by,
+                body,
+                harness=selected_harness,
+                conversation_store=conversation_store,
+                agent_store=agent_store,
+                agent_cache=agent_cache,
+            )
+    inherited_permission_labels: dict[str, str] = {}
+    if inherited_launch_options is not None:
+        validated_launch_args, inherited_permission_labels = inherited_launch_options
 
     # Spec-seeded defaults: a self-resolved agent's stored spec supplies the
     # spec-level reasoning effort and, when the body carried no launch args,
@@ -13456,7 +13501,7 @@ async def _create_session_from_existing_agent(
         not body.sub_agent_name
         and validated_launch_args is None
         and body.permission_mode is None
-        and automation_launch_options is None
+        and inherited_launch_options is None
     )
     needs_effort_from_spec = reasoning_effort is None and sub_spec is None
     if (
@@ -13518,7 +13563,7 @@ async def _create_session_from_existing_agent(
     if launched_by_scheduled_task_id is not None:
         initial_labels[SCHEDULED_TASK_LAUNCH_LABEL_KEY] = launched_by_scheduled_task_id
     initial_labels.update(registry_labels)
-    initial_labels.update(automation_permission_labels)
+    initial_labels.update(inherited_permission_labels)
     initial_labels.update(inherited_mcp_labels)
     if created_worktree_path is not None:
         from omnigent.server.routes._host_worktree import (

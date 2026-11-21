@@ -6298,7 +6298,7 @@ async def _session_get_info_via_rest(
     caller's own ``conversation_id`` when omitted), fetches the session
     snapshot, and projects the metadata fields — status, title, agent
     binding, runner binding, host and its reported harness readiness,
-    reasoning effort, effective model,
+    reasoning effort, effective model, the server-resolved permission mode,
     parent linkage, workspace / git branch, project, persisted last-activity
     time, and the outstanding approval prompts (the prompts themselves plus a
     count). Runner connectivity
@@ -6378,6 +6378,10 @@ async def _session_get_info_via_rest(
             # Effective model: a per-session override wins over the
             # agent spec's default; both may be None when unset.
             "model": snap.get("model_override") or snap.get("llm_model"),
+            # Mode names are the ones sys_session_create's permission_mode takes;
+            # None when the harness has none, the mode is unknown, or the server
+            # predates the field.
+            "permission_mode": _optional_string(snap.get("permission_mode")),
             "workspace": snap.get("workspace"),
             "git_branch": snap.get("git_branch"),
             "project_id": snap.get("project_id"),

@@ -118,6 +118,7 @@ from omnigent.server.scheduled.dispatch_scheduler import (
 from omnigent.server.scheduled.harness_settings import (
     forget_unrecorded_legacy_run_session,
     inherited_approval_skipping_problem,
+    launch_args_contain,
     note_unrecorded_legacy_run_session,
     permission_mode_launch_options,
     scheduled_agent_harness,
@@ -1305,11 +1306,6 @@ _APPROVAL_SKIPPING_LAUNCH_ARGS: tuple[tuple[str, ...], ...] = (
 )
 
 
-def _contains_args(args: list[str], needle: tuple[str, ...]) -> bool:
-    width = len(needle)
-    return any(tuple(args[i : i + width]) == needle for i in range(len(args) - width + 1))
-
-
 def session_approval_skipping_mode(conv: Conversation) -> str | None:
     """The approval-skipping permission mode *conv* is running in, or ``None``.
 
@@ -1323,7 +1319,7 @@ def session_approval_skipping_mode(conv: Conversation) -> str | None:
         return "bypass"
     launch_args = list(getattr(conv, "terminal_launch_args", None) or [])
     for needle in _APPROVAL_SKIPPING_LAUNCH_ARGS:
-        if _contains_args(launch_args, needle):
+        if launch_args_contain(launch_args, needle):
             return " ".join(needle)
     return None
 
