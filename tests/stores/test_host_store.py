@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 
 import pytest
 from sqlalchemy import event, insert, update
-from sqlalchemy.exc import DBAPIError, IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from omnigent.db.account_authority import account_authority_scope
@@ -121,6 +123,129 @@ async def test_session_delete_keeps_shared_sandbox_until_last_binding(
         event.remove(conversations._conv_engine, "after_cursor_execute", capture_cleanup)
     assert deleted_labels == [2, 2, 2, 1]
     assert conversations.get_conversation(first.id) is None
+
+
+def _register_shared_sandbox(host_store: HostStore) -> str:
+    host_id = uuid.uuid4().hex
+    host_store.register_managed_host(
+        host_id=host_id,
+        name="shared",
+        user_id="alice",
+        token="shared-token",
+        provider="modal",
+        sandbox_id="shared-sandbox",
+        token_expires_at=now_epoch() + 1000,
+    )
+    return host_id
+
+
+@contextmanager
+def _metadata_commit_fails_after_applying(engine, before_raise=lambda: None):
+    armed, inserted = True, False
+
+    def on_execute(_connection, _cursor, statement, *_args):
+        nonlocal inserted
+        if armed and statement.startswith("INSERT INTO omnigent_conversation_metadata"):
+            inserted = True
+
+    def on_commit(_session: Session) -> None:
+        nonlocal armed, inserted
+        if inserted:
+            armed, inserted = False, False
+            before_raise()
+            raise OperationalError("COMMIT", None, sqlite3.OperationalError("database is locked"))
+
+    event.listen(engine, "before_cursor_execute", on_execute)
+    event.listen(Session, "after_commit", on_commit)
+    try:
+        yield
+    finally:
+        event.remove(Session, "after_commit", on_commit)
+        event.remove(engine, "before_cursor_execute", on_execute)
+
+
+@pytest.mark.parametrize("split_database", [False, True])
+def test_failed_create_releases_last_shared_sandbox_binding(
+    host_store: HostStore, db_uri: str, split_database, tmp_path
+) -> None:
+    host_id = _register_shared_sandbox(host_store)
+    conversations = SqlAlchemyConversationStore(
+        db_uri, f"sqlite:///{tmp_path / 'messages.db'}" if split_database else None
+    )
+    first = conversations.create_conversation(host_id=host_id, workspace="/work")
+
+    def delete_first() -> None:
+        assert asyncio.run(conversations.delete_conversation(first.id))
+        assert host_store.get_host(host_id) is not None
+
+    with (
+        _metadata_commit_fails_after_applying(conversations._engine, delete_first),
+        pytest.raises(OperationalError, match="database is locked"),
+    ):
+        conversations.create_conversation(host_id=host_id, workspace="/work")
+    assert host_store.get_host(host_id) is None
+    pending = host_store.get_host(host_id, include_deleted=True)
+    assert pending is not None and pending.deleted_at is not None
+
+
+@pytest.mark.parametrize("split_database", [False, True])
+def test_failed_create_keeps_same_id_replacement(
+    host_store: HostStore, db_uri: str, split_database, tmp_path
+) -> None:
+    host_id = _register_shared_sandbox(host_store)
+    conversations = SqlAlchemyConversationStore(
+        db_uri, f"sqlite:///{tmp_path / 'messages.db'}" if split_database else None
+    )
+    conversation_id = uuid.uuid4().hex
+
+    def replace_conversation() -> None:
+        assert asyncio.run(
+            conversations.delete_conversation(conversation_id, preserve_host_binding=host_id)
+        )
+        conversations.create_conversation(
+            conversation_id=conversation_id, host_id=host_id, workspace="/replacement"
+        )
+
+    with (
+        _metadata_commit_fails_after_applying(conversations._engine, replace_conversation),
+        pytest.raises(OperationalError, match="database is locked"),
+    ):
+        conversations.create_conversation(
+            conversation_id=conversation_id, host_id=host_id, workspace="/work"
+        )
+    replacement = conversations.get_conversation(conversation_id)
+    assert replacement is not None
+    assert (replacement.host_id, replacement.workspace) == (host_id, "/replacement")
+    assert host_store.get_host(host_id) is not None
+
+
+@pytest.mark.parametrize("split_database", [False, True])
+def test_failed_metadata_cleanup_keeps_deletable_session(
+    host_store: HostStore, db_uri: str, split_database, tmp_path
+) -> None:
+    host_id = _register_shared_sandbox(host_store)
+    conversations = SqlAlchemyConversationStore(
+        db_uri, f"sqlite:///{tmp_path / 'messages.db'}" if split_database else None
+    )
+
+    def fail_cleanup(_connection, _cursor, statement, *_args):
+        if statement.startswith("DELETE FROM omnigent_conversation_metadata"):
+            raise OperationalError(statement, None, sqlite3.OperationalError("disk I/O error"))
+
+    event.listen(conversations._engine, "before_cursor_execute", fail_cleanup)
+    try:
+        with (
+            _metadata_commit_fails_after_applying(conversations._engine),
+            pytest.raises(OperationalError, match="database is locked"),
+        ):
+            conversations.create_conversation(host_id=host_id, workspace="/work")
+    finally:
+        event.remove(conversations._engine, "before_cursor_execute", fail_cleanup)
+    [kept_id] = conversations.list_host_conversation_ids(host_id)
+    assert conversations.get_conversation(kept_id) is not None
+    assert asyncio.run(conversations.delete_conversation(kept_id))
+    assert host_store.get_host(host_id) is None
+    assert host_store.get_host(host_id, include_deleted=True).deleted_at is not None
 
 
 @pytest.mark.parametrize("split_database", [False, True])

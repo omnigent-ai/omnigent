@@ -1376,7 +1376,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                 insert_conversation,
             )
 
+            flushed_new_metadata = False
+
             def insert_metadata(meta_sess: Session) -> SqlConversationMetadata:
+                nonlocal flushed_new_metadata
+                flushed_new_metadata = False
                 lock_host_for_binding(meta_sess, host_id)
                 previous = (
                     meta_sess.get(SqlConversationMetadata, (current_workspace_id(), new_id))
@@ -1406,6 +1410,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                     side_chat_parent_id=side_chat_parent_id,
                 )
                 meta_sess.add(meta)
+                meta_sess.flush()
+                flushed_new_metadata = True
                 return meta
 
             try:
@@ -1414,8 +1420,14 @@ class SqlAlchemyConversationStore(ConversationStore):
                     "insert_conversation_metadata",
                     insert_metadata,
                 )
-            except OmnigentError:
-                self._discard_unbound_conversation(new_id)
+            except Exception as exc:
+                # Only a generated id proves that the rows under it still belong to this attempt.
+                if conversation_id is None:
+                    self._discard_unbound_conversation(
+                        new_id, flushed_metadata=flushed_new_metadata
+                    )
+                elif isinstance(exc, OmnigentError):
+                    self._discard_unbound_conversation(new_id)
                 raise
             return _to_conversation(row, meta, creation_labels)
         except IntegrityError as exc:
@@ -1446,8 +1458,57 @@ class SqlAlchemyConversationStore(ConversationStore):
                 ) from exc
             raise
 
-    def _discard_unbound_conversation(self, conversation_id: str) -> None:
-        """Undo an unpublished conversation when metadata admission was rejected."""
+    def _discard_unbound_conversation(
+        self,
+        conversation_id: str,
+        *,
+        flushed_metadata: bool = False,
+        agent_id: str | None = None,
+    ) -> None:
+        """Undo an unpublished conversation and any rows a failed COMMIT may have applied."""
+        if flushed_metadata:
+
+            def delete_flushed(session: Session) -> None:
+                host_id = session.scalar(
+                    select(SqlConversationMetadata.host_id).where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.id == conversation_id,
+                    )
+                )
+                host = (
+                    session.get(SqlHost, (current_workspace_id(), host_id), with_for_update=True)
+                    if host_id is not None
+                    else None
+                )
+                session.execute(
+                    delete(SqlConversationMetadata).where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.id == conversation_id,
+                    )
+                )
+                if agent_id is not None:
+                    session.execute(
+                        delete(SqlAgent).where(
+                            SqlAgent.workspace_id == current_workspace_id(),
+                            SqlAgent.id == agent_id,
+                        )
+                    )
+                if host is not None:
+                    session.flush()
+                    delete_unused_host_in_session(session, host)
+
+            try:
+                run_write_transaction(
+                    self._session_immediate,
+                    "discard_unbound_conversation_metadata",
+                    delete_flushed,
+                )
+            except Exception:
+                # Keeping the conversation row leaves a session that normal deletion can release.
+                _logger.exception(
+                    "could not discard metadata for conversation %s", conversation_id
+                )
+                return
 
         def write(session: Session) -> bool:
             keys = list(
@@ -6621,9 +6682,13 @@ class SqlAlchemyConversationStore(ConversationStore):
             insert_ap,
         )
 
+        metadata_flushed = False
+
         def insert_metadata(
             session: Session,
         ) -> tuple[SqlConversationMetadata, SqlAgent]:
+            nonlocal metadata_flushed
+            metadata_flushed = False
             lock_host_for_binding(session, host_id)
             agent_row = _new_session_agent_row(
                 created_by=created_by,
@@ -6646,6 +6711,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             session.add(agent_row)
             session.add(meta_row)
+            session.flush()
+            metadata_flushed = True
             return meta_row, agent_row
 
         try:
@@ -6654,8 +6721,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                 "create_session_with_agent_metadata",
                 insert_metadata,
             )
-        except OmnigentError:
-            self._discard_unbound_conversation(conversation_id)
+        except Exception:
+            self._discard_unbound_conversation(
+                conversation_id, flushed_metadata=metadata_flushed, agent_id=agent_id
+            )
             raise
 
         return _created_session_from_rows(
