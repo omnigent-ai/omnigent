@@ -741,7 +741,11 @@ _SESSION_UPDATES_MAX_WATCHED: int = 500
 _SHARED_DISCOVERY_KEY = "__all__"
 
 
-_session_terminal_pending_cache: WorkspaceScopedCache[str, bool] = WorkspaceScopedCache()
+# A flag nothing clears on this replica expires: the runner's clear lands on
+# the replica holding its tunnel, and a runner that never boots sends none.
+_session_terminal_pending_cache: WorkspaceScopedCache[str, bool] = WorkspaceScopedCache(
+    lambda: cachetools.TTLCache(maxsize=16384, ttl=600, timer=lambda: time.monotonic())
+)
 
 
 _session_sandbox_status_cache: WorkspaceScopedCache[str, SandboxStatus] = WorkspaceScopedCache()
