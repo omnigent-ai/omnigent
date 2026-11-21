@@ -262,13 +262,11 @@ export function useSessionJournal(
   );
   const plan = currentPlan(journalEntries);
   const planId = plan?.id;
-  // Run boundaries are not sent with the live plan event and can predate the
-  // newest page. Read the current one whenever the plan changes, unless the
-  // loaded entries already reach back to the journal's start: the boundary and
-  // the run's original plan both come before the current plan.
+  // Run boundaries aren't in the live plan event and can predate the newest page.
+  // Read the current one per plan unless the whole journal through it is loaded.
   const boundaryLoaded = useMemo(
-    () => plan !== null && holdsJournalThrough(journalEntries, plan.position),
-    [journalEntries, plan],
+    () => !olderExist && plan !== null && holdsJournalThrough(journalEntries, plan.position),
+    [olderExist, journalEntries, plan],
   );
   const readBoundary = planId !== undefined && !boundaryLoaded;
   const runBoundary = useQuery({
