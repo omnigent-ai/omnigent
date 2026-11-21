@@ -1,25 +1,34 @@
-"""E2E regression: a peer-cancelled gRPC call must not book an unhandled session error.
+"""E2E regression: a cancelled backing gRPC call must not book an unhandled session error.
 
 Journey (Databricks agentbricks embedding): a session's client requests
 workspace-tree data from a server route backed by a MAS gRPC call
-(``ListTreeNodeChildren`` over a barnacle channel). The backing service
-cancels the in-flight RPC (an upstream teardown/restart burst) and the raw
-``grpc._channel._InactiveRpcError`` with ``StatusCode.CANCELLED`` escapes the
-route into the server's generic catch-all, which books it as::
+(``ListTreeNodeChildren`` over a barnacle channel). Two upstream cancellation
+shapes reach the route:
+
+* the backing service peer-cancels the in-flight RPC (an upstream
+  teardown/restart burst) — ``StatusCode.CANCELLED``;
+* a client cancels its own request, the barnacle lease covering the channel is
+  released and the endpoint tears down, sending GOAWAY ``Cancelling all calls``
+  (``StatusCode.UNAVAILABLE``) to every other call still in flight.
+
+Either way the raw ``grpc._channel._InactiveRpcError`` escapes the route into
+the server's generic catch-all, which books it as::
 
     Unhandled exception: <_InactiveRpcError of RPC that terminated with:
         status = StatusCode.CANCELLED ...
 
-at ERROR level (category UNKNOWN, impact BLOCKING, HTTP 500).
+at ERROR level (category UNKNOWN, impact BLOCKING, HTTP 500) — once per
+affected request, so a lease release floods the log and the clients.
 
 The reproduction stands in for that deployment: a real in-process gRPC server
-peer-cancels every call, and an ``extra_routers`` router (the embedding
-extension point agentbricks uses to mount its MAS routers) performs the
-blocking call inside a request handler, matching the deployed stack tail
-(``with_call`` → ``_end_unary_response_blocking`` → ``_InactiveRpcError``).
+plays the backend, and an ``extra_routers`` router (the embedding extension
+point agentbricks uses to mount its MAS routers) performs the blocking call
+inside a request handler, matching the deployed stack tail (``with_call`` →
+``_end_unary_response_blocking`` → ``_InactiveRpcError``). The lease release
+is modelled by stopping the backing server without grace while calls are held.
 
-The test drives the journey over real HTTP against a real uvicorn server and
-asserts the guarded contract: the client still receives an error response, and
+The tests drive the journey over real HTTP against a real uvicorn server and
+assert the guarded contract: the client still receives an error response, and
 the cancelled RPC — an expected upstream condition — is not logged through
 ``_handle_unhandled_exception`` as an ERROR-level ``Unhandled exception``.
 
@@ -30,12 +39,15 @@ Run::
 
 from __future__ import annotations
 
+import json
 import logging
 import socket
 import threading
 import time
 from collections.abc import Iterator
 from concurrent import futures
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
@@ -61,6 +73,10 @@ from tests.e2e.helpers import HEALTH_TIMEOUT_S, POLL_INTERVAL_S  # noqa: E402
 # The gRPC method the ticket's stack tail names (MAS tree listing via barnacle).
 _GRPC_SERVICE = "mas.TreeService"
 _GRPC_METHOD = "ListTreeNodeChildren"
+_ROUTE = "/v1/mas/workspace-tree/children"
+# How many clients hold calls on the leased channel when its lease is released.
+_LEASED_CLIENTS = 3
+_CLIENT_TIMEOUT_S = 30.0
 
 
 class _RecordingHandler(logging.Handler):
@@ -80,6 +96,27 @@ class _RecordingHandler(logging.Handler):
         :param record: The emitted log record.
         """
         self._records.append(record)
+
+
+def _serve_grpc(handler) -> tuple[grpc.Server, str]:
+    """
+    Start a real gRPC server exposing ``ListTreeNodeChildren`` via *handler*.
+
+    :param handler: Unary-unary servicer callable ``(request, context)``.
+    :returns: The started server and its ``host:port`` target.
+    """
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=_LEASED_CLIENTS + 2))
+    server.add_generic_rpc_handlers(
+        (
+            grpc.method_handlers_generic_handler(
+                _GRPC_SERVICE,
+                {_GRPC_METHOD: grpc.unary_unary_rpc_method_handler(handler)},
+            ),
+        )
+    )
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    return server, f"127.0.0.1:{port}"
 
 
 @pytest.fixture()
@@ -107,19 +144,81 @@ def cancelling_grpc_target() -> Iterator[str]:
         context.abort(grpc.StatusCode.CANCELLED, "")
         return b""  # pragma: no cover - unreachable, abort() raises
 
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
-    server.add_generic_rpc_handlers(
-        (
-            grpc.method_handlers_generic_handler(
-                _GRPC_SERVICE,
-                {_GRPC_METHOD: grpc.unary_unary_rpc_method_handler(_cancel)},
-            ),
-        )
-    )
-    port = server.add_insecure_port("127.0.0.1:0")
-    server.start()
+    server, target = _serve_grpc(_cancel)
     try:
-        yield f"127.0.0.1:{port}"
+        yield target
+    finally:
+        server.stop(grace=None)
+
+
+@dataclass
+class _LeasedBackend:
+    """A backing gRPC endpoint that holds every call until its lease is released."""
+
+    server: grpc.Server
+    target: str
+    arrived: threading.Semaphore = field(default_factory=lambda: threading.Semaphore(0))
+
+    def wait_for_inflight(self, count: int, timeout: float = 20.0) -> None:
+        """
+        Block until *count* calls are held in the backend.
+
+        :param count: Number of in-flight calls to wait for.
+        :param timeout: Per-call wait budget in seconds.
+        """
+        for _ in range(count):
+            assert self.arrived.acquire(timeout=timeout), "backing call never arrived"
+
+    def release_lease(self) -> None:
+        """
+        Tear the endpoint down under the held calls, as a released lease does.
+
+        ``stop(grace=None)`` cancels every in-flight call from the server side;
+        grpc delivers that to the clients as ``UNAVAILABLE`` / ``Cancelling all
+        calls``.
+        """
+        stopped = self.server.stop(grace=None)
+        assert stopped.wait(timeout=20.0), (
+            "backing gRPC server did not stop after cancelling its calls"
+        )
+
+
+@pytest.fixture()
+def leased_grpc_backend() -> Iterator[_LeasedBackend]:
+    """
+    Start a real gRPC server that holds ``ListTreeNodeChildren`` calls in flight.
+
+    Stands in for the barnacle-leased MAS endpoint: calls stay open until the
+    test releases the lease (tearing the endpoint down) or the call is
+    cancelled from under the handler.
+
+    :returns: The backend handle (target, in-flight tracking, lease release).
+    """
+    backend: _LeasedBackend | None = None
+
+    def _hold(request: bytes, context: grpc.ServicerContext) -> bytes:
+        """
+        Hold the call until the endpoint teardown cancels it.
+
+        :param request: Raw request payload (unused).
+        :param context: Servicer context, polled so a cancelled call returns.
+        :returns: An empty listing, discarded because the call was already cancelled.
+        """
+        del request
+        assert backend is not None
+        backend.arrived.release()
+        # The deadline only guards a hung test; the teardown is what ends the call.
+        deadline = time.monotonic() + 60.0
+        while context.is_active() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if context.is_active():
+            context.abort(grpc.StatusCode.DEADLINE_EXCEEDED, "teardown never cancelled the call")
+        return b""
+
+    server, target = _serve_grpc(_hold)
+    backend = _LeasedBackend(server=server, target=target)
+    try:
+        yield backend
     finally:
         server.stop(grace=None)
 
@@ -159,24 +258,22 @@ def _make_embedding_router(target: str) -> tuple[APIRouter, grpc.Channel]:
     return router, channel
 
 
-@pytest.fixture()
-def embedded_server(
-    db_uri: str,
-    tmp_path: Path,
-    cancelling_grpc_target: str,
+@contextmanager
+def _serve_embedding(
+    db_uri: str, tmp_path: Path, grpc_target: str
 ) -> Iterator[tuple[str, list[logging.LogRecord]]]:
     """
-    Run a real omnigent server with an embedding router over the gRPC backend.
+    Run a real omnigent server with an embedding router over a gRPC backend.
 
     Builds the app exactly as a deployment does — real stores, plus an
-    ``extra_routers`` entry whose handler calls the cancelling gRPC service —
+    ``extra_routers`` entry whose handler calls the backing gRPC service —
     and serves it with uvicorn on a real socket, capturing everything the
     ``omnigent.server.app`` logger emits (the logger the ticket's KPI
     signatures attribute).
 
     :param db_uri: Per-test database URI from the root conftest.
     :param tmp_path: Pytest temp directory for artifacts and cache.
-    :param cancelling_grpc_target: Target of the peer-cancelling gRPC server.
+    :param grpc_target: ``host:port`` of the backing gRPC service.
     :returns: ``(base_url, records)`` — the server URL and captured records.
     """
     agent_store = SqlAlchemyAgentStore(db_uri)
@@ -191,7 +288,7 @@ def embedded_server(
         file_store=file_store,
         artifact_store=artifact_store,
     )
-    router, channel = _make_embedding_router(cancelling_grpc_target)
+    router, channel = _make_embedding_router(grpc_target)
     app = create_app(
         agent_store=agent_store,
         file_store=file_store,
@@ -226,6 +323,42 @@ def embedded_server(
         channel.close()
 
 
+@pytest.fixture()
+def embedded_server(
+    db_uri: str,
+    tmp_path: Path,
+    cancelling_grpc_target: str,
+) -> Iterator[tuple[str, list[logging.LogRecord]]]:
+    """
+    Real omnigent server whose embedding route is backed by the peer-cancelling service.
+
+    :param db_uri: Per-test database URI from the root conftest.
+    :param tmp_path: Pytest temp directory for artifacts and cache.
+    :param cancelling_grpc_target: Target of the peer-cancelling gRPC server.
+    :returns: ``(base_url, records)`` — the server URL and captured records.
+    """
+    with _serve_embedding(db_uri, tmp_path, cancelling_grpc_target) as served:
+        yield served
+
+
+@pytest.fixture()
+def leased_embedded_server(
+    db_uri: str,
+    tmp_path: Path,
+    leased_grpc_backend: _LeasedBackend,
+) -> Iterator[tuple[str, list[logging.LogRecord]]]:
+    """
+    Real omnigent server whose embedding route is backed by the leased endpoint.
+
+    :param db_uri: Per-test database URI from the root conftest.
+    :param tmp_path: Pytest temp directory for artifacts and cache.
+    :param leased_grpc_backend: The holding backend standing in for the leased channel.
+    :returns: ``(base_url, records)`` — the server URL and captured records.
+    """
+    with _serve_embedding(db_uri, tmp_path, leased_grpc_backend.target) as served:
+        yield served
+
+
 def _wait_until_serving(base_url: str) -> None:
     """
     Block until the server answers HTTP (any status) or the boot budget lapses.
@@ -241,6 +374,66 @@ def _wait_until_serving(base_url: str) -> None:
             continue
         return
     raise RuntimeError(f"Server did not come up within {HEALTH_TIMEOUT_S}s")
+
+
+def _unhandled_records(
+    records: list[logging.LogRecord], status_name: str | None = None
+) -> list[logging.LogRecord]:
+    """
+    ERROR-level catch-all bookings of a failed RPC.
+
+    :param records: Records captured from the ``omnigent.server.app`` logger.
+    :param status_name: gRPC status name quoted in the booked exception, or
+        ``None`` to match a booking of any status.
+    :returns: The matching ``Unhandled exception`` records.
+    """
+    return [
+        record
+        for record in records
+        if record.levelno >= logging.ERROR
+        and record.funcName == "_handle_unhandled_exception"
+        and record.getMessage().startswith("Unhandled exception:")
+        and f"StatusCode.{status_name or ''}" in record.getMessage()
+    ]
+
+
+def _upstream_cancelled_records(
+    records: list[logging.LogRecord], status_name: str
+) -> list[logging.LogRecord]:
+    """
+    WARNING-level upstream-cancellation bookings of an RPC that ended with *status_name*.
+
+    :param records: Records captured from the ``omnigent.server.app`` logger.
+    :param status_name: gRPC status name quoted in the booked exception.
+    :returns: The matching ``Upstream call cancelled by its peer`` records.
+    """
+    return [
+        record
+        for record in records
+        if record.levelno == logging.WARNING
+        and record.getMessage().startswith("Upstream call cancelled by its peer:")
+        and f"StatusCode.{status_name}" in record.getMessage()
+    ]
+
+
+def _booked_category(record: logging.LogRecord) -> str:
+    """
+    :param record: The captured record.
+    :returns: The ``error_category`` attribute the booking carries, or ``?``.
+    """
+    attributes = getattr(record, "attributes", None) or {}
+    return attributes.get("error_category", "?")
+
+
+def _describe_booking(record: logging.LogRecord) -> str:
+    """
+    One-line summary of a booked exception record for assertion messages.
+
+    :param record: The captured record.
+    :returns: Level, category and the first message line.
+    """
+    first_line = record.getMessage().splitlines()[0]
+    return f"{record.levelname} category={_booked_category(record)}: {first_line}"
 
 
 def test_peer_cancelled_rpc_is_not_booked_as_unhandled_session_error(
@@ -260,21 +453,125 @@ def test_peer_cancelled_rpc_is_not_booked_as_unhandled_session_error(
     """
     base_url, records = embedded_server
 
-    response = httpx.get(f"{base_url}/v1/mas/workspace-tree/children", timeout=30.0)
+    response = httpx.get(f"{base_url}{_ROUTE}", timeout=_CLIENT_TIMEOUT_S)
 
     # The journey still ends in an observable error: the backing call failed,
     # so the route must not fabricate a success (and must answer at all).
     assert response.status_code >= 400
 
-    unhandled = [
-        record
-        for record in records
-        if record.levelno >= logging.ERROR
-        and record.funcName == "_handle_unhandled_exception"
-        and record.getMessage().startswith("Unhandled exception:")
-        and "StatusCode.CANCELLED" in record.getMessage()
-    ]
+    unhandled = _unhandled_records(records, "CANCELLED")
     assert not unhandled, (
         "peer-cancelled gRPC call was booked as an unhandled session error: "
         + unhandled[0].getMessage().splitlines()[0]
     )
+
+
+@dataclass
+class _ClientOutcome:
+    """What one client received after the lease release."""
+
+    name: str
+    status_code: int | None = None
+    body: str = ""
+    error: str = ""
+
+    def describe(self) -> str:
+        """
+        :returns: One-line summary for assertion messages.
+        """
+        if self.error:
+            return f"{self.name}: transport error {self.error}"
+        return f"{self.name}: HTTP {self.status_code} {self.body}"
+
+    def error_code(self) -> str | None:
+        """
+        :returns: The ``error.code`` of a JSON error body, or ``None`` without one.
+        """
+        try:
+            return json.loads(self.body)["error"]["code"]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            return None
+
+
+def _drive_lease_release(base_url: str, backend: _LeasedBackend) -> list[_ClientOutcome]:
+    """
+    Several clients hold calls on the leased channel when its lease is released.
+
+    Each client sends the listing request; once every backing call is held,
+    the lease release tears the endpoint down under all of them.
+
+    :param base_url: Server base URL.
+    :param backend: The leased backend standing in for the barnacle channel.
+    :returns: What each client received.
+    """
+    outcomes = [_ClientOutcome(f"client-{index}") for index in range(_LEASED_CLIENTS)]
+
+    def _request(outcome: _ClientOutcome) -> None:
+        try:
+            response = httpx.get(f"{base_url}{_ROUTE}", timeout=_CLIENT_TIMEOUT_S)
+        except httpx.HTTPError as exc:
+            outcome.error = repr(exc)
+            return
+        outcome.status_code = response.status_code
+        outcome.body = response.text
+
+    threads = [
+        threading.Thread(target=_request, args=(outcome,), daemon=True) for outcome in outcomes
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        backend.wait_for_inflight(_LEASED_CLIENTS)
+    finally:
+        # Tear the endpoint down even if a call never arrived, so every request
+        # ends and the client threads can be joined.
+        backend.release_lease()
+        for thread in threads:
+            thread.join(timeout=_CLIENT_TIMEOUT_S + 5)
+    assert not any(thread.is_alive() for thread in threads), "a client never got a response"
+    return outcomes
+
+
+def test_lease_release_answers_499_and_books_no_unhandled_errors(
+    leased_embedded_server: tuple[str, list[logging.LogRecord]],
+    leased_grpc_backend: _LeasedBackend,
+) -> None:
+    """
+    Endpoint teardown answers connected callers with the typed 499 and books no unhandled error.
+
+    :param leased_embedded_server: Base URL of the running server plus the
+        records captured from the ``omnigent.server.app`` logger.
+    :param leased_grpc_backend: The leased backend whose teardown is driven.
+    """
+    base_url, records = leased_embedded_server
+
+    outcomes = _drive_lease_release(base_url, leased_grpc_backend)
+
+    # Responses: every client gets the coded, retryable 499.
+    received = [(outcome.status_code, outcome.error_code()) for outcome in outcomes]
+    assert received == [(499, "upstream_cancelled")] * len(outcomes), (
+        "lease release did not answer the clients with upstream_cancelled:\n"
+        + "\n".join(outcome.describe() for outcome in outcomes)
+    )
+
+    # Bookings: nothing reaches the catch-all as an unhandled error, whatever
+    # status the teardown surfaced under.
+    unhandled = _unhandled_records(records)
+    assert not unhandled, (
+        f"lease release booked {len(unhandled)} unhandled session error(s) "
+        f"for {_LEASED_CLIENTS} in-flight calls:\n"
+        + "\n".join(_describe_booking(record) for record in unhandled)
+    )
+
+    # Exactly one WARNING upstream-cancellation booking per cancelled call.
+    cancelled = _upstream_cancelled_records(records, "UNAVAILABLE")
+    assert len(cancelled) == len(outcomes), (
+        "expected one WARNING upstream-cancellation booking per cancelled call, "
+        f"got {len(cancelled)}:\n"
+        + "\n".join(
+            _describe_booking(record) for record in records if record.levelno >= logging.WARNING
+        )
+    )
+    assert {_booked_category(record) for record in cancelled} == {"upstream"}, [
+        _describe_booking(record) for record in cancelled
+    ]
