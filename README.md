@@ -46,7 +46,7 @@ Omnigent lets you:
   disposable [Modal](https://modal.com), [Daytona](https://www.daytona.io),
   [Blaxel](https://blaxel.ai),
   [Islo](https://islo.dev), [E2B](https://e2b.dev),
-  [Gensee](https://gensee.ai),
+  [Gensee](https://gensee.ai), [boxd](https://boxd.sh?ref=omnigent),
   [CoreWeave](https://docs.coreweave.com/products/sandboxes),
   [Kubernetes](https://kubernetes.io), [OpenShell](https://github.com/NVIDIA/OpenShell),
   [Boxlite](https://github.com/boxlite-ai/boxlite),
