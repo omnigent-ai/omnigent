@@ -6995,6 +6995,7 @@ describe("localhost previews for hosts reached over SSH", () => {
 
   it("keeps a verified preview destination separate from SSH file access", async (t) => {
     const proofs = [];
+    let questions = 0;
     const h = loadNavigationHarness({
       serverUrl: server,
       sshPreviewVerification: async (...args) => {
@@ -7005,7 +7006,11 @@ describe("localhost previews for hosts reached over SSH", () => {
     t.after(h.cleanup);
     h.api.registerIpc();
     h.api.createBrowserRegistryForWindow(h.win);
-    h.electron.dialog.showMessageBox = async () => ({ response: 1 });
+    const approve = async () => {
+      questions++;
+      return { response: 1 };
+    };
+    h.electron.dialog.showMessageBox = approve;
     const event = { sender: h.webContents, senderFrame: { url: server } };
     const deps = h.browserIpcDeps();
     const opts = {
@@ -7023,6 +7028,29 @@ describe("localhost previews for hosts reached over SSH", () => {
     assert.equal(savedProof.destination(server, hostId), "devbox");
     const context = deps.getAgentContextForEvent(event, opts);
     assert.equal(h.browserRegistryDeps().allowsLocalhost(context), true);
+    h.sshHosts.record(server, hostId, "devbox");
+    assert.equal(h.browserRegistryDeps().allowsLocalhost(context), true);
+    h.sshHosts.record(server, hostId, "replacement");
+    h.sshHosts.record(server, hostId, "devbox");
+    assert.equal(h.browserRegistryDeps().allowsLocalhost(context), false);
+
+    const consent = Promise.withResolvers();
+    h.electron.dialog.showMessageBox = () => {
+      questions++;
+      return consent.promise;
+    };
+    const pending = deps.requestPreviewHostForEvent(event, preview, opts);
+    await until(() => questions === 2, "fresh consent for the restored destination");
+    h.sshHosts.record(server, hostId, "replacement");
+    h.sshHosts.record(server, hostId, "devbox");
+    consent.resolve({ response: 1 });
+    assert.equal(await pending, false, "intermediate writes must invalidate pending consent too");
+    assert.equal(h.browserRegistryDeps().allowsLocalhost(context), false);
+
+    h.electron.dialog.showMessageBox = approve;
+    assert.equal(await deps.requestPreviewHostForEvent(event, preview, opts), true);
+    assert.equal(questions, 3);
+    assert.equal(proofs.length, 1, "the file-access route is already proven");
     h.sshHosts.record(server, hostId, "replacement");
     assert.equal(h.browserRegistryDeps().allowsLocalhost(context), false);
   });

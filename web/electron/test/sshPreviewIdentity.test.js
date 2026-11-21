@@ -127,6 +127,7 @@ it(
     assert.equal(parsed?.status, 0, parsed?.stderr);
     assert.match(parsed.stdout, /^requesttty false$/m);
     assert.match(parsed.stdout, /^controlmaster false$/m);
+    assert.doesNotMatch(parsed.stdout, /^remotecommand (?!none$)/m);
     assert.match(parsed.stdout, /^forwardagent no$/m);
     assert.match(parsed.stdout, /^forwardx11 no$/m);
     assert.equal(verified, true);

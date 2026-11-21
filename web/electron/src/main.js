@@ -377,12 +377,17 @@ function databricksInternalFeaturesEnabled() {
  */
 const arcaIdentities = createArcaIdentityStore();
 // Hosts this desktop connected over SSH, and the connections that reach their workspace sockets.
-const sshHosts = createSshHostStore(() => path.join(app.getPath("userData"), "ssh-hosts.json"));
+const onSshDestinationChanged = (serverUrl, hostId) =>
+  sshPreviewHosts.destinationChanged(serverUrl, hostId);
+const sshHosts = createSshHostStore(() => path.join(app.getPath("userData"), "ssh-hosts.json"), {
+  onChange: onSshDestinationChanged,
+});
 const workspaceSshForwards = createWorkspaceSshForwards();
 const sshTargetChecks = createSshTargetChecks({ record: sshHosts.record });
 // Preview identity proofs must not approve workspace file access.
-const sshPreviewDestinations = createSshHostStore(() =>
-  path.join(app.getPath("userData"), "ssh-preview-hosts.json"),
+const sshPreviewDestinations = createSshHostStore(
+  () => path.join(app.getPath("userData"), "ssh-preview-hosts.json"),
+  { onChange: onSshDestinationChanged },
 );
 const sshPreviewHosts = createSshPreviewHosts({
   destination: (serverUrl, hostId) =>

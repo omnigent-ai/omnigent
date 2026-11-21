@@ -132,20 +132,29 @@ describe("localhost previews for hosts reached over SSH", () => {
   }
 
   it("doesn't overwrite a destination recorded during verification", async () => {
-    let destination = null;
-    let records = 0;
-    const previews = createSshPreviewHosts({
-      destination: () => destination,
-      verify: async () => {
-        destination = "replacement";
-        return true;
-      },
-      record: () => records++,
-    });
-    assert.equal(await previews.request(SERVER, HOST, async () => true, "devbox"), false);
-    assert.equal(records, 0);
-    assert.equal(destination, "replacement");
-    assert.equal(previews.allows(SERVER, HOST), false);
+    await Promise.all(
+      [false, true].map(async (restored) => {
+        let destination = null;
+        let records = 0;
+        const previews = createSshPreviewHosts({
+          destination: () => destination,
+          verify: async () => {
+            destination = "replacement";
+            previews.destinationChanged(SERVER, HOST);
+            if (restored) {
+              destination = "devbox";
+              previews.destinationChanged(SERVER, HOST);
+            }
+            return true;
+          },
+          record: () => records++,
+        });
+        assert.equal(await previews.request(SERVER, HOST, async () => true, "devbox"), false);
+        assert.equal(records, 0);
+        assert.equal(destination, restored ? "devbox" : "replacement");
+        assert.equal(previews.allows(SERVER, HOST), false);
+      }),
+    );
   });
 
   it("allows a recorded host only after the user allows it", async () => {

@@ -29,10 +29,20 @@ function createSshPreviewHosts({ destination, verify, record }) {
     const key = keyFor(serverUrl, hostId);
     // Restoring a replaced destination must not revive its earlier consent.
     if (allowed.get(key) !== current) allowed.delete(key);
+    const attempt = pending.get(key);
+    if (attempt && current !== attempt.observedDestination) {
+      if (current !== attempt.destination) attempt.invalidated = true;
+      attempt.observedDestination = current;
+    }
     return current;
   }
 
   return {
+    /** Observe destination writes even when no preview is open. */
+    destinationChanged(serverUrl, hostId) {
+      recorded(serverUrl, hostId);
+    },
+
     /**
      * Whether `hostId`'s sessions may open localhost pages. A host whose recorded
      * destination changed since the user allowed it no longer qualifies.
@@ -71,18 +81,21 @@ function createSshPreviewHosts({ destination, verify, record }) {
       const asked = existing ?? (verify && record ? suggestedAlias(sshTarget) : null);
       if (asked === null) return Promise.resolve(false);
       const inFlight = pending.get(key);
-      if (inFlight) return inFlight;
-      const attempt = Promise.resolve()
-        .then(() => approve(asked, existing === null))
+      if (inFlight) return inFlight.promise;
+      const attempt = { destination: asked, observedDestination: existing, invalidated: false };
+      attempt.promise = Promise.resolve()
+        .then(() => (attempt.invalidated ? null : approve(asked, existing === null)))
         .catch(() => null)
         .then(async (answer) => {
           if (answer === false) {
             allowed.delete(key);
             declined.add(key);
           }
-          if (answer !== true) return false;
+          if (answer !== true || attempt.invalidated) return false;
           if (existing === null) {
-            if (!(await verify(serverUrl, hostId, asked).catch(() => false))) {
+            const verified = await verify(serverUrl, hostId, asked).catch(() => false);
+            if (attempt.invalidated) return false;
+            if (!verified) {
               failed.set(
                 key,
                 "The SSH destination could not be verified as this session's host. Check its connection and restart Omnigent to retry.",
@@ -91,7 +104,7 @@ function createSshPreviewHosts({ destination, verify, record }) {
             }
             // Another connection may have recorded a different destination during verification.
             const current = recorded(serverUrl, hostId);
-            if (current !== null && current !== asked) return false;
+            if (attempt.invalidated || (current !== null && current !== asked)) return false;
             try {
               record(serverUrl, hostId, asked);
             } catch (error) {
@@ -104,13 +117,13 @@ function createSshPreviewHosts({ destination, verify, record }) {
             }
           }
           // The record can change while the question is open; the answer covers only what was shown.
-          if (recorded(serverUrl, hostId) !== asked) return false;
+          if (recorded(serverUrl, hostId) !== asked || attempt.invalidated) return false;
           allowed.set(key, asked);
           return true;
         })
         .finally(() => pending.delete(key));
       pending.set(key, attempt);
-      return attempt;
+      return attempt.promise;
     },
 
     /**
