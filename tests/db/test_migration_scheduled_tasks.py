@@ -24,7 +24,7 @@ from packaging.version import Version
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
-from omnigent.db.cockroachdb import _crdb_server_version
+from omnigent.db.cockroachdb import _crdb_server_version, _prepare_crdb_schema_transaction
 from omnigent.db.db_models import (
     ConversationBase,
     OmnigentBase,
@@ -1277,12 +1277,26 @@ def test_timer_kind_downgrade_requires_live_connection() -> None:
     assert "ALTER TABLE" not in config.output_buffer.getvalue()
 
 
+def _migrate_on_one_connection(engine: Engine, revision: str, *, downgrade: bool = False) -> None:
+    """Migrate the way startup does: one connection, committed once the run finishes.
+
+    The timer-kind migration commits part way on CockroachDB, which a connection
+    opened with ``engine.begin()`` refuses.
+    """
+    config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
+    with engine.connect() as connection:
+        if engine.dialect.name == "cockroachdb":
+            _prepare_crdb_schema_transaction(connection, _crdb_server_version(engine))
+        config.attributes["connection"] = connection
+        (command.downgrade if downgrade else command.upgrade)(config, revision)
+        connection.commit()
+
+
 @pytest.mark.parametrize("dispatch_migration_engine", [_SMART_ROUTING_REVISION], indirect=True)
 def test_timer_kind_migration_round_trips_once_timers_are_gone(
     dispatch_migration_engine: Engine,
 ) -> None:
     engine = dispatch_migration_engine
-    config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
     values = {
         "name": "Timer",
         "prompt": b"p",
@@ -1295,16 +1309,13 @@ def test_timer_kind_migration_round_trips_once_timers_are_gone(
     # Before the migration a timer cannot be stored.
     with pytest.raises((IntegrityError, sa.exc.OperationalError)), engine.begin() as conn:
         conn.execute(before.insert().values(id=b"t" * 16, kind=3, **values))
-    with engine.begin() as conn:
-        config.attributes["connection"] = conn
-        command.upgrade(config, _TIMER_KIND_REVISION)
+    _migrate_on_one_connection(engine, _TIMER_KIND_REVISION)
     tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
     with engine.begin() as conn:
         conn.execute(tasks.insert().values(id=b"t" * 16, kind=3, **values))
         conn.execute(tasks.insert().values(id=b"a" * 16, kind=1, **values))
-    with pytest.raises(RuntimeError, match="Cancel or delete"), engine.begin() as conn:
-        config.attributes["connection"] = conn
-        command.downgrade(config, _SMART_ROUTING_REVISION)
+    with pytest.raises(RuntimeError, match="Cancel or delete"):
+        _migrate_on_one_connection(engine, _SMART_ROUTING_REVISION, downgrade=True)
     with engine.connect() as conn:
         assert (
             conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one()
@@ -1312,9 +1323,7 @@ def test_timer_kind_migration_round_trips_once_timers_are_gone(
         )
     with engine.begin() as conn:
         conn.execute(tasks.delete().where(tasks.c.kind == 3))
-    with engine.begin() as conn:
-        config.attributes["connection"] = conn
-        command.downgrade(config, _SMART_ROUTING_REVISION)
+    _migrate_on_one_connection(engine, _SMART_ROUTING_REVISION, downgrade=True)
     with pytest.raises((IntegrityError, sa.exc.OperationalError)), engine.begin() as conn:
         conn.execute(tasks.insert().values(id=b"t" * 16, kind=3, **values))
     with engine.begin() as conn:

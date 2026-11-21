@@ -22,8 +22,18 @@ depends_on: tuple[str, ...] | None = None
 _TIMER = 3
 
 
+def _publish_earlier_schema_changes() -> None:
+    """Commit pending schema changes on CockroachDB, which can't drop a check it is adding."""
+    bind = op.get_bind()
+    if bind.dialect.name == "cockroachdb":
+        bind.commit()
+        bind.execute(sa.text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
+
+
 def upgrade() -> None:
     """Replace the kind check so it also accepts timers."""
+    # An upgrade that also runs the migration adding the old check holds it unpublished.
+    _publish_earlier_schema_changes()
     with op.batch_alter_table("scheduled_tasks") as batch:
         # A distinct name lets CockroachDB replace the check in one transaction.
         batch.drop_constraint("ck_scheduled_tasks_kind", type_="check")
@@ -38,6 +48,8 @@ def downgrade() -> None:
     timer = sa.select(tasks.c.kind).where(tasks.c.kind == _TIMER).limit(1)
     if op.get_bind().execute(timer).first():
         raise RuntimeError("Cancel or delete scheduled-task timers before downgrading")
+    # A round trip in one transaction would otherwise drop a check it is still adding.
+    _publish_earlier_schema_changes()
     with op.batch_alter_table("scheduled_tasks") as batch:
         batch.drop_constraint("ck_scheduled_tasks_task_kind", type_="check")
         batch.create_check_constraint("ck_scheduled_tasks_kind", "kind IN (1, 2)")
