@@ -20,6 +20,11 @@ const QuickPickCommandPalette = lazy(() =>
 const ThemePicker = lazy(() =>
   import("./ThemePicker").then((module) => ({ default: module.ThemePicker })),
 );
+const SessionActionHost = lazy(() =>
+  import("./sessionCommands/SessionActionHost").then((module) => ({
+    default: module.SessionActionHost,
+  })),
+);
 
 // Dev-only preview; lazy so the sample data never ships in production bundles.
 const ImportContextPreview = import.meta.env.DEV
@@ -97,6 +102,12 @@ export function AppShellOverlays({
       {quickPick && (
         <Suspense fallback={null}>
           <ThemePicker />
+        </Suspense>
+      )}
+      {/* Carries out a session's action picked from ⌘↵ on its ⌘K row. */}
+      {quickPick && (
+        <Suspense fallback={null}>
+          <SessionActionHost />
         </Suspense>
       )}
       <RecentSessionsSwitcher

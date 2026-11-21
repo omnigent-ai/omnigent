@@ -34,6 +34,10 @@ beforeEach(() => {
     loaded.add("ThemePicker");
     return { ThemePicker: () => <div data-testid="theme-picker" /> };
   });
+  vi.doMock("./sessionCommands/SessionActionHost", () => {
+    loaded.add("SessionActionHost");
+    return { SessionActionHost: () => <div data-testid="session-action-host" /> };
+  });
 });
 
 async function renderOverlays(
@@ -98,7 +102,12 @@ describe("AppShellOverlays palette flag", () => {
       );
       expect(await findByTestId("theme-picker")).toBeTruthy();
       expect(queryByTestId("cmdk-palette")).toBeNull();
-      expect([...loaded].sort()).toEqual(["QuickPickCommandPalette", "ThemePicker"]);
+      expect(await findByTestId("session-action-host")).toBeTruthy();
+      expect([...loaded].sort()).toEqual([
+        "QuickPickCommandPalette",
+        "SessionActionHost",
+        "ThemePicker",
+      ]);
     },
   );
 });
