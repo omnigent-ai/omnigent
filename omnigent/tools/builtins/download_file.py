@@ -23,9 +23,9 @@ class DownloadFileTool(Tool):
     @classmethod
     def name(cls) -> str:
         """
-        :returns: ``"download_file"``.
+        :returns: ``"sys_download_file"``.
         """
-        return "download_file"
+        return "sys_download_file"
 
     @classmethod
     def description(cls) -> str:
@@ -34,7 +34,7 @@ class DownloadFileTool(Tool):
         """
         return (
             "Download a file by its file_id to the workspace. "
-            "Returns the local file path. Use list_files to "
+            "Returns the local file path. Use sys_list_files to "
             "find available file IDs."
         )
 
@@ -47,10 +47,10 @@ class DownloadFileTool(Tool):
         return {
             "type": "function",
             "function": {
-                "name": "download_file",
+                "name": "sys_download_file",
                 "description": (
                     "Download a file by its file_id to the workspace. "
-                    "Returns the local file path. Use list_files to "
+                    "Returns the local file path. Use sys_list_files to "
                     "find available file IDs."
                 ),
                 "parameters": {

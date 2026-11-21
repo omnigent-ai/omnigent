@@ -505,8 +505,8 @@ def _render_task_list(
     "sys_call_async",
     "sys_cancel_async",
     "sys_cancel_task",
-    "upload_file",
-    "download_file",
+    "sys_upload_file",
+    "sys_download_file",
 )
 def _render_status_tool(
     ex: ToolExecution,
@@ -873,12 +873,12 @@ def _status_title_message(
     if "cancel" in name:
         message = f"{fields.task_id} · cancelled={fields.cancelled}"
         return "task cancellation", message
-    if name == "upload_file":
+    if name == "sys_upload_file":
         message = " · ".join(
             bit for bit in (fields.filename, fields.content_type, fields.file_id) if bit
         )
         return "uploaded file", message
-    if name == "download_file":
+    if name == "sys_download_file":
         message = " · ".join(
             bit
             for bit in (

@@ -1360,6 +1360,7 @@ tool_groups:
   projects: false         # sys_project_* / sys_session_update
   user_inbox: false       # sys_user_inbox_post / sys_user_inbox_list
   memory: false           # memory_search / _get / _list / _write / _delete
+  files: false            # sys_upload_file / sys_list_files / sys_download_file
 ```
 
 Every group defaults to `true`, so omitting the block changes nothing. Values
@@ -1388,6 +1389,13 @@ on them is an error:
   `omnigent server --memory-backend hindsight`.
 - Specs with their own local tool or MCP server named like a memory tool, which
   keep that tool. See [MEMORY.md](MEMORY.md).
+
+The `files` group shares files through the current session's file resources
+(`/v1/sessions/{id}/resources/files`). `sys_upload_file` stores a file from
+inside the session workspace, `sys_list_files` lists the session's files, and
+`sys_download_file` returns a stored file's content as text, so it suits text
+files rather than binary ones. These tools cannot be listed under
+`tools.builtins`.
 
 `agent_discovery: false` is rejected while `spawn: true` or the
 `scheduled_tasks` group is on: `sys_session_create` and

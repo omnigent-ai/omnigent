@@ -1066,7 +1066,7 @@ def register_inline_agent(
         block into the executor so the harness hits the mock server
         instead of ``api.openai.com``.
     :param builtin_tools: When set, add a ``tools.builtins`` list to
-        the agent spec, e.g. ``["list_files", "upload_file"]``.
+        the agent spec, e.g. ``["web_search"]``.
     :param extra_config: When set, top-level keys shallow-merged into
         the agent YAML before upload (e.g. ``tools`` and ``policies``).
         ``name``/``prompt``/``executor`` stay helper-controlled.

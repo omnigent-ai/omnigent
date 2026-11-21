@@ -9,7 +9,7 @@ and skips).
 Tool categories:
 - _OS_ENV_TOOLS: execute through a runner-local OSEnvironment (sys_os_*)
 - _REST_TOOLS: call server REST APIs (sys_call_async, sys_cancel_async)
-- _FILE_TOOLS: call server file APIs (sys_upload/download/list_files)
+- _FILE_TOOLS: call server file APIs (sys_upload_file, sys_list_files, sys_download_file)
 - _TERMINAL_TOOLS: runner-local TerminalRegistry
 - MCP tools: spec-defined; dispatched via RunnerMcpManager passed
   in by proxy_stream (designs/RUNNER_MCP.md). Not in the static
@@ -92,6 +92,7 @@ from omnigent.tools.builtins.async_inbox import (
 from omnigent.tools.builtins.browser import BROWSER_TOOL_NAMES
 from omnigent.tools.builtins.download_file import DownloadFileTool
 from omnigent.tools.builtins.list_comments import ListCommentsTool
+from omnigent.tools.builtins.list_files import ListFilesTool
 from omnigent.tools.builtins.os_env import (
     OS_ENV_TOOL_TYPES,
     SysOsEditTool,
@@ -297,14 +298,8 @@ _OS_ENV_TOOLS = frozenset(tool_cls.name() for tool_cls in OS_ENV_TOOL_TYPES)
 # (sys_call_async / sys_cancel_async moved to _ASYNC_INBOX_TOOLS)
 _REST_TOOLS: frozenset[str] = frozenset()
 
-# Priority 5c: File tools — runner calls server file APIs.
-_FILE_TOOLS = frozenset(
-    {
-        UploadFileTool.name(),
-        DownloadFileTool.name(),
-        "list_files",  # from builtins registry; no standalone class
-    }
-)
+# Priority 5c: File tools — runner calls the server's session file APIs.
+_FILE_TOOLS = frozenset({UploadFileTool.name(), ListFilesTool.name(), DownloadFileTool.name()})
 
 # Priority 5d: Terminal tools — runner-local TerminalRegistry.
 _TERMINAL_TOOLS = frozenset(
@@ -534,7 +529,7 @@ _BROWSER_TIMEOUT_ERROR = (
 # ignore the harness ``tools`` list, so the relay is their ONLY tool
 # surface; this set is the runner-/server-proxied builtin surface that
 # rides through the Omnigent ``/mcp`` endpoint (comment, session read/write,
-# async inbox, task lifecycle, agent-discovery, and terminal families —
+# async inbox, task lifecycle, agent-discovery, file, and terminal families —
 # the same dispatch posture non-native harnesses get via
 # ``request.tools``). ``sys_terminal_*`` inherits the spec gate for
 # free: the relay only advertises names that ``ToolManager(spec)``
@@ -576,6 +571,9 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     # what discovers host-scope skills (``.agents/skills`` and friends), and a
     # native session's only tool surface is this relay.
     | _SKILL_TOOLS
+    # Session file tools reach only this session's file store, and uploads
+    # only read files inside the session workspace.
+    | _FILE_TOOLS
 )
 
 
@@ -624,7 +622,7 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
     Returns the same tool set the claude-native / codex-native relay advertises
     and that pi-native registers via ``pi.registerTool``: the spec-gated builtin
     surface (``_NATIVE_RELAY_BUILTIN_TOOLS`` — comment, session read/write,
-    agent-discovery, policy, and terminal families). It never includes
+    agent-discovery, policy, file, and terminal families). It never includes
     ``sys_os_*``: native harnesses use their own shell and file tools.
 
     Each entry is a flat ``{"name", "description", "parameters"}`` dict (the
@@ -703,6 +701,9 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
             SysAgentDownloadTool,
             SysAddPolicyTool,
             SysPolicyRegistryTool,
+            UploadFileTool,
+            ListFilesTool,
+            DownloadFileTool,
         ):
             if _cls is SysSessionMessageTool and not peer_session_messaging_enabled():
                 continue
@@ -9246,19 +9247,19 @@ async def _execute_file_tool(
     """
     Execute a file tool by calling session-scoped server file APIs.
 
-    :param tool_name: File tool name, e.g. ``"upload_file"``.
+    :param tool_name: File tool name, e.g. ``"sys_upload_file"``.
     :param args: Parsed tool arguments.
     :param server_client: HTTP client for the Omnigent server.
     :param conversation_id: Owning session/conversation id,
         e.g. ``"conv_abc123"``.
     :param agent_spec: Agent spec resolved for the current turn, used
         (with ``runner_workspace``) to derive the workspace root that
-        an ``upload_file`` path is resolved against. ``None`` falls back
+        a ``sys_upload_file`` path is resolved against. ``None`` falls back
         to the per-conversation default workspace.
     :param runner_workspace: Authoritative runtime cwd for the runner,
         sourced from ``OMNIGENT_RUNNER_WORKSPACE``. Combined with
         ``agent_spec`` to compute the workspace containment boundary
-        for ``upload_file``.
+        for ``sys_upload_file``.
     :returns: Tool result string.
     """
     if server_client is None:
@@ -9314,14 +9315,14 @@ async def _execute_file_tool(
         except Exception as exc:  # noqa: BLE001
             return f"Error: {DownloadFileTool.name()} failed: {exc}"
 
-    if tool_name == "list_files":
+    if tool_name == ListFilesTool.name():
         try:
             resp = await server_client.get(files_path, timeout=30.0)
             if resp.status_code == 200:
                 return json.dumps(resp.json())
-            return f"Error: list_files returned {resp.status_code}"
+            return f"Error: {tool_name} returned {resp.status_code}"
         except Exception as exc:  # noqa: BLE001
-            return f"Error: list_files failed: {exc}"
+            return f"Error: {tool_name} failed: {exc}"
 
     return f"Error: {tool_name} not implemented in file dispatch"
 

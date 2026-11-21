@@ -619,6 +619,33 @@ def test_render_status_tool_raw_error_prefix() -> None:
     assert "disk full" in rendered
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "output", "expected"),
+    [
+        (
+            "sys_upload_file",
+            {"file_id": "file_abc123", "filename": "chart.png", "content_type": "image/png"},
+            ["uploaded file", "chart.png", "image/png", "file_abc123"],
+        ),
+        (
+            "sys_download_file",
+            {"path": "notes.txt", "filename": "notes.txt", "bytes": 2048},
+            ["downloaded file", "notes.txt", "2.0 KB"],
+        ),
+    ],
+)
+def test_render_session_file_tools(
+    tool_name: str, output: dict[str, object], expected: list[str]
+) -> None:
+    """The session file tools render their status panel under their ``sys_`` names."""
+    raw = json.dumps(output)
+    ex = _tool_ex(tool_name, output=raw)
+    result = DEFAULT_TOOL_RENDERERS.render_tool(ex, parse_tool_output(raw), _theme())
+    rendered = _render_to_text(result)
+    for text in expected:
+        assert text in rendered, rendered
+
+
 def test_render_terminal_launch_success() -> None:
     """sys_terminal_launch renders terminal name and status."""
     output = json.dumps(

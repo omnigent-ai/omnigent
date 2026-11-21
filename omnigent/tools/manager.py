@@ -201,6 +201,7 @@ class ToolManager:
         # The framework-owned groups below register without the spec
         # opting in; a spec drops one it cannot use via ``tool_groups:``.
         self._register_comment_tools()
+        self._register_file_tools()
         self._register_policy_tools()
         self._register_scheduled_task_tools()
         self._register_journal_tools()
@@ -385,9 +386,9 @@ class ToolManager:
 
         Most tools are looked up in the built-in registry and
         instantiated with spec-level config. Some (``web_search``,
-        ``web_fetch``, ``upload_file``) need runtime context the
-        registry doesn't have and are dispatched through
-        :meth:`_create_builtin` instead.
+        ``web_fetch``) need runtime context the registry doesn't
+        have and are dispatched through :meth:`_create_builtin`
+        instead.
         """
         for entry in self._spec.tools.builtins:
             tool = self._create_builtin(entry.name, entry.config)
@@ -395,9 +396,9 @@ class ToolManager:
                 _logger.warning(
                     "Unknown built-in tool %r — skipping. "
                     "Available: web_search, web_read, web_fetch, "
-                    "upload_file, list_files, download_file, "
                     "search_conversations, export_agent. "
-                    "Note: list_comments and update_comment are "
+                    "Note: list_comments, update_comment, sys_upload_file, "
+                    "sys_list_files and sys_download_file are "
                     "framework-owned and auto-registered; they cannot "
                     "be declared in the spec. "
                     "(Interactive shells now go through the "
@@ -424,10 +425,6 @@ class ToolManager:
             return self._create_web_search(config)
         if name == "web_fetch":
             return self._create_web_fetch()
-        if name == "upload_file":
-            from omnigent.tools.builtins.upload_file import UploadFileTool
-
-            return UploadFileTool()
         return get_builtin_tool(name, config=config)
 
     def _create_web_search(self, config: dict[str, str] | None) -> Tool:
@@ -651,6 +648,25 @@ class ToolManager:
             return
         self._tools[ListCommentsTool.name()] = ListCommentsTool()
         self._tools[UpdateCommentTool.name()] = UpdateCommentTool()
+
+    def _register_file_tools(self) -> None:
+        """
+        Auto-register ``sys_upload_file``, ``sys_list_files`` and ``sys_download_file``.
+
+        Registered without spec opt-in so every agent can share workspace files
+        with the user and read the session's files; ``tool_groups.files: false``
+        drops all three. The runner dispatches them through the server's
+        session-scoped ``/v1/sessions/{id}/resources/files`` routes, and uploads
+        only read files inside the session workspace.
+        """
+        if not self._spec.tool_groups.files:
+            return
+        from omnigent.tools.builtins.download_file import DownloadFileTool
+        from omnigent.tools.builtins.list_files import ListFilesTool
+        from omnigent.tools.builtins.upload_file import UploadFileTool
+
+        for tool in (UploadFileTool(), ListFilesTool(), DownloadFileTool()):
+            self._tools[tool.name()] = tool
 
     def _register_browser_tools(self) -> None:
         """

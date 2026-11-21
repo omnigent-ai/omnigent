@@ -85,6 +85,6 @@ def test_unconditional_tools_always_advertised(monkeypatch: pytest.MonkeyPatch) 
     """Tools with no optional dependency survive every gate combination."""
     _reload_with_specs(monkeypatch, present=set())
 
-    assert {"web_search", "web_fetch", "list_files", "upload_file"} <= set(
+    assert {"web_search", "web_fetch", "export_agent", "search_conversations"} <= set(
         list_tools_mod._TOOL_CLASSES
     )
