@@ -1025,11 +1025,11 @@ describe("FileViewer URL sync — comment param", () => {
   });
 
   it("opens the comments panel for a linked comment it's given, with no ?comment= in the URL", () => {
-    useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1")]));
+    useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1"), makeComment("c2")]));
 
-    renderViewer({ open: true, path: "file1.py", linkedCommentId: "c1" });
+    renderViewer({ open: true, path: "file1.py", linkedCommentId: "c2" });
 
-    expect(screen.getByTestId("comments-panel")).toBeInTheDocument();
+    expect(screen.getByTestId("comments-panel")).toHaveAttribute("data-active-comment-id", "c2");
   });
 
   it("applies the linked comment only once per component lifecycle", () => {

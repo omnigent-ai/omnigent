@@ -140,6 +140,26 @@ describe("FilesPageViewer", () => {
     expect(captured.viewer!.linkedCommentId).toBe("c1");
   });
 
+  it("starts the app's viewer afresh for another linked comment, so its thread opens too", () => {
+    const text = { data: file("src/app.ts", "const a = 1;\n") };
+    const { rerender, onClose } = renderViewer("src/app.ts", text, { commentId: "c1" });
+    const viewerFor = (commentId: string) => (
+      <FilesPageViewer
+        conversationId="conv_1"
+        path="src/app.ts"
+        active
+        onClose={onClose}
+        commentId={commentId}
+      />
+    );
+    const first = screen.getByTestId("file-viewer");
+    rerender(viewerFor("c1"));
+    expect(screen.getByTestId("file-viewer")).toBe(first);
+    rerender(viewerFor("c2"));
+    expect(screen.getByTestId("file-viewer")).not.toBe(first);
+    expect(captured.viewer!.linkedCommentId).toBe("c2");
+  });
+
   it("gives the app's viewer the session's permission level, for rich files and bytes that aren't text", () => {
     renderViewer(
       "docs/guide.md",
