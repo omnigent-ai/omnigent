@@ -7,6 +7,7 @@ androidxActivity = "1.12.4"
 androidxWebkit = "1.15.0"
 androidxBrowser = "1.10.0"
 androidxAppcompat = "1.8.0"
+androidxWork = "2.10.1"
 junit = "4.13.2"
 robolectric = "4.17"
 androidxTestCore = "1.7.0"
@@ -23,6 +24,7 @@ androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = 
 androidx-activity = { group = "androidx.activity", name = "activity-ktx", version.ref = "androidxActivity" }
 androidx-appcompat = { group = "androidx.appcompat", name = "appcompat", version.ref = "androidxAppcompat" }
 androidx-webkit = { group = "androidx.webkit", name = "webkit", version.ref = "androidxWebkit" }
+androidx-work-runtime-ktx = { group = "androidx.work", name = "work-runtime-ktx", version.ref = "androidxWork" }
 androidx-browser = { group = "androidx.browser", name = "browser", version.ref = "androidxBrowser" }
 junit = { group = "junit", name = "junit", version.ref = "junit" }
 robolectric = { group = "org.robolectric", name = "robolectric", version.ref = "robolectric" }
