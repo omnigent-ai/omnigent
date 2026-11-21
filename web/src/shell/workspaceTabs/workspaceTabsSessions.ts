@@ -306,12 +306,13 @@ export async function openWorkspaceFileLink(
     return openWorkspaceFile(sessionId, path, fileOptions, opener);
   }
   const line = lineRange(fileOptions);
-  const range = selected.place.range;
+  const { range, comparison } = selected.place;
   const result = await store.navigate(selected.id, {
     kind: "changes",
     path,
     ...(line ? { line } : {}),
     ...(range ? { range } : {}),
+    ...(comparison ? { comparison } : {}),
   });
   // A fresh request each time, so the same line cited again is brought back into view.
   if (result.ok) session.setFileRequest(selected.id, { position: citedFilePosition(fileOptions) });

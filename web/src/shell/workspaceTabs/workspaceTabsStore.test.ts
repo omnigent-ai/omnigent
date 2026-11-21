@@ -90,6 +90,20 @@ describe("opening", () => {
     expectInvariant(store);
   });
 
+  it("marks a fresh landing for each open and history step, and none for a click on a tab", async () => {
+    const { store } = makeStore();
+    expect(store.landing("P")).toBeUndefined();
+    await store.open({ place: { kind: "pulls" } }, { opener: "user" });
+    const opened = store.landing("P");
+    expect(opened).toEqual({ settled: false });
+    store.select("F");
+    expect(store.landing("F")).toBeUndefined();
+    await store.go("back");
+    expect(store.selectedTabId()).toBe("P");
+    expect(store.landing("P")).not.toBe(opened);
+    expect(store.landing("P")).toEqual({ settled: false });
+  });
+
   it("reuses the tab that already shows a page", async () => {
     const { store } = makeStore();
     const result = await store.open({ place: { kind: "pulls" } }, { opener: "user" });

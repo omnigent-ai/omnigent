@@ -48,6 +48,8 @@ export interface ComparisonOwnerSnapshot {
   headOverride: boolean;
   /** Bumped when the session's files may be read again; readers retry then. */
   accessEpoch: number;
+  /** Bumped each time the person chooses a comparison here, even the one shown. */
+  choices: number;
 }
 
 export interface ComparisonOwnerDependencies {
@@ -127,6 +129,7 @@ interface SessionState {
   idleTtlTimer: unknown;
   headOverride: boolean;
   accessEpoch: number;
+  choices: number;
   /** When the route was last asked again about a comparison policy that was off. */
   lastPolicyAskAt: number;
   /** Paths whose automatic re-list was spent; each file has its own chain. */
@@ -269,6 +272,7 @@ export class WorkingCopyComparisonOwner {
   /** The person chose a base, even the current one: their override and typed comparison end. */
   chose(sessionId: string): void {
     const session = this.session(sessionId);
+    session.choices += 1;
     this.clearCustom(session);
     this.clearChoiceState(session);
     session.dirty = session.dirty || session.established === null;
@@ -283,6 +287,7 @@ export class WorkingCopyComparisonOwner {
   compareRevisions(sessionId: string, spec: RevisionSpec): void {
     const session = this.session(sessionId);
     if (!session.workspace) return;
+    session.choices += 1;
     this.deps.customComparisons?.write(sessionId, session.workspace, spec);
     this.applyCustom(session, spec);
     this.clearChoiceState(session);
@@ -434,6 +439,7 @@ export class WorkingCopyComparisonOwner {
         idleTtlTimer: undefined,
         headOverride: false,
         accessEpoch: 0,
+        choices: 0,
         lastPolicyAskAt: Number.NEGATIVE_INFINITY,
         recoveryUsed: new Map(),
         listSerial: 0,
@@ -785,6 +791,7 @@ export class WorkingCopyComparisonOwner {
       connectTimedOut: session.connectTimedOut,
       headOverride: session.headOverride,
       accessEpoch: session.accessEpoch,
+      choices: session.choices,
     };
   }
 
@@ -800,6 +807,7 @@ export class WorkingCopyComparisonOwner {
       previous.connectTimedOut === next.connectTimedOut &&
       previous.headOverride === next.headOverride &&
       previous.accessEpoch === next.accessEpoch &&
+      previous.choices === next.choices &&
       sameRevisions(previous.custom, next.custom) &&
       previous.workspace === next.workspace &&
       JSON.stringify(previous.support) === JSON.stringify(next.support) &&

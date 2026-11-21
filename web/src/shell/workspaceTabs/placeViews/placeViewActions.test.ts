@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { planOpen, type OpenState } from "../planOpen";
 import {
+  changesComparisonShown,
   changesFileInNewTab,
   changesOverview,
   fileTabFileChosen,
@@ -91,6 +92,24 @@ describe("Changes tab", () => {
       replace: false,
     });
     expect(changesOverview({ kind: "changes" })).toEqual({ type: "none" });
+  });
+
+  it("keeps the visit's comparison on the overview it goes back to", () => {
+    const comparison = { kind: "saved", intent: "branch-point" } as const;
+    expect(changesOverview({ kind: "changes", path: "a.go", comparison })).toMatchObject({
+      place: { kind: "changes", comparison },
+    });
+  });
+
+  it("records a comparison the person picked as a step, and any other in place", () => {
+    const shown = { kind: "typed", base: "v1", head: "" } as const;
+    const current = { kind: "changes", path: "a.go" } as const;
+    expect(changesComparisonShown(current, shown, true)).toEqual({
+      type: "navigate",
+      place: { kind: "changes", path: "a.go", comparison: shown },
+      replace: false,
+    });
+    expect(changesComparisonShown(current, shown, false)).toMatchObject({ replace: true });
   });
 });
 

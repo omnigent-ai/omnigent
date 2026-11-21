@@ -843,6 +843,7 @@ function WorkspaceTabsPanelImpl({
               permissionLevel,
             }}
             position={session.fileRequest(tab.id)?.position}
+            landing={store.landing(tab.id)}
             registerLeaveGuard={leaveGuardRegistrar(tab.id)}
           />
         );

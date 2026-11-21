@@ -369,6 +369,18 @@ describe("planOpen", () => {
         });
       });
 
+      it("reuses a Diffs file tab whatever comparison its visit recorded", () => {
+        const diffFile: WorkspacePlace = { kind: "changes", path: "a.go", fileTab: true };
+        const shown: PlanTab = {
+          id: "D",
+          place: { ...diffFile, comparison: { kind: "saved", intent: "branch-point" } },
+          dirty: false,
+        };
+        expect(
+          plan(state([changes, shown], "C"), diffFile, { ...focus, reuse: "same-place" }),
+        ).toMatchObject({ ok: true, plan: { action: "navigate", tabId: "D" } });
+      });
+
       it("refuses at the tab cap", () => {
         expect(plan(state([files], "F", { maxTabs: 1 }), { kind: "pulls" }, focus)).toEqual({
           ok: false,

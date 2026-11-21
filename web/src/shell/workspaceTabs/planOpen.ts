@@ -170,6 +170,16 @@ export function samePlace(left: WorkspacePlace, right: WorkspacePlace): boolean 
   return formatWorkspaceLink({ place: left }) === formatWorkspaceLink({ place: right });
 }
 
+/** The same place, whatever comparison each visit showed, which is its state, not what it is. */
+function sameShownPlace(left: WorkspacePlace, right: WorkspacePlace): boolean {
+  const withoutComparison = (place: WorkspacePlace): WorkspacePlace => {
+    if (place.kind !== "changes") return place;
+    const { comparison: _comparison, ...rest } = place;
+    return rest;
+  };
+  return samePlace(withoutComparison(left), withoutComparison(right));
+}
+
 function withoutPosition(place: WorkspacePlace): WorkspacePlace {
   if (place.kind !== "files" && place.kind !== "changes") return place;
   const { line: _line, comment: _comment, ...rest } = place;
@@ -337,7 +347,8 @@ export function planOpen(state: OpenState, link: WorkspaceLink, options: OpenOpt
       options.reuse === "same-place"
         ? preferredTab(
             state,
-            (tab) => tab.id !== state.selectedTabId && !tab.binding && samePlace(tab.place, place),
+            (tab) =>
+              tab.id !== state.selectedTabId && !tab.binding && sameShownPlace(tab.place, place),
           )
         : identity === null
           ? undefined
