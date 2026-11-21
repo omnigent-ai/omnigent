@@ -156,10 +156,19 @@ def test_requested_sandbox_never_falls_back_to_bare_worker(
     spec = OSEnvSpec(cwd=str(workspace), sandbox=OSEnvSandboxSpec(type="linux_bwrap"))
     private_diagnostic = "/private/host/sandbox-cwd-sentinel"
     cwd_resolution = Mock(side_effect=OSError(f"cwd resolution failed: {private_diagnostic}"))
+    original_resolve = Path.resolve
+
+    def resolve_path(path: Path, strict: bool = False) -> Path:
+        if path == workspace:
+            return cwd_resolution()
+        return original_resolve(path, strict=strict)
+
     with pytest.raises(sandbox.HarnessSandboxPreparationError) as failure:
         with monkeypatch.context() as launch_patch:
             if fault == "cwd":
-                launch_patch.setattr(Path, "resolve", cwd_resolution)
+                launch_patch.setattr(Path, "resolve", resolve_path)
+                assert executable.resolve() == original_resolve(executable)
+                cwd_resolution.assert_not_called()
             with _prepared_launch(harness, executable, workspace, spec):
                 pytest.fail(f"{harness} accepted an unavailable requested sandbox")
     cause = failure.value.__cause__
@@ -325,12 +334,9 @@ def test_relative_policy_cwd_preserves_non_claude_workspace(
 @pytest.mark.parametrize(
     "harness,feature",
     [
-        (harness, feature)
+        # The validator owns the feature matrix; each adapter proves early rejection.
+        (harness, "cwd_conflict" if harness in ("acp", "codex") else "egress_rules")
         for harness in _HARNESSES
-        for feature in ("cwd_conflict", "egress_rules")
-        if feature == "cwd_conflict" or harness != "codex"
-        # Claude's successful-wrap scenario also exercises cwd conflicts.
-        if (harness, feature) != ("claude-sdk", "cwd_conflict")
     ]
     + [pytest.param("codex", "tcp_egress", id="codex-tcp_egress")],
 )
