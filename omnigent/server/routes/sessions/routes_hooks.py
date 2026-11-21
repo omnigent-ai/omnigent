@@ -971,7 +971,7 @@ def register_hooks_routes(
         # is gated here — the hook is its only request-phase gate. The signal
         # is "is a web prompt in flight", not text correlation (the native
         # transcript gives no reliable id channel — see ``pending_inputs``).
-        if phase == Phase.REQUEST and pending_inputs.snapshot_for(session_id):
+        if phase == Phase.REQUEST and pending_inputs.has_recent_web_prompt(session_id):
             return Response(
                 content=json.dumps({"result": "POLICY_ACTION_ALLOW"}),
                 media_type="application/json",

@@ -3376,9 +3376,11 @@ async def test_external_user_message_folds_pending_image_into_durable_item(
         pending_inputs.reset_for_tests()
 
 
+@pytest.mark.parametrize("held_past_ttl_mid_turn", [False, True])
 async def test_external_user_message_drain_publishes_cleared_pending_id(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    held_past_ttl_mid_turn: bool,
 ) -> None:
     """
     Draining a pending entry publishes its id on session.input.consumed.
@@ -3390,16 +3392,30 @@ async def test_external_user_message_drain_publishes_cleared_pending_id(
     ``session.input.consumed`` carries ``cleared_pending_id`` equal to
     the recorded id. A regression here silently breaks the bubble swap
     (the client falls back to FIFO and the entry can strand).
+
+    A native TUI can also hold an accepted message past the pending-input
+    TTL while the turn runs; its late mirror must still clear its own entry,
+    not the newer message queued behind it.
     """
     from omnigent.runtime import pending_inputs
+    from omnigent.server.routes import sessions as sessions_module
 
     published: list[tuple[str, dict[str, Any]]] = []
     _capture_published(monkeypatch, published)
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock["t"])
     pending_inputs.reset_for_tests()
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
     pid = pending_inputs.record(session["id"], [{"type": "input_text", "text": "hi there"}])
+    still_pending: list[str] = []
     try:
+        if held_past_ttl_mid_turn:
+            monkeypatch.setitem(sessions_module._session_status_cache, session["id"], "running")
+            clock["t"] += pending_inputs._TTL_S + 1.0
+            still_pending.append(
+                pending_inputs.record(session["id"], [{"type": "input_text", "text": "newer"}])
+            )
         resp = await client.post(
             f"/v1/sessions/{session['id']}/events",
             json={
@@ -3421,7 +3437,9 @@ async def test_external_user_message_drain_publishes_cleared_pending_id(
         # The drained entry's id is echoed so the client drops that bubble by id.
         assert consumed[0]["data"]["cleared_pending_id"] == pid
         # And the entry is gone from the index.
-        assert pending_inputs.snapshot_for(session["id"]) == []
+        assert [
+            entry["pending_id"] for entry in pending_inputs.snapshot_for(session["id"])
+        ] == still_pending
     finally:
         pending_inputs.reset_for_tests()
 

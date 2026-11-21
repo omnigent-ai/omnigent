@@ -511,6 +511,34 @@ def test_stale_entries_evicted_after_ttl(monkeypatch: pytest.MonkeyPatch) -> Non
     assert pending_inputs.snapshot_for("conv_a") == []
 
 
+def test_mid_turn_session_keeps_a_stale_entry_for_its_late_mirror(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A message the TUI holds past the TTL mid-turn drains its own entry, not a newer one."""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock["t"])
+    busy_sessions = {"conv_a"}
+    monkeypatch.setattr(pending_inputs, "_session_busy_check", busy_sessions.__contains__)
+
+    held = pending_inputs.record("conv_a", [_text_block("held steer")])
+    clock["t"] = 1000.0 + pending_inputs._TTL_S + 0.1
+    newer = pending_inputs.record("conv_a", [_text_block("newer message")])
+    pending_inputs.record("conv_b", [_text_block("idle ghost")])
+    clock["t"] += pending_inputs._TTL_S + 0.1
+    assert pending_inputs.pending_ids("conv_a") == [held, newer]
+    assert pending_inputs.pending_ids("conv_b") == []
+    assert not pending_inputs.has_recent_web_prompt("conv_a")
+
+    match = pending_inputs.resolve_matching_text("conv_a", "held steer")
+    assert match.matched is not None
+    assert match.matched.pending_id == held
+    assert match.skipped == []
+    assert pending_inputs.pending_ids("conv_a") == [newer]
+
+    busy_sessions.clear()
+    assert pending_inputs.snapshot_for("conv_a") == []
+
+
 def test_restore_returns_a_drained_entry_to_the_front() -> None:
     """A restored entry reclaims the head of the FIFO.
 
