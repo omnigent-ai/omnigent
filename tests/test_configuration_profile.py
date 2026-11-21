@@ -316,8 +316,11 @@ async def test_workspace_selector_uses_normal_auth_and_routing(tmp_path, monkeyp
     )
 
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    auth_file = tmp_path / "auth_tokens.json"
+    monkeypatch.setattr("omnigent.cli_auth._token_file_path", lambda: auth_file)
     base = "https://workspace.example/api/2.0/omnigent"
     store_databricks_org_id(base, "111")
+    original_auth = auth_file.read_bytes()
     identity = PreferenceNamespace(authority_id="a", user_id="u", workspace_id="222")
 
     def token_factory(**options):
@@ -341,4 +344,5 @@ async def test_workspace_selector_uses_normal_auth_and_routing(tmp_path, monkeyp
     )
     result = await commands._request(base + "?o=222")
     assert result.identity == identity
+    assert auth_file.read_bytes() == original_auth
     assert commands.onboarding_marker(base + "?o=222") == commands.onboarding_marker(base)

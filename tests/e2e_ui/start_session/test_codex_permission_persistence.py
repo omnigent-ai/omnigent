@@ -24,12 +24,12 @@ from tests.e2e_ui.start_session.test_start_session import (
         ("default", "Default", None),
         (
             "full-access",
-            "Full access",
+            "Full Access",
             ["--sandbox", "danger-full-access", "--ask-for-approval", "never"],
         ),
         (
             "read-only",
-            "Read only",
+            "Read Only",
             ["--sandbox", "read-only", "--ask-for-approval", "on-request"],
         ),
         ("bypass", "Bypass approvals & sandbox", None),

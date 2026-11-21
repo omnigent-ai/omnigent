@@ -91,7 +91,11 @@ def test_status_wrapper_captures_cost(tmp_path: Path, monkeypatch: pytest.Monkey
         {
             "session_id": "abc",
             "context_window": {"context_window_size": 1_000_000},
-            "cost": {"total_cost_usd": 0.42, "total_duration_ms": 1234},
+            "cost": {
+                "total_cost_usd": 0.42,
+                "total_duration_ms": 1234,
+                "total_api_duration_ms": 567,
+            },
         }
     )
 
@@ -100,6 +104,8 @@ def test_status_wrapper_captures_cost(tmp_path: Path, monkeypatch: pytest.Monkey
 
     persisted = json.loads((tmp_path / "context.json").read_text(encoding="utf-8"))
     assert persisted["total_cost_usd"] == 0.42
+    # Zero before the first API call tells a restored total from a billed one.
+    assert persisted["total_api_duration_ms"] == 567
 
 
 def test_status_wrapper_drops_payload_without_context_window(
@@ -212,6 +218,23 @@ def test_normalize_status_payload_extracts_record() -> None:
         "model": "claude-opus-4-8",
     }
     assert normalize_status_payload({"model": "claude-opus-4-8"}) is None
+
+
+@pytest.mark.parametrize(
+    ("version", "kept"),
+    [("2.1.299", True), ("", False), (2.1, False), ("9" * 33, False)],
+)
+def test_normalize_status_payload_keeps_a_short_claude_code_version(
+    version: object, kept: bool
+) -> None:
+    """The statusLine's Claude Code version is kept for delivery diagnostics."""
+    from omnigent.harnesses.claude_native.status import normalize_status_payload
+
+    record = normalize_status_payload(
+        {"context_window": {"context_window_size": 200_000}, "version": version}
+    )
+    assert record is not None
+    assert record.get("claude_code_version") == (version if kept else None)
 
 
 def test_sync_raw_status_context_normalizes_and_retries(tmp_path: Path) -> None:

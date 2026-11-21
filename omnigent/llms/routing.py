@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.models.model_override import is_databricks_model_id
 
 # Known providers and their default base URLs.
 # API keys come from connection_params at call time (llm.connection config),
@@ -79,9 +80,15 @@ def parse_model_string(model: str) -> RoutedModel:
 # Used by :func:`infer_harness_from_model` when a spec doesn't name
 # a harness explicitly.
 _HARNESS_FOR_MODEL_PREFIX: dict[str, str] = {
+    "system.ai.claude-": "claude-sdk",
     "databricks-claude-": "claude-sdk",
     "anthropic/claude-": "claude-sdk",
+    "system.ai.gpt-": "openai-agents",
     "databricks-gpt-": "openai-agents",
+    "system.ai.glm-": "openai-agents",
+    "databricks-glm-": "openai-agents",
+    "system.ai.kimi-": "openai-agents",
+    "databricks-kimi-": "openai-agents",
     "openai/gpt-": "openai-agents",
     "gpt-": "openai-agents",
     # xAI is OpenAI-compatible; provider prefix required (bare grok- defaults to openai).
@@ -100,9 +107,10 @@ def web_search_native_passthrough_provider(
     Only OpenAI Responses-compatible harnesses (``openai-agents`` / ``codex``)
     can execute the passthrough server-side; every other harness must get the
     function-tool schema or the tool is silently dropped (the schema has no
-    ``name``). ``databricks-*`` models never use the passthrough (Databricks
-    rejects it with HTTP 400). Shared by session-setup advertisement
-    (``ToolManager._create_web_search``) and runner dispatch
+    ``name``). Databricks models -- legacy ``databricks-*`` serving endpoints
+    and Unity Catalog ``system.ai.*`` model services -- never use the
+    passthrough (Databricks rejects it with HTTP 400). Shared by session-setup
+    advertisement (``ToolManager._create_web_search``) and runner dispatch
     (``_execute_web_search_tool``) so the two sites cannot drift.
 
     :param model: The spec's ``executor.model``, or ``None``.
@@ -112,7 +120,7 @@ def web_search_native_passthrough_provider(
         ``llm_provider`` (e.g. ``"openai"``), or ``None`` for
         function-tool mode.
     """
-    if not model or model.startswith("databricks-"):
+    if not model or is_databricks_model_id(model):
         return None
     from omnigent.harness_aliases import canonicalize_harness
     from omnigent.onboarding.provider_config import _EXECUTOR_TYPE_HARNESS_ALIASES

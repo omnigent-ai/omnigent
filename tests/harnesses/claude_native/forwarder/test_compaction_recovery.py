@@ -35,7 +35,8 @@ async def test_persist_native_compaction_item_posts_compaction_event(tmp_path: P
     find the most recent persisted item, reads post-compaction messages
     from the Claude session, then POSTs a ``compaction`` event using
     that item's id as ``last_item_id`` and the messages as
-    ``compacted_messages``.
+    ``compacted_messages``. No transcript is staged, so the snapshot comes
+    from the SDK fallback.
     """
     get_response = MagicMock()
     get_response.raise_for_status = MagicMock()
@@ -66,7 +67,7 @@ async def test_persist_native_compaction_item_posts_compaction_event(tmp_path: P
         ),
     ):
         await forwarder._persist_native_compaction_item(
-            client, session_id="conv_test", bridge_dir=bridge_dir
+            client, session_id="conv_test", bridge_dir=bridge_dir, allow_snapshot_fallback=True
         )
 
     client.get.assert_called_once_with(
@@ -101,7 +102,8 @@ async def test_persist_native_compaction_item_empty_items_uses_fallback(tmp_path
     If the session has no persisted items yet (e.g. the very first turn
     was compacted before anything was stored), the function generates
     ``compact_boundary_{session_id}`` as the boundary marker instead of
-    crashing on an empty list.
+    crashing on an empty list. No transcript is staged, so the snapshot
+    comes from the SDK fallback.
     """
     get_response = MagicMock()
     get_response.raise_for_status = MagicMock()
@@ -128,7 +130,7 @@ async def test_persist_native_compaction_item_empty_items_uses_fallback(tmp_path
         patch("claude_agent_sdk.get_session_messages", return_value=[fake_msg]),
     ):
         await forwarder._persist_native_compaction_item(
-            client, session_id="conv_empty", bridge_dir=bridge_dir
+            client, session_id="conv_empty", bridge_dir=bridge_dir, allow_snapshot_fallback=True
         )
 
     post_call = client.post.call_args

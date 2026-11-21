@@ -5,6 +5,8 @@ name: Maintainer Approval
 # a trusted author) is present, and GitHub reports that pass/fail as the
 # `Maintainer Approval` status. Before granting a dependency exemption it
 # invalidates Merge Ready; workflow completion triggers fresh evidence checks.
+# A new young-dependency-floor waiver in pyproject.toml also needs the
+# dependency-floor-approved label from a maintainer (dependency_floor_approval.py).
 #
 # Trigger is `pull_request_target`, so it runs from main with the base token
 # even for fork PRs: it isn't held behind the fork-PR-workflow approval gate
@@ -40,7 +42,7 @@ jobs:
       pull-requests: read
       actions: read
       statuses: write  # invalidate readiness before granting a dependency exemption
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Check out approval evaluator
@@ -49,9 +51,13 @@ jobs:
           ref: main
           sparse-checkout: |
             .github/scripts/maintainer_approval.py
+            .github/scripts/dependency_floor_approval.py
             .github/scripts/dependabot_automerge.py
             .github/scripts/dependabot_policy.py
             .github/dependabot-automerge.json
+            dev/__init__.py
+            dev/lint/__init__.py
+            dev/lint/_framework.py
           sparse-checkout-cone-mode: false
           persist-credentials: false
 
@@ -78,3 +84,17 @@ jobs:
             --pr-number "$PR" \
             --trusted-author 'omni-resolve-agent[bot]' \
             --trusted-successor 'omni-resolve-agent[bot]'
+
+      - name: Require dependency floor approval
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN:   ${{ github.token }}
+          REPO:       ${{ github.repository }}
+          PR:         ${{ github.event.pull_request.number }}
+          PYTHONPATH: ${{ github.workspace }}
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 .github/scripts/dependency_floor_approval.py \
+            --repository "$REPO" \
+            --pr-number "$PR" \
+            --expected-head "$EXPECTED_HEAD"

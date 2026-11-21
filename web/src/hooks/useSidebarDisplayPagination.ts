@@ -1,12 +1,16 @@
 import { useCallback, useMemo, useState } from "react";
 
-/** Page the display independently of the retained cache and backend page size. */
+/**
+ * Page the display independently of the retained cache and backend page size.
+ * The window grows by whole pages to keep the row at `revealIndex` visible.
+ */
 export function useSidebarDisplayPagination<T>(
   rows: T[],
   scopeKey: string,
   configuredSize: number | false | undefined,
   hasNextPage: boolean,
   fetchNextPage: () => unknown,
+  revealIndex = -1,
 ) {
   const pageSize =
     typeof configuredSize === "number" && Number.isSafeInteger(configuredSize) && configuredSize > 0
@@ -14,8 +18,11 @@ export function useSidebarDisplayPagination<T>(
       : undefined;
   const key = JSON.stringify([scopeKey, pageSize]);
   const [window, setWindow] = useState({ key, limit: pageSize ?? Infinity });
-  const limit = window.key === key ? window.limit : (pageSize ?? Infinity);
-  if (window.key !== key) setWindow({ key, limit });
+  let limit = window.key === key ? window.limit : (pageSize ?? Infinity);
+  if (pageSize !== undefined && revealIndex >= limit) {
+    limit += Math.ceil((revealIndex + 1 - limit) / pageSize) * pageSize;
+  }
+  if (window.key !== key || window.limit !== limit) setWindow({ key, limit });
   const visibleRows = useMemo(
     () => (pageSize === undefined ? rows : rows.slice(0, limit)),
     [rows, limit, pageSize],

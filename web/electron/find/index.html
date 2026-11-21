@@ -83,15 +83,24 @@
       const q = document.getElementById("q");
       const count = document.getElementById("count");
 
+      // A selection prefill arrives just after opening; typing first wins.
+      let typedSinceActivate = false;
+      function search(text) {
+        count.textContent = "";
+        find.query(text, { forward: true, findNext: false });
+      }
+
       // New text starts a fresh search; Enter / arrows step through matches.
       q.addEventListener("input", () => {
-        count.textContent = "";
-        find.query(q.value, { forward: true, findNext: false });
+        typedSinceActivate = true;
+        search(q.value);
       });
       function step(forward) {
         find.query(q.value, { forward, findNext: true });
       }
       q.addEventListener("keydown", (e) => {
+        // IME composition keys (CJK input) confirm text, not find.
+        if (e.isComposing || e.keyCode === 229) return;
         if (e.key === "Enter") step(!e.shiftKey);
         if (e.key === "Escape") find.close();
       });
@@ -104,6 +113,17 @@
       });
       // Re-opening an already-open bar (Cmd+F again) re-selects the query.
       find.onActivate(() => {
+        typedSinceActivate = false;
+        q.focus();
+        q.select();
+      });
+      // Cmd/Ctrl+F over selected page text searches for that text.
+      find.onPrefill((text) => {
+        if (typedSinceActivate || text === "") return;
+        if (q.value !== text) {
+          q.value = text;
+          search(text);
+        }
         q.focus();
         q.select();
       });

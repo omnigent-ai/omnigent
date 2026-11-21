@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import queue
 import re
 import threading
@@ -14,8 +15,9 @@ from unittest.mock import Mock
 
 import pytest
 
-from omnigent.debug_logging import record_to_row
-from omnigent.server import event_loop_watchdog as watchdog
+from omnigent.debug_logging import PRIMARY_SESSION_ID_ENV_VAR, record_to_row
+from omnigent.runner.identity import RUNNER_ID_ENV_VAR
+from omnigent.util import event_loop_watchdog as watchdog
 from tests.budgets import budget
 
 
@@ -37,11 +39,17 @@ def stall_records() -> Iterator[queue.Queue[logging.LogRecord]]:
 
 
 @pytest.mark.asyncio
-async def test_captures_blocking_stack_rate_limits_and_recovers(stall_records) -> None:
+@pytest.mark.parametrize("process_role", ["server", "runner"])
+async def test_captures_blocking_stack_rate_limits_and_recovers(
+    stall_records, monkeypatch, process_role
+) -> None:
     # This local must never appear in diagnostics, even though this frame is sampled.
     private_request_content = "private-request-body-canary"
     threads_before = set(threading.enumerate())
+    monkeypatch.setenv(RUNNER_ID_ENV_VAR, "runner-watchdog-test")
+    monkeypatch.setenv(PRIMARY_SESSION_ID_ENV_VAR, "conv-watchdog-test")
     with watchdog.monitor_event_loop(
+        process_role=process_role,
         stall_threshold_s=budget(0.5),
         sample_interval_s=budget(0.05),
         report_interval_s=budget(0.8),
@@ -50,8 +58,12 @@ async def test_captures_blocking_stack_rate_limits_and_recovers(stall_records) -
         assert stall_records.empty()
         # Synchronous Queue.get deliberately blocks this loop until the watchdog logs.
         first = stall_records.get(timeout=budget(3))
-        row = record_to_row(first, source="server")
-        assert row["event_name"] == "server_event_loop_stalled"
+        row = record_to_row(first, source=process_role)
+        assert row["event_name"] == f"{process_role}_event_loop_stalled"
+        assert row["attributes"]["pid"] == str(os.getpid())
+        if process_role == "runner":
+            assert row["attributes"]["runner_id"] == "runner-watchdog-test"
+            assert row["session_id"] == "conv-watchdog-test"
         assert "test_captures_blocking_stack_rate_limits_and_recovers" in row["stack_trace"]
         assert "in _capture_stack" not in row["stack_trace"]
         assert "\n" not in row["message"]
@@ -65,7 +77,7 @@ async def test_captures_blocking_stack_rate_limits_and_recovers(stall_records) -
         await asyncio.sleep(budget(1.4))
         assert stall_records.empty()
         third = stall_records.get(timeout=budget(3))
-        assert third.event_name == "server_event_loop_stalled"
+        assert third.event_name == f"{process_role}_event_loop_stalled"
         threads = set(threading.enumerate()) - threads_before
         watchdog_threads = [t for t in threads if t.name == "omnigent-event-loop-watchdog"]
         assert len(watchdog_threads) == 1
@@ -149,16 +161,20 @@ async def test_discarded_capture_does_not_suppress_next_stall(stall_records, mon
 
 
 @pytest.mark.asyncio
-async def test_thread_start_failure_does_not_prevent_serving(stall_records, monkeypatch) -> None:
+@pytest.mark.parametrize("process_role", ["server", "runner"])
+async def test_thread_start_failure_does_not_prevent_serving(
+    stall_records, monkeypatch, process_role
+) -> None:
     threading_proxy = Mock(wraps=threading)
     thread = Mock(ident=None)
     threading_proxy.Thread = Mock(return_value=thread)
     thread.start.side_effect = RuntimeError("can't start new thread")
     monkeypatch.setattr(watchdog, "threading", threading_proxy)
 
-    with watchdog.monitor_event_loop():
+    with watchdog.monitor_event_loop(process_role=process_role):
         record = stall_records.get(timeout=budget(1))
-        assert record.event_name == "server_event_loop_watchdog_failed"
+        assert record.event_name == f"{process_role}_event_loop_watchdog_failed"
+        assert record.attributes["pid"] == os.getpid()
         assert "can't start new thread" in str(record.exc_info[1])
     thread.join.assert_not_called()
 
@@ -233,3 +249,9 @@ def test_invalid_intervals_are_rejected(threshold) -> None:
     with pytest.raises(ValueError):
         with watchdog.monitor_event_loop(stall_threshold_s=threshold):
             pytest.fail("Invalid watchdog configuration was accepted")
+
+
+def test_invalid_process_role_is_rejected() -> None:
+    with pytest.raises(ValueError, match="process role"):
+        with watchdog.monitor_event_loop(process_role="worker"):
+            pytest.fail("Unknown watchdog role was accepted")

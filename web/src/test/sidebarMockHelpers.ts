@@ -3,10 +3,19 @@ import { vi } from "vitest";
 import type { Conversation, useConversations } from "@/hooks/useConversations";
 import type { SidebarListQuery } from "@/hooks/useSidebarData";
 import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+
+/** Records the row menu's mute/unmute writes. */
+export const setConversationMutedMock = vi.fn();
 
 export function conversationHooksMock() {
   return {
     useConversations: vi.fn(),
+    // Same gate as the real hook, so tests drive it through the server info.
+    useAutomationsEnabled: () => {
+      const info = useServerInfo();
+      return info !== "loading" && info.automations_enabled !== false;
+    },
     useStopAndDeleteConversation: () => ({
       mutate: vi.fn(),
       reset: vi.fn(),
@@ -23,8 +32,10 @@ export function conversationHooksMock() {
       mutateAsync: vi.fn(() => Promise.resolve({})),
     }),
     useReorderPinnedConversations: () => ({ mutate: vi.fn() }),
+    useSetConversationMuted: () => ({ mutate: setConversationMutedMock }),
     setConversationPinned: vi.fn(() => Promise.resolve({})),
     PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
+    retryListFetch: () => false,
     useRenameConversation: () => ({ mutate: vi.fn() }),
     useLeaveSession: () => ({ mutate: vi.fn(), isPending: false }),
     useArchiveConversation: () => ({ mutate: vi.fn() }),
@@ -42,6 +53,8 @@ export function conversationHooksMock() {
       fetchNextPage: vi.fn(),
     }),
     useMoveToProject: () => ({ mutate: vi.fn() }),
+    useMoveToNest: () => ({ mutate: vi.fn(), isPending: false }),
+    useSessionSearch: () => ({ data: undefined, isFetching: false }),
     useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
     useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
     useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),

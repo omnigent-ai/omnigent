@@ -16,6 +16,12 @@ _check-uv:
 _ensure-uv:
     uv sync --extra all --group dev
 
+# Installs the pre-commit and pre-push git hooks (see default_install_hook_types
+# in .pre-commit-config.yaml). Worktrees share the main checkout's .git, so one
+# install covers all of them.
+_ensure-hooks: _ensure-uv
+    uv run --no-sync pre-commit install
+
 # --- iOS Ruby dependencies ---
 
 _check-ios:
@@ -41,7 +47,7 @@ _ensure-omnidev:
 check: _check-uv _check-ios _check-omnidev
 
 [group('setup')]
-ensure: _ensure-uv _ensure-ios _ensure-omnidev
+ensure: _ensure-uv _ensure-hooks _ensure-ios _ensure-omnidev
 
 # --- Local dev ---
 
@@ -105,7 +111,18 @@ generate-theme-palettes: _ensure-web
 # --- Electron desktop app ---
 
 _ensure-electron:
-    cd web/electron && test -d node_modules || pnpm install
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd web/electron
+    test -d node_modules || pnpm install
+    # A macOS package is built for both CPUs and each needs its own native
+    # Keychain binding, but a plain install fetches only this machine's.
+    if [ "$(uname)" = "Darwin" ] && ! node -e '
+        const fromKeyring = require("node:module").createRequire(require.resolve("@napi-rs/keyring"));
+        for (const cpu of ["x64", "arm64"]) fromKeyring.resolve(`@napi-rs/keyring-darwin-${cpu}`);
+    ' 2>/dev/null; then
+        (cd ../.. && pnpm install --filter ./web --filter ./web/electron --cpu x64 --cpu arm64)
+    fi
 
 [group('electron')]
 electron-dev: _ensure-web _ensure-electron
@@ -256,6 +273,10 @@ lint: _ensure-uv
 lint-all: _ensure-uv
     uv run --no-sync pre-commit run --all-files
 
+# Install (or reinstall) the git hooks without the rest of `just ensure`.
+[group('lint')]
+hooks: _ensure-hooks
+
 [group('lint')]
 typecheck-python: _ensure-uv
     uv run --no-sync pyrefly check
@@ -272,3 +293,11 @@ lint-ts:
 [group('lint')]
 normalize-locks: _ensure-uv
     uv run --no-sync scripts/normalize_uv_lock_registry.py uv.lock || true
+
+# Resolve the declared dependencies through a package mirror without writing
+# uv.lock; fails when a floor needs a release the mirror does not serve yet.
+# Dependency groups resolve too, so a dev-only gap can fail it as well.
+# No `_ensure-uv`: its `uv sync` would re-resolve and rewrite uv.lock first.
+[group('lint')]
+check-internal-mirror index="https://pypi-proxy.cloud.databricks.com/simple":
+    uv lock --dry-run --default-index {{ index }}

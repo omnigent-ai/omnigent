@@ -74,6 +74,7 @@ export interface PaletteTokens {
   primaryForeground: string;
   selectionBackground: string;
   selectionForeground: string;
+  codeSelection: string;
   secondary: string;
   secondaryForeground: string;
   muted: string;
@@ -115,6 +116,7 @@ export const PALETTE_TOKEN_CSS_NAMES = {
   primaryForeground: "primary-foreground",
   selectionBackground: "selection-background",
   selectionForeground: "selection-foreground",
+  codeSelection: "code-selection",
   secondary: "secondary",
   secondaryForeground: "secondary-foreground",
   muted: "muted",
@@ -172,6 +174,9 @@ function paletteTokens(tokens: PaletteTokenInput): PaletteTokens {
     // saturated one reads heavy at low alpha, a pastel needs more; light
     // variants use the lightest alpha that stays visible.
     selectionForeground: tokens.foreground,
+    // The code viewer paints its selection under the text; palettes whose text wash
+    // is too faint there, or too heavy over syntax colours, tune it for code.
+    codeSelection: tokens.selectionBackground,
     cardForeground: tokens.foreground,
     tray: tokens.card,
     popover: tokens.cardSolid,
@@ -187,8 +192,8 @@ function paletteTokens(tokens: PaletteTokenInput): PaletteTokens {
     sidebarAccentForeground: tokens.accentForeground,
     sidebarBorder: tokens.border,
     sidebarRing: tokens.ring,
-    sidebarActive: "color-mix(in srgb, var(--sidebar-foreground) 7%, var(--sidebar))",
-    sidebarActiveForeground: "var(--sidebar-foreground)",
+    sidebarActive: "color-mix(in srgb, var(--primary) 12%, transparent)",
+    sidebarActiveForeground: "var(--primary)",
     sidebarBackground: "var(--sidebar)",
     link: tokens.ring,
     ...tokens,
@@ -232,71 +237,65 @@ export const PALETTES: readonly PaletteMeta[] = [
         card: "#ffffff",
         cardSolid: "#ffffff",
         popoverForeground: "#11171c",
-        primary: "#11171c",
-        link: "#1967b5",
+        primary: "#df3c85",
+        link: "#c42f70",
         primaryForeground: "#ffffff",
-        // Selection is the brand tint that also marks the sidebar's active
-        // row, not an opaque primary block (near-black on this palette).
-        selectionBackground: "rgba(240, 1, 150, 0.1)",
+        selectionBackground: "rgba(223, 60, 133, 0.1)",
+        codeSelection: "rgba(223, 60, 133, 0.2)",
         selectionForeground: "#651249",
         secondary: "#eceef1",
         muted: "#0000000f",
         mutedForeground: "#71717a",
         codeBackground: "#0000000f",
-        accent: "#d7edfe",
-        accentForeground: "#04355d",
+        accent: "#f2f1f2",
+        accentForeground: "#27272a",
         border: "#e4e4e7",
         borderStrong: "#a1a1aa",
         buttonBorder: "#d6d6d6",
         ring: "#11171c",
         brandAccent: "#df3c85",
-        sidebar: "#fdfafa",
-        sidebarPrimary: "#2272b4",
-        sidebarRing: "#2272b4",
-        sidebarActive: "rgba(240, 1, 150, 0.1)",
-        sidebarActiveForeground: "#651249",
-        sidebarBackground: "linear-gradient(90deg, #fffefe, #fcf6fa)",
+        sidebar: "#f9f9f9",
+        sidebarPrimary: "var(--link)",
+        sidebarRing: "var(--ring)",
         shellBackground: "var(--background)",
       }),
       dark: paletteTokens({
-        background: "#0e1013",
-        foreground: "oklch(0.965 0.003 240)",
+        background: "#0e0b19",
+        foreground: "#f5f5f4",
         card: "rgba(31, 39, 45, 0.6)",
         cardSolid: "#181f25",
         popover: "rgba(26, 33, 41, 0.8)",
-        primary: "#e8ecf0",
-        link: "#72b7f5",
+        primary: "#df3c85",
+        link: "#e65a9c",
         primaryForeground: "#11171c",
         // pink-300 rather than the sidebar's pink-400 so selected text stays
         // >= 4.5:1 over the tinted code and muted surfaces.
-        selectionBackground: "rgba(240, 1, 150, 0.15)",
+        selectionBackground: "rgba(223, 60, 133, 0.15)",
+        codeSelection: "rgba(223, 60, 133, 0.25)",
         selectionForeground: "#f9a8d4",
         secondary: "#1f272d",
         secondaryForeground: "#e8ecf0",
-        muted: "color-mix(in srgb, #92a4b3 15%, #262f36)",
-        mutedForeground: "#92a4b3",
+        muted: "rgb(255 255 255 / 12%)",
+        mutedForeground: "rgb(245 245 244 / 56%)",
         codeBackground: "oklch(0.38 0.005 240)",
-        accent: "#04355d",
-        accentForeground: "#4299e0",
+        accent: "#28262e",
+        accentForeground: "#f5f5f4",
         border: "oklch(0.28 0.005 240)",
         borderStrong: "#a1a1aa",
         buttonBorder: "#d6d6d6",
-        input: "oklch(0.28 0.005 240)",
+        input: "rgb(255 255 255 / 15%)",
         ring: "#e8ecf0",
         brandAccent: "#df3c85",
-        sidebar: "rgba(17, 23, 28, 0.75)",
-        sidebarPrimary: "oklch(0.64 0.22 254)",
+        sidebar: "#0e0b19",
+        sidebarPrimary: "var(--link)",
         sidebarPrimaryForeground: "oklch(0.12 0.004 240)",
         sidebarAccent: "oklch(0.245 0.005 240)",
         sidebarAccentForeground: "oklch(0.965 0.003 240)",
         sidebarBorder: "oklch(0.28 0.005 240)",
         sidebarRing: "oklch(0.92 0.003 240 / 0.4)",
-        sidebarActive: "rgba(240, 1, 150, 0.15)",
-        sidebarActiveForeground: "#f472b6",
         sidebarBackground:
           "linear-gradient(transparent 35%, rgba(92, 48, 108, 0.2)), linear-gradient(135deg, rgba(255, 255, 255, 0.04), transparent 60%)",
-        shellBackground:
-          "radial-gradient(rgba(100, 40, 180, 0.12), transparent 50%), radial-gradient(at 80% 20%, rgba(80, 30, 140, 0.08), transparent 45%), linear-gradient(145deg, #1a0e2d, #0e1418, #130e1b)",
+        shellBackground: "var(--background)",
       }),
     },
   },
@@ -337,6 +336,7 @@ export const PALETTES: readonly PaletteMeta[] = [
       dark: paletteTokens({
         background: "#282a36",
         selectionBackground: "rgba(189, 147, 249, 0.33)",
+        codeSelection: "rgba(189, 147, 249, 0.26)",
         foreground: "#f8f8f2",
         card: "rgba(68, 71, 90, 0.5)",
         cardSolid: "#343746",
@@ -355,8 +355,7 @@ export const PALETTES: readonly PaletteMeta[] = [
         ring: "#bd93f9",
         brandAccent: "#ff79c6",
         sidebar: "rgba(33, 34, 44, 0.8)",
-        shellBackground:
-          "radial-gradient(ellipse at 20% 40%, rgba(189, 147, 249, 0.14) 0%, transparent 50%), radial-gradient(ellipse at 80% 20%, rgba(255, 121, 198, 0.1) 0%, transparent 45%), linear-gradient(160deg, #2a2c3a 0%, #282a36 55%, #21222c 100%)",
+        shellBackground: "var(--background)",
       }),
     },
   },
@@ -375,11 +374,11 @@ export const PALETTES: readonly PaletteMeta[] = [
     tokens: {
       light: paletteTokens({
         background: "#f6f8fa",
-        selectionBackground: "rgba(31, 136, 61, 0.15)",
+        selectionBackground: "rgba(9, 105, 218, 0.15)",
         foreground: "#1f2328",
         card: "#ffffff",
         cardSolid: "#ffffff",
-        primary: "#1f883d",
+        primary: "#0969da",
         link: "#0968d9",
         primaryForeground: "#ffffff",
         secondary: "#eaeef2",
@@ -396,13 +395,14 @@ export const PALETTES: readonly PaletteMeta[] = [
       }),
       dark: paletteTokens({
         background: "#0d1117",
-        selectionBackground: "rgba(35, 134, 54, 0.39)",
+        selectionBackground: "rgba(88, 166, 255, 0.39)",
+        codeSelection: "rgba(88, 166, 255, 0.24)",
         foreground: "#e6edf3",
         card: "rgba(22, 27, 34, 0.72)",
         cardSolid: "#161b22",
         popover: "rgba(22, 27, 34, 0.9)",
-        primary: "#238636",
-        primaryForeground: "#ffffff",
+        primary: "#58a6ff",
+        primaryForeground: "#0d1117",
         secondary: "#21262d",
         muted: "#21262d",
         mutedForeground: "#8b949e",
@@ -414,7 +414,7 @@ export const PALETTES: readonly PaletteMeta[] = [
         ring: "#58a6ff",
         sidebar: "rgba(13, 17, 23, 0.75)",
         sidebarPrimaryForeground: "#0d1117",
-        shellBackground: "linear-gradient(160deg, #0d1117 0%, #0a0e14 100%)",
+        shellBackground: "var(--background)",
       }),
     },
   },
@@ -458,6 +458,7 @@ export const PALETTES: readonly PaletteMeta[] = [
         // The body text sits at the 4.5:1 edge over the wash; rosewater is the
         // lightest Catppuccin text.
         selectionBackground: "rgba(203, 166, 247, 0.26)",
+        codeSelection: "rgba(203, 166, 247, 0.16)",
         selectionForeground: "#f5e0dc",
         foreground: "#cdd6f4",
         card: "rgba(49, 50, 68, 0.6)",
@@ -475,8 +476,7 @@ export const PALETTES: readonly PaletteMeta[] = [
         borderStrong: "#585b70",
         ring: "#cba6f7",
         sidebar: "rgba(24, 24, 37, 0.8)",
-        shellBackground:
-          "radial-gradient(ellipse at 20% 30%, rgba(203, 166, 247, 0.12) 0%, transparent 55%), radial-gradient(ellipse at 80% 20%, rgba(245, 194, 231, 0.08) 0%, transparent 45%), linear-gradient(160deg, #232336 0%, #1e1e2e 60%, #181825 100%)",
+        shellBackground: "var(--background)",
       }),
     },
   },
@@ -517,6 +517,7 @@ export const PALETTES: readonly PaletteMeta[] = [
       dark: paletteTokens({
         background: "#282828",
         selectionBackground: "rgba(254, 128, 25, 0.34)",
+        codeSelection: "rgba(254, 128, 25, 0.24)",
         foreground: "#ebdbb2",
         card: "rgba(60, 56, 54, 0.6)",
         cardSolid: "#32302f",
@@ -533,8 +534,7 @@ export const PALETTES: readonly PaletteMeta[] = [
         borderStrong: "#665c54",
         ring: "#fe8019",
         sidebar: "rgba(29, 32, 33, 0.8)",
-        shellBackground:
-          "radial-gradient(ellipse at 20% 30%, rgba(254, 128, 25, 0.1) 0%, transparent 55%), radial-gradient(ellipse at 80% 20%, rgba(250, 189, 47, 0.07) 0%, transparent 45%), linear-gradient(160deg, #32302f 0%, #282828 60%, #1d2021 100%)",
+        shellBackground: "var(--background)",
       }),
     },
   },
@@ -560,6 +560,7 @@ export const PALETTES: readonly PaletteMeta[] = [
       light: paletteTokens({
         background: "#fdf6e3",
         selectionBackground: "rgba(38, 139, 210, 0.15)",
+        codeSelection: "rgba(38, 139, 210, 0.16)",
         // base02: the body text (base00) is too light over the wash.
         selectionForeground: "#073642",
         foreground: "#657b83",
@@ -585,6 +586,7 @@ export const PALETTES: readonly PaletteMeta[] = [
       dark: paletteTokens({
         background: "#002b36",
         selectionBackground: "rgba(38, 139, 210, 0.42)",
+        codeSelection: "rgba(38, 139, 210, 0.26)",
         // base2, for the same reason as light mode.
         selectionForeground: "#eee8d5",
         foreground: "#839496",
@@ -607,7 +609,7 @@ export const PALETTES: readonly PaletteMeta[] = [
         brandAccent: "#6c71c4",
         sidebar: "#073642",
         sidebarPrimaryForeground: "#fdf6e3",
-        shellBackground: "#002b36",
+        shellBackground: "var(--background)",
       }),
     },
   },
@@ -651,6 +653,7 @@ export const PALETTES: readonly PaletteMeta[] = [
         // The body text, already the lightest Nord colour, only stays at 4.5:1
         // over the muted surface up to here.
         selectionBackground: "rgba(136, 192, 208, 0.25)",
+        codeSelection: "rgba(136, 192, 208, 0.19)",
         foreground: "#eceff4",
         card: "rgba(59, 66, 82, 0.6)",
         cardSolid: "#3b4252",
@@ -668,8 +671,7 @@ export const PALETTES: readonly PaletteMeta[] = [
         borderStrong: "#81a1c1",
         ring: "#88c0d0",
         sidebar: "rgba(46, 52, 64, 0.8)",
-        shellBackground:
-          "radial-gradient(ellipse at 20% 30%, rgba(136, 192, 208, 0.12) 0%, transparent 55%), radial-gradient(ellipse at 80% 20%, rgba(94, 129, 172, 0.08) 0%, transparent 45%), linear-gradient(160deg, #434c5e 0%, #2e3440 60%, #2e3440 100%)",
+        shellBackground: "var(--background)",
       }),
     },
   },

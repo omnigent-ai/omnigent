@@ -5,38 +5,83 @@
 
 import type { MouseEvent } from "react";
 import { showToast } from "@/components/ui/toast";
+import { AGENT_BROWSER_TAB_ID, browserViewId } from "./browserTabs";
 import { readOpenLinksInApp } from "./linkOpenPreferences";
-import { isNativeShell, supportsBrowser } from "./nativeBridge";
+import { isNativeShell, supportsBrowser, type BrowserHostOptions } from "./nativeBridge";
+import { fetchSessionHostId } from "./fetchSessionHostId";
+import { previewHostOptions, withPreviewHostRetry } from "./previewHostOptions";
+import { randomUUID } from "./randomUUID";
+import { readSessionWorkspaceState } from "./sessionWorkspaceState";
 
 type OpenOrNavigate = (
   conversationId: string,
   url: string,
   bounds: undefined,
-  opts: { agent: boolean },
+  opts: BrowserHostOptions & { agent: boolean },
 ) => Promise<{ ok: boolean; error?: string }>;
 
-const listeners = new Set<(conversationId: string) => void>();
+interface BrowserBridge {
+  browserOpenOrNavigate: OpenOrNavigate;
+  browserClose?: (viewId: string) => Promise<{ ok: boolean }>;
+  browserHasView?: (
+    viewId: string,
+  ) => Promise<{ exists: boolean; url?: string; pendingUrl?: string }>;
+}
+
+const listeners = new Set<(conversationId: string, tabId: string) => void>();
+const pendingLinks = new Set<string>();
 
 /** Subscribe to links the embedded browser accepted; returns an unsubscribe. */
-export function onInAppLinkOpen(listener: (conversationId: string) => void): () => void {
+export function onInAppLinkOpen(
+  listener: (conversationId: string, tabId: string) => void,
+): () => void {
   listeners.add(listener);
   return () => void listeners.delete(listener);
 }
 
 async function openInApp(conversationId: string, url: string): Promise<void> {
-  const bridge = (
-    window as unknown as { omnigentDesktop: { browserOpenOrNavigate: OpenOrNavigate } }
-  ).omnigentDesktop;
+  const bridge = (window as unknown as { omnigentDesktop: BrowserBridge }).omnigentDesktop;
   let error: string | undefined;
+  let newViewId: string | undefined;
   try {
-    // Chat and workspace-file links are agent- or repo-authored and the agent can
-    // read the view, so they get the agent's navigation policy (no loopback/private
-    // hosts, even via redirect).
-    const result = await bridge.browserOpenOrNavigate(conversationId, url, undefined, {
-      agent: true,
-    });
+    // The reserved agent view may navigate independently of the user's tabs.
+    const tabs = (readSessionWorkspaceState(conversationId).openBrowsers ?? []).filter(
+      (tabId) => tabId !== AGENT_BROWSER_TAB_ID,
+    );
+    if (bridge.browserHasView && tabs.length > 0) {
+      const probes = await Promise.allSettled(
+        tabs.map(async (tabId) => {
+          const view = await bridge.browserHasView!(browserViewId(conversationId, tabId));
+          const currentUrl = view.url && view.url !== "about:blank" ? view.url : view.pendingUrl;
+          return view.exists && currentUrl && parseHttpUrl(currentUrl)?.href === url ? tabId : null;
+        }),
+      );
+      const stillOpen = readSessionWorkspaceState(conversationId).openBrowsers ?? [];
+      const match = probes.find(
+        (probe) => probe.status === "fulfilled" && probe.value && stillOpen.includes(probe.value),
+      );
+      if (match?.status === "fulfilled" && match.value) {
+        for (const listener of listeners) listener(conversationId, match.value);
+        return;
+      }
+    }
+    const tabId = randomUUID();
+    newViewId = browserViewId(conversationId, tabId);
+    const hostId = await fetchSessionHostId(conversationId);
+    const options = await previewHostOptions(hostId, url);
+    // Chat and file content can come from an agent, so their links use the
+    // agent policy even when a user clicks them.
+    const viewId = newViewId;
+    const result = await withPreviewHostRetry(conversationId, hostId, (retryOptions) =>
+      bridge.browserOpenOrNavigate(viewId, url, undefined, {
+        agent: true,
+        ...options,
+        ...retryOptions,
+      }),
+    );
     if (result?.ok) {
-      for (const listener of listeners) listener(conversationId);
+      newViewId = undefined;
+      for (const listener of listeners) listener(conversationId, tabId);
       return;
     }
     error = result?.error;
@@ -51,6 +96,13 @@ async function openInApp(conversationId: string, url: string): Promise<void> {
     `Couldn't open this link in the in-app browser (${error?.trim() || "unknown error"}). ` +
       "It opened in your default browser instead.",
   );
+  if (newViewId) {
+    try {
+      await bridge.browserClose?.(newViewId);
+    } catch (err) {
+      console.warn("[openLinkInApp] browserClose failed:", err);
+    }
+  }
 }
 
 /** Resolve `href` against the page, or null unless it is an http(s) URL — so a
@@ -65,15 +117,24 @@ export function parseHttpUrl(href: string): URL | null {
   return url.protocol === "http:" || url.protocol === "https:" ? url : null;
 }
 
+/** Open `href` where links open: the in-app browser when the user opted in, else a new window. */
+export function openLink(conversationId: string | undefined, href: string): void {
+  if (!maybeOpenLinkInApp(conversationId, href)) window.open(href, "_blank", "noopener,noreferrer");
+}
+
 /**
- * Open an http(s) `href` in the conversation's embedded browser when the user
+ * Open an http(s) `href` in a matching or new in-app browser tab when the user
  * opted in. Returns true when routed (the caller cancels the default click).
  */
 export function maybeOpenLinkInApp(conversationId: string | undefined, href: string): boolean {
   if (!conversationId || !supportsBrowser() || !readOpenLinksInApp()) return false;
   const url = parseHttpUrl(href);
   if (!url) return false;
-  void openInApp(conversationId, url.toString());
+  const key = JSON.stringify([conversationId, url.href]);
+  if (!pendingLinks.has(key)) {
+    pendingLinks.add(key);
+    void openInApp(conversationId, url.href).finally(() => pendingLinks.delete(key));
+  }
   return true;
 }
 
@@ -83,25 +144,30 @@ export function maybeOpenLinkInApp(conversationId: string | undefined, href: str
  * the link still opens a new tab, but in an embedding host pane (or under a
  * popup blocker) a bare `_blank` click is silently swallowed — nothing opens
  * and nothing navigates — so a click must fall back to navigating in place.
- * Modified clicks (cmd/ctrl/shift/alt, non-primary buttons) keep their native
- * open-in-new-tab / menu semantics. In a native shell the default path is the
+ * Modified clicks keep their native semantics outside the in-app browser.
+ * In a native shell the default path is the
  * shell's window-open policy (external browser / system handlers) — except
- * when the user opted in to the in-app browser, where a plain click on a web
- * link routes to the conversation's embedded browser pane instead. The web
+ * when the user opted in to the in-app browser: plain and Cmd/Ctrl clicks open
+ * matching or new in-app tabs, while Shift-click opens externally. The web
  * popup fallback never runs natively: the shell's policy reports `null` from
  * window.open regardless, so it would navigate twice.
  */
 export function followLinkWithPopupFallback(
-  event: MouseEvent<HTMLAnchorElement>,
+  // React's or the DOM's: a menu row passes the native click, so the menu still sees it unhandled.
+  event: Pick<
+    MouseEvent,
+    "defaultPrevented" | "button" | "shiftKey" | "altKey" | "metaKey" | "ctrlKey" | "preventDefault"
+  >,
   href: string,
   conversationId: string | undefined,
 ): void {
   if (event.defaultPrevented || event.button !== 0) return;
-  if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+  if (event.shiftKey || event.altKey) return;
   if (isNativeShell()) {
     if (maybeOpenLinkInApp(conversationId, href)) event.preventDefault();
     return;
   }
+  if (event.metaKey || event.ctrlKey) return;
   if (!/^(?:https?:)?\/\//i.test(href)) return;
   event.preventDefault();
   const popup = window.open("about:blank", "_blank");

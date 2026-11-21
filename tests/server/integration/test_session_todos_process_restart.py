@@ -42,7 +42,9 @@ def test_plan_hydrates_after_a_real_server_process_restart(tmp_path) -> None:
         return json.loads(result.strip().splitlines()[-1])
 
     before = run("report")
-    assert run("read", before["id"]) == before and before["items"] == []
+    # The task in progress gets one chat marker, and a restart neither loses nor repeats it.
+    assert run("read", before["id"]) == before
+    assert [item["type"] for item in before["items"]] == ["resource_event"]
     assert before["todos"][0]["status"] == "in_progress"
     cleared = run("clear", before["id"])
     assert run("read", before["id"]) == cleared and cleared["todos"] == []
