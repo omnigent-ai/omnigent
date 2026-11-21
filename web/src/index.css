@@ -1846,10 +1846,10 @@ html[data-electron-mac] .breadcrumb-folder {
 .message-markdown a {
   unicode-bidi: isolate;
 }
-.message-markdown :is(ul, ol) {
+.message-markdown :is(ul, ol):has(> li:dir(rtl)) {
   padding-inline: 0;
 }
-.message-markdown li {
+.message-markdown :is(ul, ol):has(> li:dir(rtl)) > li {
   margin-inline-start: 1.5rem;
 }
 
