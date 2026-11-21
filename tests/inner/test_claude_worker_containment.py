@@ -817,8 +817,8 @@ def cli_model_server(
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             requests.append({"path": self.path, "headers": dict(self.headers), "body": body})
-            # Background titles and nested inference must not consume foreground tool replies.
-            if replies and body.get("tools"):
+            # Titles also advertise built-in tools; only the foreground model consumes the script.
+            if replies and body.get("tools") and body["model"] == "claude-sonnet-4-6":
                 next_reply = replies.pop(0)
                 blocks = next_reply() if callable(next_reply) else next_reply
             else:
@@ -1461,9 +1461,9 @@ def test_omnigent_run_cli_with_contained_claude(
                 "prompt": "Reply with the test marker. Execute any requested Bash tool.",
                 "executor": {
                     "type": "omnigent",
+                    "model": "claude-sonnet-4-6",
                     "config": {
                         "harness": "claude-sdk",
-                        "model": "claude-sonnet-4-6",
                         "permission_mode": "bypassPermissions",
                     },
                     "auth": {"type": "api_key", "api_key": "parent-only-cli-secret"},
