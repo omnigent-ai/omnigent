@@ -1085,9 +1085,9 @@ function SidebarImpl({
   // full-screen overlay (``fixed inset-0``) and the variable is ignored.
   const { width: sidebarWidth, resizing, handleProps: resizeHandleProps } = useResizableSidebar();
 
-  // On the mobile layout a leftward swipe slides the open drawer shut and a
-  // rightward swipe across the chat slides the closed one open. Android closes
-  // with the system back gesture instead.
+  // On the mobile layout, a leftward swipe on the open drawer slides it shut and
+  // a rightward swipe across the chat slides the closed one open, both under
+  // the finger, reusing the iOS edge swipe's progress rendering below.
   const drawerRef = useRef<HTMLElement>(null);
   const scrimRef = useRef<HTMLButtonElement>(null);
   const [closeSwipeProgress, setCloseSwipeProgress] = useState<number | null>(null);
@@ -1096,7 +1096,7 @@ function SidebarImpl({
   // A wide phone (unfolded foldable, landscape) docks the open sidebar beside
   // the chat instead of over it.
   const sideBySide = useIsSideBySideSidebarViewport();
-  const closeSwipeEnabled = open && mobileLayout && dragProgress == null && !isAndroidShell();
+  const closeSwipeEnabled = open && mobileLayout && dragProgress == null;
   const openSwipeEnabled = !open && !peek && mobileLayout && dragProgress == null;
   // A touch held past this before moving is a long-press, not an open swipe.
   useSidebarSwipeToOpen({

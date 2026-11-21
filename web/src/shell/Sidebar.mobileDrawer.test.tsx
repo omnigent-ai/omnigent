@@ -442,6 +442,20 @@ describe("mobile sidebar drawer swipe to close", () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
+  it("closes by swipe in the Android app too", () => {
+    stubMobileLayout(true);
+    isAndroidShellMock.mockReturnValue(true);
+    const { onClose, drawer } = renderDrawer();
+
+    touch(drawer, "touchstart", 300, 0);
+    touch(drawer, "touchmove", 250, 60);
+    touch(drawer, "touchmove", 100, 120);
+    expect(drawer.style.transform).toBe("translateX(-50%)");
+    touch(drawer, "touchend", 0, 400);
+
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
   interface SwipeContext {
     mobile: boolean;
     android?: boolean;
@@ -452,8 +466,6 @@ describe("mobile sidebar drawer swipe to close", () => {
     ["the desktop layout", { mobile: false }, ""],
     // The native edge swipe owns the drawer while its progress is live.
     ["a native edge swipe", { mobile: true, dragProgress: 0.5 }, "translateX(-50%)"],
-    // Android closes the drawer with the system back gesture.
-    ["the Android shell", { mobile: true, android: true }, ""],
   ])("ignores the swipe during %s", (_label, { mobile, android = false, ...props }, transform) => {
     stubMobileLayout(mobile);
     isAndroidShellMock.mockReturnValue(android);
