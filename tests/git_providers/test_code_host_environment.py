@@ -47,6 +47,14 @@ def test_token_variables_never_reach_a_run_whatever_is_passed_in() -> None:
     assert environment == {"PATH": DEFAULT_PATH}
 
 
+def test_diagnostic_variables_never_reach_a_run_whatever_is_passed_in() -> None:
+    names = ["HTTP_DEBUG", "GIT_TRACE_CURL", "GIT_CURL_VERBOSE", "GIT_CURL_FTP_NO_EPSV"]
+
+    environment = pinned_environment(names, dict.fromkeys(names, "1"), {"HTTP_DEBUG": "1"})
+
+    assert environment == {"PATH": DEFAULT_PATH}
+
+
 def test_no_config_passes_nothing_but_the_pinned_path() -> None:
     passed, fixed = check_environment(None, None, instance_id="internal")
 
@@ -94,6 +102,36 @@ def test_a_fixed_value_with_a_secret_shaped_name_is_refused_without_its_value() 
     assert "env_set entry 2 is refused by the secret-name rule" in str(refused.value)
     assert "value-123" not in str(refused.value)
     assert "PROJECT_KEY" not in str(refused.value)
+
+
+@pytest.mark.parametrize(
+    ("name", "part"),
+    [
+        ("DEBUG_HTTP", "DEBUG"),
+        ("HTTP_DEBUG", "DEBUG"),
+        ("GODEBUG", "DEBUG"),
+        ("GIT_TRACE_CURL", "TRACE"),
+        ("GIT_TRACE", "TRACE"),
+        ("GIT_CURL_VERBOSE", "VERBOSE"),
+        ("curl_verbose", "VERBOSE"),
+        ("GIT_CURL_FTP_NO_EPSV", "GIT_CURL_"),
+    ],
+)
+@pytest.mark.parametrize("field", ["env", "env_set"])
+def test_a_diagnostic_variable_is_refused_naming_the_rule(
+    name: str, part: str, field: str
+) -> None:
+    passed, fixed = ([name], {}) if field == "env" else ([], {name: "1"})
+    where = "env[0]" if field == "env" else "env_set entry 1"
+
+    with pytest.raises(EnvironmentRuleError) as refused:
+        check_environment(passed, fixed, instance_id="internal")
+
+    assert str(refused.value) == (
+        f"instance internal {where} is refused by the diagnostic-variable rule: names "
+        f"containing or starting with {part} turn on diagnostic output, which can print "
+        "credentials"
+    )
 
 
 @pytest.mark.parametrize(

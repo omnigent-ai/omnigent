@@ -2,7 +2,8 @@
 
 A run gets only an allowlist: ``PATH`` (pinned, never the host's), the variables an
 instance names to pass through from the host, and fixed values from its config.
-Nothing else in the host environment reaches the CLI, and token variables never do.
+Nothing else in the host environment reaches the CLI, and token and diagnostic
+variables never do: diagnostic output can print the credentials a request carries.
 Refusals name the rule and the variable's position in the config, never its value.
 """
 
@@ -19,11 +20,22 @@ TOKEN_VARIABLES = frozenset(
 )
 # A name containing one of these is treated as holding a secret.
 SECRET_NAME_PARTS = ("TOKEN", "SECRET", "PASSWORD", "KEY")
+# A name containing one of these, or starting with one of the prefixes, turns on
+# diagnostic output, such as HTTP_DEBUG, GIT_TRACE_CURL or GIT_CURL_VERBOSE.
+DIAGNOSTIC_NAME_PARTS = ("DEBUG", "TRACE", "VERBOSE")
+DIAGNOSTIC_NAME_PREFIXES = ("GIT_CURL_",)
 _NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 class EnvironmentRuleError(ValueError):
     """An instance's environment config breaks a rule; the message names the rule."""
+
+
+def _diagnostic_rule(name: str) -> str | None:
+    """Return the part or prefix that makes *name* a diagnostic variable, if any."""
+    upper = name.upper()
+    part = next((part for part in DIAGNOSTIC_NAME_PARTS if part in upper), None)
+    return part or next((p for p in DIAGNOSTIC_NAME_PREFIXES if upper.startswith(p)), None)
 
 
 def _check_name(name: object, where: str) -> str:
@@ -42,6 +54,11 @@ def _check_name(name: object, where: str) -> str:
                 f"{where} is refused by the secret-name rule: names containing {part} are "
                 "treated as secrets. Rename the variable if it doesn't hold one"
             )
+    if (diagnostic := _diagnostic_rule(name)) is not None:
+        raise EnvironmentRuleError(
+            f"{where} is refused by the diagnostic-variable rule: names containing or "
+            f"starting with {diagnostic} turn on diagnostic output, which can print credentials"
+        )
     if upper.startswith(("GH_", "GITHUB_")):
         raise EnvironmentRuleError(
             f"{where} is refused by the CLI-settings rule: GH_ and GITHUB_ settings come "
@@ -106,6 +123,7 @@ def pinned_environment(
         if name in host_environment:
             environment[name] = host_environment[name]
     environment.update(fixed)
-    for name in TOKEN_VARIABLES:
-        environment.pop(name, None)
+    for name in [*environment]:
+        if name in TOKEN_VARIABLES or _diagnostic_rule(name) is not None:
+            del environment[name]
     return environment

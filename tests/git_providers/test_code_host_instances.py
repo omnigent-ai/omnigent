@@ -182,6 +182,7 @@ def test_arguments_stay_literal_with_no_shell(load: Load, cli: Path) -> None:
         ({"command": '["/bin/sh"]'}, "unknown field command"),
         ({"env": '["GH_TOKEN"]'}, "token-variable rule"),
         ({"env": '["SERVICE_API_KEY"]'}, "secret-name rule"),
+        ({"env_set": '{ GIT_TRACE_CURL = "1" }'}, "diagnostic-variable rule"),
     ],
 )
 def test_a_broken_rule_refuses_the_file(
