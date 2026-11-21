@@ -219,6 +219,10 @@ import { showArchiveUndoToast } from "./archiveUndoToast";
 import { unpinWithUndo } from "./unpinUndoToast";
 import { useArchivePrompt } from "./ArchivePrompt";
 import { useSessionActions } from "./useSessionActions";
+import {
+  useBulkSessionPaletteCommands,
+  useSessionSelectionPaletteCommands,
+} from "./sessionCommands/useBulkSessionPaletteCommands";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
 import { ProjectRowIcon } from "./ProjectPicker";
 import { EmojiPicker } from "@/components/ProjectIconPicker";
@@ -876,6 +880,13 @@ function SidebarImpl({
     setSelectedIds(new Set());
     lastSelectedIdRef.current = null;
   }, []);
+
+  useSessionSelectionPaletteCommands({
+    selecting: selectionMode,
+    selected: selectedIds.size,
+    selectAll: () => setSelectedIds(new Set(getVisibleIdsRef.current())),
+    deselectAll,
+  });
 
   // Enter selection mode targeting a given scope; clear any prior selection so
   // rows from the previous scope don't linger.
@@ -8026,6 +8037,28 @@ function BulkActionBar({
     onDeselectAll();
     bulkDelete.mutate({ ids, deleteBranchIds: branchesToDelete });
   }
+
+  useBulkSessionPaletteCommands({
+    facts: {
+      selected: count,
+      unread: unreadSelected.length,
+      flaggable: flaggableSelected.length,
+      owned: ownedSelected.length,
+      ownedArchived: archivedSelected.length,
+      canMove: canMoveSelection,
+      busy: isBusy,
+    },
+    selection: selectedIds,
+    projects: projects.map((project) => project.name),
+    run: {
+      "mark-read": handleMarkRead,
+      "mark-unread": handleMarkUnread,
+      archive: handleArchive,
+      unarchive: handleUnarchive,
+      delete: () => setConfirmDeleteOpen(true),
+    },
+    moveToProject: handleMoveToProject,
+  });
 
   return (
     <>
