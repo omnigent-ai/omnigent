@@ -129,6 +129,7 @@ import {
 import { newSessionLocation } from "@/lib/newSessionHandoff";
 import {
   DISMISS_REASONS,
+  listSuggestions,
   OPEN_SUGGESTION_STATUSES,
   PROACTIVE_AGENT_DISPLAY_NAME,
   suggestionKindLabel,
@@ -213,6 +214,8 @@ const EMPTY_STATES: Record<InboxFilter, { title: string; body: string }> = {
 // Enough trailing items to step past a tool call or two after the final reply.
 const PREVIEW_SCAN_ITEMS = 12;
 const UNREAD_ONLY = ["unread"] as const;
+// "Mark all as read" lists at most this many pages of unread suggestions per click.
+const MARK_ALL_SUGGESTION_PAGES = 20;
 const PREVIEW_MAX_CHARS = 280;
 
 /** One inbox card, tagged by kind, with the epoch-seconds time it sorts and groups by. */
@@ -289,6 +292,8 @@ export function InboxPage() {
     if (!proactiveInbox.enabled) setPinnedSuggestions({});
   }, [proactiveInbox.enabled]);
   const [responded, setResponded] = useState<RespondedMap>({});
+  // True while "Mark all as read" is still listing or marking suggestions.
+  const [markingAll, setMarkingAll] = useState(false);
   const pendingSubmissions = useRef(new Map<string, RespondedMap[string]>());
   // Manual expand/collapse toggles keyed by entry key. Anything not in
   // the map falls back to the default: expanded only for the newest
@@ -450,11 +455,52 @@ export function InboxPage() {
   const unreadSessionsToClear = visibleUnread.filter(
     ({ row }) => replyStatuses[row.id]?.state !== "sending",
   );
+  // Outside the advisor tab the server's unread total covers what the tab
+  // lists, so it also counts unread suggestions past the loaded pages.
+  const unloadedUnreadSuggestions =
+    showSuggestions && proactiveInbox.hasNextPage && !advisorOnly
+      ? Math.max(0, proactiveInbox.unreadCount - unreadSuggestions.length)
+      : 0;
   const markAllReadCount =
     visibleComments.length +
     unreadSessionsToClear.length +
     visibleAutomations.length +
-    unreadSuggestions.length;
+    unreadSuggestions.length +
+    unloadedUnreadSuggestions;
+  const markSuggestionsRead = async () => {
+    const targets = new Set(unreadSuggestions.map((item) => item.id));
+    let listingFailed = false;
+    if (showSuggestions && proactiveInbox.hasNextPage) {
+      try {
+        let cursor: string | null = null;
+        for (let pages = 0; pages < MARK_ALL_SUGGESTION_PAGES; pages += 1) {
+          // oxlint-disable-next-line no-await-in-loop -- Each page's cursor comes from the one before.
+          const page = await listSuggestions(cursor, UNREAD_ONLY);
+          for (const item of page.data) {
+            if (!advisorOnly || isAdvisorItem(item)) targets.add(item.id);
+          }
+          cursor = page.nextCursor;
+          if (cursor === null) break;
+        }
+      } catch {
+        listingFailed = true;
+      }
+    }
+    let failures = 0;
+    const onError = () => {
+      failures += 1;
+    };
+    await Promise.all(
+      [...targets].map((id) => proactiveInbox.update(id, { status: "read" }, { onError })),
+    );
+    if (failures > 0) {
+      showToast(
+        `Couldn’t mark ${failures === 1 ? "1 suggestion" : `${failures} suggestions`} as read. Try again.`,
+      );
+    } else if (listingFailed) {
+      showToast("Couldn’t load every unread suggestion, so some are still unread. Try again.");
+    }
+  };
   const markAllRead = () => {
     const clearedKeys = new Set(unreadSessionsToClear.map(({ row }) => `unread:${row.id}`));
     const clearedSessions = new Set(unreadSessionsToClear.map(({ row }) => row.id));
@@ -466,7 +512,10 @@ export function InboxPage() {
     for (const { row } of unreadSessionsToClear) markConversationRead(row.id, row.updated_at);
     markCommentsSeen(visibleComments.map(({ comment }) => comment.id));
     for (const item of visibleAutomations) automationInbox.markRead(item.runId);
-    for (const item of unreadSuggestions) void proactiveInbox.update(item.id, { status: "read" });
+    if (unreadSuggestions.length > 0 || (showSuggestions && proactiveInbox.hasNextPage)) {
+      setMarkingAll(true);
+      void markSuggestionsRead().finally(() => setMarkingAll(false));
+    }
   };
 
   const groups = groupInboxEntries<InboxEntry>([
@@ -1120,11 +1169,12 @@ export function InboxPage() {
             <span className="sr-only">{summary}</span>
           </span>
         )}
-        {markAllReadCount > 0 && (
+        {(markAllReadCount > 0 || markingAll) && (
           <Button
             variant="outline"
             size="xs"
             className={`ml-auto ${OUTLINE_ACTION}`}
+            disabled={markingAll}
             onClick={markAllRead}
             componentId="inbox.mark_all_read"
             data-testid="inbox-mark-all-read"

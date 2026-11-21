@@ -27,6 +27,7 @@ import * as conversationsHook from "@/hooks/useConversations";
 import * as automationInboxHook from "@/hooks/useAutomationInbox";
 import * as proactiveInboxHook from "@/hooks/useProactiveInbox";
 import type { Suggestion } from "@/lib/proactiveInbox";
+import * as proactiveInboxApi from "@/lib/proactiveInbox";
 import { NEW_SESSION_HANDOFF_PARAM, peekNewSessionHandoff } from "@/lib/newSessionHandoff";
 import * as commentInboxHook from "@/hooks/useCommentInbox";
 import { resetLocalElicitationResolutionsForTests } from "@/lib/localElicitationResolutions";
@@ -108,6 +109,10 @@ vi.mock("@/hooks/useProactiveAgentSettings", () => ({
   }),
 }));
 vi.mock("@/hooks/useCommentInbox", () => ({ useCommentInbox: vi.fn() }));
+vi.mock("@/lib/proactiveInbox", async (importActual) => ({
+  ...(await importActual<typeof proactiveInboxApi>()),
+  listSuggestions: vi.fn(),
+}));
 // Real exports (ApiError, codes) so failure handling sees genuine error types.
 vi.mock("@/lib/sessionsApi", async (importActual) => ({
   ...(await importActual<typeof sessionsApi>()),
@@ -2210,7 +2215,7 @@ describe("InboxPage mark all as read", () => {
     expect(getSeenCommentIds().has("cm_1")).toBe(true);
     expect(markRead).toHaveBeenCalledWith("run");
     expect(update).toHaveBeenCalledOnce();
-    expect(update).toHaveBeenCalledWith("sug_unread", { status: "read" });
+    expect(update).toHaveBeenCalledWith("sug_unread", { status: "read" }, expect.anything());
     expect(await screen.findByTestId("inbox-item")).toBeInTheDocument();
   });
 
@@ -2232,7 +2237,96 @@ describe("InboxPage mark all as read", () => {
     fireEvent.click(screen.getByRole("button", { name: "Mark all as read" }));
 
     expect(update).toHaveBeenCalledOnce();
-    expect(update).toHaveBeenCalledWith("sug_advisor", { status: "read" });
+    expect(update).toHaveBeenCalledWith("sug_advisor", { status: "read" }, expect.anything());
+  });
+
+  it("reaches unread suggestions past the loaded pages", async () => {
+    // WHY: the header's unread total counts suggestions no page has loaded yet.
+    const update = vi.fn().mockResolvedValue(true);
+    vi.mocked(proactiveInboxHook.useProactiveInbox).mockReturnValue(
+      proactiveInboxStub({
+        items: [suggestionItem({ id: "sug_read", status: "read" })],
+        unreadCount: 2,
+        hasNextPage: true,
+        update,
+      }),
+    );
+    vi.mocked(proactiveInboxApi.listSuggestions)
+      .mockResolvedValueOnce({
+        data: [suggestionItem({ id: "sug_older" })],
+        nextCursor: "cursor_1",
+        unreadCount: 2,
+        unreadCountCapped: false,
+      })
+      .mockResolvedValueOnce({
+        data: [suggestionItem({ id: "sug_oldest" })],
+        nextCursor: null,
+        unreadCount: 2,
+        unreadCountCapped: false,
+      });
+    renderPage();
+
+    fireEvent.click(screen.getByRole("button", { name: "Mark all as read" }));
+
+    await waitFor(() => expect(update).toHaveBeenCalledTimes(2));
+    expect(proactiveInboxApi.listSuggestions).toHaveBeenNthCalledWith(1, null, ["unread"]);
+    expect(proactiveInboxApi.listSuggestions).toHaveBeenNthCalledWith(2, "cursor_1", ["unread"]);
+    expect(update).toHaveBeenCalledWith("sug_older", { status: "read" }, expect.anything());
+    expect(update).toHaveBeenCalledWith("sug_oldest", { status: "read" }, expect.anything());
+  });
+
+  it("reports failed suggestions in one toast", async () => {
+    const toasts: unknown[] = [];
+    const onToast = (e: Event) => toasts.push((e as CustomEvent).detail.content);
+    window.addEventListener("omnigent:toast", onToast);
+    onTestFinished(() => window.removeEventListener("omnigent:toast", onToast));
+    const update = vi.fn((_id: string, _change: unknown, options?: { onError?: () => void }) => {
+      options?.onError?.();
+      return Promise.resolve(false);
+    });
+    vi.mocked(proactiveInboxHook.useProactiveInbox).mockReturnValue(
+      proactiveInboxStub({
+        items: ["sug_a", "sug_b", "sug_c"].map((id) => suggestionItem({ id })),
+        unreadCount: 3,
+        update,
+      }),
+    );
+    renderPage();
+
+    fireEvent.click(screen.getByRole("button", { name: "Mark all as read" }));
+
+    await waitFor(() =>
+      expect(toasts).toEqual(["Couldn’t mark 3 suggestions as read. Try again."]),
+    );
+    expect(update).toHaveBeenCalledTimes(3);
+  });
+
+  it("still marks the loaded suggestions when listing the rest fails", async () => {
+    const toasts: unknown[] = [];
+    const onToast = (e: Event) => toasts.push((e as CustomEvent).detail.content);
+    window.addEventListener("omnigent:toast", onToast);
+    onTestFinished(() => window.removeEventListener("omnigent:toast", onToast));
+    const update = vi.fn().mockResolvedValue(true);
+    vi.mocked(proactiveInboxHook.useProactiveInbox).mockReturnValue(
+      proactiveInboxStub({
+        items: [suggestionItem({})],
+        unreadCount: 5,
+        hasNextPage: true,
+        update,
+      }),
+    );
+    vi.mocked(proactiveInboxApi.listSuggestions).mockRejectedValueOnce(new Error("offline"));
+    renderPage();
+
+    fireEvent.click(screen.getByRole("button", { name: "Mark all as read" }));
+
+    await waitFor(() =>
+      expect(toasts).toEqual([
+        "Couldn’t load every unread suggestion, so some are still unread. Try again.",
+      ]),
+    );
+    expect(update).toHaveBeenCalledOnce();
+    expect(update).toHaveBeenCalledWith("sug_unread", { status: "read" }, expect.anything());
   });
 
   it("is offered only while the tab lists something unread", async () => {
