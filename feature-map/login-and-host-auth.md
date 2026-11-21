@@ -53,7 +53,9 @@ be able to write resources without a separate Omnigent account.
   the user is not signed in to runs the login flow first; `--non-interactive`
   fails with the login command instead. States: missing Databricks SDK extra,
   missing Databricks CLI, first browser login followed by host registration,
-  and a saved login reused on the next invocation.
+  a saved login reused on the next invocation, and a browser callback that never
+  arrives (callback guidance after 30 s, or up front over SSH; a timeout after 10
+  minutes).
 - `desktop-ssh-connect`: in the desktop app (macOS and Linux), **Connect a host**
   connects a machine the user reaches over SSH. The app runs the system `ssh`
   with the user's config, runs `omnigent login` there with the sign-in callback
@@ -257,7 +259,9 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   online. Restart with the same home to confirm its host ID and login are reused
   without a second browser authorization. Transcripts and host API snapshots
   remain in pytest's temporary directory; use `--basetemp=/tmp/host-onboarding`
-  to keep them at a known location.
+  to keep them at a known location. A second case diverts Chromium's `localhost`
+  callback to a listener that never answers and requires the stall notice with
+  the `ssh -L` and reload guidance, a running login, and no token exchange.
   Prerequisites: Databricks CLI, OpenSSL, and this checkout's Playwright Chromium
   (`uv run --no-sync playwright install chromium`). Missing prerequisites skip
   the journey; a passing feature-map check does not run it. The regular E2E CI
