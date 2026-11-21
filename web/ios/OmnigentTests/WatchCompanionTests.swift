@@ -5,6 +5,35 @@ import XCTest
 final class WatchCompanionTests: XCTestCase {
   private let now = Date(timeIntervalSince1970: 1_000)
 
+  func testCredentialContextsCannotUndoNewerSignInOrSignOut() throws {
+    let credentials = WatchCredentials(
+      apiURL: URL(string: "https://omnigent.example.com/v1")!, cookie: "session=1")
+    let data = try JSONEncoder().encode(credentials)
+    var state = WatchCredentialState()
+    XCTAssertTrue(state.apply(data, sentAt: now))
+    XCTAssertEqual(state.credentials, credentials)
+
+    let signOut = now.addingTimeInterval(1)
+    XCTAssertTrue(state.apply(Data(), sentAt: signOut))
+    XCTAssertNil(state.credentials)
+    for stale in [now, signOut] {
+      XCTAssertFalse(state.apply(data, sentAt: stale))
+      XCTAssertNil(state.credentials)
+    }
+
+    XCTAssertTrue(state.apply(data, sentAt: now.addingTimeInterval(2)))
+    XCTAssertFalse(state.apply(Data(), sentAt: signOut))
+    XCTAssertEqual(state.credentials, credentials)
+  }
+
+  func testMalformedCredentialContextClearsSavedCredentials() {
+    let credentials = WatchCredentials(
+      apiURL: URL(string: "https://omnigent.example.com/v1")!, cookie: "session=1")
+    var state = WatchCredentialState(credentials: credentials)
+    XCTAssertTrue(state.apply(Data("invalid".utf8), sentAt: now))
+    XCTAssertNil(state.credentials)
+  }
+
   @MainActor func testCredentialsSendOnlyCookiesTheAPIWouldReceive() throws {
     let cookies = [
       cookie("session", domain: "omnigent.example.com", path: "/"),
@@ -139,7 +168,11 @@ final class WatchCompanionTests: XCTestCase {
   func testSnapshotDecodesMessagesQueuedInputsAndApprovals() throws {
     let json = """
       {"status": "running",
-       "pending_inputs": [{"pending_id": "p1", "content": [{"type": "input_text", "text": "queued"}]}],
+       "pending_inputs": [
+         {"pending_id": "p1", "content": [{"type": "input_text", "text": "queued"}]},
+         {"pending_id": "p2", "content": [{"type": "input_text", "text": "hello"}]},
+         {"pending_id": "p3", "content": [{"type": "input_text", "text": "ok"}]}
+       ],
        "pending_elicitations": [
          {"elicitation_id": "e1", "params": {"mode": "form", "message": "Run it?",
           "requestedSchema": {"type": "object", "properties": {}}}},
@@ -154,7 +187,9 @@ final class WatchCompanionTests: XCTestCase {
     XCTAssertEqual(
       snapshot.pendingInputs?.compactMap(\.bubble),
       [
-        WatchMessage(id: "pending:p1", isUser: true, text: "queued")
+        WatchMessage(id: "pending:p1", isUser: true, text: "queued"),
+        WatchMessage(id: "pending:p2", isUser: true, text: "hello"),
+        WatchMessage(id: "pending:p3", isUser: true, text: "ok"),
       ])
     XCTAssertEqual(snapshot.pendingElicitations?.map(\.isBinary), [true, false, false, false])
 
@@ -179,6 +214,10 @@ final class WatchCompanionTests: XCTestCase {
         WatchMessage(id: "r2", isUser: true, text: "ok"),
         WatchMessage(id: "m1", isUser: true, text: "hello"),
       ])
+    // Both an older repeat and a repeat of the last user message remain visible while queued.
+    XCTAssertEqual(
+      snapshot.messages(items: Array(page.data.reversed())),
+      page.data.bubbles + (snapshot.pendingInputs ?? []).compactMap(\.bubble))
   }
 
   private func cookie(

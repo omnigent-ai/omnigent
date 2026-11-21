@@ -45,7 +45,8 @@ struct BrandBackground: View {
 /// Receives credentials from the iPhone and keeps them in this watch's Keychain.
 @MainActor @Observable
 final class WatchLink: NSObject, WCSessionDelegate {
-  private(set) var credentials = WatchKeychain.load()
+  private var state = WatchCredentialState(credentials: WatchKeychain.load())
+  var credentials: WatchCredentials? { state.credentials }
 
   override init() {
     super.init()
@@ -67,11 +68,12 @@ final class WatchLink: NSObject, WCSessionDelegate {
   }
 
   private nonisolated func receive(_ context: [String: Any]) {
-    guard let data = context[WatchCredentials.contextKey] as? Data else { return }
-    let credentials = try? JSONDecoder().decode(WatchCredentials.self, from: data)
+    guard let data = context[WatchCredentials.contextKey] as? Data,
+      let sentAt = context["sentAt"] as? Date
+    else { return }
     Task { @MainActor in
-      self.credentials = credentials
-      WatchKeychain.save(credentials)
+      guard state.apply(data, sentAt: sentAt) else { return }
+      WatchKeychain.save(state.credentials)
     }
   }
 }

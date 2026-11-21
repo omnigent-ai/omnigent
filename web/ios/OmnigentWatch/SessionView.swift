@@ -133,13 +133,7 @@ extension SessionView {
         async let items: WatchPage<WatchItem> = client.get(
           path + "/items", ["order": "desc", "limit": "30"], host: session.hostId)
         let (state, page) = try await (snapshot, items)
-        let committed = Array(page.data.reversed().bubbles.suffix(12))
-        // A native harness records the message before its pending copy clears; show it once.
-        let recent = Set(committed.suffix(6).filter(\.isUser).map(\.text))
-        let queued = (state.pendingInputs ?? []).compactMap(\.bubble).filter {
-          !recent.contains($0.text)
-        }
-        messages = committed + queued
+        messages = state.messages(items: page.data)
         approvals = (state.pendingElicitations ?? []).filter { !answered.contains($0.id) }
         session.status = state.status ?? session.status
         session.pendingElicitationsCount = approvals.count

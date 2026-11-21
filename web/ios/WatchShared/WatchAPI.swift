@@ -9,6 +9,23 @@ struct WatchCredentials: Codable, Hashable, Sendable {
   let cookie: String
 }
 
+/// Orders credential callbacks so a delayed context cannot undo a newer sign-out.
+struct WatchCredentialState {
+  private(set) var credentials: WatchCredentials?
+  private var lastSentAt: Date?
+
+  init(credentials: WatchCredentials? = nil) {
+    self.credentials = credentials
+  }
+
+  mutating func apply(_ data: Data, sentAt: Date) -> Bool {
+    if let lastSentAt, sentAt <= lastSentAt { return false }
+    credentials = try? JSONDecoder().decode(WatchCredentials.self, from: data)
+    lastSentAt = sentAt
+    return true
+  }
+}
+
 struct WatchPage<Element: Decodable & Sendable>: Decodable, Sendable {
   let data: [Element]
 }
@@ -71,6 +88,12 @@ struct WatchSnapshot: Decodable, Sendable {
   let lastTaskError: TaskError?
   let pendingElicitations: [WatchElicitation]?
   let pendingInputs: [WatchItem]?
+
+  func messages(items: [WatchItem]) -> [WatchMessage] {
+    let committed = Array(items.reversed().bubbles.suffix(12))
+    // Pending IDs are distinct from committed IDs; equal text can be a separate user input.
+    return committed + (pendingInputs ?? []).compactMap(\.bubble)
+  }
 }
 
 /// A committed item or a queued input (`pending_id`): both share this shape.

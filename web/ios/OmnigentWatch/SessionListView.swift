@@ -64,7 +64,6 @@ struct SessionListView: View {
   }
 }
 
-/// A sidebar row: the title, with the web's trailing state marker and nothing when idle.
 /// A small spinner in the top-left corner while the list loads.
 struct LoadingIndicator: ToolbarContent {
   let isLoading: Bool
@@ -76,6 +75,7 @@ struct LoadingIndicator: ToolbarContent {
   }
 }
 
+/// A sidebar row: the title, with the web's trailing state marker and nothing when idle.
 private struct SessionRow: View {
   let session: WatchSession
 
