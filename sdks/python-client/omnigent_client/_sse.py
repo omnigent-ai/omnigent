@@ -294,6 +294,7 @@ def _parse_event(event_type: str, data: dict[str, Any]) -> StreamEvent | None:
             return None
         requested_schema = params.get("requestedSchema")
         target_session_id = params.get("target_session_id")
+        ask_user_question = params.get("ask_user_question")
         return ElicitationRequest(
             elicitation_id=elicitation_id,
             message=str(params.get("message") or ""),
@@ -310,6 +311,7 @@ def _parse_event(event_type: str, data: dict[str, Any]) -> StreamEvent | None:
             target_session_id=target_session_id
             if isinstance(target_session_id, str) and target_session_id
             else None,
+            ask_user_question=ask_user_question if isinstance(ask_user_question, dict) else None,
         )
 
     # Unknown event — skip gracefully for forward-compatibility
