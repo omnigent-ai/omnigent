@@ -242,6 +242,69 @@ async def test_still_untrusted_after_write_raises() -> None:
     assert len(_batchwrite_calls(client)) == 1
 
 
+@pytest.mark.parametrize(
+    "reloaded_hooks",
+    [
+        [],
+        [_hook("k1", _OUR_COMMAND, "trusted")],
+        [_hook("replacement", _OUR_COMMAND, "trusted")],
+        [_hook("k1", _OUR_COMMAND, "trusted"), _hook("k2", _USER_COMMAND, "trusted")],
+        [
+            _hook("k1", _OUR_COMMAND, "trusted", "sha256:changed"),
+            _hook("k2", _OUR_COMMAND, "trusted"),
+        ],
+    ],
+    ids=["all-missing", "subset-missing", "replaced", "foreign-command", "hash-changed"],
+)
+async def test_policy_hooks_disappearing_after_trust_write_raise(
+    monkeypatch: pytest.MonkeyPatch, reloaded_hooks: list[dict]
+) -> None:
+    """Reload must preserve every discovered policy hook before trust is confirmed."""
+    client = _FakeCodexClient(
+        hooks=[
+            _hook("k1", _OUR_COMMAND, "untrusted"),
+            _hook("k2", _OUR_COMMAND, "trusted"),
+        ]
+    )
+    request = client.request
+
+    async def reload_hooks(method: str, params: dict) -> dict:
+        response = await request(method, params)
+        if method == "config/batchWrite":
+            client.hooks = reloaded_hooks
+        return response
+
+    monkeypatch.setattr(client, "request", reload_hooks)
+    with pytest.raises(RuntimeError, match="disappeared after config/batchWrite"):
+        await trust_native_policy_hooks(client, cwd=_CWD)
+    assert len(_batchwrite_calls(client)) == 1
+    assert [call.method for call in client.requests] == [
+        "hooks/list",
+        "config/batchWrite",
+        "hooks/list",
+    ]
+
+
+async def test_all_policy_hooks_survive_trust_reload_with_foreign_hooks() -> None:
+    """The trust write preserves both policy gates and leaves user hooks alone."""
+    client = _FakeCodexClient(
+        hooks=[
+            _hook("k1", _OUR_COMMAND, "untrusted"),
+            _hook("k2", _OUR_COMMAND, "trusted"),
+            _hook("foreign", _USER_COMMAND, "untrusted"),
+        ]
+    )
+    await trust_native_policy_hooks(client, cwd=_CWD)
+    assert [hook["trustStatus"] for hook in client.hooks] == [
+        "trusted",
+        "trusted",
+        "untrusted",
+    ]
+    assert _batchwrite_calls(client)[0].params["edits"][0]["value"] == {
+        "k1": {"trusted_hash": "sha256:h"}
+    }
+
+
 async def test_user_hooks_are_never_trusted() -> None:
     """
     Only Omnigent hooks are trusted; user-declared hooks are left alone.
@@ -471,8 +534,15 @@ async def test_old_codex_with_routing_armed_keeps_user_hooks(
         await server.close()
 
 
+@pytest.mark.parametrize(
+    "failure_reason",
+    [
+        "Omnigent policy hook was not discovered for cwd ...",
+        "Omnigent policy hooks disappeared after config/batchWrite",
+    ],
+)
 async def test_trust_failure_is_fail_open_with_reason(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_reason: str
 ) -> None:
     """
     A trust handshake failure degrades the session instead of blocking it.
@@ -497,7 +567,7 @@ async def test_trust_failure_is_fail_open_with_reason(
         _self: CodexNativeAppServer, *, client: CodexAppServerClient | None = None
     ) -> None:
         del client
-        raise RuntimeError("Omnigent policy hook was not discovered for cwd ...")
+        raise RuntimeError(failure_reason)
 
     monkeypatch.setattr(CodexNativeAppServer, "_trust_policy_hooks", _raise_trust)
 
@@ -509,7 +579,7 @@ async def test_trust_failure_is_fail_open_with_reason(
         assert (codex_home / "hooks.json").exists()
         assert server.policy_hook_disabled_reason is not None
         # The underlying trust error is carried into the reason.
-        assert "not discovered" in server.policy_hook_disabled_reason
+        assert failure_reason in server.policy_hook_disabled_reason
         assert "could not be trusted" in server.policy_hook_disabled_reason
     finally:
         await server.close()
