@@ -141,6 +141,13 @@ describe("useInertRef", () => {
       expect(outside()).toHaveFocus();
     });
 
+    it("blurs what an element focuses as it mounts while inert is pending", () => {
+      const { rerender } = render(<ClosingPanel inert={false} pending mounted={false} />);
+      rerender(<ClosingPanel inert={false} pending autoFocus />);
+      expect(inside()).not.toHaveFocus();
+      expect(document.activeElement).toBe(document.body);
+    });
+
     it("lets an element that mounts as the guard lifts keep what it focuses", () => {
       const { rerender } = render(<ClosingPanel inert={false} pending mounted={false} />);
       rerender(<ClosingPanel inert={false} pending={false} autoFocus />);

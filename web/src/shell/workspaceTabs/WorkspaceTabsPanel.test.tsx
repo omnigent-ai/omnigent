@@ -266,7 +266,18 @@ describe("the panel's placement", () => {
     outside.focus();
     inside.focus();
     expect(outside).toHaveFocus();
+    outside.blur();
     outside.remove();
+  });
+
+  it("keeps focus out of an open rail while its host says it's about to go inert", () => {
+    const view = renderPanels([{ conversationId: "conv_a", open: true, inertPending: true }]);
+    const inside = screen.getByRole("button", { name: "Full screen", hidden: true });
+    inside.focus();
+    expect(inside).not.toHaveFocus();
+    view.rerender([{ conversationId: "conv_a", open: true, inertPending: false }]);
+    inside.focus();
+    expect(inside).toHaveFocus();
   });
 
   it("fills a drawer at any width, with no resize handle or full screen", () => {

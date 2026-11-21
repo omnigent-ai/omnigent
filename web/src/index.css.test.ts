@@ -390,6 +390,24 @@ describe("workspace rail open motion", () => {
     rail.setAttribute(attribute, "closed");
     expect(rail.matches(openRule.trim())).toBe(false);
   });
+
+  // Where an animated open starts from; the selector list inside @starting-style.
+  const startingRule =
+    indexCssSource.match(/@starting-style\s*\{([^{}]*\.workspace-panel-motion[^{}]*)\{/)?.[1] ?? "";
+
+  it.each([
+    ["data-state", "the classic rail"],
+    ["data-rail-state", "the tabs rail"],
+  ])("animates an open rail that names its state %s (%s) from its start", (attribute) => {
+    const rail = document.createElement("aside");
+    rail.className = "workspace-panel-motion";
+    rail.setAttribute(attribute, "open");
+    expect(rail.matches(startingRule.trim())).toBe(false);
+    rail.setAttribute("data-animate-visibility", "");
+    expect(rail.matches(startingRule.trim())).toBe(true);
+    rail.setAttribute(attribute, "closed");
+    expect(rail.matches(startingRule.trim())).toBe(false);
+  });
 });
 
 describe("index.css app-shell viewport lock", () => {
