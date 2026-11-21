@@ -381,6 +381,67 @@ def test_format_tool_group_no_output() -> None:
     assert len(items) == 1
 
 
+@pytest.mark.parametrize(
+    "args_summary", ["echo '[/dim]'", "printf '[bold]x[/bold]'", "echo ok # \\"]
+)
+def test_format_tool_group_renders_markup_like_args_literally(args_summary: str) -> None:
+    """Bracketed or backslash-terminated tool args on the ``⏵`` line are text, not markup."""
+    fmt = RichBlockFormatter()
+    group = ToolGroup(
+        executions=[
+            ToolExecution(
+                name="Bash",
+                arguments={"command": args_summary},
+                args_summary=args_summary,
+                call_id="c1",
+                agent_name="coder.worker",
+                executed_by="server",
+                output=None,
+            ),
+        ]
+    )
+    (line,) = fmt.format(group)
+    assert isinstance(line, Text)
+    assert line.plain == f"   coder.worker → ⏵ Bash({args_summary})", (
+        f"tool args must survive rendering unchanged; got {line.plain!r}"
+    )
+    prefix = "   coder.worker → "
+    assert [(s.start, s.end, str(s.style)) for s in line.spans] == [
+        (3, len(prefix), fmt.muted),
+        (len(prefix), len(prefix) + len("⏵ Bash"), fmt.accent),
+        (len(prefix) + len("⏵ Bash"), len(line.plain), "dim"),
+    ]
+
+
+def test_format_tool_group_renders_markup_like_names_literally() -> None:
+    """Tool and sub-agent names on the ``⏵`` line are escaped like the args."""
+    fmt = RichBlockFormatter()
+    group = ToolGroup(
+        executions=[
+            ToolExecution(
+                name="run[/dim]",
+                arguments={},
+                args_summary="ls",
+                call_id="c1",
+                agent_name="coder.[bold]worker",
+                executed_by="server",
+                output=None,
+            ),
+        ]
+    )
+    (line,) = fmt.format(group)
+    assert isinstance(line, Text)
+    assert line.plain == "   coder.[bold]worker → ⏵ run[/dim](ls)", (
+        f"tool and agent names must survive rendering unchanged; got {line.plain!r}"
+    )
+    prefix = "   coder.[bold]worker → "
+    assert [(s.start, s.end, str(s.style)) for s in line.spans] == [
+        (3, len(prefix), fmt.muted),
+        (len(prefix), len(prefix) + len("⏵ run[/dim]"), fmt.accent),
+        (len(prefix) + len("⏵ run[/dim]"), len(line.plain), "dim"),
+    ]
+
+
 def test_duplicate_tool_call_renders_call_line_once() -> None:
     """
     Regression: sessions API emits ``function_call`` twice per tool —
