@@ -18,9 +18,42 @@ from omnigent.runner.app_support import (
     _SpecEntry,
 )
 from omnigent.runner.native import _unwrap_resolved_spec
+from omnigent.util.http_retry import jittered_retry_delay
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger("omnigent.runner.app")
+_HISTORY_READ_ATTEMPTS = 3
+_HISTORY_RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
+
+
+async def _fetch_history_page(
+    server_client: httpx.AsyncClient, session_id: str, params: dict[str, str]
+) -> dict[str, Any]:
+    """Read one history page, retrying transient failures within a bounded budget."""
+    for attempt in range(_HISTORY_READ_ATTEMPTS):
+        response = None
+        try:
+            response = await server_client.get(
+                f"/v1/sessions/{session_id}/items", params=params, timeout=10.0
+            )
+            if response.status_code == 200:
+                page = response.json()
+                if not isinstance(page, dict) or not isinstance(page.get("data", []), list):
+                    raise RuntimeError("History read returned an invalid page.")
+                return page
+            response.raise_for_status()
+            raise RuntimeError(f"History read returned unexpected status {response.status_code}.")
+        except (httpx.TransportError, httpx.HTTPStatusError) as exc:
+            if attempt + 1 == _HISTORY_READ_ATTEMPTS or (
+                isinstance(exc, httpx.HTTPStatusError)
+                and exc.response.status_code not in _HISTORY_RETRYABLE_STATUSES
+            ):
+                raise
+            delay = jittered_retry_delay(response, backoff=0.5 * 2**attempt, max_delay=10.0)
+            if delay is None:
+                raise
+            await asyncio.sleep(delay)
+    raise AssertionError("History read attempts exhausted without a result.")
 
 
 class _LoadHistoryAsInputFn(Protocol):
@@ -117,6 +150,8 @@ def build_session_history(
     ) -> list[_JsonObject]:
         all_items: list[_JsonObject] = []
         after_cursor: str | None = None
+        newest_item_id: str | None = None
+        seen_cursors: set[str] = set()
         while True:
             params: dict[str, str] = {
                 "limit": "100",
@@ -124,38 +159,21 @@ def build_session_history(
             }
             if after_cursor is not None:
                 params["after"] = after_cursor
-            try:
-                resp = await server_client.get(
-                    f"/v1/sessions/{session_id}/items",
-                    params=params,
-                    timeout=10.0,
-                )
-                if resp.status_code != 200:
-                    _logger.warning(
-                        "History load returned %d for session=%s",
-                        resp.status_code,
-                        session_id,
-                        extra={"session_id": session_id},
-                    )
-                    break
-            except httpx.HTTPError:
-                _logger.warning(
-                    "History load failed for session=%s",
-                    session_id,
-                    exc_info=True,
-                    extra={"session_id": session_id},
-                )
-                break
-            page = resp.json()
+            page = await _fetch_history_page(server_client, session_id, params)
             page_items = page.get("data", [])
             if not page_items:
+                if page.get("has_more"):
+                    raise RuntimeError("History pagination returned an empty unfinished page.")
                 break
             all_items.extend(page_items)
             last_id = page_items[-1].get("id")
-            if last_id:
-                _last_server_item_id[session_id] = last_id
+            if isinstance(last_id, str) and last_id:
+                newest_item_id = last_id
             if not page.get("has_more", False):
                 break
+            if not isinstance(last_id, str) or not last_id or last_id in seen_cursors:
+                raise RuntimeError("History pagination did not advance its cursor.")
+            seen_cursors.add(last_id)
             after_cursor = last_id
 
         if drop_item_id is not None:
@@ -173,6 +191,8 @@ def build_session_history(
                     session_id=session_id,
                     server_client=server_client,
                 )
+        if newest_item_id is not None:
+            _last_server_item_id[session_id] = newest_item_id
         return converted
 
     def _convert_raw_items_to_input(
