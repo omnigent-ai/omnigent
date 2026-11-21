@@ -481,24 +481,27 @@ function TicketDetails({
               </div>
               <TicketError error={configuration.error} />
               <TicketAgents projectId={projectId} ticket={ticket} />
-              {ticket.description ? (
-                <ProseMarkdown className="text-ui leading-relaxed">
-                  {ticket.description}
-                </ProseMarkdown>
-              ) : (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="-ml-2 text-muted-foreground"
-                  onClick={() => {
-                    update.reset();
-                    setEditing(true);
-                  }}
-                >
-                  <PlusIcon aria-hidden />
-                  Add description
-                </Button>
-              )}
+              <section aria-label="Description" className="space-y-2">
+                <h3 className="text-sm font-medium">Description</h3>
+                {ticket.description ? (
+                  <ProseMarkdown className="text-ui leading-relaxed">
+                    {ticket.description}
+                  </ProseMarkdown>
+                ) : (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="-ml-2 text-muted-foreground"
+                    onClick={() => {
+                      update.reset();
+                      setEditing(true);
+                    }}
+                  >
+                    <PlusIcon aria-hidden />
+                    Add description
+                  </Button>
+                )}
+              </section>
             </div>
           )}
           {!editing && !completing && !reviewing && !requestingChanges && (

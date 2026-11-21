@@ -557,6 +557,7 @@ describe("Project ticket board", () => {
     expect(
       await screen.findByRole("heading", { name: "Ship the board", level: 2 }),
     ).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Description", level: 3 })).toBeInTheDocument();
     expect(await screen.findByRole("heading", { name: "Acceptance" })).toBeInTheDocument();
     const completion = screen.getByRole("button", { name: "Completion summary" });
     expect(completion).toHaveAttribute("aria-expanded", "false");
@@ -579,6 +580,10 @@ describe("Project ticket board", () => {
     expect(screen.queryByRole("button", { name: "Request review" })).toBeNull();
     expect(screen.queryByRole("region", { name: "Ticket plan" })).toBeNull();
     expect(screen.queryByRole("region", { name: "Human review" })).toBeNull();
+    await waitFor(() =>
+      expect(screen.queryByRole("region", { name: "Related tickets" })).toBeNull(),
+    );
+    expect(screen.queryByRole("button", { name: "Link ticket" })).toBeNull();
   });
 
   it.each([
@@ -961,31 +966,22 @@ describe("Project ticket board", () => {
     },
   );
 
-  it("links and unlinks related tickets by title without changing phase", async () => {
+  it("shows related tickets read-only with pagination and visible query errors", async () => {
     const peer: ProjectTicket = {
       ...ticket,
       id: "peer",
       title: "Related work",
       stage_id: "planning",
     };
-    let related: ProjectTicket[] = [];
-    vi.mocked(api.listTickets).mockResolvedValue({
-      data: [ticket, peer],
-      has_more: false,
-      last_id: "peer",
-    });
-    vi.mocked(api.listRelatedTickets).mockImplementation(async () => ({
-      data: related,
-      has_more: false,
-      last_id: related.at(-1)?.id ?? null,
-    }));
-    vi.mocked(api.linkRelatedTicket).mockImplementation(
-      async (_project, _ticket, _related, action) => {
-        related = action === "attach" ? [peer] : [];
-        return ticket;
-      },
-    );
-    renderBoard(
+    const followup = { ...peer, id: "followup", title: "Follow-up work" };
+    vi.mocked(api.listRelatedTickets)
+      .mockRejectedValueOnce(new Error("Could not load related tickets"))
+      .mockImplementation(async (_project, _ticket, after) => ({
+        data: after ? [followup] : [peer],
+        has_more: !after,
+        last_id: after ? followup.id : peer.id,
+      }));
+    const { client } = renderBoard(
       <ProjectTicketPanel
         projectName="Shipping"
         ticketId="ticket"
@@ -993,15 +989,29 @@ describe("Project ticket board", () => {
         onCreated={vi.fn()}
       />,
     );
-    fireEvent.click(await screen.findByRole("button", { name: "Link ticket" }));
-    fireEvent.click(await screen.findByRole("button", { name: "Related work" }));
-    const section = screen.getByRole("region", { name: "Related tickets" });
+    const section = await screen.findByRole("region", { name: "Related tickets" });
+    expect(await within(section).findByRole("alert")).toHaveTextContent(
+      "Could not load related tickets",
+    );
+    await act(async () =>
+      client.refetchQueries({
+        queryKey: ["project-tickets", "project", "ticket", "related"],
+        exact: true,
+      }),
+    );
     expect(
       await within(section).findByRole("link", { name: /Related work.*Planning/ }),
     ).toHaveAttribute("href", "/?ticket=peer");
-    fireEvent.click(within(section).getByRole("button", { name: "Unlink Related work" }));
-    await waitFor(() => expect(within(section).queryByRole("link")).toBeNull());
-    expect(api.linkRelatedTicket).toHaveBeenLastCalledWith("project", "ticket", "peer", "remove");
+    expect(within(section).queryByRole("alert")).toBeNull();
+    expect(within(section).queryByRole("button", { name: "Link ticket" })).toBeNull();
+    expect(within(section).queryByRole("button", { name: /Unlink/ })).toBeNull();
+    fireEvent.click(within(section).getByRole("button", { name: "More related tickets" }));
+    expect(
+      await within(section).findByRole("link", { name: /Follow-up work.*Planning/ }),
+    ).toHaveAttribute("href", "/?ticket=followup");
+    expect(within(section).getAllByRole("link")).toHaveLength(2);
+    expect(within(section).queryByRole("button", { name: "More related tickets" })).toBeNull();
+    expect(api.linkRelatedTicket).not.toHaveBeenCalled();
     expect(api.updateTicket).not.toHaveBeenCalled();
   });
 
@@ -1077,7 +1087,7 @@ describe("Project ticket board", () => {
     },
   );
 
-  it("lists paginated agents with involvement and keeps the orchestrator visible once", async () => {
+  it("lists paginated agents with read-only involvement and keeps chat routing intact", async () => {
     ticket.stage_id = "planning";
     ticket.lead_session_id = "reviewer";
     vi.mocked(api.listTicketSessions).mockImplementation(async (_project, _ticket, after) => ({
@@ -1110,6 +1120,9 @@ describe("Project ticket board", () => {
     );
     const agents = await screen.findByRole("region", { name: "Agents" });
     expect(await within(agents).findByText("Investigating the approach")).toBeInTheDocument();
+    expect(
+      await within(agents).findByRole("link", { name: "Open chat with: Plan the work" }),
+    ).toHaveAttribute("href", "/?ticket=ticket&session=planner");
     fireEvent.click(screen.getByRole("button", { name: "More agents" }));
     expect(
       await within(agents).findByRole("link", {
@@ -1124,6 +1137,9 @@ describe("Project ticket board", () => {
     expect(screen.queryByRole("button", { name: "More agents" })).toBeNull();
     expect(screen.queryByRole("region", { name: "Responsible agent" })).toBeNull();
     expect(screen.queryByRole("region", { name: "Linked sessions" })).toBeNull();
+    expect(within(agents).queryByRole("button", { name: "Edit agent involvement" })).toBeNull();
+    expect(screen.queryByLabelText("Involvement")).toBeNull();
+    expect(api.setTicketSessionInvolvement).not.toHaveBeenCalled();
     expect(api.updateTicket).not.toHaveBeenCalled();
     expect(projectsApi.initializeProjectOrchestrator).not.toHaveBeenCalled();
   });
@@ -1152,57 +1168,6 @@ describe("Project ticket board", () => {
       "/?ticket=ticket",
     );
     expect(projectsApi.initializeProjectOrchestrator).not.toHaveBeenCalled();
-  });
-
-  it("edits or clears involvement, preserving a failed edit for retry", async () => {
-    let involvement = "Planning the approach";
-    vi.mocked(api.listTicketSessions).mockImplementation(async () => ({
-      data: [{ session_id: "worker", created_at: 1000, involvement }],
-      has_more: false,
-      last_id: "worker",
-    }));
-    vi.mocked(api.setTicketSessionInvolvement)
-      .mockRejectedValueOnce(new Error("Could not save involvement"))
-      .mockImplementation(async (_project, _ticket, _session, text) => {
-        involvement = text;
-        return ticket;
-      });
-    renderBoard(
-      <ProjectTicketPanel
-        projectName="Shipping"
-        ticketId="ticket"
-        onClose={vi.fn()}
-        onCreated={vi.fn()}
-      />,
-    );
-    fireEvent.click(await screen.findByRole("button", { name: "Edit agent involvement" }));
-    const input = screen.getByLabelText("Involvement");
-    expect(input).toHaveValue("Planning the approach");
-    fireEvent.change(input, { target: { value: " Implementing the plan " } });
-    fireEvent.click(screen.getByRole("button", { name: "Save" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent("Could not save involvement");
-    expect(input).toHaveValue(" Implementing the plan ");
-    fireEvent.click(screen.getByRole("button", { name: "Save" }));
-    const agents = screen.getByRole("region", { name: "Agents" });
-    expect(await within(agents).findByText("Implementing the plan")).toBeInTheDocument();
-    expect(api.setTicketSessionInvolvement).toHaveBeenLastCalledWith(
-      "project",
-      "ticket",
-      "worker",
-      "Implementing the plan",
-    );
-    await waitFor(() => expect(screen.queryByLabelText("Involvement")).toBeNull());
-    fireEvent.click(screen.getByRole("button", { name: "Edit agent involvement" }));
-    fireEvent.change(screen.getByLabelText("Involvement"), { target: { value: "" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save" }));
-    expect(await within(agents).findByText("Linked to this ticket")).toBeInTheDocument();
-    expect(api.setTicketSessionInvolvement).toHaveBeenLastCalledWith(
-      "project",
-      "ticket",
-      "worker",
-      "",
-    );
-    expect(api.updateTicket).not.toHaveBeenCalled();
   });
 
   it("keeps agents accessible without the new involvement capability", async () => {
