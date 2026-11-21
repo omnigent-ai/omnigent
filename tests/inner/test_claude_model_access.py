@@ -518,10 +518,9 @@ def test_model_access_configuration_preserves_refusal_guidance(
         if unowned_environment:
             assert detail.code == "HarnessSandboxValidationError"
             assert (
-                "Brokered Claude model access requires an owned worker environment"
-                in detail.message
-            )
-            assert "Pass worker_env when preparing the CLI and retry" in detail.message
+                "Brokered Claude model access requires an Omnigent-owned worker environment; "
+                "this configuration is not supported."
+            ) in detail.message
         elif transport is not None:
             assert detail.code == "HarnessSandboxValidationError"
             assert "Anthropic-compatible API" in detail.message

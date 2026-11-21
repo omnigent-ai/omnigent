@@ -868,8 +868,8 @@ class HarnessSandboxValidationError(ValueError):
             "Disable Bedrock, Vertex or Foundry transport settings and retry."
         ),
         "model_access": (
-            "Brokered Claude model access requires an owned worker environment. "
-            "Pass worker_env when preparing the CLI and retry."
+            "Brokered Claude model access requires an Omnigent-owned worker environment; "
+            "this configuration is not supported."
         ),
         "git_ssh": "The selected harness does not support os_env.sandbox.git_ssh.",
         "tcp_egress": (
