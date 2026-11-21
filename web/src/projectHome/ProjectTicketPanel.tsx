@@ -3,9 +3,12 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   BotIcon,
   CheckIcon,
+  ChevronRightIcon,
   ExternalLinkIcon,
   GitPullRequestIcon,
   LinkIcon,
+  Maximize2Icon,
+  Minimize2Icon,
   PencilIcon,
   PlusIcon,
   TagsIcon,
@@ -14,6 +17,7 @@ import {
 } from "lucide-react";
 import { ProseMarkdown } from "@/components/blocks/ChatMarkdown";
 import { Button } from "@/components/ui/button";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Textarea } from "@/components/ui/textarea";
@@ -29,6 +33,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useNow } from "@/hooks/useNow";
 import { useViewerId } from "@/hooks/useViewerId";
+import { markdownPreviewText } from "@/lib/markdownPreviewText";
 import { parseHttpUrl } from "@/lib/openLinkInApp";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import { Link, useSearchParams, useReplaceSearchParams } from "@/lib/routing";
@@ -67,17 +72,25 @@ import {
   useTicketStatuses,
 } from "./useProjectTickets";
 
+interface TicketExpansionProps {
+  expanded?: boolean;
+  onExpandedChange?: (expanded: boolean) => void;
+}
+
 function Panel({
   title,
   onClose,
   children,
   footer,
+  expanded = false,
+  onExpandedChange,
 }: {
   title: string;
   onClose: () => void;
   children: ReactNode;
   footer?: ReactNode;
-}) {
+} & TicketExpansionProps) {
+  const expansionLabel = expanded ? "Restore ticket panel" : "Expand ticket";
   return (
     <section
       aria-label={title}
@@ -87,6 +100,23 @@ function Panel({
         <h2 title={title} className="min-w-0 flex-1 truncate text-ui font-medium">
           {title}
         </h2>
+        {onExpandedChange && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                className="text-muted-foreground"
+                aria-label={expansionLabel}
+                onClick={() => onExpandedChange(!expanded)}
+              >
+                {expanded ? <Minimize2Icon aria-hidden /> : <Maximize2Icon aria-hidden />}
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">{expansionLabel}</TooltipContent>
+          </Tooltip>
+        )}
         <Tooltip>
           <TooltipTrigger asChild>
             <Button
@@ -180,12 +210,14 @@ export function ProjectTicketPanel({
   ticketId,
   onClose,
   onCreated,
+  expanded,
+  onExpandedChange,
 }: {
   projectName: string;
   ticketId: string;
   onClose: () => void;
   onCreated: (ticketId: string) => void;
-}) {
+} & TicketExpansionProps) {
   const { projectId, projects, ensure } = useTicketProject(projectName);
   const client = useQueryClient();
   const create = useMutation({
@@ -198,7 +230,12 @@ export function ProjectTicketPanel({
   });
   if (ticketId === "new")
     return (
-      <Panel title="New ticket" onClose={onClose}>
+      <Panel
+        title="New ticket"
+        onClose={onClose}
+        expanded={expanded}
+        onExpandedChange={onExpandedChange}
+      >
         <TicketEditor
           onSave={(body) => create.mutate(body)}
           pending={create.isPending}
@@ -213,7 +250,12 @@ export function ProjectTicketPanel({
     );
   if (!projectId)
     return (
-      <Panel title="Ticket" onClose={onClose}>
+      <Panel
+        title="Ticket"
+        onClose={onClose}
+        expanded={expanded}
+        onExpandedChange={onExpandedChange}
+      >
         {projects.isLoading ? (
           <Spinner aria-label="Loading ticket" />
         ) : (
@@ -229,6 +271,8 @@ export function ProjectTicketPanel({
       projectName={projectName}
       ticketId={ticketId}
       onClose={onClose}
+      expanded={expanded}
+      onExpandedChange={onExpandedChange}
     />
   );
 }
@@ -308,12 +352,14 @@ function TicketDetails({
   projectName,
   ticketId,
   onClose,
+  expanded,
+  onExpandedChange,
 }: {
   projectId: string;
   projectName: string;
   ticketId: string;
   onClose: () => void;
-}) {
+} & TicketExpansionProps) {
   const query = useTicket(projectId, ticketId);
   const { update, comment } = useTicketActions(projectId);
   const [editing, setEditing] = useState(false);
@@ -331,7 +377,12 @@ function TicketDetails({
   const ticket = query.data;
   if (!ticket)
     return (
-      <Panel title="Ticket" onClose={onClose}>
+      <Panel
+        title="Ticket"
+        onClose={onClose}
+        expanded={expanded}
+        onExpandedChange={onExpandedChange}
+      >
         {query.isPending && <Spinner aria-label="Loading ticket" />}
         <TicketError error={query.error} />
         {query.isError && (
@@ -350,6 +401,8 @@ function TicketDetails({
         <Panel
           title={ticket.title}
           onClose={onClose}
+          expanded={expanded}
+          onExpandedChange={onExpandedChange}
           footer={<TicketCommentComposer ticketId={ticketId} comment={comment} />}
         >
           {editing ? (
@@ -446,56 +499,61 @@ function TicketDetails({
           {!editing && !completing && !reviewing && !requestingChanges && (
             <TicketError error={update.error} />
           )}
-          {lifecycle && <TicketPlan projectId={projectId} ticket={ticket} />}
-          {ticket.status === "review" && (
-            <section
-              aria-label="Human review"
-              className="space-y-3 rounded-lg border border-brand-accent/20 bg-tag-pink p-3.5"
-            >
-              <h3 className="flex items-center gap-2 text-sm font-medium">
-                <TicketStatusIcon status="review" />
-                Ready for your review
-              </h3>
-              <ProseMarkdown className="text-ui leading-relaxed">
-                {ticket.review_summary ?? ""}
-              </ProseMarkdown>
-              <p className="text-sm text-muted-foreground">
-                These actions update the ticket. Answer any open agent prompt in that agent’s chat.
-              </p>
-              <div className="flex flex-wrap gap-2">
-                <Button
-                  size="sm"
-                  disabled={update.isPending}
-                  onClick={() => {
-                    update.reset();
-                    setCompleting(true);
-                  }}
+          {(lifecycle || ticket.status === "review" || ticket.completion_summary) && (
+            <div className="space-y-2">
+              {lifecycle && <TicketPlan projectId={projectId} ticket={ticket} />}
+              {ticket.status === "review" && (
+                <TicketDisclosure
+                  label="Human review"
+                  title="Ready for review"
+                  icon={<TicketStatusIcon status="review" />}
+                  preview={markdownPreviewText(ticket.review_summary ?? "")}
+                  footer={
+                    <div className="flex flex-wrap gap-2">
+                      <Button
+                        size="sm"
+                        disabled={update.isPending}
+                        onClick={() => {
+                          update.reset();
+                          setCompleting(true);
+                        }}
+                      >
+                        <CheckIcon aria-hidden />
+                        Approve &amp; mark done
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={update.isPending}
+                        onClick={() => {
+                          update.reset();
+                          setRequestingChanges(true);
+                        }}
+                      >
+                        Request changes
+                      </Button>
+                    </div>
+                  }
                 >
-                  <CheckIcon aria-hidden />
-                  Approve &amp; mark done
-                </Button>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  disabled={update.isPending}
-                  onClick={() => {
-                    update.reset();
-                    setRequestingChanges(true);
-                  }}
+                  <ProseMarkdown className="text-ui leading-relaxed">
+                    {ticket.review_summary ?? ""}
+                  </ProseMarkdown>
+                  <p className="mt-3 text-sm text-muted-foreground">
+                    These actions update the ticket. Answer any open agent prompt in that agent’s
+                    chat.
+                  </p>
+                </TicketDisclosure>
+              )}
+              {ticket.completion_summary && (
+                <TicketDisclosure
+                  title="Completion summary"
+                  icon={<CheckIcon aria-hidden className="size-4 text-success" />}
+                  preview={markdownPreviewText(ticket.completion_summary)}
                 >
-                  Request changes
-                </Button>
-              </div>
-            </section>
-          )}
-          {ticket.completion_summary && (
-            <section className="space-y-2 rounded-lg bg-success/5 p-3.5">
-              <h3 className="flex items-center gap-2 text-sm font-medium">
-                <CheckIcon aria-hidden className="size-4 text-success" />
-                Completion summary
-              </h3>
-              <ProseMarkdown className="text-ui">{ticket.completion_summary}</ProseMarkdown>
-            </section>
+                  <ProseMarkdown className="text-ui">{ticket.completion_summary}</ProseMarkdown>
+                </TicketDisclosure>
+              )}
+            </div>
           )}
           <TicketOutputs projectId={projectId} ticketId={ticketId} />
           {lifecycle && <TicketRelatedTickets projectId={projectId} ticketId={ticketId} />}
@@ -589,7 +647,64 @@ function TicketDetails({
   );
 }
 
+function TicketDisclosure({
+  title,
+  label = title,
+  preview,
+  icon,
+  action,
+  children,
+  footer,
+  open,
+  onOpenChange,
+}: {
+  title: string;
+  label?: string;
+  preview: string;
+  icon?: ReactNode;
+  action?: ReactNode;
+  children: ReactNode;
+  footer?: ReactNode;
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+}) {
+  return (
+    <Collapsible open={open} onOpenChange={onOpenChange} asChild>
+      <section aria-label={label} className="rounded-lg border border-border/60">
+        <div className="flex items-center gap-1 pr-1.5">
+          <h3 className="min-w-0 flex-1">
+            <CollapsibleTrigger className="group flex w-full min-w-0 items-center gap-3 rounded-md p-3 text-left outline-none hover:bg-muted/50 focus-visible:ring-2 focus-visible:ring-ring">
+              <span className="min-w-0 flex-1">
+                <span className="flex items-center gap-2 text-sm font-medium">
+                  {icon}
+                  {title}
+                </span>
+                {preview && (
+                  <span
+                    aria-hidden
+                    className="mt-0.5 block truncate text-xs font-normal text-muted-foreground group-data-[state=open]:hidden"
+                  >
+                    {preview}
+                  </span>
+                )}
+              </span>
+              <ChevronRightIcon
+                aria-hidden
+                className="size-4 shrink-0 text-muted-foreground transition-transform group-data-[state=open]:rotate-90"
+              />
+            </CollapsibleTrigger>
+          </h3>
+          {action}
+        </div>
+        <CollapsibleContent className="px-3 pb-3">{children}</CollapsibleContent>
+        {footer && <div className="px-3 pb-3">{footer}</div>}
+      </section>
+    </Collapsible>
+  );
+}
+
 function TicketPlan({ projectId, ticket }: { projectId: string; ticket: ProjectTicket }) {
+  const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState(false);
   const [plan, setPlan] = useState("");
   const { update } = useTicketActions(projectId);
@@ -597,6 +712,7 @@ function TicketPlan({ projectId, ticket }: { projectId: string; ticket: ProjectT
     setPlan(ticket.plan ?? "");
     update.reset();
     setEditing(true);
+    setOpen(true);
   };
   if (!editing && !ticket.plan && ticket.status !== "planning")
     return (
@@ -606,18 +722,24 @@ function TicketPlan({ projectId, ticket }: { projectId: string; ticket: ProjectT
       </Button>
     );
   return (
-    <section
-      aria-label="Ticket plan"
-      className="space-y-3 rounded-lg border border-border/60 p-3.5"
-    >
-      <div className="flex items-center justify-between gap-2">
-        <h3 className="text-sm font-medium">Plan</h3>
-        {!editing && (
+    <TicketDisclosure
+      label="Ticket plan"
+      title="Plan"
+      preview={
+        editing
+          ? "Unsaved changes"
+          : markdownPreviewText(ticket.plan ?? "") || "Approach and acceptance criteria"
+      }
+      open={open}
+      onOpenChange={setOpen}
+      action={
+        !editing && (
           <Button variant="ghost" size="icon-sm" aria-label="Edit plan" onClick={edit}>
             <PencilIcon aria-hidden />
           </Button>
-        )}
-      </div>
+        )
+      }
+    >
       {editing ? (
         <form
           className="space-y-3"
@@ -625,7 +747,7 @@ function TicketPlan({ projectId, ticket }: { projectId: string; ticket: ProjectT
             event.preventDefault();
             update.mutate(
               { id: ticket.id, changes: { plan: plan.trim() } },
-              { onSuccess: () => setEditing(false) },
+              { onSuccess: () => setEditing(false), onError: () => setOpen(true) },
             );
           }}
         >
@@ -662,7 +784,7 @@ function TicketPlan({ projectId, ticket }: { projectId: string; ticket: ProjectT
           here.
         </p>
       )}
-    </section>
+    </TicketDisclosure>
   );
 }
 

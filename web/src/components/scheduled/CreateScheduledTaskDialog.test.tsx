@@ -2866,6 +2866,38 @@ describe("CreateScheduledTaskDialog project", () => {
     expect(resolveOrCreateProjectId).toHaveBeenCalledWith("Omnigent Automation");
   });
 
+  it.each(["proj_1", null])("seeds project %s without resolving it until save", async (id) => {
+    resolveOrCreateProjectId.mockResolvedValueOnce("proj_new");
+    renderWithProjects(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        initialProject={{ id, name: "Triage" }}
+      />,
+    );
+    fillRequired();
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Triage");
+    expect(resolveOrCreateProjectId).not.toHaveBeenCalled();
+    expect(mutateAsync).not.toHaveBeenCalled();
+    expect(await submitCreate()).toMatchObject({ projectId: id ?? "proj_new" });
+    if (id) expect(resolveOrCreateProjectId).not.toHaveBeenCalled();
+    else expect(resolveOrCreateProjectId).toHaveBeenCalledWith("Triage");
+  });
+
+  it("does not send a project prefill to an older server", async () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        initialProject={{ id: "proj_1", name: "Triage" }}
+      />,
+    );
+    fillRequired();
+    expect(screen.queryByTestId("task-project-field")).not.toBeInTheDocument();
+    expect(await submitCreate()).not.toHaveProperty("projectId");
+    expect(resolveOrCreateProjectId).not.toHaveBeenCalled();
+  });
+
   it("allows opting out of the default project", async () => {
     renderWithProjects();
     fillRequired();
@@ -3516,6 +3548,57 @@ describe("automation trigger type", () => {
   function type(testId: string, value: string) {
     fireEvent.change(screen.getByTestId(testId), { target: { value } });
   }
+
+  it("seeds project intake, preserves edits, and clears it on an ordinary reopen", async () => {
+    const props = {
+      initialTrigger: "jira" as const,
+      initialName: "Jira intake",
+      initialPrompt: "Create a project ticket and attach the source URL.",
+      initialProject: { id: "proj_1", name: "Triage" },
+    };
+    const info = { scheduled_task_projects: true };
+    const view = render(dialog(props, info));
+    expect(screen.getByTestId("task-name-input")).toHaveValue(props.initialName);
+    expect(screen.getByTestId("task-trigger-instructions")).toHaveValue(props.initialPrompt);
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Triage");
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+    expect(mutateAsync).not.toHaveBeenCalled();
+    expect(resolveOrCreateProjectId).not.toHaveBeenCalled();
+
+    type("task-trigger-scope", "OPS");
+    type("task-trigger-instructions", "File only actionable work.");
+    type("task-name-input", "Team intake");
+    // A refresh changes the project's name, not its identity or the edited draft.
+    projectsQuery.current = {
+      data: [{ id: "proj_1", name: "Bugs", icon: null }, PROJECTS[1]],
+      isPending: false,
+      isSuccess: true,
+      isError: false,
+    };
+    view.rerender(dialog({ ...props, initialPrompt: "Different prefill" }, info));
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Bugs");
+    expect(screen.getByTestId("task-name-input")).toHaveValue("Team intake");
+    expect(screen.getByTestId("task-trigger-instructions")).toHaveValue(
+      "File only actionable work.",
+    );
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    const input = mutateAsync.mock.calls[0][0];
+    expect(input).toMatchObject({ projectId: "proj_1", templateId: "jira", name: "Team intake" });
+    expect(decodeTriggerPrompt(input.prompt)).toMatchObject({
+      source: "jira",
+      scope: "OPS",
+      instructions: "File only actionable work.",
+    });
+    expect(resolveOrCreateProjectId).not.toHaveBeenCalled();
+
+    view.rerender(dialog({ open: false }, info));
+    view.rerender(dialog({}, info));
+    expect(screen.getByLabelText("Trigger type")).toHaveTextContent("Schedule");
+    expect(screen.getByTestId("task-name-input")).toHaveValue("");
+    expect(screen.getByTestId("task-prompt-input")).toHaveValue("");
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Omnigent Automation");
+  });
 
   it.each([
     ["Jira", "jira", "ES"],

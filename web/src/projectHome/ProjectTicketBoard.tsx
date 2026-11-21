@@ -30,6 +30,7 @@ import {
   TicketStatusIcon,
   TicketTags,
 } from "./TicketControls";
+import { ProjectTicketSources } from "./ProjectTicketSources";
 import {
   useRelatedTickets,
   useTicketActions,
@@ -108,6 +109,7 @@ function TicketBoard({
   );
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+      <ProjectTicketSources key={projectName} projectId={projectId} projectName={projectName} />
       <TicketError error={completing || reviewing ? null : update.error} />
       <DndContext
         sensors={sensors}

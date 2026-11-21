@@ -3,7 +3,7 @@ import { useScheduleEscape } from "./useScheduleEscape";
 // Dialog for creating or editing a scheduled task. Reuses the existing agent,
 // host, and workspace pickers where the backend can persist those fields.
 
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ComponentProps, type ReactNode } from "react";
 import {
   BoxIcon,
   CalendarOffIcon,
@@ -108,7 +108,11 @@ import {
 import { WorkspacePickerDialog } from "@/shell/WorkspacePickerDialog";
 import { AgentHarnessPicker } from "@/shell/NewChatDialog";
 import { ProjectPicker, ProjectRowIcon } from "@/shell/ProjectPicker";
-import { useProjects, useResolveOrCreateProjectId } from "@/hooks/useConversations";
+import {
+  useProjects,
+  useResolveOrCreateProjectId,
+  type ProjectSummary,
+} from "@/hooks/useConversations";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useHosts } from "@/hooks/useHosts";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
@@ -232,8 +236,10 @@ function SettingsGroupHeading({ children }: { children: ReactNode }) {
 export function CreateScheduledTaskDialog({
   open,
   onOpenChange,
+  onCloseAutoFocus,
   initialName,
   initialPrompt,
+  initialProject,
   initialTrigger = null,
   initialTemplateId,
   sessionLink = "",
@@ -244,9 +250,14 @@ export function CreateScheduledTaskDialog({
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  /** Restore focus for entry points whose picker unmounts when this dialog opens. */
+  onCloseAutoFocus?: ComponentProps<typeof DialogContent>["onCloseAutoFocus"];
   /** Seed values applied when opening from a template card. */
   initialName?: string;
+  /** Instructions for the schedule or matching-item sessions of a trigger. */
   initialPrompt?: string;
+  /** Project-page entry points keep their project; resolve label-only projects on save. */
+  initialProject?: Pick<ProjectSummary, "id" | "name">;
   /** Open on a Jira/Slack/GitHub/Linear trigger template instead of a plain prompt. */
   initialTrigger?: TriggerSource | null;
   initialTemplateId?: AutomationTemplateId;
@@ -689,9 +700,9 @@ export function CreateScheduledTaskDialog({
         }
       } else {
         setName(
-          initialTrigger
-            ? TRIGGER_TEMPLATES[initialTrigger].name
-            : (sourceSession?.title ?? initialName ?? ""),
+          sourceSession?.title ??
+            initialName ??
+            (initialTrigger ? TRIGGER_TEMPLATES[initialTrigger].name : ""),
         );
         setPickedAgentId(sourceSession?.agentId ?? null);
         setPickedModel("");
@@ -702,7 +713,10 @@ export function CreateScheduledTaskDialog({
         setSessionMode(initialTrigger && !sourceSession ? "continue" : "new");
         setStartNewSession(false);
         setTrigger(sourceSession ? null : initialTrigger);
-        setTriggerFields(emptyTriggerFields(initialTrigger ?? "jira"));
+        setTriggerFields({
+          ...emptyTriggerFields(initialTrigger ?? "jira"),
+          instructions: initialPrompt ?? "",
+        });
         setSchedule(
           initialTrigger && !sourceSession ? defaultTriggerSchedule : DEFAULT_SCHEDULE_MODEL,
         );
@@ -711,8 +725,8 @@ export function CreateScheduledTaskDialog({
         setWorkspace("");
         setBaseBranch(null);
         setSandboxMode(false);
-        setProjectChoice(null);
-        setPickedProjectId(null);
+        setProjectChoice(initialProject?.name ?? null);
+        setPickedProjectId(initialProject?.id ?? null);
         setMcpServices([]);
       }
       setError(null);
@@ -722,6 +736,7 @@ export function CreateScheduledTaskDialog({
     open,
     initialName,
     initialPrompt,
+    initialProject,
     initialTrigger,
     defaultTriggerSchedule,
     editingTask,
@@ -1678,13 +1693,15 @@ export function CreateScheduledTaskDialog({
         ...workspacePatch,
         ...((editingTask?.sessionMode ?? "new") !== sessionMode ? { sessionMode } : {}),
       };
-      const projectInput = await projectChangeInput(
-        // Saving over a deleted project clears it, matching the "No project" shown.
-        effectiveProjectChoice ?? (savedProjectDeleted ? "" : null),
-        pickedProjectId,
-        savedProjectId,
-        resolveProjectId,
-      );
+      const projectInput = projectsSupported
+        ? await projectChangeInput(
+            // Saving over a deleted project clears it, matching the "No project" shown.
+            effectiveProjectChoice ?? (savedProjectDeleted ? "" : null),
+            pickedProjectId,
+            savedProjectId,
+            resolveProjectId,
+          )
+        : {};
       if (editingTask) {
         // Continued-session edits omit launch settings, except to clear a stored mode
         // the server refuses; new targets clear stale overrides.
@@ -1796,6 +1813,7 @@ export function CreateScheduledTaskDialog({
       <DialogContent
         className="flex max-h-[90vh] flex-col gap-0 overflow-hidden p-0 sm:max-w-[720px]"
         data-testid="create-scheduled-task-dialog"
+        onCloseAutoFocus={onCloseAutoFocus}
         onOpenAutoFocus={(event) => {
           const title = document.getElementById("task-name");
           if (title) {

@@ -25,6 +25,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
 }));
 
 vi.mock("@/hooks/useConversations", () => ({
+  useAutomationsEnabled: () => false,
   useProjects: () => ({
     data: [{ id: "project", name: "Shipping" }],
     isLoading: false,
@@ -78,13 +79,15 @@ function renderBoard(element: React.ReactNode) {
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
   clients.push(client);
-  const rendered = render(
-    <QueryClientProvider client={client}>
-      <TooltipProvider>
-        <MemoryRouter>{element}</MemoryRouter>
-      </TooltipProvider>
-    </QueryClientProvider>,
-  );
+  const rendered = render(element, {
+    wrapper: ({ children }) => (
+      <QueryClientProvider client={client}>
+        <TooltipProvider>
+          <MemoryRouter>{children}</MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>
+    ),
+  });
   return { ...rendered, client };
 }
 
@@ -162,15 +165,24 @@ describe("Project ticket board", () => {
 
   it("creates a title-only ticket without creating a session", async () => {
     const onCreated = vi.fn();
-    renderBoard(
-      <ProjectTicketPanel
-        projectName="Shipping"
-        ticketId="new"
-        onClose={vi.fn()}
-        onCreated={onCreated}
-      />,
-    );
+    const onExpandedChange = vi.fn();
+    const props = {
+      projectName: "Shipping",
+      ticketId: "new",
+      onClose: vi.fn(),
+      onCreated,
+      onExpandedChange,
+    };
+    const { rerender } = renderBoard(<ProjectTicketPanel {...props} />);
     fireEvent.change(screen.getByLabelText("Title"), { target: { value: "A small task" } });
+    fireEvent.click(screen.getByRole("button", { name: "Expand ticket" }));
+    expect(onExpandedChange).toHaveBeenLastCalledWith(true);
+    rerender(<ProjectTicketPanel {...props} expanded />);
+    expect(screen.getByLabelText("Title")).toHaveValue("A small task");
+    fireEvent.click(screen.getByRole("button", { name: "Restore ticket panel" }));
+    expect(onExpandedChange).toHaveBeenLastCalledWith(false);
+    rerender(<ProjectTicketPanel {...props} expanded={false} />);
+    expect(screen.getByLabelText("Title")).toHaveValue("A small task");
     fireEvent.click(screen.getByRole("button", { name: "Create ticket" }));
     await waitFor(() => expect(onCreated).toHaveBeenCalledWith("ticket"));
     expect(api.createTicket).toHaveBeenCalledWith("project", {
@@ -310,6 +322,12 @@ describe("Project ticket board", () => {
       await screen.findByRole("heading", { name: "Ship the board", level: 2 }),
     ).toBeInTheDocument();
     expect(await screen.findByRole("heading", { name: "Acceptance" })).toBeInTheDocument();
+    const completion = screen.getByRole("button", { name: "Completion summary" });
+    expect(completion).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("Delivered")).toBeNull();
+    expect(completion).toHaveTextContent("Delivered and verified.");
+    fireEvent.click(completion);
+    expect(completion).toHaveAttribute("aria-expanded", "true");
     const emphasized = await Promise.all(
       ["Readable", "Delivered", "Reviewed"].map((word) => screen.findByText(word)),
     );
@@ -553,6 +571,7 @@ describe("Project ticket board", () => {
 
   it("saves the current plan and renders its acceptance criteria as Markdown", async () => {
     ticket.status = "planning";
+    const user = userEvent.setup();
     renderBoard(
       <ProjectTicketPanel
         projectName="Shipping"
@@ -561,10 +580,24 @@ describe("Project ticket board", () => {
         onCreated={vi.fn()}
       />,
     );
-    fireEvent.click(await screen.findByRole("button", { name: "Edit plan" }));
+    const disclosure = await screen.findByRole("button", { name: "Plan" });
+    expect(disclosure).toHaveAttribute("aria-expanded", "false");
+    disclosure.focus();
+    await user.keyboard("{Enter}");
+    expect(disclosure).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText(/Align on the approach/)).toBeInTheDocument();
+    await user.keyboard(" ");
+    expect(disclosure).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(screen.getByRole("button", { name: "Edit plan" }));
+    expect(disclosure).toHaveAttribute("aria-expanded", "true");
     fireEvent.change(screen.getByLabelText("Plan"), {
       target: { value: "## Acceptance\n\n- **Readable** UI" },
     });
+    fireEvent.click(disclosure);
+    expect(screen.queryByRole("textbox", { name: "Plan" })).toBeNull();
+    expect(disclosure).toHaveTextContent("Unsaved changes");
+    fireEvent.click(disclosure);
+    expect(screen.getByLabelText("Plan")).toHaveValue("## Acceptance\n\n- **Readable** UI");
     fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
     expect(await screen.findByRole("heading", { name: "Acceptance" })).toBeInTheDocument();
     expect(api.updateTicket).toHaveBeenCalledWith("project", "ticket", {
@@ -589,9 +622,15 @@ describe("Project ticket board", () => {
       target: { value: "**Verified** tests. Please inspect the demo." },
     });
     await user.click(screen.getByRole("button", { name: "Send for review" }));
-    expect(await screen.findByRole("region", { name: "Human review" })).toHaveTextContent(
-      "Verified",
-    );
+    const review = await screen.findByRole("region", { name: "Human review" });
+    const disclosure = within(review).getByRole("button", { name: "Ready for review" });
+    expect(disclosure).toHaveAttribute("aria-expanded", "false");
+    expect(disclosure).toHaveTextContent("Verified tests. Please inspect the demo.");
+    expect(screen.queryByText("Verified")).toBeNull();
+    await user.click(disclosure);
+    expect(await screen.findByText("Verified")).toHaveAttribute("data-streamdown", "strong");
+    await user.click(disclosure);
+    expect(disclosure).toHaveAttribute("aria-expanded", "false");
     await user.click(screen.getByRole("button", { name: "Request changes" }));
     const dialog = screen.getByRole("dialog");
     expect(within(dialog).getByRole("button", { name: "Request changes" })).toBeDisabled();
@@ -609,6 +648,35 @@ describe("Project ticket board", () => {
     await waitFor(() => expect(screen.queryByRole("region", { name: "Human review" })).toBeNull());
   });
 
+  it("reopens a collapsed plan on save failure without losing its draft", async () => {
+    ticket.status = "planning";
+    let rejectSave!: (error: Error) => void;
+    vi.mocked(api.updateTicket).mockImplementationOnce(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectSave = reject;
+        }),
+    );
+    renderBoard(
+      <ProjectTicketPanel
+        projectName="Shipping"
+        ticketId="ticket"
+        onClose={vi.fn()}
+        onCreated={vi.fn()}
+      />,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "Edit plan" }));
+    fireEvent.change(screen.getByLabelText("Plan"), { target: { value: "Keep the draft" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
+    await waitFor(() => expect(api.updateTicket).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole("button", { name: "Plan" }));
+    expect(screen.queryByRole("textbox", { name: "Plan" })).toBeNull();
+    await act(async () => rejectSave(new Error("Could not save plan")));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Could not save plan");
+    expect(screen.getByRole("button", { name: "Plan" })).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByLabelText("Plan")).toHaveValue("Keep the draft");
+  });
+
   it("records human acceptance with a completion summary", async () => {
     ticket.status = "review";
     ticket.review_summary = "Tested and ready; check the demo.";
@@ -619,6 +687,10 @@ describe("Project ticket board", () => {
         onClose={vi.fn()}
         onCreated={vi.fn()}
       />,
+    );
+    expect(await screen.findByRole("button", { name: "Ready for review" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
     );
     fireEvent.click(await screen.findByRole("button", { name: "Approve & mark done" }));
     const dialog = screen.getByRole("dialog");
@@ -698,14 +770,15 @@ describe("Project ticket board", () => {
         last_id: "planner",
       });
       const user = userEvent.setup();
-      renderBoard(
-        <ProjectTicketPanel
-          projectName="Shipping"
-          ticketId="ticket"
-          onClose={vi.fn()}
-          onCreated={vi.fn()}
-        />,
-      );
+      const onExpandedChange = vi.fn();
+      const props = {
+        projectName: "Shipping",
+        ticketId: "ticket",
+        onClose: vi.fn(),
+        onCreated: vi.fn(),
+        onExpandedChange: mobile ? undefined : onExpandedChange,
+      };
+      const { rerender } = renderBoard(<ProjectTicketPanel {...props} />);
       const agents = await screen.findByRole("list", { name: "Involved agents" });
       const chat = await within(agents).findByRole("link", {
         name: "Respond to: Design the board",
@@ -723,14 +796,29 @@ describe("Project ticket board", () => {
       fireEvent.change(screen.getByLabelText("Add a comment"), {
         target: { value: "Comment draft" },
       });
+      const plan = screen.getByRole("button", { name: "Plan" });
+      expect(plan).toHaveAttribute("aria-expanded", "false");
+      expect(plan).toHaveTextContent("Original plan");
       await user.click(screen.getByRole("button", { name: "Edit plan" }));
       fireEvent.change(screen.getByLabelText("Plan"), { target: { value: "Plan draft" } });
+      if (!mobile) {
+        await user.click(screen.getByRole("button", { name: "Expand ticket" }));
+        expect(onExpandedChange).toHaveBeenLastCalledWith(true);
+        rerender(<ProjectTicketPanel {...props} expanded />);
+      }
       await user.click(chat);
       expect(screen.getByLabelText("Existing session chat")).toHaveTextContent("planner");
       expect(screen.queryByRole("textbox", { name: "Add a comment" })).toBeNull();
       await user.click(screen.getByRole("link", { name: "Back to ticket" }));
       expect(screen.getByLabelText("Add a comment")).toHaveValue("Comment draft");
       expect(screen.getByLabelText("Plan")).toHaveValue("Plan draft");
+      if (!mobile) {
+        await user.click(screen.getByRole("button", { name: "Restore ticket panel" }));
+        expect(onExpandedChange).toHaveBeenLastCalledWith(false);
+        rerender(<ProjectTicketPanel {...props} expanded={false} />);
+        expect(screen.getByLabelText("Add a comment")).toHaveValue("Comment draft");
+        expect(screen.getByLabelText("Plan")).toHaveValue("Plan draft");
+      }
       expect(projectsApi.initializeProjectOrchestrator).not.toHaveBeenCalled();
     },
   );

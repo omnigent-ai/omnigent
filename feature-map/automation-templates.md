@@ -96,6 +96,27 @@ to customize.
 - `default-project`: new automations select Omnigent Automation. Saving reuses or
   creates that project; canceling creates nothing. The project picker can choose
   another project or remove the default. Editing preserves the saved project.
+- `project-sources`: one Sources control above the ticket lanes groups the
+  project's linked automations and the add-source flow. Its provider icons and
+  count summarize existing sources; failures have a warning indicator. With no
+  sources, Connect source opens the provider picker directly. With existing
+  sources, the list opens first and Add source opens the same picker, with a back
+  action and per-provider linked counts. Selecting a provider opens the existing
+  automation form with that project, a descriptive name, and ticket-intake instructions.
+  Source scope stays editable: Jira boards use a project and optional board JQL,
+  Slack uses a channel, and Linear, GitHub, and PagerDuty use their existing
+  team/repository/service fields. Selecting a preset does not connect an account
+  or create an automation; the user must review and save. Normal trigger
+  link-back and reply settings still apply. A project can have multiple sources,
+  including several of the same provider; each is a separate automation. Saved
+  source automations appear together in the Sources panel with readable names,
+  scopes, Jira board filters, and active/paused/failed-run state, linking to their
+  existing automation pages. These are automation states, not account-authentication
+  or connector-health claims. Long text wraps, lists scroll within the viewport,
+  and Add source stays visible. Creating one reopens the source list and updates
+  the count without leaving the board. List failures retain cached sources and
+  offer a retry without preventing setup. Keyboard dismissal returns to Sources;
+  choosing a provider hands focus to the automation form.
 - `workspace`: connected-host setup disables workspace browsing while the
   selected host is offline and asks the user to connect it. Reconnecting enables
   browsing again; saved paths and sandbox setup are preserved. When the default
@@ -183,6 +204,12 @@ to customize.
   follow `/tasks?view=templates`. Old `/tasks/templates` links redirect here.
 - **Your automations:** select a suggestion beneath the saved automations or
   empty-state message, with All selected and the search cleared.
+- **Project ticket board:** open Sources above the lanes to inspect linked
+  automations or choose Add source. With no sources, choose Connect source directly.
+  Select Jira board, Slack channel, Linear team, GitHub repository, or PagerDuty service.
+  Review the prefilled name and Instructions, supply the source scope, and inspect
+  Project under Advanced. Cancel to leave without creating anything, or explicitly
+  create the automation after reviewing its connection and permission settings.
 - **Creation modal:** click New automation on either tab. Schedule is selected
   by default; use Trigger type to select an integration and reveal its conditions
   and session instructions. Returning to Schedule restores the schedule draft.
@@ -241,6 +268,11 @@ Minute-schedule checks use the server’s advertised sub-hour capability and `au
 - `web/src/pages/TasksPage.test.tsx` covers populated and empty lists, search and
   filter preservation, deep links with an embedded mount prefix, load failures,
   capability gating, and both creation buttons' paths.
+- `web/src/projectHome/ProjectTicketSources.test.tsx` covers project source
+  selection, capability gates, cancel/reopen, and the modal's prefilled inputs.
+  The creation-dialog component tests cover editable trigger instructions,
+  project-ID preservation across a rename, and resolving a label-only project
+  only on explicit save. These use mocked mutations and create no live records.
 - `web/src/components/scheduled/CreateScheduledTaskDialog.test.tsx` covers offline
   workspace browsing in create/edit setup, disconnect/reconnect, preserving a
   saved workspace, and sandbox creation with offline connected hosts. It also

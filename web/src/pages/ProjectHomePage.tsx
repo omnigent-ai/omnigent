@@ -1,9 +1,10 @@
-import { useCallback, useEffect, type KeyboardEvent } from "react";
+import { useCallback, useEffect, useState, type KeyboardEvent } from "react";
 import { PageScroll } from "@/components/PageScroll";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useResizablePanel } from "@/hooks/useResizablePanel";
 import { isKeyOwningOverlayOpen } from "@/lib/hotkeys";
 import { useParams, useReplaceSearchParams, useSearchParams } from "@/lib/routing";
+import { cn } from "@/lib/utils";
 import {
   useProjectBoardSearchStore,
   useProjectComposerStore,
@@ -44,8 +45,13 @@ export function ProjectHomePage() {
   const panelTicketId = tickets ? searchParams.get("ticket") : null;
   const orchestratorOpen = tickets && searchParams.has("orchestrator");
   const hasPanel = panelSessionId !== null || panelTicketId !== null || orchestratorOpen;
+  const [ticketExpanded, setTicketExpanded] = useState(false);
+  const ticketFillsPage = panelTicketId !== null && ticketExpanded && !isMobile;
+  const hideBoard = (isMobile && hasPanel) || ticketFillsPage;
+  useEffect(() => setTicketExpanded(false), [projectName, panelTicketId]);
   const replaceSearchParams = useReplaceSearchParams();
   const closePanel = useCallback(() => {
+    setTicketExpanded(false);
     const next = new URLSearchParams(searchParams);
     next.delete(PROJECT_PANEL_SESSION_PARAM);
     next.delete("ticket");
@@ -62,12 +68,14 @@ export function ProjectHomePage() {
     if (!hasPanel) return;
     function closeOnEscape(event: globalThis.KeyboardEvent) {
       if (event.key === "Escape" && !event.defaultPrevented && !isKeyOwningOverlayOpen()) {
-        closePanel();
+        event.preventDefault();
+        if (ticketFillsPage) setTicketExpanded(false);
+        else closePanel();
       }
     }
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [hasPanel, closePanel]);
+  }, [hasPanel, closePanel, ticketFillsPage]);
 
   function closeComposerOnEscape(event: KeyboardEvent<HTMLDivElement>) {
     // Portaled menus bubble through React too; they handle their own Escape.
@@ -94,7 +102,7 @@ export function ProjectHomePage() {
         extraBottom="0px"
       >
         {tickets ? (
-          <div className={isMobile && hasPanel ? "hidden" : "flex min-h-0 min-w-0 flex-1"}>
+          <div hidden={hideBoard} className={hideBoard ? "hidden" : "flex min-h-0 min-w-0 flex-1"}>
             <ProjectTicketBoard
               projectName={projectName}
               selectedTicketId={panelTicketId}
@@ -122,10 +130,13 @@ export function ProjectHomePage() {
             }
             // It closes on Escape, so page-wide Escape shortcuts leave keys inside it alone.
             data-escape-owner=""
-            className="relative flex shrink-0 flex-col pt-1 pr-4 pb-4"
-            style={{ width: isMobile ? "100%" : panelWidth }}
+            className={cn(
+              "relative flex min-h-0 min-w-0 shrink-0 flex-col pt-1 pr-4 pb-4",
+              ticketFillsPage && "pl-4",
+            )}
+            style={{ width: isMobile || ticketFillsPage ? "100%" : panelWidth }}
           >
-            {!isMobile && (
+            {!isMobile && !ticketFillsPage && (
               <div
                 {...handleProps}
                 aria-label="Resize session panel"
@@ -141,6 +152,8 @@ export function ProjectHomePage() {
                 ticketId={panelTicketId}
                 onClose={closePanel}
                 onCreated={(id) => replaceSearchParams(new URLSearchParams({ ticket: id }))}
+                expanded={ticketFillsPage}
+                onExpandedChange={isMobile ? undefined : setTicketExpanded}
               />
             ) : orchestratorOpen ? (
               <ProjectOrchestratorPanel
@@ -160,7 +173,7 @@ export function ProjectHomePage() {
         <div
           className="pointer-events-none absolute inset-x-0 bottom-0 z-20 flex justify-center px-4 pb-6"
           // Centered over the board, clear of the session panel.
-          style={{ right: hasPanel ? panelWidth : undefined }}
+          style={{ right: hasPanel && !ticketFillsPage ? panelWidth : undefined }}
         >
           <div
             data-testid="project-floating-composer"
