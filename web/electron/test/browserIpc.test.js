@@ -2424,6 +2424,7 @@ describe("browser IPC sessions on this machine", () => {
       sshPreview: true,
     });
     await navigate("http://localhost:5173");
+    assert.equal((await readView(ipcMain, "screenshot")).ok, true);
     const loads = [];
     webContents.loadURL = async (url) => loads.push(url);
     setLive(false);
@@ -2463,7 +2464,7 @@ describe("browser IPC sessions on this machine", () => {
         conversationId: "conv",
         action,
         params: { ref: 1, text: "hello" },
-        opts: { sessionHostProtocol: 1, sourceHostId },
+        opts: { sessionHostProtocol: 1, sshPreviewProtocol: 1, sourceHostId },
       },
     );
   }
