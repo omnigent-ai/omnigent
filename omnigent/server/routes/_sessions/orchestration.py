@@ -5817,9 +5817,10 @@ async def _maybe_relaunch_managed_sandbox(
             return False
     launch = tracker.get(session_id)
     if launch is None or launch.settled.is_set():
-        _raise_if_managed_wake_misses_host_tunnel(
+        if await _raise_if_managed_wake_misses_host_tunnel(
             conv=conv, host=host, request=request, app_state=app_state
-        )
+        ):
+            return False
         if keyed_wake is None:
             keyed_wake = _request_wakes_keyed(request)
         # A resumable managed host whose sandbox merely idle-stopped is WOKEN
@@ -5902,13 +5903,13 @@ def _request_wakes_keyed(request: Any) -> bool:
     return not isinstance(request, Request) or routed_slice_key(request) is not None
 
 
-def _raise_if_managed_wake_misses_host_tunnel(
+async def _raise_if_managed_wake_misses_host_tunnel(
     *,
     conv: Conversation,
     host: Host,
     request: Any,
     app_state: Any,
-) -> None:
+) -> bool:
     """
     Re-address a client request that would wake a managed host off its tunnel's replica.
 
@@ -5919,15 +5920,18 @@ def _raise_if_managed_wake_misses_host_tunnel(
     replica is connected elsewhere, and force-waking it would restart it under
     every session it serves, so the request is re-addressed instead: by the host's
     id when it arrived keyless (the host is keyed), or without a key when it
-    arrived keyed (the host is on the default replica). A request carrying any
-    other key is re-addressed by the host's id before any wake. Only a fastapi
-    ``Request`` names a routing key; internal callers pass nothing and skip this
-    check.
+    arrived keyed and the host doesn't reconnect here within the host reconnect
+    grace (it is on the default replica, not a keyed host moving to this one). A
+    request carrying any other key is re-addressed by the host's id before any
+    wake. Only a fastapi ``Request`` names a routing key; internal callers pass
+    nothing and skip this check.
 
     :param conv: Session row whose host may need a wake.
     :param host: The session's managed host row, already loaded by the caller.
     :param request: The inbound request, or ``None``/a non-HTTP context to skip.
     :param app_state: ``request.app.state`` — supplies the host registry.
+    :returns: ``True`` when the host's tunnel reconnected here during the grace,
+        so the caller serves the request over it instead of waking the host.
     :raises WrongReplicaError: Naming the host's id, for a request that must be
         resent keyed by it.
     :raises OmnigentError: ``WRONG_REPLICA`` (no key to resend) for a host-keyed
@@ -5938,17 +5942,30 @@ def _raise_if_managed_wake_misses_host_tunnel(
     from omnigent.server.routes._host_launch import _deployment_is_sharded, routed_slice_key
 
     if not isinstance(request, Request):
-        return
+        return False
     host_registry = getattr(app_state, "host_registry", None)
     if conv.host_id is None or host_registry is None or not _deployment_is_sharded():
-        return
+        return False
     if host_registry.get(conv.host_id) is not None or host.sandbox_provider is None:
-        return
+        return False
     routed_key = routed_slice_key(request)
     live_elsewhere = host_is_live(host)
     if routed_key in (None, conv.host_id) and not live_elsewhere:
-        return
+        return False
     if routed_key == conv.host_id:
+        from omnigent.server.routes import sessions as _facade
+
+        if (
+            await _wait_for_host_reconnect(
+                conv.host_id,
+                host_registry,
+                None,
+                runner_id=None,
+                timeout_s=_facade._HOST_RECONNECT_GRACE_S,
+            )
+            is not None
+        ):
+            return True
         raise OmnigentError(
             f"managed host {conv.host_id} is connected on the default replica; "
             "retry without its slice key",
@@ -5991,7 +6008,7 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
     host = await asyncio.to_thread(host_store.get_host, conv.host_id)
     if host is None or not host_resume_supported(host, sandbox_config):
         return False
-    _raise_if_managed_wake_misses_host_tunnel(
+    await _raise_if_managed_wake_misses_host_tunnel(
         conv=conv, host=host, request=request, app_state=app_state
     )
     host_registry = cast(HostRegistry | None, getattr(app_state, "host_registry", None))

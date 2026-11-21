@@ -7,6 +7,7 @@ list, so a test can assert both that a wake was kicked and where it ended.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Callable
 from typing import Any
@@ -254,12 +255,17 @@ async def test_keyless_request_never_restarts_a_host_live_elsewhere(
 @pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)
 @LABELLED
 async def test_host_keyed_request_never_restarts_a_host_live_on_the_default_route(
-    two_replica_stack: Any, managed_wake: Any, db_uri: str, labelled: bool
+    two_replica_stack: Any,
+    managed_wake: Any,
+    db_uri: str,
+    labelled: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A host-keyed request is sent back keyless, not woken, while an unkeyed host is live."""
     arrange, events = managed_wake
     session_id = await arrange(keyed=labelled)
     HostStore(db_uri).upsert_on_connect(HOST_ID, "managed-wake-host", OWNER)
+    monkeypatch.setattr(sessions_module, "_HOST_RECONNECT_GRACE_S", 0.2)
 
     response = await two_replica_stack.tunnel_client.post(
         f"/v1/sessions/{session_id}/events", headers=_headers(HOST_ID), json=MESSAGE
@@ -268,6 +274,36 @@ async def test_host_keyed_request_never_restarts_a_host_live_on_the_default_rout
     assert _wrong_replica(response), response.text
     assert "slice_key" not in response.json()["error"]
     assert "resume" not in events and "launch" not in events, events
+
+
+@pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)
+@LABELLED
+async def test_host_keyed_request_waits_for_a_live_host_reconnecting_here(
+    two_replica_stack: Any, managed_wake: Any, db_uri: str, labelled: bool
+) -> None:
+    """A keyed host still reconnecting to its key's replica is served there, not restarted."""
+    arrange, events = managed_wake
+    session_id = await arrange(keyed=labelled)
+    HostStore(db_uri).upsert_on_connect(HOST_ID, "managed-wake-host", OWNER)
+
+    async def reconnect() -> None:
+        await asyncio.sleep(0.3)
+        two_replica_stack.tunnel_replica.state.host_registry.register(
+            HOST_ID,
+            AsyncMock(),
+            HostHelloFrame(version="test", frame_protocol_version=1, name="wake", runners=[]),
+            owner=None,
+            registered_with_managed_token=True,
+        )
+
+    reconnecting = asyncio.create_task(reconnect())
+    response = await two_replica_stack.tunnel_client.post(
+        f"/v1/sessions/{session_id}/events", headers=_headers(HOST_ID), json=MESSAGE
+    )
+    await reconnecting
+
+    assert not _wrong_replica(response), response.text
+    assert "resume" not in events, events
 
 
 @pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)
