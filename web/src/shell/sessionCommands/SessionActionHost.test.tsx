@@ -88,6 +88,15 @@ describe("SessionActionHost", () => {
     expect(readMarks.read).not.toHaveBeenCalled();
   });
 
+  it("asks nothing of the server for a session still being created", () => {
+    renderHost();
+    const draft: Conversation = { ...SESSION, id: "temp:example", provisional: true };
+    act(() => requestSessionAction(draft, "pin"));
+    act(() => requestSessionAction(draft, "rename"));
+    expect(writes.pin).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
   it("does nothing for an action that stopped applying, such as pinning it once archived", () => {
     renderHost();
     act(() => requestSessionAction({ ...SESSION, archived: true }, "pin"));
