@@ -114,6 +114,17 @@ def permission_mode_launch_options(
     return list(args) or None, labels
 
 
+def launch_args_contain(args: Sequence[str], needle: Sequence[str]) -> bool:
+    """Whether *needle* appears in *args* as consecutive items."""
+    width = len(needle)
+    return any(tuple(args[i : i + width]) == tuple(needle) for i in range(len(args) - width + 1))
+
+
+# Harnesses whose launch settings are read with the CLI's own parsing, so a session
+# they start can take their creator's mode.
+_INHERITED_MODE_HARNESSES = frozenset({"claude-native", "codex-native"})
+
+
 # Codex's built-in permission profiles, as the sandbox each one selects.
 _CODEX_PROFILE_SANDBOXES = {":danger-full-access": "danger-full-access", ":read-only": "read-only"}
 
@@ -150,8 +161,8 @@ def _launch_permission_mode(session: Conversation, harness: str) -> str | None:
     :param session: A session running *harness*.
     :param harness: Its canonical harness, e.g. ``"codex-native"``.
     :returns: A mode of :data:`PERMISSION_LAUNCH_ARGS` for *harness*, or ``None``
-        when the settings select none of them exactly or the harness isn't
-        Claude Code or Codex.
+        when the settings select none of them exactly. Harnesses other than
+        Claude Code and Codex match a preset's args among the options.
     """
     launch_args = list(session.terminal_launch_args or [])
     # Everything after ``--`` is prompt text, not an option.
@@ -184,7 +195,10 @@ def _launch_permission_mode(session: Conversation, harness: str) -> str | None:
             ),
             None,
         )
-    return None
+    return next(
+        (mode for mode, args in modes.items() if args and launch_args_contain(options, args)),
+        None,
+    )
 
 
 def session_permission_mode(session: Conversation, harness: str) -> str | None:
@@ -218,9 +232,10 @@ def creator_session_launch_options(
     """The creator's permission mode for a session that *creator* starts.
 
     A session another session starts can do without asking what its creator can.
-    ``None`` keeps the new session's agent default: the two run different harnesses,
-    the creator's mode cannot be told, or it skips approval and the new session runs
-    off the creator's host, where the user never chose that mode.
+    ``None`` keeps the new session's agent default: the harness isn't Claude Code or
+    Codex, the two run different harnesses, the creator's mode cannot be told, or it
+    skips approval and the new session runs off the creator's host, where the user
+    never chose that mode.
 
     :param creator: The session that starts the new one.
     :param harness: The new session's harness, e.g. ``"codex-native"``.
@@ -229,7 +244,11 @@ def creator_session_launch_options(
     :returns: Launch args and labels, as :func:`permission_mode_launch_options` returns.
     """
     harness = canonicalize_harness(harness) or harness
-    if harness is None or harness != (canonicalize_harness(creator_harness) or creator_harness):
+    if (
+        harness is None
+        or harness not in _INHERITED_MODE_HARNESSES
+        or harness != (canonicalize_harness(creator_harness) or creator_harness)
+    ):
         return None
     mode = session_permission_mode(creator, harness)
     if mode is None or (mode in APPROVAL_SKIPPING_PERMISSION_MODES and not on_creator_host):

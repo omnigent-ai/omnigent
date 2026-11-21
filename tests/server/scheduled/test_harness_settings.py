@@ -20,6 +20,7 @@ from omnigent.server.scheduled.harness_settings import (
     creator_session_launch_options,
     forget_unrecorded_legacy_run_session,
     note_unrecorded_legacy_run_session,
+    session_permission_mode,
     validate_scheduled_permission_mode,
     validate_scheduled_permission_support,
 )
@@ -533,6 +534,27 @@ def test_creator_mode_needs_the_same_harness(
     )
     options = creator_session_launch_options(
         creator, harness=harness, creator_harness=creator_harness, on_creator_host=True
+    )
+    assert options is None
+
+
+@pytest.mark.parametrize(
+    ("harness", "launch_args", "expected"),
+    [
+        ("cursor-native", ["--yolo"], "yolo"),
+        ("devin-native", ["--permission-mode", "smart"], "smart"),
+        # Text after ``--`` is the prompt, not an option.
+        ("cursor-native", ["--", "--yolo"], None),
+    ],
+)
+def test_other_harnesses_report_their_launch_mode_without_passing_it_on(
+    harness: str, launch_args: list[str], expected: str | None
+) -> None:
+    """Only Claude Code's and Codex's launch settings pass a mode to a session they start."""
+    session = SimpleNamespace(labels={}, terminal_launch_args=launch_args)
+    assert session_permission_mode(session, harness) == expected
+    options = creator_session_launch_options(
+        session, harness=harness, creator_harness=harness, on_creator_host=True
     )
     assert options is None
 

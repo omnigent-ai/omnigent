@@ -12259,19 +12259,42 @@ async def test_patch_approval_mode_forwards_and_persists_label(
     assert mode_events[0]["approval_mode"] == "full-access"
 
 
+_APPROVE_FOR_ME = PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"]
+
+
 @pytest.mark.parametrize(
-    ("harness", "reported", "expected"),
+    ("harness", "reported", "launch_args", "expected"),
     [
-        ("codex-native", "read-only", "read-only"),
+        pytest.param(
+            "codex-native", "read-only", _APPROVE_FOR_ME, "read-only", id="reported-mode"
+        ),
         # Anyone who can edit the session can write the label, so it can't claim
         # a mode that skips approval.
-        ("codex-native", "full-access", "approve-for-me"),
-        (None, "read-only", None),
+        pytest.param(
+            "codex-native",
+            "full-access",
+            _APPROVE_FOR_ME,
+            "approve-for-me",
+            id="reported-approval-skipping-mode",
+        ),
+        pytest.param("cursor-native", None, ["--auto-review"], "auto-review", id="cursor"),
+        pytest.param(
+            "antigravity-native",
+            None,
+            ["--dangerously-skip-permissions"],
+            "skip",
+            id="antigravity",
+        ),
+        pytest.param("devin-native", None, ["--permission-mode", "smart"], "smart", id="devin"),
+        pytest.param(None, "read-only", _APPROVE_FOR_ME, None, id="harness-without-modes"),
     ],
-    ids=["reported-mode", "reported-approval-skipping-mode", "harness-without-modes"],
 )
 async def test_session_snapshot_reports_its_permission_mode(
-    client: httpx.AsyncClient, harness: str | None, reported: str, expected: str | None
+    client: httpx.AsyncClient,
+    harness: str | None,
+    reported: str | None,
+    launch_args: list[str],
+    expected: str | None,
 ) -> None:
     """The snapshot names the mode a session reports, over the one it launched in."""
     executor = {"type": "omnigent", "config": {"harness": harness}} if harness else None
@@ -12279,8 +12302,8 @@ async def test_session_snapshot_reports_its_permission_mode(
     session = await _create_session(
         client,
         agent["id"],
-        labels={"omnigent.codex_native.approval_mode": reported},
-        terminal_launch_args=PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
+        labels={"omnigent.codex_native.approval_mode": reported} if reported else None,
+        terminal_launch_args=launch_args,
     )
 
     snapshot = await client.get(f"/v1/sessions/{session['id']}")
