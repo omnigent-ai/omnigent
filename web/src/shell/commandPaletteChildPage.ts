@@ -14,7 +14,14 @@ export interface PaletteParentPlace {
 
 export type PaletteChildPage =
   /** A session's actions, from ⌘↵ on its row; `conversation` is that row as listed. */
-  | { kind: "session-actions"; sessionId: string; title: string; conversation: Conversation }
+  | {
+      kind: "session-actions";
+      sessionId: string;
+      title: string;
+      conversation: Conversation;
+      /** Whether the sidebar's lists held the session as its actions opened. */
+      listed: boolean;
+    }
   /** A command's options, bound to its row and the command target then. */
   | { kind: "command-options"; itemId: string; targetKey: string; label: string }
   /**
