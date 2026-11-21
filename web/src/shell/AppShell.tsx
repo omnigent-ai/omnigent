@@ -54,6 +54,7 @@ import { useSettingsHotkey } from "@/hooks/useSettingsHotkey";
 import { useIsEmbedded } from "@/lib/embedded";
 import { AgentInfoContent, agentHasInfo } from "@/components/AgentInfo";
 import { useIdleNotifications } from "@/hooks/useIdleNotifications";
+import { WebUpdateBanner } from "@/components/WebUpdateBanner";
 import { useSeedReadState } from "@/hooks/useUnseenConversations";
 import { useToggleUnreadHotkey } from "@/hooks/useToggleUnreadHotkey";
 import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
@@ -3268,6 +3269,7 @@ function AppShellImpl() {
           canvas for the traffic lights, and the strip is the window's one
           drag surface — content below and right stays fully clickable. */}
             {isMacElectronShell() && <div className="electron-drag-strip" aria-hidden="true" />}
+            {!isEmbedded && <WebUpdateBanner />}
             {/* macOS shell: the toggle and Back/Forward stay fixed beside the traffic
           lights. Search joins them when collapsed; Settings is in the profile footer. */}
             {/* Hidden on /settings: the settings nav replaces the session list
