@@ -2002,7 +2002,8 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
-    pane = "❯ "
+    # The empty input box: no key is sent before a capture shows it.
+    pane = "──────\n❯ \n──────\n"
     enters = 0
     prompt_pending = False
     killed: list[Path] = []

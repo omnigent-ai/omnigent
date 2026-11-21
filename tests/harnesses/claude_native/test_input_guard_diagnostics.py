@@ -18,8 +18,10 @@ _PROMPT = (
 )
 
 
-def _composer(text: str = "", *, glyph: str = "❯") -> str:
-    return f"{_RULE}\n{glyph} {text}\n{_RULE}\n"
+def _composer(text: str = "", *, glyph: str = "❯", stashed: bool = False) -> str:
+    # Claude Code always draws rows above the box, where the stash marker sits.
+    marker = "  \u203a stashed\n" if stashed else ""
+    return f"⏺ done\n{marker}{_RULE}\n{glyph} {text}\n{_RULE}\n"
 
 
 class _Terminal:
@@ -33,6 +35,8 @@ class _Terminal:
         self.pending_source: str | None = None
         self.pending_after_paste = False
         self.clears_surface = False
+        # Claude Code shows the marker for as long as its stash holds a draft.
+        self.stashed = False
         monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path)
         monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
         monkeypatch.setattr(
@@ -77,13 +81,17 @@ class _Terminal:
         self.commands.append(args)
         if args[0] == "paste-buffer":
             self.pasted = True
-            self.pane = _composer(_PRIVATE_TEXT)
+            self.pane = _composer(_PRIVATE_TEXT, stashed=self.stashed)
         if args[-1] == "Enter" and self.newline_on_enter:
             self.pane = self.pane.replace(f"\n{_RULE}\n", f"\n\n{_RULE}\n")
         if self.clears_surface and (
             args[-1] == "Escape" or bridge._COMPOSER_KILL_TO_LINE_START in args[-1]
         ):
             self.pane = _composer()
+        if self.clears_surface and args[-1] == bridge._COMPOSER_STASH_KEY:
+            # Claude Code stashes the typed command and returns the box to chat.
+            self.stashed = True
+            self.pane = _composer(stashed=True)
 
 
 @pytest.fixture
@@ -110,9 +118,12 @@ def test_shell_refusal_records_recovery_attempts_before_any_paste(
     terminal: _Terminal, caplog: pytest.LogCaptureFixture, has_draft: bool
 ) -> None:
     terminal.pane = _composer(_PRIVATE_TEXT if has_draft else "", glyph="!")
+    # A typed command the stash key leaves in place refuses at once; an empty
+    # shell box is given Escapes until the dismissal window ends.
+    refusal = bridge.ClaudeComposerHoldsDraft if has_draft else bridge.ClaudeTerminalDialog
     with (
         caplog.at_level("INFO", logger=delivery_diagnostics.__name__),
-        pytest.raises(bridge.ClaudeTerminalDialog),
+        pytest.raises(refusal),
     ):
         bridge.inject_user_message(terminal.directory, content=_PRIVATE_TEXT)
 
@@ -120,12 +131,15 @@ def test_shell_refusal_records_recovery_attempts_before_any_paste(
     assert attrs["attempt"] == 0
     assert attrs["stage"] == "restoring_input"
     assert attrs["restore_first_surface"] == attrs["restore_last_surface"] == "shell_mode"
-    assert attrs["restore_captures"] > 2
-    assert attrs["restore_pane_rows"] == 3
+    assert attrs["restore_captures"] >= 2
+    assert attrs["restore_pane_rows"] == 4
     assert attrs["restore_capture_empty"] is False
-    action = "shell_clear" if has_draft else "escape"
+    action = "shell_stash" if has_draft else "escape"
     assert attrs[f"restore_{action}_attempts"] == len(terminal.commands)
-    assert attrs[f"restore_{action}_attempts"] > 1
+    if has_draft:
+        assert attrs["restore_shell_stash_attempts"] == 1
+    else:
+        assert attrs["restore_escape_attempts"] > 1
     assert all(command[-1] != "Enter" for command in terminal.commands)
     assert not terminal.pasted
 
@@ -145,7 +159,7 @@ def test_recovered_surface_is_retained_when_a_later_submit_fails(
     assert attrs["attempt"] == 1
     assert attrs["restore_first_surface"] == "shell_mode"
     assert attrs["restore_last_surface"] == "none"
-    assert attrs["restore_shell_clear_attempts"] == 1
+    assert attrs["restore_shell_stash_attempts"] == 1
     assert attrs["verification"] == "draft_still_present"
 
 

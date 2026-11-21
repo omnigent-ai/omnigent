@@ -17,6 +17,7 @@ import pytest
 
 from omnigent.harnesses.claude_native.bridge import (
     REQUEST_SESSION_ID_ENV_VAR,
+    ClaudeComposerHoldsDraft,
     ClaudeComposerNotCleared,
     ClaudeInputBoxOccupied,
     ClaudeTerminalDialog,
@@ -24,7 +25,7 @@ from omnigent.harnesses.claude_native.bridge import (
 )
 from omnigent.inner import claude_native_executor
 from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
-from omnigent.inner.executor import ExecutorError, TurnComplete
+from omnigent.inner.executor import ExecutorError, TextChunk, TurnComplete
 
 _REFUSAL = "Answer the pending Claude question or permission request before sending a message."
 _NOT_CLEARED = (
@@ -62,6 +63,7 @@ class _Pane:
         self.polls = 0
         self.repaints = 0
         self.kills = 0
+        self.stash_in_use_checks: list[bool] = []
 
     def inject_user_message(
         self, bridge_dir: Path, *, content: str, timeout_s: float = 30.0
@@ -84,6 +86,14 @@ class _Pane:
     def input_box_reads_clear(self, bridge_dir: Path, *, repaint: bool = False) -> bool:
         del bridge_dir
         self.repaints += repaint
+        return not self._still_refusing()
+
+    def input_box_takes_delivery(
+        self, bridge_dir: Path, *, stash_in_use: bool, repaint: bool = False
+    ) -> bool:
+        del bridge_dir
+        self.repaints += repaint
+        self.stash_in_use_checks.append(stash_in_use)
         return not self._still_refusing()
 
     def terminal_dialog_pending(self, bridge_dir: Path) -> bool:
@@ -128,6 +138,12 @@ def pane(monkeypatch: pytest.MonkeyPatch) -> _Pane:
     )
     monkeypatch.setattr(
         claude_native_executor, "claude_pane_ready", fake.claude_pane_ready, raising=False
+    )
+    monkeypatch.setattr(
+        claude_native_executor,
+        "input_box_takes_delivery",
+        fake.input_box_takes_delivery,
+        raising=False,
     )
     monkeypatch.setattr(
         claude_native_executor, "terminal_dialog_pending", fake.terminal_dialog_pending
@@ -289,13 +305,68 @@ async def test_a_message_the_input_box_refused_waits_for_it_to_read_clear(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stash_in_use", [True, False])
+async def test_a_message_the_persons_draft_refused_says_why_then_waits_for_it(
+    pane: _Pane, tmp_path: Path, stash_in_use: bool
+) -> None:
+    """
+    The sender learns why the message waits; it is delivered once the draft allows.
+
+    The person's draft could not be stashed, so nothing was typed: the turn
+    holds the message rather than failing it or erasing the draft.
+    """
+    pane.refusals = [ClaudeComposerHoldsDraft("nothing was sent", stash_in_use=stash_in_use)]
+
+    events = await _run(tmp_path)
+
+    assert events == [
+        TextChunk(text=claude_native_executor._DRAFT_HOLD_MESSAGE),
+        TurnComplete(response=None),
+    ]
+    assert pane.delivered == ["hello from the web"]
+    assert pane.deliveries == 2
+    assert pane.stash_in_use_checks == [stash_in_use] * 3
+    assert pane.kills == 0, "A held message must not reap the pane."
+
+
+@pytest.mark.asyncio
+async def test_a_draft_that_refuses_the_message_again_is_announced_once(
+    pane: _Pane, tmp_path: Path
+) -> None:
+    """Each refused attempt holds the message again; the sender is told once, and it goes once."""
+    pane.refusals = [
+        ClaudeComposerHoldsDraft("nothing was sent", stash_in_use=False) for _ in range(3)
+    ]
+
+    events = await _run(tmp_path)
+
+    assert events == [
+        TextChunk(text=claude_native_executor._DRAFT_HOLD_MESSAGE),
+        TurnComplete(response=None),
+    ]
+    assert pane.delivered == ["hello from the web"]
+    assert pane.deliveries == 4
+
+
+_INPUT_BOX_HOLDS = pytest.mark.parametrize(
+    "refusal",
+    [
+        ClaudeComposerNotCleared(_NOT_CLEARED),
+        ClaudeComposerHoldsDraft("nothing was sent", stash_in_use=False),
+    ],
+    ids=["box-not-clear", "draft-held"],
+)
+
+
+@pytest.mark.asyncio
+@_INPUT_BOX_HOLDS
 async def test_a_held_message_asks_for_a_repaint_each_interval(
-    pane: _Pane, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    pane: _Pane, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refusal: Exception
 ) -> None:
     monkeypatch.setattr(
         claude_native_executor, "_INPUT_BOX_REPAINT_INTERVAL_S", 0.0, raising=False
     )
-    pane.refusals = [ClaudeComposerNotCleared(_NOT_CLEARED)]
+    pane.refusals = [refusal]
 
     await _run(tmp_path)
 
@@ -364,12 +435,13 @@ async def test_a_message_sent_during_the_hold_queues_behind_the_held_one(
 
 
 @pytest.mark.asyncio
+@_INPUT_BOX_HOLDS
 async def test_stopping_a_turn_held_for_the_input_box_keeps_the_pane(
-    pane: _Pane, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    pane: _Pane, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refusal: Exception
 ) -> None:
     """Stop during the hold cancels the wait; it neither types nor reaps the pane."""
     monkeypatch.setattr(claude_native_executor, "_MESSAGE_HOLD_POLL_S", 0.01, raising=False)
-    pane.refusals = [ClaudeComposerNotCleared(_NOT_CLEARED)]
+    pane.refusals = [refusal]
     pane.pending_polls = 10**6
     turn = asyncio.create_task(_run(tmp_path))
     for _ in range(200):

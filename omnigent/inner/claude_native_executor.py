@@ -18,6 +18,7 @@ from omnigent.harnesses.claude_native.bridge import (
     MANAGED_SANDBOX_SIGN_IN_REMEDY,
     REQUEST_SESSION_ID_ENV_VAR,
     SWITCH_MODEL_DIALOG_HINT,
+    ClaudeComposerHoldsDraft,
     ClaudeComposerNotCleared,
     ClaudeInputBoxOccupied,
     ClaudeMessageNotAccepted,
@@ -33,6 +34,7 @@ from omnigent.harnesses.claude_native.bridge import (
     inject_slash_command,
     inject_user_message,
     input_box_reads_clear,
+    input_box_takes_delivery,
     is_auth_slash_command,
     kill_session,
     read_active_session_id,
@@ -91,6 +93,11 @@ _INPUT_BOX_REPAINT_INTERVAL_S = 10.0
 # ("Transcript write failed (ENOSPC)"), so a message would run unseen by the web.
 _MIN_TRANSCRIPT_FREE_BYTES = 1024 * 1024
 _HOST_DISK_POLL_S = 5.0
+_DRAFT_HOLD_MESSAGE = (
+    "Claude Code's input box in the terminal holds an unsent draft that could not be "
+    "set aside, so this message is waiting. It will be sent once that draft is sent "
+    "or cleared."
+)
 _HOST_DISK_WAIT_MESSAGE = (
     "The host's disk is full, so Claude Code can't save this conversation. "
     "Free up disk space on the host; this message will be sent when there is room."
@@ -238,6 +245,8 @@ class ClaudeNativeExecutor(Executor):
         """
         self._holding_message = True
         try:
+            if isinstance(refusal, ClaudeComposerHoldsDraft):
+                return await self._wait_for_draft(refusal.stash_in_use, deadline)
             if isinstance(refusal, ClaudeComposerNotCleared):
                 return await self._wait_for_clear_input_box(deadline)
             if isinstance(refusal, ClaudeInputBoxOccupied):
@@ -297,6 +306,37 @@ class ClaudeNativeExecutor(Executor):
             return input_box_reads_clear(self._bridge_dir, repaint=repaint)
 
         return await self._poll_until(deadline, reads_clear)
+
+    async def _wait_for_draft(self, stash_in_use: bool, deadline: float) -> bool:
+        """
+        Hold a turn whose message the person's unsent draft refused.
+
+        The draft could not be stashed, so nothing was typed. The message can
+        go once the person sends or clears it or, when the stash was in use,
+        once the stash is free (:func:`input_box_takes_delivery`).
+
+        :param stash_in_use: Whether Claude Code's stash already held a draft.
+        :param deadline: Event-loop time the hold ends at, shared by every
+            refusal in the turn.
+        :returns: ``True`` once the message can go, ``False`` when the hold ran out.
+        """
+        loop = asyncio.get_running_loop()
+        _logger.info(
+            "claude-native: holding the message while Claude Code's input box keeps a draft",
+            extra={"session_id": self._request_session_id},
+        )
+        next_repaint = loop.time() + _INPUT_BOX_REPAINT_INTERVAL_S
+
+        def takes_delivery() -> bool:
+            nonlocal next_repaint
+            repaint = loop.time() >= next_repaint
+            if repaint:
+                next_repaint = loop.time() + _INPUT_BOX_REPAINT_INTERVAL_S
+            return input_box_takes_delivery(
+                self._bridge_dir, stash_in_use=stash_in_use, repaint=repaint
+            )
+
+        return await self._poll_until(deadline, takes_delivery)
 
     async def _wait_for_free_input_box(self, surface: str, deadline: float) -> bool:
         """
@@ -458,6 +498,7 @@ class ClaudeNativeExecutor(Executor):
         try:
             with telemetry.span("claude_native.inject"):
                 hold_deadline: float | None = None
+                draft_hold_told = False
                 while True:
                     try:
                         await self._inject_turn(text, notices, wanted_model, wanted_model_arg)
@@ -472,6 +513,9 @@ class ClaudeNativeExecutor(Executor):
                             raise
                         if hold_deadline is None:
                             hold_deadline = asyncio.get_running_loop().time() + _MESSAGE_HOLD_S
+                        if isinstance(exc, ClaudeComposerHoldsDraft) and not draft_hold_told:
+                            draft_hold_told = True
+                            yield TextChunk(text=_DRAFT_HOLD_MESSAGE)
                         if not await self._hold_message(exc, hold_deadline):
                             raise
                         wanted_model_arg = self._model_command_arg(wanted_model)
