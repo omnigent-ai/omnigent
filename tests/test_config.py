@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import os as _os
 from pathlib import Path
 
 import pytest
+import yaml
 
 import omnigent.config as _config_module
 from omnigent.config import (
@@ -205,6 +207,65 @@ def test_set_github_account_preference_clear(tmp_path: Path) -> None:
     set_github_account_preference(key, "daniellok-db", cfg)
     set_github_account_preference(key, "", cfg)  # empty clears the entry
     assert github_account_preference(key, cfg) is None
+
+
+@pytest.mark.skipif(hasattr(_os, "geteuid") and _os.geteuid() == 0, reason="root reads anything")
+@pytest.mark.parametrize("loader", [load_global_config, load_local_config])
+def test_unreadable_config_reads_as_absent(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, loader
+) -> None:
+    """A config under an untraversable directory must not raise.
+
+    ``Path.exists()`` raises ``PermissionError`` rather than answering when a
+    parent directory denies traversal, so a container that runs the CLI as a
+    uid with no access to ``$HOME`` crashed every command that reads config,
+    including one whose real work had already succeeded.
+    """
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    cfg = locked / ".omnigent" / "config.yaml"
+    _os.chmod(locked, 0)
+    try:
+        with caplog.at_level("WARNING"):
+            assert loader(cfg) == {}
+    finally:
+        _os.chmod(locked, 0o755)
+
+    assert "unreadable" in caplog.text
+    assert str(cfg) in caplog.text
+
+
+def test_unreadable_config_warns_once_per_path(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Repeated reads stay quiet so a long-lived process is not flooded."""
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    cfg = locked / ".omnigent" / "config.yaml"
+    _config_module._unreadable_warned.discard(cfg)
+    _os.chmod(locked, 0)
+    try:
+        with caplog.at_level("WARNING"):
+            load_global_config(cfg)
+            load_global_config(cfg)
+    finally:
+        _os.chmod(locked, 0o755)
+        _config_module._unreadable_warned.discard(cfg)
+
+    # Count records, not substrings: tmp_path carries the test's own name.
+    assert len([record for record in caplog.records if "unreadable" in record.message]) == 1
+
+
+def test_malformed_config_still_raises(tmp_path: Path) -> None:
+    """Only unreadable paths degrade: bad YAML is a real error, not an absent file.
+
+    Treating a parse failure as "no config" would silently drop settings the
+    user can see in the file.
+    """
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("server: [unclosed\n")
+    with pytest.raises(yaml.YAMLError):
+        load_global_config(cfg)
 
 
 def test_save_global_config_preserves_unrelated_keys(tmp_path: Path) -> None:
