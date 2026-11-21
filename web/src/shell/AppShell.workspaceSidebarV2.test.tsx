@@ -658,6 +658,15 @@ describe("workspace_sidebar_v2", () => {
       ),
     );
     await waitFor(() => expect(screen.getByTestId("search")).not.toHaveTextContent("comment="));
+
+    // Full screen and back only change the layout; neither opens the linked file again.
+    const linkOpens = vi.mocked(workspaceTabsSessions.openWorkspaceFileLink).mock.calls.length;
+    act(() => tabs.host!.onToggleMaximized());
+    await waitFor(() => expect(tabs.host).toMatchObject({ maximized: true }));
+    act(() => tabs.host!.onToggleMaximized());
+    await waitFor(() => expect(tabs.host).toMatchObject({ maximized: false }));
+    expect(screen.getByTestId("search")).not.toHaveTextContent("file=");
+    expect(workspaceTabsSessions.openWorkspaceFileLink).toHaveBeenCalledTimes(linkOpens);
   });
 
   it("fills the window with the sidebar for a ?fullscreen=1 link, and leaves the URL", async () => {

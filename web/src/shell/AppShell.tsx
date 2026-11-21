@@ -1935,21 +1935,24 @@ function AppShellImpl() {
   useEffect(() => {
     tabsLinkRestoreRef.current = restoredWorkspace;
   });
-  const restoreSelectedFileUrl = useCallback(() => {
-    // The tabs sidebar keeps its own files; the classic selection would open as a tab.
-    if (!selectedFilePath || tabsModeRef.current) return;
-    setSearchParams(
-      (prev) => {
-        const params = new URLSearchParams(prev);
-        params.set("file", selectedFilePath);
-        if (rightPanelMaximized) params.set("fullscreen", "1");
-        else params.delete("fullscreen");
-        localFileUrlRef.current = params;
-        return params;
-      },
-      { replace: true },
-    );
-  }, [selectedFilePath, rightPanelMaximized, setSearchParams]);
+  const restoreSelectedFileUrl = useCallback(
+    (fullscreen: boolean = rightPanelMaximized) => {
+      // The tabs sidebar keeps its own files; the classic selection would open as a tab.
+      if (!selectedFilePath || tabsModeRef.current) return;
+      setSearchParams(
+        (prev) => {
+          const params = new URLSearchParams(prev);
+          params.set("file", selectedFilePath);
+          if (fullscreen) params.set("fullscreen", "1");
+          else params.delete("fullscreen");
+          localFileUrlRef.current = params;
+          return params;
+        },
+        { replace: true },
+      );
+    },
+    [selectedFilePath, rightPanelMaximized, setSearchParams],
+  );
 
   // Toggle the right (Workspace) sidebar — shared by the header's collapse
   // button and the ⌘⌥]/Ctrl+Alt+] hotkey so they can't drift. Beyond flipping the
@@ -2175,26 +2178,13 @@ function AppShellImpl() {
       restoreSidebarAfterMaximize();
     }
     setRightPanelMaximized((prev) => !prev);
-    if (selectedFilePath) {
-      setSearchParams(
-        (prev) => {
-          const next = new URLSearchParams(prev);
-          next.set("file", selectedFilePath);
-          if (rightPanelMaximized) next.delete("fullscreen");
-          else next.set("fullscreen", "1");
-          localFileUrlRef.current = next;
-          return next;
-        },
-        { replace: true },
-      );
-    }
+    restoreSelectedFileUrl(!rightPanelMaximized);
   }, [
     rightPanelMaximized,
     sidebarOpen,
     restoreSidebarAfterMaximize,
     setSidebarOpen,
-    selectedFilePath,
-    setSearchParams,
+    restoreSelectedFileUrl,
   ]);
 
   // ⌘B / ⇧⌘B in the desktop app (⌘⌥[ / ⌘⌥] in a browser) toggle the left and
