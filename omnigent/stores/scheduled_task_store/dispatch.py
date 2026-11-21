@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
@@ -12,6 +13,19 @@ DispatchCursor = tuple[int, int, str]
 TaskCursor = tuple[int, str]
 # Resume both the task scan and an unfinished page scan within that task.
 DeletedTaskCursor = tuple[int, str, tuple[int, str] | None]
+
+
+@dataclass(frozen=True)
+class TimerDelivery:
+    """
+    Whether a claimed timer firing may go out, and its run as it now stands.
+
+    :param run: The claimed run; it records the session once delivery is committed.
+    :param deliver: ``False`` when the timer was cancelled before its firing went out.
+    """
+
+    run: ScheduledTaskRun
+    deliver: bool
 
 
 @runtime_checkable
@@ -59,6 +73,10 @@ class ScheduledTaskDispatchStore(Protocol):
     def list_due_tasks(
         self, now: int, *, after: DispatchCursor | None = None, limit: int = 100
     ) -> list[ScheduledTask]: ...
+
+    def next_due_at(self, after: int) -> int | None:
+        """The earliest saved next run of an active task later than *after*, if any."""
+        ...
 
     def claim_scheduled_run(
         self,
@@ -147,5 +165,22 @@ class ScheduledTaskDispatchStore(Protocol):
 
         Deleting a task prevents future claims; it does not cancel an existing
         claim. Startup and recovery may still record progress for that run.
+        """
+        ...
+
+    def begin_timer_delivery(
+        self,
+        run: ScheduledTaskRun,
+        *,
+        now: Callable[[], float],
+        conversation_id: str,
+        consume: bool,
+    ) -> TimerDelivery | None:
+        """Commit a claimed timer firing for delivery unless its timer was cancelled.
+
+        Runs under the task lock that deleting takes, so a cancel either lands first
+        (``deliver`` is False and nothing goes out) or finds the firing already on its
+        way. A committed run records *conversation_id*; ``consume`` also deletes a
+        one-shot timer. Returns None when the run's startup lease no longer matches.
         """
         ...

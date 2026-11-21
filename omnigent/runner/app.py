@@ -1294,10 +1294,6 @@ def _harness_error_response_error(response: object) -> dict[str, str]:
     return {"message": text.strip()[:200] or "harness returned error response"}
 
 
-# Per-session timer registry. Keyed by session_id → {timer_id → Task}.
-_session_timers: dict[str, dict[str, asyncio.Task[None]]] = {}
-
-
 def _has_live_async_tasks(
     session_async_tasks: Mapping[
         str,
@@ -1310,51 +1306,6 @@ def _has_live_async_tasks(
         for handles in session_async_tasks.values()
         for task, _cancel_event in handles.values()
     )
-
-
-def register_timer(
-    session_id: str,
-    timer_id: str,
-    task: asyncio.Task[None],
-) -> None:
-    """
-    Register an active timer task for a session.
-
-    :param session_id: Session the timer belongs to.
-    :param timer_id: Timer identifier, e.g. ``"timer_a1b2..."``.
-    :param task: The asyncio.Task running the timer loop.
-    """
-    _session_timers.setdefault(session_id, {})[timer_id] = task
-
-
-def unregister_timer(session_id: str, timer_id: str) -> None:
-    """
-    Remove a timer from the registry on completion or cancel.
-
-    :param session_id: Session the timer belongs to.
-    :param timer_id: Timer to remove.
-    """
-    timers = _session_timers.get(session_id)
-    if timers is not None:
-        timers.pop(timer_id, None)
-
-
-def cancel_timer(session_id: str, timer_id: str) -> bool:
-    """
-    Cancel a timer by ID.
-
-    :param session_id: Session the timer belongs to.
-    :param timer_id: Timer to cancel.
-    :returns: True if found and cancelled, False otherwise.
-    """
-    timers = _session_timers.get(session_id)
-    if timers is None:
-        return False
-    task = timers.pop(timer_id, None)
-    if task is None or task.done():
-        return False
-    task.cancel()
-    return True
 
 
 # Module-level ref to _session_agent_ids. Populated inside
@@ -1966,10 +1917,6 @@ def create_runner_app(
             return True
         if _has_live_async_tasks(_session_async_tasks):
             return True
-        for timers in _session_timers.values():
-            for timer_task in timers.values():
-                if not timer_task.done():
-                    return True
         if pending_approvals.has_any_pending():
             return True
         session_ids = set(_session_start_cache) | set(_session_agent_ids)
@@ -4334,8 +4281,6 @@ def create_runner_app(
             filesystem_registry.unregister_conversation(session_id)
         for _task, evt in _session_async_tasks.pop(session_id, {}).values():
             evt.set()
-        for _tmr in _session_timers.pop(session_id, {}).values():
-            _tmr.cancel()
         _version_cache.pop(session_id, None)
         stale_resp_ids = [rid for rid, cid in _resp_to_conv.items() if cid == session_id]
         for rid in stale_resp_ids:

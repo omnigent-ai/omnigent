@@ -12,7 +12,8 @@ in-process store.
 * ``sys_scheduled_task_delete`` — delete a task.
 * ``sys_reminder_set`` — send a message into the calling session once, at a
   given time. It is a scheduled task with a one-time ``COUNT=1`` rule that
-  continues the session, so it survives runner exits, unlike ``sys_timer_set``.
+  continues the session, so it survives runner exits, as ``sys_timer_set``
+  timers do.
 """
 
 from __future__ import annotations
@@ -576,7 +577,7 @@ class SysReminderSetTool(Tool):
             "scheduled_task_id. Works in top-level sessions you own on a "
             "connected host, not in sub-agent sessions, side chats, managed sandboxes, or "
             "sessions running in a permission mode that skips approval. For "
-            "a shorter wait inside an active turn, use sys_timer_set (when enabled)."
+            "a shorter or repeating wait, use sys_timer_set (when enabled)."
         )
 
     def get_schema(self) -> dict[str, Any]:

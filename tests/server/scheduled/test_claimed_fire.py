@@ -45,8 +45,10 @@ from omnigent.server.scheduled.schedule import (
     continued_sandbox_host_id,
     host_ownership_key,
     manual_trigger_key,
+    next_scheduled_time,
     occurrence_host_id,
     scheduled_trigger_key,
+    timer_rule,
 )
 from omnigent.server.startup_inputs import STARTUP_LABEL
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -2191,3 +2193,204 @@ async def test_failed_run_releases_its_binding_without_deleting_a_peers_sandbox(
     assert launcher.terminated == ([] if shared else ["sb-failed"])
     if shared:
         assert conversations.get_conversation(peer.id).host_id == host.host_id
+
+
+# ── Timers ───────────────────────────────────────────────────────────────────
+
+
+class _TimerPermissions(FakePermissionStore):
+    """Grants as ``FakePermissionStore`` decides them, with no administrators."""
+
+    def is_admin(self, user_id: str) -> bool:
+        return False
+
+
+class _HeldSessionReads(_ExistingConversationStore):
+    """Holds each session read until the test releases it, from a worker thread."""
+
+    def __init__(self, *conversations: _FakeConversation) -> None:
+        super().__init__(*conversations)
+        self.reading = threading.Event()
+        self.release = threading.Event()
+
+    def get_conversation(self, conversation_id: str) -> _FakeConversation | None:
+        self.reading.set()
+        assert self.release.wait(10)
+        return super().get_conversation(conversation_id)
+
+
+def _timer_session(**overrides: Any) -> _FakeConversation:
+    return _FakeConversation(id=_CONV_ID, agent_id=_AGENT_ID, host_id=_HOST_ID, **overrides)
+
+
+def _timer_deps(store: SqlAlchemyScheduledTaskStore, **overrides: Any) -> FireDeps:
+    overrides.setdefault("conversation_store", _ExistingConversationStore(_timer_session()))
+    overrides.setdefault("permission_store", _TimerPermissions())
+    return _deps(store, **overrides)
+
+
+def _claim_timer(store: SqlAlchemyScheduledTaskStore, *, repeat: bool) -> _Claimed:
+    """Save a timer due now for the test session, then claim its firing as a poll would."""
+    now = int(time.time())
+    task_id = uuid.uuid4().hex
+    store.create(
+        task_id,
+        "Timer",
+        f"[System: timer {task_id} fired]",
+        timer_rule(30, repeat=repeat),
+        None,
+        _AGENT_ID,
+        "UTC",
+        session_mode="continue",
+        session_id=_CONV_ID,
+        host_id=_HOST_ID,
+        first_run_at=now,
+        kind="timer",
+        schedule_anchor=now - 30,
+    )
+    task = store.get(task_id)
+    clock = FakeClock(now)
+    run = store.claim_scheduled_run(
+        task,
+        now=now,
+        next_run_at=next_scheduled_time(task, now),
+        host_id=_HOST_ID,
+        lease_seconds=_LEASE_SECONDS,
+    )
+    assert run is not None
+    lease = StartupLease(store, run, now=clock.now, lease_seconds=_LEASE_SECONDS)
+    return _Claimed(task=task, lease=lease, clock=clock)
+
+
+def _startup_outcomes(caplog: pytest.LogCaptureFixture) -> list[tuple[str, str | None]]:
+    return [
+        (record.attributes["outcome"], record.attributes.get("error_code"))
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "scheduled_run_startup_ended"
+    ]
+
+
+@pytest.mark.parametrize("repeat", [False, True], ids=["one_shot", "repeating"])
+async def test_a_timer_firing_wakes_its_session_once_committed(store, repeat) -> None:
+    claimed = _claim_timer(store, repeat=repeat)
+    seen: list[tuple[str, str, str, str | None]] = []
+
+    async def dispatch(conv: Any, task: ScheduledTask) -> None:
+        [run] = store.list_runs(task.id)[0]
+        seen.append((conv.id, task.prompt, run.status, run.conversation_id))
+
+    await ClaimedRunExecutor(_timer_deps(store), launch_dispatch=dispatch).fire(
+        claimed.task, claimed.lease
+    )
+    # The wake goes out only once its run is committed to this session.
+    assert seen == [(_CONV_ID, f"[System: timer {claimed.task.id} fired]", "starting", _CONV_ID)]
+    if not repeat:
+        # A fired one-shot timer leaves nothing behind.
+        assert store.get(claimed.task.id) is None
+        assert _runs(store, claimed.task) == []
+        return
+    [run] = _runs(store, claimed.task)
+    assert (run.status, run.conversation_id, run.error_code) == ("succeeded", _CONV_ID, None)
+    saved = store.get(claimed.task.id)
+    # A tick never writes its task, which would race the next claim's snapshot.
+    assert (saved.state, saved.last_run_at) == ("active", None)
+
+
+@pytest.mark.parametrize("repeat", [False, True], ids=["one_shot", "repeating"])
+async def test_a_cancel_that_lands_before_the_commit_suppresses_the_firing(
+    store, caplog, repeat
+) -> None:
+    caplog.set_level(logging.INFO, logger="omnigent.server.scheduled.dispatch_scheduler")
+    claimed = _claim_timer(store, repeat=repeat)
+    sessions = _HeldSessionReads(_timer_session())
+    dispatch = AsyncMock()
+    executor = ClaimedRunExecutor(
+        _timer_deps(store, conversation_store=sessions), launch_dispatch=dispatch
+    )
+    firing = asyncio.create_task(executor.fire(claimed.task, claimed.lease))
+    assert await asyncio.to_thread(sessions.reading.wait, 10)
+    # sys_timer_cancel deletes the timer while its claimed firing still checks the session.
+    assert await asyncio.to_thread(store.delete, claimed.task.id)
+    sessions.release.set()
+    await firing
+    dispatch.assert_not_awaited()
+    assert _startup_outcomes(caplog) == [("skipped", "timer_cancelled")]
+    # Recording the suppressed run removed the cancelled timer.
+    assert store.get(claimed.task.id) is None
+
+
+async def test_a_cancel_after_the_commit_stops_later_ticks_but_not_this_one(store, caplog) -> None:
+    caplog.set_level(logging.INFO, logger="omnigent.server.scheduled.dispatch_scheduler")
+    claimed = _claim_timer(store, repeat=True)
+    sending = asyncio.Event()
+    release = asyncio.Event()
+
+    async def dispatch(conv: Any, task: ScheduledTask) -> None:
+        sending.set()
+        await release.wait()
+
+    executor = ClaimedRunExecutor(_timer_deps(store), launch_dispatch=dispatch)
+    firing = asyncio.create_task(executor.fire(claimed.task, claimed.lease))
+    await asyncio.wait_for(sending.wait(), 10)
+    # The cancel lands while the committed wake is being sent.
+    assert await asyncio.to_thread(store.delete, claimed.task.id)
+    assert store.list_due_tasks(claimed.task.next_run_at + 3600) == []
+    release.set()
+    await firing
+    assert _startup_outcomes(caplog) == [("succeeded", None)]
+    assert store.get(claimed.task.id) is None
+
+
+@pytest.mark.parametrize("problem", ["deleted", "archived", "no_access"])
+async def test_a_timer_whose_session_is_gone_stops_without_waking_it(store, problem) -> None:
+    claimed = _claim_timer(store, repeat=True)
+    sessions = (
+        _ExistingConversationStore()
+        if problem == "deleted"
+        else _ExistingConversationStore(_timer_session(archived=problem == "archived"))
+    )
+    permissions = _TimerPermissions()
+    if problem == "no_access":
+        permissions.unowned.add(_CONV_ID)
+    dispatch = AsyncMock()
+    await ClaimedRunExecutor(
+        _timer_deps(store, conversation_store=sessions, permission_store=permissions),
+        launch_dispatch=dispatch,
+    ).fire(claimed.task, claimed.lease)
+    dispatch.assert_not_awaited()
+    # The timer is gone, so no later tick tries the session again.
+    assert store.get(claimed.task.id) is None
+    assert store.list_due_tasks(claimed.task.next_run_at + 3600) == []
+
+
+async def test_a_wake_that_reaches_no_runner_fails_only_that_tick(store) -> None:
+    claimed = _claim_timer(store, repeat=True)
+    dispatch = AsyncMock(side_effect=RuntimeError("no runner can be reached or woken"))
+    await ClaimedRunExecutor(_timer_deps(store), launch_dispatch=dispatch).fire(
+        claimed.task, claimed.lease
+    )
+    [run] = _runs(store, claimed.task)
+    assert (run.status, run.error_code, run.conversation_id) == (
+        "failed",
+        "launch_failed",
+        _CONV_ID,
+    )
+    assert store.get(claimed.task.id).next_run_at == claimed.task.next_run_at + 30
+
+
+@pytest.mark.parametrize("committed", [False, True], ids=["before_commit", "after_commit"])
+async def test_recovery_fails_an_interrupted_timer_firing_without_inspecting_it(
+    store, committed
+) -> None:
+    claimed = _claim_timer(store, repeat=False)
+    if committed:
+        assert await claimed.lease.begin_timer_delivery(_CONV_ID, consume=True)
+    # Any session read would raise: recovery decides a timer run from its kind alone.
+    executor = ClaimedRunExecutor(_deps(store, conversation_store=SimpleNamespace()))
+    assert await executor.recover(claimed.lease.run) == "failed"
+    claimed.clock.advance(_LEASE_SECONDS)
+    store.transition_starting_run(
+        claimed.lease.run, now=claimed.clock.now, status="failed", expired=True
+    )
+    # Recording the result removes the spent one-shot timer either way.
+    assert store.get(claimed.task.id) is None

@@ -54,6 +54,7 @@ _SHARES_PREVIOUS = "a7d4c2e9f610"
 _SHARES_REVISION = "a8be64286ffc"
 _SMART_ROUTING_PREVIOUS = "d3bda6dbade3"
 _SMART_ROUTING_REVISION = "5ab01aaca219"
+_TIMER_KIND_REVISION = "bf30d7cbda61"
 _SCHEMA_PATHS = [
     "migration",
     "metadata",
@@ -434,7 +435,7 @@ def test_session_mode_check_rejects_bad_code(db_engine: Engine) -> None:
 
 @pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
 def test_kind_check_rejects_bad_code(db_engine: Engine) -> None:
-    """Migrated and model-built ``kind`` CHECKs both reject codes outside 1-2."""
+    """Migrated and model-built ``kind`` CHECKs both reject codes outside 1-3."""
     tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=db_engine)
     # MySQL reports CHECK violations as OperationalError (3819).
     with pytest.raises((IntegrityError, sa.exc.OperationalError)), db_engine.begin() as conn:
@@ -446,7 +447,7 @@ def test_kind_check_rejects_bad_code(db_engine: Engine) -> None:
                 rrule="FREQ=DAILY;BYHOUR=9",
                 agent_id=b"g" * 16,
                 timezone="UTC",
-                kind=3,
+                kind=4,
                 created_at=1,
             )
         )
@@ -1266,3 +1267,55 @@ def test_merge_reconciles_mcp_services_and_comment_anchor_branches(
             _MCP_SERVICES_REVISION,
             _COMMENT_ANCHOR_REVISION,
         }
+
+
+def test_timer_kind_downgrade_requires_live_connection() -> None:
+    config = _build_alembic_config("postgresql://")
+    config.output_buffer = StringIO()
+    with pytest.raises(RuntimeError, match="Downgrade requires a live connection"):
+        command.downgrade(config, f"{_TIMER_KIND_REVISION}:{_SMART_ROUTING_REVISION}", sql=True)
+    assert "ALTER TABLE" not in config.output_buffer.getvalue()
+
+
+@pytest.mark.parametrize("dispatch_migration_engine", [_SMART_ROUTING_REVISION], indirect=True)
+def test_timer_kind_migration_round_trips_once_timers_are_gone(
+    dispatch_migration_engine: Engine,
+) -> None:
+    engine = dispatch_migration_engine
+    config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
+    values = {
+        "name": "Timer",
+        "prompt": b"p",
+        "rrule": "FREQ=SECONDLY;INTERVAL=120",
+        "agent_id": b"g" * 16,
+        "timezone": "UTC",
+        "created_at": 1,
+    }
+    before = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
+    # Before the migration a timer cannot be stored.
+    with pytest.raises((IntegrityError, sa.exc.OperationalError)), engine.begin() as conn:
+        conn.execute(before.insert().values(id=b"t" * 16, kind=3, **values))
+    with engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.upgrade(config, _TIMER_KIND_REVISION)
+    tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
+    with engine.begin() as conn:
+        conn.execute(tasks.insert().values(id=b"t" * 16, kind=3, **values))
+        conn.execute(tasks.insert().values(id=b"a" * 16, kind=1, **values))
+    with pytest.raises(RuntimeError, match="Cancel or delete"), engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.downgrade(config, _SMART_ROUTING_REVISION)
+    with engine.connect() as conn:
+        assert (
+            conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one()
+            == _TIMER_KIND_REVISION
+        )
+    with engine.begin() as conn:
+        conn.execute(tasks.delete().where(tasks.c.kind == 3))
+    with engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.downgrade(config, _SMART_ROUTING_REVISION)
+    with pytest.raises((IntegrityError, sa.exc.OperationalError)), engine.begin() as conn:
+        conn.execute(tasks.insert().values(id=b"t" * 16, kind=3, **values))
+    with engine.begin() as conn:
+        assert conn.execute(sa.select(tasks.c.kind)).scalars().all() == [1]

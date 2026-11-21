@@ -98,9 +98,12 @@ class ScheduledTask:
         firing, or ``None``.
     :param updated_at: Unix epoch seconds of the last write, or ``None`` if the
         row has never been updated.
-    :param kind: ``"automation"``, or ``"reminder"`` for a one-time message an
-        agent set for its own session. Clients list reminders apart from
-        automations; scheduling and firing ignore it.
+    :param kind: ``"automation"``, ``"reminder"`` for a one-time message an
+        agent set for its own session, or ``"timer"`` for a hidden one-shot or
+        repeating wake an agent set with ``sys_timer_set``. Clients list neither
+        reminders nor timers as automations. Timers have their own schedule
+        arithmetic (see :func:`omnigent.server.scheduled.schedule.next_timer_time`)
+        and deliver their ``prompt`` as a hidden message.
     """
 
     id: str

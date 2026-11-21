@@ -40,6 +40,12 @@ Every `poll_seconds`, each server does the following:
    owns, and claims the owned tasks while it has startup capacity.
 4. Reads one page of pending Run now requests and claims the ones it owns.
 
+Between polls, the server also wakes at the soonest saved `next_run_at`, read with
+one indexed query, and when `wake()` is called, as the timer route does after saving a
+timer. It then claims due tasks only, so an occurrence this server owns starts within
+about a second of its time; recovery, initialization and Run now requests keep the
+poll interval.
+
 The claim creates a `starting` run with a lease and, for a scheduled occurrence,
 moves the task's `next_run_at` forward, in one transaction. If another replica already claimed the
 occurrence, or the task was edited, paused or deleted after it was listed, the
@@ -444,6 +450,48 @@ deployment:
   task waits for its next scheduled time.
 - Each poll reads one page of pending Run now requests, so on a server with many
   pending requests for other replicas' hosts, a request can wait a few polls.
+
+## Agent timers
+
+`sys_timer_set` saves a timer as one `kind="timer"` task through
+`POST /v1/sessions/{id}/timers`, and `sys_timer_cancel` deletes it through
+`DELETE /v1/sessions/{id}/timers/{timer_id}`. Both authorize the caller as posting a
+message would; cancelling also needs the same session and owner. The task ID is the
+`timer_id`. The automations gate does not hide these routes, but they need the
+database scheduler (`session_timers` in `/v1/info`).
+
+- **Schedule.** The rule is `FREQ=SECONDLY;INTERVAL=<n>`, plus `COUNT=1` for a
+  one-shot timer, with `n` the delay rounded up to whole seconds. Firings fall at
+  `created_at + k * n`. The route saves `created_at` so the first firing is the first
+  whole second at least the delay away, and saves that time as `next_run_at`.
+  `next_timer_time` computes later firings directly, skipping missed ones, instead of
+  using the midnight-anchored RRULE search, and a timer is exempt from the automation
+  minimum interval.
+- **Delivery.** The built-in executor skips the automation steps (budgets, sharing,
+  run labels) for a timer. A session that was deleted or archived, or that the owner
+  can no longer send to, records `skipped` (`timer_session_unavailable`) and deletes
+  the timer without waking anything. Otherwise `begin_timer_delivery` commits the
+  firing under the task lock that deleting takes, then the prompt, a hidden
+  (`is_meta`) user message, goes in through the continued-session wake and dispatch.
+  The run records `succeeded`, or `failed` (`launch_failed`) when no runner can be
+  reached or woken; a firing is never retried.
+- **Cancelling.** A cancel that commits before a claimed firing does suppresses it:
+  the run records `skipped` (`timer_cancelled`). A firing committed first still goes
+  out. A one-shot firing deletes its timer as it commits, so a later cancel finds
+  nothing.
+- **Busy sessions.** A repeating timer uses the trigger automations' busy check
+  without the quiet period: a tick due while the session runs a turn, waits on an
+  approval or question, or still delivers the previous tick is moved, recording no
+  run, to the next check, never past the next tick. One-shot timers always fire.
+- **History.** Claiming a timer's firing deletes its finished runs, so a timer keeps
+  only its newest outcome, and finishing a spent one-shot timer's run removes the
+  timer. Timers never stamp `last_run_at`, so a tick's bookkeeping can't race the
+  next claim. Automation lists filter by kind in the query, and the automation Inbox
+  never lists timers.
+- **Recovery.** An expired timer startup records `failed` without inspecting the
+  session or resending.
+- **Rollout.** Kind 3 needs this release's migration and code on every replica that
+  shares the database: an older binary can't decode a timer row.
 
 ## Custom callbacks
 

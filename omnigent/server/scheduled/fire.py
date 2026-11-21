@@ -90,7 +90,13 @@ from omnigent.native.permission_modes import (
     APPROVAL_SKIPPING_PERMISSION_MODES,
     PERMISSION_LAUNCH_ARGS,
 )
-from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
+from omnigent.server.auth import (
+    LEVEL_EDIT,
+    LEVEL_OWNER,
+    LEVEL_READ,
+    RESERVED_USER_LOCAL,
+    RESERVED_USER_PUBLIC,
+)
 from omnigent.server.bundles import agent_for_user
 from omnigent.server.host_registry import host_owner_scope
 from omnigent.server.managed_hosts import (
@@ -99,6 +105,7 @@ from omnigent.server.managed_hosts import (
     parse_repo_workspace,
     read_managed_repo_workspaces,
 )
+from omnigent.server.permissions import check_session_access
 from omnigent.server.proactive_agent import fire_skip_reason, is_proactive_task
 from omnigent.server.routes._session_create_validation import (
     validate_existing_host_workspace,
@@ -522,6 +529,21 @@ def _prompt_event(prompt: str) -> SessionEventInput:
     )
 
 
+def _task_event(task: ScheduledTask) -> SessionEventInput:
+    """The message a firing sends: a timer's hidden wake, or the task's prompt."""
+    if task.kind != "timer":
+        return _prompt_event(run_prompt_text(task))
+    # Hidden from transcripts, but still a user message, so it starts or steers a turn.
+    return SessionEventInput(
+        type="message",
+        data={
+            "role": "user",
+            "is_meta": True,
+            "content": [{"type": "input_text", "text": task.prompt}],
+        },
+    )
+
+
 def build_on_fire(
     deps: FireDeps,
     *,
@@ -572,7 +594,8 @@ def build_busy_until(deps: FireDeps) -> Callable[[ScheduledTask, int], Awaitable
     :data:`BUSY_RECHECK_SECONDS` from now while it shows as running (a turn in progress,
     or waiting on an approval or question), has an approval or question pending, or the
     previous poll is still being delivered. It never waits past
-    :data:`BUSY_SKIP_MAX_SECONDS` after the latest poll went out.
+    :data:`BUSY_SKIP_MAX_SECONDS` after the latest poll went out. A repeating timer's
+    tick waits the same way while the session is busy, but not for an idle one's quiet.
     """
 
     async def busy_until(task: ScheduledTask, now: int) -> int | None:
@@ -599,6 +622,9 @@ def build_busy_until(deps: FireDeps) -> Callable[[ScheduledTask, int], Awaitable
         delivering = latest is not None and latest.status in ("scheduled", "starting")
         if running or waiting or delivering:
             until = now + BUSY_RECHECK_SECONDS
+        elif task.kind == "timer":
+            # An idle session takes a timer's tick at once; only triggers wait for quiet.
+            return None
         else:
             until = session.updated_at + BUSY_QUIET_SECONDS
         if until <= now:
@@ -2698,7 +2724,7 @@ async def _send_prompt(
         result = await _dispatch_session_event_to_runner(
             conv.id,
             conv,
-            _prompt_event(run_prompt_text(task)),
+            _task_event(task),
             deps.conversation_store,
             runner_client,
             agent_name=None,
@@ -2923,6 +2949,9 @@ class _ClaimedRunRecorder:
             if status == "failed"
             else None,
         )
+        if self._task.kind == "timer":
+            # A timer's newest run is its summary; writing its task would race its next claim.
+            return
         # The outcome is already recorded; a failed stamp only leaves the task's
         # last-run summary stale.
         try:
@@ -3116,6 +3145,74 @@ def _delivered_run_outcome(
     return "running"
 
 
+async def _timer_session_problem(
+    deps: FireDeps, task: ScheduledTask, conv: Conversation | None
+) -> str | None:
+    """Why a timer can no longer wake *conv*, its session, or ``None`` if it can."""
+    if conv is None:
+        return "the session no longer exists"
+    if conv.archived:
+        return "the session is archived"
+    if deps.permission_store is not None and not await asyncio.to_thread(
+        check_session_access,
+        task.user_id or RESERVED_USER_LOCAL,
+        conv.id,
+        LEVEL_EDIT,
+        deps.permission_store,
+        deps.conversation_store,
+        conversation=conv,
+    ):
+        return "the timer's owner can no longer send messages to the session"
+    return None
+
+
+async def _fire_timer(
+    deps: FireDeps,
+    task: ScheduledTask,
+    lease: StartupLease,
+    recorder: _ClaimedRunRecorder,
+    dispatch: LaunchDispatch,
+) -> None:
+    """Wake a timer's session with its hidden firing message, unless it was cancelled.
+
+    A session that was deleted or archived, or that the timer's owner can no longer
+    send to, stops the timer instead: it is never woken or recreated. The firing is
+    committed under the task lock before anything is sent, so a cancel that lands
+    first suppresses it; a committed firing goes out even if a cancel follows.
+    """
+    session_id = task.session_id
+    assert session_id is not None  # a timer always names its session
+    start_fire_stage("session_validation", session_id=session_id)
+    conv = await asyncio.to_thread(deps.conversation_store.get_conversation, session_id)
+    problem = await _timer_session_problem(deps, task, conv)
+    if problem is not None:
+        _logger.info("scheduled fire: timer %s stopped: %s", task.id, problem)
+        await recorder.finish("skipped", error=problem, error_code="timer_session_unavailable")
+        await asyncio.to_thread(deps.scheduled_task_store.delete, task.id)
+        return
+    assert conv is not None
+    if not await lease.begin_timer_delivery(conv.id, consume=is_one_time_rule(task.rrule)):
+        await recorder.finish(
+            "skipped",
+            conversation_id=conv.id,
+            error="the timer was cancelled before this firing went out",
+            error_code="timer_cancelled",
+        )
+        return
+    try:
+        await dispatch(conv, task)
+    except Exception:
+        _logger.exception("scheduled fire: timer %s could not wake session %s", task.id, conv.id)
+        await recorder.finish(
+            "failed",
+            conversation_id=conv.id,
+            error="runner launch/dispatch failed",
+            error_code="launch_failed",
+        )
+        return
+    await recorder.finish("succeeded", conversation_id=conv.id)
+
+
 class ClaimedRunExecutor:
     """Start runs the persistent scheduler claimed, and recover interrupted startups.
 
@@ -3172,6 +3269,15 @@ class ClaimedRunExecutor:
                     error_code="owner_identity_unavailable",
                 )
                 return
+            if task.kind == "timer":
+                await _fire_timer(
+                    self._deps,
+                    task,
+                    lease,
+                    recorder,
+                    self._fire_dispatch.reuse or _make_reuse_dispatch(self._deps),
+                )
+                return
             await _run_fire_for_task(self._deps, task, self._fire_dispatch, recorder)
 
     async def _fail_revoked_fire(self, task: ScheduledTask, recorder: _FireRecorder) -> None:
@@ -3203,6 +3309,10 @@ class ClaimedRunExecutor:
         checks the run again.
         """
         task = await asyncio.to_thread(self._deps.scheduled_task_store.get, run.scheduled_task_id)
+        if task is not None and task.kind == "timer":
+            # A timer's wake is never resent; an interrupted firing is lost, and the
+            # finished run removes a spent one-shot timer.
+            return "failed"
         async with contextlib.AsyncExitStack() as stack:
             if task is not None:
                 try:

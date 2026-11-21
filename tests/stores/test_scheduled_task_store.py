@@ -16,7 +16,7 @@ import pytest
 
 from omnigent.db.db_models import current_workspace_id, workspace_scope
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.scheduled.schedule import next_scheduled_time
+from omnigent.server.scheduled.schedule import next_scheduled_time, timer_rule
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 
@@ -3117,3 +3117,242 @@ def test_a_schedule_anchor_keeps_count_from_the_anchor(
     assert task.created_at == anchor
     # Only the occurrences left after now remain; none, once COUNT is used up.
     assert (task.next_run_at, task.state) == expected
+
+
+# ── Timers ──────────────────────────────────────────────────────────────────
+
+_TIMER_FIRST_RUN = 1_800_000_000
+
+
+def _timer(
+    store: SqlAlchemyScheduledTaskStore,
+    seed: str = "timer",
+    *,
+    repeat: bool = False,
+    interval: int = 60,
+    first_run_at: int = _TIMER_FIRST_RUN,
+):
+    """Save a ``sys_timer_set`` timer whose first firing is *first_run_at*, as its route does."""
+    store.configure_dispatch(True)
+    task = store.create(
+        scheduled_task_id=_uid(seed),
+        name="Timer",
+        prompt=f"[System: timer {_uid(seed)} fired]",
+        rrule=timer_rule(interval, repeat=repeat),
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+        session_mode="continue",
+        session_id=_uid("conv"),
+        first_run_at=first_run_at,
+        kind="timer",
+        schedule_anchor=first_run_at - interval,
+    )
+    return store.get(task.id)
+
+
+def _claim_timer(store: SqlAlchemyScheduledTaskStore, task):
+    """Claim a timer's due firing as the scheduler's poll would."""
+    assert task.next_run_at is not None
+    return store.claim_scheduled_run(
+        task,
+        now=task.next_run_at,
+        next_run_at=next_scheduled_time(task, task.next_run_at),
+        host_id=None,
+        lease_seconds=120,
+    )
+
+
+@pytest.mark.parametrize("repeat", [False, True], ids=["one_shot", "repeating"])
+def test_a_timer_keeps_the_first_run_its_route_chose(
+    store: SqlAlchemyScheduledTaskStore, repeat: bool
+) -> None:
+    """A firing already due when the row is written still fires, instead of being skipped."""
+    # A zero-second timer whose write lands after its first run time.
+    task = _timer(store, repeat=repeat, first_run_at=1)
+    assert (task.kind, task.state, task.next_run_at) == ("timer", "active", 1)
+    assert store.list_due_tasks(2) == [task]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"session_id": None}, {"session_mode": "new", "session_id": None}, {"first_run_at": None}],
+    ids=["no_session", "new_session", "no_first_run"],
+)
+def test_create_refuses_a_timer_without_its_session_or_first_run(
+    store: SqlAlchemyScheduledTaskStore, overrides: dict[str, Any]
+) -> None:
+    fields: dict[str, Any] = {
+        **_reminder_fields(kind="timer", rrule=timer_rule(60, repeat=True)),
+        "first_run_at": _TIMER_FIRST_RUN,
+        **overrides,
+    }
+    with pytest.raises(ValueError, match="a timer needs"):
+        store.create(scheduled_task_id=_uid("st_bad_timer"), **fields)
+    assert store.list() == []
+
+
+def test_claiming_a_timer_keeps_only_its_newest_outcome(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    timer = _timer(store, repeat=True, interval=5)
+    automation = _due_task(store, "automation_history")
+    for _ in range(3):
+        for task in (store.get(timer.id), store.get(automation.id)):
+            run = _claim_timer(store, task)
+            store.transition_starting_run(
+                run,
+                now=lambda run=run: run.fired_at,
+                status="succeeded",
+                conversation_id=_uid("c"),
+            )
+    # Each claim of a timer drops the runs before it; an automation keeps its history.
+    [kept] = store.list_runs(timer.id)[0]
+    assert kept.scheduled_at == _TIMER_FIRST_RUN + 10
+    assert len(store.list_runs(automation.id)[0]) == 3
+    assert store.get(timer.id).next_run_at == _TIMER_FIRST_RUN + 15
+
+
+@pytest.mark.parametrize("repeat", [False, True], ids=["one_shot", "repeating"])
+def test_a_cancel_before_the_commit_suppresses_the_firing(
+    store: SqlAlchemyScheduledTaskStore, repeat: bool
+) -> None:
+    timer = _timer(store, repeat=repeat)
+    run = _claim_timer(store, timer)
+    assert store.delete(timer.id)
+    delivery = store.begin_timer_delivery(
+        run, now=lambda: _TIMER_FIRST_RUN, conversation_id=_uid("conv"), consume=not repeat
+    )
+    assert delivery is not None
+    assert delivery.deliver is False
+    assert delivery.run.conversation_id is None
+    # Recording the suppressed run purges the cancelled timer.
+    store.transition_starting_run(
+        run, now=lambda: _TIMER_FIRST_RUN, status="skipped", error_code="timer_cancelled"
+    )
+    assert store.get(timer.id) is None
+
+
+def test_a_committed_repeating_firing_survives_a_cancel_that_stops_the_rest(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    timer = _timer(store, repeat=True, interval=5)
+    run = _claim_timer(store, timer)
+    delivery = store.begin_timer_delivery(
+        run, now=lambda: _TIMER_FIRST_RUN, conversation_id=_uid("conv"), consume=False
+    )
+    assert delivery is not None and delivery.deliver is True
+    assert delivery.run.conversation_id == _uid("conv")
+    assert store.get(timer.id).state == "active"
+    # The cancel still lands: it stops every later tick.
+    assert store.delete(timer.id)
+    assert store.list_due_tasks(_TIMER_FIRST_RUN + 60) == []
+    store.transition_starting_run(
+        delivery.run,
+        now=lambda: _TIMER_FIRST_RUN,
+        status="succeeded",
+        conversation_id=_uid("conv"),
+    )
+    assert store.get(timer.id) is None
+
+
+def test_a_one_shot_firing_spends_its_timer_when_it_commits(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    timer = _timer(store)
+    run = _claim_timer(store, timer)
+    assert store.get(timer.id).state == "completed"
+    delivery = store.begin_timer_delivery(
+        run, now=lambda: _TIMER_FIRST_RUN, conversation_id=_uid("conv"), consume=True
+    )
+    assert delivery is not None and delivery.deliver is True
+    # Nothing is left to cancel once the only firing is on its way.
+    assert store.get(timer.id).state == "deleted"
+    assert not store.delete(timer.id)
+    store.transition_starting_run(
+        delivery.run,
+        now=lambda: _TIMER_FIRST_RUN,
+        status="succeeded",
+        conversation_id=_uid("conv"),
+    )
+    assert store.get(timer.id) is None
+    assert store.list_runs(timer.id)[0] == []
+
+
+def test_timer_delivery_needs_the_live_claimed_lease(store: SqlAlchemyScheduledTaskStore) -> None:
+    timer = _timer(store, repeat=True)
+    run = _claim_timer(store, timer)
+    assert run is not None and run.lease_expires_at is not None
+    expired = store.begin_timer_delivery(
+        run, now=lambda: run.lease_expires_at, conversation_id=_uid("conv"), consume=False
+    )
+    assert expired is None
+    assert store.list_runs(timer.id)[0][0].conversation_id is None
+
+
+@pytest.mark.parametrize("status", ["succeeded", "failed", "skipped"])
+def test_a_spent_one_shot_timer_is_removed_once_its_run_finishes(
+    store: SqlAlchemyScheduledTaskStore, status: str
+) -> None:
+    """However its only firing ends, even before delivery commits, the timer leaves nothing."""
+    timer = _timer(store)
+    run = _claim_timer(store, timer)
+    store.transition_starting_run(
+        run,
+        now=lambda: _TIMER_FIRST_RUN,
+        status=status,
+        conversation_id=_uid("conv") if status == "succeeded" else None,
+    )
+    assert store.get(timer.id) is None
+    assert store.list_runs(timer.id)[0] == []
+
+
+def test_a_repeating_timer_outlives_its_finished_runs(store: SqlAlchemyScheduledTaskStore) -> None:
+    timer = _timer(store, repeat=True)
+    run = _claim_timer(store, timer)
+    store.transition_starting_run(run, now=lambda: _TIMER_FIRST_RUN, status="failed")
+    assert store.get(timer.id).state == "active"
+
+
+def test_list_reads_only_the_requested_kinds(store: SqlAlchemyScheduledTaskStore) -> None:
+    automation = store.create(
+        scheduled_task_id=_uid("st_kinds_automation"),
+        **_reminder_fields(kind="automation", rrule="FREQ=DAILY"),
+    )
+    reminder = store.create(scheduled_task_id=_uid("st_kinds_reminder"), **_reminder_fields())
+    timer = _timer(store, "st_kinds_timer", repeat=True)
+    assert [task.id for task in store.list(owner_user_id="u", kinds=("automation",))] == [
+        automation.id
+    ]
+    assert {task.id for task in store.list(owner_user_id="u")} == {
+        automation.id,
+        reminder.id,
+        timer.id,
+    }
+
+
+def test_inbox_failures_never_list_timers(store: SqlAlchemyScheduledTaskStore) -> None:
+    timer = _timer(store, repeat=True)
+    store.create_run(
+        run_id=_uid("timer-failure"),
+        scheduled_task_id=timer.id,
+        status="failed",
+        scheduled_at=100,
+        finished_at=101,
+        error_code="owner_identity_unavailable",
+    )
+    assert store.list_inbox_failures(owner_user_id="u") == ([], None)
+
+
+def test_next_due_at_reads_the_soonest_later_active_run(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    now = _TIMER_FIRST_RUN
+    _timer(store, "due_now", repeat=True, first_run_at=now)
+    soonest = _timer(store, "due_soon", repeat=True, first_run_at=now + 10)
+    _timer(store, "due_later", repeat=True, first_run_at=now + 20)
+    paused = _timer(store, "paused_sooner", repeat=True, first_run_at=now + 5)
+    with workspace_scope(paused.workspace_id):
+        store.pause_invalid_schedule(paused)
+    assert store.next_due_at(now) == soonest.next_run_at == now + 10
+    assert store.next_due_at(now + 20) is None

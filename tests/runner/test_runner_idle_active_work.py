@@ -1,9 +1,10 @@
 """Idle-monitor active-work accounting for background runner work.
 
 Pins that ``app.state.has_active_work`` keeps the inactivity watchdog from
-shutting down while ``sys_call_async`` tools, scheduled timers, or parked
-approvals are still live — and that completion / cancel / failure release
-the pin so a short idle timeout can shut down.
+shutting down while ``sys_call_async`` tools or parked approvals are still
+live — and that completion / cancel / failure release the pin so a short idle
+timeout can shut down. Timers live on the server, which wakes the session's
+runner when one fires, so they never pin it.
 """
 
 from __future__ import annotations
@@ -23,12 +24,7 @@ from fastapi import FastAPI
 
 from omnigent.runner import create_runner_app, pending_approvals
 from omnigent.runner._entry import _run_inactivity_monitor
-from omnigent.runner.app import (
-    _has_live_async_tasks,
-    _session_timers,
-    register_timer,
-    unregister_timer,
-)
+from omnigent.runner.app import _has_live_async_tasks
 from tests._helpers.polling import poll_until_async
 from tests.runner.helpers import NullServerClient
 
@@ -38,7 +34,7 @@ _HUMAN_WAIT_HOLD_ENV = "OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S"
 @pytest.fixture(autouse=True)
 def _clean_global_active_work_state(monkeypatch: pytest.MonkeyPatch) -> None:
     """
-    Reset module-global timer / approval registries between tests.
+    Reset the module-global approval registry between tests.
 
     Also clears an ambient human-wait hold so the default applies.
 
@@ -47,16 +43,8 @@ def _clean_global_active_work_state(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.delenv(_HUMAN_WAIT_HOLD_ENV, raising=False)
     pending_approvals.reset_for_tests()
-    for session_timers in list(_session_timers.values()):
-        for task in list(session_timers.values()):
-            task.cancel()
-    _session_timers.clear()
     yield
     pending_approvals.reset_for_tests()
-    for session_timers in list(_session_timers.values()):
-        for task in list(session_timers.values()):
-            task.cancel()
-    _session_timers.clear()
 
 
 def _scaffold_app() -> FastAPI:
@@ -243,34 +231,6 @@ async def test_failed_async_tool_releases_active_work() -> None:
         release=_release,
     )
     assert _has_live_async_tasks(registry) is False
-
-
-@pytest.mark.asyncio
-async def test_live_timer_blocks_idle_shutdown() -> None:
-    """A registered timer task pins the runner until it completes.
-
-    :returns: None.
-    """
-    app = _scaffold_app()
-    finish = asyncio.Event()
-
-    async def _timer() -> None:
-        await finish.wait()
-
-    task = asyncio.create_task(_timer(), name="timer-pin")
-    register_timer("conv_timer", "timer_pin", task)
-    assert app.state.has_active_work() is True
-
-    async def _release() -> None:
-        finish.set()
-        await task
-        unregister_timer("conv_timer", "timer_pin")
-
-    await _assert_monitor_blocked_then_shuts_down(
-        has_active_work=app.state.has_active_work,
-        release=_release,
-    )
-    assert app.state.has_active_work() is False
 
 
 @pytest.mark.asyncio

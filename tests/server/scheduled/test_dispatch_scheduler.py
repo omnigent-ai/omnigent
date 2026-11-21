@@ -25,6 +25,7 @@ from omnigent.server.scheduled.schedule import (
     occurrence_host_id,
     sandbox_host_id,
     scheduled_trigger_key,
+    timer_rule,
 )
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 from tests._helpers.polling import poll_until_async
@@ -2741,3 +2742,124 @@ async def test_without_a_busy_check_a_trigger_keeps_its_saved_schedule(store) ->
     await _drain(scheduler)
     fire.assert_awaited_once()
     assert store.get(task.id).next_run_at == task.next_run_at + 600
+
+
+def _timer_task(
+    store: SqlAlchemyScheduledTaskStore,
+    seed: str,
+    *,
+    repeat: bool,
+    interval: int,
+    first_run_at: int,
+):
+    """Save a ``sys_timer_set`` timer as its route does: first firing at *first_run_at*."""
+    task = store.create(
+        uuid.uuid5(uuid.NAMESPACE_DNS, seed).hex,
+        "Timer",
+        "[System: timer fired]",
+        timer_rule(interval, repeat=repeat),
+        None,
+        uuid.uuid4().hex,
+        "UTC",
+        session_mode="continue",
+        session_id=uuid.uuid4().hex,
+        first_run_at=first_run_at,
+        kind="timer",
+        schedule_anchor=first_run_at - interval,
+    )
+    return store.get(task.id)
+
+
+async def test_a_timer_ticks_on_its_own_interval_below_the_automation_minimum(store) -> None:
+    task = _timer_task(store, "fast_timer", repeat=True, interval=5, first_run_at=1_800_000_000)
+    # The poll comes 12 seconds late, so two ticks were missed meanwhile.
+    clock = FakeClock(task.next_run_at + 12)
+    fire = AsyncMock()
+    scheduler = PersistentTaskScheduler(store, fire, AsyncMock(return_value=None), now=clock.now)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    fire.assert_awaited_once()
+    [run] = store.list_runs(task.id)[0]
+    assert run.scheduled_at == task.next_run_at
+    saved = store.get(task.id)
+    # Not paused for its five-second interval; missed ticks are skipped, the phase kept.
+    assert (saved.state, saved.next_run_at) == ("active", task.next_run_at + 15)
+
+
+@pytest.mark.parametrize("repeat", [True, False], ids=["repeating", "one_shot"])
+async def test_a_busy_session_defers_a_repeating_timer_but_never_a_one_shot(
+    store, repeat: bool
+) -> None:
+    task = _timer_task(
+        store, f"busy_timer_{repeat}", repeat=repeat, interval=60, first_run_at=1_800_000_000
+    )
+    clock = FakeClock(task.next_run_at)
+    fire = AsyncMock()
+    busy = AsyncMock(return_value=task.next_run_at + 120)
+    scheduler = PersistentTaskScheduler(
+        store, fire, AsyncMock(return_value=None), now=clock.now, busy_until=busy
+    )
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    if not repeat:
+        busy.assert_not_awaited()
+        fire.assert_awaited_once()
+        return
+    busy.assert_awaited_once_with(task, task.next_run_at)
+    fire.assert_not_awaited()
+    assert store.list_runs(task.id)[0] == []
+    # The deferred tick is checked again no later than the next one, which replaces it.
+    assert store.get(task.id).next_run_at == task.next_run_at + 60
+
+
+async def test_a_run_due_before_the_next_poll_starts_at_its_time(store) -> None:
+    due = int(time.time()) + 2
+    task = _timer_task(store, "due_soon", repeat=False, interval=2, first_run_at=due)
+    fired = asyncio.Event()
+
+    async def fire(_task, _lease) -> None:
+        fired.set()
+
+    # The hour-long poll would leave the run for an hour after the first poll.
+    scheduler = PersistentTaskScheduler(
+        store, fire, AsyncMock(return_value=None), poll_seconds=3600
+    )
+    await scheduler.start()
+    try:
+        await asyncio.wait_for(fired.wait(), 10)
+    finally:
+        await scheduler.stop()
+    [run] = store.list_runs(task.id)[0]
+    assert due <= run.fired_at <= due + 2
+
+
+async def test_wake_looks_again_for_a_run_saved_after_the_last_read(store, monkeypatch) -> None:
+    read = threading.Event()
+    read_next_due = store.next_due_at
+
+    def next_due_at(after: int) -> int | None:
+        due_at = read_next_due(after)
+        read.set()
+        return due_at
+
+    monkeypatch.setattr(store, "next_due_at", next_due_at)
+    fired = asyncio.Event()
+
+    async def fire(_task, _lease) -> None:
+        fired.set()
+
+    scheduler = PersistentTaskScheduler(
+        store, fire, AsyncMock(return_value=None), poll_seconds=3600
+    )
+    await scheduler.start()
+    try:
+        # The loop read that nothing is due, so it would wait out its hour-long poll.
+        assert await asyncio.to_thread(read.wait, 10)
+        due = int(time.time()) + 2
+        task = _timer_task(store, "saved_later", repeat=False, interval=2, first_run_at=due)
+        scheduler.wake()
+        await asyncio.wait_for(fired.wait(), 10)
+    finally:
+        await scheduler.stop()
+    [run] = store.list_runs(task.id)[0]
+    assert due <= run.fired_at <= due + 2
