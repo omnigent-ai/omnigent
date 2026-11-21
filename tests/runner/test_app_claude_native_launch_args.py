@@ -1176,6 +1176,44 @@ def test_claude_trust_seeding_never_expands_runner_auth_secrets(
     assert not any(token in str(path) for path in tmp_path.rglob("*"))
 
 
+def test_a_launch_records_the_keybindings_its_wrapper_selects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Deliveries check Ctrl+S in the config the pane really launches with.
+
+    An ``env`` wrapper can move Claude to another working directory and config
+    dir; a relative ``CLAUDE_CONFIG_DIR`` then resolves from the new cwd, so
+    the bindings checked are the wrapper's, and one binding Ctrl+S to submit
+    keeps the stash key from being sent.
+    """
+    from omnigent.harnesses.claude_native import bridge
+    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+    from omnigent.runner.native import orchestration
+
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "runner-claude"))
+    workspace = tmp_path / "workspace"
+    (workspace / "sub").mkdir(parents=True)
+    spec = TerminalEnvSpec(
+        command="env",
+        args=["-C", "sub", "CLAUDE_CONFIG_DIR=cfg", "claude"],
+        os_env=OSEnvSpec(type="caller_process", cwd=str(workspace)),
+    )
+    bridge_dir = bridge.prepare_bridge_dir("conv_abc", workspace=workspace)
+
+    orchestration._seed_claude_launch_config(bridge_dir, spec, None, added_dirs=())
+
+    keybindings = workspace.resolve() / "sub" / "cfg" / "keybindings.json"
+    assert bridge.read_claude_keybindings_path(bridge_dir) == keybindings
+    assert bridge._ctrl_s_stashes(bridge_dir) is True
+    keybindings.write_text(
+        json.dumps({"bindings": [{"context": "Chat", "bindings": {"ctrl+s": "chat:submit"}}]})
+    )
+    assert bridge._ctrl_s_stashes(bridge_dir) is False
+
+
 def test_claude_terminal_launch_cwd_uses_terminal_os_env_resolution(tmp_path: Path) -> None:
     """
     Trust seeding resolves the pane cwd the way terminal creation does.

@@ -250,6 +250,8 @@ APPROVAL_WAIT_MARKER_REFRESH_S = 60.0
 # reads stale; a hook killed mid-wait leaves a marker that expires on its own.
 APPROVAL_WAIT_MARKER_TTL_S = 420.0
 _CONFIG_FILE = "bridge.json"
+# Where the session's Claude Code reads its keybindings, recorded at launch.
+_KEYBINDINGS_CONFIG_KEY = "claude_keybindings"
 _SERVER_FILE = "server.json"
 # Control socket of one ``serve-mcp`` process under the harness socket root,
 # named by owner pid so a socket left behind by a dead process can be reaped.
@@ -1967,6 +1969,7 @@ def prepare_bridge_dir(
         if not isinstance(token, str) or not token:
             token = secrets.token_urlsafe(32)
         previous_session_id = config.get("active_session_id") if isinstance(config, dict) else None
+        keybindings = config.get(_KEYBINDINGS_CONFIG_KEY) if isinstance(config, dict) else None
         payload: dict[str, object] = {
             "bridge_id": resolved_bridge_id,
             "active_session_id": conversation_id,
@@ -1986,6 +1989,8 @@ def prepare_bridge_dir(
             payload["model_env"] = model_env
         if picker_values is not None:
             payload["model_picker_values"] = list(picker_values)
+        if isinstance(keybindings, str) and keybindings:
+            payload[_KEYBINDINGS_CONFIG_KEY] = keybindings
         _write_json_file(bridge_dir / _CONFIG_FILE, payload)
         if previous_session_id != conversation_id:
             # A window opened for another session must not answer this one's hooks.
@@ -8060,8 +8065,8 @@ def _set_draft_aside(
     if not _ctrl_s_stashes(bridge_dir):
         _record_held_draft(pane)
         raise ClaudeComposerHoldsDraft(
-            "Claude Code's input box holds an unsent draft, and its keybindings give Ctrl+S "
-            "an action other than the stash, so nothing was sent.",
+            "Claude Code's input box holds an unsent draft, and its keybindings do not show "
+            "that Ctrl+S is the stash, so nothing was sent.",
             stash_in_use=False,
         )
     _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, _COMPOSER_STASH_KEY)
@@ -8118,19 +8123,46 @@ def _claude_keybindings_path(cwd: Path, env: Mapping[str, str]) -> Path:
     return _claude_joined_path(cwd, config_dir, "keybindings.json")
 
 
-def _session_keybindings_path(bridge_dir: Path | None) -> Path:
+def record_claude_keybindings_path(bridge_dir: Path, *, cwd: Path, env: Mapping[str, str]) -> None:
     """
-    Return the keybindings file the session's Claude Code reads.
+    Persist where the session's Claude Code reads its keybindings.
 
-    Claude Code runs in the runner's environment, from the session workspace.
+    The launch knows Claude's real working directory and environment, wrappers
+    included; deliveries, which run elsewhere, check Ctrl+S in this file.
+
+    :param bridge_dir: Bridge directory path.
+    :param cwd: Claude's launch working directory, e.g. ``Path("/home/user/repo")``.
+    :param env: Claude's launch environment, e.g. ``{"HOME": "/home/user"}``.
+    :returns: None.
+    """
+    with _bridge_metadata_write_lock(bridge_dir):
+        config = _read_json_file(bridge_dir / _CONFIG_FILE)
+        if not isinstance(config, dict) or not config:
+            return
+        config[_KEYBINDINGS_CONFIG_KEY] = str(_claude_keybindings_path(cwd, env))
+        _write_json_file(bridge_dir / _CONFIG_FILE, config)
+
+
+def read_claude_keybindings_path(bridge_dir: Path) -> Path | None:
+    """
+    Read where the session's Claude Code reads its keybindings.
+
+    :param bridge_dir: Bridge directory path.
+    :returns: The file path, or ``None`` when the launch recorded none.
+    """
+    config = _read_json_file(bridge_dir / _CONFIG_FILE)
+    value = config.get(_KEYBINDINGS_CONFIG_KEY) if isinstance(config, dict) else None
+    return Path(value) if isinstance(value, str) and value else None
+
+
+def _session_keybindings_path(bridge_dir: Path | None) -> Path | None:
+    """
+    Return the keybindings file the session's Claude Code reads, as its launch recorded.
 
     :param bridge_dir: Bridge directory of the session, or ``None``.
-    :returns: The file path, which need not exist.
+    :returns: The file path, which need not exist, or ``None`` when unknown.
     """
-    config = _read_json_file(bridge_dir / _CONFIG_FILE) if bridge_dir is not None else None
-    workspace = config.get("workspace") if isinstance(config, dict) else None
-    cwd = Path(workspace) if isinstance(workspace, str) and workspace else Path.cwd()
-    return _claude_keybindings_path(cwd, os.environ)
+    return read_claude_keybindings_path(bridge_dir) if bridge_dir is not None else None
 
 
 def _ctrl_s_stashes(bridge_dir: Path | None) -> bool:
@@ -8140,13 +8172,17 @@ def _ctrl_s_stashes(bridge_dir: Path | None) -> bool:
     A person can bind Ctrl+S to another action, such as submit, which would
     send the draft the stash key was meant to set aside. Their bindings leave
     it to ``chat:stash`` only when no binding, in any context, gives Ctrl+S, or
-    a chord it opens, another action. A file that cannot be read cannot vouch.
+    a chord it opens, another action. A file that cannot be read cannot vouch,
+    nor can a session whose launch recorded no location for it.
 
     :param bridge_dir: Bridge directory of the session, or ``None``.
     :returns: ``True`` when the stash key may be sent.
     """
+    path = _session_keybindings_path(bridge_dir)
+    if path is None:
+        return False
     try:
-        data = json.loads(_session_keybindings_path(bridge_dir).read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return True
     except (OSError, ValueError):

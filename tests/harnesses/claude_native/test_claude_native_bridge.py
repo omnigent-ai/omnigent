@@ -13331,8 +13331,17 @@ def test_a_stash_left_from_an_earlier_delivery_is_not_submitted_by_a_retry(
         {"bindings": [{"context": "Global", "bindings": {"control+s": "app:toggleTodos"}}]},
         {"bindings": [{"context": "Chat", "bindings": {"ctrl+s ctrl+x": "chat:submit"}}]},
         "{not json",
+        # The launch recorded no location, so nothing vouches for Ctrl+S.
+        None,
     ],
-    ids=["bound-to-submit", "unbound", "global-binding", "opens-a-chord", "unreadable"],
+    ids=[
+        "bound-to-submit",
+        "unbound",
+        "global-binding",
+        "opens-a-chord",
+        "unreadable",
+        "location-unknown",
+    ],
 )
 def test_a_draft_is_held_while_ctrl_s_may_mean_something_else(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, keybindings: object
@@ -13345,8 +13354,10 @@ def test_a_draft_is_held_while_ctrl_s_may_mean_something_else(
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
     path = tmp_path / "keybindings.json"
-    path.write_text(keybindings if isinstance(keybindings, str) else json.dumps(keybindings))
-    monkeypatch.setattr(claude_native_bridge, "_session_keybindings_path", lambda *_args: path)
+    if keybindings is not None:
+        path.write_text(keybindings if isinstance(keybindings, str) else json.dumps(keybindings))
+    location = None if keybindings is None else path
+    monkeypatch.setattr(claude_native_bridge, "_session_keybindings_path", lambda *_args: location)
     composer = _EditableComposer(_STALE_MULTILINE_DRAFT, cursor=4)
     composer.install(monkeypatch)
     keys: list[str] = []
@@ -13393,6 +13404,24 @@ def test_keybindings_that_leave_ctrl_s_to_the_stash_let_it_stash(
 
     assert [text.strip() for text in composer.submitted] == ["hello from the web"]
     assert (composer.text, composer.cursor, composer.stash) == (_STALE_MULTILINE_DRAFT, 4, None)
+
+
+def test_the_bridge_keeps_where_the_launch_found_the_keybindings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The launch's record of the keybindings file survives the bridge being prepared again."""
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = prepare_bridge_dir("conv_abc", workspace=tmp_path)
+    assert claude_native_bridge.read_claude_keybindings_path(bridge_dir) is None
+
+    claude_native_bridge.record_claude_keybindings_path(
+        bridge_dir, cwd=Path("/work"), env={"HOME": "/home/someone", "CLAUDE_CONFIG_DIR": "cfg"}
+    )
+    prepare_bridge_dir("conv_abc", workspace=tmp_path)
+
+    assert claude_native_bridge.read_claude_keybindings_path(bridge_dir) == Path(
+        "/work/cfg/keybindings.json"
+    )
 
 
 @pytest.mark.parametrize(
