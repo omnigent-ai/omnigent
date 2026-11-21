@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
@@ -37,6 +39,19 @@ def _no_one_typing_in_the_pane(monkeypatch: pytest.MonkeyPatch) -> None:
     :returns: None.
     """
     monkeypatch.setattr(claude_native_bridge, "last_human_input_at", lambda *_args: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_keybindings_of_the_developer(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """
+    Deliveries read no developer's Claude keybindings; tests of them write their own.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp directory, where no keybindings file exists.
+    :returns: None.
+    """
+    missing = tmp_path / "claude-config" / "keybindings.json"
+    monkeypatch.setattr(claude_native_bridge, "_session_keybindings_path", lambda *_args: missing)
 
 
 @pytest.fixture(autouse=True)

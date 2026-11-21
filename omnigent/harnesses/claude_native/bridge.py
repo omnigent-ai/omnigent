@@ -7998,7 +7998,10 @@ def _set_draft_aside(
     before such text refuses the delivery as a draft that could not be
     stashed. A capture that does not show the box, such as a torn read during
     a repaint, says nothing about a draft: it is retried, and the delivery is
-    refused before any key if no capture shows the box. So is a box the pane
+    refused before any key if no capture shows the box. The stash key is sent
+    only while the person's keybindings leave Ctrl+S to the stash
+    (:func:`_ctrl_s_stashes`), since bound to submit it would send the draft. So
+    is a box the pane
     cuts off whose visible rows are blank, since the rest of a draft can sit
     below a blank first line; the refused delivery gives the pane room and
     retries (:func:`_serialize_bridge_injection`).
@@ -8054,6 +8057,13 @@ def _set_draft_aside(
             "its stash is in use are out of view, so nothing was sent.",
             stash_in_use=False,
         )
+    if not _ctrl_s_stashes(bridge_dir):
+        _record_held_draft(pane)
+        raise ClaudeComposerHoldsDraft(
+            "Claude Code's input box holds an unsent draft, and its keybindings give Ctrl+S "
+            "an action other than the stash, so nothing was sent.",
+            stash_in_use=False,
+        )
     _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, _COMPOSER_STASH_KEY)
     # Owned from the key on: a delivery cancelled while waiting still returns the draft.
     guard.stashed = True
@@ -8090,6 +8100,71 @@ def _readable_composer_pane(socket_path: str, tmux_target: str) -> str:
         if _composer_box(pane) is not None:
             break
     return pane
+
+
+def _claude_keybindings_path(cwd: Path, env: Mapping[str, str]) -> Path:
+    """
+    Return the keybindings file Claude Code reads for its launch env and working directory.
+
+    It sits in Claude's config dir: ``$CLAUDE_CONFIG_DIR``, else ``~/.claude``. A
+    relative ``CLAUDE_CONFIG_DIR`` is relative to its working directory.
+
+    :param cwd: Claude's working directory, e.g. ``Path("/home/user/repo")``.
+    :param env: Claude's launch environment, e.g. ``{"HOME": "/home/user"}``.
+    :returns: The file path, which need not exist.
+    """
+    home_value = env.get("HOME") or str(_account_home_dir())
+    config_dir = env.get("CLAUDE_CONFIG_DIR") or os.path.join(home_value, ".claude")
+    return _claude_joined_path(cwd, config_dir, "keybindings.json")
+
+
+def _session_keybindings_path(bridge_dir: Path | None) -> Path:
+    """
+    Return the keybindings file the session's Claude Code reads.
+
+    Claude Code runs in the runner's environment, from the session workspace.
+
+    :param bridge_dir: Bridge directory of the session, or ``None``.
+    :returns: The file path, which need not exist.
+    """
+    config = _read_json_file(bridge_dir / _CONFIG_FILE) if bridge_dir is not None else None
+    workspace = config.get("workspace") if isinstance(config, dict) else None
+    cwd = Path(workspace) if isinstance(workspace, str) and workspace else Path.cwd()
+    return _claude_keybindings_path(cwd, os.environ)
+
+
+def _ctrl_s_stashes(bridge_dir: Path | None) -> bool:
+    """
+    Return whether Ctrl+S in the session's Claude Code is its stash and nothing else.
+
+    A person can bind Ctrl+S to another action, such as submit, which would
+    send the draft the stash key was meant to set aside. Their bindings leave
+    it to ``chat:stash`` only when no binding, in any context, gives Ctrl+S, or
+    a chord it opens, another action. A file that cannot be read cannot vouch.
+
+    :param bridge_dir: Bridge directory of the session, or ``None``.
+    :returns: ``True`` when the stash key may be sent.
+    """
+    try:
+        data = json.loads(_session_keybindings_path(bridge_dir).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return True
+    except (OSError, ValueError):
+        return False
+    blocks = data.get("bindings") if isinstance(data, dict) else None
+    if not isinstance(blocks, list):
+        return False
+    for block in blocks:
+        bindings = block.get("bindings") if isinstance(block, dict) else None
+        if not isinstance(bindings, dict):
+            return False
+        for keystroke, action in bindings.items():
+            strokes = str(keystroke).lower().replace("control+", "ctrl+").split()
+            if not strokes or strokes[0] != "ctrl+s":
+                continue
+            if strokes != ["ctrl+s"] or block.get("context") != "Chat" or action != "chat:stash":
+                return False
+    return True
 
 
 def _record_held_draft(pane: str) -> None:

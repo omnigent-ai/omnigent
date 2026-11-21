@@ -13323,6 +13323,99 @@ def test_a_stash_left_from_an_earlier_delivery_is_not_submitted_by_a_retry(
     assert (composer.text, composer.cursor, composer.stash) == (stashed_draft, 4, None)
 
 
+@pytest.mark.parametrize(
+    "keybindings",
+    [
+        {"bindings": [{"context": "Chat", "bindings": {"ctrl+s": "chat:submit"}}]},
+        {"bindings": [{"context": "Chat", "bindings": {"ctrl+s": None}}]},
+        {"bindings": [{"context": "Global", "bindings": {"control+s": "app:toggleTodos"}}]},
+        {"bindings": [{"context": "Chat", "bindings": {"ctrl+s ctrl+x": "chat:submit"}}]},
+        "{not json",
+    ],
+    ids=["bound-to-submit", "unbound", "global-binding", "opens-a-chord", "unreadable"],
+)
+def test_a_draft_is_held_while_ctrl_s_may_mean_something_else(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, keybindings: object
+) -> None:
+    """
+    The stash key is sent only while Ctrl+S is Claude Code's stash.
+
+    Bound to submit, it would send the draft, so the delivery holds before
+    any key reaches the box.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    path = tmp_path / "keybindings.json"
+    path.write_text(keybindings if isinstance(keybindings, str) else json.dumps(keybindings))
+    monkeypatch.setattr(claude_native_bridge, "_session_keybindings_path", lambda *_args: path)
+    composer = _EditableComposer(_STALE_MULTILINE_DRAFT, cursor=4)
+    composer.install(monkeypatch)
+    keys: list[str] = []
+    run_tmux = claude_native_bridge._run_tmux
+
+    def record_keys(socket_path: str, *args: str) -> None:
+        if args[0] == "send-keys":
+            keys.append(args[-1])
+        run_tmux(socket_path, *args)
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", record_keys)
+
+    with pytest.raises(
+        claude_native_bridge.ClaudeComposerHoldsDraft, match="nothing was sent"
+    ) as refused:
+        inject_user_message(bridge_dir, content="hello from the web")
+
+    assert refused.value.stash_in_use is False
+    assert keys == []
+    assert composer.submitted == []
+    assert (composer.text, composer.cursor, composer.stash) == (_STALE_MULTILINE_DRAFT, 4, None)
+
+
+@pytest.mark.parametrize(
+    "keybindings",
+    [
+        {"bindings": [{"context": "Chat", "bindings": {"ctrl+e": "chat:externalEditor"}}]},
+        {"bindings": [{"context": "Chat", "bindings": {"ctrl+s": "chat:stash"}}]},
+    ],
+    ids=["other-keys", "stash-spelled-out"],
+)
+def test_keybindings_that_leave_ctrl_s_to_the_stash_let_it_stash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, keybindings: object
+) -> None:
+    """Bindings that leave Ctrl+S alone keep the draft stashed and returned."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    path = tmp_path / "keybindings.json"
+    path.write_text(json.dumps(keybindings))
+    monkeypatch.setattr(claude_native_bridge, "_session_keybindings_path", lambda *_args: path)
+    composer = _EditableComposer(_STALE_MULTILINE_DRAFT, cursor=4)
+    composer.install(monkeypatch)
+
+    inject_user_message(bridge_dir, content="hello from the web")
+
+    assert [text.strip() for text in composer.submitted] == ["hello from the web"]
+    assert (composer.text, composer.cursor, composer.stash) == (_STALE_MULTILINE_DRAFT, 4, None)
+
+
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [
+        ({"HOME": "/home/someone"}, "/home/someone/.claude/keybindings.json"),
+        (
+            {"HOME": "/home/someone", "CLAUDE_CONFIG_DIR": "/srv/claude"},
+            "/srv/claude/keybindings.json",
+        ),
+        ({"HOME": "/home/someone", "CLAUDE_CONFIG_DIR": "cfg"}, "/work/cfg/keybindings.json"),
+    ],
+    ids=["home", "config-dir", "relative-config-dir"],
+)
+def test_claude_reads_its_keybindings_from_its_config_dir(
+    env: dict[str, str], expected: str
+) -> None:
+    """The bindings sit beside the rest of Claude Code's config."""
+    path = claude_native_bridge._claude_keybindings_path(Path("/work"), env)
+
+    assert path == Path(expected)
+
+
 def test_a_confirmed_dialog_is_not_taken_for_open_by_a_returned_draft(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
