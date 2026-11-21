@@ -69,6 +69,27 @@ describe("splitPullRequestRefs", () => {
     ["octo-org/.github#12", [`${PULL_REQUEST_REF_HREF_PREFIX}octo-org/.github/12`]],
     // Accepted: an all-digit hex color reads the same as a PR number.
     ["#123456", [`${PULL_REQUEST_REF_HREF_PREFIX}123456`]],
+    ["Fixed in #1234", [`${PULL_REQUEST_REF_HREF_PREFIX}1234`]],
+    ["é #1234", [`${PULL_REQUEST_REF_HREF_PREFIX}1234`]],
+    // Scripts written without spaces between words border a reference directly.
+    ["修复#4242", [`${PULL_REQUEST_REF_HREF_PREFIX}4242`]],
+    ["修复了#1234。", [`${PULL_REQUEST_REF_HREF_PREFIX}1234`]],
+    ["#1234を修正", [`${PULL_REQUEST_REF_HREF_PREFIX}1234`]],
+    // Japanese marks like the prolonged sound mark count with their scripts.
+    ["#4242ーを修正", [`${PULL_REQUEST_REF_HREF_PREFIX}4242`]],
+    ["ーー#4242", [`${PULL_REQUEST_REF_HREF_PREFIX}4242`]],
+    [
+      "修复#1234和#5678",
+      [`${PULL_REQUEST_REF_HREF_PREFIX}1234`, `${PULL_REQUEST_REF_HREF_PREFIX}5678`],
+    ],
+    ["수정#1234", [`${PULL_REQUEST_REF_HREF_PREFIX}1234`]],
+    ["修复acme/app#12", [`${PULL_REQUEST_REF_HREF_PREFIX}acme/app/12`]],
+    ["See #4242.", [`${PULL_REQUEST_REF_HREF_PREFIX}4242`]],
+    ["(#4242).", [`${PULL_REQUEST_REF_HREF_PREFIX}4242`]],
+    ["#4242.)", [`${PULL_REQUEST_REF_HREF_PREFIX}4242`]],
+    ["#1234,#5678", [`${PULL_REQUEST_REF_HREF_PREFIX}1234`, `${PULL_REQUEST_REF_HREF_PREFIX}5678`]],
+    ["#4242, then", [`${PULL_REQUEST_REF_HREF_PREFIX}4242`]],
+    ["#4242.\nNext", [`${PULL_REQUEST_REF_HREF_PREFIX}4242`]],
   ])("links %j", (text, hrefs) => {
     expect(refHrefs(text)).toEqual(hrefs);
   });
@@ -99,6 +120,18 @@ describe("splitPullRequestRefs", () => {
     "feature/login#12",
     "docs/README#3",
     "acme-/app#12",
+    "naïve/app#12",
+    "résumé#1234",
+    "docs/说明#1234",
+    "docs/说明acme/app#12",
+    "docs/𠀀明#1234",
+    "docs/ーデ#1234",
+    "docs\\𠀀明#1234",
+    "#1234é",
+    "#4242.md",
+    "#1234.5",
+    "Read #4242.json",
+    "acme/app#12.txt",
     "cache/build.tsbuildinfo#1234",
   ])("leaves %j as text", (text) => {
     expect(splitPullRequestRefs(text)).toEqual([{ type: "text", value: text }]);
@@ -228,14 +261,24 @@ describe("remarkPullRequestRefs", () => {
     });
   });
 
+  // Thousands of alternating escaped and literal refs in one node still map one to one.
+  const longNumbers = Array.from({ length: 5000 }, (_, index) => String(1000 + index));
+  const longRow: [string, string, string, string[]] = [
+    "5000 alternating escaped and literal refs",
+    longNumbers.map((number, index) => (index % 2 ? `#${number}` : `\\#${number}`)).join(" "),
+    longNumbers.map((number) => `#${number}`).join(" "),
+    longNumbers.filter((_, index) => index % 2),
+  ];
+
   it.each([
-    ["a &#35;1234 \\#2345 #5678", "a #1234 #2345 #5678", ["5678"]],
-    ["a &#1234; #5678", "a \u04d2 #5678", ["5678"]],
+    ["an escaped hash and reference", "a &#35;1234 \\#2345 #5678", "a #1234 #2345 #5678", ["5678"]],
+    ["a numeric reference", "a &#1234; #5678", "a \u04d2 #5678", ["5678"]],
     // A source that doesn't account for every `#` links nothing.
-    ["a b c", "a #1234", []],
+    ["a misread source", "a b c", "a #1234", []],
     // Neither does a node the source can't place.
-    [null, "a #1234", []],
-  ])("reads escaped hashes in %j from the source", (raw, value, linked) => {
+    ["a node without a position", null, "a #1234", []],
+    longRow,
+  ])("reads escaped hashes for %s from the source", (_label, raw, value, linked) => {
     const source = raw ?? "a #1234";
     const position =
       raw === null ? undefined : { start: { offset: 0 }, end: { offset: source.length } };
@@ -246,24 +289,6 @@ describe("remarkPullRequestRefs", () => {
     remarkPullRequestRefs()(tree, { value: source });
     const urls = tree.children[0].children.flatMap((node) => ("url" in node ? [node.url] : []));
     expect(urls).toEqual(linked.map((number) => `${PULL_REQUEST_REF_HREF_PREFIX}${number}`));
-  });
-
-  it("maps escaped hashes across a long node", () => {
-    const numbers = Array.from({ length: 5000 }, (_, index) => String(1000 + index));
-    const source = numbers
-      .map((number, index) => (index % 2 ? `#${number}` : `\\#${number}`))
-      .join(" ");
-    const value = numbers.map((number) => `#${number}`).join(" ");
-    const position = { start: { offset: 0 }, end: { offset: source.length } };
-    const tree = {
-      type: "root",
-      children: [{ type: "paragraph", children: [{ type: "text", value, position }] }],
-    };
-    remarkPullRequestRefs()(tree, { value: source });
-    const urls = tree.children[0].children.flatMap((node) => ("url" in node ? [node.url] : []));
-    expect(urls).toEqual(
-      numbers.filter((_, index) => index % 2).map((n) => `${PULL_REQUEST_REF_HREF_PREFIX}${n}`),
-    );
   });
 
   it("links text nested in emphasis and headings", () => {
