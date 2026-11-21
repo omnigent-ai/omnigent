@@ -10149,9 +10149,9 @@ def _build_spawn_env_from_spec(
     :param session_id: Session/conversation id, used to hand the harness
         this session's subagent-routing endpoint. ``None`` omits it.
     :param model_override: The per-session ``/model`` override, e.g.
-        ``"claude-sonnet-4-6"``, or ``None``. When set, it overrides the
-        ``HARNESS_<H>_MODEL`` the builder baked in (spec model / provider
-        default / catalog default) so ``/model`` actually takes effect on
+        ``"claude-sonnet-4-6"``, or ``None``. When set, it selects the effective
+        executor model before provider defaults or catalog discovery, so
+        ``/model`` actually takes effect on
         the SDK / in-process harnesses. (The native CLIs honor the override
         via ``--model`` in :func:`_build_claude_native_base_args`; the
         SDK harnesses have no such arg, so the override must land in the
@@ -10200,8 +10200,7 @@ def _build_spawn_env_from_spec(
     if model_override is not None:
         executor = getattr(spec, "executor", None)
         if (
-            harness == "acp"
-            and not has_inference_bindings
+            not has_inference_bindings
             and dataclasses.is_dataclass(spec)
             and dataclasses.is_dataclass(executor)
         ):

@@ -10,6 +10,7 @@ import pytest
 
 from omnigent.inference_config import inference_config_scope
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.inner.os_env_serialization import encode_os_env_spec
 from omnigent.policies import FunctionPolicy
 from omnigent.runner import app as runner_app_module
 from omnigent.runner import create_runner_app
@@ -30,6 +31,7 @@ from omnigent.spec.types import (
     GuardrailsSpec,
     Phase,
     PhaseSelector,
+    ProviderAuth,
 )
 from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient, _sse
 from tests.runner.helpers import NullServerClient
@@ -279,20 +281,25 @@ async def test_direct_stream_legacy_model_switch_reaches_reused_worker() -> None
     ]
 
 
-@pytest.mark.parametrize("legacy_model", ["model-a", "model-b"])
+@pytest.mark.parametrize(
+    "legacy_model,bound", [("model-a", True), ("model-b", True), ("model-b", False)]
+)
 async def test_direct_stream_legacy_model_obeys_inference_allowlist(
-    monkeypatch: pytest.MonkeyPatch, legacy_model: str
+    monkeypatch: pytest.MonkeyPatch, legacy_model: str, bound: bool
 ) -> None:
+    from omnigent.runtime import workflow
+
     monkeypatch.setenv("INFERENCE_TEST_KEY", "test-key")
+    provider_family = {
+        "base_url": "https://gateway.example.test/v1",
+        "api_key_ref": "env:INFERENCE_TEST_KEY",
+        **({"models": {"default": "model-a"}} if bound else {}),
+    }
     config: dict[str, object] = {
         "providers": {
             "gateway": {
                 "kind": "gateway",
-                "openai": {
-                    "base_url": "https://gateway.example.test/v1",
-                    "api_key_ref": "env:INFERENCE_TEST_KEY",
-                    "models": {"default": "model-a"},
-                },
+                "openai": provider_family,
             }
         },
         "inference": {
@@ -305,11 +312,21 @@ async def test_direct_stream_legacy_model_obeys_inference_allowlist(
             }
         },
     }
+    if not bound:
+        config.pop("inference")
+    catalog = Mock(side_effect=AssertionError("Explicit model must avoid catalog discovery"))
+    monkeypatch.setattr(workflow, "resolve_catalog_model", catalog)
     declared = _spec(_force_bwrap())
     spec = replace(
         declared,
         executor=replace(
-            declared.executor, config={"harness": "qwen"}, model="model-a", auth=None
+            declared.executor,
+            config={"harness": "qwen"},
+            model="model-a" if bound else None,
+            auth=None if bound else ProviderAuth(name="gateway"),
+        ),
+        os_env=OSEnvSpec(
+            sandbox=OSEnvSandboxSpec(type="none", read_paths=["/allowed"], write_paths=[])
         ),
     )
     worker = _ScriptedHarnessClient([])
@@ -332,7 +349,7 @@ async def test_direct_stream_legacy_model_obeys_inference_allowlist(
                     "spawn_env": {"HARNESS_QWEN_MODEL": legacy_model},
                 },
             )
-    if legacy_model == "model-b":
+    if bound and legacy_model == "model-b":
         assert response.status_code == 400, response.text
         assert not manager.get_client_calls
         assert not worker.posted_bodies
@@ -341,10 +358,15 @@ async def test_direct_stream_legacy_model_obeys_inference_allowlist(
         env = manager.get_client_calls[0][2]
         assert env is not None
         assert env["HARNESS_QWEN_MODEL"] == legacy_model
-        sandbox = json.loads(env["HARNESS_QWEN_OS_ENV"])["sandbox"]
-        assert sandbox["type"] == "linux_bwrap"
-        assert sandbox["allow_network"] is False
+        assert spec.os_env is not None and spec.os_env.sandbox is not None
+        expected_policy = replace(
+            spec.os_env,
+            sandbox=replace(spec.os_env.sandbox, type="linux_bwrap", allow_network=False),
+        )
+        assert json.loads(env["HARNESS_QWEN_OS_ENV"]) == encode_os_env_spec(expected_policy)
         assert worker.posted_bodies[0]["model_override"] == legacy_model
+    catalog.assert_not_called()
+    assert spec.executor.model == ("model-a" if bound else None)
 
 
 @pytest.mark.parametrize(

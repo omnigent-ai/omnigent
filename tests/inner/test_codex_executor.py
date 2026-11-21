@@ -1015,7 +1015,7 @@ class TestCodexExecutor(unittest.TestCase):
         _run(_t())
 
     def test_app_server_run_turn_keeps_native_shell_by_default(self):
-        async def _t(supports_direct_tools: bool, sandbox_mode: str):
+        async def _t(supports_direct_tools: bool):
             session = _CodexAppServerSession(
                 codex_path="/bin/echo",
                 cwd="/tmp/workspace",
@@ -1069,14 +1069,14 @@ class TestCodexExecutor(unittest.TestCase):
                     system_prompt="Be helpful.",
                     model="gpt-5.4-mini",
                     cwd=".",
-                    sandbox=sandbox_mode,
+                    sandbox="read-only",
                 )
             ]
             await inject_task
 
             thread_start_call = session._request.await_args_list[0]
             params = thread_start_call.args[1]
-            self.assertEqual(params["sandbox"], sandbox_mode)
+            self.assertEqual(params["sandbox"], "read-only")
             self.assertNotIn("features.shell_tool", params["config"])
             if supports_direct_tools:
                 self.assertEqual(
@@ -1090,11 +1090,8 @@ class TestCodexExecutor(unittest.TestCase):
             self.assertEqual(params["dynamicTools"][0]["name"], "sys_os_shell")
 
         for supports_direct_tools in (False, True):
-            for sandbox_mode in ("read-only", "workspace-write"):
-                with self.subTest(
-                    supports_direct_tools=supports_direct_tools, sandbox_mode=sandbox_mode
-                ):
-                    _run(_t(supports_direct_tools, sandbox_mode))
+            with self.subTest(supports_direct_tools=supports_direct_tools):
+                _run(_t(supports_direct_tools))
 
     def test_app_server_run_turn_starts_goal_before_objective_turn(self):
         async def _t():

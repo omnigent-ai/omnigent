@@ -25,6 +25,7 @@ from omnigent.inner.claude_model_access import (
     _MAX_REQUEST_BODY_BYTES,
     HELPER_ENV,
     ClaudeAuthRequired,
+    ClaudeCredentialConfigurationError,
     ClaudeModelAccess,
     _ClaudeCredential,
     _ClaudeRelay,
@@ -304,10 +305,12 @@ def test_relay_accepts_provider_sized_bodies_without_raising_the_shared_limit() 
         "https://model.test/%2e%2e",
         "https://model.test/../path",
         "https://*.model.test",
+        "https://model.test:invalid",
+        "https://[model.test",
     ],
 )
 def test_rejects_ambiguous_model_authority(endpoint: str) -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(ClaudeCredentialConfigurationError):
         ClaudeModelAccess(endpoint, "authorization", lambda: "secret")
 
 
@@ -422,8 +425,9 @@ def test_static_helper_never_executes_a_shell(monkeypatch: pytest.MonkeyPatch) -
     access = resolve_claude_model_access({HELPER_ENV: "printf %s 'private-key'"})
     assert access.credential() == "private-key"
     assert access.auth_header == "x-api-key"
-    with pytest.raises(ValueError, match="shell auth helper"):
-        resolve_claude_model_access({HELPER_ENV: "./workspace-helper.sh"})
+    for helper in ("./workspace-helper.sh", "printf 'private-key"):
+        with pytest.raises(ClaudeCredentialConfigurationError, match="shell auth helper"):
+            resolve_claude_model_access({HELPER_ENV: helper})
     run.assert_not_called()
 
 
@@ -450,6 +454,8 @@ def test_custom_provider_config_cannot_be_granted_to_the_worker(tmp_path: Path) 
         ("prepared", None, "CLAUDE_CODE_USE_BEDROCK"),
         ("prepared", None, "CLAUDE_CODE_USE_VERTEX"),
         ("prepared", None, "CLAUDE_CODE_USE_FOUNDRY"),
+        ("prepared-renewable-helper", None, None),
+        ("prepared-invalid-endpoint", None, None),
     ],
 )
 def test_model_access_configuration_preserves_refusal_guidance(
@@ -470,6 +476,11 @@ def test_model_access_configuration_preserves_refusal_guidance(
         "ANTHROPIC_BASE_URL": "https://gateway.example.test/anthropic",
         "CLAUDE_CONFIG_DIR": str(config_dir),
     }
+    if entrypoint == "prepared-renewable-helper":
+        env[HELPER_ENV] = "./private-credential-helper.sh"
+    elif entrypoint == "prepared-invalid-endpoint":
+        env["ANTHROPIC_BASE_URL"] = "http://private-model.example.test"
+        env["ANTHROPIC_API_KEY"] = "parent-only-provider-token"
     if transport is not None:
         env[transport] = "1"
     if explicit_token is not None:
@@ -528,10 +539,18 @@ def test_model_access_configuration_preserves_refusal_guidance(
         else:
             assert detail.code == "PROVIDER_AUTH_REQUIRED"
             assert detail.title is not None and "credential configuration" in detail.title
-            assert "user settings apiKeyHelper" in detail.message
-            assert "configure a supported provider credential" in detail.message
+            if entrypoint == "prepared-renewable-helper":
+                assert "renewable shell auth helper" in detail.message
+                assert "parent-owned credential source" in detail.message
+            elif entrypoint == "prepared-invalid-endpoint":
+                assert "exact HTTPS model endpoint on port 443" in detail.message
+            else:
+                assert "user settings apiKeyHelper" in detail.message
+                assert "configure a supported provider credential" in detail.message
         assert "parent-only-oauth" not in detail.message
         assert "parent-only-refresh" not in detail.message
+        assert "private-credential-helper" not in detail.message
+        assert "private-model.example.test" not in detail.message
         proxy.assert_not_called()
         launcher.assert_not_called()
 

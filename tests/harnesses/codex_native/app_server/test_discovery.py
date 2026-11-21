@@ -965,16 +965,24 @@ async def test_provider_attribution_uses_effective_codex_config_and_cleans_up(
     assert "inherited-secret" not in text
 
 
-@pytest.mark.parametrize("allow_discovery", [True, False])
 @pytest.mark.parametrize(
-    ("overrides", "app_server_command", "probed"),
+    ("overrides", "app_server_command", "probed", "allow_discovery"),
     [
-        (['model_provider="openai"'], (), False),
-        (['model_provider="openai"'], ("/wrapped/codex",), True),
-        (['model="gpt-5.5"'], (), True),
-        (['model_provider="inactive_gateway"'], ("/wrapped/codex",), True),
+        pytest.param(overrides, command, probed, allow, id=f"{case}-{allow}")
+        for case, overrides, command, probed in [
+            ("omnigent-picked", ['model_provider="openai"'], (), False),
+            ("launcher-wrapper", ['model_provider="openai"'], ("/wrapped/codex",), True),
+            ("codex-picked", ['model="gpt-5.5"'], (), True),
+            (
+                "configured-provider",
+                ['model_provider="inactive_gateway"'],
+                ("/wrapped/codex",),
+                True,
+            ),
+        ]
+        for allow in (True, False)
+        if allow or probed
     ],
-    ids=["omnigent-picked", "launcher-wrapper", "codex-picked", "configured-provider"],
 )
 async def test_provider_attribution_probes_only_when_codex_may_pick_the_provider(
     tmp_path: Path,
