@@ -271,26 +271,26 @@ describe("Project ticket board", () => {
         <ProjectTicketBoard projectName="Shipping" selectedTicketId={null} />,
       );
       const card = await screen.findByRole("link", { name: "Open ticket: Ship the board" });
-      expect(within(card).getByText("Running")).toBeInTheDocument();
+      expect(within(card).getByRole("img", { name: "Running" })).toBeInTheDocument();
       expect(within(card).getByTestId("running-dot")).toBeInTheDocument();
       expect(within(card).getByText("Needs response")).toBeInTheDocument();
       expect(card).toHaveAttribute("href", "/?ticket=ticket");
       expect(
-        within(screen.getByRole("link", { name: "Open ticket: Other work" })).queryByText(
-          "Running",
-        ),
+        within(screen.getByRole("link", { name: "Open ticket: Other work" })).queryByRole("img", {
+          name: "Running",
+        }),
       ).toBeNull();
       ticket = { ...ticket, has_running_agents: activity };
       await act(async () =>
         client.refetchQueries({ queryKey: ["project-tickets", "project", "board"] }),
       );
-      await waitFor(() => expect(within(card).queryByText("Running")).toBeNull());
+      await waitFor(() => expect(within(card).queryByRole("img", { name: "Running" })).toBeNull());
       expect(within(card).getByText("Needs response")).toBeInTheDocument();
       ticket = { ...ticket, has_running_agents: true };
       await act(async () =>
         client.refetchQueries({ queryKey: ["project-tickets", "project", "board"] }),
       );
-      expect(await within(card).findByText("Running")).toBeInTheDocument();
+      expect(await within(card).findByRole("img", { name: "Running" })).toBeInTheDocument();
       expect(api.listTicketSessions).not.toHaveBeenCalled();
       expect(fetchConversationById).not.toHaveBeenCalled();
     },

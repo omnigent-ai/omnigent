@@ -362,7 +362,16 @@ function TicketCardContent({ ticket }: { ticket: ProjectTicket }) {
   const now = useNow();
   return (
     <>
-      <h3 className="text-ui leading-snug font-medium wrap-anywhere">{ticket.title}</h3>
+      <div className="flex items-start gap-2">
+        <h3 className="min-w-0 flex-1 text-ui leading-snug font-medium wrap-anywhere">
+          {ticket.title}
+        </h3>
+        {ticket.has_running_agents === true && (
+          <span role="img" aria-label="Running" className="mt-0.5 shrink-0">
+            <RunningDot />
+          </span>
+        )}
+      </div>
       {ticket.tags.length > 0 && <TicketTags tags={ticket.tags} />}
       <p className="line-clamp-2 text-sm leading-relaxed text-muted-foreground wrap-anywhere">
         {ticket.latest_update}
@@ -375,12 +384,6 @@ function TicketCardContent({ ticket }: { ticket: ProjectTicket }) {
           >
             {relativeTime(ticket.updated_at * 1000, now.getTime())}
           </time>
-          {ticket.has_running_agents === true && (
-            <span className="inline-flex items-center gap-1.5">
-              <RunningDot />
-              Running
-            </span>
-          )}
         </div>
         {ticket.comment_count > 0 && (
           <span
