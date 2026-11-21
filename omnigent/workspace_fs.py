@@ -47,6 +47,7 @@ from typing import TypeAlias, TypedDict, cast
 
 from omnigent.entities.environment_filesystem import FilesystemEntry, InvalidPath
 from omnigent.entities.pagination import PagedList, paginate_in_memory
+from omnigent.inner.os_env_upload import is_upload_staging
 from omnigent.runner import pr_resource
 from omnigent.runner.environment_filesystem import (
     _SEARCH_SCAN_BUDGET,
@@ -481,6 +482,8 @@ class WorkspaceReader:
             child_rel = os.path.join(validated, name) if validated else name
             entry = _describe_entry(resolved / name, name, child_rel)
             if entry is not None:
+                if entry["type"] == "file" and is_upload_staging(name):
+                    continue
                 entries.append(entry)
         return entries
 
@@ -591,8 +594,13 @@ class WorkspaceReader:
             limit=limit,
         )
 
+        def keep_entry(path: str) -> bool:
+            # Hide upload staging files; a directory with a staging-like
+            # name is still a real directory.
+            return not is_upload_staging(path) or (self._root / path).is_dir()
+
         results, truncated = walk_search(
-            self._root, q, inc, exc, limit, budget=_SEARCH_SCAN_BUDGET
+            self._root, q, inc, exc, limit, budget=_SEARCH_SCAN_BUDGET, emit=keep_entry
         )
         if indexed is not None:
             results = merge_entries(indexed, results, limit)
@@ -647,6 +655,7 @@ class WorkspaceReader:
                 "untracked_lines": rec.get("untracked_lines"),
             }
             for rec in raw_changes
+            if not is_upload_staging(rec["path"])
         ]
         return {"object": "list", "data": data, "has_more": False}
 

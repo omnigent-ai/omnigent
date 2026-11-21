@@ -93,6 +93,7 @@ import { readPreferredShell, resolveDefaultShell, writePreferredShell } from "./
 import { scrollTabIntoView, WorkspaceTabsScroller } from "./WorkspaceTabsScroller";
 import { FilesPanel } from "./FilesPanel";
 import { resolveWorkspaceActiveView } from "./workspaceActiveView";
+import { WorkspaceUploadDropRoot, WorkspaceUploadProvider, UploadsTray } from "./WorkspaceUploads";
 import { ContentSearchPanel } from "./ContentSearchPanel";
 import { FileViewer } from "./FileViewer";
 import { ResponsiveViewerSlot } from "./ResponsiveViewerSlot";
@@ -2111,16 +2112,18 @@ function WorkspacePanelImpl({
                   name="this workspace pane"
                   resetKey={JSON.stringify([conversationId, activeView.flat])}
                 >
-                  <FilesPanel
-                    conversationId={contained ? conversationId : undefined}
-                    frameless
-                    onFileSelect={openFileViewer}
-                    flatView={activeView.flat}
-                    showHidden={filesPanelShowHidden}
-                    onShowHiddenChange={onShowHiddenChange}
-                    sort={filesPanelSort}
-                    onSortChange={onSortChange}
-                  />
+                  <WorkspaceUploadDropRoot>
+                    <FilesPanel
+                      conversationId={contained ? conversationId : undefined}
+                      frameless
+                      onFileSelect={openFileViewer}
+                      flatView={activeView.flat}
+                      showHidden={filesPanelShowHidden}
+                      onShowHiddenChange={onShowHiddenChange}
+                      sort={filesPanelSort}
+                      onSortChange={onSortChange}
+                    />
+                  </WorkspaceUploadDropRoot>
                 </RenderErrorBoundary>
               </div>
             )}
@@ -2206,12 +2209,13 @@ function WorkspacePanelImpl({
             ) : null}
           </RenderErrorBoundary>
         </div>
+        <UploadsTray visible={open && !isMobile} />
       </div>
     </aside>
   );
   return (
     <>
-      {rail}
+      <WorkspaceUploadProvider sessionId={conversationId}>{rail}</WorkspaceUploadProvider>
       {/* The rail is `hidden` on phones, so the drawer renders beside it. A
         portal to the body would escape the embed's scoped styles. */}
       {isMobile && (
