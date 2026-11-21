@@ -12,10 +12,12 @@ import contextlib
 import hashlib
 import json
 import logging
+import re
 import time
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -61,6 +63,17 @@ BOOTSTRAP_CONTAINER = "bootstrap"
 PROFILE_ANNOTATION = "omnigent.ai/warm-profile"
 SHARED_POOL_ANNOTATION = "omnigent.ai/warm-pool-shared"
 _ACTIVATION_PATH = "/run/omnigent-activation"
+# Bootstrap runs beside the host for the Pod's lifetime, so Kubernetes adds its requests
+# to the host's. It keeps the configured limits for workspace preparation.
+_BOOTSTRAP_REQUESTS = {"cpu": "50m", "memory": "128Mi", "ephemeral-storage": "0"}
+_QUANTITY_SCALE = {
+    "n": Decimal("1e-9"),
+    "u": Decimal("1e-6"),
+    "m": Decimal("1e-3"),
+    "": Decimal(1),
+    **{suffix: Decimal(10) ** (3 * power) for power, suffix in enumerate("kMGTPE", 1)},
+    **{suffix + "i": Decimal(2) ** (10 * power) for power, suffix in enumerate("KMGTPE", 1)},
+}
 _HANDLE_PREFIX = "wp1:"
 _POLL_S = 0.5
 _EXEC_TIMEOUT_S = 15
@@ -116,6 +129,15 @@ def _shared_profile(spec: dict[str, Any]) -> bool:
             "and the omnigent.ai/agent label must be absent."
         )
     return True
+
+
+def _quantity(value: str) -> Decimal:
+    """Parse an unsigned Kubernetes quantity without the optional Kubernetes SDK."""
+    # Kubernetes accepts either a decimal exponent or an SI suffix, not both.
+    match = re.fullmatch(r"(\d+\.?\d*|\.\d+)(?:([eE][-+]?\d+)|([a-zA-Z]*))", value)
+    if match is None or (match[3] or "") not in _QUANTITY_SCALE:
+        raise click.ClickException(f"{value!r} is not a valid Kubernetes resource quantity.")
+    return Decimal(match[1] + (match[2] or "")) * _QUANTITY_SCALE[match[3] or ""]
 
 
 def _contains(expected: Any, actual: Any, *, field: str = "") -> bool:
@@ -179,8 +201,13 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
         agent_name: str | None = None,
         host_config: dict[str, object] | None = None,
         shared: bool = False,
+        legacy_bootstrap: bool = False,
     ) -> dict[str, Any]:
-        """Render the static pod profile from the same config as direct Sandboxes."""
+        """Render the static pod profile from the same config as direct Sandboxes.
+
+        ``legacy_bootstrap`` renders the earlier profile whose bootstrap requested the
+        configured resources, so pools and allocations created from it still validate.
+        """
         if shared and agent_name is not None:
             raise click.ClickException("A shared warm pool cannot have an agent classifier.")
         job = build_job_manifest(
@@ -219,6 +246,15 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
         bootstrap["command"] = _bootstrap_command("prepare")
         host = pod["containers"][0]
         host["command"] = _bootstrap_command("host")
+        if not legacy_bootstrap:
+            configured = host["resources"]
+            tiers = (configured["requests"], configured["limits"])
+            requests = {}
+            for name, default in _BOOTSTRAP_REQUESTS.items():
+                bounds = [tier[name] for tier in tiers if name in tier]
+                if bounds:
+                    requests[name] = min([default, *bounds], key=_quantity)
+            bootstrap["resources"] = {"requests": requests, "limits": dict(configured["limits"])}
         host["env"] = [
             item
             for item in host["env"]
@@ -283,14 +319,20 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
         shared: bool = False,
     ) -> None:
         expected_agent = None if shared else agent_name
-        expected = self.template_spec(
-            agent_name=expected_agent, host_config=host_config, shared=shared
-        )
+        accepted = [
+            self.template_spec(
+                agent_name=expected_agent,
+                host_config=host_config,
+                shared=shared,
+                legacy_bootstrap=legacy_bootstrap,
+            )
+            for legacy_bootstrap in (False, True)
+        ]
         labels = spec["podTemplate"].get("metadata", {}).get("labels", {})
         if (
             _shared_profile(spec) != shared
             or labels.get(_AGENT_LABEL) != expected_agent
-            or not _contains(expected, spec)
+            or not any(_contains(expected, spec) for expected in accepted)
         ):
             raise click.ClickException(
                 "Warm-pool template does not match sandbox.kubernetes/workspace configuration. "
@@ -308,18 +350,23 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
         from kubernetes import client
 
         expected_agent = None if shared else agent_name
-        profile = self.template_spec(agent_name=expected_agent, shared=shared)
-        expected = profile["podTemplate"]
-        for claim in profile.get("volumeClaimTemplates", []):
-            name = claim["metadata"]["name"]
-            volumes = expected["spec"]["volumes"]
-            volumes[:] = [volume for volume in volumes if volume["name"] != name]
-            volumes.append(
-                {
-                    "name": name,
-                    "persistentVolumeClaim": {"claimName": f"{name}-{handle.sandbox_name}"},
-                }
+        accepted: list[dict[str, Any]] = []
+        for legacy_bootstrap in (False, True):
+            profile = self.template_spec(
+                agent_name=expected_agent, shared=shared, legacy_bootstrap=legacy_bootstrap
             )
+            expected = profile["podTemplate"]
+            for claim in profile.get("volumeClaimTemplates", []):
+                name = claim["metadata"]["name"]
+                volumes = expected["spec"]["volumes"]
+                volumes[:] = [volume for volume in volumes if volume["name"] != name]
+                volumes.append(
+                    {
+                        "name": name,
+                        "persistentVolumeClaim": {"claimName": f"{name}-{handle.sandbox_name}"},
+                    }
+                )
+            accepted.append(expected)
         with client.ApiClient() as api:
             actual = api.sanitize_for_serialization(pod)
         classifier = actual.get("metadata", {}).get("labels", {}).get(_AGENT_LABEL)
@@ -333,7 +380,7 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
             _shared_profile({"podTemplate": actual}) != shared
             or classifier != expected_agent
             or has_identity
-            or not _contains(expected, actual)
+            or not any(_contains(expected, actual) for expected in accepted)
         ):
             raise click.ClickException(
                 "Warm Pod does not match its configured profile; create a new versioned pool."
