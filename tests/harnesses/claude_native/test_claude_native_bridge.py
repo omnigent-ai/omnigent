@@ -13121,6 +13121,147 @@ def test_a_delivery_refused_after_its_paste_returns_the_draft(
     assert (composer.text, composer.cursor, composer.stash) == (_STALE_MULTILINE_DRAFT, 4, None)
 
 
+class _ComposerTypedIntoAfterTheDelivery(_EditableComposer):
+    """A box the person types into just after the delivery's text lands in it."""
+
+    def __init__(self, draft: str, *, cursor: int, delivered: str, typed: str) -> None:
+        super().__init__(draft, cursor=cursor)
+        self._delivered = delivered
+        self._typed = typed
+        self.typed_at: float | None = None
+
+    def _run_tmux(self, socket_path: str, *args: str) -> None:
+        super()._run_tmux(socket_path, *args)
+        if self.typed_at is None and self._delivered in self.text:
+            self._insert(self._typed)
+            # The person's keys come just after the delivery's.
+            self.typed_at = claude_native_bridge.time.time() + 0.01
+
+
+_DELIVERIES = pytest.mark.parametrize(
+    ("inject", "delivered"),
+    [
+        (
+            lambda bridge_dir: inject_user_message(bridge_dir, content="hello from the web"),
+            "hello from the web",
+        ),
+        (
+            lambda bridge_dir: claude_native_bridge.inject_slash_command(
+                bridge_dir, command="/effort high"
+            ),
+            "/effort high",
+        ),
+    ],
+    ids=["web-message", "slash-command"],
+)
+
+
+@_DELIVERIES
+def test_a_delivery_refused_after_the_person_typed_beside_it_deletes_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    inject: Callable[[Path], None],
+    delivered: str,
+) -> None:
+    """
+    Clean-up leaves the box alone once the person has typed beside the delivery's text.
+
+    Deleting the delivery's text would delete their keys with it, so the box
+    keeps both, and the draft stashed before stays stashed for them to return.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    composer = _ComposerTypedIntoAfterTheDelivery(
+        _STALE_MULTILINE_DRAFT, cursor=4, delivered=delivered, typed=" and mine"
+    )
+    composer.install(monkeypatch)
+    monkeypatch.setattr(
+        claude_native_bridge, "last_human_input_at", lambda *_args: composer.typed_at
+    )
+    # A permission prompt opens once the delivery is in the box.
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "has_pending_user_prompt",
+        lambda _bridge_dir: delivered in composer.text,
+    )
+
+    with pytest.raises(claude_native_bridge.ClaudeUserPromptPending):
+        inject(bridge_dir)
+
+    assert composer.submitted == []
+    assert composer.text == f"{delivered} and mine"
+    assert composer.stash == (_STALE_MULTILINE_DRAFT, 4)
+
+
+class _ComposerThatStallsAtTheSubmit(_EditableComposer):
+    """
+    Claude Code that stops drawing and reading keys when the submit Enter arrives.
+
+    Keys sent meanwhile wait in order, as in a stalled TUI's input, and the
+    screen keeps its last frame until :meth:`resume`. The delivery is stopped
+    while its Enter waits, as a cancelled turn stops it.
+    """
+
+    def __init__(self, draft: str, *, cursor: int, cancelled: threading.Event) -> None:
+        super().__init__(draft, cursor=cursor)
+        self._cancelled = cancelled
+        self._frozen: str | None = None
+        self._waiting: list[tuple[str, ...]] = []
+
+    def _run_tmux(self, socket_path: str, *args: str) -> None:
+        claude_native_bridge._check_injection_cancelled()
+        if self._frozen is None and args[0] == "send-keys" and args[-1] == "Enter":
+            self._frozen = super()._capture_pane(socket_path, "")
+            self._cancelled.set()
+        if self._frozen is not None:
+            self._waiting.append(args)
+            return
+        super()._run_tmux(socket_path, *args)
+
+    def _capture_pane(self, socket_path: str, tmux_target: str) -> str:
+        claude_native_bridge._check_injection_cancelled()
+        if self._frozen is not None:
+            return self._frozen
+        return super()._capture_pane(socket_path, tmux_target)
+
+    def resume(self) -> None:
+        """Take the waiting keys in order, then draw again."""
+        waiting, self._waiting, self._frozen = self._waiting, [], None
+        for args in waiting:
+            super()._run_tmux("/tmp/example/tmux.sock", *args)
+
+
+@_DELIVERIES
+def test_a_delivery_stopped_while_its_enter_waits_deletes_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    inject: Callable[[Path], None],
+    delivered: str,
+) -> None:
+    """
+    Clean-up after the submit Enter went out sends no editing keys.
+
+    A stalled Claude Code takes the waiting Enter later and then returns the
+    person's draft, so keys sent to take the delivery back out would land on
+    the returned draft and delete it.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    cancelled = threading.Event()
+    composer = _ComposerThatStallsAtTheSubmit(
+        _STALE_MULTILINE_DRAFT, cursor=4, cancelled=cancelled
+    )
+    composer.install(monkeypatch)
+
+    with (
+        claude_native_bridge.cancellable_injection(cancelled),
+        pytest.raises(claude_native_bridge.ClaudeInjectionCancelled),
+    ):
+        inject(bridge_dir)
+    composer.resume()
+
+    assert [text.strip() for text in composer.submitted] == [delivered]
+    assert (composer.text, composer.cursor, composer.stash) == (_STALE_MULTILINE_DRAFT, 4, None)
+
+
 @pytest.mark.parametrize(
     ("pane", "stash_in_use", "expected"),
     [
@@ -13408,7 +13549,7 @@ def test_a_stash_left_from_an_earlier_delivery_is_not_submitted_by_a_retry(
         {"bindings": [{"context": "Global", "bindings": {"control+s": "app:toggleTodos"}}]},
         {"bindings": [{"context": "Chat", "bindings": {"ctrl+s ctrl+x": "chat:submit"}}]},
         "{not json",
-        # The launch recorded no location, so nothing vouches for Ctrl+S.
+        # Claude Code has not reported where it keeps its config, so nothing vouches.
         None,
     ],
     ids=[
@@ -13483,43 +13624,84 @@ def test_keybindings_that_leave_ctrl_s_to_the_stash_let_it_stash(
     assert (composer.text, composer.cursor, composer.stash) == (_STALE_MULTILINE_DRAFT, 4, None)
 
 
-def test_the_bridge_keeps_where_the_launch_found_the_keybindings(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The launch's record of the keybindings file survives the bridge being prepared again."""
-    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
-    bridge_dir = prepare_bridge_dir("conv_abc", workspace=tmp_path)
-    assert claude_native_bridge.read_claude_keybindings_path(bridge_dir) is None
+# The real lookup, before the conftest points deliveries at a missing file.
+_CLAUDES_OWN_KEYBINDINGS_PATH = claude_native_bridge._session_keybindings_path
 
-    claude_native_bridge.record_claude_keybindings_path(
-        bridge_dir, cwd=Path("/work"), env={"HOME": "/home/someone", "CLAUDE_CONFIG_DIR": "cfg"}
-    )
-    prepare_bridge_dir("conv_abc", workspace=tmp_path)
 
-    assert claude_native_bridge.read_claude_keybindings_path(bridge_dir) == Path(
-        "/work/cfg/keybindings.json"
+def _record_session_start(bridge_dir: Path, transcript: Path) -> None:
+    """Record the SessionStart hook a launch's Claude Code sends, reporting *transcript*."""
+    claude_native_bridge.record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "source": "startup",
+            "session_id": "s1",
+            "transcript_path": str(transcript),
+        },
     )
 
 
 @pytest.mark.parametrize(
-    ("env", "expected"),
+    ("transcript", "expected"),
     [
-        ({"HOME": "/home/someone"}, "/home/someone/.claude/keybindings.json"),
         (
-            {"HOME": "/home/someone", "CLAUDE_CONFIG_DIR": "/srv/claude"},
-            "/srv/claude/keybindings.json",
+            "/home/someone/.claude/projects/-home-someone-repo/s1.jsonl",
+            "/home/someone/.claude/keybindings.json",
         ),
-        ({"HOME": "/home/someone", "CLAUDE_CONFIG_DIR": "cfg"}, "/work/cfg/keybindings.json"),
+        ("/srv/claude/projects/-repo/s1.jsonl", "/srv/claude/keybindings.json"),
+        ("/tmp/elsewhere/s1.jsonl", None),
     ],
-    ids=["home", "config-dir", "relative-config-dir"],
+    ids=["default-config-dir", "config-dir-set", "unknown-layout"],
 )
-def test_claude_reads_its_keybindings_from_its_config_dir(
-    env: dict[str, str], expected: str
+def test_the_keybindings_checked_sit_beside_claudes_reported_transcripts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, transcript: str, expected: str | None
 ) -> None:
-    """The bindings sit beside the rest of Claude Code's config."""
-    path = claude_native_bridge._claude_keybindings_path(Path("/work"), env)
+    """Claude Code keeps keybindings in the config dir its transcripts are under."""
+    monkeypatch.setattr(
+        claude_native_bridge, "_session_keybindings_path", _CLAUDES_OWN_KEYBINDINGS_PATH
+    )
+    bridge_dir = _picker_bridge_dir(tmp_path)
 
-    assert path == Path(expected)
+    _record_session_start(bridge_dir, Path(transcript))
+
+    assert claude_native_bridge._session_keybindings_path(bridge_dir) == (
+        None if expected is None else Path(expected)
+    )
+
+
+def test_ctrl_s_is_checked_in_the_config_of_the_claude_that_launched_last(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Every launch is checked against the config its own Claude Code reports.
+
+    A wrapper can move Claude's config dir in any way; the hooks of the
+    Claude it runs report where its transcripts go. A relaunch drops the
+    earlier report, so until the new one arrives nothing vouches for Ctrl+S,
+    and a relaunch into a config that binds Ctrl+S to submit sends no stash key.
+    """
+    monkeypatch.setattr(
+        claude_native_bridge, "_session_keybindings_path", _CLAUDES_OWN_KEYBINDINGS_PATH
+    )
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    first, wrapped = tmp_path / "first-config", tmp_path / "wrapper-config"
+    wrapped.mkdir()
+    (wrapped / "keybindings.json").write_text(
+        json.dumps({"bindings": [{"context": "Chat", "bindings": {"ctrl+s": "chat:submit"}}]})
+    )
+    bridge_dir = prepare_bridge_dir("conv_abc", workspace=tmp_path)
+    assert claude_native_bridge._ctrl_s_stashes(bridge_dir) is False
+
+    _record_session_start(bridge_dir, first / "projects" / "-repo" / "s1.jsonl")
+    assert claude_native_bridge._ctrl_s_stashes(bridge_dir) is True
+
+    prepare_bridge_dir("conv_abc", workspace=tmp_path)
+    assert claude_native_bridge._ctrl_s_stashes(bridge_dir) is False
+    _record_session_start(bridge_dir, wrapped / "projects" / "-repo" / "s1.jsonl")
+    assert claude_native_bridge._session_keybindings_path(bridge_dir) == (
+        wrapped / "keybindings.json"
+    )
+    assert claude_native_bridge._ctrl_s_stashes(bridge_dir) is False
 
 
 def test_a_confirmed_dialog_is_not_taken_for_open_by_a_returned_draft(

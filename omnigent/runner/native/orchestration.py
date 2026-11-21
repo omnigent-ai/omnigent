@@ -8470,63 +8470,6 @@ def _claude_terminal_env_unset(
     ]
 
 
-def _seed_claude_launch_config(
-    bridge_dir: Path,
-    spec: TerminalEnvSpec,
-    parent_os_env: OSEnvSpec | None,
-    *,
-    added_dirs: Sequence[Path],
-) -> None:
-    """
-    Seed trust in the config the Claude terminal launches with, and record its keybindings.
-
-    Both follow the pane's real working directory and environment, wrappers
-    included, so deliveries check Ctrl+S in the file Claude Code reads. A
-    wrapper whose environment is not modeled records no file, so deliveries
-    hold a draft rather than stash it.
-
-    :param bridge_dir: The session's bridge directory.
-    :param spec: The Claude terminal launch spec.
-    :param parent_os_env: The agent's os_env the terminal inherits from, or ``None``.
-    :param added_dirs: Omnigent-owned directories passed to ``--add-dir`` to trust as well.
-    :returns: None.
-    """
-    from omnigent.harnesses.claude_native.bridge import (
-        ensure_claude_workspace_trusted,
-        forget_claude_keybindings_path,
-        record_claude_keybindings_path,
-    )
-
-    cwd = _claude_terminal_launch_cwd(spec, parent_os_env)
-    env = _claude_terminal_launch_env(spec)
-    ensure_claude_workspace_trusted(cwd, env=env, added_dirs=added_dirs)
-    if _claude_terminal_env_is_modeled(spec):
-        record_claude_keybindings_path(bridge_dir, cwd=cwd, env=env)
-    else:
-        forget_claude_keybindings_path(bridge_dir)
-
-
-def _claude_terminal_env_is_modeled(spec: TerminalEnvSpec) -> bool:
-    """
-    Return whether the Claude launch's environment is known rather than inferred.
-
-    An ``env`` wrapper in a form that is not modeled can set any variable,
-    Claude's config dir included. Another command is taken to pass the
-    environment through, as trust seeding does.
-
-    :param spec: The Claude terminal launch spec.
-    :returns: ``False`` only for an ``env`` wrapper whose form is not modeled.
-    """
-    if Path(spec.command or "").name != "env":
-        return True
-    return (
-        env_wrapper_environment(
-            spec.command or "", list(spec.args), _claude_terminal_pre_wrapper_env(spec)
-        )
-        is not None
-    )
-
-
 def _claude_terminal_launch_cwd(spec: TerminalEnvSpec, parent_os_env: OSEnvSpec | None) -> Path:
     """
     Return the directory the native Claude terminal pane starts in.
@@ -9466,6 +9409,7 @@ async def _auto_create_claude_terminal(
         BRIDGE_ID_LABEL_KEY,
         augment_claude_args,
         claude_terminal_relay_env,
+        ensure_claude_workspace_trusted,
         prepare_bridge_dir,
         validate_claude_hook_interpreter_compatibility,
     )
@@ -10253,8 +10197,10 @@ async def _auto_create_claude_terminal(
     )
     # Seed trust and onboarding in the config selected by the terminal's launch environment.
     try:
-        _seed_claude_launch_config(
-            bridge_dir, env_spec, agent_os_env, added_dirs=trusted_added_dirs
+        ensure_claude_workspace_trusted(
+            _claude_terminal_launch_cwd(env_spec, agent_os_env),
+            env=_claude_terminal_launch_env(env_spec),
+            added_dirs=trusted_added_dirs,
         )
     except BaseException as seed_error:
         # No forwarder owns the routers yet, so release the ones this launch started.
