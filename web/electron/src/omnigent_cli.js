@@ -32,6 +32,8 @@ const DEFAULT_TIMEOUT_MS = 10000;
 /** Ceiling for `login`, just past the CLI's own 300s OIDC ticket deadline. */
 const LOGIN_TIMEOUT_MS = 305000;
 
+const WORKSPACE_API_PATH = "/api/2.0/omnigent";
+
 /**
  * One-liner shown on the setup page when the CLI is missing. Mirrors the
  * install instructions in the repo root README.
@@ -869,14 +871,27 @@ async function stopHost(cliPath, serverUrl) {
   return { ok: res.code === 0, output: (res.stdout || res.stderr).trim() };
 }
 
-/** True when any recorded server URL matches, including loopback aliases.
+/** Map a workspace API mount to the web-UI mount on the same origin, which windows pin. */
+function workspaceUiServerUrl(value) {
+  const normalized = normalizeServerUrl(value);
+  try {
+    const parsed = new URL(normalized);
+    if (parsed.pathname.replace(/\/+$/, "") !== WORKSPACE_API_PATH) return normalized;
+    parsed.pathname = url.WORKSPACE_UI_PATH;
+    return normalizeServerUrl(parsed.href);
+  } catch {
+    return normalized;
+  }
+}
+
+/** True when any recorded server URL matches, including loopback and workspace-mount aliases.
  * Local-mode records may carry the URL only in resolved_server_url. */
 function matchesServer(daemon, serverUrl) {
   if (!daemon || typeof daemon !== "object") return false;
-  const want = normalizeServerUrl(serverUrl);
+  const want = workspaceUiServerUrl(serverUrl);
   if (want === "") return false;
   return [daemon.server_url, daemon.target, daemon.resolved_server_url].some(
-    (field) => normalizeServerUrl(field) === want || sameLoopbackServer(field, serverUrl),
+    (field) => workspaceUiServerUrl(field) === want || sameLoopbackServer(field, serverUrl),
   );
 }
 
@@ -1020,7 +1035,6 @@ function bearerTokenFor(serverUrl) {
 }
 
 const OMNIGENT_SLICE_KEY_HEADER = "X-Databricks-Omnigent-Slice-Key";
-const WORKSPACE_API_PATH = "/api/2.0/omnigent";
 
 /**
  * Whether requests to `serverUrl` should carry a host's routing key, by the same
