@@ -50,7 +50,8 @@ change their layout and type syntax, plus one renamed local variable.
   ties.
 - `FileTree`'s `renderRowDecoration` and `onRowMenu` props. The menu opens from
   a right-click, Shift+F10, the context menu key, or one actions button that
-  follows the hovered or focused row, using upstream's ellipsis icon.
+  follows the hovered or focused row, using upstream's ellipsis icon. The row
+  under the button keeps room for it and its hover fill.
 - `resolveFileIcon` and `useFileTreeSpriteSheet` as exports, so a file's icon can be
   drawn outside a tree, such as on a workspace tab.
 - Middle truncation of long names, splitting before the extension as
