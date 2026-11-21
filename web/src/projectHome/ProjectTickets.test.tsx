@@ -287,10 +287,12 @@ describe("Project ticket board", () => {
         onCreated={vi.fn()}
       />,
     );
-    expect(await screen.findByText("Confirm recovery before resolving.")).toBeInTheDocument();
-    expect(
-      screen.getByRole("combobox", { name: "Ticket stage" }).querySelector(".lucide-wrench"),
-    ).toHaveClass("text-orange-600");
+    await waitFor(() =>
+      expect(
+        screen.getByRole("combobox", { name: "Ticket stage" }).querySelector(".lucide-wrench"),
+      ).toHaveClass("text-orange-600"),
+    );
+    expect(screen.queryByText("Confirm recovery before resolving.")).toBeNull();
     await user.click(screen.getByRole("button", { name: "Edit plan" }));
     fireEvent.change(screen.getByLabelText("Plan"), {
       target: { value: "Verify recovery evidence." },

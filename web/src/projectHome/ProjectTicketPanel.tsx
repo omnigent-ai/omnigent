@@ -480,9 +480,6 @@ function TicketDetails({
                 />
               </div>
               <TicketError error={configuration.error} />
-              {currentStage?.instructions && (
-                <p className="text-sm text-muted-foreground">{currentStage.instructions}</p>
-              )}
               <TicketAgents projectId={projectId} ticket={ticket} />
               {ticket.description ? (
                 <ProseMarkdown className="text-ui leading-relaxed">
@@ -844,9 +841,6 @@ function TicketCommentComposer({
         );
       }}
     >
-      <p className="text-xs text-muted-foreground">
-        For a conversation or an approval prompt, open an agent’s chat above.
-      </p>
       <div className="rounded-xl border border-input bg-background focus-within:border-ring focus-within:ring-2 focus-within:ring-ring/30">
         <Textarea
           name="comment"
