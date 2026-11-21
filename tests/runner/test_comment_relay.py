@@ -460,7 +460,8 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
     # (sys_session_list / sys_session_get_history / sys_session_get_info),
     # read-only agent tools (sys_agent_list / sys_agent_get /
     # sys_agent_download), policy tools (sys_add_policy /
-    # sys_policy_registry) — claude-native ignores the harness tool
+    # sys_policy_registry), session file tools (sys_upload_file /
+    # sys_list_files / sys_download_file) — claude-native ignores the harness tool
     # schemas, so this relay is the only surface that reaches Claude Code.
     # All are routed through the AP server's /mcp endpoint for policy
     # enforcement. The opt-in spawn writes (sys_session_send/close/create)
@@ -489,6 +490,9 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
         "sys_agent_download",
         "sys_add_policy",
         "sys_policy_registry",
+        "sys_upload_file",
+        "sys_list_files",
+        "sys_download_file",
     }
     # Parameters must be the real schemas from the tool classes — proving
     # get_schema() flowed through rather than an empty placeholder. "status"

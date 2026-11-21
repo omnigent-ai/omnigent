@@ -293,7 +293,6 @@ async def _upload(
     )
 
 
-@pytest.mark.asyncio
 def _default_temp_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     """
     Point the runner's default temp roots at a fresh directory, with no override.
@@ -446,7 +445,7 @@ async def test_upload_on_an_isolating_runner_refuses_a_sibling_session_file(
     secret = Path(sibling_root, "secret.txt")
     secret.write_text("SIBLING SECRET")
     sibling_path = {
-        # Inside the shared runner root, so the old fallback root uploaded it.
+        # Relative to the shared runner root, which holds the sibling's directory.
         "inside-runner-root": f"{secret.parent.name}/secret.txt",
         "parent-traversal": f"../{secret.parent.name}/secret.txt",
         "absolute": str(secret),

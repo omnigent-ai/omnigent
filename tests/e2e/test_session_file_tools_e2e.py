@@ -60,6 +60,15 @@ def _wait(check: Callable[[], Any], description: str, timeout: float = 90) -> An
     raise AssertionError(f"Timed out waiting for {description}")
 
 
+def _stack_base_env() -> dict[str, str]:
+    """The ambient variables an isolated stack keeps; nothing else is inherited."""
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key in {"PATH", "LANG", "LC_ALL", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR"}
+    }
+
+
 def _session_files(client: httpx.Client, session_id: str) -> dict[str, str]:
     """Map each stored session file's name to its id."""
     response = client.get(f"/v1/sessions/{session_id}/resources/files")
@@ -111,6 +120,18 @@ def _mcp_tool_call(
     return "".join(block.get("text", "") for block in body["result"]["content"])
 
 
+def _tool_call(call_id: str, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    """
+    Script one mock model response that calls a single tool.
+
+    :param call_id: The call's id, e.g. ``"upload"``.
+    :param name: Tool name, e.g. ``"sys_upload_file"``.
+    :param arguments: Tool arguments, e.g. ``{"path": "report.md"}``.
+    :returns: A mock response entry for :func:`configure_mock_llm`.
+    """
+    return {"tool_calls": [{"call_id": call_id, "name": name, "arguments": json.dumps(arguments)}]}
+
+
 def _model_session(
     client: httpx.Client,
     *,
@@ -118,6 +139,7 @@ def _model_session(
     mock_llm_server_url: str,
     model: str,
     spec_overrides: dict[str, Any],
+    metadata: dict[str, Any] | None = None,
 ) -> str:
     """
     Create a runner-bound openai-agents session from a ``config.yaml`` bundle.
@@ -125,11 +147,12 @@ def _model_session(
     The ``spec_version: 1`` bundle form is the one whose parser reads
     ``tools.builtins``; its model calls go to the mock endpoint.
 
-    :param client: Client for the shared live server.
-    :param runner_id: The live runner to bind, e.g. ``"runner_abc"``.
+    :param client: Client for the server.
+    :param runner_id: The runner to bind, e.g. ``"runner_abc"``.
     :param mock_llm_server_url: Mock model server URL, without ``/v1``.
     :param model: Model name, also the mock queue key, e.g. ``"mock-files-1a2b"``.
     :param spec_overrides: Top-level spec keys to add, e.g. ``{"os_env": {...}}``.
+    :param metadata: Session-create metadata, e.g. ``{"workspace": "/repo"}``.
     :returns: The session id.
     """
     config = {
@@ -152,6 +175,7 @@ def _model_session(
         client.post,
         "/v1/sessions",
         bundle_files({"config.yaml": yaml.safe_dump(config).encode()}),
+        metadata=metadata,
         headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
     )
     created.raise_for_status()
@@ -192,20 +216,16 @@ def test_model_turn_shares_and_reads_session_files_with_the_default_tools(
         json={"content": "notes from the files panel", "encoding": "utf-8"},
     )
     panel_write.raise_for_status()
-
-    def call(call_id: str, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "tool_calls": [{"call_id": call_id, "name": name, "arguments": json.dumps(arguments)}]
-        }
-
     configure_mock_llm(
         mock_llm_server_url,
         [
-            call("write", "sys_os_write", {"path": "out/report.md", "content": "agent report"}),
-            call("upload_report", "sys_upload_file", {"path": "out/report.md"}),
-            call("upload_notes", "sys_upload_file", {"path": "notes.txt"}),
-            call("list", "sys_list_files", {}),
-            call("download", "sys_download_file", {"file_id": brief_id}),
+            _tool_call(
+                "write", "sys_os_write", {"path": "out/report.md", "content": "agent report"}
+            ),
+            _tool_call("upload_report", "sys_upload_file", {"path": "out/report.md"}),
+            _tool_call("upload_notes", "sys_upload_file", {"path": "notes.txt"}),
+            _tool_call("list", "sys_list_files", {}),
+            _tool_call("download", "sys_download_file", {"file_id": brief_id}),
             {"text": "Shared your files."},
         ],
         key=model,
@@ -339,11 +359,7 @@ def test_native_cli_uploads_a_workspace_file_through_the_omnigent_relay(
     workspace.mkdir()
     (workspace / "report.md").write_text("native report")
     write_model_config(config, mock_url, _NATIVE_MODELS["claude"], _NATIVE_MODELS["codex"])
-    base_env = {
-        key: value
-        for key, value in os.environ.items()
-        if key in {"PATH", "LANG", "LC_ALL", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR"}
-    }
+    base_env = _stack_base_env()
     if harness == "codex":
         # Set the app-server's MCP budget; --remote TUI overrides cannot change it.
         codex = shutil.which("codex")
@@ -484,6 +500,10 @@ def test_native_cli_uploads_a_workspace_file_through_the_omnigent_relay(
             [{"tool_calls": [upload_call]}, {"text": "Shared report.md."}],
             key=f"native-files-{harness}",
             match=upload_prompt,
+            # Codex's approval review quotes the prompt but advertises no relay tools.
+            required_tools=[
+                "mcp__omnigent__sys_upload_file" if harness == "claude" else "mcp__omnigent"
+            ],
         )
         send(upload_prompt)
 
@@ -511,11 +531,7 @@ def test_isolating_runner_keeps_uploads_inside_each_session(tmp_path: Path) -> N
     uploads from its own directory, while a sibling session's existing file is
     unreachable by relative, parent-traversal or absolute path.
     """
-    base_env = {
-        key: value
-        for key, value in os.environ.items()
-        if key in {"PATH", "LANG", "LC_ALL", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR"}
-    }
+    base_env = _stack_base_env()
     with server_runner(tmp_path, base_env=base_env, poll_interval=0.2) as stack:
         stack.start_runner(env={"OMNIGENT_RUNNER_ISOLATE_SESSION": "1"})
         with httpx.Client(
@@ -570,3 +586,60 @@ def test_isolating_runner_keeps_uploads_inside_each_session(tmp_path: Path) -> N
     for path, result in refused.items():
         assert result.startswith("Error: sys_upload_file failed:"), (path, result)
     assert set(stored) == {"own.txt"}, stored
+
+
+def test_cli_style_model_turn_uploads_the_file_it_wrote_to_its_workspace(
+    tmp_path: Path, mock_llm_server_url: str
+) -> None:
+    """
+    ``omnigent chat`` and ``omnigent run`` start a runner that isolates sessions
+    and give each session the launch directory as its workspace. A model turn's
+    ``sys_os_write`` writes there, and its ``sys_upload_file`` shares that file.
+    """
+    model = f"mock-files-cli-{uuid.uuid4().hex[:8]}"
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            _tool_call("write", "sys_os_write", {"path": "report.md", "content": "cli report"}),
+            _tool_call("upload", "sys_upload_file", {"path": "report.md"}),
+            {"text": "Shared report.md."},
+        ],
+        key=model,
+        required_tools=["sys_upload_file"],
+    )
+    with server_runner(tmp_path, base_env=_stack_base_env(), poll_interval=0.2) as stack:
+        # The CLI's runner: its workspace is the launch directory, sessions isolated.
+        stack.start_runner(env={"OMNIGENT_RUNNER_ISOLATE_SESSION": "1"})
+        with httpx.Client(
+            base_url=stack.base_url,
+            trust_env=False,
+            timeout=60,
+            headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+        ) as client:
+            session_id = _model_session(
+                client,
+                runner_id=stack.runner_id,
+                mock_llm_server_url=mock_llm_server_url,
+                model=model,
+                spec_overrides={"os_env": _OS_ENV},
+                metadata={"workspace": str(stack.workspace)},
+            )
+            response_id = send_user_message_to_session(
+                client, session_id=session_id, content="Write the report and share it."
+            )
+            body = poll_session_until_terminal(
+                client, session_id=session_id, response_id=response_id, timeout=120
+            )
+            stored = _session_files(client, session_id)
+            shared = (
+                _file_bytes(client, session_id, stored["report.md"])
+                if "report.md" in stored
+                else None
+            )
+
+    assert body["status"] == "completed", (body.get("status"), body.get("error"))
+    assert (stack.workspace / "report.md").read_text() == "cli report"
+    upload = _outputs_by_call_id(body)["upload"]
+    assert not upload.startswith("Error:"), upload
+    assert json.loads(upload)["filename"] == "report.md", upload
+    assert shared == b"cli report", stored
