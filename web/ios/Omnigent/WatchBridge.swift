@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 import WatchConnectivity
 import WebKit
 
@@ -6,6 +7,7 @@ import WebKit
 @MainActor
 final class WatchBridge: NSObject, WCSessionDelegate {
   static let shared = WatchBridge()
+  private static let logger = Logger(subsystem: "ai.omnigent.ios", category: "watch-credentials")
   private(set) var latest: [String: Any]?
   /// New syncs and sign-out invalidate any older cookie read still in flight.
   private var generation = 0
@@ -47,7 +49,12 @@ final class WatchBridge: NSObject, WCSessionDelegate {
       WCSession.default.isWatchAppInstalled, let latest
     else { return }
     // The system drops a context equal to the last one sent, even to a reinstalled watch app.
-    try? WCSession.default.updateApplicationContext(latest.merging(["sentAt": Date.now]) { $1 })
+    do {
+      try WCSession.default.updateApplicationContext(latest.merging(["sentAt": Date.now]) { $1 })
+    } catch {
+      Self.logger.error(
+        "Watch credential handoff failed (code \((error as NSError).code, privacy: .public))")
+    }
   }
 
   nonisolated func session(

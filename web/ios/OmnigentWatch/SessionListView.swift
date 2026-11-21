@@ -58,6 +58,7 @@ struct SessionListView: View {
       (sessions, groups) = (loaded, loaded.grouped(projects: projects))
       error = nil
     } catch is CancellationError {
+    } catch let failure as URLError where failure.code == .cancelled {
     } catch {
       self.error = error.localizedDescription
     }

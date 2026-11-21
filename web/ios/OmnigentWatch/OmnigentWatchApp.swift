@@ -1,3 +1,4 @@
+import OSLog
 import Security
 import SwiftUI
 import WatchConnectivity
@@ -45,7 +46,8 @@ struct BrandBackground: View {
 /// Receives credentials from the iPhone and keeps them in this watch's Keychain.
 @MainActor @Observable
 final class WatchLink: NSObject, WCSessionDelegate {
-  private var state = WatchCredentialState(credentials: WatchKeychain.load())
+  private static let logger = Logger(subsystem: "ai.omnigent.ios.watch", category: "credentials")
+  private var state = WatchCredentialState(credentials: WatchKeychain.shared.load())
   var credentials: WatchCredentials? { state.credentials }
 
   override init() {
@@ -73,36 +75,11 @@ final class WatchLink: NSObject, WCSessionDelegate {
     else { return }
     Task { @MainActor in
       guard state.apply(data, sentAt: sentAt) else { return }
-      WatchKeychain.save(state.credentials)
+      let status = WatchKeychain.shared.save(state.credentials)
+      if status != errSecSuccess {
+        Self.logger.error(
+          "Watch credential persistence failed (status \(status, privacy: .public))")
+      }
     }
-  }
-}
-
-enum WatchKeychain {
-  private static var query: [String: Any] {
-    [
-      kSecClass as String: kSecClassGenericPassword,
-      kSecAttrService as String: "ai.omnigent.ios.watch",
-      kSecAttrAccount as String: WatchCredentials.contextKey,
-    ]
-  }
-
-  static func load() -> WatchCredentials? {
-    var result: CFTypeRef?
-    let search = query.merging([kSecReturnData as String: true]) { $1 }
-    guard SecItemCopyMatching(search as CFDictionary, &result) == errSecSuccess,
-      let data = result as? Data
-    else { return nil }
-    return try? JSONDecoder().decode(WatchCredentials.self, from: data)
-  }
-
-  static func save(_ credentials: WatchCredentials?) {
-    SecItemDelete(query as CFDictionary)
-    guard let credentials, let data = try? JSONEncoder().encode(credentials) else { return }
-    let item = query.merging([
-      kSecValueData as String: data,
-      kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
-    ]) { $1 }
-    SecItemAdd(item as CFDictionary, nil)
   }
 }

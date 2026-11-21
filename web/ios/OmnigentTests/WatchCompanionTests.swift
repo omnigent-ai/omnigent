@@ -1,3 +1,4 @@
+import Security
 import XCTest
 
 @testable import Omnigent
@@ -32,6 +33,72 @@ final class WatchCompanionTests: XCTestCase {
     var state = WatchCredentialState(credentials: credentials)
     XCTAssertTrue(state.apply(Data("invalid".utf8), sentAt: now))
     XCTAssertNil(state.credentials)
+  }
+
+  func testWatchKeychainRoundTripAndExplicitSignOut() throws {
+    let service = "ai.omnigent.ios.tests.watch.\(UUID().uuidString)"
+    let store = WatchKeychain(service: service)
+    defer { _ = store.save(nil) }
+    XCTAssertNil(store.load())
+    for value in ["first", "renewed"] {
+      let credentials = WatchCredentials(
+        apiURL: URL(string: "https://omnigent.example.com/v1")!, cookie: "session=\(value)")
+      XCTAssertEqual(store.save(credentials), errSecSuccess)
+      XCTAssertEqual(WatchKeychain(service: service).load(), credentials)
+    }
+    let query: [String: Any] = [
+      kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
+      kSecAttrAccount as String: WatchCredentials.contextKey, kSecReturnAttributes as String: true,
+    ]
+    var result: CFTypeRef?
+    XCTAssertEqual(SecItemCopyMatching(query as CFDictionary, &result), errSecSuccess)
+    let attributes = try XCTUnwrap(result as? [String: Any])
+    XCTAssertEqual(
+      attributes[kSecAttrAccessible as String] as? String,
+      kSecAttrAccessibleWhenUnlockedThisDeviceOnly as String)
+    XCTAssertFalse((attributes[kSecAttrSynchronizable as String] as? Bool) ?? false)
+    XCTAssertEqual(store.save(nil), errSecSuccess)
+    XCTAssertEqual(store.save(nil), errSecSuccess)
+    XCTAssertNil(store.load())
+  }
+
+  func testWatchKeychainWriteFailurePreservesSavedCredentials() {
+    let store = WatchKeychain(service: "ai.omnigent.ios.tests.watch.\(UUID().uuidString)")
+    defer { _ = store.save(nil) }
+    let saved = WatchCredentials(
+      apiURL: URL(string: "https://omnigent.example.com/v1")!, cookie: "session=saved")
+    let renewed = WatchCredentials(apiURL: saved.apiURL, cookie: "session=renewed")
+    XCTAssertEqual(store.save(saved), errSecSuccess)
+    for failure in [errSecInteractionNotAllowed, errSecAuthFailed] {
+      XCTAssertEqual(
+        store.save(
+          renewed, update: { _, _ in failure },
+          add: { _, _ in
+            XCTFail("An update failure must not replace the item")
+            return failure
+          },
+          delete: { _ in
+            XCTFail("Renewal must not delete saved credentials")
+            return failure
+          }),
+        failure)
+      XCTAssertEqual(store.load(), saved)
+    }
+    XCTAssertEqual(
+      store.save(nil, delete: { _ in errSecInteractionNotAllowed }), errSecInteractionNotAllowed)
+    XCTAssertEqual(store.load(), saved)
+
+    var updates = 0
+    XCTAssertEqual(
+      store.save(
+        renewed,
+        update: { query, attributes in
+          updates += 1
+          return updates == 1 ? errSecItemNotFound : SecItemUpdate(query, attributes)
+        }, add: { _, _ in errSecDuplicateItem }),
+      errSecSuccess)
+    XCTAssertEqual(updates, 2)
+    XCTAssertEqual(store.load(), renewed)
   }
 
   @MainActor func testOnlyNewestPhoneSyncCanPublishCredentials() async throws {
