@@ -367,6 +367,57 @@ async def test_host_keyed_retry_after_a_failed_wake_of_a_stale_local_tunnel_wake
 
 
 @pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)
+@pytest.mark.parametrize("slice_key", [None, FOREIGN_KEY], ids=["keyless", "foreign-key"])
+async def test_mismatched_key_is_rerouted_without_asking_the_provider(
+    two_replica_stack: Any,
+    managed_wake: Any,
+    db_uri: str,
+    slice_key: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refusal the key already decides never waits on, or fails with, the provider."""
+    arrange, events = managed_wake
+    session_id = await arrange(keyed=True)
+    HostStore(db_uri).upsert_on_connect(HOST_ID, "managed-wake-host", OWNER)
+
+    def provider_down(_host: object, _config: object) -> bool:
+        raise RuntimeError("provider status API down")
+
+    monkeypatch.setattr(orchestration, "host_sandbox_is_running", provider_down)
+
+    response = await two_replica_stack.keyless_client.post(
+        f"/v1/sessions/{session_id}/events", headers=_headers(slice_key), json=MESSAGE
+    )
+
+    assert _wrong_replica(response), response.text
+    assert response.json()["error"]["slice_key"] == HOST_ID
+    assert "resume" not in events, events
+
+
+@pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)
+async def test_host_keyed_request_to_a_live_host_is_refused_when_the_provider_errors(
+    two_replica_stack: Any, managed_wake: Any, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unreadable provider status leaves the live row in charge: refuse, don't restart."""
+    arrange, events = managed_wake
+    session_id = await arrange(keyed=True)
+    HostStore(db_uri).upsert_on_connect(HOST_ID, "managed-wake-host", OWNER)
+
+    def provider_down(_host: object, _config: object) -> bool:
+        raise RuntimeError("provider status API down")
+
+    monkeypatch.setattr(orchestration, "host_sandbox_is_running", provider_down)
+
+    response = await two_replica_stack.tunnel_client.post(
+        f"/v1/sessions/{session_id}/events", headers=_headers(HOST_ID), json=MESSAGE
+    )
+
+    assert _wrong_replica(response), response.text
+    assert "slice_key" not in response.json()["error"]
+    assert "resume" not in events, events
+
+
+@pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)
 async def test_single_replica_is_unaffected_by_a_foreign_key(
     two_replica_stack: Any, managed_wake: Any
 ) -> None:

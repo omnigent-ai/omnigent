@@ -5940,7 +5940,15 @@ async def _managed_host_connected_elsewhere(
     if launch is not None and not launch.settled.is_set():
         return False
     sandbox_config = getattr(app_state, "sandbox_config", None)
-    running = await asyncio.to_thread(host_sandbox_is_running, host, sandbox_config)
+    try:
+        running = await asyncio.to_thread(host_sandbox_is_running, host, sandbox_config)
+    except Exception:  # noqa: BLE001 — an unreadable status is unknown, like no status hook
+        _logger.warning(
+            "Could not read managed host %s sandbox status; trusting its live row",
+            conv.host_id,
+            exc_info=True,
+        )
+        running = None
     return running is not False
 
 
@@ -5987,8 +5995,9 @@ async def _raise_if_managed_wake_misses_host_tunnel(
         return
     keyed = _managed_wake_is_keyed(conv, request)
     routed_key = routed_slice_key(request)
-    connected_elsewhere = await _managed_host_connected_elsewhere(conv, host, app_state)
-    if routed_key == (conv.host_id if keyed else None) and not connected_elsewhere:
+    if routed_key == (
+        conv.host_id if keyed else None
+    ) and not await _managed_host_connected_elsewhere(conv, host, app_state):
         return
     if routed_key != conv.host_id and (keyed or routed_key is None):
         raise WrongReplicaError(
