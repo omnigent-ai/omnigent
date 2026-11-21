@@ -6,6 +6,7 @@ import { HostLabel } from "./HostLabel";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
 import { SettingsLabel } from "@/components/SettingsLabel";
 import {
   Select,
@@ -24,12 +25,13 @@ import {
   IMPORT_RECENT_COUNT_ENTRY,
   IMPORT_RECENT_COUNT_LABEL,
   IMPORT_RECENT_LIMITS,
+  IMPORT_REPLACE_ENTRY,
   IMPORT_RUN_ENTRY,
   IMPORT_SESSION_ID_ENTRY,
   IMPORT_SOURCES,
   importRecentLimitLabel,
 } from "@/pages/settings/search/catalog/import";
-import { SettingsItem } from "@/pages/settings/search/SettingsItem";
+import { SettingsEntryLabel, SettingsItem } from "@/pages/settings/search/SettingsItem";
 import {
   settingsControlProps,
   settingsDescriptionId,
@@ -49,7 +51,8 @@ const ROW_CLASS = "flex flex-wrap items-center justify-between gap-x-6 gap-y-3";
  * Inline (non-modal) import UI for the Settings "Import sessions" section.
  * Imports recent transcripts or one known harness session through the chosen
  * host, then refreshes the sidebar. Already-imported sessions are skipped
- * server-side; progress and results show aggregate counts.
+ * server-side unless a session-by-ID import replaces its earlier copy; progress
+ * and results show aggregate counts.
  */
 export function ImportSessionsPanel() {
   const queryClient = useQueryClient();
@@ -63,6 +66,15 @@ export function ImportSessionsPanel() {
   const [limit, setLimit] = useState(request?.limit ?? 25);
   const [mode, setMode] = useState<ImportMode>(request?.sessionId ? "session" : "recent");
   const [sessionId, setSessionId] = useState(request?.sessionId ?? "");
+  // A run that neither failed nor skipped a session turns replacing off, so a
+  // later import never replaces by accident.
+  const finishedCleanly = result !== null && result.failed === 0 && result.alreadyImported === 0;
+  const [replaceExisting, setReplaceExisting] = useState(
+    request?.force === true && !finishedCleanly,
+  );
+  useEffect(() => {
+    if (finishedCleanly) setReplaceExisting(false);
+  }, [finishedCleanly]);
 
   // Default to the caller's current online machine — the transcripts are read
   // on the host, so there's nothing to import without one.
@@ -78,7 +90,13 @@ export function ImportSessionsPanel() {
     if (mode === "session" && exactSessionId.length === 0) return;
     await start(
       mode === "session"
-        ? { hostId, source, limit, sessionId: exactSessionId }
+        ? {
+            hostId,
+            source,
+            limit,
+            sessionId: exactSessionId,
+            ...(replaceExisting ? { force: true } : {}),
+          }
         : { hostId, source, limit },
       queryClient,
     );
@@ -91,6 +109,7 @@ export function ImportSessionsPanel() {
     setLimit(request.limit);
     setMode(request.sessionId ? "session" : "recent");
     setSessionId(request.sessionId ?? "");
+    setReplaceExisting(request.force === true);
     void start(request, queryClient);
   }
 
@@ -251,6 +270,26 @@ export function ImportSessionsPanel() {
         </div>
       )}
 
+      {mode === "session" && (
+        <div className="border-b border-border py-4">
+          <SettingsItem
+            entry={IMPORT_REPLACE_ENTRY}
+            className="flex items-start justify-between gap-x-6 gap-y-3"
+          >
+            <SettingsEntryLabel entry={IMPORT_REPLACE_ENTRY} className="flex-1" />
+            <Switch
+              {...settingsControlProps(IMPORT_REPLACE_ENTRY)}
+              data-testid="import-replace-toggle"
+              checked={replaceExisting}
+              disabled={importing}
+              onCheckedChange={setReplaceExisting}
+              className="mt-0.5 shrink-0"
+              componentId="settings.import.replace_existing"
+            />
+          </SettingsItem>
+        </div>
+      )}
+
       <SettingsItem entry={IMPORT_RUN_ENTRY} className="flex flex-col">
         <div className="flex justify-end pt-4">
           <Button
@@ -333,7 +372,9 @@ export function ImportSessionsPanel() {
                     Retry failed
                   </Button>
                   <p className="mt-1 text-xs text-muted-foreground">
-                    Retrying re-runs the import; sessions already imported are skipped.
+                    {request?.force === true
+                      ? "Retrying re-runs the replacement."
+                      : "Retrying re-runs the import; sessions already imported are skipped."}
                   </p>
                 </div>
               </div>

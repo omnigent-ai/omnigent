@@ -3247,7 +3247,7 @@ function ImportSection() {
   return (
     <Section
       title="Import sessions"
-      description="Import local chats from a connected machine. Already imported sessions are skipped."
+      description="Import local chats from a connected machine. Already imported sessions are skipped unless you replace one by ID."
     >
       <div className="flex flex-col gap-3">
         <h2 className="text-ui font-medium">Import from a machine</h2>

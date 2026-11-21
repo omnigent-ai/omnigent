@@ -81,6 +81,17 @@ export const IMPORT_SESSION_ID_ENTRY = settingsEntry({
   revealedBy: "import-mode",
 });
 
+export const IMPORT_REPLACE_ENTRY = settingsEntry({
+  id: "import-replace-existing",
+  section: "import",
+  label: "Replace existing snapshot",
+  description:
+    "If this session was already imported, replace that copy with the latest transcript. The old copy's comments, sharing, labels, project, and custom title are removed.",
+  keywords: ["import", "replace", "refresh", "re-import", "update", "snapshot", "session id"],
+  // Only importing one session by its ID can replace an earlier copy.
+  revealedBy: "import-mode",
+});
+
 export const IMPORT_RUN_ENTRY = settingsEntry({
   id: "import-run",
   section: "import",
@@ -110,5 +121,6 @@ export const IMPORT_SETTINGS = [
   IMPORT_HARNESS_ENTRY,
   IMPORT_RECENT_COUNT_ENTRY,
   IMPORT_SESSION_ID_ENTRY,
+  IMPORT_REPLACE_ENTRY,
   IMPORT_RUN_ENTRY,
 ] as const;
