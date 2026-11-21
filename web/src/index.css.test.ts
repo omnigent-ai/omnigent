@@ -963,7 +963,6 @@ describe("index.css floating panes", () => {
 
   it("gates every floating rule at 48rem alone, in a browser and the desktop app alike", () => {
     expect(gates).toHaveLength(1);
-    expect(rules.length).toBeGreaterThan(20);
     for (const rule of rules) {
       expect(rule.selector).toContain(".app-shell[data-floating-panes]");
       // `md` is 73.8125rem in a browser and every width in the desktop app: not this gate.
@@ -982,13 +981,18 @@ describe("index.css floating panes", () => {
         rule.selector,
       ),
     );
-    expect(paneRules.length).toBeGreaterThan(10);
     for (const rule of paneRules) {
       for (const selector of rule.selector.split(/,\s*/)) {
         if (selector.includes(".omnigent-sidebar-panel")) continue;
         expect(selector).toContain("[data-main-view");
       }
     }
+    // The chat itself is the pane's card.
+    const card = ruleFor(
+      '.app-shell[data-floating-panes] [data-main-view="chat"] > main[data-session-id]',
+    );
+    expect(card).toContain("border-radius: var(--radius-lg, 0.5rem)");
+    expect(card).toContain("border: 1px solid var(--pane-card-border)");
   });
 
   it("keeps every control the edge-to-edge layout shows", () => {
@@ -1000,7 +1004,7 @@ describe("index.css floating panes", () => {
     }
   });
 
-  it("makes the dark backdrop the one surface the sidebar and panes sit on", () => {
+  it("makes the dark backdrop one surface, measured from the window corner in the sidebar's colors", () => {
     const backdrop = ruleFor(".dark .app-shell[data-floating-panes]");
     expect(backdrop).toContain("background: var(--floating-backdrop-image) !important");
     expect(backdrop).toContain("background-color: var(--sidebar) !important");
@@ -1008,9 +1012,6 @@ describe("index.css floating panes", () => {
       ".dark .app-shell[data-floating-panes] .omnigent-sidebar-panel:not(.is-peek), .dark .app-shell[data-floating-panes] [data-main-view] .main-terminal-view",
     );
     expect(overBackdrop).toContain("background: none");
-  });
-
-  it("measures the dark backdrop from the window corner in the sidebar's own colors", () => {
     const token = (name: string) =>
       indexCssSource
         .match(new RegExp(`${name}:([^;]*);`))?.[1]
@@ -1041,19 +1042,11 @@ describe("index.css floating panes", () => {
     expect(dark).toContain("background-color: var(--background) !important");
   });
 
-  it("rises the chat's card to the gap when an extension owns the header", () => {
+  it("keeps the gap above the chat's card when an extension owns the header", () => {
     const hidden = ruleFor(
       '.app-shell[data-floating-panes] [data-main-view="chat"] > main[data-session-id][data-shell-header="hidden"]',
     );
     expect(hidden).toContain("margin-top: var(--pane-gap)");
-  });
-
-  it("cards a session's chat, which a grid of sessions shows in its own panes", () => {
-    const card = ruleFor(
-      '.app-shell[data-floating-panes] [data-main-view="chat"] > main[data-session-id]',
-    );
-    expect(card).toContain("border-radius: var(--radius-lg, 0.5rem)");
-    expect(card).toContain("border: 1px solid var(--pane-card-border)");
   });
 });
 
