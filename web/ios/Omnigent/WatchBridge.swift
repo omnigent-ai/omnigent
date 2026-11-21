@@ -8,21 +8,38 @@ import WebKit
 final class WatchBridge: NSObject, WCSessionDelegate {
   static let shared = WatchBridge()
   private static let logger = Logger(subsystem: "ai.omnigent.ios", category: "watch-credentials")
+  private static let pendingSignOutKey = "omnigent.watch.pendingSignOut"
+  private static let lastSentAtKey = "omnigent.watch.lastSentAt"
+  private let defaults: UserDefaults
+  private let transport: (any WatchSessionTransport)?
   private(set) var latest: [String: Any]?
   /// New syncs and sign-out invalidate any older cookie read still in flight.
   private var generation = 0
 
+  init(
+    defaults: UserDefaults = .standard,
+    transport: (any WatchSessionTransport)? = WCSession.isSupported() ? WCSession.default : nil
+  ) {
+    self.defaults = defaults
+    self.transport = transport
+    super.init()
+    if defaults.bool(forKey: Self.pendingSignOutKey) {
+      latest = [WatchCredentials.contextKey: Data()]
+    }
+  }
+
   func start() {
-    guard WCSession.isSupported() else { return }
-    WCSession.default.delegate = self
-    WCSession.default.activate()
+    guard let transport else { return }
+    transport.delegate = self
+    transport.activate()
+    flush()
   }
 
   @discardableResult
   func sync(serverURL: URL?, workspaceID: String? = nil, cookieStore: some WatchCookieStore)
     -> Task<Void, Never>?
   {
-    guard WCSession.isSupported(), let serverURL else { return nil }
+    guard transport != nil, let serverURL else { return nil }
     generation += 1
     let started = generation
     return Task {
@@ -39,18 +56,24 @@ final class WatchBridge: NSObject, WCSessionDelegate {
 
   private func push(_ credentials: WatchCredentials?) {
     let data = credentials.flatMap { try? JSONEncoder().encode($0) } ?? Data()
+    // Persist intent, never credentials, until WatchConnectivity accepts a replacement context.
+    if data.isEmpty { defaults.set(true, forKey: Self.pendingSignOutKey) }
     latest = [WatchCredentials.contextKey: data]
     flush()
   }
 
-  private func flush() {
-    guard WCSession.isSupported(), WCSession.default.delegate === self,
-      WCSession.default.activationState == .activated,
-      WCSession.default.isWatchAppInstalled, let latest
+  func flush(now: Date = .now) {
+    guard let transport, transport.delegate === self,
+      transport.activationState == .activated,
+      transport.isWatchAppInstalled, let latest
     else { return }
     // The system drops a context equal to the last one sent, even to a reinstalled watch app.
+    let previous = defaults.object(forKey: Self.lastSentAtKey) as? Date ?? .distantPast
+    let sentAt = max(now, previous.addingTimeInterval(0.001))
+    defaults.set(sentAt, forKey: Self.lastSentAtKey)
     do {
-      try WCSession.default.updateApplicationContext(latest.merging(["sentAt": Date.now]) { $1 })
+      try transport.updateApplicationContext(latest.merging(["sentAt": sentAt]) { $1 })
+      defaults.removeObject(forKey: Self.pendingSignOutKey)
     } catch {
       Self.logger.error(
         "Watch credential handoff failed (code \((error as NSError).code, privacy: .public))")
@@ -71,6 +94,17 @@ final class WatchBridge: NSObject, WCSessionDelegate {
   nonisolated func sessionDidBecomeInactive(_ session: WCSession) {}
   nonisolated func sessionDidDeactivate(_ session: WCSession) { session.activate() }
 }
+
+@MainActor
+protocol WatchSessionTransport: AnyObject {
+  var delegate: (any WCSessionDelegate)? { get set }
+  var activationState: WCSessionActivationState { get }
+  var isWatchAppInstalled: Bool { get }
+  func activate()
+  func updateApplicationContext(_ applicationContext: [String: Any]) throws
+}
+
+extension WCSession: WatchSessionTransport {}
 
 @MainActor
 protocol WatchCookieStore {

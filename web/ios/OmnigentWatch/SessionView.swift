@@ -15,7 +15,7 @@ struct SessionView: View {
         if conversation.isLoading {
           ProgressView().frame(maxWidth: .infinity)
         } else if conversation.messages.isEmpty {
-          Text("No messages yet").font(.footnote).foregroundStyle(.secondary)
+          Text("No recent messages").font(.footnote).foregroundStyle(.secondary)
         }
         ForEach(conversation.approvals) { ApprovalCard(approval: $0, conversation: conversation) }
       }

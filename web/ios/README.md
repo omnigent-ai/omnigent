@@ -24,7 +24,10 @@ proxy/CORS behavior.
 
 ## Apple Watch
 
-`OmnigentWatch` lists sessions, shows their conversations, and resolves yes/no approvals.
+`OmnigentWatch` lists the 25 most recently updated sessions, shows recent conversation messages,
+and resolves yes/no approvals. Older sessions and full history remain available on the phone.
+The transcript shows up to 12 committed messages, scanning at most 300 recent items past tool
+activity, plus queued inputs.
 After each page load or sign-in renewal the phone sends the server's API root and the cookies
 scoped to it (`WatchBridge`); the watch keeps them in its Keychain and calls the API directly.
 Signing out on the phone signs the watch out. Run the `OmnigentWatch` scheme on a paired

@@ -1,4 +1,5 @@
 import Security
+import WatchConnectivity
 import XCTest
 
 @testable import Omnigent
@@ -102,7 +103,12 @@ final class WatchCompanionTests: XCTestCase {
   }
 
   @MainActor func testOnlyNewestPhoneSyncCanPublishCredentials() async throws {
-    let bridge = WatchBridge()
+    let defaultsName = "WatchCompanionTests.\(UUID().uuidString)"
+    let defaults = try XCTUnwrap(UserDefaults(suiteName: defaultsName))
+    defer { defaults.removePersistentDomain(forName: defaultsName) }
+    let transport = PendingWatchTransport()
+    let bridge = WatchBridge(defaults: defaults, transport: transport)
+    bridge.start()
     let olderCookies = PendingWatchCookies()
     let newerCookies = PendingWatchCookies()
     let older = try XCTUnwrap(
@@ -121,13 +127,47 @@ final class WatchCompanionTests: XCTestCase {
     let latest = try JSONDecoder().decode(WatchCredentials.self, from: data)
     XCTAssertEqual(latest.apiURL.absoluteString, "https://new.example.com/v1?o=2")
     XCTAssertEqual(latest.cookie, "new=1")
+    transport.activationState = .activated
+    bridge.flush(now: now)
+    let signedIn = try XCTUnwrap(transport.contexts.last)
+    XCTAssertEqual(signedIn[WatchCredentials.contextKey] as? Data, data)
 
+    transport.activationState = .notActivated
     let signingOut = try XCTUnwrap(
       bridge.sync(serverURL: URL(string: "https://new.example.com"), cookieStore: newerCookies))
     bridge.signOut()
     newerCookies.cookies.continuation.yield([cookie("new", domain: "new.example.com", path: "/")])
     await signingOut.value
     XCTAssertEqual(bridge.latest?[WatchCredentials.contextKey] as? Data, Data())
+    XCTAssertEqual(transport.contexts.count, 1, "Inactive handoffs must remain pending")
+
+    let restored = WatchBridge(defaults: defaults, transport: transport)
+    restored.start()
+    XCTAssertEqual(restored.latest?[WatchCredentials.contextKey] as? Data, Data())
+    transport.activationState = .activated
+    transport.failDelivery = true
+    restored.flush(now: now.addingTimeInterval(-1))
+    let failedSignOut = try XCTUnwrap(transport.contexts.last)
+
+    transport.activationState = .notActivated
+    let retried = WatchBridge(defaults: defaults, transport: transport)
+    retried.start()
+    XCTAssertEqual(retried.latest?[WatchCredentials.contextKey] as? Data, Data())
+    transport.activationState = .activated
+    transport.failDelivery = false
+    retried.flush(now: now.addingTimeInterval(-2))
+    let signedOut = try XCTUnwrap(transport.contexts.last)
+    XCTAssertEqual(signedOut[WatchCredentials.contextKey] as? Data, Data())
+    XCTAssertGreaterThan(
+      try XCTUnwrap(failedSignOut["sentAt"] as? Date),
+      try XCTUnwrap(signedIn["sentAt"] as? Date))
+    XCTAssertGreaterThan(
+      try XCTUnwrap(signedOut["sentAt"] as? Date),
+      try XCTUnwrap(failedSignOut["sentAt"] as? Date))
+    XCTAssertNil(WatchBridge(defaults: defaults, transport: transport).latest)
+    let sentCount = transport.contexts.count
+    bridge.flush()
+    XCTAssertEqual(transport.contexts.count, sentCount, "Only the active delegate may send")
   }
 
   @MainActor func testPollingPreservesApprovalFailureUntilSuccessfulResponse() async throws {
@@ -218,7 +258,7 @@ final class WatchCompanionTests: XCTestCase {
     XCTAssertEqual(learned?.apiURL.absoluteString, "https://omnigent.example.com/omnigent/v1?o=7")
   }
 
-  func testClientAddressesTheAPIWithCookieAndHostKey() {
+  @MainActor func testClientAddressesTheAPIWithCookieAndHostKey() async throws {
     let client = WatchClient(
       credentials: WatchCredentials(
         apiURL: URL(string: "https://omnigent.example.com/v1")!, cookie: "session=1"))
@@ -232,6 +272,100 @@ final class WatchCompanionTests: XCTestCase {
     XCTAssertNil(
       client.request("sessions", host: nil).value(
         forHTTPHeaderField: "X-Databricks-Omnigent-Slice-Key"))
+
+    let cases: [(metadata: String, host: String?, succeeds: Bool)] = [
+      (#"{"parent_session_id":"parent"}"#, "inherited-host", true),
+      (#"{"host_id":"child-host","parent_session_id":"parent"}"#, "child-host", true),
+      (#"{"labels":{"omnigent.sandbox.requested_host_id":"sandbox-host"}}"#, "sandbox-host", true),
+      (#"{"host_id":null,"parent_session_id":null}"#, nil, true),
+      (#"{"parent_session_id":"child"}"#, nil, false),
+      ("missing", nil, false),
+    ]
+    for testCase in cases {
+      var resolved = false
+      let pending =
+        #"[{"elicitation_id":"e1","params":{"message":"Run it?","target_session_id":"child"}}]"#
+      let server = try MockHTTPServer(requestHandler: { request in
+        switch (request.method, URLComponents(string: request.path)?.path) {
+        case ("GET", "/v1/sessions/child"):
+          if testCase.metadata == "missing" { return (404, [:], Data()) }
+          return (200, [:], Data(testCase.metadata.utf8))
+        case ("GET", "/v1/sessions/parent"):
+          return (200, [:], Data(#"{"parent_session_id":"grandparent"}"#.utf8))
+        case ("GET", "/v1/sessions/grandparent"):
+          return (200, [:], Data(#"{"host_id":"inherited-host"}"#.utf8))
+        case ("POST", "/v1/sessions/child/elicitations/e1/resolve"):
+          XCTAssertTrue(testCase.succeeds, "Unresolved routing must not POST an approval")
+          XCTAssertEqual(request.headers["x-databricks-omnigent-slice-key"], testCase.host)
+          XCTAssertEqual(request.headers["cookie"], "session=test")
+          resolved = true
+          return (200, [:], Data())
+        case ("GET", "/v1/sessions/s1"):
+          return (200, [:], Data("{\"pending_elicitations\":\(resolved ? "[]" : pending)}".utf8))
+        case ("GET", "/v1/sessions/s1/items"):
+          return (200, [:], Data(#"{"data":[]}"#.utf8))
+        default:
+          XCTFail("Unexpected watch request: \(request.method) \(request.path)")
+          return (404, [:], Data())
+        }
+      })
+      let session = try WatchClient.decoder.decode(
+        WatchSession.self,
+        from: Data(#"{"id":"s1","status":"running","host_id":"displayed-host"}"#.utf8))
+      let conversation = WatchConversation(
+        session: session,
+        client: WatchClient(
+          credentials: WatchCredentials(
+            apiURL: URL(string: "http://127.0.0.1:\(server.port)/v1")!, cookie: "session=test")))
+      await conversation.load()
+      let approval = try XCTUnwrap(conversation.approvals.first)
+      await conversation.resolve(approval, accept: true)
+      XCTAssertEqual(conversation.error == nil, testCase.succeeds, testCase.metadata)
+      XCTAssertEqual(conversation.approvals.isEmpty, testCase.succeeds, testCase.metadata)
+    }
+  }
+
+  @MainActor func testToolHeavyTranscriptBackfillsVisibleMessages() async throws {
+    let tools = (1...35).reversed().map { ["id": "tool-\($0)", "type": "function_call"] }
+    let olderItems: [[String: Any]] =
+      Array(tools.suffix(5)) + [
+        ["id": "failure", "type": "error", "message": "Task failed"],
+        ["id": "reply", "type": "message", "role": "assistant", "content": [["text": "Working"]]],
+        [
+          "id": "question", "type": "message", "role": "user",
+          "content": [["text": "Please check"]],
+        ],
+      ]
+    let newestPage = try JSONSerialization.data(withJSONObject: [
+      "data": Array(tools.prefix(30)), "last_id": "tool-6", "has_more": true,
+    ])
+    let olderPage = try JSONSerialization.data(withJSONObject: [
+      "data": olderItems, "last_id": "question", "has_more": false,
+    ])
+    let server = try MockHTTPServer(requestHandler: { request in
+      let url = URLComponents(string: request.path)
+      switch url?.path {
+      case "/v1/sessions/s1": return (200, [:], Data(#"{"status":"running"}"#.utf8))
+      case "/v1/sessions/s1/items":
+        let cursor = url?.queryItems?.first { $0.name == "after" }?.value
+        XCTAssertTrue(cursor == nil || cursor == "tool-6")
+        return (200, [:], cursor == nil ? newestPage : olderPage)
+      default:
+        XCTFail("Unexpected watch request: \(request.path)")
+        return (404, [:], Data())
+      }
+    })
+    let session = try WatchClient.decoder.decode(
+      WatchSession.self, from: Data(#"{"id":"s1","status":"running"}"#.utf8))
+    let conversation = WatchConversation(
+      session: session,
+      client: WatchClient(
+        credentials: WatchCredentials(
+          apiURL: URL(string: "http://127.0.0.1:\(server.port)/v1")!, cookie: "session=test")))
+    await conversation.load()
+    XCTAssertNil(conversation.error)
+    XCTAssertEqual(conversation.messages.map(\.id), ["question", "reply", "error:failure"])
+    XCTAssertEqual(conversation.messages.map(\.text), ["Please check", "Working", "Task failed"])
   }
 
   func testClientRejectsRedirectsWithoutForwardingCredentials() async throws {
@@ -321,7 +455,8 @@ final class WatchCompanionTests: XCTestCase {
        "pending_inputs": [
          {"pending_id": "p1", "content": [{"type": "input_text", "text": "queued"}]},
          {"pending_id": "p2", "content": [{"type": "input_text", "text": "hello"}]},
-         {"pending_id": "p3", "content": [{"type": "input_text", "text": "ok"}]}
+         {"pending_id": "p3", "content": [{"type": "input_text", "text": "ok"}]},
+         {"pending_id": "p4", "content": [{"type": "input_text", "text": "<system-reminder>queued</system-reminder>"}]}
        ],
        "pending_elicitations": [
          {"elicitation_id": "e1", "params": {"mode": "form", "message": "Run it?",
@@ -340,6 +475,8 @@ final class WatchCompanionTests: XCTestCase {
         WatchMessage(id: "pending:p1", isUser: true, text: "queued"),
         WatchMessage(id: "pending:p2", isUser: true, text: "hello"),
         WatchMessage(id: "pending:p3", isUser: true, text: "ok"),
+        WatchMessage(
+          id: "pending:p4", isUser: true, text: "<system-reminder>queued</system-reminder>"),
       ])
     XCTAssertEqual(snapshot.pendingElicitations?.map(\.isBinary), [true, false, false, false])
 
@@ -352,7 +489,14 @@ final class WatchCompanionTests: XCTestCase {
         {"id": "r1", "type": "message", "role": "user", "content": [{"type": "input_text", "text": "<system-reminder>\\nnote\\n</system-reminder>"}]},
         {"id": "r2", "type": "message", "role": "user", "content": [{"type": "input_text", "text": "<system-reminder>a</system-reminder>\\n ok"}]},
         {"id": "m1", "type": "message", "role": "user", "content": [{"type": "input_text", "text": " hello "}]},
-        {"id": "m1r", "type": "message", "role": "user", "content": [{"type": "input_text", "text": "<system-reminder>x</system-reminder>\\nhello"}]}
+        {"id": "m1r", "type": "message", "role": "user", "content": [{"type": "input_text", "text": "<system-reminder>x</system-reminder>\\nhello"}]},
+        {"id": "authored", "type": "message", "role": "user", "user_authored": true, "content": [{"text": "<system-reminder>authored</system-reminder>"}]},
+        {"id": "attributed", "type": "message", "role": "user", "created_by": "user@example.test", "content": [{"text": "<system-reminder>attributed</system-reminder>"}]},
+        {"id": "assistant", "type": "message", "role": "assistant", "content": [{"text": "<system-reminder>quoted</system-reminder>"}]},
+        {"id": "repeat1", "type": "message", "role": "user", "user_authored": true, "content": [{"text": "same"}]},
+        {"id": "repeat2", "type": "message", "role": "user", "user_authored": true, "content": [{"text": "same"}]},
+        {"id": "bare1", "type": "message", "role": "user", "content": [{"text": "legacy"}]},
+        {"id": "bare2", "type": "message", "role": "user", "content": [{"text": "legacy"}]}
       ]}
       """
     let page = try WatchClient.decoder.decode(WatchPage<WatchItem>.self, from: Data(items.utf8))
@@ -363,6 +507,16 @@ final class WatchCompanionTests: XCTestCase {
         WatchMessage(id: "error:x1", isUser: false, text: "workspace gone"),
         WatchMessage(id: "r2", isUser: true, text: "ok"),
         WatchMessage(id: "m1", isUser: true, text: "hello"),
+        WatchMessage(
+          id: "authored", isUser: true, text: "<system-reminder>authored</system-reminder>"),
+        WatchMessage(
+          id: "attributed", isUser: true, text: "<system-reminder>attributed</system-reminder>"),
+        WatchMessage(
+          id: "assistant", isUser: false, text: "<system-reminder>quoted</system-reminder>"),
+        WatchMessage(id: "repeat1", isUser: true, text: "same"),
+        WatchMessage(id: "repeat2", isUser: true, text: "same"),
+        WatchMessage(id: "bare1", isUser: true, text: "legacy"),
+        WatchMessage(id: "bare2", isUser: true, text: "legacy"),
       ])
     // Both an older repeat and a repeat of the last user message remain visible while queued.
     XCTAssertEqual(
@@ -379,6 +533,22 @@ final class WatchCompanionTests: XCTestCase {
     if secure { properties[.secure] = "TRUE" }
     if let expires { properties[.expires] = expires }
     return HTTPCookie(properties: properties)!
+  }
+}
+
+@MainActor
+private final class PendingWatchTransport: WatchSessionTransport {
+  weak var delegate: (any WCSessionDelegate)?
+  var activationState = WCSessionActivationState.notActivated
+  var isWatchAppInstalled = true
+  var failDelivery = false
+  var contexts: [[String: Any]] = []
+
+  func activate() {}
+
+  func updateApplicationContext(_ applicationContext: [String: Any]) throws {
+    contexts.append(applicationContext)
+    if failDelivery { throw URLError(.notConnectedToInternet) }
   }
 }
 

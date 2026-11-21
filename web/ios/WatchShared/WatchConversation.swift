@@ -35,10 +35,9 @@ final class WatchConversation {
     ]
     do {
       async let snapshot: WatchSnapshot = client.get(path, snapshotQuery, host: session.hostId)
-      async let items: WatchPage<WatchItem> = client.get(
-        path + "/items", ["order": "desc", "limit": "30"], host: session.hostId)
-      let (state, page) = try await (snapshot, items)
-      messages = state.messages(items: page.data)
+      async let items = recentItems(path + "/items")
+      let (state, transcript) = try await (snapshot, items)
+      messages = state.messages(items: transcript)
       approvals = (state.pendingElicitations ?? []).filter { !answered.contains($0.id) }
       // Only a poll begun after this failure can confirm it was resolved elsewhere.
       if let failureBeforeLoad, failureBeforeLoad == resolveError,
@@ -57,16 +56,32 @@ final class WatchConversation {
     isLoading = false
   }
 
+  private func recentItems(_ path: String) async throws -> [WatchItem] {
+    var query = ["order": "desc", "limit": "30"]
+    var items: [WatchItem] = []
+    var cursors: Set<String> = []
+    // Bound polling work even when hundreds of tool/reasoning items precede visible messages.
+    for _ in 0..<10 {
+      let page: WatchPage<WatchItem> = try await client.get(path, query, host: session.hostId)
+      items += page.data
+      guard items.reversed().bubbles.count < 12, page.hasMore == true, !page.data.isEmpty,
+        let cursor = page.lastId, cursors.insert(cursor).inserted
+      else { break }
+      query["after"] = cursor
+    }
+    return items
+  }
+
   func resolve(_ approval: WatchElicitation, accept: Bool) async {
     let target = approval.params.targetSessionId ?? session.id
     isBusy = true
     defer { isBusy = false }
     do {
-      // A sub-agent's prompt may live on another host, so only the session's own uses its key.
+      let host = try await client.routingHost(for: target)
       try await client.post(
         "sessions/\(target)/elicitations/\(approval.id)/resolve",
         ["action": accept ? "accept" : "decline"],
-        host: target == session.id ? session.hostId : nil)
+        host: host)
       resolveError = nil
       answered.insert(approval.id)
       approvals.removeAll { $0.id == approval.id }

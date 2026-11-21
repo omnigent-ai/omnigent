@@ -28,6 +28,8 @@ struct WatchCredentialState {
 
 struct WatchPage<Element: Decodable & Sendable>: Decodable, Sendable {
   let data: [Element]
+  let lastId: String?
+  let hasMore: Bool?
 }
 
 struct WatchProject: Decodable, Sendable {
@@ -85,6 +87,9 @@ struct WatchSnapshot: Decodable, Sendable {
   struct TaskError: Decodable, Sendable { let message: String? }
 
   let status: String?
+  let hostId: String?
+  let parentSessionId: String?
+  let labels: [String: String]?
   let lastTaskError: TaskError?
   let pendingElicitations: [WatchElicitation]?
   let pendingInputs: [WatchItem]?
@@ -107,12 +112,22 @@ struct WatchItem: Decodable, Sendable {
   let content: [Part]?
   let message: String?
   let isMeta: Bool?
+  let userAuthored: Bool?
+  let createdBy: String?
 
-  /// The visible text, without the `<system-reminder>` blocks Claude Code injects into user turns.
+  private var rawText: String { (content ?? []).compactMap(\.text).joined(separator: "\n") }
+
+  var isInjectedReminder: Bool {
+    role == "user" && pendingId == nil && userAuthored != true && (createdBy ?? "").isEmpty
+      && rawText.contains("<system-reminder>")
+  }
+
+  /// Strip injected reminders, but preserve literal markup in authored and assistant messages.
   var text: String {
-    (content ?? []).compactMap(\.text).joined(separator: "\n")
-      .replacing(#/<system-reminder>[\s\S]*?</system-reminder>/#, with: "")
-      .trimmingCharacters(in: .whitespacesAndNewlines)
+    let visible =
+      isInjectedReminder
+      ? rawText.replacing(#/<system-reminder>[\s\S]*?</system-reminder>/#, with: "") : rawText
+    return visible.trimmingCharacters(in: .whitespacesAndNewlines)
   }
 
   /// The chat bubble for a message or a failed turn; nil for tool calls and empty turns.
@@ -132,8 +147,10 @@ struct WatchItem: Decodable, Sendable {
 extension Sequence<WatchItem> {
   /// The chat bubbles in order. Claude Code re-records a prompt behind injected context; show it once.
   var bubbles: [WatchMessage] {
-    compactMap(\.bubble).reduce(into: []) { shown, bubble in
-      guard !(bubble.isUser && shown.last?.isUser == true && shown.last?.text == bubble.text)
+    reduce(into: []) { shown, item in
+      guard let bubble = item.bubble else { return }
+      guard
+        !(item.isInjectedReminder && shown.last?.isUser == true && shown.last?.text == bubble.text)
       else { return }
       shown.append(bubble)
     }
@@ -173,11 +190,14 @@ struct WatchElicitation: Decodable, Identifiable, Sendable {
 enum WatchError: LocalizedError, Equatable {
   case signedOut
   case status(Int)
+  case routingUnavailable
 
   var errorDescription: String? {
     switch self {
     case .signedOut: "Open Omnigent on your iPhone to sign in again."
     case .status(let code): "The server returned HTTP \(code)."
+    case .routingUnavailable:
+      "Couldn't find this session's host. Open it on your iPhone to respond."
     }
   }
 }
@@ -197,6 +217,31 @@ struct WatchClient: Sendable {
   }()
 
   let credentials: WatchCredentials
+
+  /// A hostless child uses its nearest host-bound ancestor, as in the web client.
+  func routingHost(for sessionID: String) async throws -> String? {
+    var current = sessionID
+    var visited: Set<String> = []
+    for _ in 0..<16 {
+      guard visited.insert(current).inserted else { throw WatchError.routingUnavailable }
+      let state: WatchSnapshot = try await get(
+        "sessions/\(current)",
+        [
+          "include_items": "false", "include_liveness": "false", "include_live_status": "false",
+          "include_usage": "false",
+        ])
+      for host in [state.hostId, state.labels?["omnigent.sandbox.requested_host_id"]] {
+        if let host, !host.isEmpty { return host }
+      }
+      let parent =
+        state.parentSessionId ?? state.labels?["omnigent.side_chat.source_id"]
+        ?? (state.labels?["omnigent.side_chat"] == "1"
+          ? state.labels?["omnigent.fork.source_id"] : nil)
+      guard let parent, !parent.isEmpty else { return nil }
+      current = parent
+    }
+    throw WatchError.routingUnavailable
+  }
 
   func get<Response: Decodable>(
     _ path: String, _ query: [String: String] = [:], host: String? = nil
