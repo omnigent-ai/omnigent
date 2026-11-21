@@ -28,7 +28,11 @@ import {
   type StoreCredentialResult,
   type StoreCredentialInput,
 } from "@/hooks/useHosts";
-import { harnessCredentialAdoptFamilies } from "@/lib/harnessSetup";
+import { harnessCredentialAdoptFamilies, MIN_TMUX_VERSION } from "@/lib/harnessSetup";
+import {
+  SETTINGS_NO_TOOLTIP,
+  useSettingsOverlayParts,
+} from "@/pages/settings/search/settingsOwnership";
 
 export function HarnessCredentialForm({
   harness,
@@ -50,6 +54,8 @@ export function HarnessCredentialForm({
 }) {
   // What the user sees in toasts — the friendly name, not the canonical id.
   const display = label ?? harness;
+  // Inside Settings the form's controls are parts of the fix dialog's opener; elsewhere they keep their names.
+  const parts = useSettingsOverlayParts();
   const store = useStoreCredential(host?.host_id ?? "");
   // Detection is only meaningful for a live host and this open form.
   const { data: detected } = useDetectedCredentials(host?.host_id, !!host);
@@ -84,7 +90,12 @@ export function HarnessCredentialForm({
         // "ready" then would contradict the still-yellow dot. Only close the
         // form when the harness actually turned ready, so a not-ready result
         // keeps the options visible to try another.
-        const ready = result.configured_harnesses[harness] === true;
+        const availability = result.configured_harnesses[harness];
+        const ready = availability === true;
+        // The host reports "tmux-unavailable" only for an otherwise ready native
+        // harness, so the credential worked and tmux is what's left. Close the
+        // form and let the parent show the tmux step.
+        const onlyTmuxMissing = availability === "tmux-unavailable";
         // Clear the secret fields so a saved value doesn't linger in the input
         // (the form stays open on a not-ready result to try another option).
         setApiKey("");
@@ -92,6 +103,11 @@ export function HarnessCredentialForm({
         setGatewayKey("");
         if (ready) {
           showToast(`${display} is ready on ${host.name}.`);
+          onDone(result);
+        } else if (onlyTmuxMissing) {
+          showToast(
+            `Saved. ${display} still needs tmux ${MIN_TMUX_VERSION} or newer on ${host.name}.`,
+          );
           onDone(result);
         } else {
           showToast(
@@ -174,8 +190,14 @@ export function HarnessCredentialForm({
             onChange={(e) => setApiKey(e.target.value)}
             data-testid="harness-credential-key"
             className="h-8 font-mono text-sm"
+            {...parts.control("apiKey", { ...SETTINGS_NO_TOOLTIP, outside: {} })}
           />
-          <SaveButton busy={busy} disabled={!apiKey.trim()} testId="harness-credential-save" />
+          <SaveButton
+            part="saveKey"
+            busy={busy}
+            disabled={!apiKey.trim()}
+            testId="harness-credential-save"
+          />
         </form>
       </CredentialOption>
     ),
@@ -209,6 +231,7 @@ export function HarnessCredentialForm({
             value={gatewayUrl}
             onChange={(e) => setGatewayUrl(e.target.value)}
             className="h-8 text-sm"
+            {...parts.control("gatewayUrl", { ...SETTINGS_NO_TOOLTIP, outside: {} })}
           />
           <div className="flex items-center gap-2">
             <Input
@@ -218,8 +241,13 @@ export function HarnessCredentialForm({
               value={gatewayKey}
               onChange={(e) => setGatewayKey(e.target.value)}
               className="h-8 font-mono text-sm"
+              {...parts.control("gatewayKey", { ...SETTINGS_NO_TOOLTIP, outside: {} })}
             />
-            <SaveButton busy={busy} disabled={!gatewayUrl.trim() || !gatewayKey.trim()} />
+            <SaveButton
+              part="saveGateway"
+              busy={busy}
+              disabled={!gatewayUrl.trim() || !gatewayKey.trim()}
+            />
           </div>
         </form>
       </CredentialOption>
@@ -263,14 +291,17 @@ function CredentialOption({
 /** Save button whose disabled state stays a light, clearly-inert outline
  *  (rather than a heavy dark fill that reads as an error). */
 function SaveButton({
+  part,
   busy,
   disabled,
   testId,
 }: {
+  part: "saveKey" | "saveGateway";
   busy: boolean;
   disabled: boolean;
   testId?: string;
 }) {
+  const parts = useSettingsOverlayParts();
   return (
     <Button
       type="submit"
@@ -280,6 +311,7 @@ function SaveButton({
       variant={disabled ? "outline" : "default"}
       data-testid={testId}
       className="shrink-0"
+      {...parts.control(part, { ...SETTINGS_NO_TOOLTIP, outside: {} })}
     >
       Save
     </Button>
@@ -310,6 +342,7 @@ function AdoptRow({
   busy: boolean;
   onUse: () => void;
 }) {
+  const parts = useSettingsOverlayParts();
   return (
     <div
       className="flex items-center gap-2 rounded bg-emerald-50 px-2 py-1.5 dark:bg-emerald-500/10"
@@ -318,7 +351,13 @@ function AdoptRow({
       <span className="flex-1 text-sm">
         Found <code className="font-mono">{detected.source}</code> on this host.
       </span>
-      <Button type="button" size="sm" loading={busy} onClick={onUse}>
+      <Button
+        type="button"
+        size="sm"
+        loading={busy}
+        onClick={onUse}
+        {...parts.control("adoptCredential", { ...SETTINGS_NO_TOOLTIP, outside: {} })}
+      >
         Use it
       </Button>
     </div>

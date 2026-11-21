@@ -58,12 +58,15 @@ class SandboxProviderMetadata:
         provider-specific ``sandbox.<name>`` config block.
     :param managed_token_ttl_s: Optional default managed launch-token
         lifetime in seconds.
+    :param manages_profiles: Advertise profile support without importing or
+        constructing the launcher. Must match its ``manages_profiles`` capability.
     """
 
     name: str
     launcher_class: str
     config_model: type[object] | None = None
     managed_token_ttl_s: int | None = None
+    manages_profiles: bool = False
 
 
 @dataclass(frozen=True)
@@ -139,9 +142,8 @@ def _builtin_contribution() -> SandboxProviderContribution:
                 name="lakebox",
                 launcher_class="omnigent.onboarding.sandboxes.lakebox:LakeboxLauncher",
             ),
-            # OSS Databricks Sandbox provider over the REST command-execution
-            # API (no SSH). Distinct from `lakebox`, whose launcher ships only
-            # in the internal build.
+            # Databricks Sandbox provider over the REST command-execution API (no
+            # SSH). Distinct from `lakebox`.
             "databricks": SandboxProviderMetadata(
                 name="databricks",
                 launcher_class=(
@@ -210,6 +212,15 @@ def _builtin_contribution() -> SandboxProviderContribution:
                     "omnigent.onboarding.sandboxes.agent_sandbox:AgentSandboxLauncher"
                 ),
                 managed_token_ttl_s=7 * 24 * 3600,
+            ),
+            # No static managed_token_ttl_s: the TTL is derived from the
+            # (operator-overridable) MicroVM lifetime at config-parse time via
+            # lambda_microvm.managed_token_ttl_s(), mirroring cwsandbox/e2b.
+            "lambda_microvm": SandboxProviderMetadata(
+                name="lambda_microvm",
+                launcher_class=(
+                    "omnigent.onboarding.sandboxes.lambda_microvm:LambdaMicroVMSandboxLauncher"
+                ),
             ),
         },
     )

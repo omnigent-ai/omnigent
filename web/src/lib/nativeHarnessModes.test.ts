@@ -3,14 +3,46 @@ import { describe, expect, it } from "vitest";
 import {
   canonicalNativeHarness,
   harnessAccountKey,
+  nativeDefaultPermissionMode,
+  nativePermissionOptions,
   permissionModeConcept,
 } from "./nativeHarnessModes";
+
+describe("nativePermissionOptions", () => {
+  it.each([
+    [
+      "claude-native",
+      ["default", "auto", "acceptEdits", "plan", "dontAsk", "bypassPermissions"],
+      "default",
+    ],
+    [
+      "codex-native",
+      ["default", "ask-for-approval", "approve-for-me", "full-access", "read-only", "bypass"],
+      "default",
+    ],
+    ["cursor-native", ["default", "auto-review", "plan", "ask", "yolo"], "default"],
+    ["antigravity-native", ["default", "skip"], "default"],
+    ["devin-native", ["normal", "accept-edits", "smart", "dangerous"], "normal"],
+    ["unknown-harness", [], null],
+    [null, [], null],
+    [undefined, [], null],
+  ] as const)(
+    "returns the create-time permission vocabulary and default for %s",
+    (harness, values, defaultMode) => {
+      const options = nativePermissionOptions(harness);
+      expect(options.map((option) => option.value).sort()).toEqual([...values].sort());
+      expect(nativeDefaultPermissionMode(harness)).toBe(defaultMode);
+    },
+  );
+});
 
 describe("permissionModeConcept", () => {
   it("maps Claude and Codex vocabularies onto shared concepts", () => {
     expect(permissionModeConcept("claude-native", "default")).toBe("manual");
     expect(permissionModeConcept("claude-native", "plan")).toBe("read-only");
-    expect(permissionModeConcept("codex-native", "default")).toBe("automatic");
+    expect(permissionModeConcept("codex-native", "default")).toBe("manual");
+    expect(permissionModeConcept("codex-native", "ask-for-approval")).toBe("manual");
+    expect(permissionModeConcept("codex-native", "approve-for-me")).toBe("automatic");
     expect(permissionModeConcept("codex-native", "read-only")).toBe("read-only");
     expect(permissionModeConcept("codex-native", "full-access")).toBe("full-access");
     expect(permissionModeConcept("codex-native", "bypass")).toBe("full-access");

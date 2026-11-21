@@ -2,10 +2,17 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { showToast } from "@/components/ui/toast";
 import { AGENT_BROWSER_TAB_ID, browserViewId } from "@/lib/browserTabs";
 import { writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
-import { maybeOpenLinkInApp, onInAppLinkOpen, parseHttpUrl } from "@/lib/openLinkInApp";
+import type { BrowserNavigationResult } from "@/lib/nativeBridge";
+import { maybeOpenLinkInApp, onInAppLinkOpen, openLink, parseHttpUrl } from "@/lib/openLinkInApp";
 import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
+vi.mock("@/hooks/useHosts", () => ({ fetchHosts: vi.fn(async () => []) }));
+
+const getSessionSlim = vi.fn();
+vi.mock("@/lib/sessionsApi", () => ({
+  getSessionSlim: (...args: unknown[]) => getSessionSlim(...args),
+}));
 
 const CONV = "conv-1";
 const URL_ = "https://example.com/page";
@@ -17,6 +24,11 @@ let surfaced: { conversationId: string; tabId: string }[];
 let unsubscribe: () => void;
 
 beforeEach(() => {
+  getSessionSlim.mockReset().mockImplementation(async (id: string) => ({
+    id,
+    hostId: "local-host",
+    parentSessionId: null,
+  }));
   openOrNavigate = vi.fn().mockResolvedValue({ ok: true });
   hasView = vi.fn().mockResolvedValue({ exists: false });
   closeView = vi.fn().mockResolvedValue({ ok: true });
@@ -53,16 +65,20 @@ it.each([true, false])(
       vi.stubGlobal("crypto", { getRandomValues: crypto.getRandomValues.bind(crypto) });
     }
     expect(maybeOpenLinkInApp(CONV, URL_)).toBe(true);
-    expect(openOrNavigate).toHaveBeenCalledOnce();
-    // Model-authored links get the agent navigation policy (no internal hosts).
+    expect(surfaced).toEqual([]);
+    await vi.waitFor(() => expect(openOrNavigate).toHaveBeenCalledOnce());
     const firstViewId = openOrNavigate.mock.calls[0][0];
     expect(firstViewId).toMatch(/^browser-tab:conv-1:[^:]+$/);
-    expect(openOrNavigate).toHaveBeenCalledWith(firstViewId, URL_, undefined, { agent: true });
-    expect(surfaced).toEqual([]);
+    expect(openOrNavigate).toHaveBeenCalledWith(firstViewId, URL_, undefined, {
+      agent: true,
+      sourceHostId: "local-host",
+      sessionHostProtocol: 1,
+    });
     await vi.waitFor(() =>
       expect(surfaced).toEqual([{ conversationId: CONV, tabId: firstViewId.split(":")[2] }]),
     );
     expect(maybeOpenLinkInApp(CONV, "https://example.com/other")).toBe(true);
+    await vi.waitFor(() => expect(openOrNavigate).toHaveBeenCalledTimes(2));
     const secondViewId = openOrNavigate.mock.calls[1][0];
     expect(secondViewId).not.toBe(firstViewId);
     await vi.waitFor(() => expect(surfaced).toHaveLength(2));
@@ -119,7 +135,7 @@ it("coalesces repeated clicks before the first navigation is accepted", async ()
 
   maybeOpenLinkInApp(CONV, URL_);
   maybeOpenLinkInApp(CONV, URL_);
-  expect(openOrNavigate).toHaveBeenCalledOnce();
+  await vi.waitFor(() => expect(openOrNavigate).toHaveBeenCalledOnce());
   accept({ ok: true });
   await vi.waitFor(() => expect(surfaced).toHaveLength(1));
 });
@@ -245,4 +261,79 @@ it.each([
   ["http://[", null],
 ])("parseHttpUrl(%j) keeps only http(s) URLs", (href, expected) => {
   expect(parseHttpUrl(href)?.href ?? null).toBe(expected);
+});
+
+it("omits host options when the owning session has no resolvable host", async () => {
+  getSessionSlim.mockRejectedValue(new Error("host unavailable"));
+  maybeOpenLinkInApp(CONV, URL_);
+  await vi.waitFor(() =>
+    expect(openOrNavigate).toHaveBeenCalledWith(expect.any(String), URL_, undefined, {
+      agent: true,
+    }),
+  );
+  expect(getSessionSlim).toHaveBeenCalledWith(CONV);
+});
+
+it.each([false, true])(
+  "resolves the current host for a new link after the session moves (during consent: %s)",
+  async (movesDuringConsent) => {
+    let hostId = "local-host";
+    getSessionSlim.mockImplementation(async (id: string) => ({
+      id,
+      hostId,
+      parentSessionId: null,
+    }));
+    maybeOpenLinkInApp(CONV, "http://127.0.0.1:5173/before");
+    await vi.waitFor(() => expect(surfaced).toHaveLength(1));
+    hostId = "remote-host";
+    let answerConsent!: (result: BrowserNavigationResult) => void;
+    const consent = new Promise<BrowserNavigationResult>((resolve) => {
+      answerConsent = resolve;
+    });
+    if (movesDuringConsent) {
+      Object.assign(window, {
+        omnigentDesktop: {
+          kind: "electron",
+          browserOpenOrNavigate: openOrNavigate,
+          browserHasView: hasView,
+          browserClose: closeView,
+          getDesktopFeatures: async () => ({ sshLocalhostPreview: true }),
+        },
+      });
+      openOrNavigate.mockReturnValueOnce(consent);
+    }
+    maybeOpenLinkInApp(CONV, "http://127.0.0.1:5173/after");
+    await vi.waitFor(() => expect(openOrNavigate).toHaveBeenCalledTimes(2));
+    expect(openOrNavigate).toHaveBeenLastCalledWith(
+      expect.any(String),
+      "http://127.0.0.1:5173/after",
+      undefined,
+      {
+        agent: true,
+        sourceHostId: "remote-host",
+        sessionHostProtocol: 1,
+        ...(movesDuringConsent ? { sshPreviewProtocol: 1 } : {}),
+      },
+    );
+    if (movesDuringConsent) {
+      expect(surfaced).toHaveLength(1);
+      hostId = "ungranted-host";
+      answerConsent({ ok: false, retryWithFreshHost: true, navigationRetryToken: "link" });
+      await vi.waitFor(() => expect(closeView).toHaveBeenCalledOnce());
+      expect(showToast).toHaveBeenCalledWith(expect.stringContaining("session host changed"));
+    } else {
+      await vi.waitFor(() => expect(surfaced).toHaveLength(2));
+    }
+    expect(openOrNavigate).toHaveBeenCalledTimes(2);
+    expect(getSessionSlim).toHaveBeenCalledTimes(movesDuringConsent ? 3 : 2);
+    expect(surfaced).toHaveLength(movesDuringConsent ? 1 : 2);
+  },
+);
+
+it("opens a link in a new window unless the in-app browser takes it", () => {
+  openLink(CONV, URL_);
+  expect(window.open).not.toHaveBeenCalled();
+  writeOpenLinksInApp(false);
+  openLink(CONV, URL_);
+  expect(window.open).toHaveBeenCalledWith(URL_, "_blank", "noopener,noreferrer");
 });

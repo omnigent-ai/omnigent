@@ -22,6 +22,8 @@ _QUOTED_REVIEW = f"## Blocking issues\nDo not strip inline `{_MARKER}` text.\n"
     ("raw", "expected"),
     [
         pytest.param(f"{_MARKER}\n{_REVIEW}", _REVIEW, id="single-review"),
+        pytest.param(_REVIEW.rstrip(), _REVIEW.rstrip(), id="no-final-newline"),
+        pytest.param("## Review\n" + "é" * 40000, "## Review\n" + "é" * 40000, id="large-review"),
         pytest.param(
             f"{_MARKER}\n## Blocking issues\nPartial draft\n{_MARKER}\n{_REVIEW}",
             _REVIEW,
@@ -78,10 +80,9 @@ def test_review_output_preserves_final_review(tmp_path: Path, raw: str, expected
         return
     assert result.returncode == 0, result.stdout + result.stderr
     assert review.read_text() == expected
-    header, payload = github_output.read_text().split("\n", 1)
-    assert header.startswith("review_text<<")
-    delimiter = header.removeprefix("review_text<<")
-    assert payload == f"{expected}{delimiter}\n"
+    assert github_output.read_text() == "review_ready=true\n"
+    publish = next(s for s in workflow["jobs"]["review"]["steps"] if s.get("id") == "publish")
+    assert publish["if"] == "steps.polly.outputs.review_ready == 'true'"
 
 
 @pytest.mark.parametrize(
@@ -178,15 +179,24 @@ def test_failure_diagnostics_preserves_logs_without_gateway_secrets(
     assert not (destination / "polly-review.txt").exists()
 
 
-@pytest.mark.parametrize("failure_step", ["secret-scan", "posting", "timeout", None])
 @pytest.mark.parametrize(
-    "scope_suffix",
+    ("failure_step", "scope_suffix"),
     [
-        "",
-        "<!-- POLLY_SCOPE_START -->\n{malformed\n<!-- POLLY_SCOPE_END -->\n",
-        "<!-- POLLY_SCOPE_START -->\n{}\n<!-- POLLY_SCOPE_END --> (see above)\n" * 2,
-    ],
-    ids=["plain-prose", "malformed-legacy-scope", "duplicate-legacy-scope"],
+        pytest.param(failure_step, scope_suffix, id=f"{scope_id}-{failure_step}")
+        for scope_id, scope_suffix in [
+            ("plain-prose", ""),
+            (
+                "malformed-legacy-scope",
+                "<!-- POLLY_SCOPE_START -->\n{malformed\n<!-- POLLY_SCOPE_END -->\n",
+            ),
+            (
+                "duplicate-legacy-scope",
+                "<!-- POLLY_SCOPE_START -->\n{}\n<!-- POLLY_SCOPE_END --> (see above)\n" * 2,
+            ),
+        ]
+        for failure_step in ["secret-scan", "posting", "timeout", None]
+    ]
+    + [pytest.param("setup-timeout", "", id="plain-prose-setup-timeout")],
 )
 def test_review_diagnostics_retain_raw_stdout(
     tmp_path: Path, failure_step: str | None, scope_suffix: str
@@ -197,15 +207,18 @@ def test_review_diagnostics_retain_raw_stdout(
     (tmp_path / "timeout").symlink_to(timeout_command)
     workflow = yaml.safe_load(_WORKFLOW.read_text())
     steps = {step["name"]: step for step in workflow["jobs"]["review"]["steps"]}
-    review = (
-        _REVIEW + scope_suffix + ("test-api-secret\n" if failure_step == "secret-scan" else "")
-    )
+    review = _REVIEW + scope_suffix
+    if failure_step == "secret-scan":
+        review += "é" * 35000 + "\ntest-api-secret\n"
     raw = f"Starting review: test-api-secret at https://gateway.test\n{_MARKER}\n{review}"
     (tmp_path / "stdout.txt").write_text(raw)
     (tmp_path / "review_prompt.txt").write_text("Synthetic review; no model calls.")
     (tmp_path / "python3").symlink_to(sys.executable)
     commands = {
-        "uv": 'cat "$POLLY_TEST_STDOUT"\necho "stderr: test-api-secret" >&2\n',
+        "uv": (
+            'printf "%s" "$OMNIGENT_HEADLESS_TIMEOUT_S" > headless-timeout.txt\n'
+            'cat "$POLLY_TEST_STDOUT"\necho "stderr: test-api-secret" >&2\n'
+        ),
         "gh": 'echo "Forced posting failure" >&2\nexit 42\n' if failure_step else "exit 0\n",
     }
     if failure_step == "timeout":
@@ -236,6 +249,10 @@ def test_review_diagnostics_retain_raw_stdout(
     def run_step(name: str) -> subprocess.CompletedProcess[str]:
         script = steps[name]["run"].replace("/tmp/", str(tmp_path) + "/")
         script = script.replace(
+            ".github/scripts/polly-review-summary.py",
+            str(_WORKFLOW.parent.parent / "scripts/polly-review-summary.py"),
+        )
+        script = script.replace(
             "pathlib.Path.home() / '.omnigent' / 'logs'",
             f"pathlib.Path({str(tmp_path / 'logs')!r})",
         )
@@ -255,7 +272,24 @@ def test_review_diagnostics_retain_raw_stdout(
     assert 0 < remaining < workflow["jobs"]["review"]["timeout-minutes"] * 60
     if failure_step == "timeout":
         env["POLLY_REVIEW_DEADLINE"] = str(int(time.time()) + 2)
+    elif failure_step == "setup-timeout":
+        env["POLLY_REVIEW_DEADLINE"] = str(int(time.time()) - 1)
+    before_review = int(time.time())
     result = run_step("Run Polly review")
+    after_review = int(time.time())
+    if failure_step == "setup-timeout":
+        assert result.returncode == 124, result.stdout + result.stderr
+        assert "time budget was exhausted during setup" in result.stdout
+        assert not (tmp_path / "headless-timeout.txt").exists()
+        assert not (tmp_path / "github_output").exists()
+        assert not (tmp_path / "polly_review.txt").exists()
+        return
+    headless_timeout = float((tmp_path / "headless-timeout.txt").read_text())
+    deadline = int(env["POLLY_REVIEW_DEADLINE"])
+    assert 0 < headless_timeout <= deadline - before_review
+    assert deadline - after_review <= headless_timeout
+    if failure_step != "timeout":
+        assert headless_timeout > 1800
     if failure_step == "timeout":
         assert result.returncode == 124, result.stdout + result.stderr
         assert "no review was published" in result.stdout
@@ -268,10 +302,7 @@ def test_review_diagnostics_retain_raw_stdout(
         assert "timed out or was killed" in (diagnostics / "polly-stderr.log").read_text()
         return
     assert result.returncode == 0, result.stdout + result.stderr
-    header, payload = (tmp_path / "github_output").read_text().split("\n", 1)
-    delimiter = header.removeprefix("review_text<<")
-    assert payload == f"{review}{delimiter}\n"
-    env["REVIEW_TEXT"] = payload.removesuffix(f"{delimiter}\n")
+    assert (tmp_path / "github_output").read_text() == "review_ready=true\n"
     result = run_step("Scan review output for secrets before posting")
     if failure_step == "secret-scan":
         assert result.returncode != 0

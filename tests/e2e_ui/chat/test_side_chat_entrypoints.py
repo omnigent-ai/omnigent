@@ -11,11 +11,13 @@ import json
 import re
 import time
 from collections.abc import Iterator
+from typing import Any
 
 import httpx
 import pytest
-from playwright.sync_api import Locator, Page, Route, expect
+from playwright.sync_api import Browser, Locator, Page, Route, expect
 
+from tests._helpers.browser import user_page
 from tests.e2e.conftest import get_mock_requests
 from tests.e2e_ui.conftest import configure_mock_llm, fetch_with_retry, open_right_rail
 
@@ -129,7 +131,7 @@ def test_composer_add_tray_offers_a_side_chat(
     runner_id: str,
     mock_llm_server_url: str,
 ) -> None:
-    """The ``+`` tray starts a working side chat whose composer also opens the slash menu."""
+    """The ``+`` tray starts a side chat whose focused composer also opens the slash menu."""
     base_url, session_id = seeded_session
     question = f"tray-side-{session_id}: answer in the side chat"
     reply = "The add tray started a side chat."
@@ -139,7 +141,10 @@ def test_composer_add_tray_offers_a_side_chat(
 
     page.get_by_test_id("composer-attach").click()
     page.get_by_role("menuitem", name="Start a new side chat").click()
-    page.get_by_test_id("side-chat-input").fill(question)
+    side_input = page.get_by_test_id("side-chat-input")
+    expect(side_input).to_be_enabled(timeout=30_000)
+    expect(side_input).to_be_focused()
+    side_input.fill(question)
     page.get_by_test_id("side-chat-send").click()
     expect(page.locator(".side-chat-backdrop").get_by_text(reply, exact=True)).to_be_visible(
         timeout=30_000
@@ -151,14 +156,15 @@ def test_composer_add_tray_offers_a_side_chat(
 
     # The live side chat shares the main composer's slash menu; /help is the
     # built-in offered on every non-native harness, so it proves the menu opened.
-    side_input = page.get_by_test_id("side-chat-input")
     expect(side_input).to_be_enabled(timeout=30_000)
     side_input.fill("/")
     expect(page.get_by_test_id("slash-menu-item-help")).to_be_visible(timeout=10_000)
 
 
-def test_rail_new_tab_menu_offers_a_side_chat(page: Page, seeded_session: tuple[str, str]) -> None:
-    """The Workspace rail's "Open new" (``+``) menu lists "Side chat"."""
+def test_rail_new_tab_menu_opens_a_focused_side_chat(
+    page: Page, seeded_session: tuple[str, str]
+) -> None:
+    """The rail's "Open new" (``+``) menu lists "Side chat" and opens it ready to type."""
     base_url, session_id = seeded_session
     page.goto(f"{base_url}/c/{session_id}")
     expect(page.get_by_placeholder("Send a message…")).to_be_visible()
@@ -166,7 +172,12 @@ def test_rail_new_tab_menu_offers_a_side_chat(page: Page, seeded_session: tuple[
     open_right_rail(page)
     rail = page.get_by_role("complementary", name="Workspace")
     rail.get_by_role("button", name="Open new", exact=True).click()
-    expect(page.get_by_role("menuitem", name="Side chat", exact=True)).to_be_visible()
+    side_chat_item = page.get_by_role("menuitem", name="Side chat", exact=True)
+    expect(side_chat_item).to_be_visible()
+
+    side_chat_item.click()
+    expect(rail.get_by_role("tab", name="Side chat 1", exact=True)).to_be_visible()
+    expect(page.get_by_test_id("side-chat-input")).to_be_focused()
 
 
 @pytest.mark.parametrize("entrypoint", ["slash", "panel"])
@@ -244,6 +255,8 @@ def test_side_chat_sends_with_stale_branch_metadata(
     assert child.json()["runner_id"] == runner_id
     expect(pane.get_by_text(parent_reply, exact=True)).to_have_count(0)
 
+    expect(pane.get_by_role("button", name="Side chat model and effort")).to_have_count(0)
+
     expect(pane.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
     page.get_by_test_id("side-chat-input").fill(followup)
     expect(page.get_by_test_id("side-chat-send")).to_be_enabled(timeout=30_000)
@@ -271,6 +284,63 @@ def test_side_chat_sends_with_stale_branch_metadata(
     assert question in followup_input
     assert "First side answer." in followup_input
     expect(page).to_have_url(f"{base_url}/c/{session_id}")
+
+
+def test_side_chat_keeps_reader_scrolled_up_when_follow_up_reply_finishes(
+    seeded_session: tuple[str, str],
+    side_chat_forks: list[str],
+    mock_llm_server_url: str,
+    page: Page,
+) -> None:
+    """Scrolling up during a follow-up reply keeps the earlier text in view after it finishes."""
+    base_url, session_id = seeded_session
+    token = f"scroll-side-{session_id}"
+    earlier = "\n\n".join(
+        f"Earlier side-chat paragraph {n}: content the reader scrolls back to." for n in range(30)
+    )
+    streamed = " ".join(f"followupword{n:03d}" for n in range(60))
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {"text": earlier},
+            {"text": streamed, "block": True, "stream": True, "chunk_delay": 0.1},
+        ],
+        key=token,
+        match=token,
+    )
+
+    try:
+        page.goto(f"{base_url}/c/{session_id}")
+        expect(page.get_by_placeholder("Send a message…")).to_be_visible()
+        _start_side_chat(page, "panel", f"{token}: explain in detail")
+        pane = page.locator(".side-chat-backdrop")
+        first_paragraph = pane.get_by_text("Earlier side-chat paragraph 0:")
+        expect(pane.get_by_text("Earlier side-chat paragraph 29:")).to_be_in_viewport(
+            timeout=30_000
+        )
+        expect(pane.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
+        assert len(side_chat_forks) == 1
+
+        page.get_by_test_id("side-chat-input").fill(f"{token}: a follow-up question")
+        page.get_by_test_id("side-chat-send").click()
+        _wait_for_blocked_reply(page, mock_llm_server_url, "The side-chat follow-up")
+        expect(pane.get_by_test_id("working-indicator")).to_be_visible()
+        transcript = pane.locator(":scope > div.overflow-y-auto")
+        transcript.hover()
+        page.mouse.wheel(0, -transcript.evaluate("el => el.scrollHeight"))
+        expect(first_paragraph).to_be_in_viewport()
+
+        # Release the reply only once the reader has scrolled up.
+        httpx.post(f"{mock_llm_server_url}/gate/release", timeout=5.0).raise_for_status()
+        expect(pane.get_by_text("followupword059", exact=False)).to_be_attached(timeout=30_000)
+        expect(pane.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
+        # The snap lands when the turn commits, so hold briefly past completion.
+        page.wait_for_timeout(1_000)
+        expect(
+            first_paragraph, "the side chat scrolled the reader back to the bottom"
+        ).to_be_in_viewport(timeout=1_000)
+    finally:
+        httpx.post(f"{mock_llm_server_url}/gate/release", timeout=5.0).raise_for_status()
 
 
 def test_runner_bound_side_chat_closes_without_stopping_parent(
@@ -451,7 +521,7 @@ def test_side_chat_opens_in_a_drawer_on_mobile(
     side_chat_forks: list[str],
     mock_llm_server_url: str,
 ) -> None:
-    """Phones hide the Workspace rail, so a side chat opens in a full-screen drawer."""
+    """Phones show side chats in a full-screen drawer, whose ``+`` starts another ready to type."""
     base_url, session_id = seeded_session
     parent_reply = "Retry the upload with exponential backoff."
     side_reply = "Backoff spreads the retries out so the server can recover."
@@ -485,6 +555,8 @@ def test_side_chat_opens_in_a_drawer_on_mobile(
     expect(drawer.locator(_ASSISTANT).filter(has_text=side_reply)).to_be_visible(timeout=30_000)
     expect(drawer.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
     assert len(side_chat_forks) == 1
+
+    expect(drawer.get_by_role("button", name="Side chat model and effort")).to_have_count(0)
 
     drawer.locator(_ASSISTANT).get_by_text(side_reply, exact=True).select_text()
     reply_popup = page.get_by_role("button", name="Reply ↵", exact=True)
@@ -549,6 +621,90 @@ def test_side_chat_opens_in_a_drawer_on_mobile(
     page.get_by_role("menuitem", name="Side chats").click()
     expect(drawer).to_have_attribute("data-state", "open")
     expect(drawer.locator(_ASSISTANT).filter(has_text=side_reply)).to_be_visible()
+
+    # The drawer's + opens a fresh, empty side chat that is ready to type.
+    drawer.get_by_role("button", name="New side chat", exact=True).click()
+    expect(drawer.get_by_role("tab", name="Side chat 2", exact=True)).to_be_visible()
+    new_input = drawer.get_by_test_id("side-chat-input")
+    expect(new_input).to_be_enabled()
+    expect(new_input).to_have_value("")
+    expect(new_input).to_be_focused()
+
+
+def test_side_chat_follows_the_user_to_another_device(
+    page: Page,
+    browser: Browser,
+    browser_context_args: dict[str, Any],
+    seeded_session: tuple[str, str],
+    side_chat_forks: list[str],
+    mock_llm_server_url: str,
+) -> None:
+    """A phone discovers and uses a desktop side chat; closing its tab stays local."""
+    base_url, session_id = seeded_session
+    parent_reply = "The parent chat answered first."
+    side_reply = "Your phone can read this side-chat answer too."
+    phone_reply = "Sent from the phone, answered in the side chat."
+    question = f"devices-side-{session_id}: will my phone see this?"
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": parent_reply}],
+        key=f"devices-main-{session_id}",
+        match=f"devices-main-{session_id}",
+    )
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": side_reply}, {"text": phone_reply}],
+        key=f"devices-side-{session_id}",
+        match=f"devices-side-{session_id}",
+    )
+
+    page.goto(f"{base_url}/c/{session_id}")
+    _send_parent(page, f"devices-main-{session_id}: start the parent", parent_reply)
+    _start_side_chat(page, "panel", question)
+    desktop_tab = page.get_by_role("tab", name="Side chat 1", exact=True)
+    expect(page.locator(".side-chat-backdrop").locator(_ASSISTANT)).to_contain_text(
+        side_reply, timeout=30_000
+    )
+    expect(desktop_tab).to_be_visible()
+    assert len(side_chat_forks) == 1
+
+    # A separate context has its own storage, like a second device.
+    phone_options = {**browser_context_args, "viewport": {"width": 390, "height": 844}}
+    with user_page(browser, headers={}, **phone_options) as phone:
+        phone.goto(f"{base_url}/c/{session_id}")
+        phone.get_by_role("button", name="Conversation actions").click()
+        phone.get_by_role("menuitem", name="Side chats").click()
+        drawer = phone.get_by_test_id("side-chats-panel-drawer")
+        drawer.get_by_role("tab", name="Side chat 1", exact=True).click()
+        expect(phone.get_by_role("button", name="Browse side chats")).to_have_count(0)
+        expect(drawer.locator(_ASSISTANT).filter(has_text=side_reply)).to_be_visible()
+        # The parent history the fork copied stays hidden here too.
+        expect(drawer.locator(_ASSISTANT).filter(has_text=parent_reply)).to_have_count(0)
+        expect(drawer.get_by_test_id("side-chat-input")).to_be_visible()
+        # The phone can carry the side chat on, without touching the parent.
+        drawer.get_by_test_id("side-chat-input").fill(f"devices-side-{session_id}: and now?")
+        drawer.get_by_test_id("side-chat-send").click()
+        expect(drawer.locator(_ASSISTANT).filter(has_text=phone_reply)).to_be_visible(
+            timeout=30_000
+        )
+        parent_items = httpx.get(f"{base_url}/v1/sessions/{session_id}/items", timeout=10.0)
+        assert parent_items.status_code == 200, parent_items.text
+        assert phone_reply not in parent_items.text
+
+        with phone.expect_response(f"**/v1/sessions/{side_chat_forks[0]}/events") as stopped:
+            drawer.get_by_role("button", name="Close Side chat 1", exact=True).click()
+        assert stopped.value.ok
+        expect(drawer.get_by_role("tab", name="Side chat 1", exact=True)).to_have_count(0)
+        phone.reload()
+        phone.get_by_role("button", name="Conversation actions").click()
+        phone.get_by_role("menuitem", name="Side chats").click()
+        expect(drawer).to_be_visible()
+        expect(drawer.get_by_role("button", name="Browse side chats")).to_have_count(0)
+        expect(drawer.get_by_role("tab", name="Side chat 1", exact=True)).to_have_count(0)
+
+    page.reload()
+    expect(page.get_by_placeholder("Send a message…")).to_be_visible()
+    expect(desktop_tab).to_be_visible()
 
 
 def test_running_empty_side_chat_shows_working(

@@ -2,26 +2,47 @@ import { AlertTriangleIcon, Loader2Icon, WifiOffIcon, XIcon } from "lucide-react
 import { ConversationEmptyState } from "@/components/ai-elements/conversation";
 import { Message, MessageContent } from "@/components/ai-elements/message";
 import { ErrorBanner } from "@/components/blocks/StatusBlocks";
+import { useConversationEntryValue } from "@/hooks/useConversationEntryState";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import { SANDBOX_STAGE_LABELS } from "@/lib/sandboxStatus";
 import type { SandboxStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
-import { useChatStore } from "@/store/chatStore";
+import { type ConversationState, useChatStore } from "@/store/chatStore";
+import { conversationRegistry } from "@/store/conversationRegistry";
 import { CHAT_COLUMN_WIDTH } from "./chatLayout";
+
+/** What a launch in `action_required` asks the user to do, or null. */
+function launchActionDetails(state: Pick<ConversationState, "sandboxStatus">): string | null {
+  return state.sandboxStatus?.stage === "action_required" && state.sandboxStatus.details
+    ? state.sandboxStatus.details
+    : null;
+}
 
 /**
  * Shows what a launch in `action_required` needs the user to do. Only a
  * warning: the launch keeps going, and the banner leaves when it moves on.
  */
-export function SandboxActionBanner() {
-  const asking = useChatStore((s) =>
-    s.sandboxStatus?.stage === "action_required" && s.sandboxStatus.details
-      ? s.sandboxStatus.details
-      : null,
-  );
-  const dismissed = useChatStore((s) => s.sandboxActionDismissed);
-  const dismiss = useChatStore((s) => s.dismissSandboxAction);
+export function SandboxActionBanner({
+  conversationId,
+  className,
+}: {
+  /** A pane showing another session names it; defaults to the open session. */
+  conversationId?: string;
+  className?: string;
+}) {
+  const openSessionAsking = useChatStore(launchActionDetails);
+  const openSessionDismissed = useChatStore((s) => s.sandboxActionDismissed);
+  const dismissOpenSession = useChatStore((s) => s.dismissSandboxAction);
+  const paneId = conversationId ?? null;
+  const paneAsking = useConversationEntryValue(paneId, launchActionDetails);
+  const paneDismissed = useConversationEntryValue(paneId, (s) => s.sandboxActionDismissed);
+  const asking = paneId === null ? openSessionAsking : paneAsking;
+  const dismissed = paneId === null ? openSessionDismissed : paneDismissed;
+  const dismiss = (details: string) => {
+    if (paneId === null) dismissOpenSession(details);
+    else conversationRegistry.peek(paneId)?.setState({ sandboxActionDismissed: details });
+  };
   if (asking === null || dismissed === asking) return null;
   return (
     <div
@@ -33,6 +54,7 @@ export function SandboxActionBanner() {
         "border border-amber-300 bg-amber-100 text-amber-900",
         "dark:border-amber-700/60 dark:bg-amber-950 dark:text-amber-100",
         "animate-in fade-in-0 slide-in-from-top-1 duration-200",
+        className,
       )}
     >
       <AlertTriangleIcon className="size-4 shrink-0" aria-hidden="true" />
@@ -53,14 +75,7 @@ export function SandboxActionBanner() {
   );
 }
 
-/**
- * Failure band for a managed-sandbox session whose background launch
- * died. Renders the recorded reason so a dead launch explains itself
- * instead of presenting a silent dead chat. In-flight launch progress
- * does NOT render here — it shares the in-thread
- * :func:`RunnerStartingIndicator` spot so all launch states live on
- * one consistent line.
- */
+/** The recorded launch failure, shared by the chat and terminal surfaces. */
 export function SandboxFailedIndicator({ status }: { status: SandboxStatus }) {
   return (
     <div
@@ -90,11 +105,13 @@ export function ConnectionIndicator({
   const unreachable = liveness.kind === "host_offline" || liveness.kind === "local_stranded";
 
   if (sandboxStatus !== null) {
-    // A failed launch owns this band with its reason. An IN-FLIGHT
-    // launch renders in the chat thread (RunnerStartingIndicator)
-    // instead — but still suppresses the liveness bands below, which
-    // would misread the not-yet-bound session as stranded.
-    if (sandboxStatus.stage === "failed") {
+    // Chat renders all launch states in the transcript. The terminal surface
+    // has no transcript, so its connection band still carries launch failures.
+    if (
+      sandboxStatus.stage === "failed" &&
+      terminalFirst?.isTerminalFirst &&
+      terminalFirst.view === "terminal"
+    ) {
       return <SandboxFailedIndicator status={sandboxStatus} />;
     }
     return null;
@@ -171,24 +188,31 @@ export function ConnectionIndicator({
 
 /**
  * Main-pane managed-sandbox launch indicator. Shows the current pipeline
- * stage ("Provisioning sandbox…", "Cloning repository…", …) for any session
- * type. Ordinary terminal startup uses the standard Working indicator.
+ * stage or recorded failure for any session type. Ordinary terminal startup
+ * uses the standard Working indicator.
  *
- * Self-gates to null when neither applies. `hero` is the centered
+ * Renders nothing without a launch status. `hero` is the centered
  * empty-state placeholder (no bubbles yet); `row` is the in-thread
  * spinner beneath the user's first message (the create-then-send path
  * renders that bubble immediately, so the empty state never shows
  * there).
  */
-export function RunnerStartingIndicator({ variant }: { variant: "hero" | "row" }) {
-  const sandboxStatus = useChatStore((s) => s.sandboxStatus);
-  // `ready` never reaches the store (cleared) and `failed` renders the
-  // destructive band in ConnectionIndicator — only in-flight stages
-  // with known copy show here.
+export function RunnerStartingIndicator({
+  variant,
+  status,
+}: {
+  variant: "hero" | "row";
+  /** A pane showing another session passes that session's launch; defaults to the open session's. */
+  status?: SandboxStatus | null;
+}) {
+  const openSessionStatus = useChatStore((s) => s.sandboxStatus);
+  const sandboxStatus = status === undefined ? openSessionStatus : status;
+  if (sandboxStatus?.stage === "failed") {
+    return <SandboxFailedIndicator status={sandboxStatus} />;
+  }
+  // `ready` clears the store; only in-flight stages have progress copy.
   const sandboxLabel =
-    sandboxStatus !== null && sandboxStatus.stage !== "failed"
-      ? SANDBOX_STAGE_LABELS[sandboxStatus.stage]
-      : undefined;
+    sandboxStatus !== null ? SANDBOX_STAGE_LABELS[sandboxStatus.stage] : undefined;
   if (sandboxLabel === undefined) return null;
   const line = `${sandboxLabel}…`;
   // role=status + aria-live so assistive tech announces the transient wait;

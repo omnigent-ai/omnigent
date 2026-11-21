@@ -114,6 +114,14 @@ const FORMATTERS: Record<string, ArgFormatter> = {
     const id = asString(args.timer_id);
     return id === null ? verbOnly("Cancel timer") : { verb: "Cancel timer:", body: id };
   },
+  sys_reminder_set: (args) => {
+    const at = asString(args.at);
+    if (at !== null) return { verb: "Set reminder:", body: at };
+    const seconds = asNumber(args.delay_seconds);
+    return seconds === null
+      ? verbOnly("Set reminder")
+      : { verb: "Set reminder:", body: `in ${seconds}s` };
+  },
 
   // Terminal multiplexer.
   sys_terminal_launch: (args) => terminalTitle("Launch terminal", args),
@@ -170,6 +178,7 @@ const FORMATTERS: Record<string, ArgFormatter> = {
     const cmd = asString(args.command);
     return shellTitle(cmd === null ? null : unwrapShellCommand(cmd));
   },
+  view_image: (args) => withPath("View image", args.path),
   apply_patch: (args) => {
     const changes = Array.isArray(args.changes) ? args.changes : null;
     if (changes === null || changes.length === 0) return null;
@@ -328,6 +337,16 @@ const ARG_LIST_ITEM_MAX_CHARS = 40;
 // Numbers only identify something under id-like keys; a bare `20` from
 // `limit` or `max_results` means nothing in a one-line summary.
 const ID_LIKE_KEY_WORDS = new Set(["id", "number", "num", "pid", "port"]);
+// Arguments that pick which fields or columns come back (`fields: [id, title]`,
+// `select: "id,title"`); they shape the result rather than name what the call is about.
+const SELECTOR_KEY_WORDS = new Set([
+  "attributes",
+  "columns",
+  "expand",
+  "fields",
+  "properties",
+  "select",
+]);
 // Words that mark an argument as a credential; matched per word so `author` passes.
 const SECRET_KEY_WORDS = new Set([
   "apikey",
@@ -364,13 +383,14 @@ export function summarizeArgs(args: Record<string, unknown>): string {
 }
 
 function argSummaryPart(key: string, value: unknown): string | null {
+  const lastWord = identifierWords(key).at(-1);
+  if (lastWord !== undefined && SELECTOR_KEY_WORDS.has(lastWord)) return null;
   if (typeof value === "string") {
     const text = value.trim();
     if (text.length === 0 || text.length > ARG_STRING_MAX_CHARS || text.includes("\n")) return null;
     return text;
   }
   if (typeof value === "number") {
-    const lastWord = identifierWords(key).at(-1);
     return lastWord !== undefined && ID_LIKE_KEY_WORDS.has(lastWord) ? String(value) : null;
   }
   if (Array.isArray(value)) {
@@ -445,7 +465,8 @@ function runPhrase(category: RunCategory, n: number): string {
   }
 }
 
-function stripOmnigentPrefix(name: string): string {
+/** A tool name without Omnigent's `mcp__omnigent__` prefix. */
+export function stripOmnigentPrefix(name: string): string {
   return name.startsWith("mcp__omnigent__") ? name.slice("mcp__omnigent__".length) : name;
 }
 

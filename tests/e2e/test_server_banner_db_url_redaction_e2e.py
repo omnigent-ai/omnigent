@@ -163,6 +163,8 @@ def _server_env(home: Path, shim_dir: Path, d1_port: int) -> dict[str, str]:
         f"{shim_dir}{os.pathsep}{_REPO_ROOT}{os.pathsep}{env.get('PYTHONPATH', '')}"
     )
     env["CF_D1_BASE_URL"] = f"http://127.0.0.1:{d1_port}"
+    # D1 uses legacy scheduling, including in the maintained container image.
+    env["OMNIGENT_FEATURES"] = "-automations_v2"
     # The dialect reaches the loopback emulator over HTTP; keep any ambient
     # corporate proxy out of that hop.
     env["no_proxy"] = "127.0.0.1,localhost"

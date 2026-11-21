@@ -47,6 +47,47 @@ DEPENDENCY_SCOPES = {
     "deploy/cloudflare/Dockerfile": "docker",
     "deploy/hf-spaces/Dockerfile": "docker",
 }
+# Tests of CI, release and dev tooling run only when a change can affect them.
+# Manifests match by file name, so an added or removed one still runs the tests
+# that check every manifest is configured for Dependabot and CI.
+TOOLING_GROUP = "ci-tooling"
+TOOLING_PREFIXES = (".github/", "scripts/", "dev/", "tests/scripts/")
+TOOLING_FILES = {"tests/conftest.py"}
+TOOLING_FILE_NAMES = {Path(path).name for path in DEPENDENCY_SCOPES}
+# Dialect lanes rerun tests/stores and tests/db. Match store implementations
+# (including ones outside omnigent/stores), migrations, models, those tests,
+# and the CI that runs the lanes.
+DATABASE_PREFIXES = (
+    "omnigent/stores/",
+    "omnigent/db/",
+    "omnigent/connections/",
+    "tests/stores/",
+    "tests/db/",
+    "deploy/cockroachdb/",
+    # Native drivers install through this action. SQLite does not.
+    ".github/actions/setup-uv/",
+)
+DATABASE_FILES = {
+    "omnigent/server/accounts_store.py",
+    "omnigent/server/device_grant_store.py",
+    # tests/stores calls these writers directly.
+    "omnigent/server/host_session_recovery.py",
+    "omnigent/server/journal_markers.py",
+    "omnigent/server/routes/_sessions/helpers.py",
+    "omnigent/server/session_families.py",
+    "omnigent/server/session_live_state.py",
+    # UUID bytes are bound into binary columns; the anchor cap sizes MySQL VARBINARY.
+    "omnigent/util/uuid.py",
+    "omnigent/entities/comment.py",
+    "tests/conftest.py",
+    ".python-version",
+    "uv.lock",
+    "pyproject.toml",
+    ".github/workflows/ci.yml",
+    ".github/scripts/ci/dependency_scope.py",
+    ".github/scripts/ci/require_results.py",
+    ".github/actions/dependency-ci-scope/action.yml",
+}
 
 
 def pin_only(before: str, after: str, pattern: str) -> bool:
@@ -132,8 +173,24 @@ def file_scope(path: str, read=None) -> str:
     return scope
 
 
-def python_matrix(backend: bool) -> str:
+def touches_database(paths: set[str]) -> bool:
+    return any(path.startswith(DATABASE_PREFIXES) or path in DATABASE_FILES for path in paths)
+
+
+def touches_tooling(paths: set[str]) -> bool:
+    return any(
+        path.startswith(TOOLING_PREFIXES)
+        or path in TOOLING_FILES
+        or Path(path).name in TOOLING_FILE_NAMES
+        or Path(path).name.startswith("Dockerfile")
+        for path in paths
+    )
+
+
+def python_matrix(backend: bool, *, tooling: bool = True) -> str:
     groups = json.loads(Path(__file__).with_name("python-matrix.json").read_text())
+    if not tooling:
+        groups = [group for group in groups if group["group"] != TOOLING_GROUP]
     return json.dumps({"include": groups if backend else []}, separators=(",", ":"))
 
 
@@ -154,8 +211,13 @@ def select_scope(files: list[dict], *, read=None, reason: str = "") -> dict[str,
     return {
         "dependency": str(not full).lower(),
         "backend": str(backend).lower(),
-        "python_matrix": python_matrix(backend),
-        "database": str(backend).lower(),
+        # No file list means a push, scheduled, manual or unscoped run: test everything.
+        "python_matrix": python_matrix(
+            backend, tooling=bool(reason) or not files or touches_tooling(paths)
+        ),
+        # Unscoped runs always run the dialect lanes. A PR runs them only when a
+        # changed path can affect tests/stores or tests/db on another backend.
+        "database": str(bool(reason) or not files or touches_database(paths)).lower(),
         "integration": str(backend).lower(),
         "e2e": str(backend or "javascript" in scopes).lower(),
         "windows": str(backend).lower(),

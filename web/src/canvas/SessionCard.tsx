@@ -7,8 +7,10 @@ import type { Node, NodeProps } from "@xyflow/react";
 import { FolderIcon, GitBranchIcon, GitPullRequestIcon } from "lucide-react";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
 import type { Conversation } from "@/hooks/useConversations";
-import { getSessionState, type SessionState } from "@/hooks/useSessionState";
+import { getSessionState, withUnreadState, type SessionState } from "@/hooks/useSessionState";
+import { stateAsOf } from "@/hooks/useSessionPullRequests";
 import { useConversationReadState } from "@/hooks/useUnseenConversations";
+import { showsUnreadFor } from "@/lib/sessionMute";
 import { gitProviderCopy } from "@/lib/gitProviders";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
 import { cn } from "@/lib/utils";
@@ -37,6 +39,13 @@ function stateLabel(state: SessionState | null, status: Conversation["status"]):
   }
 }
 
+/** The PR link's tooltip: its title and last fetched state, with that state's age once stale. */
+function pullRequestTooltip(pr: CanvasPullRequest): string {
+  if (!pr.state) return pr.title;
+  const asOf = stateAsOf(pr.state_checked_at);
+  return `${pr.title} (${pr.state.toLowerCase()}${asOf ? `, as of ${asOf}` : ""})`;
+}
+
 function SessionCardComponent({ data, selected }: NodeProps<SessionCardNode>) {
   const { conversation, pullRequest, onOpen } = data;
   const optimisticTitle = useOptimisticTitle(conversation.id);
@@ -45,8 +54,9 @@ function SessionCardComponent({ data, selected }: NodeProps<SessionCardNode>) {
     conversation.updated_at,
     conversation.status,
   );
-  const state: SessionState | null =
-    getSessionState(conversation) ?? (readState.unseen ? { kind: "unseen" } : null);
+  // A muted session shows no unread state, matching its sidebar row.
+  const unread = showsUnreadFor(conversation, readState.unseen);
+  const state: SessionState | null = withUnreadState(getSessionState(conversation), unread);
   const title = conversation.title || optimisticTitle || conversationDisplayLabel(conversation);
   const titleProvisional = !conversation.title && optimisticTitle !== undefined;
   const label = stateLabel(state, conversation.status);
@@ -124,7 +134,7 @@ function SessionCardComponent({ data, selected }: NodeProps<SessionCardNode>) {
           rel="noopener noreferrer"
           // `nodrag` keeps React Flow from turning a click on the link into a card drag.
           className="nodrag flex min-w-0 items-center gap-1.5 text-xs font-medium text-brand-accent hover:underline"
-          title={`${pullRequest.title} (${pullRequest.state.toLowerCase()})`}
+          title={pullRequestTooltip(pullRequest)}
           aria-label={`Open ${prCopy.requestName} ${prNumberPrefix}${pullRequest.number}`}
           onClick={stopCardEvents}
           onDoubleClick={stopCardEvents}

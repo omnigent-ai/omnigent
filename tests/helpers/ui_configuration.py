@@ -71,7 +71,7 @@ def pytest_configure(config: pytest.Config) -> None:
             "browser windows are only allowed for local debugging."
         )
     _isolate_config_home(config)
-    _isolate_playwright_output(config)
+    isolate_playwright_output(config)
 
 
 # Run after the root conftest reaps leaked processes that may still use this home.
@@ -121,7 +121,7 @@ def _isolate_config_home(config: pytest.Config) -> None:
     config.stash[_CONFIG_HOME_KEY] = (home, originals)
 
 
-def _isolate_playwright_output(config: pytest.Config) -> None:
+def isolate_playwright_output(config: pytest.Config) -> None:
     """Keep each xdist worker's Playwright artifacts in its own directory.
 
     pytest-playwright clears ``--output`` when every worker's session starts, so
@@ -177,7 +177,8 @@ def temp_omnigent_mock_config(
 
     Native credential helpers may read provider configuration on every turn,
     so the mock config stays in place for the fixture's full lifetime.
-    Restores the original file (or removes it) on exit.
+    Restores the original file (or removes it) on exit. Raises ``RuntimeError``
+    when ``OMNIGENT_CONFIG_HOME`` is unset rather than writing the user's config.
 
     :param mock_llm_server_url: Base URL of the mock LLM server, e.g.
         ``"http://127.0.0.1:51235"``.
@@ -187,6 +188,15 @@ def temp_omnigent_mock_config(
     if workflow_owned:
         yield
         return
+    # Spawned servers and runners read the config home they inherited at launch,
+    # so the helper must not redirect it here, nor fall back to the real one.
+    if not os.environ.get(_CONFIG_HOME_ENV):
+        raise RuntimeError(
+            f"{_CONFIG_HOME_ENV} is unset, so the mock provider config would overwrite "
+            "the real ~/.omnigent/config.yaml. Run under the tests/e2e_ui conftest, which "
+            f"sets a private {_CONFIG_HOME_ENV}, or set it to the config home that the "
+            "server and runner under test use."
+        )
 
     from omnigent.config import global_config_path
 

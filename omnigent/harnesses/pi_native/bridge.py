@@ -56,7 +56,7 @@ def pi_native_env_unset(environ: Mapping[str, str]) -> list[str]:
     return sorted({name.strip() for name in raw.split(",") if name.strip()})
 
 
-_BRIDGE_ROOT = Path.home() / ".omnigent" / "pi-native"
+_BRIDGE_ROOT = native_bridge_common.native_bridge_data_dir() / "pi-native"
 _CONFIG_FILE = "config.json"
 _EXTENSION_FILE = "omnigent_pi_native_extension.js"
 _EXTENSION_PACKAGE = "omnigent.resources.pi_native"
@@ -314,7 +314,9 @@ def enqueue_thinking_level_change(bridge_dir: Path, level: str) -> str:
     return change_id
 
 
-def enqueue_model_change(bridge_dir: Path, model: str) -> str:
+def enqueue_model_change(
+    bridge_dir: Path, model: str, *, thinking_level: str | None = None
+) -> str:
     """
     Queue a UI-originated model switch for the resident Pi extension.
 
@@ -328,6 +330,7 @@ def enqueue_model_change(bridge_dir: Path, model: str) -> str:
     :param bridge_dir: Native Pi bridge directory.
     :param model: Model id to switch to, e.g.
         ``"databricks-claude-sonnet-4-6"``.
+    :param thinking_level: Explicit session effort to apply after the model switch.
     :returns: Opaque model-change id.
     """
     model_change_id = f"model_change_{uuid.uuid4().hex}"
@@ -337,6 +340,8 @@ def enqueue_model_change(bridge_dir: Path, model: str) -> str:
         "model": model,
         "created_at": time.time(),
     }
+    if thinking_level is not None:
+        payload["thinkingLevel"] = thinking_level
     _enqueue_payload(bridge_dir, model_change_id, payload)
     return model_change_id
 
@@ -458,7 +463,10 @@ def refresh_config_auth_headers(bridge_dir: Path, auth_headers: dict[str, str]) 
     if not isinstance(payload, dict):
         return False
     existing = payload.get("authHeaders") or {}
-    merged = {**existing, **auth_headers}
+    # Header names are case-insensitive: a fresh "User-Agent" replaces a stored "user-agent".
+    fresh_names = {name.lower() for name in auth_headers}
+    merged = {key: value for key, value in existing.items() if key.lower() not in fresh_names}
+    merged.update(auth_headers)
     if merged == existing:
         return False
     payload["authHeaders"] = merged

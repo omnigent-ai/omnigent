@@ -21,13 +21,15 @@ record omissions rather than treating unselected checks as passed.
 | `model-effort` | P0 | Pre-launch and in-session selections reach the intended model/request. Supported effort survives a tool round trip and a later change without losing history; rejected changes do not falsely appear applied. |
 | `interrupt-continue` | P0 | Interrupt a demonstrably active turn, then complete another turn in the same session without stale work or a stuck running state. |
 | `reload-resume` | P1 | Reload/reattach and supported resume retain history and settings; a subsequent turn works without missing or duplicated output. |
-| `auth-recovery` | P1 | The normal credential path works; renewal during tools/later turns works where supported. Authentication failure is clear and redacted; after repair the supported continuation path works. |
+| `auth-recovery` | P1 | The normal credential path works; renewal during tools/later turns works where supported. A sandboxed Claude SDK session and its terminals reach inference automatically without exposing the parent credential. Authentication failure is clear and redacted; after repair the supported continuation path works. |
 | `approvals` | P1 | Supported allow, deny and ask decisions reach the tool; denied side effects do not occur and the session can continue. |
 | `steering-queue` | P1 | Supported immediate steering and queued messages arrive once, in the intended order, including around interruption. |
 | `compaction` | P1 | Supported compaction finishes and a later turn works with retained context; pending messages are not lost. |
 | `images` | P1 | A supported image reaches the model and its reply uses the image; unsupported inputs are rejected without losing the draft. |
 | `fork` | P1 | A supported fork uses copied history on its first turn and remains separate from its parent. |
 | `mcp` | P1 | A configured, supported Omnigent MCP connection can call a harmless tool and show its result. |
+| `user-resources` | P1 | Supported user skills, extensions, prompts and packages remain available after launch/resume; relative paths, disabled resources and owner context controls retain their meaning. In sandboxed Claude SDK, inline skill commands run under the same filesystem and network restrictions as Bash. |
+| `interactive-input` | P1 | Supported questions and editor dialogs preserve literal/empty answers, settle cancellation, and allow a later turn to complete. |
 
 ## How to get to it (user POV)
 
@@ -39,7 +41,7 @@ does not make the surfaces interchangeable.
 | Web new session | Pick a native harness or SDK custom agent, host/workspace, model and effort, then send. See [Composer](./composer.md) and [Custom agents](./custom-agents.md). |
 | Web existing session | Send follow-ups, edit configuration, interrupt, answer approvals, reload or fork. See [Composer](./composer.md), [Sessions](./sessions.md) and [Native harnesses](./native-harnesses.md). |
 | Native terminal / CLI | Launch using the harness's CLI entry, use supported native controls, and switch Terminal ↔ Chat. See [Native harnesses](./native-harnesses.md) and [Terminals](./terminals.md). |
-| SDK CLI / API | Launch a custom agent with `omnigent run` or the session API; verify the server/runner contract. The [bench](../tests/harness_bench/README.md#transport-selection) uses this boundary, not browser rendering. |
+| SDK CLI / API | Launch a custom agent with `omnigent run` or the session API; verify the server/runner contract, including [confinement refusal and retry](#custom-agent-confinement-and-retry). The [bench](../tests/harness_bench/README.md#transport-selection) uses this boundary, not browser rendering. |
 | Alternate UI surfaces | Exercise mobile, fork-dialog configuration and Inbox approvals when the change affects them. Use the owning recipes above, not desktop Chat as a substitute. |
 
 ## Driving it with the repro environment
@@ -69,6 +71,39 @@ consumers of shared code. A capability declaration selects relevant checks; it
 does not prove behavior. Missing credentials or an unobservable transport are
 blocked/missing evidence, not reasons to mark a supported feature N/A.
 
+### Compare harnesses by user journey
+
+Keep a dated comparison with the project's evidence, using one column per
+harness and separate SDK/native rows when their behavior differs. Start with
+Claude, Codex and Pi using the existing declared matrix:
+
+```sh
+uv run --no-sync python -m tests.harness_bench --no-live --markdown \
+  --harness claude-sdk --harness claude-native \
+  --harness codex --harness codex-native --harness pi --harness pi-native
+```
+
+Omit the harness filters to include every official bench profile. Read the
+[capability registry](../omnigent/harness_plugins.py) and owning recipes for
+axes the bench does not measure, such as model families, resources, native
+child discovery and startup settings. Do not duplicate the registry as a
+second maintained capability matrix here.
+
+Each comparison cell needs two independent statements:
+
+| Dimension | What to record |
+| --- | --- |
+| Product behavior | Implemented, limited, known gap, or not established; name the surface and provider/version limits. |
+| Verification | Declaration/source review, mapped test, or observed pass/failure at a specific revision and transport. An unrun test is available coverage, not a pass. |
+
+Unknown declarations are not unsupported features. In particular, a generic
+elicitation flag does not describe every policy bridge or extension dialog;
+Omnigent subagent tools and vendor-child discovery are different journeys.
+Compare like-for-like observations before calling one harness more reliable.
+Keep OSS, live-gateway and Managed evidence separate. For a short CUJ table,
+include core turns, model/effort choice, history recovery, user resources,
+interactive input, native child visibility and remaining acceptance gaps.
+
 ### Existing coverage and gaps
 
 Bench dimensions below are reusable checks, not complete coverage of a row.
@@ -85,13 +120,15 @@ no harness-specific tests exist. No passing per-harness results are implied.
 | `model-effort` | `model_override`, `reasoning` | Native-TUI model override is currently skipped; SDK routing/reasoning observations are narrower than selection persistence. Reasoning output does not prove outgoing effort, tool continuity, High→Low or UI state. |
 | `interrupt-continue` | `interrupt` | Cancellation signal/early termination; follow-up recovery needs a separate assertion in the same session. |
 | `reload-resume` | — | No shared resume/reconnect probe. Existing native resume/disconnect tests and session/terminal recipes cover specific harnesses and boundaries only. |
-| `auth-recovery` | — | No shared auth-renewal probe. Reuse the owning harness credential tests; distinguish injected rotation from real elapsed expiry. |
+| `auth-recovery` | — | No shared auth-renewal probe. Reuse the owning harness credential tests; distinguish injected rotation from real elapsed expiry. For sandboxed Claude SDK and terminals, `tests/inner/test_claude_worker_containment.py` uses a real CLI and synthetic provider; it does not prove live-provider authentication. |
 | `approvals` | `policy_allow`, `policy_deny`, `policy_ask` | Supported policy paths through the chosen transport; Chat/Inbox presentation and post-decision continuation need their own evidence. |
 | `steering-queue` | — | No shared probe. Map the harness-specific steer/queue scenarios from Composer and Native harnesses. |
 | `compaction` | — | No shared probe. Use the Composer compaction recipe and the harness's supported entry points. |
 | `images` | — | No shared probe. Attachment UI alone does not establish delivery to a real harness/model. |
 | `fork` | `fork_replay` | Copied-history use through server/runner; fork dialog, alternate targets and parent isolation need the Sessions recipe. |
 | `mcp` | `omnigent_mcp` | Read-only relay tool for supported natives; Settings inventory alone is not a tool-execution check. |
+| `user-resources` | — | Use the Pi resource recipes below and the native skill/plugin recipes. The real Claude CLI skill, hook, MCP and Bash containment cases are in `tests/inner/test_claude_worker_containment.py` (opt-in); file linking alone does not prove runtime discovery or marketplace compatibility. |
+| `interactive-input` | — | `tests/e2e/test_pi_extension_ui_round_trip.py` drives SDK/native Pi through the approval API. The [native dialog recipe](./native-harnesses.md#driving-it-with-the-repro-environment) separately covers browser answers. No shared cross-harness dialog probe. |
 
 Start the tool/history/effort continuity work by extending compatible scenarios,
 not by copying their server/runner setup:
@@ -106,6 +143,72 @@ in the existing drivers/[primitives](../tests/_helpers/README.md). Keep input
 matrices at the lowest reliable layer; retain browser/process cases for distinct
 boundaries. Do not move or replace working regression coverage just to fit the
 checklist.
+
+### Custom-agent confinement and retry
+
+For `launch-reply`, a custom agent's `os_env` restrictions must be enforced or
+startup must fail before launching its worker. Copilot, Cursor, Hermes and
+Antigravity inner adapters refuse requested process confinement. An `os_env`
+without an explicit sandbox type requests the platform default too. When its
+parent has no `os_env`, the `web_fetch` researcher inherits the parent's harness
+and requests platform-default confinement, so it also refuses startup on those
+adapters. Select a sandbox-capable harness
+when confinement is required; see the [worker policy limits](../docs/AGENT_YAML_SPEC.md#local-os-access)
+for supported configurations. These restrictions concern custom-agent workers,
+separately from provider sandbox profiles used to provision sessions.
+
+On a supported adapter, submit a policy containing an unsupported option such
+as `os_env.fork: true`. Confirm the session reports refusal, then correct that
+option and retry in the same session while retaining its sandbox and path/network
+restrictions. The retry must execute an allowed operation and still deny access
+outside the policy. Do not remove confinement to turn a refusal into a pass.
+The CLI journey similarly requires correcting the policy before rerunning
+`omnigent run`; a fresh CLI invocation does not establish same-session recovery.
+
+`tests/e2e/test_codex_sandbox_policy_retry_e2e.py` covers API refusal and
+same-session recovery with a real server, runner and Codex worker plus a scripted
+provider. It verifies allowed reads, denied private reads and denied workspace
+writes after policy repair. That scenario does not establish recovery for every
+adapter, native-wrapper session or provider sandbox profile; use the owning
+adapter's component checks for its launch refusals and record other entry points
+as unverified until exercised.
+
+### Pi SDK large tool requests
+
+For the transport portion of `tool-history`, run
+`pytest tests/inner/test_pi_executor.py -k TestToolServer --reruns 0 -q`
+with Node installed. The
+generated bridge sends a request larger than 64 KiB, then another tool call in
+the same Node process. The oversized case checks the exact size-limit error,
+no rejected tool execution, redacted diagnostics, and a successful next call.
+Real TCP cases cover a sender still writing and bounded cleanup of truncated
+or stalled input. Rejection tests reduce the production 16 MiB request limit.
+
+These checks use the production generated extension and loopback server with
+a test tool executor and Pi registration stub. They do not launch Pi, exercise
+the server/runner or browser entry points, or establish later-turn model recall.
+Native Pi uses a separate tool path. To verify the SDK CLI/API journey, use a
+Pi custom agent with a harmless tool accepting a large string; send a request
+over 64 KiB but below 16 MiB, then one above the limit, and confirm another small
+tool call succeeds after each. The limit includes the serialized request
+envelope, not only its arguments.
+
+### Pi SDK compaction and restart (own environment)
+
+For `compaction`, `reload-resume` and `fork`, run
+`tests/e2e/test_pi_compact_restart_resume.py::test_pi_compacted_session_resumes_compacted_after_restart`.
+It drives the real Pi CLI through a server/runner with a scripted provider and
+a 32k context limit. After repeated compactions, restart both processes and
+continue the session, then fork it and continue the copy. Both outgoing requests
+must retain the summary and recent context, omit summarized turns and fit the
+window; the fork must leave its parent unchanged.
+
+This is an API/process check, not browser reload or live-provider acceptance.
+Existing sessions without a saved compaction checkpoint are not repaired by
+this recipe. After compaction, a failed streamed retry is aborted and drained
+to settlement before exporting context and evicting Pi; retry text is suppressed.
+If settlement or context export fails, the fallback retains only the summary
+and loses recent kept context. Component tests cover these failure paths separately.
 
 ### Pi SDK bundled resources (own environment)
 
@@ -132,21 +235,23 @@ uv run --no-sync pytest tests/e2e/omnigent/test_pi_bundle_extensions_cwd_e2e.py 
 
 ### Pi user resources (own environments)
 
-For `launch-reply` and `reload-resume`, configure Pi skills/extensions in the
+For `user-resources`, `launch-reply` and `reload-resume`, configure Pi skills/extensions in the
 user agent root, with relative local-package paths and disabled-resource patterns.
 `tests/e2e/omnigent/test_pi_managed_extensions_e2e.py` drives SDK CLI startup with
 default and relative custom roots; inspect provider requests for loaded skills,
 package markers, excluded extensions, and unchanged SDK tool restrictions.
 `tests/e2e/omnigent/test_pi_context_files_e2e.py` checks that context/prompt controls
-and `skills: none` still apply. Native startup/resume is covered by
+and `skills: none` still apply, and that the user root's `AGENTS.md` follows
+`context_files`. Native startup/resume is covered by
 `tests/e2e/test_pi_native_cold_resume_model_rewrite_e2e.py` through server/host/runner.
 A host custom root uses the existing explicit
 `OMNIGENT_RUNNER_ENV_PASSTHROUGH=PI_CODING_AGENT_DIR` setting.
 
 These scenarios use real Pi with scripted providers or prompt-observer extensions;
 they do not establish marketplace compatibility, browser rendering, live MCP OAuth,
-OS sandbox or Managed deployment acceptance. Linked resources are shared writable
-files; global instruction files, model credentials and session state stay separate.
+OS sandbox or Managed deployment acceptance. Linked resources, including global
+context files, are shared writable files; `SYSTEM.md`, `APPEND_SYSTEM.md`, model
+credentials and session state stay separate.
 
 ### Deterministic checks versus live canaries
 

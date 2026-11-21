@@ -50,6 +50,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
+from tests.budgets import Deadline, budget
 from tests.server.helpers import (
     FakeSandboxLauncher,
     HostStartInvocation,
@@ -153,8 +154,9 @@ async def _sandbox_host(
     scope = _websocket_scope(f"/v1/hosts/{host_id}/tunnel")
     scope["headers"] = [(b"x-omnigent-host-token", token.encode("ascii"))]
     comm = ApplicationCommunicator(app, scope)
+    deadline = Deadline(15.0)
     await comm.send_input({"type": "websocket.connect"})
-    accepted = await comm.receive_output(timeout=5.0)
+    accepted = await comm.receive_output(timeout=deadline.next_wait(5.0))
     assert accepted["type"] == "websocket.accept", f"tunnel refused: {accepted!r}"
     hello = encode_host_frame(
         HostHelloFrame(
@@ -167,7 +169,7 @@ async def _sandbox_host(
     await comm.send_input({"type": "websocket.receive", "text": hello})
     # Serve frames until the launch request arrives, then answer it.
     for _ in range(50):
-        output = await comm.receive_output(timeout=10.0)
+        output = await comm.receive_output(timeout=deadline.next_wait(10.0))
         if output["type"] != "websocket.send":
             continue
         try:
@@ -213,8 +215,8 @@ async def _wait_for_failed_launch(
     :param timeout_s: Poll budget.
     :returns: The failed ``sandbox_status`` payload.
     """
-    deadline = asyncio.get_running_loop().time() + timeout_s
-    while asyncio.get_running_loop().time() < deadline:
+    deadline = Deadline(timeout_s)
+    while deadline.remaining() > 0:
         snapshot = await env.client.get(f"/v1/sessions/{session_id}")
         assert snapshot.status_code == 200, snapshot.text
         status = snapshot.json()["sandbox_status"]
@@ -244,8 +246,8 @@ async def _wait_for_sandbox_teardown(
     :param host_id: The managed host bound to the failed session.
     :param timeout_s: Poll budget before declaring the sandbox leaked.
     """
-    deadline = asyncio.get_running_loop().time() + timeout_s
-    while asyncio.get_running_loop().time() < deadline:
+    deadline = Deadline(timeout_s)
+    while deadline.remaining() > 0:
         if fake.terminated and env.host_store.get_host(host_id) is None:
             return
         await asyncio.sleep(0.05)
@@ -275,7 +277,7 @@ async def test_harness_refusal_failure_tears_down_managed_sandbox(
     env = teardown_env
     # A healthy fake host registers in well under a second; shrink the
     # online-poll budget so a registration regression fails in seconds.
-    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
+    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", budget(10))
     loop = asyncio.get_running_loop()
     host_futures: list[asyncio.Future[ApplicationCommunicator]] = []
     launched_host_ids: list[str] = []
@@ -348,7 +350,7 @@ async def test_runner_connect_timeout_failure_tears_down_managed_sandbox(
     left to ever delete it.
     """
     env = teardown_env
-    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
+    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", budget(10))
     # No runner ever connects in this test by design; shrink the
     # connect grace so the launch settles in milliseconds, not 30s.
     monkeypatch.setattr(

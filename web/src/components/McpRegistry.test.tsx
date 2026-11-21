@@ -23,6 +23,16 @@ beforeEach(() => {
 });
 
 describe("MCP account connections", () => {
+  it("renders each service's rows from the Settings catalog", async () => {
+    vi.mocked(registryRequest).mockResolvedValue({ data: [service] });
+    render(<McpRegistryConnections />);
+    fireEvent.click(await screen.findByRole("button", { name: "Connect" }));
+    expect(document.querySelector('[data-settings-region="mcp-services:services"]')).not.toBeNull();
+    expect(document.querySelector('[data-settings-row-action="connect"]')).not.toBeNull();
+    expect(document.querySelector('[data-settings-row-field="token"]')).not.toBeNull();
+    expect(document.querySelector('[data-settings-row-action="saveToken"]')).not.toBeNull();
+  });
+
   it.each(["github", "databricks"])(
     "links shared %s accounts to their provider controls",
     async (auth) => {

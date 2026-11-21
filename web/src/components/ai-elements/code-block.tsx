@@ -118,7 +118,8 @@ const LineSpan = ({
   colorScheme: CodeColorScheme | undefined;
 }) => (
   <span className={showLineNumbers ? LINE_NUMBER_CLASSES : "block"}>
-    {keyedLine.tokens.length === 0
+    {/* Plain text gives a blank line one empty token, which would render zero-height. */}
+    {keyedLine.tokens.every(({ token }) => token.content === "")
       ? "\n"
       : keyedLine.tokens.map(({ token, key }) => (
           <TokenSpan key={key} token={token} colorScheme={colorScheme} />
@@ -171,7 +172,8 @@ const getTokensCacheKey = (code: string, language: CodeLanguage) => {
   return `${language}:${code.length}:${start}:${end}`;
 };
 
-const getHighlighter = (
+/** The shared Shiki highlighter for one language, loading its grammar on first use. */
+export const getHighlighter = (
   language: CodeLanguage,
 ): Promise<HighlighterGeneric<BundledLanguage, BundledTheme>> => {
   const cached = highlighterCache.get(language);
@@ -308,7 +310,7 @@ const CodeBlockBody = memo(
       >
         <code
           className={cn(
-            "font-mono text-ui",
+            "literal-code font-mono text-ui",
             showLineNumbers && "[counter-increment:line_0] [counter-reset:line]",
           )}
         >

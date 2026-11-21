@@ -73,8 +73,10 @@ async def read_workspace_from_host(
     :param op: Operation name — ``"list_or_read"`` / ``"changes"`` /
         ``"diff"`` / ``"search"`` / ``"github_info"`` / ``"github_changes"`` /
         ``"github_diff"`` / ``"github_pr_diff"`` / ``"github_labels"`` /
-        ``"github_merge_options"`` / ``"github_reviewers"``. The ``github_*`` ops
-        serve every git provider; their names are stable wire ids.
+        ``"github_merge_options"`` / ``"github_reviewers"`` /
+        ``"github_review_threads"`` / ``"github_review_thread_comments"`` /
+        ``"github_commits"`` / ``"github_commit_diff"`` / ``"github_compare_diff"``.
+        The ``github_*`` ops serve every git provider; their names are stable wire ids.
     :param workspace: Absolute workspace path on the host.
     :param session_id: Session id, forwarded to the change registry.
     :param params: Operation-specific arguments.
@@ -152,7 +154,8 @@ async def write_workspace_from_host(
     of host-servable writes (currently ``"github_set_preference"``,
     ``"github_prs_update"``, ``"github_labels_update"``, ``"github_reviewers_update"``,
     ``"github_details_update"``, ``"github_comment_create"``,
-    ``"github_attachment_upload"``, ``"github_merge"``,
+    ``"github_review_thread_reply"``, ``"github_review_thread_create"``,
+    ``"github_attachment_upload"``, ``"github_merge"``, ``"github_merge_as"``,
     and ``"github_disable_auto_merge"``) so a preference change, a PR attach/remove,
     a label, reviewer, title, or description edit, a comment, an attachment upload, or a merge
     works when the session's runner is offline.
@@ -162,7 +165,8 @@ async def write_workspace_from_host(
     :param op: Write op name — currently ``"github_set_preference"``,
         ``"github_prs_update"``, ``"github_labels_update"``,
         ``"github_reviewers_update"``, ``"github_details_update"``, ``"github_comment_create"``,
-        ``"github_attachment_upload"``, ``"github_merge"``, or
+        ``"github_review_thread_reply"``, ``"github_review_thread_create"``,
+        ``"github_attachment_upload"``, ``"github_merge"``, ``"github_merge_as"``, or
         ``"github_disable_auto_merge"``.
     :param params: Operation-specific arguments, e.g. ``{"account": ...}``.
     :param timeout: Seconds to wait for the host, longer for a slow op like an upload.

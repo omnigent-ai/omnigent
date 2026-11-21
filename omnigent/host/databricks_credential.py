@@ -39,6 +39,7 @@ import logging
 import os
 import shlex
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -47,6 +48,7 @@ import httpx
 
 from omnigent.host.identity import HOST_TOKEN_ENV_VAR, MANAGED_HOST_TOKEN_HEADER
 from omnigent.host.identity_env import in_managed_sandbox
+from omnigent.telemetry.request_headers import client_identity_headers
 
 if TYPE_CHECKING:
     from omnigent.spec.types import AgentSpec
@@ -93,7 +95,7 @@ def _fetch(server: str, host_id: str, host_token: str) -> dict | None:
         try:
             resp = httpx.get(
                 _credential_url(server, host_id),
-                headers={MANAGED_HOST_TOKEN_HEADER: host_token},
+                headers={**client_identity_headers(), MANAGED_HOST_TOKEN_HEADER: host_token},
                 timeout=max(deadline - time.monotonic(), 0.1),
             )
         except httpx.TransportError:
@@ -184,17 +186,25 @@ def _write_sidecar(
         "host_token": host_token,
         "workspace_host": workspace_host,
     }
+    temporary_path: Path | None = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        # Create 0600 atomically so the launch token is never briefly world/group
-        # readable, and fail closed if secure perms can't be guaranteed.
-        with contextlib.suppress(FileNotFoundError):
-            path.unlink()
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        # Keep complete coordinates available to helpers until the 0600 replacement
+        # is ready. A failed write must leave the previous sidecar intact.
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", delete=False
+        ) as handle:
+            temporary_path = Path(handle.name)
             json.dump(payload, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
     except OSError:
         return False
+    finally:
+        if temporary_path is not None:
+            with contextlib.suppress(OSError):
+                temporary_path.unlink()
     return True
 
 

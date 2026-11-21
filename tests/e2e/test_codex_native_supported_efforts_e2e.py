@@ -19,7 +19,9 @@ import shutil
 import subprocess
 import time
 import tomllib
+import traceback
 import uuid
+from collections import deque
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
@@ -30,7 +32,11 @@ import httpx
 import pytest
 
 from omnigent.harnesses.codex_native.app_server import client_for_transport
-from omnigent.harnesses.codex_native.bridge import read_bridge_state
+from omnigent.harnesses.codex_native.bridge import (
+    CodexNativeBridgeState,
+    read_bridge_state,
+    read_bridge_state_result,
+)
 from tests._helpers.live_server import terminate_process
 from tests._helpers.native_session import create_native_session
 from tests._helpers.server_runner import ServerRunner, server_runner
@@ -41,6 +47,111 @@ _EXTENDED_MODEL = os.environ.get("OMNIGENT_TEST_CODEX_EXTENDED_MODEL", "gpt-6-so
 _SWITCH_MODEL = os.environ.get("OMNIGENT_TEST_CODEX_SWITCH_MODEL", "gpt-5.6-sol")
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.mark.parametrize("codex_effort_rig", [30], indirect=True)
+def test_terminal_only_work_survives_runner_inactivity(codex_effort_rig: _Rig) -> None:
+    """A real native turn pins a runner until it settles, without a web message."""
+    rig = codex_effort_rig
+    with _session(rig, _STANDARD_MODEL, "medium") as session:
+        _assert_turn(rig, session, _STANDARD_MODEL, "medium", terminal=True)
+        terminate_process(rig.stack.runner)
+        rig.stack.runner = None
+        rig.stack.start_runner(cwd=_REPO_ROOT, env=rig.runner_env)
+        session.ensure_terminal(rig)
+        runner_log = max((rig.stack.runner_home / ".omnigent/logs/runner").glob("*.log"))
+        assert "Runner session initialization started" not in runner_log.read_text()
+        marker = f"TERMINAL_ONLY_{uuid.uuid4().hex}"
+        _json(rig.model.post("/mock/reset"))
+        _json(
+            rig.model.post(
+                "/mock/configure",
+                json={"key": _STANDARD_MODEL, "responses": [{"text": marker, "block": True}] * 12},
+            )
+        )
+        before = len(_json(rig.model.get("/mock/requests"))["requests"])
+        session.tmux("send-keys", "-l", f"Reply with {marker}")
+        time.sleep(0.5)
+        session.tmux("send-keys", "Enter")
+        deadline = time.monotonic() + 20
+        next_submit = time.monotonic() + 1
+        submits_remaining = 10
+        while time.monotonic() < deadline:
+            state = read_bridge_state(session.bridge)
+            requests = _json(rig.model.get("/mock/requests"))["requests"][before:]
+            own = [
+                request
+                for request in requests
+                if state is not None and request.get("prompt_cache_key") == state.thread_id
+            ]
+            snapshot = _json(rig.api.get(f"/v1/sessions/{session.id}"))
+            if own and snapshot.get("status") == "running":
+                break
+            sent = any(marker in json.dumps(request.get("input")) for request in requests)
+            # The TUI can drop Enter while it is still classifying a paste.
+            if not sent and submits_remaining and next_submit <= time.monotonic() < deadline:
+                session.tmux("send-keys", "Enter")
+                submits_remaining -= 1
+                next_submit = time.monotonic() + 1
+            time.sleep(0.2)
+        else:
+            pytest.fail(
+                "Terminal input did not reach the mock provider.\n"
+                f"{session.tmux('capture-pane', '-p')}"
+            )
+        assert len(own) == 1
+        assert state is not None
+        assert rig.stack.runner is not None
+        held_at = time.monotonic()
+        try:
+            # Do not send runner requests or keep a terminal WebSocket attached here.
+            while time.monotonic() - held_at < 36:
+                assert rig.stack.runner.poll() is None, rig.stack.log_tail()
+                time.sleep(0.25)
+            held_seconds = time.monotonic() - held_at
+            (rig.stack.root / "held-terminal.txt").write_text(session.tmux("capture-pane", "-p"))
+            while _json(rig.model.post("/gate/release"))["released"]:
+                pass
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                items = _json(
+                    rig.api.get(f"/v1/sessions/{session.id}/items", params={"limit": 100})
+                )["data"]
+                replies = [
+                    item
+                    for item in items
+                    if item.get("role") == "assistant"
+                    and marker in json.dumps(item.get("content"))
+                ]
+                state = read_bridge_state(session.bridge)
+                snapshot = _json(rig.api.get(f"/v1/sessions/{session.id}"))
+                if replies and snapshot.get("status") == "idle":
+                    break
+                time.sleep(0.2)
+            else:
+                pytest.fail(f"Terminal turn did not settle.\n{rig.stack.log_tail()}")
+            assert len(replies) == 1
+            assert len([item for item in items if item.get("role") == "user"]) == 2
+            return_code = rig.stack.runner.wait(timeout=50)
+            assert return_code == 0, rig.stack.log_tail()
+            log = runner_log.read_text()
+            assert "idle timeout reached" in log, log[-4000:]
+            assert "Runner session initialization started" not in log
+            (rig.stack.root / "terminal-only-evidence.json").write_text(
+                json.dumps(
+                    {
+                        "held_seconds": held_seconds,
+                        "idle_timeout_s": 30,
+                        "requests": own,
+                        "reply_count": len(replies),
+                        "runner_exit": return_code,
+                    },
+                    indent=2,
+                )
+            )
+        finally:
+            while _json(rig.model.post("/gate/release"))["released"]:
+                pass
 
 
 pytestmark = [
@@ -56,6 +167,147 @@ pytestmark = [
 def _json(response: httpx.Response) -> Any:
     response.raise_for_status()
     return response.json()
+
+
+@dataclass(frozen=True)
+class _FreshTerminalSample:
+    ordinal: int
+    bridge_read_status: str
+    bridge_errno: int | None
+    thread_present: bool
+    session_matches: bool
+    mock_read_status: str
+    total: int | None = None
+    key_present: int | None = None
+    nonempty_string: int | None = None
+    matching: int | None = None
+
+
+def _fresh_terminal_sample(
+    model: httpx.Client, bridge: Path, session_id: str, ordinal: int
+) -> tuple[CodexNativeBridgeState | None, _FreshTerminalSample]:
+    """Keep raw ledger data and failures out of the polling frame."""
+    result = state = response = payload = requests = current = linked = None
+    errors: list[BaseException] = []
+    seen: set[int] = set()
+    bridge_status, bridge_errno = "error", None
+    thread_present = session_matches = False
+    mock_status = "bridge_error"
+    total = key_present = nonempty_string = matching = None
+    try:
+        try:
+            result = read_bridge_state_result(bridge)
+            if result.status not in {
+                "ready",
+                "missing",
+                "not_file",
+                "unreadable",
+                "invalid_encoding",
+                "invalid_json",
+                "invalid_state",
+            }:
+                raise ValueError
+            bridge_status = result.status
+            bridge_errno = result.os_errno if type(result.os_errno) is int else None
+            state = result.state
+            thread_present = bool(state is not None and state.thread_id)
+            session_matches = bool(state is not None and state.session_id == session_id)
+            mock_status = "transport_error"
+            response = model.get("/mock/requests")
+            mock_status = "http_error"
+            response.raise_for_status()
+            mock_status = "decode_error"
+            payload = response.json()
+            mock_status = "invalid_response"
+            if isinstance(payload, dict) and isinstance(payload.get("requests"), list):
+                requests = payload["requests"]
+                mock_status = "invalid_entry"
+                if all(isinstance(request, dict) for request in requests):
+                    total = len(requests)
+                    key_present = sum("prompt_cache_key" in request for request in requests)
+                    nonempty_string = sum(
+                        isinstance(request.get("prompt_cache_key"), str)
+                        and bool(request.get("prompt_cache_key"))
+                        for request in requests
+                    )
+                    matching = sum(
+                        1
+                        for request in requests
+                        if state is not None and request.get("prompt_cache_key") == state.thread_id
+                    )
+                    mock_status = "ready"
+        except BaseException as error:
+            if isinstance(error, KeyboardInterrupt):
+                mock_status = "interrupted"
+            elif isinstance(error, SystemExit):
+                mock_status = "system_exit"
+            errors.append(error)
+            while errors:
+                current = errors.pop()
+                if id(current) in seen:
+                    continue
+                seen.add(id(current))
+                for linked in (current.__cause__, current.__context__):
+                    if linked is not None:
+                        errors.append(linked)
+                if isinstance(current, BaseExceptionGroup):
+                    errors.extend(current.exceptions)
+                traceback.clear_frames(current.__traceback__)
+                current.__traceback__ = current.__cause__ = current.__context__ = None
+        return (
+            state if mock_status == "ready" and matching == 1 else None,
+            _FreshTerminalSample(
+                ordinal,
+                bridge_status,
+                bridge_errno,
+                thread_present,
+                session_matches,
+                mock_status,
+                total,
+                key_present,
+                nonempty_string,
+                matching,
+            ),
+        )
+    finally:
+        # Tracebacks can outlive both successful and failed samples under --showlocals.
+        model = bridge = session_id = None
+        result = state = response = payload = requests = current = linked = None
+        errors.clear()
+
+
+def _wait_for_fresh_terminal_request(
+    model: httpx.Client, session: _Session
+) -> CodexNativeBridgeState:
+    samples: deque[_FreshTerminalSample] = deque(maxlen=8)
+    omitted = ordinal = matching = 0
+    state = None
+    try:
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            ordinal += 1
+            state, sample = _fresh_terminal_sample(model, session.bridge, session.id, ordinal)
+            if len(samples) == 8:
+                omitted += 1
+            samples.append(sample)
+            if sample.mock_read_status == "interrupted":
+                raise KeyboardInterrupt from None
+            if sample.mock_read_status == "system_exit":
+                raise SystemExit(1) from None
+            assert sample.mock_read_status == "ready", (tuple(samples), omitted)
+            matching = sample.matching
+            if matching:
+                break
+            time.sleep(0.1)
+        assert matching == 1, (
+            "Passive samples; input acceptance unknown",
+            tuple(samples),
+            "omitted",
+            omitted,
+        )
+        return state
+    finally:
+        model = session = state = None
 
 
 @dataclass
@@ -87,7 +339,9 @@ class _Rig:
 
 @pytest.fixture(scope="module")
 def codex_effort_rig(
-    tmp_path_factory: pytest.TempPathFactory, mock_llm_server_url: str
+    tmp_path_factory: pytest.TempPathFactory,
+    mock_llm_server_url: str,
+    request: pytest.FixtureRequest,
 ) -> Iterator[_Rig]:
     """Own a real server, runner, and private Codex home without ambient credentials."""
     root = tmp_path_factory.mktemp("codex-supported-efforts")
@@ -98,7 +352,7 @@ def codex_effort_rig(
     (config / "config.yaml").write_text(
         json.dumps(
             {
-                "runner": {"idle_timeout_s": 0},
+                "runner": {"idle_timeout_s": getattr(request, "param", 0)},
                 "providers": {
                     "effort-test": {
                         "kind": "key",
@@ -628,19 +882,7 @@ def test_fresh_terminal_turn_reports_running_before_first_model_output(
         time.sleep(0.5)
         session.tmux("send-keys", "Enter")
         try:
-            deadline = time.monotonic() + 20
-            requests = []
-            while time.monotonic() < deadline:
-                state = read_bridge_state(session.bridge)
-                requests = [
-                    request
-                    for request in _json(rig.model.get("/mock/requests"))["requests"]
-                    if state is not None and request.get("prompt_cache_key") == state.thread_id
-                ]
-                if requests:
-                    break
-                time.sleep(0.1)
-            assert len(requests) == 1, session.tmux("capture-pane", "-p")
+            state = _wait_for_fresh_terminal_request(rig.model, session)
             assert state is not None
 
             async def native_snapshot() -> dict[str, Any]:

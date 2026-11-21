@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import threading
@@ -241,12 +242,278 @@ def test_insert_auth_rejection_refreshes_credentials_and_retries_same_batch(
     sink._client = client  # type: ignore[assignment]
     sink._tokens = dl._TokenSource(config, client)  # type: ignore[arg-type]
     sink._delivered_any = False
+    sink._reset_held_rows()
     batch: list[dl.DebugLogRow] = [{"message": "same batch"}]
 
     sink._post(batch)
 
     assert command_calls == 2
     assert client.insert_payloads == [json.dumps(batch), json.dumps(batch)]
+
+
+def _command_secret_sink(
+    monkeypatch: pytest.MonkeyPatch,
+    outcomes: list[int],
+    token_bodies: list[object] | None = None,
+    insert_statuses: list[int] | None = None,
+) -> tuple[dl.ZerobusLogHandler, list[str], list[int]]:
+    """A worker-less sink whose secret command exits with *outcomes* in turn.
+
+    Token mints answer with *token_bodies* in turn, the last one repeating;
+    inserts answer with *insert_statuses* in turn, then 200. Only accepted
+    inserts are recorded.
+    """
+    bodies = token_bodies or [{"access_token": "token", "expires_in": 3600}]
+    statuses = iter(insert_statuses or [])
+    mints: list[object] = []
+    monkeypatch.setenv(dl.CLIENT_ID_ENV_VAR, "cid")
+    monkeypatch.setenv(dl.CLIENT_SECRET_COMMAND_ENV_VAR, "credential-helper")
+    monkeypatch.setenv(dl.WORKSPACE_URL_ENV_VAR, "https://workspace.example.com")
+    monkeypatch.setenv(dl.ENDPOINT_ENV_VAR, _INSERT_URL)
+    inserted: list[str] = []
+    command_calls: list[int] = []
+
+    def run(*_: object, **__: object) -> object:
+        returncode = outcomes[min(len(command_calls), len(outcomes) - 1)]
+        command_calls.append(returncode)
+        return type("Completed", (), {"returncode": returncode, "stdout": "secret"})()
+
+    class Client:
+        def post(self, url: str, **kwargs: object) -> httpx.Response:
+            if url.endswith("/oidc/v1/token"):
+                body = bodies[min(len(mints), len(bodies) - 1)]
+                mints.append(body)
+                return httpx.Response(200, json=body)
+            status = next(statuses, 200)
+            if status == 200:
+                inserted.append(kwargs["content"])  # type: ignore[arg-type]
+            return httpx.Response(status)
+
+    monkeypatch.setattr(dl.subprocess, "run", run)
+    return _bare_zerobus_sink(Client()), inserted, command_calls
+
+
+def test_mint_failure_holds_rows_and_delivers_them_after_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink, inserted, command_calls = _command_secret_sink(monkeypatch, [1, 0])
+    first: list[dl.DebugLogRow] = [{"message": "startup"}]
+    second: list[dl.DebugLogRow] = [{"message": "later"}]
+
+    sink._post(first)
+    assert inserted == []
+    assert sink._has_held_rows()
+    assert sink._mint_backoff_s == dl._MINT_RETRY_INITIAL_S
+
+    # Inside the backoff window rows queue up without re-running the helper.
+    sink._post(second)
+    assert command_calls == [1]
+    assert inserted == []
+
+    sink._mint_retry_at = 0.0  # backoff elapsed
+    sink._post([])
+    assert command_calls == [1, 0]
+    assert inserted == [json.dumps([*first, *second])]
+    assert not sink._has_held_rows()
+    assert sink._mint_backoff_s == 0.0
+
+
+def test_mint_failure_backoff_grows_and_held_rows_stay_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(dl, "_HELD_MAX_RECORDS", 3)
+    sink, inserted, command_calls = _command_secret_sink(monkeypatch, [1])
+
+    backoffs: list[float] = []
+    for index in range(6):
+        sink._mint_retry_at = 0.0
+        sink._post([{"message": f"row-{index}"}])
+        backoffs.append(sink._mint_backoff_s)
+
+    assert inserted == []
+    assert len(command_calls) == 6
+    assert [row["message"] for row in sink._held_rows] == ["row-3", "row-4", "row-5"]
+    # Failures double the backoff from its floor until the ceiling caps it.
+    assert backoffs == [5.0, 10.0, 20.0, 40.0, 80.0, dl._MINT_RETRY_MAX_S]
+    assert dl._MINT_RETRY_MAX_S == 120.0
+
+
+def test_held_rows_cap_keeps_the_newest_production_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    sink, _, _ = _command_secret_sink(monkeypatch, [1])
+    rows: list[dl.DebugLogRow] = [{"message": f"row-{index}"} for index in range(1_001)]
+
+    sink._post(rows)
+
+    assert dl._HELD_MAX_RECORDS == 1_000
+    assert list(sink._held_rows) == rows[1:]
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        {"access_token": "token", "expires_in": "invalid"},
+        {"access_token": "token", "expires_in": None},
+        ["not", "an", "object"],
+    ],
+)
+def test_malformed_mint_response_preserves_held_rows(
+    monkeypatch: pytest.MonkeyPatch, malformed: object
+) -> None:
+    valid = {"access_token": "token", "expires_in": 3600}
+    sink, inserted, command_calls = _command_secret_sink(
+        monkeypatch, [1, 0], token_bodies=[malformed, valid]
+    )
+    held: list[dl.DebugLogRow] = [{"message": "startup"}]
+    sink._post(held)
+    assert command_calls == [1]
+
+    # The helper recovers but the token response is unusable: keep holding.
+    sink._mint_retry_at = 0.0
+    sink._post([])
+    assert inserted == []
+    assert [row["message"] for row in sink._held_rows] == ["startup"]
+
+    sink._mint_retry_at = 0.0
+    sink._post([])
+    assert inserted == [json.dumps(held)]
+    assert not sink._has_held_rows()
+
+
+def test_held_rows_are_dropped_not_retried_during_shutdown_drain(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(dl, "_diag_last", {})
+    caplog.set_level(logging.WARNING, logger=dl.__name__)
+    sink, inserted, command_calls = _command_secret_sink(monkeypatch, [1])
+    sink._post([{"message": "startup"}])
+    sink._drain_deadline = time.monotonic() + 5.0
+
+    with pytest.raises(dl._ShutdownDeadline) as dropped:
+        sink._post([])
+
+    assert dropped.value.rows == 1
+    # An unresolved secret command is never run under the shutdown deadline.
+    assert command_calls == [1]
+    assert inserted == []
+    assert not sink._has_held_rows()
+    # The earlier "holding" diag must not throttle away the drop notice.
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("holding 1 row(s)" in message for message in messages)
+    assert any("dropping 1 held row(s)" in message for message in messages)
+
+
+def test_mint_failure_mid_batch_holds_only_the_unsent_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(dl, "_BATCH_MAX_RECORDS", 1)
+    # The first token is already stale, so the second chunk re-mints and fails.
+    sink, inserted, _ = _command_secret_sink(
+        monkeypatch, [0], token_bodies=[{"access_token": "token", "expires_in": 0}, {}]
+    )
+    rows: list[dl.DebugLogRow] = [{"message": "sent"}, {"message": "held"}]
+
+    sink._post(rows)
+
+    assert inserted == [json.dumps(rows[:1])]
+    assert list(sink._held_rows) == rows[1:]
+
+
+def test_insert_401_then_failed_remint_holds_the_batch(monkeypatch: pytest.MonkeyPatch) -> None:
+    sink, inserted, command_calls = _command_secret_sink(
+        monkeypatch, [0, 1, 0], insert_statuses=[401]
+    )
+    batch: list[dl.DebugLogRow] = [{"message": "rejected"}]
+
+    sink._post(batch)
+    assert command_calls == [0, 1]  # the 401 dropped the cached secret
+    assert inserted == []
+    assert list(sink._held_rows) == batch
+
+    sink._mint_retry_at = 0.0
+    sink._post([])
+    assert inserted == [json.dumps(batch)]
+    assert not sink._has_held_rows()
+
+
+def test_post_reraises_shutdown_deadline_with_the_unsent_row_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(dl, "_BATCH_MAX_RECORDS", 1)
+    sink, _, _ = _command_secret_sink(monkeypatch, [0])
+    chunk_calls: list[int] = []
+
+    def post_chunk(chunk: list[dl.DebugLogRow]) -> bool:
+        chunk_calls.append(len(chunk))
+        if len(chunk_calls) == 2:
+            raise dl._ShutdownDeadline(len(chunk))
+        return True
+
+    monkeypatch.setattr(sink, "_post_chunk", post_chunk)
+
+    with pytest.raises(dl._ShutdownDeadline) as dropped:
+        sink._post([{"message": f"row-{index}"} for index in range(3)])
+
+    assert chunk_calls == [1, 1]
+    assert dropped.value.rows == 2
+
+
+def test_unexpected_chunk_error_drops_only_that_chunk(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(dl, "_diag_last", {})
+    monkeypatch.setattr(dl, "_BATCH_MAX_RECORDS", 1)
+    caplog.set_level(logging.WARNING, logger=dl.__name__)
+    sink, inserted, _ = _command_secret_sink(monkeypatch, [0])
+    later: list[dl.DebugLogRow] = [{"message": "later"}]
+
+    sink._post([{"message": object()}, *later])  # the first row is not JSON-serializable
+
+    assert inserted == [json.dumps(later)]
+    assert not sink._has_held_rows()
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("dropped 1 row(s) after an unexpected upload error" in m for m in messages)
+
+
+def test_uploader_delivers_held_rows_on_idle_tick(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(dl.CLIENT_ID_ENV_VAR, "cid")
+    monkeypatch.setenv(dl.CLIENT_SECRET_COMMAND_ENV_VAR, "credential-helper")
+    monkeypatch.setenv(dl.WORKSPACE_URL_ENV_VAR, "https://workspace.example.com")
+    monkeypatch.setenv(dl.ENDPOINT_ENV_VAR, _INSERT_URL)
+    monkeypatch.setattr(dl.DebugLogHandler, "_FLUSH_WAIT", 0.01)
+    monkeypatch.setattr(dl, "_MINT_RETRY_INITIAL_S", 0.05)
+    outcomes = iter((1, 0))
+    delivered = threading.Event()
+    payloads: list[str] = []
+
+    def run(*_: object, **__: object) -> object:
+        returncode = next(outcomes, 0)
+        return type("Completed", (), {"returncode": returncode, "stdout": "secret"})()
+
+    class Client:
+        def post(self, url: str, **kwargs: object) -> httpx.Response:
+            if url.endswith("/oidc/v1/token"):
+                return httpx.Response(200, json={"access_token": "token", "expires_in": 3600})
+            payloads.append(kwargs["content"])  # type: ignore[arg-type]
+            delivered.set()
+            return httpx.Response(200)
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(dl.subprocess, "run", run)
+    monkeypatch.setattr(dl.httpx, "Client", lambda **_: Client())
+    config = dl.config_from_env()
+    assert config is not None
+    sink = dl.ZerobusLogHandler(config, "runner")
+    try:
+        record = logging.LogRecord("omnigent.test", logging.INFO, __file__, 1, "early", (), None)
+        sink.emit(record)
+
+        # No further rows arrive: the held row is retried on its own.
+        assert delivered.wait(timeout=2.0)
+        assert [row["message"] for row in json.loads(payloads[0])] == ["early"]
+    finally:
+        sink.close()
 
 
 def test_client_secret_command_runs_on_uploader_thread(
@@ -435,6 +702,30 @@ def test_record_to_row_without_event_or_attributes() -> None:
     row = dl.record_to_row(record, source="host")
     assert row["event_name"] is None
     assert row["attributes"] == {}
+
+
+async def test_log_attributes_follow_task_and_thread_without_leaking() -> None:
+    record = logging.makeLogRecord({"msg": "ordinary lifecycle log"})
+
+    async def read(task_id: str) -> dict:
+        with dl.log_attributes_scope(task_id=task_id, run_id="outer"):
+            with dl.log_attributes_scope(run_id="inner"):
+                row = await asyncio.to_thread(dl.record_to_row, record, "server")
+                assert row["attributes"] == {"task_id": task_id, "run_id": "inner"}
+            return dl.record_to_row(record, "server")
+
+    rows = await asyncio.gather(read("first"), read("second"))
+    assert [row["attributes"] for row in rows] == [
+        {"task_id": "first", "run_id": "outer"},
+        {"task_id": "second", "run_id": "outer"},
+    ]
+    assert dl.record_to_row(record, "server")["attributes"] == {}
+    record.attributes = {"run_id": "explicit", "secret": "Bearer test-secret-token"}
+    with dl.log_attributes_scope(run_id="ambient", token="Bearer ambient-secret-token"):
+        attributes = dl.record_to_row(record, "server")["attributes"]
+    assert attributes["run_id"] == "explicit"
+    assert "test-secret-token" not in attributes["secret"]
+    assert "ambient-secret-token" not in attributes["token"]
 
 
 def test_record_to_row_captures_stack_trace() -> None:
@@ -752,12 +1043,16 @@ def test_emit_revives_closed_uploader(_configured_env: None) -> None:
         sink.close()
         assert sink._closed
         assert not first_thread.is_alive()
+        # Rows held by the old worker (or a fork's parent) must not carry over.
+        sink._held_rows = ({"message": "parent"},)
+        sink._mint_retry_at = sink._mint_backoff_s = 60.0
         # A subsequent record revives the worker (fresh thread) and enqueues.
         record = logging.LogRecord("omnigent.x", logging.INFO, __file__, 1, "hi", (), None)
         sink.emit(record)
         assert not sink._closed
         assert sink._thread is not first_thread
         assert sink._thread.is_alive()
+        assert (sink._held_rows, sink._mint_retry_at, sink._mint_backoff_s) == ((), 0.0, 0.0)
     finally:
         sink.close()
 
@@ -984,7 +1279,7 @@ def test_parse_app_host_non_apps_urls_yield_nothing() -> None:
     # Managed service (dbc-<hash> host), localhost, a custom domain, and empty
     # input carry no parseable Databricks Apps identity.
     assert dl._parse_databricks_app_host(
-        "https://dbc-a5d4177a-49dc.cloud.databricks.com/omnigent"
+        "https://dbc-12345678-abcd.cloud.databricks.com/omnigent"
     ) == (None, None)
     assert dl._parse_databricks_app_host("http://localhost:8000") == (None, None)
     assert dl._parse_databricks_app_host("https://omnigent.example.com") == (None, None)
@@ -1032,7 +1327,7 @@ def test_process_identity_managed_service_is_none(monkeypatch: pytest.MonkeyPatc
     # Managed service: no DATABRICKS_* env and the server URL is a dbc-<hash> host,
     # not an Apps URL. Identity arrives per-record, so the process constant is empty.
     monkeypatch.setenv(
-        dl.SERVER_URL_ENV_VAR, "https://dbc-a5d4177a-49dc.cloud.databricks.com/omnigent"
+        dl.SERVER_URL_ENV_VAR, "https://dbc-12345678-abcd.cloud.databricks.com/omnigent"
     )
     assert dl._process_identity() == (None, None)
 
@@ -1533,7 +1828,7 @@ class _FakeZerobus:
         pass
 
 
-def _bare_zerobus_sink(client: _FakeZerobus) -> dl.ZerobusLogHandler:
+def _bare_zerobus_sink(client: object) -> dl.ZerobusLogHandler:
     config = dl.config_from_env()
     assert config is not None
     sink = object.__new__(dl.ZerobusLogHandler)
@@ -1541,6 +1836,7 @@ def _bare_zerobus_sink(client: _FakeZerobus) -> dl.ZerobusLogHandler:
     sink._client = client  # type: ignore[assignment]
     sink._tokens = dl._TokenSource(config, client)  # type: ignore[arg-type]
     sink._delivered_any = False
+    sink._reset_held_rows()
     return sink
 
 
@@ -1718,3 +2014,15 @@ def test_near_deadline_auth_rejection_does_not_start_a_new_mint(_configured_env:
 
     assert client.mints == 1
     assert client.inserts == 1
+
+
+def test_stage_timings_split_wall_time_into_marked_stages() -> None:
+    """Each mark closes the stage since the previous one; repeats accumulate."""
+    moments = iter([0.0, 0.010, 0.250, 0.300, 0.400])
+    timings = dl.StageTimings(clock=lambda: next(moments))
+
+    timings.mark("config")
+    timings.mark("catalog")
+    timings.mark("config")
+
+    assert timings.attributes() == {"config_ms": 60, "catalog_ms": 240, "total_ms": 400}

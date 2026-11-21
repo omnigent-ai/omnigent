@@ -799,6 +799,7 @@ async def test_rejected_native_switch_restores_saved_model(
         "type": "model_change",
         "model": forwarded_model,
         "rollback_on_refusal": True,
+        "cold_start_settings": True,
     }
     saved = env.store.get_conversation(session_id)
     assert saved is not None

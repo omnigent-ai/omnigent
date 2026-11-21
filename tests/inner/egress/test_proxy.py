@@ -12,19 +12,29 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from unittest.mock import Mock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from omnigent.inner.claude_gateway_shim import gateway_body_transform
+from omnigent.inner.claude_model_access import ClaudeModelAccess
 from omnigent.inner.credential_proxy import (
+    CODEX_GATEWAY_TOKEN_ENV,
     SYNTHETIC_CREDENTIAL_PREFIX,
     CredentialRewriteRule,
     RefreshingSecretProvider,
     prepare_credential_proxy_runtime,
 )
+from omnigent.inner.datamodel import (
+    CredentialProxyEntry,
+    CredentialProxySpec,
+    CredentialSourceSpec,
+)
+from omnigent.inner.egress import controller
 from omnigent.inner.egress.ca import ensure_ca, ensure_ca_bundle
 from omnigent.inner.egress.certs import HostCertCache
-from omnigent.inner.egress.proxy import EgressProxy
+from omnigent.inner.egress.proxy import EgressProxy, RequestBodyTransform
 from omnigent.inner.egress.rules import parse_rules
 from omnigent.inner.sandbox import SandboxPolicy
 from omnigent.spec.parser import _parse_credential_proxy
@@ -218,6 +228,169 @@ async def test_proxy_start_unix(ca_paths: tuple[Path, Path, Path], short_tmp_par
     # Socket file is created
     assert sock_path.exists()
     await proxy.stop()
+
+
+def test_controller_rejects_unauthenticated_credential_rewrites_before_setup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resolve_secret = Mock(side_effect=AssertionError("credential must not be resolved"))
+    setup = Mock(side_effect=AssertionError("proxy setup must not start"))
+    monkeypatch.setattr(controller, "IS_WINDOWS", False)
+    monkeypatch.setattr(controller, "ensure_ca", setup)
+    monkeypatch.setattr(controller, "EgressProxy", setup)
+    monkeypatch.setattr(ClaudeModelAccess, "create_proxy", setup)
+
+    with pytest.raises(ValueError, match="credential rewrites require proxy authentication"):
+        controller.start_egress_proxy(
+            rules=[],
+            tmpdir=tmp_path,
+            allow_private_destinations=False,
+            require_auth=False,
+            credential_rewrites=[
+                CredentialRewriteRule(
+                    host="api.example.test", scheme="bearer", secret_provider=resolve_secret
+                )
+            ],
+        )
+
+    setup.assert_not_called()
+    resolve_secret.assert_not_called()
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "listener-error",
+        "readiness-timeout",
+        "startup-completes-at-deadline",
+        "listener-fails-at-deadline",
+        "cleanup-overlaps-timeout",
+    ],
+)
+def test_controller_startup_failure_reaches_caller_and_releases_resources(
+    ca_paths: tuple[Path, Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    cert_path, key_path, bundle_path = ca_paths
+    scratch = tmp_path / "proxy"
+    scratch.mkdir()
+    proxy = EgressProxy([], cert_path, key_path)
+    listener = Mock(close=Mock(), wait_closed=AsyncMock())
+    entered_start = threading.Event()
+    ready = threading.Event()
+    startup_tasks: list[asyncio.Task[None]] = []
+    worker_threads: list[threading.Thread] = []
+    loops: list[asyncio.AbstractEventLoop] = []
+    listener_error = OSError("listener unavailable")
+    cleanup_entered = threading.Event()
+    cleanup_release = asyncio.Event()
+    original_stop = proxy.stop
+    startup_pending_future: asyncio.Future[None] | None = None
+
+    async def stop_proxy() -> None:
+        if failure == "cleanup-overlaps-timeout":
+            cleanup_entered.set()
+            await cleanup_release.wait()
+        await original_stop()
+
+    async def start_listener(_path: str) -> None:
+        nonlocal startup_pending_future
+        loop = asyncio.get_running_loop()
+        loops.append(loop)
+        worker_threads.append(threading.current_thread())
+        task = asyncio.current_task()
+        assert task is not None
+        startup_tasks.append(task)
+        # A partially started listener must also be closed on startup failure.
+        proxy._servers.append(listener)
+        if failure in ("listener-error", "listener-fails-at-deadline", "cleanup-overlaps-timeout"):
+            entered_start.set()
+            raise listener_error
+        startup_pending = loop.create_future()
+        if failure == "startup-completes-at-deadline":
+            startup_pending_future = startup_pending
+        entered_start.set()
+        await startup_pending
+
+    def readiness_wait(timeout: float) -> bool:
+        if failure == "listener-error":
+            return ready.wait(timeout)
+        assert entered_start.wait(1), "proxy thread did not enter listener startup"
+        if failure == "startup-completes-at-deadline":
+            assert startup_pending_future is not None
+            loops[0].call_soon_threadsafe(startup_pending_future.set_result, None)
+            assert ready.wait(1)
+        if failure == "listener-fails-at-deadline":
+            worker_threads[0].join(timeout=1)
+            assert loops[0].is_closed()
+        if failure == "cleanup-overlaps-timeout":
+            assert cleanup_entered.wait(1)
+            loop = loops[0]
+            call_soon_threadsafe = loop.call_soon_threadsafe
+
+            def release_after_timeout(callback, *args) -> None:
+                call_soon_threadsafe(callback, *args)
+                call_soon_threadsafe(cleanup_release.set)
+
+            monkeypatch.setattr(loop, "call_soon_threadsafe", release_after_timeout)
+        return False
+
+    # The listener is stubbed, so exercise the lifecycle on every host.
+    monkeypatch.setattr(controller, "IS_WINDOWS", False)
+    monkeypatch.setattr(controller, "ensure_ca", lambda: (cert_path, key_path))
+    monkeypatch.setattr(controller, "ensure_ca_bundle", lambda _cert: bundle_path)
+    monkeypatch.setattr(controller, "EgressProxy", Mock(return_value=proxy))
+    monkeypatch.setattr(proxy, "start_unix", start_listener)
+    monkeypatch.setattr(proxy, "stop", stop_proxy)
+    # Keep Thread's own bootstrap event real; only the controller's wait expires.
+    monkeypatch.setattr(
+        controller,
+        "threading",
+        SimpleNamespace(
+            Thread=threading.Thread,
+            Event=Mock(
+                side_effect=[
+                    SimpleNamespace(set=ready.set, wait=readiness_wait),
+                    threading.Event(),
+                    threading.Event(),
+                ]
+            ),
+        ),
+    )
+
+    error_type = OSError if failure == "listener-error" else TimeoutError
+    message = "could not start" if failure == "listener-error" else "did not become ready"
+    try:
+        with pytest.raises(error_type, match=message) as raised:
+            controller.start_egress_proxy(
+                rules=[],
+                tmpdir=scratch,
+                allow_private_destinations=False,
+                require_auth=True,
+            )
+
+        if failure == "listener-error":
+            assert raised.value.__cause__ is listener_error
+        assert len(worker_threads) == 1
+        assert not worker_threads[0].is_alive()
+        assert loops[0].is_closed()
+        listener.close.assert_called_once_with()
+        listener.wait_closed.assert_awaited_once_with()
+        assert proxy._servers == []
+        assert all(task.done() for task in startup_tasks)
+        if failure == "readiness-timeout":
+            assert startup_tasks[0].cancelled()
+        elif failure == "startup-completes-at-deadline":
+            assert startup_tasks[0].result() is None
+    finally:
+        for loop, worker in zip(loops, worker_threads, strict=True):
+            if worker.is_alive():
+                loop.call_soon_threadsafe(asyncio.BaseEventLoop.stop, loop)
+                worker.join(timeout=1)
 
 
 @pytest.mark.asyncio
@@ -1341,18 +1514,126 @@ def _mitm_client_selected_alpn(
             raw.close()
 
 
+def test_body_transform_rebuilds_bare_lf_headers_with_one_length() -> None:
+    proxy = EgressProxy.__new__(EgressProxy)
+    proxy._request_body_transform = Mock(return_value=b"replacement")
+    headers = b"Host: gateway.example.com\nContent-Length: 40\nTransfer-Encoding: chunked\n\n"
+
+    forwarded, body = proxy._transform_request_body(
+        "POST", "gateway.example.com", 443, "/allowed", headers, b"{}"
+    )
+
+    assert body == b"replacement"
+    assert forwarded == (b"Host: gateway.example.com\r\nContent-Length: 11\r\n\r\n")
+    assert b"Content-Length: 11\r\n" in proxy._force_connection_close(forwarded)
+
+
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tls", [False, True])
+async def test_compatibility_body_patch_preserves_framing_and_policy(
+    ca_paths: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch, tls: bool
+) -> None:
+    cert_path, key_path, bundle_path = ca_paths
+    host = "gateway.example.com"
+    received: list[tuple[bytes, bytes]] = []
+    replacement = b'{"thinking":{"display":"summarized"}}'
+    transform = Mock(return_value=replacement)
+
+    async def upstream_request(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        headers = await reader.readuntil(b"\r\n\r\n")
+        length = int(
+            EgressProxy._parse_header_dict(headers.partition(b"\r\n")[2])["content-length"]
+        )
+        received.append((headers, await reader.readexactly(length)))
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    upstream = await asyncio.start_server(
+        upstream_request,
+        "127.0.0.1",
+        0,
+        ssl=HostCertCache(cert_path, key_path).get_ssl_context(host) if tls else None,
+    )
+    upstream_port = upstream.sockets[0].getsockname()[1]
+    proxy = EgressProxy(
+        parse_rules([f"POST {host}/allowed"]),
+        cert_path,
+        key_path,
+        upstream_ca_bundle=bundle_path,
+        block_private_destinations=False,
+        request_body_transform=transform,
+    )
+    proxy_port = await proxy.start_tcp()
+    monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", _resolve_to_loopback())
+    try:
+        assert not proxy._allows_http2_passthrough(host)
+        for path, status in (("/allowed", b"200 OK"), ("/forbidden", b"403 Forbidden")):
+            target = path if tls else f"http://{host}:{upstream_port}{path}"
+            request = (
+                f"POST {target} HTTP/1.1\r\nHost: {host}:{upstream_port}\r\n"
+                "Content-Length: 2\r\nContent-Type: application/json\r\n\r\n{}"
+            ).encode()
+            if tls:
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        _mitm_client_send_inner,
+                        proxy_port,
+                        f"{host}:{upstream_port}",
+                        host,
+                        bundle_path,
+                        request,
+                    ),
+                    timeout=15,
+                )
+            else:
+                reader, writer = await asyncio.open_connection("127.0.0.1", proxy_port)
+                writer.write(request)
+                await writer.drain()
+                response = await asyncio.wait_for(reader.read(), timeout=5)
+                writer.close()
+                await writer.wait_closed()
+            assert status in response
+        transform.assert_called_once_with("POST", host, upstream_port, "/allowed", b"{}")
+        assert len(received) == 1
+        headers, body = received[0]
+        assert body == replacement
+        assert headers.lower().count(b"content-length:") == 1
+        assert b"Content-Type: application/json" in headers
+    finally:
+        await proxy.stop()
+        upstream.close()
+        await upstream.wait_closed()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "use_upstream_proxy,model_relay",
+    [(False, False), (True, False), (False, True)],
+    ids=["direct", "upstream-proxy", "model-relay"],
+)
 async def test_connect_relays_http2_for_unrestricted_host(
     ca_paths: tuple[Path, Path, Path],
     monkeypatch: pytest.MonkeyPatch,
+    use_upstream_proxy: bool,
+    model_relay: bool,
 ) -> None:
     cert_path, key_path, bundle_path = ca_paths
     host = "agent.example.com"
     request = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\nopaque-client-frames"
     response = b"opaque-server-frames"
     received: list[bytes] = []
+    connects: list[bytes] = []
+    negotiated_protocols: list[str | None] = []
 
     async def _upstream(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        if use_upstream_proxy:
+            connects.append(await reader.readuntil(b"\r\n\r\n"))
+            writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            await writer.drain()
+            await writer.start_tls(upstream_ctx)
+        negotiated_protocols.append(writer.get_extra_info("ssl_object").selected_alpn_protocol())
         received.append(await reader.readexactly(len(request)))
         writer.write(response)
         await writer.drain()
@@ -1360,14 +1641,21 @@ async def test_connect_relays_http2_for_unrestricted_host(
 
     upstream_ctx = HostCertCache(cert_path, key_path).get_ssl_context(host)
     upstream_ctx.set_alpn_protocols(["h2"])
-    upstream = await asyncio.start_server(_upstream, "127.0.0.1", 0, ssl=upstream_ctx)
+    upstream = await asyncio.start_server(
+        _upstream, "127.0.0.1", 0, ssl=None if use_upstream_proxy else upstream_ctx
+    )
     upstream_port = upstream.sockets[0].getsockname()[1]
-    proxy = EgressProxy(
+    if use_upstream_proxy:
+        monkeypatch.setenv("https_proxy", f"http://127.0.0.1:{upstream_port}")
+    access = ClaudeModelAccess("https://model.example.com", "x-api-key", lambda: "secret")
+    factory = access.create_proxy if model_relay else EgressProxy
+    proxy = factory(
         parse_rules([f"* {host}/**"]),
         cert_path,
         key_path,
         upstream_ca_bundle=bundle_path,
         block_private_destinations=False,
+        request_body_transform=gateway_body_transform(access.base_url) if model_relay else None,
     )
     proxy_port = await proxy.start_tcp()
     monkeypatch.setattr(asyncio.get_event_loop(), "getaddrinfo", _resolve_to_loopback())
@@ -1386,6 +1674,17 @@ async def test_connect_relays_http2_for_unrestricted_host(
         )
         assert received == [request]
         assert observed == response
+        assert negotiated_protocols == ["h2"]
+        assert connects == (
+            [
+                (
+                    f"CONNECT {host}:{upstream_port} HTTP/1.1\r\n"
+                    f"Host: {host}:{upstream_port}\r\n\r\n"
+                ).encode()
+            ]
+            if use_upstream_proxy
+            else []
+        )
     finally:
         await proxy.stop()
         upstream.close()
@@ -1393,24 +1692,43 @@ async def test_connect_relays_http2_for_unrestricted_host(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "proxy_kind", ["generic", "gateway-transform", "model-relay", "unknown-transform"]
+)
 async def test_connect_advertises_http2_only_for_safe_passthrough(
     ca_paths: tuple[Path, Path, Path],
+    proxy_kind: str,
 ) -> None:
     cert_path, key_path, bundle_path = ca_paths
     unrestricted_host = "unrestricted.example.com"
     restricted_host = "restricted.example.com"
     credential_host = "credential.example.com"
-    proxy = EgressProxy(
+    model_host = "model.example.com"
+    access = ClaudeModelAccess(f"https://{model_host}/anthropic", "x-api-key", lambda: "secret")
+    factory = access.create_proxy if proxy_kind == "model-relay" else EgressProxy
+    transform: RequestBodyTransform | None = None
+    if proxy_kind in ("gateway-transform", "model-relay"):
+        transform = gateway_body_transform(access.base_url)
+    elif proxy_kind == "unknown-transform":
+
+        def passthrough(_method: str, _host: str, _port: int, _path: str, body: bytes) -> bytes:
+            return body
+
+        transform = passthrough
+    proxy = factory(
         parse_rules(
             [
                 f"* {unrestricted_host}/**",
                 f"POST {restricted_host}/allowed/**",
                 f"* {credential_host}/**",
+                f"* {model_host}/**",
             ]
         ),
         cert_path,
         key_path,
+        upstream_ca_bundle=bundle_path,
         block_private_destinations=False,
+        request_body_transform=transform,
         credential_rewrites=[
             CredentialRewriteRule(
                 host=credential_host,
@@ -1424,9 +1742,10 @@ async def test_connect_advertises_http2_only_for_safe_passthrough(
 
     try:
         for host, expected in (
-            (unrestricted_host, "h2"),
+            (unrestricted_host, "http/1.1" if proxy_kind == "unknown-transform" else "h2"),
             (restricted_host, "http/1.1"),
             (credential_host, "http/1.1"),
+            (model_host, "h2" if proxy_kind == "generic" else "http/1.1"),
         ):
             selected = await asyncio.wait_for(
                 asyncio.to_thread(
@@ -1438,7 +1757,7 @@ async def test_connect_advertises_http2_only_for_safe_passthrough(
                 ),
                 timeout=15,
             )
-            assert selected == expected
+            assert selected == expected, host
     finally:
         await proxy.stop()
 
@@ -1514,6 +1833,213 @@ async def test_connect_blocks_http2_when_host_has_credential_rewrite(
         assert b"credential rewrite rule" in observed
     finally:
         await proxy.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_relay", [False, True])
+async def test_connect_blocks_http2_when_relay_requires_http1(
+    ca_paths: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch, model_relay: bool
+) -> None:
+    from omnigent.inner.claude_model_access import ClaudeModelAccess
+
+    cert_path, key_path, bundle_path = ca_paths
+    host = "model.example.com"
+    rules = parse_rules([f"* {host}/**"])
+    if model_relay:
+        proxy = ClaudeModelAccess(f"https://{host}", "x-api-key", lambda: "secret").create_proxy(
+            rules,
+            cert_path,
+            key_path,
+            upstream_ca_bundle=bundle_path,
+            block_private_destinations=False,
+        )
+    else:
+        proxy = EgressProxy(
+            rules,
+            cert_path,
+            key_path,
+            block_private_destinations=False,
+            request_body_transform=lambda *args: args[-1],
+        )
+    forward = AsyncMock()
+    monkeypatch.setattr(proxy, "_forward_http2", forward)
+    proxy_port = await proxy.start_tcp()
+    try:
+        # A malicious client can send the preface without negotiating HTTP/2.
+        observed = await asyncio.wait_for(
+            asyncio.to_thread(
+                _mitm_client_send_inner,
+                proxy_port,
+                f"{host}:443",
+                host,
+                bundle_path,
+                b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+            ),
+            timeout=15,
+        )
+        assert b"403 Forbidden" in observed
+        forward.assert_not_awaited()
+    finally:
+        await proxy.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_host", [False, True], ids=["ordinary-host", "model-host"])
+@pytest.mark.parametrize(
+    "request_line,extra_headers,forwarded_headers",
+    [
+        pytest.param(
+            b"POST /v1/messages HTTP/1.1\r\n",
+            b"X-Tag: first\r\nX-Tag: second\r\n",
+            b"X-Tag: first\r\nX-Tag: second\r\n",
+            id="repeated-header",
+        ),
+        pytest.param(
+            b"POST /v1/messages HTTP/1.1\r\n",
+            b"X-Label: caf\xe9\r\n",
+            b"X-Label: =?unknown-8bit?q?caf=E9?=\r\n",
+            id="non-ascii-header",
+        ),
+        pytest.param(
+            b"POST /v1/messages HTTP/1.1\r\n",
+            b"Expect: 100-continue\r\n",
+            b"Expect: 100-continue\r\n",
+            id="expect-with-eager-body",
+        ),
+        pytest.param(
+            b"POST   /v1/messages   HTTP/1.0\r\n",
+            b"",
+            None,
+            id="noncanonical-request-line",
+        ),
+    ],
+)
+async def test_claude_relay_scopes_strict_connect_parsing_to_model_host(
+    ca_paths: tuple[Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    model_host: bool,
+    request_line: bytes,
+    extra_headers: bytes,
+    forwarded_headers: bytes | None,
+) -> None:
+    """Ordinary HTTPS remains compatible while signed framing stays strict."""
+    from omnigent.inner.claude_model_access import ClaudeModelAccess
+
+    cert_path, key_path, bundle_path = ca_paths
+    host = "model.example.com" if model_host else "ordinary.example.com"
+    body = b'{"model":"claude-test","messages":[]}'
+    received: list[tuple[bytes, bytes]] = []
+
+    async def upstream_request(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            headers = await reader.readuntil(b"\r\n\r\n")
+            received.append((headers, await reader.readexactly(len(body))))
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    upstream = await asyncio.start_server(
+        upstream_request,
+        "127.0.0.1",
+        0,
+        ssl=HostCertCache(cert_path, key_path).get_ssl_context(host),
+    )
+    upstream_port = upstream.sockets[0].getsockname()[1]
+    access = ClaudeModelAccess("https://model.example.com", "x-api-key", lambda: "parent-secret")
+    proxy = access.create_proxy(
+        parse_rules(["POST ordinary.example.com/v1/messages"]),
+        cert_path,
+        key_path,
+        upstream_ca_bundle=bundle_path,
+        block_private_destinations=False,
+    )
+    forward = AsyncMock(wraps=proxy._forward_https)
+    monkeypatch.setattr(proxy, "_forward_https", forward)
+    credential = AsyncMock(side_effect=AssertionError("request must not resolve credentials"))
+    monkeypatch.setattr(proxy._credential_source, "token_for_request", credential)
+    proxy_port = await proxy.start_tcp()
+    monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", _resolve_to_loopback())
+    request = (
+        request_line
+        + (
+            f"Host: {host}\r\nContent-Type: application/json\r\nContent-Length: {len(body)}\r\n"
+        ).encode()
+        + (f"Authorization: Bearer {access.placeholder}\r\n".encode() if model_host else b"")
+        + extra_headers
+        + b"\r\n"
+        + body
+    )
+    try:
+        # Expect is sent with the body immediately; no 100-continue handshake is tested.
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                _mitm_client_send_inner,
+                proxy_port,
+                f"{host.upper()}:{443 if model_host else upstream_port}",
+                host,
+                bundle_path,
+                request,
+            ),
+            timeout=15,
+        )
+        if model_host:
+            assert b"403 Forbidden" in response
+            forward.assert_not_awaited()
+            assert received == []
+        else:
+            assert response.startswith(b"HTTP/1.1 200 OK\r\n"), response
+            forward.assert_awaited_once()
+            assert len(received) == 1
+            headers, received_body = received[0]
+            assert headers.startswith(b"POST /v1/messages HTTP/1.1\r\n")
+            if forwarded_headers is not None:
+                assert forwarded_headers in headers
+            assert received_body == body
+            assert b"Authorization:" not in headers
+            assert b"parent-secret" not in headers
+        credential.assert_not_awaited()
+    finally:
+        await proxy.stop()
+        upstream.close()
+        await upstream.wait_closed()
+
+
+def test_tunnel_parser_defaults_preserve_frozen_signer_framing(
+    ca_paths: tuple[Path, Path, Path],
+) -> None:
+    """Signers without a host override retain their frozen route and strict headers."""
+    from omnigent.inner.model_egress import FrozenModelRoute
+    from omnigent.inner.model_signer_service import _SignerRelay
+    from omnigent.inner.model_signing import SigningRejected
+
+    cert_path, key_path, bundle_path = ca_paths
+    host = "model.example.com"
+    proxy = _SignerRelay(
+        route=FrozenModelRoute("POST", host, "/v1/responses"),
+        placeholder="session-placeholder",
+        bearer_token="parent-secret",
+        ca_cert_path=cert_path,
+        ca_key_path=key_path,
+        ca_bundle_path=bundle_path,
+        provider_port=None,
+    )
+    assert proxy._parse_tunnel_request_line(host, b"POST /v1/responses HTTP/1.1\r\n") == (
+        "POST",
+        "/v1/responses",
+    )
+    assert proxy._parse_tunnel_content_length(host, b"Content-Length: 0\r\n\r\n") == 0
+    with pytest.raises(SigningRejected):
+        proxy._parse_tunnel_request_line(host, b"POST /other-route HTTP/1.1\r\n")
+    with pytest.raises(SigningRejected):
+        proxy._parse_tunnel_content_length(
+            host, b"Content-Length: 0\r\nX-Tag: first\r\nX-Tag: second\r\n\r\n"
+        )
+    with pytest.raises(SigningRejected):
+        proxy._parse_tunnel_content_length(
+            host, b"Content-Length: 0\r\nTransfer-Encoding: chunked\r\n\r\n"
+        )
 
 
 @pytest.mark.asyncio
@@ -2120,13 +2646,18 @@ async def test_credential_rewrite_swaps_via_refreshing_provider(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("tls", [False, True])
+@pytest.mark.parametrize(
+    "tls,brokered",
+    [(False, False), (True, False), (True, True)],
+    ids=["http", "https", "brokered"],
+)
 async def test_running_proxy_refreshes_after_idle_and_recovers_from_source_failure(
     ca_paths: tuple[Path, Path, Path],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     tls: bool,
+    brokered: bool,
 ) -> None:
     cert_path, key_path, bundle_path = ca_paths
     token_file = tmp_path / "private-source-marker"
@@ -2136,8 +2667,13 @@ async def test_running_proxy_refreshes_after_idle_and_recovers_from_source_failu
         "omnigent.inner.credential_proxy.RefreshingSecretProvider",
         partial(RefreshingSecretProvider, clock=clock),
     )
+    binding = (
+        {"type": "https_bearer", "target": "model.example.com", "env": CODEX_GATEWAY_TOKEN_ENV}
+        if brokered
+        else {"type": "gh_basic"}
+    )
     spec = _parse_credential_proxy(
-        [{"type": "gh_basic", "source": {"file": str(token_file), "refresh_interval_seconds": 60}}]
+        [{**binding, "source": {"file": str(token_file), "refresh_interval_seconds": 60}}]
     )
     policy = SandboxPolicy(
         backend_type="linux_bwrap",
@@ -2151,11 +2687,15 @@ async def test_running_proxy_refreshes_after_idle_and_recovers_from_source_failu
     placeholders = dict(runtime.helper_env_updates)
     captured: list[_CapturedRequest] = []
     upstreams: dict[str, asyncio.Server] = {}
-    for host in ("github.com", "api.github.com"):
+    for host in ("model.example.com",) if brokered else ("github.com", "api.github.com"):
         context = HostCertCache(cert_path, key_path).get_ssl_context(host) if tls else None
         upstreams[host] = await _start_capturing_upstream(captured, context)
     proxy = EgressProxy(
-        parse_rules(["* github.com/**", "* api.github.com/**"]),
+        parse_rules(
+            ["POST model.example.com/v1/responses"]
+            if brokered
+            else ["* github.com/**", "* api.github.com/**"]
+        ),
         cert_path,
         key_path,
         upstream_ca_bundle=bundle_path,
@@ -2163,19 +2703,28 @@ async def test_running_proxy_refreshes_after_idle_and_recovers_from_source_failu
         credential_rewrites=runtime.rewrites,
     )
     port = await proxy.start_tcp()
-    monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", _resolve_to_loopback())
+    resolve = _resolve_to_loopback()
 
-    async def request(host: str) -> bytes:
-        upstream_port = upstreams[host].sockets[0].getsockname()[1]
-        target = "/probe" if tls else f"http://{host}:{upstream_port}/probe"
-        auth = (
-            f"Authorization: token {placeholders['GH_TOKEN']}\r\n"
-            if host.startswith("api.")
-            else ""
-        )
+    async def resolve_upstream(host: str, port: int, *args: object, **kwargs: object) -> list:
+        if brokered and host in upstreams and port == 443:
+            port = upstreams[host].sockets[0].getsockname()[1]
+        return await resolve(host, port, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", resolve_upstream)
+
+    async def request(host: str, path: str | None = None, *, bare: bool = False) -> bytes:
+        upstream_port = 443 if brokered else upstreams[host].sockets[0].getsockname()[1]
+        path = path or ("/v1/responses" if brokered else "/probe")
+        target = path if tls else f"http://{host}:{upstream_port}{path}"
+        auth = ""
+        if brokered and not bare:
+            auth = f"Authorization: Bearer {placeholders[CODEX_GATEWAY_TOKEN_ENV]}\r\n"
+        elif host.startswith("api."):
+            auth = f"Authorization: token {placeholders['GH_TOKEN']}\r\n"
+        method = "POST" if brokered else "GET"
         headers = (
-            f"GET {target} HTTP/1.1\r\nHost: {host}:{upstream_port}\r\n"
-            f"{auth}Connection: close\r\n\r\n"
+            f"{method} {target} HTTP/1.1\r\nHost: {host}:{upstream_port}\r\n"
+            f"{auth}Content-Length: 0\r\nConnection: close\r\n\r\n"
         ).encode()
         if tls:
             return await asyncio.wait_for(
@@ -2199,26 +2748,33 @@ async def test_running_proxy_refreshes_after_idle_and_recovers_from_source_failu
             await writer.wait_closed()
 
     try:
+        if brokered:
+            assert b"200 OK" in await request("model.example.com", bare=True)
+            assert captured[-1].authorization is None
+            assert b"403 Forbidden" in await request("model.example.com", "/v1/models")
+            assert len(captured) == 1
+            captured.clear()
         clock.return_value = 4 * 3600.0
         token_file.write_text("after-idle")
         for host in upstreams:
             assert b"200 OK" in await request(host)
         expected_basic = base64.b64encode(b"x-access-token:after-idle").decode()
-        assert [capture.authorization for capture in captured] == [
-            f"Basic {expected_basic}",
-            "token after-idle",
-        ]
+        assert [capture.authorization for capture in captured] == (
+            ["Bearer after-idle"] if brokered else [f"Basic {expected_basic}", "token after-idle"]
+        )
         token_file.unlink()
         clock.return_value += 60
         for host in upstreams:
             response = await request(host)
             assert b"502 Bad Gateway" in response
             assert b"private-source-marker" not in response
-        assert len(captured) == 2
+        assert len(captured) == len(upstreams)
         assert "private-source-marker" not in caplog.text
         token_file.write_text("recovered")
-        assert b"200 OK" in await request("api.github.com")
-        assert captured[-1].authorization == "token recovered"
+        assert b"200 OK" in await request("model.example.com" if brokered else "api.github.com")
+        assert captured[-1].authorization == (
+            "Bearer recovered" if brokered else "token recovered"
+        )
         assert runtime.helper_env_updates == placeholders
     finally:
         await proxy.stop()
@@ -2464,6 +3020,85 @@ async def test_credential_rewrite_injects_on_access_without_header(
     # The proxy synthesized the Authorization header from the rule — the
     # client sent none.
     assert captured[0].authorization == "Bearer real-secret-value"
+
+
+@pytest.mark.asyncio
+async def test_brokered_rule_needs_placeholder_and_https(
+    ca_paths: tuple[Path, Path, Path],
+    tmp_path: Path,
+) -> None:
+    cert_path, key_path, _ = ca_paths
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    token_file = tmp_path / "model-token"
+    token_file.write_text("real-secret-value")
+    runtime = prepare_credential_proxy_runtime(
+        CredentialProxySpec(
+            entries=[
+                CredentialProxyEntry(
+                    host="127.0.0.1",
+                    scheme="bearer",
+                    source=CredentialSourceSpec(
+                        kind="file", path=str(token_file), refresh_interval_seconds=300
+                    ),
+                    inject_env=[CODEX_GATEWAY_TOKEN_ENV],
+                )
+            ]
+        ),
+        parent_env={},
+        sandbox=SandboxPolicy(
+            backend_type="darwin_seatbelt",
+            active=True,
+            read_roots=[workspace],
+            write_roots=[],
+            write_files=[],
+            allow_network=False,
+        ),
+        cwd=workspace,
+    )
+    rule = runtime.rewrites[0]
+    assert not rule.inject_on_missing
+    assert rule.https_only
+    assert rule.required_tls_port == 443
+    assert rule.synthetic == runtime.helper_env_updates[CODEX_GATEWAY_TOKEN_ENV]
+    captured: list[_CapturedRequest] = []
+    upstream = await _start_capturing_upstream(captured)
+    upstream_port = upstream.sockets[0].getsockname()[1]
+    proxy = EgressProxy(
+        parse_rules(["POST 127.0.0.1/v1/responses"]),
+        cert_path,
+        key_path,
+        block_private_destinations=False,
+        credential_rewrites=[rule],
+    )
+    proxy_port = await proxy.start_tcp()
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", proxy_port)
+        request = (
+            f"POST http://127.0.0.1:{upstream_port}/v1/responses HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{upstream_port}\r\n"
+            f"Authorization: Bearer {rule.synthetic}\r\n"
+            "Content-Length: 0\r\n\r\n"
+        )
+        writer.write(request.encode())
+        await writer.drain()
+        response = await reader.read()
+        writer.close()
+        await writer.wait_closed()
+        assert b"403 Forbidden" in response
+        assert captured == []
+        reader, writer = await asyncio.open_connection("127.0.0.1", proxy_port)
+        writer.write(b"CONNECT 127.0.0.1:80 HTTP/1.1\r\nHost: 127.0.0.1:80\r\n\r\n")
+        await writer.drain()
+        response = await reader.read()
+        writer.close()
+        await writer.wait_closed()
+        assert b"403 Forbidden" in response
+        assert captured == []
+    finally:
+        await proxy.stop()
+        upstream.close()
+        await upstream.wait_closed()
 
 
 # ---------------------------------------------------------------------------
@@ -3014,3 +3649,116 @@ async def test_stop_cancels_in_flight_connection_handlers(
     finally:
         for s in socks:
             s.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("proxy_url", "expected_status"),
+    [
+        ("http://127.0.0.1:{port}", 200),
+        ("http://proxy-user:proxy-secret\uff0fvalue@proxy.example:8080", 502),
+        ("http://proxy-user:proxy-secret@proxy.example:proxy-secret", 502),
+    ],
+    ids=["tunnel", "malformed-authority", "invalid-port"],
+)
+async def test_http_request_with_upstream_proxy(
+    ca_paths: tuple[Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    proxy_url: str,
+    expected_status: int,
+) -> None:
+    """Tunnel allowed requests; keep invalid proxy credentials out of responses and logs."""
+    cert_path, key_path, _ = ca_paths
+    seen: list[bytes] = []
+
+    async def upstream_proxy(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        seen.append(await reader.readuntil(b"\r\n\r\n"))
+        writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
+        seen.append(await reader.readuntil(b"\r\n\r\n"))
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nvia-up")
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(upstream_proxy, "127.0.0.1", 0)
+    monkeypatch.setenv("http_proxy", proxy_url.format(port=server.sockets[0].getsockname()[1]))
+    caplog.set_level("DEBUG", logger="omnigent.inner.egress.proxy")
+    monkeypatch.setattr(
+        asyncio.get_event_loop(),
+        "getaddrinfo",
+        _stub_getaddrinfo_resolving(
+            {"allowed.example.com": "93.184.216.34", "127.0.0.1": "127.0.0.1"}
+        ),
+    )
+    proxy = EgressProxy(parse_rules(["GET allowed.example.com/**"]), cert_path, key_path)
+    port = await proxy.start_tcp()
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(
+            b"GET http://allowed.example.com/x HTTP/1.1\r\nHost: allowed.example.com\r\n\r\n"
+        )
+        await writer.drain()
+        response = await asyncio.wait_for(reader.read(), timeout=5)
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        await proxy.stop()
+        server.close()
+        await server.wait_closed()
+
+    assert response.startswith(f"HTTP/1.1 {expected_status} ".encode())
+    if expected_status == 200:
+        assert response.endswith(b"via-up")
+        assert seen[0].startswith(b"CONNECT 93.184.216.34:80 HTTP/1.1")
+        assert seen[1].startswith(b"GET /x HTTP/1.1")
+    else:
+        assert b"Invalid upstream proxy configuration" in response
+        assert not seen
+        for credential in ("proxy-user", "proxy-secret"):
+            assert credential.encode() not in response
+            assert credential not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("request_host", "resolved_ip"),
+    [("blocked.example.com", "93.184.216.34"), ("allowed.example.com", "10.0.0.5")],
+    ids=["rule-denied", "private-destination"],
+)
+async def test_denied_request_never_contacts_upstream_proxy(
+    ca_paths: tuple[Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    request_host: str,
+    resolved_ip: str,
+) -> None:
+    """Rule and private-IP denials return 403 before any upstream proxy dial."""
+    cert_path, key_path, _ = ca_paths
+    contacted: list[bool] = []
+
+    async def upstream_proxy(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        contacted.append(True)
+        writer.close()
+
+    server = await asyncio.start_server(upstream_proxy, "127.0.0.1", 0)
+    monkeypatch.setenv("http_proxy", f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}")
+    monkeypatch.setattr(
+        asyncio.get_event_loop(),
+        "getaddrinfo",
+        _stub_getaddrinfo_resolving({request_host: resolved_ip}),
+    )
+    proxy = EgressProxy(parse_rules(["GET allowed.example.com/**"]), cert_path, key_path)
+    port = await proxy.start_tcp()
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(
+            f"GET http://{request_host}/x HTTP/1.1\r\nHost: {request_host}\r\n\r\n".encode()
+        )
+        await writer.drain()
+        response = await asyncio.wait_for(reader.read(4096), timeout=5)
+        writer.close()
+    finally:
+        await proxy.stop()
+        server.close()
+
+    assert b"403 Forbidden" in response
+    assert not contacted

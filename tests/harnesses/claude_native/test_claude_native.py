@@ -16,6 +16,7 @@ import re
 import shlex
 import ssl
 import subprocess
+import sys
 import threading
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -41,11 +42,15 @@ from omnigent.models.databricks_model_discovery import DatabricksClaudeCatalog
 from omnigent.native import native_terminal
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.runtime import tool_result_replay as trc
+from omnigent.runtime import workflow
+from omnigent.runtime.prompt import WORKSPACE_IMAGE_INSTRUCTION
 from omnigent.spec import load_omnigent_yaml
+from omnigent.telemetry.request_headers import client_user_agent
 from omnigent.terminals.ws_common import (
     WS_CLOSE_TERMINAL_DETACHED,
     WS_CLOSE_TERMINAL_NOT_FOUND,
 )
+from tests._helpers.managed_mcp import expand_entry_value
 from tests._image_fixtures import (
     _TINY_CMYK_JPEG_BASE64,
     _TINY_GIF_BASE64,
@@ -62,7 +67,10 @@ from tests.budgets import budget
 
 
 @pytest.fixture(autouse=True)
-def _stub_catalog_default(monkeypatch: pytest.MonkeyPatch) -> None:
+def _isolate_provider_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep provider defaults independent of ambient CI context and catalog access."""
+    monkeypatch.delenv("OMNIGENT_CI_PIPELINE", raising=False)
+    monkeypatch.delenv("OMNIGENT_CI_CONTEXT", raising=False)
     monkeypatch.setattr(
         "omnigent.models.model_catalog.resolve_catalog_model",
         lambda provider_name, *, family, **kwargs: SimpleNamespace(
@@ -76,6 +84,16 @@ def _test_bridge_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", bridge_root)
     return bridge_root / "session"
+
+
+def _install_managed_mcp_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    managed_dir = tmp_path / "etc-claude-code"
+    managed_dir.mkdir()
+    (managed_dir / "managed-mcp.json").write_text('{"mcpServers":{}}', encoding="utf-8")
+    monkeypatch.setattr(
+        "omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS",
+        (managed_dir / "managed-settings.json",),
+    )
 
 
 def _load_invocation_settings(args: list[str]) -> dict[str, Any]:
@@ -102,6 +120,7 @@ def test_claude_terminal_request_pins_launch_cwd(tmp_path, monkeypatch) -> None:
     Channels flag is not snuck in.
     """
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("API_TIMEOUT_MS", raising=False)
     bridge_dir = _test_bridge_dir(tmp_path, monkeypatch)
     body = claude_native._claude_terminal_request(
         ("--resume", "claude-session", "-p", "hi"),
@@ -117,9 +136,12 @@ def test_claude_terminal_request_pins_launch_cwd(tmp_path, monkeypatch) -> None:
     spec = body["spec"]
     assert spec["command"] == "claude"
     assert spec["env"] == {
+        "CLAUDE_AGENT_SDK_CLIENT_APP": "omnigent",
         "ENABLE_TOOL_SEARCH": "true",
         "CLAUDE_CODE_DISABLE_AGENT_VIEW": "1",
         "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
+        "CLAUDE_ENV_FILE": claude_native.claude_tool_env_file(),
+        "API_TIMEOUT_MS": "120000",
     }
     assert spec["os_env_type"] == "caller_process"
     # Claude Code emits long interactive transcripts; this value is
@@ -160,6 +182,136 @@ def test_claude_terminal_request_pins_launch_cwd(tmp_path, monkeypatch) -> None:
         "TaskCreated",
         "UserPromptSubmit",
     ]
+
+
+def test_claude_terminal_request_omits_mcp_flags_under_managed_mcp_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Claude Code exits at startup on ``--mcp-config`` when ``managed-mcp.json`` exists."""
+    from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+
+    monkeypatch.chdir(tmp_path)
+    _install_managed_mcp_config(tmp_path, monkeypatch)
+    socket_root = tmp_path / "harness-sockets"
+    monkeypatch.setenv("OMNIGENT_HARNESS_TMP_PARENT", str(socket_root))
+    bridge_dir = _test_bridge_dir(tmp_path, monkeypatch)
+    captured_warnings: list[str] = []
+    monkeypatch.setattr(
+        claude_native_bridge._logger,
+        "warning",
+        lambda message, *args, **kwargs: captured_warnings.append(
+            message % args if args else message
+        ),
+    )
+
+    body = claude_native._claude_terminal_request((), command="claude", bridge_dir=bridge_dir)
+
+    args = body["spec"]["args"]
+    assert "--mcp-config" not in args
+    assert "--strict-mcp-config" not in args
+    assert any("managed-mcp.json" in message for message in captured_warnings)
+    # The runner recovers the bridge from the settings path, and hooks still load.
+    assert Path(args[args.index("--settings") + 1]).parent == bridge_dir
+    assert "SessionStart" in _load_invocation_settings(args)["hooks"]
+    # A static relay entry in the managed file reaches this bridge through the env.
+    relay_env = body["spec"]["env"]
+    assert relay_env[claude_native_bridge.MANAGED_MCP_RELAY_BRIDGE_DIR_ENV] == str(bridge_dir)
+    assert relay_env[claude_native_bridge.MANAGED_MCP_RELAY_PYTHON_ENV] == sys.executable
+    # serve-mcp keeps the operator's harness socket root once Claude expands the entry.
+    entry_env = claude_native_bridge.managed_mcp_relay_entry()["env"]
+    assert expand_entry_value(entry_env["OMNIGENT_HARNESS_TMP_PARENT"], relay_env) == str(
+        socket_root
+    )
+
+    managed_file = tmp_path / "etc-claude-code" / "managed-mcp.json"
+    managed_file.write_text(
+        json.dumps({"mcpServers": {"omnigent": claude_native_bridge.managed_mcp_relay_entry()}}),
+        encoding="utf-8",
+    )
+    captured_warnings.clear()
+    body = claude_native._claude_terminal_request((), command="claude", bridge_dir=bridge_dir)
+    assert "--mcp-config" not in body["spec"]["args"]
+    assert captured_warnings == []
+
+
+_RELAY_ARGS = [
+    "-I",
+    "-m",
+    "omnigent.harnesses.claude_native.bridge",
+    "serve-mcp",
+    "--bridge-dir",
+    "${OMNIGENT_MCP_RELAY_BRIDGE_DIR}",
+]
+
+
+@pytest.mark.parametrize(
+    ("entry", "configured"),
+    [
+        pytest.param(
+            {"command": "${OMNIGENT_MCP_RELAY_PYTHON}", "args": _RELAY_ARGS}, True, id="documented"
+        ),
+        pytest.param(
+            {
+                "command": "/usr/bin/corp-run",
+                "args": ["${OMNIGENT_MCP_RELAY_PYTHON}", *_RELAY_ARGS],
+            },
+            True,
+            id="wrapper",
+        ),
+        pytest.param(
+            {
+                "command": "/bin/sh",
+                "args": [
+                    "-c",
+                    "exec python -m x serve-mcp --bridge-dir=${OMNIGENT_MCP_RELAY_BRIDGE_DIR}",
+                ],
+            },
+            True,
+            id="shell-wrapper",
+        ),
+        pytest.param(
+            {"command": "/bin/false", "env": {"NOTE": "${OMNIGENT_MCP_RELAY_BRIDGE_DIR}"}},
+            False,
+            id="prefix-only-in-env",
+        ),
+        pytest.param(
+            {"command": "/usr/bin/other", "args": ["--dir", "${OMNIGENT_MCP_RELAY_BRIDGE_DIR}"]},
+            False,
+            id="not-the-relay",
+        ),
+        pytest.param(
+            {"url": "https://relay.example/${OMNIGENT_MCP_RELAY_BRIDGE_DIR}/serve-mcp"},
+            False,
+            id="http",
+        ),
+        pytest.param(
+            {"command": "${OMNIGENT_MCP_RELAY_PYTHON}", "args": "serve-mcp"}, False, id="bad-args"
+        ),
+    ],
+)
+def test_managed_relay_entry_must_launch_serve_mcp_for_the_session_bridge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: dict[str, object], configured: bool
+) -> None:
+    """Only an entry whose launch reaches serve-mcp with the session's bridge dir counts,
+    so the warning and the tools prompt never rest on an entry that cannot connect."""
+    from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+
+    _install_managed_mcp_config(tmp_path, monkeypatch)
+    managed_file = tmp_path / "etc-claude-code" / "managed-mcp.json"
+    managed_file.write_text(json.dumps({"mcpServers": {"omnigent": entry}}), encoding="utf-8")
+
+    assert claude_native_bridge.managed_mcp_relay_configured() is configured
+
+
+def test_documented_managed_relay_entry_matches_the_one_omnigent_reads() -> None:
+    """Operators copy the entry from the docs, so it must be the shape the relay expands."""
+    from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+
+    doc = (Path(__file__).parents[3] / "docs" / "CLAUDE_MANAGED_MCP.md").read_text()
+    documented = json.loads(doc.split("```json\n", 1)[1].split("```", 1)[0])
+    assert documented == {
+        "mcpServers": {"omnigent": claude_native_bridge.managed_mcp_relay_entry()}
+    }
 
 
 def test_claude_terminal_request_loads_workspace_agents_skills(tmp_path, monkeypatch) -> None:
@@ -218,15 +370,25 @@ def test_claude_terminal_request_launcher_plugin_wraps(tmp_path, monkeypatch) ->
     monkeypatch.setenv("OMNIGENT_CLAUDE_LAUNCHER", "isaac")
     monkeypatch.chdir(tmp_path)
     body = claude_native._claude_terminal_request(
-        ("--resume", "s"),
+        ("--resume", "s", "--append-system-prompt", "Review like a staff engineer."),
         command="claude",
         bridge_dir=_test_bridge_dir(tmp_path, monkeypatch),
+        append_system_prompt="Claude Code is running in the session terminal.",
     )
     spec = body["spec"]
     assert spec["command"] == "isaac"
     # Claude's argv is now passed through isaac after the ``--`` separator.
     assert spec["args"][0] == "--"
     assert spec["args"][1:3] == ["--resume", "s"]
+    # Omnigent's prompt joins the caller's flag, so the launch carries the caller's prompt once.
+    prompt_values = [
+        spec["args"][index + 1]
+        for index, arg in enumerate(spec["args"])
+        if arg == "--append-system-prompt"
+    ]
+    assert prompt_values == [
+        "Claude Code is running in the session terminal.\n\nReview like a staff engineer."
+    ]
     # The bridge MCP + hook injection still rides along.
     assert "--mcp-config" in spec["args"]
     assert "--settings" in spec["args"]
@@ -251,6 +413,7 @@ def test_claude_terminal_request_injects_claude_config(tmp_path, monkeypatch) ->
         model="databricks-claude-opus-test",
     )
 
+    monkeypatch.delenv("API_TIMEOUT_MS", raising=False)
     body = claude_native._claude_terminal_request(
         ("--print", "hi"),
         command="claude",
@@ -261,12 +424,15 @@ def test_claude_terminal_request_injects_claude_config(tmp_path, monkeypatch) ->
     spec = body["spec"]
     assert spec["command"] == "env"
     assert spec["env"] == {
+        "CLAUDE_AGENT_SDK_CLIENT_APP": "omnigent",
         "ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic",
         "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": "900000",
         "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
         "ENABLE_TOOL_SEARCH": "true",
         "CLAUDE_CODE_DISABLE_AGENT_VIEW": "1",
         "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
+        "CLAUDE_ENV_FILE": claude_native.claude_tool_env_file(),
+        "API_TIMEOUT_MS": "120000",
         "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK": "1",
     }
     args = spec["args"]
@@ -416,8 +582,10 @@ def test_claude_terminal_request_preserves_user_model_arg(tmp_path, monkeypatch)
     assert args.count("--model") == 1
 
 
+@pytest.mark.parametrize("gateway", [True, False])
 def test_ucode_config_for_profile_reads_allowlisted_claude_state(
     monkeypatch: pytest.MonkeyPatch,
+    gateway: bool,
 ) -> None:
     """
     Profile-backed native Claude config reads only required ucode fields.
@@ -428,24 +596,29 @@ def test_ucode_config_for_profile_reads_allowlisted_claude_state(
     """
     from omnigent.onboarding.ucode_state import UcodeAgentState, UcodeWorkspaceState
 
+    workspace_url = "https://example.cloud.databricks.com"
+    path = "/ai-gateway/anthropic" if gateway else "/serving-endpoints/anthropic"
+    base_url = workspace_url + path
     workspace_state = UcodeWorkspaceState(
-        workspace_url="https://example.databricks.com",
+        workspace_url=workspace_url,
         agents={
             "claude": UcodeAgentState(
                 model="databricks-claude-opus-test",
-                base_url="https://example.databricks.com/ai-gateway/anthropic",
+                base_url=base_url,
                 auth_command="printf token",
                 auth_refresh_interval_ms=123456,
                 env={
-                    "ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic",
+                    "ANTHROPIC_BASE_URL": base_url,
                     "ANTHROPIC_AUTH_TOKEN": "must-not-leak",
+                    "ANTHROPIC_CUSTOM_HEADERS": "User-Agent: ucode/test claude/test",
+                    "CLAUDE_CODE_DISABLE_ADVISOR_TOOL": "0",
                 },
             )
         },
     )
     monkeypatch.setattr(
         "omnigent.onboarding.databricks_config.get_workspace_url_for_profile",
-        lambda profile: "https://example.databricks.com",
+        lambda profile: workspace_url,
     )
     monkeypatch.setattr(
         "omnigent.onboarding.ucode_state.read_ucode_state",
@@ -456,13 +629,18 @@ def test_ucode_config_for_profile_reads_allowlisted_claude_state(
 
     assert config == claude_native.ClaudeNativeUcodeConfig(
         env={
-            "ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic",
+            "ANTHROPIC_BASE_URL": base_url,
             "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": "123456",
             "CLAUDE_CODE_USE_GATEWAY": "1",
+            "CLAUDE_CODE_DISABLE_ADVISOR_TOOL": "1",
             "ANTHROPIC_CUSTOM_HEADERS": (
-                "x-databricks-use-coding-agent-mode: true\n"
-                "Databricks-Custom-Coding-Agent: claude-code\n"
-                "Databricks-Custom-Client-Surfaces: omnigent, ug"
+                "x-databricks-use-coding-agent-mode: true\nUser-Agent: ucode/test claude/test"
+            )
+            + (
+                "\nDatabricks-Custom-Coding-Agent: claude-code"
+                "\nDatabricks-Custom-Client-Surfaces: omnigent, ug"
+                if gateway
+                else ""
             ),
             # No CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: this path launches in
             # gateway mode (CLAUDE_CODE_USE_GATEWAY=1), where Claude Code
@@ -864,9 +1042,11 @@ def test_claude_native_static_model_options_list_nothing(
     assert claude_native.claude_native_model_options(None) == []
 
 
+@pytest.mark.parametrize("subscription_auth", [False, True])
 def test_claude_native_model_options_follow_managed_claude_catalog(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    subscription_auth: bool,
 ) -> None:
     """Managed Claude model overrides replace the generic fallback rows."""
     managed_settings = tmp_path / "managed-settings.json"
@@ -888,7 +1068,12 @@ def test_claude_native_model_options_follow_managed_claude_catalog(
         (managed_settings,),
     )
 
-    assert claude_native.claude_native_model_options(None) == [
+    config = (
+        claude_native.ClaudeNativeUcodeConfig(env={}, subscription_auth=True)
+        if subscription_auth
+        else None
+    )
+    assert claude_native.claude_native_model_options(config) == [
         {
             "id": "opus",
             "model": "system.ai.claude-opus-4-8[1m]",
@@ -939,46 +1124,92 @@ def test_unpinned_family_alias_passes_through_on_the_anthropic_api() -> None:
     assert claude_native.resolve_claude_native_model_selection("opus", config) == "opus"
 
 
-def test_launch_model_takes_the_custom_slot_when_no_alias_names_it() -> None:
-    """A routed older generation gets its own spelling for later ``/model``."""
+@pytest.mark.parametrize(
+    ("launch_model", "alias_env", "alias_model", "custom_slot", "display_name"),
+    [
+        (
+            "databricks-claude-opus-4-8",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "databricks-claude-opus-5",
+            None,
+            "Opus 4.8",
+        ),
+        (
+            "databricks-claude-sonnet-5[1m]",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "databricks-claude-sonnet-6",
+            "databricks-claude-sonnet-5",
+            "Sonnet 5",
+        ),
+        (
+            "databricks-claude-opus-5[1m]",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "databricks-claude-opus-5",
+            None,
+            "Opus 5",
+        ),
+        (
+            "databricks-claude-sonnet-5[1m]",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "databricks-claude-sonnet-5",
+            None,
+            "Sonnet 5",
+        ),
+    ],
+    ids=["older-generation", "bare-custom-slot", "bare-opus-alias", "bare-sonnet-alias"],
+)
+def test_launch_model_takes_the_custom_slot_when_no_alias_names_it(
+    launch_model: str, alias_env: str, alias_model: str, custom_slot: str | None, display_name: str
+) -> None:
+    """A launch model gets a slot preserving its exact generation and context."""
     from omnigent.models.claude_model_vocabulary import claude_model_command_arg
 
     config = claude_native.ClaudeNativeUcodeConfig(
         env={
-            "ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic",
-            "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-5",
+            "ANTHROPIC_BASE_URL": "https://gateway.example/anthropic",
+            alias_env: alias_model,
         },
-        model="databricks-claude-opus-5",
+        model=alias_model,
     )
+    if custom_slot is not None:
+        config.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] = custom_slot
+    initial_env = dict(config.env)
 
-    pinned = claude_native.claude_config_with_launch_model_pinned(
-        config, "databricks-claude-opus-4-8"
-    )
+    pinned = claude_native.claude_config_with_launch_model_pinned(config, launch_model)
 
     assert pinned is not None
-    assert pinned.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-8"
-    assert pinned.env["ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"] == "Opus 4.8"
-    assert config.env.get("ANTHROPIC_CUSTOM_MODEL_OPTION") is None
-    assert (
-        claude_model_command_arg("databricks-claude-opus-4-8", pinned.env)
-        == "databricks-claude-opus-4-8"
-    )
+    assert pinned.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == launch_model
+    assert pinned.env["ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"] == display_name
+    assert config.env == initial_env
+    assert claude_model_command_arg(launch_model, pinned.env) == launch_model
 
 
 @pytest.mark.parametrize(
-    "launch_model",
-    ["opus", "databricks-claude-opus-5", None, ""],
+    ("launch_model", "opus_pin"),
+    [
+        ("opus", "databricks-claude-opus-5"),
+        ("databricks-claude-opus-5", "databricks-claude-opus-5"),
+        ("databricks-claude-opus-5[1m]", "databricks-claude-opus-5[1m]"),
+        (None, "databricks-claude-opus-5"),
+        ("", "databricks-claude-opus-5"),
+    ],
 )
 def test_launch_model_needs_no_custom_slot_when_already_speakable(
     launch_model: str | None,
+    opus_pin: str,
 ) -> None:
     """Aliases and the pinned id resolve without the extra slot."""
     config = claude_native.ClaudeNativeUcodeConfig(
-        env={"ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-5"},
-        model="databricks-claude-opus-5",
+        env={
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": opus_pin,
+            "ANTHROPIC_CUSTOM_MODEL_OPTION": "other-picker-model",
+        },
+        model=opus_pin,
     )
+    initial_env = dict(config.env)
 
     assert claude_native.claude_config_with_launch_model_pinned(config, launch_model) is config
+    assert config.env == initial_env
     assert claude_native.claude_config_with_launch_model_pinned(None, "x") is None
 
 
@@ -4752,6 +4983,7 @@ async def test_is_terminal_resource_gone_reports_404_as_gone(
         does not recurse into the patched name when constructing
         the underlying client.
         """
+        kwargs.pop("transport", None)
         return real_client_cls(transport=transport, **kwargs)
 
     monkeypatch.setattr(claude_native.httpx, "AsyncClient", _mock_client_cls)
@@ -4794,6 +5026,7 @@ async def test_is_terminal_resource_gone_reports_running_false_as_gone(
 
     def _mock_client_cls(**kwargs: Any) -> httpx.AsyncClient:
         """Real AsyncClient bound to the mock transport; see above."""
+        kwargs.pop("transport", None)
         return real_client_cls(transport=transport, **kwargs)
 
     monkeypatch.setattr(claude_native.httpx, "AsyncClient", _mock_client_cls)
@@ -4828,6 +5061,7 @@ async def test_is_terminal_resource_gone_treats_transport_errors_as_not_gone(
 
     def _mock_client_cls(**kwargs: Any) -> httpx.AsyncClient:
         """Real AsyncClient bound to the mock transport; see above."""
+        kwargs.pop("transport", None)
         return real_client_cls(transport=transport, **kwargs)
 
     monkeypatch.setattr(claude_native.httpx, "AsyncClient", _mock_client_cls)
@@ -5523,6 +5757,7 @@ def test_websocket_connect_sets_short_close_timeout(monkeypatch: pytest.MonkeyPa
             "Authorization": "Bearer tok",
             "Origin": OMNIGENT_INTERNAL_WS_ORIGIN,
         },
+        "user_agent_header": client_user_agent(),
         "close_timeout": claude_native._CLAUDE_ATTACH_WS_CLOSE_TIMEOUT_S,
     }
 
@@ -5988,6 +6223,147 @@ async def test_resolve_cold_resume_args_replaces_existing_local_claude_transcrip
         if line.strip()
     ]
     assert [record["message"]["content"] for record in records] == ["fresh Omnigent text"]
+
+
+@pytest.mark.parametrize("resume_cost_usd", [1.25, None], ids=["cost", "no-cost"])
+@pytest.mark.asyncio
+async def test_ensure_local_claude_resume_transcript_restores_the_session_cost(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    resume_cost_usd: float | None,
+) -> None:
+    """
+    The rebuilt transcript ends with the record Claude restores its cost from.
+
+    ``claude --resume`` reads its running cost back only from a ``cost-state``
+    record and skips a partial one. Without the record a cold-resumed session
+    counts from zero, and its reports stay below the session's stored total,
+    which only moves up. The bridge dir records the seeded cost for the
+    forwarder's check, replacing an earlier launch's, and drops the previous
+    process's statusLine snapshot, which would read as the new process's cost.
+    """
+    from omnigent.harnesses.claude_native import bridge as claude_bridge
+
+    monkeypatch.setattr(claude_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
+    bridge_dir = claude_bridge.bridge_dir_for_conversation_id("conv_abc")
+    claude_bridge.record_resume_cost_baseline(
+        bridge_dir, claude_session_id="sid-earlier", cost_usd=0.5
+    )
+    snapshots = [bridge_dir / "context.json", bridge_dir / "context_raw.json"]
+    for snapshot in snapshots:
+        snapshot.write_text('{"total_cost_usd": 0.5}', encoding="utf-8")
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", tmp_path / "projects")
+    client = await _httpx_client_with_canned_response(None, 200)
+    async with client:
+        written = await claude_native._ensure_local_claude_resume_transcript(
+            client,
+            session_id="conv_abc",
+            external_session_id="sid123",
+            workspace=tmp_path / "workspace",
+            resume_cost_usd=resume_cost_usd,
+        )
+
+    assert written is not None
+    records = [json.loads(line) for line in written.read_text(encoding="utf-8").splitlines()]
+    cost_states = [record for record in records if record.get("type") == "cost-state"]
+    if resume_cost_usd is None:
+        assert cost_states == []
+        assert claude_bridge.read_resume_cost_baseline(bridge_dir) is None
+        assert all(snapshot.exists() for snapshot in snapshots)
+        return
+    assert claude_bridge.read_resume_cost_baseline(bridge_dir) == (
+        claude_bridge.ResumeCostBaseline(claude_session_id="sid123", cost_usd=1.25)
+    )
+    assert not any(snapshot.exists() for snapshot in snapshots)
+    assert cost_states == [records[-1]]
+    assert set(records[-1]) == {
+        "type",
+        "sessionId",
+        "totalCostUSD",
+        "totalAPIDuration",
+        "totalAPIDurationWithoutRetries",
+        "totalToolDuration",
+        "totalLinesAdded",
+        "totalLinesRemoved",
+        "totalDuration",
+        "startTime",
+        "hasUnknownModelCost",
+        "modelUsage",
+    }
+    assert records[-1]["sessionId"] == "sid123"
+    assert records[-1]["totalCostUSD"] == 1.25
+
+
+@pytest.mark.asyncio
+async def test_resolve_cold_resume_args_restores_the_session_cost(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A CLI cold resume carries the server's own-session cost into the transcript."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    projects = tmp_path / "projects"
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    snapshot = _conversation_response_body(
+        labels={"omnigent.wrapper": "claude-code-native-ui"},
+        external_session_id="claude-uuid-abc",
+    )
+    snapshot["native_usage_baseline"] = {"cumulative_cost_usd": 2.5}
+    client = await _httpx_client_with_canned_response(snapshot, 200)
+    async with client:
+        args = await claude_native._resolve_cold_resume_args(client, "conv_abc")
+
+    assert args == ("--resume", "claude-uuid-abc")
+    transcript = (
+        projects
+        / claude_native._sanitize_claude_project_name(str(workspace.resolve()))
+        / "claude-uuid-abc.jsonl"
+    )
+    last_record = json.loads(transcript.read_text(encoding="utf-8").splitlines()[-1])
+    assert last_record["type"] == "cost-state"
+    assert last_record["totalCostUSD"] == 2.5
+
+
+@pytest.mark.parametrize(
+    ("snapshot", "expected"),
+    [
+        ({"native_usage_baseline": {"cumulative_cost_usd": 2.5}}, 2.5),
+        ({"native_usage_baseline": {"cumulative_cost_usd": 3}}, 3.0),
+        ({"native_usage_baseline": {"cumulative_cost_usd": 0}}, None),
+        ({"native_usage_baseline": {"cumulative_cost_usd": -1.0}}, None),
+        ({"native_usage_baseline": {"cumulative_cost_usd": float("nan")}}, None),
+        ({"native_usage_baseline": {"cumulative_cost_usd": float("inf")}}, None),
+        ({"native_usage_baseline": {"cumulative_cost_usd": 10**400}}, None),
+        ({"native_usage_baseline": {"cumulative_cost_usd": True}}, None),
+        ({"native_usage_baseline": {"cumulative_cost_usd": "2.5"}}, None),
+        ({"native_usage_baseline": {"cumulative_cost_usd": None}}, None),
+        ({"native_usage_baseline": None}, None),
+        ({}, None),
+        (None, None),
+    ],
+    ids=[
+        "float",
+        "int",
+        "zero",
+        "negative",
+        "nan",
+        "inf",
+        "overflow",
+        "bool",
+        "string",
+        "null-cost",
+        "null-baseline",
+        "older-server",
+        "not-a-dict",
+    ],
+)
+def test_claude_resume_cost_from_snapshot_accepts_only_a_positive_cost(
+    snapshot: object, expected: float | None
+) -> None:
+    """Only a positive, finite own-session cost is restored into Claude."""
+    assert claude_native._claude_resume_cost_from_snapshot(snapshot) == expected
 
 
 @pytest.mark.asyncio
@@ -6691,7 +7067,7 @@ async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
     assert prepared.reattached is False
 
 
-def test_wrapper_spec_raw_instructions_resolves_prompt(tmp_path: Path) -> None:
+def test_wrapper_spec_startup_instructions_resolves_prompt(tmp_path: Path) -> None:
     """The ``omnigent claude`` wrapper's own materialized spec is resolvable.
 
     Its ``prompt`` field is real ``AgentSpec.instructions`` content (the
@@ -6700,16 +7076,19 @@ def test_wrapper_spec_raw_instructions_resolves_prompt(tmp_path: Path) -> None:
     instructions.
     """
     spec_path = claude_native._materialize_claude_agent_spec(tmp_path)
-    result = claude_native._wrapper_spec_raw_instructions(spec_path)
+    result = claude_native._wrapper_spec_startup_instructions(spec_path)
     assert result is not None
     assert "Claude Code is running in the session terminal" in result
+    assert result.endswith(WORKSPACE_IMAGE_INSTRUCTION)
 
 
-def test_wrapper_spec_raw_instructions_degrades_on_malformed_spec(tmp_path: Path) -> None:
+def test_wrapper_spec_startup_instructions_degrades_on_malformed_spec(tmp_path: Path) -> None:
     """A malformed wrapper spec must not block the terminal launch."""
     bad_spec = tmp_path / "bad.yaml"
     bad_spec.write_text("not: [valid, agent, spec")
-    assert claude_native._wrapper_spec_raw_instructions(bad_spec) is None
+    assert (
+        claude_native._wrapper_spec_startup_instructions(bad_spec) == WORKSPACE_IMAGE_INSTRUCTION
+    )
 
 
 @pytest.mark.asyncio
@@ -8221,6 +8600,57 @@ def test_copy_transcript_with_cwd_keeps_background_handles_for_the_same_session(
     assert moved["cwd"] == str(tmp_path)
 
 
+def test_clone_claude_transcript_drops_the_source_cost(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A fork counts its own spend, so its clone drops the source's ``cost-state``.
+
+    Claude restores its running cost from that record on ``--resume``; a clone
+    that kept it would start the fork at the source's total and count that
+    spend twice. Moving a session's own transcript keeps the record.
+    """
+    projects_dir = tmp_path / ".claude" / "projects"
+    source_workspace = tmp_path / "source"
+    source_workspace.mkdir()
+    clone_workspace = tmp_path / "clone"
+    clone_workspace.mkdir()
+    source_uuid = "11111111-1111-1111-1111-111111111111"
+    source_path = (
+        projects_dir
+        / claude_native._sanitize_claude_project_name(str(source_workspace.resolve()))
+        / f"{source_uuid}.jsonl"
+    )
+    source_path.parent.mkdir(parents=True)
+    turn = {
+        "type": "user",
+        "cwd": str(source_workspace.resolve()),
+        "sessionId": source_uuid,
+        "uuid": "u1",
+        "parentUuid": None,
+    }
+    cost_state = claude_native._claude_cost_state_record(source_uuid, 2.5)
+    source_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in (turn, cost_state)), encoding="utf-8"
+    )
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
+
+    clone = claude_native._clone_claude_transcript(
+        source_external_session_id=source_uuid,
+        target_external_session_id="22222222-2222-2222-2222-222222222222",
+        clone_workspace=clone_workspace.resolve(),
+    )
+    moved = tmp_path / "moved.jsonl"
+    claude_native._copy_transcript_with_cwd(source=source_path, target=moved, current=tmp_path)
+
+    assert clone is not None
+    cloned_types = [json.loads(line)["type"] for line in clone.read_text().splitlines()]
+    assert cloned_types == ["user"]
+    moved_records = [json.loads(line) for line in moved.read_text().splitlines()]
+    assert moved_records[-1] == cost_state
+
+
 def test_clone_claude_transcript_repairs_stale_image_duplication(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -8233,8 +8663,8 @@ def test_clone_claude_transcript_repairs_stale_image_duplication(
     in both the structured content and the metadata) — or one holding an
     MCP screenshot as a raw string — would overflow the clone's first
     ``--resume`` before any later rebuild could heal it. The copy must
-    repair image-bearing tool-result records on the way through: exactly
-    one structured image copy per payload, redacted metadata, and no
+    repair image- and PDF-bearing tool-result records on the way through:
+    exactly one structured copy per payload, redacted metadata, and no
     string-valued content carrying base64. Records without image
     duplication must pass through unchanged.
     """
@@ -8304,15 +8734,101 @@ def test_clone_claude_transcript_repairs_stale_image_duplication(
         },
         "toolUseResult": json.dumps("file written"),
     }
+    b64_pdf = base64.b64encode(b"%PDF-1.7\n" + b"0" * 3000).decode()
+    pdf_blocks = [
+        {"type": "text", "text": "PDF file read: report.pdf"},
+        {
+            "type": "document",
+            "source": {"type": "base64", "media_type": "application/pdf", "data": b64_pdf},
+        },
+    ]
+    pdf_string = json.dumps(pdf_blocks, separators=(",", ":"))
+    stale_pdf = {
+        "type": "user",
+        "cwd": str(source_workspace.resolve()),
+        "sessionId": source_uuid,
+        "uuid": "u4",
+        "parentUuid": "u3",
+        "message": {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "toolu_4", "content": pdf_string}],
+        },
+        "toolUseResult": claude_native._json_safe_tool_use_result(pdf_string),
+    }
+    b64_native_pdf = base64.b64encode(b"%PDF-1.7\n" + b"1" * 3000).decode()
+    native_pdf_blocks = [
+        {"type": "text", "text": "PDF file read: notes.pdf"},
+        {
+            "type": "document",
+            "source": {"type": "base64", "media_type": "application/pdf", "data": b64_native_pdf},
+        },
+    ]
+    native_pdf = {
+        "type": "user",
+        "cwd": str(source_workspace.resolve()),
+        "sessionId": source_uuid,
+        "uuid": "u5",
+        "parentUuid": "u4",
+        "message": {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_5", "content": native_pdf_blocks}
+            ],
+        },
+        # Older Claude Code kept the payload in its own Read metadata.
+        "toolUseResult": {"type": "pdf", "file": {"base64": b64_native_pdf, "originalSize": 3009}},
+    }
+    stripped_pdf_meta = {"type": "pdf", "file": {"base64": "", "originalSize": 3009}}
+    stripped_native_pdf = {
+        **native_pdf,
+        "uuid": "u6",
+        "parentUuid": "u5",
+        "toolUseResult": stripped_pdf_meta,
+    }
+    b64_native_image = "iVBORw0KGgo" + "L" * 4000 + "="
+    native_image_block = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": b64_native_image},
+    }
+    stripped_image_meta = {
+        "type": "image",
+        "file": {"base64": "", "type": "image/png", "originalSize": 3009},
+    }
+    native_image = {
+        **native_pdf,
+        "uuid": "u7",
+        "parentUuid": "u6",
+        "message": {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_7", "content": [native_image_block]}
+            ],
+        },
+        "toolUseResult": {
+            **stripped_image_meta,
+            "file": {**stripped_image_meta["file"], "base64": b64_native_image},
+        },
+    }
     source_path.write_text(
         "".join(
-            json.dumps(record) + "\n" for record in (stale_structured, stale_mixed, plain_result)
+            json.dumps(record) + "\n"
+            for record in (
+                stale_structured,
+                stale_mixed,
+                plain_result,
+                stale_pdf,
+                native_pdf,
+                stripped_native_pdf,
+                native_image,
+            )
         ),
         encoding="utf-8",
     )
     source_text = source_path.read_text(encoding="utf-8")
     assert source_text.count(b64_structured) == 2, "pre-fix wedged state"
     assert source_text.count(b64_mcp) == 2, "pre-fix wedged state"
+    assert source_text.count(b64_native_pdf) == 3
+    assert source_text.count(b64_native_image) == 2
     monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
 
     result = claude_native._clone_claude_transcript(
@@ -8345,6 +8861,18 @@ def test_clone_claude_transcript_repairs_stale_image_duplication(
     # No image duplication: the plain record is preserved untouched.
     assert records[2]["message"]["content"][0]["content"] == "file written"
     assert records[2]["toolUseResult"] == json.dumps("file written")
+    # A PDF replayed as a raw string becomes a document block, kept once.
+    assert records[3]["message"]["content"][0]["content"] == pdf_blocks
+    assert text.count(b64_pdf) == 1
+    # Claude Code's Read metadata keeps its native shape, as current releases store it.
+    assert records[4]["message"]["content"][0]["content"] == native_pdf_blocks
+    assert records[4]["toolUseResult"] == stripped_pdf_meta
+    assert records[5]["message"]["content"][0]["content"] == native_pdf_blocks
+    assert records[5]["toolUseResult"] == stripped_pdf_meta
+    assert text.count(b64_native_pdf) == 2
+    assert records[6]["message"]["content"][0]["content"] == [native_image_block]
+    assert records[6]["toolUseResult"] == stripped_image_meta
+    assert text.count(b64_native_image) == 1
     # The fork must not mutate the source session's transcript.
     assert source_path.read_text(encoding="utf-8") == source_text
 
@@ -9153,11 +9681,16 @@ def test_provider_config_for_native_claude_keeps_betas_under_use_gateway(
     assert "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS" not in cfg.env
 
 
+@pytest.mark.parametrize("ci", [False, True])
 def test_provider_config_for_native_claude_attributes_a_unity_gateway(
     monkeypatch: pytest.MonkeyPatch,
+    ci: bool,
 ) -> None:
     """A provider on the Unity Gateway adds attribution after the user's own headers."""
     from omnigent.onboarding.provider_config import load_providers
+
+    if ci:
+        monkeypatch.setenv("OMNIGENT_CI_CONTEXT", '{"pipeline":"polly-review","run_id":"123"}')
 
     monkeypatch.setenv("CLAUDE_CODE_USE_GATEWAY", "1")
     monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", "X-Team: search")
@@ -9176,14 +9709,28 @@ def test_provider_config_for_native_claude_attributes_a_unity_gateway(
     cfg = claude_native._provider_config_for_native_claude(entry)
 
     assert cfg is not None
+    preserved_headers = ["X-Team: search"]
+    if ci:
+        preserved_headers.append(
+            'Databricks-Ai-Gateway-Request-Tags: {"pipeline":"polly-review","run_id":"123"}'
+        )
     assert cfg.env == {
         "ANTHROPIC_BASE_URL": base_url,
-        "ANTHROPIC_CUSTOM_HEADERS": (
-            "X-Team: search\n"
-            "Databricks-Custom-Coding-Agent: claude-code\n"
-            "Databricks-Custom-Client-Surfaces: omnigent"
+        "CLAUDE_CODE_DISABLE_ADVISOR_TOOL": "1",
+        "ANTHROPIC_CUSTOM_HEADERS": "\n".join(
+            [
+                *preserved_headers,
+                "Databricks-Custom-Coding-Agent: claude-code",
+                "Databricks-Custom-Client-Surfaces: omnigent",
+            ]
         ),
     }
+    terminal_env = claude_native.build_native_claude_terminal_env(cfg, client_surface="desktop")
+    assert terminal_env["ANTHROPIC_CUSTOM_HEADERS"].splitlines() == [
+        *preserved_headers,
+        "Databricks-Custom-Coding-Agent: claude-code",
+        "Databricks-Custom-Client-Surfaces: omnigent-desktop",
+    ]
 
 
 def test_bedrock_config_for_native_claude_static_key(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -9262,7 +9809,7 @@ def test_bedrock_config_for_native_claude_keeps_betas_under_use_gateway(
 ) -> None:
     """A bedrock-style gateway with CLAUDE_CODE_USE_GATEWAY=1 keeps betas on.
 
-    Bedrock-compatible corporate gateways can run in gateway-aware mode; when
+    Bedrock-compatible enterprise gateways can run in gateway-aware mode; when
     CLAUDE_CODE_USE_GATEWAY=1 the beta-disable flag is skipped so MCP tool
     search stays enabled, matching the generic gateway provider path.
     """
@@ -9350,23 +9897,91 @@ def test_resolve_native_claude_config_spec_provider_default(
     assert cfg.api_key_helper == "printf %s sk-ant-default"
 
 
+@pytest.mark.parametrize("selection", ["cli-default", "spec-default", "spec-provider"])
 def test_resolve_native_claude_config_subscription_uses_cli_login(
     _isolated_provider_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    selection: str,
 ) -> None:
-    """A claude subscription default → None (use the CLI's own enterprise login).
+    """A subscription launch cannot use an inherited API key instead of its login."""
+    from omnigent.spec.types import ProviderAuth
 
-    A subscription means "use whatever ~/.claude is logged into" (e.g. a
-    Claude Enterprise seat), NOT a gateway. The resolver must return None so
-    the native launch leaves Claude's own login alone — and must NOT fall
-    back to ucode.
-    """
     _seed_config(
         _isolated_provider_config,
         {"claude-subscription": {"kind": "subscription", "cli": "claude", "default": True}},
     )
+    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
+        monkeypatch.setenv(name, "inherited-test-credential")
+    for name in ("ANTHROPIC_BASE_URL", *claude_native._CLAUDE_TRANSPORT_FLAGS):
+        monkeypatch.delenv(name, raising=False)
+    spec = None if selection == "cli-default" else _no_auth_claude_spec()
+    if selection == "spec-provider":
+        spec.executor.auth = ProviderAuth(name="claude-subscription")
+    config = claude_native.resolve_native_claude_config(spec=spec)
+    script = _isolated_provider_config / "credentials.py"
+    script.write_text(
+        "import json, os\n"
+        "print(json.dumps(sorted(name for name in "
+        "('ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN') "
+        "if name in os.environ)))\n"
+    )
+    body = claude_native._claude_terminal_request(
+        (str(script),),
+        command=sys.executable,
+        bridge_dir=_test_bridge_dir(_isolated_provider_config, monkeypatch),
+        claude_config=config,
+    )
+    terminal = body["spec"]
+    result = subprocess.run(
+        [terminal["command"], *terminal["args"]],
+        env={**os.environ, **terminal["env"]},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
 
-    cfg = claude_native.resolve_native_claude_config(spec=_no_auth_claude_spec())
-    assert cfg is None
+    assert json.loads(result.stdout) == ["CLAUDE_CODE_OAUTH_TOKEN"]
+
+
+@pytest.mark.parametrize(
+    ("source", "settings"),
+    [
+        ("managed", {"apiKeyHelper": "print-token"}),
+        ("user", {"apiKeyHelper": "print-token"}),
+        ("managed", {"env": {"CLAUDE_CODE_USE_GATEWAY": "1"}}),
+        ("user", {"env": {"CLAUDE_CODE_USE_GATEWAY": "1"}}),
+        ("environment", {"CLAUDE_CODE_USE_GATEWAY": "1"}),
+        ("environment", {"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"}),
+        ("environment", {"CLAUDE_CODE_USE_VERTEX": "1"}),
+    ],
+)
+def test_subscription_provider_preserves_claude_configured_auth(
+    _isolated_provider_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+    settings: dict[str, Any],
+) -> None:
+    """CLI-owned gateway and cloud credentials keep their existing launch behavior."""
+    _seed_config(
+        _isolated_provider_config,
+        {"claude": {"kind": "subscription", "cli": "claude", "default": True}},
+    )
+    if source == "environment":
+        for name, value in settings.items():
+            monkeypatch.setenv(name, value)
+    else:
+        settings_dir = _isolated_provider_config / ".claude"
+        settings_dir.mkdir()
+        settings_path = settings_dir / "settings.json"
+        settings_path.write_text(json.dumps(settings))
+        if source == "managed":
+            monkeypatch.setattr(
+                claude_native, "_CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (settings_path,)
+            )
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "inherited-test-credential")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "inherited-test-credential")
+
+    assert claude_native.resolve_native_claude_config(spec=None) is None
 
 
 def test_resolve_native_claude_config_global_databricks_auth_matches_session(
@@ -9896,6 +10511,86 @@ def test_claude_transcript_records_handles_native_compaction_messages() -> None:
     assert "discarded before compaction" not in json.dumps(records)
 
 
+def test_claude_transcript_records_replay_pi_compaction_snapshot() -> None:
+    """A Pi-native compaction snapshot keeps its summary and retained tool pair."""
+    summary = (
+        "The conversation history before this point was compacted into the following summary:"
+        "\n\n<summary>\nPI-CHECKPOINT\n</summary>"
+    )
+    items: list[dict[str, Any]] = [
+        {
+            "id": "msg_before",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "summarized raw history"}],
+        },
+        {
+            "id": "cmp_pi",
+            "type": "compaction",
+            "summary": "PI-CHECKPOINT",
+            "token_count": 50,
+            "compacted_messages": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": summary}],
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "reading"}],
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "toolu_pi",
+                    "name": "read",
+                    "arguments": '{"path":"a.txt"}',
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "toolu_pi",
+                    "output": "retained result",
+                },
+            ],
+        },
+        {
+            "id": "msg_after",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "after compaction"}],
+        },
+    ]
+
+    records = claude_native._claude_transcript_records_from_session_items(
+        items,
+        session_id="conv_pi",
+        external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
+        cwd=Path("/tmp/test"),
+        bridge_dir=Path("/tmp/test-bridge"),
+    )
+
+    assert [record.get("subtype") or record["message"] for record in records] == [
+        "compact_boundary",
+        {"role": "user", "content": summary},
+        {"role": "assistant", "content": [{"type": "text", "text": "reading"}]},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "toolu_pi", "name": "read", "input": {"path": "a.txt"}}
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_pi", "content": "retained result"}
+            ],
+        },
+        {"role": "user", "content": "after compaction"},
+    ]
+    assert all(record["parentUuid"] == previous["uuid"] for previous, record in pairwise(records))
+    assert "summarized raw history" not in json.dumps(records)
+
+
 def test_claude_transcript_records_downgrades_compaction_stripped_image() -> None:
     """A compaction-stripped image block never resumes as an invalid image.
 
@@ -10169,6 +10864,31 @@ def test_tool_use_result_redacts_inline_image_base64() -> None:
     assert tool_use_result[1]["width"] == 1280
     # Whole-record invariant: the payload exists exactly once.
     assert json.dumps(record).count(b64) == 1
+
+
+def test_claude_transcript_pdf_read_result_replays_as_one_document_block() -> None:
+    """
+    A PDF Read result resumes as a document block, not base64 prompt text.
+
+    The payload must appear exactly once in the rebuilt record.
+    """
+    pdf_b64 = base64.b64encode(b"%PDF-1.7\n" + b"0" * 30_000).decode()
+    text_block = {"type": "text", "text": "PDF file read: /tmp/test/report.pdf (29.3KB)"}
+    document_block = {
+        "type": "document",
+        "source": {"type": "base64", "media_type": "application/pdf", "data": pdf_b64},
+    }
+    records = _image_output_records(
+        json.dumps([text_block, document_block], separators=(",", ":"))
+    )
+
+    assert len(records) == 1
+    record = records[0]
+    assert record["message"]["content"][0]["content"] == [text_block, document_block]
+    redacted = json.loads(record["toolUseResult"])[1]["source"]["data"]
+    assert pdf_b64 not in redacted
+    assert "application/pdf" in redacted
+    assert json.dumps(record).count(pdf_b64) == 1
 
 
 def test_tool_use_result_redaction_is_tool_name_independent() -> None:
@@ -11391,8 +12111,8 @@ async def test_probe_claude_model_options_uses_harness_startup_config(
             "plugin-wrapper" if with_launcher else expected_command, *prefix, "-p"
         )
         assert (command, *args)[: len(expected_argv)] == expected_argv
-        # No --settings without an apiKeyHelper to deliver.
-        assert "--settings" not in args
+        # Without an apiKeyHelper to deliver, the settings only disable hooks.
+        assert json.loads(args[args.index("--settings") + 1]) == {"disableAllHooks": True}
         return _FakeProcess()
 
     monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
@@ -11535,13 +12255,46 @@ async def test_probe_claude_model_options_runs_the_harness_under_the_launch_env(
     assert args[probe_start : probe_start + 3] == ["-p", "--input-format", "stream-json"]
     assert "--strict-mcp-config" in args and "--no-session-persistence" in args
     settings_payload = json.loads(args[args.index("--settings") + 1])
-    assert settings_payload == {"apiKeyHelper": "printf token"}
+    assert settings_payload == {"disableAllHooks": True, "apiKeyHelper": "printf token"}
     env = captured["env"]
     assert env["ANTHROPIC_BASE_URL"] == "https://gw.example/anthropic"
     assert env["DISABLE_TELEMETRY"] == "1"
     assert env["DISABLE_AUTOUPDATER"] == "1"
     assert "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC" not in env
     assert "CLAUDECODE" not in env
+
+
+async def test_probe_claude_model_options_omits_mcp_flags_under_managed_mcp_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Claude Code rejects ``--strict-mcp-config`` when ``managed-mcp.json`` exists."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    _install_managed_mcp_config(tmp_path, monkeypatch)
+    spawned_args: list[list[str]] = []
+
+    class _FakeProcess:
+        pid = None
+        returncode = 0
+
+        async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
+            return _picker_response("opus"), b""
+
+    async def _fake_exec(command: str, *args: str, **kwargs: Any) -> _FakeProcess:
+        spawned_args.append(list(args))
+        return _FakeProcess()
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
+
+    probe = await claude_native.probe_claude_model_options(_gateway_probe_config())
+
+    assert probe is not None
+    assert probe.alias_rows == [{"id": "opus", "model": "opus", "displayName": "opus"}]
+    assert spawned_args
+    for args in spawned_args:
+        assert "--strict-mcp-config" not in args
+        assert "--mcp-config" not in args
+        assert "--no-session-persistence" in args
 
 
 async def test_claude_model_catalog_marks_the_enumerated_default(
@@ -12240,6 +12993,86 @@ def test_managed_gateway_endpoint_takes_precedence(
     assert claude_native.claude_catalog_fingerprint(None) == fingerprint
 
 
+@pytest.mark.parametrize(
+    ("managed", "user", "process", "effective", "leaves_login"),
+    [
+        pytest.param(
+            {"CLAUDE_CODE_USE_BEDROCK": "0"},
+            {"CLAUDE_CODE_USE_BEDROCK": "1"},
+            {},
+            {"CLAUDE_CODE_USE_BEDROCK": "0"},
+            False,
+            id="managed-off-over-user-on",
+        ),
+        pytest.param(
+            {},
+            {"CLAUDE_CODE_USE_VERTEX": "1"},
+            {"CLAUDE_CODE_USE_VERTEX": "0"},
+            {"CLAUDE_CODE_USE_VERTEX": "1"},
+            True,
+            id="user-on-over-process-off",
+        ),
+        pytest.param(
+            {},
+            {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"},
+            {"ANTHROPIC_BASE_URL": "https://gateway.example"},
+            {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"},
+            False,
+            id="user-anthropic-over-process-gateway",
+        ),
+        pytest.param(
+            {"ANTHROPIC_BASE_URL": "https://gateway.example"},
+            {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"},
+            {},
+            {"ANTHROPIC_BASE_URL": "https://gateway.example"},
+            True,
+            id="managed-gateway-over-user-anthropic",
+        ),
+        pytest.param(
+            {},
+            {},
+            {"CLAUDE_CODE_USE_FOUNDRY": "on"},
+            {"CLAUDE_CODE_USE_FOUNDRY": "on"},
+            True,
+            id="process-foundry-on",
+        ),
+        pytest.param(
+            {},
+            {},
+            {"CLAUDE_CODE_USE_GATEWAY": "1"},
+            {"CLAUDE_CODE_USE_GATEWAY": "1"},
+            True,
+            id="process-gateway-on",
+        ),
+    ],
+)
+def test_ambient_transport_takes_managed_then_user_then_process_values(
+    managed: dict[str, str],
+    user: dict[str, str],
+    process: dict[str, str],
+    effective: dict[str, str],
+    leaves_login: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each transport setting comes from managed settings, else user settings, else the env."""
+    for name in ("ANTHROPIC_BASE_URL", *claude_native._CLAUDE_TRANSPORT_FLAGS):
+        monkeypatch.delenv(name, raising=False)
+    managed_settings = tmp_path / "managed-settings.json"
+    managed_settings.write_text(json.dumps({"env": managed}))
+    monkeypatch.setattr(claude_native, "_CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed_settings,))
+    (tmp_path / "claude-config").mkdir()
+    (tmp_path / "claude-config" / "settings.json").write_text(json.dumps({"env": user}))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
+    for name, value in process.items():
+        monkeypatch.setenv(name, value)
+
+    transport = claude_native.claude_ambient_transport()
+
+    assert dict(transport.env) == effective
+    assert transport.leaves_login() is leaves_login
+
+
 def test_catalog_fingerprint_changes_with_managed_gateway(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -12391,10 +13224,37 @@ def _isolate_to_connect_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
         "omnigent.onboarding.provider_config.default_provider_for_harness",
         lambda *a, **k: None,
     )
-    monkeypatch.setattr("omnigent.runtime.workflow._load_global_auth", lambda: None)
+    monkeypatch.setattr(workflow, "_load_global_auth", lambda: None)
     monkeypatch.setattr(
         "omnigent.onboarding.detected.effective_config_with_detected", lambda cfg: cfg
     )
+
+
+def test_connect_fallback_isolation_does_not_leak_provider_stub() -> None:
+    """A fresh interpreter must restore provider aliases imported during isolation."""
+    program = """
+import pytest
+from omnigent.onboarding import provider_config
+
+original = provider_config.default_provider_for_harness
+from tests.harnesses.claude_native.test_claude_native import _isolate_to_connect_fallback
+
+with pytest.MonkeyPatch.context() as monkeypatch:
+    _isolate_to_connect_fallback(monkeypatch)
+
+from omnigent.runtime import workflow
+assert provider_config.default_provider_for_harness is original
+assert workflow.default_provider_for_harness is original
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", program],
+        cwd=Path(__file__).resolve().parents[3],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_resolve_native_claude_config_connect_broker_fallback(
@@ -12408,14 +13268,16 @@ def test_resolve_native_claude_config_connect_broker_fallback(
     cfg = tmp_path / ".databrickscfg"
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
-    dc._write_profile(cfg, "https://ws.example")
-    dc._write_sidecar(cfg, "https://srv", "hid", "launch-tok", "https://ws.example")
+    workspace_url = "https://ws.cloud.databricks.com"
+    dc._write_profile(cfg, workspace_url)
+    dc._write_sidecar(cfg, "https://srv", "hid", "launch-tok", workspace_url)
 
     config = claude_native.resolve_native_claude_config(spec=None, refresh_models=False)
 
     assert config is not None
-    assert config.env["ANTHROPIC_BASE_URL"] == "https://ws.example/ai-gateway/anthropic"
+    assert config.env["ANTHROPIC_BASE_URL"] == workspace_url + "/ai-gateway/anthropic"
     assert config.env["CLAUDE_CODE_USE_GATEWAY"] == "1"
+    assert config.env["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"] == "1"
     assert config.env["ANTHROPIC_CUSTOM_HEADERS"].splitlines() == [
         "x-databricks-use-coding-agent-mode: true",
         "Databricks-Custom-Coding-Agent: claude-code",
@@ -12427,8 +13289,9 @@ def test_resolve_native_claude_config_connect_broker_fallback(
     assert config.model == "catalog-databricks-claude-default"
 
 
+@pytest.mark.parametrize("gateway", [False, True])
 def test_connect_fallback_prefers_ucode_state(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gateway: bool
 ) -> None:
     """When ucode has populated ~/.ucode/state.json for the connected workspace,
     the managed-connect config uses ucode's base URL and discovered served model,
@@ -12440,17 +13303,21 @@ def test_connect_fallback_prefers_ucode_state(
     cfg = tmp_path / ".databrickscfg"
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
-    dc._write_profile(cfg, "https://ws.example")
-    dc._write_sidecar(cfg, "https://srv", "hid", "launch-tok", "https://ws.example")
+    workspace_url = "https://ws.cloud.databricks.com"
+    path = "/ai-gateway/anthropic" if gateway else "/serving-endpoints/anthropic"
+    base_url = workspace_url + path
+    dc._write_profile(cfg, workspace_url)
+    dc._write_sidecar(cfg, "https://srv", "hid", "launch-tok", workspace_url)
 
     state = UcodeWorkspaceState(
-        workspace_url="https://ws.example",
+        workspace_url=workspace_url,
         agents={
             "claude": UcodeAgentState(
                 model="system.ai.claude-sonnet-4-6",
                 env={
-                    "ANTHROPIC_BASE_URL": "https://ws.example/serving-endpoints/anthropic",
+                    "ANTHROPIC_BASE_URL": base_url,
                     "ANTHROPIC_CUSTOM_HEADERS": "User-Agent: ucode/0.1.0 claude/2.1.0",
+                    "CLAUDE_CODE_DISABLE_ADVISOR_TOOL": "0",
                 },
             )
         },
@@ -12461,13 +13328,20 @@ def test_connect_fallback_prefers_ucode_state(
 
     assert config is not None
     # ucode's base URL + discovered model win over the hand-built defaults.
-    assert config.env["ANTHROPIC_BASE_URL"] == "https://ws.example/serving-endpoints/anthropic"
+    assert config.env["ANTHROPIC_BASE_URL"] == base_url
     assert config.model == "system.ai.claude-sonnet-4-6"
-    # ug's own header lines survive, and the route is attributed to it.
+    assert config.env["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"] == "1"
+    # Preserve ug's headers; add attribution only on its Unity Gateway route.
     assert config.env["ANTHROPIC_CUSTOM_HEADERS"].splitlines() == [
         "User-Agent: ucode/0.1.0 claude/2.1.0",
-        "Databricks-Custom-Coding-Agent: claude-code",
-        "Databricks-Custom-Client-Surfaces: omnigent, ug",
+        *(
+            [
+                "Databricks-Custom-Coding-Agent: claude-code",
+                "Databricks-Custom-Client-Surfaces: omnigent, ug",
+            ]
+            if gateway
+            else []
+        ),
     ]
     # But the bearer is still our own broker command, not ucode's.
     assert config.api_key_helper is not None

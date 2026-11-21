@@ -33,13 +33,14 @@ import ipaddress
 import logging
 import socket
 import ssl
+import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
 from email.message import Message
 from email.parser import BytesParser
 from pathlib import Path
 from typing import cast
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from omnigent.inner.credential_proxy import (
     SYNTHETIC_CREDENTIAL_PREFIX,
@@ -55,6 +56,22 @@ from omnigent.inner.egress.rules import (
 )
 
 logger = logging.getLogger(__name__)
+
+RequestBodyTransform = Callable[[str, str, int, str, bytes], bytes]
+
+
+@dataclass(frozen=True)
+class HostScopedRequestBodyTransform:
+    """Apply a trusted body transform only to one destination host."""
+
+    host: str
+    transform: RequestBodyTransform
+
+    def __call__(self, method: str, host: str, port: int, path: str, body: bytes) -> bytes:
+        if host.lower() != self.host.lower():
+            return body
+        return self.transform(method, host, port, path, body)
+
 
 _CONNECT_RESPONSE = b"HTTP/1.1 200 Connection Established\r\n\r\n"
 _HTTP2_PREFACE_FIRST_LINE = b"PRI * HTTP/2.0\r\n"
@@ -153,6 +170,70 @@ _CLOUD_TRAP_NETWORKS: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] 
 )
 
 
+async def _open_upstream(
+    host: str, connect_host: str, port: int, ssl_ctx: ssl.SSLContext | None = None
+) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    """Dial the destination, tunnelling via the ambient HTTP(S)_PROXY when set.
+
+    ``NO_PROXY`` hosts connect directly. TLS (when ``ssl_ctx`` is given) is
+    negotiated end-to-end with ``host`` over the CONNECT tunnel. Only env
+    vars are read (``ALL_PROXY`` is the fallback); OS proxy settings are ignored.
+
+    The CONNECT target is the DNS-pinned IP, and plain HTTP also uses CONNECT
+    (to port 80). Proxies that deny CONNECT to non-TLS ports (Squid's default)
+    or filter by hostname will refuse. Schemeless proxy values are read as
+    ``http://``; any other scheme is logged as an error and ignored (direct dial).
+    """
+    proxies = urllib.request.getproxies_environment()
+    proxy = proxies.get("https" if ssl_ctx else "http") or proxies.get("all")
+    # Missing from typeshed stubs; present at runtime.
+    bypass = urllib.request.proxy_bypass_environment  # type: ignore[missing-attribute]
+    if proxy and bypass(f"{host}:{port}", proxies):
+        proxy = None
+    try:
+        parsed_proxy = urlparse(proxy if "://" in proxy else f"http://{proxy}") if proxy else None
+        if parsed_proxy and (parsed_proxy.scheme != "http" or not parsed_proxy.hostname):
+            logger.error(
+                "Unsupported upstream proxy scheme %r; connecting directly", parsed_proxy.scheme
+            )
+            parsed_proxy = None
+        proxy_port = (parsed_proxy.port or 80) if parsed_proxy else 80
+    except ValueError:
+        # URL parsing errors can contain the credential-bearing authority.
+        raise OSError("Invalid upstream proxy configuration") from None
+    if parsed_proxy is None:
+        return await asyncio.open_connection(
+            connect_host, port, ssl=ssl_ctx, server_hostname=host if ssl_ctx else None
+        )
+    reader, writer = await asyncio.open_connection(parsed_proxy.hostname, proxy_port)
+    try:
+        auth = b""
+        if parsed_proxy.username:  # basic auth only; no NTLM/Kerberos
+            cred = (
+                f"{unquote(parsed_proxy.username)}:{unquote(parsed_proxy.password or '')}".encode()
+            )
+            auth = b"Proxy-Authorization: Basic " + base64.b64encode(cred) + b"\r\n"
+        target = (
+            f"{connect_host}:{port}" if ":" not in connect_host else f"[{connect_host}]:{port}"
+        )
+        writer.write(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n".encode() + auth + b"\r\n")
+        await writer.drain()
+        head = await reader.readuntil(b"\r\n\r\n")
+        version, _, rest = head.split(b"\r\n", 1)[0].partition(b" ")
+        code = rest.partition(b" ")[0]
+        if version not in (b"HTTP/1.0", b"HTTP/1.1") or len(code) != 3 or not code.isdigit():
+            raise OSError("upstream proxy refused CONNECT: invalid response")
+        if not code.startswith(b"2"):
+            # Status code only: the proxy's reason text is untrusted.
+            raise OSError(f"upstream proxy refused CONNECT: {code.decode('ascii')}")
+        if ssl_ctx:
+            await writer.start_tls(ssl_ctx, server_hostname=host)
+    except BaseException:
+        writer.close()
+        raise
+    return reader, writer
+
+
 class EgressProxy:
     """Asyncio-based MITM HTTP(S) proxy with rule enforcement.
 
@@ -224,8 +305,10 @@ class EgressProxy:
         block_private_destinations: bool = True,
         auth_token: str | None = None,
         credential_rewrites: list[CredentialRewriteRule] | None = None,
+        request_body_transform: RequestBodyTransform | None = None,
     ) -> None:
         self._rules = rules
+        self._request_body_transform = request_body_transform
         self._cert_cache = HostCertCache(ca_cert_path, ca_key_path)
         # Build the upstream TLS verification context ONCE, at
         # construction time, from the configured bundle path. The
@@ -457,6 +540,11 @@ class EgressProxy:
     ) -> None:
         """Handle CONNECT — TLS MITM, inspect inner HTTP, enforce rules."""
         host, port = self._parse_host_port(target, default_port=443)
+        host_rule = self._cred_by_host.get(host.lower())
+        if host_rule is not None and host_rule.required_tls_port is not None:
+            if port != host_rule.required_tls_port:
+                await self._send_forbidden(writer, "credential-bound host has invalid TLS port")
+                return
 
         # S5 (security): hostname canonicalization. Reject any host
         # carrying a byte outside the DNS grammar ``[A-Za-z0-9.-]``
@@ -605,14 +693,19 @@ class EgressProxy:
                             tls_writer, "HTTP/2 cannot use a credential rewrite rule"
                         )
                         return
+                    if not self._allows_http2_passthrough(host):
+                        await self._send_forbidden(
+                            tls_writer, "HTTP/2 cannot bypass request inspection"
+                        )
+                        return
                     logger.info("ALLOW-H2 https://%s/**", host)
                     await self._forward_http2(tls_reader, tls_writer, host, port, inner_first)
                     return
 
                 try:
-                    inner_method, inner_path = self._parse_inner_request_line(inner_first)
+                    inner_method, inner_path = self._parse_tunnel_request_line(host, inner_first)
                     inner_headers_raw = await self._read_headers(tls_reader)
-                    content_length = self._parse_inner_content_length(inner_headers_raw)
+                    content_length = self._parse_tunnel_content_length(host, inner_headers_raw)
                 except ValueError:
                     await self._send_forbidden(tls_writer, "malformed inner request")
                     return
@@ -709,6 +802,16 @@ class EgressProxy:
     def _tls_connection_closed(self) -> None:
         """Notify a specialized relay when the inbound TLS tunnel ends."""
 
+    def _parse_tunnel_request_line(self, host: str, raw: bytes) -> tuple[str, str]:
+        """Parse a CONNECT request line using the relay's existing parser."""
+        del host
+        return self._parse_inner_request_line(raw)
+
+    def _parse_tunnel_content_length(self, host: str, headers_raw: bytes) -> int:
+        """Parse CONNECT body framing using the relay's existing parser."""
+        del host
+        return self._parse_inner_content_length(headers_raw)
+
     @staticmethod
     def _parse_inner_request_line(raw: bytes) -> tuple[str, str]:
         """Parse the generic proxy's inner HTTP request line."""
@@ -728,7 +831,32 @@ class EgressProxy:
 
     def _allows_http2_passthrough(self, host: str) -> bool:
         """Return whether opaque HTTP/2 relay is safe for *host*."""
-        return self._allows_unrestricted_host(host) and host.lower() not in self._cred_by_host
+        return (
+            (
+                self._request_body_transform is None
+                or (
+                    isinstance(self._request_body_transform, HostScopedRequestBodyTransform)
+                    and host.lower() != self._request_body_transform.host.lower()
+                )
+            )
+            and self._allows_unrestricted_host(host)
+            and host.lower() not in self._cred_by_host
+        )
+
+    def _transform_request_body(
+        self, method: str, host: str, port: int, path: str, headers: bytes, body: bytes
+    ) -> tuple[bytes, bytes]:
+        """Apply a trusted compatibility patch after request policy checks."""
+        if self._request_body_transform is None:
+            return headers, body
+        transformed = self._request_body_transform(method, host, port, path, body)
+        if transformed == body:
+            return headers, body
+        message = _parse_http_headers(headers)
+        del message["Content-Length"]
+        del message["Transfer-Encoding"]
+        message["Content-Length"] = str(len(transformed))
+        return message.as_bytes(policy=email.policy.HTTP), transformed
 
     async def _forward_http2(
         self,
@@ -748,12 +876,7 @@ class EgressProxy:
         connect_host = pinned_ip or host
         try:
             upstream_reader, upstream_writer = await asyncio.wait_for(
-                asyncio.open_connection(
-                    connect_host,
-                    port,
-                    ssl=self._upstream_h2_ssl_ctx,
-                    server_hostname=host,
-                ),
+                _open_upstream(host, connect_host, port, self._upstream_h2_ssl_ctx),
                 timeout=30,
             )
         except Exception as exc:  # noqa: BLE001 — closing the h2 stream signals failure
@@ -793,6 +916,9 @@ class EgressProxy:
         body: bytes,
     ) -> bool:
         """Open a real TLS connection to the target and relay."""
+        headers_raw, body = self._transform_request_body(
+            method, host, port, path, headers_raw, body
+        )
         try:
             pinned_ip = await self._assert_destination_allowed(host, port)
         except PermissionError as exc:
@@ -832,12 +958,7 @@ class EgressProxy:
         headers_raw = self._force_connection_close(rewrite.headers)
         try:
             upstream_reader, upstream_writer = await asyncio.wait_for(
-                asyncio.open_connection(
-                    connect_host,
-                    port,
-                    ssl=ssl_ctx,
-                    server_hostname=host,
-                ),
+                _open_upstream(host, connect_host, port, ssl_ctx),
                 timeout=30,
             )
         except Exception as exc:  # noqa: BLE001 — upstream connect failure maps to 502
@@ -938,6 +1059,12 @@ class EgressProxy:
             await self._send_forbidden(writer, "host contains forbidden character")
             return
 
+        if (
+            host_rule := self._cred_by_host.get(host.lower())
+        ) is not None and host_rule.https_only:
+            await self._send_forbidden(writer, "credential-bound hosts require HTTPS")
+            return
+
         if not check_request(self._rules, method, host, path):
             logger.warning("BLOCKED %s http://%s%s", method, host, path)
             await self._send_forbidden(writer, f"{method} http://{host}{path} denied by policy")
@@ -971,6 +1098,10 @@ class EgressProxy:
         if content_length > 0:
             body = await asyncio.wait_for(reader.readexactly(content_length), timeout=30)
 
+        headers_raw, body = self._transform_request_body(
+            method, host, port, path, headers_raw, body
+        )
+
         relative_line = f"{method} {path} HTTP/1.1\r\n".encode("latin-1")
         rewrite = await self._rewrite_authorization_async(
             method=method, host=host, headers_raw=headers_raw
@@ -997,7 +1128,7 @@ class EgressProxy:
         connect_host = pinned_ip or host
         try:
             upstream_reader, upstream_writer = await asyncio.wait_for(
-                asyncio.open_connection(connect_host, port),
+                _open_upstream(host, connect_host, port),
                 timeout=30,
             )
         except Exception as exc:  # noqa: BLE001 — upstream connect failure maps to 502
@@ -1395,7 +1526,7 @@ class EgressProxy:
                 del msg["Authorization"]
                 for value in rewritten:
                     msg["Authorization"] = value
-        elif host_rule is not None:
+        elif host_rule is not None and host_rule.inject_on_missing:
             # Swap-on-access: the request reached a bound host with no
             # Authorization header, so attach the real credential now.
             msg["Authorization"] = format_auth(host_rule)

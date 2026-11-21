@@ -54,6 +54,7 @@ from omnigent.inner.sandbox import SandboxPolicy, protect_credential_source
 # to be unmistakable and to use only base64url-safe characters so it
 # survives Basic-auth ``base64(user:pass)`` round-trips intact.
 SYNTHETIC_CREDENTIAL_PREFIX = "oa_cred_"
+CODEX_GATEWAY_TOKEN_ENV = "OMNIGENT_CODEX_GATEWAY_TOKEN"
 # Timeout for a ``command:`` source subprocess, in seconds.
 _COMMAND_SOURCE_TIMEOUT_SECONDS = 30
 _BROKER_SOURCE_TIMEOUT_SECONDS = 5
@@ -117,6 +118,9 @@ class CredentialRewriteRule:
         secret expires and must be refreshed for long sessions (e.g. a
         Databricks OAuth profile). Takes precedence over
         :attr:`real_secret` when set.
+    :param inject_on_missing: Attach the credential to bare requests by default.
+    :param https_only: Reject plain HTTP requests to this host.
+    :param required_tls_port: Restrict CONNECT to one TLS port when set.
     """
 
     host: str
@@ -125,6 +129,9 @@ class CredentialRewriteRule:
     synthetic: str | None = None
     username: str | None = None
     secret_provider: Callable[[], str] | None = None
+    inject_on_missing: bool = True
+    https_only: bool = False
+    required_tls_port: int | None = None
 
     def resolve_secret(self) -> str:
         """
@@ -272,6 +279,8 @@ def prepare_credential_proxy_runtime(
             for env_name in entry.inject_env:
                 synthetic_by_env[env_name] = synthetic
                 runtime.helper_env_updates[env_name] = synthetic
+        # OS tools share this binding, so every relay must require HTTPS and the placeholder.
+        locked_gateway = CODEX_GATEWAY_TOKEN_ENV in entry.inject_env
         runtime.rewrites.append(
             CredentialRewriteRule(
                 host=entry.host,
@@ -280,6 +289,9 @@ def prepare_credential_proxy_runtime(
                 synthetic=synthetic,
                 username=entry.username,
                 secret_provider=secret_provider,
+                inject_on_missing=not locked_gateway,
+                https_only=locked_gateway,
+                required_tls_port=443 if locked_gateway else None,
             )
         )
     return runtime
