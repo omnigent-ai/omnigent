@@ -21,6 +21,7 @@ import {
   ChevronDownIcon,
   ChevronLeftIcon,
   Loader2Icon,
+  MessageSquareIcon,
   PencilIcon,
   PlayIcon,
   ShareIcon,
@@ -89,6 +90,7 @@ import { nativeCodingAgentForAvailableAgent } from "@/lib/nativeCodingAgents";
 import { canonicalNativeHarness, nativePermissionOptions } from "@/lib/nativeHarnessModes";
 import { formatStatusEffortLabel, formatStatusModelLabel } from "@/lib/composerModelLabel";
 import { formatSessionCostUsd } from "@/lib/formatCost";
+import { groupRunsBySession } from "@/lib/runSessionGroups";
 import {
   describeRunFailure,
   describeSchedule,
@@ -440,6 +442,22 @@ function TaskDetail({ taskId }: { taskId: string }) {
     });
   }
 
+  function renderRun(run: ScheduledTaskRun, showCost: boolean) {
+    return (
+      <RunRow
+        key={run.id}
+        run={run}
+        now={now}
+        highlighted={run.id === highlightedRunId}
+        showCost={showCost}
+        steps={runStepsEnabled ? runSteps.get(run.id) : undefined}
+        pullRequests={
+          runPullRequestsEnabled ? runPullRequests.get(run.id)?.pullRequests : undefined
+        }
+      />
+    );
+  }
+
   return (
     <PageScroll contentClassName="px-6" data-testid="task-detail-page">
       <BackLink />
@@ -717,12 +735,6 @@ function TaskDetail({ taskId }: { taskId: string }) {
 
       {/* Runs. */}
       <h2 className="mb-2 text-sm font-medium text-muted-foreground">Runs</h2>
-      {runs?.some((run) => run.sessionCostUsd != null) && (
-        <p className="mb-2 text-xs text-muted-foreground">
-          Session cost is each session’s current recorded total. Runs sharing a session show the
-          same total. Separate sub-agent sessions are excluded.
-        </p>
-      )}
       {runsLoading ? (
         <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
           <Loader2Icon className="size-4 animate-spin" />
@@ -738,18 +750,23 @@ function TaskDetail({ taskId }: { taskId: string }) {
         </p>
       ) : (
         <ul className="flex flex-col gap-1" data-testid="task-detail-runs">
-          {(runs ?? []).map((run) => (
-            <RunRow
-              key={run.id}
-              run={run}
-              now={now}
-              highlighted={run.id === highlightedRunId}
-              steps={runStepsEnabled ? runSteps.get(run.id) : undefined}
-              pullRequests={
-                runPullRequestsEnabled ? runPullRequests.get(run.id)?.pullRequests : undefined
-              }
-            />
-          ))}
+          {groupRunsBySession(
+            runs ?? [],
+            task.sessionMode === "continue" ? (task.sessionId ?? null) : null,
+          ).map((entry) =>
+            entry.kind === "run" ? (
+              renderRun(entry.run, true)
+            ) : (
+              <RunSessionGroup
+                key={`session:${entry.sessionId}`}
+                sessionId={entry.sessionId}
+                runs={entry.runs}
+                readOnly={readOnly}
+              >
+                {entry.runs.map((run) => renderRun(run, false))}
+              </RunSessionGroup>
+            ),
+          )}
         </ul>
       )}
 
@@ -862,12 +879,66 @@ function useRunUnread(run: ScheduledTaskRun): boolean {
 }
 
 /**
+ * Runs that went into one session, listed under a link to it with its running
+ * total, so the total reads as the session's rather than each run's.
+ */
+function RunSessionGroup({
+  sessionId,
+  runs,
+  readOnly,
+  children,
+}: {
+  sessionId: string;
+  runs: readonly ScheduledTaskRun[];
+  readOnly: boolean;
+  children: ReactNode;
+}) {
+  // The session is the owner's, so a viewer has no title for it.
+  const { session } = useSession(readOnly ? null : sessionId);
+  const title = session?.title || "Continued session";
+  // Every run in the group reports the same session total.
+  const totalCostUsd = runs.find((run) => run.sessionCostUsd != null)?.sessionCostUsd ?? null;
+  return (
+    <li className="flex flex-col gap-1" data-testid="run-session-group">
+      <Link
+        to={`/c/${encodeURIComponent(sessionId)}`}
+        data-testid="run-session-group-open"
+        className="flex items-center gap-3 rounded-lg px-2 py-2 transition-colors hover:bg-muted focus-visible:bg-muted focus-visible:outline-none"
+      >
+        <span className="flex size-5 shrink-0 items-center justify-center">
+          <MessageSquareIcon
+            aria-hidden="true"
+            className="size-4 text-muted-foreground"
+            strokeWidth={1.75}
+          />
+        </span>
+        <span className="flex min-w-0 flex-wrap items-baseline gap-x-2">
+          <span className="min-w-0 truncate text-sm font-medium">{title}</span>
+          {totalCostUsd != null && (
+            <span className="text-xs text-muted-foreground" data-testid="run-session-group-cost">
+              {formatSessionCostUsd(totalCostUsd)} total
+            </span>
+          )}
+        </span>
+      </Link>
+      <ul
+        aria-label={`Runs in ${title}`}
+        className="ml-[17px] flex flex-col gap-1 border-l border-border pl-1.5"
+      >
+        {children}
+      </ul>
+    </li>
+  );
+}
+
+/**
  * One run in the history list. Layout (LEFT status column + whole-row click):
  * - LEADING: a single status icon chosen by priority (see `RunStatusIcon`) —
  *   failed triangle > skipped circle-slash > succeeded-unread blue dot >
  *   succeeded-read grey dot — each with an explanatory tooltip.
- * - BODY: the fire timestamp, the duration (muted), and — for skipped/failed —
- *   the stage the fire stopped at and why, derived from `errorCode`.
+ * - BODY: the fire timestamp, the duration (muted), the cost of a run that has
+ *   its session to itself, and — for skipped/failed — the stage the fire stopped
+ *   at and why, derived from `errorCode`.
  *
  * When the run produced a conversation the ENTIRE row is the click target
  * (a real `<Link>`: keyboard-focusable, Enter/Space activate natively) that
@@ -887,12 +958,15 @@ function RunRow({
   run,
   now,
   highlighted,
+  showCost,
   steps,
   pullRequests,
 }: {
   run: ScheduledTaskRun;
   now: Date;
   highlighted: boolean;
+  /** `false` for a run listed under its shared session, which shows the session's total. */
+  showCost: boolean;
   /** The run's latest plan, independent of the automation's current prompt. */
   steps?: ScheduledTaskRunSteps;
   /** The PRs the run created or worked on. */
@@ -990,9 +1064,10 @@ function RunRow({
               {duration}
             </span>
           )}
-          {run.sessionCostUsd != null && (
+          {showCost && run.sessionCostUsd != null && (
             <span className="text-xs text-muted-foreground" data-testid="run-cost">
-              Session cost {formatSessionCostUsd(run.sessionCostUsd)}
+              {formatSessionCostUsd(run.sessionCostUsd)}
+              {inFlightLabel !== undefined && " so far"}
             </span>
           )}
           {inFlightLabel && !(run.conversationPendingApprovals ?? 0) && (
