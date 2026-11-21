@@ -23,12 +23,37 @@ from tests.harnesses.claude_native.forwarder._support import (
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("slow_observer_stderr", [False, True])
+@pytest.mark.parametrize(
+    ("slow_file", "read_number"),
+    [
+        (None, 0),
+        ("observer_hook.stderr", 1),
+        ("transcript_forwarder.json", 1),
+        ("subagent_forwarder.json", 1),
+        ("message_deltas_forwarder.json", 1),
+        ("bridge.json", 1),
+        ("state.json", 1),
+        ("state.json", 2),
+        ("state.json", 3),
+    ],
+    ids=[
+        "ordinary",
+        "observer",
+        "cursor",
+        "children",
+        "deltas",
+        "owner",
+        "native-id",
+        "transcript",
+        "parent-ids",
+    ],
+)
 async def test_forwarder_survives_unhandled_loop_exceptions(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
-    slow_observer_stderr: bool,
+    slow_file: str | None,
+    read_number: int,
 ) -> None:
     """
     A non-HTTP loop exception is logged and the next poll continues.
@@ -87,21 +112,35 @@ async def test_forwarder_survives_unhandled_loop_exceptions(
     )
     caplog.set_level(logging.ERROR, logger="omnigent.harnesses.claude_native.forwarder")
 
-    observer_entered = asyncio.Event()
-    release_observer = threading.Event()
-    observer_finished = threading.Event()
+    monkeypatch.setattr(forwarder, "harness_stderr_capture_enabled", lambda: False)
+    io_entered = asyncio.Event()
+    release_io = threading.Event()
+    io_finished = threading.Event()
     original_stat = Path.stat
+    original_read_text = Path.read_text
     loop = asyncio.get_running_loop()
+    reads = 0
+
+    def hold_io() -> None:
+        nonlocal reads
+        reads += 1
+        if reads == read_number:
+            loop.call_soon_threadsafe(io_entered.set)
+            release_io.wait(timeout=5.0)
+            io_finished.set()
 
     def slow_stat(path: Path, *args: Any, **kwargs: Any) -> Any:
-        if path == bridge_dir / forwarder.OBSERVER_HOOK_STDERR_FILE:
-            if slow_observer_stderr and not observer_finished.is_set():
-                loop.call_soon_threadsafe(observer_entered.set)
-                release_observer.wait(timeout=5.0)
-                observer_finished.set()
+        if slow_file == "observer_hook.stderr" and path == bridge_dir / slow_file:
+            hold_io()
         return original_stat(path, *args, **kwargs)
 
+    def slow_read_text(path: Path, *args: Any, **kwargs: Any) -> str:
+        if slow_file != "observer_hook.stderr" and path == bridge_dir / str(slow_file):
+            hold_io()
+        return original_read_text(path, *args, **kwargs)
+
     monkeypatch.setattr(Path, "stat", slow_stat)
+    monkeypatch.setattr(Path, "read_text", slow_read_text)
 
     server, thread, base_url = _start_recording_server()
     task = asyncio.create_task(
@@ -116,13 +155,13 @@ async def test_forwarder_survives_unhandled_loop_exceptions(
         )
     )
     try:
-        if slow_observer_stderr:
-            await asyncio.wait_for(observer_entered.wait(), timeout=10.0)
-            assert not observer_finished.is_set(), "observer file I/O blocked the event loop"
-            release_observer.set()
+        if slow_file is not None:
+            await asyncio.wait_for(io_entered.wait(), timeout=10.0)
+            assert not io_finished.is_set(), "forwarder file I/O blocked the event loop"
+            release_io.set()
         request = await _get_recorded_item_request(server)
     finally:
-        release_observer.set()
+        release_io.set()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
