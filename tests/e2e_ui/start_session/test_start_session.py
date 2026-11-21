@@ -1121,6 +1121,9 @@ async def _drive_landing_clears_after_navigating_away(
             await landing_input.fill(message)
             await page.get_by_test_id("new-chat-landing-submit").click()
             await poll_until_async(lambda: len(create_bodies) == 1)
+            # The landing unmounts only when the temp chat commits; a detour
+            # started earlier can supersede that navigation and keep the landing.
+            await landing_input.wait_for(state="detached", timeout=30_000)
 
             # Detour through another session and come straight back, all
             # while the create is still bootstrapping.
