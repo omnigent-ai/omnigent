@@ -50,14 +50,12 @@ def test_default_collaboration_mode_sends_none_when_confirmed_absent() -> None:
     assert mode["settings"]["developer_instructions"] is None
 
 
-def test_default_collaboration_mode_reuses_current_developer_instructions() -> None:
-    """A Default-mode ``turn/start`` must not silently wipe developer_instructions.
+def test_default_collaboration_mode_keeps_codex_mode_instructions() -> None:
+    """A Default-mode ``turn/start`` never replaces Codex's built-in mode instructions.
 
-    Guards a self-inflicted overwrite: a ``_default_collaboration_mode`` that
-    always sends ``developer_instructions: null`` has that null applied
-    literally by Codex's app-server, clearing whatever
-    ``build_codex_native_server`` persisted, the instant the user (or the
-    plan-implementation flow) triggers a Default-mode turn.
+    Codex's app-server fills a null ``collaborationMode`` instruction with the
+    mode's preset; configured ``developer_instructions`` apply separately, so
+    echoing them here would only drop the preset.
     """
     state = fwd._CodexForwarderState()
     state.model = "gpt-5.4"
@@ -67,7 +65,7 @@ def test_default_collaboration_mode_reuses_current_developer_instructions() -> N
     mode = fwd._default_collaboration_mode(state)
 
     assert mode is not None
-    assert mode["settings"]["developer_instructions"] == "Be a concise coding assistant."
+    assert mode["settings"]["developer_instructions"] is None
 
 
 def test_note_thread_settings_updated_whitespace_nested_value_not_confirmed() -> None:
