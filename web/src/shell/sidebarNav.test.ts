@@ -4,6 +4,7 @@ import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTi
 import { orderSessionFamilies } from "@/lib/sessionFamilies";
 import {
   type ActiveChatOverride,
+  appendPinWrites,
   bareConversationId,
   computeNextActiveOverride,
   conversationDisplayLabel,
@@ -13,17 +14,20 @@ import {
   groupConversations,
   getConversationAgentType,
   customSortOrder,
+  isSharedAutomationRun,
   migratePinnedConversationIds,
   moveCustomOrder,
   orderByPinnedTimestamp,
   pinOrderWrites,
   resolveSidebarDrop,
+  sessionInSidebarFolder,
   sessionsListAcceptsDrop,
   sortConversations,
   startCustomOrder,
   STATUS_BUCKETS,
   statusBucket,
   dateBucket,
+  withAutomationFolder,
 } from "./sidebarNav";
 
 function conversation(
@@ -289,6 +293,19 @@ describe("pinOrderWrites", () => {
     ]);
   });
 
+  it("inserts a not-yet-pinned session below the row with below", () => {
+    expect(pinOrderWrites(pins(1000, 2000), "new", "conv_1", true)).toEqual([
+      { id: "new", pinnedAt: 2001 },
+    ]);
+    expect(pinOrderWrites(pins(1000, 2000), "new", "conv_0", true)).toEqual([
+      { id: "new", pinnedAt: 1500 },
+    ]);
+    // An existing pin still moves into the row's slot.
+    expect(pinOrderWrites(pins(1000, 2000, 3000), "conv_0", "conv_1", true)).toEqual(
+      pinOrderWrites(pins(1000, 2000, 3000), "conv_0", "conv_1"),
+    );
+  });
+
   it("is a no-op for a drop on itself or an unknown row", () => {
     expect(pinOrderWrites(pins(1000, 2000), "conv_0", "conv_0")).toEqual([]);
     expect(pinOrderWrites(pins(1000, 2000), "conv_0", "missing")).toEqual([]);
@@ -320,6 +337,65 @@ describe("pinOrderWrites", () => {
       "conv_1",
       "conv_2",
     ]);
+  });
+
+  it("appends a new pin past every shown row's value with appendPinWrites", () => {
+    const rows = pins(1000, 2000, undefined);
+    rows[2].family = { id: "family", representative_id: "parent", pinned: true, pinned_at: "3000" };
+    expect(appendPinWrites(rows, "new")).toEqual([{ id: "new", pinnedAt: 3001 }]);
+    // A pin without a value sorts last, so it's numbered first.
+    expect(appendPinWrites(pins(1000, undefined), "new")).toEqual([
+      { id: "conv_1", pinnedAt: 1001 },
+      { id: "new", pinnedAt: 1002 },
+    ]);
+    expect(appendPinWrites([], "new")).toEqual([]);
+  });
+
+  it("keeps a valueless pin below a family shown without its representative when appending", () => {
+    // Shown order: conv_0 (1000), conv_1 (a family member, family at 3000), conv_2 (no value).
+    const rows = pins(1000, undefined, undefined);
+    rows[1].family = { id: "family", representative_id: "parent", pinned: true, pinned_at: "3000" };
+    const writes = appendPinWrites(rows, "new");
+    expect(writes).toEqual([
+      { id: "conv_2", pinnedAt: 3001 },
+      { id: "new", pinnedAt: 3002 },
+    ]);
+    const byId = new Map(writes.map((w) => [w.id, w.pinnedAt]));
+    const next = [...rows, conversation("new", null, new Date(2026, 4, 14, 8))].map((c) =>
+      byId.has(c.id) ? { ...c, labels: { "omnigent.pinned": String(byId.get(c.id)) } } : c,
+    );
+    expect(orderByPinnedTimestamp(next).map((c) => c.id)).toEqual([
+      "conv_0",
+      "conv_1",
+      "conv_2",
+      "new",
+    ]);
+  });
+
+  it("doesn't give a valueless nested family row a value when appending", () => {
+    const rows = pins(1000, undefined, undefined);
+    rows[1].family = { id: "family", representative_id: "parent", pinned: true };
+    expect(appendPinWrites(rows, "new")).toEqual([{ id: "new", pinnedAt: 1001 }]);
+    rows[0].family = rows[1].family;
+    rows[0].labels = {};
+    expect(appendPinWrites(rows.slice(0, 2), "new")).toEqual([]);
+  });
+
+  it("numbers valueless pins just below now when no shown row has a value", () => {
+    vi.useFakeTimers({ now: 5000 });
+    try {
+      expect(appendPinWrites(pins(undefined, undefined), "new")).toEqual([
+        { id: "conv_0", pinnedAt: 4998 },
+        { id: "conv_1", pinnedAt: 4999 },
+        { id: "new", pinnedAt: 5000 },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("falls back to a plain pin when the values are too large to step past", () => {
+    expect(appendPinWrites(pins(Number.MAX_SAFE_INTEGER), "new")).toEqual([]);
   });
 });
 
@@ -833,6 +909,47 @@ it("orders equal-updated_at rows by id whether or not the order is frozen", () =
   expect(sortConversations([c, a, b], null).map((row) => row.id)).toEqual(["c", "b", "a"]);
 });
 
+it("keeps nested drafts at the representative's active or frozen sort position", () => {
+  const parent = { ...conversation("parent", "Parent", new Date(1000)), updated_at: 300 };
+  const other = { ...parent, id: "other", updated_at: 200 };
+  const draft = {
+    ...parent,
+    id: "temp:draft",
+    provisional: true,
+    family: { id: "family", representative_id: parent.id, pinned: false },
+  };
+  for (const frozen of [null, new Map([[parent.id, 100]])]) {
+    const rows = sortConversations(
+      [parent, other, draft],
+      { id: parent.id, updatedAt: 100 },
+      frozen,
+    );
+    expect(rows[0].id).toBe(other.id);
+  }
+  const tiedParent = { ...parent, id: "conv_a", created_at: 150, updated_at: 200 };
+  const tiedOther = { ...tiedParent, id: "conv_b", created_at: 160 };
+  const tiedDraft = {
+    ...draft,
+    created_at: 300,
+    family: { ...draft.family, representative_id: tiedParent.id },
+  };
+  const rows = [tiedParent, tiedOther, tiedDraft];
+  expect(sortConversations(rows, null).map((row) => row.id)).toEqual([
+    "conv_b",
+    "conv_a",
+    "temp:draft",
+  ]);
+  expect(
+    sortConversations(
+      rows,
+      null,
+      null,
+      "updated_at",
+      customSortOrder({ base: "updated", since: 100, ids: [] }),
+    ).map((row) => row.id),
+  ).toEqual(["conv_b", "conv_a", "temp:draft"]);
+});
+
 describe("Custom order", () => {
   // Whole-second server timestamps, as the API returns them.
   const row = (id: string, createdAt: number, updatedAt = createdAt): Conversation => ({
@@ -940,5 +1057,65 @@ describe("Custom order", () => {
     ]);
     expect(moveCustomOrder(order, rows, "s1", "s1", null, null)).toBeNull();
     expect(moveCustomOrder(order, rows, "s1", "deleted", null, null)).toBeNull();
+  });
+});
+
+describe("automation runs shared with the viewer", () => {
+  const ORIGIN = "omnigent.scheduled_task_origin";
+  const INITIAL_RUN = "omnigent.scheduled_task_initial_run";
+  const LAUNCH = "omnigent.scheduled_task_launch";
+  const session = (labels: Record<string, string>, owner: string | null = "alice@example.com") =>
+    ({ ...conversation("conv_1", "Run", new Date(0), { labels }), owner }) as Conversation;
+
+  it.each([
+    ["a run's own session", { [ORIGIN]: "st_1", [INITIAL_RUN]: "run_1" }, true],
+    ["a session a run's tree launched", { [LAUNCH]: "st_1" }, true],
+    ["a fork of a run's session", { [ORIGIN]: "st_1" }, false],
+    ["an initial-run label without an origin", { [INITIAL_RUN]: "run_1" }, false],
+    ["an ordinary shared session", {}, false],
+  ])("counts %s", (_label, labels, expected) => {
+    expect(isSharedAutomationRun(session(labels), "bob@example.com")).toBe(expected);
+  });
+
+  it("leaves the viewer's own runs to their own filing", () => {
+    const labels = { [ORIGIN]: "st_1", [INITIAL_RUN]: "run_1" };
+    expect(isSharedAutomationRun(session(labels, "bob@example.com"), "bob@example.com")).toBe(
+      false,
+    );
+    expect(isSharedAutomationRun(session(labels, null), "bob@example.com")).toBe(false);
+  });
+
+  it("files a shared run only in the default automation folder, when asked", () => {
+    const run = session({ [LAUNCH]: "st_1", omni_project: "Alpha" });
+    const automation = { id: "p_1", name: "Omnigent Automation" };
+    expect(sessionInSidebarFolder(run, automation, "bob@example.com", true)).toBe(true);
+    expect(sessionInSidebarFolder(run, automation, "bob@example.com", false)).toBe(false);
+    // Not where its owner filed it.
+    expect(sessionInSidebarFolder(run, { id: null, name: "Alpha" }, "bob@example.com", true)).toBe(
+      false,
+    );
+  });
+
+  it("places the default automation folder where a new project would go", () => {
+    const projects = [
+      { id: "p_a", name: "Alpha" },
+      { id: "p_z", name: "Zeta" },
+    ];
+    const placeholder = { id: null, name: "Omnigent Automation", placeholder: true };
+    expect(withAutomationFolder(projects, true, false)).toEqual([
+      projects[0],
+      placeholder,
+      projects[1],
+    ]);
+    // Uppercase sorts before lowercase, as the server compares names.
+    expect(withAutomationFolder([{ id: "p_l", name: "lower" }], true, false)).toEqual([
+      placeholder,
+      { id: "p_l", name: "lower" },
+    ]);
+    // A manual order puts unranked projects last.
+    expect(withAutomationFolder(projects, true, true)).toEqual([...projects, placeholder]);
+    expect(withAutomationFolder(projects, false, false)).toBe(projects);
+    const existing = [{ id: null, name: "Omnigent Automation" }];
+    expect(withAutomationFolder(existing, true, false)).toBe(existing);
   });
 });

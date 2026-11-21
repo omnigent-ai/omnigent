@@ -14,11 +14,10 @@ const {
   spawnServer,
 } = require("./desktopHarness");
 const { startDesignBackend, eventually } = require("./desktopDesignPromptHarness");
+const { launchThisMachineDesktop, openSessionBrowserTab } = require("./desktopBrowserTabHarness");
 const { escapeHtml } = require("../src/loopback-oauth");
 
 const deps = desktopDepsAvailable();
-
-const THIS_MACHINE_HOST_ID = "a".repeat(32);
 
 // Accept a WebSocket upgrade, echo one short masked text frame, then close.
 function echoOneWebSocketFrame(request, socket) {
@@ -68,70 +67,6 @@ function writeResponseObserver(scratch) {
   `,
   );
   return observer;
-}
-
-// Launch with a live daemon enrolled for this machine; only `backend.sessionId`
-// reports this host ID, every other session reports a remote host.
-async function launchThisMachineDesktop({ backend, scratch, recordDir, preload = [] }) {
-  const machineHome = path.join(scratch, "machine");
-  const stateDir = path.join(machineHome, ".omnigent");
-  fs.mkdirSync(path.join(stateDir, "daemons"), { recursive: true });
-  fs.writeFileSync(
-    path.join(stateDir, "config.yaml"),
-    `host:\n  host_id: ${THIS_MACHINE_HOST_ID}\n`,
-  );
-  // Disk-backed enrollment and a live PID exercise the production predicate.
-  fs.writeFileSync(
-    path.join(stateDir, "daemons", "local.json"),
-    JSON.stringify({
-      pid: process.pid,
-      target: backend.serverUrl,
-      server_url: backend.serverUrl,
-      mode: "server",
-      host_id: THIS_MACHINE_HOST_ID,
-    }),
-  );
-  const desktop = await launchDesktop({
-    serverUrl: backend.serverUrl,
-    recordDir,
-    env: { HOME: machineHome, OMNIGENT_CONFIG_HOME: stateDir },
-    preload,
-  });
-  let sessionIsLocal = true;
-  try {
-    await desktop.window.route(/\/v1\/sessions\/[a-f0-9]+(?:\?.*)?$/, async (route) => {
-      if (route.request().method() !== "GET") return route.continue();
-      const response = await route.fetch();
-      const body = await response.json();
-      const local = body.id === backend.sessionId && sessionIsLocal;
-      await route.fulfill({
-        response,
-        json: { ...body, host_id: local ? THIS_MACHINE_HOST_ID : "b".repeat(32) },
-      });
-    });
-  } catch (error) {
-    // The caller only cleans up a desktop this helper returns.
-    await desktop.electronApp.close().catch(() => {});
-    await desktop.stopDisplayCapture();
-    fs.rmSync(desktop.userDataDir, { recursive: true, force: true });
-    throw error;
-  }
-  return {
-    desktop,
-    setSessionIsLocal: (value) => {
-      sessionIsLocal = value;
-    },
-  };
-}
-
-/** Open a session and add a Browser tab from the workspace rail's "Open new" menu. */
-async function openSessionBrowserTab(window, serverUrl, sessionId) {
-  await window.goto(`${serverUrl}/c/${sessionId}`);
-  await window.getByRole("button", { name: /^(Expand|Collapse) right panel$/ }).waitFor();
-  const expand = window.getByRole("button", { name: "Expand right panel", exact: true });
-  if (await expand.isVisible()) await expand.click();
-  await window.getByRole("button", { name: "Open new", exact: true }).click();
-  await window.getByRole("menuitem", { name: "Browser", exact: true }).click();
 }
 
 /** POST the request the agent's browser_navigate tool makes, relayed to the desktop. */
@@ -1095,6 +1030,138 @@ it(
       proxyFixture.closeAllConnections();
       await new Promise((resolve) => {
         proxyFixture.close(resolve);
+      });
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  },
+);
+
+it(
+  "opens a Cmd/Ctrl+clicked page link in a new browser tab and keeps the clicked tab's page",
+  { skip: deps.ok ? false : `missing deps: ${deps.missing.join(", ")}`, timeout: 120_000 },
+  async () => {
+    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "omni-modifier-click-"));
+    const recordDir =
+      process.env.OMNIGENT_DESKTOP_RECORD_DIR ||
+      fs.mkdtempSync(path.join(os.tmpdir(), "omni-modifier-click-recordings-"));
+    const fixture = http.createServer((request, response) => {
+      response.writeHead(200, { "Content-Type": "text/html", "Cache-Control": "no-store" });
+      response.end(
+        request.url === "/linked"
+          ? `<title>Linked page</title><body style="font:20px system-ui;padding:24px"><h1>Linked page</h1></body>`
+          : `<title>Link source page</title><body style="font:20px system-ui;padding:24px">` +
+              `<h1>Link source page</h1><p><a href="/linked">Open linked page</a></p></body>`,
+      );
+    });
+    await new Promise((resolve) => {
+      fixture.listen(0, "127.0.0.1", resolve);
+    });
+    const sourceUrl = `http://localhost:${fixture.address().port}/`;
+    const linkedUrl = `${sourceUrl}linked`;
+    const marks = [];
+    let started = Date.now();
+    const mark = (label) => {
+      marks.push({ label, seconds: (Date.now() - started) / 1000 });
+    };
+    // Pauses only pace the recording.
+    const recording = Boolean(process.env.OMNIGENT_DESKTOP_RECORD_DIR);
+    const hold = (ms) =>
+      recording
+        ? new Promise((resolve) => {
+            setTimeout(resolve, ms);
+          })
+        : Promise.resolve();
+    let backend;
+    let desktop;
+    let tabsAfterClick;
+    try {
+      backend = await startDesignBackend(scratch);
+      started = Date.now();
+      ({ desktop } = await launchThisMachineDesktop({ backend, scratch, recordDir }));
+      const { window, electronApp } = desktop;
+      const sessionBrowserTabs = () =>
+        electronApp.evaluate((_electron, sessionId) => {
+          const tabs = [];
+          global.omnigentTestBrowserRegistries[0].forEach((entry, id) => {
+            if (id.startsWith(`browser-tab:${sessionId}:`)) {
+              const { webContents } = entry.view;
+              tabs.push({
+                id,
+                url: webContents.getURL(),
+                loading: webContents.isLoading(),
+                policyEnforced: entry.navigationPolicyEnforced,
+              });
+            }
+          });
+          return tabs;
+        }, backend.sessionId);
+
+      mark("open browser tab");
+      await openSessionBrowserTab(window, backend.serverUrl, backend.sessionId);
+      const bar = window.getByRole("textbox", { name: "Address bar" });
+      await bar.click();
+      await bar.pressSequentially(sourceUrl, { delay: recording ? 25 : 0 });
+      await bar.press("Enter");
+      const [original] = await eventually(async () => {
+        const tabs = await sessionBrowserTabs();
+        return tabs.length === 1 && tabs[0].url === sourceUrl ? tabs : null;
+      }, "source page in the browser tab");
+      const sourcePage = await eventually(
+        () => electronApp.windows().find((page) => page.url() === sourceUrl),
+        "source page target",
+      );
+      const link = sourcePage.getByRole("link", { name: "Open linked page" });
+      await link.waitFor();
+      mark("source page loaded");
+      await hold(3000);
+      await link.hover();
+      await hold(2500);
+      mark("modifier click");
+      await link.click({ modifiers: ["ControlOrMeta"] });
+      await eventually(async () => {
+        const tabs = await sessionBrowserTabs();
+        return tabs.some((tab) => tab.url === linkedUrl) ? tabs : null;
+      }, "linked page in a browser tab");
+      await window.getByRole("button", { name: "Close Linked page", exact: true }).waitFor();
+      // Re-read once settled, so a late in-place load of the clicked tab is caught.
+      tabsAfterClick = await eventually(async () => {
+        const tabs = await sessionBrowserTabs();
+        return tabs.every((tab) => !tab.loading) ? tabs : null;
+      }, "browser tabs finished loading");
+      mark("linked page loaded");
+      await hold(6000);
+      mark("end");
+      // End the clip on this state rather than on the window closing.
+      await desktop.stopDisplayCapture();
+      assert.deepEqual(
+        tabsAfterClick.map(({ id, url, policyEnforced }) => ({
+          clickedTab: id === original.id,
+          url,
+          policyEnforced,
+        })),
+        [
+          { clickedTab: true, url: sourceUrl, policyEnforced: true },
+          { clickedTab: false, url: linkedUrl, policyEnforced: true },
+        ],
+      );
+      await window.getByRole("button", { name: "Close Link source page", exact: true }).waitFor();
+    } finally {
+      fs.mkdirSync(recordDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(recordDir, "modifier-click-evidence.json"),
+        JSON.stringify({ marks, sourceUrl, linkedUrl, tabsAfterClick }, null, 2),
+      );
+      if (desktop) {
+        await desktop.window.unrouteAll({ behavior: "wait" });
+        await desktop.electronApp.close();
+        await desktop.stopDisplayCapture();
+        console.log(saveRecording(recordDir, "modifier-click"));
+        fs.rmSync(desktop.userDataDir, { recursive: true, force: true });
+      }
+      if (backend) await backend.close();
+      fixture.closeAllConnections();
+      await new Promise((resolve) => {
+        fixture.close(resolve);
       });
       fs.rmSync(scratch, { recursive: true, force: true });
     }

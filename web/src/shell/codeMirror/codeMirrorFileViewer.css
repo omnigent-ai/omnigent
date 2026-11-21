@@ -1,0 +1,86 @@
+/* The active line's wash, faint enough that code on a commented or cited active line stays
+   readable on the page and the dark canvas's glow (VIEWER_ACTIVE_LINE_MIX). */
+.cm-editor {
+  --viewer-active-line: color-mix(in oklch, var(--foreground) 3%, transparent);
+}
+/* In dark, the Files viewer shows the shell canvas through its editor; the sticky gutter
+   repaints that canvas (pinned to the window), so code scrolled sideways stays hidden under it. */
+.dark [data-testid="file-viewer"] .cm-editor {
+  background-color: transparent;
+}
+.dark [data-testid="file-viewer"] .cm-editor .cm-gutters {
+  background: var(--shell-canvas, var(--background));
+}
+
+/* Real CSS rules for classes CodeMirror applies to its own DOM. */
+
+/* Shiki tokens carry the light color inline; dark mode switches to the dark one. */
+.dark .cm-shiki-token {
+  color: var(--shiki-dark) !important;
+}
+
+/* Lines a chat citation points at, with the shared highlight tokens. */
+.cm-line.cm-cited-line {
+  --cm-line-background: var(--cited-line, color-mix(in oklch, var(--warning) 18%, transparent));
+  background-color: var(--cm-line-background);
+}
+
+/* Cited text on that line, such as a search match: a match-colored chip whose text is the
+   solid card color, a pair the theme contrast checks hold to 4.5:1 in every theme. */
+.cm-cited-text,
+.cm-cited-text .cm-shiki-token,
+.dark .cm-cited-text .cm-shiki-token {
+  color: var(--card-solid) !important;
+}
+.cm-cited-text {
+  background-color: var(--search-match-foreground, var(--warning));
+  box-decoration-break: clone;
+}
+
+/* Comments; the active one is stronger. */
+.cm-comment {
+  background-color: var(--comment-highlight, color-mix(in oklch, var(--warning) 14%, transparent));
+}
+.cm-comment-active {
+  background-color: var(
+    --comment-highlight-active,
+    color-mix(in oklch, var(--warning) 28%, transparent)
+  );
+}
+
+/* Whitespace inside a selection: a dot per space, a line across each tab. */
+.cm-selectionSpace {
+  background-image: radial-gradient(
+    circle at 50% 55%,
+    color-mix(in srgb, var(--muted-foreground) 70%, transparent) 12%,
+    transparent 14%
+  );
+}
+.cm-selectionTab {
+  background: linear-gradient(
+      color-mix(in srgb, var(--muted-foreground) 70%, transparent),
+      color-mix(in srgb, var(--muted-foreground) 70%, transparent)
+    )
+    no-repeat 2px 55% / calc(100% - 4px) 1px;
+}
+
+/* Fold markers stay quiet until the gutter is hovered, as in other code editors. */
+.cm-foldGutter .cm-gutterElement {
+  color: var(--muted-foreground);
+  cursor: pointer;
+  padding: 0 2px;
+  opacity: 0;
+  transition: opacity 120ms;
+}
+.cm-gutters:hover .cm-foldGutter .cm-gutterElement,
+.cm-foldGutter .cm-gutterElement:has(.cm-foldMarker-folded) {
+  opacity: 1;
+}
+.cm-foldPlaceholder {
+  background: var(--muted);
+  border: 1px solid var(--border);
+  color: var(--muted-foreground);
+  border-radius: 4px;
+  padding: 0 4px;
+  margin: 0 2px;
+}

@@ -34,17 +34,15 @@ test to assert joining instead.
 
 from __future__ import annotations
 
-import gzip
 import os
 import secrets
 import subprocess
-import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from tests.e2e.conftest import configure_mock_llm, find_free_port, reset_mock_llm
+from tests._helpers.otlp import OtlpTraceCollector
+from tests.e2e.conftest import configure_mock_llm, reset_mock_llm
 
 _MODEL = "mock-caller-traceparent-model"
 
@@ -59,77 +57,7 @@ _RUN_TIMEOUT_SEC = 150
 _SPAN_DRAIN_SEC = 15.0
 
 
-class _OtlpTraceCollector:
-    """Minimal OTLP/HTTP trace sink that records exported spans."""
-
-    def __init__(self) -> None:
-        self.spans: list[dict[str, str]] = []
-        self._lock = threading.Lock()
-        self._port = find_free_port()
-        collector = self
-
-        class Handler(BaseHTTPRequestHandler):
-            def do_POST(self) -> None:  # http.server API name
-                length = int(self.headers.get("Content-Length", 0))
-                body = self.rfile.read(length)
-                if self.headers.get("Content-Encoding") == "gzip":
-                    body = gzip.decompress(body)
-                if self.path == "/v1/traces":
-                    collector._record(body)
-                self.send_response(200)
-                self.send_header("Content-Type", "application/x-protobuf")
-                self.end_headers()
-
-            def log_message(self, *args: Any) -> None:
-                pass
-
-        self._server = ThreadingHTTPServer(("127.0.0.1", self._port), Handler)
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
-        self._thread.start()
-
-    @property
-    def endpoint(self) -> str:
-        return f"http://127.0.0.1:{self._port}"
-
-    def _record(self, body: bytes) -> None:
-        from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
-            ExportTraceServiceRequest,
-        )
-
-        req = ExportTraceServiceRequest()
-        req.ParseFromString(body)
-        rows: list[dict[str, str]] = []
-        for resource_spans in req.resource_spans:
-            service = next(
-                (
-                    attr.value.string_value
-                    for attr in resource_spans.resource.attributes
-                    if attr.key == "service.name"
-                ),
-                "",
-            )
-            for scope_spans in resource_spans.scope_spans:
-                for span in scope_spans.spans:
-                    rows.append(
-                        {
-                            "service": service,
-                            "name": span.name,
-                            "trace_id": span.trace_id.hex(),
-                        }
-                    )
-        with self._lock:
-            self.spans.extend(rows)
-
-    def snapshot(self) -> list[dict[str, str]]:
-        with self._lock:
-            return list(self.spans)
-
-    def close(self) -> None:
-        self._server.shutdown()
-        self._server.server_close()
-
-
-def _summarize_traces(spans: list[dict[str, str]]) -> str:
+def _summarize_traces(spans: list[dict[str, Any]]) -> str:
     """Group collected spans by trace id for a readable failure message."""
     by_trace: dict[str, list[str]] = {}
     for span in spans:
@@ -145,12 +73,12 @@ def _run_with_caller_traceparent(
     omnigent_python: Path,
     omnigent_repo_root: Path,
     mock_credentials_env: dict[str, str],
-    collector: _OtlpTraceCollector,
+    collector: OtlpTraceCollector,
     caller_trace_id: str,
     caller_span_id: str,
     extra_flags: list[str],
     extra_env: dict[str, str] | None = None,
-) -> tuple[list[dict[str, str]], str]:
+) -> tuple[list[dict[str, Any]], str]:
     """
     Dispatch ``omnigent run`` with a caller ``TRACEPARENT`` and collect
     the spans it exports.
@@ -255,7 +183,7 @@ def test_run_omnigent_joins_dispatching_clients_trace(
         key=_MODEL,
     )
 
-    collector = _OtlpTraceCollector()
+    collector = OtlpTraceCollector()
     try:
         # The dispatching client's active-span context, serialized the way
         # a wrapper using TraceContextTextMapPropagator().inject would.
@@ -324,7 +252,7 @@ def test_daemon_backed_run_keeps_response_derived_traces(
     fake_home = tmp_path / "home"
     fake_home.mkdir()
 
-    collector = _OtlpTraceCollector()
+    collector = OtlpTraceCollector()
     try:
         caller_trace_id = secrets.token_hex(16)
         spans, traceparent = _run_with_caller_traceparent(

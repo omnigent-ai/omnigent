@@ -31,6 +31,7 @@ from omnigent.server.auth import (
     LEVEL_OWNER,
     RESERVED_USER_LOCAL,
     AuthProvider,
+    effective_admin,
     local_single_user_enabled,
 )
 from omnigent.server.permissions import (
@@ -287,7 +288,7 @@ class SessionAccess:
     conversation: Conversation | None
 
 
-def _require_access_and_level_sync(
+def require_access_and_level_sync(
     user_id: str | None,
     conversation_id: str,
     required_level: int,
@@ -295,6 +296,10 @@ def _require_access_and_level_sync(
     conversation_store: ConversationStore,
 ) -> SessionAccess:
     """Synchronous core of :func:`require_access_and_level`.
+
+    Callable directly from a worker thread so a route can run it inside its
+    own :func:`shared_read_scope` alongside the other reads of the request
+    (the nested scope here then reuses the caller's checkout).
 
     Folds :func:`_require_access_sync` and :func:`_get_permission_level_sync`
     into a single resolution: one :meth:`PermissionStore.resolve_access`
@@ -343,7 +348,7 @@ def _require_access_and_level_sync(
         # check_session_access's admin short-circuit, which never reads the
         # conversation). A missing conversation is left for the snapshot builder
         # to 404 on, exactly as today.
-        if access.is_admin:
+        if effective_admin(access.is_admin):
             return SessionAccess(level=level, conversation=None)
 
         conv = conversation_store.get_conversation(conversation_id)
@@ -405,7 +410,7 @@ async def require_access_and_level(
     :meth:`PermissionStore.resolve_access` + at most one conversation read)
     instead of the ~5-6 separate store round-trips the two helpers issued
     independently. On a remote DB those round-trips dominate the snapshot's
-    fixed cost. Async wrapper over :func:`_require_access_and_level_sync`,
+    fixed cost. Async wrapper over :func:`require_access_and_level_sync`,
     routed through :func:`asyncio.to_thread` to keep the event loop unblocked.
 
     :param user_id: The authenticated user, or ``None`` to skip.
@@ -418,7 +423,7 @@ async def require_access_and_level(
     :raises OmnigentError: 401 / 403 / 404 as documented on the sync core.
     """
     return await asyncio.to_thread(
-        _require_access_and_level_sync,
+        require_access_and_level_sync,
         user_id,
         conversation_id,
         required_level,
@@ -454,7 +459,7 @@ def _can_mutate_agent(
     """Whether the caller satisfies the agent-ownership mutation gate."""
     if permission_store is None or local_single_user_enabled():
         return True
-    if user_id is not None and permission_store.is_admin(user_id):
+    if user_id is not None and effective_admin(permission_store.is_admin(user_id)):
         return True
     return agent.created_by is not None and user_id == agent.created_by
 

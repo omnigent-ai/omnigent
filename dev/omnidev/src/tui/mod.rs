@@ -530,6 +530,7 @@ mod tests {
     /// Build an `App` over a throwaway pod and a channel whose receiver we keep
     /// so `cmds.send` never fails.
     fn app() -> (App, mpsc::UnboundedReceiver<Cmd>) {
+        let _guard = crate::paths::lock_test_env();
         let root = std::env::temp_dir().join(format!("omnidev-tui-{}", std::process::id()));
         let dir = root.join("pod");
         let pod = Arc::new(

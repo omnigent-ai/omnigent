@@ -9,7 +9,7 @@ through the proxy fails closed and drops the prompt.
 Stand-in topology: an in-process forward proxy answers loopback destinations with
 ``502`` (a remote proxy's ``127.0.0.1`` is its own host) and forwards the model
 endpoint, which is addressed by a non-loopback name only the proxy can reach --
-the shape of a corporate egress proxy. The mock LLM serves the model traffic.
+the shape of an egress proxy. The mock LLM serves the model traffic.
 """
 
 from __future__ import annotations
@@ -62,7 +62,7 @@ pytestmark = pytest.mark.skipif(
     reason="native Claude Code journey needs the `claude` CLI on PATH.",
 )
 
-# The model endpoint's name on the corporate network: not loopback, resolvable
+# The model endpoint's name on the network: not loopback, resolvable
 # only by the proxy.
 _MODEL_HOST = "anthropic-gateway.corp.test"
 

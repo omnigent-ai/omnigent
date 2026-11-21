@@ -287,8 +287,8 @@ export function useSessionReconnect({
       return;
     }
     // Arca is a remote machine, so it can never match the desktop host
-    // identity below. Starting it here still runs nothing on its own: the
-    // desktop's Arca console shows the command and waits for confirmation.
+    // identity below. Starting it here still needs the user's confirmation
+    // in the desktop app.
     if (isSessionArcaHost()) {
       await reconnectArca();
       return;

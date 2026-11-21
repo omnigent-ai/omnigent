@@ -3,15 +3,32 @@
 // which closes via Escape, the "x" button, or a click on the empty stage
 // around the image.
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+const { authenticatedFetch, isAndroidShell, isIOSShell, toastError } = vi.hoisted(() => ({
+  authenticatedFetch: vi.fn(),
+  isAndroidShell: vi.fn(() => false),
+  isIOSShell: vi.fn(() => false),
+  toastError: vi.fn(),
+}));
 
 // getEmbedRoot decides the Radix portal container; null → portal to body.
 vi.mock("@/lib/host", () => ({
   getEmbedRoot: () => null,
+  isDatabricksWorkspace: () => false,
 }));
+vi.mock("@/lib/nativeBridge", () => ({
+  isIOSShell: () => isIOSShell(),
+  isAndroidShell: () => isAndroidShell(),
+}));
+vi.mock("@/lib/identity", () => ({
+  authenticatedFetch: (url: string) => authenticatedFetch(url),
+}));
+vi.mock("sonner", () => ({ toast: { error: toastError } }));
 
+import { captureDownloads } from "@/test/downloadTestHelpers";
 import { ImageLightboxProvider, ZoomableImage } from "./ImageLightbox";
 
 afterEach(cleanup);
@@ -168,5 +185,166 @@ describe("dismissing the lightbox by clicking outside the image", () => {
     fireEvent.click(stage);
 
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+});
+
+describe("downloading from the lightbox", () => {
+  function openImage(props: {
+    src: string;
+    alt?: string;
+    downloadName?: string;
+    downloadPath?: string;
+    downloadBlob?: Blob;
+  }) {
+    render(
+      <ImageLightboxProvider>
+        <ZoomableImage alt="diagram" {...props} />
+      </ImageLightboxProvider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /^Zoom image/ }));
+    return within(screen.getByRole("dialog"));
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    authenticatedFetch.mockReset();
+    isAndroidShell.mockReset().mockReturnValue(false);
+    isIOSShell.mockReset().mockReturnValue(false);
+    toastError.mockReset();
+  });
+
+  it("offers no download in the iOS shell, whose web view can't save one", () => {
+    isIOSShell.mockReturnValue(true);
+    render(
+      <ImageLightboxProvider>
+        <ZoomableImage src="blob:shown-image" alt="diagram" downloadName="shot.png" />
+      </ImageLightboxProvider>,
+    );
+    expect(screen.queryByRole("button", { name: /Download/ })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: /^Zoom image/ }));
+
+    expect(
+      within(screen.getByRole("dialog")).queryByRole("button", { name: /Download/ }),
+    ).toBeNull();
+  });
+
+  it("saves the bytes the preview already shows under the image's file name", () => {
+    const clicked = captureDownloads();
+    const dialog = openImage({ src: "blob:shown-image", downloadName: "shot.png" });
+
+    fireEvent.click(dialog.getByRole("button", { name: "Download image: shot.png" }));
+
+    expect(clicked).toEqual([["blob:shown-image", "shot.png"]]);
+    expect(authenticatedFetch).not.toHaveBeenCalled();
+  });
+
+  it("names an inline data image after its alt text, typed by its MIME type", () => {
+    const clicked = captureDownloads();
+    const dialog = openImage({ src: "data:image/png;base64,iVBORw0KGgo=" });
+
+    fireEvent.click(dialog.getByRole("button", { name: "Download image: diagram" }));
+
+    expect(clicked).toEqual([["data:image/png;base64,iVBORw0KGgo=", "diagram.png"]]);
+  });
+
+  it("falls back to a typed generic name for an image with no alt text", () => {
+    const clicked = captureDownloads();
+    const dialog = openImage({ src: "data:image/jpeg;base64,/9j/4AAQ", alt: "" });
+
+    fireEvent.click(dialog.getByRole("button", { name: "Download image" }));
+
+    expect(clicked).toEqual([["data:image/jpeg;base64,/9j/4AAQ", "image.jpg"]]);
+  });
+
+  it("saves held bytes even after the source's object URL is gone", () => {
+    const clicked = captureDownloads();
+    const blob = new Blob(["png"], { type: "image/png" });
+    const createObjectURL = vi.fn(() => "blob:lightbox-copy");
+    vi.stubGlobal("URL", { createObjectURL, revokeObjectURL: vi.fn() });
+    const dialog = openImage({ src: "blob:revoked", downloadName: "1f3a", downloadBlob: blob });
+
+    fireEvent.click(dialog.getByRole("button", { name: "Download image: 1f3a" }));
+
+    expect(createObjectURL).toHaveBeenCalledWith(blob);
+    expect(clicked).toEqual([["blob:lightbox-copy", "1f3a.png"]]);
+  });
+
+  it("sends one request when Download is clicked again while saving", async () => {
+    isAndroidShell.mockReturnValue(true);
+    let respond: (response: Response) => void = () => {};
+    authenticatedFetch.mockReturnValue(
+      new Promise<Response>((resolve) => {
+        respond = resolve;
+      }),
+    );
+    const dialog = openImage({
+      src: "/v1/sessions/s/resources/files/f/content",
+      downloadName: "shot.png",
+      downloadPath: "/v1/sessions/s/resources/files/f/content",
+    });
+    const download = dialog.getByRole("button", { name: "Download image: shot.png" });
+
+    fireEvent.click(download);
+    fireEvent.click(download);
+    expect(authenticatedFetch).toHaveBeenCalledOnce();
+
+    respond(new Response(null, { status: 503 }));
+    await waitFor(() => expect(download).toBeEnabled());
+  });
+
+  it("keeps the hidden inline button from taking taps until it shows", () => {
+    render(<ZoomableImage src="blob:shown" alt="diagram" downloadName="shot.png" />);
+
+    // Touch screens never match hover, so the zoom button gets the tap.
+    expect(screen.getByRole("button", { name: "Download image: shot.png" })).toHaveClass(
+      "pointer-events-none",
+      "group-hover/image:pointer-events-auto",
+      "focus-visible:pointer-events-auto",
+    );
+  });
+
+  it("saves a same-origin image from the API path it was read from", () => {
+    const clicked = captureDownloads();
+    const dialog = openImage({
+      src: "/v1/sessions/s/resources/files/f/content",
+      downloadName: "shot.png",
+      downloadPath: "/v1/sessions/s/resources/files/f/content",
+    });
+
+    fireEvent.click(dialog.getByRole("button", { name: "Download image: shot.png" }));
+
+    expect(clicked).toEqual([["/v1/sessions/s/resources/files/f/content", "shot.png"]]);
+  });
+
+  it("offers no download for a source it would have to fetch from elsewhere", () => {
+    const dialog = openImage({ src: "https://example.com/remote.png", downloadName: "remote.png" });
+
+    expect(dialog.queryByRole("button", { name: /Download/ })).toBeNull();
+  });
+
+  it("reports a failed download once the response arrives", async () => {
+    // The Android shell can't save an http(s) link inside the WebView's
+    // session, so the bytes come through the app's transport and can fail.
+    isAndroidShell.mockReturnValue(true);
+    let respond: (response: Response) => void = () => {};
+    authenticatedFetch.mockReturnValue(
+      new Promise<Response>((resolve) => {
+        respond = resolve;
+      }),
+    );
+    const dialog = openImage({
+      src: "/v1/sessions/s/resources/files/f/content",
+      downloadName: "shot.png",
+      downloadPath: "/v1/sessions/s/resources/files/f/content",
+    });
+
+    fireEvent.click(dialog.getByRole("button", { name: "Download image: shot.png" }));
+    expect(authenticatedFetch).toHaveBeenCalledWith("/v1/sessions/s/resources/files/f/content");
+    expect(toastError).not.toHaveBeenCalled();
+
+    respond(new Response(null, { status: 503, statusText: "Service Unavailable" }));
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith("Download failed"));
   });
 });

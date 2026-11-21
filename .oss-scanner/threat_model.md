@@ -86,7 +86,8 @@ Most:
   authentication, cookies, password login, device grant, client credentials; `ws_origin.py` for the
   WebSocket Origin check.
 - `omnigent/server/routes/` and `omnigent/stores/`: the permission check on every session, host, file and
-  connection route; `routes/sessions/routes_permissions.py` and `sharing_settings.py` for sharing.
+  connection route; `routes/sessions/routes_permissions.py`, `omnigent/server/session_sharing.py` (the grant
+  policy the share route calls) and `sharing_settings.py` for sharing.
 - `omnigent/server/routes/host_tunnel.py`, `runner_tunnel.py`, `omnigent/server/host_registry.py`,
   `managed_hosts.py`: host and runner identity.
 - `omnigent/server/mcp_gateway.py`, `mcp_*.py`, `connections_registry.py`: the MCP gateway and stored
