@@ -13362,52 +13362,37 @@ def test_the_watchers_confirm_never_reaches_a_draft_quoting_the_title(
 
 
 @pytest.mark.parametrize(
-    "stashed_draft",
-    ["hello from the web and more", "[Pasted text #1 +4 lines] look at line 3"],
-    ids=["draft-quoting-the-message", "collapsed-paste"],
+    ("pane_rows", "message"),
+    [
+        (None, "hello from the web"),
+        # The delivered lines push the marker above a six-row screen.
+        (6, "hello from the web\nsecond line\nthird line"),
+    ],
+    ids=["marker-in-view", "marker-hidden-by-the-paste"],
 )
-def test_a_stash_left_from_an_earlier_delivery_is_not_submitted_by_a_retry(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stashed_draft: str
-) -> None:
-    """
-    A stash up when the Enter goes out is returned by the submit, whoever made it.
-
-    A stash an earlier delivery could not return, its clean-up unable to read
-    the pane, comes back on this submit. Its return confirms the delivery, and
-    no retry Enter submits it.
-    """
-    bridge_dir = _picker_bridge_dir(tmp_path)
-    composer = _EditableComposer("", cursor=0)
-    composer.stash = (stashed_draft, 4)
-    composer.install(monkeypatch)
-
-    inject_user_message(bridge_dir, content="hello from the web")
-
-    assert [text.strip() for text in composer.submitted] == ["hello from the web"]
-    assert (composer.text, composer.cursor, composer.stash) == (stashed_draft, 4, None)
-
-
 @pytest.mark.parametrize(
     "stashed_draft",
     ["hello from the web and more", "[Pasted text #1 +4 lines] look at line 3"],
     ids=["draft-quoting-the-message", "collapsed-paste"],
 )
-def test_a_stash_left_from_before_stays_pending_once_the_paste_hides_its_marker(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stashed_draft: str
+def test_a_stash_left_from_an_earlier_delivery_is_not_submitted_by_a_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stashed_draft: str,
+    pane_rows: int | None,
+    message: str,
 ) -> None:
     """
-    A stash seen before the delivery typed still guards its submit.
+    A stash up before the delivery types is returned by its submit, whoever made it.
 
-    In a short pane the delivered lines push the stash marker above the
-    screen, so the capture before the Enter cannot show it. The stash was seen
-    before the paste, so its return confirms the delivery and no retry Enter
-    submits it.
+    A stash an earlier delivery could not return, its clean-up unable to read
+    the pane, comes back on this submit, even once the delivered lines hide
+    its marker. Its return confirms the delivery, and no retry Enter submits it.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
-    composer = _EditableComposer("", cursor=0, pane_rows=6)
+    composer = _EditableComposer("", cursor=0, pane_rows=pane_rows)
     composer.stash = (stashed_draft, 4)
     composer.install(monkeypatch)
-    message = "hello from the web\nsecond line\nthird line"
 
     inject_user_message(bridge_dir, content=message)
 
@@ -13754,11 +13739,17 @@ def test_unavailable_composer_capture_never_submits_the_leftover_draft(
 
 
 @pytest.mark.parametrize(
-    "inject",
+    ("inject", "expected"),
     [
-        lambda bridge_dir: inject_user_message(bridge_dir, content="hello from the web"),
-        lambda bridge_dir: claude_native_bridge.inject_slash_command(
-            bridge_dir, command="/effort high"
+        (
+            lambda bridge_dir: inject_user_message(bridge_dir, content="hello from the web"),
+            "hello from the web",
+        ),
+        (
+            lambda bridge_dir: claude_native_bridge.inject_slash_command(
+                bridge_dir, command="/effort high"
+            ),
+            "/effort high",
         ),
     ],
     ids=["web-message", "slash-command"],
@@ -13772,6 +13763,7 @@ def test_an_unreadable_box_before_the_stash_leaves_the_draft_as_typed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     inject: Callable[[Path], None],
+    expected: str,
     failed_captures: int,
 ) -> None:
     """
@@ -13795,7 +13787,7 @@ def test_an_unreadable_box_before_the_stash_leaves_the_draft_as_typed(
 
     if failed_captures == 1:
         inject(bridge_dir)
-        assert len(composer.submitted) == 1
+        assert [text.strip() for text in composer.submitted] == [expected]
     else:
         with pytest.raises(
             claude_native_bridge.ClaudeComposerNotCleared, match="nothing was sent"
@@ -13874,6 +13866,67 @@ def test_a_first_paste_that_lands_during_recovery_is_submitted_once(
     assert composer.pastes == 1
     assert [text.strip() for text in composer.submitted] == ["hello from the web"]
     assert (composer.text, composer.cursor, composer.stash) == (draft, cursor, None)
+
+
+class _ResumingComposerTypedInto(_ResumingComposer):
+    """A resuming box the person types into right after the held paste lands."""
+
+    def __init__(self, draft: str, *, cursor: int, replay_captures: int, typed: str) -> None:
+        super().__init__(draft, cursor=cursor, replay_captures=replay_captures)
+        self._typed = typed
+        self.typed_at: float | None = None
+
+    def _capture_pane(self, socket_path: str, tmux_target: str) -> str:
+        landing = self._replay_left == 1 and self._held_paste is not None
+        pane = super()._capture_pane(socket_path, tmux_target)
+        if landing:
+            self._insert(self._typed)
+            self.typed_at = claude_native_bridge.time.time()
+        return pane
+
+
+@pytest.mark.parametrize(
+    ("draft", "cursor"),
+    [("", 0), (_STALE_MULTILINE_DRAFT, 4)],
+    ids=["empty-box", "draft-stashed-first"],
+)
+def test_a_late_paste_the_person_typed_after_is_left_in_the_box_unsent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, draft: str, cursor: int
+) -> None:
+    """
+    A box mixing the late paste with the person's typing is neither stashed nor sent.
+
+    Stashing it would hand the delivered message back inside their draft, and
+    clearing it would delete what they typed. The delivery is not accepted,
+    the box keeps both, and a draft stashed first stays stashed for Claude
+    Code to return after their next submit.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    replay_captures = (
+        int(
+            claude_native_bridge._PASTE_COMMIT_TIMEOUT_S
+            / claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S
+        )
+        + 10
+    )
+    composer = _ResumingComposerTypedInto(
+        draft, cursor=cursor, replay_captures=replay_captures, typed=" and more"
+    )
+    composer.install(monkeypatch)
+    monkeypatch.setattr(
+        claude_native_bridge, "last_human_input_at", lambda *_args: composer.typed_at
+    )
+
+    with pytest.raises(
+        claude_native_bridge.ClaudeMessageNotAccepted, match="left there"
+    ) as refused:
+        inject_user_message(bridge_dir, content="hello from the web")
+
+    assert refused.type is claude_native_bridge.ClaudeMessageNotAccepted
+    assert composer.pastes == 1
+    assert composer.submitted == []
+    assert composer.text == "hello from the web and more"
+    assert composer.stash == ((draft, cursor) if draft else None)
 
 
 class _ComposerKeepingItsStash(_EditableComposer):
@@ -15097,6 +15150,7 @@ def test_an_effort_injection_with_no_dialog_completes_without_hanging(
     ]
 
 
+@pytest.mark.parametrize("pane_rows", [None, 6], ids=["tall-pane", "short-pane"])
 @pytest.mark.parametrize(
     ("typing_until", "applied"),
     [(5.0, True), (12.0, False), (None, False)],
@@ -15107,6 +15161,7 @@ def test_an_effort_change_while_someone_types_keeps_to_its_deadline(
     monkeypatch: pytest.MonkeyPatch,
     typing_until: float | None,
     applied: bool,
+    pane_rows: int | None,
 ) -> None:
     """
     A settings change lands in the terminal only within the request that asked for it.
@@ -15115,7 +15170,9 @@ def test_an_effort_change_while_someone_types_keeps_to_its_deadline(
     typing as well as the submit and the watch for a dialog after it, which
     ``/effort`` without one spends in full. Typing that goes on through the
     wait for the input box refuses the change with nothing typed; a change
-    applied in the terminal after the deadline would be reported as failed.
+    applied in the terminal after the deadline would be reported as failed. In
+    a short pane the refusal is not retried after a resize, since more rows do
+    not end the typing.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
     draft = "my half-typed question"
@@ -15127,7 +15184,25 @@ def test_an_effort_change_while_someone_types_keeps_to_its_deadline(
         "last_human_input_at",
         lambda *_args: clock.now if typing_until is None else min(clock.now, typing_until),
     )
+    if pane_rows is not None:
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda *args, **kwargs: SimpleNamespace(
+                returncode=0, stdout=f"120 {pane_rows} latest\n", stderr=""
+            ),
+        )
     deadline = _web_control_deadline(monkeypatch)
+    resizes: list[tuple[str, ...]] = []
+    run_tmux = claude_native_bridge._run_tmux
+
+    def record_resizes(socket_path: str, *args: str, **kwargs: Any) -> None:
+        if args[0] == "resize-window":
+            resizes.append(args)
+            return
+        run_tmux(socket_path, *args, **kwargs)
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", record_resizes)
 
     if applied:
         _change_effort_as_the_web_control_does(bridge_dir, deadline)
@@ -15136,6 +15211,7 @@ def test_an_effort_change_while_someone_types_keeps_to_its_deadline(
         with pytest.raises(claude_native_bridge.ClaudeComposerHoldsDraft, match="typing"):
             _change_effort_as_the_web_control_does(bridge_dir, deadline)
         assert composer.submitted == []
+        assert resizes == []
     assert not deadline.is_set()
     assert (composer.text, composer.cursor, composer.stash) == (draft, len(draft), None)
 

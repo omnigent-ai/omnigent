@@ -178,7 +178,9 @@ def _serialize_bridge_injection(function: _InjectionFunction) -> _InjectionFunct
         ):
             try:
                 return function(bridge_dir, *args, **kwargs)
-            except ClaudeComposerNotCleared:
+            except ClaudeComposerNotCleared as refusal:
+                if isinstance(refusal, ClaudeComposerHoldsDraft) and not refusal.room_may_help:
+                    raise
                 # The refused paste sent nothing. Give a clipped composer room,
                 # then recheck readiness and pending prompts before retrying.
                 info = _wait_for_tmux_info(bridge_dir, timeout_s=_TMUX_READY_TIMEOUT_S)
@@ -818,11 +820,14 @@ class ClaudeComposerHoldsDraft(ClaudeComposerNotCleared):
 
     :param message: Why the draft stayed in the box.
     :param stash_in_use: Whether Claude Code's one stash already holds a draft.
+    :param room_may_help: Whether a taller pane could show what the refusal
+        could not see, such as the stash marker's rows.
     """
 
-    def __init__(self, message: str, *, stash_in_use: bool) -> None:
+    def __init__(self, message: str, *, stash_in_use: bool, room_may_help: bool = False) -> None:
         super().__init__(message)
         self.stash_in_use = stash_in_use
+        self.room_may_help = room_may_help
 
 
 class ClaudeSubmitBlockedUnconfirmed(RuntimeError):
@@ -5214,14 +5219,24 @@ def _paste_and_submit(
             guard=guard,
         )
         pane = _capture_pane(socket_path, tmux_target)
-        if _draft_in_input_box(pane, needle, tail_needle=tail_needle) and not _typed_in_pane_since(
-            socket_path, tmux_target, paste_sent_at
-        ):
+        late_paste = _draft_in_input_box(pane, needle, tail_needle=tail_needle)
+        if late_paste and not _typed_in_pane_since(socket_path, tmux_target, paste_sent_at):
             # The first paste landed during the wait. No one has typed since it
             # was sent, so the box holds this delivery's own text: it is
             # submitted, not stashed as the person's draft and pasted again.
             draft_seen = True
             delivery_diagnostics.record_details(late_paste_seen=True)
+        elif late_paste:
+            # Someone typed since: the box can mix this delivery's text with
+            # theirs. Stashing it would hand the message back inside their
+            # draft, and clearing it would delete what they typed, so the box
+            # and any draft stashed first stay as they are, and nothing is sent.
+            delivery_diagnostics.record_details(late_paste_seen=True)
+            guard.stashed = False
+            raise ClaudeMessageNotAccepted(
+                "Claude Code's input box holds this message together with keys typed "
+                "after it was pasted, so it was left there unsent."
+            )
         else:
             _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir, guard=guard)
             draft_seen, pane, polls, empty_captures, paste_wait_started = _paste_and_await_draft(
@@ -7540,6 +7555,7 @@ def _restore_occupied_input(
                 "Claude Code's input box holds a draft taller than the terminal, so its "
                 "stash cannot be checked and nothing was sent.",
                 stash_in_use=False,
+                room_may_help=True,
             )
         elif last_escape is None or now - last_escape >= _OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S:
             if surface == _SHELL_MODE_SURFACE and _shell_mode_draft(pane):
@@ -8091,6 +8107,7 @@ def _set_draft_aside(
             "Claude Code's input box holds an unsent draft, and the rows that show whether "
             "its stash is in use are out of view, so nothing was sent.",
             stash_in_use=False,
+            room_may_help=True,
         )
     if not _ctrl_s_stashes(bridge_dir):
         _record_held_draft(pane)

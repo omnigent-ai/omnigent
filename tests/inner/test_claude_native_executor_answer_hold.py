@@ -348,14 +348,25 @@ async def test_a_draft_that_refuses_the_message_again_is_announced_once(
     assert pane.deliveries == 4
 
 
+_INPUT_BOX_HOLDS = pytest.mark.parametrize(
+    "refusal",
+    [
+        ClaudeComposerNotCleared(_NOT_CLEARED),
+        ClaudeComposerHoldsDraft("nothing was sent", stash_in_use=False),
+    ],
+    ids=["box-not-clear", "draft-held"],
+)
+
+
 @pytest.mark.asyncio
+@_INPUT_BOX_HOLDS
 async def test_a_held_message_asks_for_a_repaint_each_interval(
-    pane: _Pane, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    pane: _Pane, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refusal: Exception
 ) -> None:
     monkeypatch.setattr(
         claude_native_executor, "_INPUT_BOX_REPAINT_INTERVAL_S", 0.0, raising=False
     )
-    pane.refusals = [ClaudeComposerNotCleared(_NOT_CLEARED)]
+    pane.refusals = [refusal]
 
     await _run(tmp_path)
 
@@ -424,12 +435,13 @@ async def test_a_message_sent_during_the_hold_queues_behind_the_held_one(
 
 
 @pytest.mark.asyncio
+@_INPUT_BOX_HOLDS
 async def test_stopping_a_turn_held_for_the_input_box_keeps_the_pane(
-    pane: _Pane, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    pane: _Pane, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refusal: Exception
 ) -> None:
     """Stop during the hold cancels the wait; it neither types nor reaps the pane."""
     monkeypatch.setattr(claude_native_executor, "_MESSAGE_HOLD_POLL_S", 0.01, raising=False)
-    pane.refusals = [ClaudeComposerNotCleared(_NOT_CLEARED)]
+    pane.refusals = [refusal]
     pane.pending_polls = 10**6
     turn = asyncio.create_task(_run(tmp_path))
     for _ in range(200):
