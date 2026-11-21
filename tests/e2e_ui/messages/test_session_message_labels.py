@@ -271,8 +271,12 @@ def test_sent_messages_read_to_and_arrive_from(
         _script_turns(mock_url, tasks, worker_id=worker, agent_id=agent_id, missing_id=missing_id)
 
         _send_prompt(page, f"{hosted.stack.base_url}/c/{manager}", tasks.prompt)
-        # Live rows, then the same rows rebuilt from the saved transcript.
         _assert_sender_rows(page, tasks)
+        _assert_recipient(page, "Worker", tasks.repro.split("\n")[0], _WORKER_REPLY, worker)
+        # Back to the chat watched live: its reconnect must not repeat the sends.
+        page.go_back()
+        _assert_sender_rows(page, tasks)
+        # The same rows rebuilt from the saved transcript.
         page.reload()
         _assert_sender_rows(page, tasks)
         to_worker = _sent_row(page, "Worker")
@@ -280,6 +284,4 @@ def test_sent_messages_read_to_and_arrive_from(
         expect(to_worker.get_by_text("List each cart that rounds the wrong way.")).to_be_visible()
 
         fix_worker = _created_session(hosted.client, "Fix worker", manager)
-        _assert_recipient(page, "Worker", tasks.repro.split("\n")[0], _WORKER_REPLY, worker)
-        page.go_back()
         _assert_recipient(page, "Fix worker", tasks.fix, _FIX_WORKER_REPLY, fix_worker)
