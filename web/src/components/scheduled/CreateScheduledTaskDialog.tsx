@@ -45,6 +45,7 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Label } from "@/components/scheduled/Label";
+import { TemplateNameInput } from "@/components/scheduled/TemplateNameInput";
 import { ScheduleFields } from "@/components/scheduled/ScheduleFields";
 import {
   acceptsApprovalSkippingModes,
@@ -1853,7 +1854,7 @@ export function CreateScheduledTaskDialog({
                 ? "Edit automation"
                 : "New automation"}
           </DialogTitle>
-          <Input
+          <TemplateNameInput
             id="task-name"
             value={name}
             placeholder="Name your automation"

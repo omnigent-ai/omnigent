@@ -285,6 +285,57 @@ async def test_schedule_validation_keeps_requests_responsive(
     assert "time limit" in result.text
 
 
+async def test_name_template_create_stores_raw_and_rejects_invalid(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri)
+    name = "Open PR Rebase - {{YYYY-MM-DD}}"
+    response = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(name=name), headers=_headers()
+    )
+    assert response.status_code == 200
+    assert response.json()["name"] == name
+    response = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(name="{{yyyy-MM-dd}}"), headers=_headers()
+    )
+    assert response.status_code == 400
+    assert "supported tokens" in response.text
+
+
+async def test_name_template_patch_invalid_leaves_row_unchanged(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri)
+    created = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
+    )
+    task_id = created.json()["id"]
+    response = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}", json={"name": "{{env}}"}, headers=_headers()
+    )
+    assert response.status_code == 400
+    task = SqlAlchemyScheduledTaskStore(db_uri).get(task_id)
+    assert task is not None and task.name == "nightly triage"
+
+
+async def test_name_template_legacy_name_resent_unchanged_is_accepted(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri)
+    created = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
+    )
+    task_id = created.json()["id"]
+    SqlAlchemyScheduledTaskStore(db_uri).update(task_id, name="Deploy {{env}}")
+    response = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}",
+        json={"name": "Deploy {{env}}", "prompt": "updated prompt"},
+        headers=_headers(),
+    )
+    assert response.status_code == 200
+    assert response.json()["prompt"] == "updated prompt"
+
+
 async def test_create_lists_and_gets(auth_client: httpx.AsyncClient, db_uri: str) -> None:
     _make_user(db_uri)
     headers = {
@@ -921,6 +972,34 @@ async def test_the_reminder_tools_request_continues_its_session(
     assert (task.session_mode, task.session_id, task.kind) == ("continue", session_id, "reminder")
     assert task.agent_id == builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME)
     assert (task.permission_mode, task.state, task.next_run_at) == (None, "active", fire_at)
+
+
+@pytest.mark.parametrize("auth_app", ["one_time"], indirect=True)
+async def test_reminder_names_skip_date_placeholder_validation(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    from omnigent.tools.builtins.scheduled_tasks import reminder_name
+
+    session_id = _owned_session(db_uri)
+    rule, fire_at = _one_time_rule_in(hours=2)
+    name = reminder_name("Check the {{env}} rollout")
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json={
+            "name": name,
+            "prompt": "check the rollout",
+            "rrule": rule,
+            "timezone": "UTC",
+            "agent_id": builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME),
+            "session_mode": "continue",
+            "session_id": session_id,
+            "kind": "reminder",
+            "first_run_at": fire_at,
+        },
+        headers=_headers(),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["name"] == name
 
 
 @pytest.mark.parametrize("auth_app", ["one_time"], indirect=True)
