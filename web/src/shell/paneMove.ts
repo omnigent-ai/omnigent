@@ -217,8 +217,8 @@ export interface PaneMoveSource {
   sizing: () => PaneSizing | null;
   /** The name a pane's row shows. */
   nameOf: (key: string) => string;
-  /** Moves the pane; returns the move to run once the choice is made. */
-  move: (destination: { key: string; targetKey: string; side: TerminalPaneSide }) => () => void;
+  /** Moves the pane there; called only once that spot is chosen. */
+  move: (destination: { key: string; targetKey: string; side: TerminalPaneSide }) => void;
 }
 
 /**
@@ -258,12 +258,11 @@ export function paneMoveOptions(source: PaneMoveSource): PaneMoveOption[] {
   const layout = current && paneMoveLayout(current.layout, current.zoomedKey);
   if (!current || !layout) return [];
   return paneMoveDestinations(layout, current.key, source.sizing()).map(({ targetKey, side }) => {
-    const run = source.move({ key: current.key, targetKey, side });
     return {
       id: `${current.key}>${targetKey}:${side}`,
       label: paneMoveDestinationLabel(side, source.nameOf(targetKey)),
       keywords: [source.nameOf(targetKey)],
-      run,
+      run: () => source.move({ key: current.key, targetKey, side }),
     };
   });
 }

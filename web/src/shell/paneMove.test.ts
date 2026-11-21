@@ -82,8 +82,7 @@ describe("movePaneCommand", () => {
     read: () => ({ layout: layout.current, zoomedKey: zoomed.current, key: "c" }),
     sizing: () => null,
     nameOf: (key: string) => `shell ${key}`,
-    move: (destination: { key: string; targetKey: string; side: string }) => () =>
-      move(destination),
+    move: (destination: { key: string; targetKey: string; side: string }) => move(destination),
   });
 
   it("offers each destination by the target's name, and moves there", () => {
@@ -100,8 +99,10 @@ describe("movePaneCommand", () => {
       "Right of shell b",
       "Above shell b",
     ]);
+    // Listing the spots moves nothing; only the chosen one runs.
+    expect(move).not.toHaveBeenCalled();
     options.find((option) => option.label === "Above shell b")!.run();
-    expect(move).toHaveBeenCalledWith({ key: "c", targetKey: "b", side: "top" });
+    expect(move).toHaveBeenCalledExactlyOnceWith({ key: "c", targetKey: "b", side: "top" });
   });
 
   it("reads the split again when asked, so a pane closed meanwhile isn't offered", () => {
