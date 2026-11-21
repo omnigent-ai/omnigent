@@ -355,6 +355,8 @@ async def test_direct_stream_legacy_model_obeys_inference_allowlist(
         "native-selection",
         "lazy-metadata",
         "lazy-replaced-entry",
+        "lazy-persisted-harness",
+        "lazy-persisted-alias",
     ],
 )
 async def test_cached_harness_selection_preserves_single_policy_transform(
@@ -362,7 +364,11 @@ async def test_cached_harness_selection_preserves_single_policy_transform(
 ) -> None:
     monkeypatch.setattr(runner_app_module, "_session_inboxes_ref", {})
     monkeypatch.setattr(runner_app_module, "_session_agent_ids_ref", {})
-    lazy_metadata = cache_state in {"lazy-metadata", "lazy-replaced-entry"}
+    lazy_metadata = cache_state.startswith("lazy-")
+    persisted_harness = {
+        "lazy-persisted-harness": "pi",
+        "lazy-persisted-alias": "openai-agents-sdk",
+    }.get(cache_state)
     declared = _spec()
     resolver = AsyncMock(return_value=declared)
 
@@ -411,7 +417,11 @@ async def test_cached_harness_selection_preserves_single_policy_transform(
         monkeypatch.setattr(
             server_client,
             "get",
-            AsyncMock(return_value=httpx.Response(200, json={"agent_id": "agent"})),
+            AsyncMock(
+                return_value=httpx.Response(
+                    200, json={"agent_id": "agent", "harness": persisted_harness}
+                )
+            ),
         )
         monkeypatch.setattr(
             "omnigent.models.model_catalog.catalog_for_spec", Mock(return_value={})
@@ -426,6 +436,7 @@ async def test_cached_harness_selection_preserves_single_policy_transform(
         "native-selection": "opencode-native",
         "lazy-metadata": "claude-sdk",
         "lazy-replaced-entry": "claude-sdk",
+        "lazy-persisted-alias": "openai-agents",
     }.get(cache_state, "pi")
     async with _runner_client(app) as client:
         if lazy_metadata:
@@ -435,6 +446,11 @@ async def test_cached_harness_selection_preserves_single_policy_transform(
             assert not manager.get_client_calls
             assert _SESSION_ID not in runner_app_module._session_agent_ids_ref
             gate.assert_awaited_once_with(declared, harness)
+            if persisted_harness:
+                # Resource reads after restart must reuse the persisted harness's transform.
+                metadata = await client.get(f"/v1/sessions/{_SESSION_ID}/models")
+                assert metadata.status_code == 200, metadata.text
+                gate.assert_awaited_once_with(declared, harness)
         else:
             initialized = await client.post(
                 "/v1/sessions",
@@ -503,7 +519,7 @@ async def test_cached_harness_selection_preserves_single_policy_transform(
         {"POLICY_NAME": f"{declared.name}-{harness}"},
     )
     selected = build_environment.call_args.args[0]
-    if cache_state == "lazy-metadata":
+    if lazy_metadata and cache_state != "lazy-replaced-entry":
         assert selected is original_cached
         assert cache[_SESSION_ID] is original_cached
     assert f"Policy for {harness}." in worker.posted_bodies[-1]["instructions"]
@@ -519,7 +535,7 @@ async def test_cached_harness_selection_preserves_single_policy_transform(
         assert context.agent_spec is selected
         assert context.ensure_comment_relay.keywords["effective_spec_entry"] is selected
         assert launch_terminal.call_args.kwargs["resolve_agent_spec"] is None
-    if cache_state == "lazy-metadata":
+    if lazy_metadata:
         gate.assert_awaited_once_with(declared, harness)
         resolver.assert_awaited_once()
     else:

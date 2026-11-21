@@ -1527,12 +1527,11 @@ def create_runner_app(
         if spec is None:
             return None
         selected = (
-            harness
-            or _session_harness_overrides.get(session_id)
-            or spec.executor.config.get("harness")
-            or spec.executor.type
+            canonicalize_harness(harness)
+            if harness
+            else _session_harness_name(session_id, spec=spec)
         )
-        return entry if provenance[1] == (canonicalize_harness(selected) or selected) else None
+        return entry if provenance[1] == selected else None
 
     # session_id → effective revision of the bundle and MCP selections
     _session_agent_revisions: dict[str, str] = {}
@@ -4404,7 +4403,7 @@ def create_runner_app(
         _session_harness_overrides[conv_id] = harness_override
         return True
 
-    def _session_harness_name(conv_id: str) -> str | None:
+    def _session_harness_name(conv_id: str, *, spec: AgentSpec | None = None) -> str | None:
         # The override wins: a routed session runs the harness the server
         # pinned, not the one its spec declares. Reading the spec here left a
         # sub-agent whose spec says ``claude-native`` looking native while it
@@ -4416,10 +4415,10 @@ def create_runner_app(
         )
         if override and override != "auto":
             return canonicalize_harness(override) or override
-        spec = _session_spec_cache.get(conv_id)
-        if spec is None:
+        entry = spec if spec is not None else _session_spec_cache.get(conv_id)
+        if entry is None:
             return None
-        h = spec.executor.config.get("harness") or spec.executor.type
+        h = entry.executor.config.get("harness") or entry.executor.type
         return canonicalize_harness(h) or h
 
     def _native_turn_outcome_is_forwarder_confirmed(conv_id: str) -> bool:
@@ -9069,12 +9068,7 @@ def create_runner_app(
             spec = _unwrap_resolved_spec(spec_entry)
             harness: str | None = None
             if spec is not None:
-                raw_harness = (
-                    _session_harness_overrides.get(session_id)
-                    or spec.executor.config.get("harness")
-                    or spec.executor.type
-                )
-                harness = canonicalize_harness(raw_harness) or raw_harness
+                harness = cast(str, _session_harness_name(session_id, spec=spec))
                 spec = await _apply_agent_start_gate(spec, harness)
                 spec_entry = _rewrap_like(spec_entry, spec, _resolved_spec_workdir(spec_entry))
             if _session_cache_generation_is_current(session_id, generation):
