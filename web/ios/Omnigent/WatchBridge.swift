@@ -6,8 +6,8 @@ import WebKit
 @MainActor
 final class WatchBridge: NSObject, WCSessionDelegate {
   static let shared = WatchBridge()
-  private var latest: [String: Any]?
-  /// Bumped by sign-out, so a sync still reading cookies can't sign the watch back in.
+  private(set) var latest: [String: Any]?
+  /// New syncs and sign-out invalidate any older cookie read still in flight.
   private var generation = 0
 
   func start() {
@@ -16,10 +16,14 @@ final class WatchBridge: NSObject, WCSessionDelegate {
     WCSession.default.activate()
   }
 
-  func sync(serverURL: URL?, workspaceID: String? = nil, cookieStore: WKHTTPCookieStore) {
-    guard WCSession.isSupported(), let serverURL else { return }
+  @discardableResult
+  func sync(serverURL: URL?, workspaceID: String? = nil, cookieStore: some WatchCookieStore)
+    -> Task<Void, Never>?
+  {
+    guard WCSession.isSupported(), let serverURL else { return nil }
+    generation += 1
     let started = generation
-    Task {
+    return Task {
       let cookies = await cookieStore.allCookies()
       guard generation == started else { return }
       push(WatchCredentials(serverURL: serverURL, workspaceID: workspaceID, cookies: cookies))
@@ -59,6 +63,13 @@ final class WatchBridge: NSObject, WCSessionDelegate {
   nonisolated func sessionDidBecomeInactive(_ session: WCSession) {}
   nonisolated func sessionDidDeactivate(_ session: WCSession) { session.activate() }
 }
+
+@MainActor
+protocol WatchCookieStore {
+  func allCookies() async -> [HTTPCookie]
+}
+
+extension WKHTTPCookieStore: WatchCookieStore {}
 
 extension WatchCredentials {
   /// The API root under the server's mount and the cookies a browser would send it.

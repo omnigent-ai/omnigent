@@ -34,6 +34,73 @@ final class WatchCompanionTests: XCTestCase {
     XCTAssertNil(state.credentials)
   }
 
+  @MainActor func testOnlyNewestPhoneSyncCanPublishCredentials() async throws {
+    let bridge = WatchBridge()
+    let olderCookies = PendingWatchCookies()
+    let newerCookies = PendingWatchCookies()
+    let older = try XCTUnwrap(
+      bridge.sync(
+        serverURL: URL(string: "https://old.example.com"), workspaceID: "1",
+        cookieStore: olderCookies))
+    let newer = try XCTUnwrap(
+      bridge.sync(
+        serverURL: URL(string: "https://new.example.com"), workspaceID: "2",
+        cookieStore: newerCookies))
+    newerCookies.cookies.continuation.yield([cookie("new", domain: "new.example.com", path: "/")])
+    await newer.value
+    olderCookies.cookies.continuation.yield([cookie("old", domain: "old.example.com", path: "/")])
+    await older.value
+    let data = try XCTUnwrap(bridge.latest?[WatchCredentials.contextKey] as? Data)
+    let latest = try JSONDecoder().decode(WatchCredentials.self, from: data)
+    XCTAssertEqual(latest.apiURL.absoluteString, "https://new.example.com/v1?o=2")
+    XCTAssertEqual(latest.cookie, "new=1")
+
+    let signingOut = try XCTUnwrap(
+      bridge.sync(serverURL: URL(string: "https://new.example.com"), cookieStore: newerCookies))
+    bridge.signOut()
+    newerCookies.cookies.continuation.yield([cookie("new", domain: "new.example.com", path: "/")])
+    await signingOut.value
+    XCTAssertEqual(bridge.latest?[WatchCredentials.contextKey] as? Data, Data())
+  }
+
+  @MainActor func testPollingPreservesApprovalFailureUntilSuccessfulResponse() async throws {
+    let snapshot = Data(
+      #"{"status":"running","pending_elicitations":[{"elicitation_id":"e1","params":{"message":"Run it?"}}]}"#
+        .utf8)
+    let server = try MockHTTPServer(requestHandler: { request in
+      switch (request.method, URLComponents(string: request.path)?.path) {
+      case ("GET", "/v1/sessions/s1"):
+        return (200, [:], snapshot)
+      case ("GET", "/v1/sessions/s1/items"):
+        return (200, [:], Data(#"{"data":[]}"#.utf8))
+      case ("POST", "/v1/sessions/s1/elicitations/e1/resolve"):
+        let body = try? JSONSerialization.jsonObject(with: request.body) as? [String: String]
+        return (body?["action"] == "accept" ? 401 : 200, [:], Data())
+      default:
+        XCTFail("Unexpected watch request: \(request.method) \(request.path)")
+        return (404, [:], Data())
+      }
+    })
+    let session = try WatchClient.decoder.decode(
+      WatchSession.self, from: Data(#"{"id":"s1","status":"running"}"#.utf8))
+    let conversation = WatchConversation(
+      session: session,
+      client: WatchClient(
+        credentials: WatchCredentials(
+          apiURL: URL(string: "http://127.0.0.1:\(server.port)/v1")!, cookie: "session=test")))
+    await conversation.load()
+    XCTAssertNil(conversation.error)
+    let approval = try XCTUnwrap(conversation.approvals.first)
+    await conversation.resolve(approval, accept: true)
+    XCTAssertEqual(conversation.error, WatchError.signedOut.localizedDescription)
+    await conversation.load()
+    XCTAssertEqual(conversation.error, WatchError.signedOut.localizedDescription)
+    XCTAssertEqual(conversation.approvals.map(\.id), ["e1"])
+    await conversation.resolve(approval, accept: false)
+    XCTAssertNil(conversation.error)
+    XCTAssertTrue(conversation.approvals.isEmpty)
+  }
+
   @MainActor func testCredentialsSendOnlyCookiesTheAPIWouldReceive() throws {
     let cookies = [
       cookie("session", domain: "omnigent.example.com", path: "/"),
@@ -229,5 +296,15 @@ final class WatchCompanionTests: XCTestCase {
     if secure { properties[.secure] = "TRUE" }
     if let expires { properties[.expires] = expires }
     return HTTPCookie(properties: properties)!
+  }
+}
+
+@MainActor
+private final class PendingWatchCookies: WatchCookieStore {
+  let cookies = AsyncStream<[HTTPCookie]>.makeStream()
+
+  func allCookies() async -> [HTTPCookie] {
+    var iterator = cookies.stream.makeAsyncIterator()
+    return await iterator.next() ?? []
   }
 }
