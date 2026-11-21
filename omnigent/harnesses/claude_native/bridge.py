@@ -6033,7 +6033,7 @@ def _confirm_tui_dialog(
         raise ClaudeUserPromptPending(
             "Claude is waiting for an explicit answer; settings dialog not confirmed."
         )
-    if not _blind_confirm_is_safe(socket_path, tmux_target, pane):
+    if not _blind_confirm_is_safe(socket_path, tmux_target, pane, bridge_dir=bridge_dir):
         # Claude Code may have returned the person's draft; an Enter would send it.
         _logger.warning(
             "claude-native: %r never rendered and the pane does not show that an Enter "
@@ -6045,24 +6045,38 @@ def _confirm_tui_dialog(
     return False
 
 
-def _blind_confirm_is_safe(socket_path: str, tmux_target: str, pane: str) -> bool:
+def _blind_confirm_is_safe(
+    socket_path: str, tmux_target: str, pane: str, *, bridge_dir: Path | None
+) -> bool:
     """
     Return whether the timeout confirm Enter can only reach a dialog or an empty box.
 
     The Enter stands in for a dialog whose title drifted, so it needs a pane
-    showing either the input box holding no draft, or no input box and a
-    numbered choice, on two captures in a row. An empty or torn capture shows
-    neither, and a returned draft could be what it hides.
+    showing either the whole input box holding no draft, or no input box and
+    a numbered choice, on two captures in a row. An empty or torn capture
+    shows neither, a box the pane cuts off can hide a draft, and a permission
+    prompt or a :data:`_FOREIGN_DIALOG_HINTS` surface opening between the two
+    lists numbered choices too, so each capture is checked for those.
 
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :param pane: The capture the watch ended on.
+    :param bridge_dir: Bridge whose live permission hooks protect confirmation.
     :returns: ``True`` when both captures show it is safe.
+    :raises ClaudeUserPromptPending: If a question or permission request is pending.
     """
 
     def safe(capture: str) -> bool:
-        if _composer_box(capture) is not None:
-            return not _composer_holds_draft(socket_path, tmux_target, capture)
+        _raise_if_user_prompt_pending(
+            bridge_dir,
+            capture,
+            message="Claude is waiting for an explicit answer; settings dialog not confirmed.",
+        )
+        if any(text in capture for text in _FOREIGN_DIALOG_HINTS):
+            return False
+        box = _composer_box(capture)
+        if box is not None:
+            return box.framed and not _composer_holds_draft(socket_path, tmux_target, capture)
         return _DIALOG_CHOICE_RE.search(capture) is not None
 
     if not safe(pane):

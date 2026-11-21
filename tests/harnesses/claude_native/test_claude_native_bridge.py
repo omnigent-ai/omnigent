@@ -13260,8 +13260,16 @@ def test_the_stash_marker_is_read_only_above_the_input_box() -> None:
         ["⏺ Change effort level? asks before switching.\n" + _composer_pane("my returned draft")],
         # The capture the watch ends on fails, after the draft came back.
         [_composer_pane("my returned draft"), ""],
+        # The pane cuts the box off below a blank first row; the draft can sit under it.
+        ["⏺ done\n──────────────────────────────\n❯ \n"],
     ],
-    ids=["draft", "draft-quoting-the-title", "reply-quoting-the-title", "torn-final-capture"],
+    ids=[
+        "draft",
+        "draft-quoting-the-title",
+        "reply-quoting-the-title",
+        "torn-final-capture",
+        "cut-off-below-a-blank-row",
+    ],
 )
 def test_a_confirm_enter_never_reaches_a_returned_draft(
     monkeypatch: pytest.MonkeyPatch, frames: list[str]
@@ -14606,6 +14614,64 @@ def test_a_foreign_dialog_rendering_during_the_watch_gets_no_enter(
             )
             is False
         )
+    assert sends == []
+
+
+class _SurfaceOpensAfterTheWatch(_VirtualClock):
+    """A clock whose first sleep after the confirm watch ends opens another surface."""
+
+    def __init__(self, watch_s: float) -> None:
+        super().__init__()
+        self._watch_s = watch_s
+        self.surface_open = False
+
+    def sleep(self, seconds: float) -> None:
+        if self.now >= self._watch_s:
+            self.surface_open = True
+        super().sleep(seconds)
+
+
+@pytest.mark.parametrize(
+    ("name", "foreign_pane"),
+    [
+        ("model picker", _MODEL_PICKER_PANE),
+        ("permission prompt", _PERMISSION_PROMPT_PANE),
+    ],
+    ids=["model-picker", "permission-prompt"],
+)
+def test_a_foreign_dialog_opening_as_the_blind_confirm_looks_again_gets_no_enter(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    foreign_pane: str,
+) -> None:
+    """
+    The blind confirm's second capture is checked like every other one.
+
+    The watch ends over an empty input box, which the first look finds safe.
+    A permission prompt or a picker opens just before the second look, and
+    its selected numbered choice must not take the Enter: that approves the
+    tool or rewrites the default model.
+    """
+    sends = _fake_tmux(monkeypatch, [_IDLE_PANE])
+    clock = _SurfaceOpensAfterTheWatch(claude_native_bridge._CONFIRM_DIALOG_TIMEOUT_S)
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_capture_pane",
+        lambda *_args, **_kwargs: foreign_pane if clock.surface_open else _IDLE_PANE,
+    )
+
+    def confirm() -> bool:
+        return claude_native_bridge._confirm_tui_dialog(
+            "/tmp/s.sock", "claude:0.0", hint=claude_native_bridge.EFFORT_DIALOG_HINT
+        )
+
+    if name == "permission prompt":
+        with pytest.raises(claude_native_bridge.ClaudeUserPromptPending):
+            confirm()
+    else:
+        assert confirm() is False
+    assert clock.surface_open
     assert sends == []
 
 
