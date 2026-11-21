@@ -1234,6 +1234,89 @@ async def test_forwarder_migrates_hook_cursor_state_to_byte_offset(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["memory", "disk", "relocated", "seed"])
+async def test_transcript_cursor_reads_preserve_loop_progress(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+) -> None:
+    """A slow cursor read must preserve loop progress and the unread message."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    prefix = (
+        json.dumps({"type": "user", "uuid": "old", "message": {"role": "user", "content": "old"}})
+        + "\n"
+    )
+    transcript_path.write_text(
+        prefix
+        + json.dumps(
+            {"type": "user", "uuid": "new", "message": {"role": "user", "content": "new"}}
+        )
+        + "\n"
+    )
+    offset = len(prefix.encode())
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=1,
+        byte_offset=offset,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, offset),
+        seen_source_ids=("old",),
+    )
+    if source == "disk":
+        await forwarder._write_forward_state_async(bridge_dir, state)
+    elif source == "relocated":
+        transcript_path = tmp_path / "worktree" / "session.jsonl"
+        transcript_path.parent.mkdir()
+        state.transcript_path.rename(transcript_path)
+
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    open_file = Path.open
+    held_path = bridge_dir / "transcript_forwarder.json" if source == "disk" else transcript_path
+
+    def slow_open(path: Path, *args: Any, **kwargs: Any) -> Any:
+        if path == held_path and not finished.is_set():
+            loop.call_soon_threadsafe(entered.set)
+            try:
+                assert release.wait(5), "cursor read was never released"
+            finally:
+                finished.set()
+        return open_file(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", slow_open)
+    fail_safe = threading.Timer(3, release.set)
+    fail_safe.start()
+    task = asyncio.create_task(
+        forwarder._ensure_state_for_transcript(
+            bridge_dir=bridge_dir,
+            state=state if source in ("memory", "relocated") else None,
+            transcript_path=transcript_path,
+            start_at_end=False,
+            session_id="conv_slow_cursor",
+        )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        assert not release.is_set(), "cursor read blocked the runner event loop"
+        assert not task.done()
+    finally:
+        release.set()
+        fail_safe.cancel()
+        fail_safe.join()
+        result = await asyncio.wait_for(task, timeout=5)
+
+    assert result.transcript_path == transcript_path
+    assert result.byte_offset == (0 if source == "seed" else offset)
+    if source != "seed":
+        assert result.seen_source_ids == ("old",)
+    unread = forwarder._read_transcript_items_for_state(result, "claude-native-ui", None)
+    expected = ["old:0:message", "new:0:message"] if source == "seed" else ["new:0:message"]
+    assert [item.source_id for item in unread.items] == expected
+
+
+@pytest.mark.asyncio
 async def test_forwarder_state_writes_run_off_event_loop(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
