@@ -73,6 +73,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   Equivalent model-ID spellings use the catalog's display name consistently,
   including case, gateway-prefix, and version-punctuation differences; context
   variants keep their own labels and checked rows, including in side chats.
+  Claude terminals reporting a stable CLI version of 2.1.323 or newer preserve
+  the saved default through session-only picks. Older or unverified versions
+  keep an already selected model when status matches the same native session;
+  actual legacy model changes may also change the saved default.
 - `effort-picker`: reasoning effort for harnesses that support it (Codex, Claude,
   Pi, Devin). States: available, unavailable placeholder, max/ultra levels, refused
   change (the pill keeps the applied level).
@@ -728,13 +732,19 @@ composer with its prompt`).
   `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_picker_repeated_pins_reach_the_real_terminal`
   selects pinned Opus through the gear, repeats it through the model pill,
   then returns to Sonnet through Ctrl+Shift+M. Each uses the real browser,
-  server, owned isolated host, runner and Claude CLI. Subsequent mock requests
-  retain the wire model's exact generation; native status and `requestedModel`
-  retain the selected `[1m]` suffix, and the correlated API request includes
-  the `context-1m` beta. Chat and the persisted transcript each contain the
-  reply once, with no model-change error. Requires Claude Code and tmux. Use
-  a clean container when machine-managed Claude settings override the mock
-  endpoint; this does not establish live gateway compatibility.
+  server, owned isolated host, runner and Claude CLI. Every pick must succeed
+  before sending a unique turn. Chat, persisted history and the native
+  transcript each contain one user message and one reply, with exactly one
+  matching streaming provider request. The request, native `requestedModel`
+  and fresh status retain the exact concrete generation. In Claude Code
+  2.1.323, native-1M Opus 4.8 reports its bare public ID without `[1m]` and
+  does not need a `context-1m` beta. Its selected context is checked through
+  a fresh 1,000,000-token status record matching that turn's prompt ID,
+  native session and transcript. Only this known public context spelling is
+  normalized; private IDs remain literal. A refused pick still fails this
+  success journey. Requires Claude Code and tmux. Use a clean container when
+  machine-managed settings override the mock endpoint; short synthetic replies
+  do not establish live gateway compatibility or inference beyond 200K tokens.
 - **`model-picker`, paused Pi after server restart (own environment):**
   Start a Pi session on a host with a configured local catalog, pause the
   session, restart only the server, and reload the session. Open the model

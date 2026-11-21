@@ -580,6 +580,10 @@ class _FakeServerClient:
     items: list[dict[str, Any]] | None = None
     items_fail: bool = False
 
+    @property
+    def messages(self) -> list[tuple[str, dict[str, Any]]]:
+        return [post for post in self.posts if post[1].get("type") == "message"]
+
     async def post(self, url: str, *, json: dict[str, Any], timeout: float) -> _FakeResponse:
         del timeout
         self.posts.append((url, json))
@@ -1004,42 +1008,75 @@ def test_settle_probe_reads_the_pane_for_claude_and_the_turn_id_for_codex(
     assert codex_probe("turn_1") is True
 
 
-async def test_replay_switches_the_claude_pane_before_delivering(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("version", ["2.1.323", "2.1.322"], ids=["session-only", "legacy"])
+async def test_replay_selects_the_claude_model_before_posting_one_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str
 ) -> None:
-    """
-    Claude's model switch happens in the replay, not in its hook.
+    from omnigent.harnesses.claude_native import bridge
+    from tests.harnesses.claude_native._model_switch_support import (
+        _session_model_bridge,
+        _SessionModelComposer,
+    )
 
-    The hook's own pane is frozen waiting on the hook subprocess, so
-    keystrokes sent from there would queue behind the block. Order is
-    load-bearing: the pane must already be on the routed model when the
-    prompt arrives, or the turn runs on the launch model.
-    """
-    monkeypatch.setattr(turn_routing, "REPLAY_MARKER_WAIT_S", 1.0)
-    monkeypatch.setattr(turn_routing, "REPLAY_POLL_S", 0.01)
+    monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path)
+    monkeypatch.setenv(bridge.REQUEST_SESSION_ID_ENV_VAR, "web-session")
+    composer = _SessionModelComposer(draft="hello")
+    composer.version = version
+    session_only = version == "2.1.323"
+    initial_default = composer.saved_default
+    model = composer.options[-1]
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    composer.install(monkeypatch)
+    _mark(bridge_dir, session_id="web-session")
+    turn_routing.write_pending_replay(
+        bridge_dir, session_id="web-session", prompt="hello", blocked_turn_id=None, model=model
+    )
+    client = _FakeServerClient()
+    original_post = client.post
+
+    async def receive_message(url: str, *, json: dict[str, Any], timeout: float) -> _FakeResponse:
+        assert json["type"] == "message"
+        assert json["model_override"] == model
+        assert composer.model == model and composer.text == ""
+        assert composer.status_queries == 2 * int(session_only)
+        assert composer.saved_default == (initial_default if session_only else model)
+        return await original_post(url, json=json, timeout=timeout)
+
+    monkeypatch.setattr(client, "post", receive_message)
+    await schedule_replay(
+        "web-session",
+        prompt="hello",
+        bridge_dir=bridge_dir,
+        blocked_turn_id=None,
+        server_client=client,
+        harness="claude-native",
+        model=model,
+        idle=lambda _: True,
+    )
+
+    assert sum(args[-1] == "s" for args in composer.sends) == int(session_only)
+    if not session_only:
+        assert [command for command in composer.submitted if command] == [f"/model {model}"]
+    assert len(client.messages) == 1
+    assert client.messages[0][1]["data"]["content"][0]["text"] == "hello"
+    assert turn_routing.read_pending_replay(bridge_dir) is None
+
+
+@pytest.mark.parametrize("actuator_result", [False, None])
+async def test_replay_keeps_the_prompt_pending_when_the_model_actuator_is_not_true(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, actuator_result: bool | None
+) -> None:
     _mark(tmp_path)
-    switched: list[tuple[Path, str, bool]] = []
+    turn_routing.write_pending_replay(
+        tmp_path, session_id="conv_1", prompt="hello", blocked_turn_id=None, model="private-model"
+    )
     client = _FakeServerClient()
 
-    def _inject(
-        bridge_dir: Path,
-        *,
-        command: str,
-        auto_confirm: bool = False,
-        confirm_hint: str | None = None,
-    ) -> None:
-        assert not client.posts, "the pane must be switched before the prompt lands"
-        switched.append((bridge_dir, command, auto_confirm))
+    async def refuse(*args: object, **kwargs: object) -> bool | None:
+        return actuator_result
 
-    monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.bridge.inject_slash_command", _inject, raising=False
-    )
-    monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.bridge.read_model_env",
-        lambda _dir: {"ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-sonnet-5"},
-    )
-
+    monkeypatch.setattr(turn_routing, "_apply_routed_model", refuse)
     await schedule_replay(
         "conv_1",
         prompt="hello",
@@ -1047,94 +1084,492 @@ async def test_replay_switches_the_claude_pane_before_delivering(
         blocked_turn_id=None,
         server_client=client,
         harness="claude-native",
-        model="databricks-claude-sonnet-5",
-        idle=lambda _turn: True,
+        model="private-model",
+        idle=lambda _: True,
     )
 
-    # The vocabulary spelling, not the catalog id: ``/model`` rejects a bare
-    # gateway id and silently keeps the old model.
-    assert switched == [(tmp_path, "/model sonnet", True)]
+    assert not client.messages
     assert len(client.posts) == 1
+    assert client.posts[0][1]["type"] == "external_conversation_item"
+    pending = turn_routing.read_pending_replay(tmp_path)
+    assert pending is not None and pending.prompt == "hello"
 
 
-async def test_replay_still_delivers_when_the_claude_switch_fails(
+@pytest.mark.parametrize("notification_fails", [False, True])
+@pytest.mark.parametrize(
+    ("refusal", "unsupported"),
+    [
+        ("No exact picker choice", False),
+        ("post-clear-picker-refusal", False),
+        ("physical-row-collision", False),
+        ("physical-row-collision-after-read", False),
+        (
+            "Session-only model switching requires Claude Code 2.1.323 or newer. "
+            "Update Claude Code and relaunch this terminal.",
+            True,
+        ),
+    ],
+    ids=[
+        "picker-refusal",
+        "post-clear-picker-refusal",
+        "physical-row-collision",
+        "physical-row-collision-after-read",
+        "unsupported-cli",
+    ],
+)
+async def test_replay_refused_model_switch_can_be_rescheduled_by_the_caller(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    refusal: str,
+    unsupported: bool,
+    notification_fails: bool,
 ) -> None:
-    """A switch that does not take must not cost the user their prompt."""
-    monkeypatch.setattr(turn_routing, "REPLAY_MARKER_WAIT_S", 1.0)
-    monkeypatch.setattr(turn_routing, "REPLAY_POLL_S", 0.01)
+    """Refusal exposes the exact unsent text and only explicit rescheduling delivers it."""
+    from omnigent.harnesses.claude_native.bridge import (
+        ClaudeModelSwitchRefused,
+        ClaudeModelSwitchResult,
+    )
+
+    collision = refusal.startswith("physical-row-collision")
+    actual_picker = refusal == "post-clear-picker-refusal" or collision
+    prompt = (
+        "abcdefgh\nijklmnop"
+        if collision
+        else "Recover this exact draft: <literal> `message`  "
+        if actual_picker
+        else "hello"
+    )
+    bridge_dir = tmp_path
+    if actual_picker:
+        from omnigent.harnesses.claude_native import bridge
+        from tests.harnesses.claude_native._model_switch_support import (
+            _session_model_bridge,
+            _SessionModelComposer,
+        )
+
+        monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
+        monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path)
+        composer = _SessionModelComposer(draft=prompt)
+        composer.options[-1] = "private-model"
+        bridge_dir = _session_model_bridge(tmp_path, composer)
+        if collision:
+            composer.wrap_columns = 8
+            if refusal == "physical-row-collision":
+                composer.text = "abcdefghijklmnop"
+        else:
+            composer.options[-1] = "different-private-model"
+        composer.install(monkeypatch)
+        if refusal == "physical-row-collision-after-read":
+            captures = 0
+
+            def capture(socket_path: str, target: str, *, join_wrapped: bool = False) -> str:
+                nonlocal captures
+                if not join_wrapped:
+                    captures += 1
+                    if captures == 3:
+                        composer.text = "abcdefghijklmnop"
+                return composer._capture_pane(socket_path, target, join_wrapped=join_wrapped)
+
+            monkeypatch.setattr(bridge, "_capture_pane", capture)
+        monkeypatch.setenv(bridge.REQUEST_SESSION_ID_ENV_VAR, "web-session")
+        actuator = bridge.inject_model_command
+    _mark(bridge_dir)
+    turn_routing.write_pending_replay(
+        bridge_dir, session_id="conv_1", prompt=prompt, blocked_turn_id=None, model="private-model"
+    )
+    pending_before = (bridge_dir / turn_routing.PENDING_FILE).read_bytes()
+    client = _FakeServerClient(fail=notification_fails)
+    refusing = True
+    attempts = 0
+    expected_refusal = refusal
+
+    def select(_bridge: Path, *, model: str, owned_draft: str | None) -> ClaudeModelSwitchResult:
+        nonlocal attempts, expected_refusal
+        attempts += 1
+        if actual_picker:
+            if not refusing:
+                composer.options[-1] = "private-model"
+            try:
+                return actuator(_bridge, model=model, owned_draft=owned_draft)
+            except ClaudeModelSwitchRefused as exc:
+                expected_refusal = str(exc)
+                raise
+        if refusing:
+            raise ClaudeModelSwitchRefused(refusal, unsupported=unsupported)
+        return ClaudeModelSwitchResult(model, model, model, model, "native-session")
+
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge.inject_model_command", select)
+
+    async def replay() -> None:
+        await schedule_replay(
+            "conv_1",
+            prompt=prompt,
+            bridge_dir=bridge_dir,
+            blocked_turn_id=None,
+            server_client=client,
+            harness="claude-native",
+            model="private-model",
+            idle=lambda _: True,
+        )
+
+    await replay()
+    assert attempts == 1
+    assert not client.messages
+    assert (bridge_dir / turn_routing.PENDING_FILE).read_bytes() == pending_before
+    if actual_picker:
+        if collision:
+            assert composer.text == "abcdefghijklmnop"
+            assert composer.sends == []
+            assert composer.submitted == []
+        else:
+            assert composer.text == ""
+            assert composer.submitted == ["/model"]
+        assert composer.model == composer.options[0]
+        assert prompt not in composer.submitted
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_1/events",
+            {
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "error",
+                    "item_data": {
+                        "source": "harness",
+                        "code": "turn_routing_replay_pending",
+                        "level": "info",
+                        "title": "Your message is saved and has not been sent",
+                        "message": (
+                            "Smart Routing could not confirm the requested model. "
+                            + expected_refusal
+                        ),
+                        "remediation": (
+                            "Open Terminal to check the current model and resolve the "
+                            "refusal, then copy and send your saved message below. "
+                            "The saved message will not retry automatically.\n\n"
+                            "Saved message:\n" + prompt
+                        ),
+                    },
+                },
+            },
+        )
+    ]
+    if collision:
+        # The person explicitly clears the replacement before resubmitting the saved text.
+        composer.text = ""
+        composer.cursor = 0
+    refusing = False
+    client.fail = False
+    await replay()
+    assert attempts == 2
+    assert len(client.posts) == 2
+    assert client.messages == [
+        (
+            "/v1/sessions/conv_1/events",
+            {
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": prompt}],
+                },
+                "model_override": "private-model",
+            },
+        )
+    ]
+    assert turn_routing.read_pending_replay(bridge_dir) is None
+
+
+@pytest.mark.parametrize("surface", ["permission", "dialog", "occupied-input"])
+async def test_replay_resumes_after_an_untouched_prompt_is_answered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, surface: str
+) -> None:
+    import threading
+
+    from omnigent.harnesses.claude_native import bridge
+
     _mark(tmp_path)
+    write_pending_replay(
+        tmp_path, session_id="conv_1", prompt="hello", blocked_turn_id=None, model="private-model"
+    )
     client = _FakeServerClient()
+    refused = asyncio.Event()
+    answered = threading.Event()
+    loop = asyncio.get_running_loop()
+    selections: list[str | None] = []
 
-    def _boom(
-        _bridge_dir: Path,
-        *,
-        command: str,
-        auto_confirm: bool = False,
-        confirm_hint: str | None = None,
-    ) -> None:
-        del command, auto_confirm, confirm_hint
-        raise RuntimeError("tmux target is not advertised")
+    def select(
+        _bridge: Path, *, model: str, owned_draft: str | None
+    ) -> bridge.ClaudeModelSwitchResult:
+        assert not client.posts
+        selections.append(owned_draft)
+        if not answered.is_set():
+            loop.call_soon_threadsafe(refused.set)
+            if surface == "permission":
+                raise bridge.ClaudeUserPromptPending("Answer the question", nothing_typed=True)
+            if surface == "occupied-input":
+                raise bridge.ClaudeInputBoxOccupied(
+                    "Leave the prompt-history search", surface="the prompt-history search"
+                )
+            raise bridge.ClaudeTerminalDialog("Answer the terminal dialog", awaits_answer=True)
+        return bridge.ClaudeModelSwitchResult(model, model, model, model, "native-session")
 
-    monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.bridge.inject_slash_command", _boom, raising=False
+    async def answer() -> None:
+        await refused.wait()
+        assert not client.posts
+        assert read_pending_replay(tmp_path) is not None
+        answered.set()
+
+    monkeypatch.setattr(bridge, "inject_model_command", select)
+    answer_task = asyncio.create_task(answer())
+    await asyncio.wait_for(
+        schedule_replay(
+            "conv_1",
+            prompt="hello",
+            bridge_dir=tmp_path,
+            blocked_turn_id=None,
+            server_client=client,
+            harness="claude-native",
+            model="private-model",
+            idle=lambda _: True,
+        ),
+        timeout=2,
     )
-    monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.bridge.read_model_env",
-        lambda _dir: {"ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-sonnet-5"},
-    )
+    await answer_task
 
-    await schedule_replay(
+    assert selections == ["hello", "hello"]
+    assert len(client.posts) == 1
+    assert client.posts[0][1]["model_override"] == "private-model"
+    assert read_pending_replay(tmp_path) is None
+
+
+async def test_replay_hold_does_not_authorize_delivery_without_a_fresh_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.harnesses.claude_native import bridge
+
+    _mark(tmp_path)
+    write_pending_replay(
+        tmp_path, session_id="conv_1", prompt="hello", blocked_turn_id=None, model="private-model"
+    )
+    client = _FakeServerClient()
+    attempts = 0
+
+    def select(_bridge: Path, **kwargs: object) -> bridge.ClaudeModelSwitchResult:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise bridge.ClaudeUserPromptPending("Answer the question", nothing_typed=True)
+        return bridge.ClaudeModelSwitchResult("another-model", "other", "other", "other", "native")
+
+    monkeypatch.setattr(bridge, "inject_model_command", select)
+    await asyncio.wait_for(
+        schedule_replay(
+            "conv_1",
+            prompt="hello",
+            bridge_dir=tmp_path,
+            blocked_turn_id=None,
+            server_client=client,
+            harness="claude-native",
+            model="private-model",
+            idle=lambda _: True,
+        ),
+        timeout=2,
+    )
+    assert attempts == 2
+    assert not client.messages
+    assert read_pending_replay(tmp_path) is not None
+
+
+async def test_replay_deduplicates_an_already_scheduled_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    from omnigent.harnesses.claude_native import bridge
+
+    _mark(tmp_path)
+    write_pending_replay(
+        tmp_path, session_id="conv_1", prompt="hello", blocked_turn_id=None, model="private-model"
+    )
+    client = _FakeServerClient()
+    entered = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    attempts = 0
+
+    def select(_bridge: Path, *, model: str, **kwargs: object) -> bridge.ClaudeModelSwitchResult:
+        nonlocal attempts
+        attempts += 1
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(timeout=2)
+        return bridge.ClaudeModelSwitchResult(model, model, model, model, "native-session")
+
+    def replay() -> asyncio.Task[None]:
+        return schedule_replay(
+            "conv_1",
+            prompt="hello",
+            bridge_dir=tmp_path,
+            blocked_turn_id=None,
+            server_client=client,
+            harness="claude-native",
+            model="private-model",
+            idle=lambda _: True,
+        )
+
+    monkeypatch.setattr(bridge, "inject_model_command", select)
+    first = replay()
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    second = replay()
+    release.set()
+    await asyncio.wait_for(asyncio.gather(first, second), timeout=2)
+    assert attempts == 1
+    assert len(client.posts) == 1
+    assert read_pending_replay(tmp_path) is None
+
+
+async def test_replay_hold_keeps_a_replacement_pending_prompt_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.harnesses.claude_native import bridge
+
+    _mark(tmp_path)
+    write_pending_replay(
+        tmp_path, session_id="conv_1", prompt="hello", blocked_turn_id=None, model="private-model"
+    )
+    client = _FakeServerClient()
+    attempts = 0
+
+    def select(_bridge: Path, **kwargs: object) -> bridge.ClaudeModelSwitchResult:
+        nonlocal attempts
+        attempts += 1
+        write_pending_replay(
+            tmp_path,
+            session_id="conv_1",
+            prompt="replacement",
+            blocked_turn_id=None,
+            model="private-model",
+        )
+        raise bridge.ClaudeUserPromptPending("Answer the question", nothing_typed=True)
+
+    monkeypatch.setattr(bridge, "inject_model_command", select)
+    await asyncio.wait_for(
+        schedule_replay(
+            "conv_1",
+            prompt="hello",
+            bridge_dir=tmp_path,
+            blocked_turn_id=None,
+            server_client=client,
+            harness="claude-native",
+            model="private-model",
+            idle=lambda _: True,
+        ),
+        timeout=2,
+    )
+    assert attempts == 1
+    assert not client.posts
+    pending = read_pending_replay(tmp_path)
+    assert pending is not None and pending.prompt == "replacement"
+
+
+@pytest.mark.parametrize(
+    ("hold_s", "cancel"),
+    [(0, False), (30, False), (30, True)],
+    ids=["zero-budget", "resumed-worker", "task-cancellation"],
+)
+async def test_replay_hold_expires_without_sending_or_discarding_the_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hold_s: int, cancel: bool
+) -> None:
+    import threading
+    from types import SimpleNamespace
+
+    from omnigent.harnesses.claude_native import bridge
+
+    _mark(tmp_path)
+    write_pending_replay(
+        tmp_path, session_id="conv_1", prompt="hello", blocked_turn_id=None, model="private-model"
+    )
+    pending_before = read_pending_replay(tmp_path)
+    assert pending_before is not None
+    pending_bytes = (tmp_path / turn_routing.PENDING_FILE).read_bytes()
+    client = _FakeServerClient()
+    loop = asyncio.get_running_loop()
+    clock = SimpleNamespace(now=0.0)
+    resumed = asyncio.Event()
+    cleaning = asyncio.Event()
+    expire = threading.Event()
+    release = threading.Event()
+    drained = threading.Event()
+    keys: list[str] = []
+    attempts = 0
+
+    def select(_bridge: Path, **kwargs: object) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise bridge.ClaudeUserPromptPending("Answer the question", nothing_typed=True)
+        assert attempts == 2
+        try:
+            deadline = bridge._INJECTION_CANCEL_EVENT.get()
+            assert isinstance(deadline, bridge.ModelSwitchDeadline)
+            assert not deadline.is_set()
+            loop.call_soon_threadsafe(resumed.set)
+            assert expire.wait(timeout=2)
+            bridge._check_injection_cancelled()
+            keys.append("late control")
+            raise AssertionError("the resumed worker ignored its expired or cancelled hold")
+        finally:
+            loop.call_soon_threadsafe(cleaning.set)
+            assert release.wait(timeout=2)
+            drained.set()
+
+    monkeypatch.setattr(bridge, "inject_model_command", select)
+    monkeypatch.setattr(bridge, "CLAUDE_INPUT_HOLD_S", hold_s)
+    monkeypatch.setattr(turn_routing, "REPLAY_POLL_S", 0)
+    # Advance the worker's deadline clock without changing asyncio's timers.
+    monkeypatch.setattr(turn_routing, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    replay = schedule_replay(
         "conv_1",
         prompt="hello",
         bridge_dir=tmp_path,
         blocked_turn_id=None,
         server_client=client,
         harness="claude-native",
-        model="databricks-claude-sonnet-5",
-        idle=lambda _turn: True,
+        model="private-model",
+        idle=lambda _: True,
     )
-
-    assert len(client.posts) == 1
-
-
-async def test_replay_skips_the_switch_for_an_unspeakable_model(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    A model this pane has no ``/model`` spelling for is left alone.
-
-    Typing a value the CLI will not take leaves the pane on its old model
-    while the recorded decision claims the routed one.
-    """
-    monkeypatch.setattr(turn_routing, "REPLAY_MARKER_WAIT_S", 1.0)
-    monkeypatch.setattr(turn_routing, "REPLAY_POLL_S", 0.01)
-    _mark(tmp_path)
-    client = _FakeServerClient()
-    monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.bridge.inject_slash_command",
-        lambda *a, **k: pytest.fail("must not touch the pane"),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.bridge.read_model_env",
-        lambda _dir: {"ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-sonnet-5"},
-    )
-
-    await schedule_replay(
-        "conv_1",
-        prompt="hello",
-        bridge_dir=tmp_path,
-        blocked_turn_id=None,
-        server_client=client,
-        harness="claude-native",
-        model="databricks-claude-opus-4-8",
-        idle=lambda _turn: True,
-    )
-
-    assert len(client.posts) == 1
+    try:
+        if hold_s:
+            await asyncio.wait_for(resumed.wait(), timeout=2)
+            if cancel:
+                replay.cancel()
+                await asyncio.sleep(0)
+                assert not replay.done(), "cancellation returned before its worker drained"
+            else:
+                clock.now += hold_s
+            expire.set()
+            await asyncio.wait_for(cleaning.wait(), timeout=2)
+            await asyncio.sleep(0)
+            assert not replay.done(), "replay returned before its worker drained"
+            assert not drained.is_set()
+            assert not client.posts
+            assert read_pending_replay(tmp_path) == pending_before
+            assert (tmp_path / turn_routing.PENDING_FILE).read_bytes() == pending_bytes
+            release.set()
+        if cancel:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(replay, timeout=2)
+        else:
+            await asyncio.wait_for(replay, timeout=2)
+    finally:
+        expire.set()
+        release.set()
+        if not replay.done():
+            await asyncio.wait_for(replay, timeout=2)
+    assert attempts == (2 if hold_s else 1)
+    assert drained.is_set() is bool(hold_s)
+    assert not client.messages
+    assert keys == []
+    assert read_pending_replay(tmp_path) == pending_before
+    assert (tmp_path / turn_routing.PENDING_FILE).read_bytes() == pending_bytes
 
 
 async def test_replay_leaves_the_model_alone_for_codex(
@@ -1147,9 +1582,8 @@ async def test_replay_leaves_the_model_alone_for_codex(
     _mark(tmp_path)
     client = _FakeServerClient()
     monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.bridge.inject_slash_command",
+        "omnigent.harnesses.claude_native.bridge.inject_model_command",
         lambda *a, **k: pytest.fail("codex must not drive the claude pane"),
-        raising=False,
     )
 
     await schedule_replay(
@@ -1188,31 +1622,46 @@ async def test_server_relay_hands_the_routed_model_to_the_replay(
     assert armed[0]["harness"] == "claude-native"
 
 
-async def test_replay_skips_the_switch_when_the_pane_is_already_there(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("receipt_model", "legacy"),
+    [
+        pytest.param("private-model", False, id="session-only-private-model"),
+        pytest.param("another-model", False, id="session-only-another-model"),
+        pytest.param("private-model", True, id="legacy-private-model"),
+        pytest.param("another-model", True, id="legacy-another-model"),
+        pytest.param(None, False, id="missing-receipt"),
+    ],
+)
+async def test_replay_requires_a_matching_model_selection_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, receipt_model: str | None, legacy: bool
 ) -> None:
-    """
-    A pane already on the routed model gets no ``/model`` echo.
+    from omnigent.harnesses.claude_native.bridge import (
+        ClaudeLegacyModelSwitchResult,
+        ClaudeModelSwitchResult,
+    )
 
-    Block-and-replay puts that echo ahead of the session's very first turn,
-    where weak models have been observed refusing the replayed prompt, so a
-    redundant switch is worth not typing.
-    """
-    monkeypatch.setattr(turn_routing, "REPLAY_MARKER_WAIT_S", 1.0)
-    monkeypatch.setattr(turn_routing, "REPLAY_POLL_S", 0.01)
     _mark(tmp_path)
+    turn_routing.write_pending_replay(
+        tmp_path, session_id="conv_1", prompt="hello", blocked_turn_id=None, model="private-model"
+    )
     client = _FakeServerClient()
-    monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.bridge.read_claude_status_model",
-        lambda _dir: "databricks-claude-sonnet-5",
-    )
-    monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.bridge.inject_slash_command",
-        lambda *a, **k: pytest.fail("no switch when the pane is already on it"),
-        raising=False,
-    )
+    checked: list[str] = []
 
+    def select(
+        _bridge: Path, *, model: str, **kwargs: object
+    ) -> ClaudeModelSwitchResult | ClaudeLegacyModelSwitchResult | None:
+        checked.append(model)
+        return (
+            None
+            if receipt_model is None
+            else ClaudeLegacyModelSwitchResult(receipt_model, receipt_model)
+            if legacy
+            else ClaudeModelSwitchResult(
+                receipt_model, receipt_model, receipt_model, receipt_model, "native-session", True
+            )
+        )
+
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge.inject_model_command", select)
     await schedule_replay(
         "conv_1",
         prompt="hello",
@@ -1220,11 +1669,15 @@ async def test_replay_skips_the_switch_when_the_pane_is_already_there(
         blocked_turn_id=None,
         server_client=client,
         harness="claude-native",
-        model="databricks-claude-sonnet-5",
-        idle=lambda _turn: True,
+        model="private-model",
+        idle=lambda _: True,
     )
 
-    assert len(client.posts) == 1
+    assert checked == ["private-model"]
+    assert len(client.messages) == (1 if receipt_model == "private-model" else 0)
+    assert (turn_routing.read_pending_replay(tmp_path) is None) is (
+        receipt_model == "private-model"
+    )
 
 
 # ── Timeout ladder ──────────────────────────────────────────────────

@@ -16,11 +16,11 @@ What is scored:
   it blocks the prompt, the model is switched while nothing is running, and the
   runner replays the captured prompt. The block notice must appear **once** —
   twice means the replay itself was routed again.
-* **The switch actually lands.** The apply layer types ``/model <id>``, so the
-  pane must report the switch before the replay runs. Claude Code answers that
-  form by also rewriting the ``model`` key in the developer's own
-  ``~/.claude/settings.json`` — an accepted trade-off — so everything *else* in
-  that file must be unchanged.
+* **The switch actually lands.** The apply layer selects the model through
+  Claude's session-only picker action, and the pane must confirm it before
+  replay. On supported stable CLIs, session-only selection leaves the saved
+  default unchanged, and this comparison includes it. Older or unverified CLIs
+  retain their existing model-setting behavior.
 * **One decision, one turn.** A leaked replay shows up as two user messages for
   one thing typed.
 * **The second prompt fast-skips.** Turn 2 must issue **zero** routing calls —
@@ -40,7 +40,9 @@ from omnigent.runner.turn_routing import MARKER_FILE
 from tests.e2e.routing._helpers import (
     capture_pane,
     claude_bridge_dir,
-    claude_settings_apart_from_the_model,
+    claude_settings_snapshot,
+    claude_settings_unchanged,
+    claude_user_settings_path,
     decisions,
     same_arm,
     settle,
@@ -104,6 +106,7 @@ def _wait_for_pane_ready(socket_path: str, target: str) -> None:
 def test_claude_routes_the_first_typed_message_exactly_once(
     routing_client: httpx.Client,
     routing_host: str,
+    routing_claude_settings_env: dict[str, str],
     routing_arms: object,
     mock_router: MockRouter,
     type_into_tui: Callable[[str, str, str], None],
@@ -111,8 +114,9 @@ def test_claude_routes_the_first_typed_message_exactly_once(
 ) -> None:
     require_tmux()
     routing_arms("claude-native")  # type: ignore[operator]
-    settings_before = claude_settings_apart_from_the_model()
     workspace = trusted_workspace(tmp_path, "claude_hook_ws")
+    settings_path = claude_user_settings_path(workspace, routing_claude_settings_env)
+    settings_before = claude_settings_snapshot(settings_path)
 
     # A BARE routed create: Smart Routing on, no prompt, so nothing is routed
     # yet and the pick is left to the in-harness hook.
@@ -190,7 +194,6 @@ def test_claude_routes_the_first_typed_message_exactly_once(
         "turn 2's prompt reached the router; the fast skip must be free"
     )
 
-    assert claude_settings_apart_from_the_model() == settings_before, (
-        "~/.claude/settings.json changed beyond its `model` key — `/model <id>` "
-        "may move Claude Code's own default, nothing else"
+    assert claude_settings_unchanged(settings_path, settings_before, session_id), (
+        f"{settings_path} changed fields promised by the running CLI version"
     )

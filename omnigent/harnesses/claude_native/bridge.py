@@ -58,7 +58,7 @@ import unicodedata
 import urllib.parse
 from collections.abc import Awaitable, Callable, Collection, Iterator, Mapping, Sequence
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from http import HTTPStatus
 from http.client import HTTPConnection, HTTPException
@@ -78,6 +78,15 @@ from omnigent.harnesses.claude_native import (
 )
 from omnigent.harnesses.claude_native.failure_telemetry import claude_failure_context
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
+from omnigent.harnesses.claude_native.model_switch import (
+    ClaudeLegacyModelPane,
+    ClaudeLegacyModelSwitchResult,
+    ClaudeModelSwitchRefused,
+    ClaudeModelSwitchResult,
+    ModelSwitchDeadline,
+    SessionOnlyModelSwitch,
+    supports_session_only_model_switch,
+)
 from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
 from omnigent.harnesses.claude_native.submit_verification import (
     SubmitBoundary,
@@ -166,7 +175,9 @@ def _cancellable_injection_lock(lock: threading.Lock | FileLock) -> Iterator[Non
         lock.release()
 
 
-def _serialize_bridge_injection(function: _InjectionFunction) -> _InjectionFunction:
+def _serialize_bridge_injection(
+    function: _InjectionFunction, *, recover_composer_height: bool = True
+) -> _InjectionFunction:
     """Serialize complete tmux injection operations across threads and processes."""
 
     @functools.wraps(function)
@@ -178,6 +189,8 @@ def _serialize_bridge_injection(function: _InjectionFunction) -> _InjectionFunct
             try:
                 return function(bridge_dir, *args, **kwargs)
             except ClaudeComposerNotCleared:
+                if not recover_composer_height:
+                    raise
                 # The refused paste sent nothing. Give a clipped composer room,
                 # then recheck readiness and pending prompts before retrying.
                 info = _wait_for_tmux_info(bridge_dir, timeout_s=_TMUX_READY_TIMEOUT_S)
@@ -188,6 +201,10 @@ def _serialize_bridge_injection(function: _InjectionFunction) -> _InjectionFunct
                     return function(bridge_dir, *args, **kwargs)
 
     return cast(_InjectionFunction, wrapped)
+
+
+def _serialize_model_injection(function: _InjectionFunction) -> _InjectionFunction:
+    return _serialize_bridge_injection(function, recover_composer_height=False)
 
 
 # Bind/advertise coordinates for the bridge's HTTP servers (the tool relay and
@@ -482,8 +499,7 @@ _MODE_CYCLE_MAX_PRESSES = 8
 _MODE_FOOTER_SETTLE_TIMEOUT_S = 2.0
 _MODE_FOOTER_POLL_INTERVAL_S = 0.1
 # Footer Claude Code's interactive ``/model`` picker renders while it is open.
-# Omnigent never drives that picker — it switches with ``/model <id>`` — but a
-# picker the person opened by hand covers the input box, so an injection would
+# A picker the person opened by hand covers the input box, so an injection would
 # be lost; the readiness gate treats it as "not ready".
 _MODEL_PICKER_OPEN_HINT = "use this session only"
 # How long to keep dismissing an occupying surface that verifiably stays on
@@ -787,6 +803,21 @@ class ClaudeMessageNotAccepted(RuntimeError):
 
 class ClaudeComposerNotCleared(ClaudeMessageNotAccepted):
     """A draft left in Claude's input box could not be cleared, so nothing was sent."""
+
+
+# Finish a held delivery before the server's 600 s pending-input lifetime ends.
+CLAUDE_INPUT_HOLD_S = 8 * 60.0
+
+
+def can_hold_input_refusal(
+    exc: ClaudeUserPromptPending | ClaudeTerminalDialog | ClaudeComposerNotCleared,
+) -> bool:
+    """Only refusals before typing can safely resume the same delivery."""
+    if isinstance(exc, ClaudeUserPromptPending):
+        return exc.nothing_typed
+    if isinstance(exc, ClaudeTerminalDialog):
+        return isinstance(exc, ClaudeInputBoxOccupied) or exc.awaits_answer
+    return True
 
 
 class ClaudeSubmitBlockedUnconfirmed(RuntimeError):
@@ -1891,6 +1922,7 @@ def prepare_bridge_dir(
     launch_model: str | None = None,
     launch_env: Mapping[str, str] | None = None,
     picker_values: Sequence[str] | None = None,
+    picker_options: Sequence[Mapping[str, object]] | None = None,
 ) -> Path:
     """
     Create or refresh the bridge directory for a native Claude session.
@@ -1917,6 +1949,8 @@ def prepare_bridge_dir(
         offers, e.g. ``["system.ai.glm-5-3"]``. Persisted for the same
         translation: a gateway-managed picker names rows by served id, and
         no pin spells those.
+    :param picker_options: Actual picker descriptors with raw display labels
+        and provenance, excluding synthesized default catalog rows.
     :returns: Bridge directory path.
     """
     resolved_bridge_id = bridge_id or conversation_id
@@ -1952,6 +1986,8 @@ def prepare_bridge_dir(
             payload["model_env"] = model_env
         if picker_values is not None:
             payload["model_picker_values"] = list(picker_values)
+        if picker_options is not None:
+            payload["model_picker_options"] = [dict(option) for option in picker_options]
         _write_json_file(bridge_dir / _CONFIG_FILE, payload)
         if previous_session_id != conversation_id:
             # A window opened for another session must not answer this one's hooks.
@@ -2294,12 +2330,22 @@ def read_model_picker_values(bridge_dir: Path) -> list[str]:
     return [value for value in values if isinstance(value, str) and value]
 
 
+def read_model_picker_options(bridge_dir: Path) -> list[dict[str, object]] | None:
+    """Read actual picker descriptors; ``None`` means an older unknown catalog."""
+    config = _read_json_file(bridge_dir / _CONFIG_FILE)
+    options = config.get("model_picker_options") if isinstance(config, dict) else None
+    if not isinstance(options, list):
+        return None
+    return [option for option in options if isinstance(option, dict)]
+
+
 def record_model_vocabulary(
     bridge_dir: Path,
     *,
     launch_env: Mapping[str, str] | None,
     launch_model: str | None,
     picker_values: Sequence[str] | None = None,
+    picker_options: Sequence[Mapping[str, object]] | None = None,
 ) -> None:
     """
     Persist the launch's model vocabulary after the bridge dir exists.
@@ -2318,6 +2364,8 @@ def record_model_vocabulary(
         ``None``.
     :param picker_values: The ``/model`` spellings this session's picker
         offers, or ``None`` when the catalog is unknown. An empty list clears it.
+    :param picker_options: Actual picker descriptors, including raw labels and
+        provenance. An empty list clears previously recorded descriptors.
     :returns: None.
     """
     # Read-modify-write under the bridge dir's cross-process lock so a
@@ -2343,10 +2391,16 @@ def record_model_vocabulary(
         if picker_values is not None and config.get("model_picker_values") != list(picker_values):
             config["model_picker_values"] = list(picker_values)
             changed = True
+        if picker_options is not None and config.get("model_picker_options") != list(
+            picker_options
+        ):
+            config["model_picker_options"] = [dict(option) for option in picker_options]
+            changed = True
         if launch_model and config.get("launch_model") != launch_model:
             config["launch_model"] = launch_model
             changed = True
         if changed:
+            _check_injection_cancelled()
             _write_json_file(bridge_dir / _CONFIG_FILE, config)
 
 
@@ -2357,7 +2411,9 @@ def _bridge_metadata_write_lock(bridge_dir: Path) -> Iterator[None]:
     Shares bridge-dir preparation's on-disk lock, so metadata updates and
     :func:`prepare_bridge_dir` exclude each other across processes.
     """
-    with native_bridge_common.bridge_dir_preparation_lock(bridge_dir):
+    with native_bridge_common.bridge_dir_preparation_lock(
+        bridge_dir, check_cancelled=_check_injection_cancelled
+    ):
         yield
 
 
@@ -5627,6 +5683,300 @@ def wait_for_input_ready(
     )
 
 
+def inject_model_command(
+    bridge_dir: Path,
+    *,
+    model: str,
+    timeout_s: float = _TMUX_READY_TIMEOUT_S,
+    ready_timeout_s: float | None = None,
+    owned_draft: str | None = None,
+    legacy_literal_model: bool = False,
+) -> ClaudeModelSwitchResult | ClaudeLegacyModelSwitchResult:
+    """Use session-only selection, or a legacy command when its session needs a change.
+
+    The session-only path clears only the exact ``owned_draft`` whose routing
+    hook proved it blocked. The timeout covers lock waits and every step;
+    this function never sends the dependent prompt.
+    Older or unverified CLIs keep matching, identity-bound status unchanged;
+    actual legacy selections retain their default-changing command behavior.
+    """
+    deadline = ModelSwitchDeadline(timeout_s, _INJECTION_CANCEL_EVENT.get(), time.monotonic)
+    transaction = SessionOnlyModelSwitch(
+        bridge_dir,
+        model=model,
+        deadline=deadline,
+        ready_timeout_s=ready_timeout_s,
+        owned_draft=owned_draft,
+    )
+    try:
+        with cancellable_injection(deadline):
+            raw = _read_json_file(bridge_dir / CONTEXT_RAW_FILE) or {}
+            if not supports_session_only_model_switch(raw.get("version")):
+                return _inject_legacy_model_command_locked(
+                    bridge_dir, transaction, literal_model=legacy_literal_model
+                )
+            return _inject_model_command_locked(bridge_dir, transaction)
+    except ClaudeInjectionCancelled as exc:
+        raise transaction.refuse(
+            "Claude's model switch was cancelled; the prompt was not sent."
+        ) from exc
+
+
+@_serialize_model_injection
+def _inject_model_command_locked(
+    bridge_dir: Path, transaction: SessionOnlyModelSwitch
+) -> ClaudeModelSwitchResult:
+    del bridge_dir
+    return transaction.run()
+
+
+@_serialize_bridge_injection
+def _inject_legacy_model_command_locked(
+    bridge_dir: Path, transaction: SessionOnlyModelSwitch, *, literal_model: bool = False
+) -> ClaudeLegacyModelSwitchResult:
+    from omnigent.harnesses.claude_native.model_switch import _target
+    from omnigent.models.claude_model_vocabulary import (
+        CLAUDE_MODEL_ALIASES,
+        alias_pins,
+        claude_model_command_arg,
+    )
+
+    raw = _read_json_file(bridge_dir / CONTEXT_RAW_FILE) or {}
+    version = raw.get("version")
+    if supports_session_only_model_switch(version):
+        raise transaction.refuse(
+            "Claude Code's version changed while waiting for model selection. Retry explicitly."
+        )
+    model_env = read_model_env(bridge_dir)
+    model_arg = (
+        transaction.model
+        if literal_model
+        else claude_model_command_arg(
+            transaction.model,
+            model_env,
+            picker_values=read_model_picker_values(bridge_dir),
+        )
+    )
+    if (
+        model_arg is None
+        or not model_arg
+        or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in model_arg)
+    ):
+        raise transaction.refuse(
+            f"This Claude terminal has no /model spelling for {transaction.model}.",
+            unsupported=True,
+        )
+    transaction.phase = "legacy"
+    _wait_for_tmux_info(bridge_dir, timeout_s=transaction.deadline.remaining_s())
+    origin = _legacy_model_pane(bridge_dir)
+    if origin is None:
+        raise transaction.refuse(
+            "Claude's terminal changed before model selection. Retry explicitly."
+        )
+
+    def revalidate_version() -> None:
+        current = _read_json_file(bridge_dir / CONTEXT_RAW_FILE) or {}
+        if supports_session_only_model_switch(current.get("version")):
+            raise transaction.refuse(
+                "Claude Code's version changed while waiting for model selection. "
+                "Retry explicitly."
+            )
+        if _legacy_model_pane(bridge_dir) != origin:
+            raise transaction.refuse(
+                "Claude's terminal or session changed during model selection. Retry explicitly."
+            )
+
+    def submitting() -> None:
+        revalidate_version()
+        transaction.submitted = True
+        transaction.commit_attempted = True
+
+    revalidate_version()
+    current = _read_json_file(bridge_dir / CONTEXT_RAW_FILE) or {}
+    reported = current.get("model")
+    current_model = reported.get("id") if isinstance(reported, dict) else None
+    alias = transaction.model.lower().removesuffix("[1m]")
+    pinned = alias_pins(model_env).get(alias) if not literal_model else None
+    expected_model = pinned or transaction.model
+    if transaction.model.lower().endswith("[1m]") and not expected_model.lower().endswith("[1m]"):
+        expected_model += "[1m]"
+    can_match = literal_model or alias not in CLAUDE_MODEL_ALIASES or pinned is not None
+    same_model = can_match and _legacy_model_status_matches(expected_model, current_model)
+    if (
+        origin.active_session_id is not None
+        and origin.session_id is not None
+        and current.get("session_id") == origin.session_id
+        and same_model
+    ):
+        _check_injection_cancelled()
+        state = _claude_pane_state(origin.socket_path, origin.tmux_target)
+        revalidate_version()
+        _check_injection_cancelled()
+        if state.exited:
+            raise ClaudeTerminalExited(
+                "Claude Code's terminal exited before the dependent prompt was sent.",
+                exit_status=state.exit_status,
+            )
+        return ClaudeLegacyModelSwitchResult(
+            transaction.model, model_arg, origin, already_selected=True
+        )
+
+    confirmation_model = expected_model if can_match else None
+    confirmation_label = None
+    try:
+        choice = _target(
+            transaction.model,
+            read_model_picker_options(bridge_dir),
+            read_model_picker_values(bridge_dir),
+            model_env,
+        )
+    except ClaudeModelSwitchRefused:
+        pass
+    else:
+        if literal_model or choice.model.lower().removesuffix("[1m]") not in (
+            *CLAUDE_MODEL_ALIASES,
+            "default",
+            "opusplan",
+        ):
+            confirmation_model = choice.model
+            confirmation_label = choice.confirmation_label
+    receipt = ClaudeLegacyModelSwitchResult(
+        transaction.model,
+        model_arg,
+        origin,
+        confirmation_model=confirmation_model,
+        confirmation_label=confirmation_label,
+    )
+    _logger.warning(
+        "Claude Code version %r uses legacy /model submission; "
+        "the command may also change the saved default",
+        version,
+    )
+    try:
+        _inject_slash_command_locked(
+            bridge_dir,
+            command=f"/model {model_arg}",
+            timeout_s=transaction.deadline.remaining_s(),
+            ready_timeout_s=transaction.ready_timeout_s,
+            before_edit=revalidate_version,
+            before_submit=submitting,
+        )
+        until = min(time.monotonic() + _CONFIRM_DIALOG_TIMEOUT_S, transaction.deadline.at)
+        while True:
+            if _confirm_legacy_model_dialog_locked(bridge_dir, receipt=receipt) is not False:
+                return receipt
+            remaining = until - time.monotonic()
+            if remaining <= 0:
+                return replace(receipt, confirmation_pending=True)
+            time.sleep(min(_CLAUDE_READY_POLL_INTERVAL_S, remaining))
+    except (RuntimeError, ValueError, OSError) as exc:
+        if transaction.submitted:
+            raise transaction.refuse(
+                "Claude's legacy model command may have changed the model and saved default. "
+                "Check the terminal before retrying; the dependent prompt was not sent."
+            ) from exc
+        raise
+
+
+def _legacy_model_status_matches(expected: str, actual: object) -> bool:
+    """Match a fixed concrete target without inferring an alias or private identity."""
+    from omnigent.models.claude_model_vocabulary import public_claude_model_id
+
+    if not isinstance(actual, str):
+        return False
+    canonical = public_claude_model_id(expected)
+    return actual == expected or (
+        canonical is not None
+        and public_claude_model_id(actual) == canonical
+        and actual.lower().endswith("[1m]") == expected.lower().endswith("[1m]")
+    )
+
+
+def _legacy_model_pane(bridge_dir: Path) -> ClaudeLegacyModelPane | None:
+    info = read_tmux_target(bridge_dir)
+    if info is None:
+        return None
+    try:
+        advertised = (bridge_dir / _TMUX_FILE).stat()
+    except OSError:
+        return None
+    return ClaudeLegacyModelPane(
+        info["socket_path"],
+        info["tmux_target"],
+        read_active_session_id(bridge_dir),
+        read_claude_session_id(bridge_dir),
+        (advertised.st_ino, advertised.st_mtime_ns),
+    )
+
+
+@_serialize_model_injection
+def confirm_legacy_model_dialog(
+    bridge_dir: Path, *, receipt: ClaudeLegacyModelSwitchResult
+) -> bool | None:
+    """Confirm a queued command's visible dialog; None ends an obsolete watch."""
+    if receipt.pane is None or _legacy_model_pane(bridge_dir) != receipt.pane:
+        return None
+    if not receipt.confirmation_pending:
+        return True
+    return _confirm_legacy_model_dialog_locked(bridge_dir, receipt=receipt)
+
+
+def _confirm_legacy_model_dialog_locked(
+    bridge_dir: Path, *, receipt: ClaudeLegacyModelSwitchResult
+) -> bool | None:
+    """Keep immediate and delayed confirmations bound to the submitted target."""
+    from omnigent.harnesses.claude_native.model_switch import (
+        _cache_cost_confirmation,
+        _model_control_surface,
+    )
+
+    origin = receipt.pane
+
+    def require_origin() -> None:
+        if origin is None or _legacy_model_pane(bridge_dir) != origin:
+            raise ClaudeModelSwitchRefused(
+                "The legacy model command's terminal or session changed."
+            )
+
+    if origin is None or _legacy_model_pane(bridge_dir) != origin:
+        return None
+    if receipt.already_selected:
+        return True
+    status = read_claude_status_model(bridge_dir)
+    if status in (receipt.requested_model, receipt.picker_value) or (
+        receipt.confirmation_model is not None
+        and _legacy_model_status_matches(receipt.confirmation_model, status)
+    ):
+        return True
+    label = receipt.confirmation_label
+    if label is None:
+        return None
+    pane = _capture_pane(origin.socket_path, origin.tmux_target)
+    require_origin()
+    _raise_if_user_prompt_pending(bridge_dir, pane)
+    if not _cache_cost_confirmation(pane, label, yes_selected=True):
+        return None if _model_control_surface(pane) is not None else False
+
+    def require_owned_dialog() -> None:
+        require_origin()
+        latest = _capture_pane(origin.socket_path, origin.tmux_target)
+        require_origin()
+        _raise_if_user_prompt_pending(bridge_dir, latest)
+        if not _cache_cost_confirmation(latest, label, yes_selected=True):
+            raise ClaudeModelSwitchRefused(
+                "The legacy model command's confirmation changed; it was left untouched."
+            )
+
+    _confirm_and_verify_dialog_closed(
+        origin.socket_path,
+        origin.tmux_target,
+        hint=SWITCH_MODEL_DIALOG_HINT,
+        bridge_dir=bridge_dir,
+        before_confirm=require_owned_dialog,
+    )
+    return True
+
+
 @_serialize_bridge_injection
 def inject_slash_command(
     bridge_dir: Path,
@@ -5681,6 +6031,39 @@ def inject_slash_command(
         if a ``tmux send-keys`` invocation fails, if the typed
         command verifiably never left the input box (submit swallowed).
     """
+    _require_legacy_model_command(bridge_dir, command)
+    _inject_slash_command_locked(
+        bridge_dir,
+        command=command,
+        timeout_s=timeout_s,
+        auto_confirm=auto_confirm,
+        confirm_hint=confirm_hint,
+        ready_timeout_s=ready_timeout_s,
+    )
+
+
+def _require_legacy_model_command(bridge_dir: Path, command: str) -> None:
+    if not re.match(r"^/model\s+\S", command):
+        return
+    raw = _read_json_file(bridge_dir / CONTEXT_RAW_FILE) or {}
+    if supports_session_only_model_switch(raw.get("version")):
+        raise ClaudeModelSwitchRefused(
+            "Automated model selections must use the session-only picker."
+        )
+
+
+def _inject_slash_command_locked(
+    bridge_dir: Path,
+    *,
+    command: str,
+    timeout_s: float,
+    auto_confirm: bool = False,
+    confirm_hint: str | None = None,
+    ready_timeout_s: float | None = None,
+    before_edit: Callable[[], None] | None = None,
+    before_submit: Callable[[], None] | None = None,
+) -> None:
+    """Submit a slash command while the caller owns both bridge injection locks."""
     if not command or not command.startswith("/"):
         raise ValueError(f"slash command must start with '/'; got {command!r}")
     if "\n" in command:
@@ -5708,17 +6091,16 @@ def inject_slash_command(
             "Answer the pending Claude question or permission request before changing settings.",
             nothing_typed=True,
         )
-    # Clear any draft the user is mid-typing; otherwise the command below
-    # concatenates with their text and Enter submits
-    # ``<their-draft>/effort high`` as a turn. Unlike Escape it does
-    # not interrupt an in-flight generation.
+    if before_edit is not None:
+        before_edit()
+    _require_legacy_model_command(bridge_dir, command)
+    # Clear the user's draft so the command is not appended to it.
+    # Unlike Escape, this leaves an in-flight generation running.
     _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
     # ``-l`` pastes ``/`` and spaces literally; trailing Enter submits.
     _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, command)
-    # Same delivery hazards as inject_user_message: a coalesced or dropped
-    # Enter leaves the command drafted while the persisted session value
-    # claims it applied. Wait for the command to render, submit, verify it
-    # left the box; an unidentifiable draft falls through to a blind submit.
+    # A dropped Enter can leave the command drafted: wait for rendering, submit,
+    # and verify it left the box. An unidentifiable draft gets a blind submit.
     needle = _submit_needle(command)
     draft_seen = False
     deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
@@ -5734,6 +6116,9 @@ def inject_slash_command(
         raise ClaudeUserPromptPending(
             "Claude is waiting for an explicit answer; settings command not sent."
         )
+    _require_legacy_model_command(bridge_dir, command)
+    if before_submit is not None:
+        before_submit()
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     if draft_seen:
         # Retry only while the command remains drafted and no user decision
@@ -5745,10 +6130,12 @@ def inject_slash_command(
             what="slash command",
             bridge_dir=bridge_dir,
         ):
+            # Not cancelled: Enters queued in a stalled pane can still submit it.
             raise RuntimeError(
-                f"Claude Code did not accept the slash command within "
-                f"{_SUBMIT_VERIFY_TIMEOUT_S}s (the command is still in the "
-                "input box). The command was not delivered."
+                f"Claude Code could not confirm submission of the slash command within "
+                f"{_SUBMIT_VERIFY_TIMEOUT_S}s (the command is still in the input box). "
+                "Queued Enter presses may still submit it. Check the terminal state before "
+                "explicitly retrying the command."
             )
     if dialog_hint is not None:
         _confirm_tui_dialog(socket_path, tmux_target, hint=dialog_hint, bridge_dir=bridge_dir)
@@ -6166,46 +6553,13 @@ def set_permission_mode(
     )
 
 
-def confirm_dialog_if_open(bridge_dir: Path, *, hint: str) -> bool:
-    """
-    Accept the *hint* dialog iff it is on screen RIGHT NOW; never blind-Enter.
-
-    Loop-safe building block for watchers that outlive a single injection
-    (a mid-turn ``/model`` queues in Claude's composer and pops its confirm
-    dialog only when the turn settles — minutes later). Unlike
-    :func:`_confirm_tui_dialog` there is no timeout fallback Enter, so
-    calling this every few seconds can never type into a surface that is
-    not the named dialog.
-
-    :param bridge_dir: Bridge directory path.
-    :param hint: Text the dialog renders, e.g.
-        :data:`SWITCH_MODEL_DIALOG_HINT`.
-    :returns: ``True`` when the dialog was on screen and confirmed.
-    """
-    try:
-        info = _wait_for_tmux_info(bridge_dir, timeout_s=1.0)
-    except (RuntimeError, OSError):
-        return False
-    socket_path = info["socket_path"]
-    tmux_target = info["tmux_target"]
-    try:
-        pane = _capture_pane(socket_path, tmux_target)
-        if hint not in pane:
-            return False
-        _confirm_and_verify_dialog_closed(
-            socket_path, tmux_target, hint=hint, bridge_dir=bridge_dir
-        )
-    except (RuntimeError, OSError):
-        return False
-    return True
-
-
 def _confirm_and_verify_dialog_closed(
     socket_path: str,
     tmux_target: str,
     *,
     hint: str,
     bridge_dir: Path | None = None,
+    before_confirm: Callable[[], None] | None = None,
 ) -> None:
     """
     Press Enter on the *hint* dialog, re-pressing while it stays on screen.
@@ -6228,6 +6582,8 @@ def _confirm_and_verify_dialog_closed(
         raise ClaudeUserPromptPending(
             "Claude is waiting for an explicit answer; settings dialog not confirmed."
         )
+    if before_confirm is not None:
+        before_confirm()
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     last_enter = time.monotonic()
     deadline = last_enter + _CONFIRM_DIALOG_ACCEPT_TIMEOUT_S
@@ -6240,6 +6596,8 @@ def _confirm_and_verify_dialog_closed(
             return
         _raise_if_user_prompt_pending(bridge_dir, pane)
         if hint in pane and time.monotonic() - last_enter >= _CONFIRM_DIALOG_RETRY_INTERVAL_S:
+            if before_confirm is not None:
+                before_confirm()
             _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
             last_enter = time.monotonic()
 
@@ -6417,6 +6775,17 @@ class _UnixHTTPConnection(HTTPConnection):
         self.sock = sock
 
 
+def _tmux_injection_timeout_s() -> float:
+    deadline = _INJECTION_CANCEL_EVENT.get()
+    if isinstance(deadline, ModelSwitchDeadline):
+        _check_injection_cancelled()
+        remaining = deadline.remaining_s()
+        if remaining <= 0:
+            raise ClaudeInjectionCancelled("Claude's model-switch deadline expired.")
+        return min(_TMUX_SEND_TIMEOUT_S, remaining)
+    return _TMUX_SEND_TIMEOUT_S
+
+
 def _run_tmux(socket_path: str, *args: str, allow_missing_target: bool = False) -> None:
     """
     Invoke ``tmux -S <socket_path> <args...>`` and raise on failure.
@@ -6444,17 +6813,18 @@ def _run_tmux(socket_path: str, *args: str, allow_missing_target: bool = False) 
         target = args[args.index("-t") + 1]
         args = ("copy-mode", "-q", "-t", target, ";", *args)
     cmd = ["tmux", "-S", socket_path, *args]
+    timeout_s = _tmux_injection_timeout_s()
     try:
         proc = subprocess.run(
             cmd,
             check=False,
             capture_output=True,
             text=True,
-            timeout=_TMUX_SEND_TIMEOUT_S,
+            timeout=timeout_s,
         )
     except subprocess.TimeoutExpired as exc:
-        delivery_diagnostics.record_tmux_failure(operation, timeout_s=_TMUX_SEND_TIMEOUT_S)
-        raise RuntimeError(f"tmux command timed out after {_TMUX_SEND_TIMEOUT_S}s") from exc
+        delivery_diagnostics.record_tmux_failure(operation, timeout_s=timeout_s)
+        raise RuntimeError(f"tmux command timed out after {timeout_s}s") from exc
     except OSError as exc:
         delivery_diagnostics.record_tmux_failure(operation, os_errno=exc.errno)
         raise
@@ -6573,7 +6943,7 @@ def _capture_pane(socket_path: str, tmux_target: str, *, join_wrapped: bool = Fa
             check=False,
             capture_output=True,
             text=True,
-            timeout=_TMUX_SEND_TIMEOUT_S,
+            timeout=_tmux_injection_timeout_s(),
         )
     except (subprocess.SubprocessError, OSError):
         return ""
@@ -6633,7 +7003,7 @@ def _claude_pane_state(socket_path: str, tmux_target: str) -> _ClaudePaneState:
             check=False,
             capture_output=True,
             text=True,
-            timeout=_TMUX_SEND_TIMEOUT_S,
+            timeout=_tmux_injection_timeout_s(),
         )
     except (subprocess.SubprocessError, OSError):
         return _ClaudePaneState(None)
@@ -6939,39 +7309,6 @@ def terminal_dialog_pending(bridge_dir: Path) -> bool:
         return False
     pane = _capture_pane(socket_path, target)
     return _terminal_dialog_headline(pane) is not None or launcher_install_prompt(pane)
-
-
-# Claude Code echoes a ``/model`` command, then prints this acknowledgement
-# under it ("Set model to Opus 5.5 and saved as your default for new sessions").
-_MODEL_SWITCH_ACKNOWLEDGEMENT = "Set model to "
-
-
-def model_switch_acknowledged(bridge_dir: Path, *, command: str) -> bool:
-    """
-    Check whether Claude Code acknowledged a ``/model`` command on the pane.
-
-    A second confirmation source next to the statusLine snapshot: the
-    acknowledgement Claude Code prints under the echoed command says the
-    switch took effect even when the snapshot spells the model differently
-    or has not been rewritten yet.
-
-    :param bridge_dir: The session's native bridge directory.
-    :param command: The injected command, e.g. ``"/model opus[1m]"``.
-    :returns: ``True`` when the acknowledgement follows the command's last
-        echo on the pane; ``False`` when it does not, the echo is not on
-        screen, or the pane cannot be read.
-    """
-    info = _read_json_file(bridge_dir / _TMUX_FILE)
-    if not isinstance(info, dict):
-        return False
-    socket_path, target = info.get("socket_path"), info.get("tmux_target")
-    if not isinstance(socket_path, str) or not isinstance(target, str):
-        return False
-    lines = _capture_pane(socket_path, target).splitlines()
-    echoes = [index for index, line in enumerate(lines) if command in line]
-    if not echoes:
-        return False
-    return any(_MODEL_SWITCH_ACKNOWLEDGEMENT in line for line in lines[echoes[-1] + 1 :])
 
 
 def auto_mode_billing_notice_visible(pane: str) -> bool:

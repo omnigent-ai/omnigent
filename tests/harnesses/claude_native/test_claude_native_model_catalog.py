@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import textwrap
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -18,8 +19,21 @@ import pytest
 from omnigent.harnesses.claude_native import main as claude_native
 from omnigent.inner import _proc
 from omnigent.models import model_catalog_store
+from omnigent.models.claude_model_vocabulary import picker_model_options
+from omnigent.onboarding.provider_config import FamilyConfig, ProviderEntry
 from tests._helpers.polling import poll_until_async
 from tests._helpers.providers import isolate_provider_resolution
+
+
+@pytest.fixture(autouse=True)
+def _isolated_model_probe_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    isolate_provider_resolution(monkeypatch, tmp_path / "config")
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
+    monkeypatch.delenv("OMNIGENT_CLAUDE_LAUNCHER", raising=False)
+    for alias in ("OPUS", "SONNET", "HAIKU", "FABLE"):
+        monkeypatch.delenv(f"ANTHROPIC_DEFAULT_{alias}_MODEL", raising=False)
+    monkeypatch.setattr("omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ())
 
 
 @pytest.mark.parametrize(
@@ -290,6 +304,21 @@ def test_stored_catalog_does_not_validate_launch_credentials(
         claude_native._claude_model_probe_invocation(config)
 
 
+def _provider_launch_config(*, env: dict[str, str], model: str | None = None):
+    entry = ProviderEntry(
+        name="catalog",
+        kind="key",
+        families={
+            "anthropic": FamilyConfig(
+                base_url="https://api.anthropic.com", auth_command="printf test-token"
+            )
+        },
+    )
+    config = claude_native._provider_config_for_native_claude(entry)
+    assert config is not None
+    return replace(config, env={**config.env, **env}, model=model)
+
+
 def _stub_picker(
     monkeypatch: pytest.MonkeyPatch,
     models: list[dict[str, Any]] | None,
@@ -405,9 +434,12 @@ async def test_catalog_excludes_unavailable_fable(
         )
     launches = _stub_picker(monkeypatch, models, control_failure=control_failure)
 
-    assert await claude_native.claude_model_catalog(None) == [
-        {"id": "opus", "model": "claude-opus-5", "displayName": "Opus 5", "isDefault": True}
-    ]
+    rows = await claude_native.claude_model_catalog(None)
+    assert rows is not None
+    assert [
+        {key: value for key, value in row.items() if key != "_claude_picker_options"}
+        for row in rows
+    ] == [{"id": "opus", "model": "claude-opus-5", "displayName": "Opus 5", "isDefault": True}]
     assert len(launches) == 1
 
 
@@ -440,7 +472,12 @@ async def test_catalog_uses_cli_managed_picker_for_every_launch_config(
     config = (
         claude_native.ClaudeNativeUcodeConfig(env={}, model="gateway-opus") if configured else None
     )
-    assert await claude_native.claude_model_catalog(config) == [
+    rows = await claude_native.claude_model_catalog(config)
+    assert rows is not None
+    assert [
+        {key: value for key, value in row.items() if key != "_claude_picker_options"}
+        for row in rows
+    ] == [
         {"id": "gateway-opus", "model": "gateway-opus", "displayName": "Opus", "isDefault": True}
     ]
 
@@ -464,7 +501,21 @@ async def test_catalog_falls_back_for_older_claude(
         lambda: (("fable", "Fable"),),
     )
     assert await claude_native.claude_model_catalog(None) == [
-        {"id": "opus", "model": "claude-opus-5", "displayName": "opus", "isDefault": True}
+        {
+            "id": "opus",
+            "model": "claude-opus-5",
+            "displayName": "opus",
+            "isDefault": True,
+            "_claude_picker_options": [
+                {
+                    "value": "opus",
+                    "model": "claude-opus-5",
+                    "display_name": None,
+                    "enabled": True,
+                    "provenance": "legacy",
+                }
+            ],
+        }
     ]
     assert len(launches) == 3
     assert "--input-format" in launches[0]
@@ -515,10 +566,20 @@ async def test_disabled_only_refresh_replaces_the_cached_catalog(
     model = {"value": "opus", "resolvedModel": "claude-opus-5", "displayName": "Opus 5"}
     _stub_picker(monkeypatch, [model])
     assert await claude_native.claude_launch_catalog(None)
+    assert picker_model_options(claude_native.stored_claude_catalog_rows(None) or ()) == [
+        {
+            "value": "opus",
+            "model": "claude-opus-5",
+            "display_name": "Opus 5",
+            "enabled": True,
+            "provenance": "structured",
+        }
+    ]
 
     launches = _stub_picker(monkeypatch, [{**model, "disabled": True}])
     assert await claude_native.claude_reprobed_launch_catalog(None) == []
     assert await claude_native.claude_launch_catalog(None) == []
+    assert claude_native.stored_claude_catalog_rows(None) == []
     assert len(launches) == 1
 
 
@@ -563,7 +624,12 @@ async def test_catalog_keeps_enabled_fable_and_future_picker_models(
         ],
         default="claude-fable-5-1",
     )
-    assert await claude_native.claude_model_catalog(None) == [
+    rows = await claude_native.claude_model_catalog(None)
+    assert rows is not None
+    assert [
+        {key: value for key, value in row.items() if key != "_claude_picker_options"}
+        for row in rows
+    ] == [
         {
             "id": "fable",
             "model": "claude-fable-5-1",
@@ -572,3 +638,283 @@ async def test_catalog_keeps_enabled_fable_and_future_picker_models(
         },
         {"id": "future", "model": "vendor-future", "displayName": "Future model"},
     ]
+
+
+@pytest.mark.parametrize("prefix", ["", "system.ai.", "databricks-"])
+async def test_structured_picker_preserves_explicit_context_before_deduplication(
+    monkeypatch: pytest.MonkeyPatch, prefix: str
+) -> None:
+    from omnigent.harnesses.claude_native.model_switch import ClaudeModelSwitchRefused, _target
+
+    plain = f"{prefix}claude-opus-4-8"
+    contextual = f"{plain}[1m]"
+    _stub_picker(
+        monkeypatch,
+        [
+            {"value": plain, "resolvedModel": plain, "displayName": "Opus"},
+            {"value": contextual, "resolvedModel": plain, "displayName": "Opus (1M)"},
+        ],
+        default=contextual,
+    )
+    rows = await claude_native.claude_model_catalog(None)
+    assert rows is not None
+    assert [(row["id"], row["model"]) for row in rows] == [
+        (plain, plain),
+        (contextual, contextual),
+    ]
+    options = picker_model_options(rows)
+    assert [option["model"] for option in options] == [plain, contextual]
+    target = _target("opus", options, [], {"ANTHROPIC_DEFAULT_OPUS_MODEL": contextual})
+    assert (target.value, target.model) == (contextual, contextual)
+    with pytest.raises(ClaudeModelSwitchRefused, match="no unambiguous"):
+        _target(
+            "opus", options, [], {"ANTHROPIC_DEFAULT_OPUS_MODEL": f"{prefix}claude-opus-5[1m]"}
+        )
+
+
+@pytest.mark.parametrize(
+    ("value", "resolved"),
+    [
+        ("system.ai.claude-opus-4-8[1m]", "system.ai.claude-opus-5"),
+        ("private-claude-opus-4-8[1m]", "private-claude-opus-4-8"),
+        ("PrivateModel[1m]", "PrivateModel"),
+        ("PrivateModel[1m]", "privatemodel[1m]"),
+        ("PrivateModel[1M]", "PrivateModel[1m]"),
+        ("system.ai.claude-opus-4-8[other]", "system.ai.claude-opus-4-8"),
+    ],
+)
+async def test_structured_picker_does_not_infer_context_or_private_identity(
+    monkeypatch: pytest.MonkeyPatch, value: str, resolved: str
+) -> None:
+    _stub_picker(
+        monkeypatch,
+        [{"value": value, "resolvedModel": resolved, "displayName": "Opus (1M context)"}],
+        default=resolved,
+    )
+    rows = await claude_native.claude_model_catalog(None)
+    assert rows is not None
+    assert picker_model_options(rows)[0]["model"] == resolved
+
+
+@pytest.mark.parametrize("configured", [False, True])
+async def test_structured_alias_preserves_its_exact_public_context_pin(
+    monkeypatch: pytest.MonkeyPatch, configured: bool
+) -> None:
+    from omnigent.harnesses.claude_native.model_switch import _target
+
+    plain = "system.ai.claude-opus-4-8"
+    contextual = f"{plain}[1m]"
+    pin = {"ANTHROPIC_DEFAULT_OPUS_MODEL": contextual}
+    if configured:
+        config = _provider_launch_config(env=pin, model=contextual)
+    else:
+        config = None
+        monkeypatch.setenv("ANTHROPIC_DEFAULT_OPUS_MODEL", contextual)
+    _stub_picker(
+        monkeypatch,
+        [{"value": "opus", "resolvedModel": plain, "displayName": "Opus 4.8"}],
+        default=plain,
+    )
+    rows = await claude_native.claude_model_catalog(config)
+    assert rows is not None
+    options = picker_model_options(rows)
+    assert options[0]["model"] == contextual
+    target = _target("opus", options, [], pin)
+    assert (target.value, target.model) == ("opus", contextual)
+
+
+@pytest.mark.parametrize(
+    ("pin", "resolved"),
+    [
+        ("system.ai.claude-opus-5[1m]", "system.ai.claude-opus-4-8"),
+        ("PrivateModel[1m]", "PrivateModel"),
+        ("PrivateModel[1m]", "privatemodel[1m]"),
+    ],
+)
+async def test_structured_alias_cannot_infer_context_from_a_mismatched_or_private_pin(
+    monkeypatch: pytest.MonkeyPatch, pin: str, resolved: str
+) -> None:
+    from omnigent.harnesses.claude_native.model_switch import ClaudeModelSwitchRefused, _target
+
+    env = {"ANTHROPIC_DEFAULT_OPUS_MODEL": pin}
+    _stub_picker(monkeypatch, [{"value": "opus", "resolvedModel": resolved}], default=resolved)
+    rows = await claude_native.claude_model_catalog(_provider_launch_config(env=env, model=pin))
+    assert rows is not None
+    options = picker_model_options(rows)
+    assert options[0]["model"] == resolved
+    with pytest.raises(ClaudeModelSwitchRefused, match="no unambiguous"):
+        _target("opus", options, [], env)
+
+
+async def test_disabled_context_choice_cannot_become_an_enabled_plain_choice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plain = "system.ai.claude-opus-4-8"
+    _stub_picker(
+        monkeypatch,
+        [
+            {"value": plain, "resolvedModel": plain},
+            {"value": f"{plain}[1m]", "resolvedModel": plain, "disabled": True},
+        ],
+        default=plain,
+    )
+    probe = await claude_native.probe_claude_model_options(None)
+    assert probe is not None
+    # The CLI marks the concrete resolution disabled as well as its picker value.
+    assert probe.alias_rows == []
+    assert probe.disabled_models == frozenset({plain, f"{plain}[1m]"})
+
+
+@pytest.mark.parametrize(
+    ("value", "resolved"),
+    [
+        ("opus", "system.ai.claude-opus-4-8"),
+        ("system.ai.claude-opus-4-8[1m]", "system.ai.claude-opus-4-8"),
+        ("opus", "SYSTEM.AI.CLAUDE-OPUS-4-8"),
+    ],
+)
+async def test_context_normalization_cannot_admit_a_disabled_resolution(
+    monkeypatch: pytest.MonkeyPatch, value: str, resolved: str
+) -> None:
+    plain = "system.ai.claude-opus-4-8"
+    monkeypatch.setenv("ANTHROPIC_DEFAULT_OPUS_MODEL", f"{plain}[1m]")
+    _stub_picker(
+        monkeypatch,
+        [
+            {"value": value, "resolvedModel": resolved},
+            {"value": plain, "resolvedModel": plain, "disabled": True},
+        ],
+        default=resolved,
+    )
+    probe = await claude_native.probe_claude_model_options(None)
+    assert probe is not None
+    assert probe.alias_rows == []
+    assert probe.disabled_models == frozenset({plain})
+    assert await claude_native.claude_model_catalog(None) == []
+
+
+@pytest.mark.parametrize(
+    ("enabled", "disabled"),
+    [
+        ("PrivateModel", "privatemodel"),
+        ("claude-private-A", "claude-private-a"),
+        ("system.ai.claude-opus-4-8-Private", "system.ai.claude-opus-4-8-private"),
+    ],
+    ids=["private-id", "public-prefix-private-id", "public-suffix-private-id"],
+)
+async def test_disabled_private_model_keeps_its_literal_identity(
+    monkeypatch: pytest.MonkeyPatch, enabled: str, disabled: str
+) -> None:
+    from omnigent.harnesses.claude_native.model_switch import ClaudeModelSwitchRefused, _target
+
+    _stub_picker(
+        monkeypatch,
+        [
+            {"value": "private-enabled", "resolvedModel": enabled},
+            {"value": "private-disabled", "resolvedModel": disabled, "disabled": True},
+        ],
+        default=enabled,
+    )
+    probe = await claude_native.probe_claude_model_options(None)
+    assert probe is not None
+    assert [(row["id"], row["model"]) for row in probe.alias_rows] == [
+        ("private-enabled", enabled)
+    ]
+    options = picker_model_options(probe.alias_rows)
+    assert _target(enabled, options, [], {}).model == enabled
+    with pytest.raises(ClaudeModelSwitchRefused, match="no unambiguous"):
+        _target(disabled, options, [], {})
+
+
+@pytest.mark.parametrize("alias", ["OPUS", "SONNET", "HAIKU", "FABLE"])
+def test_catalog_cache_tracks_effective_alias_pins(
+    monkeypatch: pytest.MonkeyPatch, alias: str
+) -> None:
+    env_var = f"ANTHROPIC_DEFAULT_{alias}_MODEL"
+    monkeypatch.setenv(env_var, "claude-opus-4-8")
+    old_key = claude_native.claude_catalog_fingerprint(None)
+    monkeypatch.setenv(env_var, "claude-opus-4-8[1m]")
+    assert claude_native.claude_catalog_fingerprint(None) != old_key
+
+    config = _provider_launch_config(env={env_var: "configured-model"})
+    configured_key = claude_native.claude_catalog_fingerprint(config)
+    monkeypatch.setenv(env_var, "another-ambient-model")
+    assert claude_native.claude_catalog_fingerprint(config) == configured_key
+
+
+async def test_picker_descriptors_preserve_raw_labels_and_deduplicated_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_picker(
+        monkeypatch,
+        [
+            {"value": "opus[1m]", "resolvedModel": "claude-opus-5[1m]", "displayName": "Opus"},
+            {"value": "best", "resolvedModel": "claude-opus-5[1m]", "displayName": "Best"},
+            {"value": "opus", "resolvedModel": "claude-opus-5", "displayName": "Opus"},
+            {"value": "default", "resolvedModel": "off-list-model", "displayName": "Default"},
+            {"value": "disabled", "resolvedModel": "disabled-model", "disabled": True},
+            {"value": "fable", "resolvedModel": "claude-fable-5-1", "displayName": "Fable 5.1"},
+            {"value": "future", "resolvedModel": "vendor-future", "displayName": "Future model"},
+            {
+                "value": "gateway-opus",
+                "resolvedModel": "gateway-opus",
+                "displayName": "Gateway Opus",
+            },
+        ],
+        default="off-list-model",
+    )
+    rows = await claude_native.claude_model_catalog(None)
+    assert rows is not None
+    assert [row["id"] for row in rows] == [
+        "opus[1m]",
+        "opus",
+        "fable",
+        "future",
+        "gateway-opus",
+        "off-list-model",
+    ]
+    assert rows[0]["displayName"] == "Opus (1M context)"
+    expected = [
+        {
+            "value": "opus[1m]",
+            "model": "claude-opus-5[1m]",
+            "display_name": "Opus",
+            "enabled": True,
+            "provenance": "structured",
+        },
+        {
+            "value": "best",
+            "model": "claude-opus-5[1m]",
+            "display_name": "Best",
+            "enabled": True,
+            "provenance": "structured",
+        },
+        {
+            "value": "opus",
+            "model": "claude-opus-5",
+            "display_name": "Opus",
+            "enabled": True,
+            "provenance": "structured",
+        },
+    ]
+    expected.extend(
+        {
+            "value": value,
+            "model": model,
+            "display_name": label,
+            "enabled": True,
+            "provenance": "structured",
+        }
+        for value, model, label in [
+            ("fable", "claude-fable-5-1", "Fable 5.1"),
+            ("future", "vendor-future", "Future model"),
+            ("gateway-opus", "gateway-opus", "Gateway Opus"),
+        ]
+    )
+    assert picker_model_options(rows) == expected
+    assert picker_model_options([rows[-1]]) == []
+    fingerprint = claude_native.claude_catalog_fingerprint(None)
+    model_catalog_store.write_catalog("claude-native", fingerprint, rows)
+    assert picker_model_options(claude_native.stored_claude_catalog_rows(None) or ()) == expected
+    model_catalog_store.write_catalog("claude-native", fingerprint, [])
+    assert claude_native.stored_claude_catalog_rows(None) == []

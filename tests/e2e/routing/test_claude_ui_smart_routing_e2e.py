@@ -31,7 +31,9 @@ import pytest
 from omnigent.server.smart_routing import models_in_family
 from tests.e2e.routing._helpers import (
     arm_in,
-    claude_settings_apart_from_the_model,
+    claude_settings_snapshot,
+    claude_settings_unchanged,
+    claude_user_settings_path,
     decisions,
     same_arm,
     session_snapshot,
@@ -67,14 +69,16 @@ _SPAWN_TIMEOUT_S = 300.0
 def test_claude_session_create_routes_the_model_and_then_the_spawn(
     routing_client: httpx.Client,
     routing_host: str,
+    routing_claude_settings_env: dict[str, str],
     routing_arms: object,
     mock_router: MockRouter,
     tmp_path: Path,
 ) -> None:
     require_tmux()
     routing_arms("claude-native")  # type: ignore[operator]
-    settings_before = claude_settings_apart_from_the_model()
     workspace = trusted_workspace(tmp_path, "claude_ui_ws")
+    settings_path = claude_user_settings_path(workspace, routing_claude_settings_env)
+    settings_before = claude_settings_snapshot(settings_path)
 
     # ── 1. The routed create ────────────────────────────────────────────────
     # Unique but still rule-0 (short, no error/code markers), so the mock's
@@ -167,8 +171,7 @@ def test_claude_session_create_routes_the_model_and_then_the_spawn(
         "the spawn's task text never reached the router"
     )
 
-    # ── 4. Isolation: only Claude Code's own `model` key may have moved ──────
-    assert claude_settings_apart_from_the_model() == settings_before, (
-        "~/.claude/settings.json changed beyond its `model` key — routing must "
-        "confine its hook wiring to the session's bridge dir"
+    # Only newer CLIs promise to preserve the saved model default.
+    assert claude_settings_unchanged(settings_path, settings_before, session_id), (
+        "Claude settings changed fields promised by the running CLI version"
     )

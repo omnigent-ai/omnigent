@@ -304,14 +304,14 @@ def test_explicit_interrupt_can_cancel_a_pending_question(
 def test_prompt_appearing_after_slash_paste_receives_no_submit_enter(
     native_bridge: Path, monkeypatch: pytest.MonkeyPatch, prompt: str | None
 ) -> None:
-    """A model-setting command must not submit a dialog that replaces its draft."""
+    """A settings command must not submit a dialog that replaces its draft."""
     sent: list[tuple[str, ...]] = []
     pasted = False
 
     def send(*args: str) -> None:
         nonlocal pasted
         sent.append(args)
-        if args[-1] == "/model different":
+        if args[-1] == "/effort high":
             pasted = True
             if prompt is None:
                 _park_hook(native_bridge)
@@ -323,9 +323,9 @@ def test_prompt_appearing_after_slash_paste_receives_no_submit_enter(
     monkeypatch.setattr(bridge, "_PASTE_COMMIT_TIMEOUT_S", 0)
     monkeypatch.setattr(bridge, "_PASTE_SETTLE_S", 0)
     with pytest.raises(bridge.ClaudeUserPromptPending):
-        bridge.inject_slash_command(native_bridge, command="/model different")
+        bridge.inject_slash_command(native_bridge, command="/effort high")
     assert pasted
-    assert [args[-1] for args in sent] == ["Space", _CLEAR_ONE_ROW_COMPOSER, "/model different"]
+    assert [args[-1] for args in sent] == ["Space", _CLEAR_ONE_ROW_COMPOSER, "/effort high"]
 
 
 @pytest.mark.parametrize(
