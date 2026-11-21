@@ -258,7 +258,8 @@ def test_session_row_keyboard_focus_outline_is_not_clipped(
         assert outline["bounds"][start] >= clip["start"] - 0.5, outline
         assert outline["bounds"][end] <= clip["end"] + 0.5, outline
 
-    if width < 768:
+    # Row controls exist only in the desktop layout (md, 1181px, and up).
+    if width < 1181:
         return
     control_rings = []
     for test_id in (

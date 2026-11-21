@@ -15,7 +15,7 @@ from tests.e2e_ui.conftest import set_session_title
 
 _DESKTOP_VIEWPORT = {"width": 1280, "height": 800}
 _PHONE_VIEWPORT = {"width": 390, "height": 844}
-# An unfolded foldable: wide enough for the md+ sidebar, but touch-only.
+# An unfolded foldable: touch-only and below md (1181px), so it gets the mobile layout.
 _FOLDABLE_VIEWPORT = {"width": 884, "height": 1104}
 
 
@@ -330,23 +330,24 @@ def test_row_actions_use_long_press_on_unfolded_foldable(
     browser: Browser,
     seeded_session: tuple[str, str],
 ) -> None:
-    """An unfolded foldable hides the row's hover controls; long-press has them."""
+    """An unfolded foldable gets the mobile layout's rows: no controls; long-press has them."""
     base_url, session_id = seeded_session
     context = new_touch_context(browser, viewport=_FOLDABLE_VIEWPORT)
     try:
         page = context.new_page()
-        page.goto(f"{base_url}/c/{session_id}")
+        # Below md the sidebar starts closed; its docked mobile layout opens on request.
+        page.goto(f"{base_url}/c/{session_id}?sidebar=open")
 
         # This context reports itself as touch-only, exactly like a real
-        # unfolded foldable, while still getting the md+ desktop sidebar.
+        # unfolded foldable; the layout follows its width, not its pointer.
         assert page.evaluate("matchMedia('(hover: none)').matches")
 
         row_link = page.locator(f'a[href="/c/{session_id}"]')
         expect(row_link).to_be_visible()
         row = row_link.locator("xpath=ancestor::li[1]")
 
-        # Rows are driven by swipes and long-press here, so the pin, archive
-        # and kebab controls must not be painted at all.
+        # Mobile-layout rows are driven by swipes and long-press, so the pin,
+        # archive and kebab controls must not be painted at all.
         for test_id in (
             "quick-pin-conversation",
             "quick-archive-conversation",
@@ -354,8 +355,8 @@ def test_row_actions_use_long_press_on_unfolded_foldable(
         ):
             expect(
                 row.get_by_test_id(test_id),
-                f"{test_id} is shown on a touch-only md+ device; row controls "
-                "belong to fine-hover desktops",
+                f"{test_id} is shown in the mobile layout; row controls "
+                "belong to the desktop layout (md and up)",
             ).to_be_hidden()
 
         box = row_link.bounding_box()
@@ -367,7 +368,7 @@ def test_row_actions_use_long_press_on_unfolded_foldable(
         )
 
         # The long-press menu carries the actions the hidden controls held,
-        # including Pin (which fine-hover desktops get from the quick button).
+        # including Pin (which the desktop layout gets from the quick button).
         expect(page.get_by_test_id("rename-conversation")).to_be_visible(timeout=2_000)
         expect(page.get_by_test_id("pin-conversation")).to_be_visible()
         expect(page.get_by_test_id("archive-conversation")).to_be_visible()

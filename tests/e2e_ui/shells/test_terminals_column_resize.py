@@ -27,7 +27,7 @@ import time
 import httpx
 from playwright.sync_api import Page, ViewportSize, expect
 
-# Below Tailwind's ``md`` (768px) so the mobile header menu and drawer render.
+# Below Tailwind's ``md`` (1181px) so the mobile header menu and drawer render.
 _MOBILE_VIEWPORT: ViewportSize = {"width": 390, "height": 844}
 # Comfortably above ``md`` so the panel splits into list + xterm columns.
 _DESKTOP_VIEWPORT: ViewportSize = {"width": 1400, "height": 900}

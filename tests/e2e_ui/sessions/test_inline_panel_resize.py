@@ -8,9 +8,9 @@ from tests.e2e_ui._touch import touch_drag_between
 from tests.e2e_ui.conftest import open_right_rail, seed_committed_turn
 
 _VIEWPORT = {"width": 1280, "height": 700}
-# Tablet / unfolded-foldable width: md+ layout with the sidebar open by
-# default, where the old clamp left the rail no drag range at all.
-_TABLET_VIEWPORT = {"width": 1024, "height": 720}
+# The narrowest desktop layout (md is 1181px; below it the rail is a drawer),
+# with the sidebar open by default: the most cramped row the rail is inline in.
+_NARROW_DESKTOP_VIEWPORT = {"width": 1181, "height": 720}
 _GUTTER = "[data-workspace-panel-resize-gutter]"
 _STORAGE_KEY = "omnigent:session-workspace-state"
 
@@ -187,19 +187,19 @@ def test_touch_resize_persists_without_stealing_transcript_scroll(
     assert stored is not None and abs(stored - resized_width) <= 1
 
 
-def test_touch_resize_keeps_drag_range_on_tablet_width(
+def test_touch_resize_keeps_drag_range_on_narrow_desktop_width(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """The rail must stay touch-resizable at tablet width with the sidebar open.
+    """The rail must stay touch-resizable at the narrowest desktop width, sidebar open.
 
-    On unfolded-foldable viewports the sidebar defaults open, and reserving it
-    plus the chat's full comfort minimum used to pin the clamp's floor onto its
-    ceiling — the gutter rendered but every touch drag was a no-op.
+    There the sidebar defaults open, and reserving it plus the chat's comfort
+    minimum leaves the clamp little room; if its floor reached its ceiling the
+    gutter would render but every touch drag would be a no-op.
     """
     base_url, session_id = seeded_session
 
-    page.set_viewport_size(_TABLET_VIEWPORT)
+    page.set_viewport_size(_NARROW_DESKTOP_VIEWPORT)
     page.goto(f"{base_url}/c/{session_id}")
     open_right_rail(page)
 
