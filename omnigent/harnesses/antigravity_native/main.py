@@ -112,6 +112,7 @@ from omnigent.harnesses.antigravity_native.bridge import (
 )
 from omnigent.harnesses.antigravity_native.launch import (
     agy_binary_path,
+    agy_native_env_unset,
     build_agy_launch,
     resolve_native_antigravity_launch,
 )
@@ -1016,6 +1017,10 @@ async def _launch_and_record(
             trusted_workspace=Path.cwd().resolve(),
         ),
     }
+    # An ambient ``GEMINI_API_KEY`` exported for other tooling would preempt
+    # agy's OAuth login inside the session; ``agy_native_env_unset`` strips it
+    # when the credential resolver left OAuth in charge.
+    agy_env_unset = list(agy_native_env_unset())
     # agy's feedback survey shares its "esc to cancel" footer with the running-turn
     # marker, so a web turn injected into this CLI-launched session while the survey
     # is up would be silently lost (#1494). Disable it in the isolated dir agy reads
@@ -1023,7 +1028,11 @@ async def _launch_and_record(
     await asyncio.to_thread(
         ensure_agy_feedback_survey_disabled,
         agy_home_dir(bridge_dir),
-        launch_env={**os.environ, **env_overrides},
+        launch_env={
+            name: value
+            for name, value in {**os.environ, **env_overrides}.items()
+            if name not in agy_env_unset
+        },
     )
     # Lead the args so the flag is never swallowed by a later positional.
     argv = [argv[0], f"--gemini_dir={agy_gemini_dir(bridge_dir)}", *argv[1:]]
@@ -1036,6 +1045,7 @@ async def _launch_and_record(
         session_id,
         argv=argv,
         env=env_overrides,
+        env_unset=agy_env_unset,
         command=argv[0],
     )
     # Advertise the tmux pane so a web turn to this CLI-launched session can be
@@ -1498,6 +1508,7 @@ async def _launch_antigravity_terminal(
     *,
     argv: list[str],
     env: dict[str, str],
+    env_unset: list[str] | None = None,
     command: str,
 ) -> LaunchedAntigravityTerminal:
     """
@@ -1509,6 +1520,8 @@ async def _launch_antigravity_terminal(
         first element is the agy binary; the rest are its args.
     :param env: Environment overrides for the terminal process from
         :func:`build_agy_launch`.
+    :param env_unset: Variable names stripped from the inherited environment —
+        e.g. an ambient ``GEMINI_API_KEY`` the resolver declined.
     :param command: agy executable to run (matches ``argv[0]``).
     :returns: Launched terminal resource details.
     :raises click.ClickException: If the terminal launch fails.
@@ -1525,6 +1538,7 @@ async def _launch_antigravity_terminal(
         # in ``claude_native._claude_terminal_request``.
         "cwd": str(Path.cwd().resolve()),
         "env": env,
+        "env_unset": list(env_unset or ()),
         "scrollback": _ANTIGRAVITY_TERMINAL_SCROLLBACK_LINES,
         "tmux_allow_passthrough": True,
         "tmux_start_on_attach": True,
