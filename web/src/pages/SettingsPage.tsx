@@ -38,7 +38,6 @@ import {
   Suspense,
   useCallback,
   useEffect,
-  useId,
   useMemo,
   useRef,
   useState,
@@ -136,6 +135,7 @@ import {
   DEFAULT_WORKSPACE_TAB_ENTRY,
   PROJECT_FOLDER_PAGINATION_ENTRY,
   SESSION_ROW_QUICK_ACTIONS_ENTRY,
+  SWIPE_ACTIONS_ENTRY,
   UI_FONT_FAMILY_ENTRY,
   UI_FONT_SIZE_ENTRY,
   WORKSPACE_PANEL_DEFAULT_ENTRY,
@@ -388,6 +388,7 @@ import {
   DEFAULT_PALETTE,
   isThemeSelection,
   PALETTES,
+  type PaletteSwatch,
   readThemePalette,
   type ThemeSelection,
   writeThemePalette,
@@ -1315,7 +1316,7 @@ function SwipeActionsControl() {
   const actions = useSwipeActions();
   const swatch = useResolvedThemeMode() === "dark" ? DARK_MODE_PREVIEW : LIGHT_MODE_PREVIEW;
   const [openDirection, setOpenDirection] = useState<SwipeDirection | null>(null);
-  const labelId = useId();
+  const labelId = settingsLabelId(SWIPE_ACTIONS_ENTRY);
 
   const choose = useCallback(
     (direction: SwipeDirection, next: SwipeAction) => {
@@ -1323,76 +1324,141 @@ function SwipeActionsControl() {
     },
     [actions],
   );
+  const menuState = (direction: SwipeDirection) => ({
+    open: openDirection === direction,
+    onOpenChange: (next: boolean) => setOpenDirection(next ? direction : null),
+  });
+  const cardClass = (direction: SwipeDirection) =>
+    // The border shows "selected" only while this card's menu is open.
+    themeCardClass(openDirection === direction, false, "items-center gap-2 p-4");
 
+  // One card per finger direction. Each names its own catalog part, so Settings search can
+  // reveal it, which is why the two are written out rather than mapped.
   return (
-    <ThemeSubsection
-      labelId={labelId}
-      title="Swipe actions"
-      helper="Choose what swiping a session in the sidebar does. Delete always asks first."
-    >
-      <div role="group" aria-labelledby={labelId} className="grid grid-cols-2 gap-3">
-        {(["right", "left"] as const).map((direction) => {
-          const action = actions[direction];
-          const tone = SWIPE_ACTION_TONES[action];
-          const open = openDirection === direction;
-          return (
-            <DropdownMenu
-              key={direction}
-              open={open}
-              onOpenChange={(next) => setOpenDirection(next ? direction : null)}
+    <SettingsItem entry={SWIPE_ACTIONS_ENTRY}>
+      <ThemeSubsection
+        labelId={labelId}
+        descriptionId={settingsDescriptionId(SWIPE_ACTIONS_ENTRY)}
+        title="Swipe actions"
+        helper="Choose what swiping a session in the sidebar does. Delete always asks first."
+      >
+        <div role="group" aria-labelledby={labelId} className="grid grid-cols-2 gap-3">
+          <DropdownMenu {...menuState("right")}>
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                {...settingsControlProps(SWIPE_ACTIONS_ENTRY, "right", {
+                  runtime: SWIPE_ACTION_LABELS[actions.right],
+                })}
+                data-testid="swipe-action-right"
+                className={cardClass("right")}
+              >
+                <SwipeActionCardBody direction="right" action={actions.right} />
+              </button>
+            </DropdownMenuTrigger>
+            {/* Radix names the menu after its card, e.g. "Swipe right: Archive". */}
+            <DropdownMenuContent
+              {...settingsOverlayProps(SWIPE_ACTIONS_ENTRY, "right")}
+              className="min-w-(--radix-dropdown-menu-trigger-width)"
             >
-              <DropdownMenuTrigger asChild>
-                {/* The border shows "selected" only while this card's menu is open. */}
-                <button
-                  type="button"
-                  aria-label={`Swipe ${direction}: ${SWIPE_ACTION_LABELS[action]}`}
-                  data-testid={`swipe-action-${direction}`}
-                  className={themeCardClass(open, false, "items-center gap-2 p-4")}
-                >
-                  {iconCardBody(SWIPE_ACTION_ICONS[action], `Swipe ${direction}`, tone)}
-                  <span
-                    data-testid={`swipe-action-${direction}-label`}
-                    className={cn("flex items-center gap-1 text-sm text-muted-foreground", tone)}
-                  >
-                    {SWIPE_ACTION_LABELS[action]}
-                    <ChevronDownIcon aria-hidden="true" className="size-4 text-muted-foreground" />
-                  </span>
-                </button>
-              </DropdownMenuTrigger>
-              {/* Radix names the menu after its card, e.g. "Swipe right: Archive". */}
-              <DropdownMenuContent className="min-w-(--radix-dropdown-menu-trigger-width)">
-                <DropdownMenuRadioGroup
-                  value={action}
-                  onValueChange={(next) => {
-                    if (isSwipeAction(next)) choose(direction, next);
-                  }}
-                >
-                  {swipeActionOptions.map((option) => (
-                    <DropdownMenuRadioItem
-                      key={option}
-                      value={option}
-                      data-testid={`swipe-action-${direction}-${option}`}
-                      className={cn(
-                        "gap-3 [&_svg]:text-current",
-                        option === action && [
-                          SWIPE_ACTION_TONES[option],
-                          SWIPE_ACTION_FOCUS_TONES[option],
-                        ],
-                      )}
-                    >
-                      <span className="w-24 shrink-0">
-                        <SwipeActionPreview swatch={swatch} direction={direction} action={option} />
-                      </span>
-                      {SWIPE_ACTION_LABELS[option]}
-                    </DropdownMenuRadioItem>
-                  ))}
-                </DropdownMenuRadioGroup>
-              </DropdownMenuContent>
-            </DropdownMenu>
-          );
-        })}
-      </div>
-    </ThemeSubsection>
+              <SwipeActionMenuItems
+                direction="right"
+                action={actions.right}
+                swatch={swatch}
+                onChoose={(next) => choose("right", next)}
+              />
+            </DropdownMenuContent>
+          </DropdownMenu>
+          <DropdownMenu {...menuState("left")}>
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                {...settingsControlProps(SWIPE_ACTIONS_ENTRY, "left", {
+                  runtime: SWIPE_ACTION_LABELS[actions.left],
+                })}
+                data-testid="swipe-action-left"
+                className={cardClass("left")}
+              >
+                <SwipeActionCardBody direction="left" action={actions.left} />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent
+              {...settingsOverlayProps(SWIPE_ACTIONS_ENTRY, "left")}
+              className="min-w-(--radix-dropdown-menu-trigger-width)"
+            >
+              <SwipeActionMenuItems
+                direction="left"
+                action={actions.left}
+                swatch={swatch}
+                onChoose={(next) => choose("left", next)}
+              />
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
+      </ThemeSubsection>
+    </SettingsItem>
+  );
+}
+
+/** A swipe card's face: the current action's icon and name, toned by action. */
+function SwipeActionCardBody({
+  direction,
+  action,
+}: {
+  direction: SwipeDirection;
+  action: SwipeAction;
+}) {
+  const tone = SWIPE_ACTION_TONES[action];
+  return (
+    <>
+      {iconCardBody(SWIPE_ACTION_ICONS[action], `Swipe ${direction}`, tone)}
+      <span
+        data-testid={`swipe-action-${direction}-label`}
+        className={cn("flex items-center gap-1 text-sm text-muted-foreground", tone)}
+      >
+        {SWIPE_ACTION_LABELS[action]}
+        <ChevronDownIcon aria-hidden="true" className="size-4 text-muted-foreground" />
+      </span>
+    </>
+  );
+}
+
+/** A swipe card's menu: Archive / Delete / None, each with a preview of the swiped row. */
+function SwipeActionMenuItems({
+  direction,
+  action,
+  swatch,
+  onChoose,
+}: {
+  direction: SwipeDirection;
+  action: SwipeAction;
+  swatch: PaletteSwatch;
+  onChoose: (next: SwipeAction) => void;
+}) {
+  return (
+    <DropdownMenuRadioGroup
+      value={action}
+      onValueChange={(next) => {
+        if (isSwipeAction(next)) onChoose(next);
+      }}
+    >
+      {swipeActionOptions.map((option) => (
+        <DropdownMenuRadioItem
+          key={option}
+          value={option}
+          data-testid={`swipe-action-${direction}-${option}`}
+          className={cn(
+            "gap-3 [&_svg]:text-current",
+            option === action && [SWIPE_ACTION_TONES[option], SWIPE_ACTION_FOCUS_TONES[option]],
+          )}
+        >
+          <span className="w-24 shrink-0">
+            <SwipeActionPreview swatch={swatch} direction={direction} action={option} />
+          </span>
+          {SWIPE_ACTION_LABELS[option]}
+        </DropdownMenuRadioItem>
+      ))}
+    </DropdownMenuRadioGroup>
   );
 }
 

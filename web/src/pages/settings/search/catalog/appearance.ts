@@ -255,6 +255,27 @@ export const PROJECT_FOLDER_PAGINATION_ENTRY = settingsEntry({
   presence: { pageSize: { states: ["collapsed"] } },
 });
 
+export const SWIPE_ACTIONS_ENTRY = settingsEntry({
+  id: "swipe-actions",
+  section: "appearance",
+  label: "Swipe actions",
+  description: "Choose what swiping a session in the sidebar does. Delete always asks first.",
+  keywords: ["swipe", "touch", "mobile", "gesture", "archive", "delete", "sidebar", "session"],
+  // One card per finger direction; each opens a menu of the same three actions.
+  parts: { right: "Swipe right", left: "Swipe left" },
+  // A card is named with its current action, such as "Swipe right: Archive".
+  nameTemplates: {
+    right: { before: "Swipe right: " },
+    left: { before: "Swipe left: " },
+  },
+  partChoices: {
+    right: ["Archive", "Delete", "None"],
+    left: ["Archive", "Delete", "None"],
+  },
+  overlays: { right: {}, left: {} },
+  focus: "right",
+});
+
 export const APPEARANCE_SETTINGS = [
   THEME_MODE_ENTRY,
   TERMINAL_THEME_ENTRY,
@@ -275,4 +296,5 @@ export const APPEARANCE_SETTINGS = [
   DEFAULT_WORKSPACE_TAB_ENTRY,
   SESSION_ROW_QUICK_ACTIONS_ENTRY,
   PROJECT_FOLDER_PAGINATION_ENTRY,
+  SWIPE_ACTIONS_ENTRY,
 ] as const;
