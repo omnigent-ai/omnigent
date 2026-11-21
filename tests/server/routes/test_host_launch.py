@@ -9,18 +9,22 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 import pytest
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 
 from omnigent import debug_logging
+from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_OWNER
+from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY
 from omnigent.server.routes._host_launch import (
     LAUNCH_TIMEOUT_ENV_VAR,
     configure_host_sharding,
     host_absent_error,
+    joined_managed_host_labels,
     resolve_host_launch,
     resolve_host_owner,
     resolve_launch_timeout_s,
@@ -306,6 +310,37 @@ class TestHostAbsentError:
             assert host_absent_error(host).code == ErrorCode.WRONG_REPLICA
         finally:
             configure_host_sharding(False)
+
+
+# ── joined_managed_host_labels ───────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("slice_key", "tunnel", "expected"),
+    [
+        pytest.param("host_1", "managed", {REQUESTED_HOST_ID_LABEL_KEY: "host_1"}, id="keyed"),
+        pytest.param(None, "managed", {}, id="keyless-request"),
+        pytest.param("host_2", "managed", {}, id="foreign-key"),
+        pytest.param("host_1", "user-machine", {}, id="unmanaged-tunnel"),
+        pytest.param("host_1", None, {}, id="no-local-tunnel"),
+    ],
+)
+def test_joined_managed_host_labels(
+    slice_key: str | None, tunnel: str | None, expected: dict[str, str]
+) -> None:
+    conns: dict[str, object] = {}
+    if tunnel is not None:
+        conns["host_1"] = SimpleNamespace(registered_with_managed_token=tunnel == "managed")
+    app = SimpleNamespace(state=SimpleNamespace(host_registry=_FakeHostRegistry(conns=conns)))
+    headers = (
+        []
+        if slice_key is None
+        else [(OMNIGENT_SLICE_KEY_HEADER.lower().encode(), slice_key.encode())]
+    )
+    request = Request({"type": "http", "headers": headers, "query_string": b"", "app": app})
+
+    assert joined_managed_host_labels(request, "host_1") == expected
+    assert joined_managed_host_labels(request, None) == {}
 
 
 # ── resolve_launch_timeout_s (operator-tunable launch budget) ─────────

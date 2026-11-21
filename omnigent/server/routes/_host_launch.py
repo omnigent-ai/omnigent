@@ -191,6 +191,28 @@ def routed_slice_key(request: Request) -> str | None:
     )
 
 
+def joined_managed_host_labels(request: Request, host_id: str | None) -> dict[str, str]:
+    """Return the routing label for a session created on a live managed host.
+
+    A managed host whose launch requested its id dials keyed by it, so only a
+    request routed by that id reaches its tunnel. A session joining it there
+    records the label a managed create records, and its wakes route the same way.
+
+    :param request: The create request.
+    :param host_id: The host the new session joins, or ``None``.
+    :returns: ``{REQUESTED_HOST_ID_LABEL_KEY: host_id}``, or ``{}``.
+    """
+    from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY
+
+    host_registry = getattr(request.app.state, "host_registry", None)
+    if host_id is None or host_registry is None or routed_slice_key(request) != host_id:
+        return {}
+    connection = host_registry.get(host_id)
+    if connection is None or not connection.registered_with_managed_token:
+        return {}
+    return {REQUESTED_HOST_ID_LABEL_KEY: host_id}
+
+
 def host_absent_error(host: Host, *, sharded: bool | None = None) -> OmnigentError:
     """Classify a "host not on this replica" miss for a host-scoped route.
 
