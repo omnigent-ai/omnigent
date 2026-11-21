@@ -52,6 +52,7 @@ from omnigent.harnesses.claude_native.bridge import (
 )
 from omnigent.onboarding.ambient import claude_managed_gateway
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, token_bound_runner_id
+from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests._helpers.live_server import terminate_process
 from tests._helpers.native_session import create_native_session
 from tests._helpers.polling import poll_until
@@ -68,6 +69,8 @@ pytestmark = [
         reason="requires Linux, the real Claude CLI, and tmux",
     ),
     pytest.mark.timeout(300),
+    # The runner keeps the person's draft from this release on; older runners erase it.
+    pytest.mark.min_runner_version("0.24.0"),
 ]
 
 _REPO = Path(__file__).resolve().parents[2]
@@ -608,9 +611,9 @@ def claude(
         ) as client,
     ):
         runner = subprocess.Popen(
-            [sys.executable, "-m", "omnigent.runner._entry"],
-            cwd=runner_cwd,
-            env=env,
+            [runner_executable(), "-m", "omnigent.runner._entry"],
+            cwd=compat_runner_cwd() or runner_cwd,
+            env=apply_runner_env(env),
             stdout=log,
             stderr=subprocess.STDOUT,
         )
