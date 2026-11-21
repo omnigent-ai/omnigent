@@ -1,7 +1,6 @@
 """Headless recovery through the real SDK's HTTP and SSE parsing paths."""
 
 import json
-from functools import partial
 
 import httpx
 import pytest
@@ -14,7 +13,7 @@ from omnigent.cli_diagnostics import suppresses_recovery_hint
 @pytest.mark.parametrize("completion_stream", [2, 3], ids=["probe", "later-turn"])
 @pytest.mark.parametrize("item_status", ["completed", "incomplete"])
 async def test_headless_recovers_final_text_when_completion_event_is_missed(
-    monkeypatch: pytest.MonkeyPatch, completion_stream: int, item_status: str
+    completion_stream: int, item_status: str
 ) -> None:
     session_id = "conv_headless"
     final_text = "<!-- POLLY_REVIEW_START -->\n## Summary\nReview complete."
@@ -79,11 +78,9 @@ async def test_headless_recovers_final_text_when_completion_event_is_missed(
             return httpx.Response(200, text=wire, headers={"Content-Type": "text/event-stream"})
         raise AssertionError(f"Unexpected request: {request.method} {request.url}")
 
-    monkeypatch.setattr(
-        "omnigent_client._client.httpx.AsyncClient",
-        partial(httpx.AsyncClient, transport=httpx.MockTransport(handle)),
-    )
-    async with OmnigentClient(base_url="http://127.0.0.1") as client:
+    async with OmnigentClient(
+        base_url="http://127.0.0.1", transport=httpx.MockTransport(handle)
+    ) as client:
         result = await _query_sessions_once(
             client=client,
             agent_name="polly",
@@ -99,9 +96,7 @@ async def test_headless_recovers_final_text_when_completion_event_is_missed(
     assert result == (final_text if item_status == "completed" else None)
 
 
-async def test_headless_raises_when_turn_fails_after_streaming_text(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_headless_raises_when_turn_fails_after_streaming_text() -> None:
     """A ``response.failed`` turn exits non-zero even if it streamed text first.
 
     The Claude CLI reports a failing ``apiKeyHelper`` as assistant text and then
@@ -155,11 +150,9 @@ async def test_headless_raises_when_turn_fails_after_streaming_text(
             return httpx.Response(200, text=wire, headers={"Content-Type": "text/event-stream"})
         raise AssertionError(f"Unexpected request: {request.method} {request.url}")
 
-    monkeypatch.setattr(
-        "omnigent_client._client.httpx.AsyncClient",
-        partial(httpx.AsyncClient, transport=httpx.MockTransport(handle)),
-    )
-    async with OmnigentClient(base_url="http://127.0.0.1") as client:
+    async with OmnigentClient(
+        base_url="http://127.0.0.1", transport=httpx.MockTransport(handle)
+    ) as client:
         with pytest.raises(OmnigentError) as excinfo:
             await _query_sessions_once(
                 client=client,

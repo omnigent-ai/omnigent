@@ -194,7 +194,8 @@ class SessionRoutingTransport(httpx.AsyncBaseTransport):
       and cached, and retried once if it differs from the cached host. Whatever
       remains is one keyless attempt, and nothing else is retried.
 
-    A create whose JSON body names a ``host_id`` is keyed by it and never retried.
+    A create whose JSON body or ``REQUEST_HOST_EXTENSION`` names a host id is keyed
+    by it and never retried.
     Timeouts and other failures propagate unchanged, because delivery is uncertain.
     Established event streams are never inspected or replayed; JSON routing
     refusals before stream establishment may recover like other requests.
@@ -227,7 +228,10 @@ class SessionRoutingTransport(httpx.AsyncBaseTransport):
             address_request(request, base_url, "")
             return await self._send(request)
         if route in _CREATE_ROUTES:
-            create_host = _create_body_host(request)
+            # A multipart create names its new host in the request extension, not a JSON body.
+            create_host = _create_body_host(request) or request.extensions.get(
+                REQUEST_HOST_EXTENSION
+            )
             if create_host is not None:
                 address_request(request, base_url, create_host)
             return await self._send(request)

@@ -114,8 +114,9 @@ class OmnigentClient:
         flows. ``None`` (default) relies on static ``headers``.
     :param request_hooks: Async HTTP request hooks, run after authentication.
     :param transport: Optional ``httpx.AsyncBaseTransport`` that sends every
-        request, e.g. one that routes requests across server replicas or a
-        test ``httpx.MockTransport``. ``None`` uses httpx's network transport.
+        request, e.g. a test ``httpx.MockTransport``. ``None`` routes each
+        session request to its session's host across server replicas
+        (:class:`omnigent.session_host.SessionRoutingTransport`).
     :param timeout: Default timeout for non-streaming HTTP requests in
         seconds. SSE streams use a 600-second read timeout so server-side
         tool execution can pause the stream for several minutes. Session
@@ -153,8 +154,10 @@ class OmnigentClient:
         )
         if headers:
             default_headers.update(headers)
-        # Only a caller's transport replaces httpx's own; None leaves the default in place.
-        transport_kwargs: dict[str, Any] = {} if transport is None else {"transport": transport}
+        if transport is None:
+            from omnigent.session_host import SessionRoutingTransport
+
+            transport = SessionRoutingTransport(trust_env=not is_loopback_url(self._base_url))
         self._http = httpx.AsyncClient(
             headers=default_headers,
             auth=auth,
@@ -173,7 +176,7 @@ class OmnigentClient:
             # environment for local targets. Loopback is plain HTTP with
             # explicit headers, so losing netrc/CA env with it costs nothing.
             trust_env=not is_loopback_url(self._base_url),
-            **transport_kwargs,
+            transport=transport,
         )
 
         self.sessions = SessionsNamespace(self._http, self._base_url)
