@@ -27,6 +27,7 @@ def _clear_harness_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "HARNESS_COPILOT_SKILLS_FILTER",
         "HARNESS_COPILOT_BUNDLE_DIR",
         "HARNESS_COPILOT_AGENT_NAME",
+        "HARNESS_COPILOT_PERMISSION_MODE",
         "COPILOT_GITHUB_TOKEN",
         "GH_TOKEN",
         "GITHUB_TOKEN",
@@ -62,12 +63,14 @@ def test_build_executor_threads_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HARNESS_COPILOT_GITHUB_TOKEN", "gho_test")
     monkeypatch.setenv("HARNESS_COPILOT_CWD", "/tmp/work")
     monkeypatch.setenv("HARNESS_COPILOT_AGENT_NAME", "cop")
+    monkeypatch.setenv("HARNESS_COPILOT_PERMISSION_MODE", "bypassPermissions")
     executor = ch._build_copilot_executor()
     assert isinstance(executor, CopilotExecutor)
     assert executor._model_override == "claude-haiku-4.5"
     assert executor._github_token == "gho_test"
     assert executor._cwd == "/tmp/work"
     assert executor._agent_name == "cop"
+    assert executor._permission_mode == "bypassPermissions"
 
 
 def test_build_executor_threads_os_env_bundle_dir_and_ambient_token(
@@ -89,6 +92,7 @@ def test_build_executor_threads_os_env_bundle_dir_and_ambient_token(
     assert executor._cwd == "/tmp/oe"  # cwd fell back to os_env.cwd
     assert executor._bundle_dir == Path("/tmp/bundle")
     assert executor._github_token == "gho_ambient"  # ambient fallback
+    assert executor._permission_mode == "default"
 
 
 def test_create_app_exposes_executor_adapter_routes() -> None:

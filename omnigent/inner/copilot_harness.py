@@ -34,6 +34,9 @@ Env vars read at startup:
   ``caller_process + sandbox=none``.
 - ``HARNESS_COPILOT_SKILLS_FILTER``: JSON ``str | list[str]`` (parity;
   copilot has no skill mechanism wired here). Defaults to ``"all"``.
+- ``HARNESS_COPILOT_PERMISSION_MODE``: Omnigent permission stance for native
+  tools: ``"default"`` (prompt via elicitation card) or ``"bypassPermissions"``
+  (approve non-ASK verdicts without prompting while enforcing policy denials).
 - ``HARNESS_COPILOT_BUNDLE_DIR`` / ``HARNESS_COPILOT_AGENT_NAME``:
   reserved for future use.
 """
@@ -63,6 +66,8 @@ _ENV_OS_ENV = "HARNESS_COPILOT_OS_ENV"
 _ENV_SKILLS_FILTER = "HARNESS_COPILOT_SKILLS_FILTER"
 _ENV_BUNDLE_DIR = "HARNESS_COPILOT_BUNDLE_DIR"
 _ENV_AGENT_NAME = "HARNESS_COPILOT_AGENT_NAME"
+_ENV_PERMISSION_MODE = "HARNESS_COPILOT_PERMISSION_MODE"
+_DEFAULT_PERMISSION_MODE = "default"
 
 
 def _resolve_os_env() -> OSEnvSpec:
@@ -143,6 +148,9 @@ def _build_copilot_executor() -> Executor:
         bundle_dir=bundle_dir,
         agent_name=os.environ.get(_ENV_AGENT_NAME, "").strip() or None,
         skills_filter=_resolve_skills_filter(),
+        permission_mode=(
+            os.environ.get(_ENV_PERMISSION_MODE, "").strip() or _DEFAULT_PERMISSION_MODE
+        ),
     )
 
 

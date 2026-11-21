@@ -69,6 +69,7 @@ from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store import (
     CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+    COPILOT_PERMISSION_MODE_LABEL_KEY,
     FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
     FORK_SOURCE_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
@@ -1270,6 +1271,8 @@ def _claude_agent_deps(
         ("devin-native", "accept-edits", ["--permission-mode", "accept-edits"], False),
         ("devin-native", "smart", ["--permission-mode", "smart"], False),
         ("devin-native", "dangerous", ["--permission-mode", "dangerous"], False),
+        ("copilot", "default", None, False),
+        ("copilot", "bypassPermissions", None, False),
     ],
 )
 async def test_permission_mode_launch_options(
@@ -1281,7 +1284,12 @@ async def test_permission_mode_launch_options(
     launch_args, labels = await fire_mod._permission_mode_launch_options(deps, task)
 
     assert launch_args == args
-    assert labels == ({CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "1"} if bypass else {})
+    expected_labels = (
+        {CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "1"}
+        if bypass
+        else ({COPILOT_PERMISSION_MODE_LABEL_KEY: mode} if harness == "copilot" else {})
+    )
+    assert labels == expected_labels
 
 
 @pytest.mark.asyncio
@@ -1291,6 +1299,8 @@ async def test_permission_mode_launch_options(
         ("claude-native", "acceptEdits", ["--permission-mode", "acceptEdits"], False),
         ("codex-native", "default", None, False),
         ("codex-native", "bypass", None, True),
+        ("copilot", "bypassPermissions", None, False),
+        ("copilot", "default", None, False),
     ],
 )
 async def test_permission_mode_becomes_terminal_launch_args(
@@ -1318,6 +1328,9 @@ async def test_permission_mode_becomes_terminal_launch_args(
 
     assert conv_store.created[0]["labels"].get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == (
         "1" if bypass else None
+    )
+    assert conv_store.created[0]["labels"].get(COPILOT_PERMISSION_MODE_LABEL_KEY) == (
+        mode if harness == "copilot" else None
     )
 
 
@@ -3263,6 +3276,11 @@ async def test_new_session_mode_never_keeps_the_session() -> None:
             {"permission_mode": "auto"},
             "permission_mode_not_allowed",
         ),
+        (
+            _continued_session(labels={COPILOT_PERMISSION_MODE_LABEL_KEY: "bypassPermissions"}),
+            {"permission_mode": "default"},
+            "permission_mode_not_allowed",
+        ),
         # Codex's full bypass, as spec-derived launch args emit it, with no label.
         (
             _continued_session(
@@ -3396,6 +3414,14 @@ async def test_continue_never_replaces_an_unusable_session(
             ),
         ),
         ("full-access", _continued_session(labels={CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "1"})),
+        (
+            "bypassPermissions",
+            _continued_session(labels={COPILOT_PERMISSION_MODE_LABEL_KEY: "bypassPermissions"}),
+        ),
+        (
+            "default",
+            _continued_session(labels={COPILOT_PERMISSION_MODE_LABEL_KEY: "default"}),
+        ),
     ],
 )
 async def test_continue_accepts_a_session_in_a_mode_the_task_selects(
@@ -4656,6 +4682,8 @@ async def test_sdk_agent_default_mode_gates_a_continued_session(
         ),
         ({}, ["--sandbox", "read-only", "--ask-for-approval", "on-request"], None),
         ({CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "1"}, None, "bypass"),
+        ({COPILOT_PERMISSION_MODE_LABEL_KEY: "bypassPermissions"}, None, "bypassPermissions"),
+        ({COPILOT_PERMISSION_MODE_LABEL_KEY: "default"}, None, None),
     ],
 )
 def test_session_approval_skipping_mode(
@@ -5126,6 +5154,7 @@ def test_a_run_on_another_agent_leaves_off_the_copys_mcp_picks() -> None:
         "omnigent.wrapper",
         "omnigent.claude_native.permission_mode",
         "omnigent.codex_native.approval_mode",
+        COPILOT_PERMISSION_MODE_LABEL_KEY,
     } <= same_agent
     assert "omnigent.mcp_service.jira" not in same_agent
     assert "omnigent.mcp_service.jira" in other_agent

@@ -31,8 +31,11 @@ gated through a two-stage check inside the SDK ``on_permission_request`` handler
    rather than aborting the whole turn).
 2. **User elicitation**: for any other outcome (ALLOW, ASK, or no evaluator
    wired), ``_elicitation_handler`` is invoked so the user can approve or
-   reject from the web-UI approval card. If no handler is wired (single-process
-   / pre-turn paths) the call is approved, preserving prior behavior.
+   reject from the web-UI approval card — except under
+   ``permission_mode="bypassPermissions"``, which skips the card for non-ASK
+   verdicts via ``PermissionHandler.approve_all`` while still honoring policy
+   denials. If no handler is wired (single-process / pre-turn paths) the call
+   is approved, preserving prior behavior.
 
 Native tool calls still leave no ``function_call`` item in the persisted
 transcript — only the streamed narration is recorded — so an ``on:[tool_call]``
@@ -57,6 +60,7 @@ Requirements:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -317,6 +321,7 @@ class CopilotExecutor(Executor):
         bundle_dir: Path | None = None,
         agent_name: str | None = None,
         skills_filter: str | list[str] = "all",
+        permission_mode: str = "default",
     ) -> None:
         """Create a CopilotExecutor.
 
@@ -336,6 +341,9 @@ class CopilotExecutor(Executor):
         :param agent_name: Optional agent name (reserved for parity).
         :param skills_filter: Accepted for parity; copilot has no skill
             mechanism wired here.
+        :param permission_mode: Native-tool permission stance: ``"default"``
+            surfaces elicitation cards; ``"bypassPermissions"`` approves
+            non-ASK verdicts without prompting while keeping policy denials.
         """
         self._cwd = cwd or (os_env.cwd if os_env is not None else None)
         self._os_env_spec = os_env
@@ -346,6 +354,7 @@ class CopilotExecutor(Executor):
         self._bundle_dir = bundle_dir
         self._agent_name = agent_name
         self._skills_filter = skills_filter
+        self._permission_mode = permission_mode
         self._session_states: dict[str, _CopilotSessionState] = {}
         # Installed by the runtime adapter; routes a bridged-tool call back into
         # Omnigent's session (policy gating, sub-agent dispatch, logging).
@@ -492,11 +501,27 @@ class CopilotExecutor(Executor):
 
         # Stage 1 — hard policy deny: block immediately, no elicitation.
         evaluator = self._policy_evaluator
+        policy_requires_ask = False
         if evaluator is not None:
             verdict = await evaluator("PHASE_TOOL_CALL", {"name": name, "arguments": args})
-            if getattr(verdict, "action", "") == "POLICY_ACTION_DENY":
+            action = getattr(verdict, "action", "")
+            if action == "POLICY_ACTION_DENY":
                 reason = getattr(verdict, "reason", "") or "blocked by policy"
                 return PermissionDecisionReject(feedback=f"Denied by Omnigent policy: {reason}")
+            policy_requires_ask = action == "POLICY_ACTION_ASK"
+
+        # Stage 2 — bypass elicitation when opted in (unless policy asked explicitly).
+        if self._permission_mode == "bypassPermissions" and not policy_requires_ask:
+            import copilot as copilot_sdk
+
+            permission_handler = getattr(copilot_sdk, "PermissionHandler", None)
+            approve_all = getattr(permission_handler, "approve_all", None)
+            if callable(approve_all):
+                decision = approve_all(request, _invocation)
+                if inspect.isawaitable(decision):
+                    return await decision
+                return decision
+            return PermissionDecisionApproveOnce()
 
         # Stage 2 — user elicitation: surface an approval card.
         handler = self._elicitation_handler
