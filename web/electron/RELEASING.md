@@ -38,6 +38,9 @@ pnpm --dir web/electron run build:mac:release
 ```bash
 for arch in mac mac-arm64; do
   spctl -a -vv "web/electron/dist/$arch/Omnigent.app" # Notarized Developer ID
+  # RunAsNode, EnableNodeOptionsEnvironmentVariable and EnableNodeCliInspectArguments
+  # must read "Disabled"; the two asar fuses "Enabled".
+  pnpm dlx @electron/fuses read --app "web/electron/dist/$arch/Omnigent.app"
 done
 for dmg in web/electron/dist/Omnigent-"$VERSION"-*.dmg; do
   codesign --verify --verbose=2 "$dmg"

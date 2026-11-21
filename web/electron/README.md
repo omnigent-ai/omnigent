@@ -362,7 +362,9 @@ defaults delete ai.omnigent.desktop DeveloperMode
 
 Development (`pnpm --dir web/electron dev`) builds keep Developer Tools enabled
 without this preference. The override is intentionally macOS-only and does not
-relax production update security checks.
+relax production update security checks. It covers the windows only: the
+production app's main process accepts no debugger (see
+[What a packaged app refuses to run](#what-a-packaged-app-refuses-to-run)).
 
 The native enhancements live on the web side in
 [`../src/lib/nativeBridge.ts`](../src/lib/nativeBridge.ts). It detects the
@@ -870,10 +872,10 @@ picks how much:
   Allow** is recorded against the app's signature. It never asks a helper such
   as `/usr/bin/security` for the key, and does not fall back to one when the
   binding can't load: a grant to a shared tool lets any local process run that
-  tool and read the key without a prompt. Still choose **Allow** rather than
-  **Always Allow** for now: the packaged app can be started in Electron's
-  plain-Node mode, which runs another program's script under the app's
-  signature. Builds before this change did read the key through `security`; if
+  tool and read the key without a prompt. That grant is only as narrow as the
+  signed binary, so the packaged app restricts its main process to the app's
+  own sealed code (see [What a packaged app refuses to run](#what-a-packaged-app-refuses-to-run)).
+  Builds before this change did read the key through `security`; if
   you chose Always Allow in one, remove `security` from the "Chrome Safe
   Storage" item's Access Control list in Keychain Access.
 - Reading never touches Chrome's live database: `Cookies` (plus any
@@ -991,6 +993,36 @@ install production desktop updates. `build:mac:release` retains
 `ai.omnigent.desktop`, **Omnigent**, and `electron/dist/`. For the full
 cross-platform publishing and update-feed checklist, see [the desktop release
 runbook](RELEASING.md).
+
+### What a packaged app refuses to run
+
+macOS records a Keychain **Always Allow** against the app's signature, not
+against the code that asked. A packaged app therefore turns off, through
+Electron fuses (`build.electronFuses` in `package.json`), the ways to run other
+JavaScript in the signed binary:
+
+| Fuse                                          | Effect in a packaged app                                                                                       |
+| --------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `runAsNode: false`                            | `ELECTRON_RUN_AS_NODE` is ignored, so the binary can't be used as a plain Node.js to run someone's script.     |
+| `enableNodeCliInspectArguments: false`        | `--inspect` and `SIGUSR1` don't open a debugger on the main process.                                           |
+| `enableNodeOptionsEnvironmentVariable: false` | `NODE_OPTIONS` and `NODE_EXTRA_CA_CERTS` are ignored.                                                          |
+| `enableEmbeddedAsarIntegrityValidation: true` | On macOS and Windows the app checks `app.asar` against the hash sealed at build time, and exits if it differs. |
+| `onlyLoadAppFromAsar: true`                   | The app loads its code from `app.asar` only, never from an `app/` folder placed beside it.                     |
+
+Two consequences to know about:
+
+- `NODE_EXTRA_CA_CERTS` no longer adds a certificate authority to the main
+  process's own requests (sign-in, server checks). Pages in the app's windows
+  never used that variable.
+- Local **Omnigent Dev** packages (`pnpm run build`, `build:mac`, `build:linux`,
+  `build:win`) keep `--inspect`, which Playwright needs to drive a packaged
+  binary. They are a different app (`ai.omnigent.desktop-dev`), so a grant made
+  to the release app never covers them. A grant made to Omnigent Dev itself is
+  open to anyone who can attach that debugger, so choose **Allow**, not
+  **Always Allow**, in Omnigent Dev. Every other fuse is the same.
+
+Unpackaged development (`pnpm start`) runs the stock Electron binary and is not
+affected.
 
 macOS apps, including unpackaged development, default to V2 onboarding for both
 new and existing profiles. Windows/Linux keep the legacy default. The setup-page
