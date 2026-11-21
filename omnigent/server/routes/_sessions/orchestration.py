@@ -13573,7 +13573,8 @@ async def _create_session_from_existing_agent(
         with creation_stage("create_persistence_ms"):
             conv = conversation_store.create_conversation(
                 agent_id=agent.id,
-                title=body.title,
+                # A run is named for its workflow unless the caller names it.
+                title=body.title if body.title is not None or workflow is None else workflow.name,
                 parent_conversation_id=body.parent_session_id,
                 runner_id=inherited_runner_id,
                 kind="sub_agent" if body.parent_session_id else "default",

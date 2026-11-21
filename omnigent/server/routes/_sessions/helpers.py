@@ -129,6 +129,7 @@ from omnigent.server.auth import (
     effective_admin,
     env_var_is_truthy,
 )
+from omnigent.server.background_session_titles import saved_workflow_run_title
 from omnigent.server.host_registry import (
     HostConnection,
     HostLaunchResult,
@@ -8780,7 +8781,7 @@ async def _seed_missing_title(
     """
     if conv.title is not None:
         return
-    title = synthesize_conversation_title(content)
+    title = saved_workflow_run_title(content) or synthesize_conversation_title(content)
     if title is None:
         return
     updated = await asyncio.to_thread(
