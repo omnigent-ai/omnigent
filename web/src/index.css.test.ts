@@ -1533,7 +1533,14 @@ describe("index.css electron-mac sidebar header", () => {
       /html\[data-electron-mac\][^{}]*\{\s*@(?:variant (?:max-)?md\b|media [^{]*width)/,
     );
     for (const block of rawMdMediaBlocks) expect(block).not.toContain("[data-electron-mac]");
-    expect(cssSource).not.toMatch(/\.electron-sidebar-header-actions \{\s*display: none;/);
+    // The cluster steps aside only while a full-window view covers the app.
+    const clusterHidingSelectors = cssBlocks
+      .map(([block]) => block.replace(/\/\*[\s\S]*?\*\//g, ""))
+      .filter((block) => /\.electron-sidebar-header-actions \{\s*display: none;/.test(block))
+      .map((block) => block.slice(0, block.indexOf("{")).trim());
+    expect(clusterHidingSelectors).toEqual([
+      "html[data-electron-mac]:has([data-fullscreen-overlay]) .electron-sidebar-header-actions",
+    ]);
   });
 
   it("keeps every header rule scoped to the desktop shell", () => {
