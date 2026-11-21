@@ -17,7 +17,7 @@ struct OmnigentWatchApp: App {
             Label {
               Text("Open Omnigent on iPhone")
             } icon: {
-              Image("OmnigentLogoReverse").resizable().scaledToFit().frame(width: 130)
+              Image("OmnigentStarfish").resizable().scaledToFit().frame(width: 72)
             }
           } description: {
             Text("Sign in on your iPhone to see sessions here.")
