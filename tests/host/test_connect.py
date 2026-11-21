@@ -18,6 +18,7 @@ import weakref
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
 import click
@@ -28,6 +29,7 @@ from websockets.exceptions import ConnectionClosedError, InvalidStatus, InvalidU
 from websockets.frames import Close
 from websockets.http11 import Response
 
+import omnigent.runner.code_host_instances as code_host_instances_module
 from omnigent import debug_logging
 from omnigent.host import HOST_FATAL_EXIT_CODE, daemon_launch
 from omnigent.host.connect import (
@@ -113,6 +115,10 @@ from omnigent.host.session_env import session_env_handoff
 from omnigent.onboarding import harness_install
 from omnigent.onboarding.harness_install import READINESS_CLI_PROBE_TIMEOUT_S
 from omnigent.onboarding.harness_login import CodexDeviceLogin
+from omnigent.runner.code_host_instances import active_code_host_instances
+from omnigent.runner.code_host_instances import (
+    serve_in_this_process as serve_code_host_instances_in_process,
+)
 from omnigent.runner.identity import (
     RUNNER_CONNECT_MARKER_ENV_VAR,
     RUNNER_DELEGATED_AUTH_ENV_VAR,
@@ -5760,6 +5766,7 @@ async def test_hello_advertises_code_host_instances_only_to_a_server_that_takes_
         'auth = "cli"\ncapabilities = ["line_counts"]\n'
     )
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    loads = _record_instance_file_loads(monkeypatch)
     received: asyncio.Future[str] = asyncio.get_running_loop().create_future()
 
     def _process_response(_connection: object, _request: object, response: Response) -> Response:
@@ -5784,6 +5791,7 @@ async def test_hello_advertises_code_host_instances_only_to_a_server_that_takes_
         connect_task = asyncio.create_task(host._connect_and_serve())
         try:
             hello = json.loads(await asyncio.wait_for(received, timeout=5.0))
+            serving_during = active_code_host_instances().instances
         finally:
             connect_task.cancel()
             with contextlib.suppress(BaseException):
@@ -5792,6 +5800,10 @@ async def test_hello_advertises_code_host_instances_only_to_a_server_that_takes_
 
     assert (CAP_CODE_HOST_INSTANCES in hello["capabilities"]) is served
     assert host._serves_code_host_instances() is served
+    assert len(loads) == (1 if served else 0)
+    assert bool(serving_during) is served
+    # Once the connection ends, this process's own reads serve no host's instances.
+    assert code_host_instances_module._served_in_this_process is None
     if served:
         assert hello["code_host_instances"] == [
             {
@@ -5806,6 +5818,69 @@ async def test_hello_advertises_code_host_instances_only_to_a_server_that_takes_
     assert str(cli) not in json.dumps(hello) and "--fixed" not in json.dumps(hello)
 
 
+def _record_instance_file_loads(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """Record each time the host opens its instance file, still loading it for real."""
+    from omnigent.host import connect as connect_module
+
+    loads: list[Path] = []
+    load = connect_module.load_code_host_instances
+
+    def recording(path: Path, **options: Any) -> Any:
+        loads.append(path)
+        return load(path, **options)
+
+    monkeypatch.setattr(connect_module, "load_code_host_instances", recording)
+    return loads
+
+
+@pytest.fixture(autouse=True)
+def _no_process_wide_code_host_instances() -> Iterator[None]:
+    """Keep one test's served instances from reaching another, in any order."""
+    serve_code_host_instances_in_process(None)
+    yield
+    serve_code_host_instances_in_process(None)
+
+
+def test_a_host_never_served_instances_never_opens_its_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """With the flag off, startup and upgrades leave even a broken file unread."""
+    (tmp_path / "code_host_instances.toml").write_text("not toml [[")
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    loads = _record_instance_file_loads(monkeypatch)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        host = _make_host_process()
+        for capabilities in (frozenset(), frozenset({"some_other_capability"})):
+            host._server_capabilities = capabilities
+            host._serve_code_host_instances_for_server()
+
+    assert loads == []
+    assert "code host instance" not in caplog.text.lower()
+    assert host._code_host_instances_file is None and not host._serves_code_host_instances()
+    _cleanup_host(host)
+
+
+def test_an_enabled_server_has_the_file_read_once_across_reconnects(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    (tmp_path / "code_host_instances.toml").write_text("")
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    loads = _record_instance_file_loads(monkeypatch)
+    host = _make_host_process()
+
+    for capabilities in (
+        {SERVER_CAP_CODE_HOST_INSTANCES},
+        set(),
+        {SERVER_CAP_CODE_HOST_INSTANCES},
+    ):
+        host._server_capabilities = frozenset(capabilities)
+        host._serve_code_host_instances_for_server()
+
+    assert loads == [tmp_path / "code_host_instances.toml"]
+    _cleanup_host(host)
+
+
 def test_a_refused_instance_file_serves_no_instances_and_logs_no_values(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -5815,9 +5890,11 @@ def test_a_refused_instance_file_serves_no_instances_and_logs_no_values(
         'env_set = { PROJECT_KEY = "value-that-must-not-be-logged" }\n'
     )
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    host = _make_host_process()
 
     with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
-        host = _make_host_process()
+        host._server_capabilities = frozenset({SERVER_CAP_CODE_HOST_INSTANCES})
+        host._serve_code_host_instances_for_server()
 
     assert host._code_host_instances.instances == ()
     assert "secret-name rule" in caplog.text

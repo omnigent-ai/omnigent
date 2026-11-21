@@ -1456,10 +1456,10 @@ class HostProcess:
         self._configured_harnesses: dict[str, HarnessAvailability] | None = None
         # Capabilities the connected server advertised on its upgrade response.
         self._server_capabilities: frozenset[str] = frozenset()
-        # Read once at start; served only to a server that turned instances on.
-        self._code_host_instances_file, self._code_host_instances = (
-            _load_host_code_host_instances()
-        )
+        # Read once, at the first upgrade from a server that turned instances on; a
+        # host never served them never opens the file.
+        self._code_host_instances_file: Path | None = None
+        self._code_host_instances: CodeHostInstances = NO_CODE_HOST_INSTANCES
         self._harness_accounts: HarnessAccounts | None = None
         self._gateway_inference: dict[str, bool] | None = None
         self._capabilities_initialized = False
@@ -1729,6 +1729,23 @@ class HostProcess:
 
         task.add_done_callback(_release)
         return await asyncio.shield(task)
+
+    def _serve_code_host_instances_for_server(self) -> None:
+        """Load the instance file at the first upgrade that turns instances on, then serve.
+
+        A server that didn't advertise them leaves the file unopened. Reads this host
+        answers for a parked runner follow the same instances as its runners.
+        """
+        if (
+            SERVER_CAP_CODE_HOST_INSTANCES in self._server_capabilities
+            and self._code_host_instances_file is None
+        ):
+            self._code_host_instances_file, self._code_host_instances = (
+                _load_host_code_host_instances()
+            )
+        serve_code_host_instances_in_process(
+            self._code_host_instances if self._serves_code_host_instances() else None
+        )
 
     def _serves_code_host_instances(self) -> bool:
         """Whether this connection serves the host's code host instances.
@@ -2306,7 +2323,11 @@ class HostProcess:
             code_host_instances_file=(
                 self._code_host_instances_file if self._serves_code_host_instances() else None
             ),
-            code_host_instance_hosts=self._code_host_instances.hosts_for("github"),
+            code_host_instance_hosts=(
+                self._code_host_instances.hosts_for("github")
+                if self._serves_code_host_instances()
+                else frozenset()
+            ),
         )
         if frame.inference_config is not None:
             try:
@@ -5615,9 +5636,18 @@ class HostProcess:
     async def _connect_and_serve(self) -> None:
         """Single connection attempt: connect, hello, serve.
 
+        The host's own reads stop serving code host instances once the connection ends.
+
         :returns: None.
         :raises Exception: On WebSocket disconnect or error.
         """
+        try:
+            await self._connect_and_serve_once()
+        finally:
+            serve_code_host_instances_in_process(None)
+
+    async def _connect_and_serve_once(self) -> None:
+        """Connect, send the hello and serve frames until the connection ends."""
         # Fresh per-connection markers for the silent-connect streak.
         self._conn_upgrade_accepted = False
         self._conn_frame_received = False
@@ -5689,10 +5719,7 @@ class HostProcess:
             if upgrade_response is not None
             else None
         )
-        # Reads this host answers for a parked runner follow the same instances.
-        serve_code_host_instances_in_process(
-            self._code_host_instances if self._serves_code_host_instances() else None
-        )
+        self._serve_code_host_instances_for_server()
         # An accepted upgrade proves the credentials work: login redirects
         # from here on are server restarts, not an unauthenticated host.
         reconnect = self._ever_connected
