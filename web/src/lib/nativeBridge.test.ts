@@ -7,7 +7,9 @@ import {
   confirmDesktopQuit,
   onDesktopCommand,
   setDesktopCommandState,
+  startSystemDictation,
   supportsDesktopCommands,
+  supportsSystemDictation,
   getServerPicker,
   hasDbcertPreflightBridge,
   isAndroidShell,
@@ -856,5 +858,36 @@ describe("desktop command bridge", () => {
 
     closeWindow.mockRejectedValueOnce(new Error("bridge down"));
     await expect(closeDesktopWindow()).resolves.toBe(false);
+  });
+});
+
+describe("system dictation bridge", () => {
+  afterEach(() => {
+    delete (window as unknown as Record<string, unknown>).omnigentDesktop;
+  });
+
+  it("is unsupported outside a shell that exposes it", async () => {
+    expect(supportsSystemDictation()).toBe(false);
+    await expect(startSystemDictation()).resolves.toBe(false);
+
+    (window as unknown as Record<string, unknown>).omnigentDesktop = { kind: "electron" };
+    expect(supportsSystemDictation()).toBe(false);
+  });
+
+  it("resolves whether the shell started macOS Dictation", async () => {
+    const start = vi.fn().mockResolvedValue(true);
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      startSystemDictation: start,
+    };
+    expect(supportsSystemDictation()).toBe(true);
+    await expect(startSystemDictation()).resolves.toBe(true);
+
+    start.mockResolvedValueOnce(false);
+    await expect(startSystemDictation()).resolves.toBe(false);
+
+    // A rejected IPC call reads as not started, so the mic can report it.
+    start.mockRejectedValueOnce(new Error("ipc down"));
+    await expect(startSystemDictation()).resolves.toBe(false);
   });
 });

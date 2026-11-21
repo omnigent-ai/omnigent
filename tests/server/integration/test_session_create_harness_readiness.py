@@ -69,7 +69,16 @@ async def test_child_create_rejects_unavailable_harness(
     assert len(store.list_conversations(limit=100).data) == len(before)
 
 
-@pytest.mark.parametrize("readiness", [None, {}, {"jcode": True}, {"jcode": "needs-auth"}])
+@pytest.mark.parametrize(
+    "readiness",
+    [
+        None,
+        {},
+        {"jcode": True},
+        {"jcode": "needs-auth"},
+        {"jcode": "cli-unresponsive", "claude-sdk": True},
+    ],
+)
 async def test_child_create_preserves_ready_and_unknown_hosts(
     client: httpx.AsyncClient,
     app: FastAPI,

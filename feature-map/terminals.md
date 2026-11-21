@@ -16,6 +16,8 @@ reattach when the session moves to another host.
   Automatic recovery runs once when opening Terminal. Leaving it open does not
   revive an idle-reaped pane. Failed recovery stays manual across view switches.
 - `user-shell`: open a shell, type into it, and close it.
+- `sandboxed-claude-inference`: in a sandboxed Claude SDK session, a terminal
+  can use Claude inference automatically while parent credentials stay hidden.
 - `scrollback`: scroll back with the mouse wheel (including programs that track
   the mouse), by touch on phones, and by keyboard.
 - `reconnect`: after the terminal connection drops, the terminal shows that it
@@ -36,6 +38,8 @@ reattach when the session moves to another host.
   tag, until the input box returns. `!` shell mode, the ctrl+r history search
   and a draft quoting a dialog's title keep the input box in use, so they do
   not count as hidden. A runner connected to an older server sends no alert.
+  Sending a Claude chat message or changing its settings returns an open
+  detailed transcript view to its input box with Ctrl+O before typing.
 - `split-panes`: behind `splittable_terminal_view_ui`, split the Terminal view
   into shell panes, resize them (each side stays within 25–75%), and close them.
 
@@ -52,7 +56,7 @@ with their own terminal retain the switcher.
   off while a rail-opened shell owns the main view.
 - On a phone, use the view mode choice in the header menu.
 - Choose Resume when the terminal shows as stopped.
-- On desktop with `grid_sessions_display_ui` enabled, use each grid cell's header switch.
+- On desktop with `grid_sessions_display_ui` on (the default), use each grid cell's header switch.
   The shortcut targets the active cell; shells remain in the shared Workspace.
 - On desktop with `splittable_terminal_view_ui` enabled, use the header's "Split
   right" / "Split down" buttons in Terminal view and pick a shell type. Drag a
@@ -68,6 +72,9 @@ with their own terminal retain the switcher.
 
 - Open a new shell from the workspace rail on desktop, or from the header menu
   on a phone.
+- In a sandboxed Claude SDK session, use that shell or an agent-launched
+  terminal to run the Claude CLI; model access is available without entering a
+  credential in the shell.
 - Press Control+` (on every platform) to open a shell of the remembered default
   type, also from a focused terminal. The chord is inert while the host is
   offline, the session is stranded, or a shell is still being created.
@@ -78,9 +85,14 @@ with their own terminal retain the switcher.
   In the Electron desktop app, Cmd/Ctrl+W also closes the selected visible
   workspace tab, using the same terminal confirmation. A read-only viewer's
   terminal stays open. Cmd/Ctrl+Shift+W closes the window.
+- Tabs sidebar: with `workspace_sidebar_v2` on, in a desktop app or desktop browser (not a
+  touch client), shells open as tabs in the workspace sidebar. The
+  session-actions menu's **Shells** shows the session's selected or last shell tab,
+  or a New tab to start one.
 
 **After the session moves:** open the host badge, choose "Switch host…", pick
-another host, then look at both the terminal strip and the agent terminal.
+another host or a new sandbox, then look at both the terminal strip and the
+agent terminal.
 Sandbox-backed sessions, including Databricks Sandbox and Arclet, cannot switch
 hosts. Their "Switch host…" item is disabled; hover or focus it for the
 unsupported explanation.
@@ -128,6 +140,14 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   `tests/e2e_ui/shells/test_new_shell.py::test_shell_program_gets_one_reply_to_a_cursor_position_query`.
   Closing a shell has no e2e coverage: close its tab, confirm, and expect the
   tab to disappear.
+- **`sandboxed-claude-inference`:**
+  `tests/inner/test_claude_worker_containment.py` runs the real Claude CLI in a
+  sandboxed tmux shell and through `sys_terminal_launch` / `sys_terminal_send`
+  against a local TLS model provider. It checks successful inference, hidden
+  parent credentials and denied direct network access. Set
+  `OMNIGENT_CLAUDE_CLI_E2E=1` and follow
+  [the worker prerequisites](../docs/CLAUDE_SANDBOX_TESTING.md); a passing
+  mock-provider run does not establish live Anthropic authentication.
 - **`agent-terminal-view`, `user-shell`, `split-panes`, keyboard:** no e2e
   coverage; component tests `web/src/hooks/useViewModeToggleHotkey.test.tsx`,
   `web/src/hooks/useNewShellHotkey.test.tsx`,
@@ -192,6 +212,11 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   `tests/harnesses/claude_native/test_claude_native_bridge.py`
   (`-k input_box_shown`), and the labels in `web/src/pages/ChatPage.test.ts` and
   `web/src/components/SessionStateBadge.test.tsx`.
+  `tests/harnesses/claude_native/test_claude_native_copy_mode.py::test_message_leaves_detailed_transcript_before_pasting`
+  checks a web send through a real tmux pane with a synthetic Claude composer.
+  To verify with Claude Code, open Terminal, press Ctrl+O to show the detailed
+  transcript, then send a follow-up from Chat. It should appear once and the
+  terminal should return to its input box. Repeat with a model or effort change.
   For Claude's OSC
   working/blocked status with an attached or closed viewer and the flag-off
   fallback, use the [native working-status recipe](./native-harnesses.md#driving-it-with-the-repro-environment).

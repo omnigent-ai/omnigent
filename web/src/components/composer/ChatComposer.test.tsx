@@ -8,6 +8,7 @@ import {
   ComposerSendButton,
   COMPOSER_LABELS_MIN_GAP_PX,
 } from "./ChatComposer";
+import { composerTargetOf } from "./engine/composerInput";
 
 describe("ChatComposer", () => {
   function renderEditor(initial: string, submitWithModEnter = false) {
@@ -45,6 +46,11 @@ describe("ChatComposer", () => {
     caretToEnd(input);
     fireEvent.keyDown(input, { key: " " });
     expect(input).toHaveValue(expected);
+  });
+
+  it("marks its textarea as a composer input target", () => {
+    const { input } = renderEditor("draft");
+    expect(composerTargetOf(input)).toBe(input);
   });
 
   it("leaves markers after other text alone", () => {
@@ -184,6 +190,27 @@ describe("ChatComposer", () => {
     expect(input.parentElement).toHaveClass("composer-input-text", "text-ui");
     expect(input).not.toHaveClass("text-[13px]", "leading-[20.8px]");
     expect(screen.getByText("Composer actions").closest(".composer-input-text")).toBeNull();
+  });
+
+  it("backs only the glass composer with the palette surface behind its text", () => {
+    const composer = (appearance: "default" | "glass") => (
+      <ChatComposer
+        appearance={appearance}
+        keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
+        input={{ "aria-label": "Draft" }}
+        actions={{ leading: null, trailing: null }}
+      />
+    );
+    const { container, rerender } = render(composer("glass"));
+    const card = container.querySelector("[data-composer-card]")!;
+    const surface = card.querySelector<HTMLElement>(":scope > [aria-hidden] > .omni-glass-surface");
+    expect(surface?.style.background).toBe(
+      "var(--omni-glass-background, color-mix(in srgb, var(--card-solid) 94%, transparent))",
+    );
+
+    rerender(composer("default"));
+    expect(card).toHaveClass("composer-reference-surface");
+    expect(card.querySelector(".omni-glass-surface")).toBeNull();
   });
 
   it("preserves interrupt and pending-creation states", () => {
@@ -372,7 +399,7 @@ describe("ChatComposer", () => {
   describe("mobile expansion", () => {
     beforeEach(() => {
       vi.stubGlobal("matchMedia", (query: string) => ({
-        matches: query === "(max-width: 767.98px)",
+        matches: query === "(max-width: 1180.98px)",
         addEventListener: vi.fn(),
         removeEventListener: vi.fn(),
       }));

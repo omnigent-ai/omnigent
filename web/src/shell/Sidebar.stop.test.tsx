@@ -90,9 +90,11 @@ describe("sidebar Stop session item", () => {
     openKebab();
     fireEvent.click(screen.getByTestId("stop-conversation"));
 
-    // Killing the shared runner also takes every shell opened on it.
     expect(screen.getByRole("dialog")).toHaveTextContent(
-      "stops its runner, including side chats running on it, and closes any open side shells",
+      "stops its runner, including side chats running on it",
+    );
+    expect(screen.getByRole("dialog")).toHaveTextContent(
+      "Conversation histories are kept. Any open side shells are closed.",
     );
     // The confirm dialog gates the mutation — nothing fires on item click.
     expect(mocks.stop.mutate).not.toHaveBeenCalled();
@@ -137,11 +139,13 @@ describe("sidebar Stop session item", () => {
     openKebab();
     expect(screen.getByTestId("stop-conversation")).toBeInTheDocument();
     fireEvent.click(screen.getByTestId("stop-conversation"));
-    // Stop tears down the session's own terminals even though the runner survives.
     expect(screen.getByRole("dialog")).toHaveTextContent(
-      "This terminates the running session for My Session and closes any open side shells. Conversation histories are kept.",
+      "This terminates the running session for My Session. Conversation histories are kept.",
     );
     expect(screen.getByRole("dialog")).not.toHaveTextContent("stops its runner");
+    expect(screen.getByRole("dialog")).toHaveTextContent(
+      "Conversation histories are kept. Any open side shells are closed.",
+    );
   });
 
   it("is hidden for a local in-process runner (runner_id, no host_id)", () => {

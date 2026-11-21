@@ -277,8 +277,8 @@ React app under `web/src/` (note: renamed from `ap-web/` upstream). TUI/REPL und
   autosave, download. Changed-files badge.
 - **Terminals** — `shell/TerminalsPanel.tsx` xterm.js → tmux; multiple per session; terminal-first sessions render
   inline (`InlineTerminalsSection.tsx`). [→ 2.C]
-- **Subagents rail** — `shell/SubagentsPanel.tsx`, `hooks/useChildSessions.ts`; tree by depth; click to navigate;
-  manual create via `AddAgentDialog.tsx`. [→ 2.F]
+- **Subagents rail** — `shell/SubagentsPanel.tsx`, `hooks/useChildSessions.ts`; tree by depth; click to navigate.
+  [→ 2.F]
 - **Switch agent / model / harness** — `SwitchAgentDialog.tsx`; `/model` & `/effort` slash commands
   (`SlashCommandMenu.tsx`); harness selector in NewChatDialog (localStorage per agent, `lib/modePreferences.ts`).
 - **Settings** — theme, keyboard shortcuts, account/password (`accounts_enabled`), archived sessions.
@@ -509,7 +509,7 @@ source-of-truth (SoT) anchor → issue/PR refs.
 ### Onboarding, credentials & auth [§2.G]
 - 🔴 **Managed sandboxes broken under OIDC/accounts auth.** SoT: runner tunnel 403; host never boots (`nohup`
   env-prefix). Issues #357, #1305, #1297 · PRs #1298 (host boot), #360 + #1308 (overlapping tunnel-auth — pick one).
-- 🟠 **Host daemon can't reach backend behind a corporate proxy.** SoT: `cli.py` daemon allowlist has no
+- 🟠 **Host daemon can't reach backend behind an HTTP proxy.** SoT: `cli.py` daemon allowlist has no
   `HTTP(S)_PROXY`/`NO_PROXY`; no config workaround. Issue #1022 · PR #1029.
 - 🟠 **First-run install: Claude CLI via `npm -g` → EACCES.** Issue #890 · PR #891 (native installer). Also live,
   no PR: #904 (`omnigent claude` config-json crash), #1023 (`[Errno 8]` macOS arm64).

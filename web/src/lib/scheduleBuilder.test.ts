@@ -11,6 +11,7 @@ import {
   DEFAULT_SCHEDULE_MODEL,
   parseRRuleToScheduleModel,
   type ScheduleModel,
+  validateRuleText,
   validateSchedule,
   parseUntil,
 } from "./scheduleBuilder";
@@ -112,11 +113,66 @@ describe("parseRRuleToScheduleModel", () => {
     "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;BYSECOND=30",
     "FREQ=WEEKLY;BYDAY=1MO;BYHOUR=9;BYMINUTE=0",
     "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;INTERVAL=367",
+    "FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=32;BYHOUR=9;BYMINUTE=0",
+    "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9,10,11,12,13,14,15,16,17;BYMINUTE=0",
+  ])("opens a rule the visual controls can't express as RRULE text: %s", (rule) => {
+    const parsed = parseRRuleToScheduleModel(rule);
+    expect(parsed).toMatchObject({ preset: "custom", customFreq: "rule", rule });
+    expect(buildRRule(parsed!)).toBe(rule);
+  });
+
+  it("moves a rule's COUNT or UNTIL to Ends when it opens as RRULE text", () => {
+    expect(
+      parseRRuleToScheduleModel("FREQ=YEARLY;BYWEEKNO=1;BYDAY=MO;BYHOUR=9;BYMINUTE=0;COUNT=3"),
+    ).toMatchObject({
+      customFreq: "rule",
+      rule: "FREQ=YEARLY;BYWEEKNO=1;BYDAY=MO;BYHOUR=9;BYMINUTE=0",
+      end: { type: "count", count: 3 },
+    });
+    const until = "FREQ=MONTHLY;BYDAY=1MO;BYHOUR=9;BYMINUTE=0;UNTIL=20271231T155959Z";
+    const parsed = parseRRuleToScheduleModel(until);
+    expect(parsed).toMatchObject({
+      customFreq: "rule",
+      rule: "FREQ=MONTHLY;BYDAY=1MO;BYHOUR=9;BYMINUTE=0",
+      end: { type: "until", until: "20271231T155959Z" },
+    });
+    expect(buildRRule(parsed!)).toBe(until);
+    expect(
+      buildRRule(
+        model({ preset: "custom", customFreq: "rule", rule: " rrule:freq=yearly;byeaster=0 " }),
+      ),
+    ).toBe("FREQ=YEARLY;BYEASTER=0");
+  });
+
+  it.each([
+    [
+      "rrule:count=3;freq=daily;byhour=9;byminute=0",
+      { preset: "daily", hour: 9, end: { type: "count", count: 3 } },
+    ],
+    [
+      "  RRULE:FREQ=WEEKLY;BYDAY=MO;BYHOUR=8;BYMINUTE=30  ",
+      { preset: "weekly", weekdays: ["MO"], hour: 8, minute: 30 },
+    ],
+    [
+      " freq=monthly;byday=1mo;byhour=9;byminute=0;until=20271231T155959Z ",
+      {
+        customFreq: "rule",
+        rule: "FREQ=MONTHLY;BYDAY=1MO;BYHOUR=9;BYMINUTE=0",
+        end: { type: "until", until: "20271231T155959Z" },
+      },
+    ],
+  ] as [string, Partial<ScheduleModel>][])(
+    "reads a stored rule in any case, prefix and spacing: %j",
+    (rule, expected) => {
+      expect(parseRRuleToScheduleModel(rule)).toMatchObject(expected);
+    },
+  );
+
+  it.each([
     "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;COUNT=1",
     "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;BYHOUR=10",
     "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;COUNT=3;UNTIL=20271231T155959Z",
-    "FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=32;BYHOUR=9;BYMINUTE=0",
-  ])("does not silently discard unsupported fields: %s", (rule) => {
+  ])("rejects a rule whose ending Ends can't show: %s", (rule) => {
     expect(parseRRuleToScheduleModel(rule)).toBeNull();
   });
 
@@ -244,4 +300,41 @@ describe("minute cadence policy", () => {
       );
     },
   );
+});
+
+describe("validateRuleText", () => {
+  it.each([
+    ["", "Enter a recurrence rule, such as FREQ=DAILY;BYHOUR=9;BYMINUTE=0."],
+    [
+      "DTSTART;TZID=Asia/Singapore:19700101T000000\nRRULE:FREQ=WEEKLY;BYDAY=MO",
+      "Enter one RRULE line. Choose the timezone below instead of DTSTART;TZID.",
+    ],
+    [
+      "FREQ=DAILY;BYHOUR",
+      "Write the rule as NAME=VALUE pairs separated by semicolons, using each name once.",
+    ],
+    [
+      "FREQ=DAILY;BYHOUR=9;BYHOUR=10",
+      "Write the rule as NAME=VALUE pairs separated by semicolons, using each name once.",
+    ],
+    ["FREQ=DAILY;COUNT=3", "Set when the schedule ends under Ends instead of with COUNT or UNTIL."],
+    ["FREQ=DAILY;DTSTART=20260101T000000Z", "DTSTART isn't a supported rule field."],
+    ["BYHOUR=9", "Include a FREQ such as MINUTELY, HOURLY, DAILY, WEEKLY, MONTHLY or YEARLY."],
+  ])("rejects %j", (rule, message) => {
+    expect(validateRuleText(rule)).toBe(message);
+  });
+
+  // The server decides whether these run, how often and with which values, then
+  // explains its verdict on save; sampling them here diverged from it or hung the tab.
+  it.each([
+    "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9,10,11,12,13,14,15,16,17;BYMINUTE=0",
+    "rrule:freq=monthly;byday=-1fr;byhour=16;byminute=0",
+    "FREQ=YEARLY;BYEASTER=0;BYMONTH=4;BYMONTHDAY=1,21;BYHOUR=9;BYMINUTE=0",
+    "FREQ=DAILY;BYHOUR=9,09,009,0009,00009;BYMINUTE=0,00,000,0000,00000",
+    "FREQ=MINUTELY;BYHOUR=99",
+    "FREQ=SECONDLY;BYSECOND=61",
+    "FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=30",
+  ])("leaves %s to the server", (rule) => {
+    expect(validateRuleText(rule)).toBeNull();
+  });
 });

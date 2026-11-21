@@ -18,6 +18,17 @@ import {
   selectableSessionAgents,
 } from "@/lib/agentGrouping";
 import { resetHiddenPickerAgents, setPickerAgentHidden } from "@/lib/pickerEntryVisibility";
+import { PICKER_VISIBILITY_ENTRY } from "@/pages/settings/search/catalog/appearance";
+import { SettingsItem } from "@/pages/settings/search/SettingsItem";
+import {
+  settingsControlProps,
+  settingsDescriptionId,
+  settingsLabelId,
+} from "@/pages/settings/search/settingsControl";
+import {
+  settingsOverlayProps,
+  settingsRuntimeChoiceProps,
+} from "@/pages/settings/search/settingsOwnership";
 
 const NAMED_HIDDEN_LIMIT = 3;
 const LIST_FORMAT = new Intl.ListFormat("en", { style: "long", type: "conjunction" });
@@ -71,10 +82,18 @@ export function PickerVisibilitySetting() {
           : "No agents available on this server yet.";
 
   return (
-    <div className="flex items-start justify-between gap-6">
+    <SettingsItem
+      entry={PICKER_VISIBILITY_ENTRY}
+      className="flex items-start justify-between gap-6"
+    >
       <div className="flex min-w-0 flex-col">
-        <span className="text-ui font-medium">Show in agent pickers</span>
-        <span className="text-sm text-muted-foreground">
+        <span id={settingsLabelId(PICKER_VISIBILITY_ENTRY)} className="text-ui font-medium">
+          Show in agent pickers
+        </span>
+        <span
+          id={settingsDescriptionId(PICKER_VISIBILITY_ENTRY)}
+          className="text-sm text-muted-foreground"
+        >
           Choose this server's harnesses and agents for new chats, automations, and project
           defaults. Existing sessions stay unchanged; the selected entry stays visible.
         </span>
@@ -88,6 +107,7 @@ export function PickerVisibilitySetting() {
             variant="ghost"
             size="sm"
             onClick={retry}
+            {...settingsControlProps(PICKER_VISIBILITY_ENTRY, "retry")}
             data-testid="picker-visibility-retry"
             componentId="settings.appearance.picker_visibility_retry"
           >
@@ -100,15 +120,23 @@ export function PickerVisibilitySetting() {
               variant="outline"
               size="sm"
               disabled={entries.length === 0}
+              {...settingsControlProps(PICKER_VISIBILITY_ENTRY, "edit")}
               data-testid="picker-visibility-edit"
               componentId="settings.appearance.picker_visibility_edit"
             >
               Edit
             </Button>
           </PopoverTrigger>
-          <PopoverContent align="end" className="p-0">
+          <PopoverContent
+            {...settingsOverlayProps(PICKER_VISIBILITY_ENTRY, "edit")}
+            align="end"
+            className="p-0"
+          >
             <Command label="Filter harnesses and agents">
-              <CommandInput placeholder="Filter harnesses and agents…" />
+              <CommandInput
+                placeholder="Filter harnesses and agents…"
+                {...settingsControlProps(PICKER_VISIBILITY_ENTRY, "filter")}
+              />
               <CommandList>
                 <CommandEmpty>No entries match.</CommandEmpty>
                 {groups.map((group) => (
@@ -122,6 +150,7 @@ export function PickerVisibilitySetting() {
                           keywords={[entry.name]}
                           data-checked={shown}
                           aria-checked={shown}
+                          {...settingsRuntimeChoiceProps(PICKER_VISIBILITY_ENTRY, "edit")}
                           data-testid={`picker-visibility-toggle-${entry.name}`}
                           onSelect={() => setPickerAgentHidden(entry.name, shown)}
                         >
@@ -140,12 +169,13 @@ export function PickerVisibilitySetting() {
           size="sm"
           disabled={!anyHidden}
           onClick={resetHiddenPickerAgents}
+          {...settingsControlProps(PICKER_VISIBILITY_ENTRY, "showAll")}
           data-testid="picker-visibility-reset"
           componentId="settings.appearance.picker_visibility_reset"
         >
           Show all
         </Button>
       </div>
-    </div>
+    </SettingsItem>
   );
 }

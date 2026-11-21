@@ -159,13 +159,15 @@ def isolated_process_env(
     return env
 
 
-def terminate_process(proc: subprocess.Popen[bytes] | subprocess.Popen[str] | None) -> None:
-    """Reap a running child, escalating SIGTERM to SIGKILL after ten seconds."""
+def terminate_process(
+    proc: subprocess.Popen[bytes] | subprocess.Popen[str] | None, *, timeout_s: float = 10
+) -> None:
+    """Reap a running child, escalating SIGTERM to SIGKILL after ``timeout_s`` seconds."""
     if proc is None or proc.poll() is not None:
         return
     proc.send_signal(signal.SIGTERM)
     try:
-        proc.wait(timeout=10)
+        proc.wait(timeout=timeout_s)
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait(timeout=5)

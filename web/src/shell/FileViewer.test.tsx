@@ -14,7 +14,7 @@
 //  12. Comments are marked seen (inbox-clearing registry) only while the
 //      comments panel is open — never from merely opening the file.
 
-import { useMemo } from "react";
+import { type ComponentProps, useMemo } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, useSearchParams } from "react-router-dom";
@@ -53,7 +53,7 @@ vi.mock("./CodeViewer", () => ({
     wrapLines?: boolean;
     onDirtyChange?: (dirty: boolean) => void;
   }) => {
-    codeViewerRenders({ path, position });
+    codeViewerRenders({ path, position, viewMode });
     return (
       <div
         data-testid="code-viewer"
@@ -253,6 +253,7 @@ function LocationDisplay() {
 }
 
 interface RenderProps {
+  registerLeaveGuard?: ComponentProps<typeof FileViewer>["registerLeaveGuard"];
   syncUrl?: boolean;
   frameless?: boolean;
   mobileOverlay?: boolean;
@@ -269,12 +270,15 @@ interface RenderProps {
   /** Spy for the close affordance; defaults to a throwaway mock. */
   onClose?: () => void;
   onCloseTab?: () => void;
+  onExitFullScreen?: () => void;
   /** Sort order for the prev/next navigation; defaults to the component default. */
   sort?: ChangedSort;
   /** Enables the prev/next nav header when provided. */
   onNavigateTo?: (path: string) => void;
   /** Esc closes through `onClose` too, as a workspace file tab or the narrow-screen overlay does. */
   escapeCloses?: boolean;
+  onShare?: () => void;
+  shareDisabledReason?: string;
 }
 
 /**
@@ -297,9 +301,13 @@ function viewerTree({
   initialSearch = "",
   onClose = vi.fn(),
   onCloseTab,
+  onExitFullScreen,
   sort,
   onNavigateTo,
   escapeCloses = false,
+  onShare,
+  shareDisabledReason,
+  registerLeaveGuard,
 }: RenderProps = {}) {
   const url = initialSearch ? `/?${initialSearch}` : "/";
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -319,8 +327,12 @@ function viewerTree({
           path={path}
           onClose={onClose}
           onCloseTab={onCloseTab ?? (escapeCloses ? onClose : undefined)}
+          onExitFullScreen={onExitFullScreen}
           sort={sort}
           onNavigateTo={onNavigateTo}
+          onShare={onShare}
+          shareDisabledReason={shareDisabledReason}
+          registerLeaveGuard={registerLeaveGuard}
         />
       </MemoryRouter>
     </QueryClientProvider>
@@ -445,6 +457,59 @@ function clearIOSViewport(): void {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+describe("FileViewer render failures", () => {
+  it.each(["retry", "source", "another file"])(
+    "contains a preview crash and recovers through %s",
+    (recovery) => {
+      const error = new Error("File preview failed");
+      const suppressExpectedError = (event: ErrorEvent) => {
+        if (event.error === error) event.preventDefault();
+      };
+      window.addEventListener("error", suppressExpectedError);
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+      let broken = false;
+      codeViewerRenders.mockImplementation(({ path, viewMode }) => {
+        if (broken && path === "results.csv" && viewMode === "preview") throw error;
+      });
+      const tree = (path = "results.csv") => (
+        <>
+          <textarea aria-label="Chat draft" />
+          {viewerTree({ open: true, path })}
+        </>
+      );
+      try {
+        const view = render(tree());
+        const draft = screen.getByRole("textbox", { name: "Chat draft" });
+        fireEvent.change(draft, { target: { value: "Unsent message" } });
+        broken = true;
+        view.rerender(tree());
+
+        expect(screen.getByRole("alert")).toHaveTextContent("Unable to display this file.");
+        expect(screen.getByRole("textbox", { name: "Chat draft" })).toBe(draft);
+        expect(draft).toHaveValue("Unsent message");
+        expect(screen.getByRole("button", { name: "View source" })).toBeInTheDocument();
+
+        if (recovery === "retry") {
+          broken = false;
+          fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+        } else if (recovery === "source") {
+          fireEvent.click(screen.getByRole("button", { name: "View source" }));
+          expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", "source");
+        } else {
+          view.rerender(tree("other.csv"));
+        }
+        expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+        expect(screen.getByTestId("code-viewer")).toBeInTheDocument();
+        expect(draft).toHaveValue("Unsent message");
+      } finally {
+        codeViewerRenders.mockReset();
+        window.removeEventListener("error", suppressExpectedError);
+      }
+    },
+  );
+});
 
 // The mobile viewer is a `fixed inset-0` overlay that the iOS shell-lock (which
 // only resizes flow content inside .app-shell) can't lift above the soft
@@ -1087,6 +1152,18 @@ describe("FileViewer Address All", () => {
   const otherDraft = { ...makeComment("c2"), path: "other.py" };
   const otherSent = { ...makeComment("c3", "addressed"), path: "other.py" };
   const sentHere = makeComment("c4", "addressed");
+  const localReview: Comment = {
+    ...makeComment("pr-comment"),
+    path: "review.py",
+    anchor_metadata: {
+      pr_url: "https://github.com/acme/app/pull/1",
+      side: "RIGHT",
+      line: 1,
+      start_line: null,
+      head_sha: "head",
+      base_sha: "base",
+    },
+  };
 
   it.each([
     ["the open file and others", [makeComment("c1"), sentHere], ["c1", "c2"], 2],
@@ -1101,6 +1178,7 @@ describe("FileViewer Address All", () => {
       makeComment("c5"),
       otherDraft,
       otherSent,
+      localReview,
     ];
     useCommentsMock.mockImplementation((_sessionId, path) =>
       makeCommentsQuery(path ? fileComments : staleSessionComments),
@@ -1115,6 +1193,24 @@ describe("FileViewer Address All", () => {
     const panel = screen.getByTestId("comments-panel");
     expect(panel).toHaveAttribute("data-address-count", String(expectedIds.length));
     expect(panel).toHaveAttribute("data-address-file-count", String(fileCount));
+  });
+
+  it("does not send or count local review comments on any path", () => {
+    const mutate = vi.fn();
+    useOptionalCommentSenderMock.mockReturnValue({ mutate, isPending: false });
+    const localHere = { ...localReview, id: "pr-here", path: "file1.py" };
+    useCommentsMock.mockImplementation((_sessionId, path) =>
+      makeCommentsQuery(path ? [localHere] : [localHere, localReview]),
+    );
+
+    renderViewer({ open: true, path: "file1.py" });
+    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+    fireEvent.click(screen.getByRole("button", { name: "address all comments" }));
+
+    expect(mutate).not.toHaveBeenCalled();
+    const panel = screen.getByTestId("comments-panel");
+    expect(panel).toHaveAttribute("data-address-count", "0");
+    expect(panel).toHaveAttribute("data-address-file-count", "0");
   });
 
   it.each([
@@ -1271,6 +1367,72 @@ describe("FileViewer clickable file path", () => {
 
     await waitFor(() => expect(toast.error).toHaveBeenCalledWith("Failed to copy file path"));
     expect(toast.success).not.toHaveBeenCalled();
+  });
+});
+
+describe("FileViewer file sharing", () => {
+  beforeEach(() => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+  });
+
+  it("opens file sharing from the toolbar while preserving copy link", async () => {
+    const onShare = vi.fn();
+    renderViewer({ open: true, onShare });
+
+    const button = screen.getByRole("button", { name: "Share file" });
+    act(() => button.focus());
+    const tooltip = await screen.findByRole("tooltip");
+    expect(button).toHaveAttribute("aria-describedby", tooltip.id);
+    expect(tooltip).toHaveTextContent("Share file");
+    fireEvent.click(button);
+
+    expect(onShare).toHaveBeenCalledOnce();
+    expect(screen.getByRole("button", { name: "Copy link to file" })).toBeInTheDocument();
+  });
+
+  it("omits sharing when no share action is available", () => {
+    renderViewer({ open: true });
+
+    expect(screen.queryByRole("button", { name: "Share file" })).toBeNull();
+  });
+
+  it("disables sharing and explains the server restriction", async () => {
+    const onShare = vi.fn();
+    const reason = "Sharing has been disabled for this Omnigent server.";
+    renderViewer({ open: true, onShare, shareDisabledReason: reason });
+
+    const button = screen.getByRole("button", { name: `Share file disabled: ${reason}` });
+    expect(button).toBeDisabled();
+    fireEvent.click(button);
+    expect(onShare).not.toHaveBeenCalled();
+    fireEvent.pointerMove(button.parentElement!, { pointerType: "mouse" });
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(reason);
+  });
+
+  it("opens sharing from the narrow toolbar overflow", () => {
+    installCollapsedToolbar();
+    const onShare = vi.fn();
+    renderViewer({ open: true, onShare });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "More actions" }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Share file" }));
+
+    expect(onShare).toHaveBeenCalledOnce();
+  });
+
+  it("keeps sharing disabled in the narrow toolbar overflow", async () => {
+    installCollapsedToolbar();
+    const onShare = vi.fn();
+    const reason = "Sharing is unavailable from a local server.";
+    renderViewer({ open: true, onShare, shareDisabledReason: reason });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "More actions" }), { button: 0 });
+    const item = screen.getByRole("menuitem", { name: `Share file disabled: ${reason}` });
+    expect(item).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(item);
+    expect(onShare).not.toHaveBeenCalled();
+    fireEvent.pointerMove(item.parentElement!, { pointerType: "mouse" });
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(reason);
   });
 });
 
@@ -1819,12 +1981,67 @@ describe("FileViewer markdown preview/edit/source modes", () => {
     expect(screen.queryByRole("button", { name: /^View mode/ })).toBeNull();
   });
 
-  it("keeps HTML's preview-default and preview ↔ source toggle intact", () => {
-    renderViewer({ open: true, path: "page.html" });
-    expect(viewModeOf()).toBe("preview");
-    // In preview, the single toggle switches to source (existing behavior).
-    fireEvent.click(screen.getByRole("button", { name: "View source" }));
+  it.each(["page.html", "results.csv", "export.tsv"])(
+    "opens %s in preview and guards unsaved source edits when toggling back",
+    (path) => {
+      renderViewer({ open: true, path });
+      expect(viewModeOf()).toBe("preview");
+      // In preview, the single toggle switches to source (existing behavior).
+      fireEvent.click(screen.getByRole("button", { name: "View source" }));
+      expect(viewModeOf()).toBe("source");
+      fireEvent.click(screen.getByRole("button", { name: "make dirty" }));
+      fireEvent.click(screen.getByRole("button", { name: "View preview" }));
+      expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+      expect(viewModeOf()).toBe("source");
+      fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+      expect(viewModeOf()).toBe("source");
+      expect(screen.queryByText("Unsaved changes")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "View preview" }));
+      expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+      expect(viewModeOf()).toBe("preview");
+    },
+  );
+
+  it("opens a ?comment= link to a CSV in source, then lets the toggle reach the table", () => {
+    renderViewer({ open: true, path: "results.csv", initialSearch: "comment=c1" });
     expect(viewModeOf()).toBe("source");
+    fireEvent.click(screen.getByRole("button", { name: "View preview" }));
+    expect(viewModeOf()).toBe("preview");
+  });
+
+  it("switches a CSV opened on its table to source when a comment is picked", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1")]));
+    renderViewer({ open: true, path: "results.csv" });
+    expect(viewModeOf()).toBe("preview");
+
+    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+    fireEvent.click(screen.getByRole("button", { name: "comment c1" }));
+    expect(viewModeOf()).toBe("source");
+    // The toggle still returns to the table.
+    fireEvent.click(screen.getByRole("button", { name: "View preview" }));
+    expect(viewModeOf()).toBe("preview");
+  });
+
+  it("ends a picked comment's pull toward source when another file opens", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1")]));
+    const view = renderViewer({ open: true, path: "results.csv" });
+    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+    fireEvent.click(screen.getByRole("button", { name: "comment c1" }));
+    expect(viewModeOf()).toBe("source");
+
+    view.rerender(viewerTree({ open: true, path: "other.csv" }));
+    view.rerender(viewerTree({ open: true, path: "results.csv" }));
+    expect(viewModeOf()).toBe("preview");
+  });
+
+  it("keeps a Markdown comment link's pull toward its editor across a visit elsewhere", () => {
+    // Only a data table's pull ends on leaving; Markdown keeps its deep-link bias.
+    const view = renderViewer({ open: true, path: "notes.md", initialSearch: "comment=c1" });
+    expect(viewModeOf()).toBe("editor");
+    view.rerender(viewerTree({ open: true, path: "other.py", initialSearch: "comment=c1" }));
+    view.rerender(viewerTree({ open: true, path: "notes.md", initialSearch: "comment=c1" }));
+    expect(viewModeOf()).toBe("editor");
   });
 
   it("guards unsaved edits when leaving the markdown editor, switching only after Discard", () => {
@@ -1841,6 +2058,61 @@ describe("FileViewer markdown preview/edit/source modes", () => {
     // Confirming the discard performs the deferred switch.
     fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
     expect(viewModeOf()).toBe("source");
+  });
+
+  it("asks its host's leave question while the markdown editor has unsaved edits", async () => {
+    let guard: (() => Promise<"leave" | "cancel">) | undefined;
+    const unregister = vi.fn();
+    const registerLeaveGuard = vi.fn((next: () => Promise<"leave" | "cancel">) => {
+      guard = next;
+      return unregister;
+    });
+    renderViewer({ open: true, path: "notes.md", registerLeaveGuard });
+    selectMode("Edit");
+    expect(registerLeaveGuard).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "make dirty" }));
+    expect(registerLeaveGuard).toHaveBeenCalledTimes(1);
+
+    let answer!: Promise<"leave" | "cancel">;
+    act(() => {
+      answer = guard!();
+    });
+    expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+    await expect(answer).resolves.toBe("cancel");
+    act(() => {
+      answer = guard!();
+    });
+    expect(unregister).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    await expect(answer).resolves.toBe("leave");
+    // With the edits gone there's nothing to ask about.
+    expect(unregister).toHaveBeenCalledTimes(1);
+  });
+
+  it("answers a waiting leave question when another replaces it or the viewer goes away", async () => {
+    let guard: (() => Promise<"leave" | "cancel">) | undefined;
+    const registerLeaveGuard = vi.fn((next: () => Promise<"leave" | "cancel">) => {
+      guard = next;
+      return () => undefined;
+    });
+    const view = renderViewer({ open: true, path: "notes.md", registerLeaveGuard });
+    selectMode("Edit");
+    fireEvent.click(screen.getByRole("button", { name: "make dirty" }));
+
+    let first!: Promise<"leave" | "cancel">;
+    let second!: Promise<"leave" | "cancel">;
+    act(() => {
+      first = guard!();
+    });
+    act(() => {
+      second = guard!();
+    });
+    await expect(first).resolves.toBe("cancel");
+    expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+
+    view.unmount();
+    await expect(second).resolves.toBe("cancel");
   });
 
   it("switches out of a clean markdown editor immediately, with no discard dialog", () => {
@@ -2525,6 +2797,76 @@ describe("FileViewer Escape closes the active tab", () => {
   });
 });
 
+describe("FileViewer Escape exits full screen", () => {
+  it("exits full screen and keeps the tab open", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    const onCloseTab = vi.fn();
+    const onExitFullScreen = vi.fn();
+    render(viewerTree({ open: true, frameless: true, onCloseTab, onExitFullScreen }));
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(onExitFullScreen).toHaveBeenCalledTimes(1);
+    expect(onCloseTab).not.toHaveBeenCalled();
+  });
+
+  it("keeps unsaved edits without a prompt, and a later Escape still guards them", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    const onCloseTab = vi.fn();
+    const onExitFullScreen = vi.fn();
+    const props = { open: true, frameless: true, path: "file1.md", onCloseTab };
+    const { rerender } = render(viewerTree({ ...props, onExitFullScreen }));
+    const draft = screen.getByRole("textbox", { name: "Draft text" });
+    fireEvent.change(draft, { target: { value: "Unsaved draft" } });
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(onExitFullScreen).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("Unsaved changes")).toBeNull();
+
+    rerender(viewerTree(props));
+    expect(draft).toHaveValue("Unsaved draft");
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+    expect(onCloseTab).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    expect(onCloseTab).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps Escape after a click outside the viewer, since full screen hides the chat", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    const onExitFullScreen = vi.fn();
+    render(
+      <>
+        {viewerTree({
+          open: true,
+          frameless: true,
+          syncUrl: false,
+          onCloseTab: vi.fn(),
+          onExitFullScreen,
+        })}
+        <button type="button">Exit full screen</button>
+      </>,
+    );
+    fireEvent.mouseDown(screen.getByRole("button", { name: "Exit full screen" }));
+    // Page-wide Escape handlers, such as declining an approval, yield to the viewer.
+    expect(screen.getByTestId("file-viewer")).toHaveAttribute("data-escape-owner");
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(onExitFullScreen).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores Escape while focus is in a text field", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    const onExitFullScreen = vi.fn();
+    render(
+      <>
+        {viewerTree({ open: true, frameless: true, onCloseTab: vi.fn(), onExitFullScreen })}
+        <input aria-label="Notes" />
+      </>,
+    );
+    const input = screen.getByRole("textbox", { name: "Notes" });
+    input.focus();
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(onExitFullScreen).not.toHaveBeenCalled();
+  });
+});
+
 describe("FileViewer video files", () => {
   it("skips capped content and diff reads and suppresses diff controls", () => {
     useCommentsMock.mockReturnValue(makeCommentsQuery([]));
@@ -2600,6 +2942,32 @@ describe("FileViewer 3D model files", () => {
     expect(viewModeOf()).toBe("source");
   });
 
+  it.each(["sales.xlsx", "events.parquet"])(
+    "opens %s on its table, with no source toggle, even from a line link",
+    (path) => {
+      renderViewer({ open: true, path, position: { line: 3 } });
+      expect(viewModeOf()).toBe("preview");
+      expect(screen.queryByRole("button", { name: "View source" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "View preview" })).toBeNull();
+    },
+  );
+
+  it.each(["sales.xlsx", "events.parquet"])(
+    "opens a changed %s on its table even when the link asks for the diff",
+    (path) => {
+      vi.mocked(useWorkspaceChangedFiles).mockReturnValue({
+        data: {
+          available: true,
+          data: [{ path, bytes: 10, modified_at: null, name: path, status: "modified" }],
+        },
+      } as ReturnType<typeof useWorkspaceChangedFiles>);
+      renderViewer({ open: true, path, initialSearch: "diff=1" });
+      expect(viewModeOf()).toBe("preview");
+      expect(screen.queryByTestId("diff-viewer")).toBeNull();
+      expect(screen.queryByRole("button", { name: "Show diff" })).toBeNull();
+    },
+  );
+
   it("suppresses the diff toggle for a model file even when it is a changed file", () => {
     // Report the model as a changed file — an ordinary changed file would get a
     // "Show diff" button; a model must not.
@@ -2666,7 +3034,7 @@ describe("file position navigation", () => {
     rerender(viewerTree({ open: true, path: "file2.md" }));
     expect(codeViewerRenders).toHaveBeenCalled();
     for (const [props] of codeViewerRenders.mock.calls) {
-      expect(props).toEqual({ path: "file2.md", position: undefined });
+      expect(props).toMatchObject({ path: "file2.md", position: undefined });
     }
   });
 

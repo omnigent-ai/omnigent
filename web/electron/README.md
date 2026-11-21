@@ -88,12 +88,14 @@ adds native niceties:
   > Electron's bundled Chromium does **not** ship. Electron therefore uses the
   > **server-side dictation fallback** instead: when the connected server has
   > the `dictation` extra and models installed (`GET /v1/info` reports
-  > `dictation_available`), a take that fails with Web Speech's `network`
-  > error falls back to streaming audio to `WS /v1/dictation/stream` and
-  > transcribing on the server — no cloud, no Chrome dependency. See
-  > `designs/server-dictation.md`. Without the server extra, the button still
-  > renders (the constructor exists) but shows "Dictation unavailable" when
-  > clicked, as before.
+  > `dictation_available`), a take streams audio to `WS /v1/dictation/stream`
+  > and is transcribed on the server — no cloud, no Chrome dependency. See
+  > `designs/server-dictation.md`. Without the server extra, macOS builds hand
+  > the mic to macOS Dictation (the Edit > Start Dictation… action, via
+  > `omnigent:start-system-dictation`), which types into the focused message
+  > box. Windows and Linux builds offer no mic button at all: with no working
+  > Web Speech backend, a button there could only fail with "Voice input isn't
+  > available on this device."
 
 ## How it works (zero UI duplication)
 
@@ -267,7 +269,7 @@ logs separately.
 - `phase: 'workspace landing'` means the bridge redirected and the status came
   from the destination page; it is not a rejection from the session-create endpoint.
 - For a direct `403 PERMISSION_DENIED`, give the request ID and custom client ID
-  to the Databricks platform owner to check the denial reason (client enablement,
+  to the workspace administrator to check the denial reason (client enablement,
   token scope, or workspace permissions). Do not infer the cause from status alone.
 
 ## OIDC sign-in through the system browser
@@ -383,7 +385,7 @@ electron/
   src/browserViewRegistry.js  # per-conversation WebContentsView registry (browser pane)
   src/browserViewBounds.js    # CSS-px → window-DIP bounds conversion (browser pane)
   src/browserIpc.js           # omnigent:browser-* IPC handlers (extracted from main.js)
-  src/chromeCookieStore.js    # per-site Chrome cookie import for the browser pane
+  src/chromeCookieStore.js    # Chrome cookie import for the browser pane
   src/loopback-oauth.js       # RFC 8252 loopback listener shared by browser sign-ins
   src/oidc-credentials.js     # OIDC loopback sign-in, refresh, and revoke
   src/oidc-auth.js            # OIDC window session lifecycle (cookie, renewal, sign-out)
@@ -391,7 +393,7 @@ electron/
   about/index.html         # bundled About UI opened from the macOS app menu
   find/index.html          # the bundled find-in-page bar (Cmd/Ctrl+F)
   icons/                   # app icons
-  docs/managed-preferences.md # public MDM configuration contract
+  docs/managed-preferences.md # MDM configuration reference
 ```
 
 Native niceties beyond notifications/badge: a right-click context menu
@@ -537,12 +539,11 @@ session's agent browser view and are not targeted by the agent relay.
 ### Agent previews on Arca
 
 The verified Arca exception also applies to the address bar and chat/file links.
-Companion or another external tool must forward the remote app's port to the
-desktop first.
+The remote app's port must be forwarded to the desktop first.
 
-On a Databricks-managed server with internal desktop features enabled, an
-Arca session's agent can open and inspect an app through Companion forwarding
-using the existing browser tools and tool approval or autoapproval policy.
+On a managed server with the managed features enabled, an Arca session's agent
+can open and inspect an app through a forwarded port using the existing browser
+tools and tool approval or autoapproval policy.
 Provide the actual forwarded URL to the agent; its local port may differ from
 the app's remote port. Omnigent does not establish or verify forwarding or
 prove that the local endpoint belongs to the Arca host.
@@ -553,7 +554,7 @@ source session on that host, or a subagent inheriting that host, is eligible.
 An older CLI or an unrecognized, failed, or missing identity leaves localhost
 navigation denied; the remembered host-picker label alone does not grant it.
 Eligibility is scoped to the selected server/workspace, not all sessions on
-a Databricks server.
+the server.
 
 After restarting the desktop, launch-time auto-connect restores this identity
 for users who opted into it. Otherwise, the first loopback preview request with
@@ -616,6 +617,30 @@ permission. Approval does not bypass CORS, TLS certificate validation, or the
 browser navigation policy. A helper that rejects this origin through its own CORS
 policy must be configured to allow it; the pane does not rewrite those headers.
 
+### Security keys
+
+Electron draws no WebAuthn UI, so a sign-in page waiting on a security key
+would otherwise sit with nothing on screen. On macOS and Linux, a preload in
+each pane page reports its WebAuthn requests, and the same popover window then
+tells the user to insert and touch their security key. It also says built-in
+biometrics and saved passkeys are unavailable (see
+[Passkeys](#passkeys-webauthn)). **Open in browser** hands the current page to
+the default browser; on macOS the popover also points to the cookie button.
+The popover closes when the request finishes or fails, or when the page navigates.
+It waits until the pane is visible and returns if the pane is hidden or covered
+while the request still waits. Clicking elsewhere leaves it open. Once the user
+closes it or presses Escape, it stays closed until the page makes a new request.
+Only requests from the top-level page are observed; requests inside iframes
+do not open the notice. Conditional (autofill) requests do not open it.
+Options with accessor-backed `publicKey` or `mediation` properties also bypass
+observation so the preload does not evaluate page getters a second time. Those
+requests still run through Chromium, but they do not open the notice.
+For observed requests, tracking completion marks rejected promises as handled,
+so the page does not receive an `unhandledrejection` event for them. Callers
+still receive the original rejected promise.
+Windows already shows its own WebAuthn dialog, so the shell skips this notice
+there.
+
 ### Browser implementation
 
 The browser runs on the user's machine (a native `WebContentsView`); the agent —
@@ -627,14 +652,16 @@ including the address bar, chat links, and agent actions, enforces this policy.
 **Pieces:**
 
 - `src/browserViewRegistry.js` — a per-**conversation** `Map` of
-  `WebContentsView`s (cap 10). `setActive` attaches one view to the host window
+  `WebContentsView`s (cap 20). `setActive` attaches one view to the host window
   and **detaches (does not destroy)** the previous one, so a background
   conversation's page keeps running when the user switches away; views are
   destroyed only on explicit close or window teardown. Each child view keeps
   `nodeIntegration:false, contextIsolation:true, sandbox:true`.
   Page-initiated `window.open` / `target=_blank` never spawns a window: an
   http(s) target navigates the same view in place (still allowlist-checked on
-  a policy-enforced view), and right-click offers "Open Link in Browser" /
+  a policy-enforced view). A Cmd/Ctrl- or middle-clicked link instead opens a
+  new background Browser tab in the same session when the loaded UI declares
+  support (`browser-open-tab`). Right-click offers "Open Link in Browser" /
   "Copy Link Address".
 - `src/browserUrlPolicy.js` — the browser navigation policy: http(s) only, and
   no private, link-local, metadata, or other non-public address in
@@ -701,8 +728,9 @@ including the address bar, chat links, and agent actions, enforces this policy.
   listeners that push `browser-url-changed` + `browser-nav-state` to the renderer
   so the toolbar's URL bar live-tracks the real URL (redirects, in-page link
   clicks, agent navigation) instead of going stale.
-- `src/chromeCookieStore.js` — reads the current site's cookies out of a local
-  Chrome profile for the toolbar's **Import cookies from Chrome** action (below).
+- `src/chromeCookieStore.js` — reads cookies out of a local Chrome profile, for
+  every website or the current site, for the toolbar's **Import cookies from
+  Chrome** action (below).
   Electron-free, so it is unit-tested with a stub session and a synthetic
   `Cookies` DB.
 - `src/preload.js` — adds `browserOpenOrNavigate/SetActive/Resize/Screenshot/`
@@ -777,13 +805,24 @@ under the same policy.
 
 **Importing cookies from Chrome (macOS).** Sites that reject embedded browsers
 (Google sign-in is the common one) can't be signed in from this pane, so the
-toolbar's cookie button copies the **current site's** cookies out of a local
-Chrome profile into this conversation's in-memory session and reloads the page.
-Scope is deliberately narrow:
+toolbar's cookie button copies cookies out of a local Chrome profile into this
+conversation's in-memory session and reloads the page. The dialog's _Site scope_
+picks how much:
 
-- Only cookies inside the page's own domain tree: its host, its subdomains, and
-  the leading-dot parent domains that reach it (`.google.com` for
-  `mail.google.com`). Nothing else in the jar is read into the app.
+- **All websites** (the default) copies every unexpired, unpartitioned cookie in
+  the chosen profile, so sign-ins that span several sites work without picking
+  each one. Any profile holding cookies can be chosen. The scope is the literal
+  `"*"`, which is not a hostname, and has its own store functions
+  (`previewAllSitesCookies` / `importAllSitesCookies`), so a site import can
+  never be widened into it. It is not tied to the tab's current site: main
+  validates only the profile, against its own preview. The agent can then act
+  as the user on every site that profile is signed in to; both prompts say so.
+  The preview reports these profiles as `allSitesProfiles`, a field a pane or
+  shell that predates it ignores, leaving the site scopes below.
+- A site scope copies only cookies inside the page's own domain tree: its host,
+  its subdomains, and the leading-dot parent domains that reach it
+  (`.google.com` for `mail.google.com`). Nothing else in the jar is read into
+  the app.
 - When the host has parent domains the dialog offers them as _Site scope_, each
   labelled with its own count (`accounts.google.com (25)` vs `google.com (64)`, the
   wider scope being a superset because it covers every subdomain's cookies).
@@ -813,9 +852,9 @@ Scope is deliberately narrow:
 - The secret-copying step itself needs consent from the main process, not just
   the pane's dialog: the connected page holds the bridge and could call it
   directly, so `browser-chrome-cookie-import` runs a native
-  `dialog.showMessageBox` naming the scope, the tab's host (when an ancestor
-  scope was picked), the Chrome profile and the count (that count comes from
-  main's own preview, never from the renderer). Like the shell's other consent
+  `dialog.showMessageBox` naming the scope (or that it covers all websites), the
+  tab's host (when an ancestor scope was picked), the Chrome profile and the
+  count (that count comes from main's own preview, never from the renderer). Like the shell's other consent
   dialogs it is parented to the sender's window, so it can't be approved while
   the tab it describes is hidden behind another app, and Chrome's profile name —
   a plain file on disk — is flattened to one short line so it can't add its own
@@ -824,24 +863,32 @@ Scope is deliberately narrow:
 - Values are decrypted with `v10`/`v11` (AES-128-CBC, key from the login
   Keychain's "Chrome Safe Storage" item) and never shown, logged, or persisted.
   App-bound `v20` values and non-macOS platforms are refused with a message, not
-  guessed at. The Keychain prompt is attributed to `security`; choose **Allow**
-  rather than **Always Allow**, because Always Allow adds `/usr/bin/security` to
-  the item's ACL, and any local process can then read Chrome's key without a
-  prompt. Partitioned (CHIPS) cookies are skipped rather than replayed
+  guessed at. Partitioned (CHIPS) cookies are skipped rather than replayed
   unpartitioned, which would widen the site they were scoped to.
+- The app reads that Keychain item in its own process, through the native
+  `@napi-rs/keyring` binding, so the macOS prompt names the app and **Always
+  Allow** is recorded against the app's signature. It never asks a helper such
+  as `/usr/bin/security` for the key, and does not fall back to one when the
+  binding can't load: a grant to a shared tool lets any local process run that
+  tool and read the key without a prompt. Still choose **Allow** rather than
+  **Always Allow** for now: the packaged app can be started in Electron's
+  plain-Node mode, which runs another program's script under the app's
+  signature. Builds before this change did read the key through `security`; if
+  you chose Always Allow in one, remove `security` from the "Chrome Safe
+  Storage" item's Access Control list in Keychain Access.
 - Reading never touches Chrome's live database: `Cookies` (plus any
   `Cookies-wal` / `Cookies-journal`) is copied into a private temp directory and
   `sqlite3` only opens that copy, so Chrome's file is never locked or rewritten.
-  `sqlite3` and `security` are spawned by absolute path (`/usr/bin/...`, the
-  macOS system copies) instead of being resolved through `PATH`, so nothing on
-  the user's path can intercept Chrome's key or jar. Failures surface as a fixed
-  message, never the command line.
+  `sqlite3` is spawned by absolute path (`/usr/bin/sqlite3`, the macOS system
+  copy) instead of being resolved through `PATH`, so nothing on the user's path
+  can intercept Chrome's jar. Failures surface as a fixed message, never the
+  command line.
 - Cookies land in the conversation's existing in-memory partition, so they
   disappear when the app quits; nothing is written back to Chrome, and there is
   no background sync.
 - Cookies alone don't always reproduce a sign-in (localStorage, device checks,
   `HttpOnly` site state), and an agent-controlled tab means the agent can act as
-  you on that site while they're loaded — the dialog says so. For real SSO use
+  you on the imported sites while they're loaded — the dialog says so. For real SSO use
   system-browser sign-in above.
 
 **JS trust boundary:** `omnigent:browser-perform-action` accepts only snapshot,
@@ -945,12 +992,11 @@ install production desktop updates. `build:mac:release` retains
 cross-platform publishing and update-feed checklist, see [the desktop release
 runbook](RELEASING.md).
 
-macOS apps, including unpackaged development, default to V2 onboarding only when the MDM preference
-`databricksInternalFeaturesEnabled` is `true`, for both new and existing profiles.
-Public macOS users and Windows/Linux keep the legacy
-default. The setup-page switch still persists an explicit choice on every
-platform, and `OMNIGENT_SERVER_SELECTOR_V2=1` forces V2 regardless of the saved
-choice. A saved server still reconnects on launch.
+macOS apps, including unpackaged development, default to V2 onboarding for both
+new and existing profiles. Windows/Linux keep the legacy default. The setup-page
+switch still persists an explicit choice on every platform, and
+`OMNIGENT_SERVER_SELECTOR_V2=1` forces V2 regardless of the saved choice. A
+saved server still reconnects on launch.
 
 Unpackaged `pnpm start` / `just electron-dev` runs inside Electron's own macOS
 bundle, but reads local preferences from `ai.omnigent.desktop-dev` explicitly
@@ -1139,10 +1185,10 @@ reconnect this machine explicitly from the host menu when you want it.
 ## Passkeys (WebAuthn)
 
 External security keys (e.g. a YubiKey) work out of the box: Chromium's
-content layer speaks CTAP to the key directly. That's also why the flow is
-_invisible_ — the passkey sheet you see in Chrome/Safari is browser chrome,
-which Electron doesn't ship. Touching the key completes the ceremony with no
-UI.
+content layer speaks CTAP to the key directly. Electron doesn't ship the passkey
+sheet you see in Chrome/Safari, so touching the key completes the ceremony with
+no Chromium UI. The embedded browser pane shows its own
+[security-key notice](#security-keys) while the request waits.
 
 The shell intentionally does **not** enable Electron's Touch ID platform
 authenticator (`app.configureWebAuthn`). Doing so routes the entire WebAuthn

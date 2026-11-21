@@ -11,6 +11,7 @@ import logging
 import os
 import uuid
 from collections.abc import AsyncIterator, Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Literal, cast
 
@@ -25,7 +26,11 @@ from omnigent.harnesses.codex_native.app_server import (
     CodexMessage,
     CodexParams,
     client_for_transport,
+    codex_resume_current_model_provider,
+    codex_resume_unconfigured_model_provider,
+    input_too_large_limits,
     is_compaction_steer_refusal,
+    is_project_hooks_config_refusal,
     is_server_draining_error,
     is_stale_active_turn_error,
     resolve_codex_effort_for_model,
@@ -73,6 +78,7 @@ from omnigent.inner.executor import (
     ExecutorEvent,
     InjectionDeliveryAmbiguous,
     Message,
+    NativeTurnAcceptance,
     ToolSpec,
     TurnComplete,
 )
@@ -105,18 +111,43 @@ _BRIDGE_STATE_FAST_POLL_WINDOW_SECONDS = 2.0
 _BRIDGE_STATE_SLOW_POLL_SECONDS = 0.25
 _COMPACTION_WAIT_TIMEOUT_SECONDS = 60.0
 _DELIVERY_RPC_TIMEOUT_SECONDS = 30.0
+_GOAL_RPC_TIMEOUT_SECONDS = 30.0
 _DELIVERY_RECEIPT_TIMEOUT_SECONDS = 2.0
+_MAX_CODEX_TEXT_INPUT_CHARS = 1 << 20
 _CODEX_COMPACTING_FAILURE = CodexStartupFailure(
     message="Codex is still compacting, so this message was not delivered.",
     code="codex_compacting",
     title="Codex is compacting",
     remediation="Wait for compaction to finish, then send your message again.",
 )
+_CODEX_PROVIDER_CHANGED_FAILURE = CodexStartupFailure(
+    message="Codex rejected this message because the conversation's model provider "
+    "differs from, or is missing in, its current configuration.",
+    code="codex_provider_changed",
+    title="Codex provider configuration changed",
+    remediation="Select and configure the intended provider, restart the session terminal, "
+    "then retry this message.",
+)
+_CODEX_PROJECT_CONFIG_INVALID_FAILURE = CodexStartupFailure(
+    message="Codex could not read this project's hooks configuration, so this message "
+    "was not delivered.",
+    code="codex_project_config_invalid",
+    title="Codex project configuration needs attention",
+    remediation="Check that the project's .codex path is a directory and its config.toml "
+    "is readable, then retry this message.",
+)
 _CODEX_DELIVERY_UNCONFIRMED_FAILURE = CodexStartupFailure(
     message="Codex did not confirm this message. It may already be running.",
     code="codex_delivery_unconfirmed",
     title="Codex delivery is unconfirmed",
     remediation="Check the native terminal for the message before sending it again.",
+)
+_CODEX_SETTINGS_UPDATE_FAILED = CodexStartupFailure(
+    message="Codex did not confirm the model settings, so this message was not delivered.",
+    code="codex_settings_update_failed",
+    title="Codex model settings unconfirmed",
+    remediation="Check the model settings in the native terminal, then retry this message. "
+    "The settings may already have changed.",
 )
 _CODEX_SHELL_AUTHORIZATION_REQUIRED = CodexStartupFailure(
     message="This shell command was not delivered because the server did not authorize "
@@ -128,13 +159,36 @@ _CODEX_SHELL_AUTHORIZATION_REQUIRED = CodexStartupFailure(
 )
 
 
+def _input_too_large_failure(actual_chars: int, max_chars: int) -> CodexStartupFailure:
+    """Describe Codex refusing a message over its input limit."""
+    sizes = (
+        f" ({actual_chars:,} characters; the limit is {max_chars:,})"
+        if actual_chars and max_chars
+        else ""
+    )
+    return CodexStartupFailure(
+        message=f"This message is too long for Codex{sizes}, so it was not delivered.",
+        code="codex_input_too_large",
+        title="Message too long",
+        remediation="Shorten the message or attach large content as a file, then send it again.",
+    )
+
+
 class _CodexNativeInputUndelivered(RuntimeError):
-    """Delivery stopped after a proven refusal and before any resubmission."""
+    """Delivery stopped before native input was submitted or resubmitted."""
 
     def __init__(self, failure: CodexStartupFailure, *, preserve_session: bool = False) -> None:
         self.failure = failure
         self.preserve_session = preserve_session
         super().__init__(failure.message)
+
+
+class _CodexNativeSettingsUpdateFailed(RuntimeError):
+    """A settings request failed before any native input was submitted."""
+
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+        super().__init__(str(error))
 
 
 async def _wait_for_bridge_state(
@@ -435,6 +489,8 @@ async def _native_delivery_request_once(
             outcome = "rpc_rejected_draining"
         elif isinstance(exc, CodexAppServerResponseError) and is_compaction_steer_refusal(exc):
             outcome = "rpc_rejected_compacting"
+        elif isinstance(exc, CodexAppServerResponseError) and input_too_large_limits(exc):
+            outcome = "rpc_rejected_input_too_large"
         log_input_event(
             _logger,
             "codex_native_delivery_finished",
@@ -503,7 +559,7 @@ async def _start_codex_turn(
     state: CodexNativeBridgeState,
     input_items: list[dict[str, object]],
     settings_overrides: Mapping[str, object],
-) -> None:
+) -> NativeTurnAcceptance | None:
     """Apply optional settings and start one Codex turn on an idle thread."""
     settings_overrides = dict(settings_overrides)
     # Settings applied while their config write failed are recorded beside the config.
@@ -533,13 +589,17 @@ async def _start_codex_turn(
         )
     if settings_overrides:
         _require_codex_binding(bridge_dir, state)
-        await client.request(
-            "thread/settings/update",
-            {
-                "threadId": state.thread_id,
-                **settings_overrides,
-            },
-        )
+        try:
+            async with asyncio.timeout(_DELIVERY_RPC_TIMEOUT_SECONDS):
+                await client.request(
+                    "thread/settings/update",
+                    {
+                        "threadId": state.thread_id,
+                        **settings_overrides,
+                    },
+                )
+        except (CodexAppServerResponseError, OSError, WebSocketException) as exc:
+            raise _CodexNativeSettingsUpdateFailed(exc) from exc
         _require_codex_binding(bridge_dir, state)
         # The forwarder and a fresh forwarder state (thread resume / reconnect)
         # re-read config.toml, so mirror what applied; without it they would
@@ -580,6 +640,13 @@ async def _start_codex_turn(
                 turn_id,
             )
 
+        return NativeTurnAcceptance(
+            session_id=state.session_id,
+            thread_id=state.thread_id,
+            response_id=f"codex_{turn_id}",
+        )
+    return None
+
 
 async def _steer_codex_turn(
     client: CodexAppServerClient,
@@ -587,7 +654,7 @@ async def _steer_codex_turn(
     bridge_dir: Path,
     state: CodexNativeBridgeState,
     input_items: list[dict[str, object]],
-) -> None:
+) -> NativeTurnAcceptance | None:
     """Steer one bridge-recorded active Codex turn."""
     assert state.active_turn_id is not None
     response = await _native_delivery_request(
@@ -611,6 +678,13 @@ async def _steer_codex_turn(
                 "Codex native steer acknowledged after the active turn changed: turn_id=%s",
                 turn_id,
             )
+
+        return NativeTurnAcceptance(
+            session_id=state.session_id,
+            thread_id=state.thread_id,
+            response_id=f"codex_{turn_id}",
+        )
+    return None
 
 
 # Bound reconciliation after shell submission before releasing the injection lock.
@@ -732,6 +806,31 @@ async def _wait_for_shell_completion(
         await asyncio.sleep(min(_SHELL_TURN_POLL_SECONDS, max(0, remaining)))
 
 
+async def _set_codex_goal(client: CodexAppServerClient, *, thread_id: str, objective: str) -> None:
+    """Distinguish uncertain goal setup from undelivered objective input."""
+    try:
+        async with asyncio.timeout(_GOAL_RPC_TIMEOUT_SECONDS):
+            await client.request(
+                "thread/goal/set", {"threadId": thread_id, "objective": objective}
+            )
+    except Exception as exc:
+        if isinstance(exc, CodexAppServerResponseError):
+            if is_server_draining_error(exc):
+                raise
+            failure = CodexStartupFailure(message=f"Codex goal request failed: {exc}")
+        else:
+            detail = "request timed out" if isinstance(exc, TimeoutError) else str(exc)
+            failure = CodexStartupFailure(
+                message=f"Codex goal setup may have succeeded: {detail}. "
+                "The objective input was not delivered.",
+                remediation="Open Goal to inspect the current goal before resending this message.",
+            )
+        raise _CodexNativeInputUndelivered(
+            failure,
+            preserve_session=True,
+        ) from exc
+
+
 async def _inject_codex_turn(
     client: CodexAppServerClient,
     *,
@@ -739,24 +838,23 @@ async def _inject_codex_turn(
     state: CodexNativeBridgeState,
     input_items: list[dict[str, object]],
     settings_overrides: Mapping[str, object],
-) -> None:
+) -> NativeTurnAcceptance | None:
     """Retain input while a standalone shell or explicitly refused compaction settles."""
     state = await _wait_for_shell_completion(client, bridge_dir, state)
     try:
-        await _inject_codex_turn_once(
+        return await _inject_codex_turn_once(
             client,
             bridge_dir=bridge_dir,
             state=state,
             input_items=input_items,
             settings_overrides=settings_overrides,
         )
-        return
     except CodexAppServerResponseError as error:
         if state.active_turn_id is None or not is_compaction_steer_refusal(error):
             raise
     recovered_state = await _wait_for_compaction_turn(bridge_dir, state)
     try:
-        await _inject_codex_turn_once(
+        return await _inject_codex_turn_once(
             client,
             bridge_dir=bridge_dir,
             state=recovered_state,
@@ -827,27 +925,25 @@ async def _inject_codex_turn_once(
     state: CodexNativeBridgeState,
     input_items: list[dict[str, object]],
     settings_overrides: Mapping[str, object],
-) -> None:
+) -> NativeTurnAcceptance | None:
     """Steer an active turn or start one, recovering one proven stale steer."""
     if state.active_turn_id is None:
-        await _start_codex_turn(
+        return await _start_codex_turn(
             client,
             bridge_dir=bridge_dir,
             state=state,
             input_items=input_items,
             settings_overrides=settings_overrides,
         )
-        return
 
     expected_turn_id = state.active_turn_id
     try:
-        await _steer_codex_turn(
+        return await _steer_codex_turn(
             client,
             bridge_dir=bridge_dir,
             state=state,
             input_items=input_items,
         )
-        return
     except CodexAppServerResponseError as error:
         if not is_stale_active_turn_error(error):
             raise
@@ -864,15 +960,14 @@ async def _inject_codex_turn_once(
             "Codex native stale steer raced with a newer turn; steering turn_id=%s",
             recovered_state.active_turn_id,
         )
-        await _steer_codex_turn(
+        return await _steer_codex_turn(
             client,
             bridge_dir=bridge_dir,
             state=recovered_state,
             input_items=input_items,
         )
-        return
     _logger.info("Codex native reconciled completed stale turn: turn_id=%s", expected_turn_id)
-    await _start_codex_turn(
+    return await _start_codex_turn(
         client,
         bridge_dir=bridge_dir,
         state=recovered_state,
@@ -926,6 +1021,9 @@ class CodexNativeExecutor(Executor):
         :returns: ``True`` when Codex accepted the steering message.
         """
         del session_key
+        if goal_objective_from_content(content) is not None:
+            # Keep goal setup in run_turn so a refused live message cannot replay it.
+            return False
         input_items = _content_to_input_items(content, self._bridge_dir)
         if not input_items:
             return False
@@ -943,6 +1041,7 @@ class CodexNativeExecutor(Executor):
             if client is None:
                 return False
             try:
+                _require_codex_binding(self._bridge_dir, state)
                 shell_command = _shell_command_from_content(content)
                 if shell_command is not None:
                     await _run_codex_shell_command(
@@ -1107,7 +1206,7 @@ class CodexNativeExecutor(Executor):
             # JSON-RPC -32600 error never reaches the user.
             length_error = goal_objective_length_error(goal_objective)
             if length_error is not None:
-                yield ExecutorError(message=length_error)
+                yield ExecutorError(message=length_error, undelivered=True, preserve_session=True)
                 return
         input_items: list[dict[str, object]] = (
             [{"type": "text", "text": goal_objective}]
@@ -1140,6 +1239,7 @@ class CodexNativeExecutor(Executor):
         undelivered = False
         delivery_unconfirmed = False
         preserve_session = False
+        native_acceptance: NativeTurnAcceptance | None = None
         while True:
             if state is None:
                 (
@@ -1249,14 +1349,10 @@ class CodexNativeExecutor(Executor):
                             side_chat.request_side_chat(self._bridge_dir, side_question)
                         else:
                             if goal_objective is not None:
-                                await client.request(
-                                    "thread/goal/set",
-                                    {
-                                        "threadId": state.thread_id,
-                                        "objective": goal_objective,
-                                    },
+                                await _set_codex_goal(
+                                    client, thread_id=state.thread_id, objective=goal_objective
                                 )
-                            await _inject_codex_turn(
+                            native_acceptance = await _inject_codex_turn(
                                 client,
                                 bridge_dir=self._bridge_dir,
                                 state=state,
@@ -1264,6 +1360,17 @@ class CodexNativeExecutor(Executor):
                                 settings_overrides=settings_overrides,
                             )
                     except Exception as exc:
+                        settings_update_failed = isinstance(exc, _CodexNativeSettingsUpdateFailed)
+                        if isinstance(exc, _CodexNativeSettingsUpdateFailed):
+                            exc = exc.error
+                            startup_failure = _CODEX_SETTINGS_UPDATE_FAILED
+                            if isinstance(exc, CodexAppServerResponseError) and exc.message:
+                                startup_failure = replace(
+                                    startup_failure,
+                                    message=f"{startup_failure.message}\n\n{exc.message}",
+                                )
+                            undelivered = True
+                            preserve_session = True
                         if isinstance(exc, InjectionDeliveryAmbiguous):
                             startup_failure = _CODEX_DELIVERY_UNCONFIRMED_FAILURE
                             delivery_unconfirmed = True
@@ -1271,6 +1378,17 @@ class CodexNativeExecutor(Executor):
                             startup_failure = exc.failure
                             undelivered = True
                             preserve_session = exc.preserve_session
+                        elif (
+                            codex_resume_current_model_provider(exc) is not None
+                            or codex_resume_unconfigured_model_provider(exc) is not None
+                        ):
+                            startup_failure = _CODEX_PROVIDER_CHANGED_FAILURE
+                            undelivered = True
+                            preserve_session = True
+                        elif is_project_hooks_config_refusal(exc):
+                            startup_failure = _CODEX_PROJECT_CONFIG_INVALID_FAILURE
+                            undelivered = True
+                            preserve_session = True
                         elif isinstance(
                             exc, CodexAppServerResponseError
                         ) and is_server_draining_error(exc):
@@ -1281,6 +1399,13 @@ class CodexNativeExecutor(Executor):
                         ) and is_compaction_steer_refusal(exc):
                             startup_failure = _CODEX_COMPACTING_FAILURE
                             undelivered = True
+                        elif isinstance(exc, CodexAppServerResponseError) and (
+                            limits := input_too_large_limits(exc)
+                        ):
+                            # Codex validated and refused the input; the session is unaffected.
+                            startup_failure = _input_too_large_failure(*limits)
+                            undelivered = True
+                            preserve_session = True
                         _logger.exception(
                             "Codex native turn injection failed",
                             extra=with_input_attributes(
@@ -1295,7 +1420,9 @@ class CodexNativeExecutor(Executor):
                                         if isinstance(exc, CodexAppServerResponseError)
                                         else None
                                     ),
-                                    stage="native_rpc",
+                                    stage="settings_update"
+                                    if settings_update_failed
+                                    else "native_rpc",
                                     outcome="undelivered" if undelivered else "error",
                                 )
                             ),
@@ -1334,7 +1461,7 @@ class CodexNativeExecutor(Executor):
                 or (undelivered and state is not None and state.active_turn_id is not None),
             )
         else:
-            yield TurnComplete(response=None)
+            yield TurnComplete(response=None, native_acceptance=native_acceptance)
 
 
 def _model_effort_overrides(config: ExecutorConfig | None) -> dict[str, object]:
@@ -1441,7 +1568,8 @@ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str,
     URI inline as text would blow past the app-server's 1 MiB input
     limit. Files inline their decoded text when they are textual;
     binary files are materialized and referenced by path in a text
-    item so the model can open them with its tools.
+    item so the model can open them with its tools. Text files also use
+    that path when their combined text and the prompt exceed the input limit.
 
     :param content: Message content, e.g. a string or a list of content
         blocks like ``{"type": "input_text", "text": "..."}`` and
@@ -1453,6 +1581,7 @@ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str,
         return [{"type": "text", "text": content}] if content else []
     if isinstance(content, list):
         items: list[dict[str, object]] = []
+        file_blocks: list[tuple[int, dict[str, object]]] = []
         for raw_block in content:
             block = _json_object(raw_block)
             if block is None:
@@ -1484,7 +1613,17 @@ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str,
             elif block_type == "input_file":
                 file_item = _file_block_to_input_item(block, bridge_dir)
                 if file_item is not None:
+                    file_data = block.get("file_data")
+                    if isinstance(file_data, str) and file_data.startswith("data:text/"):
+                        file_blocks.append((len(items), block))
                     items.append(file_item)
+        if sum(len(text) for item in items if isinstance(text := item.get("text"), str)) > (
+            _MAX_CODEX_TEXT_INPUT_CHARS
+        ):
+            for index, block in file_blocks:
+                file_item = _file_block_to_input_item(block, bridge_dir, inline_text=False)
+                if file_item is not None:
+                    items[index] = file_item
         return items
     if content is None:
         return []
@@ -1512,6 +1651,8 @@ def _apply_resize_notice_to_latest_image(
 def _file_block_to_input_item(
     block: Mapping[str, object],
     bridge_dir: Path,
+    *,
+    inline_text: bool = True,
 ) -> dict[str, object] | None:
     """
     Convert an ``input_file`` block into a Codex input item.
@@ -1526,12 +1667,13 @@ def _file_block_to_input_item(
         ``file_data`` data URI, e.g.
         ``"data:text/plain;base64,aGVsbG8="``.
     :param bridge_dir: Session bridge path identifying the attachment cache.
-    :returns: A Codex ``text`` input item; a visible could-not-load
-        marker item when the file failed to materialize; or ``None``
-        for an empty text file.
+    :param inline_text: Whether text files fit in the turn's text budget.
+    :returns: A Codex ``text`` input item; a visible could-not-load marker
+        when normal delivery fails; or ``None`` for empty text or a failed
+        optional spill, letting the caller retain its original inline item.
     """
     file_data = block.get("file_data")
-    if isinstance(file_data, str) and file_data.startswith("data:"):
+    if inline_text and isinstance(file_data, str) and file_data.startswith("data:"):
         try:
             parsed = parse_data_uri(file_data)
             if parsed.mime_type.startswith("text/"):
@@ -1546,6 +1688,8 @@ def _file_block_to_input_item(
         # matching _ATTACHMENT_MARKER_RE in
         # omnigent/entities/conversation.py. Keep in sync.
         return {"type": "text", "text": f"[Attached file: {path}]"}
+    if not inline_text:
+        return None
     return {"type": "text", "text": unresolved_attachment_marker(block)}
 
 

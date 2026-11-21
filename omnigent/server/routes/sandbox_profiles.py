@@ -16,6 +16,8 @@ from omnigent.server.routes._auth_helpers import require_user
 class SandboxProfilesResponse(BaseModel):
     profiles: list[SandboxProfileSummary]
     managed_providers: list[str]
+    # Provider -> profile ID a create that names none takes; clients preselect it.
+    default_profile_ids: dict[str, str] = {}
     next_cursor: str | None
 
 
@@ -36,7 +38,12 @@ def create_sandbox_profiles_router(*, auth_provider: AuthProvider | None) -> API
         response.headers["Cache-Control"] = "private, no-store"
         service = getattr(request.app.state, "sandbox_profiles", None)
         if service is None:
-            return {"profiles": [], "managed_providers": [], "next_cursor": None}
+            return {
+                "profiles": [],
+                "managed_providers": [],
+                "default_profile_ids": {},
+                "next_cursor": None,
+            }
         profiles, next_cursor = await asyncio.to_thread(
             service.list_profiles,
             cursor=cursor,
@@ -47,9 +54,11 @@ def create_sandbox_profiles_router(*, auth_provider: AuthProvider | None) -> API
             profile_id=profile_id,
         )
         managed_providers = await asyncio.to_thread(service.managed_providers, provider)
+        default_profile_ids = await asyncio.to_thread(service.default_profile_ids, provider)
         return {
             "profiles": profiles,
             "managed_providers": managed_providers,
+            "default_profile_ids": default_profile_ids,
             "next_cursor": next_cursor,
         }
 
