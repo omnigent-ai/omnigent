@@ -12,6 +12,7 @@ from omnigent_slack.omnigent import (
     HarnessNotConfiguredError,
     HostType,
     HostUnavailableError,
+    McpSelectionError,
     OmnigentError,
     RunnerUnavailableError,
     ServerUnreachableError,
@@ -239,6 +240,8 @@ class FakeOmnigentClient:
         # host_type each create_session / run_turn was asked for, so a test can
         # prove a managed session never reaches the runner-launch path.
         self.created_host_types: list[str] = []
+        # MCP registry services each create_session was asked for.
+        self.created_mcp_services: list[tuple[str, ...]] = []
         self.turn_host_types: list[str] = []
         self.bound: list[str] = []
         self.launched: list[tuple[str, str, str | None]] = []
@@ -282,10 +285,16 @@ class FakeOmnigentClient:
         return SessionInfo(harness=self.info_harness, agent_name=self.info_agent_name)
 
     async def create_session(
-        self, agent_id: str, title: str, *, host_type: str = "external"
+        self,
+        agent_id: str,
+        title: str,
+        *,
+        host_type: str = "external",
+        mcp_registry_services: tuple[str, ...] = (),
     ) -> str:
         self.created.append((agent_id, title))
         self.created_host_types.append(host_type)
+        self.created_mcp_services.append(mcp_registry_services)
         return self.next_session_id
 
     async def launch_runner(
@@ -434,6 +443,7 @@ async def _configure_user(
     workspace: str = "/tmp/workspace",
     host_id: str | None = None,
     host_type: HostType = "external",
+    mcp_registry_services: tuple[str, ...] = (),
 ) -> None:
     await store.upsert_user_config(
         team_id,
@@ -444,6 +454,7 @@ async def _configure_user(
             workspace=workspace,
             host_id=host_id,
             host_type=host_type,
+            mcp_registry_services=mcp_registry_services,
         ),
     )
 
@@ -2178,7 +2189,12 @@ async def test_turn_runs_against_the_fixed_operator_server(tmp_path: Path) -> No
 
 class ServerUnreachableClient(FakeOmnigentClient):
     async def create_session(
-        self, agent_id: str, title: str, *, host_type: str = "external"
+        self,
+        agent_id: str,
+        title: str,
+        *,
+        host_type: str = "external",
+        mcp_registry_services: tuple[str, ...] = (),
     ) -> str:
         raise ServerUnreachableError("boom")
 
@@ -2192,18 +2208,43 @@ class HostUnavailableClient(FakeOmnigentClient):
 
 class AuthRequiredClient(FakeOmnigentClient):
     async def create_session(
-        self, agent_id: str, title: str, *, host_type: str = "external"
+        self,
+        agent_id: str,
+        title: str,
+        *,
+        host_type: str = "external",
+        mcp_registry_services: tuple[str, ...] = (),
     ) -> str:
         raise AuthRequiredError("401")
 
 
 class ServerErrorClient(FakeOmnigentClient):
     async def create_session(
-        self, agent_id: str, title: str, *, host_type: str = "external"
+        self,
+        agent_id: str,
+        title: str,
+        *,
+        host_type: str = "external",
+        mcp_registry_services: tuple[str, ...] = (),
     ) -> str:
         # Mirrors a 500 from POST /v1/sessions: a bare OmnigentError, NOT one of
         # the specifically-handled subclasses.
         raise OmnigentError("Omnigent request failed with 500: internal_error")
+
+
+class StaleMcpClient(FakeOmnigentClient):
+    async def create_session(
+        self,
+        agent_id: str,
+        title: str,
+        *,
+        host_type: str = "external",
+        mcp_registry_services: tuple[str, ...] = (),
+    ) -> str:
+        # Mirrors a 403/409 from POST /v1/sessions with a pinned selection the
+        # server no longer accepts — and records what the turn asked for.
+        self.created_mcp_services.append(mcp_registry_services)
+        raise McpSelectionError("The MCP services pinned in Slack setup were rejected.")
 
 
 async def _wait_for_posts(client: FakeSlackClient, count: int) -> None:
@@ -2385,6 +2426,34 @@ async def test_server_error_creating_session_reports(tmp_path: Path) -> None:
     assert "500" not in text
     # A non-auth error is PUBLIC (affects everyone on the thread), unlike the
     # expired-login notice which is DM'd to the owner — no ephemeral here.
+    assert slack.ephemerals == []
+
+
+async def test_stale_pinned_mcps_tell_the_user_to_repick(tmp_path: Path) -> None:
+    # A pinned selection the server rejects must not read as a generic startup
+    # failure: the user is told to re-run /omnigent and re-pick, and the pin
+    # that was sent is the one from their stored setup.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = StaleMcpClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1", mcp_registry_services=("tracker",))
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> hi"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_posts(slack, 1)
+    await _wait_for_turns(service)
+    await service.shutdown()
+
+    assert omnigent.created_mcp_services == [("tracker",)]
+    assert await store.get_session(ThreadKey("T1", "C1", "100.1")) is None
+    text = slack.posts[-1]["text"]
+    assert "/omnigent" in text
+    assert "re-pick" in text
     assert slack.ephemerals == []
 
 

@@ -25,6 +25,7 @@ from omnigent_slack.omnigent import (
     HarnessNotConfiguredError,
     HostType,
     HostUnavailableError,
+    McpSelectionError,
     OmnigentClient,
     OmnigentClientPool,
     RunnerUnavailableError,
@@ -573,6 +574,7 @@ class SlackOmnigentService:
                     workspace=config.workspace,
                     host_id=config.host_id,
                     host_type=config.host_type,
+                    mcp_registry_services=config.mcp_registry_services,
                 )
             )
             spawned = True
@@ -797,7 +799,10 @@ class SlackOmnigentService:
 
         try:
             session_id = await omnigent.create_session(
-                turn.agent_id, turn.title, host_type=turn.host_type
+                turn.agent_id,
+                turn.title,
+                host_type=turn.host_type,
+                mcp_registry_services=turn.mcp_registry_services,
             )
             runner_id: str | None = None
             if turn.host_type == "managed":
@@ -827,6 +832,18 @@ class SlackOmnigentService:
                 "Session startup needs re-login thread=%s: %s", turn.key.display(), exc
             )
             raise _AuthExpired() from exc
+        except McpSelectionError as exc:
+            # A pinned service stopped being usable after setup (disconnected,
+            # revoked, or colliding with the agent). Retrying the same thread
+            # can't help; the user has to re-pick in setup.
+            self._logger.info(
+                "Session startup rejected pinned MCPs thread=%s: %s", turn.key.display(), exc
+            )
+            raise _TurnAborted(
+                ":warning: Your saved MCP choices in Slack setup no longer work "
+                "(a service was disconnected, or it clashes with the agent). "
+                "Run `/omnigent` and re-pick them, then start a new thread."
+            ) from exc
         except (
             ServerUnreachableError,
             HostUnavailableError,

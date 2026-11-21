@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ from omnigent_slack.models import SessionRecord, ThreadKey, UserConfig
 _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("thread_sessions", "host_type", "TEXT NOT NULL DEFAULT 'external'"),
     ("user_configs", "host_type", "TEXT NOT NULL DEFAULT 'external'"),
+    ("user_configs", "mcp_registry_services", "TEXT NOT NULL DEFAULT ''"),
     ("thread_sessions", "turn_inflight", "INTEGER NOT NULL DEFAULT 0"),
 )
 
@@ -30,6 +32,29 @@ def _host_type(value: Any) -> HostType:
     land on ``"external"`` — the behavior every pre-existing row had.
     """
     return "managed" if value == "managed" else "external"
+
+
+def _encode_mcp_services(services: tuple[str, ...]) -> str:
+    """Store a pinned MCP list as JSON, so service ids survive verbatim."""
+    return json.dumps(list(services))
+
+
+def _decode_mcp_services(value: Any) -> tuple[str, ...]:
+    """Read a pinned MCP list back; a blank or malformed value means none.
+
+    A row written before the column existed reads as its ``''`` default, and
+    anything unrecognized would be a hand-edited database. Both land on
+    ``()`` — the behavior every pre-existing row had.
+    """
+    if not isinstance(value, str) or not value:
+        return ()
+    try:
+        decoded = json.loads(value)
+    except (json.JSONDecodeError, ValueError):
+        return ()
+    if not isinstance(decoded, list):
+        return ()
+    return tuple(item for item in decoded if isinstance(item, str))
 
 
 class SQLiteStore:
@@ -78,6 +103,7 @@ class SQLiteStore:
                     host_id TEXT,
                     host_name TEXT,
                     host_type TEXT NOT NULL DEFAULT 'external',
+                    mcp_registry_services TEXT NOT NULL DEFAULT '',
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL,
                     PRIMARY KEY (team_id, user_id)
@@ -201,7 +227,8 @@ class SQLiteStore:
         async with aiosqlite.connect(self._path) as db:
             cursor = await db.execute(
                 """
-                SELECT agent_id, agent_name, workspace, host_id, host_name, host_type
+                SELECT agent_id, agent_name, workspace, host_id, host_name, host_type,
+                       mcp_registry_services
                 FROM user_configs
                 WHERE team_id = ? AND user_id = ?
                 """,
@@ -218,6 +245,7 @@ class SQLiteStore:
             host_id=str(row[3]) if row[3] is not None else None,
             host_name=str(row[4]) if row[4] is not None else None,
             host_type=_host_type(row[5]),
+            mcp_registry_services=_decode_mcp_services(row[6]),
         )
 
     async def upsert_user_config(self, team_id: str, user_id: str, config: UserConfig) -> None:
@@ -227,9 +255,10 @@ class SQLiteStore:
                 """
                 INSERT INTO user_configs (
                     team_id, user_id, agent_id, agent_name, workspace,
-                    host_id, host_name, host_type, created_at, updated_at
+                    host_id, host_name, host_type, mcp_registry_services,
+                    created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(team_id, user_id) DO UPDATE SET
                     agent_id = excluded.agent_id,
                     agent_name = excluded.agent_name,
@@ -237,6 +266,7 @@ class SQLiteStore:
                     host_id = excluded.host_id,
                     host_name = excluded.host_name,
                     host_type = excluded.host_type,
+                    mcp_registry_services = excluded.mcp_registry_services,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -248,6 +278,7 @@ class SQLiteStore:
                     config.host_id,
                     config.host_name,
                     config.host_type,
+                    _encode_mcp_services(config.mcp_registry_services),
                     now,
                     now,
                 ),

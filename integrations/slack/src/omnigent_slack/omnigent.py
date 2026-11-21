@@ -7,7 +7,7 @@ import logging
 import random
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -53,6 +53,7 @@ __all__ = [
     "HarnessNotConfiguredError",
     "HostType",
     "HostUnavailableError",
+    "McpSelectionError",
     "OmnigentClient",
     "OmnigentClientPool",
     "OmnigentError",
@@ -148,6 +149,16 @@ class HarnessNotConfiguredError(OmnigentError):
     """
 
 
+class McpSelectionError(OmnigentError):
+    """The server rejected the MCP registry services pinned at setup.
+
+    Raised when a session is created with a pinned selection the owner can no
+    longer use — a service disconnected or revoked since setup, or a name
+    colliding with the chosen agent's own custom server. The user resolves it
+    by re-running setup and re-picking, not by retrying the same thread.
+    """
+
+
 # A long-lived turn stream is severed by a proxy max-duration cap (e.g. the
 # ~5-minute cutoff fronting Databricks-App-hosted servers) while the turn keeps
 # running server-side. Reconnect transparently rather than reporting the server
@@ -218,6 +229,11 @@ class ValidatedServer:
     readable. A failed probe leaves ``managed_hosts`` False — the option is
     still withheld — but callers must not then tell a user the server
     provisions no sandboxes, which is a claim we never established.
+
+    ``mcp_services`` is the MCP registry catalog as this user sees it
+    (``GET /v1/mcp-registry/services``), each entry carrying its ``connected``
+    flag. Empty when the registry is unavailable on the server, so setup can
+    degrade to the picker without it.
     """
 
     agents: list[dict[str, Any]]
@@ -225,6 +241,7 @@ class ValidatedServer:
     managed_hosts: bool = False
     managed_host_provider: str | None = None
     managed_support_known: bool = True
+    mcp_services: list[dict[str, Any]] = field(default_factory=list)
 
 
 class ClientAuth:
@@ -403,6 +420,18 @@ class OmnigentClient:
         hosts = await self.list_hosts()
         online_hosts = [host for host in hosts if _is_host_online(host)]
         managed_supported, provider = await self.managed_host_support()
+        # The registry is a best-effort extra: an older server without it must
+        # not break setup, so an unreadable catalog degrades to "no MCP block"
+        # rather than failing validation. Auth failures still surface — the
+        # token was good enough for agents/hosts a moment ago, so a 401 here
+        # is a real sign-in problem, not a missing endpoint.
+        try:
+            mcp_services = await self.list_mcp_registry_services()
+        except AuthRequiredError:
+            raise
+        except OmnigentError as exc:
+            self._logger.info("MCP registry unavailable; setup offers no MCP choice: %s", exc)
+            mcp_services = []
         return ValidatedServer(
             agents=agents,
             online_hosts=online_hosts,
@@ -411,6 +440,7 @@ class OmnigentClient:
             managed_hosts=managed_supported is True,
             managed_host_provider=provider,
             managed_support_known=managed_supported is not None,
+            mcp_services=mcp_services,
         )
 
     async def managed_host_support(self) -> tuple[bool | None, str | None]:
@@ -435,17 +465,34 @@ class OmnigentClient:
         self._logger.debug("Omnigent managed sandboxes enabled=%s provider=%s", enabled, provider)
         return enabled, provider if isinstance(provider, str) and provider else None
 
+    async def list_mcp_registry_services(self) -> list[dict[str, Any]]:
+        """List the MCP registry catalog as the authenticated user.
+
+        One page at the server's default limit — the catalog order is
+        ascending service id, and Slack's multi-select caps at 100 options, so
+        a further page could not be offered anyway. Each entry carries ``id``,
+        ``title`` and ``connected`` (see ``designs/MCP_REGISTRY_API.md``).
+        """
+        self._logger.debug("Listing MCP registry services")
+        services = await self._get_list("/v1/mcp-registry/services", "data", "services")
+        self._logger.info("Found MCP registry services count=%s", len(services))
+        return services
+
     async def create_session(
         self,
         agent_id: str,
         title: str,
         *,
         host_type: HostType = "external",
+        mcp_registry_services: tuple[str, ...] = (),
     ) -> str:
         # Don't log the title — it embeds the user's message text; log only the
         # agent id (everywhere else we log lengths, not content).
         self._logger.info(
-            "Creating Omnigent session agent_id=%s host_type=%s", agent_id, host_type
+            "Creating Omnigent session agent_id=%s host_type=%s mcp_services=%s",
+            agent_id,
+            host_type,
+            len(mcp_registry_services),
         )
         body: dict[str, Any] = {"agent_id": agent_id, "title": title}
         if host_type == "managed":
@@ -454,8 +501,25 @@ class OmnigentClient:
             # switch. The key is omitted for an external session so that request
             # stays byte-identical to what the server has always received.
             body["host_type"] = host_type
+        if mcp_registry_services:
+            # Likewise omitted when empty, so a user with nothing pinned sends
+            # exactly the request the bot has always sent.
+            body["mcp_registry_services"] = list(mcp_registry_services)
         response = await self._request("POST", "/v1/sessions", json=body)
-        await _raise_for_status(response)
+        try:
+            await _raise_for_status(response)
+        except OmnigentError as exc:
+            if mcp_registry_services and response.status_code in (403, 409, 422):
+                # With a pinned selection in the request, these are the
+                # registry rejections: not connected / not allowed (403), a
+                # name colliding with the agent's own server (409), or an
+                # invalid selection (422). Surface them as a selection failure
+                # so the caller can tell the user to re-pick, instead of a
+                # generic startup failure.
+                raise McpSelectionError(
+                    "The MCP services pinned in Slack setup were rejected by the server."
+                ) from exc
+            raise
         payload = response.json()
         session_id = _extract_session_id(payload)
         if session_id is None:

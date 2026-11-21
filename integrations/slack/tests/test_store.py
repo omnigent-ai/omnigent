@@ -123,6 +123,68 @@ async def test_store_adds_host_type_to_a_pre_existing_database(tmp_path: Path) -
     assert await store.get_user_config("T1", "U1") == config
 
 
+async def test_store_round_trips_pinned_mcp_services(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.sqlite3")
+    await store.initialize()
+
+    config = UserConfig(
+        agent_id="ag_1",
+        agent_name="Helper",
+        workspace="/home/me/project",
+        host_id="h1",
+        mcp_registry_services=("tracker", "notes"),
+    )
+    await store.upsert_user_config("T1", "U1", config)
+    assert await store.get_user_config("T1", "U1") == config
+
+    # Clearing the pin in setup overwrites it with an empty list.
+    await store.upsert_user_config(
+        "T1", "U1", UserConfig("ag_1", "Helper", "/home/me/project", host_id="h1")
+    )
+    reread = await store.get_user_config("T1", "U1")
+    assert reread is not None
+    assert reread.mcp_registry_services == ()
+
+
+async def test_store_adds_mcp_services_to_a_pre_existing_database(tmp_path: Path) -> None:
+    # A store written before the MCP column existed keeps the old table shape.
+    # initialize() must add it in place and read existing rows as "no MCPs
+    # pinned" — the behavior they were saved with.
+    path = tmp_path / "store.sqlite3"
+    async with aiosqlite.connect(path) as db:
+        await db.execute(
+            """
+            CREATE TABLE user_configs (
+                team_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                agent_name TEXT NOT NULL,
+                workspace TEXT,
+                host_id TEXT,
+                host_name TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (team_id, user_id)
+            )
+            """
+        )
+        await db.execute(
+            "INSERT INTO user_configs VALUES ('T1','U1','ag_1','Helper','/ws','h1','H',1,1)"
+        )
+        await db.commit()
+
+    store = SQLiteStore(path)
+    await store.initialize()
+
+    config = await store.get_user_config("T1", "U1")
+    assert config is not None
+    assert config.mcp_registry_services == ()
+    assert config.host_type == "external"
+    # Idempotent: a second initialize on the upgraded file must not fail.
+    await store.initialize()
+    assert await store.get_user_config("T1", "U1") == config
+
+
 async def test_store_claim_event_dedupes(tmp_path: Path) -> None:
     store = SQLiteStore(tmp_path / "store.sqlite3")
     await store.initialize()
