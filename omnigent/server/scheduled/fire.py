@@ -1446,10 +1446,12 @@ async def continued_session_problem(
                 f"the session runs {where}, unlike the automation's execution target",
                 "continued_session_incompatible",
             )
-    from omnigent.server.routes._sessions.common import _LAST_TASK_ERROR_CODE_LABEL_KEY
+    from omnigent.server.routes._sessions.helpers import _last_task_error_from_labels
 
-    # Another prompt would fail the same way and only add to the full history.
-    if conv.labels.get(_LAST_TASK_ERROR_CODE_LABEL_KEY) == "context_length_exceeded":
+    # Classify the stored error as the session's snapshot does. Another prompt
+    # would fail the same way and only add to the full history.
+    last_error = _last_task_error_from_labels(conv.labels)
+    if last_error is not None and last_error["code"] == "context_length_exceeded":
         return (
             "the session's context window is full, so every prompt fails until /compact "
             "runs in it",

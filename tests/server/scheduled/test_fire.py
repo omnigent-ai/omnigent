@@ -3800,19 +3800,46 @@ async def test_continue_fails_when_the_owner_no_longer_owns_the_session() -> Non
 
 
 @pytest.mark.asyncio
-async def test_continue_fails_without_sending_when_the_session_context_is_full() -> None:
+@pytest.mark.parametrize(
+    ("error_code", "error_message", "context_full"),
+    [
+        ("context_length_exceeded", "Context limit reached", True),
+        # A gateway's request-size rejection is shown to the owner as a full context.
+        (
+            "native_turn_error",
+            "API Error: 400 Request size exceeds the maximum allowed limit",
+            True,
+        ),
+        ("native_turn_error", "Not logged in", False),
+        # Cleared labels: the session's next turn started.
+        ("", "", False),
+    ],
+    ids=["overflow", "request-size", "other-error", "cleared"],
+)
+async def test_continue_sends_nothing_while_the_session_context_is_full(
+    error_code: str, error_message: str, context_full: bool
+) -> None:
     """A session whose last turn overflowed its context window gets no further prompt."""
     conv_store = _ExistingConversationStore(
-        _continued_session(labels={"omnigent.last_task_error_code": "context_length_exceeded"})
+        _continued_session(
+            labels={
+                "omnigent.last_task_error_code": error_code,
+                "omnigent.last_task_error_message": error_message,
+            }
+        )
     )
     store = FakeScheduledTaskStore(rows={"task_1": _continuing_task()})
 
     launched = await _fire_once(_deps(store, conversation_store=conv_store))
 
-    assert launched == []
     [run] = store.runs
-    assert (run["status"], run["error_code"]) == ("failed", CONTEXT_FULL_ERROR_CODE)
-    assert "/compact" in run["error"]
+    if context_full:
+        assert launched == []
+        assert (run["status"], run["error_code"]) == ("failed", CONTEXT_FULL_ERROR_CODE)
+        assert "/compact" in run["error"]
+    else:
+        assert [conv.id for conv in launched] == ["conv_prev"]
+        assert run["status"] == "succeeded"
 
 
 def _running_run(fired_at: int) -> ScheduledTaskRun:
