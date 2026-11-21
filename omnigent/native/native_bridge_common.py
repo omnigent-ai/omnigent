@@ -19,6 +19,9 @@ own bridge root), plus a dynamic cross-harness reaper for host maintenance or
 standalone runner startup. It mirrors the terminal orphan sweep
 (``inner/terminal.py:reap_orphaned_terminals``) and reuses that module's
 canonical process-liveness predicate.
+
+:func:`refresh_file_times` keeps a live session's launch-time files from
+aging out of a temp dir whose cleaner deletes files by age.
 """
 
 from __future__ import annotations
@@ -28,6 +31,7 @@ import importlib
 import logging
 import os
 import shutil
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -101,6 +105,64 @@ def write_owner_pid_marker(bridge_dir: Path) -> None:
     """
     with contextlib.suppress(OSError):
         (bridge_dir / OWNER_PID_FILENAME).write_text(str(os.getpid()), encoding="utf-8")
+
+
+def refresh_file_times(
+    root: Path,
+    *,
+    older_than_s: float,
+    max_depth: int = 1,
+    now: float | None = None,
+) -> int:
+    """
+    Bump the access and modification times of stale regular files under *root*.
+
+    Temp-dir cleaners delete files by age: macOS ``dirhelper`` runs daily with
+    ``CLEAN_FILES_OLDER_THAN_DAYS=3``, and systemd-tmpfiles ages out ``/tmp``.
+    A file written once at launch would otherwise disappear from under a pane
+    that is still running. File contents never change. Symlinks are skipped
+    rather than followed, so nothing outside *root* is touched. A missing or
+    unreadable entry is skipped.
+
+    :param root: Directory to refresh, e.g. a per-session bridge dir.
+    :param older_than_s: Only files whose mtime is at least this many seconds
+        old are touched, e.g. ``43200.0``.
+    :param max_depth: Directory levels to visit. ``1`` covers files directly in
+        *root*; ``2`` also covers files in its immediate subdirectories.
+    :param now: Timestamp to set, e.g. ``time.time()``. ``None`` uses the
+        current time.
+    :returns: Number of files refreshed.
+    """
+    current = time.time() if now is None else now
+    cutoff = current - older_than_s
+    # Never follow a link where the platform allows it; symlinks are skipped below anyway.
+    follow_links = os.utime not in os.supports_follow_symlinks
+    refreshed = 0
+    pending = [(root, 1)]
+    while pending:
+        directory, depth = pending.pop()
+        try:
+            with os.scandir(directory) as scan:
+                entries = list(scan)
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if entry.is_symlink():
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    if depth < max_depth:
+                        pending.append((Path(entry.path), depth + 1))
+                    continue
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                if entry.stat(follow_symlinks=False).st_mtime > cutoff:
+                    continue
+                os.utime(entry.path, (current, current), follow_symlinks=follow_links)
+            except OSError:
+                continue
+            refreshed += 1
+    return refreshed
 
 
 def prune_orphaned_dirs(

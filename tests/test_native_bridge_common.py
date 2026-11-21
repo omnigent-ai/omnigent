@@ -462,3 +462,92 @@ def test_relay_in_another_workspace_accepts_the_runner_bridge_dir(
     )
 
     assert Path(relay_root) == Path(runner_root) == launch_dir.resolve() / "state" / dirname
+
+
+_FOUR_DAYS_S = 4 * 24 * 60 * 60.0
+_ONE_HOUR_S = 60 * 60.0
+_HALF_DAY_S = 12 * 60 * 60.0
+
+
+def _age(path: Path, seconds: float, *, now: float) -> None:
+    os.utime(path, (now - seconds, now - seconds))
+
+
+def test_refresh_file_times_bumps_only_stale_files(tmp_path: Path) -> None:
+    """Files past the age limit get the new time; fresh files and contents stay as they are."""
+    now = 1_800_000_000.0
+    stale = tmp_path / "tmux.json"
+    stale.write_text('{"socket_path": "/x"}', encoding="utf-8")
+    fresh = tmp_path / "state.json"
+    fresh.write_text("{}", encoding="utf-8")
+    _age(stale, _FOUR_DAYS_S, now=now)
+    _age(fresh, _ONE_HOUR_S, now=now)
+
+    refreshed = native_bridge_common.refresh_file_times(
+        tmp_path, older_than_s=_HALF_DAY_S, now=now
+    )
+
+    assert refreshed == 1
+    assert stale.stat().st_mtime == now
+    assert stale.stat().st_atime == now
+    assert fresh.stat().st_mtime == now - _ONE_HOUR_S
+    assert stale.read_text(encoding="utf-8") == '{"socket_path": "/x"}'
+
+
+def test_refresh_file_times_does_not_follow_symlinks(tmp_path: Path) -> None:
+    """A symlink inside the root never leads the refresh to a file outside it."""
+    now = 1_800_000_000.0
+    root = tmp_path / "bridge"
+    root.mkdir()
+    outside = tmp_path / "outside.json"
+    outside.write_text("{}", encoding="utf-8")
+    _age(outside, _FOUR_DAYS_S, now=now)
+    (root / "tmux.json").symlink_to(outside)
+    outside_dir = tmp_path / "outside-dir"
+    outside_dir.mkdir()
+    nested = outside_dir / "secret.json"
+    nested.write_text("{}", encoding="utf-8")
+    _age(nested, _FOUR_DAYS_S, now=now)
+    (root / "linked-dir").symlink_to(outside_dir, target_is_directory=True)
+
+    refreshed = native_bridge_common.refresh_file_times(
+        root, older_than_s=_HALF_DAY_S, max_depth=2, now=now
+    )
+
+    assert refreshed == 0
+    assert outside.stat().st_mtime == now - _FOUR_DAYS_S
+    assert nested.stat().st_mtime == now - _FOUR_DAYS_S
+
+
+def test_refresh_file_times_respects_max_depth(tmp_path: Path) -> None:
+    """``max_depth=1`` stays in the root; ``max_depth=2`` adds one level of subdirectories."""
+    now = 1_800_000_000.0
+    top = tmp_path / "program-status.json"
+    child = tmp_path / "clipboard-bin" / "pbcopy"
+    grandchild = tmp_path / "clipboard-bin" / "deeper" / "file"
+    grandchild.parent.mkdir(parents=True)
+    for path in (top, child, grandchild):
+        path.write_text("x", encoding="utf-8")
+        _age(path, _FOUR_DAYS_S, now=now)
+
+    assert (
+        native_bridge_common.refresh_file_times(tmp_path, older_than_s=_HALF_DAY_S, now=now) == 1
+    )
+    assert top.stat().st_mtime == now
+    assert child.stat().st_mtime == now - _FOUR_DAYS_S
+
+    assert (
+        native_bridge_common.refresh_file_times(
+            tmp_path, older_than_s=_HALF_DAY_S, max_depth=2, now=now
+        )
+        == 1
+    )
+    assert child.stat().st_mtime == now
+    assert grandchild.stat().st_mtime == now - _FOUR_DAYS_S
+
+
+def test_refresh_file_times_missing_root_is_a_no_op(tmp_path: Path) -> None:
+    """A bridge dir that is already gone is not an error."""
+    assert (
+        native_bridge_common.refresh_file_times(tmp_path / "gone", older_than_s=_HALF_DAY_S) == 0
+    )
