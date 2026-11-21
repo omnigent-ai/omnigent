@@ -9124,6 +9124,8 @@ class _ClaudeSessionLaunchMetadata:
     external_session_id: str | None = None
     fork_source_external_id: str | None = None
     fork_carry_history: bool = False
+    #: The session's own recorded cost, which a cold resume restores into Claude.
+    resume_cost_usd: float | None = None
     #: Both routing fields come from ``routing_class_from_snapshot``, so an
     #: auto-harness session always reads as routing-enabled too. Deriving them
     #: separately was the bug: a sub-agent child of a routed parent carries the
@@ -9171,6 +9173,7 @@ def _claude_launch_metadata_from_envelope(
             fork_source if isinstance(fork_source, str) and fork_source else None
         ),
         fork_carry_history=snapshot.labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1",
+        resume_cost_usd=snapshot.own_cost_usd,
     )
 
 
@@ -9179,6 +9182,7 @@ async def _load_legacy_claude_launch_metadata(
     session_id: str,
 ) -> _ClaudeSessionLaunchMetadata:
     """Fetch Claude launch metadata for servers predating the init envelope."""
+    from omnigent.harnesses.claude_native.main import _claude_resume_cost_from_snapshot
     from omnigent.runner.subagent_routing import routing_class_from_snapshot
     from omnigent.stores.conversation_store import (
         FORK_CARRY_HISTORY_LABEL_KEY,
@@ -9237,6 +9241,7 @@ async def _load_legacy_claude_launch_metadata(
             fork_source if isinstance(fork_source, str) and fork_source else None
         ),
         fork_carry_history=labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1",
+        resume_cost_usd=_claude_resume_cost_from_snapshot(snapshot),
     )
     permission_mode = _claude_launch_permission_mode(metadata.terminal_launch_args)
     _logger.info(
@@ -9603,6 +9608,7 @@ async def _auto_create_claude_terminal(
                 workspace=Path(workspace).resolve(),
                 bridge_dir=bridge_dir,
                 resume_copy=resume_session_id != session_external_id,
+                resume_cost_usd=launch_metadata.resume_cost_usd,
             )
             if _transcript is not None:
                 resume_external_session_id = resume_session_id
