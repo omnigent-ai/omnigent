@@ -213,7 +213,11 @@ vi.mock("@/lib/serverOrigin", () => ({
 import { useConversations } from "@/hooks/useConversations";
 import { useChatStore } from "@/store/chatStore";
 import { Sidebar } from "./Sidebar";
-import { EXPANDED_PROJECT_SECTIONS_STORAGE_KEY } from "./sidebarNav";
+import {
+  COLLAPSED_SESSION_FAMILIES_STORAGE_KEY,
+  EXPANDED_PROJECT_SECTIONS_STORAGE_KEY,
+  MAX_STORED_COLLAPSED_SESSION_FAMILIES,
+} from "./sidebarNav";
 import { useSessionImportStore } from "@/store/sessionImport";
 import * as identity from "@/lib/identity";
 
@@ -2602,6 +2606,45 @@ describe("Sidebar sections", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Expand session family" }));
     expect(screen.getByText("conv_nested")).toBeInTheDocument();
+  });
+
+  it("restores each family's collapsed state when the sidebar mounts again", () => {
+    const family = { id: "family", representative_id: "conv_parent", pinned: false };
+    mockConversations([
+      conv("conv_parent", "Claude Code", { updated_at: 2, family }),
+      conv("conv_nested", "Claude Code", { updated_at: 1, family }),
+    ]);
+    renderSidebar();
+    fireEvent.click(screen.getByRole("button", { name: "Collapse session family" }));
+
+    cleanup();
+    renderSidebar();
+    expect(screen.queryByText("conv_nested")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Expand session family" }));
+
+    cleanup();
+    renderSidebar();
+    expect(screen.getByText("conv_nested")).toBeInTheDocument();
+  });
+
+  it("stores only the most recently collapsed families", () => {
+    const stale = Array.from(
+      { length: MAX_STORED_COLLAPSED_SESSION_FAMILIES },
+      (_, index) => `stale_${index}`,
+    );
+    localStorage.setItem(COLLAPSED_SESSION_FAMILIES_STORAGE_KEY, JSON.stringify(stale));
+    const family = { id: "family", representative_id: "conv_parent", pinned: false };
+    mockConversations([
+      conv("conv_parent", "Claude Code", { updated_at: 2, family }),
+      conv("conv_nested", "Claude Code", { updated_at: 1, family }),
+    ]);
+    renderSidebar();
+    fireEvent.click(screen.getByRole("button", { name: "Collapse session family" }));
+
+    expect(JSON.parse(localStorage.getItem(COLLAPSED_SESSION_FAMILIES_STORAGE_KEY)!)).toEqual([
+      ...stale.slice(1),
+      "family",
+    ]);
   });
 });
 

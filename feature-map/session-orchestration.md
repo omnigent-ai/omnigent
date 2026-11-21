@@ -20,6 +20,10 @@ MCP independent creation.
   sender reads "From another session". The prefix is a label, not proof of origin.
 - `read-results`: the manager reads history/status; replies are not forwarded.
   Existing owner-authorized reads remain allowed when a session is shared.
+  `sys_session_get_info` reports the session's `permission_mode` in its
+  harness's vocabulary, as `sys_session_create` takes it, including a switch
+  made while it runs; `null` when the harness has no permission modes or the
+  mode is unknown. Coverage: `tests/e2e/test_session_info_permission_mode_e2e.py`.
 - `created-by`: independent workers record their creating session. The worker's
   Chat/Terminal header rechecks access when opened, hides attribution during the
   lookup, and links to the creator when accessible; otherwise it says "Created by

@@ -1784,6 +1784,7 @@ def _build_session_response(
             conv, agent_store=agent_store, agent_cache=agent_cache, agent=agent
         )
     from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
+    from omnigent.server.scheduled.harness_settings import session_permission_mode
 
     native_usage_baseline = None
     if harness in ("pi-native", "claude-native") or (
@@ -1836,6 +1837,7 @@ def _build_session_response(
         root_conversation_id=conv.root_conversation_id,
         llm_model=llm_model,
         harness=harness,
+        permission_mode=session_permission_mode(conv, harness) if harness else None,
         model_override=conv.model_override,
         cost_control_mode_override=conv.cost_control_mode_override,
         subagent_routing_override=conv.subagent_routing_override,

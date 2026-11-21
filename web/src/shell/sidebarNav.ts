@@ -106,6 +106,12 @@ export const COLLAPSED_SIDEBAR_SECTIONS_STORAGE_KEY = "omnigent:collapsed-sideba
 // when its name is present here.
 export const EXPANDED_PROJECT_SECTIONS_STORAGE_KEY = "omnigent:expanded-project-sections";
 
+// Ids of session families (a session and its nested agents) the user has
+// collapsed. Families default to expanded, so only collapsed ids are stored.
+export const COLLAPSED_SESSION_FAMILIES_STORAGE_KEY = "omnigent:collapsed-session-families";
+// A family deleted while collapsed never leaves the list, so keep only the newest ids.
+export const MAX_STORED_COLLAPSED_SESSION_FAMILIES = 500;
+
 // Snapshot of the active chat's updated_at at the moment the user
 // entered it. Used as the sort key for the active row so subsequent
 // updated_at bumps (the user sending a message) don't move it.
