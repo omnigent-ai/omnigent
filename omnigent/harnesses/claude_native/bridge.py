@@ -5057,6 +5057,7 @@ def _deliver_user_message(
         info["tmux_target"],
         timeout_s=timeout_s,
         bridge_dir=bridge_dir,
+        guard=guard,
     )
     # Escape unsupported slash commands (e.g. ``/help``, ``/exit``) so the
     # Claude Code TUI treats them as user text instead of invoking a state
@@ -5202,6 +5203,7 @@ def _paste_and_submit(
             timeout_s=_TMUX_READY_TIMEOUT_S,
             bridge_dir=bridge_dir,
             extend_for_slow_boot=False,
+            guard=guard,
         )
         pane = _capture_pane(socket_path, tmux_target)
         if _draft_in_input_box(pane, needle, tail_needle=tail_needle) and not _typed_in_pane_since(
@@ -5392,8 +5394,9 @@ def _verify_submit_accepted(
     :param submitted_text: Full submitted text; a marker alone cannot identify a refusal.
     :param stash_pending: Whether the person's draft was stashed for this submit.
         Claude Code returns it only once it has taken the submit, so a box
-        shown without the stash marker on two captures in a row is accepted,
-        however the returned draft reads, and no Enter follows.
+        whose indicator rows show no stash marker on two captures in a row is
+        accepted, however the returned draft reads. While those rows are out of
+        view, neither acceptance nor another Enter follows.
     :returns: ``True`` when the draft left the input box (accepted),
         ``False`` when it is still there after the full window.
     :raises ClaudeSubmitBlockedUnconfirmed: A fresh matching refusal appeared;
@@ -5455,7 +5458,7 @@ def _verify_submit_accepted(
                     time.monotonic() - start,
                 )
             return True
-        if stash_pending and _composer_box(pane) is not None and not _stash_marker_shown(pane):
+        if stash_pending and _stash_marker_state(pane) is False:
             # The returned draft may quote the message or hold a collapsed paste
             # that reads like it; two captures in a row rule out a torn one.
             returned_polls += 1
@@ -7161,7 +7164,7 @@ def input_box_takes_delivery(
     if _composer_box(pane) is not None:
         if not _composer_holds_draft(socket_path, target, pane):
             return True
-        if stash_in_use and not _stash_marker_shown(pane):
+        if stash_in_use and _stash_marker_state(pane) is False:
             return True
     if repaint:
         _request_claude_repaint(socket_path, target, bridge_dir)
@@ -7777,23 +7780,38 @@ def _typed_in_pane_since(socket_path: str, tmux_target: str, since: float) -> bo
     return typed_at is not None and typed_at > since
 
 
+def _stash_marker_state(pane: str) -> bool | None:
+    """
+    Read Claude Code's stash marker: shown, absent, or out of view.
+
+    Only the indicator rows directly above the input box's opening rule are
+    read, so transcript text that quotes the marker does not count. When those
+    rows are not on screen, as when the box's opening rule or glyph row is
+    scrolled off the top, the stash cannot be told free from in use.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: ``True`` while the marker is shown, ``False`` when the rows above
+        the box show none, ``None`` when those rows are out of view.
+    """
+    lines = pane.replace("\xa0", " ").splitlines()
+    rules = _composer_frame_rule_indices(lines)
+    if not rules or _composer_row(pane) is None:
+        return None
+    opening = rules[-2] if len(rules) >= 2 else rules[-1]
+    if opening == 0:
+        return None
+    indicator_rows = lines[max(0, opening - _STASH_MARKER_ROWS) : opening]
+    return any(_STASH_MARKER_RE.search(line) for line in indicator_rows)
+
+
 def _stash_marker_shown(pane: str) -> bool:
     """
     Return whether Claude Code shows that a stashed draft is waiting.
 
-    Only the indicator rows above the input box's opening rule are read, so
-    transcript text that quotes the marker does not count.
-
     :param pane: Captured pane text from :func:`_capture_pane`.
-    :returns: ``True`` while the marker is shown.
+    :returns: ``True`` only while the marker is on screen (:func:`_stash_marker_state`).
     """
-    lines = pane.replace("\xa0", " ").splitlines()
-    rules = _composer_frame_rule_indices(lines)
-    if not rules:
-        return False
-    opening = rules[-2] if len(rules) >= 2 else rules[-1]
-    indicator_rows = lines[max(0, opening - _STASH_MARKER_ROWS) : opening]
-    return any(_STASH_MARKER_RE.search(line) for line in indicator_rows)
+    return _stash_marker_state(pane) is True
 
 
 def _capture_pane_styled(socket_path: str, tmux_target: str) -> str:
@@ -7961,12 +7979,20 @@ def _set_draft_aside(
         )
     if not _composer_holds_draft(socket_path, tmux_target, pane):
         return
-    if guard.stashed or _stash_marker_shown(pane):
+    marker = _stash_marker_state(pane)
+    if guard.stashed or marker is True:
         _record_held_draft(pane)
         raise ClaudeComposerHoldsDraft(
             "Claude Code's input box holds an unsent draft and its stash already holds "
             "another one, so nothing was sent.",
             stash_in_use=True,
+        )
+    if marker is None:
+        _record_held_draft(pane)
+        raise ClaudeComposerHoldsDraft(
+            "Claude Code's input box holds an unsent draft, and the rows that show whether "
+            "its stash is in use are out of view, so nothing was sent.",
+            stash_in_use=False,
         )
     _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, _COMPOSER_STASH_KEY)
     # Owned from the key on: a delivery cancelled while waiting still returns the draft.
@@ -8025,7 +8051,8 @@ def _await_draft_stashed(socket_path: str, tmux_target: str) -> bool | None:
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :returns: ``True`` once the box is empty and the stash marker shows,
         ``False`` when the box ends empty without the marker (nothing was left
-        to stash), or ``None`` when the box still shows a draft.
+        to stash), or ``None`` when the box still shows a draft or the
+        marker's rows are out of view.
     """
     deadline = time.monotonic() + _STASH_SETTLE_S
     emptied = False
@@ -8035,9 +8062,11 @@ def _await_draft_stashed(socket_path: str, tmux_target: str) -> bool | None:
         if _composer_box(pane) is None or _composer_holds_draft(socket_path, tmux_target, pane):
             emptied = False
             continue
-        if _stash_marker_shown(pane):
+        marker = _stash_marker_state(pane)
+        if marker is True:
             return True
-        emptied = True
+        # Out of view, the marker cannot tell whether the stash took.
+        emptied = marker is False
     return False if emptied else None
 
 
@@ -8071,8 +8100,10 @@ def _put_draft_back(
     try:
         with _ignoring_injection_cancellation():
             pane = _capture_pane(socket_path, tmux_target)
-            if not _stash_marker_shown(pane):
-                guard.stashed = False
+            marker = _stash_marker_state(pane)
+            if marker is not True:
+                # Gone, or out of view: nothing can be returned safely from here.
+                guard.stashed = marker is None
                 return
             box = _composer_box(pane)
             if box is not None and needle and _draft_in_input_box(pane, needle):
@@ -8109,7 +8140,7 @@ def _await_draft_restored(socket_path: str, tmux_target: str, *, guard: _DraftGu
     pane = ""
     while time.monotonic() < deadline:
         pane = _capture_pane(socket_path, tmux_target)
-        if _composer_box(pane) is not None and not _stash_marker_shown(pane):
+        if _stash_marker_state(pane) is False:
             guard.stashed = False
             return
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
@@ -8600,6 +8631,7 @@ def _wait_for_claude_prompt_ready(
     timeout_s: float,
     bridge_dir: Path | None = None,
     extend_for_slow_boot: bool = True,
+    guard: _DraftGuard | None = None,
 ) -> None:
     """
     Block until Claude Code's TUI input box is ready for keystrokes.
@@ -8634,6 +8666,8 @@ def _wait_for_claude_prompt_ready(
         time). A slow boot then fails the wait instead of outliving the request,
         while a dead pane still ends it at the first liveness check, a
         :data:`_CLAUDE_LIVENESS_POLL_INTERVAL_S` in, rather than at the cap.
+    :param guard: The delivery's record of the draft it stashed, so a draft the
+        panel recovery here stashes is the delivery's to return.
     :returns: None.
     :raises ClaudeTerminalExited: If the pane is gone: tmux affirms the
         process exited, carrying its wait-status so a clean quit is
@@ -8725,6 +8759,7 @@ def _wait_for_claude_prompt_ready(
                 tmux_target,
                 bridge_dir=bridge_dir,
                 timeout_s=min(_OCCUPIED_INPUT_DISMISS_TIMEOUT_S, remaining),
+                guard=guard,
             )
             if surface is not None:
                 raise ClaudeTerminalDialog(
@@ -8930,7 +8965,7 @@ def _reclaim_and_wait_for_prompt(
             )
     if ready_timeout_s is None:
         _wait_for_claude_prompt_ready(
-            socket_path, tmux_target, timeout_s=timeout_s, bridge_dir=bridge_dir
+            socket_path, tmux_target, timeout_s=timeout_s, bridge_dir=bridge_dir, guard=guard
         )
         return
     _wait_for_claude_prompt_ready(
@@ -8939,6 +8974,7 @@ def _reclaim_and_wait_for_prompt(
         timeout_s=max(0.0, ready_timeout_s - (time.monotonic() - started)),
         bridge_dir=bridge_dir,
         extend_for_slow_boot=False,
+        guard=guard,
     )
 
 

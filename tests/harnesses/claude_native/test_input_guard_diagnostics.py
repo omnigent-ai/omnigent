@@ -18,8 +18,10 @@ _PROMPT = (
 )
 
 
-def _composer(text: str = "", *, glyph: str = "❯") -> str:
-    return f"{_RULE}\n{glyph} {text}\n{_RULE}\n"
+def _composer(text: str = "", *, glyph: str = "❯", stashed: bool = False) -> str:
+    # Claude Code always draws rows above the box, where the stash marker sits.
+    marker = "  \u203a stashed\n" if stashed else ""
+    return f"⏺ done\n{marker}{_RULE}\n{glyph} {text}\n{_RULE}\n"
 
 
 class _Terminal:
@@ -79,7 +81,7 @@ class _Terminal:
         self.commands.append(args)
         if args[0] == "paste-buffer":
             self.pasted = True
-            self.pane = ("  \u203a stashed\n" if self.stashed else "") + _composer(_PRIVATE_TEXT)
+            self.pane = _composer(_PRIVATE_TEXT, stashed=self.stashed)
         if args[-1] == "Enter" and self.newline_on_enter:
             self.pane = self.pane.replace(f"\n{_RULE}\n", f"\n\n{_RULE}\n")
         if self.clears_surface and (
@@ -89,7 +91,7 @@ class _Terminal:
         if self.clears_surface and args[-1] == bridge._COMPOSER_STASH_KEY:
             # Claude Code stashes the typed command and returns the box to chat.
             self.stashed = True
-            self.pane = "  \u203a stashed\n" + _composer()
+            self.pane = _composer(stashed=True)
 
 
 @pytest.fixture
@@ -130,7 +132,7 @@ def test_shell_refusal_records_recovery_attempts_before_any_paste(
     assert attrs["stage"] == "restoring_input"
     assert attrs["restore_first_surface"] == attrs["restore_last_surface"] == "shell_mode"
     assert attrs["restore_captures"] >= 2
-    assert attrs["restore_pane_rows"] == 3
+    assert attrs["restore_pane_rows"] == 4
     assert attrs["restore_capture_empty"] is False
     action = "shell_stash" if has_draft else "escape"
     assert attrs[f"restore_{action}_attempts"] == len(terminal.commands)

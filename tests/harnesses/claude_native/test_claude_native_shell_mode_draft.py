@@ -50,6 +50,8 @@ class _InputBox:
         self.submitted: list[tuple[str, str]] = []
         # Claude Code's one stash slot: (mode, draft, cursor) set aside by Ctrl+S.
         self.stash: tuple[str, str, int] | None = None
+        # A panel drawn over the box until Escape closes it.
+        self.overlay: str | None = None
 
     def paste(self, content: str) -> None:
         # A leading "!" in an empty chat box switches it to shell mode instead of being typed.
@@ -59,14 +61,21 @@ class _InputBox:
         self.cursor = len(content)
 
     def pane(self) -> str:
+        if self.overlay is not None:
+            return self.overlay
         glyph = "!" if self.mode == "bash" else "❯"
         footer = "  ! for shell mode" if self.mode == "bash" else "  ? for shortcuts"
         first, *rest = self.draft.split("\n")
         rows = [f"{glyph} {first}", *(f"  {row}" for row in rest)]
         marker = ["                    \u203a stashed"] if self.stash else []
-        return "\n".join([*marker, _RULE, *rows, _RULE, footer]) + "\n"
+        # Claude Code always draws rows above the box, where the stash marker sits.
+        return "\n".join(["⏺ done", *marker, _RULE, *rows, _RULE, footer]) + "\n"
 
     def key(self, key: str) -> None:
+        if self.overlay is not None:
+            if key == "Escape":
+                self.overlay = None
+            return
         if key in (_CTRL_U, "C-u"):
             # Clears the line; at the start of the line it leaves shell mode.
             if self.cursor == 0:
@@ -219,6 +228,25 @@ def test_a_settings_command_stashes_a_shell_mode_draft_too(
 
     assert box.submitted == [("prompt", "/effort high")]
     assert (box.mode, box.draft) == ("bash", "ls -la")
+
+
+def test_a_shell_draft_readiness_stashes_behind_a_panel_is_the_deliverys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A draft that readiness's own panel recovery stashes is the delivery's to return."""
+    box = _InputBox("bash", "ls -la")
+    box.overlay = "  Keyboard shortcuts\n  Esc to close\n"
+    bridge_dir, _calls = _patch_tmux(monkeypatch, tmp_path, box, content="")
+    guard = claude_native_bridge._DraftGuard()
+
+    claude_native_bridge._wait_for_claude_prompt_ready(
+        "/tmp/example/tmux.sock", "main", timeout_s=5.0, bridge_dir=bridge_dir, guard=guard
+    )
+
+    assert guard.stashed is True
+    assert box.stash == ("bash", "ls -la", 6)
+    claude_native_bridge._put_draft_back("/tmp/example/tmux.sock", "main", guard=guard, needle="")
+    assert (box.mode, box.draft, box.stash) == ("bash", "ls -la", None)
 
 
 def test_waiting_for_the_input_box_leaves_a_shell_draft_as_it_was(

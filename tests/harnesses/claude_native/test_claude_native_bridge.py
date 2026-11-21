@@ -12870,7 +12870,8 @@ class _EditableComposer:
         screen = ["⏺ done", *marker, self._RULE, *rows, self._RULE, "  ? for shortcuts"]
         if self._pane_rows is not None:
             screen = screen[-self._pane_rows :]
-        return "\n".join(screen[1:] if self._pane_rows is None else screen) + "\n"
+        # Claude Code always draws rows above the box, where the stash marker sits.
+        return "\n".join(screen) + "\n"
 
     def _insert(self, text: str) -> None:
         self.text = self.text[: self.cursor] + text + self.text[self.cursor :]
@@ -13296,7 +13297,8 @@ def test_a_returned_draft_confirms_the_submit_without_another_enter(
     The returned draft can read like the delivered input, so it is the return
     itself that confirms the delivery, and no retry Enter would submit it.
     """
-    sends = _fake_tmux(monkeypatch, [_composer_pane(returned_draft)])
+    # The indicator row above the box shows no stash marker any more.
+    sends = _fake_tmux(monkeypatch, ["  ◐ medium · /effort\n" + _composer_pane(returned_draft)])
     monkeypatch.setattr(claude_native_bridge, "_SUBMIT_VERIFY_TIMEOUT_S", 5.0)
 
     accepted = claude_native_bridge._verify_submit_accepted(
@@ -13311,12 +13313,26 @@ def test_a_returned_draft_confirms_the_submit_without_another_enter(
     assert not any(args[-1] == "Enter" for args in sends)
 
 
+@pytest.mark.parametrize(
+    ("pane", "retried"),
+    [
+        ("                    › stashed\n" + _composer_pane("hello from the web"), True),
+        # The message's rows push the indicator rows above the pane.
+        (_composer_pane("hello from the web"), False),
+    ],
+    ids=["marker-shown", "marker-out-of-view"],
+)
 def test_a_submit_whose_draft_is_still_stashed_is_retried(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, pane: str, retried: bool
 ) -> None:
-    """While the stash marker shows, the box still holds the delivery, so Enter is retried."""
-    pending = "                    › stashed\n" + _composer_pane("hello from the web")
-    sends = _fake_tmux(monkeypatch, [pending])
+    """
+    A swallowed submit is never taken for accepted while the stash may still be up.
+
+    While the marker shows, the box still holds the delivery, so Enter is
+    retried. With the rows that show it out of view, the box may hold the
+    delivery or the returned draft, so neither acceptance nor Enter follows.
+    """
+    sends = _fake_tmux(monkeypatch, [pane])
     monkeypatch.setattr(claude_native_bridge, "_SUBMIT_VERIFY_TIMEOUT_S", 5.0)
 
     accepted = claude_native_bridge._verify_submit_accepted(
@@ -13328,7 +13344,20 @@ def test_a_submit_whose_draft_is_still_stashed_is_retried(
     )
 
     assert accepted is False
-    assert any(args[-1] == "Enter" for args in sends)
+    assert any(args[-1] == "Enter" for args in sends) is retried
+
+
+def test_a_stash_whose_marker_is_out_of_view_is_not_taken_for_returned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the indicator rows out of view, the stash stays the delivery's to return."""
+    sends = _fake_tmux(monkeypatch, [_composer_pane("hello from the web")])
+    guard = claude_native_bridge._DraftGuard(stashed=True)
+
+    claude_native_bridge._await_draft_restored("/tmp/example/tmux.sock", "claude:0.0", guard=guard)
+
+    assert guard.stashed is True
+    assert sends == []
 
 
 def test_delivery_waits_for_the_person_to_pause_typing(
@@ -13795,12 +13824,14 @@ def test_idle_compact_notice_redraw_preserves_delivery_checks(
 # redraw of the input row already erased an idle-compaction notice's marker.
 _PRINTED_OVER_BOX_PANES = {
     "launcher-warning": """\
+⏺ done
 ──────────────────────────────
 ❯ Background token refresh failed: certificate expired. Troubleshooting step
 s: 1. Renew the certificate, then send your message again.
   ? for shortcuts
 """,
     "idle-compact-tail": """\
+⏺ done
 ──────────────────────────────
 ❯
 ens (example-model) -> sent /compact. Use /rewind if you need to return to a spec
@@ -14769,6 +14800,7 @@ def test_inject_user_message_refuses_a_shell_mode_draft_it_cannot_stash(
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
     shell_draft_pane = (
+        "⏺ done\n"
         "──────────────────────────────\n"
         "! git status --short\n"
         "──────────────────────────────\n"

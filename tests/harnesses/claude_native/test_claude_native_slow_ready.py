@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -139,10 +140,13 @@ def test_first_message_survives_slow_terminal_startup(
         *,
         timeout_s: float,
         bridge_dir: Path | None = None,
+        **kwargs: Any,
     ) -> None:
         started_at.append(time.monotonic())
         gate_started.touch()
-        original_wait(socket_path, tmux_target, timeout_s=timeout_s, bridge_dir=bridge_dir)
+        original_wait(
+            socket_path, tmux_target, timeout_s=timeout_s, bridge_dir=bridge_dir, **kwargs
+        )
         if startup == "exit-after-ready":
             subprocess.run(
                 ["tmux", "-S", socket_path, "kill-server"],
