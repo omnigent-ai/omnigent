@@ -13158,6 +13158,8 @@ _STYLED_DRAFT = "\x1b[39m❯\xa0typed draft text\x1b[7m \x1b[0m"
         ("❯\xa0\x1b[38;2;200;200;200mtyped\x1b[0m", True),
         ("❯\xa0\x1b[2mfaint suggestion\x1b[22m", False),
         ("\x1b[39m❯\xa0[Pasted text #1 +4 lines]\x1b[7m \x1b[0m", True),
+        # Typed at full intensity, the queued hint's words are a draft.
+        ("\x1b[39m❯\xa0Press up to edit queued messages\x1b[7m \x1b[0m", True),
     ],
     ids=[
         "empty",
@@ -13167,6 +13169,7 @@ _STYLED_DRAFT = "\x1b[39m❯\xa0typed draft text\x1b[7m \x1b[0m"
         "truecolour",
         "suggestion",
         "paste-only",
+        "typed-like-the-hint",
     ],
 )
 def test_faint_hints_in_the_box_are_not_a_draft(styled_row: str, typed: bool) -> None:
@@ -13178,19 +13181,6 @@ def test_faint_hints_in_the_box_are_not_a_draft(styled_row: str, typed: bool) ->
     assert box is not None
 
     assert claude_native_bridge._styled_box_has_typed_text(styled, box.rows) is typed
-
-
-def test_typed_text_reading_like_the_queued_hint_is_a_draft(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The hint is told from typed text by its styling, so typing its words is kept."""
-    rule = "─" * 30
-    styled_row = "\x1b[39m❯\xa0Press up to edit queued messages\x1b[7m \x1b[0m"
-    styled = f"{rule}\n{styled_row}\n{rule}\n"
-    monkeypatch.setattr(claude_native_bridge, "_capture_pane_styled", lambda *_args: styled)
-    plain = claude_native_bridge._SGR_RE.sub("", styled)
-
-    assert claude_native_bridge._composer_holds_draft("/tmp/sock", "main", plain) is True
 
 
 @pytest.mark.parametrize(
@@ -13264,6 +13254,59 @@ def test_a_confirm_enter_never_reaches_a_returned_draft(
 
     assert confirmed is False
     assert not any(args[-1] == "Enter" for args in sends)
+
+
+@pytest.mark.parametrize(
+    "pane",
+    [
+        "⏺ done\n" + _composer_pane("why does Switch model? keep showing up"),
+        "⏺ done\n"
+        "──────────────────────────────\n"
+        "! echo 'Switch model?' && rm -rf build\n"
+        "──────────────────────────────\n"
+        "  ! for shell mode\n",
+    ],
+    ids=["chat-draft", "shell-draft"],
+)
+def test_the_watchers_confirm_never_reaches_a_draft_quoting_the_title(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pane: str
+) -> None:
+    """The later confirm of a queued model switch sends no Enter to a returned draft."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(monkeypatch, [pane])
+
+    confirmed = claude_native_bridge.confirm_dialog_if_open(
+        bridge_dir, hint=claude_native_bridge.SWITCH_MODEL_DIALOG_HINT
+    )
+
+    assert confirmed is False
+    assert sends == []
+
+
+@pytest.mark.parametrize(
+    "stashed_draft",
+    ["hello from the web and more", "[Pasted text #1 +4 lines] look at line 3"],
+    ids=["draft-quoting-the-message", "collapsed-paste"],
+)
+def test_a_stash_left_from_an_earlier_delivery_is_not_submitted_by_a_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stashed_draft: str
+) -> None:
+    """
+    A stash up when the Enter goes out is returned by the submit, whoever made it.
+
+    A stash an earlier delivery could not return, its clean-up unable to read
+    the pane, comes back on this submit. Its return confirms the delivery, and
+    no retry Enter submits it.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    composer = _EditableComposer("", cursor=0)
+    composer.stash = (stashed_draft, 4)
+    composer.install(monkeypatch)
+
+    inject_user_message(bridge_dir, content="hello from the web")
+
+    assert [text.strip() for text in composer.submitted] == ["hello from the web"]
+    assert (composer.text, composer.cursor, composer.stash) == (stashed_draft, 4, None)
 
 
 def test_a_confirmed_dialog_is_not_taken_for_open_by_a_returned_draft(

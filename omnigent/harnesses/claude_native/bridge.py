@@ -5273,7 +5273,7 @@ def _paste_and_submit(
             bridge_dir=bridge_dir,
             submit_boundary=submit_boundary,
             submitted_text=text,
-            stash_pending=guard.stashed,
+            stash_pending=_stash_pending_at_submit(pane, guard),
         )
     except ClaudeUserPromptPending as exc:
         # The Enter already went out, so the prompt may belong to this message's own turn.
@@ -5392,11 +5392,12 @@ def _verify_submit_accepted(
     :param bridge_dir: Bridge whose pending questions protect submit retries.
     :param submit_boundary: Native transcript boundary captured before Enter.
     :param submitted_text: Full submitted text; a marker alone cannot identify a refusal.
-    :param stash_pending: Whether the person's draft was stashed for this submit.
-        Claude Code returns it only once it has taken the submit, so a box
+    :param stash_pending: Whether a stash was up when the Enter went out, this
+        delivery's or one left from before (:func:`_stash_pending_at_submit`).
+        Claude Code returns a stash only once it has taken the submit, so a box
         whose indicator rows show no stash marker on two captures in a row is
-        accepted, however the returned draft reads. While those rows are out of
-        view, neither acceptance nor another Enter follows.
+        accepted, however the returned draft reads, and no Enter is re-sent
+        unless the marker still shows.
     :returns: ``True`` when the draft left the input box (accepted),
         ``False`` when it is still there after the full window.
     :raises ClaudeSubmitBlockedUnconfirmed: A fresh matching refusal appeared;
@@ -5912,7 +5913,7 @@ def _deliver_slash_command(
             needle=needle,
             what="slash command",
             bridge_dir=bridge_dir,
-            stash_pending=guard.stashed,
+            stash_pending=_stash_pending_at_submit(pane, guard),
         ):
             raise RuntimeError(
                 f"Claude Code did not accept the slash command within "
@@ -6370,7 +6371,8 @@ def confirm_dialog_if_open(bridge_dir: Path, *, hint: str) -> bool:
     dialog only when the turn settles — minutes later). Unlike
     :func:`_confirm_tui_dialog` there is no timeout fallback Enter, so
     calling this every few seconds can never type into a surface that is
-    not the named dialog.
+    not the named dialog. The title counts only where the dialog replaced the
+    input box (:func:`_confirm_dialog_shown`), never in a returned draft.
 
     :param bridge_dir: Bridge directory path.
     :param hint: Text the dialog renders, e.g.
@@ -6385,7 +6387,7 @@ def confirm_dialog_if_open(bridge_dir: Path, *, hint: str) -> bool:
     tmux_target = info["tmux_target"]
     try:
         pane = _capture_pane(socket_path, tmux_target)
-        if hint not in pane:
+        if not _confirm_dialog_shown(pane, hint):
             return False
         _confirm_and_verify_dialog_closed(
             socket_path, tmux_target, hint=hint, bridge_dir=bridge_dir
@@ -7802,6 +7804,21 @@ def _stash_marker_state(pane: str) -> bool | None:
         return None
     indicator_rows = lines[max(0, opening - _STASH_MARKER_ROWS) : opening]
     return any(_STASH_MARKER_RE.search(line) for line in indicator_rows)
+
+
+def _stash_pending_at_submit(pane: str, guard: _DraftGuard) -> bool:
+    """
+    Return whether the submit about to go out will return a stashed draft.
+
+    Claude Code returns its stash after any submit, so a stash left from an
+    earlier delivery whose clean-up could not run counts as much as this
+    delivery's own.
+
+    :param pane: The last capture before the Enter, showing the delivered text.
+    :param guard: This delivery's record of the draft it stashed.
+    :returns: ``True`` for this delivery's stash, or when the marker shows one.
+    """
+    return guard.stashed or _stash_marker_shown(pane)
 
 
 def _stash_marker_shown(pane: str) -> bool:
