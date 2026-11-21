@@ -5301,6 +5301,16 @@ def create_app(
                 or (conv.parent_conversation_id in bound_ids and conv.host_id is None)
             )
 
+        def awaits_sign_in(conv: Conversation) -> bool:
+            # The refused turn never reached the agent, and relaunching its pane
+            # would make the launcher open another sign-in page in the browser.
+            last_error = _last_task_error_from_labels(conv.labels)
+            return (
+                _session_status_cache.get(conv.id, conv.live_status) == "failed"
+                and last_error is not None
+                and last_error["code"] == "databricks_sign_in_pending"
+            )
+
         def needs_eager_recovery(conv: Conversation) -> bool:
             if conv.archived:
                 return False
@@ -5311,6 +5321,8 @@ def create_app(
                 conv.pending_elicitation_count or 0,
                 pending_elicitations.count_for(conv.id),
             )
+            if pending == 0 and awaits_sign_in(conv):
+                return False
             return (
                 status != "idle"
                 or pending > 0
@@ -5495,8 +5507,10 @@ def create_app(
                         reason = "no_agent"
                     elif conv.archived:
                         reason = "archived"
+                    elif initialize_runtime:
+                        reason = "recovery_required"
                     else:
-                        reason = "recovery_required" if initialize_runtime else "idle"
+                        reason = "sign_in_pending" if awaits_sign_in(conv) else "idle"
                     runner_session_initializer.log_decision(
                         conv,
                         generation=connection.generation,
