@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 
+from omnigent.cli import parse_routing_settings
 from omnigent.server.smart_routing import ExternalRoutingClient
 
 # The two canonical harness names the gateway's task_v3 router accepts.
@@ -99,7 +100,7 @@ def task_v3_router() -> Iterator[tuple[str, list[dict[str, Any]]]]:
         thread.join(timeout=5)
 
 
-@pytest.mark.parametrize("router_name", ["task_v3", "task_v1"])
+@pytest.mark.parametrize("router_name", [None, "task_v1"])
 @pytest.mark.parametrize(
     ("harness", "model", "wire_harness"),
     [
@@ -115,19 +116,23 @@ def task_v3_router() -> Iterator[tuple[str, list[dict[str, Any]]]]:
 )
 async def test_routes_back_to_the_offered_harness(
     task_v3_router: tuple[str, list[dict[str, Any]]],
-    router_name: str,
+    router_name: str | None,
     harness: str,
     model: str,
     wire_harness: str,
 ) -> None:
-    """Canonical wire tags resolve back to native, SDK, and aliased harness ids."""
+    """Default and legacy routers round-trip native, SDK, and aliased harness ids."""
     base_url, recorded = task_v3_router
-    client = ExternalRoutingClient(base_url=base_url, router_name=router_name)
+    settings = parse_routing_settings({"router_name": router_name})
+    client = ExternalRoutingClient(base_url=base_url, router_name=settings.router_name)
     catalog_model = f"system.ai.{model}"
 
     result = await client.route(_PROMPT, {harness: [catalog_model]})
 
     assert result is not None, client.last_error
+    assert recorded[-1]["route_selector"]["router_name"] == (router_name or "task_v3")
+    if router_name is None:
+        assert recorded[-1]["route_options"] == [{"model": model, "harness": wire_harness}]
     sent_harnesses = {o["harness"] for o in recorded[-1]["route_options"]}
     assert sent_harnesses == {wire_harness}
     assert (result.harness, result.model, result.raw_model) == (harness, catalog_model, model)
