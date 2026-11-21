@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState
     from omnigent.inner.claude_model_access import ClaudeModelAccess
     from omnigent.runner.mcp_manager import RunnerMcpManager
+    from omnigent.runner.tool_dispatch import UnknownSessionWorkspace
     from omnigent.terminals.registry import TerminalRegistry
 
 import httpx
@@ -2810,16 +2811,29 @@ def create_runner_app(
             )
         return None
 
-    async def _session_explicit_workspace(session_id: str) -> Path | None:
-        """The session's own server-stored workspace, or ``None`` when it has none."""
+    async def _session_explicit_workspace(
+        session_id: str,
+    ) -> Path | UnknownSessionWorkspace | None:
+        """
+        The session's own server-stored workspace.
+
+        :returns: The workspace, ``None`` when the session has none, or
+            ``UNKNOWN_SESSION_WORKSPACE`` when its metadata could not be read.
+        """
+        from omnigent.runner.tool_dispatch import UNKNOWN_SESSION_WORKSPACE
+
         workspace = await _session_workspace_value(session_id)
         if workspace and workspace.strip():
             return Path(workspace.strip()).expanduser().resolve()
+        # A successful read is cached, even an empty one; an uncached session's
+        # metadata was unreadable (or superseded mid-read), so its boundary is unknown.
+        if session_id not in _session_workspace_cache:
+            return UNKNOWN_SESSION_WORKSPACE
         return None
 
     async def _session_runtime_cwd(session_id: str) -> Path | None:
         explicit = await _session_explicit_workspace(session_id)
-        if explicit is not None:
+        if isinstance(explicit, Path):
             return explicit
         return runner_workspace.resolve() if runner_workspace is not None else None
 

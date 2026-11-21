@@ -171,6 +171,13 @@ class _UnsetLocalToolWorkdir:
 _UNSET_LOCAL_TOOL_WORKDIR = _UnsetLocalToolWorkdir()
 
 
+class UnknownSessionWorkspace:
+    """Sentinel for a session whose workspace could not be read from the server."""
+
+
+UNKNOWN_SESSION_WORKSPACE = UnknownSessionWorkspace()
+
+
 class _DynamicCallable(Protocol):
     """Callable loaded from an agent spec's dotted Python path."""
 
@@ -8157,7 +8164,7 @@ async def execute_tool(
     wake_on_async_result: AsyncResultWake | None = None,
     call_id: str | None = None,
     caller_user_id: str | None = None,
-    session_workspace: Path | None = None,
+    session_workspace: Path | UnknownSessionWorkspace | None = None,
 ) -> str:
     """
     Execute a tool and return the output string.
@@ -8191,8 +8198,10 @@ async def execute_tool(
     :param call_id: The harness's tool call ID, when the caller has one; the
         journal tools key their writes on it.
     :param session_workspace: The session's own server-stored workspace, e.g.
-        ``Path("/repo")``; ``None`` when it has none. Bounds ``sys_upload_file``
-        reads; unlike ``runner_workspace`` it never falls back to the runner's.
+        ``Path("/repo")``; ``None`` when it has none, or
+        :data:`UNKNOWN_SESSION_WORKSPACE` when it could not be read. Bounds
+        ``sys_upload_file`` reads; unlike ``runner_workspace`` it never falls
+        back to the runner's.
     :returns: Tool output string.
     """
     if not arguments.strip():
@@ -9247,7 +9256,7 @@ def _session_upload_roots(
     conversation_id: str,
     *,
     runner_workspace: Path | None,
-    session_workspace: Path | None,
+    session_workspace: Path | UnknownSessionWorkspace | None,
     resource_registry: SessionResourceRegistry | None,
 ) -> list[Path]:
     """
@@ -9265,10 +9274,14 @@ def _session_upload_roots(
     :param runner_workspace: The runtime cwd: the session's workspace, else the
         runner's, e.g. ``Path("/repo")``; ``None`` when neither has one.
     :param session_workspace: The session's server-stored workspace, e.g.
-        ``Path("/repo")``; ``None`` when it has none or the caller can't tell.
+        ``Path("/repo")``; ``None`` when it has none, or
+        :data:`UNKNOWN_SESSION_WORKSPACE` when it could not be read, which no
+        fallback root may stand in for.
     :param resource_registry: The runner's session resource registry.
     :returns: The upload roots; empty when no boundary can be established.
     """
+    if isinstance(session_workspace, UnknownSessionWorkspace):
+        return []
     if session_workspace is not None:
         return [session_workspace]
     roots: list[Path] = []
@@ -9319,7 +9332,7 @@ async def _execute_file_tool(
     conversation_id: str | None,
     agent_spec: AgentSpec | None = None,
     runner_workspace: Path | None = None,
-    session_workspace: Path | None = None,
+    session_workspace: Path | UnknownSessionWorkspace | None = None,
     resource_registry: SessionResourceRegistry | None = None,
 ) -> str:
     """
@@ -9333,7 +9346,8 @@ async def _execute_file_tool(
     :param agent_spec: Agent spec resolved for the current turn.
     :param runner_workspace: The runtime cwd, e.g. ``Path("/repo")``, or ``None``.
     :param session_workspace: The session's server-stored workspace, e.g.
-        ``Path("/repo")``, or ``None``. See :func:`_session_upload_roots`.
+        ``Path("/repo")``, ``None`` or :data:`UNKNOWN_SESSION_WORKSPACE`. See
+        :func:`_session_upload_roots`.
     :param resource_registry: The runner's session resource registry, which
         knows the session's default environment root.
     :returns: Tool result string.
@@ -9717,7 +9731,7 @@ async def _execute_async_inbox_tool(
     harness_client: httpx.AsyncClient | None = None,
     effective_harness: str | None = None,
     wake_on_async_result: AsyncResultWake | None = None,
-    session_workspace: Path | None = None,
+    session_workspace: Path | UnknownSessionWorkspace | None = None,
 ) -> str:
     """
     Runner-local dispatch for async inbox tools.
@@ -10285,7 +10299,7 @@ def _spawn_async_tool(
     local_tool_workdir: Path | _UnsetLocalToolWorkdir | None = _UNSET_LOCAL_TOOL_WORKDIR,
     effective_harness: str | None = None,
     wake_on_async_result: AsyncResultWake | None = None,
-    session_workspace: Path | None = None,
+    session_workspace: Path | UnknownSessionWorkspace | None = None,
 ) -> str:
     """
     Spawn a tool as a background asyncio.Task.

@@ -29,6 +29,8 @@ from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.runner import resource_registry, subagent_work
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.runner.tool_dispatch import (
+    UNKNOWN_SESSION_WORKSPACE,
+    UnknownSessionWorkspace,
     _execute_file_tool,
     execute_tool,
     should_dispatch_locally,
@@ -278,7 +280,7 @@ async def _upload(
     agent_spec: AgentSpec,
     resource_registry: SessionResourceRegistry | None,
     runner_workspace: Path | None = None,
-    session_workspace: Path | None = None,
+    session_workspace: Path | UnknownSessionWorkspace | None = None,
 ) -> str:
     """Call ``sys_upload_file`` the way the runner's ``/mcp/execute`` route does."""
     return await execute_tool(
@@ -518,13 +520,19 @@ async def test_upload_reads_the_explicit_session_workspace_on_an_isolating_runne
     assert b"project report" in captured[0].content
 
 
+@pytest.mark.parametrize("unreadable", [False, True], ids=["no-registry", "unreadable-session"])
 @pytest.mark.asyncio
-async def test_upload_without_a_known_workspace_is_refused(tmp_path: Path) -> None:
+async def test_upload_without_a_known_workspace_is_refused(
+    tmp_path: Path, unreadable: bool
+) -> None:
     """
-    Without the session's own workspace or the runner's registry, the runtime cwd
-    alone is not trusted as a boundary, so nothing is read or posted.
+    The runtime cwd alone is not trusted as a boundary: without the runner's
+    registry, or when the session's workspace could not be read, nothing is read
+    or posted, even though the registry's default root would hold the file.
 
     :param tmp_path: Pytest-provided runtime cwd holding the requested file.
+    :param unreadable: Whether the session's workspace lookup failed, with a
+        registry rooted at the runtime cwd, rather than no registry at all.
     """
     (tmp_path / "notes.txt").write_text("notes")
 
@@ -535,8 +543,11 @@ async def test_upload_without_a_known_workspace_is_refused(tmp_path: Path) -> No
             client,
             "notes.txt",
             agent_spec=_placeholder_cwd_spec(),
-            resource_registry=None,
+            resource_registry=(
+                SessionResourceRegistry(runner_workspace=tmp_path) if unreadable else None
+            ),
             runner_workspace=tmp_path,
+            session_workspace=UNKNOWN_SESSION_WORKSPACE if unreadable else None,
         )
     finally:
         await client.aclose()
