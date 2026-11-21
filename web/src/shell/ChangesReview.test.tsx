@@ -428,8 +428,10 @@ describe("ChangesReview", () => {
       onComparisonShown,
       landing: { settled: false, choices: 0 },
     });
-    expect(screen.queryByText(/Comparing “v1.2” with “Working Copy”/)).toBeNull();
+    expect(screen.queryByText(/isn't available here yet/)).toBeNull();
     expect(data.choice.choose).toHaveBeenCalledWith({ kind: "typed", base: "v1.2", head: "" });
+    // Until the session shows it, none of its previous files show in its place.
+    expect(screen.getByText("Comparing “v1.2” with “Working Copy”…")).toBeInTheDocument();
     expect(onComparisonShown).not.toHaveBeenCalled();
   });
 

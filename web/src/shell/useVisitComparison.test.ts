@@ -98,10 +98,23 @@ describe("useVisitComparison", () => {
     expect(choose).toHaveBeenCalledWith(BRANCH);
   });
 
-  it("applies a linked visit's comparison when its tab first shows", () => {
-    const { choose, onShown } = setup({ visit: TYPED, landing: landed() });
+  it("applies a linked visit's comparison when its tab first shows, waiting until it shows", () => {
+    const link = landed();
+    const { choose, onShown, rerender, result } = setup({ visit: TYPED, landing: link });
     expect(choose).toHaveBeenCalledWith(TYPED);
     expect(onShown).not.toHaveBeenCalled();
+    expect(result.current).toEqual({ waiting: TYPED });
+    rerender({ visit: TYPED, landing: link, shown: TYPED, choices: 1 });
+    expect(result.current).toBeNull();
+  });
+
+  it("waits on a linked comparison before the session is known, without applying it", () => {
+    const link = landed();
+    const { choose, rerender, result } = setup({ visit: TYPED, landing: link, settled: false });
+    expect(result.current).toEqual({ waiting: TYPED });
+    expect(choose).not.toHaveBeenCalled();
+    rerender({ visit: TYPED, landing: link });
+    expect(choose).toHaveBeenCalledWith(TYPED);
   });
 
   it("keeps what the session shows when a tab shows again without landing, as after a reload", () => {

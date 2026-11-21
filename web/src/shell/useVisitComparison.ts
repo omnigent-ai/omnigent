@@ -107,16 +107,17 @@ export function useVisitComparison({
     latest.current.onShown(current.shown, { step: picked && recorded !== undefined });
   }, [active, session.settled, landing, visitKey, shownKey, choices, availabilityKey]);
 
-  // Effects settle a landing without rendering, so one the session already shows isn't pending.
+  // A landing nobody has picked past waits until its comparison shows; readiness only gates
+  // applying it. Effects settle a landing without rendering, so one already shown isn't pending.
   const pending =
     active &&
-    session.settled &&
     landing !== undefined &&
     !landing.settled &&
+    landing.choices === choices &&
     visit !== undefined &&
     !sameComparisonChoice(visit, session.shown);
-  if (!pending || availability === "now") return null;
-  return availability === "later"
-    ? { waiting: visit }
-    : { unavailable: { choice: visit, reason: availability.unavailable } };
+  if (!pending) return null;
+  return session.settled && typeof availability !== "string"
+    ? { unavailable: { choice: visit, reason: availability.unavailable } }
+    : { waiting: visit };
 }
