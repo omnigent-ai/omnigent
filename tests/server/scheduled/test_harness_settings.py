@@ -493,6 +493,14 @@ _CODEX_FULL_ACCESS = (_CODEX_ARGS["full-access"], {})
             id="approval-skipping-off-host",
         ),
         pytest.param(
+            "claude-native",
+            {},
+            ["--permission-mode", "bypassPermissions"],
+            False,
+            None,
+            id="claude-bypass-off-host",
+        ),
+        pytest.param(
             "codex-native",
             {CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "1"},
             None,
