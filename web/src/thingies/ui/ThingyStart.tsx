@@ -14,7 +14,7 @@ import { markThingySessionPending } from "@/thingies/host/thingySession";
 import type { ThingyTemplate } from "@/thingies/templates/thingyTemplates";
 import { ThingyDescribeForm } from "./ThingyDescribeForm";
 import { ThingyTemplatesSection } from "./ThingyTemplateGallery";
-import { appPathFromUrl } from "./thingyNavigation";
+import { IN_APP_THINGY_OPEN, appPathFromUrl } from "./thingyNavigation";
 import { rememberUnbuiltThingy } from "./useAdoptStartedThingySession";
 
 const START_EXPLANATION =
@@ -48,7 +48,7 @@ function ThingyStartContent({
   };
   const onTemplateCreated = (thingy: Thingy, template: ThingyTemplate) => {
     if (template.revision) {
-      navigate(thingyBoardPath(thingy.id));
+      navigate(thingyBoardPath(thingy.id), { state: IN_APP_THINGY_OPEN });
       onLeave?.();
     } else {
       // A blank thingy is built in a new session, which then shows it beside itself.

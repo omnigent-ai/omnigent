@@ -745,6 +745,24 @@ const PANEL_ICON_BUTTON =
   "flex size-6 shrink-0 text-muted-foreground hover:text-foreground mobile-touch-target";
 
 /**
+ * The full screen thingy beside New session, staying over the session its Create session menu
+ * started until that session shows the thingy full screen itself, so the viewer never sees the
+ * session in between.
+ */
+interface ThingyHandoff {
+  thingyId: string;
+  /** The started session's ID in the URL: its temporary ID, then its real one. */
+  sessionId: string;
+  /** The thingy's frame connections and failed starts when the handoff began. */
+  connections: number;
+  failures: number;
+}
+// After this the session shows as it is, full screen or not.
+const HANDOFF_TIMEOUT_MS = 15_000;
+// The session's frame has connected; it gets a moment to draw before it shows.
+const HANDOFF_SETTLE_MS = 150;
+
+/**
  * The thingy beside New session, when New session was opened from it: docked on the right like a
  * session's side panel, or filling the screen, with the same full screen toggle. Phones show it
  * only full screen; after Open session a chip above New session brings it back.
@@ -763,15 +781,77 @@ export function ThingyNewSessionPanel({
   onSidebarOpenChange?: (open: boolean) => void;
 }) {
   const thingyId = useThingyStartId();
-  const thingy = useThingy(active ? thingyId : null, { watch: true });
   const maximized = useThingyRailRequest((state) => state.newSessionMaximized);
   const [toolbar, setToolbar] = useState<HTMLElement | null>(null);
   const mobile = useIsMobileViewport();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const location = useLocation();
+  const rebasePath = useRebasePath();
   const replaceSearchParams = useReplaceSearchParams();
   const shown = active && thingyId !== null;
+
+  // Create session from the full screen thingy's menu moves New session to the session it
+  // creates, at its temporary ID first. The thingy stays over it until the session shows it.
+  const sessionPrefix = rebasePath("/c/");
+  const routeSessionId = location.pathname.startsWith(sessionPrefix)
+    ? decodeURIComponent(location.pathname.slice(sessionPrefix.length).replace(/\/$/, ""))
+    : null;
+  const [lastFullScreen, setLastFullScreen] = useState<string | null>(null);
+  const [handoff, setHandoff] = useState<ThingyHandoff | null>(null);
+  const shownFullScreen = shown && maximized ? thingyId : null;
+  if (shown) {
+    if (lastFullScreen !== shownFullScreen) setLastFullScreen(shownFullScreen);
+    if (handoff !== null) setHandoff(null);
+  } else if (lastFullScreen !== null) {
+    setLastFullScreen(null);
+    if (routeSessionId !== null && isTempConvId(routeSessionId)) {
+      const { frameConnections, failedStarts } = useThingyRailRequest.getState();
+      setHandoff({
+        thingyId: lastFullScreen,
+        sessionId: routeSessionId,
+        connections: frameConnections[lastFullScreen] ?? 0,
+        failures: failedStarts[lastFullScreen] ?? 0,
+      });
+    }
+  } else if (handoff !== null && routeSessionId !== handoff.sessionId) {
+    // The temporary ID gives way to the real one; any other page ends the handoff.
+    if (isTempConvId(handoff.sessionId) && routeSessionId !== null && !isTempConvId(routeSessionId))
+      setHandoff({ ...handoff, sessionId: routeSessionId });
+    else setHandoff(null);
+  }
+  const coverThingyId = shown ? thingyId : (handoff?.thingyId ?? null);
+  const covering = !shown && handoff !== null;
+  const handoffThingyId = handoff?.thingyId ?? null;
+  const handoffReady = useThingyRailRequest(
+    (state) =>
+      handoff !== null &&
+      state.fullScreenThingyId === handoff.thingyId &&
+      (state.frameConnections[handoff.thingyId] ?? 0) > handoff.connections,
+  );
+  const handoffFailed = useThingyRailRequest(
+    (state) => handoff !== null && (state.failedStarts[handoff.thingyId] ?? 0) > handoff.failures,
+  );
+  // Whether the session took the thingy over full screen, for the sidebar below.
+  const handedOverRef = useRef(false);
+  useEffect(() => {
+    if (handoffThingyId === null) return undefined;
+    const timer = setTimeout(
+      () => {
+        handedOverRef.current = handoffReady;
+        setHandoff(null);
+      },
+      handoffFailed ? 0 : handoffReady ? HANDOFF_SETTLE_MS : HANDOFF_TIMEOUT_MS,
+    );
+    return () => clearTimeout(timer);
+  }, [handoffThingyId, handoffReady, handoffFailed]);
+  // The thingy over the session is only a picture of it: the session's own thingy takes clicks.
+  const asideRef = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    asideRef.current?.toggleAttribute("inert", covering);
+  });
+
+  const thingy = useThingy(coverThingyId, { watch: true });
   // Full screen lasts while the thingy shows; the next New session starts docked unless thingy
   // code asks again before it opens.
   useEffect(() => {
@@ -831,33 +911,37 @@ export function ThingyNewSessionPanel({
   sidebarOpenRef.current = sidebarOpen;
   const onSidebarOpenChangeRef = useRef(onSidebarOpenChange);
   onSidebarOpenChangeRef.current = onSidebarOpenChange;
+  // A session that took the thingy over full screen leaves the sidebar as it is.
+  const coverId = fullScreenId ?? handoffThingyId;
   useEffect(() => {
-    if (fullScreenId !== null) {
+    if (coverId !== null) {
       if (sidebarStashRef.current !== null || keepSidebar || mobile) return;
       sidebarStashRef.current = sidebarOpenRef.current ?? true;
       onSidebarOpenChangeRef.current?.(false);
     } else if (sidebarStashRef.current !== null) {
-      const reopen = sidebarStashRef.current;
+      const reopen = sidebarStashRef.current && !handedOverRef.current;
       sidebarStashRef.current = null;
       if (reopen) onSidebarOpenChangeRef.current?.(true);
     }
-  }, [fullScreenId, keepSidebar, mobile]);
+    handedOverRef.current = false;
+  }, [coverId, keepSidebar, mobile]);
 
-  if (!shown) return null;
+  if (coverThingyId === null) return null;
+  const panelMaximized = covering || maximized;
   const label = thingy.data?.name ?? "Thingy";
   const close = () => {
     const nextParams = new URLSearchParams(location.search);
     nextParams.delete(THINGY_START_PARAM);
     nextParams.delete(THINGY_FULL_SCREEN_PARAM);
-    leaveThingyStart(thingyId, queryClient);
+    leaveThingyStart(coverThingyId, queryClient);
     replaceSearchParams(nextParams);
   };
   const onDeleted = () => {
-    leaveThingyStart(thingyId, queryClient);
+    leaveThingyStart(coverThingyId, queryClient);
     // Back must not reopen New session for the deleted thingy.
     navigate("/thingy", { replace: true });
   };
-  if (!maximized && mobile) {
+  if (!panelMaximized && mobile) {
     // A phone has no room beside New session: a chip brings the thingy back over it.
     return (
       <div className="pointer-events-none absolute inset-x-0 top-[calc(var(--omnigent-header-height,3rem)+0.5rem)] z-30 flex justify-center px-4">
@@ -877,13 +961,15 @@ export function ThingyNewSessionPanel({
   }
   return (
     <aside
+      ref={asideRef}
       aria-label={label}
+      aria-busy={covering || undefined}
       data-testid="thingy-new-session-panel"
-      data-maximized={maximized || undefined}
+      data-maximized={panelMaximized || undefined}
       className={cn(
         "relative z-40 min-h-0 flex-col overflow-hidden bg-card",
         // Full screen covers New session, as a full screen side panel covers its session.
-        maximized
+        panelMaximized
           ? "absolute inset-0 flex"
           : "hidden border-l border-border md:flex md:w-[min(560px,45%)] md:shrink-0",
       )}
@@ -893,7 +979,7 @@ export function ThingyNewSessionPanel({
         aria-label={`${label} tabs`}
         className="flex shrink-0 items-center gap-1 border-b border-border px-2 py-3"
       >
-        {maximized ? (
+        {panelMaximized ? (
           <ThingyFullScreenSlot
             onToolbar={setToolbar}
             sidebarOpen={sidebarOpen}
@@ -906,11 +992,12 @@ export function ThingyNewSessionPanel({
           </div>
         )}
         <div className="ml-auto flex shrink-0 items-center gap-1 pl-1">
-          {maximized ? (
+          {panelMaximized ? (
             // Leaving full screen shows New session, so the button shows the harness New session
             // will start, in grey until it starts, with New session's controls in a popover.
             <ThingyOpenSessionButton
               sessionId={null}
+              starting={covering}
               onOpenSession={() => setFullScreen(false)}
               className={PANEL_ICON_BUTTON}
             />
@@ -931,7 +1018,7 @@ export function ThingyNewSessionPanel({
               <TooltipContent side="bottom">Full screen</TooltipContent>
             </Tooltip>
           )}
-          {!maximized && (
+          {!panelMaximized && (
             <Tooltip>
               <TooltipTrigger asChild>
                 <Button
@@ -951,12 +1038,12 @@ export function ThingyNewSessionPanel({
           )}
         </div>
       </div>
-      <RenderErrorBoundary name="this thingy" resetKey={thingyId}>
+      <RenderErrorBoundary name="this thingy" resetKey={coverThingyId}>
         <div className="flex min-h-0 flex-1 flex-col">
           <ThingyNewSessionPane
-            key={thingyId}
-            thingyId={thingyId}
-            view={{ fullScreen: maximized, toolbar: maximized ? toolbar : null }}
+            key={coverThingyId}
+            thingyId={coverThingyId}
+            view={{ fullScreen: panelMaximized, toolbar: panelMaximized ? toolbar : null }}
             onOpenSession={() => setFullScreen(false)}
             onDeleted={onDeleted}
           />

@@ -40,7 +40,7 @@ import { DeleteThingyDialog } from "./DeleteThingyDialog";
 import { ThingyErrorNotice } from "./ThingyErrorNotice";
 import { ThingyStartDialog } from "./ThingyStart";
 import { MAX_THINGY_NAME_LENGTH } from "./ThingyTemplateGallery";
-import { thingyErrorMessage } from "./thingyNavigation";
+import { IN_APP_THINGY_OPEN, thingyErrorMessage } from "./thingyNavigation";
 import {
   usePinThingy,
   useRenameThingy,
@@ -98,7 +98,7 @@ function ThingyRow({
         type="button"
         data-row-open
         aria-label={`Open ${thingy.name}`}
-        onClick={() => navigate(thingyBoardPath(thingy.id))}
+        onClick={() => navigate(thingyBoardPath(thingy.id), { state: IN_APP_THINGY_OPEN })}
         className="flex min-w-0 flex-1 cursor-pointer flex-col gap-0.5 text-left outline-none after:absolute after:inset-0 after:content-['']"
       >
         <span className="truncate text-[15px] font-semibold">{thingy.name}</span>

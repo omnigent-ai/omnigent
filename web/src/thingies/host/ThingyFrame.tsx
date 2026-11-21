@@ -16,6 +16,7 @@ import { getOmnigentThingyFrame } from "@/lib/host";
 import { randomUUID } from "@/lib/randomUUID";
 import { useNavigate, useRebasePath } from "@/lib/routing";
 import {
+  noteThingyFrameConnected,
   requestThingyCreateSessionMenu,
   requestThingyRailTab,
   thingyFillsScreen,
@@ -462,6 +463,7 @@ export function ThingyFrame({
           }
         },
       });
+      if (!preview) noteThingyFrameConnected(latest.app.id);
       frameWindow.postMessage(
         { type: THINGY_CONNECT_MESSAGE_TYPE, frameId: mount.frameId, nonce: mount.nonce },
         // The frame's origin is opaque; the nonce and the transferred port are the boundary.

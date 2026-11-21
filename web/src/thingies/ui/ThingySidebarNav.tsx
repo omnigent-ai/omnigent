@@ -12,11 +12,9 @@ import { useThingyRailRequest } from "@/lib/thingyRailTabs";
 import { PrimaryNavLink } from "@/shell/PrimaryNavLink";
 import { SIDEBAR_HOVER_HIGHLIGHT, SIDEBAR_ROW } from "@/shell/sidebarStyles";
 import { thingyBoardPath } from "@/thingies/host/thingyPages";
-import type { ThingyOpenState } from "./thingyNavigation";
+import { IN_APP_THINGY_OPEN } from "./thingyNavigation";
 import { useThingyStartId } from "./ThingyRailTabs";
 import { useLinkedThingiesSync, useThingiesEnabled, useThingyShelf } from "./thingyQueries";
-
-const PINNED_OPEN_STATE: ThingyOpenState = { keepSidebar: true };
 
 /** The thingy filling the screen, in a session's side panel or beside New session, or null. */
 export function useFullScreenThingyId(): string | null {
@@ -76,7 +74,7 @@ export function ThingySidebarNav({
                 >
                   <Link
                     to={thingyBoardPath(pin.id)}
-                    state={PINNED_OPEN_STATE}
+                    state={IN_APP_THINGY_OPEN}
                     onClick={onNavigate}
                     componentId="sidebar.thingies.pinned"
                     aria-current={current ? "page" : undefined}

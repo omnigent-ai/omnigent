@@ -232,13 +232,13 @@ import { hasSessionDraft, useHasSessionDraft, useSessionDraftIds } from "@/lib/s
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
 import type { SessionState } from "@/hooks/useSessionState";
 import { useSessionBadgeStates } from "@/hooks/useSessionBadgeStates";
+import { useSessionIndicatorState } from "@/hooks/useSessionIndicatorState";
 import { useChatStore } from "@/store/chatStore";
 import {
   isConversationUnseen,
   isExplicitlyUnread,
   markConversationRead,
   markConversationUnread,
-  useConversationReadState,
   useReadStateSnapshot,
   useUnseenTick,
 } from "@/hooks/useUnseenConversations";
@@ -6124,38 +6124,11 @@ function ConversationRowImpl({
   const isProvisionalLabel =
     pendingTitle === null && conversation.title == null && optimisticTitle !== undefined;
   const hasDraft = useHasSessionDraft(conversation.id);
-  // A write for another conversation leaves this primitive snapshot unchanged,
-  // so useSyncExternalStore skips the heavy row render.
-  const readState = useConversationReadState(
-    conversation.id,
-    conversation.updated_at,
-    conversation.status,
+  const { sessionState, unread, hasUnseenMessages, isMuted } = useSessionIndicatorState(
+    conversation,
+    isActive,
   );
-  // Explicit unread overrides active-row suppression; running turns remain
-  // hidden through readState.unseen. Muting hides the dot without marking read.
-  const isMuted = isConversationMuted(conversation);
-  const unread = readState.unseen && (!isActive || readState.explicitlyUnread);
-  const hasUnseenMessages = showsUnreadFor(conversation, unread);
   const canMarkUnread = !unread;
-  // Approvals and failures outrank the unread dot without clearing read state.
-  const badgeConversations = useMemo(() => [conversation], [conversation]);
-  const [derivedState] = useSessionBadgeStates(badgeConversations);
-  // The bound session's launch/relaunch window: a send is in flight (local
-  // status "streaming") or the runner is auto-creating the PTY
-  // (`terminalPending`), but the server hasn't confirmed `running` yet — a
-  // cold boot, or a send waking a disconnected runner. Without this the row
-  // shows nothing while the session is visibly "Starting up…" in the chat.
-  // Only the bound (open) conversation has this store state; other rows read
-  // false, and the server-derived states above win once they land.
-  const isStartingUp = useChatStore(
-    (s) => s.conversationId === conversation.id && (s.status === "streaming" || s.terminalPending),
-  );
-  const sessionState =
-    derivedState?.kind === "awaiting" || derivedState?.kind === "running"
-      ? derivedState
-      : isStartingUp
-        ? { kind: "starting" as const }
-        : (derivedState ?? (hasUnseenMessages ? { kind: "unseen" as const } : null));
   // Drafts share the row's trailing indicator slot, but the active session's
   // composer already makes its draft visible. Live session state wins while
   // present; otherwise only an inactive row needs the draft marker.

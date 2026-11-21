@@ -77,6 +77,11 @@ describe("Thingy page", () => {
 
     fireEvent.click(within(yours).getByRole("button", { name: "Open Launch board" }));
     expect(screen.getByLabelText("location")).toHaveTextContent("/thingy/board");
+    // Opened from inside Omnigent, whatever key the host's router gives the entry.
+    expect(screen.getByLabelText("location")).toHaveAttribute(
+      "data-state",
+      JSON.stringify({ keepSidebar: true }),
+    );
   });
 
   it("deletes a thingy after confirming", async () => {

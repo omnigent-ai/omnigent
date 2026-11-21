@@ -14,6 +14,13 @@ export interface ThingyOpenState {
 }
 
 /**
+ * The state for every link or navigation inside Omnigent that opens a thingy's page: the sidebar
+ * stays as it is. A host's router can give in-app entries the key of a fresh load, so the key
+ * alone can't tell them apart.
+ */
+export const IN_APP_THINGY_OPEN: ThingyOpenState = { keepSidebar: true };
+
+/**
  * Whether a thingy opened full screen leaves the sidebar as it is: yes when the viewer opened it
  * from inside Omnigent, no for a link opened in a new tab or pasted into the address bar, which
  * opens it with the sidebar closed. Link state that says so wins.
@@ -33,11 +40,19 @@ export function appPathFromUrl(url: string): string {
   return `${parsed.pathname}${parsed.search}${parsed.hash}`;
 }
 
+const THINGY_PAGE_PATH = /^\/thingy\/[^/?#]+\/?(?:[?#]|$)/;
+
 /** Opens a URL from thingy code in this tab, replacing the current entry with `replace`. */
 export function useThingyNavigate({ replace = false }: { replace?: boolean } = {}): ThingyNavigate {
   const navigate = useNavigate();
   return useCallback(
-    (url: string) => navigate(appPathFromUrl(url), { replace }),
+    (url: string) => {
+      const path = appPathFromUrl(url);
+      navigate(path, {
+        replace,
+        ...(THINGY_PAGE_PATH.test(path) ? { state: IN_APP_THINGY_OPEN } : {}),
+      });
+    },
     [navigate, replace],
   );
 }

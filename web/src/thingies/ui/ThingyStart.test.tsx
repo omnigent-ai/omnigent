@@ -94,6 +94,10 @@ describe("New thingy", () => {
     fireEvent.click(within(naming).getByRole("button", { name: "Create" }));
 
     await waitFor(() => expect(location().pathname).toBe("/thingy/where-1"));
+    expect(screen.getByLabelText("location")).toHaveAttribute(
+      "data-state",
+      JSON.stringify({ keepSidebar: true }),
+    );
     expect(createThingy).toHaveBeenCalledWith("Team where was I");
     expect(createThingyRevision).toHaveBeenCalledWith(
       "where-1",

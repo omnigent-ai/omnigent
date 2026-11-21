@@ -11,7 +11,7 @@ import { useEffect } from "react";
 import { type QueryClient, useQueryClient } from "@tanstack/react-query";
 
 import { useLocation, useRebasePath, useReplaceSearchParams } from "@/lib/routing";
-import { requestThingyRailTab } from "@/lib/thingyRailTabs";
+import { noteThingyStartFailed, requestThingyRailTab } from "@/lib/thingyRailTabs";
 import { deleteThingy, getThingy, getThingyThingySession } from "@/thingies/api/thingyApi";
 import { THINGY_START_PARAM } from "@/thingies/host/thingyPages";
 import {
@@ -113,6 +113,8 @@ export function useAdoptStartedThingySession(): void {
         else requestThingyRailTab(sessionId, key);
       })
       // The session still runs; the thingy stays on its own page.
-      .catch(() => undefined);
+      .catch(() => {
+        if (fullScreen) noteThingyStartFailed(thingyId);
+      });
   }, [pathname, queryClient, search, sessionPrefix, replaceSearchParams]);
 }

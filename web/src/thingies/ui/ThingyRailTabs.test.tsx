@@ -6,8 +6,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import {
   exitThingyRailFullScreen,
+  noteThingyFrameConnected,
+  noteThingyStartFailed,
   requestThingyRailTab,
   resetThingyRailRequests,
+  setFullScreenThingy,
   useThingyRailRequest,
 } from "@/lib/thingyRailTabs";
 import {
@@ -27,7 +30,7 @@ import {
   useThingyRailTabState,
 } from "./ThingyRailTabs";
 import { renderWithThingies, thingyFixture } from "./testUtils";
-import { useNavigate } from "@/lib/routing";
+import { useLocation, useNavigate } from "@/lib/routing";
 import { resetThingyDrafts } from "./thingyDrafts";
 import { resetThingyStarts } from "./useAdoptStartedThingySession";
 import type * as ThingySessionModule from "@/thingies/host/thingySession";
@@ -451,6 +454,115 @@ describe("the thingy beside New session", () => {
     expect(search.get("thingy_start")).toBe("1");
     expect(search.get("thingy")).toBe("1");
     expect(await screen.findByRole("dialog", { name: "Create session" })).toBeInTheDocument();
+  });
+
+  describe("creating its session from the full screen thingy", () => {
+    let navigate: ((url: string, replace?: boolean) => void) | null = null;
+    function CaptureNavigate() {
+      const go = useNavigate();
+      useEffect(() => {
+        navigate = (url: string, replace = false) => go(url, { replace });
+      }, [go]);
+      return null;
+    }
+
+    async function renderFullScreen(onSidebarOpenChange = vi.fn()) {
+      vi.mocked(getThingy).mockResolvedValue(BOARD);
+      // AppShell's New session panel: shown while no session is open.
+      function Shell() {
+        const location = useLocation();
+        return (
+          <ThingyNewSessionPanel
+            active={!location.pathname.startsWith("/c/")}
+            sidebarOpen
+            onSidebarOpenChange={onSidebarOpenChange}
+          />
+        );
+      }
+      renderWithThingies(
+        <>
+          <Shell />
+          <CaptureNavigate />
+        </>,
+        { path: "/?thingy_start=1" },
+      );
+      const panel = await screen.findByRole("complementary", { name: "Board" });
+      fireEvent.click(within(panel).getByRole("button", { name: "Full screen" }));
+      const thingy = within(panel).getByText("shows Board");
+      // Create session: New session moves to the session at its temporary ID, then its real one.
+      act(() => navigate!("/c/temp:abc?thingy_start=1"));
+      return { panel, thingy, onSidebarOpenChange };
+    }
+
+    it("keeps the same thingy full screen over the session until the session shows it", async () => {
+      const { panel, thingy, onSidebarOpenChange } = await renderFullScreen();
+
+      // Not the session view: the same panel, and the same thingy in it, still fill the screen.
+      expect(screen.getByRole("complementary", { name: "Board" })).toBe(panel);
+      expect(panel).toHaveAttribute("data-maximized", "true");
+      expect(panel).toHaveAttribute("aria-busy", "true");
+      expect(panel).toHaveAttribute("inert");
+      expect(within(panel).getByText("shows Board")).toBe(thingy);
+      expect(within(panel).getByTestId("session-state-badge")).toHaveAttribute(
+        "data-state",
+        "starting",
+      );
+      act(() => navigate!("/c/conv_9", true));
+      expect(within(panel).getByText("shows Board")).toBe(thingy);
+
+      // The session shows the thingy full screen, but its frame isn't connected yet.
+      act(() => setFullScreenThingy("1"));
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 300);
+      });
+      expect(screen.getByRole("complementary", { name: "Board" })).toBe(panel);
+
+      act(() => noteThingyFrameConnected("1"));
+      await waitFor(() => expect(screen.queryByTestId("thingy-new-session-panel")).toBeNull());
+      // The session's full screen keeps the sidebar as it is.
+      expect(onSidebarOpenChange).not.toHaveBeenCalledWith(true);
+    });
+
+    it("shows the session when it couldn't take the thingy", async () => {
+      const { onSidebarOpenChange } = await renderFullScreen();
+      act(() => navigate!("/c/conv_9", true));
+
+      act(() => noteThingyStartFailed("1"));
+
+      await waitFor(() => expect(screen.queryByTestId("thingy-new-session-panel")).toBeNull());
+      expect(onSidebarOpenChange).toHaveBeenLastCalledWith(true);
+    });
+
+    it("stops covering when the viewer goes elsewhere", async () => {
+      await renderFullScreen();
+      act(() => navigate!("/c/conv_9", true));
+      expect(screen.getByTestId("thingy-new-session-panel")).toBeInTheDocument();
+
+      act(() => navigate!("/c/conv_other"));
+
+      expect(screen.queryByTestId("thingy-new-session-panel")).toBeNull();
+    });
+
+    it("doesn't cover a session opened another way", async () => {
+      vi.mocked(getThingy).mockResolvedValue(BOARD);
+      useThingyRailRequest.setState({ newSessionMaximized: true });
+      function Shell() {
+        const location = useLocation();
+        return <ThingyNewSessionPanel active={!location.pathname.startsWith("/c/")} />;
+      }
+      renderWithThingies(
+        <>
+          <Shell />
+          <CaptureNavigate />
+        </>,
+        { path: "/?thingy_start=1&thingy=1" },
+      );
+      await screen.findByRole("complementary", { name: "Board" });
+
+      act(() => navigate!("/c/conv_existing"));
+
+      expect(screen.queryByTestId("thingy-new-session-panel")).toBeNull();
+    });
   });
 
   it("closes the sidebar for full screen and opens it again after", async () => {

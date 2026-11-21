@@ -6,12 +6,21 @@
 //
 // Before the session exists, the menu's main button is New session's own Create session button:
 // it starts the session with New session's prompt and settings while the thingy stays full
-// screen. A request from the thingy that needs the session opens the menu by itself.
+// screen. A request from the thingy that needs the session opens the menu by itself, over a dimmed
+// screen, so the viewer sees what the request waits for.
+//
+// Beside the button, the session's status shows as in its sidebar row.
 import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { createPortal } from "react-dom";
 import { MessagesSquareIcon } from "lucide-react";
 
+import { SessionStateBadge } from "@/components/SessionStateBadge";
 import { Button } from "@/components/ui/button";
 import { Popover, PopoverAnchor, PopoverContent } from "@/components/ui/popover";
+import { useOpenSessionRow } from "@/hooks/useOpenSessionRow";
+import { useSessionIndicatorState } from "@/hooks/useSessionIndicatorState";
+import type { Conversation } from "@/hooks/useConversations";
+import { getEmbedRoot } from "@/lib/host";
 import { takeThingyCreateSessionMenuRequest, useThingyRailRequest } from "@/lib/thingyRailTabs";
 import { cn } from "@/lib/utils";
 import {
@@ -34,22 +43,31 @@ const FOCUSABLE = "button:not([disabled]), [href], [tabindex]:not([tabindex='-1'
 
 type RowSlot = Exclude<SessionControlSlot, "icon" | "create">;
 
-// The controls name themselves, so the rows carry no labels.
-const ROWS: RowSlot[] = ["host", "permission", "harness"];
+// The controls name themselves, so they carry no labels, side by side in one row.
+const CONTROLS: RowSlot[] = ["host", "permission", "harness"];
 
-function ControlRow({ sessionId, slot }: { sessionId: string | null; slot: RowSlot }) {
+function ControlSlot({ sessionId, slot }: { sessionId: string | null; slot: RowSlot }) {
   const ref = useSessionControlSlotRef(sessionId, slot);
-  // A row whose control the composer doesn't offer (an empty slot) hides itself.
+  // A control the composer doesn't offer (an empty slot) takes no room.
   return (
-    <div className="flex min-w-0 items-center has-[>[data-control-slot]:empty]:hidden">
-      <div
-        ref={ref}
-        data-control-slot
-        data-testid={`thingy-open-session-${slot}`}
-        className="flex min-w-0 flex-1 items-center"
-      />
-    </div>
+    <div
+      ref={ref}
+      data-control-slot
+      data-testid={`thingy-open-session-${slot}`}
+      className="flex min-w-0 shrink items-center empty:hidden"
+    />
   );
+}
+
+/** The session's status as its sidebar row shows it; the viewer isn't reading the session. */
+function SessionRowStatus({ row }: { row: Conversation }) {
+  const { sessionState } = useSessionIndicatorState(row, false);
+  return sessionState === null ? null : <SessionStateBadge state={sessionState} />;
+}
+
+function SessionStatus({ sessionId }: { sessionId: string }) {
+  const row = useOpenSessionRow(sessionId);
+  return row === null ? null : <SessionRowStatus row={row} />;
 }
 
 function CreateSlot({ onFilled }: { onFilled: (element: HTMLElement | null) => void }) {
@@ -73,15 +91,20 @@ function CreateSlot({ onFilled }: { onFilled: (element: HTMLElement | null) => v
 
 export function ThingyOpenSessionButton({
   sessionId,
+  starting = false,
   onOpenSession,
   className,
 }: {
   /** The session the thingy is shown beside; null for New session. */
   sessionId: string | null;
+  /** Whether the session New session created is starting, before it shows the thingy. */
+  starting?: boolean;
   onOpenSession: () => void;
   className?: string;
 }) {
   const [open, setOpen] = useState(false);
+  // Opened for a request: the rest of the screen dims until the viewer answers or dismisses it.
+  const [modal, setModal] = useState(false);
   // Once the viewer uses a control in the menu, or the menu opened for a request, only Escape or
   // a click outside closes it: a control's own menu opens outside this one, where the pointer
   // would otherwise close it.
@@ -104,7 +127,10 @@ export function ThingyOpenSessionButton({
   const changeOpen = useCallback(
     (next: boolean) => {
       clearTimer();
-      if (!next) pinned.current = false;
+      if (!next) {
+        pinned.current = false;
+        setModal(false);
+      }
       setOpen(next);
     },
     [clearTimer],
@@ -122,10 +148,14 @@ export function ThingyOpenSessionButton({
   const focusInMenu = useCallback((preferCreate: boolean) => {
     // The menu mounts on the next frame, and the composer fills its slots after that.
     requestAnimationFrame(() => {
-      const create = preferCreate
-        ? createSlotRef.current?.querySelector<HTMLElement>(FOCUSABLE)
-        : null;
-      (create ?? contentRef.current?.querySelector<HTMLElement>(FOCUSABLE))?.focus();
+      if (!preferCreate) {
+        contentRef.current?.querySelector<HTMLElement>(FOCUSABLE)?.focus();
+        return;
+      }
+      // Without Create session (no host yet, say), the menu itself: a control would show its
+      // tooltip, which takes the first Escape.
+      const create = createSlotRef.current?.querySelector<HTMLElement>(FOCUSABLE);
+      (create ?? contentRef.current)?.focus({ preventScroll: true });
     });
   }, []);
 
@@ -136,6 +166,7 @@ export function ThingyOpenSessionButton({
     if (sessionId !== null || !requested || !takeThingyCreateSessionMenuRequest()) return;
     changeOpen(true);
     pinned.current = true;
+    setModal(true);
     focusInMenu(true);
   }, [changeOpen, focusInMenu, requested, sessionId]);
 
@@ -214,6 +245,23 @@ export function ThingyOpenSessionButton({
   const creating = sessionId === null;
   return (
     <Popover open={open} onOpenChange={changeOpen}>
+      {starting ? (
+        <SessionStateBadge state={{ kind: "starting" }} />
+      ) : (
+        sessionId !== null && <SessionStatus sessionId={sessionId} />
+      )}
+      {/* Below the menu (z-50), above the thingy and everything else. A press on it is a press
+      outside the menu, which closes it. */}
+      {open &&
+        modal &&
+        createPortal(
+          <div
+            aria-hidden
+            data-testid="thingy-open-session-scrim"
+            className="fixed inset-0 z-[49] bg-black/40 duration-150 animate-in fade-in-0"
+          />,
+          getEmbedRoot() ?? document.body,
+        )}
       <PopoverAnchor asChild>
         <Button
           type="button"
@@ -265,9 +313,12 @@ export function ThingyOpenSessionButton({
       <PopoverContent
         side="bottom"
         align="end"
-        className="group w-max min-w-44 max-w-64 p-2"
+        className="group w-max min-w-44 max-w-[min(42rem,calc(100vw-1rem))] p-2"
         data-testid="thingy-open-session-popover"
+        tabIndex={-1}
+        data-modal={modal || undefined}
         aria-label={creating ? "Create session" : LABEL}
+        aria-modal={modal || undefined}
         // Focus stays on the button; ArrowDown, or a request that opens the menu, moves it in.
         onOpenAutoFocus={(event) => event.preventDefault()}
         onCloseAutoFocus={(event) => event.preventDefault()}
@@ -278,9 +329,13 @@ export function ThingyOpenSessionButton({
           if (nestedOpen()) event.preventDefault();
         }}
       >
-        <div ref={setContentRef} className="flex flex-col gap-2">
-          {ROWS.map((slot) => (
-            <ControlRow key={slot} sessionId={sessionId} slot={slot} />
+        <div
+          ref={setContentRef}
+          data-testid="thingy-open-session-controls"
+          className="flex min-w-0 flex-row flex-wrap items-center gap-1"
+        >
+          {CONTROLS.map((slot) => (
+            <ControlSlot key={slot} sessionId={sessionId} slot={slot} />
           ))}
         </div>
         {creating && <CreateSlot onFilled={setCreateSlot} />}

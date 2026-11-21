@@ -1,6 +1,11 @@
-import { useState } from "react";
-import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { type ReactElement, type ReactNode, useState } from "react";
+import { act, fireEvent, render as renderUi, screen, within } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { TooltipProvider } from "@/components/ui/tooltip";
+import type { Conversation } from "@/hooks/useConversations";
+import { markConversationUnread } from "@/hooks/useUnseenConversations";
 
 import {
   requestThingyCreateSessionMenu,
@@ -19,6 +24,41 @@ import {
   SessionControlPortal,
 } from "@/shell/MobileHeaderControlsSlot";
 import { ThingyOpenSessionButton } from "./ThingyOpenSessionButton";
+
+let queryClient = new QueryClient();
+
+function render(ui: ReactElement) {
+  const wrapper = ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={queryClient}>
+      <TooltipProvider>{children}</TooltipProvider>
+    </QueryClientProvider>
+  );
+  return renderUi(ui, { wrapper });
+}
+
+/** Puts the session's row in a sidebar list, where its status comes from. */
+function listSession(row: Partial<Conversation> & { id: string }) {
+  queryClient.setQueryData(["conversations", "test"], {
+    pages: [
+      {
+        data: [
+          {
+            object: "conversation",
+            title: "Session",
+            created_at: 1000,
+            updated_at: 2000,
+            labels: {},
+            permission_level: null,
+            owner: "viewer@example.com",
+            status: "idle",
+            ...row,
+          },
+        ],
+      },
+    ],
+    pageParams: [null],
+  });
+}
 
 // A composer: its host, permission and harness controls keep their own state, like New
 // session's draft, and render through the session control portals the real composers use.
@@ -67,16 +107,22 @@ function renderButton({
   harness = "codex",
   onOpenSession = vi.fn(),
   createError,
+  starting,
 }: {
   sessionId: string | null;
   composerSessionId?: string | null;
   harness?: string;
   onOpenSession?: () => void;
   createError?: string;
+  starting?: boolean;
 }) {
   render(
     <MobileHeaderControlsProvider>
-      <ThingyOpenSessionButton sessionId={sessionId} onOpenSession={onOpenSession} />
+      <ThingyOpenSessionButton
+        sessionId={sessionId}
+        starting={starting}
+        onOpenSession={onOpenSession}
+      />
       <Composer sessionId={composerSessionId} harness={harness} createError={createError} />
     </MobileHeaderControlsProvider>,
   );
@@ -93,6 +139,7 @@ function hoverOpen(button: HTMLElement) {
 describe("ThingyOpenSessionButton", () => {
   beforeEach(() => {
     vi.useFakeTimers();
+    queryClient = new QueryClient();
   });
   afterEach(() => {
     vi.useRealTimers();
@@ -278,6 +325,139 @@ describe("ThingyOpenSessionButton", () => {
 
     expect(screen.queryByTestId("thingy-open-session-popover")).toBeNull();
     expect(useThingyRailRequest.getState().createSessionMenuRequested).toBe(true);
+  });
+
+  it("dims the screen behind a menu opened for a request, and a press there dismisses it", () => {
+    const { onOpenSession } = renderButton({ sessionId: null });
+    act(() => {
+      requestThingyCreateSessionMenu();
+    });
+
+    const popover = screen.getByRole("dialog", { name: "Create session" });
+    expect(popover).toHaveAttribute("aria-modal", "true");
+    const scrim = screen.getByTestId("thingy-open-session-scrim");
+    // Under the menu, over everything else, the thingy included.
+    expect(scrim).toHaveClass("fixed", "inset-0", "z-[49]");
+    expect(scrim.parentElement).toBe(document.body);
+    expect(scrim).toBeEmptyDOMElement();
+    // The menu's own controls stay usable over it.
+    fireEvent.click(within(popover).getByRole("button", { name: "Permission: Ask" }));
+    expect(screen.getByTestId("thingy-open-session-scrim")).toBeInTheDocument();
+
+    act(() => {
+      vi.advanceTimersByTime(10);
+    });
+    fireEvent.pointerDown(scrim, { button: 0 });
+    fireEvent.click(scrim);
+
+    expect(screen.queryByTestId("thingy-open-session-popover")).toBeNull();
+    expect(screen.queryByTestId("thingy-open-session-scrim")).toBeNull();
+    // Dismissing creates nothing and keeps New session's draft for later.
+    expect(onOpenSession).not.toHaveBeenCalled();
+    expect(screen.getByTestId("composer")).toHaveTextContent("Permission: Auto");
+  });
+
+  it("dismisses the dimmed menu on Escape", () => {
+    renderButton({ sessionId: null });
+    act(() => {
+      requestThingyCreateSessionMenu();
+    });
+    expect(screen.getByTestId("thingy-open-session-scrim")).toBeInTheDocument();
+
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+
+    expect(screen.queryByTestId("thingy-open-session-popover")).toBeNull();
+    expect(screen.queryByTestId("thingy-open-session-scrim")).toBeNull();
+  });
+
+  it("focuses the menu itself when Create session can't be pressed yet", () => {
+    render(
+      <MobileHeaderControlsProvider>
+        <ThingyOpenSessionButton sessionId={null} onOpenSession={vi.fn()} />
+        <MobileHeaderControlPortal sessionId={null} popoverSlot="host">
+          <button type="button">Host: none</button>
+        </MobileHeaderControlPortal>
+        <SessionControlPortal sessionId={null} slot="create" inPlace={false}>
+          <button type="button" disabled>
+            Create session
+          </button>
+        </SessionControlPortal>
+      </MobileHeaderControlsProvider>,
+    );
+    act(() => {
+      requestThingyCreateSessionMenu();
+    });
+    act(() => {
+      vi.advanceTimersByTime(50);
+    });
+
+    const popover = screen.getByTestId("thingy-open-session-popover");
+    expect(document.activeElement).toBe(popover);
+    fireEvent.keyDown(popover, { key: "Escape" });
+    expect(screen.queryByTestId("thingy-open-session-popover")).toBeNull();
+  });
+
+  it("doesn't dim the screen for a menu opened by hover", () => {
+    const { button } = renderButton({ sessionId: null });
+    hoverOpen(button);
+
+    expect(screen.getByTestId("thingy-open-session-popover")).not.toHaveAttribute("aria-modal");
+    expect(screen.queryByTestId("thingy-open-session-scrim")).toBeNull();
+  });
+
+  it("puts host, permission and harness side by side, with the main button below them", () => {
+    const { button } = renderButton({ sessionId: null });
+    hoverOpen(button);
+
+    const controls = screen.getByTestId("thingy-open-session-controls");
+    expect(controls).toHaveClass("flex-row");
+    expect(Array.from(controls.children).map((slot) => slot.getAttribute("data-testid"))).toEqual([
+      "thingy-open-session-host",
+      "thingy-open-session-permission",
+      "thingy-open-session-harness",
+    ]);
+    const create = screen.getByTestId("thingy-open-session-create");
+    expect(
+      controls.compareDocumentPosition(create) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(within(create).getByRole("button", { name: "Create session" })).toBeInTheDocument();
+    // The menu is as wide as that row.
+    expect(screen.getByTestId("thingy-open-session-popover")).toHaveClass("w-max");
+  });
+
+  describe("the session's status", () => {
+    const badge = () => screen.queryByTestId("session-state-badge");
+
+    it("shows a session waiting for the viewer", () => {
+      listSession({ id: "conv_wait", status: "running", pending_elicitations_count: 1 });
+      renderButton({ sessionId: "conv_wait" });
+      expect(badge()).toHaveAttribute("data-state", "awaiting");
+      expect(badge()).toHaveTextContent("Needs response");
+    });
+
+    it("shows a running session", () => {
+      listSession({ id: "conv_run", status: "running" });
+      renderButton({ sessionId: "conv_run" });
+      expect(badge()).toHaveAttribute("data-state", "running");
+    });
+
+    it("shows new messages the viewer hasn't read", () => {
+      listSession({ id: "conv_new", status: "idle", updated_at: 2000 });
+      markConversationUnread("conv_new", 2000);
+      renderButton({ sessionId: "conv_new" });
+      expect(badge()).toHaveAttribute("data-state", "unseen");
+    });
+
+    it("shows nothing for a quiet session, or before one exists", () => {
+      listSession({ id: "conv_quiet", status: "idle" });
+      renderButton({ sessionId: "conv_quiet" });
+      expect(badge()).toBeNull();
+    });
+
+    it("shows a session New session just created as starting", () => {
+      renderButton({ sessionId: null, starting: true });
+      expect(badge()).toHaveAttribute("data-state", "starting");
+    });
   });
 
   it("hides rows for controls the composer doesn't offer", () => {

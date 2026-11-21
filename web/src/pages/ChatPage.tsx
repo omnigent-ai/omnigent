@@ -226,6 +226,7 @@ import {
 } from "@/hooks/useSessionLiveness";
 import { useMessageDeepLinkChatView } from "@/hooks/useMessageDeepLink";
 import { useMarkConversationSeen } from "@/hooks/useUnseenConversations";
+import { useThingyRailRequest } from "@/lib/thingyRailTabs";
 import { useFileDropTarget } from "@/hooks/useFileDropTarget";
 import { useComposerAttachments } from "@/hooks/useComposerAttachments";
 import { useSlashCompletion } from "@/hooks/useSlashCompletion";
@@ -509,9 +510,11 @@ export function ChatPage() {
 
   // Clear the "unseen messages" sidebar dot for the conversation the
   // user is currently viewing. Re-fires when conversations refresh
-  // (every 4 s) so messages arriving while viewing are marked seen.
+  // (every 4 s) so messages arriving while viewing are marked seen. A thingy
+  // filling the screen hides the conversation, so its new messages stay new.
+  const thingyCoversChat = useThingyRailRequest((state) => state.fullScreenThingyId !== null);
   useMarkConversationSeen(
-    sessionConvId,
+    thingyCoversChat ? undefined : sessionConvId,
     conversations?.find((c) => c.id === sessionConvId)?.updated_at,
   );
 

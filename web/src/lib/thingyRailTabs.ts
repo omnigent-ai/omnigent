@@ -25,6 +25,13 @@ interface ThingyRailState {
    * opens, which can be after the navigation that made the request.
    */
   createSessionMenuRequested: boolean;
+  /**
+   * How many times a frame of each thingy has connected, and how many sessions started beside
+   * each full screen thingy failed to show it. The thingy beside New session covers the session
+   * it started until that session's own frame connects, or its start fails.
+   */
+  frameConnections: Record<string, number>;
+  failedStarts: Record<string, number>;
 }
 
 export const useThingyRailRequest = create<ThingyRailState>(() => ({
@@ -33,6 +40,8 @@ export const useThingyRailRequest = create<ThingyRailState>(() => ({
   newSessionMaximized: false,
   fullScreenThingyId: null,
   createSessionMenuRequested: false,
+  frameConnections: {},
+  failedStarts: {},
 }));
 
 /**
@@ -108,6 +117,23 @@ export function takeThingyCreateSessionMenuRequest(): boolean {
   return true;
 }
 
+/** Notes that a frame of `thingyId` connected to its thingy. */
+export function noteThingyFrameConnected(thingyId: string): void {
+  useThingyRailRequest.setState((state) => ({
+    frameConnections: {
+      ...state.frameConnections,
+      [thingyId]: (state.frameConnections[thingyId] ?? 0) + 1,
+    },
+  }));
+}
+
+/** Notes that the session started beside `thingyId` couldn't show it. */
+export function noteThingyStartFailed(thingyId: string): void {
+  useThingyRailRequest.setState((state) => ({
+    failedStarts: { ...state.failedStarts, [thingyId]: (state.failedStarts[thingyId] ?? 0) + 1 },
+  }));
+}
+
 export function clearThingyRailRequest(): void {
   useThingyRailRequest.setState({ requested: null });
 }
@@ -120,5 +146,7 @@ export function resetThingyRailRequests(): void {
     newSessionMaximized: false,
     fullScreenThingyId: null,
     createSessionMenuRequested: false,
+    frameConnections: {},
+    failedStarts: {},
   });
 }

@@ -180,25 +180,27 @@ export function ThingyCommentsButton({ comments }: { comments: ThingyComments })
           aria-pressed={comments.open}
           aria-label={count > 0 ? `Comments (${count} open)` : "Comments"}
           className={cn(
-            "shrink-0 text-muted-foreground hover:text-foreground mobile-touch-target",
+            "h-6 min-w-6 shrink-0 px-1 text-muted-foreground hover:text-foreground mobile-touch-target",
             comments.open && "bg-muted text-foreground",
           )}
           componentId="thingies.comments"
           onClick={() => comments.setOpen(!comments.open)}
         >
-          <MessageSquareIcon className="size-3.5" />
-          Comments
+          <MessageSquareIcon className="size-4" />
           {count > 0 && (
             <span className="rounded-full bg-muted px-1.5 text-[10px] tabular-nums">{count}</span>
           )}
         </Button>
       </TooltipTrigger>
       <TooltipContent side="bottom">
-        {comments.canComment
-          ? "Select something in the thingy and choose Add comment"
-          : comments.open
-            ? "Hide comments"
-            : "Show comments"}
+        <span className="flex flex-col items-start">
+          <span>Comments</span>
+          {comments.canComment && (
+            <span className="opacity-70">
+              Select something in the thingy and choose Add comment
+            </span>
+          )}
+        </span>
       </TooltipContent>
     </Tooltip>
   );

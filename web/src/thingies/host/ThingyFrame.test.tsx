@@ -11,6 +11,7 @@ import {
 import type { Thingy, ThingyContent } from "../api/thingyApi";
 import { THINGY_CONNECT_MESSAGE_TYPE, THINGY_HELLO_MESSAGE_TYPE } from "../sdk/thingyProtocol";
 import { setOmnigentHostConfig, type ThingyFrameHostProps } from "@/lib/host";
+import { resetThingyRailRequests, useThingyRailRequest } from "@/lib/thingyRailTabs";
 
 class FakePort {
   postMessage = vi.fn();
@@ -77,6 +78,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  resetThingyRailRequests();
 });
 
 describe("buildThingyFrameDocument", () => {
@@ -156,7 +158,10 @@ describe("ThingyFrame", () => {
     greet(frameWindow, { type: THINGY_HELLO_MESSAGE_TYPE, frameId, nonce: "wrong" });
     expect(posted).not.toHaveBeenCalled();
 
+    expect(useThingyRailRequest.getState().frameConnections["app-1"]).toBeUndefined();
     greet(frameWindow, { type: THINGY_HELLO_MESSAGE_TYPE, frameId, nonce });
+    // The thingy beside New session waits for this to hand its full screen to the session.
+    expect(useThingyRailRequest.getState().frameConnections["app-1"]).toBe(1);
 
     const channel = FakeMessageChannel.created[0];
     expect(posted).toHaveBeenCalledWith(
