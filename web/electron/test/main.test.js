@@ -174,6 +174,7 @@ function loadNavigationHarness({
   cliPath = null,
   hostConnectResult = { ok: true },
   sshConnectResult = { ok: true, shownInConsole: true },
+  sshPreviewVerification = null,
   serverAuthResult = { ok: true },
   managedServerNames = {},
   // A createWorkspaceNetwork() to run the real session module against.
@@ -733,6 +734,12 @@ function loadNavigationHarness({
       startLocalServer: async () => ({ ok: false }),
     },
   };
+
+  if (sshPreviewVerification) {
+    localRequires["./sshPreviewIdentity"] = {
+      verifySshPreviewIdentity: sshPreviewVerification,
+    };
+  }
 
   if (arcaConsentResult !== undefined) {
     localRequires["./arca_connect_window"] = {
@@ -6963,6 +6970,40 @@ describe("localhost previews for hosts reached over SSH", () => {
     );
     assert.equal(await request(preview), false, "an allowed host needs no retry");
     assert.equal(questions.length, 1);
+  });
+
+  it("keeps a verified preview destination separate from SSH file access", async (t) => {
+    const proofs = [];
+    const h = loadNavigationHarness({
+      serverUrl: server,
+      sshPreviewVerification: async (...args) => {
+        proofs.push(args);
+        return true;
+      },
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    h.api.createBrowserRegistryForWindow(h.win);
+    h.electron.dialog.showMessageBox = async () => ({ response: 1 });
+    const event = { sender: h.webContents, senderFrame: { url: server } };
+    const deps = h.browserIpcDeps();
+    const opts = {
+      sourceHostId: hostId,
+      sourceSshTarget: "devbox",
+      sessionHostProtocol: 1,
+      sshPreviewProtocol: 1,
+    };
+    assert.equal(await deps.requestPreviewHostForEvent(event, preview, opts), true);
+    assert.deepEqual(proofs, [[server, hostId, "devbox"]]);
+    assert.equal(h.sshHosts.destination(server, hostId), null);
+    const savedProof = require("../src/sshHosts").createSshHostStore(() =>
+      path.join(path.dirname(h.settingsPath), "ssh-preview-hosts.json"),
+    );
+    assert.equal(savedProof.destination(server, hostId), "devbox");
+    const context = deps.getAgentContextForEvent(event, opts);
+    assert.equal(h.browserRegistryDeps().allowsLocalhost(context), true);
+    h.sshHosts.record(server, hostId, "replacement");
+    assert.equal(h.browserRegistryDeps().allowsLocalhost(context), false);
   });
 
   it("keeps a declined host blocked until restart and tells the agent why", async (t) => {

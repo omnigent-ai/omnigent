@@ -18,7 +18,7 @@ function setup(records = { [SERVER]: { [HOST]: "devbox" } }) {
 }
 
 describe("localhost previews for hosts reached over SSH", () => {
-  it("verifies an unrecorded suggestion only after consent, then records and allows it", async () => {
+  it("verifies an unrecorded suggestion after consent, then records its preview proof", async () => {
     let destination = null;
     const steps = [];
     const previews = createSshPreviewHosts({

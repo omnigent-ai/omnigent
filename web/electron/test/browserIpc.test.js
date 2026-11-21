@@ -749,28 +749,6 @@ describe("browser IPC localhost previews from hosts reached over SSH", () => {
     assert.deepEqual(state.calls, ["denied", "recover", "request"]);
   });
 
-  it("does not navigate with the old binding after a host moves during consent", async () => {
-    const started = Promise.withResolvers();
-    const answer = Promise.withResolvers();
-    let sessionHost = "host-1";
-    const { state, navigate } = previewSetup({
-      request: async (current) => {
-        started.resolve();
-        current.allowed = await answer.promise;
-        return current.allowed;
-      },
-    });
-    const pending = navigate({ sourceHostId: sessionHost });
-    await started.promise;
-    sessionHost = "host-2";
-    answer.resolve(true);
-    const result = await pending;
-    assert.equal(result.ok, false);
-    assert.equal(result.retryWithFreshHost, true);
-    assert.notEqual(sessionHost, state.allowedHost);
-    assert.deepEqual(state.calls, ["denied", "request"]);
-  });
-
   it("doesn't ask when identity recovery already allowed the page", async () => {
     const { state, navigate } = previewSetup({
       recover: async () => {

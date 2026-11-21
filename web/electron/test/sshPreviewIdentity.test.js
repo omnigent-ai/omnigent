@@ -2,7 +2,7 @@
 
 const { it } = require("node:test");
 const assert = require("node:assert/strict");
-const { execFile } = require("node:child_process");
+const { execFile, spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -36,6 +36,11 @@ it("proves the exact host and selected server using only a bounded read-only SSH
     "ConnectTimeout=5",
     "-o",
     "ClearAllForwardings=yes",
+    "-o",
+    "ControlMaster=no",
+    "-o",
+    "RemoteCommand=none",
+    "-T",
     "devbox",
   ]);
   assert.equal(
@@ -66,6 +71,33 @@ it(
         env: { HOME: remoteHome, PATH: "/usr/bin:/bin" },
       });
     assert.equal(await verifySshPreviewIdentity(SERVER, HOST, "devbox", run), true);
+  },
+);
+
+it(
+  "ignores interactive SSH configuration during identity verification",
+  { skip: process.platform === "win32" },
+  async (t) => {
+    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "preview-ssh-config-"));
+    t.after(() => fs.rmSync(scratch, { recursive: true, force: true }));
+    const config = path.join(scratch, "config");
+    fs.writeFileSync(
+      config,
+      "Host devbox\n  HostName example.invalid\n  RemoteCommand tmux attach\n  RequestTTY force\n  ControlMaster ask\n  CanonicalizeHostname no\n",
+    );
+    let parsed;
+    const verified = await verifySshPreviewIdentity(SERVER, HOST, "devbox", async (file, args) => {
+      // -G validates the real invocation and prints configuration without connecting.
+      parsed = spawnSync(file, ["-G", "-F", config, ...args], {
+        encoding: "utf8",
+        timeout: 5_000,
+      });
+      return { stdout: JSON.stringify({ daemons: [daemon] }) };
+    });
+    assert.equal(parsed?.status, 0, parsed?.stderr);
+    assert.match(parsed.stdout, /^requesttty false$/m);
+    assert.match(parsed.stdout, /^controlmaster false$/m);
+    assert.equal(verified, true);
   },
 );
 

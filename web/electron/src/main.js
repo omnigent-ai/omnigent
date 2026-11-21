@@ -380,10 +380,16 @@ const arcaIdentities = createArcaIdentityStore();
 const sshHosts = createSshHostStore(() => path.join(app.getPath("userData"), "ssh-hosts.json"));
 const workspaceSshForwards = createWorkspaceSshForwards();
 const sshTargetChecks = createSshTargetChecks({ record: sshHosts.record });
+// Preview identity proofs must not approve workspace file access.
+const sshPreviewDestinations = createSshHostStore(() =>
+  path.join(app.getPath("userData"), "ssh-preview-hosts.json"),
+);
 const sshPreviewHosts = createSshPreviewHosts({
-  destination: sshHosts.destination,
+  destination: (serverUrl, hostId) =>
+    sshHosts.destination(serverUrl, hostId) ??
+    sshPreviewDestinations.destination(serverUrl, hostId),
   verify: verifySshPreviewIdentity,
-  record: sshHosts.record,
+  record: sshPreviewDestinations.record,
 });
 
 /**

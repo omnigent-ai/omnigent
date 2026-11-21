@@ -10,7 +10,7 @@ const { suggestedAlias } = require("./sshTargets");
  * @param {{ destination: (serverUrl: string, hostId: string) => string | null,
  *   verify?: (serverUrl: string, hostId: string, destination: string) => Promise<boolean>,
  *   record?: (serverUrl: string, hostId: string, destination: string) => void }} deps
- *   Read a recorded SSH destination, or prove and record a new one.
+ *   Read a known SSH destination, or prove and record it for previews only.
  */
 function createSshPreviewHosts({ destination, verify, record }) {
   // Allowed hosts, each with the destination the user saw when allowing it.

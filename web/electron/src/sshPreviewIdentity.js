@@ -32,6 +32,11 @@ async function verifySshPreviewIdentity(serverUrl, hostId, destination, run = pr
         "ConnectTimeout=5",
         "-o",
         "ClearAllForwardings=yes",
+        "-o",
+        "ControlMaster=no",
+        "-o",
+        "RemoteCommand=none",
+        "-T",
         target,
         remoteCommand(
           `${REMOTE_PATH}; OMNIGENT_WRAPPER_BYPASS=1 omnigent host status --server "${server}" --json`,

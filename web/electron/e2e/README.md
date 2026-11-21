@@ -167,6 +167,8 @@ real. Host-list/session provenance responses and the external SSH executable
 are fixtures; no permission records or URL-policy decisions are seeded.
 CI substitutes only the native dialog's answer, asserting that the preview
 receives no request before consent. This is not a real remote-machine test.
+Preview identity proofs are stored separately from SSH file-access approvals;
+localhost permission lasts only until the desktop app restarts.
 
 ```sh
 # From the repository root, after installing Python and desktop dependencies:
