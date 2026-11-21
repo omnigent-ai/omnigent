@@ -178,9 +178,20 @@ describe("CommandPalette — sessions", () => {
   it("shows the sidebar's loaded sessions until the archived-inclusive list loads", () => {
     sidebarSessions = { pages: [{ data: [conv("cached", "Cached session")] }] };
     useConversations.mockReturnValue({ data: undefined, isFetching: true });
-    renderPalette();
+    const props = {
+      open: true,
+      onOpenChange: vi.fn(),
+      onToggleLeftSidebar: vi.fn(),
+      onToggleRightSidebar: vi.fn(),
+    };
+    const { rerender } = render(<CommandPalette {...props} />, { wrapper: withQueryClient() });
 
     expect(screen.getByText("Cached session")).toBeTruthy();
+
+    // Once loaded, the list replaces the sidebar's rows, even when it's empty.
+    setSessions([]);
+    rerender(<CommandPalette {...props} />);
+    expect(screen.queryByText("Cached session")).toBeNull();
   });
 
   it("doesn't fill Find a session's list from the sidebar", () => {
