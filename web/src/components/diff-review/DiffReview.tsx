@@ -2001,6 +2001,8 @@ export function DiffReview<A = undefined>({
         label: `${action.label} for ${name}`,
         icon: action.icon,
         keywords: ["markdown", "rendered", "preview", "diff", file.path],
+        // Named after the file, so sessions matching its name stay above it.
+        leadsSources: false,
         run: action.run,
       },
     ];
@@ -2029,6 +2031,7 @@ export function DiffReview<A = undefined>({
         label: viewed ? `Mark ${name} as not viewed` : `Mark ${name} as viewed`,
         icon: CheckIcon,
         keywords: ["viewed", "reviewed", "done", "seen", file.path],
+        leadsSources: false,
         run: () => toggleFileViewed(file),
       },
     ];
@@ -2149,6 +2152,7 @@ export function DiffReview<A = undefined>({
       icon: SquarePlusIcon,
       keywords: [...command.keywords, command.path],
       availability: command.availability,
+      leadsSources: command.leadsSources,
       run: () => latestOpenInNewTab.current?.(command.path, { background: true }),
     }));
   }, [commandsActive, currentFile, opensInNewTab]);

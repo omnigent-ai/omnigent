@@ -187,26 +187,25 @@ describe("ThemePicker", () => {
   });
 
   describe("appearance preview", () => {
-    it("previews the highlighted appearance without saving it, and Escape goes back reverting it", async () => {
-      await previewDark();
-      await userEvent.keyboard("{ArrowUp}");
-      await waitFor(() => expect(isDarkShown()).toBe(false));
-      await userEvent.keyboard("{ArrowDown}");
-      await waitFor(() => expect(isDarkShown()).toBe(true));
+    it.each([
+      ["Escape", "{Escape}"],
+      ["Backspace in the empty query", "{Backspace}"],
+    ])(
+      "previews the highlighted appearance without saving it, and %s goes back reverting it",
+      async (_input, keys) => {
+        await previewDark();
+        await userEvent.keyboard("{ArrowUp}");
+        await waitFor(() => expect(isDarkShown()).toBe(false));
+        await userEvent.keyboard("{ArrowDown}");
+        await waitFor(() => expect(isDarkShown()).toBe(true));
 
-      await userEvent.keyboard("{Escape}");
-      expect(screen.getByRole("combobox", { name: "Select theme" })).toBeInTheDocument();
-      expect(isDarkShown()).toBe(false);
-      expect(savedMode()).toBeNull();
-      expect(useThemeModePreviewStore.getState().mode).toBeNull();
-    });
-
-    it("reverts on Backspace in the empty query, which goes back", async () => {
-      await previewDark();
-      await userEvent.keyboard("{Backspace}");
-      expect(screen.getByRole("combobox", { name: "Select theme" })).toBeInTheDocument();
-      expect(isDarkShown()).toBe(false);
-    });
+        await userEvent.keyboard(keys);
+        expect(screen.getByRole("combobox", { name: "Select theme" })).toBeInTheDocument();
+        expect(isDarkShown()).toBe(false);
+        expect(savedMode()).toBeNull();
+        expect(useThemeModePreviewStore.getState().mode).toBeNull();
+      },
+    );
 
     it("saves the highlighted appearance on Enter", async () => {
       await previewDark();

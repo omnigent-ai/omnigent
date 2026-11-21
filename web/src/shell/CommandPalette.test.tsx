@@ -106,7 +106,11 @@ beforeEach(() => {
   setSessions([]);
   setSearchGroups({});
 });
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  // QuickPick records accepted commands under Recent; a later case starts without them.
+  localStorage.clear();
+});
 
 /** Every non-empty live region's text, so both palettes' status messages read the same. */
 const announced = () =>

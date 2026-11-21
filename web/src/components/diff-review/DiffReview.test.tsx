@@ -1001,6 +1001,7 @@ describe("DiffReview rich Markdown diff", () => {
     );
     const command = commands.find((each) => each.label === "Show rich diff for guide.md");
     expect(command).toBeDefined();
+    expect(command!.leadsSources).toBe(false);
     act(() => command!.run());
     expect(item().type).toBe("file");
     const updated = Object.values(usePaletteCommandsStore.getState().groups).flatMap(
@@ -1300,6 +1301,8 @@ describe("the current file's actions in ⌘K", () => {
     );
     const newTab = fileCommands().find((command) => command.label === `Open ${FIRST} in a new tab`);
     expect(newTab).toBeDefined();
+    // Named after the file, it stays below sessions that match the file's name.
+    expect(newTab!.leadsSources).toBe(false);
     act(() => newTab!.run());
     expect(opened).toEqual([[FIRST, { background: true }]]);
     // The file's own actions stay as the source gave them, under "File".
@@ -1622,6 +1625,7 @@ describe("file headers", () => {
         .flatMap((group) => group.commands)
         .find((each) => each.id === "toggle-viewed")!;
     expect(command().label).toBe("Mark main.ts as viewed");
+    expect(command().leadsSources).toBe(false);
     act(() => command().run());
     expect(itemFor(FIRST).collapsed).toBe(true);
     expect(command().label).toBe("Mark main.ts as not viewed");
