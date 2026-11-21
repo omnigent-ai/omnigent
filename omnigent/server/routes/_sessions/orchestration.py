@@ -6043,6 +6043,10 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
 
     if host_registry is not None:
         host_registry.deregister(conv.host_id)
+    if host_conn is not None:
+        # The tunnel's own close no longer finds its connection to mark the row
+        # offline, so a fresh row would read as the host live on another replica.
+        await asyncio.to_thread(host_store.set_offline, conv.host_id)
     if tunnel_registry is not None and conv.runner_id is not None:
         # A stale tunnel is torn down, not handed to another replica.
         tunnel_registry.deregister(conv.runner_id, retire=False)

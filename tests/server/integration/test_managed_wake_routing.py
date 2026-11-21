@@ -302,6 +302,46 @@ async def test_host_keyed_request_to_a_host_live_on_the_default_route_is_sent_ba
 
 
 @pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)
+async def test_host_keyed_retry_after_a_failed_wake_of_a_stale_local_tunnel_wakes_again(
+    two_replica_stack: Any, managed_wake: Any, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Tearing down this replica's stale tunnel leaves no row that reads as live elsewhere."""
+    from fastapi import HTTPException
+
+    arrange, events = managed_wake
+    session_id = await arrange(keyed=True)
+    HostStore(db_uri).upsert_on_connect(HOST_ID, "managed-wake-host", OWNER)
+    connection = two_replica_stack.tunnel_replica.state.host_registry.register(
+        HOST_ID,
+        AsyncMock(),
+        HostHelloFrame(version="test", frame_protocol_version=1, name="stale", runners=[]),
+        owner=None,
+        registered_with_managed_token=True,
+    )
+    connection.last_frame_at = 0.0
+
+    async def failing_resume(*_args: object, **_kwargs: object) -> None:
+        events.append("failed-resume")
+        raise HTTPException(status_code=502, detail="resume failed")
+
+    real_resume = managed_hosts.resume_managed_host
+    monkeypatch.setattr(managed_hosts, "resume_managed_host", failing_resume)
+    failed = await two_replica_stack.tunnel_client.post(
+        f"/v1/sessions/{session_id}/events", headers=_headers(HOST_ID), json=MESSAGE
+    )
+    assert not _wrong_replica(failed), failed.text
+    assert "failed-resume" in events, events
+
+    monkeypatch.setattr(managed_hosts, "resume_managed_host", real_resume)
+    retried = await two_replica_stack.tunnel_client.post(
+        f"/v1/sessions/{session_id}/events", headers=_headers(HOST_ID), json=MESSAGE
+    )
+
+    assert not _wrong_replica(retried), retried.text
+    assert events.index("resume") < events.index("launch") < events.index("ready"), events
+
+
+@pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)
 async def test_single_replica_is_unaffected_by_a_foreign_key(
     two_replica_stack: Any, managed_wake: Any
 ) -> None:

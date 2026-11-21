@@ -3448,6 +3448,12 @@ async def test_resumable_managed_wake_drops_fresh_local_tunnels_when_provider_pa
     def _finish_wake(**kwargs: object) -> None:
         del kwargs
         calls.append("wake")
+        # The woken host reconnects on another replica.
+        host_store.upsert_on_connect(
+            host_id="055e31f38d07908f171ebad4ff5cbe9c",
+            name="managed-stale-tunnel-islo",
+            user_id=RESERVED_USER_LOCAL,
+        )
         tracker.begin(conv.id)
         tracker.finish(conv.id)
 
