@@ -524,6 +524,8 @@ _SCROLLED_DRAFT_SURFACE = "a draft taller than the terminal"
 # Surfaces drawn over the input box advertise their dismissal in the footer
 # ("Esc to cancel", "Esc/Enter/Space to close"), possibly wrapped between words.
 # Escape cannot clear a screen with neither this nor a composer, e.g. a launch wrapper's output.
+# A dialog's numbered choice with the selection on it, e.g. "❯ 1. Yes, switch to high".
+_DIALOG_CHOICE_RE = re.compile(r"❯\s*\d+\.")
 _ESCAPE_DISMISS_HINT = re.compile(r"\b(?:\w+/)*Esc(?:/\w+)*\s+to\s+\w", re.IGNORECASE)
 # Headlines of startup dialogs whose "Esc to cancel" quits Claude Code rather
 # than closing the dialog (2.1.299: the settings error exits 1, the folder-trust
@@ -5963,8 +5965,8 @@ def _confirm_tui_dialog(
     Claude Code release does not sit open forever wedging the pane. It is
     withheld when a question or permission request is pending, when the pane
     shows a :data:`_FOREIGN_DIALOG_HINTS` surface, whose default answer would
-    commit something unasked-for, or when the input box holds a draft the
-    Enter would send.
+    commit something unasked-for, and unless the pane shows that the Enter can
+    only reach a dialog or an empty input box (:func:`_blind_confirm_is_safe`).
 
     The same load that renders the dialog late can also swallow the confirm
     Enter outright (the TUI drops keystrokes mid-repaint), so a matched-hint
@@ -6007,16 +6009,42 @@ def _confirm_tui_dialog(
         raise ClaudeUserPromptPending(
             "Claude is waiting for an explicit answer; settings dialog not confirmed."
         )
-    if _composer_holds_draft(socket_path, tmux_target, pane):
-        # Claude Code returned the person's stashed draft; an Enter would send it.
+    if not _blind_confirm_is_safe(socket_path, tmux_target, pane):
+        # Claude Code may have returned the person's draft; an Enter would send it.
         _logger.warning(
-            "claude-native: %r never rendered and the input box holds a draft; "
-            "withholding the confirm Enter",
+            "claude-native: %r never rendered and the pane does not show that an Enter "
+            "can only reach a dialog or an empty input box; withholding the confirm Enter",
             hint,
         )
         return False
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     return False
+
+
+def _blind_confirm_is_safe(socket_path: str, tmux_target: str, pane: str) -> bool:
+    """
+    Return whether the timeout confirm Enter can only reach a dialog or an empty box.
+
+    The Enter stands in for a dialog whose title drifted, so it needs a pane
+    showing either the input box holding no draft, or no input box and a
+    numbered choice, on two captures in a row. An empty or torn capture shows
+    neither, and a returned draft could be what it hides.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param pane: The capture the watch ended on.
+    :returns: ``True`` when both captures show it is safe.
+    """
+
+    def safe(capture: str) -> bool:
+        if _composer_box(capture) is not None:
+            return not _composer_holds_draft(socket_path, tmux_target, capture)
+        return _DIALOG_CHOICE_RE.search(capture) is not None
+
+    if not safe(pane):
+        return False
+    time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+    return safe(_capture_pane(socket_path, tmux_target))
 
 
 def _permission_mode_from_pane(pane: str) -> str | None:
@@ -7900,8 +7928,8 @@ def _styled_box_has_typed_text(styled: str, rows: Sequence[str]) -> bool:
 
     :param styled: A ``capture-pane -e`` capture.
     :param rows: The box rows :func:`_composer_box` read from the plain capture.
-    :returns: ``True`` when the box shows typed text, and when the rows cannot
-        be found in *styled*.
+    :returns: ``True`` when the box shows typed text, and when *styled* does
+        not show exactly those rows, as a capture taken mid-repaint may not.
     """
     lines = styled.splitlines()
     plain = [_SGR_RE.sub("", _NON_SGR_ESCAPE_RE.sub("", line)).rstrip() for line in lines]
@@ -7909,7 +7937,7 @@ def _styled_box_has_typed_text(styled: str, rows: Sequence[str]) -> bool:
     first = next(
         (index for index in range(len(plain) - 1, -1, -1) if plain[index] == first_row), None
     )
-    if first is None:
+    if first is None or plain[first : first + len(rows)] != [row.rstrip() for row in rows]:
         return True
     for offset, line in enumerate(lines[first : first + len(rows)]):
         cells = _styled_cells(line)

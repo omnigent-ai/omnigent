@@ -13217,6 +13217,17 @@ def test_a_typed_draft_that_reads_like_the_queued_hint_is_returned(
     assert (composer.text, composer.cursor, composer.stash) == (draft, 5, None)
 
 
+def test_a_styled_capture_of_other_rows_does_not_clear_a_draft() -> None:
+    """A styled capture taken mid-repaint says nothing about the rows the plain one read."""
+    rule = "─" * 30
+    plain = f"{rule}\n❯\xa0\n  KEEP\n{rule}\n"
+    styled = f"{rule}\n\x1b[39m❯\xa0\x1b[7m \x1b[0m\n\x1b[2m  loading\x1b[22m\n{rule}\n"
+    box = claude_native_bridge._composer_box(plain)
+    assert box is not None
+
+    assert claude_native_bridge._styled_box_has_typed_text(styled, box.rows) is True
+
+
 def test_the_stash_marker_is_read_only_above_the_input_box() -> None:
     """Transcript text that quotes the marker does not count as a stashed draft."""
     rule = "─" * 30
@@ -13228,16 +13239,18 @@ def test_the_stash_marker_is_read_only_above_the_input_box() -> None:
 
 
 @pytest.mark.parametrize(
-    "pane",
+    "frames",
     [
-        _composer_pane("my returned draft"),
-        _composer_pane("why does Change effort level? keep showing up"),
-        "⏺ Change effort level? asks before switching.\n" + _composer_pane("my returned draft"),
+        [_composer_pane("my returned draft")],
+        [_composer_pane("why does Change effort level? keep showing up")],
+        ["⏺ Change effort level? asks before switching.\n" + _composer_pane("my returned draft")],
+        # The capture the watch ends on fails, after the draft came back.
+        [_composer_pane("my returned draft"), ""],
     ],
-    ids=["draft", "draft-quoting-the-title", "reply-quoting-the-title"],
+    ids=["draft", "draft-quoting-the-title", "reply-quoting-the-title", "torn-final-capture"],
 )
 def test_a_confirm_enter_never_reaches_a_returned_draft(
-    monkeypatch: pytest.MonkeyPatch, pane: str
+    monkeypatch: pytest.MonkeyPatch, frames: list[str]
 ) -> None:
     """
     A settings dialog that never renders gets no Enter over the person's draft.
@@ -13245,8 +13258,9 @@ def test_a_confirm_enter_never_reaches_a_returned_draft(
     Claude Code returns the stashed draft as soon as the command runs; an
     Enter sent for a dialog that never appeared would submit it. The title in
     the draft or the transcript is not the dialog: the input box is still there.
+    A capture that shows neither the box nor a dialog says nothing either way.
     """
-    sends = _fake_tmux(monkeypatch, [pane])
+    sends = _fake_tmux(monkeypatch, frames)
 
     confirmed = claude_native_bridge._confirm_tui_dialog(
         "/tmp/example/tmux.sock", "claude:0.0", hint="Change effort level?", timeout_s=1.0
@@ -14291,7 +14305,10 @@ def test_a_dialog_whose_title_drifted_still_gets_the_blind_fallback_enter(
     on screen, so the timeout Enter is the only thing that can close it — and
     on an idle pane it costs nothing.
     """
-    drifted = "  Change the effort level?\n  This invalidates the cache.\n"
+    drifted = (
+        "  Change the effort level?\n  This invalidates the cache.\n"
+        "  ❯ 1. Yes, switch to high\n    2. No, go back\n"
+    )
     sends = _fake_tmux(monkeypatch, [drifted])
 
     assert (
