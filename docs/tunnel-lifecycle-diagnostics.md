@@ -62,9 +62,21 @@ one `host_ping_failed` warning before the ping loop exits.
 These fields distinguish local scheduling gaps, queued pings and blocked sends;
 they cannot alone identify a network device, OOM killer or signal sender.
 Correlate host exits by host identity and PID with `host_exiting`, and correlate
-machine lifecycle/resource evidence separately. A killed process may be unable
-to emit its final snapshot. Database `host_heartbeat_failed` events describe
-persistence, not unanswered network pings; that worker is separate from the
+machine lifecycle/resource evidence separately.
+
+`host_runner_stop_requested` records host cleanup before it requests a runner
+termination. It carries `host_id`, `host_pid`, `runner_id`, `runner_pid`, the
+primary `session_id` when known, and the cached `runner_create_time` when
+available. `action = terminate` and `reason = host_shutdown` identify the initial
+request; `action = kill` and `reason = shutdown_timeout` identify escalation after
+the five-second wait. POSIX hosts also include `signal_name`. These rows establish
+which host requested the action, not signal delivery or process death. Match the
+host identity and PID to `host_exiting` for its recorded exit reason. SIGHUP's
+finish-work callback remains separate from ordinary cleanup.
+
+A killed process may be unable to emit its final snapshot. Database
+`host_heartbeat_failed` events describe persistence, not unanswered network
+pings; that worker is separate from the
 application keepalive loop. Diagnostic attribution never establishes harmless
 session impact or changes KPI eligibility.
 
