@@ -2681,6 +2681,9 @@ async def test_background_setup_failure_preserves_replacement_turn(
         "wrapped-public-config",
         "signer-profile",
         "signer-state",
+        "broker-gateway",
+        "wrapped-broker-gateway",
+        "missing-provider",
     ],
 )
 async def test_runner_failed_status_carries_setup_error_message(
@@ -2709,6 +2712,7 @@ async def test_runner_failed_status_carries_setup_error_message(
     from omnigent.models.model_resolver import ModelResolutionError
     from omnigent.onboarding.provider_config import ProviderEntry
     from omnigent.runtime import workflow
+    from omnigent.spec.types import ProviderAuth
 
     conv = "conv_failed_status_carries_error"
     stable_id = "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
@@ -2766,6 +2770,22 @@ async def test_runner_failed_status_carries_setup_error_message(
                 try:
                     workflow._apply_codex_provider_env({}, spec, provider)
                 except OmnigentError as exc:
+                    raise exc from ValueError(raised_message)
+            if failure_kind in ("broker-gateway", "wrapped-broker-gateway", "missing-provider"):
+                try:
+                    if failure_kind == "missing-provider":
+                        spec.executor.auth = ProviderAuth(name="private-provider-name")
+                        monkeypatch.setattr(workflow, "load_config", dict)
+                        monkeypatch.setattr(
+                            workflow, "effective_config_with_detected", lambda cfg: cfg
+                        )
+                        workflow._resolve_provider_for_build(spec, harness_type="claude-sdk")
+                    else:
+                        spec.executor.config["broker_gateway"] = "private-invalid-value"
+                        workflow._codex_broker_gateway_enabled(spec)
+                except OmnigentError as exc:
+                    if failure_kind == "wrapped-broker-gateway":
+                        raise OmnigentError(raised_message, code=ErrorCode.INVALID_INPUT) from exc
                     raise exc from ValueError(raised_message)
             raise OmnigentError(raised_message, code=ErrorCode.INVALID_INPUT)
         return {}
@@ -2877,6 +2897,17 @@ async def test_runner_failed_status_carries_setup_error_message(
             "signer-backed Codex requires configured provider state. "
             "Run the provider's Codex setup and retry. "
         )
+    elif failure_kind in ("broker-gateway", "wrapped-broker-gateway"):
+        public_guidance = (
+            "executor.config.broker_gateway must be a boolean. "
+            "Use true or false (without quotes) and retry. "
+        )
+    elif failure_kind == "missing-provider":
+        public_guidance = (
+            "The provider named by executor.auth is not configured. "
+            "Configure it under 'providers:' in ~/.omnigent/config.yaml "
+            "or update executor.auth.name, then retry. "
+        )
     assert error["message"] == (
         f"turn setup failed: {public_guidance}Request failed on the runner; "
         f"see the runner log for details: {pinned_runner_log}"
@@ -2885,6 +2916,8 @@ async def test_runner_failed_status_carries_setup_error_message(
     assert raised_message not in error["message"]
     assert "/private/provider-config" not in json.dumps(events)
     assert "provider.example.test" not in json.dumps(events)
+    assert "private-provider-name" not in json.dumps(events)
+    assert "private-invalid-value" not in json.dumps(events)
     assert raised_message in caplog.text
     if failure_kind == "model-discovery":
         catalog.assert_called_once_with("provider.example.test", family="openai")

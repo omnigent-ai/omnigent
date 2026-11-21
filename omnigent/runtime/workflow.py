@@ -39,6 +39,7 @@ from omnigent.entities import (
 from omnigent.errors import (
     CodexSignerConfigurationError,
     ErrorCode,
+    HarnessConfigurationError,
     KimiAuthConfigurationError,
     OmnigentError,
     StaleCursorError,
@@ -1187,11 +1188,13 @@ def _resolve_provider_for_build(
             local_providers = load_providers(effective_config_with_detected(_load_config()))
             entry = local_providers.get(auth.name)
         if entry is None:
-            raise OmnigentError(
-                f"executor.auth references provider {auth.name!r}, but no such provider is "
-                "configured under 'providers:' in ~/.omnigent/config.yaml. "
-                f"Run `{cli_invocation()} setup --no-internal-beta` to configure one.",
-                code=ErrorCode.INVALID_INPUT,
+            raise HarnessConfigurationError(
+                "missing_provider",
+                diagnostic=(
+                    f"executor.auth references provider {auth.name!r}, but no such provider is "
+                    "configured under 'providers:' in ~/.omnigent/config.yaml. "
+                    f"Run `{cli_invocation()} setup` to configure one."
+                ),
             )
         return entry
     if isinstance(auth, DatabricksAuth):
@@ -1571,9 +1574,7 @@ def _apply_codex_provider_env(
 def _codex_broker_gateway_enabled(spec: AgentSpec) -> bool:
     locked = spec.executor.config.get("broker_gateway", False)
     if not isinstance(locked, bool):
-        raise OmnigentError(
-            "executor.config.broker_gateway must be a boolean", code=ErrorCode.INVALID_INPUT
-        )
+        raise HarnessConfigurationError("codex_broker_gateway_type")
     return locked
 
 

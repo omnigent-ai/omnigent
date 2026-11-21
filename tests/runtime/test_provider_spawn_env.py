@@ -34,7 +34,12 @@ from unittest.mock import patch
 import pytest
 import yaml as _yaml
 
-from omnigent.errors import CodexSignerConfigurationError, ErrorCode, OmnigentError
+from omnigent.errors import (
+    CodexSignerConfigurationError,
+    ErrorCode,
+    HarnessConfigurationError,
+    OmnigentError,
+)
 from omnigent.inner.codex_worker import BROKERED_CODEX_AUTH_COMMAND
 from omnigent.inner.datamodel import (
     CredentialProxyEntry,
@@ -444,7 +449,7 @@ def test_codex_gateway_binding_uses_only_placeholder_auth(config_home: Path) -> 
 
     for value in (None, 0, 1, "true", "false"):
         spec.executor.config["broker_gateway"] = value
-        with pytest.raises(OmnigentError, match="broker_gateway must be a boolean"):
+        with pytest.raises(HarnessConfigurationError, match="broker_gateway must be a boolean"):
             _build_codex_spawn_env(spec)
     spec.executor.config["broker_gateway"] = True
 
@@ -1292,8 +1297,10 @@ def test_named_provider_auth_missing_provider_fails_loud(config_home: Path) -> N
     _write_config(config_home, _anthropic_default_config())
     spec = _make_spec(harness="claude-sdk", auth=ProviderAuth(name="does-not-exist"))
 
-    with pytest.raises(Exception, match="does-not-exist"):
+    with pytest.raises(HarnessConfigurationError, match="does-not-exist") as raised:
         _build_claude_sdk_spawn_env(spec, workdir=None)
+    assert "executor.auth.name" in raised.value.client_message
+    assert "does-not-exist" not in raised.value.client_message
 
 
 def test_named_provider_auth_survives_inference_config_overlay(

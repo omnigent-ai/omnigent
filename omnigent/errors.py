@@ -546,6 +546,29 @@ class OmnigentError(Exception):
         return self._phase_override or phase_for_code(self.code)
 
 
+class HarnessConfigurationError(OmnigentError):
+    """Fixed public repairs for recognized harness configuration failures."""
+
+    def __init__(
+        self,
+        reason: Literal["codex_broker_gateway_type", "missing_provider"],
+        *,
+        diagnostic: str | None = None,
+    ) -> None:
+        self.client_message = {
+            "codex_broker_gateway_type": (
+                "executor.config.broker_gateway must be a boolean. "
+                "Use true or false (without quotes) and retry."
+            ),
+            "missing_provider": (
+                "The provider named by executor.auth is not configured. "
+                "Configure it under 'providers:' in ~/.omnigent/config.yaml "
+                "or update executor.auth.name, then retry."
+            ),
+        }[reason]
+        super().__init__(diagnostic or self.client_message, code=ErrorCode.INVALID_INPUT)
+
+
 class CodexSignerConfigurationError(OmnigentError):
     """Fixed public guidance for recognized signer-backed Codex setup failures."""
 
