@@ -5,6 +5,8 @@ import java.util.concurrent.CompletableFuture
 
 /** Shipping builds expose no authentication fault-injection surface. */
 internal object DatabricksAuthDebugMenu {
+    val ACTIONS = emptyList<AuthDebugAction>()
+
     fun addItems(menu: Menu) = Unit
 
     fun handles(itemId: Int): Boolean = false
