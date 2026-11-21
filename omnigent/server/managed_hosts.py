@@ -148,7 +148,8 @@ stores into ``create_app``):
    (12-factor): the Modal launcher reads ``MODAL_TOKEN_ID`` /
    ``MODAL_TOKEN_SECRET`` (or ``~/.modal.toml``) and the Daytona
    launcher reads ``DAYTONA_API_KEY`` (plus optional
-   ``DAYTONA_API_URL`` / ``DAYTONA_TARGET``), and the Islo launcher
+   ``DAYTONA_API_URL`` / ``DAYTONA_TARGET`` /
+   ``DAYTONA_OUTBOUND_PROXY_URL``), and the Islo launcher
    reads ``ISLO_API_KEY`` (plus optional ``ISLO_BASE_URL``) from the
    server process environment. Gensee reads the environment variable named by
    ``sandbox.gensee.api_token_env`` (``GENSEE_CONTROLLER_API_TOKEN`` by
