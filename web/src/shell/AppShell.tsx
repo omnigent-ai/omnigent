@@ -27,7 +27,8 @@ import {
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { ShellCommandContext, ShellCommandDraftContext } from "./ShellCommandContext";
-import { useFloatingPanes } from "./useFloatingPanes";
+import { ChatPaneStrip } from "./ChatPaneStrip";
+import { useFloatingPanes, useFloatingPanesShown } from "./useFloatingPanes";
 import {
   Outlet,
   useLocation,
@@ -411,6 +412,7 @@ function AppShellImpl() {
   // until a new session has its real id: there are no tabs to open in before that.
   const tabsSidebar = useTabsSidebar();
   const floatingPanes = useFloatingPanes();
+  const floatingPanesShown = useFloatingPanesShown();
   const tabsModeRef = useRef(false);
   tabsModeRef.current = tabsSidebar;
   const tabsSessionRef = useRef<string | null>(null);
@@ -3102,6 +3104,10 @@ function AppShellImpl() {
   // affordance. The PANEL_NO_TERMINAL_KEY sentinel ("") is falsy, so
   // "open with no target" keeps the switcher.
   const isShellView = terminalFirst && !!panelInitialKey && !isAgentTerminalKey(panelInitialKey);
+  // A terminal-first chat's card has a row of its own, over its Chat and Terminal views, which
+  // takes the Chat/Terminal switch. A sidebar shell in the main view has no switch to hold.
+  const chatPaneStrip =
+    floatingPanesShown && !!conversationId && terminalFirst && !isShellView && !mobileViewport;
   const shellViewTargetAvailable =
     isShellView && terminals.some((terminal) => terminalTabKey(terminal) === panelInitialKey);
 
@@ -3491,7 +3497,11 @@ function AppShellImpl() {
                   data-flyout-boundary=""
                   data-shell-header={extensionOwnsHeader ? "hidden" : "visible"}
                   data-session-id={conversationId}
+                  data-chat-pane-strip={chatPaneStrip ? "" : undefined}
                 >
+                  {chatPaneStrip && conversationId && (
+                    <ChatPaneStrip conversationId={conversationId} />
+                  )}
                   <SubagentPanelOpenerContext.Provider value={openSubagentInPanel}>
                     <RenderErrorBoundary name="this page" resetKey={location.pathname}>
                       <ShellCommandContext.Provider value={shellCommandAction}>

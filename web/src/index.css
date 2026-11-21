@@ -1378,6 +1378,53 @@ aside[aria-label="Workspace"][data-maximized] {
   .app-shell[data-floating-panes] [data-main-view="chat"] .main-terminal-view {
     padding-top: 0;
   }
+  /* A terminal-first chat's own row tops its card, over the terminal, which starts below it. */
+  .app-shell[data-floating-panes]
+    [data-main-view="chat"]
+    > main[data-chat-pane-strip]
+    .main-terminal-view {
+    padding-top: 1.75rem;
+  }
+  /* The chat pane's Chat/Terminal switch: a recessed track with a raised, lit active segment. */
+  .app-shell[data-floating-panes] .view-mode-track {
+    padding: 2px;
+    border-radius: 7px;
+    background: color-mix(in srgb, var(--muted) 90%, transparent);
+    box-shadow:
+      inset 0 1px 2px rgb(0 0 0 / 9%),
+      inset 0 0 0 1px color-mix(in srgb, var(--foreground) 5%, transparent);
+  }
+  .dark .app-shell[data-floating-panes] .view-mode-track {
+    background: color-mix(in srgb, var(--background) 70%, transparent);
+    box-shadow:
+      inset 0 1px 2px rgb(0 0 0 / 55%),
+      inset 0 0 0 1px color-mix(in srgb, var(--foreground) 6%, transparent),
+      0 1px 0 color-mix(in srgb, var(--foreground) 4%, transparent);
+  }
+  .app-shell[data-floating-panes] .view-mode-segment {
+    transition:
+      background-color 150ms ease,
+      box-shadow 150ms ease,
+      color 150ms ease;
+  }
+  .app-shell[data-floating-panes] .view-mode-segment[data-active] {
+    background: var(--background);
+    box-shadow:
+      0 1px 2px rgb(0 0 0 / 14%),
+      0 0 0 0.5px color-mix(in srgb, var(--foreground) 10%, transparent);
+  }
+  .dark .app-shell[data-floating-panes] .view-mode-segment[data-active] {
+    background: linear-gradient(
+      color-mix(in srgb, var(--foreground) 16%, transparent),
+      color-mix(in srgb, var(--foreground) 10%, transparent)
+    );
+    box-shadow:
+      0 1px 2px rgb(0 0 0 / 60%),
+      inset 0 0.5px 0 color-mix(in srgb, var(--foreground) 18%, transparent);
+  }
+  .app-shell[data-floating-panes] .view-mode-segment:not([data-active]):hover {
+    background: color-mix(in srgb, var(--foreground) 5%, transparent);
+  }
 
   /* The workspace sidebar's tabs are its part of the top row; its body is a card that kisses the
    * window's right edge, rounded only where it faces the panes. */
