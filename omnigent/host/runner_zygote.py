@@ -41,6 +41,7 @@ from typing import BinaryIO
 
 import psutil
 
+from omnigent.debug_logging import debug_event
 from omnigent.inner import _proc
 from omnigent.process_logging import child_logging_popen_kwargs
 from omnigent.runner._zygote import ZYGOTE_CONTROL_FD_ENV_VAR
@@ -398,6 +399,25 @@ class ZygoteManager:
                 # A late or partial reply cannot be assigned to the next request.
                 # Keep the socket open: daemon EOF would kill healthy children.
                 self._control_failed = True
+                proc = self._proc
+                returncode = proc.poll() if proc is not None else None
+                state = "unknown"
+                if proc is not None:
+                    state = "running" if returncode is None else "exited"
+                logger.warning(
+                    "Runner zygote control channel lost; runner exit status may be unavailable",
+                    extra=debug_event(
+                        "runner_zygote_control_lost",
+                        host_pid=os.getpid(),
+                        zygote_pid=proc.pid if proc is not None else None,
+                        zygote_generation=self._generation,
+                        zygote_state=state,
+                        zygote_returncode=returncode,
+                        control_command=request.get("cmd"),
+                        runner_pid=request.get("pid"),
+                        error_type=type(exc).__name__,
+                    ),
+                )
                 raise ZygoteUnavailable(f"runner zygote control error: {exc}") from exc
 
     @staticmethod
