@@ -33,6 +33,7 @@ export const SESSION_HOST_PROTOCOL = 1;
 export interface BrowserHostOptions {
   sourceHostId?: string | null;
   sessionHostProtocol?: number;
+  sourceSshTarget?: string;
 }
 
 export function navigationHostOptions(hostId: string | null): BrowserHostOptions {
@@ -251,7 +252,13 @@ interface ElectronDesktopApi extends NativeShellApi {
       rememberedArcaHostId?: string;
       sourceIsArcaHost?: boolean;
     },
-  ) => Promise<{ ok: boolean; created?: boolean; hostIsThisMachine?: boolean; error?: string }>;
+  ) => Promise<{
+    ok: boolean;
+    created?: boolean;
+    hostIsThisMachine?: boolean;
+    sshPreviewHost?: boolean;
+    error?: string;
+  }>;
   /**
    * Hide/show the active embedded browser view while a DOM overlay is open.
    * The native view paints above the renderer, so this is how overlays
@@ -542,6 +549,8 @@ export interface DesktopFeatures {
   arcaPreviewRecovery?: boolean;
   /** This shell can import the current site's cookies from local Google Chrome. */
   chromeCookieImport?: boolean;
+  /** Shell can ask to verify a remote host over SSH before allowing localhost previews. */
+  sshLocalhostPreview?: boolean;
   /** This shell can show the floating New Agent panel (macOS). */
   floatingComposer?: boolean;
   /** This shell's shortcut calls take the "floatingComposer" id (macOS). */

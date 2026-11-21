@@ -366,8 +366,10 @@ describe("useBrowserAgentRelay — action dispatch", () => {
     expect(getSessionSlim.mock.calls.map(([id]) => id)).toEqual(["conv_background_A", "parent"]);
   });
 
-  it("corrects a mismatched remembered Arca host after an authorized preview retry", async () => {
-    const bridge = installBridge();
+  it.each([false, true])("isolates SSH identity: %s", async (ssh) => {
+    const bridge = installBridge({
+      browserOpenOrNavigate: vi.fn().mockResolvedValue({ ok: true, sshPreviewHost: ssh }),
+    });
     const client = new QueryClient();
     client.setQueryData(
       ["hosts", { includeSandbox: false }],
@@ -388,6 +390,7 @@ describe("useBrowserAgentRelay — action dispatch", () => {
       parentSessionId: null,
     });
 
+    const storageBefore = { ...localStorage };
     await runAction(actionEvent("navigate", { url: "http://localhost:5173" }), {
       client,
       source: "conv_background_A",
@@ -406,6 +409,10 @@ describe("useBrowserAgentRelay — action dispatch", () => {
         sourceIsArcaHost: true,
       },
     );
+    if (ssh) {
+      expect({ ...localStorage }).toEqual(storageBefore);
+      return;
+    }
     expect(readArcaHostId()).toBe("actual-arca-host-b");
   });
 
@@ -811,12 +818,17 @@ describe("useBrowserAgentRelay — result POST resilience", () => {
 describe("useBrowserAgentRelay — privileged reads", () => {
   beforeEach(() => authenticatedFetch.mockResolvedValue(WON));
 
-  it.each(["screenshot", "snapshot", "click", "type"])(
-    "fetches a fresh host for %s after a privileged navigation",
-    async (action) => {
+  it.each(
+    ["screenshot", "snapshot", "click", "type"].flatMap((action) => [
+      { action, privilege: { hostIsThisMachine: true } },
+      { action, privilege: { hostIsThisMachine: false, sshPreviewHost: true } },
+    ]),
+  )(
+    "fetches a fresh host for $action after a privileged navigation ($privilege)",
+    async ({ action, privilege }) => {
       const bridge = installBridge({
-        browserOpenOrNavigate: vi.fn().mockResolvedValue({ ok: true, hostIsThisMachine: true }),
-        browserHasView: vi.fn().mockResolvedValue({ exists: true, hostIsThisMachine: true }),
+        browserOpenOrNavigate: vi.fn().mockResolvedValue({ ok: true, ...privilege }),
+        browserHasView: vi.fn().mockResolvedValue({ exists: true, ...privilege }),
         browserPerformAction: vi.fn().mockResolvedValue({ ok: true, result: "{}" }),
       });
       const client = new QueryClient();

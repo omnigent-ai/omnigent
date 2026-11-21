@@ -27,6 +27,7 @@ const {
   lookupHostAddresses,
 } = require("./browserUrlPolicy");
 const { createAgentNavigation } = require("./agentNavigation");
+const { hasHostLocalAccess } = require("./hostIdentity");
 const { agentInputInFlight } = require("./browserInput");
 
 // Each view is a separate renderer process; the cap bounds memory per window.
@@ -115,9 +116,9 @@ function createBrowserViewRegistry({
   function needsAgentViewRevocation(entry, nextContext) {
     const context = entry?.agentContext;
     return (
-      context?.hostIsThisMachine === true &&
+      hasHostLocalAccess(context) &&
       (context.revoked ||
-        !nextContext?.hostIsThisMachine ||
+        !hasHostLocalAccess(nextContext) ||
         nextContext.sourceHostId !== context.sourceHostId)
     );
   }

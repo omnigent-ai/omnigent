@@ -7,6 +7,8 @@
 
 "use strict";
 
+const { hasHostLocalAccess } = require("./hostIdentity");
+
 const crypto = require("node:crypto");
 const { buildBrowserActionScript } = require("./browserActionScript.mjs");
 const chromeCookieStoreModule = require("./chromeCookieStore");
@@ -453,7 +455,7 @@ function registerBrowserIpc({
     if (!entry) return { error: "No browser view" };
     const context = entry.agentContext;
     if (context?.revoked) return { error: "The previous browser page is no longer available" };
-    if (context?.hostIsThisMachine === true) {
+    if (hasHostLocalAccess(context)) {
       const opts = args?.opts;
       if (
         opts?.sessionHostProtocol !== SESSION_HOST_PROTOCOL ||
@@ -463,10 +465,7 @@ function registerBrowserIpc({
         return { error: "Current session host is required to read this browser view" };
       }
       const currentContext = getAgentContextForEvent(event, opts);
-      if (
-        opts.sourceHostId !== context.sourceHostId ||
-        currentContext?.hostIsThisMachine !== true
-      ) {
+      if (opts.sourceHostId !== context.sourceHostId || !hasHostLocalAccess(currentContext)) {
         // A tab check (browser_tabs list / select) only reads: it refuses the
         // tab but leaves its page, which may still hold the user's work.
         if (args?.action === "check_page") {
@@ -549,7 +548,13 @@ function registerBrowserIpc({
     // Typed URLs and links reach here too; the question names the session's host, not the page.
     if (!r.ok && !recovered && isCurrent()) {
       try {
-        recovered = (await requestPreviewHostForEvent(event, url, opts?.sourceHostId)) === true;
+        recovered =
+          (await requestPreviewHostForEvent(
+            event,
+            url,
+            opts?.sourceHostId,
+            opts?.sourceSshTarget,
+          )) === true;
       } catch {
         recovered = false;
       }
@@ -587,6 +592,7 @@ function registerBrowserIpc({
       ok: r.ok,
       created: r.created ?? false,
       ...(r.ok ? { hostIsThisMachine: r.entry?.agentContext?.hostIsThisMachine === true } : {}),
+      ...(r.ok && r.entry?.agentContext?.hostIsSshPreview ? { sshPreviewHost: true } : {}),
       error: hint ? `${r.error} ${hint}` : r.error,
     };
   };
@@ -747,6 +753,7 @@ function registerBrowserIpc({
     return {
       exists: true,
       hostIsThisMachine: entry.agentContext?.hostIsThisMachine === true,
+      ...(entry.agentContext?.hostIsSshPreview ? { sshPreviewHost: true } : {}),
       url,
       title: viewTitle(webContents), // "" once the page is gone
       ...(pendingUrl ? { pendingUrl } : {}),

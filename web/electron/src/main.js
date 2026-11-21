@@ -155,6 +155,7 @@ const { createWorkspaceSshForwards } = require("./workspaceSshForwards");
 const { createSshHostStore } = require("./sshHosts");
 const { createSshTargetChecks } = require("./sshTargets");
 const { createSshPreviewHosts } = require("./sshPreviewHosts");
+const { verifySshPreviewIdentity } = require("./sshPreviewIdentity");
 
 const serverManager = require("./server_manager");
 const { diagnostics } = require("./diagnostics");
@@ -375,13 +376,17 @@ const arcaIdentities = createArcaIdentityStore();
 const sshHosts = createSshHostStore(() => path.join(app.getPath("userData"), "ssh-hosts.json"));
 const workspaceSshForwards = createWorkspaceSshForwards();
 const sshTargetChecks = createSshTargetChecks({ record: sshHosts.record });
-const sshPreviewHosts = createSshPreviewHosts({ destination: sshHosts.destination });
+const sshPreviewHosts = createSshPreviewHosts({
+  destination: sshHosts.destination,
+  verify: verifySshPreviewIdentity,
+  record: sshHosts.record,
+});
 
 /**
  * Ask, in a dialog the page can't draw over, before sessions on a host reached
  * over SSH may open this computer's localhost pages. Null when there is no window to ask in.
  */
-async function approveSshPreviewHost(win, serverUrl, destination) {
+async function approveSshPreviewHost(win, serverUrl, destination, needsVerification) {
   if (!win || win.isDestroyed()) return null;
   const { response } = await dialog.showMessageBox(win, {
     type: "question",
@@ -390,11 +395,14 @@ async function approveSshPreviewHost(win, serverUrl, destination) {
     cancelId: 0,
     message: `Let sessions on "${destination}" open localhost pages?`,
     detail:
-      `${new URL(serverUrl).host} says this session runs on the host you reach over SSH as "${destination}", which Omnigent has already checked. ` +
+      `${new URL(serverUrl).host} says this session runs on the SSH destination "${destination}". ` +
+      (needsVerification
+        ? "Omnigent will use your SSH config and keys to check its running host identity first. It won't install software, start a host or sign in. "
+        : "Omnigent has already checked this destination. ") +
       "Sessions there, and their agents, could then open localhost, 127.0.0.1 and *.localhost pages in the Browser pane. Those are this computer's own ports, including any you forward from that host.\n\n" +
       `Allow only if you recognize "${destination}".`,
   });
-  return response === 1;
+  return win.isDestroyed() || windows.get(win)?.serverUrl !== serverUrl ? null : response === 1;
 }
 
 /**
@@ -4649,7 +4657,8 @@ function createBrowserRegistryForWindow(win) {
           serverTarget: target,
         }) ||
         context?.hostIsThisMachine === true ||
-        sshPreviewHosts.allows(windows.get(win)?.serverUrl, context?.sourceHostId)
+        (context?.hostIsSshPreview === true &&
+          sshPreviewHosts.allows(windows.get(win)?.serverUrl, context?.sourceHostId))
       );
     },
     createBoundsController: createBrowserViewBoundsController,
@@ -5832,6 +5841,7 @@ function registerIpc() {
       // Importing local Chrome cookies is wired for macOS only (Keychain-decrypted
       // v10 values); the SPA hides the toolbar button everywhere else.
       chromeCookieImport: process.platform === "darwin",
+      sshLocalhostPreview: process.platform !== "win32",
       // The floating New Agent panel is a macOS panel window.
       floatingComposer: process.platform === "darwin",
       // Settings can read and change the panel's shortcut by id.
@@ -6084,6 +6094,10 @@ function registerIpc() {
       return {
         serverTarget: arcaTarget(windowArcaServerUrl(win)),
         sourceHostId,
+        ...(opts?.sessionHostProtocol === SESSION_HOST_PROTOCOL &&
+        sshPreviewHosts.allows(windows.get(win)?.serverUrl, sourceHostId)
+          ? { hostIsSshPreview: true }
+          : {}),
         hostIsThisMachine:
           opts?.sessionHostProtocol === SESSION_HOST_PROTOCOL &&
           isHostThisMachine({
@@ -6130,11 +6144,12 @@ function registerIpc() {
         return false;
       }
     },
-    requestPreviewHostForEvent: async (event, url, sourceHostId) => {
+    requestPreviewHostForEvent: async (event, url, sourceHostId, sshTarget) => {
       const win = BrowserWindow.fromWebContents(event.sender);
       const serverUrl = senderServerUrl(event);
       if (
         !win ||
+        process.platform === "win32" ||
         win.isDestroyed() ||
         !isPinnedOriginSender(event) ||
         !isLoopbackPreviewUrl(url) ||
@@ -6142,8 +6157,12 @@ function registerIpc() {
       ) {
         return false;
       }
-      return sshPreviewHosts.request(serverUrl, sourceHostId, (destination) =>
-        approveSshPreviewHost(win, serverUrl, destination),
+      return sshPreviewHosts.request(
+        serverUrl,
+        sourceHostId,
+        (destination, needsVerification) =>
+          approveSshPreviewHost(win, serverUrl, destination, needsVerification),
+        sshTarget,
       );
     },
     getAgentNavigationHintForEvent: (

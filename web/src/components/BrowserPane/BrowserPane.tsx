@@ -52,7 +52,6 @@ import { useDesktopCommand } from "@/lib/desktopCommands";
 import {
   CHROME_COOKIE_ALL_SITES_SCOPE,
   getDesktopFeatures,
-  navigationHostOptions,
   supportsBrowser,
   supportsDesktopCommands,
   type BrowserHostOptions,
@@ -61,6 +60,7 @@ import {
 } from "@/lib/nativeBridge";
 import { browserViewOwnerId } from "@/lib/browserTabs";
 import { fetchSessionHostId } from "@/lib/fetchSessionHostId";
+import { previewHostOptions } from "@/lib/previewHostOptions";
 import { normalizeTypedUrl } from "@/lib/normalizeTypedUrl";
 import { cn } from "@/lib/utils";
 // Say when the tab's page is open in another desktop window.
@@ -383,11 +383,12 @@ export function BrowserPane({
     setNavigationError(null);
     const sequence = ++submitSequenceRef.current;
     void fetchSessionHostId(browserViewOwnerId(conversationId))
-      .then((hostId) => {
+      .then(async (hostId) => {
+        const options = await previewHostOptions(hostId, navUrl);
         if (sequence !== submitSequenceRef.current) return null;
         return bridge.browserOpenOrNavigate!(conversationId, navUrl, undefined, {
           force: true,
-          ...navigationHostOptions(hostId),
+          ...options,
         });
       })
       .then((result) => {

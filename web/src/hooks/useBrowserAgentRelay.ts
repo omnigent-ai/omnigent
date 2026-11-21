@@ -12,12 +12,12 @@ import { useEffect } from "react";
 import { emitBrowserActionSettled, onBrowserActionRequest } from "@/lib/browserActionBus";
 import type { BrowserActionRequestEvent } from "@/lib/events";
 import {
-  navigationHostOptions,
   SESSION_HOST_PROTOCOL,
   supportsBrowser,
   type BrowserHostOptions,
 } from "@/lib/nativeBridge";
 import { fetchSessionHostId } from "@/lib/fetchSessionHostId";
+import { previewHostOptions } from "@/lib/previewHostOptions";
 import { authenticatedFetch } from "@/lib/identity";
 import { useQueryClient } from "@tanstack/react-query";
 import { loadOnce } from "@/lib/loadOnce";
@@ -40,10 +40,16 @@ interface BrowserDesktopBridge {
       rememberedArcaHostId?: string;
       sourceIsArcaHost?: boolean;
     },
-  ) => Promise<{ ok: boolean; created?: boolean; hostIsThisMachine?: boolean; error?: string }>;
+  ) => Promise<{
+    ok: boolean;
+    created?: boolean;
+    hostIsThisMachine?: boolean;
+    sshPreviewHost?: boolean;
+    error?: string;
+  }>;
   browserHasView?: (
     conversationId: string,
-  ) => Promise<{ exists: boolean; hostIsThisMachine?: boolean }>;
+  ) => Promise<{ exists: boolean; hostIsThisMachine?: boolean; sshPreviewHost?: boolean }>;
   browserScreenshot?: (
     conversationId: string,
     opts?: BrowserHostOptions,
@@ -153,13 +159,14 @@ async function dispatch(
         const r = await desktop.browserOpenOrNavigate(conversationId, url, undefined, {
           force: true,
           agent: true,
-          ...navigationHostOptions(sourceHostId),
+          ...(await previewHostOptions(sourceHostId, url)),
           ...(rememberedArcaHostId ? { rememberedArcaHostId } : {}),
           ...(sourceIsArcaHost ? { sourceIsArcaHost: true } : {}),
         });
         if (!r?.ok) return { ok: false, error: r?.error ?? "navigate failed" };
         if (
           isLoopbackPreview(url) &&
+          r.sshPreviewHost !== true &&
           sourceHostId &&
           rememberedArcaHostId &&
           sourceHostId !== rememberedArcaHostId
@@ -298,7 +305,7 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
       if (needsHostRevalidation && desktop.browserHasView) {
         try {
           const view = await desktop.browserHasView(sourceConversationId);
-          privilegedView = view.hostIsThisMachine === true;
+          privilegedView = view.hostIsThisMachine === true || view.sshPreviewHost === true;
         } catch {
           // A failed probe requires current host metadata before acting.
         }

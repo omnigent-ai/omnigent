@@ -880,6 +880,7 @@ describe("Arca extend IPC", () => {
         arcaPreviewRecovery: true,
         // Managed-feature fixtures simulate macOS on every test host.
         chromeCookieImport: true,
+        sshLocalhostPreview: true,
         floatingComposer: true,
         floatingComposerShortcut: true,
       },
@@ -5226,6 +5227,7 @@ describe("browser-view teardown on server change (src/main.js)", () => {
         arcaPreviewRecovery: true,
         // Managed-feature fixtures simulate macOS on every test host.
         chromeCookieImport: true,
+        sshLocalhostPreview: true,
         floatingComposer: true,
         floatingComposerShortcut: true,
       },
@@ -6916,7 +6918,8 @@ describe("localhost previews for hosts reached over SSH", () => {
       event,
       deps,
       questions,
-      context: deps.getAgentContextForEvent(event, { sourceHostId: hostId }),
+      context: () =>
+        deps.getAgentContextForEvent(event, { sourceHostId: hostId, sessionHostProtocol: 1 }),
       eligible: h.browserRegistryDeps().allowsLocalhost,
       connect: () => h.ipc.get("omnigent:ssh-connect")(event, "devbox"),
     };
@@ -6930,7 +6933,7 @@ describe("localhost previews for hosts reached over SSH", () => {
 
     assert.equal(await request(preview), false, "nothing is recorded for the host yet");
     assert.equal((await connect()).ok, true);
-    assert.equal(eligible(context), false);
+    assert.equal(eligible(context()), false);
     assert.equal(await request("https://example.com/"), false);
     assert.equal(await request(preview, "b".repeat(32)), false);
     assert.equal(await request(preview, hostId, elsewhere), false);
@@ -6938,8 +6941,11 @@ describe("localhost previews for hosts reached over SSH", () => {
 
     assert.equal(await request(preview), true);
     assert.deepEqual(questions, ['Let sessions on "devbox" open localhost pages?']);
-    assert.equal(eligible(context), true);
-    assert.equal(eligible({ ...context, sourceHostId: "b".repeat(32) }), false);
+    assert.equal(eligible(context()), true);
+    assert.equal(context().hostIsSshPreview, true);
+    assert.equal(context().hostIsThisMachine, false);
+    assert.equal(eligible({ ...context(), sourceHostId: "b".repeat(32) }), false);
+    assert.equal(eligible(deps.getAgentContextForEvent(event, { sourceHostId: hostId })), false);
     assert.equal(await request(preview), false, "an allowed host needs no retry");
     assert.equal(questions.length, 1);
   });
@@ -6952,7 +6958,7 @@ describe("localhost previews for hosts reached over SSH", () => {
     assert.equal(await deps.requestPreviewHostForEvent(event, preview, hostId), false);
     assert.equal(await deps.requestPreviewHostForEvent(event, preview, hostId), false);
     assert.equal(questions.length, 1);
-    assert.equal(eligible(context), false);
+    assert.equal(eligible(context()), false);
     assert.match(
       deps.getAgentNavigationHintForEvent(event, preview, hostId),
       /"devbox" were declined/,

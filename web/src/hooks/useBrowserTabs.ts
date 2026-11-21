@@ -4,7 +4,8 @@ import { browserPageLabel } from "@/lib/browserPageLabel";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
 import { AGENT_BROWSER_TAB_ID, browserViewId, browserViewOwnerId } from "@/lib/browserTabs";
 import { fetchSessionHostId } from "@/lib/fetchSessionHostId";
-import { type BrowserHostOptions, navigationHostOptions } from "@/lib/nativeBridge";
+import type { BrowserHostOptions } from "@/lib/nativeBridge";
+import { previewHostOptions } from "@/lib/previewHostOptions";
 import { onInAppLinkOpen } from "@/lib/openLinkInApp";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import {
@@ -199,7 +200,7 @@ async function openBrowserTabAt(
   const result = await browserTabsBridge()
     ?.browserOpenOrNavigate?.(browserViewId(conversationId, tabId), url, undefined, {
       force: true,
-      ...navigationHostOptions(hostId),
+      ...(await previewHostOptions(hostId, url)),
     })
     .catch((error: unknown) => ({ ok: false, error: String(error) }));
   if (result && !result.ok) return result;

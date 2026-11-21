@@ -1,21 +1,24 @@
 "use strict";
 
-// Localhost previews for sessions whose host this desktop already reaches over
-// the user's own SSH. Only hosts with a destination main recorded after proving
-// it (see sshHosts) qualify, and only once the user allows them in this run.
+// Localhost previews require a proven SSH destination and consent for this run.
+// A new destination is verified only after the user agrees to the SSH check.
 
 const { canonicalHostId } = require("./sshHosts");
+const { suggestedAlias } = require("./sshTargets");
 
 /**
- * @param {{ destination: (serverUrl: string, hostId: string) => string | null }} deps
- *   The recorded SSH destination for a host on a server, or null.
+ * @param {{ destination: (serverUrl: string, hostId: string) => string | null,
+ *   verify?: (serverUrl: string, hostId: string, destination: string) => Promise<boolean>,
+ *   record?: (serverUrl: string, hostId: string, destination: string) => void }} deps
+ *   Read a recorded SSH destination, or prove and record a new one.
  */
-function createSshPreviewHosts({ destination }) {
+function createSshPreviewHosts({ destination, verify, record }) {
   // Allowed hosts, each with the destination the user saw when allowing it.
   const allowed = new Map();
   // "Not now" holds until restart, so a retrying agent can't keep asking.
   const declined = new Set();
   const pending = new Map();
+  const failed = new Set();
 
   const keyFor = (serverUrl, hostId) => JSON.stringify([serverUrl, canonicalHostId(hostId)]);
 
@@ -41,29 +44,45 @@ function createSshPreviewHosts({ destination }) {
 
     /**
      * Ask once whether `hostId`'s sessions may open localhost pages. Concurrent
-     * requests share one question; hosts without a recorded destination are never asked.
+     * requests share one question; unrecorded destinations require read-only verification.
      *
      * @param {string | null | undefined} serverUrl
      * @param {string | null | undefined} hostId
-     * @param {(destination: string) => Promise<boolean | null>} approve
+     * @param {(destination: string, needsVerification: boolean) => Promise<boolean | null>} approve
      *   Shows the question; null when it couldn't be shown.
+     * @param {string | undefined} sshTarget Untrusted route hint, never an identity proof.
      * @returns {Promise<boolean>} Whether the host is allowed now.
      */
-    request(serverUrl, hostId, approve) {
-      const asked = recorded(serverUrl, hostId);
+    request(serverUrl, hostId, approve, sshTarget) {
+      if (typeof serverUrl !== "string" || typeof hostId !== "string" || !hostId) {
+        return Promise.resolve(false);
+      }
+      const existing = recorded(serverUrl, hostId);
+      const asked = existing ?? (verify && record ? suggestedAlias(sshTarget) : null);
       if (asked === null) return Promise.resolve(false);
       const key = keyFor(serverUrl, hostId);
       if (allowed.get(key) === asked) return Promise.resolve(true);
-      if (declined.has(key)) return Promise.resolve(false);
+      if (declined.has(key) || failed.has(key)) return Promise.resolve(false);
       const inFlight = pending.get(key);
       if (inFlight) return inFlight;
       const attempt = Promise.resolve()
-        .then(() => approve(asked))
+        .then(() => approve(asked, existing === null))
         .catch(() => null)
-        .then((answer) => {
+        .then(async (answer) => {
           if (answer === false) declined.add(key);
+          if (answer !== true) return false;
+          if (existing === null) {
+            if (!(await verify(serverUrl, hostId, asked).catch(() => false))) {
+              failed.add(key);
+              return false;
+            }
+            // Another connection may have recorded a different destination during verification.
+            const current = recorded(serverUrl, hostId);
+            if (current !== null && current !== asked) return false;
+            record(serverUrl, hostId, asked);
+          }
           // The record can change while the question is open; the answer covers only what was shown.
-          if (answer !== true || recorded(serverUrl, hostId) !== asked) return false;
+          if (recorded(serverUrl, hostId) !== asked) return false;
           allowed.set(key, asked);
           return true;
         })
@@ -73,16 +92,19 @@ function createSshPreviewHosts({ destination }) {
     },
 
     /**
-     * Why a recorded host's localhost pages stay blocked, or null.
+     * Why a host's localhost pages stay blocked, or null.
      *
      * @param {string | null | undefined} serverUrl
      * @param {string | null | undefined} hostId
      * @returns {string | null}
      */
     hint(serverUrl, hostId) {
+      if (failed.has(keyFor(serverUrl, hostId))) {
+        return "The SSH destination could not be verified as this session's host. Check its connection and restart Omnigent to retry.";
+      }
       const current = recorded(serverUrl, hostId);
-      if (current === null || !declined.has(keyFor(serverUrl, hostId))) return null;
-      return `Localhost previews from "${current}" were declined; restart Omnigent to be asked again.`;
+      if (!declined.has(keyFor(serverUrl, hostId))) return null;
+      return `Localhost previews${current ? ` from "${current}"` : " for this host"} were declined; restart Omnigent to be asked again.`;
     },
   };
 }

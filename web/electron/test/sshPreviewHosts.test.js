@@ -18,6 +18,68 @@ function setup(records = { [SERVER]: { [HOST]: "devbox" } }) {
 }
 
 describe("localhost previews for hosts reached over SSH", () => {
+  it("verifies an unrecorded suggestion only after consent, then records and allows it", async () => {
+    let destination = null;
+    const steps = [];
+    const previews = createSshPreviewHosts({
+      destination: () => destination,
+      verify: async (server, host, target) => {
+        steps.push(["verify", server, host, target]);
+        return true;
+      },
+      record: (server, host, target) => {
+        steps.push(["record", server, host, target]);
+        destination = target;
+      },
+    });
+    assert.equal(
+      await previews.request(
+        SERVER,
+        HOST,
+        async (target, needsVerification) => {
+          steps.push(["approve", target, needsVerification]);
+          return true;
+        },
+        "devbox",
+      ),
+      true,
+    );
+    assert.deepEqual(steps, [
+      ["approve", "devbox", true],
+      ["verify", SERVER, HOST, "devbox"],
+      ["record", SERVER, HOST, "devbox"],
+    ]);
+    assert.equal(previews.allows(SERVER, HOST), true);
+  });
+
+  it("never probes a declined suggestion or grants a failed proof", async () => {
+    let attempts = 0;
+    const previews = createSshPreviewHosts({
+      destination: () => null,
+      verify: async () => {
+        attempts++;
+        return false;
+      },
+      record: () => assert.fail("must not record an unverified host"),
+    });
+    assert.equal(await previews.request(SERVER, HOST, async () => false, "devbox"), false);
+    assert.equal(await previews.request(SERVER, HOST, async () => true, "devbox"), false);
+    assert.equal(attempts, 0);
+    assert.equal(await previews.request(SERVER, "b".repeat(32), async () => true, "devbox"), false);
+    assert.equal(attempts, 1);
+    assert.equal(previews.allows(SERVER, "b".repeat(32)), false);
+    assert.match(previews.hint(SERVER, "b".repeat(32)), /could not be verified/);
+    assert.equal(
+      await previews.request(
+        SERVER,
+        "b".repeat(32),
+        () => assert.fail("must not repeatedly ask"),
+        "devbox",
+      ),
+      false,
+    );
+  });
+
   it("allows a recorded host only after the user allows it", async () => {
     const { previews } = setup();
     const asked = [];

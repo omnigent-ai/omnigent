@@ -538,23 +538,33 @@ session's agent browser view and are not targeted by the agent relay.
 
 ### Previews from hosts reached over SSH
 
-A session whose host runs on another machine can also open localhost pages
-once this desktop reaches that host over the user's own SSH: through
-**Connect over SSH**, or by reading one of the session's files over the SSH
-alias the web app suggests. Main records the destination only after a
-token-checked call over it reaches that host (`src/sshHosts.js`,
-`src/sshTargets.js`); the page and server name only the session's host.
+A session on a remote host can open localhost previews after the desktop
+proves the host's SSH destination and the user grants access. Existing
+destinations from **Connect over SSH** or token-checked file access can be
+used directly. For a new destination, the web app supplies a route hint from
+the host list, and the consent dialog explains the read-only SSH check.
+Only after **Allow** does main run `omnigent host status --server ... --json`
+over SSH. It requires one online daemon with the session's exact host ID and
+selected server/workspace before recording the destination. It never starts
+a daemon or signs in (`src/sshPreviewIdentity.js`, `src/sshPreviewHosts.js`).
 
 When such a session first opens a localhost page (address bar, link, or
 agent), a shell-owned dialog names the destination and asks whether its
-sessions may open localhost pages. **Allow** opens the page; **Not now** keeps
+sessions may access this computer's localhost ports, including forwarded ones.
+**Allow** opens the page after any required verification; **Not now** keeps
 that host's localhost pages blocked until Omnigent restarts. The answer lasts
 for this app run and only while the host's recorded destination is unchanged
-(`src/sshPreviewHosts.js`).
+(`src/sshPreviewHosts.js`). Failed verification also stays blocked until restart.
+Agent screenshots, snapshots, clicks, and typing revalidate the session host;
+moving the session to a different host revokes the old page's privileged access.
 
 `localhost` still names this computer, so forward the app's port first, for
-example with `ssh -L 5173:localhost:5173 <destination>`. The loopback rules
-above still apply.
+example with `ssh -N -L 127.0.0.1:5173:127.0.0.1:5173 <destination>`.
+This grants access to all permitted loopback ports, not only the forwarded
+port; it does not establish forwarding or prove the local endpoint's owner.
+The loopback rules above still apply. This path is available on macOS and
+Linux. New web bundles check the optional `sshLocalhostPreview` capability;
+older shells keep their existing behavior.
 
 ### Agent previews on Arca
 
