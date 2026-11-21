@@ -318,9 +318,43 @@ def without_codex_positional_prompt(args: Sequence[str]) -> list[str]:
 def _merge_tables(base: dict[str, Any], overlay: dict[str, Any]) -> None:
     for key, value in overlay.items():
         if isinstance(value, dict) and isinstance(base.get(key), dict):
-            _merge_tables(base[key], value)
+            if key == "mcp_servers":
+                _merge_mcp_servers(base[key], value)
+            else:
+                _merge_tables(base[key], value)
         else:
             base[key] = copy.deepcopy(value)
+
+
+def _merge_mcp_servers(base: dict[str, Any], overlay: dict[str, Any]) -> None:
+    """Merge MCP settings, discarding the old transport when a profile switches it."""
+    transport_fields = {
+        "command",
+        "args",
+        "env",
+        "env_vars",
+        "cwd",
+        "url",
+        "bearer_token_env_var",
+        "http_headers",
+        "env_http_headers",
+        "oauth_resource",
+        "scopes",
+    }
+    for name, settings in overlay.items():
+        inherited = base.get(name)
+        if not isinstance(settings, dict) or not isinstance(inherited, dict):
+            base[name] = copy.deepcopy(settings)
+            continue
+        switches_transport = (
+            "command" in settings and "url" not in settings and "url" in inherited
+        ) or ("url" in settings and "command" not in settings and "command" in inherited)
+        if switches_transport:
+            # Keep shared tool restrictions and required/enabled flags; endpoint
+            # credentials and launch settings belong to the selected transport.
+            for field in transport_fields:
+                inherited.pop(field, None)
+        _merge_tables(inherited, settings)
 
 
 def _carry_config_edits(
@@ -410,7 +444,7 @@ def read_codex_mcp_servers(
             overlay = profiles.get(profile) if isinstance(profiles, dict) else None
             if not isinstance(overlay, dict):
                 raise ValueError(f"Codex config profile {profile!r} does not exist")
-        _merge_tables(servers, inventory(overlay, profile_path))
+        _merge_mcp_servers(servers, inventory(overlay, profile_path))
     return servers
 
 
