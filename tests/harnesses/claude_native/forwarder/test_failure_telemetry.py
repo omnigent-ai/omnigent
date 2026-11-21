@@ -267,6 +267,119 @@ async def test_category_only_failure_retains_current_api_error_after_restart(
         assert "native_api_error_message" not in context
 
 
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "current_error",
+        "newer_prompt_before_transcript",
+        "newer_activity_without_prompt_hook",
+        "missing_activity",
+        "unstamped_error",
+        "malformed_timestamp",
+        "future_timestamp",
+        "settled_error",
+        "pending_settled_error",
+        "foreign_owner",
+        "foreign_launch",
+        "foreign_bridge",
+        "foreign_native_session",
+        "subagent_error",
+        "stopped_prompt",
+        "missing_prompt",
+    ],
+)
+@pytest.mark.asyncio
+async def test_program_error_detail_requires_current_launch_prompt(
+    tmp_path: Path, scenario: str
+) -> None:
+    from omnigent.harnesses.claude_native.lifecycle import record_hook_lifecycle
+    from omnigent.inner.terminal_lifecycle import (
+        TERMINAL_INSTANCE_ID_ENV,
+        TERMINAL_LAUNCH_ID_ENV,
+    )
+
+    bridge_dir = bridge.prepare_bridge_dir("conv_synthetic", workspace=tmp_path)
+    transcript_path = tmp_path / "session.jsonl"
+    instance_id, launch_id = "a" * 32, "b" * 32
+    launch_env = {TERMINAL_INSTANCE_ID_ENV: instance_id, TERMINAL_LAUNCH_ID_ENV: launch_id}
+    for name, recorded_at in [("SessionStart", 1.0), ("UserPromptSubmit", 2.0)]:
+        if scenario == "missing_prompt" and name == "UserPromptSubmit":
+            continue
+        payload = {"hook_event_name": name, "session_id": "native-session"}
+        bridge.record_hook_event(bridge_dir, payload)
+        record_hook_lifecycle(bridge_dir, payload, recorded_at, env=launch_env)
+    entry = {
+        "type": "assistant",
+        "uuid": "current-error",
+        "sessionId": "other-session" if scenario == "foreign_native_session" else "native-session",
+        "timestamp": "1970-01-01T00:00:03Z",
+        "isApiErrorMessage": True,
+        "message": {"role": "assistant", "content": "Prompt is too long"},
+    }
+    if scenario == "unstamped_error":
+        entry.pop("timestamp")
+    if scenario == "malformed_timestamp":
+        entry["timestamp"] = "not-a-timestamp"
+    if scenario == "future_timestamp":
+        entry["timestamp"] = "2999-01-01T00:00:03Z"
+    if scenario == "subagent_error":
+        entry["agentId"] = "native-child"
+    if scenario == "newer_prompt_before_transcript":
+        record_hook_lifecycle(
+            bridge_dir,
+            {"hook_event_name": "UserPromptSubmit", "session_id": "native-session"},
+            4.0,
+            env=launch_env,
+        )
+    transcript_path.write_text(json.dumps(entry) + "\n")
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(202, json={})),
+        base_url="http://test",
+    ) as client:
+        state = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_synthetic",
+            bridge_dir=bridge_dir,
+            agent_name="test-agent",
+            state=forwarder.TranscriptForwardState(transcript_path, 0),
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=forwarder._ForwardDedupeState(),
+        )
+    if scenario == "stopped_prompt":
+        record_hook_lifecycle(
+            bridge_dir,
+            {"hook_event_name": "Stop", "session_id": "native-session"},
+            4.0,
+            env=launch_env,
+        )
+    if scenario == "settled_error":
+        forwarder._write_forward_state(
+            bridge_dir, replace(state, settled_response_id=state.api_error_response_id)
+        )
+    if scenario == "pending_settled_error":
+        forwarder._write_forward_state(
+            bridge_dir, replace(state, pending_settled_response_id=state.api_error_response_id)
+        )
+    if scenario == "foreign_owner":
+        forwarder._write_forward_state(
+            bridge_dir, replace(state, api_error_response_id="resp_other")
+        )
+    if scenario == "foreign_bridge":
+        bridge.write_active_session_id(bridge_dir, "conv_other")
+    detail = forwarder.program_status_failure_detail(
+        bridge_dir,
+        "conv_synthetic",
+        instance_id,
+        "c" * 32 if scenario == "foreign_launch" else launch_id,
+        activity_recorded_at=None
+        if scenario == "missing_activity"
+        else 4.0
+        if scenario == "newer_activity_without_prompt_hook"
+        else 2.5,
+    )
+    assert detail == ("Prompt is too long" if scenario == "current_error" else None)
+
+
 _SPEND_LIMIT_ERROR = (
     'API Error: 403 {"error":{"type":"permission_error",'
     '"message":"Synthetic spend limit reached"}}'
