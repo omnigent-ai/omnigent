@@ -10,7 +10,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { RenderItem } from "@/lib/renderItems";
+import type { RenderItem, ToolState } from "@/lib/renderItems";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import { ConversationScrollLockContext } from "@/components/ai-elements/conversation";
@@ -1369,6 +1369,113 @@ describe("BlockRenderer dispatch", () => {
       expect(screen.queryByText("Tool 1")).toBeNull();
       expect(screen.getByText("Relayed.")).toBeDefined();
     });
+
+    const messageToWorker = (output: string | null, state: ToolState): RenderItem => ({
+      kind: "tool",
+      itemId: "fc_message",
+      execution: {
+        name: "mcp__omnigent__sys_session_message",
+        arguments: { session_id: "s_worker", message: "Reproduce the bug.\n\nList the carts." },
+        argsSummary: "",
+        callId: "c_message",
+        agentName: "nessie",
+        executedBy: "server",
+        output,
+      },
+      output,
+      state,
+      startedAt: null,
+      duration: undefined,
+    });
+
+    function renderWithWorker(items: RenderItem[], sessionStatus: "idle" | "running" = "idle") {
+      const client = new QueryClient();
+      client.setQueryData(["session", "s_worker"], {
+        title: "Repro worker",
+        parentSessionId: null,
+      });
+      render(
+        <QueryClientProvider client={client}>
+          <MemoryRouter>
+            <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+              <BlockRenderer items={items} sessionStatus={sessionStatus} />
+            </FileViewerContext.Provider>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    }
+
+    it("shows an accepted message to another session once, as a To… row outside the fold", () => {
+      renderWithWorker([
+        { kind: "text", itemId: "m0", text: "Briefing the worker.", final: true },
+        messageToWorker('{"queued": true, "item_id": "i_1"}', "output-available"),
+        tool(1),
+        { kind: "text", itemId: "m1", text: "Briefed.", final: true },
+      ]);
+      expect(screen.getByTestId("outbound-session-message")).toHaveAttribute("data-status", "sent");
+      expect(screen.getByTestId("message-destination").textContent).toBe("To@Repro worker");
+      expect(screen.getByRole("link", { name: "@Repro worker" })).toHaveAttribute(
+        "href",
+        "/c/s_worker",
+      );
+      expect(screen.getByTestId("expand-sent-message").textContent).toBe("Reproduce the bug.");
+      expect(screen.queryByText("List the carts.")).toBeNull();
+
+      // The fold holds only the other tool: the message is not also a tool row in there.
+      fireEvent.click(screen.getByRole("button", { name: "Worked" }));
+      expect(screen.getByText("Called 1 tool")).toBeDefined();
+      expect(screen.queryByText(/Session message/)).toBeNull();
+      expect(screen.getAllByTestId("outbound-session-message")).toHaveLength(1);
+
+      fireEvent.click(screen.getByTestId("expand-sent-message"));
+      expect(screen.getByText("List the carts.")).toBeDefined();
+      fireEvent.click(screen.getByTestId("collapse-sent-message"));
+      expect(screen.queryByText("List the carts.")).toBeNull();
+    });
+
+    it.each([
+      {
+        status: "sending",
+        output: null,
+        state: "input-available",
+        label: "Sending to@Repro worker",
+        note: "",
+        detail: null,
+      },
+      {
+        status: "not_sent",
+        output: '{"error": "Session message refused", "delivery": "refused"}',
+        state: "output-available",
+        label: "Not sent to@Repro worker",
+        note: "· Session message refused",
+        detail: "Session message refused",
+      },
+      {
+        status: "unconfirmed",
+        output: '{"error": "Delivery could not be confirmed", "delivery": "unconfirmed"}',
+        state: "output-available",
+        label: "Could not confirm send to@Repro worker",
+        note: "· don't resend automatically",
+        detail: "Delivery could not be confirmed",
+      },
+    ] as const)(
+      "labels a $status send without a message surface, expandable to its text",
+      ({ status, output, state, label, note, detail }) => {
+        renderWithWorker([messageToWorker(output, state)], "running");
+        const row = screen.getByTestId("outbound-session-message");
+        expect(row).toHaveAttribute("data-status", status);
+        expect(row).not.toHaveClass("ring-1");
+        expect(screen.getByTestId("message-destination").textContent).toBe(label);
+        const toggle = screen.getByTestId("toggle-unsent-message");
+        expect(toggle.textContent).toBe(note);
+        expect(screen.queryByText("List the carts.")).toBeNull();
+
+        fireEvent.click(toggle);
+        expect(toggle).toHaveAttribute("aria-expanded", "true");
+        expect(screen.getByText("List the carts.")).toBeDefined();
+        if (detail !== null) expect(screen.getByText(detail, { selector: "p" })).toBeDefined();
+      },
+    );
 
     const slashReceipt = (name = "dev-productivity:simplify"): RenderItem => ({
       kind: "slash_command",
