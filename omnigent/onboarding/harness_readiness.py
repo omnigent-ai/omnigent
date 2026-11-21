@@ -53,6 +53,7 @@ from omnigent.onboarding.harness_install import (
     CURSOR_KEY,
     DEVIN_KEY,
     GOOSE_KEY,
+    GROK_KEY,
     HERMES_KEY,
     KIMI_KEY,
     KIRO_KEY,
@@ -150,6 +151,13 @@ _KIRO_NATIVE_HARNESSES: frozenset[str] = frozenset({"kiro-native", "native-kiro"
 # other native CLI harnesses. Goose owns its own auth (``goose configure``), so
 # there is no SDK variant or key to gate on.
 _GOOSE_NATIVE_HARNESSES: frozenset[str] = frozenset({"goose-native", "native-goose"})
+
+# Native Grok harnesses (``omnigent grok`` → ``grok agent serve``). They wrap
+# the resident ``grok`` binary and can't launch without it on ``PATH`` — gate
+# on it, like the other native CLI harnesses. Grok owns its own auth
+# (``grok login`` / ``XAI_API_KEY``); the bare ``grok`` ACP surface gates on
+# the same binary.
+_GROK_NATIVE_HARNESSES: frozenset[str] = frozenset({"grok-native", "native-grok"})
 
 # Native Kimi TUI harnesses (``omnigent kimi``). Like the other native CLIs,
 # they wrap the resident ``kimi`` binary and can't launch without it on
@@ -262,6 +270,8 @@ def _harness_availability_core(harness: str) -> HarnessAvailability:
         return _installer_only_availability(KIRO_KEY)
     if canonical in _GOOSE_NATIVE_HARNESSES or canonical == GOOSE_KEY:
         return _installer_only_availability(GOOSE_KEY)
+    if canonical in _GROK_NATIVE_HARNESSES or canonical == GROK_KEY:
+        return _installer_only_availability(GROK_KEY)
     if canonical in _HERMES_NATIVE_HARNESSES or canonical == HERMES_KEY:
         return _installer_only_availability(HERMES_KEY)
     if canonical in _DEVIN_NATIVE_HARNESSES:
@@ -312,6 +322,8 @@ def _harness_availability_core(harness: str) -> HarnessAvailability:
         and canonical not in _KIMI_NATIVE_HARNESSES
         and canonical not in _OPENCODE_HARNESSES
         and canonical not in _QWEN_HARNESSES
+        and canonical not in _GROK_NATIVE_HARNESSES
+        and canonical != GROK_KEY
     ):
         required_cli = required_cli_for_harness(canonical) or required_cli_for_harness(harness)
         if required_cli is not None:
@@ -1093,6 +1105,7 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
     spellings.update(_CURSOR_NATIVE_HARNESSES)
     spellings.update(_KIRO_NATIVE_HARNESSES)
     spellings.update(_GOOSE_NATIVE_HARNESSES)
+    spellings.update(_GROK_NATIVE_HARNESSES)
     spellings.update(_KIMI_NATIVE_HARNESSES)
     spellings.update(_HERMES_NATIVE_HARNESSES)
     spellings.update(_DEVIN_NATIVE_HARNESSES)
