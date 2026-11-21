@@ -27,6 +27,7 @@ import {
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { ShellCommandContext, ShellCommandDraftContext } from "./ShellCommandContext";
+import { useFloatingPanes } from "./useFloatingPanes";
 import {
   Outlet,
   useLocation,
@@ -409,6 +410,7 @@ function AppShellImpl() {
   // With tabs enabled, links, pages and shells open there. The session ref stays null
   // until a new session has its real id: there are no tabs to open in before that.
   const tabsSidebar = useTabsSidebar();
+  const floatingPanes = useFloatingPanes();
   const tabsModeRef = useRef(false);
   tabsModeRef.current = tabsSidebar;
   const tabsSessionRef = useRef<string | null>(null);
@@ -3266,6 +3268,7 @@ function AppShellImpl() {
             // maximized workspace rail's tab strip in index.css): with the
             // sidebar open over the window corner there are no lights to clear.
             data-sidebar-open={sidebarOpen ? "true" : undefined}
+            data-floating-panes={floatingPanes ? "" : undefined}
             data-ios-native={isIOSShell() ? "true" : undefined}
             data-android-native={isAndroidShell() ? "true" : undefined}
           >
@@ -3357,6 +3360,8 @@ function AppShellImpl() {
               <div
                 data-workspace-panel-resizing={inlinePanelResizing || undefined}
                 data-workspace-panel-animate={rightPanelVisibilityAnimating || undefined}
+                // A session's column, whose chat page (its terminal view included) floats as one pane.
+                data-main-view={conversationId ? "chat" : undefined}
                 className={cn(
                   "relative flex min-h-0 min-w-0 flex-1",
                   panelOpen && !terminalFirst && "md:hidden",
