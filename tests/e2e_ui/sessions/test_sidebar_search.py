@@ -39,8 +39,8 @@ def test_search_lists_matching_sessions_in_palette(
     - A query matching the title lists the session row.
     - A query that matches nothing lists no session and surfaces the
       "No results found" empty state.
-    - Once the session is archived, the matching query still lists it,
-      marked Archived.
+    - Once the session is archived, the recent sessions shown before typing
+      list it, marked Archived, and the matching query still lists it.
 
     The unique marker (a uuid) can't collide with other tests' sessions
     in the shared server, so the non-matching assertion is deterministic.
@@ -95,8 +95,11 @@ def test_search_lists_matching_sessions_in_palette(
         timeout=10.0,
     ).raise_for_status()
     search_button.click()
-    palette_input.fill(marker)
+    # Archiving bumps the session's recency, so it leads the recent sessions.
     archived_row = dialog.get_by_role("option").filter(has_text=title)
+    expect(archived_row).to_be_visible()
+    expect(archived_row.get_by_text("Archived", exact=True)).to_be_visible()
+    palette_input.fill(marker)
     expect(archived_row).to_be_visible()
     expect(archived_row.get_by_text("Archived", exact=True)).to_be_visible()
 

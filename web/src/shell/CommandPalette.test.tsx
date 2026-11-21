@@ -118,7 +118,7 @@ const announced = () =>
 
 describe("CommandPalette — sessions", () => {
   it.each([false, true])(
-    "requests active sessions and keeps owned and shared results (sessionsOnly=%s)",
+    "keeps owned and shared sessions, and archived ones only in ⌘K (sessionsOnly=%s)",
     (sessionsOnly) => {
       const sessions = [
         { ...conv("owned", "Owned session"), owner: "current-user", permission_level: 4 },
@@ -128,12 +128,68 @@ describe("CommandPalette — sessions", () => {
       setSessions(sessions);
       renderPalette({ sessionsOnly });
 
-      expect(useConversations).toHaveBeenCalledWith("", false, { enabled: true });
+      expect(useConversations).toHaveBeenCalledWith("", !sessionsOnly, { enabled: true });
       expect(screen.getByText("Owned session")).toBeTruthy();
       expect(screen.getByText("Shared session")).toBeTruthy();
-      expect(screen.queryByText("Archived session")).toBeNull();
+      if (sessionsOnly) {
+        expect(screen.queryByText("Archived session")).toBeNull();
+      } else {
+        expect(labelRow("Archived session").closest('[role="option"]')?.textContent).toContain(
+          "Archived",
+        );
+      }
     },
   );
+
+  it("lists a just-archived session first among the recent sessions and opens it", () => {
+    // Archiving bumps updated_at, so the session lands above older activity.
+    setSessions([
+      ...Array.from({ length: 5 }, (_, index) => ({
+        ...conv(`active-${index}`, `Active ${index}`),
+        updated_at: 10 - index,
+      })),
+      { ...conv("mistake", "Archived too early"), archived: true, updated_at: 20 },
+    ]);
+    const { onOpenChange } = renderPalette();
+
+    const rows = screen
+      .getAllByRole("option")
+      .map((option) => option.textContent ?? "")
+      .filter((text) => text.includes("Active") || text.includes("Archived too early"));
+    expect(rows).toHaveLength(5);
+    expect(rows[0]).toContain("Archived too early");
+    expect(rows[0]).toContain("Archived");
+    expect(rows.slice(1).some((text) => text.includes("Archived"))).toBe(false);
+    expect(screen.queryByText("Active 4")).toBeNull();
+
+    fireEvent.keyDown(screen.getByTestId("command-palette-input"), { key: "Enter" });
+    expect(navigate).toHaveBeenCalledWith("/c/mistake");
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("shows the sidebar's active sessions until the archived-inclusive list loads", () => {
+    useConversations.mockImplementation((_query: string, includeArchived: boolean) =>
+      includeArchived
+        ? { data: undefined, isFetching: true }
+        : { data: { pages: [{ data: [conv("cached", "Cached session")] }] }, isFetching: false },
+    );
+    renderPalette();
+
+    expect(useConversations).toHaveBeenCalledWith("", false, { enabled: false });
+    expect(screen.getByText("Cached session")).toBeTruthy();
+  });
+
+  it("keeps the row of a session opened from the recent list for the sidebar to list", () => {
+    const archived = { ...conv("archived", "Archived session"), archived: true, owner: "me" };
+    setSessions([archived]);
+    const queryClient = new QueryClient();
+    renderPalette({}, queryClient);
+
+    fireEvent.click(labelRow("Archived session"));
+
+    expect(navigate).toHaveBeenCalledWith("/c/archived");
+    expect(queryClient.getQueryData(["conversation-backfill", "archived"])).toEqual(archived);
+  });
 
   it.each([false, true])(
     "shows project and parent context without needing the parent in results (sessionsOnly=%s)",
@@ -414,7 +470,7 @@ describe("CommandPalette — sessions", () => {
       setSessions([conv("c1", "Fix the parser")]);
       renderPalette();
 
-      expect(useConversations).toHaveBeenCalledWith("", false, { enabled: true });
+      expect(useConversations).toHaveBeenCalledWith("", true, { enabled: true });
 
       fireEvent.change(screen.getByTestId("command-palette-input"), {
         target: { value: "deploy" },
