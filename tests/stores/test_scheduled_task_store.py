@@ -3332,16 +3332,35 @@ def test_list_reads_only_the_requested_kinds(store: SqlAlchemyScheduledTaskStore
 
 
 def test_inbox_failures_never_list_timers(store: SqlAlchemyScheduledTaskStore) -> None:
-    timer = _timer(store, repeat=True)
-    store.create_run(
-        run_id=_uid("timer-failure"),
-        scheduled_task_id=timer.id,
-        status="failed",
-        scheduled_at=100,
-        finished_at=101,
-        error_code="owner_identity_unavailable",
+    automation = store.create(
+        scheduled_task_id=_uid("inbox-automation"),
+        name="nightly",
+        prompt="continue",
+        rrule="FREQ=DAILY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
     )
-    assert store.list_inbox_failures(owner_user_id="u") == ([], None)
+    # Set after the automation, so it is the newer task.
+    timer = _timer(store, repeat=True, first_run_at=int(datetime.now(UTC).timestamp()) + 3600)
+    for task in (automation, timer):
+        store.create_run(
+            run_id=_uid(f"{task.id}-failure"),
+            scheduled_task_id=task.id,
+            status="failed",
+            scheduled_at=100,
+            finished_at=101,
+            error_code="owner_identity_unavailable",
+        )
+    failures, no_cursor = store.list_inbox_failures(owner_user_id="u")
+    assert [failure.task_id for failure in failures] == [automation.id]
+    assert no_cursor is None
+    # The timer still takes its page slot, so a page never scans past its limit.
+    first, cursor = store.list_inbox_failures(owner_user_id="u", limit=1)
+    assert first == [] and cursor is not None
+    rest, last_cursor = store.list_inbox_failures(owner_user_id="u", after=cursor, limit=1)
+    assert [failure.task_id for failure in rest] == [automation.id]
+    assert last_cursor is None
 
 
 def test_next_due_at_reads_the_soonest_later_active_run(

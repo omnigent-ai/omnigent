@@ -595,7 +595,8 @@ def build_busy_until(deps: FireDeps) -> Callable[[ScheduledTask, int], Awaitable
     or waiting on an approval or question), has an approval or question pending, or the
     previous poll is still being delivered. It never waits past
     :data:`BUSY_SKIP_MAX_SECONDS` after the latest poll went out. A repeating timer's
-    tick waits the same way while the session is busy, but not for an idle one's quiet.
+    tick waits the same way while the session is busy, including its first tick, which
+    counts the limit from when the timer was set, but not for an idle session's quiet.
     """
 
     async def busy_until(task: ScheduledTask, now: int) -> int | None:
@@ -630,8 +631,9 @@ def build_busy_until(deps: FireDeps) -> Callable[[ScheduledTask, int], Awaitable
         if until <= now:
             return None
         # The latest poll went out at the task's last firing or when its newest run started,
-        # whichever is later; either can be later than the poll was due.
-        sent_times = [task.last_run_at]
+        # whichever is later; either can be later than the poll was due. A timer never
+        # records a last firing, and its first tick counts from when the timer was set.
+        sent_times = [task.created_at if task.kind == "timer" else task.last_run_at]
         if latest is not None:
             sent_times.append(
                 latest.fired_at if latest.fired_at is not None else latest.scheduled_at

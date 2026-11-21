@@ -365,7 +365,7 @@ def register_scheduled_task_permissions_routes(
     """Register the automation share routes on the scheduled-tasks *router*.
 
     :param load_owned_task: Returns the caller's live automation, or raises the
-        not-found error the other automation routes give.
+        not-found error the other automation routes give, or their refusal for a timer.
     """
 
     def require_sharing(request: Request, *, granting: bool) -> PermissionStore:
@@ -429,8 +429,8 @@ def register_scheduled_task_permissions_routes(
         :param limit: Max grants to return (1–1000, default 100).
         :param after: Cursor — user_id to start after (exclusive).
         :returns: ``{"permissions": [...], "next_cursor": str|null}``.
-        :raises OmnigentError: 404 when the caller does not own the automation, 403
-            for an agent or a server that cannot keep automation grants.
+        :raises OmnigentError: 404 when the caller does not own the automation, 400
+            for a timer, 403 for an agent or a server that cannot keep automation grants.
         """
         store = require_sharing(request, granting=False)
         task = await owned_task(request, scheduled_task_id)
@@ -471,8 +471,8 @@ def register_scheduled_task_permissions_routes(
         :returns: The resulting grant.
         :raises OmnigentError: 404 when the caller does not own the automation, 403
             for an agent, a server that cannot share automations, the sharing policy
-            or an automation its store cannot keep grants for, 400 for an empty or
-            over-long ID, the owner, ``__public__`` or a level other than read.
+            or an automation its store cannot keep grants for, 400 for a timer, an
+            empty or over-long ID, the owner, ``__public__`` or a level other than read.
         """
         store = require_sharing(request, granting=True)
         task = await owned_task(request, scheduled_task_id)
@@ -570,9 +570,9 @@ def register_scheduled_task_permissions_routes(
         :param target_user_id: The grantee to remove, e.g. ``"alice@example.com"``, in
             any spelling :meth:`PermissionStore.validate_grants` resolves.
         :returns: 204 No Content.
-        :raises OmnigentError: 404 when the caller does not own the automation, 403
-            for an agent or a server that cannot keep automation grants, 500 when the
-            removal cannot finish.
+        :raises OmnigentError: 404 when the caller does not own the automation, 400
+            for a timer, 403 for an agent or a server that cannot keep automation
+            grants, 500 when the removal cannot finish.
         """
         store = require_sharing(request, granting=False)
         task = await owned_task(request, scheduled_task_id)

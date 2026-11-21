@@ -738,10 +738,13 @@ def create_scheduled_tasks_router(
     _reject_proactive_agent = reject_proactive_agent_id
 
     def _refuse_timer(task: ScheduledTask) -> None:
-        """Raise a 400 for a timer: it keeps the schedule its agent set until cancelled."""
+        """Raise a 400 for a timer: it keeps the schedule its agent set until cancelled.
+
+        Its session's own sharing decides who can use it, so it has no grants either.
+        """
         if task.kind == "timer":
             raise OmnigentError(
-                "A timer can't be run or edited; cancel it and set a new one",
+                "A timer can't be run, edited or shared; cancel it and set a new one",
                 code=ErrorCode.INVALID_INPUT,
             )
 
@@ -2210,7 +2213,10 @@ def create_scheduled_tasks_router(
 
     def _load_owned_by_caller(request: Request, scheduled_task_id: str) -> ScheduledTask:
         owner = _owner(request)
-        return _require_owned(scheduled_task_id, None if owner == RESERVED_USER_LOCAL else owner)
+        task = _require_owned(scheduled_task_id, None if owner == RESERVED_USER_LOCAL else owner)
+        # A grant would also share the timer's session.
+        _refuse_timer(task)
+        return task
 
     register_scheduled_task_permissions_routes(
         router,
@@ -2251,7 +2257,7 @@ def create_scheduled_tasks_router(
         and its ID is the ``timer_id``. The first firing falls on the whole second at or
         after ``seconds`` from now, so it never comes early; a repeating timer then fires
         every ``seconds`` rounded up to a whole second. Firings that come due while the
-        server is down are skipped, not replayed.
+        server is down make one late firing when it is back, not one each.
 
         :param body: ``{"seconds": number, "repeat": bool, "note": str | null}``, checked
             like the tool's arguments, e.g. ``{"seconds": 120, "repeat": true}``.

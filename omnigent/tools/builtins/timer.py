@@ -128,10 +128,10 @@ class SysTimerSetTool(Tool):
             "you can include an optional note that's echoed back in the firing. "
             "Set repeat=true for a recurring timer (cancel via sys_timer_cancel); "
             "a repeating timer skips a tick while this session is busy, and ticks "
-            "missed while the server was down are not replayed. Times are rounded "
-            "up to whole seconds and are best effort: a firing can arrive a little "
-            "late, never early. The tool returns immediately with the timer_id and "
-            "the first fire_at."
+            "missed while the server was down arrive as one late firing. Times are "
+            "rounded up to whole seconds and are best effort: a firing can arrive "
+            "a little late, never early. The tool returns immediately with the "
+            "timer_id and the first fire_at."
         )
 
     def get_schema(self) -> dict[str, Any]:

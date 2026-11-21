@@ -1008,11 +1008,10 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 SqlScheduledTask.state,
                 SqlScheduledTask.account_generation,
                 SqlScheduledTask.user_id,
+                SqlScheduledTask.kind,
             ).where(
                 SqlScheduledTask.workspace_id == current_workspace_id(),
                 SqlScheduledTask.user_id == owner_user_id,
-                # A timer's missed wake belongs to its session, not the automation Inbox.
-                SqlScheduledTask.kind != _TIMER_KIND,
             )
             if exclude_agent_ids:
                 stmt = stmt.where(SqlScheduledTask.agent_id.not_in(sorted(exclude_agent_ids)))
@@ -1031,9 +1030,11 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             cursor = (page[-1].created_at, page[-1].id) if len(tasks) > limit else None
             failures = []
             for task in page:
-                # Filter after paging to bound scans even through deleted/rotated owners.
+                # Filter after paging to bound scans even through deleted/rotated owners
+                # and timers, whose missed wakes belong to their sessions, not the Inbox.
                 if (
                     task.user_id != owner_user_id
+                    or task.kind == _TIMER_KIND
                     or task.state == encode_scheduled_task_state("deleted")
                     or (check_generation and task.account_generation != generation)
                 ):

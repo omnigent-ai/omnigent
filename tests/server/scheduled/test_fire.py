@@ -59,7 +59,7 @@ from omnigent.server.scheduled.fire import (
     build_on_fire,
     build_run_now,
 )
-from omnigent.server.scheduled.schedule import continued_sandbox_host_id
+from omnigent.server.scheduled.schedule import continued_sandbox_host_id, timer_rule
 from omnigent.server.scheduled.source_session import (
     run_copy_dropped_label_keys,
     run_prompt_text,
@@ -5188,6 +5188,34 @@ async def test_a_busy_session_is_checked_again_later(
     task = _task(
         session_mode=session_mode,
         session_id="sess_busy_check" if session_mode == "continue" else None,
+        next_run_at=due,
+    )
+    assert await check(task, due) == (None if wait_seconds is None else due + wait_seconds)
+
+
+@pytest.mark.parametrize(
+    ("live_status", "minutes_since_set", "wait_seconds"),
+    [
+        # The first tick waits for the turn that set the timer...
+        pytest.param("running", 1, BUSY_RECHECK_SECONDS, id="first-tick-while-busy"),
+        # ...but never past ten minutes after the timer was set.
+        pytest.param("running", BUSY_SKIP_MAX_SECONDS // 60, None, id="ten-minutes-after-set"),
+        # An idle session takes it at once, without a trigger's quiet wait.
+        pytest.param("idle", 1, None, id="idle-session"),
+    ],
+)
+async def test_a_timer_that_has_not_fired_waits_only_while_its_session_is_busy(
+    live_status, minutes_since_set, wait_seconds
+) -> None:
+    due = 1_800_003_600
+    # The session changed ten seconds ago, and the timer has no run yet.
+    check = _busy_until_check(live_status, None, updated_at=due - 10)
+    task = _task(
+        kind="timer",
+        rrule=timer_rule(60, repeat=True),
+        session_mode="continue",
+        session_id="sess_busy_check",
+        created_at=due - minutes_since_set * 60,
         next_run_at=due,
     )
     assert await check(task, due) == (None if wait_seconds is None else due + wait_seconds)

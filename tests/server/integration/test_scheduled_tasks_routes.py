@@ -7298,13 +7298,21 @@ async def test_a_timer_is_one_hidden_task_its_session_can_cancel(
     assert await listed({"kind": "all"}) == [timer_id]
     got = await auth_client.get(f"/v1/scheduled-tasks/{timer_id}", headers=_headers())
     assert got.json()["kind"] == "timer"
-    # A timer keeps the schedule its agent set; it can only be cancelled.
+    session_grants = _session_grants(db_uri, session_id)
+    # A timer keeps the schedule its agent set and is never shared, which would also
+    # share its session; it can only be cancelled.
     for method, url, body in (
         ("PATCH", f"/v1/scheduled-tasks/{timer_id}", {"rrule": "FREQ=DAILY"}),
         ("POST", f"/v1/scheduled-tasks/{timer_id}/run", None),
+        ("GET", _permissions_url(timer_id), None),
+        ("PUT", _permissions_url(timer_id), {"user_id": "bob@example.com", "level": 1}),
+        ("DELETE", _permissions_url(timer_id, "bob@example.com"), None),
     ):
         refused = await auth_client.request(method, url, json=body, headers=_headers())
         assert refused.status_code == 400, refused.text
+        assert "can't be run, edited or shared" in refused.text
+    assert _task_grantees(db_uri, timer_id) == []
+    assert _session_grants(db_uri, session_id) == session_grants
 
     cancel_url = f"/v1/sessions/{session_id}/timers/{timer_id}"
     cancelled = await auth_client.delete(cancel_url, headers=_headers())
