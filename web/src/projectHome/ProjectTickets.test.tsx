@@ -203,9 +203,10 @@ describe("Project ticket board", () => {
     const initial = screen.getByRole("region", { name: "New" });
     const board = screen.getByRole("region", { name: "Shipping ticket board" });
     expect(investigating.querySelector(".lucide-search")).toHaveClass("text-purple-600");
-    expect(
-      within(investigating).getByText("Investigating").closest('[data-slot="badge"]'),
-    ).toHaveClass("bg-purple-500/10");
+    const badge = within(investigating)
+      .getByText("Investigating")
+      .closest('[data-slot="hover-card-trigger"]')!;
+    expect(badge).toHaveClass("bg-purple-500/10");
     expect(
       screen.getByRole("region", { name: "Resolved" }).querySelector(".lucide-rocket"),
     ).toHaveClass("text-session-active");
@@ -214,9 +215,25 @@ describe("Project ticket board", () => {
         .getAllByRole("region")
         .map((lane) => lane.getAttribute("aria-label")),
     ).toEqual(["New", "Investigating", "Resolved"]);
-    expect(
-      within(investigating).getByText("Gather evidence before resolving."),
-    ).toBeInTheDocument();
+    const instructions = "Gather evidence before resolving.";
+    expect(screen.queryByText(instructions)).toBeNull();
+    expect(badge).not.toHaveAttribute("title");
+    fireEvent.pointerEnter(badge, { pointerType: "mouse" });
+    const description = await screen.findByText(instructions);
+    expect(description.closest('[data-slot="hover-card-content"]')).toHaveClass(
+      "bg-popover",
+      "shadow-menu",
+    );
+    expect(within(investigating).queryByText(instructions)).toBeNull();
+    fireEvent.pointerLeave(badge, { pointerType: "mouse" });
+    await waitFor(() => expect(screen.queryByText(instructions)).toBeNull());
+    fireEvent.focus(badge);
+    expect(await screen.findByText(instructions)).toHaveAttribute(
+      "id",
+      badge.getAttribute("aria-describedby"),
+    );
+    fireEvent.blur(badge);
+    await waitFor(() => expect(screen.queryByText(instructions)).toBeNull());
     expect(within(initial).getByRole("link", { name: "New ticket" })).toHaveAttribute(
       "href",
       "/?ticket=new",
@@ -242,6 +259,7 @@ describe("Project ticket board", () => {
 
   it("moves to the last stage without requiring a summary and preserves optional content", async () => {
     ticket.stage_id = "verifying";
+    ticket.plan = "Gather recovery evidence.";
     ticket.review_summary = "Inspect the evidence in any stage.";
     ticket.completion_summary = "Earlier result";
     vi.mocked(api.getTicketStages).mockResolvedValue({
@@ -273,7 +291,7 @@ describe("Project ticket board", () => {
     expect(
       screen.getByRole("combobox", { name: "Ticket stage" }).querySelector(".lucide-wrench"),
     ).toHaveClass("text-orange-600");
-    await user.click(screen.getByRole("button", { name: "Add plan" }));
+    await user.click(screen.getByRole("button", { name: "Edit plan" }));
     fireEvent.change(screen.getByLabelText("Plan"), {
       target: { value: "Verify recovery evidence." },
     });
@@ -555,6 +573,10 @@ describe("Project ticket board", () => {
     expect(screen.queryByRole("heading", { name: "Outputs" })).toBeNull();
     expect(screen.queryByRole("heading", { name: "Sessions" })).toBeNull();
     expect(screen.queryByRole("combobox", { name: "Output type" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Add plan" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Request review" })).toBeNull();
+    expect(screen.queryByRole("region", { name: "Ticket plan" })).toBeNull();
+    expect(screen.queryByRole("region", { name: "Human review" })).toBeNull();
   });
 
   it.each([
@@ -826,7 +848,8 @@ describe("Project ticket board", () => {
     });
   });
 
-  it("requests review and records feedback independently of the ticket stage", async () => {
+  it("edits an existing review and records feedback independently of the ticket stage", async () => {
+    ticket.review_summary = "Inspect the existing evidence.";
     const user = userEvent.setup();
     renderBoard(
       <ProjectTicketPanel
@@ -836,12 +859,15 @@ describe("Project ticket board", () => {
         onCreated={vi.fn()}
       />,
     );
-    await user.click(await screen.findByRole("button", { name: "Request review" }));
+    await user.click(await screen.findByRole("button", { name: "Edit review brief" }));
+    expect(screen.getByLabelText("Review brief")).toHaveValue("Inspect the existing evidence.");
+    fireEvent.change(screen.getByLabelText("Review brief"), { target: { value: "" } });
     expect(screen.getByRole("button", { name: "Send for review" })).toBeDisabled();
     fireEvent.change(screen.getByLabelText("Review brief"), {
       target: { value: "**Verified** tests. Please inspect the demo." },
     });
     await user.click(screen.getByRole("button", { name: "Send for review" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     const review = await screen.findByRole("region", { name: "Human review" });
     const disclosure = within(review).getByRole("button", { name: "Review brief" });
     expect(disclosure).toHaveAttribute("aria-expanded", "false");

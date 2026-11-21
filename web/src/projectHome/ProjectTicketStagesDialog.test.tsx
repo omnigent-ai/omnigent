@@ -252,6 +252,11 @@ describe("Project stage editor", () => {
     const user = userEvent.setup();
     renderEditor();
     fireEvent.click(await screen.findByRole("button", { name: "Remove Planning" }));
+    expect(screen.getByRole("button", { name: "Undo removal of Planning" })).toHaveTextContent(
+      /^Undo$/,
+    );
+    expect(screen.getByText("Planning", { selector: "strong" })).toBeInTheDocument();
+    expect(screen.queryByText(/^Removing /)).toBeNull();
     expect(screen.getByRole("button", { name: "Save stages" })).toBeDisabled();
     await user.click(screen.getByRole("combobox", { name: "Move tickets from Planning to" }));
     await user.click(screen.getByRole("option", { name: "Working" }));

@@ -1,4 +1,4 @@
-import { useRef } from "react";
+import { useId, useRef } from "react";
 import * as RadioGroup from "radix-ui/radio-group";
 import {
   CheckIcon,
@@ -19,6 +19,7 @@ import {
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import type { TicketStage, TicketStageColor, TicketStageIconName } from "@/lib/projectTicketsApi";
@@ -109,16 +110,49 @@ export function TicketStageIcon({
   return <Icon aria-hidden className={cn("size-3.5 shrink-0", color.text, className)} />;
 }
 
-export function TicketStageBadge({ stage }: { stage: TicketStage }) {
+export function TicketStageBadge({
+  stage,
+  showInstructionsOnHover = false,
+}: {
+  stage: TicketStage;
+  showInstructionsOnHover?: boolean;
+}) {
   const { color } = appearance(stage);
-  return (
+  const descriptionId = useId();
+  const hasInstructions = showInstructionsOnHover && !!stage.instructions;
+  const badge = (
     <Badge
-      className={cn("min-w-0 max-w-full shrink border-transparent", color.text, color.tint)}
-      title={stage.name}
+      className={cn(
+        "min-w-0 max-w-full shrink border-transparent",
+        color.text,
+        color.tint,
+        hasInstructions && "cursor-help",
+      )}
+      title={hasInstructions ? undefined : stage.name}
+      tabIndex={hasInstructions ? 0 : undefined}
+      aria-describedby={hasInstructions ? descriptionId : undefined}
     >
       <TicketStageIcon stage={stage} />
       <span className="truncate">{stage.name}</span>
     </Badge>
+  );
+  if (!hasInstructions) return badge;
+  return (
+    <HoverCard openDelay={150} closeDelay={100}>
+      <HoverCardTrigger asChild>{badge}</HoverCardTrigger>
+      <HoverCardContent
+        side="bottom"
+        align="start"
+        sideOffset={8}
+        collisionPadding={8}
+        className="max-h-(--radix-hover-card-content-available-height) w-72 max-w-(--radix-hover-card-content-available-width) overflow-y-auto wrap-anywhere px-3 py-2 text-sm"
+      >
+        <p className="font-medium">{stage.name}</p>
+        <p id={descriptionId} className="mt-1 whitespace-pre-wrap text-muted-foreground">
+          {stage.instructions}
+        </p>
+      </HoverCardContent>
+    </HoverCard>
   );
 }
 

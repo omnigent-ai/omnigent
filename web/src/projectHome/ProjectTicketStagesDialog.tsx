@@ -228,53 +228,50 @@ function StageEditor({
       {removed.map((stage) => (
         <div key={stage.id} className="space-y-2 rounded-lg border border-border/60 p-3 text-sm">
           <div className="flex items-center justify-between gap-2">
-            <p>
-              Removing <span className="font-medium">{stage.name}</span>. Tickets and history are
-              kept.
+            <p className="min-w-0 text-left wrap-anywhere">
+              Move tickets from <strong className="font-semibold">{stage.name}</strong> to
             </p>
             <Button
               type="button"
               variant="ghost"
               size="sm"
+              aria-label={`Undo removal of ${stage.name}`}
               disabled={pending || stages.length >= 20}
               onClick={() => setStages([...stages, stage])}
             >
-              Undo removal of {stage.name}
+              Undo
             </Button>
           </div>
-          <label className="grid gap-1.5">
-            Move tickets from {stage.name} to
-            <Select
-              value={stages.some((target) => target.id === moves[stage.id]) ? moves[stage.id] : ""}
-              disabled={pending}
-              onValueChange={(value) =>
-                setMoves({ ...moves, [stage.id]: value === NO_MOVE_DESTINATION ? "" : value })
-              }
-            >
-              <SelectTrigger aria-label={`Move tickets from ${stage.name} to`} className="w-full">
-                <SelectValue
-                  placeholder={
-                    occupied.has(stage.id)
-                      ? "Choose a stage…"
-                      : "No tickets currently — choose a fallback (optional)"
-                  }
-                />
-              </SelectTrigger>
-              <SelectContent position="popper">
-                <SelectItem value={NO_MOVE_DESTINATION}>
-                  {occupied.has(stage.id) ? "Choose a stage…" : "No fallback"}
+          <Select
+            value={stages.some((target) => target.id === moves[stage.id]) ? moves[stage.id] : ""}
+            disabled={pending}
+            onValueChange={(value) =>
+              setMoves({ ...moves, [stage.id]: value === NO_MOVE_DESTINATION ? "" : value })
+            }
+          >
+            <SelectTrigger aria-label={`Move tickets from ${stage.name} to`} className="w-full">
+              <SelectValue
+                placeholder={
+                  occupied.has(stage.id)
+                    ? "Choose a stage…"
+                    : "No tickets currently — choose a fallback (optional)"
+                }
+              />
+            </SelectTrigger>
+            <SelectContent position="popper">
+              <SelectItem value={NO_MOVE_DESTINATION}>
+                {occupied.has(stage.id) ? "Choose a stage…" : "No fallback"}
+              </SelectItem>
+              {stages.map((target, index) => (
+                <SelectItem key={target.id} value={target.id}>
+                  <TicketStageIcon
+                    stage={{ ...target, is_complete: index === stages.length - 1 }}
+                  />
+                  {target.name || "Unnamed stage"}
                 </SelectItem>
-                {stages.map((target, index) => (
-                  <SelectItem key={target.id} value={target.id}>
-                    <TicketStageIcon
-                      stage={{ ...target, is_complete: index === stages.length - 1 }}
-                    />
-                    {target.name || "Unnamed stage"}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </label>
+              ))}
+            </SelectContent>
+          </Select>
         </div>
       ))}
       {validation && <p className="text-sm text-muted-foreground">{validation}</p>}

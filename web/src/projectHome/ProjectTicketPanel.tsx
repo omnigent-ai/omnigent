@@ -568,19 +568,6 @@ function TicketDetails({
                   </p>
                 </TicketDisclosure>
               )}
-              {lifecycle && !ticket.review_summary && (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="-ml-2 text-muted-foreground"
-                  onClick={() => {
-                    update.reset();
-                    setReviewing(true);
-                  }}
-                >
-                  <PlusIcon aria-hidden /> Request review
-                </Button>
-              )}
               {ticket.completion_summary && (
                 <TicketDisclosure
                   title="Completion summary"
@@ -753,13 +740,7 @@ function TicketPlan({ projectId, ticket }: { projectId: string; ticket: ProjectT
     setEditing(true);
     setOpen(true);
   };
-  if (!editing && !ticket.plan)
-    return (
-      <Button variant="ghost" size="sm" className="-ml-2 text-muted-foreground" onClick={edit}>
-        <PlusIcon aria-hidden />
-        Add plan
-      </Button>
-    );
+  if (!editing && !ticket.plan) return null;
   return (
     <TicketDisclosure
       label="Ticket plan"

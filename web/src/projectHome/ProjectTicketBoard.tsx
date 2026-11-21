@@ -253,20 +253,12 @@ function TicketColumn({
       )}
     >
       <h2 className="flex shrink-0 items-center justify-between px-1.5 pt-1.5 pb-3 text-sm font-medium text-muted-foreground">
-        <TicketStageBadge stage={stage} />
+        <TicketStageBadge stage={stage} showInstructionsOnHover />
         <span className="tabular-nums">
           {tickets.length}
           {query.hasNextPage ? "+" : ""}
         </span>
       </h2>
-      {stage.instructions && (
-        <p
-          className="mb-2 line-clamp-2 px-1.5 text-xs text-muted-foreground"
-          title={stage.instructions}
-        >
-          {stage.instructions}
-        </p>
-      )}
       <div
         className="-mx-2 flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-2 pt-0.5 pb-2"
         style={{ paddingBottom: overlayClearance }}
