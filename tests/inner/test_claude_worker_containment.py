@@ -817,10 +817,8 @@ def cli_model_server(
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             requests.append({"path": self.path, "headers": dict(self.headers), "body": body})
-            nested_terminal = not body.get("tools") and "TERMINAL_NESTED_PROBE" in json.dumps(
-                body["messages"]
-            )
-            if replies and not nested_terminal:
+            # Background titles and nested inference must not consume foreground tool replies.
+            if replies and body.get("tools"):
                 next_reply = replies.pop(0)
                 blocks = next_reply() if callable(next_reply) else next_reply
             else:
