@@ -31,6 +31,7 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
 )
 from omnigent.host.workspace_git.comparison import (
     EMPTY_TREES,
+    MAXIMUM_COMMIT_BODY_BYTES,
     list_branch_commits,
     list_repository_refs,
 )
@@ -430,6 +431,39 @@ async def test_branch_commits_follow_a_detached_head_and_are_empty_on_the_base_i
     on_main = await _branch_commits(root, "main")
     assert not on_main.commits
     assert not on_main.base.HasField("unavailable")
+
+
+async def test_branch_commits_carry_each_messages_body_after_its_subject(tmp_path: Path) -> None:
+    root = _branches(tmp_path)
+    _commit(root, "Explain the parser\n\n  Why it reads ahead.\n\nA second paragraph.\n\n")
+    _commit(root, "Only a subject")
+    # A body may hold the listing's field separator; it stays part of the body.
+    _commit(root, "Odd body\n\nbefore\x1fafter")
+
+    odd, only_subject, explained, feature = (await _branch_commits(root, "main")).commits
+    assert explained.subject == "Explain the parser"
+    assert explained.body == "  Why it reads ahead.\n\nA second paragraph."
+    assert only_subject.body == ""
+    assert odd.subject == "Odd body"
+    assert odd.body == "before\x1fafter"
+    assert feature.subject == "feature work"
+
+
+async def test_a_long_commit_body_is_cut_at_a_character_within_the_limit(
+    tmp_path: Path,
+) -> None:
+    root = _branches(tmp_path)
+    # Three-byte characters, so the limit falls inside one.
+    body = "€" * (MAXIMUM_COMMIT_BODY_BYTES // 3 + 10)
+    _commit(root, f"Long\n\n{body}")
+
+    long_body = (await _branch_commits(root, "main")).commits[0].body
+    assert len(long_body.encode()) <= MAXIMUM_COMMIT_BODY_BYTES
+    # It ends in an ellipsis, after as many whole characters as fit before it.
+    assert long_body.endswith("…")
+    kept = long_body.removesuffix("…")
+    assert body.startswith(kept)
+    assert len(kept.encode()) > MAXIMUM_COMMIT_BODY_BYTES - 3 - 3
 
 
 async def test_branch_commits_stop_at_the_limit_and_say_so(tmp_path: Path) -> None:

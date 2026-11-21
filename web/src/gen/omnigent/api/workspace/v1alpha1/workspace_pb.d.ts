@@ -1254,6 +1254,15 @@ export declare type BranchCommit = Message<"omnigent.api.workspace.v1alpha1.Bran
    * @generated from field: bool root = 5;
    */
   root: boolean;
+
+  /**
+   * The message after the subject line, trimmed: at most 4096 bytes, cut
+   * at a character boundary. Empty when the message is the subject alone,
+   * and from hosts that predate this field.
+   *
+   * @generated from field: string body = 6;
+   */
+  body: string;
 };
 
 /**

@@ -70,7 +70,11 @@ MAXIMUM_REFS = 1_000
 MAXIMUM_BRANCH_COMMITS = 200
 # Remote HEADs a ref listing may skip while still filling its limit; one per remote.
 _REMOTE_HEAD_ALLOWANCE = 64
-_LOG_FORMAT = "--format=%H%x1f%P%x1f%at%x1f%an%x1f%s"
+_LOG_FORMAT = "--format=%H%x1f%P%x1f%at%x1f%an%x1f%s%x1f%b"
+# A commit message's body past this many bytes is cut, so a long one never fills the listing;
+# the cut one ends in an ellipsis, within the limit.
+MAXIMUM_COMMIT_BODY_BYTES = 4096
+_BODY_CUT_MARK = "…"
 
 
 def _checked_revision(text: str, field: ComparisonField) -> str | None:
@@ -323,15 +327,28 @@ async def list_repository_refs(
     )
 
 
+def _commit_body(text: str) -> str:
+    """A message's body, trimmed, and cut at a character within the body limit."""
+    body = text.strip("\n").rstrip()
+    encoded = body.encode("utf-8")
+    if len(encoded) <= MAXIMUM_COMMIT_BODY_BYTES:
+        return body
+    budget = MAXIMUM_COMMIT_BODY_BYTES - len(_BODY_CUT_MARK.encode("utf-8"))
+    # A character cut in two at the budget is left out whole.
+    return encoded[:budget].decode("utf-8", "ignore").rstrip() + _BODY_CUT_MARK
+
+
 def _parse_commits(output: bytes) -> list[BranchCommit]:
     """Commits from ``log -z`` records in :data:`_LOG_FORMAT`; malformed records are skipped."""
     commits: list[BranchCommit] = []
     for record in output.decode("utf-8", "replace").split("\0"):
-        fields = record.lstrip("\n").split("\x1f", 4)
+        # The body comes last, so a separator inside it stays part of it.
+        fields = record.lstrip("\n").split("\x1f", 5)
         if len(fields) < 4 or not is_object_name(fields[0]):
             continue
         object_name, parents, time_text, author_name = fields[:4]
         subject = fields[4] if len(fields) > 4 else ""
+        body = _commit_body(fields[5]) if len(fields) > 5 else ""
         commits.append(
             BranchCommit(
                 object=object_name,
@@ -339,6 +356,7 @@ def _parse_commits(output: bytes) -> list[BranchCommit]:
                 author_name=author_name,
                 author_time_unix=int(time_text) if time_text.isdigit() else 0,
                 root=not parents.strip(),
+                body=body,
             )
         )
     return commits
