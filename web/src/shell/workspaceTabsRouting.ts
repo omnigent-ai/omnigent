@@ -21,6 +21,11 @@ let workspaceTabsModule: Promise<WorkspaceTabsModule> | null = null;
 /** The tabs sidebar's host, loaded when it first shows. */
 export const LazyWorkspaceTabsHost = lazy(() => import("./workspaceTabs/WorkspaceTabsHost"));
 
+/** Carries out the file actions the tabs sidebar's menus and ⌘K ask for; loaded with the sidebar. */
+export const LazyFileActionHost = lazy(() =>
+  import("./fileCommands/FileActionHost").then((module) => ({ default: module.FileActionHost })),
+);
+
 export { useTabsSidebar } from "./useTabsSidebar";
 
 /** Said when the tabs code can't load, such as after an update replaced it, or an open fails. */

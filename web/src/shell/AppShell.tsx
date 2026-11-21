@@ -3,6 +3,7 @@ import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import { GridSessionsProvider, useGridSessions } from "@/grid/GridSessionsContext";
 import { GridWorkspace } from "@/grid/GridWorkspace";
 import {
+  LazyFileActionHost,
   LazyWorkspaceTabsHost,
   routeToWorkspaceTabs,
   showAgentBrowserTab,
@@ -3234,6 +3235,12 @@ function AppShellImpl() {
       }}
       fileViewer={fileViewerContextValue}
     >
+      {/* One for the whole window, so a grid of sidebars runs each request once. */}
+      {tabsSidebar && (
+        <Suspense fallback={null}>
+          <LazyFileActionHost />
+        </Suspense>
+      )}
       <TerminalFirstContextProvider value={terminalFirstContextValue}>
         <ForkDialogContextProvider value={forkDialogContextValue}>
           {/* `app-shell` paints the shared canvas behind the sidebar and

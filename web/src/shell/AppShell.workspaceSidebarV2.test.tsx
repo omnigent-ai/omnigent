@@ -70,6 +70,10 @@ vi.mock("@/components/BrowserPane/agentTools/tabStore", async (importOriginal) =
 }));
 
 // A draft typed into the host stands for its editors' unsaved text, which a remount loses.
+// The file action host has its own suite; these tests check that it mounts only with the flag.
+vi.mock("./fileCommands/FileActionHost", () => ({
+  FileActionHost: () => <div data-testid="file-action-host" />,
+}));
 vi.mock("./workspaceTabs/WorkspaceTabsHost", () => ({
   default: (props: WorkspaceTabsHostProps) => {
     tabs.host = props;
@@ -375,6 +379,8 @@ describe("workspace_sidebar_v2", () => {
     expect(await screen.findByTestId("tabs-host")).toBeInTheDocument();
     expect(screen.queryByRole("tab", { name: /^Files$/ })).toBeNull();
     expect(tabs.host).toMatchObject({ conversationId: "conv_ws", terminals: [] });
+    // One file action host carries out what the sidebar's file menus and ⌘K ask for.
+    expect(await screen.findAllByTestId("file-action-host")).toHaveLength(1);
   });
 
   it.each([
@@ -387,6 +393,7 @@ describe("workspace_sidebar_v2", () => {
 
     expect(screen.getByRole("tab", { name: /^Files$/ })).toBeInTheDocument();
     expect(screen.queryByTestId("tabs-host")).toBeNull();
+    expect(screen.queryByTestId("file-action-host")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Open linked PR" }));
     fireEvent.click(screen.getByRole("button", { name: "Open cited file" }));
     expectTabsUntouched();
