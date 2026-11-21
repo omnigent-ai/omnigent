@@ -69,7 +69,12 @@ class HangingOmnigentClient:
         return SessionInfo(harness="claude-native", agent_name="debby")
 
     async def create_session(
-        self, agent_id: str, title: str, *, host_type: str = "external"
+        self,
+        agent_id: str,
+        title: str,
+        *,
+        host_type: str = "external",
+        mcp_registry_services: tuple[str, ...] = (),
     ) -> str:
         return "conv_1"
 

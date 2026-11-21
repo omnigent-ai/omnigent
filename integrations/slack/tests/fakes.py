@@ -220,6 +220,11 @@ OMNIGENT_ENDPOINTS: list[tuple[str, str, bool]] = [
     ("GET", "/v1/agents", True),
     ("GET", "/v1/hosts", True),
     ("GET", "/v1/hosts/{host_id}/filesystem", True),
+    # MCP registry catalog (list_mcp_registry_services, setup-time). Marked
+    # internal, not documented: the router is only mounted when a registry is
+    # configured, so the dumped openapi.json (no registry) omits it — even
+    # though the endpoint itself is documented in designs/MCP_REGISTRY_API.md.
+    ("GET", "/v1/mcp-registry/services", False),
     # Session lifecycle.
     ("POST", "/v1/sessions", True),
     ("DELETE", "/v1/sessions/{session_id}", True),
@@ -303,6 +308,9 @@ class FakeOmnigentServer:
         # decides whether setup offers a server-provisioned host at all.
         self.managed_sandboxes_enabled = False
         self.sandbox_provider: str | None = None
+        # MCP registry catalog reported by GET /v1/mcp-registry/services — the
+        # services setup can offer to pin. Empty by default: no MCP choice.
+        self.mcp_services: list[dict[str, Any]] = []
         self.session_id = "conv_1"
         self.runner_id = "runner_1"
         self.harness = "claude-native"
@@ -374,6 +382,11 @@ class FakeOmnigentServer:
             side_effect=self._auth_wall_or({"data": self.agents})
         )
         respx_mock.get(b + "/v1/hosts").mock(side_effect=self._auth_wall_or({"hosts": self.hosts}))
+
+        # MCP registry catalog (auth-gated, like agents/hosts).
+        respx_mock.get(b + "/v1/mcp-registry/services").mock(
+            side_effect=self._auth_wall_or({"data": self.mcp_services})
+        )
 
         # Login-mode probe + device grant (only hit when a login starts).
         def _me(request: httpx.Request) -> httpx.Response:
