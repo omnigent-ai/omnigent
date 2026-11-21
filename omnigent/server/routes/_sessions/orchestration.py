@@ -5822,7 +5822,7 @@ async def _maybe_relaunch_managed_sandbox(
             return False
     launch = tracker.get(session_id)
     if launch is None or launch.settled.is_set():
-        _raise_if_managed_wake_misses_host_tunnel(
+        await _raise_if_managed_wake_misses_host_tunnel(
             conv=conv, host=host, request=request, app_state=app_state
         )
         if keyed_wake is None:
@@ -5893,12 +5893,9 @@ def _managed_wake_is_keyed(conv: Conversation, request: Any) -> bool:
     """
     Whether a wake keeps the session's managed host routed by the host's own id.
 
-    The host is keyed when the create chose its id (the session's label says so),
-    or, on a host-sharded deployment, when the client request driving the wake is
-    routed by that id: a client that knows the host routes by it even on a
-    session that joined the host later. A keyless request or a server-internal
-    wake of an unlabelled host keeps it on the default replica, as before host
-    sharding.
+    Keyed when the session's label names the host, or, on a host-sharded
+    deployment, when the request is routed by the host's id (as from a session
+    that joined the host later). Otherwise the host stays on the default route.
 
     :param conv: Session row whose host is waking.
     :param request: The client request, or ``None``/a non-HTTP context for a
@@ -5921,7 +5918,33 @@ def _managed_wake_is_keyed(conv: Conversation, request: Any) -> bool:
     )
 
 
-def _raise_if_managed_wake_misses_host_tunnel(
+async def _managed_host_connected_elsewhere(
+    conv: Conversation, host: Host, app_state: Any
+) -> bool:
+    """
+    Whether a managed host with no tunnel on this replica is connected on another one.
+
+    Its row reads live, no wake for the session is in flight here, and its provider
+    does not report the sandbox stopped. A provider's answer outranks the row's
+    heartbeat, which stays fresh for a while after a host's tunnel is gone.
+
+    :param conv: Session row whose host may need a wake.
+    :param host: The session's managed host row.
+    :param app_state: ``request.app.state`` — supplies the tracker and sandbox config.
+    :returns: ``True`` when waking the host would restart a connected host.
+    """
+    if not host_is_live(host):
+        return False
+    tracker = getattr(app_state, "managed_launches", None)
+    launch = tracker.get(conv.id) if tracker is not None else None
+    if launch is not None and not launch.settled.is_set():
+        return False
+    sandbox_config = getattr(app_state, "sandbox_config", None)
+    running = await asyncio.to_thread(host_sandbox_is_running, host, sandbox_config)
+    return running is not False
+
+
+async def _raise_if_managed_wake_misses_host_tunnel(
     *,
     conv: Conversation,
     host: Host,
@@ -5936,9 +5959,10 @@ def _raise_if_managed_wake_misses_host_tunnel(
     default route. A wake run from any other replica lands its tunnel elsewhere,
     so the request parks for the whole wake. Answer ``WRONG_REPLICA`` first so
     the client re-addresses to the key that starts the wake where the tunnel
-    lands. A host that is live with no tunnel here is connected on another
-    replica; force-waking it would restart it under every session it serves, so
-    the request is re-addressed instead. Only a fastapi ``Request`` names a
+    lands. A host connected on another replica (see
+    :func:`_managed_host_connected_elsewhere`) is never force-woken, which would
+    restart it under every session it serves; the request is re-addressed
+    instead. Only a fastapi ``Request`` names a
     routing key; internal callers pass nothing and skip this check.
 
     :param conv: Session row whose host may need a wake.
@@ -5963,7 +5987,8 @@ def _raise_if_managed_wake_misses_host_tunnel(
         return
     keyed = _managed_wake_is_keyed(conv, request)
     routed_key = routed_slice_key(request)
-    if routed_key == (conv.host_id if keyed else None) and not host_is_live(host):
+    connected_elsewhere = await _managed_host_connected_elsewhere(conv, host, app_state)
+    if routed_key == (conv.host_id if keyed else None) and not connected_elsewhere:
         return
     if routed_key != conv.host_id and (keyed or routed_key is None):
         raise WrongReplicaError(
@@ -6008,7 +6033,7 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
     host = await asyncio.to_thread(host_store.get_host, conv.host_id)
     if host is None or not host_resume_supported(host, sandbox_config):
         return False
-    _raise_if_managed_wake_misses_host_tunnel(
+    await _raise_if_managed_wake_misses_host_tunnel(
         conv=conv, host=host, request=request, app_state=app_state
     )
     host_registry = cast(HostRegistry | None, getattr(app_state, "host_registry", None))
@@ -6043,10 +6068,6 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
 
     if host_registry is not None:
         host_registry.deregister(conv.host_id)
-    if host_conn is not None:
-        # The tunnel's own close no longer finds its connection to mark the row
-        # offline, so a fresh row would read as the host live on another replica.
-        await asyncio.to_thread(host_store.set_offline, conv.host_id)
     if tunnel_registry is not None and conv.runner_id is not None:
         # A stale tunnel is torn down, not handed to another replica.
         tunnel_registry.deregister(conv.runner_id, retire=False)

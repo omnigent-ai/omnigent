@@ -302,14 +302,39 @@ async def test_host_keyed_request_to_a_host_live_on_the_default_route_is_sent_ba
 
 
 @pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)
+@pytest.mark.parametrize("labelled", [True, False], ids=["create", "joined"])
+async def test_host_keyed_request_wakes_a_paused_host_whose_row_still_reads_live(
+    two_replica_stack: Any,
+    managed_wake: Any,
+    db_uri: str,
+    labelled: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A replica died with the host's tunnel: no replica holds it, but the row is still fresh."""
+    arrange, events = managed_wake
+    session_id = await arrange(keyed=labelled)
+    HostStore(db_uri).upsert_on_connect(HOST_ID, "managed-wake-host", OWNER)
+    monkeypatch.setattr(orchestration, "host_sandbox_is_running", lambda _host, _config: False)
+
+    response = await two_replica_stack.tunnel_client.post(
+        f"/v1/sessions/{session_id}/events", headers=_headers(HOST_ID), json=MESSAGE
+    )
+
+    assert not _wrong_replica(response), response.text
+    assert events.index("resume") < events.index("launch") < events.index("ready"), events
+    assert "slice_key_enabled=True" in events, events
+
+
+@pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)
 async def test_host_keyed_retry_after_a_failed_wake_of_a_stale_local_tunnel_wakes_again(
     two_replica_stack: Any, managed_wake: Any, db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Tearing down this replica's stale tunnel leaves no row that reads as live elsewhere."""
+    """After a failed wake, the provider's paused sandbox outranks the row's fresh heartbeat."""
     from fastapi import HTTPException
 
     arrange, events = managed_wake
     session_id = await arrange(keyed=True)
+    monkeypatch.setattr(orchestration, "host_sandbox_is_running", lambda _host, _config: False)
     HostStore(db_uri).upsert_on_connect(HOST_ID, "managed-wake-host", OWNER)
     connection = two_replica_stack.tunnel_replica.state.host_registry.register(
         HOST_ID,
