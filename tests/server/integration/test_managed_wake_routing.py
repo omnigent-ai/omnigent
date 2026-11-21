@@ -282,6 +282,58 @@ async def test_live_local_tunnel_bypasses_the_guard(
 
 
 @pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)
+@pytest.mark.parametrize("slice_key", [HOST_ID, None])
+async def test_bundle_session_joining_a_managed_host_records_how_it_routes(
+    two_replica_stack: Any, db_uri: str, monkeypatch: pytest.MonkeyPatch, slice_key: str | None
+) -> None:
+    """A bundle create on a live managed host routes its wakes the way its create reached it."""
+    host_registry = two_replica_stack.tunnel_replica.state.host_registry
+
+    def answer_host(connection: Any, payload: str) -> None:
+        frame = decode_host_frame(payload)
+        if isinstance(frame, HostStatFrame):
+            connection.pending_stats[frame.request_id].set_result(
+                {"status": "ok", "exists": True, "type": "directory", "canonical_path": frame.path}
+            )
+        elif isinstance(frame, HostLaunchRunnerFrame):
+            connection.pending_launches[frame.request_id].set_result({"status": "launched"})
+
+    monkeypatch.setattr(host_registry, "send_text", answer_host)
+    host_registry.register(
+        HOST_ID,
+        AsyncMock(),
+        HostHelloFrame(version="test", frame_protocol_version=1, name="live", runners=[]),
+        owner=None,
+        registered_with_managed_token=True,
+    )
+    host_store = HostStore(db_uri)
+    host_store.register_managed_host(
+        host_id=HOST_ID,
+        name="managed-wake-host",
+        user_id=OWNER,
+        token="tok-managed-wake",
+        provider="modal",
+        sandbox_id="sb-managed-wake",
+        token_expires_at=9_999_999_999,
+    )
+    host_store.upsert_on_connect(host_id=HOST_ID, name="managed-wake-host", user_id=OWNER)
+
+    response = await two_replica_stack.tunnel_client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({"host_id": HOST_ID, "workspace": "/worker"})},
+        files={
+            "bundle": ("agent.tar.gz", build_agent_bundle(name="wake-agent"), "application/gzip")
+        },
+        headers=_headers(slice_key),
+    )
+
+    assert response.status_code == 201, response.text
+    created = two_replica_stack.conv_store.get_conversation(response.json()["session_id"])
+    assert created is not None
+    assert created.labels.get(REQUESTED_HOST_ID_LABEL_KEY) == slice_key
+
+
+@pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)
 async def test_non_resumable_relaunch_is_rerouted_before_the_kick(
     two_replica_stack: Any, managed_wake: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -375,55 +427,3 @@ async def test_session_joining_a_keyed_host_wakes_it_by_its_key(
 
     assert not _wrong_replica(response), response.text
     assert events.index("resume") < events.index("launch") < events.index("ready"), events
-
-
-@pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)
-@pytest.mark.parametrize("slice_key", [HOST_ID, None])
-async def test_bundle_session_joining_a_managed_host_records_how_it_routes(
-    two_replica_stack: Any, db_uri: str, monkeypatch: pytest.MonkeyPatch, slice_key: str | None
-) -> None:
-    """A bundle create on a live managed host routes its wakes the way its create reached it."""
-    host_registry = two_replica_stack.tunnel_replica.state.host_registry
-
-    def answer_host(connection: Any, payload: str) -> None:
-        frame = decode_host_frame(payload)
-        if isinstance(frame, HostStatFrame):
-            connection.pending_stats[frame.request_id].set_result(
-                {"status": "ok", "exists": True, "type": "directory", "canonical_path": frame.path}
-            )
-        elif isinstance(frame, HostLaunchRunnerFrame):
-            connection.pending_launches[frame.request_id].set_result({"status": "launched"})
-
-    monkeypatch.setattr(host_registry, "send_text", answer_host)
-    host_registry.register(
-        HOST_ID,
-        AsyncMock(),
-        HostHelloFrame(version="test", frame_protocol_version=1, name="live", runners=[]),
-        owner=None,
-        registered_with_managed_token=True,
-    )
-    host_store = HostStore(db_uri)
-    host_store.register_managed_host(
-        host_id=HOST_ID,
-        name="managed-wake-host",
-        user_id=OWNER,
-        token="tok-managed-wake",
-        provider="modal",
-        sandbox_id="sb-managed-wake",
-        token_expires_at=9_999_999_999,
-    )
-    host_store.upsert_on_connect(host_id=HOST_ID, name="managed-wake-host", user_id=OWNER)
-
-    response = await two_replica_stack.tunnel_client.post(
-        "/v1/sessions",
-        data={"metadata": json.dumps({"host_id": HOST_ID, "workspace": "/worker"})},
-        files={
-            "bundle": ("agent.tar.gz", build_agent_bundle(name="wake-agent"), "application/gzip")
-        },
-        headers=_headers(slice_key),
-    )
-
-    assert response.status_code == 201, response.text
-    created = two_replica_stack.conv_store.get_conversation(response.json()["session_id"])
-    assert created is not None
-    assert created.labels.get(REQUESTED_HOST_ID_LABEL_KEY) == slice_key
