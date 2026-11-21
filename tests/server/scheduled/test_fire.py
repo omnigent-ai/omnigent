@@ -54,6 +54,7 @@ from omnigent.server.scheduled.fire import (
     BUSY_QUIET_SECONDS,
     BUSY_RECHECK_SECONDS,
     BUSY_SKIP_MAX_SECONDS,
+    CONTEXT_FULL_ERROR_CODE,
     FireDeps,
     build_busy_until,
     build_on_fire,
@@ -3796,6 +3797,22 @@ async def test_continue_fails_when_the_owner_no_longer_owns_the_session() -> Non
     assert [(run["status"], run["error_code"]) for run in store.runs] == [
         ("failed", "continued_session_forbidden")
     ]
+
+
+@pytest.mark.asyncio
+async def test_continue_fails_without_sending_when_the_session_context_is_full() -> None:
+    """A session whose last turn overflowed its context window gets no further prompt."""
+    conv_store = _ExistingConversationStore(
+        _continued_session(labels={"omnigent.last_task_error_code": "context_length_exceeded"})
+    )
+    store = FakeScheduledTaskStore(rows={"task_1": _continuing_task()})
+
+    launched = await _fire_once(_deps(store, conversation_store=conv_store))
+
+    assert launched == []
+    [run] = store.runs
+    assert (run["status"], run["error_code"]) == ("failed", CONTEXT_FULL_ERROR_CODE)
+    assert "/compact" in run["error"]
 
 
 def _running_run(fired_at: int) -> ScheduledTaskRun:

@@ -1289,6 +1289,7 @@ def _recovery_hint(task: ScheduledTask) -> str:
 
 
 UNATTENDED_PERMISSION_ERROR_CODE = "permission_mode_not_allowed"
+CONTEXT_FULL_ERROR_CODE = "continued_session_context_full"
 
 # Launch flags that start a native CLI without an approval gate, for sessions whose
 # live mode has no label; Codex's full bypass is what spec-derived args emit for ``yolo``.
@@ -1358,7 +1359,8 @@ async def continued_session_problem(
     """Why ``conv`` cannot take *task*'s prompts, with an error code, or ``None`` if it can.
 
     Checked when the owner picks a session and again on every firing, since the
-    session and the task can both change in between.
+    session and the task can both change in between. A session whose last turn
+    overflowed its context window cannot take prompts until it is compacted.
     """
     if conv is None:
         return "the session no longer exists", "continued_session_missing"
@@ -1444,6 +1446,15 @@ async def continued_session_problem(
                 f"the session runs {where}, unlike the automation's execution target",
                 "continued_session_incompatible",
             )
+    from omnigent.server.routes._sessions.common import _LAST_TASK_ERROR_CODE_LABEL_KEY
+
+    # Another prompt would fail the same way and only add to the full history.
+    if conv.labels.get(_LAST_TASK_ERROR_CODE_LABEL_KEY) == "context_length_exceeded":
+        return (
+            "the session's context window is full, so every prompt fails until /compact "
+            "runs in it",
+            CONTEXT_FULL_ERROR_CODE,
+        )
     return None
 
 
