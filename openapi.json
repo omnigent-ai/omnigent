@@ -8282,6 +8282,11 @@
             "title": "Server Version",
             "type": "string"
           },
+          "session_archive_runner_checks": {
+            "default": false,
+            "title": "Session Archive Runner Checks",
+            "type": "boolean"
+          },
           "session_bundle_model_override": {
             "default": true,
             "title": "Session Bundle Model Override",
