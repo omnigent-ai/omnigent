@@ -12,7 +12,7 @@ import uuid
 import httpx
 from playwright.sync_api import Browser, BrowserContext, Locator, Page, expect
 
-from tests.e2e_ui._touch import center, new_touch_context, touch
+from tests.e2e_ui._touch import center, ensure_sidebar_open, new_touch_context, touch
 from tests.e2e_ui.conftest import set_session_title
 
 _MOBILE_VIEWPORT = {"width": 390, "height": 844}
@@ -78,13 +78,10 @@ def test_released_swipe_archives_without_navigating_and_stationary_tap_navigates
     try:
         page = context.new_page()
         page.goto(f"{base_url}/?sidebar=open")
+        ensure_sidebar_open(page)
         link = _row_link(page, session_id)
         expect(link).to_be_visible()
         expect(link.locator("xpath=ancestor::li[1]")).to_have_css("touch-action", "pan-y")
-        page.wait_for_function(
-            """() => Math.abs(document.querySelector('aside[aria-label="Conversations"]')
-                .getBoundingClientRect().left) < 0.01"""
-        )
         x, y = center(link)
 
         cdp = page.context.new_cdp_session(page)
@@ -94,15 +91,12 @@ def test_released_swipe_archives_without_navigating_and_stationary_tap_navigates
             page.wait_for_url(f"**/c/{session_id}")
 
             page.goto(f"{base_url}/?sidebar=open")
+            ensure_sidebar_open(page)
             link = _row_link(page, session_id)
             expect(link).to_be_visible()
             row = link.locator("xpath=ancestor::li[1]")
             surface = row.get_by_test_id("conversation-swipe-surface")
             expect(row).to_have_css("touch-action", "pan-y")
-            page.wait_for_function(
-                """() => Math.abs(document.querySelector('aside[aria-label="Conversations"]')
-                    .getBoundingClientRect().left) < 0.01"""
-            )
             x, y = center(link)
             touch(cdp, "touchStart", x, y)
             for offset in (16, 32, 50, 74, 90):
@@ -151,6 +145,7 @@ def test_still_touch_opens_session_context_menu_without_dragging(
     try:
         page = context.new_page()
         page.goto(f"{base_url}/c/{session_id}?sidebar=open")
+        ensure_sidebar_open(page)
 
         link = _row_link(page, session_id)
         expect(link).to_be_visible()
@@ -197,6 +192,7 @@ def test_vertical_touch_scroll_still_works_on_session_row(
     try:
         page = context.new_page()
         page.goto(f"{base_url}/c/{session_id}?sidebar=open")
+        ensure_sidebar_open(page)
 
         link = _row_link(page, session_id)
         expect(link).to_be_visible()
@@ -251,6 +247,7 @@ def test_horizontal_swipe_wins_before_hold_while_vertical_motion_yields_to_scrol
         page = context.new_page()
         page.clock.install()
         page.goto(f"{base_url}/c/{session_id}?sidebar=open")
+        ensure_sidebar_open(page)
         link = _row_link(page, session_id)
         expect(link).to_be_visible()
         row = link.locator("xpath=ancestor::li[1]")
@@ -302,6 +299,7 @@ def test_pointercancel_resets_menu_and_drag_then_allows_another_hold(
     try:
         page = context.new_page()
         page.goto(f"{base_url}/c/{session_id}?sidebar=open")
+        ensure_sidebar_open(page)
         link = _row_link(page, session_id)
         expect(link).to_be_visible()
         row = link.locator("xpath=ancestor::li[1]")
@@ -346,6 +344,7 @@ def test_lost_pointer_capture_resets_swipe_and_allows_another_swipe(
     try:
         page = context.new_page()
         page.goto(f"{base_url}/c/{session_id}?sidebar=open")
+        ensure_sidebar_open(page)
         link = _row_link(page, session_id)
         expect(link).to_be_visible()
         row = link.locator("xpath=ancestor::li[1]")
@@ -418,6 +417,7 @@ def test_touch_drag_moves_session_into_project(
     try:
         page = context.new_page()
         page.goto(f"{base_url}/c/{session_id}?sidebar=open")
+        ensure_sidebar_open(page)
 
         link = _row_link(page, session_id)
         header = page.get_by_role("button", name=project, exact=True)

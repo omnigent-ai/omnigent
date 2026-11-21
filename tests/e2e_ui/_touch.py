@@ -8,10 +8,13 @@ semantics), exactly as a finger would.
 from __future__ import annotations
 
 import os
+import re
 import time
 from typing import Any
 
-from playwright.sync_api import Browser, BrowserContext, CDPSession, Locator, Page
+from playwright.sync_api import Browser, BrowserContext, CDPSession, Locator, Page, expect
+
+from tests._helpers.polling import poll_until
 
 _TOUCH_ID = 1
 
@@ -64,6 +67,56 @@ def touch_drag_between(page: Page, start: tuple[float, float], end: tuple[float,
         touch_drag(cdp, start, [(end[0] - start[0], end[1] - start[1])], step_pause_s=0)
     finally:
         cdp.detach()
+
+
+_SIDEBAR_LEFT_SCRIPT = """() => {
+    const aside = document.querySelector('aside[aria-label="Conversations"]');
+    return aside === null ? null : aside.getBoundingClientRect().left;
+}"""
+
+
+def _sidebar_left(page: Page) -> float | None:
+    return page.evaluate(_SIDEBAR_LEFT_SCRIPT)
+
+
+def _sidebar_at_left_edge(page: Page) -> bool:
+    left = _sidebar_left(page)
+    return left is not None and abs(left) < 0.01
+
+
+def _settled_sidebar_left(page: Page, *, timeout_s: float = 10.0) -> float:
+    """The sidebar's left edge once it has stopped moving.
+
+    Sampled from here rather than from page timers or animation frames, so a
+    journey's fake page clock cannot stall it.
+    """
+    deadline = time.monotonic() + timeout_s
+    last = _sidebar_left(page)
+    while True:
+        time.sleep(0.25)
+        now = _sidebar_left(page)
+        if now is not None and last is not None and abs(now - last) < 0.01:
+            return now
+        assert time.monotonic() < deadline, f"the session sidebar never settled (left={now})"
+        last = now
+
+
+def ensure_sidebar_open(page: Page, *, timeout_s: float = 10.0) -> None:
+    """Leave the session sidebar fully open before a journey measures its rows.
+
+    ``?sidebar=open`` is a one-shot request: AppShell applies it, strips it from
+    the URL, and can still leave a narrow drawer closed. Once the request has
+    been consumed and the drawer has stopped moving, a closed drawer gets the
+    same "Open sidebar" tap a person would give it.
+    """
+    expect(page).not_to_have_url(re.compile(r"[?&]sidebar="), timeout=timeout_s * 1000)
+    if abs(_settled_sidebar_left(page, timeout_s=timeout_s)) >= 0.01:
+        button = page.get_by_role("button", name="Open sidebar", exact=True)
+        if page.evaluate("navigator.maxTouchPoints > 0"):
+            button.tap()
+        else:
+            button.click()
+    poll_until(lambda: _sidebar_at_left_edge(page), timeout_s=timeout_s, interval_s=0.05)
 
 
 def center(locator: Locator) -> tuple[float, float]:

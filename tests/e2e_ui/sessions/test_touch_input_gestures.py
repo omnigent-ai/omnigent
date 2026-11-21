@@ -10,7 +10,7 @@ import pytest
 from playwright.sync_api import Browser, CDPSession, Page, expect
 
 from tests._helpers.polling import poll_until
-from tests.e2e_ui._touch import new_touch_context, touch, touch_drag
+from tests.e2e_ui._touch import ensure_sidebar_open, new_touch_context, touch, touch_drag
 from tests.e2e_ui.conftest import set_session_title
 
 _DESKTOP_VIEWPORT = {"width": 1280, "height": 800}
@@ -86,14 +86,11 @@ def test_session_row_swipe_tracks_finger(
         page = context.new_page()
         page.emulate_media(reduced_motion=reduced_motion)
         page.goto(f"{base_url}/c/{session_id}?sidebar=open")
+        ensure_sidebar_open(page)
 
         row_link = page.locator(f'a[href="/c/{session_id}"]')
         expect(row_link).to_be_visible()
         expect(row_link.locator("xpath=ancestor::li[1]")).to_have_css("touch-action", "pan-y")
-        page.wait_for_function(
-            """() => Math.abs(document.querySelector('aside[aria-label="Conversations"]')
-                .getBoundingClientRect().left) < 0.01"""
-        )
         measure = """sessionId => {
             const link = document.querySelector(`a[href="/c/${sessionId}"]`);
             const surface = link.closest('[data-testid="conversation-swipe-surface"]');
@@ -155,6 +152,7 @@ def test_session_row_left_swipe_opens_default_delete_confirmation(
         page = context.new_page()
 
         page.goto(f"{base_url}/c/{session_id}?sidebar=open")
+        ensure_sidebar_open(page)
 
         row_link = page.locator(f'a[href="/c/{session_id}"]')
         expect(row_link).to_be_visible()
@@ -197,12 +195,9 @@ def test_session_row_swipe_reversal_keeps_action_colors(
         page = context.new_page()
         page.emulate_media(reduced_motion="no-preference")
         page.goto(f"{base_url}/c/{session_id}?sidebar=open")
+        ensure_sidebar_open(page)
         row_link = page.locator(f'a[href="/c/{session_id}"]')
         expect(row_link).to_be_visible()
-        page.wait_for_function(
-            """() => Math.abs(document.querySelector('aside[aria-label="Conversations"]')
-                .getBoundingClientRect().left) < 0.01"""
-        )
         frame = row_link.locator("xpath=ancestor::li[1]")
         frame.evaluate(
             """frame => {
@@ -306,6 +301,7 @@ def test_session_row_long_press_opens_actions_menu(
     try:
         page = context.new_page()
         page.goto(f"{base_url}/c/{session_id}?sidebar=open")
+        ensure_sidebar_open(page)
 
         row_link = page.locator(f'a[href="/c/{session_id}"]')
         expect(row_link).to_be_visible()
@@ -337,6 +333,7 @@ def test_row_actions_use_long_press_on_unfolded_foldable(
         page = context.new_page()
         # Below md the sidebar starts closed; its docked mobile layout opens on request.
         page.goto(f"{base_url}/c/{session_id}?sidebar=open")
+        ensure_sidebar_open(page)
 
         # This context reports itself as touch-only, exactly like a real
         # unfolded foldable; the layout follows its width, not its pointer.

@@ -17,6 +17,7 @@ import pytest
 from playwright.sync_api import Browser, Locator, Page, expect
 
 from tests._helpers.session import post_session_bundle
+from tests.e2e_ui._touch import ensure_sidebar_open
 from tests.e2e_ui.conftest import _build_hello_world_bundle, set_session_title
 
 _SWIPE_ACTIONS_KEY = "omnigent:swipe-actions"
@@ -209,12 +210,9 @@ def test_session_row_keyboard_focus_outline_is_not_clipped(
     base_url, session_id = seeded_session
     page.set_viewport_size({"width": width, "height": 800})
     page.goto(f"{base_url}/c/{session_id}?sidebar=open")
+    ensure_sidebar_open(page)
     link = _row(page, session_id).locator(f'a[href="/c/{session_id}"]')
     expect(link).to_be_visible()
-    page.wait_for_function(
-        """() => Math.abs(document.querySelector('aside[aria-label="Conversations"]')
-            .getBoundingClientRect().left) < 0.01"""
-    )
     for _ in range(60):
         page.keyboard.press("Tab")
         if link.evaluate("element => element === document.activeElement"):
