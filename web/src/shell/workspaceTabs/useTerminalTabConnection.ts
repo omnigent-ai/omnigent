@@ -9,9 +9,11 @@ import type { SandboxResumeNoticeState } from "@/components/SandboxResumeNotice"
 import { useSandboxResume } from "@/hooks/useSandboxResume";
 import { useSession } from "@/hooks/useSession";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
+import { getCliServerUrl } from "@/lib/host";
 import { retrySession } from "@/lib/sessionsApi";
 import { terminalsQueryKey } from "@/lib/terminals";
 import { useCommandSession } from "@/shell/commandContext";
+import { buildReconnectCommand } from "@/shell/ReconnectSessionDialog";
 import { resumeSandboxAvailability } from "@/shell/resumeSandboxAvailability";
 
 import type { ShellWaits } from "./shellWaits";
@@ -77,6 +79,8 @@ export interface TerminalTabConnections {
   resumeSession: () => Promise<void>;
   /** A session Resume is on its way. */
   resumingSession: boolean;
+  /** The command that relaunches the session when it isn't host-bound and its runner stopped. */
+  localReconnectCommand: string;
 }
 
 /** ``sessionId``'s shell tab connections, timed by the waits its tab store keeps. */
@@ -194,5 +198,12 @@ export function useTerminalTabConnections(
     },
     resumeSession,
     resumingSession,
+    localReconnectCommand: buildReconnectCommand({
+      conversationId: sessionId,
+      serverUrl: getCliServerUrl(),
+      wrapper: session?.labels?.["omnigent.wrapper"],
+      harness: session?.harness,
+      state: "local_stranded",
+    }),
   };
 }

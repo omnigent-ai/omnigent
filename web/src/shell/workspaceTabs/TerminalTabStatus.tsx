@@ -10,6 +10,8 @@ import {
 } from "@/components/SandboxResumeNotice";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
+import { CliCommandBlock } from "@/shell/CliCommandBlock";
+import { LOCAL_RECONNECT_DESCRIPTION, LOCAL_RECONNECT_TITLE } from "@/shell/ReconnectSessionDialog";
 
 import type { TerminalTabConnection } from "./terminalTabConnection";
 
@@ -21,6 +23,7 @@ export function TerminalTabStatus({
   onResumeSession,
   resumingSession = false,
   onTryAgain,
+  localReconnectCommand,
 }: {
   connection: TerminalTabConnection;
   sandboxNotice: SandboxResumeNoticeState | null;
@@ -29,6 +32,8 @@ export function TerminalTabStatus({
   /** A session Resume is on its way. */
   resumingSession?: boolean;
   onTryAgain: () => void;
+  /** The command that relaunches a session that isn't host-bound, as Reconnect shows it. */
+  localReconnectCommand: string;
 }) {
   const stalled = stalledReason(connection);
   useEffect(() => {
@@ -56,6 +61,22 @@ export function TerminalTabStatus({
           icon={<WifiOffIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden />}
           title="Host is offline"
           detail="Use Reconnect host in the host menu below the chat to bring this terminal back."
+        />
+      );
+    case "local_stranded":
+      return (
+        <TerminalTabMessage
+          icon={<WifiOffIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden />}
+          title={LOCAL_RECONNECT_TITLE}
+          detail={LOCAL_RECONNECT_DESCRIPTION}
+          action={
+            <div className="w-full max-w-sm text-left">
+              <CliCommandBlock
+                command={localReconnectCommand}
+                testIdPrefix="terminal-tab-reconnect"
+              />
+            </div>
+          }
         />
       );
     case "runner_asleep":
@@ -125,6 +146,7 @@ function stalledReason(connection: TerminalTabConnection): string | null {
     case "sandbox":
       return connection.status === "resuming" ? null : `sandbox_${connection.status}`;
     case "host_offline":
+    case "local_stranded":
     case "runner_asleep":
     case "unreachable":
       return connection.kind;

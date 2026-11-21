@@ -55,12 +55,13 @@ describe("terminalTabConnection", () => {
     });
   });
 
-  it("says the host is offline, or the session isn't running", () => {
+  it("says the host is offline, the session has no host and stopped, or it isn't running", () => {
     expect(terminalTabConnection(inputs({ liveness: "host_offline" }))).toEqual({
       kind: "host_offline",
     });
+    // No host is bound, so there's none to reconnect; whoever started it relaunches it.
     expect(terminalTabConnection(inputs({ liveness: "local_stranded" }))).toEqual({
-      kind: "host_offline",
+      kind: "local_stranded",
     });
     expect(terminalTabConnection(inputs({ liveness: "runner_asleep" }))).toEqual({
       kind: "runner_asleep",

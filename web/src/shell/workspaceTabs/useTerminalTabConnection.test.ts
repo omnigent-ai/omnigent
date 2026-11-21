@@ -39,10 +39,10 @@ describe("Resume session from a shell tab", () => {
   const client = new QueryClient();
   const wrapper = ({ children }: { children: ReactNode }) =>
     createElement(QueryClientProvider, { client }, children);
-  const renderConnections = () =>
+  const renderConnections = (shellWaits = createShellWaits()) =>
     renderHook(
       () =>
-        useTerminalTabConnections("s-resume", createShellWaits(), {
+        useTerminalTabConnections("s-resume", shellWaits, {
           liveness: "runner_asleep",
           listFailed: false,
           shells: [],
@@ -106,6 +106,41 @@ describe("Resume session from a shell tab", () => {
     await act(async () => first.reject(new Error("late")));
     expect(toast.error).toHaveBeenCalledTimes(1);
     expect(result.current.resumingSession).toBe(true);
+  });
+
+  it("doesn't let a late success end a newer Resume or start its wait over", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const shellWaits = createShellWaits();
+    const restart = vi.spyOn(shellWaits, "restart");
+    const first = heldRequest();
+    const { result } = renderConnections(shellWaits);
+    act(() => void result.current.resumeSession());
+    await act(async () => {
+      vi.advanceTimersByTime(SESSION_RESUME_REQUEST_LIMIT_MS);
+    });
+    heldRequest();
+    act(() => void result.current.resumeSession());
+    const restartsBefore = restart.mock.calls.length;
+
+    await act(async () => first.resolve());
+    expect(result.current.resumingSession).toBe(true);
+    expect(restart).toHaveBeenCalledTimes(restartsBefore);
+  });
+
+  it("keeps one Resume and its state while the tab showing it is replaced", async () => {
+    const held = heldRequest();
+    const first = renderConnections();
+    act(() => void first.result.current.resumeSession());
+    first.unmount();
+
+    const second = renderConnections();
+    expect(second.result.current.resumingSession).toBe(true);
+    act(() => void second.result.current.resumeSession());
+    expect(retrySession).toHaveBeenCalledTimes(1);
+
+    await act(async () => held.resolve());
+    expect(second.result.current.resumingSession).toBe(false);
+    expect(toast.error).not.toHaveBeenCalled();
   });
 });
 

@@ -938,6 +938,7 @@ function WorkspaceTabsPanelImpl({
               onResumeSession={isEditorLevel(permissionLevel) ? resumeSession : undefined}
               resumingSession={tabConnections.resumingSession}
               onTryAgain={retryTerminals}
+              localReconnectCommand={tabConnections.localReconnectCommand}
             />
           );
         }

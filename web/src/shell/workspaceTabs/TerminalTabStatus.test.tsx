@@ -2,10 +2,14 @@ import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { LOCAL_RECONNECT_DESCRIPTION } from "@/shell/ReconnectSessionDialog";
+
 import { START_TIMED_OUT } from "./terminalTabConnection";
 import { TerminalTabStatus, VIEWER_RESUME_HINT } from "./TerminalTabStatus";
 
 afterEach(cleanup);
+
+const RECONNECT_COMMAND = "omnigent run path/to/agent.yaml --resume conv_example";
 
 describe("TerminalTabStatus", () => {
   it("shows the sandbox's Resume notice, which resumes it", async () => {
@@ -20,6 +24,7 @@ describe("TerminalTabStatus", () => {
           resume,
         }}
         onTryAgain={vi.fn()}
+        localReconnectCommand={RECONNECT_COMMAND}
       />,
     );
     await userEvent.click(screen.getByRole("button", { name: /Resume/ }));
@@ -32,6 +37,7 @@ describe("TerminalTabStatus", () => {
         connection={{ kind: "runner_asleep", failure: null }}
         sandboxNotice={null}
         onTryAgain={vi.fn()}
+        localReconnectCommand={RECONNECT_COMMAND}
       />,
     );
     expect(screen.getByRole("status")).toHaveTextContent("Session isn't running");
@@ -44,6 +50,7 @@ describe("TerminalTabStatus", () => {
         connection={{ kind: "runner_asleep", failure: START_TIMED_OUT }}
         sandboxNotice={null}
         onTryAgain={vi.fn()}
+        localReconnectCommand={RECONNECT_COMMAND}
       />,
     );
     expect(screen.getByRole("alert")).toHaveTextContent(`${START_TIMED_OUT} ${VIEWER_RESUME_HINT}`);
@@ -55,10 +62,40 @@ describe("TerminalTabStatus", () => {
         sandboxNotice={null}
         onResumeSession={vi.fn()}
         onTryAgain={vi.fn()}
+        localReconnectCommand={RECONNECT_COMMAND}
       />,
     );
     expect(screen.getByRole("alert")).toHaveTextContent("Starting the session took too long.");
     expect(screen.getByRole("button", { name: "Try Again" })).toBeInTheDocument();
+  });
+
+  it("tells a stopped session with no host how to relaunch it, and an offline host how to reconnect", () => {
+    const view = render(
+      <TerminalTabStatus
+        connection={{ kind: "local_stranded" }}
+        sandboxNotice={null}
+        onTryAgain={vi.fn()}
+        localReconnectCommand={RECONNECT_COMMAND}
+      />,
+    );
+    const status = screen.getByRole("status");
+    expect(status).toHaveTextContent("Agent disconnected");
+    expect(status).toHaveTextContent(LOCAL_RECONNECT_DESCRIPTION);
+    expect(status).toHaveTextContent(RECONNECT_COMMAND);
+    // There's no host to reconnect, so the tab doesn't point there.
+    expect(status).not.toHaveTextContent("Reconnect host");
+
+    view.rerender(
+      <TerminalTabStatus
+        connection={{ kind: "host_offline" }}
+        sandboxNotice={null}
+        onTryAgain={vi.fn()}
+        localReconnectCommand={RECONNECT_COMMAND}
+      />,
+    );
+    expect(screen.getByRole("status")).toHaveTextContent("Host is offline");
+    expect(screen.getByRole("status")).toHaveTextContent("Reconnect host");
+    expect(screen.getByRole("status")).not.toHaveTextContent(RECONNECT_COMMAND);
   });
 
   it("records why a shell tab stalled, once per reason, for bug reports", () => {
@@ -68,6 +105,7 @@ describe("TerminalTabStatus", () => {
         connection={{ kind: "connecting" }}
         sandboxNotice={null}
         onTryAgain={vi.fn()}
+        localReconnectCommand={RECONNECT_COMMAND}
       />,
     );
     expect(info).not.toHaveBeenCalled();
@@ -76,6 +114,7 @@ describe("TerminalTabStatus", () => {
         connection={{ kind: "unreachable" }}
         sandboxNotice={null}
         onTryAgain={vi.fn()}
+        localReconnectCommand={RECONNECT_COMMAND}
       />,
     );
     view.rerender(
@@ -83,6 +122,7 @@ describe("TerminalTabStatus", () => {
         connection={{ kind: "unreachable" }}
         sandboxNotice={null}
         onTryAgain={vi.fn()}
+        localReconnectCommand={RECONNECT_COMMAND}
       />,
     );
     expect(info).toHaveBeenCalledTimes(1);

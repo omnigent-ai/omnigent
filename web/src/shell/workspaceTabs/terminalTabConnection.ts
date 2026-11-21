@@ -22,6 +22,8 @@ export type TerminalTabConnection =
   /** The sandbox is asleep, waking, or failed to wake; shown with the shared Resume notice. */
   | { kind: "sandbox"; status: Exclude<SandboxResumeStatus, "none">; failure: string | null }
   | { kind: "host_offline" }
+  /** Not host-bound, and its runner stopped: whoever started it relaunches it. */
+  | { kind: "local_stranded" }
   /** The session's runner isn't running; Resume session starts it. */
   | { kind: "runner_asleep"; failure: string | null };
 
@@ -81,7 +83,8 @@ export function terminalTabConnection(inputs: TerminalTabInputs): TerminalTabCon
     }
     return { kind: "sandbox", status: sandbox.status, failure: sandbox.failure };
   }
-  if (liveness === "host_offline" || liveness === "local_stranded") return { kind: "host_offline" };
+  if (liveness === "host_offline") return { kind: "host_offline" };
+  if (liveness === "local_stranded") return { kind: "local_stranded" };
   if (liveness === "runner_asleep") return { kind: "runner_asleep", failure: null };
   if (liveness === "starting") {
     if (waited < SANDBOX_RESUME_TOTAL_LIMIT_MS) return { kind: "connecting" };
