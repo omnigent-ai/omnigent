@@ -10,14 +10,17 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import textwrap
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
 import click
 import httpx
+import psutil
 import pytest
 
 import omnigent
@@ -1244,6 +1247,7 @@ def _patch_spawn_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     :param tmp_path: The test's tmp dir standing in for ``$HOME``.
     """
     monkeypatch.setattr(local_server, "local_server_url_if_healthy", lambda: None)
+    monkeypatch.setattr(local_server, "_process_owns_loopback_listener", lambda _pid, _port: False)
     monkeypatch.setattr(local_server, "_LOCAL_SERVER_PID_PATH", tmp_path / "local_server.pid")
     monkeypatch.setattr(local_server, "_LOCAL_SERVER_SIG_PATH", tmp_path / "local_server.sig")
     monkeypatch.setattr(
@@ -1280,6 +1284,75 @@ def _proc_cls_with_pids(pids: list[int], polls: list[int | None] | None = None) 
             return self._poll
 
     return _Proc
+
+
+@pytest.mark.parametrize("legacy_process_api", [False, True], ids=["current-api", "legacy-api"])
+@pytest.mark.parametrize(
+    ("listener_ip", "listener_family", "listener_port", "listener_status", "expected"),
+    [
+        ("127.0.0.1", socket.AF_INET, 8765, psutil.CONN_LISTEN, None),
+        ("::1", socket.AF_INET6, 8765, psutil.CONN_LISTEN, 4242),
+        ("127.0.0.2", socket.AF_INET, 8765, psutil.CONN_LISTEN, 4242),
+        ("127.0.0.1", socket.AF_INET, 8766, psutil.CONN_LISTEN, 4242),
+        ("127.0.0.1", socket.AF_INET, 8765, psutil.CONN_ESTABLISHED, 4242),
+    ],
+)
+def test_foreign_port_probe_recognizes_its_original_ipv4_listener(
+    monkeypatch: pytest.MonkeyPatch,
+    legacy_process_api: bool,
+    listener_ip: str,
+    listener_family: socket.AddressFamily,
+    listener_port: int,
+    listener_status: str,
+    expected: int | None,
+) -> None:
+    monkeypatch.setattr(local_server, "_pid_listening_on_port", lambda _port: 4242)
+    connections = [
+        SimpleNamespace(
+            family=listener_family,
+            status=listener_status,
+            laddr=SimpleNamespace(ip=listener_ip, port=listener_port),
+        )
+    ]
+
+    def connection_lookup(*, kind: str) -> list[SimpleNamespace]:
+        assert kind == "tcp"
+        return connections
+
+    def original_process(pid: int) -> SimpleNamespace:
+        assert pid == 9001
+        name = "connections" if legacy_process_api else "net_connections"
+        return SimpleNamespace(**{name: connection_lookup})
+
+    monkeypatch.setattr(
+        local_server,
+        "psutil",
+        SimpleNamespace(
+            Process=original_process, Error=psutil.Error, CONN_LISTEN=psutil.CONN_LISTEN
+        ),
+    )
+
+    assert local_server._foreign_port_owner(8765, 9001) == expected
+
+
+@pytest.mark.parametrize(
+    "failure", [psutil.AccessDenied(pid=9001), psutil.NoSuchProcess(pid=9001)]
+)
+def test_foreign_port_probe_keeps_rejecting_without_original_listener_evidence(
+    monkeypatch: pytest.MonkeyPatch, failure: psutil.Error
+) -> None:
+    monkeypatch.setattr(local_server, "_pid_listening_on_port", lambda _port: 4242)
+
+    def unavailable_process(_pid: int) -> None:
+        raise failure
+
+    monkeypatch.setattr(
+        local_server,
+        "psutil",
+        SimpleNamespace(Process=unavailable_process, Error=psutil.Error),
+    )
+
+    assert local_server._foreign_port_owner(8765, 9001) == 4242
 
 
 def test_ensure_respawns_on_free_port_when_foreign_server_owns_preferred_port(
