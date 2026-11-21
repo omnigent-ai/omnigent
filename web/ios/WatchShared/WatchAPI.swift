@@ -102,6 +102,7 @@ struct WatchSnapshot: Decodable, Sendable {
 
   let status: String?
   let hostId: String?
+  let runnerId: String?
   let parentSessionId: String?
   let labels: [String: String]?
   let lastTaskError: TaskError?
@@ -235,11 +236,13 @@ struct WatchClient: Sendable {
   }()
 
   let credentials: WatchCredentials
+  private let routing = WatchRoutingAffinity()
 
   /// A hostless child uses its nearest host-bound ancestor, as in the web client.
   func routingHost(for sessionID: String) async throws -> String? {
     var current = sessionID
     var visited: Set<String> = []
+    var probeSessionID: String?
     for _ in 0..<16 {
       guard visited.insert(current).inserted else { throw WatchError.routingUnavailable }
       let state: WatchSnapshot = try await get(
@@ -248,8 +251,20 @@ struct WatchClient: Sendable {
           "include_items": "false", "include_liveness": "false", "include_live_status": "false",
           "include_usage": "false",
         ])
+      if probeSessionID == nil, let runner = state.runnerId, !runner.isEmpty {
+        probeSessionID = current
+      }
       for host in [state.hostId, state.labels?["omnigent.sandbox.requested_host_id"]] {
-        if let host, !host.isEmpty { return host }
+        if let host, !host.isEmpty {
+          // Snapshots can silently omit live approvals on the wrong replica.
+          // A bounded, read-only runner inventory verifies affinity first.
+          if let probeSessionID {
+            _ = try await send(
+              request("sessions/\(probeSessionID)/resources/terminals", ["limit": "1"], host: host),
+              allowingOfflineRunner: true)
+          }
+          return host
+        }
       }
       let parent =
         state.parentSessionId ?? state.labels?["omnigent.side_chat.source_id"]
@@ -285,22 +300,62 @@ struct WatchClient: Sendable {
     return request
   }
 
-  private func send(_ request: URLRequest) async throws -> Data {
+  private func send(_ request: URLRequest, allowingOfflineRunner: Bool = false) async throws -> Data
+  {
     var request = request
+    let host = request.value(forHTTPHeaderField: Self.sliceKey)
+    if let host {
+      request.setValue(await routing.key(for: host), forHTTPHeaderField: Self.sliceKey)
+    }
     var (data, response) = try await Self.session.data(for: request)
-    // A stale host key reaches a replica without the session's tunnel; retry keyless like the web.
-    if (response as? HTTPURLResponse)?.statusCode == 400,
-      request.value(forHTTPHeaderField: Self.sliceKey) != nil,
-      String(decoding: data, as: UTF8.self).contains("wrong_replica")
+    var retried = false
+    // Retry once in either direction: a host can reconnect with or without a key.
+    if let host, (response as? HTTPURLResponse)?.statusCode == 400,
+      serverErrorCode(data) == "wrong_replica"
     {
-      request.setValue(nil, forHTTPHeaderField: Self.sliceKey)
+      let key = request.value(forHTTPHeaderField: Self.sliceKey) == nil ? host : nil
+      request.setValue(key, forHTTPHeaderField: Self.sliceKey)
       (data, response) = try await Self.session.data(for: request)
+      retried = true
     }
     switch (response as? HTTPURLResponse)?.statusCode ?? 0 {
-    case 200..<300: return data
+    case 200..<300:
+      if retried, let host {
+        await routing.remember(
+          host, keyless: request.value(forHTTPHeaderField: Self.sliceKey) == nil)
+      }
+      return data
+    case 503
+    where allowingOfflineRunner && !retried && serverErrorCode(data) == "runner_unavailable":
+      // An offline runner still has a readable durable transcript; no new affinity is learned.
+      return Data()
     case 401: throw WatchError.signedOut
     case 403: throw WatchError.forbidden
     case let code: throw WatchError.status(code)
+    }
+  }
+
+  private func serverErrorCode(_ data: Data) -> String? {
+    struct Failure: Decodable {
+      struct Detail: Decodable { let code: String }
+      let error: Detail
+    }
+    return (try? Self.decoder.decode(Failure.self, from: data))?.error.code
+  }
+}
+
+private actor WatchRoutingAffinity {
+  private var keylessHosts: Set<String> = []
+
+  func key(for host: String) -> String? {
+    keylessHosts.contains(host) ? nil : host
+  }
+
+  func remember(_ host: String, keyless: Bool) {
+    if keyless {
+      keylessHosts.insert(host)
+    } else {
+      keylessHosts.remove(host)
     }
   }
 }

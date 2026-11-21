@@ -668,6 +668,101 @@ final class WatchCompanionTests: XCTestCase {
     await conversation.load()
     XCTAssertNil(conversation.error)
     XCTAssertEqual(conversation.approvals.map(\.id), ["late"])
+
+    var actualKey: String?
+    var probeFails = false
+    var pendingID: String? = "keyless"
+    var probeKeys: [String?] = []
+    var snapshotKeys: [String?] = []
+    var responseKeys: [String?] = []
+    let keylessServer = try MockHTTPServer(requestHandler: { request in
+      let url = URLComponents(string: request.path)
+      let key = request.headers["x-databricks-omnigent-slice-key"]
+      XCTAssertEqual(request.headers["cookie"], "session=test")
+      switch (request.method, url?.path) {
+      case ("GET", "/v1/sessions/s1"):
+        let metadata = #""host_id":"moving-host","runner_id":"runner""#
+        if url?.queryItems?.contains(where: { $0.name == "include_live_status" }) == true {
+          return (200, [:], Data("{\(metadata)}".utf8))
+        }
+        snapshotKeys.append(key)
+        let pending =
+          key == actualKey && pendingID != nil
+          ? #"[{"elicitation_id":"\#(pendingID!)","params":{"message":"Run it?"}}]"# : "[]"
+        return (200, [:], Data("{\(metadata),\"pending_elicitations\":\(pending)}".utf8))
+      case ("GET", "/v1/sessions/s1/resources/terminals"):
+        probeKeys.append(key)
+        XCTAssertEqual(url?.queryItems?.first { $0.name == "limit" }?.value, "1")
+        if key != actualKey {
+          return (400, [:], Data(#"{"error":{"code":"wrong_replica"}}"#.utf8))
+        }
+        if probeFails {
+          return (503, [:], Data(#"{"error":{"code":"runner_unavailable"}}"#.utf8))
+        }
+        return (200, [:], Data(#"{"data":[]}"#.utf8))
+      case ("GET", "/v1/sessions/s1/items"):
+        return (200, [:], Data(#"{"data":[]}"#.utf8))
+      case ("POST", "/v1/sessions/s1/elicitations/keyless/resolve"):
+        responseKeys.append(key)
+        XCTAssertNil(key, "Approvals must use the proven keyless route")
+        pendingID = nil
+        return (200, [:], Data())
+      default:
+        XCTFail("Unexpected watch request: \(request.method) \(request.path)")
+        return (404, [:], Data())
+      }
+    })
+    let routed = WatchConversation(
+      session: initiallyHostless,
+      client: WatchClient(
+        credentials: WatchCredentials(
+          apiURL: URL(string: "http://127.0.0.1:\(keylessServer.port)/v1")!,
+          cookie: "session=test")))
+    await routed.load()
+    XCTAssertNil(routed.error)
+    XCTAssertEqual(routed.approvals.map(\.id), ["keyless"])
+    XCTAssertEqual(probeKeys, ["moving-host", nil])
+    XCTAssertEqual(snapshotKeys, [nil], "An empty keyed HTTP 200 is not a routing proof")
+    let keylessApproval = try XCTUnwrap(routed.approvals.first)
+    await routed.resolve(keylessApproval, accept: true)
+    XCTAssertEqual(responseKeys, [nil])
+    XCTAssertTrue(routed.approvals.isEmpty)
+    pendingID = "later"
+    await routed.load()
+    XCTAssertEqual(routed.approvals.map(\.id), ["later"])
+    XCTAssertEqual(probeKeys, ["moving-host", nil, nil, nil, nil])
+    XCTAssertTrue(snapshotKeys.allSatisfy { $0 == nil })
+
+    // A host can reconnect keyed; do not let learned keyless affinity strand it.
+    actualKey = "moving-host"
+    await routed.load()
+    XCTAssertNil(routed.error)
+    XCTAssertEqual(Array(probeKeys.suffix(2)), [nil, "moving-host"])
+    XCTAssertEqual(snapshotKeys.last!, "moving-host")
+    await routed.load()
+    XCTAssertEqual(probeKeys.last!, "moving-host")
+
+    // A failed retry cannot prove new affinity or replace the last good snapshot.
+    actualKey = nil
+    probeFails = true
+    let priorSnapshotCount = snapshotKeys.count
+    await routed.load()
+    XCTAssertNotNil(routed.error)
+    XCTAssertEqual(snapshotKeys.count, priorSnapshotCount)
+    XCTAssertEqual(routed.approvals.map(\.id), ["later"])
+    probeFails = false
+    await routed.load()
+    XCTAssertNil(routed.error)
+    XCTAssertEqual(Array(probeKeys.suffix(2)), ["moving-host", nil])
+    XCTAssertNil(snapshotKeys.last!)
+
+    // A genuinely offline runner must not prevent reading the stored transcript.
+    probeFails = true
+    pendingID = nil
+    await routed.load()
+    XCTAssertNil(routed.error)
+    XCTAssertTrue(routed.approvals.isEmpty)
+    XCTAssertEqual(snapshotKeys.count, priorSnapshotCount + 2)
   }
 
   @MainActor func testToolHeavyTranscriptBackfillsVisibleMessages() async throws {
@@ -753,7 +848,7 @@ final class WatchCompanionTests: XCTestCase {
       XCTAssertEqual(request.headers["cookie"], "session=test")
       if request.headers["x-databricks-omnigent-slice-key"] != nil {
         originalRequest.fulfill()
-        return (400, [:], Data(#"{"error":"wrong_replica"}"#.utf8))
+        return (400, [:], Data(#"{"error":{"code":"wrong_replica"}}"#.utf8))
       }
       retriedRequest.fulfill()
       return (307, ["location": "/outside-cookie-path"], Data())

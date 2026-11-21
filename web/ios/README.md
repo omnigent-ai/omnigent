@@ -28,6 +28,9 @@ proxy/CORS behavior.
 and resolves yes/no approvals. Older sessions and full history remain available on the phone.
 The transcript shows up to 12 committed messages, scanning at most 300 recent items past tool
 activity, plus queued inputs.
+For bound runners, each refresh first checks a one-item terminal inventory to verify routing
+before trusting live approvals. This read does not launch or attach to a terminal. Successful
+keyless retries are reused; later refreshes can recover if the host reconnects with a key.
 Receipt-based native approvals stay visible but require the phone for confirmation/retry;
 the watch does not expose approval buttons for that delivery protocol.
 Only form-mode yes/no prompts have watch buttons. URL-mode prompts, including internal
