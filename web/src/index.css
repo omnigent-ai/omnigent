@@ -994,7 +994,8 @@
     transform 200ms ease-in-out;
 }
 
-.workspace-panel-motion[data-state="open"] {
+.workspace-panel-motion[data-state="open"],
+.workspace-panel-motion[data-rail-state="open"] {
   opacity: 1;
   transform: translateX(0);
   pointer-events: auto;
@@ -1063,7 +1064,8 @@
 }
 
 @starting-style {
-  .workspace-panel-motion[data-state="open"][data-animate-visibility] {
+  .workspace-panel-motion[data-state="open"][data-animate-visibility],
+  .workspace-panel-motion[data-rail-state="open"][data-animate-visibility] {
     width: 0 !important;
     opacity: 0;
     transform: translateX(12px);

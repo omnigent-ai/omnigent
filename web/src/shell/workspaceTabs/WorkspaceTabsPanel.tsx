@@ -142,6 +142,8 @@ export interface WorkspaceTabsPanelProps {
   pending?: boolean;
   width: number;
   inert?: boolean;
+  /** The rail is about to go inert, which its host defers; focus is kept out until it does. */
+  inertPending?: boolean;
   open?: boolean;
   animateVisibility?: boolean;
   resizing?: boolean;
@@ -245,6 +247,7 @@ function WorkspaceTabsPanelImpl({
   pending = false,
   width,
   inert,
+  inertPending,
   open = true,
   animateVisibility = false,
   resizing = false,
@@ -302,7 +305,10 @@ function WorkspaceTabsPanelImpl({
     tabIds: [tab.id],
   }));
   const stripValue = selectedTabId ?? "";
-  const railInertRef = useInertRef<HTMLElement>(inert ?? false);
+  // The rail goes inert a frame late (WorkspaceTabsHost); focus stays out meanwhile.
+  const railInertRef = useInertRef<HTMLElement>(inert ?? false, undefined, {
+    pending: inertPending ?? !open,
+  });
 
   const terminalsKnown = terminalKeys !== null;
   const terminalSignature = terminalKeys?.join("\n") ?? "";
@@ -988,7 +994,8 @@ function WorkspaceTabsPanelImpl({
       data-workspace-design="tabs"
       data-collapsed={width === 0 || undefined}
       data-maximized={maximized || undefined}
-      data-state={open ? "open" : "closed"}
+      // Its own name, not data-state: a data-state change restyles everything inside the rail.
+      data-rail-state={open ? "open" : "closed"}
       data-animate-visibility={animateVisibility || undefined}
       data-resizing={resizing || undefined}
       className={
