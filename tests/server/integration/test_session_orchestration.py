@@ -2091,8 +2091,8 @@ async def test_sub_agent_requests_are_keyed_by_its_host_across_replicas(
         # The runner's key is refused first, fast and without a wake, then the host serves.
         assert len(wrong) == 1 and wrong[0][0] == 1, seen
         assert seen[0][4] and seen[0][2] == "parent-host", seen
-        # The refusal names the host either way, so it is retried there without a lookup.
-        assert not any(entry[5] for entry in seen), seen
+        # A refusal that names the host is retried on it directly; an unnamed one costs a lookup.
+        assert sum(entry[5] for entry in seen) == (0 if keyed else 1), seen
     settled = [entry for entry in seen if not entry[4] and not entry[5]]
     assert settled and all(key == host_id for _, _, key, *_ in settled), seen
     # The keyless replica refuses the runner's key before any wake is kicked, primed or not.

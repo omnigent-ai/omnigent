@@ -7235,7 +7235,7 @@ async def _provision_managed_sandbox(
         ``None`` to mint one. Ignored on a relaunch, which keeps the host's
         identity.
     :param relaunch_slice_key_enabled: On a relaunch, whether the host routes
-        by its own id, which a known host does on a host-sharded deployment.
+        by its own id, as at its first launch.
     :returns: The launch result, or ``None`` when the launch failed
         (the tracker entry is already settled with the reason).
     """

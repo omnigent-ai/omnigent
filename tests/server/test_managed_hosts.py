@@ -2966,6 +2966,17 @@ async def test_resume_rematerializes_host_config_before_host_restart(db_uri: str
     assert write_index < host_index
 
 
+def test_host_slice_key_enabled_only_for_the_requested_host() -> None:
+    """Relaunch and wake key only the host the create named, so a later host can't inherit it."""
+    from omnigent.server.managed_hosts import host_slice_key_enabled
+
+    requested = {"omnigent.sandbox.requested_host_id": "0123456789abcdef0123456789abcdef"}
+
+    assert host_slice_key_enabled(requested, "0123456789abcdef0123456789abcdef") is True
+    assert host_slice_key_enabled(requested, "fedcba9876543210fedcba9876543210") is False
+    assert host_slice_key_enabled({}, "0123456789abcdef0123456789abcdef") is False
+
+
 async def test_launch_without_host_config_writes_no_config(db_uri: str) -> None:
     """No host_config → the launch issues no config-write command at all."""
     host_store = HostStore(db_uri)
@@ -6482,9 +6493,8 @@ async def test_run_managed_wake_omits_the_classifier_for_a_session_scoped_impost
     assert captured["agent_name"] is None
 
 
-@pytest.mark.parametrize("keyed_wake", [True, False])
 async def test_run_managed_wake_recreates_a_definitively_gone_sandbox(
-    monkeypatch: pytest.MonkeyPatch, keyed_wake: bool
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A gone wake reuses the host identity and create-time session metadata."""
     from omnigent.server.routes._sessions import orchestration
@@ -6532,12 +6542,9 @@ async def test_run_managed_wake_recreates_a_definitively_gone_sandbox(
         tunnel_registry=tunnel_registry,
         agent_store=agent_store,
         agent_id=builtin.id,
-        keyed_wake=keyed_wake,
     )
 
     assert captured["session_id"] == "conv_1"
-    # The fresh generation keeps the wake's routing decision.
-    assert captured["keyed_wake"] is keyed_wake
     assert captured["owner"] == _OWNER
     assert captured["sandbox_config"] is sandbox_config
     assert captured["conversation_store"] is conversation_store
