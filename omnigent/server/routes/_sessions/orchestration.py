@@ -5916,8 +5916,9 @@ def _raise_if_managed_wake_misses_host_tunnel(
     wakes dials the replica that id names. A request carrying any other key would
     run the wake where the tunnel won't land and park for the whole wake, so
     answer ``WRONG_REPLICA`` first, naming the host's id. A request with no key at
-    all comes from a client that predates host routing; it wakes the host on the
-    default replica, where that client's requests go. Only a fastapi ``Request``
+    all comes from a client that predates host routing; it wakes a dormant host on
+    the default replica, where that client's requests go, but is re-addressed like
+    any other key when the host is live on another replica. Only a fastapi ``Request``
     names a routing key; internal callers pass nothing and skip this check.
 
     :param conv: Session row whose host may need a wake.
@@ -5936,9 +5937,13 @@ def _raise_if_managed_wake_misses_host_tunnel(
     if conv.host_id is None or host_registry is None or not _deployment_is_sharded():
         return
     routed_key = routed_slice_key(request)
-    if routed_key in (None, conv.host_id) or host_registry.get(conv.host_id) is not None:
+    if routed_key == conv.host_id or host_registry.get(conv.host_id) is not None:
         return
     if host.sandbox_provider is None:
+        return
+    # A host live with no tunnel here is connected on its own key's replica; a
+    # keyless wake would restart it unkeyed under every session it serves.
+    if routed_key is None and not host_is_live(host):
         return
     raise WrongReplicaError(
         f"managed host {conv.host_id} wakes on the replica its slice key names",
@@ -6877,6 +6882,7 @@ async def _run_managed_wake(
                 agent_store=agent_store,
                 agent_id=agent_id,
                 sandbox_profiles=sandbox_profiles,
+                keyed_wake=keyed_wake,
             )
             return
         _publish_sandbox_status(session_id, "connecting")

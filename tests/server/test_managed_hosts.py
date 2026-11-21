@@ -6482,8 +6482,9 @@ async def test_run_managed_wake_omits_the_classifier_for_a_session_scoped_impost
     assert captured["agent_name"] is None
 
 
+@pytest.mark.parametrize("keyed_wake", [True, False])
 async def test_run_managed_wake_recreates_a_definitively_gone_sandbox(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, keyed_wake: bool
 ) -> None:
     """A gone wake reuses the host identity and create-time session metadata."""
     from omnigent.server.routes._sessions import orchestration
@@ -6531,9 +6532,12 @@ async def test_run_managed_wake_recreates_a_definitively_gone_sandbox(
         tunnel_registry=tunnel_registry,
         agent_store=agent_store,
         agent_id=builtin.id,
+        keyed_wake=keyed_wake,
     )
 
     assert captured["session_id"] == "conv_1"
+    # The fresh generation keeps the wake's routing decision.
+    assert captured["keyed_wake"] is keyed_wake
     assert captured["owner"] == _OWNER
     assert captured["sandbox_config"] is sandbox_config
     assert captured["conversation_store"] is conversation_store

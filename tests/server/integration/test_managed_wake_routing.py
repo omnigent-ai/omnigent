@@ -233,6 +233,25 @@ async def test_keyless_request_wakes_from_the_default_route(
 
 
 @pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)
+@LABELLED
+async def test_keyless_request_never_restarts_a_host_live_elsewhere(
+    two_replica_stack: Any, managed_wake: Any, db_uri: str, labelled: bool
+) -> None:
+    """A keyless request is re-addressed, not woken, while the host is live on its key's pod."""
+    arrange, events = managed_wake
+    session_id = await arrange(keyed=labelled)
+    HostStore(db_uri).upsert_on_connect(HOST_ID, "managed-wake-host", OWNER)
+
+    response = await two_replica_stack.keyless_client.post(
+        f"/v1/sessions/{session_id}/events", headers=_headers(None), json=MESSAGE
+    )
+
+    assert _wrong_replica(response), response.text
+    assert response.json()["error"]["slice_key"] == HOST_ID
+    assert "resume" not in events and "launch" not in events, events
+
+
+@pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)
 async def test_single_replica_is_unaffected_by_a_foreign_key(
     two_replica_stack: Any, managed_wake: Any
 ) -> None:
