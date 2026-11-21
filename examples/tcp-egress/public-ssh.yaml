@@ -1,3 +1,5 @@
+# Configuration reference: Claude SDK does not support worker TCP-egress routing.
+# Brokered model inference is supported. See README.md for the routing limitation.
 name: tcp-egress-public-ssh
 executor:
   harness: claude-sdk

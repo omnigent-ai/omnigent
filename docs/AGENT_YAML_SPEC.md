@@ -733,7 +733,7 @@ not pass secrets through the environment unless the tool genuinely needs them.
 
 You usually don't need to choose a `sandbox.type` — omit it and Omnigent picks
 the platform default (`linux_bwrap` on Linux, `darwin_seatbelt` on macOS, or
-`windows_jobobject` on Windows), so the same YAML works across platforms. Use
+`windows_jobobject` on Windows). Use
 `type: auto` to explicitly request the platform-default sandbox backend:
 
 ```yaml
@@ -764,15 +764,91 @@ fresh helper. Shell calls therefore still incur helper startup cost; warm shell
 reuse needs a complete per-request process lifetime boundary. This tool lease
 policy does not change shared copy-on-write environments or forked environments.
 
+Inner harness adapters reject `windows_jobobject`, including the Windows
+default, because it cannot enforce the requested filesystem and network
+boundaries. Confined harness processes require a supported Linux or macOS
+backend. Codex checks these capabilities during session initialization, before
+starting its worker. Claude SDK containment also requires a system-installed or SDK-bundled CLI;
+`OMNIGENT_CLAUDE_SDK_NO_SANDBOX` cannot bypass a requested sandbox.
+
+The Copilot, Cursor, Hermes, and Antigravity inner adapters cannot install
+process confinement and reject requests for it. Supplying `os_env` without a
+sandbox type selects the platform default, which these adapters also reject.
+Choose a sandbox-capable harness for confinement. Use an explicit
+`sandbox.type: none` only when unrestricted execution is intended.
+
+The framework-created `web_fetch` researcher inherits its parent's harness and
+requests the platform-default sandbox when the parent has no `os_env`.
+On Copilot, Cursor, Hermes, and Antigravity, that researcher therefore refuses to start.
+Use a sandbox-capable harness for this confined research path.
+
+ACP, Claude SDK, Codex, Goose, Kimi, Pi, and Qwen worker containment supports
+`os_env.type: caller_process` and rejects `fork`, `start_in_scratch`, and
+`sandbox.git_ssh`. Worker `egress_rules` are supported by Codex and Claude SDK.
+Worker `credential_proxy` requires Codex's supported brokered gateway
+configuration or Claude SDK's owned worker environment and credential broker.
+When a later turn supplies a changed OS policy, the runtime replaces its retained
+worker before running that turn so the new policy reaches a fresh process.
+Launch-policy overrides such as `enforce_sandbox` are reapplied before deriving
+the spawn environment, including after an agent revision changes.
+Whole-process `allow_network: false` denies direct external network connections
+from the worker. Supported brokered inference, including Claude SDK's owned
+model broker, can remain available without granting direct provider connections.
+
+Claude SDK routes supported HTTP egress and credential injection through an
+owned broker outside its confined worker. Direct CLI preparation without an
+owned worker environment rejects these settings. `sys_os_shell` shares the
+agent's primary `os_env`; it cannot substitute for worker containment.
+
+- For HTTP egress on the primary worker policy, use Claude SDK's owned broker
+  or Codex's supported egress configuration. Credentialed Codex operations
+  require the [brokered Codex gateway configuration](#secretless-credential-proxy)
+  below, including `broker_gateway: true` and its required gateway binding.
+  Nonbrokered or signer-backed Codex is not a substitute for that configuration.
+- For terminal-only HTTP or TCP egress without credentials, put `egress_rules`
+  or `tcp_egress` in the terminal's own `os_env`. Terminal launches ignore
+  `credential_proxy` and do not inject its credentials. Keep the primary
+  worker's required confinement; terminal-local rules do not replace a worker
+  egress boundary.
+
+Inner workers cannot enforce `tcp_egress`. If that restriction must cover the
+worker itself, there is no supported inner-harness migration yet. Retain the
+restriction and treat the configuration as unsupported.
+
+Relative `os_env.cwd` does not override a workspace selected by the runner.
+Claude SDK additionally resolves a named relative directory such as `./project`
+against the runner base when that base is still the selected workspace; `.`
+continues to use the selected workspace. Other adapters retain the selected
+workspace rather than applying that Claude-specific directory selection.
+Claude's CLI-preparation callbacks already resolve named relative directories;
+the SDK uses that prepared cwd for settings, credentials, execution, and transcript
+lookup so the process runs in the directory its sandbox protects.
+An absolute `os_env.cwd` must contain the selected session workspace; conflicting
+absolute boundaries refuse launch. Codex skips optional provider discovery when
+the worker policy blocks its loopback transport; configured providers still apply.
+
+Sandbox launchers also grant read access to the installed `omnigent` Python
+package. With an editable installation, this includes that package's source
+directory even when it is outside the executable's installation roots. Existing
+private scratch and vendor runtime-state write grants also remain.
+
 ### Secretless credential proxy
 
-`sandbox.credential_proxy` lets sandboxed tools authenticate to external hosts
-without the real secret ever entering the sandbox: the mandatory L7 egress proxy
-attaches the credential on the way out. It requires `egress_rules` and a
+The credential-proxy machinery lets sandboxed framework tools authenticate to
+external hosts without the real secret ever entering the sandbox: the mandatory
+L7 egress proxy attaches the credential on the way out. It requires `egress_rules` and a
 network-isolating backend (`linux_bwrap` or `darwin_seatbelt`). See
 `designs/SANDBOX_CREDENTIAL_PROXY.md` for the full type table.
 
-The `databricks_cli` type proxies the Databricks CLI. List the profiles to
+Inner workers accept `sandbox.credential_proxy` with Codex's supported brokered
+gateway configuration or Claude SDK's owned worker environment and credential
+broker. Direct Claude CLI preparation without an owned worker environment,
+nonbrokered Codex, and other inner adapters reject these policies. The general
+proxy types described below do not imply support for launching an inner worker
+with them.
+
+The `databricks_cli` type is for framework tools, not inner workers. It proxies
+the Databricks CLI. List the profiles to
 proxy; only those are materialized into the sandbox (with placeholder tokens)
 and swapped by the proxy. As with every other credential-proxy type, you must
 list each workspace host in `egress_rules` yourself — the proxy does not widen
@@ -805,8 +881,9 @@ The runner replaces the provider's auth command with a fixed command that
 prints only the placeholder. The trusted parent reads the protected source and
 renews its token; Codex receives a private home without host auth or provider
 configuration. A locked profile requires an explicit `broker_gateway: true`;
-missing or mismatched bindings prevent launch. Other gateway profiles retain
-their existing authentication.
+missing or mismatched bindings prevent launch. Nonbrokered gateway profiles
+retain their existing authentication only when `credential_proxy` is absent;
+configuring it on a nonbrokered Codex worker prevents launch.
 
 ```yaml
 executor:

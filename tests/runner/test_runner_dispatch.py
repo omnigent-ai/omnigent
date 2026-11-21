@@ -1522,51 +1522,155 @@ def test_spec_resolve_error_detail_names_structured_cause(
 
 
 @pytest.mark.asyncio
-async def test_runner_post_returns_503_when_spec_resolver_fails(
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "outage",
+        "unsupported-policy",
+        "codex-policy",
+        "invalid-spec",
+        "private-policy-detail",
+        "private-validator-detail",
+    ],
+)
+async def test_runner_post_releases_turn_when_spec_resolution_fails(
     caplog: pytest.LogCaptureFixture,
     pinned_runner_log: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure: str,
 ) -> None:
-    """Spec resolver failures are surfaced as structured 503 errors.
+    """Resolver outages and policy rejection must release the turn before retry."""
 
-    :param caplog: Pytest log capture, used to confirm the raw cause is
-        logged server-side (the other half of the log-and-genericize
-        contract).
-    :param pinned_runner_log: The log path the detail must name.
-    :returns: None.
-    """
+    from unittest.mock import AsyncMock
+
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.sandbox import (
+        HarnessSandboxValidationError,
+        UnsupportedHarnessSandboxError,
+    )
+
+    session_id = f"conv_spec_resolver_failed_{failure}"
+    corrected = False
+    if failure == "codex-policy":
+        isolate_provider_resolution(monkeypatch, tmp_path / "config")
 
     async def _failing_spec_resolver(
         agent_id: str, session_id: str | None = None
     ) -> AgentSpec | None:
-        """
-        Raise the resolver failure under test.
-
-        :param agent_id: Agent id requested by the runner.
-        :returns: Never returns.
-        :raises RuntimeError: Always.
-        """
+        """Return an unsupported policy or raise a resolver outage."""
+        if failure == "codex-policy":
+            return AgentSpec(
+                spec_version=1,
+                name="restricted-agent",
+                executor=ExecutorSpec(type="omnigent", config={"harness": "codex"}),
+                os_env=OSEnvSpec(fork=not corrected, sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+            )
+        if failure == "unsupported-policy":
+            return AgentSpec(
+                spec_version=1,
+                name="restricted-agent",
+                executor=ExecutorSpec(type="omnigent", config={"harness": "antigravity"}),
+                os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+            )
+        if failure == "invalid-spec":
+            raise ValueError("invalid spec from internal-host:6767/private/agent.yaml")
+        if failure == "private-policy-detail":
+            raise UnsupportedHarnessSandboxError("private-policy-token at internal-host:6767")
+        if failure == "private-validator-detail":
+            raise HarnessSandboxValidationError(
+                "private-policy-token at internal-host:6767", reason="fork"
+            )
         raise RuntimeError(f"spec resolver unavailable for {agent_id}")
 
+    manager = _FakeProcessManager()
+    get_client = AsyncMock(side_effect=AssertionError("must not launch a harness"))
+    monkeypatch.setattr(manager, "get_client", get_client)
     app = create_runner_app(
-        process_manager=cast(HarnessProcessManager, _FakeProcessManager()),
+        process_manager=cast(HarnessProcessManager, manager),
         spec_resolver=_failing_spec_resolver,
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
     async with _runner_test_client(app) as http:
         with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
-            response = await http.post(
-                "/v1/sessions/conv_spec_resolver_failed/events?stream=true",
-                json={
-                    "type": "message",
-                    "role": "user",
-                    "agent_id": "ag_missing",
-                    "model": "x",
-                    "content": [],
-                },
-            )
+            for _ in range(2):
+                response = await http.post(
+                    f"/v1/sessions/{session_id}/events?stream=true",
+                    json={
+                        "type": "message",
+                        "role": "user",
+                        "agent_id": "ag_missing",
+                        "model": "x",
+                        "content": [],
+                    },
+                )
+                assert response.status_code == (503 if failure == "outage" else 400)
+                assert session_id not in app.state.active_turns
+                assert not app.state.session_message_buffers.get(session_id)
+                events = await _drain_turn_events(
+                    app.state.session_event_queues,
+                    session_id,
+                    until_status="failed",
+                    timeout=2.0,
+                )
+                statuses = [
+                    event["status"] for event in events if event["type"] == "session.status"
+                ]
+                assert statuses == ["running", "failed"]
+                if failure != "outage":
+                    failed = next(event for event in events if event.get("status") == "failed")
+                    assert failed["error"] == response.json()["error"]
 
-    assert response.status_code == 503
+            get_client.assert_not_called()
+            if failure == "codex-policy":
+                corrected = True
+                get_client.side_effect = None
+                get_client.return_value = _FakeHarnessClient(
+                    [_SSE_RESPONSE_CREATED, _SSE_RESPONSE_COMPLETED]
+                )
+                retry = await http.post(
+                    f"/v1/sessions/{session_id}/events?stream=true",
+                    json={
+                        "type": "message",
+                        "role": "user",
+                        "agent_id": "ag_missing",
+                        "agent_revision": "corrected",
+                        "model": "x",
+                        "content": [],
+                    },
+                )
+                assert retry.status_code == 200, retry.text
+                assert "response.completed" in retry.text
+                get_client.assert_awaited_once()
+                assert session_id not in app.state.active_turns
+                assert not app.state.session_message_buffers.get(session_id)
+
     body = response.json()
+    if failure != "outage":
+        assert body["error"]["code"] == "invalid_input"
+        # Older servers read the flat detail instead of the structured error.
+        assert body["detail"] == body["error"]["message"]
+        detail = (
+            f"Request failed on the runner; see the runner log for details: {pinned_runner_log}"
+        )
+        if failure in ("unsupported-policy", "private-policy-detail"):
+            detail = (
+                "The selected harness cannot enforce os_env.sandbox. "
+                f"Choose a sandbox-capable harness. {detail}"
+            )
+        elif failure in ("codex-policy", "private-validator-detail"):
+            detail = f"The selected harness does not support os_env.fork. {detail}"
+        assert body["error"]["message"] == detail
+        cause = {
+            "unsupported-policy": "Antigravity cannot enforce",
+            "codex-policy": "Codex does not support os_env.fork",
+            "invalid-spec": "invalid spec from internal-host:6767/private/agent.yaml",
+            "private-policy-detail": "private-policy-token at internal-host:6767",
+            "private-validator-detail": "private-policy-token at internal-host:6767",
+        }[failure]
+        assert cause not in response.text
+        assert cause in caplog.text
+        return
     # The structured error slug is preserved for the caller; the detail names
     # the runner log holding the cause. The raw resolver exception text must
     # not leak into the HTTP body (it is logged on the runner instead).
@@ -1583,11 +1687,95 @@ async def test_runner_post_returns_503_when_spec_resolver_fails(
 
 
 @pytest.mark.asyncio
-async def test_runner_stream_emits_failed_when_tool_spec_resolver_fails() -> None:
-    """Streaming spec resolver failures emit ``response.failed`` SSE.
+async def test_runner_policy_changes_replace_retained_worker(
+    started_manager: HarnessProcessManager,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Corrected and tightened policies reach fresh children in the same session."""
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
-    :returns: None.
-    """
+    isolate_provider_resolution(monkeypatch, tmp_path / "config")
+    monkeypatch.setitem(
+        _HARNESS_MODULES,
+        "claude-sdk",
+        "tests.runtime.harnesses._test_executor_adapter_harness",
+    )
+    monkeypatch.setenv("MOCK_EXECUTOR_SCRIPT", "sandbox_policy")
+    spec = AgentSpec(
+        spec_version=1,
+        name="policy-retry-agent",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+        os_env=OSEnvSpec(fork=True, sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+    )
+
+    async def resolve_spec(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        return spec
+
+    session_id = "conv_policy_retry"
+    app = create_runner_app(
+        process_manager=started_manager,
+        spec_resolver=resolve_spec,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    body = {
+        "type": "message",
+        "role": "user",
+        "agent_id": "ag_policy_retry",
+        "agent_revision": "initial",
+        "model": "x",
+        "content": [],
+    }
+    url = f"/v1/sessions/{session_id}/events?stream=true"
+    async with _runner_test_client(app) as http, asyncio.timeout(30):
+        rejected = await http.post(url, json=body)
+        assert rejected.status_code == 200
+        failed = _parse_sse(rejected.content)
+        assert failed[-1][0] == "response.failed"
+        assert "os_env.fork" in failed[-1][1]["response"]["error"]["message"]
+        assert session_id not in app.state.active_turns
+        client = started_manager.registered_client(session_id)
+        assert client is not None
+        process = started_manager._entries[session_id].process
+
+        spec.os_env = OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none"))
+        body["agent_revision"] = "corrected"
+        completed = await http.post(url, json=body)
+        assert completed.status_code == 200
+        events = _parse_sse(completed.content)
+        assert events[-1][0] == "response.completed"
+        assert "policy retry completed" in completed.text
+        corrected_client = started_manager.registered_client(session_id)
+        assert corrected_client is not None and corrected_client is not client
+        assert process.returncode is not None
+        assert session_id not in app.state.active_turns
+        assert not app.state.session_message_buffers.get(session_id)
+
+        unchanged = await http.post(url, json=body)
+        assert unchanged.status_code == 200
+        assert _parse_sse(unchanged.content)[-1][0] == "response.completed"
+        assert started_manager.registered_client(session_id) is corrected_client
+        spec.os_env = OSEnvSpec(fork=True, sandbox=OSEnvSandboxSpec(type="linux_bwrap"))
+        body["agent_revision"] = "tightened"
+        tightened = await http.post(url, json=body)
+        assert tightened.status_code == 200
+        tightened_events = _parse_sse(tightened.content)
+        assert tightened_events[-1][0] == "response.failed"
+        assert "os_env.fork" in tightened_events[-1][1]["response"]["error"]["message"]
+        assert started_manager.registered_client(session_id) is not corrected_client
+        assert session_id not in app.state.active_turns
+        assert not app.state.session_message_buffers.get(session_id)
+
+
+@pytest.mark.asyncio
+async def test_runner_stream_reuses_launch_spec_when_resolver_later_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Local tools retain the selected launch spec when its resolver later fails."""
+    from unittest.mock import AsyncMock
+
+    dispatch_tool = AsyncMock(return_value="mocked tool result")
+    monkeypatch.setattr("omnigent.runner.tool_dispatch.dispatch_tool_locally", dispatch_tool)
     chunks = [
         (
             "event: response.created\ndata: "
@@ -1598,24 +1786,33 @@ async def test_runner_stream_emits_failed_when_tool_spec_resolver_fails() -> Non
             '"item":{"type":"function_call","status":"action_required",'
             '"name":"sys_os_read","call_id":"call_1","arguments":"{}"}}\n\n'
         ),
+        'event: response.completed\ndata: {"type":"response.completed",'
+        '"response":{"id":"resp_1","status":"completed"}}\n\n',
     ]
 
-    async def _failing_spec_resolver(
-        agent_id: str, session_id: str | None = None
-    ) -> AgentSpec | None:
+    recording = _RecordingHarnessClient(chunks)
+    spec = AgentSpec(
+        spec_version=1,
+        name="tool-resolution-agent",
+        executor=ExecutorSpec(type="omnigent", config={"harness": _TEST_HARNESS_NAME}),
+    )
+
+    async def _failing_spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         """
-        Raise during local tool dispatch spec resolution.
+        Resolve startup, then fail local tool dispatch resolution.
 
         :param agent_id: Agent id requested by the runner.
-        :returns: Never returns.
-        :raises RuntimeError: Always.
+        :returns: The startup spec before harness dispatch.
+        :raises RuntimeError: After the harness receives the turn.
         """
-        raise RuntimeError(f"stream spec resolver unavailable for {agent_id}")
+        if recording.posted_bodies:
+            raise RuntimeError(f"stream spec resolver unavailable for {agent_id}")
+        return spec
 
     app = create_runner_app(
         process_manager=cast(
             HarnessProcessManager,
-            _FakeProcessManager(_FakeHarnessClient(chunks)),
+            _FakeProcessManager(recording),
         ),
         spec_resolver=_failing_spec_resolver,
         server_client=NullServerClient(),  # type: ignore[arg-type]
@@ -1635,14 +1832,10 @@ async def test_runner_stream_emits_failed_when_tool_spec_resolver_fails() -> Non
 
     assert response.status_code == 200
     assert "event: response.created" in response.text
-    assert "event: response.failed" in response.text
-    # The exception class (a safe, generic label) is still surfaced as the
-    # error ``type``; the failure message is a fixed client-safe string. The
-    # raw resolver exception text must not leak into the SSE stream (it is
-    # logged on the runner instead).
-    assert "RuntimeError" in response.text
-    assert "Failed to resolve the agent spec for this turn." in response.text
-    assert "stream spec resolver unavailable for ag_stream" not in response.text
+    assert "event: response.completed" in response.text
+    assert "event: response.failed" not in response.text
+    dispatch_tool.assert_awaited_once()
+    assert dispatch_tool.call_args.kwargs["agent_spec"] is spec
 
 
 # ── Harness error-response detail → stream subscribers ───
@@ -1653,6 +1846,14 @@ _SPAWN_LOG_DETAIL = "Request failed on the runner; see the runner log for detail
 @pytest.mark.parametrize(
     "response, expected",
     [
+        pytest.param(
+            JSONResponse(
+                status_code=400,
+                content={"error": {"code": "invalid_input", "message": _SPAWN_LOG_DETAIL}},
+            ),
+            {"code": "invalid_input", "message": _SPAWN_LOG_DETAIL},
+            id="nested-error-keeps-code-and-message",
+        ),
         pytest.param(
             JSONResponse(
                 status_code=503,
@@ -1820,23 +2021,25 @@ async def test_runner_stream_spawn_failed_reaches_subscribers_with_detail(
     :returns: None.
     """
 
-    async def _none_spec_resolver(
-        agent_id: str, session_id: str | None = None
-    ) -> AgentSpec | None:
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         """
-        Resolve no spec, so the harness named in the body is used as-is.
+        Resolve the test harness so dispatch reaches the failing spawn.
 
         :param agent_id: Agent id requested by the runner.
         :param session_id: Session id (unused).
-        :returns: Always ``None``.
+        :returns: A minimal spec naming the test harness.
         """
         del agent_id, session_id
-        return None
+        return AgentSpec(
+            spec_version=1,
+            name="spawn-failing-agent",
+            executor=ExecutorSpec(type="omnigent", config={"harness": _TEST_HARNESS_NAME}),
+        )
 
     conv = "conv_stream_spawn_failed"
     app = create_runner_app(
         process_manager=cast(HarnessProcessManager, _SpawnFailingProcessManager()),
-        spec_resolver=_none_spec_resolver,
+        spec_resolver=_spec_resolver,
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
     async with _runner_test_client(app) as http:
@@ -1881,9 +2084,7 @@ async def test_runner_background_spawn_failed_reaches_subscribers_with_detail(
     :func:`test_runner_stream_spawn_failed_reaches_subscribers_with_detail`:
     both turn paths inspect the harness error response through the same
     helper, so a 202 background turn must surface the identical message.
-    The resolver returns a spec here (rather than ``None``) because the
-    background path takes its harness from the resolved spec, not from the
-    request body.
+    Both resolvers select the test harness before the spawn fails.
 
     :param pinned_runner_log: The log path the detail must name.
     :returns: None.
@@ -2471,10 +2672,22 @@ async def test_background_setup_failure_preserves_replacement_turn(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_kind",
+    [
+        "model-discovery",
+        "other-setup",
+        "public-config",
+        "provider-protocol",
+    ],
+)
 async def test_runner_failed_status_carries_setup_error_message(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    pinned_runner_log: Path,
+    failure_kind: str,
 ) -> None:
-    """A SETUP-phase failure forwards its error message on the ``failed`` event.
+    """A setup failure forwards safe diagnostics and allows a corrected retry.
 
     Regression for the silent-REPL failure mode: ending the turn on a
     pre-stream error stopped the spinner but rendered no text, because the
@@ -2488,11 +2701,20 @@ async def test_runner_failed_status_carries_setup_error_message(
     :param monkeypatch: pytest fixture used to force the spawn-env build to
         raise the no-model provider error.
     """
-    from omnigent.errors import ErrorCode, OmnigentError
+    from unittest.mock import Mock
+
+    from omnigent.errors import ErrorCode, KimiAuthConfigurationError, OmnigentError
+    from omnigent.models.model_resolver import ModelResolutionError
+    from omnigent.onboarding.provider_config import FamilyConfig, ProviderEntry
+    from omnigent.runtime import workflow
 
     conv = "conv_failed_status_carries_error"
     stable_id = "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
-    raised_message = "No model resolved for the 'claude-sdk' harness on a generic provider."
+    raised_message = "Model setup failed at /private/provider-config on provider.example.test."
+    setup_valid = False
+    catalog = Mock(side_effect=ModelResolutionError(raised_message))
+    monkeypatch.setattr(workflow, "resolve_catalog_model", catalog)
+    monkeypatch.setattr(workflow, "get_workspace_url_for_profile", lambda profile: None)
 
     async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         """
@@ -2510,18 +2732,45 @@ async def test_runner_failed_status_carries_setup_error_message(
         )
 
     def _raising_build(
-        spec: object, *, cwd: object = None, workdir: object = None
+        spec: AgentSpec, *, cwd: object = None, workdir: object = None
     ) -> dict[str, str]:
         """
-        Fail the spawn-env build the way the no-model provider path does.
+        Script a setup failure until the configuration is corrected.
 
         :param spec: The agent spec (unused).
         :param workdir: Bundle workdir (unused).
-        :returns: Never returns.
-        :raises OmnigentError: Always.
+        :returns: Empty spawn environment after correction.
+        :raises OmnigentError: While setup is invalid.
         """
-        del spec, workdir
-        raise OmnigentError(raised_message, code=ErrorCode.INVALID_INPUT)
+        del workdir
+        if not setup_valid:
+            if failure_kind == "provider-protocol":
+                provider = ProviderEntry(
+                    name="private-provider-name",
+                    kind="gateway",
+                    families={
+                        "openai": FamilyConfig(
+                            base_url="https://provider.example.test/private-route",
+                            api_key="private-provider-token",
+                            wire_api="chat",
+                        )
+                    },
+                )
+                monkeypatch.setattr(
+                    workflow, "_resolve_provider_for_build", lambda *_a, **_k: provider
+                )
+                try:
+                    workflow._build_codex_spawn_env(spec)
+                except OmnigentError as exc:
+                    raise exc from ValueError(raised_message)
+            if failure_kind == "model-discovery":
+                workflow._resolve_catalog_default_model(
+                    "provider.example.test", "openai", context=raised_message
+                )
+            if failure_kind == "public-config":
+                raise KimiAuthConfigurationError() from ValueError(raised_message)
+            raise OmnigentError(raised_message, code=ErrorCode.INVALID_INPUT)
+        return {}
 
     monkeypatch.setattr(
         "omnigent.runtime.workflow._build_claude_sdk_spawn_env",
@@ -2531,7 +2780,9 @@ async def test_runner_failed_status_carries_setup_error_message(
     app = create_runner_app(
         process_manager=cast(
             HarnessProcessManager,
-            _FakeProcessManager(_FakeHarnessClient([])),
+            _FakeProcessManager(
+                _FakeHarnessClient([_SSE_RESPONSE_CREATED, _SSE_RESPONSE_COMPLETED])
+            ),
         ),
         spec_resolver=_spec_resolver,
         server_client=NullServerClient(),  # type: ignore[arg-type]
@@ -2560,6 +2811,42 @@ async def test_runner_failed_status_carries_setup_error_message(
             until_status="failed",
             timeout=2.0,
         )
+        assert conv not in app.state.active_turns
+        assert conv not in app.state.live_response_id
+        assert not app.state.session_message_buffers.get(conv)
+
+        setup_valid = True
+        retry_id = "b" * 32
+        retry = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_claude_sdk",
+                "model": "x",
+                "content": [{"role": "user", "content": "retry"}],
+                "stable_id": retry_id,
+                "input_stable_id": retry_id,
+            },
+        )
+        assert retry.status_code == 202
+        assert retry.json()["status"] == "accepted"
+        await _await_bg_turn_task(conv)
+        retry_events = await _drain_turn_events(
+            app.state.session_event_queues, conv, until_status="idle", timeout=2.0
+        )
+        [completed] = [
+            event for event in retry_events if event.get("type") == "response.completed"
+        ]
+        assert completed["input_stable_id"] == retry_id
+        assert completed["response"]["status"] == "completed"
+        assert [
+            event["status"] for event in retry_events if event.get("type") == "session.status"
+        ] == ["running", "idle"]
+        assert not any(event.get("type") == "response.failed" for event in retry_events)
+        assert conv not in app.state.active_turns
+        assert conv not in app.state.live_response_id
+        assert not app.state.session_message_buffers.get(conv)
 
     failed_event = next(
         event
@@ -2569,17 +2856,97 @@ async def test_runner_failed_status_carries_setup_error_message(
     [undelivered] = [event for event in events if event.get("type") == "response.failed"]
     assert undelivered["input_stable_id"] == stable_id
     assert undelivered["response"]["error"]["undelivered"] is True
-    # The failed event must carry the real setup error message — not a
-    # bare status. Without the fix ``error`` is absent and the REPL
-    # renders nothing.
     assert failed_event is not None
     error = failed_event.get("error")
     assert isinstance(error, dict)
-    # The raised OmnigentError message is wrapped as "turn setup
-    # failed: <message>" by _run_turn_bg's setup-phase handler.
-    assert raised_message in error["message"]
+    public_guidance = (
+        "No default model could be resolved. Set 'executor.model' in the agent YAML "
+        "or a provider 'models.default', or retry when model discovery is available. "
+        if failure_kind == "model-discovery"
+        else ""
+    )
+    if failure_kind == "public-config":
+        public_guidance = f"{KimiAuthConfigurationError.client_message} "
+        assert "Remove ``executor.auth``" in error["message"]
+        assert "~/.kimi-code/config.toml" in error["message"]
+    elif failure_kind == "provider-protocol":
+        public_guidance = (
+            "The 'codex' harness requires an OpenAI Responses API endpoint. "
+            "Choose a Responses-capable endpoint and set 'wire_api: responses', "
+            "or use a harness that supports Chat Completions. "
+        )
+    assert error["message"] == (
+        f"turn setup failed: {public_guidance}Request failed on the runner; "
+        f"see the runner log for details: {pinned_runner_log}"
+    )
+    assert undelivered["response"]["error"]["message"] == error["message"]
+    assert raised_message not in error["message"]
+    assert "/private/provider-config" not in json.dumps(events)
+    assert "provider.example.test" not in json.dumps(events)
+    assert "private-provider-name" not in json.dumps(events)
+    assert "private-provider-token" not in json.dumps(events)
+    assert raised_message in caplog.text
+    if failure_kind == "model-discovery":
+        catalog.assert_called_once_with("provider.example.test", family="openai")
+    else:
+        catalog.assert_not_called()
     # Normalized shape always has a code so the wire ErrorDetail validates.
     assert error["code"]
+
+
+@pytest.mark.parametrize(
+    "error_kind,wrapped,repair",
+    [
+        ("kimi", False, "Remove ``executor.auth``"),
+        ("kimi", True, "Remove ``executor.auth``"),
+        ("signer-profile", False, "Set the Databricks provider's 'profile'"),
+        ("signer-state", False, "Run the provider's Codex setup"),
+        ("harness", False, "Correct the provider configuration and retry."),
+        ("harness", True, "Correct the provider configuration and retry."),
+    ],
+)
+def test_client_safe_error_detail_preserves_configuration_repairs(
+    error_kind: str,
+    wrapped: bool,
+    repair: str,
+    caplog: pytest.LogCaptureFixture,
+    pinned_runner_log: Path,
+) -> None:
+    from omnigent.errors import (
+        CodexSignerConfigurationError,
+        ErrorCode,
+        HarnessConfigurationError,
+        KimiAuthConfigurationError,
+        OmnigentError,
+    )
+    from omnigent.runner.app_support import _client_safe_error_detail
+
+    private_diagnostic = (
+        "private-provider-name at /private/provider-config on provider.example.test"
+    )
+    if error_kind == "kimi":
+        error = KimiAuthConfigurationError()
+    elif error_kind == "harness":
+        error = HarnessConfigurationError(
+            "Correct the provider configuration and retry.", diagnostic=private_diagnostic
+        )
+    else:
+        error = CodexSignerConfigurationError(
+            "profile" if error_kind == "signer-profile" else "state"
+        )
+    error.__cause__ = ValueError(private_diagnostic)
+    if wrapped:
+        outer = OmnigentError(private_diagnostic, code=ErrorCode.INVALID_INPUT)
+        outer.__cause__ = error
+        error = outer
+
+    detail = _client_safe_error_detail(error, context="turn setup")
+    assert repair in detail
+    assert detail.endswith(f"see the runner log for details: {pinned_runner_log}")
+    assert "private-provider-name" not in detail
+    assert "/private/provider-config" not in detail
+    assert "provider.example.test" not in detail
+    assert private_diagnostic in caplog.text
 
 
 # ── Harness-stream failure → terminal session.status ────
@@ -13677,9 +14044,11 @@ async def _contract_run_known_harness(
             "instructions": _CONTRACT_CALLER_INSTRUCTIONS,
         },
     )
+    events = _parse_sse(resp.content)
     return {
         "status": resp.status_code,
         "error": (resp.json().get("error") if resp.status_code >= 400 else None),
+        "terminal_event": events[-1][0] if events else None,
         "instructions": (
             recording.posted_bodies[-1].get("instructions") if recording.posted_bodies else None
         ),
@@ -13806,7 +14175,7 @@ def _contract_resolver_for(scenario: str, calls: list[str]) -> Any:
             },
             id="child_missing-background-parent",
         ),
-        # ── Resolver raises: same three-way split, different trigger.
+        # Selection failures are JSON; failures for a selected harness use SSE.
         pytest.param(
             "resolver_raises",
             "no_harness",
@@ -13816,8 +14185,13 @@ def _contract_resolver_for(scenario: str, calls: list[str]) -> Any:
         pytest.param(
             "resolver_raises",
             "known_harness",
-            {"status": 200, "instructions": _CONTRACT_CALLER_INSTRUCTIONS},
-            id="resolver_raises-known_harness-degrades",
+            {
+                "status": 200,
+                "error": None,
+                "instructions": None,
+                "terminal_event": "response.failed",
+            },
+            id="resolver_raises-known_harness-sse",
         ),
         pytest.param(
             "resolver_raises",
@@ -13836,8 +14210,8 @@ def _contract_resolver_for(scenario: str, calls: list[str]) -> Any:
         pytest.param(
             "resolver_none",
             "known_harness",
-            {"status": 200, "instructions": _CONTRACT_CALLER_INSTRUCTIONS},
-            id="resolver_none-known_harness-continues-unknown-spec",
+            {"status": 410, "error": "session_agent_missing", "instructions": None},
+            id="resolver_none-known_harness-410-agent-missing",
         ),
         pytest.param(
             "resolver_none",
@@ -13873,16 +14247,15 @@ def _contract_resolver_for(scenario: str, calls: list[str]) -> Any:
             },
             id="cache_holds_child-known_harness-shortcut",
         ),
-        # no_harness path resolves a second time even with a cached child.
         pytest.param(
             "cache_holds_child",
             "no_harness",
             {
                 "status": 200,
                 "instructions": _contract_composed_instructions("Worker instructions."),
-                "resolver_calls": 2,
+                "resolver_calls": 1,
             },
-            id="cache_holds_child-no_harness-resolves-again",
+            id="cache_holds_child-no_harness-shortcut",
         ),
     ],
 )
@@ -13891,6 +14264,9 @@ async def test_cross_path_resolution_contract(
     scenario: str,
     path: str,
     expected: dict[str, Any],
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Pin the resolution behaviour matrix across all three dispatch paths.
 
@@ -13899,10 +14275,9 @@ async def test_cross_path_resolution_contract(
     agreement is load-bearing — an unresolvable ``sub_agent_name`` gets one
     answer (warn, then the parent's spec) no matter which transport asked.
     The remaining scenarios still record transport-driven differences that
-    are intended: a synchronous 503, graceful degradation preserving the
-    caller's own instructions, and an asynchronous terminal ``failed``
-    against a 202 that has already gone out. Those differences come from
-    what each transport can report, not from differing answers.
+    are intended: streaming requests reject failed or missing resolution
+    before dispatch, while background requests publish terminal ``failed``
+    after their 202 response. All paths reuse a valid cached child spec.
 
     If you change one path and a row here starts failing, that is the point:
     decide whether the contract moved, do not quietly re-align the table.
@@ -13910,13 +14285,35 @@ async def test_cross_path_resolution_contract(
     :param scenario: Which resolution outcome the fake resolver produces.
     :param path: Which dispatch path adapter drives the turn.
     :param expected: Subset of the adapter's normalized result to assert.
+    :param caplog: Captured lookup diagnostics after session initialization.
     """
     conv = f"conv_contract_{scenario}_{path}"
     calls: list[str] = []
+    resolver = _contract_resolver_for(scenario, calls)
+    selected_entries = []
+    child_stream = scenario == "child_present" and path != "background"
+    if child_stream:
+        from omnigent.runner import app as runner_module
+
+        parent = _contract_root_spec(with_child=True)
+
+        async def resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+            calls.append(agent_id)
+            return parent
+
+        resolve_launch = runner_module._resolve_harness_launch
+
+        async def record_selection(**kwargs: Any) -> Any:
+            launch = await resolve_launch(**kwargs)
+            selected_entries.append(launch.spec_entry)
+            return launch
+
+        monkeypatch.setattr(runner_module, "_resolve_harness_launch", record_selection)
     recording = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
     app = create_runner_app(
         process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording)),
-        spec_resolver=_contract_resolver_for(scenario, calls),
+        spec_resolver=resolver,
+        runner_workspace=tmp_path,
         server_client=_ContractSnapshotClient(conv),  # type: ignore[arg-type]
     )
     async with _runner_test_client(app) as http:
@@ -13934,6 +14331,7 @@ async def test_cross_path_resolution_contract(
             )
             assert created.status_code == 201, created.text
             assert len(calls) == 1, f"session-create should resolve once, got {calls!r}"
+            caplog.clear()
         result = await _CONTRACT_ADAPTERS[path](http, conv, recording)
         if path == "background" and result.get("terminal_status") is None:
             # Background adapter needs the app's queue to drain terminal status.
@@ -13942,6 +14340,16 @@ async def test_cross_path_resolution_contract(
             )
             result["terminal_status"] = statuses[-1] if statuses else None
     result["resolver_calls"] = len(calls)
+
+    if child_stream:
+        from omnigent.runner.native.orchestration import ResolvedSpec
+
+        [selected] = selected_entries
+        assert isinstance(selected, ResolvedSpec) and selected.workdir is None
+
+    if scenario == "cache_holds_child" and path != "background":
+        assert "no workdir resolved" not in caplog.text
+        assert "falling back to the parent spec" not in caplog.text
 
     for key, want in expected.items():
         assert result.get(key) == want, (
