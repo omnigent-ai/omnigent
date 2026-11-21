@@ -144,6 +144,19 @@ def _kms_context(context: SecretContext) -> dict[str, str]:
     return {k: v for k, v in context.items() if v != ""}
 
 
+def _kms_key_region(key_id: str) -> str | None:
+    """Return the region of a KMS key or alias ARN, or ``None`` for a bare id or alias.
+
+    :param key_id: KMS key id, ARN, or ``alias/…``, e.g.
+        ``"arn:aws:kms:eu-west-1:111122223333:key/abc"``.
+    :returns: The ARN's region, e.g. ``"eu-west-1"``, else ``None``.
+    """
+    parts = key_id.split(":", 5)
+    if len(parts) == 6 and parts[0] == "arn" and parts[2] == "kms" and parts[3]:
+        return parts[3]
+    return None
+
+
 class KmsSecretCipher:
     """:class:`SecretCipher` backed by AWS KMS direct encrypt/decrypt.
 
@@ -155,7 +168,8 @@ class KmsSecretCipher:
     credentials — only constructing the cipher (which only happens when a key is
     configured) does.
 
-    :param key_id: KMS key id, ARN, or ``alias/…``.
+    :param key_id: KMS key id, ARN, or ``alias/…``. An ARN also selects the
+        client's region; otherwise boto3's default region resolution applies.
     :param client: Optional pre-built boto3 KMS client (tests inject a fake).
     """
 
@@ -174,7 +188,7 @@ class KmsSecretCipher:
                     "`pip install 'omnigent[kms]'`."
                 ) from exc
 
-            self._client = boto3.client("kms")
+            self._client = boto3.client("kms", region_name=_kms_key_region(self._key_id))
         return self._client
 
     def encrypt(self, plaintext: str, *, context: SecretContext) -> str:
