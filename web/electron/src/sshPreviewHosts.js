@@ -25,7 +25,11 @@ function createSshPreviewHosts({ destination, verify, record }) {
   function recorded(serverUrl, hostId) {
     if (typeof serverUrl !== "string" || typeof hostId !== "string" || !hostId) return null;
     const found = destination(serverUrl, hostId);
-    return typeof found === "string" && found ? found : null;
+    const current = typeof found === "string" && found ? found : null;
+    const key = keyFor(serverUrl, hostId);
+    // Restoring a replaced destination must not revive its earlier consent.
+    if (allowed.get(key) !== current) allowed.delete(key);
+    return current;
   }
 
   return {
@@ -39,7 +43,10 @@ function createSshPreviewHosts({ destination, verify, record }) {
      */
     allows(serverUrl, hostId) {
       const current = recorded(serverUrl, hostId);
-      return current !== null && allowed.get(keyFor(serverUrl, hostId)) === current;
+      const key = keyFor(serverUrl, hostId);
+      return (
+        current !== null && !declined.has(key) && !failed.has(key) && allowed.get(key) === current
+      );
     },
 
     /**
@@ -58,18 +65,21 @@ function createSshPreviewHosts({ destination, verify, record }) {
         return Promise.resolve(false);
       }
       const existing = recorded(serverUrl, hostId);
+      const key = keyFor(serverUrl, hostId);
+      if (declined.has(key) || failed.has(key)) return Promise.resolve(false);
+      if (existing !== null && allowed.get(key) === existing) return Promise.resolve(true);
       const asked = existing ?? (verify && record ? suggestedAlias(sshTarget) : null);
       if (asked === null) return Promise.resolve(false);
-      const key = keyFor(serverUrl, hostId);
-      if (allowed.get(key) === asked) return Promise.resolve(true);
-      if (declined.has(key) || failed.has(key)) return Promise.resolve(false);
       const inFlight = pending.get(key);
       if (inFlight) return inFlight;
       const attempt = Promise.resolve()
         .then(() => approve(asked, existing === null))
         .catch(() => null)
         .then(async (answer) => {
-          if (answer === false) declined.add(key);
+          if (answer === false) {
+            allowed.delete(key);
+            declined.add(key);
+          }
           if (answer !== true) return false;
           if (existing === null) {
             if (!(await verify(serverUrl, hostId, asked).catch(() => false))) {

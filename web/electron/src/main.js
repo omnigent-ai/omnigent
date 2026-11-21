@@ -47,7 +47,6 @@ const { omnigentBuild } = require("../package.json");
 const { execFile } = require("node:child_process");
 const { registerLocalhostCors } = require("./localhost_cors");
 const { isLoopbackPreviewUrl } = require("./browserUrlPolicy");
-const { normalizedServerTarget } = require("./hostStatusIdentity");
 const {
   registerBrowserPermissions,
   createBrowserPermissionStore,
@@ -4535,7 +4534,7 @@ function guardAgentPartitionRequests(partition, registry) {
  * Main-owned recovery scope for a loopback preview request, excluding the
  * renderer-supplied host match that decides whether this session may ask.
  */
-function arcaPreviewRecoveryTargetForEvent(event, url) {
+function previewRecoveryTargetForEvent(event, url) {
   const win = BrowserWindow.fromWebContents(event.sender);
   if (
     !isLoopbackPreviewUrl(url) ||
@@ -4565,7 +4564,7 @@ function arcaPreviewRecoveryContextForEvent(
   rememberedArcaHostId,
   sourceIsArcaHost,
 ) {
-  const targetContext = arcaPreviewRecoveryTargetForEvent(event, url);
+  const targetContext = previewRecoveryTargetForEvent(event, url);
   if (
     !targetContext ||
     typeof sourceHostId !== "string" ||
@@ -6168,7 +6167,7 @@ function registerIpc() {
         win.isDestroyed() ||
         !isPinnedOriginSender(event) ||
         !isLoopbackPreviewUrl(url) ||
-        pendingPreviewReconnects.has(normalizedServerTarget(serverUrl)) ||
+        pendingPreviewReconnects.has(previewRecoveryTargetForEvent(event, url)?.target) ||
         sshPreviewHosts.allows(serverUrl, sourceHostId)
       ) {
         return false;
@@ -6192,7 +6191,7 @@ function registerIpc() {
         ? sshPreviewHosts.hint(senderServerUrl(event), sourceHostId)
         : null;
       if (previewHint) return previewHint;
-      const targetContext = arcaPreviewRecoveryTargetForEvent(event, url);
+      const targetContext = previewRecoveryTargetForEvent(event, url);
       if (!targetContext) return null;
       if (typeof rememberedArcaHostId !== "string") {
         return "Open New session > Host > Run on Arca to restore its connection details, then retry the preview.";

@@ -5429,6 +5429,7 @@ describe("browser-view teardown on server change (src/main.js)", () => {
 
   it("returns immediately and shares one consent prompt across agent retries", async (t) => {
     const serverUrl = "https://account.databricks.com/omnigent?o=123";
+    const resolvedOrigin = "https://accounts.cloud.databricks.com";
     const hostId = "a".repeat(32);
     let settleConsent;
     const consent = new Promise((resolve) => {
@@ -5436,16 +5437,21 @@ describe("browser-view teardown on server change (src/main.js)", () => {
     });
     const h = loadNavigationHarness({
       serverUrl,
+      databricksMode: "browser",
+      ensureSession: async () => resolvedOrigin,
       internalFeatures: true,
       arcaPath: "/usr/local/bin/arca",
       arcaConsentResult: () => consent,
     });
     t.after(h.cleanup);
     h.api.registerIpc();
+    const resolvedUrl = await h.api.loadServerUrl(h.win, serverUrl);
+    assert.equal(resolvedUrl, `${resolvedOrigin}/omnigent`);
+    assert.notEqual(resolvedUrl, serverUrl);
     const deps = h.browserIpcDeps();
     const recover = deps.recoverAgentNavigationForEvent;
     const hint = deps.getAgentNavigationHintForEvent;
-    const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
+    const event = { sender: h.webContents, senderFrame: { url: resolvedUrl } };
     let previewPrompts = 0;
     h.electron.dialog.showMessageBox = async () => {
       previewPrompts++;

@@ -274,6 +274,7 @@ function createBrowserViewRegistry({
         return { action: "deny" };
       }
       try {
+        beginAgentNavigation(entry.conversationId);
         wc.loadURL(url);
       } catch {
         /* view destroyed mid-click */

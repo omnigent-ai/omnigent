@@ -37,6 +37,10 @@ it("proves the exact host and selected server using only a bounded read-only SSH
     "-o",
     "ClearAllForwardings=yes",
     "-o",
+    "ForwardAgent=no",
+    "-o",
+    "ForwardX11=no",
+    "-o",
     "ControlMaster=no",
     "-o",
     "RemoteCommand=none",
@@ -109,7 +113,7 @@ it(
     const config = path.join(scratch, "config");
     fs.writeFileSync(
       config,
-      "Host devbox\n  HostName example.invalid\n  RemoteCommand tmux attach\n  RequestTTY force\n  ControlMaster ask\n  CanonicalizeHostname no\n",
+      "Host devbox\n  HostName example.invalid\n  RemoteCommand tmux attach\n  RequestTTY force\n  ControlMaster ask\n  ForwardAgent yes\n  ForwardX11 yes\n  CanonicalizeHostname no\n",
     );
     let parsed;
     const verified = await verifySshPreviewIdentity(SERVER, HOST, "devbox", async (file, args) => {
@@ -123,6 +127,8 @@ it(
     assert.equal(parsed?.status, 0, parsed?.stderr);
     assert.match(parsed.stdout, /^requesttty false$/m);
     assert.match(parsed.stdout, /^controlmaster false$/m);
+    assert.match(parsed.stdout, /^forwardagent no$/m);
+    assert.match(parsed.stdout, /^forwardx11 no$/m);
     assert.equal(verified, true);
   },
 );

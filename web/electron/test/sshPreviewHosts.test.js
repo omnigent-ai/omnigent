@@ -95,12 +95,13 @@ describe("localhost previews for hosts reached over SSH", () => {
 
   for (const failure of ["verification", "storage"]) {
     it(`fails closed without repeating consent when ${failure} throws`, async (t) => {
+      let destination = "devbox";
       let questions = 0;
       let proofs = 0;
       let records = 0;
       const warnings = t.mock.method(console, "warn", () => {});
       const previews = createSshPreviewHosts({
-        destination: () => null,
+        destination: () => destination,
         verify: async () => {
           proofs++;
           if (failure === "verification") throw new Error("offline");
@@ -115,9 +116,13 @@ describe("localhost previews for hosts reached over SSH", () => {
         questions++;
         return true;
       };
+      assert.equal(await previews.request(SERVER, HOST, async () => true), true);
+      destination = null;
       assert.equal(await previews.request(SERVER, HOST, approve, "devbox"), false);
       assert.equal(await previews.request(SERVER, HOST, approve, "another-alias"), false);
+      destination = "devbox";
       assert.equal(previews.allows(SERVER, HOST), false);
+      assert.equal(await previews.request(SERVER, HOST, approve), false);
       assert.equal(questions, 1);
       assert.equal(proofs, 1);
       assert.equal(records, failure === "storage" ? 1 : 0);
@@ -205,13 +210,17 @@ describe("localhost previews for hosts reached over SSH", () => {
       return false;
     };
     assert.equal(previews.hint(SERVER, HOST), null);
+    assert.equal(await previews.request(SERVER, HOST, async () => true), true);
+    destinations[SERVER][HOST] = "replacement";
     assert.equal(await previews.request(SERVER, HOST, decline), false);
     assert.equal(await previews.request(SERVER, HOST, decline), false);
     assert.equal(questions, 1);
     assert.equal(previews.allows(SERVER, HOST), false);
-    assert.match(previews.hint(SERVER, HOST), /"devbox" were declined/);
-    destinations[SERVER][HOST] = "replacement";
+    assert.match(previews.hint(SERVER, HOST), /"replacement" were declined/);
+    destinations[SERVER][HOST] = "devbox";
+    assert.equal(previews.allows(SERVER, HOST), false);
     assert.equal(await previews.request(SERVER, HOST, decline), false);
+    assert.match(previews.hint(SERVER, HOST), /"devbox" were declined/);
     assert.equal(questions, 1);
   });
 
@@ -248,7 +257,16 @@ describe("localhost previews for hosts reached over SSH", () => {
     assert.equal(await previews.request(SERVER, HOST, async () => true), true);
     destinations[SERVER][HOST] = "replacement";
     assert.equal(previews.allows(SERVER, HOST), false);
+    destinations[SERVER][HOST] = "devbox";
+    assert.equal(
+      previews.allows(SERVER, HOST),
+      false,
+      "restoring a destination must not revive consent",
+    );
+    assert.equal(await previews.request(SERVER, HOST, async () => true), true);
     destinations[SERVER][HOST] = null;
+    assert.equal(previews.allows(SERVER, HOST), false);
+    destinations[SERVER][HOST] = "devbox";
     assert.equal(previews.allows(SERVER, HOST), false);
   });
 
