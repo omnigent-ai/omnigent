@@ -5912,20 +5912,26 @@ def _raise_if_managed_wake_misses_host_tunnel(
     """
     Re-address a client request that would wake a managed host off its tunnel's replica.
 
-    A client that knows the host sends its id as the routing key, and the host it
-    wakes dials the replica that id names. A request carrying any other key would
-    run the wake where the tunnel won't land and park for the whole wake, so
-    answer ``WRONG_REPLICA`` first, naming the host's id. A request with no key at
-    all comes from a client that predates host routing; it wakes a dormant host on
-    the default replica, where that client's requests go, but is re-addressed like
-    any other key when the host is live on another replica. Only a fastapi ``Request``
-    names a routing key; internal callers pass nothing and skip this check.
+    A client that knows the host sends its id as the routing key, and a host it
+    wakes dials the replica that id names. A request with no key at all comes from
+    a client that predates host routing, whose host lives on the default replica.
+    Either may wake a dormant host here. A host that is live with no tunnel on this
+    replica is connected elsewhere, and force-waking it would restart it under
+    every session it serves, so the request is re-addressed instead: by the host's
+    id when it arrived keyless (the host is keyed), or without a key when it
+    arrived keyed (the host is on the default replica). A request carrying any
+    other key is re-addressed by the host's id before any wake. Only a fastapi
+    ``Request`` names a routing key; internal callers pass nothing and skip this
+    check.
 
     :param conv: Session row whose host may need a wake.
     :param host: The session's managed host row, already loaded by the caller.
     :param request: The inbound request, or ``None``/a non-HTTP context to skip.
     :param app_state: ``request.app.state`` — supplies the host registry.
-    :raises WrongReplicaError: When the request is routed by another key.
+    :raises WrongReplicaError: Naming the host's id, for a request that must be
+        resent keyed by it.
+    :raises OmnigentError: ``WRONG_REPLICA`` (no key to resend) for a host-keyed
+        request whose host is live on the default replica.
     """
     from fastapi import Request
 
@@ -5936,15 +5942,18 @@ def _raise_if_managed_wake_misses_host_tunnel(
     host_registry = getattr(app_state, "host_registry", None)
     if conv.host_id is None or host_registry is None or not _deployment_is_sharded():
         return
+    if host_registry.get(conv.host_id) is not None or host.sandbox_provider is None:
+        return
     routed_key = routed_slice_key(request)
-    if routed_key == conv.host_id or host_registry.get(conv.host_id) is not None:
+    live_elsewhere = host_is_live(host)
+    if routed_key in (None, conv.host_id) and not live_elsewhere:
         return
-    if host.sandbox_provider is None:
-        return
-    # A host live with no tunnel here is connected on its own key's replica; a
-    # keyless wake would restart it unkeyed under every session it serves.
-    if routed_key is None and not host_is_live(host):
-        return
+    if routed_key == conv.host_id:
+        raise OmnigentError(
+            f"managed host {conv.host_id} is connected on the default replica; "
+            "retry without its slice key",
+            code=ErrorCode.WRONG_REPLICA,
+        )
     raise WrongReplicaError(
         f"managed host {conv.host_id} wakes on the replica its slice key names",
         host_id=conv.host_id,
