@@ -92,6 +92,62 @@ async def test_post_user_message_truly_empty_is_skipped() -> None:
     assert client.posts == []
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("resumed_client_id", "live_client_id", "expected_count"),
+    [
+        ("a" * 32, "b" * 32, 2),
+        ("a" * 32, "a" * 32, 1),
+        ("a" * 32, None, 2),
+        (None, "b" * 32, 2),
+        (None, None, 1),
+    ],
+    ids=["new_steer", "same_input_echo", "resumed_id_only", "live_id_only", "legacy_echo"],
+)
+@pytest.mark.parametrize("resume_first", [False, True], ids=["live_first", "resume_first"])
+async def test_user_message_copy_pairing_respects_native_client_id(
+    resumed_client_id: str | None,
+    live_client_id: str | None,
+    expected_count: int,
+    resume_first: bool,
+) -> None:
+    """Identical text from different accepted inputs must survive resume overlap."""
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState(parent_session_id="conv_x")
+    state.resume_echo_thread_ids.add("thread_1")
+    content = [{"type": "text", "text": "Run the tests again."}]
+    resumed = {
+        "type": "userMessage",
+        "id": "item-1",
+        "clientId": resumed_client_id,
+        "content": content,
+    }
+    live = {
+        "type": "userMessage",
+        "id": "native_user_1",
+        "clientId": live_client_id,
+        "content": content,
+    }
+    items = [resumed, live] if resume_first else [live, resumed]
+    for item in [*items, live]:
+        await fwd._handle_completed_item(
+            client,  # type: ignore[arg-type]
+            "conv_x",
+            {"threadId": "thread_1", "turnId": "turn_1", "item": item},
+            forwarder_state=state,
+        )
+
+    posted = [body["data"] for _, body in client.posts]
+    assert len(posted) == expected_count
+    assert [item["source_id"] for item in posted] == [
+        f"thread_1:turn_1:{item['id']}" for item in items[: len(posted)]
+    ]
+    assert all(
+        item["item_data"]["content"] == [{"type": "input_text", "text": "Run the tests again."}]
+        for item in posted
+    )
+
+
 @pytest.mark.parametrize(
     ("echoing_replay", "copies", "expected_duplicates"),
     [
