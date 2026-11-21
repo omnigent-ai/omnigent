@@ -21,6 +21,11 @@ Each test names the production behavior it pins:
   ``interrupt`` path with the correct session id.
 * ``test_files_*``: that the file-upload pipeline runs through the
   injected uploader and produces the right content blocks.
+* ``test_create_factory_forwards_session_metadata``: that ``create()``
+  passes title/labels/reasoning_effort/workspace/host_id/
+  ``terminal_launch_args`` through to ``namespace.create`` instead of
+  dropping them. Failure means headless native sessions cannot set
+  launch flags without wrapping the namespace by hand.
 """
 
 from __future__ import annotations
@@ -139,6 +144,7 @@ class _FakeNamespace(SessionsNamespace):
         self.resolve_elicitation_calls: list[_ResolveElicitationCall] = []
         self.interrupt_calls: list[str] = []
         self.create_calls: list[tuple[bytes, str]] = []
+        self.create_kwargs: list[dict[str, Any]] = []
         self.get_calls: list[str] = []
         self.subtree_busy_calls: list[tuple[str, int]] = []
         self._subtree_busy_result: bool = False
@@ -150,9 +156,27 @@ class _FakeNamespace(SessionsNamespace):
         filename: str = "agent.tar.gz",
         title: str | None = None,
         labels: dict[str, str] | None = None,
+        reasoning_effort: str | None = None,
+        workspace: str | None = None,
+        host_type: str = "external",
+        sandbox_provider: str | None = None,
+        terminal_launch_args: list[str] | None = None,
+        host_id: str | None = None,
     ) -> Session:
-        del title, labels
         self.create_calls.append((bundle, filename))
+        self.create_kwargs.append(
+            {
+                "filename": filename,
+                "title": title,
+                "labels": labels,
+                "reasoning_effort": reasoning_effort,
+                "workspace": workspace,
+                "host_type": host_type,
+                "sandbox_provider": sandbox_provider,
+                "terminal_launch_args": terminal_launch_args,
+                "host_id": host_id,
+            }
+        )
         return self._session_obj
 
     async def get(self, session_id: str) -> Session:  # type: ignore[override]
@@ -1270,6 +1294,46 @@ async def test_create_factory_creates_session_and_wires_helpers() -> None:
     assert chat.session_id == "conv_abc"
     assert chat.agent_id == "ag_abc"
     assert chat._hooks is hooks
+
+
+@pytest.mark.asyncio
+async def test_create_factory_forwards_session_metadata() -> None:
+    session = _make_session()
+    ns = _FakeNamespace(stream_scripts=[], session_obj=session)
+    launch_args = [
+        "--disallowedTools",
+        "AskUserQuestion",
+        "--permission-mode",
+        "bypassPermissions",
+    ]
+
+    chat = await SessionsChat.create(
+        namespace=ns,
+        bundle=b"bundle-bytes",
+        filename="agent.tar.gz",
+        title="headless native",
+        labels={"bench": "flowbench"},
+        reasoning_effort="high",
+        workspace="/tmp/proj",
+        host_id="host_abc",
+        terminal_launch_args=launch_args,
+    )
+
+    assert chat.session_id == "conv_abc"
+    assert ns.create_calls == [(b"bundle-bytes", "agent.tar.gz")]
+    assert ns.create_kwargs == [
+        {
+            "filename": "agent.tar.gz",
+            "title": "headless native",
+            "labels": {"bench": "flowbench"},
+            "reasoning_effort": "high",
+            "workspace": "/tmp/proj",
+            "host_type": "external",
+            "sandbox_provider": None,
+            "terminal_launch_args": launch_args,
+            "host_id": "host_abc",
+        }
+    ]
 
 
 # ── tool_callables validation + dispatch ──────────────────────────────
