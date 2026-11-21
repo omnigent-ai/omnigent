@@ -911,6 +911,10 @@ class SqlProject(OmnigentBase):
     # (CompressedText).
     config: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     orchestrator_session_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    # Board definitions are a single bounded document, separate from session defaults.
+    ticket_stages: Mapped[dict[str, Any] | None] = mapped_column(
+        EnvelopedJSON(16383), nullable=True
+    )
 
     __table_args__ = (
         # "list my projects" — prefix scan on (workspace_id, user_id) with
@@ -952,6 +956,8 @@ class SqlProjectTicket(OmnigentBase):
     title: Mapped[str] = mapped_column(EnvelopedText(1024), nullable=False)
     description: Mapped[str] = mapped_column(EnvelopedText(16383), nullable=False)
     status: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    # NULL retains the original numeric status until a stage-aware writer moves the ticket.
+    stage_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     tags: Mapped[list[dict[str, str]]] = mapped_column(EnvelopedJSON(4096), nullable=False)
     completion_summary: Mapped[str | None] = mapped_column(EnvelopedText(8192), nullable=True)
     plan: Mapped[str | None] = mapped_column(EnvelopedText(16383), nullable=True)
@@ -967,6 +973,23 @@ class SqlProjectTicket(OmnigentBase):
         Index("ix_project_tickets_created", "workspace_id", "project_id", "created_at", "id"),
         Index(
             "ix_project_tickets_status", "workspace_id", "project_id", "status", "created_at", "id"
+        ),
+        Index(
+            "ix_project_tickets_stage",
+            "workspace_id",
+            "project_id",
+            "stage_id",
+            "created_at",
+            "id",
+        ),
+        Index(
+            "ix_project_tickets_legacy_stage",
+            "workspace_id",
+            "project_id",
+            "stage_id",
+            "status",
+            "created_at",
+            "id",
         ),
     )
 

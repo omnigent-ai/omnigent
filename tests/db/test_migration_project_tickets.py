@@ -69,6 +69,8 @@ def test_schema_paths_agree_on_keys_bounds_defaults_and_indexes(ticket_engine):
         } == expected
     project = {col["name"]: col for col in inspector.get_columns("projects")}
     assert project["orchestrator_session_id"]["nullable"] is True
+    assert project["ticket_stages"]["nullable"] is True
+    assert project["ticket_stages"]["default"] is None
     # SQLite ignores VARCHAR lengths, so the migration and metadata enforce a byte cap.
     event_table = sa.Table("project_ticket_events", sa.MetaData(), autoload_with=ticket_engine)
     with pytest.raises(sa.exc.DBAPIError), ticket_engine.begin() as connection:
@@ -115,6 +117,18 @@ def test_ticket_pages_seek_indexes_without_sorting(ticket_engine):
             f"{project} AND status = 0 AND {cursor}",
             "created_at, id",
             "ix_project_tickets_status",
+        ),
+        (
+            "project_tickets",
+            f"{project} AND stage_id = 'investigating' AND {cursor}",
+            "created_at, id",
+            "ix_project_tickets_stage",
+        ),
+        (
+            "project_tickets",
+            f"{project} AND stage_id IS NULL AND status = 0 AND {cursor}",
+            "created_at, id",
+            "ix_project_tickets_legacy_stage",
         ),
         (
             "project_ticket_events",
@@ -229,10 +243,116 @@ def test_lifecycle_migration_preserves_existing_ticket_statuses_and_history(tmp_
         }
         with engine.begin() as connection:
             config.attributes["connection"] = connection
-            command.upgrade(config, "f9a0b1c2d3e4")
+            command.upgrade(config, "head")
         for ticket, events in records:
             assert tickets.get(project.id, ticket["id"], user_id=actor.user_id) == ticket
             assert tickets.events(project.id, ticket["id"], user_id=actor.user_id) == events
+    finally:
+        engine.dispose()
+        clear_engine_cache()
+
+
+def test_stages_migration_preserves_legacy_rows_and_refuses_lossy_downgrade(tmp_path):
+    uri = f"sqlite:///{tmp_path / 'stages.db'}"
+    engine = get_or_create_engine(uri)
+    config = _build_alembic_config(uri)
+    try:
+        with engine.begin() as connection:
+            config.attributes["connection"] = connection
+            command.downgrade(config, "0a1b2c3d4e5f")
+            tables = {
+                name: sa.Table(name, sa.MetaData(), autoload_with=connection)
+                for name in ("projects", *(table.name for table in TABLES))
+            }
+            connection.execute(
+                tables["projects"]
+                .insert()
+                .values(workspace_id=0, id=b"p" * 16, name="Existing", user_id=None, created_at=1)
+            )
+            for status in range(5):
+                connection.execute(
+                    tables["project_tickets"]
+                    .insert()
+                    .values(
+                        workspace_id=0,
+                        project_id=b"p" * 16,
+                        id=bytes([status]) * 16,
+                        title=b"original title",
+                        description=b"original description",
+                        status=status,
+                        tags=b"original tags",
+                        completion_summary=b"original summary" if status == 2 else None,
+                        plan=b"original plan",
+                        review_summary=b"original review",
+                        latest_update=b"original update",
+                        comment_count=1,
+                        next_event_position=1,
+                        created_at=1,
+                        updated_at=2,
+                    )
+                )
+            connection.execute(
+                tables["project_ticket_events"]
+                .insert()
+                .values(
+                    workspace_id=0,
+                    project_id=b"p" * 16,
+                    ticket_id=bytes(16),
+                    id=b"e" * 16,
+                    position=0,
+                    kind=1,
+                    payload=b"historical status",
+                    created_at=2,
+                    notification_state=0,
+                )
+            )
+            connection.execute(
+                tables["project_ticket_sessions"]
+                .insert()
+                .values(
+                    workspace_id=0,
+                    project_id=b"p" * 16,
+                    ticket_id=bytes(16),
+                    session_id=b"s" * 16,
+                    involvement=b"original involvement",
+                    created_at=1,
+                )
+            )
+            connection.execute(
+                tables["project_ticket_links"]
+                .insert()
+                .values(
+                    workspace_id=0,
+                    project_id=b"p" * 16,
+                    ticket_id=bytes(16),
+                    related_ticket_id=bytes([1]) * 16,
+                    created_at=1,
+                )
+            )
+            before = {
+                name: list(connection.execute(table.select()).mappings())
+                for name, table in tables.items()
+            }
+            command.upgrade(config, "1b2c3d4e5f6a")
+            for name, table in tables.items():
+                assert list(connection.execute(table.select()).mappings()) == before[name]
+            assert (
+                connection.scalar(sa.text("SELECT stage_id FROM project_tickets LIMIT 1")) is None
+            )
+            assert connection.scalar(sa.text("SELECT ticket_stages FROM projects LIMIT 1")) is None
+            command.downgrade(config, "0a1b2c3d4e5f")
+            command.upgrade(config, "1b2c3d4e5f6a")
+            connection.execute(
+                sa.text("UPDATE project_tickets SET stage_id = 'investigating' WHERE id = :id"),
+                {"id": bytes(16)},
+            )
+        with engine.begin() as connection:
+            config.attributes["connection"] = connection
+            with pytest.raises(RuntimeError, match="Stage data exists"):
+                command.downgrade(config, "0a1b2c3d4e5f")
+        assert "stage_id" in {
+            col["name"] for col in sa.inspect(engine).get_columns("project_tickets")
+        }
     finally:
         engine.dispose()
         clear_engine_cache()
