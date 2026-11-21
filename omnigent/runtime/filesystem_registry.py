@@ -70,6 +70,11 @@ _GIT_DISCOVERY_ENV = frozenset(
 )
 
 
+# Global options that keep read-only status/diff from refreshing and writing
+# the index. ``--no-optional-locks`` alone does not stop ``git diff`` doing so.
+_LOCK_FREE_GIT_READ_OPTIONS = ("--no-optional-locks", "-c", "diff.autoRefreshIndex=false")
+
+
 def _anchored_git_env() -> dict[str, str]:
     """Return this process's environment minus repository-redirecting ``GIT_*``.
 
@@ -164,6 +169,14 @@ _SKIP_DIRS: frozenset[str] = frozenset(
     }
 )
 
+# Caps on reading untracked files to count their lines, per changes listing.
+# Each read reserves the listed size plus one byte, which detects a grown file.
+_UNTRACKED_LINES_MAX_FILES = 1_000
+_UNTRACKED_LINES_MAX_FILE_BYTES = 1024 * 1024
+_UNTRACKED_LINES_MAX_TOTAL_BYTES = 8 * 1024 * 1024
+# Git's content heuristic for binary files: a NUL within the first 8000 bytes.
+_BINARY_SNIFF_BYTES = 8000
+
 # Cursor plumbing Omnigent writes into ``<workspace>/.cursor`` at session launch
 # (cursor-agent reads project config only there). Session infrastructure, not
 # user edits; only these exact paths are hidden, other ``.cursor`` content shows.
@@ -174,6 +187,45 @@ _CURSOR_PLUMBING_PATHS: frozenset[str] = frozenset(
         ".cursor/omnigent-hook.sh",
     }
 )
+
+
+def _count_untracked_lines(root: Path, records: list[dict[str, Any]], untracked: set[str]) -> None:
+    """Set ``untracked_lines`` on each untracked record, newest first.
+
+    Counts newline-terminated lines (plus an unterminated last line) in files
+    that pass Git's NUL-byte content check; ``.gitattributes`` overrides are
+    not applied. Binary, oversized, grown, unsafe, unreadable and over-budget
+    files get ``None``; one budget bounds the reads of a whole listing. Tracked
+    records are left alone, so ``lines_added`` keeps meaning "tracked lines".
+
+    :param root: Directory the record paths are relative to.
+    :param records: Records to annotate in place, newest first.
+    :param untracked: Record paths ``git status`` reported as ``??``.
+    """
+    from omnigent.runner.environment_filesystem import read_regular_file_beneath
+
+    budget = _UNTRACKED_LINES_MAX_TOTAL_BYTES
+    files_left = _UNTRACKED_LINES_MAX_FILES
+    for record in records:
+        if record["path"] not in untracked:
+            continue
+        size = record["bytes"]
+        data = None
+        if (
+            files_left > 0
+            and size is not None
+            and size <= _UNTRACKED_LINES_MAX_FILE_BYTES
+            and size < budget
+        ):
+            # Spend the allowance before reading, so a read that fails midway still counts.
+            files_left -= 1
+            budget -= size + 1
+            data = read_regular_file_beneath(root, record["path"], size)
+        if data is None or len(data) > size or b"\0" in data[:_BINARY_SNIFF_BYTES]:
+            record["untracked_lines"] = None
+        else:
+            trailing = 1 if data and not data.endswith(b"\n") else 0
+            record["untracked_lines"] = data.count(b"\n") + trailing
 
 
 def _is_ephemeral(path: str) -> bool:
@@ -466,7 +518,8 @@ def _parse_git_porcelain_line(line: str) -> tuple[str, str] | None:
 
     Status mapping:
 
-    - ``??`` (untracked) and ``A`` (staged new file) → ``"created"``
+    - ``??`` (untracked), ``A`` (staged new file) and `` A`` (``git add -N``,
+      no HEAD version) → ``"created"``
     - ``D`` in either column → ``"deleted"``
     - Everything else (``M``, ``R``, ``C``, ``U``, …) → ``"modified"``
 
@@ -492,7 +545,7 @@ def _parse_git_porcelain_line(line: str) -> tuple[str, str] | None:
         path_part = _strip_git_quotes(path_part)
 
     x, y = xy[0], xy[1]
-    if (x == "?" and y == "?") or x == "A":
+    if xy in ("??", " A") or x == "A":
         operation = "created"
     elif x == "D" or y == "D":
         operation = "deleted"
@@ -1266,6 +1319,18 @@ class GitFilesystemRegistry(FilesystemRegistry):
         :param limit: Maximum number of records to return.
         :returns: List of file-record dicts, newest first.
         """
+        records, untracked = self._list_git_changes()
+        records = records[:limit]
+        _count_untracked_lines(self._cwd, records, untracked)
+        return records
+
+    def _list_git_changes(self) -> tuple[list[dict[str, Any]], set[str]]:
+        """Return every change record, newest first, and the untracked paths.
+
+        :returns: ``(records, untracked)``; *untracked* holds the paths
+            ``git status`` reported as ``??``.
+        :raises GitStatusUnavailable: When ``git status`` cannot answer.
+        """
         # ``--untracked-files=all`` forces git to expand entirely-untracked
         # directories into their individual files.  Without it, a new file
         # inside a brand-new directory tree collapses to a single ``?? dir/``
@@ -1319,6 +1384,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
 
         numstat = self._run_git_numstat()
         records: list[dict[str, Any]] = []
+        untracked: set[str] = set()
         for line in result.stdout.decode("utf-8", errors="replace").splitlines():
             parsed = _parse_git_porcelain_line(line)
             if parsed is None:
@@ -1327,6 +1393,8 @@ class GitFilesystemRegistry(FilesystemRegistry):
             rel_path = self._git_to_rel(git_path)
             if rel_path is None:
                 continue
+            if line.startswith("??"):
+                untracked.add(rel_path)
             if _is_ephemeral(rel_path) or _is_harness_plumbing(rel_path):
                 continue
             # Skip runner-internal and build directories (e.g. terminals/,
@@ -1343,7 +1411,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
         # its own ``git status``, which can take tens of seconds on a big repo.
         self._last_changes = [r["path"] for r in records if r["status"] != "deleted"]
         records.sort(key=lambda r: (r["modified_at"] or 0, r["path"]), reverse=True)
-        return records[:limit]
+        return records, untracked
 
     def get_changed_file(self, session_id: str, path: str) -> dict[str, Any] | None:
         """Return the change record for a single *path*, or ``None``.
@@ -1464,6 +1532,9 @@ class GitFilesystemRegistry(FilesystemRegistry):
     def _run_git(self, argv: list[str]) -> subprocess.CompletedProcess[bytes]:
         if self._run_git_command is not None:
             return self._run_git_command(argv[1:], self._git_root, _git_timeout_seconds())
+        # These background reads must not take index.lock, or the agent's own
+        # `git add`/`git commit` fails while a slow status is running.
+        argv = [argv[0], *_LOCK_FREE_GIT_READ_OPTIONS, *argv[1:]]
         return subprocess.run(
             argv, cwd=str(self._git_root), capture_output=True, timeout=_git_timeout_seconds()
         )
@@ -1668,22 +1739,24 @@ class MultiRepositoryFilesystemRegistry(AgentEditFilesystemRegistry):
     def list_changed_files(self, conversation_id: str, *, limit: int) -> list[dict[str, Any]]:
         roots = self._repository_roots()
         records = self._list_observed_files(conversation_id, limit=10_001, excluded_roots=roots)
+        untracked: set[str] = set()
         for prefix, root in sorted(roots.items()):
             try:
-                records.extend(
-                    self._prefix(record, prefix)
-                    for record in self._reader(root).list_changed_files(
-                        conversation_id, limit=10_001
-                    )
-                )
+                repository_records, repository_untracked = self._reader(root)._list_git_changes()
             except GitStatusUnavailable as exc:
                 raise GitStatusUnavailable(
                     f"Repository {prefix or root.name!r}: {exc.reason}"
                 ) from exc
+            records.extend(self._prefix(record, prefix) for record in repository_records)
+            untracked.update(
+                f"{prefix}/{path}" if prefix else path for path in repository_untracked
+            )
             if len(records) > 10_000:
                 raise GitStatusUnavailable("Workspace exceeds 10000 changed files")
         records.sort(key=lambda record: (record["modified_at"] or 0, record["path"]), reverse=True)
-        return records[:limit]
+        records = records[:limit]
+        _count_untracked_lines(self._cwd, records, untracked)
+        return records
 
     def get_changed_file(self, session_id: str, path: str) -> dict[str, Any] | None:
         owner = self._owner(path)

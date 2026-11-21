@@ -37,6 +37,11 @@ export interface Host {
   /** Whether this connected host supports the interactive login/logout routes. */
   harness_login_supported?: boolean;
   /**
+   * Whether this host's runners accept session messages over 8,000 characters.
+   * False when the server can't confirm it; absent from older servers.
+   */
+  long_session_messages_supported?: boolean;
+  /**
    * Whether each harness family's launch on this host resolves an
    * AI-Gateway-backed inference config, e.g. `{"claude-native": true,
    * "codex": false}`. Smart Routing's apply layer only works on gateway-backed
@@ -68,8 +73,9 @@ interface HostsResponse {
 export async function fetchHosts(
   includeSandbox: boolean,
   sourceHostId?: string | null,
+  signal?: AbortSignal,
 ): Promise<Host[]> {
-  const res = await authenticatedFetch("/v1/hosts");
+  const res = await authenticatedFetch("/v1/hosts", signal ? { signal } : undefined);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const body = (await res.json()) as HostsResponse;
   // Hide server-managed sandbox hosts from every host picker: they

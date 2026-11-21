@@ -7,14 +7,19 @@ import type * as ConversationsModule from "@/hooks/useConversations";
 import type * as UnseenConversationsModule from "@/hooks/useUnseenConversations";
 import type * as UseFileContentModule from "@/hooks/useFileContent";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
+import type * as ScheduledTasksApiModule from "@/lib/scheduledTasksApi";
+import { deleteScheduledTask } from "@/lib/scheduledTasksApi";
+import type { ServerInfo } from "@/lib/capabilities";
 import { setOmnigentHostConfig } from "@/lib/host";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { PINNED_LABEL_KEY, PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
+import { MUTED_LABEL_KEY } from "@/lib/sessionMute";
 import { toast } from "sonner";
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { resetDesktopCommandsForTests } from "@/lib/desktopCommands";
+import { usePaletteCommandsStore } from "@/store/paletteCommands";
 import { HeaderConversationMenu } from "./HeaderConversationMenu";
 
 const mocks = vi.hoisted(() => ({
@@ -35,6 +40,18 @@ const mocks = vi.hoisted(() => ({
   exportTranscript: vi.fn(),
   triggerDownload: vi.fn(),
   toastError: vi.fn(),
+}));
+
+vi.mock("@/components/scheduled/CreateAutomationFromSessionDialog", () => ({
+  CreateAutomationFromSessionDialog: ({ conversation }: { conversation: { id: string } }) => (
+    <div data-testid="create-automation-dialog" data-conversation-id={conversation.id} />
+  ),
+}));
+// A session an automation runs from: its delete looks up and deletes the automation.
+vi.mock("@/lib/scheduledTasksApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof ScheduledTasksApiModule>()),
+  getScheduledTask: vi.fn(() => Promise.resolve({ id: "st_1", name: "Weekly rubric" })),
+  deleteScheduledTask: vi.fn(() => Promise.resolve()),
 }));
 
 vi.mock("@/hooks/useIsMobileViewport", () => ({
@@ -221,6 +238,15 @@ describe("HeaderConversationMenu", () => {
     expect(screen.getByTestId("header-rename-conversation")).toBeInTheDocument();
   });
 
+  it("hides Mark as unread for a muted session", () => {
+    renderMenu({
+      conversation: { ...CONVERSATION, labels: { ...CONVERSATION.labels, [MUTED_LABEL_KEY]: "1" } },
+    });
+    openMenu();
+    expect(screen.queryByTestId("header-mark-unread-conversation")).toBeNull();
+    expect(screen.getByRole("menuitem", { name: "Rename" })).toBeInTheDocument();
+  });
+
   it("opens from the keyboard and focuses the first action", () => {
     renderMenu();
     const trigger = screen.getByRole("button", { name: "Conversation actions" });
@@ -272,6 +298,18 @@ describe("HeaderConversationMenu", () => {
     fireEvent(window, accepted);
     expect(accepted.defaultPrevented).toBe(true);
     expect(screen.getByTestId("location")).toHaveTextContent("/?sibling=conv-1");
+  });
+
+  it.each([false, true])("hides pin actions on nested sessions (legacy pin: %s)", (legacyPin) => {
+    renderMenu({
+      conversation: {
+        ...CONVERSATION,
+        labels: legacyPin ? { [PINNED_LABEL_KEY]: "1" } : {},
+        family: { id: "family", representative_id: "parent", pinned: false },
+      },
+    });
+    openMenu();
+    expect(screen.queryByTestId("header-pin-conversation")).toBeNull();
   });
 
   it("runs pin and mark-unread actions for the active session", () => {
@@ -390,6 +428,89 @@ describe("HeaderConversationMenu", () => {
       id: "conv-1",
       deleteBranch: true,
     });
+  });
+
+  describe("in ⌘K", () => {
+    const sessionCommands = () =>
+      Object.values(usePaletteCommandsStore.getState().groups).filter(
+        (group) => group.heading === "Session",
+      );
+    const runCommand = (label: string) => {
+      const command = sessionCommands()[0]?.commands.find((row) => row.label === label);
+      if (!command) throw new Error(`No ⌘K command "${label}"`);
+      act(() => command.run());
+    };
+
+    it("offers the menu's actions for the session shown and withdraws them on unmount", () => {
+      const view = renderMenu();
+      expect(sessionCommands()).toHaveLength(1);
+      expect(sessionCommands()[0].commands.map((command) => command.id)).toEqual([
+        "open-session:conv-1:add-nested-agent",
+        "open-session:conv-1:pin",
+        "open-session:conv-1:share",
+        "open-session:conv-1:fork",
+        "open-session:conv-1:export",
+        "open-session:conv-1:rename",
+        "open-session:conv-1:mark-unread",
+        "open-session:conv-1:archive",
+        "open-session:conv-1:delete",
+      ]);
+      view.unmount();
+      expect(sessionCommands()).toEqual([]);
+    });
+
+    it("runs the menu's own handlers", () => {
+      renderMenu();
+      runCommand("Pin session");
+      expect(mocks.togglePinned).toHaveBeenCalledWith({ id: "conv-1", pinned: true });
+      runCommand("Fork session");
+      expect(mocks.fork).toHaveBeenCalledTimes(1);
+      runCommand("Rename session");
+      fireEvent.change(screen.getByRole("textbox", { name: "Session name" }), {
+        target: { value: "Roadmap planning" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Rename" }));
+      expect(mocks.rename).toHaveBeenCalledWith({ id: "conv-1", title: "Roadmap planning" });
+      runCommand("Delete session");
+      expect(screen.getByRole("dialog", { name: "Delete session?" })).toBeVisible();
+    });
+
+    it("drops a row built for the previous session once another is shown", () => {
+      const view = renderMenu();
+      const stalePin = sessionCommands()[0].commands.find((row) => row.label === "Pin session");
+      view.rerender(menuTree({ conversation: SECOND_CONVERSATION }));
+      expect(sessionCommands()[0].commands[0].id).toMatch(/^open-session:conv-2:/);
+      act(() => stalePin?.run());
+      expect(mocks.togglePinned).not.toHaveBeenCalled();
+    });
+
+    it("doesn't run a held row once its action can't run, as when sharing turns off", () => {
+      const onShare = vi.fn();
+      const view = renderMenu({ onShare });
+      const share = sessionCommands()[0].commands.find((row) => row.label === "Share session");
+      view.rerender(menuTree({ onShare, shareDisabled: true, shareDisabledReason: "Off." }));
+      act(() => share?.run());
+      expect(onShare).not.toHaveBeenCalled();
+    });
+
+    it("keeps Share listed with its reason when sharing is off", () => {
+      renderMenu({ shareDisabled: true, shareDisabledReason: "Sharing is turned off." });
+      const share = sessionCommands()[0].commands.find((row) => row.label === "Share session");
+      expect(share?.availability).toEqual({ available: false, reason: "Sharing is turned off." });
+    });
+  });
+
+  it("asks before archiving a running session, and Cancel keeps it open", () => {
+    renderMenu({ conversation: { ...CONVERSATION, status: "running" } });
+
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Archive" }));
+    expect(screen.getByRole("dialog", { name: "Archive running session?" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(mocks.archive).not.toHaveBeenCalled();
+    expect(screen.getByTestId("location")).toHaveTextContent("/c/conv-1");
   });
 
   it("offers Unarchive on an archived session and unarchives in place", () => {
@@ -555,7 +676,7 @@ describe("HeaderConversationMenu", () => {
     view.rerender(menuTree({ conversation: SECOND_CONVERSATION }));
 
     await waitFor(() => {
-      expect(screen.queryByRole("heading", { name: "Delete conversation?" })).toBeNull();
+      expect(screen.queryByRole("heading", { name: "Delete session?" })).toBeNull();
     });
     expect(mocks.deleteConversation).not.toHaveBeenCalled();
 
@@ -825,6 +946,23 @@ describe("HeaderConversationMenu desktop menu commands", () => {
         }),
       ),
     );
+    view.rerender(
+      menuTree({
+        conversation: {
+          ...CONVERSATION,
+          labels: { [PINNED_LABEL_KEY]: "1" },
+          family: { id: "family", representative_id: "parent", pinned: true },
+        },
+      }),
+    );
+    await waitFor(() =>
+      expect(setDesktopCommandState).toHaveBeenLastCalledWith(
+        expect.objectContaining({ commands: ["archive-session", "fork-session"] }),
+      ),
+    );
+    mocks.togglePinned.mockClear();
+    act(() => sendCommand({ command: "toggle-pin-session", browserViewId: null }));
+    expect(mocks.togglePinned).not.toHaveBeenCalled();
   });
 
   it("disables Session → Pin while a pin write is pending", async () => {
@@ -859,17 +997,21 @@ describe("HeaderConversationMenu desktop menu commands", () => {
     await reportsPin(true);
   });
 
-  it("archives through the same worktree prompt as the menu item", () => {
-    renderMenu();
-    act(() => sendCommand({ command: "archive-session", browserViewId: null }));
-    expect(mocks.archive).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: "Yes, delete worktree" }));
-    expect(mocks.archive).toHaveBeenCalledWith({
-      id: "conv-1",
-      archived: true,
-      deleteWorktree: true,
-    });
-  });
+  it.each([
+    { status: "idle", worktreeChoice: "Yes, delete worktree", deleteWorktree: true },
+    { status: "running", worktreeChoice: "No, archive only", deleteWorktree: false },
+  ] as const)(
+    "archives a $status session through the menu item's prompts from Session → Archive",
+    ({ status, worktreeChoice, deleteWorktree }) => {
+      renderMenu({ conversation: { ...CONVERSATION, status } });
+      act(() => sendCommand({ command: "archive-session", browserViewId: null }));
+      if (status === "running") fireEvent.click(screen.getByRole("button", { name: "Archive" }));
+      else expect(screen.queryByTestId("archive-running-dialog")).toBeNull();
+      expect(mocks.archive).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByRole("button", { name: worktreeChoice }));
+      expect(mocks.archive).toHaveBeenCalledWith({ id: "conv-1", archived: true, deleteWorktree });
+    },
+  );
 
   it("shows the desktop chords on Pin, Archive and Fork", () => {
     renderMenu();
@@ -886,5 +1028,73 @@ describe("HeaderConversationMenu desktop menu commands", () => {
     renderMenu({ onFork });
     act(() => sendCommand({ command: "fork-session", browserViewId: null }));
     expect(onFork).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("automations started from this session", () => {
+  const AGENT_SESSION: Conversation = { ...CONVERSATION, agent_id: "ag_1", git_branch: null };
+
+  function renderWithInfo(info: Partial<ServerInfo>, conversation = AGENT_SESSION) {
+    return render(
+      <QueryClientProvider client={new QueryClient()}>
+        <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, ...info }}>
+          <MemoryRouter initialEntries={[`/c/${conversation.id}`]}>
+            <HeaderConversationMenu
+              conversation={conversation}
+              currentProject={null}
+              canShare
+              canFork
+              onShare={() => {}}
+              onFork={mocks.fork}
+            />
+          </MemoryRouter>
+        </CapabilitiesProvider>
+      </QueryClientProvider>,
+    );
+  }
+
+  it("offers Create automation below Mark as unread and opens the dialog for the session", () => {
+    renderWithInfo({ automations_enabled: true, scheduled_task_source_sessions: true });
+    openMenu();
+
+    const items = screen.getAllByRole("menuitem");
+    const readState = items.indexOf(screen.getByTestId("header-mark-unread-conversation"));
+    expect(items[readState + 1]).toBe(screen.getByTestId("header-create-automation"));
+    expect(items[readState + 1]).toHaveTextContent(/^Create automation$/);
+
+    fireEvent.click(screen.getByTestId("header-create-automation"));
+    expect(screen.getByTestId("create-automation-dialog")).toHaveAttribute(
+      "data-conversation-id",
+      "conv-1",
+    );
+  });
+
+  it("leaves it out when automations are off", () => {
+    renderWithInfo({ automations_enabled: false, scheduled_task_source_sessions: true });
+    openMenu();
+
+    expect(screen.getByTestId("header-fork-conversation")).toBeInTheDocument();
+    expect(screen.queryByTestId("header-create-automation")).toBeNull();
+  });
+
+  it("deletes the automation that runs from a session before the session", async () => {
+    renderWithInfo({}, { ...AGENT_SESSION, labels: { "omnigent.scheduled_task_source": "st_1" } });
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Delete" }));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("automation-source-delete-notice")).toHaveTextContent(
+        "Deleting it also deletes the automation “Weekly rubric”.",
+      ),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Delete both" }));
+
+    await waitFor(() =>
+      expect(mocks.deleteConversation).toHaveBeenCalledWith({ id: "conv-1", deleteBranch: false }),
+    );
+    expect(deleteScheduledTask).toHaveBeenCalledWith("st_1");
+    expect(vi.mocked(deleteScheduledTask).mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.deleteConversation.mock.invocationCallOrder[0],
+    );
   });
 });

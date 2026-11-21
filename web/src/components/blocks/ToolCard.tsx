@@ -23,6 +23,7 @@ import type { RenderItem, ToolState } from "@/lib/renderItems";
 import { dropTrailingPartialEscape, showControlCharacters, stripAnsi } from "@/lib/ansi";
 import { type ShellOutputFormat, parseShellToolOutput } from "@/lib/shellToolOutput";
 import { terminalSurfaceStyle } from "@/lib/terminalPalette";
+import { toggleCodeBlockWordWrap, useCodeBlockWordWrap } from "@/lib/codeWrapPreferences";
 import { iconForTool } from "@/lib/toolIcon";
 import { mcpServerDisplayName } from "@/lib/mcpServerName";
 import type { LineCounts, ToolCall } from "@/lib/toolResultSummary";
@@ -588,7 +589,7 @@ function ShellCommandLine({ command }: { command: string }) {
   const { env, rest } = splitEnvPrefix(firstLine);
   return (
     // Only the command truncates, so the line count stays visible.
-    <span className="inline-flex max-w-full items-baseline font-mono text-sm">
+    <span className="literal-code inline-flex max-w-full items-baseline font-mono text-sm">
       <span className="min-w-0 truncate">
         {env.length > 0 && <span className="opacity-60">{env}</span>}
         <span>{rest}</span>
@@ -626,7 +627,7 @@ function ShellTerminalPanel({
   output: string | null;
   state: ToolState;
 }) {
-  const [wrap, setWrap] = useState(true);
+  const wrap = useCodeBlockWordWrap();
   const [showRaw, setShowRaw] = useState(false);
   const inputJson = useMemo(() => JSON.stringify(args, null, 2), [args]);
   const terminalIsDark = useTerminalIsDark();
@@ -652,7 +653,7 @@ function ShellTerminalPanel({
   const actionsBesideCommand = cwd === null;
   const actions = (
     <CodeBlockActions className="my-0 mr-0 ml-auto shrink-0 gap-1 @max-[480px]/shell:-ml-1">
-      <WrapTextButton onToggle={() => setWrap((value) => !value)} wrap={wrap} />
+      <WrapTextButton onToggle={toggleCodeBlockWordWrap} wrap={wrap} />
       <CopyTextButton label="Copy command" caption="command" text={command} />
       {hasOutput && (
         <CopyTextButton label="Copy output" caption="output" text={stripAnsi(parsed.text)} />

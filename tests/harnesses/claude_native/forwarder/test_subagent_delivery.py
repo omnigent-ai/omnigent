@@ -842,6 +842,75 @@ async def test_individual_redrive_honors_not_confirmed_retry_budget(
 
 
 @pytest.mark.asyncio
+async def test_undeliverable_subagent_status_stops_after_not_confirmed_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child status the runner cannot hand to its parent is not resent forever."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    subagents_dir = tmp_path / "subagents"
+    subagents_dir.mkdir()
+    (subagents_dir / "agent-orphan.jsonl").write_text("", encoding="utf-8")
+    monkeypatch.setattr(
+        forwarder,
+        "read_transcript_items_from_offset",
+        lambda *args, **kwargs: TranscriptReadResult(
+            line_cursor=0, byte_offset=0, current_response_id=None, items=[]
+        ),
+    )
+    checkpoint = forwarder._SubagentStateCheckpoint(
+        bridge_dir,
+        forwarder.SubagentForwardState(
+            subagents={
+                "orphan": forwarder.SubagentEntry(
+                    subagent_id="orphan",
+                    child_conversation_id="conv_child_orphan",
+                    last_activity_ts=time.time() - forwarder._SUBAGENT_IDLE_THRESHOLD_S - 1,
+                    last_status="running",
+                    delivery_error=forwarder._SUBAGENT_DROPPED_ITEM_REASON,
+                )
+            }
+        ),
+    )
+    posted_statuses: list[str] = []
+    relayed_message = (
+        "Runner rejected external_session_status 'failed' with status 503: "
+        '{"error":"subagent_delivery_not_confirmed","reason":"missing_parent_inbox"}'
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        posted_statuses.append(json.loads(request.content)["data"]["status"])
+        return httpx.Response(
+            503, json={"error": {"code": "runner_unavailable", "message": relayed_message}}
+        )
+
+    status_retry_tracker = forwarder._PostRetryTracker(
+        base_delay_s=0.0, max_not_confirmed_attempts=2
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        for _ in range(4):
+            await forwarder._forward_one_subagent(
+                client=client,
+                parent_session_id="conv_parent",
+                bridge_dir=bridge_dir,
+                subagents_dir=subagents_dir,
+                entry=checkpoint.state.subagents["orphan"],
+                agent_name="claude-native-ui",
+                checkpoint=checkpoint,
+                item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+                status_retry_tracker=status_retry_tracker,
+                batch_capability=forwarder._SessionEventBatchCapability(),
+                status_capability=forwarder._SubagentStatusCapability(),
+            )
+
+    assert posted_statuses == ["failed", "failed"]
+    assert checkpoint.state.subagents["orphan"].last_status == "failed"
+
+
+@pytest.mark.asyncio
 async def test_subagent_batch_backoff_survives_new_tail_items(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

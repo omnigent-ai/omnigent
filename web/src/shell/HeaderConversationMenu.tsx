@@ -1,15 +1,9 @@
-import {
-  useEffect,
-  useRef,
-  useState,
-  type FormEvent,
-  type KeyboardEvent,
-  type ReactNode,
-} from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   ArchiveIcon,
   ArchiveRestoreIcon,
   ChevronLeftIcon,
+  ClockPlusIcon,
   DownloadIcon,
   EllipsisIcon,
   FolderInputIcon,
@@ -54,19 +48,27 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { useIsMutating, useQueryClient } from "@tanstack/react-query";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isIndentedSibling } from "@/lib/sessionFamilies";
+import { isIndentedSibling, isSessionPinned } from "@/lib/sessionFamilies";
 import { PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
+import { canFlagUnread } from "@/lib/sessionMute";
 import { exportSessionTranscript } from "@/lib/sessionsApi";
 import { triggerBrowserDownload } from "@/hooks/useFileContent";
 import {
-  PINNED_LABEL_KEY,
   type Conversation,
   useArchiveConversation,
   useMoveToProject,
-  useRenameConversation,
   useStopAndDeleteConversation,
   useTogglePinnedConversation,
+  useAutomationsEnabled,
 } from "@/hooks/useConversations";
+import { CreateAutomationFromSessionDialog } from "@/components/scheduled/CreateAutomationFromSessionDialog";
+import { AutomationSourceDeleteNotice } from "@/components/scheduled/AutomationSourceDeleteNotice";
+import {
+  canCreateAutomationFromSession,
+  automationDeletedWith,
+  useDeleteSourceAutomations,
+} from "@/lib/automationFromSession";
+import { type OpenSessionCommandId, useOpenSessionPaletteCommands } from "./openSessionCommands";
 import { ProjectPicker } from "./ProjectPicker";
 import { markConversationUnread } from "@/hooks/useUnseenConversations";
 import { useOmnigentAnalytics } from "@/lib/analytics";
@@ -77,14 +79,14 @@ import { useIsEmbedded } from "@/lib/embedded";
 import { getEmbedRoot } from "@/lib/host";
 import { hasCommandModifier, isFocusInDialogOrMenu } from "@/lib/hotkeys";
 import { useNavigate } from "@/lib/routing";
-import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { showArchiveUndoToast } from "./archiveUndoToast";
 import { unpinWithUndo } from "./unpinUndoToast";
-import { useArchiveWorktreePrompt } from "./ArchiveWorktreeDialog";
+import { useArchivePrompt } from "./ArchivePrompt";
 import { cn } from "@/lib/utils";
 import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { conversationDisplayLabel } from "./sidebarNav";
 import { MobileHeaderButton } from "./MobileHeaderButton";
+import { RenameSessionDialog } from "./RenameSessionDialog";
 import { SessionMenuHeader } from "./SessionMenuHeader";
 
 interface HeaderConversationMenuProps {
@@ -135,19 +137,29 @@ export function HeaderConversationMenu({
   const togglePinned = useTogglePinnedConversation();
   // Pin writes don't overlap, so Pin/Unpin is disabled while one is saving.
   const pinSaving = useIsMutating({ mutationKey: PIN_WRITE_MUTATION_KEY }) > 0;
-  const rename = useRenameConversation();
   const moveToProject = useMoveToProject();
   const archive = useArchiveConversation();
-  const archiveWorktreePrompt = useArchiveWorktreePrompt();
+  const archivePrompt = useArchivePrompt();
   const deleteConversation = useStopAndDeleteConversation();
   const [menuOpen, setMenuOpen] = useState(false);
   const [projectPickerOpen, setProjectPickerOpen] = useState(false);
   const [renameOpen, setRenameOpen] = useState(false);
-  const [renameTitle, setRenameTitle] = useState(conversation.title ?? "");
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleteBranch, setDeleteBranch] = useState(false);
+  const [automationOpen, setAutomationOpen] = useState(false);
+  const automationsEnabled = useAutomationsEnabled();
+  // This menu is only offered to the session's owner (see ChatHeader).
+  const canCreateAutomation = canCreateAutomationFromSession({
+    info,
+    automationsEnabled,
+    conversation,
+    isOwner: true,
+  });
+  const automationSourceOf = automationDeletedWith(info, conversation);
+  const deleteSourceAutomations = useDeleteSourceAutomations();
   const previousConversationId = useRef(conversation.id);
-  const isPinned = conversation.labels?.[PINNED_LABEL_KEY] != null;
+  const isPinned = isSessionPinned(conversation);
+  const canPin = !isIndentedSibling(conversation);
   const isArchived = conversation.archived === true;
   const canAddAgent = !isArchived && info !== "loading" && info.sibling_sessions;
   const addAgentPath = `/?sibling=${encodeURIComponent(conversation.id)}`;
@@ -164,19 +176,15 @@ export function HeaderConversationMenu({
   const gitBranch = conversation.git_branch ?? null;
 
   useEffect(() => {
-    if (!renameOpen) setRenameTitle(conversation.title ?? "");
-  }, [conversation.title, renameOpen]);
-
-  useEffect(() => {
     if (previousConversationId.current === conversation.id) return;
     previousConversationId.current = conversation.id;
     setMenuOpen(false);
     setProjectPickerOpen(false);
     setRenameOpen(false);
-    setRenameTitle(conversation.title ?? "");
     setDeleteOpen(false);
     setDeleteBranch(false);
-  }, [conversation.id, conversation.title]);
+    setAutomationOpen(false);
+  }, [conversation.id]);
 
   useEffect(() => {
     if (!canAddAgent) return;
@@ -215,19 +223,16 @@ export function HeaderConversationMenu({
     moveToProject.mutate({ id: conversation.id, project });
   };
 
-  const submitRename = (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    const title = renameTitle.trim();
-    if (title && title !== (conversation.title ?? "")) {
-      rename.mutate({ id: conversation.id, title });
-    }
-    setRenameOpen(false);
-  };
-
-  const confirmDelete = () => {
+  const confirmDelete = async () => {
     setDeleteOpen(false);
     setDeleteBranch(false);
-    navigate("/", { replace: true });
+    // "Delete both": the automation first, so no run starts from a missing session.
+    if (automationSourceOf === null) {
+      navigate("/", { replace: true });
+    } else if (!(await deleteSourceAutomations([automationSourceOf], [conversation.id]))) {
+      toast.error("Couldn't delete the automation, so the session was kept");
+      return;
+    }
     deleteConversation.mutate({
       id: conversation.id,
       deleteBranch: gitBranch !== null && deleteBranch,
@@ -254,7 +259,7 @@ export function HeaderConversationMenu({
       archive.mutate({ id: conversation.id, archived: false });
       return;
     }
-    archiveWorktreePrompt.requestArchive([conversation], (deleteWorktreeIds) =>
+    archivePrompt.requestArchive([conversation], (deleteWorktreeIds) =>
       archiveNow(deleteWorktreeIds.has(conversation.id)),
     );
   };
@@ -280,10 +285,69 @@ export function HeaderConversationMenu({
       : togglePinned.mutate({ id: conversation.id, pinned: true });
   // Desktop Session → Pin (⌥⌘P), Archive (⇧⌘A) and Fork (⌥⌘F) act on the session shown here.
   // Like the menu item, Pin waits out a pending pin write (from any row).
-  useDesktopCommand("toggle-pin-session", pinSaving ? null : togglePin, { active: isPinned });
+  useDesktopCommand("toggle-pin-session", pinSaving || !canPin ? null : togglePin, {
+    active: isPinned,
+  });
   useDesktopCommand("archive-session", archiveConversation, { active: isArchived });
   useDesktopCommand("fork-session", canFork && !forkDisabledReason ? onFork : null);
   const desktopShortcuts = supportsDesktopCommands();
+  const runOpenSessionCommand = (id: OpenSessionCommandId) => {
+    switch (id) {
+      case "add-nested-agent":
+        navigate(addAgentPath);
+        return;
+      case "pin":
+      case "unpin":
+        togglePin();
+        return;
+      case "share":
+        onShare();
+        return;
+      case "fork":
+        onFork();
+        return;
+      case "export":
+        void exportConversation();
+        return;
+      case "rename":
+        setRenameOpen(true);
+        return;
+      case "mark-unread":
+        markConversationUnread(conversation.id, conversation.updated_at);
+        return;
+      case "create-automation":
+        setAutomationOpen(true);
+        return;
+      case "archive":
+      case "unarchive":
+        archiveConversation();
+        return;
+      case "delete":
+        setDeleteOpen(true);
+        return;
+    }
+  };
+  // ⌘K offers these same items for the session shown here.
+  useOpenSessionPaletteCommands({
+    conversationId: conversation.id,
+    facts: {
+      canAddAgent: canAddAgent === true,
+      pinnable: canPin,
+      pinned: isPinned,
+      pinSaving,
+      canShare,
+      shareDisabledReason: shareDisabled
+        ? (shareDisabledReason ?? "Sharing is unavailable.")
+        : undefined,
+      canFork,
+      forkDisabledReason,
+      canMarkUnread: canFlagUnread(conversation),
+      canCreateAutomation,
+      archived: isArchived,
+      desktopShortcuts,
+    },
+    onRun: runOpenSessionCommand,
+  });
 
   const mainItems = (
     <>
@@ -303,18 +367,20 @@ export function HeaderConversationMenu({
       )}
       {/* Chat/Terminal renders its own trailing separator (null on other sessions). */}
       {viewItems}
-      <DropdownMenuItem
-        data-testid="header-pin-conversation"
-        className={itemClass}
-        disabled={pinSaving}
-        onSelect={togglePin}
-      >
-        {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
-        {isPinned ? "Unpin" : "Pin"}
-        {desktopShortcuts && (
-          <CompactShortcutKeys keys={PIN_SESSION_KEYS} className="ml-auto pl-4" />
-        )}
-      </DropdownMenuItem>
+      {canPin && (
+        <DropdownMenuItem
+          data-testid="header-pin-conversation"
+          className={itemClass}
+          disabled={pinSaving}
+          onSelect={togglePin}
+        >
+          {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
+          {isPinned ? "Unpin" : "Pin"}
+          {desktopShortcuts && (
+            <CompactShortcutKeys keys={PIN_SESSION_KEYS} className="ml-auto pl-4" />
+          )}
+        </DropdownMenuItem>
+      )}
       {canShare && (
         <DropdownMenuItem
           data-testid="header-share-conversation"
@@ -380,14 +446,27 @@ export function HeaderConversationMenu({
         <PencilIcon className="size-3.5" />
         Rename
       </DropdownMenuItem>
-      <DropdownMenuItem
-        data-testid="header-mark-unread-conversation"
-        className={itemClass}
-        onSelect={() => markConversationUnread(conversation.id, conversation.updated_at)}
-      >
-        <MailIcon className="size-3.5" />
-        Mark as unread
-      </DropdownMenuItem>
+      {/* A muted session can't be flagged unread, matching its row menu. */}
+      {canFlagUnread(conversation) && (
+        <DropdownMenuItem
+          data-testid="header-mark-unread-conversation"
+          className={itemClass}
+          onSelect={() => markConversationUnread(conversation.id, conversation.updated_at)}
+        >
+          <MailIcon className="size-3.5" />
+          Mark as unread
+        </DropdownMenuItem>
+      )}
+      {canCreateAutomation && (
+        <DropdownMenuItem
+          data-testid="header-create-automation"
+          className={itemClass}
+          onSelect={() => setAutomationOpen(true)}
+        >
+          <ClockPlusIcon className="size-3.5" />
+          Create automation
+        </DropdownMenuItem>
+      )}
       {/* Move to project is also reachable on desktop via the breadcrumb's
           folder tag (HeaderProjectTag); on mobile the native shells hide the
           breadcrumb, so this menu is the sole entry point. */}
@@ -518,46 +597,20 @@ export function HeaderConversationMenu({
         </DropdownMenuContent>
       </DropdownMenu>
 
-      {archiveWorktreePrompt.dialog}
-      <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
-        <DialogContent>
-          <form onSubmit={submitRename}>
-            <DialogHeader>
-              <DialogTitle>Rename session</DialogTitle>
-              <DialogDescription>Choose a short name that is easy to find later.</DialogDescription>
-            </DialogHeader>
-            <input
-              autoFocus
-              aria-label="Session name"
-              data-testid="header-rename-conversation-input"
-              maxLength={USER_SESSION_TITLE_MAX_CHARS}
-              value={renameTitle}
-              onChange={(event) => setRenameTitle(event.target.value)}
-              onKeyDown={(event: KeyboardEvent<HTMLInputElement>) => {
-                if (event.key === "Escape") setRenameOpen(false);
-              }}
-              className="mt-4 h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/50"
-            />
-            <DialogFooter className="mt-4 border-t-0 bg-transparent mobile-app:flex-col-reverse mobile-app:gap-1">
-              <Button
-                type="button"
-                variant="ghost"
-                className="mobile-touch-target mobile-app:w-full"
-                onClick={() => setRenameOpen(false)}
-              >
-                Cancel
-              </Button>
-              <Button
-                type="submit"
-                className="mobile-touch-target mobile-app:w-full"
-                disabled={!renameTitle.trim() || rename.isPending}
-              >
-                Rename
-              </Button>
-            </DialogFooter>
-          </form>
-        </DialogContent>
-      </Dialog>
+      {archivePrompt.dialog}
+      {automationOpen && (
+        <CreateAutomationFromSessionDialog
+          conversation={conversation}
+          open
+          onOpenChange={setAutomationOpen}
+        />
+      )}
+      <RenameSessionDialog
+        conversation={conversation}
+        open={renameOpen}
+        onOpenChange={setRenameOpen}
+        inputTestId="header-rename-conversation-input"
+      />
 
       <Dialog
         open={deleteOpen}
@@ -568,12 +621,23 @@ export function HeaderConversationMenu({
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Delete conversation?</DialogTitle>
+            <DialogTitle>
+              {automationSourceOf !== null ? "Delete session and automation?" : "Delete session?"}
+            </DialogTitle>
             <DialogDescription>
               <span className="font-medium break-all">{label}</span> and all of its history will be
               removed. This cannot be undone.
             </DialogDescription>
           </DialogHeader>
+          {automationSourceOf !== null && (
+            <AutomationSourceDeleteNotice
+              taskId={automationSourceOf}
+              onNavigate={() => {
+                setDeleteOpen(false);
+                setDeleteBranch(false);
+              }}
+            />
+          )}
           {gitBranch !== null && (
             <div className="flex flex-col gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-3">
               <p className="text-sm text-muted-foreground">
@@ -610,10 +674,10 @@ export function HeaderConversationMenu({
             <Button
               type="button"
               variant="destructive"
-              onClick={confirmDelete}
+              onClick={() => void confirmDelete()}
               disabled={deleteConversation.isPending}
             >
-              Delete
+              {automationSourceOf !== null ? "Delete both" : "Delete"}
             </Button>
           </DialogFooter>
         </DialogContent>
