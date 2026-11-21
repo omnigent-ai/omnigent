@@ -117,9 +117,12 @@ final class WatchCompanionTests: XCTestCase {
         cookieStore: olderCookies))
     let newer = try XCTUnwrap(
       bridge.sync(
-        serverURL: URL(string: "https://new.example.com"), workspaceID: "2",
+        serverURL: URL(string: "https://new.example.com"), workspaceID: "2", cookieName: "new",
         cookieStore: newerCookies))
-    newerCookies.cookies.continuation.yield([cookie("new", domain: "new.example.com", path: "/")])
+    newerCookies.cookies.continuation.yield([
+      cookie("new", domain: "new.example.com", path: "/"),
+      cookie("unrelated", domain: "new.example.com", path: "/"),
+    ])
     await newer.value
     olderCookies.cookies.continuation.yield([cookie("old", domain: "old.example.com", path: "/")])
     await older.value
@@ -256,6 +259,19 @@ final class WatchCompanionTests: XCTestCase {
       serverURL: URL(string: "https://omnigent.example.com/omnigent")!, workspaceID: "7",
       cookies: [])
     XCTAssertEqual(learned?.apiURL.absoluteString, "https://omnigent.example.com/omnigent/v1?o=7")
+
+    let sessionNames = ["DBAUTH", "__Host-ap_session", "ap_session"]
+    let nativeCookies =
+      sessionNames.map {
+        cookie($0, domain: "omnigent.example.com", path: "/", secure: true)
+      } + [cookie("unrelated", domain: "omnigent.example.com", path: "/")]
+    for name in sessionNames + ["absent"] {
+      let credentials = try XCTUnwrap(
+        WatchCredentials(
+          serverURL: URL(string: "https://omnigent.example.com/omnigent")!, cookieName: name,
+          cookies: nativeCookies))
+      XCTAssertEqual(credentials.cookie, name == "absent" ? "" : "\(name)=1")
+    }
   }
 
   @MainActor func testClientAddressesTheAPIWithCookieAndHostKey() async throws {
@@ -283,6 +299,7 @@ final class WatchCompanionTests: XCTestCase {
     ]
     for testCase in cases {
       var resolved = false
+      var responseCount = 0
       let pending =
         #"[{"elicitation_id":"e1","params":{"message":"Run it?","target_session_id":"child"}}]"#
       let server = try MockHTTPServer(requestHandler: { request in
@@ -295,6 +312,8 @@ final class WatchCompanionTests: XCTestCase {
         case ("GET", "/v1/sessions/grandparent"):
           return (200, [:], Data(#"{"host_id":"inherited-host"}"#.utf8))
         case ("POST", "/v1/sessions/child/elicitations/e1/resolve"):
+          responseCount += 1
+          XCTAssertEqual(responseCount, 1, "Only the first answer may be submitted")
           XCTAssertTrue(testCase.succeeds, "Unresolved routing must not POST an approval")
           XCTAssertEqual(request.headers["x-databricks-omnigent-slice-key"], testCase.host)
           XCTAssertEqual(request.headers["cookie"], "session=test")
@@ -319,7 +338,11 @@ final class WatchCompanionTests: XCTestCase {
             apiURL: URL(string: "http://127.0.0.1:\(server.port)/v1")!, cookie: "session=test")))
       await conversation.load()
       let approval = try XCTUnwrap(conversation.approvals.first)
-      await conversation.resolve(approval, accept: true)
+      let first = Task { await conversation.resolve(approval, accept: true) }
+      let conflicting = Task { await conversation.resolve(approval, accept: false) }
+      await first.value
+      await conflicting.value
+      if testCase.succeeds { await conversation.resolve(approval, accept: false) }
       XCTAssertEqual(conversation.error == nil, testCase.succeeds, testCase.metadata)
       XCTAssertEqual(conversation.approvals.isEmpty, testCase.succeeds, testCase.metadata)
     }

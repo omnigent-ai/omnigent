@@ -36,16 +36,19 @@ final class WatchBridge: NSObject, WCSessionDelegate {
   }
 
   @discardableResult
-  func sync(serverURL: URL?, workspaceID: String? = nil, cookieStore: some WatchCookieStore)
-    -> Task<Void, Never>?
-  {
+  func sync(
+    serverURL: URL?, workspaceID: String? = nil, cookieName: String? = nil,
+    cookieStore: some WatchCookieStore
+  ) -> Task<Void, Never>? {
     guard transport != nil, let serverURL else { return nil }
     generation += 1
     let started = generation
     return Task {
       let cookies = await cookieStore.allCookies()
       guard generation == started else { return }
-      push(WatchCredentials(serverURL: serverURL, workspaceID: workspaceID, cookies: cookies))
+      push(
+        WatchCredentials(
+          serverURL: serverURL, workspaceID: workspaceID, cookieName: cookieName, cookies: cookies))
     }
   }
 
@@ -56,7 +59,7 @@ final class WatchBridge: NSObject, WCSessionDelegate {
 
   private func push(_ credentials: WatchCredentials?) {
     let data = credentials.flatMap { try? JSONEncoder().encode($0) } ?? Data()
-    // Persist intent, never credentials, until WatchConnectivity accepts a replacement context.
+    // Defaults persist only intent; WatchConnectivity retains the credential delivery context.
     if data.isEmpty { defaults.set(true, forKey: Self.pendingSignOutKey) }
     latest = [WatchCredentials.contextKey: data]
     flush()
@@ -115,7 +118,9 @@ extension WKHTTPCookieStore: WatchCookieStore {}
 
 extension WatchCredentials {
   /// The API root under the server's mount and the cookies a browser would send it.
-  @MainActor init?(serverURL: URL, workspaceID: String? = nil, cookies: [HTTPCookie]) {
+  @MainActor init?(
+    serverURL: URL, workspaceID: String? = nil, cookieName: String? = nil, cookies: [HTTPCookie]
+  ) {
     let mount = WorkspaceURLExpander.workspaceUIURL(forBareRoot: serverURL) ?? serverURL
     guard let endpoint = mount.omnigentEndpoint("/v1"),
       var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false)
@@ -125,7 +130,10 @@ extension WatchCredentials {
       .queryItems?.first { $0.name == "o" }?.value
     components.queryItems = (workspaceID ?? selector).map { [URLQueryItem(name: "o", value: $0)] }
     guard let apiURL = components.url else { return nil }
-    let sent = cookies.filter { DatabricksSessionClient.cookie($0, appliesTo: apiURL) }
+    let sent = cookies.filter {
+      (cookieName == nil || $0.name == cookieName)
+        && DatabricksSessionClient.cookie($0, appliesTo: apiURL)
+    }
     self.init(apiURL: apiURL, cookie: HTTPCookie.requestHeaderFields(with: sent)["Cookie"] ?? "")
   }
 }

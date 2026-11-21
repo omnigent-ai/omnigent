@@ -1121,7 +1121,8 @@ struct OmnigentWebView: UIViewRepresentable {
         }
         oidcRenewalCause = nil
         // A background renewal rotates the cookie without a page load, so hand it on here.
-        WatchBridge.shared.sync(serverURL: connection.serverURL, cookieStore: store)
+        WatchBridge.shared.sync(
+          serverURL: connection.serverURL, cookieName: connection.cookieName, cookieStore: store)
         scheduleOidcRenewal()
         if reload, let webView {
           webView.load(URLRequest(url: oidcPageURL ?? connection.serverURL))
@@ -1461,6 +1462,7 @@ struct OmnigentWebView: UIViewRepresentable {
         webView.evaluateJavaScript(WorkspaceChromeScript.source)
         WatchBridge.shared.sync(
           serverURL: parent.serverURL ?? pinnedURL, workspaceID: workspaceSession?.workspaceID,
+          cookieName: workspaceSession == nil ? oidcConnection?.cookieName : "DBAUTH",
           cookieStore: webView.configuration.websiteDataStore.httpCookieStore)
         parent.loadSucceeded()
       }

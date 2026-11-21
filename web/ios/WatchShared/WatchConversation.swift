@@ -73,6 +73,7 @@ final class WatchConversation {
   }
 
   func resolve(_ approval: WatchElicitation, accept: Bool) async {
+    guard !isBusy, !answered.contains(approval.id) else { return }
     let target = approval.params.targetSessionId ?? session.id
     isBusy = true
     defer { isBusy = false }

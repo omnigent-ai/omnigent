@@ -33,6 +33,15 @@ scoped to it (`WatchBridge`); the watch keeps them in its Keychain and calls the
 Signing out on the phone signs the watch out. Run the `OmnigentWatch` scheme on a paired
 simulator.
 
+The watch has the same server permissions as the phone's bearer session, not a watch-scoped
+token. Native workspace and OIDC sign-in hand off only their named session cookie; browser-only
+authentication keeps URL-scoped cookies because its cookie contract is unknown.
+[WatchConnectivity retains the latest application context](https://developer.apple.com/documentation/watchconnectivity/wcsession/applicationcontext)
+on the phone and watch until it is replaced. The watch's Keychain accessibility policy protects
+its own saved copy, not that system-managed context. Defaults contain only sign-out intent and
+ordering metadata. This design trusts both paired devices with the bearer credential and does
+not add app-layer encryption to the handoff; watch-scoped tokens would require server support.
+
 ## Databricks OAuth
 
 Workspace connections use native OAuth, isolated persistent WebKit stores, bounded
