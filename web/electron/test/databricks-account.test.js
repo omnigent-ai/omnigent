@@ -1,4 +1,4 @@
-// Unit tests for account-first (SPOG) workspace resolution
+// Unit tests for account-first workspace resolution
 // (src/databricks-account.js), run with `node --test`.
 //
 // Covers reading the account origin+id from an account-scoped token's issuer,

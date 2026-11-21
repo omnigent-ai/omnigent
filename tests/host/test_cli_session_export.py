@@ -15,8 +15,8 @@ from omnigent.cli import cli
 from omnigent.util.server_url import ServerUrl
 
 _BASE = "http://localhost:6767"
-_SPOG_DISPLAY = "https://example.databricks.com/omnigent?o=123"
-_SPOG_API = "https://example.databricks.com/api/2.0/omnigent"
+_ACCOUNT_DISPLAY = "https://account.example.com/omnigent?o=123"
+_ACCOUNT_API = "https://account.example.com/api/2.0/omnigent"
 
 _SESSION_META = {
     "id": "conv_abc123",
@@ -99,18 +99,18 @@ def test_session_export_writes_jsonl(tmp_path: Path) -> None:
 
 
 @respx.mock
-def test_session_export_spog_url_sends_workspace_selector(
+def test_session_export_account_url_sends_workspace_selector(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
-    """A pasted SPOG URL keeps its ``?o=`` selector in request headers."""
+    """A pasted account URL keeps its ``?o=`` selector in request headers."""
     monkeypatch.setattr(
         "omnigent.cli._workspace_api_server_url",
-        lambda _server: _SPOG_API,
+        lambda _server: _ACCOUNT_API,
     )
-    session_route = respx.get(f"{_SPOG_API}/v1/sessions/conv_abc123").mock(
+    session_route = respx.get(f"{_ACCOUNT_API}/v1/sessions/conv_abc123").mock(
         return_value=httpx.Response(200, json=_SESSION_META)
     )
-    respx.get(f"{_SPOG_API}/v1/sessions/conv_abc123/items").mock(
+    respx.get(f"{_ACCOUNT_API}/v1/sessions/conv_abc123/items").mock(
         return_value=httpx.Response(200, json={**_ITEMS_PAGE, "data": []})
     )
 
@@ -124,7 +124,7 @@ def test_session_export_spog_url_sends_workspace_selector(
             "--output",
             str(tmp_path / "out.jsonl"),
             "--server",
-            _SPOG_DISPLAY,
+            _ACCOUNT_DISPLAY,
         ],
     )
 

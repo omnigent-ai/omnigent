@@ -254,7 +254,7 @@ class SlackNotifier:
         # mount (``https://<ws>/api/2.0/omnigent``), but the web UI lives on the
         # workspace SPA mount (``https://<ws>/omnigent``) — linking to the API
         # mount answers JSON, not the UI. Map the path and keep any ``?o=<org>``
-        # workspace selector from the configured URL so multi-workspace (SPOG)
+        # workspace selector from the configured URL so multi-workspace account
         # hosts open in the right workspace. (This bot is standalone — it can't
         # import ``omnigent.util.server_url`` — so the mount mapping is mirrored
         # here.)
