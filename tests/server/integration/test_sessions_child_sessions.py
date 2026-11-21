@@ -517,6 +517,7 @@ async def test_session_snapshot_replays_only_visible_descendant_pending_elicitat
     assert await replayed(session["id"]) == {worker.id, worker_task.id, sibling.id}
     assert await replayed(worker.id) == {worker_task.id}
     assert await replayed(sibling.id) == set()
+    assert await replayed(worker_task.id) == set()
 
 
 async def test_late_ancestor_mirror_keeps_child_current_elicitation(
