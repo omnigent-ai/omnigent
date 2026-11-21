@@ -81,9 +81,94 @@ async def test_completed_context_compaction_item_clears_spinner() -> None:
 
 
 @pytest.mark.asyncio
-async def test_persist_codex_compaction_item_posts_uuid_window_id(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "snapshot_kind",
+    [
+        "message",
+        "function_pair",
+        "structured_output",
+        "native_tool",
+        "native_output",
+        "opaque_context",
+        "custom_pair",
+    ],
+)
+async def test_persist_codex_compaction_item_posts_uuid_window_id(
+    tmp_path: Path, snapshot_kind: str
+) -> None:
     """Codex's UUID window id is posted with the compaction checkpoint."""
     import json as _json
+
+    from omnigent.entities import CompactionData, ConversationItem, FunctionCallData
+    from omnigent.runtime.compaction import compaction_to_history_items
+    from omnigent.runtime.prompt import history_to_input_items
+
+    snapshot = [
+        {
+            "type": "message",
+            "role": "user",
+            "native_input_state": "recorded",
+            "content": [{"type": "input_text", "text": "hi"}],
+        }
+    ]
+    if snapshot_kind in {"function_pair", "structured_output"}:
+        snapshot.extend(
+            [
+                {
+                    "type": "function_call",
+                    "call_id": "call_owned",
+                    "name": "read",
+                    "namespace": "workspace",
+                    "arguments": '{"path":"notes.txt"}',
+                    "model": "original_tool_agent",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_owned",
+                    "output": [{"type": "input_text", "text": "Tool result"}]
+                    if snapshot_kind == "structured_output"
+                    else "Tool result",
+                },
+            ]
+        )
+    elif snapshot_kind in {"native_tool", "native_output"}:
+        native = {
+            "type": "web_search_call",
+            "id": "search_owned",
+            "status": "completed",
+            "action": {"type": "search", "query": "synthetic query"},
+        }
+        snapshot.append(
+            {"type": "native_tool", "item": native} if snapshot_kind == "native_tool" else native
+        )
+    elif snapshot_kind == "opaque_context":
+        snapshot.extend(
+            [
+                {
+                    "type": "reasoning",
+                    "id": "reasoning_owned",
+                    "summary": [],
+                    "encrypted_content": "synthetic_encrypted_reasoning",
+                },
+                {"type": "compaction", "encrypted_content": "synthetic_encrypted_compaction"},
+            ]
+        )
+    elif snapshot_kind == "custom_pair":
+        snapshot.extend(
+            [
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "custom_owned",
+                    "name": "apply_patch",
+                    "input": "Synthetic patch",
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "custom_owned",
+                    "output": "Synthetic result",
+                },
+            ]
+        )
 
     codex_home = codex_home_for_bridge_dir(tmp_path)
     rollout = codex_home / "sessions" / "2026" / "09" / "05" / "rollout-thread_1.jsonl"
@@ -93,13 +178,7 @@ async def test_persist_codex_compaction_item_posts_uuid_window_id(tmp_path: Path
             {
                 "type": "compacted",
                 "payload": {
-                    "replacement_history": [
-                        {
-                            "type": "message",
-                            "role": "user",
-                            "content": [{"type": "input_text", "text": "hi"}],
-                        }
-                    ],
+                    "replacement_history": snapshot,
                     "window_id": "01a070e2-2665-7d62-9b74-973decf239b7",
                 },
             }
@@ -142,6 +221,31 @@ async def test_persist_codex_compaction_item_posts_uuid_window_id(tmp_path: Path
     assert "Codex" in body["data"]["summary"]
     assert body["data"]["window_id"] == "01a070e2-2665-7d62-9b74-973decf239b7"
     assert body["data"]["compacted_messages"][0]["role"] == "user"
+    checkpoint = ConversationItem(
+        id="checkpoint",
+        type="compaction",
+        status="completed",
+        response_id="response_owned",
+        created_at=1,
+        data=CompactionData(**body["data"]),
+    )
+    restored = compaction_to_history_items(checkpoint)
+    projected = history_to_input_items(restored)
+    assert len(projected) == len(snapshot)
+    assert projected[0]["content"] == snapshot[0]["content"]
+    if snapshot_kind in {"function_pair", "structured_output"}:
+        assert isinstance(restored[1].data, FunctionCallData)
+        assert restored[1].data.agent == "original_tool_agent"
+        assert projected[1] == {key: value for key, value in snapshot[1].items() if key != "model"}
+        output = projected[2]["output"]
+        assert (
+            _json.loads(output) if snapshot_kind == "structured_output" else output
+        ) == snapshot[2]["output"]
+        assert projected[2]["call_id"] == projected[1]["call_id"] == "call_owned"
+    elif snapshot_kind == "native_tool":
+        assert projected[1] == snapshot[1]["item"]
+    else:
+        assert projected[1:] == snapshot[1:]
 
 
 def test_compaction_persist_failure_reason_includes_server_body() -> None:
