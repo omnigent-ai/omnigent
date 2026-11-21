@@ -42,9 +42,12 @@ export function requestFileAction(
   useFileActionStore.setState({ request: { target, command, linkState, key: nextKey } });
 }
 
-/** Finish `request`; a newer request is left alone. */
-export function finishFileAction(request: FileActionRequest): void {
-  useFileActionStore.setState((state) =>
-    state.request?.key === request.key ? { request: null } : state,
-  );
+/**
+ * Take `request` to run it. Only the first claim wins, so an effect that runs again
+ * can't run it twice; a newer request is left alone.
+ */
+export function claimFileAction(request: FileActionRequest): boolean {
+  if (useFileActionStore.getState().request?.key !== request.key) return false;
+  useFileActionStore.setState({ request: null });
+  return true;
 }

@@ -1,4 +1,5 @@
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as EditorLinksModule from "@/lib/editorLinks";
 import type * as NativeBridgeModule from "@/lib/nativeBridge";
@@ -144,6 +145,19 @@ describe("FileActionHost", () => {
       ),
     );
     expect(launchEditorLink).not.toHaveBeenCalled();
+  });
+
+  it("runs each request once under StrictMode, which runs effects twice", () => {
+    cleanup();
+    render(
+      <StrictMode>
+        <FileActionHost />
+      </StrictMode>,
+    );
+    act(() => requestFileAction(target("src/main.ts"), "open-in-vscode"));
+    act(() => requestFileAction(target("src/main.ts"), "copy-path"));
+    expect(launchEditorLink).toHaveBeenCalledTimes(1);
+    expect(copyText).toHaveBeenCalledTimes(1);
   });
 
   it("opens a remote host's file over SSH, but never reveals it", () => {

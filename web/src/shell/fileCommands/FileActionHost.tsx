@@ -12,7 +12,7 @@ import { copyWithToast } from "./copyWithToast";
 import { rememberPreferredEditor } from "./preferredEditor";
 import { fileCommandsById, OPEN_IN_EDITOR } from "./model";
 import {
-  finishFileAction,
+  claimFileAction,
   type FileActionRequest,
   type HostedFileCommandId,
   useFileActionStore,
@@ -60,7 +60,8 @@ function FileActionRunner({ request }: { request: FileActionRequest }) {
   const environment = useFileCommandEnvironment(target.hostId, target.conversationId);
 
   useEffect(() => {
-    finishFileAction(request);
+    // StrictMode runs this effect twice; only the first run claims the request.
+    if (!claimFileAction(request)) return;
     // An action that stopped applying since the request was made does nothing.
     const facts = fileCommandFacts(target, environment);
     const { availability } = fileCommandsById(facts)[command];
