@@ -3,6 +3,7 @@
 const { performance } = require("node:perf_hooks");
 
 const SESSION_HOST_PROTOCOL = 1;
+const SSH_PREVIEW_PROTOCOL = 1;
 
 /** Local previews remain bound to the session host that received the permission. */
 function hasHostLocalAccess(context) {
@@ -41,5 +42,6 @@ module.exports = {
   createHostThisMachineChecker,
   isHostThisMachine,
   SESSION_HOST_PROTOCOL,
+  SSH_PREVIEW_PROTOCOL,
   hasHostLocalAccess,
 };

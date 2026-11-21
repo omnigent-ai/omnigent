@@ -674,17 +674,16 @@ it("does not mistake subframe loading for an initial main-frame navigation", () 
 });
 
 describe("browser IPC localhost previews from hosts reached over SSH", () => {
-  /** A registry that blocks localhost until `state.allowed`, recording each step. */
+  /** A registry that grants one host only, recording each step. */
   function previewSetup({ request, recover } = {}) {
     const ipcMain = makeIpcMain();
-    const state = { allowed: false, calls: [] };
+    const state = { allowed: false, allowedHost: "host-1", calls: [] };
     const registry = {
       beginAgentNavigation: () => () => true,
-      checkAgentNavigation: async () => {
-        state.calls.push(state.allowed ? "allowed" : "denied");
-        return state.allowed
-          ? { ok: true }
-          : { ok: false, error: "blocked", localhostBlocked: true };
+      checkAgentNavigation: async (_id, _url, context) => {
+        const allowed = state.allowed && context.sourceHostId === state.allowedHost;
+        state.calls.push(allowed ? "allowed" : "denied");
+        return allowed ? { ok: true } : { ok: false, error: "blocked", localhostBlocked: true };
       },
       openOrNavigate: () => {
         state.calls.push("navigate");
@@ -709,24 +708,27 @@ describe("browser IPC localhost previews from hosts reached over SSH", () => {
         {
           conversationId: "source",
           url: "http://127.0.0.1:8787/",
-          opts: { sessionHostProtocol: 1, ...opts },
+          opts: { sessionHostProtocol: 1, sshPreviewProtocol: 1, ...opts },
         },
       );
     return { state, navigate, registry };
   }
 
-  it("asks about the source host after a typed localhost URL is blocked, then retries", async () => {
+  it("asks about the source host, then requires fresh provenance before retrying", async () => {
     const seen = [];
     const { state, navigate } = previewSetup({
-      request: (current, _event, url, sourceHostId) => {
-        seen.push([url, sourceHostId]);
+      request: (current, _event, url, opts) => {
+        seen.push([url, opts.sourceHostId]);
         current.allowed = true;
         return true;
       },
     });
     const result = await navigate({ force: true, sourceHostId: "host-1" });
-    assert.equal(result.ok, true);
+    assert.equal(result.ok, false);
+    assert.equal(result.retryWithFreshHost, true);
     assert.deepEqual(seen, [["http://127.0.0.1:8787/", "host-1"]]);
+    assert.deepEqual(state.calls, ["denied", "request"]);
+    assert.equal((await navigate({ sourceHostId: "host-1" })).ok, true);
     assert.deepEqual(state.calls, ["denied", "request", "allowed", "navigate"]);
   });
 
@@ -742,8 +744,31 @@ describe("browser IPC localhost previews from hosts reached over SSH", () => {
       },
     });
     const result = await navigate({ agent: true, sourceHostId: "host-1" });
-    assert.equal(result.ok, true);
-    assert.deepEqual(state.calls, ["denied", "recover", "request", "allowed", "navigate"]);
+    assert.equal(result.ok, false);
+    assert.equal(result.retryWithFreshHost, true);
+    assert.deepEqual(state.calls, ["denied", "recover", "request"]);
+  });
+
+  it("does not navigate with the old binding after a host moves during consent", async () => {
+    const started = Promise.withResolvers();
+    const answer = Promise.withResolvers();
+    let sessionHost = "host-1";
+    const { state, navigate } = previewSetup({
+      request: async (current) => {
+        started.resolve();
+        current.allowed = await answer.promise;
+        return current.allowed;
+      },
+    });
+    const pending = navigate({ sourceHostId: sessionHost });
+    await started.promise;
+    sessionHost = "host-2";
+    answer.resolve(true);
+    const result = await pending;
+    assert.equal(result.ok, false);
+    assert.equal(result.retryWithFreshHost, true);
+    assert.notEqual(sessionHost, state.allowedHost);
+    assert.deepEqual(state.calls, ["denied", "request"]);
   });
 
   it("doesn't ask when identity recovery already allowed the page", async () => {
@@ -788,6 +813,14 @@ describe("browser IPC localhost previews from hosts reached over SSH", () => {
       const { state, navigate } = previewSetup({ request: () => true });
       assert.equal(
         (await navigate({ sourceHostId: "host-1", sessionHostProtocol: protocol })).ok,
+        false,
+      );
+      assert.deepEqual(state.calls, ["denied"]);
+    });
+    it(`doesn't ask when the renderer's SSH preview protocol is ${protocol}`, async () => {
+      const { state, navigate } = previewSetup({ request: () => true });
+      assert.equal(
+        (await navigate({ sourceHostId: "host-1", sshPreviewProtocol: protocol })).ok,
         false,
       );
       assert.deepEqual(state.calls, ["denied"]);

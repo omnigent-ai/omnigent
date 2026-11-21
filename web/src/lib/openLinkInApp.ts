@@ -9,7 +9,7 @@ import { AGENT_BROWSER_TAB_ID, browserViewId } from "./browserTabs";
 import { readOpenLinksInApp } from "./linkOpenPreferences";
 import { isNativeShell, supportsBrowser, type BrowserHostOptions } from "./nativeBridge";
 import { fetchSessionHostId } from "./fetchSessionHostId";
-import { previewHostOptions } from "./previewHostOptions";
+import { previewHostOptions, withPreviewHostRetry } from "./previewHostOptions";
 import { randomUUID } from "./randomUUID";
 import { readSessionWorkspaceState } from "./sessionWorkspaceState";
 
@@ -68,12 +68,13 @@ async function openInApp(conversationId: string, url: string): Promise<void> {
     const tabId = randomUUID();
     newViewId = browserViewId(conversationId, tabId);
     const hostId = await fetchSessionHostId(conversationId);
+    const options = await previewHostOptions(hostId, url);
     // Chat and file content can come from an agent, so their links use the
     // agent policy even when a user clicks them.
-    const result = await bridge.browserOpenOrNavigate(newViewId, url, undefined, {
-      agent: true,
-      ...(await previewHostOptions(hostId, url)),
-    });
+    const viewId = newViewId;
+    const result = await withPreviewHostRetry(conversationId, hostId, () =>
+      bridge.browserOpenOrNavigate(viewId, url, undefined, { agent: true, ...options }),
+    );
     if (result?.ok) {
       newViewId = undefined;
       for (const listener of listeners) listener(conversationId, tabId);

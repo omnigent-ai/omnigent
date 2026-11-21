@@ -25,7 +25,7 @@ const { routedGate, viewElsewhere } = require("./browserTabs");
 const { buildDesignModeScript } = require("./designModeScript");
 const { isBrowserViewFocused, registerDesignToolsIpc } = require("./designTools");
 
-const { SESSION_HOST_PROTOCOL } = require("./hostIdentity");
+const { SESSION_HOST_PROTOCOL, SSH_PREVIEW_PROTOCOL } = require("./hostIdentity");
 
 // Max age of a real native input event for a design-mode submit marker to be
 // honored (see the gesture gate below). Covers click/Enter → console.log.
@@ -387,10 +387,10 @@ function makeDesignModeInputHandler(gestureState, isAgentInput = () => false) {
  * @param {(event: Electron.IpcMainInvokeEvent) => boolean} [deps.showsServerForEvent]
  *        Whether the sender's window still shows its server's page. Pushes to a
  *        window that navigated to a foreign page are dropped at send time.
- * @param {(event: Electron.IpcMainInvokeEvent, url: string, sourceHostId: unknown) =>
+ * @param {(event: Electron.IpcMainInvokeEvent, url: string, opts: object) =>
  *          Promise<boolean>} [deps.requestPreviewHostForEvent]
  *        After a blocked navigation, asks whether the session's host may open
- *        localhost pages; true retries the navigation once.
+ *        localhost pages; true asks the renderer to refresh provenance before retrying.
  */
 function registerBrowserIpc({
   ipcMain,
@@ -546,26 +546,31 @@ function registerBrowserIpc({
       }
     }
     // Typed URLs and links reach here too; the question names the session's host, not the page.
+    let previewAllowed = false;
     if (
       !r.ok &&
       r.localhostBlocked === true &&
       opts?.sessionHostProtocol === SESSION_HOST_PROTOCOL &&
+      opts?.sshPreviewProtocol === SSH_PREVIEW_PROTOCOL &&
       !recovered &&
       isCurrent()
     ) {
       try {
-        recovered =
-          (await requestPreviewHostForEvent(
-            event,
-            url,
-            opts?.sourceHostId,
-            opts?.sourceSshTarget,
-          )) === true;
+        previewAllowed = (await requestPreviewHostForEvent(event, url, opts)) === true;
       } catch {
-        recovered = false;
+        previewAllowed = false;
       }
     }
     if (!isCurrent()) return cancelled;
+    if (previewAllowed) {
+      // Consent may outlive a session-host change; the renderer must resolve it again.
+      return {
+        ok: false,
+        created: false,
+        retryWithFreshHost: true,
+        error: "Localhost access allowed; refresh the session host before retrying.",
+      };
+    }
     if (recovered) {
       // Recovery updates main-owned identity, so rebuild the context and ask
       // the registry to evaluate the same navigation once more.

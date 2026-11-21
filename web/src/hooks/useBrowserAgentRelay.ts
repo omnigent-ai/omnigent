@@ -13,11 +13,17 @@ import { emitBrowserActionSettled, onBrowserActionRequest } from "@/lib/browserA
 import type { BrowserActionRequestEvent } from "@/lib/events";
 import {
   SESSION_HOST_PROTOCOL,
+  SSH_PREVIEW_PROTOCOL,
   supportsBrowser,
   type BrowserHostOptions,
 } from "@/lib/nativeBridge";
 import { fetchSessionHostId } from "@/lib/fetchSessionHostId";
-import { isLoopbackPreviewUrl, previewHostOptions } from "@/lib/previewHostOptions";
+import {
+  isLoopbackPreviewUrl,
+  previewHostOptions,
+  withPreviewHostRetry,
+} from "@/lib/previewHostOptions";
+import { browserViewOwnerId } from "@/lib/browserTabs";
 import { authenticatedFetch } from "@/lib/identity";
 import { useQueryClient } from "@tanstack/react-query";
 import { loadOnce } from "@/lib/loadOnce";
@@ -142,13 +148,16 @@ async function dispatch(
         }
         // force: honor the explicit agent nav even on same-URL. agent: mark it
         // model-issued so the registry applies the scheme/host allowlist (Risk).
-        const r = await desktop.browserOpenOrNavigate(conversationId, url, undefined, {
+        const options = {
           force: true,
           agent: true,
           ...(await previewHostOptions(sourceHostId, url)),
           ...(rememberedArcaHostId ? { rememberedArcaHostId } : {}),
           ...(sourceIsArcaHost ? { sourceIsArcaHost: true } : {}),
-        });
+        };
+        const r = await withPreviewHostRetry(browserViewOwnerId(conversationId), sourceHostId, () =>
+          desktop.browserOpenOrNavigate!(conversationId, url, undefined, options),
+        );
         if (!r?.ok) return { ok: false, error: r?.error ?? "navigate failed" };
         if (
           isLoopbackPreviewUrl(url) &&
@@ -302,7 +311,11 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
           ? await fetchSessionHostId(sourceConversationId, { queryClient })
           : null;
       const readHostOptions = revalidateHost
-        ? { sessionHostProtocol: SESSION_HOST_PROTOCOL, sourceHostId }
+        ? {
+            sessionHostProtocol: SESSION_HOST_PROTOCOL,
+            sshPreviewProtocol: SSH_PREVIEW_PROTOCOL,
+            sourceHostId,
+          }
         : undefined;
       const rememberedArcaHostId = evt.action === "navigate" ? readArcaHostId() : null;
       const sourceIsArcaHost =
@@ -364,7 +377,11 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
               currentHostId,
               rememberedArcaHostId,
               sourceIsArcaHost,
-              { sessionHostProtocol: SESSION_HOST_PROTOCOL, sourceHostId: currentHostId },
+              {
+                sessionHostProtocol: SESSION_HOST_PROTOCOL,
+                sshPreviewProtocol: SSH_PREVIEW_PROTOCOL,
+                sourceHostId: currentHostId,
+              },
             );
       }
       emitBrowserActionSettled(evt, sourceConversationId, result);

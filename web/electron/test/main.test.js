@@ -6919,7 +6919,11 @@ describe("localhost previews for hosts reached over SSH", () => {
       deps,
       questions,
       context: () =>
-        deps.getAgentContextForEvent(event, { sourceHostId: hostId, sessionHostProtocol: 1 }),
+        deps.getAgentContextForEvent(event, {
+          sourceHostId: hostId,
+          sessionHostProtocol: 1,
+          sshPreviewProtocol: 1,
+        }),
       eligible: h.browserRegistryDeps().allowsLocalhost,
       connect: () => h.ipc.get("omnigent:ssh-connect")(event, "devbox"),
     };
@@ -6928,7 +6932,11 @@ describe("localhost previews for hosts reached over SSH", () => {
   it("asks once about a host connected over SSH, then lets its sessions open localhost pages", async (t) => {
     const { h, event, deps, questions, context, eligible, connect } = previewHarness(t, () => 1);
     const request = (url, source = hostId, from = event) =>
-      deps.requestPreviewHostForEvent(from, url, source);
+      deps.requestPreviewHostForEvent(from, url, {
+        sourceHostId: source,
+        sessionHostProtocol: 1,
+        sshPreviewProtocol: 1,
+      });
     const elsewhere = { sender: h.webContents, senderFrame: { url: "https://elsewhere.example/" } };
 
     assert.equal(await request(preview), false, "nothing is recorded for the host yet");
@@ -6946,6 +6954,13 @@ describe("localhost previews for hosts reached over SSH", () => {
     assert.equal(context().hostIsThisMachine, false);
     assert.equal(eligible({ ...context(), sourceHostId: "b".repeat(32) }), false);
     assert.equal(eligible(deps.getAgentContextForEvent(event, { sourceHostId: hostId })), false);
+    assert.equal(
+      eligible(
+        deps.getAgentContextForEvent(event, { sourceHostId: hostId, sessionHostProtocol: 1 }),
+      ),
+      false,
+      "an older renderer cannot reuse another renderer's SSH preview grant",
+    );
     assert.equal(await request(preview), false, "an allowed host needs no retry");
     assert.equal(questions.length, 1);
   });
@@ -6955,8 +6970,9 @@ describe("localhost previews for hosts reached over SSH", () => {
     assert.equal((await connect()).ok, true);
     assert.equal(deps.getAgentNavigationHintForEvent(event, preview, hostId), null);
 
-    assert.equal(await deps.requestPreviewHostForEvent(event, preview, hostId), false);
-    assert.equal(await deps.requestPreviewHostForEvent(event, preview, hostId), false);
+    const opts = { sourceHostId: hostId, sessionHostProtocol: 1, sshPreviewProtocol: 1 };
+    assert.equal(await deps.requestPreviewHostForEvent(event, preview, opts), false);
+    assert.equal(await deps.requestPreviewHostForEvent(event, preview, opts), false);
     assert.equal(questions.length, 1);
     assert.equal(eligible(context()), false);
     assert.match(
@@ -6964,6 +6980,24 @@ describe("localhost previews for hosts reached over SSH", () => {
       /"devbox" were declined/,
     );
     assert.equal(deps.getAgentNavigationHintForEvent(event, "https://example.com/", hostId), null);
+  });
+
+  it("does not ask an older renderer even for a recorded destination or supplied hint", async (t) => {
+    const { event, deps, questions, eligible, connect } = previewHarness(t, () => 1);
+    assert.equal((await connect()).ok, true);
+    await Promise.all(
+      [undefined, 0, 2].map(async (sshPreviewProtocol) => {
+        const opts = {
+          sourceHostId: hostId,
+          sessionHostProtocol: 1,
+          sshPreviewProtocol,
+          sourceSshTarget: "devbox",
+        };
+        assert.equal(await deps.requestPreviewHostForEvent(event, preview, opts), false);
+        assert.equal(eligible(deps.getAgentContextForEvent(event, opts)), false);
+      }),
+    );
+    assert.deepEqual(questions, []);
   });
 });
 

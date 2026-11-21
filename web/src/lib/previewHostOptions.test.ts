@@ -1,10 +1,16 @@
 import { beforeEach, expect, it, vi } from "vitest";
-import { isLoopbackPreviewUrl, previewHostOptions } from "./previewHostOptions";
+import {
+  isLoopbackPreviewUrl,
+  previewHostOptions,
+  withPreviewHostRetry,
+} from "./previewHostOptions";
 import { fetchHosts } from "@/hooks/useHosts";
 import { getDesktopFeatures } from "./nativeBridge";
 import type * as NativeBridge from "./nativeBridge";
+import { getSessionSlim } from "./sessionsApi";
 
 vi.mock("@/hooks/useHosts", () => ({ fetchHosts: vi.fn() }));
+vi.mock("./sessionsApi", () => ({ getSessionSlim: vi.fn() }));
 vi.mock("./nativeBridge", async (importOriginal) => ({
   ...(await importOriginal<typeof NativeBridge>()),
   getDesktopFeatures: vi.fn(),
@@ -12,6 +18,7 @@ vi.mock("./nativeBridge", async (importOriginal) => ({
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.mocked(getSessionSlim).mockReset();
   vi.mocked(getDesktopFeatures).mockResolvedValue({ sshLocalhostPreview: true });
   vi.mocked(fetchHosts).mockResolvedValue([
     { host_id: "remote", name: "devbox", status: "online" } as Awaited<
@@ -24,6 +31,7 @@ it("adds an SSH route hint to a remote localhost navigation in a capable shell",
   expect(await previewHostOptions("remote", "http://dev.localhost:8787")).toEqual({
     sourceHostId: "remote",
     sessionHostProtocol: 1,
+    sshPreviewProtocol: 1,
     sourceSshTarget: "devbox",
   });
 });
@@ -57,6 +65,7 @@ it("keeps unknown provenance and discovery failures public-only", async () => {
   expect(await previewHostOptions("remote", "http://127.0.0.1:8787")).toEqual({
     sourceHostId: "remote",
     sessionHostProtocol: 1,
+    sshPreviewProtocol: 1,
   });
 });
 
@@ -70,6 +79,7 @@ it.each([
   expect(await previewHostOptions("remote", "http://localhost:8787")).toEqual({
     sourceHostId: "remote",
     sessionHostProtocol: 1,
+    sshPreviewProtocol: 1,
   });
 });
 
@@ -86,9 +96,80 @@ it("aborts stalled discovery and keeps navigation on the existing policy path", 
   expect(await previewHostOptions("remote", "http://localhost:8787")).toEqual({
     sourceHostId: "remote",
     sessionHostProtocol: 1,
+    sshPreviewProtocol: 1,
   });
   expect(signal?.aborted).toBe(true);
 });
+
+it("refreshes provenance after consent and retries only once for the same host", async () => {
+  const steps: string[] = [];
+  vi.mocked(getSessionSlim).mockImplementation(async (id) => {
+    steps.push("refresh");
+    return { id, hostId: "host-a", parentSessionId: null } as Awaited<
+      ReturnType<typeof getSessionSlim>
+    >;
+  });
+  const navigate = vi.fn(async () => {
+    steps.push("navigate");
+    return { ok: false, retryWithFreshHost: true };
+  });
+  await withPreviewHostRetry("session", "host-a", navigate);
+  expect(steps).toEqual(["navigate", "refresh", "navigate"]);
+  expect(navigate).toHaveBeenCalledTimes(2);
+});
+
+it.each([false, true])(
+  "refuses a moved host after deferred consent (inherited: %s)",
+  async (inherited) => {
+    let currentHost = "host-a";
+    vi.mocked(getSessionSlim).mockImplementation(
+      async (id) =>
+        ({
+          id,
+          hostId: inherited && id === "session" ? null : currentHost,
+          parentSessionId: inherited && id === "session" ? "parent" : null,
+        }) as Awaited<ReturnType<typeof getSessionSlim>>,
+    );
+    let resolveConsent!: (result: NativeBridge.BrowserNavigationResult) => void;
+    const consent = new Promise<NativeBridge.BrowserNavigationResult>((resolve) => {
+      resolveConsent = resolve;
+    });
+    const navigate = vi.fn(() => consent);
+    const pending = withPreviewHostRetry("session", "host-a", navigate);
+    expect(getSessionSlim).not.toHaveBeenCalled();
+    currentHost = "host-b";
+    resolveConsent({ ok: false, retryWithFreshHost: true });
+    expect(await pending).toMatchObject({
+      ok: false,
+      retryWithFreshHost: false,
+      error: expect.stringContaining("host changed"),
+    });
+    expect(navigate).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(getSessionSlim).mock.calls.map(([id]) => id)).toEqual(
+      inherited ? ["session", "parent"] : ["session"],
+    );
+  },
+);
+
+it("does not retry if current provenance is unavailable", async () => {
+  vi.mocked(getSessionSlim).mockRejectedValue(new Error("offline"));
+  const navigate = vi.fn().mockResolvedValue({ ok: false, retryWithFreshHost: true });
+  expect(await withPreviewHostRetry("session", "host-a", navigate)).toMatchObject({
+    ok: false,
+    retryWithFreshHost: false,
+  });
+  expect(navigate).toHaveBeenCalledTimes(1);
+});
+
+it.each([{ ok: true }, { ok: false, error: "blocked" }, null, undefined])(
+  "does not refresh or retry unrelated results: %j",
+  async (result) => {
+    const navigate = vi.fn().mockResolvedValue(result);
+    expect(await withPreviewHostRetry("session", "host-a", navigate)).toEqual(result);
+    expect(navigate).toHaveBeenCalledTimes(1);
+    expect(getSessionSlim).not.toHaveBeenCalled();
+  },
+);
 
 it.each([
   ["http://localhost:8787", true],

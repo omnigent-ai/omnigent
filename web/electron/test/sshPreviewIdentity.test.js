@@ -2,6 +2,11 @@
 
 const { it } = require("node:test");
 const assert = require("node:assert/strict");
+const { execFile } = require("node:child_process");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { promisify } = require("node:util");
 const { verifySshPreviewIdentity } = require("../src/sshPreviewIdentity");
 
 const SERVER = "https://server.example/team?o=7";
@@ -39,6 +44,30 @@ it("proves the exact host and selected server using only a bounded read-only SSH
   );
   assert.deepEqual(call[2], { timeout: 15000, maxBuffer: 65536, encoding: "utf8" });
 });
+
+it(
+  "finds the CLI in an isolated user install with a restricted shell PATH",
+  {
+    skip: process.platform === "win32",
+  },
+  async (t) => {
+    const remoteHome = fs.mkdtempSync(path.join(os.tmpdir(), "preview-identity-"));
+    t.after(() => fs.rmSync(remoteHome, { recursive: true, force: true }));
+    const bin = path.join(remoteHome, ".local", "bin");
+    fs.mkdirSync(bin, { recursive: true });
+    fs.writeFileSync(
+      path.join(bin, "omnigent"),
+      `#!/bin/sh\n[ "$#" = 5 ] && [ "$1" = host ] && [ "$2" = status ] && [ "$3" = --server ] && [ "$4" = "${SERVER}" ] && [ "$5" = --json ] && [ "$OMNIGENT_WRAPPER_BYPASS" = 1 ] || exit 1\nprintf '%s\\n' '${JSON.stringify({ daemons: [daemon] })}'\n`,
+      { mode: 0o755 },
+    );
+    const run = (_file, args, options) =>
+      promisify(execFile)("/bin/sh", ["-c", args.at(-1)], {
+        ...options,
+        env: { HOME: remoteHome, PATH: "/usr/bin:/bin" },
+      });
+    assert.equal(await verifySshPreviewIdentity(SERVER, HOST, "devbox", run), true);
+  },
+);
 
 it("refuses missing, ambiguous, offline, mismatched and malformed identity", async () => {
   await Promise.all(

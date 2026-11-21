@@ -84,7 +84,11 @@ const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { goBack, goForward, registerBrowserIpc } = require("./browserIpc");
 const { isBrowserViewFocused, sharedDesignTools } = require("./designTools");
 const { arcaTarget, createArcaIdentityStore, isArcaAgentContext } = require("./arcaIdentity");
-const { createHostThisMachineChecker, SESSION_HOST_PROTOCOL } = require("./hostIdentity");
+const {
+  createHostThisMachineChecker,
+  SESSION_HOST_PROTOCOL,
+  SSH_PREVIEW_PROTOCOL,
+} = require("./hostIdentity");
 const { isDeveloperModeEnabled } = require("./developer_mode");
 const { DEV_DOMAIN, getDevUserDefault } = require("./dev_preferences");
 const {
@@ -6095,6 +6099,7 @@ function registerIpc() {
         serverTarget: arcaTarget(windowArcaServerUrl(win)),
         sourceHostId,
         ...(opts?.sessionHostProtocol === SESSION_HOST_PROTOCOL &&
+        opts?.sshPreviewProtocol === SSH_PREVIEW_PROTOCOL &&
         sshPreviewHosts.allows(windows.get(win)?.serverUrl, sourceHostId)
           ? { hostIsSshPreview: true }
           : {}),
@@ -6144,11 +6149,14 @@ function registerIpc() {
         return false;
       }
     },
-    requestPreviewHostForEvent: async (event, url, sourceHostId, sshTarget) => {
+    requestPreviewHostForEvent: async (event, url, opts) => {
       const win = BrowserWindow.fromWebContents(event.sender);
       const serverUrl = senderServerUrl(event);
+      const sourceHostId = opts?.sourceHostId;
       if (
         !win ||
+        opts?.sessionHostProtocol !== SESSION_HOST_PROTOCOL ||
+        opts?.sshPreviewProtocol !== SSH_PREVIEW_PROTOCOL ||
         process.platform === "win32" ||
         win.isDestroyed() ||
         !isPinnedOriginSender(event) ||
@@ -6162,7 +6170,7 @@ function registerIpc() {
         sourceHostId,
         (destination, needsVerification) =>
           approveSshPreviewHost(win, serverUrl, destination, needsVerification),
-        sshTarget,
+        opts?.sourceSshTarget,
       );
     },
     getAgentNavigationHintForEvent: (
