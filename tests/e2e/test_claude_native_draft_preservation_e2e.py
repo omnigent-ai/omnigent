@@ -12,9 +12,10 @@ exactly as left, and the delivered input must reach Claude without it.
 
 Claude's replies do not matter here. When the machine's Claude Code managed
 settings pin a gateway credential, that gateway answers; otherwise a scripted
-local gateway does. The peer session's model is always scripted. Assertions read
-the input box from the pane and the prompts from Claude's own transcript, never
-reply text.
+local gateway does. The peer session's model is always scripted. One journey
+needs Claude to run a long command: the scripted gateway always asks for it, and
+a real model is asked to. Assertions read the input box from the pane and the
+prompts from Claude's own transcript, never reply text.
 """
 
 from __future__ import annotations
@@ -51,6 +52,9 @@ from omnigent.harnesses.claude_native.bridge import (
 )
 from omnigent.onboarding.ambient import claude_managed_gateway
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, token_bound_runner_id
+from tests._helpers.live_server import terminate_process
+from tests._helpers.native_session import create_native_session
+from tests._helpers.polling import poll_until
 from tests._helpers.session import bundle_files, post_session_bundle, send_user_text
 from tests.e2e.conftest import configure_mock_llm, set_fallback_mock_llm
 from tests.server.integration.mock_llm_server import (
@@ -165,13 +169,20 @@ def gateway() -> Iterator[tuple[_ScriptedGateway, str]]:
 
 
 def _wait_for(check: Callable[[], Any], description: str, timeout: float = 60) -> Any:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+    """Poll *check* until it returns a truthy result, and return that result."""
+    found: list[Any] = []
+
+    def holds() -> bool:
         result = check()
         if result:
-            return result
-        time.sleep(0.25)
-    raise AssertionError(f"Timed out after {timeout:.0f}s waiting for {description}")
+            found.append(result)
+        return bool(result)
+
+    try:
+        poll_until(holds, timeout_s=timeout, interval_s=0.25)
+    except AssertionError:
+        raise AssertionError(f"Timed out after {timeout:.0f}s waiting for {description}") from None
+    return found[-1]
 
 
 def _is_rule(line: str) -> bool:
@@ -339,12 +350,7 @@ class _PersonTerminal:
         os.write(self.fd, b"\x1b[200~" + text.encode() + b"\x1b[201~")
 
     def close(self) -> None:
-        self._process.terminate()
-        try:
-            self._process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            self._process.kill()
-            self._process.wait(timeout=5)
+        terminate_process(self._process)
         with contextlib.suppress(OSError):
             os.close(self.fd)
         self._reader.join(timeout=5)
@@ -422,6 +428,13 @@ class _SessionStream:
         self._events: list[dict[str, Any]] = []
         self._connected = threading.Event()
         self._stop = threading.Event()
+        # No read timeout: the stream does not replay, so a reconnect could miss events.
+        self._client = httpx.Client(
+            base_url=claude.base_url,
+            headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+            timeout=httpx.Timeout(10.0, read=None),
+            trust_env=False,
+        )
         self._thread = threading.Thread(target=self._read, daemon=True)
 
     def __enter__(self) -> _SessionStream:
@@ -431,30 +444,24 @@ class _SessionStream:
 
     def __exit__(self, *_exc: object) -> None:
         self._stop.set()
+        self._client.close()
         self._thread.join(timeout=5)
 
     def _read(self) -> None:
-        with httpx.Client(
-            base_url=self._claude.base_url,
-            headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
-            timeout=httpx.Timeout(10.0, read=2.0),
-            trust_env=False,
-        ) as client:
-            while not self._stop.is_set():
-                try:
-                    with client.stream(
-                        "GET", f"/v1/sessions/{self._claude.session_id}/stream"
-                    ) as response:
-                        if response.status_code == 200:
-                            self._connected.set()
+        while not self._stop.is_set():
+            try:
+                with self._client.stream(
+                    "GET", f"/v1/sessions/{self._claude.session_id}/stream"
+                ) as response:
+                    if response.status_code == 200:
+                        self._connected.set()
                         for line in response.iter_lines():
-                            if self._stop.is_set():
-                                return
                             if line.startswith("data:"):
                                 with contextlib.suppress(ValueError):
                                     self._events.append(json.loads(line[len("data:") :]))
-                except httpx.HTTPError:
-                    continue
+            except (httpx.HTTPError, RuntimeError):
+                pass
+            self._stop.wait(0.5)
 
     def text(self) -> str:
         """Text the session streamed to the web UI so far."""
@@ -612,30 +619,17 @@ def claude(
                 lambda: client.get(f"/v1/runners/{runner_id}/status").json().get("online"),
                 "the runner tunnel",
             )
-            spec = b"""name: draft-preservation
-prompt: Reply briefly.
-executor:
-  harness: claude-native
-os_env:
-  type: caller_process
-  cwd: .
-  sandbox:
-    type: none
-"""
-            response = post_session_bundle(
-                client.post,
-                "/v1/sessions",
-                bundle_files({"draft-preservation.yaml": spec}),
+            session_id = create_native_session(
+                client,
+                resume_test_server,
+                harness="claude",
                 metadata={
                     "workspace": str(workspace),
-                    "labels": {"omnigent.wrapper": "claude-code-native-ui"},
                     # Auto mode asks the model whether a tool call may run, which a
                     # scripted gateway cannot answer; the allow rule decides instead.
                     "terminal_launch_args": ["--permission-mode", "default"],
                 },
-            )
-            response.raise_for_status()
-            session_id = response.json()["session_id"]
+            )["session_id"]
             client.patch(
                 f"/v1/sessions/{session_id}", json={"runner_id": runner_id}
             ).raise_for_status()
@@ -667,12 +661,7 @@ os_env:
                     (tmp_path / "pane.txt").write_text(
                         session.tmux("capture-pane", "-p", "-S", "-200", "-t", session.target)
                     )
-            runner.terminate()
-            try:
-                runner.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                runner.kill()
-                runner.wait(timeout=5)
+            terminate_process(runner, timeout_s=15)
             if session is not None:
                 subprocess.run(
                     ["tmux", "-S", session.socket_path, "kill-server"],
