@@ -159,9 +159,12 @@ export function useTerminalTabConnections(
   };
 
   // A wait starts when it's first seen, in the store, so a panel that replaces this one keeps it.
+  // The render that saw a wait change timed it from the old start, so it renders again even if
+  // the clock reads the same as at the last tick.
   useLayoutEffect(() => {
-    shellWaits.track(new Map(JSON.parse(waitingSignature) as [string, string][]));
+    const changed = shellWaits.track(new Map(JSON.parse(waitingSignature) as [string, string][]));
     setNow(Date.now());
+    if (changed) setRevision((revision) => revision + 1);
   }, [shellWaits, waitingSignature]);
 
   // The clock ticks only until the last wait runs out; Try Again or Resume starts it again.

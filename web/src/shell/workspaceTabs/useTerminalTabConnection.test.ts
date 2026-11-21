@@ -191,6 +191,39 @@ describe("a shell tab's clock", () => {
   });
 });
 
+describe("a shell tab whose wait changes", () => {
+  it("keeps timing the new wait when the session comes online on a tick", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    try {
+      const client = new QueryClient();
+      const shellWaits = createShellWaits();
+      const shell = { key: "terminal:t1", inventory: "unknown" } as const;
+      const { result, rerender } = renderHook(
+        ({ liveness }: { liveness: "starting" | "online" }) =>
+          useTerminalTabConnections("s-online", shellWaits, {
+            liveness,
+            listFailed: false,
+            shells: [shell],
+          }),
+        {
+          initialProps: { liveness: "starting" },
+          wrapper: ({ children }) => createElement(QueryClientProvider, { client }, children),
+        },
+      );
+      // Starting for 30 s, past the shell list's own limit; it comes online right on a tick.
+      await act(async () => vi.advanceTimersByTime(30_000));
+      rerender({ liveness: "online" });
+      expect(result.current.connectionOf(shell).kind).toBe("connecting");
+      // The shell list's wait starts then, and runs out on its own.
+      await act(async () => vi.advanceTimersByTime(SHELL_LIST_LIMIT_MS + 1_000));
+      expect(result.current.connectionOf(shell).kind).toBe("unreachable");
+      client.clear();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("Try Again from a shell tab", () => {
   it("asks afresh once a list request that never answered has failed at its deadline", async () => {
     vi.useFakeTimers();
