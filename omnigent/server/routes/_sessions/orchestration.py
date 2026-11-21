@@ -5303,9 +5303,9 @@ async def _run_managed_launch(
     from omnigent.server.managed_hosts import (
         deployment_with_inference_snapshot,
         deployment_with_sandbox_profile,
-        host_slice_key_enabled,
         resolve_managed_agent_label,
     )
+    from omnigent.server.routes._host_launch import _deployment_is_sharded
 
     try:
         profile = None
@@ -5386,11 +5386,7 @@ async def _run_managed_launch(
             provider=provider,
             agent_name=agent_name,
             host_id=host_id,
-            relaunch_slice_key_enabled=(
-                relaunch_host is not None
-                and saved_conversation is not None
-                and host_slice_key_enabled(saved_conversation.labels, relaunch_host.host_id)
-            ),
+            relaunch_slice_key_enabled=relaunch_host is not None and _deployment_is_sharded(),
         )
         if managed is None:
             return
@@ -5884,24 +5880,21 @@ def _raise_if_managed_wake_misses_host_tunnel(
     """
     Re-address a client request that would wake a managed host off its tunnel's replica.
 
-    A managed host dials the replica that owns its slice key: its own id when
-    the create keyed it, otherwise the default route. A wake run from any other
-    replica lands its tunnel elsewhere, so the request parks for the whole wake.
-    Answer ``WRONG_REPLICA`` first so the client re-addresses to the key that
-    starts the wake where the tunnel lands. Only a fastapi ``Request`` names a
-    routing key; internal callers pass nothing and skip this check.
+    A woken managed host dials the replica its own id names, and every client that
+    knows the host routes by that id. A wake run from any other replica lands its
+    tunnel elsewhere, so the request parks for the whole wake. Answer
+    ``WRONG_REPLICA`` first so the client re-addresses by the host's id. Only a
+    fastapi ``Request`` names a routing key; internal callers pass nothing and skip
+    this check.
 
     :param conv: Session row whose host may need a wake.
     :param host: The session's managed host row, already loaded by the caller.
     :param request: The inbound request, or ``None``/a non-HTTP context to skip.
     :param app_state: ``request.app.state`` — supplies the host registry.
-    :raises WrongReplicaError: For a keyed host whose key the request does not carry.
-    :raises OmnigentError: ``WRONG_REPLICA`` (no key to resend) for an unkeyed host
-        reached through a keyed request.
+    :raises WrongReplicaError: When the request is not routed by the host's id.
     """
     from fastapi import Request
 
-    from omnigent.server.managed_hosts import host_slice_key_enabled
     from omnigent.server.routes._host_launch import _deployment_is_sharded, routed_slice_key
 
     if not isinstance(request, Request):
@@ -5909,20 +5902,13 @@ def _raise_if_managed_wake_misses_host_tunnel(
     host_registry = getattr(app_state, "host_registry", None)
     if conv.host_id is None or host_registry is None or not _deployment_is_sharded():
         return
-    keyed = host_slice_key_enabled(conv.labels, conv.host_id)
-    expected_key = conv.host_id if keyed else None
-    if routed_slice_key(request) == expected_key or host_registry.get(conv.host_id) is not None:
+    if routed_slice_key(request) == conv.host_id or host_registry.get(conv.host_id) is not None:
         return
     if host.sandbox_provider is None:
         return
-    if keyed:
-        raise WrongReplicaError(
-            f"managed host {conv.host_id} wakes on the replica its slice key names",
-            host_id=conv.host_id,
-        )
-    raise OmnigentError(
-        f"managed host {conv.host_id} wakes on the default replica; retry without its slice key",
-        code=ErrorCode.WRONG_REPLICA,
+    raise WrongReplicaError(
+        f"managed host {conv.host_id} wakes on the replica its slice key names",
+        host_id=conv.host_id,
     )
 
 
@@ -6740,11 +6726,11 @@ async def _run_managed_wake(
     from omnigent.server.managed_hosts import (
         deployment_with_inference_snapshot,
         deployment_with_sandbox_profile,
-        host_slice_key_enabled,
         resolve_managed_agent_label,
         resume_managed_host,
     )
     from omnigent.server.routes import sessions as _facade
+    from omnigent.server.routes._host_launch import _deployment_is_sharded
 
     sandbox_config = deployment_with_inference_snapshot(sandbox_config, conv.inference_snapshot)
     host_id = conv.host_id
@@ -6811,7 +6797,7 @@ async def _run_managed_wake(
                 force=True,
                 on_stage=_on_stage,
                 agent_name=agent_name,
-                slice_key_enabled=host_slice_key_enabled(conv.labels, host_id),
+                slice_key_enabled=_deployment_is_sharded(),
             )
         except SandboxGoneError:
             _logger.info(

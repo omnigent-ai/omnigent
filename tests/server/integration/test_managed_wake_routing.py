@@ -168,13 +168,19 @@ def _wrong_replica(response: Any) -> bool:
     return response.status_code == 400 and response.json()["error"]["code"] == "wrong_replica"
 
 
+# A session that joined the host later carries no requested-host label; it routes
+# the same way as the session whose create launched the host.
+LABELLED = pytest.mark.parametrize("labelled", [True, False], ids=["create", "joined"])
+
+
 @pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)
 @pytest.mark.parametrize("entry_point", ["message", "compact", "terminal", "retry"])
+@LABELLED
 async def test_keyed_host_mismatched_key_is_rerouted_before_any_wake(
-    two_replica_stack: Any, managed_wake: Any, entry_point: str
+    two_replica_stack: Any, managed_wake: Any, entry_point: str, labelled: bool
 ) -> None:
     arrange, events = managed_wake
-    session_id = await arrange(keyed=True, wrapper=entry_point == "compact")
+    session_id = await arrange(keyed=labelled, wrapper=entry_point == "compact")
     method, path, body = _route(entry_point, session_id)
 
     response = await two_replica_stack.keyless_client.request(
@@ -188,31 +194,13 @@ async def test_keyed_host_mismatched_key_is_rerouted_before_any_wake(
 
 
 @pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)
-@pytest.mark.parametrize("entry_point", ["message", "terminal", "retry"])
-async def test_unkeyed_host_keyed_request_gets_plain_wrong_replica(
-    two_replica_stack: Any, managed_wake: Any, entry_point: str
-) -> None:
-    arrange, events = managed_wake
-    session_id = await arrange(keyed=False)
-    method, path, body = _route(entry_point, session_id)
-
-    response = await two_replica_stack.keyless_client.request(
-        method, path, headers=_headers(FOREIGN_KEY), json=body
-    )
-
-    assert _wrong_replica(response), response.text
-    # Unkeyed: there is no key to name, so the body must not point at the host.
-    assert "slice_key" not in response.json()["error"]
-    assert events == []
-
-
-@pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)
-@pytest.mark.parametrize("entry_point", ["message", "compact", "terminal"])
+@pytest.mark.parametrize("entry_point", ["message", "compact", "terminal", "retry"])
+@LABELLED
 async def test_matching_key_wakes_and_launches_runner_before_ready(
-    two_replica_stack: Any, managed_wake: Any, entry_point: str
+    two_replica_stack: Any, managed_wake: Any, entry_point: str, labelled: bool
 ) -> None:
     arrange, events = managed_wake
-    session_id = await arrange(keyed=True, wrapper=entry_point == "compact")
+    session_id = await arrange(keyed=labelled, wrapper=entry_point == "compact")
     method, path, body = _route(entry_point, session_id)
 
     response = await two_replica_stack.tunnel_client.request(
@@ -221,21 +209,6 @@ async def test_matching_key_wakes_and_launches_runner_before_ready(
 
     assert not _wrong_replica(response), response.text
     assert "resume" in events and "launch" in events and "ready" in events, events
-    assert events.index("resume") < events.index("launch") < events.index("ready"), events
-
-
-@pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)
-async def test_unkeyed_host_wakes_from_the_default_route(
-    two_replica_stack: Any, managed_wake: Any
-) -> None:
-    arrange, events = managed_wake
-    session_id = await arrange(keyed=False, dial_replica="keyless")
-
-    response = await two_replica_stack.keyless_client.post(
-        f"/v1/sessions/{session_id}/events", headers=_headers(None), json=MESSAGE
-    )
-
-    assert not _wrong_replica(response), response.text
     assert events.index("resume") < events.index("launch") < events.index("ready"), events
 
 

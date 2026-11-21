@@ -454,20 +454,6 @@ def managed_host_name(host_id: str) -> str:
     return f"managed-{host_id[:8]}"
 
 
-def host_slice_key_enabled(labels: Mapping[str, str], host_id: str) -> bool:
-    """
-    Whether a session's managed host routes by its own id.
-
-    Only when the create or fork chose this host id, so the caller routes by it from
-    the start; otherwise the host stays on the caller's default replica.
-
-    :param labels: The session's labels.
-    :param host_id: The session's managed host.
-    :returns: ``True`` when the create requested *host_id*.
-    """
-    return labels.get(REQUESTED_HOST_ID_LABEL_KEY) == host_id
-
-
 def _with_host_slice_key(
     host_config: dict[str, object] | None, enabled: bool, server_url: str
 ) -> dict[str, object] | None:
@@ -4184,7 +4170,7 @@ async def launch_managed_host(
         must be thread-safe. ``None`` disables progress reporting.
     :param host_id: Id to register the host under — a create's
         ``host_id`` — or ``None`` to mint one. A requested id also makes the
-        host route by it (see :func:`host_slice_key_enabled`).
+        host route by it.
     :param launch_state: In-flight state for callers with an independent
         registration deadline. Retains provider recovery guidance while launching.
     :returns: The registered host id + in-sandbox workspace path
@@ -4357,8 +4343,8 @@ async def _relaunch_managed_host(
     :param on_stage: Progress observer forwarded to
         :func:`_register_and_start_host`; see :func:`launch_managed_host`.
         ``None`` disables progress reporting.
-    :param slice_key_enabled: Whether the host routes by its own id, as at its
-        first launch (see :func:`host_slice_key_enabled`).
+    :param slice_key_enabled: Whether the host routes by its own id, which a known
+        host does on a host-sharded deployment.
     :param launch_state: In-flight state retaining provider guidance during registration.
     :returns: The (unchanged) host id + fresh in-sandbox workspace.
     :raises HTTPException: 400 when the host's recorded provider no
@@ -4941,8 +4927,8 @@ async def resume_managed_host(
         runner, or ``None`` to leave it unstamped. A wake rebuilds the runner
         from scratch, so the classifier is not carried over by the resume: the
         caller re-derives it through the same built-in gate a launch uses.
-    :param slice_key_enabled: Whether the host routes by its own id, as at its
-        first launch (see :func:`host_slice_key_enabled`).
+    :param slice_key_enabled: Whether the host routes by its own id, which a known
+        host does on a host-sharded deployment.
     :raises SandboxGoneError: When the sandbox generation definitively no
         longer exists, allowing the caller to create a fresh one.
     :raises HTTPException: 502 when the resume or host restart otherwise fails.
