@@ -11,11 +11,20 @@ vi.mock("./CommandPalette", () => ({
     <div data-testid="cmdk-palette" data-sessions-only={String(Boolean(sessionsOnly))} />
   ),
 }));
-vi.mock("./QuickPickCommandPalette", () => ({
-  QuickPickCommandPalette: ({ sessionsOnly }: { sessionsOnly?: boolean }) => (
-    <div data-testid="quick-pick-palette" data-sessions-only={String(Boolean(sessionsOnly))} />
-  ),
-}));
+// Which flagged modules have been imported; the flag-off cases run first and need none.
+const loaded = vi.hoisted(() => new Set<string>());
+vi.mock("./QuickPickCommandPalette", () => {
+  loaded.add("QuickPickCommandPalette");
+  return {
+    QuickPickCommandPalette: ({ sessionsOnly }: { sessionsOnly?: boolean }) => (
+      <div data-testid="quick-pick-palette" data-sessions-only={String(Boolean(sessionsOnly))} />
+    ),
+  };
+});
+vi.mock("./ThemePicker", () => {
+  loaded.add("ThemePicker");
+  return { ThemePicker: () => <div data-testid="theme-picker" /> };
+});
 vi.mock("@/components/KeyboardShortcutsDialog", () => ({ KeyboardShortcutsDialog: () => null }));
 vi.mock("@/components/onboarding/HostImportReview", () => ({ ImportReviewGate: () => null }));
 vi.mock("./RecentSessionsSwitcher", () => ({ RecentSessionsSwitcher: () => null }));
@@ -62,17 +71,23 @@ describe("AppShellOverlays palette flag", () => {
       const { getByTestId, queryByTestId } = renderOverlays(features, sessionSearch);
       expect(getByTestId("cmdk-palette").dataset.sessionsOnly).toBe(String(sessionSearch));
       expect(queryByTestId("quick-pick-palette")).toBeNull();
+      expect(queryByTestId("theme-picker")).toBeNull();
+      // Without the flag, neither the QuickPick palette nor its theme picker is even fetched.
+      expect([...loaded]).toEqual([]);
     },
   );
 
   it.each([false, true])(
     "shows the QuickPick palette when the flag is on (sessions only: %s)",
-    (sessionSearch) => {
-      const { getByTestId, queryByTestId } = renderOverlays(
+    async (sessionSearch) => {
+      const { findByTestId, queryByTestId } = renderOverlays(
         { quick_pick_palette: true },
         sessionSearch,
       );
-      expect(getByTestId("quick-pick-palette").dataset.sessionsOnly).toBe(String(sessionSearch));
+      expect((await findByTestId("quick-pick-palette")).dataset.sessionsOnly).toBe(
+        String(sessionSearch),
+      );
+      expect(await findByTestId("theme-picker")).toBeTruthy();
       expect(queryByTestId("cmdk-palette")).toBeNull();
     },
   );
