@@ -43,4 +43,16 @@ describe("currentSessionRow", () => {
     queryClient.setQueryData(["conversation-backfill", "c1"], null);
     expect(currentSessionRow(queryClient, SESSION, false)).toBeNull();
   });
+
+  it("keeps a search result's own row when only the session's detail is cached", () => {
+    const queryClient = cached();
+    queryClient.setQueryData(["session", "c1"], { id: "c1", title: "Fix the parser" });
+    const shared = { ...SESSION, owner: "someone-else" };
+    // The detail carries no owner, so it never stands in for the row; reads stay the same object.
+    expect(isSessionListed(queryClient, "c1")).toBe(false);
+    expect(currentSessionRow(queryClient, shared, false)).toBe(shared);
+    expect(currentSessionRow(queryClient, shared, false)).toBe(
+      currentSessionRow(queryClient, shared, false),
+    );
+  });
 });
