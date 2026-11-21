@@ -133,6 +133,13 @@ describe("FilesPageViewer", () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
+  it("shows a text file in the app's viewer at a linked comment's thread, since the editor has none", () => {
+    renderViewer("src/app.ts", { data: file("src/app.ts", "const a = 1;\n") }, { commentId: "c1" });
+    expect(screen.queryByTestId("editor")).toBeNull();
+    expect(screen.getByTestId("file-viewer")).toBeInTheDocument();
+    expect(captured.viewer!.linkedCommentId).toBe("c1");
+  });
+
   it("gives the app's viewer the session's permission level, for rich files and bytes that aren't text", () => {
     renderViewer(
       "docs/guide.md",

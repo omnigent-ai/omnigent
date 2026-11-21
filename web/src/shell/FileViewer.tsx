@@ -357,6 +357,8 @@ interface PendingLeave {
 
 interface FileViewerProps {
   syncUrl?: boolean;
+  /** A comment whose thread opens with the file, as a `?comment=` link asks for. */
+  linkedCommentId?: string;
   agentId?: string | null;
   position?: FilePosition;
   open: boolean;
@@ -430,6 +432,7 @@ export function FileViewer(props: FileViewerProps) {
 
 function FileViewerBody({
   syncUrl = true,
+  linkedCommentId,
   position,
   open,
   mediaActive = true,
@@ -465,7 +468,9 @@ function FileViewerBody({
   // param writes to re-run the initialization logic.
   const initialDiffRef = useRef(syncUrl && searchParams.get("diff") === "1");
   const linkedFileRef = useRef(initialDiffRef.current ? { conversationId, path } : null);
-  const initialCommentIdRef = useRef(syncUrl ? searchParams.get("comment") : null);
+  const initialCommentIdRef = useRef(
+    linkedCommentId ?? (syncUrl ? searchParams.get("comment") : null),
+  );
   // Seeded from the parent's persisted state on remount (e.g. returning to a
   // tab); defaults closed on a fresh open. The linked-comment / fresh-open
   // effects below only force it open, never closed, so a restored-open value

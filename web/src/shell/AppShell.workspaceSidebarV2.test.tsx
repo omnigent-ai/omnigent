@@ -631,6 +631,39 @@ describe("workspace_sidebar_v2", () => {
     );
   });
 
+  it("opens a ?diff= link's file in the Changes review, and a ?comment= link's thread on the file", async () => {
+    setViewport(DESKTOP);
+    renderShell(withFlag(true), "/c/conv_ws?file=README.md&line=4&diff=1");
+    await waitFor(() =>
+      expect(workspaceTabsSessions.openWorkspaceFileLink).toHaveBeenCalledWith(
+        "conv_ws",
+        "README.md",
+        { line: 4, view: "diff" },
+        "link",
+      ),
+    );
+    await waitFor(() => expect(screen.getByTestId("search")).not.toHaveTextContent("diff="));
+    cleanup();
+
+    renderShell(withFlag(true), "/c/conv_ws?file=README.md&comment=c1");
+    await waitFor(() =>
+      expect(workspaceTabsSessions.openWorkspaceFileLink).toHaveBeenLastCalledWith(
+        "conv_ws",
+        "README.md",
+        { commentId: "c1" },
+        "link",
+      ),
+    );
+    await waitFor(() => expect(screen.getByTestId("search")).not.toHaveTextContent("comment="));
+  });
+
+  it("fills the window with the sidebar for a ?fullscreen=1 link, and leaves the URL", async () => {
+    setViewport(DESKTOP);
+    renderShell(withFlag(true), "/c/conv_ws?file=README.md&fullscreen=1");
+    await waitFor(() => expect(tabs.host).toMatchObject({ maximized: true }));
+    await waitFor(() => expect(screen.getByTestId("search")).not.toHaveTextContent("fullscreen="));
+  });
+
   it("shows the browser tab an agent selects in its tab", async () => {
     changeBrowserTabs("conv_ws", ["agent-browser", "t1"], "agent-browser");
     setViewport(DESKTOP);

@@ -254,6 +254,7 @@ function FilesPlaceView({
           toolbarLeading={treeToggle}
           registerLeaveGuard={registerLeaveGuard}
           permissionLevel={files.permissionLevel}
+          commentId={place.comment}
           // The Files tab closes its file back to the tree; another file tab goes to the Files tab.
           onClose={() =>
             filesTab

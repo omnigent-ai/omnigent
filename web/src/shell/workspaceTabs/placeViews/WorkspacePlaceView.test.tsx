@@ -221,6 +221,11 @@ describe("Files tab", () => {
     expect(captured.viewer!.permissionLevel).toBe(1);
   });
 
+  it("hands the viewer the comment a link opened the file at", () => {
+    renderView({ kind: "files", path: "a.ts", comment: "c1" });
+    expect(captured.viewer!.commentId).toBe("c1");
+  });
+
   it("closes the Files tab's file back to its tree, and a file tab's to the Files tab", () => {
     const files = renderView({ kind: "files", path: "a.ts" });
     captured.viewer!.onClose();

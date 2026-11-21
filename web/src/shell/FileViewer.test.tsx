@@ -279,6 +279,7 @@ interface RenderProps {
   escapeCloses?: boolean;
   onShare?: () => void;
   shareDisabledReason?: string;
+  linkedCommentId?: string;
 }
 
 /**
@@ -308,6 +309,7 @@ function viewerTree({
   onShare,
   shareDisabledReason,
   registerLeaveGuard,
+  linkedCommentId,
 }: RenderProps = {}) {
   const url = initialSearch ? `/?${initialSearch}` : "/";
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -333,6 +335,7 @@ function viewerTree({
           onShare={onShare}
           shareDisabledReason={shareDisabledReason}
           registerLeaveGuard={registerLeaveGuard}
+          linkedCommentId={linkedCommentId}
         />
       </MemoryRouter>
     </QueryClientProvider>
@@ -1018,6 +1021,14 @@ describe("FileViewer URL sync — comment param", () => {
     // Panel must open because the linked comment was found and applied.
     // Failure: linkedCommentAppliedRef logic did not run, or commentsQuery.data
     // was not available when the effect fired.
+    expect(screen.getByTestId("comments-panel")).toBeInTheDocument();
+  });
+
+  it("opens the comments panel for a linked comment it's given, with no ?comment= in the URL", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1")]));
+
+    renderViewer({ open: true, path: "file1.py", linkedCommentId: "c1" });
+
     expect(screen.getByTestId("comments-panel")).toBeInTheDocument();
   });
 

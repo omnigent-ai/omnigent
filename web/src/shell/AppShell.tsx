@@ -10,6 +10,7 @@ import {
   showWorkspaceTabOrChooser,
   useTabsSidebar,
 } from "@/shell/workspaceTabsRouting";
+import type { WorkspaceFileOpenOptions } from "@/shell/workspaceTabs/workspacePlaceNavigation";
 import {
   type ComponentProps,
   type CSSProperties,
@@ -1900,17 +1901,26 @@ function AppShellImpl() {
       { replace: true },
     );
   }, [setSearchParams]);
-  // In the tabs sidebar, a ?file= link opens the file's tab at its cited line, and the
-  // request leaves the URL once it's handed over.
+  // In the tabs sidebar, a ?file= link opens the file's tab at its cited line, its diff in
+  // Changes, or its comment's thread, and the request leaves the URL once it's handed over.
   useEffect(() => {
     const tabsSession = tabsSessionRef.current;
     if (tabsSession === null || !citationPath) return;
-    const position = urlNavigation?.position;
+    const commentId = searchParams.get("comment") || undefined;
+    const options: WorkspaceFileOpenOptions = {
+      ...urlNavigation?.position,
+      ...(searchParams.get("diff") === "1" ? { view: "diff" } : {}),
+      ...(commentId !== undefined ? { commentId } : {}),
+    };
     void routeToWorkspaceTabs((tabs) =>
-      tabs.openWorkspaceFileLink(tabsSession, citationPath, position, "link"),
+      tabs.openWorkspaceFileLink(tabsSession, citationPath, options, "link"),
     );
     if (isMobileViewport()) setTabsDrawerOpen(true);
-    else setRightPanelOpenImmediately(true);
+    else {
+      setRightPanelOpenImmediately(true);
+      // ?fullscreen=1 fills the window with the sidebar, as its Full screen button does.
+      if (urlFileFullscreen && !rightPanelMaximized) toggleRightPanelMaximized();
+    }
     clearFileViewerUrl();
   }, [tabsSidebar, conversationId, citationPath, urlNavigation, clearFileViewerUrl]); // eslint-disable-line react-hooks/exhaustive-deps
   const restoreSelectedFileUrl = useCallback(() => {
