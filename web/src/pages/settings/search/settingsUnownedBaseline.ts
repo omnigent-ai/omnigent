@@ -143,4 +143,16 @@ export const UNOWNED_CONTROLS: Readonly<Record<string, { count: number; reason: 
     reason:
       "Subscription sign-in's copy button, named by its command text; the fix dialog's owner doesn't name it, and it isn't a catalog part yet.",
   },
+  "src/pages/SettingsPage.tsx › TerminalExtraKeysControl › SelectContent": {
+    count: 1,
+    reason: "added after the Settings catalog; no section entry yet",
+  },
+  "src/pages/SettingsPage.tsx › TerminalExtraKeysControl › SelectItem": {
+    count: 1,
+    reason: "added after the Settings catalog; no section entry yet",
+  },
+  "src/pages/SettingsPage.tsx › TerminalExtraKeysControl › SelectTrigger": {
+    count: 1,
+    reason: "added after the Settings catalog; no section entry yet",
+  },
 };
