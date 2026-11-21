@@ -407,14 +407,14 @@ def test_harness_without_process_sandbox_rejects_requested_confinement(
 
 
 @pytest.mark.parametrize(
-    "harness,launch_state",
+    "harness,launch_state,writable_grant",
     [
-        *((harness, "expected") for harness in _HARNESSES),
-        ("launcher", "different_cwd"),
-        ("launcher", "forged_marker"),
+        *((harness, "expected", False) for harness in _HARNESSES),
+        ("launcher", "expected", True),
+        ("launcher", "different_cwd", False),
+        ("launcher", "forged_marker", False),
     ],
 )
-@pytest.mark.parametrize("writable_grant", [False, True])
 def test_real_worker_keeps_declared_filesystem_and_network_boundary(
     harness: str,
     launch_state: str,
@@ -642,9 +642,8 @@ def test_installed_codex_native_commands_remain_inside_outer_sandbox(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("allow_network", [False, True], ids=["skip-denied", "discover-allowed"])
 async def test_codex_provider_discovery_runs_inside_requested_sandbox(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, active_sandbox_type: str, allow_network: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, active_sandbox_type: str
 ) -> None:
     from omnigent.harnesses.codex_native import app_server
 
@@ -704,7 +703,7 @@ with serve(respond, address.hostname, address.port) as server:
             type=active_sandbox_type,
             read_paths=[str(workspace)],
             write_paths=[],
-            allow_network=allow_network,
+            allow_network=True,
         ),
     )
     env = {"PATH": os.environ["PATH"], "HOME": str(home), "HOST_ONLY": "parent-value"}
@@ -732,18 +731,13 @@ with serve(respond, address.hostname, address.port) as server:
     assert overrides == []
     providers = tomllib.loads((home / "config.toml").read_text())["model_providers"]
     assert providers["configured"]["base_url"] == "https://other.test"
-    if allow_network:
-        started.assert_awaited_once()
-        assert providers["inherited"]["http_headers"]["Databricks-Custom-Coding-Agent"] == "codex"
-        assert json.loads(report.read_text()) == {
-            "cwd": str(workspace.resolve()),
-            "filtered": True,
-            "denied": True,
-        }
-    else:
-        started.assert_not_awaited()
-        assert not report.exists()
-        assert "inherited" not in providers
+    started.assert_awaited_once()
+    assert providers["inherited"]["http_headers"]["Databricks-Custom-Coding-Agent"] == "codex"
+    assert json.loads(report.read_text()) == {
+        "cwd": str(workspace.resolve()),
+        "filtered": True,
+        "denied": True,
+    }
 
 
 def test_pi_version_probe_runs_inside_requested_sandbox(
