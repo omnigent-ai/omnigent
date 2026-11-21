@@ -543,16 +543,16 @@ def test_a_runners_children_never_see_its_instance_settings(
     assert code_host_instances.instance_for_host(INSTANCE_HOST) is not None
 
 
-def test_a_host_process_drops_the_runner_settings_it_inherited(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv(CODE_HOST_INSTANCES_FILE_ENV_VAR, "/elsewhere/code_host_instances.toml")
-    monkeypatch.setenv(CODE_HOST_INSTANCE_HOSTS_ENV_VAR, INSTANCE_HOST)
+def test_a_host_process_drops_the_runner_settings_it_inherited() -> None:
+    inherited = {
+        **SYNTHETIC_ENVIRONMENT,
+        CODE_HOST_INSTANCES_FILE_ENV_VAR: "/elsewhere/code_host_instances.toml",
+        CODE_HOST_INSTANCE_HOSTS_ENV_VAR: INSTANCE_HOST,
+    }
 
-    code_host_instances.discard_runner_settings()
+    code_host_instances.discard_runner_settings(inherited)
 
-    assert CODE_HOST_INSTANCES_FILE_ENV_VAR not in os.environ
-    assert CODE_HOST_INSTANCE_HOSTS_ENV_VAR not in os.environ
+    assert inherited == SYNTHETIC_ENVIRONMENT
     assert code_host_instances.code_host_routing() is code_host_instances.NO_ROUTING
 
 

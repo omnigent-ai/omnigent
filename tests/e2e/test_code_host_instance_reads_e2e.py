@@ -88,7 +88,8 @@ def test_a_pull_request_on_an_instance_host_is_read_through_the_instance_cli(
         for directory in os.environ["PATH"].split(os.pathsep)
         if directory and not (Path(directory) / "gh").exists()
     )
-    assert shutil.which("gh", path=base_env["PATH"]) is None
+    plain_gh_on_path = shutil.which("gh", path=base_env["PATH"]) is not None
+    assert not plain_gh_on_path, "plain gh is still on the test PATH"
 
     with server_runner(
         tmp_path / "stack",

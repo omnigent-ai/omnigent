@@ -5732,10 +5732,13 @@ def test_build_runner_env_names_the_code_host_instance_file_only_from_the_host(
     )
     unserved = _build_runner_env({"PATH": "/usr/bin", **planted}, session_env=planted, **common)
 
-    assert served[CODE_HOST_INSTANCES_FILE_ENV_VAR] == str(host_file)
-    assert served[CODE_HOST_INSTANCE_HOSTS_ENV_VAR] == "code.example.test,mirror.example.test"
-    assert CODE_HOST_INSTANCES_FILE_ENV_VAR not in unserved
-    assert CODE_HOST_INSTANCE_HOSTS_ENV_VAR not in unserved
+    # Compare only these two values, so a failure prints no other environment value.
+    names = (CODE_HOST_INSTANCES_FILE_ENV_VAR, CODE_HOST_INSTANCE_HOSTS_ENV_VAR)
+    assert [served.get(name) for name in names] == [
+        str(host_file),
+        "code.example.test,mirror.example.test",
+    ]
+    assert [unserved.get(name) for name in names] == [None, None]
 
 
 @pytest.mark.parametrize(
@@ -5925,7 +5928,8 @@ def test_a_refused_instance_file_serves_no_instances_and_keeps_its_hosts_from_pl
         parent_pid=42,
         code_host_instance_hosts=host._code_host_declared_hosts,
     )
-    assert runner_env[CODE_HOST_INSTANCE_HOSTS_ENV_VAR] == "code.example.test"
+    runner_hosts = runner_env.get(CODE_HOST_INSTANCE_HOSTS_ENV_VAR)
+    assert runner_hosts == "code.example.test"
     _cleanup_host(host)
 
 
