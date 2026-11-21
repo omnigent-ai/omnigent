@@ -70,6 +70,8 @@ export interface ProjectTicket {
   plan?: string;
   review_summary?: string;
   lead_session_id?: string | null;
+  /** Latest linked-agent activity; absent or null means unknown. */
+  has_running_agents?: boolean | null;
   latest_update: string;
   comment_count: number;
   created_at: number;

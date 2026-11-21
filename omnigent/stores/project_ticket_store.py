@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import builtins
 import uuid
+from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import select, union_all
@@ -44,6 +45,14 @@ from omnigent.entities.project_ticket import (
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
+
+TICKET_ACTIVITY_SESSION_MAX = 100
+
+
+@dataclass(frozen=True)
+class TicketActivitySessions:
+    session_ids: list[str]
+    has_more: bool
 
 
 def _identifier(value: str) -> str:
@@ -302,6 +311,42 @@ class ProjectTicketStore:
             )
         ]
         return sorted(rows, key=lambda row: (row.created_at, row.id))[:limit]
+
+    def activity_sessions(
+        self, project_id: str, ticket_ids: builtins.list[str], *, user_id: str | None
+    ) -> dict[str, TicketActivitySessions]:
+        if len(ticket_ids) > TICKET_PAGE_MAX:
+            raise OmnigentError("Too many tickets", code=ErrorCode.INVALID_INPUT)
+        ticket_ids = sorted({_identifier(ticket_id) for ticket_id in ticket_ids})
+        with self._session("read_ticket_activity_sessions") as session:
+            project = self._project(session, project_id, user_id)
+            if not ticket_ids:
+                return {}
+            # Each primary-key prefix scan is bounded before the union, including quiet tickets.
+            pages = [
+                select(SqlProjectTicketSession.ticket_id, SqlProjectTicketSession.session_id)
+                .where(
+                    SqlProjectTicketSession.workspace_id == project.workspace_id,
+                    SqlProjectTicketSession.project_id == project.id,
+                    SqlProjectTicketSession.ticket_id == ticket_id,
+                )
+                .order_by(SqlProjectTicketSession.session_id)
+                .limit(TICKET_ACTIVITY_SESSION_MAX + 1)
+                .subquery()
+                for ticket_id in ticket_ids
+            ]
+            grouped: dict[str, builtins.list[str]] = {ticket_id: [] for ticket_id in ticket_ids}
+            for ticket_id, session_id in session.execute(
+                union_all(*(select(page) for page in pages))
+            ):
+                grouped[ticket_id].append(session_id)
+            return {
+                ticket_id: TicketActivitySessions(
+                    session_ids[:TICKET_ACTIVITY_SESSION_MAX],
+                    len(session_ids) > TICKET_ACTIVITY_SESSION_MAX,
+                )
+                for ticket_id, session_ids in grouped.items()
+            }
 
     def stages(
         self, project_id: str, *, user_id: str | None, include_usage: bool = False

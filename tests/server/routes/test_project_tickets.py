@@ -15,7 +15,9 @@ from omnigent.host.frames import (
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, RESERVED_USER_PUBLIC
 from omnigent.server.project_ticket_notifications import ProjectTicketNotifications
+from omnigent.server.routes import project_tickets as ticket_routes
 from omnigent.server.sharing_settings import DefaultPublicSessions
+from omnigent.stores.conversation_store import SessionActivity
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
@@ -452,6 +454,85 @@ async def test_links_require_same_project_and_preserve_history(project_client, d
     await store.delete_conversation(source.id)
     assert (await project_client.get(path)).json()["stage_id"] == "open"
     assert len((await project_client.get(path + "/events")).json()["data"]) == 3
+
+
+@pytest.mark.parametrize(
+    ("persisted", "cached", "archived", "expected"),
+    [
+        ("running", None, False, True),
+        ("running", "idle", False, False),
+        ("idle", "running", False, True),
+        ("waiting", None, False, False),
+        ("failed", None, False, False),
+        ("running", None, True, False),
+        (None, None, False, None),
+        ("running", None, None, None),
+        ("idle", "unknown", False, None),
+    ],
+)
+def test_ticket_running_projection_uses_only_known_live_activity(
+    monkeypatch, persisted, cached, archived, expected
+):
+    session_id = uuid4().hex
+    monkeypatch.setattr(
+        ticket_routes, "_session_status_cache", {session_id: cached} if cached else {}
+    )
+    sessions = {
+        session_id: SessionActivity(updated_at=0, live_status=persisted, archived=archived)
+    }
+    assert ticket_routes._has_running_agents([session_id], sessions, has_more=False) is expected
+    assert ticket_routes._has_running_agents([session_id], sessions, has_more=True) is (
+        True if expected is True else None
+    )
+    assert ticket_routes._has_running_agents([session_id], {}, has_more=False) is None
+
+
+async def test_ticket_running_projection_batches_links_and_respects_access(
+    multi_user_client, db_uri, monkeypatch
+):
+    client = multi_user_client
+    headers = _as_user(ALICE)
+    project = (
+        await client.post("/v1/projects", json={"name": "Activity"}, headers=headers)
+    ).json()
+    base = f"/v1/projects/{project['id']}/tickets"
+    active = (await client.post(base, json={"title": "Working"}, headers=headers)).json()
+    quiet = (await client.post(base, json={"title": "Unassigned"}, headers=headers)).json()
+    conversations = SqlAlchemyConversationStore(db_uri)
+    worker = conversations.create_conversation(project_id=project["id"])
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.grant(ALICE, worker.id, LEVEL_OWNER)
+    assert (
+        await client.post(
+            f"{base}/{active['id']}/sessions", json={"session_id": worker.id}, headers=headers
+        )
+    ).status_code == 200
+    conversations.set_session_live_status(worker.id, "running")
+    monkeypatch.setattr(
+        ticket_routes, "_session_status_cache", {project["orchestrator_session_id"]: "running"}
+    )
+    original = SqlAlchemyConversationStore.get_session_activity
+    batches = []
+
+    def capture(store, session_ids):
+        batches.append(session_ids)
+        return original(store, session_ids)
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "get_session_activity", capture)
+    page = (await client.get(base, headers=headers)).json()["data"]
+    assert {row["id"]: row["has_running_agents"] for row in page} == {
+        active["id"]: True,
+        quiet["id"]: False,
+    }
+    assert batches == [[worker.id]]
+    ticket_routes._session_status_cache[worker.id] = "idle"
+    page = (await client.get(base, headers=headers)).json()["data"]
+    assert all(row["has_running_agents"] is False for row in page)
+    ticket_routes._session_status_cache[worker.id] = "running"
+    permissions.revoke(ALICE, worker.id)
+    page = (await client.get(base, headers=headers)).json()["data"]
+    assert next(row for row in page if row["id"] == active["id"])["has_running_agents"] is None
+    assert (await client.get(base, headers=_as_user(BOB))).status_code == 404
 
 
 async def test_lifecycle_related_links_and_lead_api(project_client, db_uri):

@@ -257,6 +257,45 @@ describe("Project ticket board", () => {
     expect(api.listTickets).not.toHaveBeenCalled();
   });
 
+  it.each([false, null, undefined])(
+    "refreshes projected running activity to %s without session lookups",
+    async (activity) => {
+      ticket.has_running_agents = true;
+      const quiet = { ...ticket, id: "quiet", title: "Other work", has_running_agents: false };
+      vi.mocked(api.listTickets).mockImplementation(async (_projectId, options) => ({
+        data: options?.stage_id === ticket.stage_id ? [ticket, quiet] : [],
+        has_more: false,
+        last_id: quiet.id,
+      }));
+      const { client } = renderBoard(
+        <ProjectTicketBoard projectName="Shipping" selectedTicketId={null} />,
+      );
+      const card = await screen.findByRole("link", { name: "Open ticket: Ship the board" });
+      expect(within(card).getByText("Running")).toBeInTheDocument();
+      expect(within(card).getByTestId("running-dot")).toBeInTheDocument();
+      expect(within(card).getByText("Needs response")).toBeInTheDocument();
+      expect(card).toHaveAttribute("href", "/?ticket=ticket");
+      expect(
+        within(screen.getByRole("link", { name: "Open ticket: Other work" })).queryByText(
+          "Running",
+        ),
+      ).toBeNull();
+      ticket = { ...ticket, has_running_agents: activity };
+      await act(async () =>
+        client.refetchQueries({ queryKey: ["project-tickets", "project", "board"] }),
+      );
+      await waitFor(() => expect(within(card).queryByText("Running")).toBeNull());
+      expect(within(card).getByText("Needs response")).toBeInTheDocument();
+      ticket = { ...ticket, has_running_agents: true };
+      await act(async () =>
+        client.refetchQueries({ queryKey: ["project-tickets", "project", "board"] }),
+      );
+      expect(await within(card).findByText("Running")).toBeInTheDocument();
+      expect(api.listTicketSessions).not.toHaveBeenCalled();
+      expect(fetchConversationById).not.toHaveBeenCalled();
+    },
+  );
+
   it("moves to the last stage without requiring a summary and preserves optional content", async () => {
     ticket.stage_id = "verifying";
     ticket.plan = "Gather recovery evidence.";

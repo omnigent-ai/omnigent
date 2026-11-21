@@ -25,8 +25,11 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.server.auth import LEVEL_EDIT, AuthProvider
 from omnigent.server.routes._auth_helpers import require_access, require_user
+from omnigent.server.routes._sessions.common import _session_status_cache
+from omnigent.server.routes._sessions.helpers import _permission_level_from_grants
 from omnigent.server.session_orchestration import require_named_source_private
 from omnigent.stores import ConversationStore, PermissionStore
+from omnigent.stores.conversation_store import SessionActivity
 from omnigent.stores.project_ticket_store import ProjectTicketStore
 from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
 
@@ -41,6 +44,26 @@ def _storage_errors() -> Iterator[None]:
         raise OmnigentError(
             "Ticket content exceeds its storage limit", code=ErrorCode.INVALID_INPUT
         ) from exc
+
+
+def _has_running_agents(
+    session_ids: list[str], sessions: dict[str, SessionActivity], *, has_more: bool
+) -> bool | None:
+    unknown = has_more
+    for session_id in session_ids:
+        activity = sessions.get(session_id)
+        if activity is None or activity.archived is None:
+            unknown = True
+            continue
+        if activity.archived:
+            continue
+        # Use this linked session's own turn, without project or child rollups.
+        status = _session_status_cache.get(session_id, activity.live_status)
+        if status == "running":
+            return True
+        if status not in ("idle", "waiting", "failed"):
+            unknown = True
+    return None if unknown else False
 
 
 def create_project_tickets_router(
@@ -109,7 +132,7 @@ def create_project_tickets_router(
         limit: int = Query(50, ge=1, le=100),
     ) -> dict[str, Any]:
         who = await actor(request, project_id)
-        return await asyncio.to_thread(
+        page = await asyncio.to_thread(
             store.list,
             project_id,
             user_id=who.user_id,
@@ -117,6 +140,35 @@ def create_project_tickets_router(
             after=after,
             limit=limit,
         )
+        if not page["data"]:
+            return page
+        links = await asyncio.to_thread(
+            store.activity_sessions,
+            project_id,
+            [ticket["id"] for ticket in page["data"]],
+            user_id=who.user_id,
+        )
+        session_ids = sorted({sid for link in links.values() for sid in link.session_ids})
+        if permissions is not None and session_ids:
+            grants = await asyncio.to_thread(permissions.list_for_sessions, session_ids)
+            is_admin = (
+                await asyncio.to_thread(permissions.is_admin, who.user_id)
+                if who.user_id
+                else False
+            )
+            session_ids = [
+                sid
+                for sid in session_ids
+                if _permission_level_from_grants(who.user_id, grants.get(sid, []), is_admin)
+                is not None
+            ]
+        sessions = await asyncio.to_thread(conversations.get_session_activity, session_ids)
+        for ticket in page["data"]:
+            linked = links[ticket["id"]]
+            ticket["has_running_agents"] = _has_running_agents(
+                linked.session_ids, sessions, has_more=linked.has_more
+            )
+        return page
 
     @router.post("", status_code=201)
     async def create_ticket(

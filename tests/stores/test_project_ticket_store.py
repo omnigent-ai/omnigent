@@ -2,7 +2,7 @@ import random
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import update
+from sqlalchemy import event, update
 from sqlalchemy.exc import StatementError
 
 from omnigent.db.db_models import SqlProjectTicket, workspace_scope
@@ -15,6 +15,7 @@ from omnigent.entities.project_ticket import (
     UpdateTicketStages,
 )
 from omnigent.errors import OmnigentError
+from omnigent.stores import project_ticket_store
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 from omnigent.stores.project_ticket_store import ProjectTicketStore
@@ -143,6 +144,52 @@ def test_project_owner_tenant_and_ticket_boundaries(board):
     with pytest.raises(OmnigentError, match="cannot be deleted"):
         projects.delete(project.id, user_id="alice")
     assert projects.get(project.id, user_id="alice") is not None
+
+
+def test_activity_sessions_are_scoped_bounded_indexed_reads(board, db_uri, monkeypatch):
+    tickets, projects, project = board
+    actor = TicketActor("alice")
+    first, second = [
+        tickets.create(project.id, CreateTicket(title=name), actor) for name in ("First", "Second")
+    ]
+    sessions = sorted(uuid4().hex for _ in range(4))
+    for session_id in sessions:
+        tickets.link_session(project.id, first["id"], session_id, "attach", actor)
+    tickets.link_session(project.id, second["id"], sessions[-1], "attach", actor)
+    other = projects.create(uuid4().hex, "Other", "alice")
+    foreign = tickets.create(other.id, CreateTicket(title="Elsewhere"), actor)
+    tickets.link_session(other.id, foreign["id"], sessions[0], "attach", actor)
+    monkeypatch.setattr(project_ticket_store, "TICKET_ACTIVITY_SESSION_MAX", 2)
+    engine = get_or_create_engine(db_uri)
+    queries = []
+
+    def capture(_connection, _cursor, statement, parameters, _context, _many):
+        if "project_ticket_sessions" in statement:
+            queries.append((statement, parameters))
+
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        result = tickets.activity_sessions(
+            project.id, [first["id"], second["id"], foreign["id"]], user_id="alice"
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+    assert result[first["id"]].session_ids == sessions[:2]
+    assert result[first["id"]].has_more
+    assert result[second["id"]].session_ids == [sessions[-1]]
+    assert not result[second["id"]].has_more
+    assert result[foreign["id"]].session_ids == []
+    assert len(queries) == 1
+    with engine.connect() as connection:
+        plan = connection.exec_driver_sql(
+            "EXPLAIN QUERY PLAN " + queries[0][0], queries[0][1]
+        ).all()
+    scans = [row[3] for row in plan if "project_ticket_sessions" in row[3]]
+    assert len(scans) == 3 and all("SEARCH" in scan and "INDEX" in scan for scan in scans)
+    with pytest.raises(OmnigentError, match="Project not found"):
+        tickets.activity_sessions(project.id, [first["id"]], user_id="bob")
+    with workspace_scope(9), pytest.raises(OmnigentError, match="Project not found"):
+        tickets.activity_sessions(project.id, [first["id"]], user_id="alice")
 
 
 def test_pagination_and_outbox_order(board):

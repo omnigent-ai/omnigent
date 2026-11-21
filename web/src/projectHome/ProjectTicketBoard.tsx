@@ -10,6 +10,7 @@ import {
   useSensors,
 } from "@dnd-kit/core";
 import { MessageSquareIcon, PlusIcon } from "lucide-react";
+import { RunningDot } from "@/components/RunningDot";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { useNow } from "@/hooks/useNow";
@@ -369,12 +370,20 @@ function TicketCardContent({ ticket }: { ticket: ProjectTicket }) {
         {ticket.latest_update}
       </p>
       <div className="flex items-center justify-between gap-2 text-sm text-muted-foreground">
-        <time
-          dateTime={new Date(ticket.updated_at * 1000).toISOString()}
-          title={`Updated ${absoluteTime(ticket.updated_at * 1000)}`}
-        >
-          {relativeTime(ticket.updated_at * 1000, now.getTime())}
-        </time>
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+          <time
+            dateTime={new Date(ticket.updated_at * 1000).toISOString()}
+            title={`Updated ${absoluteTime(ticket.updated_at * 1000)}`}
+          >
+            {relativeTime(ticket.updated_at * 1000, now.getTime())}
+          </time>
+          {ticket.has_running_agents === true && (
+            <span className="inline-flex items-center gap-1.5">
+              <RunningDot />
+              Running
+            </span>
+          )}
+        </div>
         {ticket.comment_count > 0 && (
           <span
             className="flex items-center gap-1.5 tabular-nums"
