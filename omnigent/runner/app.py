@@ -221,6 +221,7 @@ from omnigent.runner.subagent_work import (
     unregister_subagent_work_for_session,
     wrapper_label_from_labels,
 )
+from omnigent.runner.tool_dispatch import release_inbox_waits
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
 from omnigent.runtime.prompt import (
     build_instructions,
@@ -8457,6 +8458,7 @@ def create_runner_app(
             # Stop fences even recovery initialization that has not arrived yet.
             _recovery_blocked_sessions.add(conversation_id)
             _cancel_claude_prompt_waiter(conversation_id)
+            release_inbox_waits(conversation_id)
             _harness = _session_harness_name(conversation_id)
             resource_registry.note_terminal_control_request(conversation_id, "interrupt")
             _interrupt_resp = await _native_interrupt_runner.interrupt(_harness, conversation_id)
@@ -8468,6 +8470,11 @@ def create_runner_app(
             )
             if not _had_live_turn:
                 _settle_stop_without_turn(conversation_id)
+            return Response(status_code=204)
+
+        if body_type == "external_session_interrupted":
+            # The harness interrupted its own turn (e.g. Esc in its terminal UI).
+            release_inbox_waits(conversation_id)
             return Response(status_code=204)
 
         if body_type == "external_session_status":

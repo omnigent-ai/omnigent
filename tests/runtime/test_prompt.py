@@ -408,6 +408,14 @@ def test_embedded_browser_guidance_names_registered_tools() -> None:
         assert name in EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
 
 
+def test_subagent_wake_instruction_names_inbox_wait_parameter() -> None:
+    """The no-sleep guidance must track the real ``sys_read_inbox`` parameter."""
+    from omnigent.tools.builtins.async_inbox import SysReadInboxTool
+
+    properties = SysReadInboxTool().get_schema()["function"]["parameters"]["properties"]
+    assert all(name in SUBAGENT_WAKE_NOTICE_INSTRUCTION for name in properties)
+
+
 def test_subagent_wake_notice_shape_matches_runner_notice() -> None:
     """
     The announced shape must track the notice the runner actually posts.
@@ -461,11 +469,23 @@ def test_browser_group_disabled_keeps_wake_notice_for_spawning_agent() -> None:
     assert EMBEDDED_BROWSER_PRIORITY_INSTRUCTION not in result
 
 
-def test_native_startup_instructions_keep_only_stable_image_guidance() -> None:
-    """Native startup preserves author text without unrelated tool/turn guidance."""
-    spec = _spec("  Follow the user's directions.  ", spawn=True)
+@pytest.mark.parametrize("spawn", [True, False])
+def test_native_startup_instructions_keep_only_stable_guidance(spawn: bool) -> None:
+    """
+    Native startup preserves author text plus stable framework guidance only.
+
+    A dispatching agent (every native wrapper spec sets ``spawn: true``) is told
+    what the wake notice is, so it ends its turn instead of sleeping on a child;
+    other agents are not. Browser and per-turn guidance never ride along.
+    """
+    spec = _spec("  Follow the user's directions.  ", spawn=spawn)
+    framework = (
+        f"{SUBAGENT_WAKE_NOTICE_INSTRUCTION}\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
+        if spawn
+        else WORKSPACE_IMAGE_INSTRUCTION
+    )
     result = build_native_startup_instructions(spec)
-    assert result == f"{spec.instructions}\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
+    assert result == f"{spec.instructions}\n\n{framework}"
     assert EMBEDDED_BROWSER_PRIORITY_INSTRUCTION not in result
-    assert SUBAGENT_WAKE_NOTICE_INSTRUCTION not in result
+    assert build_native_startup_instructions(spec, include_author_text=False) == framework
     assert build_native_startup_instructions(None) == WORKSPACE_IMAGE_INSTRUCTION

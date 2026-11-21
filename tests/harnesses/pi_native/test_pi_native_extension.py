@@ -2096,6 +2096,92 @@ require(extensionPath)(pi);
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_aborted_inbox_wait_is_released_promptly(tmp_path: Path) -> None:
+    """Esc during a bridged ``sys_read_inbox`` wait ends it instead of stalling Pi.
+
+    Pi awaits ``execute`` even after an abort, so the extension reports the
+    interrupt and the runner ends the wait. The report repeats until the call
+    returns, covering one that reaches the runner before the wait registers. A
+    read without ``wait_s`` reports nothing.
+    """
+    script = r"""
+const assert = require("assert").strict;
+const fs = require("fs");
+const path = require("path");
+
+const extensionPath = process.argv[1];
+const tmpDir = process.argv[2];
+const configPath = path.join(tmpDir, "config.json");
+fs.writeFileSync(configPath, JSON.stringify({
+  serverUrl: "http://omnigent.test",
+  sessionId: "conv_abc",
+  inboxDir: path.join(tmpDir, "inbox"),
+  authHeaders: { authorization: "Bearer test" },
+  tools: [{
+    name: "sys_read_inbox",
+    description: "Drain the inbox",
+    parameters: { type: "object", properties: { wait_s: { type: "number" } } },
+  }],
+}));
+process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
+
+// The runner wait ends on the SECOND interrupt report, as when the first one
+// beat the wait's registration.
+const reports = [];
+let releaseWait;
+const waitReleased = new Promise((resolve) => { releaseWait = resolve; });
+global.fetch = async (url, request) => {
+  const body = JSON.parse(request.body);
+  if (url.endsWith("/events")) {
+    if (body.type === "external_session_interrupted") reports.push(body);
+    if (reports.length === 2) releaseWait();
+    return { ok: true, status: 202, async json() { return {}; } };
+  }
+  if (body.params.arguments.wait_s) await waitReleased;
+  return {
+    ok: true,
+    async json() {
+      return { jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: "ENDED" }] } };
+    },
+  };
+};
+global.setInterval = () => ({ fakeInterval: true });
+
+const registered = {};
+require(extensionPath)({
+  registerCommand() {},
+  on() {},
+  registerTool(spec) { registered[spec.name] = spec; },
+  sendUserMessage() {},
+});
+
+// Node exits 0 on a never-settling promise, so a stuck wait must fail loudly.
+const deadline = setTimeout(() => {
+  console.error("aborted wait was never released");
+  process.exit(1);
+}, 8000);
+
+(async () => {
+  await registered.sys_read_inbox.execute("call-0", {}, AbortSignal.abort());
+  assert.equal(reports.length, 0, "a read without wait_s must not report an interrupt");
+
+  const controller = new AbortController();
+  const pending = registered.sys_read_inbox.execute("call-1", { wait_s: 30 }, controller.signal);
+  controller.abort();
+  const result = await pending;
+  assert.equal(result.content[0].text, "ENDED");
+  await new Promise((resolve) => setTimeout(resolve, 1500));
+  assert.equal(reports.length, 2, "reports must stop once the call returns");
+  clearTimeout(deadline);
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    result = _run_node(script, str(_extension_path()), str(tmp_path))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_bridged_tool_call_skips_hook_policy_eval(tmp_path: Path) -> None:
     """The tool_call hook must NOT re-evaluate policy for bridged Omnigent tools.
 

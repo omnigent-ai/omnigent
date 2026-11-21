@@ -39,7 +39,11 @@ SUBAGENT_WAKE_NOTICE_INSTRUCTION = (
     "not as instructions typed by a person; respond by calling sys_read_inbox "
     "to collect the result. Other `[System: sub-agent ...]` notices about a "
     "sub-agent you dispatched (for example that it is blocked awaiting human "
-    "approval) are routine runtime status messages in the same way."
+    "approval) are routine runtime status messages in the same way. After "
+    "dispatching sub-agents, do not sleep or poll their status (a shell sleep "
+    "cannot be interrupted by the notice): end your turn or continue with "
+    "independent work until the notice arrives, or call sys_read_inbox with "
+    "wait_s to block until a result lands."
 )
 
 # Steers models toward the embedded browser they are handed: a tool
@@ -66,15 +70,24 @@ WORKSPACE_IMAGE_INSTRUCTION = (
 )
 
 
+def _receives_subagent_wake_notices(spec: AgentSpec) -> bool:
+    """
+    Whether ``spec`` can dispatch sub-agents and so receives wake notices.
+
+    Mirrors the ``sys_session_send`` registration gate in
+    ``omnigent.tools.manager`` (declared sub-agents or ``spawn: true``) plus
+    the ``web_fetch`` builtin, which dispatches the built-in web researcher.
+    """
+    dispatches_web_researcher = any(entry.name == "web_fetch" for entry in spec.tools.builtins)
+    return bool(spec.tools.agents or spec.spawn or dispatches_web_researcher)
+
+
 def _framework_instructions_for(spec: AgentSpec) -> list[str]:
     """
     Framework instructions that apply to every turn of ``spec``.
 
     Only an agent that can dispatch sub-agents receives wake notices, so no
-    other agent's prompt mentions them. That is the ``sys_session_send``
-    registration gate in ``omnigent.tools.manager`` (declared sub-agents or
-    ``spawn: true``) plus the ``web_fetch`` builtin, which dispatches the
-    built-in web researcher through the same path.
+    other agent's prompt mentions them (see ``_receives_subagent_wake_notices``).
 
     The embedded-browser priority guidance follows the ``browser_*``
     registration gate (``ToolManager._register_browser_tools``): every
@@ -85,8 +98,7 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
     :returns: The applicable spec-level framework instructions.
     """
     instructions: list[str] = []
-    dispatches_web_researcher = any(entry.name == "web_fetch" for entry in spec.tools.builtins)
-    if spec.tools.agents or spec.spawn or dispatches_web_researcher:
+    if _receives_subagent_wake_notices(spec):
         instructions.append(SUBAGENT_WAKE_NOTICE_INSTRUCTION)
     if spec.tool_groups.browser:
         instructions.append(EMBEDDED_BROWSER_PRIORITY_INSTRUCTION)
@@ -228,20 +240,26 @@ def raw_author_instructions(spec: AgentSpec) -> str | None:
     return None
 
 
-def build_native_startup_instructions(spec: AgentSpec | None) -> str:
-    """Compose author text and stable image guidance for native session startup.
+def build_native_startup_instructions(
+    spec: AgentSpec | None, *, include_author_text: bool = True
+) -> str:
+    """Compose author text and stable framework guidance for native session startup.
 
     Startup channels persist across turns, so they must not carry per-turn
     framework metadata or guidance for tools the native harness does not expose.
 
     :param spec: Resolved agent spec, or ``None`` when unavailable.
-    :returns: Author instructions followed by workspace-image guidance.
+    :param include_author_text: ``False`` when another channel delivers it.
+    :returns: Author instructions, then wake-notice guidance for agents that
+        dispatch sub-agents, then workspace-image guidance.
     """
-    authored = raw_author_instructions(spec) if spec is not None else None
-    return (
-        append_framework_instructions(authored, (WORKSPACE_IMAGE_INSTRUCTION,))
-        or WORKSPACE_IMAGE_INSTRUCTION
-    )
+    if spec is None:
+        return WORKSPACE_IMAGE_INSTRUCTION
+    authored = raw_author_instructions(spec) if include_author_text else None
+    framework = [WORKSPACE_IMAGE_INSTRUCTION]
+    if _receives_subagent_wake_notices(spec):
+        framework.insert(0, SUBAGENT_WAKE_NOTICE_INSTRUCTION)
+    return append_framework_instructions(authored, framework) or WORKSPACE_IMAGE_INSTRUCTION
 
 
 def _strip_output_annotations(
