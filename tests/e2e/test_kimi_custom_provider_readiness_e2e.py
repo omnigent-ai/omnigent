@@ -31,7 +31,6 @@ import os
 import signal
 import stat
 import subprocess
-import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -40,6 +39,7 @@ import httpx
 import pytest
 
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
+from tests._helpers.host import wait_for_routable_host
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -159,15 +159,8 @@ def _online_host_id(client: httpx.Client, timeout: float = 60.0) -> str:
     :returns: The online host's ``host_id``.
     :raises AssertionError: If no host comes online within *timeout*.
     """
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        resp = client.get("/v1/hosts")
-        if resp.status_code == 200:
-            online = [h for h in resp.json().get("hosts", []) if h.get("status") == "online"]
-            if online:
-                return str(online[0]["host_id"])
-        time.sleep(1.0)
-    raise AssertionError(f"No host came online within {timeout}s")
+    row = wait_for_routable_host(client, timeout=timeout, poll_interval=1.0)
+    return str(row["host_id"])
 
 
 @pytest.mark.timeout(180)

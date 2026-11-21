@@ -26,6 +26,7 @@ from playwright.sync_api import Locator, Page, expect
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from tests._helpers.compat import apply_server_env, compat_server_cwd, server_executable
+from tests._helpers.host import routable_host
 from tests._helpers.live_server import terminate_process
 from tests.e2e_ui.conftest import (
     _BUILD_OUTPUT,
@@ -178,12 +179,11 @@ def spawn_host(base_url: str, host_tmp: Path) -> HostRig:
                 f"omnigent host exited with {proc.returncode}: {log_path.read_text()[-3000:]}"
             )
         try:
-            hosts = httpx.get(f"{base_url}/v1/hosts", timeout=5.0).json().get("hosts", [])
+            row = routable_host(httpx, base_url=base_url)
         except (httpx.HTTPError, ValueError):
-            hosts = []
-        online = [h for h in hosts if h.get("status") == "online"]
-        if online:
-            return HostRig(proc, online[0], log_path)
+            row = None
+        if row is not None:
+            return HostRig(proc, row, log_path)
         time.sleep(1.0)
     terminate_process(proc)
     raise RuntimeError(f"omnigent host never came online: {log_path.read_text()[-3000:]}")

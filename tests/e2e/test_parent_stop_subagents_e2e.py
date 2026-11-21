@@ -33,6 +33,7 @@ from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
 from omnigent.onboarding.ambient import CLAUDE_CODE_MANAGED_SETTINGS_PATHS
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.server.routes.sessions import RUNNER_DISCONNECT_GRACE_S
+from tests._helpers.host import routable_host
 from tests._helpers.server_runner import server_runner
 from tests._helpers.session import bundle_files, post_session_bundle
 from tests.e2e.conftest import get_mock_requests, set_fallback_mock_llm
@@ -268,10 +269,7 @@ def test_native_parent_teardown_preserves_child_outcome(
 
         def online_host():
             assert stack.host is not None and stack.host.poll() is None, stack.log_tail()
-            return next(
-                (h for h in _get(client, "/v1/hosts")["hosts"] if h["status"] == "online"),
-                None,
-            )
+            return routable_host(client)
 
         host = _wait(online_host, "real host registration")
         spec = {

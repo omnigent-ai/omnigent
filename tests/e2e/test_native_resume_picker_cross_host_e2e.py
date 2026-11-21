@@ -48,6 +48,7 @@ import httpx
 import pytest
 import yaml
 
+from tests._helpers.host import routable_host
 from tests._helpers.live_server import find_free_port
 from tests._helpers.session import bundle_files, post_session_bundle
 
@@ -251,8 +252,7 @@ def _spawn_host(root: Path, name: str, server_url: str) -> tuple[subprocess.Pope
         deadline = time.monotonic() + _HOST_ONLINE_TIMEOUT_S
         while time.monotonic() < deadline:
             try:
-                r = c.get(f"{server_url}/v1/hosts/{host_id}")
-                if r.status_code == 200 and r.json().get("status") == "online":
+                if routable_host(c, base_url=server_url, host_id=host_id) is not None:
                     return proc, host_id, home
             except httpx.HTTPError:
                 pass

@@ -80,6 +80,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     encode_frame,
 )
 from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
+from tests._helpers.host import routable_host
 from tests.e2e_ui.start_session.helpers import (
     commit_landing_workspace_picker,
     open_landing_workspace_picker,
@@ -306,13 +307,11 @@ async def _windows_host(base_url: str) -> AsyncIterator[str]:
             # composer can pick it. Yield the REST-reported id — that's the
             # spelling the SPA's testids and the HTTP routes use.
             rest_host_id: str | None = None
-            async with httpx.AsyncClient() as client:
+            with httpx.Client() as client:
                 for _ in range(100):
-                    resp = await client.get(f"{base_url}/v1/hosts")
-                    hosts = resp.json().get("hosts", [])
-                    match = next(
-                        (h for h in hosts if h["name"] == _HOST_NAME and h["status"] == "online"),
-                        None,
+                    # The fake answers the tunnel probe on this loop, so poll from a thread.
+                    match = await asyncio.to_thread(
+                        routable_host, client, base_url=base_url, name=_HOST_NAME
                     )
                     if match is not None:
                         rest_host_id = match["host_id"]

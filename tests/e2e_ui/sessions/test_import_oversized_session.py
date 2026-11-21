@@ -42,6 +42,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from omnigent.runner.transports.ws_tunnel.limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
+from tests._helpers.host import routable_host
 
 pytestmark = pytest.mark.min_server_version("0.16.0")
 
@@ -170,13 +171,9 @@ def _wait_for_host_online(live_server: str, host_id: str, timeout: float = 60.0)
     last: object = None
     while time.monotonic() < deadline:
         try:
-            resp = httpx.get(f"{live_server}/v1/hosts", timeout=5)
-            if resp.status_code == 200:
-                last = resp.json()
-                hosts = last.get("hosts", []) if isinstance(last, dict) else []
-                for host in hosts:
-                    if host.get("host_id") == host_id and host.get("status") == "online":
-                        return
+            if routable_host(httpx, base_url=live_server, host_id=host_id) is not None:
+                return
+            last = "not online with a registered tunnel"
         except httpx.HTTPError as exc:  # server still booting
             last = f"{type(exc).__name__}: {exc}"
         time.sleep(0.5)

@@ -9,6 +9,7 @@ import pytest
 import yaml
 
 from dev.repro_env.runtime import write_model_config
+from tests._helpers.host import wait_for_routable_host
 from tests._helpers.polling import poll_until
 from tests._helpers.server_runner import server_runner
 from tests._helpers.session import bundle_files, post_session_bundle
@@ -67,15 +68,7 @@ def test_config_path_child_runs_requested_model_and_effort(tmp_path, isolated_mo
     ) as stack:
         stack.start_host(env=env, cwd=_REPO)
         with httpx.Client(base_url=stack.base_url, timeout=60, trust_env=False) as client:
-            poll_until(
-                lambda: [
-                    h
-                    for h in client.get("/v1/hosts").json().get("hosts", [])
-                    if h.get("status") == "online"
-                ],
-                timeout_s=45,
-            )
-            host_id = client.get("/v1/hosts").json()["hosts"][0]["host_id"]
+            host_id = wait_for_routable_host(client, timeout=45)["host_id"]
             set_fallback_mock_llm(mock, key="_policy_llm_", text='{"action":"allow","reason":""}')
 
             (stack.workspace / "child.yaml").write_text(
