@@ -68,7 +68,11 @@ class SandboxCapabilities:
         ``host_type="managed"`` sessions (``prepare`` / ``provision`` /
         ``start_host``).
     :param local_port_forward: Provider can bridge a local port into the
-        sandbox for the App OAuth callback flow.
+        sandbox (``ssh -L`` semantics). Used for the App OAuth callback
+        flow, and for previewing sandbox-local services — e.g. a dev
+        server on the sandbox's loopback, viewed in the desktop
+        browser. The primitive itself is not OAuth-specific: see
+        :meth:`SandboxLauncher.forward_local_port`.
     :param resume_stopped: Provider can resume a stopped sandbox in place
         with its persistent volume.
     :param programmatic_terminate: Provider can terminate a sandbox

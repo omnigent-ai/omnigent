@@ -581,6 +581,24 @@ that resolve to any of them, and non-web schemes remain restricted. Existing
 tool approvals are unchanged; whether a tool call asks for approval depends on
 the harness and its policy.
 
+### Agent previews on trusted remote hosts
+
+Sessions on a remote host without an Arca connect flow — a self-hosted sandbox
+host, for example — can open localhost previews once the user explicitly
+trusts that host. Add the host to `settings.json`:
+
+```json
+{ "trusted_remote_hosts": [{ "server_url": "https://my-server.example.com", "host_id": "abc123" }] }
+```
+
+`server_url` is the server the session runs on and `host_id` is that session's
+host ID; a denied loopback preview tells the agent the exact entry to add.
+Trust is scoped to one server and one host ID: if the host's identity changes,
+the entry stops matching and previews are denied again until it is updated,
+and removing the entry revokes trust. As with Arca, the remote app's port must
+be forwarded to the desktop first; Omnigent does not establish or verify
+forwarding. The same URL coverage applies as for Arca above.
+
 ### Local network permission
 
 Sites in the embedded pane can ask for **local network access**, including

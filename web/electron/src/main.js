@@ -84,6 +84,7 @@ const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { goBack, goForward, registerBrowserIpc } = require("./browserIpc");
 const { isBrowserViewFocused, sharedDesignTools } = require("./designTools");
 const { arcaTarget, createArcaIdentityStore, isArcaAgentContext } = require("./arcaIdentity");
+const { isTrustedRemoteContext, readTrustedRemoteHosts } = require("./trustedRemoteHosts");
 const { createHostThisMachineChecker, SESSION_HOST_PROTOCOL } = require("./hostIdentity");
 const { isDeveloperModeEnabled } = require("./developer_mode");
 const { DEV_DOMAIN, getDevUserDefault } = require("./dev_preferences");
@@ -4625,7 +4626,13 @@ function createBrowserRegistryForWindow(win) {
             isDatabricksManagedServerUrl(windows.get(win)?.serverUrl) &&
             isDatabricksManagedServerUrl(target),
           serverTarget: target,
-        }) || context?.hostIsThisMachine === true
+        }) ||
+        isTrustedRemoteContext(
+          readTrustedRemoteHosts(loadSettings().trusted_remote_hosts),
+          context,
+          target,
+        ) ||
+        context?.hostIsThisMachine === true
       );
     },
     createBoundsController: createBrowserViewBoundsController,
@@ -6114,7 +6121,20 @@ function registerIpc() {
       sourceIsArcaHost,
     ) => {
       const targetContext = arcaPreviewRecoveryTargetForEvent(event, url);
-      if (!targetContext) return null;
+      if (!targetContext) {
+        // A non-Arca session denied loopback access can still be trusted
+        // explicitly: hand the agent the exact settings entry for this host.
+        if (isLoopbackPreviewUrl(url) && typeof sourceHostId === "string") {
+          const win = BrowserWindow.fromWebContents(event.sender);
+          const serverUrl =
+            win && !win.isDestroyed() ? arcaTarget(windowArcaServerUrl(win)) : null;
+          if (serverUrl !== null) {
+            return `To allow localhost previews from this session's host, add {"server_url": "${serverUrl}", "host_id": "${sourceHostId}"} to trusted_remote_hosts in settings.json, then retry the preview.`;
+          }
+          return "To allow localhost previews from this session's host, add it to trusted_remote_hosts in settings.json, then retry the preview.";
+        }
+        return null;
+      }
       if (typeof rememberedArcaHostId !== "string") {
         return "Open New session > Host > Run on Arca to restore its connection details, then retry the preview.";
       }
