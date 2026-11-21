@@ -377,6 +377,25 @@ sequenceDiagram
   G-->>H: Policy-checked result
 ```
 
+### Example: company knowledge with PipesHub
+
+[`pipeshub.yaml`](pipeshub.yaml) registers [PipesHub](https://github.com/pipeshub-ai/pipeshub-ai),
+which searches a company's Slack, Jira, Confluence, Drive and GitHub over MCP.
+Each person signs in to PipesHub once from Settings → MCP, so their searches
+respect their own PipesHub permissions, and the server refreshes their token.
+
+1. **In PipesHub**, under **Workspace settings → Developer settings → OAuth 2.0
+   apps**, create an app with the **Authorization code** and **Refresh token**
+   grant types, the redirect URI `<public_url>/v1/connections/mcp-pipeshub/callback`, and the
+   scopes listed in the file. Keep its client ID and secret.
+2. **In Omnigent**, merge the service into your catalog with your PipesHub
+   host and the client ID, set `PIPESHUB_OAUTH_CLIENT_SECRET` to the secret,
+   and restart the server.
+
+To use personal access tokens instead, set `auth: bearer` and remove the
+`oauth` block. Each person then pastes a PipesHub token
+(**Developer settings → Personal access tokens**) in Settings → MCP.
+
 ## Embedding and downstream compatibility
 
 The registry and gateway are enabled only when `OMNIGENT_MCP_REGISTRY` is configured.
