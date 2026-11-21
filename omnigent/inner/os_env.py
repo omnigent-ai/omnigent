@@ -422,9 +422,11 @@ class _HelperProcessClient:
         egress_allow_private_destinations: bool = False,
         copy_on_write_environment: CopyOnWriteEnvironment | None = None,
         relaunch_when_stale: bool = False,
+        upload_raw: bool = False,
     ) -> None:
         self._copy_on_write_environment = copy_on_write_environment
         self._relaunch_when_stale = relaunch_when_stale
+        self._upload_raw = upload_raw
         self.cwd = cwd
         self.shell_path = shell_path
         self.sandbox = sandbox
@@ -621,7 +623,7 @@ class _HelperProcessClient:
             if self.start_in_scratch:
                 helper_cwd = self._tmpdir
                 env["PWD"] = str(self._tmpdir)
-            if sandbox.credential_proxy is not None:
+            if sandbox.credential_proxy is not None and not self._upload_raw:
                 # Resolve real secrets in the parent. Real secrets stay
                 # here and are attached to outbound requests by the egress
                 # proxy (swap-on-access). Only entries that opted into
@@ -654,7 +656,11 @@ class _HelperProcessClient:
 
         # Model inference always uses the relay; ordinary HTTP access needs rules.
         # The helper bridges private loopback to the parent's Unix socket.
-        if (self._egress_rules or self._model_access is not None) and self._tmpdir is not None:
+        if (
+            (self._egress_rules or self._model_access is not None)
+            and self._tmpdir is not None
+            and not self._upload_raw
+        ):
             sandbox = self._start_egress_proxy_locked(
                 sandbox,
                 env,
@@ -681,6 +687,7 @@ class _HelperProcessClient:
             "cwd": str(helper_cwd),
             "shell_path": self.shell_path,
             "sandbox": sandbox.to_jsonable(),
+            "upload_raw": self._upload_raw,
         }
         # S4 (security): include the per-helper Proxy-Authorization
         # token IF egress is active. Delivered ONLY via the pipe FD,
@@ -2265,6 +2272,11 @@ def _run_helper(config: JsonValue) -> int:
 
     sandbox = SandboxPolicy.from_jsonable(sandbox_value)
     activate_sandbox(sandbox)
+
+    if config.get("upload_raw") is True:
+        from omnigent.inner.os_env_upload import serve_uploads
+
+        return serve_uploads(cwd, sandbox)
 
     for line in sys.stdin:
         line = line.strip()
