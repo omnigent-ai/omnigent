@@ -2,8 +2,11 @@
 // linked to a pasted `#123` or pull request link.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { ContextType } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { SidebarDataContext } from "@/hooks/useSidebarData";
 
 import { PULL_REQUEST_NOT_FOUND, QuickPickCommandPalette } from "./QuickPickCommandPalette";
 
@@ -32,15 +35,30 @@ afterEach(() => {
   useSessionSearch.mockImplementation(() => ({ isFetching: false }));
 });
 
-function renderPalette() {
+/** Only the sidebar's loaded and pinned rows, the parts the palette reads. */
+function sidebarDataWith(loadedRows: Record<string, unknown>[]) {
+  return { loadedRows, pinned: { data: { conversations: [] } } } as unknown as ContextType<
+    typeof SidebarDataContext
+  >;
+}
+
+function renderPalette(sidebarRows?: Record<string, unknown>[]) {
+  const sidebarData = sidebarRows ? sidebarDataWith(sidebarRows) : null;
+  const palette = (
+    <QuickPickCommandPalette
+      open
+      onOpenChange={vi.fn()}
+      onToggleLeftSidebar={vi.fn()}
+      onToggleRightSidebar={vi.fn()}
+    />
+  );
   render(
     <QueryClientProvider client={new QueryClient()}>
-      <QuickPickCommandPalette
-        open
-        onOpenChange={vi.fn()}
-        onToggleLeftSidebar={vi.fn()}
-        onToggleRightSidebar={vi.fn()}
-      />
+      {sidebarData ? (
+        <SidebarDataContext.Provider value={sidebarData}>{palette}</SidebarDataContext.Provider>
+      ) : (
+        palette
+      )}
     </QueryClientProvider>,
   );
   return { input: screen.getByTestId("command-palette-input") };
@@ -138,5 +156,21 @@ describe("QuickPickCommandPalette session matching", () => {
     fireEvent.change(input, { target: { value: "#43" } });
     expect(screen.queryByRole("group", { name: "Sessions" })).toBeNull();
     expect(screen.getByText(PULL_REQUEST_NOT_FOUND)).toBeTruthy();
+  });
+
+  it("finds a session the sidebar loaded outside the list's window, such as a pinned one", () => {
+    listLoaded([{ id: "c1", title: "Recent work", agent_name: null }]);
+    const pinned = {
+      id: "p1",
+      title: "Old pinned fix",
+      agent_name: null,
+      pull_request: linked(99),
+    };
+    const { input } = renderPalette([pinned, { id: "c1", title: "Recent work", agent_name: null }]);
+    fireEvent.change(input, { target: { value: "#99" } });
+    expect(sessionNames()).toEqual([expect.stringContaining("Old pinned fix")]);
+    fireEvent.change(input, { target: { value: "recent" } });
+    // Listed by both, shown once.
+    expect(sessionNames()).toEqual([expect.stringContaining("Recent work")]);
   });
 });

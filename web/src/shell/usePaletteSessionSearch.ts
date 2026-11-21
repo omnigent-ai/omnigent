@@ -2,7 +2,7 @@
 // server-side title and content search. Rendering stays in the palette.
 
 import { defaultFilter } from "cmdk";
-import { useEffect, useMemo, useState } from "react";
+import { useContext, useEffect, useMemo, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   type Conversation,
@@ -13,6 +13,7 @@ import {
   useSessionSearch,
 } from "@/hooks/useConversations";
 import { rememberOpenSessionRow } from "@/hooks/useOpenSessionRow";
+import { SidebarDataContext } from "@/hooks/useSidebarData";
 import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import { BOOT_PROBE_TIMEOUT_MS } from "@/lib/bootCapabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -56,6 +57,16 @@ function paletteSessions(
     pages.flatMap((page) => page.data),
     options,
   );
+}
+
+/** `rows` with each session once, keeping its first copy. */
+function uniqueRows(rows: readonly Conversation[]): Conversation[] {
+  const seen = new Set<string>();
+  return rows.filter((row) => {
+    if (seen.has(row.id)) return false;
+    seen.add(row.id);
+    return true;
+  });
 }
 
 /** Palette rows for `rows`, in order unless `newestFirst`; see `paletteSessions`. */
@@ -120,6 +131,7 @@ export function usePaletteSessionSearch({
   matchLoaded?: boolean;
 }) {
   const { data: projects = EMPTY_PROJECTS } = useProjects({ enabled: open });
+  const sidebarRows = useContext(SidebarDataContext)?.loadedRows;
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
   const [pageLimit, setPageLimit] = useState(SESSION_SEARCH_PAGE_BATCH);
@@ -215,10 +227,12 @@ export function usePaletteSessionSearch({
         })
       : [];
     if (matchingLoaded) {
+      // The sidebar's pinned, folder and scoped rows too, which this list's window can miss.
       // Rows archived after they loaded are still cached here, so leave them out.
-      const loaded = (data?.pages ?? [])
-        .flatMap((page) => page.data)
-        .filter((row) => !row.archived);
+      const loaded = uniqueRows([
+        ...(data?.pages ?? []).flatMap((page) => page.data),
+        ...(sidebarRows ?? []),
+      ]).filter((row) => !row.archived);
       const matches = matchSessions(loaded, query);
       const rangesById = new Map(matches.map((match) => [match.session.id, match.labelRanges]));
       const local = paletteRows(
@@ -242,6 +256,7 @@ export function usePaletteSessionSearch({
     return out.slice(0, IDLE_SESSION_LIMIT);
   }, [
     data,
+    sidebarRows,
     titleSearch.data,
     query,
     searching,
