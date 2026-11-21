@@ -134,38 +134,54 @@ final class WatchCompanionTests: XCTestCase {
     let snapshot = Data(
       #"{"status":"running","pending_elicitations":[{"elicitation_id":"e1","params":{"message":"Run it?"}}]}"#
         .utf8)
-    let server = try MockHTTPServer(requestHandler: { request in
-      switch (request.method, URLComponents(string: request.path)?.path) {
-      case ("GET", "/v1/sessions/s1"):
-        return (200, [:], snapshot)
-      case ("GET", "/v1/sessions/s1/items"):
-        return (200, [:], Data(#"{"data":[]}"#.utf8))
-      case ("POST", "/v1/sessions/s1/elicitations/e1/resolve"):
-        let body = try? JSONSerialization.jsonObject(with: request.body) as? [String: String]
-        return (body?["action"] == "accept" ? 401 : 200, [:], Data())
-      default:
-        XCTFail("Unexpected watch request: \(request.method) \(request.path)")
-        return (404, [:], Data())
-      }
-    })
-    let session = try WatchClient.decoder.decode(
-      WatchSession.self, from: Data(#"{"id":"s1","status":"running"}"#.utf8))
-    let conversation = WatchConversation(
-      session: session,
-      client: WatchClient(
+    for resolvedElsewhere in [false, true] {
+      // Only the serial HTTP handler reads or changes this server-side state.
+      var promptResolved = false
+      let server = try MockHTTPServer(requestHandler: { request in
+        switch (request.method, URLComponents(string: request.path)?.path) {
+        case ("GET", "/v1/sessions/s1"):
+          return (
+            200, [:],
+            promptResolved
+              ? Data(#"{"status":"running","pending_elicitations":[]}"#.utf8) : snapshot
+          )
+        case ("GET", "/v1/sessions/s1/items"):
+          return (200, [:], Data(#"{"data":[]}"#.utf8))
+        case ("POST", "/v1/sessions/s1/elicitations/e1/resolve"):
+          let body = try? JSONSerialization.jsonObject(with: request.body) as? [String: String]
+          if body?["action"] == "accept" { return (401, [:], Data()) }
+          XCTAssertEqual(body?["action"], "decline")
+          promptResolved = true
+          return (200, [:], Data())
+        default:
+          XCTFail("Unexpected watch request: \(request.method) \(request.path)")
+          return (404, [:], Data())
+        }
+      })
+      let session = try WatchClient.decoder.decode(
+        WatchSession.self, from: Data(#"{"id":"s1","status":"running"}"#.utf8))
+      let client = WatchClient(
         credentials: WatchCredentials(
-          apiURL: URL(string: "http://127.0.0.1:\(server.port)/v1")!, cookie: "session=test")))
-    await conversation.load()
-    XCTAssertNil(conversation.error)
-    let approval = try XCTUnwrap(conversation.approvals.first)
-    await conversation.resolve(approval, accept: true)
-    XCTAssertEqual(conversation.error, WatchError.signedOut.localizedDescription)
-    await conversation.load()
-    XCTAssertEqual(conversation.error, WatchError.signedOut.localizedDescription)
-    XCTAssertEqual(conversation.approvals.map(\.id), ["e1"])
-    await conversation.resolve(approval, accept: false)
-    XCTAssertNil(conversation.error)
-    XCTAssertTrue(conversation.approvals.isEmpty)
+          apiURL: URL(string: "http://127.0.0.1:\(server.port)/v1")!, cookie: "session=test"))
+      let conversation = WatchConversation(session: session, client: client)
+      await conversation.load()
+      XCTAssertNil(conversation.error)
+      let approval = try XCTUnwrap(conversation.approvals.first)
+      await conversation.resolve(approval, accept: true)
+      XCTAssertEqual(conversation.error, WatchError.signedOut.localizedDescription)
+      await conversation.load()
+      XCTAssertEqual(conversation.error, WatchError.signedOut.localizedDescription)
+      XCTAssertEqual(conversation.approvals.map(\.id), ["e1"])
+      if resolvedElsewhere {
+        try await client.post(
+          "sessions/s1/elicitations/e1/resolve", ["action": "decline"], host: nil)
+        await conversation.load()
+      } else {
+        await conversation.resolve(approval, accept: false)
+      }
+      XCTAssertNil(conversation.error, "resolvedElsewhere: \(resolvedElsewhere)")
+      XCTAssertTrue(conversation.approvals.isEmpty)
+    }
   }
 
   @MainActor func testCredentialsSendOnlyCookiesTheAPIWouldReceive() throws {

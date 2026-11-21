@@ -13,8 +13,14 @@ final class WatchConversation {
   /// Resolved here, so a poll that started before the answer can't bring the card back.
   private var answered: Set<String> = []
   private var loadError: String?
-  private var resolveError: String?
-  var error: String? { resolveError ?? loadError }
+  private var resolveError: ResolveFailure?
+  var error: String? { resolveError?.message ?? loadError }
+
+  private struct ResolveFailure: Equatable {
+    let id = UUID()
+    let approvalID: String
+    let message: String
+  }
 
   init(session: WatchSession, client: WatchClient) {
     self.session = session
@@ -22,6 +28,7 @@ final class WatchConversation {
   }
 
   func load() async {
+    let failureBeforeLoad = resolveError
     let path = "sessions/\(session.id)"
     let snapshotQuery = [
       "include_items": "false", "include_liveness": "false", "include_usage": "false",
@@ -33,6 +40,12 @@ final class WatchConversation {
       let (state, page) = try await (snapshot, items)
       messages = state.messages(items: page.data)
       approvals = (state.pendingElicitations ?? []).filter { !answered.contains($0.id) }
+      // Only a poll begun after this failure can confirm it was resolved elsewhere.
+      if let failureBeforeLoad, failureBeforeLoad == resolveError,
+        !approvals.contains(where: { $0.id == failureBeforeLoad.approvalID })
+      {
+        resolveError = nil
+      }
       session.status = state.status ?? session.status
       session.pendingElicitationsCount = approvals.count
       loadError = state.status == "failed" ? state.lastTaskError?.message ?? "Session failed." : nil
@@ -59,7 +72,7 @@ final class WatchConversation {
       approvals.removeAll { $0.id == approval.id }
       await load()
     } catch {
-      resolveError = error.localizedDescription
+      resolveError = ResolveFailure(approvalID: approval.id, message: error.localizedDescription)
     }
   }
 }
