@@ -401,3 +401,28 @@ def test_any_open_or_unknown_pr_past_freshness_makes_a_session_stale(
 ) -> None:
     stored = SessionPullRequests(entries=list(entries), synced=synced)
     assert server_prs.has_stale_state(stored, now=1_000.0) is expected
+
+
+def test_the_answer_keeps_the_instance_name_a_host_reported_for_a_pr(
+    store: SessionPullRequestStore,
+) -> None:
+    """A host names the code host instance serving a PR; anything else gets the server's."""
+
+    def display(name: object, provider_id: str = "github") -> dict[str, object]:
+        return {"id": provider_id, "display_name": name, "request_name": "x"}
+
+    third = "https://github.com/example/three/pull/3"
+    fourth = "https://github.com/example/four/pull/4"
+    info = _info(
+        _entry(A, 42, provider_display=display(" Internal code host ")),
+        _entry(B, 7, provider_display=display("Other", provider_id="gitlab")),
+        _entry(third, 3, provider_display=display("x" * 65)),
+        _entry(fourth, 4, provider_display=display("Bad\nname")),
+    )
+    stored = server_prs.ingest_info(store, SESSION, info, requested_at=50.0)
+
+    answered = server_prs.answer(info, stored)
+
+    names = {entry["url"]: entry["provider_display"]["display_name"] for entry in answered["prs"]}
+    assert names == {A: "Internal code host", B: "GitHub", third: "GitHub", fourth: "GitHub"}
+    assert answered["prs"][0]["provider_display"]["request_name"] == "pull request"

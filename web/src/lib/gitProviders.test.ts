@@ -20,6 +20,38 @@ describe("gitProviderCopy", () => {
     expect(gitProviderCopy("github")).toBe(copy);
   });
 
+  it("keeps GitHub's copy when the host's display names GitHub itself", () => {
+    const display = {
+      id: "github",
+      display_name: "GitHub",
+      request_name: "pull request",
+      number_prefix: "#",
+    };
+    expect(gitProviderCopy("github", null, display)).toBe(GIT_PROVIDERS.github);
+  });
+
+  it("names a code host instance of GitHub by its own name, without GitHub's CLI hints", () => {
+    const copy = gitProviderCopy("github", null, {
+      id: "github",
+      display_name: "Internal code host",
+      request_name: "pull request",
+      number_prefix: "#",
+    });
+    expect(copy).toMatchObject({
+      id: "github",
+      label: "Internal code host",
+      Icon: GithubMono,
+      requestName: "pull request",
+      prNumberPrefix: "#",
+      defaultHost: null,
+      authHint: "Check that Internal code host can sign in on the host.",
+      cliLabel: "Internal code host CLI",
+    });
+    expect(copy.repoUnresolvedHint).toBeUndefined();
+    expect(copy.checksUnavailableHint).toBeUndefined();
+    expect(GIT_PROVIDERS.github.label).toBe("GitHub");
+  });
+
   it("uses an external provider's presentation without a frontend registration", () => {
     const copy = gitProviderCopy("example_forge", "Run `forge login`.", {
       id: "example_forge",
