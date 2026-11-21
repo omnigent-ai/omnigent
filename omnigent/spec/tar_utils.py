@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import gzip
 import io
+import lzma
 import tarfile
+import zlib
 from pathlib import Path, PurePosixPath
 
 # 500 MB default limit to guard against decompression bombs
@@ -11,6 +14,16 @@ DEFAULT_MAX_BYTES = 500 * 1024 * 1024
 
 # Maximum number of entries to prevent zip-bomb style attacks
 DEFAULT_MAX_ENTRIES = 10_000
+
+# Errors raised while decoding a damaged archive stream. Plain ``OSError`` is
+# deliberately absent so disk failures (e.g. ENOSPC) are not blamed on the input.
+_CORRUPT_ARCHIVE_ERRORS = (
+    tarfile.TarError,
+    EOFError,
+    zlib.error,
+    gzip.BadGzipFile,
+    lzma.LZMAError,
+)
 
 
 class ExtractionError(Exception):
@@ -69,26 +82,31 @@ def extract_safe(
     entry_count = 0
 
     with _open_tar(source) as tf:
-        for member in tf:
-            entry_count += 1
-            if entry_count > max_entries:
-                raise ExtractionError(f"tarball exceeds max entry count ({max_entries})")
+        try:
+            for member in tf:
+                entry_count += 1
+                if entry_count > max_entries:
+                    raise ExtractionError(f"tarball exceeds max entry count ({max_entries})")
 
-            _check_member_safety(member, resolved_dest)
+                _check_member_safety(member, resolved_dest)
 
-            if member.isfile():
-                total_bytes += member.size
-                if total_bytes > max_bytes:
-                    raise ExtractionError(
-                        f"tarball exceeds max extracted size ({max_bytes} bytes)"
-                    )
+                if member.isfile():
+                    total_bytes += member.size
+                    if total_bytes > max_bytes:
+                        raise ExtractionError(
+                            f"tarball exceeds max extracted size ({max_bytes} bytes)"
+                        )
 
-            # Defense in depth on top of _check_member_safety: only
-            # regular files and directories reach this point, so
-            # ``filter='data'`` (Python >= 3.12) is a no-op for valid
-            # members but rejects anything malicious that slipped past
-            # the explicit checks above.
-            tf.extract(member, dest, set_attrs=False, filter="data")
+                # Defense in depth on top of _check_member_safety: only
+                # regular files and directories reach this point, so
+                # ``filter='data'`` (Python >= 3.12) is a no-op for valid
+                # members but rejects anything malicious that slipped past
+                # the explicit checks above.
+                tf.extract(member, dest, set_attrs=False, filter="data")
+        # A valid header can precede a truncated or corrupt stream; those
+        # decode errors surface mid-iteration, not from tarfile.open().
+        except _CORRUPT_ARCHIVE_ERRORS as exc:
+            raise ExtractionError(f"invalid tarball: {exc}") from exc
 
     return dest
 
