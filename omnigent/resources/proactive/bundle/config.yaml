@@ -15,9 +15,7 @@ executor:
 # Only the Inbox tools are opted in; every other framework tool group the agent
 # does not need is off. The session discovery tools (sys_session_list,
 # sys_session_get_history, sys_session_get_info) are always registered and are
-# limited server-side to sessions the user can see. The session file tools are
-# denied by the no_session_files policy below rather than `files: false`,
-# because runners released before that group reject the key.
+# limited server-side to sessions the user can see.
 tool_groups:
   user_inbox: true
   browser: false
@@ -56,6 +54,7 @@ guardrails:
         arguments:
           gate_pushes: true
           risky_action: DENY
+    # Denies the session file tools; runners released before `tool_groups.files` reject it.
     no_session_files:
       type: function
       on: [tool_call]
