@@ -18,6 +18,7 @@ import {
   rememberPaletteParent,
 } from "../commandPaletteChildPage";
 import type { PaletteTarget } from "../paletteTarget";
+import { conversationDisplayLabel } from "../sidebarNav";
 import { currentSessionRow, isSessionListed } from "./currentSession";
 import { SESSION_COMMAND_ICONS } from "./icons";
 import { type SessionCommandId, sessionCommands } from "./model";
@@ -68,7 +69,10 @@ export function useSessionActionsPage(): SessionActionsPage {
 
   return {
     open: page !== null,
-    heading: page ? `Actions for “${page.title}”` : null,
+    // Named as the session reads now, so a rename elsewhere shows here too.
+    heading: page
+      ? `Actions for “${conversation ? conversationDisplayLabel(conversation) : page.title}”`
+      : null,
     items,
     openActions: (opened, title, parent) => {
       rememberPaletteParent(parent);
