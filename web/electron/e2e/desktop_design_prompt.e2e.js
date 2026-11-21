@@ -99,6 +99,22 @@ async function assertModalIntact(page, kind) {
   assert.deepEqual(state, { open: true, period: "W41", submits: 0 });
 }
 
+/** Size, show and foreground the test window: overlays and pages take the keys only then. */
+async function foreground(electronApp, nativeWindow) {
+  const ids = await nativeWindow.evaluate((win) => {
+    win.setSize(1400, 900);
+    win.show();
+    win.focus();
+    return { windowId: win.id, shellId: win.webContents.id };
+  });
+  // macOS may show the test window without making its application foreground.
+  await electronApp.evaluate(({ app }) => {
+    if (process.platform === "darwin") app.focus({ steal: true });
+  });
+  await eventually(() => nativeWindow.evaluate((win) => win.isFocused()), "foreground test window");
+  return ids;
+}
+
 /** Count the chat messages the SPA posts to the session, into `messages`. */
 function recordMessages(window, backend, messages) {
   window.on("request", (request) => {
@@ -194,20 +210,7 @@ describe(
           OMNIGENT_DESKTOP_LEGACY_DESIGN_MODE: "1",
         }));
         nativeWindow = await electronApp.browserWindow(window);
-        windowIds = await nativeWindow.evaluate((win) => {
-          win.setSize(1400, 900);
-          win.show();
-          win.focus();
-          return { windowId: win.id, shellId: win.webContents.id };
-        });
-        // macOS may show the test window without making its application foreground.
-        await electronApp.evaluate(({ app }) => {
-          if (process.platform === "darwin") app.focus({ steal: true });
-        });
-        await eventually(
-          () => nativeWindow.evaluate((win) => win.isFocused()),
-          "foreground test window",
-        );
+        windowIds = await foreground(electronApp, nativeWindow);
         recordMessages(window, backend, messages);
         await openBrowserTab(window, backend);
         if (process.env.OMNIGENT_DESKTOP_COMPOSITED_VIDEO === "1") {
@@ -524,12 +527,7 @@ describe(
         fixture = await startFormFixture();
         backend = await startDesignBackend(tmpDir);
         ({ electronApp, window } = await launchDesignDesktop(tmpDir, recordDir, backend.serverUrl));
-        const nativeWindow = await electronApp.browserWindow(window);
-        await nativeWindow.evaluate((win) => {
-          win.setSize(1400, 900);
-          win.show();
-          win.focus();
-        });
+        await foreground(electronApp, await electronApp.browserWindow(window));
         recordMessages(window, backend, messages);
         await openBrowserTab(window, backend);
       },
@@ -600,7 +598,7 @@ describe(
           "mock agent reply in the real chat",
           45_000,
         );
-        // The page's modal, its field and its form are as they were.
+        // Sending through Annotate's overlay must not change or submit the page's modal.
         await assertModalIntact(page, "native");
       },
     );

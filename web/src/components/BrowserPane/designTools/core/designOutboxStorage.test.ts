@@ -445,11 +445,15 @@ describe("design outbox storage", () => {
   it("never takes or drops a request a live page holds: an open tab's, or this page's", async () => {
     installLocks(["open_tab"]);
     await putRecord(record({ id: "theirs", page: "open_tab" }));
+    // However old, or whoever's: that tab still shows them, and counts them as saved.
+    const old = Date.now() - SAVED_REQUEST_TTL_MS - 1;
+    await putRecord(record({ id: "theirs_old", page: "open_tab", savedAt: old }));
+    await putRecord(record({ id: "theirs_bobs", page: "open_tab", userId: "bob" }));
     // This page's own, which it queued and still holds.
     const id = queueDesignRequest({ tabId: TAB, label: "Annotate", text: "Long-lived" });
     await designOutboxSaved();
     await restoreSavedDesignRequests();
-    expect(await savedIds()).toEqual([id, "theirs"].sort());
+    expect(await savedIds()).toEqual([id, "theirs", "theirs_bobs", "theirs_old"].sort());
     expect(ids()).toEqual([id]);
   });
 
