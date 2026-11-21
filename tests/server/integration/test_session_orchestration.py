@@ -6,7 +6,6 @@ from unittest.mock import Mock
 from uuid import uuid4
 
 import pytest
-import yaml
 
 from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
@@ -1699,25 +1698,42 @@ async def test_a_planted_reported_mode_does_not_skip_approval_for_nested_agents(
     assert CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY not in worker.labels
 
 
+@pytest.mark.parametrize(
+    ("config", "leaves_open"),
+    [
+        ({"harness": "codex-native"}, True),
+        ({"harness": "codex-native", "permission_mode": "default"}, False),
+        ({"harness": "codex-native", "yolo": False}, False),
+        ({"harness": "cursor-native", "exec_mode": "default"}, False),
+    ],
+)
+async def test_any_spec_permission_setting_keeps_the_creators_mode_out(config, leaves_open):
+    """A worker spec that sets any permission key, even to its default, keeps its own mode."""
+    from types import SimpleNamespace
+
+    from omnigent.server.routes._sessions.orchestration import _spec_leaves_permission_mode_open
+
+    spec = SimpleNamespace(executor=SimpleNamespace(config=config))
+    assert _spec_leaves_permission_mode_open(spec) is leaves_open
+    assert _spec_leaves_permission_mode_open(None) is False
+
+
 async def test_a_worker_whose_spec_cannot_be_read_keeps_its_agent_default(
-    creator_client, auth_app, db_uri, monkeypatch, tmp_path
+    creator_client, auth_app, db_uri, monkeypatch
 ):
     """A worker spec the server can't read might set its own mode, so the creator's isn't used."""
-    from omnigent.harnesses.codex_native.main import _materialize_codex_agent_spec
     from omnigent.runtime.agent_cache import AgentCache
     from omnigent.server.routes.sessions import routes_core
-    from tests._helpers.session import bundle_files, post_session_bundle
+    from tests._helpers.session import post_session_bundle
+    from tests.server.helpers import build_agent_bundle
 
     creator = await _codex_creator(creator_client, auth_app, db_uri, monkeypatch, "approve-for-me")
     # A wrapper agent's harness resolves from its name, without its bundle.
-    spec = yaml.safe_load(_materialize_codex_agent_spec(tmp_path, model=None).read_text())
-    spec["executor"]["permission_mode"] = "read-only"
-    uploaded = await post_session_bundle(
-        creator_client.post,
-        "/v1/sessions",
-        bundle_files({"codex-native-ui.yaml": yaml.safe_dump(spec).encode()}),
-        filename="codex-native-ui.tar.gz",
+    bundle = build_agent_bundle(
+        "codex-native-ui",
+        executor={"config": {"harness": "codex-native", "permission_mode": "read-only"}},
     )
+    uploaded = await post_session_bundle(creator_client.post, "/v1/sessions", bundle)
     assert uploaded.status_code == 201, uploaded.text
     worker_agent_id = uploaded.json()["agent_id"]
     real_load = AgentCache.load

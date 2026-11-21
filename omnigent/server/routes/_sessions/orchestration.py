@@ -13546,9 +13546,8 @@ async def _create_session_from_existing_agent(
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
 
-    # A worker can do without asking what the session that started it can, so one
-    # that its request, automation and own spec, once read, leave without a mode runs
-    # in its creator's.
+    # Inherit the creator's mode only when the request, automation and readable spec
+    # select none.
     creator_permission_labels: dict[str, str] = {}
     if (
         needs_launch_args_from_spec

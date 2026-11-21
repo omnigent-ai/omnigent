@@ -386,6 +386,24 @@ _CODEX_FULL_ACCESS = (_CODEX_ARGS["full-access"], {})
         pytest.param(
             "codex-native", {}, ["--", "--approve-for-me"], True, None, id="codex-prompt-text-mode"
         ),
+        # A file profile can set more than a preset, so none stands in for it...
+        pytest.param(
+            "codex-native",
+            {},
+            ["--profile", "restricted", *_CODEX_ARGS["full-access"]],
+            True,
+            None,
+            id="codex-file-profile",
+        ),
+        # ...though a reported mode that keeps approval still applies.
+        pytest.param(
+            "codex-native",
+            {_CODEX_APPROVAL_MODE: "approve-for-me"},
+            ["-p", "restricted", *_CODEX_ARGS["approve-for-me"]],
+            True,
+            (_CODEX_ARGS["approve-for-me"], {}),
+            id="codex-file-profile-reported-mode",
+        ),
         pytest.param(
             "claude-native",
             {},
