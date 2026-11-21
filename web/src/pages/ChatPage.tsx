@@ -321,6 +321,7 @@ import {
   workflowMessage,
 } from "@/lib/workflow";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { usePreventsKeyboardSubmit } from "@/hooks/usePreventsKeyboardSubmit";
 import { ConnectionIndicator } from "./ChatIndicators";
 import { SessionHarnessPicker } from "@/components/composer/SessionHarnessPicker";
 import {
@@ -2849,7 +2850,7 @@ function ComposerImpl(
   // Keep desktop's fast-type affordance, but let mobile users explicitly tap
   // the composer when switching back from Terminal or changing sessions.
   const isMobile = useIsMobileViewport();
-  const preventsKeyboardSubmit = isMobile;
+  const preventsKeyboardSubmit = usePreventsKeyboardSubmit();
   const isMobileRef = useRef(isMobile);
   isMobileRef.current = isMobile;
   // Mobile moves a bound host's button, with its Reconnect host item, into the

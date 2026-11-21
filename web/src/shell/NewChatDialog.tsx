@@ -209,6 +209,7 @@ import {
 import { markSessionCreated } from "@/store/interactionTelemetry";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import { DesktopWindowContext, useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { usePreventsKeyboardSubmit } from "@/hooks/usePreventsKeyboardSubmit";
 import { MODEL_PICKER_KEYS, useModelPickerHotkey } from "@/hooks/useModelPickerHotkey";
 import { CliCommandBlock, renderTextWithInlineCode } from "./CliCommandBlock";
 import { isHostAbsolutePath, isNavigablePath } from "./WorkspacePicker";
@@ -2405,7 +2406,7 @@ function NewChatLandingContent({
   const [handoff] = useState(() => peekNewSessionHandoff(handoffToken));
   const queryClient = useQueryClient();
   const isMobileViewport = useIsMobileViewport();
-  const preventsKeyboardSubmit = isMobileViewport;
+  const preventsKeyboardSubmit = usePreventsKeyboardSubmit();
   // The floating New Agent panel renders this same screen with its own chrome.
   const presentation = useComposerPresentation();
   const floating = presentation.kind === "floating" ? presentation : null;

@@ -13,6 +13,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { usePreventsKeyboardSubmit } from "@/hooks/usePreventsKeyboardSubmit";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -45,7 +46,7 @@ export function openKeyboardShortcuts(): void {
 export function useShortcutPageGroups(): ShortcutPageGroup[] {
   // Feature-based, stable per session; computed at render so tests can vary it.
   const isMobileViewport = useIsMobileViewport();
-  const preventsKeyboardSubmit = isMobileViewport;
+  const preventsKeyboardSubmit = usePreventsKeyboardSubmit();
   const serverInfo = useServerInfo();
   return shortcutPageGroups({
     native: isNativeShell(),
