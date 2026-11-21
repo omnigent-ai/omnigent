@@ -210,10 +210,10 @@ def test_non_native_harness_with_bypass_fields_is_ignored(harness: str) -> None:
 
 def test_kimi_native_without_yolo_field_returns_none() -> None:
     """
-    kimi-native bypass is opt-IN: an absent ``yolo`` leaves args unset.
+    kimi-native auto-approval is opt-IN: an absent ``yolo`` leaves args unset.
 
     Unlike codex/cursor's headless default-bypass, kimi keeps its current
-    prompting behavior unless the bundle explicitly declares ``yolo: true``.
+    prompting behavior unless the bundle explicitly requests auto-approval.
     ``None`` (not ``[]``) is the leave-unset contract.
     """
     spec = _spec_with_config({"harness": "kimi-native"})
@@ -225,9 +225,9 @@ def test_kimi_native_without_yolo_field_returns_none() -> None:
     [
         # Accepted spellings: real bool (programmatic spec) + the parser's
         # stringified form, case-insensitive with no whitespace tolerance.
-        (True, ["--yolo"]),
-        ("True", ["--yolo"]),
-        ("true", ["--yolo"]),
+        (True, ["--auto"]),
+        ("True", ["--auto"]),
+        ("true", ["--auto"]),
         # Rejected: padded strings, bool False, the parser's "False", and
         # truthy-LOOKING spellings that are NOT part of the contract — they
         # must silently (debug-logged) leave args unset rather than
@@ -246,8 +246,7 @@ def test_kimi_native_yolo_spelling_boundary(yolo: object, expected: list[str] | 
     Pin the accepted-vs-rejected spelling boundary for the kimi opt-in.
 
     Only a real bool ``True`` or a case-insensitive, unpadded ``"true"``
-    string enables ``--yolo`` (kimi's auto-approve-tools flag — ``--auto``
-    full autonomy is deliberately NOT mapped); every other present value
+    string enables ``--auto`` (Kimi's Never Ask mode); every other present value
     (including YAML-1.1-style ``yes``/``on`` and numeric ``1``) leaves
     launch args unset. A failure here means the opt-in boundary drifted —
     either silently enabling bypass for a spelling the contract rejects, or
@@ -256,6 +255,49 @@ def test_kimi_native_yolo_spelling_boundary(yolo: object, expected: list[str] | 
     """
     spec = _spec_with_config({"harness": "kimi-native", "yolo": yolo})
     assert _derive_terminal_launch_args_from_spec(spec) == expected
+
+
+def test_kimi_native_bypass_permission_mode_translates_to_never_ask() -> None:
+    """The shared native ``bypassPermissions`` mode enables Kimi Never Ask."""
+    spec = _spec_with_config({"harness": "kimi-native", "permission_mode": "bypassPermissions"})
+    assert _derive_terminal_launch_args_from_spec(spec) == ["--auto"]
+
+
+def test_kimi_native_bypass_permission_mode_precedes_yolo_false() -> None:
+    """An explicit Kimi bypass mode takes precedence over the yolo opt-out."""
+    spec = _spec_with_config(
+        {
+            "harness": "kimi-native",
+            "permission_mode": "bypassPermissions",
+            "yolo": False,
+        }
+    )
+    assert _derive_terminal_launch_args_from_spec(spec) == ["--auto"]
+
+
+def test_kimi_native_non_bypass_permission_mode_without_yolo_returns_none() -> None:
+    """Kimi ignores non-bypass modes when no yolo opt-in is present."""
+    spec = _spec_with_config({"harness": "kimi-native", "permission_mode": "plan"})
+    assert _derive_terminal_launch_args_from_spec(spec) is None
+
+
+def test_kimi_native_yolo_true_applies_after_non_bypass_permission_mode() -> None:
+    """A non-bypass permission mode does not suppress an explicit yolo opt-in."""
+    spec = _spec_with_config({"harness": "kimi-native", "permission_mode": "plan", "yolo": True})
+    assert _derive_terminal_launch_args_from_spec(spec) == ["--auto"]
+
+
+def test_kimi_native_non_string_permission_mode_is_fail_closed() -> None:
+    """Non-string permission modes must never enable Kimi Never Ask."""
+
+    class _EqAnything:
+        def __eq__(self, other: object) -> bool:
+            return True
+
+        __hash__ = object.__hash__
+
+    spec = _spec_with_config({"harness": "kimi-native", "permission_mode": _EqAnything()})
+    assert _derive_terminal_launch_args_from_spec(spec) is None
 
 
 @pytest.mark.parametrize(
