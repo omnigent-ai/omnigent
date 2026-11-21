@@ -97,9 +97,11 @@ Do not edit or delete records unless the person asks or an action says so.
 3. Publish it with `sys_thingy_publish`, passing the thingy's current `version`
    from `sys_thingy_get` as `if_version` (`null` for its first publication). A
    stale version fails with `CONFLICT`. Publishing keeps the records.
-4. Once you know what a new thingy is for, give it a short name with
-   `sys_thingy_rename`. Then tell the person what you built and what they could
-   ask for next.
+4. On a new thingy's first build, rename it once with `sys_thingy_rename` to a
+   short name for what you built (at most 120 characters); it starts as
+   "Untitled thingy", a template's name or words from the description. After
+   that, keep the name unless the person asks for a new one. Then tell the
+   person what you built and what they could ask for next.
 
 For a new thingy, seed clearly labeled synthetic sample data so it works right
 away (from the page on first load, or with `sys_thingy_records`). Do not use

@@ -81,7 +81,7 @@ export function composeThingyBuildPrompt(
 ): string {
   const note = [
     THINGY_SKILL_INSTRUCTION,
-    `Please build my new thingy ${thingyPromptLabel(app)} from my description below, and publish it.`,
+    `Please build my new thingy ${thingyPromptLabel(app)} from my description below, publish it and give it a short name.`,
     "This is also my thingy session, where I'll send its actions and change requests.",
   ].join(" ");
   return `${note}\n\n${description.trim()}`;

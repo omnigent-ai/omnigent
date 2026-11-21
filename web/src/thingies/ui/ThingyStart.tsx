@@ -17,8 +17,18 @@ import { ThingyTemplatesSection } from "./ThingyTemplateGallery";
 import { IN_APP_THINGY_OPEN, appPathFromUrl } from "./thingyNavigation";
 import { rememberUnbuiltThingy } from "./useAdoptStartedThingySession";
 
-const START_EXPLANATION =
-  "Say what it shows, what data it uses and what people do with it. Build opens a new session with the thingy beside it; send the message there to build it.";
+export const THINGY_INTRO =
+  "A thingy is a small app you build with an agent: it keeps its own data, hands work to agents, and you can share it.";
+
+const START_EXPLANATION = (
+  <>
+    <span className="block text-foreground">{THINGY_INTRO}</span>
+    <span className="block">
+      Say what it shows, what data it uses and what people do with it. Build opens a new session
+      with the thingy beside it; send the message there to build it.
+    </span>
+  </>
+);
 
 function ThingyStartContent({
   onCancel,
