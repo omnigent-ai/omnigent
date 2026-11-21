@@ -8,6 +8,7 @@ import { fetchHosts } from "@/hooks/useHosts";
 import { getDesktopFeatures } from "./nativeBridge";
 import type * as NativeBridge from "./nativeBridge";
 import { getSessionSlim } from "./sessionsApi";
+import { fetchSessionHostId } from "./fetchSessionHostId";
 
 vi.mock("@/hooks/useHosts", () => ({ fetchHosts: vi.fn() }));
 vi.mock("./sessionsApi", () => ({ getSessionSlim: vi.fn() }));
@@ -159,6 +160,27 @@ it("does not retry if current provenance is unavailable", async () => {
     retryWithFreshHost: false,
   });
   expect(navigate).toHaveBeenCalledTimes(1);
+});
+
+it("does not reuse a host lookup that started before consent", async () => {
+  type Session = Awaited<ReturnType<typeof getSessionSlim>>;
+  let resolveEarlier!: (session: Session) => void;
+  const oldResponse = new Promise<Session>((resolve) => {
+    resolveEarlier = resolve;
+  });
+  vi.mocked(getSessionSlim)
+    .mockReturnValueOnce(oldResponse)
+    .mockResolvedValue({ id: "session", hostId: "host-b", parentSessionId: null } as Session);
+  const earlier = fetchSessionHostId("session");
+  const consent = Promise.resolve({ ok: false, retryWithFreshHost: true });
+  const navigate = vi.fn(() => consent);
+  const pending = withPreviewHostRetry("session", "host-a", navigate);
+  await consent;
+  resolveEarlier({ id: "session", hostId: "host-a", parentSessionId: null } as Session);
+  await earlier;
+  expect(await pending).toMatchObject({ ok: false, retryWithFreshHost: false });
+  expect(navigate).toHaveBeenCalledTimes(1);
+  expect(getSessionSlim).toHaveBeenCalledTimes(2);
 });
 
 it.each([{ ok: true }, { ok: false, error: "blocked" }, null, undefined])(

@@ -54,7 +54,7 @@ export async function withPreviewHostRetry(
 ): Promise<BrowserNavigationResult | null | undefined> {
   const result = await navigate();
   if (result?.retryWithFreshHost !== true) return result;
-  if (!sourceHostId || (await fetchSessionHostId(sessionId)) !== sourceHostId) {
+  if (!sourceHostId || (await fetchSessionHostId(sessionId, { fresh: true })) !== sourceHostId) {
     return {
       ...result,
       ok: false,
