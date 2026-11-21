@@ -23,6 +23,21 @@ def sample_policy(monkeypatch: pytest.MonkeyPatch) -> None:
         policy, "HOST", policy.host_pattern(("service.example.test", "apps.example.test"))
     )
     monkeypatch.setattr(policy, "PUBLIC_HOSTS", frozenset({"docs.service.example.test"}))
+    monkeypatch.setattr(
+        policy, "SYNTHETIC_FIXTURE_HOSTS", frozenset({"test.service.example.test"})
+    )
+    monkeypatch.setattr(
+        policy,
+        "SYNTHETIC_FIXTURE_URLS",
+        frozenset(
+            {
+                "https://accounts.service.example.test/oidc/accounts/test-account",
+                "https://accounts.service.example.test/oidc/accounts/test-account/"
+                ".well-known/openid-configuration",
+                "https://accounts.service.example.test/oidc/accounts/test-account/v1/token",
+            }
+        ),
+    )
 
 
 @pytest.mark.parametrize(
@@ -44,6 +59,31 @@ def sample_policy(monkeypatch: pytest.MonkeyPatch) -> None:
         "docs.extra.service.example.test",
         "See https://tenant.service.example.test.",
         "See tenant.service.example.test. More text.",
+        "https://extra.test.service.example.test",
+        "https://test-2.service.example.test",
+        "http://test.service.example.test",
+        "ftp://test.service.example.test",
+        "https://user@test.service.example.test",
+        "https://test.service.example.test:443",
+        "https://test.service.example.test:/path",
+        "https://test.service.example.test/tenant.service.example.test/path",
+        "https://test.service.example.test/?next=https://tenant.service.example.test/path",
+        "https://test.service.example.test/#tenant.service.example.test/path",
+        "https://test.service.example.test/ https://tenant.service.example.test/path",
+        "https://[tenant.service.example.test/path",
+        "https://tenant.service.example.test:not-a-port/path",
+        "https://tenant.service.example.test:/path",
+        "https://accounts.service.example.test/oidc/accounts/real-account",
+        "https://accounts.service.example.test/oidc/accounts/TEST-ACCOUNT",
+        "https://accounts.service.example.test/oidc/accounts/test-account/other",
+        "https://accounts.service.example.test/oidc/accounts/test-account/",
+        "https://accounts.service.example.test/oidc/accounts/test-account.",
+        "https://accounts.service.example.test/oidc/accounts/test-account,other",
+        "http://accounts.service.example.test/oidc/accounts/test-account",
+        "https://user@accounts.service.example.test/oidc/accounts/test-account",
+        "https://accounts.service.example.test:443/oidc/accounts/test-account",
+        "https://accounts.service.example.test/oidc/accounts/test-account/v1/token?query=value",
+        "https://accounts.service.example.test/oidc/accounts/test-account#fragment",
     ],
 )
 @pytest.mark.usefixtures("sample_policy")
@@ -64,6 +104,18 @@ def test_prohibited(text: str) -> None:
         "https://service.example.test/",
         "https://tenant.service.example.test.other.example/",
         "See docs.service.example.test. More text.",
+        "test.service.example.test",
+        "See test.service.example.test. More text.",
+        "https://test.service.example.test",
+        "https://test.service.example.test/",
+        "https://test.service.example.test/omnigent",
+        "https://test.service.example.test/oidc",
+        "https://test.service.example.test/auth/session/create?mode=test#result",
+        "https://test.service.example.test/sso/a%2Fb",
+        "https://accounts.service.example.test/oidc/accounts/test-account",
+        "https://accounts.service.example.test/oidc/accounts/test-account/"
+        ".well-known/openid-configuration",
+        "https://accounts.service.example.test/oidc/accounts/test-account/v1/token",
     ],
 )
 @pytest.mark.usefixtures("sample_policy")
@@ -92,6 +144,19 @@ def test_public_hosts_and_reserved_examples_are_allowed() -> None:
         assert violates(f"extra.{host}")
     for text in ["Databricks OAuth", "https://workspace.example.test/", "https://example.com/"]:
         assert not violates(text)
+
+
+def test_exact_synthetic_fixture_hosts_and_account_urls_are_allowed() -> None:
+    for host in policy.SYNTHETIC_FIXTURE_HOSTS:
+        assert not violates(host)
+        assert not violates(f"https://{host}")
+        assert not violates(f"https://{host}/")
+        assert not violates(f"https://{host}/omnigent")
+        assert not violates(f"https://{host}/oidc")
+        assert not violates(f"https://{host}/auth/session/create?mode=test#result")
+        assert not violates(f"https://{host}/sso/a%2Fb")
+    for url in policy.SYNTHETIC_FIXTURE_URLS:
+        assert not violates(url)
 
 
 def test_fixture_source_follows_policy() -> None:
