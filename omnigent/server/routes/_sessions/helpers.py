@@ -1808,33 +1808,89 @@ def _pending_elicitation_snapshot_for_session(
     Duplicate ids are skipped because live mirroring also records the
     ancestor copy in the in-memory index.
 
-    The descendant walk costs one ``list_conversations`` query per
-    session in the tree, so it is skipped entirely unless some session
-    other than ``conv`` has an outstanding prompt in the in-memory
-    index (the common case is none anywhere).
+    Descendants are found by walking up from the sessions that have a
+    prompt, not down the spawn tree: the pending index is small, while
+    a tree can hold hundreds of sub-agents and the index is shared by
+    every session, so a downward walk ran one listing query per tree
+    node on most snapshots of a busy root.
 
-    :param conv_store: Store used to list descendant sub-agents.
+    :param conv_store: Store used to read the pending sessions' ancestors.
     :param conv: Session conversation being snapshotted.
     :returns: Pending elicitation event dicts suitable for
         :class:`SessionResponse.pending_elicitations`.
     """
     events = pending_elicitations.snapshot_for(conv.id)
-    if not (set(pending_elicitations.pending_session_ids()) - {conv.id}):
+    other_pending = [
+        session_id
+        for session_id in pending_elicitations.pending_session_ids()
+        if session_id != conv.id
+    ]
+    if not other_pending:
         return events
     seen = {
         event.get("elicitation_id")
         for event in events
         if isinstance(event.get("elicitation_id"), str)
     }
-    for child in _descendant_sessions(conv_store, conv.id):
-        for event in pending_elicitations.snapshot_for(child.id):
+    for child_id in _pending_descendant_session_ids(conv_store, conv, other_pending):
+        for event in pending_elicitations.snapshot_for(child_id):
             elicitation_id = event.get("elicitation_id")
             if isinstance(elicitation_id, str) and elicitation_id in seen:
                 continue
             if isinstance(elicitation_id, str):
                 seen.add(elicitation_id)
-            events.append(_targeted_elicitation_event(event, target_session_id=child.id))
+            events.append(_targeted_elicitation_event(event, target_session_id=child_id))
     return events
+
+
+def _pending_descendant_session_ids(
+    conv_store: ConversationStore,
+    conv: Conversation,
+    candidate_ids: list[str],
+) -> list[str]:
+    """
+    Return the candidates that are visible sub-agent descendants of ``conv``.
+
+    Matches what listing ``conv``'s sub-agent tree would reach: every
+    session on the path below ``conv`` must be a readable, unarchived
+    ``sub_agent``. All candidates move up one level per batch read, so
+    the cost follows the deepest candidate's depth, not the tree size.
+
+    :param conv_store: Store used to batch-read conversations.
+    :param conv: Session whose descendants are wanted.
+    :param candidate_ids: Sessions to test, e.g. those with a pending
+        prompt. Returned in this order.
+    :returns: The ``candidate_ids`` below ``conv``.
+    """
+    known: dict[str, Conversation | None] = {}
+    frontier = list(dict.fromkeys(candidate_ids))
+    while frontier:
+        fetched = conv_store.get_conversations(frontier)
+        known.update({session_id: fetched.get(session_id) for session_id in frontier})
+        next_ids: list[str] = []
+        for session_id in frontier:
+            node = known[session_id]
+            if node is None or node.kind != "sub_agent" or node.archived:
+                continue
+            parent_id = node.parent_conversation_id
+            if parent_id is not None and parent_id != conv.id and parent_id not in known:
+                next_ids.append(parent_id)
+        frontier = list(dict.fromkeys(next_ids))
+
+    def below_conv(session_id: str) -> bool:
+        visited: set[str] = set()
+        current: str | None = session_id
+        while current is not None and current not in visited:
+            visited.add(current)
+            node = known.get(current)
+            if node is None or node.kind != "sub_agent" or node.archived:
+                return False
+            if node.parent_conversation_id == conv.id:
+                return True
+            current = node.parent_conversation_id
+        return False
+
+    return [session_id for session_id in dict.fromkeys(candidate_ids) if below_conv(session_id)]
 
 
 def _publish_input_consumed(
