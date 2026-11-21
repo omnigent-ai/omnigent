@@ -670,14 +670,14 @@ describe("quick pin/unpin hover button", () => {
     expect(kebab).not.toHaveClass("md:block");
   });
 
-  it("keeps the iOS link callout and text selection off a mobile row's long press", () => {
+  it("keeps the iOS link callout and text selection off a touch row's long press", () => {
     renderSidebar();
 
     const rowLink = screen.getByRole("link", { name: "My Session" });
     expect(rowLink).toHaveClass(
       "mobile-touch-target",
-      "max-md:select-none",
-      "max-md:[-webkit-touch-callout:none]",
+      "pointer-coarse:select-none",
+      "[-webkit-touch-callout:none]",
     );
   });
 });
