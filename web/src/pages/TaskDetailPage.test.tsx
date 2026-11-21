@@ -94,9 +94,12 @@ const showToast = vi.fn();
 vi.mock("@/components/ui/toast", () => ({ showToast: (...args: unknown[]) => showToast(...args) }));
 
 // A session-based automation names the session copy its runs start from.
+const defaultSessionSnapshot = (sessionId: string | null | undefined) =>
+  sessionId ? { title: "Weekly rubric copy" } : null;
+const sessionSnapshot = vi.fn(defaultSessionSnapshot);
 vi.mock("@/hooks/useSession", () => ({
   useSession: (sessionId: string | null | undefined) => ({
-    session: sessionId ? { title: "Weekly rubric copy" } : null,
+    session: sessionSnapshot(sessionId),
     isLoading: false,
     error: null,
   }),
@@ -279,6 +282,7 @@ beforeEach(() => {
   vi.mocked(useViewerId).mockReturnValue(null);
   vi.mocked(useOptionalLoadedConversations).mockReturnValue(undefined);
   useAvailableAgents.mockImplementation(defaultAgentCatalog);
+  sessionSnapshot.mockImplementation(defaultSessionSnapshot);
   navigate.mockReset();
   updateMutate.mockReset();
   deleteMutate.mockReset();
@@ -1281,6 +1285,33 @@ describe("run history", () => {
     expect(within(ownSession as HTMLElement).getByTestId("run-cost").textContent).toBe("$3.00");
     expect(screen.queryByText(/Runs sharing a session/)).toBeNull();
   });
+
+  it("keeps a session's runs usable when its snapshot and cost are unavailable", () => {
+    sessionSnapshot.mockReturnValue(null);
+    setTask(task({ sessionMode: "continue", sessionId: "c_1" }));
+    setRuns([
+      run({ id: "run_2", conversationId: "c_1" }),
+      run({ id: "run_1", status: "failed", errorCode: "launch_failed", conversationId: "c_1" }),
+    ]);
+    renderPage();
+
+    const header = screen.getByTestId("run-session-group-open");
+    expect(header).toHaveAttribute("href", "/c/c_1");
+    expect(header).toHaveTextContent("Continued session");
+    expect(screen.queryByTestId("run-session-group-cost")).toBeNull();
+    const rows = within(
+      screen.getByRole("list", { name: "Runs in Continued session" }),
+    ).getAllByTestId("task-detail-run");
+    expect(rows.map((row) => within(row).getByTestId("run-open").getAttribute("href"))).toEqual([
+      "/c/c_1",
+      "/c/c_1",
+    ]);
+    expect(within(rows[1]!).getByTestId("run-failure")).toHaveTextContent(
+      "Launch · The agent session failed to launch.",
+    );
+    expect(screen.queryByTestId("run-cost")).toBeNull();
+  });
+
   it("renders the empty state when there are no runs", () => {
     setTask(task());
     setRuns([]);
