@@ -13160,6 +13160,48 @@ _STYLED_QUEUED_HINT = (
 _STYLED_DRAFT = "\x1b[39m❯\xa0typed draft text\x1b[7m \x1b[0m"
 
 
+class _ComposerShowingTheQueuedHint(_EditableComposer):
+    """An empty box that shows Claude Code 2.1.325's faint queued-message hint."""
+
+    def _capture_pane(self, socket_path: str, tmux_target: str) -> str:
+        pane = super()._capture_pane(socket_path, tmux_target)
+        if self.text:
+            return pane
+        return pane.replace("❯ \n", "❯\xa0Press up to edit queued messages\n")
+
+    def capture_styled(self, socket_path: str, tmux_target: str) -> str:
+        """Capture the box with its text attributes, as ``capture-pane -e`` does."""
+        pane = super()._capture_pane(socket_path, tmux_target)
+        if self.text:
+            return pane
+        return pane.replace("❯ \n", f"{_STYLED_QUEUED_HINT}\n")
+
+
+def test_a_faint_hint_in_the_box_is_not_stashed_and_the_message_goes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The queued-message hint is no draft: no stash key, and the message is delivered."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    composer = _ComposerShowingTheQueuedHint("", cursor=0)
+    composer.install(monkeypatch)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane_styled", composer.capture_styled)
+    keys: list[str] = []
+    run_tmux = claude_native_bridge._run_tmux
+
+    def record_keys(socket_path: str, *args: str) -> None:
+        if args[0] == "send-keys":
+            keys.append(args[-1])
+        run_tmux(socket_path, *args)
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", record_keys)
+
+    inject_user_message(bridge_dir, content="hello from the web")
+
+    assert not any(claude_native_bridge._COMPOSER_STASH_KEY in key for key in keys)
+    assert [text.strip() for text in composer.submitted] == ["hello from the web"]
+    assert (composer.text, composer.stash) == ("", None)
+
+
 @pytest.mark.parametrize(
     ("styled_row", "typed"),
     [
@@ -13342,6 +13384,34 @@ def test_a_stash_left_from_an_earlier_delivery_is_not_submitted_by_a_retry(
     inject_user_message(bridge_dir, content="hello from the web")
 
     assert [text.strip() for text in composer.submitted] == ["hello from the web"]
+    assert (composer.text, composer.cursor, composer.stash) == (stashed_draft, 4, None)
+
+
+@pytest.mark.parametrize(
+    "stashed_draft",
+    ["hello from the web and more", "[Pasted text #1 +4 lines] look at line 3"],
+    ids=["draft-quoting-the-message", "collapsed-paste"],
+)
+def test_a_stash_left_from_before_stays_pending_once_the_paste_hides_its_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stashed_draft: str
+) -> None:
+    """
+    A stash seen before the delivery typed still guards its submit.
+
+    In a short pane the delivered lines push the stash marker above the
+    screen, so the capture before the Enter cannot show it. The stash was seen
+    before the paste, so its return confirms the delivery and no retry Enter
+    submits it.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    composer = _EditableComposer("", cursor=0, pane_rows=6)
+    composer.stash = (stashed_draft, 4)
+    composer.install(monkeypatch)
+    message = "hello from the web\nsecond line\nthird line"
+
+    inject_user_message(bridge_dir, content=message)
+
+    assert [text.strip() for text in composer.submitted] == [message]
     assert (composer.text, composer.cursor, composer.stash) == (stashed_draft, 4, None)
 
 
@@ -13577,7 +13647,9 @@ def test_delivery_waits_for_the_person_to_pause_typing(
         lambda *_args: min(clock.now, 1003.0),
     )
 
-    claude_native_bridge._wait_for_typing_pause("/tmp/example/tmux.sock", "claude:0.0")
+    assert (
+        claude_native_bridge._wait_for_typing_pause("/tmp/example/tmux.sock", "claude:0.0") is True
+    )
 
     assert 1003.0 + claude_native_bridge._TYPING_PAUSE_S <= clock.now < 1005.0
 
@@ -13589,7 +13661,10 @@ def test_delivery_stops_waiting_for_a_person_who_keeps_typing(
     monkeypatch.setattr(claude_native_bridge, "time", clock)
     monkeypatch.setattr(claude_native_bridge, "last_human_input_at", lambda *_args: clock.now)
 
-    claude_native_bridge._wait_for_typing_pause("/tmp/example/tmux.sock", "claude:0.0")
+    assert (
+        claude_native_bridge._wait_for_typing_pause("/tmp/example/tmux.sock", "claude:0.0")
+        is False
+    )
 
     cap = claude_native_bridge._TYPING_PAUSE_MAX_WAIT_S
     assert cap <= clock.now < cap + 1.0
@@ -14029,6 +14104,11 @@ def test_delivery_expands_a_clipped_composer_until_submit_is_verified(
         "/effort high" if slash else "hello from the web"
     ]
     assert sizes == ["24", "6"]
+    assert (composer.text, composer.cursor, composer.stash) == (
+        draft,
+        min(cursor, len(draft)),
+        None,
+    )
 
 
 @pytest.mark.parametrize(

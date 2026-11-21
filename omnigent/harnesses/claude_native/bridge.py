@@ -7806,9 +7806,13 @@ def _scrolled_draft_rows(lines: list[str], rules: list[int]) -> list[str] | None
 
 @dataclass
 class _DraftGuard:
-    """Whether one delivery has stashed the person's draft, so it must come back."""
+    """One delivery's record of Claude Code's stash."""
 
+    # This delivery stashed the person's draft, so it must come back.
     stashed: bool = False
+    # A stash, this delivery's or one left from before, was up before it typed;
+    # the submit returns it even once the delivered text hides its marker.
+    stash_seen: bool = False
 
 
 def _wait_for_typing_pause(
@@ -7885,10 +7889,11 @@ def _stash_pending_at_submit(pane: str, guard: _DraftGuard) -> bool:
     delivery's own.
 
     :param pane: The last capture before the Enter, showing the delivered text.
-    :param guard: This delivery's record of the draft it stashed.
-    :returns: ``True`` for this delivery's stash, or when the marker shows one.
+    :param guard: This delivery's record of the stash.
+    :returns: ``True`` for this delivery's stash, for one seen before it typed,
+        or when the marker shows one.
     """
-    return guard.stashed or _stash_marker_shown(pane)
+    return guard.stashed or guard.stash_seen or _stash_marker_shown(pane)
 
 
 def _stash_marker_shown(pane: str) -> bool:
@@ -8056,6 +8061,8 @@ def _set_draft_aside(
             "Claude Code's input box could not be read, so nothing was sent. "
             "Open the terminal and retry."
         )
+    if _stash_marker_state(pane) is True:
+        guard.stash_seen = True
     box = _composer_box(pane)
     if (
         not guard.stashed
@@ -8163,6 +8170,24 @@ def record_claude_keybindings_path(bridge_dir: Path, *, cwd: Path, env: Mapping[
         if not isinstance(config, dict) or not config:
             return
         config[_KEYBINDINGS_CONFIG_KEY] = str(_claude_keybindings_path(cwd, env))
+        _write_json_file(bridge_dir / _CONFIG_FILE, config)
+
+
+def forget_claude_keybindings_path(bridge_dir: Path) -> None:
+    """
+    Record that the session's launch could not establish where Claude Code reads keybindings.
+
+    No file then vouches for Ctrl+S (:func:`_ctrl_s_stashes`), so deliveries
+    hold a draft rather than stash it.
+
+    :param bridge_dir: Bridge directory path.
+    :returns: None.
+    """
+    with _bridge_metadata_write_lock(bridge_dir):
+        config = _read_json_file(bridge_dir / _CONFIG_FILE)
+        if not isinstance(config, dict) or _KEYBINDINGS_CONFIG_KEY not in config:
+            return
+        del config[_KEYBINDINGS_CONFIG_KEY]
         _write_json_file(bridge_dir / _CONFIG_FILE, config)
 
 

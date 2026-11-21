@@ -1214,6 +1214,45 @@ def test_a_launch_records_the_keybindings_its_wrapper_selects(
     assert bridge._ctrl_s_stashes(bridge_dir) is False
 
 
+def test_a_launch_through_an_env_form_not_modeled_records_no_keybindings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A wrapper whose config dir cannot be established vouches for no Ctrl+S binding.
+
+    ``env -v`` is a valid ``env`` form the launch does not model, so the
+    config dir it sets is unknown. The real one binds Ctrl+S to submit; the
+    stash key must not be authorized, and a record left by an earlier launch
+    is dropped.
+    """
+    from omnigent.harnesses.claude_native import bridge
+    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+    from omnigent.runner.native import orchestration
+
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    workspace = tmp_path / "workspace"
+    (workspace / "cfg").mkdir(parents=True)
+    (workspace / "cfg" / "keybindings.json").write_text(
+        json.dumps({"bindings": [{"context": "Chat", "bindings": {"ctrl+s": "chat:submit"}}]})
+    )
+    spec = TerminalEnvSpec(
+        command="env",
+        args=["-v", "CLAUDE_CONFIG_DIR=cfg", "claude"],
+        os_env=OSEnvSpec(type="caller_process", cwd=str(workspace)),
+    )
+    bridge_dir = bridge.prepare_bridge_dir("conv_abc", workspace=workspace)
+    bridge.record_claude_keybindings_path(
+        bridge_dir, cwd=workspace, env={"HOME": str(tmp_path / "home")}
+    )
+
+    orchestration._seed_claude_launch_config(bridge_dir, spec, None, added_dirs=())
+
+    assert bridge.read_claude_keybindings_path(bridge_dir) is None
+    assert bridge._ctrl_s_stashes(bridge_dir) is False
+
+
 def test_claude_terminal_launch_cwd_uses_terminal_os_env_resolution(tmp_path: Path) -> None:
     """
     Trust seeding resolves the pane cwd the way terminal creation does.
