@@ -19,7 +19,6 @@ import { resumeSandboxAvailability } from "@/shell/resumeSandboxAvailability";
 
 import type { ShellWaits } from "./shellWaits";
 import {
-  TERMINAL_TAB_WAIT_LIMIT_MS,
   type TerminalTabConnection,
   type TerminalTabInputs,
   terminalTabConnection,
@@ -159,19 +158,12 @@ export function useTerminalTabConnections(
   };
 
   // A wait starts when it's first seen, in the store, so a panel that replaces this one keeps it.
-  // The render that saw a wait change timed it from the old start, so it renders again even if
-  // the clock reads the same as at the last tick.
   useLayoutEffect(() => {
-    const changed = shellWaits.track(new Map(JSON.parse(waitingSignature) as [string, string][]));
+    shellWaits.track(new Map(JSON.parse(waitingSignature) as [string, string][]));
     setNow(Date.now());
-    if (changed) setRevision((revision) => revision + 1);
   }, [shellWaits, waitingSignature]);
 
-  // The clock ticks only until the last wait runs out; Try Again or Resume starts it again.
-  const anyWaiting = waiting.some(([key, wait]) => {
-    const since = shellWaits.since(key);
-    return since === undefined || now - since < TERMINAL_TAB_WAIT_LIMIT_MS[wait];
-  });
+  const anyWaiting = waiting.length > 0;
   useEffect(() => {
     if (!anyWaiting) return;
     const timer = window.setInterval(() => setNow(Date.now()), TICK_MS);

@@ -30,13 +30,6 @@ export type TerminalTabConnection =
 /** What a shell tab can be waiting for, each with its own limit. */
 export type TerminalTabWait = "shell_list" | "starting" | "reported_stage";
 
-/** How long a shell tab waits for each thing before it says why it stopped. */
-export const TERMINAL_TAB_WAIT_LIMIT_MS: Record<TerminalTabWait, number> = {
-  shell_list: SHELL_LIST_LIMIT_MS,
-  starting: SANDBOX_RESUME_TOTAL_LIMIT_MS,
-  reported_stage: SANDBOX_RESUME_TOTAL_LIMIT_MS,
-};
-
 export interface TerminalTabInputs {
   /** Whether the session's shell list has this shell: listed, missing for good, or unknown. */
   inventory: "live" | "gone" | "unknown";
@@ -85,8 +78,7 @@ export function terminalTabConnection(inputs: TerminalTabInputs): TerminalTabCon
   const { liveness, sandbox, waited } = inputs;
   if (inputs.inventory === "live") return { kind: "live" };
   if (sandbox.status !== "none") {
-    const limit = TERMINAL_TAB_WAIT_LIMIT_MS.reported_stage;
-    if (terminalTabWait(inputs) === "reported_stage" && waited >= limit) {
+    if (terminalTabWait(inputs) === "reported_stage" && waited >= SANDBOX_RESUME_TOTAL_LIMIT_MS) {
       return { kind: "sandbox", status: "asleep", failure: null };
     }
     return { kind: "sandbox", status: sandbox.status, failure: sandbox.failure };
@@ -95,7 +87,7 @@ export function terminalTabConnection(inputs: TerminalTabInputs): TerminalTabCon
   if (liveness === "local_stranded") return { kind: "local_stranded" };
   if (liveness === "runner_asleep") return { kind: "runner_asleep", failure: null };
   if (liveness === "starting") {
-    if (waited < TERMINAL_TAB_WAIT_LIMIT_MS.starting) return { kind: "connecting" };
+    if (waited < SANDBOX_RESUME_TOTAL_LIMIT_MS) return { kind: "connecting" };
     return inputs.hostResumable
       ? { kind: "sandbox", status: "failed", failure: WAKE_TIMED_OUT }
       : { kind: "runner_asleep", failure: START_TIMED_OUT };
@@ -103,7 +95,5 @@ export function terminalTabConnection(inputs: TerminalTabInputs): TerminalTabCon
   if (inputs.inventory === "gone") return { kind: "ended" };
   if (inputs.listFailed) return { kind: "unreachable" };
   // Before the list loads, or while a newly opened shell isn't in it yet.
-  return waited >= TERMINAL_TAB_WAIT_LIMIT_MS.shell_list
-    ? { kind: "unreachable" }
-    : { kind: "connecting" };
+  return waited >= SHELL_LIST_LIMIT_MS ? { kind: "unreachable" } : { kind: "connecting" };
 }

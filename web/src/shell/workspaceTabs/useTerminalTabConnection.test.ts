@@ -154,43 +154,6 @@ describe("Resume session from a shell tab", () => {
   });
 });
 
-describe("a shell tab's clock", () => {
-  it("stops ticking once the last wait has run out, and starts again on Try Again", async () => {
-    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
-    try {
-      const client = new QueryClient();
-      const shellWaits = createShellWaits();
-      let renders = 0;
-      const { result } = renderHook(
-        () => {
-          renders += 1;
-          return useTerminalTabConnections("s-tick", shellWaits, {
-            liveness: "online",
-            listFailed: false,
-            shells: [{ key: "terminal:t1", inventory: "unknown" }],
-          });
-        },
-        { wrapper: ({ children }) => createElement(QueryClientProvider, { client }, children) },
-      );
-      const shell = { key: "terminal:t1", inventory: "unknown" } as const;
-      await act(async () => vi.advanceTimersByTime(SHELL_LIST_LIMIT_MS + 1_000));
-      expect(result.current.connectionOf(shell).kind).toBe("unreachable");
-      const settled = renders;
-      await act(async () => vi.advanceTimersByTime(10_000));
-      expect(renders).toBe(settled);
-
-      act(() => result.current.tryAgain());
-      expect(result.current.connectionOf(shell).kind).toBe("connecting");
-      const restarted = renders;
-      await act(async () => vi.advanceTimersByTime(3_000));
-      expect(renders).toBeGreaterThan(restarted);
-      client.clear();
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-});
-
 describe("a shell tab whose wait changes", () => {
   it("keeps timing the new wait when the session comes online on a tick", async () => {
     vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });

@@ -29,16 +29,6 @@ describe("createShellWaits", () => {
     expect(waits.since("terminal:a")).toBe(9_000);
   });
 
-  it("reports whether a wait started, started over or ended", () => {
-    const waits = createShellWaits();
-    const listWait = new Map([["terminal:a", "shell_list"]]);
-    expect(waits.track(listWait)).toBe(true);
-    expect(waits.track(listWait)).toBe(false);
-    expect(waits.track(new Map([["terminal:a", "starting"]]))).toBe(true);
-    expect(waits.track(new Map())).toBe(true);
-    expect(waits.track(new Map())).toBe(false);
-  });
-
   it("restarts every current wait from now", () => {
     const waits = createShellWaits();
     waits.track(
