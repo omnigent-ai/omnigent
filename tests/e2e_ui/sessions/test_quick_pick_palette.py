@@ -8,7 +8,8 @@ that run against both palettes (``CommandPalette.quickPick.test.tsx``).
 
 On an open session, the QuickPick palette also previews themes as the user moves
 through Select theme…, hands focus to the session switcher and back, and runs
-the session's own actions.
+the session's own actions. ⌘↵ on another session's row lists that session's
+actions, which archive it without leaving the open one.
 """
 
 from __future__ import annotations
@@ -31,7 +32,9 @@ from tests._helpers.compat import (
     server_pythonpath,
 )
 from tests._helpers.live_server import isolated_local_server
+from tests._helpers.polling import poll_until
 from tests.e2e_ui.conftest import _BUILD_OUTPUT, _REPO_ROOT, fetch_with_retry
+from tests.e2e_ui.sessions._sidebar_helpers import patch_session, session_archived
 
 _PALETTE_INPUT = "command-palette-input"
 # "Go to Settings" navigates to /settings, which redirects to the general section.
@@ -205,3 +208,38 @@ def test_quick_pick_on_an_open_session(
     rename = page.get_by_role("dialog", name="Rename session")
     expect(rename).to_be_visible(timeout=10_000)
     expect(rename.get_by_role("textbox", name="Session name")).to_be_focused()
+
+
+def test_quick_pick_archives_another_session_from_its_row(
+    request: pytest.FixtureRequest, seeded_session_pair: tuple[str, str, str]
+) -> None:
+    """⌘↵ on another session's row lists its actions, and Archive archives that one."""
+    base_url, open_id, other_id = seeded_session_pair
+    patch_session(base_url, other_id, title="Kestrel notes")
+    page: Page = request.getfixturevalue("page")
+    _enable_quick_pick(page)
+    page.goto(f"{base_url}/c/{open_id}")
+    expect(page.get_by_placeholder("Send a message…")).to_be_visible(timeout=30_000)
+
+    page.keyboard.press("ControlOrMeta+k")
+    palette_input = page.get_by_role("combobox", name="Command palette")
+    expect(palette_input).to_be_focused(timeout=10_000)
+    palette_input.fill("kestrel")
+    dialog = page.get_by_role("dialog")
+    sessions = dialog.get_by_role("group", name="Sessions")
+    expect(sessions.get_by_role("option").first).to_contain_text("Kestrel notes")
+    page.keyboard.press("ControlOrMeta+Enter")
+    expect(dialog.locator('[data-slot="quick-pick-heading"]')).to_have_text(
+        "Actions for “Kestrel notes”", timeout=10_000
+    )
+    # The actions page names its field for what it lists.
+    actions_input = dialog.get_by_role("combobox", name="Session actions")
+    expect(actions_input).to_be_focused()
+
+    actions_input.fill("archive")
+    expect(dialog.get_by_role("option").first).to_contain_text("Archive")
+    page.keyboard.press("Enter")
+    poll_until(lambda: session_archived(base_url, other_id), timeout_s=15.0)
+    # The open session stays open; only the other one was archived.
+    expect(page).to_have_url(f"{base_url}/c/{open_id}")
+    assert not session_archived(base_url, open_id)
