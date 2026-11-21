@@ -82,6 +82,7 @@ import {
   OLDER_HISTORY_PAGE_ITEMS,
   openSessionStream,
   postEvent,
+  type PostEventResponse,
   rewindSession,
   type RewindAttachment,
   SIGN_IN_EXPIRED_CODE,
@@ -1872,6 +1873,23 @@ const sendChains = new Map<string | symbol, SendChain>();
  */
 const inFlightSends = new Map<string, boolean>();
 
+/**
+ * Sends awaiting their POST, by pending bubble, flagged `true` once a receipt took the
+ * bubble. Stop and other resets clear bubbles too, so only this flag shows delivery.
+ */
+const awaitedReceipts = new Map<string, boolean>();
+
+/** Flag each awaited send whose bubble a receipt took from *before*, leaving *after*. */
+function noteReceipts(
+  before: readonly PendingUserMessage[],
+  after: readonly PendingUserMessage[],
+): void {
+  const kept = new Set(after.map((p) => p.tempId));
+  for (const { tempId } of before) {
+    if (!kept.has(tempId) && awaitedReceipts.has(tempId)) awaitedReceipts.set(tempId, true);
+  }
+}
+
 // Sends with no conversation id yet (brand-new chat) serialize together: the
 // session is created inside the chained work, so they can't key by id. A
 // non-string key can never collide with a conversation id.
@@ -2109,6 +2127,21 @@ export const SESSION_READ_TIMEOUT_MS = 15_000;
 export const ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS = SESSION_READ_TIMEOUT_MS;
 // A send whose POST is still open after this says so on its bubble.
 export const SEND_STILL_SENDING_AFTER_MS = 10_000;
+// A send still pending after this fails, so its draft comes back for a retry.
+export const SEND_UNANSWERED_AFTER_MS = SEND_CHAIN_MAX_WAIT_MS;
+const SEND_UNANSWERED_TITLE = "Message not confirmed";
+const SEND_UNANSWERED_MESSAGE =
+  "The server didn't answer, so this may have reached the agent. If it doesn't appear, send it again.";
+
+/** A send given up on with its POST still open; `delivered` once a receipt took its bubble. */
+class UnansweredSendError extends Error {
+  readonly delivered: boolean;
+  constructor(delivered: boolean) {
+    super(SEND_UNANSWERED_MESSAGE);
+    this.name = "UnansweredSendError";
+    this.delivered = delivered;
+  }
+}
 // After the stream reconnects, `reconcileActiveSessionStatus` runs once
 // immediately — but a server that just restarted may not have reprocessed the
 // in-flight turn's completion yet, so that read can see a stale "running" and
@@ -2940,14 +2973,17 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         : pinnedId === null
           ? get().status === "streaming"
           : setterForState(pinnedId)?.status === "streaming";
+    // The latch this send holds, if any; a later send can take it over.
+    let latchedAt: number | null = null;
     if (!alreadyStreaming && !opensSideChat) {
+      latchedAt = Date.now();
       // Latch on the SAME entry as `status`, in one patch, so they can't
       // diverge — a new chat buffers both on root and `adoptPreSessionState`
       // moves them onto the entry together.
       pinnedSetter({
         status: "streaming",
         activeResponse: null,
-        sendLatchedAt: Date.now(),
+        sendLatchedAt: latchedAt,
         sendLatchSeenRunning: null,
       });
     }
@@ -3112,13 +3148,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       }
 
       if (initialDraft) {
+        latchedAt = Date.now();
         // From this point Interrupt belongs to the runner, not the local draft.
         setterFor(sessionId)((s) => ({
           pendingUserMessages: s.pendingUserMessages.map((p) =>
             p.tempId === tempId ? { ...p, initialDraft: undefined } : p,
           ),
           status: "streaming",
-          sendLatchedAt: Date.now(),
+          sendLatchedAt: latchedAt,
           sendLatchSeenRunning: null,
         }));
         initialDispatched = true;
@@ -3205,6 +3242,16 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       queryClient?.invalidateQueries({ queryKey: ["conversations"] });
     } catch (err) {
       if (initialDraft && !initialDispatched && !initialSendPending()) return;
+      // It was delivered, and the turn it started settles itself.
+      if (
+        err instanceof UnansweredSendError &&
+        (err.delivered || inFlightSends.get(stableId) === true)
+      ) {
+        endPlanStop();
+        queryClient?.invalidateQueries({ queryKey: ["conversations"] });
+        return;
+      }
+      const unanswered = err instanceof UnansweredSendError;
       const { message, code } = describeSendFailure(err);
       if (opts?.external && !posting) {
         // Never posted (held back, or its upload failed or was stopped): drop only this
@@ -3253,7 +3300,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       }
       const callerHandlesError = heldForHost || opts?.onError !== undefined;
       // An external send hears of the failure below, once it's known.
-      if (!heldForHost && !opts?.external) opts?.onError?.(message);
+      // `refused: false` tells the caller an unanswered send may still arrive.
+      if (!heldForHost && !opts?.external) {
+        if (unanswered) opts?.onError?.(message, false);
+        else opts?.onError?.(message);
+      }
       // Hand the failed message back to the composer so the user can retry it —
       // a failed send has no server-side record, so nothing else would restore
       // it. Keyed by the session it was meant for, so it lands in the right
@@ -3365,11 +3416,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         ? null
         : {
             ...makeClientErrorBlock(message, code),
+            ...(unanswered ? { title: SEND_UNANSWERED_TITLE } : {}),
             ...(serverRefused
               ? {}
               : { unansweredSend: { stableId, ...(sentText ? { text: sentText } : {}) } }),
           };
-      if (!alreadyStreaming) {
+      if (unanswered) {
+        settleUnansweredSend(failSet, callerHandlesError ? null : failureCard, latchedAt);
+      } else if (!alreadyStreaming) {
         if (failGet().activeResponse !== null) {
           // A response bubble already exists (the turn started, then failed)
           // — mark it failed so the error rides on that bubble.
@@ -3423,12 +3477,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       pinnedId === null
         ? get().status === "streaming"
         : setterForState(pinnedId)?.status === "streaming";
-    if (!alreadyStreaming) {
+    const latchedAt = alreadyStreaming ? null : Date.now();
+    if (latchedAt !== null) {
       // See `send`: latch and status on one entry, in one patch.
       pinnedSetter({
         status: "streaming",
         activeResponse: null,
-        sendLatchedAt: Date.now(),
+        sendLatchedAt: latchedAt,
         sendLatchSeenRunning: null,
       });
     }
@@ -3465,6 +3520,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
 
     // The session this command actually posts to, once resolved.
     let postedSessionId: string | null = null;
+    // Its POST, which can still answer after the command stops waiting on it.
+    let answer: Promise<PostEventResponse> | null = null;
 
     try {
       await waitForPrior();
@@ -3474,19 +3531,19 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // Same wire shape the REPL sends (repl/_repl.py). The server resolves
       // the skill, persists a visible receipt + hidden `<skill>` meta
       // message, and forwards the meta to the runner.
-      const postResult = await withStillSendingMark(sessionId, tempId, () =>
-        postEvent(sessionId, {
-          type: "slash_command",
-          data: {
-            kind: "skill",
-            name,
-            arguments: args,
-            ...(setterForState(sessionId)?.startupPending
-              ? { stable_id: randomUUID().replace(/-/g, "") }
-              : {}),
-          },
-        }),
-      );
+      const post = postEvent(sessionId, {
+        type: "slash_command",
+        data: {
+          kind: "skill",
+          name,
+          arguments: args,
+          ...(setterForState(sessionId)?.startupPending
+            ? { stable_id: randomUUID().replace(/-/g, "") }
+            : {}),
+        },
+      });
+      answer = post;
+      const postResult = await withStillSendingMark(sessionId, tempId, () => post);
       if (postResult.denied) {
         // Denied commands publish no receipt, so nothing will pop the
         // optimistic echo — roll it back here alongside the status settle.
@@ -3522,6 +3579,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       }
       queryClient?.invalidateQueries({ queryKey: ["conversations"] });
     } catch (err) {
+      if (err instanceof UnansweredSendError && err.delivered) {
+        endPlanStop();
+        queryClient?.invalidateQueries({ queryKey: ["conversations"] });
+        return;
+      }
       const message = err instanceof Error ? err.message : String(err);
       // Settle the conversation this command targeted, wherever the user is
       // now: its echo must roll back and its status must not stay "streaming"
@@ -3535,7 +3597,20 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       failSet((s) => ({
         pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
       }));
-      if (!alreadyStreaming) {
+      if (err instanceof UnansweredSendError) {
+        const card = { ...makeClientErrorBlock(message, ""), title: SEND_UNANSWERED_TITLE };
+        settleUnansweredSend(failSet, card, latchedAt);
+        // A late acceptance means the command went through, so withdraw its warning.
+        answer?.then(
+          (result) => {
+            if (result.denied) return;
+            endPlanStop();
+            failSet((s) => ({ blocks: s.blocks.filter((block) => block !== card) }));
+            queryClient?.invalidateQueries({ queryKey: ["conversations"] });
+          },
+          () => {},
+        );
+      } else if (!alreadyStreaming) {
         finalizeActive(failSet, "failed", message, null);
         failSet({ status: "idle" });
       } else {
@@ -4306,7 +4381,10 @@ export function sendableQueuedHead(
   return waitsForHost(queuedMessages, head.conversationId) ? null : head;
 }
 
-/** Await a send's POST, marking its pending bubble once the POST is slow to answer. */
+/**
+ * Await a send's POST, marking its pending bubble once slow; stop waiting after
+ * {@link SEND_UNANSWERED_AFTER_MS} with an {@link UnansweredSendError}, deferred while a turn runs.
+ */
 async function withStillSendingMark<T>(
   sessionId: string,
   tempId: string,
@@ -4319,12 +4397,55 @@ async function withStillSendingMark<T>(
       ),
     }));
   }, SEND_STILL_SENDING_AFTER_MS);
+  let unanswered: ReturnType<typeof setTimeout> | undefined;
+  awaitedReceipts.set(tempId, false);
   try {
     // Never cancelled: the server may already have accepted the send.
-    return await post();
+    return await Promise.race([
+      post(),
+      new Promise<never>((_resolve, reject) => {
+        const giveUp = (): void => {
+          const state = setterForState(sessionId);
+          const delivered = awaitedReceipts.get(tempId) === true;
+          const running =
+            cachedConversationStatus(sessionId) === "running" ||
+            state?.sessionStatus === "running" ||
+            state?.activeResponse?.state === "streaming";
+          if (!delivered && running) {
+            unanswered = setTimeout(giveUp, SEND_STILL_SENDING_AFTER_MS);
+          } else {
+            reject(new UnansweredSendError(delivered));
+          }
+        };
+        unanswered = setTimeout(giveUp, SEND_UNANSWERED_AFTER_MS);
+      }),
+    ]);
   } finally {
     clearTimeout(timer);
+    clearTimeout(unanswered);
+    awaitedReceipts.delete(tempId);
   }
+}
+
+/**
+ * Settle a send given up on unanswered: show its card, and end the latch it set at
+ * *latchedAt* unless a later send took it over or a turn started since, which its own
+ * events settle.
+ */
+function settleUnansweredSend(
+  set: Setter,
+  card: ErrorBlock | null,
+  latchedAt: number | null,
+): void {
+  set((s) => ({
+    ...(card === null ? {} : { blocks: [...s.blocks, card] }),
+    ...(latchedAt !== null &&
+    s.sendLatchedAt === latchedAt &&
+    s.sessionStatus !== "running" &&
+    s.activeResponse?.state !== "streaming"
+      ? { status: "idle" as const, sendLatchedAt: null, sendLatchSeenRunning: null }
+      : {}),
+  }));
 }
 
 /**
@@ -4370,7 +4491,7 @@ function queuedSendOptions(
     replyDraft: message.replyDraft,
     stableId,
     pinnedConversationId: message.conversationId,
-    onError: (error) => {
+    onError: (error, refused) => {
       setActive((s) => {
         if (s.queuedMessages.some((m) => m.queueId === message.queueId)) return {};
         // Keep failed sends in batch order, ahead of newly queued messages.
@@ -4389,9 +4510,25 @@ function queuedSendOptions(
           ],
         };
       });
-      setterFor(message.conversationId)((s) => ({
-        blocks: [...s.blocks, makeClientErrorBlock(error, "")],
-      }));
+      // A send that may still arrive names its stable id; its commit retracts this card and retry.
+      setterFor(message.conversationId)((s) => {
+        const text = s.isNativeTerminalSession
+          ? messageContentText([{ type: "input_text", text: message.text }])
+          : "";
+        const card = makeClientErrorBlock(error, "");
+        return {
+          blocks: [
+            ...s.blocks,
+            refused === false
+              ? {
+                  ...card,
+                  title: SEND_UNANSWERED_TITLE,
+                  unansweredSend: { stableId, ...(text ? { text } : {}) },
+                }
+              : card,
+          ],
+        };
+      });
     },
   };
 }
@@ -6580,6 +6717,7 @@ async function rehydrateWindowOnReconnect(
       // Same persisted-item evidence as the reconnect path: a rehydrated item
       // can be a send whose POST died in the gap.
       ...reconcileSendDraftWithSnapshot(s, freshItemIds, session),
+      ...withoutDeliveredQueuedRetries(s, s.blocks, currentBlocks),
       blocks:
         snapshotCompactionSpinners(blocks, s.activeResponse, statusPatch.activeResponse) ?? blocks,
       hasMoreHistory: fresh.hasMore,
@@ -6781,12 +6919,14 @@ async function reconcileOnReconnect(
       nextBlocks =
         at >= 0 ? [...kept.slice(0, at), ...unseen, ...kept.slice(at)] : [...kept, ...unseen];
     }
+    const undelivered = nextBlocks;
     nextBlocks = withoutDeliveredSendFailureCards(
       nextBlocks,
       snapshotItemIds,
       committedUserTextsOf(unseen),
       session,
     );
+    Object.assign(patch, withoutDeliveredQueuedRetries(s, undelivered, nextBlocks));
     // Recover elicitation state the dead socket swallowed: gap-fired
     // prompts, gap-resolved cards, and re-parked prompts whose card
     // was auto-cleared. Items can't resupply these (elicitations are
@@ -8604,6 +8744,34 @@ function withoutDeliveredSendFailureCards(
 }
 
 /**
+ * Drop the queued retries of sends whose unanswered cards `after` no longer holds: a
+ * commit retracted them, so those sends were delivered after all.
+ *
+ * @returns The queue patch, empty when no retry is dropped.
+ */
+function withoutDeliveredQueuedRetries(
+  s: ChatState,
+  before: AnyBlock[],
+  after: AnyBlock[],
+): Partial<ChatState> {
+  if (after === before) return {};
+  const unansweredIds = (blocks: AnyBlock[]): string[] =>
+    blocks.flatMap((b) =>
+      b.type === "error" && b.unansweredSend ? [b.unansweredSend.stableId] : [],
+    );
+  const kept = new Set(unansweredIds(after));
+  const delivered = new Set(unansweredIds(before).filter((id) => !kept.has(id)));
+  const queuedMessages = s.queuedMessages.filter(
+    (m) =>
+      !m.requiresRetry ||
+      m.conversationId !== s.conversationId ||
+      m.stableId === undefined ||
+      !delivered.has(m.stableId),
+  );
+  return queuedMessages.length === s.queuedMessages.length ? {} : { queuedMessages };
+}
+
+/**
  * Build the committed user-message content from a consumed event,
  * preserving optimistic file blocks the native transcript drops.
  *
@@ -8888,6 +9056,15 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
   ): void => {
     if (namedConversationId !== sourceConversationId) return;
     applyToConversation(patch);
+  };
+
+  /** {@link applyToConversation} for a receipt, flagging awaited sends whose bubbles it took. */
+  const applyReceipt = (patch: (s: ChatState) => Partial<ConversationState>): void => {
+    applyToConversation((s) => {
+      const next = patch(s);
+      if (next.pendingUserMessages) noteReceipts(s.pendingUserMessages, next.pendingUserMessages);
+      return next;
+    });
   };
 
   const settleLegacyPiCompact = (): void => {
@@ -9537,6 +9714,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         );
         return {
           ...retractDeliveredSendDraft(s, committedIds, "consumed"),
+          ...withoutDeliveredQueuedRetries(s, s.blocks, blocks),
           ...(blocks === s.blocks ? {} : { blocks }),
         };
       });
@@ -9566,7 +9744,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       //   3. No pending entry — render the event payload as a fresh
       //      committed bubble (TUI-typed message, marker, or another
       //      client).
-      applyToConversation((s) => {
+      applyReceipt((s) => {
         const eventContent = userContentFromEvent(event);
         const pendingHead = s.pendingUserMessages[0];
         // Bare envelopes typed in the terminal must not consume unrelated web input.
@@ -9711,7 +9889,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // until refresh. Pop the FIFO head here to ack the local
       // send; observing clients and drafts still held locally cannot
       // acknowledge a send, so they just render the block.
-      applyToConversation((s) => {
+      applyReceipt((s) => {
         if (s.pendingUserMessages.length === 0 || s.pendingUserMessages[0]?.initialDraft) return {};
         const [, ...rest] = s.pendingUserMessages;
         return { pendingUserMessages: rest };
@@ -9721,7 +9899,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // Shell inputs have no consumed receipt; remove only the matching sent bubble.
       const command = event.kind === "input" ? event.input : null;
       if (command === null) return;
-      applyToConversation((s) => {
+      applyReceipt((s) => {
         if (s.settledShellInputs.some((entry) => entry.itemId === event.itemId)) return {};
         const at = s.pendingUserMessages.findIndex((p) => isShellCommandBubble(p, command));
         const popped = s.pendingUserMessages[at];

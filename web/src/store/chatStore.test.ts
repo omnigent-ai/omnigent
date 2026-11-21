@@ -125,6 +125,7 @@ import {
   pumpStreamEvents,
   retryConversationLoad,
   SEND_STILL_SENDING_AFTER_MS,
+  SEND_UNANSWERED_AFTER_MS,
   SESSION_READ_TIMEOUT_MS,
   SSE_MAX_STREAM_AGE_MS,
   SSE_STALE_RECYCLE_MS,
@@ -7459,17 +7460,7 @@ describe("chatStore — delivered-but-unacked send", () => {
       conversationId: "conv_existing",
       abortController: new AbortController(),
     });
-    let answerPost: () => void = () => {};
-    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
-      if (String(input).endsWith("/v1/sessions/conv_existing/events") && init?.method === "POST") {
-        // Rejects on abort like a real fetch, so the settled send shows it was never cancelled.
-        return new Promise<Response>((resolve, reject) => {
-          init.signal?.addEventListener("abort", () => reject(init.signal?.reason));
-          answerPost = () => resolve(mockResponse({ queued: true, item_id: "ci_mock" }));
-        });
-      }
-      return defaultFetchHandler(input, init);
-    });
+    const { answerPost } = holdEventPosts();
     const pending = () => useChatStore.getState().pendingUserMessages;
 
     const sent = sendInput();
@@ -7482,6 +7473,394 @@ describe("chatStore — delivered-but-unacked send", () => {
     answerPost();
     await sent;
     expect(pending()).toEqual([expect.objectContaining({ posted: true })]);
+  });
+
+  /** Hold every events POST for conv_existing open until answered, recording its body. */
+  function holdEventPosts(): { answerPost: (body?: object) => void; postedBodies: unknown[] } {
+    const postedBodies: unknown[] = [];
+    let answer: (body: object) => void = () => {};
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/v1/sessions/conv_existing/events") && init?.method === "POST") {
+        postedBodies.push(JSON.parse(String(init.body)));
+        // Rejects on abort like a real fetch, so the settled send shows it was never cancelled.
+        return new Promise<Response>((resolve, reject) => {
+          init.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+          answer = (body) => resolve(mockResponse(body));
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    return {
+      answerPost: (body = { queued: true, item_id: "ci_mock" }) => answer(body),
+      postedBodies,
+    };
+  }
+
+  it.each([
+    ["accepts", { queued: true, item_id: "ci_mock" }, true],
+    ["denies", { queued: false, denied: true }, false],
+  ])(
+    "stops waiting on a slash command whose POST never answers until it %s the command late",
+    async (_verb, lateAnswer, withdrawn) => {
+      vi.useFakeTimers();
+      onTestFinished(() => {
+        vi.useRealTimers();
+        usePlanStops.setState({ requests: {}, settledStops: {} });
+      });
+      useChatStore.setState({
+        conversationId: "conv_existing",
+        abortController: new AbortController(),
+      });
+      await trackPlanStop("conv_existing", async () => ({}));
+      const { answerPost } = holdEventPosts();
+
+      const sent = useChatStore.getState().sendSlashCommand("grill-me", "review this", "agent_xyz");
+      await vi.advanceTimersByTimeAsync(SEND_UNANSWERED_AFTER_MS - 1);
+      expect(useChatStore.getState().pendingUserMessages).toEqual([
+        expect.objectContaining({ stillSending: true }),
+      ]);
+      await vi.advanceTimersByTimeAsync(1);
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+      expect(useChatStore.getState().status).toBe("idle");
+      expect(errorCards()).toEqual([
+        expect.objectContaining({
+          title: "Message not confirmed",
+          message: expect.stringContaining("The server didn't answer"),
+        }),
+      ]);
+      await sent;
+      expect(usePlanStops.getState().requests.conv_existing).toMatchObject({ sent: true });
+
+      answerPost(lateAnswer);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(useChatStore.getState().status).toBe("idle");
+      expect(errorCards()).toHaveLength(withdrawn ? 0 : 1);
+      expect(usePlanStops.getState().requests.conv_existing === undefined).toBe(withdrawn);
+    },
+  );
+
+  it.each([
+    [
+      "message",
+      () => ({
+        sent: useChatStore.getState().send("summarize the deploy status", "agent_xyz"),
+        expectReported: () => {
+          expect(useChatStore.getState().failedSendDraft).toMatchObject({
+            text: "summarize the deploy status",
+          });
+          expect(errorCards()).toEqual([
+            expect.objectContaining({ title: "Message not confirmed" }),
+          ]);
+        },
+      }),
+    ],
+    [
+      "queued message",
+      () => {
+        const onError = vi.fn();
+        return {
+          sent: useChatStore
+            .getState()
+            .send("summarize the deploy status", "agent_xyz", undefined, { onError }),
+          expectReported: () =>
+            expect(onError).toHaveBeenCalledWith(
+              expect.stringContaining("The server didn't answer"),
+              false,
+            ),
+        };
+      },
+    ],
+    [
+      "slash command",
+      () => ({
+        sent: useChatStore.getState().sendSlashCommand("grill-me", "review this", "agent_xyz"),
+        expectReported: () =>
+          expect(errorCards()).toEqual([
+            expect.objectContaining({ title: "Message not confirmed" }),
+          ]),
+      }),
+    ],
+  ])("still reports an unanswered %s after Stop clears its bubble", async (_kind, start) => {
+    vi.useFakeTimers();
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+    });
+    holdEventPosts();
+
+    const { sent, expectReported } = start();
+    await vi.advanceTimersByTimeAsync(SEND_STILL_SENDING_AFTER_MS);
+    useChatStore.getState().stop();
+    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    await vi.advanceTimersByTimeAsync(SEND_UNANSWERED_AFTER_MS);
+
+    expectReported();
+    await sent;
+  });
+
+  it("leaves another turn's response and background work alone when it gives up", async () => {
+    vi.useFakeTimers();
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+    });
+    holdEventPosts();
+
+    const sent = useChatStore.getState().send("summarize the deploy status", "agent_xyz");
+    await vi.advanceTimersByTimeAsync(SEND_STILL_SENDING_AFTER_MS);
+    useChatStore.setState({
+      activeResponse: { responseId: "resp_other", state: "completed", error: null },
+      backgroundTaskCount: 1,
+    });
+    await vi.advanceTimersByTimeAsync(SEND_UNANSWERED_AFTER_MS);
+
+    const state = useChatStore.getState();
+    expect(state.activeResponse).toMatchObject({ responseId: "resp_other", state: "completed" });
+    expect(state.backgroundTaskCount).toBe(1);
+    expect(state.status).toBe("idle");
+    expect(state.failedSendDraft).toMatchObject({ text: "summarize the deploy status" });
+    expect(errorCards()).toEqual([expect.objectContaining({ title: "Message not confirmed" })]);
+    await sent;
+  });
+
+  it("waits out a turn its session shows running before giving up", async () => {
+    vi.useFakeTimers();
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+    });
+    holdEventPosts();
+
+    const sent = useChatStore.getState().send("summarize the deploy status", "agent_xyz");
+    await vi.advanceTimersByTimeAsync(SEND_STILL_SENDING_AFTER_MS);
+    useChatStore.setState({ sessionStatus: "running" });
+    await vi.advanceTimersByTimeAsync(SEND_UNANSWERED_AFTER_MS);
+    expect(useChatStore.getState().pendingUserMessages).toHaveLength(1);
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+
+    useChatStore.setState({ sessionStatus: "idle" });
+    await vi.advanceTimersByTimeAsync(SEND_STILL_SENDING_AFTER_MS);
+    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    expect(useChatStore.getState().failedSendDraft).toMatchObject({
+      text: "summarize the deploy status",
+    });
+    await sent;
+  });
+
+  it.each([
+    ["under its stable id", false],
+    ["as a native terminal's mirror", true],
+  ])(
+    "drops a queued message's retry once its unanswered send commits %s",
+    async (_kind, native) => {
+      vi.useFakeTimers();
+      onTestFinished(() => {
+        vi.useRealTimers();
+      });
+      useChatStore.setState({
+        conversationId: "conv_existing",
+        abortController: new AbortController(),
+        boundAgentId: "agent_xyz",
+        isNativeTerminalSession: native,
+        queuedMessages: [
+          { queueId: "q_1", text: "first queued", conversationId: "conv_existing" },
+          { queueId: "q_2", text: "second queued", conversationId: "conv_existing" },
+        ],
+      });
+      const { postedBodies } = holdEventPosts();
+
+      useChatStore.getState().maybeFlushQueuedHead();
+      await vi.advanceTimersByTimeAsync(SEND_UNANSWERED_AFTER_MS);
+      const stableId = (postedBodies[0] as { data: { stable_id: string } }).data.stable_id;
+      expect(useChatStore.getState().queuedMessages).toEqual([
+        expect.objectContaining({ queueId: "q_1", stableId, requiresRetry: true }),
+        expect.objectContaining({ queueId: "q_2" }),
+      ]);
+      expect(errorCards()).toEqual([
+        expect.objectContaining({
+          title: "Message not confirmed",
+          unansweredSend: native ? { stableId, text: "first queued" } : { stableId },
+        }),
+      ]);
+
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: native ? "item_mirror" : stableId,
+        itemType: "message",
+        data: { role: "user", content: [{ type: "input_text", text: "first queued" }] },
+      });
+      expect(useChatStore.getState().queuedMessages).toEqual([
+        expect.objectContaining({ queueId: "q_2", text: "second queued" }),
+      ]);
+      expect(useChatStore.getState().queuedMessages[0]!.requiresRetry).toBeUndefined();
+      expect(errorCards()).toEqual([]);
+    },
+  );
+
+  it("hands an unanswered message back for a retry until it commits", async () => {
+    vi.useFakeTimers();
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+    });
+    holdEventPosts();
+
+    const sent = useChatStore.getState().send("summarize the deploy status", "agent_xyz");
+    await vi.advanceTimersByTimeAsync(SEND_UNANSWERED_AFTER_MS - 1);
+    expect(useChatStore.getState().pendingUserMessages).toEqual([
+      expect.objectContaining({ stillSending: true }),
+    ]);
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    expect(useChatStore.getState().status).toBe("idle");
+    const draft = useChatStore.getState().failedSendDraft;
+    expect(draft).toMatchObject({ text: "summarize the deploy status", serverRefused: false });
+    const stableId = draft?.stableId;
+    expect(stableId).toBeTruthy();
+    expect(errorCards()).toEqual([
+      expect.objectContaining({
+        title: "Message not confirmed",
+        message: expect.stringContaining("The server didn't answer"),
+        unansweredSend: { stableId },
+      }),
+    ]);
+
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemId: stableId!,
+      itemType: "message",
+      data: {
+        role: "user",
+        content: [{ type: "input_text", text: "summarize the deploy status" }],
+      },
+    });
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+    expect(errorCards()).toEqual([]);
+    await sent;
+  });
+
+  it.each([
+    [
+      "message",
+      () => useChatStore.getState().send("summarize the deploy status", "agent_xyz"),
+      (postedBodies: unknown[]) =>
+        handleSessionEvent({
+          type: "session_input_consumed",
+          itemId: (postedBodies[0] as { data: { stable_id: string } }).data.stable_id,
+          itemType: "message",
+          data: {
+            role: "user",
+            content: [{ type: "input_text", text: "summarize the deploy status" }],
+          },
+        }),
+    ],
+    [
+      "mirrored native message",
+      () => useChatStore.getState().send("summarize the deploy status", "agent_xyz"),
+      () =>
+        handleSessionEvent({
+          type: "session_input_consumed",
+          itemId: "item_native_mirror",
+          clearedPendingId: "pending_native_mirror",
+          itemType: "message",
+          data: {
+            role: "user",
+            content: [{ type: "input_text", text: "summarize the deploy status" }],
+          },
+        }),
+    ],
+    [
+      "slash command",
+      () => useChatStore.getState().sendSlashCommand("grill-me", "review this", "agent_xyz"),
+      () =>
+        handleSessionEvent({
+          type: "slash_command",
+          kind: "skill",
+          name: "grill-me",
+          arguments: "review this",
+          output: null,
+          agentName: "claude-native-ui",
+          itemId: "item_slash_committed",
+          responseId: "resp_a",
+        }),
+    ],
+  ])(
+    "settles a committed %s without touching its turn when its POST never answers",
+    async (_kind, sendInput, commit) => {
+      vi.useFakeTimers();
+      onTestFinished(() => {
+        vi.useRealTimers();
+        usePlanStops.setState({ requests: {}, settledStops: {} });
+      });
+      useChatStore.setState({
+        conversationId: "conv_existing",
+        abortController: new AbortController(),
+      });
+      await trackPlanStop("conv_existing", async () => ({}));
+      const { postedBodies } = holdEventPosts();
+
+      const sent = sendInput();
+      await vi.advanceTimersByTimeAsync(SEND_STILL_SENDING_AFTER_MS);
+      commit(postedBodies);
+      useChatStore.setState({
+        sessionStatus: "running",
+        activeResponse: { responseId: "resp_a", state: "streaming", error: null },
+      });
+      let settled = false;
+      void sent.then(() => {
+        settled = true;
+      });
+      await vi.advanceTimersByTimeAsync(SEND_UNANSWERED_AFTER_MS);
+
+      expect(settled).toBe(true);
+      const state = useChatStore.getState();
+      expect(state.status).toBe("streaming");
+      expect(state.activeResponse?.state).toBe("streaming");
+      expect(state.failedSendDraft).toBeNull();
+      expect(errorCards()).toEqual([]);
+      expect(usePlanStops.getState().requests.conv_existing).toBeUndefined();
+      await sent;
+    },
+  );
+
+  it("tells the caller an unanswered send may still arrive after its conversation is released", async () => {
+    vi.useFakeTimers();
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+    });
+    holdEventPosts();
+    const onError = vi.fn();
+
+    const sent = useChatStore
+      .getState()
+      .send("summarize the deploy status", "agent_xyz", undefined, { onError });
+    await vi.advanceTimersByTimeAsync(SEND_STILL_SENDING_AFTER_MS);
+    releaseConversation("conv_existing");
+    await vi.advanceTimersByTimeAsync(SEND_UNANSWERED_AFTER_MS);
+
+    expect(onError).toHaveBeenCalledWith(
+      expect.stringContaining("The server didn't answer"),
+      false,
+    );
+    await sent;
   });
 
   it("retracts the failed-send draft and card when its message commits under the send's stable id", async () => {
@@ -16528,6 +16907,70 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
+  it.each([
+    ["message", undefined],
+    ["queued message", vi.fn()],
+  ])(
+    "hands back an unanswered %s the reconnect snapshot records the runner refusing",
+    async (_kind, onError) => {
+      const id = "conv_unanswered_rejected";
+      const before = userMessage(`${id}_pre`, "before the gap");
+      seedSession(id, [before]);
+      const sinks = routeStreamOpens();
+      const routed = fetchMock.getMockImplementation()!;
+      const postedBodies: { data: { stable_id: string } }[] = [];
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).endsWith(`/v1/sessions/${id}/events`) && init?.method === "POST") {
+          postedBodies.push(JSON.parse(String(init.body)));
+          return new Promise<Response>(() => {});
+        }
+        return routed(input, init);
+      });
+      const controller = new AbortController();
+      useChatStore.setState({
+        conversationId: id,
+        abortController: controller,
+        blocks: itemsToBlocks([before]),
+      });
+      const loop = startStreamPump(id, controller, setState, getState);
+      await drainAsync();
+      expect(sinks).toHaveLength(1);
+
+      const sent = useChatStore
+        .getState()
+        .send("resend me", "agent_xyz", undefined, onError ? { onError } : undefined);
+      await drainAsync();
+      const stableId = postedBodies[0]!.data.stable_id;
+
+      // The live rejection is lost with the socket; the snapshot has the persisted item.
+      serveRunnerRejectedSnapshot(id, stableId);
+      seedSessionItems(id, [before, { ...userMessage(`${id}_gap`, "resend me"), id: stableId }]);
+      sinks[0]!.error();
+      await drainAsync();
+      expect(sinks).toHaveLength(2);
+      expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+
+      await vi.advanceTimersByTimeAsync(SEND_UNANSWERED_AFTER_MS);
+      await drainAsync();
+      await sent;
+      if (onError) {
+        expect(onError).toHaveBeenCalledWith(expect.any(String), false);
+      } else {
+        expect(useChatStore.getState().failedSendDraft).toMatchObject({
+          stableId,
+          text: "resend me",
+          serverRefused: true,
+        });
+      }
+
+      const last = sinks.at(-1)!;
+      last.push("data: [DONE]\n\n");
+      last.close();
+      await drainAsync(2);
+      await loop;
+    },
+  );
+
   it("keeps an attributed rejection in force after the session has moved on", async () => {
     const stableId = "e".repeat(32);
     // Another client's send has since taken the session to `running`; the
@@ -18134,6 +18577,13 @@ describe("chatStore — startStreamPump reconnect loop", () => {
         ],
         hasMoreHistory: true,
         oldestItemId: windowItems[0]!.id,
+        queuedMessages: ["a", "b"].map((digit) => ({
+          queueId: `q_${digit}`,
+          text: "queued",
+          conversationId: id,
+          stableId: digit.repeat(32),
+          requiresRetry: true,
+        })),
       });
 
       const loop = startStreamPump(id, controller, setState, getState);
@@ -18155,6 +18605,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
         .getState()
         .blocks.filter((block): block is ErrorBlock => block.type === "error");
       expect(cards.map((card) => card.unansweredSend?.text)).toEqual(["pre 25"]);
+      expect(useChatStore.getState().queuedMessages.map((m) => m.queueId)).toEqual(["q_b"]);
 
       const last = sinks[1]!;
       last.push("data: [DONE]\n\n");
@@ -22397,11 +22848,27 @@ describe("chatStore — client-side message queue", () => {
     try {
       const delivered = await wedgeOnHungSend("running");
 
-      await vi.advanceTimersByTimeAsync(300_000);
+      // Within the cache's 5-minute gcTime, which would drop this unobserved row.
+      await vi.advanceTimersByTimeAsync(240_000);
       useChatStore.getState().maybeFlushQueuedHead();
       await vi.advanceTimersByTimeAsync(1);
       expect(delivered).toEqual(["hung"]);
       expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["queued"]);
+
+      // Once the row stops showing a turn, the queued send takes over the stranded latch
+      // before the unanswered send fails and hands its text back.
+      seedConversationsCache([conv("conv_abc", "idle")]);
+      useChatStore.getState().maybeFlushQueuedHead();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(delivered).toEqual(["hung", "queued"]);
+      const queuedLatch = useChatStore.getState().sendLatchedAt;
+      expect(queuedLatch).not.toBeNull();
+      await vi.advanceTimersByTimeAsync(SEND_STILL_SENDING_AFTER_MS);
+      expect(useChatStore.getState().failedSendDraft).toMatchObject({ text: "hung" });
+      expect(useChatStore.getState()).toMatchObject({
+        status: "streaming",
+        sendLatchedAt: queuedLatch,
+      });
     } finally {
       vi.useRealTimers();
     }
