@@ -2440,6 +2440,11 @@ class SessionResponse(BaseModel):
         family instead of inferring it from the model string (which
         is wrong when the agent declares no model). ``None`` when
         the agent cannot be looked up.
+    :param permission_mode: The permission mode the session is in, in its
+        harness's vocabulary, e.g. ``"auto"`` or ``"approve-for-me"`` (the
+        names ``sys_session_create`` takes). Follows a switch made while it
+        runs. ``None`` when the harness has no permission modes or the mode
+        cannot be told.
     :param model_override: Per-session LLM model override,
         e.g. ``"claude-opus-4-7"``. ``None`` means no override is
         active (the agent's ``llm_model`` applies). Set via
@@ -2633,6 +2638,7 @@ class SessionResponse(BaseModel):
     root_conversation_id: str | None = None
     llm_model: str | None = None
     harness: str | None = None
+    permission_mode: str | None = None
     model_override: str | None = None
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None

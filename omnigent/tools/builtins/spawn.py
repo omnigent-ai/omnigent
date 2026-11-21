@@ -706,7 +706,7 @@ class SysSessionGetInfoTool(Tool):
     model), not just the caller's spawn subtree. Reports lifecycle
     status, title, agent binding (id + name), runner binding and live
     connectivity, host and its reported harness readiness, reasoning effort,
-    effective model, parent
+    effective model, current permission mode, parent
     linkage, workspace / git branch, project, persisted last-activity time, and
     the count of outstanding approval prompts. Comparing
     ``last_activity_at`` across polls distinguishes a running session that
@@ -736,6 +736,9 @@ class SysSessionGetInfoTool(Tool):
             "Return a session's metadata: lifecycle status, title, "
             "agent binding (id/name), runner binding + connectivity, "
             "host + configured harness readiness, reasoning effort, model, "
+            "permission_mode (the mode it is in now, named as "
+            "sys_session_create's permission_mode names it; null when its "
+            "harness has no permission modes or the mode is unknown), "
             "parent session, workspace, project_id, project_name, "
             "persisted last-activity time, and outstanding approval "
             "prompts. Global read — any "
