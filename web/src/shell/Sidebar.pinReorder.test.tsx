@@ -67,7 +67,7 @@ function stubRowRects() {
   });
 }
 
-// The Pinned zone reaches 12px below its last pin, over the dragged row (never a target).
+// Pinned zone extends 12px below the last pin, over the dragged row (never a target).
 function stubPinZoneRect(pinnedRows: number) {
   const rowRect = vi.mocked(Element.prototype.getBoundingClientRect).getMockImplementation()!;
   vi.mocked(Element.prototype.getBoundingClientRect).mockImplementation(function (this: Element) {
@@ -285,11 +285,11 @@ describe("dropping an unpinned session onto a pinned row", () => {
     stubPinZoneRect(2);
     renderSidebar();
 
-    await dropOnto("conv_c", "conv_b", { expectTarget: false, offsetY: ROW_HEIGHT / 2 + 6 });
+    await dropOnto("conv_d", "conv_b", { expectTarget: false, offsetY: ROW_HEIGHT / 2 + 6 });
 
     await waitFor(() =>
       expect(mocks.pinFn).toHaveBeenCalledExactlyOnceWith({
-        id: "conv_c",
+        id: "conv_d",
         pinned: true,
         pinnedAt: last + 1,
       }),
@@ -305,11 +305,11 @@ describe("dropping an unpinned session onto a pinned row", () => {
     stubPinZoneRect(3);
     renderSidebar();
 
-    await dropOnto("conv_c", "conv_member", { expectTarget: false, offsetY: ROW_HEIGHT / 2 + 6 });
+    await dropOnto("conv_d", "conv_member", { expectTarget: false, offsetY: ROW_HEIGHT / 2 + 6 });
 
     await waitFor(() =>
       expect(mocks.pinFn).toHaveBeenCalledExactlyOnceWith({
-        id: "conv_c",
+        id: "conv_d",
         pinned: true,
         pinnedAt: 3001,
       }),
@@ -498,7 +498,7 @@ describe("Custom session order", () => {
     );
   const saved = () => JSON.parse(localStorage.getItem("omnigent:sidebar-view") ?? "{}");
   const link = (id: string) => screen.getByRole("link", { name: id });
-  const renderGrouping = () => renderSidebar({ features: { sidebar_grouping_ui: true } });
+  const renderLoaded = () => renderSidebar({ features: {} });
   const listRows = (...extra: ReturnType<typeof conv>[]) =>
     vi
       .mocked(useConversations)
@@ -544,7 +544,7 @@ describe("Custom session order", () => {
           custom: { base: "created", since: 100, ids: ["conv_c", "conv_peer", "conv_d"] },
         }),
       );
-      renderGrouping();
+      renderLoaded();
       if (collapsed)
         fireEvent.click(screen.getByRole("button", { name: "Collapse session family" }));
       const familyRows = collapsed ? ["conv_c"] : ["conv_c", "conv_peer"];
@@ -571,7 +571,7 @@ describe("Custom session order", () => {
       expect(saved().custom.ids).toEqual(["conv_d", "conv_c"]);
 
       cleanup();
-      renderGrouping();
+      renderLoaded();
       expect(rowOrder()).toEqual(["conv_d", "conv_c", "conv_peer"]);
       fireEvent.contextMenu(link("conv_peer"));
       expect(screen.queryByTestId("move-session-up")).toBeNull();
@@ -580,7 +580,7 @@ describe("Custom session order", () => {
   );
 
   it("starts from the order on screen on drop, not hover, and never follows the row's link", async () => {
-    renderGrouping();
+    renderLoaded();
     expect(rowOrder()).toEqual(["conv_c", "conv_d", "conv_e"]);
 
     await dropOnto("conv_e", "conv_c", {
@@ -610,7 +610,7 @@ describe("Custom session order", () => {
     );
     localStorage.setItem("omnigent:session-filter", "all");
     listRows(conv("conv_f", { created_at: 0, updated_at: 0, owner: "other@example.com" }));
-    renderGrouping();
+    renderLoaded();
     expect(rowOrder()).toEqual(["conv_d", "conv_c", "conv_e", "conv_f"]);
     // A shared row holds a place in the order but can't be moved itself.
     fireEvent.contextMenu(link("conv_f"));
@@ -647,7 +647,7 @@ describe("Custom session order", () => {
   ])("moves a session down and up from its %s", (_menu, openMenu) => {
     // A just-created row has no server id yet, so it is never a Move target.
     listRows(conv("temp:new", { created_at: 99, updated_at: 99, provisional: true }));
-    renderGrouping();
+    renderLoaded();
 
     openMenu("conv_c");
     expect(screen.getByTestId("move-session-up")).toHaveAttribute("aria-disabled", "true");

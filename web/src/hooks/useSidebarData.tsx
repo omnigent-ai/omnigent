@@ -9,8 +9,6 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isFeatureEnabled } from "@/lib/capabilities";
 import {
   DEFAULT_SIDEBAR_VIEW,
   readSidebarViewPreferences,
@@ -87,11 +85,7 @@ function overlayPinnedRows<Data extends { conversations: Conversation[] }>(
 
 function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
   const client = useQueryClient();
-  const serverInfo = useServerInfo();
-  const [storedView, setView] = useState(readSidebarViewPreferences);
-  const view = isFeatureEnabled(serverInfo, "sidebar_grouping_ui")
-    ? storedView
-    : DEFAULT_SIDEBAR_VIEW;
+  const [view, setView] = useState(readSidebarViewPreferences);
   const sortBy: SessionSortBy = sidebarSortBy(sidebarBaseOrdering(view));
   const customOrder = useMemo(
     () => (view.ordering === "custom" && view.custom ? customSortOrder(view.custom) : null),
@@ -99,9 +93,9 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
   );
   const updateView = useCallback(
     (patch: Partial<SidebarViewPreferences>) => {
-      const next = { ...storedView, ...patch };
+      const next = { ...view, ...patch };
       writeSidebarViewPreferences(next);
-      if (sidebarBaseOrdering(next) !== sidebarBaseOrdering(storedView)) {
+      if (sidebarBaseOrdering(next) !== sidebarBaseOrdering(view)) {
         const nextSortBy = sidebarSortBy(sidebarBaseOrdering(next));
         // Clear the destination snapshots before observers switch to the selected order.
         for (const queryKey of [["conversations", "", false, null], ["project-sessions"]]) {
@@ -118,7 +112,7 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
       }
       setView(next);
     },
-    [storedView, client],
+    [view, client],
   );
   const [selectedView, registerView] = useState<SessionFilter | null>(null);
   const viewNeedsShared = selectedView === "all" || selectedView === "shared";

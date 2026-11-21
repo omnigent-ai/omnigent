@@ -55,7 +55,6 @@ let client: QueryClient;
 let config: SidebarConfig;
 let view: SessionFilter;
 let mounted: boolean;
-let groupingUi = false;
 function View() {
   useSidebarView(view);
   return null;
@@ -63,9 +62,7 @@ function View() {
 function wrapper({ children }: { children: ReactNode }) {
   return (
     <QueryClientProvider client={client}>
-      <CapabilitiesProvider
-        info={{ ...FALLBACK_SERVER_INFO, features: { sidebar_grouping_ui: groupingUi } }}
-      >
+      <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
         <SidebarDataProvider config={config}>
           {mounted && <View />}
           {children}
@@ -84,7 +81,6 @@ const response = (rows: Conversation[], more = false) => ({
   json: async () => sessionRowsPage(rows, more),
 });
 beforeEach(() => {
-  groupingUi = false;
   localStorage.clear();
   identity.viewerId = null;
   identity.resolution = Promise.resolve(null);
@@ -489,19 +485,10 @@ it.each([true, false])(
   },
 );
 
-it("gates Created ordering and separates its pagination from Updated caches", async () => {
+it("orders by Created and separates its pagination from Updated caches", async () => {
   localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ ordering: "created" }));
   view = "all";
-  const { result, rerender } = renderHook(useSidebarData, { wrapper });
-  await waitFor(() => expect(result.current.shared.isSuccess).toBe(true));
-  expect(
-    [...listCalls("mine"), ...listCalls("shared")].every(
-      ([url]) => params(url).get("sort_by") === "updated_at",
-    ),
-  ).toBe(true);
-  groupingUi = true;
-  fetchMock.mockClear();
-  rerender();
+  const { result } = renderHook(useSidebarData, { wrapper });
   await waitFor(() => expect(result.current.shared.isSuccess).toBe(true));
   expect(result.current.sortBy).toBe("created_at");
   expect(listCalls("mine")).toHaveLength(1);
@@ -521,7 +508,8 @@ it("gates Created ordering and separates its pagination from Updated caches", as
   expect(
     client.getQueryData(["conversations", "", false, null, "mine", "created_at"]),
   ).toBeDefined();
-  expect(client.getQueryData(["conversations", "", false, null, "mine"])).toBeDefined();
+  // Created pages never land in the Updated cache.
+  expect(client.getQueryData(["conversations", "", false, null, "mine"])).toBeUndefined();
   await act(async () => {
     result.current.updateView({ ordering: "updated" });
   });
@@ -532,7 +520,6 @@ it("gates Created ordering and separates its pagination from Updated caches", as
 it.each([false, true])(
   "clears destination sort snapshots while folders, pins and Archived reload (archived folder: %s)",
   async (archivedFolder) => {
-    groupingUi = true;
     view = "all";
     client.setQueryDefaults(["project-sessions"], { staleTime: 30_000 });
     let updatedAt = 100;
@@ -639,7 +626,6 @@ it.each([false, true])(
 );
 
 it("keeps Custom on its base's caches and saves cutoff-second arrivals through storage failures", async () => {
-  groupingUi = true;
   const { result } = renderHook(useSidebarData, { wrapper });
   await waitFor(() => expect(result.current.mine.isSuccess).toBe(true));
   fetchMock.mockClear();

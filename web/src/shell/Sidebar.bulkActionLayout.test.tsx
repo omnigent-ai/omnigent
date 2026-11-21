@@ -1,4 +1,4 @@
-import { renderSidebar } from "@/test/sidebarTestHelpers";
+import { openDisplaySubmenu, renderSidebar } from "@/test/sidebarTestHelpers";
 import { conversationPage } from "@/test/sidebarMockHelpers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -115,7 +115,7 @@ describe("bulk-action bar layout", () => {
   });
 
   it.each([
-    ["session-filter", "Filter sessions"],
+    ["session-filter", "Group, sort, and filter sessions"],
     ["toggle-selection-mode", "Exit selection"],
     ["bulk-mark-unread", "Mark as unread"],
     ["bulk-archive", "Archive"],
@@ -152,8 +152,11 @@ describe("bulk-action bar layout", () => {
   const menuTooltipCases: [string, string, (menu: HTMLElement) => void][] = [
     [
       "session-filter",
-      "Filter sessions",
-      () => fireEvent.click(screen.getByTestId("session-filter-all")),
+      "Group, sort, and filter sessions",
+      () => {
+        openDisplaySubmenu();
+        fireEvent.click(screen.getByTestId("session-filter-all"));
+      },
     ],
     [
       "bulk-move-to-project",

@@ -1,4 +1,5 @@
 import { conversationPage } from "@/test/sidebarMockHelpers";
+import { selectSessionFilter } from "@/test/sidebarTestHelpers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
@@ -167,8 +168,7 @@ describe("archive flow", () => {
     mockConversations([{ ...CONV, archived: true }]);
     renderSidebar();
     // Radix menu opens on pointerdown; pick the Archived filter.
-    fireEvent.pointerDown(screen.getByTestId("session-filter"), { button: 0 });
-    fireEvent.click(screen.getByTestId("session-filter-archived"));
+    selectSessionFilter("archived");
 
     fireEvent.click(screen.getByTestId("quick-archive-conversation"));
 
