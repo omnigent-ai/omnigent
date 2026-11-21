@@ -1530,6 +1530,14 @@ async def test_created_session_launches_in_the_requested_permission_mode(
     assert worker.terminal_launch_args == expected
 
 
+@pytest.fixture
+def creator_client(auth_client, monkeypatch):
+    """Alice's client with late runner binds stubbed; ``_codex_creator`` binds a runner."""
+    auth_client.headers["X-Forwarded-Email"] = "alice"
+    _stub_late_runner_bind(monkeypatch)
+    return auth_client
+
+
 async def _codex_creator(auth_client, auth_app, db_uri, monkeypatch, permission_mode):
     """Alice's runner-bound Codex session on her online host, running in *permission_mode*."""
     from omnigent.host.frames import HostLaunchRunnerFrame, HostStatFrame, decode_host_frame
@@ -1611,12 +1619,19 @@ async def _codex_creator(auth_client, auth_app, db_uri, monkeypatch, permission_
             PERMISSION_LAUNCH_ARGS["codex-native"]["read-only"],
             id="worker-spec-mode",
         ),
+        pytest.param(
+            "full-access",
+            "same_host",
+            None,
+            {"permission_mode": "default"},
+            None,
+            id="worker-spec-default",
+        ),
     ],
 )
 async def test_nested_agent_starts_in_its_creators_permission_mode(
-    auth_client,
+    creator_client,
     auth_app,
-    peers,
     db_uri,
     monkeypatch,
     creator_mode,
@@ -1627,10 +1642,10 @@ async def test_nested_agent_starts_in_its_creators_permission_mode(
 ):
     from omnigent.server.routes.sessions import routes_core
 
-    creator = await _codex_creator(auth_client, auth_app, db_uri, monkeypatch, creator_mode)
+    creator = await _codex_creator(creator_client, auth_app, db_uri, monkeypatch, creator_mode)
     agent_id = creator["agent_id"]
     if worker_config is not None:
-        agent_id = await _upload_codex_worker(auth_client, **worker_config)
+        agent_id = await _upload_codex_worker(creator_client, **worker_config)
 
     async def launch(**kwargs):
         pass
@@ -1643,7 +1658,7 @@ async def test_nested_agent_starts_in_its_creators_permission_mode(
         await execute_tool(
             tool_name="sys_session_create",
             arguments=json.dumps(arguments),
-            server_client=auth_client,
+            server_client=creator_client,
             conversation_id=creator["session_id"],
         )
     )
@@ -1653,26 +1668,26 @@ async def test_nested_agent_starts_in_its_creators_permission_mode(
 
 
 async def test_a_planted_reported_mode_does_not_skip_approval_for_nested_agents(
-    auth_client, auth_app, peers, db_uri, monkeypatch
+    creator_client, auth_app, db_uri, monkeypatch
 ):
     """An editor can write a session's reported-mode label but not its launch mode."""
-    creator = await _codex_creator(auth_client, auth_app, db_uri, monkeypatch, "approve-for-me")
+    creator = await _codex_creator(creator_client, auth_app, db_uri, monkeypatch, "approve-for-me")
     session_id = creator["session_id"]
     SqlAlchemyPermissionStore(db_uri).grant("bob", session_id, LEVEL_EDIT)
-    planted = await auth_client.patch(
+    planted = await creator_client.patch(
         f"/v1/sessions/{session_id}",
         json={"labels": {"omnigent.codex_native.approval_mode": "full-access"}},
         headers={"X-Forwarded-Email": "bob"},
     )
     assert planted.status_code == 200, planted.text
     # A shared source can't start sessions, so the owner removes the editor first.
-    revoked = await auth_client.delete(f"/v1/sessions/{session_id}/permissions/bob")
+    revoked = await creator_client.delete(f"/v1/sessions/{session_id}/permissions/bob")
     assert revoked.status_code == 204, revoked.text
     result = json.loads(
         await execute_tool(
             tool_name="sys_session_create",
             arguments=json.dumps({"agent_id": creator["agent_id"], "placement": "same_host"}),
-            server_client=auth_client,
+            server_client=creator_client,
             conversation_id=session_id,
         )
     )

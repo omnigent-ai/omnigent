@@ -114,10 +114,34 @@ def permission_mode_launch_options(
     return list(args) or None, labels
 
 
-def launch_args_contain(args: Sequence[str], needle: Sequence[str]) -> bool:
-    """Whether *needle* appears in *args* as consecutive items."""
-    width = len(needle)
-    return any(tuple(args[i : i + width]) == tuple(needle) for i in range(len(args) - width + 1))
+# Codex's built-in permission profiles, as the sandbox each one selects.
+_CODEX_PROFILE_SANDBOXES = {":danger-full-access": "danger-full-access", ":read-only": "read-only"}
+
+
+def _codex_permission_settings(launch_args: Sequence[str]) -> dict[str, Any] | None:
+    """The approval and sandbox settings Codex resumes with for *launch_args*.
+
+    :param launch_args: Codex launch args, e.g. ``["-a", "never", "-s", "danger-full-access"]``.
+    :returns: The settings, e.g. ``{"approvalPolicy": "never", "sandbox": "danger-full-access"}``,
+        or ``None`` when a custom profile or config value takes part.
+    """
+    from omnigent.harnesses.codex_native.app_server import _codex_resume_permission_params
+
+    try:
+        settings = dict(_codex_resume_permission_params(launch_args))
+    except ValueError:
+        return None
+    if "config" in settings:
+        return None
+    profile = settings.pop("permissions", None)
+    if profile is not None:
+        if profile not in _CODEX_PROFILE_SANDBOXES:
+            return None
+        settings.setdefault("sandbox", _CODEX_PROFILE_SANDBOXES[profile])
+    if settings.get("approvalPolicy") == "never":
+        # Nothing asks for approval, so no reviewer takes part.
+        settings.pop("approvalsReviewer", None)
+    return settings
 
 
 def _launch_permission_mode(session: Conversation, harness: str) -> str | None:
@@ -126,39 +150,33 @@ def _launch_permission_mode(session: Conversation, harness: str) -> str | None:
     :param session: A session running *harness*.
     :param harness: Its canonical harness, e.g. ``"codex-native"``.
     :returns: A mode of :data:`PERMISSION_LAUNCH_ARGS` for *harness*, or ``None``
-        when the settings select none of them exactly.
+        when the settings select none of them exactly or the harness isn't
+        Claude Code or Codex.
     """
-    launch_args = session.terminal_launch_args or []
+    launch_args = list(session.terminal_launch_args or [])
     modes = PERMISSION_LAUNCH_ARGS.get(harness, {})
     if harness == "claude-native":
         from omnigent.runner.native.orchestration import _claude_launch_permission_mode
 
-        mode = _claude_launch_permission_mode(launch_args)
+        # Everything after ``--`` is prompt text, not an option.
+        options = launch_args[: launch_args.index("--")] if "--" in launch_args else launch_args
+        mode = _claude_launch_permission_mode(options)
         return mode if mode in modes else None
     if harness == "codex-native":
         if session.labels.get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == "1":
             return "bypass"
-        from omnigent.harnesses.codex_native.app_server import (
-            _codex_resume_permission_params,
-        )
-
-        # Compare the settings Codex resumes with, not how the args spell them.
-        try:
-            effective = _codex_resume_permission_params(launch_args)
-        except ValueError:
+        effective = _codex_permission_settings(launch_args)
+        if effective is None:
             return None
         return next(
             (
                 mode
                 for mode, args in modes.items()
-                if args and _codex_resume_permission_params(args).items() <= effective.items()
+                if args and _codex_permission_settings(args) == effective
             ),
             None,
         )
-    return next(
-        (mode for mode, args in modes.items() if args and launch_args_contain(launch_args, args)),
-        None,
-    )
+    return None
 
 
 def session_permission_mode(session: Conversation, harness: str) -> str | None:
