@@ -22,6 +22,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const moduleLoader = require("node:module");
 const path = require("node:path");
+const v8 = require("node:v8");
 const vm = require("node:vm");
 const { EventEmitter } = require("node:events");
 
@@ -448,7 +449,7 @@ function loadNavigationHarness({
       function Notification(options) {
         calls.notifications = [...(calls.notifications ?? []), options];
         const notification = Object.assign(new EventEmitter(), { show: () => {} });
-        calls.notificationRefs = [...(calls.notificationRefs ?? []), new WeakRef(notification)];
+        calls.shownNotifications = [...(calls.shownNotifications ?? []), new WeakRef(notification)];
         return notification;
       },
       { isSupported: () => notificationsSupported },
@@ -7285,7 +7286,7 @@ describe("desktop notifications", () => {
   const server = "https://omni.example";
   const pageEvent = (h) => ({ sender: h.webContents, senderFrame: { url: server } });
   const collectGarbage = () => {
-    require("node:v8").setFlagsFromString("--expose-gc");
+    v8.setFlagsFromString("--expose-gc");
     vm.runInNewContext("gc")();
   };
 
@@ -7303,7 +7304,7 @@ describe("desktop notifications", () => {
     await wait();
     collectGarbage();
 
-    const notification = h.calls.notificationRefs.at(-1).deref();
+    const notification = h.calls.shownNotifications.at(-1).deref();
     assert.ok(notification, "the shown notification was garbage-collected before its click");
     notification.emit("click");
     assert.deepEqual(h.calls.progress.at(-1), {
@@ -7320,7 +7321,7 @@ describe("desktop notifications", () => {
     for (let i = 0; i <= h.api.maxRetainedNotifications(); i++) {
       h.ipc.get("omnigent:notify")(pageEvent(h), { title: "Done", navigatePath: `/c/${i}` });
     }
-    const shown = h.calls.notificationRefs.map((ref) => ref.deref());
+    const shown = h.calls.shownNotifications.map((ref) => ref.deref());
     shown.at(-1).emit("click");
     shown.at(-3).emit("failed");
 
