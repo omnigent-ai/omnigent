@@ -1,7 +1,7 @@
 """E2E regression: a connect blip during a stream reconnect must not orphan a turn.
 
 The Slack integration's stream-reconnect loop
-(``omnigent_slack.omnigent._run_turn_once``) historically counted only
+(``omnigent_bot_core.omnigent._run_turn_once``) historically counted only
 ``StreamInterruptedError`` against its bounded reconnect budget. A
 ``ServerUnreachableError`` raised while *re-opening* the stream — a single
 transient connect failure during the reconnect the budget exists for — escapes
@@ -54,10 +54,10 @@ from tests.e2e.conftest import (
 )
 
 try:
-    from omnigent_slack.omnigent import OmnigentClient, ServerUnreachableError
-except ModuleNotFoundError:  # Checkout without the omnigent-slack editable install.
-    sys.path.insert(0, str(_REPO_ROOT / "integrations" / "slack" / "src"))
-    from omnigent_slack.omnigent import OmnigentClient, ServerUnreachableError
+    from omnigent_bot_core.omnigent import OmnigentClient, ServerUnreachableError
+except ModuleNotFoundError:  # Checkout without the omnigent-bot-core editable install.
+    sys.path.insert(0, str(_REPO_ROOT / "integrations" / "bot-core" / "src"))
+    from omnigent_bot_core.omnigent import OmnigentClient, ServerUnreachableError
 
 # The scripted answer the mock LLM releases once the gate opens. The turn is
 # healthy the whole time — only the client's view of it is under test.

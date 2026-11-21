@@ -2,16 +2,18 @@ import asyncio
 from collections.abc import AsyncIterator
 
 import httpx
-import omnigent_slack.omnigent as omnigent_module
+import omnigent_bot_core.omnigent as omnigent_module
+import omnigent_bot_core.user_agent as user_agent_module
 import pytest
 import respx
-from omnigent_slack.omnigent import (
+from omnigent_bot_core.omnigent import (
     AuthRequiredError,
     HarnessNotConfiguredError,
     HostUnavailableError,
     OmnigentClient,
     OmnigentClientPool,
     OmnigentError,
+    RunnerAlreadyBoundError,
     RunnerUnavailableError,
     ServerUnreachableError,
     StreamInterruptedError,
@@ -128,8 +130,17 @@ def test_extract_assistant_text_from_stream_item() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("distribution", "expected_prefix"),
+    [(None, "omnigent-bot-core/"), ("omnigent-discord", "omnigent-discord/")],
+)
 @respx.mock
-async def test_client_identifies_as_slack_bot() -> None:
+async def test_client_identifies_as_the_running_bot(
+    monkeypatch: pytest.MonkeyPatch, distribution: str | None, expected_prefix: str
+) -> None:
+    monkeypatch.setattr(user_agent_module, "_headers", user_agent_module._headers)
+    if distribution is not None:
+        user_agent_module.set_bot_user_agent(distribution, "0.0.0")
     route = respx.get("http://omnigent.test/v1/me").mock(return_value=httpx.Response(200, json={}))
     client = OmnigentClient("http://omnigent.test")
     try:
@@ -137,7 +148,7 @@ async def test_client_identifies_as_slack_bot() -> None:
     finally:
         await client.aclose()
 
-    assert route.calls.last.request.headers["User-Agent"].startswith("omnigent-slack/")
+    assert route.calls.last.request.headers["User-Agent"].startswith(expected_prefix)
 
 
 @respx.mock
@@ -1019,6 +1030,74 @@ async def test_run_turn_relaunches_a_runner_only_for_an_external_session() -> No
 
 
 @respx.mock
+async def test_cold_started_runner_recovers_by_reopening_the_stream() -> None:
+    """A slow runner must not be replaced by a second one.
+
+    The server's 503 means "no usable runner on the stream", which covers both
+    "none exists" and "one exists but had not subscribed yet". On a cold start
+    it is the second: the relaunch is then rejected with 400 (already bound),
+    and re-opening the stream is what actually recovers the turn. Before this,
+    the 400 escaped as a generic error and the user saw the turn fail even
+    though the runner came up fine a moment later.
+    """
+    respx.post("http://omnigent.test/v1/sessions/conv_c/events").mock(
+        side_effect=[
+            httpx.Response(503, json={"error": {"code": "runner_unavailable"}}),
+            httpx.Response(202, json={}),
+        ]
+    )
+    respx.get("http://omnigent.test/v1/sessions/conv_c/stream").mock(
+        return_value=httpx.Response(
+            200,
+            text=(
+                'data: {"type":"response.output_text.delta","delta":"warm"}\n\n'
+                'data: {"type":"session.status","status":"idle","response_id":"r1"}\n\n'
+            ),
+        )
+    )
+    launch = respx.post("http://omnigent.test/v1/hosts/host_1/runners").mock(
+        return_value=httpx.Response(400, json={"detail": "session already has a runner bound"})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        deltas = [
+            event.get("delta")
+            async for event in client.run_turn(
+                "conv_c", "go", workspace="/home/u", host_id="host_1"
+            )
+            if event.get("type") == "response.output_text.delta"
+        ]
+    finally:
+        await client.aclose()
+
+    # The turn completed on the runner that was already there.
+    assert deltas == ["warm"]
+    # Exactly one relaunch was attempted, and its rejection was not fatal.
+    assert launch.call_count == 1
+
+
+@respx.mock
+async def test_launch_runner_reports_an_already_bound_session() -> None:
+    """The 400 is distinguishable, so callers can tell it from "no runner"."""
+    respx.post("http://omnigent.test/v1/hosts/host_1/runners").mock(
+        return_value=httpx.Response(400, json={"detail": "session already has a runner bound"})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        raised = False
+        try:
+            await client.launch_runner("conv_1", workspace="/home/u", host_id="host_1")
+        except RunnerAlreadyBoundError:
+            raised = True
+    finally:
+        await client.aclose()
+
+    assert raised is True
+
+
+@respx.mock
 async def test_run_turn_never_launches_a_runner_for_a_managed_session() -> None:
     # The server owns a managed session's sandbox and rebinds its runner itself.
     # There is no host of ours to launch on, so the client must surface the
@@ -1562,6 +1641,46 @@ async def test_run_turn_survives_many_drops_that_each_make_progress(
     # Every leg's new delta was forwarded and the turn completed — not abandoned
     # despite far more drops than the consecutive-reconnect cap.
     assert "".join(d for d in deltas if d) == "".join(f"part{i} " for i in range(n_legs))
+
+
+@respx.mock
+async def test_harness_that_never_starts_ends_turn_immediately() -> None:
+    """A harness that cannot launch must end the turn, not wait out the grace.
+
+    A harness that fails to start (no tmux, missing binary) reports the failure
+    with NO ``running`` edge and no delta, so the id-less ``failed`` that
+    follows must not be dismissed as a status replayed from before the turn.
+    Getting this wrong strands the user on an unchanging placeholder until the
+    idle grace expires, minutes after the server already called the turn dead.
+    Found live against claude-native on a machine without tmux.
+    """
+    body = (
+        'data: {"type":"session.input.consumed"}\n\n'
+        'data: {"type":"response.error","error":{"message":'
+        '"Native Claude terminal failed to start"}}\n\n'
+        'data: {"type":"session.status","status":"failed"}\n\n'
+        # Must never be reached: the turn ends on the failure above.
+        'data: {"type":"session.heartbeat"}\n\n'
+    )
+    respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
+        return_value=httpx.Response(202, json={})
+    )
+    respx.get("http://omnigent.test/health").mock(return_value=httpx.Response(200))
+    respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
+        return_value=httpx.Response(200, text=body)
+    )
+    client = OmnigentClient("http://omnigent.test")
+    try:
+        events = [e async for e in client.run_turn("conv_1", "hi", idle_grace_seconds=1)]
+    finally:
+        await client.aclose()
+
+    types = [e.get("type") for e in events]
+    assert types[-1] == "session.status"
+    assert "session.heartbeat" not in types
+    # The caller reads ``response.error`` to mark the turn errored, so ending
+    # promptly must not swallow it on the way out.
+    assert "response.error" in types
 
 
 @respx.mock

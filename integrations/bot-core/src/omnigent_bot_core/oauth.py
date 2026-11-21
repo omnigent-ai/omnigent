@@ -1,8 +1,8 @@
 """Client side of the Omnigent browserless-login flows.
 
-A Slack user authorizes this bot to act as their own Omnigent identity
-without any credential passing through Slack. The bot relays a login
-link into the setup modal and polls in the background until the user
+A chat user authorizes a bot to act as their own Omnigent identity
+without any credential passing through the chat platform. The bot relays a login
+link into the ephemeral setup message and polls in the background until the user
 finishes in their browser. Two server auth modes are supported, detected
 from the server itself (see :func:`probe_auth_mode`, mirroring the
 ``omnigent login`` CLI):
@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 
 import httpx
 
-from omnigent_slack.user_agent import USER_AGENT_HEADERS
+from omnigent_bot_core.user_agent import user_agent_headers
 
 _DEVICE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code"
 
@@ -119,7 +119,7 @@ def _token_from_response(
     non-numeric ``expires_in`` would otherwise raise
     ``JSONDecodeError``/``KeyError``/``ValueError`` — none of which the
     login poller's caller catches, so the background task would die and
-    leave the setup modal hung on "waiting for approval…". Normalise them
+    leave the setup message hung on "waiting for approval…". Normalise them
     into ``OAuthError`` so the caller reports a clean failure.
     """
     try:
@@ -141,7 +141,7 @@ def _token_from_response(
 class PendingLogin:
     """A login in progress: a link to show the user + how to complete it.
 
-    Flow-agnostic. ``verification_url`` goes in the modal; the caller then
+    Flow-agnostic. ``verification_url`` goes in the setup message; the caller then
     awaits :meth:`poll` in the background until it returns a
     :class:`TokenResult` or raises an :class:`OAuthError` subclass.
     :meth:`close` releases the underlying HTTP client.
@@ -174,7 +174,7 @@ async def probe_auth_mode(server_url: str, http_timeout: float = 10.0) -> AuthMo
     async with httpx.AsyncClient(
         base_url=server_url.rstrip("/"),
         timeout=httpx.Timeout(http_timeout),
-        headers=USER_AGENT_HEADERS,
+        headers=user_agent_headers(),
     ) as client:
         try:
             resp = await client.get("/v1/me")
@@ -242,7 +242,7 @@ async def _start_device_login(
     client = httpx.AsyncClient(
         base_url=server_url.rstrip("/"),
         timeout=httpx.Timeout(30.0),
-        headers={**USER_AGENT_HEADERS, **_secret_headers(client_secret)},
+        headers={**user_agent_headers(), **_secret_headers(client_secret)},
     )
     try:
         resp = await client.post("/oauth/device/authorize", json={"client_id": client_id})
@@ -323,7 +323,7 @@ async def _poll_device(
 async def _start_cli_ticket_login(server_url: str) -> PendingLogin:
     base = server_url.rstrip("/")
     client = httpx.AsyncClient(
-        base_url=base, timeout=httpx.Timeout(30.0), headers=USER_AGENT_HEADERS
+        base_url=base, timeout=httpx.Timeout(30.0), headers=user_agent_headers()
     )
     code_verifier = secrets.token_urlsafe(48)
     code_challenge = (
@@ -414,7 +414,7 @@ class DeviceFlowClient:
         self._client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
             timeout=httpx.Timeout(timeout),
-            headers={**USER_AGENT_HEADERS, **_secret_headers(client_secret)},
+            headers={**user_agent_headers(), **_secret_headers(client_secret)},
         )
 
     async def aclose(self) -> None:

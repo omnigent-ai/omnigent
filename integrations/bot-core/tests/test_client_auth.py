@@ -5,7 +5,7 @@ import asyncio
 import httpx
 import pytest
 import respx
-from omnigent_slack.omnigent import (
+from omnigent_bot_core.omnigent import (
     AuthRequiredError,
     ClientAuth,
     OmnigentClient,

@@ -55,6 +55,7 @@ def test_classify_surface_android() -> None:
         ("omnigent-harness/0.22.0 (claude-sdk) python-httpx/0.28.1", "harness"),
         ("omnigent-client/0.22.0 python-httpx/0.28.1", "sdk"),
         ("omnigent-slack/0.22.0 python-httpx/0.28.1", "slack"),
+        ("omnigent-discord/0.22.0 python-httpx/0.28.1", "discord"),
     ],
 )
 def test_classify_surface_omnigent_components(user_agent: str, surface: str) -> None:
@@ -128,10 +129,12 @@ def test_session_surface_header_stores_only_user_surfaces() -> None:
         {"x-omnigent-client": "slack"},
         {"user-agent": "omnigent-client/0.22.0 python-httpx/0.28.1"},
         {"user-agent": "omnigent-slack/0.1.0 python-httpx/0.28.1"},
+        {"x-omnigent-client": "discord"},
+        {"user-agent": "omnigent-discord/0.1.0 python-httpx/0.28.1"},
     ],
 )
 def test_sdk_and_slack_sessions_store_cli(headers: dict[str, str]) -> None:
-    """SDK and Slack sessions store ``cli``, the label older runners accept."""
+    """SDK and chat-bot sessions store ``cli``, the label older runners accept."""
     assert resolve_session_surface(headers) == "cli"
 
 
