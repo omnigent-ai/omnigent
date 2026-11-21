@@ -65,12 +65,10 @@ def test_classify_surface_omnigent_components(user_agent: str, surface: str) -> 
 @pytest.mark.parametrize(
     ("user_agent", "surface"),
     [
-        # Main parity: bare httpx/requests and empty UAs are the CLI, host and runner
-        # releases 0.17-0.21, which send no component token.
         ("", "cli"),
-        ("python-httpx/0.28.1", "cli"),
-        ("python-httpx/0.27.0", "cli"),
-        ("python-requests/2.32.3", "cli"),
+        ("python-httpx/0.28.1", "script"),
+        ("python-httpx/0.27.0", "script"),
+        ("python-requests/2.32.3", "script"),
         ("Python-urllib/3.12", "script"),
         ("node", "script"),
         ("Bun/1.1.38", "script"),
@@ -80,9 +78,20 @@ def test_classify_surface_omnigent_components(user_agent: str, surface: str) -> 
         ("Python/3.12 websockets/14.2", "script"),
     ],
 )
-def test_classify_surface_main_parity(user_agent: str, surface: str) -> None:
-    """Bare httpx/requests and empty stay ``cli`` as on main; other non-browsers are ``script``."""
+def test_classify_surface_non_browser_clients(user_agent: str, surface: str) -> None:
+    """Empty is ``cli``; bare httpx/requests and other non-browser clients are ``script``."""
     assert classify_surface(user_agent) == surface
+
+
+@pytest.mark.parametrize("user_agent", ["python-httpx/0.28.1", "python-requests/2.32.3"])
+def test_bare_python_client_session_stays_cli(user_agent: str) -> None:
+    """Bare httpx/requests is ``script`` in request telemetry but its session stores ``cli``.
+
+    Session labels drive AI-gateway attribution (``omnigent-cli``), so they must not move.
+    """
+    assert classify_surface(user_agent) == "script"
+    assert resolve_client_surface({"user-agent": user_agent}) == "script"
+    assert resolve_session_surface({"user-agent": user_agent}) == "cli"
 
 
 def test_classify_surface_regular_browser() -> None:
