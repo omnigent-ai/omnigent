@@ -90,6 +90,7 @@ from omnigent.native.permission_modes import (
     APPROVAL_SKIPPING_PERMISSION_MODES,
     PERMISSION_LAUNCH_ARGS,
 )
+from omnigent.runner.routing import routing_host_session
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_OWNER,
@@ -2666,7 +2667,6 @@ def _make_reuse_dispatch(deps: FireDeps) -> LaunchDispatch:
     async def _dispatch(conv: Conversation, task: ScheduledTask) -> None:
         from omnigent.server.routes.sessions import (
             _await_settled_managed_launch,
-            _get_runner_client,
             ensure_runner_connected,
         )
 
@@ -2690,13 +2690,7 @@ def _make_reuse_dispatch(deps: FireDeps) -> LaunchDispatch:
                 raise RuntimeError(f"session {conv.id} is not bound to the automation's sandbox")
             runner_client = None
             if conv.kind == "sub_agent":
-                # As for a message, a sub-agent follows its parent to a new runner before
-                # anything launches a runner of its own.
-                runner_client = await _get_runner_client(
-                    conv.id, deps.runner_router, conversation=conv
-                )
-                if runner_client is None:
-                    runner_client, conv = await _follow_parent_runner(deps, conv)
+                runner_client, conv = await _sub_agent_runner(deps, task, conv)
             if runner_client is None:
                 runner_client, conv = await ensure_runner_connected(
                     session_id=conv.id,
@@ -2710,6 +2704,62 @@ def _make_reuse_dispatch(deps: FireDeps) -> LaunchDispatch:
         await _send_prompt(deps, conv, runner_client, task)
 
     return _dispatch
+
+
+async def _sub_agent_runner(
+    deps: FireDeps, task: ScheduledTask, conv: Conversation
+) -> tuple[httpx.AsyncClient | None, Conversation]:
+    """Find the runner a sub-agent shares with its parent, as a message to it would.
+
+    It tries the sub-agent's current runner, then its parent's live one, then wakes
+    the session that owns their host, before anything launches it a runner of its own.
+
+    :param deps: The fire's stores and runner registries.
+    :param task: The timer waking *conv*.
+    :param conv: The sub-agent session.
+    :returns: The runner's client and the session as last read, or ``None`` and *conv*.
+    """
+    from omnigent.server.routes.sessions import _get_runner_client
+
+    runner_client = await _get_runner_client(conv.id, deps.runner_router, conversation=conv)
+    if runner_client is not None:
+        return runner_client, conv
+    runner_client, conv = await _follow_parent_runner(deps, conv)
+    if runner_client is not None:
+        return runner_client, conv
+    return await _wake_host_owner(deps, task, conv)
+
+
+async def _wake_host_owner(
+    deps: FireDeps, task: ScheduledTask, conv: Conversation
+) -> tuple[httpx.AsyncClient | None, Conversation]:
+    """Relaunch an exited shared runner through the session that owns its host.
+
+    A sub-agent with no host of its own can't relaunch the runner it shares; the
+    ancestor that owns the host can, while the timer's owner may still send to it.
+
+    :param deps: The fire's stores and runner registries.
+    :param task: The timer waking *conv*.
+    :param conv: The sub-agent session, e.g. one whose shared runner idled out.
+    :returns: The new runner's client and the re-read session, or ``None`` and *conv*.
+    """
+    from omnigent.server.routes.sessions import ensure_runner_connected
+
+    owner = await asyncio.to_thread(routing_host_session, conv, deps.conversation_store)
+    if owner is None or owner.id == conv.id:
+        return None, conv
+    if await _timer_session_problem(deps, task, owner) is not None:
+        return None, conv
+    owner_client, _ = await ensure_runner_connected(
+        session_id=owner.id,
+        conv=owner,
+        app_state=deps.app_state,
+        conversation_store=deps.conversation_store,
+        runner_router=deps.runner_router,
+    )
+    if owner_client is None:
+        return None, conv
+    return await _follow_parent_runner(deps, conv)
 
 
 async def _follow_parent_runner(
@@ -2795,6 +2845,9 @@ async def _send_prompt(
                 failure_stage="prompt_send",
                 outcome="not_sent",
             )
+            if task.kind == "timer":
+                # The timer's run must say its wake never went in; nothing resends it.
+                raise RuntimeError(f"session {conv.id} did not accept the timer's wake")
 
 
 def _make_managed_sandbox_dispatch(deps: FireDeps) -> LaunchDispatch:

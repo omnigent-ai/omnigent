@@ -478,9 +478,10 @@ tunnel claims its firings.
   (`is_meta`) user message, goes in through the continued-session wake and dispatch.
   A sub-agent session whose runner is gone first moves to its parent's live runner,
   output relay included, before anything launches a runner of its own, as a message
-  to it would.
+  to it would. If no ancestor runner is live, the session owning their host (while
+  the timer's owner may still send to it) is woken and the sub-agent follows it.
   The run records `succeeded`, or `failed` (`launch_failed`) when no runner can be
-  reached or woken; a firing is never retried.
+  reached or woken or the runner declines the wake; a firing is never retried.
 - **Cancelling.** A cancel that commits before a claimed firing does suppresses it:
   the run records `skipped` (`timer_cancelled`). A firing committed first still goes
   out. A one-shot firing deletes its timer as it commits, so a later cancel finds

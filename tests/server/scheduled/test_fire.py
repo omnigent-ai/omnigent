@@ -469,6 +469,9 @@ class FakePermissionStore:
     def check_access(self, user_id: str | None, conversation_id: str, required_level: int) -> bool:
         return conversation_id not in self.unowned
 
+    def is_admin(self, user_id: str) -> bool:
+        return False
+
     def grant(self, user_id: str, conversation_id: str, level: int) -> Any:
         self.grant_workspace_ids.append(current_workspace_id())
         if self.fail_grant or user_id in self.fail_grant_users:
@@ -4354,6 +4357,66 @@ async def test_a_sub_agent_follows_its_parents_new_runner_before_its_host_launch
     assert relay.await_args.args[:3] == ("conv_prev", "runner_parent", parent_runner)
     send.assert_awaited_once()
     assert send.await_args.args[1:] == (healed, parent_runner, task)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner_usable", [True, False], ids=["wakes-host-owner", "owner-unusable"])
+async def test_a_sub_agents_exited_runner_is_relaunched_through_the_session_owning_its_host(
+    monkeypatch: pytest.MonkeyPatch, owner_usable: bool
+) -> None:
+    """A runner-created sub-agent has no host; its parent's host relaunches their runner.
+
+    The parent is only woken while the timer's owner may still send to it.
+    """
+    from omnigent.server.routes import sessions
+
+    child = _continued_session(
+        kind="sub_agent", parent_conversation_id="conv_parent", runner_id="gone", host_id=None
+    )
+    healed = _continued_session(
+        kind="sub_agent", parent_conversation_id="conv_parent", runner_id="new", host_id=None
+    )
+    parent = _continued_session(id="conv_parent")
+    parent_runner = object()
+    monkeypatch.setattr(sessions, "_get_runner_client", AsyncMock(return_value=None))
+    # No ancestor runner is live until the parent's is relaunched.
+    heal = AsyncMock(side_effect=[None, parent_runner])
+    monkeypatch.setattr(sessions, "_heal_subagent_runner_binding_via_parent", heal)
+    monkeypatch.setattr(sessions, "_ensure_runner_relay_ready", AsyncMock())
+
+    async def _wake(*, conv: Any, **_: Any) -> tuple[object | None, Any]:
+        # Only a session bound to a host can have its runner relaunched.
+        return (parent_runner if conv.host_id is not None else None), conv
+
+    wake = AsyncMock(side_effect=_wake)
+    monkeypatch.setattr(sessions, "ensure_runner_connected", wake)
+    send = AsyncMock()
+    monkeypatch.setattr(fire_mod, "_send_prompt", send)
+    permissions = FakePermissionStore()
+    if not owner_usable:
+        permissions.unowned.add("conv_parent")
+    task = _continuing_task()
+    dispatch = fire_mod._make_reuse_dispatch(
+        _deps(
+            FakeScheduledTaskStore(rows={"task_1": task}),
+            conversation_store=_ExistingConversationStore(healed, parent),
+            permission_store=permissions,
+        )
+    )
+    woken = lambda: [call.kwargs["session_id"] for call in wake.await_args_list]  # noqa: E731
+
+    if owner_usable:
+        await dispatch(child, task)
+        assert woken() == ["conv_parent"]
+        assert heal.await_count == 2
+        send.assert_awaited_once()
+        assert send.await_args.args[1:] == (healed, parent_runner, task)
+    else:
+        with pytest.raises(RuntimeError, match="no runner can be reached"):
+            await dispatch(child, task)
+        # Only the sub-agent's own wake was tried, which its missing host can't do.
+        assert woken() == ["conv_prev"]
+        send.assert_not_awaited()
 
 
 @pytest.mark.asyncio

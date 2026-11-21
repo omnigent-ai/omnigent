@@ -15,7 +15,10 @@ Excluded from default ``pytest`` runs via ``--ignore=tests/e2e``. Invoke with::
 from __future__ import annotations
 
 import json
+import os
+import re
 import secrets
+import signal
 import time
 import uuid
 from collections.abc import Iterator, Mapping
@@ -74,8 +77,38 @@ def _timer_stack(
         yield stack, client
 
 
-def _timer_session(client: httpx.Client, stack: ServerRunner, mock_url: str, model: str) -> str:
-    """Create a runner-bound session whose agent has the timer tools."""
+@contextmanager
+def _host_stack(tmp_path: Path) -> Iterator[tuple[ServerRunner, httpx.Client]]:
+    """A server and a host that launches each session's runner itself."""
+    with (
+        # Host-launched runners bind their own tunnel tokens.
+        server_runner(
+            tmp_path / "stack", server_env={"OMNIGENT_RUNNER_TUNNEL_TOKEN": None}
+        ) as stack,
+        httpx.Client(
+            base_url=stack.base_url,
+            trust_env=False,
+            timeout=60,
+            headers={"x-omnigent-background-session-titles": "off"},
+        ) as client,
+    ):
+        stack.start_host()
+        yield stack, client
+
+
+def _timer_session(
+    client: httpx.Client,
+    stack: ServerRunner,
+    mock_url: str,
+    model: str,
+    *,
+    on_host: bool = False,
+) -> str:
+    """Create a session whose agent has the timer tools.
+
+    :param on_host: Bind it to the stack's host, which launches its runner, instead of
+        to the stack's own runner.
+    """
     spec = {
         "name": f"timer-agent-{model}",
         "prompt": "You set timers with sys_timer_set and cancel them with sys_timer_cancel.",
@@ -90,10 +123,14 @@ def _timer_session(client: httpx.Client, stack: ServerRunner, mock_url: str, mod
         client.post,
         "/v1/sessions",
         bundle_files({f"timer-agent-{model}.yaml": yaml.safe_dump(spec).encode()}),
+        metadata={"host_id": stack.host_id, "workspace": str(stack.workspace)}
+        if on_host
+        else None,
     )
     created.raise_for_status()
     session_id = str(created.json()["session_id"])
-    bind_session_runner(client.patch, "", session_id, stack.runner_id)
+    if not on_host:
+        bind_session_runner(client.patch, "", session_id, stack.runner_id)
     return session_id
 
 
@@ -405,4 +442,62 @@ def test_a_sub_agent_timer_wakes_its_child_after_the_parent_moves_runners(
             interval_s=0.5,
         )
         assert client.get(f"/v1/sessions/{child_id}").json()["runner_id"] == new_runner_id
+        assert _firings(client, parent_id, timer_id) == []
+
+
+def test_a_sub_agent_timer_has_its_parents_host_relaunch_their_exited_runner(
+    tmp_path: Path, isolated_mock_llm_server_url: str
+) -> None:
+    """A sub-agent can't relaunch the runner it shares; its parent's host does, for its timer."""
+    mock_url = isolated_mock_llm_server_url
+    model = f"mock-timer-host-{uuid.uuid4().hex[:6]}"
+    interval = 15
+    set_fallback_mock_llm(mock_url, model, _REPLY)
+    with _host_stack(tmp_path) as (stack, client):
+        parent_id = _timer_session(client, stack, mock_url, model, on_host=True)
+        # The parent's first turn has the host launch the runner its sub-agent shares.
+        send_user_message_to_session(client, session_id=parent_id, content="Hello.")
+        poll_until(lambda: _replies(client, parent_id) >= 1, timeout_s=120)
+        runner_id = client.get(f"/v1/sessions/{parent_id}").json()["runner_id"]
+        child_id = _child_session(client, parent_id)
+        child = client.get(f"/v1/sessions/{child_id}").json()
+        assert (child["kind"], child["runner_id"], child["host_id"]) == (
+            "sub_agent",
+            runner_id,
+            None,
+        )
+        timer = _set_timer(
+            client,
+            mock_url,
+            child_id,
+            model,
+            {"seconds": interval, "repeat": True, "note": "check in"},
+        )
+        timer_id = timer["timer_id"]
+        first_tick_at = datetime.fromisoformat(timer["fire_at"]).timestamp()
+        poll_until(lambda: _replies(client, child_id) >= 1, timeout_s=60)
+        _wait_until_idle_before(client, child_id, first_tick_at + interval)
+
+        # The shared runner exits, as an idle runner does, before the next tick.
+        launched = re.search(
+            rf"Runner started: {re.escape(runner_id)} \(pid=(\d+)\)",
+            stack.log_path("host").read_text(),
+        )
+        assert launched is not None, stack.log_tail()
+        os.kill(int(launched.group(1)), signal.SIGTERM)
+        poll_until(
+            lambda: not client.get(f"/v1/runners/{runner_id}/status").json().get("online"),
+            timeout_s=60,
+        )
+        replies_before = _replies(client, child_id)
+
+        # A later tick has the parent's host relaunch the runner, and reaches the child.
+        poll_until(
+            lambda: _replies(client, child_id) > replies_before,
+            timeout_s=4 * interval,
+            interval_s=0.5,
+        )
+        relaunched = client.get(f"/v1/sessions/{parent_id}").json()["runner_id"]
+        assert client.get(f"/v1/runners/{relaunched}/status").json()["online"] is True
+        assert client.get(f"/v1/sessions/{child_id}").json()["runner_id"] == relaunched
         assert _firings(client, parent_id, timer_id) == []

@@ -2198,13 +2198,6 @@ async def test_failed_run_releases_its_binding_without_deleting_a_peers_sandbox(
 # ── Timers ───────────────────────────────────────────────────────────────────
 
 
-class _TimerPermissions(FakePermissionStore):
-    """Grants as ``FakePermissionStore`` decides them, with no administrators."""
-
-    def is_admin(self, user_id: str) -> bool:
-        return False
-
-
 class _HeldSessionReads(_ExistingConversationStore):
     """Holds each session read until the test releases it, from a worker thread."""
 
@@ -2225,7 +2218,7 @@ def _timer_session(**overrides: Any) -> _FakeConversation:
 
 def _timer_deps(store: SqlAlchemyScheduledTaskStore, **overrides: Any) -> FireDeps:
     overrides.setdefault("conversation_store", _ExistingConversationStore(_timer_session()))
-    overrides.setdefault("permission_store", _TimerPermissions())
+    overrides.setdefault("permission_store", FakePermissionStore())
     return _deps(store, **overrides)
 
 
@@ -2349,7 +2342,7 @@ async def test_a_timer_whose_session_is_gone_stops_without_waking_it(store, prob
         if problem == "deleted"
         else _ExistingConversationStore(_timer_session(archived=problem == "archived"))
     )
-    permissions = _TimerPermissions()
+    permissions = FakePermissionStore()
     if problem == "no_access":
         permissions.unowned.add(_CONV_ID)
     dispatch = AsyncMock()
@@ -2363,12 +2356,33 @@ async def test_a_timer_whose_session_is_gone_stops_without_waking_it(store, prob
     assert store.list_due_tasks(claimed.task.next_run_at + 3600) == []
 
 
-async def test_a_wake_that_reaches_no_runner_fails_only_that_tick(store) -> None:
+@pytest.mark.parametrize("delivery", ["raises", "declined"])
+async def test_a_wake_that_reaches_no_runner_fails_only_that_tick(
+    store, monkeypatch, delivery
+) -> None:
     claimed = _claim_timer(store, repeat=True)
-    dispatch = AsyncMock(side_effect=RuntimeError("no runner can be reached or woken"))
-    await ClaimedRunExecutor(_timer_deps(store), launch_dispatch=dispatch).fire(
-        claimed.task, claimed.lease
-    )
+    if delivery == "raises":
+        dispatch = AsyncMock(side_effect=RuntimeError("no runner can be reached or woken"))
+        executor = ClaimedRunExecutor(_timer_deps(store), launch_dispatch=dispatch)
+    else:
+        from omnigent.server.routes import sessions
+
+        # The runner answers without taking the wake, e.g. when its terminal can't start.
+        monkeypatch.setattr(
+            sessions,
+            "ensure_runner_connected",
+            AsyncMock(side_effect=lambda **kwargs: (object(), kwargs["conv"])),
+        )
+        monkeypatch.setattr(sessions, "_ensure_runner_session_initialized", AsyncMock())
+        monkeypatch.setattr(fire_mod, "_agent_revision", AsyncMock(return_value=None))
+        declined = sessions._SessionEventDispatchResult(
+            item_id=None, pending_id=None, accepted=False
+        )
+        monkeypatch.setattr(
+            sessions, "_dispatch_session_event_to_runner", AsyncMock(return_value=declined)
+        )
+        executor = ClaimedRunExecutor(_timer_deps(store))
+    await executor.fire(claimed.task, claimed.lease)
     [run] = _runs(store, claimed.task)
     assert (run.status, run.error_code, run.conversation_id) == (
         "failed",
