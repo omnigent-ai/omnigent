@@ -12,7 +12,9 @@ from omnigent.gateway_inference import (
     CODEX_GATEWAY_HARNESSES,
     claude_gateway_inference_backed,
     codex_gateway_inference_backed,
+    gateway_backs_static_table,
     gateway_inference_map,
+    gateway_inference_reports,
     gateway_inference_state,
     not_gateway_backed,
 )
@@ -556,6 +558,46 @@ def test_not_gateway_backed_names_only_the_explicit_false_arms() -> None:
     # Unknown keeps every option: an older host must not silently lose routing.
     assert not_gateway_backed(None, arms) == []
     assert not_gateway_backed({"claude-native": True}, arms) == []
+
+
+def test_only_the_native_families_are_reported() -> None:
+    # A reported map carries the native Claude/Codex families, in any spelling.
+    assert gateway_inference_reports("claude-native")
+    assert gateway_inference_reports("native-codex")
+    # claude-sdk and pi are never evaluated, so a host never names them.
+    assert not gateway_inference_reports("claude-sdk")
+    assert not gateway_inference_reports("pi")
+
+
+def test_static_table_declines_the_sdk_on_an_off_gateway_host() -> None:
+    # A host that reported its families and backs none with the gateway is off
+    # the gateway; its claude-sdk/pi launch cannot reach a databricks-* id.
+    off_gateway = {"claude-native": False, "codex-native": False}
+    assert not gateway_backs_static_table(off_gateway, ("claude-sdk",))
+    assert not gateway_backs_static_table(off_gateway, ("pi",))
+    # An explicit False on any native arm declines the whole menu.
+    assert not gateway_backs_static_table(
+        {"codex-native": False}, ("claude-native", "codex-native")
+    )
+
+
+def test_static_table_stays_lenient_until_a_host_proves_off_gateway() -> None:
+    # No report yet (older host, none bound) keeps every option, the SDK too.
+    assert gateway_backs_static_table(None, ("claude-sdk",))
+    assert gateway_backs_static_table({}, ("pi",))
+    # A reportable family a host has not named is only unknown, not off-gateway.
+    assert gateway_backs_static_table({"claude-native": False}, ("codex-native",))
+    # A host that backs any family can reach the gateway, so the SDK keeps the
+    # table too, and an explicitly backed native family always does.
+    assert gateway_backs_static_table({"claude-native": True}, ("claude-sdk",))
+    assert gateway_backs_static_table(
+        {"claude-native": True, "codex-native": True}, ("claude-native",)
+    )
+    # An explicit SDK/pi report wins over the host-wide heuristic either way.
+    assert gateway_backs_static_table(
+        {"claude-native": False, "claude-sdk": True}, ("claude-sdk",)
+    )
+    assert not gateway_backs_static_table({"claude-native": True, "pi": False}, ("pi",))
 
 
 @pytest.mark.parametrize(
