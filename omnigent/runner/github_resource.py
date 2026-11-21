@@ -66,6 +66,7 @@ import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
 
@@ -183,17 +184,26 @@ def _in_sandbox() -> bool:
     return in_managed_sandbox()
 
 
-def _gh(
-    argv: list[str], *, cwd: str, token: str | None = None, timeout: float | None = None
-) -> tuple[int | None, str, str]:
-    # ``timeout`` replaces the per-call limit: higher for a slow call such as a video
-    # upload, lower for a best-effort one.
-    timeout = timeout or _gh_timeout_seconds()
-    if (deadline := _gh_deadline.get()) is not None:
-        timeout = min(timeout, deadline - time.monotonic())
-        if timeout <= 0:
-            _gh_timed_out.set(True)
-            return None, "", "gh deadline exceeded"
+@dataclass(frozen=True)
+class GhInvocation:
+    """The process one ``gh`` call starts.
+
+    :ivar argv: The command and its arguments.
+    :ivar env: The child's whole environment, or ``None`` to inherit this process's.
+    """
+
+    argv: list[str]
+    env: dict[str, str] | None
+
+
+def _gh_invocation(argv: list[str], *, token: str | None) -> GhInvocation:
+    """Return the command and environment that run ``gh`` with *argv*.
+
+    Every ``gh`` call the panel makes starts through here.
+
+    :param argv: Arguments after ``gh``.
+    :param token: A GitHub token to run this one call as a chosen account, or ``None``.
+    """
     # In a managed sandbox the panel must authenticate as the connected owner via
     # the per-user hosts.yml that configure_host_gh writes — never an ambient
     # GH_TOKEN/GITHUB_TOKEN, which gh ranks ABOVE hosts.yml. Scrub them so a stray
@@ -218,7 +228,22 @@ def _gh(
         env["GH_ENTERPRISE_TOKEN"] = token
         env.pop("GITHUB_TOKEN", None)
         env.pop("GITHUB_ENTERPRISE_TOKEN", None)
-    result = _run(["gh", *argv], cwd=cwd, timeout=timeout, env=env)
+    return GhInvocation(argv=["gh", *argv], env=env)
+
+
+def _gh(
+    argv: list[str], *, cwd: str, token: str | None = None, timeout: float | None = None
+) -> tuple[int | None, str, str]:
+    # ``timeout`` replaces the per-call limit: higher for a slow call such as a video
+    # upload, lower for a best-effort one.
+    timeout = timeout or _gh_timeout_seconds()
+    if (deadline := _gh_deadline.get()) is not None:
+        timeout = min(timeout, deadline - time.monotonic())
+        if timeout <= 0:
+            _gh_timed_out.set(True)
+            return None, "", "gh deadline exceeded"
+    invocation = _gh_invocation(argv, token=token)
+    result = _run(invocation.argv, cwd=cwd, timeout=timeout, env=invocation.env)
     if (
         deadline is not None
         and result[0] is None

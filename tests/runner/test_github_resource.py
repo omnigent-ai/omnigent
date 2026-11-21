@@ -50,6 +50,82 @@ def _stub_gh(
     monkeypatch.setattr(github_resource, "_gh", fake_gh)
 
 
+GH_TOKEN_NAMES = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
+
+
+@pytest.fixture
+def gh_starts(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, object]]:
+    """Record each process ``_gh`` starts, with ambient tokens in the environment."""
+    starts: list[dict[str, object]] = []
+
+    def run(
+        argv: list[str], *, cwd: str, timeout: float, env: dict[str, str] | None = None
+    ) -> tuple[int | None, str, str]:
+        starts.append({"argv": argv, "cwd": cwd, "timeout": timeout, "env": env})
+        return 0, "answer", ""
+
+    monkeypatch.setattr(github_resource, "_run", run)
+    monkeypatch.delenv("OMNIGENT_GH_TIMEOUT_SECONDS", raising=False)
+    for name in GH_TOKEN_NAMES:
+        monkeypatch.setenv(name, f"ambient-{name.lower()}")
+    return starts
+
+
+def _without_tokens(environment: dict[str, str]) -> dict[str, str]:
+    return {name: value for name, value in environment.items() if name not in GH_TOKEN_NAMES}
+
+
+@pytest.mark.parametrize("sandbox", [False, True], ids=["local", "sandbox"])
+@pytest.mark.parametrize("token", [None, "chosen-token"], ids=["ambient", "chosen-account"])
+def test_gh_starts_gh_with_todays_command_and_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    gh_starts: list[dict[str, object]],
+    sandbox: bool,
+    token: str | None,
+) -> None:
+    """Pin the process every ``gh`` call starts: command, environment, cwd and timeout."""
+    monkeypatch.setattr(github_resource, "_in_sandbox", lambda: sandbox)
+    ambient = dict(os.environ)
+    argv = ["pr", "view", "7", "-R", "ghe.example.test/acme/repo", "--json", "number"]
+
+    result = github_resource._gh(argv, cwd="/workspace", token=token)
+
+    if not sandbox and token is None:
+        expected_env = None
+    else:
+        expected_env = _without_tokens(ambient) if sandbox else dict(ambient)
+        if token is not None:
+            expected_env = {
+                **_without_tokens(expected_env),
+                "GH_TOKEN": token,
+                "GH_ENTERPRISE_TOKEN": token,
+            }
+    assert result == (0, "answer", "")
+    assert gh_starts == [
+        {
+            "argv": ["gh", *argv],
+            "cwd": "/workspace",
+            "timeout": github_resource._DEFAULT_GH_TIMEOUT_SECONDS,
+            "env": expected_env,
+        }
+    ]
+
+
+def test_gh_keeps_a_callers_timeout_and_starts_nothing_past_its_deadline(
+    monkeypatch: pytest.MonkeyPatch, gh_starts: list[dict[str, object]]
+) -> None:
+    monkeypatch.setattr(github_resource, "_in_sandbox", lambda: False)
+
+    github_resource._gh(["api", "user"], cwd="/workspace", timeout=90.0)
+    with github_resource._gh_deadline_scope(0.0):
+        late = github_resource._gh(["api", "user"], cwd="/workspace")
+
+    assert late == (None, "", "gh deadline exceeded")
+    assert gh_starts == [
+        {"argv": ["gh", "api", "user"], "cwd": "/workspace", "timeout": 90.0, "env": None}
+    ]
+
+
 def _git_env() -> dict[str, str]:
     """Env with a dummy git identity so commits don't need a configured user."""
     return {
