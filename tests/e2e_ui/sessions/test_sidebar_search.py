@@ -99,8 +99,14 @@ def test_search_lists_matching_sessions_in_palette(
     archived_row = dialog.get_by_role("option").filter(has_text=title)
     expect(archived_row).to_be_visible()
     expect(archived_row.get_by_text("Archived", exact=True)).to_be_visible()
-    palette_input.fill(marker)
-    expect(archived_row).to_be_visible()
+    # The recent list already shows the row, so wait for the search's own answer.
+    with page.expect_response(
+        lambda response: f"search_query={marker}" in response.url
+        and "search_scope=title" in response.url
+    ) as title_search:
+        palette_input.fill(marker)
+    assert title_search.value.ok
+    expect(archived_row.locator("mark", has_text=marker)).to_be_visible()
     expect(archived_row.get_by_text("Archived", exact=True)).to_be_visible()
 
 

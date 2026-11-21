@@ -29,6 +29,12 @@ vi.mock("@/hooks/useConversations", () => ({
   useProjects: (...args: unknown[]) => useProjects(...args),
 }));
 
+let sidebarSessions: { pages: { data: unknown[] }[] } | undefined;
+vi.mock("@/hooks/useSidebarData", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/hooks/useSidebarData")>()),
+  useOptionalLoadedConversations: () => sidebarSessions,
+}));
+
 function conv(
   id: string,
   title: string | null,
@@ -99,6 +105,7 @@ function withQueryClient(queryClient = new QueryClient()) {
 
 beforeEach(() => {
   navigate.mockClear();
+  sidebarSessions = undefined;
   useConversations.mockReset();
   useSessionSearch.mockReset();
   useProjects.mockReturnValue({ data: [] });
@@ -167,16 +174,20 @@ describe("CommandPalette — sessions", () => {
     expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 
-  it("shows the sidebar's active sessions until the archived-inclusive list loads", () => {
-    useConversations.mockImplementation((_query: string, includeArchived: boolean) =>
-      includeArchived
-        ? { data: undefined, isFetching: true }
-        : { data: { pages: [{ data: [conv("cached", "Cached session")] }] }, isFetching: false },
-    );
+  it("shows the sidebar's loaded sessions until the archived-inclusive list loads", () => {
+    sidebarSessions = { pages: [{ data: [conv("cached", "Cached session")] }] };
+    useConversations.mockReturnValue({ data: undefined, isFetching: true });
     renderPalette();
 
-    expect(useConversations).toHaveBeenCalledWith("", false, { enabled: false });
     expect(screen.getByText("Cached session")).toBeTruthy();
+  });
+
+  it("doesn't fill Find a session's list from the sidebar", () => {
+    sidebarSessions = { pages: [{ data: [conv("cached", "Cached session")] }] };
+    useConversations.mockReturnValue({ data: undefined, isFetching: true });
+    renderPalette({ sessionsOnly: true });
+
+    expect(screen.queryByText("Cached session")).toBeNull();
   });
 
   it("keeps the row of a session opened from the recent list for the sidebar to list", () => {

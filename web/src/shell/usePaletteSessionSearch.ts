@@ -12,6 +12,7 @@ import {
   useSessionSearch,
 } from "@/hooks/useConversations";
 import { rememberOpenSessionRow } from "@/hooks/useOpenSessionRow";
+import { useOptionalLoadedConversations } from "@/hooks/useSidebarData";
 import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import { BOOT_PROBE_TIMEOUT_MS } from "@/lib/bootCapabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -120,10 +121,10 @@ export function usePaletteSessionSearch({
   const recentIncludesArchived = !sessionsOnly;
   const { data, isFetching, isError, refetch, hasNextPage, fetchNextPage, isFetchNextPageError } =
     useConversations("", recentIncludesArchived, { enabled: open });
-  // The sidebar's cached active list fills the recent rows until that list loads.
-  const { data: activeSessions } = useConversations("", false, { enabled: false });
+  // The sidebar's loaded sessions fill the recent rows until that list loads.
+  const sidebarSessions = useOptionalLoadedConversations();
   const recentPages =
-    data?.pages ?? (recentIncludesArchived ? activeSessions?.pages : undefined) ?? EMPTY_PAGES;
+    data?.pages ?? (recentIncludesArchived ? sidebarSessions?.pages : undefined) ?? EMPTY_PAGES;
   const serverInfo = useServerInfo();
   // Older servers ignore `search_scope`, so they get one mixed group instead.
   const groupedSearch = serverInfo !== "loading" && serverInfo.session_search_scope === true;
