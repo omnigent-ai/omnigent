@@ -9,6 +9,7 @@ import { KEYBOARD_SHORTCUTS_EVENT } from "@/components/KeyboardShortcutsDialog";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { registerFindSurface } from "@/lib/findRouting";
 import { readFoldAssistantNarration } from "@/lib/foldNarrationPreferences";
+import { useSidebarSessionOrderStore } from "@/hooks/useSidebarSessionOrder";
 import { useThemePickerStore } from "@/store/themePicker";
 import { readTerminalThemeMode } from "@/lib/terminalThemePreferences";
 
@@ -160,6 +161,21 @@ describe("QuickPick ⌘K setting rows", () => {
 });
 
 describe("QuickPick ⌘K app commands", () => {
+  it("lists Next and Previous session while a sidebar lists sessions", () => {
+    onTestFinished(() =>
+      useSidebarSessionOrderStore.setState({ orderedSessionIds: [], activeSessionId: null }),
+    );
+    const input = renderPalette();
+    fireEvent.change(input, { target: { value: "next session" } });
+    expect(screen.queryByRole("option", { name: /Next session/ })).toBeNull();
+    act(() =>
+      useSidebarSessionOrderStore.setState({ orderedSessionIds: ["a", "b"], activeSessionId: "a" }),
+    );
+    expect(actionNames()[0]).toContain("Next session");
+    fireEvent.change(input, { target: { value: "previous session" } });
+    expect(actionNames()[0]).toContain("Previous session");
+  });
+
   it("opens the keyboard shortcuts once the palette has closed", async () => {
     const opened = vi.fn(() => expect(screen.queryByRole("dialog")).toBeNull());
     window.addEventListener(KEYBOARD_SHORTCUTS_EVENT, opened);
