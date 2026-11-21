@@ -1,6 +1,9 @@
 // The workspace sidebar's tab strip and the selected place's content.
 
 import { WorkspacePlaceView } from "./placeViews/WorkspacePlaceView";
+import { TerminalTabStatus } from "./TerminalTabStatus";
+import { type TerminalTabConnection, terminalTabSpins } from "./terminalTabConnection";
+import { useTerminalTabConnections } from "./useTerminalTabConnection";
 import { isPinnedTab } from "./pinnedTabs";
 import { reorderStripEntries, type StripReorderEntry } from "./stripReorder";
 import { pinnedTabsMaxWidth, TAB_GAP } from "./tabStripWidth";
@@ -315,9 +318,25 @@ function WorkspaceTabsPanelImpl({
   const {
     terminals,
     listCompleteAt,
+    isFetching: terminalsFetching,
     error: terminalsError,
   } = useTerminals(pending ? null : conversationId);
   const terminalsLoaded = (listCompleteAt ?? 0) > 0 && terminalsError === null;
+  const shellOf = (tab: WorkspaceTab, key: string) => ({
+    key,
+    inventory: store.resourceState(tab.id),
+  });
+  // One resolved connection per shell tab, which its body and its strip icon share.
+  const tabConnections = useTerminalTabConnections(conversationId, store.shellWaits, {
+    liveness: liveness?.kind ?? "unknown",
+    // A failed list that's being asked for again connects until the answer comes.
+    listFailed: terminalsError !== null && !terminalsFetching,
+    shells: knownTabs.flatMap((tab) =>
+      tab.binding?.kind === "terminal" ? [shellOf(tab, tab.binding.key)] : [],
+    ),
+  });
+  const retryTerminals = tabConnections.tryAgain;
+  const resumeSession = () => void tabConnections.resumeSession();
   // Shell tabs that have shown their terminal, by tab and shell, so a failed list refresh
   // keeps them mounted. Recorded after commit and pruned to the tabs still open.
   const shellTabKeys = knownTabs.flatMap((tab) =>
@@ -421,7 +440,11 @@ function WorkspaceTabsPanelImpl({
       agentName: place.kind === "agent" ? agentLabels[subagentTabId(place.id)] : undefined,
       // Side chats are numbered in strip order, as the classic strip numbers them.
       chatTitle: place.kind === "chat" ? `Side chat ${chatTabs.indexOf(tab) + 1}` : undefined,
-      connecting: false,
+      // An attached shell shows its terminal, so its icon follows that, not the list.
+      connecting:
+        binding?.kind === "terminal" &&
+        !attachedShells.has(attachedShellKey(tab.id, binding.key)) &&
+        terminalTabSpins(tabConnections.connectionOf(shellOf(tab, binding.key))),
       // A session file tab's place among the changes; a range lists other files.
       changedFiles: place.kind === "changes" && !place.range ? orderedChangedPaths : undefined,
     });
@@ -898,21 +921,28 @@ function WorkspaceTabsPanelImpl({
         );
       case "terminal": {
         const shellState = store.resourceState(tab.id);
-        if (tab.binding?.kind !== "terminal" || shellState === "gone") {
-          return <Unavailable text="This shell has ended." />;
-        }
         // Until the shell list confirms it, a shell isn't ended; an attached one stays put.
         if (
-          shellState !== "live" &&
-          !attachedShells.has(attachedShellKey(tab.id, tab.binding.key))
+          tab.binding?.kind !== "terminal" ||
+          shellState === "gone" ||
+          (shellState !== "live" && !attachedShells.has(attachedShellKey(tab.id, tab.binding.key)))
         ) {
-          return terminalsError ? (
-            <Unavailable text="Couldn’t reach this session’s shells." />
-          ) : (
-            <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 text-muted-foreground">
-              <Spinner />
-              <span className="text-ui">Connecting to the shell…</span>
-            </div>
+          const connection: TerminalTabConnection =
+            tab.binding?.kind === "terminal"
+              ? tabConnections.connectionOf(shellOf(tab, tab.binding.key))
+              : { kind: "ended" };
+          return (
+            <TerminalTabStatus
+              connection={connection}
+              sandboxNotice={tabConnections.sandboxNotice(connection)}
+              onResumeSession={isEditorLevel(permissionLevel) ? resumeSession : undefined}
+              resumingSession={tabConnections.resumingSession}
+              onTryAgain={retryTerminals}
+              // Only the owner can attach a runner, so only the owner gets the command.
+              localReconnectCommand={
+                isOwnerLevel(permissionLevel) ? tabConnections.localReconnectCommand : undefined
+              }
+            />
           );
         }
         return (

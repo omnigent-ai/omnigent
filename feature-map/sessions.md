@@ -609,7 +609,7 @@ pressing Reconnect host does. Each opening checks once, so a session that sleeps
 while it stays open waits for Reconnect host, a Files, Changes or Pull
 Requests pick, or a message. Every way of waking
 the sandbox (Reconnect host, opening the session, Files or Changes, the
-terminal's Resume) joins one wake per session, including after switching to
+terminal's Resume, and a tabs-sidebar shell tab's Resume sandbox or Retry) joins one wake per session, including after switching to
 another session and back, and the Files and Pull Requests views say the
 sandbox is starting while it runs or the server reports its launch.
 

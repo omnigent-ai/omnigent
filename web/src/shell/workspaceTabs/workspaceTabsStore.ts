@@ -7,6 +7,7 @@ import { randomUUID } from "@/lib/randomUUID";
 import { newPendingSideChatId } from "@/lib/sideChat";
 
 import { isPinnedTab, withPinnedFirst } from "./pinnedTabs";
+import { createShellWaits } from "./shellWaits";
 import { type HistoryMoveOptions, WorkspaceHistory } from "./workspaceHistory";
 import {
   bindingForPlace,
@@ -221,6 +222,7 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
   const stamp = () => revision - excusedChanges;
   let saveFailureReported = false;
   let terminalInventory: TerminalInventory = { status: "unknown" };
+  const shellWaits = createShellWaits();
   // Shells seen in a loaded list this run, or saved from an earlier one. Only those
   // can end; a shell that is still starting stays "Connecting…" until it appears.
   const seenTerminals = new Set<string>(
@@ -1156,6 +1158,7 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
     move,
     reorder,
     resourceState,
+    shellWaits,
     setTerminalInventory: (inventory: TerminalInventory) =>
       transact(() => setTerminalInventory(inventory)),
     completeDraftChat,
