@@ -160,6 +160,23 @@ While the credential-check spinner is visible, click Skip to continue without
 verification. Confirm this starts one session without sign-in; later launches
 must check credentials again. Skipping does not guarantee sandbox authentication.
 
+## Arca connect console copy
+
+`desktop_arca_connect_copy.e2e.js` opens the shell-owned Connect Arca console
+from the SPA's Run on Arca option. A preload enables the Databricks gates for the
+local server, and a stand-in `arca` fails with `OMNIGENT_AUTH_REQUIRED`. The test
+copies the host command, the red status line, and a terminal output row, with the
+keyboard shortcut and with the right-click menu's Copy item. It checks each
+copied text on the system clipboard.
+
+```sh
+OMNIGENT_PW_NO_SANDBOX=1 xvfb-run -a node --test e2e/desktop_arca_connect_copy.e2e.js
+```
+
+Human check on macOS with a managed server: open Run on Arca, then select and
+copy the command with right-click → Copy and with Cmd+C. Confirm, let it fail,
+and copy the status line and a terminal output line the same way.
+
 ## Authoring a desktop reproduction
 
 For macOS titlebar clearance, build the SPA and run
