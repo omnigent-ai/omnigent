@@ -1,7 +1,8 @@
 """End-to-end test: ``instructions:`` field loading (mock LLM).
 
 The model request must contain the instructions, and the one-shot CLI
-must print the scripted reply.
+must print the scripted reply. Each run uses an ephemeral server so parallel
+tests do not contend for the persistent local server's preferred port.
 
 **What breaks if this fails:**
 - ``omnigent/inner/loader.py::_resolve_instructions`` regresses.
@@ -87,6 +88,7 @@ def _argv_run_omnigent(
         _HARNESS,
         "-p",
         prompt,
+        "--no-session",
         "--no-log",
     ]
 
