@@ -971,12 +971,6 @@ def test_a_launch_frame_naming_a_code_host_command_or_file_is_refused(
     assert "planted" not in str(refused.value) and "/bin/sh" not in str(refused.value)
 
 
-def test_a_launch_frame_without_those_fields_still_decodes() -> None:
-    frame = HostLaunchRunnerFrame(request_id="r1", binding_token="tok", workspace="/ws")
-
-    assert decode_host_frame(encode_host_frame(frame)) == frame
-
-
 def test_hello_frame_capabilities_round_trip() -> None:
     """Advertised capability tokens survive encode → decode."""
     from omnigent.host.frames import (

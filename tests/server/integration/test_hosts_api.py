@@ -413,18 +413,8 @@ async def test_code_host_instances_are_listed_only_while_served(
         assert "code_host_instances" not in detail
 
 
-@pytest.mark.parametrize(
-    "field",
-    [
-        "cli",
-        "command",
-        "env",
-        "env_set",
-        "code_host_instances",
-        "code_host_instances_file",
-        "code_host_instance_hosts",
-    ],
-)
+# Representative fields; the frame decoder's tests cover every refused field.
+@pytest.mark.parametrize("field", ["cli", "code_host_instances_file"])
 async def test_a_launch_request_naming_a_code_host_command_is_refused(
     db_uri: str, field: str
 ) -> None:
