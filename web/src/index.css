@@ -1278,7 +1278,7 @@ aside[aria-label="Workspace"][data-maximized] {
   background: var(--card-solid) !important;
 }
 
-/* Floating panes (the shell's data-floating-panes, md and wider): the session's chat and the
+/* Floating panes (the shell's data-floating-panes, 48rem and wider): the session's chat and the
  * workspace sidebar are rounded cards on the left sidebar's color, below one top row that
  * carries the session header and the sidebar's tabs. */
 :root {
@@ -1294,70 +1294,57 @@ aside[aria-label="Workspace"][data-maximized] {
     var(--app-shell-bg);
 }
 
-/* Nothing divides the sidebar from the panes: they float over its own color. */
-.app-shell[data-floating-panes] .conversations-sidebar:not(.is-peek) {
-  @variant md {
+/* Every floating rule shares one gate: windows 48rem and wider, in a browser or the desktop app. */
+@media (width >= 48rem) {
+  /* Nothing divides the sidebar from the panes: they float over its own color. */
+  .app-shell[data-floating-panes] .conversations-sidebar:not(.is-peek) {
     border-right: none;
     box-shadow: none;
   }
-}
 
-/* The dark sidebar's surface image measured from the window's corner, for a backdrop that spans
- * past the sidebar. A 135deg gradient's position is (x + y) / sqrt(2) from that corner whatever
- * its box, so a stop at 60% of the sidebar's own diagonal paints the sidebar as its own surface
- * does and runs on past its edge with no step. Same colors as --sidebar-surface-image. */
-.dark .app-shell[data-floating-panes] {
-  --floating-backdrop-image:
-    linear-gradient(transparent 35%, rgb(255 255 255 / 6%)),
-    linear-gradient(
-      135deg,
-      rgb(255 255 255 / 4%),
-      transparent calc(0.6 * (var(--app-sidebar-width, 0px) + 100dvh) * 0.7071)
-    );
-}
+  /* The dark sidebar's surface image measured from the window's corner, for a backdrop that spans
+   * past the sidebar. A 135deg gradient's position is (x + y) / sqrt(2) from that corner whatever
+   * its box, so a stop at 60% of the sidebar's own diagonal paints the sidebar as its own surface
+   * does and runs on past its edge with no step. Same colors as --sidebar-surface-image. */
+  .dark .app-shell[data-floating-panes] {
+    --floating-backdrop-image:
+      linear-gradient(transparent 35%, rgb(255 255 255 / 6%)),
+      linear-gradient(
+        135deg,
+        rgb(255 255 255 / 4%),
+        transparent calc(0.6 * (var(--app-sidebar-width, 0px) + 100dvh) * 0.7071)
+      );
+  }
 
-/* The backdrop the panes float over is the sidebar's color, all the way across. */
-:root:not(.dark) .app-shell[data-floating-panes] {
-  @variant md {
+  /* The backdrop the panes float over is the sidebar's color, all the way across. */
+  :root:not(.dark) .app-shell[data-floating-panes] {
     background: var(--sidebar-background, var(--sidebar));
   }
-}
-.dark .app-shell[data-floating-panes] {
-  @variant md {
+  .dark .app-shell[data-floating-panes] {
     background: var(--floating-backdrop-image) !important;
     background-color: var(--sidebar) !important;
   }
-}
-/* That backdrop is the one surface: the docked sidebar and the terminal view paint none of their
- * own over it, since a gradient sized to their own boxes steps at their edges. */
-.dark .app-shell[data-floating-panes] .omnigent-sidebar-panel:not(.is-peek),
-.dark .app-shell[data-floating-panes] .main-terminal-view {
-  @variant md {
+  /* That backdrop is the one surface: the docked sidebar and the terminal view paint none of their
+   * own over it, since a gradient sized to their own boxes steps at their edges. */
+  .dark .app-shell[data-floating-panes] .omnigent-sidebar-panel:not(.is-peek),
+  .dark .app-shell[data-floating-panes] .main-terminal-view {
     background: none;
   }
-}
 
-/* An open sidebar owns the gap beside the panes, so its resize band reaches the panes' edge. */
-.app-shell[data-floating-panes][data-sidebar-open] .conversations-sidebar:not(.is-peek) {
-  @variant md {
+  /* An open sidebar owns the gap beside the panes, so its resize band reaches the panes' edge. */
+  .app-shell[data-floating-panes][data-sidebar-open] .conversations-sidebar:not(.is-peek) {
     padding-right: var(--pane-gap);
   }
-}
-.app-shell[data-floating-panes][data-sidebar-open] [data-main-view] {
-  @variant md {
+  .app-shell[data-floating-panes][data-sidebar-open] [data-main-view] {
     --pane-gap-start: 0px;
   }
-}
 
-/* One top row runs across the session column and the workspace sidebar, on the backdrop. */
-.app-shell[data-floating-panes] {
-  @variant md {
+  /* One top row runs across the session column and the workspace sidebar, on the backdrop. */
+  .app-shell[data-floating-panes] {
     --shell-top-row: 48px;
   }
-}
-/* A session's chat is a pane: a rounded card on the chat's surface, below the top row. */
-.app-shell[data-floating-panes] [data-main-view="chat"] > main[data-session-id] {
-  @variant md {
+  /* A session's chat is a pane: a rounded card on the chat's surface, below the top row. */
+  .app-shell[data-floating-panes] [data-main-view="chat"] > main[data-session-id] {
     margin: var(--pane-gap);
     margin-top: calc(var(--shell-top-row) + var(--pane-cell-gap));
     margin-left: calc(var(--pane-gap-start, var(--pane-gap)) + var(--pane-cell-gap));
@@ -1366,58 +1353,42 @@ aside[aria-label="Workspace"][data-maximized] {
     background: var(--background);
     overflow: clip;
   }
-}
-.dark .app-shell[data-floating-panes] [data-main-view="chat"] > main[data-session-id] {
-  @variant md {
+  .dark .app-shell[data-floating-panes] [data-main-view="chat"] > main[data-session-id] {
     background: var(--floating-card-canvas);
   }
-}
-/* The session header is the top row, not a pane's: it sits on the backdrop with no glass. */
-.app-shell[data-floating-panes] [data-main-view] > .chat-header {
-  @variant md {
+  /* The session header is the top row, not a pane's: it sits on the backdrop with no glass. */
+  .app-shell[data-floating-panes] [data-main-view] > .chat-header {
     height: var(--shell-top-row);
     padding-block: 0;
     left: var(--pane-gap-start, var(--pane-gap));
     right: calc(var(--workspace-panel-offset, 0px) + var(--pane-gap));
   }
-}
-.app-shell[data-floating-panes] [data-main-view] > .chat-header.session-header-glass::before {
-  @variant md {
+  .app-shell[data-floating-panes] [data-main-view] > .chat-header.session-header-glass::before {
     display: none;
   }
-}
-/* Nothing scrolls under the header any more, so the transcript and the terminal need no room
- * for it. */
-.app-shell[data-floating-panes] .chat-conversation-content.pt-20 {
-  @variant md {
+  /* Nothing scrolls under the header any more, so the transcript and the terminal need no room
+   * for it. */
+  .app-shell[data-floating-panes] .chat-conversation-content.pt-20 {
     padding-top: 1.5rem;
   }
-}
-.app-shell[data-floating-panes] [data-main-view="chat"] .main-terminal-view {
-  @variant md {
+  .app-shell[data-floating-panes] [data-main-view="chat"] .main-terminal-view {
     padding-top: 0;
   }
-}
 
-/* The workspace sidebar's tabs are its part of the top row; its body is a card that kisses the
- * window's right edge, rounded only where it faces the panes. */
-.app-shell[data-floating-panes] aside[aria-label="Workspace"]:not([data-maximized]) {
-  @variant md {
+  /* The workspace sidebar's tabs are its part of the top row; its body is a card that kisses the
+   * window's right edge, rounded only where it faces the panes. */
+  .app-shell[data-floating-panes] aside[aria-label="Workspace"]:not([data-maximized]) {
     border-left-width: 0;
     background: transparent !important;
   }
-}
-.app-shell[data-floating-panes] aside[aria-label="Workspace"] .workspace-tab-strip {
-  @variant md {
+  .app-shell[data-floating-panes] aside[aria-label="Workspace"] .workspace-tab-strip {
     height: var(--shell-top-row);
     padding-block: 0;
     border-bottom-width: 0;
   }
-}
-.app-shell[data-floating-panes]
-  aside[aria-label="Workspace"]:not([data-maximized])
-  [data-workspace-panel-content] {
-  @variant md {
+  .app-shell[data-floating-panes]
+    aside[aria-label="Workspace"]:not([data-maximized])
+    [data-workspace-panel-content] {
     margin-top: var(--pane-cell-gap);
     margin-bottom: var(--pane-gap);
     border: 1px solid var(--pane-card-border);
@@ -1425,13 +1396,11 @@ aside[aria-label="Workspace"][data-maximized] {
     border-radius: var(--radius-lg, 0.5rem) 0 0 var(--radius-lg, 0.5rem);
     background: var(--background);
   }
-}
-/* Full screen, the body fills the window below the top row: only the corner facing the
- * sidebar is rounded, and it runs flush to the window's right and bottom edges. */
-.app-shell[data-floating-panes]
-  aside[aria-label="Workspace"][data-maximized]
-  [data-workspace-panel-content] {
-  @variant md {
+  /* Full screen, the body fills the window below the top row: only the corner facing the
+   * sidebar is rounded, and it runs flush to the window's right and bottom edges. */
+  .app-shell[data-floating-panes]
+    aside[aria-label="Workspace"][data-maximized]
+    [data-workspace-panel-content] {
     margin-top: var(--pane-cell-gap);
     margin-left: var(--pane-gap);
     border-top: 1px solid var(--pane-card-border);
@@ -1439,74 +1408,67 @@ aside[aria-label="Workspace"][data-maximized] {
     border-top-left-radius: var(--radius-lg, 0.5rem);
     background: var(--background);
   }
-}
-/* Beside the conversations sidebar, the same gap a pane card keeps there. */
-.app-shell[data-floating-panes][data-sidebar-open]
-  aside[aria-label="Workspace"][data-maximized]
-  [data-workspace-panel-content] {
-  @variant md {
+  /* Beside the conversations sidebar, the same gap a pane card keeps there. */
+  .app-shell[data-floating-panes][data-sidebar-open]
+    aside[aria-label="Workspace"][data-maximized]
+    [data-workspace-panel-content] {
     margin-left: var(--pane-cell-gap);
   }
-}
-.dark .app-shell[data-floating-panes] aside[aria-label="Workspace"] [data-workspace-panel-content] {
-  @variant md {
+  .dark
+    .app-shell[data-floating-panes]
+    aside[aria-label="Workspace"]
+    [data-workspace-panel-content] {
     background: var(--floating-card-canvas);
   }
-}
-/* Full screen sits on the backdrop, edge to edge with the sidebar, and paints it opaquely: it
- * covers the chat. */
-.app-shell[data-floating-panes] aside[aria-label="Workspace"][data-maximized] {
-  @variant md {
+  /* Full screen sits on the backdrop, edge to edge with the sidebar, and paints it opaquely: it
+   * covers the chat. */
+  .app-shell[data-floating-panes] aside[aria-label="Workspace"][data-maximized] {
     border-left-width: 0;
   }
-}
-:root:not(.dark) .app-shell[data-floating-panes] aside[aria-label="Workspace"][data-maximized] {
-  @variant md {
+  :root:not(.dark) .app-shell[data-floating-panes] aside[aria-label="Workspace"][data-maximized] {
     background: var(--sidebar-background, var(--sidebar)) !important;
   }
-}
-.dark .app-shell[data-floating-panes] aside[aria-label="Workspace"][data-maximized] {
-  @variant md {
+  .dark .app-shell[data-floating-panes] aside[aria-label="Workspace"][data-maximized] {
     background-image:
       var(--floating-backdrop-image), linear-gradient(var(--sidebar), var(--sidebar)) !important;
     background-attachment: fixed !important;
     background-color: var(--background) !important;
   }
-}
 
-/* The sidebar's tabs sit on the backdrop: the selected tab takes the card's color and a soft
- * lift, the others a faint fill of their own. The fills set the tabs apart, so the dividers go. */
-.app-shell[data-floating-panes] aside[aria-label="Workspace"] [data-tab-strip-entry] {
-  background: color-mix(in srgb, var(--foreground) 5%, transparent);
-}
-.app-shell[data-floating-panes] aside[aria-label="Workspace"] [data-tab-strip-entry]:hover {
-  background: color-mix(in srgb, var(--foreground) 8%, transparent);
-}
-.app-shell[data-floating-panes]
-  aside[aria-label="Workspace"]
-  [data-tab-strip-entry][data-selected] {
-  background: var(--background);
-  box-shadow:
-    0 1px 2px rgb(0 0 0 / 8%),
-    0 0 0 0.5px color-mix(in srgb, var(--foreground) 6%, transparent);
-}
-.dark .app-shell[data-floating-panes] aside[aria-label="Workspace"] [data-tab-strip-entry] {
-  background: color-mix(in srgb, var(--foreground) 4%, transparent);
-}
-.dark .app-shell[data-floating-panes] aside[aria-label="Workspace"] [data-tab-strip-entry]:hover {
-  background: color-mix(in srgb, var(--foreground) 7%, transparent);
-}
-.dark
+  /* The sidebar's tabs sit on the backdrop: the selected tab takes the card's color and a soft
+   * lift, the others a faint fill of their own. The fills set the tabs apart, so the dividers go. */
+  .app-shell[data-floating-panes] aside[aria-label="Workspace"] [data-tab-strip-entry] {
+    background: color-mix(in srgb, var(--foreground) 5%, transparent);
+  }
+  .app-shell[data-floating-panes] aside[aria-label="Workspace"] [data-tab-strip-entry]:hover {
+    background: color-mix(in srgb, var(--foreground) 8%, transparent);
+  }
   .app-shell[data-floating-panes]
-  aside[aria-label="Workspace"]
-  [data-tab-strip-entry][data-selected] {
-  background: color-mix(in srgb, var(--foreground) 11%, transparent);
-  box-shadow:
-    0 1px 2px rgb(0 0 0 / 45%),
-    inset 0 0.5px 0 color-mix(in srgb, var(--foreground) 10%, transparent);
-}
-.app-shell[data-floating-panes] aside[aria-label="Workspace"] [data-tab-strip-entry]::before {
-  opacity: 0;
+    aside[aria-label="Workspace"]
+    [data-tab-strip-entry][data-selected] {
+    background: var(--background);
+    box-shadow:
+      0 1px 2px rgb(0 0 0 / 8%),
+      0 0 0 0.5px color-mix(in srgb, var(--foreground) 6%, transparent);
+  }
+  .dark .app-shell[data-floating-panes] aside[aria-label="Workspace"] [data-tab-strip-entry] {
+    background: color-mix(in srgb, var(--foreground) 4%, transparent);
+  }
+  .dark .app-shell[data-floating-panes] aside[aria-label="Workspace"] [data-tab-strip-entry]:hover {
+    background: color-mix(in srgb, var(--foreground) 7%, transparent);
+  }
+  .dark
+    .app-shell[data-floating-panes]
+    aside[aria-label="Workspace"]
+    [data-tab-strip-entry][data-selected] {
+    background: color-mix(in srgb, var(--foreground) 11%, transparent);
+    box-shadow:
+      0 1px 2px rgb(0 0 0 / 45%),
+      inset 0 0.5px 0 color-mix(in srgb, var(--foreground) 10%, transparent);
+  }
+  .app-shell[data-floating-panes] aside[aria-label="Workspace"] [data-tab-strip-entry]::before {
+    opacity: 0;
+  }
 }
 
 /* Label-only tooltips must not block controls beneath their portal wrapper. */

@@ -20,6 +20,7 @@ from PIL import Image
 from playwright.sync_api import Locator, Page, Route, expect
 
 from tests.e2e_ui.conftest import open_right_rail
+from tests.e2e_ui.desktop._mac_shell import MAC_SHELL_INIT_SCRIPT
 
 _VIEWPORT = {"width": 1440, "height": 900}
 
@@ -67,8 +68,16 @@ def _set_features(page: Page, floating: bool) -> None:
     page.route("**/v1/info", answer)
 
 
-def _open(page: Page, base_url: str, session_id: str, *, scheme: str, floating: bool) -> None:
-    page.set_viewport_size(_VIEWPORT)
+def _open(
+    page: Page,
+    base_url: str,
+    session_id: str,
+    *,
+    scheme: str,
+    floating: bool,
+    viewport: dict[str, int] = _VIEWPORT,
+) -> None:
+    page.set_viewport_size(viewport)
     page.emulate_media(color_scheme=scheme)
     _set_features(page, floating)
     page.goto(f"{base_url}/c/{session_id}")
@@ -200,3 +209,46 @@ def test_a_full_screen_workspace_sits_on_the_sidebars_backdrop(
     x_from = max(0, sidebar_right - 24)
     step, at = _largest_step(image, 860, x_from, round(body) - 1)
     assert step <= _MAX_STEP, f"step of {step} at x={x_from + at}"
+
+
+_CHAT_RADIUS_JS = """() => getComputedStyle(
+  document.querySelector('[data-main-view="chat"] > main[data-session-id]')
+).borderTopLeftRadius"""
+
+
+# 48rem is 768px: one side of the gate, then the other.
+@pytest.mark.parametrize(("width", "floats"), [(760, False), (776, True)])
+def test_a_browser_floats_the_panes_from_48rem(
+    page: Page, seeded_session: tuple[str, str], width: int, floats: bool
+) -> None:
+    """In a browser the chat becomes a card at 48rem, below the desktop layout's own breakpoint."""
+    base_url, session_id = seeded_session
+    _open(
+        page,
+        base_url,
+        session_id,
+        scheme="light",
+        floating=True,
+        viewport={"width": width, "height": 900},
+    )
+    expect(page.locator("html")).not_to_have_attribute("data-desktop-app", "true")
+    assert (page.evaluate(_CHAT_RADIUS_JS) != "0px") is floats
+
+
+@pytest.mark.parametrize(("width", "floats"), [(700, False), (800, True)])
+def test_the_desktop_app_floats_the_panes_from_48rem_too(
+    page: Page, seeded_session: tuple[str, str], width: int, floats: bool
+) -> None:
+    """The desktop app keeps its desktop layout at every width, but floats the panes from 48rem."""
+    base_url, session_id = seeded_session
+    page.add_init_script(MAC_SHELL_INIT_SCRIPT)
+    _open(
+        page,
+        base_url,
+        session_id,
+        scheme="light",
+        floating=True,
+        viewport={"width": width, "height": 900},
+    )
+    expect(page.locator("html")).to_have_attribute("data-desktop-app", "true")
+    assert (page.evaluate(_CHAT_RADIUS_JS) != "0px") is floats

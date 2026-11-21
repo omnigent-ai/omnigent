@@ -922,7 +922,9 @@ describe("index.css sidebar canvas", () => {
 });
 
 /** Each top-level rule in `source`: its selector and its whole body, nested `@variant`s included. */
-function topLevelRules(source: string): { selector: string; body: string }[] {
+function topLevelRules(css: string): { selector: string; body: string }[] {
+  // A comment's ";" or braces aren't the stylesheet's.
+  const source = css.replace(/\/\*[\s\S]*?\*\//g, "");
   const rules: { selector: string; body: string }[] = [];
   let depth = 0;
   let start = 0;
@@ -951,7 +953,11 @@ function topLevelRules(source: string): { selector: string; body: string }[] {
 }
 
 describe("index.css floating panes", () => {
-  const rules = topLevelRules(indexCssSource);
+  const FLOATING_GATE = "@media (width >= 48rem)";
+  const topLevel = topLevelRules(indexCssSource);
+  const gates = topLevel.filter((rule) => rule.selector === FLOATING_GATE);
+  // The floating rules, read from inside their one width gate.
+  const rules = gates.flatMap((gate) => topLevelRules(gate.body));
   // Every rule for exactly this selector, as one body.
   const ruleFor = (selector: string) =>
     rules
@@ -959,14 +965,18 @@ describe("index.css floating panes", () => {
       .map((rule) => rule.body.replace(/\s+/g, " "))
       .join(" ");
 
-  it("styles only a shell marked for floating panes", () => {
-    const tokens =
-      /var\(--(pane-gap|pane-cell-gap|pane-card-border|floating-[a-z-]+|shell-top-row)\b/;
-    const users = rules.filter((rule) => tokens.test(rule.body) && rule.selector !== ":root");
-    expect(users.length).toBeGreaterThan(5);
-    for (const rule of users) expect(rule.selector).toContain(".app-shell[data-floating-panes]");
-    // Layout that isn't a card's or the top row's stays to md and wider.
-    for (const rule of users) expect(rule.body).toMatch(/@variant md \{/);
+  it("gates every floating rule at 48rem alone, in a browser and the desktop app alike", () => {
+    expect(gates).toHaveLength(1);
+    expect(rules.length).toBeGreaterThan(20);
+    for (const rule of rules) {
+      expect(rule.selector).toContain(".app-shell[data-floating-panes]");
+      // `md` is 73.8125rem in a browser and every width in the desktop app: not this gate.
+      expect(rule.body).not.toMatch(/@variant|@media/);
+    }
+    const outside = topLevel.filter(
+      (rule) => rule.selector !== FLOATING_GATE && rule.selector.includes("[data-floating-panes]"),
+    );
+    expect(outside).toEqual([]);
   });
 
   it("keeps every control the edge-to-edge layout shows", () => {
