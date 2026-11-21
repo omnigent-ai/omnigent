@@ -20,8 +20,9 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { useProjectConfig, useProjects } from "@/hooks/useConversations";
+import { useProjectConfig, useProjects, useProjectUsage } from "@/hooks/useConversations";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { formatSessionCostUsd } from "@/lib/formatCost";
 import { useNavigate } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { MobileHeaderButton } from "@/shell/MobileHeaderButton";
@@ -80,8 +81,37 @@ export function ProjectHomeTitle({ projectName }: { projectName: string }) {
         small
       />
       <h1 className="min-w-0 truncate text-xl font-medium text-foreground">{projectName}</h1>
+      <ProjectCost projectId={projectId} />
       <ProjectHomeActions projectName={projectName} />
     </div>
+  );
+}
+
+/**
+ * The project's total cost: its sessions and their sub-agents. Shown once any
+ * of them is priced, so an unpriced project never reads as `$0.00`.
+ */
+function ProjectCost({ projectId }: { projectId: string | null }) {
+  const { data: usage } = useProjectUsage(projectId);
+  const cost = usage?.total_cost_usd;
+  if (cost === undefined) return null;
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span
+          tabIndex={0}
+          aria-label={`Project cost ${formatSessionCostUsd(cost)}`}
+          data-testid="project-home-cost"
+          className="shrink-0 font-mono text-xs text-muted-foreground tabular-nums"
+        >
+          {formatSessionCostUsd(cost)}
+        </span>
+      </TooltipTrigger>
+      <TooltipContent side="bottom" className="max-w-64">
+        Cost of this project&apos;s sessions, including sub-agents. Sessions created before cost
+        tracking aren&apos;t counted.
+      </TooltipContent>
+    </Tooltip>
   );
 }
 

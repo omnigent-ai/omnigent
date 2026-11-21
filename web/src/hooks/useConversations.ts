@@ -79,8 +79,10 @@ import {
   createProject as apiCreateProject,
   deleteProject as apiDeleteProject,
   getProject as apiGetProject,
+  getProjectUsage as apiGetProjectUsage,
   listProjects as apiListProjects,
   type ProjectConfig,
+  type ProjectUsage,
   renameProject as apiRenameProject,
   updateProjectConfig as apiUpdateProjectConfig,
 } from "@/lib/projectsApi";
@@ -3266,6 +3268,24 @@ export function useProjectConfig(id: string | null) {
     queryFn: async () => (await apiGetProject(id as string)).config ?? {},
     enabled: id !== null,
     staleTime: 30_000,
+  });
+}
+
+/** How often an open project home re-reads its cost; each read is one stored row. */
+export const PROJECT_USAGE_REFETCH_INTERVAL_MS = 30_000;
+
+/**
+ * Fetch a project's summed usage from `GET /v1/projects/{id}/usage`, refreshed
+ * while the project home is open. Disabled when `id` is `null` (a label-only
+ * folder keeps no total).
+ */
+export function useProjectUsage(id: string | null) {
+  return useQuery<ProjectUsage>({
+    queryKey: ["project-usage", id],
+    queryFn: ({ signal }) => apiGetProjectUsage(id as string, signal),
+    enabled: id !== null,
+    staleTime: PROJECT_USAGE_REFETCH_INTERVAL_MS,
+    refetchInterval: PROJECT_USAGE_REFETCH_INTERVAL_MS,
   });
 }
 

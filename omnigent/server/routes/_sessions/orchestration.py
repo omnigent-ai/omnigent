@@ -2093,7 +2093,11 @@ def _accumulate_session_usage(
             model_delta["total_cost_usd"] = cost_delta
         delta["by_model"] = {llm_model: model_delta}
 
-    new_current = conversation_store.increment_session_usage(session_id, delta)
+    new_current = conversation_store.increment_session_usage(
+        session_id,
+        delta,
+        root_conversation_id=conv.root_conversation_id if conv else None,
+    )
     # Per-user daily rollup (policy-gated; this is the per-turn delta).
     _record_daily_cost(conv, cost_delta, conversation_store)
     return _priced_cost_for_display(new_current)
@@ -2404,7 +2408,11 @@ def _persist_native_cumulative_usage(
                 merged[child_id] = max(float(merged.get(child_id, 0.0)), child_cost)
         current["subagent_costs_usd"] = merged
 
-    conversation_store.set_session_usage(session_id, current)
+    conversation_store.set_session_usage(
+        session_id,
+        current,
+        root_conversation_id=conv.root_conversation_id if conv else None,
+    )
     # Per-user daily rollup. Native reports cumulative totals, so the turn's
     # delta is the increase in cumulative cost. Uses the authoritative
     # ``total_cost_usd`` (= statusLine S), NOT ``policy_cost_usd`` — the
