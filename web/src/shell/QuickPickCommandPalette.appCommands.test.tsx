@@ -22,6 +22,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({ session_search_scope: true }),
 }));
 vi.mock("@/hooks/useConversations", () => ({
+  isAbortTimeout: () => false,
   useConversations: () => ({ data: { pages: [] }, isFetching: false }),
   useSessionSearch: () => ({ isFetching: false }),
   useProjects: () => ({ data: [] }),
