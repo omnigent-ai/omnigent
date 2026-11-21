@@ -737,7 +737,8 @@ class SysSessionGetInfoTool(Tool):
             "agent binding (id/name), runner binding + connectivity, "
             "host + configured harness readiness, reasoning effort, model, "
             "permission_mode (the mode it is in now, named as "
-            "sys_session_create's permission_mode names it; null when its "
+            "sys_session_create's permission_mode names it; a mode that skips "
+            "approval shows only if the session launched in it; null when its "
             "harness has no permission modes or the mode is unknown), "
             "parent session, workspace, project_id, project_name, "
             "persisted last-activity time, and outstanding approval "
@@ -1155,9 +1156,10 @@ class SysSessionCreateTool(Tool):
                                 "harness's vocabulary, e.g. Claude Code 'auto' or Codex "
                                 "'approve-for-me' (agent_id only). Modes that skip "
                                 "approval, such as 'bypassPermissions' or 'full-access', "
-                                "are refused. Omit to start it in your current mode when it "
-                                "runs your harness (a mode that skips approval only on your "
-                                "own host), else in the agent's default."
+                                "are refused. Omit to start it in your current mode when both "
+                                "run Claude Code or Codex and its agent sets none (a mode that "
+                                "skips approval only on your own host), else in the agent's "
+                                "default."
                             ),
                         },
                         "workflow_id": {

@@ -20,6 +20,7 @@ from omnigent.server.scheduled.harness_settings import (
     creator_session_launch_options,
     forget_unrecorded_legacy_run_session,
     note_unrecorded_legacy_run_session,
+    session_permission_mode,
     validate_scheduled_permission_mode,
     validate_scheduled_permission_support,
 )
@@ -317,18 +318,119 @@ async def test_session_keeps_its_agent_default_without_an_applicable_mode(
 _CODEX_APPROVAL_MODE = "omnigent.codex_native.approval_mode"
 _CLAUDE_PERMISSION_MODE = "omnigent.claude_native.permission_mode"
 _CODEX_ARGS = PERMISSION_LAUNCH_ARGS["codex-native"]
+_CODEX_FULL_ACCESS = (_CODEX_ARGS["full-access"], {})
 
 
 @pytest.mark.parametrize(
     ("harness", "labels", "launch_args", "on_creator_host", "expected"),
     [
+        pytest.param("codex-native", {}, _CODEX_ARGS["full-access"], True, _CODEX_FULL_ACCESS),
+        # Codex resumes with the same settings however the args spell them.
         pytest.param(
             "codex-native",
             {},
-            _CODEX_ARGS["full-access"],
+            ["-s", "danger-full-access", "-a", "never", "-c", 'approvals_reviewer="user"'],
             True,
-            (_CODEX_ARGS["full-access"], {}),
-            id="launch-mode",
+            _CODEX_FULL_ACCESS,
+            id="codex-spelling",
+        ),
+        pytest.param(
+            "codex-native",
+            {},
+            ["--dangerously-bypass-approvals-and-sandbox"],
+            True,
+            _CODEX_FULL_ACCESS,
+            id="codex-bypass-flag",
+        ),
+        # No preset matches, so none is widened to fit.
+        pytest.param(
+            "codex-native",
+            {},
+            ["--ask-for-approval", "never", "--sandbox", "workspace-write"],
+            True,
+            None,
+            id="codex-no-preset",
+        ),
+        pytest.param(
+            "codex-native",
+            {},
+            ["-c", 'default_permissions=":danger-full-access"'],
+            True,
+            _CODEX_FULL_ACCESS,
+            id="codex-full-access-profile",
+        ),
+        pytest.param(
+            "codex-native",
+            {},
+            ["-c", 'default_permissions="team"', "-c", 'approval_policy="never"'],
+            True,
+            None,
+            id="codex-custom-profile",
+        ),
+        pytest.param(
+            "codex-native",
+            {},
+            [*_CODEX_ARGS["approve-for-me"], "-c", "sandbox_workspace_write.network_access=true"],
+            True,
+            None,
+            id="codex-custom-config",
+        ),
+        # Text after ``--`` is a prompt, never an option.
+        pytest.param(
+            "codex-native",
+            {},
+            ["--", "--dangerously-bypass-approvals-and-sandbox"],
+            True,
+            None,
+            id="codex-prompt-text",
+        ),
+        pytest.param(
+            "codex-native", {}, ["--", "--approve-for-me"], True, None, id="codex-prompt-text-mode"
+        ),
+        # A file profile can set more than a preset, so none stands in for it...
+        pytest.param(
+            "codex-native",
+            {},
+            ["--profile", "restricted", *_CODEX_ARGS["full-access"]],
+            True,
+            None,
+            id="codex-file-profile",
+        ),
+        # ...though a reported mode that keeps approval still applies.
+        pytest.param(
+            "codex-native",
+            {_CODEX_APPROVAL_MODE: "approve-for-me"},
+            ["-p", "restricted", *_CODEX_ARGS["approve-for-me"]],
+            True,
+            (_CODEX_ARGS["approve-for-me"], {}),
+            id="codex-file-profile-reported-mode",
+        ),
+        pytest.param(
+            "claude-native",
+            {},
+            ["--", "--permission-mode", "bypassPermissions"],
+            True,
+            None,
+            id="claude-prompt-text",
+        ),
+        # Only Claude Code's and Codex's launch settings are read.
+        pytest.param("cursor-native", {}, ["--yolo"], True, None, id="other-harness"),
+        pytest.param("pi", {}, None, True, None, id="no-permission-modes"),
+        pytest.param(
+            "claude-native",
+            {},
+            ["--permission-mode", "plan", "--permission-mode=acceptEdits"],
+            False,
+            (["--permission-mode", "acceptEdits"], {}),
+            id="claude-last-flag",
+        ),
+        pytest.param(
+            "claude-native",
+            {},
+            ["--dangerously-skip-permissions"],
+            True,
+            (["--permission-mode", "bypassPermissions"], {}),
+            id="claude-skip-flag",
         ),
         # A switch through the web picker updates only the reported mode.
         pytest.param(
@@ -337,7 +439,7 @@ _CODEX_ARGS = PERMISSION_LAUNCH_ARGS["codex-native"]
             _CODEX_ARGS["full-access"],
             True,
             (_CODEX_ARGS["approve-for-me"], {}),
-            id="reported-mode-wins",
+            id="reported-mode",
         ),
         pytest.param(
             "codex-native",
@@ -346,6 +448,32 @@ _CODEX_ARGS = PERMISSION_LAUNCH_ARGS["codex-native"]
             True,
             (None, {CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "1"}),
             id="bypass",
+        ),
+        # A bypass launch switched to a mode that asks keeps asking.
+        pytest.param(
+            "codex-native",
+            {CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "1", _CODEX_APPROVAL_MODE: "ask-for-approval"},
+            None,
+            True,
+            (_CODEX_ARGS["ask-for-approval"], {}),
+            id="bypass-switched",
+        ),
+        # Editors can write the reported mode, so it never skips approval.
+        pytest.param(
+            "codex-native",
+            {_CODEX_APPROVAL_MODE: "full-access"},
+            _CODEX_ARGS["approve-for-me"],
+            True,
+            (_CODEX_ARGS["approve-for-me"], {}),
+            id="reported-approval-skipping-mode",
+        ),
+        pytest.param(
+            "claude-native",
+            {_CLAUDE_PERMISSION_MODE: "bypassPermissions"},
+            None,
+            True,
+            None,
+            id="reported-claude-bypass",
         ),
         pytest.param(
             "claude-native",
@@ -366,8 +494,8 @@ _CODEX_ARGS = PERMISSION_LAUNCH_ARGS["codex-native"]
         ),
         pytest.param(
             "claude-native",
-            {_CLAUDE_PERMISSION_MODE: "bypassPermissions"},
-            None,
+            {},
+            ["--permission-mode", "bypassPermissions"],
             False,
             None,
             id="claude-bypass-off-host",
@@ -414,6 +542,27 @@ def test_creator_mode_needs_the_same_harness(
     )
     options = creator_session_launch_options(
         creator, harness=harness, creator_harness=creator_harness, on_creator_host=True
+    )
+    assert options is None
+
+
+@pytest.mark.parametrize(
+    ("harness", "launch_args", "expected"),
+    [
+        ("cursor-native", ["--yolo"], "yolo"),
+        ("devin-native", ["--permission-mode", "smart"], "smart"),
+        # Text after ``--`` is the prompt, not an option.
+        ("cursor-native", ["--", "--yolo"], None),
+    ],
+)
+def test_other_harnesses_report_their_launch_mode_without_passing_it_on(
+    harness: str, launch_args: list[str], expected: str | None
+) -> None:
+    """Only Claude Code's and Codex's launch settings pass a mode to a session they start."""
+    session = SimpleNamespace(labels={}, terminal_launch_args=launch_args)
+    assert session_permission_mode(session, harness) == expected
+    options = creator_session_launch_options(
+        session, harness=harness, creator_harness=harness, on_creator_host=True
     )
     assert options is None
 

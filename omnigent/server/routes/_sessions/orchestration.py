@@ -12778,6 +12778,24 @@ def _created_session_title(body: SessionCreateInput, workflow: Workflow | None) 
     return workflow.name
 
 
+# Agent-spec keys with which a worker's own agent chooses its permission mode.
+_SPEC_PERMISSION_MODE_KEYS = ("permission_mode", "yolo", "exec_mode")
+
+
+def _spec_leaves_permission_mode_open(spec: AgentSpec | None) -> bool:
+    """
+    Whether *spec* was read and chooses no permission mode of its own, even its default.
+
+    A spec the server couldn't read might choose one, so it never counts as open.
+
+    :param spec: The new session's agent spec, or ``None`` when it couldn't be loaded.
+    :returns: ``True`` when the spec sets none of :data:`_SPEC_PERMISSION_MODE_KEYS`.
+    """
+    if spec is None:
+        return False
+    return not any(key in spec.executor.config for key in _SPEC_PERMISSION_MODE_KEYS)
+
+
 def _creator_permission_launch_options(
     creator: Conversation,
     body: SessionCreateInput,
@@ -13463,33 +13481,23 @@ async def _create_session_from_existing_agent(
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
 
-    # A worker can do without asking what the session that started it can: it runs
-    # in the automation's permission mode when an automation's run starts it, else
-    # in its creator's, instead of its agent's default. A mode the request names wins.
-    inherited_launch_options: tuple[list[str] | None, dict[str, str]] | None = None
+    # Workers an automation's run starts are unattended like the run itself, so they
+    # use the automation's permission mode instead of their agent's default. A mode
+    # the request names wins.
+    automation_launch_options: tuple[list[str] | None, dict[str, str]] | None = None
     if not body.sub_agent_name and validated_launch_args is None and body.permission_mode is None:
         from omnigent.server.scheduled.harness_settings import automation_session_launch_options
 
-        inherited_launch_options = await automation_session_launch_options(
+        automation_launch_options = await automation_session_launch_options(
             getattr(request.app.state, "scheduled_task_store", None),
             created_by_scheduled_task_id,
             source_session_id=created_by_session_id,
             user_id=user_id,
             harness=selected_harness,
         )
-        if inherited_launch_options is None and created_by is not None:
-            inherited_launch_options = await asyncio.to_thread(
-                _creator_permission_launch_options,
-                created_by,
-                body,
-                harness=selected_harness,
-                conversation_store=conversation_store,
-                agent_store=agent_store,
-                agent_cache=agent_cache,
-            )
-    inherited_permission_labels: dict[str, str] = {}
-    if inherited_launch_options is not None:
-        validated_launch_args, inherited_permission_labels = inherited_launch_options
+    automation_permission_labels: dict[str, str] = {}
+    if automation_launch_options is not None:
+        validated_launch_args, automation_permission_labels = automation_launch_options
 
     # Spec-seeded defaults: a self-resolved agent's stored spec supplies the
     # spec-level reasoning effort and, when the body carried no launch args,
@@ -13501,7 +13509,7 @@ async def _create_session_from_existing_agent(
         not body.sub_agent_name
         and validated_launch_args is None
         and body.permission_mode is None
-        and inherited_launch_options is None
+        and automation_launch_options is None
     )
     needs_effort_from_spec = reasoning_effort is None and sub_spec is None
     if (
@@ -13540,6 +13548,27 @@ async def _create_session_from_existing_agent(
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
 
+    # Inherit the creator's mode only when the request, automation and readable spec
+    # select none.
+    creator_permission_labels: dict[str, str] = {}
+    if (
+        needs_launch_args_from_spec
+        and validated_launch_args is None
+        and created_by is not None
+        and _spec_leaves_permission_mode_open(own_spec)
+    ):
+        creator_launch_options = await asyncio.to_thread(
+            _creator_permission_launch_options,
+            created_by,
+            body,
+            harness=selected_harness,
+            conversation_store=conversation_store,
+            agent_store=agent_store,
+            agent_cache=agent_cache,
+        )
+        if creator_launch_options is not None:
+            validated_launch_args, creator_permission_labels = creator_launch_options
+
     if reasoning_effort is None:
         effort_spec: AgentSpec | None = sub_spec if sub_spec is not None else own_spec
         spec_effort = effort_spec.executor.reasoning_effort if effort_spec is not None else None
@@ -13563,7 +13592,8 @@ async def _create_session_from_existing_agent(
     if launched_by_scheduled_task_id is not None:
         initial_labels[SCHEDULED_TASK_LAUNCH_LABEL_KEY] = launched_by_scheduled_task_id
     initial_labels.update(registry_labels)
-    initial_labels.update(inherited_permission_labels)
+    initial_labels.update(automation_permission_labels)
+    initial_labels.update(creator_permission_labels)
     initial_labels.update(inherited_mcp_labels)
     if created_worktree_path is not None:
         from omnigent.server.routes._host_worktree import (

@@ -22,8 +22,10 @@ MCP independent creation.
   Existing owner-authorized reads remain allowed when a session is shared.
   `sys_session_get_info` reports the session's `permission_mode` in its
   harness's vocabulary, as `sys_session_create` takes it, including a switch
-  made while it runs; `null` when the harness has no permission modes or the
-  mode is unknown. Coverage: `tests/e2e/test_session_info_permission_mode_e2e.py`.
+  made while it runs to a mode that keeps approval. A mode that skips approval
+  shows only when the session launched in it, since anyone who can edit the
+  session can write the reported mode; `null` when the harness has no
+  permission modes or the mode is unknown. Coverage: `tests/e2e/test_session_info_permission_mode_e2e.py`.
 - `created-by`: independent workers record their creating session. The worker's
   Chat/Terminal header rechecks access when opened, hides attribution during the
   lookup, and links to the creator when accessible; otherwise it says "Created by
@@ -55,11 +57,12 @@ MCP independent creation.
   An optional `permission_mode` starts the session in a mode of its harness;
   modes that skip approval are refused, and on a server that doesn't advertise
   `session_create_permission_modes` the tool refuses the call before creating anything.
-  Without one, an independent session that runs its creator's harness starts in
-  the mode the creator is in, so a workflow run's nested agents work as
-  unattended as the run; a mode that skips approval carries over only onto the
-  creator's own host. An automation that sets a mode gives it to its run's
-  workers first (see `scheduled`). Coverage:
+  Without one, an independent session that runs its creator's harness, Claude
+  Code or Codex, starts in the mode the creator is in, so a workflow run's
+  nested agents work as unattended as the run; a mode that skips approval comes
+  only from the creator's launch settings and carries over only onto its own
+  host. An automation that sets a mode gives it to its run's workers first (see
+  `scheduled`), and a worker whose agent sets a mode keeps it. Coverage:
   `tests/e2e/test_nested_agent_permission_mode_e2e.py`.
   An optional `workflow_id` (agent_id only) starts the session as a run of one
   of the owner's saved workflows, with that workflow's plan already in its
