@@ -82,7 +82,8 @@ export function domPaneFocus(
         left(event.target);
       };
       const onFocusIn = (event: FocusEvent) => {
-        if (within(document.activeElement)) entered(event.target);
+        if (!within(event.target) || within(event.relatedTarget)) return;
+        entered(event.target);
       };
       const onAct = (event: Event) => {
         if (within(event.target)) acted();

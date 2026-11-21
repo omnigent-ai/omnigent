@@ -97,12 +97,17 @@ describe("domPaneFocus", () => {
     const unsubscribe = focus.subscribe(listener);
 
     left.focus();
-    expect(listener.entered).toHaveBeenLastCalledWith(left);
-    // Moving between panes stays inside them: nothing left.
+    expect(listener.entered).toHaveBeenCalledExactlyOnceWith(left);
+    // Moving between panes stays inside them: nothing left, nothing entered.
     right.focus();
     expect(listener.left).not.toHaveBeenCalled();
+    expect(listener.entered).toHaveBeenCalledOnce();
     outside.focus();
     expect(listener.left).toHaveBeenCalledExactlyOnceWith(right);
+    right.focus();
+    expect(listener.entered).toHaveBeenCalledTimes(2);
+    expect(listener.entered).toHaveBeenLastCalledWith(right);
+    outside.focus();
 
     outside.dispatchEvent(new Event("pointerdown", { bubbles: true }));
     expect(listener.acted).not.toHaveBeenCalled();
@@ -113,6 +118,7 @@ describe("domPaneFocus", () => {
     left.focus();
     left.dispatchEvent(new Event("pointerdown", { bubbles: true }));
     expect(listener.entered).toHaveBeenCalledTimes(2);
+    expect(listener.left).toHaveBeenCalledTimes(2);
     expect(listener.acted).toHaveBeenCalledOnce();
   });
 });
