@@ -997,11 +997,7 @@ def _pr_view_json(root: str, fields: str, *, token: str | None = None) -> dict[s
 
 
 def _repo_payload(name_with_owner: str | None, url: object) -> dict[str, Any]:
-    """The ``repo`` payload; ``host`` is omitted when ``url`` names none.
-
-    This provider also serves Enterprise hosts, so clients need the host to tell
-    a github.com repo from an Enterprise repo with the same name.
-    """
+    """The repo payload; the forge host (omitted when unknown) tells github.com from Enterprise."""
     repo: dict[str, Any] = {"name_with_owner": name_with_owner}
     host = host_of(url) if isinstance(url, str) else None
     if host:

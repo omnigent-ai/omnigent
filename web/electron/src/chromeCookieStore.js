@@ -21,17 +21,20 @@ const execFileAsync = promisify(execFile);
 
 /** Chrome's encryption key lives under this Keychain generic password. */
 const SAFE_STORAGE_SERVICE = "Chrome Safe Storage";
+/** The account name Google Chrome files that password under. */
+const SAFE_STORAGE_ACCOUNT = "Chrome";
 
-// Absolute paths: a GUI-launched shell has a minimal PATH, and a PATH lookup
-// would let a planted binary stand in for the one that reads Chrome's key.
+// Absolute path: a GUI-launched shell has a minimal PATH, and a PATH lookup
+// would let a planted binary stand in for the one that reads Chrome's jar.
 const SQLITE3_BINARY = "/usr/bin/sqlite3";
-const SECURITY_BINARY = "/usr/bin/security";
 /** Chrome's PBKDF2 parameters for the "v10" AES key (unchanged since 2013). */
 const KEY_SALT = "saltysalt";
 const KEY_ITERATIONS = 1003;
 const KEY_LENGTH = 16;
 /** The Keychain read blocks on a system approval dialog the first time. */
 const KEYCHAIN_TIMEOUT_MS = 120_000;
+const KEYCHAIN_TIMEOUT_MESSAGE =
+  "Timed out waiting for Keychain access. Retry and approve the prompt.";
 /** Seconds between the Windows/Chrome epoch (1601-01-01) and the Unix epoch. */
 const CHROME_EPOCH_OFFSET_SECONDS = 11644473600;
 /** Chrome 130+ prepends SHA-256(host_key) to the plaintext (domain binding). */
@@ -599,40 +602,57 @@ async function readAllSitesRows({ cookieDbPath, run = execFileAsync, fsImpl = fs
   }
 }
 
+/** The in-process Keychain binding, loaded on first use: only an import needs it. */
+function loadKeychainBinding() {
+  return require("@napi-rs/keyring");
+}
+
 /**
- * Chrome's "Safe Storage" password from the login Keychain. Shows a system
- * approval dialog the first time — the caller must have a user-initiated import
- * behind this.
+ * Read Chrome's Safe Storage password in-process so Keychain grants belong to
+ * this app, never a shared helper. Shows the system approval dialog the first
+ * time — the caller must have a user-initiated import behind this.
  *
- * @param {{ run?: Function }} [options]
+ * @param {{ loadBinding?: () => { AsyncEntry: new (service: string, account: string) => { getPassword: () => Promise<string | null> } }, timeoutMs?: number }} [options]
  * @returns {Promise<string>}
  */
-async function readSafeStoragePassword({ run = execFileAsync } = {}) {
-  let stdout;
+async function readSafeStoragePassword({
+  loadBinding = loadKeychainBinding,
+  timeoutMs = KEYCHAIN_TIMEOUT_MS,
+} = {}) {
+  let entry;
   try {
-    ({ stdout } = await run(
-      SECURITY_BINARY,
-      ["find-generic-password", "-w", "-s", SAFE_STORAGE_SERVICE],
-      { timeout: KEYCHAIN_TIMEOUT_MS },
-    ));
+    const { AsyncEntry } = loadBinding();
+    entry = new AsyncEntry(SAFE_STORAGE_SERVICE, SAFE_STORAGE_ACCOUNT);
   } catch (err) {
-    if (err && err.code === 44) {
-      throw new Error(
-        "Chrome's cookie key isn't in your login Keychain. Open Google Chrome once, then retry.",
-        { cause: err },
-      );
-    }
-    if (err && (err.killed || err.signal)) {
-      throw new Error("Timed out waiting for Keychain access. Retry and approve the prompt.", {
-        cause: err,
-      });
-    }
+    throw new Error("This build of the app can't read the Keychain, so it can't import cookies.", {
+      cause: err,
+    });
+  }
+  let timer;
+  let password;
+  try {
+    // The native read can't be cancelled; a late answer to the dialog is dropped.
+    password = await Promise.race([
+      entry.getPassword(),
+      new Promise((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(KEYCHAIN_TIMEOUT_MESSAGE)), timeoutMs);
+      }),
+    ]);
+  } catch (err) {
+    if (err && err.message === KEYCHAIN_TIMEOUT_MESSAGE) throw err;
+    // Fixed text: the platform error can name Keychain internals.
     throw new Error(
       "Couldn't read Chrome's cookie key from the Keychain. Approve the prompt (or unlock the login Keychain) and retry.",
       { cause: err },
     );
+  } finally {
+    clearTimeout(timer);
   }
-  const password = String(stdout ?? "").replace(/\r?\n$/, "");
+  if (password === null || password === undefined) {
+    throw new Error(
+      "Chrome's cookie key isn't in your login Keychain. Open Google Chrome once, then retry.",
+    );
+  }
   if (!password) {
     throw new Error("Chrome's Keychain item is empty. Open Google Chrome once, then retry.");
   }
@@ -756,7 +776,7 @@ async function importSiteCookies({
   }
   let key;
   try {
-    key = deriveMacKey(await readPassword({ run }));
+    key = deriveMacKey(await readPassword());
   } catch (err) {
     return { ok: false, error: messageOf(err) };
   }
@@ -868,7 +888,7 @@ async function importAllSitesCookies({
   const rows = await readAllSitesRows({ cookieDbPath: profile.cookieDbPath, run, fsImpl });
   let key;
   try {
-    key = deriveMacKey(await readPassword({ run }));
+    key = deriveMacKey(await readPassword());
   } catch (err) {
     return { ok: false, error: messageOf(err) };
   }
@@ -912,6 +932,7 @@ module.exports = {
   normalizeRow,
   defaultChromeRoot,
   SAFE_STORAGE_SERVICE,
+  SAFE_STORAGE_ACCOUNT,
   KEY_ITERATIONS,
   KEY_SALT,
   KEY_LENGTH,

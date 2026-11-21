@@ -272,7 +272,7 @@ describe("chromeCookieStore — Electron cookie mapping", () => {
 });
 
 describe("chromeCookieStore — system binaries", () => {
-  it("runs sqlite3 and security by absolute path", async () => {
+  it("runs sqlite3 by absolute path", async () => {
     const calls = [];
     const failing = async (command) => {
       calls.push(command);
@@ -302,65 +302,143 @@ describe("chromeCookieStore — system binaries", () => {
     );
     // Only a missing column may fall back to an older column set.
     assert.deepEqual(calls, ["/usr/bin/sqlite3"]);
-    calls.length = 0;
-    const password = await store.readSafeStoragePassword({
-      run: async (command) => {
-        calls.push(command);
-        return { stdout: "secret\n" };
-      },
-    });
-    assert.equal(password, "secret");
-    assert.deepEqual(calls, ["/usr/bin/security"]);
   });
 });
 
 describe("chromeCookieStore — Keychain", () => {
-  it("returns the password without its trailing newline", async () => {
+  /** A Keychain binding whose one entry answers with `getPassword`. */
+  function keychainBinding(getPassword, created = []) {
+    return () => ({
+      AsyncEntry: class {
+        constructor(service, account) {
+          created.push([service, account]);
+        }
+
+        getPassword() {
+          return getPassword();
+        }
+      },
+    });
+  }
+
+  // Probe like the store does: a checkout without the desktop app's packages has no binding.
+  const hasKeychainBinding = (() => {
+    try {
+      require.resolve("@napi-rs/keyring");
+      return true;
+    } catch {
+      return false;
+    }
+  })();
+
+  it(
+    "ships a Keychain binding with the entry API the store calls",
+    { skip: !hasKeychainBinding },
+    () => {
+      const { AsyncEntry } = require("@napi-rs/keyring");
+      assert.equal(typeof AsyncEntry.prototype.getPassword, "function");
+    },
+  );
+
+  it("reads Chrome's own Keychain item in this process", async () => {
+    const created = [];
     const password = await store.readSafeStoragePassword({
-      run: async () => ({ stdout: "horse-battery\n" }),
+      loadBinding: keychainBinding(async () => "horse-battery", created),
     });
     assert.equal(password, "horse-battery");
+    assert.deepEqual(created, [["Chrome Safe Storage", "Chrome"]]);
+  });
+
+  it("never starts a helper process, so the grant can't go to a shared tool", async () => {
+    const childProcess = require("node:child_process");
+    const storePath = require.resolve("../src/chromeCookieStore");
+    const launchers = [
+      "execFile",
+      "execFileSync",
+      "spawn",
+      "spawnSync",
+      "exec",
+      "execSync",
+      "fork",
+    ];
+    const originals = launchers.map((name) => childProcess[name]);
+    const spawned = [];
+    for (const name of launchers) {
+      childProcess[name] = (...args) => {
+        spawned.push([name, args[0]]);
+        throw new Error(`unexpected child process: ${name}`);
+      };
+    }
+    // The store captures `execFile` when it loads, so load a fresh copy over the stubs.
+    const cached = require.cache[storePath];
+    Reflect.deleteProperty(require.cache, storePath);
+    try {
+      const isolated = require("../src/chromeCookieStore");
+      assert.notEqual(isolated, store);
+      const password = await isolated.readSafeStoragePassword({
+        loadBinding: keychainBinding(async () => "secret"),
+      });
+      assert.equal(password, "secret");
+      // A binding that can't load fails the read; it must not fall back to /usr/bin/security.
+      await assert.rejects(
+        isolated.readSafeStoragePassword({
+          loadBinding: () => {
+            throw new Error("Cannot find module '@napi-rs/keyring-darwin-arm64'");
+          },
+        }),
+        (err) => {
+          assert.match(err.message, /can't read the Keychain/);
+          assert.doesNotMatch(err.message, /napi-rs|module/);
+          return true;
+        },
+      );
+    } finally {
+      launchers.forEach((name, index) => {
+        childProcess[name] = originals[index];
+      });
+      require.cache[storePath] = cached;
+    }
+    assert.deepEqual(spawned, []);
   });
 
   it("explains a missing Keychain item", async () => {
     await assert.rejects(
-      store.readSafeStoragePassword({
-        run: async () => {
-          throw Object.assign(new Error("item not found"), { code: 44 });
-        },
-      }),
+      store.readSafeStoragePassword({ loadBinding: keychainBinding(async () => null) }),
       /isn't in your login Keychain/,
     );
   });
 
-  it("explains a dismissed/timed-out approval prompt", async () => {
+  it("explains an empty Keychain item", async () => {
+    await assert.rejects(
+      store.readSafeStoragePassword({ loadBinding: keychainBinding(async () => "") }),
+      /Keychain item is empty/,
+    );
+  });
+
+  it("explains an approval prompt left unanswered", async () => {
     await assert.rejects(
       store.readSafeStoragePassword({
-        run: async () => {
-          throw Object.assign(new Error("killed"), { killed: true, signal: "SIGTERM" });
-        },
+        // The native read stays blocked for as long as the system dialog is up.
+        loadBinding: keychainBinding(() => new Promise(() => {})),
+        timeoutMs: 5,
       }),
       /Timed out waiting for Keychain access/,
     );
   });
 
-  it("never echoes the security(1) error text", async () => {
+  it("never echoes the platform's error text", async () => {
     await assert.rejects(
       store.readSafeStoragePassword({
-        run: async () => {
+        loadBinding: keychainBinding(async () => {
           throw Object.assign(
-            new Error(
-              "security: SecKeychainSearchCopyNext: The user name or passphrase you entered is not correct.",
-            ),
-            {
-              code: 51,
-            },
+            new Error("Couldn't access platform storage: SecKeychainFindGenericPassword -128"),
+            { code: "GenericFailure" },
           );
-        },
+        }),
       }),
       (err) => {
         assert.match(err.message, /Couldn't read Chrome's cookie key/);
-        assert.doesNotMatch(err.message, /SecKeychain/);
+        assert.doesNotMatch(err.message, /SecKeychain|platform storage/);
         return true;
       },
     );

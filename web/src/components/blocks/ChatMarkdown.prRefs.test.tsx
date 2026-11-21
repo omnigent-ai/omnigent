@@ -195,7 +195,7 @@ describe("pull request references in chat markdown", () => {
     expect(hrefs()).toEqual(["#omnigent-pr-4242"]);
   });
 
-  it("keeps references as text when the session's GitHub info fails to load", async () => {
+  it("keeps references as text when GitHub info fails, without refetching per message", async () => {
     serveGithubInfo(() => new Response("boom", { status: 500 }));
     renderMarkdown("See #4242 and acme/app#12");
     await waitFor(() =>
@@ -203,14 +203,6 @@ describe("pull request references in chat markdown", () => {
     );
     expect(screen.queryByRole("link")).not.toBeInTheDocument();
     expect(screen.getByText("#4242")).toBeVisible();
-  });
-
-  it("doesn't refetch failed GitHub info for each newly rendered message", async () => {
-    serveGithubInfo(() => new Response("boom", { status: 500 }));
-    renderMarkdown("See #4242");
-    await waitFor(() =>
-      expect(client.getQueryState(["github-info", CONVERSATION_ID])?.status).toBe("error"),
-    );
     const calls = githubInfoRequests().length;
     renderMarkdown("And #4243");
     // A mount-time refetch starts in the mount effect and fetches after a microtask.
