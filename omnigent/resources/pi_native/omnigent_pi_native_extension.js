@@ -1980,6 +1980,8 @@ module.exports = function (pi) {
   let cumulativeOutputTokens = 0;
   let cumulativeCacheReadTokens = 0;
   let cumulativeCostUsd = 0;
+  // Current context occupancy (latest message's prompt + output), not a sum.
+  let lastContextTokens = 0;
   let completeCost = true;
   let usageModel = null;
   let lastPostedUsageKey = "";
@@ -2026,6 +2028,8 @@ module.exports = function (pi) {
     cumulativeInputTokens += usage.input + usage.cacheRead + usage.cacheWrite;
     cumulativeOutputTokens += usage.output;
     cumulativeCacheReadTokens += usage.cacheRead;
+    lastContextTokens =
+      usage.total || usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
     if (usage.cost === null) completeCost = false;
     else cumulativeCostUsd += usage.cost;
     if (usage.model) usageModel = usage.model;
@@ -2033,7 +2037,7 @@ module.exports = function (pi) {
   }
 
   function usagePostKey() {
-    return `${cumulativeInputTokens}-${cumulativeOutputTokens}-${cumulativeCacheReadTokens}-${completeCost ? cumulativeCostUsd : "unknown"}-${usageModel || ""}`;
+    return `${cumulativeInputTokens}-${cumulativeOutputTokens}-${cumulativeCacheReadTokens}-${lastContextTokens}-${completeCost ? cumulativeCostUsd : "unknown"}-${usageModel || ""}`;
   }
 
   // Persist before reporting; unchanged totals need no additional POST.
@@ -2052,6 +2056,7 @@ module.exports = function (pi) {
       cumulative_cache_read_input_tokens: cumulativeCacheReadTokens,
     };
     if (completeCost) data.cumulative_cost_usd = cumulativeCostUsd;
+    if (lastContextTokens > 0) data.context_tokens = lastContextTokens;
     if (usageModel) data.model = usageModel;
     await postEvent(config, { type: "external_session_usage", data });
   }
