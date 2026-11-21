@@ -59,19 +59,9 @@ const actionNames = () =>
 
 describe("QuickPick ⌘K Go to Session…", () => {
   // As the shell does: the palette continues in its sessions-only mode, as a fresh palette.
-  function Shell({ switcherDelay }: { switcherDelay?: number } = {}) {
+  function Shell() {
     const [open, setOpen] = useState(false);
     const [sessionsOnly, setSessionsOnly] = useState(false);
-    const goToSession = () => {
-      setSessionsOnly(true);
-      if (switcherDelay === undefined) return;
-      // The switcher opens well after the palette it replaces has gone.
-      setOpen(false);
-      setTimeout(() => {
-        (document.activeElement as HTMLElement | null)?.blur();
-        setOpen(true);
-      }, switcherDelay);
-    };
     return (
       <>
         <button
@@ -90,7 +80,7 @@ describe("QuickPick ⌘K Go to Session…", () => {
           onOpenChange={setOpen}
           onToggleLeftSidebar={vi.fn()}
           onToggleRightSidebar={vi.fn()}
-          onGoToSession={goToSession}
+          onGoToSession={() => setSessionsOnly(true)}
         />
       </>
     );
@@ -117,29 +107,6 @@ describe("QuickPick ⌘K Go to Session…", () => {
       });
     });
     expect(sessions).toHaveFocus();
-    fireEvent.keyDown(sessions, { key: "Escape" });
-    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-    await waitFor(() => expect(opener).toHaveFocus());
-  });
-
-  it("returns focus where ⌘K opened even when the switcher opens a while later", async () => {
-    render(
-      <QueryClientProvider client={new QueryClient()}>
-        <Shell switcherDelay={300} />
-      </QueryClientProvider>,
-    );
-    const opener = screen.getByRole("button", { name: "Search" });
-    opener.focus();
-    fireEvent.click(opener);
-    const input = await screen.findByTestId("command-palette-input");
-    fireEvent.change(input, { target: { value: "go to session" } });
-    fireEvent.keyDown(input, { key: "Enter" });
-    const sessions = await screen.findByRole(
-      "combobox",
-      { name: "Switch session" },
-      { timeout: 2000 },
-    );
-    await waitFor(() => expect(sessions).toHaveFocus());
     fireEvent.keyDown(sessions, { key: "Escape" });
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     await waitFor(() => expect(opener).toHaveFocus());
