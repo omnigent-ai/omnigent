@@ -90,8 +90,9 @@ def managed_wake(
     events: list[str] = []
     dial: dict[str, Any] = {"replica": stack.tunnel_replica}
 
-    async def fake_resume(host_id: str, *_args: object, **_kwargs: object) -> None:
+    async def fake_resume(host_id: str, *_args: object, **kwargs: object) -> None:
         events.append("resume")
+        events.append(f"slice_key_enabled={kwargs.get('slice_key_enabled')}")
         dial["replica"].state.host_registry.register(
             host_id,
             AsyncMock(),
@@ -210,6 +211,25 @@ async def test_matching_key_wakes_and_launches_runner_before_ready(
     assert not _wrong_replica(response), response.text
     assert "resume" in events and "launch" in events and "ready" in events, events
     assert events.index("resume") < events.index("launch") < events.index("ready"), events
+    assert "slice_key_enabled=True" in events, events
+
+
+@pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)
+@LABELLED
+async def test_keyless_request_wakes_from_the_default_route(
+    two_replica_stack: Any, managed_wake: Any, labelled: bool
+) -> None:
+    """A client that predates host routing sends no key; its host stays on the default replica."""
+    arrange, events = managed_wake
+    session_id = await arrange(keyed=labelled, dial_replica="keyless")
+
+    response = await two_replica_stack.keyless_client.post(
+        f"/v1/sessions/{session_id}/events", headers=_headers(None), json=MESSAGE
+    )
+
+    assert not _wrong_replica(response), response.text
+    assert events.index("resume") < events.index("launch") < events.index("ready"), events
+    assert "slice_key_enabled=False" in events, events
 
 
 @pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)

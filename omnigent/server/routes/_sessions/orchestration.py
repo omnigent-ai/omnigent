@@ -5228,6 +5228,7 @@ async def _run_managed_launch(
     sandbox_profiles: Any = None,
     held_runner_id: str | None = None,
     adopt_default_profile: bool = False,
+    keyed_wake: bool = True,
 ) -> None:
     """
     Provision a managed sandbox for a session in the background.
@@ -5299,6 +5300,9 @@ async def _run_managed_launch(
     :param adopt_default_profile: Whether a relaunch whose host has no
         recorded profile takes the provider's default, as a scheduled
         fire's session reset does.
+    :param keyed_wake: On a relaunch, whether the host routes by its own id. ``False`` only
+        for a client request that carried no routing key, whose host stays on the
+        default replica as before host sharding.
     """
     from omnigent.server.managed_hosts import (
         deployment_with_inference_snapshot,
@@ -5386,7 +5390,9 @@ async def _run_managed_launch(
             provider=provider,
             agent_name=agent_name,
             host_id=host_id,
-            relaunch_slice_key_enabled=relaunch_host is not None and _deployment_is_sharded(),
+            relaunch_slice_key_enabled=(
+                relaunch_host is not None and keyed_wake and _deployment_is_sharded()
+            ),
         )
         if managed is None:
             return
@@ -5752,6 +5758,7 @@ async def _maybe_relaunch_managed_sandbox(
     app_state: Any,
     conversation_store: ConversationStore,
     request: Any = None,
+    keyed_wake: bool | None = None,
 ) -> bool:
     """
     Relaunch a dead managed sandbox for a session, if it has one.
@@ -5776,6 +5783,9 @@ async def _maybe_relaunch_managed_sandbox(
     :param app_state: ``request.app.state`` — supplies the host store,
         sandbox config, tracker, and registries.
     :param conversation_store: Store holding the session row.
+    :param request: The client request that triggered the wake, or ``None``.
+    :param keyed_wake: Whether the woken host routes by its own id, when a caller
+        already decided it; ``None`` reads it from *request*.
     :returns: ``True`` when a relaunch engaged and settled
         successfully (the session row is re-bound; re-resolve the
         runner client). ``False`` when the host is not a managed
@@ -5810,6 +5820,8 @@ async def _maybe_relaunch_managed_sandbox(
         _raise_if_managed_wake_misses_host_tunnel(
             conv=conv, host=host, request=request, app_state=app_state
         )
+        if keyed_wake is None:
+            keyed_wake = _request_wakes_keyed(request)
         # A resumable managed host whose sandbox merely idle-stopped is WOKEN
         # in place (resume: same sandbox + workspace volume) rather than
         # relaunched onto a fresh empty sandbox — same gate the wake itself
@@ -5826,6 +5838,7 @@ async def _maybe_relaunch_managed_sandbox(
                 host_store=host_store,
                 app_state=app_state,
                 provider=host.sandbox_provider,
+                keyed_wake=keyed_wake,
             )
         else:
             _kick_managed_relaunch(
@@ -5837,6 +5850,7 @@ async def _maybe_relaunch_managed_sandbox(
                 conversation_store=conversation_store,
                 host_store=host_store,
                 app_state=app_state,
+                keyed_wake=keyed_wake,
             )
         launch = tracker.get(session_id)
     if launch is not None:
@@ -5870,6 +5884,24 @@ async def _maybe_relaunch_managed_sandbox(
     return True
 
 
+def _request_wakes_keyed(request: Any) -> bool:
+    """
+    Whether a wake triggered by *request* keeps its managed host routed by its id.
+
+    Every wake does except one from a client request with no routing key at all,
+    a client that predates host routing and finds the host on the default replica.
+
+    :param request: The client request, or ``None``/a non-HTTP context for a
+        server-internal wake.
+    :returns: ``False`` only for a keyless client request.
+    """
+    from fastapi import Request
+
+    from omnigent.server.routes._host_launch import routed_slice_key
+
+    return not isinstance(request, Request) or routed_slice_key(request) is not None
+
+
 def _raise_if_managed_wake_misses_host_tunnel(
     *,
     conv: Conversation,
@@ -5880,18 +5912,19 @@ def _raise_if_managed_wake_misses_host_tunnel(
     """
     Re-address a client request that would wake a managed host off its tunnel's replica.
 
-    A woken managed host dials the replica its own id names, and every client that
-    knows the host routes by that id. A wake run from any other replica lands its
-    tunnel elsewhere, so the request parks for the whole wake. Answer
-    ``WRONG_REPLICA`` first so the client re-addresses by the host's id. Only a
-    fastapi ``Request`` names a routing key; internal callers pass nothing and skip
-    this check.
+    A client that knows the host sends its id as the routing key, and the host it
+    wakes dials the replica that id names. A request carrying any other key would
+    run the wake where the tunnel won't land and park for the whole wake, so
+    answer ``WRONG_REPLICA`` first, naming the host's id. A request with no key at
+    all comes from a client that predates host routing; it wakes the host on the
+    default replica, where that client's requests go. Only a fastapi ``Request``
+    names a routing key; internal callers pass nothing and skip this check.
 
     :param conv: Session row whose host may need a wake.
     :param host: The session's managed host row, already loaded by the caller.
     :param request: The inbound request, or ``None``/a non-HTTP context to skip.
     :param app_state: ``request.app.state`` — supplies the host registry.
-    :raises WrongReplicaError: When the request is not routed by the host's id.
+    :raises WrongReplicaError: When the request is routed by another key.
     """
     from fastapi import Request
 
@@ -5902,7 +5935,8 @@ def _raise_if_managed_wake_misses_host_tunnel(
     host_registry = getattr(app_state, "host_registry", None)
     if conv.host_id is None or host_registry is None or not _deployment_is_sharded():
         return
-    if routed_slice_key(request) == conv.host_id or host_registry.get(conv.host_id) is not None:
+    routed_key = routed_slice_key(request)
+    if routed_key in (None, conv.host_id) or host_registry.get(conv.host_id) is not None:
         return
     if host.sandbox_provider is None:
         return
@@ -6001,6 +6035,7 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
         conv=conv,
         app_state=app_state,
         conversation_store=conversation_store,
+        keyed_wake=_request_wakes_keyed(request),
     )
 
 
@@ -6508,6 +6543,7 @@ def _kick_managed_relaunch(
     conversation_store: ConversationStore,
     host_store: HostStore,
     app_state: Any,
+    keyed_wake: bool = True,
 ) -> None:
     """
     Register and spawn the background relaunch for a dead sandbox.
@@ -6532,6 +6568,9 @@ def _kick_managed_relaunch(
     :param host_store: Persistent host registrations.
     :param app_state: ``request.app.state`` — supplies the registries and the
         agent store the classifier is re-derived from.
+    :param keyed_wake: Whether the woken host routes by its own id. ``False`` only
+        for a client request that carried no routing key, whose host stays on the
+        default replica as before host sharding.
     """
     repos = _recorded_repo_workspaces(
         session_id,
@@ -6570,6 +6609,7 @@ def _kick_managed_relaunch(
             agent_store=agent_store,
             agent_id=conv.agent_id,
             sandbox_profiles=getattr(app_state, "sandbox_profiles", None),
+            keyed_wake=keyed_wake,
         )
     )
     _managed_launch_tasks.add(relaunch_task)
@@ -6586,6 +6626,7 @@ def _kick_managed_wake(
     host_store: HostStore,
     app_state: Any,
     provider: str | None = None,
+    keyed_wake: bool = True,
 ) -> None:
     """
     Spawn the background wake for a dormant resumable host.
@@ -6604,6 +6645,7 @@ def _kick_managed_wake(
         host_store=host_store,
         app_state=app_state,
         provider=provider,
+        keyed_wake=keyed_wake,
     )
 
 
@@ -6617,6 +6659,7 @@ def _kick_managed_wake_impl(
     host_store: HostStore,
     app_state: Any,
     provider: str | None = None,
+    keyed_wake: bool = True,
 ) -> None:
     """
     Register and spawn the background WAKE for a dormant resumable host.
@@ -6637,6 +6680,9 @@ def _kick_managed_wake_impl(
     :param app_state: ``request.app.state`` — supplies the registries.
     :param provider: The dormant host's sandbox provider, e.g. ``"arclet"``,
         which the seeded launch status names.
+    :param keyed_wake: Whether the woken host routes by its own id. ``False`` only
+        for a client request that carried no routing key, whose host stays on the
+        default replica as before host sharding.
     """
     _logger.info(
         "Managed host %s (session %s) is dormant but resumable; waking in background",
@@ -6669,6 +6715,7 @@ def _kick_managed_wake_impl(
             agent_store=wake_agent_store,
             agent_id=conv.agent_id,
             sandbox_profiles=getattr(app_state, "sandbox_profiles", None),
+            keyed_wake=keyed_wake,
         )
     )
     _managed_launch_tasks.add(wake_task)
@@ -6688,6 +6735,7 @@ async def _run_managed_wake(
     agent_store: AgentStore | None = None,
     agent_id: str | None = None,
     sandbox_profiles: Any = None,
+    keyed_wake: bool = True,
 ) -> None:
     """
     Wake a dormant resumable managed host in the background, settling the
@@ -6721,6 +6769,9 @@ async def _run_managed_wake(
     :param agent_id: Agent the session is bound to, resolved through the
         built-in gate into the woken runner Pod's ``omnigent.ai/agent``
         classifier, or ``None`` to leave it unstamped.
+    :param keyed_wake: Whether the woken host routes by its own id. ``False`` only
+        for a client request that carried no routing key, whose host stays on the
+        default replica as before host sharding.
     """
     from omnigent.onboarding.sandboxes.base import SandboxGoneError
     from omnigent.server.managed_hosts import (
@@ -6797,7 +6848,7 @@ async def _run_managed_wake(
                 force=True,
                 on_stage=_on_stage,
                 agent_name=agent_name,
-                slice_key_enabled=_deployment_is_sharded(),
+                slice_key_enabled=keyed_wake and _deployment_is_sharded(),
             )
         except SandboxGoneError:
             _logger.info(
