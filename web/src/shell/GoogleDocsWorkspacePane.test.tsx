@@ -102,7 +102,8 @@ it("restores a legacy saved Doc for a viewer and keeps the same iframe while hid
     FIRST_URL + "?tab=t.one",
   );
   expect(screen.queryByRole("textbox", { name: "Google Docs URL" })).not.toBeInTheDocument();
-  expect(screen.queryByRole("button", { name: "Request agent revision" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Request agent review" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "New Google Doc" })).not.toBeInTheDocument();
 
   pane.rerender(<GoogleDocsWorkspacePane {...pane.props} visible={false} />);
   expect(iframe).not.toBeVisible();
@@ -263,7 +264,7 @@ it("posts one normal user message to the active child chat with the URL captured
   renderWorkspace();
   await screen.findByTitle("Google Docs editor");
 
-  const request = screen.getByRole("button", { name: "Request agent revision" });
+  const request = screen.getByRole("button", { name: "Request agent review" });
   fireEvent.click(request);
   fireEvent.click(request);
   await waitFor(() => expect(requests("POST")).toHaveLength(1));
@@ -286,20 +287,23 @@ it("posts one normal user message to the active child chat with the URL captured
     },
   });
   expect(JSON.parse(String(options?.body)).data.content[0].text).toContain(
-    "native comment threads",
+    "native comment-thread replies where permitted",
+  );
+  expect(JSON.parse(String(options?.body)).data.content[0].text).toContain(
+    "If Google access is read-only or does not permit an edit or reply, provide findings and proposed changes in chat instead.",
   );
   expect(JSON.parse(String(options?.body)).data.content[0].text).not.toContain(SECOND_URL);
 });
 
-it("queues only one revision for a busy chat when always-steer is disabled", async () => {
+it("queues only one review for a busy chat when always-steer is disabled", async () => {
   writeAlwaysSteer(false);
   useChatStore.setState({ status: "streaming", sessionStatus: "running" });
   fetchMock.mockResolvedValueOnce(sessionResponse(SESSION_ID));
   renderWorkspace();
   await screen.findByTitle("Google Docs editor");
 
-  await act(async () => click("Request agent revision"));
-  await act(async () => click("Request agent revision"));
+  await act(async () => click("Request agent review"));
+  await act(async () => click("Request agent review"));
   expect(useChatStore.getState().queuedMessages).toEqual([
     expect.objectContaining({
       conversationId: SESSION_ID,
@@ -307,4 +311,70 @@ it("queues only one revision for a busy chat when always-steer is disabled", asy
     }),
   ]);
   expect(requests("POST")).toEqual([]);
+});
+
+it("links an existing Doc from an empty pane without offering UI creation or sending a message", async () => {
+  fetchMock
+    .mockResolvedValueOnce(sessionResponse(SESSION_ID, ""))
+    .mockResolvedValueOnce(sessionResponse(SESSION_ID, ""))
+    .mockResolvedValueOnce(confirmedSecondDocument());
+  renderWorkspace();
+  const input = await screen.findByRole("textbox", { name: "Google Docs URL" });
+  expect(screen.queryByRole("button", { name: "New Google Doc" })).not.toBeInTheDocument();
+  fireEvent.change(input, { target: { value: SECOND_URL } });
+  click("Open document");
+  expect(await screen.findByTitle("Google Docs editor")).toHaveAttribute(
+    "src",
+    SECOND_URL + "&embedded=true",
+  );
+  expect(screen.queryByRole("button", { name: "New Google Doc" })).not.toBeInTheDocument();
+  expect(requests("PATCH")).toHaveLength(1);
+  expect(requests("POST")).toEqual([]);
+});
+
+it("opens a newly attached Doc in an empty pane when its session update arrives", async () => {
+  let receiveFrame: ((frame: SessionUpdatesFrame) => void) | undefined;
+  vi.spyOn(sessionUpdatesSocket, "subscribe").mockImplementation((listener) => {
+    receiveFrame = listener;
+    return () => {};
+  });
+  fetchMock
+    .mockResolvedValueOnce(sessionResponse(SESSION_ID, ""))
+    .mockResolvedValueOnce(sessionResponse(SESSION_ID, SECOND_URL));
+  renderWorkspace();
+  await screen.findByRole("textbox", { name: "Google Docs URL" });
+  act(() =>
+    receiveFrame?.({
+      type: "changed",
+      items: [{ id: SESSION_ID, labels: { [GOOGLE_DOCS_SELECTION_LABEL]: SECOND_URL } }],
+    }),
+  );
+  expect(await screen.findByTitle("Google Docs editor")).toHaveAttribute(
+    "src",
+    SECOND_URL + "&embedded=true",
+  );
+  expect(requests("PATCH")).toEqual([]);
+});
+
+it("reports a denied review and disables review when the active chat changes", async () => {
+  fetchMock.mockResolvedValueOnce(sessionResponse(SESSION_ID));
+  vi.spyOn(useChatStore.getState(), "send").mockImplementation(
+    async (_text, _agent, _attachments, options) => {
+      options?.onDenied?.();
+    },
+  );
+  renderWorkspace();
+  const iframe = await screen.findByTitle("Google Docs editor");
+  click("Request agent review");
+  expect(await screen.findByRole("alert")).toHaveTextContent("policy blocked");
+  act(() => useChatStore.setState({ conversationId: OTHER_SESSION_ID }));
+  expect(screen.getByRole("button", { name: "Request agent review" })).toBeDisabled();
+  fireEvent.keyDown(screen.getByRole("button", { name: "Document actions" }), {
+    key: "ArrowDown",
+  });
+  expect(screen.getByRole("menuitem", { name: "Request agent review" })).toHaveAttribute(
+    "aria-disabled",
+    "true",
+  );
+  expect(screen.getByTitle("Google Docs editor")).toBe(iframe);
 });

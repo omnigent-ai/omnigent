@@ -42,6 +42,8 @@ interface FileViewerContextType {
   guardFileNavigation?: FileNavigationGuard;
   /** Open Pull Requests in the workspace rail or mobile drawer. */
   openGithubTab: (prUrl?: string) => void;
+  /** Open a Google Doc in this session; false leaves the original link external. */
+  openGoogleDoc?: (url: string) => boolean;
   /** Show a host-absolute folder in the Files tree; absent where no Files panel exists. */
   openFolder?: (absolutePath: string) => void;
   /**
@@ -93,6 +95,10 @@ export function useFolderOpener(): ((absolutePath: string) => void) | null {
  */
 export function useOpenGithubTab(): ((prUrl?: string) => void) | null {
   return useContext(FileViewerContext)?.openGithubTab ?? null;
+}
+
+export function useOpenGoogleDoc(): ((url: string) => boolean) | null {
+  return useContext(FileViewerContext)?.openGoogleDoc ?? null;
 }
 
 // Stable fallback used when the context is absent (tests, Storybook).

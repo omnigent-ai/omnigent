@@ -4,7 +4,6 @@ import {
   type GoogleDocsOpenRequest,
 } from "@/components/GoogleDocsPane/GoogleDocsPane";
 import { Button } from "@/components/ui/button";
-import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { readGoogleDocsLabels, type GoogleDocsReference } from "@/lib/googleDocs";
 import {
   loadGoogleDocsSession,
@@ -13,8 +12,8 @@ import {
 } from "@/lib/googleDocsSession";
 import { isEditorLevel } from "@/lib/permissionsApi";
 import { sessionUpdatesSocket } from "@/lib/sessionUpdatesSocket";
-import { shouldQueueSend } from "@/lib/messageQueue";
-import { holdsInitialDraft, useChatStore } from "@/store/chatStore";
+import { useChatStore } from "@/store/chatStore";
+import { requestGoogleDocRevision } from "@/lib/googleDocsRequests";
 
 export type { GoogleDocsOpenRequest };
 
@@ -31,63 +30,6 @@ export interface GoogleDocsWorkspacePaneProps {
 interface DocumentView {
   displayed: GoogleDocsReference | null;
   saved: GoogleDocsReference | null;
-}
-
-const revisionRequests = new Set<string>();
-
-function revisionText(url: string): string {
-  return `Review the latest changes and comments in this Google Doc: ${url}\nMake appropriate edits and reply in the document’s native comment threads. Use the session’s authorized Google tools and report the outcome in chat, including if you lack access.`;
-}
-
-async function requestRevision(sessionId: string, url: string) {
-  const chat = useChatStore.getState();
-  if (chat.conversationId !== sessionId || !chat.boundAgentId) {
-    throw new Error("Wait for this chat to connect before requesting a revision.");
-  }
-  const text = revisionText(url);
-  if (
-    revisionRequests.has(sessionId) ||
-    chat.queuedMessages.some(
-      (message) => message.conversationId === sessionId && message.text === text,
-    ) ||
-    chat.pendingUserMessages.some((message) =>
-      message.content.some((part) => part.type === "input_text" && part.text === text),
-    )
-  )
-    return;
-
-  if (
-    shouldQueueSend(
-      sessionId,
-      chat.status,
-      chat.sessionStatus,
-      chat.queuedMessages,
-      readAlwaysSteer(),
-      false,
-      holdsInitialDraft(chat),
-    )
-  ) {
-    chat.enqueueMessage(text, undefined, undefined, sessionId);
-    return;
-  }
-
-  revisionRequests.add(sessionId);
-  try {
-    let failure: string | undefined;
-    await chat.send(text, chat.boundAgentId, undefined, {
-      pinnedConversationId: sessionId,
-      external: true,
-      onDenied: () => {
-        failure = "The session’s policy blocked the revision request.";
-      },
-      onError: (message, refused) => {
-        failure = refused ? message : `${message} Check the chat for the request before retrying.`;
-      },
-    });
-    if (failure !== undefined) throw new Error(failure);
-  } finally {
-    revisionRequests.delete(sessionId);
-  }
 }
 
 function SessionGoogleDocsPane({
@@ -124,7 +66,7 @@ function SessionGoogleDocsPane({
       const { selected } = await request.result;
       if (!isCurrent()) return;
       setView((previous) =>
-        previous === undefined
+        previous === undefined || previous.displayed === null
           ? { displayed: selected, saved: selected }
           : { ...previous, saved: selected },
       );
@@ -200,7 +142,7 @@ function SessionGoogleDocsPane({
 
   const disabledReason =
     revisionDisabledReason ??
-    (!chatReady ? "Wait for this chat to connect before requesting a revision." : undefined);
+    (!chatReady ? "Wait for this chat to connect before sending a document request." : undefined);
 
   return (
     <>
@@ -239,7 +181,7 @@ function SessionGoogleDocsPane({
               if (!canEdit || disabledReason) {
                 throw new Error(disabledReason ?? "This session is read-only.");
               }
-              return requestRevision(sessionId, url);
+              return requestGoogleDocRevision(sessionId, url);
             }}
           />
         </div>

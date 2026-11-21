@@ -52,6 +52,9 @@ import { useIsSideBySideSidebarViewport } from "@/hooks/useIsSideBySideSidebarVi
 import { useReportLocalTimezone } from "@/hooks/useReportLocalTimezone";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
+import { classifyGoogleDocsUrl, readGoogleDocsLabels } from "@/lib/googleDocs";
+import { randomUUID } from "@/lib/randomUUID";
+import type { GoogleDocsOpenRequest } from "./GoogleDocsWorkspacePane";
 import { derivePermissionLevel, isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import { readOnlyReasonForSessionLabels } from "@/lib/sessionCapabilities";
 import {
@@ -1209,6 +1212,14 @@ function AppShellImpl() {
   const googleDocsRevisionDisabledReason =
     readOnlyReasonForSessionLabels(activeSession, activeConv) ?? undefined;
   const googleDocsEnabled = railTabsAvailable["google-docs"];
+  const [googleDocsOpenRequest, setGoogleDocsOpenRequest] = useState<GoogleDocsOpenRequest>();
+  const googleDocsSessionRef = useRef(googleDocsSessionId);
+  useEffect(() => {
+    googleDocsSessionRef.current = googleDocsSessionId;
+  }, [googleDocsSessionId]);
+  const handleGoogleDocsOpenRequest = useCallback((request: GoogleDocsOpenRequest) => {
+    setGoogleDocsOpenRequest((current) => (current?.id === request.id ? undefined : current));
+  }, []);
   const googleDocs = useMemo(
     () =>
       googleDocsEnabled && googleDocsSessionId
@@ -1216,9 +1227,21 @@ function AppShellImpl() {
             sessionId: googleDocsSessionId,
             canEditReference: googleDocsCanEdit,
             revisionDisabledReason: googleDocsRevisionDisabledReason,
+            openRequest:
+              googleDocsOpenRequest?.sessionId === googleDocsSessionId
+                ? googleDocsOpenRequest
+                : undefined,
+            onOpenRequestHandled: handleGoogleDocsOpenRequest,
           }
         : undefined,
-    [googleDocsEnabled, googleDocsSessionId, googleDocsCanEdit, googleDocsRevisionDisabledReason],
+    [
+      googleDocsEnabled,
+      googleDocsSessionId,
+      googleDocsCanEdit,
+      googleDocsRevisionDisabledReason,
+      googleDocsOpenRequest,
+      handleGoogleDocsOpenRequest,
+    ],
   );
 
   const initialWorkspaceTab = readInitialWorkspaceTab();
@@ -2758,6 +2781,37 @@ function AppShellImpl() {
     ],
   );
 
+  const openGoogleDoc = useCallback(
+    (url: string): boolean => {
+      if (!googleDocsEnabled || !activeSession || isMobileViewport()) return false;
+      const link = classifyGoogleDocsUrl(url);
+      if (link.kind !== "embed") return false;
+      const selected = readGoogleDocsLabels(activeSession.labels ?? {}).selected;
+      if (!googleDocsCanEdit && selected?.canonicalUrl !== link.reference.canonicalUrl)
+        return false;
+      const sessionId = activeSession.id;
+      guardFileNavigation(null, undefined, () => {
+        if (googleDocsSessionRef.current !== sessionId) return;
+        setGoogleDocsOpenRequest({
+          id: randomUUID(),
+          sessionId,
+          canonicalUrl: link.reference.canonicalUrl,
+        });
+        handleRightRailTabChange("google-docs");
+        revealRightPanel();
+      });
+      return true;
+    },
+    [
+      googleDocsEnabled,
+      activeSession,
+      googleDocsCanEdit,
+      guardFileNavigation,
+      handleRightRailTabChange,
+      revealRightPanel,
+    ],
+  );
+
   function openMainExecutionLog() {
     // Mobile FAB → "Execution logs" jumps straight to the main thread.
     // Children are reachable via the panel's tab switcher.
@@ -2824,6 +2878,7 @@ function AppShellImpl() {
       registerNavigationGuard,
       guardFileNavigation,
       openGithubTab,
+      openGoogleDoc: googleDocsEnabled ? openGoogleDoc : undefined,
       openFolder: showFilesPanel ? openFolderInFiles : undefined,
       isChangedPath,
       conversationId,
@@ -2836,6 +2891,8 @@ function AppShellImpl() {
       registerNavigationGuard,
       guardFileNavigation,
       openGithubTab,
+      openGoogleDoc,
+      googleDocsEnabled,
       showFilesPanel,
       openFolderInFiles,
       isChangedPath,

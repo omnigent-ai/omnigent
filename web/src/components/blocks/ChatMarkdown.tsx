@@ -56,6 +56,7 @@ import { useThrottledValue } from "@/hooks/useThrottledValue";
 import { withBasePath } from "@/lib/basePath";
 import { copyText } from "@/lib/clipboard";
 import { absoluteWorkspacePath } from "@/lib/composerContext";
+import { classifyGoogleDocsUrl } from "@/lib/googleDocs";
 import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
 import { cn } from "@/lib/utils";
 import { parseMentionPillTitle } from "@/lib/mentionPills";
@@ -64,6 +65,7 @@ import {
   useFileViewerConversationId,
   useFolderOpener,
   useIsChangedPath,
+  useOpenGoogleDoc,
   useWorkspacePaths,
 } from "@/shell/FileViewerContext";
 import { resolveChatFilePath, useWorkspaceFileExists } from "@/hooks/useWorkspaceChangedFiles";
@@ -366,6 +368,7 @@ function WorkspaceFileLink({
   } = useWorkspaceFileOpener(path, true);
   // Scopes the desktop in-app browser route to this conversation's view.
   const conversationId = useFileViewerConversationId();
+  const openGoogleDoc = useOpenGoogleDoc();
   const { root, home } = useWorkspacePaths();
 
   if (!path) {
@@ -407,6 +410,9 @@ function WorkspaceFileLink({
     // Streamdown renders external links with target="_blank"; those need the
     // popup fallback so a click still works where new tabs can't open.
     const blankHref = props.target === "_blank" && typeof rebased === "string" ? rebased : null;
+    const googleDoc =
+      openGoogleDoc && typeof href === "string" ? classifyGoogleDocsUrl(href) : null;
+    const routeGoogleDoc = googleDoc !== null && googleDoc.kind !== "invalid";
     const pullRequest = githubPullRequest(rebased);
     return (
       <a
@@ -420,7 +426,24 @@ function WorkspaceFileLink({
             ? props.onClick
             : (event) => {
                 props.onClick?.(event);
-                followLinkWithPopupFallback(event, blankHref, conversationId);
+                if (
+                  !event.defaultPrevented &&
+                  event.button === 0 &&
+                  !event.metaKey &&
+                  !event.ctrlKey &&
+                  !event.shiftKey &&
+                  !event.altKey &&
+                  googleDoc?.kind === "embed" &&
+                  openGoogleDoc?.(googleDoc.reference.canonicalUrl)
+                ) {
+                  event.preventDefault();
+                  return;
+                }
+                followLinkWithPopupFallback(
+                  event,
+                  blankHref,
+                  routeGoogleDoc ? undefined : conversationId,
+                );
               }
         }
       >

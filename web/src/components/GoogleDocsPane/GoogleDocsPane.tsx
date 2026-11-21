@@ -1,5 +1,19 @@
 import { useCallback, useEffect, useId, useRef, useState, type FormEvent } from "react";
+import {
+  ExternalLink,
+  FilePenLine,
+  MoreHorizontal,
+  RefreshCw,
+  Sparkles,
+  Unlink,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { classifyGoogleDocsUrl, type GoogleDocsReference } from "@/lib/googleDocs";
 
@@ -153,7 +167,14 @@ export function GoogleDocsPane({
   }
 
   async function requestRevision() {
-    if (displayedUrl === null || revisionDisabledReason || requestingRef.current) return;
+    if (
+      !canEditReference ||
+      displayedUrl === null ||
+      savingRef.current ||
+      revisionDisabledReason ||
+      requestingRef.current
+    )
+      return;
     requestingRef.current = true;
     setRequesting(true);
     setRevisionError(undefined);
@@ -170,54 +191,112 @@ export function GoogleDocsPane({
     }
   }
 
+  function changeDocument() {
+    setDraft(displayedUrl ?? "");
+    setValidationError(undefined);
+    setChanging(true);
+  }
+
+  function reloadEditor() {
+    if (confirmEditorChange("Reload the editor")) setReload((count) => count + 1);
+  }
+
+  const revisionDisabled = saving || requesting || !!revisionDisabledReason;
+
   return (
-    <section aria-label="Google Docs pane" className="flex h-full min-h-0 min-w-0 flex-col">
+    <section
+      aria-label="Google Docs pane"
+      className="@container/google-docs flex h-full min-h-0 min-w-0 flex-col"
+    >
       {displayedUrl !== null && (
-        <div className="flex shrink-0 flex-wrap items-center gap-1 border-b border-border p-2">
-          {canEditReference && (
+        <div className="flex shrink-0 flex-nowrap items-center gap-1 border-b border-border p-2">
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="shrink-0 @min-[36rem]/google-docs:hidden"
+                aria-label="Document actions"
+              >
+                <MoreHorizontal className="size-4" aria-hidden="true" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="start" aria-label="Document actions">
+              {canEditReference && (
+                <DropdownMenuItem disabled={saving || changing} onSelect={changeDocument}>
+                  <FilePenLine aria-hidden="true" />
+                  Change document
+                </DropdownMenuItem>
+              )}
+              <DropdownMenuItem disabled={saving} onSelect={reloadEditor}>
+                <RefreshCw aria-hidden="true" />
+                Reload
+              </DropdownMenuItem>
+              <DropdownMenuItem asChild>
+                <a href={displayedUrl} target="_blank" rel="noopener noreferrer">
+                  <ExternalLink aria-hidden="true" />
+                  Open in Google Docs
+                </a>
+              </DropdownMenuItem>
+              {canEditReference && (
+                <>
+                  <DropdownMenuItem
+                    disabled={revisionDisabled}
+                    aria-describedby={revisionDisabledReason ? revisionReasonId : undefined}
+                    onSelect={() => void requestRevision()}
+                  >
+                    <Sparkles aria-hidden="true" />
+                    Request agent review
+                  </DropdownMenuItem>
+                  <DropdownMenuItem disabled={saving} onSelect={() => void save(null)}>
+                    <Unlink aria-hidden="true" />
+                    Unlink document
+                  </DropdownMenuItem>
+                </>
+              )}
+            </DropdownMenuContent>
+          </DropdownMenu>
+          <div className="hidden min-w-0 flex-nowrap items-center gap-1 @min-[36rem]/google-docs:flex">
+            {canEditReference && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                disabled={saving || changing}
+                onClick={changeDocument}
+              >
+                Change document
+              </Button>
+            )}
             <Button
               type="button"
               variant="ghost"
               size="sm"
-              disabled={saving || changing}
-              onClick={() => {
-                setDraft(displayedUrl);
-                setValidationError(undefined);
-                setChanging(true);
-              }}
+              disabled={saving}
+              onClick={reloadEditor}
             >
-              Change document
+              Reload
             </Button>
-          )}
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            disabled={saving}
-            onClick={() => {
-              if (confirmEditorChange("Reload the editor")) setReload((count) => count + 1);
-            }}
-          >
-            Reload
-          </Button>
-          <Button variant="ghost" size="sm" asChild>
-            <a href={displayedUrl} target="_blank" rel="noopener noreferrer">
-              Open in Google Docs
-            </a>
-          </Button>
-          {canEditReference && (
-            <Button
-              type="button"
-              size="sm"
-              loading={requesting}
-              disabled={requesting || !!revisionDisabledReason}
-              title="Requires an authorized Google connection in this session"
-              aria-describedby={revisionDisabledReason ? revisionReasonId : undefined}
-              onClick={() => void requestRevision()}
-            >
-              Request agent revision
+            <Button variant="ghost" size="sm" asChild>
+              <a href={displayedUrl} target="_blank" rel="noopener noreferrer">
+                Open in Google Docs
+              </a>
             </Button>
-          )}
+            {canEditReference && (
+              <Button
+                type="button"
+                size="sm"
+                loading={requesting}
+                disabled={revisionDisabled}
+                title="Requires an authorized Google connection in this session"
+                aria-describedby={revisionDisabledReason ? revisionReasonId : undefined}
+                onClick={() => void requestRevision()}
+              >
+                Request agent review
+              </Button>
+            )}
+          </div>
         </div>
       )}
       {revisionDisabledReason && canEditReference && displayedUrl !== null && (
@@ -325,8 +404,8 @@ export function GoogleDocsPane({
       {revisionError && (
         <p role="alert" className="shrink-0 px-3 py-2 text-xs text-destructive">
           {revisionError.url === displayedUrl
-            ? "Could not request a revision."
-            : "Could not request a revision for the previous document."}{" "}
+            ? "Could not request a review."
+            : "Could not request a review for the previous document."}{" "}
           {revisionError.message}
         </p>
       )}

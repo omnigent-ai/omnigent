@@ -469,6 +469,19 @@ function DirtyFileViewerProbe() {
   ) : null;
 }
 
+function GoogleDocsLinkProbe({ url }: { url: string }) {
+  const openGoogleDoc = useContext(FileViewerContext)?.openGoogleDoc;
+  const [handled, setHandled] = useState<boolean>();
+  return (
+    <>
+      <button type="button" onClick={() => setHandled(openGoogleDoc?.(url) ?? false)}>
+        Open linked Doc
+      </button>
+      <output aria-label="Doc link handled">{String(handled)}</output>
+    </>
+  );
+}
+
 function NavProbe() {
   const navigate = useNavigate();
   return (
@@ -610,6 +623,7 @@ function renderShell(
     rerenderable?: boolean;
     sessionNavTo?: string;
     dirtyFileViewer?: boolean;
+    googleDocsUrl?: string;
     seedQueryClient?: (client: QueryClient) => void;
   } = {},
 ) {
@@ -639,6 +653,7 @@ function renderShell(
             <NavProbe />
             {options.sessionNavTo && <SessionNavButton to={options.sessionNavTo} />}
             {options.dirtyFileViewer && <DirtyFileViewerProbe />}
+            {options.googleDocsUrl && <GoogleDocsLinkProbe url={options.googleDocsUrl} />}
             <LocationDisplay />
           </>
         }
@@ -825,6 +840,70 @@ afterEach(() => {
   toast.dismiss();
   cleanup();
   vi.useRealTimers();
+});
+
+describe("AppShell Google Docs links", () => {
+  const first = "https://docs.google.com/document/d/first/edit";
+  const second = "https://docs.google.com/document/d/second/edit";
+  const id = "conv_docs_link";
+
+  it.each([
+    [false, 4, second, false],
+    [true, 1, second, false],
+    [true, 1, first, true],
+    [true, 4, second, true],
+  ])(
+    "routes links with enabled=%s permission=%s url=%s",
+    async (enabled, permission, url, handled) => {
+      const baseMatchMedia = window.matchMedia;
+      const viewport = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+        ...baseMatchMedia(query),
+        matches: query === "(min-width: 1181px)" || baseMatchMedia(query).matches,
+      }));
+      const labels = { "ui.google_docs_url": first };
+      mockConversations([{ id, permission_level: permission, labels }]);
+      useSessionMock.mockReturnValue({
+        session: sessionSnapshot({ id, permissionLevel: permission, labels }),
+        isLoading: false,
+        error: null,
+      });
+      const fetchMock = vi.fn(async (_url: RequestInfo | URL, options?: RequestInit) =>
+        Response.json({
+          id,
+          labels:
+            options?.method === "PATCH"
+              ? { ...labels, ...JSON.parse(String(options.body)).labels }
+              : labels,
+        }),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+      onTestFinished(() => {
+        vi.unstubAllGlobals();
+        confirm.mockRestore();
+        viewport.mockRestore();
+      });
+      writeWorkspacePanelDefault("collapsed");
+      renderShell(`/c/${id}`, serverInfo({ features: { google_docs: enabled } }), {
+        googleDocsUrl: url,
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Open linked Doc" }));
+      expect(screen.getByLabelText("Doc link handled")).toHaveTextContent(String(handled));
+      if (handled) {
+        await waitFor(() =>
+          expect(screen.getByTitle("Google Docs editor")).toHaveAttribute(
+            "src",
+            url + "?embedded=true",
+          ),
+        );
+      } else {
+        expect(screen.queryByTitle("Google Docs editor")).not.toBeInTheDocument();
+      }
+      expect(
+        fetchMock.mock.calls.filter(([, options]) => options?.method === "PATCH"),
+      ).toHaveLength(handled && url !== first ? 1 : 0);
+    },
+  );
 });
 
 describe("AppShell header", () => {
