@@ -118,6 +118,27 @@ final class ConnectionErrorTests: XCTestCase {
       .login)
     XCTAssertEqual(transport.contexts.last?[WatchCredentials.contextKey] as? Data, Data())
 
+    for serverURL in [URL(string: "https://server.invalid")!, url] {
+      coordinator.parent.serverURL = serverURL
+      cookies.cookies.continuation.yield([oldCookie])
+      await bridge.sync(serverURL: serverURL, cookieStore: cookies)?.value
+      let active = try XCTUnwrap(transport.contexts.last?[WatchCredentials.contextKey] as? Data)
+      XCTAssertFalse(active.isEmpty)
+      let login = serverURL.appending(path: "login")
+      for (destination, isMainFrame) in [
+        (login, false),
+        (URL(string: "https://other.invalid/login")!, true),
+        (serverURL.appending(path: "other/login"), true),
+      ] {
+        XCTAssertNil(coordinator.authNavigationRoute(for: destination, isMainFrame: isMainFrame))
+        XCTAssertEqual(transport.contexts.last?[WatchCredentials.contextKey] as? Data, active)
+      }
+      // Accounts login clears before any completion, without becoming a native OIDC route.
+      XCTAssertNil(coordinator.authNavigationRoute(for: login, isMainFrame: true))
+      XCTAssertEqual(transport.contexts.last?[WatchCredentials.contextKey] as? Data, Data())
+    }
+    coordinator.parent.serverURL = view.serverURL
+
     let anonymousCookies = PendingWatchCookies()
     anonymousCookies.cookies.continuation.yield([])
     await coordinator.syncWatchCredentials(afterLoading: url, cookieStore: anonymousCookies)?.value

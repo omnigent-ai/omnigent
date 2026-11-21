@@ -826,10 +826,19 @@ struct OmnigentWebView: UIViewRepresentable {
       guard isMainFrame,
         let serverURL = oidcConnection?.serverURL ?? parent.serverURL ?? pinnedURL
       else { return nil }
-      let route = OidcAuthRoute(url: url, serverURL: serverURL)
       // Auth transitions can redirect externally without another app page completing.
-      if route != nil { watchBridge.signOut() }
-      return route
+      if isWatchAuthenticationPage(url, of: serverURL) { watchBridge.signOut() }
+      return OidcAuthRoute(url: url, serverURL: serverURL)
+    }
+
+    private func isWatchAuthenticationPage(_ url: URL, of serverURL: URL) -> Bool {
+      guard let origin = url.omnigentOrigin, origin == serverURL.omnigentOrigin else {
+        return false
+      }
+      let mount = OidcWebSession.mountPath(of: serverURL)
+      let path = OidcWebSession.mountPath(of: url)
+      return path == mount + "/login" || path == mount + "/auth"
+        || path.hasPrefix(mount + "/auth/")
     }
 
     @discardableResult
@@ -840,11 +849,8 @@ struct OmnigentWebView: UIViewRepresentable {
         let serverURL = parent.serverURL ?? pinnedURL
       else { return nil }
       if workspaceSession == nil {
-        let mount = OidcWebSession.mountPath(of: serverURL)
-        let path = OidcWebSession.mountPath(of: pageURL)
         guard OidcWebSession.isPage(pageURL, of: serverURL),
-          path != mount + "/login", path != mount + "/auth",
-          !path.hasPrefix(mount + "/auth/")
+          !isWatchAuthenticationPage(pageURL, of: serverURL)
         else {
           watchBridge.signOut()
           return nil

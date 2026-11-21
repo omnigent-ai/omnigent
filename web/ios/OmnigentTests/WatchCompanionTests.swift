@@ -179,7 +179,13 @@ final class WatchCompanionTests: XCTestCase {
     let snapshot = Data(
       #"{"status":"running","pending_elicitations":[{"elicitation_id":"e1","params":{"message":"Run it?"}}]}"#
         .utf8)
-    for resolvedElsewhere in [false, true] {
+    for (resolvedElsewhere, failureStatus) in [
+      (false, 401), (true, 401), (false, 403), (true, 403),
+    ] {
+      let expectedError =
+        failureStatus == 401
+        ? WatchError.signedOut.localizedDescription
+        : "You don't have permission to perform this action."
       // Only the serial HTTP handler reads or changes this server-side state.
       var promptResolved = false
       let server = try MockHTTPServer(requestHandler: { request in
@@ -194,7 +200,7 @@ final class WatchCompanionTests: XCTestCase {
           return (200, [:], Data(#"{"data":[]}"#.utf8))
         case ("POST", "/v1/sessions/s1/elicitations/e1/resolve"):
           let body = try? JSONSerialization.jsonObject(with: request.body) as? [String: String]
-          if body?["action"] == "accept" { return (401, [:], Data()) }
+          if body?["action"] == "accept" { return (failureStatus, [:], Data()) }
           XCTAssertEqual(body?["action"], "decline")
           promptResolved = true
           return (200, [:], Data())
@@ -213,9 +219,9 @@ final class WatchCompanionTests: XCTestCase {
       XCTAssertNil(conversation.error)
       let approval = try XCTUnwrap(conversation.approvals.first)
       await conversation.resolve(approval, accept: true)
-      XCTAssertEqual(conversation.error, WatchError.signedOut.localizedDescription)
+      XCTAssertEqual(conversation.error, expectedError)
       await conversation.load()
-      XCTAssertEqual(conversation.error, WatchError.signedOut.localizedDescription)
+      XCTAssertEqual(conversation.error, expectedError)
       XCTAssertEqual(conversation.approvals.map(\.id), ["e1"])
       if resolvedElsewhere {
         try await client.post(

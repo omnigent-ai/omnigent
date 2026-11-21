@@ -205,12 +205,14 @@ struct WatchElicitation: Decodable, Identifiable, Sendable {
 
 enum WatchError: LocalizedError, Equatable {
   case signedOut
+  case forbidden
   case status(Int)
   case routingUnavailable
 
   var errorDescription: String? {
     switch self {
     case .signedOut: "Open Omnigent on your iPhone to sign in again."
+    case .forbidden: "You don't have permission to perform this action."
     case .status(let code): "The server returned HTTP \(code)."
     case .routingUnavailable:
       "Couldn't find this session's host. Open it on your iPhone to respond."
@@ -296,7 +298,8 @@ struct WatchClient: Sendable {
     }
     switch (response as? HTTPURLResponse)?.statusCode ?? 0 {
     case 200..<300: return data
-    case 401, 403: throw WatchError.signedOut
+    case 401: throw WatchError.signedOut
+    case 403: throw WatchError.forbidden
     case let code: throw WatchError.status(code)
     }
   }
