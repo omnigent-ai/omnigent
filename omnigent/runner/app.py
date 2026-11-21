@@ -2810,10 +2810,17 @@ def create_runner_app(
             )
         return None
 
-    async def _session_runtime_cwd(session_id: str) -> Path | None:
+    async def _session_explicit_workspace(session_id: str) -> Path | None:
+        """The session's own server-stored workspace, or ``None`` when it has none."""
         workspace = await _session_workspace_value(session_id)
         if workspace and workspace.strip():
             return Path(workspace.strip()).expanduser().resolve()
+        return None
+
+    async def _session_runtime_cwd(session_id: str) -> Path | None:
+        explicit = await _session_explicit_workspace(session_id)
+        if explicit is not None:
+            return explicit
         return runner_workspace.resolve() if runner_workspace is not None else None
 
     async def _load_legacy_session_init_context() -> _SessionInitContext:
@@ -9553,6 +9560,7 @@ def create_runner_app(
         _session_harness_name=_session_harness_name,
         _session_inboxes=_session_inboxes,
         _session_runtime_cwd=_session_runtime_cwd,
+        _session_explicit_workspace=_session_explicit_workspace,
         _session_spec_cache=_session_spec_cache,
         filesystem_registry=filesystem_registry,
         mcp_execution_registry=mcp_execution_registry,

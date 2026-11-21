@@ -146,7 +146,7 @@ async def _file_tool(
 
     :param client: The test HTTP client, standing in for the runner's server client.
     :param session_id: The calling session, e.g. ``"conv_abc123"``.
-    :param workspace: The session's runtime workspace.
+    :param workspace: The session's own workspace, where its native terminal runs.
     :param name: File tool name, e.g. ``"sys_upload_file"``.
     :param args: Tool arguments, e.g. ``path="out/report.txt"``.
     :returns: The tool's output string.
@@ -162,6 +162,7 @@ async def _file_tool(
         ),
         conversation_id=session_id,
         runner_workspace=workspace,
+        session_workspace=workspace,
         effective_harness="claude-native",
     )
 

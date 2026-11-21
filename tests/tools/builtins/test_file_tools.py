@@ -380,6 +380,19 @@ def test_list_files_excludes_other_sessions(
 # ── sys_download_file tests ──────────────────────────────────
 
 
+def test_download_schema_describes_the_text_result_agents_receive() -> None:
+    """
+    The advertised description matches the runner's result, the file's content as
+    text, and promises neither a saved local path nor intact binary content.
+    """
+    function = DownloadFileTool().get_schema()["function"]
+
+    assert function["description"] == DownloadFileTool.description()
+    assert "return its content as text" in function["description"]
+    assert "binary content is not returned intact" in function["description"]
+    assert "path" not in function["description"]
+
+
 def test_download_file_saves_to_workspace(
     monkeypatch: pytest.MonkeyPatch,
     tool_ctx: ToolContext,
