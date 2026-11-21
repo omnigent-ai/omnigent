@@ -5391,7 +5391,9 @@ def _verify_submit_accepted(
     :param submit_boundary: Native transcript boundary captured before Enter.
     :param submitted_text: Full submitted text; a marker alone cannot identify a refusal.
     :param stash_pending: Whether the person's draft was stashed for this submit.
-        Once Claude Code returns it, the box may hold it, so no Enter follows.
+        Claude Code returns it only once it has taken the submit, so a box
+        shown without the stash marker on two captures in a row is accepted,
+        however the returned draft reads, and no Enter follows.
     :returns: ``True`` when the draft left the input box (accepted),
         ``False`` when it is still there after the full window.
     :raises ClaudeSubmitBlockedUnconfirmed: A fresh matching refusal appeared;
@@ -5405,6 +5407,7 @@ def _verify_submit_accepted(
     warned = False
     retries = 0
     polls = 0
+    returned_polls = 0
     pane = ""
     while time.monotonic() - start < _SUBMIT_VERIFY_TIMEOUT_S:
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
@@ -5452,6 +5455,24 @@ def _verify_submit_accepted(
                     time.monotonic() - start,
                 )
             return True
+        if stash_pending and _composer_box(pane) is not None and not _stash_marker_shown(pane):
+            # The returned draft may quote the message or hold a collapsed paste
+            # that reads like it; two captures in a row rule out a torn one.
+            returned_polls += 1
+            if returned_polls >= 2:
+                delivery_diagnostics.record_verification(
+                    draft_still_present=False,
+                    pane=pane,
+                    needle=needle,
+                    prompt_glyph=_CLAUDE_PROMPT_GLYPH,
+                    start=start,
+                    retries=retries,
+                    polls=polls,
+                )
+                delivery_diagnostics.record_details(stashed_draft_returned=True)
+                return True
+            continue
+        returned_polls = 0
         now = time.monotonic()
         if not warned and now - start >= _SUBMIT_SLOW_ACCEPT_WARN_S:
             warned = True
@@ -5899,6 +5920,21 @@ def _deliver_slash_command(
         _confirm_tui_dialog(socket_path, tmux_target, hint=dialog_hint, bridge_dir=bridge_dir)
 
 
+def _confirm_dialog_shown(pane: str, hint: str) -> bool:
+    """
+    Return whether the confirmation titled *hint* is on screen.
+
+    The dialog takes the input box's place, so its title only counts while no
+    input box shows: the same words in the person's draft, or in the
+    transcript above the box, do not open a dialog.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :param hint: The dialog's title, e.g. :data:`EFFORT_DIALOG_HINT`.
+    :returns: ``True`` when the dialog is shown.
+    """
+    return hint in pane and not claude_pane_input_box_shown(pane)
+
+
 def _confirm_tui_dialog(
     socket_path: str,
     tmux_target: str,
@@ -5915,7 +5951,9 @@ def _confirm_tui_dialog(
     left it open to swallow the person's next message. Polling for the
     command's own title — not for "a dialog" — is also what keeps the Enter off
     a surface that is not ours, e.g. a ``/model`` picker the person opened by
-    hand or a permission prompt that rendered mid-turn.
+    hand or a permission prompt that rendered mid-turn. The title counts only
+    where the dialog replaced the input box (:func:`_confirm_dialog_shown`),
+    never in the person's draft or the transcript.
 
     On timeout the Enter is still sent, so a dialog whose title drifted in a
     Claude Code release does not sit open forever wedging the pane. It is
@@ -5944,7 +5982,7 @@ def _confirm_tui_dialog(
     while True:
         pane = _capture_pane(socket_path, tmux_target)
         _raise_if_user_prompt_pending(bridge_dir, pane)
-        if hint in pane:
+        if _confirm_dialog_shown(pane, hint):
             _confirm_and_verify_dialog_closed(
                 socket_path, tmux_target, hint=hint, bridge_dir=bridge_dir
             )
@@ -6389,11 +6427,15 @@ def _confirm_and_verify_dialog_closed(
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
         pane = _capture_pane(socket_path, tmux_target)
         # A torn (empty) capture proves nothing — only a pane that renders
-        # WITHOUT the hint shows the dialog actually closed.
-        if pane.strip() and hint not in pane:
+        # WITHOUT the dialog shows it actually closed. A returned draft that
+        # quotes the title is the input box, not the dialog.
+        if pane.strip() and not _confirm_dialog_shown(pane, hint):
             return
         _raise_if_user_prompt_pending(bridge_dir, pane)
-        if hint in pane and time.monotonic() - last_enter >= _CONFIRM_DIALOG_RETRY_INTERVAL_S:
+        if (
+            _confirm_dialog_shown(pane, hint)
+            and time.monotonic() - last_enter >= _CONFIRM_DIALOG_RETRY_INTERVAL_S
+        ):
             _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
             last_enter = time.monotonic()
 

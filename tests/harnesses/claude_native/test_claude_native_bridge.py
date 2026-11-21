@@ -12928,8 +12928,12 @@ _BOX_GEOMETRIES = pytest.mark.parametrize(
 @_STALE_DRAFT_CURSORS
 @pytest.mark.parametrize(
     "draft",
-    [_STALE_MULTILINE_DRAFT, _STALE_MULTILINE_DRAFT.replace("STALE TWO", "─────────")],
-    ids=["plain-draft", "draft-with-rule"],
+    [
+        _STALE_MULTILINE_DRAFT,
+        _STALE_MULTILINE_DRAFT.replace("STALE TWO", "─────────"),
+        _STALE_MULTILINE_DRAFT.replace("STALE TWO", "ÉTÉ ☃ 日本語"),
+    ],
+    ids=["plain-draft", "draft-with-rule", "utf8-draft"],
 )
 def test_inject_user_message_sends_none_of_a_leftover_draft_and_returns_it(
     tmp_path: Path,
@@ -12960,8 +12964,12 @@ def test_inject_user_message_sends_none_of_a_leftover_draft_and_returns_it(
 @_STALE_DRAFT_CURSORS
 @pytest.mark.parametrize(
     "draft",
-    [_STALE_MULTILINE_DRAFT, _STALE_MULTILINE_DRAFT.replace("STALE TWO", "─────────")],
-    ids=["plain-draft", "draft-with-rule"],
+    [
+        _STALE_MULTILINE_DRAFT,
+        _STALE_MULTILINE_DRAFT.replace("STALE TWO", "─────────"),
+        _STALE_MULTILINE_DRAFT.replace("STALE TWO", "ÉTÉ ☃ 日本語"),
+    ],
+    ids=["plain-draft", "draft-with-rule", "utf8-draft"],
 )
 def test_inject_slash_command_sends_none_of_a_leftover_draft_and_returns_it(
     tmp_path: Path,
@@ -13226,16 +13234,26 @@ def test_the_stash_marker_is_read_only_above_the_input_box() -> None:
     assert not claude_native_bridge._stash_marker_shown(quoted)
 
 
+@pytest.mark.parametrize(
+    "pane",
+    [
+        _composer_pane("my returned draft"),
+        _composer_pane("why does Change effort level? keep showing up"),
+        "⏺ Change effort level? asks before switching.\n" + _composer_pane("my returned draft"),
+    ],
+    ids=["draft", "draft-quoting-the-title", "reply-quoting-the-title"],
+)
 def test_a_confirm_enter_never_reaches_a_returned_draft(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, pane: str
 ) -> None:
     """
     A settings dialog that never renders gets no Enter over the person's draft.
 
     Claude Code returns the stashed draft as soon as the command runs; an
-    Enter sent for a dialog that never appeared would submit it.
+    Enter sent for a dialog that never appeared would submit it. The title in
+    the draft or the transcript is not the dialog: the input box is still there.
     """
-    sends = _fake_tmux(monkeypatch, [_composer_pane("my returned draft")])
+    sends = _fake_tmux(monkeypatch, [pane])
 
     confirmed = claude_native_bridge._confirm_tui_dialog(
         "/tmp/example/tmux.sock", "claude:0.0", hint="Change effort level?", timeout_s=1.0
@@ -13245,11 +13263,60 @@ def test_a_confirm_enter_never_reaches_a_returned_draft(
     assert not any(args[-1] == "Enter" for args in sends)
 
 
-def test_submit_retries_stop_once_the_stashed_draft_is_back(
+def test_a_confirmed_dialog_is_not_taken_for_open_by_a_returned_draft(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With the draft returned, the box may hold it, so no retry Enter is sent."""
-    sends = _fake_tmux(monkeypatch, [_composer_pane("hello from the web and more")])
+    """After the confirm Enter, a returned draft quoting the title gets no second one."""
+    dialog = (
+        "▔" * 30 + "\n   Change effort level?\n   ❯ 1. Yes, switch to high\n     2. No, go back\n"
+    )
+    sends = _fake_tmux(
+        monkeypatch, [dialog, _composer_pane("why does Change effort level? keep showing up")]
+    )
+
+    confirmed = claude_native_bridge._confirm_tui_dialog(
+        "/tmp/example/tmux.sock", "claude:0.0", hint="Change effort level?", timeout_s=1.0
+    )
+
+    assert confirmed is True
+    assert [args[-1] for args in sends] == ["Enter"]
+
+
+@pytest.mark.parametrize(
+    "returned_draft",
+    ["hello from the web and more", "[Pasted text #1 +4 lines] look at line 3"],
+    ids=["draft-quoting-the-message", "collapsed-paste"],
+)
+def test_a_returned_draft_confirms_the_submit_without_another_enter(
+    monkeypatch: pytest.MonkeyPatch, returned_draft: str
+) -> None:
+    """
+    Claude Code returns the stashed draft only once it has taken the submit.
+
+    The returned draft can read like the delivered input, so it is the return
+    itself that confirms the delivery, and no retry Enter would submit it.
+    """
+    sends = _fake_tmux(monkeypatch, [_composer_pane(returned_draft)])
+    monkeypatch.setattr(claude_native_bridge, "_SUBMIT_VERIFY_TIMEOUT_S", 5.0)
+
+    accepted = claude_native_bridge._verify_submit_accepted(
+        "/tmp/example/tmux.sock",
+        "claude:0.0",
+        needle="hello from the web",
+        what="submitted message",
+        stash_pending=True,
+    )
+
+    assert accepted is True
+    assert not any(args[-1] == "Enter" for args in sends)
+
+
+def test_a_submit_whose_draft_is_still_stashed_is_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """While the stash marker shows, the box still holds the delivery, so Enter is retried."""
+    pending = "                    › stashed\n" + _composer_pane("hello from the web")
+    sends = _fake_tmux(monkeypatch, [pending])
     monkeypatch.setattr(claude_native_bridge, "_SUBMIT_VERIFY_TIMEOUT_S", 5.0)
 
     accepted = claude_native_bridge._verify_submit_accepted(
@@ -13261,7 +13328,7 @@ def test_submit_retries_stop_once_the_stashed_draft_is_back(
     )
 
     assert accepted is False
-    assert not any(args[-1] == "Enter" for args in sends)
+    assert any(args[-1] == "Enter" for args in sends)
 
 
 def test_delivery_waits_for_the_person_to_pause_typing(
@@ -13568,13 +13635,12 @@ def test_a_draft_taller_than_the_pane_refuses_delivery_and_is_left_alone(
     inject: Callable[[Path], None],
 ) -> None:
     """
-    A draft too tall for the pane refuses the delivery, not waited on as an overlay.
+    Delivery is refused while the pane hides whether the stash is in use.
 
     Claude Code keeps the bottom of its screen in view, so the draft scrolls
     the box's opening rule, ``❯`` row and stash marker off the top. A draft
     stashed earlier cannot be ruled out, and stashing could replace it, so
-    nothing is typed and the executor holds the message. Read as "no input
-    box", the readiness gate used to wait out its budget instead.
+    nothing is typed and the executor holds the message.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
     composer = _EditableComposer(_TALL_DRAFT, cursor=cursor, pane_rows=10)
