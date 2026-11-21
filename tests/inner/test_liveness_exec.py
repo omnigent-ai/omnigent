@@ -7,6 +7,7 @@ import signal
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -316,12 +317,54 @@ def test_main_in_process_reaps_leftovers_with_both_signals(
     assert census_calls == [signal.SIGTERM, signal.SIGKILL]
 
 
+@pytest.fixture(params=[False, True], ids=["fd-below-1024", "fd-above-1024"])
+def liveness_pipe(request: pytest.FixtureRequest) -> Iterator[tuple[int, int]]:
+    """A pipe for the test to close, its read end optionally above ``select()``'s FD_SETSIZE.
+
+    The runner raises its open-file limit, so the liveness descriptor it passes
+    on can be numbered above 1024. Both read ends sit well above the lowest free
+    descriptor so a closed one is not reused while the wrapper polls it.
+    """
+    import fcntl
+    import resource
+
+    original_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+    soft, hard = original_limit
+    try:
+        if request.param:
+            wanted = 2048 if hard == resource.RLIM_INFINITY else min(hard, 2048)
+            if wanted <= 1100:
+                pytest.skip(f"hard open-file limit {hard} cannot hold a descriptor above 1024")
+            if soft != resource.RLIM_INFINITY and soft < wanted:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (wanted, hard))
+            lowest_read_fd = 1025
+        else:
+            lowest_read_fd = (1024 if soft == resource.RLIM_INFINITY else min(soft, 1024)) // 2
+        pipe_read_fd, write_fd = os.pipe()
+        try:
+            read_fd = fcntl.fcntl(pipe_read_fd, fcntl.F_DUPFD, lowest_read_fd)
+        except OSError:
+            os.close(write_fd)
+            raise
+        finally:
+            os.close(pipe_read_fd)
+        yield read_fd, write_fd
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, original_limit)
+
+
 @posix_only
-def test_main_in_process_tears_down_when_the_pipe_closes(
+@pytest.mark.parametrize("liveness_fd_open", [True, False], ids=["parent-exits", "fd-closed"])
+def test_main_in_process_tears_down_when_the_liveness_pipe_breaks(
     monkeypatch: pytest.MonkeyPatch,
+    liveness_pipe: tuple[int, int],
+    liveness_fd_open: bool,
 ) -> None:
-    read_fd, write_fd = os.pipe()
+    """Parent death, or a liveness fd the kernel rejects (EBADF), tears the worker down."""
+    read_fd, write_fd = liveness_pipe
     os.close(write_fd)  # the parent is already gone
+    if not liveness_fd_open:
+        os.close(read_fd)
     torn_down: list[tuple[int, bool]] = []
 
     def _fake_terminate(pgid: int, child: subprocess.Popen[bytes], **kw: object) -> None:
@@ -335,32 +378,10 @@ def test_main_in_process_tears_down_when_the_pipe_closes(
             monkeypatch, [sys.executable, "-c", "import time; time.sleep(60)"], read_fd
         )
     finally:
-        os.close(read_fd)
+        if liveness_fd_open:
+            os.close(read_fd)
     assert rc == 1
     assert torn_down == [(os.getpgrp(), True)]
-
-
-@posix_only
-def test_main_in_process_tears_down_on_a_broken_liveness_fd(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    torn_down: list[int] = []
-
-    def _fake_terminate(pgid: int, child: subprocess.Popen[bytes], **kw: object) -> None:
-        torn_down.append(pgid)
-        child.kill()
-        child.wait(timeout=5)
-
-    monkeypatch.setattr(_liveness_exec, "_terminate_group", _fake_terminate)
-
-    def _broken_select(*args: object, **kwargs: object) -> object:
-        raise OSError(9, "Bad file descriptor")
-
-    # A liveness fd the kernel rejects (EBADF) takes the same teardown path.
-    monkeypatch.setattr(_liveness_exec.select, "select", _broken_select)
-    rc = _main_with(monkeypatch, [sys.executable, "-c", "import time; time.sleep(60)"], 0)
-    assert rc == 1
-    assert torn_down == [os.getpgrp()]
 
 
 @posix_only

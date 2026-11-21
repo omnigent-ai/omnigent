@@ -161,13 +161,15 @@ def main() -> int:
     if not args.argv:
         return 2
     pgid = os.getpgrp()
+    # poll() has no FD_SETSIZE ceiling; select() rejects descriptors >= 1024.
+    liveness = select.poll()
+    liveness.register(args.liveness_fd, select.POLLIN)
     child = subprocess.Popen(args.argv, close_fds=True)
     census: dict[int, float] = {}
     while child.poll() is None:
         _refresh_census(child, census)
         try:
-            readable, _, _ = select.select([args.liveness_fd], [], [], 0.1)
-            if readable and not os.read(args.liveness_fd, 1):
+            if liveness.poll(100) and not os.read(args.liveness_fd, 1):
                 _terminate_group(pgid, child, detached_reaper=True, census=census)
                 return 1
         except OSError:
