@@ -21,6 +21,7 @@ import {
   parseTerminalClipboardMessage,
   resolveTerminalWorkspaceFileLink,
   sgrWheelReports,
+  terminalFitReserveWidth,
   terminalTheme,
   terminalKeyEventPayload,
   touchScrollPayload,
@@ -706,6 +707,18 @@ class FakeResizeObserver {
   }
 }
 
+describe("terminalFitReserveWidth", () => {
+  it("holds back the scrollbar's width as the fit does, or nothing without scrollback", () => {
+    expect(terminalFitReserveWidth({ options: { scrollback: 1000 } })).toBe(14);
+    expect(
+      terminalFitReserveWidth({ options: { scrollback: 1000, overviewRuler: { width: 20 } } }),
+    ).toBe(20);
+    expect(
+      terminalFitReserveWidth({ options: { scrollback: 0, overviewRuler: { width: 20 } } }),
+    ).toBe(0);
+  });
+});
+
 describe("TerminalSession", () => {
   beforeEach(() => {
     FakeWebSocket.instances = [];
@@ -758,6 +771,38 @@ describe("TerminalSession", () => {
       (m) => typeof m === "string" && m.includes('"type":"resize"'),
     );
     expect(resizeFrame).toBeDefined();
+    session.dispose();
+  });
+
+  it("says its fitted size in cells on its container once it sends one", () => {
+    const { container, socket, session } = makeSession();
+    expect(container.dataset.terminalCols).toBeUndefined();
+
+    socket.open();
+
+    const term = (session as unknown as { term: Terminal }).term;
+    expect(container.dataset.terminalCols).toBe(String(term.cols));
+    expect(container.dataset.terminalRows).toBe(String(term.rows));
+    expect(container.dataset.terminalFitReserveWidth).toBe(String(terminalFitReserveWidth(term)));
+    session.dispose();
+  });
+
+  it.each([
+    [
+      "its socket closes",
+      (socket: FakeWebSocket) => socket.emit("close", { code: 1006, reason: "" }),
+    ],
+    ["it's disposed", (_socket: FakeWebSocket, session: TerminalSession) => session.dispose()],
+  ])("stops saying a fitted size once %s", (_case, end) => {
+    const { container, socket, session } = makeSession();
+    socket.open();
+    expect(container.dataset.terminalCols).toBeDefined();
+
+    end(socket, session);
+
+    expect(container.dataset.terminalCols).toBeUndefined();
+    expect(container.dataset.terminalRows).toBeUndefined();
+    expect(container.dataset.terminalFitReserveWidth).toBeUndefined();
     session.dispose();
   });
 
