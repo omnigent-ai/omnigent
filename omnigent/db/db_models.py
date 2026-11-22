@@ -910,7 +910,11 @@ class SqlProject(OmnigentBase):
     # can always override. Opaque and never SQL-filtered — stored compressed
     # (CompressedText).
     config: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
-    orchestrator_session_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    main_session_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    # Read-only rollout fallback; remove after the 0.25 compatibility window.
+    legacy_orchestrator_session_id: Mapped[str | None] = mapped_column(
+        "orchestrator_session_id", Uuid16(), nullable=True
+    )
     # Board definitions are a single bounded document, separate from session defaults.
     ticket_stages: Mapped[dict[str, Any] | None] = mapped_column(
         EnvelopedJSON(16383), nullable=True

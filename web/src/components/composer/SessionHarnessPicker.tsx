@@ -3,7 +3,7 @@ import {
   HarnessPickerConfigRow,
   HarnessPickerConfigPage,
 } from "@/components/composer/HarnessPicker";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { WandSparklesIcon } from "lucide-react";
 import { CompactShortcutKeys } from "@/components/KeyboardShortcut";
 import { ComposerConfigTooltipRows } from "@/components/composer/ComposerControls";
@@ -62,6 +62,7 @@ function hasSessionConfig({
 export function SessionHarnessPicker({
   sessionId,
   appearance = "composer",
+  agentIcon,
   busy,
   busyRef,
   setBusy,
@@ -85,6 +86,8 @@ export function SessionHarnessPicker({
   modelPickerShortcutEnabled = false,
 }: {
   appearance?: "composer" | "header";
+  /** Project agents may supply their own identity without changing the session's harness. */
+  agentIcon?: ReactNode;
   busy: boolean;
   busyRef: { current: boolean };
   setBusy: (busy: boolean) => void;
@@ -530,7 +533,7 @@ export function SessionHarnessPicker({
         label: "Configure session",
         model: label,
         effort: effortLabel ?? undefined,
-        icon: (
+        icon: agentIcon ?? (
           <ComposerAgentIcon
             agent={iconAgent}
             className={appearance === "header" ? "size-5" : undefined}

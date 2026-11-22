@@ -13,8 +13,13 @@ import { conversation } from "@/test/sidebarMockHelpers";
 import type { ProjectTicket, TicketChanges, TicketEvent } from "@/lib/projectTicketsApi";
 import * as api from "@/lib/projectTicketsApi";
 import * as projectsApi from "@/lib/projectsApi";
-import { Link, useLocation } from "@/lib/routing";
+import { getSessionSlim } from "@/lib/sessionsApi";
+import type * as SessionsModule from "@/lib/sessionsApi";
+import type { Session } from "@/lib/types";
+import { Link, useLocation, useSearchParams } from "@/lib/routing";
 import { buildMessageDeepLink } from "@/lib/messageDeepLink";
+import { ProjectTicketUpdates } from "./ProjectTicketUpdates";
+import { ticketSelectionIds } from "./projectHomeNavigation";
 
 const capabilities = vi.hoisted(() => ({ lifecycle: true, involvement: true, stages: true }));
 vi.mock("@/lib/CapabilitiesContext", () => ({
@@ -52,6 +57,25 @@ vi.mock("@/projectHome/ProjectSessionPanel", () => ({
     </div>
   ),
 }));
+vi.mock("./ProjectChat", () => ({
+  ProjectChat: () => <output aria-label="Main chat composer" />,
+  ProjectAgentChat: ({
+    sessionId,
+    ticket,
+  }: {
+    sessionId: string;
+    ticket?: { id: string; title: string };
+  }) => (
+    <div>
+      <output aria-label="Existing session chat">{sessionId}</output>
+      {ticket && (
+        <Link to={`?view=board&ticket=${ticket.id}`} aria-label="Back to ticket">
+          {ticket.title}
+        </Link>
+      )}
+    </div>
+  ),
+}));
 vi.mock("@/hooks/useOpenSessionRow", () => ({ fetchConversationById: vi.fn() }));
 vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: vi.fn(() => false) }));
 vi.mock("@/hooks/useViewerId", () => ({ useViewerId: () => "local" }));
@@ -71,8 +95,11 @@ vi.mock("@/lib/projectTicketsApi", async (importOriginal) => ({
 }));
 vi.mock("@/lib/projectsApi", () => ({
   getProject: vi.fn(),
-  initializeProjectOrchestrator: vi.fn(),
   createProject: vi.fn(),
+}));
+vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionsModule>()),
+  getSessionSlim: vi.fn(),
 }));
 
 let ticket: ProjectTicket;
@@ -98,6 +125,22 @@ function renderBoard(element: React.ReactNode) {
   return { ...rendered, client };
 }
 
+function TicketBatchFlow({ ids }: { ids: string[] }) {
+  const [search] = useSearchParams();
+  return search.get("view") === "board" ? (
+    <ProjectTicketBoard
+      projectName="Shipping"
+      selectedTicketId={null}
+      ticketIds={ticketSelectionIds(search)}
+    />
+  ) : (
+    <ProjectTicketUpdates
+      projectId="project"
+      batch={{ bubbleId: "response", ticketIds: ids, kind: "created" }}
+    />
+  );
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   capabilities.lifecycle = true;
@@ -106,13 +149,24 @@ beforeEach(() => {
   vi.mocked(api.getTicketStages).mockResolvedValue(structuredClone(api.DEFAULT_TICKET_STAGES));
   vi.mocked(useIsMobileViewport).mockReturnValue(false);
   vi.mocked(fetchConversationById).mockImplementation(async (id) =>
-    id === "orchestrator" ? conversation(id, { title: "Shipping orchestrator" }) : null,
+    id === "orchestrator"
+      ? conversation(id, { title: "Main", agent_name: "maestro", harness: "claude-sdk" })
+      : null,
   );
   vi.mocked(projectsApi.getProject).mockResolvedValue({
     id: "project",
     name: "Shipping",
-    orchestrator_session_id: "orchestrator",
+    main_session_id: "orchestrator",
+    main_session_state: "active",
   });
+  vi.mocked(getSessionSlim).mockImplementation(
+    async (id) =>
+      ({
+        id,
+        projectId: "project",
+        archived: false,
+      }) as Session,
+  );
   ticket = {
     id: "ticket",
     project_id: "project",
@@ -153,6 +207,93 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   clients.splice(0).forEach((client) => client.clear());
+});
+
+describe("ticket updates in Chat", () => {
+  it("shows three current records, refreshes their stages, and drops inaccessible row details", async () => {
+    vi.mocked(api.getTicket).mockImplementation(async (_project, id) => ({
+      ...ticket,
+      id,
+      title: `Ticket ${id}`,
+    }));
+    const { client } = renderBoard(
+      <ProjectTicketUpdates
+        projectId="project"
+        batch={{
+          bubbleId: "response",
+          kind: "updated",
+          ticketIds: ["one", "two", "three", "four"],
+        }}
+      />,
+    );
+    expect(await screen.findByText("Ticket one")).toBeVisible();
+    expect(screen.getAllByRole("listitem")).toHaveLength(3);
+    expect(screen.getByRole("link", { name: "View all 4" })).toHaveAttribute(
+      "href",
+      "/?view=board&tickets=one%2Ctwo%2Cthree%2Cfour",
+    );
+    expect(vi.mocked(api.getTicket).mock.calls.map((call) => call[1])).toEqual([
+      "one",
+      "two",
+      "three",
+    ]);
+    act(() =>
+      client.setQueryData(["project-tickets", "project", "one"], {
+        ...ticket,
+        id: "one",
+        title: "Current title",
+        stage_id: "done",
+      }),
+    );
+    expect(await screen.findByText("Current title")).toBeVisible();
+    expect(screen.getByText("Done")).toBeVisible();
+    vi.mocked(api.getTicket).mockRejectedValue(new Error("Ticket unavailable"));
+    await act(() =>
+      client.invalidateQueries({ queryKey: ["project-tickets", "project", "one"], exact: true }),
+    );
+    expect(await screen.findByText("Ticket unavailable")).toBeVisible();
+    expect(screen.queryByText("Current title")).toBeNull();
+  });
+
+  it("opens a large explicit batch without scanning Board and pages requests before clearing the filter", async () => {
+    const ids = Array.from({ length: 30 }, (_, index) => `ticket-${index}`);
+    vi.mocked(api.getTicket).mockImplementation(async (_project, id) => ({
+      ...ticket,
+      id,
+      title: `Ticket ${id}`,
+    }));
+    renderBoard(<TicketBatchFlow ids={ids} />);
+    fireEvent.click(screen.getByRole("link", { name: "View all 30" }));
+    expect(await screen.findByText("Ticket ticket-24")).toBeVisible();
+    expect(screen.queryByText("Ticket ticket-25")).toBeNull();
+    expect(new Set(vi.mocked(api.getTicket).mock.calls.map((call) => call[1])).size).toBe(25);
+    expect(api.listTickets).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Load more" }));
+    expect(await screen.findByText("Ticket ticket-29")).toBeVisible();
+    fireEvent.click(screen.getByRole("link", { name: "Clear ticket filter" }));
+    expect(await screen.findByText("Ship the board")).toBeVisible();
+    expect(api.listTickets).toHaveBeenCalled();
+    expect(screen.queryByRole("link", { name: "Clear ticket filter" })).toBeNull();
+  });
+
+  it("asks Maestro in the saved session and returns without losing the ticket comment draft", async () => {
+    renderBoard(
+      <ProjectTicketPanel
+        projectName="Shipping"
+        ticketId="ticket"
+        onClose={vi.fn()}
+        onCreated={vi.fn()}
+      />,
+    );
+    fireEvent.change(await screen.findByLabelText("Add a comment"), {
+      target: { value: "Keep this ticket draft" },
+    });
+    fireEvent.click(screen.getByRole("link", { name: "Ask in Chat" }));
+    expect(await screen.findByLabelText("Existing session chat")).toHaveTextContent("orchestrator");
+    expect(projectsApi.createProject).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("link", { name: "Back to ticket" }));
+    expect(screen.getByLabelText("Add a comment")).toHaveValue("Keep this ticket draft");
+  });
 });
 
 describe("Ticket comment previews", () => {
@@ -255,6 +396,47 @@ describe("Ticket comment previews", () => {
 });
 
 describe("Project ticket board", () => {
+  it("overlays deduplicated circular agent icons without changing ticket navigation", async () => {
+    ticket.agents = [
+      { agent_name: "claude-native-ui", harness: "claude-native" },
+      { agent_name: "claude-native-ui (fork one)", harness: "claude-native" },
+      { agent_name: "claude-native", harness: "claude-native" },
+      { agent_name: "maestro", harness: "codex" },
+      { agent_name: "codex-native-ui", harness: "codex-native" },
+      { agent_name: "debby", harness: "claude-sdk" },
+    ];
+    const user = userEvent.setup();
+    renderBoard(
+      <>
+        <ProjectTicketBoard projectName="Shipping" selectedTicketId={null} />
+        <LocationProbe />
+      </>,
+    );
+    const icons = await screen.findByRole("group", { name: "Ticket agents" });
+    expect(within(icons).getAllByRole("button")).toHaveLength(4);
+    const claude = within(icons).getByRole("button", { name: "Claude Code" });
+    expect(claude).toHaveClass("rounded-full", "bg-card");
+    expect(claude.closest("a")).toBeNull();
+    expect(claude.querySelector('[data-harness-icon="claude"]')).not.toBeNull();
+    expect(
+      within(icons)
+        .getByRole("button", { name: "Maestro" })
+        .querySelector('[data-agent-icon="maestro"]'),
+    ).not.toBeNull();
+    await user.click(claude);
+    expect(
+      await screen.findByText("Claude Code", {
+        selector: '[data-slot="hover-card-content"]',
+      }),
+    ).toHaveTextContent(/^Claude Code$/);
+    expect(screen.getByLabelText("Current location")).toBeEmptyDOMElement();
+    await user.keyboard("{Escape}");
+    await user.click(screen.getByRole("link", { name: "Open ticket: Ship the board" }));
+    expect(screen.getByLabelText("Current location")).toHaveTextContent("?ticket=ticket");
+    expect(api.listTicketSessions).not.toHaveBeenCalled();
+    expect(fetchConversationById).not.toHaveBeenCalled();
+  });
+
   it("shows five phases and human-input labels, without filter controls", async () => {
     renderBoard(<ProjectTicketBoard projectName="Shipping" selectedTicketId={null} />);
     await screen.findByRole("region", { name: "Open" });
@@ -638,7 +820,7 @@ describe("Project ticket board", () => {
       title: "A small task",
       description: "",
     });
-    expect(projectsApi.initializeProjectOrchestrator).not.toHaveBeenCalled();
+    expect(projectsApi.createProject).not.toHaveBeenCalled();
   });
 
   it.each([false, true])(
@@ -1314,7 +1496,7 @@ describe("Project ticket board", () => {
         rerender(<ProjectTicketPanel {...props} expanded={false} />);
         expect(screen.getByLabelText("Add a comment")).toHaveValue("Comment draft");
       }
-      expect(projectsApi.initializeProjectOrchestrator).not.toHaveBeenCalled();
+      expect(projectsApi.createProject).not.toHaveBeenCalled();
     },
   );
 
@@ -1338,6 +1520,18 @@ describe("Project ticket board", () => {
             : id === "planner"
               ? "Plan the work"
               : "Verify the result",
+        agent_name:
+          id === "orchestrator"
+            ? "maestro"
+            : id === "planner"
+              ? "claude-native-ui (fork planning)"
+              : "codex-native-ui",
+        harness:
+          id === "orchestrator"
+            ? "claude-sdk"
+            : id === "planner"
+              ? "claude-native"
+              : "codex-native",
       }),
     );
     renderBoard(
@@ -1350,17 +1544,25 @@ describe("Project ticket board", () => {
     );
     const agents = await screen.findByRole("region", { name: "Agents" });
     expect(await within(agents).findByText("Investigating the approach")).toBeInTheDocument();
-    expect(
-      await within(agents).findByRole("link", { name: "Open chat with: Plan the work" }),
-    ).toHaveAttribute("href", "/?ticket=ticket&session=planner");
+    const planner = await within(agents).findByRole("link", {
+      name: "Open chat with: Claude Code",
+    });
+    expect(planner).toHaveAttribute("href", "/?ticket=ticket&session=planner");
+    expect(planner).toHaveAttribute("title", "Plan the work (planner)");
+    expect(planner.querySelector('[data-harness-icon="claude"]')).not.toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "More agents" }));
-    expect(
-      await within(agents).findByRole("link", {
-        name: "Open chat with: Verify the result",
-      }),
-    ).toHaveAttribute("href", "/?ticket=ticket&session=reviewer");
+    const reviewer = await within(agents).findByRole("link", { name: "Open chat with: Codex" });
+    expect(reviewer).toHaveAttribute("href", "/?ticket=ticket&session=reviewer");
+    expect(reviewer.querySelector('[data-harness-icon="codex"]')).not.toBeNull();
     expect(await within(agents).findByText("Verifying the result")).toBeInTheDocument();
-    expect(within(agents).getAllByRole("link", { name: /Shipping orchestrator/ })).toHaveLength(1);
+    expect(within(agents).getAllByRole("link", { name: /Maestro/ })).toHaveLength(1);
+    expect(
+      within(agents)
+        .getByRole("link", { name: "Open chat with: Maestro" })
+        .querySelector('[data-agent-icon="maestro"]'),
+    ).not.toBeNull();
+    expect(agents).not.toHaveTextContent("claude-native-ui");
+    expect(agents).not.toHaveTextContent("codex-native-ui");
     expect(
       within(screen.getByRole("list", { name: "Involved agents" })).getAllByRole("link"),
     ).toHaveLength(3);
@@ -1371,7 +1573,7 @@ describe("Project ticket board", () => {
     expect(screen.queryByLabelText("Involvement")).toBeNull();
     expect(api.setTicketSessionInvolvement).not.toHaveBeenCalled();
     expect(api.updateTicket).not.toHaveBeenCalled();
-    expect(projectsApi.initializeProjectOrchestrator).not.toHaveBeenCalled();
+    expect(projectsApi.createProject).not.toHaveBeenCalled();
   });
 
   it("opens the existing orchestrator with a return to the unassigned ticket", async () => {
@@ -1389,15 +1591,13 @@ describe("Project ticket board", () => {
         onCreated={vi.fn()}
       />,
     );
-    await user.click(
-      await screen.findByRole("link", { name: "Open chat with: Shipping orchestrator" }),
-    );
+    await user.click(await screen.findByRole("link", { name: "Open chat with: Maestro" }));
     expect(await screen.findByLabelText("Existing session chat")).toHaveTextContent("orchestrator");
     expect(screen.getByRole("link", { name: "Back to ticket" })).toHaveAttribute(
       "href",
-      "/?ticket=ticket",
+      "/?view=board&ticket=ticket",
     );
-    expect(projectsApi.initializeProjectOrchestrator).not.toHaveBeenCalled();
+    expect(projectsApi.createProject).not.toHaveBeenCalled();
   });
 
   it("keeps agents accessible without the new involvement capability", async () => {
@@ -1421,9 +1621,10 @@ describe("Project ticket board", () => {
     expect(screen.queryByRole("button", { name: "Edit agent involvement" })).toBeNull();
     expect(api.setTicketSessionInvolvement).not.toHaveBeenCalled();
     expect(screen.queryByRole("region", { name: "Response needed" })).toBeNull();
-    expect(
-      await screen.findByRole("link", { name: "Open chat with: Shipping orchestrator" }),
-    ).toHaveAttribute("href", "/?ticket=ticket&session=orchestrator");
+    expect(await screen.findByRole("link", { name: "Open chat with: Maestro" })).toHaveAttribute(
+      "href",
+      "/?ticket=ticket&view=chat",
+    );
   });
 
   it("routes responses to the prompt owner and does not treat a comment as a prompt answer", async () => {
@@ -1466,7 +1667,7 @@ describe("Project ticket board", () => {
     expect(api.updateTicket).not.toHaveBeenCalled();
     await user.click(respond);
     expect(screen.getByLabelText("Existing session chat")).toHaveTextContent("worker");
-    expect(projectsApi.initializeProjectOrchestrator).not.toHaveBeenCalled();
+    expect(projectsApi.createProject).not.toHaveBeenCalled();
   });
 
   it.each(["hover", "focus"])(
@@ -1532,7 +1733,7 @@ describe("Project ticket board", () => {
   );
 });
 
-describe("Project orchestrator", () => {
+describe("Legacy project chat panel", () => {
   it("opens the existing session component without creating another session", async () => {
     vi.mocked(projectsApi.getProject).mockResolvedValue({
       id: "project",
@@ -1541,21 +1742,18 @@ describe("Project orchestrator", () => {
     });
     renderBoard(<ProjectOrchestratorPanel projectName="Shipping" onClose={vi.fn()} />);
     expect(await screen.findByLabelText("Existing session chat")).toHaveTextContent("orchestrator");
-    expect(projectsApi.initializeProjectOrchestrator).not.toHaveBeenCalled();
+    expect(projectsApi.createProject).not.toHaveBeenCalled();
   });
 
-  it("initializes an older project only on request and uses the same session component", async () => {
-    vi.mocked(projectsApi.getProject).mockResolvedValue({ id: "project", name: "Shipping" });
-    vi.mocked(projectsApi.initializeProjectOrchestrator).mockResolvedValue({
+  it("uses project Chat's normal composer when Main is missing", async () => {
+    vi.mocked(projectsApi.getProject).mockResolvedValue({
       id: "project",
       name: "Shipping",
-      orchestrator_session_id: "new-orchestrator",
+      main_session_id: "old-main",
+      main_session_state: "missing",
     });
     renderBoard(<ProjectOrchestratorPanel projectName="Shipping" onClose={vi.fn()} />);
-    fireEvent.click(await screen.findByRole("button", { name: "Create orchestrator" }));
-    expect(await screen.findByLabelText("Existing session chat")).toHaveTextContent(
-      "new-orchestrator",
-    );
-    expect(projectsApi.initializeProjectOrchestrator).toHaveBeenCalledWith("project");
+    expect(await screen.findByLabelText("Main chat composer")).toBeInTheDocument();
+    expect(projectsApi.createProject).not.toHaveBeenCalled();
   });
 });

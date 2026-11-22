@@ -2202,13 +2202,17 @@ def test_ensure_default_debby_agent_skips_when_bundle_absent(
 
 @pytest.mark.parametrize(
     "seeder",
-    [server_app._ensure_default_polly_agent, server_app._ensure_default_debby_agent],
-    ids=["polly", "debby"],
+    [
+        server_app._ensure_default_polly_agent,
+        server_app._ensure_default_debby_agent,
+        server_app._ensure_default_maestro_agent,
+    ],
+    ids=["polly", "debby", "maestro"],
 )
 def test_bundle_agent_seeders_skip_when_not_allowlisted(
     seed_stores: _SeedStores, seeder: Callable[..., frozenset[str]]
 ) -> None:
-    """Polly and Debby are gated like the native rows and still return their name."""
+    """Bundle agents honor the allowlist and still return their reserved name."""
     (name,) = seeder(
         seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache, frozenset()
     )
@@ -2349,6 +2353,7 @@ def test_ensure_default_agents_allowlist_recognizes_every_packaged_name(
     stores = (seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache)
     monkeypatch.setenv(SEEDED_AGENTS_ENV, "")
     packaged = server_app._ensure_default_agents(*stores)
+    assert "maestro" in packaged
 
     def seeded() -> set[str]:
         # The proactive agent is seeded outside the allowlist and never listed.

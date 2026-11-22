@@ -4390,6 +4390,39 @@ class HostProcess:
         """
         harness = canonicalize_harness(frame.harness) or frame.harness
         with_source = functools.partial(_with_model_configuration_source, harness=harness)
+        if harness == "codex":
+            # SDK Codex uses its own provider binding, not the native wrapper's routes.
+            from omnigent.models.model_catalog import list_models_for_worker
+            from omnigent.spec.types import AgentSpec, ExecutorSpec
+
+            spec = AgentSpec(
+                spec_version=1,
+                name="codex-prelaunch",
+                executor=ExecutorSpec(type="omnigent", config={"harness": "codex"}),
+            )
+            try:
+                listing = await asyncio.to_thread(list_models_for_worker, spec, "codex")
+            except Exception:
+                _logger.exception("Failed to resolve pre-launch Codex SDK model options")
+                return HostModelOptionsResultFrame(
+                    request_id=frame.request_id,
+                    status="failed",
+                    error="failed to resolve Codex SDK model options",
+                )
+            if not listing.models:
+                return HostModelOptionsResultFrame(
+                    request_id=frame.request_id,
+                    status="failed",
+                    error="No model catalog is available for this host's Codex SDK configuration",
+                )
+            return HostModelOptionsResultFrame(
+                request_id=frame.request_id,
+                status="ok",
+                models=with_source(
+                    [{"id": model.id, "displayName": model.id} for model in listing.models]
+                ),
+                routable_models=[model.id for model in listing.models],
+            )
         if harness == "codex-native":
             # Harness-truth lane: every launch shape is answered from the
             # shared catalog, probed from the configured Codex binary itself.

@@ -136,6 +136,8 @@ export interface ServerInfo {
   /** Per-ticket descriptions of linked agents' contributions. */
   project_ticket_agent_involvement?: boolean;
   project_ticket_stages?: boolean;
+  /** Bounded project-wide counts of tickets needing a response. */
+  project_ticket_summary?: boolean;
   /**
    * Short name of the backing sandbox provider (e.g. ``"modal"``,
    * ``"lakebox"``) used to label the new-session sandbox option per
@@ -698,6 +700,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           project_ticket_lifecycle: data.project_ticket_lifecycle === true,
           project_ticket_agent_involvement: data.project_ticket_agent_involvement === true,
           project_ticket_stages: data.project_ticket_stages === true,
+          project_ticket_summary: data.project_ticket_summary === true,
           sandbox_provider:
             typeof data.sandbox_provider === "string" ? data.sandbox_provider : null,
           sandbox_providers: Array.isArray(data.sandbox_providers)

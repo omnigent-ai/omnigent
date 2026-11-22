@@ -43,7 +43,7 @@ import type * as NativeBridgeModule from "@/lib/nativeBridge";
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { Profiler, type ProfilerOnRenderCallback, useCallback } from "react";
+import { Profiler, type ComponentProps, type ProfilerOnRenderCallback, useCallback } from "react";
 import {
   createPath,
   MemoryRouter,
@@ -168,6 +168,7 @@ import {
   peekNewSessionHandoff,
 } from "@/lib/newSessionHandoff";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import * as agentBundle from "@/lib/agentBundle";
 
 describe("ComposerAddMenu", () => {
   it("groups real actions and opens the existing attachment picker only after selection", () => {
@@ -367,6 +368,7 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
     antigravity: "Antigravity",
     copilot: "Copilot",
   }),
+  useHarnessEffortFamilies: () => ({ codex: "openai", "claude-sdk": "anthropic" }),
   // The setup dialog reads server-authored steps from here; stub codex-native's
   // two-step flow (install → login) so the dialog renders without a real fetch.
   useHarnessSetupSteps: () => ({
@@ -1454,6 +1456,7 @@ function renderLanding(
   onRender?: ProfilerOnRenderCallback,
   strictMode = false,
   routing: RoutingApi = reactRouterRouting,
+  landingProps: ComponentProps<typeof NewChatLandingScreen> = {},
 ) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -1474,10 +1477,10 @@ function renderLanding(
               <LandingNavigationProbe />
               {onRender ? (
                 <Profiler id="landing" onRender={onRender}>
-                  <NewChatLandingScreen />
+                  <NewChatLandingScreen {...landingProps} />
                 </Profiler>
               ) : (
-                <NewChatLandingScreen />
+                <NewChatLandingScreen {...landingProps} />
               )}
             </RoutingProvider>
           </MemoryRouter>
@@ -1529,6 +1532,342 @@ function landingInfo(infoOverrides: Partial<ServerInfo>): ServerInfo {
     ...infoOverrides,
   };
 }
+
+describe("NewChatLandingScreen project Main", () => {
+  const refreshProject = vi.fn();
+  const main = { projectId: "project-main", expectedMainSessionId: "old-main" };
+  const sdkModels = {
+    ...SUCCESS_QUERY_STATE,
+    data: [
+      {
+        id: "model-a",
+        displayName: "Model A",
+        supportedReasoningEfforts: [{ reasoningEffort: "high" }],
+      },
+    ],
+  };
+  const props = {
+    projectName: "Shipping",
+    projectMainSession: main,
+    onSessionStarted: refreshProject,
+  };
+  const createCalls = () =>
+    authenticatedFetchMock.mock.calls.filter(
+      ([url, init]) => url === "/v1/sessions" && init?.method === "POST",
+    );
+
+  beforeEach(() => {
+    setupLandingMocks();
+    refreshProject.mockReset();
+    vi.mocked(setPendingInitialPrompt).mockClear();
+    mockAgents([
+      ...DEFAULT_LANDING_AGENTS,
+      testAgent("maestro-id", "maestro", {
+        display_name: "Maestro",
+        harness: "claude-sdk",
+        builtin: true,
+        description: "Coordinates the project.",
+      }),
+    ]);
+    useProjectsMock.mockReturnValue({
+      ...SUCCESS_QUERY_STATE,
+      data: [{ id: main.projectId, name: "Shipping" }],
+    });
+    useProjectConfigMock.mockReturnValue({
+      ...SUCCESS_QUERY_STATE,
+      data: {
+        host_id: "host_1",
+        workspace: "/work/project",
+        agent_id: "maestro-id",
+        harness: "codex",
+      },
+    });
+    mockModelQueries((harness) =>
+      harness === "codex"
+        ? sdkModels
+        : harness === "codex-native"
+          ? CODEX_MODEL_OPTIONS_RESULT
+          : CLAUDE_MODEL_OPTIONS_RESULT,
+    );
+    authenticatedFetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ id: "new-main" }), { status: 200 }),
+    );
+  });
+  afterEach(cleanup);
+
+  function renderMain(info: Partial<ServerInfo> = {}) {
+    return renderLanding(
+      info,
+      "/projects/Shipping?view=chat",
+      undefined,
+      false,
+      reactRouterRouting,
+      props,
+    );
+  }
+
+  it("prefills changeable Maestro without a write, then submits explicit SDK choices and the old pointer", async () => {
+    localStorage.setItem("omnigent:last-agent-id", "a2");
+    renderMain();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+        /Maestro, SDK Codex/,
+      ),
+    );
+    expect(screen.getByRole("button", { name: "About Maestro" })).toBeInTheDocument();
+    expect(createCalls()).toHaveLength(0);
+    openAgentModels("maestro-id");
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Model A" }));
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-high"));
+    closeMenu();
+    const { body } = await submitAndReadBody();
+    expect(body).toMatchObject({
+      project_id: main.projectId,
+      project_main_session: true,
+      expected_main_session_id: "old-main",
+      title: "Main",
+      agent_id: "maestro-id",
+      harness_override: "codex",
+      model_override: "model-a",
+      reasoning_effort: "high",
+      host_id: "host_1",
+    });
+    expect(body).not.toHaveProperty("workspace"); // Unedited project defaults are filled server-side.
+    expect(body).not.toHaveProperty("initial_input");
+    expect(new Headers(createCalls()[0][1]?.headers).get("Idempotency-Key")).toMatch(
+      /^[0-9a-f-]{36}$/,
+    );
+    await waitFor(() => expect(refreshProject).toHaveBeenCalledOnce());
+    expect(setPendingInitialPrompt).toHaveBeenCalledWith(
+      "new-main",
+      expect.objectContaining({ text: "ship it" }),
+    );
+    expect(screen.getByTestId("landing-location")).toHaveTextContent(
+      "/projects/Shipping?view=chat",
+    );
+    expect(localStorage.getItem("omnigent:last-agent-id")).toBe("a2");
+    expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_1", "codex", true);
+  });
+
+  it("uses a selected native alternative without an SDK harness override", async () => {
+    renderMain();
+    selectAgent("a2");
+    const { body } = await submitAndReadBody();
+    expect(body).toMatchObject({ agent_id: "a2", project_main_session: true });
+    expect(body).not.toHaveProperty("harness_override");
+    expect(screen.queryByRole("button", { name: "About Maestro" })).toBeNull();
+  });
+
+  it.each([false, true])(
+    "keeps managed Main's first input server-owned (attachments=%s)",
+    async (attachments) => {
+      renderMain({ managed_sandboxes_enabled: true, durable_initial_input: true });
+      fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+      fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+      const file = new File(["context"], "context.txt", { type: "text/plain" });
+      if (attachments)
+        fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+          target: { files: [file] },
+        });
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "Plan the work" },
+      });
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() => expect(createCalls()).toHaveLength(1));
+      const request = createCalls()[0][1]!;
+      const body = JSON.parse(
+        attachments
+          ? ((request.body as FormData).get("metadata") as string)
+          : (request.body as string),
+      );
+      expect(body).toMatchObject({
+        project_id: main.projectId,
+        project_main_session: true,
+        expected_main_session_id: "old-main",
+        title: "Main",
+        host_type: "managed",
+        workspace: null,
+        git: null,
+        initial_input: {
+          type: "message",
+          data: { role: "user", content: [{ type: "input_text", text: "Plan the work" }] },
+        },
+      });
+      if (attachments) {
+        expect((request.body as FormData).getAll("initial_files")).toEqual([file]);
+        expect(new Headers(request.headers).has("Content-Type")).toBe(false);
+      }
+      expect(new Headers(request.headers).get("Idempotency-Key")).toMatch(/^[0-9a-f-]{36}$/);
+      await waitFor(() => expect(refreshProject).toHaveBeenCalledOnce());
+      expect(setPendingInitialPrompt).not.toHaveBeenCalled();
+      expect(screen.getByTestId("landing-location")).toHaveTextContent(
+        "/projects/Shipping?view=chat",
+      );
+    },
+  );
+
+  it("retains the draft, attachments, client token and operation key after a network failure", async () => {
+    authenticatedFetchMock.mockRejectedValue(new TypeError("Failed to fetch"));
+    renderMain();
+    const file = new File(["notes"], "notes.txt", { type: "text/plain" });
+    fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+      target: { files: [file] },
+    });
+    await submitAndReadBody("Keep this request");
+    await screen.findByTestId("new-chat-landing-error");
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Keep this request");
+    expect(screen.getByText("notes.txt")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(createCalls()).toHaveLength(2));
+    expect(createCalls()[1][1]?.body).toEqual(createCalls()[0][1]?.body);
+    expect(new Headers(createCalls()[1][1]?.headers).get("Idempotency-Key")).toBe(
+      new Headers(createCalls()[0][1]?.headers).get("Idempotency-Key"),
+    );
+    expect(refreshProject).not.toHaveBeenCalled();
+    expect(setPendingInitialPrompt).not.toHaveBeenCalled();
+  });
+
+  it("refetches on a conflicting Main without overwriting it or losing the draft", async () => {
+    authenticatedFetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ error: { message: "Main chat has changed." } }), {
+        status: 409,
+      }),
+    );
+    renderMain();
+    await submitAndReadBody("Keep this question");
+    await waitFor(() => expect(refreshProject).toHaveBeenCalledOnce());
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Keep this question");
+    expect(screen.getByTestId("new-chat-landing-error")).toHaveTextContent(
+      "Main chat has changed.",
+    );
+    expect(createCalls()).toHaveLength(1);
+    expect(authenticatedFetchMock.mock.calls.some(([, init]) => init?.method === "PATCH")).toBe(
+      false,
+    );
+    expect(setPendingInitialPrompt).not.toHaveBeenCalled();
+  });
+
+  it("preserves the replacement draft across leaving and reopening the project", () => {
+    const chat = renderMain();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "Unsent project question" },
+    });
+    chat.unmount();
+    renderMain();
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Unsent project question");
+    expect(createCalls()).toHaveLength(0);
+  });
+
+  it.each([true, false])(
+    "hands a conflicted draft to Main, clearing it only after recovery (%s)",
+    async (recovered) => {
+      authenticatedFetchMock.mockResolvedValue(
+        new Response(JSON.stringify({ error: { message: "Main chat has changed." } }), {
+          status: 409,
+        }),
+      );
+      const onMainSessionConflict = vi.fn().mockResolvedValue(recovered);
+      const chat = renderLanding(
+        {},
+        "/projects/Shipping?view=chat",
+        undefined,
+        false,
+        reactRouterRouting,
+        { ...props, onMainSessionConflict },
+      );
+      const file = new File(["notes"], "notes.txt", { type: "text/plain" });
+      fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+        target: { files: [file] },
+      });
+      await submitAndReadBody("Keep my question");
+      await waitFor(() =>
+        expect(onMainSessionConflict).toHaveBeenCalledWith(
+          expect.objectContaining({ text: "Keep my question", files: [file] }),
+        ),
+      );
+      await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).not.toBeDisabled());
+      expect(refreshProject).not.toHaveBeenCalled();
+      expect(setPendingInitialPrompt).not.toHaveBeenCalled();
+      chat.unmount();
+      renderMain();
+      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue(
+        recovered ? "" : "Keep my question",
+      );
+      expect(screen.queryByText("notes.txt") !== null).toBe(!recovered);
+    },
+  );
+
+  it("leaves an unavailable SDK catalog explicit without borrowing native models", async () => {
+    mockModelQueries((harness) =>
+      harness === "codex"
+        ? {
+            ...SUCCESS_QUERY_STATE,
+            status: "error",
+            isSuccess: false,
+            isError: true,
+            data: undefined,
+            error: new Error("Catalog unavailable"),
+          }
+        : CODEX_MODEL_OPTIONS_RESULT,
+    );
+    renderMain();
+    expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+      /Model unavailable/,
+    );
+    openAgentModels("maestro-id");
+    expect(screen.getByTestId("new-chat-landing-agent-models")).toHaveTextContent(
+      "Catalog unavailable",
+    );
+    expect(screen.queryByRole("menuitemcheckbox", { name: "GPT-5.5" })).toBeNull();
+  });
+
+  it("uploads a custom Main's selected harness in its bundle, not in forbidden metadata", async () => {
+    const bundle = new File(["bundle"], "agent.tar.gz", { type: "application/gzip" });
+    const build = vi.spyOn(agentBundle, "buildAgentBundle").mockResolvedValue(bundle);
+    onTestFinished(() => build.mockRestore());
+    authenticatedFetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ session_id: "new-main", agent_id: "uploaded-agent" }), {
+        status: 200,
+      }),
+    );
+    renderMain();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    const custom = screen.queryByTestId("new-chat-landing-custom-agents");
+    if (custom) fireEvent.click(custom);
+    fireEvent.click(screen.getByTestId("new-chat-landing-create-agent"));
+    fireEvent.change(screen.getByTestId("create-agent-name"), {
+      target: { value: "project-guide" },
+    });
+    fireEvent.change(screen.getByTestId("create-agent-model"), { target: { value: "model-a" } });
+    fireEvent.click(screen.getByTestId("create-agent-submit"));
+    await waitFor(() => expect(screen.queryByTestId("create-agent-dialog")).toBeNull());
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "Plan the work" },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(createCalls()).toHaveLength(1));
+    const init = createCalls()[0][1]!;
+    expect(init.body).toBeInstanceOf(FormData);
+    const form = init.body as FormData;
+    expect(JSON.parse(form.get("metadata") as string)).toMatchObject({
+      project_id: main.projectId,
+      project_main_session: true,
+      expected_main_session_id: "old-main",
+      title: "Main",
+    });
+    expect(JSON.parse(form.get("metadata") as string)).not.toHaveProperty("harness_override");
+    expect(form.get("bundle")).toBe(bundle);
+    expect(build).toHaveBeenCalledWith(
+      expect.objectContaining({ name: "project-guide", harness: "claude-sdk" }),
+    );
+    expect(new Headers(init.headers).get("Idempotency-Key")).toMatch(/^[0-9a-f-]{36}$/);
+    await waitFor(() => expect(refreshProject).toHaveBeenCalledOnce());
+    expect(setPendingInitialPrompt).toHaveBeenCalledWith(
+      "new-main",
+      expect.objectContaining({ text: "Plan the work" }),
+    );
+  });
+});
 
 function tooltipKeys(tooltip: HTMLElement): string[] {
   return Array.from(tooltip.querySelectorAll('[data-slot="kbd"]')).map(

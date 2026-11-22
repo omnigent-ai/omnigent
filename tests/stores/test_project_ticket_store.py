@@ -226,6 +226,81 @@ def test_project_owner_tenant_and_ticket_boundaries(board):
     assert projects.get(project.id, user_id="alice") is not None
 
 
+def test_response_summary_counts_labels_across_stages_and_projects(board):
+    tickets, projects, project = board
+    actor = TicketActor("alice")
+    assert tickets.summary(project.id, user_id="alice") == {
+        "needs_response_count": 0,
+        "is_complete": True,
+    }
+    flagged = []
+    for stage, value in (("open", "approval"), ("in_progress", ""), ("done", None)):
+        ticket = tickets.create(
+            project.id,
+            CreateTicket(title=stage, labels=[{"key": "needs-human", "value": value}]),
+            actor,
+        )
+        tickets.update(project.id, ticket["id"], UpdateTicket(stage_id=stage), actor)
+        flagged.append(ticket["id"])
+    tickets.create(
+        project.id,
+        CreateTicket(title="Unflagged", labels=[{"key": "note", "value": "needs-human"}]),
+        actor,
+    )
+    other = projects.create(uuid4().hex, "Other", "alice")
+    tickets.create(other.id, CreateTicket(title="Other", labels=[{"key": "needs-human"}]), actor)
+    with workspace_scope(9):
+        projects.create(project.id, "Other workspace", "alice")
+        tickets.create(
+            project.id, CreateTicket(title="Other", labels=[{"key": "needs-human"}]), actor
+        )
+        assert tickets.summary(project.id, user_id="alice")["needs_response_count"] == 1
+    assert tickets.summary(project.id, user_id="alice") == {
+        "needs_response_count": 3,
+        "is_complete": True,
+    }
+    tickets.update(project.id, flagged[0], UpdateTicket(labels=[]), actor)
+    assert tickets.summary(project.id, user_id="alice")["needs_response_count"] == 2
+    with pytest.raises(OmnigentError, match="Project not found"):
+        tickets.summary(project.id, user_id="bob")
+    with workspace_scope(10), pytest.raises(OmnigentError, match="Project not found"):
+        tickets.summary(project.id, user_id="alice")
+
+
+def test_response_summary_reports_a_bounded_indexed_partial_count(board, db_uri, monkeypatch):
+    tickets, _, project = board
+    for index in range(3):
+        tickets.create(
+            project.id,
+            CreateTicket(title=str(index), labels=[{"key": "needs-human"}]),
+            TicketActor("alice"),
+        )
+    monkeypatch.setattr(project_ticket_store, "TICKET_SUMMARY_SCAN_MAX", 2)
+    engine = get_or_create_engine(db_uri)
+    queries = []
+
+    def capture(_connection, _cursor, statement, parameters, _context, _many):
+        if "project_tickets" in statement:
+            queries.append((statement, parameters))
+
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        assert tickets.summary(project.id, user_id="alice") == {
+            "needs_response_count": 2,
+            "is_complete": False,
+        }
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+    assert len(queries) == 1
+    statement, parameters = queries[0]
+    assert "LIMIT" in statement
+    assert parameters[-2] == 3
+    with engine.connect() as connection:
+        plan = connection.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all()
+    assert any("SEARCH" in row[3] and "ix_project_tickets_created" in row[3] for row in plan)
+    assert not any("TEMP B-TREE" in row[3] for row in plan)
+
+
 def test_activity_sessions_are_scoped_bounded_indexed_reads(board, db_uri, monkeypatch):
     tickets, projects, project = board
     actor = TicketActor("alice")
@@ -296,7 +371,7 @@ def test_pagination_and_outbox_order(board):
         "Two",
     ]
     orchestrator = uuid4().hex
-    projects.set_orchestrator(project.id, orchestrator, user_id="alice")
+    projects.set_main_session(project.id, orchestrator, user_id="alice")
     tickets.comment(
         project.id,
         ticket_id,

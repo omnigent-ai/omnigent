@@ -5,6 +5,7 @@ import { ProjectHomePage } from "./ProjectHomePage";
 import { resetSharedWidthStoreForTesting } from "@/hooks/useResizablePanel";
 import { writePanelSizePreference } from "@/lib/panelSizePreferences";
 import { useProjectComposerStore } from "@/projectHome/ProjectHomeHeader";
+import { TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 const mocks = vi.hoisted(() => ({ isMobile: false, ticketsEnabled: false }));
 const originalInnerWidth = window.innerWidth;
@@ -29,6 +30,17 @@ vi.mock("@/shell/NewChatDialog", () => ({
 }));
 vi.mock("@/projectHome/useProjectTickets", () => ({
   useProjectTicketsEnabled: () => mocks.ticketsEnabled,
+}));
+vi.mock("@/projectHome/ProjectViewNavigation", () => ({
+  ProjectViewNavigation: () => (
+    <TabsList aria-label="Project views">
+      <TabsTrigger value="chat">Chat</TabsTrigger>
+      <TabsTrigger value="board">Board</TabsTrigger>
+    </TabsList>
+  ),
+}));
+vi.mock("@/projectHome/ProjectChat", () => ({
+  ProjectChat: () => <div data-testid="project-chat">Maestro conversation</div>,
 }));
 vi.mock("@/projectHome/ProjectTicketBoard", () => ({
   ProjectTicketBoard: () => (
@@ -123,6 +135,41 @@ beforeEach(() => {
 });
 
 describe("ProjectHomePage tickets", () => {
+  it.each(["", "?orchestrator=1"])(
+    "opens the project conversation for %s and switches to Board",
+    (search) => {
+      mocks.ticketsEnabled = true;
+      renderPage(`/projects/Payments${search}`);
+      expect(screen.getByTestId("project-chat")).toBeVisible();
+      expect(screen.getByRole("tab", { name: "Chat" })).toHaveAttribute("aria-selected", "true");
+      expect(screen.queryByRole("complementary")).toBeNull();
+      fireEvent.mouseDown(screen.getByRole("tab", { name: "Board" }), { button: 0 });
+      expect(screen.getByTestId("ticket-board")).toBeVisible();
+      expect(screen.getByTestId("location")).toHaveTextContent("?view=board");
+      fireEvent.mouseDown(screen.getByRole("tab", { name: "Chat" }), { button: 0 });
+      expect(screen.getByTestId("project-chat")).toBeVisible();
+      expect(screen.getByTestId("location")).toHaveTextContent("?view=chat");
+    },
+  );
+
+  it("opens a ticket's main-chat context without mounting a duplicate conversation", () => {
+    mocks.ticketsEnabled = true;
+    renderPage("/projects/Payments?view=chat&ticket=ticket-1");
+    expect(screen.queryByTestId("project-chat")).toBeNull();
+    expect(screen.getByRole("complementary", { name: "Ticket details" })).toBeVisible();
+  });
+
+  it.each(["", "agent=primary", "orchestrator=1"])(
+    "does not mount a second lead conversation behind a ticket's %s chat",
+    (target) => {
+      mocks.ticketsEnabled = true;
+      renderPage(`/projects/Payments?view=chat&ticket=ticket-1&${target}`);
+      expect(screen.queryByTestId("project-chat")).toBeNull();
+      expect(screen.getByRole("complementary", { name: "Ticket details" })).toHaveStyle({
+        width: "100%",
+      });
+    },
+  );
   it.each(["ticket-1", "new"])(
     "expands %s in place and restores the resized panel, board, and draft",
     (ticketId) => {
@@ -209,7 +256,6 @@ describe("ProjectHomePage tickets", () => {
 
   it.each([
     ["ticket=ticket-1", "Ticket details", "Close ticket ticket-1"],
-    ["orchestrator=1", "Orchestrator chat", "Close orchestrator"],
     ["session=session-1", "Session quick view", "Close session-1"],
   ])(
     "opens %s beside the board and preserves the normal New session composer",
@@ -224,7 +270,9 @@ describe("ProjectHomePage tickets", () => {
       expect(screen.getByTestId("location")).toHaveTextContent(`/projects/Payments?${search}`);
       fireEvent.click(screen.getByRole("button", { name: close }));
       expect(screen.queryByRole("complementary")).toBeNull();
-      expect(screen.getByTestId("location")).toHaveTextContent(/^\/projects\/Payments$/);
+      expect(screen.getByTestId("location")).toHaveTextContent(
+        /^\/projects\/Payments\?view=board$/,
+      );
     },
   );
 });

@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useState, type KeyboardEvent } from "react";
+import { useCallback, useEffect, useState, type KeyboardEvent, type ReactNode } from "react";
 import { PageScroll } from "@/components/PageScroll";
+import { Tabs, TabsContent } from "@/components/ui/tabs";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useResizablePanel } from "@/hooks/useResizablePanel";
 import { isKeyOwningOverlayOpen } from "@/lib/hotkeys";
-import { useParams, useReplaceSearchParams, useSearchParams } from "@/lib/routing";
+import { useNavigate, useParams, useReplaceSearchParams, useSearchParams } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import {
   useProjectBoardSearchStore,
@@ -12,11 +13,18 @@ import {
 import {
   PROJECT_PANEL_SESSION_PARAM,
   projectSessionPanelSearch,
+  projectView,
+  projectViewSearch,
+  ticketPanelSearch,
+  ticketSelectionIds,
+  type ProjectView,
 } from "@/projectHome/projectHomeNavigation";
 import { ProjectKanbanBoard } from "@/projectHome/ProjectKanbanBoard";
 import { ProjectSessionPanel } from "@/projectHome/ProjectSessionPanel";
 import { ProjectTicketBoard } from "@/projectHome/ProjectTicketBoard";
-import { ProjectTicketPanel, ProjectOrchestratorPanel } from "@/projectHome/ProjectTicketPanel";
+import { ProjectTicketPanel } from "@/projectHome/ProjectTicketPanel";
+import { ProjectChat } from "@/projectHome/ProjectChat";
+import { ProjectViewNavigation } from "@/projectHome/ProjectViewNavigation";
 import { useProjectTicketsEnabled } from "@/projectHome/useProjectTickets";
 import { NewChatLandingScreen } from "@/shell/NewChatDialog";
 
@@ -24,8 +32,7 @@ const SESSION_PANEL_DEFAULT_WIDTH_VW = 40;
 const SESSION_PANEL_MIN_WIDTH_PX = 360;
 
 /**
- * A project's home: its sessions board, with the header's composer floating over
- * it and a card's quick view open in a side panel.
+ * Ticket projects share one conversation and board; legacy projects keep their sessions board.
  */
 export function ProjectHomePage() {
   const { projectName = "" } = useParams<{ projectName: string }>();
@@ -41,13 +48,15 @@ export function ProjectHomePage() {
 
   // Phones have no room beside the board; their cards open the full session.
   const [searchParams] = useSearchParams();
-  const panelSessionId = isMobile ? null : searchParams.get(PROJECT_PANEL_SESSION_PARAM);
+  const view = projectView(searchParams);
+  const panelSessionId =
+    isMobile && !tickets ? null : searchParams.get(PROJECT_PANEL_SESSION_PARAM);
   const panelTicketId = tickets ? searchParams.get("ticket") : null;
-  const orchestratorOpen = tickets && searchParams.has("orchestrator");
-  const hasPanel = panelSessionId !== null || panelTicketId !== null || orchestratorOpen;
+  const hasPanel = panelSessionId !== null || panelTicketId !== null;
   const [ticketExpanded, setTicketExpanded] = useState(false);
+  const ticketChatOpen = tickets && view === "chat" && hasPanel;
   const ticketFillsPage = panelTicketId !== null && ticketExpanded && !isMobile;
-  const hideBoard = (isMobile && hasPanel) || ticketFillsPage;
+  const hideBoard = (isMobile && hasPanel) || ticketFillsPage || ticketChatOpen;
   useEffect(() => setTicketExpanded(false), [projectName, panelTicketId]);
   const replaceSearchParams = useReplaceSearchParams();
   const closePanel = useCallback(() => {
@@ -56,8 +65,10 @@ export function ProjectHomePage() {
     next.delete(PROJECT_PANEL_SESSION_PARAM);
     next.delete("ticket");
     next.delete("orchestrator");
+    next.delete("agent");
+    if (tickets) next.set("view", view);
     replaceSearchParams(next);
-  }, [searchParams, replaceSearchParams]);
+  }, [searchParams, replaceSearchParams, tickets, view]);
   const { panelWidth, handleProps } = useResizablePanel(
     hasPanel,
     SESSION_PANEL_DEFAULT_WIDTH_VW,
@@ -101,73 +112,73 @@ export function ProjectHomePage() {
         extraTop={isMobile ? "0.75rem" : "4rem"}
         extraBottom="0px"
       >
-        {tickets ? (
-          <div hidden={hideBoard} className={hideBoard ? "hidden" : "flex min-h-0 min-w-0 flex-1"}>
-            <ProjectTicketBoard
+        <ProjectViews enabled={tickets} projectName={projectName} view={view}>
+          {tickets ? (
+            <div
+              hidden={hideBoard}
+              className={hideBoard ? "hidden" : "flex min-h-0 min-w-0 flex-1"}
+            >
+              {view === "chat" ? (
+                !ticketChatOpen && <ProjectChat key={projectName} projectName={projectName} />
+              ) : (
+                <ProjectTicketBoard
+                  projectName={projectName}
+                  selectedTicketId={panelTicketId}
+                  ticketIds={ticketSelectionIds(searchParams)}
+                  overlayClearance={composerOpen ? "10rem" : undefined}
+                />
+              )}
+            </div>
+          ) : (
+            <ProjectKanbanBoard
               projectName={projectName}
-              selectedTicketId={panelTicketId}
+              searchQuery={searchQuery}
+              quickViewHref={isMobile ? undefined : projectSessionPanelSearch}
+              selectedSessionId={panelSessionId}
+              onCloseQuickView={closePanel}
               overlayClearance={composerOpen ? "10rem" : undefined}
             />
-          </div>
-        ) : (
-          <ProjectKanbanBoard
-            projectName={projectName}
-            searchQuery={searchQuery}
-            quickViewHref={isMobile ? undefined : projectSessionPanelSearch}
-            selectedSessionId={panelSessionId}
-            onCloseQuickView={closePanel}
-            overlayClearance={composerOpen ? "10rem" : undefined}
-          />
-        )}
-        {hasPanel && (
-          <aside
-            aria-label={
-              panelTicketId
-                ? "Ticket details"
-                : orchestratorOpen
-                  ? "Orchestrator chat"
-                  : "Session quick view"
-            }
-            // It closes on Escape, so page-wide Escape shortcuts leave keys inside it alone.
-            data-escape-owner=""
-            className={cn(
-              "relative flex min-h-0 min-w-0 shrink-0 flex-col pt-1 pr-4 pb-4",
-              ticketFillsPage && "pl-4",
-            )}
-            style={{ width: isMobile || ticketFillsPage ? "100%" : panelWidth }}
-          >
-            {!isMobile && !ticketFillsPage && (
-              <div
-                {...handleProps}
-                aria-label="Resize session panel"
-                className="group/resize absolute inset-y-0 -left-2 z-10 flex w-2 cursor-col-resize items-center justify-center outline-none"
-              >
-                <span className="h-9 w-0.5 rounded-full bg-muted-foreground/30 opacity-0 group-hover/resize:opacity-100 group-focus-visible/resize:opacity-100" />
-              </div>
-            )}
-            {panelTicketId !== null ? (
-              <ProjectTicketPanel
-                key={`${projectName}:${panelTicketId}`}
-                projectName={projectName}
-                ticketId={panelTicketId}
-                onClose={closePanel}
-                onCreated={(id) => replaceSearchParams(new URLSearchParams({ ticket: id }))}
-                expanded={ticketFillsPage}
-                onExpandedChange={isMobile ? undefined : setTicketExpanded}
-              />
-            ) : orchestratorOpen ? (
-              <ProjectOrchestratorPanel
-                key={projectName}
-                projectName={projectName}
-                onClose={closePanel}
-              />
-            ) : (
-              panelSessionId !== null && (
-                <ProjectSessionPanel sessionId={panelSessionId} onClose={closePanel} />
-              )
-            )}
-          </aside>
-        )}
+          )}
+          {hasPanel && (
+            <aside
+              aria-label={panelTicketId ? "Ticket details" : "Session quick view"}
+              // It closes on Escape, so page-wide Escape shortcuts leave keys inside it alone.
+              data-escape-owner=""
+              className={cn(
+                "relative flex min-h-0 min-w-0 shrink-0 flex-col pt-1 pr-4 pb-4",
+                ticketFillsPage && "pl-4",
+              )}
+              style={{ width: isMobile || ticketFillsPage || ticketChatOpen ? "100%" : panelWidth }}
+            >
+              {!isMobile && !ticketFillsPage && !ticketChatOpen && (
+                <div
+                  {...handleProps}
+                  aria-label="Resize session panel"
+                  className="group/resize absolute inset-y-0 -left-2 z-10 flex w-2 cursor-col-resize items-center justify-center outline-none"
+                >
+                  <span className="h-9 w-0.5 rounded-full bg-muted-foreground/30 opacity-0 group-hover/resize:opacity-100 group-focus-visible/resize:opacity-100" />
+                </div>
+              )}
+              {panelTicketId !== null ? (
+                <ProjectTicketPanel
+                  key={`${projectName}:${panelTicketId}`}
+                  projectName={projectName}
+                  ticketId={panelTicketId}
+                  onClose={closePanel}
+                  onCreated={(id) =>
+                    replaceSearchParams(new URLSearchParams(ticketPanelSearch(id, searchParams)))
+                  }
+                  expanded={ticketFillsPage}
+                  onExpandedChange={isMobile ? undefined : setTicketExpanded}
+                />
+              ) : (
+                panelSessionId !== null && (
+                  <ProjectSessionPanel sessionId={panelSessionId} onClose={closePanel} />
+                )
+              )}
+            </aside>
+          )}
+        </ProjectViews>
       </PageScroll>
       {composerOpen && (
         <div
@@ -189,5 +200,33 @@ export function ProjectHomePage() {
         </div>
       )}
     </div>
+  );
+}
+
+function ProjectViews({
+  enabled,
+  projectName,
+  view,
+  children,
+}: {
+  enabled: boolean;
+  projectName: string;
+  view: ProjectView;
+  children: ReactNode;
+}) {
+  const navigate = useNavigate();
+  const [search] = useSearchParams();
+  if (!enabled) return children;
+  return (
+    <Tabs
+      value={view}
+      onValueChange={(value) => navigate(projectViewSearch(value as ProjectView, search))}
+      className="min-h-0 min-w-0 flex-1 gap-0"
+    >
+      <ProjectViewNavigation projectName={projectName} view={view} />
+      <TabsContent value={view} className="flex min-h-0 min-w-0 pt-3">
+        {children}
+      </TabsContent>
+    </Tabs>
   );
 }

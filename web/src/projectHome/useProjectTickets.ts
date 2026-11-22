@@ -1,4 +1,10 @@
-import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQueries,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import { useMemo } from "react";
 import { useProjects } from "@/hooks/useConversations";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -6,6 +12,7 @@ import { createProject } from "@/lib/projectsApi";
 import {
   commentOnTicket,
   getTicket,
+  getTicketSummary,
   getTicketStages,
   listTicketEvents,
   listTickets,
@@ -77,7 +84,7 @@ export function useTicketProject(projectName: string) {
   return { projectId, projects, ensure };
 }
 
-export function useTickets(projectId: string | null, stageId?: string) {
+export function useTickets(projectId: string | null, stageId?: string, enabled = true) {
   const supported = useTicketStagesEnabled();
   return useInfiniteQuery({
     queryKey: ["project-tickets", projectId, "board", stageId, supported],
@@ -89,8 +96,32 @@ export function useTickets(projectId: string | null, stageId?: string) {
       }),
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (page) => (page.has_more ? (page.last_id ?? undefined) : undefined),
-    enabled: projectId !== null,
+    enabled: projectId !== null && enabled,
     refetchInterval: 5000,
+  });
+}
+
+export function useTicketSummary(projectId: string | null) {
+  const info = useServerInfo();
+  const supported = info !== "loading" && info.project_ticket_summary === true;
+  const query = useQuery({
+    queryKey: ["project-tickets", projectId, "summary"],
+    queryFn: () => getTicketSummary(projectId!),
+    enabled: projectId !== null && supported,
+    refetchInterval: 5000,
+  });
+  return { ...query, data: supported ? query.data : undefined };
+}
+
+/** Callers page the explicit selection before requesting it; no board-wide scan. */
+export function useTicketSelection(projectId: string | null, ticketIds: readonly string[]) {
+  return useQueries({
+    queries: ticketIds.map((ticketId) => ({
+      queryKey: ["project-tickets", projectId, ticketId],
+      queryFn: () => getTicket(projectId!, ticketId),
+      enabled: projectId !== null,
+      refetchInterval: 5000,
+    })),
   });
 }
 

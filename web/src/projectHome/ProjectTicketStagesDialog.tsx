@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ComponentProps } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   DndContext,
@@ -51,9 +51,11 @@ const NO_MOVE_DESTINATION = "__none__";
 export function ProjectTicketStagesDialog({
   projectName,
   onClose,
+  onCloseAutoFocus,
 }: {
   projectName: string;
   onClose: () => void;
+  onCloseAutoFocus?: ComponentProps<typeof DialogContent>["onCloseAutoFocus"];
 }) {
   const { projectId, projects, ensure } = useTicketProject(projectName);
   const query = useTicketStages(projectId, true);
@@ -87,6 +89,7 @@ export function ProjectTicketStagesDialog({
       <DialogContent
         className="max-h-[85dvh] overflow-y-auto sm:max-w-2xl"
         aria-describedby={undefined}
+        onCloseAutoFocus={onCloseAutoFocus}
       >
         <DialogHeader>
           <DialogTitle>Edit stages</DialogTitle>

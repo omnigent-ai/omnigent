@@ -1,4 +1,5 @@
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -6,6 +7,9 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { Tabs } from "@/components/ui/tabs";
+import { ProjectViewNavigation } from "./ProjectViewNavigation";
+import * as ticketsApi from "@/lib/projectTicketsApi";
 import type * as ConversationsModule from "@/hooks/useConversations";
 import {
   ProjectBoardSearch,
@@ -46,12 +50,18 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => {
       ],
       isLoading: mocks.projectsLoading,
       error: mocks.projectsError,
+      isError: mocks.projectsError !== null,
     }),
     useProjectConfig: () => ({ data: { icon: "💸" } }),
   };
 });
 
 vi.mock("@/components/ProjectIconPicker", () => ({ ProjectLandingIcon: () => null }));
+
+vi.mock("@/lib/projectTicketsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof ticketsApi>()),
+  getTicketSummary: vi.fn(),
+}));
 
 vi.mock("./ProjectTicketSources", () => ({
   ProjectTicketSources: ({
@@ -73,12 +83,14 @@ vi.mock("./ProjectTicketStagesDialog", () => ({
   ProjectTicketStagesDialog: ({
     projectName,
     onClose,
+    onCloseAutoFocus,
   }: {
     projectName: string;
     onClose: () => void;
+    onCloseAutoFocus?: (event: Event) => void;
   }) => (
     <Dialog open>
-      <DialogContent>
+      <DialogContent onCloseAutoFocus={onCloseAutoFocus}>
         <DialogTitle>Edit {projectName} stages</DialogTitle>
         <DialogDescription>Configure ticket stages.</DialogDescription>
         <button type="button" onClick={onClose}>
@@ -104,9 +116,42 @@ function LocationProbe() {
 function renderButton() {
   return render(
     <MemoryRouter>
-      <ProjectNewSessionButton projectName="Payments" />
+      <TooltipProvider>
+        <ProjectNewSessionButton projectName="Payments" />
+      </TooltipProvider>
     </MemoryRouter>,
   );
+}
+
+const clients: QueryClient[] = [];
+
+function renderNavigation(view: "chat" | "board" = "board", stages = true, summary = false) {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  clients.push(client);
+  const rendered = render(
+    <QueryClientProvider client={client}>
+      <CapabilitiesProvider
+        info={{
+          ...FALLBACK_SERVER_INFO,
+          project_tickets: true,
+          project_ticket_stages: stages,
+          project_ticket_summary: summary,
+        }}
+      >
+        <MemoryRouter initialEntries={[`/projects/Billing%20%26%20Payments?view=${view}`]}>
+          <TooltipProvider>
+            <ProjectHomeTitle projectName="Billing & Payments" />
+            <ProjectHomeHeaderActions projectName="Billing & Payments" />
+            <Tabs value={view}>
+              <ProjectViewNavigation projectName="Billing & Payments" view={view} />
+            </Tabs>
+          </TooltipProvider>
+          <LocationProbe />
+        </MemoryRouter>
+      </CapabilitiesProvider>
+    </QueryClientProvider>,
+  );
+  return { ...rendered, client };
 }
 
 beforeEach(() => {
@@ -116,9 +161,77 @@ beforeEach(() => {
   useProjectComposerStore.setState({ open: false });
   useProjectBoardSearchStore.setState({ query: "" });
   vi.clearAllMocks();
+  vi.mocked(ticketsApi.getTicketSummary).mockResolvedValue({
+    needs_response_count: 3,
+    is_complete: true,
+  });
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  clients.splice(0).forEach((client) => client.clear());
+});
+
+describe("Board response count", () => {
+  it.each(["chat", "board"] as const)("shows a project-wide badge in %s", async (view) => {
+    const { client } = renderNavigation(view, true, true);
+    const badge = await screen.findByLabelText("3 tickets need a response");
+    expect(badge).toHaveTextContent(/^3$/);
+    expect(badge).toHaveClass("rounded-full", "bg-primary-cta");
+    expect(ticketsApi.getTicketSummary).toHaveBeenCalledWith("project-2");
+    expect(screen.getByRole("tab", { name: /Board/ })).toContainElement(badge);
+    expect(screen.getByRole("tab", { name: "Chat" })).not.toContainElement(badge);
+    act(() =>
+      client.setQueryData(["project-tickets", "project-2", "summary"], {
+        needs_response_count: 1,
+        is_complete: true,
+      }),
+    );
+    expect(await screen.findByLabelText("1 ticket needs a response")).toHaveTextContent(/^1$/);
+    act(() =>
+      client.setQueryData(["project-tickets", "project-2", "summary"], {
+        needs_response_count: 0,
+        is_complete: true,
+      }),
+    );
+    await waitFor(() => expect(screen.queryByLabelText(/needs? a response/)).toBeNull());
+    expect(screen.getByRole("tab", { name: "Board" })).toHaveTextContent(/^Board$/);
+  });
+
+  it.each([0, 2])("marks an incomplete count of %s explicitly", async (count) => {
+    vi.mocked(ticketsApi.getTicketSummary).mockResolvedValue({
+      needs_response_count: count,
+      is_complete: false,
+    });
+    renderNavigation("chat", true, true);
+    expect(
+      await screen.findByLabelText(
+        count ? "At least 2 tickets need a response" : "Response count is incomplete",
+      ),
+    ).toHaveTextContent(count ? "2+" : "+");
+  });
+
+  it("does not request or display a count on older servers", async () => {
+    const { client } = renderNavigation();
+    act(() =>
+      client.setQueryData(["project-tickets", "project-2", "summary"], {
+        needs_response_count: 3,
+        is_complete: true,
+      }),
+    );
+    await act(async () => {});
+    expect(ticketsApi.getTicketSummary).not.toHaveBeenCalled();
+    expect(screen.getByRole("tab", { name: "Board" })).toHaveTextContent(/^Board$/);
+  });
+
+  it("drops a stale count when the summary request fails", async () => {
+    const { client } = renderNavigation("board", true, true);
+    expect(await screen.findByLabelText("3 tickets need a response")).toBeVisible();
+    vi.mocked(ticketsApi.getTicketSummary).mockRejectedValue(new Error("Project unavailable"));
+    await act(() => client.invalidateQueries({ queryKey: ["project-tickets", "project-2"] }));
+    await waitFor(() => expect(screen.queryByLabelText(/tickets need a response/)).toBeNull());
+  });
+});
 
 describe("ProjectHomeTitle", () => {
   function renderTitle(stagesEnabled = false) {
@@ -171,13 +284,22 @@ describe("ProjectHomeTitle", () => {
 
   it("opens the project stage editor from the menu and hands it focus", async () => {
     const user = userEvent.setup();
-    renderTitle(true);
-    await user.click(screen.getByRole("button", { name: "Project actions for Payments" }));
+    renderNavigation();
+    const trigger = screen.getByRole("button", { name: "Board actions" });
+    expect(
+      within(screen.getByRole("tablist")).queryByRole("button", { name: "Board actions" }),
+    ).toBeNull();
+    expect(trigger.querySelector(".lucide-ellipsis-vertical")).not.toBeNull();
+    await user.click(trigger);
+    expect(screen.getAllByRole("menuitem")).toHaveLength(1);
     await user.click(screen.getByRole("menuitem", { name: "Edit stages" }));
-    expect(screen.getByRole("dialog", { name: "Edit Payments stages" })).toBeInTheDocument();
+    expect(
+      screen.getByRole("dialog", { name: "Edit Billing & Payments stages" }),
+    ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Close editor" })).toHaveFocus();
     await user.click(screen.getByRole("button", { name: "Close editor" }));
     expect(screen.queryByRole("dialog")).toBeNull();
+    expect(trigger).toHaveFocus();
   });
 
   it("hides the title and moves the project actions beside New session on phones", () => {
@@ -223,21 +345,11 @@ describe("ProjectBoardSearch", () => {
 
 describe("ProjectNewSessionButton", () => {
   it("keeps ticket actions simple and sends New session to the full project composer", () => {
-    render(
-      <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, project_tickets: true }}>
-        <MemoryRouter initialEntries={["/projects/Billing%20%26%20Payments?ticket=ticket-1"]}>
-          <ProjectHomeHeaderActions projectName="Billing & Payments" />
-          <LocationProbe />
-        </MemoryRouter>
-      </CapabilitiesProvider>,
-    );
-    expect(screen.getByRole("link", { name: "Orchestrator" })).toHaveAttribute(
-      "href",
-      "/projects/Billing%20%26%20Payments?orchestrator=1",
-    );
+    renderNavigation();
+    expect(screen.queryByRole("link", { name: "Orchestrator" })).toBeNull();
     expect(screen.getByRole("link", { name: "New ticket" })).toHaveAttribute(
       "href",
-      "/projects/Billing%20%26%20Payments?ticket=new",
+      "/projects/Billing%20%26%20Payments?view=board&ticket=new",
     );
     expect(screen.queryByRole("searchbox")).toBeNull();
     expect(screen.queryByRole("combobox")).toBeNull();
@@ -245,7 +357,12 @@ describe("ProjectNewSessionButton", () => {
     const source = screen.getByRole("button", { name: "Connect source" });
     expect(source).toHaveAttribute("data-project-id", "project-2");
     expect(source).toHaveAttribute("data-project-name", "Billing & Payments");
-    expect(source.closest("section")?.nextElementSibling).toBe(button);
+    expect(button.previousElementSibling).toBe(
+      screen.getByRole("button", { name: "Project settings" }),
+    );
+    expect(
+      screen.queryByRole("button", { name: "Project actions for Billing & Payments" }),
+    ).toBeNull();
     expect(button).not.toHaveAttribute("aria-expanded");
     fireEvent.click(button);
     expect(screen.getByTestId("location")).toHaveTextContent(
@@ -257,15 +374,20 @@ describe("ProjectNewSessionButton", () => {
   it.each(["loading", "failed"])("hides sources while project lookup is %s", (state) => {
     mocks.projectsLoading = state === "loading";
     mocks.projectsError = state === "failed" ? new Error("Projects unavailable") : null;
-    render(
-      <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, project_tickets: true }}>
-        <MemoryRouter>
-          <ProjectHomeHeaderActions projectName="Payments" />
-        </MemoryRouter>
-      </CapabilitiesProvider>,
-    );
+    renderNavigation();
     expect(screen.queryByRole("button", { name: "Connect source" })).toBeNull();
     expect(screen.getByRole("button", { name: "New session" })).toBeInTheDocument();
+  });
+
+  it("shows no ticket actions in Chat and gates stage editing on the server capability", () => {
+    const chat = renderNavigation("chat");
+    expect(screen.queryByRole("button", { name: "Board actions" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Connect source" })).toBeNull();
+    expect(screen.queryByRole("link", { name: "New ticket" })).toBeNull();
+    chat.unmount();
+    renderNavigation("board", false);
+    expect(screen.queryByRole("button", { name: "Board actions" })).toBeNull();
+    expect(screen.getByRole("link", { name: "New ticket" })).toBeInTheDocument();
   });
 
   it("shows and hides the floating composer", () => {
@@ -285,7 +407,9 @@ describe("ProjectNewSessionButton", () => {
     mocks.isMobile = true;
     render(
       <MemoryRouter initialEntries={["/projects/Payments"]}>
-        <ProjectNewSessionButton projectName="Payments" />
+        <TooltipProvider>
+          <ProjectNewSessionButton projectName="Payments" />
+        </TooltipProvider>
         <LocationProbe />
       </MemoryRouter>,
     );

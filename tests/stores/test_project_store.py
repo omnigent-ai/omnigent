@@ -65,6 +65,52 @@ def test_get_scoped_to_owner(store: SqlAlchemyProjectStore) -> None:
     assert store.get(_uid("p1"), user_id="bob@example.com") is None
 
 
+def test_main_session_assignment_is_owner_scoped_and_compares_effective_legacy_pointer(store):
+    from sqlalchemy import update
+
+    from omnigent.db.db_models import SqlProject
+
+    project = store.create(_uid("main-project"), "Main", "alice@example.com")
+    old_id, first_id, next_id = [_uid(value) for value in ("old", "first", "next")]
+    with store._session("seed_legacy_main") as session:
+        session.execute(
+            update(SqlProject)
+            .where(SqlProject.id == project.id)
+            .values(legacy_orchestrator_session_id=old_id)
+        )
+    assert store.get(project.id, user_id=project.user_id).main_session_id == old_id
+    with pytest.raises(OmnigentError) as stale:
+        store.set_main_session(project.id, first_id, user_id=project.user_id)
+    assert stale.value.code == ErrorCode.CONFLICT
+    assert (
+        store.update(
+            project.id,
+            user_id="bob@example.com",
+            main_session_id=first_id,
+            expected_main_session_id=old_id,
+        )
+        is None
+    )
+    result = store.set_main_session(
+        project.id, first_id, user_id=project.user_id, expected_main_session_id=old_id
+    )
+    assert result.main_session_id == first_id
+    with pytest.raises(OmnigentError) as changed:
+        store.update(
+            project.id,
+            user_id=project.user_id,
+            name="Must roll back",
+            main_session_id=next_id,
+            expected_main_session_id=old_id,
+        )
+    assert changed.value.code == ErrorCode.CONFLICT
+    assert store.get(project.id, user_id=project.user_id).name == "Main"
+    assert store.delete(project.id, user_id=project.user_id, require_no_main=True) is False
+    with store._session("read_legacy_main") as session:
+        row = session.get(SqlProject, (0, project.id))
+        assert row.main_session_id == first_id and row.legacy_orchestrator_session_id == old_id
+
+
 # ── list ──────────────────────────────────────────────────────────────────
 
 

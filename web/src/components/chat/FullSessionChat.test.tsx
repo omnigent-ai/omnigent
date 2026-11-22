@@ -1,13 +1,52 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { ReactNode } from "react";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { SandboxStatus } from "@/lib/types";
 import type * as ChatStoreModule from "@/store/chatStore";
-import { useChatStore } from "@/store/chatStore";
+import {
+  useChatStore,
+  consumePendingInitialPrompt,
+  setPendingInitialPrompt,
+} from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { FullSessionChat } from "./FullSessionChat";
+import type { ChatPresentation } from "./assistantPresentation";
+import { MaestroIcon } from "@/components/icons/MaestroIcon";
+import { clearSessionDrafts, getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
+
+const access = vi.hoisted(() => ({ canEdit: true, offline: false }));
+vi.mock("@/components/HostBadge", () => ({ HostBadge: () => null }));
+vi.mock("@/components/composer/ScopedSessionComposerControls", () => ({
+  SessionPermissionPicker: () => null,
+  ScopedSessionHarnessPicker: ({
+    sessionId,
+    agentIcon,
+  }: {
+    sessionId: string;
+    agentIcon?: ReactNode;
+  }) => (
+    <span aria-label="Session controls">
+      {agentIcon}
+      {sessionId}
+    </span>
+  ),
+}));
+vi.mock("@/hooks/useComposerGitStatus", () => ({
+  useComposerGitStatus: () => ({
+    branchState: "unknown",
+    branch: null,
+    isWorktree: null,
+    worktreePath: null,
+    creationBranch: null,
+  }),
+}));
+vi.mock("@/hooks/useSessionLiveness", () => ({
+  livenessRowFromSession: () => null,
+  useSessionLiveness: () => ({ kind: access.offline ? "host_offline" : "online" }),
+}));
 
 // The tests seed the session's live state in its registry entry instead of streaming it.
 vi.mock("@/store/chatStore", async (importOriginal) => ({
@@ -16,12 +55,12 @@ vi.mock("@/store/chatStore", async (importOriginal) => ({
 }));
 vi.mock("@/hooks/useSession", () => ({
   useSession: (id: string | null) => ({
-    session: id ? { id, labels: {} } : null,
+    session: id ? { id, agentId: "agent", labels: {} } : null,
     isLoading: false,
     error: null,
   }),
 }));
-vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: () => true }));
+vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: () => access.canEdit }));
 
 const SESSION = "c".repeat(32);
 const FIRST_MESSAGE = "Help me design the reusable workflow.";
@@ -45,23 +84,106 @@ function seedSession({
   });
 }
 
-function renderChat() {
+function renderChat(sessionComposer = false, presentation?: ChatPresentation) {
   const queryClient = new QueryClient();
   return render(
     <QueryClientProvider client={queryClient}>
       <MemoryRouter>
-        <FullSessionChat sessionId={SESSION} />
+        <FullSessionChat
+          sessionId={SESSION}
+          sessionComposer={sessionComposer}
+          presentation={presentation}
+        />
       </MemoryRouter>
     </QueryClientProvider>,
   );
 }
 
-beforeEach(() => conversationRegistry.clear());
+beforeEach(() => {
+  conversationRegistry.clear();
+  clearSessionDrafts();
+  consumePendingInitialPrompt(SESSION);
+  access.canEdit = true;
+  access.offline = false;
+});
 
 afterEach(() => {
   cleanup();
   conversationRegistry.clear();
   useChatStore.setState(initialStoreState);
+  clearSessionDrafts();
+});
+
+describe("FullSessionChat shared composer", () => {
+  it.each([false, true])(
+    "delivers Main's stashed first input once to its own session (skill: %s)",
+    (skill) => {
+      seedSession({ sandboxStatus: null, firstMessage: false });
+      const send = vi.fn().mockResolvedValue(undefined);
+      const sendSlashCommand = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ send, sendSlashCommand });
+      const files = [new File(["notes"], "notes.txt")];
+      setPendingInitialPrompt(SESSION, {
+        text: FIRST_MESSAGE,
+        files: skill ? [] : files,
+        skill: skill ? { name: "plan", args: "the next release" } : null,
+      });
+      const chat = renderChat(true);
+      if (skill) {
+        expect(sendSlashCommand).toHaveBeenCalledExactlyOnceWith(
+          "plan",
+          "the next release",
+          "agent",
+          { pinnedConversationId: SESSION },
+        );
+        expect(send).not.toHaveBeenCalled();
+      } else {
+        expect(send).toHaveBeenCalledExactlyOnceWith(FIRST_MESSAGE, "agent", files, {
+          pinnedConversationId: SESSION,
+        });
+        expect(sendSlashCommand).not.toHaveBeenCalled();
+      }
+      chat.unmount();
+      renderChat(true);
+      expect(send.mock.calls.length + sendSlashCommand.mock.calls.length).toBe(1);
+    },
+  );
+
+  it("reuses the full session draft across embedded chat mounts and targets its own controls", () => {
+    seedSession({ sandboxStatus: null, firstMessage: false });
+    conversationRegistry.acquire(SESSION).setState({ boundAgentId: "agent" });
+    setSessionDraft(SESSION, { text: "From the full session", files: [] });
+    const chat = renderChat(true, { assistant: { name: "Maestro", icon: <MaestroIcon /> } });
+    expect(screen.getByLabelText("Message the agent")).toHaveValue("From the full session");
+    expect(screen.getByLabelText("Session controls")).toHaveTextContent(SESSION);
+    expect(
+      screen.getByLabelText("Session controls").querySelector('[data-agent-icon="maestro"]'),
+    ).not.toBeNull();
+    fireEvent.change(screen.getByLabelText("Message the agent"), {
+      target: { value: "From project Chat" },
+    });
+    chat.unmount();
+    expect(getSessionDraft(SESSION)?.text).toBe("From project Chat");
+    setSessionDraft(SESSION, { text: "Changed in the full session", files: [] });
+    renderChat(true);
+    expect(screen.getByLabelText("Session controls").querySelector("[data-agent-icon]")).toBeNull();
+    expect(screen.getByLabelText("Message the agent")).toHaveValue("Changed in the full session");
+  });
+
+  it("keeps offline drafts editable but disables sending, and hides the read-only composer", () => {
+    seedSession({ sandboxStatus: null, firstMessage: false });
+    conversationRegistry.acquire(SESSION).setState({ boundAgentId: "agent" });
+    access.offline = true;
+    setSessionDraft(SESSION, { text: "Keep this offline draft", files: [] });
+    const chat = renderChat(true);
+    expect(screen.getByLabelText("Message the agent")).toBeEnabled();
+    expect(screen.getByTestId("side-chat-send")).toBeDisabled();
+    chat.unmount();
+    access.canEdit = false;
+    renderChat(true);
+    expect(screen.queryByLabelText("Message the agent")).toBeNull();
+    expect(getSessionDraft(SESSION)?.text).toBe("Keep this offline draft");
+  });
 });
 
 describe("FullSessionChat sandbox launch", () => {

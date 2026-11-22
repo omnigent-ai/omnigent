@@ -69,6 +69,7 @@ def test_schema_paths_agree_on_keys_bounds_defaults_and_indexes(ticket_engine):
         } == expected
     project = {col["name"]: col for col in inspector.get_columns("projects")}
     assert project["orchestrator_session_id"]["nullable"] is True
+    assert project["main_session_id"]["nullable"] is True
     assert project["ticket_stages"]["nullable"] is True
     assert project["ticket_stages"]["default"] is None
     # SQLite ignores VARCHAR lengths, so the migration and metadata enforce a byte cap.
@@ -97,6 +98,45 @@ def test_mysql_uses_bounded_binary_and_total_rows_fit():
         bounds = [col.type.max_bytes for col in table.columns if hasattr(col.type, "max_bytes")]
         assert all(bound < 16384 for bound in bounds)
         assert sum(bounds) < 60000
+
+
+def test_main_pointer_migration_preserves_legacy_rows_and_upgrade_retries(tmp_path):
+    from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+
+    uri = f"sqlite:///{tmp_path / 'main-pointer.db'}"
+    engine = get_or_create_engine(uri)
+    config = _build_alembic_config(uri)
+    project_id, session_id = uuid4().hex, uuid4().hex
+    try:
+        with engine.begin() as connection:
+            config.attributes["connection"] = connection
+            command.downgrade(config, "3d4e5f6a7b8c")
+            # Recreate the genuine pre-addition shape, not just its version stamp.
+            connection.execute(sa.text("ALTER TABLE projects DROP COLUMN main_session_id"))
+            connection.execute(
+                sa.text(
+                    "INSERT INTO projects "
+                    "(workspace_id, id, name, user_id, created_at, orchestrator_session_id) "
+                    "VALUES (0, :id, 'Legacy', 'owner', 1, :session)"
+                ),
+                {"id": bytes.fromhex(project_id), "session": bytes.fromhex(session_id)},
+            )
+        for _ in range(2):
+            with engine.begin() as connection:
+                config.attributes["connection"] = connection
+                command.upgrade(config, "head")
+            store = SqlAlchemyProjectStore(uri)
+            assert store.get(project_id, user_id="owner").main_session_id == session_id
+            with engine.begin() as connection:
+                row = connection.execute(sa.select(SqlProject.__table__)).mappings().one()
+                assert (
+                    row["main_session_id"] is None and row["orchestrator_session_id"] == session_id
+                )
+                config.attributes["connection"] = connection
+                command.downgrade(config, "3d4e5f6a7b8c")
+    finally:
+        engine.dispose()
+        clear_engine_cache()
 
 
 @pytest.mark.parametrize("ticket_engine", ["metadata", "migration"], indirect=True)

@@ -2,6 +2,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
+import { AssistantPresentationContext } from "./assistantPresentation";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ElicitationBlock } from "@/lib/blocks";
 import type { Bubble, RenderItem } from "@/lib/renderItems";
@@ -10,6 +11,9 @@ import { PEER_SESSION_MESSAGES_STORAGE_KEY } from "@/lib/peerSessionMessagePrefe
 import { formatLocalReviewComments } from "@/lib/localReviewComments";
 import type { Comment } from "@/hooks/useComments";
 import { childSessionsQueryKey } from "@/hooks/useChildSessions";
+import * as sidebarData from "@/hooks/useSidebarData";
+import { conversation } from "@/test/sidebarMockHelpers";
+import { sessionRowsPage } from "@/lib/sidebarData";
 import { basenamedRouting, RoutingProvider } from "@/lib/routing";
 import { useChatStore, type ChatState } from "@/store/chatStore";
 import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
@@ -94,6 +98,56 @@ afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   useChatStore.setState(initialStoreState);
+});
+
+const namedResponsePresentation = {
+  identity: { name: "Maestro" },
+  extras: new Map([["work", <div key="tickets">Ticket batch</div>]]),
+};
+
+describe("named assistant response blocks", () => {
+  it("adds one header per action-bearing block, not per output or work fold", () => {
+    const answer: Extract<Bubble, { kind: "assistant" }> = {
+      kind: "assistant",
+      responseId: "answer",
+      stableId: "answer",
+      lifecycle: "completed",
+      error: null,
+      items: [
+        { kind: "text", itemId: "first", text: "First output", final: true },
+        { kind: "text", itemId: "second", text: "Second output", final: true },
+      ],
+    };
+    const work: Extract<Bubble, { kind: "assistant" }> = {
+      ...answer,
+      responseId: "work",
+      stableId: "work",
+      continued: true,
+      items: [
+        {
+          kind: "native_tool",
+          itemId: "read",
+          toolType: "read_file",
+          label: "Read file",
+          data: {},
+        },
+      ],
+    };
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <AssistantPresentationContext.Provider value={namedResponsePresentation}>
+          <BubbleView bubble={answer} />
+          <BubbleView bubble={work} />
+          <BubbleView bubble={errorBubble()} />
+        </AssistantPresentationContext.Provider>
+      </QueryClientProvider>,
+    );
+    expect(screen.getAllByTestId("assistant-name")).toHaveLength(1);
+    expect(screen.getByTestId("assistant-name")).toHaveTextContent("Maestro");
+    expect(screen.getByText(/First output/)).toBeVisible();
+    expect(screen.getByText(/Second output/)).toBeVisible();
+    expect(screen.getByText("Ticket batch")).toBeVisible();
+  });
 });
 
 describe("Mermaid diagram width", () => {
@@ -313,6 +367,99 @@ describe("UserBubble messages from another session", () => {
   });
 
   it.each([
+    [
+      "claude-native-ui (fork sender)",
+      "claude-native",
+      "Claude Code",
+      "data-harness-icon",
+      "claude",
+    ],
+    ["maestro (fork sender)", "codex-native", "Maestro", "data-agent-icon", "maestro"],
+  ])(
+    "shows %s's icon with a name-only hover card",
+    async (agentName, harness, name, attribute, icon) => {
+      const user = userEvent.setup();
+      const client = new QueryClient();
+      client.setQueryData(["session", "s_src"], {
+        title: "Review the change",
+        parentSessionId: null,
+        agentName,
+        harness,
+      });
+      renderOriginBubble(client, "[Message from session s_src]\nVerdict: approve\nDetails follow");
+      const origin = screen.getByTestId("message-origin");
+      const trigger = within(origin).getByRole("button", { name });
+      expect(trigger.querySelector(`[${attribute}="${icon}"]`)).not.toBeNull();
+      expect(origin.textContent).toBe("From@Review the change");
+      expect(screen.getByTestId("mention-pill")).toHaveAttribute("href", "/c/s_src");
+      expect(screen.getByTestId("mention-pill")).not.toContainElement(trigger);
+
+      await user.hover(trigger);
+      const card = await screen.findByText(name);
+      expect(card).toHaveAttribute("data-slot", "hover-card-content");
+      expect(card.textContent).toBe(name);
+      expect(card).not.toHaveTextContent(harness);
+      await user.unhover(trigger);
+      fireEvent.focus(trigger);
+      await waitFor(() => expect(trigger).toHaveAttribute("aria-expanded", "true"));
+      fireEvent.keyDown(trigger, { key: "Escape" });
+      await waitFor(() => expect(trigger).toHaveAttribute("aria-expanded", "false"));
+      await user.click(trigger);
+      expect(trigger).toHaveAttribute("aria-expanded", "true");
+      expect(screen.getByTestId("collapsed-session-message")).toBeVisible();
+      fireEvent.click(screen.getByTestId("expand-session-message"));
+      expect(
+        screen.getByTestId("message-origin").querySelector(`[${attribute}="${icon}"]`),
+      ).not.toBeNull();
+      expect(screen.getByTestId("user-message-content")).toHaveTextContent("Details follow");
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("uses a loaded sender's agent metadata without another lookup", () => {
+    vi.spyOn(sidebarData, "useOptionalLoadedConversations").mockReturnValue({
+      pages: [
+        sessionRowsPage([
+          conversation("s_src", {
+            title: "Review the change",
+            agent_name: "codex-native-ui",
+            harness: "codex-native",
+          }),
+        ]),
+      ],
+      pageParams: [undefined],
+    });
+    renderOriginBubble(new QueryClient(), "[Message from session s_src]\nApproved");
+    expect(screen.getByRole("button", { name: "Codex" })).toBeVisible();
+    expect(screen.getByTestId("mention-pill")).toHaveTextContent("@Review the change");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps a legacy project sender's actual agent and title without a role lookup", () => {
+    vi.spyOn(sidebarData, "useOptionalLoadedConversations").mockReturnValue({
+      pages: [
+        sessionRowsPage([
+          conversation("s_src", {
+            title: "Project chat",
+            project_id: "project",
+            agent_name: "codex-native-ui",
+            harness: "codex-native",
+          }),
+        ]),
+      ],
+      pageParams: [undefined],
+    });
+    const client = new QueryClient();
+    renderOriginBubble(client, "[Message from session s_src]\nFirst update");
+    expect(screen.getByRole("button", { name: "Codex" })).toBeVisible();
+    expect(screen.getByTestId("mention-pill")).toHaveTextContent("@Project chat");
+    cleanup();
+    renderOriginBubble(client, "[Message from session s_src]\nSecond update");
+    expect(screen.getByRole("button", { name: "Codex" })).toBeVisible();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
     ["standalone", null, "/c/s_src"],
     ["an embed mount", "/mount", "/mount/c/s_src"],
   ])(
@@ -392,7 +539,14 @@ describe("UserBubble messages from another session", () => {
 
   it("fetches an uncached sender once and reuses it for later bubbles", async () => {
     fetchMock.mockResolvedValue(
-      jsonResponse({ id: "s_far", object: "session", title: "Release notes draft" }),
+      jsonResponse({
+        id: "s_far",
+        object: "session",
+        title: "Release notes draft",
+        agent_name: "codex-native-ui",
+        harness: "codex-native",
+        project_orchestrator: true,
+      }),
     );
     const client = new QueryClient();
     renderOriginBubble(client, "[Message from session s_far]\nfirst");
@@ -402,6 +556,10 @@ describe("UserBubble messages from another session", () => {
     cleanup();
     renderOriginBubble(client, "[Message from session s_far]\nsecond");
     expect(screen.getByTestId("mention-pill").textContent).toBe("@Release notes draft");
+    expect(screen.getByRole("button", { name: "Codex" })).toBeVisible();
+    expect(
+      screen.getByTestId("message-origin").querySelector('[data-harness-icon="codex"]'),
+    ).not.toBeNull();
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 

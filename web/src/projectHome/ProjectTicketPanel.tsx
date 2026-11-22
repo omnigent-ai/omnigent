@@ -1,11 +1,12 @@
 import { useState, type ReactNode } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   BotIcon,
   ExternalLinkIcon,
   GitPullRequestIcon,
   LinkIcon,
   Maximize2Icon,
+  MessageSquareIcon,
   Minimize2Icon,
   PencilIcon,
   PlusIcon,
@@ -34,7 +35,8 @@ import { parseHttpUrl } from "@/lib/openLinkInApp";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import { Link, useSearchParams, useReplaceSearchParams } from "@/lib/routing";
 import { cn } from "@/lib/utils";
-import { getProject, initializeProjectOrchestrator } from "@/lib/projectsApi";
+import { useProjectChatSession } from "./useProjectAgentSession";
+import { ProjectAgentChat, ProjectChat } from "./ProjectChat";
 import {
   createTicket,
   ticketOutputs,
@@ -45,7 +47,7 @@ import {
   type TicketLabel,
 } from "@/lib/projectTicketsApi";
 import { ProjectSessionPanel } from "./ProjectSessionPanel";
-import { ticketPanelSearch } from "./projectHomeNavigation";
+import { ticketPanelSearch, ticketSessionSearch } from "./projectHomeNavigation";
 import { TicketAgents } from "./TicketAgents";
 import { TicketCommentBody } from "./TicketCommentBody";
 import { TicketSessionLink } from "./TicketSessionLink";
@@ -141,54 +143,31 @@ export function ProjectOrchestratorPanel({
   onClose: () => void;
   ticket?: { id: string; title: string };
 }) {
-  const { projectId, projects, ensure } = useTicketProject(projectName);
-  const client = useQueryClient();
-  const project = useQuery({
-    queryKey: ["project-record", projectId],
-    queryFn: () => getProject(projectId!),
-    enabled: projectId !== null,
-  });
-  const initialize = useMutation({
-    mutationFn: async () => initializeProjectOrchestrator(await ensure.mutateAsync()),
-    onSuccess: (value) => {
-      client.setQueryData(["project-record", value.id], value);
-      void client.invalidateQueries({ queryKey: ["conversations"] });
-      void client.invalidateQueries({ queryKey: ["project-sessions"] });
-    },
-  });
-  if (project.data?.orchestrator_session_id)
+  const { projectId, sessionId } = useProjectChatSession(projectName);
+  const [search] = useSearchParams();
+  if (
+    sessionId &&
+    projectId &&
+    (search.get("view") === "chat" || search.get("agent") === "primary")
+  )
     return (
-      <ProjectSessionPanel
-        sessionId={project.data.orchestrator_session_id}
-        onClose={onClose}
+      <ProjectAgentChat
+        key={sessionId}
+        sessionId={sessionId}
+        projectId={projectId}
         ticket={ticket}
       />
     );
+  if (sessionId)
+    return <ProjectSessionPanel sessionId={sessionId} onClose={onClose} ticket={ticket} />;
   return (
-    <Panel title="Orchestrator" onClose={onClose}>
+    <Panel title="Chat" onClose={onClose}>
       {ticket && (
         <Button asChild variant="ghost" size="sm">
           <Link to={ticketPanelSearch(ticket.id)}>Back to ticket</Link>
         </Button>
       )}
-      {projects.isLoading || (projectId && project.isPending) ? (
-        <Spinner aria-label="Loading orchestrator" />
-      ) : (
-        <>
-          <p className="text-sm text-muted-foreground">
-            Create this project’s orchestrator session. It uses your project’s session defaults and
-            receives ticket updates automatically.
-          </p>
-          <Button
-            onClick={() => initialize.mutate()}
-            loading={initialize.isPending}
-            disabled={projects.isError || project.isError}
-          >
-            Create orchestrator
-          </Button>
-        </>
-      )}
-      <TicketError error={initialize.error ?? projects.error ?? project.error} />
+      <ProjectChat projectName={projectName} ticket={ticket} />
     </Panel>
   );
 }
@@ -231,9 +210,6 @@ export function ProjectTicketPanel({
           disabled={projects.isLoading || projects.isError}
         />
         <TicketError error={projects.error} />
-        <p className="text-sm text-muted-foreground">
-          Starts in Open. A title is enough; the orchestrator can help clarify the rest.
-        </p>
       </Panel>
     );
   if (!projectId)
@@ -359,9 +335,17 @@ function TicketDetails({
   const [searchParams] = useSearchParams();
   const replaceSearchParams = useReplaceSearchParams();
   const chatSessionId = searchParams.get("session");
-  const orchestratorChat = searchParams.has("orchestrator");
+  const orchestratorChat =
+    searchParams.get("view") === "chat" ||
+    searchParams.has("orchestrator") ||
+    searchParams.get("agent") === "primary";
   const chatting = !!chatSessionId || orchestratorChat;
-  const closeChat = () => replaceSearchParams(new URLSearchParams({ ticket: ticketId }));
+  const closeChat = () => {
+    const next = new URLSearchParams(ticketPanelSearch(ticketId, searchParams));
+    if (searchParams.get("view") === "chat" || searchParams.get("agent") === "primary")
+      next.set("view", "board");
+    replaceSearchParams(next);
+  };
   const ticket = query.data;
   if (!ticket)
     return (
@@ -464,6 +448,12 @@ function TicketDetails({
               </div>
               <TicketError error={configuration.error} />
               <TicketAgents projectId={projectId} ticket={ticket} />
+              <Button asChild variant="outline" size="sm">
+                <Link to={ticketSessionSearch(ticketId, undefined, searchParams)}>
+                  <MessageSquareIcon />
+                  Ask in Chat
+                </Link>
+              </Button>
               <section aria-label="Description" className="space-y-2">
                 <h3 className="text-sm font-medium">Description</h3>
                 {ticket.description ? (

@@ -44,6 +44,7 @@ import { Shimmer } from "@/components/ai-elements/shimmer";
 import { renderLocalReviewComment } from "./LocalReviewCommentPreview";
 import { omitIncompleteLocalReviewComment } from "@/lib/localReviewComments";
 import { SessionMentionPill } from "@/components/blocks/ChatMarkdown";
+import { SessionAgentIcon } from "@/components/SessionAgentIcon";
 import {
   BlockRenderer,
   FilePathAwareMessageResponse,
@@ -82,6 +83,7 @@ import {
   keyedAttachments,
 } from "@/lib/blocks";
 import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
+import { AssistantPresentationContext } from "./assistantPresentation";
 import { getCurrentAuthorId, getCurrentUserId } from "@/lib/identity";
 import { TERMINAL_PROMPT_BLOCKED_ON } from "@/lib/events";
 import { QueryClientContext } from "@tanstack/react-query";
@@ -166,6 +168,7 @@ function SessionMessageOriginLine({
     >
       <CornerDownRightIcon className="size-3 shrink-0" />
       <span>From</span>
+      {label?.agent && <SessionAgentIcon agent={label.agent} />}
       {label ? (
         <SessionMentionPill id={sourceId} isSubagent={label.isSubagent}>
           @{label.title}
@@ -1374,6 +1377,7 @@ function AssistantBubble({
   actionsPersistent?: boolean;
   recoveryDisabled?: boolean;
 }) {
+  const presentation = useContext(AssistantPresentationContext);
   const { toggleActions, visibilityClassName, visibilityToggle, actionsId } =
     useMessageActionVisibility(isLastAssistant, actionsPersistent);
   // The walker only emits an assistant bubble when at least one assistant-side
@@ -1530,6 +1534,15 @@ function AssistantBubble({
             flashing && "animate-message-highlight rounded-lg",
           )}
         >
+          {!foldOnly && !errorOnly && presentation.identity && (
+            <div
+              data-testid="assistant-name"
+              className="mb-2 flex items-center gap-2 text-sm font-medium text-foreground"
+            >
+              {presentation.identity.icon}
+              <span>{presentation.identity.name}</span>
+            </div>
+          )}
           <BlockRenderer
             items={mainItems}
             sessionStatus={sessionStatus}
@@ -1544,6 +1557,7 @@ function AssistantBubble({
             foldNarration={foldNarration}
             onRetryError={recoveryDisabled ? undefined : handleRetryError}
           />
+          {presentation.extras?.get(bubble.stableId)}
         </MessageContent>
         {bubble.lifecycle === "cancelled" && (
           <p

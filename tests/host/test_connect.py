@@ -877,6 +877,47 @@ async def test_handle_model_options_rejects_unsupported_harness() -> None:
     )
 
 
+@pytest.mark.parametrize("outcome", ["models", "empty", "failure"])
+async def test_codex_sdk_prelaunch_models_use_own_provider_not_native_catalog(
+    monkeypatch, outcome
+):
+    from omnigent.models import model_catalog
+
+    listing = model_catalog.ModelListing(
+        source="openai-compatible",
+        verified=True,
+        models=(model_catalog.ModelEntry(id="gpt-5.4-mini", family="openai"),)
+        if outcome == "models"
+        else (),
+        note="Test provider",
+    )
+
+    def read_sdk(spec, harness):
+        assert harness == "codex" and spec.executor.config["harness"] == "codex"
+        if outcome == "failure":
+            raise RuntimeError("Provider unavailable")
+        return listing
+
+    monkeypatch.setattr(model_catalog, "list_models_for_worker", read_sdk)
+    monkeypatch.setattr(
+        "omnigent.host.connect._model_configuration_source_for_harness", lambda harness: None
+    )
+    host = _make_host_process()
+    native = AsyncMock(side_effect=AssertionError("SDK must not use native catalog"))
+    monkeypatch.setattr(host, "_probed_codex_model_options", native)
+    try:
+        result = await host._handle_model_options(
+            HostModelOptionsFrame(request_id="sdk", harness="codex")
+        )
+        assert result.status == ("ok" if outcome == "models" else "failed")
+        assert result.models == (
+            [{"id": "gpt-5.4-mini", "displayName": "gpt-5.4-mini"}] if outcome == "models" else []
+        )
+        native.assert_not_called()
+    finally:
+        _cleanup_host(host)
+
+
 async def test_handle_model_options_reports_the_endpoints_wider_catalog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

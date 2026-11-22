@@ -369,8 +369,6 @@ describe("project ticket sources", () => {
     expect(preset.initialPrompt).toContain("sys_ticket_create without stage_id");
     expect(preset.initialPrompt).toContain("project's configured initial stage");
     expect(preset.initialPrompt).not.toContain("Open ticket");
-    expect(preset.initialPrompt).toContain(
-      "Leave planning, execution, and review to the project orchestrator",
-    );
+    expect(preset.initialPrompt).toContain("Leave follow-up work to the project's main chat.");
   });
 });

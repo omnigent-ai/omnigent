@@ -806,7 +806,8 @@
   background: none;
 }
 
-/* The project board's session panel has no glow. */
+/* Project conversations have no glow. */
+[data-project-chat] .side-chat-backdrop,
 [data-project-session-panel] .side-chat-backdrop {
   background: none;
 }

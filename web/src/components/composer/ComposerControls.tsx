@@ -185,6 +185,7 @@ export const ComposerHostTrigger = forwardRef<
     cloud?: boolean;
     appearance?: "composer" | "header";
     testIdPrefix?: string;
+    showLabel?: boolean;
   }
 >(function ComposerHostTrigger(
   {
@@ -193,6 +194,7 @@ export const ComposerHostTrigger = forwardRef<
     cloud = false,
     appearance = "composer",
     testIdPrefix = "composer",
+    showLabel = false,
     className,
     ...props
   },
@@ -225,6 +227,8 @@ export const ComposerHostTrigger = forwardRef<
           data-testid={`${testIdPrefix}-host-icon`}
         />
       </span>
+      {showLabel && <span className="min-w-0 flex-1 truncate text-left">{label}</span>}
+      {showLabel && <ChevronDownIcon className="size-3 shrink-0 opacity-60" />}
     </Trigger>
   );
 });

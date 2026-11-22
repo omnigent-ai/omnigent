@@ -1,6 +1,8 @@
 import claudeCodeLogo from "@/assets/claude-code-logo.svg";
 import { iconForAgent } from "@/components/AgentCard";
+import { MaestroIcon } from "@/components/icons/MaestroIcon";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
+import { agentRootName } from "@/lib/forkHarness";
 import { nativeCodingAgentForAvailableAgent } from "@/lib/nativeCodingAgents";
 import { cn } from "@/lib/utils";
 
@@ -35,6 +37,9 @@ export function ComposerAgentIcon({
   agent: Pick<AvailableAgent, "name" | "harness">;
   className?: string;
 }) {
+  if (agentRootName(agent.name).toLowerCase() === "maestro") {
+    return <MaestroIcon className={cn("size-4 shrink-0", className)} />;
+  }
   if (agent.name === "polly" || agent.name === "debby") {
     return (
       <svg viewBox="0 0 16 16" className={cn("size-4 shrink-0", className)} aria-hidden="true">

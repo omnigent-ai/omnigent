@@ -1466,6 +1466,7 @@ describe("getSession", () => {
       mockJsonResponse({
         id: "conv_abc",
         agent_id: "agent_xyz",
+        agent_name: "codex-native-ui",
         status: "idle",
         created_at: 1704067200,
         items: [],
@@ -1482,6 +1483,7 @@ describe("getSession", () => {
       "/v1/sessions/conv_abc?include_items=false&include_liveness=false&include_usage=false",
     );
     expect(session.agentId).toBe("agent_xyz");
+    expect(session.agentName).toBe("codex-native-ui");
     expect(session.items).toEqual([]);
     expect(session.usageIncluded).toBe(false);
     expect(session.totalCostUsd).toBeNull();

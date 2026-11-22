@@ -1808,6 +1808,21 @@ class _SessionCreateRequestBase(_SandboxProfileSelection):
     subagent_routing_override: str | None = None
     harness_override: str | None = None
     smart_routing_message: str | None = None
+    project_main_session: bool = False
+    expected_main_session_id: str | None = None
+
+    @model_validator(mode="after")
+    def _check_project_main_session(self) -> Self:
+        if self.project_main_session:
+            if not self.project_id or self.parent_session_id or self.sibling_source_id:
+                raise ValueError("A main session must be a top-level project session")
+            if "expected_main_session_id" not in self.model_fields_set:
+                raise ValueError("expected_main_session_id is required for a main session")
+            if self.initial_items:
+                raise ValueError("Send main-session messages after session creation")
+        elif "expected_main_session_id" in self.model_fields_set and self.expected_main_session_id:
+            raise ValueError("expected_main_session_id requires project_main_session")
+        return self
 
     @model_validator(mode="after")
     def _check_startup_input(self) -> Self:
@@ -2042,6 +2057,8 @@ class SessionCreateMetadata(_SandboxProfileSelection):
 
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     project_id: str | None = None
+    project_main_session: bool = False
+    expected_main_session_id: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     reasoning_effort: str | None = None
     model_override: str | None = None
@@ -2060,6 +2077,17 @@ class SessionCreateMetadata(_SandboxProfileSelection):
     model_config = ConfigDict(extra="forbid")
 
     initial_input: SessionStartupInput | None = None
+
+    @model_validator(mode="after")
+    def _check_project_main_session(self) -> Self:
+        if self.project_main_session:
+            if not self.project_id or self.parent_session_id or self.sibling_source_id:
+                raise ValueError("A main session must be a top-level project session")
+            if "expected_main_session_id" not in self.model_fields_set:
+                raise ValueError("expected_main_session_id is required for a main session")
+        elif self.expected_main_session_id is not None:
+            raise ValueError("expected_main_session_id requires project_main_session")
+        return self
 
     @model_validator(mode="after")
     def _check_startup_input(self) -> Self:
@@ -2677,6 +2705,8 @@ class SessionResponse(BaseModel):
     # session's root can. ``None`` where the response doesn't compute it.
     side_chat_allowed: bool | None = None
     # Computed from the project's designated session, not inherited by workers.
+    project_main_session: bool = False
+    # Deprecated response alias; remove in 0.25.0.
     project_orchestrator: bool = False
 
 
@@ -6399,6 +6429,11 @@ class ProjectObject(BaseModel):
     created_at: int
     updated_at: int | None = None
     config: dict[str, Any] = Field(default_factory=dict)
+    main_session_id: str | None = None
+    main_session_state: Literal["absent", "missing", "archived", "active", "unavailable"] = (
+        "absent"
+    )
+    # Deprecated response alias; remove in 0.25.0.
     orchestrator_session_id: str | None = None
 
 
@@ -6480,6 +6515,21 @@ class UpdateProjectRequest(BaseModel):
 
     name: str | None = None
     config: dict[str, Any] | None = None
+    main_session_id: str | None = None
+    expected_main_session_id: str | None = None
+
+    @model_validator(mode="after")
+    def _check_main_assignment(self) -> Self:
+        if "main_session_id" in self.model_fields_set:
+            if not self.main_session_id:
+                raise ValueError("main_session_id must name an existing session")
+            if "expected_main_session_id" not in self.model_fields_set:
+                raise ValueError(
+                    "expected_main_session_id is required for main-session assignment"
+                )
+        elif "expected_main_session_id" in self.model_fields_set:
+            raise ValueError("expected_main_session_id requires main_session_id")
+        return self
 
     @field_validator("name")
     @classmethod

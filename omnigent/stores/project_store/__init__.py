@@ -110,6 +110,8 @@ class ProjectStore(ABC):
         user_id: str | None,
         name: str | None = None,
         config: dict[str, Any] | None = None,
+        main_session_id: str | None = None,
+        expected_main_session_id: str | None = None,
     ) -> Project | None:
         """
         Update mutable fields of an owned project.
@@ -130,7 +132,9 @@ class ProjectStore(ABC):
         ...
 
     @abstractmethod
-    def delete(self, project_id: str, *, user_id: str | None) -> bool:
+    def delete(
+        self, project_id: str, *, user_id: str | None, require_no_main: bool = False
+    ) -> bool:
         """
         Delete an owned project. Idempotent.
 
@@ -143,14 +147,15 @@ class ProjectStore(ABC):
         """
         ...
 
-    def set_orchestrator(
-        self, project_id: str, session_id: str, *, user_id: str | None
+    def set_main_session(
+        self,
+        project_id: str,
+        session_id: str,
+        *,
+        user_id: str | None,
+        expected_main_session_id: str | None = None,
     ) -> Project:
-        """Attach the project's first ordinary orchestrator session; retain an existing one."""
-        raise NotImplementedError
-
-    def clear_orchestrator(self, project_id: str, session_id: str, *, user_id: str | None) -> None:
-        """Roll back a failed launch only if this session is still the orchestrator."""
+        """Compare-and-set the main session; a repeated assignment is idempotent."""
         raise NotImplementedError
 
     @abstractmethod

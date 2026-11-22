@@ -2390,6 +2390,7 @@ class ConversationStore(ABC):
         host_id: str | None = None,
         inference_snapshot: dict[str, Any] | None = None,
         created_by: str | None = None,
+        conversation_id: str | None = None,
     ) -> CreatedSession:
         """
         Atomically create a session and its session-scoped agent.

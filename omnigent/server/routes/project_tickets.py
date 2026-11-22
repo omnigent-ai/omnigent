@@ -23,13 +23,17 @@ from omnigent.entities.project_ticket import (
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.project_ticket_instructions import PROJECT_TICKET_WORK_INSTRUCTION
 from omnigent.server.auth import LEVEL_EDIT, RESERVED_USER_PUBLIC, AuthProvider
 from omnigent.server.routes._auth_helpers import require_access, require_user
 from omnigent.server.routes._sessions.common import _session_status_cache
-from omnigent.server.routes._sessions.helpers import _permission_level_from_grants
+from omnigent.server.routes._sessions.helpers import (
+    _permission_level_from_grants,
+    _resolve_harness,
+)
 from omnigent.server.session_orchestration import require_named_source_private
-from omnigent.stores import ConversationStore, PermissionStore
+from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.conversation_store import SessionActivity
 from omnigent.stores.project_ticket_store import ProjectTicketStore
 from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
@@ -73,6 +77,8 @@ def create_project_tickets_router(
     *,
     auth_provider: AuthProvider | None = None,
     permissions: PermissionStore | None = None,
+    agents: AgentStore | None = None,
+    agent_cache: AgentCache | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/projects/{project_id}/tickets")
 
@@ -118,31 +124,13 @@ def create_project_tickets_router(
             )
         return session_id
 
-    @router.get("")
-    async def list_tickets(
-        request: Request,
-        project_id: str,
-        stage_id: TicketStageId | None = None,
-        after: str | None = None,
-        limit: int = Query(50, ge=1, le=100),
-    ) -> dict[str, Any]:
-        who = await actor(request, project_id)
-        page = await asyncio.to_thread(
-            store.list,
-            project_id,
-            user_id=who.user_id,
-            stage_id=stage_id,
-            after=after,
-            limit=limit,
-        )
-        if who.session_id is not None:
-            page["agent_guidance"] = PROJECT_TICKET_WORK_INSTRUCTION
-        if not page["data"]:
-            return page
+    async def enrich(project_id: str, tickets: list[dict[str, Any]], who: TicketActor) -> None:
+        if not tickets:
+            return
         links = await asyncio.to_thread(
             store.activity_sessions,
             project_id,
-            [ticket["id"] for ticket in page["data"]],
+            [ticket["id"] for ticket in tickets],
             user_id=who.user_id,
         )
         session_ids = sorted({sid for link in links.values() for sid in link.session_ids})
@@ -166,11 +154,60 @@ def create_project_tickets_router(
                     is not None
                 ]
         sessions = await asyncio.to_thread(conversations.get_session_activity, session_ids)
-        for ticket in page["data"]:
+
+        def identities() -> dict[str, tuple[str, str | None]]:
+            rows = conversations.get_conversations(session_ids)
+            project = uuid_to_bytes(project_id).hex()
+            known_agents = (
+                agents.get_many(list({row.agent_id for row in rows.values() if row.agent_id}))
+                if agents is not None
+                else {}
+            )
+            return {
+                row.id: (
+                    row.sub_agent_name or known_agents[row.agent_id].name,
+                    _resolve_harness(row, agent_cache=agent_cache, agents_by_id=known_agents),
+                )
+                for row in rows.values()
+                if row.project_id == project
+                and row.agent_id is not None
+                and row.agent_id in known_agents
+            }
+
+        metadata = await asyncio.to_thread(identities)
+        for ticket in tickets:
             linked = links[ticket["id"]]
             ticket["has_running_agents"] = _has_running_agents(
                 linked.session_ids, sessions, has_more=linked.has_more
             )
+            distinct = dict.fromkeys(
+                metadata[sid] for sid in linked.session_ids if sid in metadata
+            )
+            ticket["agents"] = [
+                {"agent_name": name, "harness": harness} for name, harness in distinct
+            ]
+            ticket["agents_has_more"] = linked.has_more
+
+    @router.get("")
+    async def list_tickets(
+        request: Request,
+        project_id: str,
+        stage_id: TicketStageId | None = None,
+        after: str | None = None,
+        limit: int = Query(50, ge=1, le=100),
+    ) -> dict[str, Any]:
+        who = await actor(request, project_id)
+        page = await asyncio.to_thread(
+            store.list,
+            project_id,
+            user_id=who.user_id,
+            stage_id=stage_id,
+            after=after,
+            limit=limit,
+        )
+        if who.session_id is not None:
+            page["agent_guidance"] = PROJECT_TICKET_WORK_INSTRUCTION
+        await enrich(project_id, page["data"], who)
         return page
 
     @router.post("", status_code=201)
@@ -202,12 +239,18 @@ def create_project_tickets_router(
         wake(request)
         return configuration
 
+    @router.get("/summary")
+    async def ticket_summary(request: Request, project_id: str) -> dict[str, Any]:
+        who = await actor(request, project_id)
+        return await asyncio.to_thread(store.summary, project_id, user_id=who.user_id)
+
     @router.get("/{ticket_id}")
     async def get_ticket(request: Request, project_id: str, ticket_id: str) -> dict[str, Any]:
         who = await actor(request, project_id)
         ticket = await asyncio.to_thread(store.get, project_id, ticket_id, user_id=who.user_id)
         if who.session_id is not None:
             ticket["agent_guidance"] = PROJECT_TICKET_WORK_INSTRUCTION
+        await enrich(project_id, [ticket], who)
         return ticket
 
     @router.patch("/{ticket_id}")

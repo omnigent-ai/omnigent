@@ -16,7 +16,7 @@ from omnigent.db.utils import builtin_agent_id
 from omnigent.errors import OmnigentError
 from omnigent.native._native_supersession import clear_replacement_create_body
 from omnigent.runtime.agent_cache import AgentCache
-from omnigent.server.app import create_app
+from omnigent.server.app import _ensure_default_maestro_agent, create_app
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.managed_hosts import parse_sandbox_config
 from omnigent.server.routes._session_create_validation import (
@@ -59,12 +59,14 @@ def project_create_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastA
         BUILTIN_AGENT_NAME,
         f"{BUILTIN_AGENT_ID}/bundle",
     )
+    agent_cache = AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache")
+    _ensure_default_maestro_agent(agent_store, artifact_store, agent_cache)
     return create_app(
         agent_store=agent_store,
         file_store=SqlAlchemyFileStore(db_uri),
         conversation_store=SqlAlchemyConversationStore(db_uri),
         artifact_store=artifact_store,
-        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        agent_cache=agent_cache,
         permission_store=SqlAlchemyPermissionStore(db_uri),
         project_store=SqlAlchemyProjectStore(db_uri),
         auth_provider=UnifiedAuthProvider(source="header"),
@@ -589,9 +591,7 @@ async def test_a_project_default_cannot_bind_the_proactive_agent(
     # Uploads and imports resolve project defaults through the same chokepoint.
     project = SqlAlchemyProjectStore(db_uri).get(project_id, user_id=ALICE)
     assert project is not None
-    assert [session["id"] for session in listed.json()["data"]] == [
-        project.orchestrator_session_id
-    ]
+    assert [session["id"] for session in listed.json()["data"]] == [project.main_session_id]
     with pytest.raises(OmnigentError, match="built-in schedule"):
         await resolve_project_session_create(
             body=ProjectSessionCreateRequest(project_id=project_id),

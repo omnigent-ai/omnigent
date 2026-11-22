@@ -12662,6 +12662,7 @@ async def _create_session_from_existing_agent(
     created_by_scheduled_task_id: str | None = None,
     created_by: Conversation | None = None,
     launched_by_scheduled_task_id: str | None = None,
+    conversation_id: str | None = None,
 ) -> tuple[SessionResponse, Conversation, SessionCreateInput]:
     """
     Create a session bound to an already-registered agent.
@@ -13452,6 +13453,7 @@ async def _create_session_from_existing_agent(
         )
         with creation_stage("create_persistence_ms"):
             conv = conversation_store.create_conversation(
+                conversation_id=conversation_id,
                 agent_id=agent.id,
                 title=body.title,
                 parent_conversation_id=body.parent_session_id,
@@ -13746,6 +13748,7 @@ def _create_session_from_bundle(
     git_branch: str | None = None,
     created_by: str | None = None,
     agent_store: AgentStore | None = None,
+    conversation_id: str | None = None,
 ) -> CreatedSessionResponse:
     """
     Validate, store, and persist a bundled session request.
@@ -13845,6 +13848,7 @@ def _create_session_from_bundle(
                 inference_snapshot=inference_snapshot,
                 inference_model=inference_model,
                 git_branch=git_branch,
+                conversation_id=conversation_id,
             )
 
     agent_id = generate_agent_id()
@@ -13870,6 +13874,7 @@ def _create_session_from_bundle(
         inference_model=inference_model,
         git_branch=git_branch,
         created_by=created_by,
+        conversation_id=conversation_id,
     )
 
 

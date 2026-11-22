@@ -9,17 +9,19 @@ import {
   useSensor,
   useSensors,
 } from "@dnd-kit/core";
-import { MessageSquareIcon, PlusIcon } from "lucide-react";
+import { MessageSquareIcon, PlusIcon, XIcon } from "lucide-react";
 import { RunningDot } from "@/components/RunningDot";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { useNow } from "@/hooks/useNow";
-import { Link } from "@/lib/routing";
+import { Link, useSearchParams } from "@/lib/routing";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import type { ProjectTicket, TicketStage } from "@/lib/projectTicketsApi";
 import { cn } from "@/lib/utils";
 import { TicketError, TicketLabels } from "./TicketControls";
 import { TicketStageBadge } from "./TicketStageAppearance";
+import { TicketAgentIcons } from "./TicketAgentIcons";
+import { ticketPanelSearch } from "./projectHomeNavigation";
 import {
   useRelatedTickets,
   useTicketActions,
@@ -27,16 +29,21 @@ import {
   useTicketProject,
   useTickets,
   useTicketStages,
+  useTicketSelection,
 } from "./useProjectTickets";
+
+const NO_TICKET_FILTER: string[] = [];
 
 export function ProjectTicketBoard({
   projectName,
   selectedTicketId,
   overlayClearance,
+  ticketIds = NO_TICKET_FILTER,
 }: {
   projectName: string;
   selectedTicketId: string | null;
   overlayClearance?: string;
+  ticketIds?: string[];
 }) {
   const { projectId, projects } = useTicketProject(projectName);
   if (projects.isLoading) return <Spinner className="m-6" aria-label="Loading project" />;
@@ -48,10 +55,12 @@ export function ProjectTicketBoard({
     );
   return (
     <TicketBoard
+      key={`${projectId}:${ticketIds.join(",")}`}
       projectId={projectId}
       projectName={projectName}
       selectedTicketId={selectedTicketId}
       overlayClearance={overlayClearance}
+      ticketIds={ticketIds}
     />
   );
 }
@@ -61,12 +70,23 @@ function TicketBoard({
   projectName,
   selectedTicketId,
   overlayClearance,
+  ticketIds,
 }: {
   projectId: string | null;
   projectName: string;
   selectedTicketId: string | null;
   overlayClearance?: string;
+  ticketIds: string[];
 }) {
+  const [search] = useSearchParams();
+  const [selectionLimit, setSelectionLimit] = useState(25);
+  const selected = useTicketSelection(projectId, ticketIds.slice(0, selectionLimit));
+  const selectedTickets = selected.flatMap((query) =>
+    query.data && !query.isError ? [query.data] : [],
+  );
+  const selectionPending = selected.some((query) => query.isPending);
+  const unfilteredSearch = new URLSearchParams(search);
+  unfilteredSearch.delete("tickets");
   const [dragged, setDragged] = useState<ProjectTicket | null>(null);
   const [hoveredId, setHoveredId] = useState<string | null>(null);
   const [focusedId, setFocusedId] = useState<string | null>(null);
@@ -89,6 +109,31 @@ function TicketBoard({
   );
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+      {ticketIds.length > 0 && (
+        <div className="flex shrink-0 items-center gap-2 px-4 pb-3 text-sm text-muted-foreground">
+          <span>
+            {ticketIds.length} {ticketIds.length === 1 ? "ticket" : "tickets"}
+          </span>
+          <Button asChild variant="ghost" size="icon-xs">
+            <Link to={`?${unfilteredSearch}`} aria-label="Clear ticket filter">
+              <XIcon />
+            </Link>
+          </Button>
+          {selectionPending && (
+            <Spinner aria-label="Loading selected tickets" className="size-3.5" />
+          )}
+          <TicketError error={selected.find((query) => query.isError)?.error ?? null} />
+          {selectionLimit < ticketIds.length && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setSelectionLimit((limit) => limit + 25)}
+            >
+              Load more
+            </Button>
+          )}
+        </div>
+      )}
       <TicketError error={update.error} />
       {configuration.isPending && <Spinner className="m-6" aria-label="Loading stages" />}
       <TicketError error={configuration.error} />
@@ -134,13 +179,22 @@ function TicketBoard({
               relatedIds={relatedIds}
               onHover={setHoveredId}
               onFocus={setFocusedId}
+              filteredTickets={
+                ticketIds.length
+                  ? selectedTickets.filter((ticket) => ticket.stage_id === stage.id)
+                  : undefined
+              }
+              selectionPending={selectionPending}
             />
           ))}
         </div>
         <DragOverlay dropAnimation={null}>
           {dragged && (
-            <div className="rounded-xl border bg-background p-3 shadow-lg">
-              <TicketCardContent ticket={dragged} />
+            <div>
+              <div className="flex flex-col gap-3 rounded-xl border bg-card p-3.5 shadow-lg">
+                <TicketCardContent ticket={dragged} />
+              </div>
+              <TicketAgentIcons ticket={dragged} />
             </div>
           )}
         </DragOverlay>
@@ -161,6 +215,8 @@ function TicketColumn({
   relatedIds,
   onHover,
   onFocus,
+  filteredTickets,
+  selectionPending,
 }: {
   projectId: string | null;
   stage: TicketStage;
@@ -173,9 +229,13 @@ function TicketColumn({
   relatedIds: Set<string>;
   onHover: (id: string | null) => void;
   onFocus: (id: string | null) => void;
+  filteredTickets?: ProjectTicket[];
+  selectionPending: boolean;
 }) {
-  const query = useTickets(projectId, stage.id);
-  const tickets = query.data?.pages.flatMap((page) => page.data) ?? [];
+  const [search] = useSearchParams();
+  const query = useTickets(projectId, stage.id, filteredTickets === undefined);
+  const tickets = filteredTickets ?? query.data?.pages.flatMap((page) => page.data) ?? [];
+  const hasNextPage = filteredTickets === undefined && query.hasNextPage;
   const { setNodeRef, isOver } = useDroppable({ id: stage.id, disabled });
   return (
     <section
@@ -191,18 +251,18 @@ function TicketColumn({
         <TicketStageBadge stage={stage} showInstructionsOnHover />
         <span className="tabular-nums">
           {tickets.length}
-          {query.hasNextPage ? "+" : ""}
+          {hasNextPage ? "+" : ""}
         </span>
       </h2>
       <div
         className="-mx-2 flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-2 pt-0.5 pb-2"
         style={{ paddingBottom: overlayClearance }}
       >
-        {projectId && query.isPending ? (
+        {projectId && filteredTickets === undefined && query.isPending ? (
           <Spinner aria-label="Loading tickets" className="mx-auto my-4" />
         ) : null}
-        <TicketError error={query.error} />
-        {query.isError && (
+        <TicketError error={filteredTickets === undefined ? query.error : null} />
+        {filteredTickets === undefined && query.isError && (
           <Button variant="ghost" onClick={() => void query.refetch()}>
             Try again
           </Button>
@@ -219,10 +279,12 @@ function TicketColumn({
             onFocus={onFocus}
           />
         ))}
-        {!query.isError && (!projectId || query.isSuccess) && tickets.length === 0 && (
-          <p className="px-2 py-4 text-sm text-muted-foreground">No tickets</p>
-        )}
-        {query.hasNextPage && (
+        {!selectionPending &&
+          (filteredTickets !== undefined || (!query.isError && (!projectId || query.isSuccess))) &&
+          tickets.length === 0 && (
+            <p className="px-2 py-4 text-sm text-muted-foreground">No tickets</p>
+          )}
+        {hasNextPage && (
           <Button
             variant="ghost"
             loading={query.isFetchingNextPage}
@@ -233,7 +295,7 @@ function TicketColumn({
         )}
         {initial && (
           <Button variant="ghost" asChild className="justify-start text-muted-foreground">
-            <Link to="?ticket=new">
+            <Link to={ticketPanelSearch("new", search)}>
               <PlusIcon />
               New ticket
             </Link>
@@ -261,36 +323,40 @@ function TicketCard({
   onHover: (id: string | null) => void;
   onFocus: (id: string | null) => void;
 }) {
+  const [search] = useSearchParams();
   const { setNodeRef, listeners, attributes, isDragging } = useDraggable({
     id: ticket.id,
     data: { ticket },
     disabled,
   });
   return (
-    <Link
-      ref={setNodeRef}
-      {...attributes}
-      {...listeners}
-      role="link"
-      to={`?ticket=${encodeURIComponent(ticket.id)}`}
-      aria-label={`Open ticket: ${ticket.title}`}
-      data-related-highlight={related || undefined}
-      onMouseEnter={() => onHover(ticket.id)}
-      onMouseLeave={() => onHover(null)}
-      onFocus={() => onFocus(ticket.id)}
-      onBlur={() => onFocus(null)}
-      onClick={(event) => {
-        if (suppressClick()) event.preventDefault();
-      }}
-      className={cn(
-        "flex min-w-0 flex-col gap-3 rounded-xl border border-border/60 bg-card p-3.5 text-left shadow-xs outline-none transition-colors hover:border-primary/70 hover:bg-primary/5 hover:ring-2 hover:ring-primary/20 focus-visible:bg-primary/5 focus-visible:ring-2 focus-visible:ring-ring",
-        related && "border-muted-foreground/50",
-        selected && "border-primary ring-1 ring-primary/20",
-        isDragging && "opacity-40",
-      )}
-    >
-      <TicketCardContent ticket={ticket} />
-    </Link>
+    <div>
+      <Link
+        ref={setNodeRef}
+        {...attributes}
+        {...listeners}
+        role="link"
+        to={ticketPanelSearch(ticket.id, search)}
+        aria-label={`Open ticket: ${ticket.title}`}
+        data-related-highlight={related || undefined}
+        onMouseEnter={() => onHover(ticket.id)}
+        onMouseLeave={() => onHover(null)}
+        onFocus={() => onFocus(ticket.id)}
+        onBlur={() => onFocus(null)}
+        onClick={(event) => {
+          if (suppressClick()) event.preventDefault();
+        }}
+        className={cn(
+          "flex min-w-0 flex-col gap-3 rounded-xl border border-border/60 bg-card p-3.5 text-left shadow-xs outline-none transition-colors hover:border-primary/70 hover:bg-primary/5 hover:ring-2 hover:ring-primary/20 focus-visible:bg-primary/5 focus-visible:ring-2 focus-visible:ring-ring",
+          related && "border-muted-foreground/50",
+          selected && "border-primary ring-1 ring-primary/20",
+          isDragging && "opacity-40",
+        )}
+      >
+        <TicketCardContent ticket={ticket} />
+      </Link>
+      <TicketAgentIcons ticket={ticket} />
+    </div>
   );
 }
 

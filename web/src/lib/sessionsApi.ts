@@ -933,6 +933,11 @@ export async function createBundledSession(
     sandbox_profile_revision?: string;
     project_id?: string;
     sibling_source_id?: string;
+    project_main_session?: boolean;
+    expected_main_session_id?: string | null;
+    title?: string;
+    model_override?: string;
+    reasoning_effort?: string;
     labels?: Record<string, string>;
     initial_input?: SessionEventInput;
     terminal_launch_args?: string[];
@@ -940,6 +945,7 @@ export async function createBundledSession(
     mcp_registry_services?: string[];
   } = {},
   initialFiles: File[] = [],
+  options: { idempotencyKey?: string } = {},
 ): Promise<{ id: string; agentId?: string }> {
   const form = new FormData();
   form.append("metadata", JSON.stringify(metadata));
@@ -951,12 +957,12 @@ export async function createBundledSession(
       "X-Omnigent-Client": getClientSurface(),
       ...backgroundSessionTitlesRequestHeaders(),
       ...timezoneRequestHeaders(),
+      ...(options.idempotencyKey ? { "Idempotency-Key": options.idempotencyKey } : {}),
     },
     body: form,
   });
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Failed to create bundled session: ${res.status} ${text}`);
+    throw await apiErrorFromResponse(res);
   }
   // The multipart response uses `session_id` (CreatedSessionResponse),
   // while the JSON path uses `id` (SessionResponse). Normalize to `id`

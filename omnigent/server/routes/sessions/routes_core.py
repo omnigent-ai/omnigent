@@ -27,6 +27,7 @@ from fastapi import (
 )
 from fastapi.responses import Response
 from pydantic import ValidationError
+from sqlalchemy.exc import IntegrityError
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from omnigent.codex_approval_modes import (
@@ -49,6 +50,7 @@ from omnigent.entities import (
     Agent,
     CommentsFingerprint,
     Conversation,
+    NewConversationItem,
     StoredFile,
     synthesize_conversation_title,
 )
@@ -114,6 +116,12 @@ from omnigent.server.proactive_agent import (
 from omnigent.server.proactive_agent import reject_proactive_agent_id
 from omnigent.server.proactive_agent import (
     start_provisioning as start_proactive_provisioning,
+)
+from omnigent.server.project_main_session import (
+    MainSessionCreation,
+    maestro_agent_id,
+    main_session_state,
+    prepare_main_creation,
 )
 from omnigent.server.routes._auth_helpers import SessionAccess
 from omnigent.server.routes._auth_helpers import (
@@ -191,6 +199,7 @@ from omnigent.server.routes._sessions.helpers import (
     _notify_runner_of_bundled_child,
     _parse_session_create_metadata,
     _permission_level_from_grants,
+    _persist_session_status_error_labels,
     _pin_claude_permission_launch_args,
     _presentation_labels_for_agent,
     _prune_session_read_state,
@@ -199,6 +208,7 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_permission_mode,
     _publish_sandbox_status,
     _publish_session_superseded,
+    _publish_status,
     _publish_terminal_pending,
     _reject_reserved_cost_control_label_seed,
     _reject_server_reserved_label_seed,
@@ -220,6 +230,7 @@ from omnigent.server.routes._sessions.helpers import (
     _validate_terminal_launch_args,
     _validated_cost_control_mode_override,
     _validated_subagent_routing_override,
+    announce_projects_changed,
     reconcile_orphaned_running_status,
 )
 from omnigent.server.routes._sessions.orchestration import (
@@ -255,11 +266,14 @@ from omnigent.server.schemas import (
     AutomaticSessionRenameRequest,
     AutomaticSessionRenameResponse,
     CreatedSessionResponse,
+    ErrorDetail,
     PaginatedList,
     ProjectSessionCreateRequest,
     ReadStatePutRequest,
     ResetSessionModelOverrideRequest,
     ResetSessionModelOverrideResponse,
+    SessionCreateInput,
+    SessionCreateMetadata,
     SessionCreateRequest,
     SessionEventInput,
     SessionFamily,
@@ -295,6 +309,7 @@ from omnigent.stores.conversation_store import (
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
+    ConversationAlreadyExistsError,
     ConversationNotFoundError,
     pinned_label_key,
     runner_seen_is_fresh,
@@ -668,7 +683,8 @@ def register_core_routes(
         except Exception:
             # The create fails, so leave no session (or uploaded file) for a retry
             # to duplicate.
-            await _delete_unreturned_session(session_id)
+            if getattr(request.state, "project_main_bound_session_id", None) != session_id:
+                await _delete_unreturned_session(session_id)
             raise
 
     async def _list_session_grants(session_id: str) -> dict[str, int]:
@@ -1372,6 +1388,11 @@ def register_core_routes(
                     error_phase=ErrorPhase.RUNNER_LAUNCH.value,
                 ),
             )
+            if getattr(request.state, "project_main_bound_session_id", None) == session_id:
+                raise OmnigentError(
+                    launch_result.get("error") or "Host could not start the main chat",
+                    code=launch_result.get("error_code") or ErrorCode.RUNNER_UNAVAILABLE,
+                )
         return runner_id, launch_failed
 
     def _side_chat_allowed_sync(user_id: str | None, conversation: Conversation) -> bool:
@@ -1475,6 +1496,168 @@ def register_core_routes(
         payload_override: dict[str, Any] | None = None,
         before_launch: Callable[[str], Awaitable[None]] | None = None,
     ) -> SessionResponse | CreatedSessionResponse:
+        """Keep a bound main chat visible when its launch fails."""
+        request.state.project_main_creation = None
+        request.state.project_main_bound_session_id = None
+        request.state.project_main_bundled = False
+        try:
+            return await _create_session_impl(request, user_id, payload_override, before_launch)
+        except Exception as exc:
+            creation = request.state.project_main_creation
+            bound_id = request.state.project_main_bound_session_id
+            if bound_id is not None:
+                error = ErrorDetail(
+                    code=exc.code if isinstance(exc, OmnigentError) else "session_launch_failed",
+                    message=str(exc)
+                    if isinstance(exc, OmnigentError)
+                    else "Main chat was saved, but could not start. Retry from the chat.",
+                )
+                await _persist_session_status_error_labels(bound_id, error, conversation_store)
+                await asyncio.to_thread(
+                    conversation_store.set_session_live_status, bound_id, "failed"
+                )
+                _publish_status(
+                    bound_id,
+                    "failed",
+                    error=error,
+                    persist_live_status=False,
+                    failure_origin="project_main_session_launch",
+                )
+                _publish_terminal_pending(bound_id, False)
+                _announce_session_added(user_id, bound_id)
+                return await _main_creation_response(request, bound_id)
+            if creation is not None and (
+                isinstance(exc, (IntegrityError, ConversationAlreadyExistsError))
+                or (
+                    isinstance(exc, OmnigentError)
+                    and exc.code in (ErrorCode.ALREADY_EXISTS, ErrorCode.CONFLICT)
+                )
+            ):
+                assert project_store is not None
+                current = await asyncio.to_thread(
+                    project_store.get, creation.project.id, user_id=user_id
+                )
+                if current is not None and current.main_session_id == creation.session_id:
+                    return await _main_creation_response(request, creation.session_id)
+                if isinstance(exc, (IntegrityError, ConversationAlreadyExistsError)):
+                    raise OmnigentError(
+                        "Main-chat creation is in progress; retry this submission",
+                        code=ErrorCode.CONFLICT,
+                    ) from exc
+            raise
+
+    async def _main_creation_response(
+        request: Request, session_id: str
+    ) -> SessionResponse | CreatedSessionResponse:
+        snapshot = await get_session(
+            request,
+            Response(),
+            session_id,
+            include_items=True,
+            include_liveness=False,
+            include_live_status=False,
+            refresh_state=False,
+            include_usage=False,
+        )
+        if request.state.project_main_bundled:
+            if snapshot.agent_name is None:
+                raise OmnigentError("Session agent is unavailable", code=ErrorCode.NOT_FOUND)
+            return CreatedSessionResponse(
+                session_id=session_id, agent_id=snapshot.agent_id, agent_name=snapshot.agent_name
+            )
+        return snapshot
+
+    async def _prepare_main(
+        request: Request,
+        user_id: str | None,
+        body: SessionCreateInput | SessionCreateMetadata,
+        *,
+        initial_project: bool = False,
+    ) -> MainSessionCreation | None:
+        if not body.project_main_session:
+            return None
+        if project_store is None or body.project_id is None:
+            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        await asyncio.to_thread(
+            require_named_source_private, request, user_id, conversation_store, permission_store
+        )
+        creation = await prepare_main_creation(
+            request,
+            user_id=user_id,
+            project_id=body.project_id,
+            expected_id=body.expected_main_session_id,
+            projects=project_store,
+            conversations=conversation_store,
+            permissions=permission_store,
+            initial_project=initial_project,
+        )
+        request.state.project_main_creation = creation
+        if body.title is None:
+            body.title = "Main"
+        return creation
+
+    async def _bind_main(
+        request: Request,
+        user_id: str | None,
+        creation: MainSessionCreation | None,
+        session_id: str,
+        agent_name: str | None,
+        *,
+        notify_project: bool = True,
+    ) -> None:
+        if creation is None:
+            return
+        assert project_store is not None
+        try:
+            state = await main_session_state(
+                creation.project, conversation_store, permission_store
+            )
+            if state not in ("absent", "missing", "archived"):
+                raise OmnigentError(
+                    "The main chat is no longer replaceable; reload the project",
+                    code=ErrorCode.CONFLICT,
+                )
+            await asyncio.to_thread(
+                project_store.set_main_session,
+                creation.project.id,
+                session_id,
+                user_id=user_id,
+                expected_main_session_id=creation.expected_id,
+            )
+        except OmnigentError:
+            # This request owns this unlaunched row, never the competing winner.
+            await request.app.state.project_session_delete(request, session_id)
+            raise
+        request.state.project_main_bound_session_id = session_id
+        if notify_project:
+            announce_projects_changed(user_id)
+        await asyncio.to_thread(
+            conversation_store.append,
+            session_id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id="seed",
+                    data=MessageData(
+                        role="assistant",
+                        agent=agent_name,
+                        content=[
+                            {
+                                "type": "output_text",
+                                "text": "Hello, what would you like to work on?",
+                            }
+                        ],
+                    ),
+                )
+            ],
+        )
+
+    async def _create_session_impl(
+        request: Request,
+        user_id: str | None,
+        payload_override: dict[str, Any] | None = None,
+        before_launch: Callable[[str], Awaitable[None]] | None = None,
+    ) -> SessionResponse | CreatedSessionResponse:
         """Create a session for *user_id*; see :func:`create_session`."""
         content_type = (
             "application/json"
@@ -1537,6 +1720,14 @@ def register_core_routes(
             raise HTTPException(status_code=422, detail=exc.errors(include_context=False)) from exc
 
         reject_proactive_agent_id(body.agent_id)
+        main_creation = await _prepare_main(
+            request, user_id, body, initial_project=payload_override is not None
+        )
+        if main_creation is not None:
+            if main_creation.replay:
+                return await _main_creation_response(request, main_creation.session_id)
+            if body.agent_id is None:
+                body.agent_id = await maestro_agent_id(request, agent_store)
         explicit_host = request.url.path.endswith("/sessions/orchestrated/host")
         if explicit_host and (
             body.host_type != "external" or not body.host_id or not body.workspace
@@ -1717,6 +1908,7 @@ def register_core_routes(
             launched_by_scheduled_task_id=(
                 launching_task.id if launching_task is not None else None
             ),
+            conversation_id=main_creation.session_id if main_creation is not None else None,
         )
         # Ownership and the project role must exist before runner initialization.
         if permission_store is not None and user_id is not None:
@@ -1730,6 +1922,17 @@ def register_core_routes(
                     LEVEL_OWNER,
                 )
             resp.permission_level = grant.level
+        await _bind_main(
+            request,
+            user_id,
+            main_creation,
+            resp.id,
+            resp.agent_name,
+            notify_project=payload_override is None,
+        )
+        if main_creation is not None:
+            resp.project_main_session = True
+            resp.project_orchestrator = True
         if before_launch is not None:
             await before_launch(resp.id)
         # Notify the runner about the new session so it can resolve
@@ -1887,6 +2090,7 @@ def register_core_routes(
             and orchestration_source is None
             and body.sibling_source_id is None
             and payload_override is None
+            and not body.project_main_session
         ):
             await _grant_default_public(
                 request.app.state,
@@ -1949,6 +2153,12 @@ def register_core_routes(
         if not isinstance(bundle, StarletteUploadFile):
             raise HTTPException(status_code=422, detail=[_multipart_missing_detail("bundle")])
         parsed_metadata = _parse_session_create_metadata(metadata)
+        request.state.project_main_bundled = True
+        main_creation = await _prepare_main(request, user_id, parsed_metadata)
+        if main_creation is not None and main_creation.replay:
+            replay = await _main_creation_response(request, main_creation.session_id)
+            assert isinstance(replay, CreatedSessionResponse)
+            return replay
         if parsed_metadata.sibling_source_id is not None:
             from omnigent.server.session_families import authorize_sibling_source
 
@@ -2201,6 +2411,9 @@ def register_core_routes(
                     git_branch=git_branch,
                     created_by=user_id,
                     agent_store=agent_store,
+                    conversation_id=main_creation.session_id
+                    if main_creation is not None
+                    else None,
                 )
             if parsed_metadata.sibling_source_id is not None:
                 from omnigent.server.session_families import complete_sibling_creation
@@ -2255,6 +2468,7 @@ def register_core_routes(
                 await asyncio.to_thread(
                     permission_store.grant, user_id, result.session_id, LEVEL_OWNER
                 )
+        await _bind_main(request, user_id, main_creation, result.session_id, result.agent_name)
         await _accept_initial_input(
             request, result.session_id, parsed_metadata.initial_input, user_id
         )
@@ -2302,6 +2516,7 @@ def register_core_routes(
             user_id is not None
             and parsed_metadata.parent_session_id is None
             and parsed_metadata.sibling_source_id is None
+            and not parsed_metadata.project_main_session
         ):
             await _grant_default_public(
                 request.app.state,
@@ -2506,9 +2721,10 @@ def register_core_routes(
         snapshot.side_chat_allowed = side_chat_ok
         if conv.project_id is not None and project_store is not None:
             project = await asyncio.to_thread(project_store.get, conv.project_id, user_id=user_id)
-            snapshot.project_orchestrator = (
-                project is not None and project.orchestrator_session_id == session_id
+            snapshot.project_main_session = (
+                project is not None and project.main_session_id == conv.id and not conv.archived
             )
+            snapshot.project_orchestrator = snapshot.project_main_session
         return snapshot
 
     @router.get(

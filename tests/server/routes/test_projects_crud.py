@@ -29,7 +29,7 @@ from fastapi import FastAPI
 
 from omnigent.runtime import user_session_stream
 from omnigent.runtime.agent_cache import AgentCache
-from omnigent.server.app import create_app
+from omnigent.server.app import _ensure_default_maestro_agent, create_app
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
@@ -56,6 +56,10 @@ def project_agents(db_uri: str, tmp_path: Path) -> SqlAlchemyAgentStore:
         bundle_key, build_agent_bundle("project-agent")
     )
     store.create(PROJECT_AGENT_ID, "project-agent", bundle_key)
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    _ensure_default_maestro_agent(
+        store, artifacts, AgentCache(artifact_store=artifacts, cache_dir=tmp_path / "seed-cache")
+    )
     return store
 
 
@@ -521,7 +525,7 @@ async def test_project_mutations_announce_projects_changed_to_owner(
         await _wait_for_events(alice_events, 4)
 
         assert alice_events == [
-            {"type": "session_added", "session_id": created.json()["orchestrator_session_id"]},
+            {"type": "session_added", "session_id": created.json()["main_session_id"]},
             *[{"type": "projects_changed"}] * 3,
         ]
         # Give any mis-keyed publish a chance to land before asserting silence.

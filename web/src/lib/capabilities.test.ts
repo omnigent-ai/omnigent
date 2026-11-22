@@ -588,6 +588,14 @@ describe("custom ticket stages capability", () => {
   });
 });
 
+describe("ticket response summary capability", () => {
+  it.each([undefined, false, "true", true])("requires explicit support: %s", async (supported) => {
+    expect((await probe({ project_ticket_summary: supported })).project_ticket_summary).toBe(
+      supported === true,
+    );
+  });
+});
+
 describe("picker curation", () => {
   it("reads the names and the default off the probe", async () => {
     const parsed = await probe({

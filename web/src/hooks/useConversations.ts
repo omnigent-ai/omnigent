@@ -2940,16 +2940,22 @@ export function useDeleteProject() {
 }
 
 /**
- * Create an empty first-class project (`POST /v1/projects`). This is the
- * capability the label model can't express — a project with no members. The
+ * Create a first-class project and its Main session (`POST /v1/projects`). The
  * server rejects a duplicate name (409); the error message is surfaced to the
  * caller for inline display.
  */
 export function useCreateProject() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: ({ name, config }: { name: string; config?: ProjectConfig }) =>
-      apiCreateProject(name, config),
+    mutationFn: ({
+      name,
+      config,
+      idempotencyKey,
+    }: {
+      name: string;
+      config?: ProjectConfig;
+      idempotencyKey?: string;
+    }) => apiCreateProject(name, config, idempotencyKey),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
     },

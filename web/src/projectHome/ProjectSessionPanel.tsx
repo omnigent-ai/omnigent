@@ -1,10 +1,13 @@
 import { ArrowLeftIcon, Maximize2Icon, XIcon } from "lucide-react";
 import { FullSessionChat } from "@/components/chat/FullSessionChat";
+import type { ChatPresentation } from "@/components/chat/assistantPresentation";
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useSession } from "@/hooks/useSession";
-import { Link } from "@/lib/routing";
+import { Link, useSearchParams } from "@/lib/routing";
+import { sessionAgentIdentity } from "@/lib/sessionAgentIdentity";
+import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
 import { ticketPanelSearch } from "./projectHomeNavigation";
 
 const HEADER_HEIGHT = "2.75rem";
@@ -14,13 +17,25 @@ export function ProjectSessionPanel({
   sessionId,
   onClose,
   ticket,
+  assistant,
 }: {
   sessionId: string;
   onClose: () => void;
   ticket?: { id: string; title: string };
+  assistant?: ChatPresentation["assistant"];
 }) {
   const { session } = useSession(sessionId);
+  const [search] = useSearchParams();
   const title = session?.title || "Session";
+  const agent = session ? sessionAgentIdentity(session) : null;
+  const identity =
+    assistant ??
+    (agent
+      ? {
+          name: agent.displayName,
+          icon: <ComposerAgentIcon agent={agent} />,
+        }
+      : undefined);
   const headerHeight = ticket ? "4.75rem" : HEADER_HEIGHT;
   return (
     <section
@@ -36,7 +51,7 @@ export function ProjectSessionPanel({
       >
         {ticket && (
           <Link
-            to={ticketPanelSearch(ticket.id)}
+            to={ticketPanelSearch(ticket.id, search)}
             aria-label="Back to ticket"
             title={ticket.title}
             className="mt-1 flex h-7 min-w-0 shrink-0 items-center gap-1.5 rounded-sm text-sm text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
@@ -81,6 +96,8 @@ export function ProjectSessionPanel({
           <FullSessionChat
             key={sessionId}
             sessionId={sessionId}
+            sessionComposer
+            presentation={identity ? { assistant: identity } : undefined}
             evenComposerPadding
             transcriptTopInset={headerHeight}
           />

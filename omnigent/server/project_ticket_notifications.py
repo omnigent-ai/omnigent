@@ -67,9 +67,9 @@ class ProjectTicketNotifications:
                     project = await asyncio.to_thread(
                         self.projects.get, event["project_id"], user_id=event["user_id"]
                     )
-                    if project is None or project.orchestrator_session_id is None:
+                    if project is None or project.main_session_id is None:
                         continue
-                    session_id = project.orchestrator_session_id
+                    session_id = project.main_session_id
                     conversation = await asyncio.to_thread(
                         self.inputs.conversations.get_conversation, session_id
                     )

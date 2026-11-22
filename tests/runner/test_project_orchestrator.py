@@ -14,7 +14,10 @@ from omnigent.spec.types import AgentSpec, ToolGroupsConfig
 
 @pytest.mark.parametrize("role", [True, False, None, "true"])
 @pytest.mark.parametrize("project_id", [None, "project"])
-async def test_project_guidance_and_designated_role_in_native_and_sdk_prompts(role, project_id):
+@pytest.mark.parametrize("role_field", ["project_main_session", "project_orchestrator"])
+async def test_project_guidance_and_designated_role_in_native_and_sdk_prompts(
+    role, project_id, role_field
+):
     spec = AgentSpec(
         spec_version=1,
         instructions="Shared agent instructions",
@@ -31,7 +34,7 @@ async def test_project_guidance_and_designated_role_in_native_and_sdk_prompts(ro
             "include_live_status": "false",
             "include_usage": "false",
         }
-        return httpx.Response(200, json={"project_orchestrator": role, "project_id": project_id})
+        return httpx.Response(200, json={role_field: role, "project_id": project_id})
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(respond), base_url="http://server.test"

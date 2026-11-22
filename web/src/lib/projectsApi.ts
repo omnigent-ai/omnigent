@@ -16,8 +16,7 @@ import { apiErrorFromResponse } from "./sessionsApi";
 /**
  * Default session settings a project stores, pre-filled into the new-chat
  * composer. All fields optional — an unset key means "no default for this
- * slot". The vocabulary is client-owned; the server persists the object whole
- * and never acts on it, so adding a key here needs no backend change.
+ * slot". Creation uses these choices for Main; later sessions prefill from them.
  */
 export interface ProjectConfig {
   /** Default host id, or the sandbox sentinel. */
@@ -33,6 +32,8 @@ export interface ProjectConfig {
   sandbox_provider?: string;
   /** Default agent id for new sessions. */
   agent_id?: string;
+  /** Per-session harness override for a configurable agent. */
+  harness?: string;
   /** Chosen emoji icon (a unicode grapheme, e.g. "🔥"). Unset → default folder. */
   icon?: string;
   /**
@@ -70,6 +71,9 @@ export interface ProjectConfig {
 export interface Project {
   id: string;
   name: string;
+  main_session_id?: string | null;
+  main_session_state?: "absent" | "missing" | "archived" | "active" | "unavailable";
+  /** @deprecated Read-only compatibility with servers before 0.25.0. */
   orchestrator_session_id?: string | null;
   /** Owner user id; `null` in single-user / OSS mode. */
   user_id?: string | null;
@@ -108,26 +112,24 @@ export async function getProject(id: string): Promise<Project> {
   return (await res.json()) as Project;
 }
 
-/** Initialize an older project's ordinary orchestrator session, or reuse it. */
-export async function initializeProjectOrchestrator(id: string): Promise<Project> {
-  const res = await authenticatedFetch(`/v1/projects/${encodeURIComponent(id)}/orchestrator`, {
-    method: "POST",
-  });
-  if (!res.ok) throw await apiErrorFromResponse(res);
-  return (await res.json()) as Project;
-}
-
 /**
  * Create a project, optionally with initial `config` defaults. Rejects with the
  * server's message on a duplicate name (409) so callers can surface it inline.
  */
-export async function createProject(name: string, config?: ProjectConfig): Promise<Project> {
+export async function createProject(
+  name: string,
+  config?: ProjectConfig,
+  idempotencyKey?: string,
+): Promise<Project> {
   const res = await authenticatedFetch("/v1/projects", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...(idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {}),
+    },
     body: JSON.stringify(config ? { name, config } : { name }),
   });
-  if (!res.ok) throw new Error(await readError(res));
+  if (!res.ok) throw await apiErrorFromResponse(res);
   return (await res.json()) as Project;
 }
 

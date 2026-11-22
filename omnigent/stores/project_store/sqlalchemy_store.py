@@ -89,7 +89,7 @@ def _to_entity(row: SqlProject) -> Project:
         created_at=row.created_at,
         updated_at=row.updated_at,
         config=_decode_config(row.config),
-        orchestrator_session_id=row.orchestrator_session_id,
+        main_session_id=row.main_session_id or row.legacy_orchestrator_session_id,
     )
 
 
@@ -287,6 +287,8 @@ class SqlAlchemyProjectStore(ProjectStore):
         user_id: str | None,
         name: str | None = None,
         config: dict[str, Any] | None = None,
+        main_session_id: str | None = None,
+        expected_main_session_id: str | None = None,
     ) -> Project | None:
         """Update mutable fields of an owned project.
 
@@ -303,10 +305,20 @@ class SqlAlchemyProjectStore(ProjectStore):
 
         def write(session: Session) -> Project | None:
             require_active_account(session, user_id)
-            row = session.get(SqlProject, (current_workspace_id(), project_id))
+            row = session.get(
+                SqlProject, (current_workspace_id(), project_id), with_for_update=True
+            )
             if row is None or row.user_id != user_id:
                 return None
             changed = False
+            current_main = row.main_session_id or row.legacy_orchestrator_session_id
+            if main_session_id is not None and current_main != main_session_id:
+                if current_main != expected_main_session_id:
+                    raise OmnigentError(
+                        "The project's main session changed; reload the project",
+                        code=ErrorCode.CONFLICT,
+                    )
+                row.main_session_id = main_session_id
             if name is not None and row.name != name:
                 if self._name_taken(session, user_id=user_id, name=name, exclude_id=project_id):
                     raise OmnigentError(
@@ -326,7 +338,9 @@ class SqlAlchemyProjectStore(ProjectStore):
 
         return run_write_transaction(self._session_immediate, "update_project", write)
 
-    def delete(self, project_id: str, *, user_id: str | None) -> bool:
+    def delete(
+        self, project_id: str, *, user_id: str | None, require_no_main: bool = False
+    ) -> bool:
         """Delete an owned project. Idempotent; returns ``False`` if not found."""
 
         def write(session: Session) -> bool:
@@ -339,6 +353,8 @@ class SqlAlchemyProjectStore(ProjectStore):
                 .with_for_update()
             )
             if row is None or row.user_id != user_id:
+                return False
+            if require_no_main and (row.main_session_id or row.legacy_orchestrator_session_id):
                 return False
             if (
                 session.scalar(
@@ -360,42 +376,23 @@ class SqlAlchemyProjectStore(ProjectStore):
 
         return run_write_transaction(self._session_immediate, "delete_project", write)
 
-    def set_orchestrator(
-        self, project_id: str, session_id: str, *, user_id: str | None
+    def set_main_session(
+        self,
+        project_id: str,
+        session_id: str,
+        *,
+        user_id: str | None,
+        expected_main_session_id: str | None = None,
     ) -> Project:
-        def write(session: Session) -> Project:
-            row = session.scalar(
-                select(SqlProject)
-                .where(
-                    SqlProject.workspace_id == current_workspace_id(),
-                    SqlProject.id == project_id,
-                )
-                .with_for_update()
-            )
-            if row is None or row.user_id != user_id:
-                raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
-            require_active_account(session, user_id)
-            if row.orchestrator_session_id is None:
-                row.orchestrator_session_id = session_id
-            return _to_entity(row)
-
-        return run_write_transaction(self._session_immediate, "set_project_orchestrator", write)
-
-    def clear_orchestrator(self, project_id: str, session_id: str, *, user_id: str | None) -> None:
-        def write(session: Session) -> None:
-            require_active_account(session, user_id)
-            session.execute(
-                update(SqlProject)
-                .where(
-                    SqlProject.workspace_id == current_workspace_id(),
-                    SqlProject.id == project_id,
-                    SqlProject.user_id == user_id,
-                    SqlProject.orchestrator_session_id == session_id,
-                )
-                .values(orchestrator_session_id=None)
-            )
-
-        run_write_transaction(self._session_immediate, "clear_project_orchestrator", write)
+        project = self.update(
+            project_id,
+            user_id=user_id,
+            main_session_id=session_id,
+            expected_main_session_id=expected_main_session_id,
+        )
+        if project is None:
+            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        return project
 
     def get_order(self, *, user_id: str | None) -> builtins.list[str] | None:
         """Return the active order used by project-list endpoints."""

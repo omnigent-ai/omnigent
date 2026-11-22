@@ -68,6 +68,9 @@ export interface ProjectTicket {
   labels: TicketLabel[];
   /** Latest linked-agent activity; absent or null means unknown. */
   has_running_agents?: boolean | null;
+  /** Authorized linked-agent identities, batched with the ticket page. */
+  agents?: { agent_name: string; harness: string | null }[];
+  agents_has_more?: boolean;
   latest_update: string;
   comment_count: number;
   created_at: number;
@@ -88,6 +91,10 @@ export interface TicketPage<T> {
   data: T[];
   has_more: boolean;
   last_id: string | null;
+}
+export interface TicketSummary {
+  needs_response_count: number;
+  is_complete: boolean;
 }
 export interface EventPage {
   data: TicketEvent[];
@@ -137,6 +144,10 @@ export function listTickets(
 }
 export function getTicket(projectId: string, ticketId: string) {
   return request<ProjectTicket>(path(projectId, ticketId)).then(normalizeTicket);
+}
+
+export function getTicketSummary(projectId: string) {
+  return request<TicketSummary>(`${path(projectId)}/summary`);
 }
 
 function normalizeTicket(ticket: ProjectTicket & { status?: string }): ProjectTicket {

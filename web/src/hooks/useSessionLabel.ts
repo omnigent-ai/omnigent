@@ -3,18 +3,21 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { type ChildSessionInfo, childSessionsQueryKey } from "@/hooks/useChildSessions";
 import { useOptionalLoadedConversations } from "@/hooks/useSidebarData";
 import { getSessionSlim } from "@/lib/sessionsApi";
+import { sessionAgentIdentity, type SessionAgentIdentity } from "@/lib/sessionAgentIdentity";
 import { childPrimaryLabel } from "@/shell/subagentLabel";
 
-/** A session's display title and kind, or ``null`` while unknown or unreadable. */
+/** A session's title, kind and known agent identity, or null while unreadable. */
 export interface SessionLabel {
   title: string;
   isSubagent: boolean;
+  agent: SessionAgentIdentity | null;
 }
 
 /**
  * Title of session ``sessionId`` for a pill. Reads the sidebar's loaded rows,
  * then the subagents of ``currentSessionId``, then the shared
  * ``["session", id]`` cache, and fetches that session only when all three miss.
+ * Agent metadata uses the same lookup; repeated senders share it.
  *
  * :param sessionId: Session to label, or ``null`` to skip.
  * :param currentSessionId: Session being viewed, whose subagents are checked.
@@ -45,9 +48,27 @@ export function useSessionLabel(
     retry: false,
     retryOnMount: false,
   });
-  if (row) return { title: row.title || "Untitled session", isSubagent: !!row.parent_session_id };
-  if (child) return { title: childPrimaryLabel(child), isSubagent: true };
   const session = snapshot.data;
+  if (row)
+    return {
+      title: row.title || "Untitled session",
+      isSubagent: !!row.parent_session_id,
+      agent: sessionAgentIdentity({
+        agentName: row.agent_name ?? session?.agentName,
+        harness: row.harness ?? session?.harness,
+        labels: row.labels,
+      }),
+    };
+  if (child)
+    return {
+      title: childPrimaryLabel(child),
+      isSubagent: true,
+      agent: sessionAgentIdentity({ ...session, labels: child.labels }),
+    };
   if (!session) return null;
-  return { title: session.title || "Untitled session", isSubagent: !!session.parentSessionId };
+  return {
+    title: session.title || "Untitled session",
+    isSubagent: !!session.parentSessionId,
+    agent: sessionAgentIdentity(session),
+  };
 }

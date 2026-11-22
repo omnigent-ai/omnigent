@@ -15,18 +15,24 @@ projects share that scope.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import uuid
 from typing import Any
 
 from fastapi import APIRouter, Query, Request
+from sqlalchemy.exc import IntegrityError
 
 from omnigent.entities import Project
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import AuthProvider
-from omnigent.server.project_orchestrator import (
+from omnigent.server.project_main_session import (
     ProjectSessionCreator,
-    ProjectSessionDeleter,
-    ensure_project_orchestrator,
+    create_initial_main_session,
+    creation_id,
+    creation_key,
+    expected_main_id,
+    main_session_state,
+    validate_main_assignment,
 )
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes.sessions import announce_projects_changed
@@ -59,7 +65,9 @@ def _to_response(project: Project) -> dict[str, Any]:
         "created_at": project.created_at,
         "updated_at": project.updated_at,
         "config": project.config,
-        "orchestrator_session_id": project.orchestrator_session_id,
+        "main_session_id": project.main_session_id,
+        # Deprecated response alias; remove in 0.25.0.
+        "orchestrator_session_id": project.main_session_id,
     }
 
 
@@ -70,7 +78,6 @@ def create_projects_router(
     permission_store: PermissionStore | None = None,
     agent_store: AgentStore | None = None,
     create_session: ProjectSessionCreator | None = None,
-    delete_session: ProjectSessionDeleter | None = None,
 ) -> APIRouter:
     """Build the projects router (``/v1/projects``).
 
@@ -83,18 +90,13 @@ def create_projects_router(
     """
     router = APIRouter()
 
-    async def _orchestrator(request: Request, project: Project) -> Project:
-        if conversation_store is None:
-            return project
-        return await ensure_project_orchestrator(
-            request,
-            project,
-            projects=project_store,
-            conversations=conversation_store,
-            agents=agent_store,
-            create_session=create_session,
-            delete_session=delete_session,
-        )
+    async def response(project: Project) -> dict[str, Any]:
+        return {
+            **_to_response(project),
+            "main_session_state": await main_session_state(
+                project, conversation_store, permission_store
+            ),
+        }
 
     async def _require_private_source(request: Request, user_id: str | None) -> None:
         """Refuse an agent-tool write whose calling session is shared with edit access."""
@@ -112,7 +114,7 @@ def create_projects_router(
         request: Request,
         body: CreateProjectRequest,
     ) -> dict[str, Any]:
-        """Create a project and its ordinary orchestrator session for the caller.
+        """Create a project and its ordinary main session for the caller.
 
         :param request: The incoming request, used to identify the user.
         :param body: Project payload (name).
@@ -122,35 +124,45 @@ def create_projects_router(
         """
         user_id = require_user(request, auth_provider)
         await _require_private_source(request, user_id)
-        project = await asyncio.to_thread(
-            project_store.create,
-            uuid.uuid4().hex,
-            body.name,
-            user_id,
-            body.config,
-        )
+        key = creation_key(request) if "Idempotency-Key" in request.headers else None
+        project_id = creation_id("project", user_id, key) if key else uuid.uuid4().hex
+        project = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
+        created_here = False
+        if project is None:
+            try:
+                project = await asyncio.to_thread(
+                    project_store.create, project_id, body.name, user_id, body.config
+                )
+                created_here = True
+            except (IntegrityError, OmnigentError) as exc:
+                if isinstance(exc, OmnigentError) and exc.code != ErrorCode.ALREADY_EXISTS:
+                    raise
+                # A concurrent retry may have inserted this exact operation's row.
+                project = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
+                if project is None:
+                    raise
         try:
-            project = await _orchestrator(request, project)
-        except Exception:
-            # A refused launch must not leave an unusable project name behind.
-            await asyncio.to_thread(project_store.delete, project.id, user_id=user_id)
+            project = await create_initial_main_session(
+                request,
+                project,
+                projects=project_store,
+                agents=agent_store,
+                create_session=create_session,
+            )
+        except Exception as exc:
+            if created_here and not (
+                isinstance(exc, OmnigentError) and exc.code == ErrorCode.CONFLICT
+            ):
+                # Roll back validation failures, never a bound chat or a concurrent winner.
+                with contextlib.suppress(OmnigentError):
+                    await asyncio.to_thread(
+                        project_store.delete, project.id, user_id=user_id, require_no_main=True
+                    )
             raise
         # Push the change to the owner's other connected clients so their
         # sidebars pick up the new folder without a reload.
         announce_projects_changed(user_id)
-        return _to_response(project)
-
-    @router.post("/projects/{project_id}/orchestrator")
-    async def initialize_orchestrator(request: Request, project_id: str) -> dict[str, Any]:
-        """Initialize an existing project's ordinary session; repeated calls reuse it."""
-        user_id = require_user(request, auth_provider)
-        await _require_private_source(request, user_id)
-        project = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
-        if project is None:
-            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
-        project = await _orchestrator(request, project)
-        announce_projects_changed(user_id)
-        return _to_response(project)
+        return await response(project)
 
     @router.get("/projects")
     async def list_projects(
@@ -185,7 +197,7 @@ def create_projects_router(
                 raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
             return {
                 "object": "list",
-                "data": [_to_response(p) for p in page],
+                "data": [await response(p) for p in page],
                 "first_id": page[0].id if page else None,
                 "last_id": page[-1].id if page else None,
                 "has_more": has_more,
@@ -200,7 +212,7 @@ def create_projects_router(
             )
 
         projects = await asyncio.to_thread(read_projects)
-        return {"object": "list", "data": [_to_response(p) for p in projects]}
+        return {"object": "list", "data": [await response(p) for p in projects]}
 
     @router.get(
         "/projects/order", response_model=None, responses={200: {"model": ProjectOrderResponse}}
@@ -238,7 +250,7 @@ def create_projects_router(
         project = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
         if project is None:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
-        return _to_response(project)
+        return await response(project)
 
     @router.patch("/projects/{project_id}")
     async def update_project(
@@ -258,12 +270,22 @@ def create_projects_router(
         """
         user_id = require_user(request, auth_provider)
         await _require_private_source(request, user_id)
+        session_id = None
+        if body.main_session_id is not None:
+            current = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
+            if current is None or conversation_store is None:
+                raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+            session_id = await validate_main_assignment(
+                current, body.main_session_id, conversation_store, permission_store
+            )
         project = await asyncio.to_thread(
             project_store.update,
             project_id,
             user_id=user_id,
             name=body.name,
             config=body.config,
+            main_session_id=session_id,
+            expected_main_session_id=expected_main_id(body.expected_main_session_id),
         )
         if project is None:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
@@ -271,7 +293,7 @@ def create_projects_router(
         # (another tab, the mobile app) if it is pushed; nothing else refreshes
         # their projects cache until a full reload.
         announce_projects_changed(user_id)
-        return _to_response(project)
+        return await response(project)
 
     @router.delete("/projects/{project_id}")
     async def delete_project(request: Request, project_id: str) -> dict[str, Any]:

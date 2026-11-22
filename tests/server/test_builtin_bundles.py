@@ -38,6 +38,7 @@ _NATIVE_BUILDERS = [(agent.key, f"{agent.agent_name}.yaml") for agent in _NATIVE
 _EXAMPLE_BUILDERS = [
     ("_build_debby_bundle", "config.yaml", True),
     ("_build_polly_bundle", "config.yaml", True),
+    ("_build_maestro_bundle", "config.yaml", False),
 ]
 
 

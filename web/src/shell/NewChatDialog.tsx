@@ -231,6 +231,10 @@ import {
 import { getCliServerUrl, getOmnigentHostConfig, getOmnigentServerIdentity } from "@/lib/host";
 import { quoteShellArgument } from "@/lib/shell";
 import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
+import { reuseCreationAttempt, type CreationAttempt } from "@/lib/creationAttempt";
+import type { ProjectTicket } from "@/lib/projectTicketsApi";
+import { ProjectAgentIdentity } from "@/projectHome/ProjectAgentIdentity";
+import { useLaunchModelOptions } from "@/hooks/useLaunchModelOptions";
 import {
   onProjectLaunchDefaultsCleared,
   readProjectLaunchDefaults,
@@ -429,7 +433,11 @@ import { CreateAgentDialog } from "./CreateAgentDialog";
 import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
 import { installAgentBundle } from "@/lib/agentsApi";
 import { createBundledSession, getSessionSlim, launchRunner } from "@/lib/sessionsApi";
-import { promoteSessionDraft, recoverFailedSessionDraft } from "@/lib/sessionDrafts";
+import {
+  promoteSessionDraft,
+  recoverFailedSessionDraft,
+  type SessionDraft,
+} from "@/lib/sessionDrafts";
 import {
   NEW_SESSION_HANDOFF_PARAM,
   forgetNewSessionHandoff,
@@ -547,7 +555,7 @@ export function resolveThisMachineHostId(
   return serverIsLocal && onlineHostIds.length === 1 ? onlineHostIds[0] : null;
 }
 
-function HostOption({
+export function HostOption({
   host,
   displayName = host.name,
   subtitle,
@@ -2169,6 +2177,11 @@ const LANDING_IMPORT_DISMISSED_STORAGE_KEY = "omnigent:landing-import-dismissed"
 interface LandingDraftState {
   draft: LandingDraft | null;
   revision: number;
+  mainCreation?: CreationAttempt & {
+    provisional: ReturnType<typeof newTempConversation>;
+    managedHostId?: string;
+    bundle?: File;
+  };
 }
 const landingDrafts = new Map<string | null, LandingDraftState>();
 
@@ -2318,10 +2331,21 @@ function NewChatWorkspaceControls({
 export function NewChatLandingScreen({
   projectName,
   onSessionStarted,
-}: { projectName?: string; onSessionStarted?: () => void } = {}) {
+  onMainSessionConflict,
+  projectMainSession,
+  ticketContext,
+}: {
+  projectName?: string;
+  onSessionStarted?: () => void | Promise<unknown>;
+  onMainSessionConflict?: (
+    draft: Pick<SessionDraft, "text" | "files" | "mentions">,
+  ) => Promise<boolean>;
+  projectMainSession?: { projectId: string; expectedMainSessionId: string | null };
+  ticketContext?: Pick<ProjectTicket, "id" | "project_id" | "title">;
+} = {}) {
   const [params] = useSearchParams();
   const navigate = useNavigate();
-  const siblingSourceId = params.get("sibling");
+  const siblingSourceId = projectMainSession ? null : params.get("sibling");
   const info = useServerInfo();
   const supportsNested = info !== "loading" && info.sibling_sessions === true;
   const source = useQuery({
@@ -2358,11 +2382,18 @@ export function NewChatLandingScreen({
     );
   return (
     <NewChatLandingContent
-      key={siblingSourceId ?? "standalone"}
+      key={
+        projectMainSession
+          ? `main:${projectMainSession.projectId}`
+          : (siblingSourceId ?? "standalone")
+      }
       siblingSourceId={siblingSourceId}
       siblingSource={source.data}
       projectHomeName={projectName}
       onSessionStarted={onSessionStarted}
+      onMainSessionConflict={onMainSessionConflict}
+      projectMainSession={projectMainSession}
+      ticketContext={ticketContext}
     />
   );
 }
@@ -2372,15 +2403,26 @@ function NewChatLandingContent({
   siblingSource,
   projectHomeName,
   onSessionStarted,
+  onMainSessionConflict,
+  projectMainSession,
+  ticketContext,
 }: {
   siblingSourceId: string | null;
   siblingSource?: Awaited<ReturnType<typeof getSessionSlim>>;
   projectHomeName?: string;
-  onSessionStarted?: () => void;
+  onSessionStarted?: () => void | Promise<unknown>;
+  onMainSessionConflict?: (
+    draft: Pick<SessionDraft, "text" | "files" | "mentions">,
+  ) => Promise<boolean>;
+  projectMainSession?: { projectId: string; expectedMainSessionId: string | null };
+  ticketContext?: Pick<ProjectTicket, "id" | "project_id" | "title">;
 }) {
   const [draftState] = useState(() => {
-    const state = landingDrafts.get(siblingSourceId) ?? { draft: null, revision: 0 };
-    landingDrafts.set(siblingSourceId, state);
+    const key = projectMainSession
+      ? `main:${getOmnigentServerIdentity()}:${getCurrentUserId()}:${projectMainSession.projectId}`
+      : siblingSourceId;
+    const state = landingDrafts.get(key) ?? { draft: null, revision: 0 };
+    landingDrafts.set(key, state);
     return state;
   });
   const landingDraft = draftState.draft;
@@ -2439,10 +2481,11 @@ function NewChatLandingContent({
   const { data: projectList, isLoading: projectListLoading } = useProjects();
   const configProjectId = useMemo(
     () =>
-      projectParam !== ""
+      projectMainSession?.projectId ??
+      (projectParam !== ""
         ? ((projectList ?? []).find((p) => p.name === projectParam)?.id ?? null)
-        : null,
-    [projectList, projectParam],
+        : null),
+    [projectList, projectParam, projectMainSession?.projectId],
   );
   const { data: storedProjectConfig, isLoading: projectConfigLoading } =
     useProjectConfig(configProjectId);
@@ -2496,7 +2539,11 @@ function NewChatLandingContent({
           repository: projectRepository(c.repository),
         }
       : {};
-    return withProjectLaunchDefaults(stored, projectLaunch);
+    const resolved = withProjectLaunchDefaults(stored, projectLaunch);
+    // Main always starts with a changeable Maestro pick, not the general last agent.
+    return projectMainSession
+      ? { ...resolved, agentId: undefined, launchAgentId: undefined }
+      : resolved;
   }, [
     projectParam,
     projectListLoading,
@@ -2504,6 +2551,7 @@ function NewChatLandingContent({
     projectConfigLoading,
     storedProjectConfig,
     projectLaunch,
+    projectMainSession,
   ]);
 
   // Preserve a configured agent through name deduplication when it is in the
@@ -2568,6 +2616,9 @@ function NewChatLandingContent({
       ),
     [agents, agentsLoading, cachedPickerOptions, curation.restrictToAgentNames],
   );
+  const mainDefaultAgent = projectMainSession
+    ? agentList.find((agent) => agent.name === "maestro")
+    : undefined;
 
   // Split the picker into "Harnesses" (harness-backed picks — the native
   // terminal CLIs plus generic-ACP harness agents like Grok / Devin / Kilocode)
@@ -2603,28 +2654,31 @@ function NewChatLandingContent({
   // visit (or a plain one) must not beat THIS visit's project defaults —
   // strip them so the prefill machine (fill-empty-only) can seed. Read once
   // per mount; only the lazy state initializers below consume it.
-  const restoredDraft: LandingDraft | null =
-    landingDraft === null || landingDraft.project === projectParam
-      ? landingDraft
-      : {
-          ...landingDraft,
-          pickedAgentId: null,
-          pickedHarness: null,
-          selectedHostId: null,
-          sandboxSelected: false,
-          sandboxProvider: null,
-          sandboxProfile: null,
-          // The repo inputs compose the managed create's workspace string, so
-          // they are location state too — keeping them would clone another
-          // project's repository into this project's sandbox.
-          sandboxRepoSelections: [],
-          workspace: "",
-          branchName: "",
-          // The branch may be the worktree-default's auto-seed, generated for
-          // the other visit's workspace — drop the marker with it so the
-          // seed/retract machinery starts clean for this visit.
-          autoSeededBranch: "",
-        };
+  const restoredDraft = useMemo<LandingDraft | null>(
+    () =>
+      landingDraft === null || landingDraft.project === projectParam
+        ? landingDraft
+        : {
+            ...landingDraft,
+            pickedAgentId: null,
+            pickedHarness: null,
+            selectedHostId: null,
+            sandboxSelected: false,
+            sandboxProvider: null,
+            sandboxProfile: null,
+            // The repo inputs compose the managed create's workspace string, so
+            // they are location state too — keeping them would clone another
+            // project's repository into this project's sandbox.
+            sandboxRepoSelections: [],
+            workspace: "",
+            branchName: "",
+            // The branch may be the worktree-default's auto-seed, generated for
+            // the other visit's workspace — drop the marker with it so the
+            // seed/retract machinery starts clean for this visit.
+            autoSeededBranch: "",
+          },
+    [landingDraft, projectParam],
+  );
 
   // Restore from storage only without a parked draft. A parked draft with the
   // same text takes over cleanup of the kept copy; a different one (e.g. a
@@ -2656,6 +2710,17 @@ function NewChatLandingContent({
     if (restoresKeptLinkedPrompt) return keptLinkedPrompt?.text ?? "";
     return restoredDraft?.message ?? "";
   });
+  const addedTicket = useRef<string | null>(null);
+  useEffect(() => {
+    if (!ticketContext || addedTicket.current === ticketContext.id) return;
+    addedTicket.current = ticketContext.id;
+    const reference = `Ticket ID: ${ticketContext.id}\n> Project ID: ${ticketContext.project_id}`;
+    setMessage((current) =>
+      current.includes(reference)
+        ? current
+        : `${current}${current ? "\n\n" : ""}> ${ticketContext.title}\n> ${reference}\n\n`,
+    );
+  }, [ticketContext]);
   // Filled in once the mention browser below owns the tags.
   const clearTaggedMentionsRef = useRef<() => void>(() => {});
   useEffect(() => {
@@ -3572,9 +3637,11 @@ function NewChatLandingContent({
               agentList.some((agent) => agent.id === cachedPickerOptions?.agent.id)
             ? cachedPickerOptions!.agent.id
             : // No remembered pick: use the configured default, else the first agent.
-              (agentList.find((agent) => agent.name === curation.defaultAgentName)?.id ??
-              agentList[0]?.id ??
-              null);
+              projectMainSession
+              ? (mainDefaultAgent?.id ?? null)
+              : (agentList.find((agent) => agent.name === curation.defaultAgentName)?.id ??
+                agentList[0]?.id ??
+                null);
   const effectiveAgentId = automaticHarnessFallback?.candidate?.value.id ?? defaultEffectiveAgentId;
   // The remembered agent is not one this deployment offers, so the configured
   // default runs in its place. Drives the harness re-seed below: an override
@@ -3603,6 +3670,24 @@ function NewChatLandingContent({
   // The selected native harness persists and restores harness-specific model,
   // effort, and permission knobs.
   const selectedNativeHarness = nativeCodingAgentForAvailableAgent(selectedAgent)?.harness ?? null;
+  const mainSdkHarness =
+    projectMainSession &&
+    !sandboxSelected &&
+    !isAutoHarness(pickedHarness) &&
+    selectedNativeHarness === null &&
+    selectedAgent?.harness &&
+    selectedAgent.harness in brainHarnessLabelsAll
+      ? (pickedHarness ?? selectedAgent.harness)
+      : null;
+  const mainSdkModels = useLaunchModelOptions({
+    host: selectedHost,
+    sandbox: false,
+    provider: null,
+    harness: mainSdkHarness,
+    agentId: effectiveAgentId,
+    model: pickedModel,
+    enabled: mainSdkHarness !== null,
+  });
   // Probe only the selected, available harness. Older hosts without readiness
   // metadata remain eligible, matching the picker's setup warnings. A CLI that
   // missed its version check still launches, so its catalog stays loadable.
@@ -3918,6 +4003,19 @@ function NewChatLandingContent({
       selectedAgent?.harness != null &&
       selectedAgent.harness in brainHarnessLabelsAll);
   const configSummary = useMemo((): { label: string; value: string }[] => {
+    if (mainSdkHarness !== null) {
+      const model = mainSdkModels.models.find((option) => option.id === pickedModel);
+      return [
+        { label: "SDK", value: brainHarnessLabelsAll[mainSdkHarness] ?? mainSdkHarness },
+        {
+          label: "Model",
+          value: model
+            ? nativeModelLabel(model)
+            : pickedModel || defaultModelLabel(mainSdkModels.models),
+        },
+        ...(pickedEffort ? [{ label: "Effort", value: normalizeEffortLabel(pickedEffort) }] : []),
+      ];
+    }
     const sourceRows = (options: readonly NativeModelOption[]) => {
       if (routingOn) return [];
       if (sandboxHasModelCatalog && sandboxModels.data?.provider_label) {
@@ -4046,6 +4144,8 @@ function NewChatLandingContent({
     }
     return routingRow;
   }, [
+    mainSdkHarness,
+    mainSdkModels.models,
     sandboxHasModelCatalog,
     sandboxCatalog,
     sandboxModels.data?.provider_label,
@@ -4083,18 +4183,22 @@ function NewChatLandingContent({
   const permissionConfigRow = configSummary.find(
     (row) => row.label === "Permission mode" || row.label === "Mode",
   );
-  const pickerModelOptions: readonly NativeModelOption[] = sandboxHasModelCatalog
-    ? (sandboxCatalog ?? [])
-    : supportsPermissionMode
-      ? claudeModelOptions
-      : selectedNativeHarness === "devin-native"
-        ? devinModelOptions
-        : selectedNativeHarness === "pi-native"
-          ? piModelOptions
-          : selectedNativeHarness === "codex-native"
-            ? codexModelOptions
-            : [];
+  const pickerModelOptions: readonly NativeModelOption[] =
+    mainSdkHarness !== null
+      ? mainSdkModels.models
+      : sandboxHasModelCatalog
+        ? (sandboxCatalog ?? [])
+        : supportsPermissionMode
+          ? claudeModelOptions
+          : selectedNativeHarness === "devin-native"
+            ? devinModelOptions
+            : selectedNativeHarness === "pi-native"
+              ? piModelOptions
+              : selectedNativeHarness === "codex-native"
+                ? codexModelOptions
+                : [];
   const pickerModelsLoading =
+    mainSdkModels.loading ||
     sandboxCatalogPending ||
     (!sandboxSelected &&
       selectedHostId !== null &&
@@ -4107,20 +4211,25 @@ function NewChatLandingContent({
             : selectedNativeHarness === "devin-native"
               ? hostDevinModelsLoading
               : false));
-  const pickerModelsError = sandboxSelected
-    ? sandboxCatalogError || sandboxDefaultCatalogError
-      ? new Error((sandboxCatalogError ?? sandboxDefaultCatalogError)!)
-      : null
-    : selectedNativeHarness === "claude-native"
-      ? hostClaudeModelsError
-      : selectedNativeHarness === "codex-native"
-        ? hostCodexModelsError
-        : selectedNativeHarness === "devin-native"
-          ? hostDevinModelsError
-          : null;
+  const pickerModelsError =
+    mainSdkHarness !== null
+      ? mainSdkModels.error
+      : sandboxSelected
+        ? sandboxCatalogError || sandboxDefaultCatalogError
+          ? new Error((sandboxCatalogError ?? sandboxDefaultCatalogError)!)
+          : null
+        : selectedNativeHarness === "claude-native"
+          ? hostClaudeModelsError
+          : selectedNativeHarness === "codex-native"
+            ? hostCodexModelsError
+            : selectedNativeHarness === "devin-native"
+              ? hostDevinModelsError
+              : null;
   const modelCatalogLookupEnabled = sandboxSelected
     ? sandboxPreviewEnabled && sandboxInferenceConfigured
-    : selectedNativeHarness !== null && canLoadHostModels(selectedNativeHarness);
+    : mainSdkHarness !== null
+      ? selectedHost?.status === "online"
+      : selectedNativeHarness !== null && canLoadHostModels(selectedNativeHarness);
   const modelCatalogAvailability: ModelCatalogAvailability | undefined =
     harnessTriggerDetails.some((row) => row.label === "Model") && !routingOn
       ? pickerModelOptions.length > 0
@@ -4237,12 +4346,15 @@ function NewChatLandingContent({
   }, [pickerCacheKey, pickerLoading, permissionPreview]);
   const visiblePermissionRow =
     pickerLoading && !interactiveWhileLoading ? cachedPermission?.row : permissionConfigRow;
-  const pickerEffortOptions = sandboxDefaultModelsEnabled
-    ? sandboxEffortLevels(pickerModelOptions, pickedModel).map((value) => ({
-        value,
-        label: normalizeEffortLabel(value),
-      }))
-    : (nativeEffortOptions(selectedNativeHarness, pickerModelOptions, pickedModel) ?? []);
+  const pickerEffortOptions =
+    mainSdkHarness !== null
+      ? mainSdkModels.efforts
+      : sandboxDefaultModelsEnabled
+        ? sandboxEffortLevels(pickerModelOptions, pickedModel).map((value) => ({
+            value,
+            label: normalizeEffortLabel(value),
+          }))
+        : (nativeEffortOptions(selectedNativeHarness, pickerModelOptions, pickedModel) ?? []);
   const rememberPickerOptions = (harness: string, options: HarnessOptions) => {
     const picked = pickedOptionKeysRef.current.get(harness) ?? new Set<string>();
     for (const key of Object.keys(options)) picked.add(key);
@@ -4263,7 +4375,7 @@ function NewChatLandingContent({
   };
   const selectPickerModel = (model: string) => {
     const selectionHarness =
-      selectedNativeHarness ?? (sandboxHasModelCatalog ? previewHarness : null);
+      mainSdkHarness ?? selectedNativeHarness ?? (sandboxHasModelCatalog ? previewHarness : null);
     if (!selectionHarness) return;
     // Every model-picker commit also settles the effort (routing and Fusion clear it).
     userPickedModelRef.current = true;
@@ -4290,6 +4402,17 @@ function NewChatLandingContent({
       return;
     }
     const picked = model === MODEL_SELECT_DEFAULT ? "" : model;
+    if (mainSdkHarness !== null) {
+      const effort = mainSdkModels
+        .effortsForModel(picked)
+        .some((option) => option.value === pickedEffort)
+        ? pickedEffort
+        : "";
+      setPickedModel(picked);
+      setPickedEffort(effort);
+      rememberPickerOptions(mainSdkHarness, { model: picked, effort });
+      return;
+    }
     // Gateway catalogs carry no default row, so Default keeps no effort.
     const effortModel = sandboxDefaultModelsEnabled
       ? picked
@@ -4310,7 +4433,7 @@ function NewChatLandingContent({
   };
   const selectPickerEffort = (effort: string) => {
     const selectionHarness =
-      selectedNativeHarness ?? (sandboxHasModelCatalog ? previewHarness : null);
+      mainSdkHarness ?? selectedNativeHarness ?? (sandboxHasModelCatalog ? previewHarness : null);
     if (!selectionHarness) return;
     const picked = effort === EFFORT_SELECT_NONE ? "" : effort;
     userPickedEffortRef.current = true;
@@ -4368,6 +4491,7 @@ function NewChatLandingContent({
   // "Models unavailable" and offers no harness Default row.
   const sandboxOffersHarnessDefault = sandboxUsesHarnessDefault && !routingOn;
   const modelSection: ComposerConfigSection | undefined =
+    mainSdkHarness !== null ||
     sandboxHasModelCatalog ||
     supportsModelPicker ||
     supportsPermissionMode ||
@@ -4402,7 +4526,8 @@ function NewChatLandingContent({
           ),
           choices: [
             // Default can't launch once the provider rules the harness out.
-            ...((sandboxDefaultModelsEnabled && !sandboxSelectedUnsupported) ||
+            ...(mainSdkHarness !== null ||
+            (sandboxDefaultModelsEnabled && !sandboxSelectedUnsupported) ||
             (!sandboxInferenceConfigured &&
               (pickerModelOptions.length > 0 || sandboxOffersHarnessDefault) &&
               !pickerModelOptions.some((option) => option.isDefault))
@@ -4649,6 +4774,44 @@ function NewChatLandingContent({
   const userPickedModelRef = useRef(false);
   // Same guard for an explicit effort pick against the project's default effort.
   const userPickedEffortRef = useRef(false);
+  const mainSdkSeed = useRef<string | null>(null);
+  useEffect(() => {
+    if (!mainSdkHarness) {
+      mainSdkSeed.current = null;
+      return;
+    }
+    if (projectConfigLoading) return;
+    const key = `${effectiveAgentId}:${mainSdkHarness}`;
+    if (mainSdkSeed.current === key) return;
+    const restore =
+      mainSdkSeed.current === null &&
+      restoredDraft?.pickedAgentId === effectiveAgentId &&
+      restoredDraft.pickedHarness === pickedHarness;
+    mainSdkSeed.current = key;
+    const saved = readRememberedHarnessOptions(mainSdkHarness);
+    const projectMatches =
+      storedProjectConfig?.harness === mainSdkHarness &&
+      (!storedProjectConfig.agent_id || storedProjectConfig.agent_id === effectiveAgentId);
+    setPickedModel(
+      restore
+        ? restoredDraft.pickedModel
+        : ((projectMatches ? storedProjectConfig.model : undefined) ?? saved.model ?? ""),
+    );
+    setPickedEffort(
+      restore
+        ? restoredDraft.pickedEffort
+        : ((projectMatches ? storedProjectConfig.effort : undefined) ?? saved.effort ?? ""),
+    );
+  }, [
+    mainSdkHarness,
+    effectiveAgentId,
+    pickedHarness,
+    projectConfigLoading,
+    storedProjectConfig,
+    readRememberedHarnessOptions,
+    setPickedModel,
+    restoredDraft,
+  ]);
   useEffect(() => {
     const prev = prevAgentIdRef.current;
     prevAgentIdRef.current = effectiveAgentId;
@@ -5246,7 +5409,7 @@ function NewChatLandingContent({
       sandboxSelected,
       managedSandboxesEnabled,
       selectedHostId,
-      lastAgentId: readLastAgentId(),
+      lastAgentId: projectMainSession ? (mainDefaultAgent?.id ?? null) : readLastAgentId(),
       config: prefillConfig,
     });
     if (step === null) return;
@@ -5273,7 +5436,7 @@ function NewChatLandingContent({
         setPickedHarness(
           writes.agentId === projectLaunch?.agentId && projectLaunch.pickedHarness !== undefined
             ? projectLaunch.pickedHarness
-            : readLastHarness(writes.agentId),
+            : (storedProjectConfig?.harness ?? readLastHarness(writes.agentId)),
         );
         // Config-sourced seed into an empty slot (as opposed to the last-agent
         // fallback): the create omits the field until any other write flips this.
@@ -5305,6 +5468,9 @@ function NewChatLandingContent({
     projectLaunch,
     defaultSandboxProvider,
     sandboxProviderRows,
+    projectMainSession,
+    mainDefaultAgent?.id,
+    storedProjectConfig?.harness,
   ]);
 
   // Nested agents reuse their source checkout unless a new worktree is explicitly chosen.
@@ -5918,7 +6084,7 @@ function NewChatLandingContent({
     setPickerEdits(null);
     agentFromConfigRef.current = false;
     setPickedAgentId(placeholder.id);
-    writeLastAgentId(placeholder.id);
+    if (!projectMainSession) writeLastAgentId(placeholder.id);
     setPickedHarness(AUTO_NATIVE_HARNESS_ID);
     writeLastHarness(placeholder.id, AUTO_NATIVE_HARNESS_ID);
     _setCostControlMode("on");
@@ -5946,7 +6112,7 @@ function NewChatLandingContent({
     // own choice: send it with the create rather than default-filling.
     agentFromConfigRef.current = false;
     setPickedAgentId(agent.id);
-    writeLastAgentId(agent.id);
+    if (!projectMainSession) writeLastAgentId(agent.id);
     if (pickerEdits?.agentId !== agent.id) {
       setPickerEdits(
         pickerLoading
@@ -6132,6 +6298,7 @@ function NewChatLandingContent({
         ? { ...draftRef.current, message: "", files: [] }
         : draftRef.current;
     const returnedDraft = recoverFailedSessionDraft(originalDraft, temporaryConversationId);
+    draftRef.current = returnedDraft;
     if (onScreenRef.current) {
       setMessage(returnedDraft.message);
       // The draft's files were validated when the user attached them, so
@@ -6144,6 +6311,24 @@ function NewChatLandingContent({
       }
     } else {
       writeLandingDraft(draftState, returnedDraft);
+    }
+    return returnedDraft;
+  }
+
+  async function recoverMainConflict(draft: LandingDraft) {
+    if (!onMainSessionConflict) {
+      await onSessionStarted?.();
+      return;
+    }
+    const recovered = await onMainSessionConflict({
+      text: draft.message,
+      files: draft.files,
+      mentions: draft.mentions,
+    });
+    if (recovered) {
+      submittedRef.current = true;
+      writeLandingDraft(draftState, null);
+      draftState.mainCreation = undefined;
     }
   }
 
@@ -6317,6 +6502,7 @@ function NewChatLandingContent({
         // the New-Chat selection never reaches `_auto_create_devin_terminal`
         // and Devin launches on its own config default.
         (sandboxHasModelCatalog ||
+          mainSdkHarness !== null ||
           agentSupportsModelPicker ||
           nativeAgent?.harness === "codex-native" ||
           nativeAgent?.harness === "devin-native") &&
@@ -6327,6 +6513,7 @@ function NewChatLandingContent({
         !smartRoutingHarnessSelected &&
         !routingOwnsModel &&
         (sandboxDefaultModelsEnabled ||
+          mainSdkHarness !== null ||
           agentSupportsPermissionMode ||
           selectedNativeHarness === "pi-native" ||
           nativeAgent?.harness === "codex-native" ||
@@ -6385,6 +6572,7 @@ function NewChatLandingContent({
       // (the server treats it as authoritative and only warns on mismatch).
       // The value-equality guard checks the server's config, so it also sends last-start seeds.
       const agentFromProjectConfig =
+        !projectMainSession &&
         createProjectId !== null &&
         agentFromConfigRef.current &&
         storedProjectConfig?.agent_id != null &&
@@ -6428,6 +6616,36 @@ function NewChatLandingContent({
               type: "message",
               data: { role: "user", content: [{ type: "input_text", text: initialPrompt }] },
             };
+      let mainAttempt = projectMainSession ? draftState.mainCreation : undefined;
+      if (projectMainSession) {
+        const attempt = reuseCreationAttempt(
+          mainAttempt,
+          {
+            projectMainSession,
+            draft: draftRef.current,
+            effectiveAgentId,
+            normalizedModelOverride,
+            normalizedReasoningEffort,
+            costControlOverride,
+            baseBranch,
+            pendingAgent,
+            initialPrompt,
+          },
+          files,
+        );
+        if (attempt !== mainAttempt) {
+          mainAttempt = { ...attempt, provisional: newTempConversation() };
+          draftState.mainCreation = mainAttempt;
+        }
+      }
+      const mainMetadata = projectMainSession
+        ? {
+            project_id: projectMainSession.projectId,
+            project_main_session: true,
+            expected_main_session_id: projectMainSession.expectedMainSessionId,
+            title: "Main",
+          }
+        : {};
       let data: { id: string };
       // The agent the create ran; a custom agent's id comes back from its create.
       let launchedAgentId = effectiveAgentId;
@@ -6435,7 +6653,14 @@ function NewChatLandingContent({
       if (effectiveAgentId === PENDING_AGENT_ID && pendingAgent) {
         // Custom agents upload their bundle with the session. Sibling and managed
         // creates launch server-side; ordinary connected-host creates launch below.
-        const bundle = await buildAgentBundle(pendingAgent);
+        const bundle =
+          mainAttempt?.bundle ??
+          (await buildAgentBundle(
+            projectMainSession && pickedHarness
+              ? { ...pendingAgent, harness: pickedHarness }
+              : pendingAgent,
+          ));
+        if (mainAttempt) mainAttempt.bundle = bundle;
         let bundledGitOptions: Parameters<typeof launchRunner>[3];
         if (shouldCreateWorktree) {
           bundledGitOptions = {
@@ -6445,7 +6670,16 @@ function NewChatLandingContent({
         } else if (startInExistingWorktree) {
           bundledGitOptions = { branchName: activeWorktree!.branch!, existingWorktree: true };
         }
-        const metadata: Parameters<typeof createBundledSession>[1] = { labels: createLabels };
+        const metadata: Parameters<typeof createBundledSession>[1] = {
+          labels: createLabels,
+          ...mainMetadata,
+          ...(projectMainSession
+            ? {
+                model_override: normalizedModelOverride ?? undefined,
+                reasoning_effort: normalizedReasoningEffort ?? undefined,
+              }
+            : {}),
+        };
         if (siblingSourceId) metadata.sibling_source_id = siblingSourceId;
         if (sandboxSelected) {
           // Bundle creates send no host id until the server's multipart host_id is deployed.
@@ -6461,7 +6695,7 @@ function NewChatLandingContent({
             metadata.git = null;
           }
           if (serverOwnsInitialInput) metadata.initial_input = initialInput;
-        } else if (siblingSourceId && selectedHostId) {
+        } else if ((siblingSourceId || projectMainSession) && selectedHostId) {
           metadata.host_id = selectedHostId;
           if (bundledGitOptions) {
             metadata.git = {
@@ -6491,11 +6725,11 @@ function NewChatLandingContent({
           // session groups under its project from its first sidebar appearance,
           // same as the JSON path (see `createLabels`).
         }
-        const bundled = await createBundledSession(
-          bundle,
-          metadata,
-          serverOwnsInitialInput ? files : [],
-        );
+        const bundled = projectMainSession
+          ? await createBundledSession(bundle, metadata, serverOwnsInitialInput ? files : [], {
+              idempotencyKey: mainAttempt!.key,
+            })
+          : await createBundledSession(bundle, metadata, serverOwnsInitialInput ? files : []);
         data = { id: bundled.id };
         createdSessionId = data.id;
         launchedAgentId = bundled.agentId ?? null;
@@ -6503,14 +6737,21 @@ function NewChatLandingContent({
         // otherwise both sandbox and computer bundled creates emit nothing. Split
         // by the picked host; interactionTelemetry completes/settles the span.
         markSessionCreated(data.id, sandboxSelected ? "sandbox" : "computer");
-        if (!siblingSourceId && !sandboxSelected && selectedHostId && workspaceTrimmed) {
+        if (
+          !siblingSourceId &&
+          !projectMainSession &&
+          !sandboxSelected &&
+          selectedHostId &&
+          workspaceTrimmed
+        ) {
           await launchRunner(selectedHostId, data.id, workspaceTrimmed, bundledGitOptions);
         }
         // Clear pending agent after successful creation.
         setPendingAgent(null);
       } else {
         // Normal path: bind to an existing registered agent.
-        const provisional = siblingSource ? nestedProvisional : newTempConversation();
+        const provisional =
+          mainAttempt?.provisional ?? (siblingSource ? nestedProvisional : newTempConversation());
         try {
           localConv = beginLocalConversation(initialPrompt, files, provisional, localProject, {
             // Seed the temp session with the NORMALIZED create identity so the
@@ -6544,8 +6785,12 @@ function NewChatLandingContent({
         const matchOwnCreate = (item: SessionListWireItem) =>
           item.parent_session_id == null &&
           item.labels?.[CLIENT_CREATE_TOKEN_LABEL] === createToken;
-        const managedHostId = sandboxSelected ? await managedSandboxHostId(info) : undefined;
+        const managedHostId = sandboxSelected
+          ? (mainAttempt?.managedHostId ?? (await managedSandboxHostId(info)))
+          : undefined;
+        if (mainAttempt) mainAttempt.managedHostId = managedHostId;
         const createPayload = JSON.stringify({
+          ...mainMetadata,
           ...(siblingSourceId ? { sibling_source_id: siblingSourceId } : {}),
           ...(serverOwnsInitialInput ? { initial_input: initialInput } : {}),
           // Config-seeded agent on a `project_id` create: omitted so the
@@ -6655,6 +6900,7 @@ function NewChatLandingContent({
         const createRequest = authenticatedFetch("/v1/sessions", {
           method: "POST",
           headers: {
+            ...(mainAttempt ? { "Idempotency-Key": mainAttempt.key } : {}),
             ...(createForm === null ? { "Content-Type": "application/json" } : {}),
             ...backgroundSessionTitlesRequestHeaders(),
             ...timezoneRequestHeaders(),
@@ -6664,10 +6910,13 @@ function NewChatLandingContent({
         // Managed launch validation continues after the row is announced, so
         // only its HTTP response can resolve the temp chat.
         const abortPush = new AbortController();
-        const pushedRow = sandboxSelected
-          ? Promise.resolve(null)
-          : nextPushedSession(matchOwnCreate, abortPush.signal);
-        const confirmed = (async (): Promise<{ id: string } | { error: string }> => {
+        const pushedRow =
+          sandboxSelected || projectMainSession
+            ? Promise.resolve(null)
+            : nextPushedSession(matchOwnCreate, abortPush.signal);
+        const confirmed = (async (): Promise<
+          { id: string } | { error: string; status: number }
+        > => {
           const response = await createRequest;
           if (!response.ok) {
             if (sandboxSelected) {
@@ -6683,7 +6932,7 @@ function NewChatLandingContent({
                 ),
               });
             }
-            return { error: await describeCreateError(response) };
+            return { error: await describeCreateError(response), status: response.status };
           }
           const created = (await response.json()) as {
             id: string;
@@ -6698,26 +6947,30 @@ function NewChatLandingContent({
         })();
         // Once the create answers, its id is authoritative — stop listening.
         void confirmed.finally(() => abortPush.abort()).catch(() => {});
-        const created = await new Promise<{ id: string } | { error: string }>((resolve, reject) => {
-          // Only a match settles this; an abort resolves null and leaves the
-          // response to decide.
-          void pushedRow.then((row) => {
-            if (row !== null) resolve({ id: row.id });
-          });
-          confirmed.then(resolve, reject);
-        });
+        const created = await new Promise<{ id: string } | { error: string; status: number }>(
+          (resolve, reject) => {
+            // Only a match settles this; an abort resolves null and leaves the
+            // response to decide.
+            void pushedRow.then((row) => {
+              if (row !== null) resolve({ id: row.id });
+            });
+            confirmed.then(resolve, reject);
+          },
+        );
         abortPush.abort();
         // A row is only written (and announced) after the create has validated
         // the workspace and agent, so winning on the push can't skip past an
         // error the user needed to see on this screen.
         if ("error" in created) {
-          returnDraftToUser(localConv?.tempConvId);
+          const returnedDraft = returnDraftToUser(localConv?.tempConvId);
           // On the navigate-first path the landing screen is unmounted, so tear
           // down the phantom chat, return to landing, and surface the error as a
           // toast (survives the remount); inline error only when still on landing.
           tearDownLocalConversation();
-          if (localConv !== null) showToast(created.error);
+          if (localConv !== null && !projectMainSession) showToast(created.error);
           else setCreateError(created.error);
+          if (projectMainSession && created.status === 409)
+            await recoverMainConflict(returnedDraft);
           return;
         }
         data = { id: created.id };
@@ -6874,17 +7127,28 @@ function NewChatLandingContent({
         void queryClient.refetchQueries({ queryKey: ["conversations"] });
         if (!serverOwnsInitialInput)
           setPendingInitialPrompt(data.id, { text: initialPrompt, skill, files });
-        // Only the full chat delivers a pending prompt, so the project home hands off to it.
+        // Main's embedded composer also delivers the exact-session pending prompt.
         if (
-          (!onProjectHome || !serverOwnsInitialInput) &&
+          (!onProjectHome || (!serverOwnsInitialInput && !projectMainSession)) &&
           onScreenRef.current &&
           window.location.href === createLocation
         ) {
           navigate(sessionLocation(data.id));
         }
       }
-      if (onProjectHome && onScreenRef.current) onSessionStarted?.();
-    } catch {
+      if (projectMainSession) draftState.mainCreation = undefined;
+      if (onProjectHome && onScreenRef.current) await onSessionStarted?.();
+    } catch (error) {
+      if (projectMainSession && createdSessionId) {
+        if (undeliveredPrompt) setPendingInitialPrompt(createdSessionId, undeliveredPrompt);
+        if (localConv) removeLocalConversation(localConv.tempConvId);
+        draftState.mainCreation = undefined;
+        void queryClient.invalidateQueries({
+          queryKey: ["project-record", projectMainSession.projectId],
+        });
+        showToast("Session created, but setup didn't finish. Open the session to continue.");
+        return;
+      }
       if (siblingSource && createdSessionId) {
         const stillViewing = localConv
           ? stillViewingLocalSession(localConv.tempConvId)
@@ -6904,12 +7168,23 @@ function NewChatLandingContent({
         }
         return;
       }
-      const msg = "Couldn't reach the server. Check your connection and try again.";
-      returnDraftToUser(localConv?.tempConvId);
+      const msg =
+        error instanceof Error && "status" in error
+          ? error.message
+          : "Couldn't reach the server. Check your connection and try again.";
+      const returnedDraft = returnDraftToUser(localConv?.tempConvId);
       tearDownLocalConversation();
       // Toast when the landing screen is gone (navigate-first); inline otherwise.
-      if (localConv !== null) showToast(msg);
+      if (localConv !== null && !projectMainSession) showToast(msg);
       else setCreateError(msg);
+      if (
+        projectMainSession &&
+        error instanceof Error &&
+        "status" in error &&
+        error.status === 409
+      ) {
+        await recoverMainConflict(returnedDraft);
+      }
     } finally {
       if (createAttemptRef.current === createAttempt) {
         createAttemptRef.current = null;
@@ -7428,6 +7703,7 @@ function NewChatLandingContent({
       className={cn(
         "relative flex",
         !onProjectHome && "min-h-0 flex-1 items-stretch justify-center md:items-center md:pb-24",
+        projectMainSession && "min-h-0 flex-1 items-center justify-center px-4",
       )}
       data-testid="new-chat-landing"
     >
@@ -7440,10 +7716,18 @@ function NewChatLandingContent({
           "flex min-h-0 w-full flex-col md:select-none",
           !onProjectHome &&
             "max-w-[800px] items-center px-4 pt-8 pb-[max(16px,env(safe-area-inset-bottom))] md:pb-16",
+          projectMainSession && "max-w-[800px] items-center",
         )}
       >
         {onProjectHome ? (
-          isMobileViewport && workspaceControls
+          <>
+            {projectMainSession && selectedAgent && (
+              <div className="mb-8">
+                <ProjectAgentIdentity agent={selectedAgent} />
+              </div>
+            )}
+            {isMobileViewport && workspaceControls}
+          </>
         ) : (
           /* On phones the heading yields its height first, so a long draft cannot
             push Send below the keyboard. */

@@ -6358,6 +6358,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         host_id: str | None = None,
         inference_snapshot: dict[str, Any] | None = None,
         created_by: str | None = None,
+        conversation_id: str | None = None,
     ) -> CreatedSession:
         """
         Insert a conversation row and session-scoped agent.
@@ -6417,7 +6418,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             conversation exists.
         """
         return self._create_session_with_agent_with_id(
-            generate_conversation_id(),
+            conversation_id or generate_conversation_id(),
             agent_id=agent_id,
             agent_name=agent_name,
             agent_bundle_location=agent_bundle_location,

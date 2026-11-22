@@ -1,5 +1,15 @@
 import { type CSSProperties, useEffect, useRef, useState } from "react";
-import { ChevronRightIcon, FolderOpenIcon, PlusIcon, SmilePlusIcon } from "lucide-react";
+import {
+  ChevronRightIcon,
+  FolderOpenIcon,
+  MonitorCloudIcon,
+  PlusIcon,
+  SmilePlusIcon,
+} from "lucide-react";
+import {
+  ComposerHostTrigger,
+  ComposerWorkspaceTrigger,
+} from "@/components/composer/ComposerControls";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
@@ -12,11 +22,19 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { EmojiPicker } from "@/components/ProjectIconPicker";
 import { useCreateProject, useProjects } from "@/hooks/useConversations";
 import { useCloneHostRepository, useCreateHostDirectory } from "@/hooks/useHostFilesystem";
 import type { Host } from "@/hooks/useHosts";
+import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { isFeatureEnabled, sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import {
@@ -26,11 +44,17 @@ import {
 } from "@/lib/hostPreferences";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import type { ProjectConfig } from "@/lib/projectsApi";
+import { ApiError } from "@/lib/sessionsApi";
+import { reuseCreationAttempt, type CreationAttempt } from "@/lib/creationAttempt";
+import { shouldGuardDialogDismiss } from "@/lib/dialogDismissGuard";
 import type { LastSandboxRepo } from "@/lib/repoPreferences";
 import { deriveRepoName, sandboxRepoProblem } from "@/lib/sandboxRepositories";
 import { SandboxRepositoryPicker } from "./SandboxRepositoryPicker";
 import { joinPath } from "./WorkspacePicker";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
+import { HostOption } from "./NewChatDialog";
+import { RecentWorkspaceList } from "./RecentWorkspaceList";
+import { ProjectChatLaunchPicker, useProjectChatChoices } from "./ProjectChatLaunchPicker";
 
 interface WorkspaceSelection {
   hostId: string;
@@ -94,6 +118,9 @@ function friendlyProjectError(error: unknown): string {
   ) {
     return "The project couldn’t be created. Check your connection and try again.";
   }
+  if (error instanceof ApiError && error.status >= 400 && error.status < 500) {
+    return error.message;
+  }
   return "The project couldn’t be created. Try again.";
 }
 
@@ -132,9 +159,7 @@ function friendlyCloneError(error: unknown): string {
 
 /**
  * "New project" control in the Projects group header. Opens a dialog that
- * creates an EMPTY first-class project (`POST /v1/projects`) — the capability
- * the legacy label model can't express. On success the new folder is expanded
- * (via `onCreated`) so the user can immediately file sessions into it.
+ * creates a first-class project and its Main conversation (`POST /v1/projects`).
  *
  * When the server supports project repositories, the dialog also takes a
  * "Run on" target: a connected host (a folder, or a repository cloned onto it
@@ -158,8 +183,27 @@ export function NewProjectButton({
   const [emojiOpen, setEmojiOpen] = useState(false);
   // Where the project runs: a host id, or a sandbox choice (see sandboxHostChoice).
   const [runOn, setRunOn] = useState<string | null>(null);
-  // A host the user picked, as opposed to the default: only a pick is saved for a name-only project.
-  const runOnPicked = useRef(false);
+  const [hostMenuOpen, setHostMenuOpen] = useState(false);
+  const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false);
+  const creationAttempt = useRef<CreationAttempt | undefined>(undefined);
+  const dropdownOpen = useRef(false);
+  const dropdownClosedAt = useRef(0);
+  const onDropdownOpenChange = (nextOpen: boolean) => {
+    dropdownOpen.current = nextOpen;
+    if (!nextOpen) dropdownClosedAt.current = Date.now();
+  };
+  const guardDialogDismiss = (event: {
+    target: EventTarget | null;
+    preventDefault: () => void;
+  }) => {
+    if (
+      shouldGuardDialogDismiss(event.target, {
+        selectOpen: dropdownOpen.current,
+        msSinceSelectClose: Date.now() - dropdownClosedAt.current,
+      })
+    )
+      event.preventDefault();
+  };
   const [sourceMode, setSourceMode] = useState<"folder" | "repository">("folder");
   const [workspace, setWorkspace] = useState<WorkspaceSelection | null>(null);
   const [createdWorkspace, setCreatedWorkspace] = useState<
@@ -203,7 +247,10 @@ export function NewProjectButton({
   const sandboxProvider = runOn === null ? undefined : sandboxHostChoiceProvider(runOn);
   const runsOnSandbox = sandboxProvider !== undefined;
   const hostTarget = runOn !== null && !runsOnSandbox ? runOn : null;
-  const hostName = hosts.find((host) => host.host_id === hostTarget)?.name ?? "the host";
+  const selectedHost = hosts.find((host) => host.host_id === hostTarget);
+  const hostName = selectedHost?.name ?? "Choose host";
+  const chat = useProjectChatChoices(open, selectedHost, runsOnSandbox, sandboxProvider ?? null);
+  const { recent, addRecent } = useRecentWorkspaces(hostTarget);
   // Folder UI applies to host targets (and the legacy folder-only dialog).
   const folderMode = !runsOnSandbox && (!repositoryCreation || sourceMode === "folder");
   const repositoryMode = repositoryCreation && (runsOnSandbox || sourceMode === "repository");
@@ -223,14 +270,46 @@ export function NewProjectButton({
     }
   }, [runOn, hostId, open]);
 
+  const selectHost = (next: string) => {
+    if (next !== runOn) {
+      submissionGeneration.current += 1;
+      setWorkspace(null);
+      setCreatedWorkspace(null);
+      setCreateWorkspaceFolder(false);
+      setCloneParent("~");
+      setDestinationOverride(null);
+    }
+    setRunOn(next);
+    setSubmitError(null);
+  };
+
   const submit = async () => {
     const trimmed = name.trim();
     if (trimmed === "" || isPending || repositorySubmitting) return;
     const submission = ++submissionGeneration.current;
     setSubmitError(null);
+    if (!chat.selected || chat.loading) {
+      setSubmitError("Choose an agent.");
+      return;
+    }
+    if (runOn === null) {
+      setSubmitError("Choose a host.");
+      return;
+    }
+    if (!runsOnSandbox && selectedHost?.status !== "online") {
+      setSubmitError("The host is offline. Reconnect it and try again.");
+      return;
+    }
+    if (chat.options.unsupported) {
+      setSubmitError("This harness is unavailable on the selected host.");
+      return;
+    }
 
     // Label-only legacy projects (no id) can be promoted to a project of the same name.
-    if (projects.some((project) => project.id !== null && project.name === trimmed)) {
+    if (
+      !creationAttempt.current &&
+      projects.some((project) => project.id !== null && project.name === trimmed)
+    ) {
       setSubmitError("A project with this name already exists. Use a different name.");
       return;
     }
@@ -318,7 +397,7 @@ export function NewProjectButton({
       }
     }
 
-    const config: ProjectConfig = {};
+    const config: ProjectConfig = { ...chat.config };
     if (icon) config.icon = icon;
     if (runsOnSandbox) {
       config.host_id = SANDBOX_HOST_CHOICE;
@@ -330,14 +409,18 @@ export function NewProjectButton({
       } else if (selectedWorkspace) {
         config.host_id = selectedWorkspace.hostId;
         config.workspace = selectedWorkspace.path;
-      } else if (runOnPicked.current || repositoryMode) {
+      } else {
         config.host_id = hostTarget;
       }
     }
     if (locking) config.repository = branch ? { url, branch } : { url };
+    creationAttempt.current = reuseCreationAttempt(creationAttempt.current, {
+      name: trimmed,
+      config,
+    });
 
     createProject.mutate(
-      { name: trimmed, config: Object.keys(config).length > 0 ? config : undefined },
+      { name: trimmed, config, idempotencyKey: creationAttempt.current.key },
       {
         onSuccess: (project) => {
           if (submission !== submissionGeneration.current) return;
@@ -346,7 +429,8 @@ export function NewProjectButton({
           setName("");
           setIcon(undefined);
           setRunOn(null);
-          runOnPicked.current = false;
+          creationAttempt.current = undefined;
+          if (config.workspace) addRecent(config.workspace);
           setSourceMode("folder");
           setWorkspace(null);
           setCreatedWorkspace(null);
@@ -365,11 +449,11 @@ export function NewProjectButton({
         onError: (error) => {
           if (submission !== submissionGeneration.current) return;
           setRepositorySubmitting(false);
-          if (checkoutPath !== null) {
-            setSubmitError(
-              `${friendlyProjectError(error)} The repository is already checked out at ${checkoutPath}.`,
-            );
-          }
+          setSubmitError(
+            checkoutPath !== null
+              ? `${friendlyProjectError(error)} The repository is already checked out at ${checkoutPath}.`
+              : friendlyProjectError(error),
+          );
         },
       },
     );
@@ -380,7 +464,7 @@ export function NewProjectButton({
       open={open}
       onOpenChange={(next) => {
         // A clone or save in flight keeps the dialog open until it settles.
-        if (!next && repositorySubmitting) return;
+        if (!next && (repositorySubmitting || isPending)) return;
         if (!next) {
           submissionGeneration.current += 1;
         }
@@ -394,6 +478,8 @@ export function NewProjectButton({
     >
       <DialogContent
         className="sm:max-w-lg"
+        onPointerDownOutside={guardDialogDismiss}
+        onInteractOutside={guardDialogDismiss}
         onClick={(e) => e.stopPropagation()}
         // emoji-mart preventDefaults the pointer event, so Radix's own
         // outside-dismissal never fires for clicks elsewhere in the modal.
@@ -412,11 +498,9 @@ export function NewProjectButton({
       >
         <DialogHeader>
           <DialogTitle>New project</DialogTitle>
-          <DialogDescription>
-            Create a project, then file sessions into it from a session's menu.
-          </DialogDescription>
+          <DialogDescription className="sr-only">Create a project.</DialogDescription>
         </DialogHeader>
-        <fieldset disabled={repositorySubmitting} className="contents">
+        <fieldset disabled={repositorySubmitting || isPending} className="contents">
           {/* One combined control: emoji tile (left) + name (right) share a
             single border, so it reads as a single input. */}
           <div className="flex items-stretch overflow-hidden rounded-lg border border-input">
@@ -486,240 +570,306 @@ export function NewProjectButton({
               }}
             />
           </div>
-          {repositoryCreation && (
-            <div className="flex flex-col gap-1.5">
-              <label htmlFor="new-project-run-on" className="font-medium text-ui">
-                Run on
-              </label>
-              <select
-                id="new-project-run-on"
-                className="h-10 rounded-lg border border-input bg-transparent px-3 text-ui outline-none"
-                value={runOn ?? ""}
-                onChange={(event) => {
-                  const next = event.target.value;
-                  runOnPicked.current = true;
-                  if (next !== runOn) {
-                    // A submission still creating a folder for the old target must not save it.
-                    submissionGeneration.current += 1;
-                    setWorkspace(null);
-                    setCreatedWorkspace(null);
-                    setCreateWorkspaceFolder(false);
-                    setCloneParent("~");
-                    setDestinationOverride(null);
+          <section aria-label="Run on" className="flex flex-col gap-3 border-t pt-4">
+            <h3 className="text-xs font-medium text-muted-foreground">Run on</h3>
+            <DropdownMenu
+              open={hostMenuOpen}
+              onOpenChange={(nextOpen) => {
+                setHostMenuOpen(nextOpen);
+                onDropdownOpenChange(nextOpen);
+              }}
+            >
+              <DropdownMenuTrigger asChild>
+                <ComposerHostTrigger
+                  aria-label="Run on"
+                  data-testid="new-project-run-on"
+                  showLabel
+                  label={
+                    runsOnSandbox
+                      ? sandboxOptionLabel(sandboxProvider)
+                      : hostsLoading
+                        ? "Loading hosts…"
+                        : hostName
                   }
-                  setRunOn(next);
-                  setSubmitError(null);
-                }}
-              >
-                {runOn === null && (
-                  <option value="" disabled>
-                    {hostsLoading ? "Loading hosts…" : "No host available"}
-                  </option>
+                  status={runsOnSandbox ? undefined : (selectedHost?.status ?? "unknown")}
+                  cloud={runsOnSandbox || !!selectedHost?.sandbox_provider}
+                  className="h-9 w-full justify-start gap-2 px-2 text-sm text-foreground md:h-9"
+                />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start" className="composer-host-menu min-w-64">
+                {(sandboxProviders.length > 0 || hosts.some((host) => host.sandbox_provider)) && (
+                  <>
+                    <div className="px-2 py-1 text-xs text-muted-foreground">Cloud</div>
+                    {sandboxProviders.map((provider) => (
+                      <DropdownMenuItem
+                        key={provider}
+                        onSelect={() => selectHost(sandboxHostChoice(provider))}
+                      >
+                        <MonitorCloudIcon className="size-3.5 text-muted-foreground" />
+                        {sandboxOptionLabel(provider)}
+                      </DropdownMenuItem>
+                    ))}
+                    {hosts
+                      .filter((host) => host.sandbox_provider)
+                      .map((host) => (
+                        <DropdownMenuItem
+                          key={host.host_id}
+                          disabled={host.status !== "online"}
+                          onSelect={() => selectHost(host.host_id)}
+                        >
+                          <HostOption host={host} cloud />
+                        </DropdownMenuItem>
+                      ))}
+                    <DropdownMenuSeparator />
+                  </>
                 )}
-                {runOn !== null &&
-                  !onlineHosts.some((host) => host.host_id === runOn) &&
-                  !sandboxProviders.some((provider) => sandboxHostChoice(provider) === runOn) && (
-                    <option value={runOn}>{hostsLoading ? "Loading hosts…" : hostName}</option>
-                  )}
-                {onlineHosts.map((host) => (
-                  <option key={host.host_id} value={host.host_id}>
-                    {host.name}
-                  </option>
-                ))}
-                {sandboxProviders.map((provider) => (
-                  <option key={sandboxHostChoice(provider)} value={sandboxHostChoice(provider)}>
-                    {sandboxOptionLabel(provider)}
-                  </option>
-                ))}
-              </select>
-            </div>
-          )}
-          {repositoryCreation && !runsOnSandbox && hostTarget !== null && (
-            <div role="radiogroup" aria-label="Project source" className="flex gap-4 text-ui">
-              <label className="flex cursor-pointer items-center gap-2">
-                <input
-                  type="radio"
-                  name="new-project-source"
-                  value="folder"
-                  checked={sourceMode === "folder"}
-                  onChange={() => {
-                    submissionGeneration.current += 1;
-                    setSourceMode("folder");
-                    setSubmitError(null);
-                  }}
-                />
-                Folder
-              </label>
-              <label className="flex cursor-pointer items-center gap-2">
-                <input
-                  type="radio"
-                  name="new-project-source"
-                  value="repository"
-                  checked={sourceMode === "repository"}
-                  onChange={() => {
-                    submissionGeneration.current += 1;
-                    setSourceMode("repository");
-                    setSubmitError(null);
-                  }}
-                />
-                Repository
-              </label>
-            </div>
-          )}
-          {repositoryMode && (
-            <div className="flex flex-col gap-2" data-testid="new-project-repository">
-              <SandboxRepositoryPicker
-                selections={repositories}
-                onChange={(next) => {
-                  // The picker adds a URL with a blank branch; keep the branch typed for it.
-                  const typedBranch = pendingRepoBranch.trim();
-                  if (repositories.length === 0) {
-                    setRepositories(
-                      next.map((repo) =>
-                        repo.branch === "" && typedBranch !== ""
-                          ? { ...repo, branch: typedBranch }
-                          : repo,
-                      ),
-                    );
-                    setPendingRepoBranch("");
-                  } else {
-                    setRepositories(next);
-                  }
-                  setSubmitError(null);
-                }}
-                maxRepos={1}
-                pendingUrl={pendingRepoUrl}
-                onPendingUrlChange={(url) => {
-                  setPendingRepoUrl(url);
-                  setSubmitError(null);
-                }}
-                testIdPrefix="new-project-repo"
-              />
-              {repositories.length === 0 && (
-                <input
-                  aria-label="Branch"
-                  placeholder="Default branch"
-                  value={pendingRepoBranch}
-                  onChange={(event) => {
-                    setPendingRepoBranch(event.target.value);
-                    setSubmitError(null);
-                  }}
-                  className="h-10 rounded-lg border border-input bg-transparent px-3 text-ui outline-none"
-                />
-              )}
-              {hostTarget !== null ? (
-                <>
-                  <label htmlFor="new-project-clone-into" className="font-medium text-ui">
-                    Clone into
-                  </label>
-                  <div className="flex items-center gap-2">
-                    <input
-                      id="new-project-clone-into"
-                      className="h-10 min-w-0 flex-1 rounded-lg border border-input bg-transparent px-3 text-ui outline-none"
-                      placeholder="~/repository"
-                      value={destinationShown}
-                      onChange={(event) => {
-                        setDestinationOverride(event.target.value);
-                        setSubmitError(null);
-                      }}
-                    />
-                    <Button
-                      type="button"
-                      variant="outline"
-                      disabled={isPending}
-                      onClick={() => setParentPickerOpen(true)}
+                <div className="px-2 py-1 text-xs text-muted-foreground">My machines</div>
+                {hosts
+                  .filter((host) => !host.sandbox_provider)
+                  .map((host) => (
+                    <DropdownMenuItem
+                      key={host.host_id}
+                      disabled={host.status !== "online"}
+                      onSelect={() => selectHost(host.host_id)}
                     >
-                      Browse
-                    </Button>
+                      <HostOption host={host} />
+                    </DropdownMenuItem>
+                  ))}
+                {!hosts.length && (
+                  <div className="px-2 py-1.5 text-sm text-muted-foreground">
+                    No hosts connected yet.
                   </div>
-                  <p className="text-xs text-muted-foreground">
-                    Cloned onto {hostName} before the project is saved.
-                  </p>
-                  <WorkspacePickerDialog
-                    open={parentPickerOpen}
-                    onOpenChange={setParentPickerOpen}
-                    hostId={hostTarget}
-                    initialPath={cloneParent}
-                    title="Choose parent folder"
-                    description="Choose the folder the repository will be cloned into."
-                    onConfirm={(path) => {
-                      setCloneParent(path);
-                      setDestinationOverride(null);
-                    }}
-                  />
-                </>
-              ) : (
-                <p className="text-xs text-muted-foreground">
-                  Saved with this project. The repository will be prepared when you start a session.
-                </p>
-              )}
-            </div>
-          )}
-          {folderMode && (
-            <Collapsible>
-              <CollapsibleTrigger className="group flex w-full cursor-pointer items-center gap-1 rounded-sm text-left outline-none focus-visible:ring-3 focus-visible:ring-ring/50">
-                <span className="font-medium text-ui">
-                  Working directory{" "}
-                  <span className="font-normal text-muted-foreground">(optional)</span>
-                </span>
-                <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground transition-transform duration-200 ease-out group-data-[state=open]:rotate-90" />
-              </CollapsibleTrigger>
-              <CollapsibleContent className="new-project-working-directory-content mt-2 flex flex-col gap-1.5">
-                <label
-                  htmlFor="new-project-create-workspace"
-                  className={`flex h-10 items-center gap-2 rounded-lg border border-input bg-transparent px-3 text-ui ${
-                    folderCreationDisabled ? "cursor-not-allowed opacity-50" : "cursor-pointer"
-                  }`}
-                >
-                  <Checkbox
-                    id="new-project-create-workspace"
-                    checked={createWorkspaceFolder}
-                    onCheckedChange={(checked) => {
-                      setCreateWorkspaceFolder(checked === true);
+                )}
+              </DropdownMenuContent>
+            </DropdownMenu>
+            {repositoryCreation && !runsOnSandbox && hostTarget !== null && (
+              <div role="radiogroup" aria-label="Project source" className="flex gap-4 text-ui">
+                <label className="flex cursor-pointer items-center gap-2">
+                  <input
+                    type="radio"
+                    name="new-project-source"
+                    value="folder"
+                    checked={sourceMode === "folder"}
+                    onChange={() => {
+                      submissionGeneration.current += 1;
+                      setSourceMode("folder");
                       setSubmitError(null);
                     }}
-                    disabled={folderCreationDisabled}
                   />
-                  <span>Create a folder using the project name</span>
+                  Folder
                 </label>
-                <button
-                  id="new-project-workspace"
-                  type="button"
-                  data-testid="new-project-workspace"
-                  aria-label={`Working directory: ${
-                    createWorkspaceFolder
-                      ? joinPath("~", name.trim() || "Project name")
-                      : workspace?.path || "Not selected"
-                  }`}
-                  onClick={() => setWorkspacePickerOpen(true)}
-                  disabled={createWorkspaceFolder || hostTarget === null || isPending}
-                  className="flex h-10 w-full items-center justify-between gap-3 rounded-lg border border-input bg-transparent px-3 text-ui outline-none transition-colors hover:bg-muted/50 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  <span className="flex min-w-0 items-center gap-2">
-                    <FolderOpenIcon className="size-4 shrink-0 text-muted-foreground" />
-                    <span className="truncate">
-                      {createWorkspaceFolder
-                        ? joinPath("~", name.trim() || "Project name")
-                        : workspace?.path || (hostsLoading ? "Loading hosts…" : "Choose a folder…")}
-                    </span>
-                  </span>
-                  <span className="shrink-0 text-muted-foreground text-sm">Browse</span>
-                </button>
-                <WorkspacePickerDialog
-                  open={workspacePickerOpen}
-                  onOpenChange={setWorkspacePickerOpen}
-                  hostId={hostTarget}
-                  initialPath={workspace?.path}
-                  onConfirm={(path) => {
-                    if (hostTarget !== null) {
-                      setWorkspace({ hostId: hostTarget, path });
+                <label className="flex cursor-pointer items-center gap-2">
+                  <input
+                    type="radio"
+                    name="new-project-source"
+                    value="repository"
+                    checked={sourceMode === "repository"}
+                    onChange={() => {
+                      submissionGeneration.current += 1;
+                      setSourceMode("repository");
+                      setSubmitError(null);
+                    }}
+                  />
+                  Repository
+                </label>
+              </div>
+            )}
+            {repositoryMode && (
+              <div className="flex flex-col gap-2" data-testid="new-project-repository">
+                <SandboxRepositoryPicker
+                  selections={repositories}
+                  onChange={(next) => {
+                    // The picker adds a URL with a blank branch; keep the branch typed for it.
+                    const typedBranch = pendingRepoBranch.trim();
+                    if (repositories.length === 0) {
+                      setRepositories(
+                        next.map((repo) =>
+                          repo.branch === "" && typedBranch !== ""
+                            ? { ...repo, branch: typedBranch }
+                            : repo,
+                        ),
+                      );
+                      setPendingRepoBranch("");
+                    } else {
+                      setRepositories(next);
                     }
+                    setSubmitError(null);
                   }}
-                  description="Choose a default working directory for sessions in this project."
+                  maxRepos={1}
+                  pendingUrl={pendingRepoUrl}
+                  onPendingUrlChange={(url) => {
+                    setPendingRepoUrl(url);
+                    setSubmitError(null);
+                  }}
+                  testIdPrefix="new-project-repo"
                 />
-              </CollapsibleContent>
-            </Collapsible>
-          )}
+                {repositories.length === 0 && (
+                  <input
+                    aria-label="Branch"
+                    placeholder="Default branch"
+                    value={pendingRepoBranch}
+                    onChange={(event) => {
+                      setPendingRepoBranch(event.target.value);
+                      setSubmitError(null);
+                    }}
+                    className="h-10 rounded-lg border border-input bg-transparent px-3 text-ui outline-none"
+                  />
+                )}
+                {hostTarget !== null ? (
+                  <>
+                    <label htmlFor="new-project-clone-into" className="text-sm">
+                      Clone into
+                    </label>
+                    <div className="flex items-center gap-2">
+                      <input
+                        id="new-project-clone-into"
+                        className="h-10 min-w-0 flex-1 rounded-lg border border-input bg-transparent px-3 text-ui outline-none"
+                        placeholder="~/repository"
+                        value={destinationShown}
+                        onChange={(event) => {
+                          setDestinationOverride(event.target.value);
+                          setSubmitError(null);
+                        }}
+                      />
+                      <Button
+                        type="button"
+                        variant="outline"
+                        disabled={isPending}
+                        onClick={() => setParentPickerOpen(true)}
+                      >
+                        Browse
+                      </Button>
+                    </div>
+                    <WorkspacePickerDialog
+                      open={parentPickerOpen}
+                      onOpenChange={setParentPickerOpen}
+                      hostId={hostTarget}
+                      initialPath={cloneParent}
+                      title="Choose parent folder"
+                      description="Choose the folder the repository will be cloned into."
+                      onConfirm={(path) => {
+                        setCloneParent(path);
+                        setDestinationOverride(null);
+                      }}
+                    />
+                  </>
+                ) : null}
+              </div>
+            )}
+            {folderMode && (
+              <Collapsible>
+                <CollapsibleTrigger className="group flex w-full cursor-pointer items-center gap-1 rounded-sm text-left outline-none focus-visible:ring-3 focus-visible:ring-ring/50">
+                  <span className="text-sm">
+                    Working directory{" "}
+                    <span className="font-normal text-muted-foreground">(optional)</span>
+                  </span>
+                  <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground transition-transform duration-200 ease-out group-data-[state=open]:rotate-90" />
+                </CollapsibleTrigger>
+                <CollapsibleContent className="new-project-working-directory-content mt-2 flex flex-col gap-1.5">
+                  <label
+                    htmlFor="new-project-create-workspace"
+                    className={`flex h-10 items-center gap-2 rounded-lg border border-input bg-transparent px-3 text-ui ${
+                      folderCreationDisabled ? "cursor-not-allowed opacity-50" : "cursor-pointer"
+                    }`}
+                  >
+                    <Checkbox
+                      id="new-project-create-workspace"
+                      checked={createWorkspaceFolder}
+                      onCheckedChange={(checked) => {
+                        setCreateWorkspaceFolder(checked === true);
+                        setSubmitError(null);
+                      }}
+                      disabled={folderCreationDisabled}
+                    />
+                    <span>Create a folder using the project name</span>
+                  </label>
+                  <Popover
+                    modal
+                    open={workspaceMenuOpen}
+                    onOpenChange={(nextOpen) => {
+                      setWorkspaceMenuOpen(nextOpen);
+                      onDropdownOpenChange(nextOpen);
+                    }}
+                  >
+                    <PopoverTrigger asChild>
+                      <ComposerWorkspaceTrigger
+                        id="new-project-workspace"
+                        data-testid="new-project-workspace"
+                        kind="directory"
+                        menuOpen={workspaceMenuOpen}
+                        tooltip={workspace?.path || "Working directory"}
+                        label={
+                          createWorkspaceFolder
+                            ? joinPath("~", name.trim() || "Project name")
+                            : workspace?.path || "Choose a folder…"
+                        }
+                        aria-label={`Working directory: ${createWorkspaceFolder ? joinPath("~", name.trim() || "Project name") : workspace?.path || "Not selected"}`}
+                        disabled={createWorkspaceFolder || hostTarget === null || isPending}
+                        className="h-8 text-sm"
+                      />
+                    </PopoverTrigger>
+                    <PopoverContent align="start" className="w-80 max-w-[calc(100vw-2rem)] p-1.5">
+                      {recent.length > 0 && (
+                        <>
+                          <div className="px-2 py-1 text-xs text-muted-foreground">Recents</div>
+                          <RecentWorkspaceList
+                            hostId={hostTarget}
+                            paths={recent}
+                            selectedPath={workspace?.path}
+                            onSelect={(path) => {
+                              if (hostTarget) setWorkspace({ hostId: hostTarget, path });
+                              setWorkspaceMenuOpen(false);
+                              onDropdownOpenChange(false);
+                            }}
+                            onBrowse={(path) => {
+                              if (hostTarget) setWorkspace({ hostId: hostTarget, path });
+                              setWorkspaceMenuOpen(false);
+                              onDropdownOpenChange(false);
+                              setWorkspacePickerOpen(true);
+                            }}
+                          />
+                        </>
+                      )}
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="w-full justify-start"
+                        onClick={() => {
+                          setWorkspaceMenuOpen(false);
+                          onDropdownOpenChange(false);
+                          setWorkspacePickerOpen(true);
+                        }}
+                      >
+                        <FolderOpenIcon />
+                        Open folder…
+                      </Button>
+                    </PopoverContent>
+                  </Popover>
+                  <WorkspacePickerDialog
+                    open={workspacePickerOpen}
+                    onOpenChange={setWorkspacePickerOpen}
+                    hostId={hostTarget}
+                    initialPath={workspace?.path}
+                    onConfirm={(path) => {
+                      if (hostTarget !== null) {
+                        setWorkspace({ hostId: hostTarget, path });
+                      }
+                    }}
+                    description="Choose a default working directory for sessions in this project."
+                  />
+                </CollapsibleContent>
+              </Collapsible>
+            )}
+          </section>
+          <section aria-label="Chat" className="space-y-3 border-t pt-4">
+            <h3 className="text-xs font-medium text-muted-foreground">Chat</h3>
+            <ProjectChatLaunchPicker
+              choices={chat}
+              host={selectedHost}
+              sandbox={runsOnSandbox}
+              onOpenChange={onDropdownOpenChange}
+            />
+          </section>
           {(submitError || createProject.isError) && (
             <p className="text-ui text-destructive" role="alert">
               {submitError ?? friendlyProjectError(createProject.error)}
@@ -739,7 +889,13 @@ export function NewProjectButton({
             type="button"
             data-testid="new-project-confirm"
             loading={isPending}
-            disabled={name.trim() === "" || isPending || repositorySubmitting}
+            disabled={
+              name.trim() === "" ||
+              isPending ||
+              repositorySubmitting ||
+              chat.loading ||
+              !chat.selected
+            }
             onClick={() => void submit()}
           >
             Create
@@ -766,7 +922,7 @@ export function NewProjectButton({
               setName("");
               setIcon(undefined);
               setRunOn(hostId);
-              runOnPicked.current = false;
+              creationAttempt.current = undefined;
               setSourceMode("folder");
               setWorkspace(null);
               setCreatedWorkspace(null);

@@ -11575,6 +11575,7 @@ def _persist_stored_session_bundle(
     inference_model: str | None = None,
     git_branch: str | None = None,
     created_by: str | None = None,
+    conversation_id: str | None = None,
 ) -> CreatedSessionResponse:
     """
     Persist database rows for a bundle already written to artifacts.
@@ -11607,6 +11608,7 @@ def _persist_stored_session_bundle(
         inference_kwargs["model_override"] = inference_model
     try:
         created = conversation_store.create_session_with_agent(
+            conversation_id=conversation_id,
             agent_id=agent_id,
             agent_name=agent_name,
             agent_bundle_location=agent_bundle_location,
@@ -11675,6 +11677,7 @@ def _persist_session_for_uploaded_agent(
     inference_snapshot: dict[str, Any] | None = None,
     inference_model: str | None = None,
     git_branch: str | None = None,
+    conversation_id: str | None = None,
 ) -> CreatedSessionResponse:
     """
     Persist a top-level session bound to the agent row of an earlier, identical upload.
@@ -11692,6 +11695,7 @@ def _persist_session_for_uploaded_agent(
     """
     try:
         conversation = conversation_store.create_conversation(
+            conversation_id=conversation_id,
             agent_id=agent.id,
             title=metadata.title,
             runner_id=runner_id,

@@ -1,11 +1,14 @@
+import type { ReactNode } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { BotIcon, ChevronRightIcon } from "lucide-react";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
+import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { fetchConversationById } from "@/hooks/useOpenSessionRow";
 import { useSessionBadgeStates } from "@/hooks/useSessionBadgeStates";
-import { Link } from "@/lib/routing";
+import { Link, useSearchParams } from "@/lib/routing";
 import { findCachedListRow } from "@/lib/sessionListCache";
+import { sessionAgentIdentity } from "@/lib/sessionAgentIdentity";
 import { cn } from "@/lib/utils";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
 import { projectSessionPanelSearch, ticketSessionSearch } from "./projectHomeNavigation";
@@ -30,15 +33,30 @@ export function TicketSessionLink({
   showStatus = false,
   ticketId,
   involvement,
+  label,
+  icon,
+  to,
 }: {
   sessionId: string;
   showStatus?: boolean;
   ticketId?: string;
   involvement?: string;
+  label?: string;
+  icon?: ReactNode;
+  to?: string;
 }) {
   const mobile = useIsMobileViewport();
-  const { query, title } = useTicketSessionMetadata(sessionId, showStatus);
+  const [search] = useSearchParams();
+  const { query, title: sessionTitle } = useTicketSessionMetadata(sessionId, showStatus);
   const session = query.data;
+  const agent = session
+    ? sessionAgentIdentity({
+        agentName: session.agent_name,
+        harness: session.harness,
+        labels: session.labels,
+      })
+    : null;
+  const title = label ?? (showStatus ? agent?.displayName : undefined) ?? sessionTitle;
   const [state] = useSessionBadgeStates(session ? [session] : []);
   const unavailable = query.isError || session === null;
   const awaiting = !unavailable && !session?.archived && state?.kind === "awaiting";
@@ -65,21 +83,26 @@ export function TicketSessionLink({
           ? "flex min-w-0 flex-1 items-start gap-3 rounded-lg p-3 transition-colors hover:bg-muted/40 focus-visible:ring-inset"
           : "inline-block max-w-full align-bottom wrap-anywhere hover:underline",
       )}
-      title={`${title} (${sessionId})`}
+      title={`${sessionTitle} (${sessionId})`}
       aria-label={
         showStatus ? `${awaiting ? "Respond to" : "Open chat with"}: ${title}` : undefined
       }
       to={
-        ticketId
-          ? ticketSessionSearch(ticketId, sessionId)
+        to ??
+        (ticketId
+          ? ticketSessionSearch(ticketId, sessionId, search)
           : mobile
             ? `/c/${encodeURIComponent(sessionId)}`
-            : projectSessionPanelSearch(sessionId)
+            : projectSessionPanelSearch(sessionId))
       }
     >
-      {showStatus && (
-        <BotIcon aria-hidden className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
-      )}
+      {showStatus &&
+        (icon ??
+          (agent ? (
+            <ComposerAgentIcon agent={agent} className="mt-0.5 text-muted-foreground" />
+          ) : (
+            <BotIcon aria-hidden className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+          )))}
       <span className={showStatus ? "min-w-0 flex-1 space-y-1 text-sm" : undefined}>
         <span className={showStatus ? "block font-medium wrap-anywhere" : undefined}>{title}</span>
         {showStatus && (

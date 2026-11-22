@@ -66,7 +66,8 @@ async def project_orchestrator_instructions(
     instructions = []
     if snapshot.get("project_id"):
         instructions.append(PROJECT_TICKET_WORK_INSTRUCTION)
-    if snapshot.get("project_orchestrator") is True:
+    # Legacy server response fallback; remove in 0.25.0.
+    if snapshot.get("project_main_session", snapshot.get("project_orchestrator")) is True:
         instructions.append(PROJECT_ORCHESTRATOR_INSTRUCTION)
     return "\n\n".join(instructions) or None
 

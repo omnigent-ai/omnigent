@@ -48,6 +48,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
 
 TICKET_ACTIVITY_SESSION_MAX = 100
+TICKET_SUMMARY_SCAN_MAX = 1000
 
 
 @dataclass(frozen=True)
@@ -196,7 +197,8 @@ class ProjectTicketStore:
                 created_at=now_epoch(),
                 notification_state=NOTIFICATION_SKIPPED
                 if actor.session_id is not None
-                and actor.session_id == project.orchestrator_session_id
+                and actor.session_id
+                == (project.main_session_id or project.legacy_orchestrator_session_id)
                 else NOTIFICATION_PENDING,
             )
         )
@@ -269,6 +271,27 @@ class ProjectTicketStore:
                 "data": [_ticket(row) for row in rows[:limit]],
                 "has_more": len(rows) > limit,
                 "last_id": rows[min(limit, len(rows)) - 1].id if rows else None,
+            }
+
+    def summary(self, project_id: str, *, user_id: str | None) -> dict[str, Any]:
+        with self._session("ticket_response_summary") as session:
+            project = self._project(session, project_id, user_id)
+            # Labels are encrypted; bound the read and report partial counts explicitly.
+            labels = session.scalars(
+                select(SqlProjectTicket.labels)
+                .where(
+                    SqlProjectTicket.workspace_id == project.workspace_id,
+                    SqlProjectTicket.project_id == project.id,
+                )
+                .order_by(SqlProjectTicket.created_at, SqlProjectTicket.id)
+                .limit(TICKET_SUMMARY_SCAN_MAX + 1)
+            ).all()
+            return {
+                "needs_response_count": sum(
+                    any(label.get("key") == "needs-human" for label in ticket_labels)
+                    for ticket_labels in labels[:TICKET_SUMMARY_SCAN_MAX]
+                ),
+                "is_complete": len(labels) <= TICKET_SUMMARY_SCAN_MAX,
             }
 
     def _stage_rows(

@@ -1,6 +1,7 @@
 import { SelectionPopup } from "./SelectionPopup";
 import { EditSentMessageContext, useEditSentMessage } from "./editSentMessage";
 import { SideChatSettings } from "./SideChatSettings";
+import { AssistantPresentationContext, type ChatPresentation } from "./assistantPresentation";
 import {
   useCallback,
   useEffect,
@@ -246,6 +247,9 @@ function writeInheritedBoundary(childId: string, ids: Set<string>): void {
 
 /** A grid cell's extra composer controls, and its Shift+Tab permission cycle. */
 interface GridComposerSlots {
+  workspace?: ReactNode;
+  placeholder?: string;
+  sendDisabledReason?: string;
   leading?: ReactNode;
   trailing?: ReactNode;
   /** Steps the cell's permission mode; returns whether it took the key. */
@@ -283,6 +287,7 @@ export function SideChatPane({
   evenComposerPadding = false,
   transcriptTopInset,
   gridComposer,
+  presentation,
 }: {
   childId: string;
   selectionParentId?: string;
@@ -300,6 +305,7 @@ export function SideChatPane({
    * the session's shared draft (tags, review comments) as the full-screen composer does.
    */
   gridComposer?: GridComposerSlots;
+  presentation?: ChatPresentation;
 }) {
   const pending = isPendingSideChat(childId);
   // A grid cell edits its own composer entry, apart from a sub-agent tab of the same id.
@@ -557,138 +563,151 @@ export function SideChatPane({
     }
   };
 
+  const assistantPresentation = useMemo(
+    () => ({
+      identity: presentation?.assistant,
+      extras: presentation?.responseExtras?.(bubbles),
+    }),
+    [presentation, bubbles],
+  );
+
   return (
     <ConversationScopeContext.Provider value={childId}>
-      {/* Keys pressed in here belong to the side chat, not the parent's question. */}
-      <div className="side-chat-backdrop flex h-full min-h-0 flex-col" data-side-chat-pane="">
-        {replaceDraftDialog}
-        <div
-          ref={transcriptRef}
-          className="flex min-h-0 flex-1 flex-col overflow-y-auto px-3 py-4"
-          style={
-            transcriptTopInset ? { paddingTop: `calc(1rem + ${transcriptTopInset})` } : undefined
-          }
-          onScroll={(event) => {
-            const node = event.currentTarget;
-            followTail.current = node.scrollHeight - node.scrollTop - node.clientHeight < 64;
-          }}
-        >
-          {fullSession && state.hasMoreHistory && (
-            <Button
-              variant="ghost"
-              size="sm"
-              disabled={state.loadingMoreHistory}
-              onClick={() => {
-                followTail.current = false;
-                void useChatStore.getState().loadMoreHistory(childId);
-              }}
-            >
-              {state.loadingMoreHistory ? "Loading…" : "Load earlier messages"}
-            </Button>
-          )}
-          {loadFailed ? (
-            <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
-              <TriangleAlertIcon className="size-6 text-muted-foreground" />
-              <p className="text-ui font-medium text-foreground">
-                {fullSession ? "Couldn’t load this session" : "Couldn’t load this side chat"}
-              </p>
-              <p className="max-w-[36ch] text-sm text-muted-foreground">
-                {conversationLoadError?.message ?? "Please try again."}
-              </p>
+      <AssistantPresentationContext.Provider value={assistantPresentation}>
+        {/* Keys pressed in here belong to the side chat, not the parent's question. */}
+        <div className="side-chat-backdrop flex h-full min-h-0 flex-col" data-side-chat-pane="">
+          {replaceDraftDialog}
+          <div
+            ref={transcriptRef}
+            className="flex min-h-0 flex-1 flex-col overflow-y-auto px-3 py-4"
+            style={
+              transcriptTopInset ? { paddingTop: `calc(1rem + ${transcriptTopInset})` } : undefined
+            }
+            onScroll={(event) => {
+              const node = event.currentTarget;
+              followTail.current = node.scrollHeight - node.scrollTop - node.clientHeight < 64;
+            }}
+          >
+            {presentation?.header?.(isEmpty)}
+            {fullSession && state.hasMoreHistory && (
               <Button
-                type="button"
+                variant="ghost"
                 size="sm"
-                variant="outline"
-                className="mt-1"
-                onClick={() => void ensureConversationStreamed(childId)}
+                disabled={state.loadingMoreHistory}
+                onClick={() => {
+                  followTail.current = false;
+                  void useChatStore.getState().loadMoreHistory(childId);
+                }}
               >
-                Retry
+                {state.loadingMoreHistory ? "Loading…" : "Load earlier messages"}
               </Button>
-            </div>
-          ) : fullSession && loadingConversation && bubbles.length === 0 ? (
-            <p role="status" className="m-auto text-sm text-muted-foreground">
-              Loading session…
-            </p>
-          ) : isEmpty && launch !== null ? (
-            <RunnerStartingIndicator variant="hero" status={launch} />
-          ) : isEmpty ? (
-            <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
-              <MessagesSquareIcon className="size-6 text-muted-foreground" />
-              <p className="text-ui font-medium text-foreground">
-                {fullSession ? "No messages yet" : "Side chat"}
+            )}
+            {loadFailed ? (
+              <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
+                <TriangleAlertIcon className="size-6 text-muted-foreground" />
+                <p className="text-ui font-medium text-foreground">
+                  {fullSession ? "Couldn’t load this session" : "Couldn’t load this side chat"}
+                </p>
+                <p className="max-w-[36ch] text-sm text-muted-foreground">
+                  {conversationLoadError?.message ?? "Please try again."}
+                </p>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  className="mt-1"
+                  onClick={() => void ensureConversationStreamed(childId)}
+                >
+                  Retry
+                </Button>
+              </div>
+            ) : fullSession && loadingConversation && bubbles.length === 0 ? (
+              <p role="status" className="m-auto text-sm text-muted-foreground">
+                Loading session…
               </p>
-              {!fullSession && (
-                <p className="max-w-[36ch] text-sm text-muted-foreground">{EMPTY_STATE_BODY}</p>
+            ) : isEmpty && launch !== null ? (
+              <RunnerStartingIndicator variant="hero" status={launch} />
+            ) : isEmpty && presentation?.header ? (
+              <div className="flex-1" />
+            ) : isEmpty ? (
+              <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
+                <MessagesSquareIcon className="size-6 text-muted-foreground" />
+                <p className="text-ui font-medium text-foreground">
+                  {fullSession ? "No messages yet" : "Side chat"}
+                </p>
+                {!fullSession && (
+                  <p className="max-w-[36ch] text-sm text-muted-foreground">{EMPTY_STATE_BODY}</p>
+                )}
+              </div>
+            ) : (
+              <div ref={listRef} className="flex flex-col gap-4">
+                <EditSentMessageContext.Provider
+                  value={readOnly || starting ? null : editSentMessage}
+                >
+                  {bubbles.map((bubble, index) => (
+                    <BubbleView
+                      key={bubbleKey(bubble)}
+                      bubble={bubble}
+                      isLastAssistant={index === lastAssistantIndex}
+                      showsWorking={showsWorking}
+                      recoveryDisabled={readOnly}
+                    />
+                  ))}
+                </EditSentMessageContext.Provider>
+                <WorkingIndicatorRow key={childId} show={showsWorkingRow} />
+                {!showsWorkingRow && launch !== null && (
+                  <RunnerStartingIndicator variant="row" status={launch} />
+                )}
+                <div ref={bottomRef} />
+              </div>
+            )}
+          </div>
+          {launch !== null && (
+            // A full session's composer is hidden when read-only, so the banner keeps its own gap.
+            <SandboxActionBanner
+              conversationId={childId}
+              className={cn("mx-3 shrink-0", readOnly && "mb-3")}
+            />
+          )}
+          {!readOnly && !starting && (
+            <SelectionPopup
+              containerRef={transcriptRef}
+              onReply={(text) => {
+                useChatStore.getState().updateSideChatComposer(composerKey, (current) => ({
+                  ...current,
+                  ...appendReplyQuote(current, text),
+                }));
+              }}
+            />
+          )}
+          {(!fullSession || !readOnly) && (
+            <div className={cn("shrink-0 px-3 pt-3", evenComposerPadding ? "pb-3" : "pb-5")}>
+              {readOnly ? (
+                <p className="rounded-md border border-border bg-muted/40 px-3 py-2 text-center text-sm text-muted-foreground">
+                  This side chat has ended and can’t be continued.
+                </p>
+              ) : (
+                <SideChatComposer
+                  fullSession={fullSession}
+                  childId={childId}
+                  harness={sessionHarness}
+                  session={session}
+                  settingsSession={pending ? draftSource : session}
+                  agentId={boundAgentId}
+                  responseId={activeResponse?.responseId}
+                  interruptReady={interruptReady}
+                  busy={showsWorking}
+                  pending={pending}
+                  starting={starting}
+                  onStart={onStart ? startSideChat : undefined}
+                  onSend={followSentMessage}
+                  gridComposer={gridComposer}
+                />
               )}
-            </div>
-          ) : (
-            <div ref={listRef} className="flex flex-col gap-4">
-              <EditSentMessageContext.Provider
-                value={readOnly || starting ? null : editSentMessage}
-              >
-                {bubbles.map((bubble, index) => (
-                  <BubbleView
-                    key={bubbleKey(bubble)}
-                    bubble={bubble}
-                    isLastAssistant={index === lastAssistantIndex}
-                    showsWorking={showsWorking}
-                    recoveryDisabled={readOnly}
-                  />
-                ))}
-              </EditSentMessageContext.Provider>
-              <WorkingIndicatorRow key={childId} show={showsWorkingRow} />
-              {!showsWorkingRow && launch !== null && (
-                <RunnerStartingIndicator variant="row" status={launch} />
-              )}
-              <div ref={bottomRef} />
             </div>
           )}
         </div>
-        {launch !== null && (
-          // A full session's composer is hidden when read-only, so the banner keeps its own gap.
-          <SandboxActionBanner
-            conversationId={childId}
-            className={cn("mx-3 shrink-0", readOnly && "mb-3")}
-          />
-        )}
-        {!readOnly && !starting && (
-          <SelectionPopup
-            containerRef={transcriptRef}
-            onReply={(text) => {
-              useChatStore.getState().updateSideChatComposer(composerKey, (current) => ({
-                ...current,
-                ...appendReplyQuote(current, text),
-              }));
-            }}
-          />
-        )}
-        {(!fullSession || !readOnly) && (
-          <div className={cn("shrink-0 px-3 pt-3", evenComposerPadding ? "pb-3" : "pb-5")}>
-            {readOnly ? (
-              <p className="rounded-md border border-border bg-muted/40 px-3 py-2 text-center text-sm text-muted-foreground">
-                This side chat has ended and can’t be continued.
-              </p>
-            ) : (
-              <SideChatComposer
-                fullSession={fullSession}
-                childId={childId}
-                harness={sessionHarness}
-                session={session}
-                settingsSession={pending ? draftSource : session}
-                agentId={boundAgentId}
-                responseId={activeResponse?.responseId}
-                interruptReady={interruptReady}
-                busy={showsWorking}
-                pending={pending}
-                starting={starting}
-                onStart={onStart ? startSideChat : undefined}
-                onSend={followSentMessage}
-                gridComposer={gridComposer}
-              />
-            )}
-          </div>
-        )}
-      </div>
+      </AssistantPresentationContext.Provider>
     </ConversationScopeContext.Provider>
   );
 }
@@ -971,9 +990,10 @@ function SideChatComposer({
     return () => document.removeEventListener("focusin", cancelOnOtherInput);
   }, [autoFocus, ready, dropFocusRequest]);
   const canSend =
-    serializeReplyDraft({ quotes, text }).trim().length > 0 ||
-    (!pending && files.length > 0) ||
-    reviewComments.length > 0;
+    !gridComposer?.sendDisabledReason &&
+    (serializeReplyDraft({ quotes, text }).trim().length > 0 ||
+      (!pending && files.length > 0) ||
+      reviewComments.length > 0);
   // The tags and review comments a send carries. A grid cell's come from its session draft.
   const sharedTags = presentTaggedMentions(sessionMentions, [
     text,
@@ -1308,6 +1328,7 @@ function SideChatComposer({
           />
         </TooltipProvider>
       )}
+      {gridComposer?.workspace}
       <ChatComposer
         hasContent={!pending && files.length > 0}
         data-side-chat="true"
@@ -1327,7 +1348,11 @@ function SideChatComposer({
           },
           // Menu rows preventDefault on mousedown so selecting one keeps focus.
           onBlur: () => setInputFocused(false),
-          placeholder: fullSession ? "Reply to this session..." : "Ask a side question...",
+          placeholder:
+            gridComposer?.sendDisabledReason ??
+            gridComposer?.placeholder ??
+            (fullSession ? "Reply to this session..." : "Ask a side question..."),
+          "aria-label": fullSession ? "Message the agent" : "Ask a side question",
           rows: gridComposer ? 1 : undefined,
           disabled: !ready,
           "data-testid": "side-chat-input",

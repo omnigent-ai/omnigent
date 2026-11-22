@@ -3,6 +3,7 @@ import {
   DEFAULT_TICKET_STAGES,
   createTicket,
   getTicket,
+  getTicketSummary,
   getTicketStages,
   listTickets,
   setTicketSessionInvolvement,
@@ -25,6 +26,18 @@ const event: TicketEvent = {
   payload: {},
   created_at: 1000,
 };
+
+it("reads the project-wide response summary without fetching board pages", async () => {
+  const summary = { needs_response_count: 4, is_complete: true };
+  const fetchMock = vi.fn(async () => new Response(JSON.stringify(summary)));
+  vi.stubGlobal("fetch", fetchMock);
+  expect(await getTicketSummary("project one")).toEqual(summary);
+  expect(fetchMock).toHaveBeenCalledOnce();
+  expect(fetchMock).toHaveBeenCalledWith(
+    "/v1/projects/project%20one/tickets/summary",
+    expect.objectContaining({ method: "GET" }),
+  );
+});
 
 it.each([{ labels: [] }, { labels: [{ key: "needs-human", value: "approval" }, { key: "area" }] }])(
   "uses labels for ticket creation and replacement: %j",

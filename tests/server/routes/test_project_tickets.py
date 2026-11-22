@@ -1,3 +1,4 @@
+import asyncio
 import json
 from unittest.mock import AsyncMock
 from uuid import uuid4
@@ -5,6 +6,7 @@ from uuid import uuid4
 import pytest
 
 from omnigent.entities import MessageData
+from omnigent.entities.project_ticket import CreateTicket, TicketActor
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
     HostHelloFrame,
@@ -15,16 +17,21 @@ from omnigent.host.frames import (
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runtime.project_ticket_instructions import PROJECT_TICKET_WORK_INSTRUCTION
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, RESERVED_USER_PUBLIC
+from omnigent.server.managed_hosts import parse_sandbox_config
 from omnigent.server.project_ticket_notifications import ProjectTicketNotifications
 from omnigent.server.routes import project_tickets as ticket_routes
+from omnigent.server.routes.sessions import routes_core
 from omnigent.server.sharing_settings import DefaultPublicSessions
 from omnigent.stores.conversation_store import SessionActivity
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+from omnigent.stores.project_ticket_store import ProjectTicketStore
 from tests._helpers.polling import poll_until_async
-from tests.server.helpers import register_test_runner
+from tests._helpers.session import post_session_bundle
+from tests.server.helpers import build_agent_bundle, register_test_runner
 from tests.server.integration.test_sessions_attribution import _bind_runner
 from tests.server.integration.test_sessions_permissions import _register_online_host
 from tests.server.integration.test_sessions_web_send_stable_id import _stub_runner
@@ -36,13 +43,19 @@ from tests.server.routes.test_projects_crud import project_app as project_app
 from tests.server.routes.test_projects_crud import project_client as project_client
 
 
-async def test_project_creation_has_one_normal_orchestrator(project_client, db_uri):
-    project = (await project_client.post("/v1/projects", json={"name": "Shipping"})).json()
-    session_id = project["orchestrator_session_id"]
+async def test_project_creation_has_one_normal_main_session(project_client, db_uri):
+    headers = {"Idempotency-Key": str(uuid4())}
+    project = (
+        await project_client.post("/v1/projects", json={"name": "Shipping"}, headers=headers)
+    ).json()
+    session_id = project["main_session_id"]
     session = (await project_client.get(f"/v1/sessions/{session_id}")).json()
-    assert session["title"] == "Orchestrator"
+    assert session["title"] == "Main"
     assert session["project_id"] == project["id"]
-    assert session["project_orchestrator"] is True
+    assert session["project_main_session"] is True
+    assert session["agent_name"] == "maestro"
+    assert session["project_orchestrator"] is True  # Compatibility alias through 0.25.0.
+    assert project["main_session_state"] == "active"
     assert session["status"] == "idle"
     assert session.get("active_response_id") is None
     assert len(session["items"]) == 1
@@ -54,14 +67,18 @@ async def test_project_creation_has_one_normal_orchestrator(project_client, db_u
         {"type": "output_text", "text": "Hello, what would you like to work on?"}
     ]
     assert SqlAlchemyConversationStore(db_uri).get_conversation(session_id).kind == "default"
-    again = await project_client.post(f"/v1/projects/{project['id']}/orchestrator")
-    assert again.json()["orchestrator_session_id"] == session_id
+    again = await project_client.post("/v1/projects", json={"name": "Shipping"}, headers=headers)
+    assert again.json()["main_session_id"] == session_id
+    assert (
+        await project_client.post(f"/v1/projects/{project['id']}/orchestrator")
+    ).status_code == 404
     assert (await project_client.get(f"/v1/sessions/{session_id}")).json()["items"] == [greeting]
     info = (await project_client.get("/v1/info")).json()
     assert info["project_tickets"] is True
     assert info["project_ticket_lifecycle"] is True
     assert info["project_ticket_agent_involvement"] is True
     assert info["project_ticket_stages"] is True
+    assert info["project_ticket_summary"] is True
     assert info["durable_initial_input"] is False
 
     worker = (
@@ -70,14 +87,30 @@ async def test_project_creation_has_one_normal_orchestrator(project_client, db_u
             json={
                 "agent_id": PROJECT_AGENT_ID,
                 "project_id": project["id"],
-                "title": "Orchestrator",
+                "title": "Main",
             },
         )
     ).json()
     worker = (await project_client.get(f"/v1/sessions/{worker['id']}")).json()
     assert worker["project_id"] == project["id"]
-    assert worker["project_orchestrator"] is False
+    assert worker["project_main_session"] is False
     assert worker["items"] == []
+
+
+async def test_ticket_response_summary_is_owner_private(multi_user_client, db_uri):
+    project = SqlAlchemyProjectStore(db_uri).create(uuid4().hex, "Summary", ALICE)
+    ProjectTicketStore(db_uri).create(
+        project.id,
+        CreateTicket(title="Needs a decision", labels=[{"key": "needs-human"}]),
+        TicketActor(ALICE),
+    )
+    path = f"/v1/projects/{project.id}/tickets/summary"
+    response = await multi_user_client.get(path, headers=_as_user(ALICE))
+    assert response.status_code == 200
+    assert response.json() == {"needs_response_count": 1, "is_complete": True}
+    assert (await multi_user_client.get(path, headers=_as_user(BOB))).status_code == 404
+    info = (await multi_user_client.get("/v1/info", headers=_as_user(ALICE))).json()
+    assert info["project_ticket_summary"] is True
 
 
 async def test_orchestrator_inherits_defaults_but_not_public_sharing(
@@ -94,7 +127,7 @@ async def test_orchestrator_inherits_defaults_but_not_public_sharing(
     )
     assert response.status_code == 200, response.text
     project = response.json()
-    session_id = project["orchestrator_session_id"]
+    session_id = project["main_session_id"]
     conversation = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
     assert conversation.agent_id == PROJECT_AGENT_ID
     assert conversation.workspace == "/work/board"
@@ -107,25 +140,51 @@ async def test_orchestrator_inherits_defaults_but_not_public_sharing(
     ).status_code == 404
 
 
-async def test_empty_agent_catalog_leaves_no_broken_project(
+async def test_missing_maestro_requires_explicit_agent_and_is_retryable(
     project_client, project_agents, db_uri
 ):
-    project_agents.delete(PROJECT_AGENT_ID)
-    response = await project_client.post("/v1/projects", json={"name": "Unconfigured"})
+    project_agents.delete(project_agents.get_by_name("maestro").id)
+    headers = {"Idempotency-Key": str(uuid4())}
+    response = await project_client.post(
+        "/v1/projects", json={"name": "Unconfigured"}, headers=headers
+    )
     assert response.status_code == 400
     assert "available project agent" in response.text
     assert SqlAlchemyProjectStore(db_uri).list(user_id=None) == []
     assert SqlAlchemyConversationStore(db_uri).list_conversations().data == []
+    retry = await project_client.post(
+        "/v1/projects",
+        json={
+            "name": "Unconfigured",
+            "config": {"agent_id": PROJECT_AGENT_ID},
+        },
+        headers=headers,
+    )
+    assert retry.status_code == 200, retry.text
+    session = (await project_client.get(f"/v1/sessions/{retry.json()['main_session_id']}")).json()
+    assert session["agent_name"] == "project-agent"
 
 
-async def test_existing_project_can_initialize_its_orchestrator(project_client, db_uri):
+async def test_existing_project_initializes_main_through_ordinary_sessions(project_client, db_uri):
     project = SqlAlchemyProjectStore(db_uri).create(uuid4().hex, "Existing", None)
-    first = await project_client.post(f"/v1/projects/{project.id}/orchestrator")
-    second = await project_client.post(f"/v1/projects/{project.id}/orchestrator")
-    assert first.status_code == second.status_code == 200
-    assert first.json()["orchestrator_session_id"] == second.json()["orchestrator_session_id"]
-    session_id = first.json()["orchestrator_session_id"]
+    headers = {"Idempotency-Key": str(uuid4())}
+    body = {
+        "project_id": project.id,
+        "project_main_session": True,
+        "expected_main_session_id": None,
+    }
+    before = (await project_client.get(f"/v1/projects/{project.id}")).json()
+    assert before["main_session_id"] is None and before["main_session_state"] == "absent"
+    first = await project_client.post("/v1/sessions", json=body, headers=headers)
+    second = await project_client.post("/v1/sessions", json=body, headers=headers)
+    assert first.status_code == second.status_code == 201
+    assert first.json()["id"] == second.json()["id"]
+    session_id = first.json()["id"]
+    assert (await project_client.get(f"/v1/projects/{project.id}")).json()[
+        "main_session_id"
+    ] == session_id
     session = (await project_client.get(f"/v1/sessions/{session_id}")).json()
+    assert session["title"] == "Main"
     assert len(session["items"]) == 1
     assert session["items"][0]["data"]["content"][0]["text"] == (
         "Hello, what would you like to work on?"
@@ -133,44 +192,432 @@ async def test_existing_project_can_initialize_its_orchestrator(project_client, 
     assert len(SqlAlchemyConversationStore(db_uri).list_conversations().data) == 1
 
 
-async def test_failed_launch_can_retry_without_a_dangling_project_role(
+async def test_failed_launch_retains_main_chat_and_idempotent_retry_does_not_relaunch(
     project_client, db_uri, monkeypatch
 ):
     projects = SqlAlchemyProjectStore(db_uri)
     project = projects.create(uuid4().hex, "Retry", None)
+    headers = {"Idempotency-Key": str(uuid4())}
+    body = {
+        "project_id": project.id,
+        "project_main_session": True,
+        "expected_main_session_id": None,
+    }
     with monkeypatch.context() as launch_failure:
         launch_failure.setattr(
             "omnigent.server.routes.sessions.routes_core._get_runner_client",
             AsyncMock(side_effect=OmnigentError("Launch failed", code=ErrorCode.INVALID_INPUT)),
         )
-        response = await project_client.post(f"/v1/projects/{project.id}/orchestrator")
-    assert response.status_code == 400
-    assert projects.get(project.id, user_id=None).orchestrator_session_id is None
-    assert SqlAlchemyConversationStore(db_uri).list_conversations().data == []
+        response = await project_client.post("/v1/sessions", json=body, headers=headers)
+    assert response.status_code == 201, response.text
+    session_id = response.json()["id"]
+    assert projects.get(project.id, user_id=None).main_session_id == session_id
+    assert response.json()["last_task_error"]["message"] == "Launch failed"
+    assert response.json()["status"] == "failed"
+    retry = await project_client.post("/v1/sessions", json=body, headers=headers)
+    assert retry.status_code == 201
+    assert retry.json()["id"] == session_id
+    assert len(SqlAlchemyConversationStore(db_uri).list_conversations().data) == 1
 
-    retry = await project_client.post(f"/v1/projects/{project.id}/orchestrator")
-    assert retry.status_code == 200
-    assert retry.json()["orchestrator_session_id"] is not None
+
+@pytest.mark.parametrize("bundled", [False, True])
+@pytest.mark.parametrize("enqueue_fails", [False, True])
+async def test_main_multipart_binds_before_attachment_input_or_launch(
+    multi_user_client, multi_user_app, db_uri, monkeypatch, bundled, enqueue_fails
+):
+    app = multi_user_app
+    projects = SqlAlchemyProjectStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    project = projects.create(uuid4().hex, "Attachments", ALICE)
+    app.state.host_store = HostStore(db_uri)
+    app.state.sandbox_config = parse_sandbox_config(
+        {
+            "provider": "modal",
+            "server_url": "https://managed.example.test",
+            "modal": {"image": "docker.io/test/omnigent-host:latest"},
+        }
+    )
+    startup = app.state.startup_inputs
+    enqueue = startup.enqueue
+    launches = []
+
+    async def accept_input(session_id, event, **kwargs):
+        assert projects.get(project.id, user_id=ALICE).main_session_id == session_id
+        assert event.data["content"][0]["type"] == "input_file"
+        if enqueue_fails:
+            raise RuntimeError("input storage is unavailable")
+        return await enqueue(session_id, event, **kwargs)
+
+    async def capture_launch(**kwargs):
+        session_id = kwargs["session_id"]
+        assert projects.get(project.id, user_id=ALICE).main_session_id == session_id
+        assert len(conversations.list_pending_inputs(session_id)) == 1
+        launches.append(session_id)
+
+    monkeypatch.setattr(startup, "enqueue", accept_input)
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.routes_core._run_managed_launch", capture_launch
+    )
+    metadata = {
+        "project_id": project.id,
+        "project_main_session": True,
+        "expected_main_session_id": None,
+        "host_type": "managed",
+        "initial_input": {
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Use the attachment"},
+                ],
+            },
+        },
+    }
+    files = [("initial_files", ("context.txt", b"project context", "text/plain"))]
+    if bundled:
+        files.append(
+            ("bundle", ("agent.tar.gz", build_agent_bundle("conductor"), "application/gzip"))
+        )
+    else:
+        metadata.update(
+            {
+                "agent_id": PROJECT_AGENT_ID,
+                "harness_override": "codex",
+                "model_override": "gpt-5.4-mini",
+                "reasoning_effort": "high",
+            }
+        )
+    headers = {**_as_user(ALICE), "Idempotency-Key": str(uuid4())}
+    try:
+        response = await multi_user_client.post(
+            "/v1/sessions", data={"metadata": json.dumps(metadata)}, files=files, headers=headers
+        )
+        assert response.status_code == 201, response.text
+        session_id = response.json()["session_id" if bundled else "id"]
+        assert projects.get(project.id, user_id=ALICE).main_session_id == session_id
+        conversation = conversations.get_conversation(session_id)
+        assert conversation is not None
+        stored = SqlAlchemyFileStore(db_uri).list(session_id=session_id).data
+        assert len(stored) == 1 and stored[0].filename == "context.txt"
+        snapshot = (
+            await multi_user_client.get(f"/v1/sessions/{session_id}", headers=headers)
+        ).json()
+        if enqueue_fails:
+            assert snapshot["status"] == "failed" and snapshot["last_task_error"]
+            assert launches == []
+        else:
+            await poll_until_async(lambda: bool(launches), timeout_s=5)
+            assert launches == [session_id]
+            assert len(conversations.list_pending_inputs(session_id)) == 1
+        if not bundled:
+            assert (
+                conversation.harness_override,
+                conversation.model_override,
+                conversation.reasoning_effort,
+            ) == ("codex", "gpt-5.4-mini", "high")
+        retry = await multi_user_client.post(
+            "/v1/sessions", data={"metadata": json.dumps(metadata)}, files=files, headers=headers
+        )
+        assert retry.status_code == 201, retry.text
+        assert retry.json()["session_id" if bundled else "id"] == session_id
+        assert len(SqlAlchemyFileStore(db_uri).list(session_id=session_id).data) == 1
+        assert launches == ([] if enqueue_fails else [session_id])
+    finally:
+        await startup.shutdown()
 
 
-async def test_concurrent_initializer_uses_normal_session_teardown(
+async def test_concurrent_replacement_cannot_overwrite_winner_or_launch_loser(
     project_client, db_uri, monkeypatch
 ):
     projects = SqlAlchemyProjectStore(db_uri)
     conversations = SqlAlchemyConversationStore(db_uri)
     project = projects.create(uuid4().hex, "Concurrent", None)
     winner = conversations.create_conversation(project_id=project.id, agent_id=PROJECT_AGENT_ID)
-    attach = SqlAlchemyProjectStore.set_orchestrator
+    attach = SqlAlchemyProjectStore.set_main_session
 
-    def attach_winner(store, project_id, session_id, *, user_id):
-        return attach(store, project_id, winner.id, user_id=user_id)
+    def attach_winner(store, project_id, session_id, *, user_id, expected_main_session_id=None):
+        attach(store, project_id, winner.id, user_id=user_id)
+        return attach(
+            store,
+            project_id,
+            session_id,
+            user_id=user_id,
+            expected_main_session_id=expected_main_session_id,
+        )
 
-    monkeypatch.setattr(SqlAlchemyProjectStore, "set_orchestrator", attach_winner)
-    response = await project_client.post(f"/v1/projects/{project.id}/orchestrator")
-    assert response.status_code == 200, response.text
-    assert response.json()["orchestrator_session_id"] == winner.id
+    monkeypatch.setattr(SqlAlchemyProjectStore, "set_main_session", attach_winner)
+    launch = AsyncMock()
+    monkeypatch.setattr("omnigent.server.routes.sessions.routes_core._get_runner_client", launch)
+    response = await project_client.post(
+        "/v1/sessions",
+        json={
+            "project_id": project.id,
+            "project_main_session": True,
+            "expected_main_session_id": None,
+        },
+        headers={"Idempotency-Key": str(uuid4())},
+    )
+    assert response.status_code == 409, response.text
+    assert projects.get(project.id, user_id=None).main_session_id == winner.id
+    launch.assert_not_called()
     assert [session.id for session in conversations.list_conversations().data] == [winner.id]
     assert (await project_client.get(f"/v1/sessions/{winner.id}")).json()["items"] == []
+
+
+@pytest.mark.parametrize("new_project", [False, True])
+async def test_same_key_concurrent_creations_keep_one_session(
+    project_client, db_uri, monkeypatch, new_project
+):
+    prepared = 0
+    both_prepared = asyncio.Event()
+    prepare = routes_core.prepare_main_creation
+
+    async def prepare_together(*args, **kwargs):
+        nonlocal prepared
+        result = await prepare(*args, **kwargs)
+        prepared += 1
+        if prepared >= 2:
+            both_prepared.set()
+        await asyncio.wait_for(both_prepared.wait(), timeout=5)
+        return result
+
+    monkeypatch.setattr(routes_core, "prepare_main_creation", prepare_together)
+    headers = {"Idempotency-Key": str(uuid4())}
+    if new_project:
+        path, body, success = "/v1/projects", {"name": "One operation"}, 200
+    else:
+        project = SqlAlchemyProjectStore(db_uri).create(uuid4().hex, "One operation", None)
+        path, body, success = (
+            "/v1/sessions",
+            {
+                "project_id": project.id,
+                "project_main_session": True,
+                "expected_main_session_id": None,
+            },
+            201,
+        )
+    responses = await asyncio.gather(
+        *[project_client.post(path, json=body, headers=headers) for _ in range(2)]
+    )
+    assert any(response.status_code == success for response in responses)
+    assert all(response.status_code in (success, 409) for response in responses), [
+        r.text for r in responses
+    ]
+    conversations = SqlAlchemyConversationStore(db_uri).list_conversations().data
+    assert len(conversations) == 1
+    retry = await project_client.post(path, json=body, headers=headers)
+    assert retry.status_code == success, retry.text
+    session_id = retry.json()["main_session_id" if new_project else "id"]
+    assert session_id == conversations[0].id
+    assert len(SqlAlchemyConversationStore(db_uri).list_items(session_id).data) == 1
+
+
+@pytest.mark.parametrize(
+    "state", ["absent", "missing", "archived", "active", "inaccessible", "foreign"]
+)
+@pytest.mark.parametrize("bundled", [False, True])
+async def test_main_lifecycle_read_is_nonmutating_and_only_recoverable_states_replace(
+    multi_user_client, multi_user_app, db_uri, state, bundled
+):
+    client = multi_user_client
+    projects = SqlAlchemyProjectStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    project = projects.create(uuid4().hex, "Lifecycle", ALICE)
+    old_id = None
+    if state != "absent":
+        old = conversations.create_conversation(project_id=project.id, agent_id=PROJECT_AGENT_ID)
+        old_id = old.id
+        permissions.grant(ALICE if state != "inaccessible" else BOB, old.id, LEVEL_OWNER)
+        projects.set_main_session(project.id, old.id, user_id=ALICE)
+        if state == "archived":
+            archived = await client.patch(
+                f"/v1/sessions/{old.id}", json={"archived": True}, headers=_as_user(ALICE)
+            )
+            assert archived.status_code == 200, archived.text
+        elif state == "missing":
+            assert (
+                await client.delete(f"/v1/sessions/{old.id}", headers=_as_user(ALICE))
+            ).status_code == 200
+        elif state == "foreign":
+            other = projects.create(uuid4().hex, "Other", ALICE)
+            conversations.set_conversation_project(old.id, other.id)
+    before_count = len(conversations.list_conversations().data)
+    for _ in range(2):
+        snapshot = (await client.get(f"/v1/projects/{project.id}", headers=_as_user(ALICE))).json()
+        assert snapshot["main_session_id"] == old_id
+        assert snapshot["main_session_state"] == (
+            "unavailable" if state in ("inaccessible", "foreign") else state
+        )
+    assert len(conversations.list_conversations().data) == before_count
+    multi_user_app.state.default_public_sessions = lambda: DefaultPublicSessions.ALL
+    headers = {**_as_user(ALICE), "Idempotency-Key": str(uuid4())}
+    metadata = {
+        "project_id": project.id,
+        "project_main_session": True,
+        "expected_main_session_id": old_id,
+    }
+
+    async def submit():
+        if bundled:
+            return await post_session_bundle(
+                client.post,
+                "/v1/sessions",
+                build_agent_bundle("custom-conductor"),
+                metadata=metadata,
+                headers=headers,
+            )
+        return await client.post(
+            "/v1/sessions", json={**metadata, "agent_id": PROJECT_AGENT_ID}, headers=headers
+        )
+
+    result = await submit()
+    if state in ("active", "inaccessible", "foreign"):
+        assert result.status_code == 409, result.text
+        assert projects.get(project.id, user_id=ALICE).main_session_id == old_id
+        assert len(conversations.list_conversations().data) == before_count
+        return
+    assert result.status_code == 201, result.text
+    new_id = result.json()["session_id" if bundled else "id"]
+    assert new_id != old_id
+    assert projects.get(project.id, user_id=ALICE).main_session_id == new_id
+    assert permissions.get(RESERVED_USER_PUBLIC, new_id) is None
+    retry = await submit()
+    assert retry.status_code == 201, retry.text
+    assert retry.json()["session_id" if bundled else "id"] == new_id
+    assert len(conversations.list_conversations().data) == before_count + 1
+    new = (await client.get(f"/v1/sessions/{new_id}", headers=_as_user(ALICE))).json()
+    assert new["project_main_session"] is True
+    assert new["agent_name"] == ("custom-conductor" if bundled else "project-agent")
+    assert new["items"][0]["data"]["model"] == new["agent_name"]
+    if state == "archived":
+        restored = await client.patch(
+            f"/v1/sessions/{old_id}", json={"archived": False}, headers=_as_user(ALICE)
+        )
+        assert restored.status_code == 200
+        assert projects.get(project.id, user_id=ALICE).main_session_id == new_id
+        assert (await client.get(f"/v1/sessions/{old_id}", headers=_as_user(ALICE))).json()[
+            "project_main_session"
+        ] is False
+
+
+async def test_main_creation_requires_owner_idempotency_and_expected_pointer(
+    multi_user_client, db_uri
+):
+    projects = SqlAlchemyProjectStore(db_uri)
+    project = projects.create(uuid4().hex, "Validation", ALICE)
+    body = {
+        "project_id": project.id,
+        "project_main_session": True,
+        "expected_main_session_id": None,
+    }
+    for patch, headers, expected in (
+        ({}, _as_user(ALICE), 400),
+        ({}, {**_as_user(ALICE), "Idempotency-Key": "invalid"}, 400),
+        (
+            {"expected_main_session_id": uuid4().hex},
+            {**_as_user(ALICE), "Idempotency-Key": str(uuid4())},
+            409,
+        ),
+        ({}, {**_as_user(BOB), "Idempotency-Key": str(uuid4())}, 404),
+        (
+            {"parent_session_id": uuid4().hex},
+            {**_as_user(ALICE), "Idempotency-Key": str(uuid4())},
+            422,
+        ),
+    ):
+        response = await multi_user_client.post(
+            "/v1/sessions", json={**body, **patch}, headers=headers
+        )
+        assert response.status_code == expected, response.text
+    assert projects.get(project.id, user_id=ALICE).main_session_id is None
+    assert SqlAlchemyConversationStore(db_uri).list_conversations().data == []
+
+
+async def test_project_main_assignment_validates_target_and_cas(multi_user_client, db_uri):
+    projects = SqlAlchemyProjectStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    project = projects.create(uuid4().hex, "Assignment", ALICE)
+    other = projects.create(uuid4().hex, "Other", ALICE)
+    valid = conversations.create_conversation(project_id=project.id, agent_id=PROJECT_AGENT_ID)
+    permissions.grant(ALICE, valid.id, LEVEL_OWNER)
+    path = f"/v1/projects/{project.id}"
+    for kind in ("missing", "archived", "foreign", "inaccessible", "child"):
+        target = conversations.create_conversation(
+            project_id=other.id if kind == "foreign" else project.id,
+            parent_conversation_id=valid.id if kind == "child" else None,
+        )
+        permissions.grant(BOB if kind == "inaccessible" else ALICE, target.id, LEVEL_OWNER)
+        if kind == "missing":
+            await conversations.delete_conversation(target.id)
+        elif kind == "archived":
+            conversations.update_conversation(target.id, archived=True)
+        rejected = await multi_user_client.patch(
+            path,
+            json={"main_session_id": target.id, "expected_main_session_id": None},
+            headers=_as_user(ALICE),
+        )
+        assert rejected.status_code in (400, 403, 404), rejected.text
+        assert projects.get(project.id, user_id=ALICE).main_session_id is None
+    assigned = await multi_user_client.patch(
+        path,
+        json={"main_session_id": valid.id, "expected_main_session_id": None},
+        headers=_as_user(ALICE),
+    )
+    assert assigned.status_code == 200 and assigned.json()["main_session_id"] == valid.id
+    next_session = conversations.create_conversation(project_id=project.id)
+    permissions.grant(ALICE, next_session.id, LEVEL_OWNER)
+    stale = await multi_user_client.patch(
+        path,
+        json={"main_session_id": next_session.id, "expected_main_session_id": None},
+        headers=_as_user(ALICE),
+    )
+    assert stale.status_code == 409
+    assert projects.get(project.id, user_id=ALICE).main_session_id == valid.id
+
+
+async def test_maestro_session_choices_are_independent_and_do_not_change_agent(
+    project_client, project_agents, db_uri
+):
+    agent = project_agents.get_by_name("maestro")
+    choices = [("codex", "gpt-5.4-mini", "high"), ("claude-sdk", "claude-sonnet-4-6", "medium")]
+    for harness, model, effort in choices:
+        response = await project_client.post(
+            "/v1/projects",
+            json={
+                "name": harness,
+                "config": {
+                    "harness": harness,
+                    "model": model,
+                    "effort": effort,
+                    "workspace": "/work/project",
+                },
+            },
+            headers={"Idempotency-Key": str(uuid4())},
+        )
+        assert response.status_code == 200, response.text
+        session_id = response.json()["main_session_id"]
+        stored = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+        assert (
+            stored.agent_id,
+            stored.harness_override,
+            stored.model_override,
+            stored.reasoning_effort,
+        ) == (agent.id, harness, model, effort)
+        snapshot = (await project_client.get(f"/v1/sessions/{session_id}")).json()
+        assert snapshot["harness"] == harness and snapshot["agent_name"] == "maestro"
+        await project_client.patch(
+            f"/v1/projects/{response.json()['id']}",
+            json={"config": {"harness": "pi", "effort": "low"}},
+        )
+        unchanged = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+        assert (
+            unchanged.harness_override,
+            unchanged.model_override,
+            unchanged.reasoning_effort,
+        ) == (harness, model, effort)
+    assert project_agents.get(agent.id).bundle_location == agent.bundle_location
 
 
 @pytest.mark.parametrize("explicit_host", [False, True])
@@ -199,11 +646,18 @@ async def test_name_only_project_uses_owned_host_home_and_normal_launch(
         elif isinstance(frame, HostLaunchRunnerFrame):
             conversation = SqlAlchemyConversationStore(db_uri).get_conversation(frame.session_id)
             project = SqlAlchemyProjectStore(db_uri).get(conversation.project_id, user_id=ALICE)
-            assert project.orchestrator_session_id == frame.session_id
+            assert project.main_session_id == frame.session_id
             items = SqlAlchemyConversationStore(db_uri).list_items(frame.session_id).data
             assert len(items) == 1 and items[0].type == "message"
             assert isinstance(items[0].data, MessageData)
             assert items[0].data.role == "assistant"
+            assert frame.harness == ("codex" if explicit_host else "claude-sdk")
+            if explicit_host:
+                assert (
+                    conversation.harness_override,
+                    conversation.model_override,
+                    conversation.reasoning_effort,
+                ) == ("codex", "gpt-5.4-mini", "high")
             launches.append(frame)
             connection.pending_launches[frame.request_id].set_result({"status": "launched"})
         else:
@@ -212,11 +666,21 @@ async def test_name_only_project_uses_owned_host_home_and_normal_launch(
     monkeypatch.setattr(app.state.host_registry, "send_text", answer_host)
     response = await multi_user_client.post(
         "/v1/projects",
-        json={"name": "Home board", "config": {"host_id": own_host} if explicit_host else {}},
+        json={
+            "name": "Home board",
+            "config": {
+                "host_id": own_host,
+                "harness": "codex",
+                "model": "gpt-5.4-mini",
+                "effort": "high",
+            }
+            if explicit_host
+            else {},
+        },
         headers=_as_user(ALICE),
     )
     assert response.status_code == 200, response.text
-    session_id = response.json()["orchestrator_session_id"]
+    session_id = response.json()["main_session_id"]
     conversation = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
     assert conversation.host_id == own_host and conversation.workspace == "/home/owner"
     assert conversation.runner_id and len(launches) == 1
@@ -287,7 +751,12 @@ async def test_board_api_lifecycle_and_no_deletion(project_client):
         rejected = await project_client.request(method, url, json=body)
         assert rejected.status_code == 422
         assert any(error["loc"] == ["body", field] for error in rejected.json()["detail"])
-    assert (await project_client.get(path)).json() == completed.json()
+    assert (await project_client.get(path)).json() == {
+        **completed.json(),
+        "agents": [],
+        "agents_has_more": False,
+        "has_running_agents": False,
+    }
     assert (await project_client.get(path + "/events")).json() == events_before
     assert len((await project_client.get(base)).json()["data"]) == 1
     schemas = (await project_client.get("/openapi.json")).json()["components"]["schemas"]
@@ -311,7 +780,7 @@ async def test_custom_stage_api_and_ticket_tools_share_real_project_definitions(
 
     project = (await project_client.post("/v1/projects", json={"name": "Response"})).json()
     base = f"/v1/projects/{project['id']}/tickets"
-    source = project["orchestrator_session_id"]
+    source = project["main_session_id"]
     empty = json.loads(await execute_ticket_tool("sys_ticket_list", {}, project_client, source))
     assert empty["data"] == []
     assert empty["agent_guidance"] == PROJECT_TICKET_WORK_INSTRUCTION
@@ -354,7 +823,12 @@ async def test_custom_stage_api_and_ticket_tools_share_real_project_definitions(
     assert "HTTP 400" in rejected["error"]
     assert "contains tickets" in rejected["detail"]
     assert (await project_client.get(base + "/stages")).json() == stages.json()
-    assert (await project_client.get(f"{base}/{ticket['id']}")).json() == ticket
+    assert (await project_client.get(f"{base}/{ticket['id']}")).json() == {
+        **ticket,
+        "agents": [],
+        "agents_has_more": False,
+        "has_running_agents": False,
+    }
     assert (await project_client.get(f"{base}/{ticket['id']}/events")).json() == events_before
     configured = json.loads(
         await execute_ticket_tool(
@@ -603,7 +1077,9 @@ async def test_ticket_running_projection_batches_links_and_respects_access(
     active = (await client.post(base, json={"title": "Working"}, headers=headers)).json()
     quiet = (await client.post(base, json={"title": "Unassigned"}, headers=headers)).json()
     conversations = SqlAlchemyConversationStore(db_uri)
-    worker = conversations.create_conversation(project_id=project["id"])
+    worker = conversations.create_conversation(
+        project_id=project["id"], agent_id=PROJECT_AGENT_ID, harness_override="codex"
+    )
     permissions = SqlAlchemyPermissionStore(db_uri)
     permissions.grant(ALICE, worker.id, LEVEL_OWNER)
     assert (
@@ -613,7 +1089,7 @@ async def test_ticket_running_projection_batches_links_and_respects_access(
     ).status_code == 200
     conversations.set_session_live_status(worker.id, "running")
     monkeypatch.setattr(
-        ticket_routes, "_session_status_cache", {project["orchestrator_session_id"]: "running"}
+        ticket_routes, "_session_status_cache", {project["main_session_id"]: "running"}
     )
     original = SqlAlchemyConversationStore.get_session_activity
     original_grants = SqlAlchemyPermissionStore.list_for_sessions
@@ -638,6 +1114,10 @@ async def test_ticket_running_projection_batches_links_and_respects_access(
     }
     assert batches == [[worker.id]]
     assert grant_batches == [([worker.id], ALICE), ([worker.id], RESERVED_USER_PUBLIC)]
+    active_row = next(row for row in page if row["id"] == active["id"])
+    identity = {"agent_name": "project-agent", "harness": "codex"}
+    assert active_row["agents"] == [identity] and active_row["agents_has_more"] is False
+    assert next(row for row in page if row["id"] == quiet["id"])["agents"] == []
     ticket_routes._session_status_cache[worker.id] = "idle"
     page = (await client.get(base, headers=headers)).json()["data"]
     assert all(row["has_running_agents"] is False for row in page)
@@ -645,9 +1125,22 @@ async def test_ticket_running_projection_batches_links_and_respects_access(
     permissions.revoke(ALICE, worker.id)
     page = (await client.get(base, headers=headers)).json()["data"]
     assert next(row for row in page if row["id"] == active["id"])["has_running_agents"] is None
+    assert next(row for row in page if row["id"] == active["id"])["agents"] == []
     permissions.grant(RESERVED_USER_PUBLIC, worker.id, LEVEL_EDIT)
     page = (await client.get(base, headers=headers)).json()["data"]
     assert next(row for row in page if row["id"] == active["id"])["has_running_agents"] is True
+    # Several linked conversations on one agent/harness render one identity.
+    duplicate = conversations.create_conversation(
+        project_id=project["id"], agent_id=PROJECT_AGENT_ID, harness_override="codex"
+    )
+    permissions.grant(ALICE, duplicate.id, LEVEL_OWNER)
+    assert (
+        await client.post(
+            f"{base}/{active['id']}/sessions", json={"session_id": duplicate.id}, headers=headers
+        )
+    ).status_code == 200
+    detail = (await client.get(f"{base}/{active['id']}", headers=headers)).json()
+    assert detail["agents"] == [identity] and detail["agents_has_more"] is False
     assert (await client.get(base, headers=_as_user(BOB))).status_code == 404
 
 
@@ -753,7 +1246,7 @@ async def test_notification_enqueue_survives_crash_without_duplicate_message(
     project_client, project_app, db_uri, monkeypatch
 ):
     project = (await project_client.post("/v1/projects", json={"name": "Outbox"})).json()
-    session_id = project["orchestrator_session_id"]
+    session_id = project["main_session_id"]
     store = SqlAlchemyConversationStore(db_uri)
     store.set_host_id(session_id, uuid4().hex, "/tmp/project")
     service = project_app.state.project_ticket_notifications
@@ -788,7 +1281,7 @@ async def test_notifications_drain_through_normal_dispatch_after_reconnect(
     project_client, project_app, db_uri, monkeypatch, external_host
 ):
     project = (await project_client.post("/v1/projects", json={"name": "Reconnect"})).json()
-    session_id = project["orchestrator_session_id"]
+    session_id = project["main_session_id"]
     store = SqlAlchemyConversationStore(db_uri)
     host_id, runner_id = uuid4().hex, uuid4().hex
     if external_host:
