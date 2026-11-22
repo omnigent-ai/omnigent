@@ -456,6 +456,19 @@ async def test_builtin_tool_tolerates_a_failed_spec_resolution(
     assert seen["local_tool_workdir"] == Path("/tmp/runner-workspace")
 
 
+async def test_file_tool_is_refused_when_the_spec_fails_to_resolve() -> None:
+    """
+    The real dispatch can't see a ``tool_groups.files`` opt-in without the
+    spec, so it refuses the file tool instead of calling the server's file API.
+    """
+    h = Harness(spec_resolver=object())
+    h.resolve_error = OmnigentError("agent gone", code=ErrorCode.NOT_FOUND)
+    status, body = await h.execute(_call("sys_files_list"))
+    assert status == 200
+    output = json.loads(body["result"]["output"])
+    assert output["error"].startswith("tool 'sys_files_list' is not enabled"), output
+
+
 async def test_builtin_tool_failure_is_generic_to_the_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -84,3 +84,18 @@ def test_dispatch_refuses_a_disabled_group_tool() -> None:
     for name in sorted(_FILE_TOOL_NAMES):
         reason = _ungranted_tool_reason(name, default_spec)
         assert reason is not None and "not enabled for this agent" in reason, name
+
+
+def test_spec_less_relay_and_dispatch_leave_the_file_tools_off() -> None:
+    """
+    When the runner can't resolve a session's spec it can't see a
+    ``files: true`` opt-in, so the relay leaves the file tools out and dispatch
+    refuses them, while the always-on session reads still work.
+    """
+    spec_less = {schema["name"] for schema in build_native_relay_tool_schemas(None)}
+    assert not (spec_less & _FILE_TOOL_NAMES), sorted(spec_less & _FILE_TOOL_NAMES)
+    assert {"sys_session_list", "sys_session_get_info"} <= spec_less
+    for name in sorted(_FILE_TOOL_NAMES):
+        reason = _ungranted_tool_reason(name, None)
+        assert reason is not None and "is not enabled" in reason, name
+    assert _ungranted_tool_reason("sys_session_get_info", None) is None

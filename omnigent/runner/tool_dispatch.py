@@ -637,8 +637,9 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
     ``pi.registerTool`` and the claude-native relay both consume.
 
     :param spec: The session's resolved agent spec. ``None`` falls back to the
-        always-on read/discovery surface (never the opt-in spawn writes, whose
-        gate can't be evaluated without the spec), mirroring the relay.
+        always-on read/discovery surface, never opt-in tools such as the spawn
+        writes or the session file tools, whose gates can't be evaluated
+        without the spec. This mirrors the relay.
     :returns: Flat tool schemas for native bridges.
     """
     from omnigent.tools.builtins.agents import (
@@ -708,9 +709,6 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
             SysAgentDownloadTool,
             SysAddPolicyTool,
             SysPolicyRegistryTool,
-            UploadFileTool,
-            ListFilesTool,
-            DownloadFileTool,
         ):
             if _cls is SysSessionMessageTool and not peer_session_messaging_enabled():
                 continue
@@ -1214,8 +1212,10 @@ def _ungranted_tool_reason(
 
     The check is skipped when no granted surface is known: ``agent_spec`` is
     ``None`` (spec-less dispatch paths) or is not a real :class:`AgentSpec`
-    (partial stand-ins cannot build a ``ToolManager``). Fails closed when the
-    surface exists but cannot be computed.
+    (partial stand-ins cannot build a ``ToolManager``). A spec-less dispatch
+    still refuses the session file tools: they are opt-in, and the
+    ``tool_groups.files`` that turns them on is in the missing spec. Fails
+    closed when the surface exists but cannot be computed.
 
     :param tool_name: Tool the caller wants to dispatch, e.g. ``"sys_os_shell"``.
     :param agent_spec: The session's resolved agent spec, or ``None``.
@@ -1225,6 +1225,11 @@ def _ungranted_tool_reason(
     """
     from omnigent.spec.types import AgentSpec as _AgentSpec
 
+    if agent_spec is None and tool_name in _FILE_TOOLS:
+        return (
+            f"tool {tool_name!r} is not enabled: the agent spec is unavailable, "
+            "so its tool_groups.files setting can't be checked"
+        )
     if not isinstance(agent_spec, _AgentSpec):
         return None
     try:

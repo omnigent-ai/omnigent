@@ -613,8 +613,9 @@ async def test_unprefixed_file_tool_names_are_not_dispatched(
     tmp_path: Path,
 ) -> None:
     """
-    The file tools' former names are not runner tools and are not granted, so a
-    model calling one is refused without any request to the session file store.
+    The file tools' former names are not runner tools and are not granted even
+    with the files group on, so a model calling one is refused without any
+    request to the session file store.
 
     :param old_name: A pre-``sys_`` file tool name, e.g. ``"upload_file"``.
     :param tmp_path: Pytest-provided workspace root for the session.
@@ -628,7 +629,7 @@ async def test_unprefixed_file_tool_names_are_not_dispatched(
             tool_name=old_name,
             arguments=json.dumps({"path": "notes.txt", "file_id": "file_abc123"}),
             server_client=client,
-            agent_spec=AgentSpec(spec_version=1, skills_filter="none"),
+            agent_spec=AgentSpec(spec_version=1, skills_filter="none", tool_groups=_FILE_TOOLS_ON),
             conversation_id=_CONVERSATION_ID,
             runner_workspace=tmp_path,
         )

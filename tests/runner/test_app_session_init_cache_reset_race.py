@@ -245,7 +245,9 @@ async def test_upload_refuses_while_the_session_workspace_is_unreadable(tmp_path
     """
     While the session's metadata can't be read, its workspace is unknown: an upload
     is refused instead of reading the runner's workspace, though the file store
-    would accept it. Once the metadata reads, the session uploads its own file.
+    would accept it. Before session init has cached the spec, the spec can't be
+    resolved either, so the refusal is that the file tools aren't known to be on.
+    Once the metadata reads, the session uploads its own file.
     """
     runner_root = tmp_path / "runner"
     session_root = tmp_path / "session"
@@ -271,11 +273,17 @@ async def test_upload_refuses_while_the_session_workspace_is_unreadable(tmp_path
         "params": {"name": "sys_files_upload", "arguments": {"path": "report.md"}},
     }
     async with _runner_client(app) as client:
+        spec_less = await client.post(f"/v1/sessions/{_SESSION_ID}/mcp/execute", json=call)
+        init = await client.post(
+            "/v1/sessions", json={"session_id": _SESSION_ID, "agent_id": _AGENT_ID}
+        )
+        assert init.status_code == 201, init.text
         refused = await client.post(f"/v1/sessions/{_SESSION_ID}/mcp/execute", json=call)
         uploaded_while_unreadable = list(server.uploaded)
         server.readable = True
         shared = await client.post(f"/v1/sessions/{_SESSION_ID}/mcp/execute", json=call)
 
+    assert "tool_groups.files setting can't be checked" in spec_less.text, spec_less.text
     assert "the session workspace is unknown" in refused.text, refused.text
     assert uploaded_while_unreadable == []
     assert "file_1" in shared.text, shared.text

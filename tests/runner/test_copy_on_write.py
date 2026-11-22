@@ -180,9 +180,10 @@ async def test_cached_cow_still_rejects_host_io_when_spec_unavailable(spec, tmp_
     shared = Mock(sandbox=SimpleNamespace(copy_on_write_roots=[tmp_path]))
     monkeypatch.setattr(registry, "_create_primary_env", Mock(return_value=shared))
     registry._resolve_primary("session", spec)
+    # Not sys_files_upload: without a spec, the grant gate refuses it first.
     result = await execute_tool(
-        tool_name="sys_files_upload",
-        arguments='{"path":"original"}',
+        tool_name="sys_agent_list",
+        arguments="{}",
         agent_spec=None,
         resource_registry=registry,
         conversation_id="session",

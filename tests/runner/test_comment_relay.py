@@ -464,9 +464,10 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
     # schemas, so this relay is the only surface that reaches Claude Code.
     # All are routed through the AP server's /mcp endpoint for policy
     # enforcement. The opt-in spawn writes (sys_session_send/close/create)
-    # are absent here because this fixture's session has no resolvable
-    # spec — the fallback can't evaluate the (tools.agents | spawn) gate;
-    # specs that opt in get them via the ToolManager-derived branch. The
+    # and session file tools (sys_files_*) are absent here because this
+    # fixture's session has no resolvable spec — the fallback can't evaluate
+    # the (tools.agents | spawn) gate or tool_groups.files; specs that opt in
+    # get them via the ToolManager-derived branch. The
     # OS tools (sys_os_*) are absent too: native harnesses use their own
     # shell and file tools.
     # No more, no less: a missing entry means the schema loop dropped a class;
@@ -489,9 +490,6 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
         "sys_agent_download",
         "sys_add_policy",
         "sys_policy_registry",
-        "sys_files_upload",
-        "sys_files_list",
-        "sys_files_download",
     }
     # Parameters must be the real schemas from the tool classes — proving
     # get_schema() flowed through rather than an empty placeholder. "status"
