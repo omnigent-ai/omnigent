@@ -1,13 +1,18 @@
 import { describe, expect, it } from "vitest";
 
-import type { MentionItem, SessionMention, TaggedMentions } from "@/lib/composerMentions";
+import {
+  composerInlineMentions,
+  sessionTagToken,
+  type MentionItem,
+  type SessionMention,
+  type TaggedMentions,
+} from "@/lib/composerMentions";
 
 import {
   claimFileTag,
   claimSessionTag,
   mergeTags,
   NO_TAGS,
-  sessionTagToken,
   tagsGoneFrom,
   tagsRestoredByHistory,
   tagTokens,
@@ -52,6 +57,31 @@ describe("tag sets", () => {
       tags([readme], [renamed]),
     );
     expect(mergeTags(NO_TAGS, NO_TAGS)).toEqual(NO_TAGS);
+  });
+});
+
+describe("a session tagged without a token of its own", () => {
+  // Quotes, brackets, a newline and repeated spaces, which the composer's token leaves out.
+  const messy: SessionMention = {
+    id: "s_messy01",
+    title: 'Fix "CI" [flaky]\n  tests',
+    isSubagent: false,
+  };
+  const token = "@Fix CI flaky tests";
+
+  it("stands as the same cleaned token the composer sends", () => {
+    expect(sessionTagToken(messy)).toBe(token);
+    expect(composerInlineMentions([], [messy], null).map((mention) => mention.token)).toEqual([
+      token,
+    ]);
+    expect(tagTokens(tags([], [messy]))).toEqual([token]);
+    expect(sessionTagToken({ ...messy, title: " \n " })).toBe("@Untitled session");
+  });
+
+  it("stays tagged while its token is in the draft, and an undo restores it", () => {
+    const active = tags([], [messy]);
+    expect(tagsGoneFrom(active, [`Ask ${token} now`], [token])).toEqual(NO_TAGS);
+    expect(tagsRestoredByHistory(active, "Ask  now", `Ask ${token} now`, [token])).toEqual(active);
   });
 });
 

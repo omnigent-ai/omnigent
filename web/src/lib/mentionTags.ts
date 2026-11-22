@@ -9,16 +9,12 @@ import {
   type MentionItem,
   type SessionMention,
   sessionMentionToken,
+  sessionTagToken,
   type TaggedMentions,
 } from "@/lib/composerMentions";
 import { composerAttachmentKey } from "@/store/chatStore";
 
 export const NO_TAGS: TaggedMentions = { files: [], sessions: [] };
-
-/** The token a tagged session stands as in the draft. */
-export function sessionTagToken(session: SessionMention): string {
-  return session.token ?? `@${session.title}`;
-}
 
 /** Every token `tags` own, files first. */
 export function tagTokens(tags: TaggedMentions): string[] {
