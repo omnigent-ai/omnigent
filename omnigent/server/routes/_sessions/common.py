@@ -719,22 +719,28 @@ def _record_held_turn_start(session_id: str, input_item_ids: object, *, continue
     Record the start of a turn a runner began with messages it held.
 
     The runner starts such a turn as the one before it ends, with no idle edge
-    between, and names the stored items the turn takes up on its running edge.
-    An older runner names none; its running edge then arrives while a turn already
-    runs, and the turn takes up the oldest held message.
+    between, and names the stored items the turn takes up on its running edge;
+    messages it holds for later turns keep their place. An older runner names
+    none; its running edge then arrives while a turn already runs, and that turn
+    takes up every held message, starting at the oldest.
 
     :param session_id: Session whose turn started, e.g. ``"conv_abc123"``.
     :param input_item_ids: The runner's item ids for the messages, oldest first,
-        e.g. ``["msg_b", "msg_c"]``, or ``None`` when the edge names none.
+        e.g. ``["msg_b", "msg_c"]``; ``[]`` when none is stored, and ``None``
+        from an older runner.
     :param continued: Whether the edge arrived while a turn was already running.
     """
-    named = input_item_ids if isinstance(input_item_ids, list) else []
-    if not named and not continued:
-        return
-    held = _session_held_request_cache.pop(session_id, None) or {}
-    if named and isinstance(first := named[0], str):
-        _session_turn_request_cache[session_id] = held.get(first, first)
-    elif held:
+    if isinstance(input_item_ids, list):
+        named = [item_id for item_id in input_item_ids if isinstance(item_id, str)]
+        if not named:
+            return
+        held = _session_held_request_cache.get(session_id) or {}
+        _session_turn_request_cache[session_id] = held.get(named[0], named[0])
+        for item_id in named:
+            held.pop(item_id, None)
+        if not held:
+            _session_held_request_cache.pop(session_id, None)
+    elif continued and (held := _session_held_request_cache.pop(session_id, None)):
         _session_turn_request_cache[session_id] = next(iter(held.values()))
 
 

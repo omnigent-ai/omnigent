@@ -4486,8 +4486,9 @@ def create_runner_app(
             # response's own terminal error; the id lets it recognise this edge
             # as the same failure instead of adding a second card.
             event["response_id"] = response_id
-        if input_item_ids:
-            # The stored messages a turn takes up when it follows the last one with no idle edge.
+        if input_item_ids is not None:
+            # The stored messages a turn takes up when it follows the last one with no idle
+            # edge; empty when none of them is stored, e.g. a buffered /compact.
             event["input_item_ids"] = input_item_ids
         if status == "failed":
             source = source_error if source_error is not None else (error or {})
