@@ -3,7 +3,7 @@
 // stays mounted after a dialog closes so a write it started still reports how it went.
 
 import { useEffect, useRef, useState } from "react";
-import { useQueryClient } from "@tanstack/react-query";
+import { useIsMutating, useQueryClient } from "@tanstack/react-query";
 
 import {
   type Conversation,
@@ -25,33 +25,57 @@ import { useSessionActions } from "../useSessionActions";
 import { currentSessionRow } from "./currentSession";
 import { sessionCommand } from "./model";
 import { MoveToProjectPicker } from "./MoveToProjectPicker";
-import { type SessionActionRequest, useSessionActionStore } from "./sessionActionStore";
+import {
+  type SessionActionRequest,
+  settleSessionAction,
+  startSessionAction,
+  useSessionActionStore,
+} from "./sessionActionStore";
 import { useSessionCommandFacts } from "./useSessionCommandFacts";
 
 /** Mount once, beside the palette. */
 export function SessionActionHost() {
-  const request = useSessionActionStore((state) => state.request);
-  return request ? <SessionActionResolver key={request.key} request={request} /> : null;
+  const requests = useSessionActionStore((state) => state.requests);
+  const shownKey = requests.at(-1)?.key;
+  return requests.map((request) => (
+    <SessionActionResolver key={request.key} request={request} shown={request.key === shownKey} />
+  ));
+}
+
+interface SessionActionProps {
+  request: SessionActionRequest;
+  /** The newest request, whose dialogs show; an older one only finishes its writes. */
+  shown: boolean;
 }
 
 /** Looks the session up as the action starts; one gone since does nothing. */
-function SessionActionResolver({ request }: { request: SessionActionRequest }) {
+function SessionActionResolver({ request, shown }: SessionActionProps) {
   const queryClient = useQueryClient();
   const [conversation] = useState(() =>
     currentSessionRow(queryClient, request.conversation, request.listed),
   );
+  useEffect(() => {
+    if (!conversation && !shown) settleSessionAction(request.key);
+  }, [conversation, shown, request.key]);
   return conversation ? (
-    <SessionActionRunner conversation={conversation} command={request.command} />
+    <SessionActionRunner conversation={conversation} request={request} shown={shown} />
   ) : null;
+}
+
+/** Whether a mutation's variables name session `id`, as the per-session writes' do. */
+function namesSession(variables: unknown, id: string): boolean {
+  if (variables === id) return true;
+  return (
+    typeof variables === "object" && variables !== null && "id" in variables && variables.id === id
+  );
 }
 
 function SessionActionRunner({
   conversation,
-  command,
-}: {
-  conversation: Conversation;
-  command: SessionActionRequest["command"];
-}) {
+  request,
+  shown,
+}: SessionActionProps & { conversation: Conversation }) {
+  const { command, key } = request;
   const facts = useSessionCommandFacts(conversation);
   const viewerId = useViewerId();
   const serverInfo = useServerInfo();
@@ -72,14 +96,24 @@ function SessionActionRunner({
     componentIdPrefix: "palette.conversation",
   });
   const [picker, setPicker] = useState<"rename" | "move-to-project" | null>(null);
-  const started = useRef(false);
   const latest = useRef({ actions, facts });
   latest.current = { actions, facts };
+  // A write it started, such as Stop or Leave, reports how it went through this runner's
+  // own callbacks, so a replaced runner stays mounted until its writes settle.
+  const writing =
+    useIsMutating({
+      predicate: (mutation) =>
+        mutation.state.status === "pending" &&
+        namesSession(mutation.state.variables, conversation.id),
+    }) > 0;
+  useEffect(() => {
+    if (!shown && !writing) settleSessionAction(key);
+  }, [shown, writing, key]);
 
   useEffect(() => {
     const current = latest.current.facts;
-    if (started.current || !current) return;
-    started.current = true;
+    // Once per request, even on a host mounted again, such as after a server info reload.
+    if (!current || !startSessionAction(key)) return;
     // Checked against the session's current state, which may have changed since its row showed.
     if (!sessionCommand(current, command).availability.available) return;
     const { id, updated_at: updatedAt } = conversation;
@@ -133,8 +167,10 @@ function SessionActionRunner({
         run.setLeaveOpen(true);
         return;
     }
-  }, [command, conversation, facts, navigate, queryClient, togglePinned, setMuted]);
+  }, [command, key, conversation, facts, navigate, queryClient, togglePinned, setMuted]);
 
+  // A replaced request's dialogs close; only the newest one's show.
+  if (!shown) return null;
   return (
     <>
       {actions.dialogs}
