@@ -242,6 +242,14 @@ describe("pinch-to-zoom", () => {
     expect(previewImg).toHaveStyle({ transform: "translate(-120px, -50px) scale(2)" });
   });
 
+  it("moves the image with the fingers as they pinch", () => {
+    const { previewImg, stage } = openPreview();
+
+    pinch(stage, [finger(100, 50), finger(140, 50)], [finger(70, 80), finger(150, 80)]);
+
+    expect(previewImg).toHaveStyle({ transform: "translate(-130px, -20px) scale(2)" });
+  });
+
   it("holds the image's nearest edge when the fingers start beside it", () => {
     const { previewImg, stage } = openPreview();
 
@@ -275,11 +283,26 @@ describe("pinch-to-zoom", () => {
     fireEvent.click(screen.getByRole("button", { name: "Zoom in" }));
 
     fireEvent.pointerDown(stage, { pointerId: 1, clientX: 0, clientY: 0 });
-    fireEvent.pointerDown(stage, { pointerId: 2, clientX: 100, clientY: 0 });
-    fireEvent.touchStart(stage, fingers([finger(0), finger(100)]));
-    fireEvent.pointerMove(stage, { pointerId: 2, clientX: 100, clientY: 80 });
+    fireEvent.pointerMove(stage, { pointerId: 1, clientX: 0, clientY: 20 });
+    expect(previewImg).toHaveStyle({ transform: "translate(0px, 20px) scale(1.5)" });
 
-    expect(previewImg).toHaveStyle({ transform: "translate(0px, 0px) scale(1.5)" });
+    fireEvent.pointerDown(stage, { pointerId: 2, clientX: 100, clientY: 20 });
+    fireEvent.touchStart(stage, fingers([finger(0, 20), finger(100, 20)]));
+    fireEvent.pointerMove(stage, { pointerId: 2, clientX: 100, clientY: 100 });
+
+    expect(previewImg).toHaveStyle({ transform: "translate(0px, 20px) scale(1.5)" });
+  });
+
+  it("stays open when the pinch's fingers lift, then closes on a tap beside the image", () => {
+    const { stage } = openPreview();
+    pinch(stage, [finger(-50), finger(50)], [finger(-100), finger(100)]);
+
+    fireEvent.click(stage);
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+
+    fireEvent.pointerDown(stage, { pointerId: 3, clientX: 0, clientY: 0 });
+    fireEvent.click(stage);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
   it.each([
