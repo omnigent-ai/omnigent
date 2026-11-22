@@ -88,13 +88,16 @@ def test_stage_fit_contract_requires_a_decision_without_phase_or_approval_shortc
     assert "responsible agent's chat" in PROJECT_TICKET_WORK_INSTRUCTION
     assert "stage fit" in PROJECT_TICKET_WORK_INSTRUCTION
     assert "actual work and next step" in PROJECT_TICKET_WORK_INSTRUCTION
-    assert "ticket owner" in PROJECT_TICKET_WORK_INSTRUCTION
+    assert "ticket owner" not in PROJECT_TICKET_WORK_INSTRUCTION
     assert "never grant approval" in PROJECT_TICKET_WORK_INSTRUCTION
     assert "substantive progress" in PROJECT_TICKET_WORK_INSTRUCTION
     assert "stage_id and a concise evidence-based comment in the same call" in (
         PROJECT_TICKET_WORK_INSTRUCTION
     )
-    assert "helpers report mismatches" in PROJECT_TICKET_WORK_INSTRUCTION
+    assert "Coordinate stage changes with other agents working on the same ticket" in (
+        PROJECT_TICKET_WORK_INSTRUCTION
+    )
+    assert "helpers report mismatches" not in PROJECT_TICKET_WORK_INSTRUCTION
     assert "implementation even when the code is uncommitted" in PROJECT_TICKET_WORK_INSTRUCTION
     assert "Keep needs-human until its request is resolved" in PROJECT_TICKET_WORK_INSTRUCTION
     assert "existing monitoring checks" in PROJECT_TICKET_WORK_INSTRUCTION

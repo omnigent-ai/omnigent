@@ -118,6 +118,8 @@ def test_orchestrator_skill_is_available_without_workflows_and_respects_project_
     assert skill == (source / "SKILL.md").read_text()
     assert "explicitly assess **stage fit**" in skill
     assert "Progress alone is not stage fit" in skill
+    assert "stage owner" not in skill.replace("-", " ")
+    assert "assigned ticket owner" not in skill
     assert "A stage decision never grants approval or resolves `needs-human`" in skill
     assert not (tmp_path / "skills" / "workflow").exists()
     sources = codex_skill_sources(tmp_path, tmp_path / "fake-home").linked

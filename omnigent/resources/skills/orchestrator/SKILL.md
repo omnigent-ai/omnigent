@@ -165,11 +165,10 @@ The worker executes its assignment; it does not inherit your orchestrator role.
 Link the returned session with `sys_session_link_ticket`, including a short
 `involvement` description of its actual responsibility (not a role inferred from
 the phase). Reattach with updated involvement as responsibilities change; retain
-prior participants and describe their completed contribution. Name one worker as
-the ticket's stage owner in its brief and involvement; helpers report phase changes
-to that owner.
-The owner checks stage fit at substantive progress updates, before changing the
-kind of work, requesting input, or handing off. Use fresh definitions and combine
+prior participants and describe their completed contribution. Workers check stage
+fit at substantive progress updates, before changing the kind of work, requesting
+input, or handing off. When several agents share a ticket, coordinate stage changes
+to avoid conflicting updates. Use fresh definitions and combine
 a stage change with its progress rationale in one `sys_ticket_update` call.
 On handoff, update involvement descriptions without removing prior session links.
 Record who is doing what in a ticket comment.
@@ -217,7 +216,7 @@ updates and worker reports promptly between checks.
   Follow the project's meanings rather than hard-coded stage names.
 - Correct a clear mismatch: refresh the ticket and update `stage_id` together
   with a concise evidence-based `comment`. If the boundary is ambiguous, ask
-  the assigned ticket owner a focused question about the current work and next
+  the agent doing the work a focused question about the current work and next
   step; do not default to asking the human. Keep a fitting stage, explaining an
   ambiguous keep/move decision in the next substantive progress update rather
   than adding heartbeat comments. Reuse this monitor; add no stage-check timer.
