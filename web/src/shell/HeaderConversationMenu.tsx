@@ -2,8 +2,10 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   ArchiveIcon,
   ArchiveRestoreIcon,
+  CheckIcon,
   ChevronLeftIcon,
   ClockPlusIcon,
+  Columns2Icon,
   DownloadIcon,
   EllipsisIcon,
   FolderInputIcon,
@@ -88,6 +90,9 @@ import { conversationDisplayLabel } from "./sidebarNav";
 import { MobileHeaderButton } from "./MobileHeaderButton";
 import { RenameSessionDialog } from "./RenameSessionDialog";
 import { SessionMenuHeader } from "./SessionMenuHeader";
+import { BestOfNDialog, KeepAttemptDialog, canStartBestOfN } from "./BestOfNDialog";
+import { otherBestOfNAttemptIds } from "@/lib/bestOfN";
+import { isFeatureEnabled } from "@/lib/capabilities";
 
 interface HeaderConversationMenuProps {
   conversation: Conversation;
@@ -147,6 +152,8 @@ export function HeaderConversationMenu({
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleteBranch, setDeleteBranch] = useState(false);
   const [automationOpen, setAutomationOpen] = useState(false);
+  const [bestOfNOpen, setBestOfNOpen] = useState(false);
+  const [keepAttemptOpen, setKeepAttemptOpen] = useState(false);
   const automationsEnabled = useAutomationsEnabled();
   // This menu is only offered to the session's owner (see ChatHeader).
   const canCreateAutomation = canCreateAutomationFromSession({
@@ -163,6 +170,11 @@ export function HeaderConversationMenu({
   const isArchived = conversation.archived === true;
   const canAddAgent = !isArchived && info !== "loading" && info.sibling_sessions;
   const addAgentPath = `/?sibling=${encodeURIComponent(conversation.id)}`;
+  // This menu is owner-only, so ownership holds for both best-of-N actions.
+  const canBestOfN = canStartBestOfN(info, conversation, true);
+  const otherAttemptIds = otherBestOfNAttemptIds(conversation.id, conversation.labels);
+  const canKeepAttempt =
+    !isArchived && isFeatureEnabled(info, "best_of_n") && otherAttemptIds.length > 0;
   const label = conversationDisplayLabel(conversation);
   // Mobile taps need a bigger target than the dense desktop row.
   const itemClass = cn("mobile-touch-target", isMobile && "gap-2.5 px-2.5 py-2");
@@ -184,6 +196,8 @@ export function HeaderConversationMenu({
     setDeleteOpen(false);
     setDeleteBranch(false);
     setAutomationOpen(false);
+    setBestOfNOpen(false);
+    setKeepAttemptOpen(false);
   }, [conversation.id]);
 
   useEffect(() => {
@@ -414,6 +428,26 @@ export function HeaderConversationMenu({
           )}
         </SessionActionMenuItem>
       )}
+      {canBestOfN && (
+        <DropdownMenuItem
+          data-testid="header-best-of-n"
+          className={itemClass}
+          onSelect={() => setBestOfNOpen(true)}
+        >
+          <Columns2Icon className="size-3.5" />
+          Best of N…
+        </DropdownMenuItem>
+      )}
+      {canKeepAttempt && (
+        <DropdownMenuItem
+          data-testid="header-keep-attempt"
+          className={itemClass}
+          onSelect={() => setKeepAttemptOpen(true)}
+        >
+          <CheckIcon className="size-3.5" />
+          Keep this attempt
+        </DropdownMenuItem>
+      )}
       <DropdownMenuItem
         data-testid="header-export-conversation"
         className={itemClass}
@@ -598,6 +632,17 @@ export function HeaderConversationMenu({
       </DropdownMenu>
 
       {archivePrompt.dialog}
+      {bestOfNOpen && (
+        <BestOfNDialog conversation={conversation} open onOpenChange={setBestOfNOpen} />
+      )}
+      {keepAttemptOpen && (
+        <KeepAttemptDialog
+          sessionId={conversation.id}
+          title={label}
+          open
+          onOpenChange={setKeepAttemptOpen}
+        />
+      )}
       {automationOpen && (
         <CreateAutomationFromSessionDialog
           conversation={conversation}

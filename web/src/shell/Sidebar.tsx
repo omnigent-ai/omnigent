@@ -65,6 +65,7 @@ import {
   ClockIcon,
   ClockPlusIcon,
   CircleAlertIcon,
+  Columns2Icon,
   CircleStopIcon,
   CornerDownRightIcon,
   FolderGit2Icon,
@@ -343,6 +344,8 @@ import {
   useSessionBranch,
 } from "./sessionRowMeta";
 import { AutomationSourcesDeleteNotice } from "@/components/scheduled/AutomationSourceDeleteNotice";
+import { BestOfNDialog, KeepAttemptDialog, canStartBestOfN } from "./BestOfNDialog";
+import { otherBestOfNAttemptIds } from "@/lib/bestOfN";
 import {
   canCreateAutomationFromSession,
   automationDeletedWith,
@@ -5121,6 +5124,8 @@ export function ConversationMenuItems({
   moveToProject,
   setShareOpen,
   setForkOpen,
+  setBestOfNOpen,
+  setKeepAttemptOpen,
   canCreateAutomation,
   setAutomationOpen,
   setIsEditing,
@@ -5160,6 +5165,9 @@ export function ConversationMenuItems({
   moveToProject: ReturnType<typeof useMoveToProject>;
   setShareOpen: (open: boolean) => void;
   setForkOpen: (open: boolean) => void;
+  /** Best-of-N actions; a menu that omits these doesn't offer them. */
+  setBestOfNOpen?: (open: boolean) => void;
+  setKeepAttemptOpen?: (open: boolean) => void;
   /** Whether "Create automation" applies to this session. */
   canCreateAutomation: boolean;
   setAutomationOpen: (open: boolean) => void;
@@ -5198,6 +5206,11 @@ export function ConversationMenuItems({
       )
     : [];
   const { forkDisabledReason } = useSessionActionRestrictions(conversation.id, conversation);
+  const keepableAttempt =
+    isFeatureEnabled(info, "best_of_n") &&
+    isOwner &&
+    !isArchived &&
+    otherBestOfNAttemptIds(conversation.id, conversation.labels).length > 0;
   const showQuickActions = useSessionRowQuickActions();
   // Mobile lacks the horizontal room for a side-opening submenu, so the
   // project picker replaces the menu body in place instead of flying out
@@ -5374,6 +5387,26 @@ export function ConversationMenuItems({
           <CompactShortcutKeys keys={FORK_SESSION_KEYS} className="ml-auto pl-4" />
         )}
       </SessionActionMenuItem>
+      {setBestOfNOpen && canStartBestOfN(info, conversation, isOwner) && (
+        <C.Item
+          className="mobile-touch-target"
+          data-testid="best-of-n-conversation"
+          onSelect={() => setBestOfNOpen(true)}
+        >
+          <Columns2Icon className="size-3.5" />
+          Best of N…
+        </C.Item>
+      )}
+      {setKeepAttemptOpen && keepableAttempt && (
+        <C.Item
+          className="mobile-touch-target"
+          data-testid="keep-attempt-conversation"
+          onSelect={() => setKeepAttemptOpen(true)}
+        >
+          <CheckMarkIcon className="size-3.5" />
+          Keep this attempt
+        </C.Item>
+      )}
       {isOwner ? (
         <C.Item
           className="mobile-touch-target"
@@ -6038,6 +6071,8 @@ function ConversationRowImpl({
   // The kebab menu is controlled so the project submenu can close the whole
   // menu after a pick (a plain click inside the submenu wouldn't otherwise).
   const [menuOpen, setMenuOpen] = useState(false);
+  const [bestOfNOpen, setBestOfNOpen] = useState(false);
+  const [keepAttemptOpen, setKeepAttemptOpen] = useState(false);
   const gitBranch = conversation.git_branch ?? null;
   // Every row action gates on ownership alone — the sidebar carries no
   // effective-permission level, so rename/share/move/drag are owner-only and
@@ -6378,6 +6413,8 @@ function ConversationRowImpl({
     moveToProject,
     setShareOpen,
     setForkOpen,
+    setBestOfNOpen,
+    setKeepAttemptOpen,
     canCreateAutomation,
     setAutomationOpen,
     setIsEditing,
@@ -6940,6 +6977,17 @@ function ConversationRowImpl({
         <SessionShortcutHint slot={shortcutSlot} overlayTop={overlayTop} />
       )}
       {actionDialogs}
+      {bestOfNOpen && (
+        <BestOfNDialog conversation={conversation} open onOpenChange={setBestOfNOpen} />
+      )}
+      {keepAttemptOpen && (
+        <KeepAttemptDialog
+          sessionId={conversation.id}
+          title={conversationDisplayLabel(conversation)}
+          open
+          onOpenChange={setKeepAttemptOpen}
+        />
+      )}
     </li>
   );
 }

@@ -14,7 +14,10 @@ from collections.abc import Mapping
 
 import httpx
 
-from omnigent.entities.conversation import USER_SESSION_TITLE_MAX_CHARS
+from omnigent.entities.conversation import (
+    BEST_OF_N_GROUP_LABEL_KEY,
+    USER_SESSION_TITLE_MAX_CHARS,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -33,7 +36,9 @@ def clear_replacement_create_body(
     ``/clear`` resets only the conversation, so the replacement inherits the
     old session's title and first-class project. Explicit ``workspace`` and
     ``git`` nulls stop project defaults from starting a new workspace or
-    worktree for the terminal that is being transferred.
+    worktree for the terminal that is being transferred. The replacement is
+    not created as an attempt of a best-of-N run, so it leaves the old
+    session's run label behind.
 
     :param old_session: ``GET /v1/sessions/{id}`` snapshot of the session
         being cleared, e.g. ``{"title": "Fix login", "project_id": "proj_1"}``.
@@ -41,6 +46,7 @@ def clear_replacement_create_body(
     :param labels: Labels for the replacement, including its bridge id.
     :returns: JSON body for the create request.
     """
+    labels = {key: value for key, value in labels.items() if key != BEST_OF_N_GROUP_LABEL_KEY}
     body: dict[str, object] = {"agent_id": agent_id, "labels": labels}
     title = old_session.get("title")
     if isinstance(title, str) and title:

@@ -19,6 +19,7 @@ from omnigent.server.feature_flags import (
 )
 from omnigent.server.sharing_settings import write_peer_session_messaging_override
 from omnigent.stores.conversation_store import (
+    BEST_OF_N_GROUP_LABEL_KEY,
     CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     CREATED_BY_SESSION_LABEL_KEY,
     SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
@@ -3217,6 +3218,138 @@ async def test_scripted_host_worktree_respects_ownership_and_policy(
     assert worktree.branch_name == "review" and worktree.base_branch == "main"
     launch = next(f for f in frames if isinstance(f, HostLaunchRunnerFrame))
     assert launch.workspace == "/repos/review"
+
+
+async def test_best_of_n_attempt_keeps_the_run_it_was_created_in(
+    auth_client, auth_app, peers, db_uri, monkeypatch
+):
+    from omnigent.host.frames import (
+        HostCreateWorktreeFrame,
+        HostLaunchRunnerFrame,
+        HostStatFrame,
+        decode_host_frame,
+    )
+    from tests.server.integration.test_sessions_permissions import (
+        _register_online_host,
+        build_agent_bundle,
+    )
+
+    source, target, _ = peers
+    # The web app creates attempts as the signed-in user, not through a runner.
+    del auth_client.headers[RUNNER_TUNNEL_TOKEN_HEADER]
+    host = uuid4().hex
+    _register_online_host(auth_app, host, "alice")
+    store = SqlAlchemyConversationStore(db_uri)
+    worktrees = []
+
+    def answer_host(connection, payload):
+        frame = decode_host_frame(payload)
+        if isinstance(frame, HostStatFrame):
+            connection.pending_stats[frame.request_id].set_result(
+                {"status": "ok", "exists": True, "type": "directory", "canonical_path": frame.path}
+            )
+        elif isinstance(frame, HostCreateWorktreeFrame):
+            worktrees.append((frame.repo_path, frame.branch_name, frame.base_branch))
+            connection.pending_create_worktrees[frame.request_id].set_result(
+                {"status": "ok", "worktree_path": "/repos/attempt", "branch": frame.branch_name}
+            )
+        else:
+            assert isinstance(frame, HostLaunchRunnerFrame), frame
+            connection.pending_launches[frame.request_id].set_result({"status": "launched"})
+
+    monkeypatch.setattr(auth_app.state.host_registry, "send_text", answer_host)
+    branch = "best-of-n-1a2b3c4d-1-codex"
+    attempt_request = {
+        "agent_id": source["agent_id"],
+        "sibling_source_id": source["id"],
+        "host_id": host,
+        "workspace": "/repos/example",
+        "git": {"branch_name": branch, "base_branch": "main"},
+        "title": "Attempt 1 · Codex",
+        "labels": {BEST_OF_N_GROUP_LABEL_KEY: "1a2b3c4d", "omnigent.ui": "terminal"},
+    }
+    created = await auth_client.post("/v1/sessions", json=attempt_request)
+    assert created.status_code == 201, created.text
+    attempt_id = created.json()["id"]
+    attempt = store.get_conversation(attempt_id)
+    assert attempt.family_id == source["id"]
+    assert (attempt.host_id, attempt.workspace, attempt.git_branch) == (
+        host,
+        "/repos/attempt",
+        branch,
+    )
+    assert worktrees == [("/repos/example", branch, "main")]
+    snapshot = (await auth_client.get(f"/v1/sessions/{attempt_id}")).json()
+    assert snapshot["labels"][BEST_OF_N_GROUP_LABEL_KEY] == "1a2b3c4d"
+    assert snapshot["labels"]["omnigent.ui"] == "terminal"
+    assert snapshot["title"] == "Attempt 1 · Codex"
+
+    # An uploaded agent's attempt joins a run the same way.
+    bundled = await auth_client.post(
+        "/v1/sessions",
+        data={
+            "metadata": json.dumps(
+                {"sibling_source_id": source["id"], "labels": attempt_request["labels"]}
+            )
+        },
+        files={"bundle": ("agent.tar.gz", build_agent_bundle(name="attempt"), "application/gzip")},
+    )
+    assert bundled.status_code == 201, bundled.text
+    bundled_labels = store.get_conversation(bundled.json()["session_id"]).labels
+    assert bundled_labels[BEST_OF_N_GROUP_LABEL_KEY] == "1a2b3c4d"
+
+    # Only a nested session's creation names a run, and only with a run id.
+    sessions_before = {row.id for row in store.list_conversations().data}
+    not_nested = {k: v for k, v in attempt_request.items() if k != "sibling_source_id"}
+    malformed = {**attempt_request, "labels": {BEST_OF_N_GROUP_LABEL_KEY: "feature"}}
+    for refused in (not_nested, malformed):
+        response = await auth_client.post("/v1/sessions", json=refused)
+        assert response.status_code == 400, response.text
+        assert BEST_OF_N_GROUP_LABEL_KEY in response.text
+    # Another user can neither join the owner's source nor label a session of their own.
+    bob = {"X-Forwarded-Email": "bob"}
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user("bob")
+    permissions.grant("bob", source["id"], LEVEL_EDIT)
+    permissions.grant("bob", attempt_id, LEVEL_EDIT)
+    joined = await auth_client.post("/v1/sessions", json=attempt_request, headers=bob)
+    assert joined.status_code == 403, joined.text
+    own = await auth_client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({"labels": attempt_request["labels"]})},
+        files={
+            "bundle": ("agent.tar.gz", build_agent_bundle(name="bob-agent"), "application/gzip")
+        },
+        headers=bob,
+    )
+    assert own.status_code == 400 and BEST_OF_N_GROUP_LABEL_KEY in own.text, own.text
+    assert {row.id for row in store.list_conversations().data} == sessions_before
+    assert len(worktrees) == 1
+
+    # Afterwards nobody adds, changes or clears it, whatever their access.
+    for headers in ({}, bob):
+        for session_id, value in (
+            (source["id"], "1a2b3c4d"),
+            (attempt_id, "0f0f0f0f"),
+            (attempt_id, ""),
+        ):
+            response = await auth_client.patch(
+                f"/v1/sessions/{session_id}",
+                json={"labels": {BEST_OF_N_GROUP_LABEL_KEY: value}},
+                headers=headers,
+            )
+            assert response.status_code == 400, response.text
+            assert BEST_OF_N_GROUP_LABEL_KEY in response.text
+    assert BEST_OF_N_GROUP_LABEL_KEY not in store.get_conversation(source["id"]).labels
+    assert store.get_conversation(attempt_id).labels[BEST_OF_N_GROUP_LABEL_KEY] == "1a2b3c4d"
+    # The list of attempts to look up stays an ordinary, editable label.
+    linked = await auth_client.patch(
+        f"/v1/sessions/{attempt_id}",
+        json={"labels": {"omnigent.best_of_n.attempts": f"{attempt_id},{target['id']}"}},
+    )
+    assert linked.status_code == 200, linked.text
+    # A fork of an attempt is a session of its own, outside the run.
+    assert BEST_OF_N_GROUP_LABEL_KEY not in store.fork_conversation(attempt_id).labels
 
 
 @pytest.mark.parametrize(

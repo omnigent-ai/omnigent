@@ -15,7 +15,7 @@ import { useDraggable, useDroppable } from "@dnd-kit/core";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { cn } from "@/lib/utils";
-import { Maximize2Icon, XIcon } from "lucide-react";
+import { CheckIcon, Maximize2Icon, XIcon } from "lucide-react";
 import { SideChatPane } from "@/components/chat/SideChatPane";
 import { SessionHarnessPicker } from "@/components/composer/SessionHarnessPicker";
 import { useSessionPickerInputs } from "@/components/composer/sessionPickerInputs";
@@ -82,6 +82,8 @@ import { useGridSessions } from "./GridSessionsContext";
 import { ENABLED_COMPOSER_INPUT_SELECTOR } from "@/components/composer/engine/composerInput";
 import { useGridPermissionControl, type GridPermissionControl } from "./useGridPermissionControl";
 import { useSharedSessionDraft } from "./sharedSessionDraft";
+import { KeepAttemptDialog } from "@/shell/BestOfNDialog";
+import { otherBestOfNAttemptIds } from "@/lib/bestOfN";
 
 export type GridWorkspacePanelProps = Pick<
   ComponentProps<typeof WorkspacePanel>,
@@ -117,6 +119,14 @@ export function GridSessionPane({
   const grids = useGridSessions()!;
   useSharedSessionDraft(sessionId);
   const title = session?.title || "Session";
+  const bestOfNEnabled = isFeatureEnabled(serverInfo, "best_of_n");
+  const otherAttemptIds = otherBestOfNAttemptIds(sessionId, session?.labels);
+  const canKeepAttempt =
+    bestOfNEnabled &&
+    otherAttemptIds.length > 0 &&
+    session?.archived !== true &&
+    isOwnerLevel(permissionLevel);
+  const [keepAttemptOpen, setKeepAttemptOpen] = useState(false);
   const {
     attributes,
     listeners,
@@ -473,6 +483,18 @@ export function GridSessionPane({
             >
               {title}
             </button>
+            {canKeepAttempt && (
+              <Button
+                variant="ghost"
+                size="xs"
+                aria-label={`Keep ${title}`}
+                title="Keep this attempt and archive the others"
+                onClick={() => setKeepAttemptOpen(true)}
+              >
+                <CheckIcon className="size-3.5" />
+                Keep
+              </Button>
+            )}
             <ViewModeToggle hotkeyEnabled={selected && !workspacePanel.maximized} alwaysVisible />
             <Button asChild variant="ghost" size="icon-xs">
               <Link
@@ -692,6 +714,14 @@ export function GridSessionPane({
             </div>,
             workspaceTarget,
           )}
+        {keepAttemptOpen && (
+          <KeepAttemptDialog
+            sessionId={sessionId}
+            title={title}
+            open
+            onOpenChange={setKeepAttemptOpen}
+          />
+        )}
       </FileViewerContext.Provider>
     </TerminalFirstContextProvider>
   );

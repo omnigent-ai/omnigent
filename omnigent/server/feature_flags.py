@@ -61,6 +61,7 @@ class Feature(StrEnum):
     QUICK_PICK_PALETTE = "quick_pick_palette"
     FLOATING_COMPOSER = "floating_composer"
     WORKSPACE_SIDEBAR_V2 = "workspace_sidebar_v2"
+    BEST_OF_N = "best_of_n"
 
 
 @dataclass(frozen=True)
@@ -159,6 +160,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         # On by default; remove the flag and its off path in 0.25.0.
         review_by_release="0.25.0",
         default_enabled=True,
+    ),
+    FeatureDefinition(
+        feature=Feature.BEST_OF_N,
+        description="Run one task on several agents side by side and keep one attempt",
+        owner="web",
+        review_by_release="0.27.0",
     ),
     FeatureDefinition(
         feature=Feature.SPLITTABLE_TERMINAL_VIEW_UI,

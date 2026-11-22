@@ -6,6 +6,8 @@ export type GridLayout = string | { axis: Axis; children: [GridLayout, GridLayou
 export interface SessionGrid {
   id: string;
   name?: string;
+  /** The best-of-N run this grid was opened for. */
+  run?: string;
   layout: GridLayout;
 }
 
@@ -59,6 +61,26 @@ export function splitGrid(
   };
 }
 
+/** A balanced layout for two to four sessions, read left to right, then top to bottom. */
+export function gridLayoutForSessions(sessionIds: readonly string[]): GridLayout | null {
+  const ids = [...new Set(sessionIds)];
+  if (ids.length !== sessionIds.length || ids.some((id) => !id || id.startsWith("temp:")))
+    return null;
+  const [first, second, third, fourth] = ids;
+  if (ids.length === 2) return { axis: "columns", children: [first, second] };
+  if (ids.length === 3)
+    return { axis: "columns", children: [first, { axis: "rows", children: [second, third] }] };
+  if (ids.length === 4)
+    return {
+      axis: "rows",
+      children: [
+        { axis: "columns", children: [first, second] },
+        { axis: "columns", children: [third, fourth] },
+      ],
+    };
+  return null;
+}
+
 export function removeGridSession(layout: GridLayout, sessionId: string): GridLayout | null {
   if (typeof layout === "string") return layout === sessionId ? null : layout;
   const first = removeGridSession(layout.children[0], sessionId);
@@ -110,6 +132,7 @@ export function parseSessionGrids(raw: string | null): SessionGrid[] {
         !value.id ||
         (value.name !== undefined &&
           (typeof value.name !== "string" || value.name.length > USER_SESSION_TITLE_MAX_CHARS)) ||
+        (value.run !== undefined && (typeof value.run !== "string" || !value.run)) ||
         seen.has(value.id) ||
         !validLayout(value.layout)
       )
