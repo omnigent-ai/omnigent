@@ -2712,7 +2712,11 @@ function ConversationList({
         ? tabScoped
         : dedupeConversationsById([
             ...notArchived,
-            ...applySessionPullRequestFilter(mineSharedRuns, pullRequestFilter.value),
+            ...applySessionPullRequestFilter(
+              mineSharedRuns,
+              pullRequestFilter.value,
+              resolvedActiveId,
+            ),
           ]);
     const sharedRunsToFile =
       includeSharedRuns &&

@@ -6258,6 +6258,42 @@ describe("sidebar_grouping_ui release flag", () => {
     const sharedScopeCalls = useConvMock.mock.calls.filter((args) => args[4] === "shared");
     expect(sharedScopeCalls.some((args) => (args[2] as { enabled?: boolean }).enabled)).toBe(false);
   });
+
+  it("keeps the open shared run in the automation folder on My sessions though the pull request filter drops it", () => {
+    projectsMock.push("Alpha", "Omnigent Automation");
+    mockScopedConversations(SHARED_RUNS);
+    localStorage.setItem("omnigent:session-pull-request-filter", "open");
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const info: ServerInfo = {
+      ...FALLBACK_SERVER_INFO,
+      features: {
+        ...FALLBACK_SERVER_INFO.features,
+        sidebar_grouping_ui: true,
+        sidebar_saved_views: true,
+      },
+    };
+    render(
+      <QueryClientProvider client={client}>
+        <CapabilitiesProvider info={info}>
+          <SidebarDataProvider config={sidebarConfig}>
+            <TooltipProvider>
+              <MemoryRouter initialEntries={["/c/conv_shared_run"]}>
+                <Routes>
+                  <Route path="/c/:conversationId" element={<Sidebar open onClose={vi.fn()} />} />
+                </Routes>
+              </MemoryRouter>
+            </TooltipProvider>
+          </SidebarDataProvider>
+        </CapabilitiesProvider>
+      </QueryClientProvider>,
+    );
+    selectSessionFilter("mine");
+    const toggle = screen.getByRole("button", { name: /^Omnigent Automation/ });
+    if (toggle.getAttribute("aria-expanded") !== "true") fireEvent.click(toggle);
+    expect(within(automationFolder()).getByText("conv_shared_run")).toBeInTheDocument();
+    // The other shared run has no open pull request, so the filter drops it.
+    expect(within(automationFolder()).queryByText("conv_shared_launch")).toBeNull();
+  });
 });
 
 it.each(["default", "updated", "shared"])(
