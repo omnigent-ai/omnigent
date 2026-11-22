@@ -4879,12 +4879,13 @@ function ConversationSection({
   };
   const familyParentTitle = (row: Conversation) => {
     const representative = familyRepresentative(row);
-    // The card's "Created by" row already names a creator that heads the family.
-    return representative &&
-      representative.id !== row.id &&
-      representative.id !== row.labels?.[CREATED_BY_SESSION_LABEL_KEY]
+    return representative && representative.id !== row.id
       ? conversationDisplayLabel(representative)
       : undefined;
+  };
+  const familyParentId = (row: Conversation) => {
+    const representative = familyRepresentative(row);
+    return representative && representative.id !== row.id ? representative.id : undefined;
   };
   const familyExpandedState = (row: Conversation) =>
     row.family &&
@@ -5012,6 +5013,7 @@ function ConversationSection({
                   familyIndented={isNestedFamilyRow(conv)}
                   familyNestedCount={familyNestedCount(conv)}
                   familyParentTitle={familyParentTitle(conv)}
+                  familyParentId={familyParentId(conv)}
                   familyExpanded={familyExpandedState(conv)}
                   onToggleFamily={() => onToggleFamily(conv.family!.id)}
                   isActive={
@@ -5734,9 +5736,11 @@ function SessionTooltipDetailsBlock({ children }: { children: ReactNode }) {
 function SessionTooltipDetails({
   conversation,
   familyDetail,
+  familyParentId,
 }: {
   conversation: Conversation;
   familyDetail?: ReactNode;
+  familyParentId?: string;
 }) {
   const viewerId = useContext(ViewerIdContext);
   // Only a workspace-bound session has a checkout to read GitHub state from.
@@ -5744,6 +5748,9 @@ function SessionTooltipDetails({
   const github = githubInfo.data;
   // A session another session started names that creator; the owner then reads as "Owner".
   const creatorId = conversation.labels?.[CREATED_BY_SESSION_LABEL_KEY] ?? null;
+  // The creator row replaces a "Nested in" row that would name the same session.
+  const shownFamilyDetail =
+    creatorId !== null && familyParentId === creatorId ? null : familyDetail;
   // `owner` is null when permissions are off; there's no owner to name then.
   const owner = conversation.owner ?? null;
   const createdBy = owner !== null && isOwnedByViewer(conversation, viewerId) ? "You" : owner;
@@ -5775,7 +5782,7 @@ function SessionTooltipDetails({
   const asOf = fromStored ? stateAsOf(stored?.state_checked_at) : null;
   const branch = conversation.git_branch ?? github?.branch ?? null;
   if (
-    !familyDetail &&
+    !shownFamilyDetail &&
     creatorId === null &&
     createdBy === null &&
     repo === null &&
@@ -5786,7 +5793,7 @@ function SessionTooltipDetails({
   }
   return (
     <SessionTooltipDetailsBlock>
-      {familyDetail}
+      {shownFamilyDetail}
       {creatorId !== null && <SessionCreatorDetail sessionId={creatorId} />}
       {createdBy !== null && (
         <SessionTooltipDetail
@@ -5914,12 +5921,14 @@ function SessionTooltipContent({
   hasError,
   shared,
   familyDetail,
+  familyParentId,
 }: {
   conversation: Conversation;
   hostsById: ReadonlyMap<string, Host>;
   hasError: boolean;
   shared: SessionSharing | null;
   familyDetail?: ReactNode;
+  familyParentId?: string;
 }) {
   const serverInfo = useContext(ServerInfoContext);
   if (!isFeatureEnabled(serverInfo, "sidebar_grouping_ui")) {
@@ -5955,7 +5964,11 @@ function SessionTooltipContent({
           <span className="truncate">{sessionLocationLabel(conversation, hostsById)}</span>
         </span>
       </p>
-      <SessionTooltipDetails conversation={conversation} familyDetail={familyDetail} />
+      <SessionTooltipDetails
+        conversation={conversation}
+        familyDetail={familyDetail}
+        familyParentId={familyParentId}
+      />
       {shared !== null && <SessionSharedHint sharing={shared} />}
       {hasError && <SessionErrorHint />}
     </TooltipContent>
@@ -5972,6 +5985,7 @@ function ConversationRowImpl({
   familyExpanded,
   familyNestedCount,
   familyParentTitle,
+  familyParentId,
   onToggleFamily,
   isActive,
   inActiveGrid,
@@ -5997,6 +6011,8 @@ function ConversationRowImpl({
   familyNestedCount?: number;
   /** The family parent's title, for a nested session's tooltip. */
   familyParentTitle?: string;
+  /** The family parent's id, so a card that names it as creator can skip "Nested in". */
+  familyParentId?: string;
   onToggleFamily?: () => void;
   // Computed by the list owner against the resolved top-level root (so a
   // sub-agent view keeps its owning row highlighted). A prop, not a per-row
@@ -6683,6 +6699,7 @@ function ConversationRowImpl({
               hasError={sessionState?.kind === "error"}
               shared={sharing}
               familyDetail={familyDetail}
+              familyParentId={familyParentId}
             />
           </Tooltip>
         )
@@ -6743,6 +6760,7 @@ function ConversationRowImpl({
             hasError={sessionState?.kind === "error"}
             shared={sharing}
             familyDetail={familyDetail}
+            familyParentId={familyParentId}
           />
         </Tooltip>
       )}
@@ -7022,6 +7040,7 @@ const ConversationRow = memo(ConversationRowImpl, (prev, next) => {
     prev.familyExpanded === next.familyExpanded &&
     prev.familyNestedCount === next.familyNestedCount &&
     prev.familyParentTitle === next.familyParentTitle &&
+    prev.familyParentId === next.familyParentId &&
     prev.isActive === next.isActive &&
     prev.inActiveGrid === next.inActiveGrid &&
     prev.gridSelected === next.gridSelected &&

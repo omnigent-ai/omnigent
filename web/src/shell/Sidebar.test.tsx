@@ -5535,6 +5535,40 @@ describe("Sidebar view options", () => {
       "Created byAnother session",
     );
   });
+
+  it.each(["legacy", "pinned"] as const)(
+    "keeps Nested in on the %s card, which doesn't name the creator",
+    async (surface) => {
+      const pinned = surface === "pinned";
+      const project: Record<string, string> = pinned ? { omni_project: "Customer X" } : {};
+      if (pinned) {
+        projectsMock.push("Customer X");
+        seedPins(["conv_manager"]);
+      }
+      const family = { id: "conv_manager", representative_id: "conv_manager", pinned };
+      mockConversations([
+        conv("conv_manager", "Codex", { labels: project, family, created_at: 1 }),
+        conv("conv_worker", "Codex", {
+          labels: { ...project, [CREATED_BY_SESSION_LABEL_KEY]: "conv_manager" },
+          family,
+          created_at: 2,
+        }),
+      ]);
+      if (pinned) renderGroupingSidebar();
+      else renderSidebar();
+
+      const link = screen.getByRole("link", { name: "conv_worker" });
+      if (pinned) fireEvent.focus(link);
+      else fireEvent.pointerMove(link, { pointerType: "mouse" });
+      const card = await screen.findByTestId(
+        pinned ? "pinned-project-flyout" : "session-tooltip-content",
+      );
+      expect(within(card).getByTestId("session-tooltip-family")).toHaveTextContent(
+        /^Nested in\s*conv_manager$/,
+      );
+      expect(within(card).queryByTestId("session-tooltip-creator")).toBeNull();
+    },
+  );
 });
 
 describe("sidebar_grouping_ui release flag", () => {
