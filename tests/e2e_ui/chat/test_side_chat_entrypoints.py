@@ -885,6 +885,10 @@ def test_side_chat_opened_while_parent_runs_answers_only_its_question(
             for request in get_mock_requests(mock_llm_server_url, key="gpt-4o-mini")
         ]
         assert sum(parent_question in text and question not in text for text in model_inputs) == 1
+        # The side chat's model must not see the request the parent is still answering.
+        side_inputs = [text for text in model_inputs if question in text]
+        assert side_inputs
+        assert not any(parent_question in text for text in side_inputs), side_inputs
     finally:
         httpx.post(f"{mock_llm_server_url}/gate/release", timeout=5.0).raise_for_status()
 

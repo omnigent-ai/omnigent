@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 import pytest
@@ -28,6 +28,7 @@ from omnigent.entities import (
 )
 from omnigent.errors import SESSION_AGENT_BUNDLE_MISSING_MESSAGE, OmnigentError
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+from omnigent.runtime import pending_inputs
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_OWNER,
@@ -244,8 +245,8 @@ class _ConversationStore:
         :param up_to_response_id: Truncation point, e.g. ``"resp_a"``.
             Mirrors the real store: ``None`` copies everything; a value
             matching no item's ``response_id`` raises ValueError.
-        :param before_item_id: Continuation cutoff; recorded only (the
-            fork route never sets it).
+        :param before_item_id: Cutoff for a continuation or a side chat
+            forked mid-turn; recorded only.
         :param copy_items: ``False`` for a continuation that keeps no
             history; recorded only.
         :param continue_source: Whether the fork continues its source on the
@@ -556,13 +557,19 @@ def _make_conversation(
     )
 
 
-def _make_item(item_id: str, text: str, response_id: str = "resp_001") -> ConversationItem:
+def _make_item(
+    item_id: str,
+    text: str,
+    response_id: str = "resp_001",
+    role: Literal["user", "assistant"] = "user",
+) -> ConversationItem:
     """
     Build a minimal ConversationItem for testing.
 
     :param item_id: Item id.
     :param text: Message text content.
     :param response_id: Response the item belongs to, e.g. ``"resp_001"``.
+    :param role: Message role, ``"user"`` or ``"assistant"``.
     :returns: A ConversationItem.
     """
     return ConversationItem(
@@ -572,8 +579,11 @@ def _make_item(item_id: str, text: str, response_id: str = "resp_001") -> Conver
         response_id=response_id,
         created_at=1,
         data=MessageData(
-            role="user",
-            content=[{"type": "input_text", "text": text}],
+            role=role,
+            content=[
+                {"type": "output_text" if role == "assistant" else "input_text", "text": text}
+            ],
+            agent="test-agent" if role == "assistant" else None,
         ),
     )
 
@@ -680,6 +690,56 @@ def test_normal_fork_does_not_copy_side_chat_routing_source() -> None:
     assert SIDE_CHAT_SOURCE_LABEL_KEY not in response.json()["labels"]
     assert store.fork_calls[-1]["side_chat_parent_id"] is None
     assert response.json()["side_chat_parent_id"] is None
+
+
+@pytest.mark.parametrize(
+    ("side_chat", "live_status", "delivering", "cutoff", "clones_native"),
+    [
+        (True, "running", False, "msg_running", False),
+        (True, "waiting", False, "msg_running", False),
+        # The request is still on its way to a native terminal, so not in history.
+        (True, "running", True, None, False),
+        (True, "idle", False, None, True),
+        (True, "failed", False, None, True),
+        (False, "running", False, None, True),
+    ],
+)
+def test_side_chat_forked_mid_turn_leaves_out_the_running_request(
+    side_chat: bool,
+    live_status: str,
+    delivering: bool,
+    cutoff: str | None,
+    clones_native: bool,
+) -> None:
+    """Only a side chat skips the request its source is still answering."""
+    source = _make_conversation()
+    source.live_status = live_status
+    items = [
+        _make_item("msg_earlier", "Remember the codename", response_id="resp_001"),
+        _make_item("msg_reply", "Noted", response_id="resp_002", role="assistant"),
+    ]
+    if not delivering:
+        items += [
+            _make_item("msg_running", "Run the long command", response_id="resp_003"),
+            _make_item("msg_progress", "Running it now", response_id="resp_004", role="assistant"),
+        ]
+    store = _ConversationStore({source.id: source}, items_by_conv={source.id: items})
+    client = TestClient(_build_app(store))
+    pending_id = (
+        pending_inputs.record(source.id, [{"type": "input_text", "text": "Run the long command"}])
+        if delivering
+        else None
+    )
+    try:
+        response = client.post(f"/v1/sessions/{source.id}/fork", json={"side_chat": side_chat})
+    finally:
+        if pending_id is not None:
+            pending_inputs.resolve(source.id, pending_id)
+
+    assert response.status_code == 201, response.text
+    assert store.fork_calls[-1]["before_item_id"] == cutoff
+    # A running source's native transcript holds the request the side chat leaves out.
+    assert store.fork_calls[-1]["resume_source_native_session"] is clones_native
 
 
 async def _side_chat_ids(client: httpx.AsyncClient, parent_id: str, **kwargs: Any) -> set[str]:
