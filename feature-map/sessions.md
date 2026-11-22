@@ -627,11 +627,14 @@ Changes or Pull Requests in the Workspace rail. This only happens for editors,
 on an idle session whose launch isn't already running, and does exactly what
 pressing Reconnect host does. Each opening checks once, so a session that sleeps again
 while it stays open waits for Reconnect host, a Files, Changes or Pull
-Requests pick, or a message. Every way of waking
-the sandbox (Reconnect host, opening the session, Files or Changes, the
-terminal's Resume, and a tabs-sidebar shell tab's Resume sandbox or Retry) joins one wake per session, including after switching to
-another session and back, and the Files and Pull Requests views say the
-sandbox is starting while it runs or the server reports its launch.
+Requests pick, or a message. Reconnect host, opening the session, a Files,
+Changes or Pull Requests pick, the terminal's Resume and a tabs-sidebar shell
+tab's Resume session join one wake per session, including after switching to
+another session and back. The Resume sandbox notices (the Changes view, the
+tabs sidebar's panels and shell tabs, with their Retry, and ⌘K) share a resume
+of their own, so the two groups show their own progress until the server
+reports the launch, which every surface then shows. The Files and Pull Requests
+views say the sandbox is starting while it runs or the server reports its launch.
 
 **Message recovery:** send the first prompt while a runner is starting, or send
 another message after its runner restarts. Also open a sub-agent's conversation
