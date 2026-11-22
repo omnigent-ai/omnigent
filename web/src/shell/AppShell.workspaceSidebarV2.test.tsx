@@ -71,7 +71,6 @@ vi.mock("@/components/BrowserPane/agentTools/tabStore", async (importOriginal) =
   },
 }));
 
-// A draft typed into the host stands for its editors' unsaved text, which a remount loses.
 // The file action host has its own suite; these tests check that it mounts only with the flag.
 const fileActionHost = vi.hoisted(() => ({ throws: false }));
 vi.mock("./fileCommands/FileActionHost", () => ({
@@ -80,6 +79,8 @@ vi.mock("./fileCommands/FileActionHost", () => ({
     return <div data-testid="file-action-host" />;
   },
 }));
+
+// A draft typed into the host stands for its editors' unsaved text, which a remount loses.
 vi.mock("./workspaceTabs/WorkspaceTabsHost", () => ({
   default: (props: WorkspaceTabsHostProps) => {
     tabs.host = props;
