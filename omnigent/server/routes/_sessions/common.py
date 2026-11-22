@@ -671,7 +671,7 @@ _session_active_response_cache: WorkspaceScopedCache[str, str] = WorkspaceScoped
 _session_turn_request_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 
 # The first message a runner held for a running turn, as the runner's item id and
-# the item a side chat cuts before. It becomes the next turn's start.
+# the item a side chat cuts before, until the turn the runner starts with it.
 _session_held_request_cache: WorkspaceScopedCache[str, tuple[str, str]] = WorkspaceScopedCache()
 
 
@@ -730,7 +730,7 @@ def _record_held_turn_start(session_id: str, input_item_ids: object) -> None:
 
     The runner starts such a turn as the one before it ends, with no idle edge
     between, and names the stored items the turn takes up on its running edge.
-    Older runners name none, which leaves the record to the next turn's end.
+    Older runners name none, which leaves the previous turn's record in place.
 
     :param session_id: Session whose turn started, e.g. ``"conv_abc123"``.
     :param input_item_ids: The runner's item ids for the messages, oldest first,

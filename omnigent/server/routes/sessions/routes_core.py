@@ -359,13 +359,11 @@ class _NewestRequest(NamedTuple):
     :param item_id: The request's first item id, ``None`` when none is in reach.
     :param answered: Whether the agent produced anything after the request.
     :param end_response_id: Response id of the newest item a copy can end on.
-    :param whole_history: Whether the read reached the session's oldest item.
     """
 
     item_id: str | None
     answered: bool
     end_response_id: str | None
-    whole_history: bool
 
 
 # An image a prompt carries inline rather than as a stored file.
@@ -4901,8 +4899,9 @@ def register_core_routes(
         request out. It copies the history before the input the running turn
         began with, which follow-ups sent during the turn do not change, or,
         while that request has not reached history, the history as it stands
-        when the fork is made. A native target rebuilds its transcript from
-        those items instead of cloning the source's live one.
+        when the fork is made, or none when its newest items hold nothing to
+        end the copy on. A native target rebuilds its transcript from those
+        items instead of cloning the source's live one.
 
         The dialog's run-config picks (``body.model_override``,
         ``body.reasoning_effort``, ``body.terminal_launch_args`` — the
@@ -6473,10 +6472,10 @@ def register_core_routes(
             return _SideChatCutoff(before_item_id=newest.item_id)
         if delivering or not turn_in_flight:
             # The request has not reached history: copy only what is there now,
-            # which is nothing when no item a copy can end on exists.
+            # which is nothing when no item a copy can end on is in reach.
             return _SideChatCutoff(
                 up_to_response_id=newest.end_response_id,
-                copy_items=newest.end_response_id is not None or not newest.whole_history,
+                copy_items=newest.end_response_id is not None,
             )
         return _SideChatCutoff(copy_items=False)
 
@@ -6517,7 +6516,6 @@ def register_core_routes(
             item_id=request.id if request is not None else None,
             answered=answered,
             end_response_id=end_response_id,
-            whole_history=not page.has_more,
         )
 
     def _rewind_prompt(session_id: str, item_id: str) -> MessageData:

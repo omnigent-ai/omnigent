@@ -5377,9 +5377,9 @@ def _publish_status(
     # A ``waiting`` edge naming background agents ends a claude-native turn too.
     if status not in ("running", "waiting") or background_agents:
         _session_turn_request_cache.pop(session_id, None)
-        # A message the runner held for the ended turn starts the next one.
-        if (held := _session_held_request_cache.pop(session_id, None)) is not None:
-            _session_turn_request_cache[session_id] = held[1]
+        # The ended turn took up any message still held; a turn the runner
+        # starts with held messages names them on its running edge.
+        _session_held_request_cache.pop(session_id, None)
     # Keep the background-shell tally sticky alongside the status (see the
     # cache's declaration). A ``Stop`` hook reports an authoritative count
     # (``None`` is never sent by it): a positive count sets the tally, and
