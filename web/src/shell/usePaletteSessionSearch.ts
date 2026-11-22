@@ -233,12 +233,17 @@ export function usePaletteSessionSearch({
         ...(data?.pages ?? []).flatMap((page) => page.data),
         ...(sidebarRows ?? []),
       ]).filter((row) => !row.archived);
-      const matches = matchSessions(loaded, query);
+      // A server group's page, so a short query doesn't list every loaded session; the
+      // session switcher keeps its own bound, applied below.
+      const allMatches = matchSessions(loaded, query);
+      const matches = sessionsOnly ? allMatches : allMatches.slice(0, SEARCH_GROUP_PAGE_SIZE);
       const rangesById = new Map(matches.map((match) => [match.session.id, match.labelRanges]));
       const local = paletteRows(
         matches.map((match) => match.session),
         { projects, parentTitles },
       ).map((session) => ({ ...session, labelRanges: rangesById.get(session.id) }));
+      // The server's matches answer the debounced query; until it catches up they're stale.
+      if (debouncedQuery !== query) return local;
       const listed = new Set(local.map((session) => session.id));
       return [...local, ...serverMatches.filter((session) => !listed.has(session.id))];
     }
@@ -259,6 +264,7 @@ export function usePaletteSessionSearch({
     sidebarRows,
     titleSearch.data,
     query,
+    debouncedQuery,
     searching,
     matchingLoaded,
     sessionsOnly,

@@ -22,7 +22,7 @@ function conv(id: string, title: string) {
 }
 
 function renderSearch(
-  props: { open: boolean; sessionsOnly: boolean },
+  props: { open: boolean; sessionsOnly: boolean; matchLoaded?: boolean },
   queryClient = new QueryClient(),
 ) {
   const wrapper = ({ children }: { children: ReactNode }) => (
@@ -117,5 +117,67 @@ describe("usePaletteSessionSearch", () => {
       id: "found",
     });
     expect(queryClient.getQueryData(["conversation-backfill", "recent"])).toBeUndefined();
+  });
+
+  describe("matching loaded sessions", () => {
+    const loaded = (...rows: ReturnType<typeof conv>[]) =>
+      useConversations.mockReturnValue({ data: { pages: [{ data: rows }] }, isFetching: false });
+    const titleHits = (...rows: ReturnType<typeof conv>[]) =>
+      useSessionSearch.mockImplementation((query: string, scope: string) =>
+        scope === "title" && query !== ""
+          ? { isFetching: false, data: { pages: [{ data: rows.map((row) => ({ ...row })) }] } }
+          : { isFetching: false },
+      );
+    const ids = (sessions: { id: string }[]) => sessions.map((session) => session.id);
+
+    it("searches the server for an ordinary link, which names no pull request", () => {
+      const { result } = renderSearch({ open: true, sessionsOnly: false, matchLoaded: true });
+      act(() => result.current.setQuery("https://example.test/design"));
+      act(() => {
+        vi.advanceTimersByTime(300);
+      });
+      expect(result.current.pullRequestLookup).toBe(false);
+      expect(result.current.searching).toBe(true);
+      expect(useSessionSearch).toHaveBeenLastCalledWith("https://example.test/design", "content", {
+        enabled: true,
+        limit: 8,
+      });
+    });
+
+    it.each(["#42", "https://github.com/acme/app/pull/42/files"])(
+      "looks %s up among the loaded sessions, never asking the server",
+      (reference) => {
+        const { result } = renderSearch({ open: true, sessionsOnly: false, matchLoaded: true });
+        act(() => result.current.setQuery(reference));
+        act(() => {
+          vi.advanceTimersByTime(300);
+        });
+        expect(result.current.pullRequestLookup).toBe(true);
+        for (const call of useSessionSearch.mock.calls) {
+          expect(call[2]).toMatchObject({ enabled: false });
+        }
+      },
+    );
+
+    it("lists only the new query's loaded matches until the server answers it", () => {
+      loaded(conv("c1", "Kestrel plan"));
+      titleHits(conv("s1", "Kestrel notes"));
+      const { result } = renderSearch({ open: true, sessionsOnly: false, matchLoaded: true });
+      act(() => result.current.setQuery("kestrel"));
+      act(() => {
+        vi.advanceTimersByTime(300);
+      });
+      expect(ids(result.current.visibleSessions)).toEqual(["c1", "s1"]);
+      // The server's "kestrel" hits don't answer "kestrel plan".
+      act(() => result.current.setQuery("kestrel plan"));
+      expect(ids(result.current.visibleSessions)).toEqual(["c1"]);
+    });
+
+    it("lists at most a search group's page of loaded matches", () => {
+      loaded(...Array.from({ length: 20 }, (_, index) => conv(`c${index}`, `Alpha ${index}`)));
+      const { result } = renderSearch({ open: true, sessionsOnly: false, matchLoaded: true });
+      act(() => result.current.setQuery("alpha"));
+      expect(result.current.visibleSessions).toHaveLength(8);
+    });
   });
 });
