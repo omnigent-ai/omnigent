@@ -9,8 +9,12 @@ const CLIENT_KEY_RE = /^[0-9a-f]{32}$/;
 const SESSION_ID = "managed-session";
 const EVENTS_URL = `/v1/sessions/${SESSION_ID}/events`;
 
-function wrongReplica(): Response {
-  return Response.json({ error: { code: "wrong_replica" } }, { status: 400 });
+function wrongReplica(sliceKey?: string | null): Response {
+  const error =
+    sliceKey === undefined
+      ? { code: "wrong_replica" }
+      : { code: "wrong_replica", slice_key: sliceKey };
+  return Response.json({ error }, { status: 400 });
 }
 
 function requestHeaders(index: number): Headers {
@@ -364,6 +368,77 @@ describe("managed first-message routing", () => {
   });
 });
 
+describe("routing after a session switches hosts", () => {
+  it("resends to the host a wrong_replica refusal names and keys later requests by it", async () => {
+    const { authenticatedFetch, getSessionHost, setSessionHost, isHostKeyless } = await setup();
+    setSessionHost(SESSION_ID, "old-host");
+    const body = JSON.stringify({ type: "message", data: { content: "sync changes" } });
+    fetchMock
+      .mockResolvedValueOnce(wrongReplica("new-host"))
+      .mockResolvedValue(Response.json({ queued: true }));
+
+    expect((await authenticatedFetch(EVENTS_URL, { method: "POST", body })).ok).toBe(true);
+    await authenticatedFetch(EVENTS_URL, { method: "POST", body });
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(requestHeaders(0).get(SLICE_KEY)).toBe("old-host");
+    expect(requestHeaders(1).get(SLICE_KEY)).toBe("new-host");
+    expect(fetchMock.mock.calls[1][1]).toMatchObject({ method: "POST", body });
+    expect(requestHeaders(2).get(SLICE_KEY)).toBe("new-host");
+    expect(getSessionHost(SESSION_ID)).toBe("new-host");
+    expect(isHostKeyless("old-host")).toBe(false);
+  });
+
+  it("tries the default replica when the named host misses too", async () => {
+    const { authenticatedFetch, setSessionHost, isHostKeyless } = await setup();
+    setSessionHost(SESSION_ID, "old-host");
+    fetchMock
+      .mockResolvedValueOnce(wrongReplica("new-host"))
+      .mockResolvedValueOnce(wrongReplica(null))
+      .mockResolvedValueOnce(Response.json({}));
+
+    expect((await authenticatedFetch(EVENTS_URL, { method: "POST", body: "{}" })).ok).toBe(true);
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(requestHeaders(1).get(SLICE_KEY)).toBe("new-host");
+    expect(requestHeaders(2).has(SLICE_KEY)).toBe(false);
+    expect(isHostKeyless("new-host")).toBe(true);
+    expect(isHostKeyless("old-host")).toBe(false);
+  });
+
+  it("keys a demoted host again when the default replica names its key", async () => {
+    const { authenticatedFetch, setSessionHost, markHostKeyless, isHostKeyless } = await setup();
+    setSessionHost(SESSION_ID, "new-host");
+    markHostKeyless("new-host");
+    fetchMock
+      .mockResolvedValueOnce(wrongReplica("new-host"))
+      .mockResolvedValueOnce(Response.json({}));
+
+    expect((await authenticatedFetch(EVENTS_URL, { method: "POST", body: "{}" })).ok).toBe(true);
+
+    expect(requestHeaders(0).has(SLICE_KEY)).toBe(false);
+    expect(requestHeaders(1).get(SLICE_KEY)).toBe("new-host");
+    expect(isHostKeyless("new-host")).toBe(false);
+  });
+
+  it("keeps a managed fork keyed by its new host when the refusal names the source's", async () => {
+    const { authenticatedFetch, getSessionHost, setSessionHost } = await setup();
+    setSessionHost(SESSION_ID, "old-host");
+    fetchMock
+      .mockResolvedValueOnce(wrongReplica("old-host"))
+      .mockResolvedValueOnce(Response.json({}));
+
+    await authenticatedFetch(`/v1/sessions/${SESSION_ID}/fork`, {
+      method: "POST",
+      body: JSON.stringify({ host_type: "managed", host_id: "fork-host" }),
+    });
+
+    expect(requestHeaders(0).get(SLICE_KEY)).toBe("fork-host");
+    expect(requestHeaders(1).has(SLICE_KEY)).toBe(false);
+    expect(getSessionHost(SESSION_ID)).toBe("old-host");
+  });
+});
+
 describe("host-less requests", () => {
   it.each([
     "/v1/sessions?order=desc&limit=30",
@@ -398,7 +473,7 @@ describe("host-less requests", () => {
     const { authenticatedFetch, setSessionHost, resolveModalHost, isHostKeyless } = await setup();
     setSessionHost("session-a", "host_modal");
     resolveModalHost(["host_modal"]);
-    fetchMock.mockResolvedValueOnce(wrongReplica());
+    fetchMock.mockResolvedValueOnce(wrongReplica("host_other"));
 
     const response = await authenticatedFetch("/v1/sessions?limit=30");
 
