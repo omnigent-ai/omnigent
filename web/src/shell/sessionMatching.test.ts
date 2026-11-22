@@ -96,10 +96,24 @@ describe("matchSessions", () => {
     expect(matchSessions(sessions, "https://github.com/acme/app/pull/8")).toEqual([]);
   });
 
+  it("finds a pull request however its link is cased, keeping sub-page boundaries", () => {
+    const sessions = [withPullRequest("linked", 42), withPullRequest("longer", 420)];
+    expect(ids(matchSessions(sessions, "https://github.com/ACME/App/pull/42"))).toEqual(["linked"]);
+    expect(ids(matchSessions(sessions, "https://GITHUB.com/acme/APP/pull/42/files"))).toEqual([
+      "linked",
+    ]);
+  });
+
   it("knows a pull request reference when it sees one", () => {
     expect(isPullRequestLookup(" #8 ")).toBe(true);
     expect(isPullRequestLookup("https://github.com/acme/app/pull/8")).toBe(true);
+    expect(isPullRequestLookup("https://gitlab.example.com/acme/app/-/merge_requests/8")).toBe(
+      true,
+    );
     expect(isPullRequestLookup("pr 8")).toBe(false);
     expect(isPullRequestLookup("#8 notes")).toBe(false);
+    // Any other link is text to search for.
+    expect(isPullRequestLookup("https://example.test/design")).toBe(false);
+    expect(isPullRequestLookup("https://github.com/acme/app/issues/8")).toBe(false);
   });
 });
