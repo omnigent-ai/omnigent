@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   appPaneDropAt,
   appPaneKey,
+  appPaneRoomRefusal,
   appPaneSidebarDrop,
   appPaneTabId,
   appPaneTabIds,
@@ -20,9 +21,15 @@ import {
   useAppPaneHosts,
   useAppPaneTitles,
 } from "./appPanes";
+import type { PaneSizing } from "./paneSizing";
+import { registerSplitSizing } from "./splitTargetActions";
 import { toggleZoomedPane, zoomedPaneKey } from "./terminalPaneZoom";
 import { mainSplitTarget } from "./terminalSplitTarget";
-import { terminalLayoutGeometry } from "@/lib/paneSplitLayout";
+import {
+  type TerminalLayout,
+  terminalLayoutGeometry,
+  terminalLayoutKeys,
+} from "@/lib/paneSplitLayout";
 
 import { readPaneSplit, updatePaneSplit } from "./paneSplitStore";
 
@@ -35,7 +42,10 @@ const nextConversation = () => `conv_app_panes_${++conversation}`;
 // jsdom has no elementFromPoint; the drop tests stub it, and each test starts without one.
 const originalElementFromPoint = document.elementFromPoint;
 
+const unregisterSizings: (() => void)[] = [];
+
 afterEach(() => {
+  for (const unregister of unregisterSizings.splice(0)) unregister();
   resetAppPanes();
   document.body.replaceChildren();
   document.elementFromPoint = originalElementFromPoint;
@@ -47,6 +57,17 @@ function placePanes(conversationId: string, size = { width: 1000, height: 500 })
   root.dataset.splitPanes = conversationId;
   root.getBoundingClientRect = () => new DOMRect(0, 0, size.width, size.height);
   document.body.append(root);
+}
+
+/** A size rule for the session's panes that has room for at most two. */
+function allowTwoPanes(conversationId: string) {
+  const sizing: PaneSizing = {
+    fits: (layout) => terminalLayoutKeys(layout).length <= 2,
+    keeps: (_before, after) => terminalLayoutKeys(after).length <= 2,
+    toward: (_target, from) => from,
+    refusal: (axis) => `No room for another ${axis === "rows" ? "row" : "column"}.`,
+  };
+  unregisterSizings.push(registerSplitSizing(mainSplitTarget(conversationId).id, () => sizing));
 }
 
 describe("app pane keys", () => {
@@ -338,5 +359,50 @@ describe("dragging an app pane onto the workspace sidebar", () => {
     document.elementFromPoint = () => document.body;
     expect(drop.drop(SHELL, { x: 10, y: 10 })).toBe(false);
     expect(mover.move).toHaveBeenCalledOnce();
+  });
+});
+
+describe("a size rule with no room for another pane", () => {
+  const SPLIT: TerminalLayout = { axis: "columns", ratio: 0.5, children: [AGENT, SHELL] };
+
+  it("keeps a tab from opening as a pane, and says why", () => {
+    const conversationId = nextConversation();
+    updatePaneSplit(conversationId, () => ({ layout: SPLIT, focusedKey: SHELL }));
+    allowTwoPanes(conversationId);
+    const before = readPaneSplit(conversationId);
+
+    expect(openTabAsPane(conversationId, "files", { agentKey: AGENT })).toBe(false);
+    expect(readPaneSplit(conversationId)).toEqual(before);
+    expect(appPaneRoomRefusal(conversationId, "files", { agentKey: AGENT })).toBe(
+      "No room for another column.",
+    );
+    expect(appPaneRoomRefusal(conversationId, null, { agentKey: AGENT, axis: "rows" })).toBe(
+      "No room for another row.",
+    );
+  });
+
+  it("still opens a tab beside the agent's lone pane while the rule has room", () => {
+    const conversationId = nextConversation();
+    allowTwoPanes(conversationId);
+    expect(appPaneRoomRefusal(conversationId, "files", { agentKey: AGENT })).toBeUndefined();
+    expect(openTabAsPane(conversationId, "files", { agentKey: AGENT })).toBe(true);
+    // A tab the split already shows needs no room: it only takes focus.
+    expect(appPaneRoomRefusal(conversationId, "files", { agentKey: AGENT })).toBeUndefined();
+    expect(openTabAsPane(conversationId, "files", { agentKey: AGENT })).toBe(true);
+  });
+
+  it("offers no drop spot, and refuses a drop the preview offered before it ran out", () => {
+    const conversationId = nextConversation();
+    placePanes(conversationId);
+    updatePaneSplit(conversationId, () => ({ layout: SPLIT, focusedKey: SHELL }));
+    const drop = appPaneDropAt(conversationId, { x: 980, y: 250 }, AGENT);
+    expect(drop).not.toBeNull();
+
+    allowTwoPanes(conversationId);
+    expect(appPaneDropAt(conversationId, { x: 980, y: 250 }, AGENT)).toBeNull();
+    expect(appPaneDropAt(conversationId, { x: 250, y: 490 }, AGENT)).toBeNull();
+    const before = readPaneSplit(conversationId);
+    expect(dropTabAsPane(conversationId, "files", drop!, AGENT)).toBe(false);
+    expect(readPaneSplit(conversationId)).toEqual(before);
   });
 });
