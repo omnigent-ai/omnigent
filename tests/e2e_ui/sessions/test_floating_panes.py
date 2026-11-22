@@ -22,7 +22,7 @@ from PIL import Image
 from playwright.sync_api import Locator, Page, Route, expect
 
 from tests.e2e_ui.conftest import open_right_rail
-from tests.e2e_ui.desktop._mac_shell import MAC_SHELL_INIT_SCRIPT
+from tests.e2e_ui.desktop._mac_shell import MAC_SHELL_INIT_SCRIPT, WINDOW_CONTROLS_STRIP
 
 _VIEWPORT = {"width": 1440, "height": 900}
 
@@ -476,3 +476,65 @@ def test_a_terminal_first_chat_switches_views_from_its_own_row(
 
     view_switch.get_by_role("button", name="Chat view").click()
     expect(message_composer(page)).to_be_visible()
+
+
+_TOP_ROW_JS = """() => {
+  const box = (selector) => {
+    const rect = document.querySelector(selector).getBoundingClientRect();
+    return { top: rect.top, height: rect.height, centre: rect.top + rect.height / 2 };
+  };
+  return {
+    header: box('[data-main-view] > header.chat-header'),
+    tabs: box('aside[aria-label="Workspace"] .workspace-tab-strip'),
+    cluster: box('.electron-sidebar-header-actions'),
+  };
+}"""
+
+
+@pytest.mark.parametrize("zoom", [None, 1.25], ids=["older-preload", "zoom-125"])
+def test_the_mac_top_row_is_the_title_bar_beside_the_window_buttons(
+    page: Page, seeded_session: tuple[str, str], zoom: float | None
+) -> None:
+    """In the macOS shell the top row is the title bar: 48 window px, on the window buttons'
+    centre line with the title-bar cluster, at any page zoom and with the sidebar open or
+    closed. A preload that doesn't report the zoom gets the 48px row."""
+    base_url, session_id = seeded_session
+    page.add_init_script(MAC_SHELL_INIT_SCRIPT)
+    if zoom is not None:
+        # As the preload does: the page zoom, which keeps native controls in window pixels.
+        page.add_init_script(
+            "document.addEventListener('DOMContentLoaded', () => document.documentElement"
+            f".style.setProperty('--omnigent-electron-zoom', '{zoom}'));"
+        )
+    _open(page, base_url, session_id, scheme="light", floating=True)
+    expect(page.locator("html")).to_have_attribute("data-electron-mac", "true")
+    open_right_rail(page)
+    title_bar = 48 / (zoom or 1)
+    cluster = page.locator(".electron-sidebar-header-actions")
+
+    for sidebar in ("open", "closed"):
+        if sidebar == "closed":
+            cluster.get_by_role("button", name="Close sidebar", exact=True).click()
+            expect(page.locator('aside[aria-label="Conversations"]')).to_have_attribute(
+                "data-collapsed", "true"
+            )
+            page.wait_for_timeout(500)  # custom-lint: disable=sleep-then-assert -- the slide
+        row = page.evaluate(_TOP_ROW_JS)
+        for part in ("header", "tabs"):
+            assert abs(row[part]["height"] - title_bar) <= 0.5, (sidebar, part, row)
+            assert abs(row[part]["centre"] - row["cluster"]["centre"]) <= 1, (sidebar, part, row)
+        assert abs(row["cluster"]["centre"] - title_bar / 2) <= 1, (sidebar, row)
+
+    # With the sidebar closed, nothing in the header sits under the window buttons, whose strip
+    # is fixed in window pixels.
+    strip = {key: value / (zoom or 1) for key, value in WINDOW_CONTROLS_STRIP.items()}
+    for control in page.locator("header.chat-header button:visible").all():
+        box = control.bounding_box()
+        assert box is not None
+        overlaps = (
+            box["x"] < strip["x"] + strip["width"]
+            and strip["x"] < box["x"] + box["width"]
+            and box["y"] < strip["y"] + strip["height"]
+            and strip["y"] < box["y"] + box["height"]
+        )
+        assert not overlaps, (box, strip)

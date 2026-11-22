@@ -1042,6 +1042,13 @@ describe("index.css floating panes", () => {
     expect(dark).toContain("background-color: var(--background) !important");
   });
 
+  it("sizes the top row as the macOS title bar, which keeps window pixels at any zoom", () => {
+    expect(ruleFor("html[data-electron-mac] .app-shell[data-floating-panes]")).toContain(
+      "--shell-top-row: var(--mac-titlebar-height)",
+    );
+    expect(ruleFor(".app-shell[data-floating-panes]")).toContain("--shell-top-row: 48px");
+  });
+
   it("keeps the gap above the chat's card when an extension owns the header", () => {
     const hidden = ruleFor(
       '.app-shell[data-floating-panes] [data-main-view="chat"] > main[data-session-id][data-shell-header="hidden"]',
