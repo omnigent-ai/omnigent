@@ -38,6 +38,10 @@ from omnigent.server.auth import (
 )
 from omnigent.server.routes.projects import create_projects_router
 from omnigent.server.routes.sessions import create_sessions_router
+from omnigent.server.sharing_settings import (
+    PublicSharingMaxLevel,
+    PublicSharingPolicyMiddleware,
+)
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
@@ -281,6 +285,7 @@ def _multi_user_app(
     artifact_root: Path | None = None,
     project_store: SqlAlchemyProjectStore | None = None,
     file_store: SqlAlchemyFileStore | None = None,
+    public_sharing_max_level: PublicSharingMaxLevel = PublicSharingMaxLevel.READ,
 ) -> FastAPI:
     """Build a header-auth app mounting sessions + projects at ``/v1``.
 
@@ -289,8 +294,11 @@ def _multi_user_app(
     :param project_store: The project store to mount, e.g. one that injects a fault.
     :param file_store: The file store to mount with ``artifact_root``, e.g. one
         that injects a fault.
+    :param public_sharing_max_level: The server's ceiling on public links, e.g.
+        ``PublicSharingMaxLevel.EDIT`` for a server that allows edit links.
     """
     app = FastAPI()
+    app.add_middleware(PublicSharingPolicyMiddleware, max_level=lambda: public_sharing_max_level)
 
     @app.exception_handler(OmnigentError)
     async def _handle(request: Request, exc: OmnigentError) -> JSONResponse:
@@ -570,29 +578,53 @@ def test_a_collaborator_reaches_the_project_through_a_shared_session(
     assert upload.status_code == upload_status, upload.text
 
 
+@pytest.mark.parametrize(
+    ("link_level", "owner_status"),
+    [(LEVEL_READ, 200), (LEVEL_EDIT, 403)],
+    ids=["read-link", "edit-link"],
+)
 def test_a_session_shared_by_link_keeps_its_project_files_private(
-    db_uri: str, tmp_path: Path
+    db_uri: str, tmp_path: Path, link_level: int, owner_status: int
 ) -> None:
     """
-    A public link to one project session lets others read that session, not the project's files.
+    A link to one project session never reaches the project's files.
+
+    Someone with only the link can open the session but not the files. An edit link
+    also lets anyone drive the session's agent, whose tool calls reach the server as
+    the owner, so that session can't use the files even for the owner. A session
+    shared with an editor by name still can.
     """
     _ensure_agent(db_uri)
-    client = TestClient(_multi_user_app(db_uri, artifact_root=tmp_path / "artifacts"))
+    client = TestClient(
+        _multi_user_app(
+            db_uri,
+            artifact_root=tmp_path / "artifacts",
+            public_sharing_max_level=PublicSharingMaxLevel.EDIT,
+        )
+    )
     project = client.post("/v1/projects", json={"name": "P"}, headers=_hdr(ALICE)).json()
     linked = _filed_session(db_uri, client, ALICE, project["id"])
-    file_id = _upload_to_project(client, linked, ALICE, "plan.md")
-    SqlAlchemyPermissionStore(db_uri).grant(RESERVED_USER_PUBLIC, linked, LEVEL_READ)
+    named = _filed_session(db_uri, client, ALICE, project["id"])
+    file_id = _upload_to_project(client, named, ALICE, "plan.md")
+    perms = SqlAlchemyPermissionStore(db_uri)
+    perms.grant(RESERVED_USER_PUBLIC, linked, link_level)
+    perms.ensure_user(BOB)
+    perms.grant(BOB, named, LEVEL_EDIT)
 
     session = client.get(f"/v1/sessions/{linked}", headers=_hdr(BOB))
-    listed = client.get(f"/v1/sessions/{linked}/resources/project-files", headers=_hdr(BOB))
+    by_link = client.get(f"/v1/sessions/{linked}/resources/project-files", headers=_hdr(BOB))
     content = client.get(
         f"/v1/sessions/{linked}/resources/project-files/{file_id}/content", headers=_hdr(BOB)
     )
+    # What the runner sends for the linked session's agent, whoever started the turn.
+    as_owner = client.get(f"/v1/sessions/{linked}/resources/project-files", headers=_hdr(ALICE))
 
     assert session.status_code == 200, session.text
-    assert listed.status_code == 403, listed.text
+    assert by_link.status_code == 403, by_link.text
     assert content.status_code == 403, content.text
-    assert _project_file_names(client, linked, ALICE) == ["plan.md"]
+    assert as_owner.status_code == owner_status, as_owner.text
+    assert _project_file_names(client, named, ALICE) == ["plan.md"]
+    assert _project_file_names(client, named, BOB) == ["plan.md"]
 
 
 def test_a_sub_agent_uses_its_root_sessions_project(db_uri: str, tmp_path: Path) -> None:

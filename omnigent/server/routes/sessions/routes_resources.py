@@ -122,6 +122,7 @@ from omnigent.server.schemas import (
     SessionResourceObject,
     SessionResourcePaginatedList,
 )
+from omnigent.server.sharing_settings import effective_public_level
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.file_store import FileStore
@@ -2461,21 +2462,31 @@ def register_resources_routes(
         request: Request, root_session_id: str, required_level: int
     ) -> None:
         """
-        Refuse a caller who reaches a project session only through its public link.
+        Keep a project's files out of reach of a project session's public link.
 
         A project's files come from all of its sessions, so a link to one of them
-        doesn't share the rest. The owner, an admin, or a collaborator granted
-        access by name gets through.
+        doesn't share the rest. A caller whose only access is the link is refused.
+        So is every caller of a session whose link lets anyone edit it: an editor
+        can drive its agent, whose tool calls reach the server as the owner. The
+        owner, an admin, or a collaborator granted access by name otherwise gets
+        through.
 
         :param request: The incoming request, for the caller's identity.
         :param root_session_id: The calling session's root, which holds its grants.
         :param required_level: Minimum level the caller's own grant needs, e.g. ``LEVEL_READ``.
-        :raises OmnigentError: 403 when only the public link grants that level.
+        :raises OmnigentError: 403 when only the public link grants that level, or
+            the link grants edit.
         """
         if permission_store is None:
             return
         user_id = _get_user_id(request, auth_provider)
         access = await asyncio.to_thread(permission_store.resolve_access, user_id, root_session_id)
+        public_level = effective_public_level(access.public_grant_level)
+        if public_level is not None and public_level >= LEVEL_EDIT:
+            raise OmnigentError(
+                "A session anyone can edit by link can't use its project's files",
+                code=ErrorCode.FORBIDDEN,
+            )
         if effective_admin(access.is_admin):
             return
         if access.user_grant_level is not None and access.user_grant_level >= required_level:
@@ -2500,8 +2511,8 @@ def register_resources_routes(
         :param required_level: Minimum level on the session, e.g. ``LEVEL_EDIT``.
         :returns: The project and its owner.
         :raises OmnigentError: 403 when only the session's public link grants the
-            level; 404 when the session is in no project, or its project is gone or
-            not its owner's.
+            level, or the link lets anyone edit the session; 404 when the session is
+            in no project, or its project is gone or not its owner's.
         """
         _require_project_file_store()
         assert project_store is not None
