@@ -57,7 +57,8 @@ export function matchesSessionPullRequestFilter(
 
 /**
  * The rows that stay under `filter`, and the open session's row whatever its pull request, so
- * the session in view stays listed. The same array when the filter keeps all of them.
+ * the session in view stays listed. Under All it's `rows` itself; any other filter returns a new
+ * array, even when every row stays.
  */
 export function applySessionPullRequestFilter<Row extends PullRequestFields & { id: string }>(
   rows: Row[],
