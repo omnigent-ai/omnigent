@@ -268,7 +268,7 @@ export function usePaletteSessionSearch({
       const rangesById = new Map(matches.map((match) => [match.session.id, match.labelRanges]));
       const local = paletteRows(
         matches.map((match) => match.session),
-        { projects, parentTitles },
+        { includeArchived, projects, parentTitles },
       ).map((session) => ({ ...session, labelRanges: rangesById.get(session.id) }));
       const listed = new Set(local.map((session) => session.id));
       return [...local, ...serverMatches.filter((session) => !listed.has(session.id))];

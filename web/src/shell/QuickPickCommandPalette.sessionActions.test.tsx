@@ -384,6 +384,43 @@ describe("QuickPick ⌘K verb-first session actions", () => {
     expect(optionNames().some((name) => name.includes("Old spike"))).toBe(true);
   });
 
+  it.each(["#42", "https://github.com/acme/app/pull/42"])(
+    "finds an archived session from its pull request %s in Unarchive's picker, not Archive's",
+    async (reference) => {
+      const archived = {
+        ...MINE,
+        id: "c3",
+        title: "Old spike",
+        archived: true,
+        pull_request: {
+          url: "https://github.com/acme/app/pull/42",
+          provider: "github",
+          repository: "acme/app",
+          number: 42,
+        },
+      } as Conversation;
+      listSessions(MINE, archived);
+      const { input } = renderWithPicks();
+      const pickFor = async (verb: string, question: string) => {
+        fireEvent.change(input, { target: { value: verb.toLowerCase() } });
+        fireEvent.click(await screen.findByRole("option", { name: new RegExp(`^${verb}`) }));
+        await waitFor(() => expect(heading()).toBe(question));
+        fireEvent.change(input, { target: { value: reference } });
+      };
+      await pickFor("Unarchive a Session…", "Unarchive which session?");
+      await waitFor(() => expect(optionNames()).toEqual([expect.stringContaining("Old spike")]));
+
+      fireEvent.keyDown(input, { key: "Escape" });
+      await waitFor(() => expect(heading()).toBeNull());
+      await pickFor("Archive a Session…", "Archive which session?");
+      await waitFor(() =>
+        expect(
+          screen.queryAllByRole("option").some((row) => row.textContent?.includes("Old spike")),
+        ).toBe(false),
+      );
+    },
+  );
+
   it("searches the server from the session picker, so a session not loaded yet can be found", async () => {
     const { input } = renderWithPicks();
     fireEvent.change(input, { target: { value: "rename a session" } });
