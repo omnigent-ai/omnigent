@@ -816,7 +816,10 @@ describe("Project ticket board", () => {
   ])(
     "names workers and actors using one shared lookup per session (mobile=$mobile)",
     async ({ mobile, href }) => {
+      const user = userEvent.setup();
       vi.mocked(useIsMobileViewport).mockReturnValue(mobile);
+      const involvement =
+        "Stage owner; independently research, build and test the panel, author findings and report evidence.";
       const worker = conversation("worker", { title: "Build ticket panel", status: "running" });
       vi.mocked(fetchConversationById).mockImplementation(async (id) =>
         id === "worker" ? worker : conversation(id, { title: "Shipping orchestrator" }),
@@ -851,12 +854,30 @@ describe("Project ticket board", () => {
                   payload: {
                     action: "updated",
                     session_id: "worker",
-                    involvement: "Building the panel",
+                    involvement,
+                  },
+                },
+                {
+                  ...event,
+                  id: "assigned",
+                  position: 2,
+                  kind: "updated",
+                  payload: {
+                    changes: { lead_session_id: "worker", labels: [{ key: "research" }] },
+                  },
+                },
+                {
+                  ...event,
+                  id: "unassigned",
+                  position: 3,
+                  kind: "updated",
+                  payload: {
+                    changes: { lead_session_id: null },
                   },
                 },
               ],
           has_more: false,
-          last_position: 1,
+          last_position: 3,
         }),
       );
       const { client } = renderBoard(
@@ -873,10 +894,26 @@ describe("Project ticket board", () => {
       ).toHaveAttribute("href", href);
       expect(within(sessions).getByRole("img", { name: "Session running" })).toBeInTheDocument();
       expect(within(sessions).getByText("Running")).toBeInTheDocument();
-      expect(await screen.findAllByRole("link", { name: "Shipping orchestrator" })).toHaveLength(2);
-      expect(screen.getByRole("region", { name: "Ticket activity" })).toHaveTextContent(
-        "updated involvement for",
+      expect(await screen.findAllByRole("link", { name: "Shipping orchestrator" })).toHaveLength(4);
+      const activity = screen.getByRole("region", { name: "Ticket activity" });
+      expect(activity).toHaveTextContent("updated the role for Build ticket panel");
+      expect(activity).toHaveTextContent(
+        "set the response contact to Build ticket panel; updated labels",
       );
+      expect(activity).toHaveTextContent("cleared the response contact");
+      expect(activity).not.toHaveTextContent("lead session id");
+      expect(within(activity).getAllByRole("link", { name: "Build ticket panel" })).toHaveLength(2);
+      for (const link of within(activity).getAllByRole("link", { name: "Build ticket panel" })) {
+        expect(link).toHaveAttribute("href", href);
+      }
+      const role = within(activity).getByText(involvement);
+      expect(role).not.toBeVisible();
+      expect(role.closest("details")).not.toHaveAttribute("open");
+      await user.click(within(activity).getByText("Agent role"));
+      expect(role).toBeVisible();
+      expect(role.closest("details")).toHaveAttribute("open");
+      await user.click(within(activity).getByText("Agent role"));
+      expect(role).not.toBeVisible();
       expect(screen.queryByText(/Agent agent-id/)).toBeNull();
       expect(
         vi

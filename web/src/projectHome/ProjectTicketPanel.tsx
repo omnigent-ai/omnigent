@@ -825,13 +825,10 @@ function ActivityChange({ event }: { event: TicketEvent }) {
           ? "linked"
           : event.payload.action === "updated"
             ? event.payload.involvement
-              ? "updated involvement for"
-              : "cleared involvement for"
+              ? "updated the role for"
+              : "cleared the role for"
             : "unlinked"}{" "}
         <TicketSessionLink sessionId={event.payload.session_id} ticketId={event.ticket_id} />
-        {typeof event.payload.involvement === "string" && event.payload.involvement && (
-          <> — {event.payload.involvement}</>
-        )}
       </>
     );
   if (typeof event.payload.related_ticket_id === "string")
@@ -850,14 +847,43 @@ function ActivityChange({ event }: { event: TicketEvent }) {
     );
   const changes = event.payload.changes as Partial<ProjectTicket> | undefined;
   const stage = ticketEventStage(event);
-  if (stage)
-    return (
-      <>
-        moved to <span className="font-medium text-foreground">{stage.name}</span>
-      </>
-    );
-  const fields = Object.keys(changes ?? {}).map((field) => field.replaceAll("_", " "));
-  return <>updated {fields.join(", ") || "the ticket"}</>;
+  const leadChanged = !!changes && "lead_session_id" in changes;
+  const leadSessionId = changes?.lead_session_id;
+  const fields = Object.keys(changes ?? {})
+    .filter(
+      (field) =>
+        field !== "lead_session_id" && (!stage || (field !== "stage_id" && field !== "status")),
+    )
+    .map((field) => field.replaceAll("_", " "));
+  return (
+    <>
+      {stage && (
+        <>
+          moved to <span className="font-medium text-foreground">{stage.name}</span>
+        </>
+      )}
+      {leadChanged && (
+        <>
+          {stage && "; "}
+          {leadSessionId ? (
+            <>
+              set the response contact to{" "}
+              <TicketSessionLink sessionId={leadSessionId} ticketId={event.ticket_id} />
+            </>
+          ) : (
+            "cleared the response contact"
+          )}
+        </>
+      )}
+      {fields.length > 0 && (
+        <>
+          {(stage || leadChanged) && "; "}
+          updated {fields.join(", ")}
+        </>
+      )}
+      {!stage && !leadChanged && !fields.length && "updated the ticket"}
+    </>
+  );
 }
 
 function TicketActivity({ projectId, ticketId }: { projectId: string; ticketId: string }) {
@@ -906,6 +932,10 @@ function TicketActivityItem({
 }) {
   const note = event.kind === "comment" || event.kind === "execution";
   const body = typeof event.payload.text === "string" ? event.payload.text : null;
+  const involvement =
+    typeof event.payload.session_id === "string" && typeof event.payload.involvement === "string"
+      ? event.payload.involvement
+      : null;
   const agent = !!(event.session_id || event.agent_id);
   const author =
     event.user_id && event.user_id === viewerId
@@ -965,6 +995,14 @@ function TicketActivityItem({
             {age === "now" ? "Just now" : `${age} ago`}
           </time>
         </div>
+        {involvement && (
+          <details className="text-sm text-muted-foreground">
+            <summary className="w-fit cursor-pointer rounded-sm hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+              Agent role
+            </summary>
+            <p className="mt-2 leading-relaxed whitespace-pre-wrap wrap-anywhere">{involvement}</p>
+          </details>
+        )}
         {body && <TicketCommentBody body={body} />}
       </div>
     </li>
