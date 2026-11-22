@@ -8,9 +8,12 @@ import { randomUUID } from "@/lib/randomUUID";
 
 import { DEFAULT_SESSION_FILTER, type SessionFilter } from "./sessionFilterPreferences";
 import {
-  DEFAULT_SESSION_PULL_REQUEST_FILTER,
-  SESSION_PULL_REQUEST_FILTERS,
+  DEFAULT_SESSION_LIST_FILTER,
+  parseSessionListFilter,
+  type SessionListFilter,
+  type SessionProjectFilter,
   type SessionPullRequestFilter,
+  type SessionStatusFilter,
 } from "./sessionListFilters";
 import {
   DEFAULT_SIDEBAR_VIEW,
@@ -38,7 +41,40 @@ export interface SavedViewSettings {
   show: readonly SidebarShowField[];
   sessionFilter: SessionFilter;
   pullRequestFilter: SessionPullRequestFilter;
+  statusFilter: SessionStatusFilter;
+  /** A harness key; null keeps every harness. One no longer offered is kept as stored. */
+  harnessFilter: string | null;
+  /** By project id, so a renamed project still matches; one since deleted is kept as stored. */
+  projectFilter: SessionProjectFilter;
 }
+
+/** A view's filters, as the sidebar's filters take them. */
+export function savedViewListFilter(view: SavedViewSettings): SessionListFilter {
+  return {
+    pullRequest: view.pullRequestFilter,
+    status: view.statusFilter,
+    harness: view.harnessFilter,
+    project: view.projectFilter,
+  };
+}
+
+/** The sidebar's filters, as a view stores them. */
+export function savedViewFilterFields(
+  filter: SessionListFilter,
+): Pick<
+  SavedViewSettings,
+  "pullRequestFilter" | "statusFilter" | "harnessFilter" | "projectFilter"
+> {
+  return {
+    pullRequestFilter: filter.pullRequest,
+    statusFilter: filter.status,
+    harnessFilter: filter.harness,
+    projectFilter: filter.project,
+  };
+}
+
+/** No filter on: what a view saved before the filters existed reads as. */
+export const DEFAULT_SAVED_VIEW_FILTERS = savedViewFilterFields(DEFAULT_SESSION_LIST_FILTER);
 
 export interface SidebarSavedView extends SavedViewSettings {
   id: string;
@@ -70,6 +106,13 @@ export function parseSavedView(value: unknown): SidebarSavedView | null {
   if (typeof id !== "string" || id === "" || typeof name !== "string" || name.trim() === "")
     return null;
   const show = Array.isArray(stored.show) ? stored.show : [];
+  // Each filter falls back to All on its own, so a view saved before a filter existed reads as it was.
+  const filter = parseSessionListFilter({
+    pullRequest: stored.pullRequestFilter,
+    status: stored.statusFilter,
+    harness: stored.harnessFilter,
+    project: stored.projectFilter,
+  });
   return {
     id,
     name: name.trim().slice(0, SAVED_VIEW_NAME_LIMIT),
@@ -78,11 +121,7 @@ export function parseSavedView(value: unknown): SidebarSavedView | null {
     // The menu's order, so equal selections compare equal.
     show: SIDEBAR_SHOW_FIELDS.filter((field) => show.includes(field)),
     sessionFilter: pick(SESSION_FILTERS, stored.sessionFilter, DEFAULT_SESSION_FILTER),
-    pullRequestFilter: pick(
-      SESSION_PULL_REQUEST_FILTERS,
-      stored.pullRequestFilter,
-      DEFAULT_SESSION_PULL_REQUEST_FILTER,
-    ),
+    ...savedViewFilterFields(filter),
   };
 }
 
@@ -168,8 +207,14 @@ function addProblem(entries: readonly unknown[], name: string): "duplicate" | "l
 
 /** Only the settings a view keeps, so a view passed as settings lends neither its id nor its name. */
 function savedViewSettings(settings: SavedViewSettings): SavedViewSettings {
-  const { grouping, ordering, show, sessionFilter, pullRequestFilter } = settings;
-  return { grouping, ordering, show, sessionFilter, pullRequestFilter };
+  const { grouping, ordering, show, sessionFilter } = settings;
+  return {
+    grouping,
+    ordering,
+    show,
+    sessionFilter,
+    ...savedViewFilterFields(savedViewListFilter(settings)),
+  };
 }
 
 /** Saves `settings` as a new view named `name`, or says why it can't. */
@@ -240,13 +285,19 @@ export function deleteView(scope: SavedViewScope, id: string): (() => RestoreVie
   };
 }
 
+const sameProjectFilter = (a: SessionProjectFilter, b: SessionProjectFilter) =>
+  a.kind === b.kind && (a.kind !== "project" || (b.kind === "project" && a.id === b.id));
+
 /** The saved view the sidebar shows now, if any: the first whose every setting matches. */
 export function matchingSavedView(
   current: {
     grouping: SidebarGrouping;
     ordering: string;
     show: readonly SidebarShowField[];
-  } & Pick<SavedViewSettings, "sessionFilter" | "pullRequestFilter">,
+  } & Pick<
+    SavedViewSettings,
+    "sessionFilter" | "pullRequestFilter" | "statusFilter" | "harnessFilter" | "projectFilter"
+  >,
   views: readonly SidebarSavedView[],
 ): SidebarSavedView | null {
   return (
@@ -256,6 +307,9 @@ export function matchingSavedView(
         view.ordering === current.ordering &&
         view.sessionFilter === current.sessionFilter &&
         view.pullRequestFilter === current.pullRequestFilter &&
+        view.statusFilter === current.statusFilter &&
+        view.harnessFilter === current.harnessFilter &&
+        sameProjectFilter(view.projectFilter, current.projectFilter) &&
         view.show.length === current.show.length &&
         view.show.every((field) => current.show.includes(field)),
     ) ?? null

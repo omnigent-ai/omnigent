@@ -2,12 +2,15 @@ import { act, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  DEFAULT_SAVED_VIEW_FILTERS,
   deleteView,
   matchingSavedView,
   parseSavedView,
   readSavedViews,
   SAVED_VIEW_LIMIT,
   type SavedViewSettings,
+  savedViewFilterFields,
+  savedViewListFilter,
   saveView,
   useSidebarSavedViews,
 } from "./sidebarSavedViews";
@@ -20,6 +23,9 @@ const SETTINGS: SavedViewSettings = {
   show: ["repo", "harness"],
   sessionFilter: "all",
   pullRequestFilter: "open",
+  statusFilter: "all",
+  harnessFilter: null,
+  projectFilter: { kind: "all" },
 };
 const stored = () => JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "{}");
 const scopeKey = `${SCOPE.server}\n${SCOPE.userId}`;
@@ -49,7 +55,30 @@ describe("parseSavedView", () => {
       show: ["harness", "branch"],
       sessionFilter: "mine",
       pullRequestFilter: "all",
+      // A view saved before these filters existed reads with each at All.
+      statusFilter: "all",
+      harnessFilter: null,
+      projectFilter: { kind: "all" },
     });
+  });
+
+  it("reads the status, harness and project filters, keeping a harness or project that's gone", () => {
+    const view = parseSavedView({
+      id: "v1",
+      name: "Gone",
+      statusFilter: "working",
+      harnessFilter: "acp:retired",
+      projectFilter: { kind: "project", id: "deleted-project" },
+    });
+    expect(view && savedViewListFilter(view)).toEqual({
+      pullRequest: "all",
+      status: "working",
+      harness: "acp:retired",
+      project: { kind: "project", id: "deleted-project" },
+    });
+    expect(parseSavedView({ id: "v2", name: "Odd", statusFilter: "asleep" })?.statusFilter).toBe(
+      "all",
+    );
   });
 
   it("can't read a view without an id or a name", () => {
@@ -270,9 +299,63 @@ describe("matchingSavedView", () => {
     expect(matchingSavedView({ ...current, pullRequestFilter: "none" }, views)?.id).toBe("b");
   });
 
+  it("matches a project filter by its project's id", () => {
+    const inProject = {
+      id: "c",
+      name: "C",
+      ...SETTINGS,
+      projectFilter: { kind: "project" as const, id: "p-1" },
+    };
+    const project = (id: string) => ({
+      ...current,
+      projectFilter: { kind: "project" as const, id },
+    });
+    expect(matchingSavedView(project("p-1"), [inProject])?.id).toBe("c");
+    expect(matchingSavedView(project("p-2"), [inProject])).toBeNull();
+  });
+
+  it("keeps a view filtered to sessions without a harness, not widening it to every harness", () => {
+    saveView(SCOPE, "No harness", { ...SETTINGS, harnessFilter: "" });
+    expect(readSavedViews(SCOPE)[0]?.harnessFilter).toBe("");
+  });
+
+  it("stores a new view's status, harness and project filters", () => {
+    const saved = saveView(SCOPE, "Working Codex", {
+      ...SETTINGS,
+      statusFilter: "working",
+      harnessFilter: "codex",
+      projectFilter: { kind: "project", id: "p-1" },
+    });
+    expect(saved.ok).toBe(true);
+    expect(readSavedViews(SCOPE)[0]).toMatchObject({
+      statusFilter: "working",
+      harnessFilter: "codex",
+      projectFilter: { kind: "project", id: "p-1" },
+    });
+  });
+
+  it("saves the sidebar's filters as a view's fields, and reads them back", () => {
+    const filter = {
+      pullRequest: "closed" as const,
+      status: "unread" as const,
+      harness: "native:codex",
+      project: { kind: "none" as const },
+    };
+    expect(savedViewListFilter({ ...SETTINGS, ...savedViewFilterFields(filter) })).toEqual(filter);
+    expect(savedViewListFilter({ ...SETTINGS, ...DEFAULT_SAVED_VIEW_FILTERS })).toEqual({
+      pullRequest: "all",
+      status: "all",
+      harness: null,
+      project: { kind: "all" },
+    });
+  });
+
   it("matches none once any setting differs, or with a Custom order", () => {
     expect(matchingSavedView({ ...current, show: ["repo"] }, views)).toBeNull();
     expect(matchingSavedView({ ...current, sessionFilter: "mine" }, views)).toBeNull();
+    expect(matchingSavedView({ ...current, statusFilter: "done" }, views)).toBeNull();
+    expect(matchingSavedView({ ...current, harnessFilter: "codex" }, views)).toBeNull();
+    expect(matchingSavedView({ ...current, projectFilter: { kind: "none" } }, views)).toBeNull();
     expect(matchingSavedView({ ...current, ordering: "custom" }, views)).toBeNull();
   });
 });

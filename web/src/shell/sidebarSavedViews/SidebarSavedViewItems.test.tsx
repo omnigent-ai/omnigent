@@ -18,6 +18,9 @@ const view = (id: string, name: string): SidebarSavedView => ({
   show: [],
   sessionFilter: "all",
   pullRequestFilter: "all",
+  statusFilter: "all",
+  harnessFilter: null,
+  projectFilter: { kind: "all" },
 });
 const VIEWS = [view("a", "Review"), view("b", "Mine")];
 
