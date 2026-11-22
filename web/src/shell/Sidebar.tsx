@@ -40,6 +40,7 @@ import {
   type ReactNode,
   type RefObject,
   createContext,
+  type ComponentProps,
   type ContextType,
   Fragment,
   memo,
@@ -267,6 +268,7 @@ import {
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import { isTextEntry } from "@/lib/hotkeys";
 import {
+  DEFAULT_SESSION_FILTER,
   type SessionFilter,
   readSessionFilter,
   writeSessionFilter,
@@ -281,6 +283,18 @@ import {
   type SessionPullRequestFilterState,
   useSessionPullRequestFilter,
 } from "@/shell/useSessionPullRequestFilter";
+import {
+  matchingSavedView,
+  saveView as saveSidebarView,
+  type SavedViewSettings,
+  type SidebarSavedView,
+  useSidebarSavedViews,
+} from "@/lib/sidebarSavedViews";
+import { deleteViewWithUndo } from "@/shell/sidebarSavedViews/savedViewActions";
+import { SaveSidebarViewDialog } from "@/shell/sidebarSavedViews/SaveSidebarViewDialog";
+import { SidebarSavedViewItems } from "@/shell/sidebarSavedViews/SidebarSavedViewItems";
+import { useSavedViewScope } from "@/shell/sidebarSavedViews/useSavedViewScope";
+import { useSidebarSavedViewCommands } from "@/shell/sidebarSavedViews/useSidebarSavedViewCommands";
 import {
   SIDEBAR_GROUPINGS,
   SIDEBAR_SHOW_FIELDS,
@@ -2357,6 +2371,39 @@ function ConversationList({
         : undefined;
     saveView(custom ? { ...patch, custom } : patch);
   });
+  // Saved views, with the pull request filter they apply: off, none is read, offered or applied.
+  const savedViewsOn = pullRequestFilter.enabled;
+  const viewerScope = useSavedViewScope();
+  const savedViewScope = savedViewsOn ? viewerScope : null;
+  const savedViews = useSidebarSavedViews(savedViewScope);
+  const savedViewSettings: SavedViewSettings = {
+    grouping: view.grouping,
+    // A hand-placed order saves the automatic one it started from.
+    ordering: view.ordering === "custom" ? (view.custom?.base ?? "updated") : view.ordering,
+    show: view.show,
+    sessionFilter: activeTab,
+    pullRequestFilter: pullRequestFilter.value,
+  };
+  const matchedSavedView = matchingSavedView(
+    { ...savedViewSettings, ordering: view.ordering },
+    savedViews,
+  );
+  const [saveViewOpen, setSaveViewOpen] = useState(false);
+  const applySavedView = useStableCallback((saved: SidebarSavedView) => {
+    updateView({ grouping: saved.grouping, ordering: saved.ordering, show: saved.show });
+    // Shared isn't offered on a single-user server, so the view shows My sessions there.
+    onActiveTabChange(
+      saved.sessionFilter === "shared" && !multiUser ? DEFAULT_SESSION_FILTER : saved.sessionFilter,
+    );
+    pullRequestFilter.choose(saved.pullRequestFilter);
+  });
+  const openSaveView = useCallback(() => setSaveViewOpen(true), []);
+  useSidebarSavedViewCommands({
+    scope: savedViewScope,
+    views: savedViews,
+    apply: applySavedView,
+    openSave: openSaveView,
+  });
   const grouped = view.grouping !== "default";
   const harnessLabels = useHarnessLabels(view.grouping === "harness");
   const harnessLabel = useCallback(
@@ -3545,6 +3592,17 @@ function ConversationList({
       view={groupingUi ? view : null}
       onViewChange={updateView}
       pullRequestFilter={pullRequestFilter.enabled ? pullRequestFilter : null}
+      savedViews={
+        savedViewScope
+          ? {
+              views: savedViews,
+              matched: matchedSavedView,
+              onApply: applySavedView,
+              onSave: openSaveView,
+              onDelete: (saved: SidebarSavedView) => deleteViewWithUndo(savedViewScope, saved),
+            }
+          : null
+      }
     />
   );
 
@@ -4034,6 +4092,13 @@ function ConversationList({
           getEmbedRoot() ?? document.body,
         )}
       </DndContext>
+      {savedViewScope && (
+        <SaveSidebarViewDialog
+          open={saveViewOpen}
+          onOpenChange={setSaveViewOpen}
+          onSave={(name) => saveSidebarView(savedViewScope, name, savedViewSettings)}
+        />
+      )}
     </SidebarRowDataProvider>
   );
 }
@@ -4475,6 +4540,7 @@ function SessionFilterMenu({
   view,
   onViewChange,
   pullRequestFilter = null,
+  savedViews = null,
 }: {
   value: SidebarTab;
   onChange: (value: SidebarTab) => void;
@@ -4484,6 +4550,8 @@ function SessionFilterMenu({
   onViewChange: (patch: Partial<SidebarViewPreferences>) => void;
   /** Null while the sidebar_saved_views release flag is off: no Pull request filter. */
   pullRequestFilter?: SessionPullRequestFilterState | null;
+  /** Null while the sidebar_saved_views release flag is off: no Views. */
+  savedViews?: ComponentProps<typeof SidebarSavedViewItems> | null;
 }) {
   const triggerLabel = view === null ? "Filter sessions" : "Group, sort, and filter sessions";
   const [menuOpen, setMenuOpen] = useState(false);
@@ -4546,6 +4614,16 @@ function SessionFilterMenu({
         </DropdownMenuContent>
       ) : (
         <DropdownMenuContent align="end" className="min-w-56">
+          {savedViews && (
+            <FilterMenuSub
+              label="Views"
+              value={savedViews.matched?.name}
+              testId="session-saved-views-menu"
+              pages={pages}
+            >
+              <SidebarSavedViewItems {...savedViews} />
+            </FilterMenuSub>
+          )}
           <FilterMenuSub
             label="Grouping"
             value={GROUPING_LABELS[view.grouping]}

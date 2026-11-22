@@ -220,6 +220,9 @@ import {
 } from "./sidebarNav";
 import { useSessionImportStore } from "@/store/sessionImport";
 import * as identity from "@/lib/identity";
+import { readSavedViews, saveView } from "@/lib/sidebarSavedViews";
+import { usePaletteCommandsStore } from "@/store/paletteCommands";
+import { registeredPaletteCommands } from "@/test/paletteCommands";
 
 const useConvMock = vi.mocked(useConversations);
 
@@ -5481,6 +5484,7 @@ describe("Sidebar view options", () => {
 describe("Sidebar pull request filter", () => {
   afterEach(() => {
     vi.restoreAllMocks();
+    usePaletteCommandsStore.setState({ groups: {} });
   });
   const pullRequest = (state: string, isDraft = false) => ({
     url: "https://example.com/org/repo/pull/1",
@@ -5490,6 +5494,21 @@ describe("Sidebar pull request filter", () => {
     state,
     is_draft: isDraft,
   });
+  const VIEWER = "viewer@example.com";
+  const SCOPE = () => ({ server: window.location.origin, userId: VIEWER });
+  const REVIEW = {
+    grouping: "default",
+    ordering: "created",
+    show: [],
+    sessionFilter: "all",
+    pullRequestFilter: "open",
+  } as const;
+  const viewCommands = () =>
+    registeredPaletteCommands()
+      .map((command) => command.label)
+      .filter((label) => /sidebar view/i.test(label));
+  const commandRow = (label: string) =>
+    registeredPaletteCommands().find((command) => command.label === label)!;
   const rows = () => [
     conv("conv_open", "Codex", { pull_request: pullRequest("OPEN"), pull_requests_synced: true }),
     conv("conv_merged", "Codex", {
@@ -5528,21 +5547,32 @@ describe("Sidebar pull request filter", () => {
   it.each([
     ["off", false],
     ["absent, as on an older server", undefined],
-  ])("is inert with the flag %s: no menu entry, no stored filter read or written", (_, flag) => {
-    localStorage.setItem("omnigent:session-pull-request-filter", "open");
-    const getItem = vi.spyOn(Storage.prototype, "getItem");
-    const setItem = vi.spyOn(Storage.prototype, "setItem");
-    mockConversations(rows());
-    renderWith(flag);
-    expect(listed()).toEqual(["conv_merged", "conv_none", "conv_open"]);
-    openMenu();
-    expect(screen.getByTestId("session-display-menu")).toBeInTheDocument();
-    expect(screen.queryByTestId("session-pull-request-filter-menu")).toBeNull();
-    const touched = (spy: typeof getItem | typeof setItem) =>
-      spy.mock.calls.some(([key]) => key === "omnigent:session-pull-request-filter");
-    expect(touched(getItem)).toBe(false);
-    expect(touched(setItem)).toBe(false);
-  });
+  ])(
+    "is inert with the flag %s: no menu entry, ⌘K row or stored filter or view read or written",
+    (_, flag) => {
+      vi.spyOn(identity, "getCurrentUserId").mockReturnValue(VIEWER);
+      localStorage.setItem("omnigent:session-pull-request-filter", "open");
+      saveView(SCOPE(), "Review", REVIEW);
+      const getItem = vi.spyOn(Storage.prototype, "getItem");
+      const setItem = vi.spyOn(Storage.prototype, "setItem");
+      mockConversations(rows());
+      renderWith(flag);
+      expect(listed()).toEqual(["conv_merged", "conv_none", "conv_open"]);
+      openMenu();
+      expect(screen.getByTestId("session-display-menu")).toBeInTheDocument();
+      expect(screen.queryByTestId("session-pull-request-filter-menu")).toBeNull();
+      expect(screen.queryByTestId("session-saved-views-menu")).toBeNull();
+      expect(viewCommands()).toEqual([]);
+      const touched = (spy: typeof getItem | typeof setItem) =>
+        spy.mock.calls.some(
+          ([key]) =>
+            key === "omnigent:session-pull-request-filter" ||
+            key === "omnigent:sidebar-saved-views",
+        );
+      expect(touched(getItem)).toBe(false);
+      expect(touched(setItem)).toBe(false);
+    },
+  );
 
   it("narrows the list to the chosen pull requests, and keeps the choice", () => {
     mockConversations(rows());
@@ -5666,11 +5696,61 @@ describe("Sidebar pull request filter", () => {
     expect(screen.getByText("No sessions")).toBeInTheDocument();
   });
 
-  it("applies no stored choice without the grouping menu that offers it", () => {
+  it("offers saved views first in the menu, and a view applies all its settings", () => {
+    vi.spyOn(identity, "getCurrentUserId").mockReturnValue(VIEWER);
+    saveView(SCOPE(), "Review", REVIEW);
+    mockConversations(rows());
+    renderWith(true);
+    openMenu();
+    const menu = screen.getByRole("menu");
+    const subs = within(menu)
+      .getAllByRole("menuitem")
+      .map((item) => item.dataset.testid);
+    expect(subs[0]).toBe("session-saved-views-menu");
+    fireEvent.keyDown(screen.getByTestId("session-saved-views-menu"), { key: "ArrowRight" });
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Review" }));
+    expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!)).toMatchObject({
+      grouping: "default",
+      ordering: "created",
+    });
+    expect(localStorage.getItem("omnigent:session-filter")).toBe("all");
+    expect(localStorage.getItem("omnigent:session-pull-request-filter")).toBe("open");
+    expect(listed()).toEqual(["conv_open"]);
+    openMenu();
+    expect(screen.getByTestId("session-saved-views-menu")).toHaveTextContent("Review");
+  });
+
+  it("offers ⌘K rows that apply a view and save the sidebar as it is", async () => {
+    vi.spyOn(identity, "getCurrentUserId").mockReturnValue(VIEWER);
+    saveView(SCOPE(), "Review", REVIEW);
+    mockConversations(rows());
+    renderWith(true);
+    expect(viewCommands()).toEqual([
+      "Sidebar view: Review",
+      "Save sidebar view…",
+      "Delete sidebar view: Review",
+    ]);
+    act(() => commandRow("Sidebar view: Review").run());
+    expect(listed()).toEqual(["conv_open"]);
+    act(() => commandRow("Save sidebar view…").run());
+    fireEvent.change(await screen.findByTestId("save-sidebar-view-dialog-name"), {
+      target: { value: "Open only" },
+    });
+    fireEvent.click(screen.getByTestId("save-sidebar-view-dialog-save"));
+    expect(readSavedViews(SCOPE()).map((view) => [view.name, view.pullRequestFilter])).toEqual([
+      ["Review", "open"],
+      ["Open only", "open"],
+    ]);
+  });
+
+  it("applies no stored choice, and offers no views, without the grouping menu", () => {
+    vi.spyOn(identity, "getCurrentUserId").mockReturnValue(VIEWER);
+    saveView(SCOPE(), "Review", REVIEW);
     localStorage.setItem("omnigent:session-pull-request-filter", "open");
     mockConversations(rows());
     renderWith(true, false);
     expect(listed()).toEqual(["conv_merged", "conv_none", "conv_open"]);
+    expect(viewCommands()).toEqual([]);
   });
 });
 
