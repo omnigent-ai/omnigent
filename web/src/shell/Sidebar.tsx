@@ -272,6 +272,15 @@ import {
   writeSessionFilter,
 } from "@/lib/sessionFilterPreferences";
 import {
+  applySessionPullRequestFilter,
+  SESSION_PULL_REQUEST_FILTER_LABELS,
+} from "@/lib/sessionListFilters";
+import { SessionPullRequestFilterItems } from "@/shell/SessionPullRequestFilterItems";
+import {
+  type SessionPullRequestFilterState,
+  useSessionPullRequestFilter,
+} from "@/shell/useSessionPullRequestFilter";
+import {
   SIDEBAR_GROUPINGS,
   SIDEBAR_SHOW_FIELDS,
   sidebarBaseOrdering,
@@ -2310,6 +2319,9 @@ function ConversationList({
   // persisted per-device preference. With the release flag off the sidebar
   // keeps its default layout and ignores any stored choice.
   const groupingUi = isFeatureEnabled(serverInfo, "sidebar_grouping_ui");
+  const pullRequestFilter = useSessionPullRequestFilter(
+    isFeatureEnabled(serverInfo, "sidebar_saved_views"),
+  );
   const {
     view,
     updateView: saveView,
@@ -2597,7 +2609,11 @@ function ConversationList({
     // Merge the server pinned set in, so a pinned session outside the loaded
     // paginated window still renders. Dedupe by id: a pinned session is usually
     // also present in the paginated list, and merging both would render it twice.
-    const allWithPinned = dedupeConversationsById([...allConversations, ...pinnedConversations]);
+    const allWithPinned = applySessionPullRequestFilter(
+      dedupeConversationsById([...allConversations, ...pinnedConversations]),
+      pullRequestFilter.value,
+      activeRootSessionId,
+    );
     const notArchived = allWithPinned.filter((c) => c.archived !== true);
     // An archived open session lists on the live views too, wherever its row
     // came from; Pinned and project folders keep showing only live sessions.
@@ -2635,7 +2651,10 @@ function ConversationList({
     const folderCandidates =
       activeTab === "archived"
         ? tabScoped
-        : dedupeConversationsById([...notArchived, ...mineSharedRuns]);
+        : dedupeConversationsById([
+            ...notArchived,
+            ...applySessionPullRequestFilter(mineSharedRuns, pullRequestFilter.value),
+          ]);
     const sharedRunsToFile =
       includeSharedRuns &&
       folderCandidates.some((c) => isSharedAutomationRun(c, viewerId) && !pinnedIdSet.has(c.id));
@@ -2777,6 +2796,7 @@ function ConversationList({
     activeTab,
     includeSharedRuns,
     mineSharedRuns,
+    pullRequestFilter.value,
     viewerId,
     splitShared,
     grouped,
@@ -2803,7 +2823,7 @@ function ConversationList({
   );
   const displayPagination = useSidebarDisplayPagination(
     listRows,
-    JSON.stringify([activeTab, searchQuery, view.grouping, sortBy]),
+    JSON.stringify([activeTab, searchQuery, view.grouping, sortBy, pullRequestFilter.value]),
     activeTab === "shared"
       ? (config.sharedDisplayPageSize ?? config.displayPageSize)
       : config.displayPageSize,
@@ -3508,6 +3528,7 @@ function ConversationList({
       multiUser={multiUser}
       view={groupingUi ? view : null}
       onViewChange={updateView}
+      pullRequestFilter={pullRequestFilter.enabled ? pullRequestFilter : null}
     />
   );
 
@@ -4430,6 +4451,7 @@ function SessionFilterMenu({
   multiUser,
   view,
   onViewChange,
+  pullRequestFilter = null,
 }: {
   value: SidebarTab;
   onChange: (value: SidebarTab) => void;
@@ -4437,6 +4459,8 @@ function SessionFilterMenu({
   /** Null while the sidebar_grouping_ui release flag is off: only Display is offered. */
   view: SidebarViewPreferences | null;
   onViewChange: (patch: Partial<SidebarViewPreferences>) => void;
+  /** Null while the sidebar_saved_views release flag is off: no Pull request filter. */
+  pullRequestFilter?: SessionPullRequestFilterState | null;
 }) {
   const triggerLabel = view === null ? "Filter sessions" : "Group, sort, and filter sessions";
   const [menuOpen, setMenuOpen] = useState(false);
@@ -4529,6 +4553,19 @@ function SessionFilterMenu({
           >
             {displayOptions}
           </FilterMenuSub>
+          {pullRequestFilter && (
+            <FilterMenuSub
+              label="Pull request"
+              value={SESSION_PULL_REQUEST_FILTER_LABELS[pullRequestFilter.value]}
+              testId="session-pull-request-filter-menu"
+              pages={pages}
+            >
+              <SessionPullRequestFilterItems
+                value={pullRequestFilter.value}
+                onChange={pullRequestFilter.choose}
+              />
+            </FilterMenuSub>
+          )}
           <FilterMenuSub
             label="Ordering"
             value={ORDERING_LABELS[view.ordering]}
